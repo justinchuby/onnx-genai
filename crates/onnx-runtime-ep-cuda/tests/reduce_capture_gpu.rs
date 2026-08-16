@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! CUDA-graph capture coverage for the float (`f32`/`f16`) cuDNN reduce path.
 //!
 //! Before Lever A, every `f32`/`f16` `ReduceSum`/`ReduceMean` took the cuDNN
@@ -38,13 +52,15 @@ fn bytes<T: Copy>(values: &[T]) -> Vec<u8> {
     }
 }
 
-fn gpu() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -218,7 +234,7 @@ fn varied(count: usize, seed: f32) -> Vec<f32> {
 /// assert the replayed output is byte-identical to the eager output and matches
 /// the f32 oracle. Runs several decode steps with fresh inputs each step.
 fn capture_matches_eager_and_oracle(op: &str, dtype: DataType, is_mean: bool) {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let runtime = ep.runtime();
 
     // Router-style shape: [1,5,8] reduce trailing axis -> [1,5,1], keepdims.
@@ -344,21 +360,37 @@ fn capture_matches_eager_and_oracle(op: &str, dtype: DataType, is_mean: bool) {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fp16_reduce_sum_captures_and_matches_eager() {
     capture_matches_eager_and_oracle("ReduceSum", DataType::Float16, false);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fp16_reduce_mean_captures_and_matches_eager() {
     capture_matches_eager_and_oracle("ReduceMean", DataType::Float16, true);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn f32_reduce_sum_captures_and_matches_eager() {
     capture_matches_eager_and_oracle("ReduceSum", DataType::Float32, false);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn f32_reduce_mean_captures_and_matches_eager() {
     capture_matches_eager_and_oracle("ReduceMean", DataType::Float32, true);
@@ -368,9 +400,13 @@ fn f32_reduce_mean_captures_and_matches_eager() {
 /// shape: warm shape A, then run shape B, then shape A again — each must be
 /// numerically correct (a shape-blind cache would reuse A's workspace/descriptor
 /// for B and corrupt the result).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn float_reduce_same_kernel_alternating_shapes_stays_correct() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let dtype = DataType::Float16;
     let axes_values = [1i64];
@@ -430,9 +466,13 @@ fn float_reduce_same_kernel_alternating_shapes_stays_correct() {
 /// stale workspace/descriptor. Warm shape A, begin capture, then execute a
 /// different shape B: the cache miss during capture must error. The capture is
 /// then aborted cleanly.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn float_reduce_shape_change_under_capture_is_rejected() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let dtype = DataType::Float16;
     let axes_values = [1i64];

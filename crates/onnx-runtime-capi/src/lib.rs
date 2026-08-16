@@ -1,6 +1,6 @@
 //! # `onnx-runtime-capi`
 //!
-//! The C ABI layer for the ORT 2.0 runtime (see `docs/ORT2.md` §21). This is
+//! The C ABI layer for the ORT 2.0 runtime (see `docs/architecture/ORT2.md` §21). This is
 //! Phase 1, **Tier 1**: a clean, direct `extern "C"` surface (`nxrt_*` names)
 //! that lets a C caller load a model, build input tensors, run inference, and
 //! read outputs back. It is a thin marshalling layer over
@@ -40,7 +40,7 @@ use onnx_runtime_session::{InferenceSession, SessionBuilder, SessionError, Tenso
 // Status codes (§22)
 // ---------------------------------------------------------------------------
 
-/// ORT-compatible status code for the C API layer (`docs/ORT2.md` §22).
+/// ORT-compatible status code for the C API layer (`docs/architecture/ORT2.md` §22).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OrtErrorCode {

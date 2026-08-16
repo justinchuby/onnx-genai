@@ -23,4 +23,33 @@
 - Caveats remain: decode-only (end-to-end 0.42× ORT), TTFT 10× worse, quiet host or `PERSISTENT_POOL=1` required, Qwen 0.5B only.
 - Updated `.squad/decisions/inbox/fact-checker-win-verification.md` with the re-verification section.
 
+### 2026-08-11T16:15:00Z — Fifth review of PR #762 (commit `38625fb38`)
+- **Claims verified:** B1 absent_outputs unforgeable (✅), rank preserved (⚠️ acceptable), fails closed (✅), optional outputs claimed with fallback disabled (✅, ran 27 tests), CUDA docs honest (✅).
+- **Claim contradicted:** "ORT 1.27 has no per-node provider attribution" (❌). `Session_GetEpGraphAssignmentInfo` exists since ORT 1.24; `Node_GetEpName` since 1.23. Both in ORT 1.27 headers.
+- **Substantive:** S1 — `conformance_mixed_partition` should use the existing ORT API or correct its comment.
+- **Devil's Advocate:** `unwrap_or(0)` convention for dynamic dims is load-bearing but enforced only by comment, not by type system. New kernels could silently allocate zero bytes.
+- **Verdict:** Not ready to leave draft until S1 is resolved (~1 hour of work).
+- Output: `.squad/decisions/inbox/fact-checker-fifth-review-762.md`
+
 Full pre-compaction history in `history-archive.md`.
+
+## 2026-08-11 — PR #762 fifth review: API existence check
+
+**Task:** Fifth review of PR #762. Verify factual claims.
+
+**Key finding:** Contradicted the claim that ORT 1.27 lacks per-node provider attribution. `Session_GetEpGraphAssignmentInfo` has existed since ORT 1.24. Two prior deferrals (Freysa, Coco) cited a non-existent API gap. API present in the generated bindings; confirmed by examining ORT header and generated Rust bindings.
+
+**Outcome:** Resch wired the API in; 8 conformance tests now assert specific op assignments to `"cpu_ep"`.
+
+**Lesson reinforced:** Verify an API's absence before deferring on it. Check the generated bindings.
+
+## 2026-08-13 — Lower-bit quant accuracy reality-check (parallel to Sebastian's #885 probe)
+Independent accuracy-lens check on sub-4-bit for the 30B dense model (read-only, no kernels).
+**Findings:** int3 (~3.5 bpw imatrix/AWQ) + SpQR-style mixed = 🟢 credible (small tax); int2 scalar
+/Q2_K = 🔴 accuracy cliff; int2 via codebook/trellis (QuIP#/AQLM/QTIP) = 🟡 but adds LUT/trellis
+decode that **spends the bandwidth win back** (accuracy & bandwidth coupled); 2:4 sparsity needs a
+fine-tune + no M=1 HW benefit. **Load-bearing blocker:** we only HAVE int4 — EVERY sub-4-bit path
+must re-quantize from the **fp16/bf16 SOURCE** (re-squeezing int4 → collapse); ORT-stack tooling
+for sub-4-bit >7B is immature. Combined with Sebastian's measured byte-fold probe (−75% DRAM →
++2.8%), lower-bit quant is a **MEASURED 🟥 NO-GO** and the ceiling is **latency-bound on the ~2568-
+node serial chain**, not weight-bandwidth-bound. Chew is the numerics gate if any path is funded.

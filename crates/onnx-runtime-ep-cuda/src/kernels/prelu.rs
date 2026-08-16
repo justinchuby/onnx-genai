@@ -22,7 +22,7 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 
 use super::elementwise::{
-    BroadcastMetadataCache, BroadcastMetadataKey, is_fixed_decode_shape,
+    BroadcastMetadataCache, BroadcastMetadataKey, capture_shape_eligible,
     require_matching_capture_signature,
 };
 use crate::error::{driver_err, not_implemented};
@@ -115,6 +115,7 @@ impl KernelFactory for PReluFactory {
             runtime: self.runtime.clone(),
             metadata: Mutex::new(BroadcastMetadataCache::new(self.runtime.clone())),
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }))
     }
 }
@@ -129,6 +130,10 @@ pub struct PReluKernel {
     /// The exact dtype/shape signature recorded by the most recent successful
     /// fixed-decode call. `Some` iff the op is currently capture-safe.
     last_capture_safe_signature: Mutex<Option<PReluCaptureSignature>>,
+    /// Metadata-derived seq-independence: `true` iff all IR output dims are
+    /// statically known (no growing seq axis), making the op capture-eligible
+    /// regardless of the runtime row count.
+    capture_seq_independent: bool,
 }
 
 impl PReluKernel {
@@ -195,14 +200,15 @@ impl PReluKernel {
         let rank = i32::try_from(out_shape.len())
             .map_err(|_| EpError::KernelFailed(format!("cuda_ep {OP}: rank exceeds i32")))?;
 
-        let current_signature = is_fixed_decode_shape(&out_shape).then(|| PReluCaptureSignature {
-            dtype: x.dtype,
-            shapes: BroadcastMetadataKey {
-                a_shape: x.shape.to_vec(),
-                b_shape: slope.shape.to_vec(),
-                out_shape: out_shape.clone(),
-            },
-        });
+        let current_signature = capture_shape_eligible(self.capture_seq_independent, &out_shape)
+            .then(|| PReluCaptureSignature {
+                dtype: x.dtype,
+                shapes: BroadcastMetadataKey {
+                    a_shape: x.shape.to_vec(),
+                    b_shape: slope.shape.to_vec(),
+                    out_shape: out_shape.clone(),
+                },
+            });
         require_matching_capture_signature(
             &self.runtime,
             OP,
@@ -266,6 +272,10 @@ impl Kernel for PReluKernel {
                 "PRelu capture signature is unavailable because its state lock was poisoned",
             ),
         }
+    }
+
+    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
+        self.capture_seq_independent = seq_independent;
     }
 }
 

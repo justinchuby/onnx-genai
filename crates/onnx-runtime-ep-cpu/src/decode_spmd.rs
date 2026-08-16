@@ -1447,7 +1447,7 @@ fn report_spmd_fallback(message: &str) {
 /// so callers can inspect it via [`decode_path_label`]. Emitted as
 /// `tracing::debug!` when the `tracing` feature is enabled (visible to any
 /// subscriber at `debug` level or below), or gated behind `NXRT_CALIB_DEBUG`
-/// otherwise. See `docs/ERROR_AND_LOGGING_CONVENTIONS.md` for level guidance.
+/// otherwise. See `docs/architecture/ERROR_AND_LOGGING_CONVENTIONS.md` for level guidance.
 fn report_pool_built(mode: PersistenceMode) {
     let label = match mode {
         PersistenceMode::On if decode_schedule() == DecodeSchedule::Steal => "work-stealing-pool",

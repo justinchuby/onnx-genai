@@ -2029,8 +2029,11 @@ dependencies = [
  "anyhow",
  "clap",
  "criterion",
+ "cudarc",
+ "half",
  "onnx-genai-engine",
  "onnx-genai-kv",
+ "onnx-genai-metadata",
  "onnx-genai-ort",
  "onnx-genai-runtime-config",
  "onnx-runtime-ep-cpu",
@@ -2068,6 +2071,7 @@ dependencies = [
  "onnx-genai-engine",
  "onnx-genai-metadata",
  "onnx-genai-server",
+ "onnx-runtime-ep-cuda",
  "pyo3",
  "reedline",
  "serde_json",
@@ -2085,6 +2089,10 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
 ]
+
+[[package]]
+name = "onnx-genai-cuda-version-guard"
+version = "0.1.0-dev.5"
 
 [[package]]
 name = "onnx-genai-engine"
@@ -2168,6 +2176,7 @@ dependencies = [
  "libloading 0.8.9",
  "minijinja",
  "minijinja-contrib",
+ "onnx-genai-cuda-version-guard",
  "onnx-genai-genai-config",
  "onnx-genai-kv",
  "onnx-genai-metadata",
@@ -2265,6 +2274,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "clap",
+ "cudarc",
  "getrandom 0.3.4",
  "image",
  "onnx-genai",
@@ -2272,6 +2282,9 @@ dependencies = [
  "onnx-genai-metadata",
  "onnx-genai-ort",
  "onnx-genai-preprocess",
+ "onnx-runtime-ep-cuda",
+ "onnx-runtime-memory-governor",
+ "onnx-runtime-virtual-memory",
  "reqwest",
  "serde",
  "serde_json",
@@ -2315,6 +2328,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-runtime-cost-model"
+version = "0.1.0-dev.5"
+dependencies = [
+ "onnx-runtime-ir",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "onnx-runtime-cpuinfo"
 version = "0.1.0-dev.5"
 dependencies = [
@@ -2322,6 +2345,18 @@ dependencies = [
  "cc",
  "cmake",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "onnx-runtime-cuda-memory"
+version = "0.1.0-dev.5"
+dependencies = [
+ "cudarc",
+ "onnx-runtime-ep-api",
+ "onnx-runtime-memory-governor",
+ "onnx-runtime-virtual-memory",
+ "thiserror 2.0.19",
+ "tracing",
 ]
 
 [[package]]
@@ -2335,6 +2370,7 @@ dependencies = [
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ir",
+ "onnx-runtime-memory-governor",
  "onnx-runtime-shape-inference",
  "thiserror 2.0.19",
 ]
@@ -2348,6 +2384,7 @@ dependencies = [
  "onnx-genai-ort-sys",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
+ "onnx-runtime-memory-governor",
  "onnx-runtime-optimizer",
  "onnx-runtime-tracer",
  "thiserror 2.0.19",
@@ -2378,12 +2415,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-runtime-ep-cpu-plugin"
+version = "0.1.0-dev.5"
+dependencies = [
+ "libloading 0.8.9",
+ "onnx-genai-ort-sys",
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ep-cpu",
+ "onnx-runtime-ep-plugin",
+ "onnx-runtime-ir",
+ "onnx-runtime-ort-testkit",
+ "onnx-std",
+]
+
+[[package]]
 name = "onnx-runtime-ep-cuda"
 version = "0.1.0-dev.5"
 dependencies = [
  "cudarc",
  "half",
  "libloading 0.8.9",
+ "onnx-genai-cuda-version-guard",
+ "onnx-runtime-cuda-memory",
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ir",
@@ -2391,8 +2444,77 @@ dependencies = [
  "onnx-runtime-memory-governor",
  "onnx-runtime-optimizer",
  "onnx-runtime-quantization",
+ "onnx-runtime-shape-inference",
  "onnx-runtime-virtual-memory",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "onnx-runtime-ep-cuda-plugin"
+version = "0.1.0-dev.5"
+dependencies = [
+ "onnx-genai-ort-sys",
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ep-cuda",
+ "onnx-runtime-ep-plugin",
+ "onnx-runtime-ir",
+]
+
+[[package]]
+name = "onnx-runtime-ep-nxrt-abi"
+version = "0.1.0-dev.5"
+dependencies = [
+ "libloading 0.8.9",
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ep-cpu",
+ "onnx-runtime-ir",
+]
+
+[[package]]
+name = "onnx-runtime-ep-nxrt-host"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.8.9",
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ep-nxrt-abi",
+ "onnx-runtime-ep-nxrt-testplugin",
+ "onnx-runtime-ir",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "onnx-runtime-ep-nxrt-testplugin"
+version = "0.1.0-dev.5"
+dependencies = [
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ep-nxrt-abi",
+ "onnx-runtime-ir",
+]
+
+[[package]]
+name = "onnx-runtime-ep-plugin"
+version = "0.1.0-dev.5"
+dependencies = [
+ "libloading 0.8.9",
+ "onnx-genai-ort-sys",
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ep-cpu",
+ "onnx-runtime-ir",
+ "onnx-runtime-ort-testkit",
+]
+
+[[package]]
+name = "onnx-runtime-ep-shared-mock-plugin"
+version = "0.1.0-dev.5"
+dependencies = [
+ "libloading 0.8.9",
+ "onnx-genai-ort-sys",
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ep-plugin",
+ "onnx-runtime-ir",
+ "onnx-runtime-memory-governor",
+ "onnx-runtime-ort-testkit",
+ "onnx-std",
 ]
 
 [[package]]
@@ -2447,6 +2569,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-runtime-ort-testkit"
+version = "0.1.0-dev.5"
+
+[[package]]
 name = "onnx-runtime-protocol-trace"
 version = "0.1.0-dev.5"
 dependencies = [
@@ -2486,6 +2612,8 @@ dependencies = [
  "onnx-runtime-ep-cuda",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
+ "onnx-runtime-memory",
+ "onnx-runtime-memory-governor",
  "onnx-runtime-optimizer",
  "onnx-runtime-shape-inference",
  "onnx-runtime-tracer",

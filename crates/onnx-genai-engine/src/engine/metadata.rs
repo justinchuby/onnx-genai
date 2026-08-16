@@ -398,7 +398,6 @@ pub(crate) fn cap_kv_len(model_max_len: usize, cap: Option<usize>) -> usize {
 /// read from the graph, not expanded from a uniform layer count. If the graph
 /// cannot be inspected, this falls back to pattern-expanded metadata so no
 /// currently loading model regresses.
-#[cfg(feature = "native-backend")]
 pub(crate) fn genai_config_compat_metadata_from_model_path(
     genai_config_path: Option<&Path>,
     model_path: &Path,
@@ -444,7 +443,6 @@ pub(crate) fn genai_config_compat_metadata_from_model_path(
 /// mirroring the ORT loader's graph inspection. Returns `None` on any failure so
 /// callers fall back to pattern-expanded metadata. Only the graph interface
 /// (port names, dtypes, shapes) is needed — external weight data is never read.
-#[cfg(feature = "native-backend")]
 pub(crate) fn decoder_graph_info_from_model_path(
     model_path: &Path,
 ) -> Option<onnx_genai_genai_config::ModelGraphInfo> {
@@ -481,7 +479,6 @@ pub(crate) fn decoder_graph_info_from_model_path(
 }
 
 /// Canonical lowercase dtype spelling for an `onnx_runtime_ir` graph dtype.
-#[cfg(feature = "native-backend")]
 pub(crate) fn ir_dtype_name(dtype: onnx_runtime_ir::DataType) -> &'static str {
     use onnx_runtime_ir::DataType;
     match dtype {
@@ -508,95 +505,6 @@ pub(crate) fn ir_dtype_name(dtype: onnx_runtime_ir::DataType) -> &'static str {
         DataType::Uint4 => "uint4",
         DataType::Int4 => "int4",
         _ => "undefined",
-    }
-}
-
-/// Best-effort native metadata derived from an onnxruntime-genai
-/// `genai_config.json` in `model_dir`, used only when no
-/// `inference_metadata.yaml` is present. Returns `Ok(None)` when there is no
-/// `genai_config.json`. The KV cache native dtype is read from the loaded
-/// session's KV inputs, since it is not present in `genai_config.json`.
-pub(crate) fn genai_config_compat_metadata(
-    genai_config_path: Option<&Path>,
-    session: &Session,
-) -> anyhow::Result<Option<InferenceMetadata>> {
-    let kv_native_dtype = session
-        .inputs()
-        .iter()
-        .find(|info| crate::decode::is_kv_input(&info.name))
-        .and_then(|info| match info.dtype {
-            DataType::Float16 => Some("float16"),
-            DataType::BFloat16 => Some("bfloat16"),
-            DataType::Float32 => Some("float32"),
-            _ => None,
-        });
-    // Hand the decoder's actual ONNX graph inventory to the compatibility
-    // converter so it declares exactly the KV/state ports the graph exposes.
-    // onnxruntime-genai `genai_config.json` only carries a uniform per-layer KV
-    // name pattern and a total layer count; for hybrid SSM/attention decoders
-    // (qwen3.5: most layers are linear-attention with `conv_state`/
-    // `recurrent_state`, only the periodic full-attention layers expose dense
-    // `key`/`value`) that pattern names ports the graph never exposes and warmup
-    // aborts. Deriving the topology from the graph yields sparse `kv_inputs`/
-    // `kv_outputs` plus recurrent `state_pairs`; uniform dense-KV decoders are
-    // unchanged.
-    let decoder_graph = session_model_graph_info(session);
-    let result = if let Some(path) = genai_config_path {
-        onnx_genai_genai_config::inference_metadata_from_path_with_graph(
-            path,
-            kv_native_dtype,
-            &decoder_graph,
-        )
-        .map(Some)
-    } else {
-        Ok(None)
-    };
-    result.map_err(|e| anyhow::anyhow!("Failed to convert genai_config.json: {e}"))
-}
-
-/// Build a [`ModelGraphInfo`] inventory from a loaded session's input/output
-/// port metadata, mirroring the ONNX graph interface the strict compatibility
-/// converter consumes (names, dtype spelling, and per-axis static/symbolic
-/// dimensions). ORT reports dynamic axes as negative dimensions, which map to
-/// symbolic (`None`) entries.
-pub(crate) fn session_model_graph_info(
-    session: &Session,
-) -> onnx_genai_genai_config::ModelGraphInfo {
-    fn tensor_info(meta: &onnx_genai_ort::TensorInfo) -> onnx_genai_genai_config::GraphTensorInfo {
-        onnx_genai_genai_config::GraphTensorInfo {
-            name: meta.name.clone(),
-            dtype: graph_dtype_name(meta.dtype).to_owned(),
-            dimensions: meta
-                .shape
-                .iter()
-                .map(|&dim| usize::try_from(dim).ok())
-                .collect(),
-        }
-    }
-    onnx_genai_genai_config::ModelGraphInfo {
-        inputs: session.inputs().iter().map(tensor_info).collect(),
-        outputs: session.outputs().iter().map(tensor_info).collect(),
-    }
-}
-
-/// Canonical lowercase dtype spelling used by the compatibility metadata
-/// converter's graph inventory (`float32`, `float16`, `bfloat16`, ...).
-pub(crate) fn graph_dtype_name(dtype: DataType) -> &'static str {
-    match dtype {
-        DataType::Float32 => "float32",
-        DataType::Float16 => "float16",
-        DataType::BFloat16 => "bfloat16",
-        DataType::Float8E4M3 => "float8_e4m3fn",
-        DataType::Float8E5M2 => "float8_e5m2",
-        DataType::Int8 => "int8",
-        DataType::Int16 => "int16",
-        DataType::Int32 => "int32",
-        DataType::Int64 => "int64",
-        DataType::Uint8 => "uint8",
-        DataType::Uint16 => "uint16",
-        DataType::Uint32 => "uint32",
-        DataType::Uint64 => "uint64",
-        DataType::Bool => "bool",
     }
 }
 

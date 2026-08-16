@@ -2016,6 +2016,12 @@ impl Kernel for CompressedSparseAttentionKernel {
         if self.capturable && !self.force_host {
             return self.run_capturable_ratio4(inputs, outputs);
         }
+        if self.runtime.is_capturing()? {
+            return Err(onnx_runtime_ep_api::EpError::KernelFailed(
+                "CompressedSparseAttention reached its host-staged path during CUDA graph capture"
+                    .into(),
+            ));
+        }
         // Stage every present input host-side. Contiguity is required because the
         // host copy is a dense byte blit; the CPU oracle then reads it densely.
         let mut staged: Vec<Vec<u8>> = Vec::with_capacity(inputs.len());
@@ -2247,7 +2253,7 @@ impl Kernel for CompressedSparseAttentionKernel {
 /// ratio / cache-layout / sink-mode / arity combination the CPU oracle does not
 /// accept (via a dry-run of the CPU factory), plus explicit dtype gating on the
 /// dtype-fixed inputs, so unsupported combinations never reach `execute`
-/// (docs/DEEPSEEK_CSA_MTP_RUNTIME.md §4.8).
+/// (docs/models/DEEPSEEK_CSA_MTP_RUNTIME.md §4.8).
 pub(crate) fn unsupported_reason(
     node: &Node,
     shapes: &[Shape],

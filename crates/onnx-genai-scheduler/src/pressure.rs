@@ -1,5 +1,5 @@
 //! Ticketed non-blocking pressure protocol for machine-wide host memory
-//! (`docs/MEMORY_ARCHITECTURE.md` §5.3.1, refined against
+//! (`docs/memory/MEMORY_ARCHITECTURE.md` §5.3.1, refined against
 //! `specs/tla/PressureProtocol.tla` and `specs/tla/REFINEMENT.md`).
 //!
 //! # The invariant
@@ -114,7 +114,7 @@ pub struct HostAllocation {
     pub pinned: bool,
 }
 
-/// The state of a pressure ticket (`docs/MEMORY_ARCHITECTURE.md` §5.3.1).
+/// The state of a pressure ticket (`docs/memory/MEMORY_ARCHITECTURE.md` §5.3.1).
 #[derive(Debug)]
 pub enum PressureState {
     /// Waiting for capacity.
@@ -418,6 +418,7 @@ pub struct HostGovernor {
 }
 
 struct HostGovernorInner {
+    memory_authority_id: onnx_runtime_memory_governor::MemoryAuthorityId,
     ledger: Mutex<Ledger>,
     mailbox: Mutex<CancelMailbox>,
     sink: Arc<dyn ProtocolTraceSink>,
@@ -488,6 +489,9 @@ impl HostGovernor {
 
         Ok(Self {
             inner: Arc::new(HostGovernorInner {
+                memory_authority_id: onnx_runtime_memory_governor::MemoryAuthorityId::new(
+                    onnx_runtime_memory_governor::DeviceKey::HOST,
+                ),
                 ledger: Mutex::new(ledger),
                 mailbox: Mutex::new(CancelMailbox::new(config.mailbox_capacity)?),
                 sink,
@@ -500,6 +504,10 @@ impl HostGovernor {
                 mailbox_id: config.mailbox_id,
             }),
         })
+    }
+
+    pub(crate) fn memory_authority_id(&self) -> onnx_runtime_memory_governor::MemoryAuthorityId {
+        self.inner.memory_authority_id
     }
 
     /// Requests host pages. Returns an already-ready ticket when capacity is

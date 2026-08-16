@@ -27,9 +27,13 @@ const ACTIVATE_ENTRY: &str = "qmoe_activate";
 const LINEAR_F32_ENTRY: &str = "qmoe_linear_f32";
 const LINEAR_F16_ENTRY: &str = "qmoe_linear_f16";
 const LINEAR_BF16_ENTRY: &str = "qmoe_linear_bf16";
+const GATE_UP_ACTIVATE_F32_ENTRY: &str = "qmoe_gate_up_activate_f32";
+const GATE_UP_ACTIVATE_F16_ENTRY: &str = "qmoe_gate_up_activate_f16";
+const GATE_UP_ACTIVATE_BF16_ENTRY: &str = "qmoe_gate_up_activate_bf16";
 const COMBINE_F32_ENTRY: &str = "qmoe_combine_f32";
 const COMBINE_F16_ENTRY: &str = "qmoe_combine_f16";
 const COMBINE_BF16_ENTRY: &str = "qmoe_combine_bf16";
+const LINEAR_ONE_TASK_PER_BLOCK_MAX_ROUTES: usize = 16;
 
 const CUDA_SRC: &str = r#"
 #ifndef QMOE_BITS
@@ -55,15 +59,22 @@ __device__ __forceinline__ int total_order_key(float value)
     return bits;
 }
 
-__device__ __forceinline__ bool route_value_is_better(
-    float candidate, int candidate_index, float best, int best_index)
-{
-    const int candidate_key = total_order_key(candidate);
-    const int best_key = total_order_key(best);
-    return candidate_key > best_key
-        || (candidate_key == best_key && candidate_index < best_index);
-}
+// Sentinel key strictly below every real `total_order_key` (whose minimum is
+// the key of -inf, 0x807fffff); used by inactive reduction lanes so they always
+// lose the argmax.
+#define QMOE_ROUTE_KEY_SENTINEL ((int)0x80000000)
 
+// One CUDA block cooperatively routes one row (grid-strided over rows). The
+// top-k expert selection is parallelized as `k` rounds of a block-wide argmax
+// by (total_order_key descending, index ascending) — bit-identical to the
+// serial scan because integer-key argmax with a deterministic tie rule is
+// order-independent. The fp32 routing-weight reductions (softmax / normalize /
+// separate router-weight aggregation) stay on a single thread in the ORIGINAL
+// sequential order so their floating-point rounding is byte-for-byte identical
+// to the previous serial kernel; they now read the row's logits from shared
+// memory instead of re-issuing latency-bound global loads. At decode (rows=1)
+// this replaces a single active thread with the whole block, which was the
+// dominant decode cost.
 extern "C" __global__ void qmoe_route(
     const float* router_probs,
     const float* router_weights,
@@ -74,74 +85,105 @@ extern "C" __global__ void qmoe_route(
     const int top_k,
     const int normalize)
 {
-    const unsigned long long first =
-        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned long long stride =
-        (unsigned long long)gridDim.x * blockDim.x;
-    for (unsigned long long row = first; row < rows; row += stride) {
+    extern __shared__ unsigned char qmoe_route_smem[];
+    float* shared_logits = (float*)qmoe_route_smem;
+    int* picked = (int*)(shared_logits + experts);
+    int* reduce_key = picked + experts;
+    int* reduce_idx = reduce_key + blockDim.x;
+
+    for (unsigned long long row = blockIdx.x; row < rows; row += gridDim.x) {
         const float* logits = router_probs + row * (unsigned long long)experts;
         int* indices = selected_experts + row * (unsigned long long)top_k;
         float* weights = selected_weights + row * (unsigned long long)top_k;
 
+        for (int expert = threadIdx.x; expert < experts; expert += blockDim.x) {
+            shared_logits[expert] = logits[expert];
+            picked[expert] = 0;
+        }
+        __syncthreads();
+
         for (int slot = 0; slot < top_k; ++slot) {
-            int best_index = -1;
-            float best_value = 0.0f;
-            for (int expert = 0; expert < experts; ++expert) {
-                bool already_selected = false;
-                for (int previous = 0; previous < slot; ++previous) {
-                    already_selected |= indices[previous] == expert;
-                }
-                if (already_selected) {
+            int local_key = QMOE_ROUTE_KEY_SENTINEL;
+            int local_index = 0x7fffffff;
+            for (int expert = threadIdx.x; expert < experts;
+                 expert += blockDim.x) {
+                if (picked[expert]) {
                     continue;
                 }
-                const float candidate = logits[expert];
-                if (best_index < 0
-                    || route_value_is_better(
-                        candidate, expert, best_value, best_index)) {
-                    best_index = expert;
-                    best_value = candidate;
+                const int key = total_order_key(shared_logits[expert]);
+                if (key > local_key
+                    || (key == local_key && expert < local_index)) {
+                    local_key = key;
+                    local_index = expert;
                 }
             }
-            indices[slot] = best_index;
+            reduce_key[threadIdx.x] = local_key;
+            reduce_idx[threadIdx.x] = local_index;
+            __syncthreads();
+            for (unsigned int stride = blockDim.x >> 1; stride > 0;
+                 stride >>= 1) {
+                if (threadIdx.x < stride) {
+                    const int other_key = reduce_key[threadIdx.x + stride];
+                    const int other_index = reduce_idx[threadIdx.x + stride];
+                    const int self_key = reduce_key[threadIdx.x];
+                    const int self_index = reduce_idx[threadIdx.x];
+                    if (other_key > self_key
+                        || (other_key == self_key
+                            && other_index < self_index)) {
+                        reduce_key[threadIdx.x] = other_key;
+                        reduce_idx[threadIdx.x] = other_index;
+                    }
+                }
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) {
+                const int best_index = reduce_idx[0];
+                indices[slot] = best_index;
+                picked[best_index] = 1;
+            }
+            __syncthreads();
         }
 
-        if (router_weights) {
-            const float* aggregation =
-                router_weights + row * (unsigned long long)experts;
-            float denominator = 1.0f;
-            if (normalize) {
-                denominator = 0.0f;
+        if (threadIdx.x == 0) {
+            if (router_weights) {
+                const float* aggregation =
+                    router_weights + row * (unsigned long long)experts;
+                float denominator = 1.0f;
+                if (normalize) {
+                    denominator = 0.0f;
+                    for (int slot = 0; slot < top_k; ++slot) {
+                        denominator += aggregation[indices[slot]];
+                    }
+                }
                 for (int slot = 0; slot < top_k; ++slot) {
-                    denominator += aggregation[indices[slot]];
+                    weights[slot] = denominator == 0.0f
+                        ? 0.0f
+                        : aggregation[indices[slot]] / denominator;
+                }
+            } else {
+                float maximum = -__int_as_float(0x7f800000);
+                for (int expert = 0; expert < experts; ++expert) {
+                    maximum = fmaxf(maximum, shared_logits[expert]);
+                }
+                float all_sum = 0.0f;
+                for (int expert = 0; expert < experts; ++expert) {
+                    all_sum += expf(shared_logits[expert] - maximum);
+                }
+                float denominator = all_sum;
+                if (normalize) {
+                    denominator = 0.0f;
+                    for (int slot = 0; slot < top_k; ++slot) {
+                        denominator += expf(shared_logits[indices[slot]] - maximum);
+                    }
+                }
+                for (int slot = 0; slot < top_k; ++slot) {
+                    weights[slot] =
+                        expf(shared_logits[indices[slot]] - maximum)
+                        / denominator;
                 }
             }
-            for (int slot = 0; slot < top_k; ++slot) {
-                weights[slot] = denominator == 0.0f
-                    ? 0.0f
-                    : aggregation[indices[slot]] / denominator;
-            }
-            continue;
         }
-
-        float maximum = -__int_as_float(0x7f800000);
-        for (int expert = 0; expert < experts; ++expert) {
-            maximum = fmaxf(maximum, logits[expert]);
-        }
-        float all_sum = 0.0f;
-        for (int expert = 0; expert < experts; ++expert) {
-            all_sum += expf(logits[expert] - maximum);
-        }
-        float denominator = all_sum;
-        if (normalize) {
-            denominator = 0.0f;
-            for (int slot = 0; slot < top_k; ++slot) {
-                denominator += expf(logits[indices[slot]] - maximum);
-            }
-        }
-        for (int slot = 0; slot < top_k; ++slot) {
-            weights[slot] =
-                expf(logits[indices[slot]] - maximum) / denominator;
-        }
+        __syncthreads();
     }
 }
 
@@ -325,7 +367,9 @@ __device__ void qmoe_linear_impl(
                 (unsigned long long)expert * out_features + output_feature;
             output[task] = value + (bias ? bias[bias_index] : 0.0f);
         }
-        __syncthreads();
+        if (task + gridDim.x < tasks) {
+            __syncthreads();
+        }
     }
 }
 
@@ -484,6 +528,234 @@ extern "C" __global__ void qmoe_activate(
         }
     }
 }
+
+template <typename Input, int Bits, int BlockSize, bool HasZeroPoints>
+__device__ void qmoe_gate_up_activate_impl(
+    const Input* input,
+    const int* selected_experts,
+    const unsigned char* fc1_packed,
+    const float* fc1_scales,
+    const unsigned char* fc1_zero_points,
+    const float* fc1_bias,
+    const unsigned char* fc3_packed,
+    const float* fc3_scales,
+    const unsigned char* fc3_zero_points,
+    const float* fc3_bias,
+    float* activated,
+    const unsigned long long routes,
+    const int top_k,
+    const int inter,
+    const int fc1_out_features,
+    const int fc3_present,
+    const int swiglu_fusion,
+    const int in_features,
+    const int fc1_packed_in,
+    const int fc1_blocks,
+    const int fc1_zero_point_bytes,
+    const int fc3_packed_in,
+    const int fc3_blocks,
+    const int fc3_zero_point_bytes,
+    const float alpha,
+    const float beta,
+    const float swiglu_limit)
+{
+    const unsigned long long tasks = routes * (unsigned long long)inter;
+    const unsigned long long task = blockIdx.x;
+    if (task >= tasks) {
+        return;
+    }
+    const unsigned long long route = task / inter;
+    const int feature = (int)(task % inter);
+    const int expert = selected_experts[route];
+    const unsigned long long input_row = route / (unsigned long long)top_k;
+    const unsigned long long input_base =
+        input_row * (unsigned long long)in_features;
+    int gate_feature = feature;
+    int linear_feature = feature;
+    if (!fc3_present) {
+        if (swiglu_fusion == 1) {
+            gate_feature = 2 * feature;
+            linear_feature = 2 * feature + 1;
+        } else {
+            linear_feature = inter + feature;
+        }
+    }
+    const unsigned long long gate_expert_row =
+        (unsigned long long)expert * fc1_out_features + gate_feature;
+    const unsigned long long linear_expert_row = fc3_present
+        ? (unsigned long long)expert * inter + feature
+        : (unsigned long long)expert * fc1_out_features + linear_feature;
+
+    float gate = 0.0f;
+    float linear = 0.0f;
+    if (Bits == 4) {
+        const int chunks = in_features / 8;
+        for (int chunk = (int)threadIdx.x;
+             chunk < chunks;
+             chunk += (int)blockDim.x) {
+            gate += qmoe_int4_chunk<Input, BlockSize, HasZeroPoints>(
+                input, fc1_packed, fc1_scales, fc1_zero_points, input_base,
+                gate_expert_row, chunk * 8, fc1_packed_in, fc1_blocks,
+                fc1_zero_point_bytes);
+            linear += qmoe_int4_chunk<Input, BlockSize, HasZeroPoints>(
+                input, fc3_present ? fc3_packed : fc1_packed,
+                fc3_present ? fc3_scales : fc1_scales,
+                fc3_present ? fc3_zero_points : fc1_zero_points, input_base,
+                linear_expert_row, chunk * 8,
+                fc3_present ? fc3_packed_in : fc1_packed_in,
+                fc3_present ? fc3_blocks : fc1_blocks,
+                fc3_present ? fc3_zero_point_bytes : fc1_zero_point_bytes);
+        }
+    } else {
+        for (int depth = (int)threadIdx.x;
+             depth < in_features;
+             depth += (int)blockDim.x) {
+            gate += qmoe_load(input, input_base + depth)
+                * decode_affine_weight<Bits, BlockSize, HasZeroPoints>(
+                    fc1_packed, fc1_scales, fc1_zero_points, expert,
+                    gate_feature, depth, fc1_out_features, fc1_packed_in, fc1_blocks,
+                    fc1_zero_point_bytes);
+            linear += qmoe_load(input, input_base + depth)
+                * decode_affine_weight<Bits, BlockSize, HasZeroPoints>(
+                    fc3_present ? fc3_packed : fc1_packed,
+                    fc3_present ? fc3_scales : fc1_scales,
+                    fc3_present ? fc3_zero_points : fc1_zero_points, expert,
+                    linear_feature, depth, fc3_present ? inter : fc1_out_features,
+                    fc3_present ? fc3_packed_in : fc1_packed_in,
+                    fc3_present ? fc3_blocks : fc1_blocks,
+                    fc3_present ? fc3_zero_point_bytes : fc1_zero_point_bytes);
+        }
+    }
+    gate = block_sum(gate);
+    __syncthreads();
+    linear = block_sum(linear);
+    if (threadIdx.x == 0) {
+        const unsigned long long bias_index =
+            (unsigned long long)expert * inter + feature;
+        if (fc1_bias) {
+            gate += fc1_bias[(unsigned long long)expert * fc1_out_features + gate_feature];
+        }
+        if (fc3_present && fc3_bias) {
+            linear += fc3_bias[bias_index];
+        } else if (!fc3_present && fc1_bias) {
+            linear += fc1_bias[(unsigned long long)expert * fc1_out_features + linear_feature];
+        }
+        activated[task] = swiglu_value(gate, linear, alpha, beta, swiglu_limit);
+    }
+}
+
+extern "C" __global__ void qmoe_gate_up_activate_f32(
+    const float* input,
+    const int* selected_experts,
+    const unsigned char* fc1_packed,
+    const float* fc1_scales,
+    const unsigned char* fc1_zero_points,
+    const float* fc1_bias,
+    const unsigned char* fc3_packed,
+    const float* fc3_scales,
+    const unsigned char* fc3_zero_points,
+    const float* fc3_bias,
+    float* activated,
+    const unsigned long long routes,
+    const int top_k,
+    const int inter,
+    const int fc1_out_features,
+    const int fc3_present,
+    const int swiglu_fusion,
+    const int in_features,
+    const int fc1_packed_in,
+    const int fc1_blocks,
+    const int fc1_zero_point_bytes,
+    const int fc3_packed_in,
+    const int fc3_blocks,
+    const int fc3_zero_point_bytes,
+    const float alpha,
+    const float beta,
+    const float swiglu_limit)
+{
+    qmoe_gate_up_activate_impl<float, QMOE_BITS, QMOE_BLOCK_SIZE, QMOE_HAS_ZERO_POINTS != 0>(
+        input, selected_experts, fc1_packed, fc1_scales, fc1_zero_points, fc1_bias,
+        fc3_packed, fc3_scales, fc3_zero_points, fc3_bias, activated, routes, top_k,
+        inter, fc1_out_features, fc3_present, swiglu_fusion, in_features,
+        fc1_packed_in, fc1_blocks, fc1_zero_point_bytes,
+        fc3_packed_in, fc3_blocks, fc3_zero_point_bytes, alpha, beta, swiglu_limit);
+}
+
+#ifdef QMOE_HAS_HALF
+extern "C" __global__ void qmoe_gate_up_activate_f16(
+    const __half* input,
+    const int* selected_experts,
+    const unsigned char* fc1_packed,
+    const float* fc1_scales,
+    const unsigned char* fc1_zero_points,
+    const float* fc1_bias,
+    const unsigned char* fc3_packed,
+    const float* fc3_scales,
+    const unsigned char* fc3_zero_points,
+    const float* fc3_bias,
+    float* activated,
+    const unsigned long long routes,
+    const int top_k,
+    const int inter,
+    const int fc1_out_features,
+    const int fc3_present,
+    const int swiglu_fusion,
+    const int in_features,
+    const int fc1_packed_in,
+    const int fc1_blocks,
+    const int fc1_zero_point_bytes,
+    const int fc3_packed_in,
+    const int fc3_blocks,
+    const int fc3_zero_point_bytes,
+    const float alpha,
+    const float beta,
+    const float swiglu_limit)
+{
+    qmoe_gate_up_activate_impl<__half, QMOE_BITS, QMOE_BLOCK_SIZE, QMOE_HAS_ZERO_POINTS != 0>(
+        input, selected_experts, fc1_packed, fc1_scales, fc1_zero_points, fc1_bias,
+        fc3_packed, fc3_scales, fc3_zero_points, fc3_bias, activated, routes, top_k,
+        inter, fc1_out_features, fc3_present, swiglu_fusion, in_features,
+        fc1_packed_in, fc1_blocks, fc1_zero_point_bytes,
+        fc3_packed_in, fc3_blocks, fc3_zero_point_bytes, alpha, beta, swiglu_limit);
+}
+
+extern "C" __global__ void qmoe_gate_up_activate_bf16(
+    const __nv_bfloat16* input,
+    const int* selected_experts,
+    const unsigned char* fc1_packed,
+    const float* fc1_scales,
+    const unsigned char* fc1_zero_points,
+    const float* fc1_bias,
+    const unsigned char* fc3_packed,
+    const float* fc3_scales,
+    const unsigned char* fc3_zero_points,
+    const float* fc3_bias,
+    float* activated,
+    const unsigned long long routes,
+    const int top_k,
+    const int inter,
+    const int fc1_out_features,
+    const int fc3_present,
+    const int swiglu_fusion,
+    const int in_features,
+    const int fc1_packed_in,
+    const int fc1_blocks,
+    const int fc1_zero_point_bytes,
+    const int fc3_packed_in,
+    const int fc3_blocks,
+    const int fc3_zero_point_bytes,
+    const float alpha,
+    const float beta,
+    const float swiglu_limit)
+{
+    qmoe_gate_up_activate_impl<__nv_bfloat16, QMOE_BITS, QMOE_BLOCK_SIZE, QMOE_HAS_ZERO_POINTS != 0>(
+        input, selected_experts, fc1_packed, fc1_scales, fc1_zero_points, fc1_bias,
+        fc3_packed, fc3_scales, fc3_zero_points, fc3_bias, activated, routes, top_k,
+        inter, fc1_out_features, fc3_present, swiglu_fusion, in_features,
+        fc1_packed_in, fc1_blocks, fc1_zero_point_bytes,
+        fc3_packed_in, fc3_blocks, fc3_zero_point_bytes, alpha, beta, swiglu_limit);
+}
+#endif
 
 template <typename Output>
 __device__ __forceinline__ void qmoe_store(
@@ -750,6 +1022,14 @@ impl FloatDtype {
             Self::F32 => LINEAR_F32_ENTRY,
             Self::F16 => LINEAR_F16_ENTRY,
             Self::Bf16 => LINEAR_BF16_ENTRY,
+        }
+    }
+
+    fn gate_up_activate_entry(self) -> &'static str {
+        match self {
+            Self::F32 => GATE_UP_ACTIVATE_F32_ENTRY,
+            Self::F16 => GATE_UP_ACTIVATE_F16_ENTRY,
+            Self::Bf16 => GATE_UP_ACTIVATE_BF16_ENTRY,
         }
     }
 
@@ -1066,14 +1346,7 @@ impl Kernel for QMoEKernel {
             &input_shape[..input_shape.len() - 1],
             "flattened input row count",
         )?;
-        require_rank("router_probs", inputs[1].shape, 2)?;
-        if inputs[1].shape[0] != rows {
-            return Err(error(format!(
-                "router_probs rows {} must equal flattened input rows {rows}",
-                inputs[1].shape[0]
-            )));
-        }
-        let experts = inputs[1].shape[1];
+        let experts = router_probs_experts(inputs[1].shape, rows)?;
         if self.attributes.k > experts {
             return Err(error(format!(
                 "requires 0 < k <= num_experts, got k={} and num_experts={experts}",
@@ -1206,6 +1479,16 @@ impl Kernel for QMoEKernel {
         let route_output_elements =
             checked_product(&[routes, hidden], "route output element count")?;
         let route_output_bytes = checked_bytes(route_output_elements, 4, "route output scratch")?;
+        let fused_gate_up_decode = rows == 1
+            && routes <= LINEAR_ONE_TASK_PER_BLOCK_MAX_ROUTES
+            && ((fc3.is_some()
+                && matches!(
+                    self.attributes.activation,
+                    Activation::Silu | Activation::Swiglu
+                ))
+                || (fc3.is_none()
+                    && self.attributes.activation == Activation::Swiglu
+                    && self.attributes.swiglu_fusion != 0));
         let grouping_sizes = (rows > 1)
             .then(|| {
                 let expert_entries = experts
@@ -1238,9 +1521,11 @@ impl Kernel for QMoEKernel {
             .map_err(|_| error("QMoE scratch pool mutex poisoned"))?;
         let route_indices = scratch.ensure(&self.runtime, 0, route_index_bytes, capturing)?;
         let route_weights = scratch.ensure(&self.runtime, 1, route_weight_bytes, capturing)?;
-        let fc1_output = scratch.ensure(&self.runtime, 2, fc1_bytes, capturing)?;
-        let fc3_output = fc3
-            .map(|_| scratch.ensure(&self.runtime, 3, activated_bytes, capturing))
+        let fc1_output = (!fused_gate_up_decode)
+            .then(|| scratch.ensure(&self.runtime, 2, fc1_bytes, capturing))
+            .transpose()?;
+        let fc3_output = (fc3.is_some() && !fused_gate_up_decode)
+            .then(|| scratch.ensure(&self.runtime, 3, activated_bytes, capturing))
             .transpose()?;
         let activated = scratch.ensure(&self.runtime, 4, activated_bytes, capturing)?;
         let route_output = scratch.ensure(&self.runtime, 5, route_output_bytes, capturing)?;
@@ -1277,6 +1562,7 @@ impl Kernel for QMoEKernel {
             experts,
         )?;
         if let Some(grouping) = grouping {
+            let fc1_output = fc1_output.expect("grouped QMoE keeps FC1 scratch");
             self.launch_grouping(route_indices, grouping, routes, experts)?;
             self.launch_gather(
                 dtype,
@@ -1333,29 +1619,43 @@ impl Kernel for QMoEKernel {
                 true,
             )?;
         } else {
-            self.launch_linear(
-                dtype,
-                tensor_ptr(&inputs[0]),
-                route_indices,
-                None,
-                fc1,
-                fc1_output,
-                routes,
-                false,
-            )?;
-            if let (Some(fc3), Some(fc3_output)) = (fc3, fc3_output) {
+            if fused_gate_up_decode {
+                self.launch_gate_up_activate(
+                    dtype,
+                    tensor_ptr(&inputs[0]),
+                    route_indices,
+                    fc1,
+                    fc3,
+                    activated,
+                    routes,
+                    inter,
+                )?;
+            } else {
+                let fc1_output = fc1_output.expect("unfused QMoE keeps FC1 scratch");
                 self.launch_linear(
                     dtype,
                     tensor_ptr(&inputs[0]),
                     route_indices,
                     None,
-                    fc3,
-                    fc3_output,
+                    fc1,
+                    fc1_output,
                     routes,
                     false,
                 )?;
+                if let (Some(fc3), Some(fc3_output)) = (fc3, fc3_output) {
+                    self.launch_linear(
+                        dtype,
+                        tensor_ptr(&inputs[0]),
+                        route_indices,
+                        None,
+                        fc3,
+                        fc3_output,
+                        routes,
+                        false,
+                    )?;
+                }
+                self.launch_activation(fc1_output, fc3_output, activated, routes, inter)?;
             }
-            self.launch_activation(fc1_output, fc3_output, activated, routes, inter)?;
             self.launch_linear(
                 FloatDtype::F32,
                 activated,
@@ -1419,7 +1719,7 @@ impl QMoEKernel {
         let experts = as_i32("expert count", experts)?;
         let top_k = as_i32("top-k", self.attributes.k)?;
         let normalize = i32::from(self.attributes.normalize_routing_weights);
-        let config = self.pointwise_launch_config(rows)?;
+        let config = self.route_launch_config(rows, experts)?;
         let mut builder = self.runtime.stream().launch_builder(&function);
         builder
             .arg(&router_probs)
@@ -1678,7 +1978,7 @@ impl QMoEKernel {
         let zero_points = weights.zero_points.map(tensor_ptr).unwrap_or(0);
         let bias = weights.bias.map(tensor_ptr).unwrap_or(0);
         let tasks = checked_product(&[routes, weights.out_features], "linear output task count")?;
-        let grid_x = self.reduction_grid(tasks)?;
+        let grid_x = self.linear_reduction_grid(tasks, routes)?;
         let config = self.runtime.reduction_launch_config(
             &function,
             grid_x,
@@ -1721,6 +2021,135 @@ impl QMoEKernel {
         unsafe { builder.launch(config) }
             .map(|_| ())
             .map_err(|err| driver_err("launch QMoE block-dequant expert GEMV", err))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gate_up_activate(
+        &self,
+        dtype: FloatDtype,
+        input_ptr: CUdeviceptr,
+        route_indices: CUdeviceptr,
+        fc1: QuantizedExperts<'_>,
+        fc3: Option<QuantizedExperts<'_>>,
+        activated: CUdeviceptr,
+        routes: usize,
+        inter: usize,
+    ) -> Result<()> {
+        if let Some(fc3) = fc3 {
+            if fc1.in_features != fc3.in_features
+                || fc1.out_features != inter
+                || fc3.out_features != inter
+                || fc1.packed_in != fc3.packed_in
+                || fc1.blocks != fc3.blocks
+                || fc1.zero_point_bytes != fc3.zero_point_bytes
+                || fc1.zero_points.is_some() != fc3.zero_points.is_some()
+            {
+                return Err(error(
+                    "fused QMoE gate/up activation requires matching FC1/FC3 expert layouts",
+                ));
+            }
+        } else if self.attributes.activation != Activation::Swiglu
+            || self.attributes.swiglu_fusion == 0
+            || fc1.out_features
+                != inter
+                    .checked_mul(2)
+                    .ok_or_else(|| error("fused SwiGLU FC1 width exceeds usize limits"))?
+        {
+            return Err(error(
+                "fused QMoE gate/up activation without FC3 requires fused SwiGLU FC1",
+            ));
+        }
+        let layout = QuantLayout {
+            bits: self.bits,
+            block_size: self.block_size,
+            has_zero_points: fc1.zero_points.is_some(),
+        };
+        let (module, source) = linear_module_source(layout);
+        let function =
+            self.runtime
+                .nvrtc_function(module, source, dtype.gate_up_activate_entry())?;
+        let tasks = checked_product(&[routes, inter], "fused gate/up activation task count")?;
+        let grid_x = self.linear_reduction_grid(tasks, routes)?;
+        let config = self.runtime.reduction_launch_config(
+            &function,
+            grid_x,
+            self.preferred_reduction_threads(),
+            std::mem::size_of::<f32>() as u32,
+        )?;
+        let fc1_packed = tensor_ptr(fc1.packed);
+        let fc1_scales = tensor_ptr(fc1.scales);
+        let fc1_zero_points = fc1.zero_points.map(tensor_ptr).unwrap_or(0);
+        let fc1_bias = fc1.bias.map(tensor_ptr).unwrap_or(0);
+        let fc3_packed = fc3.map(|weights| tensor_ptr(weights.packed)).unwrap_or(0);
+        let fc3_scales = fc3.map(|weights| tensor_ptr(weights.scales)).unwrap_or(0);
+        let fc3_zero_points = fc3
+            .and_then(|weights| weights.zero_points.map(tensor_ptr))
+            .unwrap_or(0);
+        let fc3_bias = fc3
+            .and_then(|weights| weights.bias.map(tensor_ptr))
+            .unwrap_or(0);
+        let routes = as_u64("route count", routes)?;
+        let top_k = as_i32("top-k", self.attributes.k)?;
+        let inter = as_i32("intermediate feature count", inter)?;
+        let fc1_out_features = as_i32("FC1 output feature count", fc1.out_features)?;
+        let fc3_present = i32::from(fc3.is_some());
+        let swiglu_fusion = as_i32("swiglu_fusion", self.attributes.swiglu_fusion)?;
+        let in_features = as_i32("input feature count", fc1.in_features)?;
+        let packed_in = as_i32("packed input width", fc1.packed_in)?;
+        let blocks = as_i32("block count", fc1.blocks)?;
+        let zero_point_bytes = as_i32("zero-point row byte count", fc1.zero_point_bytes)?;
+        let fc3_packed_in = as_i32(
+            "FC3 packed input width",
+            fc3.map(|weights| weights.packed_in)
+                .unwrap_or(fc1.packed_in),
+        )?;
+        let fc3_blocks = as_i32(
+            "FC3 block count",
+            fc3.map(|weights| weights.blocks).unwrap_or(fc1.blocks),
+        )?;
+        let fc3_zero_point_bytes = as_i32(
+            "FC3 zero-point row byte count",
+            fc3.map(|weights| weights.zero_point_bytes)
+                .unwrap_or(fc1.zero_point_bytes),
+        )?;
+        let alpha = self.attributes.activation_alpha;
+        let beta = self.attributes.activation_beta;
+        let limit = self.attributes.swiglu_limit;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&input_ptr)
+            .arg(&route_indices)
+            .arg(&fc1_packed)
+            .arg(&fc1_scales)
+            .arg(&fc1_zero_points)
+            .arg(&fc1_bias)
+            .arg(&fc3_packed)
+            .arg(&fc3_scales)
+            .arg(&fc3_zero_points)
+            .arg(&fc3_bias)
+            .arg(&activated)
+            .arg(&routes)
+            .arg(&top_k)
+            .arg(&inter)
+            .arg(&fc1_out_features)
+            .arg(&fc3_present)
+            .arg(&swiglu_fusion)
+            .arg(&in_features)
+            .arg(&packed_in)
+            .arg(&blocks)
+            .arg(&zero_point_bytes)
+            .arg(&fc3_packed_in)
+            .arg(&fc3_blocks)
+            .arg(&fc3_zero_point_bytes)
+            .arg(&alpha)
+            .arg(&beta)
+            .arg(&limit);
+        // SAFETY: FC1/FC3 expert tensors share the validated QMoE quantized
+        // layout, `activated` covers every routed intermediate, and the ABI
+        // matches `qmoe_gate_up_activate_*`.
+        unsafe { builder.launch(config) }
+            .map(|_| ())
+            .map_err(|err| driver_err("launch fused QMoE gate/up activation", err))
     }
 
     fn launch_activation(
@@ -1817,6 +2246,54 @@ impl QMoEKernel {
             .min(saturation.max(1))
             .min(u64::from(u32::MAX));
         u32::try_from(grid).map_err(|_| error("reduction grid exceeds CUDA limits"))
+    }
+
+    fn linear_reduction_grid(&self, tasks: usize, routes: usize) -> Result<u32> {
+        if tasks == 0 {
+            return Ok(1);
+        }
+        if routes <= LINEAR_ONE_TASK_PER_BLOCK_MAX_ROUTES {
+            return u32::try_from(tasks).map_err(|_| error("linear task count exceeds CUDA grid"));
+        }
+        self.reduction_grid(tasks)
+    }
+
+    /// Launch geometry for `qmoe_route`: one block per row (grid-strided),
+    /// with a power-of-two block so the block-wide argmax tree reduction is
+    /// exact, plus dynamic shared memory for the row's logits, the picked
+    /// mask, and the reduction scratch. This cooperatively parallelizes the
+    /// per-row top-k selection — at decode (rows=1) the whole block works one
+    /// row instead of a single thread.
+    fn route_launch_config(&self, rows: u64, experts: i32) -> Result<LaunchConfig> {
+        let capabilities = self.runtime.capabilities();
+        let preferred = if capabilities.compute_capability().0 >= 7 {
+            256
+        } else {
+            128
+        };
+        let capped = preferred.min(capabilities.max_threads_per_block()).max(1);
+        // Floor to a power of two for the tree reduction.
+        let block = 1u32 << (31 - capped.leading_zeros());
+        let saturation = u64::from(capabilities.multiprocessor_count()).saturating_mul(32);
+        let grid_x = rows.min(saturation.max(1)).min(u64::from(u32::MAX)).max(1);
+        let experts = usize::try_from(experts).map_err(|_| error("negative expert count"))?;
+        let shared_ints = experts
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(2 * block as usize))
+            .ok_or_else(|| error("QMoE routing shared memory exceeds usize limits"))?;
+        let shared_mem_bytes = shared_ints
+            .checked_mul(std::mem::size_of::<i32>())
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or_else(|| error("QMoE routing shared memory exceeds CUDA limits"))?;
+        Ok(LaunchConfig {
+            grid_dim: (
+                u32::try_from(grid_x).map_err(|_| error("route grid exceeds CUDA limits"))?,
+                1,
+                1,
+            ),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes,
+        })
     }
 
     fn pointwise_launch_config(&self, total: u64) -> Result<LaunchConfig> {
@@ -1971,6 +2448,29 @@ fn require_rank(name: &str, shape: &[usize], rank: usize) -> Result<()> {
     Ok(())
 }
 
+/// Validates `router_probs` shape against the flattened input `rows` and returns
+/// the trailing `num_experts` dimension.
+///
+/// `router_probs` mirrors the `input` handling: any rank is accepted as long as
+/// the final dimension is `num_experts` and the leading dimensions multiply to
+/// the flattened token count `rows`. This treats the tensor as a row-major
+/// `[rows, num_experts]` buffer, matching the device route kernel and ORT's QMoE
+/// semantics where `num_rows` is the flattened token count. It is byte-identical
+/// to the previous 2-D `[rows, num_experts]` contract while additionally
+/// accepting 3-D `[batch, sequence, num_experts]` decode inputs.
+fn router_probs_experts(shape: &[usize], rows: usize) -> Result<usize> {
+    let (&experts, leading) = shape.split_last().ok_or_else(|| {
+        error("router_probs must have at least rank 1 ending in num_experts, got shape []")
+    })?;
+    let router_rows = checked_product(leading, "flattened router_probs row count")?;
+    if router_rows != rows {
+        return Err(error(format!(
+            "router_probs rows {router_rows} (from shape {shape:?}) must equal flattened input rows {rows}"
+        )));
+    }
+    Ok(experts)
+}
+
 fn require_shape(name: &str, got: &[usize], expected: &[usize]) -> Result<()> {
     if got != expected {
         return Err(error(format!(
@@ -2095,6 +2595,53 @@ mod tests {
             ]);
             assert!(unsupported_reason(&unsupported).is_some(), "{quant_type}");
         }
+    }
+
+    #[test]
+    fn router_probs_accepts_two_dimensional_prefill_shape() {
+        // Byte-identical to the previous rank-2 [rows, num_experts] contract.
+        assert_eq!(router_probs_experts(&[4, 256], 4).unwrap(), 256);
+        assert_eq!(router_probs_experts(&[1, 256], 1).unwrap(), 256);
+    }
+
+    #[test]
+    fn router_probs_accepts_three_dimensional_decode_shape() {
+        // Qwen3.6-35B-A3B QMoE fusion emits [batch, sequence, num_experts] for a
+        // decode step; the leading dims flatten to the single input row.
+        assert_eq!(router_probs_experts(&[1, 1, 256], 1).unwrap(), 256);
+        // A multi-token prefill window [batch, sequence, num_experts] flattens to
+        // batch * sequence rows.
+        assert_eq!(router_probs_experts(&[2, 3, 256], 6).unwrap(), 256);
+    }
+
+    #[test]
+    fn router_probs_rejects_row_count_mismatch() {
+        let error = router_probs_experts(&[2, 256], 1).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("router_probs rows 2"), "{message}");
+        assert!(message.contains("flattened input rows 1"), "{message}");
+
+        let error = router_probs_experts(&[1, 1, 256], 2).unwrap_err();
+        assert!(
+            error.to_string().contains("flattened input rows 2"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn router_probs_reports_trailing_experts_for_k_bound_check() {
+        // The trailing dimension is the num_experts value the caller compares
+        // against top-k, so a too-small last dim is caught as k > num_experts.
+        let experts = router_probs_experts(&[1, 1, 4], 1).unwrap();
+        assert_eq!(experts, 4);
+        let k = 8usize;
+        assert!(k > experts, "k must exceed a smaller trailing experts dim");
+    }
+
+    #[test]
+    fn router_probs_rejects_rank_zero_shape() {
+        let error = router_probs_experts(&[], 1).unwrap_err();
+        assert!(error.to_string().contains("at least rank 1"), "{error}");
     }
 
     #[test]

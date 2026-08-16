@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 use half::f16;
 use onnx_runtime_ep_api::{
     CaptureSupport, DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, Kernel, KernelMatch,
@@ -26,13 +40,15 @@ fn typed_bytes<T: Copy>(values: &[T]) -> &[u8] {
     }
 }
 
-fn gpu() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -193,9 +209,13 @@ fn cpu_reference(query: &[f32], key: &[f16], value: &[f16]) -> Vec<f32> {
     output
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn claim_accepts_fp16_zero_append_shared_cache_decode() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let (graph, node, shapes, dtypes) = gqa_node();
     assert!(
         matches!(
@@ -206,9 +226,13 @@ fn claim_accepts_fp16_zero_append_shared_cache_decode() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fp16_zero_append_shared_cache_matches_cpu_and_replays() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let kernel = GroupQueryAttentionKernel::new(
         runtime.clone(),

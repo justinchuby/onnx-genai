@@ -1,8 +1,22 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU-vs-CPU checks for floating pointwise dtype and broadcasting coverage.
 
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
-    DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
+    CaptureSupport, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
@@ -298,23 +312,25 @@ fn assert_close(got: &[f32], expected: &[f32], tolerance: f32) {
     }
 }
 
-fn cuda_ep() -> Option<CudaExecutionProvider> {
+fn require_cuda() -> CudaExecutionProvider {
     match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
-        Ok(Ok(ep)) => Some(ep),
-        Ok(Err(error)) => {
-            eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            None
-        }
-        Err(_) => {
-            eprintln!("skip: CUDA runtime library loading panicked");
-            None
-        }
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn f16_bf16_arithmetic_matches_cpu_compute_domain() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let a = [-3.0, -1.5, 0.5, 2.0, 5.0, 8.0];
     let b = [0.5, 2.0, -4.0, 0.25, 2.0, -2.0];
     for dtype in [DataType::Float16, DataType::BFloat16] {
@@ -344,9 +360,13 @@ fn f16_bf16_arithmetic_matches_cpu_compute_domain() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn f16_bf16_numpy_broadcast_matches_cpu_reference() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let a = (0..12).map(|i| i as f32 * 0.25 - 1.0).collect::<Vec<_>>();
     let b = (0..15).map(|i| i as f32 * 0.1 + 0.5).collect::<Vec<_>>();
     for dtype in [DataType::Float16, DataType::BFloat16] {
@@ -378,9 +398,13 @@ fn f16_bf16_numpy_broadcast_matches_cpu_reference() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn half_unary_and_activation_families_match_cpu_reference() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let x = [-3.0, -1.0, -0.0, 0.5, 2.0];
     for dtype in [DataType::Float16, DataType::BFloat16] {
         let xq = quantize(&x, dtype);
@@ -406,9 +430,13 @@ fn half_unary_and_activation_families_match_cpu_reference() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn logical_family_numpy_broadcast_matches_cpu_reference() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let a = [0_u8, 1];
     let b = [0_u8, 1, 1];
     let expected = [
@@ -425,9 +453,13 @@ fn logical_family_numpy_broadcast_matches_cpu_reference() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn comparison_family_numpy_broadcast_matches_cpu_reference() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let a = [1.0_f32, 3.0];
     let b = [2.0_f32, 3.0, 4.0];
     let a_bytes =
@@ -490,16 +522,24 @@ where
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn integer_comparisons_broadcast_match_cpu_oracle() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     assert_integer_comparisons(&ep, DataType::Int64, &[1_i64, 3], &[2_i64, 3, 4]);
     assert_integer_comparisons(&ep, DataType::Int32, &[1_i32, 3], &[2_i32, 3, 4]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn integer_comparisons_cover_glm_like_masks_and_are_deterministic() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let position_ids = [-2_i64, -1, 0, 1, 2, 3];
     let zero = [0_i64];
     let expected = cpu_predicate(&position_ids, &[2, 3], &zero, &[], &[2, 3], |a, b| a >= b);
@@ -550,9 +590,13 @@ fn integer_comparisons_cover_glm_like_masks_and_are_deterministic() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn comparison_claims_integer_dtypes_and_rejects_unsupported_dtype() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let node = Node::new(NodeId(0), "Equal", vec![], vec![]);
     let shapes = [static_shape([2]), static_shape([2])];
     for dtype in [DataType::Int64, DataType::Int32] {
@@ -574,9 +618,13 @@ fn comparison_claims_integer_dtypes_and_rejects_unsupported_dtype() {
     ));
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn binary_fixed_decode_shape_captures_replays_and_gates_other_paths() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let device = ep.device_id();
     let decode_shape = [1, 1, 4];
@@ -799,6 +847,146 @@ fn binary_fixed_decode_shape_captures_replays_and_gates_other_paths() {
     ep.deallocate(i64_a).unwrap();
     ep.deallocate(i64_b).unwrap();
     ep.deallocate(i64_y).unwrap();
+    ep.deallocate(a_buf).unwrap();
+    ep.deallocate(b_buf).unwrap();
+    ep.deallocate(y_buf).unwrap();
+}
+
+/// C1: a fully-static (sequence-independent) shape whose leading dims do **not**
+/// collapse to 1 — e.g. a head-major `[heads=32, feat=128]` decode tensor — is
+/// rejected by the runtime-extent heuristic (`is_fixed_decode_shape`) but must be
+/// admitted to capture once the executor reports the node's IR output shape is
+/// fully static via `set_capture_seq_independent(true)`. The same shape with the
+/// flag left `false` (as the executor does for a symbolic/growing seq axis) must
+/// stay eager. This is the metadata-driven gate that distinguishes
+/// `[heads=32, feat=128]` (capturable) from `[tokens=32, feat=128]` (unsafe),
+/// which runtime extents alone cannot — with no per-model hardcoding.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn seq_independent_static_shape_is_capture_eligible_via_metadata_flag() {
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+
+    // Fully static, but leading dims are 32 (do not collapse to 1): the
+    // runtime-extent heuristic alone rejects this shape for capture.
+    let shape = [32_usize, 128];
+    let bias_shape = [128_usize];
+    let strides = compute_contiguous_strides(&shape);
+    let bias_strides = compute_contiguous_strides(&bias_shape);
+    let n: usize = shape.iter().product();
+    let a_values = vec![1.0_f32; n];
+    let b_values = vec![0.5_f32; bias_shape[0]];
+
+    let a_buf = ep.allocate(n * 4, 256).unwrap();
+    let b_buf = ep.allocate(bias_shape[0] * 4, 256).unwrap();
+    let mut y_buf = ep.allocate(n * 4, 256).unwrap();
+    unsafe {
+        runtime
+            .htod(bytes(&a_values), cuptr(a_buf.as_ptr()))
+            .unwrap();
+        runtime
+            .htod(bytes(&b_values), cuptr(b_buf.as_ptr()))
+            .unwrap();
+    }
+    let inputs = [
+        TensorView::new(
+            DevicePtr(a_buf.as_ptr()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            device,
+        ),
+        TensorView::new(
+            DevicePtr(b_buf.as_ptr()),
+            DataType::Float32,
+            &bias_shape,
+            &bias_strides,
+            device,
+        ),
+    ];
+
+    // Flag left false (executor default for a symbolic/growing seq axis): the
+    // static-but-non-collapsing shape must NOT become capture-eligible.
+    let eager_kernel = ep
+        .get_kernel(&Node::new(NodeId(0), "Add", vec![], vec![]), &[], 17)
+        .unwrap();
+    let output = TensorMut::new(
+        DevicePtrMut(y_buf.as_mut_ptr()),
+        DataType::Float32,
+        &shape,
+        &strides,
+        device,
+    );
+    eager_kernel.execute(&inputs, &mut [output]).unwrap();
+    assert!(
+        matches!(
+            eager_kernel.capture_support(),
+            CaptureSupport::Unsupported { .. }
+        ),
+        "static [32,128] must stay eager without the seq-independent metadata flag"
+    );
+
+    // Flag true (executor derived all output dims are Dim::Static): the same shape
+    // is now capture-eligible and a captured replay reproduces the eager result.
+    let mut capture_kernel = ep
+        .get_kernel(&Node::new(NodeId(0), "Add", vec![], vec![]), &[], 17)
+        .unwrap();
+    capture_kernel.set_capture_seq_independent(true);
+    let output = TensorMut::new(
+        DevicePtrMut(y_buf.as_mut_ptr()),
+        DataType::Float32,
+        &shape,
+        &strides,
+        device,
+    );
+    capture_kernel.execute(&inputs, &mut [output]).unwrap();
+    assert_eq!(
+        capture_kernel.capture_support(),
+        CaptureSupport::Supported,
+        "static [32,128] must be capture-eligible once flagged seq-independent"
+    );
+
+    let mut eager_bytes = vec![0_u8; n * 4];
+    unsafe {
+        runtime
+            .dtoh(&mut eager_bytes, cuptr(y_buf.as_ptr()))
+            .unwrap();
+    }
+    let eager = eager_bytes
+        .chunks_exact(4)
+        .map(|v| f32::from_ne_bytes(v.try_into().unwrap()))
+        .collect::<Vec<_>>();
+
+    runtime
+        .begin_graph_capture(&[capture_kernel.as_ref()])
+        .unwrap();
+    let output = TensorMut::new(
+        DevicePtrMut(y_buf.as_mut_ptr()),
+        DataType::Float32,
+        &shape,
+        &strides,
+        device,
+    );
+    capture_kernel.execute(&inputs, &mut [output]).unwrap();
+    runtime.end_graph_capture().unwrap();
+    runtime.replay_graph().unwrap();
+    let mut replay_bytes = vec![0_u8; n * 4];
+    unsafe {
+        runtime
+            .dtoh(&mut replay_bytes, cuptr(y_buf.as_ptr()))
+            .unwrap();
+    }
+    let replay = replay_bytes
+        .chunks_exact(4)
+        .map(|v| f32::from_ne_bytes(v.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(replay, eager, "captured replay must match the eager result");
+    assert!(runtime.reset_graph().unwrap());
+
     ep.deallocate(a_buf).unwrap();
     ep.deallocate(b_buf).unwrap();
     ep.deallocate(y_buf).unwrap();

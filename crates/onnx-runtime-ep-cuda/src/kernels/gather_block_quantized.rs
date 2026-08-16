@@ -97,7 +97,12 @@ extern "C" __global__ void gather_block_quantized(
     const long long block_id = in_idx / block_size;
 
     const int weight = gbq_get_val(data, in_idx, bits, elems_per_byte, mask);
-    int offset = 0;
+    // When the optional zero_points input is absent, ONNX Runtime / the CPU
+    // reference dequantize against the symmetric midpoint `1 << (bits - 1)`
+    // (e.g. 8 for int4), NOT zero. Leaving offset=0 here mis-dequantizes any
+    // table packed without explicit zero points (GGUF-style embeddings), which
+    // is what produced empty / non-finite CUDA output on converted models.
+    int offset = 1 << (bits - 1);
     if (zero_points) {
       offset = gbq_get_val(zero_points, block_id, bits, elems_per_byte, mask);
     }
@@ -661,7 +666,7 @@ mod tests {
         }
 
         // Zero points share the packed layout (one code per block, `components`
-        // per byte). Default offset 0 when absent.
+        // per byte). Absent ⇒ symmetric midpoint `1 << (bits-1)`.
         let mut zp_codes = vec![0u8; block_count];
         let zp_bytes = block_count.div_ceil(components);
         let mut zero_points = vec![0u8; zp_bytes];
@@ -672,7 +677,14 @@ mod tests {
                 *byte |= (*z) << ((i % components) * bits as usize);
             }
         }
-        let zp_ref = |block: usize| -> i32 { if with_zp { zp_codes[block] as i32 } else { 0 } };
+        let zp_ref = |block: usize| -> i32 {
+            if with_zp {
+                zp_codes[block] as i32
+            } else {
+                // Absent zero_points ⇒ symmetric midpoint, matching CPU/ORT.
+                1i32 << (bits - 1)
+            }
+        };
 
         let mut scale_f32 = vec![0.0f32; block_count];
         let mut scale_f16 = vec![f16::ZERO; block_count];
@@ -843,10 +855,10 @@ mod tests {
         // (bits, block_size, scales_fp16, with_zp)
         for (bits, block_size, scales_fp16, with_zp) in [
             (8, 128, false, true),  // Foundry Qwen3-0.6B embedding (fp32 out, uint8 zp)
-            (8, 128, false, false), // symmetric (offset 0) int8
+            (8, 128, false, false), // symmetric (midpoint zp) int8
             (8, 64, true, true),    // int8, narrower block, fp16 output
             (4, 128, true, true),   // packed int4, fp16 output, asymmetric zp
-            (4, 32, false, false),  // packed int4, fp32 output, symmetric
+            (4, 32, false, false),  // packed int4, fp32 output, symmetric (midpoint zp)
         ] {
             let worst = run_gather_parity(bits, block_size, scales_fp16, with_zp);
             eprintln!(
@@ -860,5 +872,20 @@ mod tests {
                  worst_abs={worst:.3e}"
             );
         }
+    }
+
+    #[test]
+    fn gather_block_quantized_source_uses_symmetric_default_zero_point() {
+        // Guards the #702 fix: when zero_points is absent the device kernel must
+        // dequantize against the symmetric midpoint `1 << (bits - 1)` (matching
+        // the CPU reference), never leave offset at 0. This runs without a GPU.
+        assert!(
+            SOURCE.contains("int offset = 1 << (bits - 1);"),
+            "kernel must default to symmetric midpoint zero-point when absent"
+        );
+        assert!(
+            !SOURCE.contains("int offset = 0;"),
+            "kernel must not default the dequant offset to 0 when zero_points is absent"
+        );
     }
 }

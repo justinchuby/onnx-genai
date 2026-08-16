@@ -41,11 +41,11 @@ end-to-end throughput         27.46 tok/s
 inter-token latency      mean 31.2 / p50 24.5 / p90 26.9 / p99 45.8 / max 1208.9 ms
 finish reason            MaxTokens
 peak resident memory        4.9 GiB
-kv cache budget             5.4 GiB (5746063200 tokens)
+kv cache budget             5.4 GiB (233792 tokens)
 device memory breakdown:
   model weights             1.8 GiB   25.7%
   kv cache                  5.4 GiB   74.3%
-  kv pages                359128950 x 16 B
+  kv pages                14612 x 393242 B
   (activations and runtime overhead not yet measured by the engine)
 
 per-stage breakdown:

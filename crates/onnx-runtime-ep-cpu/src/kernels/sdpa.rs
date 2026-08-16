@@ -164,6 +164,12 @@ pub struct SdpaConfig {
 /// every adapter hook here holds only shared `&[f32]`/scalars, so it is `Sync`.
 pub trait AttnBias: Sync {
     fn at(&self, b: usize, head: usize, i: usize, j: usize) -> f32;
+
+    /// `true` when [`AttnBias::at`] returns `0.0` for every index, letting the
+    /// fast paths drop the per-element virtual call entirely.
+    fn is_identity(&self) -> bool {
+        false
+    }
 }
 
 /// Per-`(batch, query, key)` additive key mask (head-independent, as in ORT's
@@ -171,6 +177,12 @@ pub trait AttnBias: Sync {
 /// mask it.
 pub trait KeyMask: Sync {
     fn at(&self, b: usize, i: usize, j: usize) -> f32;
+
+    /// `true` when [`KeyMask::at`] returns `0.0` for every index, letting the
+    /// fast paths drop the per-element virtual call entirely.
+    fn is_identity(&self) -> bool {
+        false
+    }
 }
 
 /// No-op attention bias (contributes `0.0` everywhere).
@@ -180,6 +192,11 @@ impl AttnBias for NoBias {
     fn at(&self, _b: usize, _head: usize, _i: usize, _j: usize) -> f32 {
         0.0
     }
+
+    #[inline]
+    fn is_identity(&self) -> bool {
+        true
+    }
 }
 
 /// No-op key mask (keeps every key).
@@ -188,6 +205,11 @@ impl KeyMask for NoMask {
     #[inline]
     fn at(&self, _b: usize, _i: usize, _j: usize) -> f32 {
         0.0
+    }
+
+    #[inline]
+    fn is_identity(&self) -> bool {
+        true
     }
 }
 
@@ -245,8 +267,11 @@ pub struct QkCapture<'a> {
     pub stage: QkCaptureStage,
 }
 
-#[cfg(all(test, target_arch = "aarch64"))]
-static SDPA_NEON_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+))]
+static SDPA_SIMD_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Test counter: incremented when the Accelerate (cblas_sgemm/AMX) SDPA fast
 /// path fires on macOS/iOS.
@@ -343,19 +368,25 @@ pub fn sdpa_f32(
             if t.q_seq == 1 && per_head_elements <= 8192 {
                 #[cfg(all(test, target_arch = "aarch64"))]
                 SDPA_NEON_DECODE_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                sdpa_f32_neon(t, cfg, bias, mask, y);
+                sdpa_f32_simd(t, cfg, bias, mask, y);
                 return;
             }
             sdpa_f32_accelerate(t, cfg, bias, mask, y);
             return;
         }
     }
-    // NEON-vectorized path for aarch64: uses dot_f32 and axpy_f32 which
-    // dispatch to 4×-unrolled NEON intrinsics. Same semantics as the scalar
-    // reference, just faster inner loops.
+    // SIMD path: same semantics as the scalar reference, but `dot_f32` and
+    // `axpy_f32` use 4×-unrolled NEON on aarch64 and AVX2+FMA on x86. A
+    // `QkCapture` still goes to the scalar reference so captured logits stay
+    // bit-identical to the oracle the goldens pin.
     #[cfg(target_arch = "aarch64")]
     if qk.is_none() {
-        sdpa_f32_neon(t, cfg, bias, mask, y);
+        sdpa_f32_simd(t, cfg, bias, mask, y);
+        return;
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if qk.is_none() && crate::backend::has_simd_x86() {
+        sdpa_f32_simd(t, cfg, bias, mask, y);
         return;
     }
     sdpa_f32_scalar(t, cfg, bias, mask, y, qk);
@@ -460,6 +491,152 @@ pub fn sdpa_decode_row_accessor<'a>(
         }
         axpy_f32(output, probability, v_row(ks));
     }
+}
+
+/// Run **every query head that shares one KV head** against that head's KV
+/// window `[lo, hi)` in a single streaming pass — the GQA/MQA decode analogue of
+/// [`sdpa_decode_row`].
+///
+/// # Why this exists
+///
+/// `sdpa_decode_row` scores one query row against the whole KV window. Calling
+/// it once per query head means the *same* K and V bytes are streamed
+/// `group = num_heads / kv_num_heads` times per decode step. At M=1 decode the
+/// window is a GEMV — arithmetic intensity is ~2 flops per loaded float — so
+/// that repeat traffic is the cost: a 7-way group (Qwen2.5-0.5B: 14 query heads
+/// over 2 KV heads) reads the KV cache seven times per layer per token.
+///
+/// This routine keeps `k_row(ks)` / `v_row(ks)` in registers/L1 for the whole
+/// group, so the KV cache is streamed **once** per group instead of once per
+/// query head. Arithmetic is unchanged; only the loop nesting is inverted.
+///
+/// # Bit-identity contract
+///
+/// For query head `g` the operations are, in order, exactly those
+/// [`sdpa_decode_row`] performs for that head:
+///
+/// * the score for key `ks` is `dot_f32(q_g, k_row(ks)) * scale` with the same
+///   optional softcap, evaluated with the same [`dot_f32`] accumulation order;
+/// * the max / `exp` / sum / normalize sequence runs over that head's own score
+///   slice, in ascending `ks` order;
+/// * the value reduction accumulates `axpy_f32(out_g, p, v_row(ks))` in
+///   ascending `ks` order, skipping `p == 0.0` exactly as the row path does.
+///
+/// Nothing is summed across heads, so inverting the loop nesting cannot change
+/// any rounding. The output is **bit-for-bit identical** to `group` successive
+/// [`sdpa_decode_row`] calls; `group_decode_matches_row_decode_bitwise` pins it.
+///
+/// # Layout
+///
+/// `q` holds the group's query rows back to back (`group * head_size` floats,
+/// query head `g` at `g * head_size`) and `out` the group's output rows
+/// (`group * v_head_size` floats). That is exactly the `BHSD` layout of a
+/// `q_seq == 1` decode step, so the caller passes sub-slices with no copy.
+///
+/// `scores` is caller-owned scratch, resized to `group * (hi - lo)`; passing the
+/// same buffer across calls keeps the per-call allocation out of the hot loop.
+///
+/// # Blocking
+///
+/// Both passes walk the KV window in tiles of [`group_kv_tile`] keys. Within a
+/// tile the group loop is *outside* the key loop, so each query head writes (and
+/// later reads) a contiguous run of scores rather than striding by `window`, and
+/// the tile's K/V rows stay L1-resident across the whole group. Tiling only
+/// reorders work between independent query heads, so the bit-identity contract
+/// above is unaffected.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_group(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    kv_seq: usize,
+    group: usize,
+    head_size: usize,
+    v_head_size: usize,
+    lo: usize,
+    hi: usize,
+    scale: f32,
+    softcap: Option<f32>,
+    exp: SoftmaxExp,
+    out: &mut [f32],
+    scores: &mut Vec<f32>,
+) {
+    debug_assert!(group >= 1);
+    debug_assert!(lo <= hi && hi <= kv_seq);
+    debug_assert_eq!(q.len(), group * head_size);
+    debug_assert_eq!(out.len(), group * v_head_size);
+    debug_assert_eq!(k.len(), kv_seq * head_size);
+    debug_assert_eq!(v.len(), kv_seq * v_head_size);
+
+    let window = hi - lo;
+    scores.clear();
+    scores.resize(group * window, 0.0);
+
+    // QK^T: stream each key tile once, score it against all `group` query rows
+    // while the tile is still in L1.
+    let k_tile = group_kv_tile(head_size);
+    for tile in (0..window).step_by(k_tile) {
+        let tile_end = (tile + k_tile).min(window);
+        for g in 0..group {
+            let q_row = &q[g * head_size..(g + 1) * head_size];
+            let dst = &mut scores[g * window + tile..g * window + tile_end];
+            for (slot, ks) in (lo + tile..lo + tile_end).enumerate() {
+                let k_base = ks * head_size;
+                let mut score = dot_f32(q_row, &k[k_base..k_base + head_size]);
+                score *= scale;
+                if let Some(softcap) = softcap {
+                    score = softcap * (score / softcap).tanh();
+                }
+                dst[slot] = score;
+            }
+        }
+    }
+
+    // Softmax per query head, over that head's own contiguous score slice.
+    for g in 0..group {
+        let row = &mut scores[g * window..(g + 1) * window];
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for score in row.iter_mut() {
+            *score = exp.exp(*score - max);
+            sum += *score;
+        }
+        if sum > 0.0 {
+            for score in row.iter_mut() {
+                *score /= sum;
+            }
+        }
+    }
+
+    // P·V: stream each value tile once, accumulating into all `group` outputs
+    // while the tile is still in L1.
+    out.fill(0.0);
+    let v_tile = group_kv_tile(v_head_size);
+    for tile in (0..window).step_by(v_tile) {
+        let tile_end = (tile + v_tile).min(window);
+        for g in 0..group {
+            let probabilities = &scores[g * window + tile..g * window + tile_end];
+            let output = &mut out[g * v_head_size..(g + 1) * v_head_size];
+            for (slot, ks) in (lo + tile..lo + tile_end).enumerate() {
+                let probability = probabilities[slot];
+                if probability == 0.0 {
+                    continue;
+                }
+                let v_base = ks * v_head_size;
+                axpy_f32(output, probability, &v[v_base..v_base + v_head_size]);
+            }
+        }
+    }
+}
+
+/// Keys per KV tile in [`sdpa_decode_group`], sized so one tile of K (or V) rows
+/// is about 16 KiB and therefore stays in L1D while the whole query group reads
+/// it. Head sizes are small and few in practice (64/80/96/128/256), so this is
+/// a cheap division rather than a tuned table.
+#[inline]
+fn group_kv_tile(head_size: usize) -> usize {
+    const TILE_BYTES: usize = 16 * 1024;
+    (TILE_BYTES / (head_size.max(1) * size_of::<f32>())).max(1)
 }
 
 /// One chunk's contribution to a flash-decoding (split-KV) softmax reduction.
@@ -844,13 +1021,22 @@ unsafe fn axpy_avx2_fma(dst: &mut [f32], scalar: f32, src: &[f32]) {
     }
 }
 
-/// NEON-vectorized SDPA for aarch64 — same semantics as the scalar reference
-/// but uses 4×-unrolled NEON dot product and AXPY for the inner loops.
+/// SIMD-vectorized SDPA — same semantics as the scalar reference, but the
+/// inner loops go through [`dot_f32`] and [`axpy_f32`], which dispatch to
+/// unrolled NEON on aarch64 and to AVX2+FMA on x86.
 ///
-/// Handles all features (GQA, causal, softcap, bias, mask) with identical
-/// control flow to the scalar reference, just faster inner math.
-#[cfg(target_arch = "aarch64")]
-fn sdpa_f32_neon(
+/// Note this is not merely the scalar reference with wider lanes: the P·V
+/// accumulation here walks V row-major and touches each row once, whereas the
+/// scalar oracle walks it column-major and re-reads V once per output column.
+/// That locality difference is a large part of why this is faster, alongside
+/// the vectorization itself.
+///
+/// The body is arch-neutral: it was written for aarch64 but contains no
+/// intrinsics, so the only thing that ever kept it off x86 was its `cfg`.
+///
+/// Handles all features (GQA, causal, softcap, bias, mask).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+fn sdpa_f32_simd(
     t: &SdpaTensors,
     cfg: &SdpaConfig,
     bias: &dyn AttnBias,
@@ -858,7 +1044,7 @@ fn sdpa_f32_neon(
     y: &mut [f32],
 ) {
     #[cfg(test)]
-    SDPA_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SDPA_SIMD_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let SdpaTensors {
         q,
@@ -1090,11 +1276,20 @@ fn sdpa_f32_fast(
         ScaleMode::SplitSqrt(s) => s,
     };
 
+    // With no softcap and provably-identity hooks the per-element epilogue is
+    // pure overhead: two dynamic dispatches and a branch per logit, which at
+    // encoder shapes costs more than either GEMM.
+    let plain_epilogue = cfg.softcap.is_none() && bias.is_identity() && mask.is_identity();
+
     // One tile per `(b, head)`, contiguous in `y` as `[b, head, q_seq, Dv]`.
     let tile_v = q_seq * v_head_size;
+    let tile_logits = q_seq * kv_seq;
     y.par_chunks_mut(tile_v)
         .enumerate()
-        .for_each(|(bh, y_tile)| {
+        // The logits scratch is reused across every tile a worker handles: at
+        // BERT-base that is a 64 KiB allocation per `(batch, head)` pair, and
+        // glibc mmaps (and so re-faults) buffers of that size.
+        .for_each_init(Vec::<f32>::new, |logits, (bh, y_tile)| {
             let b = bh / num_heads;
             let n = bh % num_heads;
             let kv_n = n / heads_per_kv;
@@ -1107,43 +1302,57 @@ fn sdpa_f32_fast(
             let v_tile = &v[v_off..v_off + kv_seq * v_head_size];
 
             // logits[q_seq, kv_seq] = alpha · Q · Kᵀ.
-            let mut logits = vec![0.0f32; q_seq * kv_seq];
+            logits.clear();
+            logits.resize(tile_logits, 0.0);
+            let logits: &mut [f32] = logits.as_mut_slice();
             mlas_sys::sgemm(
-                false,
-                true,
-                q_seq,
-                kv_seq,
-                head_size,
-                alpha,
-                q_tile,
-                head_size,
-                k_tile,
-                head_size,
-                0.0,
-                &mut logits,
-                kv_seq,
+                false, true, q_seq, kv_seq, head_size, alpha, q_tile, head_size, k_tile, head_size,
+                0.0, logits, kv_seq,
             );
 
             // Per-row epilogue: softcap → bias → mask → causal → softmax, on
             // plain slices, in the scalar reference's exact add order.
-            for i in 0..q_seq {
-                let row = &mut logits[i * kv_seq..i * kv_seq + kv_seq];
-                for (j, s) in row.iter_mut().enumerate() {
-                    let mut val = *s;
-                    if let Some(softcap) = cfg.softcap {
-                        val = softcap * (val / softcap).tanh();
+            //
+            // When there is no softcap and both hooks are provably identities
+            // the whole element loop collapses to an optional causal tail fill,
+            // which matters: at BERT-base encoder shapes the two `&dyn` calls
+            // per logit cost more than either GEMM.
+            if plain_epilogue {
+                if cfg.causal {
+                    for i in 0..q_seq {
+                        let keep = (cfg.past_seq + i + 1).min(kv_seq);
+                        logits[i * kv_seq + keep..(i + 1) * kv_seq].fill(cfg.causal_fill);
                     }
-                    val += bias.at(b, n, i, j);
-                    val += mask.at(b, i, j);
-                    if cfg.causal && (j as i64) > cfg.past_seq as i64 + i as i64 {
-                        val = cfg.causal_fill;
-                    }
-                    *s = val;
                 }
+            } else {
+                for i in 0..q_seq {
+                    let row = &mut logits[i * kv_seq..i * kv_seq + kv_seq];
+                    for (j, s) in row.iter_mut().enumerate() {
+                        let mut val = *s;
+                        if let Some(softcap) = cfg.softcap {
+                            val = softcap * (val / softcap).tanh();
+                        }
+                        val += bias.at(b, n, i, j);
+                        val += mask.at(b, i, j);
+                        if cfg.causal && (j as i64) > cfg.past_seq as i64 + i as i64 {
+                            val = cfg.causal_fill;
+                        }
+                        *s = val;
+                    }
+                }
+            }
 
-                // Numerically-stable softmax with the fully-masked-row → zero
-                // guard (matching the scalar reference and ORT).
-                softmax_in_place(row, SoftmaxExp::F32);
+            // Numerically-stable softmax with the fully-masked-row → zero guard
+            // (matching the scalar reference and ORT). MLAS normalizes all
+            // `q_seq` rows with a vectorized exp — the same primitive ORT's own
+            // attention kernels use — but it has no `-inf` row convention, so a
+            // block that contains any `-inf` falls back to the scalar loop.
+            if logits.contains(&f32::NEG_INFINITY) {
+                for i in 0..q_seq {
+                    softmax_in_place(&mut logits[i * kv_seq..(i + 1) * kv_seq], SoftmaxExp::F32);
+                }
+            } else {
+                mlas_sys::compute_softmax_in_place(logits, q_seq, kv_seq);
             }
 
             // context[q_seq, Dv] = probs · V.
@@ -1154,7 +1363,7 @@ fn sdpa_f32_fast(
                 v_head_size,
                 kv_seq,
                 1.0,
-                &logits,
+                logits,
                 kv_seq,
                 v_tile,
                 v_head_size,
@@ -1314,6 +1523,145 @@ fn sdpa_f32_accelerate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sdpa_decode_group` must be a pure loop-nesting inversion of
+    /// `sdpa_decode_row`: same operations, same order, per query head. Anything
+    /// less would silently change decode logits, so this asserts on raw bits
+    /// (not a tolerance) across a group of 7 heads with softcap, a non-trivial
+    /// window, and `head_size != v_head_size`.
+    #[test]
+    fn group_decode_matches_row_decode_bitwise() {
+        for &(group, kv_seq, dh, dv, lo, hi) in &[
+            (7usize, 37usize, 64usize, 64usize, 0usize, 30usize),
+            (2, 23, 133, 17, 5, 21),
+            (4, 64, 128, 128, 0, 64),
+            (8, 9, 48, 48, 3, 9),
+            // Degenerate: empty window and a single-element window.
+            (3, 11, 32, 32, 4, 4),
+            (3, 11, 32, 32, 4, 5),
+            // Windows longer than one KV tile (`group_kv_tile`), including a
+            // ragged final tile and asymmetric K/V head sizes (so the QK and
+            // P·V passes tile at different widths).
+            (5, 600, 64, 64, 0, 600),
+            (2, 700, 32, 128, 13, 691),
+        ] {
+            let scale = 1.0 / (dh as f32).sqrt();
+            for softcap in [None, Some(7.5f32)] {
+                let q: Vec<f32> = (0..group * dh)
+                    .map(|i| ((i * 17 % 101) as f32 - 50.0) / 37.0)
+                    .collect();
+                let k: Vec<f32> = (0..kv_seq * dh)
+                    .map(|i| ((i * 29 % 211) as f32 - 105.0) / 61.0)
+                    .collect();
+                let v: Vec<f32> = (0..kv_seq * dv)
+                    .map(|i| ((i * 43 % 157) as f32 - 78.0) / 53.0)
+                    .collect();
+
+                let mut expected = vec![f32::NAN; group * dv];
+                for g in 0..group {
+                    sdpa_decode_row(
+                        &q[g * dh..(g + 1) * dh],
+                        &k,
+                        &v,
+                        kv_seq,
+                        lo,
+                        hi,
+                        scale,
+                        softcap,
+                        SoftmaxExp::F64Intermediate,
+                        &mut expected[g * dv..(g + 1) * dv],
+                    );
+                }
+
+                let mut actual = vec![f32::NAN; group * dv];
+                let mut scores = Vec::new();
+                sdpa_decode_group(
+                    &q,
+                    &k,
+                    &v,
+                    kv_seq,
+                    group,
+                    dh,
+                    dv,
+                    lo,
+                    hi,
+                    scale,
+                    softcap,
+                    SoftmaxExp::F64Intermediate,
+                    &mut actual,
+                    &mut scores,
+                );
+
+                assert_eq!(
+                    actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "group={group} kv_seq={kv_seq} dh={dh} dv={dv} window={lo}..{hi} softcap={softcap:?}"
+                );
+            }
+        }
+    }
+
+    /// The caller-owned `scores` scratch is reused across calls with different
+    /// window lengths and group widths; a stale tail must never leak into a
+    /// later result.
+    #[test]
+    fn group_decode_reuses_scratch_without_leaking_state() {
+        let (kv_seq, dh, dv) = (48usize, 32usize, 32usize);
+        let scale = 1.0 / (dh as f32).sqrt();
+        let k: Vec<f32> = (0..kv_seq * dh)
+            .map(|i| ((i * 29 % 211) as f32 - 105.0) / 61.0)
+            .collect();
+        let v: Vec<f32> = (0..kv_seq * dv)
+            .map(|i| ((i * 43 % 157) as f32 - 78.0) / 53.0)
+            .collect();
+        let mut scores = Vec::new();
+        // A long, wide call first so the scratch is oversized for the next one.
+        for &(group, lo, hi) in &[(8usize, 0usize, 48usize), (2, 10, 20), (4, 0, 7)] {
+            let q: Vec<f32> = (0..group * dh)
+                .map(|i| ((i * 17 % 101) as f32 - 50.0) / 37.0)
+                .collect();
+            let mut fresh_scratch = Vec::new();
+            let mut reused = vec![f32::NAN; group * dv];
+            let mut fresh = vec![f32::NAN; group * dv];
+            sdpa_decode_group(
+                &q,
+                &k,
+                &v,
+                kv_seq,
+                group,
+                dh,
+                dv,
+                lo,
+                hi,
+                scale,
+                None,
+                SoftmaxExp::F64Intermediate,
+                &mut reused,
+                &mut scores,
+            );
+            sdpa_decode_group(
+                &q,
+                &k,
+                &v,
+                kv_seq,
+                group,
+                dh,
+                dv,
+                lo,
+                hi,
+                scale,
+                None,
+                SoftmaxExp::F64Intermediate,
+                &mut fresh,
+                &mut fresh_scratch,
+            );
+            assert_eq!(
+                reused.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                fresh.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                "group={group} window={lo}..{hi}"
+            );
+        }
+    }
 
     #[test]
     fn decode_row_f64_intermediate_is_bit_exact_with_gqa_reference() {
@@ -1656,7 +2004,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     fn deterministic_values(n: usize, seed: u64, magnitude: f32) -> Vec<f32> {
         let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         (0..n)
@@ -1670,13 +2018,13 @@ mod tests {
             .collect()
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     struct PatternBias {
         q_seq: usize,
         kv_seq: usize,
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     impl AttnBias for PatternBias {
         fn at(&self, b: usize, head: usize, i: usize, j: usize) -> f32 {
             let idx = (((b * 17 + head * 13 + i) * self.kv_seq + j) % 19) as f32;
@@ -1685,14 +2033,14 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     struct PatternMask {
         q_seq: usize,
         kv_seq: usize,
         fully_masked_query: Option<usize>,
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     impl KeyMask for PatternMask {
         fn at(&self, b: usize, i: usize, j: usize) -> f32 {
             debug_assert!(i < self.q_seq && j < self.kv_seq);
@@ -1712,7 +2060,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     fn sdpa_f64_reference(
         t: &SdpaTensors,
         cfg: &SdpaConfig,
@@ -1795,9 +2143,12 @@ mod tests {
         y
     }
 
-    #[cfg(target_arch = "aarch64")]
+    /// The SIMD SDPA path must agree with the scalar oracle (and with an f64
+    /// reference) across GQA / causal / softcap / bias / mask / fully-masked
+    /// cases. Runs on aarch64 *and* x86, since both dispatch to `sdpa_f32_simd`.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     #[test]
-    fn sdpa_neon_matches_scalar_and_f64_reference_on_decode_shapes() {
+    fn sdpa_simd_matches_scalar_and_f64_reference_on_decode_shapes() {
         struct Case {
             name: &'static str,
             batch: usize,
@@ -1912,15 +2263,15 @@ mod tests {
             let bias_ref: &dyn AttnBias = if case.use_bias { &bias } else { &NoBias };
             let mask_ref: &dyn KeyMask = if case.use_mask { &mask } else { &NoMask };
             let mut scalar = vec![f32::NAN; y_len];
-            let mut neon = vec![f32::NAN; y_len];
+            let mut simd = vec![f32::NAN; y_len];
             sdpa_f32_scalar(&tensors, &case.cfg, bias_ref, mask_ref, &mut scalar, None);
-            sdpa_f32_neon(&tensors, &case.cfg, bias_ref, mask_ref, &mut neon);
+            sdpa_f32_simd(&tensors, &case.cfg, bias_ref, mask_ref, &mut simd);
             let f64_ref = sdpa_f64_reference(&tensors, &case.cfg, bias_ref, mask_ref);
 
             let mut max_scalar_abs = 0.0f32;
             let mut max_f64_abs = 0.0f32;
             let mut max_scalar_rel = 0.0f32;
-            for ((&got, &scalar), &f64_value) in neon.iter().zip(&scalar).zip(&f64_ref) {
+            for ((&got, &scalar), &f64_value) in simd.iter().zip(&scalar).zip(&f64_ref) {
                 assert!(got.is_finite(), "{} produced non-finite output", case.name);
                 let scalar_abs = (got - scalar).abs();
                 let f64_abs = (got - f64_value).abs();
@@ -1928,27 +2279,204 @@ mod tests {
                 max_f64_abs = max_f64_abs.max(f64_abs);
                 max_scalar_rel = max_scalar_rel.max(scalar_abs / scalar.abs().max(1e-4));
             }
-            // NEON uses a 4x-unrolled tree reduction while the scalar reference
-            // is sequential, so exact parity is not expected. The bound is still
-            // tight enough to catch dropped tail lanes, missing max subtraction,
-            // and accumulator corruption; guard-break probes for those fail.
+            // The SIMD path reduces through independent accumulators while the
+            // scalar reference is a single sequential chain, so exact parity is
+            // not expected. The
+            // bound is still tight enough to catch dropped tail lanes, missing
+            // max subtraction, and accumulator corruption; guard-break probes
+            // for those fail.
             assert!(
                 max_scalar_abs <= 5e-4 && max_scalar_rel <= 2e-3,
-                "{}: NEON vs scalar max_abs={max_scalar_abs:e} max_rel={max_scalar_rel:e}",
+                "{}: simd vs scalar max_abs={max_scalar_abs:e} max_rel={max_scalar_rel:e}",
                 case.name
             );
             assert!(
                 max_f64_abs <= 1e-3,
-                "{}: NEON vs f64 max_abs={max_f64_abs:e}",
+                "{}: simd vs f64 max_abs={max_f64_abs:e}",
                 case.name
             );
         }
     }
 
-    #[cfg(all(target_arch = "aarch64", not(feature = "mlas")))]
+    /// The *dispatcher* (not the vectorised body called directly) must stay
+    /// within tolerance of the scalar oracle for batched, grouped, causal and
+    /// softcapped shapes. This is the entry point `Attention`,
+    /// `MultiHeadAttention`, `com.microsoft.Attention` and `VarLenAttention`
+    /// actually call, so it is what production numerics depend on.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     #[test]
-    fn sdpa_dispatcher_reaches_neon_on_aarch64() {
+    fn sdpa_dispatch_matches_scalar_oracle_across_shapes() {
+        // (batch, heads, kv_heads, q_seq, kv_seq, head_size, v_head_size)
+        let shapes = [
+            (2usize, 8usize, 8usize, 1usize, 1usize, 64usize, 64usize),
+            (2, 12, 4, 1, 513, 64, 64),
+            (1, 32, 8, 1, 2049, 128, 128),
+            (3, 6, 3, 7, 71, 33, 17),
+            (1, 4, 1, 129, 129, 80, 80),
+        ];
+        for (bi, &(batch, heads, kv_heads, q_seq, kv_seq, dh, dv)) in shapes.iter().enumerate() {
+            let q = deterministic_values(batch * heads * q_seq * dh, 0x0005_EED0 + bi as u64, 0.9);
+            let k =
+                deterministic_values(batch * kv_heads * kv_seq * dh, 0x0005_EED1 + bi as u64, 0.9);
+            let v =
+                deterministic_values(batch * kv_heads * kv_seq * dv, 0x0005_EED2 + bi as u64, 0.9);
+            let tensors = SdpaTensors {
+                q: &q,
+                k: &k,
+                v: &v,
+                batch,
+                num_heads: heads,
+                num_kv_heads: kv_heads,
+                q_seq,
+                kv_seq,
+                head_size: dh,
+                v_head_size: dv,
+            };
+            for (label, cfg) in [
+                (
+                    "plain",
+                    SdpaConfig {
+                        scale: ScaleMode::PostDot(1.0 / (dh as f32).sqrt()),
+                        softcap: None,
+                        causal: false,
+                        past_seq: 0,
+                        causal_fill: f32::NEG_INFINITY,
+                    },
+                ),
+                (
+                    "causal-softcap",
+                    SdpaConfig {
+                        scale: ScaleMode::SplitSqrt(1.0 / (dh as f32).sqrt().sqrt()),
+                        softcap: Some(30.0),
+                        causal: true,
+                        past_seq: kv_seq.saturating_sub(q_seq),
+                        causal_fill: f32::MIN,
+                    },
+                ),
+            ] {
+                let y_len = batch * heads * q_seq * dv;
+                let mut dispatched = vec![f32::NAN; y_len];
+                let mut oracle = vec![f32::NAN; y_len];
+                sdpa_f32(&tensors, &cfg, &NoBias, &NoMask, &mut dispatched, None);
+                sdpa_f32_scalar(&tensors, &cfg, &NoBias, &NoMask, &mut oracle, None);
+                for (&got, &want) in dispatched.iter().zip(&oracle) {
+                    assert!(
+                        got.is_finite(),
+                        "shape {bi} {label}: dispatcher produced non-finite output"
+                    );
+                    let abs = (got - want).abs();
+                    // Observed worst case on AVX2 is abs=2.7e-7 / rel=1.1e-3
+                    // (the relative figure is dominated by the 1e-4 floor on
+                    // near-zero outputs), so these bounds leave ~75x abs
+                    // headroom while still catching a single dropped KV lane,
+                    // which perturbs an output by ~1e-3.
+                    assert!(
+                        abs <= 2e-5 && abs / want.abs().max(1e-4) <= 2e-3,
+                        "shape {bi} {label}: dispatcher vs scalar oracle abs={abs:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A `QkCapture` request must keep taking the scalar reference on every
+    /// architecture: the captured logits are the oracle the parity goldens pin,
+    /// so they have to stay bit-identical to `sdpa_f32_scalar`.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn qk_capture_stays_bit_identical_to_the_scalar_oracle() {
+        let (batch, heads, kv_heads, q_seq, kv_seq, dh) =
+            (2usize, 8usize, 2usize, 3usize, 67usize, 64usize);
+        let q = deterministic_values(batch * heads * q_seq * dh, 0x00C0_FFE1, 0.8);
+        let k = deterministic_values(batch * kv_heads * kv_seq * dh, 0x00C0_FFE2, 0.8);
+        let v = deterministic_values(batch * kv_heads * kv_seq * dh, 0x00C0_FFE3, 0.8);
+        let tensors = SdpaTensors {
+            q: &q,
+            k: &k,
+            v: &v,
+            batch,
+            num_heads: heads,
+            num_kv_heads: kv_heads,
+            q_seq,
+            kv_seq,
+            head_size: dh,
+            v_head_size: dh,
+        };
+        let cfg = SdpaConfig {
+            scale: ScaleMode::PostDot(1.0 / (dh as f32).sqrt()),
+            softcap: None,
+            causal: true,
+            past_seq: kv_seq - q_seq,
+            causal_fill: f32::NEG_INFINITY,
+        };
+        let y_len = batch * heads * q_seq * dh;
+        let score_len = batch * heads * q_seq * kv_seq;
+        for stage in [QkCaptureStage::PreSoftmax, QkCaptureStage::PostSoftmax] {
+            let mut y_dispatch = vec![f32::NAN; y_len];
+            let mut y_oracle = vec![f32::NAN; y_len];
+            let mut scores_dispatch = vec![f32::NAN; score_len];
+            let mut scores_oracle = vec![f32::NAN; score_len];
+            sdpa_f32(
+                &tensors,
+                &cfg,
+                &NoBias,
+                &NoMask,
+                &mut y_dispatch,
+                Some(QkCapture {
+                    scores: &mut scores_dispatch,
+                    stage,
+                }),
+            );
+            sdpa_f32_scalar(
+                &tensors,
+                &cfg,
+                &NoBias,
+                &NoMask,
+                &mut y_oracle,
+                Some(QkCapture {
+                    scores: &mut scores_oracle,
+                    stage,
+                }),
+            );
+            assert_eq!(
+                scores_dispatch.to_bits_vec(),
+                scores_oracle.to_bits_vec(),
+                "captured scores diverged from the scalar oracle"
+            );
+            assert_eq!(
+                y_dispatch.to_bits_vec(),
+                y_oracle.to_bits_vec(),
+                "capture-path output diverged from the scalar oracle"
+            );
+        }
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+    trait ToBitsVec {
+        fn to_bits_vec(&self) -> Vec<u32>;
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+    impl ToBitsVec for [f32] {
+        fn to_bits_vec(&self) -> Vec<u32> {
+            self.iter().map(|value| value.to_bits()).collect()
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"),
+        not(feature = "mlas")
+    ))]
+    #[test]
+    fn sdpa_dispatcher_reaches_simd_path() {
         use std::sync::atomic::Ordering;
+
+        // On x86 the SIMD path is runtime-detected; a pre-AVX2 host legitimately
+        // stays on the scalar reference.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if !crate::backend::has_simd_x86() {
+            return;
+        }
 
         // Use q_seq > 1 so the Accelerate path fires on macOS (the NEON decode
         // bypass only applies when q_seq == 1 with small per-head work).
@@ -1978,21 +2506,21 @@ mod tests {
         };
         // On macOS/iOS without MLAS, the Accelerate path fires instead of NEON.
         // On other aarch64 (Linux), the NEON path fires.
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
         let before = SDPA_ACCELERATE_TEST_HITS.load(Ordering::Relaxed);
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        let before = SDPA_NEON_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios"))))]
+        let before = SDPA_SIMD_TEST_HITS.load(Ordering::Relaxed);
 
         let mut y = vec![f32::NAN; batch * num_heads * q_seq * dv];
         sdpa_f32(&tensors, &cfg, &NoBias, &NoMask, &mut y, None);
 
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
         let after = SDPA_ACCELERATE_TEST_HITS.load(Ordering::Relaxed);
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        let after = SDPA_NEON_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios"))))]
+        let after = SDPA_SIMD_TEST_HITS.load(Ordering::Relaxed);
         assert!(
             after > before,
-            "sdpa_f32 dispatcher did not execute accelerated path on aarch64"
+            "sdpa_f32 dispatcher did not execute the accelerated path"
         );
         assert!(y.iter().all(|value| value.is_finite()));
     }
@@ -2546,5 +3074,131 @@ mod tests {
         run("prefill", 1, 32, 32, 512, 512, 128);
         run("decode", 1, 32, 32, 1, 513, 128);
         run("gqa-prefill", 1, 32, 8, 512, 512, 128);
+    }
+
+    /// A hook that contributes nothing but refuses to advertise itself as an
+    /// identity, forcing the fast path's general per-element epilogue. The
+    /// specialized branch must agree with it bit for bit.
+    struct OpaqueZeroBias;
+    impl AttnBias for OpaqueZeroBias {
+        fn at(&self, _b: usize, _head: usize, _i: usize, _j: usize) -> f32 {
+            0.0
+        }
+    }
+    struct OpaqueZeroMask;
+    impl KeyMask for OpaqueZeroMask {
+        fn at(&self, _b: usize, _i: usize, _j: usize) -> f32 {
+            0.0
+        }
+    }
+
+    #[test]
+    fn identity_hook_specialization_matches_the_general_epilogue() {
+        // (batch, heads, kv_heads, q_seq, kv_seq, head_size, v_head_size)
+        let shapes = [
+            (2usize, 8usize, 8usize, 5usize, 37usize, 64usize, 64usize),
+            (1, 12, 4, 128, 128, 64, 64),
+            (3, 6, 3, 7, 71, 33, 17),
+            (1, 4, 1, 1, 129, 80, 80),
+        ];
+        for (si, &(batch, heads, kv_heads, q_seq, kv_seq, dh, dv)) in shapes.iter().enumerate() {
+            let q = deterministic_values(batch * heads * q_seq * dh, 0x00A1_0000 + si as u64, 0.8);
+            let k =
+                deterministic_values(batch * kv_heads * kv_seq * dh, 0x00A1_1000 + si as u64, 0.8);
+            let v =
+                deterministic_values(batch * kv_heads * kv_seq * dv, 0x00A1_2000 + si as u64, 0.8);
+            let tensors = SdpaTensors {
+                q: &q,
+                k: &k,
+                v: &v,
+                batch,
+                num_heads: heads,
+                num_kv_heads: kv_heads,
+                q_seq,
+                kv_seq,
+                head_size: dh,
+                v_head_size: dv,
+            };
+            for causal in [false, true] {
+                let cfg = SdpaConfig {
+                    scale: ScaleMode::PostDot(1.0 / (dh as f32).sqrt()),
+                    softcap: None,
+                    causal,
+                    past_seq: kv_seq.saturating_sub(q_seq),
+                    causal_fill: f32::MIN,
+                };
+                let mut fast = vec![0.0f32; batch * heads * q_seq * dv];
+                let mut general = vec![0.0f32; batch * heads * q_seq * dv];
+                sdpa_f32(&tensors, &cfg, &NoBias, &NoMask, &mut fast, None);
+                sdpa_f32(
+                    &tensors,
+                    &cfg,
+                    &OpaqueZeroBias,
+                    &OpaqueZeroMask,
+                    &mut general,
+                    None,
+                );
+                assert_eq!(
+                    fast, general,
+                    "shape {si} causal={causal}: identity specialization diverged"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fully_masked_rows_stay_zero_when_the_fill_is_negative_infinity() {
+        // A row that is entirely `-inf` has no defined softmax; the kernel's
+        // convention (shared with the scalar oracle and ORT) is to emit zeros.
+        // MLAS has no such convention, so this exercises the guarded fallback.
+        struct MaskEverySecondRow;
+        impl KeyMask for MaskEverySecondRow {
+            fn at(&self, _b: usize, i: usize, _j: usize) -> f32 {
+                if i % 2 == 1 { f32::NEG_INFINITY } else { 0.0 }
+            }
+        }
+
+        let (batch, heads, q_seq, kv_seq, dh) = (2usize, 4usize, 6usize, 13usize, 32usize);
+        let q = deterministic_values(batch * heads * q_seq * dh, 0x00B2_0000, 0.7);
+        let k = deterministic_values(batch * heads * kv_seq * dh, 0x00B2_1000, 0.7);
+        let v = deterministic_values(batch * heads * kv_seq * dh, 0x00B2_2000, 0.7);
+        let tensors = SdpaTensors {
+            q: &q,
+            k: &k,
+            v: &v,
+            batch,
+            num_heads: heads,
+            num_kv_heads: heads,
+            q_seq,
+            kv_seq,
+            head_size: dh,
+            v_head_size: dh,
+        };
+        let cfg = SdpaConfig {
+            scale: ScaleMode::PostDot(1.0 / (dh as f32).sqrt()),
+            softcap: None,
+            causal: false,
+            past_seq: 0,
+            causal_fill: f32::NEG_INFINITY,
+        };
+        let mut y = vec![f32::NAN; batch * heads * q_seq * dh];
+        sdpa_f32(&tensors, &cfg, &NoBias, &MaskEverySecondRow, &mut y, None);
+        for b in 0..batch {
+            for h in 0..heads {
+                for i in 0..q_seq {
+                    let row = &y[(((b * heads + h) * q_seq) + i) * dh..][..dh];
+                    assert!(
+                        row.iter().all(|x| x.is_finite()),
+                        "b{b} h{h} row {i} not finite"
+                    );
+                    if i % 2 == 1 {
+                        assert!(
+                            row.iter().all(|x| *x == 0.0),
+                            "b{b} h{h} row {i} should be zeroed, got {row:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

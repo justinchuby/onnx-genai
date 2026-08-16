@@ -236,6 +236,12 @@ pub(crate) struct DeviceBindingSpec {
     pub(crate) logical_shape: Vec<usize>,
     /// Whether graph inputs see the valid prefix rather than allocation capacity.
     pub(crate) expose_logical_input_shape: bool,
+    /// Bytes reserved in the allocation. Defaults to the physical shape's byte
+    /// size; larger values let a binding grow its exposed shape without moving.
+    pub(crate) allocation_bytes: Option<usize>,
+    /// Byte ranges to commit immediately. Eager providers ignore this because
+    /// allocation already commits the whole buffer.
+    pub(crate) committed_ranges: Option<Vec<std::ops::Range<usize>>>,
 }
 
 /// The parameters for [`DeviceIoBinding::from_external_memory`], grouped the
@@ -334,6 +340,8 @@ impl DeviceIoBinding {
             physical_shape,
             logical_shape,
             expose_logical_input_shape,
+            allocation_bytes,
+            committed_ranges,
         } = spec;
         validate_logical_shape(&physical_shape, &logical_shape)?;
         let bytes = checked_expected_bytes(dtype, &physical_shape)
@@ -342,8 +350,29 @@ impl DeviceIoBinding {
                 dims: physical_shape.clone(),
             })?
             .max(1);
+        let allocation_bytes = allocation_bytes.unwrap_or(bytes).max(1);
+        if allocation_bytes < bytes {
+            return Err(SessionError::ExternalBuffer {
+                binding: input_name,
+                reason: format!(
+                    "allocation is {allocation_bytes} bytes but physical shape {physical_shape:?} needs {bytes}"
+                ),
+            });
+        }
         let allocator_for_buffer = allocator.clone();
-        let buffer = allocator_for_buffer.allocate(bytes, TensorLayout::contiguous().alignment)?;
+        let default_range;
+        let ranges = match committed_ranges.as_deref() {
+            Some(ranges) => ranges,
+            None => {
+                default_range = 0..allocation_bytes;
+                std::slice::from_ref(&default_range)
+            }
+        };
+        let buffer = allocator_for_buffer.allocate_committed(
+            allocation_bytes,
+            TensorLayout::contiguous().alignment,
+            ranges,
+        )?;
         Ok(Self {
             input_name,
             bind_input,
@@ -396,6 +425,8 @@ impl DeviceIoBinding {
             physical_shape,
             logical_shape,
             expose_logical_input_shape,
+            allocation_bytes: _,
+            committed_ranges: _,
         } = spec;
         validate_logical_shape(&physical_shape, &logical_shape)?;
         let required = checked_expected_bytes(dtype, &physical_shape)
@@ -505,6 +536,123 @@ impl DeviceIoBinding {
         Ok(())
     }
 
+    pub fn set_physical_and_logical_shapes(
+        &mut self,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+    ) -> Result<()> {
+        validate_logical_shape(&physical_shape, &logical_shape)?;
+        let required = checked_expected_bytes(self.dtype, &physical_shape).ok_or_else(|| {
+            SessionError::ShapeOverflow {
+                value: format!("device binding '{}'", self.input_name),
+                dims: physical_shape.clone(),
+            }
+        })?;
+        if required > self.buffer().len() {
+            return Err(SessionError::ExternalBuffer {
+                binding: self.input_name.clone(),
+                reason: format!(
+                    "shape {physical_shape:?} needs {required} bytes but allocation has {}",
+                    self.buffer().len()
+                ),
+            });
+        }
+        self.physical_shape = physical_shape;
+        self.logical_shape = logical_shape;
+        Ok(())
+    }
+
+    pub fn commit_range(&mut self, byte_offset: usize, bytes: usize) -> Result<()> {
+        let buffer = self
+            .buffer
+            .as_ref()
+            .expect("DeviceIoBinding buffer taken only in Drop");
+        self.allocator
+            .commit_allocation_range(buffer, byte_offset, bytes)?;
+        Ok(())
+    }
+
+    pub fn commit_binding_ranges(&self, ranges: &[(&DeviceIoBinding, usize, usize)]) -> Result<()> {
+        let buffers = ranges
+            .iter()
+            .map(|&(binding, offset, bytes)| {
+                (
+                    binding
+                        .buffer
+                        .as_ref()
+                        .expect("DeviceIoBinding buffer taken only in Drop"),
+                    offset,
+                    bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.allocator.commit_allocation_ranges(&buffers)?;
+        Ok(())
+    }
+
+    pub fn commit_binding_ranges_with_mapped_growth(
+        &self,
+        ranges: &[(&DeviceIoBinding, usize, usize)],
+        grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
+    ) -> Result<u64> {
+        let buffers = ranges
+            .iter()
+            .map(|&(binding, offset, bytes)| {
+                (
+                    binding
+                        .buffer
+                        .as_ref()
+                        .expect("DeviceIoBinding buffer taken only in Drop"),
+                    offset,
+                    bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(self
+            .allocator
+            .commit_allocation_ranges_with_mapped_growth(&buffers, grant)?)
+    }
+
+    pub fn mapped_bytes_for_binding_ranges(
+        &self,
+        ranges: &[(&DeviceIoBinding, usize, usize)],
+    ) -> Result<u64> {
+        let buffers = ranges
+            .iter()
+            .map(|&(binding, offset, bytes)| {
+                (
+                    binding
+                        .buffer
+                        .as_ref()
+                        .expect("DeviceIoBinding buffer taken only in Drop"),
+                    offset,
+                    bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(self
+            .allocator
+            .mapped_bytes_for_allocation_ranges(&buffers)?)
+    }
+
+    pub fn decommit_range(&mut self, byte_offset: usize, bytes: usize) -> Result<()> {
+        let buffer = self
+            .buffer
+            .as_ref()
+            .expect("DeviceIoBinding buffer taken only in Drop");
+        self.allocator
+            .decommit_allocation_range(buffer, byte_offset, bytes)?;
+        Ok(())
+    }
+
+    pub fn committed_bytes(&self) -> usize {
+        let buffer = self
+            .buffer
+            .as_ref()
+            .expect("DeviceIoBinding buffer taken only in Drop");
+        self.allocator.allocation_committed_bytes(buffer)
+    }
+
     pub fn device_ptr(&self) -> *const std::ffi::c_void {
         self.buffer().as_ptr()
     }
@@ -538,11 +686,56 @@ impl DeviceIoBinding {
         Ok(())
     }
 
+    pub fn read_bytes_range(&mut self, byte_offset: usize, byte_len: usize) -> Result<Vec<u8>> {
+        let end =
+            byte_offset
+                .checked_add(byte_len)
+                .ok_or_else(|| SessionError::ExternalBuffer {
+                    binding: self.input_name.clone(),
+                    reason: format!(
+                        "read range offset {byte_offset} plus {byte_len} bytes overflows"
+                    ),
+                })?;
+        let buffer = self.buffer();
+        if end > buffer.len() {
+            return Err(SessionError::ExternalBuffer {
+                binding: self.input_name.clone(),
+                reason: format!(
+                    "read range {byte_offset}..{end} exceeds allocation of {} bytes",
+                    buffer.len()
+                ),
+            });
+        }
+        let mut bytes = vec![0; byte_len];
+        if byte_len == 0 {
+            return Ok(bytes);
+        }
+        // SAFETY: the offset range is checked inside the live allocation above;
+        // the borrowed handle owns nothing and `DeviceBuffer` has no destructor.
+        let alias = unsafe {
+            DeviceBuffer::from_borrowed_parts(
+                (buffer.as_ptr() as *const u8).add(byte_offset) as *mut std::ffi::c_void,
+                buffer.device(),
+                byte_len,
+                buffer.alignment(),
+            )
+        };
+        self.allocator.copy_to_host(&alias, &mut bytes)?;
+        self.transfer_stats.host_download_calls += 1;
+        self.transfer_stats.host_download_bytes += bytes.len() as u64;
+        Ok(bytes)
+    }
+
     pub fn device_argmax_supported(&self) -> bool {
         self.allocator.device_argmax_supported()
     }
 
-    pub fn device_argmax(&self, elements: usize, result: &mut DeviceIoBinding) -> Result<()> {
+    pub fn device_argmax(
+        &self,
+        elements: usize,
+        batch: usize,
+        result: &mut DeviceIoBinding,
+    ) -> Result<()> {
         if !matches!(self.dtype, DataType::Float32 | DataType::Float16)
             || result.dtype != DataType::Uint32
         {
@@ -559,8 +752,63 @@ impl DeviceIoBinding {
         Ok(self.allocator.device_argmax(
             self.buffer(),
             elements,
+            batch,
             self.dtype,
             result.buffer_mut(),
+        )?)
+    }
+
+    /// Fold the just-selected greedy token into the persistent decode bindings
+    /// device-to-device for the native CUDA device-token-loop. `self` is the
+    /// device-argmax result binding (`result[0]` = token id, `result[1]` =
+    /// capture-error word). The token is written as an `i64` into `input_ids`,
+    /// `next_position` into `position_ids`, a `1` into `attention_mask` at
+    /// `next_position` (guarded by the binding's mask width), the token is
+    /// appended to `scratch[step]`, and the capture-error word is OR-ed into
+    /// `scratch[capacity]`. No host sync is issued; the caller drains `scratch`
+    /// once per chain. All bindings must belong to the same execution provider.
+    #[allow(clippy::too_many_arguments)]
+    pub fn device_token_writer(
+        &self,
+        input_ids: &DeviceIoBinding,
+        position_ids: Option<&DeviceIoBinding>,
+        attention_mask: &DeviceIoBinding,
+        scratch: &DeviceIoBinding,
+        capacity: usize,
+        next_position: i64,
+        mask_len: usize,
+        step: u32,
+    ) -> Result<()> {
+        if self.dtype != DataType::Uint32 || scratch.dtype != DataType::Uint32 {
+            return Err(SessionError::Internal(format!(
+                "device token writer requires u32 result/scratch, got {:?} and {:?}",
+                self.dtype, scratch.dtype
+            )));
+        }
+        let write_position = position_ids.is_some();
+        // When the model has no persistent position_ids binding (position is
+        // derived from the mask), reuse input_ids as a harmless stand-in buffer
+        // and gate the position write off in the kernel.
+        let position_binding = position_ids.unwrap_or(input_ids);
+        for binding in [input_ids, position_binding, attention_mask, scratch] {
+            if !Arc::ptr_eq(&self.allocator, &binding.allocator) {
+                return Err(SessionError::Internal(
+                    "device token writer bindings must belong to the same execution provider"
+                        .into(),
+                ));
+            }
+        }
+        Ok(self.allocator.device_token_writer(
+            self.buffer(),
+            input_ids.buffer(),
+            position_binding.buffer(),
+            attention_mask.buffer(),
+            scratch.buffer(),
+            capacity,
+            next_position,
+            mask_len,
+            write_position,
+            step,
         )?)
     }
 
@@ -695,6 +943,33 @@ impl Tensor {
     /// Build a tensor from raw little-endian bytes on the shared CPU device.
     pub fn from_raw(dtype: DataType, shape: Vec<usize>, bytes: &[u8]) -> Result<Self> {
         Self::from_raw_in(shared_cpu_ep(), dtype, shape, bytes)
+    }
+
+    /// Allocate a zero-initialised tensor on the shared CPU device.
+    ///
+    /// Zeroes the buffer in place. `from_raw` with a zeroed `Vec` allocates
+    /// these bytes twice and memcpys between them, which on a hybrid decoder's
+    /// per-layer `conv_state`/`recurrent_state` is the whole cost of the call.
+    pub fn zeros(dtype: DataType, shape: Vec<usize>) -> Result<Self> {
+        let allocator = shared_cpu_ep();
+        let numel: usize = shape.iter().product();
+        let expected = dtype.storage_bytes(numel);
+        let layout = TensorLayout::contiguous();
+        let mut buffer = allocator.allocate(expected.max(1), layout.alignment)?;
+        assert!(
+            buffer.device().is_host_accessible(),
+            "zeros on non-host device {:?}",
+            buffer.device()
+        );
+        if expected > 0 {
+            let dst = buffer.as_mut_ptr() as *mut u8;
+            // SAFETY: host-accessible device (asserted); `dst` is a unique
+            // writable host pointer obtained via `&mut buffer` with no alias,
+            // and the allocation is at least `expected` bytes because that is
+            // what was requested.
+            unsafe { std::ptr::write_bytes(dst, 0, expected) };
+        }
+        Ok(Self::from_owned_buffer(allocator, dtype, shape, buffer))
     }
 
     /// Take ownership of an already-allocated, contiguous `buffer` (allocated by
@@ -1061,6 +1336,8 @@ mod tests {
                 physical_shape: vec![element_count],
                 logical_shape: vec![element_count],
                 expose_logical_input_shape: false,
+                allocation_bytes: None,
+                committed_ranges: None,
             },
         )
         .expect_err("overflowing device binding byte count must be rejected");
@@ -1140,6 +1417,8 @@ mod tests {
                 physical_shape: vec![1, 4096],
                 logical_shape: vec![1, 4096],
                 expose_logical_input_shape: true,
+                allocation_bytes: None,
+                committed_ranges: None,
             },
         )
         .unwrap();
@@ -1166,6 +1445,8 @@ mod tests {
                 physical_shape: vec![1, 4096],
                 logical_shape: vec![1, 5],
                 expose_logical_input_shape: false,
+                allocation_bytes: None,
+                committed_ranges: None,
             },
         )
         .unwrap();
@@ -1174,5 +1455,38 @@ mod tests {
         assert_eq!(physical_mask.kernel_input_shape(), &[1, 4096]);
         physical_mask.set_logical_shape(vec![1, 4096]).unwrap();
         assert!(!physical_mask.exposes_logical_input_shape());
+    }
+
+    /// A zeroed tensor is zero even when the allocation is not.
+    ///
+    /// `zeros` writes the bytes in place instead of copying a zeroed `Vec` in,
+    /// which is cheaper and just as correct -- but it moves the guarantee from
+    /// obvious to asserted. Freshly mapped pages are usually already zero, so a
+    /// test that only allocated would pass whether or not the zeroing happened.
+    /// This dirties the buffer first, through the same public surface.
+    #[test]
+    fn a_zeroed_tensor_is_zero_even_over_dirty_memory() {
+        // Allocate, poison, drop: the allocator is very likely to hand the same
+        // block back to the next request of the same size.
+        let poison = Tensor::from_raw(DataType::Float32, vec![2, 8], &[0xABu8; 64])
+            .expect("a poisoned tensor");
+        drop(poison);
+
+        let zeroed = Tensor::zeros(DataType::Float32, vec![2, 8]).expect("a zeroed tensor");
+        let values = zeroed.to_vec_f32();
+        assert_eq!(values.len(), 16);
+        assert!(
+            values.iter().all(|value| *value == 0.0),
+            "zeros() returned {values:?}"
+        );
+    }
+
+    /// A growable KV input starts with an empty sequence axis, so this shape is
+    /// reached on a hybrid decoder's first step.
+    #[test]
+    fn a_zeroed_tensor_of_no_elements_is_valid() {
+        let empty = Tensor::zeros(DataType::Float32, vec![1, 8, 0, 4]).expect("allocatable");
+        assert_eq!(empty.shape, vec![1, 8, 0, 4]);
+        assert!(empty.to_vec_f32().is_empty());
     }
 }

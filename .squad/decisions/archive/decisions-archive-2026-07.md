@@ -78,7 +78,7 @@
 
 #### Source: `fact-checker-model-package-verify.md`
 
-### 2026-07-16: Verification of `docs/MODEL_PACKAGE.md` Microsoft-source claims
+### 2026-07-16: Verification of `docs/genai/MODEL_PACKAGE.md` Microsoft-source claims
 **By:** Fact Checker
 **What:** Verified the concrete claims in §§2.1–2.4 and §11 against the current `main` branches of `microsoft/onnxruntime` and `microsoft/onnxruntime-genai`, plus PR `microsoft/onnxruntime-genai#2255`.
 **Why:** These claims define the external compatibility basis for the proposed design and must match the real Microsoft implementation.
@@ -114,7 +114,7 @@ Evidence was checked at ONNX Runtime `main` commit `a91b0b49cb0dc9670a8cf93263b3
 | Tokenizer files can be shared through `shared_assets/sha256-<hex>/` and `model.tokenizer_dir: "sha256:<hex>"`. | ✅ Verified | Explicitly documented with layout and JSON examples. |
 | Processor config is intentionally kept per variant. | ✅ Verified | The doc explicitly names `model.vision.config_filename` and `model.speech.config_filename` as per-variant. |
 | The GenAI doc describes package loading APIs and flat-directory compatibility. | ✅ Verified | It documents `og.Model`, `og.Config.from_package_ep`, `OgaCreateModel`, `OgaCreateConfigFromPackageEp`, C++ wrappers, flat-directory compatibility, and the `OgaRuntimeSettings` restriction. |
-| The GenAI doc describes a pack/unpack or package-authoring workflow. | ❌ Contradicted | It describes layout, authoring notes, and loading, but no pack CLI/API or pack/unpack workflow. `docs/MODEL_PACKAGE.md` §2.3 does not incorrectly attribute one; §2.4 correctly says PR #2255 added none. |
+| The GenAI doc describes a pack/unpack or package-authoring workflow. | ❌ Contradicted | It describes layout, authoring notes, and loading, but no pack CLI/API or pack/unpack workflow. `docs/genai/MODEL_PACKAGE.md` §2.3 does not incorrectly attribute one; §2.4 correctly says PR #2255 added none. |
 | PR #2255 exists with the quoted title. | ✅ Verified | Title: **“Resolve model package paths and path-valued session options through ONNX Runtime.”** URL: `https://github.com/microsoft/onnxruntime-genai/pull/2255`. |
 | PR #2255 was merged on 2026-07-13. | ✅ Verified | State `MERGED`; merged at `2026-07-13T18:37:00Z`. |
 | PR #2255 changed the nine files listed in §2.4. | ✅ Verified | Exact files: `docs/model_package.md`, `src/config.cpp`, `src/config.h`, `src/models/model.cpp`, `src/models/model_package.cpp`, `src/models/model_package.h`, `src/models/onnxruntime_api.h`, `src/models/onnxruntime_inline.h`, `test/model_package_test.cpp`. They were existing files, not newly introduced files. |
@@ -326,7 +326,7 @@ synchronizing/D2H kernel non-capturable.
 **Verification:** Gather numerics genuinely executed with the worktree-local
 NVRTC loader path: all 3 Gather reference cases exact-matched (max abs error
 0); the full movement test binary passed 5/5. `CUDA_COVERED_OPS.len() == 65`
-and `docs/CUDA_COVERAGE.md` still reports 65. Full
+and `docs/execution/CUDA_COVERAGE.md` still reports 65. Full
 `cargo test -p onnx-runtime-ep-cuda` passed, and
 `cargo build --locked -p onnx-runtime-ep-cuda` passed.
 
@@ -344,7 +344,7 @@ Gather's synchronous D2H validation and stream synchronization are therefore
 reported honestly. Gather, Shape, and Constant GPU numerics all pass.
 
 The remaining blocker is the stale source-derived audit in
-`docs/CUDA_COVERAGE.md:146-176`. It still claims 63 CUDA registry pairs, 62
+`docs/execution/CUDA_COVERAGE.md:146-176`. It still claims 63 CUDA registry pairs, 62
 advertised names, 51 shared CPU pairs, 43 shared standard-domain ops, and lists
 Constant/Gather/Shape among 50 CUDA gaps. Those claims contradict the registry
 and the same document's updated 65-op statements.
@@ -372,7 +372,7 @@ NVRTC available: 113 passed, 0 failed, 0 skipped. The movement GPU binary passed
 - GPU numerical tests actually executed on the H200 with CUDA 12.6 NVRTC; neither test skipped. Maximum absolute errors against the independent in-test reference were `3.814697266e-6` (block 32, symmetric zero point 8, K=45) and `4.577636719e-5` (block 128, explicit packed zero points, batched rank-3 input, K=173).
 - Decode follows standard low-nibble-first INT4 packing, per-output/per-block scales, default zero point 8, packed explicit zero points, and correctly bounds the final non-multiple K block. Optional group indices select scale/zero-point groups after host-side range validation.
 - The implementation explicitly accepts only f32 activations/scales/output and returns a dtype error for fp16 rather than producing incorrect output. The f32-only/full-f32 temporary dequantization limitation is documented.
-- `CUDA_COVERED_OPS` contains exactly 62 unique names; its exact `.len()` assertion is 62. `docs/CUDA_COVERAGE.md` reports 62 advertised CUDA ops and documents `MatMulNBits`.
+- `CUDA_COVERED_OPS` contains exactly 62 unique names; its exact `.len()` assertion is 62. `docs/execution/CUDA_COVERAGE.md` reports 62 advertised CUDA ops and documents `MatMulNBits`.
 - Validation passed: 105 crate tests listed and the full `onnx-runtime-ep-cuda` suite passed; `cargo build --locked -p onnx-runtime-ep-cuda` passed.
 
 #### Source: `rachael-int8-nbits-review.md`
@@ -471,7 +471,7 @@ NVRTC available: 113 passed, 0 failed, 0 skipped. The movement GPU binary passed
 
 ### 2026-07-16: Retain projection fusion as a reviewed load-time design
 **By:** Nabil; verified by Fact Checker
-**What:** `docs/PROJECTION_FUSION.md` proposes a conservative CPU `Executor::build` rewrite that concatenates compatible `MatMulNBits` B/scale rows along N and supplies zero-copy output views. In the inspected Qwen2.5-0.5B artifact, QKV is already packed, so the only directly available target is each gate/up pair (`N=4864|4864 → 9728`); implementation awaits user approval.
+**What:** `docs/quantization/PROJECTION_FUSION.md` proposes a conservative CPU `Executor::build` rewrite that concatenates compatible `MatMulNBits` B/scale rows along N and supplies zero-copy output views. In the inspected Qwen2.5-0.5B artifact, QKV is already packed, so the only directly available target is each gate/up pair (`N=4864|4864 → 9728`); implementation awaits user approval.
 **Why:** The build seam is before planning, allocation, and kernel caching, where immutable initializers and mutable graph structure are both available. The verifier confirmed the model topology, packing math, and seam. The potential gain is approximately 2–7%, but the exact 124.6875 MiB newly constructed B+scale payload is a lower bound rather than a guaranteed RSS increase because alignment fallback copies can raise retained or peak memory.
 
 #### Source: `deckard-numa-decode.md`, `holden-numa-decode-review.md`, `sebastian-numa-parse-fix.md`
@@ -510,7 +510,7 @@ NVRTC available: 113 passed, 0 failed, 0 skipped. The movement GPU binary passed
 
 ### 2026-07-16: Close the CPU elementwise sweep and retain the native CUDA decode design
 **By:** Scribe
-**What:** The standalone contiguous-f32 residual `Add` fast path is closed as a negative result: its small local improvement regressed paired decode and was reverted (`3c0788a`). `docs/NATIVE_CUDA_DECODE.md` (`b416b7f`, amended by `33beb8d`) is the fact-checked design for the GPU-decode frontier, recommending `Arc<dyn ExecutionProvider>` polymorphism through five milestones: EP-polymorphic execution, target-compatible coverage, O(1) device-resident KV, CUDA graph replay, and performance tuning. It is awaiting user greenlight and is not implemented.
+**What:** The standalone contiguous-f32 residual `Add` fast path is closed as a negative result: its small local improvement regressed paired decode and was reverted (`3c0788a`). `docs/execution/NATIVE_CUDA_DECODE.md` (`b416b7f`, amended by `33beb8d`) is the fact-checked design for the GPU-decode frontier, recommending `Arc<dyn ExecutionProvider>` polymorphism through five milestones: EP-polymorphic execution, target-compatible coverage, O(1) device-resident KV, CUDA graph replay, and performance tuning. It is awaiting user greenlight and is not implemented.
 **Why:** The residual `Add` candidate improved Add only 1.3% while reducing end-to-end decode 1.5%, closing the CPU elementwise sweep. Fact Checker verified 14 central design claims, including the executor's concrete CPU EP, object-safe EP dispatch, coverage gaps, packed-QKV CUDA GQA blocker, and O(capacity) CUDA KV update. The amendment requires a real non-null CUDA stream and serialized ownership for non-Send/Sync CUDA graphs; virtual-dispatch cost remains an unmeasured assumption.
 
 #### Sources: `zhora-onnxrs-test-port.md`, `coco-onnxrs-testport-review.md`
@@ -523,7 +523,7 @@ NVRTC available: 113 passed, 0 failed, 0 skipped. The movement GPU binary passed
 ### 2026-07-16: Complete native CUDA decode Milestone 1a
 **By:** Deckard; reviewed by Holden
 **What:** Merged `f795d45` makes the native session executor EP-polymorphic: `Executor`, `Executor::build`, and `KernelCache::get_or_create` now retain `Arc<dyn ExecutionProvider>` / `&dyn ExecutionProvider` rather than concrete CPU types. `auto_detect_cpu_ep` still constructs the same initialized `CpuExecutionProvider`; CPU-only session construction, kernel dispatch, host buffers, and device selection are otherwise unchanged.
-**Why:** This behavior-preserving seam is Milestone 1a of `docs/NATIVE_CUDA_DECODE.md`. CPU validation passed all 413 EP tests and reproduced exact tokens `[11576, 42740, 11, 358, 614, 264, 3405, 911]`; 59.99 tok/s versus the 58.44 tok/s reference is within noise. Holden cleared the one-file refactor: EP virtual calls remain cache-miss-only, outside steady-state kernel execution, with no CUDA/device branching, unsafe, downcasting, or dispatch-policy changes. M2—device tensors and on-device op coverage—is next, gated on user decisions in the design doc (GPU floor, KV capacity, hard-fail policy, and graph ownership), plus packed-QKV CUDA GQA and O(1) device-KV prerequisites.
+**Why:** This behavior-preserving seam is Milestone 1a of `docs/execution/NATIVE_CUDA_DECODE.md`. CPU validation passed all 413 EP tests and reproduced exact tokens `[11576, 42740, 11, 358, 614, 264, 3405, 911]`; 59.99 tok/s versus the 58.44 tok/s reference is within noise. Holden cleared the one-file refactor: EP virtual calls remain cache-miss-only, outside steady-state kernel execution, with no CUDA/device branching, unsafe, downcasting, or dispatch-policy changes. M2—device tensors and on-device op coverage—is next, gated on user decisions in the design doc (GPU floor, KV capacity, hard-fail policy, and graph ownership), plus packed-QKV CUDA GQA and O(1) device-KV prerequisites.
 
 #### Sources: `deckard-cuda-m1a.md`, `holden-cuda-m1a-review.md`
 
@@ -651,7 +651,7 @@ All bound enums are **DONE**:
 
 ### 2026-07-16: Sub-4-bit IQ/MXFP4 quant — design + CPU proto
 **By:** Bryant
-**What:** Added `docs/SUB4BIT_QUANT.md` with exact llama.cpp IQ1/IQ2/IQ3 and OCP MXFP4 layouts, recommended linear `MatMulNBits` plus format-explicit block-quantized MatMul/MoE ops, Mobius capability wiring, and an ORT issue draft. Extended the CPU EP's registered `com.microsoft::MatMulNBits` kernel to execute standard linear `bits=2` weights through the f32 correctness path, with partial-block parity and bit-packing tests.
+**What:** Added `docs/quantization/SUB4BIT_QUANT.md` with exact llama.cpp IQ1/IQ2/IQ3 and OCP MXFP4 layouts, recommended linear `MatMulNBits` plus format-explicit block-quantized MatMul/MoE ops, Mobius capability wiring, and an ORT issue draft. Extended the CPU EP's registered `com.microsoft::MatMulNBits` kernel to execute standard linear `bits=2` weights through the f32 correctness path, with partial-block parity and bit-packing tests.
 **Why:** Enables huge-MoE sub-4-bit weights to remain compressed and makes top-k expert offload practical on smaller machines without misinterpreting IQ grid bytes as linear integers.
 **Follow-ups:** Grid-codebook IQ kernels, full MXFP4 MatMul, direct 2-bit/IQ CPU optimization, CUDA kernels, Mobius export and EP-capability wiring, expert residency/offload, and a fused block-quantized MoE op.
 
@@ -738,7 +738,7 @@ The scoped skip grep found no `Unsupported`, `todo!`, `unimplemented!`, `unreach
 
 ### Weight-specific residency design awaits greenlight
 **By:** Nabil
-**What:** `docs/WEIGHT_OFFLOAD.md` specifies an immutable mmap → bounded host cache → bounded VRAM cache subsystem with expert/page leases, fused-MoE paging, and Resource Governor sub-budgets.
+**What:** `docs/memory/WEIGHT_OFFLOAD.md` specifies an immutable mmap → bounded host cache → bounded VRAM cache subsystem with expert/page leases, fused-MoE paging, and Resource Governor sub-budgets.
 **Why:** Immutable external weight ranges have alignment, representation, transfer, and in-flight lifetime requirements unlike token-indexed mutable KV. The design reuses tiering concepts without coupling to KV structures or connector APIs. **Awaiting user greenlight; not implemented.**
 
 ### DeepSeek-V4-Flash MTP and CSA sidecars
@@ -1163,7 +1163,7 @@ Verified on NVIDIA H200, compute capability 9.0, driver 580.105.08.
 
 ### 2026-07-16: DeepSeek CSA and iterative MTP runtime design
 **By:** Nabil
-**What:** Added `docs/DEEPSEEK_CSA_MTP_RUNTIME.md` (`bca068c`), specifying private-v1 `CompressedSparseAttention` and `SparseKvGather` ops; metadata-declared compressed/index/carry state with checkpointed rollback; CPU-before-CUDA delivery; and a persistent MTP proposer with explicit BSHC `mtp_state`. **AWAITING USER GREENLIGHT.**
+**What:** Added `docs/models/DEEPSEEK_CSA_MTP_RUNTIME.md` (`bca068c`), specifying private-v1 `CompressedSparseAttention` and `SparseKvGather` ops; metadata-declared compressed/index/carry state with checkpointed rollback; CPU-before-CUDA delivery; and a persistent MTP proposer with explicit BSHC `mtp_state`. **AWAITING USER GREENLIGHT.**
 **Why:** Mobius PR #405 retains official 0/4/128 compressor/indexer tensors but currently executes zero-valued anchors plus dense sink-aware attention. The official CSA equations/cache layouts must be frozen before kernel work; existing MTP machinery cannot consume the DeepSeek sidecar state or persist it across iterations.
 
 ### 2026-07-16: First real-model sub-4-bit native generation validated
@@ -1299,7 +1299,7 @@ Re-reviewed commit `2ae464b5d894276f38a5855599c0c9124ea23558` against rejected b
 
 **Rationale:** `559c46f` correctly exposed `NativeDecodeDevice::Cuda` through `EngineConfig`, `SessionOptions`, and server CLI/environment selection, but the real 144-`BlockQuantizedMatMul` IQ4 model failed under a CUDA-only session during prefill and later on `Transpose`. The prior Constant/Gather fixture did not exercise this failure mode. Deckard's `fa30410` adds per-node CUDA capability probing, including symbolic/M>1 `BlockQuantizedMatMul`, and a reachable multi-token sub-4-bit regression: CPU generation succeeds; explicit CUDA and SessionOptions-routed CUDA fail deterministically at load with actionable remediation. A fully CUDA-supported smoke graph remains the positive CUDA parity proof.
 
-**Deferred:** True GPU serving for real sub-4-bit models requires heterogeneous CUDA-first/CPU-fallback placement, cross-device buffers/copies, and M>1 CPU prefill versus M=1 CUDA decode. The design is documented in `docs/HETEROGENEOUS_PLACEMENT.md` and is **AWAITING USER GREENLIGHT**.
+**Deferred:** True GPU serving for real sub-4-bit models requires heterogeneous CUDA-first/CPU-fallback placement, cross-device buffers/copies, and M>1 CPU prefill versus M=1 CUDA decode. The design is documented in `docs/execution/HETEROGENEOUS_PLACEMENT.md` and is **AWAITING USER GREENLIGHT**.
 
 ### 2026-07-16: Comparison and logical ops infer Bool outputs
 **By:** Chew; reviewed by Leon (🟢 CLEAR)
@@ -1499,10 +1499,10 @@ For affine block quantization, ORT requires K to be divisible by `block_size * p
 - `crates/onnx-runtime-session/src/executor.rs`
 - `crates/onnx-runtime-shape-inference/src/handlers/linalg.rs`
 - `crates/onnx-runtime-shape-inference/tests/op_rules.rs`
-- `docs/DEEPSEEK_CSA_MTP_RUNTIME.md`
-- `docs/HETEROGENEOUS_PLACEMENT.md`
-- `docs/PROGRESS.md`
-- `docs/SUB4BIT_QUANT.md`
+- `docs/models/DEEPSEEK_CSA_MTP_RUNTIME.md`
+- `docs/execution/HETEROGENEOUS_PLACEMENT.md`
+- `docs/status/PROGRESS.md`
+- `docs/quantization/SUB4BIT_QUANT.md`
 - `docs/benchmarks/e2e-sub4bit-validation.md`
 - `scripts/e2e-sub4bit-validation.sh`
 - `scripts/e2e_sub4bit_export.py`
@@ -1573,7 +1573,7 @@ Status: doc to be marked Approved; resolutions appended to §17.
 ### 2026-07-17T05-16-20: DEEPSEEK_CSA_MTP_RUNTIME.md — §9 decisions confirmed + 14 open questions resolved
 **By:** coordinator
 **What:** DEEPSEEK_CSA_MTP_RUNTIME.md — §9 decisions confirmed + 14 open questions resolved
-**Why:** Owner @justinchuby reviewed docs/DEEPSEEK_CSA_MTP_RUNTIME.md. Confirmed the §9 proposed decisions (CSA-1..7, MTP-1..6, GPU-1) EXCEPT the CSA-7 fallback default is flipped (see Q11). Resolved all 14 §10 open questions.
+**Why:** Owner @justinchuby reviewed docs/models/DEEPSEEK_CSA_MTP_RUNTIME.md. Confirmed the §9 proposed decisions (CSA-1..7, MTP-1..6, GPU-1) EXCEPT the CSA-7 fallback default is flipped (see Q11). Resolved all 14 §10 open questions.
 
 SOURCE OF TRUTH (Q1, and method for Q2-Q7): numerical truth = official HF deepseek-ai/DeepSeek-V4-Flash reference (inference/model.py + inference/kernel.py); run it to dump golden intermediate tensors, freeze as layout-v1 goldens in Phase 0. NeMo (Megatron-Bridge/AutoModel) + arXiv 2606.19348 for cross-check. llama.cpp is NOT faithful (Flash-Attn disabled, DSV4 graph WIP) — do not use for goldens. mobius is our exporter, not ground truth.
 
@@ -1601,7 +1601,7 @@ Status: design approved to begin Phase 0 (freeze contracts + goldens from the of
 ### 2026-07-17T04-50-59: HETEROGENEOUS_PLACEMENT.md — direction change + 6 questions resolved
 **By:** coordinator
 **What:** HETEROGENEOUS_PLACEMENT.md — direction change + 6 questions resolved
-**Why:** Owner @justinchuby reviewed docs/HETEROGENEOUS_PLACEMENT.md. Major direction change on Q1 plus resolutions for all 6 open questions.
+**Why:** Owner @justinchuby reviewed docs/execution/HETEROGENEOUS_PLACEMENT.md. Major direction change on Q1 plus resolutions for all 6 open questions.
 
 DIRECTION CHANGE (Q1): The doc's core premise — route M>1 quantized prefill to CPU — is REJECTED as unusable for GLM-5.2/DeepSeek-scale models ("prefill 必须留 CUDA"). Root cause is a kernel gap: CUDA BlockQuantizedMatMul is GEMV-only (M=1). Decision: FIRST build a CUDA BlockQuantizedMatMul M>1 GEMM prefill kernel (done: commit a99f7a8, pending review), so prefill stays batched on CUDA. Heterogeneous placement is put ON HOLD and, when resumed, shrinks to a narrow safety net: CPU fallback ONLY for ops with genuinely no CUDA kernel — never the hot quantized matmul. `DevicePreference::Gpu` = CUDA-preferred; keep a strict CUDA-only mode available for benchmarking/coverage-proof.
 
@@ -1622,7 +1622,7 @@ Status: design ON HOLD pending the CUDA GEMM prefill kernel; will be re-scoped t
 ### 2026-07-17T04-28-26: WEIGHT_OFFLOAD.md — 10 open questions resolved by owner
 **By:** coordinator
 **What:** WEIGHT_OFFLOAD.md — 10 open questions resolved by owner
-**Why:** Owner @justinchuby resolved all 10 open questions in docs/WEIGHT_OFFLOAD.md during design review.
+**Why:** Owner @justinchuby resolved all 10 open questions in docs/memory/WEIGHT_OFFLOAD.md during design review.
 
 Q1 lazy-initializer boundary: general executor WeightHandle from the start, compatible with existing ORT plugin EPs via capability detection — paging-capable EPs advertise an nxrt capability flag and get a lazy WeightHandle; stock ORT EPs get a materialized resident tensor fallback. Paging is opt-in, never a correctness dependency.
 
@@ -1705,7 +1705,7 @@ Status: design approved; Phase 1 = mmap disk tier + active-expert CPU MoE access
 ### 2026-07-17: Close priority onnx-rs inference-spec gaps
 **By:** Sapper
 **What:** Added ONNX-ML `TypeProto.Opaque`, expanded protobuf structural checking, and grew the built-in schema registry from 8 to 15 operators (22 versioned entries). Opaque uses `domain = 1`, `name = 2`, and `TypeProto.opaque_type = 7`. Checker additions cover metadata keys, attribute unions/references, recursive container types, dense payloads, sparse COO indices, and multi-device device-group maps. Added Softmax, LayerNormalization, Gather, Reshape, Transpose, Concat, and Slice schemas.
-**Why:** These were the highest-priority non-training gaps in `docs/ONNX_RS_SPEC_COVERAGE.md`. Field numbers were verified against the official ONNX v1.20.0 ONNX-ML schema: https://raw.githubusercontent.com/onnx/onnx/v1.20.0/onnx/onnx-ml.proto. Remaining inference gaps are the complete standard/ONNX-ML schema catalogs, function validation, quantization annotation semantics, remaining IR gates, string UTF-8 and packed-padding checks, full mutation/Text grammar, shape inference, and version conversion. Training semantics remain explicitly out of scope.
+**Why:** These were the highest-priority non-training gaps in `docs/architecture/ONNX_RS_SPEC_COVERAGE.md`. Field numbers were verified against the official ONNX v1.20.0 ONNX-ML schema: https://raw.githubusercontent.com/onnx/onnx/v1.20.0/onnx/onnx-ml.proto. Remaining inference gaps are the complete standard/ONNX-ML schema catalogs, function validation, quantization annotation semantics, remaining IR gates, string UTF-8 and packed-padding checks, full mutation/Text grammar, shape inference, and version conversion. Training semantics remain explicitly out of scope.
 
 #### Source: `sapper-onnxrs-round2.md`
 
@@ -2201,18 +2201,18 @@ Consequences: Chew's IR container refactor stays; GraphView lens is an additive 
 <!-- Source: chew-ir-refactor.md -->
 ### 2026-07-17: Make single-node graph removal fanout-independent
 **By:** Chew
-**What:** Replaced `Value.consumers: Vec<NodeId>` with a hash-backed `(NodeId, input_index)` use set; added sorted deterministic `uses`/`consumers` boundaries, `Graph::replace_input`, per-value graph-I/O flags, and Vec-indexed topological-order scratch. Updated every workspace edge reader/mutator, added randomized equivalence/topology/serialization determinism proofs, and committed a release benchmark harness plus `docs/IR_CONTAINER_REFACTOR.md`.
+**What:** Replaced `Value.consumers: Vec<NodeId>` with a hash-backed `(NodeId, input_index)` use set; added sorted deterministic `uses`/`consumers` boundaries, `Graph::replace_input`, per-value graph-I/O flags, and Vec-indexed topological-order scratch. Updated every workspace edge reader/mutator, added randomized equivalence/topology/serialization determinism proofs, and committed a release benchmark harness plus `docs/architecture/IR_CONTAINER_REFACTOR.md`.
 **Why:** Removing hub consumers one at a time was quadratic because every removal retained over the full consumer vector and scanned graph I/O. On the same 96-vCPU Xeon 8480C, release median sequential removal improved from 17.137 ms to 1.589 ms at 10k consumers and 58.792 ms to 2.927 ms at 20k; one hub-edge disconnect improved from 3.467 us to 0.683 us and 6.366 us to 0.815 us. Hash iteration is never observable: uses sort by `(NodeId,input_index)`, consumers/traversals sort by `NodeId`, Debug sorts, serialization/topology tests require byte-identical results after shuffled insertion. Wallace (IR owner) must review before merge.
 
 <!-- Source: coordinator-landed-cuda-cpu-token-16-drift-fix-ccf994c-kimi-k3.md -->
 ### 2026-07-17T18-30-21: Landed CUDA↔CPU token-16 drift fix (ccf994c); Kimi K3 MoE expert-parallelism doc read + kept in mind
 **By:** coordinator
 **What:** Landed CUDA↔CPU token-16 drift fix (ccf994c); Kimi K3 MoE expert-parallelism doc read + kept in mind
-**References:** ccf994c, docs/MOE_EXPERT_PARALLELISM.md, wt-fusion, wt-ir-refactor
+**References:** ccf994c, docs/quantization/MOE_EXPERT_PARALLELISM.md, wt-fusion, wt-ir-refactor
 **Why:** ## Landed
 - **ccf994c** — fix(ep-cuda): resolve/characterize token-16 MatMulNBits drift + extend decode parity to 32-64 tokens (author Mariette; reviewer Holden 🟢 APPROVE, 166 ep-cuda tests pass, drift 2.67e-5 deterministic reduction-order variance, 64-token parity @2e-5). Carried Deckard's per-op drift-bound test (d7cec74). Redundant GQA-present-shape commit auto-dropped (already upstream via c89e61f). Rebased linear, FF-pushed, worktree cleaned.
 
-## Kimi K3 architecture — read & noted (docs/MOE_EXPERT_PARALLELISM.md, commits 222c9a8+4538a96)
+## Kimi K3 architecture — read & noted (docs/quantization/MOE_EXPERT_PARALLELISM.md, commits 222c9a8+4538a96)
 Authoritative target specs now in-repo: Kimi K3 = 2.8T / 896 experts / 16 active (~50B active, ~1.4TB FP4). Novel components: KDA (Kimi Delta Attention), AttnRes (cross-layer attention residuals), Gated MLA, Stable LatentMoE + Quantile Balancing. Deployment design: session-per-GPU expert parallelism, control-plane(Rust)/data-plane(GPU) separation, MoeDispatch/MoeGather NCCL custom ops baked into each session graph, distributed PageTable (per-device shards), Mac Studio (MLX+TB5) cross-node path. REINFORCES our direction: frozen-plan hot path + GraphView lens (EPs get immutable graph views), EP-claim of custom NCCL op nodes, per-attention-type KV caching keyed by inference_metadata. No conflict with the in-flight IR refactor.
 
 ## In flight
@@ -2361,9 +2361,9 @@ CMakeLists) is pre-existing and unrelated — confirmed not touched by this chan
 ### 2026-07-17T19-17-36: Kimi readiness doc landed (8a73116); native MLA is the headline Kimi/DeepSeek gap — queued for design, GLM CUDA ops remain the active focus
 **By:** coordinator
 **What:** Kimi readiness doc landed (8a73116); native MLA is the headline Kimi/DeepSeek gap — queued for design, GLM CUDA ops remain the active focus
-**References:** 8a73116, docs/KIMI_K_READINESS.md, docs/MOE_EXPERT_PARALLELISM.md, docs/GLM_READINESS_GAPS.md
+**References:** 8a73116, docs/models/KIMI_K_READINESS.md, docs/quantization/MOE_EXPERT_PARALLELISM.md, docs/models/GLM_READINESS_GAPS.md
 **Why:** ## Landed
-- **8a73116** — docs/KIMI_K_READINESS.md (author Nabil, coordinator-committed + cross-linked to MOE_EXPERT_PARALLELISM.md). Op/kernel-coverage companion to the deployment doc.
+- **8a73116** — docs/models/KIMI_K_READINESS.md (author Nabil, coordinator-committed + cross-linked to MOE_EXPERT_PARALLELISM.md). Op/kernel-coverage companion to the deployment doc.
 
 ## Key finding — native MLA is the headline Kimi/DeepSeek gap
 Nabil (well-sourced: K2 config, K3 announcement, Kimi Linear proxy) confirms our GroupQueryAttention and CompressedSparseAttention do NOT implement MLA's latent-KV compression (kv_lora_rank=512, q_lora_rank=1536) or decoupled RoPE (128 non-RoPE + 64 RoPE dims). Verified K2 = 1T/384-expert/top-8 + 1 shared, MLA, FP8 (E4M3, 128x128 blocks), num_nextn_predict_layers=0 (no MTP). Announcement-level K3 = 2.8T/896/16, KDA + AttnRes + Gated MLA + Stable LatentMoE + MXFP4-weight/MXFP8-activation; weights/report due ~2026-07-27.
@@ -2386,7 +2386,7 @@ MLA is NOT on the immediate GLM-5.2 critical path (GLM uses DSA/dense + CSA, not
 ## Verdict: 🟢 APPROVE
 
 The diff correctly unblocks native CUDA loading of the GLM/DeepSeek portable exports
-(P0 gap in `docs/GLM_READINESS_GAPS.md`). Every added op is semantically faithful to
+(P0 gap in `docs/models/GLM_READINESS_GAPS.md`). Every added op is semantically faithful to
 the CPU reference, deterministic, and dtype-generic where it should be. The gate is
 green on an H200.
 
@@ -2534,7 +2534,7 @@ boundaries plus 10k-node/MoE allocation benchmarks.
 
 **Blocking defects:**
 1. `TopK` writes its output with the selected-axis and trailing dimensions transposed when `axis` is not the final dimension and `K > 1`. In `crates/onnx-runtime-ep-cuda/src/kernels/topk.rs:44`, the destination offset is `(outer * inner + i) * k + out`; contiguous output shape replaces the input axis with `K`, so it must be `(outer * k + out) * inner + i`. For `[2, 3]`, `axis=0`, `K=2`, CUDA writes `[4,4,5,2,6,6]`, whereas a contiguous `[2,3]` TopK output is `[4,5,6,4,2,6]`. The new `topk_largest_ties_k_input_and_non_default_axis` test encodes the transposed order, so it does not catch this. Coco must revise this artifact; Vasquez must not revise it.
-2. The requested scope is `crates/onnx-runtime-ep-cuda/` only, but the commit also changes `docs/CUDA_COVERAGE.md`. Remove that unrelated out-of-scope change in the revision.
+2. The requested scope is `crates/onnx-runtime-ep-cuda/` only, but the commit also changes `docs/execution/CUDA_COVERAGE.md`. Remove that unrelated out-of-scope change in the revision.
 
 **Verified:** `cargo test --locked -p onnx-runtime-ep-cuda 2>&1 | tail -25` passed (CUDA environment specified by the request; 21 library tests passed and all integration/doc-test groups completed green). The green gate does not cover the layout defect.
 
@@ -2677,7 +2677,7 @@ or fabricating an output shape.
 - **Author:** Ripley (architect)
 - **Date:** 2026-07-18
 - **Branch:** `bqmoe-design` (worktree `/home/justinchu/wt-bqmoe`), commit `2a7e45a`
-- **Deliverable:** `docs/BLOCKQUANTIZEDMOE_DESIGN.md` (docs-only, no kernels)
+- **Deliverable:** `docs/quantization/BLOCKQUANTIZEDMOE_DESIGN.md` (docs-only, no kernels)
 - **Status:** AWAITING JUSTIN SIGN-OFF on the op contract before any kernel work
 
 ## Summary
@@ -2731,7 +2731,7 @@ at `weight.rs:94-104`.
    (`crates/onnx-runtime-ep-api/src/weight.rs:121-161,205-227`).
 8. Freeze as version 1 now (default: yes).
 
-Full rationale and file:line citations in `docs/BLOCKQUANTIZEDMOE_DESIGN.md`.
+Full rationale and file:line citations in `docs/quantization/BLOCKQUANTIZEDMOE_DESIGN.md`.
 
 <!-- merged from sapper-onnxrs-r8.md -->
 

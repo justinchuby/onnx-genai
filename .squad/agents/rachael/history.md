@@ -1,69 +1,52 @@
-# Rachael — History (compacted 2026-07-29)
+# Rachael — History (compacted 2026-08-12)
 
 **Role:** CLI/server/API implementer for onnx-genai. Owns OpenAI-compatible server behavior, REPL/maintainer-tool UX, endpoint routing, streaming/session invariants, and user-visible runtime controls while preserving non-TTY byte stability.
 
 ## Durable lessons
 - Server surface includes `/health`, `/v1/models`, `/v1/chat/completions`, SSE streaming, `X-Session-Id`, session lifecycle routes, tools/tool_choice/tool-role handling, JSON response constraints, FIM, image parts, and audio routing.
 - Server DoS/session hardening is canonical: `max_output_tokens=4096`, `max_sessions=256` LRU, 128-bit CSPRNG session ids, context-token caps, loopback/no-auth deployment notes.
-- Static-cache HTTP concurrency uses a single engine driver thread and channels; do not reintroduce shared Engine locking. Future tool pause/resume should extend the driver protocol.
-- Batched-driver admission is bounded by `max_pending` with HTTP 429; output delivery must be non-blocking so slow/closed clients cannot stall other rows.
-- Vision/audio quality is gated on production Mobius model packages and complete processor metadata; routing alone does not prove real quality.
+- Static-cache HTTP concurrency uses a single engine driver thread and channels; do not reintroduce shared Engine locking.
+- Batched-driver admission is bounded by `max_pending` with HTTP 429; output delivery must be non-blocking.
 - `/v1/debug/*` must be default-off and redact session identifiers.
-- Embeddings empty `model` must fall back to the default, matching other inference endpoints; unknown model returns 404.
-- Unsupported-op diagnostics use explicit `OpsetVersion::{Known, Undeclared}` plus graceful unnamed nodes; normal loader validation makes undeclared opsets unreachable.
-- Zero-copy mmap initializer borrowing landed, but producer-aliasing soundness restrictions were later added by Zhora.
-- Zhora's full-spec onnx-rs serde claim was rejected: vendored ONNX v1.16.2/IR10 proto was stale versus v1.22.0/IR13, and base64 retained-proto native text is non-authoritative; Zhora is locked out and Batty owns revision.
-- Qwen Sigmoid fusion must recognize `Mul(x, Sigmoid(x))`, be allocation-free, and include multi-consumer negative coverage.
-- The initial Python genai Engine wrapper had a cross-thread PyO3 panic; Sebastian's cleared revision is canonical.
-- MLAS SQNBit regressed single-sequence decode but retained prefill potential, informing hybrid M-routing.
-- Flash-attention/GQA work must preserve causal-origin parity; CUDA graph decode relies on persistent external-shape seeding.
-- Per-op trace sites should emit logical bytes and documented FLOP estimates without overhead regressions.
-- Native fp16 CUDA performance work must remain correct and fast across supported SM architectures, not only sm_90.
-- QKV-bias folding and paired gate/up+SwiGLU fusion require guarded patterns and two-op-exact fp16 rounding.
-- WP-B optional-modality metadata schema landed; Rachael's WP-B design note remains active for WP-B2/WP-B3.
-- CLI is a maintainer/development harness; backlog source of truth is `docs/research/cli/00-backlog.md`.
-- REPL Phase 1 invariants: non-TTY stdin/stdout stays byte-stable; true TTY uses `reedline`; slash parser/help/completion come from a declarative registry; `/fork` and `/rewind` remain out of Phase 1.
-- TTY output owns exactly one separator newline when generated text lacks a trailing newline; piped REPL output keeps legacy separators.
-- Compact TTY stats are allowed to be a two-line block; non-TTY opt-in stats keep the single-line formatter for byte stability.
-- Reviewer lockouts remain canonical, including PR #300 after author lockout and PR #346 after Bryant lockout.
+- Zero-copy mmap initializer borrowing landed; producer-aliasing soundness restrictions added by Zhora.
+- Qwen Sigmoid fusion must recognize `Mul(x, Sigmoid(x))`, allocation-free, with multi-consumer negative coverage.
+- REPL Phase 1: non-TTY stdin/stdout byte-stable; TTY uses `reedline`; slash parser from declarative registry; `/fork`/`rewind` out of Phase 1.
+- TTY output owns exactly one separator newline when generated text lacks a trailing newline.
+- EP test hardening: `disable_cpu_ep_fallback=1` + EP assignment assertions; non-vacuity proven by forced wrong-EP assertions.
+- `NXRT_REQUIRE_ORT_TESTS` gate must route all skip paths (fixture-missing, dlopen failure) through the gate; `.ok()?` silent skips are forbidden.
+- `find_ort_lib_dir` must honour `NXRT_ORT_LIB_DIR` → `CARGO_TARGET_DIR`/debug/build → workspace default with platform-aware library names.
 
-## Recent work (current wave, ~2026-07-28/29)
+## Historical context (pre-2026-08-11)
+Wave coverage through 2026-07-28: CLI UX research, REPL redesign, Phase 1 TTY/plain split with `reedline`, PR #300/#346 lockout revisions, REPL stats two-line block. Full detail in `history-archive.md`.
 
-## 2026-07-27T09:15:14-07:00 — CLI UX/server-surface research
+## Recent entries
 
-- Audited `onnx-genai` interactive REPL, streaming output, `serve` ergonomics, and CLI reachability of server/runtime features.
-- Wrote findings to `docs\research\cli\02-ux-and-server-surface.md`; top gaps are remote OpenAI-compatible client mode, structured/quiet output, stronger REPL input/history, explicit session/fork/rewind UX, and advanced runtime controls.
+## 2026-08-11 — PR #762 final test hardening
 
-## 2026-07-27T09:30:56-07:00 — REPL redesign research
+**Commit:** `c1d2556b5`
 
-- Wrote `docs\research\cli\05-repl-redesign.md` after Justin clarified the CLI is a maintainer tool and the REPL is the primary CLI investment.
-- Recommended preserving ratatui inline viewport/native scrollback, adding a TTY-only `reedline` editor, generating slash help/completions from a declarative registry, and keeping non-TTY e2e output byte-stable.
+- `layernorm_dynamic_axis.rs`: `disable_cpu_ep_fallback=1` + EP assignment assertion for `LayerNormalization`.
+- New conformance tests: `conformance_add_float16`, `conformance_add_bfloat16`, `conformance_layer_norm_multi_output`, `conformance_layer_norm_neg_axis`, `conformance_rms_norm` — all with assignment assertions.
+- 14 total EP assignment assertions across two test files.
+- BL1 shape assertions (mean/inv_std shape `[2, 3, 1]`) fully preserved. Non-vacuity proved.
 
-### 2026-07-27T13:10:00-07:00 — CLI backlog now on main
-Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CLI improvement track are now on main at `docs/research/cli/00-backlog.md`. Use that file as the source of truth before picking up queued CLI backlog work.
+## 2026-08-12 — PR #762: Test-integrity gate hardening
 
-## 2026-07-27T14:15:00-07:00 — REPL Phase 1 implementation
+- Fixed `find_ort_lib_dir` to honour `CARGO_TARGET_DIR` (matching `cdylib_resolve.rs` logic).
+- Routed fixture-missing and dlopen-failure skip paths through the `NXRT_REQUIRE_ORT_TESTS` gate.
+- Added `NXRT_REQUIRE_ORT_TESTS=1` to CI `CLI ORT (Linux x86_64)` lane + cpu-plugin test step.
+- Test counts: 40 passed, 0 failed. Commit: `88f9de8df`.
 
-- Implemented the Phase 1 TTY/plain split for `onnx-genai run`: piped stdin/stdout stays on the byte-stable `read_line` loop, while true TTY sessions use a rich `reedline` editor.
-- Chose `reedline` after verifying it shares `crossterm v0.29.0` with ratatui 0.30.2; it provides multiline Alt+Enter input, cursor movement, persistent file-backed history, bracketed paste, and slash completion.
-- Replaced the hand slash-command parser/help with a declarative registry that also drives command and argument completion; `/fork` and `/rewind` remain out of Phase 1.
-- Made compact stats default-on only for interactive TTY sessions and added `run --no-stats`; non-TTY scripts keep stats opt-in via `/stats`.
+## 2026-08-12 — PR #762 ready for review (gate hardening complete)
 
-## 2026-07-27T02:00:00Z — Roadmap wave update
-- Fixed PR #300 / #76 after author lockout: capability projection now rejects non-convex merges with deterministic union-find + Kahn check; merged after Leon approval.
+All five red CI jobs trace to pre-existing `onnx-genai-server` failure on `main`; branch does not touch that crate. 283 passed / 0 failed. Gaff confirmed gate coverage genuinely closed. Freysa completed `find_ort_lib_dir` consolidation. PR #762 marked ready for review.
 
-## 2026-07-28T11:20:06+0000 — Independent #75 lockout revision
-- Took ownership of PR #346's revision after Holden requested changes and Bryant was locked out.
-- `c20ec211` corrected StringNormalizer/TfIdfVectorizer default-domain registration and LabelEncoder-1 default-attribute dtype selection; Holden re-approved.
+*Full pre-2026-08-11 history in `history-archive.md`.*
 
-## 2026-07-28T10:10:00-07:00 — REPL newline and stats polish
+## 2026-08-12 — PR #32001 (microsoft/onnxruntime): Cross-target Accelerate blocker
 
-- Fixed TTY turn finalization so generated text that lacks its own trailing newline is followed by exactly one CLI-owned separator before the next prompt/status/error path; piped REPL output keeps the legacy byte-stable separator behavior.
-- Expanded compact stats/profile reporting with explicit prefix-cache hit tokens plus percent of prompt, KV page activity on the compact line, and matching JSON/profile fields.
-
-## 2026-07-28T10:33:00-07:00 — REPL stats block two-line follow-up
-
-- Revised TTY stats rendering from a squeezed one-line string to a deliberate two-line block: performance/termination first, cache/context/scheduler/pages/RSS second.
-- Restored compact finish reason and end-to-end throughput to the always-on TTY block now that Justin allowed two lines; non-TTY opt-in stats keep the single-line formatter for byte stability.
-
-Full pre-compaction history in `history-archive.md`.
+- Added `parser.error()` rejections for `--android`, `--build_wasm`, `--rv64` alongside `--use_apple_accelerate`.
+- Refactored all Apple Accelerate rejection tests to assert diagnostic message content (not bare SystemExit).
+- 4 new tests (android, build_wasm, build_wasm_static_lib, rv64). Test count: 13→17.
+- Documented Catalyst/macabi CMake limitation: `PLATFORM_NAME` comes from external toolchain, no reliable direct-CMake detection.
+- Commit: `184f76a00e`. PR left in draft for Opus review.

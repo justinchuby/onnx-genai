@@ -1,57 +1,112 @@
-# Batty — History (compacted 2026-07-29)
+# Batty — History (compacted 2026-08-12T06:00:00Z)
 
 **Role:** Engine/EP implementer for the Rust ONNX runtime. Owns generation policy, logical KV, scheduler/default semantics, CLI maintainer harness wiring, and CPU/native EP correctness while preserving ORT ownership of physical forward execution/KV.
 
 ## Durable lessons
 - Canonical ownership: ORT owns forward execution and physical KV; engine owns generation policy and logical KV.
 - CPU kernels rely on session-side `strided::view_in_bounds` before dispatch.
-- Metal-prefill hybrid measured slower than CPU and should not be productionized; connector KV import should eventually degrade to `Ok(None)` on import-runner failure.
 - Optimizer fusions live under `com.microsoft` and must fail closed with strict decline-to-fuse guards.
-- EPContext writer v1 was rejected for non-injective sidecar naming; Batty is locked out of that artifact. Gaff v3 merged as `0fa025e`.
 - Batty remains locked out of H-D1 storage sizing, earlier fusion follow-ups, EPContext writer, `test/tiny-reasoning-fixture`, and any artifact explicitly reassigned by reviewers.
-- `validate_model()` is the shared load-time validation path; empty graphs remain valid, dispatch-only checks stay out of load validation, and `Graph::validate` invariants are not duplicated.
-- Native backend Auto detection is exact for `com.github.onnxruntime.genai::BlockQuantizedMatMul` opset-v1; unsupported speculation, pipelines, or non-CPU selection must error explicitly.
-- Preserve the public `MtpConfig` struct contract through internal resolved config layers.
-- CUDA EP work must remain capture-safe and correct across supported SM architectures, not only sm_90; Qwen decode locks in `common/decode_lock.rs` are co-owned with Leon/Pris.
-- CLI `generate`/`run` absent `--max-new-tokens` fills remaining effective context; engine/server default remains 128; a 512-token warning fallback applies only when no limit is discoverable.
-- Sampling flags disable greedy when temperature/top-p/top-k imply stochastic decoding unless `--temperature 0` or explicit `--greedy`; `--no-greedy` exists.
-- Justin confirmed the CLI is a development/maintainer harness, not a consumer product; remote-client mode is out of scope and `docs/research/cli/00-backlog.md` is source of truth.
-- ControlNet fixes bind real Mobius `controlnet_cond`; do not invent `conditioning_scale`; multi-ControlNet fails loudly until supported.
-- Rewinds validate before session/token/KV mutation; unsupported sliding-window evicted positions and ORT-owned KV without paged materialization reject cleanly.
-- Scheduler keeps DESIGN §26.4/§26.11 conservative reservation: reserve prompt + admitted max_tokens, cap only when prompt+one token fits, and make caps observable in result, stderr, stats/profile.
-- Native `generate` bypasses scheduler admission; ORT direct/session generation goes through `drive_next_fcfs`.
-- Tiny reasoning fixture trap: Batty's statistical token-stream replacement was rejected (15/15 failures with fix intact; one suite green was a fluke, distinct-output evidence came from stderr timestamps) and Batty is locked out.
-- Empty assistant turns poison context like unclosed reasoning; closed paths must drop whitespace-only answers. Checked-in fixtures must be reproducible from generators.
+- `validate_model()` is the shared load-time validation path; empty graphs remain valid.
+- CUDA EP work must remain capture-safe and correct across supported SM architectures.
+- Sampling flags disable greedy when temperature/top-p/top-k imply stochastic decoding unless `--temperature 0` or explicit `--greedy`.
+- Tiny reasoning fixture trap: statistical token-stream replacement was rejected (15/15 failures). Batty locked out.
+- Empty assistant turns poison context; closed paths must drop whitespace-only answers.
+- Never infer output dtypes from inputs — always read from graph's declared value info.
+- Multi-output ops must not assume all outputs share input[0]'s shape; reduction outputs (Mean, InvStdDev) follow keepdims semantics.
+- The upstream CUDA EP is mature and actively staffed; competitive advantages are runtime-level and not portable upstream.
 
-## Recent work (current wave, ~2026-07-28/29)
+## Recent work (current wave, ~2026-08-11/12)
 
-### 2026-07-27 — ControlNet, rewind, backend, scheduler
-- Fixed PR #283 / #50 after Bishop REQUEST-CHANGES: removed invented `conditioning_scale`, bound real mobius `controlnet_cond`, made multi-ControlNet fail loudly, and added contract-pinning tests. Bishop approved; PR merged as `687612f5`.
-- Took over PR #291 after Leon's rejection under reviewer lockout and made failed rewinds validate before session mutation; unsupported sliding-window and ORT-owned-KV paths now leave logical tokens, `kv_token_count`, decode state, and paged KV unchanged.
-- Added shared `--backend auto|ort|native` for `generate`/`run`; `run --backend` seeds `SessionSettings`, default stays `auto`, and explicit `native` reaches `EngineConfig` or fails clearly without native feature support. Gates passed: build, lib tests, fmt check, clippy.
-- Scheduler regression work preserved conservative reservation, attached observable `budget_cap` metadata across swap-out/swap-in, reserved capped byte amounts atomically, and cleaned up both admitted/original requests on mismatch. Added model-free scheduler tests plus an engine test locking ORT-vs-native scheduler behavior.
+### 2026-08-11 — B2 Fix: Device-ID comparison for D2D copies (PR #762, commit fb9d757b3)
+`is_same_device()` via `MemoryDevice_GetDeviceId` (verified at `bindings.rs:6309`). Fast path: pointer equality. Null guard: fail-closed. 6 unit tests; 161+9 pass.
 
-### 2026-07-29T12:30:00Z — tiny-reasoning-fixture round 2 + empty-answer fix (PRs #410, #411)
+### 2026-08-12 — PR #31988 Build Fix (sm_count parameter mismatch)
+`TryMatMulNBits` gained `sm_count` but `fpA_intB_gemm_kernel_test.cc` not updated. Fixed by passing `device_prop_.multiProcessorCount`. Commit `55e438ca6f`.
 
-#### Round 2 (PR #410 → locked out)
-Authored round-2 replacement test: statistical token-stream assertion. Luv ran it alone:
-15/15 failures with the fix intact; one green in full parallel suite was a fluke; the
-supporting "8/8 distinct outputs" was a stderr-timestamp artifact — test compared stdout
-only. Luv issued REJECT; Batty locked out of `test/tiny-reasoning-fixture`.
-
-#### Empty-answer fix (shipped in PR #411)
-Diagnosed and fixed: `quick --greedy --max-new-tokens 3` stopped on `</think>` and
-committed an empty assistant turn. Commit path was unconditional on non-emptiness while
-`manifest.json` asserted the invariant. Fix: closed path now drops whitespace-only answers
-with a diagnostic distinct from "stopped inside reasoning". Also corrected the generator
-description string that had diverged from `manifest.json` (found during merge-conflict
-resolution — regenerating would have silently reverted the manifest correction).
-
-Durable rules: "A committed turn with an empty answer poisons context exactly as an
-unclosed one does." / "A checked-in fixture must be reproducible from its generator."
-(`.squad/decisions.md`, reconstructed rules section, 2026-07-29)
-
-Inbox drop `batty-reasoning-fixture-revision.md` was lost when the worktree was deleted
-before Scribe ran; content reconstructed into `.squad/decisions.md`.
+### 2026-08-12 — #762 Opus memory-safety wave corrective completion (commit b906ab2bb)
+(1) EP assignment assertion added — `add_skip_layer_norm_mul_routed` proves Add/SkipLayerNormalization/Mul assigned to `cpu_ep`. (2) `end_version: since` → `i32::MAX`. (3) `struct_size` loader validation. (4) `NXRT_REQUIRE_ORT_TESTS=1` gate. (5) `matmul_initializer_weights` fixture. (6) 5 `.gitignore` negations. 278 passed / 0 failed.
 
 Full pre-compaction history in `history-archive.md`.
+
+## 2026-08-12 — PR #32003 narrative fix + PTX evidence (confirmed ready for review)
+
+- Corrected three overstated claims in PR body (unused-param not reproduced,
+  aliasing scope narrowed, template-instantiations wording removed).
+- Produced PTX codegen-neutral evidence: 12/12 pairs byte-identical across
+  sm_53/70/75/80/86/90 × {-O0, -O3}. No normalisation required.
+- Updated PR body via GitHub REST API.
+- clang-format passes; leak check clean.
+- Coordinator independently reproduced PTX result: byte-identical confirms
+  codegen-neutral status. PR marked ready for review.
+
+## 2026-08-12 — PR #31973 N1: HasCenteredTwoPassKernel()
+
+Closed the final blocker on #31973. Added `HasCenteredTwoPassKernel()` predicate
+(x86-64 compile-time guard) so the six precision suites skip on RISC-V/ARM where
+the centered two-pass algorithm isn't used. Fixed `mlas.h` wording (AMD64/IX86 →
+x86-64). Fresh build: 41 passed / 2 disabled, 43/43 with disabled. Produced
+benchmark numbers on AMD EPYC 9V74 (AVX2/FMA): LayerNorm 6.8–11.9× vs scalar
+at N≥128, RMSNorm 2.3–3.5× at same sizes, 1000 iters, p50 median.
+
+## 2026-08-12 — PR #31973 N1 wording fix (lockout, Deckard)
+
+Deckard corrected "x86-64" → "x86 (32-bit and 64-bit)" in `mlas.h`, `layernorm_kernel_avx2.cpp`,
+and six `GTEST_SKIP` messages after Challenger's delta review flagged the inaccuracy. Batty's
+implementation was correct; only the comment wording was stale. Head `4a16925a88`. PR #31973
+marked ready for review.
+
+## 2026-08-12 — Assigned Blocker 1 (LOAD) of the CUDA-capture escalation
+Branch `squad/native-pipeline-embedding`. Fix the native pipeline embedding / load
+path so Muse-Glimmer loads resident on the engine native decode path — precondition
+for CUDA-graph capture engaging. Part of Sebastian's 3-blocker escalation (LOAD +
+CLASSIFY [Deckard] + CAPTURE [Sebastian]). Shared team goal: **beat ORT 40 tok/s via
+CUDA-graph capture**. In progress.
+
+## 2026-08-12 — CUDA capture arc COMPLETE (shared: 11.4 → 23.13 tok/s)
+Blocker 1 (LOAD) landed as **#850** (`29bd8a35`): `PipelineEngine` now runs
+Muse-Glimmer's embedding component on the native CUDA EP (embeds-producer promoted
+to every_step, ORT-skips on native backend, bf16 gates relaxed, empty image-features
+seed, KV context ceiling threaded). End-to-end load + byte-exact parity. Prerequisite
+#2 of the 5-blocker chain (#848 → #850 → #852 → #855 → #854). Team result: native
+decode **11.4 → 23.13 tok/s**, capture fully engaged (1 segment / 0 seams). Next lever
+= Cast round-trip elimination (overlaps my decode-graph domain).
+
+## 2026-08-13 — Fusion arc: 47.25 tok/s is the CEILING (#872 doc-only, #873 opt-in)
+**#872** (doc-only): `CudaFoldConstantAdd` removed 208 cheap constant `Add` nodes/token but
+**REGRESSED −2.8%** (47.17→45.85) — not shipped. **#873** (MERGED): `CudaQkvProjectionFusion`
+(`optimizer.rs`) fused 3 per-layer q/k/v int4 projections into 1 wider `MatMulNBits` + `Split`,
+removing **104 EXPENSIVE GEMV launches/token** (417→313); byte-exact; tok/s **FLAT** (47.33→47.26).
+No new kernel. **Retained DISABLED-BY-DEFAULT** behind `ONNX_GENAI_CUDA_ENABLE_QKV_FUSION=1`;
+preserved for future dispatch-bound architectures. **CONCLUSION (with #870 GQA + #871/#872):
+native int4 decode of Muse-Glimmer-30B is weight-bandwidth/compute-floor bound at ~47.25 tok/s
+(H200), NOT dispatch-bound — the 3 projections read disjoint int4 weights so fusing cannot cut
+bytes. 47.25 is the architectural ceiling. A fused-launch QKV epilogue kernel is NOT worth
+building (still bandwidth-bound).**
+
+## 2026-08-13 — Graph-side glue node-collapse (`optimizer.rs`) is now the PRIMARY decode-overhead lever
+The persistent multi-CTA cooperative GEMV megakernel was built and measured a 🟥 NO-GO (~3% slower,
+#898) — so the kernel-family alternative to node fusion is off the table on H200. Combined with the
+#885 finding (decode is LATENCY-bound on the ~2568-node serial chain, ~8.2 µs/node), **graph-side
+glue node-collapse in `optimizer.rs` is now the primary named recoverable-overhead lever for native
+decode.** Target: the elementwise/norm "glue" (Phase B measured ~85.6% of *glue* GPU time fusible) —
+collapse glue nodes in the graph to shrink the captured graph's replay overhead, with no cooperative
+kernel, no grid.sync tax, no numerics reorder. Sebastian's landed fused epilogues (#867 SwiGLU-mul,
+#854 skip-RMSNorm) are the kernel-side enablers that let standalone nodes be deleted. NOTE: my #872
+`CudaFoldConstantAdd` (208 cheap Adds) REGRESSED and #873 QKV fusion was FLAT — so target the glue
+round-trips, not marginal disjoint-weight GEMV fusion.
+
+## 2026-08-13 — Glue node-collapse REALIZED: bf16 SiLU/SwiGLU-mul, +0.9% byte-exact (#900)
+Converted #899's +5.3% glue-collapse ceiling into a measured number on the production
+Muse-Glimmer-30B decode graph. **Root cause:** `CudaSiluFusion` (`optimizer.rs`) was gated to
+**Float16 only** and never fired on the bf16 stream — extended it to accept **BFloat16** (a
+portability fix under Rule 11). The standalone `Sigmoid`+`Mul`+`Mul` glue then collapses through
+`CudaSiluFusion`→`CudaSwiGluFusion` into the tagged `Mul[_cuda_silu_mul]`, lowered to Sebastian's
+landed `decomposed_silu_mul_bf16` epilogue (#867). **Measured +0.9% (47.20→47.63 tok/s), byte-exact**
+(24-token stream bit-identical), node count 22→20 glue/layer (−104 total; `Sigmoid` 104→52,
+`Mul` 210→158). `CudaGateUpSwiGluFusion` needs an fp16 activation so stays dormant → int4 GEMVs
+untouched. **SHIP.** Honest bound: only the 2 SiLU/SwiGLU-mul nodes/layer are byte-exactly
+collapsible here; bigger levers blocked — 6 norms/layer needed a bf16 skip kernel (Sebastian #903:
+kernel byte-exact but fold regresses −1.5%), 208 gamma+1 Adds already −2.8% (#872), 4 reshapes
+kernel-coupled. Realized ≤ ceiling as §8.3 predicted. Lesson: activate dormant byte-exact fusions
+before chasing new kernels; check the dtype gate first.

@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! CUDA-graph capture coverage for the **NVRTC block-reduction** reduce path
 //! (`ReduceSumSquare` and the other `ext_tags` ops, plus bf16, which cuDNN
 //! cannot reduce). This is the Lever-B counterpart to the cuDNN-path coverage in
@@ -46,13 +60,15 @@ fn bytes<T: Copy>(values: &[T]) -> Vec<u8> {
     }
 }
 
-fn gpu() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -226,7 +242,7 @@ fn sumsquare_capture_matches_eager_and_oracle(
     rows: usize,
     cols: usize,
 ) {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let runtime = ep.runtime();
 
     let n = rows * cols;
@@ -351,6 +367,10 @@ fn sumsquare_capture_matches_eager_and_oracle(
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fp16_reduce_sumsquare_captures_and_matches_eager() {
     // Router-style shape: [1,5,8] reduce trailing axis -> [1,5,1], keepdims.
@@ -364,6 +384,10 @@ fn fp16_reduce_sumsquare_captures_and_matches_eager() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn f32_reduce_sumsquare_captures_and_matches_eager() {
     sumsquare_capture_matches_eager_and_oracle(
@@ -379,6 +403,10 @@ fn f32_reduce_sumsquare_captures_and_matches_eager() {
 /// bf16 has no cuDNN reduce, so `ReduceSumSquare` bf16 exercises the NVRTC path
 /// exclusively. Proves it, too, is now capture-eligible (was always an eager
 /// seam before Lever B).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn bf16_reduce_sumsquare_captures_and_matches_eager() {
     sumsquare_capture_matches_eager_and_oracle(
@@ -394,6 +422,10 @@ fn bf16_reduce_sumsquare_captures_and_matches_eager() {
 /// Multi-axis reduce-all (`axes = [1,2]`, keepdims) folds into a captured
 /// segment and matches the f32 oracle — proving the cached offset tables cover
 /// multi-axis reductions, not just the trailing axis.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fp16_reduce_sumsquare_multi_axis_captures_and_matches_eager() {
     sumsquare_capture_matches_eager_and_oracle(
@@ -410,9 +442,13 @@ fn fp16_reduce_sumsquare_multi_axis_captures_and_matches_eager() {
 /// includes the shape: warm shape A, run shape B, then A again — each must be
 /// numerically correct (a shape-blind cache would reuse A's base/delta offset
 /// tables for B and corrupt the result).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn nvrtc_reduce_sumsquare_alternating_shapes_stays_correct() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let dtype = DataType::Float16;
     let axes_values = [1i64];
@@ -471,9 +507,13 @@ fn nvrtc_reduce_sumsquare_alternating_shapes_stays_correct() {
 /// stale offset tables. Warm shape A, begin capture, then execute a different
 /// shape B: the metadata cache miss during capture must error. The capture is
 /// then aborted cleanly.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn nvrtc_reduce_sumsquare_shape_change_under_capture_is_rejected() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let dtype = DataType::Float16;
     let axes_values = [1i64];

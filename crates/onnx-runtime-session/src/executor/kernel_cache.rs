@@ -38,6 +38,583 @@ impl KernelKey {
     }
 }
 
+/// The KV-cache I/O **slot indices** of a recognized stateful attention node.
+///
+/// `.past_inputs` are the input tensors whose sequence axis GROWS each decode
+/// step (the KV cache), as opposed to a fixed-capacity recurrent state;
+/// `.present_outputs` are the corresponding grown outputs. The indices mirror
+/// the authoritative structural list in
+/// [`kernel_input_uses_physical_capacity`](super::geometry::kernel_input_uses_physical_capacity):
+/// GQA past_key/value = inputs 3,4; default-domain `Attention` = inputs 4,5;
+/// `pkg.nxrt::IndexShare` = inputs 3,4. `present_key`/`present_value` are the
+/// GQA-family `outputs[1]`/`outputs[2]`.
+///
+/// `pkg.nxrt`/`com.microsoft`::`CompressedSparseAttention` (CSA) has no separate
+/// past-KV inputs (its cache is stateful device state); instead its
+/// total-sequence-length-derived cache records land on `outputs[1]`/`outputs[3]`
+/// (`[query[0], records, width]`, penultimate = `records`). Dynamic ratio-4 CSA
+/// additionally mints a fresh, growing `selections` symbol on the **last** axis
+/// of `outputs[5]` (`[query[0], index_heads, query_seq, selections]`); that axis
+/// is captured via [`KvCacheSlots::last_axis_outputs`], since it is the trailing
+/// (not penultimate) dim. See
+/// `onnx-runtime-shape-inference/src/handlers/custom_ops.rs::compressed_sparse_attention`.
+///
+/// This op list is one of two complementary growing-symbol sources (see
+/// [`compute_capture_growing_symbols`]); an attention variant not listed here is
+/// still covered by the generic declared-KV-I/O scan (any `past…`/`present…`
+/// rank-4 boundary tensor), so a missing entry degrades gracefully rather than
+/// silently admitting a growing op.
+#[derive(Default)]
+struct KvCacheSlots {
+    /// Inputs whose penultimate (sequence) axis grows each decode step.
+    past_inputs: &'static [usize],
+    /// Outputs whose penultimate (sequence/record) axis grows each decode step.
+    present_outputs: &'static [usize],
+    /// Outputs whose **last** axis is a growing symbol (CSA `selections`).
+    last_axis_outputs: &'static [usize],
+}
+
+fn attention_kv_cache_slots(node: &Node) -> Option<KvCacheSlots> {
+    if node.domain == "com.microsoft" && node.op_type == "GroupQueryAttention" {
+        return Some(KvCacheSlots {
+            past_inputs: &[3, 4],
+            present_outputs: &[1, 2],
+            last_axis_outputs: &[],
+        });
+    }
+    if node.is_default_domain() && node.op_type == "Attention" {
+        return Some(KvCacheSlots {
+            past_inputs: &[4, 5],
+            present_outputs: &[1, 2],
+            last_axis_outputs: &[],
+        });
+    }
+    if node.domain == "pkg.nxrt" && node.op_type == "IndexShare" {
+        return Some(KvCacheSlots {
+            past_inputs: &[3, 4],
+            present_outputs: &[1, 2],
+            last_axis_outputs: &[],
+        });
+    }
+    if (node.domain == "pkg.nxrt" || node.domain == "com.microsoft")
+        && node.op_type == "CompressedSparseAttention"
+    {
+        // CSA cache records (derived from total_sequence_length) live on the
+        // penultimate axis of outputs 1 and 3; it has no past-KV inputs. The
+        // ratio-4 variant additionally mints a growing `selections` symbol on
+        // the LAST axis of output 5 (`[query[0], index_heads, query_seq,
+        // selections]`), which the penultimate scan would miss.
+        return Some(KvCacheSlots {
+            past_inputs: &[],
+            present_outputs: &[1, 3],
+            last_axis_outputs: &[5],
+        });
+    }
+    None
+}
+
+/// If `shape` is a KV-cache tensor, the [`SymbolId`] on its **growing** sequence
+/// axis. The KV layout is `[batch, kv_heads, sequence, head_dim]`, so the
+/// sequence axis is the **penultimate** dim — this is the exact structural
+/// convention used by `is_recurrent_state_shape` (a static penultimate axis is a
+/// fixed recurrent state, a symbolic one is a growable KV cache). Returns `None`
+/// for a static penultimate axis (recurrent state) or a rank < 2 shape.
+fn kv_growing_symbol(shape: &Shape) -> Option<SymbolId> {
+    if shape.len() < 2 {
+        return None;
+    }
+    match shape[shape.len() - 2] {
+        Dim::Symbolic(sym) => Some(sym),
+        Dim::Static(_) => None,
+    }
+}
+
+/// If `shape`'s **last** axis is symbolic, its [`SymbolId`]. Used for the CSA
+/// ratio-4 `selections` axis, which is the trailing (not penultimate) dim and so
+/// is not covered by [`kv_growing_symbol`].
+fn last_axis_growing_symbol(shape: &Shape) -> Option<SymbolId> {
+    match shape.last()? {
+        Dim::Symbolic(sym) => Some(*sym),
+        Dim::Static(_) => None,
+    }
+}
+
+/// Compute the DENYLIST disqualifying set: the growing KV-length symbols closed
+/// over shape inference's lineage record. This is the fallback classifier mode
+/// ([`CaptureClassifier::Denylist`]); the default entry point is
+/// [`compute_capture_disqualifying_symbols`].
+///
+/// A growing symbol is one that lives on the sequence axis of an attention KV
+/// cache (`past`/`present` key/value) — it increments each decode step, so any
+/// buffer sized by it has a different extent every replay and MUST stay eager.
+/// The QUERY `sequence_len` symbol is deliberately NOT collected here: it lives
+/// on the query/hidden tensor, never on a KV slot, and the decode capture region
+/// pins it constant (=1) across replays. This distinction is the whole point of
+/// the classifier: GDN pointwise ops carry only batch/query-seq/heads (all
+/// pinned) and no KV-length symbol → they become capture-eligible, while any op
+/// carrying a KV-length symbol stays eager.
+///
+/// Symbols are gathered from complementary sources so coverage does not depend on
+/// a fixed op allowlist (the finding-2 gap):
+///   1. The past-KV **inputs** and present-KV **outputs** of every recognized
+///      stateful attention node ([`attention_kv_cache_slots`]: GQA, default
+///      `Attention`, `IndexShare`, and `CompressedSparseAttention`), including
+///      CSA ratio-4's growing `selections` symbol on the **last** axis of
+///      output 5 ([`KvCacheSlots::last_axis_outputs`]) — see
+///      [`collect_structural_growing_symbols_excluding`].
+///   2. A GENERIC scan of the model's DECLARED past/present KV I/O — every graph
+///      input named `past…`/output named `present…` with a rank-4 KV layout
+///      `[batch, kv_heads, sequence, head_dim]` whose penultimate (sequence) axis
+///      is symbolic. This catches an unrecognized attention variant's KV boundary
+///      tensor without minting a fresh op entry, while the rank-4 guard excludes
+///      fixed-capacity recurrent/conv states (rank 3, or a static penultimate).
+///   3. Any OPAQUE unknowable-extent symbol shape inference could not resolve
+///      (overflow / negative degrade — [`Graph::symbol_opaque`]).
+///   4. The TRANSITIVE LINEAGE CLOSURE of (1)∪(2)∪(3) over BOTH broadcast
+///      unifications ([`Graph::symbol_unifications`]) AND derivation provenance
+///      ([`Graph::symbol_derivations`], the round-4 fix): a growing KV symbol can
+///      be unified INTO a pinned-looking representative (finding 1) OR be baked
+///      into a DERIVED symbol like `seq_kv*8` by `Reshape`/`Flatten` (round-4).
+///      Both are the AUTHORITATIVE records inference keeps at its two lineage
+///      chokepoints (`broadcast_dim`, `lower`), so the closure
+///      ([`close_disqualifying_set`]) covers every op that substitutes or derives
+///      a symbol — complete by construction, no per-op enumeration.
+///
+/// [`Graph::symbol_opaque`]: onnx_runtime_ir::Graph::symbol_opaque
+/// [`Graph::symbol_unifications`]: onnx_runtime_ir::Graph::symbol_unifications
+/// [`Graph::symbol_derivations`]: onnx_runtime_ir::Graph::symbol_derivations
+pub(super) fn compute_capture_growing_symbols(graph: &Graph) -> HashSet<SymbolId> {
+    compute_capture_growing_symbols_excluding(graph, &HashSet::new())
+}
+
+/// As [`compute_capture_growing_symbols`], but treating every symbol in `pinned`
+/// as a CONSTANT capacity axis: it is dropped from the structural seed (so the
+/// lineage closure never propagates it) and force-excluded from the returned set.
+/// See [`super::Executor::pin_fixed_capacity_kv_capture_symbols`] for why a
+/// fixed-capacity device-valid-length KV seq axis is safe to pin.
+pub(super) fn compute_capture_growing_symbols_excluding(
+    graph: &Graph,
+    pinned: &HashSet<SymbolId>,
+) -> HashSet<SymbolId> {
+    // Denylist seed: only the STRUCTURALLY-GROWING KV symbols (plus any opaque
+    // unknowable-extent symbol shape inference could not resolve). A symbol that
+    // is not proven growing is treated as capturable.
+    let mut growing = collect_structural_growing_symbols_excluding(graph, pinned);
+    growing.extend(graph.symbol_opaque.iter().copied());
+    close_disqualifying_set(graph, &mut growing);
+    if !pinned.is_empty() {
+        growing.retain(|sym| !pinned.contains(sym));
+    }
+    growing
+}
+
+/// Collect the STRUCTURALLY-growing KV-length symbols from the graph — the raw
+/// seed, before any lineage closure. See [`compute_capture_growing_symbols`] for
+/// the source enumeration (recognized attention ops ∪ generic declared KV I/O).
+/// Any symbol in `pinned` is removed from the seed (a fixed-capacity KV seq axis
+/// pinned to a constant capacity).
+fn collect_structural_growing_symbols_excluding(
+    graph: &Graph,
+    pinned: &HashSet<SymbolId>,
+) -> HashSet<SymbolId> {
+    let mut growing = HashSet::new();
+    for node in graph.nodes.values() {
+        let Some(slots) = attention_kv_cache_slots(node) else {
+            continue;
+        };
+        for &idx in slots.past_inputs {
+            if let Some(Some(vid)) = node.inputs.get(idx).copied()
+                && let Some(value) = graph.try_value(vid)
+                && let Some(sym) = kv_growing_symbol(&value.shape)
+            {
+                growing.insert(sym);
+            }
+        }
+        // present_key = outputs[1], present_value = outputs[2] (see
+        // dynamic_shapes.rs GQA present handling: `[query[0], kv_heads,
+        // present_sequence, head_dim]`, seq axis = penultimate). CSA cache
+        // records land on outputs[1]/[3] (`[query[0], records, width]`).
+        for &idx in slots.present_outputs {
+            if let Some(&vid) = node.outputs.get(idx)
+                && let Some(value) = graph.try_value(vid)
+                && let Some(sym) = kv_growing_symbol(&value.shape)
+            {
+                growing.insert(sym);
+            }
+        }
+        // CSA ratio-4 output 5 carries the growing `selections` symbol on its
+        // LAST axis (`[query[0], index_heads, query_seq, selections]`).
+        for &idx in slots.last_axis_outputs {
+            if let Some(&vid) = node.outputs.get(idx)
+                && let Some(value) = graph.try_value(vid)
+                && let Some(sym) = last_axis_growing_symbol(&value.shape)
+            {
+                growing.insert(sym);
+            }
+        }
+    }
+
+    // Generic derivation from the DECLARED past/present KV I/O (ONNX GenAI's
+    // standard `past_key_values.*` / `present.*` contract). A rank-4 boundary
+    // tensor with a symbolic penultimate axis is a growable KV cache regardless
+    // of which op produced/consumed it; a rank-3 conv state or a static
+    // penultimate recurrent state is excluded.
+    let boundary_is_growing_kv = |vid: ValueId| -> Option<SymbolId> {
+        let value = graph.try_value(vid)?;
+        let name = value.name.as_deref()?;
+        let is_kv_boundary = name.starts_with("past") || name.starts_with("present");
+        if is_kv_boundary && value.shape.len() == 4 {
+            kv_growing_symbol(&value.shape)
+        } else {
+            None
+        }
+    };
+    for &vid in graph.inputs.iter().chain(graph.outputs.iter()) {
+        if let Some(sym) = boundary_is_growing_kv(vid) {
+            growing.insert(sym);
+        }
+    }
+    if !pinned.is_empty() {
+        growing.retain(|sym| !pinned.contains(sym));
+    }
+    growing
+}
+
+/// The KV sequence-axis symbols that a fixed-capacity, device-valid-length
+/// attention path pins CONSTANT at the bound physical capacity. On this path the
+/// kernel's launch grid is capacity-sized (bounded by the physically-allocated
+/// `max_len`) and the valid attended length is read on-device (GQA's `seqlens_k`,
+/// mask-driven `Attention`'s additive-mask frontier, `IndexShare`'s
+/// attention-bias frontier), so a captured replay is shape-static: the seq axis
+/// never changes extent between steps. These symbols are therefore safe to ADMIT
+/// into capture — but only when the runtime actually binds the cache at fixed
+/// physical capacity, which is why this is applied through the engine-gated
+/// [`super::Executor::pin_fixed_capacity_kv_capture_symbols`] and never at build.
+///
+/// Only the CAPACITY form of each op contributes: the gate is
+/// [`kernel_input_uses_physical_capacity`] over the node's past-KV inputs, which
+/// is `false` for the growing-concat / paged / mask-less forms (and for
+/// `CompressedSparseAttention`, which has no past-KV inputs). A growing/paged KV
+/// path thus keeps its symbol in the disqualifying set and stays vetoed.
+pub(super) fn collect_capacity_pinned_kv_symbols(graph: &Graph) -> HashSet<SymbolId> {
+    let mut pinned = HashSet::new();
+    for node in graph.nodes.values() {
+        let Some(slots) = attention_kv_cache_slots(node) else {
+            continue;
+        };
+        // Require that EVERY past-KV input is read as physical capacity (the
+        // device-valid-length path). An op with no past inputs (CSA) or any
+        // growing-concat input does not qualify.
+        let capacity_form = !slots.past_inputs.is_empty()
+            && slots
+                .past_inputs
+                .iter()
+                .all(|&idx| super::geometry::kernel_input_uses_physical_capacity(node, idx));
+        if !capacity_form {
+            continue;
+        }
+        for &idx in slots.past_inputs {
+            if let Some(Some(vid)) = node.inputs.get(idx).copied()
+                && let Some(value) = graph.try_value(vid)
+                && let Some(sym) = kv_growing_symbol(&value.shape)
+            {
+                pinned.insert(sym);
+            }
+        }
+        for &idx in slots.present_outputs {
+            if let Some(&vid) = node.outputs.get(idx)
+                && let Some(value) = graph.try_value(vid)
+                && let Some(sym) = kv_growing_symbol(&value.shape)
+            {
+                pinned.insert(sym);
+            }
+        }
+    }
+    pinned
+}
+
+/// The capture classifier's mode. See [`compute_capture_disqualifying_symbols`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CaptureClassifier {
+    /// FAIL-SAFE (default): an op is capture-safe only if every symbol on its
+    /// edges provably traces (via the lineage record) to graph-declared roots
+    /// that are not growing. Any symbol tracing to a growing root OR that is an
+    /// inference-minted symbol WITHOUT recorded provenance (untraceable /
+    /// data-dependent / overflow) disqualifies the op — it stays eager. This
+    /// structurally eliminates the whole "an unrecorded lineage site silently
+    /// admits a growing-dependent symbol" bug class: unknown ⇒ eager ⇒ safe.
+    FailSafe,
+    /// DENYLIST (over provenance): a symbol not proven growing is capturable.
+    /// Kept as a switchable fallback; only genuinely growing (or growing-derived,
+    /// via the closure) symbols disqualify. Recovers the maximal capture collapse
+    /// but relies on every growing-dependency being reachable through a recorded
+    /// lineage edge (see the completeness argument in sebastian-728-revision.md).
+    Denylist,
+}
+
+impl CaptureClassifier {
+    /// Resolve the classifier from `ONNX_GENAI_CAPTURE_CLASSIFIER`
+    /// (`failsafe`|`fail-safe`|`1` ⇒ fail-safe, `denylist`|`deny`|`0` ⇒
+    /// denylist). Defaults to [`FailSafe`](Self::FailSafe): a false
+    /// "capture-safe" is silent decode corruption, so the safe-by-default choice
+    /// is to keep an op eager whenever its shape lineage is not provably pinned.
+    fn from_env() -> Self {
+        match std::env::var("ONNX_GENAI_CAPTURE_CLASSIFIER") {
+            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "denylist" | "deny" | "0" => Self::Denylist,
+                _ => Self::FailSafe,
+            },
+            Err(_) => Self::FailSafe,
+        }
+    }
+}
+
+/// The set of symbols that DISQUALIFY an op from CUDA-graph capture — the single
+/// production entry point ([`super::build`]). `node_capture_seq_independent`
+/// tests exact both-edge membership against this set, so its meaning is "any op
+/// whose shape references one of these must stay eager".
+///
+/// Which set is returned depends on [`CaptureClassifier`]:
+///   * [`FailSafe`](CaptureClassifier::FailSafe) (default): the NOT-PINNED set
+///     (structural growing ∪ opaque ∪ every inference-minted symbol without a
+///     provenance trace to a pinned root), transitively closed.
+///   * [`Denylist`](CaptureClassifier::Denylist): the GROWING set
+///     ([`compute_capture_growing_symbols`]).
+///
+/// Both go through the same [`close_disqualifying_set`] closure; they differ ONLY
+/// in the seed, which is why the classifier body and the closure are shared.
+pub(super) fn compute_capture_disqualifying_symbols(graph: &Graph) -> HashSet<SymbolId> {
+    let mode = CaptureClassifier::from_env();
+    let set = match mode {
+        CaptureClassifier::FailSafe => compute_not_pinned_symbols(graph),
+        CaptureClassifier::Denylist => compute_capture_growing_symbols(graph),
+    };
+    if std::env::var("ONNX_GENAI_LOG_GROWING_SYMBOLS").is_ok() {
+        eprintln!(
+            "[onnx-genai-capture] classifier={mode:?} build-time disqualifying-symbol set:              {} symbol(s): {:?}",
+            set.len(),
+            set
+        );
+    }
+    set
+}
+
+/// As [`compute_capture_disqualifying_symbols`], but with `pinned` treated as
+/// constant capacity axes (see [`collect_capacity_pinned_kv_symbols`] and
+/// [`super::Executor::pin_fixed_capacity_kv_capture_symbols`]): each pinned
+/// symbol is dropped from the seed so the closure never propagates it, and is
+/// force-excluded from the result.
+pub(super) fn compute_capture_disqualifying_symbols_excluding(
+    graph: &Graph,
+    pinned: &HashSet<SymbolId>,
+) -> HashSet<SymbolId> {
+    let mode = CaptureClassifier::from_env();
+    let set = match mode {
+        CaptureClassifier::FailSafe => compute_not_pinned_symbols_excluding(graph, pinned),
+        CaptureClassifier::Denylist => compute_capture_growing_symbols_excluding(graph, pinned),
+    };
+    if std::env::var("ONNX_GENAI_LOG_GROWING_SYMBOLS").is_ok() {
+        eprintln!(
+            "[onnx-genai-capture] classifier={mode:?} build-time disqualifying-symbol set: \
+             {} symbol(s): {:?} (pinned-capacity KV: {:?})",
+            set.len(),
+            set,
+            pinned,
+        );
+    }
+    set
+}
+
+/// The FAIL-SAFE not-pinned symbol set (see
+/// [`CaptureClassifier::FailSafe`]). Seeds the disqualifying set with the
+/// structural growing symbols, the opaque unknowable-extent symbols, AND every
+/// inference-minted symbol that lacks a recorded provenance edge (a
+/// data-dependent / untraceable fresh symbol — `NonZero`/`Unique`/`Range`/
+/// data-dependent `Slice`, a handler `fresh_dim`, etc.), then transitively
+/// closes over the lineage record. A minted symbol whose provenance traces only
+/// to pinned roots is NOT seeded, so — thanks to the derivation record — a fresh
+/// symbol derived purely from pinned sources (`Reshape`/`Flatten` of
+/// batch/heads) stays capturable and the capture collapse is preserved.
+pub(super) fn compute_not_pinned_symbols(graph: &Graph) -> HashSet<SymbolId> {
+    compute_not_pinned_symbols_excluding(graph, &HashSet::new())
+}
+
+/// As [`compute_not_pinned_symbols`], but with `pinned` dropped from the
+/// structural seed and force-excluded from the result (fixed-capacity KV seq
+/// axes pinned constant). A pinned KV seq symbol is a DECLARED root (id < floor,
+/// with no provenance edge), so it can only enter via the structural seed; the
+/// minted/opaque seeds below never introduce it.
+pub(super) fn compute_not_pinned_symbols_excluding(
+    graph: &Graph,
+    pinned: &HashSet<SymbolId>,
+) -> HashSet<SymbolId> {
+    let mut set = collect_structural_growing_symbols_excluding(graph, pinned);
+    set.extend(graph.symbol_opaque.iter().copied());
+
+    // Without a persisted floor (inference did not run) we cannot tell a minted
+    // symbol from a declared root; degrade to the denylist seed (structural ∪
+    // opaque) — never less safe than the prior behavior.
+    if let Some(floor) = graph.inference_symbol_floor {
+        // A symbol is "provably rooted" only if it is a derived symbol (has at
+        // least one recorded provenance edge) or a declared root (id < floor).
+        // Any inference-minted symbol (id >= floor) with NO provenance edge is
+        // untraceable ⇒ disqualifying.
+        let has_provenance: HashSet<SymbolId> =
+            graph.symbol_derivations.iter().map(|&(d, _)| d).collect();
+        // Enumerate every symbol known to the graph: declared/minted symbols are
+        // registered in `symbol_constraints`; also scan the lineage records in
+        // case any endpoint is not (defensive).
+        let candidates = graph
+            .symbol_constraints
+            .keys()
+            .copied()
+            .chain(graph.symbol_derivations.iter().flat_map(|&(d, s)| [d, s]))
+            .chain(graph.symbol_unifications.iter().flat_map(|&(a, b)| [a, b]));
+        for sym in candidates {
+            if sym.0 >= floor && !has_provenance.contains(&sym) {
+                set.insert(sym);
+            }
+        }
+    }
+
+    close_disqualifying_set(graph, &mut set);
+    if !pinned.is_empty() {
+        set.retain(|sym| !pinned.contains(sym));
+    }
+    set
+}
+
+/// Transitively close `set` over shape inference's symbol-lineage record so that
+/// a symbol is disqualifying whenever it *depends on* a disqualifying symbol.
+///
+/// Two lineage edge kinds are followed, both read from the graph's
+/// AUTHORITATIVE, complete-by-construction records:
+///
+///   * **Broadcast unifications** ([`Graph::symbol_unifications`], UNDIRECTED):
+///     shape inference collapses two distinct symbolic dims onto one
+///     representative at the single `broadcast_dim` chokepoint every broadcasting
+///     handler funnels through — elementwise `broadcast`, `MatMul` batch dims
+///     (`linalg.rs`), `Einsum` ellipsis (`einsum.rs`), `Concat` non-concat axes
+///     (`movement/concat_slice.rs`), `Expand` (`movement/transform.rs`), and any
+///     future handler. The two symbols denote the *same* dimension, so the
+///     relation is symmetric: if either is disqualifying, so is the other.
+///
+///   * **Derivation provenance** ([`Graph::symbol_derivations`], DIRECTED
+///     `source → derived`): when `SymbolInterner::lower` interns a derived
+///     expression such as `seq_kv * 8` (`Reshape([-1])`, `Flatten`) to a fresh
+///     symbol, it records `(derived, source)` for each constituent. A derived
+///     symbol is disqualifying if ANY source is — but NOT the reverse (a pinned
+///     `batch` must not be poisoned just because some `batch * seq_kv` product
+///     also depends on the growing `seq_kv`). Hence this edge is directed
+///     `source → derived` only.
+///
+/// The closure is a plain worklist BFS over the directed adjacency
+/// `{a↔b for broadcast} ∪ {source→derived for derivation}` from the current
+/// `set`. Because [`node_capture_seq_independent`] tests exact both-edge
+/// membership, a closed set makes the disqualifying property transitively
+/// correct: a downstream consumer that only ever sees a pinned-looking
+/// representative or a derived symbol on both edges still stays eager.
+/// Over-inclusion only costs perf (the op stays eager) — it never admits a
+/// growing-dependent op.
+///
+/// Drift-detection greps for the two chokepoints, for reference:
+/// ```text
+/// grep -rn "\.broadcast(\|\.broadcast_dim(" crates/onnx-runtime-shape-inference/src/handlers/
+/// grep -rn "\.lower(" crates/onnx-runtime-shape-inference/src/
+/// ```
+///
+/// [`Graph::symbol_unifications`]: onnx_runtime_ir::Graph::symbol_unifications
+/// [`Graph::symbol_derivations`]: onnx_runtime_ir::Graph::symbol_derivations
+fn close_disqualifying_set(graph: &Graph, set: &mut HashSet<SymbolId>) {
+    if graph.symbol_unifications.is_empty() && graph.symbol_derivations.is_empty() {
+        return;
+    }
+    // Directed adjacency: disqualifying-ness flows along these edges.
+    let mut adj: HashMap<SymbolId, Vec<SymbolId>> = HashMap::new();
+    for &(a, b) in &graph.symbol_unifications {
+        if a != b {
+            adj.entry(a).or_default().push(b);
+            adj.entry(b).or_default().push(a);
+        }
+    }
+    for &(derived, source) in &graph.symbol_derivations {
+        if derived != source {
+            adj.entry(source).or_default().push(derived);
+        }
+    }
+    if adj.is_empty() {
+        return;
+    }
+    let mut work: Vec<SymbolId> = set.iter().copied().collect();
+    while let Some(sym) = work.pop() {
+        let Some(neighbors) = adj.get(&sym) else {
+            continue;
+        };
+        for &next in neighbors {
+            if set.insert(next) {
+                work.push(next);
+            }
+        }
+    }
+}
+
+/// Whether `node` is capture-eligible under the **build-time symbol** classifier.
+///
+/// An op is capture-eligible iff NEITHER any OUTPUT nor any INPUT references a
+/// symbol in the GROWING set ([`compute_capture_growing_symbols`]) — a denylist
+/// applied to BOTH sides of the op.
+///
+/// Checking the OUTPUT keeps eager any op whose result is sized by a KV-length
+/// symbol (the direct dependence the PR targets). Checking the INPUT as well
+/// catches a first-hop alias whose OUTPUT was rewritten to a pinned-looking
+/// representative but whose INPUT still carries the raw growing KV symbol
+/// (`[seq_kv, D]` ⊕ `[batch, D]` → `[batch, D]`).
+///
+/// The remaining, harder case — a DOWNSTREAM consumer that copies the already
+/// aliased shape, so BOTH its edges show only the representative — is closed not
+/// here but in the growing SET itself: [`compute_capture_growing_symbols`] takes
+/// the equivalence-class closure of the growing symbols under shape inference's
+/// broadcast unification, so the representative a growing symbol was unified into
+/// is itself in the set. Exact both-edge membership on that closed set is
+/// therefore transitively correct, and no per-call union-find is needed.
+///
+/// The growing set itself is derived robustly (attention-op set ∪ generic
+/// declared KV I/O scan ∪ unification closure, see
+/// [`compute_capture_growing_symbols`]) so finding-2 variants (CSA outputs incl.
+/// the ratio-4 `selections` axis, and any `past…`/`present…` rank-4 boundary
+/// tensor) are covered.
+///
+/// A growing DENYLIST (rather than a pinned ALLOWLIST) is deliberate: a
+/// capture-eligible op legitimately consumes/produces intermediates carrying
+/// benign FRESH symbols (warm-decode-seeded data-dependent extents on
+/// Cast/Mul/QMoE/ScatterElements). Requiring every symbolic dim to be provably
+/// *pinned* would keep all of those eager and dissolve the 154→34 capture
+/// collapse that is this PR's entire purpose; only a genuinely GROWING dim on
+/// either side is disqualifying.
+///
+/// Nodes with no outputs are conservatively treated as not seq-independent; a
+/// value with an unresolved (missing) shape is treated as carrying no growing
+/// symbol on that edge.
+pub(super) fn node_capture_seq_independent(
+    graph: &Graph,
+    node: &Node,
+    growing: &HashSet<SymbolId>,
+) -> bool {
+    if node.outputs.is_empty() {
+        return false;
+    }
+    let edge_free_of_growing = |vid: ValueId| {
+        graph
+            .try_value(vid)
+            .is_none_or(|value| !shape_references_any(&value.shape, growing))
+    };
+    node.outputs.iter().all(|&vid| edge_free_of_growing(vid))
+        && node
+            .inputs
+            .iter()
+            .all(|input| input.is_none_or(edge_free_of_growing))
+}
+
 /// Observable kernel-cache statistics (§11.1) — enough to prove reuse in tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheStats {
@@ -110,6 +687,7 @@ impl KernelCache {
         input_dtypes: &[DataType],
         constant_inputs: &[bool],
         opset: u64,
+        capture_seq_independent: bool,
         ep: &dyn ExecutionProvider,
     ) -> Result<(&dyn onnx_runtime_ep_api::Kernel, KernelKey)> {
         let key = KernelKey {
@@ -159,6 +737,7 @@ impl KernelCache {
                 Err(error) => return Err(error.into()),
             };
             kernel.set_constant_inputs(constant_inputs);
+            kernel.set_capture_seq_independent(capture_seq_independent);
             self.entries.insert(key.clone(), kernel);
             self.misses += 1;
         }

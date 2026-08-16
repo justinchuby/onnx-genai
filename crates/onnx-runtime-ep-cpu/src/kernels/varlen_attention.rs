@@ -9,7 +9,9 @@ use std::borrow::Cow;
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node, Shape};
 
-use super::sdpa::{AttnBias, NoBias, NoMask, ScaleMode, SdpaConfig, SdpaTensors, sdpa_f32_scalar};
+use super::sdpa::{
+    AttnBias, NoBias, NoMask, ScaleMode, SdpaConfig, SdpaTensors, sdpa_f32, sdpa_f32_scalar,
+};
 use super::{check_arity, to_dense_i64};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
@@ -34,9 +36,10 @@ pub(super) struct PackedAttentionSpec<'a> {
     pub kv_num_heads: usize,
     pub head_size: usize,
     pub value_head_size: usize,
-    pub scale: f32,
+    pub scale: ScaleMode,
     pub is_causal: bool,
     pub softcap: Option<f32>,
+    pub fast_path: bool,
 }
 
 impl KernelFactory for VarlenAttentionFactory {
@@ -81,11 +84,17 @@ pub fn unsupported_reason(
         return fail("missing input shape or dtype metadata".into());
     }
     for index in 0..3 {
-        if input_dtypes[index] != DataType::Float32 {
+        if !matches!(
+            input_dtypes[index],
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) {
             return fail(format!(
-                "input {index} must be Float32, got {:?}",
+                "input {index} must be Float32, Float16, or BFloat16, got {:?}",
                 input_dtypes[index]
             ));
+        }
+        if input_dtypes[index] != input_dtypes[0] {
+            return fail("Q, K, and V must use the same floating dtype".into());
         }
         if shapes[index].len() != 3 {
             return fail(format!(
@@ -130,11 +139,17 @@ impl Kernel for VarlenAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(OP, inputs, outputs, 5, 6, 1)?;
         for (index, input) in inputs.iter().take(3).enumerate() {
-            if input.dtype != DataType::Float32 {
+            if !matches!(
+                input.dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            ) {
                 return Err(error(format!(
-                    "input {index} must be Float32, got {:?}",
+                    "input {index} must be Float32, Float16, or BFloat16, got {:?}",
                     input.dtype
                 )));
+            }
+            if input.dtype != inputs[0].dtype {
+                return Err(error("Q, K, and V must use the same floating dtype"));
             }
             if input.shape.len() != 3 {
                 return Err(error(format!(
@@ -234,9 +249,10 @@ impl Kernel for VarlenAttentionKernel {
             kv_num_heads: kv_heads,
             head_size,
             value_head_size: value_dim,
-            scale,
+            scale: ScaleMode::SplitSqrt(scale),
             is_causal: self.is_causal,
             softcap: self.softcap,
+            fast_path: false,
         })?;
         write_dense_f32_narrow(OP, &mut outputs[0], &output)
     }
@@ -303,7 +319,7 @@ pub(super) fn compute_packed_attention(spec: PackedAttentionSpec<'_>) -> Result<
             v_head_size: spec.value_head_size,
         };
         let config = SdpaConfig {
-            scale: ScaleMode::SplitSqrt(spec.scale),
+            scale: spec.scale,
             softcap: spec.softcap,
             causal: false,
             past_seq: 0,
@@ -314,7 +330,11 @@ pub(super) fn compute_packed_attention(spec: PackedAttentionSpec<'_>) -> Result<
         };
         let bias: &dyn AttnBias = if spec.is_causal { &causal } else { &NoBias };
         let mut output_bhsd = vec![0.0; spec.num_heads * query_length * spec.value_head_size];
-        sdpa_f32_scalar(&tensors, &config, bias, &NoMask, &mut output_bhsd, None);
+        if spec.fast_path {
+            sdpa_f32(&tensors, &config, bias, &NoMask, &mut output_bhsd, None);
+        } else {
+            sdpa_f32_scalar(&tensors, &config, bias, &NoMask, &mut output_bhsd, None);
+        }
         bhsd_to_token_major(
             &output_bhsd,
             &mut output,

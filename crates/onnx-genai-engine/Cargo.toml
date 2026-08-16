@@ -21,6 +21,10 @@ name = "qwen3_0_6b_native_cuda_e2e"
 required-features = ["cuda", "native-backend"]
 
 [[test]]
+name = "marlin_m_gt_1_e2e"
+required-features = ["cuda", "native-backend"]
+
+[[test]]
 name = "weight_offload_native_cuda_e2e"
 required-features = ["cuda", "native-backend"]
 
@@ -42,6 +46,10 @@ required-features = ["native-backend"]
 
 [[test]]
 name = "native_full_pipeline_parity"
+required-features = ["native-backend"]
+
+[[test]]
+name = "deepseek_v2_tiny_qmoe_native_e2e"
 required-features = ["native-backend"]
 
 [[test]]
@@ -69,7 +77,7 @@ name = "qwen3_0_6b_capture_step_inputs_decline"
 required-features = ["cuda", "native-backend"]
 
 [features]
-default = []
+default = ["cuda-13000"]
 native-backend = [
     "dep:onnx-runtime-ep-cpu",
     "onnx-runtime-ep-cpu/tracing",
@@ -81,29 +89,43 @@ mlas = [
     "onnx-runtime-ep-cpu/mlas",
     "onnx-runtime-session/mlas",
 ]
-# The native CUDA EP is pinned to CUDA 13.0, so select the same cudarc bindings
-# in `onnx-genai-ort`. Runtime EP selection still goes through `ONNX_GENAI_EP`;
-# without `onnx-genai-ort/cuda`, a `cuda` request is rejected at session
-# creation rather than silently falling back to CPU.
+# Runtime EP selection still goes through `ONNX_GENAI_EP`; without
+# `onnx-genai-ort/cuda`, a `cuda` request is rejected at session creation rather
+# than silently falling back to CPU. The CUDA API version is selected by exactly
+# one `cuda-*` feature; this crate defaults to CUDA 13.0.
 cuda = [
     "onnx-genai-ort/cuda",
-    "onnx-genai-ort/cuda-13000",
     "onnx-runtime-session?/cuda",
     "dep:onnx-runtime-ep-cuda",
-    "dep:onnx-runtime-ep-api",
 ]
 # ONNX Runtime CUDA only: enable ONNX Runtime's built-in CUDAExecutionProvider
 # selection and the cudarc GPU sampler in `onnx-genai-ort`, WITHOUT pulling the
 # nxrt-native CUDA kernel crate (`onnx-runtime-ep-cuda`) or the native backend.
 # This is what the ONNX Runtime-backed `onnx-genai` wheel builds with; GPU comes
 # from the `onnxruntime-gpu` runtime wheel (installed via the `[cuda]` extra).
-ort-cuda = ["onnx-genai-ort/cuda", "onnx-genai-ort/cuda-13000"]
-# Legacy passthroughs for graphs that configure `onnx-genai-ort` separately.
-# Do not combine a 12.x passthrough with `cuda`; the engine CUDA EP requires 13.0.
-cuda-12060 = ["onnx-genai-ort/cuda-12060"]
-cuda-12080 = ["onnx-genai-ort/cuda-12080"]
-cuda-12090 = ["onnx-genai-ort/cuda-12090"]
-cuda-13000 = ["onnx-genai-ort/cuda-13000"]
+ort-cuda = ["onnx-genai-ort/cuda"]
+# CUDA API version passthroughs. Use `--no-default-features` and enable exactly
+# one of these when overriding the default CUDA 13.0 binding set.
+cuda-12060 = [
+    "onnx-genai-ort/cuda-12060",
+    "onnx-runtime-session?/cuda-12060",
+    "onnx-runtime-ep-cuda?/cuda-12060",
+]
+cuda-12080 = [
+    "onnx-genai-ort/cuda-12080",
+    "onnx-runtime-session?/cuda-12080",
+    "onnx-runtime-ep-cuda?/cuda-12080",
+]
+cuda-12090 = [
+    "onnx-genai-ort/cuda-12090",
+    "onnx-runtime-session?/cuda-12090",
+    "onnx-runtime-ep-cuda?/cuda-12090",
+]
+cuda-13000 = [
+    "onnx-genai-ort/cuda-13000",
+    "onnx-runtime-session?/cuda-13000",
+    "onnx-runtime-ep-cuda?/cuda-13000",
+]
 
 [dependencies]
 onnx-genai-metadata = { workspace = true }
@@ -114,12 +136,12 @@ onnx-genai-scheduler = { workspace = true }
 onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.5", default-features = false }
 onnx-genai-runtime-config = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true, optional = true }
-onnx-runtime-ep-cuda = { workspace = true, optional = true }
-onnx-runtime-ep-api = { workspace = true, optional = true }
+onnx-runtime-ep-cuda = { path = "../onnx-runtime-ep-cuda", version = "=0.1.0-dev.5", optional = true, default-features = false }
+onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
 onnx-std = { workspace = true }
-onnx-runtime-session = { workspace = true, optional = true }
+onnx-runtime-session = { path = "../onnx-runtime-session", version = "=0.1.0-dev.5", optional = true, default-features = false }
 onnx-runtime-tracer = { workspace = true, optional = true }
 prost = { workspace = true }
 memmap2 = { workspace = true }

@@ -1,11 +1,11 @@
 //! The owned, device-aware [`Tensor`] the eager engine dispatches over
-//! (`docs/EAGER.md` §3, §10.1).
+//! (`docs/execution/EAGER.md` §3, §10.1).
 //!
 //! This mirrors the owned tensor in `onnx-runtime-session` (`src/tensor.rs`):
 //! a thin owner over an [`onnx_runtime_ep_api::DeviceBuffer`] plus the IR
 //! vocabulary ([`DataType`], [`TensorLayout`], shape). It is duplicated here
 //! rather than shared because the eager crate must not depend on the session
-//! crate (see `docs/EAGER.md` §12 crate layout). When the tensor type is hoisted
+//! crate (see `docs/execution/EAGER.md` §12 crate layout). When the tensor type is hoisted
 //! into a shared `onnx-runtime-tensor` crate (the design's open question), both
 //! this crate and the session collapse onto it.
 //!
@@ -16,7 +16,7 @@
 //! access funnels through [`host_bytes`] / [`write_host`], which assert host
 //! accessibility, so the rest of the crate is safe Rust over the EP contract.
 //!
-//! DLPack / numpy interop (`docs/EAGER.md` §3) is DEFERRED — those are binding
+//! DLPack / numpy interop (`docs/execution/EAGER.md` §3) is DEFERRED — those are binding
 //! concerns handled by the (also DEFERRED) PyO3 layer (§11).
 
 use std::ffi::c_void;
@@ -93,7 +93,7 @@ fn write_host(buffer: &mut DeviceBuffer, src: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// An owned, device-aware tensor (`docs/EAGER.md` §3).
+/// An owned, device-aware tensor (`docs/execution/EAGER.md` §3).
 ///
 /// Owns the [`DeviceBuffer`] that holds its elements and the EP that must free
 /// it. On Phase-1 CPU the buffer is a host allocation, so [`Tensor::as_bytes`]
@@ -146,15 +146,43 @@ impl Tensor {
     /// Allocate a zero-initialized tensor of `shape`/`dtype` using `allocator`.
     ///
     /// Used by dispatch to materialise output tensors before kernel execution
-    /// (`docs/EAGER.md` §10.1 step 6).
+    /// (`docs/execution/EAGER.md` §10.1 step 6), and to seed the fixed-size recurrent
+    /// states of hybrid decoders.
+    ///
+    /// Zeroes the buffer in place. Building a zeroed `Vec` and copying it in
+    /// would allocate the same bytes twice and then memcpy between them, which
+    /// on a large output or a per-sequence `conv_state` is the whole cost of the
+    /// call.
     pub fn zeros_in(
         allocator: Arc<dyn ExecutionProvider>,
         dtype: DataType,
         shape: Vec<usize>,
     ) -> Result<Self> {
         let numel: usize = shape.iter().product();
-        let bytes = vec![0u8; dtype.storage_bytes(numel)];
-        Self::from_raw_in(allocator, dtype, shape, &bytes)
+        let expected = dtype.storage_bytes(numel);
+        let layout = TensorLayout::contiguous();
+        let mut buffer = allocator.allocate(expected.max(1), layout.alignment)?;
+        assert!(
+            buffer.device().is_host_accessible(),
+            "zeros_in on non-host device {:?}",
+            buffer.device()
+        );
+        if expected > 0 {
+            let dst = buffer.as_mut_ptr() as *mut u8;
+            // SAFETY: host-accessible device (asserted); `dst` is a unique
+            // writable host pointer obtained via `&mut buffer` with no alias,
+            // and the allocation is at least `expected` bytes because that is
+            // what was requested.
+            unsafe { std::ptr::write_bytes(dst, 0, expected) };
+        }
+        Ok(Self {
+            dtype,
+            shape,
+            layout,
+            device: buffer.device(),
+            buffer: Some(buffer),
+            allocator,
+        })
     }
 
     /// Build a tensor from raw little-endian bytes on the shared CPU device.

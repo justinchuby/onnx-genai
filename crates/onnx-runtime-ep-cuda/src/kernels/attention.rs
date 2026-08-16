@@ -1,5 +1,5 @@
 //! Phase-2b scaled-dot-product / grouped-query **attention** on the GPU
-//! (`docs/ORT2.md` §13 + §15.5).
+//! (`docs/architecture/ORT2.md` §13 + §15.5).
 //!
 //! Multi-token prefill uses an NVRTC-compiled tiled online-softmax kernel that
 //! keeps score tiles and softmax state in SRAM/registers. It does not allocate
@@ -53,16 +53,24 @@
 //! * non-contiguous (strided) Q/K/V/O or mask → actionable "materialise" error.
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use cudarc::driver::PushKernelArg;
 use cudarc::driver::sys::CUdeviceptr;
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+};
 use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::blas::{GemmDtype, GemmEx, WORKSPACE_BYTES, gemm_ex};
 use crate::error::{driver_err, not_implemented};
+use crate::kernels::kv_stride::KvCacheStrides;
 use crate::runtime::{CudaRuntime, cuptr};
 
 use super::flash_attention;
@@ -332,6 +340,58 @@ impl AttentionDtype {
 /// reduction is exact); rows longer than this are handled by the strided loop.
 const SOFTMAX_BLOCK: u32 = 256;
 
+/// Alignment (bytes) of the governed Phase-2a attention scratch blob. cuBLASLt
+/// requires its workspace at a 256-byte boundary, and the `[B,H,Sq,Sk]` scores
+/// buffer that precedes it is padded to the same boundary so the workspace stays
+/// aligned inside one suballocation.
+pub(super) const PHASE2A_SCRATCH_ALIGN: usize = 256;
+
+/// Sub-slice layout of the Phase-2a attention scratch (§736): the `[B,H,Sq,Sk]`
+/// scores buffer followed by the cuBLASLt performance workspace, both carved
+/// from a single governed workspace blob. Prepare-only planning and execution
+/// call this identical helper so the reserved and consumed byte counts agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Phase2aScratchLayout {
+    scores_off: usize,
+    scores_bytes: usize,
+    workspace_off: usize,
+    total_bytes: usize,
+}
+
+pub(super) fn phase2a_scratch_layout(
+    dtype: AttentionDtype,
+    batch: usize,
+    num_heads: usize,
+    sq: usize,
+    sk: usize,
+) -> Phase2aScratchLayout {
+    let elem_size = dtype.element_size() as usize;
+    let scores_bytes = batch
+        .saturating_mul(num_heads)
+        .saturating_mul(sq)
+        .saturating_mul(sk)
+        .saturating_mul(elem_size);
+    let scores_padded = scores_bytes.next_multiple_of(PHASE2A_SCRATCH_ALIGN);
+    let workspace_off = scores_padded;
+    let total_bytes = workspace_off.saturating_add(WORKSPACE_BYTES);
+    Phase2aScratchLayout {
+        scores_off: 0,
+        scores_bytes,
+        workspace_off,
+        total_bytes,
+    }
+}
+
+/// Resolved device pointers for the Phase-2a scratch, carved from a governed
+/// workspace blob. Holding no ownership, it is safe to hand to the compute path
+/// that never frees these pointers (the executor owns the workspace lifetime).
+#[derive(Clone, Copy)]
+pub(super) struct Phase2aScratch {
+    scores: CUdeviceptr,
+    workspace: CUdeviceptr,
+    workspace_bytes: usize,
+}
+
 /// Factory for [`AttentionKernel`]; reads the §13.3 binding attributes.
 ///
 /// Attributes (model-agnostic — all runtime data, RULES.md #2):
@@ -387,6 +447,7 @@ pub struct AttentionKernel {
     /// `head_dim` is known from the Q shape at execute time.
     scale: Option<f32>,
     mode: AttentionMode,
+    last_call_capture_safe: AtomicBool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -424,6 +485,7 @@ impl AttentionKernel {
             num_kv_heads,
             scale,
             mode: AttentionMode::Auto,
+            last_call_capture_safe: AtomicBool::new(false),
         })
     }
 
@@ -461,7 +523,29 @@ impl AttentionKernel {
         Ok(kernel)
     }
 
-    fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    /// Select the fused (shared-memory) prefill path over the Phase-2a cuBLASLt
+    /// path. Prepare-only workspace planning and execution both call this so the
+    /// reserved scratch (zero for the fused path) matches what runs.
+    fn use_fused(&self, dtype: DataType, sq: usize, sk: usize, d: usize) -> bool {
+        let fused_supported = flash_attention::supported(sq, d);
+        let measured_fused_win = sq.max(sk) <= 128
+            || (dtype == DataType::Float16
+                && d.is_multiple_of(16)
+                && sq.max(sk) <= 512
+                && self.runtime.capabilities().compute_capability().0 >= 7);
+        match self.mode {
+            AttentionMode::Auto => fused_supported && measured_fused_win,
+            AttentionMode::Fused => fused_supported,
+            AttentionMode::Phase2a => false,
+        }
+    }
+
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         if !(3..=4).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep Attention: expected 3 inputs (Q,K,V) or 4 (Q,K,V,mask) \
@@ -597,17 +681,19 @@ impl AttentionKernel {
         let v_base = cuptr(v.data_ptr::<u8>() as *const c_void);
         let o_base = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
-        let fused_supported = flash_attention::supported(sq, d);
-        let measured_fused_win = sq.max(sk) <= 128
-            || (q.dtype == DataType::Float16
-                && d.is_multiple_of(16)
-                && sq.max(sk) <= 512
-                && self.runtime.capabilities().compute_capability().0 >= 7);
-        let use_fused = match self.mode {
-            AttentionMode::Auto => fused_supported && measured_fused_win,
-            AttentionMode::Fused => fused_supported,
-            AttentionMode::Phase2a => false,
-        };
+        let fused = self.use_fused(q.dtype, sq, sk, d);
+        // #757: keep capture admission truthful. The fused path is capture-safe;
+        // the Phase-2a path performs an unconditional trailing synchronize (see
+        // `run_attention_phase2a`, allowlisted in capture_sync_contract.rs) and
+        // must be refused during capture. §736 governs the Phase-2a scratch for
+        // admission, but that does not make the sync capture-safe.
+        self.last_call_capture_safe.store(fused, Ordering::Relaxed);
+        if !fused && self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(
+                "cuda_ep Attention selected the Phase-2a per-call workspace path during CUDA graph capture"
+                    .into(),
+            ));
+        }
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             let score_elements = (batch as u64)
                 .saturating_mul(self.num_heads as u64)
@@ -624,7 +710,7 @@ impl AttentionKernel {
                 .saturating_add(pv_flops)
                 .saturating_add(softmax_flops)
         });
-        if use_fused {
+        if fused {
             flash_attention::run(
                 &self.runtime,
                 q.dtype,
@@ -648,8 +734,32 @@ impl AttentionKernel {
                 0,
                 0,
                 0.0,
+                &KvCacheStrides::head_major_bnsh(),
             )
         } else {
+            // Carve the governed scratch from the executor-prepared workspace
+            // when one was reserved (§736); otherwise the compatibility path
+            // owns its own scratch inside `run_attention_phase2a`.
+            let scratch = match workspace {
+                Some(view) => {
+                    let layout = phase2a_scratch_layout(dtype, batch, self.num_heads, sq, sk);
+                    if view.bytes() < layout.total_bytes {
+                        return Err(EpError::KernelFailed(format!(
+                            "cuda_ep Attention: prepared workspace {} bytes is smaller than the \
+                             {} bytes this dispatch requires",
+                            view.bytes(),
+                            layout.total_bytes
+                        )));
+                    }
+                    let base = cuptr(view.ptr().0.cast_const());
+                    Some(Phase2aScratch {
+                        scores: base + layout.scores_off as u64,
+                        workspace: base + layout.workspace_off as u64,
+                        workspace_bytes: WORKSPACE_BYTES,
+                    })
+                }
+                None => None,
+            };
             run_attention_phase2a(
                 &self.runtime,
                 dtype,
@@ -673,6 +783,7 @@ impl AttentionKernel {
                 0,
                 0,
                 0.0,
+                scratch,
             )
         }
     }
@@ -705,17 +816,28 @@ pub(super) fn run_attention_phase2a(
     past_lengths: CUdeviceptr,
     local_window: i32,
     softcap: f32,
+    scratch: Option<Phase2aScratch>,
 ) -> Result<()> {
     let elem_size = dtype.element_size();
     let scores_elems = batch * num_heads * sq * sk;
-    let scores_buf = runtime.alloc_raw(scores_elems * elem_size as usize)?;
-    let workspace = match runtime.alloc_raw(WORKSPACE_BYTES) {
-        Ok(workspace) => workspace,
-        Err(error) => {
-            // SAFETY: `scores_buf` was allocated immediately above and has not
-            // escaped or been freed.
-            let _ = unsafe { runtime.free_raw(scores_buf) };
-            return Err(error);
+    // The governed path hands us pre-reserved scratch carved from the executor's
+    // workspace; the compatibility/opt-out path owns disposable scratch and must
+    // free it here. `owned` records which contract applies.
+    let owned = scratch.is_none();
+    let (scores_buf, workspace, workspace_bytes) = match scratch {
+        Some(scratch) => (scratch.scores, scratch.workspace, scratch.workspace_bytes),
+        None => {
+            let scores_buf = runtime.alloc_raw(scores_elems * elem_size as usize)?;
+            let workspace = match runtime.alloc_raw(WORKSPACE_BYTES) {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    // SAFETY: `scores_buf` was allocated immediately above and
+                    // has not escaped or been freed.
+                    let _ = unsafe { runtime.free_raw(scores_buf) };
+                    return Err(error);
+                }
+            };
+            (scores_buf, workspace, WORKSPACE_BYTES)
         }
     };
     let result = (|| {
@@ -751,7 +873,7 @@ pub(super) fn run_attention_phase2a(
                 // SAFETY: per-head pointers lie inside the validated dense Q/K
                 // and freshly-allocated scores buffers; `workspace` is live;
                 // `s_head` (output) aliases neither operand.
-                unsafe { gemm_ex(blas, stream, &p, workspace, WORKSPACE_BYTES) }?;
+                unsafe { gemm_ex(blas, stream, &p, workspace, workspace_bytes) }?;
             }
         }
 
@@ -823,21 +945,74 @@ pub(super) fn run_attention_phase2a(
                 // SAFETY: per-head pointers lie inside the validated dense V and
                 // the softmaxed scores buffer and the dense output; `workspace`
                 // is live; `o_head` aliases neither operand.
-                unsafe { gemm_ex(blas, stream, &p, workspace, WORKSPACE_BYTES) }?;
+                unsafe { gemm_ex(blas, stream, &p, workspace, workspace_bytes) }?;
             }
         }
 
         runtime.synchronize()
     })();
-    // SAFETY: both pointers came from this runtime and are freed exactly once.
-    let free_scores = unsafe { runtime.free_raw(scores_buf) };
-    let free_ws = unsafe { runtime.free_raw(workspace) };
-    result.and(free_scores).and(free_ws)
+    if owned {
+        // SAFETY: both pointers came from this runtime and are freed exactly
+        // once; the governed path never enters this branch and leaves scratch
+        // lifetime to the executor-owned workspace.
+        let free_scores = unsafe { runtime.free_raw(scores_buf) };
+        let free_ws = unsafe { runtime.free_raw(workspace) };
+        result.and(free_scores).and(free_ws)
+    } else {
+        result
+    }
 }
 
 impl Kernel for AttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.run(inputs, outputs)
+        // Compatibility/opt-out path: no executor-prepared workspace, so the
+        // Phase-2a scratch is self-owned (see `run_attention_phase2a`).
+        self.run(inputs, outputs, None)
+    }
+
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        // Prepare-only planning (#747): report the exact governed scratch for the
+        // Phase-2a path so the executor reserves it against the device authority
+        // before request admission. The fused path uses only shared memory and
+        // needs no device scratch. On any shape/dtype that `run` would reject we
+        // report NONE and let `execute` raise the precise error (falling back to
+        // the self-owned compatibility scratch).
+        let (Some(q), Some(k)) = (inputs.first(), inputs.get(1)) else {
+            return Ok(WorkspaceRequirement::NONE);
+        };
+        if q.shape.len() != 4 || k.shape.len() != 4 {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        let Ok(dtype) = AttentionDtype::from_onnx(q.dtype) else {
+            return Ok(WorkspaceRequirement::NONE);
+        };
+        let (batch, hq, sq, d) = (q.shape[0], q.shape[1], q.shape[2], q.shape[3]);
+        let sk = k.shape[2];
+        if hq != self.num_heads {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        if self.use_fused(q.dtype, sq, sk, d) {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        let layout = phase2a_scratch_layout(dtype, batch, self.num_heads, sq, sk);
+        let bytes = u64::try_from(layout.total_bytes).map_err(|_| {
+            EpError::KernelFailed("cuda_ep Attention: workspace does not fit u64".into())
+        })?;
+        Ok(WorkspaceRequirement {
+            bytes,
+            alignment: PHASE2A_SCRATCH_ALIGN,
+            lifetime: WorkspaceLifetime::StepScoped,
+            role: MemoryRole::Workspace { step_scoped: true },
+        })
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -849,7 +1024,13 @@ impl Kernel for AttentionKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::Supported
+        if self.last_call_capture_safe.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "requires a warmed fused-attention path; the Phase-2a fallback allocates and frees per-call workspace",
+            )
+        }
     }
 }
 
@@ -892,5 +1073,65 @@ mod tests {
         for kv in [8usize, 2, 1] {
             AttentionKernel::new(runtime.clone(), true, 8, kv, Some(0.5)).unwrap();
         }
+    }
+
+    #[test]
+    fn phase2a_scratch_layout_matches_byte_formula() {
+        // Regression guard (§736): planning and execution size the governed
+        // Phase-2a scratch through this exact helper, so pin its formula. The
+        // scores blob is `batch·heads·sq·sk·elem` padded up to the cuBLASLt
+        // alignment, followed by the fixed cuBLASLt workspace.
+        let (batch, heads, sq, sk) = (2usize, 4usize, 128usize, 96usize);
+        let layout = phase2a_scratch_layout(AttentionDtype::F16, batch, heads, sq, sk);
+        let elem = AttentionDtype::F16.element_size() as usize;
+        let scores = batch * heads * sq * sk * elem;
+        assert_eq!(layout.scores_bytes, scores);
+        assert_eq!(layout.scores_off, 0);
+        let padded = scores.next_multiple_of(PHASE2A_SCRATCH_ALIGN);
+        assert_eq!(layout.workspace_off, padded);
+        assert_eq!(layout.total_bytes, padded + WORKSPACE_BYTES);
+        assert_eq!(layout.workspace_off % PHASE2A_SCRATCH_ALIGN, 0);
+    }
+
+    #[test]
+    fn workspace_requirement_matches_layout_for_phase2a_and_is_none_for_fused() {
+        let Some(runtime) = rt() else {
+            eprintln!("skip: no CUDA GPU");
+            return;
+        };
+        // A long shape forces the Phase-2a (cuBLASLt) path: its governed
+        // requirement must equal the shared layout so the executor reserves
+        // exactly what execution carves — no ungoverned raw allocation remains.
+        let (batch, heads, sq, sk, d) = (1usize, 8usize, 512usize, 512usize, 64usize);
+        let phase2a = AttentionKernel::new_phase2a(runtime.clone(), true, heads, heads, None)
+            .expect("phase2a kernel");
+        let q_shape = [batch, heads, sq, d];
+        let kv_shape = [batch, heads, sk, d];
+        let q = TensorMetadata::new(DataType::Float16, &q_shape, true);
+        let k = TensorMetadata::new(DataType::Float16, &kv_shape, true);
+        let v = TensorMetadata::new(DataType::Float16, &kv_shape, true);
+        let req = phase2a
+            .workspace_requirement(&[q, k, v])
+            .expect("workspace requirement");
+        let layout = phase2a_scratch_layout(AttentionDtype::F16, batch, heads, sq, sk);
+        assert_eq!(req.bytes, layout.total_bytes as u64);
+        assert_eq!(req.alignment, PHASE2A_SCRATCH_ALIGN);
+        assert_eq!(req.lifetime, WorkspaceLifetime::StepScoped);
+        assert!(matches!(
+            req.role,
+            MemoryRole::Workspace { step_scoped: true }
+        ));
+
+        // The fused (shared-memory) path allocates no device scratch, so it must
+        // report NONE — the executor reserves nothing for it.
+        let fused =
+            AttentionKernel::new_fused(runtime, true, heads, heads, None).expect("fused kernel");
+        let q = TensorMetadata::new(DataType::Float16, &q_shape, true);
+        let k = TensorMetadata::new(DataType::Float16, &kv_shape, true);
+        let v = TensorMetadata::new(DataType::Float16, &kv_shape, true);
+        let fused_req = fused
+            .workspace_requirement(&[q, k, v])
+            .expect("fused workspace requirement");
+        assert_eq!(fused_req.bytes, 0, "fused path needs no governed scratch");
     }
 }

@@ -18,13 +18,16 @@
 
 use std::borrow::Cow;
 use std::ffi::c_void;
-use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+};
 use onnx_runtime_ir::{DataType, Node, Shape};
+use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::error::driver_err;
 use crate::kernels::block_quantized_matmul::{BlockFormat, decoder_prelude};
@@ -458,7 +461,6 @@ impl KernelFactory for BlockQuantizedMoEFactory {
             runtime: self.runtime.clone(),
             attributes,
             format,
-            scratch: Mutex::new(ScratchPool::default()),
         }))
     }
 }
@@ -538,7 +540,132 @@ pub struct BlockQuantizedMoEKernel {
     runtime: Arc<CudaRuntime>,
     attributes: MoeAttributes,
     format: BlockFormat,
-    scratch: Mutex<ScratchPool>,
+}
+
+const WORKSPACE_ALIGNMENT: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QmoeWorkspaceLayout {
+    offsets: [usize; 6],
+    bytes: usize,
+}
+
+fn align_up(value: usize, alignment: usize) -> Result<usize> {
+    let mask = alignment - 1;
+    value
+        .checked_add(mask)
+        .map(|value| value & !mask)
+        .ok_or_else(|| error("BlockQuantizedMoE workspace alignment overflow"))
+}
+
+fn qmoe_workspace_layout(
+    input_shape: &[usize],
+    router_shape: &[usize],
+    fc1_shape: &[usize],
+    top_k: usize,
+    swiglu_fusion: usize,
+    has_fc3: bool,
+) -> Result<QmoeWorkspaceLayout> {
+    if !matches!(input_shape.len(), 2 | 3) {
+        return Err(error(format!(
+            "input must be 2-D [rows, hidden] or 3-D [batch, sequence, hidden], got {input_shape:?}"
+        )));
+    }
+    if router_shape.len() != 2 {
+        return Err(error(format!(
+            "router_logits must be rank 2, got {router_shape:?}"
+        )));
+    }
+    if fc1_shape.len() != 4 {
+        return Err(error(format!(
+            "fc1_experts_weights must be rank 4, got {fc1_shape:?}"
+        )));
+    }
+    let hidden = *input_shape
+        .last()
+        .ok_or_else(|| error("input rank unexpectedly empty"))?;
+    let rows = checked_product(
+        &input_shape[..input_shape.len() - 1],
+        "flattened input row count",
+    )?;
+    if router_shape[0] != rows {
+        return Err(error(format!(
+            "router_logits rows {} must equal flattened input rows {rows}",
+            router_shape[0]
+        )));
+    }
+    if top_k == 0 || top_k > router_shape[1] {
+        return Err(error(format!(
+            "requires 0 < k <= num_experts, got k={top_k} and num_experts={}",
+            router_shape[1]
+        )));
+    }
+    if rows == 0 || hidden == 0 {
+        return Ok(QmoeWorkspaceLayout {
+            offsets: [0; 6],
+            bytes: 0,
+        });
+    }
+    let fc1_out = fc1_shape[1];
+    let inter = if swiglu_fusion == 0 {
+        fc1_out
+    } else {
+        if !fc1_out.is_multiple_of(2) {
+            return Err(error(format!(
+                "fused SwiGLU fc1_out must be even, got {fc1_out}"
+            )));
+        }
+        fc1_out / 2
+    };
+    if inter == 0 {
+        return Err(error("inferred inter dimension must be non-zero"));
+    }
+    let routes = checked_product(&[rows, top_k], "route count")?;
+    let sizes = [
+        checked_bytes(routes, std::mem::size_of::<i32>(), "route indices")?,
+        checked_bytes(routes, std::mem::size_of::<f32>(), "route weights")?,
+        checked_bytes(
+            checked_product(&[routes, fc1_out], "FC1 scratch element count")?,
+            4,
+            "FC1 scratch",
+        )?,
+        if has_fc3 {
+            checked_bytes(
+                checked_product(&[routes, inter], "FC3 scratch element count")?,
+                4,
+                "FC3 scratch",
+            )?
+        } else {
+            0
+        },
+        checked_bytes(
+            checked_product(&[routes, inter], "intermediate element count")?,
+            4,
+            "intermediate scratch",
+        )?,
+        checked_bytes(
+            checked_product(&[routes, hidden], "route output element count")?,
+            4,
+            "route output scratch",
+        )?,
+    ];
+    let mut offsets = [0; 6];
+    let mut cursor = 0usize;
+    for (index, size) in sizes.into_iter().enumerate() {
+        if size == 0 {
+            offsets[index] = 0;
+            continue;
+        }
+        cursor = align_up(cursor, WORKSPACE_ALIGNMENT)?;
+        offsets[index] = cursor;
+        cursor = cursor
+            .checked_add(size)
+            .ok_or_else(|| error("BlockQuantizedMoE workspace byte count overflow"))?;
+    }
+    Ok(QmoeWorkspaceLayout {
+        offsets,
+        bytes: cursor,
+    })
 }
 
 /// A validated per-projection packed expert-weight tensor. `packed` is the
@@ -615,6 +742,43 @@ impl<'a> PackedExperts<'a> {
 
 impl Kernel for BlockQuantizedMoEKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let _ = (inputs, outputs);
+        Err(error(
+            "BlockQuantizedMoE requires workspace prepared before execution",
+        ))
+    }
+
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        if inputs.len() < 5 {
+            return Err(error(format!(
+                "expected at least 5 input metadata entries, got {}",
+                inputs.len()
+            )));
+        }
+        let has_fc3 = inputs.get(6).is_some_and(|input| input.present);
+        let layout = qmoe_workspace_layout(
+            inputs[0].shape,
+            inputs[1].shape,
+            inputs[2].shape,
+            self.attributes.k,
+            self.attributes.swiglu_fusion,
+            has_fc3,
+        )?;
+        Ok(WorkspaceRequirement {
+            bytes: u64::try_from(layout.bytes)
+                .map_err(|_| error("BlockQuantizedMoE workspace does not fit u64"))?,
+            alignment: WORKSPACE_ALIGNMENT,
+            lifetime: WorkspaceLifetime::SessionPersistent,
+            role: MemoryRole::Workspace { step_scoped: false },
+        })
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         if !(5..=9).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(error(format!(
                 "expected 5 to 9 inputs and exactly 1 output, got {} inputs and {} outputs",
@@ -774,30 +938,33 @@ impl Kernel for BlockQuantizedMoEKernel {
             return Ok(());
         }
 
+        let layout = qmoe_workspace_layout(
+            input_shape,
+            inputs[1].shape,
+            inputs[2].shape,
+            self.attributes.k,
+            self.attributes.swiglu_fusion,
+            fc3.is_some(),
+        )?;
         let routes = checked_product(&[rows, self.attributes.k], "route count")?;
-        let route_index_bytes = checked_bytes(routes, std::mem::size_of::<i32>(), "route indices")?;
-        let route_weight_bytes =
-            checked_bytes(routes, std::mem::size_of::<f32>(), "route weights")?;
-        let fc1_elements = checked_product(&[routes, fc1_out], "FC1 scratch element count")?;
-        let fc1_bytes = checked_bytes(fc1_elements, 4, "FC1 scratch")?;
-        let inter_elements = checked_product(&[routes, inter], "intermediate element count")?;
-        let inter_bytes = checked_bytes(inter_elements, 4, "intermediate scratch")?;
-        let route_output_elements =
-            checked_product(&[routes, hidden], "route output element count")?;
-        let route_output_bytes = checked_bytes(route_output_elements, 4, "route output scratch")?;
-
-        let mut scratch = self
-            .scratch
-            .lock()
-            .map_err(|_| error("BlockQuantizedMoE scratch pool mutex poisoned"))?;
-        let route_indices = scratch.ensure(&self.runtime, 0, route_index_bytes)?;
-        let route_weights_ptr = scratch.ensure(&self.runtime, 1, route_weight_bytes)?;
-        let fc1_output = scratch.ensure(&self.runtime, 2, fc1_bytes)?;
-        let fc3_output = fc3
-            .map(|_| scratch.ensure(&self.runtime, 3, inter_bytes))
-            .transpose()?;
-        let activated = scratch.ensure(&self.runtime, 4, inter_bytes)?;
-        let route_output = scratch.ensure(&self.runtime, 5, route_output_bytes)?;
+        let workspace = workspace.ok_or_else(|| {
+            error("BlockQuantizedMoE execute reached compute without prepared workspace")
+        })?;
+        if workspace.bytes() < layout.bytes {
+            return Err(error(format!(
+                "BlockQuantizedMoE prepared-workspace invariant violated: execution requires {} bytes but only {} were prepared",
+                layout.bytes,
+                workspace.bytes()
+            )));
+        }
+        let base = cuptr(workspace.ptr().0.cast_const());
+        let ptr = |index: usize| base + layout.offsets[index] as u64;
+        let route_indices = ptr(0);
+        let route_weights_ptr = ptr(1);
+        let fc1_output = ptr(2);
+        let fc3_output = fc3.map(|_| ptr(3));
+        let activated = ptr(4);
+        let route_output = ptr(5);
 
         self.launch_route(
             &inputs[1],
@@ -834,7 +1001,6 @@ impl Kernel for BlockQuantizedMoEKernel {
             rows,
             hidden,
         )?;
-        drop(scratch);
         self.runtime.synchronize()
     }
 
@@ -1042,66 +1208,6 @@ impl BlockQuantizedMoEKernel {
     }
 }
 
-const SCRATCH_SLOTS: usize = 6;
-
-#[derive(Clone, Copy, Debug, Default)]
-struct ScratchSlot {
-    ptr: CUdeviceptr,
-    capacity: usize,
-}
-
-#[derive(Debug)]
-struct ScratchPool {
-    slots: [ScratchSlot; SCRATCH_SLOTS],
-}
-
-impl Default for ScratchPool {
-    fn default() -> Self {
-        Self {
-            slots: [ScratchSlot::default(); SCRATCH_SLOTS],
-        }
-    }
-}
-
-impl ScratchPool {
-    fn ensure(&mut self, runtime: &CudaRuntime, index: usize, bytes: usize) -> Result<CUdeviceptr> {
-        let slot = &mut self.slots[index];
-        let bytes = bytes.max(1);
-        if slot.ptr != 0 && slot.capacity >= bytes {
-            return Ok(slot.ptr);
-        }
-        let fresh = runtime.alloc_raw(bytes)?;
-        if slot.ptr != 0 {
-            // SAFETY: the previous pointer came from this runtime and is replaced
-            // only after the new allocation succeeds.
-            unsafe {
-                let _ = runtime.free_raw(slot.ptr);
-            }
-        }
-        slot.ptr = fresh;
-        slot.capacity = bytes;
-        Ok(fresh)
-    }
-}
-
-impl Drop for BlockQuantizedMoEKernel {
-    fn drop(&mut self) {
-        let scratch = self
-            .scratch
-            .get_mut()
-            .expect("cuda_ep BlockQuantizedMoE scratch pool poisoned");
-        for slot in scratch.slots.iter_mut().rev() {
-            if slot.ptr != 0 {
-                // SAFETY: every non-zero pointer came from this runtime and is
-                // freed exactly once when the kernel is dropped.
-                let _ = unsafe { self.runtime.free_raw(slot.ptr) };
-                slot.ptr = 0;
-                slot.capacity = 0;
-            }
-        }
-    }
-}
-
 fn tensor_ptr(tensor: &TensorView) -> CUdeviceptr {
     cuptr(tensor.data_ptr::<u8>() as *const c_void)
 }
@@ -1219,4 +1325,56 @@ fn as_i32(name: &str, value: usize) -> Result<i32> {
 
 fn error(message: impl Into<String>) -> EpError {
     EpError::KernelFailed(format!("cuda_ep {DOMAIN}::{OP}: {}", message.into()))
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_layout_varies_with_prompt_top_k_and_expert_width() {
+        for (rows, top_k, hidden, fc1_out) in
+            [(1, 1, 128, 256), (17, 2, 512, 1024), (4096, 8, 2048, 6144)]
+        {
+            let layout = qmoe_workspace_layout(
+                &[1, rows, hidden],
+                &[rows, 64],
+                &[64, fc1_out, 1, 1],
+                top_k,
+                1,
+                false,
+            )
+            .unwrap();
+            assert!(layout.bytes > 0);
+            assert!(
+                layout
+                    .offsets
+                    .iter()
+                    .filter(|&&offset| offset != 0)
+                    .all(|offset| offset % WORKSPACE_ALIGNMENT == 0)
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_layout_zero_rows_requires_no_bytes() {
+        let layout =
+            qmoe_workspace_layout(&[1, 0, 128], &[0, 8], &[8, 256, 1, 1], 2, 1, false).unwrap();
+        assert_eq!(layout.bytes, 0);
+        assert_eq!(layout.offsets, [0; 6]);
+    }
+
+    #[test]
+    fn workspace_layout_rejects_overflow() {
+        let error = qmoe_workspace_layout(
+            &[usize::MAX, 2],
+            &[usize::MAX, 8],
+            &[8, 256, 1, 1],
+            2,
+            1,
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeds usize limits"));
+    }
 }

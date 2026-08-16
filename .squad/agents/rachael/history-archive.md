@@ -72,7 +72,7 @@ Batched-driver DoS hardening is canonical: admission is bounded by `max_pending`
 
 - 2026-07-16T00:00:01Z — Confirmed all 24 Qwen2.5-0.5B Sigmoids are `Mul(x, Sigmoid(x))` and landed guarded executor lowering plus allocation-free CPU SiLU (`682c93d`). Sigmoid share fell 6.55%→0%; decode improved 44.5→45.7 tok/s. Sebastian 🟢 approved; `d116a96` adds the multi-consumer negative test.
 
-- 2026-07-16T00:00:00Z — Delivered default-on `nxrt.eager` and `nxrt.genai` Python submodules plus `docs/PYTHON.md` (`56a4a90`). The initial genai Engine wrapper was later revised by Sebastian after Holden identified a cross-thread PyO3 panic; the merged, cleared result is `41d8c31`.
+- 2026-07-16T00:00:00Z — Delivered default-on `nxrt.eager` and `nxrt.genai` Python submodules plus `docs/architecture/PYTHON.md` (`56a4a90`). The initial genai Engine wrapper was later revised by Sebastian after Holden identified a cross-thread PyO3 panic; the merged, cleared result is `41d8c31`.
 
 ## 2026-07-16T14:20:00Z — onnx-rs full-spec serde review
 - 🔴 Rejected Zhora's full-spec claim: vendored ONNX v1.16.2/IR10 proto is stale against v1.22.0/IR13, and base64 retained-proto native text is non-authoritative. Zhora is locked out; Batty owns the revision.
@@ -147,3 +147,34 @@ Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CL
 
 - Revised TTY stats rendering from a squeezed one-line string to a deliberate two-line block: performance/termination first, cache/context/scheduler/pages/RSS second.
 - Restored compact finish reason and end-to-end throughput to the always-on TTY block now that Justin allowed two lines; non-TTY opt-in stats keep the single-line formatter for byte stability.
+
+---
+
+## ARCHIVED 2026-08-12 (compaction wave)
+
+### 2026-07-27T09:15:14-07:00 — CLI UX/server-surface research
+Audited interactive REPL, streaming output, `serve` ergonomics. Wrote `docs/research/cli/02-ux-and-server-surface.md`. Top gaps: remote OpenAI-compatible client mode, structured/quiet output, stronger REPL input/history, explicit session/fork/rewind UX.
+
+### 2026-07-27T09:30:56-07:00 — REPL redesign research
+Wrote `docs/research/cli/05-repl-redesign.md`. Recommended `reedline` TTY editor, declarative slash registry, non-TTY byte-stable output.
+
+### 2026-07-27T13:10:00-07:00 — CLI backlog on main
+CLI backlog source of truth: `docs/research/cli/00-backlog.md`.
+
+### 2026-07-27T14:15:00-07:00 — REPL Phase 1 implementation
+Implemented TTY/plain split: piped stdin/stdout on `read_line`, TTY on `reedline`. Declarative slash registry. Compact stats default-on TTY only, `run --no-stats`.
+
+### 2026-07-27T02:00:00Z — Roadmap wave update
+Fixed PR #300/#76 after author lockout. Merged after Leon approval.
+
+### 2026-07-28T11:20:06+0000 — Independent #75 lockout revision
+PR #346 lockout revision (Bryant barred). `c20ec211` corrected StringNormalizer/TfIdfVectorizer default-domain registration and LabelEncoder-1 default-attribute dtype selection. Holden re-approved.
+
+### 2026-07-28T10:10:00-07:00 — REPL newline and stats polish
+TTY separator exactly one newline. Expanded stats: prefix-cache hit tokens + percent, KV page activity.
+
+### 2026-07-28T10:33:00-07:00 — REPL stats block two-line follow-up
+Two-line stats block: performance/termination first, cache/context/scheduler/pages/RSS second.
+
+### 2026-08-11 — Test hardening: EP assignment assertions
+6 tests assert EP ownership. 269 passed, 0 failed. Non-vacuity: Relu assertion → immediate panics. Commit `ecfaeeec5`.

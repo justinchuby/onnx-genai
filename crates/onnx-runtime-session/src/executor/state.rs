@@ -18,6 +18,8 @@ pub(crate) struct Executor {
     /// Lazy external initializers available only at the nxrt fused-MoE boundary.
     /// Stock EPs ignore this map and keep receiving the resident buffers below.
     pub(super) weight_handles: HashMap<ValueId, WeightHandle>,
+    pub(super) prefetch_issue_nodes: std::sync::Mutex<HashMap<ValueId, usize>>,
+    pub(super) prefetch_lookahead_nodes: usize,
     /// One device buffer per backed value. Static values are allocated once at
     /// build; dynamic (symbol-shaped) values are allocated per run and cached
     /// here so a run whose resolved shape is unchanged reuses the allocation.
@@ -115,6 +117,29 @@ pub(crate) struct Executor {
     /// genuinely-capturable ops still fold. Grows monotonically within an
     /// executor: a kernel that breaks recording once breaks it every time.
     pub(super) capture_quarantine_ops: HashSet<(String, String)>,
+    /// Build-time set of GROWING symbols: the KV/past/total-sequence-length
+    /// symbols on the sequence axis of attention `present`/`past` KV caches (GQA,
+    /// default `Attention`, `IndexShare`, `CompressedSparseAttention` — incl. the
+    /// ratio-4 `selections` axis), unioned with a generic scan of the model's
+    /// declared `past…`/`present…` rank-4 KV I/O, and then CLOSED under shape
+    /// inference's broadcast symbol unification. Computed once at build (see
+    /// [`compute_capture_growing_symbols`](super::kernel_cache::compute_capture_growing_symbols)).
+    /// The shared pointwise/elementwise/bitwise/prelu capture gate rejects an op
+    /// whose INPUT **or** OUTPUT references any of these symbols — a denylist on
+    /// both edges. The OUTPUT check keeps eager any op sized by a growing length;
+    /// the INPUT check plus the class closure keep eager both a first-hop alias
+    /// and any DOWNSTREAM consumer that only ever sees the pinned-looking
+    /// representative (finding 1). A benign FRESH symbol (warm-decode seeded,
+    /// non-growing, not unified with a growing one) is absent from this set, so
+    /// ops carrying it stay capturable — preserving the 154→34 collapse.
+    pub(super) capture_growing_symbols: HashSet<SymbolId>,
+    /// KV sequence-axis symbols pinned CONSTANT to their bound physical capacity
+    /// by [`Self::pin_fixed_capacity_kv_capture_symbols`] once the engine has
+    /// bound fixed-capacity, device-valid-length KV (see
+    /// [`super::kernel_cache::collect_capacity_pinned_kv_symbols`]). Empty until
+    /// the engine calls the pin; recorded for diagnostics/tests and to document
+    /// which symbols were removed from `capture_growing_symbols`.
+    pub(super) capacity_pinned_kv_symbols: HashSet<SymbolId>,
     /// Node whose kernel returned an error while recording a captured segment,
     /// set transiently by [`Self::run_plan_segmented`] so the capture retry loop
     /// can quarantine its op-type. `None` outside a failed capture pass.
@@ -135,6 +160,12 @@ pub(crate) struct Executor {
     /// build; these values own no [`DeviceBuffer`] and are skipped by buffer
     /// sizing — their storage lives in [`Self::sequences`] at run time.
     pub(super) sequence_values: HashSet<ValueId>,
+    /// Most recent activation-memory planner result from a measured top-level
+    /// eager run once shapes and view aliases are concrete. Stage-2 replay and
+    /// nested runs skip re-planning and leave this as the last measured top-level
+    /// result. Observational only: the executor still owns one buffer per value
+    /// until issue #514's allocator surgery lands.
+    pub(super) activation_memory_plan: Option<ActivationMemoryPlanStats>,
     /// Allocation owners promoted into ref-counted storage when a tensor enters
     /// an ONNX Sequence. `buffers` retains a non-owning dispatch alias, while
     /// sequence elements clone the owner Arc. At the next run boundary, after
@@ -262,6 +293,20 @@ pub(crate) struct Executor {
     /// Control-flow and sequence nodes always have `None` (they don't use the
     /// kernel cache).
     pub(super) kernel_bindings: Vec<Option<KernelKey>>,
+    pub(super) persistent_workspace: Option<PreparedWorkspace>,
+    pub(super) step_workspace: Option<PreparedWorkspace>,
+    /// Non-owning view of an enclosing executor's prepared workspace. Nested
+    /// control-flow executors run sequentially, so they may reuse the parent's
+    /// peak allocation without reserving or allocating a second buffer.
+    pub(super) inherited_workspace: Option<(usize, usize)>,
+    pub(super) workspace_preparation_required: bool,
+}
+
+pub(super) struct PreparedWorkspace {
+    pub(super) buffer: DeviceBuffer,
+    pub(super) _lease: Option<onnx_runtime_memory_governor::MemoryLease>,
+    pub(super) bytes: usize,
+    pub(super) alignment: usize,
 }
 
 /// After this many consecutive buffer-identity signature mismatches, F5 Stage 2

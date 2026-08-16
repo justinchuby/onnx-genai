@@ -15,7 +15,7 @@
 //! |---|---|---|
 //! | reserve | `VirtualAlloc2` placeholder / `mmap(PROT_NONE)` | `cuMemAddressReserve` |
 //! | commit | `MapViewOfFile3` / `mmap(MAP_FIXED)` | `cuMemCreate` + `cuMemMap` + `cuMemSetAccess` |
-//! | release | `UnmapViewOfFile2` / `mmap(PROT_NONE)` | `cuMemUnmap` + `cuMemRelease` |
+//! | release | `UnmapViewOfFile2` / `mmap(PROT_NONE)` | `cuMemUnmap`; pool or `cuMemRelease` |
 //! | granularity | 64 KiB / page size | `cuMemGetAllocationGranularity` |
 //!
 //! Measured on the hardware this was developed against: **64 KiB** on Windows,
@@ -28,9 +28,8 @@
 //! before a block is mapped into part of it, and whether a split is needed
 //! depends on the block's already-mapped neighbours — so committing needs to
 //! know what else is mapped in the same reservation. CUDA needs the same shape
-//! for a different reason: `cuMemUnmap` releases the mapping but the physical
-//! handle from `cuMemCreate` has to be released separately, so the handles have
-//! to be kept somewhere.
+//! because mappings still belong to a reservation even when their physical
+//! handles outlive them in a shared pool.
 //!
 //! Putting that state in an associated type rather than in the backing keeps
 //! one backing able to serve many reservations, and keeps the state next to the
@@ -47,6 +46,23 @@
 //! CPU. Typing both as `*mut u8` would invite exactly that.
 
 use crate::VirtualMemoryError;
+use onnx_runtime_memory_governor::MemoryAuthorityId;
+
+/// Who charges physical memory committed by a [`VirtualBacking`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalMemoryAccounting {
+    /// [`VirtualBuffer`](crate::VirtualBuffer) leases mapped physical bytes.
+    Buffer,
+    /// The backing's authority owns physical bytes independently of mappings.
+    ///
+    /// This is the contract for a physical-handle pool: pooled-unmapped bytes
+    /// remain charged to `authority`, while mapped holder/zone bytes are only
+    /// attribution and must not be charged as additional physical ownership.
+    Backing {
+        /// The one ledger that owns every physical byte held by the backing.
+        authority: MemoryAuthorityId,
+    },
+}
 
 /// The platform operations a [`VirtualBuffer`](crate::VirtualBuffer) is built
 /// from.
@@ -78,6 +94,15 @@ pub unsafe trait VirtualBacking: Send + Sync + std::fmt::Debug {
 
     /// Allocation granularity: every offset and length is a multiple of this.
     fn granularity(&self) -> usize;
+
+    /// Who owns accounting for committed physical memory.
+    ///
+    /// Backings that retain physical allocations after unmapping must return
+    /// [`PhysicalMemoryAccounting::Backing`]. A buffer validates the authority
+    /// before reserving address space and does not take a second physical lease.
+    fn physical_memory_accounting(&self) -> PhysicalMemoryAccounting {
+        PhysicalMemoryAccounting::Buffer
+    }
 
     /// Reserve `len` bytes of address space, committing nothing.
     fn reserve(&self, len: usize) -> Result<Self::Reservation, VirtualMemoryError>;

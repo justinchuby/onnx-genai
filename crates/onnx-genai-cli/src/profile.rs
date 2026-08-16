@@ -542,7 +542,7 @@ impl PageActivity {
 }
 
 /// Memory the run needed, from the kernel and from the engine's own accounting.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct MemoryUsage {
     /// Process high-water mark: weights, KV pages, ORT arenas and transients
     /// together, which is what decides whether a model fits on a machine.
@@ -562,18 +562,80 @@ pub(crate) struct MemoryUsage {
     /// allocations do not appear in the host process's resident set.
     pub(crate) device_used_bytes: Option<u64>,
     pub(crate) device_limit_bytes: Option<u64>,
+    /// Non-zero means the device ledger is over its live ceiling.
+    pub(crate) device_oversubscribed_bytes: Option<u64>,
     /// What the device ceiling is carved into. Reporting only a total answers
     /// "how much" but never "why", which is the question when a model does not
     /// fit: weights are fixed, but the KV budget is what a longer context eats.
     pub(crate) composition: Option<DeviceComposition>,
+    /// Latest native activation planner result. This is separate from the
+    /// device-reservation breakdown: it measures what activation sharing would
+    /// save inside the executor, even before the allocator uses it.
+    pub(crate) activation_plan: Option<ActivationPlanMemory>,
+    /// Load-time static weight placement plan, when the loader found pageable
+    /// layer regions. The row is the honesty check for `device_policy`: if a
+    /// user asks for `gpu_layers:N`, `--profile` must show the translated byte
+    /// plan instead of silently accepting a knob that nothing reached.
+    pub(crate) weight_placement: Option<WeightPlacementMemory>,
+    /// Authoritative load-time memory strategy, including inference and
+    /// override provenance.
+    pub(crate) memory_strategy_plan: Option<onnx_genai::engine::MemoryStrategyPlan>,
+    /// What the virtual-memory arena did to physical memory, when this build
+    /// can have one. See [`VmmArena`].
+    pub(crate) vmm_arena: Option<VmmArena>,
+}
+
+/// Virtual-memory arena counters, as reported by the engine.
+///
+/// # Why this is printed even when it is all zero
+///
+/// The arena once logged that it was installed and committed **zero bytes**
+/// for an entire generation (#659). A field that disappears when nothing
+/// happened cannot distinguish "no arena" from "an arena doing nothing", which
+/// is precisely the bug. So the row is printed whenever the build could have
+/// an arena, and `reserved 0 B` is a visible answer rather than an absence.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct VmmArena {
+    pub(crate) commits: u64,
+    pub(crate) releases: u64,
+    pub(crate) committed_bytes: u64,
+    pub(crate) reserved_bytes: u64,
+    pub(crate) peak_committed_bytes: u64,
+    pub(crate) allocations: u64,
+    /// Non-zero means the arena's granule reference counts do not balance.
+    pub(crate) ref_underflows: u64,
+    /// Non-zero means a byte counter was decremented below zero and clamped.
+    pub(crate) byte_underflows: u64,
+    /// Non-zero means committed device bytes were not recorded in the adopted governor.
+    pub(crate) unaccounted_committed_bytes: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ActivationPlanMemory {
+    pub(crate) complete: bool,
+    pub(crate) peak_bytes: u64,
+    pub(crate) naive_bytes: u64,
+    pub(crate) savings_ratio: f64,
+    pub(crate) unknown_sizes: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct WeightPlacementMemory {
+    pub(crate) coordinated_weight_budget_bytes: u64,
+    pub(crate) effective_budget_bytes: u64,
+    pub(crate) device_bytes: u64,
+    pub(crate) host_bytes: u64,
+    pub(crate) explanation: String,
 }
 
 /// How the device memory ceiling is divided.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct DeviceComposition {
     pub(crate) model_weights_bytes: u64,
-    pub(crate) activations_bytes: u64,
-    pub(crate) runtime_overhead_bytes: u64,
+    /// None when the engine never measured it, which is not zero.
+    pub(crate) activations_bytes: Option<u64>,
+    /// None when the engine never measured it, which is not zero.
+    pub(crate) runtime_overhead_bytes: Option<u64>,
     pub(crate) kv_bytes: u64,
     pub(crate) kv_pages: u64,
     pub(crate) kv_page_bytes: u64,
@@ -589,8 +651,8 @@ impl DeviceComposition {
     /// are still reported.
     fn fixed_reservation_measured(&self) -> bool {
         self.model_weights_bytes > 0
-            || self.activations_bytes > 0
-            || self.runtime_overhead_bytes > 0
+            || self.activations_bytes.is_some()
+            || self.runtime_overhead_bytes.is_some()
     }
 }
 
@@ -605,7 +667,13 @@ impl MemoryUsage {
             && self.kv_budget_bytes.is_none()
             && self.host_ram_used_bytes.is_none()
             && self.device_used_bytes.is_none()
+            && self.device_limit_bytes.is_none()
+            && self.device_oversubscribed_bytes.is_none()
             && self.composition.is_none()
+            && self.activation_plan.is_none()
+            && self.weight_placement.is_none()
+            && self.memory_strategy_plan.is_none()
+            && self.vmm_arena.is_none()
     }
 }
 
@@ -818,16 +886,18 @@ impl RunProfile {
             {
                 let _ = writeln!(out, "device memory breakdown:");
                 for (label, bytes) in [
-                    ("  model weights", composition.model_weights_bytes),
+                    ("  model weights", Some(composition.model_weights_bytes)),
                     ("  activations", composition.activations_bytes),
                     ("  runtime overhead", composition.runtime_overhead_bytes),
-                    ("  kv cache", composition.kv_bytes),
+                    ("  kv cache", Some(composition.kv_bytes)),
                 ] {
                     // An unmeasured component is omitted: "0 B" beside a real
                     // figure reads as "this model has none", which is wrong.
-                    if bytes == 0 {
+                    // `None` now says that outright, so a genuine measurement of
+                    // zero is printed rather than swallowed with it.
+                    let Some(bytes) = bytes.filter(|bytes| *bytes > 0) else {
                         continue;
-                    }
+                    };
                     let share = self
                         .memory
                         .device_limit_bytes
@@ -850,7 +920,7 @@ impl RunProfile {
                     ("runtime overhead", composition.runtime_overhead_bytes),
                 ]
                 .into_iter()
-                .filter(|(_, bytes)| *bytes == 0)
+                .filter(|(_, bytes)| bytes.is_none())
                 .map(|(label, _)| label)
                 .collect();
                 if !unmeasured.is_empty() {
@@ -875,6 +945,125 @@ impl RunProfile {
                     format_bytes(device)
                 );
             }
+            if let Some(bytes) = self
+                .memory
+                .device_oversubscribed_bytes
+                .filter(|bytes| *bytes > 0)
+            {
+                let _ = writeln!(
+                    out,
+                    "{:<24} FAULT: device tier oversubscribed by {}",
+                    "memory ledger",
+                    format_bytes(bytes)
+                );
+            }
+            if let Some(plan) = self.memory.activation_plan {
+                if plan.complete {
+                    let _ = writeln!(
+                        out,
+                        "{:<24} {} vs {} ({:.1}% saved)",
+                        "activation plan",
+                        format_bytes(plan.peak_bytes),
+                        format_bytes(plan.naive_bytes),
+                        plan.savings_ratio * 100.0
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{:<24} deferred ({} unknown sizes)",
+                        "activation plan", plan.unknown_sizes
+                    );
+                }
+            }
+            if let Some(plan) = &self.memory.weight_placement {
+                let _ = writeln!(
+                    out,
+                    "{:<24} {} device / {} host (budget {})",
+                    "weight placement",
+                    format_bytes(plan.device_bytes),
+                    format_bytes(plan.host_bytes),
+                    format_bytes(plan.effective_budget_bytes)
+                );
+                let _ = writeln!(out, "{:<24} {}", "  explanation", plan.explanation);
+            }
+            if let Some(plan) = &self.memory.memory_strategy_plan {
+                let _ = writeln!(
+                    out,
+                    "{:<24} {:?} (inferred {:?}, access {:?})",
+                    "memory strategy",
+                    plan.strategy,
+                    plan.inferred_strategy,
+                    plan.weight_access_pattern
+                );
+                for decision in &plan.decisions {
+                    let inferred = decision
+                        .inferred_value
+                        .as_deref()
+                        .map(|value| format!(", inferred {value}"))
+                        .unwrap_or_default();
+                    let _ = writeln!(
+                        out,
+                        "{:<24} {}={} [{:?}{inferred}] — {}",
+                        "  strategy decision",
+                        decision.field,
+                        decision.value,
+                        decision.source,
+                        decision.reason
+                    );
+                }
+            }
+            if let Some(arena) = self.memory.vmm_arena {
+                if arena.reserved_bytes == 0 && arena.commits == 0 {
+                    let _ = writeln!(
+                        out,
+                        "{:<24} not installed (set ONNX_GENAI_CUDA_VMM=1)",
+                        "vmm arena"
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{:<24} {} committed of {} reserved (peak {})",
+                        "vmm arena",
+                        format_bytes(arena.committed_bytes),
+                        format_bytes(arena.reserved_bytes),
+                        format_bytes(arena.peak_committed_bytes)
+                    );
+                    // Allocations per commit is the suballocation ratio: 1.0
+                    // means every allocation took its own granule, which is the
+                    // regression that would make 2 MiB granularity unaffordable.
+                    let _ = writeln!(
+                        out,
+                        "{:<24} {} allocs, {} commits, {} releases",
+                        "vmm arena activity", arena.allocations, arena.commits, arena.releases
+                    );
+                    // Printed only when non-zero, and phrased as a fault
+                    // rather than a statistic: a balanced arena has nothing to
+                    // say here, and an unbalanced one has already unmapped
+                    // memory some other allocation believes it owns.
+                    if arena.ref_underflows > 0 {
+                        let _ = writeln!(
+                            out,
+                            "{:<24} BUG: {} granule release(s) with a zero reference count",
+                            "vmm arena", arena.ref_underflows
+                        );
+                    }
+                    if arena.byte_underflows > 0 {
+                        let _ = writeln!(
+                            out,
+                            "{:<24} BUG: {} byte counter underflow(s); committed bytes above \
+                             are a lower bound",
+                            "vmm arena", arena.byte_underflows
+                        );
+                    }
+                    if arena.unaccounted_committed_bytes > 0 {
+                        let _ = writeln!(
+                            out,
+                            "{:<24} FAULT: {} committed byte(s) not recorded in the memory ledger",
+                            "vmm arena", arena.unaccounted_committed_bytes
+                        );
+                    }
+                }
+            }
         }
 
         // The per-stage breakdown (ORT kernels versus our own orchestration)
@@ -887,14 +1076,42 @@ impl RunProfile {
             let _ = writeln!(out, "\nnative executor phases:");
             let _ = writeln!(out, "{:<34} {:>12} {:>10}", "phase", "total_ms", "calls");
             let _ = writeln!(out, "{}", "-".repeat(58));
-            for (phase, total_ns, calls) in executor_phases {
+            for (phase, total_ns, calls) in &executor_phases {
+                if !is_executor_phase_time_row(phase) {
+                    continue;
+                }
                 let _ = writeln!(
                     out,
                     "{:<34} {:>12.3} {:>10}",
                     phase,
-                    total_ns as f64 / 1e6,
+                    *total_ns as f64 / 1e6,
                     calls
                 );
+            }
+            let byte_rows = executor_phases
+                .iter()
+                .filter(|(phase, _, _)| !is_executor_phase_time_row(phase))
+                .collect::<Vec<_>>();
+            if !byte_rows.is_empty() {
+                let _ = writeln!(out, "\nnative executor byte counters:");
+                let _ = writeln!(
+                    out,
+                    "{:<34} {:>12} {:>10} {:>12}",
+                    "counter", "total_mb", "calls", "mb/call"
+                );
+                let _ = writeln!(out, "{}", "-".repeat(72));
+                for (phase, total_bytes, calls) in byte_rows {
+                    let total_mb = *total_bytes as f64 / (1024.0 * 1024.0);
+                    let mb_per_call = if *calls > 0 {
+                        total_mb / *calls as f64
+                    } else {
+                        0.0
+                    };
+                    let _ = writeln!(
+                        out,
+                        "{phase:<34} {total_mb:>12.3} {calls:>10} {mb_per_call:>12.3}"
+                    );
+                }
             }
         }
 
@@ -1018,6 +1235,13 @@ impl RunProfile {
         if let Some(limit) = self.memory.device_limit_bytes.filter(|bytes| *bytes > 0) {
             fields.push(format!("\"device_memory_limit_bytes\":{limit}"));
         }
+        if let Some(bytes) = self
+            .memory
+            .device_oversubscribed_bytes
+            .filter(|bytes| *bytes > 0)
+        {
+            fields.push(format!("\"device_oversubscribed_bytes\":{bytes}"));
+        }
         if let Some(composition) = self
             .memory
             .composition
@@ -1037,10 +1261,13 @@ impl RunProfile {
                 ("activations_bytes", composition.activations_bytes),
                 ("runtime_overhead_bytes", composition.runtime_overhead_bytes),
             ] {
-                if bytes == 0 {
-                    unmeasured.push(format!("\"{key}\""));
-                } else {
-                    parts.push(format!("\"{key}\":{bytes}"));
+                match bytes {
+                    // Absent, not zero. A machine reader told "0" concludes the
+                    // model has no activations; the distinction now survives
+                    // from the engine all the way here rather than being
+                    // reconstructed from a sentinel.
+                    None => unmeasured.push(format!("\"{key}\"")),
+                    Some(bytes) => parts.push(format!("\"{key}\":{bytes}")),
                 }
             }
             parts.push(format!("\"kv_bytes\":{}", composition.kv_bytes));
@@ -1052,6 +1279,46 @@ impl RunProfile {
             fields.push(format!(
                 "\"device_memory_breakdown\":{{{}}}",
                 parts.join(",")
+            ));
+        }
+        if let Some(plan) = self.memory.activation_plan {
+            fields.push(format!(
+                "\"activation_memory_plan\":{{\"complete\":{},\"peak_bytes\":{},\"naive_bytes\":{},\"savings_ratio\":{:.6},\"unknown_sizes\":{}}}",
+                plan.complete,
+                plan.peak_bytes,
+                plan.naive_bytes,
+                plan.savings_ratio,
+                plan.unknown_sizes
+            ));
+        }
+        if let Some(plan) = &self.memory.weight_placement {
+            fields.push(format!(
+                "\"weight_placement\":{{\"coordinated_weight_budget_bytes\":{},\"effective_budget_bytes\":{},\"device_bytes\":{},\"host_bytes\":{},\"explanation\":{}}}",
+                plan.coordinated_weight_budget_bytes,
+                plan.effective_budget_bytes,
+                plan.device_bytes,
+                plan.host_bytes,
+                json_string(&plan.explanation)
+            ));
+        }
+        if let Some(plan) = &self.memory.memory_strategy_plan {
+            fields.push(format!(
+                "\"memory_strategy\":{}",
+                serde_json::to_string(plan).expect("memory strategy plan must serialize")
+            ));
+        }
+        if let Some(arena) = self.memory.vmm_arena {
+            fields.push(format!(
+                "\"vmm_arena\":{{\"commits\":{},\"releases\":{},\"committed_bytes\":{},\"reserved_bytes\":{},\"peak_committed_bytes\":{},\"allocations\":{},\"ref_underflows\":{},\"byte_underflows\":{},\"unaccounted_committed_bytes\":{}}}",
+                arena.commits,
+                arena.releases,
+                arena.committed_bytes,
+                arena.reserved_bytes,
+                arena.peak_committed_bytes,
+                arena.allocations,
+                arena.ref_underflows,
+                arena.byte_underflows,
+                arena.unaccounted_committed_bytes
             ));
         }
         format!("{{{}}}", fields.join(","))
@@ -1074,6 +1341,10 @@ fn json_string(value: &str) -> String {
     }
     escaped.push('"');
     escaped
+}
+
+fn is_executor_phase_time_row(phase: &str) -> bool {
+    !phase.ends_with("_bytes")
 }
 
 #[cfg(test)]
@@ -1179,6 +1450,15 @@ mod tests {
         assert_eq!(percentile(&sorted, 0.9), 4.0);
         assert_eq!(percentile(&sorted, 1.0), 4.0);
         assert_eq!(percentile(&[], 0.5), 0.0);
+    }
+
+    #[test]
+    fn executor_phase_table_excludes_byte_counters_from_millisecond_rows() {
+        assert!(is_executor_phase_time_row("run_scoped.setup_total.top"));
+        assert!(!is_executor_phase_time_row("activation_plan.peak_bytes"));
+        assert!(!is_executor_phase_time_row(
+            "collect_outputs.top_host_bytes"
+        ));
     }
 
     #[test]
@@ -1299,8 +1579,8 @@ mod tests {
         profile.memory.device_limit_bytes = Some(8 * 1024 * 1024 * 1024);
         profile.memory.composition = Some(DeviceComposition {
             model_weights_bytes: 2 * 1024 * 1024 * 1024,
-            activations_bytes: 512 * 1024 * 1024,
-            runtime_overhead_bytes: 256 * 1024 * 1024,
+            activations_bytes: Some(512 * 1024 * 1024),
+            runtime_overhead_bytes: Some(256 * 1024 * 1024),
             kv_bytes: 4 * 1024 * 1024 * 1024,
             kv_pages: 2048,
             kv_page_bytes: 2 * 1024 * 1024,
@@ -1339,8 +1619,8 @@ mod tests {
         // What the engine reports today: weights and KV measured, the rest not.
         profile.memory.composition = Some(DeviceComposition {
             model_weights_bytes: 1024 * 1024 * 1024,
-            activations_bytes: 0,
-            runtime_overhead_bytes: 0,
+            activations_bytes: None,
+            runtime_overhead_bytes: None,
             kv_bytes: 3 * 1024 * 1024 * 1024,
             kv_pages: 100,
             kv_page_bytes: 32 * 1024 * 1024,
@@ -1394,8 +1674,8 @@ mod tests {
         // still a zeroed placeholder.
         profile.memory.composition = Some(DeviceComposition {
             model_weights_bytes: 0,
-            activations_bytes: 0,
-            runtime_overhead_bytes: 0,
+            activations_bytes: None,
+            runtime_overhead_bytes: None,
             kv_bytes: 1024,
             kv_pages: 4,
             kv_page_bytes: 256,
@@ -1411,6 +1691,66 @@ mod tests {
         assert!(text.contains("kv cache budget"), "{text}");
         let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
         assert!(value.get("device_memory_breakdown").is_none());
+    }
+
+    #[test]
+    fn weight_placement_explanation_is_visible_in_profile_text_and_json() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.timings = timings(10, &[10]);
+        profile.memory.weight_placement = Some(WeightPlacementMemory {
+            coordinated_weight_budget_bytes: 2048,
+            effective_budget_bytes: 1024,
+            device_bytes: 512,
+            host_bytes: 1536,
+            explanation: "VRAM placement: source=gpu_layers:1".to_string(),
+        });
+
+        let text = profile.to_text();
+        assert!(text.contains("weight placement"), "{text}");
+        assert!(text.contains("source=gpu_layers:1"), "{text}");
+
+        let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+        assert_eq!(value["weight_placement"]["device_bytes"], 512);
+        assert_eq!(
+            value["weight_placement"]["explanation"],
+            "VRAM placement: source=gpu_layers:1"
+        );
+    }
+
+    #[test]
+    fn memory_strategy_and_provenance_are_visible_in_profile_text_and_json() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.timings = timings(10, &[10]);
+        let mut plan = onnx_genai::engine::MemoryStrategyPlan::unknown(128, None, "test strategy");
+        plan.strategy = onnx_genai::engine::MemoryStrategy::Compatibility;
+        plan.inferred_strategy = onnx_genai::engine::MemoryStrategy::DynamicWeightResidency;
+        plan.decisions.push(
+            onnx_genai::engine::MemoryStrategyDecision::new(
+                "strategy",
+                "Compatibility",
+                onnx_genai::engine::DecisionSource::CompatibilityDefault,
+                "automatic activation remains gated",
+                "no explicit budget",
+            )
+            .with_inferred_value("DynamicWeightResidency"),
+        );
+        profile.memory.memory_strategy_plan = Some(plan);
+
+        let text = profile.to_text();
+        assert!(text.contains("memory strategy"), "{text}");
+        assert!(text.contains("CompatibilityDefault"), "{text}");
+        assert!(text.contains("inferred DynamicWeightResidency"), "{text}");
+
+        let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+        assert_eq!(value["memory_strategy"]["strategy"], "Compatibility");
+        assert_eq!(
+            value["memory_strategy"]["inferred_strategy"],
+            "DynamicWeightResidency"
+        );
+        assert_eq!(
+            value["memory_strategy"]["decisions"][1]["source"],
+            "CompatibilityDefault"
+        );
     }
 
     #[test]
@@ -1608,5 +1948,56 @@ mod tests {
         );
         assert_eq!(json["budget_cap"]["requested_max_new_tokens"], 3584);
         assert_eq!(json["budget_cap"]["admitted_max_new_tokens"], 128);
+    }
+
+    /// A measured zero and an unmeasured component are different things.
+    ///
+    /// They used to be the same `u64`, so the reports reconstructed the
+    /// distinction from `== 0` -- which meant a component genuinely measured at
+    /// zero was reported as "not yet measured", and before #629 an unmeasured
+    /// one was published to machine readers as a hard `0`. The type now carries
+    /// it, so neither reconstruction is needed.
+    #[test]
+    fn a_measured_zero_is_not_reported_as_unmeasured() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.timings = timings(10, &[10]);
+        profile.memory.device_limit_bytes = Some(4 * 1024 * 1024 * 1024);
+        profile.memory.composition = Some(DeviceComposition {
+            model_weights_bytes: 1024 * 1024 * 1024,
+            // Measured, and genuinely zero.
+            activations_bytes: Some(0),
+            // Never measured.
+            runtime_overhead_bytes: None,
+            kv_bytes: 2 * 1024 * 1024 * 1024,
+            kv_pages: 100,
+            kv_page_bytes: 32 * 1024 * 1024,
+        });
+
+        let text = profile.to_text();
+        assert!(
+            text.contains("runtime overhead not yet measured"),
+            "the unmeasured one must be named:\n{text}"
+        );
+        assert!(
+            !text.contains("activations and runtime overhead not yet measured"),
+            "activations were measured, so they must not be listed as unmeasured:\n{text}"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+        let breakdown = &value["device_memory_breakdown"];
+        assert_eq!(
+            breakdown["activations_bytes"], 0,
+            "a measured zero is a number and belongs in the JSON"
+        );
+        let unmeasured = breakdown["unmeasured"].as_array().expect("named");
+        assert!(
+            unmeasured
+                .iter()
+                .any(|name| name == "runtime_overhead_bytes")
+        );
+        assert!(
+            !unmeasured.iter().any(|name| name == "activations_bytes"),
+            "activations were measured: {breakdown}"
+        );
     }
 }

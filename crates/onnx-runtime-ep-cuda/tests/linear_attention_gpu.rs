@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU parity regressions for `com.microsoft::LinearAttention` (Gated DeltaNet /
 //! gated delta-rule linear attention, the recurrent attention of the Qwen3.5 /
 //! Qwen3-Next hybrid family).
@@ -9,13 +23,22 @@
 //! the four `update_rule` variants, standard and inverse GQA, key-head sharing
 //! (`n_k < H_kv`), per-head vs per-key-dim decay, per-head vs shared beta,
 //! multi-timestep recurrence (state carry), a non-trivial past_state, and the
-//! Float32 / Float16 / BFloat16 dtypes. All cases graceful-skip without a GPU.
+//! Float32 / Float16 / BFloat16 dtypes. CPU-only runs report these as ignored
+//! unless `gpu-tests` is enabled.
 
 mod common;
 
-use common::{Tensor, assert_close, cuda_ep, decode_floats, float_input, run_cpu, run_cuda};
+use common::{
+    Tensor, assert_close, build_graph, decode_floats, encode_floats, float_input, require_cuda,
+    run_cpu, run_cuda,
+};
+use onnx_runtime_ep_api::{
+    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
+};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
-use onnx_runtime_ir::{Attribute, DataType};
+use onnx_runtime_ep_cuda::runtime::cuptr;
+use onnx_runtime_ir::{Attribute, DataType, compute_contiguous_strides};
+use onnx_runtime_loader::Model;
 
 const DOMAIN: &str = "com.microsoft";
 const OPSET: u64 = 1;
@@ -139,10 +162,7 @@ fn tolerance(dtype: DataType) -> f32 {
 
 /// Run one config on CUDA and the CPU oracle, comparing every output.
 fn check(cfg: &Config, dtype: DataType) {
-    let Some(ep) = cuda_ep() else {
-        eprintln!("skip {}: no CUDA GPU", cfg.label);
-        return;
-    };
+    let ep = require_cuda();
     run_check(&ep, cfg, dtype, DOMAIN);
 }
 
@@ -292,6 +312,10 @@ fn configs() -> Vec<Config> {
     ]
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn linear_attention_f32_parity() {
     for cfg in configs() {
@@ -299,6 +323,10 @@ fn linear_attention_f32_parity() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn linear_attention_f16_parity() {
     for cfg in configs() {
@@ -306,6 +334,10 @@ fn linear_attention_f16_parity() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn linear_attention_bf16_parity() {
     for cfg in configs() {
@@ -316,12 +348,13 @@ fn linear_attention_bf16_parity() {
 /// The standard ONNX-domain spelling (`""`) must dispatch to the SAME fused
 /// kernel and match the CPU oracle exactly like the `com.microsoft` spelling —
 /// proving the dual-domain registration (onnx/onnx#7689) is wired end to end.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn linear_attention_standard_domain_parity() {
-    let Some(ep) = cuda_ep() else {
-        eprintln!("skip: no CUDA GPU");
-        return;
-    };
+    let ep = require_cuda();
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
         for cfg in configs() {
             run_check(&ep, &cfg, dtype, "");
@@ -332,12 +365,13 @@ fn linear_attention_standard_domain_parity() {
 /// The two domain spellings are semantically identical: for the same inputs the
 /// standard-domain (`""`) and `com.microsoft` ops must produce byte-identical
 /// CUDA outputs (same kernel, no numeric drift).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn linear_attention_both_domains_identical() {
-    let Some(ep) = cuda_ep() else {
-        eprintln!("skip: no CUDA GPU");
-        return;
-    };
+    let ep = require_cuda();
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
         for cfg in configs() {
             let inputs = build_inputs(&cfg, dtype);
@@ -372,12 +406,13 @@ fn linear_attention_both_domains_identical() {
 /// half-sequences chained through `past_state` must equal one full-sequence
 /// run. This proves the CUDA present_state is a faithful continuation state,
 /// not just a per-step artifact.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn linear_attention_state_carry_matches_chained() {
-    let Some(ep) = cuda_ep() else {
-        eprintln!("skip: no CUDA GPU");
-        return;
-    };
+    let ep = require_cuda();
     let dtype = DataType::Float32;
     let (batch, d_k, d_v, heads) = (1usize, 5usize, 4usize, 2usize);
     let a = vec![
@@ -430,6 +465,7 @@ fn linear_attention_state_carry_matches_chained() {
         for s in start..start + len {
             bytes.extend_from_slice(&t.bytes[s * row..(s + 1) * row]);
         }
+
         Tensor {
             dtype: t.dtype,
             shape: vec![t.shape[0], len, per],
@@ -501,4 +537,207 @@ fn linear_attention_state_carry_matches_chained() {
         &full_out,
         2e-4,
     );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn linear_attention_capture_replay_preserves_in_place_recurrent_state() {
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let cfg = Config {
+        label: "capture-in-place-state",
+        batch: 1,
+        seq: 1,
+        d_k: 5,
+        d_v: 4,
+        q_num_heads: 2,
+        kv_num_heads: 2,
+        n_k_heads: 2,
+        update_rule: "gated_delta",
+        scale: 0.5,
+        decay_per_key_dim: false,
+        beta_shared: false,
+        with_past: true,
+    };
+    let inputs = build_inputs(&cfg, DataType::Float32);
+    let outputs = vec![
+        (
+            DataType::Float32,
+            vec![cfg.batch, cfg.seq, cfg.output_hidden()],
+        ),
+        (
+            DataType::Float32,
+            vec![cfg.batch, cfg.kv_num_heads, cfg.d_k, cfg.d_v],
+        ),
+    ];
+    let attrs = attrs(&cfg);
+    let (graph, node_id) = build_graph("LinearAttention", DOMAIN, OPSET, &inputs, &outputs, &attrs);
+    let model = Model::new(&graph);
+    let concrete_shapes = inputs
+        .iter()
+        .map(|tensor| tensor.shape.clone())
+        .collect::<Vec<_>>();
+    let kernel = ep
+        .get_kernel(model.graph.node(node_id), &concrete_shapes, OPSET)
+        .unwrap();
+    let eager_kernel = ep
+        .get_kernel(model.graph.node(node_id), &concrete_shapes, OPSET)
+        .unwrap();
+    let upload_inputs = || {
+        inputs
+            .iter()
+            .map(|tensor| {
+                let buffer = ep.allocate(tensor.bytes.len(), 256).unwrap();
+                unsafe { runtime.htod(&tensor.bytes, cuptr(buffer.as_ptr())).unwrap() };
+                buffer
+            })
+            .collect::<Vec<DeviceBuffer>>()
+    };
+    let mut captured_inputs = upload_inputs();
+    let mut eager_inputs = upload_inputs();
+    let input_strides = inputs
+        .iter()
+        .map(|tensor| compute_contiguous_strides(&tensor.shape))
+        .collect::<Vec<_>>();
+    let captured_views = inputs
+        .iter()
+        .zip(&captured_inputs)
+        .zip(&input_strides)
+        .map(|((tensor, buffer), strides)| {
+            TensorView::new(
+                DevicePtr(buffer.as_ptr()),
+                tensor.dtype,
+                &tensor.shape,
+                strides,
+                ep.device_id(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let eager_views = inputs
+        .iter()
+        .zip(&eager_inputs)
+        .zip(&input_strides)
+        .map(|((tensor, buffer), strides)| {
+            TensorView::new(
+                DevicePtr(buffer.as_ptr()),
+                tensor.dtype,
+                &tensor.shape,
+                strides,
+                ep.device_id(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let output_strides = outputs
+        .iter()
+        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .collect::<Vec<_>>();
+    let output_bytes = outputs[0].0.storage_bytes(outputs[0].1.iter().product());
+    let state_bytes = inputs[3].bytes.len();
+    let mut captured_output = ep.allocate(output_bytes, 256).unwrap();
+    let mut eager_output = ep.allocate(output_bytes, 256).unwrap();
+    let mut captured_outputs = vec![
+        TensorMut::new(
+            DevicePtrMut(captured_output.as_mut_ptr()),
+            outputs[0].0,
+            &outputs[0].1,
+            &output_strides[0],
+            ep.device_id(),
+        ),
+        TensorMut::new(
+            DevicePtrMut(captured_inputs[3].as_mut_ptr()),
+            outputs[1].0,
+            &outputs[1].1,
+            &output_strides[1],
+            ep.device_id(),
+        ),
+    ];
+    let mut eager_outputs = vec![
+        TensorMut::new(
+            DevicePtrMut(eager_output.as_mut_ptr()),
+            outputs[0].0,
+            &outputs[0].1,
+            &output_strides[0],
+            ep.device_id(),
+        ),
+        TensorMut::new(
+            DevicePtrMut(eager_inputs[3].as_mut_ptr()),
+            outputs[1].0,
+            &outputs[1].1,
+            &output_strides[1],
+            ep.device_id(),
+        ),
+    ];
+    let read = |buffer: &DeviceBuffer, len: usize| {
+        let mut bytes = vec![0; len];
+        unsafe {
+            runtime.dtoh(&mut bytes, cuptr(buffer.as_ptr())).unwrap();
+        }
+        bytes
+    };
+    let overwrite = |buffer: &DeviceBuffer, bytes: &[u8]| unsafe {
+        runtime.htod(bytes, cuptr(buffer.as_ptr())).unwrap();
+    };
+
+    kernel
+        .execute(&captured_views, &mut captured_outputs)
+        .unwrap();
+    eager_kernel
+        .execute(&eager_views, &mut eager_outputs)
+        .unwrap();
+    assert_eq!(
+        read(&captured_inputs[3], state_bytes),
+        read(&eager_inputs[3], state_bytes),
+        "warmup in-place recurrent state must match eager"
+    );
+
+    let allocation_counts = runtime.allocation_counts();
+    let kernels = [kernel.as_ref()];
+    runtime.begin_graph_capture(&kernels).unwrap();
+    kernel
+        .execute(&captured_views, &mut captured_outputs)
+        .unwrap();
+    runtime.end_graph_capture().unwrap();
+
+    for step in 1_u64..=4 {
+        for index in [0_usize, 1, 2, 4, 5] {
+            let count = inputs[index].shape.iter().product();
+            let mut replacement = inputs[index].clone();
+            replacement.bytes = encode_floats(
+                &values(100 * step + index as u64, count, -0.8, 0.8),
+                replacement.dtype,
+            );
+            overwrite(&captured_inputs[index], &replacement.bytes);
+            overwrite(&eager_inputs[index], &replacement.bytes);
+        }
+        eager_kernel
+            .execute(&eager_views, &mut eager_outputs)
+            .unwrap();
+        runtime.replay_graph().unwrap();
+        assert_eq!(
+            read(&captured_output, output_bytes),
+            read(&eager_output, output_bytes),
+            "captured output diverged at recurrent decode step {step}"
+        );
+        assert_eq!(
+            read(&captured_inputs[3], state_bytes),
+            read(&eager_inputs[3], state_bytes),
+            "captured in-place recurrent state diverged at decode step {step}"
+        );
+    }
+
+    assert_eq!(runtime.allocation_counts(), allocation_counts);
+    assert!(runtime.reset_graph().unwrap());
+    drop(captured_outputs);
+    drop(eager_outputs);
+    for buffer in captured_inputs {
+        ep.deallocate(buffer).unwrap();
+    }
+    for buffer in eager_inputs {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(captured_output).unwrap();
+    ep.deallocate(eager_output).unwrap();
 }

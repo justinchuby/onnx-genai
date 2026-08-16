@@ -1,5 +1,5 @@
 //! Constant folding: replace a node whose inputs are *all* constant
-//! (initializers) with a precomputed initializer (see `docs/ORT2.md` §18.1).
+//! (initializers) with a precomputed initializer (see `docs/architecture/ORT2.md` §18.1).
 //!
 //! ## Boundary (deliberately conservative)
 //!

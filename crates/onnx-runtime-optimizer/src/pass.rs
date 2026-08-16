@@ -1,6 +1,6 @@
 //! Pass infrastructure: the [`OptimizationPass`] trait, a minimal
 //! [`PassContext`], and the [`run_passes`] pipeline runner (see
-//! `docs/ORT2.md` §18.1).
+//! `docs/architecture/ORT2.md` §18.1).
 
 use std::sync::Arc;
 
@@ -23,7 +23,7 @@ pub trait InitializerResolver: Send + Sync {
 
 /// Shared, read-only context threaded through every pass.
 ///
-/// **Phase-1 minimalism.** The design in `docs/ORT2.md` §18.1 gives this struct
+/// **Phase-1 minimalism.** The design in `docs/architecture/ORT2.md` §18.1 gives this struct
 /// `cost_model`, `ep_registry`, and `target_devices` fields. Those depend on
 /// crates or analyses that do not exist yet, and none of the device-independent
 /// Phase-1 passes
@@ -77,7 +77,7 @@ impl PassContext {
     }
 }
 
-/// A single graph→graph rewrite (see `docs/ORT2.md` §18.1).
+/// A single graph→graph rewrite (see `docs/architecture/ORT2.md` §18.1).
 ///
 /// Passes mutate the [`Graph`] in place and must preserve its structural
 /// invariants; [`postconditions`](OptimizationPass::postconditions) is checked
@@ -106,7 +106,7 @@ pub trait OptimizationPass: Send + Sync {
 /// Each pass runs to completion, then — in debug builds only — its
 /// [`postconditions`](OptimizationPass::postconditions) are checked. In release
 /// builds the postcondition check is compiled out for speed, matching the
-/// "checked in debug builds" contract of `docs/ORT2.md` §18.1.
+/// "checked in debug builds" contract of `docs/architecture/ORT2.md` §18.1.
 pub fn run_passes(
     graph: &mut Graph,
     passes: &[Box<dyn OptimizationPass>],

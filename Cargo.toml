@@ -18,10 +18,11 @@ members = [
     "crates/onnx-genai-capi",
     "crates/onnx-genai-ort/ort-sys",
 
-    # ── ORT 2.0 runtime layer (new — see docs/ORT2.md) ──
+    # ── ORT 2.0 runtime layer (new — see docs/architecture/ORT2.md) ──
     "crates/onnx-runtime-ir",
     "crates/onnx-runtime-memory",
     "crates/onnx-runtime-virtual-memory",
+    "crates/onnx-runtime-cuda-memory",
     "crates/onnx-runtime-memory-governor",
     "crates/onnx-runtime-cpuinfo",
     "crates/onnx-runtime-loader",
@@ -33,6 +34,7 @@ members = [
     "crates/onnx-runtime-ep-cpu",
     "crates/onnx-runtime-operator-selection",
     "crates/onnx-runtime-ep-cuda",
+    "crates/onnx-runtime-cost-model",
     "crates/onnx-runtime-eager",
     "crates/onnx-runtime-session",
     "crates/onnx-runtime-capi",
@@ -43,16 +45,32 @@ members = [
     # ── Python packaging + unified CLI (onnx-genai / onnx-genai-server wheels) ──
     "crates/onnx-genai-python",
     "crates/onnx-genai-cli",
+    "crates/onnx-genai-cuda-version-guard",
 
-    # ── Protocol conformance framework (new — see docs/PRESSURE_PROTOCOL_IMPL.md) ──
+    # ── Protocol conformance framework (new — see docs/memory/PRESSURE_PROTOCOL_IMPL.md) ──
     "crates/onnx-runtime-protocol-trace",
 
-    # ── Distributed runtime: communicator + buffer ownership (new — see docs/COMMUNICATOR_BUFFER_IMPL.md) ──
+    # ── Distributed runtime: communicator + buffer ownership (new — see docs/distributed/COMMUNICATOR_BUFFER_IMPL.md) ──
     "crates/onnx-runtime-comm",
 
-    # ── onnx-std standard library (new — see docs/ONNX_RS.md) ──
+    # ── onnx-std standard library (new — see docs/architecture/ONNX_RS.md) ──
     "crates/onnx-std",
     "crates/onnx-std-python",
+
+    # ── Outbound ORT plugin-EP export (not in default-members — requires ort-sys) ──
+    "crates/onnx-runtime-ep-plugin",
+    "crates/onnx-runtime-ep-cpu-plugin",
+    "crates/onnx-runtime-ep-cuda-plugin",
+    # Test-only: CPU-backed shared-EP plugin used for real-ORT conformance of
+    # the shared-EP (CUDA-shaped) ownership path on GPU-less hosts.
+    "crates/onnx-runtime-ep-shared-mock-plugin",
+    # Test-only helper crate (publish = false): real-ORT + cdylib discovery.
+    "crates/onnx-runtime-ort-testkit",
+
+    # ── Native nxrt dynamic EP ABI (§524 native half) ──
+    "crates/onnx-runtime-ep-nxrt-abi",
+    "crates/onnx-runtime-ep-nxrt-host",
+    "crates/onnx-runtime-ep-nxrt-testplugin",
 
     # ── Vendored ONNX Runtime MLAS bindings ──
     # Registered as a member so `cargo build -p mlas-sys` resolves. Crates that
@@ -82,6 +100,7 @@ default-members = [
     "crates/onnx-runtime-ir",
     "crates/onnx-runtime-memory",
     "crates/onnx-runtime-virtual-memory",
+    "crates/onnx-runtime-cuda-memory",
     "crates/onnx-runtime-memory-governor",
     "crates/onnx-runtime-cpuinfo",
     "crates/onnx-runtime-loader",
@@ -92,6 +111,7 @@ default-members = [
     "crates/onnx-runtime-ep-api",
     "crates/onnx-runtime-ep-cpu",
     "crates/onnx-runtime-ep-cuda",
+    "crates/onnx-runtime-cost-model",
     "crates/onnx-runtime-eager",
     "crates/onnx-runtime-session",
     "crates/onnx-runtime-capi",
@@ -143,6 +163,7 @@ onnx-genai-server = { path = "crates/onnx-genai-server", version = "=0.1.0-dev.5
 onnx-runtime-ir = { path = "crates/onnx-runtime-ir", version = "=0.1.0-dev.5" }
 onnx-runtime-memory = { path = "crates/onnx-runtime-memory", version = "=0.1.0-dev.5" }
 onnx-runtime-virtual-memory = { path = "crates/onnx-runtime-virtual-memory", version = "=0.1.0-dev.5" }
+onnx-runtime-cuda-memory = { path = "crates/onnx-runtime-cuda-memory", version = "=0.1.0-dev.5" }
 onnx-runtime-memory-governor = { path = "crates/onnx-runtime-memory-governor", version = "=0.1.0-dev.5" }
 onnx-runtime-cpuinfo = { path = "crates/onnx-runtime-cpuinfo", version = "=0.1.0-dev.5" }
 onnx-runtime-loader = { path = "crates/onnx-runtime-loader", version = "=0.1.0-dev.5" }
@@ -155,6 +176,7 @@ onnx-runtime-ep-cpu = { path = "crates/onnx-runtime-ep-cpu", version = "=0.1.0-d
 onnx-runtime-operator-selection = { path = "crates/onnx-runtime-operator-selection", version = "=0.1.0-dev.5" }
 mlas-sys = { path = "crates/mlas-sys", version = "=0.1.0-dev.5" }
 onnx-runtime-ep-cuda = { path = "crates/onnx-runtime-ep-cuda", version = "=0.1.0-dev.5" }
+onnx-runtime-cost-model = { path = "crates/onnx-runtime-cost-model", version = "=0.1.0-dev.5" }
 onnx-runtime-eager = { path = "crates/onnx-runtime-eager", version = "=0.1.0-dev.5" }
 onnx-runtime-session = { path = "crates/onnx-runtime-session", version = "=0.1.0-dev.5" }
 onnx-runtime-capi = { path = "crates/onnx-runtime-capi", version = "=0.1.0-dev.5" }
@@ -163,8 +185,18 @@ onnx-runtime-dlpack = { path = "crates/onnx-runtime-dlpack", version = "=0.1.0-d
 onnx-runtime-protocol-trace = { path = "crates/onnx-runtime-protocol-trace", version = "=0.1.0-dev.5" }
 onnx-runtime-comm = { path = "crates/onnx-runtime-comm", version = "=0.1.0-dev.5" }
 
-# onnx-std standard library (new — see docs/ONNX_RS.md)
+# onnx-std standard library (new — see docs/architecture/ONNX_RS.md)
 onnx-std = { path = "crates/onnx-std", version = "=0.1.0-dev.5" }
+
+onnx-runtime-ep-plugin = { path = "crates/onnx-runtime-ep-plugin", version = "=0.1.0-dev.5" }
+onnx-runtime-ep-cpu-plugin = { path = "crates/onnx-runtime-ep-cpu-plugin", version = "=0.1.0-dev.5" }
+onnx-runtime-ep-cuda-plugin = { path = "crates/onnx-runtime-ep-cuda-plugin", version = "=0.1.0-dev.5" }
+onnx-runtime-ep-nxrt-abi = { path = "crates/onnx-runtime-ep-nxrt-abi", version = "=0.1.0-dev.5" }
+onnx-runtime-ep-nxrt-host = { path = "crates/onnx-runtime-ep-nxrt-host", version = "=0.1.0-dev.5" }
+onnx-runtime-ep-nxrt-testplugin = { path = "crates/onnx-runtime-ep-nxrt-testplugin", version = "=0.1.0-dev.5" }
+
+# Test-only helper crate (publish = false, no version pin needed).
+onnx-runtime-ort-testkit = { path = "crates/onnx-runtime-ort-testkit" }
 
 # External
 # `default` pulls `onig` (a vendored C regex engine), `esaxx_fast` (a C++ suffix

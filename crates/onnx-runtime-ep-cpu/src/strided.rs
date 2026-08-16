@@ -1,4 +1,4 @@
-//! Strided-view access helpers shared by the CPU kernels (`docs/ORT2.md` §5).
+//! Strided-view access helpers shared by the CPU kernels (`docs/architecture/ORT2.md` §5).
 //!
 //! Every kernel input arrives as a [`TensorView`](onnx_runtime_ep_api::TensorView)
 //! that may be **non-contiguous** — a transposed weight, a broadcast bias, a

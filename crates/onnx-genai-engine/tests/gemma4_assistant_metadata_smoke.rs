@@ -1,11 +1,11 @@
 //! Regression test: validate the full mobius-emitted metadata -> runtime
 //! auto-config chain for the shared-KV (Gemma4-Assistant) proposer.
 //!
-//! Baseline engine loads the fixture WITHOUT metadata (plain greedy). The
-//! speculative engine loads a copy WITH a mobius-style `inference_metadata.yaml`
-//! `speculative:` block and `EngineConfig::default()` (speculative auto-enabled
-//! from metadata via `shared_kv_mode_from_metadata`). Asserts token-identity and
-//! reports tokens/sec for both.
+//! Baseline engine loads the fixture with speculation explicitly disabled (plain
+//! greedy). The speculative engine loads a copy WITH a mobius-style
+//! `inference_metadata.yaml` `speculative:` block and `EngineConfig::default()`
+//! (speculative auto-enabled from metadata via `shared_kv_mode_from_metadata`).
+//! Asserts token-identity and reports tokens/sec for both.
 
 use onnx_genai_engine::{Engine, EngineConfig, GeneratePrompt, GenerateRequest, SpeculativeMode};
 use onnx_genai_ort::SessionOptions;
@@ -55,6 +55,22 @@ model:
     kv_cache:
       dtype:
         - float32
+  io:
+    token_input: input_ids
+    attention_mask_input: attention_mask
+    position_ids_input: position_ids
+    logits_output: logits
+    hidden_output: hidden_states.0
+    kv_inputs:
+      - past_key_values.0.key
+      - past_key_values.0.value
+      - past_key_values.1.key
+      - past_key_values.1.value
+    kv_outputs:
+      - present.0.key
+      - present.0.value
+      - present.1.key
+      - present.1.value
 kv_cache:
   native_dtype: float32
 speculative:

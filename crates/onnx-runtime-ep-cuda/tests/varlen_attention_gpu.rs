@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU correctness tests for `pkg.nxrt::VarlenAttention` v1.
 //!
 //! `VarlenAttention` consumes the ONNX Attention-24 `nonpad_kv_seqlen` per-batch
@@ -9,7 +23,7 @@
 //! The reference is a from-scratch oracle — it does not call any GPU kernel — so
 //! the comparison is meaningful rather than tautological.
 //!
-//! Tests skip cleanly when no CUDA device is present. Run with:
+//! CPU-only CI reports these tests as ignored unless `gpu-tests` is enabled. Run with:
 //! `CUDA_VISIBLE_DEVICES=5 taskset -c 1 cargo test -p onnx-runtime-ep-cuda \
 //!   --test varlen_attention_gpu -- --nocapture`
 
@@ -84,13 +98,15 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-fn gpu() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -452,7 +468,7 @@ fn check(
     scale: Option<f32>,
     softcap: f32,
 ) {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let got = batch.run(&ep, is_causal, fp16, rank4, scale, softcap);
     let want = batch.cpu_reference(is_causal, fp16, scale, softcap);
     let tol = if fp16 { 3e-2 } else { 2e-4 };
@@ -464,7 +480,7 @@ fn check(
 }
 
 fn check_dtype(batch: &Batch, is_causal: bool, dtype: DataType, tolerance: f32) {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let got = batch.run_dtype(&ep, is_causal, dtype, true, None, 0.0);
     let want = batch.cpu_reference_dtype(is_causal, dtype, None, 0.0);
     let diff = max_abs_diff(&got, &want);
@@ -476,36 +492,60 @@ fn check_dtype(batch: &Batch, is_causal: bool, dtype: DataType, tolerance: f32) 
 
 // ---- ragged batch [3, 7, 2], f32, f16, and bf16, causal and non-causal ----
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn varlen_ragged_non_causal_f32() {
     let batch = Batch::new(3, 3, 8, 8, 4, &[3, 7, 2]);
     check(&batch, false, false, true, None, 0.0);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn varlen_ragged_causal_f32() {
     let batch = Batch::new(3, 3, 8, 8, 4, &[3, 7, 2]);
     check(&batch, true, false, true, None, 0.0);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn varlen_ragged_non_causal_f16() {
     let batch = Batch::new(3, 3, 8, 8, 4, &[3, 7, 2]);
     check(&batch, false, true, true, None, 0.0);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn varlen_ragged_causal_f16() {
     let batch = Batch::new(3, 3, 8, 8, 4, &[3, 7, 2]);
     check(&batch, true, true, true, None, 0.0);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn varlen_ragged_non_causal_bf16() {
     let batch = Batch::new(3, 3, 8, 8, 4, &[3, 7, 2]);
     check_dtype(&batch, false, DataType::BFloat16, 1e-1);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn varlen_ragged_causal_bf16() {
     let batch = Batch::new(3, 3, 8, 8, 4, &[3, 7, 2]);
@@ -514,6 +554,10 @@ fn varlen_ragged_causal_bf16() {
 
 // ---- rank-3 collapsed layout must match rank-4 semantics ----
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn varlen_ragged_rank3_layout_f32() {
     let batch = Batch::new(2, 2, 8, 8, 5, &[6, 3]);
@@ -522,12 +566,20 @@ fn varlen_ragged_rank3_layout_f32() {
 
 // ---- GQA / MQA head sharing ----
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn varlen_gqa_head_sharing_f32() {
     let batch = Batch::new(4, 2, 8, 8, 4, &[5, 2, 7]);
     check(&batch, false, false, true, None, 0.0);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn varlen_mqa_head_sharing_causal_f16() {
     let batch = Batch::new(4, 1, 8, 8, 4, &[5, 2, 7]);
@@ -536,6 +588,10 @@ fn varlen_mqa_head_sharing_causal_f16() {
 
 // ---- custom scale and softcap ----
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn varlen_scale_and_softcap_f32() {
     let batch = Batch::new(2, 2, 8, 8, 4, &[6, 3]);
@@ -544,18 +600,30 @@ fn varlen_scale_and_softcap_f32() {
 
 // ---- edge cases: single sequence, and sequences of length 1 ----
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn varlen_single_sequence_causal_f32() {
     let batch = Batch::new(3, 3, 16, 16, 5, &[5]);
     check(&batch, true, false, true, None, 0.0);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn varlen_single_sequence_f16() {
     let batch = Batch::new(3, 3, 16, 16, 5, &[4]);
     check(&batch, false, true, true, None, 0.0);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn varlen_length_one_kv_decode_f32() {
     // Single query token attending a single valid KV token per batch (decode).
@@ -564,6 +632,10 @@ fn varlen_length_one_kv_decode_f32() {
     check(&batch, true, false, true, None, 0.0);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn varlen_length_one_kv_decode_f16() {
     let batch = Batch::new(4, 2, 8, 8, 1, &[1, 1, 1]);
@@ -572,6 +644,10 @@ fn varlen_length_one_kv_decode_f16() {
 
 // ---- mixed valid lengths incl. a fully-padded (zero valid) sequence ----
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn varlen_zero_valid_sequence_emits_zeros_f32() {
     let batch = Batch::new(2, 2, 8, 8, 3, &[0, 5]);

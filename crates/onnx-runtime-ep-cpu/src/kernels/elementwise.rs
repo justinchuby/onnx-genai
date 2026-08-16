@@ -1,4 +1,4 @@
-//! Elementwise f32 kernels (`docs/ORT2.md` §4.4).
+//! Elementwise f32 kernels (`docs/architecture/ORT2.md` §4.4).
 //!
 //! Two tight families share this module because they share the same dense-f32
 //! read/write plumbing:
@@ -19,8 +19,10 @@ use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use super::add::{broadcast_apply, require_same_dtype};
 use super::check_arity;
+use super::simd_activations;
 use crate::dtype::{
-    ComputeDomain, FloatElem, NumericElem, to_dense, to_dense_float, write_dense, write_dense_float,
+    ComputeDomain, FloatElem, NumericElem, to_dense, to_dense_f32_widen, to_dense_float,
+    write_dense, write_dense_float,
 };
 use crate::strided::numel;
 use crate::{dispatch_arith, dispatch_float};
@@ -73,9 +75,51 @@ impl BinOp {
     }
 }
 
+/// Resolve a [`BinOp`] to a monomorphised combiner **once**, outside the hot
+/// loop. Every arm binds `$fold` to a closure over `C: ComputeDomain` and
+/// evaluates `$body`.
+macro_rules! dispatch_binop {
+    ($op:expr, $fold:ident => $body:expr) => {
+        match $op {
+            BinOp::Sub => {
+                let $fold = |a: <T as NumericElem>::Acc, b| a.c_sub(b);
+                $body
+            }
+            BinOp::Mul => {
+                let $fold = |a: <T as NumericElem>::Acc, b| a.c_mul(b);
+                $body
+            }
+            BinOp::Div => {
+                let $fold = |a: <T as NumericElem>::Acc, b| a.c_div(b);
+                $body
+            }
+            BinOp::Pow => {
+                let $fold = |a: <T as NumericElem>::Acc, b| a.c_pow(b);
+                $body
+            }
+            BinOp::Min => {
+                let $fold = |a: <T as NumericElem>::Acc, b| a.c_min(b);
+                $body
+            }
+            BinOp::Max => {
+                let $fold = |a: <T as NumericElem>::Acc, b| a.c_max(b);
+                $body
+            }
+            BinOp::Sum | BinOp::Mean => {
+                let $fold = |a: <T as NumericElem>::Acc, b| a.c_add(b);
+                $body
+            }
+        }
+    };
+}
+
 /// A stateless binary/variadic elementwise kernel.
 pub struct BinaryKernel {
     op: BinOp,
+    /// Structural FLOPs (one op per broadcast output element) when the input
+    /// shapes were static at build time; `None` otherwise (issue #995 — never
+    /// fabricated).
+    flops: Option<u64>,
 }
 
 macro_rules! binary_factory {
@@ -83,8 +127,11 @@ macro_rules! binary_factory {
         /// Factory (no attributes).
         pub struct $factory;
         impl KernelFactory for $factory {
-            fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-                Ok(Box::new(BinaryKernel { op: $variant }))
+            fn create(&self, _node: &Node, shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+                Ok(Box::new(BinaryKernel {
+                    op: $variant,
+                    flops: super::flops::elementwise_flops(shapes),
+                }))
             }
         }
     };
@@ -247,7 +294,8 @@ impl Kernel for BinaryKernel {
             });
         }
         if matches!(op, BinOp::Sub | BinOp::Mul | BinOp::Div)
-            && binary_contiguous(op, inputs, &mut outputs[0])
+            && (binary_contiguous(op, inputs, &mut outputs[0])
+                || binary_broadcast_contiguous(op, inputs, &mut outputs[0]))
         {
             return Ok(());
         }
@@ -266,6 +314,10 @@ impl Kernel for BinaryKernel {
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
+    }
+
+    fn estimated_flops(&self) -> Option<u64> {
+        self.flops
     }
 }
 
@@ -326,9 +378,192 @@ fn binary_contiguous_typed<T: NumericElem>(
     let lhs = unsafe { std::slice::from_raw_parts(inputs[0].data_ptr::<T>(), n) };
     let rhs = unsafe { std::slice::from_raw_parts(inputs[1].data_ptr::<T>(), n) };
     let out = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<T>(), n) };
-    for ((out, &lhs), &rhs) in out.iter_mut().zip(lhs).zip(rhs) {
-        *out = T::from_acc(op.apply(lhs.to_acc(), rhs.to_acc()));
+    // Same reason as `binary_broadcast_typed`: resolve the combiner once so the
+    // element loop is a single arithmetic op and can vectorise.
+    dispatch_binop!(op, fold => {
+        for ((out, &lhs), &rhs) in out.iter_mut().zip(lhs).zip(rhs) {
+            *out = T::from_acc(fold(lhs.to_acc(), rhs.to_acc()));
+        }
+    });
+}
+
+/// How a dense operand maps onto the output in [`binary_broadcast_contiguous`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DenseOperand {
+    /// One element per output element, in the same order.
+    Full,
+    /// A contiguous block of `n` elements repeated over the output, i.e. the
+    /// operand's shape is a right-aligned suffix of the output shape. Covers a
+    /// scalar (`n == 1`) and the row-bias case `[B, S, C] op [C]`.
+    Repeat(usize),
+}
+
+/// Classify `view` against a **row-major contiguous** output shape, or `None`
+/// when the broadcast is not a simple suffix repeat (e.g. an interior size-1
+/// axis such as `[B, 1, C]`, which needs the general strided walk).
+fn dense_operand(view: &TensorView, out_shape: &[usize]) -> Option<DenseOperand> {
+    if !view.is_contiguous() {
+        return None;
     }
+    if view.shape == out_shape {
+        return Some(DenseOperand::Full);
+    }
+    // Leading unit axes carry no elements, so strip them before matching.
+    let first = view
+        .shape
+        .iter()
+        .position(|&d| d != 1)
+        .unwrap_or(view.shape.len());
+    let tail = &view.shape[first..];
+    if tail.len() > out_shape.len() || tail != &out_shape[out_shape.len() - tail.len()..] {
+        return None;
+    }
+    Some(DenseOperand::Repeat(tail.iter().product()))
+}
+
+/// Fast path for strictly-binary `Sub`/`Mul`/`Div` where the operands broadcast
+/// onto the output as a **suffix repeat** — most importantly a scalar operand,
+/// which is what every inlined ONNX activation function multiplies and adds by.
+///
+/// [`binary_contiguous`] only fires when all three shapes are identical, so
+/// `x * 0.5` fell all the way to [`broadcast_apply`], which per element does a
+/// dot product over the rank, a `next_index` carry chain and a closure call,
+/// and additionally allocates a whole-tensor accumulator that it walks three
+/// times. That measured ~7.7 ns/element, about **60x slower than ORT**.
+///
+/// Byte-identical to the general path: same `to_acc`/`from_acc` rounding and the
+/// same [`BinOp::apply`] combiner, just with the index arithmetic hoisted.
+fn binary_broadcast_contiguous(op: BinOp, inputs: &[TensorView], output: &mut TensorMut) -> bool {
+    if inputs.len() != 2
+        || inputs[0].dtype != output.dtype
+        || inputs[1].dtype != output.dtype
+        || !output.is_contiguous()
+    {
+        return false;
+    }
+    let out_shape = output.shape.to_vec();
+    let (Some(lhs_kind), Some(rhs_kind)) = (
+        dense_operand(&inputs[0], &out_shape),
+        dense_operand(&inputs[1], &out_shape),
+    ) else {
+        return false;
+    };
+    // Nothing to gain over `binary_contiguous`, which already handles this and
+    // also accepts dense-but-permuted layouts.
+    if lhs_kind == DenseOperand::Full && rhs_kind == DenseOperand::Full {
+        return false;
+    }
+
+    let n = output.numel();
+    let output_start = output.data_ptr_mut::<u8>() as usize;
+    let output_end = output_start.saturating_add(output.byte_size());
+    if inputs.iter().any(|input| {
+        let start = input.data_ptr::<u8>() as usize;
+        let end = start.saturating_add(input.byte_size());
+        output_start < end && start < output_end
+    }) {
+        return false;
+    }
+
+    let lens = (kind_len(lhs_kind, n), kind_len(rhs_kind, n));
+    match output.dtype {
+        DataType::Float32 => binary_broadcast_typed::<f32>(op, inputs, output, n, lens),
+        DataType::Float64 => binary_broadcast_typed::<f64>(op, inputs, output, n, lens),
+        DataType::Float16 => binary_broadcast_typed::<half::f16>(op, inputs, output, n, lens),
+        DataType::BFloat16 => binary_broadcast_typed::<half::bf16>(op, inputs, output, n, lens),
+        _ => return false,
+    }
+    true
+}
+
+fn kind_len(kind: DenseOperand, n: usize) -> usize {
+    match kind {
+        DenseOperand::Full => n,
+        DenseOperand::Repeat(m) => m,
+    }
+}
+
+fn binary_broadcast_typed<T: NumericElem>(
+    op: BinOp,
+    inputs: &[TensorView],
+    output: &mut TensorMut,
+    n: usize,
+    (lhs_len, rhs_len): (usize, usize),
+) {
+    // SAFETY: the caller proved both inputs are contiguous with a shape that is
+    // a right-aligned suffix of the output shape, so each pointer spans exactly
+    // `lhs_len`/`rhs_len` `T`s; the output is contiguous over `n` `T`s; dtypes
+    // match; and no input overlaps the output.
+    let lhs = unsafe { std::slice::from_raw_parts(inputs[0].data_ptr::<T>(), lhs_len) };
+    let rhs = unsafe { std::slice::from_raw_parts(inputs[1].data_ptr::<T>(), rhs_len) };
+    let out = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<T>(), n) };
+
+    // `BinOp::apply` matches on a runtime value. Left inside the element loop
+    // that match is re-evaluated per element and blocks auto-vectorisation
+    // entirely (measured: 1.1 ns/element for an f32 multiply, ~8x off ORT).
+    // Resolving it once here lets each arm monomorphise to a straight-line
+    // loop over a single arithmetic op.
+    dispatch_binop!(op, fold => broadcast_loops::<T, _>(fold, lhs, rhs, out));
+}
+
+/// The four broadcast shapes, generic over an already-resolved combiner.
+#[inline(always)]
+fn broadcast_loops<T: NumericElem, F: Fn(T::Acc, T::Acc) -> T::Acc>(
+    fold: F,
+    lhs: &[T],
+    rhs: &[T],
+    out: &mut [T],
+) {
+    let n = out.len();
+    match (lhs.len(), rhs.len()) {
+        // `x op scalar` -- the dominant case; hoisting the operand out of the
+        // loop is what lets this vectorise.
+        (l, 1) if l == n => {
+            let r = rhs[0].to_acc();
+            for (out, &lhs) in out.iter_mut().zip(lhs) {
+                *out = T::from_acc(fold(lhs.to_acc(), r));
+            }
+        }
+        (1, r) if r == n => {
+            let l = lhs[0].to_acc();
+            for (out, &rhs) in out.iter_mut().zip(rhs) {
+                *out = T::from_acc(fold(l, rhs.to_acc()));
+            }
+        }
+        // `[.., C] op [C]` -- walk whole rows so the repeated operand stays in
+        // L1 and neither index needs a division.
+        (l, r) if l == n && r != 0 => {
+            for (row, out) in out.chunks_mut(r).enumerate() {
+                let lhs = &lhs[row * r..row * r + out.len()];
+                for ((out, &lhs), &rhs) in out.iter_mut().zip(lhs).zip(rhs) {
+                    *out = T::from_acc(fold(lhs.to_acc(), rhs.to_acc()));
+                }
+            }
+        }
+        (l, r) if r == n && l != 0 => {
+            for (row, out) in out.chunks_mut(l).enumerate() {
+                let rhs = &rhs[row * l..row * l + out.len()];
+                for ((out, &lhs), &rhs) in out.iter_mut().zip(lhs).zip(rhs) {
+                    *out = T::from_acc(fold(lhs.to_acc(), rhs.to_acc()));
+                }
+            }
+        }
+        // Both operands repeat (e.g. `[4, 3] <- [3] op [3]`). Rare; still far
+        // cheaper than the strided walk.
+        (l, r) => {
+            for (i, out) in out.iter_mut().enumerate() {
+                *out = T::from_acc(fold(lhs[i % l].to_acc(), rhs[i % r].to_acc()));
+            }
+        }
+    }
+}
+
+/// `Add` shares this primitive: `BinOp::Sum` folds with `c_add`, which is
+/// exactly what `add_typed` computes, with the same `to_acc`/`from_acc`
+/// rounding. Exposed so `add.rs` does not grow a second copy of the walk.
+pub(super) fn add_dense_fast_path(inputs: &[TensorView], output: &mut TensorMut) -> bool {
+    binary_contiguous(BinOp::Sum, inputs, output)
+        || binary_broadcast_contiguous(BinOp::Sum, inputs, output)
 }
 
 /// Base-storage behavior for ONNX Pow.  The exponent is allowed to have a
@@ -488,6 +723,9 @@ impl UnOp {
 /// A stateless unary elementwise kernel.
 pub struct UnaryKernel {
     op: UnOp,
+    /// Structural FLOPs (one op per element) when the input shape was static at
+    /// build time; `None` otherwise (issue #995 — never fabricated).
+    flops: Option<u64>,
 }
 
 macro_rules! unary_factory {
@@ -495,8 +733,11 @@ macro_rules! unary_factory {
         /// Factory (no attributes).
         pub struct $factory;
         impl KernelFactory for $factory {
-            fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-                Ok(Box::new(UnaryKernel { op: $variant }))
+            fn create(&self, _node: &Node, shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+                Ok(Box::new(UnaryKernel {
+                    op: $variant,
+                    flops: super::flops::elementwise_flops(shapes),
+                }))
             }
         }
     };
@@ -510,6 +751,39 @@ impl Kernel for UnaryKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(self.op.name(), inputs, outputs, 1, 1, 1)?;
         let op = self.op;
+        // Vectorised f32-domain fast path. `Float64` is excluded because it
+        // would round-trip through f32 and lose precision; `Erf` keeps its
+        // exact scalar form (see `kernels::simd_activations` for why `Erf` is
+        // deliberately not approximated).
+        //
+        // `Sqrt` joins `Tanh` here for a different reason than the usual
+        // speed-vs-accuracy trade: `vsqrtps` is the same correctly-rounded IEEE
+        // square root as the `sqrtss` it replaces, so this is pure throughput.
+        // The old `dispatch_float!`/`unary_typed` arm was the cost — it widened
+        // element by element through the `FloatElem` trait, `collect()`ed a
+        // whole `Vec<T>`, then copied that into the output, and the per-element
+        // `match` on the runtime `UnOp` blocked vectorisation of even the plain
+        // f32 case.
+        if matches!(op, UnOp::Tanh | UnOp::Sqrt) && inputs[0].dtype != DataType::Float64 {
+            let x = to_dense_f32_widen(op.name(), &inputs[0])?;
+            return simd_activations::write_mapped(
+                op.name(),
+                &mut outputs[0],
+                &x,
+                |x, y| match op {
+                    UnOp::Tanh => simd_activations::tanh_f32_slice(x, y),
+                    UnOp::Sqrt => simd_activations::sqrt_f32_slice(x, y),
+                    // Unreachable today (the gate above only admits the two
+                    // arms), but a scalar fallback beats a panic if the gate
+                    // and this match ever drift apart.
+                    UnOp::Erf => {
+                        for (o, v) in y.iter_mut().zip(x) {
+                            *o = op.apply(*v);
+                        }
+                    }
+                },
+            );
+        }
         dispatch_float!(inputs[0].dtype, op.name(), T => unary_typed::<T>(op, inputs, outputs))
     }
 
@@ -519,6 +793,10 @@ impl Kernel for UnaryKernel {
 
     fn can_run_in_place(&self, input_index: usize) -> bool {
         input_index == 0
+    }
+
+    fn estimated_flops(&self) -> Option<u64> {
+        self.flops
     }
 }
 
@@ -559,7 +837,7 @@ mod tests {
     use crate::kernels::testutil::Owned;
 
     fn run_bin(f: BinOp, a: &Owned, b: &Owned, out: &mut Owned) {
-        BinaryKernel { op: f }
+        BinaryKernel { op: f, flops: None }
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
     }
@@ -723,17 +1001,23 @@ mod tests {
         let base = Owned::f32(&[2], &[2., 3.]);
         let exponent = Owned::i64(&[2], &[3, 2]);
         let mut out = Owned::zeros_f32(&[2]);
-        BinaryKernel { op: BinOp::Pow }
-            .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Pow,
+            flops: None,
+        }
+        .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_f32(), vec![8., 9.]);
 
         let base = Owned::i32(&[2], &[2, 3]);
         let exponent = Owned::f32(&[2], &[3., 2.]);
         let mut out = Owned::zeros(DataType::Int32, &[2]);
-        BinaryKernel { op: BinOp::Pow }
-            .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Pow,
+            flops: None,
+        }
+        .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_i32(), vec![8, 9]);
     }
 
@@ -742,17 +1026,23 @@ mod tests {
         let base = Owned::i32(&[2], &[2, 3]);
         let exponent = Owned::i32(&[2], &[3, 2]);
         let mut out = Owned::zeros(DataType::Int32, &[2]);
-        BinaryKernel { op: BinOp::Pow }
-            .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Pow,
+            flops: None,
+        }
+        .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_i32(), vec![8, 9]);
 
         let base = Owned::i64(&[3], &[2, -3, 4]);
         let exponent = Owned::i64(&[3], &[3, 2, 0]);
         let mut out = Owned::zeros(DataType::Int64, &[3]);
-        BinaryKernel { op: BinOp::Pow }
-            .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Pow,
+            flops: None,
+        }
+        .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_i64(), vec![8, 9, 1]);
     }
 
@@ -761,9 +1051,12 @@ mod tests {
         let base = Owned::i64(&[2], &[2, 3]);
         let exponent = Owned::f32(&[2], &[3., 2.]);
         let mut out = Owned::zeros(DataType::Int64, &[2]);
-        BinaryKernel { op: BinOp::Pow }
-            .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Pow,
+            flops: None,
+        }
+        .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_i64(), vec![8, 9]);
     }
 
@@ -773,9 +1066,12 @@ mod tests {
         let b = Owned::f32(&[2, 2], &[3., 3., 3., 3.]);
         let c = Owned::f32(&[1], &[4.]); // broadcast scalar-ish
         let mut out = Owned::zeros_f32(&[2, 2]);
-        BinaryKernel { op: BinOp::Min }
-            .execute(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Min,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
+        .unwrap();
         // min(a,3,4) elementwise: min(5,3,4)=3, min(1,3,4)=1, min(8,3,4)=3, min(2,3,4)=2
         assert_eq!(out.to_f32(), vec![3., 1., 3., 2.]);
     }
@@ -813,9 +1109,12 @@ mod tests {
         let b = Owned::f32(&[2, 2], &[3., 3., 3., 3.]);
         let c = Owned::f32(&[1], &[4.]);
         let mut out = Owned::zeros_f32(&[2, 2]);
-        BinaryKernel { op: BinOp::Max }
-            .execute(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Max,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
+        .unwrap();
         // max(a,3,4): max(5,3,4)=5, max(1,3,4)=4, max(8,3,4)=8, max(2,3,4)=4
         assert_eq!(out.to_f32(), vec![5., 4., 8., 4.]);
     }
@@ -826,12 +1125,15 @@ mod tests {
         let vector = Owned::f32(&[3], &[10., 20., 30.]);
         let scalar = Owned::f32(&[], &[100.]);
         let mut out = Owned::zeros_f32(&[2, 3]);
-        BinaryKernel { op: BinOp::Sum }
-            .execute(
-                &[matrix.view(), vector.view(), scalar.view()],
-                &mut [out.view_mut()],
-            )
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Sum,
+            flops: None,
+        }
+        .execute(
+            &[matrix.view(), vector.view(), scalar.view()],
+            &mut [out.view_mut()],
+        )
+        .unwrap();
         assert_eq!(out.to_f32(), vec![111., 122., 133., 114., 125., 136.]);
     }
 
@@ -841,12 +1143,15 @@ mod tests {
         let vector = Owned::f32(&[3], &[10., 20., 30.]);
         let scalar = Owned::f32(&[], &[100.]);
         let mut out = Owned::zeros_f32(&[2, 3]);
-        BinaryKernel { op: BinOp::Mean }
-            .execute(
-                &[matrix.view(), vector.view(), scalar.view()],
-                &mut [out.view_mut()],
-            )
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Mean,
+            flops: None,
+        }
+        .execute(
+            &[matrix.view(), vector.view(), scalar.view()],
+            &mut [out.view_mut()],
+        )
+        .unwrap();
         assert_eq!(
             out.to_f32(),
             vec![37., 40.666_668, 44.333_332, 38., 41.666_668, 45.333_332]
@@ -857,9 +1162,12 @@ mod tests {
     fn sum_rejects_integer_input() {
         let input = Owned::i32(&[2], &[1, 2]);
         let mut out = Owned::zeros(DataType::Int32, &[2]);
-        let error = BinaryKernel { op: BinOp::Sum }
-            .execute(&[input.view()], &mut [out.view_mut()])
-            .unwrap_err();
+        let error = BinaryKernel {
+            op: BinOp::Sum,
+            flops: None,
+        }
+        .execute(&[input.view()], &mut [out.view_mut()])
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -871,15 +1179,21 @@ mod tests {
     fn sqrt_unary() {
         let a = Owned::f32(&[3], &[4., 9., 16.]);
         let mut out = Owned::zeros_f32(&[3]);
-        UnaryKernel { op: UnOp::Sqrt }
-            .execute(&[a.view()], &mut [out.view_mut()])
-            .unwrap();
+        UnaryKernel {
+            op: UnOp::Sqrt,
+            flops: None,
+        }
+        .execute(&[a.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_f32(), vec![2., 3., 4.]);
     }
 
     #[test]
     fn unary_advertises_safe_in_place_input() {
-        let kernel = UnaryKernel { op: UnOp::Tanh };
+        let kernel = UnaryKernel {
+            op: UnOp::Tanh,
+            flops: None,
+        };
         assert!(kernel.can_run_in_place(0));
         assert!(!kernel.can_run_in_place(1));
     }
@@ -888,9 +1202,12 @@ mod tests {
     fn tanh_known_values() {
         let a = Owned::f32(&[3], &[0., 1., -1.]);
         let mut out = Owned::zeros_f32(&[3]);
-        UnaryKernel { op: UnOp::Tanh }
-            .execute(&[a.view()], &mut [out.view_mut()])
-            .unwrap();
+        UnaryKernel {
+            op: UnOp::Tanh,
+            flops: None,
+        }
+        .execute(&[a.view()], &mut [out.view_mut()])
+        .unwrap();
         let r = out.to_f32();
         assert!((r[0] - 0.0).abs() < 1e-6);
         assert!((r[1] - 0.761_594_2).abs() < 1e-6);
@@ -902,9 +1219,12 @@ mod tests {
         // erf(0)=0, erf(1)=0.8427007929, erf(-1)=-0.8427007929, erf(2)=0.9953222650
         let a = Owned::f32(&[4], &[0., 1., -1., 2.]);
         let mut out = Owned::zeros_f32(&[4]);
-        UnaryKernel { op: UnOp::Erf }
-            .execute(&[a.view()], &mut [out.view_mut()])
-            .unwrap();
+        UnaryKernel {
+            op: UnOp::Erf,
+            flops: None,
+        }
+        .execute(&[a.view()], &mut [out.view_mut()])
+        .unwrap();
         let r = out.to_f32();
         assert!((r[0] - 0.0).abs() < 1e-6);
         assert!((r[1] - 0.842_700_8).abs() < 1e-6);
@@ -949,9 +1269,12 @@ mod tests {
         let a = Owned::f16(&[3, 1], &[1., 2., 3.]);
         let b = Owned::f16(&[1, 4], &[10., 20., 30., 40.]);
         let mut out = Owned::zeros(DataType::Float16, &[3, 4]);
-        BinaryKernel { op: BinOp::Mul }
-            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Mul,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(
             out.to_f16_as_f32(),
             vec![10., 20., 30., 40., 20., 40., 60., 80., 30., 60., 90., 120.]
@@ -963,9 +1286,12 @@ mod tests {
         let a = Owned::bf16(&[2, 2], &[10., 20., 30., 40.]);
         let b = Owned::bf16(&[2, 2], &[1., 2., 3., 4.]);
         let mut out = Owned::zeros(DataType::BFloat16, &[2, 2]);
-        BinaryKernel { op: BinOp::Sub }
-            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Sub,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_bf16_as_f32(), vec![9., 18., 27., 36.]);
     }
 
@@ -981,9 +1307,12 @@ mod tests {
         let a = Owned::f16(&[61], &lhs);
         let b = Owned::f16(&[61], &rhs);
         let mut fast = Owned::zeros(DataType::Float16, &[61]);
-        BinaryKernel { op: BinOp::Mul }
-            .execute(&[a.view(), b.view()], &mut [fast.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Mul,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view()], &mut [fast.view_mut()])
+        .unwrap();
         // Reference: reproduce the general per-element f16 compute directly.
         let want: Vec<f32> = lhs
             .iter()
@@ -1004,24 +1333,30 @@ mod tests {
         let a_col = Owned::f16(&[61, 1], &lhs);
         let b_scalar = Owned::f16(&[1, 1], &[rhs[0]]);
         let mut broadcast = Owned::zeros(DataType::Float16, &[61, 1]);
-        BinaryKernel { op: BinOp::Mul }
-            .execute(
-                &[a_col.view(), b_scalar.view()],
-                &mut [broadcast.view_mut()],
-            )
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Mul,
+            flops: None,
+        }
+        .execute(
+            &[a_col.view(), b_scalar.view()],
+            &mut [broadcast.view_mut()],
+        )
+        .unwrap();
         // Recompute the fast path with the same scalar multiplier as a full
         // [61] contiguous op, then compare raw bits against the broadcast result.
         let rhs_scalar = vec![rhs[0]; 61];
         let a_flat = Owned::f16(&[61], &lhs);
         let b_flat = Owned::f16(&[61], &rhs_scalar);
         let mut fast_scalar = Owned::zeros(DataType::Float16, &[61]);
-        BinaryKernel { op: BinOp::Mul }
-            .execute(
-                &[a_flat.view(), b_flat.view()],
-                &mut [fast_scalar.view_mut()],
-            )
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Mul,
+            flops: None,
+        }
+        .execute(
+            &[a_flat.view(), b_flat.view()],
+            &mut [fast_scalar.view_mut()],
+        )
+        .unwrap();
         assert_eq!(
             fast_scalar.to_u16_bits(),
             broadcast.to_u16_bits(),
@@ -1040,7 +1375,7 @@ mod tests {
             let a = Owned::f16(&[53], &lhs);
             let b = Owned::f16(&[53], &rhs);
             let mut fast = Owned::zeros(DataType::Float16, &[53]);
-            BinaryKernel { op }
+            BinaryKernel { op, flops: None }
                 .execute(&[a.view(), b.view()], &mut [fast.view_mut()])
                 .unwrap();
 
@@ -1048,7 +1383,7 @@ mod tests {
             let a_col = Owned::f16(&[53, 1], &lhs);
             let b_scalar = Owned::f16(&[1, 1], &[rhs[0]]);
             let mut broadcast = Owned::zeros(DataType::Float16, &[53, 1]);
-            BinaryKernel { op }
+            BinaryKernel { op, flops: None }
                 .execute(
                     &[a_col.view(), b_scalar.view()],
                     &mut [broadcast.view_mut()],
@@ -1058,7 +1393,7 @@ mod tests {
             let b_flat = Owned::f16(&[53], &rhs_scalar);
             let a_flat = Owned::f16(&[53], &lhs);
             let mut fast_scalar = Owned::zeros(DataType::Float16, &[53]);
-            BinaryKernel { op }
+            BinaryKernel { op, flops: None }
                 .execute(
                     &[a_flat.view(), b_flat.view()],
                     &mut [fast_scalar.view_mut()],
@@ -1078,9 +1413,12 @@ mod tests {
         let a = Owned::i32(&[3], &[7, -7, 5]);
         let b = Owned::i32(&[3], &[2, 2, 0]);
         let mut out = Owned::zeros(DataType::Int32, &[3]);
-        BinaryKernel { op: BinOp::Div }
-            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Div,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_i32(), vec![3, -3, 0]);
     }
 
@@ -1091,12 +1429,18 @@ mod tests {
         let b = Owned::f16(&[2], &[1.0, 5.0]);
         let mut mn = Owned::zeros(DataType::Float16, &[2]);
         let mut mx = Owned::zeros(DataType::Float16, &[2]);
-        BinaryKernel { op: BinOp::Min }
-            .execute(&[a.view(), b.view()], &mut [mn.view_mut()])
-            .unwrap();
-        BinaryKernel { op: BinOp::Max }
-            .execute(&[a.view(), b.view()], &mut [mx.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Min,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view()], &mut [mn.view_mut()])
+        .unwrap();
+        BinaryKernel {
+            op: BinOp::Max,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view()], &mut [mx.view_mut()])
+        .unwrap();
         // Position 0 is NaN in both.
         assert_eq!(mn.to_u16_bits()[0] & 0x7C00, 0x7C00);
         assert_ne!(mn.to_u16_bits()[0] & 0x03FF, 0);
@@ -1108,16 +1452,22 @@ mod tests {
     fn sqrt_f16_and_bf16() {
         let a16 = Owned::f16(&[3], &[4., 9., 16.]);
         let mut o16 = Owned::zeros(DataType::Float16, &[3]);
-        UnaryKernel { op: UnOp::Sqrt }
-            .execute(&[a16.view()], &mut [o16.view_mut()])
-            .unwrap();
+        UnaryKernel {
+            op: UnOp::Sqrt,
+            flops: None,
+        }
+        .execute(&[a16.view()], &mut [o16.view_mut()])
+        .unwrap();
         assert_eq!(o16.to_f16_as_f32(), vec![2., 3., 4.]);
 
         let ab = Owned::bf16(&[3], &[4., 9., 16.]);
         let mut ob = Owned::zeros(DataType::BFloat16, &[3]);
-        UnaryKernel { op: UnOp::Sqrt }
-            .execute(&[ab.view()], &mut [ob.view_mut()])
-            .unwrap();
+        UnaryKernel {
+            op: UnOp::Sqrt,
+            flops: None,
+        }
+        .execute(&[ab.view()], &mut [ob.view_mut()])
+        .unwrap();
         assert_eq!(ob.to_bf16_as_f32(), vec![2., 3., 4.]);
     }
 
@@ -1125,9 +1475,12 @@ mod tests {
     fn tanh_f16_matches_f32_within_tolerance() {
         let a = Owned::f16(&[3], &[0., 1., -1.]);
         let mut out = Owned::zeros(DataType::Float16, &[3]);
-        UnaryKernel { op: UnOp::Tanh }
-            .execute(&[a.view()], &mut [out.view_mut()])
-            .unwrap();
+        UnaryKernel {
+            op: UnOp::Tanh,
+            flops: None,
+        }
+        .execute(&[a.view()], &mut [out.view_mut()])
+        .unwrap();
         let r = out.to_f16_as_f32();
         assert!(r[0].abs() < 1e-2);
         assert!((r[1] - 0.7616).abs() < 1e-2);
@@ -1139,9 +1492,12 @@ mod tests {
         // Erf's numeric formula is unchanged; the dtype dispatch simply widens.
         let a = Owned::bf16(&[2], &[0., 1.]);
         let mut out = Owned::zeros(DataType::BFloat16, &[2]);
-        UnaryKernel { op: UnOp::Erf }
-            .execute(&[a.view()], &mut [out.view_mut()])
-            .unwrap();
+        UnaryKernel {
+            op: UnOp::Erf,
+            flops: None,
+        }
+        .execute(&[a.view()], &mut [out.view_mut()])
+        .unwrap();
         let r = out.to_bf16_as_f32();
         assert!(r[0].abs() < 1e-2);
         assert!((r[1] - 0.8427).abs() < 5e-2); // bf16 has ~3 significant digits
@@ -1151,10 +1507,225 @@ mod tests {
     fn sqrt_rejects_integer_dtype_with_rule1() {
         let a = Owned::i32(&[2], &[4, 9]);
         let mut out = Owned::zeros(DataType::Int32, &[2]);
-        let err = UnaryKernel { op: UnOp::Sqrt }
-            .execute(&[a.view()], &mut [out.view_mut()])
-            .unwrap_err();
+        let err = UnaryKernel {
+            op: UnOp::Sqrt,
+            flops: None,
+        }
+        .execute(&[a.view()], &mut [out.view_mut()])
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("WHAT") && msg.contains("HOW"));
+    }
+}
+
+/// The dense broadcast fast path must be a *pure* optimisation of the general
+/// [`broadcast_apply`] walk.
+///
+/// Each case is run twice over the **same logical values**: once with a
+/// contiguous broadcast operand (which takes the fast path) and once with a
+/// strided view of padded storage holding the same elements (which
+/// `dense_operand` rejects, so it falls through to the general path). The two
+/// results are compared **bitwise**, so a difference in `to_acc`/`from_acc`
+/// rounding, in NaN payload, or in signed zero cannot be hidden by `==` on
+/// floats.
+#[cfg(test)]
+mod dense_broadcast_equivalence_tests {
+    use super::*;
+    use crate::kernels::testutil::Owned;
+
+    /// Interleave `data` with padding and expose it through stride 2, so the
+    /// view holds exactly `data` but is not contiguous.
+    fn strided_f32(shape: &[usize], data: &[f32]) -> Owned {
+        let mut padded = Vec::with_capacity(data.len() * 2);
+        for &v in data {
+            padded.push(v);
+            padded.push(f32::NAN);
+        }
+        let strides: Vec<i64> = {
+            let mut s = onnx_runtime_ir::compute_contiguous_strides(shape);
+            for v in &mut s {
+                *v *= 2;
+            }
+            s
+        };
+        Owned::f32(&[data.len() * 2], &padded).with_view(shape, &strides)
+    }
+
+    fn strided_f16(shape: &[usize], data: &[f32]) -> Owned {
+        let mut padded = Vec::with_capacity(data.len() * 2);
+        for &v in data {
+            padded.push(v);
+            padded.push(f32::NAN);
+        }
+        let strides: Vec<i64> = {
+            let mut s = onnx_runtime_ir::compute_contiguous_strides(shape);
+            for v in &mut s {
+                *v *= 2;
+            }
+            s
+        };
+        Owned::f16(&[data.len() * 2], &padded).with_view(shape, &strides)
+    }
+
+    fn run(op: BinOp, l: &Owned, r: &Owned, out_shape: &[usize], dtype: DataType) -> Vec<u8> {
+        let mut out = Owned::zeros(dtype, out_shape);
+        BinaryKernel { op, flops: None }
+            .execute(&[l.view(), r.view()], &mut [out.view_mut()])
+            .unwrap();
+        out.bytes
+    }
+
+    /// Adversarial values: signed zeros, infinities, a NaN, subnormals and
+    /// magnitudes that make `Div` overflow and underflow.
+    fn payload(n: usize) -> Vec<f32> {
+        let special = [
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::MAX,
+            f32::MIN,
+            1e-30,
+            -1e-30,
+        ];
+        (0..n)
+            .map(|i| {
+                if i < special.len() {
+                    special[i]
+                } else {
+                    (i as f32 - (n as f32) / 2.0) * 0.75
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn f32_suffix_and_scalar_broadcast_match_the_strided_path_bitwise() {
+        for op in [BinOp::Sub, BinOp::Mul, BinOp::Div] {
+            for (out_shape, rhs_shape) in [
+                (vec![64usize], vec![] as Vec<usize>),
+                (vec![64], vec![1]),
+                (vec![8, 8], vec![8]),
+                (vec![4, 2, 8], vec![8]),
+                (vec![4, 2, 8], vec![2, 8]),
+                (vec![4, 2, 8], vec![1, 1, 8]),
+                (vec![3, 5], vec![3, 5]),
+            ] {
+                let n: usize = out_shape.iter().product();
+                let m: usize = rhs_shape.iter().product();
+                let lhs = payload(n);
+                let rhs = payload(m.max(1));
+                let l = Owned::f32(&out_shape, &lhs);
+                let fast = run(
+                    op,
+                    &l,
+                    &Owned::f32(&rhs_shape, &rhs),
+                    &out_shape,
+                    DataType::Float32,
+                );
+                let slow = run(
+                    op,
+                    &l,
+                    &strided_f32(&rhs_shape, &rhs),
+                    &out_shape,
+                    DataType::Float32,
+                );
+                assert_eq!(
+                    fast,
+                    slow,
+                    "{:?} out={out_shape:?} rhs={rhs_shape:?}",
+                    op.name()
+                );
+
+                // ... and with the broadcast operand on the left, which matters
+                // because Sub and Div are not commutative.
+                let fast = run(
+                    op,
+                    &Owned::f32(&rhs_shape, &rhs),
+                    &l,
+                    &out_shape,
+                    DataType::Float32,
+                );
+                let slow = run(
+                    op,
+                    &strided_f32(&rhs_shape, &rhs),
+                    &l,
+                    &out_shape,
+                    DataType::Float32,
+                );
+                assert_eq!(
+                    fast,
+                    slow,
+                    "{:?} (lhs broadcast) out={out_shape:?} lhs={rhs_shape:?}",
+                    op.name()
+                );
+            }
+        }
+    }
+
+    /// f16 goes through `to_acc`/`from_acc`, so this pins that the fast path
+    /// rounds through f32 exactly like the general walk, comparing raw bits.
+    #[test]
+    fn f16_broadcast_matches_the_strided_path_bitwise() {
+        for op in [BinOp::Sub, BinOp::Mul, BinOp::Div] {
+            for (out_shape, rhs_shape) in [
+                (vec![64usize], vec![] as Vec<usize>),
+                (vec![8, 8], vec![8]),
+                (vec![4, 2, 8], vec![2, 8]),
+            ] {
+                let n: usize = out_shape.iter().product();
+                let m: usize = rhs_shape.iter().product();
+                let lhs = payload(n);
+                let rhs = payload(m.max(1));
+                let l = Owned::f16(&out_shape, &lhs);
+                let fast = run(
+                    op,
+                    &l,
+                    &Owned::f16(&rhs_shape, &rhs),
+                    &out_shape,
+                    DataType::Float16,
+                );
+                let slow = run(
+                    op,
+                    &l,
+                    &strided_f16(&rhs_shape, &rhs),
+                    &out_shape,
+                    DataType::Float16,
+                );
+                assert_eq!(fast, slow, "f16 {:?} out={out_shape:?}", op.name());
+            }
+        }
+    }
+
+    /// An interior size-1 axis is not a suffix repeat, so it must decline to the
+    /// general walk -- otherwise the fast path would silently produce the wrong
+    /// broadcast.
+    #[test]
+    fn interior_unit_axis_is_declined_and_still_broadcasts_correctly() {
+        let l = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let r = Owned::f32(&[2, 1], &[10., 20.]);
+        assert!(dense_operand(&r.view(), &[2, 3]).is_none());
+        let mut out = Owned::zeros_f32(&[2, 3]);
+        BinaryKernel {
+            op: BinOp::Mul,
+            flops: None,
+        }
+        .execute(&[l.view(), r.view()], &mut [out.view_mut()])
+        .unwrap();
+        assert_eq!(out.to_f32(), vec![10., 20., 30., 80., 100., 120.]);
+    }
+
+    /// A mismatched trailing extent must not be mistaken for a repeat.
+    #[test]
+    fn non_suffix_shapes_are_declined() {
+        let r = Owned::f32(&[4], &[1., 2., 3., 4.]);
+        assert!(dense_operand(&r.view(), &[2, 3]).is_none());
+        let r = Owned::f32(&[2, 3, 4], &[0.; 24]);
+        assert!(dense_operand(&r.view(), &[3, 4]).is_none());
     }
 }

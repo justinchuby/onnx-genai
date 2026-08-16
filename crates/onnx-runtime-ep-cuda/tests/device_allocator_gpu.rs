@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! The CUDA execution provider allocates through the shared `DeviceAllocator`
 //! contract.
 //!
@@ -19,7 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cudarc::driver::CudaContext;
-use onnx_runtime_ep_cuda::device_allocator::CudaDeviceAllocator;
+use onnx_runtime_cuda_memory::device_allocator::CudaDeviceAllocator;
 use onnx_runtime_memory_governor::{DeviceAllocator, DeviceKey, MemoryError, Tier};
 
 /// A CUDA device allocator, or `None` on a machine with no driver.
@@ -29,16 +43,12 @@ use onnx_runtime_memory_governor::{DeviceAllocator, DeviceKey, MemoryError, Tier
 /// one here would make these tests skip on a machine that can run them
 /// perfectly well. Nothing on this path calls either: allocation is
 /// `cuMemAlloc`/`cuMemFree`, both driver entry points.
-fn allocator() -> Option<CudaDeviceAllocator> {
+fn require_cuda_allocator() -> CudaDeviceAllocator {
     match CudaContext::new(0) {
-        Ok(context) => Some(CudaDeviceAllocator::new(context)),
-        Err(error) => {
-            eprintln!(
-                "SKIPPED (no CUDA driver): {error}. This test verifies device allocation \
-                 through the shared contract and did NOT run."
-            );
-            None
-        }
+        Ok(context) => CudaDeviceAllocator::new(context),
+        Err(error) => panic!(
+            "CUDA allocator test requires a CUDA driver; CPU-only runs must leave this test ignored: {error}"
+        ),
     }
 }
 /// Counts what passes through it, so a test can tell "used" from "ignored".
@@ -75,9 +85,13 @@ impl DeviceAllocator for CountingAllocator {
 /// Counting alone proves nothing about the memory, so the buffer is written
 /// and read back through the driver: a counted no-op would pass the counter
 /// assertions and fail this one.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn allocated_device_memory_round_trips_and_is_returned() {
-    let Some(inner) = allocator() else { return };
+    let inner = require_cuda_allocator();
     let counters = CountingAllocator {
         inner,
         allocations: AtomicU64::new(0),
@@ -123,9 +137,13 @@ fn allocated_device_memory_round_trips_and_is_returned() {
 /// Callers decide from this whether a pointer may be dereferenced on the host,
 /// so an allocator claiming the host tier for CUDA memory would turn a read
 /// into a wild access rather than an error.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn the_cuda_allocator_reports_a_device_tier() {
-    let Some(allocator) = allocator() else { return };
+    let allocator = require_cuda_allocator();
     let key = allocator.device();
     assert_eq!(key.tier, Tier::Device, "CUDA memory is not host memory");
     assert_eq!(key.index, 0);
@@ -137,9 +155,13 @@ fn the_cuda_allocator_reports_a_device_tier() {
 /// `cuMemAlloc` guarantees 256 bytes. Returning a 256-aligned pointer for a
 /// 4096-aligned request would fault only in the vector kernels that need it,
 /// which is the worst possible way to find out.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn an_alignment_cuda_does_not_guarantee_is_refused() {
-    let Some(allocator) = allocator() else { return };
+    let allocator = require_cuda_allocator();
     let error = allocator
         .allocate(4096, 4096)
         .expect_err("4096-byte alignment is beyond what cuMemAlloc guarantees");
@@ -159,9 +181,13 @@ fn an_alignment_cuda_does_not_guarantee_is_refused() {
 ///
 /// Disjointness is the property worth asserting: it is what a caller relies on
 /// and what a wrong lock would break.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn concurrent_allocations_do_not_overlap() {
-    let Some(allocator) = allocator() else { return };
+    let allocator = require_cuda_allocator();
     let allocator = std::sync::Arc::new(allocator);
 
     const THREADS: usize = 8;
@@ -222,19 +248,25 @@ fn concurrent_allocations_do_not_overlap() {
 /// size it was told per pointer and refuses a free that disagrees. The
 /// execution provider must therefore pass the size through unchanged and leave
 /// the rounding to the allocator.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn a_zero_byte_allocation_is_freed_with_the_size_it_was_allocated_with() {
     use onnx_runtime_ep_api::ExecutionProvider;
 
-    let Ok(provider) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) else {
+    let Ok(provider) = onnx_runtime_ep_cuda::provider::CudaExecutionProvider::new(0) else {
         eprintln!(
             "SKIPPED (no CUDA runtime): the zero-byte size-agreement check did NOT run. It \
              needs a full execution provider, so it needs cudart and cuBLAS as well as the \
              driver."
         );
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
-    let Some(inner) = allocator() else { return };
+    let inner = require_cuda_allocator();
     let strict = Arc::new(StrictSizes::new(inner));
     let provider = provider
         .with_memory(Arc::clone(&strict) as Arc<dyn DeviceAllocator>)
@@ -264,11 +296,17 @@ fn a_zero_byte_allocation_is_freed_with_the_size_it_was_allocated_with() {
 /// addresses. A host allocator's pointer is a perfectly valid host address, so
 /// nothing detects the substitution until a kernel dereferences it on the
 /// device -- far from the call that caused it.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn an_allocator_for_the_wrong_device_is_refused() {
-    let Ok(provider) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) else {
+    let Ok(provider) = onnx_runtime_ep_cuda::provider::CudaExecutionProvider::new(0) else {
         eprintln!("SKIPPED (no CUDA runtime): the device-mismatch check did NOT run.");
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
     let error = provider
         .with_memory(Arc::new(onnx_runtime_memory_governor::HostAllocator))
@@ -286,11 +324,17 @@ fn an_allocator_for_the_wrong_device_is_refused() {
 /// Taking the ordinal as a separate argument let the two disagree, and nothing
 /// downstream can detect that: callers use `device()` to decide where a pointer
 /// is valid, so a wrong answer becomes an invalid address inside a kernel.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn the_reported_device_comes_from_the_context() {
     let Ok(context) = CudaContext::new(0) else {
         eprintln!("SKIPPED (no CUDA driver): device identity check did NOT run.");
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
     let ordinal = context.ordinal() as u32;
     let allocator = CudaDeviceAllocator::new(context);

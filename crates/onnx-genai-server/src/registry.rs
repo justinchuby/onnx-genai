@@ -19,7 +19,7 @@ use crate::{
     driver::EngineDriver,
     models_config::ModelSpec,
     multimodal::MultimodalSpecs,
-    state::{ServerConfig, build_handle},
+    state::{ServerConfig, ServerMemoryAuthorities, build_handle_with_authorities},
 };
 
 /// Policy used to choose which loaded model to evict when the loaded-model cap is
@@ -243,9 +243,121 @@ pub(crate) struct ModelRegistry {
     /// Per-id load guards, ensuring two concurrent requests for the same lazy id
     /// build the model only once; the second waiter observes the first result.
     load_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    policy_lock: Arc<tokio::sync::RwLock<()>>,
+    authority_provider: Arc<ServerMemoryAuthorities>,
 }
 
 impl ModelRegistry {
+    pub(crate) fn aggregate_growth_metrics(
+        &self,
+    ) -> anyhow::Result<Option<onnx_genai_engine::MappedGrowthMetrics>> {
+        self.authority_provider.aggregate_growth_metrics()
+    }
+
+    fn config_for_load(&self) -> anyhow::Result<ServerConfig> {
+        let mut config = (*self.config).clone();
+        config.engine_config.limits.vram_limit = self.authority_provider.configured_limit()?;
+        Ok(config)
+    }
+
+    /// Reconfigure the process-wide device policy and every loaded engine.
+    ///
+    /// The server exposes one unqualified VRAM flag, so this applies to all
+    /// device compatibility domains. A failed shrink is rejected by the
+    /// provider before either current ledgers or future-load policy changes.
+    pub(crate) async fn set_vram_limit(
+        &self,
+        limit: onnx_genai_engine::ResourceLimit,
+    ) -> anyhow::Result<Option<onnx_genai_engine::GovernorSnapshot>> {
+        let _policy = self.policy_lock.write().await;
+        if !self.config.engine_config.allow_runtime_override {
+            return Err(onnx_genai_engine::EngineGovernorError::RuntimeOverrideDisabled.into());
+        }
+        let old_limit = self.authority_provider.configured_limit()?;
+        let handles = self.read()?.models.values().cloned().collect::<Vec<_>>();
+        if handles.is_empty() {
+            self.authority_provider.reconfigure_limit(limit)?;
+            return Ok(None);
+        }
+        // Drain and hold every admission permit so no request can consume
+        // newly exposed headroom between provider commit and per-engine commit.
+        let mut admission_guards = Vec::with_capacity(handles.len());
+        for handle in &handles {
+            admission_guards.push(
+                Arc::clone(&handle.engine.generation_capacity)
+                    .acquire_many_owned(handle.engine.generation_capacity_size)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("engine admission semaphore closed"))?,
+            );
+        }
+        self.authority_provider.reconfigure_limit(limit)?;
+        let mut latest = None;
+        let mut updated = Vec::new();
+        for handle in handles {
+            match handle.engine.set_vram_limit(limit).await {
+                Ok(Ok(snapshot)) => {
+                    latest = Some(snapshot);
+                    updated.push(handle);
+                }
+                Ok(Err(error)) => {
+                    let _ = self.authority_provider.reconfigure_limit(old_limit);
+                    for updated_handle in updated {
+                        let _ = updated_handle.engine.set_vram_limit(old_limit).await;
+                    }
+                    return Err(error.into());
+                }
+                Err(error) => {
+                    let _ = self.authority_provider.reconfigure_limit(old_limit);
+                    for updated_handle in updated {
+                        let _ = updated_handle.engine.set_vram_limit(old_limit).await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(latest)
+    }
+
+    pub(crate) async fn aggregate_resource_snapshot(
+        &self,
+    ) -> anyhow::Result<Option<onnx_genai_engine::GovernorSnapshot>> {
+        let handle = self.read()?.models.values().next().cloned();
+        let Some(handle) = handle else {
+            return Ok(None);
+        };
+        let mut snapshot = handle.engine.resource_snapshot().await?;
+        if let Some((used, limit, headroom)) = self.authority_provider.aggregate_vram()? {
+            snapshot.vram.used = used;
+            snapshot.vram.limit = limit;
+            snapshot.vram.headroom = headroom;
+            // Keep `resolved_limits.vram_bytes` honest: it is the resolved device
+            // (VRAM) capacity limit, which stays `None` when the device capacity
+            // could not be measured (#947). The aggregate authority ceiling on a
+            // device-less box is a host-RAM-derived advisory bound (surfaced via
+            // `vram.limit`), not a measured VRAM capacity, so do not relabel it
+            // as one. Only refresh it when a real device capacity was resolved.
+            if snapshot.resolved_limits.vram_bytes.is_some() {
+                snapshot.resolved_limits.vram_bytes = Some(limit);
+            }
+        }
+        Ok(Some(snapshot))
+    }
+
+    pub(crate) fn any_loaded(&self) -> Result<Option<Arc<ModelHandle>>, RegistryError> {
+        Ok(self.read()?.models.values().next().cloned())
+    }
+
+    pub(crate) fn memory_strategy_plans(
+        &self,
+    ) -> Result<Vec<(String, Arc<onnx_genai_engine::MemoryStrategyPlan>)>, RegistryError> {
+        Ok(self
+            .read()?
+            .models
+            .iter()
+            .map(|(id, handle)| (id.clone(), handle.engine.memory_strategy_plan()))
+            .collect())
+    }
+
     /// Build a registry from a list of specs, loading the eager ones immediately.
     ///
     /// All specs (eager or not) are recorded in `available`.  Eager specs are also
@@ -269,14 +381,24 @@ impl ModelRegistry {
             default_id,
             available,
         };
+        let authority_provider = Arc::new(ServerMemoryAuthorities::new(
+            config.engine_config.limits.vram_limit,
+        ));
         let registry = Self {
             inner: Arc::new(RwLock::new(inner)),
             config: Arc::new(config.clone()),
             load_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            policy_lock: Arc::new(tokio::sync::RwLock::new(())),
+            authority_provider,
         };
         for spec in specs.iter().filter(|s| s.eager) {
             tracing::info!(id = %spec.id, path = %spec.path.display(), "loading model");
-            let handle = build_handle(spec, &config).with_context(|| {
+            let handle = build_handle_with_authorities(
+                spec,
+                &config,
+                Arc::clone(&registry.authority_provider),
+            )
+            .with_context(|| {
                 format!(
                     "failed to load model '{}' from '{}'",
                     spec.id,
@@ -303,6 +425,9 @@ impl ModelRegistry {
     /// not recorded in `available` and therefore cannot be lazily reloaded after
     /// an unload.
     pub(crate) fn from_handle(handle: Arc<ModelHandle>, config: ServerConfig) -> Self {
+        let authority_provider = Arc::new(ServerMemoryAuthorities::new(
+            config.engine_config.limits.vram_limit,
+        ));
         let default_id = Some(handle.id.clone());
         let mut inner = RegistryInner {
             models: HashMap::new(),
@@ -315,6 +440,8 @@ impl ModelRegistry {
             inner: Arc::new(RwLock::new(inner)),
             config: Arc::new(config),
             load_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            policy_lock: Arc::new(tokio::sync::RwLock::new(())),
+            authority_provider,
         }
     }
 
@@ -410,19 +537,23 @@ impl ModelRegistry {
             return Ok(handle);
         }
 
-        let config = Arc::clone(&self.config);
+        let _policy = self.policy_lock.read().await;
+        let config = self.config_for_load()?;
+        let authority_provider = Arc::clone(&self.authority_provider);
         let spec_for_build = spec.clone();
         tracing::info!(id = %spec.id, path = %spec.path.display(), "lazy-loading model");
-        let handle = tokio::task::spawn_blocking(move || build_handle(&spec_for_build, &config))
-            .await
-            .context("model load task panicked")?
-            .with_context(|| {
-                format!(
-                    "failed to load model '{}' from '{}'",
-                    spec.id,
-                    spec.path.display()
-                )
-            })?;
+        let handle = tokio::task::spawn_blocking(move || {
+            build_handle_with_authorities(&spec_for_build, &config, authority_provider)
+        })
+        .await
+        .context("model load task panicked")?
+        .with_context(|| {
+            format!(
+                "failed to load model '{}' from '{}'",
+                spec.id,
+                spec.path.display()
+            )
+        })?;
         let handle = Arc::new(handle);
 
         // Insert + evict under the write lock (no await held).
@@ -579,6 +710,10 @@ impl ModelRegistry {
             })),
             config: Arc::new(ServerConfig::default()),
             load_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            policy_lock: Arc::new(tokio::sync::RwLock::new(())),
+            authority_provider: Arc::new(ServerMemoryAuthorities::new(
+                ServerConfig::default().engine_config.limits.vram_limit,
+            )),
         }
     }
 
@@ -659,11 +794,22 @@ mod tests {
             engine: EngineDriver {
                 commands: tx,
                 generation_capacity: Arc::new(Semaphore::new(0)),
+                generation_capacity_size: 0,
                 // A test double drives no engine, so there is no pool to
                 // mirror. Left in the default `Unknown` state rather than
                 // asserted not-applicable: nothing here has determined a
                 // decode path, and "pending" is the only claim that holds.
                 kv_telemetry: Default::default(),
+                resource_snapshot: Default::default(),
+                memory_strategy_plan: Arc::new(onnx_genai_engine::MemoryStrategyPlan::unknown(
+                    0,
+                    None,
+                    "registry test stub",
+                )),
+                device_authority: None,
+                // A stub drives no engine, so it advertises the honest "no
+                // batching" report used by every non-batching backend.
+                batching: Arc::new(crate::driver::BatchingReport::single_sequence_stub()),
             },
             tokenizer,
             chat_template: None,
@@ -703,6 +849,229 @@ mod tests {
         assert_eq!(resolved.id, "gamma");
         assert_eq!(registry.default_id().unwrap().as_deref(), Some("gamma"));
         assert_eq!(registry.ids().unwrap(), ids);
+    }
+
+    #[tokio::test]
+    async fn production_load_path_shares_device_authority_and_metrics_ledger() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+        let specs = vec![
+            ModelSpec {
+                id: "first".to_string(),
+                path: model_dir.clone(),
+                eager: true,
+                warmup: false,
+            },
+            ModelSpec {
+                id: "second".to_string(),
+                path: model_dir,
+                eager: true,
+                warmup: false,
+            },
+        ];
+        let registry = ModelRegistry::from_specs(&specs, ServerConfig::default()).unwrap();
+        let first = registry.resolve("first").unwrap().unwrap();
+        let second = registry.resolve("second").unwrap().unwrap();
+        let first_authority = first.engine.device_authority.as_ref().unwrap().clone();
+        let second_authority = second.engine.device_authority.as_ref().unwrap().clone();
+
+        assert_eq!(
+            first_authority.authority_id(),
+            second_authority.authority_id()
+        );
+        let aggregate_used = first_authority.used_bytes();
+        assert!(aggregate_used > 0);
+        assert_eq!(
+            first.engine.resource_snapshot().await.unwrap().vram.used,
+            aggregate_used
+        );
+        assert_eq!(
+            second.engine.resource_snapshot().await.unwrap().vram.used,
+            aggregate_used
+        );
+
+        drop(first);
+        registry.unload("first").unwrap();
+        for _ in 0..100 {
+            if first_authority.used_bytes() < aggregate_used {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(first_authority.used_bytes() < aggregate_used);
+        assert!(first_authority.used_bytes() > 0);
+        assert_eq!(
+            second.engine.resource_snapshot().await.unwrap().vram.used,
+            first_authority.used_bytes()
+        );
+        let metrics_snapshot = registry
+            .aggregate_resource_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(metrics_snapshot.vram.used, first_authority.used_bytes());
+        assert_eq!(metrics_snapshot.vram.limit, first_authority.limit_bytes());
+        assert_eq!(
+            metrics_snapshot.vram.headroom,
+            first_authority.headroom_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn production_pipeline_loads_reserve_all_components_on_shared_ledger() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-txt2img");
+        let specs = vec![
+            ModelSpec {
+                id: "pipeline-a".to_string(),
+                path: model_dir.clone(),
+                eager: true,
+                warmup: false,
+            },
+            ModelSpec {
+                id: "pipeline-b".to_string(),
+                path: model_dir,
+                eager: true,
+                warmup: false,
+            },
+        ];
+        let registry = ModelRegistry::from_specs(&specs, ServerConfig::default()).unwrap();
+        let first = registry.resolve("pipeline-a").unwrap().unwrap();
+        let second = registry.resolve("pipeline-b").unwrap().unwrap();
+        assert!(first.pipeline);
+        let first_authority = first.engine.device_authority.as_ref().unwrap().clone();
+        let second_authority = second.engine.device_authority.as_ref().unwrap().clone();
+        assert_eq!(
+            first_authority.authority_id(),
+            second_authority.authority_id()
+        );
+        assert!(first_authority.used_bytes() > 0);
+        assert_eq!(
+            first.engine.resource_snapshot().await.unwrap().vram.used,
+            first_authority.used_bytes()
+        );
+        assert_eq!(
+            second.engine.resource_snapshot().await.unwrap().vram.used,
+            first_authority.used_bytes()
+        );
+        let aggregate_used = first_authority.used_bytes();
+        drop(first);
+        registry.unload("pipeline-a").unwrap();
+        for _ in 0..500 {
+            if first_authority.used_bytes() < aggregate_used {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(first_authority.used_bytes() < aggregate_used);
+        assert!(first_authority.used_bytes() > 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_limit_update_applies_to_future_lazy_loads() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+        let specs = vec![
+            ModelSpec {
+                id: "eager".to_string(),
+                path: model_dir.clone(),
+                eager: true,
+                warmup: false,
+            },
+            ModelSpec {
+                id: "lazy".to_string(),
+                path: model_dir,
+                eager: false,
+                warmup: false,
+            },
+        ];
+        let mut config = ServerConfig::default();
+        config.engine_config.allow_runtime_override = true;
+        let registry = ModelRegistry::from_specs(&specs, config).unwrap();
+        let new_limit = onnx_genai_engine::ResourceLimit::Bytes(7 << 30);
+        let snapshot = registry.set_vram_limit(new_limit).await.unwrap().unwrap();
+        let effective_limit = snapshot.vram.limit;
+
+        let lazy = registry.load("lazy").await.unwrap();
+        assert_eq!(
+            lazy.engine.resource_snapshot().await.unwrap().vram.limit,
+            effective_limit
+        );
+        assert_eq!(
+            registry.authority_provider.configured_limit().unwrap(),
+            new_limit
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_shrink_preserves_policy_and_ledger_limit() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+        let specs = vec![ModelSpec {
+            id: "model".to_string(),
+            path: model_dir,
+            eager: true,
+            warmup: false,
+        }];
+        let mut config = ServerConfig::default();
+        config.engine_config.allow_runtime_override = true;
+        let registry = ModelRegistry::from_specs(&specs, config).unwrap();
+        let old_policy = registry.authority_provider.configured_limit().unwrap();
+        let handle = registry.resolve("model").unwrap().unwrap();
+        let before = handle.engine.resource_snapshot().await.unwrap();
+
+        let error = registry
+            .set_vram_limit(onnx_genai_engine::ResourceLimit::Bytes(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cannot satisfy lowered resource limit"),
+            "expected a limit-rejection error, got: {error}"
+        );
+        let after = handle.engine.resource_snapshot().await.unwrap();
+        assert_eq!(after.vram.limit, before.vram.limit);
+        assert_eq!(after.vram.used, before.vram.used);
+        assert_eq!(
+            registry.authority_provider.configured_limit().unwrap(),
+            old_policy
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_limit_update_with_no_loaded_models_applies_to_future_load() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+        let specs = vec![
+            ModelSpec {
+                id: "eager".to_string(),
+                path: model_dir.clone(),
+                eager: true,
+                warmup: false,
+            },
+            ModelSpec {
+                id: "lazy".to_string(),
+                path: model_dir,
+                eager: false,
+                warmup: false,
+            },
+        ];
+        let mut config = ServerConfig::default();
+        config.engine_config.allow_runtime_override = true;
+        let registry = ModelRegistry::from_specs(&specs, config).unwrap();
+        registry.unload("eager").unwrap();
+        let new_limit = onnx_genai_engine::ResourceLimit::Bytes(7 << 30);
+
+        assert!(registry.set_vram_limit(new_limit).await.unwrap().is_none());
+        assert_eq!(
+            registry.authority_provider.configured_limit().unwrap(),
+            new_limit
+        );
+        let lazy = registry.load("lazy").await.unwrap();
+        assert_eq!(
+            lazy.engine.resource_snapshot().await.unwrap().vram.limit,
+            7 << 30
+        );
     }
 
     #[test]

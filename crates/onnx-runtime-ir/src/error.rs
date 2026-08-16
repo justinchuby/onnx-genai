@@ -1,4 +1,4 @@
-//! Error types for the IR crate (see `docs/ORT2.md` §22 and §3.3).
+//! Error types for the IR crate (see `docs/architecture/ORT2.md` §22 and §3.3).
 //!
 //! The IR uses two error types:
 //! * [`GraphError`] — a single structural defect found while validating or

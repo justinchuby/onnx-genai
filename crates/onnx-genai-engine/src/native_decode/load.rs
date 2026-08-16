@@ -1,5 +1,21 @@
 use super::*;
 
+pub(crate) struct NativeDecodeLoadOptions<'a> {
+    pub(crate) host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
+    #[cfg(feature = "cuda")]
+    pub(crate) cuda_offload_policy: Option<onnx_runtime_ep_cuda::DeviceOffloadPolicy>,
+    #[cfg(feature = "cuda")]
+    pub(crate) cuda_memory_governor:
+        Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+    pub(crate) io: Option<&'a ModelIoSpec>,
+    pub(crate) metadata_max_len: Option<usize>,
+    pub(crate) key_sequence_lengths_policy: crate::decode::KeySequenceLengthsPolicy,
+    pub(crate) decode_precision: DecodePrecision,
+    /// Persistent decode batch extent requested by the caller (`--max-batch`),
+    /// or `None` to defer to `ONNX_GENAI_NATIVE_DECODE_BATCH` (#1064).
+    pub(crate) decode_batch: Option<usize>,
+}
+
 fn native_metadata_max_len_from_model_path(path: &Path) -> Option<usize> {
     let root = if path.is_dir() { path } else { path.parent()? };
     [
@@ -69,17 +85,20 @@ impl NativeDecodeSession {
             .as_ref()
             .and_then(|metadata| metadata.model.as_ref())
             .and_then(|model| model.io.as_ref());
-        Self::load_with_cuda_options_and_io(path, device, NativeDecodeCudaOptions::default(), io)
+        Self::load_with_cuda_options_and_io(
+            path,
+            device,
+            NativeDecodeCudaOptions::default(),
+            io,
+            None,
+            None,
+        )
     }
 
     pub(crate) fn load_with_weight_offload_host_cache(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
-        host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
-        io: Option<&ModelIoSpec>,
-        metadata_max_len: Option<usize>,
-        key_sequence_lengths_policy: crate::decode::KeySequenceLengthsPolicy,
-        decode_precision: DecodePrecision,
+        options: NativeDecodeLoadOptions<'_>,
     ) -> anyhow::Result<Self> {
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
@@ -89,18 +108,26 @@ impl NativeDecodeSession {
         let mut builder = InferenceSession::builder()
             .model(path)
             .device(preference)
-            .decode_precision(decode_precision);
+            .decode_precision(options.decode_precision);
         if device == NativeDecodeDevice::Cpu {
             let ep =
                 onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_weight_offload_host_cache(
-                    host_cache,
+                    options.host_cache,
                 )
                 .context("initialize native CPU execution provider")?;
             builder = builder.execution_provider(Arc::new(ep));
         }
         #[cfg(feature = "cuda")]
         if let NativeDecodeDevice::Cuda { index } = device {
-            let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::initialized(index.unwrap_or(0))
+            let policy = options
+                .cuda_offload_policy
+                .unwrap_or_else(onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env);
+            let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::
+                initialized_with_offload_policy_and_governor(
+                    index.unwrap_or(0),
+                    policy,
+                    options.cuda_memory_governor,
+                )
                 .context("initialize native CUDA execution provider")?;
             builder = builder.execution_provider(Arc::new(ep));
         }
@@ -120,15 +147,41 @@ impl NativeDecodeSession {
             builder = builder.execution_provider(Arc::new(ep));
         }
         let session = builder.build().context("load native decoder model")?;
-        Self::validate_key_sequence_lengths_contract(&session, key_sequence_lengths_policy)?;
+        Self::validate_key_sequence_lengths_contract(
+            &session,
+            options.key_sequence_lengths_policy,
+        )?;
         Self::from_session_with_cuda_options_and_io(
             session,
             NativeDecodeCudaOptions {
                 kv_max_len: None,
-                metadata_max_len,
+                metadata_max_len: options.metadata_max_len,
                 graph_capture: None,
+                weight_offload_enabled: {
+                    #[cfg(feature = "cuda")]
+                    {
+                        options.cuda_offload_policy.map(|policy| policy.enabled)
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        None
+                    }
+                },
+                weight_offload_stable_va: {
+                    #[cfg(feature = "cuda")]
+                    {
+                        options
+                            .cuda_offload_policy
+                            .map(|policy| policy.enabled && policy.managed_no_spill)
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        None
+                    }
+                },
+                decode_batch: options.decode_batch,
             },
-            io,
+            options.io,
         )
     }
 
@@ -179,9 +232,12 @@ impl NativeDecodeSession {
             path,
             device,
             NativeDecodeCudaOptions {
+                decode_batch: None,
                 kv_max_len: cuda_kv_max_len,
                 metadata_max_len,
                 graph_capture: None,
+                weight_offload_enabled: None,
+                weight_offload_stable_va: None,
             },
         )
     }
@@ -198,7 +254,7 @@ impl NativeDecodeSession {
         device: NativeDecodeDevice,
         options: NativeDecodeCudaOptions,
     ) -> anyhow::Result<Self> {
-        Self::load_with_cuda_options_and_io(path, device, options, None)
+        Self::load_with_cuda_options_and_io(path, device, options, None, None, None)
     }
 
     /// Load a decoder-with-past model, threading the pipeline-declared
@@ -206,12 +262,61 @@ impl NativeDecodeSession {
     /// and routed step inputs are bound from metadata rather than guessed from
     /// tensor shapes. The pipeline's native device-KV decoder (inc2b) uses this so
     /// an `inputs_embeds` decoder with no token input loads correctly.
+    #[cfg(not(feature = "cuda"))]
     pub(crate) fn load_with_io(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
         io: Option<&ModelIoSpec>,
+        metadata_max_len: Option<usize>,
     ) -> anyhow::Result<Self> {
-        Self::load_with_cuda_options_and_io(path, device, NativeDecodeCudaOptions::default(), io)
+        Self::load_with_cuda_options_and_io(
+            path,
+            device,
+            NativeDecodeCudaOptions {
+                metadata_max_len,
+                ..NativeDecodeCudaOptions::default()
+            },
+            io,
+            None,
+            None,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn load_with_io_and_cuda_governor(
+        path: impl AsRef<Path>,
+        device: NativeDecodeDevice,
+        io: Option<&ModelIoSpec>,
+        metadata_max_len: Option<usize>,
+        offload_policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+    ) -> anyhow::Result<Self> {
+        Self::load_with_cuda_options_and_io(
+            path,
+            device,
+            NativeDecodeCudaOptions {
+                metadata_max_len,
+                ..NativeDecodeCudaOptions::default()
+            },
+            io,
+            Some(governor),
+            Some(offload_policy),
+        )
+    }
+
+    /// Test-support (leverb-phase0): load with an explicit [`ModelIoSpec`] and
+    /// custom CUDA options but no offload governor. Lets the `#[ignore]`d Lever-B
+    /// probe drive a real metadata-declared decoder (e.g. glm-4-9b, whose two
+    /// rank-2 int64 inputs are ambiguous under shape-only autoderive) directly at
+    /// the `NativeDecodeSession` layer, without standing up a full pipeline.
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn load_with_cuda_options_and_io_spec(
+        path: impl AsRef<Path>,
+        device: NativeDecodeDevice,
+        options: NativeDecodeCudaOptions,
+        io: Option<&ModelIoSpec>,
+    ) -> anyhow::Result<Self> {
+        Self::load_with_cuda_options_and_io(path, device, options, io, None, None)
     }
 
     fn load_with_cuda_options_and_io(
@@ -219,9 +324,26 @@ impl NativeDecodeSession {
         device: NativeDecodeDevice,
         mut options: NativeDecodeCudaOptions,
         io: Option<&ModelIoSpec>,
+        #[cfg(feature = "cuda")] cuda_governor: Option<
+            Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+        >,
+        #[cfg(not(feature = "cuda"))] _cuda_governor: Option<()>,
+        #[cfg(feature = "cuda")] cuda_offload_policy: Option<
+            onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+        >,
+        #[cfg(not(feature = "cuda"))] _cuda_offload_policy: Option<()>,
     ) -> anyhow::Result<Self> {
         if options.metadata_max_len.is_none() {
             options.metadata_max_len = native_metadata_max_len_from_model_path(path.as_ref());
+        }
+        // Issue #716: the managed no-spill authority path installs the VMM arena
+        // and physical granule pool, so weight page-ins run on reserved-once
+        // stable virtual addresses. Record that here — where the effective
+        // offload policy is known — so the decode session can keep whole-step
+        // CUDA graph capture ON while offload is active.
+        #[cfg(feature = "cuda")]
+        if let Some(policy) = cuda_offload_policy {
+            options.weight_offload_stable_va = Some(policy.enabled && policy.managed_no_spill);
         }
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
@@ -229,6 +351,18 @@ impl NativeDecodeSession {
             NativeDecodeDevice::Plugin { .. } => DevicePreference::Cpu,
         };
         let mut builder = InferenceSession::builder().model(path).device(preference);
+        #[cfg(feature = "cuda")]
+        if let (NativeDecodeDevice::Cuda { index }, Some(governor)) = (&device, cuda_governor) {
+            let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::
+                initialized_with_offload_policy_and_governor(
+                    index.unwrap_or(0),
+                    cuda_offload_policy
+                        .unwrap_or_else(onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env),
+                    governor,
+                )
+                .context("initialize governed native CUDA execution provider")?;
+            builder = builder.execution_provider(Arc::new(ep));
+        }
         if let NativeDecodeDevice::Plugin {
             library,
             registration_name,
@@ -253,6 +387,22 @@ impl NativeDecodeSession {
         Self::from_session_with_cuda_options(session, NativeDecodeCudaOptions::default())
     }
 
+    /// Wrap an already-built native session with an explicit [`ModelIoSpec`],
+    /// used when the graph's ports cannot be disambiguated by shape/dtype alone
+    /// (e.g. the synthetic decoder whose `input_ids`/`attention_mask`/
+    /// `position_ids` are all `[-1, -1]` Int64). The declared spec is
+    /// authoritative.
+    pub fn from_session_with_io(
+        session: InferenceSession,
+        io: &ModelIoSpec,
+    ) -> anyhow::Result<Self> {
+        Self::from_session_with_cuda_options_and_io(
+            session,
+            NativeDecodeCudaOptions::default(),
+            Some(io),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn from_session_with_cuda_kv_max_len_and_io(
         session: InferenceSession,
@@ -262,9 +412,12 @@ impl NativeDecodeSession {
         Self::from_session_with_cuda_options_and_io(
             session,
             NativeDecodeCudaOptions {
+                decode_batch: None,
                 kv_max_len: cuda_kv_max_len,
                 metadata_max_len: None,
                 graph_capture: None,
+                weight_offload_enabled: None,
+                weight_offload_stable_va: None,
             },
             io,
         )
@@ -306,54 +459,7 @@ impl NativeDecodeSession {
             inputs: session.inputs().iter().map(to_graph_tensor).collect(),
             outputs: session.outputs().iter().map(to_graph_tensor).collect(),
         };
-        let derived = onnx_genai_genai_config::GenAiConfig::derive_decoder_io_from_graph(&graph)?;
-        // Safety gate: only the recurrent-hybrid case the shape-inference path
-        // cannot handle. Pure-dense decoders (no state pairs) keep `io = None`.
-        if derived.state_pairs.is_empty() {
-            return None;
-        }
-        let input_names: HashSet<&str> = session
-            .inputs()
-            .iter()
-            .map(|meta| meta.name.as_str())
-            .collect();
-        let output_names: HashSet<&str> = session
-            .outputs()
-            .iter()
-            .map(|meta| meta.name.as_str())
-            .collect();
-        let present_input = |name: &str| input_names.contains(name).then(|| name.to_owned());
-        let present_output = |name: &str| output_names.contains(name).then(|| name.to_owned());
-        let state_pairs = derived
-            .state_pairs
-            .into_iter()
-            .map(|pair| LoopStatePair {
-                input: pair.input,
-                output: pair.output,
-                init: Some("zeros".to_owned()),
-                update: Some("replace".to_owned()),
-            })
-            .collect::<Vec<_>>();
-        Some(ModelIoSpec {
-            sequence_source: None,
-            kv_ownership: None,
-            token_input: present_input("input_ids"),
-            inputs_embeds_input: None,
-            attention_mask_input: present_input("attention_mask"),
-            position_ids_input: present_input("position_ids"),
-            logits_output: present_output("logits"),
-            hidden_output: None,
-            kv_inputs: (!derived.kv_inputs.is_empty()).then_some(derived.kv_inputs),
-            kv_outputs: (!derived.kv_outputs.is_empty()).then_some(derived.kv_outputs),
-            encoder_hidden_states_input: None,
-            audio_features_input: None,
-            cross_kv_inputs: None,
-            cross_kv_outputs: None,
-            kv_update: None,
-            state_pairs: Some(state_pairs),
-            optional_inputs: BTreeMap::new(),
-            static_cache: None,
-        })
+        onnx_genai_genai_config::GenAiConfig::derive_model_io_spec_from_graph(&graph)
     }
 
     fn from_session_with_cuda_options_and_io(
@@ -606,9 +712,12 @@ impl NativeDecodeSession {
                     .with_context(|| {
                         format!("missing CUDA inputs_embeds input metadata for '{name}'")
                     })?;
-                if !matches!(meta.dtype, DataType::Float32 | DataType::Float16) {
+                if !matches!(
+                    meta.dtype,
+                    DataType::Float32 | DataType::Float16 | DataType::BFloat16
+                ) {
                     bail!(
-                        "native CUDA inputs_embeds input '{name}' must be f32 or f16, got {:?} {:?}",
+                        "native CUDA inputs_embeds input '{name}' must be f32, f16 or bf16, got {:?} {:?}",
                         meta.dtype,
                         meta.shape
                     );
@@ -693,11 +802,19 @@ impl NativeDecodeSession {
             // with graph capture; when the CUDA EP isn't compiled in there is no
             // pager, so offload is unconditionally off here.
             #[cfg(feature = "cuda")]
-            let weight_offload_enabled =
-                onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env().enabled;
+            let weight_offload_enabled = cuda_options
+                .weight_offload_enabled
+                .unwrap_or_else(|| onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env().enabled);
             #[cfg(not(feature = "cuda"))]
             let weight_offload_enabled = false;
-            let graph_enabled = resolve_graph_capture_enabled(
+            // Issue #716: offload no longer forces capture OFF when it runs on
+            // the stable-VA VMM paging path. Pass the three-state Option through
+            // so the decline message can distinguish "policy proved unstable"
+            // (`Some(false)`) from "no policy supplied, conservative default"
+            // (`None`) — collapsing them to a bool here is what let a plumbing
+            // gap read as a runtime limitation.
+            let weight_offload_stable_va = cuda_options.weight_offload_stable_va;
+            let graph_capture = resolve_graph_capture_decision(
                 cuda_options.graph_capture,
                 runtime_config.cuda_graph_explicit,
                 runtime_config.cuda_graph,
@@ -706,11 +823,15 @@ impl NativeDecodeSession {
                     kv_ownership,
                 },
                 weight_offload_enabled,
+                weight_offload_stable_va,
             );
             let mut span = onnx_genai_ort::prof_span!("native.cuda_kv_alloc");
             span.set_arg("max_len", capacity.max_len as u64);
             span.set_arg("kv_pairs", present_to_past.len() as u64);
-            span.set_arg("graph_capture", graph_enabled);
+            span.set_arg("graph_capture", graph_capture.is_enabled());
+            let kv_layout = crate::native_decode::cuda::resolve_cuda_kv_layout(
+                io.and_then(|io| io.kv_layout.as_ref()),
+            );
             Some(DecodeCudaState::new(
                 &mut session,
                 DecodeCudaIo {
@@ -724,8 +845,10 @@ impl NativeDecodeSession {
                 &present_to_past,
                 &fixed_state_inputs,
                 capacity,
-                graph_enabled,
+                graph_capture,
                 position_rank,
+                kv_layout,
+                cuda_options.decode_batch,
             )?)
         } else {
             None

@@ -62,6 +62,7 @@ opset_import { domain: "" version: 13 }
 "#;
     fs::write(root.join("audio_encoder.onnx.textproto"), audio_encoder)?;
     let marker = "  output {\n    name: \"inputs_embeds\"";
+    let crlf_marker = "  output {\r\n    name: \"inputs_embeds\"";
     let audio_input = "\
   input {
     name: \"audio_features\"
@@ -77,7 +78,11 @@ opset_import { domain: "" version: 13 }
   }
   output {
     name: \"inputs_embeds\"";
-    let embedding = original.replacen(marker, audio_input, 1);
+    let embedding = if original.contains(marker) {
+        original.replacen(marker, audio_input, 1)
+    } else {
+        original.replacen(crlf_marker, audio_input, 1)
+    };
     assert_ne!(embedding, original, "embedding fixture marker must match");
     fs::write(root.join("embedding.onnx.textproto"), embedding)?;
     fs::write(root.join("inference_metadata.yaml"), metadata)?;
@@ -320,6 +325,37 @@ fn undeclared_required_audio_input_never_receives_a_fallback() -> anyhow::Result
             .to_string()
             .contains("missing required pipeline input 'embedding.audio_features'"),
         "unexpected error: {error:#}"
+    );
+    Ok(())
+}
+
+/// The counterpart to the test above, differing only in whether a producer is
+/// declared: a required input whose only declared producer is presence-gated is
+/// rejected at load time, not silently seeded with an empty tensor at run time.
+///
+/// This pins the boundary the seeding fix depends on. Package admission already
+/// forbids this shape, and it names the three legitimate ways to express the
+/// intent. The auto-seed must not become a fourth, unchecked one that resurrects
+/// the very substitution `undeclared_required_...` above forbids — so the failure
+/// must stay at admission, with a message that tells the author what to declare.
+#[test]
+fn a_presence_gated_producer_for_a_required_input_is_rejected_at_admission() -> anyhow::Result<()> {
+    let metadata = autoregressive_metadata(false, true);
+    let dir = autoregressive_fixture("declared-producer-absent", &metadata)?;
+
+    let error = Engine::from_pipeline_dir(&dir, EngineConfig::default())
+        .err()
+        .expect("a required input fed only by a gated producer must not be admitted");
+
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("embedding.audio_features")
+            && message.contains("unavailable when presence key 'audio' is absent"),
+        "the error must name the endpoint and why its source is absent: {message}"
+    );
+    assert!(
+        message.contains("optional_inputs"),
+        "the error must name the declaration that fixes it: {message}"
     );
     Ok(())
 }

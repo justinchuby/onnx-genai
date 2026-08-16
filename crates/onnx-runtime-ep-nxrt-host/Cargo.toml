@@ -1,0 +1,21 @@
+[package]
+name = "onnx-runtime-ep-nxrt-host"
+version = "0.1.0"
+edition = "2021"
+description = "Dynamic loader and Rust-trait adapter for nxrt execution-provider plugins"
+publish = false
+
+[dependencies]
+libloading = { workspace = true }
+onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-ep-nxrt-abi = { workspace = true }
+onnx-runtime-ir = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+libloading = { workspace = true }
+onnx-runtime-ep-nxrt-abi = { workspace = true }
+onnx-runtime-ep-nxrt-testplugin = { workspace = true }
+
+[lints]
+workspace = true

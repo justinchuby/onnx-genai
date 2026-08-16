@@ -86,20 +86,37 @@ struct Registry {
     trace_ids: AtomicU64,
 }
 
-static REGISTRY: Registry = Registry {
-    requests: [const { [const { AtomicU64::new(0) }; STATUS_CODES] }; ENDPOINTS.len()],
-    prompt_tokens: AtomicU64::new(0),
-    completion_tokens: AtomicU64::new(0),
-    ttft: Histogram::new(),
-    e2e: Histogram::new(),
-    active_sessions: AtomicU64::new(0),
-    pending: AtomicU64::new(0),
-    batch_size: AtomicU64::new(0),
-    prefix_cache_hits: AtomicU64::new(0),
-    prefix_cache_lookups: AtomicU64::new(0),
-    rejections: AtomicU64::new(0),
-    trace_ids: AtomicU64::new(1),
-};
+impl Registry {
+    const fn new() -> Self {
+        Self {
+            requests: [const { [const { AtomicU64::new(0) }; STATUS_CODES] }; ENDPOINTS.len()],
+            prompt_tokens: AtomicU64::new(0),
+            completion_tokens: AtomicU64::new(0),
+            ttft: Histogram::new(),
+            e2e: Histogram::new(),
+            active_sessions: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
+            batch_size: AtomicU64::new(0),
+            prefix_cache_hits: AtomicU64::new(0),
+            prefix_cache_lookups: AtomicU64::new(0),
+            rejections: AtomicU64::new(0),
+            trace_ids: AtomicU64::new(1),
+        }
+    }
+
+    fn request_finished(&self, path: &str, status: StatusCode) {
+        let endpoint = endpoint_index(path);
+        let code = usize::from(status.as_u16());
+        if code < STATUS_CODES {
+            self.requests[endpoint][code].fetch_add(1, Ordering::Relaxed);
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            self.rejections.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+static REGISTRY: Registry = Registry::new();
 
 pub(crate) struct GenerationMetrics {
     started: Instant,
@@ -109,6 +126,13 @@ pub(crate) struct GenerationMetrics {
 impl GenerationMetrics {
     pub(crate) fn start() -> Self {
         decrement(&REGISTRY.pending);
+        // NOTE (issue #750): this counts *admitted generations*, not sequences
+        // that are actually co-decoded in one batched forward pass. On a backend
+        // that cannot batch (native, or a legacy / non-shared-buffer ORT model)
+        // this gauge still climbs with concurrent requests even though each is
+        // decoded one at a time via the per-request fallback path. That is why
+        // `onnx_genai_batch_size_current` alone never revealed the missing
+        // batching — read `/v1/resources` `batching.supported` for the truth.
         REGISTRY.batch_size.fetch_add(1, Ordering::Relaxed);
         Self {
             started: Instant::now(),
@@ -147,14 +171,7 @@ impl Drop for GenerationMetrics {
 }
 
 pub(crate) fn request_finished(path: &str, status: StatusCode) {
-    let endpoint = endpoint_index(path);
-    let code = usize::from(status.as_u16());
-    if code < STATUS_CODES {
-        REGISTRY.requests[endpoint][code].fetch_add(1, Ordering::Relaxed);
-    }
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        REGISTRY.rejections.fetch_add(1, Ordering::Relaxed);
-    }
+    REGISTRY.request_finished(path, status);
 }
 
 pub(crate) fn request_started() -> u64 {
@@ -279,7 +296,9 @@ pub(crate) fn encode_prometheus() -> String {
     gauge(
         &mut output,
         "onnx_genai_batch_size_current",
-        "Current generation batch size.",
+        // Counts admitted generations, not sequences co-decoded in one batched
+        // pass; it moves even on non-batching backends (issue #750).
+        "Current number of admitted generations (not necessarily co-batched).",
         REGISTRY.batch_size.load(Ordering::Relaxed),
     );
     let hits = REGISTRY.prefix_cache_hits.load(Ordering::Relaxed);
@@ -310,7 +329,65 @@ pub(crate) fn encode_prometheus() -> String {
         "HTTP requests rejected for overload.",
         REGISTRY.rejections.load(Ordering::Relaxed),
     );
+    output.push_str(&encode_weight_offload());
     output
+}
+
+#[cfg(all(feature = "metrics", feature = "cuda"))]
+fn encode_weight_offload() -> String {
+    let mut output = String::new();
+    let stats = onnx_runtime_ep_cuda::global_offload_stats();
+    counter(
+        &mut output,
+        "onnx_genai_cuda_weight_offload_page_ins_total",
+        "Process-wide cumulative CUDA weight residency page-ins.",
+        stats.page_ins,
+    );
+    counter(
+        &mut output,
+        "onnx_genai_cuda_weight_offload_hits_total",
+        "Process-wide cumulative CUDA weight residency cache hits.",
+        stats.hits,
+    );
+    counter(
+        &mut output,
+        "onnx_genai_cuda_weight_offload_evictions_total",
+        "Process-wide cumulative CUDA weight residency evictions.",
+        stats.evictions,
+    );
+    gauge(
+        &mut output,
+        "onnx_genai_cuda_weight_offload_content_resident_bytes",
+        "Canonical weight content bytes currently held by CUDA residency caches.",
+        stats.content_resident_bytes,
+    );
+    gauge(
+        &mut output,
+        "onnx_genai_cuda_weight_offload_physical_owned_bytes",
+        "Authority-owned physical bytes across live CUDA VMM handle pools.",
+        stats.physical_owned_bytes,
+    );
+    gauge(
+        &mut output,
+        "onnx_genai_cuda_weight_offload_mapped_physical_bytes",
+        "Physical bytes mapped and attributed to CUDA weight residency zones.",
+        stats.mapped_physical_bytes,
+    );
+    output.push_str("# HELP onnx_genai_cuda_weight_offload_hit_rate Process-wide CUDA weight residency hit ratio derived from cumulative hits and page-ins.\n");
+    output.push_str("# TYPE onnx_genai_cuda_weight_offload_hit_rate gauge\n");
+    let lookups = stats.hits + stats.page_ins;
+    let hit_rate = if lookups == 0 {
+        0.0
+    } else {
+        stats.hits as f64 / lookups as f64
+    };
+    writeln!(output, "onnx_genai_cuda_weight_offload_hit_rate {hit_rate}").expect("String write");
+    output
+}
+
+#[cfg(not(all(feature = "metrics", feature = "cuda")))]
+fn encode_weight_offload() -> String {
+    String::new()
 }
 
 /// Name of the gauge that says whether the governor family below is real.
@@ -319,11 +396,11 @@ pub(crate) fn encode_prometheus() -> String {
 /// string; a typo here would split one series into two and neither would
 /// alarm.
 #[cfg(feature = "metrics")]
-pub(crate) const RESOURCE_GOVERNOR_AVAILABLE: &str = "onnxgenai_resource_governor_available";
+pub(crate) const RESOURCE_GOVERNOR_AVAILABLE: &str = "onnx_genai_resource_governor_available";
 
 #[cfg(feature = "metrics")]
 const RESOURCE_GOVERNOR_AVAILABLE_HELP: &str = "1 when the resource governor was readable for this scrape and the \
-     onnxgenai_vram_*/host_ram_*/kv_* gauges below are present; 0 when it was \
+     onnx_genai_vram_*/host_ram_*/kv_* gauges below are present; 0 when it was \
      not and those gauges are absent for that reason.";
 
 /// Emits the availability marker alone, for scrapes where the governor could
@@ -345,7 +422,7 @@ pub(crate) fn encode_resource_governor_unavailable() -> String {
     output
 }
 
-const KV_PAGING_APPLICABLE: &str = "onnxgenai_kv_paging_applicable";
+const KV_PAGING_APPLICABLE: &str = "onnx_genai_kv_paging_applicable";
 const KV_PAGING_APPLICABLE_HELP: &str = concat!(
     "Whether paged KV is the mechanism the decoder uses: ",
     "1 applicable, 0 not applicable, -1 not yet determined. ",
@@ -357,7 +434,7 @@ const KV_PAGING_APPLICABLE_HELP: &str = concat!(
 ///
 /// `applicable` is emitted first and deliberately, because the counters below
 /// it are honest reads of a real structure even on a model that never consults
-/// the pool. `onnxgenai_kv_pages_capacity` is *non-zero* on a continuous-batching
+/// the pool. `onnx_genai_kv_pages_capacity` is *non-zero* on a continuous-batching
 /// model, so a consumer that charted utilisation without checking applicability
 /// would be charting a mechanism that is not running -- and nothing in the
 /// numbers themselves would reveal it.
@@ -387,58 +464,125 @@ pub(crate) fn encode_kv_telemetry(
     );
     gauge(
         &mut output,
-        "onnxgenai_kv_pages_in_use",
+        "onnx_genai_kv_pages_in_use",
         "KV pages with at least one reference, on any tier. May exceed capacity: eviction demotes a page to the cold tier without dropping its reference.",
         snapshot.pages_in_use as u64,
     );
     gauge(
         &mut output,
-        "onnxgenai_kv_pages_shared",
+        "onnx_genai_kv_pages_shared",
         "KV pages with more than one reference, i.e. shared by copy-on-write or prefix reuse.",
         snapshot.pages_shared as u64,
     );
     gauge(
         &mut output,
-        "onnxgenai_kv_pages_capacity",
+        "onnx_genai_kv_pages_capacity",
         "Hot-tier live KV page capacity.",
         snapshot.hot_capacity as u64,
     );
     gauge(
         &mut output,
-        "onnxgenai_kv_page_size_tokens",
+        "onnx_genai_kv_page_size_tokens",
         "Token slots per KV page.",
         snapshot.page_size as u64,
     );
     counter(
         &mut output,
-        "onnxgenai_kv_page_allocations_total",
+        "onnx_genai_kv_page_allocations_total",
         "KV pages handed out.",
         snapshot.allocations,
     );
     counter(
         &mut output,
-        "onnxgenai_kv_page_allocation_failures_total",
+        "onnx_genai_kv_page_allocation_failures_total",
         "KV page allocations that found no page. The honest signal that the pool is under real pressure.",
         snapshot.allocation_failures,
     );
     counter(
         &mut output,
-        "onnxgenai_kv_page_frees_total",
+        "onnx_genai_kv_page_frees_total",
         "KV pages returned to the free list.",
         snapshot.frees,
     );
     counter(
         &mut output,
-        "onnxgenai_kv_hot_evictions_total",
+        "onnx_genai_kv_hot_evictions_total",
         "KV pages demoted from the hot tier.",
         snapshot.hot_evictions,
     );
     counter(
         &mut output,
-        "onnxgenai_kv_prefix_evictions_total",
+        "onnx_genai_kv_prefix_evictions_total",
         "KV pages dropped from the prefix cache.",
         snapshot.prefix_evictions,
     );
+    output
+}
+
+#[cfg(feature = "metrics")]
+pub(crate) fn encode_mapped_growth(metrics: &onnx_genai_engine::MappedGrowthMetrics) -> String {
+    let values = [
+        (
+            "onnx_genai_mapped_growth_attempts_total",
+            "Mapped growth grant attempts.",
+            metrics.attempts,
+            "counter",
+        ),
+        (
+            "onnx_genai_mapped_growth_bytes_transferred_total",
+            "Allowance bytes transferred by committed mapped growth grants.",
+            metrics.bytes_transferred,
+            "counter",
+        ),
+        (
+            "onnx_genai_mapped_growth_failures_total",
+            "Mapped growth grant preparation failures.",
+            metrics.failures,
+            "counter",
+        ),
+        (
+            "onnx_genai_mapped_growth_rollbacks_total",
+            "Mapped growth grants rolled back before commit.",
+            metrics.rollbacks,
+            "counter",
+        ),
+        (
+            "onnx_genai_mapped_weight_bytes",
+            "Currently mapped reloadable weight bytes.",
+            metrics.weight_mapped,
+            "gauge",
+        ),
+        (
+            "onnx_genai_mapped_kv_bytes",
+            "Currently mapped native KV bytes.",
+            metrics.kv_mapped,
+            "gauge",
+        ),
+        (
+            "onnx_genai_mapped_workspace_bytes",
+            "Currently mapped governed workspace bytes.",
+            metrics.workspace_mapped,
+            "gauge",
+        ),
+        (
+            "onnx_genai_mapped_total_owned_bytes",
+            "Total physical bytes owned by mapped-growth authorities.",
+            metrics.total_owned,
+            "gauge",
+        ),
+        (
+            "onnx_genai_mapped_growth_registered_holders",
+            "Live reclaimable mapped holders.",
+            metrics.live_holders,
+            "gauge",
+        ),
+    ];
+    let mut output = String::new();
+    for (name, help, value, metric_type) in values {
+        let _ = writeln!(output, "# HELP {name} {help}");
+        let _ = writeln!(output, "# TYPE {name} {metric_type}");
+        let _ = writeln!(output, "{name} {value}");
+    }
     output
 }
 
@@ -453,63 +597,63 @@ pub(crate) fn encode_resource_governor(snapshot: &GovernorSnapshot) -> String {
     );
     gauge(
         &mut output,
-        "onnxgenai_vram_used_bytes",
+        "onnx_genai_vram_used_bytes",
         "VRAM currently used.",
         snapshot.vram.used,
     );
     gauge(
         &mut output,
-        "onnxgenai_vram_limit_bytes",
+        "onnx_genai_vram_limit_bytes",
         "Configured VRAM ceiling.",
         snapshot.vram.limit,
     );
     gauge(
         &mut output,
-        "onnxgenai_vram_headroom_bytes",
+        "onnx_genai_vram_headroom_bytes",
         "VRAM bytes below the configured ceiling.",
         snapshot.vram.headroom,
     );
     gauge(
         &mut output,
-        "onnxgenai_host_ram_used_bytes",
+        "onnx_genai_host_ram_used_bytes",
         "Host RAM currently used.",
         snapshot.host_ram.used,
     );
     gauge(
         &mut output,
-        "onnxgenai_host_ram_limit_bytes",
+        "onnx_genai_host_ram_limit_bytes",
         "Configured host RAM ceiling.",
         snapshot.host_ram.limit,
     );
     gauge(
         &mut output,
-        "onnxgenai_host_ram_headroom_bytes",
+        "onnx_genai_host_ram_headroom_bytes",
         "Host RAM bytes below the configured ceiling.",
         snapshot.host_ram.headroom,
     );
     if let Some(disk) = snapshot.disk_spill {
         gauge(
             &mut output,
-            "onnxgenai_disk_spill_used_bytes",
+            "onnx_genai_disk_spill_used_bytes",
             "Disk spill currently used.",
             disk.used,
         );
         gauge(
             &mut output,
-            "onnxgenai_disk_spill_limit_bytes",
+            "onnx_genai_disk_spill_limit_bytes",
             "Configured disk spill ceiling.",
             disk.limit,
         );
         gauge(
             &mut output,
-            "onnxgenai_disk_spill_headroom_bytes",
+            "onnx_genai_disk_spill_headroom_bytes",
             "Disk spill bytes below the configured ceiling.",
             disk.headroom,
         );
     }
     gauge(
         &mut output,
-        "onnxgenai_kv_budget_bytes",
+        "onnx_genai_kv_budget_bytes",
         "Derived VRAM budget available to KV cache.",
         snapshot.derived_budget.kv_bytes,
     );
@@ -537,6 +681,29 @@ fn signed_gauge(output: &mut String, name: &str, help: &str, value: i64) {
     writeln!(output, "# HELP {name} {help}").expect("String write");
     writeln!(output, "# TYPE {name} gauge").expect("String write");
     writeln!(output, "{name} {value}").expect("String write");
+}
+
+#[cfg(test)]
+mod request_metric_tests {
+    use super::*;
+
+    #[test]
+    fn overload_response_increments_rejections_exactly_once() {
+        let registry = Registry::new();
+
+        registry.request_finished("/v1/chat/completions", StatusCode::TOO_MANY_REQUESTS);
+
+        assert_eq!(registry.rejections.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn unrelated_error_does_not_increment_rejections() {
+        let registry = Registry::new();
+
+        registry.request_finished("/v1/chat/completions", StatusCode::INTERNAL_SERVER_ERROR);
+
+        assert_eq!(registry.rejections.load(Ordering::Relaxed), 0);
+    }
 }
 
 #[cfg(feature = "metrics")]
@@ -613,19 +780,111 @@ mod tests {
         // with no symptom at the point of the omission, so pin all of them.
         let output = encode_kv_telemetry(Applicability::Applicable, &sample());
         for expected in [
-            "onnxgenai_kv_pages_in_use 12",
-            "onnxgenai_kv_pages_shared 3",
-            "onnxgenai_kv_pages_capacity 64",
-            "onnxgenai_kv_page_size_tokens 16",
-            "onnxgenai_kv_page_allocations_total 100",
-            "onnxgenai_kv_page_allocation_failures_total 2",
-            "onnxgenai_kv_page_frees_total 88",
-            "onnxgenai_kv_hot_evictions_total 5",
-            "onnxgenai_kv_prefix_evictions_total 1",
+            "onnx_genai_kv_pages_in_use 12",
+            "onnx_genai_kv_pages_shared 3",
+            "onnx_genai_kv_pages_capacity 64",
+            "onnx_genai_kv_page_size_tokens 16",
+            "onnx_genai_kv_page_allocations_total 100",
+            "onnx_genai_kv_page_allocation_failures_total 2",
+            "onnx_genai_kv_page_frees_total 88",
+            "onnx_genai_kv_hot_evictions_total 5",
+            "onnx_genai_kv_prefix_evictions_total 1",
         ] {
             assert!(
                 output.contains(expected),
                 "missing {expected} in:\n{output}"
+            );
+        }
+    }
+
+    /// Every emitted metric name uses the documented `onnx_genai_` prefix.
+    ///
+    /// # Why the other tests do not cover this
+    ///
+    /// The exposition tests pin metric names as **literals**, so they agree
+    /// with whatever the emitter spells and stay green under a prefix that no
+    /// documentation mentions. The whole memory-governor and KV-paging family
+    /// was emitted as `onnxgenai_` -- no underscore -- for long enough that
+    /// nobody could scrape it: the numbers were real, correct, and exported
+    /// under a name that appears zero times in `docs/`.
+    ///
+    /// This asserts the *convention* rather than a list, so a family added
+    /// tomorrow with the wrong prefix fails here instead of quietly producing
+    /// an empty Grafana panel.
+    #[test]
+    fn every_emitted_metric_name_uses_the_documented_prefix() {
+        let mut exposition = String::new();
+        exposition.push_str(&encode_prometheus());
+        exposition.push_str(&encode_kv_telemetry(Applicability::Applicable, &sample()));
+        exposition.push_str(&encode_resource_governor_unavailable());
+
+        let mut offenders = Vec::new();
+        for line in exposition.lines() {
+            // `# HELP <name> ...` / `# TYPE <name> ...` carry the name in the
+            // third field; a sample line carries it first, possibly followed
+            // by `{labels}`.
+            let name = if let Some(rest) = line
+                .strip_prefix("# HELP ")
+                .or_else(|| line.strip_prefix("# TYPE "))
+            {
+                rest.split_whitespace().next()
+            } else if line.starts_with('#') || line.trim().is_empty() {
+                None
+            } else {
+                line.split_whitespace()
+                    .next()
+                    .map(|token| token.split('{').next().unwrap_or(token))
+            };
+            if let Some(name) = name
+                && !name.starts_with("onnx_genai_")
+            {
+                offenders.push(name.to_string());
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these metric names do not use the documented `onnx_genai_` prefix, \
+             so nothing scraping the documented names will find them: {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn prometheus_does_not_export_non_aggregate_weight_offload_gauges() {
+        let output = encode_prometheus();
+        for stale_name in [
+            "onnx_genai_cuda_weight_offload_budget_bytes",
+            "onnx_genai_cuda_weight_offload_peak_resident_bytes",
+        ] {
+            assert!(
+                !output.contains(stale_name),
+                "{stale_name} is per-residency state, not process truth, and must not be exported"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_weight_offload_metrics_are_process_activity_only() {
+        let output = encode_weight_offload();
+        for expected in [
+            "# TYPE onnx_genai_cuda_weight_offload_page_ins_total counter",
+            "# TYPE onnx_genai_cuda_weight_offload_hits_total counter",
+            "# TYPE onnx_genai_cuda_weight_offload_evictions_total counter",
+            "# TYPE onnx_genai_cuda_weight_offload_hit_rate gauge",
+        ] {
+            assert!(
+                output.contains(expected),
+                "missing expected process-wide offload metric {expected} in:\n{output}"
+            );
+        }
+        for stale_name in [
+            "onnx_genai_cuda_weight_offload_budget_bytes",
+            "onnx_genai_cuda_weight_offload_peak_resident_bytes",
+        ] {
+            assert!(
+                !output.contains(stale_name),
+                "{stale_name} is per-residency state, not process truth, and must not be exported"
             );
         }
     }
@@ -639,13 +898,13 @@ mod tests {
         for (state, expected) in [
             (
                 Applicability::Applicable,
-                "onnxgenai_kv_paging_applicable 1",
+                "onnx_genai_kv_paging_applicable 1",
             ),
             (
                 Applicability::NotApplicable,
-                "onnxgenai_kv_paging_applicable 0",
+                "onnx_genai_kv_paging_applicable 0",
             ),
-            (Applicability::Unknown, "onnxgenai_kv_paging_applicable -1"),
+            (Applicability::Unknown, "onnx_genai_kv_paging_applicable -1"),
         ] {
             let output = encode_kv_telemetry(state, &sample());
             assert!(
@@ -661,10 +920,10 @@ mod tests {
         // rate() on a gauge, or a counter reset alarm on a gauge, are both
         // silent misreadings rather than errors.
         let output = encode_kv_telemetry(Applicability::Applicable, &sample());
-        assert!(output.contains("# TYPE onnxgenai_kv_page_allocations_total counter"));
-        assert!(output.contains("# TYPE onnxgenai_kv_page_allocation_failures_total counter"));
-        assert!(output.contains("# TYPE onnxgenai_kv_pages_in_use gauge"));
-        assert!(output.contains("# TYPE onnxgenai_kv_paging_applicable gauge"));
+        assert!(output.contains("# TYPE onnx_genai_kv_page_allocations_total counter"));
+        assert!(output.contains("# TYPE onnx_genai_kv_page_allocation_failures_total counter"));
+        assert!(output.contains("# TYPE onnx_genai_kv_pages_in_use gauge"));
+        assert!(output.contains("# TYPE onnx_genai_kv_paging_applicable gauge"));
     }
 
     #[test]
@@ -673,7 +932,7 @@ mod tests {
         // that the applicability flag tells a consumer not to chart them as a
         // live mechanism. Dropping them instead would look like a scrape gap.
         let output = encode_kv_telemetry(Applicability::NotApplicable, &sample());
-        assert!(output.contains("onnxgenai_kv_pages_capacity 64"));
-        assert!(output.contains("onnxgenai_kv_paging_applicable 0"));
+        assert!(output.contains("onnx_genai_kv_pages_capacity 64"));
+        assert!(output.contains("onnx_genai_kv_paging_applicable 0"));
     }
 }

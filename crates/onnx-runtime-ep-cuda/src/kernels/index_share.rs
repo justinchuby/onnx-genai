@@ -32,18 +32,19 @@
 //!
 //! ## Capture support
 //!
-//! After a warmed eager execution has sized the module-global-style pooled
-//! scratch (present K/V staging and the per-row score scratch keep stable device
-//! addresses across warmup → capture → replay), the launch path is legal to
-//! record into a CUDA graph and replay with only device-buffer contents
+//! After a warmed eager execution has sized the executor-owned persistent
+//! workspace (present K/V staging and the per-row score scratch keep stable
+//! device addresses across warmup → capture → replay), the launch path is legal
+//! to record into a CUDA graph and replay with only device-buffer contents
 //! changing:
 //!
 //!   * No `stream.synchronize()` on the capturing path (the initial input-upload
 //!     wait and the trailing completion wait are both skipped while capturing;
 //!     same-stream ordering guarantees inputs are ready).
-//!   * No per-call `cudaMalloc`/`cudaFree`: scratch is reused from the pool that
-//!     the warmup pass allocated. Growth (a fresh alloc) only ever happens in
-//!     eager mode, so captured replay keeps fixed buffer addresses.
+//!   * No per-call `cudaMalloc`/`cudaFree`: scratch is supplied through the
+//!     session workspace contract. Growth is planned before managed admission
+//!     and otherwise happens only in eager mode, so captured replay keeps fixed
+//!     buffer addresses.
 //!   * No `selected_indices` D2H copy: [`validate_index_rows`] performs the
 //!     deterministic ONNX index validation on the device and latches violations
 //!     into the runtime capture-error word.
@@ -61,15 +62,17 @@
 
 use std::borrow::Cow;
 use std::ffi::c_void;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+    CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, cuptr};
@@ -145,6 +148,7 @@ const INPUT_NAMES: [&str; 7] = [
 const BLOCK: u32 = 256;
 /// Threads per block for `index_share_row` (one block services one output row).
 const ROW_THREADS: u32 = 128;
+const WORKSPACE_ALIGNMENT: usize = 256;
 const MODULE: &str = "index_share_f32_f16_bf16_v3";
 const SOURCE: &str = r#"
 #include <cuda_fp16.h>
@@ -520,127 +524,124 @@ struct BiasMeta {
     dims: [u64; 4],
 }
 
-/// Pooled, stable-address device scratch reused across calls so the capturing
-/// path never issues a per-call `cudaMalloc`/`cudaFree`. Each buffer grows (a
-/// fresh allocation) only in eager mode; a warmed graph replay keeps the exact
-/// addresses the warmup pass established. A zero pointer means "not yet
-/// allocated"; `capacity` is the current allocation size in bytes.
-#[derive(Debug, Default)]
-struct ScratchPool {
-    present_key: CUdeviceptr,
-    present_key_capacity: usize,
-    present_value: CUdeviceptr,
-    present_value_capacity: usize,
-    scores: CUdeviceptr,
-    scores_capacity: usize,
-    /// Per-batch `[valid_len; write_pos]` (2 * batch i64) recovered on-device
-    /// from the bias frontier for the fixed-capacity present path.
-    frontier: CUdeviceptr,
-    frontier_capacity: usize,
-}
-
-impl ScratchPool {
-    fn ensure_present_key(
-        &mut self,
-        runtime: &CudaRuntime,
-        bytes: usize,
-        capturing: bool,
-    ) -> Result<CUdeviceptr> {
-        ensure_scratch(
-            runtime,
-            &mut self.present_key,
-            &mut self.present_key_capacity,
-            bytes,
-            capturing,
-            "present_key",
-        )
-    }
-
-    fn ensure_present_value(
-        &mut self,
-        runtime: &CudaRuntime,
-        bytes: usize,
-        capturing: bool,
-    ) -> Result<CUdeviceptr> {
-        ensure_scratch(
-            runtime,
-            &mut self.present_value,
-            &mut self.present_value_capacity,
-            bytes,
-            capturing,
-            "present_value",
-        )
-    }
-
-    fn ensure_scores(
-        &mut self,
-        runtime: &CudaRuntime,
-        bytes: usize,
-        capturing: bool,
-    ) -> Result<CUdeviceptr> {
-        ensure_scratch(
-            runtime,
-            &mut self.scores,
-            &mut self.scores_capacity,
-            bytes,
-            capturing,
-            "scores",
-        )
-    }
-
-    fn ensure_frontier(
-        &mut self,
-        runtime: &CudaRuntime,
-        bytes: usize,
-        capturing: bool,
-    ) -> Result<CUdeviceptr> {
-        ensure_scratch(
-            runtime,
-            &mut self.frontier,
-            &mut self.frontier_capacity,
-            bytes,
-            capturing,
-            "frontier",
-        )
-    }
-}
-
-/// Reuse (or, only in eager mode, grow) a pooled scratch buffer, keeping its
-/// device address stable whenever the current capacity already suffices. A grow
-/// allocates before freeing the previous block so a failed allocation leaves the
-/// pool intact. Growing while capturing is impossible (`cudaMalloc` is illegal
-/// during capture), so an under-sized buffer on the capturing path is a hard
-/// error pointing at the missing warmup.
-fn ensure_scratch(
-    runtime: &CudaRuntime,
-    ptr: &mut CUdeviceptr,
-    capacity: &mut usize,
+#[derive(Clone, Copy, Debug)]
+struct WorkspaceLayout {
     bytes: usize,
-    capturing: bool,
-    what: &str,
-) -> Result<CUdeviceptr> {
-    let bytes = bytes.max(1);
-    if *ptr != 0 && *capacity >= bytes {
-        return Ok(*ptr);
+    present_key_offset: usize,
+    present_value_offset: usize,
+    scores_offset: usize,
+    frontier_offset: usize,
+}
+
+impl WorkspaceLayout {
+    fn ptr_at(self, workspace: WorkspaceView, offset: usize) -> CUdeviceptr {
+        workspace.ptr().0 as CUdeviceptr + offset as CUdeviceptr
     }
-    if capturing {
-        return Err(error(format!(
-            "{what} scratch ({bytes} bytes) exceeds the warmed pool capacity ({} bytes); \
-             a fixed-shape eager warmup must run before capture",
-            *capacity
-        )));
+
+    fn present_key(self, workspace: WorkspaceView) -> CUdeviceptr {
+        self.ptr_at(workspace, self.present_key_offset)
     }
-    let fresh = runtime.alloc_raw(bytes)?;
-    if *ptr != 0 {
-        // SAFETY: the previous pointer came from this runtime's `alloc_raw` and
-        // is freed exactly once here, after the replacement is secured.
-        unsafe {
-            let _ = runtime.free_raw(*ptr);
-        }
+
+    fn present_value(self, workspace: WorkspaceView) -> CUdeviceptr {
+        self.ptr_at(workspace, self.present_value_offset)
     }
-    *ptr = fresh;
-    *capacity = bytes;
-    Ok(fresh)
+
+    fn scores(self, workspace: WorkspaceView) -> CUdeviceptr {
+        self.ptr_at(workspace, self.scores_offset)
+    }
+
+    fn frontier(self, workspace: WorkspaceView) -> CUdeviceptr {
+        self.ptr_at(workspace, self.frontier_offset)
+    }
+}
+
+fn align_up(value: usize, alignment: usize) -> Result<usize> {
+    let mask = alignment
+        .checked_sub(1)
+        .ok_or_else(|| error("workspace alignment underflow"))?;
+    value
+        .checked_add(mask)
+        .map(|value| value & !mask)
+        .ok_or_else(|| error("IndexShare workspace size overflow"))
+}
+
+fn append_workspace_segment(offset: &mut usize, bytes: usize) -> Result<usize> {
+    let start = align_up(*offset, WORKSPACE_ALIGNMENT)?;
+    *offset = start
+        .checked_add(bytes.max(1))
+        .ok_or_else(|| error("IndexShare workspace size overflow"))?;
+    Ok(start)
+}
+
+fn index_share_workspace_layout(
+    dims: Dims,
+    dtype: DataType,
+    has_bias: bool,
+    want_present: bool,
+) -> Result<WorkspaceLayout> {
+    let element_size = dtype.storage_bytes(1);
+    let present_elements = dims
+        .batch
+        .checked_mul(dims.kv_heads)
+        .and_then(|value| value.checked_mul(dims.cache_seq))
+        .and_then(|value| value.checked_mul(dims.head_size))
+        .ok_or_else(|| error("IndexShare present workspace element count overflow"))?;
+    let output_rows = dims
+        .batch
+        .checked_mul(dims.q_heads)
+        .and_then(|value| value.checked_mul(dims.q_seq))
+        .ok_or_else(|| error("IndexShare score workspace row count overflow"))?;
+    let scores_elements = output_rows
+        .checked_mul(dims.selected_width)
+        .ok_or_else(|| error("IndexShare score workspace element count overflow"))?;
+    let present_bytes = present_elements
+        .checked_mul(element_size)
+        .ok_or_else(|| error("IndexShare present workspace byte count overflow"))?;
+    let scores_bytes = scores_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| error("IndexShare score workspace byte count overflow"))?;
+    // The 3-output (`want_present`) path writes present K/V straight into the
+    // caller's output slots (`index_share.rs` execute: `want_present =
+    // outputs.len() == 3`), so their workspace staging is dead capacity on that
+    // path and is NOT reserved here — sizing the governed reservation to what
+    // execution actually touches. The 1-output path has no present outputs, so
+    // it stages present K/V in the workspace and the segments are reserved. Node
+    // output arity is static and the executor never trims output slots, so
+    // planning (`workspace_requirement`, which threads the kernel's captured
+    // arity) and execution (which recomputes `want_present` from the same arity)
+    // agree by construction and cannot drift. The tiny frontier segment is
+    // reserved whenever the optional bias is present.
+    let frontier_bytes = if has_bias {
+        2usize
+            .checked_mul(dims.batch)
+            .and_then(|value| value.checked_mul(std::mem::size_of::<i64>()))
+            .ok_or_else(|| error("IndexShare frontier workspace byte count overflow"))?
+    } else {
+        0
+    };
+
+    let mut offset = 0usize;
+    let (present_key_offset, present_value_offset) = if want_present {
+        (0, 0)
+    } else {
+        let present_key_offset = append_workspace_segment(&mut offset, present_bytes)?;
+        let present_value_offset = append_workspace_segment(&mut offset, present_bytes)?;
+        (present_key_offset, present_value_offset)
+    };
+    let scores_offset = append_workspace_segment(&mut offset, scores_bytes)?;
+    let frontier_offset = if frontier_bytes == 0 {
+        0
+    } else {
+        append_workspace_segment(&mut offset, frontier_bytes)?
+    };
+    let bytes = align_up(offset, WORKSPACE_ALIGNMENT)?;
+    Ok(WorkspaceLayout {
+        bytes,
+        present_key_offset,
+        present_value_offset,
+        scores_offset,
+        frontier_offset,
+    })
 }
 
 pub struct IndexShareFactory {
@@ -672,7 +673,7 @@ impl KernelFactory for IndexShareFactory {
             num_heads,
             kv_num_heads,
             scale,
-            scratch: Mutex::new(ScratchPool::default()),
+            present_outputs: node.outputs.len() == 3,
             warmed: AtomicBool::new(false),
         }))
     }
@@ -684,39 +685,51 @@ pub struct IndexShareKernel {
     num_heads: usize,
     kv_num_heads: usize,
     scale: Option<f32>,
-    /// Pooled stable-address scratch (present K/V staging + per-row scores).
-    scratch: Mutex<ScratchPool>,
+    /// Whether this graph node declares the 3-output form (Y + present K/V).
+    /// Captured from the static node arity at construction so workspace planning
+    /// and execution size the present staging identically: on the 3-output path
+    /// present K/V are written to the caller's output slots, so no workspace
+    /// staging is reserved for them.
+    present_outputs: bool,
     /// Set after a successful eager execution has compiled every NVRTC kernel
-    /// and sized the scratch pool, which is the precondition for capturing this
+    /// and sized the persistent workspace, which is the precondition for capturing this
     /// kernel into a CUDA graph.
     warmed: AtomicBool,
 }
 
-impl Drop for IndexShareKernel {
-    fn drop(&mut self) {
-        let pool = self
-            .scratch
-            .get_mut()
-            .expect("cuda_ep IndexShare scratch pool poisoned");
-        for ptr in [
-            pool.present_key,
-            pool.present_value,
-            pool.scores,
-            pool.frontier,
-        ] {
-            if ptr != 0 {
-                // SAFETY: every non-zero pointer came from this runtime's
-                // `alloc_raw` in `ScratchPool::ensure` and is freed exactly once.
-                unsafe {
-                    let _ = self.runtime.free_raw(ptr);
-                }
-            }
-        }
-    }
-}
-
 impl Kernel for IndexShareKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let _ = (inputs, outputs);
+        Err(error(
+            "IndexShare requires executor-provided persistent workspace",
+        ))
+    }
+
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        let dims = self.validate_metadata(inputs)?;
+        let dtype = inputs
+            .first()
+            .map(|input| input.dtype)
+            .ok_or_else(|| error("IndexShare requires input metadata"))?;
+        let has_bias = inputs.get(6).is_some_and(|input| input.present);
+        let layout = index_share_workspace_layout(dims, dtype, has_bias, self.present_outputs)?;
+        Ok(WorkspaceRequirement {
+            bytes: u64::try_from(layout.bytes)
+                .map_err(|_| error("IndexShare workspace does not fit u64"))?,
+            alignment: WORKSPACE_ALIGNMENT,
+            lifetime: WorkspaceLifetime::SessionPersistent,
+            role: MemoryRole::Workspace { step_scoped: false },
+        })
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        let workspace = workspace
+            .ok_or_else(|| error("IndexShare requires executor-provided persistent workspace"))?;
         if !(6..=7).contains(&inputs.len()) {
             return Err(error(format!(
                 "expected 6 or 7 inputs, got {}",
@@ -846,17 +859,20 @@ impl Kernel for IndexShareKernel {
         let indices_ptr = cuptr(inputs[5].data_ptr::<u8>() as *const c_void);
         let index_is_i64 = i32::from(inputs[5].dtype == DataType::Int64);
 
-        // Present K/V element counts and the output element count. `cache_seq`
-        // is `total_seq` for the growing concat present and the fixed capacity
-        // when the present aliases past in place.
-        let present_elements = dims.batch * dims.kv_heads * dims.cache_seq * dims.head_size;
         let output_elements = dims.batch * dims.q_heads * dims.q_seq * dims.head_size;
-        let scores_elements = dims.batch * dims.q_heads * dims.q_seq * dims.selected_width;
 
         // Present outputs are written directly into the caller's output slots
         // when requested (outputs 1 and 2); otherwise present K/V land in scratch
         // that only feeds the attention kernel.
         let want_present = outputs.len() == 3;
+        // Node output arity is static and the executor never trims output slots,
+        // so the runtime arity must match the arity captured at construction.
+        // Both feed `index_share_workspace_layout`, so planning and execution
+        // size the present staging identically.
+        debug_assert_eq!(
+            want_present, self.present_outputs,
+            "IndexShare runtime output arity disagrees with the arity captured at construction"
+        );
         let (output_head, output_tail) = outputs.split_at_mut(1);
         let y_ptr = cuptr(output_head[0].data_ptr_mut::<u8>() as *const c_void);
         let (present_key_out, present_value_out) = if want_present {
@@ -867,44 +883,40 @@ impl Kernel for IndexShareKernel {
         } else {
             (0, 0)
         };
+        let layout = index_share_workspace_layout(
+            dims,
+            dtype,
+            optional_input(inputs, 6).is_some(),
+            want_present,
+        )?;
+        if workspace.bytes() < layout.bytes {
+            return Err(error(format!(
+                "IndexShare workspace invariant mismatch: execute requires {} bytes, prepared {} bytes",
+                layout.bytes,
+                workspace.bytes()
+            )));
+        }
 
         let result = (|| -> Result<()> {
-            let mut pool = self
-                .scratch
-                .lock()
-                .expect("cuda_ep IndexShare scratch pool poisoned");
-
             // Present K/V land in the caller's output slots when requested;
-            // otherwise they use pooled scratch that only feeds the row kernel.
+            // otherwise they use the prepared workspace that only feeds the row kernel.
             let present_key_ptr = if want_present {
                 present_key_out
             } else {
-                pool.ensure_present_key(
-                    &self.runtime,
-                    present_elements * dtype.storage_bytes(1),
-                    capturing,
-                )?
+                layout.present_key(workspace)
             };
             let present_value_ptr = if want_present {
                 present_value_out
             } else {
-                pool.ensure_present_value(
-                    &self.runtime,
-                    present_elements * dtype.storage_bytes(1),
-                    capturing,
-                )?
+                layout.present_value(workspace)
             };
-            let scores_ptr = pool.ensure_scores(&self.runtime, scores_elements * 4, capturing)?;
+            let scores_ptr = layout.scores(workspace);
 
             if dims.capacity_mode {
                 // Recover the per-batch valid length + current-token write
                 // position from the bias frontier on-device (capture-safe), then
                 // build the fixed-capacity present that aliases past in place.
-                let frontier_ptr = pool.ensure_frontier(
-                    &self.runtime,
-                    2 * dims.batch * std::mem::size_of::<i64>(),
-                    capturing,
-                )?;
+                let frontier_ptr = layout.frontier(workspace);
                 let valid_len_ptr = frontier_ptr;
                 let write_pos_ptr = frontier_ptr + (dims.batch * std::mem::size_of::<i64>()) as u64;
                 self.launch_capacity_write_pos(
@@ -1013,7 +1025,7 @@ impl Kernel for IndexShareKernel {
             CaptureSupport::Supported
         } else {
             CaptureSupport::unsupported(
-                "requires a warmed fixed-shape eager IndexShare pass to size the pooled scratch and \
+                "requires a warmed fixed-shape eager IndexShare pass to size the prepared workspace and \
                  prime device-side selected_indices validation",
             )
         }
@@ -1021,6 +1033,129 @@ impl Kernel for IndexShareKernel {
 }
 
 impl IndexShareKernel {
+    fn validate_metadata(&self, inputs: &[TensorMetadata<'_>]) -> Result<Dims> {
+        if inputs.len() < 6 {
+            return Err(error(format!(
+                "expected at least 6 input metadata entries, got {}",
+                inputs.len()
+            )));
+        }
+        for &index in &[0, 1, 2, 5] {
+            if !inputs[index].present {
+                return Err(error(format!(
+                    "required input {index} ('{}') is absent",
+                    INPUT_NAMES[index]
+                )));
+            }
+            require_rank(index, inputs[index].shape)?;
+        }
+        for index in [3, 4] {
+            if inputs.get(index).is_some_and(|input| input.present) {
+                require_rank(index, inputs[index].shape)?;
+            }
+        }
+        let dtype = require_floating_metadata_dtype(inputs[0].dtype)?;
+        for &index in &[1, 2] {
+            if inputs[index].dtype != dtype {
+                return Err(error(
+                    "query, key, and value must use the same floating dtype",
+                ));
+            }
+        }
+        for index in [3, 4, 6] {
+            if let Some(input) = inputs.get(index)
+                && input.present
+                && input.dtype != dtype
+            {
+                return Err(error(
+                    "query, key, value, past_key, past_value, and attention_bias must use the same floating dtype",
+                ));
+            }
+        }
+        if !matches!(inputs[5].dtype, DataType::Int32 | DataType::Int64) {
+            return Err(error(format!(
+                "input 5 ('selected_indices') dtype {:?} unsupported; expected Int32 or Int64",
+                inputs[5].dtype
+            )));
+        }
+
+        let q = inputs[0].shape;
+        let key = inputs[1].shape;
+        let value = inputs[2].shape;
+        let (batch, q_heads, q_seq, head_size) = (q[0], q[1], q[2], q[3]);
+        if q_heads != self.num_heads {
+            return Err(error(format!(
+                "query head dimension {q_heads} must equal num_heads {}",
+                self.num_heads
+            )));
+        }
+        if key[0] != batch || value[0] != batch {
+            return Err(error("query, key, and value batch dimensions must match"));
+        }
+        if key[1] != self.kv_num_heads || value[1] != self.kv_num_heads {
+            return Err(error(format!(
+                "key/value head dimensions must equal kv_num_heads {}",
+                self.kv_num_heads
+            )));
+        }
+        if key[2] != value[2] || key[3] != head_size || value[3] != head_size {
+            return Err(error(
+                "key/value sequence and head dimensions must match query/schema",
+            ));
+        }
+        let current_seq = key[2];
+        let has_past_key = inputs.get(3).is_some_and(|input| input.present);
+        let has_past_value = inputs.get(4).is_some_and(|input| input.present);
+        if has_past_key != has_past_value {
+            return Err(error("past_key and past_value must be provided together"));
+        }
+        let mut past_seq = 0;
+        if has_past_key {
+            let past_key = inputs[3].shape;
+            let past_value = inputs[4].shape;
+            if past_key != past_value {
+                return Err(error("past_key and past_value shapes must match"));
+            }
+            if past_key[0] != batch || past_key[1] != self.kv_num_heads || past_key[3] != head_size
+            {
+                return Err(error(
+                    "past key/value must have shape [B, kv_num_heads, S_past, H]",
+                ));
+            }
+            past_seq = past_key[2];
+        }
+        let total_seq = past_seq
+            .checked_add(current_seq)
+            .ok_or_else(|| error("total cache sequence length overflow"))?;
+        let selected = inputs[5].shape;
+        let index_heads = selected[1];
+        if selected[0] != batch
+            || (index_heads != 1 && index_heads != q_heads)
+            || selected[2] != q_seq
+        {
+            return Err(error(format!(
+                "selected_indices must have shape [B, 1|N, S_q, K], got {selected:?}"
+            )));
+        }
+        if selected[3] == 0 {
+            return Err(error("selected_indices K dimension must be nonzero"));
+        }
+        Ok(Dims {
+            batch,
+            q_heads,
+            kv_heads: self.kv_num_heads,
+            q_seq,
+            current_seq,
+            past_seq,
+            total_seq,
+            head_size,
+            index_heads,
+            selected_width: selected[3],
+            cache_seq: total_seq,
+            capacity_mode: false,
+        })
+    }
+
     fn validate_shapes(&self, inputs: &[TensorView], outputs: &[TensorMut]) -> Result<Dims> {
         for &index in &[0, 1, 2, 5] {
             require_rank(index, inputs[index].shape)?;
@@ -1604,6 +1739,18 @@ fn require_floating_dtype(input: &TensorView, index: usize) -> Result<DataType> 
     Ok(input.dtype)
 }
 
+fn require_floating_metadata_dtype(dtype: DataType) -> Result<DataType> {
+    if !matches!(
+        dtype,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    ) {
+        return Err(error(format!(
+            "IndexShare query dtype {dtype:?} unsupported; expected Float32, Float16, or BFloat16"
+        )));
+    }
+    Ok(dtype)
+}
+
 fn dtype_code(dtype: DataType) -> Result<i32> {
     match dtype {
         DataType::Float32 => Ok(0),
@@ -1645,4 +1792,30 @@ fn optional_input<'a>(inputs: &'a [TensorView<'a>], index: usize) -> Option<&'a 
 
 fn error(message: impl Into<String>) -> EpError {
     EpError::KernelFailed(format!("cuda_ep {OP}: {}", message.into()))
+}
+
+#[cfg(test)]
+mod raw_allocation_guard {
+    /// Regression guard for issue #736: the IndexShare kernel is governed through
+    /// `Kernel::workspace_requirement` + executor-prepared persistent workspace, so
+    /// it must never reintroduce an ungoverned raw device allocation. This CPU-only
+    /// test fails if a raw-allocation seam is added back to this file, catching the
+    /// regression the mock-based session test and GPU-only tests cannot see.
+    #[test]
+    fn index_share_source_has_no_raw_device_allocation() {
+        const SOURCE: &str = include_str!("index_share.rs");
+        // The needles are assembled at runtime so the literals below do not
+        // themselves match when this file is scanned by `include_str!`.
+        let raw_alloc = ["alloc", "_raw("].concat();
+        let scratch_pool = ["Scratch", "Pool"].concat();
+        assert!(
+            !SOURCE.contains(raw_alloc.as_str()),
+            "IndexShare must not reintroduce a raw device allocation (`alloc_raw`); \
+             route scratch through Kernel::workspace_requirement instead (#736)."
+        );
+        assert!(
+            !SOURCE.contains(scratch_pool.as_str()),
+            "IndexShare must not reintroduce the ungoverned scratch-pool allocator (#736)."
+        );
+    }
 }

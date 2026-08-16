@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use onnx_runtime_ir::DataType;
+use onnx_runtime_ir::{DataType, Graph, NodeId, ValueId};
 
 use crate::ExternalMmapRegion;
 
@@ -93,6 +93,9 @@ fn checked_shape_product(shape: &[usize]) -> Result<usize, WeightHandleError> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LazyWeightBoundary {
+    /// `ai.onnx::MatMul`, the ordinary dense GEMM boundary used by unquantized
+    /// decoder exports.
+    MatMul,
     /// `pkg.nxrt::BlockQuantizedMoE`, the Phase-3 offload binding boundary.
     BlockQuantizedMoe,
     /// `com.microsoft::QMoE`, the boundary real DeepSeek/GLM/Qwen exports use.
@@ -104,12 +107,17 @@ pub enum LazyWeightBoundary {
 
 impl LazyWeightBoundary {
     /// Every op boundary at which a lazy weight may be device-paged.
-    pub const ALL: [LazyWeightBoundary; 3] =
-        [Self::BlockQuantizedMoe, Self::QMoe, Self::MatMulNBits];
+    pub const ALL: [LazyWeightBoundary; 4] = [
+        Self::MatMul,
+        Self::BlockQuantizedMoe,
+        Self::QMoe,
+        Self::MatMulNBits,
+    ];
 
     /// Canonical (domain, op_type) this boundary binds at.
     fn identity(self) -> (&'static str, &'static str) {
         match self {
+            Self::MatMul => ("", "MatMul"),
             Self::BlockQuantizedMoe => ("pkg.nxrt", "BlockQuantizedMoE"),
             Self::QMoe => ("com.microsoft", "QMoE"),
             Self::MatMulNBits => ("com.microsoft", "MatMulNBits"),
@@ -132,6 +140,49 @@ impl LazyWeightBoundary {
     pub fn matches_any(domain: &str, op_type: &str) -> bool {
         Self::for_op(domain, op_type).is_some()
     }
+}
+
+/// An initializer the executor may expose as a lazy weight handle.
+///
+/// Strategy inference and executor construction share this classifier so the
+/// reported pageable geometry cannot drift from the weights the runtime pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LazyWeightCandidate {
+    pub value: ValueId,
+    pub boundary: LazyWeightBoundary,
+    pub first_consumer: NodeId,
+}
+
+pub fn lazy_weight_candidates(graph: &Graph) -> Vec<LazyWeightCandidate> {
+    let mut candidates = Vec::new();
+    for &value in graph.initializers.keys() {
+        let graph_value = graph.value(value);
+        let consumers = graph.consumers(value);
+        let Some(&first_consumer) = consumers.first() else {
+            continue;
+        };
+        let mut boundary = None;
+        let lazy_only = graph_value.producer.is_none()
+            && !graph.outputs.contains(&value)
+            && consumers.into_iter().all(|consumer| {
+                let node = graph.node(consumer);
+                match LazyWeightBoundary::for_op(&node.domain, &node.op_type) {
+                    Some(found) => {
+                        boundary.get_or_insert(found);
+                        true
+                    }
+                    None => false,
+                }
+            });
+        if let Some(boundary) = boundary.filter(|_| lazy_only) {
+            candidates.push(LazyWeightCandidate {
+                value,
+                boundary,
+                first_consumer,
+            });
+        }
+    }
+    candidates
 }
 
 pub trait ResidentWeightMaterializer: Send + Sync {
@@ -308,6 +359,17 @@ pub trait LazyDeviceWeightBinder {
 /// this; the returned slice must stay valid for the duration of the copy.
 pub trait MmapRegionSource {
     fn region_bytes(&self, region: &ExternalMmapRegion) -> Result<&[u8], WeightHandleError>;
+
+    /// Return the whole live mapping identified by `mapping_id`, if available.
+    ///
+    /// Used by the zero-copy hybrid weight path to page-lock and device-map an
+    /// entire mapping in a single `cuMemHostRegister`, guaranteeing that every
+    /// weight's device pointer is contiguous over its full length. Returning
+    /// `None` disables zero-copy for that mapping (the caller falls back to a
+    /// copy). The returned slice must stay valid for the mapping's lifetime.
+    fn full_mapping_bytes(&self, _mapping_id: usize) -> Option<&[u8]> {
+        None
+    }
 }
 
 /// A lazy weight paged into device memory by an EP, ready for a kernel to read.
@@ -466,7 +528,11 @@ mod tests {
     }
 
     #[test]
-    fn offload_boundary_recognizes_block_quantized_moe_and_qmoe() {
+    fn offload_boundary_recognizes_dense_and_moe_boundaries() {
+        assert_eq!(
+            LazyWeightBoundary::for_op("", "MatMul"),
+            Some(LazyWeightBoundary::MatMul)
+        );
         assert_eq!(
             LazyWeightBoundary::for_op("pkg.nxrt", "BlockQuantizedMoE"),
             Some(LazyWeightBoundary::BlockQuantizedMoe)
@@ -480,6 +546,7 @@ mod tests {
             "pkg.nxrt",
             "BlockQuantizedMoE"
         ));
+        assert!(LazyWeightBoundary::matches_any("", "MatMul"));
         // Wrong domain/op pairings and unrelated ops are not offload boundaries.
         assert_eq!(LazyWeightBoundary::for_op("pkg.nxrt", "QMoE"), None);
         assert_eq!(

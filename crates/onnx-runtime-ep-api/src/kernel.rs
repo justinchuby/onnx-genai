@@ -3,13 +3,14 @@
 use std::borrow::Cow;
 
 use onnx_runtime_ir::TensorLayout;
+use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::error::Result;
-use crate::tensor::{TensorMut, TensorView};
+use crate::tensor::{DevicePtrMut, TensorMut, TensorView};
 use crate::weight::WeightHandle;
 
 /// A cost estimate for running a kernel, consumed by the placement cost model
-/// (`docs/ORT2.md` §6). All time fields are in **microseconds**; a fuller model
+/// (`docs/architecture/ORT2.md` §6). All time fields are in **microseconds**; a fuller model
 /// (roofline, calibration) lands in `onnx-runtime-cost-model` (Phase 2).
 ///
 /// The struct is `#[non_exhaustive]`: the Phase-2 cost model may add fields
@@ -76,11 +77,44 @@ impl Cost {
     }
 }
 
+/// Structural memory-traffic estimate (bytes) for a node's inputs, honest about
+/// the real element type and sub-byte packing.
+///
+/// This is the *machine-independent* half of a kernel's cost (issue #995): a
+/// property of the shapes and dtypes, not of the host. It replaces the old
+/// `elems * 4` fabrication, which assumed every tensor was f32 and was wrong by
+/// 8× for the int4 weights that dominate decode. Each input's element count is
+/// multiplied by its own dtype's *storage* size via
+/// [`DataType::checked_storage_bytes`], so a packed int4 weight counts as
+/// `ceil(numel/2)` bytes, an f16 tensor as `2*numel`, and so on.
+///
+/// Symbolic (dynamic) dimensions are treated as extent 1 so the estimate stays
+/// finite and monotonic in the statically-known problem size; it is a lower
+/// bound when a dimension is unknown, never an invented larger number. Absent
+/// inputs (dtype/shape length mismatch) contribute nothing.
+pub fn structural_input_bytes(
+    shapes: &[onnx_runtime_ir::Shape],
+    input_dtypes: &[onnx_runtime_ir::DataType],
+) -> u64 {
+    shapes
+        .iter()
+        .zip(input_dtypes.iter())
+        .map(|(shape, &dtype)| {
+            let numel: usize = shape
+                .iter()
+                .map(|d| d.as_static().unwrap_or(1))
+                .product::<usize>();
+            dtype.checked_storage_bytes(numel).unwrap_or(usize::MAX) as u64
+        })
+        .fold(0_u64, u64::saturating_add)
+}
+
 /// Result of [`crate::ExecutionProvider::supports_op`].
 ///
 /// A decline reason travels with the decision that produced it. EPs must not
 /// maintain a separate reason table: colocating the reason with `Unsupported`
 /// keeps diagnostics from drifting away from the actual claim predicate.
+#[derive(Debug)]
 pub enum KernelMatch {
     Supported {
         cost: Cost,
@@ -152,6 +186,57 @@ impl CaptureSupport {
         match self {
             Self::Supported => None,
             Self::Unsupported { reason } => Some(reason),
+        }
+    }
+}
+
+/// A plugin host's *routing preference* for a node this EP could already run.
+///
+/// [`KernelMatch`] answers "can this EP produce a correct result for this node?".
+/// `ClaimPreference` answers a strictly different question: "**should** this EP
+/// take the node away from the host runtime's own kernel?" The two must stay
+/// separate. Folding a performance decline into `supports_op` would make the
+/// native session's build step treat a statically-shaped node as a hard
+/// `unsupported_op` error, so a slow-but-correct kernel must remain reachable
+/// for native execution even when the plugin declines to advertise it to ORT.
+///
+/// The preference is consulted **only** on the plugin capability path, before
+/// convex partitioning, so a deferred node is simply left out of the supported
+/// set and the host partitions around it.
+///
+/// Declining is a claim about *measured* behaviour on the current host, so a
+/// `DeferToHost` reason must say what was measured and where the boundary is —
+/// a bare "too slow" is not actionable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaimPreference {
+    /// Advertise the node to the host runtime as ours.
+    Claim,
+    /// Leave the node to the host runtime's own kernel.
+    DeferToHost {
+        /// What was measured, and the threshold that put this node on the
+        /// losing side of it.
+        reason: Cow<'static, str>,
+    },
+}
+
+impl ClaimPreference {
+    /// Construct a deferral with its measured justification.
+    pub fn defer(reason: impl Into<Cow<'static, str>>) -> Self {
+        Self::DeferToHost {
+            reason: reason.into(),
+        }
+    }
+
+    /// Whether the EP wants the node.
+    pub fn is_claim(&self) -> bool {
+        matches!(self, Self::Claim)
+    }
+
+    /// The deferral reason, or `None` when the EP wants the node.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Claim => None,
+            Self::DeferToHost { reason } => Some(reason),
         }
     }
 }
@@ -401,7 +486,7 @@ macro_rules! require {
 
 /// A zero-copy **view output**: a kernel's declaration that one of its outputs
 /// is a strided view aliasing one of its inputs' buffers, rather than freshly
-/// computed bytes (`docs/ORT2.md` §5.4, lazy PyTorch-style views).
+/// computed bytes (`docs/architecture/ORT2.md` §5.4, lazy PyTorch-style views).
 ///
 /// The `shape` / `strides` / `byte_offset` describe the output tensor relative
 /// to the **same base pointer** as the referenced input view (i.e. relative to
@@ -446,6 +531,70 @@ impl<'a> KernelInput<'a> {
     }
 }
 
+/// Concrete tensor facts available during prepare-only graph traversal.
+#[derive(Clone, Copy, Debug)]
+pub struct TensorMetadata<'a> {
+    pub dtype: onnx_runtime_ir::DataType,
+    pub shape: &'a [usize],
+    pub present: bool,
+}
+
+impl<'a> TensorMetadata<'a> {
+    pub const fn new(dtype: onnx_runtime_ir::DataType, shape: &'a [usize], present: bool) -> Self {
+        Self {
+            dtype,
+            shape,
+            present,
+        }
+    }
+}
+
+/// How long prepared kernel workspace remains live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceLifetime {
+    StepScoped,
+    SessionPersistent,
+}
+
+/// A kernel's exact owned-scratch request for one concrete input geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkspaceRequirement {
+    pub bytes: u64,
+    pub alignment: usize,
+    pub lifetime: WorkspaceLifetime,
+    pub role: MemoryRole,
+}
+
+impl WorkspaceRequirement {
+    pub const NONE: Self = Self {
+        bytes: 0,
+        alignment: 1,
+        lifetime: WorkspaceLifetime::StepScoped,
+        role: MemoryRole::Workspace { step_scoped: true },
+    };
+}
+
+/// Executor-owned prepared workspace handed to a kernel for one dispatch.
+#[derive(Clone, Copy, Debug)]
+pub struct WorkspaceView {
+    ptr: DevicePtrMut,
+    bytes: usize,
+}
+
+impl WorkspaceView {
+    pub const fn new(ptr: DevicePtrMut, bytes: usize) -> Self {
+        Self { ptr, bytes }
+    }
+
+    pub const fn ptr(self) -> DevicePtrMut {
+        self.ptr
+    }
+
+    pub const fn bytes(self) -> usize {
+        self.bytes
+    }
+}
+
 /// A kernel ready to execute a specific op with specific shapes (§4.2).
 pub trait Kernel: Send {
     /// Tell the kernel which positional inputs are immutable graph constants.
@@ -457,8 +606,42 @@ pub trait Kernel: Send {
         let _ = constant_inputs;
     }
 
+    /// Tell the kernel whether all of this node's outputs have fully-static
+    /// (sequence-independent) symbolic shapes, as derived from the graph's IR
+    /// metadata — **not** from runtime shape values.
+    ///
+    /// The session calls this exactly once, immediately after construction. A
+    /// kernel that gates CUDA-graph capture on sequence-independence (the
+    /// pointwise/elementwise/bitwise/prelu family) uses this to admit a
+    /// fully-static head-major decode shape (e.g. `[1,1,heads,dim]`) that the
+    /// runtime-extent heuristic cannot recognize, while a shape carrying a
+    /// symbolic (growing sequence) dimension stays eager. Deriving eligibility
+    /// from metadata is essential: `[heads=32, feat=128]` (capturable) is
+    /// indistinguishable from `[tokens=32, feat=128]` (unsafe) by extent alone.
+    /// Default: no-op.
+    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
+        let _ = seq_independent;
+    }
+
     /// Execute over device-resident inputs/outputs.
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()>;
+
+    /// Report exact owned scratch needed for these concrete inputs.
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        let _ = inputs;
+        Ok(WorkspaceRequirement::NONE)
+    }
+
+    /// Execute using workspace prepared before request admission.
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        let _ = workspace;
+        self.execute(inputs, outputs)
+    }
 
     /// Execute through the general weight-delivery seam.
     ///

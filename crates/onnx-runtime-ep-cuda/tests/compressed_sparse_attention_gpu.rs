@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU parity tests for `pkg.nxrt::CompressedSparseAttention` v1 (host-staged).
 //!
 //! Each case builds a single-node model with the `onnx-runtime-ir` graph API and
@@ -14,7 +28,7 @@
 //! decode step crosses a 128-position block boundary, exercising the stateful
 //! compression / FP8 quantized-cache write and carry reset during decode.
 //!
-//! Tests skip cleanly when no CUDA device is present.
+//! CPU-only CI reports these tests as ignored unless `gpu-tests` is enabled.
 
 use onnx_runtime_ep_api::{
     CaptureSupport, DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch,
@@ -106,7 +120,7 @@ impl HostTensor {
 static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A live CUDA EP plus the held [`GPU_SERIAL`] guard. Derefs to the EP so every
-/// existing `gpu()` call site is unchanged.
+/// existing `require_cuda()` call site is unchanged.
 struct GpuGuard {
     ep: CudaExecutionProvider,
     _serial: std::sync::MutexGuard<'static, ()>,
@@ -119,19 +133,21 @@ impl std::ops::Deref for GpuGuard {
     }
 }
 
-fn gpu() -> Option<GpuGuard> {
+fn require_cuda() -> GpuGuard {
     // Ignore poisoning: a panicking test still leaves the device usable, and we
     // must not cascade one failure into spurious lock failures elsewhere.
     let serial = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(GpuGuard {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => GpuGuard {
             ep,
             _serial: serial,
-        }),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+        },
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -819,9 +835,13 @@ fn run_step(ep: &CudaExecutionProvider, inputs: &[HostTensor], next_records: usi
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn ratio128_prefill_then_two_decodes_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
 
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(
@@ -856,9 +876,13 @@ fn ratio128_prefill_then_two_decodes_matches_cpu() {
     assert_eq!(after_decode2.cache.shape, vec![1, 1, STORED_WIDTH]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn ratio128_device_compression_crosses_two_blocks_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(
         &[DIM],
@@ -882,9 +906,13 @@ fn ratio128_device_compression_crosses_two_blocks_matches_cpu() {
     assert_eq!(after_decode.cache.shape, vec![1, 2, STORED_WIDTH]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn ratio128_fp8_decode_capture_replay_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(
         &[DIM],
@@ -1109,9 +1137,13 @@ fn run_step_f32(
     (as_f32(&gpu[0]), as_f32(&cpu[0]), state)
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn ratio128_f32_device_attention_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
 
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(
@@ -1147,9 +1179,13 @@ fn ratio128_f32_device_attention_matches_cpu() {
     assert_eq!(after_decode2.cache.shape, vec![1, 1, DIM]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn ratio128_f32_device_attention_sink_material_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
 
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(
@@ -1202,9 +1238,13 @@ fn ratio128_f32_device_attention_sink_material_matches_cpu() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn ratio4_prefill_claim_and_execute_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let inputs = ratio4_inputs();
     let (graph, node) = ratio4_node(&inputs);
     let (shapes, dtypes) = claim_metadata(&inputs);
@@ -1380,9 +1420,13 @@ fn ratio4_topk_output_specs(sequence: usize, records: usize, topk: usize) -> Vec
 /// full `sorted=True, largest=True` ordering and the `-1` causal padding are all
 /// exercised (not just the single-record prefill case). Compared against the
 /// INDEPENDENT CPU oracle, never the device against itself.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn ratio4_device_topk_selection_multi_record_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     const SEQ: usize = 16;
     let index_query = ratio4_values(SEQ * RATIO4_INDEX_HEADS * RATIO4_INDEX_DIM, 17, 0.0015);
     let index_weight = ratio4_values(SEQ * RATIO4_INDEX_HEADS, 19, 0.01);
@@ -1419,9 +1463,13 @@ fn ratio4_device_topk_selection_multi_record_matches_cpu() {
 /// comparator diverged from the oracle by a single ULP, the winning record would
 /// flip; asserting bit-identical `selected_indices` vs the independent oracle
 /// catches it.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn ratio4_device_topk_tie_break_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     const SEQ: usize = 12;
     // Near-constant, tiny index queries make every `dot` tiny and the per-record
     // scores cluster in the last mantissa bits — the worst case for tie order.
@@ -1456,9 +1504,13 @@ fn ratio4_sequence_slice(tensor: &HostTensor, first: usize, count: usize) -> Hos
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn ratio4_device_index_stream_matches_cpu_oracle_across_decode_boundary() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let full = ratio4_inputs();
     let mut prefill = full.clone();
     for index in [0usize, 1, 2, 3, 11, 12, 13, 14] {
@@ -1561,9 +1613,13 @@ fn ratio4_device_index_stream_matches_cpu_oracle_across_decode_boundary() {
 /// B5 exercises the complete ratio-4 device path through a prefill and two
 /// decodes. The bias is rank-4 so its candidate axis proves the device fused
 /// candidate ordering is `[dense window, selected slot 0]`, not record order.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn ratio4_device_fused_attention_prefill_then_two_decodes_with_bias_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     const PREFILL: usize = 12;
     let full = ratio4_inputs_prefill(
         PREFILL + 2,
@@ -1641,9 +1697,13 @@ fn ratio4_device_fused_attention_prefill_then_two_decodes_with_bias_matches_cpu(
 /// `Y` assertion fails; the ratio-keyed fix restores host-oracle fallback. Drives
 /// prefill→decode→decode and asserts every present output is bit-exact vs the
 /// independent CPU oracle.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn ratio4_five_output_fused_attention_falls_back_to_host_oracle_bit_exact() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     const PREFILL: usize = 12;
     let full = ratio4_inputs_prefill(
         PREFILL + 2,
@@ -1717,9 +1777,13 @@ fn ratio4_five_output_fused_attention_falls_back_to_host_oracle_bit_exact() {
     let second = run(decode(PREFILL, &first), (PREFILL + 1) / RATIO4);
     let _third = run(decode(PREFILL + 1, &second), (PREFILL + 2) / RATIO4);
 }
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn supports_op_rejects_unsupported_configs() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
 
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(&[DIM], &vec![0.8f32; DIM]);
@@ -1800,9 +1864,13 @@ fn supports_op_rejects_unsupported_configs() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn supports_op_rejects_non_query_fixed_input_dtype() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let inputs = ratio4_inputs();
     let (graph, node) = ratio4_node(&inputs);
     let (shapes, mut dtypes) = claim_metadata(&inputs);
@@ -1816,9 +1884,13 @@ fn supports_op_rejects_non_query_fixed_input_dtype() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn supports_op_rejects_ratio4_non_128_index_head_dim() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let inputs = ratio4_inputs();
     let (mut graph, node) = ratio4_node(&inputs);
     graph
@@ -1835,9 +1907,13 @@ fn supports_op_rejects_ratio4_non_128_index_head_dim() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn supports_op_rejects_ratio4_missing_index_inputs() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let inputs = ratio4_inputs();
     let (mut graph, node) = ratio4_node(&inputs);
     graph.node_mut(node).inputs.truncate(11);
@@ -1853,9 +1929,13 @@ fn supports_op_rejects_ratio4_missing_index_inputs() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn supports_op_rejects_ratio4_wrong_output_count() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let inputs = ratio4_inputs();
     let (mut graph, node) = ratio4_node(&inputs);
     graph.node_mut(node).outputs.truncate(4);
@@ -1869,9 +1949,13 @@ fn supports_op_rejects_ratio4_wrong_output_count() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn supports_op_rejects_ratio128_fp4_cache_format() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(&[DIM], &vec![0.8f32; DIM]);
     let sink = HostTensor::f32(&[1], &[-0.375]);
@@ -1895,9 +1979,13 @@ fn supports_op_rejects_ratio128_fp4_cache_format() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn supports_op_rejects_ratio128_ratio4_only_input() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(&[DIM], &vec![0.8f32; DIM]);
     let sink = HostTensor::f32(&[1], &[-0.375]);
@@ -1926,9 +2014,13 @@ fn supports_op_rejects_ratio128_ratio4_only_input() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn supports_op_validates_ratio128_attention_bias_at_input_19() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(&[DIM], &vec![0.8f32; DIM]);
     let sink = HostTensor::f32(&[1], &[-0.375]);
@@ -1983,9 +2075,13 @@ fn supports_op_validates_ratio128_attention_bias_at_input_19() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn supports_op_claims_omitted_ratio128_attention_bias() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(&[DIM], &vec![0.8f32; DIM]);
     let sink = HostTensor::f32(&[1], &[-0.375]);
@@ -2221,9 +2317,13 @@ fn run_gpu_capture_replay(
 /// non-tautological: it byte-compares two independent executions (an eager launch
 /// and a graph replay from zeroed buffers) and independently checks both against
 /// the CPU oracle. It also asserts the config advertises capture eligibility.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn ratio4_capture_replay_decode_is_byte_identical_to_eager_and_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     const PREFILL: usize = 12;
     let full = ratio4_inputs_prefill(
         PREFILL + 1,
@@ -2333,9 +2433,13 @@ fn download_device(ep: &CudaExecutionProvider, buffer: &DeviceBuffer, len: usize
 ///      CPU oracle (`max_ulp == 0` on `Y`, byte-exact on every present output and
 ///      `selected_indices`).
 /// The rollback counter on the shared metrics surface is asserted to advance.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn ratio4_speculative_rollback_restores_accepted_prefix_bit_exact() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     const PREFILL: usize = 12;
     // Two positions past the prefill: one to establish the accepted prefix
     // (decode at PREFILL), one to draft-then-reject (decode at PREFILL+1).
@@ -2518,9 +2622,13 @@ fn ratio4_speculative_rollback_restores_accepted_prefix_bit_exact() {
 /// completed record is logically discarded by restoring the checkpoint cursors,
 /// while the pre-record carry is restored byte-exact. The follow-up decode must
 /// match an accepted-only run and the independent CPU oracle bit-for-bit.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn ratio4_speculative_rollback_discards_completed_block_bit_exact() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     const PREFILL: usize = 12;
     const ACCEPTED: u64 = 13;
     let full = ratio4_inputs_prefill(
@@ -2731,9 +2839,13 @@ fn ratio4_speculative_rollback_discards_completed_block_bit_exact() {
 /// speculative draft, and a `restore_prefix`, the continuation's `Y` — and thus
 /// its argmax greedy token — must be bit-identical to a non-speculative decode
 /// and to the independent CPU oracle.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn ratio4_greedy_token_bit_identity_across_draft_verify_correct() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     const PREFILL: usize = 12;
     let full = ratio4_inputs_prefill(
         PREFILL + 2,
@@ -2852,9 +2964,13 @@ fn ratio4_greedy_token_bit_identity_across_draft_verify_correct() {
 /// B7 — the §8 observability metrics must be populated on the shared telemetry
 /// surface after a default (device-path) decode: attention mode Device, the five
 /// cursor lengths, device output bytes, and staging bytes avoided.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn ratio4_device_default_populates_observability_metrics() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     const PREFILL: usize = 12;
     let full = ratio4_inputs_prefill(
         PREFILL + 1,
@@ -2910,9 +3026,13 @@ fn ratio4_device_default_populates_observability_metrics() {
 /// CSA layer) are checkpointed and rolled back together; both must restore their
 /// bounded carry state byte-exact, demonstrating the engine can orchestrate a
 /// composite rollback over per-layer backend journals (D6).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn csa_composite_checkpoint_rolls_back_all_layers() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let committed_a = vec![0.25f32; 64];
     let committed_b = vec![-1.5f32; 96];
     let bytes_a: Vec<u8> = committed_a.iter().flat_map(|v| v.to_ne_bytes()).collect();

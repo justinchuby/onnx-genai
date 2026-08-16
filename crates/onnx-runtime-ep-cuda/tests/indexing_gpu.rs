@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! CUDA conformance tests for router/mask indexing and scan operators.
 
 use half::{bf16, f16};
@@ -395,6 +409,10 @@ fn bf16s(bytes: &[u8]) -> Vec<bf16> {
         .collect()
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn topk_non_final_axes_match_cpu_layout_and_are_deterministic() {
     let axis_zero = || {
@@ -446,6 +464,10 @@ fn topk_non_final_axes_match_cpu_layout_and_are_deterministic() {
     assert_eq!(out, middle_axis());
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn topk_largest_ties_k_input() {
     let out = run(
@@ -462,6 +484,10 @@ fn topk_largest_ties_k_input() {
     assert_eq!(i64s(&out[1]), vec![1, 2]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn topk_deepseek_router_k6_of_64_is_deterministic() {
     let values = (0..64)
@@ -484,6 +510,10 @@ fn topk_deepseek_router_k6_of_64_is_deterministic() {
     assert_eq!(i64s(&out[1]), vec![10, 21, 32, 43, 54, 9]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn topk_fp16_and_bf16_router_values_match_cpu_order() {
     let input = [4.0_f32, 7.0, 7.0, -2.0, 6.0];
@@ -539,6 +569,10 @@ fn topk_fp16_and_bf16_router_values_match_cpu_order() {
 /// 256-expert / top-8 `TopK` in fp16. Prove the CUDA kernel is byte-identical to
 /// the CPU EP oracle at that exact shape (large last-dim, k=8, many ties) and that
 /// the fp16 path handles a non-final axis identically to the proven f32 kernel.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn topk_fp16_router_scale_and_non_final_axis_match_cpu() {
     // 256-expert / top-8 router on the final axis (two token rows). The `% 37`
@@ -632,6 +666,10 @@ fn topk_fp16_router_scale_and_non_final_axis_match_cpu() {
 /// with `input 0 ('X') dtype Float16 unsupported; expected Float32`, forcing a
 /// whole-session CPU fallback. The EP must now CLAIM fp16 TopK (and still claim
 /// f32, so no dtype is regressed).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn cuda_ep_claims_fp16_topk_router_nodes() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
@@ -670,6 +708,10 @@ fn cuda_ep_claims_fp16_topk_router_nodes() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn warmed_moe_routing_ops_capture_without_allocations() {
     let router = (0..64)
@@ -712,6 +754,10 @@ fn warmed_moe_routing_ops_capture_without_allocations() {
     assert_eq!(replay, eager);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn topk_smallest_and_sorted_false_match_cpu_order() {
     let out = run(
@@ -731,6 +777,10 @@ fn topk_smallest_and_sorted_false_match_cpu_order() {
     assert_eq!(i64s(&out[1]), vec![1, 2, 4]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gather_elements_negative_axis_and_indices() {
     let out = run(
@@ -769,6 +819,10 @@ fn scatter(reduction: &str) -> Vec<f32> {
     f32s(&out[0])
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn scatter_elements_all_reductions_are_ordered_and_deterministic() {
     assert_eq!(scatter("none"), vec![4., 3., 30.]);
@@ -778,6 +832,10 @@ fn scatter_elements_all_reductions_are_ordered_and_deterministic() {
     assert_eq!(scatter("min"), vec![4., 2., 30.]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn scatter_elements_fp16_data_matches_cpu_oracle() {
     let data = [
@@ -822,6 +880,10 @@ fn scatter_elements_fp16_data_matches_cpu_oracle() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn scatter_elements_int32_indices_match_cpu_oracle() {
     for reduction in ["none", "add", "mul", "max", "min"] {
@@ -860,6 +922,10 @@ fn scatter_elements_int32_indices_match_cpu_oracle() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn scatter_elements_bf16_data_and_int32_indices_match_cpu_oracle() {
     let data = [
@@ -901,6 +967,10 @@ fn scatter_elements_bf16_data_and_int32_indices_match_cpu_oracle() {
     assert_eq!(gpu, cpu);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn scatter_elements_warmed_fp16_int32_path_is_capture_safe() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
@@ -1022,6 +1092,10 @@ fn scatter_elements_warmed_fp16_int32_path_is_capture_safe() {
     ep.deallocate(output).unwrap();
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn cumsum_exclusive_reverse_matrix_with_negative_axis() {
     let expected = [

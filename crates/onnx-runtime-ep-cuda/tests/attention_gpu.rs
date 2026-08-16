@@ -1,9 +1,23 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! On-GPU integration test for the Phase-2a SDPA/GQA attention kernel
-//! (`docs/ORT2.md` §13 + §15.5).
+//! (`docs/architecture/ORT2.md` §13 + §15.5).
 //!
-//! Gated on a real device: if no CUDA GPU is present (or the driver / cuBLASLt /
-//! NVRTC can't be loaded), the test prints `skip` and returns, so the crate
-//! still tests cleanly on non-GPU machines. On a GPU it runs several attention
+//! Gated on a real device: CPU-only CI reports these as ignored unless
+//! `gpu-tests` is enabled. Feature-enabled runs fail loudly if CUDA cannot run.
+//! On a GPU it runs several attention
 //! shapes — non-causal MHA, causal MHA, and grouped-query (GQA) with a causal
 //! mask, plus an additive-mask case — and checks the numerics against an
 //! independent CPU reference implementing naive softmax attention.
@@ -330,13 +344,19 @@ fn max_abs_err(a: &[f32], b: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn attention_f32_on_gpu_matches_cpu_reference() {
     let ep = match CudaExecutionProvider::new_default() {
         Ok(ep) => ep,
         Err(e) => {
             eprintln!("skip: no CUDA GPU available ({e})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
     let runtime = ep.runtime().clone();
@@ -370,7 +390,9 @@ fn attention_f32_on_gpu_matches_cpu_reference() {
             DataType::Float32,
         );
         if got.is_empty() {
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
         let want = cpu_reference(&q, &k, &v, b, h, h, s, s, d, scale, false, None);
         let err = max_abs_err(&got, &want);
@@ -404,7 +426,9 @@ fn attention_f32_on_gpu_matches_cpu_reference() {
             DataType::Float32,
         );
         if got.is_empty() {
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
         let want = cpu_reference(&q, &k, &v, b, h, h, s, s, d, scale, true, None);
         let err = max_abs_err(&got, &want);
@@ -438,7 +462,9 @@ fn attention_f32_on_gpu_matches_cpu_reference() {
             DataType::Float32,
         );
         if got.is_empty() {
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
         let want = cpu_reference(&q, &k, &v, b, hq, hkv, s, s, d, scale, true, None);
         let err = max_abs_err(&got, &want);
@@ -482,7 +508,9 @@ fn attention_f32_on_gpu_matches_cpu_reference() {
             DataType::Float32,
         );
         if got.is_empty() {
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
         let want = cpu_reference(&q, &k, &v, b, hq, hkv, sq, sk, d, scale, false, Some(&mask));
         let err = max_abs_err(&got, &want);
@@ -512,7 +540,9 @@ fn attention_half_matches_f32_reference(dtype: DataType, atol: f32, rtol: f32) {
         Ok(ep) => ep,
         Err(e) => {
             eprintln!("skip: no CUDA GPU available ({e})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
     let runtime = ep.runtime().clone();
@@ -540,12 +570,18 @@ fn attention_half_matches_f32_reference(dtype: DataType, atol: f32, rtol: f32) {
         dtype,
     );
     if got.is_empty() {
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     }
     let want = cpu_reference(&q, &k, &v, b, h, h, s, s, d, scale, true, None);
     assert_close(&got, &want, atol, rtol);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn attention_f16_on_gpu_matches_f32_reference() {
     // Two native-f16 GEMM stores plus the probability store can each contribute
@@ -553,6 +589,10 @@ fn attention_f16_on_gpu_matches_f32_reference() {
     attention_half_matches_f32_reference(DataType::Float16, 3e-3, 3e-3);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn attention_bf16_on_gpu_matches_f32_reference() {
     // bf16 has a 7-bit mantissa (8x fp16 epsilon), so its bound is correspondingly
@@ -560,13 +600,19 @@ fn attention_bf16_on_gpu_matches_f32_reference() {
     attention_half_matches_f32_reference(DataType::BFloat16, 2e-2, 2e-2);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fused_attention_matches_phase2a_baseline() {
     let ep = match CudaExecutionProvider::new_default() {
         Ok(ep) => ep,
         Err(e) => {
             eprintln!("skip: no CUDA GPU available ({e})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
     let runtime = ep.runtime().clone();
@@ -836,13 +882,19 @@ fn attention_prefill_h200_benchmark() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn attention_rejects_unsupported_dtype_and_rank() {
     let ep = match CudaExecutionProvider::new_default() {
         Ok(ep) => ep,
         Err(e) => {
             eprintln!("skip: no CUDA GPU available ({e})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
     let runtime = ep.runtime().clone();

@@ -1,10 +1,34 @@
 use super::*;
-use onnx_runtime_ep_api::ExecutionProviderCapabilities;
+use onnx_runtime_ep_api::{
+    ExecutionProviderCapabilities, ExternalMmapRegion, MmapRegionSource, WeightHandleError,
+};
 
 /// Per-input-slot result of the strided-input materialization gate: `Some` with
 /// the gathered contiguous bytes and their strides when a private temp was
 /// needed for that slot, `None` when the input was used in place.
 type MaterializedInputs = Vec<Option<(Vec<u8>, Vec<i64>)>>;
+
+struct WeightStoreRegionSource<'a>(&'a onnx_runtime_loader::weights::WeightStore);
+
+impl MmapRegionSource for WeightStoreRegionSource<'_> {
+    fn region_bytes(
+        &self,
+        region: &ExternalMmapRegion,
+    ) -> std::result::Result<&[u8], WeightHandleError> {
+        self.0
+            .mmap_region_bytes(region.mapping_id, region.offset, region.len)
+            .ok_or_else(|| {
+                WeightHandleError::InvalidResident(format!(
+                    "external mmap region id={} offset={} len={} is no longer available",
+                    region.mapping_id, region.offset, region.len
+                ))
+            })
+    }
+
+    fn full_mapping_bytes(&self, mapping_id: usize) -> Option<&[u8]> {
+        self.0.mmap_full_bytes(mapping_id)
+    }
+}
 
 impl Executor {
     /// Dispatch one plan node to its execution path (control-flow, sequence, or
@@ -116,6 +140,7 @@ impl Executor {
                 if elided.is_some_and(|set| set.contains(&pi)) {
                     continue;
                 }
+                self.prefetch_lazy_weights_after(pi)?;
                 let op_type = self.graph.node(self.plan[pi].node_id).op_type.clone();
                 let start = Instant::now();
                 let result =
@@ -132,7 +157,38 @@ impl Executor {
                 if elided.is_some_and(|set| set.contains(&pi)) {
                     continue;
                 }
+                self.prefetch_lazy_weights_after(pi)?;
                 self.exec_plan_node(pi, resolved, outer_scope, external, OpCaptureTrace::Eager)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn prefetch_lazy_weights_after(&self, pi: usize) -> Result<()> {
+        if self.prefetch_lookahead_nodes == 0 {
+            return Ok(());
+        }
+        let Some(lookahead) = pi.checked_add(self.prefetch_lookahead_nodes) else {
+            return Ok(());
+        };
+        let Some(next) = self.plan.get(lookahead) else {
+            return Ok(());
+        };
+        for vid in &next.lazy_weight_inputs {
+            if self.plan[pi].lazy_weight_inputs.contains(vid) {
+                continue;
+            }
+            if let Some(lazy) = self
+                .weight_handles
+                .get(vid)
+                .and_then(|handle| handle.as_lazy())
+                && self.ep.prefetch_lazy_weight(
+                    vid.0 as u64,
+                    lazy,
+                    &WeightStoreRegionSource(self.weights.as_ref()),
+                )?
+            {
+                self.prefetch_issue_nodes.lock().unwrap().insert(*vid, pi);
             }
         }
         Ok(())
@@ -340,6 +396,7 @@ impl Executor {
         // weights the EP can page are uploaded here and bound as normal device
         // views; ones it declines stay absent and are flagged `lazy_unresolved`.
         let in_infos = self.build_input_bindings(
+            pi,
             inputs,
             input_dtypes,
             input_shapes,
@@ -360,6 +417,7 @@ impl Executor {
         // resolved kernel reference borrows `cache` for the rest of the dispatch.
         let cache = &mut self.cache;
         let kernel_bindings = &mut self.kernel_bindings;
+        let capture_growing = &self.capture_growing_symbols;
         let mut ctx = KernelDispatchContext {
             ep: &ep,
             graph: &self.graph,
@@ -369,6 +427,12 @@ impl Executor {
             shared_buffers: &mut self.shared_buffers,
             views_meta: &mut self.views,
             pinned: &mut self.pinned,
+            persistent_workspace: &mut self.persistent_workspace,
+            step_workspace: &mut self.step_workspace,
+            inherited_workspace: self
+                .inherited_workspace
+                .map(|(ptr, bytes)| WorkspaceView::new(DevicePtrMut(ptr as *mut _), bytes)),
+            workspace_preparation_required: self.workspace_preparation_required,
         };
 
         // Build the (possibly strided) input views once; they feed both the
@@ -423,6 +487,7 @@ impl Executor {
                         input_dtypes,
                         &constant_inputs,
                         opset,
+                        node_capture_seq_independent(ctx.graph, node, capture_growing),
                         ep.as_ref(),
                     )?;
                     kernel_bindings[pi] = Some(key);
@@ -450,6 +515,7 @@ impl Executor {
                     input_dtypes,
                     &constant_inputs,
                     opset,
+                    node_capture_seq_independent(ctx.graph, node, capture_growing),
                     ep.as_ref(),
                 )?;
                 kernel_bindings[pi] = Some(key);
@@ -749,8 +815,10 @@ impl Executor {
     /// become absent placeholders. Runs while only shared borrows of `self` are
     /// live, so the returned owned vector can outlive the disjoint `&mut`
     /// borrows the compute path takes afterwards.
+    #[allow(clippy::too_many_arguments)]
     fn build_input_bindings(
         &self,
+        pi: usize,
         inputs: &[Option<ValueId>],
         input_dtypes: &[DataType],
         input_shapes: &[Vec<usize>],
@@ -841,9 +909,18 @@ impl Executor {
                 // the paged bytes and keep the page pinned for the kernel's
                 // lifetime via `paged`. On `None` (EP can't page) the input stays
                 // absent and is routed to the kernel as a lazy `KernelInput::Weight`.
-                let paged = self.ep.page_lazy_weight(vid.0 as u64, lazy)?;
+                let issued_at = self.prefetch_issue_nodes.lock().unwrap().remove(&vid);
+                let paged = self.ep.page_lazy_weight(
+                    vid.0 as u64,
+                    lazy,
+                    &WeightStoreRegionSource(self.weights.as_ref()),
+                )?;
                 match paged {
                     Some(paged) => {
+                        if let Some(issued_at) = issued_at {
+                            let nodes_between = pi.saturating_sub(issued_at);
+                            record_dense_prefetch_gap(nodes_between as u64);
+                        }
                         let shape = input_shapes[i].clone();
                         let strides = compute_contiguous_strides(&shape);
                         in_infos.push(InInfo {
@@ -1090,6 +1167,10 @@ struct KernelDispatchContext<'a> {
     shared_buffers: &'a mut HashMap<ValueId, Arc<SharedTensorBuffer>>,
     views_meta: &'a mut HashMap<ValueId, ValueView>,
     pinned: &'a mut HashSet<ValueId>,
+    persistent_workspace: &'a mut Option<PreparedWorkspace>,
+    step_workspace: &'a mut Option<PreparedWorkspace>,
+    inherited_workspace: Option<WorkspaceView>,
+    workspace_preparation_required: bool,
 }
 
 impl KernelDispatchContext<'_> {
@@ -1351,9 +1432,114 @@ impl KernelDispatchContext<'_> {
         });
         let execution = {
             let _s = phase_span!("exec_kernel.compute");
+            let metadata = views
+                .iter()
+                .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
+                .collect::<Vec<_>>();
+            let requirement = kernel.workspace_requirement(&metadata)?;
+            let prepared = match requirement.lifetime {
+                WorkspaceLifetime::SessionPersistent => &mut *self.persistent_workspace,
+                WorkspaceLifetime::StepScoped => &mut *self.step_workspace,
+            };
+            let workspace = if requirement.bytes == 0 {
+                None
+            } else if let Some(inherited) = self.inherited_workspace {
+                let required = usize::try_from(requirement.bytes).map_err(|_| {
+                    EpError::KernelFailed(format!(
+                        "kernel workspace requirement {} does not fit usize",
+                        requirement.bytes
+                    ))
+                })?;
+                if required > inherited.bytes() {
+                    Err(EpError::KernelFailed(format!(
+                        "node {} (op '{}::{}') workspace invariant mismatch: execute requires {} bytes, enclosing preparation supplied {} bytes",
+                        node.id.0,
+                        node.domain,
+                        node.op_type,
+                        required,
+                        inherited.bytes()
+                    )))?;
+                }
+                Some(inherited)
+            } else {
+                let required = usize::try_from(requirement.bytes).map_err(|_| {
+                    EpError::KernelFailed(format!(
+                        "kernel workspace requirement {} does not fit usize",
+                        requirement.bytes
+                    ))
+                })?;
+                let needs_replacement = prepared.as_ref().is_none_or(|workspace| {
+                    required > workspace.bytes || requirement.alignment > workspace.alignment
+                });
+                if needs_replacement && !self.workspace_preparation_required {
+                    // Sequential dispatch is the scratch hand-off boundary. An
+                    // EP may enqueue asynchronous device work, so synchronize
+                    // before retiring the old disposable workspace. Release it
+                    // before acquiring the replacement to avoid charging both.
+                    self.ep.sync()?;
+                    if let Some(old) = prepared.take() {
+                        self.ep.deallocate(old.buffer)?;
+                    }
+                    let target_mapped = self
+                        .ep
+                        .mapped_bytes_for_allocation(required, requirement.alignment)?;
+                    let mut grant = self
+                        .ep
+                        .prepare_mapped_growth(target_mapped, requirement.role)?;
+                    let lease = match self
+                        .ep
+                        .reserve_workspace(requirement.bytes, requirement.role)
+                    {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            drop(grant);
+                            return Err(error.into());
+                        }
+                    };
+                    let buffer = match grant.take() {
+                        Some(grant) => self.ep.allocate_with_mapped_growth(
+                            required,
+                            requirement.alignment,
+                            grant,
+                        )?,
+                        None => self.ep.allocate(required, requirement.alignment)?,
+                    };
+                    *prepared = Some(PreparedWorkspace {
+                        buffer,
+                        _lease: lease,
+                        bytes: required,
+                        alignment: requirement.alignment,
+                    });
+                }
+                let prepared = prepared.as_mut().ok_or_else(|| {
+                    EpError::KernelFailed(format!(
+                        "node {} (op '{}::{}') reached execution without prepared {:?} workspace",
+                        node.id.0, node.domain, node.op_type, requirement.lifetime
+                    ))
+                })?;
+                if required > prepared.bytes || requirement.alignment > prepared.alignment {
+                    Err(EpError::KernelFailed(format!(
+                        "node {} (op '{}::{}') workspace invariant mismatch: execute requires {} bytes aligned to {}, prepared {} bytes aligned to {}",
+                        node.id.0,
+                        node.domain,
+                        node.op_type,
+                        required,
+                        requirement.alignment,
+                        prepared.bytes,
+                        prepared.alignment
+                    )))?;
+                }
+                Some(WorkspaceView::new(
+                    DevicePtrMut(prepared.buffer.as_mut_ptr()),
+                    prepared.bytes,
+                ))
+            };
             match &kernel_inputs {
-                Some(inputs) => kernel.execute_with_inputs(inputs, outs),
-                None => kernel.execute(views, outs),
+                Some(inputs) if requirement.bytes == 0 => kernel.execute_with_inputs(inputs, outs),
+                Some(_) => Err(EpError::KernelFailed(
+                    "workspace-bearing lazy-input kernels are not supported".into(),
+                )),
+                None => kernel.execute_with_workspace(views, outs, workspace),
             }
         };
         execution.map_err(|error| {

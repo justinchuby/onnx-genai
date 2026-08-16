@@ -1,7 +1,22 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU numeric parity tests for cuBLASLt bias/activation GEMM epilogues.
 
 use onnx_runtime_ep_api::{
-    DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
+    DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMetadata, TensorMut, TensorView,
+    WorkspaceView,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
@@ -137,9 +152,21 @@ fn run_model(
         &out_strides,
         device,
     );
-    ep.get_kernel(node, &shapes, 1)
-        .unwrap()
-        .execute(&inputs, &mut [output])
+    let kernel = ep.get_kernel(node, &shapes, 1).unwrap();
+    let metadata = inputs
+        .iter()
+        .map(|input| TensorMetadata::new(input.dtype, input.shape, true))
+        .collect::<Vec<_>>();
+    let requirement = kernel.workspace_requirement(&metadata).unwrap();
+    let mut workspace = (requirement.bytes != 0).then(|| {
+        ep.allocate(requirement.bytes as usize, requirement.alignment)
+            .unwrap()
+    });
+    let workspace_view = workspace
+        .as_mut()
+        .map(|buffer| WorkspaceView::new(DevicePtrMut(buffer.as_mut_ptr()), buffer.len()));
+    kernel
+        .execute_with_workspace(&inputs, &mut [output], workspace_view)
         .unwrap();
     let mut bytes = vec![0; out_shape.iter().product::<usize>() * 4];
     // SAFETY: the destination exactly matches the output allocation.
@@ -150,6 +177,9 @@ fn run_model(
     }
     for buffer in buffers {
         ep.deallocate(buffer).unwrap();
+    }
+    if let Some(workspace) = workspace {
+        ep.deallocate(workspace).unwrap();
     }
     ep.deallocate(out_buffer).unwrap();
     bytes
@@ -210,25 +240,25 @@ fn assert_close(label: &str, got: &[f32], expected: &[f32], tolerance: f32) {
     assert!(error <= tolerance, "{label}: {got:?} vs {expected:?}");
 }
 
-fn cuda_ep() -> Option<CudaExecutionProvider> {
+fn require_cuda() -> CudaExecutionProvider {
     match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
-        Ok(Ok(ep)) => Some(ep),
-        Ok(Err(error)) => {
-            eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            None
-        }
-        Err(_) => {
-            eprintln!("skip: CUDA runtime library loading panicked");
-            None
-        }
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fused_matmul_bias_matches_matmul_then_bias() {
-    let Some(ep) = cuda_ep() else {
-        return;
-    };
+    let ep = require_cuda();
     let a = [0.5, -1.0, 2.0, 1.5, 0.25, -0.75];
     let b = [1.0, 0.5, -2.0, -1.0, 3.0, 0.25, 2.0, -0.5, 1.25];
     let bias = [0.25, -1.5, 2.0];
@@ -239,11 +269,13 @@ fn fused_matmul_bias_matches_matmul_then_bias() {
     assert_close("FusedMatMulBias", &got, &expected, 1e-5);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fused_gemm_relu_bias_matches_reference_with_transpose_and_alpha() {
-    let Some(ep) = cuda_ep() else {
-        return;
-    };
+    let ep = require_cuda();
     let a = [0.5, -1.0, 2.0, 1.5, -0.25, 0.75];
     let b = [
         1.0, -2.0, 0.5, -1.0, 0.25, 2.0, 0.75, -0.5, 1.5, -2.0, 1.0, 0.25,
@@ -265,11 +297,13 @@ fn fused_gemm_relu_bias_matches_reference_with_transpose_and_alpha() {
     assert_close("FusedGemm RELU_BIAS", &got, &expected, 1e-5);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fused_gemm_gelu_bias_matches_tanh_reference() {
-    let Some(ep) = cuda_ep() else {
-        return;
-    };
+    let ep = require_cuda();
     let a = [0.5, -1.0, 2.0, -0.75, 1.25, 0.25];
     let b = [1.0, -0.5, 0.25, -1.5, 0.75, 2.0];
     let bias = [-0.25, 0.5];
@@ -288,11 +322,13 @@ fn fused_gemm_gelu_bias_matches_tanh_reference() {
     assert_close("FusedGemm GELU_BIAS (tanh)", &got, &expected, 2e-6);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn placement_declines_broadcast_bias_and_batched_matmul() {
-    let Some(ep) = cuda_ep() else {
-        return;
-    };
+    let ep = require_cuda();
 
     for op_type in ["FusedMatMulBias", "FusedGemm"] {
         for (a_shape, b_shape, bias_shape, out_shape, expected) in [

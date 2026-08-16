@@ -185,9 +185,46 @@ pub enum MergePolicy {
 #[derive(Debug)]
 pub struct SymbolInterner {
     next: u32,
+    /// The floor `next` started at: every symbol id `>= initial_floor` was
+    /// minted by inference (an anonymous/derived/data-dependent symbol), while
+    /// ids below it are graph-declared roots (`batch`, `seq`, KV length, …).
+    /// Persisted so a consumer (the CUDA-graph capture classifier's fail-safe
+    /// mode) can tell a *provably-rooted* symbol from an inference-minted one.
+    initial_floor: u32,
     cache: HashMap<DimExpr, SymbolId>,
     /// Symbols minted during inference, to be registered on the graph.
     fresh: Vec<SymbolId>,
+    /// Every `(loser, winner)` symbol pair that [`broadcast_dim`] unified when
+    /// broadcasting two *distinct* symbolic dimensions onto one representative.
+    /// This is additive bookkeeping: recording a pair never changes the returned
+    /// representative or any inferred dim, so inference output stays byte-
+    /// identical. Persisted onto [`Graph::symbol_unifications`] so downstream
+    /// consumers (e.g. capture-eligibility) can close over the equivalence
+    /// classes without re-implementing a partial copy of inference's unification.
+    ///
+    /// [`broadcast_dim`]: InferenceContext::broadcast_dim
+    /// [`Graph::symbol_unifications`]: onnx_runtime_ir::Graph::symbol_unifications
+    unifications: Vec<(SymbolId, SymbolId)>,
+    /// Every `(derived, source)` provenance edge recorded when [`lower`] interns
+    /// a non-bare *derived* [`DimExpr`] (e.g. `seq_kv * 8` from `Reshape`/
+    /// `Flatten`) to a fresh [`SymbolId`]: the fresh `derived` symbol depends on
+    /// each `source` symbol the expression was built from. This is the general
+    /// lineage record that closes the derived-symbol capture hole (a fresh
+    /// symbol built from a growing one must itself be treated as growing). Like
+    /// [`unifications`](Self::unifications) it is purely additive — `lower`
+    /// returns the same `Dim` regardless — so inference stays byte-identical.
+    /// Persisted onto [`Graph::symbol_derivations`].
+    ///
+    /// [`lower`]: Self::lower
+    /// [`Graph::symbol_derivations`]: onnx_runtime_ir::Graph::symbol_derivations
+    derivations: Vec<(SymbolId, SymbolId)>,
+    /// Symbols minted for an *unknowable* extent from which no source symbol
+    /// could be recovered — an arithmetic-overflow degrade or a nonsensical
+    /// negative extent (see [`lower`](Self::lower)). Such a symbol has no
+    /// provenance, so a conservative consumer must treat it as disqualifying
+    /// (eager) rather than assume it is constant. Persisted onto
+    /// [`Graph::symbol_opaque`](onnx_runtime_ir::Graph::symbol_opaque).
+    opaque: Vec<SymbolId>,
 }
 
 impl SymbolInterner {
@@ -196,9 +233,57 @@ impl SymbolInterner {
     pub fn new(next: u32) -> Self {
         Self {
             next,
+            initial_floor: next,
             cache: HashMap::new(),
             fresh: Vec::new(),
+            unifications: Vec::new(),
+            derivations: Vec::new(),
+            opaque: Vec::new(),
         }
+    }
+
+    /// The floor id at/above which every symbol was minted by this inference
+    /// pass (see [`initial_floor`](Self::initial_floor)).
+    pub fn initial_floor(&self) -> u32 {
+        self.initial_floor
+    }
+
+    /// Record that inference unified two distinct symbolic dimensions onto a
+    /// single representative (the `(loser, winner)` substitution in
+    /// [`broadcast_dim`](InferenceContext::broadcast_dim)). Order is irrelevant
+    /// to consumers (they build an undirected equivalence relation); this is a
+    /// pure append and does not influence the inferred shape.
+    fn record_unification(&mut self, a: SymbolId, b: SymbolId) {
+        self.unifications.push((a, b));
+    }
+
+    /// Record that the fresh symbol `derived` was interned from an expression
+    /// built out of `source` (a directed provenance edge `derived -> source`).
+    /// Pure append; never influences the inferred shape.
+    fn record_derivation(&mut self, derived: SymbolId, source: SymbolId) {
+        self.derivations.push((derived, source));
+    }
+
+    /// Record that `sym` was minted for a genuinely unknowable extent (overflow
+    /// or negative degrade) with no recoverable source symbols.
+    fn record_opaque(&mut self, sym: SymbolId) {
+        self.opaque.push(sym);
+    }
+
+    /// The symbol pairs unified during inference (to persist on the graph).
+    pub fn unifications(&self) -> &[(SymbolId, SymbolId)] {
+        &self.unifications
+    }
+
+    /// The `(derived, source)` provenance edges recorded during inference (to
+    /// persist on the graph).
+    pub fn derivations(&self) -> &[(SymbolId, SymbolId)] {
+        &self.derivations
+    }
+
+    /// The opaque (unknowable-extent) symbols minted during inference.
+    pub fn opaque(&self) -> &[SymbolId] {
+        &self.opaque
     }
 
     /// Mint a brand-new opaque symbol (not tied to any expression).
@@ -219,28 +304,62 @@ impl SymbolInterner {
 
     /// Lower a [`DimExpr`] to an IR [`Dim`], interning derived expressions to a
     /// stable fresh symbol.
+    ///
+    /// Whenever a *derived* (non-bare, non-const) expression is interned to a
+    /// fresh symbol, its symbol lineage is recorded (see
+    /// [`derivations`](Self::derivations)): the fresh symbol depends on every
+    /// constituent symbol of the expression. This is what lets a downstream
+    /// consumer close a growing/pinned set transitively across `Reshape`/
+    /// `Flatten`-style derived dims. Recording is purely additive: the returned
+    /// `Dim` is identical with or without it, so inference stays byte-identical.
     pub fn lower(&mut self, expr: &DimExpr) -> Dim {
         // An overflowed (unknown) expression has no representable value and must
         // not alias other overflows via the cache: mint a distinct fresh symbol.
+        // The overflow sentinel has dropped its terms, so no source symbols are
+        // recoverable — mark the minted symbol OPAQUE so a conservative consumer
+        // treats it as disqualifying (never assumes it is constant/pinned).
         if expr.is_overflow() {
-            return Dim::Symbolic(self.fresh_symbol());
+            let id = self.fresh_symbol();
+            self.record_opaque(id);
+            return Dim::Symbolic(id);
         }
         if let Some(n) = expr.as_const() {
             if n >= 0 {
                 return Dim::Static(n as usize);
             }
-            // A negative extent is nonsensical; degrade to a fresh symbol.
-            return Dim::Symbolic(self.fresh_symbol());
+            // A negative extent is nonsensical; degrade to a fresh symbol and
+            // mark it opaque (a pure constant carries no symbol lineage, but the
+            // degrade is unknowable, so err toward disqualifying).
+            let id = self.fresh_symbol();
+            self.record_opaque(id);
+            return Dim::Symbolic(id);
         }
         if let Some(s) = expr.as_symbol() {
             return Dim::Symbolic(s);
         }
         if let Some(&id) = self.cache.get(expr) {
+            // Provenance was already recorded when `expr` was first interned in
+            // this pass (the interner is fresh per inference run, so a cache hit
+            // implies a prior insert this run); re-record for robustness. Consumers
+            // dedup, and `infer_graph_scoped` dedups before persisting.
+            self.record_expr_derivation(id, expr);
             return Dim::Symbolic(id);
         }
         let id = self.fresh_symbol();
         self.cache.insert(expr.clone(), id);
+        self.record_expr_derivation(id, expr);
         Dim::Symbolic(id)
+    }
+
+    /// Record a provenance edge from the freshly-minted `derived` symbol to each
+    /// distinct symbol appearing in `expr`.
+    fn record_expr_derivation(&mut self, derived: SymbolId, expr: &DimExpr) {
+        let mut seen = std::collections::HashSet::new();
+        for source in expr.symbol_ids() {
+            if source != derived && seen.insert(source) {
+                self.record_derivation(derived, source);
+            }
+        }
     }
 
     /// The symbols minted during inference (to register on the graph).
@@ -478,7 +597,17 @@ impl<'a> InferenceContext<'a> {
             // (not a bare symbol) has no id to compare, so it stays a fresh
             // opaque symbol — the honest "unknown".
             (None, None) => match (a.as_symbol(), b.as_symbol()) {
-                (Some(sa), Some(sb)) => Ok(if sa.0 <= sb.0 { a.clone() } else { b.clone() }),
+                (Some(sa), Some(sb)) => {
+                    // Record the equivalence before returning. This is the SINGLE
+                    // chokepoint every broadcasting handler funnels through
+                    // (elementwise `broadcast`, `MatMul` batch dims, `Einsum`
+                    // ellipsis, `Concat` non-concat axes, `Expand`), so recording
+                    // here captures every symbol substitution inference performs —
+                    // complete by construction, with no per-op enumeration. It is
+                    // additive: the returned representative is unchanged.
+                    self.interner.record_unification(sa, sb);
+                    Ok(if sa.0 <= sb.0 { a.clone() } else { b.clone() })
+                }
                 _ => Ok(self.fresh_dim()),
             },
         }

@@ -78,13 +78,16 @@ pub(crate) struct PagedMirror<'a> {
     pub(crate) windowed: bool,
 }
 
-pub(crate) struct PipelineDecodeLoopBackend<'a> {
+pub(crate) struct PipelineDecodeLoopBackend<'a, 'admission> {
     /// The decoder driven each step, owning its KV state behind a stateful,
     /// backend-neutral seam. Boxed behind [`PipelineDecoderComponent`] so the
     /// same loop drives the ORT decoder (via [`OrtPipelineDecoder`]) or, in a
     /// follow-up, a native decoder keeping KV device-resident — one code path,
     /// no forked native copy (mirrors the Inc1 every_step seam, but stateful).
     pub(crate) decoder: Box<dyn PipelineDecoderComponent + 'a>,
+    /// One-shot admission notification fired only after the first decoder step's
+    /// exact routed inputs have successfully prepared governed workspace.
+    pub(crate) admission: Option<&'admission mut dyn FnMut()>,
     /// Shared tensor pool: external inputs + prompt-phase outputs + the
     /// per-step outputs of the `every_step` components (refreshed each step).
     pub(crate) pool: &'a mut PipelineTensors,
@@ -122,7 +125,7 @@ pub(crate) struct PipelineDecodeLoopBackend<'a> {
     pub(crate) kv_len: usize,
 }
 
-impl PipelineDecodeLoopBackend<'_> {
+impl PipelineDecodeLoopBackend<'_, '_> {
     /// Run every declared `every_step` component over `seed` (the full prompt on
     /// prefill, the single running token on decode), publishing all of their
     /// outputs into the shared pool. Topological order ensures a component sees
@@ -200,7 +203,7 @@ impl PipelineDecodeLoopBackend<'_> {
     }
 }
 
-impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
+impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_, '_> {
     fn context_len(&self) -> usize {
         self.context_tokens.len()
     }
@@ -235,6 +238,11 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
         // into the decoder for this step.
         self.run_step_components(&input_tokens)?;
         let extras = self.decoder_extras()?;
+        self.decoder
+            .prepare_step(&input_tokens, past_len, &extras)?;
+        if let Some(admitted) = self.admission.take() {
+            admitted();
+        }
         // Advance the decoder one step; it retains this step's outputs internally
         // so the loop never handles a concrete tensor type (see
         // `PipelineDecoderComponent`).

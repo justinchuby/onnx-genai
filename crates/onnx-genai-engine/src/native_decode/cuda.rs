@@ -1,5 +1,32 @@
 use super::*;
 
+use super::kv_commit::{self, KvBindingGeometry, KvCommitLayout};
+
+/// Resolve the physical KV-cache layout for the native CUDA binding layer.
+///
+/// The authoritative source is the model's [`ModelIoSpec::kv_layout`] descriptor
+/// (a seq-major descriptor selects [`KvCommitLayout::SeqMajor`]). Absent metadata
+/// means head-major, preserving the historical behavior exactly. The
+/// `ONNX_GENAI_CUDA_KV_LAYOUT` environment variable (`seq_major` / `bsnh` vs
+/// `head_major` / `bnsh`) overrides the descriptor for residency diagnostics; it
+/// never changes which kernels run, only how the binding layer accounts for and
+/// commits residency.
+pub(crate) fn resolve_cuda_kv_layout(
+    metadata: Option<&onnx_genai_metadata::KvCacheLayout>,
+) -> KvCommitLayout {
+    if let Ok(value) = std::env::var("ONNX_GENAI_CUDA_KV_LAYOUT") {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "seq_major" | "seq-major" | "bsnh" => return KvCommitLayout::SeqMajor,
+            "head_major" | "head-major" | "bnsh" => return KvCommitLayout::HeadMajor,
+            _ => {}
+        }
+    }
+    match metadata.and_then(|layout| layout.gqa_attribute_value()) {
+        Some(1) => KvCommitLayout::SeqMajor,
+        _ => KvCommitLayout::HeadMajor,
+    }
+}
+
 /// Purely structural signals that gate whether whole-step CUDA graph capture is
 /// *auto-attempted* on the native decode path. Never derived from a model or
 /// architecture name (RULES.md §2/§2.1) — only from device placement and the
@@ -18,8 +45,52 @@ pub(crate) struct GraphCaptureStructuralSafety {
 
 impl GraphCaptureStructuralSafety {
     /// True when structural conditions make whole-step capture safe to attempt.
+    #[cfg(test)]
     pub(crate) fn is_capture_safe(self) -> bool {
         self.device_is_cuda && self.kv_ownership == KvOwnership::Owned
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GraphCaptureDecision {
+    enabled: bool,
+    decline_reason: Option<String>,
+}
+
+impl GraphCaptureDecision {
+    fn enabled() -> Self {
+        Self {
+            enabled: true,
+            decline_reason: None,
+        }
+    }
+
+    fn declined(predicate: &str, detail: impl std::fmt::Display) -> Self {
+        Self {
+            enabled: false,
+            decline_reason: Some(format!(
+                "predicate `{predicate}` declined capture: {detail}"
+            )),
+        }
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decline_reason(&self) -> Option<&str> {
+        self.decline_reason.as_deref()
+    }
+
+    fn decline_if_enabled(&mut self, predicate: &str, detail: impl std::fmt::Display) {
+        if self.enabled {
+            *self = Self::declined(predicate, detail);
+        }
+    }
+
+    fn into_decline_reason(self) -> Option<String> {
+        self.decline_reason
     }
 }
 
@@ -28,51 +99,412 @@ impl GraphCaptureStructuralSafety {
 /// auto-decision.
 ///
 /// Precedence:
-/// 0. Live weight offload (`ONNX_GENAI_WEIGHT_OFFLOAD=1`) always wins and forces
-///    capture OFF. The pager's alloc/copy/free ops are capture-illegal, so the
-///    two features are mutually exclusive; offload wins and capture is skipped
-///    with a one-time notice.
+/// 0. Live weight offload (`ONNX_GENAI_WEIGHT_OFFLOAD=1`) forces capture OFF
+///    **only when its paging path is not stable-VA**. The legacy pager's
+///    alloc/copy/free ops return a different device pointer per page-in, and a
+///    captured graph bakes pointers into its recorded nodes, so the two are
+///    mutually exclusive on that path (the decision records the named predicate).
+///    When offload runs on the stable virtual-address VMM path (issue #716),
+///    every retained weight keeps a reserved-once device VA whose physical
+///    granules are remapped underneath, which is capture-safe, so this no longer
+///    forces capture OFF and the normal precedence below applies.
 /// 1. Programmatic `NativeDecodeCudaOptions::graph_capture` (`Some`) wins next.
 /// 2. An explicitly-set `ONNX_GENAI_CUDA_GRAPH` env var (`=0` forces OFF, `=1`
 ///    forces ON) is honored next.
 /// 3. When neither is set, auto-decide from `structural` safety: attempt capture
 ///    only when the decode topology is structurally graph-safe.
+pub(crate) fn resolve_graph_capture_decision(
+    programmatic: Option<bool>,
+    env_explicit: bool,
+    env_value: bool,
+    structural: GraphCaptureStructuralSafety,
+    weight_offload_enabled: bool,
+    weight_offload_stable_va: Option<bool>,
+) -> GraphCaptureDecision {
+    // `weight_offload_stable_va` is three-state on purpose: `Some(true)` proved
+    // stable (capture-safe), `Some(false)` proved unstable by the effective
+    // offload policy, and `None` means no policy was supplied so the caller took
+    // the conservative default. The first two are runtime facts; the third is a
+    // harness/plumbing gap that must not masquerade as a runtime fact — print the
+    // predicate inputs and their source so a declined capture is diagnosable.
+    let stable_va_safe = weight_offload_stable_va == Some(true);
+    if weight_offload_enabled && !stable_va_safe {
+        let source = match weight_offload_stable_va {
+            Some(false) => "effective offload policy: pointer-unstable paging path",
+            None => "caller default, cuda_offload_policy not supplied (unwrap_or false)",
+            Some(true) => unreachable!("stable_va_safe would be true"),
+        };
+        return GraphCaptureDecision::declined(
+            "weight_offload_enabled && !weight_offload_stable_va",
+            format_args!(
+                "weight_offload_enabled={weight_offload_enabled} \
+                 weight_offload_stable_va={stable_va_safe} (source: {source})"
+            ),
+        );
+    }
+    if let Some(explicit) = programmatic {
+        return if explicit {
+            GraphCaptureDecision::enabled()
+        } else {
+            GraphCaptureDecision::declined(
+                "NativeDecodeCudaOptions::graph_capture",
+                "the programmatic override is Some(false)",
+            )
+        };
+    }
+    if env_explicit {
+        return if env_value {
+            GraphCaptureDecision::enabled()
+        } else {
+            GraphCaptureDecision::declined(
+                "ONNX_GENAI_CUDA_GRAPH",
+                "the process-wide runtime configuration captured an explicit value of 0 on first use",
+            )
+        };
+    }
+    if !structural.device_is_cuda {
+        return GraphCaptureDecision::declined(
+            "GraphCaptureStructuralSafety::device_is_cuda",
+            "the decode device is not CUDA",
+        );
+    }
+    if structural.kv_ownership != KvOwnership::Owned {
+        return GraphCaptureDecision::declined(
+            "GraphCaptureStructuralSafety::kv_ownership",
+            format_args!(
+                "KV ownership is {:?}, but capture requires Owned",
+                structural.kv_ownership
+            ),
+        );
+    }
+    GraphCaptureDecision::enabled()
+}
+
+#[cfg(test)]
 pub(crate) fn resolve_graph_capture_enabled(
     programmatic: Option<bool>,
     env_explicit: bool,
     env_value: bool,
     structural: GraphCaptureStructuralSafety,
     weight_offload_enabled: bool,
+    weight_offload_stable_va: Option<bool>,
 ) -> bool {
-    if weight_offload_enabled {
-        log_weight_offload_capture_exclusion();
-        return false;
-    }
-    if let Some(explicit) = programmatic {
-        return explicit;
-    }
-    if env_explicit {
-        return env_value;
-    }
-    structural.is_capture_safe()
+    resolve_graph_capture_decision(
+        programmatic,
+        env_explicit,
+        env_value,
+        structural,
+        weight_offload_enabled,
+        weight_offload_stable_va,
+    )
+    .is_enabled()
 }
 
-/// Emit the offload/capture mutual-exclusion notice at most once per process, so
-/// operators who enable both learn capture was declined without log spam.
-fn log_weight_offload_capture_exclusion() {
-    static NOTICE: std::sync::Once = std::sync::Once::new();
-    NOTICE.call_once(|| {
-        tracing::warn!("weight offload is incompatible with CUDA graph capture; capture disabled");
-    });
+fn cuda_step_profile_enabled() -> bool {
+    std::env::var_os("ONNX_GENAI_PROFILE_CUDA_DECODE_STEPS").is_some_and(|value| {
+        let value = value.to_string_lossy();
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Upper bound on the device-token-loop chain depth `k`, matching the scratch
+/// token-log capacity. A small `k` keeps the host stop/EOS checks cheap (at most
+/// `k - 1` speculatively-run replays are discarded when generation stops
+/// mid-chain) while still amortizing the host token round-trip across the chain.
+pub(crate) const DEVICE_TOKEN_LOOP_MAX_K: usize = 16;
+/// Default chain depth when `ONNX_GENAI_DEVICE_TOKEN_LOOP` is set to an enabling
+/// value without an explicit count (e.g. `1`/`true`/`on`).
+const DEVICE_TOKEN_LOOP_DEFAULT_K: usize = 4;
+
+/// Parse the requested device-token-loop chain depth from
+/// `ONNX_GENAI_DEVICE_TOKEN_LOOP`. `0`/unset/`false`/`off` disable it; a bare
+/// enabling value (`1`/`true`/`yes`/`on`) selects [`DEVICE_TOKEN_LOOP_DEFAULT_K`];
+/// an explicit integer `>= 2` selects that depth, clamped to
+/// [`DEVICE_TOKEN_LOOP_MAX_K`].
+fn device_token_loop_k_from_env() -> usize {
+    let Some(value) = std::env::var_os("ONNX_GENAI_DEVICE_TOKEN_LOOP") else {
+        return 0;
+    };
+    let value = value.to_string_lossy();
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "0" | "false" | "no" | "off" => 0,
+        "1" | "true" | "yes" | "on" => DEVICE_TOKEN_LOOP_DEFAULT_K,
+        other => match other.parse::<usize>() {
+            Ok(0) => 0,
+            Ok(1) => DEVICE_TOKEN_LOOP_DEFAULT_K,
+            Ok(k) => k.min(DEVICE_TOKEN_LOOP_MAX_K),
+            Err(_) => 0,
+        },
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StepOffloadSnapshot {
+    materialize_ns: u64,
+    htod_ns: u64,
+    admit_sync_ns: u64,
+    page_ins: u64,
+    staging_fill_bytes: u64,
+    staging_fill_regions: u64,
+    staging_fill_calls: u64,
+    materialize_fallback_calls: u64,
+    htod_bytes: u64,
+    vram_alloc_ns: u64,
+    vram_free_ns: u64,
+}
+
+impl StepOffloadSnapshot {
+    fn read() -> Self {
+        #[cfg(feature = "cuda")]
+        {
+            let stats = onnx_runtime_ep_cuda::global_offload_stats();
+            Self {
+                materialize_ns: stats.materialize_ns,
+                htod_ns: stats.htod_ns,
+                admit_sync_ns: stats.admit_sync_ns,
+                page_ins: stats.page_ins,
+                staging_fill_bytes: stats.staging_fill_bytes,
+                staging_fill_regions: stats.staging_fill_regions,
+                staging_fill_calls: stats.staging_fill_calls,
+                materialize_fallback_calls: stats.materialize_fallback_calls,
+                htod_bytes: stats.htod_bytes,
+                vram_alloc_ns: stats.vram_alloc_ns,
+                vram_free_ns: stats.vram_free_ns,
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Self::default()
+        }
+    }
+
+    fn delta(self, before: Self) -> Self {
+        Self {
+            materialize_ns: self.materialize_ns.saturating_sub(before.materialize_ns),
+            htod_ns: self.htod_ns.saturating_sub(before.htod_ns),
+            admit_sync_ns: self.admit_sync_ns.saturating_sub(before.admit_sync_ns),
+            page_ins: self.page_ins.saturating_sub(before.page_ins),
+            staging_fill_bytes: self
+                .staging_fill_bytes
+                .saturating_sub(before.staging_fill_bytes),
+            staging_fill_regions: self
+                .staging_fill_regions
+                .saturating_sub(before.staging_fill_regions),
+            staging_fill_calls: self
+                .staging_fill_calls
+                .saturating_sub(before.staging_fill_calls),
+            materialize_fallback_calls: self
+                .materialize_fallback_calls
+                .saturating_sub(before.materialize_fallback_calls),
+            htod_bytes: self.htod_bytes.saturating_sub(before.htod_bytes),
+            vram_alloc_ns: self.vram_alloc_ns.saturating_sub(before.vram_alloc_ns),
+            vram_free_ns: self.vram_free_ns.saturating_sub(before.vram_free_ns),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CudaStepWallBreakdown {
+    run_ms: f64,
+    logits_read_ms: f64,
+    capture_check_ms: f64,
+    finite_check_ms: f64,
+}
+
+struct CudaStepProfile {
+    past_len: usize,
+    total_len: usize,
+    before: StepOffloadSnapshot,
+    start: std::time::Instant,
+}
+
+impl CudaStepProfile {
+    fn begin(past_len: usize, total_len: usize) -> Option<Self> {
+        if !cuda_step_profile_enabled() {
+            return None;
+        }
+        onnx_runtime_session::enable_exec_phase_profile_for_process();
+        onnx_runtime_session::reset_exec_phase_profile();
+        Some(Self {
+            past_len,
+            total_len,
+            before: StepOffloadSnapshot::read(),
+            start: std::time::Instant::now(),
+        })
+    }
+
+    fn finish(self, path: &'static str, wall: CudaStepWallBreakdown) {
+        let total_ms = self.start.elapsed().as_secs_f64() * 1_000.0;
+        let delta = StepOffloadSnapshot::read().delta(self.before);
+        let staging_ms = ns_to_ms(delta.materialize_ns);
+        let h2d_ms = ns_to_ms(delta.htod_ns);
+        let admit_sync_ms = ns_to_ms(delta.admit_sync_ns);
+        let vram_alloc_ms = ns_to_ms(delta.vram_alloc_ns);
+        let vram_free_ms = ns_to_ms(delta.vram_free_ns);
+        let phase_stats = onnx_runtime_session::exec_phase_stats();
+        let phase_ms = |phase: &str| -> f64 {
+            phase_stats
+                .iter()
+                .find_map(|(name, total_ns, _)| (*name == phase).then_some(*total_ns))
+                .map(|ns| ns as f64 / 1_000_000.0)
+                .unwrap_or(0.0)
+        };
+        let kernel_host_ms = phase_ms("exec_kernel.compute");
+        let build_inputs_ms = phase_ms("exec_kernel.build_inputs");
+        let build_inputs_attributed_ms =
+            staging_ms + h2d_ms + admit_sync_ms + vram_alloc_ms + vram_free_ms;
+        let build_inputs_unattributed_ms = (build_inputs_ms - build_inputs_attributed_ms).max(0.0);
+        let executor_other_ms = wall.run_ms - build_inputs_ms - kernel_host_ms;
+        let run_unattributed_ms = build_inputs_unattributed_ms + executor_other_ms;
+        let residual_ms = total_ms
+            - staging_ms
+            - h2d_ms
+            - admit_sync_ms
+            - vram_alloc_ms
+            - vram_free_ms
+            - kernel_host_ms
+            - build_inputs_unattributed_ms
+            - executor_other_ms
+            - wall.logits_read_ms
+            - wall.capture_check_ms
+            - wall.finite_check_ms;
+        static HEADER: std::sync::Once = std::sync::Once::new();
+        HEADER.call_once(|| {
+            eprintln!(
+                "[onnx-genai-cuda-step] path,past_len,total_len,total_ms,staging_fill_ms,h2d_copy_ms,kernel_host_dispatch_ms,admit_sync_ms,vram_alloc_ms,vram_free_ms,build_inputs_unattributed_ms,executor_other_ms,run_unattributed_ms,logits_read_sync_ms,capture_check_ms,finite_check_ms,residual_ms,page_ins,staging_fill_bytes,staging_fill_regions,staging_fill_calls,materialize_fallback_calls,h2d_bytes"
+            );
+        });
+        eprintln!(
+            "[onnx-genai-cuda-step] {path},{},{},{total_ms:.3},{staging_ms:.3},{h2d_ms:.3},{kernel_host_ms:.3},{admit_sync_ms:.3},{vram_alloc_ms:.3},{vram_free_ms:.3},{build_inputs_unattributed_ms:.3},{executor_other_ms:.3},{run_unattributed_ms:.3},{:.3},{:.3},{:.3},{residual_ms:.3},{},{},{},{},{},{}",
+            self.past_len,
+            self.total_len,
+            wall.logits_read_ms,
+            wall.capture_check_ms,
+            wall.finite_check_ms,
+            delta.page_ins,
+            delta.staging_fill_bytes,
+            delta.staging_fill_regions,
+            delta.staging_fill_calls,
+            delta.materialize_fallback_calls,
+            delta.htod_bytes
+        );
+    }
+}
+
+fn ns_to_ms(ns: u64) -> f64 {
+    ns as f64 / 1_000_000.0
+}
+
+/// Result of one [`NativeDecodeSession::leverb_phase0_capture_attempt`] call —
+/// a THROWAWAY Lever-B Phase-0 probe (leverb-phase0), not part of any shipping
+/// contract.
+#[cfg(all(test, feature = "cuda"))]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LeverBPhase0CaptureAttempt {
+    /// Query rows in the attempted forward (`k_max` for M=K, `1` for M=1).
+    pub rows: usize,
+    /// Committed past length the forward attended.
+    pub past_len: usize,
+    /// Physical KV bucket (`max_len`) the capture was frozen to.
+    pub bucket: usize,
+    /// Whether `try_capture_with_device_bindings` instantiated a device graph.
+    pub captured: bool,
+    /// Installed captured segment count (`1` = whole-subgraph, `>=2` = seamed).
+    pub segments: usize,
+    /// Decline reason when not captured, or a note when captured-with-caveat.
+    pub decline: Option<String>,
+    /// Device (allocations, frees) observed across the capture run — Phase-0
+    /// pass criterion (a) requires zero alloc/free inside the captured region.
+    pub alloc_delta: Option<(u64, u64)>,
+    /// Device (allocations, frees) observed across the Increment-0 pre-capture
+    /// warm forward at the M=K shape (grows the capture-safe scratch arena so
+    /// the captured region itself stays alloc-free). `None` for the raw Phase-0
+    /// probe, which performs no warm pass.
+    pub warm_alloc_delta: Option<(u64, u64)>,
+    /// Per-replay wall (ns), GPU-inclusive (synchronized by a logits read).
+    pub replay_walls_ns: Vec<u64>,
+    /// Increment-0 only: a compact summary of the eager seam nodes that split a
+    /// segmented M=K capture (`op_type[seam_reason] × count`), the root cause of
+    /// a >1-segment capture that never reaches the whole-graph replay fast path.
+    pub seam_summary: Option<String>,
+    /// Captured-vs-eager token parity (only populated when the attempt is asked
+    /// to `collect_parity` with real token inputs): the per-row greedy argmax of
+    /// the EAGER pre-capture warm forward. Empty when parity was not collected.
+    pub warm_argmax: Vec<i64>,
+    /// Captured-vs-eager token parity: the per-row greedy argmax of the last
+    /// CAPTURED-graph replay over the identical device bindings. Empty when
+    /// parity was not collected. Compared against [`Self::warm_argmax`] this is
+    /// the "captured M=K matches eager M=K" token-equality cell.
+    pub replay_argmax: Vec<i64>,
+    /// Whether the raw logits bytes of the eager warm forward and the captured
+    /// replay were byte-for-byte identical (the strongest captured-vs-eager
+    /// statement). `None` when parity was not collected or capture declined.
+    pub logits_byte_identical: Option<bool>,
+}
+
+/// Per-row greedy argmax over a `[rows, vocab]` logits buffer of raw device
+/// bytes. Supports the three logits dtypes the decoder emits (f32/f16/bf16). Ties
+/// resolve to the lowest index (matching the decoder's argmax tie-break).
+#[cfg(all(test, feature = "cuda"))]
+fn logits_rows_argmax(bytes: &[u8], dtype: DataType, rows: usize, vocab: usize) -> Vec<i64> {
+    let mut out = Vec::with_capacity(rows);
+    let decode = |b: &[u8]| -> f32 {
+        match dtype {
+            DataType::Float16 => half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32(),
+            DataType::BFloat16 => {
+                let bits = (u32::from(u16::from_le_bytes([b[0], b[1]]))) << 16;
+                f32::from_bits(bits)
+            }
+            _ => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        }
+    };
+    let width = match dtype {
+        DataType::Float16 | DataType::BFloat16 => 2,
+        _ => 4,
+    };
+    for row in 0..rows {
+        let base = row * vocab * width;
+        let mut best_idx: i64 = 0;
+        let mut best_val = f32::NEG_INFINITY;
+        for col in 0..vocab {
+            let off = base + col * width;
+            if off + width > bytes.len() {
+                break;
+            }
+            let val = decode(&bytes[off..off + width]);
+            if val > best_val {
+                best_val = val;
+                best_idx = col as i64;
+            }
+        }
+        out.push(best_idx);
+    }
+    out
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CudaKvDebugStats {
     pub logical_len: usize,
     pub max_len: usize,
+    pub kv_committed_len: usize,
+    pub hard_max_len: usize,
     pub max_len_source: String,
     pub device_ptrs: Vec<usize>,
+    pub kv_committed_bytes: usize,
+    pub kv_physical_bytes_by_binding: Vec<usize>,
     pub kv_transfers: DeviceBindingTransferStats,
+    pub kv_growth_events: u64,
+    pub kv_growth_d2d_copy_bytes: u64,
+    /// `true` when the KV bindings are stored seq-major (BSNH) and the binding
+    /// layer accounts residency by the dense live-prefix rule; `false` for the
+    /// default head-major (BNSH) flat-bucket accounting. Surfaced so the
+    /// committed-bytes measurement can attribute a residency number to the
+    /// layout that produced it.
+    pub kv_layout_seq_major: bool,
     pub graph: CudaGraphDebugStats,
 }
 
@@ -97,9 +529,31 @@ pub struct CudaGraphDebugStats {
     pub captures: u64,
     pub replays: u64,
     pub fallbacks: u64,
+    pub invalidations: u64,
+    /// Number of KV-cache growth events that **kept** the captured graph instead
+    /// of invalidating it, because the growth provably changed none of the
+    /// captured graph's baked dependencies (seq-major fixed full-context stride:
+    /// stable device pointers, unchanged physical shapes, capacity-independent
+    /// addressing). Head-major and the legacy realloc path never keep — they are
+    /// counted under `invalidations`. Surfaced so an operator can attribute why a
+    /// graph survived a growth (#804-style named reporting).
+    pub growth_keeps: u64,
     pub allocation_counts: DeviceAllocationCounts,
+    /// Named decode-level predicate that declined capture, whether before the
+    /// first attempt or during the runtime capture audit.
+    pub decline_reason: Option<String>,
+    /// The most recent KV-growth capture decision (kept vs invalidated) with the
+    /// named predicate that produced it, so an operator can see *why* a graph was
+    /// kept or invalidated across a growth — a silent "kept" is as dangerous as a
+    /// silent capture decline.
+    pub growth_decision: Option<String>,
     /// Structured reasons from the most recent capture fallback.
     pub fallback_report: Option<CaptureDeclineReport>,
+    /// Configured device-token-loop chain depth (`0` = disabled/not armed).
+    pub device_token_loop_k: usize,
+    /// Chained device-token-loop replays run this session (each advanced the
+    /// device one token without a host argmax→next-token round-trip).
+    pub device_token_loop_steps: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,8 +564,54 @@ enum DecodeCudaGraphPhase {
     Unsupported,
 }
 
+/// Result of a host-logits ragged batch step (stage 3b, #750): one `[vocab]` f32
+/// row per batch slot plus the device→host transfer cost of reading them, so a
+/// caller can report the D2H price of the host-logits sampler seam instead of
+/// hiding it.
+pub struct RaggedLogitsStep {
+    /// Per-row host logits (`logits[r]` is row `r`'s `[vocab]` distribution).
+    pub logits: Vec<Vec<f32>>,
+    /// Bytes transferred device→host for this step's logits read.
+    pub d2h_bytes: usize,
+    /// Wall time of the logits device→host copy.
+    pub d2h_time: std::time::Duration,
+}
+
 pub(crate) struct DecodeCudaState {
+    /// Number of sequences the persistent decode bindings are shaped for (KV /
+    /// mask / input / position / logits batch axis). **Constructor-fixed to `1`
+    /// today** (stage 2b-impl-1, #750): the value is threaded through the shape
+    /// and IO-binding layer so the batch extent is no longer a hard-coded `1`
+    /// literal at those sites, but every current entry point still constructs
+    /// the state at batch 1, so decode remains byte-identical. The token-writer,
+    /// KV growth/commit geometry, device argmax and batch-symbol capture pinning
+    /// that a real batch-N step also needs are owned by later increments
+    /// (2b-impl-2..4) and are *not* generalized here.
+    batch: usize,
     logical_len: usize,
+    /// Per-row logical KV length (stage 3a, #750): `row_lens[r]` is the number of
+    /// tokens sequence `r` has committed to its KV slice. In a *uniform* batch
+    /// every entry equals `logical_len`; a *ragged* batch lets rows sit at
+    /// genuinely different lengths (some admitted/advanced more than others). The
+    /// per-row length drives that row's attention-mask window (which keys it may
+    /// attend) and its `position_ids` value; the model derives each row's
+    /// `seqlens_k` from its own mask window and writes present KV at its own
+    /// offset, so a shared physical KV buffer carries rows of different lengths.
+    /// `logical_len` remains the shared *physical* extent (`max(row_lens)`) used
+    /// for capacity/KV-shape bookkeeping. Length `batch`, reset to `0` on
+    /// `rewind(0)`.
+    row_lens: Vec<usize>,
+    /// Per-row admission state (stage 3b, #750). `row_active[r]` is `true` while
+    /// row `r` holds a live sequence and `false` once it has been retired by
+    /// [`Self::deactivate_row`] and is available for backfill by
+    /// [`Self::assign_row`]. Every row starts `true` so the uniform/ragged batch
+    /// entry points (which never call assign/deactivate) behave exactly as before
+    /// — the whole batch is active from construction. Only the continuous-batch
+    /// seam toggles this to swap a finished row's occupant mid-flight while its
+    /// peers keep their captured graph. This is host-side bookkeeping; it changes
+    /// no device binding shape, so toggling it never invalidates the captured
+    /// decode graph.
+    row_active: Vec<bool>,
     /// Current physical KV bucket for the native CUDA decode session. The hard
     /// maximum lives in `capacity.max_len`; this bucket grows on demand via the
     /// shared `onnx_genai_kv::kv_capacity_bucket` policy. Growth is a capture
@@ -171,7 +671,32 @@ pub(crate) struct DecodeCudaState {
     graph_captures: u64,
     graph_replays: u64,
     graph_fallbacks: u64,
+    graph_invalidations: u64,
+    kv_growth_events: u64,
+    kv_growth_d2d_copy_bytes: u64,
+    /// Count of KV-growth events that kept the captured graph (seq-major
+    /// fixed-stride commit-on-demand path). Mutually exclusive with the
+    /// growth-attributable slice of `graph_invalidations`.
+    graph_growth_keeps: u64,
+    /// Highest committed KV sequence length, in tokens. For the seq-major
+    /// fixed-stride path this is the commit high-water mark that advances on
+    /// growth **without** changing the reported physical shape; for head-major
+    /// and legacy realloc it tracks the reported physical capacity.
+    kv_committed_len: usize,
+    /// Named rationale for the most recent KV-growth capture decision.
+    graph_growth_decision: Option<String>,
     capacity: CudaKvCapacity,
+    /// The KV bindings reserve their full context address range while the CUDA
+    /// VMM allocator maps only the token stripes reached so far.
+    kv_commits_on_demand: bool,
+    /// The physical KV-cache layout this session's bindings are stored in,
+    /// resolved from [`ModelIoSpec::kv_layout`] (absent = head-major, exactly
+    /// the historical behavior). Consumed by the residency accounting and the
+    /// commit-geometry decision so the binding layer is no longer layout-blind:
+    /// seq-major's live prefix is one dense contiguous run, so its committed
+    /// windows follow `ceil(live_bytes / granule)` rather than a flat bucket.
+    kv_layout: KvCommitLayout,
+    pub(crate) graph_decline_reason: Option<String>,
     pub(crate) graph_fallback_reason: Option<String>,
     pub(crate) graph_fallback_report: Option<CaptureDeclineReport>,
     /// Structural reasons, recorded at binding time, why one or more auxiliary
@@ -199,6 +724,32 @@ pub(crate) struct DecodeCudaState {
     /// dormant `configure_padded_verify_capture` switch (not on the hot path).
     #[cfg(test)]
     pub(crate) padded_query_capacity: Option<usize>,
+    /// Device-resident token-feedback loop (opt-in via `ONNX_GENAI_DEVICE_TOKEN_LOOP`).
+    /// `0` disables it; `k > 0` chains `k` captured decode replays back-to-back
+    /// with a device token-writer stitched between them, so the host leaves the
+    /// per-step critical path and drains `k` selected token ids in one D2H read.
+    /// Only armed when the topology is device-loopable (see `device_token_loop_ready`).
+    device_token_loop_k: usize,
+    /// `true` when the persistent-decode topology supports the device token loop:
+    /// batch 1, graph capture engaged, the attention-mask frozen to physical
+    /// `max_len` (not logical-exposed), an i64 `input_ids`/mask, and — when the
+    /// model exposes a `position_ids` binding — a rank-1 i64 one. When `false`
+    /// the loop stays off regardless of `device_token_loop_k`.
+    device_token_loop_ready: bool,
+    /// `true` when the model exposes a persistent `position_ids` binding that the
+    /// device token-writer must advance each step; `false` when position is
+    /// derived from the attention mask alone (no position binding — e.g. GLM-4),
+    /// in which case the writer only folds the token id and mask bit.
+    device_token_loop_write_position: bool,
+    /// Scratch device binding for the token loop: `k` u32 token-log slots
+    /// followed by one u32 capture-error accumulator word (index `k`). The
+    /// device token-writer appends each step's selected token and ORs the shared
+    /// capture-error word here; the host drains all `k + 1` words in one D2H per
+    /// chain. `None` unless the loop is armed.
+    device_token_loop_scratch: Option<DeviceIoBinding>,
+    /// Count of device-token-loop chained replays actually run (each advances the
+    /// device one token without a host round-trip). A diagnostics counter.
+    device_token_loop_steps: u64,
 }
 
 pub(crate) struct DecodeCudaIo<'a> {
@@ -299,6 +850,99 @@ pub(crate) fn trace_capture_declines(trace: &TraceContext, report: &CaptureDecli
 }
 
 impl NativeDecodeSession {
+    pub(crate) fn prepare_cuda_prefill_workspace(
+        &mut self,
+        token_ids: &[TokenId],
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+        self.prepare_cuda_prefill_workspace_with_step_inputs(token_ids, 0, &[])
+    }
+
+    pub(crate) fn prepare_cuda_prefill_workspace_with_step_inputs(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        step_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+        if self.has_eager_step_inputs() {
+            let workspace_nodes = self.session.workspace_node_locations();
+            if workspace_nodes.is_empty() {
+                return Ok(onnx_runtime_session::WorkspaceRequirement::NONE);
+            }
+        }
+        let position_input = self
+            .step_input_name(NativeStepInputSource::PositionIds)
+            .map(str::to_owned);
+        let input_len = token_ids.len();
+        let total_len = past_len
+            .checked_add(input_len)
+            .context("native CUDA workspace preparation length overflow")?;
+        let supplied = step_inputs
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<HashMap<_, _>>();
+        let mut owned =
+            if let Some(name) = self.step_input_name(NativeStepInputSource::InputsEmbeds) {
+                if let Some(tensor) = supplied.get(name) {
+                    vec![(name.to_owned(), (*tensor).try_clone()?)]
+                } else {
+                    let meta = self
+                        .session
+                        .inputs()
+                        .iter()
+                        .find(|meta| meta.name == name)
+                        .with_context(|| {
+                            format!("missing native CUDA inputs_embeds metadata for '{name}'")
+                        })?;
+                    let hidden = match meta.shape.last() {
+                        Some(Dim::Static(hidden)) => *hidden,
+                        _ => bail!(
+                            "prepare-only QMoE workspace planning cannot conservatively bind \
+                             inputs_embeds '{name}': expected a static hidden width, got {:?}",
+                            meta.shape
+                        ),
+                    };
+                    vec![(
+                        name.to_owned(),
+                        Tensor::zeros(meta.dtype, vec![1, input_len, hidden])?,
+                    )]
+                }
+            } else {
+                let token_input = self
+                    .step_input_name(NativeStepInputSource::TokenIds)
+                    .context("native CUDA decoder has no token or inputs_embeds input binding")?
+                    .to_owned();
+                let ids = token_ids
+                    .iter()
+                    .map(|&id| i64::from(id))
+                    .collect::<Vec<_>>();
+                vec![(token_input, Tensor::from_i64(&[1, input_len], &ids)?)]
+            };
+        for (name, tensor) in step_inputs {
+            if !owned.iter().any(|(bound, _)| bound == name) {
+                owned.push((name.clone(), tensor.try_clone()?));
+            }
+        }
+        if let Some(position_input) = position_input {
+            owned.push((
+                position_input,
+                self.build_step_positions(past_len, total_len)?,
+            ));
+        }
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        state.ensure_capacity(&mut self.session, total_len)?;
+        state.extend_mask(past_len, total_len, total_len)?;
+        let inputs = owned
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        self.session
+            .prepare_with_device_bindings(&inputs, &mut state.bindings[..state.base_binding_count])
+            .context("prepare native CUDA prefill workspace")
+    }
+
     /// Run one eager (uncaptured) `[1, K]` device forward pass and return host
     /// `[K, vocab]` logits.
     ///
@@ -369,7 +1013,9 @@ impl NativeDecodeSession {
             Ok(outputs) => outputs,
             Err(error) => {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                bail!("native CUDA {error_context} forward pass failed{diagnosis}: {error}");
+                return Err(anyhow::Error::new(error).context(format!(
+                    "native CUDA {error_context} forward pass failed{diagnosis}"
+                )));
             }
         };
         let names = self
@@ -399,6 +1045,453 @@ impl NativeDecodeSession {
         state.set_logical_len(total_len)?;
         self.current_len = total_len;
         Ok(logits)
+    }
+
+    /// THROWAWAY Lever-B Phase-0 capture-stability probe (leverb-phase0).
+    ///
+    /// NOT wired into any decode path — invoked only by the `#[ignore]`d
+    /// `leverb_phase0_probe` test. It attempts to CUDA-graph capture a single
+    /// fixed-shape `[1, m]` (padded M=K) forward against the existing persistent
+    /// KV/mask/logits bindings and, if the capture instantiates, replays it
+    /// `replays` times, timing each replay wall (the replay is synchronized by a
+    /// D2H read of the logits binding, mirroring the real per-step logits sync).
+    ///
+    /// This measures Phase-0 pass criteria (a) "instantiates capture-safe" and
+    /// (c) "per-verify replay wall" on the REAL batched GQA/GEMM (`MatMulNBits`)
+    /// kernels — it does not hand-roll a toy graph. It deliberately does NOT
+    /// commit KV or advance the logical length: the captured/replayed forward
+    /// dirties device KV, and KV-commit correctness is explicitly out of Phase-0
+    /// scope, so the caller MUST discard the session afterwards.
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn leverb_phase0_capture_attempt(
+        &mut self,
+        m: usize,
+        replays: usize,
+    ) -> anyhow::Result<LeverBPhase0CaptureAttempt> {
+        let past_len = self.current_len;
+        let total_len = past_len
+            .checked_add(m)
+            .context("leverb phase0 probe length overflow")?;
+        let token_input = self
+            .step_input_name(NativeStepInputSource::TokenIds)
+            .context("native CUDA decoder has no token input binding")?
+            .to_owned();
+        let position_input = self
+            .step_input_name(NativeStepInputSource::PositionIds)
+            .map(str::to_owned);
+
+        // Build the fixed padded `[1, m]` token/position inputs. Token *values*
+        // are irrelevant to Phase-0 (acceptance/KV correctness is out of scope);
+        // a constant id keeps the shape fixed so a captured graph can replay
+        // without re-instantiation.
+        let ids = vec![1_i64; m];
+        let input_ids = Tensor::from_i64(&[1, m], &ids)?;
+        let mut owned: Vec<(String, Tensor)> = Vec::with_capacity(2);
+        owned.push((token_input, input_ids));
+        if let Some(position_ids_name) = position_input {
+            owned.push((
+                position_ids_name,
+                self.build_step_positions(past_len, total_len)?,
+            ));
+        }
+
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if total_len > state.capacity.max_len {
+            bail!("{}", state.capacity_exceeded_error(total_len));
+        }
+        // Keep the whole probe inside one physical bucket: growth is a capture
+        // boundary and is exercised separately by the M=1 stability loop.
+        let grew = state.ensure_capacity(&mut self.session, total_len)?;
+        state.extend_mask(if grew { 0 } else { past_len }, total_len, total_len)?;
+        // Start from a clean graph slot so the capture attempt is unambiguous.
+        state.invalidate_graph(&mut self.session)?;
+
+        let borrowed = owned
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        let base = state.base_binding_count;
+
+        let alloc_before = self.session.device_allocation_counts();
+        let capture = self
+            .session
+            .try_capture_with_device_bindings(&borrowed, &mut state.bindings[..base])?;
+        let alloc_after = self.session.device_allocation_counts();
+        let alloc_delta = match (alloc_before, alloc_after) {
+            (Some(before), Some(after)) => Some((
+                after.allocations.saturating_sub(before.allocations),
+                after.frees.saturating_sub(before.frees),
+            )),
+            _ => None,
+        };
+        let segments = self.session.captured_graph_segment_count();
+
+        let mut attempt = LeverBPhase0CaptureAttempt {
+            rows: m,
+            past_len,
+            bucket: state.max_len,
+            captured: false,
+            segments,
+            decline: None,
+            alloc_delta,
+            warm_alloc_delta: None,
+            replay_walls_ns: Vec::new(),
+            seam_summary: None,
+            warm_argmax: Vec::new(),
+            replay_argmax: Vec::new(),
+            logits_byte_identical: None,
+        };
+
+        match capture {
+            DeviceGraphCaptureResult::Captured(outputs) => {
+                attempt.captured = true;
+                if outputs.iter().any(Option::is_some) {
+                    // A materialized (host-returned) output means the padded M=K
+                    // logits do not fit the single-token logits binding; still a
+                    // capture, but record it as a decline note for the findings.
+                    attempt.decline = Some(
+                        "captured, but the forward materialized a host output (padded logits do not fit the single-token logits binding)".to_string(),
+                    );
+                }
+                for _ in 0..replays {
+                    let start = std::time::Instant::now();
+                    let still_valid = self
+                        .session
+                        .replay_device_graph(&mut state.bindings[..base])?;
+                    // Force stream completion with a D2H read of the logits
+                    // binding (the real hot path syncs on the per-step logits
+                    // read); this makes the wall the GPU-inclusive replay time.
+                    let _ = state.bindings[state.logits_binding].read_bytes()?;
+                    attempt
+                        .replay_walls_ns
+                        .push(start.elapsed().as_nanos() as u64);
+                    if !still_valid {
+                        break;
+                    }
+                }
+            }
+            DeviceGraphCaptureResult::NotCapturable(report) => {
+                attempt.decline = Some(report.to_string());
+            }
+        }
+        // Leave the graph slot clean; state is intentionally left dirty.
+        state.invalidate_graph(&mut self.session)?;
+        Ok(attempt)
+    }
+
+    /// THROWAWAY Lever-B **Increment-0** capture attempt (leverb-increment0):
+    /// the same real M=K forward as [`Self::leverb_phase0_capture_attempt`], but
+    /// with the three capture-enablement fixes the Phase-0 (a)-FAIL identified,
+    /// applied as a test-only overlay (NOT wired into the decode path):
+    ///
+    ///   1. **Persistent padded `[1, m, vocab]` logits binding.** The production
+    ///      logits binding is single-token `[1, 1, vocab]`, so an M=K forward's
+    ///      `[1, m, vocab]` logits do not fit and materialize to the host — which
+    ///      makes capture reject ("every graph output must use a persistent
+    ///      device binding"). A fresh padded output binding for the same logits
+    ///      output name lands them in device memory instead.
+    ///   2. **Alloc-free captured region via a pre-capture warm forward at the
+    ///      M=K shape.** The capture-safe scratch arena is grown by a normal
+    ///      `run_with_device_bindings` at `[1, m]` *before* `BeginCapture`, so the
+    ///      captured region itself performs no device alloc/free (#854/#867).
+    ///   3. **KV-symbol pin** — inherited: the constructor already pins the
+    ///      fixed-capacity KV seq symbols for a graph-enabled session, so the
+    ///      batched GQA attention nodes admit capture at any query width `m`.
+    ///
+    /// Like the Phase-0 probe this dirties device KV (KV-commit correctness is
+    /// out of scope) and does NOT advance the logical length, so the caller MUST
+    /// discard the session afterwards. It drives the real batched GQA/GEMM M=K
+    /// kernels through the real persistent KV/mask bindings — it does not
+    /// hand-roll a toy graph. The padded token/position/logits bindings are
+    /// swapped into the persistent binding vector for the duration of the
+    /// attempt and restored before returning.
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn leverb_increment0_capture_attempt(
+        &mut self,
+        m: usize,
+        replays: usize,
+    ) -> anyhow::Result<LeverBPhase0CaptureAttempt> {
+        self.leverb_increment0_capture_attempt_inner(m, replays, None, false)
+    }
+
+    /// Captured-vs-eager token-parity variant of the Increment-0 probe: writes
+    /// the supplied `tokens` (cycled to fill the M rows) instead of a constant,
+    /// records the EAGER warm-forward per-row argmax and the CAPTURED replay
+    /// per-row argmax, and compares the raw logits bytes. This fills the
+    /// "captured M=K == eager M=K, same Marlin config, no tiled oracle" cell.
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn leverb_increment0_token_parity_attempt(
+        &mut self,
+        m: usize,
+        tokens: &[i64],
+    ) -> anyhow::Result<LeverBPhase0CaptureAttempt> {
+        self.leverb_increment0_capture_attempt_inner(m, 1, Some(tokens), true)
+    }
+
+    #[cfg(all(test, feature = "cuda"))]
+    fn leverb_increment0_capture_attempt_inner(
+        &mut self,
+        m: usize,
+        replays: usize,
+        tokens: Option<&[i64]>,
+        collect_parity: bool,
+    ) -> anyhow::Result<LeverBPhase0CaptureAttempt> {
+        let past_len = self.current_len;
+        let total_len = past_len
+            .checked_add(m)
+            .context("leverb increment0 probe length overflow")?;
+        let token_input = self
+            .step_input_name(NativeStepInputSource::TokenIds)
+            .context("native CUDA decoder has no token input binding")?
+            .to_owned();
+        let position_input = self
+            .step_input_name(NativeStepInputSource::PositionIds)
+            .map(str::to_owned);
+
+        // Resolve the immutable facts we need from state before allocating the
+        // padded bindings (which borrows `self.session`); the two live on
+        // disjoint fields so both borrows coexist.
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if total_len > state.capacity.max_len {
+            bail!("{}", state.capacity_exceeded_error(total_len));
+        }
+        let grew = state.ensure_capacity(&mut self.session, total_len)?;
+        state.extend_mask(if grew { 0 } else { past_len }, total_len, total_len)?;
+        state.invalidate_graph(&mut self.session)?;
+
+        let bucket = state.max_len;
+        let vocab = *state
+            .logits_shape
+            .last()
+            .context("CUDA logits shape has no vocabulary dimension")?;
+        let logits_dtype = state.logits_dtype;
+        let logits_index = state.logits_binding;
+        let input_ids_index = state.input_ids_binding;
+        let position_ids_index = state.position_ids_binding;
+        let logits_name = state.bindings[logits_index]
+            .output_name()
+            .context("logits binding has no output name")?
+            .to_owned();
+
+        // ---- FIX 1: persistent padded [1, m, vocab] logits device binding ----
+        let padded_logits = self.session.allocate_device_output_binding(
+            logits_name,
+            logits_dtype,
+            vec![1, m, vocab],
+            vec![1, m, vocab],
+        )?;
+        // ---- padded [1, m] token binding (device-resident, like run_one_token,
+        // so the capture takes no owned host inputs) ----
+        let mut padded_ids = self.session.allocate_device_binding(
+            token_input,
+            None::<String>,
+            DataType::Int64,
+            vec![1, m],
+            vec![1, m],
+        )?;
+        let mut token_bytes = Vec::with_capacity(m * 8);
+        for i in 0..m {
+            // For a timing/segments attempt the token value is irrelevant to
+            // capture/timing (KV correctness is out of scope); a constant keeps
+            // the device buffer fixed for replay. For a parity attempt we cycle
+            // real prompt tokens so the argmax is non-degenerate (avoids a
+            // constant-token near-tie).
+            let tok = match tokens {
+                Some(t) if !t.is_empty() => t[i % t.len()],
+                _ => 1_i64,
+            };
+            token_bytes.extend_from_slice(&tok.to_ne_bytes());
+        }
+        padded_ids.write_bytes(0, &token_bytes)?;
+
+        let padded_positions = if let Some(position_input) = position_input.as_deref() {
+            let mut binding = self.session.allocate_device_binding(
+                position_input,
+                None::<String>,
+                DataType::Int64,
+                vec![1, m],
+                vec![1, m],
+            )?;
+            let mut pos_bytes = Vec::with_capacity(m * 8);
+            for pos in past_len..total_len {
+                pos_bytes.extend_from_slice(&(pos as i64).to_ne_bytes());
+            }
+            binding.write_bytes(0, &pos_bytes)?;
+            Some(binding)
+        } else {
+            None
+        };
+
+        // Swap the padded bindings into the persistent vector. The originals are
+        // parked and restored before returning.
+        let orig_ids = std::mem::replace(&mut state.bindings[input_ids_index], padded_ids);
+        let orig_logits = std::mem::replace(&mut state.bindings[logits_index], padded_logits);
+        let orig_positions = position_ids_index
+            .zip(padded_positions)
+            .map(|(index, binding)| {
+                (
+                    index,
+                    std::mem::replace(&mut state.bindings[index], binding),
+                )
+            });
+
+        // ---- FIX 2: warm the capture-safe scratch arena at the M=K shape so the
+        // captured region below performs no device alloc/free ----
+        let warm_before = self.session.device_allocation_counts();
+        let warm = self
+            .session
+            .run_with_device_bindings(&[], &mut state.bindings[..]);
+        let warm_after = self.session.device_allocation_counts();
+        if let Err(error) = warm {
+            // Restore before surfacing the error.
+            let restored_ids = std::mem::replace(&mut state.bindings[input_ids_index], orig_ids);
+            let restored_logits = std::mem::replace(&mut state.bindings[logits_index], orig_logits);
+            drop(restored_ids);
+            drop(restored_logits);
+            if let Some((index, binding)) = orig_positions {
+                drop(std::mem::replace(&mut state.bindings[index], binding));
+            }
+            state.invalidate_graph(&mut self.session)?;
+            return Err(error).context("leverb increment0 warm forward at M=K");
+        }
+        let warm_alloc_delta = match (warm_before, warm_after) {
+            (Some(before), Some(after)) => Some((
+                after.allocations.saturating_sub(before.allocations),
+                after.frees.saturating_sub(before.frees),
+            )),
+            _ => None,
+        };
+
+        // Snapshot the EAGER warm-forward logits before capture overwrites the
+        // padded binding on replay. This is the "eager M=K" side of the
+        // captured-vs-eager token-parity cell.
+        let warm_logits_bytes = if collect_parity {
+            Some(state.bindings[logits_index].read_bytes()?)
+        } else {
+            None
+        };
+
+        // ---- Capture the real M=K forward against the full device binding set
+        // (KV + mask + token + position + padded logits), no owned host inputs. ----
+        let alloc_before = self.session.device_allocation_counts();
+        let capture = self
+            .session
+            .try_capture_with_device_bindings(&[], &mut state.bindings[..]);
+        let alloc_after = self.session.device_allocation_counts();
+        let alloc_delta = match (alloc_before, alloc_after) {
+            (Some(before), Some(after)) => Some((
+                after.allocations.saturating_sub(before.allocations),
+                after.frees.saturating_sub(before.frees),
+            )),
+            _ => None,
+        };
+
+        let segments = self.session.captured_graph_segment_count();
+        // Summarize the eager seam nodes that split a segmented capture: the
+        // root cause of a >1-segment M=K graph that never reaches the whole-
+        // subgraph replay fast path. Fold to `op_type[seam] × count`.
+        let seam_summary = {
+            let mut counts: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for decline in self.session.capture_segmentation() {
+                let seam = decline
+                    .seam_reason
+                    .map(|reason| format!("{reason:?}"))
+                    .unwrap_or_else(|| "graph".to_string());
+                *counts
+                    .entry(format!("{}[{}]", decline.op_type, seam))
+                    .or_default() += 1;
+            }
+            if counts.is_empty() {
+                None
+            } else {
+                Some(
+                    counts
+                        .into_iter()
+                        .map(|(key, count)| format!("{key}×{count}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+            }
+        };
+
+        let mut attempt = LeverBPhase0CaptureAttempt {
+            rows: m,
+            past_len,
+            bucket,
+            captured: false,
+            segments,
+            decline: None,
+            alloc_delta,
+            warm_alloc_delta,
+            replay_walls_ns: Vec::new(),
+            seam_summary,
+            warm_argmax: Vec::new(),
+            replay_argmax: Vec::new(),
+            logits_byte_identical: None,
+        };
+
+        let mut last_replay_bytes: Option<Vec<u8>> = None;
+        match capture {
+            Ok(DeviceGraphCaptureResult::Captured(outputs)) => {
+                attempt.captured = true;
+                if outputs.iter().any(Option::is_some) {
+                    attempt.decline = Some(
+                        "captured, but still materialized a host output (padded logits binding did not absorb every output)".to_string(),
+                    );
+                }
+                for _ in 0..replays {
+                    let start = std::time::Instant::now();
+                    let still_valid = self.session.replay_device_graph(&mut state.bindings[..])?;
+                    // Sync on the padded logits D2H read (the real hot path syncs
+                    // on the per-step logits read), making the wall GPU-inclusive.
+                    let replay_bytes = state.bindings[logits_index].read_bytes()?;
+                    if collect_parity {
+                        last_replay_bytes = Some(replay_bytes);
+                    }
+                    attempt
+                        .replay_walls_ns
+                        .push(start.elapsed().as_nanos() as u64);
+                    if !still_valid {
+                        break;
+                    }
+                }
+            }
+            Ok(DeviceGraphCaptureResult::NotCapturable(report)) => {
+                attempt.decline = Some(report.to_string());
+            }
+            Err(error) => {
+                attempt.decline = Some(format!("capture attempt errored: {error}"));
+            }
+        }
+
+        // Captured-vs-eager token parity: compare the eager warm-forward logits
+        // against the captured replay logits over the identical device bindings.
+        if let (Some(warm_bytes), Some(replay_bytes)) =
+            (warm_logits_bytes.as_ref(), last_replay_bytes.as_ref())
+        {
+            attempt.warm_argmax = logits_rows_argmax(warm_bytes, logits_dtype, m, vocab);
+            attempt.replay_argmax = logits_rows_argmax(replay_bytes, logits_dtype, m, vocab);
+            attempt.logits_byte_identical = Some(warm_bytes == replay_bytes);
+        }
+
+        // Restore the persistent bindings and leave the graph slot clean; the KV
+        // state is intentionally left dirty (caller discards the session).
+        let restored_ids = std::mem::replace(&mut state.bindings[input_ids_index], orig_ids);
+        let restored_logits = std::mem::replace(&mut state.bindings[logits_index], orig_logits);
+        drop(restored_ids);
+        drop(restored_logits);
+        if let Some((index, binding)) = orig_positions {
+            drop(std::mem::replace(&mut state.bindings[index], binding));
+        }
+        state.invalidate_graph(&mut self.session)?;
+        Ok(attempt)
     }
 
     pub(crate) fn decode_cuda(
@@ -493,11 +1586,19 @@ impl NativeDecodeSession {
                 // exec's capture machine stays dormant on decode, so the shared
                 // EP's single graph slot + capture-error latch are owned solely by
                 // the sibling.
+                let step_profile = CudaStepProfile::begin(past_len, total_len);
+                let mut step_wall = CudaStepWallBreakdown::default();
+                let run_start = std::time::Instant::now();
                 if let Err(error) = state.run_one_token_inline(&mut self.session, &self.trace) {
                     let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                    bail!("native CUDA decode-inline forward pass failed{diagnosis}: {error}");
+                    return Err(error.context(format!(
+                        "native CUDA decode-inline forward pass failed{diagnosis}"
+                    )));
                 }
+                step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
+                let logits_start = std::time::Instant::now();
                 let logits = state.read_logits()?;
+                step_wall.logits_read_ms = logits_start.elapsed().as_secs_f64() * 1_000.0;
                 // Detection-before-consumption (Harry #588 PR-3 rec #1): the
                 // logits read above is the single per-step device→host sync.
                 // Piggyback on it to poll the shared capture-error word — a
@@ -505,39 +1606,61 @@ impl NativeDecodeSession {
                 // latches the flag; fail hard before consuming the produced token.
                 // The latch lives on the shared EP, so this reads the sibling's
                 // replay result even though the poll is the main-exec-facing call.
+                let capture_check_start = std::time::Instant::now();
                 let capture_error = self.session.check_device_capture_error()?;
+                step_wall.capture_check_ms = capture_check_start.elapsed().as_secs_f64() * 1_000.0;
                 if capture_error != 0 {
                     let _ = state.invalidate_graph(&mut self.session);
                     bail!(
                         "native CUDA decode-inline aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay; the produced token was rejected before consumption and the decode-inline graph was invalidated"
                     );
                 }
+                let finite_check_start = std::time::Instant::now();
                 if logits.iter().flatten().any(|value| !value.is_finite()) {
                     bail!("native decoder produced non-finite logits");
+                }
+                step_wall.finite_check_ms = finite_check_start.elapsed().as_secs_f64() * 1_000.0;
+                if let Some(profile) = step_profile {
+                    profile.finish("decode_inline", step_wall);
                 }
                 state.set_logical_len(total_len)?;
                 self.current_len = total_len;
                 return Ok(logits);
             }
+            let step_profile = CudaStepProfile::begin(past_len, total_len);
+            let mut step_wall = CudaStepWallBreakdown::default();
+            let run_start = std::time::Instant::now();
             if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+                return Err(error.context(format!(
+                    "native CUDA decoder forward pass failed{diagnosis}"
+                )));
             }
+            step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
+            let logits_start = std::time::Instant::now();
             let logits = state.read_logits()?;
+            step_wall.logits_read_ms = logits_start.elapsed().as_secs_f64() * 1_000.0;
             // Detection-before-consumption: the logits read above is the single
             // per-step device→host sync. Piggyback on it to poll the shared
             // capture-error word (no extra synchronize). If a captured replay
             // violates a device-side bound, kernels latch the flag and avoid the
             // unsafe access, so fail hard before consuming the produced token.
+            let capture_check_start = std::time::Instant::now();
             let capture_error = self.session.check_device_capture_error()?;
+            step_wall.capture_check_ms = capture_check_start.elapsed().as_secs_f64() * 1_000.0;
             if capture_error != 0 {
                 let _ = state.invalidate_graph(&mut self.session);
                 bail!(
                     "native CUDA decoder aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay; the produced token was rejected before consumption and the decode graph was invalidated"
                 );
             }
+            let finite_check_start = std::time::Instant::now();
             if logits.iter().flatten().any(|value| !value.is_finite()) {
                 bail!("native decoder produced non-finite logits");
+            }
+            step_wall.finite_check_ms = finite_check_start.elapsed().as_secs_f64() * 1_000.0;
+            if let Some(profile) = step_profile {
+                profile.finish("decode", step_wall);
             }
             state.set_logical_len(total_len)?;
             self.current_len = total_len;
@@ -606,14 +1729,24 @@ impl NativeDecodeSession {
         state.extend_mask(if grew { 0 } else { past_len }, total_len, mask_expose)?;
         state.write_captured_step_inputs(supplied, position)?;
 
+        let step_profile = CudaStepProfile::begin(past_len, total_len);
+        let mut step_wall = CudaStepWallBreakdown::default();
+        let run_start = std::time::Instant::now();
         if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
             let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-            bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+            return Err(error.context(format!(
+                "native CUDA decoder forward pass failed{diagnosis}"
+            )));
         }
+        step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
+        let logits_start = std::time::Instant::now();
         let logits = state.read_logits()?;
+        step_wall.logits_read_ms = logits_start.elapsed().as_secs_f64() * 1_000.0;
         // Detection-before-consumption: piggyback on the single logits sync to
         // poll the shared capture-error word (mirrors the token captured path).
+        let capture_check_start = std::time::Instant::now();
         let capture_error = self.session.check_device_capture_error()?;
+        step_wall.capture_check_ms = capture_check_start.elapsed().as_secs_f64() * 1_000.0;
         if capture_error != 0 {
             let _ = self
                 .cuda
@@ -624,8 +1757,13 @@ impl NativeDecodeSession {
                 "native CUDA decoder aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay of a per-step-input decode; the produced token was rejected before consumption and the decode graph was invalidated"
             );
         }
+        let finite_check_start = std::time::Instant::now();
         if logits.iter().flatten().any(|value| !value.is_finite()) {
             bail!("native decoder produced non-finite logits");
+        }
+        step_wall.finite_check_ms = finite_check_start.elapsed().as_secs_f64() * 1_000.0;
+        if let Some(profile) = step_profile {
+            profile.finish("captured_step_inputs", step_wall);
         }
         let state = self
             .cuda
@@ -856,7 +1994,9 @@ impl NativeDecodeSession {
             // never round-trip to the host.
             if let Err(error) = state.run_one_token_inline(&mut self.session, &self.trace) {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                bail!("native CUDA decode-inline forward pass failed{diagnosis}: {error}");
+                return Err(error.context(format!(
+                    "native CUDA decode-inline forward pass failed{diagnosis}"
+                )));
             }
             // Detection-before-consumption (Harry #588 PR-3 rec #1): the greedy
             // device-argmax read already returns the shared capture-error word;
@@ -875,7 +2015,9 @@ impl NativeDecodeSession {
         }
         if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
             let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-            bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+            return Err(error.context(format!(
+                "native CUDA decoder forward pass failed{diagnosis}"
+            )));
         }
         let (token_id, capture_error) = state.read_greedy_result()?;
         if capture_error != 0 {
@@ -887,6 +2029,374 @@ impl NativeDecodeSession {
         state.set_logical_len(total_len)?;
         self.current_len = total_len;
         Ok(token_id)
+    }
+
+    /// The configured device-token-loop chain depth for this session (`0` when
+    /// the loop is disabled or the topology is not device-loopable).
+    pub(crate) fn device_token_loop_k(&self) -> usize {
+        self.cuda
+            .as_ref()
+            .map_or(0, DecodeCudaState::device_token_loop_k)
+    }
+
+    /// Device-resident token-feedback loop (opt-in via
+    /// `ONNX_GENAI_DEVICE_TOKEN_LOOP`): enqueue up to `k_request` captured decode
+    /// replays back-to-back with a device token-writer stitched between them, so
+    /// the host leaves the per-step critical path (no argmax read-back sync, no
+    /// next-token H2D between replays), and drain the accumulated token ids in
+    /// **one** D2H read.
+    ///
+    /// Byte-identical to the per-token [`Self::decode_cuda_greedy`] path: the
+    /// device token-writer folds the *same* device-argmax token (`greedy_result[0]`)
+    /// into the *same* persistent `input_ids`/`position_ids`/mask bindings the
+    /// host writes would, so the greedy token sequence is unchanged. Capture-error
+    /// latching is preserved (the per-step words are OR-ed on-device and rejected
+    /// at drain).
+    ///
+    /// Any structural reason to decline — the loop is off, the graph is not yet
+    /// in the replay-ready phase, an inline-routed step, or a capacity boundary —
+    /// falls back to a single captured [`Self::decode_cuda_greedy`] step, which
+    /// owns the warmup/capture/growth state machine. Returns the `1..=k` selected
+    /// token ids in order.
+    pub(crate) fn decode_cuda_greedy_loop(
+        &mut self,
+        seed_token: TokenId,
+        past_len: usize,
+        k_request: usize,
+    ) -> anyhow::Result<Vec<TokenId>> {
+        // Keep inline-routing state coherent with the per-token entry point,
+        // then decide whether the device loop applies to this step.
+        self.maybe_enable_decode_inline(std::slice::from_ref(&seed_token));
+        let route_inline = self.route_decode_inline(std::slice::from_ref(&seed_token));
+        let applies = {
+            let state = self
+                .cuda
+                .as_ref()
+                .context("CUDA decode state is not initialized")?;
+            state.device_token_loop_ready
+                && state.device_token_loop_k >= 2
+                && k_request >= 2
+                && state.graph_phase == DecodeCudaGraphPhase::Ready
+        };
+        if route_inline || !applies {
+            return Ok(vec![self.decode_cuda_greedy(seed_token, past_len)?]);
+        }
+
+        // Clamp the chain depth to the configured cap and keep the whole chain
+        // inside the current KV bucket so no reallocation (which retires the
+        // captured graph) happens mid-chain.
+        let (cap_k, max_len, hard_max_len) = {
+            let state = self.cuda.as_ref().unwrap();
+            (
+                state.device_token_loop_k,
+                state.max_len,
+                state.hard_max_len(),
+            )
+        };
+        let mut k = k_request.min(cap_k);
+        k = k.min(max_len.saturating_sub(past_len));
+        if k < 2 || past_len + k > hard_max_len {
+            return Ok(vec![self.decode_cuda_greedy(seed_token, past_len)?]);
+        }
+        let total_len = past_len + k;
+
+        // Ensure capacity for the full chain up-front; a growth here retires the
+        // captured graph, so route this step through the single captured path.
+        let grew = {
+            let state = self.cuda.as_mut().unwrap();
+            state.ensure_capacity(&mut self.session, total_len)?
+        };
+        if grew || self.cuda.as_ref().unwrap().graph_phase != DecodeCudaGraphPhase::Ready {
+            return Ok(vec![self.decode_cuda_greedy(seed_token, past_len)?]);
+        }
+
+        // Prime the first step on the host (one async H2D, no sync) so the chain
+        // is byte-identical to the per-token path regardless of prior device
+        // state, and clear the capture-error accumulator.
+        {
+            let state = self.cuda.as_mut().unwrap();
+            state.write_decode_inputs(seed_token, past_len)?;
+            let expose = state.decode_mask_expose_len(past_len + 1);
+            state.extend_mask(past_len, past_len + 1, expose)?;
+            state.reset_device_token_loop_error()?;
+        }
+
+        // Enqueue k replays back-to-back with the device token-writer stitched
+        // between them — no host sync inside the loop.
+        let mut produced = 0_usize;
+        for step in 0..k {
+            let state = self.cuda.as_mut().unwrap();
+            if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
+                let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+                return Err(error.context(format!(
+                    "native CUDA device-token-loop forward pass failed{diagnosis}"
+                )));
+            }
+            let still_ready = state.graph_phase == DecodeCudaGraphPhase::Ready;
+            state.run_device_argmax()?;
+            let next_position = i64::try_from(past_len + 1 + step)
+                .context("device token loop position exceeds i64 range")?;
+            state.device_token_writer_step(next_position, step as u32)?;
+            state.device_token_loop_steps += 1;
+            produced += 1;
+            if !still_ready {
+                // A control-flow branch flip retired the captured graph after
+                // this step (its token was produced eagerly and is valid); stop
+                // chaining and let the next call re-warm on the single-step path.
+                break;
+            }
+        }
+
+        // One D2H drain for the whole chain: the accumulated token ids plus the
+        // OR-ed capture-error word (detection-before-consumption).
+        let (tokens, capture_error) = {
+            let state = self.cuda.as_mut().unwrap();
+            state.drain_device_token_loop(produced)?
+        };
+        if capture_error != 0 {
+            let state = self.cuda.as_mut().unwrap();
+            let _ = state.invalidate_graph(&mut self.session);
+            bail!(
+                "native CUDA device-token-loop aborted: device capture validation violation (flags=0x{capture_error:x}) detected during a chained captured graph replay; the produced tokens were rejected before consumption and the decode graph was invalidated"
+            );
+        }
+
+        let new_len = past_len + produced;
+        {
+            let state = self.cuda.as_mut().unwrap();
+            // Undo the device token-writer's trailing mask bit one position past
+            // the last consumed token so the persistent mask matches the
+            // per-token path exactly (byte-identical, and no stale `1` leaks into
+            // a later prefill after reset).
+            state.clear_trailing_mask_bit(new_len)?;
+            state.set_logical_len(new_len)?;
+        }
+        self.current_len = new_len;
+        Ok(tokens)
+    }
+
+    /// sequences together, one token each, and return the `batch` selected token
+    /// ids (row `i` = the greedy token of sequence `i`). Every sequence shares
+    /// the uniform decode length `past_len → past_len + 1`, so a single mask
+    /// window and one `run_one_token` forward drive all rows; the batched device
+    /// argmax reads N rows back.
+    ///
+    /// This is the reachable batch-N entry point: `tokens.len()` must equal the
+    /// pinned session batch. It is NOT wired into the single-sequence generation
+    /// driver — presenting N real sequences with N independently seeded KV states
+    /// is the stage 2c caller — so this is exercised directly by the batch
+    /// measurement harness (`profile_native --native-decode-batch-sweep`) and by
+    /// row-identity assertions there. The greedy device argmax already returns N
+    /// rows (2b-impl-3), so no logits round-trip is needed.
+    ///
+    /// Uniform batches are the special case of the ragged path (stage 3a, #750):
+    /// every row shares `past_len` and advances, so this forwards to
+    /// [`Self::decode_cuda_greedy_batch_ragged`] with a uniform per-row length
+    /// and an all-`true` advance mask. The delegation is byte-identical to the
+    /// former single-shared-window implementation (identical mask windows,
+    /// identical positions).
+    pub(crate) fn decode_cuda_greedy_batch(
+        &mut self,
+        tokens: &[TokenId],
+        past_len: usize,
+    ) -> anyhow::Result<Vec<TokenId>> {
+        let batch = self
+            .cuda
+            .as_ref()
+            .context("CUDA decode state is not initialized")?
+            .batch;
+        let past_lens = vec![past_len; batch];
+        let advances = vec![true; batch];
+        self.decode_cuda_greedy_batch_ragged(tokens, &past_lens, &advances)
+    }
+
+    /// Ragged batch-N greedy decode step (stage 3a, #750): step `batch`
+    /// sequences together, one token each, where row `r` sits at its own logical
+    /// length `past_lens[r]` and advances only if `advances[r]`. Returns the
+    /// `batch` selected token ids (row `i` = the greedy token of sequence `i`).
+    ///
+    /// Per-row geometry:
+    /// - **Length.** Each row's attention-mask window is `past_lens[r] + 1` (its
+    ///   own prefix plus the new token); the model reduces that to the row's
+    ///   `seqlens_k = past_lens[r]` and writes present KV at that per-row offset.
+    /// - **Position.** `position_ids[r] = past_lens[r]`, so each row's rotary
+    ///   position and causal frame match what it would see run alone.
+    /// - **Physical extent.** The shared KV logical length is advanced to
+    ///   `max(past_lens) + 1`; shorter rows ignore the padded suffix via their
+    ///   own (shorter) mask window.
+    ///
+    /// The mask width is frozen to the physical bucket, so only mask *values*
+    /// vary per step and CUDA-graph capture survives per-row lengths. A held row
+    /// (`advances[r] == false`) re-attends its own prefix and reprocesses at its
+    /// current position; its present KV write lands at its unchanged offset
+    /// (overwritten harmlessly next step) and its logical length does not grow —
+    /// the mechanism a continuous batcher uses to stall a row while its peers
+    /// advance.
+    pub(crate) fn decode_cuda_greedy_batch_ragged(
+        &mut self,
+        tokens: &[TokenId],
+        past_lens: &[usize],
+        advances: &[bool],
+    ) -> anyhow::Result<Vec<TokenId>> {
+        let valid_lens = self.run_ragged_forward(tokens, past_lens, advances)?;
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        let rows = state.read_greedy_result_batch()?;
+        for (sequence, (_, capture_error)) in rows.iter().enumerate() {
+            if *capture_error != 0 {
+                let _ = state.invalidate_graph(&mut self.session);
+                bail!(
+                    "native CUDA batch decoder aborted: device capture validation violation \
+                     (flags=0x{capture_error:x}) on sequence {sequence} during captured graph \
+                     replay; the produced tokens were rejected before consumption and the decode \
+                     graph was invalidated"
+                );
+            }
+        }
+        self.commit_ragged_advance(&valid_lens, advances)?;
+        Ok(rows.into_iter().map(|(token, _)| token).collect())
+    }
+
+    /// Host-logits ragged batch-N step (stage 3b, #750): identical geometry to
+    /// [`Self::decode_cuda_greedy_batch_ragged`], but instead of the device-argmax
+    /// fast path it reads the full `[batch, 1, vocab]` logits back to the host —
+    /// one `[vocab]` row per batch slot — so a real host sampler (top-k/top-p,
+    /// temperature, penalties) can drive selection. The device-argmax path is
+    /// **not** removed: it stays the default for greedy decode because it never
+    /// pays the D2H of the full logits. This is the seam the
+    /// `ContinuousBatchManager` sampler consumes.
+    ///
+    /// The device capture-error latch is still checked *before* the host logits
+    /// are consumed (detection-before-consumption): the cheap 8-byte-per-row
+    /// argmax read-back doubles as the capture-validation read, and a latched
+    /// violation invalidates the graph and rejects the step. The full-logits D2H
+    /// cost is returned so the caller can report it honestly rather than bury it.
+    pub(crate) fn decode_cuda_greedy_batch_ragged_logits(
+        &mut self,
+        tokens: &[TokenId],
+        past_lens: &[usize],
+        advances: &[bool],
+    ) -> anyhow::Result<RaggedLogitsStep> {
+        let valid_lens = self.run_ragged_forward(tokens, past_lens, advances)?;
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        // Detection-before-consumption: read the shared capture-error latch (the
+        // argmax read-back carries it) and reject before touching the logits.
+        let guard = state.read_greedy_result_batch()?;
+        for (sequence, (_, capture_error)) in guard.iter().enumerate() {
+            if *capture_error != 0 {
+                let _ = state.invalidate_graph(&mut self.session);
+                bail!(
+                    "native CUDA batch decoder aborted: device capture validation violation \
+                     (flags=0x{capture_error:x}) on sequence {sequence} during captured graph \
+                     replay; the produced logits were rejected before consumption and the decode \
+                     graph was invalidated"
+                );
+            }
+        }
+        let (logits, d2h_bytes, d2h_time) = state.read_batch_row_logits()?;
+        self.commit_ragged_advance(&valid_lens, advances)?;
+        Ok(RaggedLogitsStep {
+            logits,
+            d2h_bytes,
+            d2h_time,
+        })
+    }
+
+    /// Shared ragged-step preamble: validate the per-row inputs, size the mask
+    /// window and physical extent, ensure KV capacity, write the ragged mask and
+    /// the per-row token/position inputs, and run the fused forward. Returns the
+    /// per-row valid mask widths (`past_lens[r] + 1`) so the caller can advance
+    /// the stepped rows after it has validated/consumed the forward's output.
+    /// Does **not** read results or advance `row_lens` — those differ between the
+    /// device-argmax and host-logits consumers.
+    fn run_ragged_forward(
+        &mut self,
+        tokens: &[TokenId],
+        past_lens: &[usize],
+        advances: &[bool],
+    ) -> anyhow::Result<Vec<usize>> {
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if tokens.len() != state.batch {
+            bail!(
+                "native CUDA batch greedy decode expects {} tokens (pinned batch), got {}",
+                state.batch,
+                tokens.len()
+            );
+        }
+        if past_lens.len() != state.batch || advances.len() != state.batch {
+            bail!(
+                "native CUDA ragged batch greedy decode expects {} per-row lengths and advances, \
+                 got {} / {}",
+                state.batch,
+                past_lens.len(),
+                advances.len()
+            );
+        }
+        if !state.greedy_fastpath_supported() {
+            bail!(
+                "native CUDA batch greedy decode requires the device-argmax fast path; this \
+                 decoder's logits binding does not support it"
+            );
+        }
+        // Per-row valid mask width (prefix + the new token) and the shared
+        // physical extent this step must cover.
+        let mut valid_lens = Vec::with_capacity(state.batch);
+        for &past_len in past_lens {
+            valid_lens.push(
+                past_len
+                    .checked_add(1)
+                    .context("native decode context length overflow")?,
+            );
+        }
+        let max_total = valid_lens
+            .iter()
+            .copied()
+            .max()
+            .context("native CUDA ragged batch requires at least one row")?;
+        if max_total > state.capacity.max_len {
+            bail!("{}", state.capacity_exceeded_error(max_total));
+        }
+        state.ensure_capacity(&mut self.session, max_total)?;
+        state.extend_mask_ragged(&valid_lens, state.decode_mask_expose_len(max_total))?;
+        state.write_decode_inputs_batch(tokens, past_lens)?;
+        if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
+            let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+            return Err(error.context(format!(
+                "native CUDA batch decoder forward pass failed{diagnosis}"
+            )));
+        }
+        Ok(valid_lens)
+    }
+
+    /// Advance the stepped rows' logical lengths after a ragged forward and
+    /// re-derive the shared physical extent. A held row (`advances[r] == false`)
+    /// keeps its length.
+    fn commit_ragged_advance(
+        &mut self,
+        valid_lens: &[usize],
+        advances: &[bool],
+    ) -> anyhow::Result<()> {
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        for (row, &advance) in advances.iter().enumerate() {
+            if advance {
+                state.row_lens[row] = valid_lens[row];
+            }
+        }
+        let new_max = state.row_lens.iter().copied().max().unwrap_or(0);
+        state.set_logical_len(new_max)?;
+        self.current_len = new_max;
+        Ok(())
     }
 }
 
@@ -906,10 +2416,13 @@ impl DecodeCudaState {
                 .iter()
                 .find(|meta| meta.name == *past)
                 .with_context(|| format!("missing CUDA KV input metadata for '{past}'"))?;
-            if !matches!(meta.dtype, DataType::Float32 | DataType::Float16) || meta.shape.len() != 4
+            if !matches!(
+                meta.dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            ) || meta.shape.len() != 4
             {
                 bail!(
-                    "CUDA KV input '{past}' must be rank-4 f32 or f16, got {:?} {:?}",
+                    "CUDA KV input '{past}' must be rank-4 f32, f16 or bf16, got {:?} {:?}",
                     meta.dtype,
                     meta.shape
                 );
@@ -954,24 +2467,52 @@ impl DecodeCudaState {
         Ok(bytes)
     }
 
+    /// Build the padded physical and initial logical shapes for a persistent KV
+    /// (`fixed == false`) or recurrent-state (`fixed == true`) binding.
+    ///
+    /// The KV shape is always **BNSH** `[batch, kv_heads, max_len, head_dim]`,
+    /// growing on axis 2, for *both* the head-major and seq-major layouts. The
+    /// `batch` axis-0 extent is threaded from the caller (stage 2b-impl-1, #750)
+    /// rather than hard-coded to `1`; every current caller passes `1`, so the
+    /// emitted shape is unchanged. Threading `batch` must **not** disturb the
+    /// axis order: the CUDA GQA node reads `present_capacity` from BNSH axis 2
+    /// regardless of `kv_layout`, so axis 0 stays batch and axis 2 stays seq.
+    /// This is deliberate and is the KV binding contract: the CUDA GQA node validates
+    /// `past_key`/`past_value` as `[batch, kv_heads, seq, head_dim]` and reads
+    /// `present_capacity` from axis 2 **regardless** of the `kv_layout`
+    /// attribute (which only re-specializes the kernel's stride arithmetic). A
+    /// seq-major binding therefore keeps this BNSH metadata shape; its BSNH
+    /// physical byte layout — and the capacity-independent fixed per-token stride
+    /// that lets it grow without moving data — is expressed by the growth/commit
+    /// geometry (`kv_growth_byte_layout`, `apply_vmm_growth`,
+    /// `build_grown_buffers`), not by permuting this shape. See
+    /// `docs/memory/MEMORY_ARCHITECTURE.md`, "KV layout and residency".
     pub(crate) fn persistent_state_shapes(
         name: &str,
         dtype: DataType,
         shape: &[Dim],
+        batch: usize,
         max_len: usize,
         fixed: bool,
     ) -> anyhow::Result<(Vec<usize>, Vec<usize>)> {
-        if !matches!(dtype, DataType::Float32 | DataType::Float16) {
-            bail!("CUDA decoder state input '{name}' must be f32 or f16, got {dtype:?} {shape:?}");
+        if !matches!(
+            dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) {
+            bail!(
+                "CUDA decoder state input '{name}' must be f32, f16 or bf16, got {dtype:?} {shape:?}"
+            );
         }
         if !fixed {
             if shape.len() != 4 {
-                bail!("CUDA KV input '{name}' must be rank-4 f32 or f16, got {dtype:?} {shape:?}");
+                bail!(
+                    "CUDA KV input '{name}' must be rank-4 f32, f16 or bf16, got {dtype:?} {shape:?}"
+                );
             }
             let mut physical_shape = Vec::with_capacity(4);
             for (axis, dim) in shape.iter().copied().enumerate() {
                 let value = if axis == 0 {
-                    1
+                    batch
                 } else if axis == 2 {
                     max_len
                 } else if let Dim::Static(value) = dim {
@@ -992,7 +2533,7 @@ impl DecodeCudaState {
             .enumerate()
             .map(|(axis, dim)| {
                 if axis == 0 {
-                    Ok(1)
+                    Ok(batch)
                 } else if let Dim::Static(value) = dim {
                     Ok(value)
                 } else {
@@ -1041,11 +2582,363 @@ impl DecodeCudaState {
         )
     }
 
-    fn ensure_capacity(
+    /// True when this session uses the seq-major fixed full-context stride path:
+    /// VMM commit-on-demand backing *and* a seq-major (BSNH) KV layout. On this
+    /// path the KV bindings report a physical shape pinned at the hard-max
+    /// context length while only the reached token stripes are committed, so
+    /// bucket growth changes no captured-graph dependency and the decode graph is
+    /// kept across growth. Head-major and the legacy realloc path return false.
+    fn seq_major_fixed_stride(&self) -> bool {
+        self.kv_commits_on_demand && self.kv_layout.is_seq_major()
+    }
+
+    /// A conservative signature of every binding's captured-graph dependencies
+    /// that KV growth could plausibly disturb: the device pointer (baked into
+    /// recorded graph nodes) and the reported physical shape (baked into kernel
+    /// argument extents / strides). If any entry differs across a growth commit,
+    /// the captured graph's assumptions changed and we must invalidate — this is
+    /// the defense-in-depth check behind the "provably unchanged -> keep" rule.
+    fn binding_growth_signature(&self) -> Vec<(usize, Vec<usize>)> {
+        self.bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.device_ptr() as usize,
+                    binding.physical_shape().to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    /// Per-binding [`KvBindingGeometry`] for a rank-4 BNSH KV binding
+    /// `[batch, kv_heads, capacity, head_dim]`, so the shared
+    /// [`kv_commit`] geometry (not a duplicated inline formula) decides the
+    /// committed byte ranges. Returns the geometry and the full-context
+    /// `capacity` (grow-axis stride) the layout is committed against.
+    fn kv_binding_geometry(
+        &self,
+        binding: &DeviceIoBinding,
+    ) -> anyhow::Result<(KvBindingGeometry, usize)> {
+        let shape = binding.physical_shape();
+        if shape.len() != 4 {
+            bail!(
+                "VMM-backed CUDA KV binding '{}' must be rank 4, got {:?}",
+                binding.input_name(),
+                shape
+            );
+        }
+        let elem_bytes = binding.dtype.checked_storage_bytes(1).with_context(|| {
+            format!(
+                "VMM-backed CUDA KV '{}' has unsized dtype {:?}",
+                binding.input_name(),
+                binding.dtype
+            )
+        })?;
+        let geometry = KvBindingGeometry {
+            kv_heads: shape[1],
+            head_dim: shape[3],
+            elem_bytes,
+        };
+        Ok((geometry, shape[2]))
+    }
+
+    /// KV-only commit requests for the seq-major fixed path: commit the dense
+    /// live-prefix ranges [`kv_commit::live_prefix_ranges`] computes for
+    /// [`KvCommitLayout::SeqMajor`] — one contiguous run
+    /// `0..(committed_len × kv_heads × head_dim × elem)` **per sequence** (batch
+    /// axis 0), each `capacity × kv_heads × head_dim × elem` apart, because
+    /// seq-major bytes are token-contiguous within a sequence and the per-
+    /// sequence stride is the fixed full-context `capacity`. At `batch == 1`
+    /// (the only value any current caller constructs, stage 2b-impl-2, #750) this
+    /// is exactly one run and byte-identical to the previous single-sequence
+    /// form; the batch axis is outermost, so committing `batch` sequences never
+    /// relocates any sequence's bytes. This is the *same* geometry unit the
+    /// driver-level residency measurement (`vmm_kv_layout_residency_gpu`) and the
+    /// `kv_commit.rs` unit tests exercise, so the live commit path and the
+    /// measured floor cannot drift apart. The mask is fully committed at
+    /// construction and never grows here, so — unlike [`Self::vmm_growth_requests`]
+    /// — no mask range is appended. Re-committing the already-mapped prefix is
+    /// idempotent; the governor only bills the newly mapped granules.
+    fn seq_major_kv_commit_requests(
+        &self,
+        committed_len: usize,
+    ) -> anyhow::Result<Vec<(usize, usize, usize)>> {
+        let mut requested = Vec::<(usize, usize, usize)>::new();
+        for index in self.kv_binding_range.clone() {
+            let binding = &self.bindings[index];
+            let (geometry, capacity) = self.kv_binding_geometry(binding)?;
+            let ranges = kv_commit::live_prefix_ranges(
+                KvCommitLayout::SeqMajor,
+                geometry,
+                self.batch,
+                capacity,
+                committed_len,
+            )
+            .with_context(|| {
+                format!(
+                    "seq-major VMM-backed CUDA KV '{}' dense-prefix commit ranges overflow \
+                     (capacity {capacity}, batch {}, committed_len {committed_len})",
+                    binding.input_name(),
+                    self.batch,
+                )
+            })?;
+            for range in ranges {
+                requested.push((index, range.start, range.end - range.start));
+            }
+        }
+        Ok(requested)
+    }
+
+    fn seq_major_commit_mapped_bytes(&self, committed_len: usize) -> anyhow::Result<u64> {
+        let requested = self.seq_major_kv_commit_requests(committed_len)?;
+        let ranges = requested
+            .iter()
+            .map(|&(index, offset, bytes)| (&self.bindings[index], offset, bytes))
+            .collect::<Vec<_>>();
+        self.bindings[0]
+            .mapped_bytes_for_binding_ranges(&ranges)
+            .context("size seq-major native CUDA KV commit transaction")
+    }
+
+    fn commit_seq_major_kv(
+        &mut self,
+        committed_len: usize,
+        grant: Option<&mut onnx_runtime_memory_governor::MappedGrowthGrant>,
+    ) -> anyhow::Result<u64> {
+        let requested = self.seq_major_kv_commit_requests(committed_len)?;
+        let ranges = requested
+            .iter()
+            .map(|&(index, offset, bytes)| (&self.bindings[index], offset, bytes))
+            .collect::<Vec<_>>();
+        match grant {
+            Some(grant) => {
+                self.bindings[0].commit_binding_ranges_with_mapped_growth(&ranges, grant)
+            }
+            None => {
+                self.bindings[0].commit_binding_ranges(&ranges)?;
+                Ok(0)
+            }
+        }
+        .context("commit seq-major native CUDA KV binding ranges atomically")
+    }
+
+    /// Zero the newly committed dense token stripe `[old_committed, new_committed)`
+    /// for **every sequence** on every KV binding. Not strictly required for
+    /// correctness (the kernel reads only `[0, total_lengths)`), but it keeps the
+    /// padding suffix zeroed exactly as the growing-bucket path does, guarding
+    /// against any future over-read touching uninitialized physical pages.
+    ///
+    /// Seq-major stores a sequence's tokens token-contiguously, so a sequence's
+    /// committed tail is one contiguous run; the `batch` sequences are a fixed
+    /// full-context `capacity × bytes_per_token` apart (batch axis outermost),
+    /// so this zeroes one run per sequence with no relocation (stage 2b-impl-2,
+    /// #750). At `batch == 1` this is a single memset byte-identical to the
+    /// previous contiguous-tail form.
+    fn zero_seq_major_committed_tail(
+        &self,
+        old_committed: usize,
+        new_committed: usize,
+    ) -> anyhow::Result<()> {
+        if new_committed <= old_committed {
+            return Ok(());
+        }
+        for index in self.kv_binding_range.clone() {
+            let binding = &self.bindings[index];
+            let (geometry, capacity) = self.kv_binding_geometry(binding)?;
+            let bytes_per_token = geometry
+                .bytes_per_token()
+                .context("seq-major committed-tail bytes-per-token overflow")?;
+            let per_sequence_stride = capacity
+                .checked_mul(bytes_per_token)
+                .context("seq-major committed-tail per-sequence stride overflow")?;
+            let tail_offset = old_committed
+                .checked_mul(bytes_per_token)
+                .context("seq-major committed-tail offset overflow")?;
+            let tail_bytes = (new_committed - old_committed)
+                .checked_mul(bytes_per_token)
+                .context("seq-major committed-tail byte count overflow")?;
+            let ptr = binding.device_ptr() as usize;
+            for sequence in 0..self.batch {
+                let base = sequence
+                    .checked_mul(per_sequence_stride)
+                    .context("seq-major committed-tail sequence base overflow")?;
+                native_cuda_memset_zero(ptr + base + tail_offset, tail_bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record and surface a KV-growth capture decision (kept vs invalidated) with
+    /// the named rationale, so an operator can attribute why a captured graph
+    /// survived or was discarded across a growth. A silent "kept" is as dangerous
+    /// as a silent capture decline, so every keep is both counted and logged.
+    fn record_growth_decision(&mut self, kept: bool, reason: &str) {
+        if kept {
+            self.graph_growth_keeps = self.graph_growth_keeps.saturating_add(1);
+        }
+        let verb = if kept { "kept" } else { "invalidated" };
+        tracing::info!(
+            kept,
+            reason,
+            growth_keeps = self.graph_growth_keeps,
+            invalidations = self.graph_invalidations,
+            "native CUDA decode graph {verb} across KV growth"
+        );
+        self.graph_growth_decision = Some(format!("{verb}: {reason}"));
+    }
+
+    /// Grow the seq-major fixed full-context stride KV cache by committing more
+    /// token stripes on demand, keeping the captured decode graph alive.
+    ///
+    /// The reported physical shape stays pinned at the hard maximum and every
+    /// device pointer stays fixed, so none of the captured graph's baked
+    /// dependencies change; we verify that invariant (device pointers + physical
+    /// shapes) before deciding to keep, and invalidate if anything moved. This is
+    /// the "provably unchanged -> keep" branch: seq-major addressing at batch
+    /// index 0 is capacity-independent (proven byte-identical with 0 bytes moved
+    /// by #805), so the graph replays correctly into the newly committed pages.
+    fn ensure_capacity_seq_major_fixed(
         &mut self,
         session: &mut InferenceSession,
         required: usize,
     ) -> anyhow::Result<bool> {
+        if required > self.capacity.max_len {
+            bail!("{}", self.capacity_exceeded_error(required));
+        }
+        if required <= self.kv_committed_len {
+            return Ok(false);
+        }
+        let old_committed = self.kv_committed_len;
+        let new_committed = onnx_genai_kv::kv_capacity_bucket(required, self.capacity.max_len);
+
+        // Defense in depth: snapshot the dependency signature before mutating any
+        // mapping so we can prove nothing the captured graph baked in moved.
+        let before = self.binding_growth_signature();
+
+        let mapped_growth_bytes = self.seq_major_commit_mapped_bytes(new_committed)?;
+        let mut grant = session
+            .prepare_mapped_growth(
+                mapped_growth_bytes,
+                onnx_runtime_memory_governor::MemoryRole::KvCache,
+            )
+            .context("prepare transactional seq-major native CUDA KV commit")?;
+        tracing::info!(
+            mapped_growth_bytes,
+            grant_prepared = grant.is_some(),
+            "prepared seq-major native CUDA KV commit transaction"
+        );
+        let actual_mapped_bytes = self
+            .commit_seq_major_kv(new_committed, grant.as_mut())
+            .map_err(|error| {
+                let memory = cuda_device_memory_snapshot(session.device_id().index as i32)
+                    .map_err(|error| error.to_string());
+                self.growth_failed_error(old_committed, new_committed, error, memory)
+            })?;
+        if let Some(grant) = grant {
+            grant
+                .commit_bytes(actual_mapped_bytes)
+                .context("commit seq-major native CUDA KV mapped-growth attribution")?;
+        }
+        native_cuda_device_barrier(session)?;
+        self.zero_seq_major_committed_tail(old_committed, new_committed)?;
+
+        // The reported physical shape and device pointers are unchanged by an
+        // on-demand commit; verify that before we keep the graph. If anything did
+        // move, default to invalidating — a wrong keep would corrupt output.
+        let after = self.binding_growth_signature();
+        if before == after {
+            self.record_growth_decision(
+                true,
+                "seq-major fixed full-context stride: device pointers and physical shapes unchanged, \
+                 batch-0 addressing capacity-independent, mask fully committed",
+            );
+        } else {
+            self.invalidate_graph(session)?;
+            self.record_growth_decision(
+                false,
+                "seq-major commit unexpectedly changed a binding device pointer or physical shape",
+            );
+        }
+
+        self.kv_committed_len = new_committed;
+        self.kv_growth_events += 1;
+        // Seq-major growth moves no KV bytes — the valid prefix keeps its offsets.
+        tracing::info!(
+            old_committed_len = old_committed,
+            new_committed_len = new_committed,
+            hard_max_len = self.capacity.max_len,
+            "committed seq-major native CUDA KV stripe on demand (fixed stride)"
+        );
+        Ok(true)
+    }
+
+    pub(super) fn ensure_capacity(
+        &mut self,
+        session: &mut InferenceSession,
+        required: usize,
+    ) -> anyhow::Result<bool> {
+        if self.seq_major_fixed_stride() {
+            return self.ensure_capacity_seq_major_fixed(session, required);
+        }
+        if self.kv_commits_on_demand {
+            if required > self.capacity.max_len {
+                bail!("{}", self.capacity_exceeded_error(required));
+            }
+            if required <= self.max_len {
+                return Ok(false);
+            }
+            let old_capacity = self.max_len;
+            let new_capacity = onnx_genai_kv::kv_capacity_bucket(required, self.capacity.max_len);
+            let valid_len = self.logical_len;
+            let mapped_growth_bytes = self.vmm_growth_mapped_bytes(new_capacity)?;
+            let mut grant = session
+                .prepare_mapped_growth(
+                    mapped_growth_bytes,
+                    onnx_runtime_memory_governor::MemoryRole::KvCache,
+                )
+                .context("prepare transactional native CUDA KV growth")?;
+            tracing::info!(
+                mapped_growth_bytes,
+                grant_prepared = grant.is_some(),
+                "prepared native CUDA KV mapped-growth transaction"
+            );
+            let actual_mapped_bytes = self
+                .commit_vmm_growth(new_capacity, grant.as_mut())
+                .map_err(|error| {
+                    let memory = cuda_device_memory_snapshot(session.device_id().index as i32)
+                        .map_err(|error| error.to_string());
+                    self.growth_failed_error(old_capacity, new_capacity, error, memory)
+                })?;
+            if let Some(grant) = grant {
+                grant
+                    .commit_bytes(actual_mapped_bytes)
+                    .context("commit native CUDA KV mapped-growth attribution")?;
+            }
+            native_cuda_device_barrier(session)?;
+            self.apply_vmm_growth(new_capacity, valid_len)?;
+            self.invalidate_graph(session)?;
+            self.max_len = new_capacity;
+            self.kv_growth_events += 1;
+            // Seq-major grows in place on a fixed per-token stride, so the valid
+            // prefix keeps its byte offsets and no KV data is copied; head-major
+            // re-strides every head stripe, moving `valid_len × bytes_per_token`.
+            let moved_bytes_per_token = if self.kv_layout.is_seq_major() {
+                0
+            } else {
+                self.capacity.bytes_per_token as u64
+            };
+            self.kv_growth_d2d_copy_bytes = self
+                .kv_growth_d2d_copy_bytes
+                .saturating_add((valid_len as u64).saturating_mul(moved_bytes_per_token));
+            tracing::info!(
+                old_len = old_capacity,
+                new_len = new_capacity,
+                valid_len,
+                hard_max_len = self.capacity.max_len,
+                "grew VMM-backed native CUDA KV capacity bucket in place"
+            );
+            return Ok(true);
+        }
         let mut backend = NativeCudaCapacityBackend {
             state: self,
             session,
@@ -1057,6 +2950,12 @@ impl DecodeCudaState {
                 new_capacity,
                 valid_len,
             } => {
+                backend.state.kv_growth_events += 1;
+                backend.state.kv_growth_d2d_copy_bytes =
+                    backend.state.kv_growth_d2d_copy_bytes.saturating_add(
+                        (valid_len as u64)
+                            .saturating_mul(backend.state.capacity.bytes_per_token as u64),
+                    );
                 tracing::info!(
                     old_len = old_capacity,
                     new_len = new_capacity,
@@ -1067,6 +2966,204 @@ impl DecodeCudaState {
                 Ok(true)
             }
         }
+    }
+
+    /// Commit every byte the next VMM-backed bucket can touch before mutating
+    /// any live KV.
+    ///
+    /// This keeps growth transactional with respect to model state: a tight
+    /// card may refuse the new granule, but then all layer bindings still expose
+    /// the old shapes and hold the old layout. Extra committed granules are
+    /// only installed after their lease succeeds, so the governor remains the
+    /// single source of memory truth.
+    fn commit_vmm_growth(
+        &mut self,
+        new_capacity: usize,
+        grant: Option<&mut onnx_runtime_memory_governor::MappedGrowthGrant>,
+    ) -> anyhow::Result<u64> {
+        let requested = self.vmm_growth_requests(new_capacity)?;
+        let ranges = requested
+            .iter()
+            .map(|&(index, offset, bytes)| (&self.bindings[index], offset, bytes))
+            .collect::<Vec<_>>();
+        match grant {
+            Some(grant) => {
+                self.bindings[0].commit_binding_ranges_with_mapped_growth(&ranges, grant)
+            }
+            None => {
+                self.bindings[0].commit_binding_ranges(&ranges)?;
+                Ok(0)
+            }
+        }
+        .context("commit native CUDA KV binding ranges atomically")
+    }
+
+    fn vmm_growth_mapped_bytes(&self, new_capacity: usize) -> anyhow::Result<u64> {
+        let requested = self.vmm_growth_requests(new_capacity)?;
+        let ranges = requested
+            .iter()
+            .map(|&(index, offset, bytes)| (&self.bindings[index], offset, bytes))
+            .collect::<Vec<_>>();
+        self.bindings[0]
+            .mapped_bytes_for_binding_ranges(&ranges)
+            .context("size native CUDA KV mapped-growth transaction")
+    }
+
+    /// Growth commit requests for the **head-major** (and non-fixed-stride)
+    /// VMM path: a single flat range `0..(new_capacity × kv_heads × head_dim ×
+    /// elem)` per KV binding, plus the mask island.
+    ///
+    /// This is deliberately left as the flat **bucket** range rather than routed
+    /// through [`kv_commit::live_prefix_ranges`], and it is byte-identical to the
+    /// dense head-major geometry here: head-major grows a *packed* bucket whose
+    /// per-head stride is `new_capacity` (the bucket, not a fixed full context),
+    /// so each head's stripe is contiguous with the next and the `kv_heads`
+    /// live-prefix fragments `live_prefix_ranges` would return tile the same
+    /// `[0, bucket_bytes)` run — they touch exactly the same physical granules.
+    /// The `kv_heads×` scatter that separates head-major from seq-major only
+    /// appears on a *fixed full-context* stride (where a head stripe is
+    /// `max_len × head_dim × elem` apart, crossing a granule once
+    /// `capacity × head_dim × elem ≥ granule`, i.e. ≈8192 tokens at head_dim
+    /// 128/fp16, #776); the growing bucket keeps head-major dense, so its dense
+    /// ranges equal its bucket ranges and it stays byte-identical (see
+    /// `docs/memory/MEMORY_ARCHITECTURE.md`, "KV layout and residency"). Seq-major
+    /// instead reports a fixed full-context stride and commits its dense prefix
+    /// through [`Self::seq_major_kv_commit_requests`].
+    ///
+    /// **Batch generality (stage 2b-impl-2, #750).** The per-binding KV range is
+    /// `checked_shape_bytes` of the physical shape whose axis 0 is `batch`, so
+    /// the flat range already spans `batch × kv_heads × new_capacity × head_dim`
+    /// bytes: a head-major packed bucket is dense from offset 0 across all `batch`
+    /// sequences, so one flat `0..bucket_bytes` run is correct at any batch (this
+    /// path only ever runs head-major — seq-major takes the fixed-stride commit).
+    /// The mask island spans `batch` rows. At `batch == 1` this is byte-identical.
+    fn vmm_growth_requests(
+        &self,
+        new_capacity: usize,
+    ) -> anyhow::Result<Vec<(usize, usize, usize)>> {
+        let mut requested = Vec::<(usize, usize, usize)>::new();
+        for index in self.kv_binding_range.clone() {
+            let binding = &self.bindings[index];
+            let mut new_shape = binding.physical_shape().to_vec();
+            if new_shape.len() != 4 {
+                bail!(
+                    "VMM-backed CUDA KV binding '{}' must be rank 4, got {:?}",
+                    binding.input_name(),
+                    new_shape
+                );
+            }
+            new_shape[2] = new_capacity;
+            let bytes = checked_shape_bytes(&new_shape, binding.dtype).with_context(|| {
+                format!(
+                    "VMM-backed CUDA KV '{}' growth size overflows for shape {:?}",
+                    binding.input_name(),
+                    new_shape
+                )
+            })?;
+            requested.push((index, 0, bytes));
+        }
+        let mask_bytes = new_capacity
+            .checked_mul(std::mem::size_of::<i64>())
+            .and_then(|row_bytes| row_bytes.checked_mul(self.batch))
+            .with_context(|| {
+                format!("VMM-backed CUDA mask growth overflows for capacity {new_capacity}")
+            })?;
+        requested.push((0, 0, mask_bytes));
+        Ok(requested)
+    }
+
+    /// Grow VMM-backed KV in place, keeping the reserved address range stable.
+    ///
+    /// The allocation is sized for full context at construction, but kernels see
+    /// only the current bucket as the physical shape. On growth we commit the
+    /// larger bucket, move each head's valid prefix from the old stride to the
+    /// new stride, and zero the newly visible suffix. This prevents the failure
+    /// where a "reserved" KV cache secretly commits the full context at load,
+    /// while preserving the fixed-stride padded shape CUDA graph capture expects
+    /// inside one bucket.
+    fn apply_vmm_growth(&mut self, new_capacity: usize, valid_len: usize) -> anyhow::Result<()> {
+        // All fallible commits have already succeeded, so the expected
+        // tight-card failure path is transactional. A later CUDA copy/memset
+        // failure can still leave mixed old/new strides; #699 tracks adding a
+        // poison/reset path rather than hiding that rarer device failure here.
+        let layout = self.kv_layout;
+        for binding in &mut self.bindings[self.kv_binding_range.clone()] {
+            let old_shape = binding.physical_shape().to_vec();
+            if old_shape.len() != 4 {
+                bail!(
+                    "VMM-backed CUDA KV binding '{}' must be rank 4, got {:?}",
+                    binding.input_name(),
+                    old_shape
+                );
+            }
+            let mut new_shape = old_shape.clone();
+            new_shape[2] = new_capacity;
+            let elem = binding.dtype.checked_storage_bytes(1).with_context(|| {
+                format!(
+                    "VMM-backed CUDA KV '{}' has unsized dtype {:?}",
+                    binding.input_name(),
+                    binding.dtype
+                )
+            })?;
+            let ptr = binding.device_ptr() as usize;
+            // Move/zero over the *physical* byte layout. Head-major re-strides
+            // each head stripe on axis 2 (unchanged); seq-major grows on axis 1
+            // with a capacity-independent per-token stride, so the in-place copy
+            // is a no-op and only the newly grown tail is zeroed — no KV moves.
+            let (old_bytes, grow_axis) = kv_growth_byte_layout(&old_shape, layout)?;
+            let (new_bytes, _) = kv_growth_byte_layout(&new_shape, layout)?;
+            copy_kv_prefix_device_to_device_in_place(
+                ptr, &old_bytes, &new_bytes, grow_axis, valid_len, elem,
+            )?;
+            zero_kv_suffix_device(ptr, &new_bytes, grow_axis, valid_len, elem)?;
+            let mut logical_shape = new_shape.clone();
+            logical_shape[2] = valid_len;
+            binding.set_physical_and_logical_shapes(new_shape, logical_shape)?;
+        }
+        self.grow_vmm_mask_in_place(new_capacity, valid_len)?;
+        Ok(())
+    }
+
+    fn initial_vmm_kv_committed_range(
+        physical_shape: &[usize],
+        dtype: DataType,
+    ) -> anyhow::Result<std::ops::Range<usize>> {
+        let bytes = checked_shape_bytes(physical_shape, dtype)
+            .context("initial VMM-backed CUDA KV bucket size overflow")?;
+        Ok(0..bytes)
+    }
+
+    fn full_vmm_kv_allocation_bytes(
+        physical_shape: &[usize],
+        dtype: DataType,
+        max_len: usize,
+    ) -> anyhow::Result<usize> {
+        let mut full_shape = physical_shape.to_vec();
+        full_shape[2] = max_len;
+        checked_shape_bytes(&full_shape, dtype)
+            .context("full VMM-backed CUDA KV reservation size overflow")
+    }
+
+    fn grow_vmm_mask_in_place(
+        &mut self,
+        new_capacity: usize,
+        valid_len: usize,
+    ) -> anyhow::Result<()> {
+        // The mask binding is `[batch, new_capacity]`; the committed byte extent
+        // and the zeroing span all `batch` rows (stage 2b-impl-2, #750). At
+        // `batch == 1` this is byte-identical to the previous single-row memset.
+        let bytes = new_capacity
+            .checked_mul(std::mem::size_of::<i64>())
+            .and_then(|row_bytes| row_bytes.checked_mul(self.batch))
+            .with_context(|| {
+                format!("VMM-backed CUDA mask growth overflows for capacity {new_capacity}")
+            })?;
+        native_cuda_memset_zero(self.bindings[0].device_ptr() as usize, bytes)?;
+        self.bindings[0].set_physical_and_logical_shapes(
+            vec![self.batch, new_capacity],
+            vec![self.batch, valid_len],
+        )?;
+        Ok(())
     }
 
     /// Collect the symbolic dimension ids that the native decoder structurally
@@ -1110,16 +3207,23 @@ impl DecodeCudaState {
         name: &str,
         dtype: DataType,
         shape: &[Dim],
+        batch: usize,
     ) -> anyhow::Result<Vec<usize>> {
         if matches!(dtype, DataType::Undefined | DataType::String) {
             bail!(
                 "cannot bind auxiliary CUDA graph output '{name}' persistently: dtype {dtype:?} does not have fixed-size device tensor storage, but CUDA graph capture requires every declared graph output to use stable device storage; export this output as a numeric tensor or remove the unused graph output"
             );
         }
+        // The batch axis (0) collapses to the threaded `batch` extent; every
+        // other symbolic axis is a decode-unit (query-seq) that stays `1`. At
+        // batch 1 (the only value any current caller passes) this is byte-
+        // identical to the historical "collapse every symbolic dim to 1".
         let shape = shape
             .iter()
-            .map(|dim| match dim {
+            .enumerate()
+            .map(|(axis, dim)| match dim {
                 Dim::Static(value) => *value,
+                Dim::Symbolic(_) if axis == 0 => batch,
                 Dim::Symbolic(_) => 1,
             })
             .collect::<Vec<_>>();
@@ -1138,24 +3242,91 @@ impl DecodeCudaState {
         Ok(shape)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         session: &mut InferenceSession,
         io: DecodeCudaIo<'_>,
         present_to_past: &HashMap<String, String>,
         fixed_state_inputs: &HashSet<String>,
         capacity: CudaKvCapacity,
-        graph_enabled: bool,
+        mut graph_capture: GraphCaptureDecision,
         position_rank: usize,
+        kv_layout: KvCommitLayout,
+        requested_batch: Option<usize>,
     ) -> anyhow::Result<Self> {
-        let max_len = onnx_genai_kv::kv_capacity_bucket(0, capacity.max_len);
-        let mut mask = session.allocate_device_binding(
-            io.attention_mask,
-            None::<String>,
-            DataType::Int64,
-            vec![1, max_len],
-            vec![1, max_len],
-        )?;
-        mask.write_bytes(0, &vec![0; max_len * std::mem::size_of::<i64>()])?;
+        let kv_commits_on_demand = session.commits_on_demand();
+        // Stage 2b-impl-4 (#750): the persistent decode bindings are shaped for
+        // `batch` sequences and batch-N is now turned ON. The batch extent comes
+        // from `requested_batch` (how `--max-batch` reaches here) or, failing
+        // that, `ONNX_GENAI_NATIVE_DECODE_BATCH`, defaulting to `1`. It is pinned
+        // for the whole session so CUDA-graph capture binds a stable batch shape
+        // (capture requires stable shapes). At the default `batch == 1`
+        // every emitted shape, IO binding, mask/token/position write, KV commit
+        // geometry and device-argmax read-back is byte-identical to the previous
+        // hard-coded `1`, so decode stays the #750 byte-identity reference.
+        let batch = resolve_native_decode_batch(requested_batch)?;
+        // Seq-major KV addressing is capacity-independent at batch index 0 (the
+        // only index native decode uses): token `t` always lands at
+        // `t * kv_heads * head_dim`, and the baked `cache_capacity` scalar only
+        // scales the batch term (= 0 here). So a seq-major VMM binding can report
+        // a *fixed* full-context physical stride while committing token stripes
+        // on demand — growth then changes neither device pointer nor physical
+        // shape nor addressing, and the captured decode graph survives it. Head-
+        // major uses `cache_capacity` as the per-head stride, so its addressing
+        // shifts on growth and it must keep the growing-bucket (re-capture) model.
+        // The legacy realloc path (no VMM) also keeps the growing-bucket model.
+        let seq_major_fixed = kv_commits_on_demand && kv_layout.is_seq_major();
+        let initial_bucket_len = onnx_genai_kv::kv_capacity_bucket(0, capacity.max_len);
+        // The capacity reported to the bindings (physical axis-2 / mask island).
+        // Seq-major fixed stride pins this at the hard maximum from the start;
+        // everything else starts at the initial bucket and grows it.
+        let reported_len = if seq_major_fixed {
+            capacity.max_len
+        } else {
+            initial_bucket_len
+        };
+        let max_len = reported_len;
+        // The mask binding is `[batch, len]`, so its committed / reserved byte
+        // extents span `batch` rows (stage 2b-impl-2, #750). Every current
+        // caller constructs at `batch == 1`, so the emitted byte counts are
+        // byte-identical to the previous single-row `len × i64` computation.
+        let mask_bytes = batch
+            .checked_mul(max_len)
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<i64>()))
+            .context("initial CUDA mask size overflow")?;
+        let full_mask_bytes = batch
+            .checked_mul(capacity.max_len)
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<i64>()))
+            .context("full CUDA mask reservation size overflow")?;
+        // Seq-major fixed stride commits the whole (tiny) mask at construction so
+        // the mask island is shape-static at the hard max and never grows; every
+        // other path commits only the initial mask bucket and grows it in place.
+        let mask_committed_bytes = if seq_major_fixed {
+            full_mask_bytes
+        } else {
+            mask_bytes
+        };
+        let mask = if kv_commits_on_demand {
+            let committed = std::iter::once(0..mask_committed_bytes).collect::<Vec<_>>();
+            session.allocate_device_binding_committed(
+                io.attention_mask,
+                None::<String>,
+                DataType::Int64,
+                vec![batch, max_len],
+                vec![batch, max_len],
+                full_mask_bytes,
+                committed,
+            )?
+        } else {
+            session.allocate_device_binding(
+                io.attention_mask,
+                None::<String>,
+                DataType::Int64,
+                vec![batch, max_len],
+                vec![batch, max_len],
+            )?
+        };
+        native_cuda_memset_zero(mask.device_ptr() as usize, mask_committed_bytes)?;
 
         let mut pairs = present_to_past
             .iter()
@@ -1175,17 +3346,79 @@ impl DecodeCudaState {
                 .iter()
                 .find(|meta| meta.name == *past)
                 .with_context(|| format!("missing CUDA KV input metadata for '{past}'"))?;
-            let (physical_shape, logical_shape) =
-                Self::persistent_state_shapes(past, meta.dtype, &meta.shape, max_len, false)?;
-            bindings.push(session.allocate_device_binding(
-                past.clone(),
-                Some(present.clone()),
+            let (physical_shape, logical_shape) = Self::persistent_state_shapes(
+                past,
                 meta.dtype,
-                physical_shape,
-                logical_shape,
-            )?);
+                &meta.shape,
+                batch,
+                max_len,
+                false,
+            )?;
+            let binding = if kv_commits_on_demand {
+                let allocation_bytes = Self::full_vmm_kv_allocation_bytes(
+                    &physical_shape,
+                    meta.dtype,
+                    capacity.max_len,
+                )
+                .with_context(|| {
+                    format!("sizing full VMM-backed CUDA KV reservation for '{past}'")
+                })?;
+                let initial_range = if seq_major_fixed {
+                    // Physical shape is pinned at the hard max, but only the
+                    // initial dense token prefix is mapped; growth commits more
+                    // stripes without ever changing the reported shape.
+                    let mut initial_shape = physical_shape.clone();
+                    initial_shape[2] = initial_bucket_len;
+                    Self::initial_vmm_kv_committed_range(&initial_shape, meta.dtype).with_context(
+                        || format!("sizing initial VMM-backed CUDA KV bucket for '{past}'"),
+                    )?
+                } else {
+                    Self::initial_vmm_kv_committed_range(&physical_shape, meta.dtype).with_context(
+                        || format!("sizing initial VMM-backed CUDA KV bucket for '{past}'"),
+                    )?
+                };
+                session.allocate_device_binding_committed(
+                    past.clone(),
+                    Some(present.clone()),
+                    meta.dtype,
+                    physical_shape,
+                    logical_shape,
+                    allocation_bytes,
+                    vec![initial_range],
+                )?
+            } else {
+                session.allocate_device_binding(
+                    past.clone(),
+                    Some(present.clone()),
+                    meta.dtype,
+                    physical_shape,
+                    logical_shape,
+                )?
+            };
+            bindings.push(binding);
         }
         let kv_end = bindings.len();
+        if kv_commits_on_demand {
+            for binding in &mut bindings[kv_start..kv_end] {
+                // Zero only the committed region. For seq-major fixed stride the
+                // physical shape is the hard max but only `initial_bucket_len`
+                // tokens are mapped, so zeroing the full shape would touch
+                // uncommitted pages and fault.
+                let mut committed_shape = binding.physical_shape().to_vec();
+                if seq_major_fixed {
+                    committed_shape[2] = initial_bucket_len;
+                }
+                let bytes =
+                    checked_shape_bytes(&committed_shape, binding.dtype).with_context(|| {
+                        format!(
+                            "initial VMM-backed CUDA KV '{}' bucket size overflows for shape {:?}",
+                            binding.input_name(),
+                            committed_shape
+                        )
+                    })?;
+                native_cuda_memset_zero(binding.device_ptr() as usize, bytes)?;
+            }
+        }
         for (present, past) in pairs
             .iter()
             .filter(|(_, past)| fixed_state_inputs.contains(past))
@@ -1196,7 +3429,7 @@ impl DecodeCudaState {
                 .find(|meta| meta.name == *past)
                 .with_context(|| format!("missing fixed CUDA state input metadata for '{past}'"))?;
             let (physical_shape, logical_shape) =
-                Self::persistent_state_shapes(past, meta.dtype, &meta.shape, max_len, true)?;
+                Self::persistent_state_shapes(past, meta.dtype, &meta.shape, batch, max_len, true)?;
             let binding = session.allocate_device_binding(
                 past.clone(),
                 Some(present.clone()),
@@ -1221,11 +3454,13 @@ impl DecodeCudaState {
             .iter()
             .find(|meta| meta.name == io.logits)
             .with_context(|| format!("missing CUDA logits output metadata for '{}'", io.logits))?;
-        if !matches!(logits_meta.dtype, DataType::Float32 | DataType::Float16)
-            || logits_meta.shape.is_empty()
+        if !matches!(
+            logits_meta.dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) || logits_meta.shape.is_empty()
         {
             bail!(
-                "CUDA logits output '{}' must be non-scalar f32 or f16, got {:?} {:?}",
+                "CUDA logits output '{}' must be non-scalar f32, f16 or bf16, got {:?} {:?}",
                 io.logits,
                 logits_meta.dtype,
                 logits_meta.shape
@@ -1233,7 +3468,7 @@ impl DecodeCudaState {
         }
         let logits_dtype = logits_meta.dtype;
         let logits_shape =
-            Self::persistent_output_shape(io.logits, logits_dtype, &logits_meta.shape)?;
+            Self::persistent_output_shape(io.logits, logits_dtype, &logits_meta.shape, batch)?;
         let logits_device_binding = session.allocate_device_output_binding(
             io.logits,
             logits_dtype,
@@ -1316,7 +3551,16 @@ impl DecodeCudaState {
                 ));
                 continue;
             }
-            let shape = Self::persistent_output_shape(&meta.name, meta.dtype, &meta.shape)?;
+            // Batch-symbol pinning (stage 2b-impl-4, #750): auxiliary outputs
+            // whose axis 0 is the batch symbol are bound at the pinned `batch`
+            // extent, exactly like the logits binding, so CUDA-graph capture
+            // admits a batch-N grid for every declared output rather than sizing
+            // one output to `1` and mis-shaping the replay. `persistent_output_shape`
+            // maps a symbolic axis 0 → `batch` and every other symbolic (decode-
+            // unit) axis → `1`; the `unresolved_symbolic_axis` gate above has
+            // already declined any output with a non-unit symbolic axis. At
+            // `batch == 1` this is byte-identical to the historical collapse.
+            let shape = Self::persistent_output_shape(&meta.name, meta.dtype, &meta.shape, batch)?;
             bindings.push(
                 session
                     .allocate_device_output_binding(
@@ -1341,11 +3585,14 @@ impl DecodeCudaState {
         // host mid-capture). Decline capture up front, with a clear structural
         // reason, and fall back to the eager device path — which still decodes
         // correctly by dynamically allocating the unbindable output each step.
-        let graph_enabled = if !declined_auxiliary.is_empty() {
-            if graph_enabled {
-                tracing::warn!(
-                    "native CUDA decode graph capture disabled: auxiliary output(s) {} carry unresolved symbolic dimensions that cannot be collapsed to a fixed persistent device binding; decode continues eagerly with dynamic allocation for those outputs",
-                    declined_auxiliary.join(", ")
+        if !declined_auxiliary.is_empty() {
+            if graph_capture.is_enabled() {
+                graph_capture.decline_if_enabled(
+                    "auxiliary_outputs_have_fixed_persistent_shapes",
+                    format_args!(
+                        "auxiliary output(s) {} carry unresolved symbolic dimensions",
+                        declined_auxiliary.join(", ")
+                    ),
                 );
             } else {
                 tracing::debug!(
@@ -1353,10 +3600,7 @@ impl DecodeCudaState {
                     declined_auxiliary.join(", ")
                 );
             }
-            false
-        } else {
-            graph_enabled
-        };
+        }
 
         let input_ids_binding = bindings.len();
         if let Some(embeds) = &io.inputs_embeds {
@@ -1370,27 +3614,28 @@ impl DecodeCudaState {
                 embeds.name,
                 None::<String>,
                 embeds.dtype,
-                vec![1, 1, embeds.hidden],
-                vec![1, 1, embeds.hidden],
+                vec![batch, 1, embeds.hidden],
+                vec![batch, 1, embeds.hidden],
             )?);
         } else {
             bindings.push(session.allocate_device_binding(
                 io.input_ids,
                 None::<String>,
                 DataType::Int64,
-                vec![1, 1],
-                vec![1, 1],
+                vec![batch, 1],
+                vec![batch, 1],
             )?);
         }
         let position_ids_binding = if let Some(position_ids) = io.position_ids {
             let index = bindings.len();
             // A rank-N mrope decoder declares `position_ids [N, B, S]`; the single
-            // decode step collapses batch/sequence to 1 → `[N, 1, 1]`. Rank 1 is
-            // the conventional `[1, 1]`, byte-identical to before.
+            // decode step collapses sequence to 1 → `[N, batch, 1]`. Rank 1 is
+            // the conventional `[batch, 1]`. At `batch == 1` this is byte-
+            // identical to the historical `[1, 1]` / `[N, 1, 1]`.
             let shape = if position_rank == 1 {
-                vec![1, 1]
+                vec![batch, 1]
             } else {
-                vec![position_rank, 1, 1]
+                vec![position_rank, batch, 1]
             };
             bindings.push(session.allocate_device_binding(
                 position_ids,
@@ -1440,22 +3685,26 @@ impl DecodeCudaState {
             let vocab = *logits_shape
                 .last()
                 .context("CUDA logits shape has no vocabulary dimension")?;
-            2 + onnx_runtime_ep_cuda::device_argmax_scratch_words(vocab)
+            // The device-argmax result buffer holds a `2 × batch` header (a token
+            // id + capture-error pair per sequence) plus per-sequence scratch
+            // (stage 2b-impl-3, #750). At `batch == 1` this is byte-identical to
+            // the previous `2 + scratch_words(vocab)` allocation.
+            2 * batch + onnx_runtime_ep_cuda::device_argmax_scratch_words(vocab, batch)
         };
         #[cfg(not(feature = "cuda"))]
-        let argmax_words = 2;
+        let argmax_words = 2 * batch;
         let greedy_result = session.allocate_device_output_binding(
             "__native_greedy_argmax",
             DataType::Uint32,
             vec![argmax_words],
-            vec![2],
+            vec![2 * batch],
         )?;
 
         // A graph records launch geometry, so replay is unsafe when a persistent
         // binding exposes a growing logical prefix instead of fixed capacity.
-        // Surfacing *which* bindings force the eager fallback (previously a
-        // silent `graph_enabled = false`) is essential for capture bring-up of
-        // new architectures — enable with `RUST_LOG=onnx_genai_engine=debug`.
+        // Surfacing *which* bindings force the eager fallback is essential for
+        // capture bring-up of new architectures, so the decision below retains
+        // their names for the session warning and debug/profile statistics.
         let dynamic_logical: Vec<String> = bindings
             .iter()
             .filter(|binding| binding.has_dynamic_logical_input_shape())
@@ -1468,10 +3717,13 @@ impl DecodeCudaState {
                 )
             })
             .collect();
-        if graph_enabled && !dynamic_logical.is_empty() {
-            tracing::debug!(
-                "native CUDA decode graph capture disabled: input binding(s) {} expose a growing logical prefix instead of fixed capacity (their consumers are not capacity-aware kernels); decode continues eagerly",
-                dynamic_logical.join(", ")
+        if graph_capture.is_enabled() && !dynamic_logical.is_empty() {
+            graph_capture.decline_if_enabled(
+                "persistent_inputs_have_fixed_logical_shapes",
+                format_args!(
+                    "input binding(s) {} expose a growing logical prefix instead of fixed capacity",
+                    dynamic_logical.join(", ")
+                ),
             );
         }
         // The attention-mask binding (bindings[0]) is allocated with the
@@ -1488,13 +3740,22 @@ impl DecodeCudaState {
         let mask_exposes_logical = bindings
             .first()
             .is_some_and(DeviceIoBinding::exposes_logical_input_shape);
-        if graph_enabled && mask_exposes_logical {
-            tracing::debug!(
-                "native CUDA decode graph capture disabled: attention-mask binding '{}' exposes its logical valid length to a non-capacity-aware consumer (e.g. an indexer arithmetic branch); single-token decode uses the growing logical mask width and continues eagerly",
-                bindings[0].input_name()
+        if graph_capture.is_enabled() && mask_exposes_logical {
+            graph_capture.decline_if_enabled(
+                "attention_mask_consumers_are_capacity_aware",
+                format_args!(
+                    "attention-mask binding '{}' exposes its logical valid length to a non-capacity-aware consumer",
+                    bindings[0].input_name()
+                ),
             );
         }
-        let graph_enabled = graph_enabled && dynamic_logical.is_empty() && !mask_exposes_logical;
+        let graph_enabled = graph_capture.is_enabled();
+        let graph_decline_reason = graph_capture.into_decline_reason();
+        if let Some(reason) = &graph_decline_reason {
+            tracing::warn!(
+                "native CUDA decode graph capture disabled: {reason}; decode continues eagerly"
+            );
+        }
 
         // Inc3c: enable the captured per-step-input path when (a) graph capture
         // is structurally available (`graph_enabled`), (b) the decoder actually
@@ -1509,8 +3770,89 @@ impl DecodeCudaState {
         let capture_step_inputs =
             graph_enabled && !captured_step_inputs.is_empty() && capture_step_inputs_enabled();
 
+        // Pin the fixed-capacity KV sequence-axis symbols CONSTANT so CUDA-graph
+        // capture ADMITS the GroupQueryAttention (and capacity-Attention) nodes
+        // instead of vetoing each per-layer node as a growing-seq eager seam. The
+        // runtime has just bound fixed-capacity, device-resident KV at physical
+        // `[.., max_len, ..]` with the valid attended length read on-device, so
+        // the attention kernels' launch grids are capacity-sized (constant within
+        // a capture) and a captured replay is shape-static. Gated on
+        // `graph_enabled`: a growing/paged KV decoder clears it and never pins,
+        // preserving the classifier's growing-seq veto for those paths. KV growth
+        // / capacity-bucket rebucket invalidates and re-captures the graph, so a
+        // pinned symbol is never replayed against a stale grid.
+        if graph_enabled {
+            let pinned = session.pin_fixed_capacity_kv_capture_symbols();
+            if pinned > 0 {
+                tracing::debug!(
+                    max_len,
+                    pinned,
+                    "native CUDA decode: pinned fixed-capacity KV seq symbol(s) for graph capture"
+                );
+            }
+        }
+
+        // Arm the device-resident token-feedback loop (opt-in) when the topology
+        // is device-loopable: graph capture engaged, a single sequence, a rank-1
+        // i64 `position_ids` binding, and an i64 attention mask frozen to
+        // physical `max_len` (not logical-exposed). The scratch binding holds `k`
+        // u32 token-log slots plus one u32 capture-error accumulator word; the
+        // device token-writer folds each step's token straight into the
+        // persistent `input_ids`/`position_ids`/mask bindings device-to-device.
+        let device_token_loop_k_req = device_token_loop_k_from_env();
+        let input_ids_is_i64 = bindings[input_ids_binding].dtype == DataType::Int64;
+        let position_is_i64 =
+            position_ids_binding.is_some_and(|index| bindings[index].dtype == DataType::Int64);
+        let mask_is_i64 = bindings
+            .first()
+            .is_some_and(|binding| binding.dtype == DataType::Int64);
+        // When the model has a persistent position_ids binding it must be a
+        // rank-1 i64 binding the writer can advance; when there is none, position
+        // is derived from the mask alone (still byte-identical) and the writer
+        // only folds the token id and mask bit.
+        let position_topology_ok = match position_ids_binding {
+            Some(_) => position_rank == 1 && position_is_i64,
+            None => true,
+        };
+        let device_token_loop_write_position = position_ids_binding.is_some();
+        let device_token_loop_ready = device_token_loop_k_req > 0
+            && graph_enabled
+            && !mask_exposes_logical
+            && batch == 1
+            && input_ids_is_i64
+            && mask_is_i64
+            && position_topology_ok;
+        let device_token_loop_k = if device_token_loop_ready {
+            device_token_loop_k_req
+        } else {
+            0
+        };
+        let device_token_loop_scratch = if device_token_loop_ready {
+            let words = device_token_loop_k + 1;
+            Some(session.allocate_device_output_binding(
+                "__native_device_token_loop",
+                DataType::Uint32,
+                vec![words],
+                vec![words],
+            )?)
+        } else {
+            None
+        };
+        if device_token_loop_k_req > 0 {
+            tracing::info!(
+                requested_k = device_token_loop_k_req,
+                armed = device_token_loop_ready,
+                effective_k = device_token_loop_k,
+                write_position = device_token_loop_write_position,
+                "native CUDA device token loop configuration"
+            );
+        }
+
         Ok(Self {
+            batch,
             logical_len: 0,
+            row_lens: vec![0; batch],
+            row_active: vec![true; batch],
             max_len,
             bindings,
             base_binding_count,
@@ -1533,13 +3875,34 @@ impl DecodeCudaState {
             graph_captures: 0,
             graph_replays: 0,
             graph_fallbacks: 0,
+            graph_invalidations: 0,
+            kv_growth_events: 0,
+            kv_growth_d2d_copy_bytes: 0,
+            graph_growth_keeps: 0,
+            // Seq-major fixed stride starts with only the initial dense token
+            // prefix mapped; every other path reports its physical capacity as
+            // fully committed (head-major grows the bucket, legacy reallocates).
+            kv_committed_len: if seq_major_fixed {
+                initial_bucket_len
+            } else {
+                reported_len
+            },
+            graph_growth_decision: None,
             capacity,
+            kv_commits_on_demand,
+            kv_layout,
+            graph_decline_reason,
             graph_fallback_reason: None,
             graph_fallback_report: None,
             auxiliary_bind_declines: declined_auxiliary,
             retain_graph_on_rewind: false,
             #[cfg(test)]
             padded_query_capacity: None,
+            device_token_loop_k,
+            device_token_loop_ready,
+            device_token_loop_write_position,
+            device_token_loop_scratch,
+            device_token_loop_steps: 0,
         })
     }
 
@@ -1576,11 +3939,76 @@ impl DecodeCudaState {
                 self.max_len
             );
         }
+        // The mask binding is physically `[batch, max_len]`, so row `r`'s
+        // `[start, end)` valid span sits `r × max_len` i64s from the base. Batch
+        // decode is uniform-length (all sequences step together), so every row
+        // gets the identical `1`s window (stage 2b-impl-4, #750). At `batch == 1`
+        // this is a single write at `start × i64` — byte-identical to before.
         let ones = (start..end)
             .flat_map(|_| 1i64.to_le_bytes())
             .collect::<Vec<_>>();
-        self.bindings[0].write_bytes(start * std::mem::size_of::<i64>(), &ones)?;
-        self.bindings[0].set_logical_shape(vec![1, expose_len])?;
+        let row_stride = self.max_len * std::mem::size_of::<i64>();
+        for sequence in 0..self.batch {
+            let offset = sequence * row_stride + start * std::mem::size_of::<i64>();
+            self.bindings[0].write_bytes(offset, &ones)?;
+        }
+        self.bindings[0].set_logical_shape(vec![self.batch, expose_len])?;
+        Ok(())
+    }
+
+    /// Ragged per-row attention-mask update (stage 3a, #750). Unlike
+    /// [`Self::extend_mask`], which writes one identical `1`s window to every row
+    /// (uniform-length batch), this writes `valid_lens[r]` leading `1`s to row
+    /// `r` and reflects that row's own length. The model reduces each row's mask
+    /// to its own `seqlens_k` (= `valid_lens[r] - 1`) and writes present KV at
+    /// that per-row offset, so a shared physical KV buffer carries rows of
+    /// genuinely different lengths.
+    ///
+    /// The full `[0, valid_lens[r])` window is (re)written each step. Because
+    /// per-row lengths are monotonic under decode (a row's window only grows, or
+    /// stays put when the row is held), this leaves the persistent mask buffer in
+    /// the same state an incremental write would, while remaining robust across a
+    /// bucket reallocation (which discards prior contents). `expose_len` is
+    /// frozen to the physical bucket (`max_len`) exactly as the uniform path
+    /// does, so only mask *values* — not the mask *shape* — vary per step and
+    /// CUDA-graph capture survives (the reduction sees a fixed-width island whose
+    /// `1`-count, not its extent, encodes each row's length).
+    ///
+    /// At `batch == 1` with a single `valid_lens[0]` this is byte-identical to
+    /// `extend_mask(0, valid_lens[0], expose_len)`.
+    fn extend_mask_ragged(
+        &mut self,
+        valid_lens: &[usize],
+        expose_len: usize,
+    ) -> anyhow::Result<()> {
+        if valid_lens.len() != self.batch {
+            bail!(
+                "ragged CUDA mask update expects {} per-row lengths, got {}",
+                self.batch,
+                valid_lens.len()
+            );
+        }
+        if expose_len > self.max_len {
+            bail!(
+                "invalid ragged CUDA mask expose {expose_len} for capacity {}",
+                self.max_len
+            );
+        }
+        let word = std::mem::size_of::<i64>();
+        let row_stride = self.max_len * word;
+        for (sequence, &valid) in valid_lens.iter().enumerate() {
+            if valid > expose_len {
+                bail!(
+                    "ragged CUDA mask row {sequence} valid length {valid} exceeds expose {expose_len}"
+                );
+            }
+            let ones = (0..valid)
+                .flat_map(|_| 1i64.to_le_bytes())
+                .collect::<Vec<_>>();
+            let offset = sequence * row_stride;
+            self.bindings[0].write_bytes(offset, &ones)?;
+        }
+        self.bindings[0].set_logical_shape(vec![self.batch, expose_len])?;
         Ok(())
     }
 
@@ -1592,6 +4020,100 @@ impl DecodeCudaState {
         }
         self.logical_len = len;
         Ok(())
+    }
+
+    /// Zero the whole attention-mask row for sequence `r` (stage 3b, #750).
+    ///
+    /// The ragged mask writer ([`Self::extend_mask_ragged`]) only (re)writes each
+    /// row's `[0, valid_lens[r])` leading `1`s, and the model derives that row's
+    /// `seqlens_k` from the *count* of `1`s in its window. A row that is being
+    /// recycled for a freshly-admitted sequence would therefore inherit its
+    /// previous occupant's trailing `1`s beyond the new (shorter) window, which
+    /// would inflate the new sequence's key count and let it attend stale KV.
+    /// Wiping the row to all `0`s here means the next `extend_mask_ragged` leaves
+    /// exactly the new sequence's window set — no leakage across the reuse
+    /// boundary. This is a pure data write into the persistent mask binding (the
+    /// same binding every step writes), so it changes no shape and does not
+    /// disturb the captured graph or any peer row.
+    fn zero_mask_row(&mut self, row: usize) -> anyhow::Result<()> {
+        let word = std::mem::size_of::<i64>();
+        let row_stride = self.max_len * word;
+        let zeros = vec![0u8; row_stride];
+        self.bindings[0].write_bytes(row * row_stride, &zeros)?;
+        Ok(())
+    }
+
+    /// Retire row `r`: mark it inactive so its slot may be recycled (stage 3b,
+    /// #750). Host-side only — no device binding shape changes — so a captured
+    /// decode graph is untouched and the peer rows keep replaying. The row's KV
+    /// and mask are left as-is; [`Self::assign_row`] resets them when the slot is
+    /// reused, and until then a deactivated row is simply never stepped
+    /// (`advances[r] == false`).
+    pub(crate) fn deactivate_row(&mut self, row: usize) -> anyhow::Result<()> {
+        if row >= self.batch {
+            bail!(
+                "native CUDA deactivate_row {row} out of range for pinned batch {}",
+                self.batch
+            );
+        }
+        self.row_active[row] = false;
+        Ok(())
+    }
+
+    /// Admit a fresh sequence into row `r` (stage 3b, #750): reset that row's
+    /// cursor to length 0, wipe its mask window so no stale key survives the
+    /// reuse boundary, and mark it active. Peers are untouched — their
+    /// `row_lens`, mask windows and KV are unchanged — and no binding is
+    /// reshaped or reallocated, so the captured decode graph survives (the next
+    /// fused step replays the same graph with the reset row simply sitting at
+    /// length 0). The row's stale KV is progressively overwritten as the new
+    /// sequence prefills (each step writes present KV at its own ascending
+    /// offset before that offset is ever attended), and the zeroed mask means it
+    /// only ever attends keys it has itself just written.
+    pub(crate) fn assign_row(&mut self, row: usize) -> anyhow::Result<()> {
+        if row >= self.batch {
+            bail!(
+                "native CUDA assign_row {row} out of range for pinned batch {}",
+                self.batch
+            );
+        }
+        self.zero_mask_row(row)?;
+        self.row_lens[row] = 0;
+        self.row_active[row] = true;
+        Ok(())
+    }
+
+    /// Active logical rows in ascending order (stage 3b, #750).
+    pub(crate) fn active_rows(&self) -> Vec<usize> {
+        (0..self.batch).filter(|&r| self.row_active[r]).collect()
+    }
+
+    /// Current logical length of row `r`.
+    pub(crate) fn row_len(&self, row: usize) -> anyhow::Result<usize> {
+        self.row_lens
+            .get(row)
+            .copied()
+            .with_context(|| format!("native CUDA row_len {row} out of range"))
+    }
+
+    /// Read the current `[batch, 1, vocab]` logits binding back to the host as
+    /// one `[vocab]` f32 row per batch slot (stage 3b, #750). This is the
+    /// host-logits seam the continuous-batch sampler consumes when a real
+    /// (non-greedy) sampler is attached, in contrast to the device-argmax fast
+    /// path which never round-trips the full logits. Returns the rows plus the
+    /// number of bytes transferred device→host and the wall time of that copy so
+    /// the caller can report the D2H cost honestly (`[B,1,vocab]` at vocab
+    /// 151936 is ~608 KB per row per step in f32).
+    fn read_batch_row_logits(
+        &mut self,
+    ) -> anyhow::Result<(Vec<Vec<f32>>, usize, std::time::Duration)> {
+        let start = std::time::Instant::now();
+        let bytes = self.bindings[self.logits_binding].read_bytes()?;
+        let elapsed = start.elapsed();
+        let transferred = bytes.len();
+        let logits = Tensor::from_raw(self.logits_dtype, self.logits_shape.clone(), &bytes)?;
+        let rows = extract_batch_row_logits(&logits, self.batch)?;
+        Ok((rows, transferred, elapsed))
     }
 
     /// Whether every self-attention KV binding is a rank-4 CUDA cache
@@ -1647,12 +4169,52 @@ impl DecodeCudaState {
         else {
             return Ok(None);
         };
+        // The device present-KV read-out below strides the padded buffer with
+        // hard-coded head-major (BNSH) arithmetic: `capacity_head_stride =
+        // physical_shape[2] * head_dim * elem` with a per-head compaction. Under
+        // a seq-major (BSNH) physical buffer the same offsets index the wrong
+        // bytes (heads are interleaved per token, not laid out as capacity
+        // stripes), so this host mirror would silently return mis-indexed KV.
+        // Only our own GQA kernel understands the seq-major byte geometry; a
+        // host mirror / paged-prefix consumer of `present_*` is a fourth place
+        // the layout lives that the seq-major byte geometry does not yet honor.
+        // Refuse rather than mis-map (the runtime's hard "error, never
+        // mis-index" gate for the converted path).
+        if self.kv_layout.is_seq_major() {
+            bail!(
+                "device present-KV read-out for '{past_name}' is unavailable under the seq-major \
+                 (BSNH) KV layout: the host mirror strides the padded buffer with head-major \
+                 (BNSH) arithmetic and would mis-index the interleaved seq-major bytes. Seq-major \
+                 is supported only on the pure decode path where our GQA kernel is the sole \
+                 consumer of the device KV; host-mirror / paged-prefix reuse must run under \
+                 head-major KV."
+            );
+        }
         let binding = &mut self.bindings[index];
         let dtype = binding.dtype;
-        let physical_shape = binding.physical_shape().to_vec();
-        let bytes = binding
-            .read_bytes()
-            .with_context(|| format!("read device present KV for '{past_name}'"))?;
+        let mut physical_shape = binding.physical_shape().to_vec();
+        let bytes = if self.kv_commits_on_demand {
+            let seq_len = self.logical_len;
+            let elem = dtype.checked_storage_bytes(1).with_context(|| {
+                format!("device present KV '{past_name}' has unsized dtype {dtype:?}")
+            })?;
+            let heads = physical_shape[1];
+            let head_dim = physical_shape[3];
+            let capacity_head_stride = physical_shape[2] * head_dim * elem;
+            let live_head_bytes = seq_len * head_dim * elem;
+            let mut compact = Vec::with_capacity(heads * live_head_bytes);
+            for head in 0..heads {
+                compact.extend(
+                    binding.read_bytes_range(head * capacity_head_stride, live_head_bytes)?,
+                );
+            }
+            physical_shape[2] = seq_len;
+            compact
+        } else {
+            binding
+                .read_bytes()
+                .with_context(|| format!("read device present KV for '{past_name}'"))?
+        };
         let tensor = Tensor::from_raw(dtype, physical_shape.clone(), &bytes)
             .with_context(|| format!("interpret device present KV bytes for '{past_name}'"))?;
         let values = kv_dtype_to_f32(&tensor)
@@ -1684,6 +4246,22 @@ impl DecodeCudaState {
     ) -> anyhow::Result<()> {
         if seq_len == 0 {
             bail!("device paged prefix reuse requires a non-empty prefix");
+        }
+        // The device seed below writes each head into its own capacity-offset
+        // slot (`head * capacity_head_stride`), i.e. head-major (BNSH) byte
+        // arithmetic. Under a seq-major (BSNH) physical buffer that offset
+        // addresses the wrong bytes, so a shared-prefix seed would corrupt the
+        // KV. Prefix sharing therefore does not "fall out" under seq-major with
+        // the current device seed: refuse rather than mis-map (the runtime's
+        // hard "error, never mis-index" gate for the converted path).
+        if self.kv_layout.is_seq_major() {
+            bail!(
+                "device paged prefix reuse is unavailable under the seq-major (BSNH) KV layout: \
+                 the device seed writes each head at a head-major (BNSH) capacity offset and would \
+                 mis-index the interleaved seq-major bytes. Seq-major is supported only on the \
+                 pure decode path where our GQA kernel is the sole consumer of the device KV; \
+                 prefix reuse must run under head-major KV."
+            );
         }
         self.ensure_capacity(session, seq_len)?;
         for (name, data, shape) in entries {
@@ -1729,6 +4307,9 @@ impl DecodeCudaState {
             }
         }
         self.set_logical_len(seq_len)?;
+        for row_len in &mut self.row_lens {
+            *row_len = seq_len;
+        }
         let expose = self.decode_mask_expose_len(seq_len);
         self.extend_mask(0, seq_len, expose)?;
         Ok(())
@@ -1736,10 +4317,24 @@ impl DecodeCudaState {
 
     pub(crate) fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
         if target_len < self.logical_len {
+            // Clear the now-invalid mask tail on *every* row (the mask binding is
+            // physically `[batch, max_len]`). A uniform batch shares one length so
+            // one row would suffice, but a ragged batch (stage 3a, #750) can leave
+            // per-row `1`s beyond `target_len`; zeroing every row's tail keeps a
+            // reused batched session from inheriting a stale attend window.
             let zeros = vec![0u8; (self.logical_len - target_len) * std::mem::size_of::<i64>()];
-            self.bindings[0].write_bytes(target_len * std::mem::size_of::<i64>(), &zeros)?;
+            let row_stride = self.max_len * std::mem::size_of::<i64>();
+            for sequence in 0..self.batch {
+                let offset = sequence * row_stride + target_len * std::mem::size_of::<i64>();
+                self.bindings[0].write_bytes(offset, &zeros)?;
+            }
         }
-        self.bindings[0].set_logical_shape(vec![1, target_len])?;
+        self.bindings[0].set_logical_shape(vec![self.batch, target_len])?;
+        // Ragged per-row lengths collapse back to the uniform rewind target
+        // (stage 3a, #750): after a rewind every row shares `target_len`.
+        for row_len in &mut self.row_lens {
+            *row_len = target_len;
+        }
         if target_len == 0 {
             // Fixed-size recurrent/conv states are unmasked rolling caches: a
             // reused session would otherwise inherit the previous generation's
@@ -1763,8 +4358,39 @@ impl DecodeCudaState {
     }
 
     fn write_decode_inputs(&mut self, token_id: TokenId, position: usize) -> anyhow::Result<()> {
-        self.bindings[self.input_ids_binding].write_bytes(0, &i64::from(token_id).to_le_bytes())?;
-        self.write_position_binding(position)
+        // Single-token decode replicates the token/position across all `batch`
+        // rows so the persistent batch grid stays coherent when a single-sequence
+        // caller drives a batch-N binding (stage 2b-impl-4, #750). At `batch == 1`
+        // this is a single i64 write at offset 0 — byte-identical to before.
+        self.write_decode_inputs_batch(&vec![token_id; self.batch], &vec![position; self.batch])
+    }
+
+    /// Write N selected token ids into the N `input_ids` slots and N positions
+    /// into the `position_ids` binding, one per sequence (stage 2b-impl-4, #750).
+    /// The `input_ids` binding is physically `[batch, 1]`, so sequence `s`'s
+    /// token is one i64 at offset `s × 8`; positions fan out per
+    /// [`Self::write_position_binding_batch`]. `tokens.len()` and
+    /// `positions.len()` must both equal the pinned `batch`.
+    fn write_decode_inputs_batch(
+        &mut self,
+        tokens: &[TokenId],
+        positions: &[usize],
+    ) -> anyhow::Result<()> {
+        if tokens.len() != self.batch || positions.len() != self.batch {
+            bail!(
+                "native CUDA batch decode expects {} tokens and {} positions, got {} / {}",
+                self.batch,
+                self.batch,
+                tokens.len(),
+                positions.len()
+            );
+        }
+        let word = std::mem::size_of::<i64>();
+        for (sequence, token) in tokens.iter().enumerate() {
+            self.bindings[self.input_ids_binding]
+                .write_bytes(sequence * word, &i64::from(*token).to_le_bytes())?;
+        }
+        self.write_position_binding_batch(positions)
     }
 
     /// Write the current position into the persistent `position_ids` device
@@ -1773,12 +4399,33 @@ impl DecodeCudaState {
     /// to before; a rank-N mrope decoder gets `[position; N]` — the one-token
     /// `linear_increment` coordinate for all axes.
     fn write_position_binding(&mut self, position: usize) -> anyhow::Result<()> {
+        self.write_position_binding_batch(&vec![position; self.batch])
+    }
+
+    /// Write N per-sequence positions into the persistent `position_ids` binding
+    /// (stage 2b-impl-4, #750). A rank-1 decoder binds `position_ids [batch, 1]`,
+    /// so sequence `s`'s position is one i64 at offset `s × 8`. A rank-R mrope
+    /// decoder binds `[R, batch, 1]`; element `(r, s)` sits at `(r × batch + s) × 8`
+    /// and every coordinate axis gets the same per-sequence position (the
+    /// one-token `linear_increment`). At `batch == 1, rank == 1` this is a single
+    /// i64 at offset 0 — byte-identical to before.
+    fn write_position_binding_batch(&mut self, positions: &[usize]) -> anyhow::Result<()> {
+        if positions.len() != self.batch {
+            bail!(
+                "native CUDA batch decode expects {} positions, got {}",
+                self.batch,
+                positions.len()
+            );
+        }
         if let Some(index) = self.position_ids_binding {
-            let position = i64::try_from(position).context("position id exceeds i64 range")?;
-            let bytes = position.to_le_bytes();
             let axis_bytes = std::mem::size_of::<i64>();
             for axis in 0..self.position_rank {
-                self.bindings[index].write_bytes(axis * axis_bytes, &bytes)?;
+                for (sequence, position) in positions.iter().enumerate() {
+                    let position =
+                        i64::try_from(*position).context("position id exceeds i64 range")?;
+                    let offset = (axis * self.batch + sequence) * axis_bytes;
+                    self.bindings[index].write_bytes(offset, &position.to_le_bytes())?;
+                }
             }
         }
         Ok(())
@@ -1864,6 +4511,7 @@ impl DecodeCudaState {
                         self.graph_phase = DecodeCudaGraphPhase::Unsupported;
                         trace_capture_declines(trace, &report);
                         let reason = report.to_string();
+                        self.graph_decline_reason = Some(reason.clone());
                         self.graph_fallback_reason = Some(reason.clone());
                         self.graph_fallback_report = Some(report);
                         tracing::warn!(
@@ -1947,6 +4595,7 @@ impl DecodeCudaState {
                         self.inline_graph_phase = DecodeCudaGraphPhase::Unsupported;
                         trace_capture_declines(trace, &report);
                         let reason = report.to_string();
+                        self.graph_decline_reason = Some(reason.clone());
                         self.graph_fallback_reason = Some(reason.clone());
                         self.graph_fallback_report = Some(report);
                         tracing::warn!(
@@ -1978,30 +4627,181 @@ impl DecodeCudaState {
         extract_logits(&logits)
     }
 
-    pub(crate) fn greedy_fastpath_supported(&self) -> bool {
-        self.bindings[self.logits_binding].device_argmax_supported()
+    /// The configured device-token-loop chain depth (`0` when disabled or the
+    /// topology is not device-loopable).
+    pub(crate) fn device_token_loop_k(&self) -> usize {
+        self.device_token_loop_k
     }
 
-    fn read_greedy_result(&mut self) -> anyhow::Result<(TokenId, u32)> {
+    /// Launch the device argmax over the current logits into `greedy_result`
+    /// **without** the host read-back, so a chained replay can proceed on-stream
+    /// with no host sync (the device token-writer consumes `greedy_result[0]`).
+    fn run_device_argmax(&mut self) -> anyhow::Result<()> {
         let vocab = *self
             .logits_shape
             .last()
             .context("CUDA logits shape has no vocabulary dimension")?;
-        self.bindings[self.logits_binding].device_argmax(vocab, &mut self.greedy_result)?;
-        let mut bytes = [0_u8; 2 * std::mem::size_of::<u32>()];
-        self.greedy_result.read_bytes_into(&mut bytes)?;
-        Ok((
-            u32::from_ne_bytes(
-                bytes[..4]
+        self.bindings[self.logits_binding].device_argmax(
+            vocab,
+            self.batch,
+            &mut self.greedy_result,
+        )?;
+        Ok(())
+    }
+
+    /// Clear the device-token-loop capture-error accumulator (the u32 word at
+    /// index `k` of the scratch binding) before enqueuing a fresh chain.
+    fn reset_device_token_loop_error(&mut self) -> anyhow::Result<()> {
+        let k = self.device_token_loop_k;
+        let scratch = self
+            .device_token_loop_scratch
+            .as_mut()
+            .context("device token loop scratch is not allocated")?;
+        scratch.write_bytes(k * std::mem::size_of::<u32>(), &0u32.to_ne_bytes())?;
+        Ok(())
+    }
+
+    /// Clear the single trailing attention-mask `1` the device token-writer set
+    /// one position beyond the chain's last consumed token. The writer sets
+    /// `mask[next_position]` on *every* step (so the following in-chain replay
+    /// attends the new token); on the final step there is no following replay, so
+    /// that bit is one past `current_len` and must be undone to leave the mask in
+    /// exactly the state the per-token path leaves — otherwise, with the mask
+    /// frozen to physical width (`mask_exposes_logical == false`), that stray `1`
+    /// inflates the derived sequence length for a later prefill after `reset()`.
+    /// No-op when the position is at/over physical capacity (the writer guarded
+    /// it, so nothing was written).
+    fn clear_trailing_mask_bit(&mut self, position: usize) -> anyhow::Result<()> {
+        if position >= self.max_len {
+            return Ok(());
+        }
+        let word = std::mem::size_of::<i64>();
+        let row_stride = self.max_len * word;
+        for sequence in 0..self.batch {
+            let offset = sequence * row_stride + position * word;
+            self.bindings[0].write_bytes(offset, &0i64.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Stitch the just-selected token (in `greedy_result`) into the persistent
+    /// decode bindings for the next replay: token id → `input_ids`,
+    /// `next_position` → `position_ids`, mask `1` at `next_position`, token →
+    /// `scratch[step]`, capture-error OR-ed into `scratch[k]`. Device-to-device,
+    /// no host sync.
+    fn device_token_writer_step(&self, next_position: i64, step: u32) -> anyhow::Result<()> {
+        let scratch = self
+            .device_token_loop_scratch
+            .as_ref()
+            .context("device token loop scratch is not allocated")?;
+        let position_binding = if self.device_token_loop_write_position {
+            let position_index = self
+                .position_ids_binding
+                .context("device token loop requires a position_ids binding")?;
+            Some(&self.bindings[position_index])
+        } else {
+            None
+        };
+        self.greedy_result.device_token_writer(
+            &self.bindings[self.input_ids_binding],
+            position_binding,
+            &self.bindings[0],
+            scratch,
+            self.device_token_loop_k,
+            next_position,
+            self.max_len,
+            step,
+        )?;
+        Ok(())
+    }
+
+    /// Drain the enqueued chain in one D2H read: the first `produced` token-log
+    /// slots as token ids, plus the OR-ed capture-error accumulator word.
+    fn drain_device_token_loop(&mut self, produced: usize) -> anyhow::Result<(Vec<TokenId>, u32)> {
+        let k = self.device_token_loop_k;
+        let scratch = self
+            .device_token_loop_scratch
+            .as_mut()
+            .context("device token loop scratch is not allocated")?;
+        let word = std::mem::size_of::<u32>();
+        let mut bytes = vec![0_u8; (k + 1) * word];
+        scratch.read_bytes_into(&mut bytes)?;
+        let mut tokens = Vec::with_capacity(produced);
+        for slot in 0..produced {
+            let base = slot * word;
+            tokens.push(u32::from_ne_bytes(
+                bytes[base..base + word]
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("four token-id bytes"))?,
-            ),
-            u32::from_ne_bytes(
-                bytes[4..]
+            ));
+        }
+        let error = u32::from_ne_bytes(
+            bytes[k * word..k * word + word]
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("four capture-error bytes"))?,
+        );
+        Ok((tokens, error))
+    }
+
+    pub(crate) fn greedy_fastpath_supported(&self) -> bool {
+        self.bindings[self.logits_binding].device_argmax_supported()
+    }
+
+    /// The pinned persistent-decode batch extent (stage 2b-impl-4, #750).
+    pub(crate) fn batch(&self) -> usize {
+        self.batch
+    }
+
+    /// The hard physical KV capacity (`max_len`) ceiling this decode state can
+    /// grow to. Used by the continuous-batch manager to clamp per-request context
+    /// limits to what the persistent bindings can actually hold.
+    pub(crate) fn hard_max_len(&self) -> usize {
+        self.capacity.max_len
+    }
+
+    /// Run the batched device argmax over the `[batch, 1, vocab]` logits binding
+    /// and read back the `batch` selected token ids paired with the shared
+    /// device capture-error word (stage 2b-impl-3, #750). Row `i` of the returned
+    /// vector is the greedy token of sequence `i`; every row carries the same
+    /// latched capture-error bitmask (the kernel copies the one shared word into
+    /// each slot). At `batch == 1` the argmax launch geometry and the 8-byte
+    /// read-back are byte-identical to the previous single-sequence path.
+    fn read_greedy_result_batch(&mut self) -> anyhow::Result<Vec<(TokenId, u32)>> {
+        let vocab = *self
+            .logits_shape
+            .last()
+            .context("CUDA logits shape has no vocabulary dimension")?;
+        self.bindings[self.logits_binding].device_argmax(
+            vocab,
+            self.batch,
+            &mut self.greedy_result,
+        )?;
+        let word = std::mem::size_of::<u32>();
+        let mut bytes = vec![0_u8; self.batch * 2 * word];
+        self.greedy_result.read_bytes_into(&mut bytes)?;
+        let mut rows = Vec::with_capacity(self.batch);
+        for sequence in 0..self.batch {
+            let base = sequence * 2 * word;
+            let token = u32::from_ne_bytes(
+                bytes[base..base + word]
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("four token-id bytes"))?,
+            );
+            let capture_error = u32::from_ne_bytes(
+                bytes[base + word..base + 2 * word]
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("four capture-error bytes"))?,
-            ),
-        ))
+            );
+            rows.push((token, capture_error));
+        }
+        Ok(rows)
+    }
+
+    fn read_greedy_result(&mut self) -> anyhow::Result<(TokenId, u32)> {
+        let rows = self.read_greedy_result_batch()?;
+        rows.into_iter()
+            .next()
+            .context("device argmax returned no rows")
     }
 
     pub(crate) fn invalidate_graph(
@@ -2016,6 +4816,7 @@ impl DecodeCudaState {
         session.reset_decode_inline_device_graph()?;
         self.graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
         self.inline_graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
+        self.graph_invalidations += 1;
         Ok(())
     }
 
@@ -2047,6 +4848,8 @@ impl DecodeCudaState {
 
     pub(crate) fn debug_stats(&self, session: &InferenceSession) -> CudaKvDebugStats {
         let mut transfers = DeviceBindingTransferStats::default();
+        let mut kv_committed_bytes = 0usize;
+        let mut kv_physical_bytes_by_binding = Vec::new();
         let device_ptrs = self.bindings[self.kv_binding_range.clone()]
             .iter()
             .map(|binding| {
@@ -2055,22 +4858,39 @@ impl DecodeCudaState {
                 transfers.host_upload_bytes += stats.host_upload_bytes;
                 transfers.host_download_calls += stats.host_download_calls;
                 transfers.host_download_bytes += stats.host_download_bytes;
+                kv_committed_bytes += binding.committed_bytes();
+                kv_physical_bytes_by_binding.push(
+                    checked_shape_bytes(binding.physical_shape(), binding.dtype).unwrap_or(0),
+                );
                 binding.device_ptr() as usize
             })
             .collect();
         CudaKvDebugStats {
             logical_len: self.logical_len,
             max_len: self.max_len,
+            kv_committed_len: self.kv_committed_len,
+            hard_max_len: self.capacity.max_len,
             max_len_source: self.capacity.source.clone(),
             device_ptrs,
+            kv_committed_bytes,
+            kv_physical_bytes_by_binding,
             kv_transfers: transfers,
+            kv_growth_events: self.kv_growth_events,
+            kv_growth_d2d_copy_bytes: self.kv_growth_d2d_copy_bytes,
+            kv_layout_seq_major: self.kv_layout.is_seq_major(),
             graph: CudaGraphDebugStats {
                 enabled: self.graph_enabled,
                 captures: self.graph_captures,
                 replays: self.graph_replays,
                 fallbacks: self.graph_fallbacks,
+                invalidations: self.graph_invalidations,
+                growth_keeps: self.graph_growth_keeps,
                 allocation_counts: session.device_allocation_counts().unwrap_or_default(),
+                decline_reason: self.graph_decline_reason.clone(),
+                growth_decision: self.graph_growth_decision.clone(),
                 fallback_report: self.graph_fallback_report.clone(),
+                device_token_loop_k: self.device_token_loop_k,
+                device_token_loop_steps: self.device_token_loop_steps,
             },
         }
     }
@@ -2112,6 +4932,7 @@ impl onnx_genai_kv::KvCapacityGrowthBackend for NativeCudaCapacityBackend<'_> {
         valid_len: usize,
     ) -> anyhow::Result<Self::GrownBuffers> {
         let old_capacity = self.state.max_len;
+        let layout = self.state.kv_layout;
         (|| {
             native_cuda_device_barrier(self.session)?;
             let mut replacements = Vec::with_capacity(self.state.kv_binding_range.len());
@@ -2139,19 +4960,19 @@ impl onnx_genai_kv::KvCapacityGrowthBackend for NativeCudaCapacityBackend<'_> {
                         )
                     })?;
                 native_cuda_memset_zero(dst, total_bytes)?;
+                // Copy the live prefix following the physical byte layout: one
+                // contiguous run for seq-major (grow axis 1), one fragment per
+                // head stripe for head-major (grow axis 2, unchanged).
+                let elem = old.dtype.checked_storage_bytes(1).with_context(|| {
+                    format!(
+                        "CUDA KV grow copy element size overflow for '{}'",
+                        old.input_name()
+                    )
+                })?;
+                let (old_bytes, grow_axis) = kv_growth_byte_layout(old.physical_shape(), layout)?;
+                let (new_bytes, _) = kv_growth_byte_layout(&physical_shape, layout)?;
                 copy_kv_prefix_device_to_device(
-                    dst,
-                    src,
-                    old.physical_shape(),
-                    &physical_shape,
-                    2,
-                    valid_len,
-                    old.dtype.checked_storage_bytes(1).with_context(|| {
-                        format!(
-                            "CUDA KV grow copy element size overflow for '{}'",
-                            old.input_name()
-                        )
-                    })?,
+                    dst, src, &old_bytes, &new_bytes, grow_axis, valid_len, elem,
                 )?;
                 replacements.push((index, new_binding));
             }
@@ -2176,14 +4997,22 @@ impl onnx_genai_kv::KvCapacityGrowthBackend for NativeCudaCapacityBackend<'_> {
                 self.state.bindings[0].input_name().to_owned(),
                 self.state.bindings[0].output_name().map(str::to_owned),
                 DataType::Int64,
-                vec![1, new_capacity],
-                vec![1, valid_len],
+                vec![self.state.batch, new_capacity],
+                vec![self.state.batch, valid_len],
             )?;
             native_cuda_memset_zero(
                 new_mask.device_ptr() as usize,
-                new_capacity * std::mem::size_of::<i64>(),
+                self.state
+                    .batch
+                    .checked_mul(new_capacity)
+                    .and_then(|elements| elements.checked_mul(std::mem::size_of::<i64>()))
+                    .with_context(|| {
+                        format!(
+                            "legacy realloc CUDA mask growth overflows for capacity {new_capacity}"
+                        )
+                    })?,
             )?;
-            new_mask.set_logical_shape(vec![1, valid_len])?;
+            new_mask.set_logical_shape(vec![self.state.batch, valid_len])?;
             Ok(Some(new_mask))
         })()
         .map_err(|error| {
@@ -2262,6 +5091,108 @@ fn native_cuda_memset_zero(_dst: usize, _bytes: usize) -> anyhow::Result<()> {
     bail!("native CUDA KV growth requires the onnx-genai-engine `cuda` feature")
 }
 
+/// Resolve the persistent decode batch extent (stage 2b-impl-4, #750).
+///
+/// An explicit `configured` value — from `NativeDecodeCudaOptions::decode_batch`,
+/// which is how `--max-batch` reaches here — wins over
+/// `ONNX_GENAI_NATIVE_DECODE_BATCH`. Neither set resolves to `1`, the
+/// byte-identity default that keeps every current single-sequence entry point
+/// unchanged. A value `> 1` turns batch-N on: the KV / mask / input / position /
+/// logits bindings are shaped `[N, …]`, the token writer fans N selected tokens
+/// into N slots, and the device argmax reads N rows. The value is pinned for the
+/// whole session (capture requires a stable batch shape), so it is read exactly
+/// once at construction. `0` is rejected — a zero-width decode has no meaning.
+///
+/// Both sources are validated the same way, so an explicit request cannot bypass
+/// a check the environment variable is subject to.
+fn resolve_native_decode_batch(configured: Option<usize>) -> anyhow::Result<usize> {
+    if let Some(batch) = configured {
+        if batch == 0 {
+            bail!("native decode batch must be > 0, got 0");
+        }
+        return Ok(batch);
+    }
+    match std::env::var("ONNX_GENAI_NATIVE_DECODE_BATCH") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let batch: usize = raw.trim().parse().with_context(|| {
+                format!("ONNX_GENAI_NATIVE_DECODE_BATCH must be a positive integer, got '{raw}'")
+            })?;
+            if batch == 0 {
+                bail!("ONNX_GENAI_NATIVE_DECODE_BATCH must be > 0, got 0");
+            }
+            Ok(batch)
+        }
+        _ => Ok(1),
+    }
+}
+
+/// Map a BNSH-declared KV binding shape `[batch, kv_heads, capacity, head_dim]`
+/// to the physical byte-layout shape and grow-axis index the resolved
+/// [`KvCommitLayout`] actually stores it in.
+///
+/// The binding *metadata* shape reported to the CUDA EP is always BNSH — the
+/// GQA node validates `past_key`/`past_value` as `[batch, kv_heads, seq,
+/// head_dim]` and reads `present_capacity` from axis 2 *regardless of the
+/// `kv_layout` attribute* (only the kernel's stride arithmetic changes). So this
+/// permutation never leaves the growth machinery; it drives the copy/zero
+/// geometry over raw device bytes so that growth is faithful to how the bytes
+/// are really laid out:
+///
+/// * **Head-major BNSH**: the byte layout equals the declared shape and the grow
+///   axis is 2. Each head owns its own `capacity × head_dim` stripe, so growth
+///   re-strides every head — byte-identical to the historical behavior.
+/// * **Seq-major BSNH**: the bytes are `[batch, capacity, kv_heads, head_dim]`
+///   and the grow axis is 1. A token's whole KV (all heads) is contiguous with a
+///   fixed `kv_heads × head_dim` stride that is **independent of capacity**, so
+///   the live prefix keeps its byte offsets across growth and no KV data moves.
+///   This is the fixed-stride property #797 measured at the driver level, here
+///   realized on the engine growth path.
+///
+/// **Batch-N refusal (stage 2b-impl-2, #750).** This helper feeds the two
+/// *growing-bucket* copy paths ([`DecodeCudaState::apply_vmm_growth`] and the
+/// legacy realloc `build_grown_buffers`), whose per-block stride *is* the
+/// mutable bucket capacity. Head-major keeps the batch axis outermost, so each
+/// `(batch, head)` block re-strides independently and batch-N growth is exact.
+/// Seq-major is different: with `batch > 1` the per-sequence stride is the
+/// growing bucket capacity, so growing the bucket relocates every sequence
+/// `b > 0`'s KV bytes. That relocation would defeat the whole point of the
+/// seq-major fixed-stride design (the "no KV moves / keep the captured graph"
+/// contract) and the `moved_bytes_per_token == 0` growth accounting. Rather than
+/// silently compute a wrong (capacity-dependent) stride, this refuses seq-major
+/// growing-bucket growth at `batch > 1` with a named error. The relocation-free
+/// batch-N seq-major path is the *fixed full-context stride* commit
+/// ([`DecodeCudaState::seq_major_kv_commit_requests`]), which never calls this
+/// helper. Turning batch-N on end-to-end is 2b-impl-4.
+pub(super) fn kv_growth_byte_layout(
+    bnsh_shape: &[usize],
+    layout: KvCommitLayout,
+) -> anyhow::Result<(Vec<usize>, usize)> {
+    if bnsh_shape.len() != 4 {
+        bail!("CUDA KV binding must be rank-4 BNSH, got shape {bnsh_shape:?}");
+    }
+    Ok(match layout {
+        KvCommitLayout::HeadMajor => (bnsh_shape.to_vec(), 2),
+        KvCommitLayout::SeqMajor => {
+            let (batch, kv_heads, capacity, head_dim) =
+                (bnsh_shape[0], bnsh_shape[1], bnsh_shape[2], bnsh_shape[3]);
+            if batch > 1 {
+                bail!(
+                    "native CUDA seq-major (BSNH) KV *growing-bucket* growth cannot be made \
+                     batch-general for batch {batch} > 1 without relocating KV: a sequence's \
+                     per-sequence stride is the mutable bucket capacity ({capacity}), so growing \
+                     the bucket moves every sequence b>0's already-written KV bytes. Head-major \
+                     (BNSH) does not have this problem because its batch axis is outermost and \
+                     re-strides per (batch, head) block without moving batch 0. The relocation-free \
+                     batch-N seq-major path is the fixed full-context stride commit-on-demand path, \
+                     not this growing bucket. Refusing rather than computing a capacity-dependent \
+                     stride (stage 2b-impl-2, #750; batch-N is turned on in 2b-impl-4)."
+                );
+            }
+            (vec![batch, capacity, kv_heads, head_dim], 1)
+        }
+    })
+}
+
 #[cfg(feature = "cuda")]
 fn copy_kv_prefix_device_to_device(
     dst: usize,
@@ -2319,6 +5250,159 @@ fn copy_kv_prefix_device_to_device(
         )?;
     }
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn copy_kv_prefix_device_to_device_in_place(
+    ptr: usize,
+    old_shape: &[usize],
+    new_shape: &[usize],
+    seq_axis: usize,
+    valid_len: usize,
+    elem_size: usize,
+) -> anyhow::Result<()> {
+    if valid_len == 0 {
+        return Ok(());
+    }
+    if old_shape.len() != new_shape.len() || seq_axis >= old_shape.len() {
+        bail!(
+            "invalid CUDA KV in-place grow copy shapes {old_shape:?} -> {new_shape:?} on axis {seq_axis}"
+        );
+    }
+    let old_cap = old_shape[seq_axis];
+    let new_cap = new_shape[seq_axis];
+    let blocks = old_shape[..seq_axis]
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+        .context("CUDA KV in-place grow copy block count overflow")?;
+    let inner = old_shape[seq_axis + 1..]
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+        .context("CUDA KV in-place grow copy inner size overflow")?;
+    let segment_bytes = valid_len
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_size))
+        .context("CUDA KV in-place grow copy segment size overflow")?;
+    let old_stride = old_cap
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_size))
+        .context("CUDA KV in-place grow copy old stride overflow")?;
+    let new_stride = new_cap
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_size))
+        .context("CUDA KV in-place grow copy new stride overflow")?;
+    for block in (0..blocks).rev() {
+        let src_offset = block
+            .checked_mul(old_stride)
+            .context("CUDA KV in-place grow copy source offset overflow")?;
+        let dst_offset = block
+            .checked_mul(new_stride)
+            .context("CUDA KV in-place grow copy destination offset overflow")?;
+        match in_place_copy_route(src_offset, dst_offset, segment_bytes) {
+            InPlaceCopyRoute::Noop => {}
+            InPlaceCopyRoute::Scratch => {
+                let src_start = ptr + src_offset;
+                let mut scratch = vec![0u8; segment_bytes];
+                onnx_genai_ort::cuda_rt::memcpy_device_to_host(&mut scratch, src_start)?;
+                onnx_genai_ort::cuda_rt::memcpy_host_to_device(ptr + dst_offset, &scratch)?;
+            }
+            InPlaceCopyRoute::DeviceToDevice => {
+                onnx_genai_ort::cuda_rt::memcpy_device_to_device(
+                    ptr + dst_offset,
+                    ptr + src_offset,
+                    segment_bytes,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "cuda")]
+pub(super) enum InPlaceCopyRoute {
+    Noop,
+    DeviceToDevice,
+    Scratch,
+}
+
+#[cfg(feature = "cuda")]
+pub(super) fn in_place_copy_route(
+    src_offset: usize,
+    dst_offset: usize,
+    segment_bytes: usize,
+) -> InPlaceCopyRoute {
+    if src_offset == dst_offset || segment_bytes == 0 {
+        return InPlaceCopyRoute::Noop;
+    }
+    let src_end = src_offset + segment_bytes;
+    let dst_end = dst_offset + segment_bytes;
+    if dst_offset < src_end && src_offset < dst_end {
+        InPlaceCopyRoute::Scratch
+    } else {
+        InPlaceCopyRoute::DeviceToDevice
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn copy_kv_prefix_device_to_device_in_place(
+    _ptr: usize,
+    _old_shape: &[usize],
+    _new_shape: &[usize],
+    _seq_axis: usize,
+    _valid_len: usize,
+    _elem_size: usize,
+) -> anyhow::Result<()> {
+    bail!("native CUDA KV growth requires the onnx-genai-engine `cuda` feature")
+}
+
+#[cfg(feature = "cuda")]
+fn zero_kv_suffix_device(
+    ptr: usize,
+    shape: &[usize],
+    seq_axis: usize,
+    valid_len: usize,
+    elem_size: usize,
+) -> anyhow::Result<()> {
+    if shape.is_empty() || seq_axis >= shape.len() || valid_len >= shape[seq_axis] {
+        return Ok(());
+    }
+    let cap = shape[seq_axis];
+    let blocks = shape[..seq_axis]
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+        .context("CUDA KV suffix zero block count overflow")?;
+    let inner = shape[seq_axis + 1..]
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+        .context("CUDA KV suffix zero inner size overflow")?;
+    let stride = cap
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_size))
+        .context("CUDA KV suffix zero stride overflow")?;
+    let suffix_offset = valid_len
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_size))
+        .context("CUDA KV suffix zero offset overflow")?;
+    let suffix_bytes = (cap - valid_len)
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_size))
+        .context("CUDA KV suffix zero byte count overflow")?;
+    for block in 0..blocks {
+        native_cuda_memset_zero(ptr + block * stride + suffix_offset, suffix_bytes)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn zero_kv_suffix_device(
+    _ptr: usize,
+    _shape: &[usize],
+    _seq_axis: usize,
+    _valid_len: usize,
+    _elem_size: usize,
+) -> anyhow::Result<()> {
+    bail!("native CUDA KV growth requires the onnx-genai-engine `cuda` feature")
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -2512,6 +5596,43 @@ mod device_kv_view_tests {
             wrong0, token0,
             "logical-stride read must diverge from the physical-stride read at H >= 2"
         );
+    }
+}
+
+#[cfg(test)]
+mod decode_batch_resolution_tests {
+    use super::resolve_native_decode_batch;
+
+    /// The default is 1, which is the #750 byte-identity reference: every shape,
+    /// binding and read-back at batch 1 matches the previous hard-coded value.
+    #[test]
+    fn nothing_requested_and_no_env_resolves_to_one() {
+        // Guard against a stray environment on the test host: this assertion is
+        // only meaningful when the variable is genuinely absent.
+        if std::env::var("ONNX_GENAI_NATIVE_DECODE_BATCH").is_ok() {
+            return;
+        }
+        assert_eq!(resolve_native_decode_batch(None).unwrap(), 1);
+    }
+
+    /// #1064: an explicit request must win over the environment, so `--max-batch`
+    /// is authoritative rather than advisory. Before this, batch-N could only be
+    /// turned on by an environment variable, and the server refused `--max-batch
+    /// N` because the capability was read from a session nobody had asked to
+    /// build in batch shape.
+    #[test]
+    fn an_explicit_request_is_honoured() {
+        assert_eq!(resolve_native_decode_batch(Some(4)).unwrap(), 4);
+        assert_eq!(resolve_native_decode_batch(Some(1)).unwrap(), 1);
+    }
+
+    /// A zero-width decode has no meaning, and both sources are validated the
+    /// same way — an explicit request must not bypass a check the environment
+    /// variable is subject to.
+    #[test]
+    fn zero_is_refused_from_either_source() {
+        let error = resolve_native_decode_batch(Some(0)).expect_err("zero-width decode");
+        assert!(error.to_string().contains("must be > 0"), "{error}");
     }
 }
 

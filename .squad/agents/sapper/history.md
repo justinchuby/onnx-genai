@@ -1,37 +1,37 @@
-# Sapper — History (compacted 2026-07-29)
+# Sapper — History (compacted 2026-08-11T23-30-00Z)
 
 **Role:** Systems/model-building implementer for onnx-genai and Mobius export/preprocess work. Owns native CUDA/CPU EP correctness and model-package metadata details; must preserve real-model parity, capture safety, Mobius lintrunner hygiene, and reviewer lockouts.
 
 ## Durable lessons
 - onnx-genai uses its own `InferenceMetadata` (`inference_metadata.yaml`), not ORT-GenAI `genai_config`; Mobius PRs must pass lintrunner (RUFF + RUFF-FORMAT).
-- Gemma4 VLM export is not solved by adding metadata fields: it needs rank-3 pre-patchified vision ingestion, embedding→decoder orchestration (`inputs_embeds`, not token IDs), and extended Mobius topology; E2B text runs needed explicit BOS.
-- Input-embedding export must read the post-embed `Mul` scale from the graph, not hardcode `sqrt(hidden)`; the real f16 scale was `39.1875`.
 - CUDA RMSNorm/SkipRMSNorm parity requires separately rounded f32 multiply/add; CUDA SiLU and acc4 scale boundaries need CPU-matching operation order/rounding.
-- The token-16 K=4864 reduction-order delta (`1.9073486e-5`) is accepted because exact GPU emulation costs 8.4%; do not chase it as a correctness bug without new evidence.
-- Loop v1 was rejected because scan accumulation reserved from untrusted `M` and carried shapes were not validated; Sapper was locked out and Leon owned the remediation.
-- Control-flow graph attributes retain ordered typed formal I/O and scoped inline initializers; `ChildExecutor` must preserve lexical captures and branch-specific `If` caches.
-- onnx-rs `SimpleShardedDimProto.dim` is optional; preserve IR13 checker/codec round trips.
-- CPU op traps: OneHot out-of-range indices are all-off; BitShift direction is required; GridSample opset 16 rejects rank-5 while opset 20 keeps 2-D/3-D support; unsafe Unique String execution was removed.
-- CUDA graph/kernel work must stay capture-safe and portable across supported SM architectures, not only sm_90; explicit int4 zero-points must preserve symmetric zp=8 fast paths.
+- Reviewer lockouts remain binding; do not revise an artifact you authored after reviewer rejection.
+- CUDA graph/kernel work must stay capture-safe and portable across supported SM architectures.
 - WP-B optional fallback validation treats raw `GraphProto.input` as authoritative.
-- Rewind policy split is canonical: public `restore_session`/`rewind_session_to` reject unsupported rewinds before mutating tokens/KV, while internal speculative runner rewind may use the allow-runner path; `RewindRequest` replaced raw `(len, policy)` tails.
-- If local engine tests need the pinned ORT DLL, place it beside the test binary.
-- Reviewer lockouts remain binding, especially the Loop remediation handed to Leon and any artifact a reviewer explicitly reassigns.
+- A self-report of "all defects fixed" is not evidence: Gaff found three blockers (UAF, pointer equality, direction classification) after Sapper's claim of completion on B4.
 
-## Recent work (current wave, ~2026-07-28/29)
+## Historical context
 
-## 2026-07-26T22:38:02+00:00 — Mobius PR triage handoff
+Pre-2026-08-11 entries archived in `history-archive.md`. Covers: Mobius PR triage, rewind policy split (PR #291, RewindRequest), Wave 5 CUDA ops (PR #331), B2 ReleaseEpFactory ABI fix, CUDA B4 implementation defects (REJECTED by Gaff — UAF, pointer equality, direction classification), B2 follow-up CPU shim fix, B2/B3 docs/OperatorKernels.md + leakage sweep (#31974), CUDA B4 REJECTED.
 
-- Prepared Mobius PRs #404/#423/#430 for Justin review without merging. #404 replacement branch `sapper/404-rebase` at `fa30534` resolves conflicts and review comments; #423 `squad/hythe-deepseek-moe-phase1` at `40846bb` and #430 `test/l4-l5-golden-new-models` at `d1d235e` have current review fixes, Ruff clean, and focused tests passing.
+## 2026-08-11 — Rebase PR #31974
 
-## 2026-07-27T21:45:00-07:00 — Runtime fork rewind policy split
+Rebased `nxrt/mlas-bf16-layernorm` onto `86d38813a8` (no conflicts). Build+test green: 17 BF16 tests, 96 LayerNorm suite, `-Werror` clean. Force-pushed to `5755a8a129`. PR remains draft.
 
-- Revised PR #291 runner-backed rewind handling so the unsupported-runner policy is explicit and limited to the public session rewind API.
-- Internal speculative target rejection and draft realignment validation now use the allow-runner policy; public `restore_session`/`rewind_session_to` keep fail-closed ordering before session removal or token/KV mutation.
-- Updated the stale tiny PastPresent checkpoint test to expect the clean unsupported error and added model-free regression coverage for the speculative runner rewind policy boundary.
-- 2026-07-28T00:55-07:00 follow-up: replaced the raw `(len, policy)` tail with `RewindRequest` to avoid an 8-argument helper and fixed remaining kv_bridge test call sites. Full engine lib tests now pass locally after staging the pinned ORT DLL beside the test binary.
+## 2026-08-11 — Rebase PR #31974 (semantic conflict with #31676)
 
-## 2026-07-28T07:46:01+00:00 — Wave 5
-- PR #331 (`52b1fc59`) merged: added CUDA GatherND, SpaceToDepth, and EyeLike; #67 remains open for later coverage batches. Hallett independently approved the GPU parity and mutation-probe evidence.
+Upstream landed `a29da16687` (Validate SkipLayerNorm prepacked lengths) which conflicted in `skip_layer_norm.cc`. Two hunks: (1) competing include additions — kept both; (2) upstream's `tensor_size > 0` guard vs our bf16 branch — took both, extended guard to bf16 path. Upstream's shape validation covers bf16 because `ConvertMLFloat16ToFloatIfNeeded` now handles bf16 and sets `is_packed`. All 5 properties preserved. Tests: 17 bf16, 103 LayerNorm suite, 6 upstream prepacked-validation tests — all green. Force-pushed to `71bc68a41b`. PR remains draft.
 
-Full pre-compaction history in `history-archive.md`.
+## 2026-08-11 (upstream CI correction wave) — Session append
+
+Both upstream PRs converted back to draft per user instruction. Rebase outcomes confirmed stable: no code changes needed. Lessons: "not caused by us" ≠ "safe to mark ready"; draft until CI board is green.
+
+## 2026-08-12 — PR #31974 PrePack A/B
+
+Converted `LayerNorm17_PrePack_ScaleBiasInitializers` and `SkipLayerNorm_PrePack_GammaBetaInitializers` from single-config (`is_initializer=true`) to A/B loop (`{false, true}`). Both configs assert against the same reference output, proving PrePack does not change results. 20 BF16 / 106 LayerNorm tests green. Head: `e053afd77e`.
+
+## 2026-08-12 — PR #31974 PrePack A/B + PR body correction
+
+**PrePack A/B:** Converted `LayerNorm17_PrePack_ScaleBiasInitializers` and `SkipLayerNorm_PrePack_GammaBetaInitializers` to A/B loop (`is_initializer ∈ {false, true}`). Both configs assert against the same `LayerNormRef` reference. 20 BF16 / 106 LayerNorm-suite tests green. Head: `e053afd77e`.
+
+**PR body correction (Coordinator):** PR #31974 also changes pre-existing MLFloat16 behavior: (1) `REGISTER_CONTRIB_KERNELS(MLFloat16)` → `REGISTER_CONTRIB_KERNELS(MLFloat16, float)`, (2) MLFloat16 `ComputeJob` overload uses `WriteStat<U=float>` instead of `MLFloat16(mean)`. PR body rewritten to disclose both explicitly; stale "45 MLAS tests / 10 operator tests" table removed. Awaiting CI.

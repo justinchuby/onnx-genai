@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU numeric parity tests for `com.microsoft::SkipSimplifiedLayerNormalization`.
 
 use onnx_runtime_ep_api::{
@@ -26,13 +40,15 @@ fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn cuda_ep() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -291,12 +307,14 @@ fn assert_f64_reference(label: &str, got: f32, reference: f64, sequential_f32: f
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn skip_simplified_layer_norm_matches_independent_residual_rms_reference() {
     let _guard = GPU_SERIAL.lock().unwrap();
-    let Some(ep) = cuda_ep() else {
-        return;
-    };
+    let ep = require_cuda();
     let input_shape = [2, 3, 4];
     let skip_shape = [3, 4];
     let input = [
@@ -321,7 +339,9 @@ fn skip_simplified_layer_norm_matches_independent_residual_rms_reference() {
     )
     .unwrap();
     if got.is_empty() {
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     }
     let (expected_y, expected_sum, expected_invstd) = reference(
         &input_shape,
@@ -338,19 +358,23 @@ fn skip_simplified_layer_norm_matches_independent_residual_rms_reference() {
     assert_close("inverse RMS", &got[2], &expected_invstd);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn skip_simplified_layer_norm_matches_f64_reference_within_one_ulp() {
     let _guard = GPU_SERIAL.lock().unwrap();
-    let Some(ep) = cuda_ep() else {
-        return;
-    };
+    let ep = require_cuda();
     let input = [-0.09129826, -1.0101787, 3.0318594, 5.774467];
     let skip = [0.0; 4];
     let gamma = [1.0; 4];
     let bias = [0.0; 4];
     let got = run_available(&ep, &[1, 4], &[1, 4], &input, &skip, &gamma, &bias, 1e-5).unwrap();
     if got.is_empty() {
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     }
     let (expected_y, expected_sum, expected_invstd) =
         reference(&[1, 4], &[1, 4], &input, &skip, &gamma, &bias, 1e-5);
@@ -389,12 +413,14 @@ fn skip_simplified_layer_norm_matches_f64_reference_within_one_ulp() {
     assert_eq!(got[3], expected_sum);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn skip_simplified_layer_norm_fixed_decode_capture_replays_bit_identically() {
     let _guard = GPU_SERIAL.lock().unwrap();
-    let Some(ep) = cuda_ep() else {
-        return;
-    };
+    let ep = require_cuda();
     let input_shape = [1, 1, 4];
     let skip_shape = [1, 4];
     let output_shape = input_shape;

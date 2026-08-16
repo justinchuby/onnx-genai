@@ -9,6 +9,7 @@ keywords = ["onnx", "execution-provider", "kernel", "inference", "runtime"]
 categories = ["science", "hardware-support"]
 
 [dependencies]
+onnx-runtime-memory-governor = { workspace = true }
 # Maps a model's external weight file once and shares it across every tensor a
 # plugin asks about, instead of re-reading the file per lookup.
 memmap2 = { workspace = true }

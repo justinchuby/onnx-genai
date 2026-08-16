@@ -1,6 +1,6 @@
 //! `com.microsoft::FusedMatMulBias`: the optimizer's fusion of `MatMul(A, B)`
 //! followed by a broadcasting `Add(_, bias)` into a single node
-//! (`docs/ORT2.md` §18.2).
+//! (`docs/architecture/ORT2.md` §18.2).
 //!
 //! `Y = MatMul(A, B) + bias`, where the matmul follows full numpy semantics
 //! (batched, broadcast leading dims, 1-D operand promotion) and `bias` is

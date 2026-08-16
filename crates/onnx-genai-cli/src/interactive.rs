@@ -671,12 +671,26 @@ impl Backend {
                 let snapshot = engine.resource_snapshot();
                 let budget = snapshot.derived_budget;
                 let breakdown = snapshot.breakdown;
+                #[cfg(feature = "native-backend")]
+                let weight_placement =
+                    engine
+                        .weight_placement_report()
+                        .map(|report| profile::WeightPlacementMemory {
+                            coordinated_weight_budget_bytes: report.coordinated_weight_budget_bytes,
+                            effective_budget_bytes: report.effective_budget_bytes,
+                            device_bytes: report.device_bytes,
+                            host_bytes: report.host_bytes,
+                            explanation: report.explanation.clone(),
+                        });
+                #[cfg(not(feature = "native-backend"))]
+                let weight_placement = None;
                 Some(profile::MemoryUsage {
                     kv_budget_bytes: Some(budget.kv_bytes),
                     kv_max_tokens: Some(budget.max_total_tokens),
                     host_ram_used_bytes: Some(snapshot.host_ram.used),
                     device_used_bytes: Some(snapshot.vram.used),
-                    device_limit_bytes: Some(snapshot.resolved_limits.vram_bytes),
+                    device_limit_bytes: snapshot.resolved_limits.vram_bytes,
+                    device_oversubscribed_bytes: Some(engine.device_oversubscribed_bytes()),
                     peak_resident_bytes: None,
                     composition: Some(profile::DeviceComposition {
                         model_weights_bytes: breakdown.model_weights_bytes,
@@ -686,9 +700,34 @@ impl Backend {
                         kv_pages: budget.total_pages,
                         kv_page_bytes: budget.kv_bytes.checked_div(budget.total_pages).unwrap_or(0),
                     }),
+                    activation_plan: engine.activation_memory_plan_stats().map(|stats| {
+                        profile::ActivationPlanMemory {
+                            complete: stats.complete,
+                            peak_bytes: stats.peak_bytes,
+                            naive_bytes: stats.naive_bytes,
+                            savings_ratio: stats.savings_ratio,
+                            unknown_sizes: stats.unknown_sizes,
+                        }
+                    }),
+                    weight_placement,
+                    memory_strategy_plan: Some(engine.memory_strategy_plan().clone()),
+                    vmm_arena: engine.vmm_arena_stats().map(|stats| profile::VmmArena {
+                        commits: stats.commits,
+                        releases: stats.releases,
+                        committed_bytes: stats.committed_bytes,
+                        reserved_bytes: stats.reserved_bytes,
+                        peak_committed_bytes: stats.peak_committed_bytes,
+                        allocations: stats.allocations,
+                        ref_underflows: stats.ref_underflows,
+                        byte_underflows: stats.byte_underflows,
+                        unaccounted_committed_bytes: stats.unaccounted_committed_bytes,
+                    }),
                 })
             }
-            Self::Pipeline(_) => None,
+            Self::Pipeline(pipeline) => Some(profile::MemoryUsage {
+                memory_strategy_plan: Some(pipeline.engine.memory_strategy_plan().clone()),
+                ..profile::MemoryUsage::default()
+            }),
         }
     }
 

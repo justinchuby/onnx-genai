@@ -21,10 +21,12 @@ use std::cell::Cell;
 #[cfg(feature = "mlas")]
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, LazyWeightBoundary, Result, TensorMut, TensorView,
+};
+use onnx_runtime_ir::{Attribute, DataType, Graph, Node};
 use rayon::prelude::*;
 
 use super::matmul::gemm;
@@ -50,6 +52,14 @@ mod mm_profile {
     static NARROW_NS: AtomicU64 = AtomicU64::new(0);
     #[cfg(feature = "mlas")]
     static CALLS: AtomicU64 = AtomicU64::new(0);
+    // One-time constant-weight repack/dequant done on the first execution of
+    // each MatMulNBits node (the `dequantize_weight` int4->f32 expansion for the
+    // non-MLAS hand path, or `build_mlas_*` for the MLAS path). This is the
+    // lazy O(weight-bytes) work that dominates the native load/init fixed cost;
+    // gated by the same `ONNX_GENAI_PROFILE_MM=1` switch.
+    static PREPACK_NS: AtomicU64 = AtomicU64::new(0);
+    static PREPACK_CALLS: AtomicU64 = AtomicU64::new(0);
+    static PREPACK_BYTES: AtomicU64 = AtomicU64::new(0);
 
     pub fn enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -85,6 +95,31 @@ mod mm_profile {
         timed(&NARROW_NS, f)
     }
 
+    /// Time one constant-weight one-time repack/dequant (`build_mlas_*` or
+    /// `dequantize_weight`), tagged with a `phase` label and its `weight_bytes`
+    /// (standard-layout `B` size). Every call emits the running total to stderr
+    /// so a harness can read the last line to get the whole model's one-time
+    /// prepack/dequant cost and its share of load time.
+    pub fn time_prepack<T>(phase: &'static str, weight_bytes: usize, f: impl FnOnce() -> T) -> T {
+        if !enabled() {
+            return f();
+        }
+        let start = Instant::now();
+        let out = f();
+        let ns = start.elapsed().as_nanos() as u64;
+        let total_ns = PREPACK_NS.fetch_add(ns, Ordering::Relaxed) + ns;
+        let calls = PREPACK_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes =
+            PREPACK_BYTES.fetch_add(weight_bytes as u64, Ordering::Relaxed) + weight_bytes as u64;
+        eprintln!(
+            "[mm_prepack] phase={phase} calls={calls} prepack_total={total:.1}ms \
+             cum_bytes={bytes} this={this:.2}ms this_bytes={weight_bytes}",
+            total = total_ns as f64 / 1e6,
+            this = ns as f64 / 1e6,
+        );
+        out
+    }
+
     /// Record one MatMulNBits call and, every 512 calls, emit the running split
     /// to stderr so the harness can tail the final line.
     #[cfg(feature = "mlas")]
@@ -112,9 +147,71 @@ mod mm_profile {
 /// Overrides the bounded M=1 decode pool size; set to `0` to use the global
 /// Rayon pool as an escape hatch.
 const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
+
+/// `mlas-sys` reads the same knob to size its standalone pool. Fail the build
+/// rather than let the two names drift apart silently.
+#[cfg(feature = "mlas")]
+const _: () = {
+    const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    assert!(
+        bytes_eq(
+            DECODE_THREADS_ENV.as_bytes(),
+            mlas_sys::CPU_DECODE_THREADS_ENV.as_bytes()
+        ),
+        "DECODE_THREADS_ENV must match mlas_sys::CPU_DECODE_THREADS_ENV"
+    );
+};
 /// Process-local override set by first-class callers such as the CLI. Zero means
 /// no override, so the environment variable and automatic default still apply.
 static DECODE_THREADS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+
+/// Governed opt-out of the resident dequantized-f32 decode cache.
+///
+/// The `m == 1` generic decode path (`weight_nk`) materializes a full f32
+/// expansion of the packed weight and holds it in a per-kernel `OnceLock` for
+/// the session -- ~8x the packed int4 bytes. That trade buys ~2.4x decode
+/// throughput and is worth it whenever the expansion fits; when it does not, the
+/// box pages and decode collapses (#971). When this flag is set the caching
+/// branches skip the resident `OnceLock` and dequantize into a transient
+/// per-call buffer that is dropped after each GEMV -- byte-identical output,
+/// slower per token, but no resident 8x footprint. The memory-strategy plan
+/// owns the fit decision and calls [`set_resident_dequant_f32_cache_enabled`]
+/// before the native session loads. Default: enabled (unchanged fast path).
+static RESIDENT_DEQUANT_F32_CACHE_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// The `bits == 4, accuracy_level == 0` MLAS SQNBit CompFp32 route packs the
+/// constant weight into an MLAS-owned buffer ([`mlas_sys::sqnbit_packed_b_size`],
+/// which for CompFp32 is `N * K / 2` -- the same size as the on-disk int4
+/// bytes) held for the session *beside* the still-resident memory-mapped weight.
+/// Each packed buffer also retains its own `f32` scale (and, when asymmetric,
+/// `u8` zero-point) copy, and the shape-keyed kernel cache materializes one such
+/// buffer per activation shape -- a prefill (`m > 1`) and a decode (`m == 1`)
+/// instance -- so the resident footprint is roughly `2 * 1.25` the int4 bytes
+/// (measured on `qwen05b-symzp`: ~604 MB against 367 MB of int4 weights, with
+/// the mapped weight still resident). That buffer buys a large decode speedup on
+/// x86 (the borrowed int4 path has no SIMD kernel there). Like the resident f32
+/// cache above, the memory-strategy plan owns the fit decision: it accounts
+/// those bytes ([`matmul_nbits_resident_side_cache_bytes`], which counts the
+/// scales and both instantiations) and, when they do not fit the residency
+/// budget, calls [`set_mlas_sqnbit_packing_enabled`] with `false`.
+/// When disabled, [`MatMulNBitsKernel::mlas_sqnbit_owns_fp32_compute`] declines
+/// ownership so the node stays on the borrowed zero-copy int4 path -- the same
+/// behaviour as before the dispatch change, holding only the on-disk weights.
+/// Default: enabled (the fast MLAS route).
+static MLAS_SQNBIT_PACKING_DISABLED: AtomicBool = AtomicBool::new(false);
+
 /// Decode is bandwidth-bound and pays one fork/join per projection. Profiling
 /// across the existing 4--96 worker sweep found no gain above eight workers and
 /// clear regressions at 16+, so topology scaling is capped here; the environment
@@ -158,7 +255,7 @@ const SQNBIT_DECODE_MIN_ENV: &str = "NXRT_SQNBIT_DECODE_MIN";
 ///   choice is a wash and the hand path is preferred (no int8 rounding).
 /// * End-to-end Qwen2.5-Coder-7B decode is the same (~8 tok/s) with either M=1
 ///   route; the 2.3x gap vs ORT/foundry is per-op Rayon fork-join and NUMA
-///   locality, not the MatMulNBits kernel (see docs/BENCH_MLAS_INT4_E2E.md).
+///   locality, not the MatMulNBits kernel (see docs/performance/BENCH_MLAS_INT4_E2E.md).
 ///
 /// The default crossover is twice the topology-derived decode worker count.
 /// That preserves `m=16` on the profiled 96-way host while scaling down on
@@ -255,12 +352,54 @@ fn resolve_decode_min(raw: Option<&str>, available: usize) -> usize {
         .unwrap_or_else(|| default_sqnbit_decode_min(available))
 }
 
+/// Whether this host has a native int8 dot-product instruction behind the hand
+/// int4/int8 `accuracy_level = 4` decode kernels.
+///
+/// The `m < sqnbit_decode_min()` short-circuit in [`Kernel::try_mlas_sqnbit`]
+/// exists because the hand decode kernels beat MLAS SQNBit CompInt8 at small
+/// `m` while also avoiding MLAS's one-time packing. That is only true where the
+/// int8 accumulation is a single instruction:
+///
+/// * x86_64 needs AVX-VNNI or AVX-512-VNNI (`vpdpbusd`). Without it the AVX2
+///   fallback emulates the dot with `vpmaddubsw` + `vpmaddwd` + widening adds,
+///   and it loses badly. Measured on an AVX2-only AMD EPYC 9V74 against ORT
+///   1.27's CPU EP, both pinned to 8 intra-op threads, int4 block-32 M=1:
+///   0.762 ms on the hand path vs 0.079 ms once MLAS SQNBit takes the node --
+///   a 9.6x regression, or 16.1x vs ORT instead of 1.9x.
+/// * aarch64 is unconditionally true: NEON is baseline on ARM64, so
+///   [`DotKernel::Neon`]/[`DotKernel::NeonDot`] always have a real dot product
+///   and the previous behaviour is preserved exactly.
+/// * Every other architecture runs the scalar `DotKernel`, which has no dot
+///   product at all, so MLAS (when present) should take the node.
+///
+/// This deliberately reads the *selected* kernel rather than probing CPUID
+/// directly, so `ONNX_GENAI_CPU_DOT_KERNEL`-style overrides and the test
+/// harness stay consistent with what actually executes.
+#[cfg(feature = "mlas")]
+fn hand_int8_decode_has_native_dot() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        selected_dot_kernel().uses_vnni_int4_direct()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        true
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
 pub struct MatMulNBitsKernel {
     k: usize,
     n: usize,
     bits: usize,
     block_size: usize,
     accuracy_level: i64,
+    /// Structural FLOPs (`2*rows*N*K`) when the activation's leading dims were
+    /// static at build time; `None` otherwise (issue #995 — never fabricated).
+    flops: Option<u64>,
     weight_prepacked: bool,
     constant_inputs: [bool; 5],
     weight_nk: OnceLock<Vec<f32>>,
@@ -373,7 +512,15 @@ static N16_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 static KAI_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(all(test, feature = "mlas"))]
 static MLAS_SQNBIT_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
-
+/// Positive-proof counters for the zero-copy borrowed int4 decode path (#979).
+/// Split by symmetry so a test can assert the *symmetric* branch is the one that
+/// executed, not merely that some path avoided the resident `weight_nk` f32
+/// cache. Incremented once per `execute` that routes into
+/// [`borrowed_affine_int4_matmul`].
+#[cfg(test)]
+static BORROWED_INT4_SYMMETRIC_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static BORROWED_INT4_ASYMMETRIC_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// Standard ONNX row-major packed NBits weight with affine block metadata.
 ///
 /// This preserves the wire layout instead of expanding it to f32. Direct
@@ -383,6 +530,23 @@ struct PackedNBitsWeight {
     values: Vec<u8>,
     scales: Vec<f32>,
     zero_points: Option<Vec<u8>>,
+}
+
+enum BorrowedScales<'a> {
+    F32(&'a [f32]),
+    F16(&'a [half::f16]),
+    Bf16(&'a [half::bf16]),
+}
+
+impl BorrowedScales<'_> {
+    #[inline]
+    fn get(&self, index: usize) -> f32 {
+        match self {
+            Self::F32(values) => values[index],
+            Self::F16(values) => values[index].to_f32(),
+            Self::Bf16(values) => values[index].to_f32(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -521,7 +685,7 @@ struct PackedU8Weight {
 pub struct MatMulNBitsFactory;
 
 impl KernelFactory for MatMulNBitsFactory {
-    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+    fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let k = required_positive_attr(node, "K")?;
         let n = required_positive_attr(node, "N")?;
         let bits = optional_int_attr(node, "bits")?.unwrap_or(4);
@@ -556,12 +720,22 @@ impl KernelFactory for MatMulNBitsFactory {
             .and_then(|value| value.as_int())
             .unwrap_or(0);
 
+        // Structural FLOPs: the activation `A` is `[..leading.., K]`; the GEMM
+        // does `2*rows*N*K` multiply-adds where `rows` is the product of the
+        // leading dims. When the shape is dynamic we report `None` rather than
+        // guess a token count (issue #995 constraint 2).
+        let rows = input_shapes
+            .first()
+            .and_then(|a| super::flops::leading_rows(a));
+        let flops = super::flops::matmul_nbits_flops(rows, n as u64, k as u64);
+
         Ok(Box::new(MatMulNBitsKernel {
             k,
             n,
             bits: bits as usize,
             block_size,
             accuracy_level,
+            flops,
             weight_prepacked: weight_prepacked == 1,
             constant_inputs: [false; 5],
             weight_nk: OnceLock::new(),
@@ -709,6 +883,50 @@ impl Kernel for MatMulNBitsKernel {
             owned_result = vec![0.0f32; result_len];
             &mut owned_result
         };
+        let dot_kernel = selected_dot_kernel();
+        if self.bits == 4
+            && self.accuracy_level == 0
+            && !self.weight_prepacked
+            && group_indices.is_none()
+            && !self.mlas_sqnbit_owns_fp32_compute(can_prepack, zero_points.is_some())
+            && let Some(packed) = contiguous_host_slice::<u8>(&inputs[1])
+            && let Some(scales) = borrowed_scales(&inputs[2])
+            && let Some(borrowed_zero_points) = borrow_optional_int4_zero_points(zero_points)
+        {
+            // Gate on *symmetry* explicitly, not on "a zero_points input happens
+            // to exist". Symmetric int4 (no zero_points) has the implicit
+            // midpoint 8 and is mathematically simpler than the asymmetric case,
+            // yet it used to fall past this zero-copy path all the way to the
+            // resident f32 `weight_nk` cache (~8x the file size in RAM). It now
+            // borrows the packed int4 in place like the asymmetric case, using
+            // `None` zero points to mean the implicit midpoint (see #979).
+            #[cfg(test)]
+            if borrowed_zero_points.is_none() {
+                BORROWED_INT4_SYMMETRIC_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                BORROWED_INT4_ASYMMETRIC_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
+            with_decode_pool(|| {
+                borrowed_affine_int4_matmul(
+                    &activations,
+                    packed,
+                    scales,
+                    borrowed_zero_points,
+                    bias.as_deref(),
+                    result,
+                    m,
+                    self.k,
+                    self.n,
+                    self.block_size,
+                    dot_kernel,
+                );
+            })?;
+            return if direct_result {
+                Ok(())
+            } else {
+                write_compute_f32(&mut outputs[0], result)
+            };
+        }
         #[cfg(feature = "mlas")]
         {
             if let Some(()) = self.try_mlas_sqnbit(
@@ -731,7 +949,6 @@ impl Kernel for MatMulNBitsKernel {
                 return out;
             }
         }
-        let dot_kernel = selected_dot_kernel();
         if self.bits == 2 && !self.weight_prepacked && group_indices.is_none() {
             let owned_weight;
             let packed_weight = if can_prepack {
@@ -954,11 +1171,27 @@ impl Kernel for MatMulNBitsKernel {
             }
         } else if self.bits == 8 && m == 1 && group_indices.is_none() {
             // 8-bit decode GEMV: keep the weight at one byte per element and
-            // dequantize on the fly against f32 activations, instead of
-            // pre-expanding it to f32 (4x the memory traffic) as the generic
-            // `weight_nk` path below does. Activations stay f32 so the result is
-            // full-precision (unlike int8-activation kernels).
-            if dot_kernel.uses_kai_sdot_direct(self.bits, self.block_size) {
+            // dequantize on the fly, instead of pre-expanding it to f32 (4x the
+            // memory traffic) as the generic `weight_nk` path below does.
+            //
+            // Precision gate: the two SDOT routes below are *not* full
+            // precision -- `kai_sdot_matmul_m1` quantizes the activations via
+            // `quantize_activation_qai8dxp` and `n16_sdot_u8_i16_matmul_m1` via
+            // `quantize_activation_signed`, both int8, costing ~1e-3 relative
+            // RMSE. That is ONNX CompInt8, so both are gated on
+            // `accuracy_level == 4`, matching the 4-bit SDOT routes above and
+            // the 0/1 == fp32 convention used throughout this kernel. They
+            // previously had no `accuracy_level` gate at all while
+            // `arm64_kai_sdot_direct_enabled` defaults *on* for non-Apple
+            // aarch64, so `accuracy_level = 0` 8-bit decode silently ran
+            // CompInt8 there. The final `else` does not quantize the
+            // activations to int8: it keeps them at f32 or, when
+            // `eight_bit_int16_activation()` is on *and the model asked for
+            // reduced precision*, at int16. int16 activations are far more
+            // accurate than int8 but they are NOT fp32, so they are gated too
+            // (`reduced_precision_activation_allowed`).
+            let int8_compute_allowed = self.accuracy_level == 4;
+            if int8_compute_allowed && dot_kernel.uses_kai_sdot_direct(self.bits, self.block_size) {
                 let owned_weight;
                 let packed_weight = if can_prepack {
                     if let Some(weight) = self.packed_kai_qsi8_weight.get() {
@@ -989,7 +1222,8 @@ impl Kernel for MatMulNBitsKernel {
                         dot_kernel,
                     );
                 })?;
-            } else if dot_kernel.uses_n16_sdot_direct()
+            } else if int8_compute_allowed
+                && dot_kernel.uses_n16_sdot_direct()
                 && self.block_size == 128
                 && activation_quant_group() == 32
             {
@@ -1041,14 +1275,16 @@ impl Kernel for MatMulNBitsKernel {
                     owned_weight = numa_place_u8(built, self.n);
                     &owned_weight
                 };
+                let int16_activation = eight_bit_int16_activation()
+                    && reduced_precision_activation_allowed(self.accuracy_level);
                 with_decode_pool(|| {
-                    if eight_bit_int16_activation() {
+                    if int16_activation {
                         // int16-activation fast path: quantize the activation to
                         // int16 per K-block and reduce against the u8 weight with a
-                        // SIMD int16 dot product. int16 keeps enough precision to
-                        // match the fp32 result (unlike int8-activation, which is
-                        // ORT's fast-but-wrong path), while replacing the widening
-                        // u8->f32 FMA with a denser int16 madd.
+                        // SIMD int16 dot product, replacing the widening u8->f32
+                        // FMA with a denser int16 madd. This *is* a reduced-precision
+                        // compute type, so it is gated on `accuracy_level` -- see
+                        // `reduced_precision_activation_allowed`.
                         gemv_nk_u8_i16(
                             &activations,
                             &weight_u8.values,
@@ -1075,17 +1311,20 @@ impl Kernel for MatMulNBitsKernel {
             }
         } else if m == 1 {
             let owned_weight;
-            let weight_nk = if can_prepack {
+            let weight_nk = if can_prepack && resident_dequant_f32_cache_enabled() {
                 if let Some(weight) = self.weight_nk.get() {
                     weight
                 } else {
-                    let weight = self.dequantize_weight(
-                        &inputs[1],
-                        &inputs[2],
-                        zero_points,
-                        group_indices,
-                        WeightLayout::Nk,
-                    )?;
+                    let weight =
+                        mm_profile::time_prepack("dequant-nk", self.nbits_weight_bytes(), || {
+                            self.dequantize_weight(
+                                &inputs[1],
+                                &inputs[2],
+                                zero_points,
+                                group_indices,
+                                WeightLayout::Nk,
+                            )
+                        })?;
                     let weight = numa_place_nk(weight, self.n);
                     let _ = self.weight_nk.set(weight);
                     self.weight_nk
@@ -1132,13 +1371,16 @@ impl Kernel for MatMulNBitsKernel {
                 result,
             )?;
             if !used_fast_nt {
-                let weight_kn = self.dequantize_weight(
-                    &inputs[1],
-                    &inputs[2],
-                    zero_points,
-                    group_indices,
-                    WeightLayout::Kn,
-                )?;
+                let weight_kn =
+                    mm_profile::time_prepack("dequant-kn", self.nbits_weight_bytes(), || {
+                        self.dequantize_weight(
+                            &inputs[1],
+                            &inputs[2],
+                            zero_points,
+                            group_indices,
+                            WeightLayout::Kn,
+                        )
+                    })?;
                 gemm(&activations, &weight_kn, result, m, self.k, self.n)?;
             }
         }
@@ -1158,6 +1400,10 @@ impl Kernel for MatMulNBitsKernel {
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
+    }
+
+    fn estimated_flops(&self) -> Option<u64> {
+        self.flops
     }
 }
 
@@ -1197,6 +1443,56 @@ impl MatMulNBitsKernel {
     /// how ORT/onnxruntime-genai run those models. Bias, when present, is added
     /// by MLAS itself, so the caller's post-loop bias add is skipped on this
     /// path.
+    /// Whether MLAS SQNBit's CompFp32 kernels own this `accuracy_level = 0`
+    /// int4 node, so [`Kernel::execute`] must not short-circuit into the
+    /// borrowed hand path first.
+    ///
+    /// The borrowed zero-copy int4 path (#979) fixed a memory regression (it
+    /// avoids the ~8x resident f32 `weight_nk` expansion), but it also became
+    /// the *first* branch in `execute`, which silently made the intended
+    /// `accuracy_level = 0` -> MLAS CompFp32 route unreachable: `try_mlas_sqnbit`
+    /// is only consulted after it. On x86_64 the borrowed path has no SIMD
+    /// kernel at all (the vectorized block dot is `cfg(target_arch = "aarch64")`),
+    /// so every `bits=4, accuracy_level=0` node ran a scalar nibble-unpack GEMV
+    /// -- measured 29x-303x slower than ONNX Runtime's CPU EP on the same graph.
+    ///
+    /// MLAS keeps ownership only when it can pack the weight **once**:
+    /// `can_prepack` means B/scales/zero-points are graph constants, so the
+    /// packed buffer is built on the first call and cached for the session. With
+    /// non-constant (dynamic) weights MLAS would repack on every call, which the
+    /// borrowed path avoids entirely, so ownership stays with the borrowed path
+    /// there. `sqnbit_packed_b_size` is MLAS's own "do I have a kernel for this
+    /// shape on this CPU" probe; when it says no, the borrowed path remains the
+    /// fallback.
+    ///
+    /// Finally, the packed buffer is a session-lifetime resident allocation
+    /// (~2x the int4 bytes) held beside the mapped weight, so the memory-strategy
+    /// plan governs it exactly like the resident f32 cache (#987): when the plan
+    /// declines it (over budget), [`set_mlas_sqnbit_packing_enabled`] is `false`
+    /// and ownership is refused so the borrowed zero-copy path stays reachable.
+    #[cfg(feature = "mlas")]
+    fn mlas_sqnbit_owns_fp32_compute(&self, can_prepack: bool, has_zero_points: bool) -> bool {
+        mlas_qnbit_enabled()
+            && mlas_sqnbit_packing_enabled()
+            && can_prepack
+            && mlas_sys::sqnbit_packed_b_size(
+                self.n,
+                self.k,
+                self.bits,
+                self.block_size,
+                has_zero_points,
+                self.mlas_compute_type(),
+            )
+            .is_some()
+    }
+
+    /// Without the vendored MLAS there is no SQNBit kernel to defer to, so the
+    /// borrowed int4 path always owns `accuracy_level = 0`.
+    #[cfg(not(feature = "mlas"))]
+    fn mlas_sqnbit_owns_fp32_compute(&self, _can_prepack: bool, _has_zero_points: bool) -> bool {
+        false
+    }
+
     #[cfg(feature = "mlas")]
     #[allow(clippy::too_many_arguments)]
     fn try_mlas_sqnbit(
@@ -1300,8 +1596,25 @@ impl MatMulNBitsKernel {
         // explicitly opted in on non-Apple ARM64, the vendored MLAS QNBit path
         // can serve accuracy-4 qsi4/qsi8 decode with the same KleidiAI kernels
         // ORT uses.
-        let hand_decode_is_fast =
-            self.bits == 4 && self.accuracy_level == 4 && !prefer_arm64_mlas_decode;
+        //
+        // "Fast" is a claim about the *host*, not about the source: the hand
+        // int4/int8 decode kernels are only competitive where the CPU has a
+        // native int8 dot product to dispatch to (see
+        // `hand_int8_decode_has_native_dot`). On a host without one they lose to
+        // MLAS SQNBit CompInt8 by an order of magnitude, so the short-circuit
+        // must not fire there.
+        //
+        // ...unless there is nothing to amortize MLAS's packing against.
+        // Without constant weights (`can_prepack == false`) the packed buffer
+        // cannot be cached in `mlas_shards`/`mlas_packed`, so MLAS would repack
+        // on *every* call -- measured at 55.8 ms for a 6.4 MB int4 weight
+        // (`ONNX_GENAI_PROFILE_MM=1`), against a sub-millisecond decode. Dynamic
+        // weights keep the hand path regardless of ISA; a slow kernel still
+        // beats repacking the whole weight per token.
+        let hand_decode_is_fast = self.bits == 4
+            && self.accuracy_level == 4
+            && !prefer_arm64_mlas_decode
+            && (!can_prepack || hand_int8_decode_has_native_dot());
         if m < sqnbit_decode_min() && hand_decode_is_fast {
             return Ok(None);
         }
@@ -1352,7 +1665,10 @@ impl MatMulNBitsKernel {
             let shards = if let Some(shards) = self.mlas_shards.get() {
                 shards
             } else {
-                let built = self.build_mlas_shards(packed, scales, zero_points, comp)?;
+                let built =
+                    mm_profile::time_prepack("mlas-shards", self.nbits_weight_bytes(), || {
+                        self.build_mlas_shards(packed, scales, zero_points, comp)
+                    })?;
                 let _ = self.mlas_shards.set(built);
                 self.mlas_shards
                     .get()
@@ -1371,7 +1687,10 @@ impl MatMulNBitsKernel {
             let cached = if let Some(cached) = self.mlas_packed.get() {
                 cached
             } else {
-                let built = self.build_mlas_packed(packed, scales, zero_points, comp)?;
+                let built =
+                    mm_profile::time_prepack("mlas-packed", self.nbits_weight_bytes(), || {
+                        self.build_mlas_packed(packed, scales, zero_points, comp)
+                    })?;
                 let _ = self.mlas_packed.set(built);
                 self.mlas_packed
                     .get()
@@ -1429,7 +1748,7 @@ impl MatMulNBitsKernel {
         }
 
         let owned_weight;
-        let weight_nk: &[f32] = if can_prepack {
+        let weight_nk: &[f32] = if can_prepack && resident_dequant_f32_cache_enabled() {
             if let Some(weight) = self.weight_nk.get() {
                 weight
             } else {
@@ -1716,6 +2035,16 @@ impl MatMulNBitsKernel {
         }
     }
 
+    /// Standard-layout `B` size in bytes for this node
+    /// (`[N, ceil(K / block_size), block_size * bits / 8]`), i.e. the number of
+    /// packed weight bytes a prepack/dequant reads. Used only to size the
+    /// one-time prepack/dequant cost under `ONNX_GENAI_PROFILE_MM=1`.
+    fn nbits_weight_bytes(&self) -> usize {
+        let k_blocks = self.k.div_ceil(self.block_size);
+        let blob_size = self.block_size * self.bits / 8;
+        self.n * k_blocks * blob_size
+    }
+
     /// Pack the constant int4 weight into one MLAS SQNBit shard per entry of
     /// [`Self::mlas_shard_segments`]. Returns `Ok(None)` when MLAS has no kernel
     /// for this `(bits, block_size, compute_type)` on the host (any shard failing
@@ -1766,6 +2095,25 @@ impl MatMulNBitsKernel {
                 })),
                 None => return Ok(None),
             }
+        }
+        if mm_profile::enabled() {
+            eprintln!(
+                "[mlas_pack] kind=shards n={} k={} block_size={} shards={} \
+                 packed_b_size={:?} live_total={}",
+                self.n,
+                self.k,
+                self.block_size,
+                shards.iter().filter(|s| s.is_some()).count(),
+                mlas_sys::sqnbit_packed_b_size(
+                    self.n,
+                    self.k,
+                    self.bits,
+                    self.block_size,
+                    zero_points.is_some(),
+                    comp,
+                ),
+                mlas_sys::sqnbit_packed_live_bytes(),
+            );
         }
         Ok(Some(shards))
     }
@@ -2044,6 +2392,46 @@ impl MatMulNBitsKernel {
             return Ok(weight_kn);
         }
 
+        // Parallel `Kn` fast path: the transposed ([k, n]) layout the dense
+        // prefill GEMM consumes. Element `weight_kn[depth * n + output]` means
+        // one depth-row `[depth * n .. (depth + 1) * n)` is contiguous, so we can
+        // parallelize across depth-rows with `par_chunks_mut(n)` and fill every
+        // output within a row. This is byte-identical to the serial scatter
+        // below (same `dequantize_nbits_value`, same indices) but distributes the
+        // f32 materialization across the pool. Previously this `Kn` transpose was
+        // the single-threaded phase that dominated the cache-cold first prefill
+        // (~5 s on qwen0.5b-q4, ~43 s/GB), the load-time gap versus ORT (#959).
+        // The grouped path keeps the original serial scatter below.
+        if matches!(layout, WeightLayout::Kn) && group_indices.is_none() {
+            let bits = self.bits;
+            let block_size = self.block_size;
+            let n = self.n;
+            weight_kn
+                .par_chunks_mut(n)
+                .enumerate()
+                .for_each(|(depth, row)| {
+                    for (output, slot) in row.iter_mut().enumerate() {
+                        let packed_start = output * k_blocks * blob_size;
+                        let scale_start = output * k_blocks;
+                        let zero_point_start = output * zp_row_bytes;
+                        let packed_row = &packed[packed_start..packed_start + k_blocks * blob_size];
+                        let scale_row = &scales[scale_start..scale_start + k_blocks];
+                        let zero_point_row = packed_zero_points.as_ref().map(|points| {
+                            &points[zero_point_start..zero_point_start + zp_row_bytes]
+                        });
+                        *slot = dequantize_nbits_value(
+                            packed_row,
+                            scale_row,
+                            zero_point_row,
+                            depth,
+                            bits,
+                            block_size,
+                        );
+                    }
+                });
+            return Ok(weight_kn);
+        }
+
         for output in 0..self.n {
             if group_indices.is_none() {
                 let packed_start = output * k_blocks * blob_size;
@@ -2210,6 +2598,16 @@ pub fn set_decode_thread_budget(threads: Option<usize>) -> std::result::Result<(
         return Err("CPU decode thread budget must be greater than zero");
     }
     DECODE_THREADS_OVERRIDE.store(threads.unwrap_or(0), Ordering::Release);
+    // The standalone MLAS pool sits below this crate and cannot read
+    // `DECODE_THREADS_OVERRIDE`, so forward the budget explicitly. Without this
+    // the budget would only reach dense `MlasGemmBatch` work on Linux, and only
+    // indirectly, via the affinity mask shrinking `available_parallelism`.
+    //
+    // Forwarded after the store because the two layers reject exactly the same
+    // input (`Some(0)`, already rejected above), so this call cannot fail and
+    // the two budgets cannot diverge. Keep that invariant if either guard grows.
+    #[cfg(feature = "mlas")]
+    mlas_sys::set_pool_thread_budget(threads)?;
     Ok(())
 }
 
@@ -2218,8 +2616,399 @@ fn decode_threads_override() -> Option<usize> {
         .map(std::num::NonZeroUsize::get)
 }
 
-/// Resolve the number of worker threads the **global Rayon pool** (which drives
-/// prefill and every MLAS GEMM through the `mlas-sys` parallel-for backend)
+/// Enable or disable the resident dequantized-f32 decode cache for the process.
+///
+/// The memory-strategy plan calls this before the native decode session is
+/// built. Passing `false` makes every `MatMulNBits` decode kernel dequantize its
+/// weight into a transient per-call buffer instead of materializing the resident
+/// ~8x f32 `weight_nk` expansion, trading decode throughput for footprint when
+/// the expansion would not fit the budget (#971). The result is byte-identical
+/// (the same `dequantize_weight` + `gemv_nk` math, just not retained). Default
+/// is enabled, so an unset process keeps the unchanged fast path.
+pub fn set_resident_dequant_f32_cache_enabled(enabled: bool) {
+    RESIDENT_DEQUANT_F32_CACHE_DISABLED.store(!enabled, Ordering::Release);
+}
+
+/// Whether the resident dequantized-f32 decode cache is currently enabled.
+fn resident_dequant_f32_cache_enabled() -> bool {
+    !RESIDENT_DEQUANT_F32_CACHE_DISABLED.load(Ordering::Acquire)
+}
+
+/// Enable or disable the MLAS SQNBit CompFp32 packed-weight route for the
+/// process (the `bits == 4, accuracy_level == 0` dispatch).
+///
+/// The memory-strategy plan calls this before the native decode session is
+/// built, with the same admission verdict it uses for the resident f32 cache.
+/// Passing `false` makes [`MatMulNBitsKernel::mlas_sqnbit_owns_fp32_compute`]
+/// decline ownership, so those nodes stay on the borrowed zero-copy int4 path
+/// and the runtime holds only the on-disk weights instead of an extra
+/// session-lifetime MLAS packed buffer (~2x the int4 bytes) beside them. The
+/// borrowed fallback is byte-identical, only slower per token on x86. Default is
+/// enabled, so an unset process keeps the fast MLAS route.
+pub fn set_mlas_sqnbit_packing_enabled(enabled: bool) {
+    MLAS_SQNBIT_PACKING_DISABLED.store(!enabled, Ordering::Release);
+}
+
+/// Whether the MLAS SQNBit CompFp32 packed-weight route is currently admitted.
+#[cfg(feature = "mlas")]
+fn mlas_sqnbit_packing_enabled() -> bool {
+    !MLAS_SQNBIT_PACKING_DISABLED.load(Ordering::Acquire)
+}
+
+/// Predict whether an `m == 1` (decode) `MatMulNBits` node with **constant**
+/// weights will materialize the resident dequantized-f32 `weight_nk` cache
+/// (the ~8x expansion of #971), given its static attributes and the host's
+/// selected decode dot-kernel.
+///
+/// This is the single authority the engine's memory plan consults so its
+/// footprint accounting cannot silently drift from the kernel's own dispatch
+/// (the #947 failure mode). It mirrors the branch order of
+/// [`MatMulNBitsKernel::execute`] exactly: any earlier packed / on-the-fly path
+/// that claims the node returns `false`; only the terminal generic `m == 1`
+/// branch that populates `weight_nk` returns `true`. A control test
+/// (`predictor_matches_actual_resident_cache`) runs real kernels and asserts
+/// this function agrees with the weight actually cached, so a change to the
+/// dispatch that this predictor does not track fails the build.
+///
+/// `n`/`k` are the canonical output/reduction dims and are only consulted on the
+/// MLAS path (whose SQNBit interception depends on the shape).
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_nbits_decode_caches_dequant_f32(
+    bits: usize,
+    block_size: usize,
+    accuracy_level: i64,
+    n: usize,
+    k: usize,
+    has_zero_points: bool,
+    has_g_idx: bool,
+    weight_prepacked: bool,
+) -> bool {
+    // Prepacked MLAS SQNBit weights are never expanded to f32; they take the
+    // dedicated packed path (or are rejected). Not the f32 cache.
+    if weight_prepacked {
+        return false;
+    }
+    let dot_kernel = selected_dot_kernel();
+    // (A) borrowed_affine_int4 on-the-fly path: bits==4, accuracy_level==0,
+    // no g_idx, symmetric OR asymmetric. Dequantizes per call, no resident
+    // cache. Constant initializers are contiguous host slices, so the runtime
+    // slice guards this path also checks always hold here.
+    //
+    // Symmetry is deliberately NOT part of this condition. #979 extended the
+    // borrowed path to symmetric int4 (implicit midpoint 8, no zero_points
+    // input); before that, symmetric fell through to the resident f32 cache and
+    // paid ~8x the file size in RAM. This predictor must track the kernel's gate
+    // exactly — when it did not, it over-reported `resident_f32_cache_bytes` for
+    // symmetric models and the governed cache decision (#987) would have
+    // declined a cache that was never going to be built.
+    if bits == 4 && accuracy_level == 0 && !has_g_idx {
+        return false;
+    }
+    // (B) MLAS SQNBit path (feature-gated). When present and the shape is
+    // supported it consumes the packed weight directly, never the f32 cache.
+    #[cfg(feature = "mlas")]
+    {
+        if !has_g_idx && mlas_qnbit_enabled() {
+            let comp = if accuracy_level == 4 {
+                mlas_sys::SQNBitComputeType::Int8
+            } else {
+                mlas_sys::SQNBitComputeType::Fp32
+            };
+            if mlas_sys::sqnbit_packed_b_size(n, k, bits, block_size, has_zero_points, comp)
+                .is_some()
+            {
+                return false;
+            }
+        }
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        let _ = (n, k);
+    }
+    // (C) 2-bit packed path.
+    if bits == 2 && !has_g_idx {
+        return false;
+    }
+    // (D) int4-direct decode (accuracy_level==4, host supports it).
+    if bits == 4
+        && accuracy_level == 4
+        && !has_g_idx
+        && dot_kernel.supports_int4_direct(block_size, has_zero_points)
+    {
+        return false;
+    }
+    // (E) int8-repacked decode (accuracy_level==4).
+    if bits == 4 && accuracy_level == 4 && !has_g_idx {
+        return false;
+    }
+    // (F) 8-bit on-the-fly decode (one byte per element, no f32 expansion).
+    if bits == 8 && !has_g_idx {
+        return false;
+    }
+    // (G) Terminal generic m==1 path: materializes the resident f32 weight_nk.
+    true
+}
+
+/// How many times the CPU decode runtime materializes each MLAS SQNBit packed
+/// buffer over a session -- the multiplier that the earlier accounting missed.
+///
+/// The executor's kernel cache is **shape-keyed** (`KernelKey { node, shapes }`
+/// in `onnx-runtime-session/src/executor/kernel_cache.rs`): a `MatMulNBits`
+/// kernel is compiled and cached *per distinct resolved activation shape*. An
+/// autoregressive decoder presents exactly two activation shapes to each such
+/// node -- the prefill shape (`m == prompt_len`) and the decode shape
+/// (`m == 1`) -- so it compiles **two** kernel instances, and each instance
+/// packs its own full copy of the weight into its own `mlas_shards`
+/// `OnceLock`. Both copies stay resident for the whole session.
+///
+/// This was measured directly on `qwen05b-symzp` (169 weight boundaries): a
+/// 1-token run packs 169 buffers, a multi-token run packs 338 = 2x169, and
+/// [`mlas_sys::sqnbit_packed_live_bytes`] holds both copies for the entire
+/// decode phase (it does not fall until process exit). Accounting a single copy
+/// therefore under-reports the resident footprint by 2x -- the dangerous
+/// (under-reporting) direction for an admission gate.
+///
+/// It is a fixed upper bound for the autoregressive decode workload: a
+/// prefill-only run (no `m == 1` step) materializes one copy, so accounting two
+/// over-estimates, which only makes the gate decline sooner (safe). MLAS packs
+/// in *both* the prefill and decode instances (unlike the generic f32
+/// `weight_nk` cache, which is a decode-only `m == 1` materialization and is
+/// held once), so this multiplier applies to the MLAS packed buffer alone.
+#[cfg(feature = "mlas")]
+const MLAS_PACKED_DECODE_INSTANTIATIONS: u64 = 2;
+
+/// Bytes the owned scale (and optional zero-point) copies retained by a single
+/// [`mlas_sys::SQNBitPackedB`] add on top of the packed buffer.
+///
+/// MLAS's `Fp32` pack keeps its own `f32` scale copy and, for an asymmetric
+/// weight, a `u8` zero-point copy, so the durable heap of one packed buffer is
+/// `packed + scales (+ zero_points)`, not `packed` alone. The layout matches the
+/// ONNX initializer shapes the kernel feeds `SQNBitPackedB::new`: scales are
+/// `[N, ceil(K / block_size)]` `f32`, and int4 zero points are
+/// `[N, ceil(ceil(K / block_size) / 2)]` `u8`. Summed over the N-sharded packs
+/// this is exact (the shards split on whole N rows), so it equals
+/// [`mlas_sys::SQNBitPackedB::owned_heap_bytes`] minus the packed size.
+#[cfg(feature = "mlas")]
+fn mlas_sqnbit_scale_zp_bytes(block_size: usize, n: usize, k: usize, has_zero_points: bool) -> u64 {
+    if block_size == 0 {
+        return 0;
+    }
+    let blocks = k.div_ceil(block_size) as u64;
+    let n = n as u64;
+    let scale_bytes = n
+        .saturating_mul(blocks)
+        .saturating_mul(std::mem::size_of::<f32>() as u64);
+    let zp_bytes = if has_zero_points {
+        n.saturating_mul(blocks.div_ceil(2))
+    } else {
+        0
+    };
+    scale_bytes.saturating_add(zp_bytes)
+}
+
+/// The durable heap bytes a **constant-weight** `bits == 4, accuracy_level == 0`
+/// `MatMulNBits` node holds for the session on the MLAS SQNBit CompFp32 route --
+/// **one packed copy** -- or `None` when that node does not take the MLAS route.
+///
+/// This mirrors [`MatMulNBitsKernel::mlas_sqnbit_owns_fp32_compute`]'s gate on
+/// static attributes: MLAS owns the node only for constant int4
+/// `accuracy_level == 0` weights without `g_idx`, when the `mlas` build has a
+/// SQNBit kernel for the shape on this host and the route is enabled.
+///
+/// The value is MLAS's own [`mlas_sys::sqnbit_packed_b_size`] -- the same probe
+/// the route decision uses -- **plus** the scale and zero-point copies a
+/// [`mlas_sys::SQNBitPackedB`] retains ([`mlas_sqnbit_scale_zp_bytes`]), so it
+/// equals the buffer the kernel actually allocates for one instance and cannot
+/// drift from it. It is the *per-copy* figure; the session holds
+/// [`MLAS_PACKED_DECODE_INSTANTIATIONS`] of these (see
+/// [`matmul_nbits_resident_side_cache_bytes`]).
+///
+/// It deliberately does **not** consult [`mlas_sqnbit_packing_enabled`]: the
+/// accounting states what admitting the route would cost, and the plan then
+/// decides admission from that cost. Gating it on the admission flag would make
+/// the cost vanish exactly when the plan needs it to make the decision.
+#[cfg(feature = "mlas")]
+fn mlas_sqnbit_packed_b_cache_bytes(
+    bits: usize,
+    block_size: usize,
+    accuracy_level: i64,
+    n: usize,
+    k: usize,
+    has_zero_points: bool,
+    has_g_idx: bool,
+    weight_prepacked: bool,
+) -> Option<u64> {
+    if weight_prepacked || has_g_idx || bits != 4 || accuracy_level != 0 || !mlas_qnbit_enabled() {
+        return None;
+    }
+    mlas_sys::sqnbit_packed_b_size(
+        n,
+        k,
+        bits,
+        block_size,
+        has_zero_points,
+        mlas_sys::SQNBitComputeType::Fp32,
+    )
+    .map(|packed| {
+        (packed as u64).saturating_add(mlas_sqnbit_scale_zp_bytes(
+            block_size,
+            n,
+            k,
+            has_zero_points,
+        ))
+    })
+}
+
+/// Resident side-buffer bytes a single **constant-weight** `MatMulNBits` node
+/// holds for the session *beside* the on-disk weights, given its static
+/// attributes: either the MLAS SQNBit CompFp32 packed buffers (the packed
+/// weight plus its retained scale/zero-point copies, held once per compiled
+/// kernel instance) when the node takes that route, the fully-expanded f32
+/// `weight_nk` cache (`N * K * 4`, #971) when it takes the generic decode path,
+/// or zero for a truly zero-copy path (borrowed int4, 2-bit, int8, accuracy-4
+/// direct).
+///
+/// For the MLAS route the figure is [`MLAS_PACKED_DECODE_INSTANTIATIONS`] times
+/// the per-copy cost, because the shape-keyed kernel cache compiles a separate
+/// `MatMulNBits` instance for the prefill (`m > 1`) and decode (`m == 1`)
+/// activation shapes and each packs its own copy (see the constant's docs). The
+/// generic f32 `weight_nk` cache is a decode-only (`m == 1`) materialization and
+/// is held once, so no multiplier applies there.
+///
+/// This is the single per-node authority [`resident_dequant_f32_cache_bytes`]
+/// sums over the graph so the memory plan's footprint accounting tracks what the
+/// kernel actually retains. The MLAS packed buffer is checked first because its
+/// route pre-empts the f32 cache in [`MatMulNBitsKernel::execute`].
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_nbits_resident_side_cache_bytes(
+    bits: usize,
+    block_size: usize,
+    accuracy_level: i64,
+    n: usize,
+    k: usize,
+    has_zero_points: bool,
+    has_g_idx: bool,
+    weight_prepacked: bool,
+) -> u64 {
+    #[cfg(feature = "mlas")]
+    if let Some(per_copy) = mlas_sqnbit_packed_b_cache_bytes(
+        bits,
+        block_size,
+        accuracy_level,
+        n,
+        k,
+        has_zero_points,
+        has_g_idx,
+        weight_prepacked,
+    ) {
+        return per_copy.saturating_mul(MLAS_PACKED_DECODE_INSTANTIATIONS);
+    }
+    if matmul_nbits_decode_caches_dequant_f32(
+        bits,
+        block_size,
+        accuracy_level,
+        n,
+        k,
+        has_zero_points,
+        has_g_idx,
+        weight_prepacked,
+    ) {
+        (n as u64).saturating_mul(k as u64).saturating_mul(4)
+    } else {
+        0
+    }
+}
+
+/// Total resident side-buffer bytes this CPU EP will hold for `graph` beside the
+/// on-disk weights, i.e. the extra footprint the memory plan must budget for.
+///
+/// For every constant-weight `MatMulNBits` node this sums
+/// [`matmul_nbits_resident_side_cache_bytes`]: the fully-expanded f32 `weight_nk`
+/// cache (`N * K * 4`, #971) when the node takes the generic decode path, or the
+/// MLAS SQNBit CompFp32 packed buffers when it takes the `accuracy_level == 0`
+/// MLAS route -- the packed weight plus its retained scale/zero-point copies,
+/// counted [`MLAS_PACKED_DECODE_INSTANTIATIONS`] times because the shape-keyed
+/// kernel cache packs a copy for the prefill and decode activation shapes alike.
+/// Nodes on a truly zero-copy path (borrowed int4, 2-bit, int8) contribute
+/// nothing, and non-constant-weight nodes never retain a session buffer (they
+/// rebuild a transient one per call) and are excluded.
+///
+/// The name is kept for API stability; the total now covers the MLAS packed
+/// buffer too, so a model whose int4 `accuracy_level == 0` nodes route to MLAS
+/// is no longer accounted as zero (the ledger blind spot that made the packed
+/// weight invisible).
+pub fn resident_dequant_f32_cache_bytes(graph: &Graph) -> u64 {
+    let mut total = 0_u64;
+    for node in graph.nodes.values() {
+        if !LazyWeightBoundary::MatMulNBits.matches(&node.domain, &node.op_type) {
+            continue;
+        }
+        // Only constant weights are cached; a non-constant B input rebuilds a
+        // transient dequant per call, so it never holds a resident expansion.
+        let Some(Some(weight_value)) = node.inputs.get(1) else {
+            continue;
+        };
+        if !graph.initializers.contains_key(weight_value) {
+            continue;
+        }
+        let bits = node
+            .attr("bits")
+            .and_then(Attribute::as_int)
+            .unwrap_or(4)
+            .max(0) as usize;
+        let block_size = node
+            .attr("block_size")
+            .and_then(Attribute::as_int)
+            .unwrap_or(0)
+            .max(0) as usize;
+        let accuracy_level = node
+            .attr("accuracy_level")
+            .and_then(Attribute::as_int)
+            .unwrap_or(0);
+        let Some(n) = node.attr("N").and_then(Attribute::as_int) else {
+            continue;
+        };
+        let Some(k) = node.attr("K").and_then(Attribute::as_int) else {
+            continue;
+        };
+        if n <= 0 || k <= 0 {
+            continue;
+        }
+        let (n, k) = (n as u64, k as u64);
+        let has_zero_points = matches!(node.inputs.get(3), Some(Some(_)));
+        let has_g_idx = matches!(node.inputs.get(4), Some(Some(_)));
+        total = total.saturating_add(matmul_nbits_resident_side_cache_bytes(
+            bits,
+            block_size,
+            accuracy_level,
+            n as usize,
+            k as usize,
+            has_zero_points,
+            has_g_idx,
+            false,
+        ));
+    }
+    total
+}
+
+/// The heap bytes all live MLAS SQNBit packed weights currently retain: the
+/// packed buffers plus their owned scale and zero-point copies, summed across
+/// every kernel instance (so an autoregressive session's prefill and decode
+/// copies are both counted). This is the *actual* runtime figure that
+/// [`resident_dequant_f32_cache_bytes`]'s *prediction* must equal; the
+/// `matmul_nbits` accounting tests compare the two directly. Zero on a build
+/// without the `mlas` feature.
+pub fn mlas_sqnbit_packed_live_bytes() -> u64 {
+    #[cfg(feature = "mlas")]
+    {
+        mlas_sys::sqnbit_packed_live_bytes() as u64
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        0
+    }
+}
+
 /// should be built with, given the explicit decode budget.
 ///
 /// Only an *explicit* budget bounds the global pool: the process-local override
@@ -3202,6 +3991,107 @@ enum DotKernel {
     NeonDot,
 }
 
+/// The best `DotKernel` this host can actually execute, resolved once.
+///
+/// [`selected_dot_kernel`] does the CPUID probing; this caches it so
+/// [`DotKernel::clamped_to_host`] costs one relaxed load per dot instead of a
+/// feature-detection call per dot.
+fn host_dot_kernel() -> DotKernel {
+    static HOST: OnceLock<DotKernel> = OnceLock::new();
+    *HOST.get_or_init(selected_dot_kernel)
+}
+
+/// Bitmask of the `DotKernel`s whose ISA this host implements, resolved once.
+fn host_dot_kernel_mask() -> u8 {
+    static MASK: OnceLock<u8> = OnceLock::new();
+    *MASK.get_or_init(|| {
+        let mut mask = DotKernel::Scalar.bit();
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                mask |= DotKernel::Avx2.bit();
+                if std::arch::is_x86_feature_detected!("avxvnni") {
+                    mask |= DotKernel::AvxVnni.bit();
+                }
+                if std::arch::is_x86_feature_detected!("avx512f")
+                    && std::arch::is_x86_feature_detected!("avx512bw")
+                    && std::arch::is_x86_feature_detected!("avx512vnni")
+                    && std::arch::is_x86_feature_detected!("avx512vl")
+                {
+                    mask |= DotKernel::Avx512Vnni.bit();
+                }
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // AdvSIMD is baseline on aarch64 and `dot_u8_i8_neon` uses only
+            // baseline intrinsics, so both NEON variants are always runnable;
+            // `dotprod` selects between them for throughput, not for safety.
+            mask |= DotKernel::Neon.bit() | DotKernel::NeonDot.bit();
+        }
+        mask
+    })
+}
+
+impl DotKernel {
+    /// One-hot tag used by [`host_dot_kernel_mask`].
+    fn bit(self) -> u8 {
+        match self {
+            DotKernel::Scalar => 1 << 0,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::Avx2 => 1 << 1,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::AvxVnni => 1 << 2,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::Avx512Vnni => 1 << 3,
+            #[cfg(target_arch = "aarch64")]
+            DotKernel::Neon => 1 << 1,
+            #[cfg(target_arch = "aarch64")]
+            DotKernel::NeonDot => 1 << 2,
+        }
+    }
+
+    /// Whether this host implements every instruction this kernel issues.
+    ///
+    /// Membership is tested per kernel rather than by ranking the ladder,
+    /// because the x86 ISA ladder is **not** a total order: Ice Lake and Cooper
+    /// Lake server parts ship AVX512-VNNI (EVEX `vpdpbusd`) with **no**
+    /// AVX-VNNI (the VEX encoding), so "supports the stronger kernel" does not
+    /// imply "supports the weaker one". A rank comparison would keep an
+    /// `AvxVnni` request on such a host and fault.
+    fn is_runnable_here(self) -> bool {
+        host_dot_kernel_mask() & self.bit() != 0
+    }
+
+    /// Degrade a requested kernel to one this host can actually run.
+    ///
+    /// The `unsafe fn`s behind [`dot_u8_i8`] carry `#[target_feature]` for
+    /// AVX2/AVX-VNNI/AVX-512-VNNI and are called on the strength of the
+    /// `DotKernel` value alone. Producing that value from anywhere other than
+    /// [`selected_dot_kernel`] -- a test, a future env override, a plumbed-through
+    /// field that outlives a process migration -- would execute an instruction
+    /// the CPU may not implement, i.e. `SIGILL`, from safe code. Rather than rely
+    /// on every present and future caller having probed CPUID first, the
+    /// dispatcher clamps: a request this host cannot run is answered by the
+    /// host's own best kernel.
+    ///
+    /// Every kernel in the ladder is bit-exact against [`dot_u8_i8_scalar`]
+    /// (asserted for all of them by `every_dot_kernel_is_bit_exact_on_this_host`),
+    /// so the substitution costs throughput and never accuracy.
+    ///
+    /// This is deliberately *not* an assertion. Clamping is total, allocation
+    /// free and bit-exact, so it is safe to leave enabled in release builds,
+    /// where a `debug_assert!` would be compiled out -- restoring the `SIGILL`
+    /// exactly where it is least debuggable.
+    fn clamped_to_host(self) -> DotKernel {
+        if self.is_runnable_here() {
+            self
+        } else {
+            host_dot_kernel()
+        }
+    }
+}
+
 impl DotKernel {
     /// Whether this kernel consumes the VNNI-only *deinterleaved* int4
     /// activation layout and may take the int4-direct decode path. `Scalar`
@@ -3211,7 +4101,15 @@ impl DotKernel {
     fn uses_vnni_int4_direct(self) -> bool {
         #[cfg(target_arch = "x86_64")]
         {
-            matches!(self, DotKernel::AvxVnni | DotKernel::Avx512Vnni)
+            // `is_runnable_here` rather than `clamped_to_host`: the int4-direct
+            // route is layout-coupled (the VNNI kernels consume the
+            // deinterleaved activation of `deinterleave_activation_int4`, the
+            // others natural order), so substituting a different kernel *inside*
+            // `int4_dot_row` would silently mis-decode. Refusing the route
+            // instead sends an unrunnable request down the int8 path, which
+            // builds its own layout and is bit-exact -- a degrade that is
+            // correct rather than merely safe.
+            matches!(self, DotKernel::AvxVnni | DotKernel::Avx512Vnni) && self.is_runnable_here()
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -3269,53 +4167,53 @@ impl DotKernel {
         }
     }
 
+    /// Whether the aarch64 N16 SDOT direct int4 kernels are enabled.
+    ///
+    /// These kernels quantize the f32 activations to int8
+    /// ([`quantize_activation_signed`]), so they are *not* numerically
+    /// equivalent to the fp32 reference and must stay opt-in. The body used to
+    /// be `#[cfg(test)] { true }` in front of a `#[cfg(not(test))]` production
+    /// policy, which meant every test silently ran this opt-in,
+    /// precision-reducing kernel while the shipped binary did not. Tests now
+    /// observe the same default the shipped binary uses.
     #[cfg(target_arch = "aarch64")]
     fn arm64_int4_direct_enabled() -> bool {
-        #[cfg(test)]
-        {
-            true
-        }
-        #[cfg(not(test))]
-        {
-            // The asymmetric N16 SDOT kernels are correctness-locked, but the
-            // first full-model Qwen3 measurement regressed decode throughput.
-            // Keep them opt-in while the microkernel is tightened.
-            //
-            // Resolved once: this gate is read from the per-token decode path,
-            // where `std::env::var` would take the process-wide environment
-            // lock and allocate on every generated token.
-            static ENABLED: OnceLock<bool> = OnceLock::new();
-            *ENABLED.get_or_init(|| {
-                std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT").is_ok_and(|value| {
-                    let value = value.trim();
-                    !value.is_empty() && value != "0"
-                })
+        // The asymmetric N16 SDOT kernels are correctness-locked, but the
+        // first full-model Qwen3 measurement regressed decode throughput.
+        // Keep them opt-in while the microkernel is tightened.
+        //
+        // Resolved once: this gate is read from the per-token decode path,
+        // where `std::env::var` would take the process-wide environment
+        // lock and allocate on every generated token.
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT").is_ok_and(|value| {
+                let value = value.trim();
+                !value.is_empty() && value != "0"
             })
-        }
+        })
     }
 
+    /// Whether the aarch64 KleidiAI SDOT direct kernels are enabled.
+    ///
+    /// Same test-fidelity fix as [`DotKernel::arm64_int4_direct_enabled`]: the
+    /// previous `#[cfg(test)] { true }` forced this on under test even on
+    /// macOS/iOS, where production defaults it off.
     #[cfg(target_arch = "aarch64")]
     fn arm64_kai_sdot_direct_enabled() -> bool {
-        #[cfg(test)]
-        {
-            true
-        }
-        #[cfg(not(test))]
-        {
-            // Resolved once: see the note in `arm64_int4_direct_enabled`.
-            static ENABLED: OnceLock<bool> = OnceLock::new();
-            *ENABLED.get_or_init(|| {
-                if let Ok(value) = std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT") {
-                    let value = value.trim();
-                    return !value.is_empty() && value != "0";
-                }
-                // Validated against the f32 reference for the asymmetric block128
-                // shapes Qwen3 actually emits, so this path is on by default.
-                // Apple silicon keeps the existing route pending its own
-                // measurement pass.
-                !cfg!(any(target_os = "macos", target_os = "ios"))
-            })
-        }
+        // Resolved once: see the note in `arm64_int4_direct_enabled`.
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            if let Ok(value) = std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT") {
+                let value = value.trim();
+                return !value.is_empty() && value != "0";
+            }
+            // Validated against the f32 reference for the asymmetric block128
+            // shapes Qwen3 actually emits, so this path is on by default.
+            // Apple silicon keeps the existing route pending its own
+            // measurement pass.
+            !cfg!(any(target_os = "macos", target_os = "ios"))
+        })
     }
 }
 
@@ -4819,6 +5717,343 @@ fn packed_nbits_output_row(
     }
 }
 
+/// Borrow the optional int4 zero-point tensor for the zero-copy decode path.
+///
+/// Returns `Some(None)` for a symmetric model (no zero_points input) — the
+/// borrowed kernel then uses the implicit midpoint 8. Returns `Some(Some(zp))`
+/// when an asymmetric uint8 zero_points input is present and host-contiguous.
+/// Returns `None` only when a zero_points input exists but cannot be borrowed
+/// in place, so the caller must fall through to another path. Gating on this
+/// (rather than on "a zero_points input happens to exist") is what lets
+/// symmetric int4 take the borrowed path instead of the resident f32 cache.
+fn borrow_optional_int4_zero_points<'a>(
+    zero_points: Option<&TensorView<'a>>,
+) -> Option<Option<&'a [u8]>> {
+    match zero_points {
+        None => Some(None),
+        Some(view) => contiguous_host_slice::<u8>(view).map(Some),
+    }
+}
+
+fn contiguous_host_slice<'a, T>(view: &TensorView<'a>) -> Option<&'a [T]> {
+    if !view.device.is_host_accessible() || !view.is_contiguous() {
+        return None;
+    }
+    // SAFETY: the executor guarantees the TensorView backing is valid for `'a`; callers validate
+    // the dtype before selecting T, and contiguous views contain exactly `numel` elements.
+    Some(unsafe { std::slice::from_raw_parts(view.data_ptr::<T>(), view.numel()) })
+}
+
+fn borrowed_scales<'a>(view: &TensorView<'a>) -> Option<BorrowedScales<'a>> {
+    match view.dtype {
+        DataType::Float32 => contiguous_host_slice(view).map(BorrowedScales::F32),
+        DataType::Float16 => contiguous_host_slice(view).map(BorrowedScales::F16),
+        DataType::BFloat16 => contiguous_host_slice(view).map(BorrowedScales::Bf16),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn borrowed_affine_int4_matmul(
+    activations: &[f32],
+    packed: &[u8],
+    scales: BorrowedScales<'_>,
+    zero_points: Option<&[u8]>,
+    bias: Option<&[f32]>,
+    result: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    block_size: usize,
+    dot_kernel: DotKernel,
+) {
+    debug_assert_eq!(activations.len(), m * k);
+    debug_assert_eq!(result.len(), m * n);
+    // Precision contract: this helper is reached only from the
+    // `accuracy_level == 0` borrowed int4 route, i.e. ONNX CompFp32. Every
+    // path below therefore has to keep the activations in f32. It must never
+    // dispatch an int8-activation kernel (`quantize_activation_signed` /
+    // `quantize_activation_qai8dxp`) -- that is CompInt8, and delivering it
+    // where CompFp32 was requested costs ~1e-3 relative error. An `aarch64`
+    // `m == 1, block_size == 32` NEON-SDOT diversion used to sit here and did
+    // exactly that; it was removed rather than gated, because acc0 is its only
+    // caller and so it had no semantically valid use.
+    //
+    // `dot_kernel` drives the `x86_64` AVX2/AVX-512 f32 fast path below, which
+    // keeps full precision (`_mm512_fmadd_ps`). On other targets it is unused,
+    // so discard it there to avoid an unused-variable error under `-D warnings`.
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = dot_kernel;
+    let bits = 4usize;
+    let layout = NBitsLayout { bits, block_size };
+    let block_count = k.div_ceil(block_size);
+    let packed_row_size = block_count * layout.packed_block_size();
+    let zero_point_row_size = layout.zero_point_row_size(block_count);
+    for (activation, output_row) in activations.chunks_exact(k).zip(result.chunks_exact_mut(n)) {
+        let activation_sums = activation
+            .chunks(block_size)
+            .map(|block| block.iter().sum::<f32>())
+            .collect::<Vec<_>>();
+        let compute = |output_start: usize, outputs: &mut [f32]| {
+            for (offset, output) in outputs.iter_mut().enumerate() {
+                let output_index = output_start + offset;
+                let packed_row =
+                    &packed[output_index * packed_row_size..(output_index + 1) * packed_row_size];
+                let zp_row = zero_points.map(|zp| {
+                    &zp[output_index * zero_point_row_size
+                        ..(output_index + 1) * zero_point_row_size]
+                });
+                let mut sum = bias.map_or(0.0, |values| values[output_index]);
+                for block in 0..block_count {
+                    let depth_start = block * block_size;
+                    let valid = k.saturating_sub(depth_start).min(block_size);
+                    let block_values = &packed_row[block * layout.packed_block_size()
+                        ..(block + 1) * layout.packed_block_size()];
+                    let scale = scales.get(output_index * block_count + block);
+                    let zero_point = layout.zero_point(zp_row, block) as f32;
+                    let mut dot;
+                    #[cfg(target_arch = "aarch64")]
+                    if valid == 32 && block_size == 32 {
+                        // SAFETY: AArch64 guarantees NEON, and both slices contain one full block.
+                        dot = unsafe {
+                            affine_int4_block32_dot_neon(
+                                &activation[depth_start..depth_start + 32],
+                                block_values,
+                            )
+                        };
+                        sum += (dot - activation_sums[block] * zero_point) * scale;
+                        continue;
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    if valid == block_size && valid.is_multiple_of(32) {
+                        // Vectorised int4 unpack + f32 FMA for the x86 borrowed
+                        // path (issue #994). Falls through to the scalar loop
+                        // when the host has no AVX2 (`DotKernel::Scalar`), so
+                        // correctness never depends on the fast path existing.
+                        if let Some(vec_dot) = borrowed_int4_block_dot_x86(
+                            &activation[depth_start..depth_start + valid],
+                            block_values,
+                            dot_kernel,
+                        ) {
+                            sum += (vec_dot - activation_sums[block] * zero_point) * scale;
+                            continue;
+                        }
+                    }
+                    dot = 0.0;
+                    for (byte_index, &byte) in block_values.iter().enumerate() {
+                        let within = byte_index * 2;
+                        if within < valid {
+                            dot += activation[depth_start + within] * (byte & 0x0f) as f32;
+                        }
+                        if within + 1 < valid {
+                            dot += activation[depth_start + within + 1] * (byte >> 4) as f32;
+                        }
+                    }
+                    sum += (dot - activation_sums[block] * zero_point) * scale;
+                }
+                *output = sum;
+            }
+        };
+        parallel_output_rows(output_row, k, compute);
+    }
+}
+
+/// Whether the x86 SIMD borrowed int4 path (issue #994) is enabled. On by
+/// default; set `ONNX_GENAI_CPU_DISABLE_INT4_SIMD=1` to fall back to the scalar
+/// unpack loop. This is an A/B escape hatch so the vectorised kernel can be
+/// diffed against the scalar reference in the *same* binary (same-run A/B is
+/// more trustworthy than a cross-build comparison). Resolved once via a
+/// `OnceLock`, mirroring `arm64_int4_direct_enabled`, so the per-token decode
+/// path never takes the process-wide env lock or allocates.
+#[cfg(target_arch = "x86_64")]
+fn int4_borrowed_simd_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ONNX_GENAI_CPU_DISABLE_INT4_SIMD").map_or(true, |value| {
+            let value = value.trim();
+            value.is_empty() || value == "0"
+        })
+    })
+}
+
+/// Dispatch one int4 borrowed-path block dot (`sum(activation[j] * nibble[j])`,
+/// nibbles as raw `0..=15`) to the widest available x86 SIMD f32 kernel.
+///
+/// `activation.len()` must equal the (full) block length and be a multiple of
+/// 32; `packed` holds `activation.len() / 2` bytes in the same low-then-high
+/// nibble interleave the scalar loop reads. Returns `None` for
+/// [`DotKernel::Scalar`] (no AVX2) so the caller keeps the scalar reference.
+///
+/// This is the f32 analogue of the aarch64 `affine_int4_block32_dot_neon`
+/// route: the per-block scale and the zero-point correction stay in the caller,
+/// so symmetric (`zero_points = None`, implicit midpoint 8) and asymmetric
+/// weights both work unchanged. The nibble unpack and the multiply-accumulate
+/// are vectorised; nothing dequantised outlives the call, so the #979
+/// zero-copy footprint is preserved.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn borrowed_int4_block_dot_x86(
+    activation: &[f32],
+    packed: &[u8],
+    dot_kernel: DotKernel,
+) -> Option<f32> {
+    debug_assert_eq!(activation.len() % 32, 0);
+    debug_assert_eq!(packed.len(), activation.len() / 2);
+    if !int4_borrowed_simd_enabled() {
+        // A/B escape hatch: fall back to the scalar reference loop so the SIMD
+        // path can be diffed against it in the same binary (issue #994).
+        return None;
+    }
+    // Both arms consume the *same* natural-order activation, so unlike
+    // `int4_dot_row` this dispatcher is layout-agnostic and a clamp is directly
+    // correct: an unrunnable request is answered by the host's own kernel (or
+    // by `None`, the scalar reference) instead of faulting.
+    match dot_kernel.clamped_to_host() {
+        // AVX-512F is a superset of AVX2; `Avx512Vnni` is selected only after
+        // `avx512f` was runtime-detected. Use the 512-bit f32 kernel.
+        DotKernel::Avx512Vnni => {
+            // SAFETY: selected_dot_kernel confirmed AVX2 + AVX-512F for this
+            // host, and the length invariants above hold.
+            Some(unsafe { borrowed_int4_block_dot_avx512(activation, packed) })
+        }
+        // Both plain AVX2 and AVX-VNNI hosts have AVX2 + FMA3 (FMA3 shipped
+        // with the first AVX2 cores); the borrowed path is f32, so VNNI's
+        // integer dot does not apply — the AVX2 f32 kernel serves both.
+        DotKernel::Avx2 | DotKernel::AvxVnni => {
+            // SAFETY: selected_dot_kernel confirmed AVX2 for this host, which
+            // implies FMA3, and the length invariants above hold.
+            Some(unsafe { borrowed_int4_block_dot_avx2(activation, packed) })
+        }
+        DotKernel::Scalar => None,
+    }
+}
+
+/// AVX2 + FMA int4 block dot for the borrowed path. Unpacks the packed nibbles
+/// into the natural `w[2i]=lo(byte i)`, `w[2i+1]=hi(byte i)` order, widens them
+/// to f32, and accumulates `activation[j] * w[j]` over the block. Processes the
+/// block in 32-lane chunks (16 packed bytes each) into a single 256-bit
+/// accumulator, so blocks larger than 32 (e.g. block-128) also vectorise.
+///
+/// The horizontal reduction reorders the additions relative to the scalar
+/// loop, so the f32 result can differ from the scalar reference by a few ULP;
+/// it is not a bit-identical transform. Callers rely on argmax stability, not
+/// on bit-identity (see the borrowed-path parity tests).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn borrowed_int4_block_dot_avx2(activation: &[f32], packed: &[u8]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mask = _mm_set1_epi8(0x0f);
+    let mut acc = _mm256_setzero_ps();
+    let chunks = activation.len() / 32;
+    for chunk in 0..chunks {
+        // SAFETY: `packed.len() == activation.len() / 2`, so 16 bytes per chunk
+        // are in bounds; loadu permits unaligned pointers.
+        let bytes = unsafe { _mm_loadu_si128(packed.as_ptr().add(chunk * 16).cast()) };
+        let low = _mm_and_si128(bytes, mask);
+        let high = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+        // Interleave low/high nibbles byte-wise to reproduce the scalar order
+        // w0=lo(b0), w1=hi(b0), w2=lo(b1), ...
+        let inter_lo = _mm_unpacklo_epi8(low, high); // weights 0..=15
+        let inter_hi = _mm_unpackhi_epi8(low, high); // weights 16..=31
+        let base = chunk * 32;
+        // Four groups of 8 weights: zero-extend u8 -> i32 -> f32, fmadd with the
+        // matching 8 activations.
+        let w0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(inter_lo));
+        // SAFETY: base + 32 <= activation.len(); loadu permits unaligned.
+        let a0 = unsafe { _mm256_loadu_ps(activation.as_ptr().add(base)) };
+        acc = _mm256_fmadd_ps(a0, w0, acc);
+
+        let w1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(inter_lo, 8)));
+        // SAFETY: base + 32 <= activation.len(); loadu permits unaligned.
+        let a1 = unsafe { _mm256_loadu_ps(activation.as_ptr().add(base + 8)) };
+        acc = _mm256_fmadd_ps(a1, w1, acc);
+
+        let w2 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(inter_hi));
+        // SAFETY: base + 32 <= activation.len(); loadu permits unaligned.
+        let a2 = unsafe { _mm256_loadu_ps(activation.as_ptr().add(base + 16)) };
+        acc = _mm256_fmadd_ps(a2, w2, acc);
+
+        let w3 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(inter_hi, 8)));
+        // SAFETY: base + 32 <= activation.len(); loadu permits unaligned.
+        let a3 = unsafe { _mm256_loadu_ps(activation.as_ptr().add(base + 24)) };
+        acc = _mm256_fmadd_ps(a3, w3, acc);
+    }
+    // Horizontal sum of the 8 f32 lanes.
+    let lo = _mm256_castps256_ps128(acc);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let sum4 = _mm_add_ps(lo, hi);
+    let sum2 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+    let sum1 = _mm_add_ss(sum2, _mm_shuffle_ps(sum2, sum2, 0x55));
+    _mm_cvtss_f32(sum1)
+}
+
+/// AVX-512F int4 block dot for the borrowed path. Same math and unpack as
+/// [`borrowed_int4_block_dot_avx2`], but widens 16 nibbles at a time into a
+/// 512-bit f32 accumulator. Selected only on hosts where `selected_dot_kernel`
+/// detected AVX-512F. Cannot be exercised on AVX2-only hardware; kept behind the
+/// runtime `Avx512Vnni` dispatch so AVX2-only builds never call it.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f")]
+unsafe fn borrowed_int4_block_dot_avx512(activation: &[f32], packed: &[u8]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mask = _mm_set1_epi8(0x0f);
+    let mut acc = _mm512_setzero_ps();
+    let chunks = activation.len() / 32;
+    for chunk in 0..chunks {
+        // SAFETY: `packed.len() == activation.len() / 2`, so 16 bytes per chunk
+        // are in bounds; loadu permits unaligned pointers.
+        let bytes = unsafe { _mm_loadu_si128(packed.as_ptr().add(chunk * 16).cast()) };
+        let low = _mm_and_si128(bytes, mask);
+        let high = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+        let inter_lo = _mm_unpacklo_epi8(low, high); // weights 0..=15
+        let inter_hi = _mm_unpackhi_epi8(low, high); // weights 16..=31
+        let base = chunk * 32;
+        // 16 nibbles per half -> 16 i32 -> 16 f32.
+        let w_lo = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(inter_lo));
+        let w_hi = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(inter_hi));
+        // SAFETY: base + 32 <= activation.len(); loadu permits unaligned.
+        let a_lo = unsafe { _mm512_loadu_ps(activation.as_ptr().add(base)) };
+        // SAFETY: base + 32 <= activation.len(); loadu permits unaligned.
+        let a_hi = unsafe { _mm512_loadu_ps(activation.as_ptr().add(base + 16)) };
+        acc = _mm512_fmadd_ps(a_lo, w_lo, acc);
+        acc = _mm512_fmadd_ps(a_hi, w_hi, acc);
+    }
+    _mm512_reduce_add_ps(acc)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn affine_int4_block32_dot_neon(activation: &[f32], packed: &[u8]) -> f32 {
+    use std::arch::aarch64::*;
+
+    debug_assert_eq!(activation.len(), 32);
+    debug_assert_eq!(packed.len(), 16);
+    let bytes = unsafe { vld1q_u8(packed.as_ptr()) };
+    let low = vandq_u8(bytes, vdupq_n_u8(0x0f));
+    let high = vshrq_n_u8::<4>(bytes);
+    let values = [vzip1q_u8(low, high), vzip2q_u8(low, high)];
+    let mut acc = vdupq_n_f32(0.0);
+    for (half_index, values) in values.into_iter().enumerate() {
+        let lo16 = vmovl_u8(vget_low_u8(values));
+        let hi16 = vmovl_high_u8(values);
+        let groups = [
+            vmovl_u16(vget_low_u16(lo16)),
+            vmovl_high_u16(lo16),
+            vmovl_u16(vget_low_u16(hi16)),
+            vmovl_high_u16(hi16),
+        ];
+        for (group_index, values) in groups.into_iter().enumerate() {
+            let weights = vcvtq_f32_u32(values);
+            let activation_offset = half_index * 16 + group_index * 4;
+            let acts = unsafe { vld1q_f32(activation.as_ptr().add(activation_offset)) };
+            acc = vmlaq_f32(acc, acts, weights);
+        }
+    }
+    vaddvq_f32(acc)
+}
+
 /// Deinterleave int8 activations for the SIMD int4 kernels. Within each
 /// 32-wide K-block, emit the 16 even-index activations (`act[2i]`, which pair
 /// with the packed low nibbles / natural weights `2i`) followed by the 16
@@ -4882,6 +6117,17 @@ fn int4_dot_row(
     block_size: usize,
     _kernel: DotKernel,
 ) -> f32 {
+    // This dispatcher cannot clamp: the caller has already laid the activation
+    // out for `_kernel` specifically, so answering with a different kernel would
+    // decode the wrong layout. `uses_vnni_int4_direct` -- the only gate that
+    // routes anything here -- already requires `is_runnable_here`, so an
+    // unrunnable kernel never reaches this function; assert that rather than
+    // leave it to provenance. This is a per-row check on a K-length dot: a
+    // cached relaxed load and a bit test.
+    debug_assert!(
+        _kernel.is_runnable_here(),
+        "int4_dot_row reached with a kernel this host cannot execute"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         match _kernel {
@@ -5752,19 +6998,22 @@ mod amx {
 
 fn dot_u8_i8(activation: &[u8], weight: &[i8], _kernel: DotKernel) -> i32 {
     debug_assert_eq!(activation.len(), weight.len());
+    // Never issue an instruction this CPU does not implement, whatever the
+    // caller asked for. See `DotKernel::clamped_to_host`.
+    let _kernel = _kernel.clamped_to_host();
     #[cfg(target_arch = "x86_64")]
     {
         match _kernel {
             DotKernel::Avx2 => {
-                // SAFETY: selected_dot_kernel checked AVX2 at runtime.
+                // SAFETY: `clamped_to_host` confirmed AVX2 via CPUID.
                 return unsafe { dot_u8_i8_avx2(activation, weight) };
             }
             DotKernel::AvxVnni => {
-                // SAFETY: selected_dot_kernel checked AVX-VNNI at runtime.
+                // SAFETY: `clamped_to_host` confirmed AVX2+AVX-VNNI via CPUID.
                 return unsafe { dot_u8_i8_avxvnni(activation, weight) };
             }
             DotKernel::Avx512Vnni => {
-                // SAFETY: selected_dot_kernel checked AVX512-VNNI and AVX512VL.
+                // SAFETY: `clamped_to_host` confirmed AVX512F/BW/VNNI/VL via CPUID.
                 return unsafe { dot_u8_i8_avx512vnni(activation, weight) };
             }
             DotKernel::Scalar => {}
@@ -6032,9 +7281,58 @@ fn gemv_nk_u8(
     }
 }
 
-/// Whether the 8-bit decode GEMV uses the int16-activation fast path.
+/// Whether the model has opted out of full-precision activations.
 ///
-/// Default **on**. Opt out (restore the fp32-activation [`gemv_nk_u8`]) with
+/// ONNX's `accuracy_level` on `MatMulNBits` names the *compute* type:
+/// `0` (unset) and `1` mean fp32, `2` fp16, `3` bf16, `4` int8. Anything that
+/// quantizes the activation before reducing is therefore only legal at `>= 2`;
+/// at `0`/`1` the kernel owes the caller an fp32 reduction.
+///
+/// The int8 SDOT routes above already gate on `accuracy_level == 4`. The
+/// int16-activation GEMV is more accurate than those but still short of fp32,
+/// so it lands at `>= 2` rather than being unconditional.
+///
+/// To be precise about *why* `>= 2` and not `== 4`: the justification is not
+/// "int16 is at least as accurate as the fp16 that level 2 names". It is not,
+/// necessarily -- int16 here is per-block *fixed point* whose scale is set by
+/// the block maximum, so for a block with one outlier it can resolve the small
+/// values worse than fp16's floating point would. The justification is that
+/// levels 2/3/4 are the levels at which the model has explicitly given up fp32,
+/// and int16 is strictly more accurate than the int8 that level 4 already
+/// permits. Level 0/1 is where the guarantee actually matters, and there the
+/// answer is unambiguous: fp32.
+///
+/// # Why this is not a free 12%
+///
+/// Measured on this repo's A/B harness, `MatMulNBits` bits=8, block_size=32,
+/// M=1, 8 threads, versus ONNX Runtime 1.27 on the same host (max absolute
+/// deviation from a float64 oracle over the whole output row):
+///
+/// | K=N  | int16 act | fp32 act | ORT   | int16 speed |
+/// |------|-----------|----------|-------|-------------|
+/// | 1024 | 1.9e-3    | 2.3e-5   | --    | +6.5%       |
+/// | 3584 | 6.0e-3    | 1.1e-4   | 1.2e-4| +12%        |
+/// | 4096 | 6.4e-3    | 9.2e-5   | --    | +18%        |
+///
+/// The fp32-activation path tracks ORT's own error almost exactly; the int16
+/// path is ~55x worse and fails the harness's default f32 parity gate
+/// (`1e-4 + 1e-3 * |y|`) on every one of those shapes. Buying 6-18% with 55x
+/// of the output's accuracy is not a trade this kernel may make on a model's
+/// behalf when the model asked for fp32 -- especially at M=1 decode, where the
+/// consumer is an argmax over near-ties (the same failure mode that makes
+/// ORT's int8 path flip qwen3's token 1479 -> 3988).
+///
+/// The fp32 path is still 4.3x faster than ORT at K=N=3584, so gating this
+/// costs no *honest* win.
+fn reduced_precision_activation_allowed(accuracy_level: i64) -> bool {
+    accuracy_level >= 2
+}
+
+/// Whether the 8-bit decode GEMV may use the int16-activation fast path at all.
+///
+/// Default **on**, but subject to [`reduced_precision_activation_allowed`]:
+/// this is the measurement/kill switch, not the precision policy. Opt out
+/// (restore the fp32-activation [`gemv_nk_u8`]) with
 /// `ONNX_GENAI_CPU_8BIT_ACT=fp32` (also accepts `f32`, `0`, `off`), used for
 /// A/B before/after measurement. This never enables int8-activation, which is
 /// ORT's fast-but-wrong path (it flips qwen3's near-tie token 1479 -> 3988).
@@ -6533,6 +7831,11 @@ mod tests {
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ep_api::ExecutionProvider;
     use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
+    // Only the MLAS-gated packed-buffer accounting tests build a graph with an
+    // inline initializer, so these are unused (and `-D warnings` fatal) in the
+    // portable configuration.
+    #[cfg(feature = "mlas")]
+    use onnx_runtime_ir::{TensorData, WeightRef};
     use onnx_runtime_loader::{Model, encode_model_proto};
 
     fn model_node(
@@ -6590,6 +7893,7 @@ mod tests {
             bits: 4,
             block_size,
             accuracy_level: 0,
+            flops: None,
             weight_prepacked: false,
             constant_inputs: [false; 5],
             weight_nk: OnceLock::new(),
@@ -6615,7 +7919,180 @@ mod tests {
         }
     }
 
-    /// Address of whichever prepack reuse cache the routed path populated, or
+    /// Serializes the tests that toggle a process-global dispatch flag
+    /// (`set_resident_dequant_f32_cache_enabled`,
+    /// `set_mlas_sqnbit_packing_enabled`) or that positively assert a node
+    /// reached MLAS SQNBit, so they never observe each other's setting under
+    /// Rust's parallel test harness. Route-agnostic correctness tests do not need
+    /// it: both the borrowed and MLAS routes are byte-identical, and every
+    /// residency assertion checks `is_none`, which a disabled flag preserves.
+    static CACHE_FLAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Build the constant `MatMulNBits` decode inputs for a bits=4 weight.
+    fn cache_probe_inputs(
+        weights: &[f32],
+        a: &[f32],
+        n: usize,
+        k: usize,
+        block_size: usize,
+        asymmetric: bool,
+    ) -> (Owned, Owned, Owned, Option<Owned>) {
+        let blocks = k.div_ceil(block_size);
+        let (packed, scales, zps, _) = quantize(weights, n, k, block_size, asymmetric);
+        let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+        let scales_t = Owned::f32(&[n, blocks], &scales);
+        let a_t = Owned::f32(&[1, k], a);
+        let zp_t = zps.as_ref().map(|z| Owned::u8(&[n, blocks.div_ceil(2)], z));
+        (b, scales_t, a_t, zp_t)
+    }
+
+    /// Control that could falsify the #971 footprint predictor: for a matrix of
+    /// bits=4 decode configurations, run a real constant-weight kernel and assert
+    /// [`matmul_nbits_decode_caches_dequant_f32`] agrees with whether the kernel
+    /// actually materialized the resident f32 `weight_nk`. If the dispatch in
+    /// `execute` changes which path a config takes and the predictor is not
+    /// updated to match, this test fails — the engine's accounting cannot silently
+    /// drift from the kernel (#947).
+    #[test]
+    fn predictor_matches_actual_resident_cache() {
+        let _guard = CACHE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_resident_dequant_f32_cache_enabled(true);
+        let (k, n, block_size) = (128usize, 16usize, 32usize);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 47) as f32 - 23.0) / 12.0)
+            .collect();
+        let a: Vec<f32> = (0..k)
+            .map(|i| ((i * 17 % 43) as f32 - 21.0) / 13.0)
+            .collect();
+
+        for &accuracy_level in &[0i64, 4] {
+            for &asymmetric in &[false, true] {
+                for &has_g_idx in &[false, true] {
+                    let (b, scales_t, a_t, zp_t) =
+                        cache_probe_inputs(&weights, &a, n, k, block_size, asymmetric);
+                    let mut kernel = MatMulNBitsKernel {
+                        accuracy_level,
+                        ..test_kernel(k, n, block_size)
+                    };
+                    kernel.set_constant_inputs(&[true; 5]);
+                    // Natural per-block group indices: in range and identity, but
+                    // present, which forces the resident `weight_nk` cache — the
+                    // one config family that still caches after #979.
+                    let g_idx_t = has_g_idx.then(|| {
+                        let indices: Vec<i32> =
+                            (0..k).map(|depth| (depth / block_size) as i32).collect();
+                        Owned::i32(&[k], &indices)
+                    });
+                    let mut inputs = vec![a_t.view(), b.view(), scales_t.view()];
+                    match (&zp_t, &g_idx_t) {
+                        (Some(zp), _) => inputs.push(zp.view()),
+                        // g_idx sits at input 4, so a symmetric config must fill
+                        // input 3 with an explicit absent placeholder.
+                        (None, Some(_)) => inputs.push(TensorView::absent(DataType::Uint8)),
+                        (None, None) => {}
+                    }
+                    if let Some(g_idx) = &g_idx_t {
+                        inputs.push(g_idx.view());
+                    }
+                    let mut y = Owned::zeros_f32(&[1, n]);
+                    kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
+
+                    let predicted = matmul_nbits_decode_caches_dequant_f32(
+                        4,
+                        block_size,
+                        accuracy_level,
+                        n,
+                        k,
+                        asymmetric,
+                        has_g_idx,
+                        false,
+                    );
+                    assert_eq!(
+                        predicted,
+                        kernel.weight_nk.get().is_some(),
+                        "predictor disagreed with actual weight_nk residency \
+                         (accuracy_level={accuracy_level}, asymmetric={asymmetric}, \
+                         has_g_idx={has_g_idx})",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Declining the resident cache (#971 governed decision) must hold no f32
+    /// expansion and yet produce byte-identical decode output: the transient
+    /// per-call dequant runs the same math, just without retaining it.
+    #[test]
+    fn declining_resident_cache_is_byte_identical_and_holds_no_expansion() {
+        let _guard = CACHE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (k, n, block_size) = (128usize, 16usize, 32usize);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 47) as f32 - 23.0) / 12.0)
+            .collect();
+        let a: Vec<f32> = (0..k)
+            .map(|i| ((i * 17 % 43) as f32 - 21.0) / 13.0)
+            .collect();
+        // bits=4, accuracy_level=0 with a constant `g_idx` reaches the generic
+        // `weight_nk` path. Symmetric int4 with no g_idx no longer caches after
+        // #979 (the borrowed midpoint-8 path), so `has_g_idx` is what now forces
+        // the resident cache: every earlier branch in `execute` (borrowed int4,
+        // 2-bit, accuracy_level==4, 8-bit) is gated on `group_indices.is_none()`,
+        // so a present g_idx falls through to the `m == 1` `weight_nk` cache.
+        assert!(
+            matmul_nbits_decode_caches_dequant_f32(4, block_size, 0, n, k, false, true, false),
+            "test premise: this config must be a caching config",
+        );
+        // Natural per-block group indices ([0,0,..,1,1,..]): in range 0..k_blocks
+        // and semantically identity, but their mere presence forces the cache.
+        let g_idx: Vec<i32> = (0..k).map(|depth| (depth / block_size) as i32).collect();
+
+        let run = |enabled: bool| {
+            set_resident_dequant_f32_cache_enabled(enabled);
+            let (b, scales_t, a_t, _) = cache_probe_inputs(&weights, &a, n, k, block_size, false);
+            let g_idx_t = Owned::i32(&[k], &g_idx);
+            let mut kernel = test_kernel(k, n, block_size);
+            kernel.set_constant_inputs(&[true; 5]);
+            let mut y = Owned::zeros_f32(&[1, n]);
+            kernel
+                .execute(
+                    &[
+                        a_t.view(),
+                        b.view(),
+                        scales_t.view(),
+                        // Symmetric: no zero_points, but g_idx sits at input 4,
+                        // so input 3 must be an explicit absent placeholder.
+                        TensorView::absent(DataType::Uint8),
+                        g_idx_t.view(),
+                    ],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+            let cached = kernel.weight_nk.get().is_some();
+            (y.bytes, cached)
+        };
+
+        let (bytes_enabled, cached_enabled) = run(true);
+        let (bytes_disabled, cached_disabled) = run(false);
+        set_resident_dequant_f32_cache_enabled(true);
+
+        assert!(
+            cached_enabled,
+            "enabled arm must materialize the resident cache"
+        );
+        assert!(
+            !cached_disabled,
+            "declined arm must hold no resident f32 expansion",
+        );
+        assert_eq!(
+            bytes_enabled, bytes_disabled,
+            "declining the resident cache changed decode output",
+        );
+    }
+
     /// `None` if none is populated yet. Which cache is filled depends on the
     /// route: MLAS SQNBit (`mlas_shards` or serialized `mlas_packed`) when
     /// available, otherwise the hand GEMV/int8 caches. Returning a raw address
@@ -6662,6 +8139,151 @@ mod tests {
     /// the reuse caches (see [`prepack_cache_ptr`]).
     fn prepack_cache_populated(kernel: &MatMulNBitsKernel) -> bool {
         prepack_cache_ptr(kernel).is_some()
+    }
+
+    /// Route probe for constant-weight `bits = 4, accuracy_level = 0` nodes.
+    ///
+    /// Two invariants are asserted together because they are the two halves of
+    /// the same policy:
+    ///
+    /// * **#979 (memory):** such a node must never expand its weight into the
+    ///   resident f32 `weight_nk` cache (~8x the file size in RAM).
+    /// * **Dispatch:** it must land on the *fastest available* zero/low-copy
+    ///   route for this build -- MLAS SQNBit CompFp32 when the vendored MLAS
+    ///   has a kernel for the shape on this host, otherwise the borrowed
+    ///   zero-copy int4 path.
+    ///
+    /// The expected route is derived from the same predicate production code
+    /// uses ([`MatMulNBitsKernel::mlas_sqnbit_owns_fp32_compute`]), so the
+    /// assertion stays exact on hosts and shapes where MLAS declines instead of
+    /// silently degrading into a tautology.
+    #[derive(Clone, Copy)]
+    struct Int4Acc0RouteProbe {
+        symmetric: usize,
+        asymmetric: usize,
+        #[cfg(feature = "mlas")]
+        mlas: usize,
+    }
+
+    impl Int4Acc0RouteProbe {
+        fn start() -> Self {
+            Self {
+                symmetric: BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed),
+                asymmetric: BORROWED_INT4_ASYMMETRIC_TEST_CALLS.load(Ordering::Relaxed),
+                #[cfg(feature = "mlas")]
+                mlas: MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed),
+            }
+        }
+
+        /// `symmetric` selects which borrowed counter proves the branch; the
+        /// counters are global and shared with tests running in parallel, hence
+        /// the strict-increase (`>`) comparisons rather than exact deltas.
+        fn assert_fast_route(self, kernel: &MatMulNBitsKernel, symmetric: bool) {
+            assert!(
+                kernel.weight_nk.get().is_none(),
+                "constant-weight int4 accuracy_level=0 must not expand the weight to a resident f32 cache (#979)"
+            );
+            // Footprint, not field-emptiness (#1027). Asserting only that
+            // `weight_nk` stays empty passes straight through the accounting
+            // bug: the MLAS SQNBit route also leaves `weight_nk` empty while
+            // holding a packed buffer ~2x the int4 bytes beside the mapped
+            // weight. The memory plan budgets exactly the byte total this
+            // function returns, so assert the route's real resident footprint.
+            let accounted = matmul_nbits_resident_side_cache_bytes(
+                kernel.bits,
+                kernel.block_size,
+                kernel.accuracy_level,
+                kernel.n,
+                kernel.k,
+                !symmetric,
+                false,
+                false,
+            );
+            // Never the ~8x f32 expansion on either route (#979).
+            assert_ne!(
+                accounted,
+                (kernel.n as u64) * (kernel.k as u64) * 4,
+                "int4 accuracy_level=0 must never be accounted as the ~8x resident f32 expansion (#979)"
+            );
+            #[cfg_attr(feature = "mlas", allow(unused_variables))]
+            let borrowed_ran = if symmetric {
+                BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed) > self.symmetric
+            } else {
+                BORROWED_INT4_ASYMMETRIC_TEST_CALLS.load(Ordering::Relaxed) > self.asymmetric
+            };
+            #[cfg(feature = "mlas")]
+            if kernel.mlas_sqnbit_owns_fp32_compute(true, !symmetric) {
+                // Per-kernel state, not the global counters: this is race-free
+                // proof that *this* node's weight was packed by MLAS SQNBit.
+                let mlas_packed_this_node = kernel
+                    .mlas_shards
+                    .get()
+                    .is_some_and(|shards| shards.is_some())
+                    || kernel
+                        .mlas_packed
+                        .get()
+                        .is_some_and(|packed| packed.is_some());
+                assert!(
+                    mlas_packed_this_node,
+                    "constant-weight int4 accuracy_level=0 must reach MLAS SQNBit CompFp32 when MLAS has a kernel for the shape"
+                );
+                assert!(
+                    MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) > self.mlas,
+                    "the MLAS SQNBit GEMM must actually have run for this node"
+                );
+                // The packed buffer is a real resident allocation. The memory
+                // plan budgets the byte total this function returns, which must
+                // equal what the kernels actually hold across the session: the
+                // per-copy packed + scale/zp bytes, materialized once per
+                // shape-keyed kernel instance (prefill + decode). Not zero (the
+                // pre-#1027 blind spot), and not a bare single packed buffer (the
+                // #1051 2x under-report this test now guards).
+                let packed_bytes = mlas_sys::sqnbit_packed_b_size(
+                    kernel.n,
+                    kernel.k,
+                    kernel.bits,
+                    kernel.block_size,
+                    !symmetric,
+                    mlas_sys::SQNBitComputeType::Fp32,
+                )
+                .expect("MLAS reported a kernel for this shape but no packed size");
+                assert!(packed_bytes > 0);
+                let per_copy = mlas_sqnbit_packed_b_cache_bytes(
+                    kernel.bits,
+                    kernel.block_size,
+                    kernel.accuracy_level,
+                    kernel.n,
+                    kernel.k,
+                    !symmetric,
+                    false,
+                    false,
+                )
+                .expect("MLAS route was asserted available for this shape");
+                assert_eq!(
+                    accounted,
+                    per_copy.saturating_mul(MLAS_PACKED_DECODE_INSTANTIATIONS),
+                    "the MLAS SQNBit packed buffer must be accounted for the memory plan (#1027) as the per-copy footprint times the prefill+decode instantiations (#1051)"
+                );
+                assert!(
+                    accounted > packed_bytes as u64,
+                    "the accounted footprint must exceed a single bare packed buffer (it includes the retained scales and both kernel instantiations)"
+                );
+                return;
+            }
+            assert!(
+                borrowed_ran,
+                "int4 accuracy_level=0 must route into the borrowed zero-copy path when MLAS has no kernel for it"
+            );
+            assert!(
+                !prepack_cache_populated(kernel),
+                "the borrowed path must borrow the packed inputs instead of building a weight cache (#979)"
+            );
+            // The borrowed zero-copy path holds no resident side buffer at all.
+            assert_eq!(
+                accounted, 0,
+                "the borrowed zero-copy int4 path must account for no resident side buffer (#979)"
+            );
+        }
     }
 
     fn quantize(
@@ -7255,6 +8877,30 @@ mod tests {
             prepack_cache_ptr(&kernel).expect("selected accuracy-4 weight cache must be reused");
         assert_eq!(reused, cached);
         assert!(kernel.weight_nk.get().is_none());
+        // On a host whose hand int8 decode has no native dot product, MLAS
+        // SQNBit CompInt8 owns accuracy-4 decode instead (see
+        // `hand_int8_decode_has_native_dot`). The invariant under test -- one
+        // weight format, chosen once and reused, never the f32 expansion --
+        // holds either way; only *which* cache holds it differs.
+        #[cfg(feature = "mlas")]
+        if !hand_int8_decode_has_native_dot() {
+            assert!(
+                kernel
+                    .mlas_shards
+                    .get()
+                    .is_some_and(|shards| shards.is_some())
+                    || kernel
+                        .mlas_packed
+                        .get()
+                        .is_some_and(|packed| packed.is_some()),
+                "accuracy-4 decode must reach MLAS SQNBit where the hand int8 kernel has no native dot product"
+            );
+            assert!(
+                kernel.int8_weight.get().is_none(),
+                "MLAS-owned accuracy-4 decode must not also build the hand int8 weight"
+            );
+            return;
+        }
         assert_eq!(
             kernel.packed_int4_weight.get().is_some()
                 || kernel.packed_int4_n16_weight.get().is_some()
@@ -7377,7 +9023,16 @@ mod tests {
             return;
         }
         let block_size = 128usize;
-        assert!(selected_dot_kernel().supports_int4_direct(block_size, false));
+        // Dispatch selects the KAI SDOT route only where production enables it:
+        // `arm64_kai_sdot_direct_enabled` is off on macOS/iOS. Assert the
+        // documented policy rather than unconditional support. The kernel
+        // numerics below are exercised by *direct* calls, not by dispatch, so
+        // they still run everywhere `dotprod` is present.
+        assert_eq!(
+            selected_dot_kernel().supports_int4_direct(block_size, false),
+            DotKernel::arm64_kai_sdot_direct_enabled(),
+            "int4-direct dispatch support must follow the documented per-OS KAI policy"
+        );
         for &(k, n) in &[
             (1000usize, 257usize), // K and N tails.
             (1024, 1024),          // attention/output projection.
@@ -7433,31 +9088,29 @@ mod tests {
             let used_mlas = kernel.mlas_shards.get().is_some();
             #[cfg(not(feature = "mlas"))]
             let used_mlas = false;
+            // Whether a fast int4 route exists at all is per-OS policy:
+            // production disables KAI SDOT on macOS/iOS
+            // (`arm64_kai_sdot_direct_enabled`). Only demand one where the
+            // policy provides one; the kernel numerics above are direct calls
+            // and ran regardless.
+            let kai_dispatch_enabled = DotKernel::arm64_kai_sdot_direct_enabled();
             assert!(
-                used_kai || used_mlas,
+                used_kai || used_mlas || !kai_dispatch_enabled,
                 "aarch64 bits=4/block128 decode reached neither MLAS QNBit nor KAI SDOT for K={k} N={n}",
             );
             assert!(
-                used_kai || {
-                    #[cfg(feature = "mlas")]
-                    {
-                        used_mlas
-                    }
-                    #[cfg(not(feature = "mlas"))]
-                    {
-                        false
-                    }
-                },
-                "block-128 direct int4 path must cache packed KAI or MLAS QNBit weight",
-            );
-            assert!(
-                kernel.int8_weight.get().is_none(),
+                kernel.int8_weight.get().is_none() || !kai_dispatch_enabled,
                 "block-128 direct int4 path must bypass the int8 prepack fallback"
             );
             if used_kai {
                 assert_close(&y.to_f32(), &dot);
-            } else {
+            } else if used_mlas {
                 mlas_close(&y.to_f32(), &dot, 2e-1, "aarch64 MLAS qsi4 decode");
+            } else {
+                // No fast route by policy (macOS/iOS). Whatever generic
+                // accuracy_level = 4 path runs must still track the f32 oracle
+                // to CompInt8 tolerance.
+                assert_qai8dxp_close(&y.to_f32(), &expected);
             }
         }
     }
@@ -7646,7 +9299,21 @@ mod tests {
             return;
         }
         let (k, n, block_size) = (1024usize, 1024usize, 128usize);
-        assert!(selected_dot_kernel().supports_int4_direct(block_size, true));
+        // "Reachable" is a per-OS policy statement, not a universal one:
+        // production disables the KAI SDOT route on macOS/iOS
+        // (`arm64_kai_sdot_direct_enabled`), so on Apple silicon without MLAS
+        // there is no fast int4 route for this shape to reach. The KAI kernel's
+        // numerics stay covered there by
+        // `matmulnbits_arm64_kai_qsi4_block128_qwen_shapes_match_reference`,
+        // which calls it directly instead of through dispatch.
+        assert_eq!(
+            selected_dot_kernel().supports_int4_direct(block_size, true),
+            DotKernel::arm64_kai_sdot_direct_enabled(),
+            "int4-direct dispatch support must follow the documented per-OS KAI policy"
+        );
+        if !DotKernel::arm64_kai_sdot_direct_enabled() && !cfg!(feature = "mlas") {
+            return;
+        }
         let blocks = k.div_ceil(block_size);
         let activations: Vec<f32> = (0..k)
             .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
@@ -8342,8 +10009,30 @@ mod tests {
         output
     }
 
-    fn bits8_n16_sdot_active_for_test() -> bool {
-        selected_dot_kernel().uses_n16_sdot_direct() && activation_quant_group() == 32
+    /// Whether the executed 8-bit `m == 1` route quantizes the activations to
+    /// int8, and therefore cannot be held to the fp32 oracle's tolerance.
+    ///
+    /// Both the KleidiAI SDOT route (`kai_sdot_matmul_m1` ->
+    /// `quantize_activation_qai8dxp`) and the N16 SDOT route
+    /// (`n16_sdot_u8_i16_matmul_m1` -> `quantize_activation_signed`) do this,
+    /// and the KAI route is tried *first*. The predicate used to name only the
+    /// N16 route; that was latent because the dispatch gates were hard-wired
+    /// `true` under `cfg(test)`, so whenever KAI was active N16 was too. With
+    /// the gates now inheriting the production default the two can differ, so
+    /// the predicate has to mirror the real dispatch order.
+    ///
+    /// `accuracy_level` mirrors the production gate: int8 activation compute is
+    /// ONNX CompInt8 and is only reachable at `accuracy_level == 4`, so at
+    /// every other level this returns `false` and the fp32 tolerance applies.
+    fn bits8_int8_activation_active_for_test(accuracy_level: i64, block_size: usize) -> bool {
+        if accuracy_level != 4 {
+            return false;
+        }
+        let dot_kernel = selected_dot_kernel();
+        dot_kernel.uses_kai_sdot_direct(8, block_size)
+            || (dot_kernel.uses_n16_sdot_direct()
+                && block_size == 128
+                && activation_quant_group() == 32)
     }
 
     #[test]
@@ -8492,6 +10181,17 @@ mod tests {
         }
     }
 
+    /// The KleidiAI SDOT int8 route must be reachable for the real Qwen
+    /// bits=8/block128/asymmetric decode shape -- but only at
+    /// `accuracy_level = 4`.
+    ///
+    /// `kai_sdot_matmul_m1` quantizes the activations via
+    /// `quantize_activation_qai8dxp`, i.e. it is ONNX CompInt8. This test used
+    /// to build the node with no `accuracy_level` attribute (so 0 == CompFp32)
+    /// and assert the int8 route was taken anyway, with the loose
+    /// `assert_qai8dxp_close` tolerance -- encoding the precision bug as an
+    /// expectation. It now asserts both halves of the real contract: acc4
+    /// reaches KAI, and acc0 does *not*.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn matmulnbits_arm64_kai_qsi8_asymmetric_qwen_shape_is_reachable() {
@@ -8508,43 +10208,93 @@ mod tests {
             quantize_8bit(&weights_nk, n, k, block_size, true);
         let zero_points = zero_points.expect("asymmetric bits8 emits qzeros");
         let expected = reference(&activations, &dequantized, 1, k, n);
-        let (mut graph, node) = model_node(
-            &[1, k],
-            &[n, blocks, block_size],
-            &[n, blocks],
-            Some(&[n, blocks]),
-            &[1, n],
-            k,
-            n,
-            block_size,
+
+        let run = |accuracy_level: i64| -> (Vec<f32>, bool) {
+            let (mut graph, node) = model_node(
+                &[1, k],
+                &[n, blocks, block_size],
+                &[n, blocks],
+                Some(&[n, blocks]),
+                &[1, n],
+                k,
+                n,
+                block_size,
+            );
+            graph
+                .node_mut(node)
+                .attributes
+                .insert("bits".into(), Attribute::Int(8));
+            graph
+                .node_mut(node)
+                .attributes
+                .insert("accuracy_level".into(), Attribute::Int(accuracy_level));
+            let model = Model::new(&graph);
+            let kernel = CpuExecutionProvider::new()
+                .get_kernel(model.graph.node(node), &[], 1)
+                .unwrap();
+            let a = Owned::f32(&[1, k], &activations);
+            let b = Owned::u8(&[n, blocks, block_size], &packed);
+            let scales = Owned::f32(&[n, blocks], &scales);
+            let zps = Owned::u8(&[n, blocks], &zero_points);
+            let mut y = Owned::zeros_f32(&[1, n]);
+            let before = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
+            kernel
+                .execute(
+                    &[a.view(), b.view(), scales.view(), zps.view()],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+            let reached_kai = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before;
+            (y.to_f32(), reached_kai)
+        };
+
+        // accuracy_level = 4 (CompInt8): the int8 route is licensed, so it must
+        // be reached wherever production enables it. `arm64_kai_sdot_direct_enabled`
+        // is off on macOS/iOS, so reachability is asserted against that policy
+        // rather than unconditionally.
+        let kai_enabled = DotKernel::arm64_kai_sdot_direct_enabled();
+        let (acc4, acc4_reached_kai) = run(4);
+        assert_eq!(
+            acc4_reached_kai, kai_enabled,
+            "accuracy_level=4 KAI SDOT reachability must follow the documented per-OS policy \
+             (enabled={kai_enabled})"
         );
-        graph
-            .node_mut(node)
-            .attributes
-            .insert("bits".into(), Attribute::Int(8));
-        let model = Model::new(&graph);
-        let kernel = CpuExecutionProvider::new()
-            .get_kernel(model.graph.node(node), &[], 1)
-            .unwrap();
-        let a = Owned::f32(&[1, k], &activations);
-        let b = Owned::u8(&[n, blocks, block_size], &packed);
-        let scales = Owned::f32(&[n, blocks], &scales);
-        let zps = Owned::u8(&[n, blocks], &zero_points);
-        let mut y = Owned::zeros_f32(&[1, n]);
-        let before = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
-        kernel
-            .execute(
-                &[a.view(), b.view(), scales.view(), zps.view()],
-                &mut [y.view_mut()],
-            )
-            .unwrap();
+        if kai_enabled {
+            // Downcast to the concrete kernel type is not available through the
+            // EP trait object; the counter above is the dispatch proof.
+            assert_qai8dxp_close(&acc4, &expected);
+        }
+
+        // accuracy_level = 0 (CompFp32): the int8 route must be declined, and
+        // the fp32 fallback must hold the tight oracle tolerance. This half is
+        // the precision regression guard and runs on *every* aarch64 host,
+        // including Apple silicon. Before the gate this shape ran CompInt8 on
+        // non-Apple aarch64, where `arm64_kai_sdot_direct_enabled` defaults on.
+        let (acc0, acc0_reached_kai) = run(0);
         assert!(
-            KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before,
-            "real Qwen bits=8/block128/asymmetric shape did not reach KAI SDOT"
+            !acc0_reached_kai,
+            "accuracy_level=0 is CompFp32 and must not reach the activation-quantizing KAI SDOT route"
         );
-        // Downcast to the concrete kernel type is not available through the EP
-        // trait object; the counter above is the dispatch proof.
-        assert_qai8dxp_close(&y.to_f32(), &expected);
+        // `assert_close`'s absolute 1e-5 does not scale with K, and this shape
+        // accumulates K=1024 products, so compare relative RMSE against the
+        // oracle instead. fp32 reassociation lands around 1e-6 relative; the
+        // int8 route lands around 1e-3, so 1e-5 cleanly separates them.
+        let oracle_rms = rmse(&expected, &vec![0.0; expected.len()]).max(1e-6);
+        let acc0_rel = rmse(&acc0, &expected) / oracle_rms;
+        let acc4_rel = rmse(&acc4, &expected) / oracle_rms;
+        assert!(
+            acc0_rel <= 1e-5,
+            "accuracy_level=0 must reconstruct the fp32 oracle: relative RMSE {acc0_rel} exceeds 1e-5"
+        );
+        if kai_enabled {
+            // Self-calibrating: whatever this host's absolute error happens to
+            // be, the CompFp32 route must be strictly more accurate than the
+            // CompInt8 one. Only meaningful where acc4 actually took CompInt8.
+            assert!(
+                acc0_rel < acc4_rel,
+                "accuracy_level=0 (relative RMSE {acc0_rel}) must be more accurate than accuracy_level=4 (relative RMSE {acc4_rel})"
+            );
+        }
     }
 
     /// Run the real end-to-end `MatMulNBits` kernel (`execute`) for an 8-bit,
@@ -8605,6 +10355,147 @@ mod tests {
         (y.to_f32(), oracle)
     }
 
+    /// Run the 8-bit `execute` path at an explicit `accuracy_level` and return
+    /// the largest absolute deviation from a float64 dequantize-and-reduce
+    /// oracle.
+    ///
+    /// float64, not the usual f32 `reference`, because the quantity under test
+    /// here *is* the reduction's precision: an f32 oracle carries its own
+    /// ~1e-4 of rounding at this K and would mask the effect entirely.
+    fn bits8_m1_max_abs_error_at(
+        accuracy_level: i64,
+        n: usize,
+        k: usize,
+        block_size: usize,
+    ) -> f32 {
+        // One large value per block and many small ones: a per-block int16
+        // activation scale is set by the large value, so every small value is
+        // quantized coarsely. This is the shape of real decode activations
+        // (a few outlier channels) and it is where a 16-bit activation loses
+        // most, which is what makes this test sensitive rather than lucky.
+        let activations: Vec<f32> = (0..k)
+            .map(|i| {
+                if i % block_size == 0 {
+                    18.0
+                } else {
+                    (i as f32 * 0.031 + 0.7).sin() * 0.05
+                }
+            })
+            .collect();
+        let weights_nk: Vec<f32> = (0..n * k)
+            .map(|i| (i as f32 * 0.0091).sin() * 1.2 + (i as f32 * 0.0003).cos() * 0.5)
+            .collect();
+        let blocks = k.div_ceil(block_size);
+        let (packed, scales, _, dequantized) = quantize_8bit(&weights_nk, n, k, block_size, false);
+        let (graph, node) = model_node(
+            &[1, k],
+            &[n, blocks, block_size],
+            &[n, blocks],
+            None,
+            &[1, n],
+            k,
+            n,
+            block_size,
+        );
+        let mut graph = graph;
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("bits".into(), Attribute::Int(8));
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("accuracy_level".into(), Attribute::Int(accuracy_level));
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .expect("bits=8 kernel must build");
+        let a = Owned::f32(&[1, k], &activations);
+        let b = Owned::u8(&[n, blocks, block_size], &packed);
+        let scales_tensor = Owned::f32(&[n, blocks], &scales);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        kernel
+            .execute(
+                &[a.view(), b.view(), scales_tensor.view()],
+                &mut [y.view_mut()],
+            )
+            .expect("8-bit execute must succeed");
+        let out = y.to_f32();
+        (0..n)
+            .map(|column| {
+                let oracle: f64 = (0..k)
+                    .map(|i| activations[i] as f64 * dequantized[column * k + i] as f64)
+                    .sum();
+                (out[column] as f64 - oracle).abs() as f32
+            })
+            .fold(0.0f32, f32::max)
+    }
+
+    /// `accuracy_level` 0/1 mean fp32 compute, so the 8-bit M=1 decode GEMV may
+    /// not quantize the activation -- not to int8, and not to int16 either.
+    ///
+    /// This is a *precision* regression test, and it is built to fail if the
+    /// gate is removed: the same input at `accuracy_level = 2` (fp16 compute
+    /// permitted) is asserted to be at least 20x less accurate, which both
+    /// proves the int16 path is genuinely reachable for this shape -- so the
+    /// fp32 assertion is not passing vacuously on a shape that never had a fast
+    /// path -- and pins the size of what the gate is holding back.
+    ///
+    /// Measured against ONNX Runtime 1.27 on the A/B harness at K=N=3584, the
+    /// ungated int16 path deviated by 6.0e-3 where ORT itself deviates 1.2e-4
+    /// from a float64 oracle, i.e. ~50x worse, while buying 12%.
+    #[test]
+    fn eight_bit_decode_keeps_fp32_activations_unless_the_model_allows_less() {
+        let (n, k, block_size) = (32usize, 2048usize, 128usize);
+        let fp32_error = bits8_m1_max_abs_error_at(0, n, k, block_size);
+        let level1_error = bits8_m1_max_abs_error_at(1, n, k, block_size);
+        let reduced_error = bits8_m1_max_abs_error_at(2, n, k, block_size);
+
+        // The weights are 8-bit quantized, so even an exact reduction carries
+        // the weight quantization error; what must NOT appear on top of it is
+        // activation quantization. Scale the bound to the operand magnitudes
+        // rather than hard-coding a constant that a future shape change would
+        // silently loosen.
+        // Tight enough to catch the int16 path itself, not just the falsifier
+        // below: at this shape fp32 lands ~5e-4 and int16 ~9.4e-3, so a bound
+        // between them makes the end-to-end assertion the real guard. Scaled by
+        // sqrt(k) because the reduction's own f32 error grows that way, so a
+        // future K change loosens it honestly rather than silently.
+        let bound = 6e-5 * (k as f32).sqrt();
+        assert!(
+            fp32_error <= bound,
+            "accuracy_level=0 must reduce in fp32: max abs error {fp32_error} > {bound}"
+        );
+        assert!(
+            level1_error <= bound,
+            "accuracy_level=1 must reduce in fp32: max abs error {level1_error} > {bound}"
+        );
+        assert!(
+            !reduced_precision_activation_allowed(0),
+            "accuracy_level 0 (unset) means fp32 compute"
+        );
+        assert!(
+            !reduced_precision_activation_allowed(1),
+            "accuracy_level 1 means fp32 compute"
+        );
+        for level in [2, 3, 4] {
+            assert!(
+                reduced_precision_activation_allowed(level),
+                "accuracy_level {level} permits a reduced-precision compute type"
+            );
+        }
+        // Falsifier: if this ever stops holding, the int16 path is no longer
+        // reachable here and the assertions above have gone vacuous.
+        if eight_bit_int16_activation() {
+            assert!(
+                reduced_error >= fp32_error * 20.0,
+                "int16 activation path is not being exercised at accuracy_level=2 \
+                 (fp32 error {fp32_error}, reduced-precision error {reduced_error}): \
+                 the fp32 assertions above are now vacuous"
+            );
+        }
+    }
+
     /// Qwen3-0.6B CPU int8/block-128 regression: the production `execute` path
     /// for 8-bit weights (symmetric default zero point and explicit asymmetric
     /// uint8 zero points; decode M=1 and prefill M=5) must reconstruct the same
@@ -8626,7 +10517,13 @@ mod tests {
                     run_8bit_execute(n, k, block_size, m, asymmetric, &activations, &weights_nk);
                 let oracle_rms = rmse(&oracle, &vec![0.0; oracle.len()]).max(1e-6);
                 let rel = rmse(&out, &oracle) / oracle_rms;
-                let tolerance = if m == 1 && bits8_n16_sdot_active_for_test() {
+                // `model_node` sets no `accuracy_level` attribute, so this runs
+                // at the default 0 == CompFp32. The int8-activation SDOT routes
+                // are gated off there, so the fp32 tolerance must hold on every
+                // architecture -- including aarch64, where
+                // `arm64_kai_sdot_direct_enabled` is on by default and used to
+                // drag this case to ~1e-3.
+                let tolerance = if m == 1 && bits8_int8_activation_active_for_test(0, block_size) {
                     1e-3
                 } else {
                     1e-5
@@ -9635,6 +11532,186 @@ mod tests {
         }
     }
 
+    /// Every `DotKernel` variant, forced through the public dispatcher, on any
+    /// host, at every length that separates the kernels' vector bodies from
+    /// their remainder and scalar tails.
+    ///
+    /// Two independent properties, neither of which needs the exotic hardware:
+    ///
+    /// 1. **No `SIGILL`.** The `#[target_feature]` kernels are reached from safe
+    ///    code purely on the strength of a `DotKernel` value. Forcing an
+    ///    AVX-512-VNNI request on an AVX2-only host must be answered, not
+    ///    faulted. A test that merely called `selected_dot_kernel()` would prove
+    ///    nothing here -- it can only ever name a kernel the host already runs.
+    /// 2. **Bit-exactness.** On a host that *does* implement the ISA -- the
+    ///    AVX-512 CI lane, an ARM lane -- the same assertion stops being a clamp
+    ///    check and becomes the only correctness oracle the VNNI kernels have.
+    ///    So this test grows teeth exactly where it is otherwise untested.
+    ///
+    /// Lengths cover 0 (empty), sub-vector, each vector width and each width
+    /// plus/minus one, so the AVX-512 path's 64-wide body, its 32-byte VNNI
+    /// remainder and its scalar tail are all entered.
+    #[test]
+    fn every_dot_kernel_is_bit_exact_on_this_host() {
+        let kernels = [
+            DotKernel::Scalar,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::Avx2,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::AvxVnni,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::Avx512Vnni,
+            #[cfg(target_arch = "aarch64")]
+            DotKernel::Neon,
+            #[cfg(target_arch = "aarch64")]
+            DotKernel::NeonDot,
+        ];
+        for len in [
+            0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 96, 127, 128, 129,
+        ] {
+            // Extremes, not a mild distribution: 255 x -128 is the product that
+            // saturates a 16-bit intermediate, which is how a kernel that used
+            // `vpmaddubsw`-style pairwise arithmetic would be caught.
+            let activation: Vec<u8> = (0..len)
+                .map(|i| {
+                    if i % 3 == 0 {
+                        255
+                    } else {
+                        (i * 37 % 256) as u8
+                    }
+                })
+                .collect();
+            let weight: Vec<i8> = (0..len)
+                .map(|i| {
+                    if i % 3 == 0 {
+                        -128
+                    } else {
+                        ((i * 53 % 256) as i32 - 128) as i8
+                    }
+                })
+                .collect();
+            let expected = dot_u8_i8_scalar(&activation, &weight);
+            for kernel in kernels {
+                assert_eq!(
+                    dot_u8_i8(&activation, &weight, kernel),
+                    expected,
+                    "{kernel:?} diverged from scalar at len {len}"
+                );
+            }
+        }
+    }
+
+    /// The clamp must be a real filter, not a constant.
+    ///
+    /// Falsifies both degenerate implementations: "always keep the request"
+    /// (which would fault on the unsupported kernels) and "always return the
+    /// host kernel" (which would silently discard a legitimately supported
+    /// request and make the ladder unreachable).
+    #[test]
+    fn dot_kernel_clamp_keeps_supported_requests_and_rewrites_only_the_rest() {
+        let host = host_dot_kernel();
+        assert!(
+            host.is_runnable_here(),
+            "the host's own selection must be runnable on the host"
+        );
+        assert_eq!(
+            host.clamped_to_host(),
+            host,
+            "clamping must not rewrite a kernel the host supports"
+        );
+        assert_eq!(
+            DotKernel::Scalar.clamped_to_host(),
+            DotKernel::Scalar,
+            "scalar has no ISA requirement and must survive clamping everywhere"
+        );
+        assert_eq!(
+            host.clamped_to_host().clamped_to_host(),
+            host.clamped_to_host(),
+            "clamping must be idempotent"
+        );
+        // Whatever this host is, an unsupported request lands on something it
+        // can run -- that is the entire postcondition.
+        for kernel in [
+            DotKernel::Scalar,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::Avx2,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::AvxVnni,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::Avx512Vnni,
+            #[cfg(target_arch = "aarch64")]
+            DotKernel::Neon,
+            #[cfg(target_arch = "aarch64")]
+            DotKernel::NeonDot,
+        ] {
+            assert!(
+                kernel.clamped_to_host().is_runnable_here(),
+                "{kernel:?} clamped to a kernel this host cannot run"
+            );
+        }
+    }
+
+    /// The one-hot tags must actually be one-hot and distinct, or the mask
+    /// aliases two kernels and `is_runnable_here` answers for the wrong one.
+    #[test]
+    fn dot_kernel_bits_are_distinct() {
+        let kernels = [
+            DotKernel::Scalar,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::Avx2,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::AvxVnni,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::Avx512Vnni,
+            #[cfg(target_arch = "aarch64")]
+            DotKernel::Neon,
+            #[cfg(target_arch = "aarch64")]
+            DotKernel::NeonDot,
+        ];
+        let mut seen = 0u8;
+        for kernel in kernels {
+            let bit = kernel.bit();
+            assert_eq!(bit.count_ones(), 1, "{kernel:?} tag is not one-hot");
+            assert_eq!(seen & bit, 0, "{kernel:?} tag collides with an earlier one");
+            seen |= bit;
+        }
+    }
+
+    /// The AVX-512-VNNI gate must demand every feature its `#[target_feature]`
+    /// list enables. `vpdpbusd` on `zmm` needs AVX512F+VNNI; the 256-bit
+    /// remainder in the same function needs AVX512VL; and MLAS's own SQNBit
+    /// dispatch additionally requires BW, so an AVX512F-only part (Xeon Phi
+    /// KNL/KNM) must not reach either. Hardware-independent: it reads the gate,
+    /// it does not need the CPU.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx512_vnni_selection_requires_the_full_feature_set() {
+        let has_all = std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+            && std::arch::is_x86_feature_detected!("avx512vl");
+        assert_eq!(
+            selected_dot_kernel() == DotKernel::Avx512Vnni,
+            has_all,
+            "AVX-512-VNNI must be selected exactly when F+BW+VNNI+VL are all present"
+        );
+        assert_eq!(
+            host_dot_kernel_mask() & DotKernel::Avx512Vnni.bit() != 0,
+            has_all,
+            "the runnable-kernel mask must agree with the selection gate"
+        );
+        // AVX-VNNI is the VEX encoding and is *independent* of the AVX-512
+        // family: Ice Lake / Cooper Lake server parts have AVX512-VNNI without
+        // it. The mask must track it separately, never infer it.
+        assert_eq!(
+            host_dot_kernel_mask() & DotKernel::AvxVnni.bit() != 0,
+            std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("avxvnni"),
+            "AVX-VNNI availability must be probed, not implied by AVX-512-VNNI"
+        );
+    }
+
     /// aarch64 must never fall back to the scalar dot: `selected_dot_kernel`
     /// picks a NEON-family kernel, and the forced `Neon` int8 dot stays
     /// bit-exact vs scalar.
@@ -10364,20 +12441,7 @@ mod tests {
             .collect();
         let (packed, scales, zero_points, dequantized) = quantize(&weights, n, k, block_size, true);
         let zero_points = zero_points.unwrap();
-        let (graph, node) = model_node(
-            &[2, 3, k],
-            &[n, 3, 8],
-            &[n * 3],
-            Some(&[n, 2]),
-            &[2, 3, n],
-            k,
-            n,
-            block_size,
-        );
-        let model = Model::new(&graph);
-        let kernel = CpuExecutionProvider::new()
-            .get_kernel(model.graph.node(node), &[], 1)
-            .unwrap();
+        let kernel = test_kernel(k, n, block_size);
         let a = Owned::f32(&[2, 3, k], &a);
         let b = Owned::u8(&[n, 3, 8], &packed);
         let scales = Owned::f32(&[n * 3], &scales);
@@ -10390,10 +12454,76 @@ mod tests {
             )
             .unwrap();
         assert_close(&y.to_f32(), &reference(&a.to_f32(), &dequantized, m, k, n));
+        assert!(
+            kernel.weight_nk.get().is_none(),
+            "batched asymmetric INT4 must not expand the weight to f32"
+        );
     }
 
     #[test]
-    fn matmulnbits_prepacked_m1_block32_symmetric_reuses_weight_for_new_activations() {
+    fn matmulnbits_bf16_asymmetric_decode_keeps_int4_packed() {
+        let (m, k, n, block_size) = (1, 64, 7, 32);
+        let a_values: Vec<f32> = (0..k)
+            .map(|i| ((i * 17 % 41) as f32 - 20.0) / 13.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 37) as f32 - 18.0) / 11.0)
+            .collect();
+        let (packed, scales, zero_points, _) = quantize(&weights, n, k, block_size, true);
+        let zero_points = zero_points.unwrap();
+        let rounded_scales: Vec<f32> = scales
+            .iter()
+            .map(|&value| half::bf16::from_f32(value).to_f32())
+            .collect();
+        let dequantized = dequantize_reference(
+            &packed,
+            &rounded_scales,
+            Some(&zero_points),
+            n,
+            k,
+            block_size,
+        );
+        let kernel = test_kernel(k, n, block_size);
+        let a = Owned::bf16(&[m, k], &a_values);
+        let b = Owned::u8(&[n, 2, 16], &packed);
+        let scales = Owned::bf16(&[n, 2], &rounded_scales);
+        let zero_points = Owned::u8(&[n, 1], &zero_points);
+        let mut y = Owned::zeros(DataType::BFloat16, &[m, n]);
+        kernel
+            .execute(
+                &[a.view(), b.view(), scales.view(), zero_points.view()],
+                &mut [y.view_mut()],
+            )
+            .unwrap();
+        assert!(
+            kernel.weight_nk.get().is_none(),
+            "Muse-style decode must not expand the INT4 initializer to f32"
+        );
+        let rounded_a: Vec<f32> = a_values
+            .iter()
+            .map(|&value| half::bf16::from_f32(value).to_f32())
+            .collect();
+        let expected = reference(&rounded_a, &dequantized, m, k, n);
+        let actual = y.to_bf16_as_f32();
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 0.02_f32.max(0.02 * expected.abs()),
+                "index {index}: actual={actual}, expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn matmulnbits_m1_block32_symmetric_borrows_weight_for_new_activations() {
+        let _guard = CACHE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Post-#979: symmetric int4 (constant B) never expands the weight into
+        // the resident f32 cache. Whichever low-copy route serves it (borrowed
+        // zero-copy, or MLAS SQNBit CompFp32 with its int4-sized packed buffer),
+        // the per-activation correctness invariant must hold: a second call with
+        // different activations must recompute rather than reuse the first
+        // result.
         let (k, n, block_size) = (35, 7, 32);
         let a1_values: Vec<f32> = (0..k)
             .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
@@ -10415,16 +12545,14 @@ mod tests {
         let scales = Owned::f32(&[n, 2], &scales);
         let a1 = Owned::f32(&[1, k], &a1_values);
         let mut y1 = Owned::zeros_f32(&[1, n]);
+        let probe = Int4Acc0RouteProbe::start();
         kernel
             .execute(&[a1.view(), b.view(), scales.view()], &mut [y1.view_mut()])
             .unwrap();
         assert_close(&y1.to_f32(), &reference(&a1_values, &dequantized, 1, k, n));
+        probe.assert_fast_route(&kernel, true);
 
         let cached_ptr = prepack_cache_ptr(&kernel);
-        assert!(
-            cached_ptr.is_some(),
-            "M=1 constant B must populate a prepacked weight cache"
-        );
         let a2 = Owned::f32(&[1, k], &a2_values);
         let mut y2 = Owned::zeros_f32(&[1, n]);
         kernel
@@ -10433,14 +12561,21 @@ mod tests {
         assert_eq!(
             prepack_cache_ptr(&kernel),
             cached_ptr,
-            "prepacked weight cache must be reused (stable) across activations"
+            "the second activation must reuse the first call's routing decision and cache identity, not build a new one"
+        );
+        assert!(
+            kernel.weight_nk.get().is_none(),
+            "symmetric decode must never expand the weight to f32 across activations (#979)"
         );
         assert_close(&y2.to_f32(), &reference(&a2_values, &dequantized, 1, k, n));
         assert_ne!(y1.to_f32(), y2.to_f32());
     }
 
     #[test]
-    fn matmulnbits_prepacked_m1_block128_explicit_zp_partial_block_matches_reference() {
+    fn matmulnbits_borrowed_m1_block128_explicit_zp_partial_block_matches_reference() {
+        let _guard = CACHE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (k, n, block_size) = (141, 7, 128);
         let a_values: Vec<f32> = (0..k)
             .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
@@ -10460,6 +12595,7 @@ mod tests {
         let scales = Owned::f32(&[n, 2], &scales);
         let zero_points = Owned::u8(&[n, 1], &zero_points);
         let mut y = Owned::zeros_f32(&[1, n]);
+        let probe = Int4Acc0RouteProbe::start();
         kernel
             .execute(
                 &[a.view(), b.view(), scales.view(), zero_points.view()],
@@ -10468,10 +12604,91 @@ mod tests {
             .unwrap();
 
         assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
+        probe.assert_fast_route(&kernel, false);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn borrowed_int4_block_dot_x86_matches_scalar_reference() {
+        // The x86 SIMD borrowed int4 block dot (#994) must reproduce the scalar
+        // `sum(activation[j] * nibble[j])` reference within f32 rounding for the
+        // block sizes the borrowed path feeds it (32 and multiples). Single-chunk
+        // (32) and multi-chunk (64/128) both exercise the accumulator loop.
+        fn scalar_dot(activation: &[f32], packed: &[u8]) -> f32 {
+            let mut dot = 0.0f32;
+            for (byte_index, &byte) in packed.iter().enumerate() {
+                dot += activation[2 * byte_index] * (byte & 0x0f) as f32;
+                dot += activation[2 * byte_index + 1] * (byte >> 4) as f32;
+            }
+            dot
+        }
+        let kernel = selected_dot_kernel();
+        if matches!(kernel, DotKernel::Scalar) {
+            return; // Host has no AVX2; the borrowed path uses the scalar loop.
+        }
+        for &len in &[32usize, 64, 128] {
+            let activation: Vec<f32> = (0..len)
+                .map(|i| ((i * 13 % 29) as f32 - 14.0) / 7.0)
+                .collect();
+            let packed: Vec<u8> = (0..len / 2)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(5))
+                .collect();
+            let simd = borrowed_int4_block_dot_x86(&activation, &packed, kernel)
+                .expect("non-scalar kernel returns Some");
+            let scalar = scalar_dot(&activation, &packed);
+            let tol = scalar.abs() * 1e-5 + 1e-4;
+            assert!(
+                (simd - scalar).abs() <= tol,
+                "len={len} kernel={kernel:?} simd={simd} scalar={scalar}"
+            );
+        }
+        // Scalar dispatch declines so the caller keeps the scalar reference.
         assert!(
-            prepack_cache_populated(&kernel),
-            "M=1 constant B/scales/zero-points must take a prepacked path"
+            borrowed_int4_block_dot_x86(&[0.0f32; 32], &[0u8; 16], DotKernel::Scalar).is_none()
         );
+    }
+
+    #[test]
+    fn matmulnbits_symmetric_m1_borrows_instead_of_building_f32_cache() {
+        let _guard = CACHE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Regression for #979: symmetric int4 (no zero_points input) must take
+        // the zero-copy borrowed decode path using the implicit midpoint 8, and
+        // must NOT fall through to the resident f32 `weight_nk` cache (~8x the
+        // file size in RAM). With constant B/scales, the pre-#979 code populated
+        // `weight_nk`; the borrowed path returns before any cache is built, so
+        // `!prepack_cache_populated` is a *positive* proof the branch changed.
+        let (k, n, block_size) = (128, 7, 32);
+        let a_values: Vec<f32> = (0..k)
+            .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, zero_points, _) = quantize(&weights, n, k, block_size, false);
+        assert!(
+            zero_points.is_none(),
+            "symmetric quantize must omit the zero_points tensor"
+        );
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+        let mut kernel = test_kernel(k, n, block_size);
+        kernel.set_constant_inputs(&[false, true, true]);
+
+        let a = Owned::f32(&[1, k], &a_values);
+        let b = Owned::u8(&[n, 4, 16], &packed);
+        let scales = Owned::f32(&[n, 4], &scales);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        let probe = Int4Acc0RouteProbe::start();
+        kernel
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+
+        assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
+        // Positive proof the intended fast branch ran (borrowed zero-copy, or
+        // MLAS SQNBit CompFp32 when the vendored MLAS has a kernel), plus
+        // negative proof no resident f32 `weight_nk` expansion was ever built.
+        probe.assert_fast_route(&kernel, true);
     }
 
     #[test]
@@ -10499,6 +12716,478 @@ mod tests {
             kernel.weight_nk.get().is_none(),
             "dynamic B must use the fallback rather than populate the prepack cache"
         );
+    }
+
+    /// Dynamic (non-constant) `B` must stay on the borrowed zero-copy path even
+    /// when the vendored MLAS *does* have a SQNBit kernel for the shape: MLAS
+    /// would have to repack the weight on every single call, and there is no
+    /// session-lifetime cache to amortize it against. This is the explicit
+    /// decline half of the dispatch policy; the win half is covered by
+    /// [`Int4Acc0RouteProbe::assert_fast_route`] on constant weights.
+    #[test]
+    fn matmulnbits_int4_acc0_dynamic_weight_keeps_borrowed_path() {
+        let (k, n, block_size) = (128, 16, 32);
+        let a_values: Vec<f32> = (0..k)
+            .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+        let mut kernel = test_kernel(k, n, block_size);
+        // B is *not* a graph constant: `can_prepack` is false.
+        kernel.set_constant_inputs(&[false, false, true]);
+
+        let a = Owned::f32(&[1, k], &a_values);
+        let b = Owned::u8(&[n, 4, 16], &packed);
+        let scales = Owned::f32(&[n, 4], &scales);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        let sym_before = BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed);
+        kernel
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+
+        assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
+        assert!(
+            BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed) > sym_before,
+            "dynamic-weight int4 accuracy_level=0 must keep the borrowed zero-copy path (MLAS would repack every call)"
+        );
+        assert!(
+            !prepack_cache_populated(&kernel),
+            "dynamic-weight int4 must not build any per-call weight cache"
+        );
+    }
+
+    /// `accuracy_level = 0` means fp32 compute, on every architecture.
+    ///
+    /// Regression guard for the aarch64 dispatch bug: with `dotprod` present,
+    /// `borrowed_affine_int4_matmul` diverted `m == 1, block_size == 32` into an
+    /// `m1_neon_dot` kernel that quantized the activations to int8 via
+    /// `quantize_activation_signed`. That is CompInt8 accuracy delivered where
+    /// CompFp32 was requested: it moved results by ~1e-3 relative, far outside
+    /// f32 reassociation. It only reached CI because
+    /// `DotKernel::arm64_int4_direct_enabled` was hard-wired `true` under
+    /// `cfg(test)` while production defaults it *off*, so every test ran an
+    /// opt-in, precision-reducing kernel that no shipped binary would pick.
+    ///
+    /// The fix is structural, not a tolerance bump: the diversion was deleted
+    /// (acc0 was its only caller, so it had no semantically valid use), so
+    /// `ONNX_GENAI_CPU_ARM64_INT4_DIRECT=1` can no longer reduce acc0 precision.
+    /// The 8-bit sibling of this invariant is covered by
+    /// [`matmulnbits_8bit_block128_execute_matches_dequant_f32_oracle`], whose
+    /// SDOT routes are now gated on `accuracy_level == 4`.
+    ///
+    /// This test is deliberately architecture-independent: it states the
+    /// invariant ("acc0 reconstructs the f32 dequantize-then-GEMM oracle") and
+    /// so fails on any host whose acc0 route silently quantizes, rather than
+    /// encoding which kernel happens to be selected here.
+    #[test]
+    fn matmulnbits_acc0_m1_block32_matches_fp32_oracle_on_every_arch() {
+        for &(k, n) in &[(32usize, 8usize), (35, 7), (256, 48), (129, 33)] {
+            let block_size = 32usize;
+            let activations: Vec<f32> = (0..k)
+                .map(|i| (i as f32 * 0.019 + 0.11).cos() * 1.7)
+                .collect();
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| (i as f32 * 0.0131).sin() * 1.3 + (i as f32 * 0.0007).cos() * 0.4)
+                .collect();
+            let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+            let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+            let expected = reference(&activations, &dequantized, 1, k, n);
+
+            let mut kernel = test_kernel(k, n, block_size);
+            kernel.set_constant_inputs(&[false, true, true]);
+            let block_count = k.div_ceil(block_size);
+            let b = Owned::u8(&[n, block_count, block_size / 2], &packed);
+            let scale_tensor = Owned::f32(&[n, block_count], &scales);
+            let a = Owned::f32(&[1, k], &activations);
+            let mut y = Owned::zeros_f32(&[1, n]);
+            kernel
+                .execute(
+                    &[a.view(), b.view(), scale_tensor.view()],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+
+            // Bound the f32 dot product itself (gamma_k ~ k * EPSILON) instead of
+            // a flat epsilon, so the assertion stays valid for any legitimate
+            // SIMD reassociation while still rejecting int8 activation
+            // quantization, which is ~1e-3 relative -- orders of magnitude larger.
+            for (index, (&actual, &want)) in y.to_f32().iter().zip(&expected).enumerate() {
+                let magnitude: f32 = (0..k)
+                    .map(|j| (activations[j] * dequantized[index * k + j]).abs())
+                    .sum();
+                let tolerance = (k as f32) * f32::EPSILON * magnitude.max(1.0);
+                assert!(
+                    (actual - want).abs() <= tolerance,
+                    "k={k} n={n} index={index}: acc0 must be fp32-exact, \
+                     actual={actual} want={want} tolerance={tolerance}"
+                );
+            }
+        }
+    }
+
+    /// The dispatch gates must report the *production* policy under `cfg(test)`.
+    ///
+    /// Pins the defect class directly: a `#[cfg(test)] { true }` in front of a
+    /// `#[cfg(not(test))]` policy body makes the whole suite exercise a
+    /// configuration no shipped binary uses, and silently disables any test of
+    /// the default. Re-introducing that pattern flips these assertions.
+    #[test]
+    fn dispatch_gates_report_production_policy_under_cfg_test() {
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Opt-in via ONNX_GENAI_CPU_ARM64_INT4_DIRECT; unset in CI. These
+            // kernels quantize activations to int8, so defaulting them on would
+            // silently reduce accuracy_level=0 precision.
+            if std::env::var_os("ONNX_GENAI_CPU_ARM64_INT4_DIRECT").is_none() {
+                assert!(
+                    !DotKernel::arm64_int4_direct_enabled(),
+                    "the aarch64 N16 SDOT direct kernels are opt-in and must stay off by default under test"
+                );
+                assert_eq!(
+                    DotKernel::arm64_kai_sdot_direct_enabled(),
+                    !cfg!(any(target_os = "macos", target_os = "ios")),
+                    "the KleidiAI SDOT gate must match its documented per-OS production default"
+                );
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Mirror image: on by default, disabled via the escape hatch.
+            if std::env::var_os("ONNX_GENAI_CPU_DISABLE_INT4_SIMD").is_none() {
+                assert!(
+                    int4_borrowed_simd_enabled(),
+                    "the x86 borrowed int4 SIMD path is on by default"
+                );
+            }
+        }
+    }
+
+    ///
+    /// [`Int4Acc0RouteProbe::assert_fast_route`] asks the production predicate
+    /// what should have happened, which catches "the code disagrees with its own
+    /// policy" but cannot catch "the policy itself regressed to never choosing
+    /// MLAS". This pins the concrete case the fix exists for: on an x86_64 host
+    /// with the vendored MLAS, a constant-weight symmetric int4
+    /// `accuracy_level = 0` node with the block size every real export uses
+    /// *must* end up on MLAS SQNBit. If someone reintroduces the branch order
+    /// that made that route dead code, this fails even if the predicate is
+    /// changed to agree with it.
+    #[cfg(all(feature = "mlas", target_arch = "x86_64"))]
+    #[test]
+    fn int4_acc0_constant_weight_reaches_mlas_on_x86_64() {
+        let _guard = CACHE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (k, n, block_size) = (256, 32, 32);
+        let a_values: Vec<f32> = (0..k)
+            .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+        let mut kernel = test_kernel(k, n, block_size);
+        kernel.set_constant_inputs(&[false, true, true]);
+
+        let a = Owned::f32(&[1, k], &a_values);
+        let b = Owned::u8(&[n, 8, 16], &packed);
+        let scales_tensor = Owned::f32(&[n, 8], &scales);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        kernel
+            .execute(
+                &[a.view(), b.view(), scales_tensor.view()],
+                &mut [y.view_mut()],
+            )
+            .unwrap();
+
+        assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
+        assert!(
+            kernel
+                .mlas_shards
+                .get()
+                .is_some_and(|shards| shards.is_some())
+                || kernel
+                    .mlas_packed
+                    .get()
+                    .is_some_and(|packed| packed.is_some()),
+            "int4 accuracy_level=0 with constant block-32 weights must reach MLAS SQNBit on x86_64; \
+             the borrowed path's block dot is aarch64-only, so pre-empting MLAS here means a scalar GEMV"
+        );
+        assert!(
+            kernel.weight_nk.get().is_none(),
+            "and it must still never expand the weight to f32 (#979)"
+        );
+    }
+
+    /// The ownership predicate must be a pure function of the node's static
+    /// shape/quantization plus `can_prepack`, so `execute`'s branch order and
+    /// the route assertions in tests cannot disagree.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_sqnbit_ownership_requires_constant_weights() {
+        let kernel = test_kernel(128, 16, 32);
+        assert!(
+            !kernel.mlas_sqnbit_owns_fp32_compute(false, false),
+            "dynamic weights must never be handed to MLAS SQNBit on the accuracy_level=0 route"
+        );
+        assert!(
+            !kernel.mlas_sqnbit_owns_fp32_compute(false, true),
+            "dynamic asymmetric weights must never be handed to MLAS SQNBit either"
+        );
+        // A block size MLAS has no SQNBit kernel for must be declined even with
+        // constant weights, so the borrowed path stays reachable as the fallback.
+        let unsupported = test_kernel(128, 16, 8);
+        assert!(
+            !unsupported.mlas_sqnbit_owns_fp32_compute(true, false),
+            "block_size=8 has no MLAS SQNBit kernel and must fall back to the borrowed path"
+        );
+    }
+
+    /// Sum the heap bytes the MLAS SQNBit shards a kernel packed actually hold
+    /// (packed buffer + retained scale/zero-point copies), reading each shard's
+    /// real [`mlas_sys::SQNBitPackedB::owned_heap_bytes`]. This is the *actual*
+    /// footprint one compiled kernel instance retains, read back deterministically
+    /// from that kernel (not the process-global counter, so parallel tests cannot
+    /// perturb it).
+    #[cfg(feature = "mlas")]
+    fn mlas_shards_owned_bytes(kernel: &MatMulNBitsKernel) -> u64 {
+        kernel
+            .mlas_shards
+            .get()
+            .and_then(Option::as_ref)
+            .map(|shards| {
+                shards
+                    .iter()
+                    .flatten()
+                    .map(|s| s.prepared.packed.owned_heap_bytes() as u64)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// #1027/#1051: the accounting the memory plan reads must equal the MLAS
+    /// packed bytes the kernels *actually* allocate -- predicted == actual, so an
+    /// admission gate is never fed an underestimate.
+    ///
+    /// This asserts the tie at all three levels, against the real allocated
+    /// bytes rather than re-deriving `sqnbit_packed_b_size` (which would only
+    /// prove the predictor calls the same function it did before, the tautology
+    /// that let the 2x under-report through):
+    ///
+    ///   1. the per-copy predictor equals the packed + scale/zp bytes one
+    ///      executed kernel instance retains;
+    ///   2. the per-node predictor equals the bytes **two** instances retain,
+    ///      because the shape-keyed kernel cache compiles a prefill (`m > 1`) and
+    ///      a decode (`m == 1`) instance and each packs its own copy;
+    ///   3. the graph walker the plan calls
+    ///      ([`resident_dequant_f32_cache_bytes`]) equals that same actual
+    ///      session footprint.
+    ///
+    /// It also guards the #979 direction: the total must be non-zero and never
+    /// the ~8x f32 expansion.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn int4_acc0_mlas_packed_accounting_equals_actual_allocated() {
+        let _guard = CACHE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (k, n, block_size) = (256usize, 32usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+
+        if !test_kernel(k, n, block_size).mlas_sqnbit_owns_fp32_compute(true, false) {
+            // This host has no MLAS SQNBit kernel for the shape, so the node
+            // stays on the borrowed zero-copy path and holds no side buffer.
+            assert_eq!(
+                matmul_nbits_resident_side_cache_bytes(4, block_size, 0, n, k, false, false, false),
+                0
+            );
+            return;
+        }
+
+        set_mlas_sqnbit_packing_enabled(true);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+
+        // Execute one kernel instance at row count `m` so it packs its MLAS
+        // shards exactly as the decode runtime does, then return the kernel so
+        // its actual retained bytes can be read back.
+        let run = |m: usize| -> MatMulNBitsKernel {
+            let a_values: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
+                .collect();
+            let mut kernel = test_kernel(k, n, block_size);
+            kernel.set_constant_inputs(&[false, true, true]);
+            let a = Owned::f32(&[m, k], &a_values);
+            let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+            let scales_t = Owned::f32(&[n, blocks], &scales);
+            let mut y = Owned::zeros_f32(&[m, n]);
+            kernel
+                .execute(&[a.view(), b.view(), scales_t.view()], &mut [y.view_mut()])
+                .unwrap();
+            kernel
+        };
+
+        // Two distinct activation shapes -> two compiled kernel instances, the
+        // exact duplication the shape-keyed kernel cache produces in a real
+        // autoregressive session (prefill `m > 1`, decode `m == 1`).
+        let prefill = run(3);
+        let decode = run(1);
+
+        let per_copy_predicted =
+            mlas_sqnbit_packed_b_cache_bytes(4, block_size, 0, n, k, false, false, false)
+                .expect("MLAS route was asserted available for this shape");
+        let prefill_actual = mlas_shards_owned_bytes(&prefill);
+        let decode_actual = mlas_shards_owned_bytes(&decode);
+        assert!(
+            prefill_actual > 0,
+            "the prefill instance must have packed MLAS shards"
+        );
+        assert_eq!(
+            prefill_actual, per_copy_predicted,
+            "per-copy predictor must equal the packed + scale/zp bytes one instance actually holds"
+        );
+        assert_eq!(
+            decode_actual, per_copy_predicted,
+            "the decode instance holds the same per-copy bytes as the prefill instance"
+        );
+
+        // Per-node accounting must equal the bytes BOTH instances retain.
+        let session_actual = prefill_actual + decode_actual;
+        let node_predicted =
+            matmul_nbits_resident_side_cache_bytes(4, block_size, 0, n, k, false, false, false);
+        assert_eq!(
+            node_predicted, session_actual,
+            "per-node accounting must equal the two instances' actual packed bytes (the missed 2x)"
+        );
+
+        // The graph walker the memory plan actually calls must equal the same
+        // actual session footprint, for a graph whose weight is a constant
+        // initializer (the only case that caches).
+        let (mut graph, node_id) = model_node(
+            &[1, k],
+            &[n, blocks, block_size / 2],
+            &[n, blocks],
+            None,
+            &[1, n],
+            k,
+            n,
+            block_size,
+        );
+        let b_value = graph
+            .node(node_id)
+            .inputs
+            .get(1)
+            .and_then(|v| *v)
+            .expect("MatMulNBits B input");
+        graph.set_initializer(
+            b_value,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Uint8,
+                vec![n, blocks, block_size / 2],
+                vec![0u8; n * blocks * (block_size / 2)],
+            )),
+        );
+        assert_eq!(
+            resident_dequant_f32_cache_bytes(&graph),
+            session_actual,
+            "the memory plan's graph accounting must equal the actual session footprint"
+        );
+
+        // #979 direction: non-zero, and never the ~8x f32 expansion.
+        assert!(
+            node_predicted > 0,
+            "the packed buffer must not be accounted as zero (#1027)"
+        );
+        assert_ne!(
+            node_predicted,
+            (n as u64) * (k as u64) * 4,
+            "the int4 packed buffer must not be accounted as the ~8x resident f32 expansion (#979)"
+        );
+
+        drop(prefill);
+        drop(decode);
+    }
+
+    /// #1027 item 2: admitting the packed buffer through the memory strategy has
+    /// a real decline path. When the plan declines it (over budget) it calls
+    /// [`set_mlas_sqnbit_packing_enabled`] with `false`; the node must then keep
+    /// the borrowed zero-copy int4 path -- correct output via the borrowed path,
+    /// no MLAS packed buffer built. This flips the process-global admission flag,
+    /// so it shares [`CACHE_FLAG_TEST_LOCK`] with the other route-asserting tests.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_sqnbit_packing_decline_keeps_borrowed_path() {
+        let _guard = CACHE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (k, n, block_size) = (256, 32, 32);
+        let a_values: Vec<f32> = (0..k)
+            .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+
+        let run = || {
+            let mut kernel = test_kernel(k, n, block_size);
+            kernel.set_constant_inputs(&[false, true, true]);
+            let a = Owned::f32(&[1, k], &a_values);
+            let b = Owned::u8(&[n, 8, 16], &packed);
+            let scales_t = Owned::f32(&[n, 8], &scales);
+            let mut y = Owned::zeros_f32(&[1, n]);
+            kernel
+                .execute(&[a.view(), b.view(), scales_t.view()], &mut [y.view_mut()])
+                .unwrap();
+            (kernel, y.to_f32())
+        };
+
+        set_mlas_sqnbit_packing_enabled(true);
+        let (admitted_kernel, admitted_y) = run();
+        let mlas_had_a_kernel = admitted_kernel.mlas_sqnbit_owns_fp32_compute(true, false);
+
+        set_mlas_sqnbit_packing_enabled(false);
+        let sym_before = BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed);
+        let (declined_kernel, declined_y) = run();
+        // Capture the route decision while the admission flag is still false;
+        // `mlas_sqnbit_owns_fp32_compute` reads the process-global flag live.
+        let declined_owns = declined_kernel.mlas_sqnbit_owns_fp32_compute(true, false);
+        set_mlas_sqnbit_packing_enabled(true);
+
+        assert_close(&admitted_y, &reference(&a_values, &dequantized, 1, k, n));
+        assert_close(&declined_y, &reference(&a_values, &dequantized, 1, k, n));
+        // Admitting takes MLAS SQNBit CompFp32; declining takes the borrowed
+        // dequant path. Both are numerically the same GEMV, but MLAS's CompFp32
+        // rounding differs from the scalar dequant by a few ULPs, so this is a
+        // near-equality (the MLAS-vs-scalar tolerance used elsewhere in this
+        // file), not bit-identity. The behavioural no-op we assert on is the
+        // *route*: declining must not claim ownership and must not build a
+        // packed buffer (checked below), leaving exactly the pre-existing
+        // borrowed zero-copy path that other tests already exercise.
+        mlas_close(&admitted_y, &declined_y, 2e-3, "admitted-vs-declined route");
+        assert!(
+            !declined_owns,
+            "a declined MLAS route must not claim ownership"
+        );
+        assert!(
+            declined_kernel.mlas_shards.get().is_none()
+                && declined_kernel.mlas_packed.get().is_none(),
+            "the declined route must not build any MLAS packed buffer"
+        );
+        assert!(
+            BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed) > sym_before,
+            "the declined int4 accuracy_level=0 node must fall back to the borrowed zero-copy path"
+        );
+        // If MLAS had no kernel for this shape the fallback is trivially the
+        // borrowed path in both arms; the correctness check still holds.
+        let _ = mlas_had_a_kernel;
     }
 
     #[test]
@@ -10962,6 +13651,43 @@ mod tests {
         assert_eq!(resolve_decode_min(Some("32"), 96), 32);
         assert_eq!(resolve_decode_min(Some("  8 "), 96), 8);
         assert_eq!(resolve_decode_min(Some("1"), 96), 1);
+    }
+
+    /// The standalone MLAS pool cannot see `DECODE_THREADS_OVERRIDE`, so
+    /// `set_decode_thread_budget` has to forward explicitly. Without the
+    /// forwarding, `--cpu-cores N` bounded dense `MlasGemmBatch` work only on
+    /// Linux, and only indirectly via the affinity mask.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn set_decode_thread_budget_forwards_the_budget_to_the_standalone_mlas_pool() {
+        let _guard = backend_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let restore = decode_threads_override();
+
+        set_decode_thread_budget(Some(6)).expect("6 is a legal budget");
+        assert_eq!(
+            mlas_sys::configured_pool_thread_budget(),
+            Some(6),
+            "the MLAS pool must observe the EP's programmatic budget"
+        );
+
+        set_decode_thread_budget(None).expect("clearing is legal");
+        assert_eq!(
+            mlas_sys::configured_pool_thread_budget(),
+            None,
+            "clearing the EP budget must clear the MLAS pool budget too"
+        );
+
+        assert!(
+            set_decode_thread_budget(Some(0)).is_err(),
+            "zero stays the opt-out sentinel, not a legal pool size"
+        );
+        assert_eq!(
+            mlas_sys::configured_pool_thread_budget(),
+            None,
+            "a rejected budget must not reach the MLAS pool"
+        );
+
+        set_decode_thread_budget(restore).expect("restoring the prior budget");
     }
 
     /// Serialize the few tests that mutate `NXRT_CPU_GEMM_BACKEND` so the global
@@ -12026,12 +14752,24 @@ mod tests {
     }
 
     /// M-based hybrid routing gate: with an otherwise-eligible int4 case
-    /// (`accuracy_level == 4`, so the hand decode path is fast) and the MLAS
-    /// backend selected, `try_mlas_sqnbit` must still fall back (`Ok(None)`) for
-    /// `m` below the decode crossover (decode keeps the hand path) and serve
-    /// MLAS (`Ok(Some(()))`) for `m` at/above it (prefill). This regression-locks
-    /// the decode/prefill split. Uses the topology-derived default threshold; the
-    /// host must have an MLAS SQNBit int4 kernel or the assertions are skipped.
+    /// (`accuracy_level == 4`) and the MLAS backend selected, `try_mlas_sqnbit`
+    /// must fall back (`Ok(None)`) for `m` below the decode crossover -- decode
+    /// keeps the hand path -- and serve MLAS (`Ok(Some(()))`) for `m` at/above
+    /// it (prefill). This regression-locks the decode/prefill split. Uses the
+    /// topology-derived default threshold; the host must have an MLAS SQNBit
+    /// int4 kernel or the assertions are skipped.
+    ///
+    /// The decode half of the split is conditional on the host actually having a
+    /// native int8 dot product behind the hand kernels
+    /// (`hand_int8_decode_has_native_dot`). Where it does not, keeping decode on
+    /// the hand path is the *wrong* answer -- measured 9.6x slower than letting
+    /// MLAS take it -- so `Some(())` below the crossover is the expected result
+    /// there, and this test asserts that instead.
+    ///
+    /// Weights are declared constant (`can_prepack = true`) because that is the
+    /// only case where the ISA question is live: dynamic weights always keep the
+    /// hand path (see
+    /// `matmulnbits_accuracy4_dynamic_weight_decode_keeps_hand_path`).
     #[cfg(feature = "mlas")]
     #[test]
     fn matmulnbits_try_mlas_gates_decode_by_m_threshold() {
@@ -12079,7 +14817,7 @@ mod tests {
                     &scales_t.view(),
                     None,
                     None,
-                    false,
+                    true,
                     &a,
                     m,
                     None,
@@ -12099,11 +14837,107 @@ mod tests {
             }
         }
 
-        assert_eq!(
-            decode, None,
-            "m={below} (< {at}) must fall back to the hand int4 path",
-        );
+        if hand_int8_decode_has_native_dot() {
+            assert_eq!(
+                decode, None,
+                "m={below} (< {at}) must fall back to the hand int4 path when the host has a native int8 dot product",
+            );
+        } else {
+            assert_eq!(
+                decode,
+                Some(()),
+                "m={below} (< {at}) must route to MLAS SQNBit when the hand int8 kernel has no native dot product to dispatch to",
+            );
+        }
         assert_eq!(prefill, Some(()), "m={at} must route to MLAS SQNBit",);
+    }
+
+    /// The decode-crossover short-circuit must be a claim about the host, not a
+    /// constant: it may only fire where the hand int8 kernels have a real int8
+    /// dot product to dispatch to.
+    ///
+    /// The x86_64 arm cross-checks against **CPUID directly** rather than
+    /// against `selected_dot_kernel().uses_vnni_int4_direct()`, which is the
+    /// implementation itself and would be a tautology. Restricted to the default
+    /// selection: an explicit `ONNX_GENAI_CPU_DOT_KERNEL` override may
+    /// legitimately choose a weaker kernel than the hardware supports, and the
+    /// predicate must follow what actually executes, not what CPUID advertises.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn hand_int8_decode_native_dot_matches_host_capability() {
+        let has_native_dot = hand_int8_decode_has_native_dot();
+        #[cfg(target_arch = "x86_64")]
+        if std::env::var_os("ONNX_GENAI_CPU_DOT_KERNEL").is_none() {
+            let host_has_vnni = std::arch::is_x86_feature_detected!("avx512vnni")
+                || std::arch::is_x86_feature_detected!("avxvnni");
+            assert_eq!(
+                has_native_dot, host_has_vnni,
+                "x86_64 needs AVX-VNNI/AVX-512-VNNI (vpdpbusd); the AVX2 vpmaddubsw/vpmaddwd \
+                 emulation is not competitive with MLAS SQNBit CompInt8"
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        assert!(
+            has_native_dot,
+            "NEON is baseline on aarch64, so the hand decode path always has a dot product"
+        );
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        assert!(
+            !has_native_dot,
+            "the scalar DotKernel has no dot product, so MLAS should take the node"
+        );
+    }
+
+    /// The dynamic-weight decline: with non-constant `B` there is no
+    /// session-lifetime cache to amortize MLAS's packing against, so decode must
+    /// stay on the hand path even on a host with no native int8 dot product.
+    /// Repacking a multi-megabyte weight per token is worse than any kernel.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn matmulnbits_accuracy4_dynamic_weight_decode_keeps_hand_path() {
+        let (k, n, block_size) = (128, 16, 32);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let scales_t = Owned::f32(&[n, 4], &scales);
+        let b = Owned::u8(&[n, 4, 16], &packed);
+        let kernel = accuracy4_kernel(k, n, block_size);
+
+        let _guard = backend_env_lock().lock().unwrap();
+        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
+        // SAFETY: the backend env lock serializes readers/writers of this var.
+        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+
+        let a = pseudo(k, 0.8);
+        let mut result = vec![0.0f32; n];
+        let routed = kernel
+            .try_mlas_sqnbit(
+                &b.view(),
+                &scales_t.view(),
+                None,
+                None,
+                false, // can_prepack = false: dynamic weights
+                &a,
+                1,
+                None,
+                &mut result,
+            )
+            .unwrap();
+
+        // SAFETY: still holding the backend env lock; restore prior value.
+        unsafe {
+            match &previous {
+                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
+                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
+            }
+        }
+
+        assert_eq!(
+            routed, None,
+            "dynamic-weight accuracy-4 decode must keep the hand path: MLAS would repack the \
+             whole weight on every call with no cache to amortize it against"
+        );
     }
 
     /// Slow-hand-path decode routing: for `m == 1` with `bits == 4` but

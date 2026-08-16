@@ -1,23 +1,23 @@
 //! Multi-model pipeline orchestrator.
 
+use crate::MemoryStrategyPlan;
 use crate::decode::{
     DecodeState, apply_paged_sliding_window, clone_value, run_decode_step_with_extra,
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::engine::{
-    Engine, EngineConfig, component_governor, model_requires_native_backend,
-    requested_decode_backend,
+    Engine, EngineConfig, EngineResourceGovernor, MemoryStrategyPlanInput, analyze_model_memory,
+    build_memory_strategy_plan, combine_graph_memory, component_governor, log_memory_strategy_plan,
+    model_requires_native_backend, requested_decode_backend,
+    resolve_memory_strategy_hot_tier_bytes, resolve_vram_limit_bytes,
 };
 use crate::kv_bridge::{
     KvModelInfo, attach_pages_to_sequence, infer_kv_model_info, load_materialized_past,
     sequence_pages_for_len,
 };
 use crate::logits::TokenId;
+use crate::memory_authority::{MemoryAuthorityProvider, SharedMemoryAuthorityProvider};
 
-/// Identifies the pipeline's KV page pool to the memory governor, distinct from
-/// the engine's own pool so pressure can be directed at the right holder.
-const PIPELINE_KV_POOL_HOLDER: onnx_runtime_memory_governor::HolderId =
-    onnx_runtime_memory_governor::HolderId::new(2);
 use crate::pipeline_cache::{
     ComponentOutputCache, Digest, DigestBuilder, PREFIX_KEY_PREAMBLE, PipelineCacheStats,
     RetainedContext, absorb_value, digest_named_values, graph_is_deterministic, prefix_key,
@@ -30,13 +30,13 @@ use anyhow::Context;
 use onnx_genai_kv::{PagedKvCache, PrefixCache, SequenceId};
 use onnx_genai_metadata::{
     AbsentInputKind, DataflowEdge, ModelIoSpec, PhaseRunOn, PipelineSpec, PipelineStrategy,
-    PipelineStrategyKind, PipelineVisionConfig, SchedulerSpec, TensorDimension,
+    PipelineStrategyKind, PipelineVisionConfig, SchedulerSpec, SequenceInputKind, TensorDimension,
 };
 use onnx_genai_ort::{
     DataType, PipelineModelDirectory, PipelineModels, Session, SessionOptions, Tokenizer, Value,
 };
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -224,6 +224,14 @@ impl From<GenerateRequest> for PipelineGenerateRequest {
 /// Engine for metadata-declared multi-model pipelines.
 pub struct PipelineEngine {
     models: PipelineModels,
+    /// Owns the pipeline's component-weight reservation. It is created before
+    /// any component session, so a failed load rolls the reservation back.
+    resource_governor: EngineResourceGovernor,
+    /// Autoregressive pipelines need a second plan after session graph I/O is
+    /// available. Both governors delegate device accounting to the same
+    /// authority; this one owns only the KV plan.
+    _kv_governor: Option<EngineResourceGovernor>,
+    memory_strategy_plan: MemoryStrategyPlan,
     plan: PipelinePlan,
     decode_backend: EngineDecodeBackend,
     /// Autoregressive decode state; `None` for non-autoregressive pipelines
@@ -251,6 +259,23 @@ pub struct PipelineEngine {
     /// `--ep cuda`), honored by the native pipeline decoder when the
     /// `ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE` override is unset.
     native_device: Option<crate::native_decode_device::NativeDecodeDevice>,
+    /// Prompt-phase / post-decode component sessions loaded on the native
+    /// backend, built lazily by the prologue the first time an active component
+    /// with no ORT session runs. Empty on the ORT backend and for native
+    /// pipelines whose prompt components never activate (e.g. a text-only prompt
+    /// through a multimodal package never builds the vision encoder). Behind a
+    /// `RefCell` because the prologue runs from `&self` paths.
+    #[cfg_attr(
+        not(feature = "native-backend"),
+        allow(
+            dead_code,
+            reason = "native prompt sessions are built only by the native backend"
+        )
+    )]
+    native_prompt_sessions:
+        RefCell<BTreeMap<String, Box<dyn onnx_genai_metadata::ComponentSession>>>,
+    #[cfg(feature = "cuda")]
+    native_cuda_authority: Option<crate::memory_authority::DeviceMemoryAuthority>,
 }
 
 /// Paged KV storage for an autoregressive pipeline decoder.
@@ -310,6 +335,20 @@ fn native_backend_not_compiled_error() -> anyhow::Error {
          decode_backend = EngineDecodeBackend::Ort (or ONNX_GENAI_BACKEND=ort) to use ONNX \
          Runtime."
     )
+}
+
+/// Resolve and validate an explicitly requested pipeline backend without
+/// touching model files. Server construction calls this before its own package
+/// discovery so both entry points preserve the same fail-fast behavior.
+pub fn validate_pipeline_backend_request(
+    requested: EngineDecodeBackend,
+) -> anyhow::Result<EngineDecodeBackend> {
+    let backend = requested_decode_backend(requested)?;
+    #[cfg(not(feature = "native-backend"))]
+    if backend == EngineDecodeBackend::Native {
+        return Err(native_backend_not_compiled_error());
+    }
+    Ok(backend)
 }
 
 /// Construct all pipeline components through the native
@@ -447,6 +486,8 @@ fn build_step_component_session<'a>(
     models: &'a PipelineModels,
     component: &str,
     native_components: &BTreeSet<String>,
+    #[cfg_attr(not(feature = "native-backend"), allow(unused_variables))]
+    native_device: &crate::native_decode_device::NativeDecodeDevice,
 ) -> anyhow::Result<Box<dyn onnx_genai_metadata::ComponentSession + 'a>> {
     if native_components.contains(component) {
         #[cfg(feature = "native-backend")]
@@ -458,14 +499,18 @@ fn build_step_component_session<'a>(
                 .with_context(|| {
                     format!("native every_step component '{component}' has no model path")
                 })?;
-            // The every_step slice (inc1) stages tensors through the host
-            // `ComponentTensor` seam, so the native component runs on CPU; device
-            // placement of the pipeline decoder is the later (inc2/inc3) work.
-            let native = crate::native_component::NativeComponentSession::load(
-                path,
-                crate::native_decode_device::NativeDecodeDevice::Cpu,
-            )
-            .with_context(|| format!("failed to load native every_step component '{component}'"))?;
+            // Run the native every_step component on the same device the native
+            // decoder targets: a CUDA pipeline keeps the embedder on the GPU (so
+            // an embeds-driven decoder's per-token embedding is a native CUDA EP
+            // forward, mirroring the `muse_decode` raw-session setup), while a
+            // CPU pipeline keeps it on CPU. Inputs/outputs still cross the host
+            // `ComponentTensor` seam, so only one small `inputs_embeds` row
+            // round-trips host<->device per step; the decoder's KV never does.
+            let native =
+                crate::native_component::NativeComponentSession::load(path, native_device.clone())
+                    .with_context(|| {
+                        format!("failed to load native every_step component '{component}'")
+                    })?;
             return Ok(Box::new(native));
         }
         #[cfg(not(feature = "native-backend"))]
@@ -485,6 +530,36 @@ fn build_step_component_session<'a>(
     )))
 }
 
+/// Resolve the decoder's KV context ceiling for the native pipeline path.
+///
+/// The native decoder's per-directory model path (`.../decoder/model.onnx`) has
+/// no metadata sidecar of its own, so the single-decoder auto-resolution from
+/// the model directory cannot see the model's `max_sequence_length`. Without it
+/// the CUDA KV capacity falls back to `usize::MAX` and the mask reservation
+/// overflows before decode can start. Read the pipeline package's declared
+/// context length instead: the native `inference_metadata.{yaml,yml,json}`
+/// sidecar's `model.max_sequence_length` first, then the compatibility
+/// `genai_config.json` context length. `None` preserves the prior unbounded
+/// behavior for packages that declare neither.
+#[cfg_attr(
+    not(feature = "native-backend"),
+    allow(
+        dead_code,
+        reason = "the declared context length is read only by the native decoder"
+    )
+)]
+fn pipeline_metadata_max_len(directory: &onnx_genai_ort::PipelineModelDirectory) -> Option<usize> {
+    if let Some(path) = directory.metadata_path.as_ref()
+        && let Ok(metadata) = onnx_genai_metadata::load_metadata(path)
+        && let Some(len) = metadata.model.and_then(|model| model.max_sequence_length)
+    {
+        return Some(len);
+    }
+    onnx_genai_genai_config::find_in_dir(&directory.root)
+        .and_then(|path| onnx_genai_genai_config::load(&path).ok())
+        .and_then(|config| config.max_sequence_length())
+}
+
 /// Build the native device-KV [`PipelineDecoderComponent`] for `decoder`, loading
 /// its ONNX model as a [`NativeDecodeSession`](crate::native_decode::NativeDecodeSession)
 /// on the native backend so its KV cache stays session-resident across steps.
@@ -493,13 +568,20 @@ fn build_step_component_session<'a>(
 /// nothing from the pipeline decode state. Requesting the native decoder in a
 /// build without the `native-backend` feature is a clear error, mirroring
 /// [`build_step_component_session`].
+#[cfg_attr(not(feature = "native-backend"), allow(unused_variables))]
 fn build_native_pipeline_decoder(
     models: &PipelineModels,
     decoder: &str,
     config_device: Option<&crate::native_decode_device::NativeDecodeDevice>,
+    memory_strategy_plan: &MemoryStrategyPlan,
+    #[cfg(feature = "cuda")] governor: std::sync::Arc<
+        dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync,
+    >,
 ) -> anyhow::Result<Box<dyn PipelineDecoderComponent + 'static>> {
     #[cfg(feature = "native-backend")]
     {
+        #[cfg(not(feature = "cuda"))]
+        let _ = memory_strategy_plan;
         let path =
             models.directory.model_paths.get(decoder).with_context(|| {
                 format!("native pipeline decoder '{decoder}' has no model path")
@@ -522,6 +604,11 @@ fn build_native_pipeline_decoder(
             path,
             native_decoder_device(config_device),
             io,
+            pipeline_metadata_max_len(&models.directory),
+            #[cfg(feature = "cuda")]
+            crate::engine::cuda_policy_from_memory_strategy_plan(memory_strategy_plan),
+            #[cfg(feature = "cuda")]
+            governor,
         )?;
         Ok(Box::new(native))
     }
@@ -529,6 +616,7 @@ fn build_native_pipeline_decoder(
     {
         let _ = models;
         let _ = config_device;
+        let _ = memory_strategy_plan;
         anyhow::bail!(
             "decoder '{decoder}' was requested on the native backend via \
              ONNX_GENAI_PIPELINE_NATIVE_DECODER, but this build was compiled without the \
@@ -621,6 +709,14 @@ impl Engine {
         PipelineEngine::from_dir_with_config(pipeline_dir, config)
     }
 
+    pub fn from_pipeline_dir_with_memory_authority_provider(
+        pipeline_dir: &Path,
+        config: EngineConfig,
+        provider: Arc<dyn MemoryAuthorityProvider>,
+    ) -> anyhow::Result<PipelineEngine> {
+        PipelineEngine::from_dir_with_memory_authority_provider(pipeline_dir, config, provider)
+    }
+
     /// Load a pipeline directory with a custom [`SchedulerRegistry`] so users
     /// can plug in their own [`Scheduler`] implementations.
     pub fn from_pipeline_dir_with_schedulers(
@@ -681,6 +777,22 @@ impl PipelineEngine {
             config,
             &SchedulerRegistry::builtin(),
             session_options,
+            None,
+        )
+    }
+
+    /// Load a pipeline using a caller-owned device authority provider.
+    pub fn from_dir_with_memory_authority_provider(
+        pipeline_dir: &Path,
+        config: EngineConfig,
+        provider: Arc<dyn MemoryAuthorityProvider>,
+    ) -> anyhow::Result<Self> {
+        Self::build(
+            pipeline_dir,
+            config,
+            &SchedulerRegistry::builtin(),
+            SessionOptions::default(),
+            Some(provider),
         )
     }
 
@@ -693,7 +805,13 @@ impl PipelineEngine {
         config: EngineConfig,
         schedulers: &SchedulerRegistry,
     ) -> anyhow::Result<Self> {
-        Self::build(pipeline_dir, config, schedulers, SessionOptions::default())
+        Self::build(
+            pipeline_dir,
+            config,
+            schedulers,
+            SessionOptions::default(),
+            None,
+        )
     }
 
     fn build(
@@ -701,8 +819,29 @@ impl PipelineEngine {
         config: EngineConfig,
         schedulers: &SchedulerRegistry,
         session_options: SessionOptions,
+        authority_provider: Option<SharedMemoryAuthorityProvider>,
     ) -> anyhow::Result<Self> {
-        let decode_backend = requested_decode_backend(config.decode_backend)?;
+        // Explicit backend requests must fail before touching the model
+        // directory. In particular, a binary without native support should
+        // report the actionable rebuild error even when the path is invalid.
+        let decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
+        let authority_domain = crate::engine::session_device_domain(&session_options)?;
+        crate::engine::validate_shared_authority_limit(
+            authority_provider.as_ref(),
+            &authority_domain,
+            config.limits.vram_limit,
+        )?;
+        let directory = PipelineModelDirectory::load(pipeline_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {e}"))?;
+        let model_weights_bytes =
+            directory
+                .model_paths
+                .values()
+                .try_fold(0_u64, |total, path| {
+                    total
+                        .checked_add(onnx_genai_ort::model_weight_bytes(path))
+                        .ok_or_else(|| anyhow::anyhow!("pipeline component weight size overflow"))
+                })?;
         // Select ONE backend for the whole pipeline (never a mix). Explicit
         // backends resolve without touching the model directory (so a bad
         // request fails fast); `Auto` inspects the components' declared
@@ -710,12 +849,209 @@ impl PipelineEngine {
         let backend = match decode_backend {
             EngineDecodeBackend::Ort => PipelineBackend::Ort,
             EngineDecodeBackend::Native => PipelineBackend::Native,
-            EngineDecodeBackend::Auto => {
-                let directory = PipelineModelDirectory::load(pipeline_dir)
-                    .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {e}"))?;
-                resolve_auto_pipeline_backend(&directory)?
-            }
+            EngineDecodeBackend::Auto => resolve_auto_pipeline_backend(&directory)?,
         };
+        let plan = PipelinePlan::from_spec(&directory.spec, schedulers)?;
+        let graph_memory = combine_graph_memory(
+            directory
+                .model_paths
+                .values()
+                .map(|path| analyze_model_memory(path)),
+            matches!(&plan, PipelinePlan::Iterative(_)),
+        );
+        let minimum_useful_weight_budget_bytes = graph_memory
+            .per_layer_weight_bytes
+            .iter()
+            .map(|layer| layer.bytes)
+            .max()
+            .unwrap_or(0);
+        let memory_strategy_kv_config = match &plan {
+            PipelinePlan::Autoregressive(ar) => {
+                let path = directory.model_paths.get(&ar.decoder).with_context(|| {
+                    format!("pipeline decoder '{}' has no model path", ar.decoder)
+                })?;
+                let decoder_io = directory
+                    .spec
+                    .models
+                    .get(&ar.decoder)
+                    .and_then(|component| component.io.as_ref());
+                let kv_inputs = decoder_io
+                    .and_then(|io| io.kv_inputs.clone())
+                    .unwrap_or_default();
+                let kv_outputs = decoder_io
+                    .and_then(|io| io.kv_outputs.clone())
+                    .unwrap_or_default();
+                let graph_io = onnx_genai_ort::graph_io_from_model_path_for_kv_pairs(
+                    path,
+                    &kv_inputs,
+                    &kv_outputs,
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to read pipeline decoder '{}' KV graph I/O",
+                        ar.decoder
+                    )
+                })?;
+                let kv_model = infer_kv_model_info(
+                    &graph_io,
+                    decoder_io,
+                    config.page_size,
+                    config.kv_cache_dtype,
+                )?;
+                match kv_model.as_ref() {
+                    Some(kv_model) => crate::engine::governor_kv_config(Some(kv_model), &config)?,
+                    None => crate::engine::governor_no_paged_kv_config(&config)?,
+                }
+            }
+            _ => crate::engine::governor_no_paged_kv_config(&config)?,
+        };
+        // Resolve the fractional VRAM limit against the real device capacity
+        // when the native CUDA pipeline path is active; otherwise the
+        // provisional 8 GiB constant would cap leases far below a large model's
+        // resident weights on any GPU.
+        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        let pipeline_cuda_index = if backend == PipelineBackend::Native {
+            native_decoder_device(config.native_device.as_ref()).cuda_index()
+        } else {
+            None
+        };
+        #[cfg(not(all(feature = "cuda", feature = "native-backend")))]
+        let pipeline_cuda_index: Option<u32> = None;
+        // The device (VRAM) capacity stays honestly `None` when it cannot be
+        // measured (#947): it is reported verbatim as `resolved_device_budget`
+        // and never borrows the host tier. The residency verdict is a separate,
+        // still-knowable fact, sized against the physical hot tier the weights
+        // will really occupy: the measured VRAM budget when the pipeline targets
+        // a queryable device, else the measured host-RAM ceiling. Unknown device
+        // *capacity* must not turn a resident model into `Unknown`.
+        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits, pipeline_cuda_index)?;
+        let residency_ceiling_bytes =
+            resolve_memory_strategy_hot_tier_bytes(&config.limits, pipeline_cuda_index)?;
+        #[cfg(feature = "cuda")]
+        let memory_strategy_overrides = crate::engine::memory_strategy_overrides_from_cuda_env(
+            onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env(),
+        );
+        #[cfg(not(feature = "cuda"))]
+        let memory_strategy_overrides = crate::engine::MemoryStrategyOverrides::default();
+        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        let native_cuda_plan = backend == PipelineBackend::Native
+            && matches!(
+                native_decoder_device(config.native_device.as_ref()),
+                crate::native_decode_device::NativeDecodeDevice::Cuda { .. }
+            );
+        #[cfg(not(all(feature = "cuda", feature = "native-backend")))]
+        let native_cuda_plan = false;
+        // #971: on the native CPU pipeline path each component's MatMulNBits
+        // kernel may build a resident dequantised f32 weight cache held for the
+        // session. Ask the CPU EP (which owns kernel dispatch) how many extra
+        // bytes each component's cache costs, summed, so the plan accounts for
+        // the real resident footprint instead of the on-disk size (#947). CUDA
+        // and ORT use different kernels, so it never applies there.
+        #[cfg(feature = "native-backend")]
+        let pipeline_resident_f32_cache_bytes = if backend == PipelineBackend::Native
+            && !native_cuda_plan
+        {
+            directory
+                .model_paths
+                .values()
+                .map(|path| {
+                    onnx_runtime_loader::load_model(path)
+                        .map(|graph| onnx_runtime_ep_cpu::resident_dequant_f32_cache_bytes(&graph))
+                        .unwrap_or(0)
+                })
+                .fold(0_u64, |total, bytes| total.saturating_add(bytes))
+        } else {
+            0
+        };
+        #[cfg(not(feature = "native-backend"))]
+        let pipeline_resident_f32_cache_bytes = 0_u64;
+        // #755: managed no-spill VMM is the default on the native CUDA pipeline
+        // path unless the legacy allocator opt-out is set. Other backends keep
+        // the pre-#755 explicit-byte-limit trigger.
+        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        let pipeline_managed_vmm = if native_cuda_plan {
+            crate::engine::managed_vmm_default_enabled()
+        } else {
+            matches!(config.limits.vram_limit, crate::ResourceLimit::Bytes(_))
+        };
+        #[cfg(not(all(feature = "cuda", feature = "native-backend")))]
+        let pipeline_managed_vmm =
+            matches!(config.limits.vram_limit, crate::ResourceLimit::Bytes(_));
+        let memory_strategy_plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
+            config: &config,
+            resolved_vram_bytes,
+            residency_ceiling_bytes,
+            model_weight_bytes: model_weights_bytes,
+            resident_f32_cache_bytes: pipeline_resident_f32_cache_bytes,
+            kv_config: memory_strategy_kv_config,
+            graph: graph_memory,
+            required_device_non_weight_bytes: 0,
+            minimum_useful_weight_budget_bytes,
+            #[cfg(feature = "cuda")]
+            default_dynamic_device_budget_bytes: Some(
+                onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES,
+            ),
+            #[cfg(not(feature = "cuda"))]
+            default_dynamic_device_budget_bytes: None,
+            inferred_policy_enabled: pipeline_managed_vmm
+                || matches!(config.limits.vram_limit, crate::ResourceLimit::Bytes(_)),
+            managed_vmm: pipeline_managed_vmm,
+            overrides: memory_strategy_overrides,
+            advisory_only: !native_cuda_plan,
+            // #864: WDDM shared-memory fallback is a Windows platform property.
+            shared_memory_weight_fallback: cfg!(windows),
+            force_managed_weight_streaming: crate::engine::force_managed_weight_streaming_enabled(),
+        });
+        log_memory_strategy_plan(&memory_strategy_plan, "pipeline");
+        // #971: tell the CPU EP whether the governor admitted the resident f32
+        // decode cache for the native pipeline path (no-op for ORT/CUDA, which
+        // pass 0 bytes and thus always report admitted).
+        #[cfg(feature = "native-backend")]
+        onnx_runtime_ep_cpu::set_resident_dequant_f32_cache_enabled(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
+        // #1027: same admission verdict governs the int4 accuracy_level=0 MLAS
+        // SQNBit packed buffer (folded into `resident_f32_cache_bytes`); when
+        // declined the kernel keeps the borrowed zero-copy int4 path.
+        #[cfg(feature = "native-backend")]
+        onnx_runtime_ep_cpu::set_mlas_sqnbit_packing_enabled(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
+        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        let authority_domain = if backend == PipelineBackend::Native {
+            match native_decoder_device(config.native_device.as_ref()) {
+                crate::native_decode_device::NativeDecodeDevice::Cuda { index } => {
+                    crate::memory_authority::DeviceCompatibilityDomain::Cuda(index.unwrap_or(0))
+                }
+                _ => authority_domain,
+            }
+        } else {
+            authority_domain
+        };
+        // Reserve every component's package bytes before constructing the
+        // first session. Native CUDA components and their VMM pool share this
+        // same authority, including in standalone pipelines.
+        let resource_governor = component_governor(
+            &config,
+            None,
+            model_weights_bytes,
+            pipeline_cuda_index,
+            authority_provider.as_ref(),
+            &authority_domain,
+        )?;
+        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        let native_cuda_authority = if backend == PipelineBackend::Native {
+            match native_decoder_device(config.native_device.as_ref()) {
+                crate::native_decode_device::NativeDecodeDevice::Cuda { .. } => {
+                    Some(resource_governor.device_authority())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        #[cfg(all(feature = "cuda", not(feature = "native-backend")))]
+        let native_cuda_authority = None;
         if backend == PipelineBackend::Native {
             // The native backend constructs every declared component through the
             // backend-neutral `ComponentSession` seam (GAP 1). When the crate is
@@ -733,20 +1069,38 @@ impl PipelineEngine {
             // autoregressive are not yet wired for native and are rejected once
             // the plan is known (below), rather than at construction.
         }
+        let native_ort_skips = if backend == PipelineBackend::Native {
+            match &plan {
+                // The native backend runs every component through native nxrt
+                // sessions: the decoder and every_step components in the decode
+                // loop, and any prompt-phase component (e.g. a vision encoder or
+                // an embeds fuser) lazily in the prologue. Building ORT sessions
+                // for them would be redundant and, for graphs using native-only
+                // operators (bf16 `Where`, int4 `MatMulNBits`), would make ORT
+                // reject the model at load. So skip ORT for all of them and keep
+                // only their session-free graph I/O for decode resolution.
+                PipelinePlan::Autoregressive(_) => directory
+                    .model_paths
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                _ => BTreeSet::new(),
+            }
+        } else {
+            BTreeSet::new()
+        };
         let models = if backend == PipelineBackend::Native {
-            // The native backend drives every component through the native nxrt
-            // `ComponentSession` seam, so an ORT `Session` for any of them would
-            // be redundant — and a native-only operator (for example a QMoE
-            // artifact whose fp16 I/O + fp32 scales ORT's op type-checker rejects
-            // at load) would abort the whole pipeline load. Skip ORT session
-            // construction and resolve each component's decode contract from its
-            // session-free graph metadata instead (see `PipelineModels::graph_io`).
-            PipelineModels::load_with_ort_session_filter(pipeline_dir, session_options, |_| false)
+            // The native flat-AR backend drives every component through native
+            // nxrt sessions, so ORT sessions would be redundant and can reject
+            // native-only operators. Prompt-phase components run natively in the
+            // prologue (built lazily by `run_prompt_phase_components`).
+            PipelineModels::load_with_ort_session_filter(pipeline_dir, session_options, |name| {
+                !native_ort_skips.contains(name)
+            })
         } else {
             PipelineModels::load_with_options(pipeline_dir, session_options)
         }
         .map_err(|e| anyhow::anyhow!("Failed to load pipeline models: {e}"))?;
-        let plan = PipelinePlan::from_spec(&models.directory.spec, schedulers)?;
         // GAP-3 Inc-A wires native decode only for the flat autoregressive plan.
         // Any other strategy on the native backend is surfaced with a precise,
         // actionable error naming the still-unwired path (rather than a blanket
@@ -760,6 +1114,7 @@ impl PipelineEngine {
         // therefore need a `DecodeState` + KV model info. Single-pass and
         // iterative (diffusion) pipelines run tensors through `run_pipeline`.
         let mut paged: Option<PipelinePagedKv> = None;
+        let mut kv_governor = None;
         let (decoder_state, tokenizer_component, fixed_state_budget_bytes) = match &plan {
             PipelinePlan::Autoregressive(ar) => {
                 let decoder = models
@@ -777,7 +1132,20 @@ impl PipelineEngine {
                     config.page_size,
                     config.kv_cache_dtype,
                 )?;
-                let component_governor = component_governor(&config, kv_model.as_ref())?;
+                let kv_config = match kv_model.as_ref() {
+                    Some(kv_model) => crate::engine::governor_kv_config(Some(kv_model), &config)?,
+                    None => crate::engine::governor_no_paged_kv_config(&config)?,
+                };
+                let component_governor = EngineResourceGovernor::new_for_shared_pipeline_kv(
+                    config.limits.clone(),
+                    config.allow_runtime_override,
+                    kv_config,
+                    resource_governor.snapshot().vram.used,
+                    pipeline_cuda_index,
+                    authority_provider.as_ref(),
+                    &authority_domain,
+                )
+                .context("failed to resolve the shared pipeline KV memory budget")?;
                 let fixed_state_budget_bytes =
                     component_governor.snapshot().resolved_limits.host_ram_bytes;
                 let pipeline_pages = match kv_model.as_ref() {
@@ -796,28 +1164,30 @@ impl PipelineEngine {
                 // carried into arithmetic that assumes it is positive.
                 paged = match kv_model.filter(|kv_model| kv_model.tensor_config.page_size > 0) {
                     Some(kv_model) => Some(PipelinePagedKv {
-                        cache: PagedKvCache::new_leased(
-                            kv_model.tensor_config.page_size,
-                            kv_model.tensor_config.dtype,
-                            kv_model.layer_configs.clone(),
-                            pipeline_pages,
-                            component_governor.memory(),
-                            onnx_runtime_memory_governor::Tier::Device,
-                            PIPELINE_KV_POOL_HOLDER,
-                        )
-                        .with_context(|| {
-                            format!(
-                                "cannot allocate the pipeline KV page pool: {pipeline_pages} \
-                                 page(s) across {} layer(s) do not fit the device KV budget",
-                                kv_model.layer_configs.len()
+                        cache: component_governor
+                            .plan()
+                            .kv_pool(
+                                crate::engine::memory_plan::Holder::PipelineKvPool,
+                                kv_model.tensor_config.page_size,
+                                kv_model.tensor_config.dtype,
+                                kv_model.layer_configs.clone(),
+                                pipeline_pages,
                             )
-                        })?,
+                            .with_context(|| {
+                                format!(
+                                    "cannot allocate the pipeline KV page pool: {pipeline_pages} \
+                                 page(s) across {} layer(s) do not fit the resolved KV/host \
+                                 memory budget",
+                                    kv_model.layer_configs.len()
+                                )
+                            })?,
                         kv_model,
                         prefix: PrefixCache::new(),
                         active: None,
                     }),
                     None => None,
                 };
+                kv_governor = Some(component_governor);
                 let decoder_io = models
                     .directory
                     .spec
@@ -859,6 +1229,9 @@ impl PipelineEngine {
         };
         Ok(Self {
             models,
+            resource_governor,
+            _kv_governor: kv_governor,
+            memory_strategy_plan,
             plan,
             decode_backend: match backend {
                 PipelineBackend::Ort => EngineDecodeBackend::Ort,
@@ -874,7 +1247,52 @@ impl PipelineEngine {
             retained: None,
             paged,
             native_device: config.native_device.clone(),
+            native_prompt_sessions: RefCell::new(BTreeMap::new()),
+            #[cfg(feature = "cuda")]
+            native_cuda_authority,
         })
+    }
+
+    pub fn resource_snapshot(&self) -> onnx_genai_scheduler::GovernorSnapshot {
+        #[cfg(feature = "cuda")]
+        {
+            let mut snapshot = self.resource_governor.snapshot();
+            if let Some(authority) = &self.native_cuda_authority {
+                snapshot.vram.used = authority.used_bytes();
+                snapshot.vram.limit = authority.limit_bytes();
+                snapshot.vram.headroom = authority.headroom_bytes();
+                snapshot.resolved_limits.vram_bytes = Some(authority.limit_bytes());
+            }
+            snapshot
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            self.resource_governor.snapshot()
+        }
+    }
+
+    pub fn memory_strategy_plan(&self) -> &MemoryStrategyPlan {
+        &self.memory_strategy_plan
+    }
+
+    pub fn models(&self) -> &PipelineModels {
+        &self.models
+    }
+
+    pub fn device_authority(&self) -> crate::memory_authority::DeviceMemoryAuthority {
+        #[cfg(feature = "cuda")]
+        if let Some(authority) = &self.native_cuda_authority {
+            return authority.clone();
+        }
+        self.resource_governor.device_authority()
+    }
+
+    pub fn set_vram_limit(
+        &self,
+        limit: onnx_genai_scheduler::ResourceLimit,
+    ) -> Result<onnx_genai_scheduler::GovernorReconfigureOutcome, crate::engine::EngineGovernorError>
+    {
+        self.resource_governor.set_vram_limit(limit)
     }
 
     /// Generate text from a pipeline with no extra non-text tensors.
@@ -897,15 +1315,30 @@ impl PipelineEngine {
         pipeline_request: PipelineGenerateRequest,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        self.generate_with_callbacks(pipeline_request, None, callback)
+    }
+
+    /// Generate text with a pre-token admission callback. For a native routed
+    /// decoder, admission fires only after exact step inputs have prepared and
+    /// reserved governed workspace.
+    pub fn generate_with_callbacks(
+        &mut self,
+        pipeline_request: PipelineGenerateRequest,
+        mut admission: Option<&mut dyn FnMut()>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
         // A nested-AR (multi-decoder TTS) pipeline drives its own outer/inner
         // loops; `generate` returns the flattened per-frame code tokens (use
         // `synthesize` to also run the post-decode vocoder into a waveform).
         if matches!(self.plan, PipelinePlan::NestedAutoregressive(_)) {
+            if let Some(admitted) = admission.as_mut() {
+                admitted();
+            }
             return self
                 .run_nested_autoregressive(pipeline_request)
                 .map(|(result, _pool)| result);
         }
-        self.run_autoregressive(pipeline_request, callback)
+        self.run_autoregressive(pipeline_request, admission, callback)
             .map(|(result, _pool)| result)
     }
 
@@ -933,7 +1366,7 @@ impl PipelineEngine {
         if matches!(self.plan, PipelinePlan::NestedAutoregressive(_)) {
             return self.synthesize_nested(pipeline_request);
         }
-        let (generation, mut tensors) = self.run_autoregressive(pipeline_request, None)?;
+        let (generation, mut tensors) = self.run_autoregressive(pipeline_request, None, None)?;
         let ar = self.plan.autoregressive_plan()?.clone();
 
         // Publish the AR decoder's generated code sequence into the shared pool
@@ -2404,6 +2837,20 @@ fn require_component_logits_output(spec: &PipelineSpec, component: &str) -> anyh
 }
 
 fn component_phase(spec: &PipelineSpec, component: &str, decoder: &str) -> PhaseRunOn {
+    // An embeds-driven decoder (`sequence_source: inputs_embeds`) must be fed a
+    // fresh embedding for the single running token on every decode step, so the
+    // upstream component that produces its `inputs_embeds` runs `every_step`
+    // even when the model package labels it `prompt_only`. A prompt-only
+    // embedding would run once over the prompt and leave the decoder consuming
+    // stale prefill embeddings for every generated token (a shape mismatch at
+    // best, silently wrong output at worst). This mirrors the `muse_decode`
+    // harness, which re-embeds the running token each step. The reclassification
+    // is scoped to the single dataflow producer of the decoder's `inputs_embeds`
+    // port, so cached conditioning producers (e.g. a vision encoder feeding the
+    // embedder's image features) keep their declared `prompt_only` phase.
+    if decoder_embeds_producer(spec, decoder).as_deref() == Some(component) {
+        return PhaseRunOn::EveryStep;
+    }
     spec.phases
         .get(component)
         .map(|phase| phase.run_on.clone())
@@ -2414,6 +2861,32 @@ fn component_phase(spec: &PipelineSpec, component: &str, decoder: &str) -> Phase
                 PhaseRunOn::PromptOnly
             }
         })
+}
+
+/// The pipeline component that produces an embeds-driven `decoder`'s
+/// `inputs_embeds`, or `None` for a token-id-driven decoder (or when no dataflow
+/// edge feeds the embeds port).
+///
+/// Resolved structurally from metadata: the decoder must declare
+/// `sequence_source: inputs_embeds` with an `inputs_embeds_input` port, and some
+/// other component must feed that port over a dataflow edge. This is the single
+/// upstream embedder whose phase [`component_phase`] promotes to `every_step`.
+fn decoder_embeds_producer(spec: &PipelineSpec, decoder: &str) -> Option<String> {
+    let io = spec
+        .models
+        .get(decoder)
+        .and_then(|model| model.io.as_ref())?;
+    if io.sequence_source != Some(SequenceInputKind::InputsEmbeds) {
+        return None;
+    }
+    let embeds_port = io.inputs_embeds_input.as_deref()?;
+    let target = format!("{decoder}.{embeds_port}");
+    spec.dataflow
+        .iter()
+        .find(|edge| edge.to == target)
+        .and_then(|edge| endpoint_component(&edge.from))
+        .filter(|from| *from != decoder)
+        .map(str::to_string)
 }
 
 fn topological_components(spec: &PipelineSpec) -> anyhow::Result<Vec<String>> {

@@ -53,6 +53,7 @@ use interactive::{
 };
 use model_inspection::{list, show, version};
 use onnx_genai::engine::EngineDecodeBackend;
+use onnx_genai::engine::native_decode_device::NativeDecodeDevice;
 use onnx_genai::text_to_audio::TextToAudioRequest;
 use onnx_genai::text_to_image::{TextToImageRequest, VaeDecoder};
 use onnx_genai::{EngineConfig, GenerateOptions, SamplingOverrides, StopSequence};
@@ -268,6 +269,52 @@ struct EngineArgs {
     /// Host RAM ceiling for the warm offload tier, in the same format.
     #[arg(long, value_name = "LIMIT", value_parser = parse_limit)]
     host_ram_limit: Option<onnx_genai::engine::ResourceLimit>,
+
+    /// Device the native decode backend runs on: `cpu`, `cuda`, `cuda:N`, or
+    /// `auto`.
+    ///
+    /// `auto` (the default) takes the device from the model's declared execution
+    /// providers. Most exported models declare none, which resolves to the CPU —
+    /// so on a machine with a GPU, `--backend native` alone will still run on the
+    /// CPU unless you say `--device cuda` (#1064). Ignored by the ORT backend,
+    /// which selects providers from the model's own session options.
+    #[arg(long, value_name = "auto|cpu|cuda[:N]", value_parser = parse_native_device)]
+    device: Option<NativeDeviceChoice>,
+}
+
+/// A `--device` value. `Auto` is distinct from an absent flag only in intent;
+/// both defer to the model's declared providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeDeviceChoice {
+    Auto,
+    Cpu,
+    Cuda(Option<u32>),
+}
+
+/// Parse a `--device` value.
+///
+/// Refuses anything else rather than silently falling back: a user who asks for
+/// a device they cannot have should be told, not quietly given the CPU. That
+/// silent fallback is exactly what #1064 documents.
+fn parse_native_device(input: &str) -> Result<NativeDeviceChoice, String> {
+    let raw = input.trim();
+    let lowered = raw.to_ascii_lowercase();
+    match lowered.as_str() {
+        "auto" => Ok(NativeDeviceChoice::Auto),
+        "cpu" => Ok(NativeDeviceChoice::Cpu),
+        "cuda" | "gpu" => Ok(NativeDeviceChoice::Cuda(None)),
+        _ => match lowered.strip_prefix("cuda:") {
+            Some(index) => index
+                .parse::<u32>()
+                .map(|index| NativeDeviceChoice::Cuda(Some(index)))
+                .map_err(|_| {
+                    format!("'{raw}' is not a valid device: expected a CUDA index, as in 'cuda:0'")
+                }),
+            None => Err(format!(
+                "'{raw}' is not a valid device: expected 'auto', 'cpu', 'cuda', or 'cuda:N'"
+            )),
+        },
+    }
 }
 
 impl EngineArgs {
@@ -281,6 +328,15 @@ impl EngineArgs {
         }
         if let Some(limit) = self.host_ram_limit {
             config.limits.host_ram_limit = limit;
+        }
+        match self.device {
+            None | Some(NativeDeviceChoice::Auto) => {}
+            Some(NativeDeviceChoice::Cpu) => {
+                config.native_device = Some(NativeDecodeDevice::Cpu);
+            }
+            Some(NativeDeviceChoice::Cuda(index)) => {
+                config.native_device = Some(NativeDecodeDevice::Cuda { index });
+            }
         }
         config
     }
@@ -559,9 +615,55 @@ struct GenerateArgs {
     #[arg(long)]
     no_stats: bool,
 
-    /// Prompt text.
-    #[arg(long, short = 'p')]
+    /// Prompt text. May also be given positionally after the model
+    /// (`generate MODEL "your prompt"`).
+    #[arg(long = "prompt", short = 'p', value_name = "PROMPT")]
+    prompt_flag: Option<String>,
+
+    /// Prompt text, given positionally.
+    #[arg(value_name = "PROMPT")]
+    prompt_positional: Option<String>,
+
+    /// The prompt resolved from either spelling. Not parsed from the command
+    /// line; filled by [`GenerateArgs::resolve_prompt`] before use.
+    #[arg(skip)]
     prompt: String,
+}
+
+impl GenerateArgs {
+    /// Accept the prompt positionally or as a flag, and fill [`Self::prompt`].
+    ///
+    /// `model` is positional while `prompt` was flag-only, so the two required
+    /// arguments of the same subcommand disagreed about how to be passed. That
+    /// asymmetry has no reason behind it and is not memorable: the coordinator
+    /// wrote `--model X --prompt Y` in a measurement runbook handed to the
+    /// repository owner, and clap rejected it.
+    ///
+    /// Supplying both spellings is an error rather than a silent precedence
+    /// rule, because someone who typed two different prompts has no preference
+    /// for us to guess at.
+    fn resolve_prompt(&mut self) -> Result<(), String> {
+        self.prompt = match (self.prompt_flag.take(), self.prompt_positional.take()) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "What: the prompt was given twice, once with --prompt/-p and once \
+                     positionally. Why: only one prompt can be generated from. How: drop \
+                     either the flag or the positional argument."
+                        .to_string(),
+                );
+            }
+            (Some(prompt), None) | (None, Some(prompt)) => prompt,
+            (None, None) => {
+                return Err(
+                    "What: no prompt was given. Why: `generate` needs text to continue. \
+                     How: pass it positionally (`generate MODEL \"your prompt\"`) or as \
+                     `--prompt \"your prompt\"`."
+                        .to_string(),
+                );
+            }
+        };
+        Ok(())
+    }
 }
 
 #[derive(Debug, Args)]
@@ -708,7 +810,12 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(run_serve(*serve_args))
         }
-        Commands::Generate(generate_args) => generate(*generate_args, &profiling),
+        Commands::Generate(mut generate_args) => {
+            generate_args
+                .resolve_prompt()
+                .map_err(|message| anyhow::anyhow!(message))?;
+            generate(*generate_args, &profiling)
+        }
         Commands::Run(run_args) => run_repl(run_args, &profiling),
         Commands::Transcribe(transcribe_args) => transcribe(*transcribe_args, &profiling),
         Commands::Show(show_args) => show(&show_args.model),
@@ -731,9 +838,48 @@ mod tests {
             Cli::try_parse_from(["onnx-genai", "generate", "./m", "--prompt", "hi"]).unwrap();
 
         match parsed_command_line.command {
-            Commands::Generate(args) => {
+            Commands::Generate(mut args) => {
+                args.resolve_prompt().expect("flag prompt resolves");
                 assert_eq!(args.model, PathBuf::from("./m"));
                 assert_eq!(args.prompt, "hi");
+            }
+            _ => panic!("expected generate command"),
+        }
+    }
+
+    #[test]
+    fn generate_accepts_a_positional_prompt() {
+        // `model` was positional while `prompt` was flag-only, so the two
+        // required arguments of one subcommand disagreed about how to be
+        // passed. That cost a real user a failed command, so both spellings
+        // work now.
+        let parsed_command_line =
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi"]).unwrap();
+
+        match parsed_command_line.command {
+            Commands::Generate(mut args) => {
+                args.resolve_prompt().expect("positional prompt resolves");
+                assert_eq!(args.model, PathBuf::from("./m"));
+                assert_eq!(args.prompt, "hi");
+            }
+            _ => panic!("expected generate command"),
+        }
+    }
+
+    #[test]
+    fn generate_rejects_a_prompt_given_twice() {
+        // Two different prompts is a mistake with no correct precedence rule,
+        // so it is an error rather than a silent choice.
+        let parsed_command_line =
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "positional", "-p", "flag"])
+                .unwrap();
+
+        match parsed_command_line.command {
+            Commands::Generate(mut args) => {
+                let error = args
+                    .resolve_prompt()
+                    .expect_err("two prompts must be rejected");
+                assert!(error.contains("twice"), "{error}");
             }
             _ => panic!("expected generate command"),
         }
@@ -745,7 +891,8 @@ mod tests {
             Cli::try_parse_from(["onnx-genai", "generate", "./m", "-p", "hi"]).unwrap();
 
         match parsed_command_line.command {
-            Commands::Generate(args) => {
+            Commands::Generate(mut args) => {
+                args.resolve_prompt().expect("short-flag prompt resolves");
                 assert_eq!(args.model, PathBuf::from("./m"));
                 assert_eq!(args.prompt, "hi");
             }
@@ -1125,8 +1272,21 @@ mod tests {
     }
 
     #[test]
-    fn generate_requires_prompt_flag() {
-        assert!(Cli::try_parse_from(["onnx-genai", "generate", "./m"]).is_err());
+    fn generate_requires_a_prompt_in_either_spelling() {
+        // Parsing now succeeds with neither spelling present -- the prompt is
+        // resolved afterwards -- so the rejection moved from clap to
+        // `resolve_prompt`, and the message has to carry its own weight.
+        let parsed = Cli::try_parse_from(["onnx-genai", "generate", "./m"]).unwrap();
+        match parsed.command {
+            Commands::Generate(mut args) => {
+                let error = args
+                    .resolve_prompt()
+                    .expect_err("a missing prompt must be rejected");
+                assert!(error.contains("no prompt was given"), "{error}");
+                assert!(error.contains("positionally"), "{error}");
+            }
+            _ => panic!("expected generate command"),
+        }
     }
 
     #[test]
@@ -1284,7 +1444,8 @@ mod tests {
         .unwrap();
 
         match parsed.command {
-            Commands::Generate(args) => {
+            Commands::Generate(mut args) => {
+                args.resolve_prompt().expect("prompt resolves");
                 let request = args.image_output.to_request(args.prompt.clone());
                 assert_eq!(
                     args.image_output.output_image,
@@ -1319,7 +1480,8 @@ mod tests {
         .unwrap();
 
         match parsed.command {
-            Commands::Generate(args) => {
+            Commands::Generate(mut args) => {
+                args.resolve_prompt().expect("prompt resolves");
                 let decoder = args
                     .image_output
                     .to_request(args.prompt.clone())
@@ -1776,6 +1938,67 @@ mod tests {
 
     #[test]
     fn a_toggle_reports_when_given_nothing_and_refuses_nonsense() {}
+
+    /// `--device` exists because `--backend native` alone silently ran on the CPU
+    /// on a GPU machine: device selection came only from the model's declared
+    /// execution providers, and typical exports declare none (#1064). Measured
+    /// 0 MiB of GPU memory across a whole native run before this flag existed.
+    #[test]
+    fn a_device_can_be_asked_for_explicitly_and_nonsense_is_refused() {
+        assert_eq!(parse_native_device("auto"), Ok(NativeDeviceChoice::Auto));
+        assert_eq!(parse_native_device("cpu"), Ok(NativeDeviceChoice::Cpu));
+        assert_eq!(
+            parse_native_device("cuda"),
+            Ok(NativeDeviceChoice::Cuda(None))
+        );
+        assert_eq!(
+            parse_native_device("CUDA:1"),
+            Ok(NativeDeviceChoice::Cuda(Some(1))),
+            "device names are case-insensitive"
+        );
+
+        // Refused rather than quietly resolved to the CPU: a silent fallback is
+        // the behaviour this flag exists to end.
+        let error = parse_native_device("cuda:x").expect_err("not a device index");
+        assert!(error.contains("cuda:0"), "{error}");
+        let error = parse_native_device("tpu").expect_err("not a device");
+        assert!(
+            error.contains("'auto', 'cpu', 'cuda', or 'cuda:N'"),
+            "{error}"
+        );
+    }
+
+    /// The flag has to reach `EngineConfig`, not merely parse. Absent and `auto`
+    /// both leave the engine's own resolution untouched.
+    #[test]
+    fn the_device_flag_reaches_the_engine_config() {
+        let args = EngineArgs::default();
+        assert!(
+            args.to_config().native_device.is_none(),
+            "an absent --device must not override the model's declared providers"
+        );
+
+        let auto = EngineArgs {
+            device: Some(NativeDeviceChoice::Auto),
+            ..EngineArgs::default()
+        };
+        assert!(auto.to_config().native_device.is_none());
+
+        let cuda = EngineArgs {
+            device: Some(NativeDeviceChoice::Cuda(Some(1))),
+            ..EngineArgs::default()
+        };
+        assert_eq!(
+            cuda.to_config().native_device,
+            Some(NativeDecodeDevice::Cuda { index: Some(1) })
+        );
+
+        let cpu = EngineArgs {
+            device: Some(NativeDeviceChoice::Cpu),
+            ..EngineArgs::default()
+        };
+        assert_eq!(cpu.to_config().native_device, Some(NativeDecodeDevice::Cpu));
+    }
 
     #[test]
     fn decode_backends_are_named_by_the_engine_not_guessed() {

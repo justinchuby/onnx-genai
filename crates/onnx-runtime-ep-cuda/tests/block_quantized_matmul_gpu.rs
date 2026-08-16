@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
 };
@@ -40,13 +54,15 @@ impl HostTensor {
     }
 }
 
-fn gpu() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -283,9 +299,13 @@ fn assert_close(actual: &[f32], expected: &[f32]) {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn block_quantized_gemv_random_supported_formats_match_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let (k, n) = (1003usize, 37usize);
     for format in [
         "mxfp4", "iq4_nl", "iq4_xs", "iq2_xxs", "iq3_xxs", "iq2_xs", "iq2_s", "iq3_s", "iq1_s",
@@ -306,9 +326,13 @@ fn block_quantized_gemv_random_supported_formats_match_cpu() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn block_quantized_gemm_prefill_matches_cpu_for_partial_and_grid_stride_tiles() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     for (format, a_shape, k, n, with_bias) in [
         ("mxfp4", vec![3, 99], 99usize, 13usize, true),
         ("iq4_xs", vec![1, 7, 515], 515usize, 11usize, false),
@@ -341,9 +365,13 @@ fn block_quantized_gemm_prefill_matches_cpu_for_partial_and_grid_stride_tiles() 
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn block_quantized_gemv_dequant_is_bit_exact_against_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let n = 2usize;
     for format in [
         "mxfp4", "iq4_nl", "iq4_xs", "iq2_xxs", "iq3_xxs", "iq2_xs", "iq2_s", "iq3_s", "iq1_s",
@@ -374,9 +402,13 @@ fn block_quantized_gemv_dequant_is_bit_exact_against_cpu() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn block_quantized_known_blocks_match_cpu_semantics_on_gpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     for (format, packed, depth, expected) in [
         (
             "mxfp4",
@@ -462,9 +494,13 @@ fn block_quantized_known_blocks_match_cpu_semantics_on_gpu() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn block_quantized_iq1_known_blocks_match_cpu_semantics_on_gpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let cases = [
         (
             "iq1_s",
@@ -510,9 +546,13 @@ fn block_quantized_iq1_known_blocks_match_cpu_semantics_on_gpu() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn supported_formats_and_prefill_route_to_cuda() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     for format in [
         "mxfp4", "iq4_nl", "iq4_xs", "iq2_xxs", "iq3_xxs", "iq2_xs", "iq2_s", "iq3_s", "iq1_s",
         "iq1_m",

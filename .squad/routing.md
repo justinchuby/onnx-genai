@@ -11,7 +11,7 @@ Maps work domains to team members. The coordinator uses this to dispatch.
 | 🍎 Metal / MPS | Nabil, Mariette, Coco, Freysa |
 | 🧮 CPU & Edge | Resch (Intel), Iran (Mac), Luba (ARM/QNN), Isidore (Bindings) |
 | 🌐 Server / API | Rachael, Zhora |
-| 🔎 Quality & Safety | Pris, Gaff, Luv, Chew, Holden, Rai, Fact Checker |
+| 🔎 Quality & Safety | Pris, Gaff, Luv, Chew, Holden, Rai, Fact Checker, Challenger |
 
 ## Domains
 
@@ -42,6 +42,7 @@ Maps work domains to team members. The coordinator uses this to dispatch.
 | Work queue, backlog, keep-alive | Ralph |
 | RAI review, content safety | Rai |
 | Claim verification, devil's advocate, pre-mortem | Fact Checker |
+| Counter-intuitive measurements, direction-setting results, "was the feature actually on?" | Challenger |
 
 ## Notes
 

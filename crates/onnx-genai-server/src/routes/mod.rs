@@ -26,11 +26,14 @@ use onnx_genai_engine::{
 use onnx_genai_metadata::GenerationDefaults;
 use onnx_genai_ort::{ChatMessage as TemplateChatMessage, ChatTemplate, Tokenizer};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    driver::{DriverEvent, EngineDriver, GenerateSubmitError},
+    driver::{
+        DriverEvent, DriverFailure, DriverFailureKind, DriverGeneration, EngineDriver,
+        GenerateSubmitError,
+    },
     multimodal::MultimodalInput,
     registry::ModelHandle,
     session::SessionRegistry,
@@ -78,6 +81,8 @@ pub(crate) use sessions::{create_session, delete_session};
 const SESSION_ID_HEADER: &str = "x-session-id";
 const MAX_SESSION_ID_LEN: usize = 128;
 const OVERLOAD_RETRY_AFTER_SECS: u64 = 1;
+const MEMORY_OVERLOAD_MESSAGE: &str =
+    "request exceeds the configured KV memory limit; retry later or reduce context/output length";
 const MAX_CHAT_TOP_LOGPROBS: usize = 20;
 const MAX_COMPLETION_LOGPROBS: usize = 5;
 /// Path of the downloadable Perfetto trace endpoint, reported by the trace
@@ -167,6 +172,14 @@ pub(crate) struct DebugKvResponse {
     available_admission_slots: usize,
     rejected_requests: u64,
     engine_kv_introspection: &'static str,
+    /// Whether the decode path can advance more than one sequence per step.
+    /// `active_batch_size` counts admitted generations, so it can be > 1 even
+    /// when `batch_supported` is false and nothing is actually co-decoded — this
+    /// pair is what makes the difference observable (issue #750).
+    batch_supported: bool,
+    /// The batch width that actually takes effect after clamping the requested
+    /// `--max-batch` to what the decode path can honor.
+    effective_max_batch: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,6 +190,56 @@ pub(crate) struct ResourcesResponse {
     vram: ResourceTier,
     host_ram: ResourceTier,
     disk_spill: Option<ResourceTier>,
+    /// Honest, decode-path-sourced batching capability for this model. Lets an
+    /// operator read `supported=false` / `effective_max_batch=1` directly rather
+    /// than inferring it from a debug-level log line (issue #750). `None` only
+    /// when the response is built without a resolved engine handle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batching: Option<BatchingInfo>,
+    /// Resolved memory strategy for this model: the chosen strategy, whether
+    /// weight streaming/offload is active, whether the managed no-spill VMM path
+    /// is the allocator, and the resolved device budget. Makes the #755 managed
+    /// VMM default observable rather than implicit. `None` when built without a
+    /// resolved engine handle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_strategy: Option<MemoryStrategyInfo>,
+}
+
+/// Operator-facing memory strategy report for `/v1/resources` (issue #755).
+#[derive(Debug, Serialize)]
+pub(crate) struct MemoryStrategyInfo {
+    /// Effective strategy the runtime applied (e.g. `FullResident`,
+    /// `DynamicWeightResidency`, `MoeRoutingAware`, `Compatibility`).
+    pub(crate) strategy: String,
+    /// Whether weight streaming/offload is active for this load.
+    pub(crate) weight_offload_enabled: bool,
+    /// Whether the managed no-spill VMM path (authority-scoped physical-handle
+    /// pool, committed-granule admission, no WDDM shared-memory spill) is the
+    /// allocator. `true` by default on native CUDA since #755.
+    pub(crate) managed_no_spill: bool,
+    /// Whether offload was auto-enabled by inference (model exceeds the resolved
+    /// device budget) rather than requested by an explicit override.
+    pub(crate) auto_enabled: bool,
+    /// The resolved device budget in bytes (committed physical bytes cap).
+    pub(crate) resolved_device_budget_bytes: Option<u64>,
+    /// The managed VMM committed-byte ceiling, when the managed path is active.
+    pub(crate) managed_limit_bytes: Option<u64>,
+    /// Whether the model weights fit the resolved device budget.
+    pub(crate) fits_resolved_device_budget: Option<bool>,
+}
+
+/// Operator-facing batching capability report for `/v1/resources`.
+#[derive(Debug, Serialize)]
+pub(crate) struct BatchingInfo {
+    /// Whether the decode path can advance more than one sequence per step.
+    pub(crate) supported: bool,
+    /// The `--max-batch` width the operator requested (or the server default).
+    pub(crate) requested_max_batch: u64,
+    /// The width that actually takes effect after clamping to the decode path's
+    /// structural limit.
+    pub(crate) effective_max_batch: u64,
+    /// Human-readable explanation naming the backend / decode path.
+    pub(crate) reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,7 +251,7 @@ struct ConfiguredResourceLimits {
 
 #[derive(Debug, Serialize)]
 struct ResolvedResourceLimits {
-    vram_bytes: u64,
+    vram_bytes: Option<u64>,
     host_ram_bytes: u64,
     disk_spill_bytes: Option<u64>,
 }
@@ -231,6 +294,7 @@ pub(crate) struct DebugProfileResponse {
     collecting: bool,
     note: &'static str,
     stages: Vec<ProfileStage>,
+    memory_strategy_plans: Vec<ModelMemoryStrategyPlan>,
 }
 
 #[derive(Debug, Serialize)]
@@ -239,6 +303,12 @@ pub(crate) struct ProfileStage {
     total_ms: f64,
     calls: u64,
     us_per_call: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ModelMemoryStrategyPlan {
+    model_id: String,
+    plan: onnx_genai_engine::MemoryStrategyPlan,
 }
 
 /// Discovery payload describing the downloadable Perfetto trace export.
@@ -307,6 +377,7 @@ struct ErrorBody {
 pub(crate) struct ApiError {
     status: StatusCode,
     message: String,
+    kind: &'static str,
     retry_after_secs: Option<u64>,
 }
 
@@ -333,6 +404,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            kind: "server_error",
             retry_after_secs: None,
         }
     }
@@ -341,6 +413,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            kind: "server_error",
             retry_after_secs: None,
         }
     }
@@ -349,6 +422,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
+            kind: "server_error",
             retry_after_secs: None,
         }
     }
@@ -357,6 +431,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
+            kind: "server_error",
             retry_after_secs: None,
         }
     }
@@ -365,6 +440,7 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
+            kind: "server_error",
             retry_after_secs: None,
         }
     }
@@ -373,7 +449,23 @@ impl ApiError {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: message.into(),
+            kind: "resource_limit_error",
             retry_after_secs: Some(OVERLOAD_RETRY_AFTER_SECS),
+        }
+    }
+}
+
+fn generation_failure(error: DriverFailure) -> ApiError {
+    match error.kind {
+        DriverFailureKind::MemoryOverload => {
+            tracing::warn!(
+                error = %error,
+                "generation rejected by the KV memory governor"
+            );
+            ApiError::too_many_requests(MEMORY_OVERLOAD_MESSAGE)
+        }
+        DriverFailureKind::Internal => {
+            ApiError::internal(format!("generation failed: {}", error.message))
         }
     }
 }
@@ -444,7 +536,7 @@ impl IntoResponse for ApiError {
         let body = Json(ErrorResponse {
             error: ErrorBody {
                 message: self.message,
-                kind: "server_error",
+                kind: self.kind,
             },
         });
         let mut response = (self.status, body).into_response();
@@ -537,4 +629,59 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod overload_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn memory_admission_failure_maps_to_stable_overload_response() {
+        let response = generation_failure(DriverFailure {
+            message: "scheduler admission failed: KV byte budget exhausted".to_string(),
+            kind: DriverFailureKind::MemoryOverload,
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["type"], "resource_limit_error");
+        assert_eq!(body["error"]["message"], MEMORY_OVERLOAD_MESSAGE);
+        assert!(!body.to_string().contains("scheduler admission failed"));
+    }
+
+    #[tokio::test]
+    async fn unreclaimable_mapped_capacity_is_a_pre_header_overload() {
+        let error: anyhow::Error = onnx_runtime_memory_governor::MemoryError::CapacityUnavailable {
+            tier: "device",
+            requested: 4096,
+            available: 0,
+            role: onnx_runtime_memory_governor::MemoryRole::KvCache,
+            detail: "mapped holder could not reach its tentative reclaim target".into(),
+        }
+        .into();
+        let response = generation_failure(DriverFailure::from_engine_error(&error)).into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["type"], "resource_limit_error");
+    }
+
+    #[test]
+    fn unrelated_generation_failure_remains_internal() {
+        let error = generation_failure(DriverFailure {
+            message: "backend execution failed".to_string(),
+            kind: DriverFailureKind::Internal,
+        });
+
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.kind, "server_error");
+    }
 }

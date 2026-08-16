@@ -445,6 +445,9 @@ impl Kernel for SpaceToDepthKernel {
             })
         }
         .map_err(|error| driver_err("launch space_to_depth_bytes", error))?;
+        if self.runtime.is_capturing()? {
+            return Ok(());
+        }
         self.runtime.synchronize()
     }
 
@@ -539,6 +542,9 @@ impl Kernel for EyeLikeKernel {
             })
         }
         .map_err(|error| driver_err("launch eye_like_bytes", error))?;
+        if self.runtime.is_capturing()? {
+            return Ok(());
+        }
         self.runtime.synchronize()
     }
 

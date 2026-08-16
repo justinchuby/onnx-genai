@@ -15,7 +15,7 @@ outs = sess.run(None, {"x": np.ones((1, 3), np.float32)})
 print(nxrt.__version__, nxrt.get_available_providers())
 ```
 
-See [`../../docs/PYTHON.md`](../../docs/PYTHON.md) for eager dispatch and text
+See [`../../docs/architecture/PYTHON.md`](../../docs/architecture/PYTHON.md) for eager dispatch and text
 generation quickstarts. The Python package intentionally does not include the
 HTTP webserver.
 
@@ -236,7 +236,7 @@ Arrays are copied to C-contiguous, little-endian layout automatically
 ## Wheels: `abi3` vs `abi3t`
 
 Two distinct wheels ship for two distinct CPython ABIs (see
-`docs/PIPELINE.md` §12.4):
+`docs/genai/PIPELINE.md` §12.4):
 
 | Wheel | ABI | Tag | Floor | Interpreter |
 |---|---|---|---|---|
@@ -308,5 +308,5 @@ tests) additionally runs when `onnx-tests` is installed, for 34 total.
 
 The full upstream matrix has also been run. See
 [`conformance/README.md`](conformance/README.md) and
-[`docs/EP_CONFORMANCE.md`](../../docs/EP_CONFORMANCE.md) for reproducible
+[`docs/execution/EP_CONFORMANCE.md`](../../docs/execution/EP_CONFORMANCE.md) for reproducible
 commands and the current CPU pass/fail/skip results.

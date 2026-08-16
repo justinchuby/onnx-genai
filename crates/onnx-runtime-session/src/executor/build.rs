@@ -375,30 +375,10 @@ pub(super) fn build_lazy_weight_handles(
     }
 
     let mut handles = HashMap::new();
-    for (&value, weight) in &graph.initializers {
-        let graph_value = graph.value(value);
-        let consumers = graph.consumers(value);
-        // A weight is offload-eligible only if it feeds exclusively into offload
-        // boundary ops (BlockQuantizedMoE, QMoE, or MatMulNBits) and nothing
-        // else. Capture the boundary from the first consumer so the lazy handle
-        // carries the right binding site.
-        let mut boundary = None;
-        let lazy_only = graph_value.producer.is_none()
-            && !graph.outputs.contains(&value)
-            && !consumers.is_empty()
-            && consumers.into_iter().all(|consumer| {
-                let node = graph.node(consumer);
-                match LazyWeightBoundary::for_op(&node.domain, &node.op_type) {
-                    Some(found) => {
-                        boundary.get_or_insert(found);
-                        true
-                    }
-                    None => false,
-                }
-            });
-        let Some(boundary) = boundary.filter(|_| lazy_only) else {
-            continue;
-        };
+    for candidate in lazy_weight_candidates(graph) {
+        let value = candidate.value;
+        let boundary = candidate.boundary;
+        let weight = &graph.initializers[&value];
         let Some((mapping_id, offset, len)) = weights.external_mmap_provenance(weight) else {
             continue;
         };
@@ -481,17 +461,28 @@ impl Executor {
             Self::classify_special_values(&graph, &order);
 
         // 3) Build the structural per-node plan.
-        let plan = Self::build_node_plan(&graph, &order, &value_dtypes, has_symbols);
+        let capabilities = ep.capabilities();
+        let plan = Self::build_node_plan(
+            &graph,
+            &order,
+            &value_dtypes,
+            has_symbols,
+            &weight_handles,
+            &capabilities,
+        );
 
         // 4) name → value id and the set of caller-required inputs.
         let (input_index, required_inputs, name_index) = Self::build_name_indexes(&graph);
 
         let plan_len = plan.len();
+        let capture_growing_symbols = compute_capture_disqualifying_symbols(&graph);
         let mut exec = Self {
             graph,
             weights,
             ep,
             weight_handles,
+            prefetch_issue_nodes: std::sync::Mutex::new(HashMap::new()),
+            prefetch_lookahead_nodes: dense_weight_prefetch_lookahead_nodes(),
             buffers,
             buffer_shapes,
             value_shapes,
@@ -514,10 +505,13 @@ impl Executor {
             capture_warm_shapes: HashMap::new(),
             capture_warm_seeded: HashMap::new(),
             capture_quarantine_ops: HashSet::new(),
+            capture_growing_symbols,
+            capacity_pinned_kv_symbols: HashSet::new(),
             last_capture_failed_node: None,
             views: HashMap::new(),
             pinned: HashSet::new(),
             sequence_values,
+            activation_memory_plan: None,
             shared_buffers: HashMap::new(),
             sequences: HashMap::new(),
             seq_elem_values: HashMap::new(),
@@ -544,6 +538,10 @@ impl Executor {
             scan_inline_single_trip_enabled: scan_inline_single_trip_env_enabled(),
             scan_inline_single_trip_count: 0,
             kernel_bindings: vec![None; plan_len],
+            persistent_workspace: None,
+            step_workspace: None,
+            inherited_workspace: None,
+            workspace_preparation_required: false,
         };
 
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole
@@ -1001,6 +999,8 @@ impl Executor {
         order: &[NodeId],
         value_dtypes: &HashMap<ValueId, DataType>,
         has_symbols: bool,
+        weight_handles: &HashMap<ValueId, WeightHandle>,
+        capabilities: &onnx_runtime_ep_api::ExecutionProviderCapabilities,
     ) -> Vec<NodePlan> {
         let mut plan_span = trace_span("session.execution_plan", "session");
         let mut plan = Vec::with_capacity(order.len());
@@ -1036,6 +1036,20 @@ impl Executor {
                 })
                 .collect();
             let output_dtypes: Vec<DataType> = outputs.iter().map(|v| value_dtypes[v]).collect();
+            let mut lazy_weight_inputs = Vec::new();
+            if LazyWeightBoundary::MatMul.matches(&node.domain, &node.op_type)
+                || LazyWeightBoundary::MatMulNBits.matches(&node.domain, &node.op_type)
+            {
+                for vid in inputs.iter().flatten() {
+                    if weight_handles
+                        .get(vid)
+                        .is_some_and(|handle| handle.is_lazy_for(capabilities))
+                        && !lazy_weight_inputs.contains(vid)
+                    {
+                        lazy_weight_inputs.push(*vid);
+                    }
+                }
+            }
             plan.push(NodePlan {
                 node_id: nid,
                 inputs,
@@ -1043,6 +1057,7 @@ impl Executor {
                 input_dtypes,
                 output_dtypes,
                 inplace_dead_inputs: Vec::new(),
+                lazy_weight_inputs,
             });
         }
         let graph_outputs: HashSet<ValueId> = graph.outputs.iter().copied().collect();
@@ -1669,6 +1684,8 @@ impl Executor {
                 .collect();
             let node = self.graph.node(node_id);
             let opset = effective_opset(&self.graph, node);
+            let seq_independent =
+                node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
             let (_, key) = self.cache.get_or_create(
                 node_id,
                 node,
@@ -1676,6 +1693,7 @@ impl Executor {
                 &input_dtypes,
                 &constant_inputs,
                 opset,
+                seq_independent,
                 self.ep.as_ref(),
             )?;
             // Pre-populate the kernel binding so the first decode step already
@@ -1733,6 +1751,42 @@ impl Executor {
                 physical_shape,
                 logical_shape,
                 expose_logical_input_shape,
+                allocation_bytes: None,
+                committed_ranges: None,
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn allocate_device_binding_committed(
+        &self,
+        input_name: String,
+        output_name: Option<String>,
+        dtype: DataType,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+        allocation_bytes: usize,
+        committed_ranges: Vec<std::ops::Range<usize>>,
+    ) -> Result<DeviceIoBinding> {
+        let expose_logical_input_shape = self.input_index.get(&input_name).is_some_and(|&vid| {
+            if output_name.is_some() {
+                !self.binding_consumers_use_physical_capacity(vid)
+            } else {
+                !self.binding_consumers_use_padded_capacity(vid)
+            }
+        });
+        DeviceIoBinding::allocate(
+            self.ep.clone(),
+            DeviceBindingSpec {
+                input_name,
+                bind_input: true,
+                output_name,
+                dtype,
+                physical_shape,
+                logical_shape,
+                expose_logical_input_shape,
+                allocation_bytes: Some(allocation_bytes),
+                committed_ranges: Some(committed_ranges),
             },
         )
     }
@@ -1785,6 +1839,8 @@ impl Executor {
                     physical_shape,
                     logical_shape,
                     expose_logical_input_shape,
+                    allocation_bytes: None,
+                    committed_ranges: None,
                 },
                 ptr,
                 len_bytes,
@@ -1809,6 +1865,8 @@ impl Executor {
                 physical_shape,
                 logical_shape,
                 expose_logical_input_shape: false,
+                allocation_bytes: None,
+                committed_ranges: None,
             },
         )
     }

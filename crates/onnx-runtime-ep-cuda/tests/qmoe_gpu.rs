@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
@@ -376,7 +390,7 @@ fn run_cpu(case: Case, inputs: &[Option<HostTensor>]) -> Vec<f32> {
 static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A live CUDA EP plus the held [`GPU_SERIAL`] guard. Derefs to the EP so every
-/// existing `gpu()` call site is unchanged.
+/// existing `require_cuda()` call site is unchanged.
 struct GpuGuard {
     ep: CudaExecutionProvider,
     _serial: std::sync::MutexGuard<'static, ()>,
@@ -389,19 +403,21 @@ impl std::ops::Deref for GpuGuard {
     }
 }
 
-fn gpu() -> Option<GpuGuard> {
+fn require_cuda() -> GpuGuard {
     // Ignore poisoning: a panicking test still leaves the device usable, and we
     // must not cascade one failure into spurious lock failures elsewhere.
     let serial = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(GpuGuard {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => GpuGuard {
             ep,
             _serial: serial,
-        }),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+        },
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -622,7 +638,7 @@ fn error_metrics(actual: &[f32], expected: &[f32]) -> (f32, u32) {
 }
 
 fn compare(case: Case, dtype: DataType) -> (f32, u32) {
-    let Some(ep) = gpu() else { return (0.0, 0) };
+    let ep = require_cuda();
     let gpu_inputs = case_inputs(case, dtype);
     let cpu_inputs = rounded_cpu_inputs(&gpu_inputs, dtype);
     let expected = run_cpu(case, &cpu_inputs);
@@ -659,7 +675,7 @@ fn compare_gemv_gemm_and_cpu(case: Case) {
     assert_eq!(case.rows, 6);
     assert_eq!(case.experts, 4);
     assert_eq!(case.top_k, 2);
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let mut inputs = case_inputs(case, DataType::Float32);
     inputs[1] = Some(HostTensor::f32(
         &[case.rows, case.experts],
@@ -698,6 +714,10 @@ fn activation_case(activation: &'static str, swiglu_fusion: usize, fc3: bool) ->
 
 macro_rules! activation_path_test {
     ($name:ident, $activation:literal, $fusion:expr, $separate_gate:expr) => {
+        #[cfg_attr(
+            not(feature = "gpu-tests"),
+            ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+        )]
         #[test]
         fn $name() {
             compare_gemv_gemm_and_cpu(activation_case($activation, $fusion, $separate_gate));
@@ -719,6 +739,70 @@ activation_path_test!(
 activation_path_test!(qmoe_swiglu_split_gemv_gemm_matches_cpu, "swiglu", 2, false);
 activation_path_test!(qmoe_identity_gemv_gemm_matches_cpu, "identity", 0, false);
 
+fn assert_fused_gate_up_decode_case(case: Case) {
+    assert_eq!(case.rows, 1);
+    assert!(case.rows * case.top_k <= 16);
+    assert!(
+        (case.fc3 && matches!(case.activation, "silu" | "swiglu"))
+            || (!case.fc3 && case.activation == "swiglu" && case.swiglu_fusion != 0),
+        "case must satisfy the qmoe_gate_up_activate launch gate"
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_decode_fused_swiglu_interleaved_matches_cpu() {
+    let case = Case {
+        experts: 4,
+        rows: 1,
+        hidden: 16,
+        inter: 16,
+        bits: 4,
+        top_k: 2,
+        activation: "swiglu",
+        swiglu_fusion: 1,
+        affine: true,
+        fc3: false,
+        biases: true,
+        normalize: true,
+        router_weights: false,
+    };
+    assert_fused_gate_up_decode_case(case);
+    compare(case, DataType::Float16);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_decode_fused_silu_fc3_matches_cpu() {
+    let case = Case {
+        experts: 4,
+        rows: 1,
+        hidden: 16,
+        inter: 16,
+        bits: 4,
+        top_k: 2,
+        activation: "silu",
+        swiglu_fusion: 0,
+        affine: true,
+        fc3: true,
+        biases: true,
+        normalize: true,
+        router_weights: false,
+    };
+    assert_fused_gate_up_decode_case(case);
+    compare(case, DataType::Float16);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_biases_gemv_gemm_match_cpu() {
     compare_gemv_gemm_and_cpu(Case {
@@ -738,6 +822,10 @@ fn qmoe_biases_gemv_gemm_match_cpu() {
     });
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_separate_router_weights_gemv_gemm_match_cpu() {
     compare_gemv_gemm_and_cpu(Case {
@@ -757,6 +845,10 @@ fn qmoe_separate_router_weights_gemv_gemm_match_cpu() {
     });
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_glm_silu_fc3_biases_separate_router_matches_cpu_all_dtypes() {
     let case = Case {
@@ -781,6 +873,10 @@ fn qmoe_glm_silu_fc3_biases_separate_router_matches_cpu_all_dtypes() {
 
 macro_rules! sub_byte_path_test {
     ($name:ident, $bits:expr, $affine:expr) => {
+        #[cfg_attr(
+            not(feature = "gpu-tests"),
+            ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+        )]
         #[test]
         fn $name() {
             compare_gemv_gemm_and_cpu(Case {
@@ -807,6 +903,10 @@ sub_byte_path_test!(qmoe_int1_affine_gemv_gemm_matches_cpu, 1, true);
 sub_byte_path_test!(qmoe_int2_symmetric_gemv_gemm_matches_cpu, 2, false);
 sub_byte_path_test!(qmoe_int2_affine_gemv_gemm_matches_cpu, 2, true);
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_int4_top2_symmetric_matches_cpu() {
     let (max_abs, max_ulp) = compare(
@@ -830,19 +930,31 @@ fn qmoe_int4_top2_symmetric_matches_cpu() {
     eprintln!("QMoE int4 top-2 CPU/CUDA max_abs_diff={max_abs:e} max_ulp_diff={max_ulp}");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_64experts_top6_fp16_decode_and_prefill_match_cpu() {
     compare_64expert_decode_and_prefill(DataType::Float16);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_64experts_top6_bf16_decode_and_prefill_match_cpu() {
     compare_64expert_decode_and_prefill(DataType::BFloat16);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_64experts_top6_handles_empty_and_hot_experts() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let case = qmoe_64expert_case(16);
     let mut inputs = case_inputs(case, DataType::Float16);
     inputs[1] = Some(router_with_hot_expert(case));
@@ -853,9 +965,13 @@ fn qmoe_64experts_top6_handles_empty_and_hot_experts() {
     assert_conforms(&actual, &expected, case, DataType::Float16);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_capture_replay_reresolves_changed_router_probs() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let case = Case {
         experts: 4,
         rows: 3,
@@ -911,9 +1027,13 @@ fn qmoe_capture_replay_reresolves_changed_router_probs() {
     assert_conforms(&replay, &eager, case, DataType::Float32);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_64experts_top6_capture_replay_reresolves_changed_router_probs() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let case = qmoe_64expert_case(8);
     let mut capture_inputs = case_inputs(case, DataType::Float16);
     capture_inputs[1] = Some(router_with_top_experts(case, 0));
@@ -947,11 +1067,19 @@ fn qmoe_64experts_top6_capture_replay_reresolves_changed_router_probs() {
     assert_conforms(&replay, &expected, case, DataType::Float16);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_64experts_top6_worst_case_scratch_sizing_matches_cpu() {
     compare(qmoe_64expert_case(64), DataType::Float16);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_int8_top1_affine_bias_matches_cpu() {
     compare(
@@ -974,6 +1102,10 @@ fn qmoe_int8_top1_affine_bias_matches_cpu() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_single_expert_top1_matches_cpu() {
     compare(
@@ -996,6 +1128,10 @@ fn qmoe_single_expert_top1_matches_cpu() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_fp16_and_bf16_storage_match_rounded_cpu_reference() {
     let case = Case {
@@ -1017,6 +1153,10 @@ fn qmoe_fp16_and_bf16_storage_match_rounded_cpu_reference() {
     compare(case, DataType::BFloat16);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_prefill_gemm_matches_gemv_and_cpu_oracle() {
     let case = Case {
@@ -1037,9 +1177,13 @@ fn qmoe_prefill_gemm_matches_gemv_and_cpu_oracle() {
     compare_gemv_gemm_and_cpu(case);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_prefill_handles_empty_experts_and_all_routes_to_one_expert() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let case = Case {
         experts: 4,
         rows: 5,

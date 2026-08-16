@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! CUDA parity tests for the standard `Attention` operator in bf16 storage.
 //!
 //! Mirrors the fp16 harness ([`standard_attention_fp16_gpu`]): the CUDA kernel
@@ -353,11 +367,17 @@ fn assert_bf16_matches_f32(label: &str, got: &[u8], expected: &[u8], tolerance: 
     maximum_error
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_bf16_matches_exact_rounded_f32_oracle() {
     let Ok(_ep) = CudaExecutionProvider::new_default() else {
         eprintln!("skip: no CUDA GPU available");
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
 
     const QUERY_HEADS: usize = 4;
@@ -596,11 +616,17 @@ fn standard_attention_bf16_matches_exact_rounded_f32_oracle() {
 /// oracles are separated by a wide margin (the scenario is genuinely sensitive)
 /// and (2) the CUDA result tracks the fp32 oracle, catching any mutation of the
 /// `float acc` accumulators in `attention_row` to the storage (bf16) type.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_bf16_accumulates_in_fp32() {
     let Ok(_ep) = CudaExecutionProvider::new_default() else {
         eprintln!("skip: no CUDA GPU available");
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
 
     const SEQUENCE: usize = 1024;

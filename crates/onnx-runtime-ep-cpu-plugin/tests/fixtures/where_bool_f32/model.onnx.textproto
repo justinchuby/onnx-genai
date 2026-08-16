@@ -1,0 +1,70 @@
+ir_version: 8
+graph {
+  node: [{
+    input: ["C", "X", "Y"]
+    output: ["Z"]
+    op_type: "Where"
+  }]
+  name: "where_bool_f32"
+  input: [{
+    name: "C"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim: [{
+            dim_value: 2
+          }, {
+            dim_value: 2
+          }]
+        }
+      }
+    }
+  }, {
+    name: "X"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_value: 2
+          }, {
+            dim_value: 2
+          }]
+        }
+      }
+    }
+  }, {
+    name: "Y"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_value: 2
+          }, {
+            dim_value: 2
+          }]
+        }
+      }
+    }
+  }]
+  output: [{
+    name: "Z"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_value: 2
+          }, {
+            dim_value: 2
+          }]
+        }
+      }
+    }
+  }]
+}
+opset_import: [{
+  version: 17
+}]

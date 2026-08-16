@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU conformance checks for CUDA data-movement and metadata kernels.
 
 use onnx_runtime_ep_api::{
@@ -20,7 +34,7 @@ fn bytes<T: Copy>(values: &[T]) -> Vec<u8> {
     }
 }
 
-fn gpu() -> CudaExecutionProvider {
+fn require_cuda() -> CudaExecutionProvider {
     CudaExecutionProvider::new_default().expect("CUDA runtime must be available for this GPU test")
 }
 
@@ -134,9 +148,13 @@ fn run_gather(
     got
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gather_gpu_embedding_i64_negative_index_exact() {
-    let ep = gpu();
+    let ep = require_cuda();
     let data = [0., 1., 10., 11., 20., 21., 30., 31.];
     let indices = [-1_i64, 1];
     let got = run_gather(
@@ -153,9 +171,13 @@ fn gather_gpu_embedding_i64_negative_index_exact() {
     eprintln!("Gather GPU executed: exact match (max abs error 0)");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gather_gpu_axis1_i32_exact() {
-    let ep = gpu();
+    let ep = require_cuda();
     let data = [0., 1., 2., 10., 11., 12.];
     let indices = [2_i32, 0];
     let got = run_gather(
@@ -172,9 +194,13 @@ fn gather_gpu_axis1_i32_exact() {
     eprintln!("Gather GPU executed: exact match (max abs error 0)");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gather_gpu_two_dimensional_indices_exact() {
-    let ep = gpu();
+    let ep = require_cuda();
     let data = [0., 1., 2., 3., 4., 5., 6., 7.];
     let indices = [3_i64, 0, 2, 1];
     let got = run_gather(
@@ -191,9 +217,13 @@ fn gather_gpu_two_dimensional_indices_exact() {
     eprintln!("Gather GPU executed: exact match (max abs error 0)");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn captured_gather_and_reduce_axes_latch_dynamic_bounds_changes() {
-    let ep = gpu();
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let device = ep.device_id();
 
@@ -409,9 +439,13 @@ impl ClampEnd for i64 {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn shape_gpu_full_and_negative_slice_exact() {
-    let ep = gpu();
+    let ep = require_cuda();
     assert_eq!(run_shape(&ep, 0, None), vec![2, 3, 5, 7]);
     assert_eq!(run_shape(&ep, -3, Some(-1)), vec![3, 5]);
     eprintln!("Shape GPU executed: exact match (max abs error 0)");
@@ -448,9 +482,13 @@ fn run_constant(
     got
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn constant_gpu_fp32_and_i64_tensor_exact() {
-    let ep = gpu();
+    let ep = require_cuda();
     let floats = [1.5_f32, -2.25, 3.75, 0.5];
     let float_value = TensorData::from_raw(DataType::Float32, vec![2, 2], bytes(&floats));
     assert_eq!(

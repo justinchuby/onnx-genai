@@ -13,9 +13,10 @@ pub(crate) use crate::decode_loop::{
 pub(crate) use crate::kv_bridge::{
     KvModelInfo, PlacedPayload, RewindRequest, RewindRunnerPolicy, attach_pages_to_sequence,
     chunk_payload_from_exported, common_prefix_len, exported_layers_from_runner,
-    infer_kv_model_info, kv_model_past_is_f32, load_materialized_past, past_kv_from_payloads,
-    rewind_draft_state_to_len, rewind_target_state_to_len, sequence_pages_for_len,
-    validate_draft_state_rewind_to_len, validate_target_state_rewind_to_len,
+    infer_kv_model_info, kv_model_past_is_f32, load_materialized_past,
+    ort_session_has_recurrent_state, past_kv_from_payloads, rewind_draft_state_to_len,
+    rewind_target_state_to_len, sequence_pages_for_len, validate_draft_state_rewind_to_len,
+    validate_target_state_rewind_to_len,
 };
 pub(crate) use crate::logits::{StopSequence, TokenId};
 pub(crate) use crate::processors::{
@@ -36,7 +37,8 @@ pub(crate) use onnx_genai_ort::{
 pub(crate) use onnx_genai_scheduler::{
     CapacityProvider, CapacityProviders, FixedCapacity, GovernorReconfigureOutcome,
     GovernorSnapshot, ModelKvConfig, Priority, ResourceError, ResourceGovernor, ResourceLimit,
-    ResourceLimits, ScheduleDecision, ScheduledBudgetCap, Scheduler, VramBreakdown,
+    ResourceLimits, ScheduleDecision, ScheduledBudgetCap, ScheduledRequest, Scheduler,
+    VramBreakdown,
 };
 pub(crate) use onnx_std::{MetadataHints, MetadataWarning, PlacementStrength};
 pub(crate) use std::collections::HashMap;
@@ -44,14 +46,17 @@ pub(crate) use std::path::Path;
 pub(crate) use std::sync::Arc;
 
 pub use crate::config::{
-    DryConfig, Eagle3Config, EngineConfig, EngineConfigError, EngineDecodeBackend, FinishReason,
-    GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
-    GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
-    KvConnectorConfig, LimitParseError, MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig,
-    MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest, PrioritizedGenerateResult,
+    DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, EngineConfig,
+    EngineConfigError, EngineDecodeBackend, FinishReason, GenerateConstraint, GenerateOptions,
+    GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
+    GenerationBudgetCap, KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError,
+    MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan,
+    MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult, RecurrentPrefixCacheStats,
     RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
     SessionForkCapability, SessionId, SessionPosition, SharedKvBinding, SharedKvProposerConfig,
-    SpeculativeMode, TokenLogprob, XtcConfig, parse_resource_limit,
+    SpeculativeMode, TokenLogprob, WeightAccessPattern, WeightPlacementReport, XtcConfig,
+    parse_device_policy, parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
@@ -62,18 +67,32 @@ pub(crate) use crate::speculative::{
 mod decode_backend;
 mod governor;
 mod load;
+pub(crate) mod memory_plan;
+mod memory_strategy;
 mod metadata;
 mod model;
+#[cfg(feature = "native-backend")]
+mod placement;
 mod runtime;
 mod speculative_load;
 
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
-pub use governor::{EngineGovernorError, EngineResourceGovernor};
-pub(crate) use load::kv_pages_for_budget;
+pub use governor::{EngineGovernorError, EngineResourceGovernor, resolve_device_vram_limit_bytes};
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+pub(crate) use load::managed_vmm_default_enabled;
+pub(crate) use load::{
+    force_managed_weight_streaming_enabled, kv_pages_for_budget, session_device_domain,
+    validate_shared_authority_limit,
+};
+#[cfg(feature = "native-backend")]
+pub(crate) use memory_plan::Holder;
+pub(crate) use memory_strategy::*;
 pub(crate) use metadata::*;
 pub use model::Engine;
 pub(crate) use model::*;
+#[cfg(feature = "native-backend")]
+pub(crate) use placement::plan_static_weight_placement;
 pub(crate) use speculative_load::*;
 
 #[cfg(test)]
@@ -85,7 +104,13 @@ mod tests {
         finish_reason_after_token, select_next_token, select_next_token_with_sampler,
     };
     use crate::sampling::Sampler;
+    #[cfg(feature = "native-backend")]
+    use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind};
+    #[cfg(feature = "native-backend")]
+    use onnx_runtime_ir::{Attribute, DataType as IrDataType, Graph, Node, NodeId, Shape};
     use proptest::prelude::*;
+    #[cfg(feature = "native-backend")]
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
 
     #[test]
@@ -175,10 +200,7 @@ mod tests {
         let governor = EngineResourceGovernor::new(
             ResourceLimits::default(),
             false,
-            ModelKvConfig {
-                page_size_bytes: 1,
-                tokens_per_page: 1,
-            },
+            ModelKvConfig::known(1, 1),
             0,
         )?;
 
@@ -198,6 +220,9 @@ mod tests {
             #[cfg(feature = "native-backend")]
             native_session: None,
             #[cfg(feature = "native-backend")]
+            weight_placement: None,
+            memory_strategy_plan: MemoryStrategyPlan::unknown(0, None, "test engine fixture"),
+            #[cfg(feature = "native-backend")]
             native_sessions: HashMap::new(),
             #[cfg(feature = "native-backend")]
             native_active_session: None,
@@ -211,6 +236,8 @@ mod tests {
             native_max_sessions: 8,
             #[cfg(feature = "native-backend")]
             native_shared_kv_proposer: None,
+            #[cfg(feature = "native-backend")]
+            native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft: None,
             mtp: None,
             eagle3: None,
@@ -223,6 +250,482 @@ mod tests {
             connector: ConnectorBridge::null(),
             _environment: None,
         })
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn insert_test_op(
+        graph: &mut Graph,
+        op_type: &str,
+        inputs: Vec<onnx_runtime_ir::ValueId>,
+        output: onnx_runtime_ir::ValueId,
+        attributes: &[(&str, Attribute)],
+    ) {
+        let mut node = Node::new(
+            NodeId(0),
+            op_type,
+            inputs.into_iter().map(Some).collect(),
+            vec![output],
+        );
+        for (name, value) in attributes {
+            node.attributes.insert((*name).to_string(), value.clone());
+        }
+        graph.insert_node(node);
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn tiny_hybrid_native_decoder() -> onnx_runtime_session::InferenceSession {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 11);
+        let batch = graph.intern_symbol("batch");
+        let sequence = graph.intern_symbol("sequence");
+        let total = graph.intern_symbol("total");
+        let past = graph.intern_symbol("past");
+        let shape = |dims: &[onnx_runtime_ir::Dim]| -> Shape { dims.to_vec() };
+
+        let input_ids = graph.create_named_value(
+            "input_ids",
+            IrDataType::Int64,
+            shape(&[batch.into(), sequence.into()]),
+        );
+        let attention_mask = graph.create_named_value(
+            "attention_mask",
+            IrDataType::Int64,
+            shape(&[batch.into(), total.into()]),
+        );
+        let position_ids = graph.create_named_value(
+            "position_ids",
+            IrDataType::Int64,
+            shape(&[batch.into(), sequence.into()]),
+        );
+        let conv_state = graph.create_named_value(
+            "past_key_values.0.conv_state",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), 1.into()]),
+        );
+        let recurrent_state = graph.create_named_value(
+            "past_key_values.1.recurrent_state",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), 1.into()]),
+        );
+        let past_key = graph.create_named_value(
+            "past_key_values.2.key",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), past.into(), 1.into()]),
+        );
+        let past_value = graph.create_named_value(
+            "past_key_values.2.value",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), past.into(), 1.into()]),
+        );
+        for input in [
+            input_ids,
+            attention_mask,
+            position_ids,
+            conv_state,
+            recurrent_state,
+            past_key,
+            past_value,
+        ] {
+            graph.add_input(input);
+        }
+
+        let cast = graph.create_value(IrDataType::Float32, shape(&[batch.into(), sequence.into()]));
+        insert_test_op(
+            &mut graph,
+            "Cast",
+            vec![input_ids],
+            cast,
+            &[("to", Attribute::Int(1))],
+        );
+        let current_kv = graph.create_value(
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), sequence.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Unsqueeze",
+            vec![cast],
+            current_kv,
+            &[("axes", Attribute::Ints(vec![1, 3]))],
+        );
+        let token_sum = graph.create_value(IrDataType::Float32, shape(&[batch.into(), 1.into()]));
+        insert_test_op(
+            &mut graph,
+            "ReduceSum",
+            vec![cast],
+            token_sum,
+            &[
+                ("axes", Attribute::Ints(vec![1])),
+                ("keepdims", Attribute::Int(1)),
+            ],
+        );
+        let token_state = graph.create_value(
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Unsqueeze",
+            vec![token_sum],
+            token_state,
+            &[("axes", Attribute::Ints(vec![2]))],
+        );
+        let conv_plus_token = graph.create_value(
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Add",
+            vec![conv_state, token_state],
+            conv_plus_token,
+            &[],
+        );
+        let present_conv = graph.create_named_value(
+            "present.0.conv_state",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Add",
+            vec![conv_plus_token, token_state],
+            present_conv,
+            &[],
+        );
+        let recurrent_plus_token = graph.create_value(
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Add",
+            vec![recurrent_state, token_state],
+            recurrent_plus_token,
+            &[],
+        );
+        let recurrent_plus_two_tokens = graph.create_value(
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Add",
+            vec![recurrent_plus_token, token_state],
+            recurrent_plus_two_tokens,
+            &[],
+        );
+        let present_recurrent = graph.create_named_value(
+            "present.1.recurrent_state",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Add",
+            vec![recurrent_plus_two_tokens, token_state],
+            present_recurrent,
+            &[],
+        );
+        let logits = graph.create_named_value(
+            "logits",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), 2.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Concat",
+            vec![present_conv, present_recurrent],
+            logits,
+            &[("axis", Attribute::Int(2))],
+        );
+        let present_key = graph.create_named_value(
+            "present.2.key",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), total.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Concat",
+            vec![past_key, current_kv],
+            present_key,
+            &[("axis", Attribute::Int(2))],
+        );
+        let present_value = graph.create_named_value(
+            "present.2.value",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), total.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Concat",
+            vec![past_value, current_kv],
+            present_value,
+            &[("axis", Attribute::Int(2))],
+        );
+        for output in [
+            logits,
+            present_conv,
+            present_recurrent,
+            present_key,
+            present_value,
+        ] {
+            graph.add_output(output);
+        }
+        onnx_runtime_session::InferenceSession::from_graph(graph).expect("tiny hybrid")
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn tiny_dense_native_decoder() -> onnx_runtime_session::InferenceSession {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 11);
+        let batch = graph.intern_symbol("batch");
+        let sequence = graph.intern_symbol("sequence");
+        let total = graph.intern_symbol("total");
+        let past = graph.intern_symbol("past");
+        let shape = |dims: &[onnx_runtime_ir::Dim]| -> Shape { dims.to_vec() };
+
+        let input_ids = graph.create_named_value(
+            "input_ids",
+            IrDataType::Int64,
+            shape(&[batch.into(), sequence.into()]),
+        );
+        let attention_mask = graph.create_named_value(
+            "attention_mask",
+            IrDataType::Int64,
+            shape(&[batch.into(), total.into()]),
+        );
+        let position_ids = graph.create_named_value(
+            "position_ids",
+            IrDataType::Int64,
+            shape(&[batch.into(), sequence.into()]),
+        );
+        let past_key = graph.create_named_value(
+            "past_key_values.0.key",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), past.into(), 1.into()]),
+        );
+        let past_value = graph.create_named_value(
+            "past_key_values.0.value",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), past.into(), 1.into()]),
+        );
+        for input in [
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key,
+            past_value,
+        ] {
+            graph.add_input(input);
+        }
+
+        let cast = graph.create_value(IrDataType::Float32, shape(&[batch.into(), sequence.into()]));
+        insert_test_op(
+            &mut graph,
+            "Cast",
+            vec![input_ids],
+            cast,
+            &[("to", Attribute::Int(1))],
+        );
+        let token_logits = graph.create_value(
+            IrDataType::Float32,
+            shape(&[batch.into(), sequence.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Unsqueeze",
+            vec![cast],
+            token_logits,
+            &[("axes", Attribute::Ints(vec![2]))],
+        );
+        let logits = graph.create_named_value(
+            "logits",
+            IrDataType::Float32,
+            shape(&[batch.into(), sequence.into(), 2.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Concat",
+            vec![token_logits, token_logits],
+            logits,
+            &[("axis", Attribute::Int(2))],
+        );
+        let current_kv = graph.create_value(
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), sequence.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Unsqueeze",
+            vec![cast],
+            current_kv,
+            &[("axes", Attribute::Ints(vec![1, 3]))],
+        );
+        let present_key = graph.create_named_value(
+            "present.0.key",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), total.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Concat",
+            vec![past_key, current_kv],
+            present_key,
+            &[("axis", Attribute::Int(2))],
+        );
+        let present_value = graph.create_named_value(
+            "present.0.value",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), total.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Concat",
+            vec![past_value, current_kv],
+            present_value,
+            &[("axis", Attribute::Int(2))],
+        );
+        for output in [logits, present_key, present_value] {
+            graph.add_output(output);
+        }
+        onnx_runtime_session::InferenceSession::from_graph(graph).expect("tiny dense")
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn tiny_dense_decoder_io() -> ModelIoSpec {
+        ModelIoSpec {
+            sequence_source: Some(SequenceInputKind::TokenIds),
+            kv_ownership: Some(KvOwnership::Owned),
+            kv_layout: None,
+            token_input: Some("input_ids".into()),
+            inputs_embeds_input: None,
+            attention_mask_input: Some("attention_mask".into()),
+            position_ids_input: Some("position_ids".into()),
+            logits_output: Some("logits".into()),
+            hidden_output: None,
+            kv_inputs: Some(vec![
+                "past_key_values.0.key".into(),
+                "past_key_values.0.value".into(),
+            ]),
+            kv_outputs: Some(vec!["present.0.key".into(), "present.0.value".into()]),
+            encoder_hidden_states_input: None,
+            audio_features_input: None,
+            cross_kv_inputs: None,
+            cross_kv_outputs: None,
+            kv_update: None,
+            state_pairs: None,
+            optional_inputs: BTreeMap::new(),
+            static_cache: None,
+        }
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn native_prefix_snapshot_test_engine() -> anyhow::Result<Engine> {
+        let mut engine = model_free_rewind_test_engine(PagedKvCache::new(1, 1), HashMap::new())?;
+        engine.decode_backend = EngineDecodeBackend::Native;
+        engine.native_session = Some(crate::native_decode::NativeDecodeSession::from_session(
+            tiny_hybrid_native_decoder(),
+        )?);
+        Ok(engine)
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn native_dense_test_engine() -> anyhow::Result<Engine> {
+        let mut engine = model_free_rewind_test_engine(PagedKvCache::new(1, 1), HashMap::new())?;
+        engine.decode_backend = EngineDecodeBackend::Native;
+        engine.native_session = Some(
+            crate::native_decode::NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
+                tiny_dense_native_decoder(),
+                None,
+                Some(&tiny_dense_decoder_io()),
+            )?,
+        );
+        Ok(engine)
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_recurrent_prefix_hit_matches_cold_output() -> anyhow::Result<()> {
+        let prompt = vec![1, 2, 3, 4, 5];
+        let mut cold = native_prefix_snapshot_test_engine()?;
+        let mut cold_options = GenerateOptions {
+            max_new_tokens: 2,
+            stop_on_eos: false,
+            cold_start: true,
+            ..GenerateOptions::default()
+        };
+        let cold_result = cold.generate(GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(prompt.clone()),
+            options: cold_options.clone(),
+        })?;
+
+        let mut cached = native_prefix_snapshot_test_engine()?;
+        cold_options.cold_start = false;
+        cold_options.semantic_prefix_len = Some(3);
+        let first = cached.create_session()?;
+        let second = cached.create_session()?;
+        cached.generate_in_session(
+            first,
+            GenerateRequest {
+                prompt: GeneratePrompt::TokenIds(prompt.clone()),
+                options: cold_options.clone(),
+            },
+        )?;
+        let incremental_hits_before =
+            crate::native_decode::NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS
+                .load(std::sync::atomic::Ordering::Relaxed);
+        let hit_result = cached.generate_in_session(
+            second,
+            GenerateRequest {
+                prompt: GeneratePrompt::TokenIds(prompt),
+                options: cold_options,
+            },
+        )?;
+        let incremental_hits_after =
+            crate::native_decode::NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS
+                .load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(hit_result.token_ids, cold_result.token_ids);
+        assert_eq!(hit_result.text, cold_result.text);
+        assert_eq!(incremental_hits_after, incremental_hits_before + 1);
+        assert_eq!(
+            cached.recurrent_prefix_cache_stats(),
+            RecurrentPrefixCacheStats {
+                lookups: 2,
+                hits: 1,
+                stores: 1,
+                restored_tokens: 3,
+            }
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_semantic_prefix_on_dense_session_generates_without_snapshot_support()
+    -> anyhow::Result<()> {
+        let mut engine = native_dense_test_engine()?;
+        let session = engine.create_session()?;
+        let result = engine.generate_in_session(
+            session,
+            GenerateRequest {
+                prompt: GeneratePrompt::TokenIds(vec![1, 2, 3, 4]),
+                options: GenerateOptions {
+                    max_new_tokens: 1,
+                    stop_on_eos: false,
+                    semantic_prefix_len: Some(2),
+                    ..GenerateOptions::default()
+                },
+            },
+        )?;
+
+        assert_eq!(result.token_ids.len(), 1);
+        assert_eq!(
+            engine.recurrent_prefix_cache_stats(),
+            RecurrentPrefixCacheStats::default()
+        );
+        Ok(())
     }
 
     #[test]
@@ -746,6 +1249,37 @@ mod tests {
         assert!(error.contains("ONNX_GENAI_BACKEND=ort"), "{error}");
     }
 
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn device_policy_reaches_native_load_and_profiles_placement() {
+        let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-glm52-qmoe-indexshare");
+        let config = EngineConfig::from_yaml(
+            "serving:\n  memory:\n    weights:\n      device_policy: gpu_layers:1\n",
+        )
+        .unwrap();
+        let config = EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            native_device: Some(crate::native_decode::NativeDecodeDevice::Cpu),
+            ..config
+        };
+
+        let engine = Engine::from_dir(&model_dir, config).unwrap();
+        let report = engine
+            .weight_placement_report()
+            .expect("QMoE fixture should produce a static weight placement report");
+
+        assert!(
+            report.explanation.contains("gpu_layers:1"),
+            "{}",
+            report.explanation
+        );
+        assert!(
+            report.host_bytes > 0,
+            "CPU load has no governed device residency budget, so the plan should visibly keep bytes on host: {report:?}"
+        );
+    }
+
     #[cfg(not(feature = "native-backend"))]
     #[test]
     fn forced_native_without_feature_reports_how_to_switch() {
@@ -775,16 +1309,13 @@ mod tests {
             limits.clone(),
             true,
             test_capacities(),
-            ModelKvConfig {
-                page_size_bytes: 100,
-                tokens_per_page: 16,
-            },
+            ModelKvConfig::known(100, 16),
             0,
         )
         .unwrap();
         let snapshot = governor.snapshot();
         assert_eq!(snapshot.configured_limits, limits);
-        assert_eq!(snapshot.resolved_limits.vram_bytes, 500);
+        assert_eq!(snapshot.resolved_limits.vram_bytes, Some(500));
         assert_eq!(snapshot.derived_budget.total_pages, 5);
         assert_eq!(snapshot.vram.headroom, 500);
         assert_eq!(snapshot.host_ram.used, 0);
@@ -793,7 +1324,7 @@ mod tests {
         assert_eq!(snapshot.disk_spill, None);
 
         let outcome = governor.set_vram_limit(ResourceLimit::Bytes(800)).unwrap();
-        assert_eq!(outcome.new_limits.vram_bytes, 800);
+        assert_eq!(outcome.new_limits.vram_bytes, Some(800));
         assert_eq!(
             governor.snapshot().configured_limits.vram_limit,
             ResourceLimit::Bytes(800)
@@ -802,7 +1333,7 @@ mod tests {
 
     #[cfg(feature = "native-backend")]
     #[test]
-    fn two_engine_governors_keep_independent_host_cache_budgets() {
+    fn engine_governors_keep_disabled_host_cache_budgets_governed() {
         let first = EngineResourceGovernor::new_with_capacities(
             ResourceLimits {
                 host_ram_limit: ResourceLimit::Bytes(400),
@@ -810,10 +1341,7 @@ mod tests {
             },
             false,
             test_capacities(),
-            ModelKvConfig {
-                page_size_bytes: 100,
-                tokens_per_page: 16,
-            },
+            ModelKvConfig::known(100, 16),
             0,
         )
         .unwrap();
@@ -824,60 +1352,58 @@ mod tests {
             },
             false,
             test_capacities(),
-            ModelKvConfig {
-                page_size_bytes: 100,
-                tokens_per_page: 16,
-            },
+            ModelKvConfig::known(100, 16),
             0,
         )
         .unwrap();
 
         assert_eq!(
             first.weight_offload_host_cache().configured_budget_bytes(),
-            400
+            0
         );
+        assert_eq!(first.weight_offload_host_cache().budget(), (0, true));
         assert_eq!(
             second.weight_offload_host_cache().configured_budget_bytes(),
-            900
+            0
         );
+        assert_eq!(second.weight_offload_host_cache().budget(), (0, true));
     }
 
     #[test]
-    fn an_explicit_byte_limit_is_honored_above_the_provisional_capacity() {
-        // The device-capacity provider is still a fixed constant, not a probe.
-        // Clamping an explicit limit to it would cap every machine at the
-        // constant — a 40 GB GPU could not be told about its own memory — so an
-        // absolute byte limit is taken as the caller's authoritative statement.
-        // Fractions and `auto` remain relative to the reported capacity.
+    fn an_explicit_byte_limit_is_honored_without_a_device_query() {
+        // There is no device-capacity probe on this path, so a fraction of the
+        // (unknown) device capacity is unknown. But an absolute byte limit is
+        // the caller's authoritative statement and must be honoured exactly,
+        // capacity query or not (#947). Host RAM and disk are measured from the
+        // OS, so their fractions/auto resolve against real, non-fabricated
+        // numbers rather than the old provisional constants.
+        const EXPLICIT_VRAM_BYTES: u64 = (40u64 << 30) + 1;
         let limits = ResourceLimits {
-            vram_limit: ResourceLimit::Bytes(PROVISIONAL_VRAM_CAPACITY_BYTES + 1),
+            vram_limit: ResourceLimit::Bytes(EXPLICIT_VRAM_BYTES),
             host_ram_limit: ResourceLimit::Fraction(0.5),
             disk_spill_limit: Some(ResourceLimit::Auto),
         };
-        let governor = EngineResourceGovernor::new(
-            limits,
-            false,
-            ModelKvConfig {
-                page_size_bytes: 1,
-                tokens_per_page: 1,
-            },
-            0,
-        )
-        .unwrap();
+        let governor =
+            EngineResourceGovernor::new(limits, false, ModelKvConfig::known(1, 1), 0).unwrap();
         let snapshot = governor.snapshot();
         assert_eq!(
             snapshot.resolved_limits.vram_bytes,
-            PROVISIONAL_VRAM_CAPACITY_BYTES + 1,
-            "an explicit byte limit must not be clamped to a provisional constant"
+            Some(EXPLICIT_VRAM_BYTES),
+            "an explicit byte limit must be honoured exactly, with no device query"
         );
-        assert_eq!(
-            snapshot.resolved_limits.host_ram_bytes,
-            PROVISIONAL_HOST_RAM_CAPACITY_BYTES / 2,
-            "a fraction stays relative to the reported capacity"
+        let host_ram_bytes = snapshot.resolved_limits.host_ram_bytes;
+        assert!(
+            host_ram_bytes > 0,
+            "a fraction of measured host RAM must be a real, positive number"
         );
-        assert_eq!(
-            snapshot.resolved_limits.disk_spill_bytes,
-            Some(PROVISIONAL_DISK_CAPACITY_BYTES)
+        assert_ne!(
+            host_ram_bytes,
+            (16u64 << 30) / 2,
+            "host RAM must be measured, not half of the old fabricated 16 GiB constant"
+        );
+        assert!(
+            snapshot.resolved_limits.disk_spill_bytes.unwrap_or(0) > 0,
+            "auto disk spill must resolve against measured free space"
         );
     }
 
@@ -896,14 +1422,24 @@ mod tests {
             },
             false,
             capacities,
-            ModelKvConfig {
-                page_size_bytes: 100,
-                tokens_per_page: 16,
-            },
+            ModelKvConfig::known(100, 16),
             0,
         )
         .unwrap();
-        governor.byte_budget().try_reserve(300).unwrap();
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor as _, MemoryRole, Tier};
+
+        let _device = governor
+            .memory()
+            .reserve(Tier::Device, 300, MemoryRole::KvCache, HolderId::new(1))
+            .unwrap();
+        let _host = governor
+            .memory()
+            .reserve(Tier::Host, 500, MemoryRole::KvCache, HolderId::new(2))
+            .unwrap();
+        let _disk = governor
+            .memory()
+            .reserve(Tier::Disk, 1_000, MemoryRole::KvCache, HolderId::new(3))
+            .unwrap();
 
         let snapshot = governor.snapshot();
         assert_eq!(
@@ -938,10 +1474,7 @@ mod tests {
             ResourceLimits::default(),
             false,
             test_capacities(),
-            ModelKvConfig {
-                page_size_bytes: 100,
-                tokens_per_page: 16,
-            },
+            ModelKvConfig::known(100, 16),
             0,
         )
         .unwrap();

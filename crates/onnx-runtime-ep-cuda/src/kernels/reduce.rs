@@ -1,5 +1,5 @@
 //! GPU **reductions** over arbitrary axes with `keepdims`
-//! (`docs/CUDA_COVERAGE.md`, "Normalization & softmax" / reduce rows).
+//! (`docs/execution/CUDA_COVERAGE.md`, "Normalization & softmax" / reduce rows).
 //!
 //! `ReduceSum` and `ReduceMean` use `cudnnReduceTensor` for f32 (native f32
 //! comp type) and f16 (with an f32 comp type). bf16 cannot be reduced by cuDNN

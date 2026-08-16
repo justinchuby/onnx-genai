@@ -1,13 +1,13 @@
 //! # `onnx-runtime-ep-cpu`
 //!
-//! The CPU execution provider for the ORT 2.0 runtime (see `docs/ORT2.md` §4.4
+//! The CPU execution provider for the ORT 2.0 runtime (see `docs/architecture/ORT2.md` §4.4
 //! and §54 Phase 1). It implements [`onnx_runtime_ep_api::ExecutionProvider`]
 //! and hosts pure-Rust reference kernels for the Phase-1 op set (`MatMul`,
 //! `Add`, `Relu`, `Reshape`, `Transpose`, `Gather`, `LayerNormalization`).
 //!
 //! ## Backends: correctness baseline + SIMD fast path
 //!
-//! The GEMM hot spot is served through [`backend::CpuBackend`] (`docs/ORT2.md`
+//! The GEMM hot spot is served through [`backend::CpuBackend`] (`docs/architecture/ORT2.md`
 //! §25.2). The **default** backend is a pure-Rust blocked, register-tiled,
 //! rayon-parallelized f32 GEMM — the portable, offline correctness baseline that
 //! compiles anywhere with no C++/FFI. On supported x86 hosts, the built-in
@@ -28,6 +28,7 @@
 // dimensions often exceed Clippy's generic argument-count threshold.
 #![allow(clippy::too_many_arguments)]
 
+pub mod assignment_policy;
 pub mod backend;
 pub mod decode_affinity;
 pub mod decode_numa;
@@ -44,18 +45,16 @@ pub mod weight_offload;
 
 pub use backend::CpuBackend;
 pub use kernels::qmoe::WeightOffloadHostCache;
+pub use kernels::{CpuOpDescriptor, build_cpu_registry_with_descriptors, supported_dtypes_for_op};
 pub use optimizer::{
     ConvBatchNormActivationFusion, MatMulNBitsBiasFusion, ProjectionFusion, SiblingProjectionMerge,
     cpu_optimization_passes,
 };
 pub use provider::CpuExecutionProvider;
 pub use weight_offload::placement::{
-    ArbitrationAction, GpuLayersOverrideReport, HostFallbackReason, IqFormat, KvAdmissionDecision,
-    KvAdmissionLimitingFactor, LayerPlacement, LayerWeightRegions, Placement, PlacementError,
-    PlacementPlan, QuantTileFormat, RegionPlacement, SnappedTileSize, TileSizeError,
-    VramArbitrationConfig, VramArbitrationError, VramArbitrationOutcome, VramArbitrationState,
-    VramDemand, VramSubBudgets, arbitrate_vram, decide_kv_admission, plan_placement,
-    snap_transfer_tile_bytes,
+    GpuLayersOverrideReport, HostFallbackReason, IqFormat, LayerPlacement, LayerWeightRegions,
+    Placement, PlacementError, PlacementPlan, QuantTileFormat, RegionPlacement, SnappedTileSize,
+    TileSizeError, plan_placement, snap_transfer_tile_bytes,
 };
 pub use weight_offload::weight_handle::{
     ExecutionProviderCapabilities, LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary,
@@ -64,8 +63,7 @@ pub use weight_offload::weight_handle::{
 };
 pub use weight_offload::{
     LinuxProcessMemoryStats, WEIGHT_OFFLOAD_ENV, WEIGHT_OFFLOAD_HOST_BYTES_ENV,
-    WeightOffloadLayerStats, WeightOffloadStats, set_weight_offload_host_budget,
-    weight_offload_stats,
+    WeightOffloadLayerStats, WeightOffloadStats, weight_offload_stats,
 };
 
 pub use kernels::selection::non_max_suppression;
@@ -74,3 +72,11 @@ pub use kernels::slice::{SliceAxisPlan, slice_axes_steps, slice_plan};
 pub use kernels::matmul_nbits::bound_process_to_decode_budget;
 pub use kernels::matmul_nbits::set_decode_thread_budget;
 pub use kernels::matmul_nbits::with_decode_pool_scope;
+pub use kernels::matmul_nbits::{
+    matmul_nbits_decode_caches_dequant_f32, matmul_nbits_resident_side_cache_bytes,
+    mlas_sqnbit_packed_live_bytes, resident_dequant_f32_cache_bytes,
+    set_mlas_sqnbit_packing_enabled, set_resident_dequant_f32_cache_enabled,
+};
+// #1056: a resident, session-lifetime, weight-scaled buffer must be reportable
+// in bytes. The entry-count accessor stays for the benchmarks that assert reuse.
+pub use kernels::matmul::weight_transpose_cache_bytes;

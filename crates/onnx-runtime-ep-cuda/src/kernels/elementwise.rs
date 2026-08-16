@@ -1,5 +1,5 @@
 //! Elementwise **unary** and **binary** ops on the GPU via runtime-compiled
-//! (NVRTC) kernels (`docs/ORT2.md` §15; RULES.md #4 — a fused NVRTC elementwise
+//! (NVRTC) kernels (`docs/architecture/ORT2.md` §15; RULES.md #4 — a fused NVRTC elementwise
 //! path is the endorsed "custom kernel" case: no NVIDIA library covers arbitrary
 //! ONNX elementwise chains, and keeping them as our own kernels is what later
 //! enables fusing an activation into a preceding GEMM epilogue).
@@ -232,6 +232,39 @@ extern "C" __global__ void decomposed_silu_mul_f16(
         y[i] = __float2half_rn(__fmul_rn(silu_h, __half2float(b[i])));
     }
 }
+
+// BFloat16 decomposed SwiGLU: byte-identical to the standalone two-op
+// `Sigmoid`/`Mul(x, sigmoid)` bf16 graph. Sigmoid and the silu product are each
+// rounded to bf16 (via `store_float<__nv_bfloat16>` = `__float2bfloat16_rn`,
+// the same rounding the standalone `sigmoid_bf16` / `mul_bf16` ops use), so the
+// fused epilogue reproduces the unfused graph's per-op bf16 rounding exactly.
+// All intermediate math runs in fp32 (bf16 carries ~8 mantissa bits).
+__device__ float op_decomposed_silu_bf16(float x) {
+    const float sigmoid_b =
+        load_float<__nv_bfloat16>(store_float<__nv_bfloat16>(op_sigmoid(x)));
+    return load_float<__nv_bfloat16>(
+        store_float<__nv_bfloat16>(__fmul_rn(x, sigmoid_b)));
+}
+
+extern "C" __global__ void decomposed_silu_mul_bf16(
+    const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* y,
+    const unsigned long long n) {
+    for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (unsigned long long)gridDim.x * blockDim.x) {
+        const float silu_b = op_decomposed_silu_bf16(load_float<__nv_bfloat16>(a[i]));
+        y[i] = store_float<__nv_bfloat16>(
+            __fmul_rn(silu_b, load_float<__nv_bfloat16>(b[i])));
+    }
+}
+
+extern "C" __global__ void decomposed_silu_bf16(
+    const __nv_bfloat16* x, __nv_bfloat16* y, const unsigned long long n) {
+    for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (unsigned long long)gridDim.x * blockDim.x) {
+        y[i] = store_float<__nv_bfloat16>(
+            op_decomposed_silu_bf16(load_float<__nv_bfloat16>(x[i])));
+    }
+}
 #endif
 "#;
 
@@ -425,6 +458,7 @@ impl KernelFactory for UnaryFactory {
                     .and_then(Attribute::as_int)
                     == Some(1),
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }))
     }
 }
@@ -454,6 +488,7 @@ impl KernelFactory for StandardGeluFactory {
             runtime: self.runtime.clone(),
             decomposed_silu: false,
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }))
     }
 }
@@ -465,6 +500,7 @@ pub struct UnaryKernel {
     runtime: Arc<CudaRuntime>,
     decomposed_silu: bool,
     last_capture_safe_signature: Mutex<Option<UnaryCaptureSignature>>,
+    capture_seq_independent: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -516,14 +552,14 @@ impl UnaryKernel {
             .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: {n} elements exceed u64")))?;
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        if self.decomposed_silu && dtype != FloatDtype::F16 {
+        if self.decomposed_silu && !matches!(dtype, FloatDtype::F16 | FloatDtype::Bf16) {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep {op}: decomposed SiLU rounding requires float16, got {:?}",
+                "cuda_ep {op}: decomposed SiLU rounding requires float16 or bfloat16, got {:?}",
                 x.dtype
             )));
         }
         let entry = if self.decomposed_silu {
-            "decomposed_silu_f16".to_string()
+            format!("decomposed_silu_{}", dtype.suffix())
         } else {
             self.op.entry(dtype)
         };
@@ -533,10 +569,13 @@ impl UnaryKernel {
                 "CUDA SwiGLU fusion was not selected because this Silu does not feed one eligible equal-shape Mul exclusively"
             );
         }
-        let current_signature = is_fixed_decode_shape(x.shape).then(|| UnaryCaptureSignature {
-            dtype,
-            shape: x.shape.to_vec(),
-        });
+        let current_signature =
+            capture_shape_eligible(self.capture_seq_independent, x.shape).then(|| {
+                UnaryCaptureSignature {
+                    dtype,
+                    shape: x.shape.to_vec(),
+                }
+            });
         require_matching_capture_signature(
             &self.runtime,
             op,
@@ -597,6 +636,10 @@ impl Kernel for UnaryKernel {
             )),
         }
     }
+
+    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
+        self.capture_seq_independent = seq_independent;
+    }
 }
 
 /// Factory for [`BinaryKernel`]; carries the op identity and shared runtime.
@@ -617,6 +660,7 @@ impl KernelFactory for BinaryFactory {
                     .and_then(Attribute::as_int)
                     == Some(1),
                 last_capture_safe_signature: Mutex::new(None),
+                capture_seq_independent: false,
             }));
         }
         Ok(Box::new(BinaryKernel {
@@ -624,6 +668,7 @@ impl KernelFactory for BinaryFactory {
             runtime: self.runtime.clone(),
             metadata: Mutex::new(BroadcastMetadataCache::new(self.runtime.clone())),
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }))
     }
 }
@@ -635,6 +680,7 @@ pub struct BinaryKernel {
     runtime: Arc<CudaRuntime>,
     metadata: Mutex<BroadcastMetadataCache>,
     last_capture_safe_signature: Mutex<Option<BinaryCaptureSignature>>,
+    capture_seq_independent: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -796,14 +842,15 @@ impl BinaryKernel {
                 "CUDA SwiGLU fusion was not selected because this Mul is not an eligible equal-shape, single-consumer Mul(Silu(gate), up) pattern"
             );
         }
-        let current_signature = is_fixed_decode_shape(&out_shape).then(|| BinaryCaptureSignature {
-            dtype: a.dtype,
-            shapes: BroadcastMetadataKey {
-                a_shape: a.shape.to_vec(),
-                b_shape: b.shape.to_vec(),
-                out_shape: out_shape.clone(),
-            },
-        });
+        let current_signature = capture_shape_eligible(self.capture_seq_independent, &out_shape)
+            .then(|| BinaryCaptureSignature {
+                dtype: a.dtype,
+                shapes: BroadcastMetadataKey {
+                    a_shape: a.shape.to_vec(),
+                    b_shape: b.shape.to_vec(),
+                    out_shape: out_shape.clone(),
+                },
+            });
         require_matching_capture_signature(
             &self.runtime,
             op,
@@ -874,6 +921,10 @@ impl Kernel for BinaryKernel {
             )),
         }
     }
+
+    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
+        self.capture_seq_independent = seq_independent;
+    }
 }
 
 /// Fused equal-shape `silu(gate) * up` pointwise kernel.
@@ -882,6 +933,7 @@ struct SiluMulKernel {
     runtime: Arc<CudaRuntime>,
     decomposed: bool,
     last_capture_safe_signature: Mutex<Option<UnaryCaptureSignature>>,
+    capture_seq_independent: bool,
 }
 
 impl SiluMulKernel {
@@ -925,10 +977,11 @@ impl SiluMulKernel {
         let n = gate.numel();
         let n_u64 = u64::try_from(n)
             .map_err(|_| EpError::KernelFailed(format!("cuda_ep {OP}: {n} elements exceed u64")))?;
-        let current_signature = is_fixed_decode_shape(gate.shape).then(|| UnaryCaptureSignature {
-            dtype,
-            shape: gate.shape.to_vec(),
-        });
+        let current_signature = capture_shape_eligible(self.capture_seq_independent, gate.shape)
+            .then(|| UnaryCaptureSignature {
+                dtype,
+                shape: gate.shape.to_vec(),
+            });
         require_matching_capture_signature(
             &self.runtime,
             OP,
@@ -936,14 +989,14 @@ impl SiluMulKernel {
             current_signature.as_ref(),
         )?;
 
-        if self.decomposed && dtype != FloatDtype::F16 {
+        if self.decomposed && !matches!(dtype, FloatDtype::F16 | FloatDtype::Bf16) {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep {OP}: decomposed SiLU fusion requires float16, got {:?}",
+                "cuda_ep {OP}: decomposed SiLU fusion requires float16 or bfloat16, got {:?}",
                 gate.dtype
             )));
         }
         let entry = if self.decomposed {
-            "decomposed_silu_mul_f16".to_string()
+            format!("decomposed_silu_mul_{}", dtype.suffix())
         } else {
             format!("silu_mul_{}", dtype.suffix())
         };
@@ -995,6 +1048,10 @@ impl Kernel for SiluMulKernel {
             ),
         }
     }
+
+    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
+        self.capture_seq_independent = seq_independent;
+    }
 }
 
 pub(crate) fn require_matching_capture_signature<T: PartialEq>(
@@ -1011,8 +1068,31 @@ pub(crate) fn require_matching_capture_signature<T: PartialEq>(
     Ok(())
 }
 
-pub(crate) fn is_fixed_decode_shape(shape: &[usize]) -> bool {
-    !shape.is_empty() && shape[..shape.len() - 1].iter().product::<usize>() == 1
+/// Whether a pointwise op may be admitted to CUDA-graph capture for this call.
+///
+/// The build-time growing-symbol classifier
+/// (`compute_capture_disqualifying_symbols` →
+/// `node_capture_seq_independent` → `set_capture_seq_independent`) is the sole,
+/// authoritative authority here: `seq_independent == true` means every symbol on
+/// this node's output shape is *provably* pinned (fail-safe classifier) / not
+/// proven growing (denylist classifier), so the captured launch geometry stays
+/// valid across every decode replay. `seq_independent == false` is a definitive
+/// "not provably safe" in BOTH classifiers, so capture MUST be vetoed regardless
+/// of the runtime shape.
+///
+/// This deliberately does NOT fall back to a runtime-extent heuristic. A prior
+/// version OR-ed in `product == 1` / `is_fixed_decode_shape` (any rank-1 `[N]`
+/// row), which could re-admit a node the classifier had correctly disqualified —
+/// e.g. a `Reshape([seq_kv*8]) → Sigmoid` whose growing extent `[320]` must be
+/// `[328]` next step — baking stale geometry into the graph and silently
+/// corrupting decode. Those OR terms can only ever *wrongly override* a real
+/// disqualification (the classifier already treats a genuinely pinned
+/// single-token decode axis — query `seq_len == 1`, static feature dims — as
+/// `seq_independent = true` natively), so they are pure hazard and are dropped.
+/// The `shape` argument is retained for a stable call signature and potential
+/// logging; eligibility is decided entirely by the classifier's verdict.
+pub(crate) fn capture_shape_eligible(seq_independent: bool, _shape: &[usize]) -> bool {
+    seq_independent
 }
 
 pub(crate) fn broadcast_metadata(a: &[usize], b: &[usize], out: &[usize]) -> Vec<u64> {
@@ -1054,7 +1134,7 @@ pub(crate) fn u64_bytes(values: &[u64]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use half::f16;
+    use half::{bf16, f16};
     use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
     use onnx_runtime_ir::DeviceId;
 
@@ -1101,6 +1181,9 @@ mod tests {
         assert!(POINTWISE_SRC.contains("DEFINE_SILU_MUL(float, f32)"));
         assert!(POINTWISE_SRC.contains("silu_mul_f16("));
         assert!(POINTWISE_SRC.contains("DEFINE_SILU_MUL(__nv_bfloat16, bf16)"));
+        assert!(POINTWISE_SRC.contains("decomposed_silu_mul_f16("));
+        assert!(POINTWISE_SRC.contains("decomposed_silu_mul_bf16("));
+        assert!(POINTWISE_SRC.contains("decomposed_silu_bf16("));
         for op in ["add", "sub", "mul", "min", "max"] {
             assert!(
                 POINTWISE_SRC.contains(&format!("DEFINE_BINARY_I64({op},")),
@@ -1148,6 +1231,70 @@ mod tests {
         assert_eq!(broadcast_strides(&[4, 1, 3], &[4, 5, 3]), [3, 0, 1]);
         assert_eq!(broadcast_strides(&[1, 5, 3], &[4, 5, 3]), [0, 3, 1]);
         assert_eq!(broadcast_strides(&[3], &[4, 5, 3]), [0, 0, 1]);
+    }
+
+    #[test]
+    fn classifier_disqualified_node_is_never_capture_eligible_regardless_of_shape() {
+        // `seq_independent == false` is the growing-symbol classifier's hard veto:
+        // no runtime shape may re-admit the node to CUDA-graph capture. On HEAD
+        // 0fd87df3 `capture_shape_eligible(false, &[320])` returned `true` (any
+        // rank-1 `[N]` satisfied `is_fixed_decode_shape`), silently baking a
+        // growing KV extent into the captured graph -> decode corruption. The
+        // authoritative veto must return `false` here.
+        assert!(!capture_shape_eligible(false, &[320]));
+        assert!(!capture_shape_eligible(false, &[328]));
+        // Scalar / product==1 shapes were also OR-admitted before; still vetoed.
+        assert!(!capture_shape_eligible(false, &[1]));
+        assert!(!capture_shape_eligible(false, &[1, 1, 1]));
+        assert!(!capture_shape_eligible(false, &[]));
+        // Higher-rank growing rows were always eager and remain so.
+        assert!(!capture_shape_eligible(false, &[320, 8]));
+    }
+
+    #[test]
+    fn classifier_pinned_node_stays_capture_eligible() {
+        // A truly pinned single-token decode shape the classifier proves safe
+        // (`seq_independent == true`, e.g. `[1,1,heads,dim]`) stays eligible.
+        assert!(capture_shape_eligible(true, &[1, 1, 32, 128]));
+        assert!(capture_shape_eligible(true, &[1]));
+        assert!(capture_shape_eligible(true, &[]));
+        // The verdict is shape-independent: even a large static feature row the
+        // classifier proved pinned stays capturable.
+        assert!(capture_shape_eligible(true, &[320]));
+    }
+
+    #[test]
+    fn disqualified_growing_reshape_consumer_yields_no_capture_signature() {
+        // Capture-LEVEL check mirroring `UnaryKernel::run`'s gating
+        // (`capture_shape_eligible(self.capture_seq_independent, shape).then(..)`)
+        // for a `Reshape([seq_kv,8],[-1]) -> seq_kv*8 -> Sigmoid` consumer that
+        // the classifier disqualified (`capture_seq_independent = false`) with a
+        // growing runtime extent `[320]`. A disqualified node must never produce a
+        // capture-safe signature, so `capture_support()` reports Unsupported. On
+        // HEAD 0fd87df3 this signature was `Some` (the silent-corruption hole).
+        let seq_independent = false;
+        let growing_shape = [320usize];
+        let signature = capture_shape_eligible(seq_independent, &growing_shape)
+            .then_some(growing_shape.to_vec());
+        assert!(
+            signature.is_none(),
+            "a classifier-disqualified node must never produce a capture-safe signature"
+        );
+    }
+
+    #[test]
+    fn pinned_single_token_consumer_yields_capture_signature() {
+        // Positive companion: a classifier-proven-pinned single-token decode
+        // consumer still produces a capture-safe signature, so capture coverage
+        // for genuinely fixed decode shapes is preserved.
+        let seq_independent = true;
+        let pinned_shape = [1usize, 1, 32, 128];
+        let signature =
+            capture_shape_eligible(seq_independent, &pinned_shape).then_some(pinned_shape.to_vec());
+        assert!(
+            signature.is_some(),
+            "a classifier-proven-pinned node must remain capture-eligible"
+        );
     }
 
     #[test]
@@ -1212,6 +1359,7 @@ mod tests {
             runtime: runtime.clone(),
             decomposed: false,
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }
         .execute(&inputs, &mut outputs)
         .unwrap();
@@ -1238,6 +1386,119 @@ mod tests {
                 error <= 2.0e-3,
                 "index {index}: silu({x}) * {} expected {expected}, got {} (error {error})",
                 b.to_f32(),
+                actual.to_f32()
+            );
+        }
+
+        unsafe {
+            runtime.free_raw(gate_dev).unwrap();
+            runtime.free_raw(up_dev).unwrap();
+            runtime.free_raw(output_dev).unwrap();
+        }
+    }
+
+    #[test]
+    fn decomposed_silu_mul_bf16_is_byte_exact_vs_two_op_bf16_reference() {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
+            .ok()
+            .flatten();
+        std::panic::set_hook(previous_hook);
+        let Some(runtime) = runtime else {
+            eprintln!("skipping decomposed SiluMul bf16 parity test: CUDA runtime unavailable");
+            return;
+        };
+        if runtime.require_nvrtc_half_headers("SiluMul").is_err() {
+            eprintln!("skipping decomposed SiluMul bf16 parity test: half headers unavailable");
+            return;
+        }
+
+        // Include the fp16-rounding-sensitive small magnitudes and both signs so
+        // the bf16 per-op rounding boundaries (Sigmoid → bf16, gate*sigmoid →
+        // bf16, silu*up → bf16) are all exercised.
+        let gate = [-9.0f32, -2.0, -0.25, -0.03125, 0.0, 0.125, 1.0, 3.0, 9.0].map(bf16::from_f32);
+        let up = [-1.5f32, 0.5, 2.0, -3.0, 4.0, -0.75, 1.25, 0.25, -2.0].map(bf16::from_f32);
+        let mut output = [bf16::ZERO; 9];
+        let bytes = std::mem::size_of_val(&gate);
+        let gate_dev = runtime.alloc_raw(bytes).unwrap();
+        let up_dev = runtime.alloc_raw(bytes).unwrap();
+        let output_dev = runtime.alloc_raw(bytes).unwrap();
+        let as_bytes = |values: &[bf16]| unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+        };
+        unsafe {
+            runtime.htod(as_bytes(&gate), gate_dev).unwrap();
+            runtime.htod(as_bytes(&up), up_dev).unwrap();
+        }
+
+        let shape = [1usize, gate.len()];
+        let strides = [gate.len() as i64, 1];
+        let device = DeviceId::cuda(0);
+        let inputs = [
+            TensorView::new(
+                DevicePtr(gate_dev as usize as *const c_void),
+                DataType::BFloat16,
+                &shape,
+                &strides,
+                device,
+            ),
+            TensorView::new(
+                DevicePtr(up_dev as usize as *const c_void),
+                DataType::BFloat16,
+                &shape,
+                &strides,
+                device,
+            ),
+        ];
+        let mut outputs = [TensorMut::new(
+            DevicePtrMut(output_dev as usize as *mut c_void),
+            DataType::BFloat16,
+            &shape,
+            &strides,
+            device,
+        )];
+        SiluMulKernel {
+            runtime: runtime.clone(),
+            decomposed: true,
+            last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
+        }
+        .execute(&inputs, &mut outputs)
+        .unwrap();
+        runtime.synchronize().unwrap();
+        let output_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                output.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of_val(&output),
+            )
+        };
+        unsafe { runtime.dtoh(output_bytes, output_dev).unwrap() };
+
+        // Reference reproduces the unfused two-op bf16 graph exactly:
+        //   s   = bf16(sigmoid_f32(gate))      (the Sigmoid node's bf16 output)
+        //   sil = bf16(gate * s)               (the first Mul's bf16 output)
+        //   y   = bf16(sil * up)               (the second Mul's bf16 output)
+        // All intermediate arithmetic is fp32 (sigmoid via f64 exp → f32, exactly
+        // like the device `op_sigmoid`), rounded to bf16 at each op boundary.
+        for (index, ((&a, &b), &actual)) in gate.iter().zip(&up).zip(&output).enumerate() {
+            let x = a.to_f32();
+            let sigmoid = if x >= 0.0 {
+                1.0f32 / (1.0 + (-f64::from(x)).exp() as f32)
+            } else {
+                let e = f64::from(x).exp() as f32;
+                e / (1.0 + e)
+            };
+            let sigmoid_b = bf16::from_f32(sigmoid).to_f32();
+            let silu_b = bf16::from_f32(x * sigmoid_b).to_f32();
+            let expected = bf16::from_f32(silu_b * b.to_f32());
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "index {index}: decomposed silu bf16 mismatch for gate={x} up={} \
+                 expected {} got {}",
+                b.to_f32(),
+                expected.to_f32(),
                 actual.to_f32()
             );
         }
@@ -1297,6 +1558,7 @@ mod tests {
             runtime: runtime.clone(),
             decomposed_silu: true,
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }
         .execute(&standalone_input, &mut standalone_output)
         .unwrap();

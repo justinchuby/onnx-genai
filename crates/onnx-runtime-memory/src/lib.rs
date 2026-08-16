@@ -22,11 +22,11 @@
 //! only on [`onnx_runtime_ir`], contains no `unsafe`, and is free of PyO3 / EP /
 //! session dependencies so it is trivially testable in isolation.
 //!
-//! Because the executor integration lands later, this crate currently has
-//! **zero inbound Cargo edges** inside the workspace — by design. It is kept in
-//! the workspace so its planner is versioned, built, and exercised by its
-//! deterministic test suite (`tests/planner.rs`) ahead of the executor rework;
-//! do not remove it as "dead weight".
+//! `onnx-runtime-session` consumes this crate, behind the native executor phase
+//! profiler, to measure the activation peak implied by concrete run shapes and
+//! zero-copy views. The executor still owns its existing buffers today; the
+//! planner measurement is the production call site that de-risks the later
+//! allocator rework.
 //!
 //! ## What it computes
 //!
@@ -68,16 +68,16 @@
 //! still-live alias. The caller supplies the `view -> source` edges via
 //! [`ViewMap`]; op names are never hardcoded here.
 //!
-//! ## Intended executor integration (deferred follow-up — out of scope now)
+//! ## Executor integration
 //!
-//! The follow-up PR wires this into `onnx-runtime-session`'s executor:
+//! `onnx-runtime-session` wires the planner into the executor in increments:
 //!
 //! 1. **Build the [`ViewMap`]** from the executor's existing view plan (the
 //!    `views`/`pinned` machinery in `executor.rs`), mapping each view value to
 //!    its source (root) buffer owner.
 //! 2. **Call the planner** with a size oracle backed by the run's *resolved*
 //!    shapes (build-time static shapes where available; a per-run oracle
-//!    otherwise). On [`PlanStatus::Deferred`], re-plan once shapes resolve.
+//!    otherwise). This is implemented and exposed as peak-vs-naive stats.
 //! 3. **Allocate `peak_bytes`** as one arena (or `num_slots` `DeviceBuffer`s),
 //!    then map each [`SlotId`] to an offset/allocation.
 //! 4. **Hand each value a `TensorMut` window** into its assigned slot instead of

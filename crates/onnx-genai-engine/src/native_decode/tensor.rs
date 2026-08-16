@@ -18,6 +18,39 @@ pub(crate) fn extract_logits(tensor: &Tensor) -> anyhow::Result<Vec<Vec<f32>>> {
     }
 }
 
+/// Extract per-*row* logits from a batched single-token forward whose logits
+/// tensor is `[batch, 1, vocab]` (batch axis leading, query-seq collapsed to 1),
+/// returning one `[vocab]` vector per batch row. Unlike [`extract_logits`],
+/// which interprets a rank-3 tensor as `[1, seq, vocab]` and keeps the query-seq
+/// rows of a single sequence, this keeps every batch row — the stage 2a
+/// batch-N fused-forward result shape.
+pub(crate) fn extract_batch_row_logits(
+    tensor: &Tensor,
+    batch: usize,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    let values = tensor_to_f32(tensor)?;
+    let vocab = match tensor.shape.as_slice() {
+        [b, seq, vocab] if *b == batch && *seq == 1 && *vocab > 0 => *vocab,
+        [b, vocab] if *b == batch && *vocab > 0 => *vocab,
+        shape => bail!(
+            "unsupported batched logits tensor shape {shape:?} for batch {batch}; expected [{batch}, 1, vocab] or [{batch}, vocab]"
+        ),
+    };
+    if values.len() < batch * vocab {
+        bail!(
+            "batched logits tensor {:?} yielded {} values, need {}",
+            tensor.shape,
+            values.len(),
+            batch * vocab
+        );
+    }
+    Ok(values
+        .chunks(vocab)
+        .take(batch)
+        .map(<[f32]>::to_vec)
+        .collect())
+}
+
 pub(crate) fn argmax_logits_tensor(tensor: &Tensor) -> anyhow::Result<TokenId> {
     let (value_count, vocab) = match tensor.shape.as_slice() {
         [vocab] if *vocab > 0 => (*vocab, *vocab),
@@ -273,9 +306,208 @@ pub(crate) fn is_recurrent_state_shape(shape: &[Dim]) -> bool {
     shape.len() >= 2 && shape[shape.len() - 2].is_static()
 }
 
+/// Bytes of fixed-size recurrent state one sequence needs.
+///
+/// The hybrid decoders (`conv_state`, `recurrent_state`) keep one of these per
+/// recurrent layer for as long as a sequence lives, which makes it a
+/// per-sequence cost that scales exactly the way KV does -- and unlike KV it was
+/// never charged to anything. Admission decides how many sequences fit while
+/// this is invisible to it, so the governor can admit a batch that does not fit
+/// and the failure lands as an allocation error mid-generation.
+///
+/// Counted from the graph's own metadata, so a model with no recurrent layers
+/// answers zero without being asked about by name (RULES.md §2).
+///
+/// The batch axis is counted as one: the reservation is per sequence, and the
+/// scheduler multiplies. A symbolic non-batch axis means the export did not pin
+/// a geometry this can size, and is reported rather than guessed at.
+pub(crate) fn recurrent_state_bytes_per_sequence(
+    session: &InferenceSession,
+    present_to_past: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<u64> {
+    // Only inputs the resolved I/O actually declares as loop-carried state.
+    // Rediscovering that from shape alone -- "the penultimate axis is static" --
+    // also matches a fixed-length KV input and any unrelated fixed-shape input,
+    // which would charge memory the decoder never keeps, multiplied by the batch
+    // size. `is_recurrent_state_shape` is the right test for *classifying* a
+    // declared state input; it is not a test for *finding* them.
+    let declared: std::collections::HashSet<&str> =
+        present_to_past.values().map(String::as_str).collect();
+    let mut total: u64 = 0;
+    for meta in session.inputs() {
+        if !declared.contains(meta.name.as_str()) || !is_recurrent_state_shape(&meta.shape) {
+            continue;
+        }
+        total = total.saturating_add(recurrent_state_tensor_bytes(
+            &meta.name,
+            meta.dtype,
+            &meta.shape,
+        )?);
+    }
+    Ok(total)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn recurrent_state_bytes_from_graph(
+    graph: &onnx_runtime_ir::Graph,
+    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+) -> anyhow::Result<u64> {
+    let declared: std::collections::HashSet<&str> = io
+        .and_then(|io| io.state_pairs.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .map(|pair| pair.input.as_str())
+        .collect();
+    let mut total = 0_u64;
+    for &input in &graph.inputs {
+        let value = graph.value(input);
+        let Some(name) = value.name.as_deref() else {
+            continue;
+        };
+        if !declared.contains(name) || !is_recurrent_state_shape(&value.shape) {
+            continue;
+        }
+        total = total.saturating_add(recurrent_state_tensor_bytes(
+            name,
+            value.dtype,
+            &value.shape,
+        )?);
+    }
+    Ok(total)
+}
+
+fn recurrent_state_tensor_bytes(name: &str, dtype: DataType, shape: &[Dim]) -> anyhow::Result<u64> {
+    let mut elements: u64 = 1;
+    for (axis, dim) in shape.iter().copied().enumerate() {
+        let extent = match dim {
+            Dim::Static(value) => u64::try_from(value).unwrap_or(0),
+            Dim::Symbolic(_) if axis == 0 => 1,
+            Dim::Symbolic(_) => bail!(
+                "cannot size recurrent state '{name}': dimension {axis} of {shape:?} is symbolic \
+                 and is not the batch axis, so the export did not pin a geometry to reserve for"
+            ),
+        };
+        elements = elements.saturating_mul(extent);
+    }
+    let bytes = dtype
+        .checked_storage_bytes(usize::try_from(elements).unwrap_or(usize::MAX))
+        .with_context(|| format!("unsupported recurrent-state dtype {dtype:?} for '{name}'"))?;
+    Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
+}
+
+/// Bytes of KV cache one sequence holds at full context, from the declared
+/// `present_to_past` pairs.
+///
+/// # Why this is charged at all
+///
+/// On the ONNX Runtime path the KV pool leases its capacity at construction, so
+/// the ledger sees it. The native path's page table is deliberately bookkeeping
+/// only -- without per-layer geometry a page carries no storage -- and the real
+/// KV lives in the session's own past/present tensors, which are allocated
+/// through the execution provider and never reach the ledger. So the tier that
+/// admission and every other consumer read was understated by the largest
+/// per-sequence cost the decoder has.
+///
+/// # Why full context rather than current length
+///
+/// A lease is a reservation, and the point of reserving is that the memory is
+/// there when the sequence grows into it. Charging the current length would
+/// admit a sequence the device cannot actually carry to its context limit, and
+/// discover that at a `cuMemAlloc` mid-generation -- which is the failure the
+/// ledger exists to convert into a refusal at admission.
+///
+/// # Why the declared pairs rather than shape discovery
+///
+/// Same reason as [`recurrent_state_bytes_per_sequence`]: `present_to_past` is
+/// what the resolved I/O says is loop-carried. Anything else that happens to
+/// look like a KV tensor is not one, and charging it would reserve memory the
+/// decoder never keeps.
+pub(crate) fn kv_cache_bytes_per_sequence(
+    session: &InferenceSession,
+    present_to_past: &std::collections::HashMap<String, String>,
+    max_context: usize,
+) -> anyhow::Result<u64> {
+    let declared: std::collections::HashSet<&str> =
+        present_to_past.values().map(String::as_str).collect();
+    let mut tensors = Vec::new();
+    for meta in session.inputs() {
+        // Recurrent state is loop-carried too, and is charged separately at its
+        // own fixed size. Sizing it by context would be wrong by orders of
+        // magnitude -- its whole point is that it does not grow.
+        if !declared.contains(meta.name.as_str()) || is_recurrent_state_shape(&meta.shape) {
+            continue;
+        }
+        tensors.push(crate::kv_sizing::KvTensorSpec {
+            name: meta.name.clone(),
+            dtype: match meta.dtype {
+                DataType::Float32 => crate::kv_sizing::KvStorageType::Float32,
+                DataType::Float16 => crate::kv_sizing::KvStorageType::Float16,
+                DataType::BFloat16 => crate::kv_sizing::KvStorageType::BFloat16,
+                dtype => bail!("unsupported KV dtype {dtype:?} for '{}'", meta.name),
+            },
+            shape: meta
+                .shape
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(axis, dim)| match dim {
+                    Dim::Static(value) => {
+                        crate::kv_sizing::KvDimension::Fixed(u64::try_from(value).unwrap_or(0))
+                    }
+                    Dim::Symbolic(_) if axis == 0 => {
+                        crate::kv_sizing::KvDimension::PerSequenceBatch
+                    }
+                    Dim::Symbolic(_) => crate::kv_sizing::KvDimension::Context,
+                })
+                .collect(),
+        });
+    }
+    crate::kv_sizing::kv_cache_bytes_for_tensors(&tensors, u64::try_from(max_context).unwrap_or(0))
+}
+
 pub(crate) fn make_empty_input_tensor(
     session: &InferenceSession,
     name: &str,
+) -> anyhow::Result<Tensor> {
+    make_empty_input_tensor_batched(session, name, 1)
+}
+
+/// Batch-aware variant of [`make_empty_input_tensor`]: builds an empty (zero
+/// sequence-length) past-KV / recurrent-state tensor with the batch axis (axis
+/// 0) set to `batch` rows instead of the single-sequence default of `1`.
+///
+/// Stage 2a uses this for the stateless batch-N fused-forward probe
+/// ([`NativeDecodeSession::run_fused_batch_prefill`]): a genuine batch axis with
+/// an empty past, so weight streaming is exercised across `N` independent rows
+/// without a batched KV *layout* (stage 2b). `batch == 1` is byte-identical to
+/// [`make_empty_input_tensor`]. For a non-empty past see
+/// [`make_past_input_tensor_batched`].
+pub(crate) fn make_empty_input_tensor_batched(
+    session: &InferenceSession,
+    name: &str,
+    batch: usize,
+) -> anyhow::Result<Tensor> {
+    make_past_input_tensor_batched(session, name, batch, 0)
+}
+
+/// Batch-aware past-KV builder that seeds a **non-empty** sequence axis of
+/// `past_len` zero-filled positions (batch axis 0 = `batch` rows).
+///
+/// Stage 2b (#750) uses this to drive the batch-N fused forward with a genuine
+/// length-`L` batched KV past ([`NativeDecodeSession::run_fused_batch_forward`]):
+/// unlike the stage 2a empty-past probe, this exercises the ONNX attention
+/// **batch coupling across QKV / mask / past-KV** at `N > 1` with real past
+/// content, and — crucially for the memory trade — commits `batch × past_len`
+/// worth of KV so the weight-residency reclaim under the elastic budget (#866)
+/// becomes observable in `htod_bytes_per_token`. Growable seq axes are seeded to
+/// `past_len`; fixed-size recurrent feature axes keep their static extent and
+/// ignore `past_len`. `past_len == 0` is byte-identical to
+/// [`make_empty_input_tensor_batched`].
+pub(crate) fn make_past_input_tensor_batched(
+    session: &InferenceSession,
+    name: &str,
+    batch: usize,
+    past_len: usize,
 ) -> anyhow::Result<Tensor> {
     let meta = session
         .inputs()
@@ -292,15 +524,16 @@ pub(crate) fn make_empty_input_tensor(
     let mut shape = Vec::with_capacity(meta.shape.len());
     for (axis, dim) in meta.shape.iter().copied().enumerate() {
         let value = if axis == 0 {
-            1
+            batch
         } else if axis == seq_axis {
-            // Growable KV caches start with an empty sequence axis; fixed-size
-            // recurrent states (hybrid linear-attention conv_state /
-            // recurrent_state) carry a static feature dim here and must be seeded
-            // at full extent so the first forward sees a zero-filled state.
+            // Growable KV caches carry the requested `past_len` on the sequence
+            // axis; fixed-size recurrent states (hybrid linear-attention
+            // conv_state / recurrent_state) carry a static feature dim here and
+            // must be seeded at full extent so the first forward sees a
+            // zero-filled state.
             match dim {
                 Dim::Static(value) => value,
-                Dim::Symbolic(_) => 0,
+                Dim::Symbolic(_) => past_len,
             }
         } else if let Dim::Static(value) = dim {
             value
@@ -312,11 +545,14 @@ pub(crate) fn make_empty_input_tensor(
         };
         shape.push(value);
     }
-    let bytes = meta
-        .dtype
-        .checked_storage_bytes(shape.iter().product())
+    let numel: usize = shape.iter().product();
+    // Sized rather than built: `from_raw` with a zeroed `Vec` allocates these
+    // bytes twice and memcpys between them, and a hybrid decoder seeds one of
+    // these per recurrent layer per sequence.
+    meta.dtype
+        .checked_storage_bytes(numel)
         .with_context(|| format!("unsupported KV dtype {:?} for '{name}'", meta.dtype))?;
-    Tensor::from_raw(meta.dtype, shape, &vec![0; bytes])
+    Tensor::zeros(meta.dtype, shape)
         .with_context(|| format!("create empty native KV tensor '{name}'"))
 }
 

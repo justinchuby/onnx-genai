@@ -173,12 +173,15 @@ jobs:
           publish_crate onnx-std
           publish_crate onnx-runtime-optimizer
           publish_crate onnx-runtime-cpuinfo
+          publish_crate onnx-runtime-memory-governor
+          publish_crate onnx-runtime-virtual-memory
           publish_crate onnx-runtime-memory
           publish_crate onnx-runtime-ep-api
           publish_crate mlas-sys
           publish_crate onnx-runtime-quantization
           publish_crate onnx-runtime-ep-cpu
           publish_crate onnx-runtime-eager
+          publish_crate onnx-runtime-cuda-memory
           publish_crate onnx-runtime-ep-cuda
           publish_crate onnx-genai-metadata
           publish_crate onnx-genai-runtime-config

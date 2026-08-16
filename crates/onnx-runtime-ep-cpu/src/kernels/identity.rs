@@ -1,4 +1,4 @@
-//! `Identity`: copy the input to the output unchanged (`docs/ORT2.md` §4.4).
+//! `Identity`: copy the input to the output unchanged (`docs/architecture/ORT2.md` §4.4).
 //!
 //! Unlike the arithmetic kernels, `Identity` is **dtype-agnostic**: it moves the
 //! raw element bytes without interpreting them, so it works for every raw-layout

@@ -38,7 +38,7 @@ use onnx_runtime_memory_governor::{
 };
 
 use crate::VirtualMemoryError;
-use crate::backing::{HostBacking, VirtualBacking};
+use crate::backing::{HostBacking, PhysicalMemoryAccounting, VirtualBacking};
 
 /// A growable region whose base address never changes.
 ///
@@ -62,6 +62,7 @@ pub struct VirtualBuffer<B: VirtualBacking = HostBacking> {
     tier: Tier,
     role: MemoryRole,
     holder: HolderId,
+    physical_memory_accounting: PhysicalMemoryAccounting,
     /// Covers exactly `committed` bytes. `None` while nothing is committed,
     /// because a zero-byte lease is not a thing to hold.
     lease: Option<MemoryLease>,
@@ -76,6 +77,17 @@ pub enum VirtualBufferError {
     /// The governor refused to lease the pages the growth needs.
     #[error(transparent)]
     Budget(#[from] MemoryError),
+    /// A backing and buffer were connected to different accounting books.
+    #[error(
+        "virtual backing charges physical memory to {backing}, but the buffer governor uses \
+         {governor}; both must use the same memory authority"
+    )]
+    AuthorityMismatch {
+        /// Authority that owns the backing's physical allocations.
+        backing: onnx_runtime_memory_governor::MemoryAuthorityId,
+        /// Authority supplied to the buffer.
+        governor: onnx_runtime_memory_governor::MemoryAuthorityId,
+    },
     /// The request exceeds the address space reserved at construction.
     #[error(
         "cannot grow to {requested} bytes: this buffer reserved {capacity} bytes of address \
@@ -120,6 +132,16 @@ impl<B: VirtualBacking> VirtualBuffer<B> {
         role: MemoryRole,
         holder: HolderId,
     ) -> Result<Self, VirtualBufferError> {
+        let physical_memory_accounting = backing.physical_memory_accounting();
+        if let PhysicalMemoryAccounting::Backing { authority } = physical_memory_accounting {
+            let governor_authority = governor.authority_id();
+            if authority != governor_authority {
+                return Err(VirtualBufferError::AuthorityMismatch {
+                    backing: authority,
+                    governor: governor_authority,
+                });
+            }
+        }
         let capacity = round_up(backing.granularity(), capacity.max(1));
         let reservation = backing.reserve(capacity)?;
         Ok(Self {
@@ -132,6 +154,7 @@ impl<B: VirtualBacking> VirtualBuffer<B> {
             tier,
             role,
             holder,
+            physical_memory_accounting,
             lease: None,
         })
     }
@@ -202,17 +225,23 @@ impl<B: VirtualBacking> VirtualBuffer<B> {
         let needed = round_up(self.backing.granularity(), bytes);
         if needed > self.committed {
             let extra = needed - self.committed;
-            // Lease before mapping. A refusal must not commit memory, or the
-            // budget is decorative.
-            match self.lease.as_mut() {
-                Some(lease) => lease.grow(extra as u64)?,
-                None => {
-                    self.lease = Some(self.governor.reserve(
-                        self.tier,
-                        extra as u64,
-                        self.role,
-                        self.holder,
-                    )?);
+            let backing_accounts = matches!(
+                self.physical_memory_accounting,
+                PhysicalMemoryAccounting::Backing { .. }
+            );
+            if !backing_accounts {
+                // Lease before mapping. A refusal must not commit memory, or
+                // the budget is decorative.
+                match self.lease.as_mut() {
+                    Some(lease) => lease.grow(extra as u64)?,
+                    None => {
+                        self.lease = Some(self.governor.reserve(
+                            self.tier,
+                            extra as u64,
+                            self.role,
+                            self.holder,
+                        )?);
+                    }
                 }
             }
             if let Err(error) = self
@@ -221,7 +250,9 @@ impl<B: VirtualBacking> VirtualBuffer<B> {
             {
                 // Give the pages back rather than leaving the governor
                 // believing they are held.
-                self.release(extra);
+                if !backing_accounts {
+                    self.release(extra);
+                }
                 return Err(error.into());
             }
             self.committed = needed;
@@ -246,7 +277,12 @@ impl<B: VirtualBacking> VirtualBuffer<B> {
             offset -= granule;
             self.backing
                 .release(&mut self.reservation, offset, granule)?;
-            self.release(granule);
+            if matches!(
+                self.physical_memory_accounting,
+                PhysicalMemoryAccounting::Buffer
+            ) {
+                self.release(granule);
+            }
             self.committed = offset;
         }
         self.len = bytes;
@@ -289,7 +325,8 @@ impl<B: VirtualBacking> std::fmt::Debug for VirtualBuffer<B> {
 mod tests {
     use super::*;
     use crate::granularity;
-    use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
+    use onnx_runtime_memory_governor::{DeviceKey, LeaseLedger, LedgerGovernor, MemoryAuthorityId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const HOLDER: HolderId = HolderId::new(4);
 
@@ -304,6 +341,134 @@ mod tests {
         )
         .expect("address space");
         (buffer, governor)
+    }
+
+    #[derive(Debug, Clone)]
+    struct AuthorityBacking {
+        authority: MemoryAuthorityId,
+        reserves: Arc<AtomicUsize>,
+        commits: Arc<AtomicUsize>,
+    }
+
+    // SAFETY: this test backing returns an inert address, never exposes slices,
+    // and records mapping calls without touching memory.
+    unsafe impl VirtualBacking for AuthorityBacking {
+        type Reservation = usize;
+
+        fn granularity(&self) -> usize {
+            4096
+        }
+
+        fn physical_memory_accounting(&self) -> PhysicalMemoryAccounting {
+            PhysicalMemoryAccounting::Backing {
+                authority: self.authority,
+            }
+        }
+
+        fn reserve(&self, _len: usize) -> Result<Self::Reservation, VirtualMemoryError> {
+            self.reserves.fetch_add(1, Ordering::Relaxed);
+            Ok(0x1000)
+        }
+
+        fn base(reservation: &Self::Reservation) -> usize {
+            *reservation
+        }
+
+        fn commit(
+            &self,
+            _reservation: &mut Self::Reservation,
+            _offset: usize,
+            _len: usize,
+        ) -> Result<(), VirtualMemoryError> {
+            self.commits.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn release(
+            &self,
+            _reservation: &mut Self::Reservation,
+            _offset: usize,
+            _len: usize,
+        ) -> Result<(), VirtualMemoryError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn backing_accounting_accepts_the_same_authority_without_double_charge() {
+        let governor = LedgerGovernor::new(LeaseLedger::new_for_device(
+            DeviceKey::device(2),
+            8192,
+            0,
+            0,
+        ));
+        let commits = Arc::new(AtomicUsize::new(0));
+        let backing = AuthorityBacking {
+            authority: governor.authority_id(),
+            reserves: Arc::new(AtomicUsize::new(0)),
+            commits: Arc::clone(&commits),
+        };
+        let mut buffer = VirtualBuffer::with_backing(
+            backing,
+            8192,
+            Arc::new(governor.clone()),
+            Tier::Device,
+            MemoryRole::KvCache,
+            HOLDER,
+        )
+        .expect("matching authority");
+
+        buffer.grow_to(4096).expect("backing owns the charge");
+
+        assert_eq!(commits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            governor.used(Tier::Device),
+            0,
+            "mapped attribution must not add a second physical charge"
+        );
+    }
+
+    #[test]
+    fn backing_accounting_rejects_a_different_authority_before_reservation() {
+        let backing_governor = LedgerGovernor::new(LeaseLedger::new_for_device(
+            DeviceKey::device(2),
+            8192,
+            0,
+            0,
+        ));
+        let buffer_governor = LedgerGovernor::new(LeaseLedger::new_for_device(
+            DeviceKey::device(2),
+            8192,
+            0,
+            0,
+        ));
+        let reserves = Arc::new(AtomicUsize::new(0));
+        let commits = Arc::new(AtomicUsize::new(0));
+        let backing = AuthorityBacking {
+            authority: backing_governor.authority_id(),
+            reserves: Arc::clone(&reserves),
+            commits: Arc::clone(&commits),
+        };
+
+        let error = VirtualBuffer::with_backing(
+            backing,
+            8192,
+            Arc::new(buffer_governor.clone()),
+            Tier::Device,
+            MemoryRole::KvCache,
+            HOLDER,
+        )
+        .expect_err("different accounting authorities must be rejected");
+
+        assert!(matches!(
+            error,
+            VirtualBufferError::AuthorityMismatch { backing, governor }
+                if backing == backing_governor.authority_id()
+                    && governor == buffer_governor.authority_id()
+        ));
+        assert_eq!(reserves.load(Ordering::Relaxed), 0);
+        assert_eq!(commits.load(Ordering::Relaxed), 0);
+        assert_eq!(buffer_governor.used(Tier::Device), 0);
     }
 
     /// The property the whole type exists for: growth does not move the buffer.

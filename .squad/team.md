@@ -38,6 +38,7 @@
 | Scribe | Session Logger | .squad/agents/scribe/charter.md | 📋 Scribe |
 | Ralph | Work Monitor | .squad/agents/ralph/charter.md | 🔄 Monitor |
 | Rai | RAI Reviewer | .squad/agents/rai/charter.md | 🛡️ RAI |
+| Challenger | Claim Challenger (挑战者) | .squad/agents/challenger/charter.md | 🎯 Challenge |
 | Fact Checker | Fact Checker | .squad/agents/fact-checker/charter.md | 🔍 Verifier |
 
 ## Sub-Teams (Pods)

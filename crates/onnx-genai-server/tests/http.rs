@@ -845,7 +845,7 @@ async fn chat_completions_response_format_json_object_returns_valid_json() {
                     json!({
                         "model": "tiny-llm",
                         "messages": [{"role": "user", "content": "hello"}],
-                        "max_tokens": 14,
+                        "max_tokens": 13,
                         "response_format": {"type": "json_object"}
                     })
                     .to_string(),
@@ -881,7 +881,7 @@ async fn streaming_chat_completions_response_format_json_object_streams_valid_js
                     json!({
                         "model": "tiny-llm",
                         "messages": [{"role": "user", "content": "hello"}],
-                        "max_tokens": 14,
+                        "max_tokens": 13,
                         "stream": true,
                         "response_format": {"type": "json_object"}
                     })

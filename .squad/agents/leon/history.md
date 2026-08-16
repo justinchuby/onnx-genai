@@ -1,60 +1,34 @@
-# Leon — History (compacted 2026-07-29)
+# Leon — History (compacted 2026-08-12)
 
 **Role:** Engine/KV/runtime-buffer implementer. Runtime owns KV; model geometry from `inference_metadata.yaml`. Preserve device-buffer ownership, past/present aliasing, exact real-model comparison, reviewer lockouts.
 
-**Historical summary through 2026-07-28:** Generalized shared KV, attention-sink SWA, connectors, prefix payload materialization (equal prefix keys prove content equality). Delivered heterogeneous Gemma4 E2B speculative execution (proposer inputs corrected). Hardened loaders/fusion (unsupported dtypes fail-closed, LayerNorm operand-order guarded, opset validation recursive, `nxrt_*` C ABI replaces `ort2_*`). Implemented weight-offload foundations, route-first QMoE, CUDA SparseKvGather D==0 validation, CPU CSA claim validation. Contributed to CUDA graph/capture correctness (SequenceAt/Scan parity, Phi decode lock, default-domain Attention and RoPE capture regressions) and PR #291 rewind policy split (public rewind rejects before mutation, internal speculative rewind allowed). Unified native CUDA/ORT KV capacity policy with transactional growth; real DeepSeek validation verified 4→8→16 growth/recapture.
+**Historical summary through 2026-08-12:** Generalized shared KV, attention-sink SWA, connectors, prefix payload materialization. Hardened loaders/fusion (unsupported dtypes fail-closed, LayerNorm operand-order guarded, opset validation recursive, `nxrt_*` C ABI). CUDA graph/capture correctness. PR #291 rewind policy split. Unified native CUDA/ORT KV capacity policy. EP plugin compute hardening (BL2/BL3 slot fidelity wave 1). Clippy dead_code cleanup. NEW-1 fix + f16/bf16 marshaling. Stream EP memory leak fix. Device data-transfer contract. TensorRT build fix (#31988). Apple Accelerate arm64 detection (#32001). BF16 LayerNorm PrePack counter + MLFloat16 stats coverage (#31974 — introduced regression, fixed by Coco).
 
-Older detailed work (2026-07-14 through 2026-07-28) archived in `history-archive.md`.
+Older detailed work archived in `history-archive.md`.
 
-## Recent work (2026-07-29)
+## 2026-08-12 — PR #31974 final cleanup: PrePack counter, MLFloat16 stats, centralised trait
 
-### 2026-07-29T03:45:00+0000 — PR #382 CPU shared-buffer regression lock
+- Threaded `number_of_pre_packed_weights_counter` through `RunBF16CpuOnly`; PrePack A/B tests now assert counter=0 (non-initializer) and counter=2 (initializer).
+- Added `LayerNorm17_MLFloat16_MeanInvStdDev_FloatPrecision` test for fp16 stat precision.
+- Moved `is_narrow_float_v` to `narrow_float_utils.h`.
+- Verified counter non-vacuity by breaking PrePack and observing test failure.
+- Test counts: 21 BF16 (was 20), 107 LayerNorm suite (was 106).
+- Head SHA: 59b84aca7a
+- ⚠️ This commit introduced a regression — see entry below.
 
-- Under Benny's reviewer lockout, added `cpu_shared_buffer_continuous_batch_uses_declared_kv_pairs`, using `tiny-llm-sharedbuffer` and explicit float32 KV metadata.
-- Engine-level CPU test runs continuous batching and compares sequential generation; fails at session construction if declared `model.io.kv_inputs` / `kv_outputs` stop reaching `BatchedSharedBufferDecodeSession`.
-- Revert verification proved the test catches latent #380 regression previously hidden because equivalent CUDA E2E auto-skips without CUDA. Repair and test merged in `85b9ba15`.
+## 2026-08-12 — PR #31974 regression: is_packed default flip caused float LayerNorm breakage
 
-### 2026-07-28T18:00:00-0700 — PR #385 re-scoped onto #392 (server + Python sampling wiring)
+Commit `59b84aca7a` (Leon) introduced a regression: flipped `is_packed` default from `false` to `true` in `LayerNormImpl::PrePack`. `ConvertMLFloat16ToFloatIfNeeded` only sets `is_packed` inside narrow-float branches; for float inputs it is a no-op, so float dispatch incorrectly believed Scale/Bias were prepacked and failed with "Missing Input: Scale". Nine float `LayerNormTest` cases broke. Coco root-caused and fixed in `e036e53d31` (one-line restore of `false` default). Full-suite results: BF16 21/21, LayerNorm 107/107, SkipLayerNorm 26/26. The `narrow_float_utils.h` centralisation was sound and kept.
 
-- #392 merged engine + CLI half of model-sampling-defaults work to `main` (`resolve_sampling_defaults`, `Option`-typed `SamplingOverrides`, CLI wiring). Strict precedence preserved: explicit override > model-declared > greedy fallback.
-- Reset branch onto `origin/main`, re-applied only the delta #392 left missing: server + Python wiring, misnamed-test fix, resolver-level temperature-0 → greedy guard. Final diff: 7 files, +414/-49, single commit `b78d8bec`.
-- Server/Python callers now decode stochastically against `do_sample: true` models, matching CLI. No greedy-assuming test broke.
-- Gates green: engine lib 274, server sampling 116 pass (1 pre-existing fixture failure)
+**Lesson reinforced:** A flag set only on some code paths must default to the conservative value. Set it explicitly where the work happens.
 
-## 2026-07-29T12:30:00Z — tiny-reasoning-fixture rounds 2–3 (PR #411)
+## 2026-08-12 — CUDA capture arc COMPLETE (shared: 11.4 → 23.13 tok/s)
+Blocker 3 (PIN) landed as **#852** (`70a5971d`): engine-gated pin of the GQA
+fixed-capacity KV seq symbols to constant so the capture classifier stops
+force-declining GQA (disqualifying set 53 → 0), keeping the kernel `capture_support()`
+gate as an independent backstop; growing/paged KV stays vetoed. Prerequisite #3 of
+the 5-blocker chain (#848 → #850 → #852 → #855 → #854). My pin exposed the bf16 GQA
+kernel gap I flagged to Sebastian (#855). Team result: native decode **11.4 → 23.13
+tok/s**, capture fully engaged (1 segment / 0 seams).
 
-### Round 2 (replaced Batty after Gaff REJECT)
-Authored statistical token-stream replacement. Luv ran it alone: 15/15 failures with
-fix intact; one green in parallel suite was a fluke. Luv issued REJECT.
-
-### Round 3 — resolved-policy surface (approved `f8ed4fb4`)
-Surfaced sampling policy generation actually resolved into `--stats`/`--profile`.
-`SamplingPolicy` captured from `turn_options` after `resolve_session_sampling`; same
-struct moved into `TurnInput.options` (`:1352`) — no separate display-side resolution.
-Two resolution sites unified: one helper called by both `/session` and every turn,
-reading live backend on demand. No cache; no staleness across `/reload`/`/ep`/`/backend`.
-`interactive.rs:1342-1347` + `generate.rs:122-127`.
-
-Luv approved at `f8ed4fb4`. Mutation: both new tests FAIL 3/3; suite 42+2/44.
-Mutated stats line `greedy=true temperature=1 top_k=0` — matches #385/#392 class.
-
-### Delta (`88fa86b5`)
-Moved capture inside `run_generation_turn` (`output.rs:206-211`). `turn` bound
-immutably; moved into `backend.generate(turn, …)` at line 278 — no window between
-capture and use. Divergence structurally impossible. Luv delta-approved after
-mutation 3/3 red, isolation 10/10 green, full suite 44/44.
-
-Also contributed to:
-- Fixture `manifest.json`/generator string consistency fix (Batty's bug).
-- Empty-answer invariant correction (manifest now accurately describes "drop
-  whitespace-only" rather than asserting strict non-emptiness).
-
-Durable rules:
-- "Instrument the boundary you care about."
-- "Two independent resolution sites for one policy is the defect, not an inconvenience."
-- "Close a gap by construction rather than by comment where you can."
-- "A checked-in fixture must be reproducible from its generator."
-(`.squad/decisions.md`, reconstructed rules section, 2026-07-29)
-
-Inbox drop `leon-reasoning-fixture-round3.md` was lost when the worktree was deleted
-before Scribe ran; content reconstructed into `.squad/decisions.md`.
+- **2026-08-14 (#921, MERGED):** textproto fixture sweep — converted 29 committed inline-weight ONNX fixtures to `model.onnx.textproto` and established the convention (keep binary only for external-data sidecars or real-ORT/ORT-GenAI package loaders). Added the in-memory textproto→binary ORT shim `tests/common/ort_session.rs`; each conversion round-trip verified and suites re-run green.

@@ -208,13 +208,16 @@ impl LeaseAccounting for HostGovernorAccounting {
 #[derive(Debug)]
 pub struct HostLeaseGovernor {
     accounting: Arc<HostGovernorAccounting>,
+    authority_id: onnx_runtime_memory_governor::MemoryAuthorityId,
 }
 
 impl HostLeaseGovernor {
     /// Grant leases against `governor` on behalf of `owner`.
     pub fn new(governor: Arc<HostGovernor>, owner: LocalDeviceId, priority: HostPriority) -> Self {
+        let authority_id = governor.memory_authority_id();
         Self {
             accounting: Arc::new(HostGovernorAccounting::new(governor, owner, priority)),
+            authority_id,
         }
     }
 
@@ -225,6 +228,10 @@ impl HostLeaseGovernor {
 }
 
 impl MemoryGovernor for HostLeaseGovernor {
+    fn authority_id(&self) -> onnx_runtime_memory_governor::MemoryAuthorityId {
+        self.authority_id
+    }
+
     fn reserve(
         &self,
         tier: Tier,
@@ -240,6 +247,20 @@ impl MemoryGovernor for HostLeaseGovernor {
             holder,
             Arc::clone(&self.accounting) as Arc<dyn LeaseAccounting>,
         ))
+    }
+
+    fn used(&self, tier: Tier) -> u64 {
+        if tier != Tier::Host {
+            return 0;
+        }
+        // What the host governor has actually granted. Unlike the ledger's
+        // count this is a claim on a machine-wide resource, so it is read from
+        // the governor rather than accumulated here.
+        self.accounting
+            .governor
+            .snapshot()
+            .map(|snapshot| snapshot.claimed_bytes)
+            .unwrap_or(0)
     }
 
     fn available(&self, tier: Tier) -> u64 {
@@ -269,6 +290,15 @@ mod tests {
         let host =
             Arc::new(HostGovernor::new(HostGovernorConfig::new(capacity)).expect("governor"));
         HostLeaseGovernor::new(host, DEVICE, 1)
+    }
+
+    #[test]
+    fn adapters_over_one_host_governor_share_its_authority_identity() {
+        let host = Arc::new(HostGovernor::new(HostGovernorConfig::new(1000)).expect("governor"));
+        let first = HostLeaseGovernor::new(Arc::clone(&host), DEVICE, 1);
+        let second = HostLeaseGovernor::new(host, LocalDeviceId::new(1), 2);
+
+        assert_eq!(first.authority_id(), second.authority_id());
     }
 
     /// The point of the adapter: a lease is charged to the *machine's* ledger,

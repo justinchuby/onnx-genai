@@ -1,5 +1,5 @@
 //! The mutable graph model: node/value arenas, edge-consistent mutation,
-//! topological ordering, and validation (see `docs/ORT2.md` §3.3 and §3.5).
+//! topological ordering, and validation (see `docs/architecture/ORT2.md` §3.3 and §3.5).
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -28,6 +28,50 @@ pub struct Graph {
     pub initializers: HashMap<ValueId, WeightRef>,
     /// Constraints on symbolic dimensions.
     pub symbol_constraints: HashMap<SymbolId, SymbolConstraints>,
+    /// Symbol pairs that shape inference unified while broadcasting two distinct
+    /// symbolic dimensions onto a single representative (the `(loser, winner)`
+    /// substitution in
+    /// `onnx-runtime-shape-inference`'s `InferenceContext::broadcast_dim`).
+    ///
+    /// This is the *authoritative, complete-by-construction* record of every
+    /// symbol equivalence inference introduced — elementwise broadcast, `MatMul`
+    /// batch dims, `Einsum` ellipsis, `Concat` non-concat axes, `Expand`, and any
+    /// future handler — because all of them funnel through the single
+    /// `broadcast_dim` chokepoint that appends here. It is populated by
+    /// [`crate::shape`]-driven inference (`infer_graph`) and left empty otherwise;
+    /// it never affects an inferred dimension. Consumers that must reason about a
+    /// symbol's full equivalence class (e.g. the CUDA-graph capture-eligibility
+    /// classifier, which closes its growing-symbol set over these pairs) read it
+    /// instead of re-deriving a partial copy of inference's unification per op.
+    pub symbol_unifications: Vec<(SymbolId, SymbolId)>,
+    /// Directed symbol provenance edges `(derived, source)` recorded when shape
+    /// inference interns a *derived* dimension expression (e.g. `seq_kv * 8` from
+    /// `Reshape([-1])` or `Flatten`) to a fresh [`SymbolId`]
+    /// (`onnx-runtime-shape-inference`'s `SymbolInterner::lower`): the `derived`
+    /// symbol depends on each `source` symbol its expression was built from.
+    ///
+    /// Together with [`symbol_unifications`](Self::symbol_unifications) this is
+    /// the *complete-by-construction* symbol-lineage record: every path by which
+    /// an inference-minted symbol acquires a dependency on a graph symbol funnels
+    /// through either the `broadcast_dim` chokepoint (unification) or the `lower`
+    /// chokepoint (derivation). Consumers that must reason about a symbol's full
+    /// dependency set — e.g. the CUDA-graph capture-eligibility classifier, which
+    /// closes its growing/pinned set over these edges — read it instead of
+    /// re-deriving inference's lineage per op. It never affects an inferred dim.
+    pub symbol_derivations: Vec<(SymbolId, SymbolId)>,
+    /// Symbols shape inference minted for a genuinely *unknowable* extent — an
+    /// arithmetic overflow degrade or a nonsensical negative extent — from which
+    /// no source symbol could be recovered (`SymbolInterner::lower`). A
+    /// conservative consumer (the capture classifier) treats these as
+    /// disqualifying (eager), never as constant/pinned.
+    pub symbol_opaque: Vec<SymbolId>,
+    /// The floor id at/above which every symbol was minted by shape inference
+    /// (an anonymous/derived/data-dependent symbol); ids below it are
+    /// graph-declared roots (`batch`, `seq`, KV length, heads, …). Set by
+    /// `infer_graph`; `None` before inference runs. The fail-safe capture
+    /// classifier uses it to distinguish a provably-rooted symbol from an
+    /// inference-minted (potentially-unknown) one.
+    pub inference_symbol_floor: Option<u32>,
     /// Imported opsets: domain → version.
     pub opset_imports: HashMap<String, u64>,
     /// Subgraph bodies for control-flow ops, keyed by `(node, attr_name)`.

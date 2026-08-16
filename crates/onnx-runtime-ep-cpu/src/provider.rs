@@ -1,5 +1,5 @@
 //! The [`CpuExecutionProvider`]: a host execution provider backed by pure-Rust
-//! reference kernels (`docs/ORT2.md` §4.4).
+//! reference kernels (`docs/architecture/ORT2.md` §4.4).
 //!
 //! # Memory & safety invariants (ep-api safety review)
 //!
@@ -23,8 +23,8 @@
 //!    so `DeviceBuffer` is soundly `Send`/`Sync` (documented in ep-api).
 
 use onnx_runtime_ep_api::{
-    Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, Fence, Kernel, KernelMatch,
-    OpRegistry, Result, deny,
+    ClaimPreference, Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, Fence, Kernel,
+    KernelMatch, OpRegistry, Result, deny, structural_input_bytes,
 };
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
 
@@ -144,6 +144,59 @@ impl ExecutionProvider for CpuExecutionProvider {
         Ok(())
     }
 
+    /// Routing preference, kept deliberately apart from [`Self::supports_op`].
+    ///
+    /// See [`crate::assignment_policy`] for the measured evidence behind each
+    /// deferral and for why a performance decline cannot live in `supports_op`.
+    fn claim_preference(
+        &self,
+        op: &Node,
+        opset: u64,
+        shapes: &[Shape],
+        input_dtypes: &[DataType],
+    ) -> ClaimPreference {
+        crate::assignment_policy::claim_preference(op, opset, shapes, input_dtypes)
+    }
+
+    /// Short-circuit the default adapter for the nodes the policy has no
+    /// opinion about.
+    ///
+    /// The default [`ExecutionProvider::claim_preference_node`] deep-clones
+    /// every input [`Shape`] before it can ask, and it runs for every node in
+    /// the graph. This policy governs five elementwise ops; a transformer graph
+    /// is overwhelmingly not those, so the cheap `(domain, op_type)` test comes
+    /// first and the allocation only happens when the answer can differ from
+    /// [`ClaimPreference::Claim`].
+    fn claim_preference_node(
+        &self,
+        view: &onnx_runtime_ir::GraphView<'_>,
+        node: onnx_runtime_ir::NodeIndex,
+        opset: u64,
+    ) -> ClaimPreference {
+        let ir_node = view.node(node);
+        if !crate::assignment_policy::governs(ir_node) {
+            return ClaimPreference::Claim;
+        }
+        let inputs = view.node_inputs(node);
+        let shapes = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| view.value(value).shape.clone())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let input_dtypes = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| view.value(value).dtype)
+                    .unwrap_or(DataType::Undefined)
+            })
+            .collect::<Vec<_>>();
+        crate::assignment_policy::claim_preference(ir_node, opset, &shapes, &input_dtypes)
+    }
+
     fn supports_op(
         &self,
         op: &Node,
@@ -224,6 +277,16 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "PackedMultiHeadAttention"
+            && op.domain == "com.microsoft"
+            && let Some(reason) = crate::kernels::packed_multi_head_attention::unsupported_reason(
+                op,
+                shapes,
+                input_dtypes,
+            )
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "ScatterND"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) =
@@ -241,20 +304,19 @@ impl ExecutionProvider for CpuExecutionProvider {
         // The reference kernels produce contiguous row-major outputs and accept
         // strided inputs, so no input layout is required.
         let output_layouts = vec![TensorLayout::contiguous(); op.outputs.len()];
-        // Rough cost estimate from the input element counts; the real cost model
-        // (Phase 2) refines this. Kept monotonic in problem size so placement
-        // still prefers a smaller CPU op over a larger one.
-        let elems: u64 = shapes
-            .iter()
-            .map(|s| {
-                s.iter()
-                    .map(|d| d.as_static().unwrap_or(1) as u64)
-                    .product::<u64>()
-            })
-            .sum();
-        let cost = Cost::new(elems as f64, elems as f64, 0.0)
-            .with_launch_us(0.1)
-            .with_bytes_moved(elems.saturating_mul(4));
+        // Report *structure only*, never a machine rate (issue #995). The EP
+        // knows how many bytes this node reads from its real dtypes and shapes;
+        // it does NOT know this host's memory bandwidth, FLOP/s, or launch
+        // latency, so it must not invent a per-element time. The old
+        // `Cost::new(elems, elems, 0.0).with_bytes_moved(elems*4)` fabricated
+        // both: a CPU-is-100×-slower-than-CUDA constant and an f32 byte count
+        // (wrong by 8× for int4 weights). Time components are left zero — the
+        // placement cost model (`onnx-runtime-cost-model`) divides this
+        // structural `bytes_moved` by the host's *measured* rate. `bytes_moved`
+        // stays monotonic in problem size so any interim consumer still prefers
+        // a smaller op over a larger one.
+        let bytes_moved = structural_input_bytes(shapes, input_dtypes);
+        let cost = Cost::ZERO.with_bytes_moved(bytes_moved);
         KernelMatch::Supported {
             cost,
             required_input_layouts: None,

@@ -1,17 +1,30 @@
 //! CPU parity oracle for frozen `pkg.nxrt::BlockQuantizedMoE` v1.
+//!
+//! This CPU kernel is memory-format-only today: it keeps expert weights in the
+//! native block-quantized wire layout at the operator boundary, then dequantizes
+//! each routed expert to dense f32 and runs the dense grouped MoE path. It does
+//! not perform quantized-domain expert compute.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node, Shape};
 
-use super::block_quantized_matmul::{BlockFormat, dequantize_weight_kn};
+use super::block_quantized_matmul::{
+    BlockFormat, DenseWeightCache, DenseWeightCacheStatus, DenseWeightIdentity,
+    dequantize_weight_kn,
+};
 use super::moe::{MoeAttributes, routing_weights, run_expert_grouped};
-use super::{check_arity, to_dense_bytes, to_dense_f32, write_dense_f32};
+use super::{check_arity, to_dense_f32, write_dense_f32};
 
 const OP: &str = "BlockQuantizedMoE";
 const LAYOUT_VERSION: i64 = 1;
+
+pub static BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS: AtomicUsize = AtomicUsize::new(0);
+pub static BLOCK_QUANT_MOE_DENSE_EXPANSIONS: AtomicUsize = AtomicUsize::new(0);
 
 const INPUT_NAMES: [&str; 9] = [
     "input",
@@ -25,11 +38,18 @@ const INPUT_NAMES: [&str; 9] = [
     "router_weights",
 ];
 
+#[cfg(test)]
+static BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub struct BlockQuantizedMoEFactory;
 
 pub struct BlockQuantizedMoEKernel {
     attributes: MoeAttributes,
     format: BlockFormat,
+    constant_inputs: [bool; 9],
+    weight_identities: [DenseWeightIdentity; 3],
+    weight_cache: DenseWeightCache,
 }
 
 struct ValidatedMetadata {
@@ -40,7 +60,13 @@ struct ValidatedMetadata {
 impl KernelFactory for BlockQuantizedMoEFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let ValidatedMetadata { attributes, format } = validate_metadata(node, None)?;
-        Ok(Box::new(BlockQuantizedMoEKernel { attributes, format }))
+        Ok(Box::new(BlockQuantizedMoEKernel {
+            attributes,
+            format,
+            constant_inputs: [false; 9],
+            weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+            weight_cache: DenseWeightCache::new(),
+        }))
     }
 }
 
@@ -55,6 +81,12 @@ pub(crate) fn unsupported_reason(
 }
 
 impl Kernel for BlockQuantizedMoEKernel {
+    fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
+        for (index, is_constant) in constant_inputs.iter().copied().enumerate().take(9) {
+            self.constant_inputs[index] = is_constant;
+        }
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(OP, inputs, outputs, 5, 9, 1)?;
         for &index in &[0, 1, 2, 4] {
@@ -99,9 +131,6 @@ impl Kernel for BlockQuantizedMoEKernel {
         let input = to_dense_f32(&inputs[0])?;
         let router_logits = to_dense_f32(&inputs[1])?;
         let router_weights = optional_dense(inputs, 8)?;
-        let fc1_packed = to_dense_bytes(&inputs[2])?;
-        let fc2_packed = to_dense_bytes(&inputs[4])?;
-        let fc3_packed = optional_input(inputs, 6).map(to_dense_bytes).transpose()?;
         let fc1_bias = optional_dense(inputs, 3)?;
         let fc2_bias = optional_dense(inputs, 5)?;
         let fc3_bias = optional_dense(inputs, 7)?;
@@ -124,14 +153,38 @@ impl Kernel for BlockQuantizedMoEKernel {
         }
 
         let mut output = vec![0.0f32; rows * hidden];
+        #[cfg(test)]
+        BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for (expert, expert_tasks) in tasks {
-            let fc1 =
-                dequantize_expert(self.format, &fc1_packed, expert, fc1_size, hidden, experts)?;
-            let fc2 = dequantize_expert(self.format, &fc2_packed, expert, hidden, inter, experts)?;
-            let fc3 = fc3_packed
-                .as_deref()
+            let fc1 = self.dequantize_expert_cached(
+                self.constant_inputs[2].then_some(&self.weight_identities[0]),
+                1,
+                &inputs[2],
+                expert,
+                fc1_size,
+                hidden,
+                experts,
+            )?;
+            let fc2 = self.dequantize_expert_cached(
+                self.constant_inputs[4].then_some(&self.weight_identities[1]),
+                2,
+                &inputs[4],
+                expert,
+                hidden,
+                inter,
+                experts,
+            )?;
+            let fc3 = optional_input(inputs, 6)
                 .map(|packed| {
-                    dequantize_expert(self.format, packed, expert, inter, hidden, experts)
+                    self.dequantize_expert_cached(
+                        self.constant_inputs[6].then_some(&self.weight_identities[2]),
+                        3,
+                        packed,
+                        expert,
+                        inter,
+                        hidden,
+                        experts,
+                    )
                 })
                 .transpose()?;
 
@@ -142,15 +195,15 @@ impl Kernel for BlockQuantizedMoEKernel {
             let expert_output = run_expert_grouped(
                 &grouped_input,
                 expert_tasks.len(),
-                &fc1,
+                fc1.as_slice(),
                 fc1_bias
                     .as_deref()
                     .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
-                &fc2,
+                fc2.as_slice(),
                 fc2_bias
                     .as_deref()
                     .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
-                fc3.as_deref(),
+                fc3.as_ref().map(|weight| weight.as_slice()),
                 fc3_bias
                     .as_deref()
                     .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
@@ -171,6 +224,58 @@ impl Kernel for BlockQuantizedMoEKernel {
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
+    }
+}
+
+impl BlockQuantizedMoEKernel {
+    #[allow(clippy::too_many_arguments)]
+    fn dequantize_expert_cached(
+        &self,
+        identity: Option<&DenseWeightIdentity>,
+        role: u8,
+        packed: &TensorView,
+        expert: usize,
+        out_features: usize,
+        in_features: usize,
+        experts: usize,
+    ) -> Result<Arc<Vec<f32>>> {
+        let expert_bytes =
+            expert_byte_count(packed, out_features, in_features, experts, self.format)?;
+        if let Some(identity) = identity {
+            let resolved = identity.resolve(
+                packed,
+                self.format,
+                in_features,
+                out_features,
+                role,
+                Some(expert),
+                || packed_expert_bytes(packed, expert, expert_bytes),
+            )?;
+            let mut resolved_payload = resolved.payload;
+            let (weight, status) =
+                self.weight_cache
+                    .get_or_insert_with(resolved.key.as_ref(), || {
+                        BLOCK_QUANT_MOE_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
+                        let packed = match resolved_payload.take() {
+                            Some(packed) => packed,
+                            None => packed_expert_bytes(packed, expert, expert_bytes)?,
+                        };
+                        dequantize_expert_slice(self.format, &packed, out_features, in_features)
+                    })?;
+            if matches!(status, DenseWeightCacheStatus::Hit) {
+                BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(weight)
+        } else {
+            BLOCK_QUANT_MOE_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
+            let packed = packed_expert_bytes(packed, expert, expert_bytes)?;
+            Ok(Arc::new(dequantize_expert_slice(
+                self.format,
+                &packed,
+                out_features,
+                in_features,
+            )?))
+        }
     }
 }
 
@@ -311,14 +416,13 @@ fn validate_packed_shape(
     Ok(())
 }
 
-fn dequantize_expert(
-    format: BlockFormat,
-    packed: &[u8],
-    expert: usize,
+fn expert_byte_count(
+    packed: &TensorView,
     out_features: usize,
     in_features: usize,
     experts: usize,
-) -> Result<Vec<f32>> {
+    format: BlockFormat,
+) -> Result<usize> {
     let expert_bytes = out_features
         .checked_mul(in_features.div_ceil(format.qk()))
         .and_then(|count| count.checked_mul(format.block_bytes()))
@@ -326,21 +430,87 @@ fn dequantize_expert(
     let expected = expert_bytes
         .checked_mul(experts)
         .ok_or_else(|| error("packed projection byte count overflow"))?;
-    if packed.len() != expected {
+    if packed.byte_size() != expected {
         return Err(error(format!(
             "packed projection contains {} bytes, expected {expected}",
-            packed.len()
+            packed.byte_size()
+        )));
+    }
+    Ok(expert_bytes)
+}
+
+fn packed_expert_bytes<'a>(
+    packed: &'a TensorView<'_>,
+    expert: usize,
+    expert_bytes: usize,
+) -> Result<Cow<'a, [u8]>> {
+    packed.validate()?;
+    if packed.dtype != DataType::Uint8 {
+        return Err(error(format!(
+            "packed expert dtype {:?} unsupported; expected Uint8",
+            packed.dtype
+        )));
+    }
+    if expert >= packed.shape[0] {
+        return Err(error(format!(
+            "expert index {expert} is out of range for {} experts",
+            packed.shape[0]
         )));
     }
     let start = expert
         .checked_mul(expert_bytes)
         .ok_or_else(|| error("expert byte offset overflow"))?;
-    let weight_kn = dequantize_weight_kn(
-        format,
-        in_features,
-        out_features,
-        &packed[start..start + expert_bytes],
-    )?;
+    if packed.is_contiguous() {
+        let end = start
+            .checked_add(expert_bytes)
+            .ok_or_else(|| error("expert byte range overflow"))?;
+        let len = packed.byte_size();
+        // SAFETY: the validated contiguous Uint8 view has `len` logical bytes,
+        // and `start..end` was derived from the already-validated expert-major
+        // shape. The returned borrow cannot outlive the input view.
+        let bytes = unsafe { std::slice::from_raw_parts(packed.data_ptr::<u8>(), len) };
+        return bytes
+            .get(start..end)
+            .map(Cow::Borrowed)
+            .ok_or_else(|| error("expert byte range exceeds packed projection"));
+    }
+
+    if packed.shape.len() != 4 {
+        return Err(error(format!(
+            "packed expert tensor must have rank 4, got {:?}",
+            packed.shape
+        )));
+    }
+    let mut dense = Vec::with_capacity(expert_bytes);
+    let origin = packed.data_ptr::<u8>();
+    for output in 0..packed.shape[1] {
+        for block in 0..packed.shape[2] {
+            for byte in 0..packed.shape[3] {
+                let index = [expert, output, block, byte];
+                let offset = crate::strided::elem_offset(packed.strides, &index);
+                // SAFETY: every component of `index` is within the validated
+                // view shape, so the executor's backing-bounds gate guarantees
+                // this element address is readable.
+                dense.push(unsafe { *origin.offset(offset) });
+            }
+        }
+    }
+    if dense.len() != expert_bytes {
+        return Err(error(format!(
+            "materialized expert contains {} bytes, expected {expert_bytes}",
+            dense.len()
+        )));
+    }
+    Ok(Cow::Owned(dense))
+}
+
+fn dequantize_expert_slice(
+    format: BlockFormat,
+    packed: &[u8],
+    out_features: usize,
+    in_features: usize,
+) -> Result<Vec<f32>> {
+    let weight_kn = dequantize_weight_kn(format, in_features, out_features, packed)?;
     let mut weight_nk = vec![0.0f32; weight_kn.len()];
     for input in 0..in_features {
         for output in 0..out_features {
@@ -919,6 +1089,271 @@ mod tests {
     }
 
     #[test]
+    fn constant_moe_expert_weights_reuse_bounded_cached_dense_path() {
+        let experts = E;
+        let fc1_out = H;
+        let input_values: Vec<f32> = (0..H).map(|i| i as f32 / 16.0 - 1.0).collect();
+        let logits_values = [4.0, -4.0];
+        let fc1_values = identity_projection([2, 4]);
+        let fc2_values = identity_projection([2, 2]);
+        let shapes = vec![
+            Some((DataType::Float32, vec![1, H])),
+            Some((DataType::Float32, vec![1, experts])),
+            Some((DataType::Uint8, vec![experts, fc1_out, 1, 17])),
+            None,
+            Some((DataType::Uint8, vec![experts, H, 1, 17])),
+            None,
+            None,
+            None,
+        ];
+        let (graph, node) = model_node(&shapes, &attrs("identity", 1, false, 0));
+        let ValidatedMetadata { attributes, format } =
+            validate_metadata(graph.node(node), None).expect("valid BlockQuantizedMoE metadata");
+        let mut kernel = BlockQuantizedMoEKernel {
+            attributes,
+            format,
+            constant_inputs: [false; 9],
+            weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+            weight_cache: DenseWeightCache::new(),
+        };
+        kernel.set_constant_inputs(&[false, false, true, false, true, false, false, false]);
+
+        let input = Owned::f32(&[1, H], &input_values);
+        let logits = Owned::f32(&[1, experts], &logits_values);
+        let fc1 = Owned::u8(&[experts, fc1_out, 1, 17], &fc1_values);
+        let fc2 = Owned::u8(&[experts, H, 1, 17], &fc2_values);
+        let views = [
+            input.view(),
+            logits.view(),
+            fc1.view(),
+            TensorView::absent(DataType::Float32),
+            fc2.view(),
+            TensorView::absent(DataType::Float32),
+            TensorView::absent(DataType::Uint8),
+            TensorView::absent(DataType::Float32),
+        ];
+        let mut output = Owned::f32(&[1, H], &[0.0; H]);
+
+        let hits_before = BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS.load(Ordering::Relaxed);
+        kernel
+            .execute(&views, &mut [output.view_mut()])
+            .expect("first MoE execution");
+        let identity_after_first = [
+            kernel.weight_identities[0].stats(),
+            kernel.weight_identities[1].stats(),
+        ];
+        let activity_after_first = kernel.weight_cache.activity();
+        kernel
+            .execute(&views, &mut [output.view_mut()])
+            .expect("second MoE execution");
+        assert_eq!(
+            kernel.weight_cache.stats().0,
+            2,
+            "one routed expert should cache exactly fc1 and fc2 dense projections across repeated calls"
+        );
+        assert_eq!(
+            [
+                kernel.weight_identities[0].stats(),
+                kernel.weight_identities[1].stats(),
+            ],
+            identity_after_first,
+            "repeat routing must not rehash or rematerialize either multi-expert tensor"
+        );
+        let fc1_expert_bytes = fc1_values.len() / experts;
+        let fc2_expert_bytes = fc2_values.len() / experts;
+        assert_eq!(
+            identity_after_first,
+            [(1, fc1_expert_bytes, 0), (1, fc2_expert_bytes, 0)],
+            "only the routed expert slices should be hashed, never the full multi-expert tensors"
+        );
+        assert_eq!(
+            kernel.weight_cache.activity(),
+            (activity_after_first.0 + 2, activity_after_first.1),
+            "the second MoE call must hit both cached projections without rebuilding"
+        );
+        assert!(
+            BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS.load(Ordering::Relaxed) >= hits_before + 2,
+            "second MoE execution must hit cached-dense fc1 and fc2 weights"
+        );
+    }
+
+    #[test]
+    fn nonconstant_fc3_matches_dense_reference_for_unfused_gated_activations() {
+        let experts = E;
+        let input_values: Vec<f32> = (0..H).map(|i| i as f32 / 32.0 + 0.25).collect();
+        let logits_values = [4.0, -4.0];
+        let fc1_values = identity_projection([2, 4]);
+        let fc2_values = identity_projection([2, 2]);
+        let fc3_values = identity_projection([4, 6]);
+
+        for activation in ["swiglu", "silu"] {
+            let shapes = vec![
+                Some((DataType::Float32, vec![1, H])),
+                Some((DataType::Float32, vec![1, experts])),
+                Some((DataType::Uint8, vec![experts, H, 1, 17])),
+                None,
+                Some((DataType::Uint8, vec![experts, H, 1, 17])),
+                None,
+                Some((DataType::Uint8, vec![experts, H, 1, 17])),
+                None,
+            ];
+            let attributes_spec = attrs(activation, 1, true, 0);
+            let (graph, node) = model_node(&shapes, &attributes_spec);
+            let ValidatedMetadata { attributes, format } =
+                validate_metadata(graph.node(node), None).expect("valid gated MoE metadata");
+            let mut kernel = BlockQuantizedMoEKernel {
+                attributes,
+                format,
+                constant_inputs: [false; 9],
+                weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+                weight_cache: DenseWeightCache::new(),
+            };
+            kernel.set_constant_inputs(&[false, false, true, false, true, false, false, false]);
+            assert!(
+                !kernel.constant_inputs[6],
+                "fc3 must remain a runtime input"
+            );
+
+            let input = Owned::f32(&[1, H], &input_values);
+            let logits = Owned::f32(&[1, experts], &logits_values);
+            let fc1 = Owned::u8(&[experts, H, 1, 17], &fc1_values);
+            let fc2 = Owned::u8(&[experts, H, 1, 17], &fc2_values);
+            let fc3 = Owned::u8(&[experts, H, 1, 17], &fc3_values);
+            let views = [
+                input.view(),
+                logits.view(),
+                fc1.view(),
+                TensorView::absent(DataType::Float32),
+                fc2.view(),
+                TensorView::absent(DataType::Float32),
+                fc3.view(),
+                TensorView::absent(DataType::Float32),
+            ];
+            let mut output = Owned::f32(&[1, H], &[0.0; H]);
+            kernel
+                .execute(&views, &mut [output.view_mut()])
+                .expect("execute gated BlockQuantizedMoE with runtime fc3");
+
+            let expert_bytes = H * 17;
+            let dense_fc1 =
+                dequantize_expert_slice(format, &fc1_values[..expert_bytes], H, H).unwrap();
+            let dense_fc2 =
+                dequantize_expert_slice(format, &fc2_values[..expert_bytes], H, H).unwrap();
+            let dense_fc3 =
+                dequantize_expert_slice(format, &fc3_values[..expert_bytes], H, H).unwrap();
+            let expected = run_expert_grouped(
+                &input_values,
+                1,
+                &dense_fc1,
+                None,
+                &dense_fc2,
+                None,
+                Some(&dense_fc3),
+                None,
+                H,
+                H,
+                H,
+                &attributes,
+            )
+            .expect("dense gated MoE reference");
+            assert_close(&output.to_f32(), &expected);
+        }
+    }
+
+    #[test]
+    fn cached_moe_matches_uncached_for_all_supported_block_formats() {
+        for (format_name, expected_format) in [
+            ("mxfp4", BlockFormat::Mxfp4),
+            ("iq4_nl", BlockFormat::Iq4Nl),
+            ("iq4_xs", BlockFormat::Iq4Xs),
+            ("iq3_s", BlockFormat::Iq3S),
+            ("iq3_xxs", BlockFormat::Iq3Xxs),
+            ("iq2_s", BlockFormat::Iq2S),
+            ("iq2_xs", BlockFormat::Iq2Xs),
+            ("iq2_xxs", BlockFormat::Iq2Xxs),
+            ("iq1_s", BlockFormat::Iq1S),
+            ("iq1_m", BlockFormat::Iq1M),
+        ] {
+            let hidden = expected_format.qk();
+            let experts = 2usize;
+            let block_bytes = expected_format.block_bytes();
+            let mut packed = vec![0u8; experts * hidden * block_bytes];
+            for (block_index, block) in packed.chunks_exact_mut(block_bytes).enumerate() {
+                for (index, byte) in block.iter_mut().enumerate() {
+                    *byte = block_index.wrapping_mul(29).wrapping_add(index * 17) as u8;
+                }
+                match expected_format {
+                    BlockFormat::Mxfp4 => block[0] = 127,
+                    BlockFormat::Iq1M => block[48..56].fill(0),
+                    _ => block[..2].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes()),
+                }
+            }
+            let mut attributes_spec = attrs("identity", 1, true, 0);
+            attributes_spec[0] = ("format", Attribute::String(format_name.as_bytes().to_vec()));
+            let shapes = vec![
+                Some((DataType::Float32, vec![1, hidden])),
+                Some((DataType::Float32, vec![1, experts])),
+                Some((DataType::Uint8, vec![experts, hidden, 1, block_bytes])),
+                None,
+                Some((DataType::Uint8, vec![experts, hidden, 1, block_bytes])),
+                None,
+                None,
+                None,
+            ];
+            let (graph, node) = model_node(&shapes, &attributes_spec);
+            let ValidatedMetadata { attributes, format } =
+                validate_metadata(graph.node(node), None).expect("valid block format");
+            assert_eq!(format, expected_format);
+            let input_values: Vec<f32> = (0..hidden)
+                .map(|index| ((index * 7 % 23) as f32 - 11.0) / 16.0)
+                .collect();
+            let input = Owned::f32(&[1, hidden], &input_values);
+            let logits = Owned::f32(&[1, experts], &[4.0, -4.0]);
+            let fc1 = Owned::u8(&[experts, hidden, 1, block_bytes], &packed);
+            let fc2 = Owned::u8(&[experts, hidden, 1, block_bytes], &packed);
+            let views = [
+                input.view(),
+                logits.view(),
+                fc1.view(),
+                TensorView::absent(DataType::Float32),
+                fc2.view(),
+                TensorView::absent(DataType::Float32),
+                TensorView::absent(DataType::Uint8),
+                TensorView::absent(DataType::Float32),
+            ];
+
+            let uncached = BlockQuantizedMoEKernel {
+                attributes,
+                format,
+                constant_inputs: [false; 9],
+                weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+                weight_cache: DenseWeightCache::new(),
+            };
+            let mut expected = Owned::f32(&[1, hidden], &vec![0.0; hidden]);
+            uncached
+                .execute(&views, &mut [expected.view_mut()])
+                .expect("uncached MoE reference");
+
+            let mut cached = BlockQuantizedMoEKernel {
+                attributes,
+                format,
+                constant_inputs: [false; 9],
+                weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+                weight_cache: DenseWeightCache::new(),
+            };
+            cached.set_constant_inputs(&[false, false, true, false, true]);
+            let mut actual = Owned::f32(&[1, hidden], &vec![0.0; hidden]);
+            cached
+                .execute(&views, &mut [actual.view_mut()])
+                .expect("cold cached MoE");
+            cached
+                .execute(&views, &mut [actual.view_mut()])
+                .expect("warm cached MoE");
+            assert_close(&actual.to_f32(), &expected.to_f32());
+        }
+    }
+
+    #[test]
     fn block_quantized_moe_matches_dense_reference_topk_softmax() {
         let input: Vec<f32> = (0..H).map(|i| i as f32 / 16.0 - 1.0).collect();
         let fc1 = identity_projection([2, 4]);
@@ -1190,6 +1625,36 @@ mod tests {
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn block_quantized_moe_manifest_counter_proves_dense_f32_expert_dispatch() {
+        let before =
+            BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let input = vec![1.0f32; H];
+        let fc1 = identity_projection([2, 4]);
+        let fc2 = identity_projection([2, 2]);
+
+        let actual = run(
+            "identity",
+            1,
+            true,
+            0,
+            &input,
+            &[3.0, -3.0],
+            &fc1,
+            H,
+            &fc2,
+            None,
+        );
+
+        let after =
+            BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after > before,
+            "dispatch manifest counter must prove BlockQuantizedMoE ran the dense-f32 expert path"
+        );
+        assert_close(&actual, &[1.0; H]);
     }
 
     fn claim_fixture() -> (Graph, NodeId, Vec<Shape>, Vec<DataType>) {

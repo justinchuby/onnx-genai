@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! On-GPU test for live GPU weight offload (WEIGHT_OFFLOAD Phase 3b).
 //!
 //! Proves the cardinal offload invariant: a weight served through the live GPU
@@ -6,8 +20,8 @@
 //! *byte-identical* to the same weight uploaded the ordinary resident way.
 //! Offload is an optimization, never an output change.
 //!
-//! Gated on a real device: prints `skip` and returns when no CUDA GPU is
-//! present, so the crate still tests cleanly on non-GPU machines.
+//! Gated on a real device: CPU-only CI reports this as ignored unless
+//! `gpu-tests` is enabled; feature-enabled runs fail loudly without CUDA.
 //!
 //! Run pinned to a free GPU, e.g.:
 //!   CUDA_VISIBLE_DEVICES=0 taskset -c 1 \
@@ -157,13 +171,19 @@ fn lazy_weight_for(b: &[f32], k: usize, n: usize, offset: usize) -> (LazyWeight,
     (lazy, host)
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn offloaded_weight_is_byte_identical_to_resident() {
     let ep = match CudaExecutionProvider::new_default() {
         Ok(ep) => ep,
         Err(e) => {
             eprintln!("skip: no CUDA GPU available ({e})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
 
@@ -213,13 +233,19 @@ fn offloaded_weight_is_byte_identical_to_resident() {
 /// Mutation guard: a binding that copies the wrong region bytes must NOT match
 /// the resident output. Locks in the test's sensitivity so a broken H2D copy
 /// (wrong offset/length) cannot pass silently.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn offloaded_weight_wrong_region_diverges() {
     let ep = match CudaExecutionProvider::new_default() {
         Ok(ep) => ep,
         Err(e) => {
             eprintln!("skip: no CUDA GPU available ({e})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
 
@@ -295,13 +321,19 @@ fn combined_weights(bs: &[Vec<f32>], k: usize, n: usize) -> (HostMmap, Vec<LazyW
 
 /// Live residency: paging under a one-page VRAM budget must page-in on a miss,
 /// reuse on a hit, evict LRU on pressure, and stay byte-identical to resident.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn residency_pages_in_reuses_and_evicts() {
     let ep = match CudaExecutionProvider::new_default() {
         Ok(ep) => ep,
         Err(e) => {
             eprintln!("skip: no CUDA GPU available ({e})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
 
@@ -363,13 +395,19 @@ fn residency_pages_in_reuses_and_evicts() {
 
 /// Use-safety: a page still referenced by a live handle is never evicted, even
 /// under budget pressure — the cache runs transiently over budget instead.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn residency_never_evicts_a_referenced_page() {
     let ep = match CudaExecutionProvider::new_default() {
         Ok(ep) => ep,
         Err(e) => {
             eprintln!("skip: no CUDA GPU available ({e})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
 
@@ -400,13 +438,19 @@ fn residency_never_evicts_a_referenced_page() {
 /// stream them host→device, evict under a tiny budget, and stay byte-identical
 /// to the resident upload. Also proves the process-global counters advance so an
 /// opaque end-to-end run can observe that paging really happened.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn residency_materialized_pages_evicts_and_matches_resident() {
     let ep = match CudaExecutionProvider::new_default() {
         Ok(ep) => ep,
         Err(e) => {
             eprintln!("skip: no CUDA GPU available ({e})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
 

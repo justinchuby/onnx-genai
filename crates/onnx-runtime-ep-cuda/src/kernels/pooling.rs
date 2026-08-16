@@ -718,4 +718,10 @@ impl Kernel for LpPoolKernel {
         let free = unsafe { self.runtime.free_raw(metadata_pointer) };
         sync.and(free)
     }
+
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "LpPool allocates, uploads, and frees per-call shape metadata",
+        )
+    }
 }

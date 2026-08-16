@@ -1,6 +1,6 @@
 //! Model directory resolution for Phase 1 runtime loading.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use onnx_genai_genai_config::{
@@ -17,6 +17,17 @@ use crate::{
     DataType, Environment, GraphIo, GraphIoMetadata, OrtError, Result, Session, SessionOptions,
     TensorInfo, Tokenizer,
 };
+
+/// The canonical error for a model-load entry point invoked on a path that is
+/// not an existing directory. Hoisted to a single definition so the message is
+/// structurally one source of truth rather than three copies that merely happen
+/// to match today — callers that match on this text match one string.
+fn model_dir_missing_err(root: &Path) -> OrtError {
+    OrtError::InvalidArgument(format!(
+        "model directory does not exist: {}",
+        root.display()
+    ))
+}
 
 /// Resolved files needed to load a single ONNX text-generation model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,10 +49,7 @@ impl ModelDirectory {
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         if !root.is_dir() {
-            return Err(OrtError::InvalidArgument(format!(
-                "model directory does not exist: {}",
-                root.display()
-            )));
+            return Err(model_dir_missing_err(root));
         }
 
         if is_model_package_directory(root) {
@@ -151,7 +159,7 @@ impl ModelDirectory {
     }
 }
 
-/// Bytes the model's graph and weights occupy on disk.
+/// Bytes the model's weights actually occupy.
 ///
 /// ONNX keeps large initializers in a sibling *external data* file rather than
 /// inside the `.onnx` protobuf, so the graph file alone understates a model's
@@ -160,8 +168,56 @@ impl ModelDirectory {
 /// (`<model>.onnx.data`, `<model>.onnx_data`, …), which is a property of the
 /// ONNX format, not of any model family.
 ///
-/// Reads directory metadata only; it never opens the weights themselves.
+/// **File size is only an upper bound.** An external-data file can contain
+/// regions no initializer references — most commonly when a re-export appends
+/// fresh tensors without truncating the original, orphaning a prefix. One local
+/// export was exactly 50% dead space, so reporting file size told the runtime it
+/// had 2.00x more weights than it did, and every budget, fits/doesn't-fit and
+/// residency decision derived from that number was skewed (#853). So this parses
+/// the graph and sums what the initializers actually reference, falling back to
+/// file size only when the graph cannot be read.
+///
+/// Reads the graph protobuf (a few MB even for tens of GB of weights) plus
+/// directory metadata; it never opens the weight blobs themselves.
 pub fn model_weight_bytes(model_path: &Path) -> u64 {
+    let file_total = model_weight_file_bytes(model_path);
+    let Ok(bytes) = onnx_runtime_loader::read_model_binary(model_path) else {
+        return file_total;
+    };
+    let Ok(model) = onnx_runtime_loader::proto::decode_model(&bytes) else {
+        return file_total;
+    };
+    let referenced = onnx_runtime_loader::weights::referenced_weight_bytes(&model);
+    let graph_bytes = std::fs::metadata(model_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    // The graph file is charged whole (it carries inline payloads plus the
+    // protobuf itself); only the external blobs are narrowed to what is
+    // referenced.
+    let total = graph_bytes.saturating_add(referenced.external);
+    // A materially oversized external blob is a defective export. Paying for it
+    // silently in budget decisions, disk, and page cache is worse than saying so.
+    if file_total > total && total > 0 {
+        let waste = file_total - total;
+        if waste.saturating_mul(10) > file_total {
+            tracing::warn!(
+                model = %model_path.display(),
+                file_bytes = file_total,
+                referenced_bytes = total,
+                unreferenced_bytes = waste,
+                "external data contains unreferenced regions; using referenced bytes as the \
+                 weight total. Repacking the export would reclaim this on disk"
+            );
+        }
+    }
+    total
+}
+
+/// On-disk size of the graph file plus its external-data siblings.
+///
+/// The upper bound [`model_weight_bytes`] narrows; used as its fallback when the
+/// graph cannot be parsed.
+fn model_weight_file_bytes(model_path: &Path) -> u64 {
     let Some(file_name) = model_path.file_name().and_then(|name| name.to_str()) else {
         return 0;
     };
@@ -234,10 +290,7 @@ impl PipelineModelDirectory {
     pub fn load_if_declared(root: impl AsRef<Path>) -> Result<Option<Self>> {
         let root = root.as_ref();
         if !root.is_dir() {
-            return Err(OrtError::InvalidArgument(format!(
-                "model directory does not exist: {}",
-                root.display()
-            )));
+            return Err(model_dir_missing_err(root));
         }
         if let Some(metadata_path) = find_metadata_path(root) {
             let metadata = load_metadata(&metadata_path)
@@ -269,10 +322,7 @@ impl PipelineModelDirectory {
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         if !root.is_dir() {
-            return Err(OrtError::InvalidArgument(format!(
-                "model directory does not exist: {}",
-                root.display()
-            )));
+            return Err(model_dir_missing_err(root));
         }
 
         let native_metadata_path = find_metadata_path(root);
@@ -438,6 +488,69 @@ impl PipelineModels {
 /// or materializing external weights. Dynamic axes are represented as `-1`, the
 /// same convention [`TensorInfo`] uses for an ORT session's declared I/O.
 pub fn graph_io_from_model_path(path: &Path) -> Result<GraphIoMetadata> {
+    graph_io_from_model_path_filtered(path, None, None)
+}
+
+/// Read only the named graph ports needed by a caller.
+///
+/// Unlike [`graph_io_from_model_path`], unrelated non-dense ports are never
+/// parsed. A selected port is still validated strictly and reports its own
+/// unsupported type.
+pub fn graph_io_from_model_path_for_names(
+    path: &Path,
+    input_names: &[String],
+    output_names: &[String],
+) -> Result<GraphIoMetadata> {
+    let inputs = input_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let outputs = output_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    graph_io_from_model_path_filtered(path, Some((&inputs, &outputs)), None)
+}
+
+/// Read declared KV pairs without inspecting unrelated graph ports.
+///
+/// Some exported models omit type metadata on graph outputs even though their
+/// paired past inputs are fully typed. An untyped present output inherits its
+/// paired past input's tensor metadata; an explicitly non-tensor present output
+/// remains an unsupported KV error.
+pub fn graph_io_from_model_path_for_kv_pairs(
+    path: &Path,
+    input_names: &[String],
+    output_names: &[String],
+) -> Result<GraphIoMetadata> {
+    if input_names.len() != output_names.len() {
+        return Err(OrtError::InvalidArgument(format!(
+            "KV input/output mapping length mismatch: {} inputs, {} outputs",
+            input_names.len(),
+            output_names.len()
+        )));
+    }
+    let inputs = input_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let outputs = output_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let output_fallbacks = output_names
+        .iter()
+        .zip(input_names)
+        .map(|(output, input)| (output.as_str(), input.as_str()))
+        .collect::<HashMap<_, _>>();
+    graph_io_from_model_path_filtered(path, Some((&inputs, &outputs)), Some(&output_fallbacks))
+}
+
+fn graph_io_from_model_path_filtered(
+    path: &Path,
+    selected_names: Option<(&HashSet<&str>, &HashSet<&str>)>,
+    untyped_output_fallbacks: Option<&HashMap<&str, &str>>,
+) -> Result<GraphIoMetadata> {
     let bytes = model_proto_bytes(path)?;
     let model = onnx_runtime_loader::proto::decode_model(&bytes).map_err(|error| {
         OrtError::InvalidArgument(format!(
@@ -465,15 +578,42 @@ pub fn graph_io_from_model_path(path: &Path) -> Result<GraphIoMetadata> {
         .input
         .iter()
         .filter(|value_info| !initializer_names.contains(value_info.name.as_str()))
+        .filter(|value_info| {
+            selected_names.is_none_or(|(inputs, _)| inputs.contains(value_info.name.as_str()))
+        })
         .map(value_info_to_tensor_info)
         .collect::<Result<Vec<_>>>()?;
-    // A graph output that lacks a declared dense tensor type is a hard error
-    // below (via `value_info_to_tensor_info`): fail loud rather than silently
-    // dropping an output whose contract we cannot recover without an ORT session.
     let outputs = graph
         .output
         .iter()
-        .map(value_info_to_tensor_info)
+        .filter(|value_info| {
+            selected_names.is_none_or(|(_, outputs)| outputs.contains(value_info.name.as_str()))
+        })
+        .map(|value_info| {
+            if value_info
+                .r#type
+                .as_ref()
+                .and_then(|ty| ty.value.as_ref())
+                .is_none()
+                && let Some(input_name) = untyped_output_fallbacks
+                    .and_then(|fallbacks| fallbacks.get(value_info.name.as_str()))
+            {
+                let mut info = inputs
+                    .iter()
+                    .find(|info| info.name == *input_name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        OrtError::InvalidArgument(format!(
+                            "declared KV output '{}' has no type metadata and its paired input \
+                             '{}' is unavailable",
+                            value_info.name, input_name
+                        ))
+                    })?;
+                info.name = value_info.name.clone();
+                return Ok(info);
+            }
+            value_info_to_tensor_info(value_info)
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(GraphIoMetadata::new(inputs, outputs))
 }
@@ -924,6 +1064,59 @@ mod tests {
 
         assert_eq!(paths, vec![binary]);
     }
+
+    fn non_dense_logits_fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-glm52-qmoe-indexshare/model.onnx")
+    }
+
+    #[test]
+    fn selected_dense_kv_ignores_unrelated_non_dense_logits() {
+        let inputs = vec![
+            "past_key_values.0.key".to_string(),
+            "past_key_values.0.value".to_string(),
+        ];
+        let outputs = vec!["present.0.key".to_string(), "present.0.value".to_string()];
+
+        let graph =
+            graph_io_from_model_path_for_kv_pairs(&non_dense_logits_fixture(), &inputs, &outputs)
+                .expect("unrelated non-dense logits must not block selected KV geometry");
+
+        assert_eq!(graph.inputs().len(), 2);
+        assert_eq!(graph.outputs().len(), 2);
+    }
+
+    #[test]
+    fn selected_non_dense_candidate_fails_explicitly() {
+        let error = graph_io_from_model_path_for_names(
+            &non_dense_logits_fixture(),
+            &[],
+            &["logits".to_string()],
+        )
+        .expect_err("a selected non-dense candidate must fail")
+        .to_string();
+
+        assert!(error.contains("graph I/O 'logits' is not a dense tensor type"));
+    }
+
+    #[test]
+    fn explicitly_non_dense_kv_candidate_fails_instead_of_using_pair_fallback() {
+        use onnx_runtime_loader::proto::onnx::{TypeProto, ValueInfoProto, type_proto};
+
+        let candidate = ValueInfoProto {
+            name: "present.0.key".to_string(),
+            r#type: Some(TypeProto {
+                value: Some(type_proto::Value::SequenceType(Box::default())),
+                ..TypeProto::default()
+            }),
+            ..ValueInfoProto::default()
+        };
+
+        let error = value_info_to_tensor_info(&candidate)
+            .expect_err("an explicitly non-dense KV candidate must fail")
+            .to_string();
+        assert!(error.contains("graph I/O 'present.0.key' is not a dense tensor type"));
+    }
 }
 
 #[cfg(test)]
@@ -963,6 +1156,71 @@ mod weight_bytes_tests {
 
         assert_eq!(model_weight_bytes(&dir.join("decoder.onnx")), 1_010);
         assert_eq!(model_weight_bytes(&dir.join("encoder.onnx")), 2_020);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unreferenced_external_regions_are_excluded_from_the_weight_total() {
+        let dir = scratch("dead-external-prefix");
+        // A minimal ONNX graph with one external initializer of 1,024 bytes at
+        // offset 4,096, hand-encoded so the test owns the exact layout: the
+        // first 4 KiB of the blob is orphaned, which is the shape of a re-export
+        // that appended fresh tensors without truncating the original (#853).
+        //
+        // Wire format, all length-delimited (tag = field << 3 | 2):
+        //   ModelProto.graph = 7, GraphProto.initializer = 5,
+        //   TensorProto: dims = 1 (varint), data_type = 2 (varint), name = 8,
+        //                external_data = 13, data_location = 14 (varint),
+        //   StringStringEntryProto: key = 1, value = 2.
+        fn len_delim(field: u32, payload: &[u8]) -> Vec<u8> {
+            let mut out = vec![u8::try_from((field << 3) | 2).unwrap()];
+            let mut len = payload.len();
+            loop {
+                let mut byte = u8::try_from(len & 0x7f).unwrap();
+                len >>= 7;
+                if len > 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if len == 0 {
+                    break;
+                }
+            }
+            out.extend_from_slice(payload);
+            out
+        }
+        fn entry(key: &str, value: &str) -> Vec<u8> {
+            let mut out = len_delim(1, key.as_bytes());
+            out.extend(len_delim(2, value.as_bytes()));
+            out
+        }
+
+        let mut tensor = vec![0x08, 0x80, 0x04]; // dims: 512
+        tensor.extend([0x10, 0x0a]); // data_type: 10 (FLOAT16) -> 512 * 2 = 1,024
+        tensor.extend(len_delim(8, b"w")); // name
+        tensor.extend(len_delim(13, &entry("location", "model.onnx.data")));
+        tensor.extend(len_delim(13, &entry("offset", "4096")));
+        tensor.extend(len_delim(13, &entry("length", "1024")));
+        tensor.extend([0x70, 0x01]); // data_location: EXTERNAL
+        let graph = len_delim(5, &tensor);
+        let graph_bytes = len_delim(7, &graph);
+        let graph_len = graph_bytes.len() as u64;
+
+        fs::write(dir.join("model.onnx"), &graph_bytes).unwrap();
+        // 5,120 bytes on disk, of which only the last 1,024 are referenced.
+        fs::write(dir.join("model.onnx.data"), vec![0_u8; 5_120]).unwrap();
+
+        assert_eq!(
+            model_weight_bytes(&dir.join("model.onnx")),
+            graph_len + 1_024,
+            "the 4 KiB orphaned prefix must not be charged as weights"
+        );
+        assert_eq!(
+            model_weight_file_bytes(&dir.join("model.onnx")),
+            graph_len + 5_120,
+            "the file-size upper bound still sees the whole blob"
+        );
 
         fs::remove_dir_all(dir).unwrap();
     }

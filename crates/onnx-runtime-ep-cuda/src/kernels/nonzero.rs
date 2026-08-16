@@ -133,4 +133,10 @@ impl Kernel for NonZeroKernel {
         unsafe { self.runtime.free_raw(strides_ptr) }?;
         result
     }
+
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "NonZero allocates and uploads per-call coordinate-stride metadata",
+        )
+    }
 }

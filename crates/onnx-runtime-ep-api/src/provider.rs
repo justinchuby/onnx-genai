@@ -9,7 +9,7 @@ use onnx_runtime_ir::{
 
 use crate::epcontext::EpContext;
 use crate::error::{EpError, Result};
-use crate::kernel::{Kernel, KernelMatch};
+use crate::kernel::{ClaimPreference, Kernel, KernelMatch};
 use crate::weight::ExecutionProviderCapabilities;
 
 /// Index of an EP within an [`crate::registry::EpRegistry`].
@@ -306,12 +306,6 @@ impl Fence {
     }
 }
 
-/// Marker for an EP exported as an ORT-compatible C ABI plugin (Phase 2).
-#[derive(Debug, Default)]
-pub struct OrtPluginExport {
-    pub register_symbol: String,
-}
-
 /// Resolved-shape facts needed by an EP's structural capture-region policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CaptureRegionShapeStatus {
@@ -349,6 +343,28 @@ impl StructuralCaptureDecline {
     }
 }
 
+/// Uploads host bytes into a raw device address for a device EP.
+///
+/// This is the narrow capability the plugin's fused-subgraph executor needs to
+/// stage a host-resident boundary input into device memory when ORT runs an
+/// interspersed CPU→device partition and never inserts the host→device copy
+/// itself (issue #982). It is deliberately smaller than the full
+/// [`ExecutionProvider`] surface — a device address and a length — so it can be
+/// captured once at compile time and stored on the executor without holding an
+/// EP reference (which would change EP teardown semantics).
+///
+/// Implementations must perform a **synchronous** upload: on return the bytes
+/// are resident at `dst`, so the caller may launch a kernel that reads them.
+pub trait HostToDeviceCopier: Send + Sync {
+    /// Copy `src` host bytes into device destination `dst`.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must point to a live device allocation, on this copier's device,
+    /// of at least `src.len()` bytes.
+    unsafe fn copy_host_to_device(&self, src: &[u8], dst: *mut c_void) -> Result<()>;
+}
+
 /// The core EP interface. Every backend crate implements this (§4.1).
 pub trait ExecutionProvider: Send + Sync {
     /// EP identifier (snake_case, e.g. `"cpu_ep"`, `"cuda_ep"`).
@@ -356,6 +372,26 @@ pub trait ExecutionProvider: Send + Sync {
 
     fn device_type(&self) -> DeviceType;
     fn device_id(&self) -> DeviceId;
+
+    /// PCI vendor id of this EP's device memory (0 = generic/host). Used by the
+    /// plugin executor to reconstruct the device `OrtMemoryInfo` ORT registered
+    /// the device allocator against, as a fallback for staging host-resident
+    /// boundary inputs when no device-resident `OrtValue` is otherwise visible
+    /// (issue #982). Host EPs keep the default.
+    fn memory_vendor_id(&self) -> u32 {
+        0
+    }
+
+    /// A synchronous host→device uploader, or `None` for host EPs.
+    ///
+    /// Device EPs return a small [`HostToDeviceCopier`] the plugin's fused
+    /// executor captures at compile time and uses to stage host-resident
+    /// boundary inputs into device scratch before launching a device kernel
+    /// (issue #982). Returning `None` (the default) opts an EP out of staging
+    /// entirely: its inputs are used verbatim, exactly as before.
+    fn host_to_device_copier(&self) -> Option<std::sync::Arc<dyn HostToDeviceCopier>> {
+        None
+    }
 
     /// Optional executor-to-EP capabilities. Stock EPs advertise none and
     /// continue receiving resident [`crate::TensorView`] inputs.
@@ -376,9 +412,25 @@ pub trait ExecutionProvider: Send + Sync {
         &self,
         key: u64,
         weight: &crate::LazyWeight,
+        source: &dyn crate::MmapRegionSource,
     ) -> Result<Option<crate::PagedWeight>> {
-        let _ = (key, weight);
+        let _ = (key, weight, source);
         Ok(None)
+    }
+
+    /// Best-effort lookahead page-in for a lazy weight the executor knows will be
+    /// needed by a later node. Returns `true` only when a transfer was actually
+    /// enqueued, so callers can distinguish a real prefetch from a no-op or
+    /// eviction-neutrality guard decline. The default is a no-op so providers
+    /// that do not own a residency cache do not need to participate.
+    fn prefetch_lazy_weight(
+        &self,
+        key: u64,
+        weight: &crate::LazyWeight,
+        source: &dyn crate::MmapRegionSource,
+    ) -> Result<bool> {
+        let _ = (key, weight, source);
+        Ok(false)
     }
 
     /// Initialize device resources / load libraries.
@@ -435,6 +487,57 @@ pub trait ExecutionProvider: Send + Sync {
         self.supports_op(view.node(node), opset, &shapes, &input_dtypes, &layouts)
     }
 
+    /// Whether this EP *wants* a node it is already able to run.
+    ///
+    /// Consulted only by the plugin capability path, after [`Self::supports_op`]
+    /// has said the node is runnable. It exists so an EP can decline to take a
+    /// node away from the host runtime when the host's own kernel is measurably
+    /// faster for that shape/dtype/ISA, without pretending the node is
+    /// unsupported: the native executor turns a statically-shaped
+    /// [`KernelMatch::Unsupported`] into a hard session error, so correctness
+    /// and routing preference cannot share one signal.
+    ///
+    /// Defaults to [`ClaimPreference::Claim`], preserving the historical
+    /// "support implies claim" behaviour for every EP that does not override it.
+    fn claim_preference(
+        &self,
+        op: &Node,
+        opset: u64,
+        shapes: &[Shape],
+        input_dtypes: &[DataType],
+    ) -> ClaimPreference {
+        let _ = (op, opset, shapes, input_dtypes);
+        ClaimPreference::Claim
+    }
+
+    /// [`Self::claim_preference`] through the same structural graph lens
+    /// [`Self::supports_node`] uses.
+    fn claim_preference_node(
+        &self,
+        view: &GraphView<'_>,
+        node: NodeIndex,
+        opset: u64,
+    ) -> ClaimPreference {
+        let inputs = view.node_inputs(node);
+        let shapes = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| view.value(value).shape.clone())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let input_dtypes = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| view.value(value).dtype)
+                    .unwrap_or(DataType::Undefined)
+            })
+            .collect::<Vec<_>>();
+        self.claim_preference(view.node(node), opset, &shapes, &input_dtypes)
+    }
+
     /// Get or create a kernel for `op` specialized to concrete `shapes`.
     ///
     /// `opset` is the effective operator-set version for `op`'s domain in the
@@ -469,8 +572,109 @@ pub trait ExecutionProvider: Send + Sync {
 
     /// Allocate device memory.
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer>;
+
+    fn allocate_with_mapped_growth(
+        &self,
+        size: usize,
+        alignment: usize,
+        grant: onnx_runtime_memory_governor::MappedGrowthGrant,
+    ) -> Result<DeviceBuffer> {
+        let newly_mapped_bytes = self.mapped_bytes_for_allocation(size, alignment)?;
+        let allocation = self.allocate(size, alignment)?;
+        if let Err(error) = grant.commit_bytes(newly_mapped_bytes) {
+            let _ = self.deallocate(allocation);
+            return Err(EpError::Memory(error));
+        }
+        Ok(allocation)
+    }
+
+    /// Allocate device address space while committing only selected byte ranges.
+    ///
+    /// Providers whose allocator cannot reserve without committing should use
+    /// the default, preserving eager allocation. CUDA VMM overrides this so
+    /// shape-stable buffers such as KV can keep one virtual address while
+    /// mapping physical granules only where the live sequence reaches.
+    fn allocate_committed(
+        &self,
+        size: usize,
+        alignment: usize,
+        committed_ranges: &[std::ops::Range<usize>],
+    ) -> Result<DeviceBuffer> {
+        let _ = committed_ranges;
+        self.allocate(size, alignment)
+    }
+
+    /// Ensure a byte range in an existing allocation is backed by physical
+    /// memory. Eager providers committed everything at allocation time, so their
+    /// default is a no-op.
+    fn commit_allocation_range(
+        &self,
+        buffer: &DeviceBuffer,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        let _ = (buffer, offset, bytes);
+        Ok(())
+    }
+
+    /// Commit all listed ranges as one allocator transaction.
+    fn commit_allocation_ranges(&self, ranges: &[(&DeviceBuffer, usize, usize)]) -> Result<()> {
+        for &(buffer, offset, bytes) in ranges {
+            self.commit_allocation_range(buffer, offset, bytes)?;
+        }
+        Ok(())
+    }
+
+    fn commit_allocation_ranges_with_mapped_growth(
+        &self,
+        ranges: &[(&DeviceBuffer, usize, usize)],
+        grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
+    ) -> Result<u64> {
+        let _ = grant;
+        self.commit_allocation_ranges(ranges)?;
+        self.mapped_bytes_for_allocation_ranges(ranges)
+    }
+
+    fn mapped_bytes_for_allocation_ranges(
+        &self,
+        ranges: &[(&DeviceBuffer, usize, usize)],
+    ) -> Result<u64> {
+        Ok(ranges.iter().fold(0_u64, |total, (_, _, bytes)| {
+            total.saturating_add(*bytes as u64)
+        }))
+    }
+
+    /// Release physical backing from a byte range in an existing allocation
+    /// while preserving its virtual address. Eager providers keep the default
+    /// no-op; lazy providers use this for transactional growth rollback.
+    /// Returns the bytes actually unmapped after shared references are applied.
+    fn decommit_allocation_range(
+        &self,
+        buffer: &DeviceBuffer,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<u64> {
+        let _ = (buffer, offset, bytes);
+        Ok(0)
+    }
+
+    /// Physical bytes currently claimed by `buffer`. Eager providers return
+    /// `buffer.len()`; lazy providers may report the committed subset.
+    fn allocation_committed_bytes(&self, buffer: &DeviceBuffer) -> usize {
+        buffer.len()
+    }
+
     /// Free device memory.
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()>;
+
+    /// Free device memory and report mapped-zone bytes actually unmapped.
+    ///
+    /// The report is based on global mapping references, not which allocation
+    /// originally caused the mapping.
+    fn deallocate_with_unmapped(&self, buffer: DeviceBuffer) -> Result<u64> {
+        self.deallocate(buffer)?;
+        Ok(0)
+    }
 
     /// Synchronous copy (host↔device or device↔device).
     fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<()>;
@@ -534,18 +738,52 @@ pub trait ExecutionProvider: Send + Sync {
         false
     }
 
-    /// Launch an allocation-free device argmax over `elements` contiguous
-    /// `dtype` values (Float32 or Float16). `result` receives two native-endian
-    /// u32 values: token id, then the latching device capture-error bitmask.
+    /// Launch an allocation-free device argmax over `batch` sequences of
+    /// `elements` contiguous `dtype` values (Float32 or Float16) each, laid out
+    /// as a `[batch, elements]` row-major block. `result` receives, per sequence
+    /// `s`, two native-endian u32 values at word offset `2*s`: the token id, then
+    /// the latching device capture-error bitmask. At `batch == 1` this is the
+    /// previous single-sequence contract byte-for-byte.
     fn device_argmax(
         &self,
         _logits: &DeviceBuffer,
         _elements: usize,
+        _batch: usize,
         _dtype: DataType,
         _result: &mut DeviceBuffer,
     ) -> Result<()> {
         Err(EpError::KernelFailed(format!(
             "{}: device argmax is not supported",
+            self.name()
+        )))
+    }
+
+    /// Fold the just-selected greedy token (from a prior [`device_argmax`],
+    /// `result[0]`) into the persistent decode bindings device-to-device, for
+    /// the native CUDA device-token-loop: write the token as an `i64` into
+    /// `input_ids`, write `next_position` into `position_ids`, set the mask `1`
+    /// at `next_position` (guarded by `mask_len`), append the token to
+    /// `scratch[step]`, and OR the shared capture-error word (`result[1]`) into
+    /// `scratch[capacity]`. No host sync — the caller drains `scratch` once per
+    /// chain. EPs without device kernels reject the request.
+    ///
+    /// [`device_argmax`]: ExecutionProvider::device_argmax
+    #[allow(clippy::too_many_arguments)]
+    fn device_token_writer(
+        &self,
+        _result: &DeviceBuffer,
+        _input_ids: &DeviceBuffer,
+        _position_ids: &DeviceBuffer,
+        _attention_mask: &DeviceBuffer,
+        _scratch: &DeviceBuffer,
+        _capacity: usize,
+        _next_position: i64,
+        _mask_len: usize,
+        _write_position: bool,
+        _step: u32,
+    ) -> Result<()> {
+        Err(EpError::KernelFailed(format!(
+            "{}: device token writer is not supported",
             self.name()
         )))
     }
@@ -625,6 +863,102 @@ pub trait ExecutionProvider: Send + Sync {
     /// Explicit device allocation/free counters, when the EP exposes them.
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {
         None
+    }
+
+    /// Reserve governed bytes for executor-owned kernel workspace.
+    ///
+    /// Providers whose allocator already charges committed bytes may return
+    /// `None`; providers backed by an eager allocator retain the returned lease
+    /// alongside the allocation. The default preserves compatibility for
+    /// providers without a device-memory governor.
+    fn reserve_workspace(
+        &self,
+        _bytes: u64,
+        _role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
+        Ok(None)
+    }
+
+    fn prepare_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
+        // `role` describes content/lifetime. Providers whose allocator
+        // suballocates shared granules must canonicalize it to the arena's
+        // physical mapped-attribution zone.
+        let _ = (bytes, role);
+        Ok(None)
+    }
+
+    fn mapped_bytes_for_allocation(&self, bytes: usize, alignment: usize) -> Result<u64> {
+        let _ = alignment;
+        Ok(bytes as u64)
+    }
+
+    fn release_mapped_growth(&self, bytes: u64, role: onnx_runtime_memory_governor::MemoryRole) {
+        // This must use the same canonical physical zone as
+        // `prepare_mapped_growth`; allocation lifetime is not map ownership.
+        let _ = (bytes, role);
+    }
+
+    /// Place any long-lived device memory this provider holds under `governor`.
+    ///
+    /// Some providers keep a standing pool for as long as a model is loaded --
+    /// the CUDA weight-residency cache is one. A pool that picks its own size is
+    /// a second claim on memory the governor is already dividing up, and neither
+    /// side can see the other: grant the KV pool most of a card, let a residency
+    /// cache default to some fraction of it, and both are individually satisfied
+    /// while the device is oversubscribed.
+    ///
+    /// This is the seam that ends that. It is on the provider contract rather
+    /// than on one backend because it is not a CUDA question: any provider with
+    /// a standing pool has it, and a third-party provider should be able to join
+    /// the same accounting rather than run a ledger of its own.
+    ///
+    /// Returns the bytes now governed. The default is zero -- most providers
+    /// hold no standing pool, and saying so is not a failure.
+    ///
+    /// # Errors
+    ///
+    /// If the tier cannot afford what the provider already holds. That is worth
+    /// failing on: it says the model does not fit *before* the pool is used,
+    /// rather than at an allocation somewhere unrelated later.
+    /// Whether the memory this provider hands out commits physically as it is
+    /// used rather than when it is requested.
+    ///
+    /// A forwarder, not a fact of its own: the property belongs to
+    /// [`DeviceAllocator::commits_on_demand`], and a provider should answer by
+    /// asking whichever allocator it is currently using. It is repeated here
+    /// only because a caller holding a session reaches the allocator through
+    /// the provider.
+    ///
+    /// `false` is the safe default -- a consumer that believes `true` will
+    /// under-reserve.
+    ///
+    /// [`DeviceAllocator::commits_on_demand`]: onnx_runtime_memory_governor::DeviceAllocator::commits_on_demand
+    fn commits_on_demand(&self) -> bool {
+        false
+    }
+
+    /// Resize a provider-owned weight-residency budget before it joins a
+    /// governor, returning the budget that will be adopted.
+    ///
+    /// `--vram-limit` is resolved after the model and backend are known, but a
+    /// CUDA EP is constructed before the engine can size native KV. This hook
+    /// lets load-time admission subtract the non-weight device claims first,
+    /// preventing #712's "weights took the whole limit, KV failed later" path.
+    fn set_weight_residency_budget(&self, _budget_bytes: u64) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    fn adopt_memory_governor(
+        &self,
+        _governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+        _tier: onnx_runtime_memory_governor::Tier,
+        _holder: onnx_runtime_memory_governor::HolderId,
+    ) -> Result<u64> {
+        Ok(0)
     }
 
     /// Synchronously upload host bytes into a buffer owned by this EP.
@@ -726,11 +1060,6 @@ pub trait ExecutionProvider: Send + Sync {
     /// Block until all pending work on this EP completes.
     fn sync(&self) -> Result<()>;
 
-    /// Export this EP as an ORT C ABI plugin, if supported (Phase 2).
-    fn as_ort_plugin(&self) -> Option<OrtPluginExport> {
-        None
-    }
-
     /// EP-specific optimization passes, run after the generic optimizer.
     fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {
         Vec::new()
@@ -743,7 +1072,7 @@ pub trait ExecutionProvider: Send + Sync {
     }
 
     /// The `EPContext` node `source` key(s) this EP accepts for compiled-context
-    /// dispatch (`docs/ORT2.md` §55.6). The keys come from the EP's own
+    /// dispatch (`docs/architecture/ORT2.md` §55.6). The keys come from the EP's own
     /// config/data — **never** hardcoded in loader/session dispatch. An empty
     /// list (the default) means the EP does not participate in `EPContext`
     /// (e.g. the pure-Rust CPU EP has no compile step).

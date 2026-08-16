@@ -1,7 +1,7 @@
 //! # `onnx-runtime-ep-api`
 //!
 //! The Execution Provider (EP) interface for the ORT 2.0 runtime
-//! (see `docs/ORT2.md` §4). Every backend — CPU, CUDA, MLX, or a legacy ORT
+//! (see `docs/architecture/ORT2.md` §4). Every backend — CPU, CUDA, MLX, or a legacy ORT
 //! plugin loaded via `dlopen` — implements the same [`ExecutionProvider`]
 //! trait; only the loading mechanism differs.
 //!
@@ -45,14 +45,15 @@ pub use epcontext::{EpContext, EpContextRegistry, build_ep_context_registry};
 pub use error::{EpError, Result};
 pub use kernel::{
     ARG_BYTES, ARG_DEVICE, ARG_FLOPS, ARG_KERNEL_VARIANT, ARG_KERNEL_VARIANT_REASON,
-    CAT_KERNEL_WORKER, CaptureSupport, Cost, Kernel, KernelInput, KernelMatch,
-    KernelVariantSelection, ViewOutput, kernel_variant_tracing_enabled, kernel_worker_span,
-    record_kernel_metrics, record_kernel_variant_selection, record_kernel_variant_stage_selection,
+    CAT_KERNEL_WORKER, CaptureSupport, ClaimPreference, Cost, Kernel, KernelInput, KernelMatch,
+    KernelVariantSelection, TensorMetadata, ViewOutput, WorkspaceLifetime, WorkspaceRequirement,
+    WorkspaceView, kernel_variant_tracing_enabled, kernel_worker_span, record_kernel_metrics,
+    record_kernel_variant_selection, record_kernel_variant_stage_selection, structural_input_bytes,
 };
 pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
 pub use provider::{
     CaptureRegionShapeStatus, DeviceBuffer, EpConfig, EpId, ExecutionProvider, Fence,
-    OrtPluginExport, StructuralCaptureDecline,
+    HostToDeviceCopier, StructuralCaptureDecline,
 };
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{
@@ -60,9 +61,9 @@ pub use tensor::{
 };
 pub use weight::{
     ExecutionProviderCapabilities, LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary,
-    MmapRegionSource, NXRT_WEIGHT_PAGING_CAPABILITY, NegotiatedWeight, PagedWeight,
-    Phase3aHostOnlyBinder, ResidentWeight, ResidentWeightMaterializer, WeightHandle,
-    WeightHandleError,
+    LazyWeightCandidate, MmapRegionSource, NXRT_WEIGHT_PAGING_CAPABILITY, NegotiatedWeight,
+    PagedWeight, Phase3aHostOnlyBinder, ResidentWeight, ResidentWeightMaterializer, WeightHandle,
+    WeightHandleError, lazy_weight_candidates,
 };
 
 // Re-export the device vocabulary from the IR so EP authors have one import.
@@ -75,7 +76,7 @@ mod error {
     pub type Result<T> = std::result::Result<T, EpError>;
 
     /// Errors produced by execution providers and kernels (subset of the
-    /// runtime top-level `Error`, `docs/ORT2.md` §22).
+    /// runtime top-level `Error`, `docs/architecture/ORT2.md` §22).
     #[derive(Debug, thiserror::Error)]
     pub enum EpError {
         #[error("no EP handler for {domain}::{op_type} at opset {opset} on any available device")]
@@ -127,5 +128,8 @@ mod error {
 
         #[error(transparent)]
         WeightHandle(#[from] crate::weight::WeightHandleError),
+
+        #[error("{0}")]
+        Memory(#[from] onnx_runtime_memory_governor::MemoryError),
     }
 }

@@ -70,6 +70,7 @@ pub struct VisionInputSpec {
     bindings: Vec<VisionOutputBinding>,
     preprocessor: ImagePreprocessor,
     expansion: Option<VisionExpansionSpec>,
+    presence_keys: Vec<String>,
 }
 
 impl VisionInputSpec {
@@ -87,6 +88,7 @@ impl VisionInputSpec {
             }],
             preprocessor,
             expansion: None,
+            presence_keys: Vec::new(),
         })
     }
 
@@ -95,6 +97,7 @@ impl VisionInputSpec {
         pixel_shape: &[i64],
         program: &ImagePreprocessingProgram,
         vision: &onnx_genai_metadata::PipelineVisionConfig,
+        presence_keys: Vec<String>,
     ) -> anyhow::Result<Self> {
         if bindings.is_empty() {
             anyhow::bail!(
@@ -105,12 +108,17 @@ impl VisionInputSpec {
         }
         let preprocessor = ImagePreprocessor::from_input_and_program(pixel_shape, program)
             .context("What: the typed image preprocessing program could not be initialized. Why: its declared transforms or pixel shape are invalid. How: correct preprocessing.image transforms and outputs in inference metadata.")?;
-        let expansion = Some(VisionExpansionSpec::from_metadata(vision)?);
+        let expansion = Some(VisionExpansionSpec::from_metadata(vision, program)?);
         Ok(Self {
             bindings,
             preprocessor,
             expansion,
+            presence_keys,
         })
+    }
+
+    pub fn presence_keys(&self) -> &[String] {
+        &self.presence_keys
     }
 
     /// The placeholder token this package expects, one per image.
@@ -144,7 +152,10 @@ impl VisionInputSpec {
 }
 
 impl VisionExpansionSpec {
-    fn from_metadata(vision: &onnx_genai_metadata::PipelineVisionConfig) -> anyhow::Result<Self> {
+    fn from_metadata(
+        vision: &onnx_genai_metadata::PipelineVisionConfig,
+        program: &ImagePreprocessingProgram,
+    ) -> anyhow::Result<Self> {
         let placeholder_token_id = vision.image_placeholder_token_id.context(
             "What: image placeholder expansion metadata is incomplete. \
              Why: pipeline.vision.image_placeholder_token_id is missing. \
@@ -175,7 +186,31 @@ impl VisionExpansionSpec {
                      How: declare the number of image tokens emitted for each real patch.",
                 )?,
             ),
-            Some("from_grid") => (ImageTokenCountSource::FromGrid, 0),
+            Some("from_grid") => {
+                let summary = vision.token_count_summary.as_deref().context(
+                    "What: grid-derived image expansion metadata is incomplete. \
+                     Why: pipeline.vision.token_count_summary is missing. \
+                     How: name the preprocessing.image output that carries grid_dimensions.",
+                )?;
+                let output = program
+                    .outputs
+                    .iter()
+                    .find(|output| output.name == summary)
+                    .with_context(|| {
+                        format!(
+                            "What: grid-derived image expansion metadata is invalid. Why: token_count_summary '{summary}' does not name a preprocessing.image output. How: bind it to the output carrying grid_dimensions."
+                        )
+                    })?;
+                if output.content != "grid_dimensions" {
+                    anyhow::bail!(
+                        "What: grid-derived image expansion metadata is invalid. \
+                         Why: token_count_summary '{summary}' carries content '{}', not grid_dimensions. \
+                         How: name the preprocessing output whose content is grid_dimensions.",
+                        output.content
+                    );
+                }
+                (ImageTokenCountSource::FromGrid, 1)
+            }
             Some(other) => anyhow::bail!(
                 "What: image placeholder expansion metadata is unsupported. \
                  Why: token_count_source '{other}' has no registered server operation. \
@@ -328,7 +363,7 @@ impl VisionExpansionSpec {
                     row_separator,
                     column_separator,
                     &mut expanded,
-                );
+                )?;
                 image_index += 1;
             } else {
                 expanded.push(token);
@@ -339,11 +374,27 @@ impl VisionExpansionSpec {
 
     fn replacement_len(&self, image: &ImageExpansionSummary) -> anyhow::Result<usize> {
         match self.count_source {
-            ImageTokenCountSource::FromGrid => anyhow::bail!(
-                "What: grid-derived image expansion metadata is incomplete. \
-                 Why: token_count_source='from_grid' does not name the processor-summary endpoint whose dtype/shape supplies each image grid. \
-                 How: add a typed grid-summary endpoint operation to pipeline.vision, then bind it to the declared preprocessing output."
-            ),
+            ImageTokenCountSource::FromGrid => {
+                let [temporal, height, width] = image.patch_grid.context(
+                    "What: grid-derived image expansion could not run. \
+                     Why: preprocessing produced no patch grid for this image. \
+                     How: include a patchify transform and bind its grid_dimensions output.",
+                )?;
+                let merge = image.spatial_merge_size;
+                if merge == 0 || !height.is_multiple_of(merge) || !width.is_multiple_of(merge) {
+                    anyhow::bail!(
+                        "What: grid-derived image expansion is invalid. \
+                         Why: patch grid {temporal}x{height}x{width} is not divisible by spatial merge size {merge}. \
+                         How: make patchify.merge_size divide both spatial grid dimensions."
+                    );
+                }
+                temporal
+                    .checked_mul(height / merge)
+                    .and_then(|count| count.checked_mul(width / merge))
+                    .context(
+                        "What: grid-derived image expansion length overflowed. Why: merged temporal-height-width dimensions exceed usize. How: reduce the image grid.",
+                    )
+            }
             ImageTokenCountSource::PerPatch => image
                 .expansion_count
                 .checked_mul(self.tokens_per_unit)
@@ -411,13 +462,14 @@ impl VisionExpansionSpec {
         row_separator: Option<u32>,
         column_separator: Option<u32>,
         tokens: &mut Vec<u32>,
-    ) {
+    ) -> anyhow::Result<()> {
         let emit_unit = |tokens: &mut Vec<u32>| {
             tokens.extend(std::iter::repeat_n(image_token, self.tokens_per_unit));
         };
         match self.count_source {
             ImageTokenCountSource::FromGrid => {
-                unreachable!("from_grid expansion is rejected before materialization")
+                let count = self.replacement_len(image)?;
+                tokens.extend(std::iter::repeat_n(image_token, count));
             }
             ImageTokenCountSource::PerPatch => {
                 for _ in 0..image.expansion_count {
@@ -448,6 +500,7 @@ impl VisionExpansionSpec {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -800,6 +853,8 @@ mod tests {
             },
             tile_count: 2,
             expansion_count: 2,
+            patch_grid: None,
+            spatial_merge_size: 1,
             tensor_offset: 0,
             tensor_length: 2,
         }];
@@ -810,5 +865,39 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("thumbnail ordering validation failed"));
         assert!(message.contains("How:"));
+    }
+
+    #[test]
+    fn grid_expansion_applies_spatial_merge() {
+        let expansion = VisionExpansionSpec {
+            placeholder_token_id: 7,
+            image_token_id: 8,
+            count_source: ImageTokenCountSource::FromGrid,
+            tokens_per_unit: 1,
+            row_separator_token_id: None,
+            column_separator_token_id: None,
+            thumbnail_position: ThumbnailPosition::None,
+        };
+        let images = [ImageExpansionSummary {
+            image_index: 0,
+            original_size: (448, 448),
+            tile_grid: onnx_genai_preprocess::image::TileGrid {
+                columns: 1,
+                rows: 1,
+            },
+            tile_count: 1,
+            expansion_count: 1024,
+            patch_grid: Some([1, 32, 32]),
+            spatial_merge_size: 2,
+            tensor_offset: 0,
+            tensor_length: 1024,
+        }];
+
+        let expanded = expansion
+            .expand(&[1, 7, 2], &images, ThumbnailPosition::None, 300)
+            .expect("grid expansion");
+        assert_eq!(expanded.len(), 258);
+        assert_eq!(&expanded[..2], &[1, 8]);
+        assert_eq!(&expanded[256..], &[8, 2]);
     }
 }

@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! Allocations this execution provider makes stay visible in the count it
 //! reports.
 //!
@@ -20,6 +34,10 @@
 use onnx_runtime_ep_api::ExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn an_execution_provider_allocation_is_visible_in_the_reported_counts() {
     let Ok(ep) = CudaExecutionProvider::new(0) else {
@@ -27,7 +45,9 @@ fn an_execution_provider_allocation_is_visible_in_the_reported_counts() {
             "SKIPPED (no CUDA runtime): the allocation-counter contract did NOT run. A skip that \
              reads like a pass is how the counter stopped observing anything in the first place."
         );
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
 
     let before = ep
@@ -67,11 +87,17 @@ fn an_execution_provider_allocation_is_visible_in_the_reported_counts() {
 ///
 /// `deallocate` returns early for one. Counting it would make the frees exceed
 /// the allocations and turn a leak check into noise.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn a_buffer_that_was_never_allocated_here_does_not_move_the_free_count() {
     let Ok(ep) = CudaExecutionProvider::new(0) else {
         eprintln!("SKIPPED (no CUDA runtime): the borrowed-buffer count check did NOT run.");
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
 
     let buffer = ep.allocate(4096, 256).expect("a device allocation");

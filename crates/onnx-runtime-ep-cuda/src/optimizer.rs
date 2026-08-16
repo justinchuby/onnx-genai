@@ -1,5 +1,5 @@
 use onnx_runtime_ir::{
-    Attribute, DataType, Graph, NodeId, TensorData, ValueId, WeightRef, static_shape,
+    Attribute, DataType, Dim, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
 use onnx_runtime_optimizer::{
     OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult,
@@ -77,6 +77,13 @@ const GATE_UP_SWIGLU_SUPPORTED_BITS: i64 = 4;
 pub(crate) struct CudaSwiGluFusion;
 
 /// Lower an exact `x * Sigmoid(x)` pair to the CUDA EP's fused SiLU kernel.
+///
+/// Fires on fp16 **and** bf16 activations: the fused SwiGLU epilogue has a
+/// byte-exact decomposed kernel for each (`decomposed_silu_mul_{f16,bf16}`),
+/// so collapsing the standalone `Sigmoid` + `Mul(x, sigmoid)` glue keeps greedy
+/// tokens byte-identical. bf16 decoders (e.g. Muse-Glimmer-30B) export SwiGLU as
+/// that standalone pair, so bf16 support is what lets the per-layer glue node
+/// collapse into the already-landed fused launch.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CudaSiluFusion;
 
@@ -84,9 +91,20 @@ pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     vec![
         Box::new(CudaSiluFusion),
         Box::new(CudaFoldConstantTranspose),
+        Box::new(CudaFoldConstantCast),
+        // Fuse the per-layer Q/K/V projections into one wider MatMulNBits while
+        // the projections are still pristine three/four-input GEMVs (before the
+        // norm-into-matmul fusion could add a gamma slot). Reuses the existing
+        // MatMulNBits + Split kernels; no new kernel required.
+        Box::new(CudaQkvProjectionFusion),
         // Runs before the fusions so they see the fp16-native normalization
         // form (no `Cast` wrappers) that the rest of the pipeline expects.
         Box::new(CudaDropNormalizationCasts),
+        // Collapse the now-clean bf16 residual `Add → SimplifiedLayerNormalization`
+        // seam into a single byte-exact `SkipSimplifiedLayerNormalization`. Placed
+        // before the MatMulNBits fusions so it does not race the residual `Add`
+        // (which is an activation+activation add, never a bias add).
+        Box::new(CudaSkipRmsNormFusion),
         Box::new(CudaMatMulNBitsBiasFusion),
         Box::new(CudaSwiGluFusion),
         Box::new(CudaGateUpSwiGluFusion),
@@ -124,7 +142,16 @@ impl OptimizationPass for CudaSiluFusion {
             let Some(x) = sigmoid.inputs[0] else {
                 continue;
             };
-            if graph.value(x).dtype != DataType::Float16 {
+            // The fused SwiGLU epilogue has a byte-exact decomposed kernel for
+            // both fp16 (`decomposed_silu_mul_f16`) and bf16
+            // (`decomposed_silu_mul_bf16`): each rounds the intermediate
+            // `sigmoid` and the `x * sigmoid` product back to the narrow dtype
+            // exactly as the standalone `Sigmoid`/`Mul` ops do, so greedy tokens
+            // stay byte-identical. bf16 decoders such as Muse-Glimmer-30B export
+            // the SwiGLU as a standalone `Sigmoid` + `Mul(x, sigmoid)` pair in
+            // their native bf16 stream; without bf16 here the ~2 glue nodes per
+            // layer never collapse into the fused launch.
+            if !matches!(graph.value(x).dtype, DataType::Float16 | DataType::BFloat16) {
                 continue;
             }
             let sigmoid_output = sigmoid.outputs[0];
@@ -171,53 +198,57 @@ impl OptimizationPass for CudaSiluFusion {
     }
 }
 
-/// Drop the redundant `Cast` pairs that some exporters (e.g. Phi-4-mini) wrap
-/// around every simplified-layer-norm, running the norm directly on its fp16
-/// activations instead.
+/// Drop the redundant `Cast` pairs that some exporters (e.g. Phi-4-mini,
+/// Muse-Glimmer) wrap around every simplified-layer-norm / RMS-norm, running the
+/// norm directly on its narrow (fp16 or bf16) activations instead.
 ///
 /// ## The pattern
 ///
 /// Certain decoders export each `SimplifiedLayerNormalization` /
-/// `SkipSimplifiedLayerNormalization` in fp32: each fp16 activation input is
-/// preceded by a `Cast(fp16 → fp32)`, and each fp32 result is followed by a
-/// `Cast(fp32 → fp16)` back to the residual stream. A 32-layer decoder emits
-/// ~256 of these tiny `Cast` kernels per token — a per-token launch/round-trip
+/// `SkipSimplifiedLayerNormalization` / `RMSNormalization` in fp32: each narrow
+/// (fp16 or bf16) activation input is preceded by a `Cast(narrow → fp32)`, and
+/// each fp32 result is followed by a `Cast(fp32 → narrow)` back to the residual
+/// stream. A 32-layer fp16 decoder emits ~256 of these tiny `Cast` kernels per
+/// token; a 52-layer bf16 decoder such as Muse-Glimmer emits ~624 (a `Cast`
+/// pair around every one of its 312 RMS-norms) — a per-token launch/round-trip
 /// cost that is pure overhead. Models like Qwen2.5 instead run the same norm in
-/// fp16 with **no** surrounding casts.
+/// their native storage dtype with **no** surrounding casts.
 ///
 /// ## Where the win lands
 ///
 /// Removing the casts shrinks the graph and drops hundreds of kernels per
-/// token, but the throughput benefit is concentrated in the **eager** decode
-/// path, where each removed kernel is a saved launch. Measured on Phi-4-mini
-/// (H200): eager decode improves ~25 %. When the decode step is CUDA-graph
-/// captured (Phi's production path, zero fallbacks), replay already amortizes
-/// per-kernel launch overhead, so the captured-path decode throughput is flat
-/// (within run-to-run noise). The pass is still net-positive there — fewer
-/// kernels, a smaller captured graph, and a real prefill/eager win — but it is
-/// not the lever that closes Phi's captured-path gap to ORT (that is
-/// GroupQueryAttention, tracked separately).
+/// token. On the **eager** decode path each removed kernel is a saved launch
+/// (measured on Phi-4-mini/H200: ~25 %). On a **CUDA-graph captured** decode
+/// step, replay amortizes per-kernel launch overhead, so for a norm count that
+/// is a small slice of the graph (Phi's fp16 path) captured throughput is flat
+/// within noise. But when the cast kernels themselves dominate captured GPU
+/// time — Muse-Glimmer's 626 casts/token are ~40 % of decode, each reading and
+/// writing the full hidden state — removing them removes real memory traffic
+/// from every replay, which is a direct captured-path speedup.
 ///
 /// ## The rewrite
 ///
-/// For a matching norm this pass rewires each activation input to the fp16
-/// value feeding its `Cast`, retypes the consumed norm outputs to fp16, and
-/// bypasses/deletes the surrounding `Cast` nodes. The CUDA norm kernels already
-/// accept fp16 activations with fp32 accumulation (and either fp16 or fp32
-/// `gamma`), so the fp32 scale weight is left untouched — the arithmetic is the
-/// same fp32-accumulate / fp16-rounded scheme those kernels use for natively
-/// fp16 models such as Qwen2.5.
+/// For a matching norm this pass rewires each activation input to the narrow
+/// value feeding its `Cast`, retypes the consumed norm outputs to that same
+/// narrow dtype, and bypasses/deletes the surrounding `Cast` nodes. The CUDA
+/// norm kernels already accept fp16/bf16 activations with fp32 accumulation (and
+/// either a narrow or fp32 `gamma`/`scale`), so the fp32 scale weight is left
+/// untouched — the arithmetic is the same fp32-accumulate / narrow-rounded
+/// scheme those kernels use for natively fp16/bf16 models. (Muse-Glimmer's RMS
+/// scale is a constant `Cast(weight_bf16 → fp32) + 1` expression on input 1,
+/// which is not an activation index and so is left exactly as exported.)
 ///
 /// ## Generality and safety
 ///
 /// The rewrite is driven purely by topology + tensor dtypes, never by model
 /// identity:
-/// * the node is a simplified-layer-norm in its expected domain;
+/// * the node is a simplified-layer-norm / RMS-norm in its expected domain;
 /// * every activation data input is produced by a `Cast(→ fp32)` whose source
-///   is fp16 (weights are producer-less initializers, so they never match and
-///   are left alone);
-/// * every consumed norm output feeds only `Cast(→ fp16)` nodes and is not a
-///   graph output;
+///   is the **same** narrow float dtype (fp16 or bf16), and weights are
+///   producer-less initializers or non-activation inputs, so they never match
+///   and are left alone;
+/// * every consumed norm output feeds only `Cast(→ narrow)` nodes (matching the
+///   activation dtype) and is not a graph output;
 /// * an optional norm bias is required absent (kept conservative).
 ///
 /// When any condition fails the norm is left exactly as exported. Input `Cast`
@@ -240,10 +271,15 @@ fn norm_cast_fold_disabled() -> bool {
 /// A planned rewrite of one cast-wrapped normalization node.
 struct NormCastFoldPlan {
     node_id: NodeId,
-    /// Full input vector with each fp16-cast activation input rewired to the
-    /// pre-cast fp16 source value.
+    /// The narrow activation storage dtype (fp16 or bf16) the norm is rewired to
+    /// run on directly. Every un-cast activation input and every retyped output
+    /// share this dtype.
+    narrow_dtype: DataType,
+    /// Full input vector with each cast activation input rewired to the pre-cast
+    /// narrow (fp16/bf16) source value.
     new_inputs: Vec<Option<ValueId>>,
-    /// Norm outputs to retype from fp32 to fp16 (the consumed float results).
+    /// Norm outputs to retype from fp32 to the narrow activation dtype (the
+    /// consumed float results).
     retyped_outputs: Vec<ValueId>,
     /// `(cast_output, norm_output, cast_node)` triples: downstream uses of
     /// `cast_output` are moved onto `norm_output` and the `Cast` is deleted.
@@ -295,11 +331,29 @@ impl CudaDropNormalizationCasts {
         // 1. Rewire the norm onto its pre-cast fp16 activation inputs.
         let mut node = graph.node(plan.node_id).clone();
         node.inputs = plan.new_inputs;
+        // `RMSNormalization` (ai.onnx opset 23) is the one supported norm whose
+        // output element type follows the *scale* (`V`), not the activation `X`
+        // (`T`) — see the ONNX schema and `rms_norm` in the shape-inference
+        // crate. Muse-Glimmer keeps an f32 scale (`Add(Cast(weight_bf16→f32), 1)`)
+        // even for its bf16 activations, so re-running shape inference after this
+        // pass would clobber the narrow output we just retyped back to f32 (the
+        // scale dtype), leaving a bf16-in / f32-out norm the kernel rejects.
+        // `SimplifiedLayerNormalization` is the identical operation (RMS scaling,
+        // no mean subtraction) whose output follows `X`; both ops map to the same
+        // fused `RmsNormKernel` on the CUDA and CPU EPs (see
+        // `kernels/mod.rs`). Converting the folded node preserves the exact
+        // arithmetic (fp32 accumulation, f32 scale, single round-to-nearest-even
+        // on the narrow output — byte-identical to the removed `Cast`) while
+        // letting inference keep the narrow output dtype.
+        if node.op_type == "RMSNormalization" && matches!(node.domain.as_str(), "" | "ai.onnx") {
+            node.op_type = "SimplifiedLayerNormalization".into();
+        }
         graph.replace_node(plan.node_id, node);
 
-        // 2. Retype the consumed float outputs to fp16 to match the inputs.
+        // 2. Retype the consumed float outputs to the narrow activation dtype to
+        //    match the inputs.
         for output in plan.retyped_outputs {
-            graph.value_mut(output).dtype = DataType::Float16;
+            graph.value_mut(output).dtype = plan.narrow_dtype;
         }
 
         // 3. Bypass and delete the output `Cast` nodes.
@@ -325,20 +379,27 @@ impl CudaDropNormalizationCasts {
 impl CudaDropNormalizationCasts {
     /// The activation (non-weight) input indices for a supported simplified
     /// layer-norm, or `None` if the node is not one. `SkipSimplified*` takes
-    /// `(input, skip, gamma[, bias])`; the plain `Simplified*` takes
-    /// `(X, scale)`. Only the data inputs are candidates for un-casting; the
-    /// weight (`gamma` / `scale`) and any bias are producer-less initializers.
+    /// `(input, skip, gamma[, bias])`; the plain `Simplified*` / `RMSNormalization`
+    /// take `(X, scale)`. Only the data inputs are candidates for un-casting; the
+    /// weight (`gamma` / `scale`) and any bias are left untouched (they may be
+    /// producer-less initializers or a constant `weight + 1` scale expression).
     fn activation_input_indices(node: &onnx_runtime_ir::Node) -> Option<&'static [usize]> {
         match (node.op_type.as_str(), node.domain.as_str()) {
             ("SkipSimplifiedLayerNormalization", MICROSOFT_DOMAIN) => Some(&[0, 1]),
             ("SimplifiedLayerNormalization", "" | "ai.onnx") => Some(&[0]),
+            ("RMSNormalization", "" | "ai.onnx") => Some(&[0]),
             _ => None,
         }
     }
 
-    /// If `value` is produced by a `Cast(fp16 → fp32)`, return the `Cast` node
-    /// and its fp16 source value.
-    fn fp32_cast_from_fp16(&self, graph: &Graph, value: ValueId) -> Option<(NodeId, ValueId)> {
+    /// If `value` is produced by a `Cast(narrow → fp32)` where `narrow` is a
+    /// narrow float storage dtype (fp16 or bf16), return the `Cast` node, its
+    /// narrow source value, and that narrow dtype.
+    fn fp32_cast_from_narrow(
+        &self,
+        graph: &Graph,
+        value: ValueId,
+    ) -> Option<(NodeId, ValueId, DataType)> {
         let producer = graph.try_value(value)?.producer?;
         let node = graph.try_node(producer)?;
         if node.op_type != "Cast" || !matches!(node.domain.as_str(), "" | "ai.onnx") {
@@ -348,10 +409,11 @@ impl CudaDropNormalizationCasts {
             return None;
         }
         let source = node.inputs.first().copied().flatten()?;
-        if graph.try_value(source)?.dtype != DataType::Float16 {
+        let source_dtype = graph.try_value(source)?.dtype;
+        if source_dtype != DataType::Float16 && source_dtype != DataType::BFloat16 {
             return None;
         }
-        Some((producer, source))
+        Some((producer, source, source_dtype))
     }
 
     fn plan_fold(&self, graph: &Graph, node_id: NodeId) -> Option<NormCastFoldPlan> {
@@ -365,18 +427,35 @@ impl CudaDropNormalizationCasts {
             return None;
         }
 
-        // Every activation input must be a fp16 → fp32 `Cast`; rewire it to the
-        // fp16 source.
+        // A narrowed `RMSNormalization` is rewritten to `SimplifiedLayerNormalization`
+        // (identical arithmetic, output follows `X`) so shape inference keeps the
+        // narrow output dtype. That synonym only carries the single normalized
+        // output, so decline any `RMSNormalization` that also emits the optional
+        // `InvStdDev` stat (whose f32 dtype the synonym's inference would not
+        // preserve). Muse-Glimmer's decode norms emit only `Y`.
+        if node.op_type == "RMSNormalization" && node.outputs.len() != 1 {
+            return None;
+        }
+
+        // Every activation input must be a narrow (fp16/bf16) → fp32 `Cast`;
+        // rewire it to the narrow source. All activation inputs must share the
+        // same narrow dtype.
         let mut new_inputs = node.inputs.clone();
         let mut dead_input_casts = Vec::new();
+        let mut narrow_dtype: Option<DataType> = None;
         for &index in activation_indices {
             let value = node.inputs.get(index).copied().flatten()?;
-            let (cast_id, source) = self.fp32_cast_from_fp16(graph, value)?;
+            let (cast_id, source, source_dtype) = self.fp32_cast_from_narrow(graph, value)?;
+            if *narrow_dtype.get_or_insert(source_dtype) != source_dtype {
+                return None;
+            }
             new_inputs[index] = Some(source);
             dead_input_casts.push(cast_id);
         }
+        let narrow_dtype = narrow_dtype?;
 
-        // Every consumed float output must feed only `Cast(→ fp16)` nodes.
+        // Every consumed float output must feed only `Cast(→ narrow)` nodes,
+        // where `narrow` matches the activation dtype.
         let mut retyped_outputs = Vec::new();
         let mut output_cast_bypass = Vec::new();
         for &output in &node.outputs {
@@ -392,7 +471,7 @@ impl CudaDropNormalizationCasts {
                 if cast.op_type != "Cast" || !matches!(cast.domain.as_str(), "" | "ai.onnx") {
                     return None;
                 }
-                if cast_target(cast)? != DataType::Float16 {
+                if cast_target(cast)? != narrow_dtype {
                     return None;
                 }
                 let cast_output = *cast.outputs.first()?;
@@ -402,7 +481,7 @@ impl CudaDropNormalizationCasts {
         }
 
         // The primary (normalized) output must actually be one we retyped; the
-        // kernel requires the output dtype to match the fp16 input dtype.
+        // kernel requires the output dtype to match the narrow input dtype.
         let primary = *node.outputs.first()?;
         if !retyped_outputs.contains(&primary) {
             return None;
@@ -410,10 +489,217 @@ impl CudaDropNormalizationCasts {
 
         Some(NormCastFoldPlan {
             node_id,
+            narrow_dtype,
             new_inputs,
             retyped_outputs,
             output_cast_bypass,
             dead_input_casts,
+        })
+    }
+}
+
+/// Opt-in switch for [`CudaSkipRmsNormFusion`]. The fold is **off by default**:
+/// it is byte-exact but, on a launch-amortized CUDA-graph decode (the production
+/// path), collapsing the residual `Add` + norm into one `SkipSimplifiedLayerNorm`
+/// launch measured a small *regression* on H200 (~-1.7%, 47.9 -> 47.1 tok/s),
+/// matching the established finding (#898/#899) that M=1 decode sits at its
+/// launch-amortized latency floor, so node-collapse recovers ~0 and the single
+/// heavier skip kernel is net-negative. The kernel itself is proven byte-exact
+/// and kept for future bf16 GEMV-prologue fusion work; the fold is retained,
+/// gated off, purely for A/B measurement. Set to a non-empty, non-`0` value to
+/// enable it (e.g. on a bandwidth-bound device where the trade may flip).
+const SKIP_RMSNORM_FUSION_ENABLE_ENV: &str = "ONNX_GENAI_CUDA_ENABLE_SKIP_RMSNORM_FUSION";
+
+fn skip_rmsnorm_fusion_enabled() -> bool {
+    std::env::var_os(SKIP_RMSNORM_FUSION_ENABLE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+/// Collapse a residual `Add(a, b) → SimplifiedLayerNormalization(sum, gamma)`
+/// seam into a single `com.microsoft::SkipSimplifiedLayerNormalization`, deleting
+/// the standalone `Add` and norm launches.
+///
+/// ## Why this is byte-exact (and only for bf16)
+///
+/// The native bf16 `SkipSimplifiedLayerNormalization` kernel
+/// (`skip_rmsnorm_bf16`) rounds the residual sum to bf16 **before** the RMS
+/// reduction — bit-for-bit what a standalone bf16 `Add` writes
+/// (`__float2bfloat16_rn(f32(a) + f32(b))`) — and reuses the identical
+/// `rmsnorm_bf16` block-tree reduction. So the fused node produces exactly the
+/// same `y` (normalized output) and `sum` (residual reused by the next layer) as
+/// running the two ops separately; greedy tokens are unchanged. The residual
+/// `sum` value is reused in place, so the next block's residual `Add` transparently
+/// consumes the fused node's output.
+///
+/// This holds **only for bf16**: the fp16 skip kernels use a warp reduction whose
+/// order differs from `Add(f16)` + `rmsnorm_f16`, so folding fp16 here would not
+/// be byte-exact (that path is instead handled, into the neighbouring GEMVs, by
+/// [`CudaSkipRmsNormMatMulFusion`], which explicitly requires fp16). f32 has no
+/// fused Skip kernel gain worth the risk. The pass therefore fires only when the
+/// residual and gamma are bf16/f32 over bf16 activations, and defers to the f32
+/// staging fallback for anything exotic (bias, broadcast skip). Off by default;
+/// enable for A/B with `ONNX_GENAI_CUDA_ENABLE_SKIP_RMSNORM_FUSION` (see that env
+/// const for the H200 regression rationale).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaSkipRmsNormFusion;
+
+struct SkipRmsNormFoldPlan {
+    add_id: NodeId,
+    norm_id: NodeId,
+    a: ValueId,
+    b: ValueId,
+    gamma: ValueId,
+    normalized_out: ValueId,
+    residual_sum: ValueId,
+    epsilon: f32,
+    stat_shape: onnx_runtime_ir::Shape,
+}
+
+impl OptimizationPass for CudaSkipRmsNormFusion {
+    fn name(&self) -> &str {
+        "CudaSkipRmsNormFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        if !skip_rmsnorm_fusion_enabled() {
+            return Ok(());
+        }
+        let norm_ids: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "SimplifiedLayerNormalization" && node.is_default_domain())
+                    .then_some(id)
+            })
+            .collect();
+
+        let mut plans: Vec<SkipRmsNormFoldPlan> = Vec::new();
+        let mut used_adds: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+        for norm_id in norm_ids {
+            if let Some(plan) = self.plan_fold(graph, norm_id) {
+                // Each residual `Add` may feed only one fold; two norms sharing an
+                // Add would both claim its output as their residual sum.
+                if !used_adds.insert(plan.add_id) {
+                    continue;
+                }
+                plans.push(plan);
+            }
+        }
+
+        let changed = !plans.is_empty();
+        for plan in plans {
+            // Delete the `Add` first, leaving its output value alive (its other
+            // consumer — the next block's residual add — keeps it referenced) but
+            // producer-less, so the skip node can reclaim it as `sum` output[3].
+            graph.remove_node(plan.add_id);
+
+            let mean_v = graph.create_value(DataType::Float32, plan.stat_shape.clone());
+            let invstd_v = graph.create_value(DataType::Float32, plan.stat_shape.clone());
+
+            let mut skip = Node::new(
+                NodeId(0),
+                "SkipSimplifiedLayerNormalization",
+                vec![Some(plan.a), Some(plan.b), Some(plan.gamma)],
+                vec![plan.normalized_out, mean_v, invstd_v, plan.residual_sum],
+            );
+            skip.domain = MICROSOFT_DOMAIN.to_string();
+            skip.attributes
+                .insert("epsilon".into(), Attribute::Float(plan.epsilon));
+            // Reuse the norm's NodeId (and reclaim `normalized_out`/`residual_sum`
+            // producers) by replacing the norm node in place.
+            graph.replace_node(plan.norm_id, skip);
+            graph
+                .opset_imports
+                .entry(MICROSOFT_DOMAIN.to_string())
+                .or_insert(1);
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+impl CudaSkipRmsNormFusion {
+    fn plan_fold(&self, graph: &Graph, norm_id: NodeId) -> Option<SkipRmsNormFoldPlan> {
+        let norm = graph.try_node(norm_id)?;
+        // Only the single normalized output; a norm that also emits stats is left
+        // alone (the folded kernel's stats are unused placeholders).
+        if norm.outputs.len() != 1 || norm.inputs.len() < 2 {
+            return None;
+        }
+        let norm_input = norm.inputs[0]?;
+        let gamma = norm.inputs[1]?;
+        if norm.inputs.get(2).copied().flatten().is_some() {
+            return None; // no bias slot support in the byte-exact fused path
+        }
+        let normalized_out = *norm.outputs.first()?;
+        if graph.value(normalized_out).is_graph_output {
+            return None;
+        }
+        // The fused kernel is byte-exact only for bf16 activations.
+        if graph.value(norm_input).dtype != DataType::BFloat16 {
+            return None;
+        }
+        // gamma must be bf16 or f32 (a final multiplicand only; both are read at
+        // full precision by the kernel).
+        let gamma_dtype = graph.value(gamma).dtype;
+        if gamma_dtype != DataType::BFloat16 && gamma_dtype != DataType::Float32 {
+            return None;
+        }
+
+        // The norm input must be produced by a dense elementwise residual `Add`.
+        let add_id = graph.try_value(norm_input)?.producer?;
+        let add = graph.try_node(add_id)?;
+        if add.op_type != "Add"
+            || !add.is_default_domain()
+            || add.inputs.len() != 2
+            || add.outputs.len() != 1
+        {
+            return None;
+        }
+        let a = add.inputs[0]?;
+        let b = add.inputs[1]?;
+        let residual_sum = *add.outputs.first()?;
+        if residual_sum != norm_input || graph.value(residual_sum).is_graph_output {
+            return None;
+        }
+        // Both residual operands must be dense bf16 with identical shapes (no
+        // broadcast), so the fused kernel's per-element bf16-rounded add matches
+        // the standalone `Add(bf16)` bit-for-bit.
+        let a_meta = graph.value(a);
+        let b_meta = graph.value(b);
+        let sum_meta = graph.value(residual_sum);
+        if a_meta.dtype != DataType::BFloat16 || b_meta.dtype != DataType::BFloat16 {
+            return None;
+        }
+        if a_meta.shape != sum_meta.shape || b_meta.shape != sum_meta.shape {
+            return None;
+        }
+        // The hidden (last) dim must be known; per-group stat outputs then span
+        // the leading dims.
+        if sum_meta.shape.is_empty() {
+            return None;
+        }
+        let stat_shape: onnx_runtime_ir::Shape =
+            sum_meta.shape[..sum_meta.shape.len() - 1].to_vec();
+
+        let epsilon = norm
+            .attr("epsilon")
+            .and_then(Attribute::as_float)
+            .unwrap_or(1e-5);
+
+        Some(SkipRmsNormFoldPlan {
+            add_id,
+            norm_id,
+            a,
+            b,
+            gamma,
+            normalized_out,
+            residual_sum,
+            epsilon,
+            stat_shape,
         })
     }
 }
@@ -632,8 +918,198 @@ fn permute_bytes(src: &[u8], dims: &[usize], perm: &[usize], elem: usize) -> Vec
     dst
 }
 
-/// Fold a standalone `Add(MatMulNBits(x), bias)` into the `MatMulNBits` bias
-/// input, removing the separate elementwise launch.
+/// Fold a `Cast` whose input is a producer-less constant initializer into a
+/// pre-converted constant, removing the per-decode-step cast launch.
+///
+/// WHY: bf16 decoders that compute their RMS/layer norms in fp32 export, around
+/// every norm, a `Cast(bf16→f32)` of the *constant* norm weight (`gamma`). That
+/// cast recomputes the identical fp32 weight on every single token — pure launch
+/// overhead in the decode step, which at M=1 is dominated by per-op dispatch
+/// (kernel launch), not GPU math. Muse-Glimmer-30B has 208 such constant-weight
+/// casts per step (four norms × 52 layers); hoisting them out of the step
+/// removes 208 launches per token. The generic [`ConstantFolding`] pass caps at
+/// 1024 elements (shape math only) and has no `Cast` evaluator, so weight-sized
+/// casts reach it unfolded; this CUDA-scoped pass materializes them exactly.
+///
+/// Correctness: the fold is byte-identical to the runtime `Cast` kernel.
+/// Widening (e.g. bf16→f32) is exact; narrowing to f16/bf16 uses `half`'s
+/// round-to-nearest-even, matching the kernel's `__float2half_rn` /
+/// `__float2bfloat16`. Only producer-less, statically-shaped, whole-byte float
+/// initializers among {f16, bf16, f32, f64} are folded; every other case is
+/// skipped (a safe no-op), never risking a wrong constant. The original
+/// initializer is left intact for any other consumers.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaFoldConstantCast;
+
+/// Environment opt-out for [`CudaFoldConstantCast`], mirroring the other
+/// CUDA-pass switches. Any value other than unset/empty/`0` restores the
+/// exported per-step constant `Cast` launches (for A/B measurement or rollback).
+const CONST_CAST_FOLD_DISABLE_ENV: &str = "ONNX_GENAI_CUDA_DISABLE_CONST_CAST_FOLD";
+
+fn const_cast_fold_disabled() -> bool {
+    std::env::var_os(CONST_CAST_FOLD_DISABLE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+struct CastFoldPlan {
+    node: NodeId,
+    output: ValueId,
+    dtype: DataType,
+    dims: Vec<usize>,
+    bytes: Vec<u8>,
+}
+
+impl OptimizationPass for CudaFoldConstantCast {
+    fn name(&self) -> &str {
+        "CudaFoldConstantCast"
+    }
+
+    fn run(&self, graph: &mut Graph, ctx: &PassContext) -> OptimizerResult<()> {
+        if const_cast_fold_disabled() {
+            return Ok(());
+        }
+        let candidates: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "Cast"
+                    && matches!(node.domain.as_str(), "" | "ai.onnx")
+                    && node.inputs.len() == 1
+                    && node.outputs.len() == 1)
+                    .then_some(id)
+            })
+            .collect();
+
+        let mut plans: Vec<CastFoldPlan> = Vec::new();
+        for node_id in candidates {
+            if let Some(plan) = self.plan_fold(graph, ctx, node_id) {
+                plans.push(plan);
+            }
+        }
+
+        let changed = !plans.is_empty();
+        for plan in plans {
+            // Delete the Cast; its output value survives because a consumer (or
+            // graph-output slot) still references it, mirroring the transpose
+            // fold. Then retype the surviving value and back it with the
+            // materialized constant.
+            graph.remove_node(plan.node);
+            if graph.try_value(plan.output).is_none() {
+                continue;
+            }
+            let value = graph.value_mut(plan.output);
+            value.dtype = plan.dtype;
+            value.shape = static_shape(plan.dims.clone());
+            let tensor = TensorData::from_raw(plan.dtype, plan.dims, plan.bytes);
+            graph.set_initializer(plan.output, WeightRef::Inline(tensor));
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+impl CudaFoldConstantCast {
+    fn plan_fold(&self, graph: &Graph, ctx: &PassContext, node_id: NodeId) -> Option<CastFoldPlan> {
+        let node = graph.try_node(node_id)?;
+        let input = node.inputs[0]?;
+        let output = node.outputs[0];
+
+        // The input must be an immutable, producer-less constant initializer.
+        if graph.try_value(input)?.producer.is_some() {
+            return None;
+        }
+        let weight = graph.initializers.get(&input)?;
+        let src_dtype = weight.dtype();
+        let dst_dtype = DataType::from_onnx(node.attr("to").and_then(Attribute::as_int)? as i32)?;
+
+        // Only whole-byte float element types are converted here; sub-byte and
+        // non-float casts are left untouched rather than risk a wrong constant.
+        if src_dtype.byte_size() == 0 || src_dtype.is_sub_byte() {
+            return None;
+        }
+        let dims = weight.dims().to_vec();
+        let src = ctx.initializer_bytes(weight)?;
+        let expected = dims
+            .iter()
+            .product::<usize>()
+            .checked_mul(src_dtype.byte_size())?;
+        if src.len() != expected {
+            return None;
+        }
+        // No-op cast (same dtype): let dead-node elimination handle it.
+        if src_dtype == dst_dtype {
+            return None;
+        }
+        let bytes = convert_float_bytes(src, src_dtype, dst_dtype)?;
+
+        Some(CastFoldPlan {
+            node: node_id,
+            output,
+            dtype: dst_dtype,
+            dims,
+            bytes,
+        })
+    }
+}
+
+/// Convert raw tensor bytes between float element types, matching the runtime
+/// `Cast` kernel's rounding (round-to-nearest-even for narrowing, exact for
+/// widening). Returns `None` for any element type outside {f16, bf16, f32, f64},
+/// so an unsupported cast is skipped rather than mis-folded.
+fn convert_float_bytes(src: &[u8], from: DataType, to: DataType) -> Option<Vec<u8>> {
+    // Decode source into an f32 working value per element. f64 is decoded via
+    // f32 to keep the kernel's `double` intermediate exactness for the float
+    // set we support (f16/bf16/f32 all fit exactly in f32 and f64).
+    let values: Vec<f64> = match from {
+        DataType::Float32 => src
+            .chunks_exact(4)
+            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]) as f64)
+            .collect(),
+        DataType::Float64 => src
+            .chunks_exact(8)
+            .map(|c| f64::from_ne_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .collect(),
+        DataType::Float16 => src
+            .chunks_exact(2)
+            .map(|c| half::f16::from_bits(u16::from_ne_bytes([c[0], c[1]])).to_f32() as f64)
+            .collect(),
+        DataType::BFloat16 => src
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_bits(u16::from_ne_bytes([c[0], c[1]])).to_f32() as f64)
+            .collect(),
+        _ => return None,
+    };
+
+    let mut out = Vec::with_capacity(values.len() * to.byte_size().max(1));
+    match to {
+        DataType::Float32 => {
+            for v in values {
+                out.extend_from_slice(&(v as f32).to_ne_bytes());
+            }
+        }
+        DataType::Float64 => {
+            for v in values {
+                out.extend_from_slice(&v.to_ne_bytes());
+            }
+        }
+        DataType::Float16 => {
+            for v in values {
+                out.extend_from_slice(&half::f16::from_f32(v as f32).to_bits().to_ne_bytes());
+            }
+        }
+        DataType::BFloat16 => {
+            for v in values {
+                out.extend_from_slice(&half::bf16::from_f32(v as f32).to_bits().to_ne_bytes());
+            }
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
 ///
 /// Only the exact QKV-style decode pattern is fused: a `MatMulNBits` with no
 /// zero-points / group-index / existing bias, whose sole consumer is a plain
@@ -1624,6 +2100,437 @@ struct Projection {
     k: usize,
 }
 
+/// Environment opt-in: set to `1` to enable [`CudaQkvProjectionFusion`].
+///
+/// The pass is **disabled by default**. An end-to-end A/B on Muse-Glimmer-30B
+/// int4 (#872 follow-up) showed the fusion is byte-exact and cuts the captured
+/// `MatMulNBits` launch count 417 → 313 (−104 GEMV launches/token), yet decode
+/// throughput is flat-to-marginally-worse (47.33 → 47.26 tok/s median). Decode
+/// is weight-bandwidth/compute-floor bound, not expensive-dispatch bound, so
+/// enabling the fusion by default would ship a (small) regression for no gain.
+/// The correct, tested implementation is retained behind this flag for future
+/// architectures where the projections are dispatch-bound (e.g. fp16 activations
+/// or shapes with a higher launch-latency-to-bandwidth ratio).
+const QKV_FUSION_ENABLE_ENV: &str = "ONNX_GENAI_CUDA_ENABLE_QKV_FUSION";
+
+fn qkv_fusion_enabled() -> bool {
+    std::env::var_os(QKV_FUSION_ENABLE_ENV).is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+/// Fuse the three per-decoder-layer attention projections (`q_proj`, `k_proj`,
+/// `v_proj`) — separate `MatMulNBits` GEMVs that all read the *same*
+/// input-normalization activation — into a single wider `MatMulNBits` whose
+/// output is demultiplexed by one `Split` back to the original Q/K/V consumers.
+///
+/// ## Why (the lever this tests)
+///
+/// Under CUDA-graph capture, decode is dominated by serially issued grid
+/// launches. Prior work (#870, #872) showed reducing *cheap* elementwise node
+/// count does not help. This pass tests the remaining hypothesis by cutting the
+/// count of *expensive* GEMV launches: 3 projection launches/layer become 1
+/// (+ one `Split` copy), i.e. −2 `MatMulNBits` launches × 52 layers = −104
+/// GEMV launches/token. If tok/s improves, decode is dispatch-bound on the
+/// expensive path; if flat/worse, it is weight-bandwidth/compute-floor bound
+/// (the three projections read disjoint weights, so fusing cannot reduce bytes).
+///
+/// ## Result (measured, Muse-Glimmer-30B int4, #872 follow-up)
+///
+/// The fusion is byte-exact and cuts the captured `MatMulNBits` launch count
+/// 417 → 313 (−104 GEMV launches/token, capture stays 1 segment / 0 seams), yet
+/// decode throughput is **flat-to-marginally-worse** (47.33 → 47.26 tok/s median
+/// over 3 interleaved trials). The three projections read disjoint weights, so
+/// fusing cannot cut bytes moved — this is the definitive evidence that decode
+/// is weight-bandwidth/compute-floor bound, not expensive-dispatch bound. The
+/// pass is therefore **disabled by default** (opt-in via
+/// [`QKV_FUSION_ENABLE_ENV`]) and retained for future dispatch-bound shapes.
+///
+/// ## Byte-exactness
+///
+/// `MatMulNBits` computes each output column independently from its own weight
+/// row / scale / zero-point block, reducing over the shared contraction `K`.
+/// Column-concatenating the Q, K, V weight/scale/zero-point initializers along
+/// their output (`N`) axis therefore leaves every column's dequant + reduction
+/// bit-for-bit identical; the trailing `Split` is a pure copy. Greedy tokens
+/// stay byte-identical (verified end-to-end).
+///
+/// ## Gate (structural + capability, never a specific model's dimensions)
+///
+/// Fires on a `GroupQueryAttention` whose query/key/value trace back to three
+/// distinct `MatMulNBits` GEMVs that (a) share one activation input, (b) share
+/// `K`, `block_size` (32) and `bits` (4), (c) hold persistent initializer
+/// weights/scales (and either all or none carry an asymmetric zero point), and
+/// (d) each feed exactly one consumer and no graph output. Any mismatch leaves
+/// the three separate GEMVs untouched.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaQkvProjectionFusion;
+
+struct QkvProj {
+    matmul: NodeId,
+    out: ValueId,
+    weight: ValueId,
+    scales: ValueId,
+    zero_points: Option<ValueId>,
+    activation: ValueId,
+    n: usize,
+    k: usize,
+    block_size: i64,
+    bits: i64,
+}
+
+struct QkvFusionPlan {
+    activation: ValueId,
+    q: QkvProj,
+    k: QkvProj,
+    v: QkvProj,
+}
+
+impl OptimizationPass for CudaQkvProjectionFusion {
+    fn name(&self) -> &str {
+        "CudaQkvProjectionFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, ctx: &PassContext) -> OptimizerResult<()> {
+        if !qkv_fusion_enabled() {
+            return Ok(());
+        }
+        self.fuse_all(graph, ctx)
+    }
+}
+
+impl CudaQkvProjectionFusion {
+    /// Perform the fusion regardless of the [`QKV_FUSION_ENABLE_ENV`] gate.
+    /// `run` applies the opt-in gate and then delegates here; tests exercise the
+    /// fusion logic directly without mutating process-global environment state.
+    fn fuse_all(&self, graph: &mut Graph, ctx: &PassContext) -> OptimizerResult<()> {
+        let gqa_nodes: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "GroupQueryAttention" && node.domain == MICROSOFT_DOMAIN)
+                    .then_some(id)
+            })
+            .collect();
+
+        let mut plans: Vec<QkvFusionPlan> = Vec::new();
+        for gqa_id in gqa_nodes {
+            if let Some(plan) = self.plan_fuse(graph, gqa_id) {
+                plans.push(plan);
+            }
+        }
+
+        let changed = !plans.is_empty();
+        for plan in plans {
+            self.apply_fuse(graph, ctx, plan)?;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+
+    fn plan_fuse(&self, graph: &Graph, gqa_id: NodeId) -> Option<QkvFusionPlan> {
+        let gqa = graph.try_node(gqa_id)?;
+        if gqa.inputs.len() < 3 {
+            return None;
+        }
+        let q_mm = self.trace_back_to_matmul(graph, gqa.inputs[0]?)?;
+        let k_mm = self.trace_back_to_matmul(graph, gqa.inputs[1]?)?;
+        let v_mm = self.trace_back_to_matmul(graph, gqa.inputs[2]?)?;
+        if q_mm == k_mm || q_mm == v_mm || k_mm == v_mm {
+            return None;
+        }
+
+        let q = self.eligible_projection(graph, q_mm)?;
+        let k = self.eligible_projection(graph, k_mm)?;
+        let v = self.eligible_projection(graph, v_mm)?;
+
+        // All three projections must read the same activation and be mutually
+        // compatible (shared contraction depth, quantization geometry, and
+        // zero-point presence) so their weights concatenate byte-exactly.
+        if q.activation != k.activation || q.activation != v.activation {
+            return None;
+        }
+        if q.k != k.k || q.k != v.k {
+            return None;
+        }
+        if q.block_size != k.block_size || q.block_size != v.block_size {
+            return None;
+        }
+        if q.bits != k.bits || q.bits != v.bits {
+            return None;
+        }
+        if q.zero_points.is_some() != k.zero_points.is_some()
+            || q.zero_points.is_some() != v.zero_points.is_some()
+        {
+            return None;
+        }
+        // Weight/scale (and zero-point) element types must match across the
+        // three so the concatenated initializer stays homogeneous.
+        if graph.value(q.out).dtype != graph.value(k.out).dtype
+            || graph.value(q.out).dtype != graph.value(v.out).dtype
+        {
+            return None;
+        }
+        if graph.initializers.get(&q.scales)?.dtype() != graph.initializers.get(&k.scales)?.dtype()
+            || graph.initializers.get(&q.scales)?.dtype()
+                != graph.initializers.get(&v.scales)?.dtype()
+        {
+            return None;
+        }
+
+        Some(QkvFusionPlan {
+            activation: q.activation,
+            q,
+            k,
+            v,
+        })
+    }
+
+    /// Walk back from `value` along the primary (`input[0]`) data edge until a
+    /// `MatMulNBits` producer is found, skipping the Q/K post-projection
+    /// norm/scale/reshape glue. Returns `None` on a dead end or if no
+    /// `MatMulNBits` is reached within a small depth bound.
+    fn trace_back_to_matmul(&self, graph: &Graph, mut value: ValueId) -> Option<NodeId> {
+        for _ in 0..12 {
+            let producer = graph.try_value(value)?.producer?;
+            let node = graph.try_node(producer)?;
+            if node.op_type == "MatMulNBits" && node.domain == MICROSOFT_DOMAIN {
+                return Some(producer);
+            }
+            value = node.inputs.first().copied().flatten()?;
+        }
+        None
+    }
+
+    /// Validate one projection `MatMulNBits` against the capability contract and
+    /// return its value ids + geometry, or `None` if it cannot be fused.
+    fn eligible_projection(&self, graph: &Graph, matmul_id: NodeId) -> Option<QkvProj> {
+        let node = graph.try_node(matmul_id)?;
+        // `[activation, weight, scales]` plus an optional asymmetric zero point
+        // (slot 3). Reject a group index (slot 4) or bias (slot 5).
+        let present: Vec<ValueId> = node.input_values().collect();
+        if !(present.len() == 3 || present.len() == 4)
+            || node.inputs.iter().skip(4).any(Option::is_some)
+        {
+            return None;
+        }
+        let zero_points = node.inputs.get(3).copied().flatten();
+
+        let n = node.attr("N").and_then(Attribute::as_int)? as usize;
+        let k = node.attr("K").and_then(Attribute::as_int)? as usize;
+        let block_size = node.attr("block_size").and_then(Attribute::as_int)?;
+        let bits = node.attr("bits").and_then(Attribute::as_int).unwrap_or(4);
+        // Match the block-32 / 4-bit form the concatenation reasons about; the
+        // byte layout of any other geometry is not assumed here.
+        if block_size != GATE_UP_SWIGLU_SUPPORTED_BLOCK_SIZE as i64
+            || bits != GATE_UP_SWIGLU_SUPPORTED_BITS
+        {
+            return None;
+        }
+
+        let activation = node.inputs[0]?;
+        let weight = node.inputs[1]?;
+        let scales = node.inputs[2]?;
+        if !graph.initializers.contains_key(&weight) || !graph.initializers.contains_key(&scales) {
+            return None;
+        }
+        if let Some(zp) = zero_points
+            && !graph.initializers.contains_key(&zp)
+        {
+            return None;
+        }
+
+        // The projection output must feed exactly one consumer and not escape as
+        // a graph output, so reusing it as a `Split` output is safe.
+        let out = node.outputs[0];
+        if graph.consumers(out).len() != 1 || graph.value(out).is_graph_output {
+            return None;
+        }
+
+        Some(QkvProj {
+            matmul: matmul_id,
+            out,
+            weight,
+            scales,
+            zero_points,
+            activation,
+            n,
+            k,
+            block_size,
+            bits,
+        })
+    }
+
+    fn apply_fuse(
+        &self,
+        graph: &mut Graph,
+        ctx: &PassContext,
+        plan: QkvFusionPlan,
+    ) -> OptimizerResult<()> {
+        let QkvFusionPlan {
+            activation,
+            q,
+            k,
+            v,
+        } = plan;
+        let n_total = q.n + k.n + v.n;
+
+        // Concatenate the int4 weight / scale / (zero-point) initializers along
+        // their output (`N`) axis. Axis 0 is the outermost, row-major dimension,
+        // so an N-axis concatenation is a byte concatenation; each sub-tensor is
+        // byte-aligned (`N * n_blocks` even for the zero points), keeping it exact.
+        let weight_bytes = self.concat_initializers(graph, ctx, &[q.weight, k.weight, v.weight])?;
+        let scale_bytes = self.concat_initializers(graph, ctx, &[q.scales, k.scales, v.scales])?;
+        let zero_bytes = match (q.zero_points, k.zero_points, v.zero_points) {
+            (Some(qz), Some(kz), Some(vz)) => {
+                Some(self.concat_initializers(graph, ctx, &[qz, kz, vz])?)
+            }
+            _ => None,
+        };
+
+        // Fused weight dims: [N_total, n_blocks, blob] cloned from Q (the three
+        // share n_blocks/blob because they share K, block_size and bits).
+        let q_weight = graph.initializers.get(&q.weight).ok_or_else(|| {
+            OptimizerError::Fusion("qkv fusion: missing q weight initializer".into())
+        })?;
+        let mut weight_dims = q_weight.dims().to_vec();
+        let weight_dtype = q_weight.dtype();
+        if weight_dims.is_empty() {
+            return Err(OptimizerError::Fusion(
+                "qkv fusion: scalar weight initializer".into(),
+            ));
+        }
+        weight_dims[0] = n_total;
+
+        let scale_dtype = graph
+            .initializers
+            .get(&q.scales)
+            .ok_or_else(|| OptimizerError::Fusion("qkv fusion: missing q scales".into()))?
+            .dtype();
+
+        let fused_weight = graph.create_value(weight_dtype, static_shape(weight_dims.clone()));
+        graph.set_initializer(
+            fused_weight,
+            WeightRef::Inline(TensorData::from_raw(
+                weight_dtype,
+                weight_dims,
+                weight_bytes,
+            )),
+        );
+
+        let scale_len = scale_bytes.len() / scale_dtype.byte_size().max(1);
+        let fused_scales = graph.create_value(scale_dtype, static_shape(vec![scale_len]));
+        graph.set_initializer(
+            fused_scales,
+            WeightRef::Inline(TensorData::from_raw(
+                scale_dtype,
+                vec![scale_len],
+                scale_bytes,
+            )),
+        );
+
+        let fused_zero = zero_bytes.map(|bytes| {
+            let value = graph.create_value(DataType::Uint8, static_shape(vec![bytes.len()]));
+            graph.set_initializer(
+                value,
+                WeightRef::Inline(TensorData::from_raw(
+                    DataType::Uint8,
+                    vec![bytes.len()],
+                    bytes,
+                )),
+            );
+            value
+        });
+
+        // Fused MatMulNBits output: Q's output shape with the trailing (`N`) axis
+        // widened to N_total.
+        let out_dtype = graph.value(q.out).dtype;
+        let mut fused_shape = graph.value(q.out).shape.clone();
+        match fused_shape.last_mut() {
+            Some(dim) => *dim = Dim::Static(n_total),
+            None => {
+                return Err(OptimizerError::Fusion(
+                    "qkv fusion: scalar projection output".into(),
+                ));
+            }
+        }
+        let fused_out = graph.create_value(out_dtype, fused_shape);
+
+        // Clone Q's attributes (preserving block_size/bits/accuracy_level/etc.)
+        // and widen N.
+        let mut attributes = graph.node(q.matmul).attributes.clone();
+        attributes.insert("N".into(), Attribute::Int(n_total as i64));
+        let version = graph.node(q.matmul).version;
+
+        let mut fused_inputs = vec![Some(activation), Some(fused_weight), Some(fused_scales)];
+        if let Some(zero) = fused_zero {
+            fused_inputs.push(Some(zero));
+        }
+        let mut fused_matmul = Node::new(NodeId(0), "MatMulNBits", fused_inputs, vec![fused_out]);
+        fused_matmul.domain = MICROSOFT_DOMAIN.into();
+        fused_matmul.version = version;
+        fused_matmul.attributes = attributes;
+        graph.insert_node(fused_matmul);
+
+        // Drop the three now-redundant projection GEMVs. Their outputs survive
+        // (each still has its downstream consumer) with a cleared producer, so
+        // they can be re-attached as the Split outputs below.
+        let axis = graph.value(q.out).shape.len() as i64 - 1;
+        for proj in [&q, &k, &v] {
+            graph.remove_node(proj.matmul);
+        }
+        // Retire the original per-projection weight/scale/zero-point initializers
+        // so they are neither uploaded nor left dangling.
+        for proj in [&q, &k, &v] {
+            for value in [Some(proj.weight), Some(proj.scales), proj.zero_points]
+                .into_iter()
+                .flatten()
+            {
+                graph.initializers.remove(&value);
+                graph.gc_value_if_orphan(value);
+            }
+        }
+
+        // One Split demuxes [Q|K|V] back to the original consumer edges.
+        let mut split = Node::new(
+            NodeId(0),
+            "Split",
+            vec![Some(fused_out)],
+            vec![q.out, k.out, v.out],
+        );
+        split.attributes.insert("axis".into(), Attribute::Int(axis));
+        split.attributes.insert(
+            "split".into(),
+            Attribute::Ints(vec![q.n as i64, k.n as i64, v.n as i64]),
+        );
+        graph.insert_node(split);
+
+        Ok(())
+    }
+
+    /// Read and byte-concatenate the raw little-endian bytes of several
+    /// initializers in order.
+    fn concat_initializers(
+        &self,
+        graph: &Graph,
+        ctx: &PassContext,
+        values: &[ValueId],
+    ) -> OptimizerResult<Vec<u8>> {
+        let mut out = Vec::new();
+        for &value in values {
+            let weight = graph.initializers.get(&value).ok_or_else(|| {
+                OptimizerError::Fusion("qkv fusion: missing initializer for concat".into())
+            })?;
+            let bytes = ctx.initializer_bytes(weight).ok_or_else(|| {
+                OptimizerError::Fusion("qkv fusion: could not resolve initializer bytes".into())
+            })?;
+            out.extend_from_slice(bytes);
+        }
+        Ok(out)
+    }
+}
+
 /// Lower a capture-unsafe `If` whose branches are pure, side-effect-free
 /// constant selections into an on-device `Where`, so its loop-invariant scalar
 /// predicate is evaluated on the device every step and the decode collapses from
@@ -1974,6 +2881,176 @@ mod tests {
         graph.create_named_value(name, dtype, vec![Dim::Static(1), Dim::Static(width)])
     }
 
+    /// Build the bf16 residual seam `CudaSkipRmsNormFusion` targets:
+    /// `Add(a, b) → SimplifiedLayerNormalization(sum, gamma) → Identity → out`,
+    /// with the residual sum also feeding a second consumer (the next block's
+    /// residual add) so its rewiring onto the fused node's `sum` output is
+    /// observable.
+    fn bf16_skip_seam_graph(hidden: usize, gamma_dtype: DataType) -> Graph {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+
+        let a = value(&mut graph, "a", DataType::BFloat16, hidden);
+        let b = value(&mut graph, "b", DataType::BFloat16, hidden);
+        graph.add_input(a);
+        graph.add_input(b);
+        let sum = value(&mut graph, "sum", DataType::BFloat16, hidden);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(a), Some(b)],
+            vec![sum],
+        ));
+
+        let gamma = vec1d(&mut graph, "gamma", gamma_dtype, hidden);
+        graph.set_initializer(
+            gamma,
+            WeightRef::Inline(TensorData::from_raw(
+                gamma_dtype,
+                vec![hidden],
+                vec![0u8; hidden * gamma_dtype.byte_size()],
+            )),
+        );
+        let normalized = value(&mut graph, "normalized", DataType::BFloat16, hidden);
+        let mut norm = Node::new(
+            NodeId(0),
+            "SimplifiedLayerNormalization",
+            vec![Some(sum), Some(gamma)],
+            vec![normalized],
+        );
+        norm.attributes
+            .insert("epsilon".into(), Attribute::Float(9.999_999e-7));
+        graph.insert_node(norm);
+
+        // Norm output sink.
+        let out = value(&mut graph, "out", DataType::BFloat16, hidden);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(normalized)],
+            vec![out],
+        ));
+        graph.add_output(out);
+
+        // Second consumer of the residual sum (the next block's residual add).
+        let next_res = value(&mut graph, "next_res", DataType::BFloat16, hidden);
+        let next_sum = value(&mut graph, "next_sum", DataType::BFloat16, hidden);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(sum), Some(next_res)],
+            vec![next_sum],
+        ));
+        graph.add_input(next_res);
+        graph.add_output(next_sum);
+
+        graph
+    }
+
+    #[test]
+    fn folds_bf16_residual_add_norm_into_skip_node() {
+        for gamma_dtype in [DataType::BFloat16, DataType::Float32] {
+            let mut graph = bf16_skip_seam_graph(6656, gamma_dtype);
+            let a = value_id_by_name(&graph, "a");
+            let b = value_id_by_name(&graph, "b");
+            let gamma = value_id_by_name(&graph, "gamma");
+            let sum = value_id_by_name(&graph, "sum");
+            let normalized = value_id_by_name(&graph, "normalized");
+
+            CudaSkipRmsNormFusion
+                .run(&mut graph, &PassContext::new())
+                .unwrap();
+
+            // The fold is opt-in; without the flag the seam is left intact.
+            assert!(
+                graph
+                    .nodes
+                    .values()
+                    .any(|n| n.op_type == "SimplifiedLayerNormalization"),
+                "default (flag unset) leaves the standalone norm (gamma={gamma_dtype:?})"
+            );
+
+            // SAFETY: single-threaded test; env is restored before returning.
+            unsafe { std::env::set_var(SKIP_RMSNORM_FUSION_ENABLE_ENV, "1") };
+            let result = CudaSkipRmsNormFusion.run(&mut graph, &PassContext::new());
+            unsafe { std::env::remove_var(SKIP_RMSNORM_FUSION_ENABLE_ENV) };
+            result.unwrap();
+            assert!(
+                graph
+                    .nodes
+                    .values()
+                    .all(|n| n.op_type != "SimplifiedLayerNormalization"),
+                "the standalone norm must be deleted (gamma={gamma_dtype:?})"
+            );
+            let skip_nodes: Vec<&Node> = graph
+                .nodes
+                .values()
+                .filter(|n| n.op_type == "SkipSimplifiedLayerNormalization")
+                .collect();
+            assert_eq!(
+                skip_nodes.len(),
+                1,
+                "exactly one skip node (gamma={gamma_dtype:?})"
+            );
+            let skip = skip_nodes[0];
+            assert_eq!(skip.domain, MICROSOFT_DOMAIN);
+            assert_eq!(
+                skip.inputs,
+                vec![Some(a), Some(b), Some(gamma)],
+                "skip inputs = [a, b, gamma] (gamma={gamma_dtype:?})"
+            );
+            // Output[0] = normalized (reused), output[3] = residual sum (reused).
+            assert_eq!(skip.outputs[0], normalized);
+            assert_eq!(skip.outputs[3], sum);
+            assert_eq!(skip.outputs.len(), 4);
+
+            // The residual sum is now produced by the skip node and still feeds
+            // the next block's residual add.
+            assert_eq!(graph.value(sum).producer, Some(skip.id));
+            let sum_consumers = graph.consumers(sum);
+            assert_eq!(sum_consumers.len(), 1);
+            assert_eq!(graph.node(sum_consumers[0]).op_type, "Add");
+
+            // No standalone residual Add feeding the (now gone) norm remains for
+            // that seam: only the *next* block's Add survives.
+            assert_eq!(
+                graph.nodes.values().filter(|n| n.op_type == "Add").count(),
+                1,
+                "only the next-block residual Add remains (gamma={gamma_dtype:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_rmsnorm_fusion_skips_fp16_seam() {
+        // fp16 activations are NOT byte-exact under the bf16 fused kernel, so the
+        // pass must leave the fp16 seam untouched.
+        let mut graph = bf16_skip_seam_graph(6656, DataType::Float16);
+        // Retype the activations to fp16.
+        for name in ["a", "b", "sum", "normalized", "out", "next_res", "next_sum"] {
+            let id = value_id_by_name(&graph, name);
+            graph.value_mut(id).dtype = DataType::Float16;
+        }
+        // SAFETY: single-threaded test; env is restored before returning.
+        unsafe { std::env::set_var(SKIP_RMSNORM_FUSION_ENABLE_ENV, "1") };
+        let result = CudaSkipRmsNormFusion.run(&mut graph, &PassContext::new());
+        unsafe { std::env::remove_var(SKIP_RMSNORM_FUSION_ENABLE_ENV) };
+        result.unwrap();
+        assert!(
+            graph
+                .nodes
+                .values()
+                .any(|n| n.op_type == "SimplifiedLayerNormalization"),
+            "fp16 seam must be left for CudaSkipRmsNormMatMulFusion, not folded here"
+        );
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|n| n.op_type != "SkipSimplifiedLayerNormalization"),
+        );
+    }
+
     fn swiglu_graph(dtype: DataType, gate_width: usize, up_width: usize) -> Graph {
         let mut graph = Graph::new();
         graph.opset_imports.insert(String::new(), 17);
@@ -2028,6 +3105,81 @@ mod tests {
                 .nodes
                 .values()
                 .all(|node| node.attr(SILU_MUL_FUSION_ATTR).is_none())
+        );
+    }
+
+    /// `Sigmoid(x)` + `Mul(x, sigmoid)` + `Mul(silu, up)` in a narrow stream
+    /// collapses through `CudaSiluFusion` -> `CudaSwiGluFusion` into a single
+    /// tagged decomposed `Mul[_cuda_silu_mul]`, deleting the standalone
+    /// `Sigmoid` and the intermediate `Mul`. The plain (non-projection) `up`
+    /// value means `CudaGateUpSwiGluFusion` cannot fold the GEMVs, so the glue
+    /// collapse is observed in isolation.
+    fn decomposed_swiglu_glue_graph(dtype: DataType) -> Graph {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let x = value(&mut graph, "x", dtype, 7);
+        let up = value(&mut graph, "up", dtype, 7);
+        let sigmoid_out = value(&mut graph, "sigmoid", dtype, 7);
+        let silu_out = value(&mut graph, "silu", dtype, 7);
+        let output = value(&mut graph, "output", dtype, 7);
+        graph.add_input(x);
+        graph.add_input(up);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Sigmoid",
+            vec![Some(x)],
+            vec![sigmoid_out],
+        ));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(x), Some(sigmoid_out)],
+            vec![silu_out],
+        ));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(silu_out), Some(up)],
+            vec![output],
+        ));
+        graph.add_output(output);
+        graph
+    }
+
+    #[test]
+    fn collapses_bf16_decomposed_swiglu_glue() {
+        let mut graph = decomposed_swiglu_glue_graph(DataType::BFloat16);
+        CudaSiluFusion.run(&mut graph, &PassContext::new()).unwrap();
+        CudaSwiGluFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(graph.num_nodes(), 1, "Sigmoid + inner Mul must be removed");
+        let fused = graph.nodes.values().next().unwrap();
+        assert_eq!(fused.op_type, "Mul");
+        assert_eq!(
+            fused.attr(SILU_MUL_FUSION_ATTR).and_then(Attribute::as_int),
+            Some(1)
+        );
+        assert_eq!(
+            fused.attr(DECOMPOSED_SILU_ATTR).and_then(Attribute::as_int),
+            Some(1),
+            "the bf16 fused Mul must carry the decomposed marker so the runtime \
+             selects the byte-exact decomposed_silu_mul_bf16 kernel"
+        );
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn leaves_fp32_decomposed_swiglu_glue_separate() {
+        let mut graph = decomposed_swiglu_glue_graph(DataType::Float32);
+        CudaSiluFusion.run(&mut graph, &PassContext::new()).unwrap();
+
+        // No fp32 decomposed-SiLU kernel: the Sigmoid must not lower to Silu.
+        assert_eq!(graph.num_nodes(), 3);
+        assert!(
+            graph.nodes.values().all(|node| node.op_type != "Silu"),
+            "fp32 has no byte-exact decomposed SiLU kernel; must stay unfused"
         );
     }
 
@@ -2137,6 +3289,201 @@ mod tests {
             .unwrap();
         assert!(graph.nodes.values().all(|node| node.op_type != "Transpose"));
         assert_eq!(static_shape_of(&graph, transposed), vec![5, 2]);
+    }
+
+    // === Constant Cast fold ===
+
+    /// Build a graph `Cast(const [n], to=dst) -> Identity consumer`, with the
+    /// constant provided as an inline initializer of `src_dtype` holding the
+    /// bytes `src_bytes`.
+    fn const_cast_graph(
+        n: usize,
+        src_dtype: DataType,
+        src_bytes: Vec<u8>,
+        dst_dtype: DataType,
+    ) -> (Graph, ValueId) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+
+        let weight = graph.create_named_value("weight", src_dtype, vec![Dim::Static(n)]);
+        graph.set_initializer(
+            weight,
+            WeightRef::Inline(TensorData::from_raw(src_dtype, vec![n], src_bytes)),
+        );
+
+        let cast_out = graph.create_named_value("cast_out", dst_dtype, vec![Dim::Static(n)]);
+        let mut node = Node::new(NodeId(0), "Cast", vec![Some(weight)], vec![cast_out]);
+        node.attributes
+            .insert("to".into(), Attribute::Int(dst_dtype.to_onnx() as i64));
+        graph.insert_node(node);
+
+        let out = graph.create_named_value("out", dst_dtype, vec![Dim::Static(n)]);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(cast_out)],
+            vec![out],
+        ));
+        graph.add_output(out);
+        (graph, cast_out)
+    }
+
+    #[test]
+    fn folds_constant_cast_bf16_to_f32_byte_identical() {
+        // bf16 → f32 widening is exact. Element i holds bf16(i * 1.5).
+        let n = 6usize;
+        let mut bytes = Vec::with_capacity(n * 2);
+        let mut expected = Vec::with_capacity(n);
+        for i in 0..n {
+            let v = half::bf16::from_f32(i as f32 * 1.5);
+            bytes.extend_from_slice(&v.to_le_bytes());
+            expected.push(v.to_f32());
+        }
+        let (mut graph, cast_out) =
+            const_cast_graph(n, DataType::BFloat16, bytes, DataType::Float32);
+        assert!(graph.value(cast_out).producer.is_some());
+
+        CudaFoldConstantCast
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        // Cast node gone; the value is now a producer-less f32 initializer.
+        assert!(graph.nodes.values().all(|node| node.op_type != "Cast"));
+        assert!(graph.value(cast_out).producer.is_none());
+        assert_eq!(graph.value(cast_out).dtype, DataType::Float32);
+        let WeightRef::Inline(tensor) = graph.initializers.get(&cast_out).unwrap() else {
+            panic!("expected inline initializer");
+        };
+        assert_eq!(tensor.dims, vec![n]);
+        for (i, want) in expected.iter().enumerate() {
+            let got = f32::from_le_bytes([
+                tensor.data[i * 4],
+                tensor.data[i * 4 + 1],
+                tensor.data[i * 4 + 2],
+                tensor.data[i * 4 + 3],
+            ]);
+            assert_eq!(got, *want, "element {i}");
+        }
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn folds_constant_cast_f32_to_bf16_round_to_nearest_even() {
+        // f32 → bf16 narrowing must match the kernel's round-to-nearest-even
+        // (`half::bf16::from_f32`).
+        let values = [0.0f32, 1.0, 1.5, -2.75, 3.141_592_7, 65_504.0];
+        let mut bytes = Vec::new();
+        for v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let (mut graph, cast_out) =
+            const_cast_graph(values.len(), DataType::Float32, bytes, DataType::BFloat16);
+
+        CudaFoldConstantCast
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        let WeightRef::Inline(tensor) = graph.initializers.get(&cast_out).unwrap() else {
+            panic!("expected inline initializer");
+        };
+        for (i, v) in values.iter().enumerate() {
+            let got = half::bf16::from_le_bytes([tensor.data[i * 2], tensor.data[i * 2 + 1]]);
+            assert_eq!(got, half::bf16::from_f32(*v), "element {i}");
+        }
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn leaves_cast_of_non_constant() {
+        // A Cast whose input is a graph input (not an initializer) is left alone.
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let x = graph.create_named_value("x", DataType::BFloat16, vec![Dim::Static(4)]);
+        graph.add_input(x);
+        let cast_out =
+            graph.create_named_value("cast_out", DataType::Float32, vec![Dim::Static(4)]);
+        let mut node = Node::new(NodeId(0), "Cast", vec![Some(x)], vec![cast_out]);
+        node.attributes.insert(
+            "to".into(),
+            Attribute::Int(DataType::Float32.to_onnx() as i64),
+        );
+        graph.insert_node(node);
+        graph.add_output(cast_out);
+
+        CudaFoldConstantCast
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(
+            graph
+                .nodes
+                .values()
+                .filter(|node| node.op_type == "Cast")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn leaves_sub_byte_constant_cast() {
+        // An int4-packed constant must not be folded by the byte-wise path.
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let weight = graph.create_named_value("weight", DataType::Int4, vec![Dim::Static(4)]);
+        graph.set_initializer(
+            weight,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int4,
+                vec![4],
+                vec![0x21, 0x43],
+            )),
+        );
+        let cast_out =
+            graph.create_named_value("cast_out", DataType::Float32, vec![Dim::Static(4)]);
+        let mut node = Node::new(NodeId(0), "Cast", vec![Some(weight)], vec![cast_out]);
+        node.attributes.insert(
+            "to".into(),
+            Attribute::Int(DataType::Float32.to_onnx() as i64),
+        );
+        graph.insert_node(node);
+        graph.add_output(cast_out);
+
+        CudaFoldConstantCast
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(
+            graph
+                .nodes
+                .values()
+                .filter(|node| node.op_type == "Cast")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn const_cast_fold_respects_disable_env() {
+        // SAFETY: single-threaded test; env is restored before returning.
+        let n = 4usize;
+        let mut bytes = Vec::new();
+        for i in 0..n {
+            bytes.extend_from_slice(&half::bf16::from_f32(i as f32).to_le_bytes());
+        }
+        let (mut graph, _cast_out) =
+            const_cast_graph(n, DataType::BFloat16, bytes, DataType::Float32);
+        unsafe { std::env::set_var(CONST_CAST_FOLD_DISABLE_ENV, "1") };
+        let result = CudaFoldConstantCast.run(&mut graph, &PassContext::new());
+        unsafe { std::env::remove_var(CONST_CAST_FOLD_DISABLE_ENV) };
+        result.unwrap();
+        assert_eq!(
+            graph
+                .nodes
+                .values()
+                .filter(|node| node.op_type == "Cast")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -3829,6 +5176,225 @@ mod tests {
         assert!(graph.validate().is_ok());
     }
 
+    /// A bf16 `RMSNormalization` exported in fp32 with a `Cast(bf16 -> f32)` on
+    /// its activation input and a `Cast(f32 -> bf16)` on its result — the
+    /// Muse-Glimmer shape. The `scale` weight stays fp32 (in the real model it is
+    /// a constant `Cast(weight_bf16 -> f32) + 1` expression; here we model it as a
+    /// plain fp32 initializer, since the pass only touches activation index 0).
+    fn cast_wrapped_rms_norm_graph_bf16(hidden: usize) -> (Graph, ValueId, ValueId) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+
+        let x_bf16 = value(&mut graph, "x_bf16", DataType::BFloat16, hidden);
+        graph.add_input(x_bf16);
+        let scale = vec1d(&mut graph, "scale", DataType::Float32, hidden);
+        graph.set_initializer(
+            scale,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![hidden],
+                vec![0u8; hidden * 4],
+            )),
+        );
+
+        let x_f32 = cast_node(&mut graph, "x_f32", x_bf16, DataType::Float32, hidden);
+        let norm_out = value(&mut graph, "norm_out", DataType::Float32, hidden);
+        let mut rms = Node::new(
+            NodeId(0),
+            "RMSNormalization",
+            vec![Some(x_f32), Some(scale)],
+            vec![norm_out],
+        );
+        rms.attributes
+            .insert("epsilon".into(), Attribute::Float(1e-6));
+        graph.insert_node(rms);
+
+        let normalized = cast_node(
+            &mut graph,
+            "normalized",
+            norm_out,
+            DataType::BFloat16,
+            hidden,
+        );
+        graph.add_output(normalized);
+        (graph, x_bf16, scale)
+    }
+
+    #[test]
+    fn drops_casts_around_fp32_wrapped_bf16_rms_norm() {
+        let hidden = 128;
+        let (mut graph, x_bf16, scale) = cast_wrapped_rms_norm_graph_bf16(hidden);
+
+        CudaDropNormalizationCasts
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        // Every wrapping Cast is gone.
+        assert_eq!(
+            graph.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            0,
+            "all bf16 cast wrappers must be removed"
+        );
+
+        // The narrowed `RMSNormalization` is rewritten to the identical-arithmetic
+        // `SimplifiedLayerNormalization` (whose output follows `X`, not the scale),
+        // so re-running shape inference keeps the bf16 output instead of clobbering
+        // it back to the f32 scale dtype.
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|n| n.op_type != "RMSNormalization"),
+            "narrowed RMSNormalization must be converted to SimplifiedLayerNormalization"
+        );
+        let rms = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "SimplifiedLayerNormalization")
+            .expect("converted norm node retained");
+        assert_eq!(rms.domain, "", "converted norm stays in the ai.onnx domain");
+        assert_eq!(
+            rms.inputs,
+            vec![Some(x_bf16), Some(scale)],
+            "activation input rewired to bf16 source; scale untouched"
+        );
+        // Its consumed float output is retyped to bf16, matching the input.
+        assert_eq!(graph.value(rms.outputs[0]).dtype, DataType::BFloat16);
+        // The fp32 scale weight is preserved (kernel upcasts activation, applies
+        // fp32 scale).
+        assert_eq!(graph.value(scale).dtype, DataType::Float32);
+        // Graph output is now the norm's bf16 output.
+        assert_eq!(graph.outputs.len(), 1);
+        assert_eq!(graph.value(graph.outputs[0]).dtype, DataType::BFloat16);
+        assert!(graph.validate().is_ok());
+
+        // Re-running shape inference (as the session does after optimization) must
+        // preserve the bf16 output — the whole point of the op conversion.
+        let registry = onnx_runtime_shape_inference::InferenceRegistry::default_registry();
+        let opsets = graph.opset_imports.clone();
+        registry
+            .infer_graph(
+                &mut graph,
+                &opsets,
+                onnx_runtime_shape_inference::MergePolicy::Permissive,
+            )
+            .unwrap();
+        let rms_out = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "SimplifiedLayerNormalization")
+            .expect("converted norm retained after inference")
+            .outputs[0];
+        assert_eq!(
+            graph.value(rms_out).dtype,
+            DataType::BFloat16,
+            "re-inference must keep the narrow (bf16) output, not the f32 scale dtype"
+        );
+    }
+
+    #[test]
+    fn leaves_native_bf16_rms_norm_untouched() {
+        // A bf16 `RMSNormalization` already exported without cast wrappers must
+        // be left byte-for-byte unchanged.
+        let hidden = 128;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let x = value(&mut graph, "x", DataType::BFloat16, hidden);
+        graph.add_input(x);
+        let scale = vec1d(&mut graph, "scale", DataType::BFloat16, hidden);
+        graph.set_initializer(
+            scale,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::BFloat16,
+                vec![hidden],
+                vec![0u8; hidden * 2],
+            )),
+        );
+        let norm_out = value(&mut graph, "norm_out", DataType::BFloat16, hidden);
+        let mut rms = Node::new(
+            NodeId(0),
+            "RMSNormalization",
+            vec![Some(x), Some(scale)],
+            vec![norm_out],
+        );
+        rms.attributes
+            .insert("epsilon".into(), Attribute::Float(1e-6));
+        graph.insert_node(rms);
+        graph.add_output(norm_out);
+
+        let before = graph.nodes.len();
+        CudaDropNormalizationCasts
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(graph.nodes.len(), before, "no nodes added or removed");
+        let rms = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "RMSNormalization")
+            .expect("norm retained");
+        assert_eq!(rms.inputs, vec![Some(x), Some(scale)]);
+        assert_eq!(graph.value(norm_out).dtype, DataType::BFloat16);
+    }
+
+    #[test]
+    fn leaves_mixed_narrow_dtype_norm_untouched() {
+        // A norm whose two activation inputs are cast from *different* narrow
+        // dtypes (one fp16, one bf16) is malformed for a single-dtype fold and
+        // must be left exactly as exported.
+        let hidden = 128;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+
+        let a = value(&mut graph, "a", DataType::Float16, hidden);
+        let b = value(&mut graph, "b", DataType::BFloat16, hidden);
+        graph.add_input(a);
+        graph.add_input(b);
+        let gamma = vec1d(&mut graph, "gamma", DataType::Float32, hidden);
+        graph.set_initializer(
+            gamma,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![hidden],
+                vec![0u8; hidden * 4],
+            )),
+        );
+
+        let in0 = cast_node(&mut graph, "in0", a, DataType::Float32, hidden);
+        let in1 = cast_node(&mut graph, "in1", b, DataType::Float32, hidden);
+        let norm_out = value(&mut graph, "norm_out", DataType::Float32, hidden);
+        let mut skip = Node::new(
+            NodeId(0),
+            "SkipSimplifiedLayerNormalization",
+            vec![Some(in0), Some(in1), Some(gamma)],
+            vec![norm_out],
+        );
+        skip.domain = MICROSOFT_DOMAIN.into();
+        graph.insert_node(skip);
+        let normalized = cast_node(
+            &mut graph,
+            "normalized",
+            norm_out,
+            DataType::Float16,
+            hidden,
+        );
+        graph.add_output(normalized);
+
+        let casts_before = graph.nodes.values().filter(|n| n.op_type == "Cast").count();
+        CudaDropNormalizationCasts
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(
+            graph.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            casts_before,
+            "a mixed fp16/bf16 activation norm must not be folded"
+        );
+        assert_eq!(graph.value(norm_out).dtype, DataType::Float32);
+        assert!(graph.validate().is_ok());
+    }
+
     // ---- CudaOnDeviceConstantSelect ----------------------------------------
 
     fn fp16_bytes(rows: usize, cols: usize, fill: u16) -> Vec<u8> {
@@ -4104,5 +5670,282 @@ mod tests {
             .unwrap();
         assert!(graph.nodes.values().any(|n| n.op_type == "If"));
         assert!(where_nodes(&graph).is_empty());
+    }
+
+    // === QKV projection fusion ===
+
+    struct QkvGraph {
+        graph: Graph,
+        q_weight: ValueId,
+        k_weight: ValueId,
+        v_weight: ValueId,
+        q_out: ValueId,
+        k_out: ValueId,
+        v_out: ValueId,
+    }
+
+    /// Build one `q_proj`/`k_proj`/`v_proj` → (Reshape, Reshape, direct) → GQA
+    /// block over a shared activation, with block-32 4-bit weights. Each
+    /// projection's weight/scale/zero-point bytes are filled with a distinct
+    /// constant so concatenation order is checkable.
+    fn qkv_graph(k: usize, nq: usize, nk: usize, nv: usize, with_zp: bool) -> QkvGraph {
+        assert!(k.is_multiple_of(32));
+        let n_blocks = k / 32;
+        let blob = 16; // 32 * 4 / 8
+        let dt = DataType::BFloat16;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+
+        let x = graph.create_named_value("x", dt, vec![Dim::Static(1), Dim::Static(k)]);
+        graph.add_input(x);
+
+        let make_proj = |graph: &mut Graph, tag: &str, n: usize, fill: u8| -> (ValueId, ValueId) {
+            let w = graph.create_named_value(
+                format!("{tag}.weight"),
+                DataType::Uint8,
+                vec![Dim::Static(n), Dim::Static(n_blocks), Dim::Static(blob)],
+            );
+            graph.set_initializer(
+                w,
+                WeightRef::Inline(TensorData::from_raw(
+                    DataType::Uint8,
+                    vec![n, n_blocks, blob],
+                    vec![fill; n * n_blocks * blob],
+                )),
+            );
+            let s = graph.create_named_value(
+                format!("{tag}.scales"),
+                dt,
+                vec![Dim::Static(n * n_blocks)],
+            );
+            graph.set_initializer(
+                s,
+                WeightRef::Inline(TensorData::from_raw(
+                    dt,
+                    vec![n * n_blocks],
+                    vec![fill.wrapping_add(1); n * n_blocks * 2],
+                )),
+            );
+            let mut inputs = vec![Some(x), Some(w), Some(s)];
+            if with_zp {
+                let zp_bytes = n * n_blocks / 2;
+                let z = graph.create_named_value(
+                    format!("{tag}.zp"),
+                    DataType::Uint8,
+                    vec![Dim::Static(zp_bytes)],
+                );
+                graph.set_initializer(
+                    z,
+                    WeightRef::Inline(TensorData::from_raw(
+                        DataType::Uint8,
+                        vec![zp_bytes],
+                        vec![fill.wrapping_add(2); zp_bytes],
+                    )),
+                );
+                inputs.push(Some(z));
+            }
+            let out = graph.create_named_value(
+                format!("{tag}.out"),
+                dt,
+                vec![Dim::Static(1), Dim::Static(n)],
+            );
+            let mut mm = Node::new(NodeId(0), "MatMulNBits", inputs, vec![out]);
+            mm.domain = MICROSOFT_DOMAIN.into();
+            mm.attributes.insert("K".into(), Attribute::Int(k as i64));
+            mm.attributes.insert("N".into(), Attribute::Int(n as i64));
+            mm.attributes
+                .insert("block_size".into(), Attribute::Int(32));
+            mm.attributes.insert("bits".into(), Attribute::Int(4));
+            graph.insert_node(mm);
+            (w, out)
+        };
+
+        let (q_weight, q_out) = make_proj(&mut graph, "q", nq, 0x11);
+        let (k_weight, k_out) = make_proj(&mut graph, "k", nk, 0x22);
+        let (v_weight, v_out) = make_proj(&mut graph, "v", nv, 0x33);
+
+        // Q and K flow through a Reshape before attention; V feeds it directly.
+        let q_res = graph.create_named_value("q_res", dt, vec![Dim::Static(1), Dim::Static(nq)]);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Reshape",
+            vec![Some(q_out)],
+            vec![q_res],
+        ));
+        let k_res = graph.create_named_value("k_res", dt, vec![Dim::Static(1), Dim::Static(nk)]);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Reshape",
+            vec![Some(k_out)],
+            vec![k_res],
+        ));
+
+        let attn = graph.create_named_value("attn", dt, vec![Dim::Static(1), Dim::Static(nq)]);
+        graph.add_output(attn);
+        let mut gqa = Node::new(
+            NodeId(0),
+            "GroupQueryAttention",
+            vec![Some(q_res), Some(k_res), Some(v_out)],
+            vec![attn],
+        );
+        gqa.domain = MICROSOFT_DOMAIN.into();
+        graph.insert_node(gqa);
+
+        QkvGraph {
+            graph,
+            q_weight,
+            k_weight,
+            v_weight,
+            q_out,
+            k_out,
+            v_out,
+        }
+    }
+
+    fn inline_bytes(graph: &Graph, value: ValueId) -> &[u8] {
+        match graph.initializers.get(&value).unwrap() {
+            WeightRef::Inline(t) => &t.data,
+            WeightRef::External { .. } => panic!("expected inline"),
+        }
+    }
+
+    #[test]
+    fn fuses_qkv_projections_into_one_matmul_and_split() {
+        let mut g = qkv_graph(64, 8, 4, 4, true);
+        let (q_out, k_out, v_out) = (g.q_out, g.k_out, g.v_out);
+        CudaQkvProjectionFusion
+            .fuse_all(&mut g.graph, &PassContext::new())
+            .unwrap();
+
+        let matmuls: Vec<_> = g
+            .graph
+            .nodes
+            .values()
+            .filter(|n| n.op_type == "MatMulNBits")
+            .collect();
+        assert_eq!(matmuls.len(), 1, "three projections collapse to one GEMV");
+        let fused = matmuls[0];
+        assert_eq!(fused.attr("N").and_then(Attribute::as_int), Some(16));
+        assert_eq!(fused.attr("K").and_then(Attribute::as_int), Some(64));
+        assert_eq!(
+            fused.input_values().count(),
+            4,
+            "activation+weight+scales+zp"
+        );
+
+        let splits: Vec<_> = g
+            .graph
+            .nodes
+            .values()
+            .filter(|n| n.op_type == "Split")
+            .collect();
+        assert_eq!(splits.len(), 1);
+        let split = splits[0];
+        assert_eq!(
+            split.attr("split").and_then(Attribute::as_ints),
+            Some([8i64, 4, 4].as_slice())
+        );
+        assert_eq!(split.attr("axis").and_then(Attribute::as_int), Some(1));
+        // Split re-attaches the original consumer edges.
+        assert_eq!(split.outputs, vec![q_out, k_out, v_out]);
+
+        // Fused weight bytes are the byte concatenation of Q||K||V weights.
+        let fused_weight = fused.inputs[1].unwrap();
+        let bytes = inline_bytes(&g.graph, fused_weight);
+        let n_blocks = 2usize;
+        let blob = 16usize;
+        assert_eq!(bytes.len(), 16 * n_blocks * blob);
+        assert!(bytes[..8 * n_blocks * blob].iter().all(|&b| b == 0x11));
+        assert!(
+            bytes[8 * n_blocks * blob..12 * n_blocks * blob]
+                .iter()
+                .all(|&b| b == 0x22)
+        );
+        assert!(bytes[12 * n_blocks * blob..].iter().all(|&b| b == 0x33));
+
+        // The original per-projection weight initializers are retired.
+        for old in [g.q_weight, g.k_weight, g.v_weight] {
+            assert!(!g.graph.initializers.contains_key(&old));
+        }
+
+        g.graph.validate().unwrap();
+    }
+
+    #[test]
+    fn fuses_symmetric_qkv_without_zero_points() {
+        let mut g = qkv_graph(32, 6, 2, 2, false);
+        CudaQkvProjectionFusion
+            .fuse_all(&mut g.graph, &PassContext::new())
+            .unwrap();
+        let fused = g
+            .graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "MatMulNBits")
+            .unwrap();
+        assert_eq!(fused.attr("N").and_then(Attribute::as_int), Some(10));
+        assert_eq!(fused.input_values().count(), 3, "no zero-point slot");
+        g.graph.validate().unwrap();
+    }
+
+    #[test]
+    fn does_not_fuse_when_activations_differ() {
+        let mut g = qkv_graph(64, 8, 4, 4, true);
+        // Repoint K's projection at a different activation.
+        let other = g.graph.create_named_value(
+            "other",
+            DataType::BFloat16,
+            vec![Dim::Static(1), Dim::Static(64)],
+        );
+        g.graph.add_input(other);
+        let k_mm = g.graph.value(g.k_out).producer.unwrap();
+        g.graph.replace_input(k_mm, 0, Some(other));
+
+        CudaQkvProjectionFusion
+            .fuse_all(&mut g.graph, &PassContext::new())
+            .unwrap();
+        let matmuls = g
+            .graph
+            .nodes
+            .values()
+            .filter(|n| n.op_type == "MatMulNBits")
+            .count();
+        assert_eq!(matmuls, 3, "mismatched activation leaves projections split");
+    }
+
+    #[test]
+    fn qkv_fusion_is_opt_in_and_disabled_by_default() {
+        // The pass must not fire unless the opt-in env flag is set, so the
+        // default release binary keeps the three separate GEMVs (no regression).
+        // SAFETY: single-threaded test; env is restored before returning.
+        let mut g = qkv_graph(64, 8, 4, 4, true);
+        unsafe { std::env::remove_var(QKV_FUSION_ENABLE_ENV) };
+        CudaQkvProjectionFusion
+            .run(&mut g.graph, &PassContext::new())
+            .unwrap();
+        let unfused = g
+            .graph
+            .nodes
+            .values()
+            .filter(|n| n.op_type == "MatMulNBits")
+            .count();
+        assert_eq!(
+            unfused, 3,
+            "default (flag unset) leaves projections unfused"
+        );
+
+        // With the flag set, `run` performs the fusion.
+        unsafe { std::env::set_var(QKV_FUSION_ENABLE_ENV, "1") };
+        let result = CudaQkvProjectionFusion.run(&mut g.graph, &PassContext::new());
+        unsafe { std::env::remove_var(QKV_FUSION_ENABLE_ENV) };
+        result.unwrap();
+        let fused = g
+            .graph
+            .nodes
+            .values()
+            .filter(|n| n.op_type == "MatMulNBits")
+            .count();
+        assert_eq!(fused, 1, "opt-in flag enables the fusion");
     }
 }

@@ -1,5 +1,5 @@
 //! Dead-node elimination: remove nodes whose outputs are not transitively
-//! consumed by any graph output (see `docs/ORT2.md` §18.1).
+//! consumed by any graph output (see `docs/architecture/ORT2.md` §18.1).
 
 use std::collections::HashSet;
 

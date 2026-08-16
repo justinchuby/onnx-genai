@@ -1,4 +1,4 @@
-# Zhora — History (compacted 2026-07-29)
+# Zhora — History (compacted 2026-08-12)
 
 **Role:** Server developer for the OpenAI-compatible HTTP surface and related model/KV lifecycle plumbing. Keep handlers thin over the batched driver, preserve deterministic model routing/admission contracts, and honor reviewer lockouts and CLI maintainer-tool boundaries.
 
@@ -17,21 +17,45 @@
 
 ## Recent work (current wave, ~2026-07-28/29)
 
-### 2026-07-27T13:10:00-07:00 — CLI backlog now on main
-Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CLI improvement track are now on main at `docs/research/cli/00-backlog.md`. Use that file as the source of truth before picking up queued CLI backlog work.
+## Historical context (2026-07-27 through 2026-08-11)
 
-### 2026-07-27T14:55:00-07:00 — REPL Phase 1 rejection revision
-- Took over PR #289 revision after Gaff's rejection under reviewer lockout.
-- Made REPL command parsing mode-aware: `Plain` preserves `main` piped behavior for `//...` and `/help <arg>`, while `Tty` keeps the new rich affordances.
-- Fixed the post-generation newline decision to depend on whether the current turn actually used live rendering, not on the reusable renderer lifecycle state.
-- Added lib and e2e regressions; local ONNX Runtime mismatch still prevents model-loading e2e verification.
+Jul-27/28 wave: CLI backlog on main; REPL Phase 1 rejection revision (PR #289); generate stats stdout/stderr contract; #364 merged. Aug-11 wave: PR #762 documentation accuracy pass (commit `bb280c0ea`; 8 stale SHA refs updated; PR marked ready for review). Full entries in `history-archive.md`.
 
-### 2026-07-27T18:46:09-07:00 — generate default stats stdout/stderr contract
-- Text `onnx-genai generate` now follows the REPL default: compact stats are on only when the shared REPL input-mode detector sees stdin and stdout as terminals, and `--no-stats` opts out.
-- The compact stats line is stderr-only and suppressed by `--profile`; piped stdout remains byte-stable generated text.
-- Image/audio `generate` and `transcribe` keep compact token stats off by default; their non-token throughput belongs in `--profile`.
+### 2026-08-12 — PR #31973: Fix stale algorithm references in LayerNorm test comments
 
-### 2026-07-28T17:40:00+0000
-#364 merged after the implementation was corrected to use prefetch only in eviction-neutral cache regimes.
+**Task:** Rewrite the ReferenceLayerNorm oracle comment block which described the kernel as Welford (it is centered two-pass). Also fix ScalarFp32Baseline comment claiming to match current kernel.
 
-Full pre-compaction history in `history-archive.md`.
+**Changes:** Comments only in `onnxruntime/test/mlas/unittest/test_layernorm.cpp`. Two sites updated:
+1. Lines 58-85: oracle block now names the kernel's actual algorithm, explains uncentered vs centered distinction, preserves independent-oracle argument.
+2. Line 436: ScalarFp32Baseline clarified as historical baseline.
+
+**Other stale references found:** ~30 other Welford mentions exist in the file (in disabled accuracy-comparison tests, WelfordFp64Reference helper, error-reporting labels). These are accurate in their own context — they describe the *historical* Welford baseline or the fp64 reference function, not the current kernel. No changes needed.
+
+**Validation:** Fresh build; 41 passed, 2 disabled; 43/43 with disabled. clang-format clean. No leaks. Pushed as `9a4fcaeaa4`.
+
+**Outcome:** PR remains draft, pending fresh Opus approval.
+
+## 2026-08-12 — PR #31973 lockout revision: oracle block and ScalarFp32Baseline comments
+
+- Coordinator found a fourth stale Welford comment site missed by Luv's review: oracle block at `test_layernorm.cpp:58-85`.
+- Rewrote oracle block to name centered two-pass, explain uncentered `E[x²] − mean²` reference form (fp64, safe only due to precision), preserve independent-oracle argument, replace "Do NOT fix this to Welford" with clearer directive.
+- Clarified `ScalarFp32Baseline` comment as historical baseline, not a mirror of current kernel.
+- Assessed ~30 other Welford mentions as accurate in context (Welford baseline history, fp64 helper).
+- Fresh build: 41 passed + 2 disabled; 43/43 with disabled; clang-format clean. Head `9a4fcaeaa4`. PR remains draft.
+
+## 2026-08-12 — PR #32001: Deduplicate Apple Accelerate validation
+
+- Removed dead-code copy of `--use_apple_accelerate` validation from `build.py:881-897` (BuildError path never reached because `build_args.py` parser.error() exits first).
+- Kept single source of truth in `build_args.py` — matches existing pattern for argument validation.
+- Improved non-macOS error message to distinguish "wrong OS" from "wrong arch".
+- 13/13 tests pass unchanged (all assert SystemExit, matching parser.error() path).
+- cmake_args assertion not added — needs heavier harness (generate_build_tree mocking). Flagged for future.
+- ruff format/check clean. Leak check clean. Head `3a0bd75aa3`. PR remains draft.
+
+## 2026-08-12 — PR #32001: Deduplicate validation to single site (lockout revision)
+
+- Holden (locked out after authoring the review) found dead-code duplication in `build.py`.
+- Removed `build.py:881-897` BuildError block. Left only cmake_args append + comment pointing to `build_args.py`.
+- Improved non-macOS message: "requires Apple Silicon host" (distinguishes wrong OS from wrong arch).
+- 13/13 tests pass unchanged. ruff format/check clean. Head `3a0bd75aa3`.
+- PR #32001 marked **ready for review**.

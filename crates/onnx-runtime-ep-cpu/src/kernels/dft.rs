@@ -9,9 +9,10 @@ use std::f32::consts::PI;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ir::Node;
 
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::check_arity;
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::numel;
 
 /// Dispatch counter for the vDSP Accelerate DFT fast path.
@@ -111,14 +112,12 @@ impl Kernel for DftKernel {
             )));
         }
 
-        // Materialize input as f32.
-        if input.dtype != DataType::Float32 {
-            return Err(EpError::KernelFailed(format!(
-                "DFT: only Float32 supported, got {:?}",
-                input.dtype
-            )));
-        }
-        let input_data = to_dense_f32(input)?;
+        // Materialize input as f32. `to_dense_f32_widen` accepts the full ONNX
+        // DFT type constraint (float32/float16/bfloat16/float64 and strided
+        // float32) and folds every case into a dense f32 buffer, so DFT is
+        // computed in f32 and narrowed back to the output dtype on write — the
+        // same compute-in-f32 contract every other float kernel uses.
+        let input_data = to_dense_f32_widen("DFT", input)?;
 
         // Compute batch dimensions: all dims except axis and last.
         let mut batch_shape: Vec<usize> = Vec::with_capacity(rank - 2);
@@ -180,7 +179,7 @@ impl Kernel for DftKernel {
             advance_indices(&mut batch_indices, &batch_shape);
         }
 
-        write_dense_f32(output, &output_data)
+        write_dense_f32_narrow("DFT", output, &output_data)
     }
 }
 

@@ -124,6 +124,7 @@ pub(crate) async fn debug_kv(
         .map_err(map_registry_error)?
         .ok_or_else(|| ApiError::internal("no model loaded"))?;
     let snapshot = crate::metrics::snapshot();
+    let batching = handle.engine.batching();
     let prefix_cache_hit_rate = if snapshot.prefix_cache_lookups == 0 {
         0.0
     } else {
@@ -138,6 +139,8 @@ pub(crate) async fn debug_kv(
         available_admission_slots: handle.engine.generation_capacity.available_permits(),
         rejected_requests: snapshot.rejections,
         engine_kv_introspection: "unavailable: engine does not yet expose KV page statistics",
+        batch_supported: batching.supported,
+        effective_max_batch: batching.effective_max_batch as u64,
     }))
 }
 
@@ -154,30 +157,44 @@ pub(crate) async fn resources(
         .resource_snapshot()
         .await
         .map_err(|err| ApiError::internal(format!("resource snapshot failed: {err}")))?;
-    Ok(Json(snapshot.into()))
+    Ok(Json(
+        ResourcesResponse::from(snapshot)
+            .with_batching(handle.engine.batching())
+            .with_memory_strategy(&handle.engine.memory_strategy_plan()),
+    ))
 }
 
 pub(crate) async fn admin_set_vram_limit(
     State(state): State<AppState>,
     Json(request): Json<SetVramLimitRequest>,
-) -> Result<Json<ResourcesResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let limit = parse_resource_limit(&request.limit)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let handle = state
-        .registry
-        .resolve("")
-        .map_err(map_registry_error)?
-        .ok_or_else(|| ApiError::internal("no model loaded"))?;
-    let snapshot = handle
-        .engine
-        .set_vram_limit(limit)
-        .await
-        .map_err(|err| ApiError::internal(format!("resource override failed: {err}")))?
-        .map_err(|err| match err {
-            EngineGovernorError::RuntimeOverrideDisabled => ApiError::forbidden(err.to_string()),
-            EngineGovernorError::Resource(_) => ApiError::conflict(err.to_string()),
-        })?;
-    Ok(Json(snapshot.into()))
+    let snapshot = state.registry.set_vram_limit(limit).await.map_err(|err| {
+        if matches!(
+            err.downcast_ref::<EngineGovernorError>(),
+            Some(EngineGovernorError::RuntimeOverrideDisabled)
+        ) {
+            ApiError::forbidden(err.to_string())
+        } else {
+            ApiError::conflict(format!("resource override failed: {err}"))
+        }
+    })?;
+    Ok(match snapshot {
+        Some(snapshot) => {
+            // Include the batching report for parity with `GET /v1/resources`.
+            // Resolving the default handle is best-effort here: a vram override
+            // succeeded, so a handle exists; if it cannot be resolved we still
+            // return the governor snapshot rather than failing the override.
+            let response = ResourcesResponse::from(snapshot);
+            let response = match state.registry.resolve("") {
+                Ok(Some(handle)) => response.with_batching(handle.engine.batching()),
+                _ => response,
+            };
+            Json(response).into_response()
+        }
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
 }
 
 /// `GET /v1/debug/profile` — where the server's decode time went.
@@ -191,7 +208,9 @@ pub(crate) async fn admin_set_vram_limit(
 /// follows the backend without this endpoint knowing which one is in use.
 /// Empty until `ONNX_GENAI_PROFILE` is set, and empty is reported as empty
 /// rather than fabricated.
-pub(crate) async fn debug_profile() -> Json<DebugProfileResponse> {
+pub(crate) async fn debug_profile(
+    State(state): State<AppState>,
+) -> Result<Json<DebugProfileResponse>, ApiError> {
     let stages = onnx_genai_ort::profile::snapshot()
         .into_iter()
         .map(|stage| ProfileStage {
@@ -205,11 +224,22 @@ pub(crate) async fn debug_profile() -> Json<DebugProfileResponse> {
             },
         })
         .collect::<Vec<_>>();
-    Json(DebugProfileResponse {
+    let memory_strategy_plans = state
+        .registry
+        .memory_strategy_plans()
+        .map_err(map_registry_error)?
+        .into_iter()
+        .map(|(model_id, plan)| ModelMemoryStrategyPlan {
+            model_id,
+            plan: (*plan).clone(),
+        })
+        .collect();
+    Ok(Json(DebugProfileResponse {
         collecting: onnx_genai_ort::profile::enabled(),
         note: "Stage totals accumulate across every request this process has served. Run with ONNX_GENAI_PROFILE=1 to collect them.",
         stages,
-    })
+        memory_strategy_plans,
+    }))
 }
 
 pub(crate) async fn debug_trace() -> Json<DebugTraceResponse> {
@@ -398,14 +428,14 @@ pub(crate) async fn admin_unload_model(
 /// 1,067 polls under sustained load.
 ///
 /// When the governor cannot be read the family is absent, so this ALWAYS emits
-/// `onnxgenai_resource_governor_available` to say which case a scrape is in.
+/// `onnx_genai_resource_governor_available` to say which case a scrape is in.
 /// Silently dropping the gauges made an unreadable governor look exactly like
 /// a scrape gap -- the one shape operators read as "nothing to see".
 pub(crate) async fn prometheus_metrics(
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
     let mut output = crate::metrics::encode_prometheus();
-    let handle = state.registry.resolve("").map_err(map_registry_error)?;
+    let handle = state.registry.any_loaded().map_err(map_registry_error)?;
 
     // Read the KV mirror before awaiting the governor snapshot. The mirror is a
     // handful of relaxed loads and never touches the driver thread, so it
@@ -420,13 +450,18 @@ pub(crate) async fn prometheus_metrics(
         ));
     }
 
-    let snapshot = match handle {
-        Some(handle) => handle.engine.resource_snapshot().await.ok(),
-        None => None,
-    };
+    let snapshot = state
+        .registry
+        .aggregate_resource_snapshot()
+        .await
+        .ok()
+        .flatten();
     match snapshot {
         Some(snapshot) => output.push_str(&crate::metrics::encode_resource_governor(&snapshot)),
         None => output.push_str(&crate::metrics::encode_resource_governor_unavailable()),
+    }
+    if let Ok(Some(metrics)) = state.registry.aggregate_growth_metrics() {
+        output.push_str(&crate::metrics::encode_mapped_growth(&metrics));
     }
     Ok((
         [(
@@ -463,7 +498,40 @@ impl From<GovernorSnapshot> for ResourcesResponse {
             vram: ResourceTier::from(snapshot.vram),
             host_ram: ResourceTier::from(snapshot.host_ram),
             disk_spill: snapshot.disk_spill.map(ResourceTier::from),
+            batching: None,
+            memory_strategy: None,
         }
+    }
+}
+
+impl ResourcesResponse {
+    /// Attach the model handle's resolved batching capability so `/v1/resources`
+    /// reports `supported` / `effective_max_batch` directly (issue #750).
+    fn with_batching(mut self, batching: &crate::driver::BatchingReport) -> Self {
+        self.batching = Some(BatchingInfo {
+            supported: batching.supported,
+            requested_max_batch: batching.requested_max_batch as u64,
+            effective_max_batch: batching.effective_max_batch as u64,
+            reason: batching.reason.clone(),
+        });
+        self
+    }
+
+    /// Attach the model's resolved memory strategy so `/v1/resources` reports the
+    /// chosen strategy, offload state, managed no-spill VMM state, and resolved
+    /// budget directly, making the #755 managed VMM default observable.
+    fn with_memory_strategy(mut self, plan: &onnx_genai_engine::MemoryStrategyPlan) -> Self {
+        let application = plan.runtime_application();
+        self.memory_strategy = Some(MemoryStrategyInfo {
+            strategy: format!("{:?}", plan.strategy),
+            weight_offload_enabled: application.weight_offload_enabled,
+            managed_no_spill: application.managed_no_spill,
+            auto_enabled: application.auto_enabled_from_vram_limit,
+            resolved_device_budget_bytes: plan.resolved_device_budget_bytes,
+            managed_limit_bytes: application.managed_limit_bytes,
+            fits_resolved_device_budget: plan.fits_resolved_device_budget,
+        });
+        self
     }
 }
 

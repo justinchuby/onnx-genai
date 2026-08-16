@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU parity for `com.microsoft::CausalConvWithState` (issue #67): the CUDA EP
 //! depthwise causal short-conv with rolling state, checked byte/tol-exact
 //! against the CPU EP oracle across fp32/fp16/bf16, decode (`L=1`) and prefill
@@ -6,7 +20,7 @@
 
 mod common;
 
-use common::{assert_close, cuda_ep, decode_floats, float_input, run_cpu, run_cuda};
+use common::{assert_close, decode_floats, float_input, require_cuda, run_cpu, run_cuda};
 use onnx_runtime_ir::{Attribute, DataType};
 
 const OP: &str = "CausalConvWithState";
@@ -82,9 +96,13 @@ fn check(
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn causal_conv_with_state_matches_cpu_across_configs() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     // B=1, C=3, K=4. Weights per channel (depthwise [C,1,K]).
     let weight = [
         0.1f32, 0.2, -0.3, 0.5, // c0
@@ -143,9 +161,13 @@ fn causal_conv_with_state_matches_cpu_across_configs() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn causal_conv_with_state_matches_cpu_for_batched_decode() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     // B=2, C=2, K=3.
     let weight = [0.3f32, -0.6, 0.9, 0.2, 0.5, -0.4];
     let bias = [0.1f32, -0.2];

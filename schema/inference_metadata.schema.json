@@ -1104,6 +1104,57 @@
       },
       "type": "object"
     },
+    "KvAxisStrides": {
+      "description": "Symbolic element stride of each of the four logical KV axes.\n\nThe stride of an axis is the product of the runtime dimensions in its factor\nlist; an **empty** list means unit stride (the innermost, contiguous axis).\nThe innermost axis of every layout the converted kernels honor is\n`head_dim`, whose stride is `1` (empty), because the fp16 read vectorizes\n`head_dim` as `half2` and the fused write addresses it as `dst + d`.\n\nThe two historical layouts map onto this as:\n\n| axis     | head-major BNSH        | seq-major BSNH        |\n|----------|------------------------|-----------------------|\n| batch    | `kv_heads·seq·head_dim`| `seq·kv_heads·head_dim`|\n| head     | `seq·head_dim`         | `head_dim`            |\n| seq      | `head_dim`             | `kv_heads·head_dim`   |\n| head_dim | `1`                    | `1`                   |",
+      "properties": {
+        "batch": {
+          "default": [],
+          "description": "Factors of the batch-axis stride.",
+          "items": {
+            "$ref": "#/$defs/KvStrideDim"
+          },
+          "type": "array"
+        },
+        "head": {
+          "default": [],
+          "description": "Factors of the KV-head-axis stride.",
+          "items": {
+            "$ref": "#/$defs/KvStrideDim"
+          },
+          "type": "array"
+        },
+        "head_dim": {
+          "default": [],
+          "description": "Factors of the head-dim-axis stride. Unit (empty) for every honored\nlayout.",
+          "items": {
+            "$ref": "#/$defs/KvStrideDim"
+          },
+          "type": "array"
+        },
+        "seq": {
+          "default": [],
+          "description": "Factors of the sequence-axis (per-token) stride.",
+          "items": {
+            "$ref": "#/$defs/KvStrideDim"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "KvCacheLayout": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/KvNamedLayout",
+          "description": "A readable shorthand for a standard layout. Deserializes from the strings\n`\"head_major_bnsh\"` and `\"seq_major_bsnh\"`; expands to explicit strides\nvia [`KvCacheLayout::resolve_strides`]."
+        },
+        {
+          "$ref": "#/$defs/KvStrideDescriptor",
+          "description": "A fully explicit stride descriptor for layouts the named forms cannot\nexpress."
+        }
+      ],
+      "description": "Physical memory layout of a backend's KV cache tensors, as a stride\ndescriptor.\n\nThis is a **per-backend capability**, not a cross-backend constant: the two\nbackends own their KV buffers independently and never read each other's KV\nbytes, so they may store the cache differently. The ONNX Runtime backend\nrequires head-major BNSH (`[batch, kv_heads, seq, head_dim]`) because ORT's\nGroupQueryAttention past/present is BNSH on every dispatch path (Flash,\ncuDNN SDPA, memory-efficient, XQA). The native backend additionally supports\nseq-major BSNH (`[batch, seq, kv_heads, head_dim]`), which makes each token's\nlive prefix contiguous across heads — shrinking the VMM granule floor by the\n`kv_heads` factor, removing growth-triggered graph re-capture (the append\nstride is sequence-length independent), and making page-level prefix sharing\n(#777) practical. Absent preserves the historical head-major behavior.\n\nLayout preference is per-EP and per-platform rather than a global constant,\nand a JIT backend compiles a specialized kernel per descriptor, so this is a\ndescriptor rather than a closed enum: a raw stride tuple is unreadable, so\nthe common cases are still nameable (`head_major_bnsh`, `seq_major_bsnh`)\nwhile an explicit [`KvStrideDescriptor`] expresses anything the named forms\ncannot (e.g. a token-major view).\n\nOn-device, the native backend selects the layout by stamping the `kv_layout`\nattribute (`0` = BNSH, `1` = BSNH) on its GroupQueryAttention nodes; the\nCUDA EP honors it on the fused fp16 single-token decode pair. Seq-major is\nonly enabled end-to-end once the prefill (flash) read is also converted, so\nthe two never disagree about how a shared cache is physically laid out."
+    },
     "KvCacheOperations": {
       "description": "Operational guarantees for mutable KV-cache state.",
       "properties": {
@@ -1223,6 +1274,21 @@
       },
       "type": "object"
     },
+    "KvNamedLayout": {
+      "description": "The named, human-readable KV cache layouts.",
+      "oneOf": [
+        {
+          "const": "head_major_bnsh",
+          "description": "Head-major BNSH `[batch, kv_heads, seq, head_dim]`. ORT-compatible; the\ndefault for both backends.",
+          "type": "string"
+        },
+        {
+          "const": "seq_major_bsnh",
+          "description": "Seq-major BSNH `[batch, seq, kv_heads, head_dim]`. Native backend only.",
+          "type": "string"
+        }
+      ]
+    },
     "KvOwnership": {
       "description": "Ownership model for a graph's KV cache inputs.",
       "oneOf": [
@@ -1265,6 +1331,54 @@
         }
       },
       "type": "object"
+    },
+    "KvStrideDescriptor": {
+      "description": "A fully explicit KV-cache stride descriptor.\n\nThis is the general form the two named layouts expand into, and the shape a\nfuture layout (e.g. token-major) is expressed in without adding an enum\nvariant. The `reservation_*` fields describe a binding that is a **view into\na larger reservation** rather than the owner of its whole buffer:\ntoken-major stores every layer's tokens in one reservation and hands each\n`(layer, side)` a sub-view, so its per-token (seq) stride is taken over the\nreservation's total token count and its data starts at a non-zero offset.\nBoth historical layouts are whole-buffer bindings: `offset == 0` and no\nreservation override.",
+      "properties": {
+        "reservation_offset_elements": {
+          "description": "Element offset of this binding's first element within the reservation it\nviews. `0` for a binding that owns its whole buffer — the only case the\nconverted kernels honor today.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reservation_seq_slots": {
+          "description": "Sequence-axis extent, in token slots, of the reservation this binding\nviews when the reservation is larger than the binding's own\n`cache_capacity`. Absent means the binding spans its own capacity (a\nwhole-buffer binding). Present expresses a token-major view whose seq\nstride collapses the per-`(layer, side)` buffer boundary; not honored by\nthe converted path yet.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "strides": {
+          "$ref": "#/$defs/KvAxisStrides",
+          "description": "Symbolic stride of each logical axis."
+        }
+      },
+      "required": [
+        "strides"
+      ],
+      "type": "object"
+    },
+    "KvStrideDim": {
+      "description": "A runtime KV-cache dimension that an axis stride can be a multiple of.\n\nAbsolute element strides are a serving-time property — they depend on the\n`cache_capacity` a runtime picks — so metadata cannot store them as numbers.\nA stride is therefore stored **symbolically**, as the (unordered) set of\nruntime dimensions it multiplies. The concrete element stride of an axis is\nthe product of the sizes of the dimensions in its factor list.",
+      "oneOf": [
+        {
+          "const": "kv_heads",
+          "description": "Number of KV heads (`kv_heads` / `N`).",
+          "type": "string"
+        },
+        {
+          "const": "seq_capacity",
+          "description": "Sequence capacity of the growing axis (`cache_capacity` / `S`).",
+          "type": "string"
+        },
+        {
+          "const": "head_dim",
+          "description": "Per-token head width (`head_dim` / `H`).",
+          "type": "string"
+        }
+      ]
     },
     "KvUpdateKind": {
       "description": "Paired KV-cache update-semantics vocabulary.",
@@ -1732,6 +1846,17 @@
             "array",
             "null"
           ]
+        },
+        "kv_layout": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KvCacheLayout"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Physical layout of this backend's KV cache tensors, as a stride\ndescriptor. Accepts a readable named layout (`head_major_bnsh` or\n`seq_major_bsnh`) or a fully explicit [`KvStrideDescriptor`]. This is a\nper-backend capability — each backend owns its KV buffers and never reads\nthe other's KV bytes — so the ORT backend stays head-major while the\nnative backend may declare seq-major. Absent preserves the historical\nhead-major (BNSH) behavior. See [`KvCacheLayout`]."
         },
         "kv_outputs": {
           "description": "Present-KV cache outputs, paired positionally with `kv_inputs`.",

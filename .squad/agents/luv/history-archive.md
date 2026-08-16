@@ -107,3 +107,29 @@ Durable rules recorded:
 Full review detail in `.squad/decisions.md` ("Luv round-3 review" section, 2026-07-29).
 Inbox drops `luv-round3-verdict.md` and `luv-round3-delta-verdict.md` survived (written
 to both TEAM ROOT and worktree) and merged into decisions.
+
+## Archived 2026-08-12 (wave 2026-08-11 entries)
+
+### 2026-08-11 — Review PR #31974 (BFloat16 LayerNorm/RMSNorm CPU EP)
+
+Verdict: CONDITIONAL APPROVE. One substantive finding (contrib U=BFloat16 schema mismatch — pre-existing pattern from MLFloat16). No blockers. 10 tests, clean anti-fallback design, correct rounding (RNE via BFloat16 constructor). Noted code duplication. Full review at `.squad/decisions/inbox/luv-review-pr31974.md`.
+
+### 2026-08-11 — Re-Review PR #31974 (S1 fix: U=float for narrow-float contrib kernels)
+
+Verdict: APPROVE. Commit `142cb563c5`. Fix correctly changes contrib macro to `(T, U)` and registers `MLFloat16,float` / `BFloat16,float`. Verified declaration-only (no runtime change), contrib constructor sets `contrib_op=false`, CUDA parity confirmed, all 4 macro expansions correct. 10 bf16 tests pass.
+
+### 2026-08-11 — B4 + B6 Test Rework for #31974
+
+Deleted `test/mlas/unittest/test_layernorm_bf16.cpp` (zero MLAS API calls; 45 tests were testing BFloat16 rounding arithmetic, not PR code). Rewrote `test/contrib_ops/layer_norm_bf16_cpu_test.cc` (10 → 17 tests: added SkipLayerNorm, contrib opset 1–16, mean/InvStdDev float assertions). All 96 LayerNorm tests pass.
+
+### 2026-08-11 — PR #762 third review (head 034876d30)
+
+Verdict: No blockers. S1 (HIGH): optional-slot conformance tests may be vacuous — absent optional outputs use DataType::Undefined, EP likely declines these nodes. S2: LayerNorm axis allows `resolved == rank` (off-by-one). S3: Scratch buffer hardcodes 4 bytes/element. S1 confirmed by Mariette; fixes landed via Mariette/Challenger/Coco/Resch/Rachael chain.
+
+### 2026-08-11 — Review PR #31985 (ort-docfix, MRotaryEmbedding doc)
+
+Confirmed `mrope_section` required. Hand edit byte-exact to schema. Single-file single-line; no leaks. Verdict: NITS only. PR reached 86/86 CI green. (Duplicate entry existed; merged here.)
+
+### 2026-08-12 — Review PR #32001 (Apple Accelerate CMake option)
+
+Three substantive: S1 `FATAL_ERROR` wrong (upstream idiom is warn+disable); S2 no `build.py` argument; S3 `MLAS_USE_APPLE_ACCELERATE=1` defined but no consumer. No blockers. Lockout held: Luba/Luv barred, Isidore fixed.

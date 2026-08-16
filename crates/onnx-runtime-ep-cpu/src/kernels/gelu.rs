@@ -43,15 +43,22 @@ pub(crate) fn tanh_gelu(x: f32) -> f32 {
     (0.5 * xf * (1.0 + inner.tanh())) as f32
 }
 
-/// Stateless f32 exact-GELU kernel.
-pub struct GeluKernel;
+/// Stateless f32 exact-GELU kernel. Carries the static element count (when
+/// known) purely so it can report structural FLOPs (issue #995).
+#[derive(Default)]
+pub struct GeluKernel {
+    /// Output element count if statically known at build time; `None` otherwise
+    /// (never fabricated).
+    flops: Option<u64>,
+}
 
 /// Factory for [`GeluKernel`] (no attributes).
 pub struct GeluFactory;
 
 impl KernelFactory for GeluFactory {
-    fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(GeluKernel))
+    fn create(&self, _node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let flops = input_shapes.first().map(|s| super::flops::numel(s));
+        Ok(Box::new(GeluKernel { flops }))
     }
 }
 
@@ -66,6 +73,10 @@ impl Kernel for GeluKernel {
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
+
+    fn estimated_flops(&self) -> Option<u64> {
+        self.flops
+    }
 }
 
 /// Standard-domain `ai.onnx::Gelu` (opset 20) kernel honoring the `approximate`
@@ -75,19 +86,23 @@ impl Kernel for GeluKernel {
 pub struct StdGeluKernel {
     /// `true` for `approximate="tanh"`, `false` for the exact erf path.
     tanh: bool,
+    /// Output element count if statically known at build time; `None` otherwise
+    /// (never fabricated).
+    flops: Option<u64>,
 }
 
 /// Factory for [`StdGeluKernel`], reading the `approximate` attribute.
 pub struct StdGeluFactory;
 
 impl KernelFactory for StdGeluFactory {
-    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+    fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let tanh = node
             .attr("approximate")
             .and_then(|a| a.as_str())
             .map(|s| s == "tanh")
             .unwrap_or(false);
-        Ok(Box::new(StdGeluKernel { tanh }))
+        let flops = input_shapes.first().map(|s| super::flops::numel(s));
+        Ok(Box::new(StdGeluKernel { tanh, flops }))
     }
 }
 
@@ -95,16 +110,28 @@ impl Kernel for StdGeluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Gelu", inputs, outputs, 1, 1, 1)?;
         let x = to_dense_f32_widen("Gelu", &inputs[0])?;
-        let y: Vec<f32> = if self.tanh {
-            x.iter().map(|&v| tanh_gelu(v)).collect()
-        } else {
-            x.iter().map(|&v| exact_gelu(v)).collect()
-        };
-        write_dense_f32_narrow("Gelu", &mut outputs[0], &y)
+        let tanh = self.tanh;
+        super::simd_activations::write_mapped("Gelu", &mut outputs[0], &x, |x, y| {
+            if tanh {
+                // Vectorised on AVX2+FMA; see `kernels::simd_activations`.
+                super::simd_activations::tanh_gelu_f32_slice(x, y);
+            } else {
+                // Exact GELU stays on `libm::erf`: the conformance suite's
+                // `Erf` reference is tighter than any f32 polynomial we would
+                // want to ship here.
+                for (o, &v) in y.iter_mut().zip(x.iter()) {
+                    *o = exact_gelu(v);
+                }
+            }
+        })
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
+    }
+
+    fn estimated_flops(&self) -> Option<u64> {
+        self.flops
     }
 }
 
@@ -118,13 +145,13 @@ mod tests {
         let xs = [-3.0f32, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0];
         let a = Owned::f32(&[xs.len()], &xs);
         let mut ref_out = Owned::zeros_f32(&[xs.len()]);
-        GeluKernel
+        GeluKernel::default()
             .execute(&[a.view()], &mut [ref_out.view_mut()])
             .unwrap();
 
         let a = Owned::bf16(&[xs.len()], &xs);
         let mut bf16_out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[xs.len()]);
-        GeluKernel
+        GeluKernel::default()
             .execute(&[a.view()], &mut [bf16_out.view_mut()])
             .unwrap();
         for (&r, &g) in ref_out
@@ -151,7 +178,7 @@ mod tests {
         let xs = [-3.0f32, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0];
         let a = Owned::f32(&[xs.len()], &xs);
         let mut out = Owned::zeros_f32(&[xs.len()]);
-        GeluKernel
+        GeluKernel::default()
             .execute(&[a.view()], &mut [out.view_mut()])
             .unwrap();
         let got = out.to_f32();
@@ -167,7 +194,7 @@ mod tests {
         // Backing [2,2] row-major; expose transposed [2,2] with strides [1,2].
         let a = Owned::f32(&[2, 2], &[-1.0, 1.0, 2.0, -2.0]).with_view(&[2, 2], &[1, 2]);
         let mut out = Owned::zeros_f32(&[2, 2]);
-        GeluKernel
+        GeluKernel::default()
             .execute(&[a.view()], &mut [out.view_mut()])
             .unwrap();
         // Transposed read order: [-1, 2, 1, -2].
@@ -190,9 +217,12 @@ mod tests {
         let xs = [-3.0f32, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0];
         let a = Owned::f32(&[xs.len()], &xs);
         let mut out = Owned::zeros_f32(&[xs.len()]);
-        StdGeluKernel { tanh: false }
-            .execute(&[a.view()], &mut [out.view_mut()])
-            .unwrap();
+        StdGeluKernel {
+            tanh: false,
+            flops: None,
+        }
+        .execute(&[a.view()], &mut [out.view_mut()])
+        .unwrap();
         for (&x, &g) in xs.iter().zip(out.to_f32().iter()) {
             assert!((g - reference(x)).abs() <= 1e-6, "gelu({x}) = {g}");
         }
@@ -203,9 +233,12 @@ mod tests {
         let xs = [-3.0f32, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0];
         let a = Owned::f32(&[xs.len()], &xs);
         let mut out = Owned::zeros_f32(&[xs.len()]);
-        StdGeluKernel { tanh: true }
-            .execute(&[a.view()], &mut [out.view_mut()])
-            .unwrap();
+        StdGeluKernel {
+            tanh: true,
+            flops: None,
+        }
+        .execute(&[a.view()], &mut [out.view_mut()])
+        .unwrap();
         let got = out.to_f32();
         for (&x, &g) in xs.iter().zip(got.iter()) {
             assert!(

@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! CUDA conformance tests for movement/construction operators and `Where`.
 
 use onnx_runtime_ep_api::{
@@ -32,7 +46,7 @@ fn tensor<T: Copy>(dtype: DataType, shape: &[usize], values: &[T]) -> Tensor {
     }
 }
 
-fn gpu() -> CudaExecutionProvider {
+fn require_cuda() -> CudaExecutionProvider {
     CudaExecutionProvider::new_default().expect("CUDA runtime must be available")
 }
 
@@ -184,9 +198,13 @@ fn f32s(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn concat_negative_axis_and_multiple_inputs() {
-    let ep = gpu();
+    let ep = require_cuda();
     let inputs = [
         tensor(DataType::Float32, &[2, 1], &[1_f32, 2.]),
         tensor(DataType::Float32, &[2, 2], &[3_f32, 4., 5., 6.]),
@@ -203,9 +221,13 @@ fn concat_negative_axis_and_multiple_inputs() {
     assert_eq!(f32s(&out[0]), vec![1., 3., 4., 7., 2., 5., 6., 8.]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn expand_right_aligned_broadcast() {
-    let ep = gpu();
+    let ep = require_cuda();
     let inputs = [
         tensor(DataType::Int64, &[3], &[7_i64, 8, 9]),
         tensor(DataType::Int64, &[2], &[2_i64, 1]),
@@ -221,9 +243,13 @@ fn expand_right_aligned_broadcast() {
     assert_eq!(out[0], raw(&[7_i64, 8, 9, 7, 8, 9]));
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn reshape_preserves_dtype_agnostic_bytes() {
-    let ep = gpu();
+    let ep = require_cuda();
     let inputs = [
         tensor(DataType::Int64, &[2, 3], &[1_i64, 2, 3, 4, 5, 6]),
         tensor(DataType::Int64, &[2], &[3_i64, 2]),
@@ -239,9 +265,13 @@ fn reshape_preserves_dtype_agnostic_bytes() {
     assert_eq!(out[0], raw(&[1_i64, 2, 3, 4, 5, 6]));
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn slice_multi_axis_negative_axis_and_step() {
-    let ep = gpu();
+    let ep = require_cuda();
     let data = (0..24).map(|v| v as f32).collect::<Vec<_>>();
     let inputs = [
         tensor(DataType::Float32, &[2, 3, 4], &data),
@@ -261,9 +291,13 @@ fn slice_multi_axis_negative_axis_and_step() {
     assert_eq!(f32s(&out[0]), vec![11., 9., 23., 21.]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn split_negative_axis_via_split_input() {
-    let ep = gpu();
+    let ep = require_cuda();
     let inputs = [
         tensor(
             DataType::Float32,
@@ -287,9 +321,13 @@ fn split_negative_axis_via_split_input() {
     assert_eq!(f32s(&out[1]), vec![2., 3., 4., 6., 7., 8.]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn squeeze_axes_input_preserves_bytes() {
-    let ep = gpu();
+    let ep = require_cuda();
     let inputs = [
         tensor(DataType::Int64, &[1, 3, 1], &[7_i64, 8, 9]),
         tensor(DataType::Int64, &[2], &[0_i64, 2]),
@@ -305,9 +343,13 @@ fn squeeze_axes_input_preserves_bytes() {
     assert_eq!(out[0], raw(&[7_i64, 8, 9]));
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn tile_multi_axis_repeats() {
-    let ep = gpu();
+    let ep = require_cuda();
     let inputs = [
         tensor(DataType::Float32, &[2, 1], &[1_f32, 2.]),
         tensor(DataType::Int64, &[2], &[2_i64, 3]),
@@ -326,9 +368,13 @@ fn tile_multi_axis_repeats() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn transpose_explicit_three_axis_permutation() {
-    let ep = gpu();
+    let ep = require_cuda();
     let inputs = [tensor(
         DataType::Float32,
         &[2, 1, 3],
@@ -345,9 +391,13 @@ fn transpose_explicit_three_axis_permutation() {
     assert_eq!(f32s(&out[0]), vec![1., 4., 2., 5., 3., 6.]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn unsqueeze_multiple_axes_input_preserves_bytes() {
-    let ep = gpu();
+    let ep = require_cuda();
     let inputs = [
         tensor(DataType::Int64, &[2], &[5_i64, 9]),
         tensor(DataType::Int64, &[2], &[0_i64, 2]),
@@ -363,9 +413,13 @@ fn unsqueeze_multiple_axes_input_preserves_bytes() {
     assert_eq!(out[0], raw(&[5_i64, 9]));
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn where_broadcasts_all_three_inputs() {
-    let ep = gpu();
+    let ep = require_cuda();
     let inputs = [
         tensor(DataType::Bool, &[2, 1], &[1_u8, 0]),
         tensor(DataType::Int64, &[1, 3], &[1_i64, 2, 3]),
@@ -439,11 +493,15 @@ fn build_split_kernel(
         .unwrap()
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn split_static_even_num_outputs_is_capture_supported() {
     // The GLM-4 fused-MLP activation split: single data input, num_outputs=2,
     // axis=-1, statically resolved even halves. This must be capturable.
-    let ep = gpu();
+    let ep = require_cuda();
     let kernel = build_split_kernel(
         &ep,
         &[1, 4, 8],
@@ -457,10 +515,14 @@ fn split_static_even_num_outputs_is_capture_supported() {
     assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn split_static_explicit_split_attribute_is_capture_supported() {
     // Explicit, uneven but statically known split sizes are also capturable.
-    let ep = gpu();
+    let ep = require_cuda();
     let kernel = build_split_kernel(
         &ep,
         &[2, 5],
@@ -474,11 +536,15 @@ fn split_static_explicit_split_attribute_is_capture_supported() {
     assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn split_dynamic_runtime_sizes_is_not_capture_supported() {
     // A wired runtime split-sizes input keeps the host-read-plus-synchronize
     // path and must never be admitted to capture.
-    let ep = gpu();
+    let ep = require_cuda();
     let kernel = build_split_kernel(
         &ep,
         &[2, 4],
@@ -492,9 +558,13 @@ fn split_dynamic_runtime_sizes_is_not_capture_supported() {
     ));
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn split_static_even_num_outputs_matches_eager_bytes() {
-    let ep = gpu();
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let device = ep.device_id();
     let input_shape = [1, 2, 4];
@@ -618,9 +688,13 @@ fn split_static_even_num_outputs_matches_eager_bytes() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn split_constant_input_warms_and_captures() {
-    let ep = gpu();
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let device = ep.device_id();
     // DeepSeek-V2-Lite decode: [B,S,16,192] -> [B,S,16,128] + [B,S,16,64].
@@ -738,6 +812,180 @@ fn split_constant_input_warms_and_captures() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn split_runtime_sizes_with_resolved_outputs_warms_and_captures() {
+    // The GatedDeltaNet decode Split (C3 of the GDN capture fix): a *runtime*
+    // split-sizes input that is NOT flagged constant (its sizes come from a
+    // `Constant` node the default `OptimizationLevel::None` never folds into an
+    // initializer). The old path host-read the sizes and synchronized every
+    // step, de-capturing the surrounding decode block. Because the executor
+    // pre-allocates each output at its statically-inferred shape, the sizes are
+    // fully determined by the output shapes — so after warmup the kernel derives
+    // a static plan and becomes capture-safe with byte-identical results.
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    // Qwen3.5 GatedDeltaNet split: [1,1,H,320] -> [1,1,H,128] + [1,1,H,128] +
+    // [1,1,H,64] (q/k/v-style fan-out), axis=-1.
+    let heads = 4usize;
+    let data_shape = [1, 1, heads, 320];
+    let split_shape = [3];
+    let output_shapes = [
+        vec![1, 1, heads, 128],
+        vec![1, 1, heads, 128],
+        vec![1, 1, heads, 64],
+    ];
+    let data = (0..heads * 320)
+        .map(|value| value as f32)
+        .collect::<Vec<_>>();
+    let data_bytes = raw(&data);
+    let split_bytes = raw(&[128_i64, 128, 64]);
+    // NOTE: no `set_constant_inputs` — constant_split_input stays false, which is
+    // exactly the GDN case the C3 fix targets.
+    let kernel = build_split_kernel(
+        &ep,
+        &data_shape,
+        &output_shapes,
+        &[("axis", Attribute::Int(-1))],
+        Some(&split_shape),
+    );
+    // Before warmup the kernel has no static plan, so it must decline capture
+    // (the dynamic host-read/synchronize path).
+    assert!(
+        matches!(kernel.capture_support(), CaptureSupport::Unsupported { .. }),
+        "a cold runtime-split Split must decline capture until warmed"
+    );
+
+    let data_buffer = ep.allocate(data_bytes.len(), 256).unwrap();
+    let split_buffer = ep.allocate(split_bytes.len(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&data_bytes, cuptr(data_buffer.as_ptr()))
+            .unwrap();
+        runtime
+            .htod(&split_bytes, cuptr(split_buffer.as_ptr()))
+            .unwrap();
+    }
+    let data_strides = compute_contiguous_strides(&data_shape);
+    let split_strides = compute_contiguous_strides(&split_shape);
+    let inputs = [
+        TensorView::new(
+            DevicePtr(data_buffer.as_ptr()),
+            DataType::Float32,
+            &data_shape,
+            &data_strides,
+            device,
+        ),
+        TensorView::new(
+            DevicePtr(split_buffer.as_ptr()),
+            DataType::Int64,
+            &split_shape,
+            &split_strides,
+            device,
+        ),
+    ];
+    let mut output_buffers = output_shapes
+        .iter()
+        .map(|shape| {
+            ep.allocate(DataType::Float32.storage_bytes(shape.iter().product()), 256)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let output_strides = output_shapes
+        .iter()
+        .map(|shape| compute_contiguous_strides(shape))
+        .collect::<Vec<_>>();
+
+    macro_rules! execute {
+        () => {{
+            let mut outputs = output_buffers
+                .iter_mut()
+                .zip(&output_shapes)
+                .zip(&output_strides)
+                .map(|((buffer, shape), strides)| {
+                    TensorMut::new(
+                        DevicePtrMut(buffer.as_mut_ptr()),
+                        DataType::Float32,
+                        shape,
+                        strides,
+                        device,
+                    )
+                })
+                .collect::<Vec<_>>();
+            kernel.execute(&inputs, &mut outputs).unwrap();
+        }};
+    }
+
+    // Warm eagerly: the output-derived plan is cached, flipping capture_support
+    // to Supported WITHOUT ever host-reading the split-size input.
+    execute!();
+    assert_eq!(
+        kernel.capture_support(),
+        CaptureSupport::Supported,
+        "after warmup the output-derived static plan must admit capture"
+    );
+
+    let eager = output_buffers
+        .iter()
+        .zip(&output_shapes)
+        .map(|(buffer, shape)| {
+            let mut bytes = vec![0; DataType::Float32.storage_bytes(shape.iter().product())];
+            unsafe {
+                runtime.dtoh(&mut bytes, cuptr(buffer.as_ptr())).unwrap();
+            };
+            bytes
+        })
+        .collect::<Vec<_>>();
+
+    // Capture + replay must succeed (no host-read/sync in the captured region)
+    // and reproduce the eager bytes exactly.
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute!();
+    runtime.end_graph_capture().unwrap();
+    assert!(runtime.has_graph_executable().unwrap());
+    runtime.replay_graph().unwrap();
+    let replayed = output_buffers
+        .iter()
+        .zip(&output_shapes)
+        .map(|(buffer, shape)| {
+            let mut bytes = vec![0; DataType::Float32.storage_bytes(shape.iter().product())];
+            unsafe {
+                runtime.dtoh(&mut bytes, cuptr(buffer.as_ptr())).unwrap();
+            };
+            bytes
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(replayed, eager, "replayed Split bytes must equal eager");
+
+    // Byte-exact vs the reference chunking.
+    let expected: Vec<Vec<f32>> = {
+        let bounds = [(0usize, 128usize), (128, 256), (256, 320)];
+        bounds
+            .iter()
+            .map(|&(lo, hi)| {
+                data.chunks_exact(320)
+                    .flat_map(|head| &head[lo..hi])
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    for (idx, want) in expected.iter().enumerate() {
+        assert_eq!(eager[idx], raw(want), "output {idx} byte mismatch");
+    }
+    assert!(runtime.reset_graph().unwrap());
+
+    ep.deallocate(data_buffer).unwrap();
+    ep.deallocate(split_buffer).unwrap();
+    for buffer in output_buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+}
+
 fn build_movement_kernel(
     ep: &CudaExecutionProvider,
     op: &str,
@@ -788,9 +1036,13 @@ fn build_movement_kernel(
         .unwrap()
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn concat_fixed_shape_captures_and_matches_eager() {
-    let ep = gpu();
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let device = ep.device_id();
     // DeepSeek-V2-Lite decode: concatenate per-head q_nope and q_rope.
@@ -875,9 +1127,13 @@ fn concat_fixed_shape_captures_and_matches_eager() {
     ep.deallocate(output_buffer).unwrap();
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn reshape_exact_signature_captures_async_copy() {
-    let ep = gpu();
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let device = ep.device_id();
     // DeepSeek-V2-Lite decode projection reshape.
@@ -984,9 +1240,13 @@ fn reshape_exact_signature_captures_async_copy() {
     ep.deallocate(output_buffer).unwrap();
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn expand_warmed_metadata_captures_and_matches_eager() {
-    let ep = gpu();
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let device = ep.device_id();
     // DeepSeek-V2-Lite decode broadcasts one rotary-key head across 16 heads.
@@ -1070,9 +1330,13 @@ fn expand_warmed_metadata_captures_and_matches_eager() {
     ep.deallocate(output_buffer).unwrap();
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn transpose_warmed_metadata_captures_and_matches_eager() {
-    let ep = gpu();
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let device = ep.device_id();
     // LinearAttention decode transposes carry a fixed perm on a fixed decode
@@ -1144,9 +1408,13 @@ fn transpose_warmed_metadata_captures_and_matches_eager() {
     ep.deallocate(output_buffer).unwrap();
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn transpose_rejects_signature_change_during_capture() {
-    let ep = gpu();
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let device = ep.device_id();
     // Signature A is the warmed decode shape; the persistent-metadata guard must
@@ -1248,9 +1516,13 @@ fn transpose_rejects_signature_change_during_capture() {
     ep.deallocate(b_output_buffer).unwrap();
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn tile_warmed_metadata_captures_and_matches_eager() {
-    let ep = gpu();
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let device = ep.device_id();
     // Fixed decode-shape Tile: the repeats/geometry are stable, so the persistent
@@ -1342,9 +1614,13 @@ fn tile_warmed_metadata_captures_and_matches_eager() {
     ep.deallocate(output_buffer).unwrap();
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn tile_rejects_signature_change_during_capture() {
-    let ep = gpu();
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let device = ep.device_id();
     // Signature A is the warmed decode shape; feeding a different tiled geometry

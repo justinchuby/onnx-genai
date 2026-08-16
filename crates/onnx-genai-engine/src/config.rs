@@ -122,6 +122,11 @@ pub enum EngineConfigError {
         #[source]
         source: LimitParseError,
     },
+    #[error("failed to parse serving.memory.weights.device_policy: {source}")]
+    DevicePolicy {
+        #[source]
+        source: DevicePolicyParseError,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +167,13 @@ struct LimitsYaml {
 struct MemoryYaml {
     #[serde(default)]
     limits: LimitsYaml,
+    #[serde(default)]
+    weights: WeightsYaml,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WeightsYaml {
+    device_policy: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -521,6 +533,282 @@ pub enum EngineDecodeBackend {
     Native,
 }
 
+/// User-selected static weight placement policy.
+///
+/// This is deliberately a loud parse surface. A misspelled `gpu_layers` setting
+/// used to be accepted by nobody and ignored by everybody, which is the exact
+/// "documented but unreachable" failure mode this configuration prevents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DevicePolicy {
+    /// Let the engine use the governor-coordinated device weight budget.
+    #[default]
+    Auto,
+    /// Keep planned layers on the host.
+    Cpu,
+    /// Compatibility override matching llama.cpp's `-ngl`: translate the layer
+    /// prefix to bytes, then cap it by the governor's weight budget.
+    GpuLayers(usize),
+    /// Request a byte ceiling for static placement, still capped by the
+    /// governor's coordinated weight budget.
+    DeviceBytes(u64),
+}
+
+/// Error returned when `device_policy` cannot be parsed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "invalid device_policy {input:?}: {reason}; use auto, cpu, gpu_layers:<N>, \
+     or device_bytes:<SIZE>"
+)]
+pub struct DevicePolicyParseError {
+    input: String,
+    reason: String,
+}
+
+impl std::str::FromStr for DevicePolicy {
+    type Err = DevicePolicyParseError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        parse_device_policy(input)
+    }
+}
+
+/// Parse the `serving.memory.weights.device_policy` value.
+pub fn parse_device_policy(input: &str) -> Result<DevicePolicy, DevicePolicyParseError> {
+    let input = input.trim();
+    if input.eq_ignore_ascii_case("auto") {
+        return Ok(DevicePolicy::Auto);
+    }
+    if input.eq_ignore_ascii_case("cpu") {
+        return Ok(DevicePolicy::Cpu);
+    }
+    if let Some(value) = input.strip_prefix("gpu_layers:") {
+        let layers = value.trim().parse::<usize>().map_err(|_| {
+            device_policy_error(
+                input,
+                "gpu_layers requires a non-negative integer layer count",
+            )
+        })?;
+        return Ok(DevicePolicy::GpuLayers(layers));
+    }
+    if let Some(value) = input.strip_prefix("device_bytes:") {
+        let bytes = match parse_resource_limit(value).map_err(|error| {
+            device_policy_error(
+                input,
+                format!("device_bytes has invalid size syntax: {error}"),
+            )
+        })? {
+            ResourceLimit::Bytes(bytes) => bytes,
+            ResourceLimit::Auto => {
+                return Err(device_policy_error(
+                    input,
+                    "device_bytes requires an explicit size, not auto",
+                ));
+            }
+            ResourceLimit::Fraction(_) => {
+                return Err(device_policy_error(
+                    input,
+                    "device_bytes requires a byte size, not a fraction",
+                ));
+            }
+        };
+        return Ok(DevicePolicy::DeviceBytes(bytes));
+    }
+    Err(device_policy_error(
+        input,
+        "the value does not match any supported policy",
+    ))
+}
+
+fn device_policy_error(
+    input: impl Into<String>,
+    reason: impl Into<String>,
+) -> DevicePolicyParseError {
+    DevicePolicyParseError {
+        input: input.into(),
+        reason: reason.into(),
+    }
+}
+
+/// Profile-facing summary of the static weight placement computed at load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WeightPlacementReport {
+    pub coordinated_weight_budget_bytes: u64,
+    pub effective_budget_bytes: u64,
+    pub device_bytes: u64,
+    pub host_bytes: u64,
+    pub explanation: String,
+}
+
+/// Load-time memory strategy selected from graph/model evidence and overrides.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MemoryStrategyPlan {
+    /// Effective strategy selected for the current runtime. Policy construction
+    /// must consume this value rather than resolving the same inputs again.
+    pub strategy: MemoryStrategy,
+    /// Unconditionally inferred strategy before the current activation gate or
+    /// an explicit override is applied.
+    pub inferred_strategy: MemoryStrategy,
+    pub weight_access_pattern: WeightAccessPattern,
+    pub total_weight_bytes: u64,
+    /// Resident side-buffer bytes folded into [`Self::total_weight_bytes`] when
+    /// admitted: the dequantized-f32 decode cache (#971) and/or the int4
+    /// `accuracy_level == 0` MLAS SQNBit packed buffer (#1027), both held for the
+    /// session beside the on-disk weights. Zero on backends/models that take
+    /// neither native CPU path.
+    pub resident_f32_cache_bytes: u64,
+    /// Whether the plan admitted the resident side buffers above. When `false`
+    /// the runtime declined them (expanded footprint over budget): the f32 cache
+    /// dequantizes on the fly and the MLAS int4 route falls back to the borrowed
+    /// zero-copy path, so only the on-disk weights are held (#971, #1027). Always
+    /// `true` when [`Self::resident_f32_cache_bytes`] is zero.
+    pub f32_weight_cache_admitted: bool,
+    pub kv_bytes_per_token: Option<u64>,
+    pub per_layer_weight_bytes: Vec<LayerWeightBytes>,
+    pub resolved_device_budget_bytes: Option<u64>,
+    pub fits_resolved_device_budget: Option<bool>,
+    pub application: MemoryPolicyApplication,
+    /// True when the backend can report the plan but cannot safely enforce
+    /// weight residency with its current provider lifecycle.
+    pub advisory_only: bool,
+    pub decisions: Vec<MemoryStrategyDecision>,
+}
+
+impl MemoryStrategyPlan {
+    pub fn unknown(
+        total_weight_bytes: u64,
+        kv_bytes_per_token: Option<u64>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            strategy: MemoryStrategy::Unknown,
+            inferred_strategy: MemoryStrategy::Unknown,
+            weight_access_pattern: WeightAccessPattern::Unknown,
+            total_weight_bytes,
+            resident_f32_cache_bytes: 0,
+            f32_weight_cache_admitted: true,
+            kv_bytes_per_token,
+            per_layer_weight_bytes: Vec::new(),
+            resolved_device_budget_bytes: None,
+            fits_resolved_device_budget: None,
+            application: MemoryPolicyApplication::default(),
+            advisory_only: true,
+            decisions: vec![MemoryStrategyDecision::new(
+                "strategy",
+                "Unknown",
+                DecisionSource::Unknown,
+                reason,
+                format!(
+                    "total_weight_bytes={total_weight_bytes} kv_bytes_per_token={kv_bytes_per_token:?}"
+                ),
+            )],
+        }
+    }
+
+    /// Concrete policy the runtime applies for this plan.
+    ///
+    /// The effective strategy remains authoritative: changing it changes
+    /// whether paging is active instead of leaving behavior hidden in a
+    /// separately resolved boolean.
+    pub fn runtime_application(&self) -> MemoryPolicyApplication {
+        let mut application = self.application.clone();
+        application.weight_offload_enabled = match self.strategy {
+            MemoryStrategy::FullResident => false,
+            MemoryStrategy::DynamicWeightResidency | MemoryStrategy::MoeRoutingAware => true,
+            MemoryStrategy::Compatibility | MemoryStrategy::Unknown => {
+                self.application.weight_offload_enabled
+            }
+        };
+        application
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum MemoryStrategy {
+    Compatibility,
+    FullResident,
+    DynamicWeightResidency,
+    MoeRoutingAware,
+    Unknown,
+}
+
+/// Concrete policy fields derived from [`MemoryStrategyPlan::strategy`].
+///
+/// Native CUDA provider construction consumes this object directly. Keeping it
+/// in the serialized plan makes the applied behavior and its evidence the same
+/// source of truth.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct MemoryPolicyApplication {
+    pub weight_offload_enabled: bool,
+    pub device_budget_bytes: Option<u64>,
+    pub scan_resistant_dense: bool,
+    pub managed_no_spill: bool,
+    pub managed_limit_bytes: Option<u64>,
+    pub device_budget_is_override: bool,
+    pub auto_enabled_from_vram_limit: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum WeightAccessPattern {
+    SequentialDense,
+    MoeRouted,
+    Iterative,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LayerWeightBytes {
+    pub layer_index: usize,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MemoryStrategyDecision {
+    pub field: &'static str,
+    pub value: String,
+    pub source: DecisionSource,
+    /// Inferred value retained when an override or compatibility gate changes
+    /// the effective value.
+    pub inferred_value: Option<String>,
+    pub reason: String,
+    pub evidence: String,
+}
+
+impl MemoryStrategyDecision {
+    pub fn new(
+        field: &'static str,
+        value: impl Into<String>,
+        source: DecisionSource,
+        reason: impl Into<String>,
+        evidence: impl Into<String>,
+    ) -> Self {
+        Self {
+            field,
+            value: value.into(),
+            source,
+            inferred_value: None,
+            reason: reason.into(),
+            evidence: evidence.into(),
+        }
+    }
+
+    pub fn with_inferred_value(mut self, inferred_value: impl Into<String>) -> Self {
+        self.inferred_value = Some(inferred_value.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum DecisionSource {
+    Inference,
+    ExplicitOverride,
+    CompatibilityDefault,
+    Unknown,
+    /// The value could not be measured on this platform (e.g. no device-capacity
+    /// query is available), so no number was resolved. Distinct from `Unknown`,
+    /// which marks an inference the evidence could not decide (#947).
+    Unavailable,
+}
+
 /// Engine configuration.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -534,6 +822,16 @@ pub struct EngineConfig {
     /// Native decoder device override. `None` follows the execution provider in
     /// [`onnx_genai_ort::SessionOptions`], including `ONNX_GENAI_EP`.
     pub native_device: Option<crate::native_decode_device::NativeDecodeDevice>,
+    /// Persistent native decode batch extent: how many sequences one fused
+    /// forward advances (#750). `None` defers to
+    /// `ONNX_GENAI_NATIVE_DECODE_BATCH`, which defaults to `1`.
+    ///
+    /// Setting it is what makes batch-N *requestable* rather than only
+    /// environment-enabled. The server's `--max-batch` sets it, so a caller who
+    /// asks for concurrent decoding either gets a session shaped for it or gets
+    /// an error -- previously the request was refused because the capability was
+    /// read from a session nobody had asked to build in batch shape (#1064).
+    pub native_decode_batch: Option<usize>,
     /// Decoder-wide numeric precision for the native decode session
     /// (see [`onnx_runtime_session::DecodePrecision`]). Defaults to
     /// [`DecodePrecision::Model`](onnx_runtime_session::DecodePrecision::Model)
@@ -568,6 +866,8 @@ pub struct EngineConfig {
     pub limits: ResourceLimits,
     /// Permit programmatic resource-limit changes after engine initialization.
     pub allow_runtime_override: bool,
+    /// Static device/host weight placement policy.
+    pub device_policy: DevicePolicy,
     /// Byte budget for a pipeline's memoized prompt-phase (encoder) outputs.
     ///
     /// Re-asking about the same picture should not re-run the vision encoder,
@@ -591,6 +891,7 @@ impl Default for EngineConfig {
         Self {
             decode_backend: EngineDecodeBackend::Auto,
             native_device: None,
+            native_decode_batch: None,
             #[cfg(feature = "native-backend")]
             decode_precision: onnx_runtime_session::DecodePrecision::Model,
             page_size: 16,
@@ -602,6 +903,7 @@ impl Default for EngineConfig {
             kv_connector: KvConnectorConfig::default(),
             limits: ResourceLimits::default(),
             allow_runtime_override: false,
+            device_policy: DevicePolicy::Auto,
             // One encoder output for a handful of attachments. Big enough that
             // a conversation about a few images keeps all of them, small enough
             // to be an unremarkable line in a process's memory profile.
@@ -618,6 +920,7 @@ impl EngineConfig {
     pub fn from_yaml(yaml: &str) -> Result<Self, EngineConfigError> {
         let document: EngineConfigYaml = serde_yaml::from_str(yaml)?;
         let yaml_limits = document.serving.memory.limits;
+        let yaml_weights = document.serving.memory.weights;
         let mut config = Self::default();
         if let Some(limit) = yaml_limits.vram_limit {
             config.limits.vram_limit = limit.parse("vram_limit")?;
@@ -629,6 +932,10 @@ impl EngineConfig {
             config.limits.disk_spill_limit = Some(limit.parse("disk_spill_limit")?);
         }
         config.allow_runtime_override = yaml_limits.allow_runtime_override;
+        if let Some(device_policy) = yaml_weights.device_policy {
+            config.device_policy = parse_device_policy(&device_policy)
+                .map_err(|source| EngineConfigError::DevicePolicy { source })?;
+        }
         Ok(config)
     }
 }
@@ -754,6 +1061,25 @@ mod resource_limit_tests {
         )
         .unwrap();
         assert_eq!(disabled.limits.disk_spill_limit, None);
+    }
+
+    #[test]
+    fn yaml_device_policy_is_loud_and_reaches_config() {
+        let config = EngineConfig::from_yaml(
+            "serving:\n  memory:\n    weights:\n      device_policy: gpu_layers:2\n",
+        )
+        .unwrap();
+        assert_eq!(config.device_policy, DevicePolicy::GpuLayers(2));
+
+        let error = EngineConfig::from_yaml(
+            "serving:\n  memory:\n    weights:\n      device_policy: gpu_layerz:2\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("failed to parse serving.memory.weights.device_policy"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -883,6 +1209,10 @@ pub struct GenerateOptions {
     /// KV state for matching prompt prefixes. Set to `true` for A/B measurement
     /// or when guaranteed-cold behaviour is required.
     pub cold_start: bool,
+    /// Token length of a declared semantic prefix boundary, such as the end of a
+    /// system prompt. Native hybrid decoders may snapshot loop-carried state at
+    /// this boundary and reuse it for later prompts that share the prefix.
+    pub semantic_prefix_len: Option<usize>,
 }
 
 impl Default for GenerateOptions {
@@ -913,8 +1243,18 @@ impl Default for GenerateOptions {
             constraint: None,
             top_logprobs: None,
             cold_start: false,
+            semantic_prefix_len: None,
         }
     }
+}
+
+/// Observable activity for semantic recurrent-prefix reuse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecurrentPrefixCacheStats {
+    pub lookups: u64,
+    pub hits: u64,
+    pub stores: u64,
+    pub restored_tokens: u64,
 }
 
 /// Sampling controls a caller explicitly requested.

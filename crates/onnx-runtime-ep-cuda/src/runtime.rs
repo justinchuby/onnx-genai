@@ -1015,13 +1015,66 @@ impl CudaRuntime {
         }
         // SAFETY: bound context; `dst` covers `src.len()` bytes per the contract,
         // and the copy is ordered on the runtime-owned transfer stream.
+        unsafe { cudarc::driver::result::memcpy_htod_async(dst, src, self.copy_stream.cu_stream()) }
+            .map_err(|e| driver_err("cuMemcpyHtoDAsync", e))
+    }
+
+    /// Measure one host-to-device copy with CUDA events on the transfer stream.
+    ///
+    /// The span is: record start event, enqueue `cuMemcpyHtoDAsync`, record end
+    /// event, then synchronize the end event before calling `cuEventElapsedTime`.
+    /// This **does block the host** until the DMA completes; use only on paths
+    /// where honest attribution is more important than preserving overlap.
+    ///
+    /// Returns the elapsed milliseconds alongside a [`CopyCompleted`] witness.
+    /// Because the end event is host-synchronized before this returns, the
+    /// witness is proof — usable by a caller — that the copy's DMA read of `src`
+    /// has *finished* (not merely been enqueued). The pinned-staging pool
+    /// requires this witness before a source buffer may be reused, so a future
+    /// switch to a non-blocking copy will fail to compile at the reuse site
+    /// rather than silently corrupt weights.
+    ///
+    /// # Safety
+    /// `dst` must cover at least `src.len()` bytes in this runtime's current
+    /// CUDA context and must remain valid until this function returns.
+    pub unsafe fn htod_async_elapsed_ms(
+        &self,
+        src: &[u8],
+        dst: CUdeviceptr,
+    ) -> Result<(f32, CopyCompleted)> {
+        self.bind()?;
+        if src.is_empty() {
+            return Ok((0.0, CopyCompleted::new()));
+        }
+        let start = self
+            .context
+            .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(|e| driver_err("cuEventCreate(start)", e))?;
+        let end = self
+            .context
+            .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(|e| driver_err("cuEventCreate(end)", e))?;
+        start
+            .record(&self.copy_stream)
+            .map_err(|e| driver_err("cuEventRecord(start)", e))?;
+        // SAFETY: caller guarantees `dst` covers `src.len()` bytes. The source
+        // must remain live until `end.elapsed_ms` returns, which this method
+        // enforces by synchronizing the end event before returning.
         unsafe {
             cudarc::driver::result::memcpy_htod_async(dst, src, self.copy_stream.cu_stream())
         }
         .map_err(|e| driver_err("cuMemcpyHtoDAsync", e))?;
+        end.record(&self.copy_stream)
+            .map_err(|e| driver_err("cuEventRecord(end)", e))?;
+        // `elapsed_ms` host-synchronizes the end event (cudarc `Event::elapsed_ms`
+        // calls `end.synchronize()`), so on return the copy is complete on the
+        // host timeline — which is exactly what `CopyCompleted` attests.
+        let elapsed_ms = start
+            .elapsed_ms(&end)
+            .map_err(|e| driver_err("cuEventElapsedTime", e))?;
         self.async_host_to_device_copies
             .fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok((elapsed_ms, CopyCompleted::new()))
     }
 
     /// Enqueue an asynchronous device → device copy on the transfer stream, so
@@ -1143,6 +1196,41 @@ impl CudaRuntime {
             len: bytes,
             context: self.context.clone(),
         })
+    }
+}
+
+/// Witness that a host→device copy issued on the transfer stream has **completed
+/// on the host timeline** — not merely been enqueued.
+///
+/// It is a zero-sized token whose sole field is private to this module, so it
+/// can only be minted by a copy primitive here that host-synchronizes the copy
+/// before returning (today, [`CudaRuntime::htod_async_elapsed_ms`]). Nothing
+/// outside `runtime` can fabricate one.
+///
+/// Its purpose is a compile-time proof obligation: reusing (or freeing) the
+/// pinned buffer that was the *source* of a copy is only sound once that copy's
+/// DMA read has finished. The pinned-staging pool's reuse path
+/// (`PinnedStagingPool::release` / `PooledStaging::retire`) consumes a
+/// `CopyCompleted`. If the page-in path is ever switched to a non-blocking
+/// `htod_async` + deferred fence, no `CopyCompleted` is available at the reuse
+/// site, so the code **fails to compile** until the author threads the witness
+/// through after awaiting the fence — the hazard cannot be reached by accident.
+#[must_use = "a CopyCompleted witness exists to gate pinned-buffer reuse; dropping it is pointless"]
+pub struct CopyCompleted(());
+
+impl CopyCompleted {
+    /// Mint a witness. Private to `runtime` so only a host-synchronizing copy
+    /// primitive in this module can produce one.
+    fn new() -> Self {
+        CopyCompleted(())
+    }
+
+    /// Test-only constructor. Unit tests in this crate that exercise the pool
+    /// without issuing a real copy need a witness; this keeps them honest about
+    /// requiring one without granting non-test code the ability to forge it.
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        CopyCompleted(())
     }
 }
 

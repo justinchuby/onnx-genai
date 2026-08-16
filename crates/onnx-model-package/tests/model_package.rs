@@ -8,6 +8,10 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn fixture_canonical(name: &str) -> PathBuf {
+    fixture(name).canonicalize().unwrap()
+}
+
 #[test]
 fn parses_valid_manifest_and_accepts_newer_minor_version() {
     let package = ModelPackage::open(fixture("valid-package")).unwrap();
@@ -58,7 +62,7 @@ fn selection_matches_execution_provider_and_precision_in_manifest_order() {
     assert_eq!(selected.variant_name, "cpu-fp16");
     assert_eq!(
         selected.model_path,
-        fixture("valid-package").join("cpu-fp16/model.onnx")
+        fixture_canonical("valid-package").join("cpu-fp16/model.onnx")
     );
 }
 
@@ -83,7 +87,7 @@ fn resolves_shared_tokenizer_directory() {
     assert_eq!(
         selected.tokenizer_directory,
         Some(
-            fixture("valid-package")
+            fixture_canonical("valid-package")
                 .join("shared_assets")
                 .join(format!("sha256-{}", "a".repeat(64)))
         )

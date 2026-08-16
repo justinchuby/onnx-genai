@@ -1,13 +1,18 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::Context;
 use onnx_genai::{Engine, EngineConfig};
-use onnx_genai_engine::KvDType;
 #[cfg(feature = "native-backend")]
 use onnx_genai_engine::NativeDecodeDevice;
-use onnx_genai_ort::{
-    ChatTemplate, ModelDirectory, PipelineModelDirectory, PipelineModels, Tokenizer,
+use onnx_genai_engine::{
+    DeviceCompatibilityDomain, DeviceMemoryAuthority, KvDType, MappedGrowthMetrics,
+    MemoryAuthorityProvider, ResourceLimit,
 };
+use onnx_genai_ort::{ChatTemplate, ModelDirectory, PipelineModelDirectory, Tokenizer};
 
 #[cfg(test)]
 use onnx_genai_engine::FimConfig;
@@ -23,6 +28,252 @@ const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
 const DEFAULT_MAX_SESSIONS: usize = 256;
 const DEFAULT_MAX_QUEUE_DEPTH: usize = 256;
 const DEFAULT_MAX_BATCH: usize = 4;
+
+#[derive(Debug)]
+pub(crate) struct ServerMemoryAuthorities {
+    effective_limit: Mutex<ResourceLimit>,
+    authorities: Mutex<HashMap<DeviceCompatibilityDomain, DeviceMemoryAuthority>>,
+}
+
+impl ServerMemoryAuthorities {
+    pub(crate) fn new(configured_limit: ResourceLimit) -> Self {
+        Self {
+            effective_limit: Mutex::new(configured_limit),
+            authorities: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn configured_limit(&self) -> anyhow::Result<ResourceLimit> {
+        self.effective_limit
+            .lock()
+            .map(|limit| *limit)
+            .map_err(|_| anyhow::anyhow!("server device-limit lock poisoned"))
+    }
+
+    pub(crate) fn aggregate_vram(&self) -> anyhow::Result<Option<(u64, u64, u64)>> {
+        let authorities = self
+            .authorities
+            .lock()
+            .map_err(|_| anyhow::anyhow!("server device-authority registry lock poisoned"))?;
+        if authorities.is_empty() {
+            return Ok(None);
+        }
+        let used = authorities.values().fold(0_u64, |total, authority| {
+            total.saturating_add(authority.used_bytes())
+        });
+        let limit = authorities.values().fold(0_u64, |total, authority| {
+            total.saturating_add(authority.limit_bytes())
+        });
+        Ok(Some((used, limit, limit.saturating_sub(used))))
+    }
+
+    pub(crate) fn aggregate_growth_metrics(&self) -> anyhow::Result<Option<MappedGrowthMetrics>> {
+        let authorities = self
+            .authorities
+            .lock()
+            .map_err(|_| anyhow::anyhow!("server device-authority registry lock poisoned"))?;
+        if authorities.is_empty() {
+            return Ok(None);
+        }
+        let mut total = MappedGrowthMetrics::default();
+        for authority in authorities.values() {
+            let metrics = authority.growth_metrics();
+            total.attempts = total.attempts.saturating_add(metrics.attempts);
+            total.bytes_transferred = total
+                .bytes_transferred
+                .saturating_add(metrics.bytes_transferred);
+            total.failures = total.failures.saturating_add(metrics.failures);
+            total.rollbacks = total.rollbacks.saturating_add(metrics.rollbacks);
+            total.weight_mapped = total.weight_mapped.saturating_add(metrics.weight_mapped);
+            total.kv_mapped = total.kv_mapped.saturating_add(metrics.kv_mapped);
+            total.workspace_mapped = total
+                .workspace_mapped
+                .saturating_add(metrics.workspace_mapped);
+            total.total_owned = total.total_owned.saturating_add(metrics.total_owned);
+            total.live_holders = total.live_holders.saturating_add(metrics.live_holders);
+            total.mapped_bytes = total.mapped_bytes.saturating_add(metrics.mapped_bytes);
+            total.total_allowance_bytes = total
+                .total_allowance_bytes
+                .saturating_add(metrics.total_allowance_bytes);
+        }
+        Ok(Some(total))
+    }
+
+    /// Atomically apply one operator policy to every device authority.
+    ///
+    /// The server flag is process-wide, so the scope is deliberately all
+    /// devices. Validation completes for every ledger before any mutation.
+    pub(crate) fn reconfigure_limit(&self, limit: ResourceLimit) -> anyhow::Result<()> {
+        let mut effective = self
+            .effective_limit
+            .lock()
+            .map_err(|_| anyhow::anyhow!("server device-limit lock poisoned"))?;
+        let authorities = self
+            .authorities
+            .lock()
+            .map_err(|_| anyhow::anyhow!("server device-authority registry lock poisoned"))?;
+        let mut ordered = authorities.values().cloned().collect::<Vec<_>>();
+        ordered.sort_by_key(|authority| authority.domain().to_string());
+        // Resolve the policy against each device's REAL capacity (or an honest
+        // "unknown") through the same engine machinery the decode governor uses
+        // — never a fabricated 8 GiB constant (#947). A fraction of an unmeasured
+        // device is unknown and cannot be resolved; an explicit byte limit is
+        // honoured on every device regardless.
+        let resolved_limits = ordered
+            .iter()
+            .map(|authority| {
+                let cuda_device_index = match authority.domain() {
+                    DeviceCompatibilityDomain::Cuda(index) => Some(*index),
+                    DeviceCompatibilityDomain::Host
+                    | DeviceCompatibilityDomain::Accelerator { .. } => None,
+                };
+                // `None` means the limit was a fraction/auto of a device capacity
+                // that could not be measured: it is unknown, not a number (#947).
+                // We do not fabricate a ceiling. Matching the engine governor's
+                // own `set_vram_limit` — which leaves an unmeasured device
+                // authority untouched rather than pushing a fabricated number —
+                // this authority's advisory ceiling is left unchanged (`None`
+                // below) instead of refusing the whole reconfigure. An explicit
+                // byte limit still resolves to `Some` and is enforced on every
+                // device, measurable or not.
+                onnx_genai_engine::resolve_device_vram_limit_bytes(limit, cuda_device_index)
+            })
+            .collect::<anyhow::Result<Vec<Option<u64>>>>()?;
+        let _mapped_growth = ordered
+            .iter()
+            .map(DeviceMemoryAuthority::pause_mapped_growth)
+            .collect::<Result<Vec<_>, _>>()?;
+        let guards = ordered
+            .iter()
+            .map(DeviceMemoryAuthority::pause_reconfiguration)
+            .collect::<Vec<_>>();
+        #[cfg(feature = "cuda")]
+        let pool_gates = ordered
+            .iter()
+            .map(DeviceMemoryAuthority::physical_pool_operation_gate)
+            .collect::<Vec<_>>();
+        #[cfg(feature = "cuda")]
+        let _pool_operations = pool_gates
+            .iter()
+            .map(|gate| {
+                gate.write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            })
+            .collect::<Vec<_>>();
+        let mut trim_plan = Vec::with_capacity(ordered.len());
+        for ((authority, guard), resolved) in ordered
+            .iter()
+            .zip(&guards)
+            .zip(resolved_limits.iter().copied())
+        {
+            // Unknown fractional limit: no new ceiling to fit under, nothing to
+            // trim — the advisory ceiling stays as it is.
+            let Some(resolved) = resolved else {
+                trim_plan.push(None);
+                continue;
+            };
+            let used = guard.used();
+            let required = used.saturating_sub(resolved);
+            let releasable = authority.releasable_unmapped_bytes();
+            if required > releasable {
+                anyhow::bail!(
+                    "cannot satisfy lowered resource limit of {resolved} bytes: {} has {used} \
+                     leased bytes but only {releasable} pooled-unmapped bytes are releasable",
+                    authority.domain()
+                );
+            }
+            trim_plan.push(Some(required));
+        }
+        for (((authority, guard), required), resolved) in ordered
+            .iter()
+            .zip(&guards)
+            .zip(trim_plan.iter().copied())
+            .zip(resolved_limits.iter().copied())
+        {
+            let (Some(required), Some(resolved)) = (required, resolved) else {
+                continue;
+            };
+            let released = authority.trim_unmapped_bytes(required)?;
+            if released < required || guard.used() > resolved {
+                anyhow::bail!(
+                    "could not complete lowered resource limit of {resolved} bytes for {}: \
+                     planned to release {required} pooled bytes, released {released}, and {} \
+                     bytes remain leased; limits and server policy remain unchanged",
+                    authority.domain(),
+                    guard.used()
+                );
+            }
+        }
+        for (guard, resolved) in guards.iter().zip(resolved_limits.iter().copied()) {
+            let Some(resolved) = resolved else {
+                continue;
+            };
+            let result = guard.try_set_limit(resolved);
+            debug_assert!(
+                result.is_ok(),
+                "claims are paused and usage was prevalidated"
+            );
+        }
+        *effective = limit;
+        Ok(())
+    }
+}
+
+impl MemoryAuthorityProvider for ServerMemoryAuthorities {
+    fn validate_limit(
+        &self,
+        domain: &DeviceCompatibilityDomain,
+        requested: ResourceLimit,
+    ) -> anyhow::Result<()> {
+        let effective = self
+            .effective_limit
+            .lock()
+            .map_err(|_| anyhow::anyhow!("server device-limit lock poisoned"))?;
+        if requested != *effective {
+            anyhow::bail!(
+                "model device limit {} conflicts with server device-authority limit {} for {}; \
+                 configure --vram-limit once at server launch instead of per model",
+                describe_limit(requested),
+                describe_limit(*effective),
+                domain
+            );
+        }
+        Ok(())
+    }
+
+    fn authority(
+        &self,
+        domain: &DeviceCompatibilityDomain,
+        resolved_limit_bytes: u64,
+    ) -> anyhow::Result<DeviceMemoryAuthority> {
+        let mut authorities = self
+            .authorities
+            .lock()
+            .map_err(|_| anyhow::anyhow!("server device-authority registry lock poisoned"))?;
+        if let Some(authority) = authorities.get(domain) {
+            if authority.limit_bytes() != resolved_limit_bytes {
+                anyhow::bail!(
+                    "resolved model device limit {resolved_limit_bytes} bytes conflicts with \
+                     existing server device-authority limit {} bytes for {}",
+                    authority.limit_bytes(),
+                    domain
+                );
+            }
+            return Ok(authority.clone());
+        }
+        let authority = DeviceMemoryAuthority::new(domain.clone(), resolved_limit_bytes);
+        authorities.insert(domain.clone(), authority.clone());
+        Ok(authority)
+    }
+}
+
+fn describe_limit(limit: ResourceLimit) -> String {
+    match limit {
+        ResourceLimit::Auto => "auto".to_string(),
+        ResourceLimit::Bytes(bytes) => format!("{bytes} bytes"),
+        ResourceLimit::Fraction(fraction) => format!("{fraction} of detected capacity"),
+    }
+}
 
 /// Parse a user-supplied KV cache dtype string.
 ///
@@ -118,6 +369,12 @@ pub struct ServerConfig {
     pub max_sessions: usize,
     /// Maximum generation requests admitted to the driver, including active and queued work.
     pub max_queue_depth: usize,
+    /// Operator-requested maximum continuous-batch width (`--max-batch`). `None`
+    /// leaves the server default in place and clamps silently to what the decode
+    /// path can honor. `Some(n)` with `n > 1` on a backend that cannot batch is a
+    /// hard startup refusal rather than a silent no-op — see
+    /// [`enforce_requested_max_batch`].
+    pub max_batch: Option<usize>,
     /// Enable the /v1/debug/* introspection endpoints. Off by default; enable with
     /// `--enable-debug-endpoints` or `ONNX_GENAI_DEBUG_ENDPOINTS=1`. These endpoints
     /// expose server internals and should only be used on loopback-bound instances or
@@ -145,6 +402,7 @@ impl Default for ServerConfig {
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
+            max_batch: None,
             enable_debug_endpoints: false,
             enable_admin_endpoints: false,
             max_loaded_models: None,
@@ -167,6 +425,9 @@ impl ServerConfig {
         }
         if self.max_queue_depth == 0 {
             anyhow::bail!("max_queue_depth must be greater than zero");
+        }
+        if self.max_batch == Some(0) {
+            anyhow::bail!("max_batch must be greater than zero when set");
         }
         if self.max_loaded_models == Some(0) {
             anyhow::bail!("max_loaded_models must be greater than zero when set");
@@ -254,7 +515,11 @@ impl AppState {
     ) -> Self {
         let config = config.validate().expect("validated server config");
         let fim_config = engine.fim_config().cloned();
-        let engine_driver = EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_queue_depth);
+        let engine_driver = EngineDriver::start(
+            engine,
+            config.max_batch.unwrap_or(DEFAULT_MAX_BATCH),
+            config.max_queue_depth,
+        );
         let handle = ModelHandle::new(ModelHandleParts {
             id: model_id,
             // Test-only constructor: the model was handed in already loaded, so
@@ -338,6 +603,35 @@ fn load_model_max_context(metadata_path: Option<&Path>) -> anyhow::Result<Option
     Ok(metadata.model.and_then(|model| model.max_sequence_length))
 }
 
+/// Refuse an explicit `--max-batch > 1` that the engine's decode path cannot
+/// honor. This is the startup-time enforcement for issue #750: the native
+/// backend (and legacy / non-shared-buffer past/present ORT models) can only
+/// decode one sequence at a time, so accepting `--max-batch 8` and silently
+/// serving one-at-a-time is dishonest. A `None` request (operator did not set
+/// the flag) is never refused — the default width is clamped silently instead.
+pub(crate) fn enforce_requested_max_batch(
+    engine: &Engine,
+    requested: Option<usize>,
+) -> anyhow::Result<()> {
+    let Some(asked) = requested else {
+        return Ok(());
+    };
+    if asked <= 1 {
+        return Ok(());
+    }
+    let capability = engine.batching_capability();
+    if !capability.allows(asked) {
+        anyhow::bail!(
+            "--max-batch {asked} cannot be honored: {reason}. This backend decodes \
+             at most {cap} sequence(s) concurrently; re-launch with --max-batch 1 \
+             (or omit the flag) to run single-sequence decoding.",
+            reason = capability.reason(),
+            cap = capability.effective_max_batch(asked),
+        );
+    }
+    Ok(())
+}
+
 /// Build one model handle (plain or pipeline) from a `ModelSpec`.
 ///
 /// `config` must already be validated.  This is the single shared construction
@@ -345,7 +639,20 @@ fn load_model_max_context(metadata_path: Option<&Path>) -> anyhow::Result<Option
 /// loading (`ModelRegistry::load`).  It is a **blocking** function (it calls
 /// `Engine::from_dir`, which takes seconds) and must therefore be invoked from a
 /// blocking context (e.g. at startup or via `tokio::task::spawn_blocking`).
+#[cfg(test)]
 pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::Result<ModelHandle> {
+    let authorities = Arc::new(ServerMemoryAuthorities::new(
+        config.engine_config.limits.vram_limit,
+    ));
+    build_handle_with_authorities(spec, config, authorities)
+}
+
+pub(crate) fn build_handle_with_authorities(
+    spec: &ModelSpec,
+    config: &ServerConfig,
+    authorities: Arc<ServerMemoryAuthorities>,
+) -> anyhow::Result<ModelHandle> {
+    onnx_genai_engine::validate_pipeline_backend_request(config.engine_config.decode_backend)?;
     let model_dir = spec.path.as_path();
     let model_id = spec.id.clone();
     let chat_template = load_chat_template(model_dir)?;
@@ -360,6 +667,7 @@ pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::R
             model_max_context,
             chat_template,
             directory,
+            authorities,
         );
     }
     let model_directory = ModelDirectory::load(model_dir)
@@ -367,13 +675,23 @@ pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::R
     let model_max_context = load_model_max_context(model_directory.metadata_path.as_deref())?;
     let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
-    let engine = Engine::from_dir(model_dir, config.engine_config.clone())?;
+    let engine = Engine::from_dir_with_memory_authority_provider(
+        model_dir,
+        config.engine_config.clone(),
+        authorities,
+    )?;
     let fim_config = engine.fim_config().cloned();
     // Capture the model author's declared generation defaults before the engine
     // is moved into the driver, so every request built for this handle can honor
     // a model that ships `do_sample: true` instead of forcing greedy.
     let generation_defaults = engine.metadata().generation.clone();
-    let engine_driver = EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_queue_depth);
+    // Refuse an explicit `--max-batch > 1` the decode path cannot honor, rather
+    // than accepting it and silently falling back to per-request decoding. The
+    // check is sourced from the engine's decode path, not from whether an ORT
+    // session exists (issue #750).
+    enforce_requested_max_batch(&engine, config.max_batch)?;
+    let requested_max_batch = config.max_batch.unwrap_or(DEFAULT_MAX_BATCH);
+    let engine_driver = EngineDriver::start(engine, requested_max_batch, config.max_queue_depth);
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
         model_dir: model_dir.to_path_buf(),
@@ -397,21 +715,22 @@ fn build_pipeline_handle(
     model_max_context: Option<usize>,
     chat_template: Option<ChatTemplate>,
     directory: PipelineModelDirectory,
+    authorities: Arc<ServerMemoryAuthorities>,
 ) -> anyhow::Result<ModelHandle> {
     let tokenizer_path = crate::multimodal::tokenizer_path(model_dir, &directory)?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load pipeline tokenizer: {e}"))?;
 
-    let models = PipelineModels::load(model_dir)
-        .map_err(|e| anyhow::anyhow!("Failed to inspect pipeline models: {e}"))?;
-    let multimodal = crate::multimodal::build(&directory, &models)?;
-    drop(models);
-
     // A package that declares a denoise loop can serve image generation; one
     // whose pipeline ends in a waveform stage can serve speech.
     let text_to_image = directory.spec.strategy.denoiser.is_some();
     let text_to_audio = onnx_genai::text_to_audio::is_text_to_audio(&directory.spec);
-    let engine = Engine::from_pipeline_dir(model_dir, config.engine_config.clone())?;
+    let engine = Engine::from_pipeline_dir_with_memory_authority_provider(
+        model_dir,
+        config.engine_config.clone(),
+        authorities,
+    )?;
+    let multimodal = crate::multimodal::build(&directory, engine.models())?;
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
         model_dir: model_dir.to_path_buf(),
@@ -429,4 +748,222 @@ fn build_pipeline_handle(
         text_to_image,
         text_to_audio,
     }))
+}
+
+#[cfg(test)]
+mod authority_tests {
+    #[cfg(not(feature = "native-backend"))]
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[cfg(not(feature = "native-backend"))]
+    #[test]
+    fn shared_server_load_validates_native_backend_before_model_io() {
+        let spec = ModelSpec {
+            id: "missing-native".to_string(),
+            path: PathBuf::from("this-model-directory-does-not-exist"),
+            eager: true,
+            warmup: false,
+        };
+        let config = ServerConfig {
+            engine_config: EngineConfig {
+                decode_backend: onnx_genai_engine::EngineDecodeBackend::Native,
+                ..EngineConfig::default()
+            },
+            ..ServerConfig::default()
+        };
+
+        let error = build_handle(&spec, &config)
+            .err()
+            .expect("native backend validation must fail")
+            .to_string();
+        assert!(error.contains("compiled without the 'native-backend' feature"));
+        assert!(!error.contains("does not exist"), "{error}");
+    }
+
+    #[test]
+    fn concurrent_requests_create_one_authority() {
+        let provider = Arc::new(ServerMemoryAuthorities::new(ResourceLimit::Bytes(100)));
+        let threads = (0..8)
+            .map(|_| {
+                let provider = Arc::clone(&provider);
+                std::thread::spawn(move || {
+                    provider
+                        .authority(&DeviceCompatibilityDomain::Cuda(0), 100)
+                        .unwrap()
+                        .authority_id()
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(ids.iter().all(|id| *id == ids[0]));
+    }
+
+    #[test]
+    fn conflicting_model_limit_names_both_values() {
+        let provider = ServerMemoryAuthorities::new(ResourceLimit::Bytes(100));
+        let error = provider
+            .validate_limit(
+                &DeviceCompatibilityDomain::Cuda(0),
+                ResourceLimit::Bytes(90),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("90 bytes"));
+        assert!(error.contains("100 bytes"));
+    }
+
+    #[test]
+    fn auto_policy_cannot_be_replaced_by_model_metadata() {
+        let provider = ServerMemoryAuthorities::new(ResourceLimit::Auto);
+        provider
+            .validate_limit(&DeviceCompatibilityDomain::Cuda(0), ResourceLimit::Auto)
+            .unwrap();
+        provider
+            .validate_limit(
+                &DeviceCompatibilityDomain::Cuda(0),
+                ResourceLimit::Bytes(90),
+            )
+            .unwrap_err();
+        assert_eq!(provider.configured_limit().unwrap(), ResourceLimit::Auto);
+    }
+
+    #[test]
+    fn different_device_keys_create_different_authorities() {
+        let provider = ServerMemoryAuthorities::new(ResourceLimit::Bytes(100));
+        let first = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(0), 100)
+            .unwrap();
+        let second = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(1), 100)
+            .unwrap();
+        assert_ne!(first.authority_id(), second.authority_id());
+    }
+
+    #[test]
+    fn multi_device_limit_failure_leaves_every_limit_and_policy_unchanged() {
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryRole, Tier};
+
+        let provider = ServerMemoryAuthorities::new(ResourceLimit::Bytes(100));
+        let first = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(0), 100)
+            .unwrap();
+        let second = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(1), 100)
+            .unwrap();
+        let _first_lease = first
+            .reserve(Tier::Device, 20, MemoryRole::Weights, HolderId::new(1))
+            .unwrap();
+        let _second_lease = second
+            .reserve(Tier::Device, 80, MemoryRole::Weights, HolderId::new(2))
+            .unwrap();
+
+        provider
+            .reconfigure_limit(ResourceLimit::Bytes(50))
+            .unwrap_err();
+        assert_eq!(first.limit_bytes(), 100);
+        assert_eq!(second.limit_bytes(), 100);
+        assert_eq!(
+            provider.configured_limit().unwrap(),
+            ResourceLimit::Bytes(100)
+        );
+        let future = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(2), 100)
+            .unwrap();
+        assert_eq!(future.limit_bytes(), 100);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn failed_multi_device_preflight_does_not_trim_an_earlier_pool() {
+        use cudarc::driver::CudaContext;
+        use onnx_runtime_ep_cuda::virtual_memory::{CudaVirtualBacking, PhysicalHandlePool};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryRole, Tier};
+        use onnx_runtime_virtual_memory::VirtualBacking;
+
+        let context = CudaContext::new(0).expect("CUDA driver");
+        let probe = CudaVirtualBacking::new(Arc::clone(&context), 0);
+        let granule = probe.granularity() as u64;
+        let initial_limit = granule * 4;
+        let provider = ServerMemoryAuthorities::new(ResourceLimit::Bytes(initial_limit));
+        let first = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(0), initial_limit)
+            .unwrap();
+        let second = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(1), initial_limit)
+            .unwrap();
+        let pool = PhysicalHandlePool::get_or_create(
+            context,
+            0,
+            (granule * 2) as usize,
+            &first,
+            HolderId::new(10),
+            MemoryRole::Weights,
+        )
+        .expect("first-device pool");
+        let stats = pool.stats();
+        let backing = CudaVirtualBacking::with_physical_pool(pool);
+        let mut reservation = backing
+            .reserve((granule * 2) as usize)
+            .expect("reservation");
+        backing
+            .commit(&mut reservation, 0, (granule * 2) as usize)
+            .expect("commit pooled bytes");
+        backing
+            .release(&mut reservation, 0, (granule * 2) as usize)
+            .expect("return pooled bytes");
+        let _mapped_second = second
+            .reserve(
+                Tier::Device,
+                granule * 2,
+                MemoryRole::Weights,
+                HolderId::new(11),
+            )
+            .expect("non-releasable second-device bytes");
+        let before = stats.snapshot();
+
+        provider
+            .reconfigure_limit(ResourceLimit::Bytes(granule))
+            .expect_err("second device prevents shrink");
+        let after = stats.snapshot();
+        assert_eq!(after.releases, before.releases);
+        assert_eq!(after.creates, before.creates);
+        assert_eq!(after.pooled_unmapped_bytes, before.pooled_unmapped_bytes);
+        assert_eq!(first.used_bytes(), granule * 2);
+        assert_eq!(first.limit_bytes(), initial_limit);
+        assert_eq!(second.limit_bytes(), initial_limit);
+        assert_eq!(
+            provider.configured_limit().unwrap(),
+            ResourceLimit::Bytes(initial_limit)
+        );
+    }
+
+    #[test]
+    fn multi_device_limit_success_updates_every_authority_and_policy() {
+        let provider = ServerMemoryAuthorities::new(ResourceLimit::Bytes(100));
+        let first = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(0), 100)
+            .unwrap();
+        let second = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(1), 100)
+            .unwrap();
+
+        provider
+            .reconfigure_limit(ResourceLimit::Bytes(50))
+            .unwrap();
+        assert_eq!(first.limit_bytes(), 50);
+        assert_eq!(second.limit_bytes(), 50);
+        assert_eq!(
+            provider.configured_limit().unwrap(),
+            ResourceLimit::Bytes(50)
+        );
+        let future = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(2), 50)
+            .unwrap();
+        assert_eq!(future.limit_bytes(), 50);
+    }
 }

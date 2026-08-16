@@ -218,24 +218,60 @@ fn download_prebuilt(target_dir: &Path) {
     // check it explicitly. Without this a 404 "Not Found" body is saved as the
     // "archive" and only surfaces later as an opaque tar/zip "unrecognized
     // format" failure that names neither the URL nor the status (RULES.md #1).
+    //
+    // We wrap curl in a Rust-level retry loop instead of relying on curl's
+    // `--retry-all-errors`: that flag only exists in curl >=7.71.0, but the
+    // manylinux_2_28 (AlmaLinux 8) build container ships curl 7.61.1, which
+    // rejects it outright (exit 2). curl's plain `--retry` does NOT retry the
+    // transient failures we actually hit on CI (exit 52 empty-reply, exit 56
+    // connection-died) on ANY curl version, so this portable loop covers them.
+    // `--connect-timeout` / `--max-time` are ancient and safe on curl 7.61.
     let download_path = target_dir.parent().unwrap().join(&filename);
-    let output = std::process::Command::new("curl")
-        .args([
-            "-sSL",
-            "--retry",
-            "3",
-            "--retry-delay",
-            "2",
-            "-w",
-            "%{http_code}",
-            "-o",
-        ])
-        .arg(&download_path)
-        .arg(&url)
-        .output()
-        .expect("Failed to run curl. Install curl or set ORT_ROOT manually.");
+    let max_attempts = 4;
+    let mut http_code = String::new();
+    let mut output = None;
+    for attempt in 1..=max_attempts {
+        let result = std::process::Command::new("curl")
+            .args([
+                "-sSL",
+                "--retry",
+                "5",
+                "--retry-delay",
+                "2",
+                // Bound each attempt so a hung connection can't consume the job.
+                "--connect-timeout",
+                "30",
+                "--max-time",
+                "300",
+                "-w",
+                "%{http_code}",
+                "-o",
+            ])
+            .arg(&download_path)
+            .arg(&url)
+            .output()
+            .expect("Failed to run curl. Install curl or set ORT_ROOT manually.");
 
-    let http_code = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        http_code = String::from_utf8_lossy(&result.stdout).trim().to_string();
+        let ok = result.status.success() && http_code == "200";
+        if ok || attempt == max_attempts {
+            output = Some(result);
+            break;
+        }
+
+        // Transient failure (e.g. curl exit 52 empty-reply / 56 connection-died,
+        // or a 5xx) that is NOT the final attempt: warn and back off, then retry.
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let stderr_tail: String = stderr.trim().chars().take(500).collect();
+        let backoff = 3u64 * (1 << (attempt - 1)); // 3s, 6s, 12s
+        eprintln!(
+            "curl download of {url} failed (attempt {attempt}/{max_attempts}, \
+             curl exit {:?}, HTTP status {http_code}); retrying in {backoff}s. stderr: {stderr_tail}",
+            result.status.code(),
+        );
+        std::thread::sleep(std::time::Duration::from_secs(backoff));
+    }
+    let output = output.expect("curl retry loop produced no output");
 
     if !output.status.success() {
         panic!(
@@ -301,7 +337,7 @@ fn download_prebuilt(target_dir: &Path) {
         // .zip (Windows). Extract with the pure-Rust `zip` crate instead of
         // shelling out to an external `unzip` binary, which is not present on a
         // clean Windows host and would fail the native build before compilation
-        // (docs/CROSS_PLATFORM.md, "ORT Windows bootstrap"). This path is
+        // (docs/architecture/CROSS_PLATFORM.md, "ORT Windows bootstrap"). This path is
         // identical on Linux/macOS/Windows and needs no external tool.
         extract_zip(&download_path, parent_dir);
         let extracted = parent_dir.join(format!("onnxruntime-{os}-{ORT_VERSION}"));

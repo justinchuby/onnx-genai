@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use onnx_runtime_memory_governor::{
-    HolderId, LeaseAccounting, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, Tier,
+    DeviceKey, HolderId, LeaseAccounting, MemoryAuthorityId, MemoryError, MemoryGovernor,
+    MemoryLease, MemoryRole, Tier,
 };
 
 /// A memory manager written entirely against the public API, sharing no code
@@ -24,6 +25,9 @@ use onnx_runtime_memory_governor::{
 #[derive(Debug)]
 struct MyOwnManager {
     free: AtomicU64,
+    /// What this manager started with, so the trait's `used` can be answered
+    /// from what it already tracks rather than needing a second counter.
+    capacity: u64,
     releases: AtomicU64,
 }
 
@@ -31,6 +35,7 @@ impl MyOwnManager {
     fn new(capacity: u64) -> Arc<Self> {
         Arc::new(Self {
             free: AtomicU64::new(capacity),
+            capacity,
             releases: AtomicU64::new(0),
         })
     }
@@ -77,9 +82,14 @@ impl LeaseAccounting for MyOwnManager {
 
 struct MyOwnGovernor {
     accounting: Arc<MyOwnManager>,
+    authority_id: MemoryAuthorityId,
 }
 
 impl MemoryGovernor for MyOwnGovernor {
+    fn authority_id(&self) -> MemoryAuthorityId {
+        self.authority_id
+    }
+
     fn reserve(
         &self,
         tier: Tier,
@@ -104,6 +114,20 @@ impl MemoryGovernor for MyOwnGovernor {
             self.accounting.free.load(Ordering::Acquire)
         }
     }
+
+    /// A third-party governor answers this from whatever it already tracks.
+    ///
+    /// Here that is the granted total, which is what a caller asking "what does
+    /// this tier hold" wants -- and the point of the method being on the trait
+    /// is that no caller can work it out for itself: leases are owned by the
+    /// components that must outlive them.
+    fn used(&self, tier: Tier) -> u64 {
+        if tier == Tier::Device {
+            0
+        } else {
+            self.accounting.capacity - self.accounting.free.load(Ordering::Acquire)
+        }
+    }
 }
 
 const HOLDER: HolderId = HolderId::new(1);
@@ -113,6 +137,7 @@ fn governor(capacity: u64) -> (MyOwnGovernor, Arc<MyOwnManager>) {
     (
         MyOwnGovernor {
             accounting: Arc::clone(&accounting),
+            authority_id: MemoryAuthorityId::new(DeviceKey::HOST),
         },
         accounting,
     )

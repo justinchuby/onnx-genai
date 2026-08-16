@@ -417,10 +417,205 @@ impl RuntimeConfig {
 }
 
 /// Return the process-wide runtime configuration, parsed on first use.
+///
+/// The snapshot is frozen the first time this is called and never re-read: an
+/// environment variable changed afterwards has no effect on the returned value.
+/// That is by design for production (the runtime policy must be stable for the
+/// life of the process), but it is a sharp edge for tests that set a knob and
+/// then expect it to take effect. In #804 a capture-OFF phase set
+/// `ONNX_GENAI_CUDA_GRAPH=0` *before* this `OnceLock` was first read, so every
+/// later phase in the same process silently inherited it and `captures=0` was
+/// misattributed to a model declining CUDA graph capture. See the debug-only
+/// [`freeze_guard`] below, which makes that mistake loud instead of silent.
 #[must_use]
 pub fn runtime_config() -> &'static RuntimeConfig {
     static CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
-    CONFIG.get_or_init(RuntimeConfig::from_env)
+
+    #[cfg(debug_assertions)]
+    {
+        let config = CONFIG.get_or_init(freeze_guard::freeze_and_record);
+        freeze_guard::assert_frozen_env_unchanged();
+        config
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        // Production (release) path: identical to the historical behaviour and
+        // free of any guard cost — a single `OnceLock` read, nothing else.
+        CONFIG.get_or_init(RuntimeConfig::from_env)
+    }
+}
+
+/// A debug-build guard that makes "this env var was already frozen" impossible
+/// to miss.
+///
+/// # Why this exists
+///
+/// [`runtime_config`] freezes its snapshot on first read. A test that sets an
+/// `ONNX_GENAI_*` knob *after* that first read believes it changed the runtime
+/// policy, but the frozen snapshot never moves — the result then depends on the
+/// order tests ran in. That is exactly the #804 defect, and #794/#801 carried
+/// the resulting wrong attribution (`captures=0` read as a model structurally
+/// declining CUDA graph capture) into a merged PR body.
+///
+/// # What it does
+///
+/// At the moment the snapshot is frozen, [`freeze_and_record`] records every
+/// environment variable that actually fed it (name and value, captured through
+/// the same lookup `RuntimeConfig::from_env` uses, so the set can never drift
+/// from the fields that were parsed). On every later [`runtime_config`] call,
+/// [`assert_frozen_env_unchanged`] re-reads those same variables and **panics
+/// loudly** if any now differs from what was frozen. A test phase can no longer
+/// silently believe it set a knob that was already frozen.
+///
+/// # Why `debug_assertions` and not `cfg(test)`
+///
+/// The #804 mutation lives in an *integration* test of a downstream crate
+/// (`onnx-genai-engine` / `onnx-runtime-session`), not in this crate's own unit
+/// tests. `cfg(test)` is only set while compiling this crate's own tests, so it
+/// would never be active for a dependent's test binary. `debug_assertions` *is*
+/// enabled for dependencies built under the `dev`/`test` profile, so the guard
+/// is live for every `cargo test` in the workspace, and it is compiled out of
+/// `--release` builds — the production path pays nothing.
+#[cfg(debug_assertions)]
+mod freeze_guard {
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    use super::RuntimeConfig;
+
+    /// The `(name, frozen value)` of every env var read while freezing the
+    /// snapshot. Recorded once, then only read.
+    static FROZEN_ENV: OnceLock<Vec<(String, Option<OsString>)>> = OnceLock::new();
+
+    /// Freeze the snapshot and record the environment it was parsed from.
+    ///
+    /// Used as the `OnceLock::get_or_init` closure, so it runs exactly once, on
+    /// the first `runtime_config()` call, under that lock.
+    pub(super) fn freeze_and_record() -> RuntimeConfig {
+        let recorded = Mutex::new(Vec::new());
+        let config = RuntimeConfig::from_os_fn(|name| {
+            let value = std::env::var_os(name);
+            recorded
+                .lock()
+                .expect("freeze-guard recorder mutex poisoned")
+                .push((name.to_owned(), value.clone()));
+            value
+        });
+        // `set` can only fail if another initializer already ran, which cannot
+        // happen inside a `OnceLock::get_or_init` closure.
+        let _ = FROZEN_ENV.set(recorded.into_inner().expect("recorder mutex poisoned"));
+        config
+    }
+
+    /// Panic loudly if any env var that fed the frozen snapshot now differs.
+    pub(super) fn assert_frozen_env_unchanged() {
+        let Some(frozen) = FROZEN_ENV.get() else {
+            return;
+        };
+        if let Some((name, frozen_value, current)) =
+            find_changed(frozen, |name| std::env::var_os(name))
+        {
+            // Emit before panicking: a phase that catches the unwind still gets
+            // the banner on stderr, so this can never be silent.
+            eprintln!(
+                "\n==== onnx-genai runtime-config freeze-guard tripped ====\n\
+                 env var `{name}` changed AFTER the process-wide RuntimeConfig \
+                 was frozen on first read.\n\
+                 frozen value: {frozen_value:?}\n\
+                 current value: {current:?}\n\
+                 The frozen snapshot did NOT change, so whatever set this knob \
+                 is operating on a stale config. This is the #804 / #801 \
+                 order-dependent-config defect. Isolate each policy phase in \
+                 its own process instead of mutating the environment mid-run.\n\
+                 ========================================================\n"
+            );
+            panic!(
+                "RuntimeConfig freeze-guard: env var `{name}` changed after the \
+                 process-wide config was frozen (frozen {frozen_value:?}, now \
+                 {current:?}); the change had no effect. Run this phase in its \
+                 own process (see #804)."
+            );
+        }
+    }
+
+    /// The first recorded env var whose current value differs from the frozen
+    /// one, if any. Pure over its `current` lookup so it is unit-testable
+    /// without touching the process environment or the global `OnceLock`.
+    ///
+    /// Returns `(name, frozen value, current value)` for the first mismatch.
+    fn find_changed(
+        frozen: &[(String, Option<OsString>)],
+        current: impl Fn(&str) -> Option<OsString>,
+    ) -> Option<(&str, &Option<OsString>, Option<OsString>)> {
+        frozen.iter().find_map(|(name, frozen_value)| {
+            let now = current(name);
+            let changed = &now != frozen_value;
+            changed.then_some((name.as_str(), frozen_value, now))
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::collections::HashMap;
+        use std::ffi::OsString;
+
+        use super::find_changed;
+
+        fn frozen(pairs: &[(&str, Option<&str>)]) -> Vec<(String, Option<OsString>)> {
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.map(OsString::from)))
+                .collect()
+        }
+
+        fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+            let map: HashMap<String, OsString> = pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), OsString::from(*value)))
+                .collect();
+            move |name: &str| map.get(name).cloned()
+        }
+
+        #[test]
+        fn unchanged_environment_does_not_trip() {
+            let frozen = frozen(&[
+                ("ONNX_GENAI_CUDA_GRAPH", Some("1")),
+                ("ONNX_GENAI_EP", None),
+            ]);
+            assert!(find_changed(&frozen, lookup(&[("ONNX_GENAI_CUDA_GRAPH", "1")])).is_none());
+        }
+
+        #[test]
+        fn a_changed_value_trips_with_both_readings() {
+            let frozen = frozen(&[("ONNX_GENAI_CUDA_GRAPH", Some("1"))]);
+            let hit = find_changed(&frozen, lookup(&[("ONNX_GENAI_CUDA_GRAPH", "0")]))
+                .expect("a changed knob must be detected");
+            assert_eq!(hit.0, "ONNX_GENAI_CUDA_GRAPH");
+            assert_eq!(hit.1.as_deref(), Some(OsString::from("1").as_os_str()));
+            assert_eq!(hit.2.as_deref(), Some(OsString::from("0").as_os_str()));
+        }
+
+        #[test]
+        fn newly_set_variable_that_was_unset_when_frozen_trips() {
+            // This is the #804 shape: the knob was absent at freeze time, then a
+            // later phase set it and believed it took effect.
+            let frozen = frozen(&[("ONNX_GENAI_CUDA_GRAPH", None)]);
+            let hit = find_changed(&frozen, lookup(&[("ONNX_GENAI_CUDA_GRAPH", "0")]))
+                .expect("setting a knob that was unset at freeze must be detected");
+            assert_eq!(hit.0, "ONNX_GENAI_CUDA_GRAPH");
+            assert!(hit.1.is_none());
+        }
+
+        #[test]
+        fn clearing_a_variable_that_was_set_when_frozen_trips() {
+            let frozen = frozen(&[("ONNX_GENAI_CUDA_GRAPH", Some("1"))]);
+            let hit = find_changed(&frozen, lookup(&[]))
+                .expect("clearing a frozen knob must be detected");
+            assert_eq!(hit.0, "ONNX_GENAI_CUDA_GRAPH");
+            assert!(hit.2.is_none());
+        }
+    }
 }
 
 fn env_bool<F>(lookup: &F, name: &str, default: bool) -> bool

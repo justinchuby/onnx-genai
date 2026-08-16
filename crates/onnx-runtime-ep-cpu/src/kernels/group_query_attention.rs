@@ -29,16 +29,53 @@
 //! greedy parity is established empirically by profiling.
 
 use super::sdpa::{
-    DecodePartial, SoftmaxExp, combine_decode_partials, sdpa_decode_partial, sdpa_decode_row,
+    DecodePartial, SoftmaxExp, combine_decode_partials, sdpa_decode_group, sdpa_decode_partial,
+    sdpa_decode_row,
 };
 use super::{check_arity, to_dense_i64};
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::dtype::{to_dense_f32_widen, widen_bf16_slice_into, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
 // Below this many row × key × head-dimension elements, Rayon synchronization
 // costs more than the attention work on the decode pool.
 const MIN_PARALLEL_ATTENTION_WORK: usize = 160 * 1024;
+
+// Minimum bytes of present KV cache **per participating worker** before the
+// past->present widen is fanned out across the decode pool. Expressed per worker
+// rather than in total so the gate follows the machine: a wider pool needs a
+// proportionally larger cache before the copy outweighs the dispatch. Paired
+// A/B on a 16-thread host puts the crossover just under a 512 KiB share -- at
+// 256 KiB per worker the fan-out loses, at 1 MiB it wins by 1.3x-1.4x.
+const MIN_PARALLEL_PRESENT_BYTES_PER_WORKER: usize = 512 * 1024;
+
+/// Counts fills that took the pooled arm, so a test can prove the fan-out ran
+/// rather than silently falling back to the serial loop.
+#[cfg(test)]
+static PRESENT_POOLED_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only override of [`MIN_PARALLEL_PRESENT_BYTES_PER_WORKER`], so the
+/// fan-out can be exercised at a cache size that is cheap to build and to
+/// compare exhaustively. `usize::MAX` means "use the production constant".
+#[cfg(test)]
+static PRESENT_PARALLEL_BYTES_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+#[cfg(test)]
+fn min_parallel_present_bytes_per_worker() -> usize {
+    let override_value = PRESENT_PARALLEL_BYTES_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if override_value == usize::MAX {
+        MIN_PARALLEL_PRESENT_BYTES_PER_WORKER
+    } else {
+        override_value
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn min_parallel_present_bytes_per_worker() -> usize {
+    MIN_PARALLEL_PRESENT_BYTES_PER_WORKER
+}
 
 // Flash-decoding (split-KV) engages only when a single head's attended KV window
 // is at least this long: below it the per-head path already parallelizes well
@@ -75,6 +112,440 @@ static ATTENTION_SPLIT_COUNT: std::sync::atomic::AtomicUsize =
 /// Number of decode forwards that took the flash-decoding split path so far.
 pub fn attention_split_count() -> usize {
     ATTENTION_SPLIT_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only tri-state override of [`group_fusion_enabled`]: `-1` defers to the
+/// environment, `0` forces off, `1` forces on.
+static GROUP_FUSION_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Whether the M=1 KV-group-fused decode path is enabled. **Opt-in**: set
+/// `ONNX_GENAI_GQA_GROUP_FUSED=1` (or `true`/`on`) to enable it.
+///
+/// The fused schedule is bit-identical and, where both gates open, is a
+/// 1.25x – 2.76x win on the attention operator, 1.31x end to end at a fixed
+/// decode width, and a 6% – 22% wall-clock win in a model-level A/B against a
+/// real ORT CPU session (see [`group_fused_min_kv_bytes`] for the matrix).
+///
+/// It is nonetheless still off by default. [`group_fused_min_kv_bytes`] now
+/// reads the host's last-level cache and can only *tighten* the calibrated
+/// 8 MiB threshold, which closes the large-L3 hole the fixed constant had. What
+/// remains unproven is the other direction: the sweep that forced the traffic
+/// gate fully open could not separate the 1 – 4 MiB per-head range from a +-9%
+/// contention noise floor, so the true crossover on an unfamiliar host is still
+/// unknown, and no model-level measurement exists for the batch >= 2 regime the
+/// pool gate also admits.
+///
+/// Flip the default once a wall-clock A/B on a quiet host resolves the
+/// crossover to better than the noise floor at a reachable geometry.
+fn group_fusion_enabled() -> bool {
+    match GROUP_FUSION_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => group_fusion_env_default(),
+    }
+}
+
+/// Environment default for [`group_fusion_enabled`], latched on first read.
+fn group_fusion_env_default() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("ONNX_GENAI_GQA_GROUP_FUSED") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on"
+        ),
+        Err(_) => false,
+    })
+}
+
+/// Count of decode attention forwards that engaged the KV-group-fused path.
+/// Cheap reachability evidence for A/B runs; read via [`group_fused_count`].
+static GROUP_FUSED_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of decode forwards that took the KV-group-fused path so far.
+pub fn group_fused_count() -> usize {
+    GROUP_FUSED_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count of forwards that assembled the present KV cache straight inside the
+/// graph's `present_key`/`present_value` outputs.
+static PRESENT_DIRECT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Count of forwards that fell back to owned present scratch plus a copy out.
+static PRESENT_SCRATCH_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of forwards that built the present cache directly in the graph
+/// outputs (no owned scratch, no trailing copy). Reachability evidence for A/B
+/// runs, in the same spirit as [`group_fused_count`].
+pub fn present_direct_count() -> usize {
+    PRESENT_DIRECT_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Number of forwards that fell back to owned present scratch.
+pub fn present_scratch_count() -> usize {
+    PRESENT_SCRATCH_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only tri-state override of the direct-present gate: `-1` defers to the
+/// structural detection, `0` forces the owned-scratch fall-back.
+#[cfg(test)]
+static PRESENT_DIRECT_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Serialises tests that force the present path, so the override cannot leak
+/// into a test running concurrently in the same process.
+#[cfg(test)]
+static PRESENT_DIRECT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Held for the whole body of any test that overrides a present-path knob or
+/// asserts on the direct/scratch/pooled counters. The knobs are process-wide
+/// statics, so a test that only locked while *forcing* an override would still
+/// race with a concurrent test's unforced arm - which is exactly the arm those
+/// tests assert took the default path.
+#[cfg(test)]
+struct PresentTestGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+fn present_test_guard() -> PresentTestGuard {
+    PresentTestGuard(
+        PRESENT_DIRECT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    )
+}
+
+/// Forces the owned-scratch present path for the lifetime of the guard, so a
+/// test can A/B it against the direct-write path on identical inputs.
+#[cfg(test)]
+struct PresentScratchOverride;
+
+#[cfg(test)]
+impl PresentScratchOverride {
+    fn forced(_serialised: &PresentTestGuard) -> Self {
+        PRESENT_DIRECT_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for PresentScratchOverride {
+    fn drop(&mut self) {
+        PRESENT_DIRECT_OVERRIDE.store(-1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Number of present fills that used the pooled arm (tests only).
+#[cfg(test)]
+fn pooled_fill_count() -> u64 {
+    PRESENT_POOLED_FILLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Lowers the fan-out gate for the lifetime of the guard so a test can drive
+/// the pooled fill at a cache size small enough to compare exhaustively.
+#[cfg(test)]
+struct PresentParallelOverride;
+
+#[cfg(test)]
+impl PresentParallelOverride {
+    fn bytes_per_worker(_serialised: &PresentTestGuard, bytes: usize) -> Self {
+        PRESENT_PARALLEL_BYTES_OVERRIDE.store(bytes, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for PresentParallelOverride {
+    fn drop(&mut self) {
+        PRESENT_PARALLEL_BYTES_OVERRIDE.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Serialises tests that force [`group_fusion_enabled`] on, so the override
+/// cannot leak into a test running concurrently in the same process.
+#[cfg(test)]
+static GROUP_FUSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Forces [`group_fusion_enabled`] on for the lifetime of the guard. Tests need
+/// this because the path is opt-in and the environment default latches in a
+/// `OnceLock`, so it cannot be toggled twice in one process.
+#[cfg(test)]
+struct GroupFusionOverride {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl GroupFusionOverride {
+    fn forced_on() -> Self {
+        let guard = GROUP_FUSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        GROUP_FUSION_OVERRIDE.store(1, std::sync::atomic::Ordering::Relaxed);
+        // Pin the traffic threshold too: the bit-identity tests pick a geometry
+        // that must reach the fused path, and the production threshold now
+        // depends on the runner's cache size.
+        GROUP_FUSED_MIN_KV_BYTES_PIN.store(8 << 20, std::sync::atomic::Ordering::Relaxed);
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(test)]
+impl Drop for GroupFusionOverride {
+    fn drop(&mut self) {
+        GROUP_FUSION_OVERRIDE.store(-1, std::sync::atomic::Ordering::Relaxed);
+        GROUP_FUSED_MIN_KV_BYTES_PIN.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Test-only pin for the per-head traffic threshold (`0` = unset). Without it
+/// every gate assertion would depend on the runner's last-level cache, so a
+/// CI host with a small L3 would silently take a different branch than the
+/// developer machine the test was written on.
+#[cfg(test)]
+static GROUP_FUSED_MIN_KV_BYTES_PIN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Pins the per-head traffic threshold for the lifetime of the guard.
+#[cfg(test)]
+struct FusedTrafficThresholdPin {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl FusedTrafficThresholdPin {
+    fn bytes_per_head(bytes: usize) -> Self {
+        let guard = GROUP_FUSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        GROUP_FUSED_MIN_KV_BYTES_PIN.store(bytes, std::sync::atomic::Ordering::Relaxed);
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(test)]
+impl Drop for FusedTrafficThresholdPin {
+    fn drop(&mut self) {
+        GROUP_FUSED_MIN_KV_BYTES_PIN.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether collapsing the decode schedule to one task per `(batch, kv_head)`
+/// still keeps every decode worker busy.
+///
+/// KV-group fusion trades parallel tasks for KV-cache traffic: it turns
+/// `batch * num_heads` independent attention rows into `batch * kv_num_heads`
+/// group tasks. Paired A/B on an 8-worker decode pool shows the trade is only
+/// worth taking while the pool stays saturated — starving it costs far more
+/// than the traffic saving is worth:
+///
+/// | geometry (heads/kv_heads/head_size) | fused tasks | fused vs per-head |
+/// |---|---|---|
+/// | 14/2/64   | 2 | 0.32x – 0.39x (2.6x slower) |
+/// | 28/4/128  | 4 | 0.59x – 0.75x (1.7x slower) |
+/// | 32/8/128  | 8 | 0.89x – 2.05x (length dependent) |
+///
+/// Repeating the sweep on a 16-worker pool (the width this host actually
+/// resolves for decode) reproduces the same shape: half-covered pools
+/// (8 fused tasks against 16 workers) lose 0.64x – 0.87x on short caches, while
+/// fully-covered pools (16 fused tasks) win 1.24x – 2.76x. Half coverage does
+/// recover on very long caches, but the sign is not stable across pool widths —
+/// it lost at every length measured on the 8-worker pool — so the gate stays at
+/// full coverage: "the fused task count still covers the workers".
+/// A single-worker scope (`worker_count <= 1`) has no parallelism to lose, so
+/// the traffic saving is taken unconditionally there.
+fn group_fusion_saturates_pool(fused_tasks: usize, worker_count: usize) -> bool {
+    fused_tasks >= worker_count
+}
+
+/// Last-level cache assumed when the host's cache topology cannot be read.
+///
+/// Guessing *small* here is the safe direction: the topology term can only make
+/// the gate stricter (see [`group_fused_min_kv_bytes`]), so an unreadable cache
+/// falls back to exactly the calibrated constant and nothing changes.
+const DEFAULT_LAST_LEVEL_CACHE_BYTES: usize = 0;
+
+/// Per-head threshold measured directly on the calibration host, and the floor
+/// the topology term may never go below.
+///
+/// The topology term can raise this but never lower it, so no host can end up
+/// admitting a working set that the calibration host measured as a loss.
+const GROUP_FUSED_CALIBRATED_MIN_KV_BYTES: usize = 8 << 20;
+
+/// Bytes of the largest cache level shared by this thread's CPU, read once from
+/// `/sys/devices/system/cpu/cpu0/cache/index*`.
+///
+/// std-only on purpose: `onnx-runtime-cpuinfo` is a cmake+bindgen FFI crate that
+/// nothing in the EP depends on, and pulling it in for one integer would put a
+/// native build step on the CPU EP's critical path.
+fn last_level_cache_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| probe_last_level_cache_bytes().unwrap_or(DEFAULT_LAST_LEVEL_CACHE_BYTES))
+}
+
+/// Largest `size` among the cache levels sysfs reports for cpu0. Returns `None`
+/// on any platform or container where the directory is absent or unparseable.
+fn probe_last_level_cache_bytes() -> Option<usize> {
+    let mut best = None;
+    for entry in std::fs::read_dir("/sys/devices/system/cpu/cpu0/cache").ok()? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path().join("size");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(bytes) = parse_cache_size(raw.trim()) {
+            best = Some(best.map_or(bytes, |current: usize| current.max(bytes)));
+        }
+    }
+    best
+}
+
+/// sysfs writes cache sizes as a decimal with a `K`/`M`/`G` suffix, e.g. `32768K`.
+fn parse_cache_size(raw: &str) -> Option<usize> {
+    let (digits, scale) = match raw.as_bytes().last()? {
+        b'K' | b'k' => (&raw[..raw.len() - 1], 1 << 10),
+        b'M' | b'm' => (&raw[..raw.len() - 1], 1 << 20),
+        b'G' | b'g' => (&raw[..raw.len() - 1], 1 << 30),
+        b'0'..=b'9' => (raw, 1),
+        _ => return None,
+    };
+    digits.parse::<usize>().ok()?.checked_mul(scale)
+}
+
+/// Test/calibration override for [`group_fused_min_kv_bytes`], in bytes.
+/// `ONNX_GENAI_GQA_GROUP_FUSED_MIN_KV_BYTES=0` forces the traffic gate open,
+/// which is how the crossover below was measured on a new host.
+fn group_fused_min_kv_bytes_override() -> Option<usize> {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("ONNX_GENAI_GQA_GROUP_FUSED_MIN_KV_BYTES")
+            .ok()?
+            .trim()
+            .parse::<usize>()
+            .ok()
+    })
+}
+
+/// Attended KV bytes per KV head (K and V, at the f32 width SDPA reads) below
+/// which KV-group fusion is not worth taking.
+///
+/// ```text
+/// max(GROUP_FUSED_CALIBRATED_MIN_KV_BYTES, last_level_cache_bytes / fused_tasks)
+/// ```
+///
+/// Re-reading a KV head `group` times is only expensive once those re-reads
+/// miss the last-level cache. While the *aggregate* concurrently attended KV
+/// (`bytes_per_head * fused_tasks`) still fits LLC, the repeat traffic is served
+/// at cache bandwidth, the fusion's saving is worth little, and its extra
+/// score-buffer traffic makes it a net loss. That is the topology term.
+///
+/// `fused_tasks` is `batch * kv_num_heads`, an *upper* bound on the KV heads
+/// whose working sets are live at once: the pool only runs `worker_count` of
+/// them concurrently, and `group_fusion_saturates_pool` guarantees
+/// `fused_tasks >= worker_count`. Dividing by the larger number yields a
+/// smaller - looser - topology term than the aggregate model strictly implies.
+/// That is deliberate: the floor is what makes this safe, not the model, and
+/// the measurements at `worker_count = 1` (0.85x - 0.94x at 8-32 MiB per head)
+/// are a win that the tighter `min(fused_tasks, worker_count)` divisor would
+/// have declined.
+///
+/// It is a `max`, not a replacement, and that asymmetry is deliberate. The
+/// 8 MiB figure is measured; the topology term is a *model*. Taking the larger
+/// of the two means the topology term can only ever make the gate **stricter**
+/// than the calibration, never looser, so no host can be talked into a working
+/// set the calibration measured as a loss. Concretely:
+///
+/// - On the calibration host (32 MiB LLC shared by 16 CPUs, 8 fused tasks for a
+///   batch-1 8-KV-head decode) the topology term is 4 MiB, the `max` keeps
+///   8 MiB, and behaviour is unchanged.
+/// - On a 256 MiB-LLC part the topology term is 32 MiB, so the gate stays shut
+///   through the 8-16 MiB range where the KV still fits that cache. This is the
+///   large-L3 failure mode the fixed constant could not express, and it is the
+///   whole reason for the change.
+///
+/// *Kernel sweep, 8-worker pool, `head_size = 128`* (ratio = fused / per-head,
+/// >1 is a fusion win) — the origin of the 8 MiB figure:
+///
+/// | attended KV per head | group 2 | group 3 | group 4 | group 6 | group 8 |
+/// |---|---|---|---|---|---|
+/// | 1 MiB (kv 1024)  | 1.05x | 0.94x | 1.12x | 0.83x | 0.81x |
+/// | 2 MiB (kv 2048)  | 1.00x | 1.18x | 1.11x | 0.81x | 0.83x |
+/// | 4 MiB (kv 4096)  | 0.96x | 1.18x | 0.89x | 0.83x | 0.82x |
+/// | 8 MiB (kv 8192)  | 1.32x | 1.44x | 1.41x | 1.11x | 1.00x |
+/// | 16 MiB (kv 16384)| 1.49x | 1.68x | 2.05x | 1.61x | 1.56x |
+///
+/// A model-level A/B against a real ORT CPU session (llama-3-8B head geometry,
+/// batch 1, the fused path forced on vs off in the same binary, interleaved,
+/// p50 of 3 trials x 8 runs) confirms the *reachable* range is a win and that
+/// the unreachable range is measurement noise:
+///
+/// | attended KV/head | t=1 | t=4 | t=8 | t=16 | t=32 |
+/// |---|---|---|---|---|---|
+/// | 8 MiB  | 0.93 | 0.93 | 0.91 | 1.01 | 0.99 |
+/// | 16 MiB | 0.94 | 0.84 | 0.85 | 1.02 | 0.99 |
+/// | 32 MiB | 0.85 | 0.78 | 0.78 | 1.00 | 1.01 |
+///
+/// (fused/unfused wall clock, lower is better. t=16 and t=32 are *controls*:
+/// `group_fusion_saturates_pool` closes the gate there for 8 fused tasks, so
+/// those columns must read 1.00 and do, to within 2%.)
+///
+/// Deliberately **not** claimed: that the topology term identifies the true
+/// crossover. A follow-up sweep with the traffic gate forced fully open put the
+/// 4 MiB per-head point at 0.91-1.19 across thread counts, i.e. inside a
+/// contention noise floor of +-9% measured from the no-op controls. 4 MiB is
+/// what `llc / fused_tasks` alone would admit on this host, and the measurement
+/// does not support admitting it - which is exactly why the `max` keeps 8 MiB.
+///
+/// `ONNX_GENAI_GQA_GROUP_FUSED_MIN_KV_BYTES` overrides the whole computation,
+/// including the floor, for recalibration on an unfamiliar host.
+fn group_fused_min_kv_bytes(fused_tasks: usize) -> usize {
+    #[cfg(test)]
+    {
+        let pinned = GROUP_FUSED_MIN_KV_BYTES_PIN.load(std::sync::atomic::Ordering::Relaxed);
+        if pinned != 0 {
+            return pinned;
+        }
+    }
+    if let Some(bytes) = group_fused_min_kv_bytes_override() {
+        return bytes;
+    }
+    min_kv_bytes_for(last_level_cache_bytes(), fused_tasks)
+}
+
+/// The threshold computation itself, split out from the environment and cache
+/// probe so it can be exercised with a synthetic cache size. On the calibration
+/// host the topology term is inert (4 MiB, below the floor), so testing it
+/// through [`group_fused_min_kv_bytes`] alone would prove nothing.
+fn min_kv_bytes_for(llc_bytes: usize, fused_tasks: usize) -> usize {
+    (llc_bytes / fused_tasks.max(1)).max(GROUP_FUSED_CALIBRATED_MIN_KV_BYTES)
+}
+
+/// KV tokens a decode step actually streams per head.
+///
+/// `local_window_size` caps the attended window independently of how long the
+/// cache is, so the traffic gate must see this rather than
+/// `total_sequence_length`: a sliding-window model at long context reads a
+/// short window out of a long cache and belongs on the per-head path.
+fn fused_attended_window(total_sequence_length: usize, local_window_size: i64) -> usize {
+    if local_window_size > 0 {
+        total_sequence_length.min(local_window_size as usize)
+    } else {
+        total_sequence_length
+    }
+}
+
+/// Whether the attended window is long enough for the fusion's traffic saving
+/// to beat its overhead. See [`group_fused_min_kv_bytes`].
+fn group_fusion_pays_for_traffic(
+    window: usize,
+    k_dim: usize,
+    v_dim: usize,
+    fused_tasks: usize,
+) -> bool {
+    window
+        .saturating_mul(k_dim.saturating_add(v_dim))
+        .saturating_mul(size_of::<f32>())
+        >= group_fused_min_kv_bytes(fused_tasks)
 }
 
 /// Contiguous `[start, end)` bounds of chunk `chunk` when the KV window
@@ -477,6 +948,14 @@ fn widen_rotary_prefix(op: &str, view: &TensorView, rows: usize, half: usize) ->
         crate::dtype::widen_f16_slice_into(src, &mut dst);
         return Ok(dst);
     }
+    if view.dtype == onnx_runtime_ir::DataType::BFloat16 && view.is_contiguous() {
+        // SAFETY: a validated contiguous BFloat16 view addresses `numel() >= count`
+        // 2-byte elements; BF16 widening is the exact high-half f32 bit shift.
+        let src = unsafe { std::slice::from_raw_parts(view.data_ptr::<u16>(), count) };
+        let mut dst = vec![0.0f32; count];
+        widen_bf16_slice_into(src, &mut dst);
+        return Ok(dst);
+    }
     if view.dtype == onnx_runtime_ir::DataType::Float32 && view.is_contiguous() {
         // SAFETY: a validated contiguous Float32 view addresses `numel() >= count`
         // initialized f32 elements.
@@ -632,6 +1111,185 @@ impl GroupQueryAttentionKernel {
         let pk_out = out_ptr(&outputs[1]);
         let pv_out = out_ptr(&outputs[2]);
         pk_in != 0 && pv_in != 0 && pk_in == pk_out && pv_in == pv_out && pk_in != pv_in
+    }
+
+    /// Decide whether the present KV cache can be *assembled directly inside the
+    /// graph's `present_key`/`present_value` outputs* instead of being built in
+    /// owned scratch and then memcpy-ed out.
+    ///
+    /// Without a present==past binding the copy path paid for the whole cache
+    /// twice every step: once widening past+current into two `Vec<f32>`, and
+    /// once copying those `Vec`s into the outputs. The second pass is pure
+    /// overhead — the widen can target the output buffers themselves, which is
+    /// exactly the traffic ONNX Runtime's CPU GroupQueryAttention pays.
+    ///
+    /// The gate is structural and conservative: both present outputs must be
+    /// present, contiguous, `Float32`, and exactly `present_len` elements, they
+    /// must not overlap each other, and they must not overlap (or even share an
+    /// allocation with) any tensor the fill reads — query/key/value/past. The
+    /// exact-alias case is handled earlier by [`Self::detect_inplace_kv`]; any
+    /// other overlap declines to the owned-scratch path, so behaviour is
+    /// byte-identical either way.
+    fn detect_direct_present(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        present_len: usize,
+    ) -> bool {
+        use onnx_runtime_ir::DataType::Float32;
+        #[cfg(test)]
+        if PRESENT_DIRECT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return false;
+        }
+        if outputs.len() < 3 || present_len == 0 {
+            return false;
+        }
+        for out in [&outputs[1], &outputs[2]] {
+            if out.is_absent()
+                || out.dtype != Float32
+                || !out.is_contiguous()
+                || out.numel() != present_len
+                || out.validate().is_err()
+            {
+                return false;
+            }
+        }
+        let present_bytes = present_len * size_of::<f32>();
+        let out_span = |out: &TensorMut| {
+            let base = (out.data.0 as *const u8).wrapping_add(out.byte_offset) as usize;
+            (base, base.saturating_add(present_bytes))
+        };
+        let k_span = out_span(&outputs[1]);
+        let v_span = out_span(&outputs[2]);
+        if k_span.0 == 0 || v_span.0 == 0 {
+            return false;
+        }
+        let overlaps = |a: (usize, usize), b: (usize, usize)| a.0 < b.1 && b.0 < a.1;
+        if overlaps(k_span, v_span) {
+            return false;
+        }
+        // The attention output is written *after* the present buffers on this
+        // path, the reverse of the owned-scratch order, so an aliased
+        // `outputs[0]` would change which write wins. Decline instead.
+        if !outputs[0].is_absent() {
+            let attn_bytes = outputs[0].numel() * outputs[0].dtype.byte_size().max(1);
+            let attn_base =
+                (outputs[0].data.0 as *const u8).wrapping_add(outputs[0].byte_offset) as usize;
+            let attn_span = (attn_base, attn_base.saturating_add(attn_bytes));
+            let attn_alloc = outputs[0].data.0 as usize;
+            if attn_alloc == outputs[1].data.0 as usize
+                || attn_alloc == outputs[2].data.0 as usize
+                || overlaps(k_span, attn_span)
+                || overlaps(v_span, attn_span)
+            {
+                return false;
+            }
+        }
+        let k_alloc = outputs[1].data.0 as usize;
+        let v_alloc = outputs[2].data.0 as usize;
+        for view in inputs.iter().take(5) {
+            if view.is_absent() {
+                continue;
+            }
+            // Same-allocation check first: it also covers strided views, whose
+            // `numel * byte_size` span can under-approximate their real extent.
+            let alloc = view.data.0 as usize;
+            if alloc == k_alloc || alloc == v_alloc {
+                return false;
+            }
+            let base = (view.data.0 as *const u8).wrapping_add(view.byte_offset) as usize;
+            let span = (
+                base,
+                base.saturating_add(view.numel() * view.dtype.byte_size().max(1)),
+            );
+            if overlaps(k_span, span) || overlaps(v_span, span) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Widen the past prefix and append the current step's K/V into `present_k`
+    /// and `present_v`, which are laid out BNSH-contiguous with
+    /// `present_sequence_length` rows per (batch, kv-head).
+    ///
+    /// Rows beyond a batch's logical `total` are padding that is emitted but
+    /// never attended; they are zeroed explicitly here so the caller never has
+    /// to pre-zero the whole buffer (which would defeat writing straight into a
+    /// graph output).
+    #[allow(clippy::too_many_arguments)]
+    fn fill_present(
+        &self,
+        present_k: &mut [f32],
+        present_v: &mut [f32],
+        past_key: Option<&PastCache>,
+        past_value: Option<&PastCache>,
+        k: &Bhsd,
+        v: &Bhsd,
+        past_lengths: &[usize],
+        totals: &[usize],
+        present_sequence_length: usize,
+        cache_dim: usize,
+    ) {
+        let rows = past_lengths.len() * self.kv_num_heads;
+        let row_len = present_sequence_length * cache_dim;
+        // `present_*` and the past caches are both BNSH-contiguous, so for a
+        // fixed (batch, kv-head) the `[s, d]` block is a single contiguous run
+        // in each: widen the whole past prefix straight into `present` (F16C for
+        // f16), append the current step after it, then zero whatever unattended
+        // capacity is left. Each row touches a disjoint destination range, which
+        // is what lets the fan-out below be safe.
+        let fill_row = |row_index: usize, dst: &mut [f32], past: Option<&PastCache>, cur: &Bhsd| {
+            let b = row_index / self.kv_num_heads;
+            let past_len = past_lengths[b];
+            if past_len > 0 {
+                let cache = past.expect("a nonzero past length implies a past cache");
+                let src = row_index * cache.seq * cache_dim;
+                cache.widen_run(src, &mut dst[..past_len * cache_dim]);
+            }
+            let cur_len = cur.seq * cache_dim;
+            let cur_start = past_len * cache_dim;
+            let src_cur = row_index * cur.seq * cache_dim;
+            dst[cur_start..cur_start + cur_len]
+                .copy_from_slice(&cur.data[src_cur..src_cur + cur_len]);
+            let tail_start = totals[b] * cache_dim;
+            if tail_start < row_len {
+                dst[tail_start..row_len].fill(0.0);
+            }
+        };
+
+        // The fill is pure memory traffic, so it only pays to fan out once the
+        // cache is large enough that the copy dominates the dispatch. Below the
+        // threshold a single-threaded pass is both faster and cheaper.
+        let workers = crate::kernels::matmul_nbits::active_decode_worker_count().max(1);
+        let per_worker_bytes = row_len * size_of::<f32>() * rows.div_ceil(workers.min(rows.max(1)));
+        if rows > 1 && workers > 1 && per_worker_bytes >= min_parallel_present_bytes_per_worker() {
+            #[cfg(test)]
+            PRESENT_POOLED_FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::kernels::matmul_nbits::decode_parallel_output_row_blocks(
+                present_k,
+                row_len,
+                rows,
+                |row_index, dst| fill_row(row_index, dst, past_key, k),
+            );
+            crate::kernels::matmul_nbits::decode_parallel_output_row_blocks(
+                present_v,
+                row_len,
+                rows,
+                |row_index, dst| fill_row(row_index, dst, past_value, v),
+            );
+        } else {
+            for row_index in 0..rows {
+                let base = row_index * row_len;
+                fill_row(row_index, &mut present_k[base..base + row_len], past_key, k);
+                fill_row(
+                    row_index,
+                    &mut present_v[base..base + row_len],
+                    past_value,
+                    v,
+                );
+            }
+        }
     }
 }
 
@@ -891,8 +1549,10 @@ impl Kernel for GroupQueryAttentionKernel {
             past_key.as_ref(),
         );
 
-        // Owned present storage backs only the copy path; the in-place path
-        // writes straight into the aliased output buffer and never touches these.
+        // Owned present storage backs only the fall-back copy path; the in-place
+        // and direct-write paths fill the aliased/graph output buffers and never
+        // touch these.
+        let direct_present = !in_place && self.detect_direct_present(inputs, outputs, present_len);
         let owned_present_k: Vec<f32>;
         let owned_present_v: Vec<f32>;
         let (present_k, present_v): (&[f32], &[f32]) = if in_place {
@@ -926,58 +1586,60 @@ impl Kernel for GroupQueryAttentionKernel {
                 }
             }
             (&*present_k, &*present_v)
+        } else if direct_present {
+            PRESENT_DIRECT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // No present==past binding, but the graph's present outputs are
+            // plain contiguous f32 buffers that overlap nothing we read: build
+            // the cache straight inside them and skip the trailing round-trip.
+            let pk_ptr = outputs[1].data_ptr_mut::<f32>();
+            let pv_ptr = outputs[2].data_ptr_mut::<f32>();
+            // SAFETY: `detect_direct_present` proved outputs[1]/[2] are valid,
+            // contiguous, non-absent f32 buffers of exactly `present_len`
+            // elements that do not overlap each other or any input this kernel
+            // reads. They are graph outputs, exclusively owned by this kernel
+            // invocation. `fill_present` writes every element in
+            // [0, present_sequence_length) per (batch, kv-head) before any read.
+            let present_k = unsafe { std::slice::from_raw_parts_mut(pk_ptr, present_len) };
+            let present_v = unsafe { std::slice::from_raw_parts_mut(pv_ptr, present_len) };
+            self.fill_present(
+                present_k,
+                present_v,
+                past_key.as_ref(),
+                past_value.as_ref(),
+                &k,
+                &v,
+                &past_lengths,
+                &totals,
+                present_sequence_length,
+                cache_dim,
+            );
+            (&*present_k, &*present_v)
         } else {
-            // A "tail" is any padding row beyond a batch's logical `total` that
-            // is emitted into the present output but never attended; those rows
-            // must be zero. In steady decode every batch's `total` exactly fills
-            // `present_sequence_length`, so the per-(b,h) loop below overwrites
-            // every element and pre-zeroing is pure waste — skip it in that case.
-            let has_tail = totals.iter().any(|&t| t < present_sequence_length);
-            let (mut present_k, mut present_v) = if has_tail {
-                (vec![0.0f32; present_len], vec![0.0f32; present_len])
-            } else {
-                let mut present_k = Vec::<f32>::with_capacity(present_len);
-                let mut present_v = Vec::<f32>::with_capacity(present_len);
-                // SAFETY: `!has_tail` ⇒ every batch's `total == present_sequence_length`,
-                // so for each `(b, h)` the loop below writes the past prefix
-                // `[0, past_len)` and the current span `[past_len, total)` =
-                // `[0, present_sequence_length)` rows, i.e. every element of both
-                // buffers, before any read (attention and the output narrow both
-                // run strictly after this loop). No uninitialized element is observed.
-                unsafe {
-                    present_k.set_len(present_len);
-                    present_v.set_len(present_len);
-                }
-                (present_k, present_v)
-            };
-            for (b, &past_len) in past_lengths.iter().enumerate() {
-                for h in 0..self.kv_num_heads {
-                    let head = b * self.kv_num_heads + h;
-                    let dst_base = head * present_sequence_length * cache_dim;
-                    // `present_k`/`present_v` and the past caches are both
-                    // BNSH-contiguous, so for a fixed (b, h) the `[s, d]` block is
-                    // a single contiguous run in each: widen the whole past prefix
-                    // directly into `present` (F16C for f16), skipping the separate
-                    // owned widen + f32 copy the decode path used to pay every token.
-                    if past_len > 0 {
-                        let copy = past_len * cache_dim;
-                        let pk = past_key.as_ref().unwrap();
-                        let pv = past_value.as_ref().unwrap();
-                        let src = head * pk.seq * cache_dim;
-                        pk.widen_run(src, &mut present_k[dst_base..dst_base + copy]);
-                        pv.widen_run(src, &mut present_v[dst_base..dst_base + copy]);
-                    }
-                    // Append the current token(s) directly after the past prefix;
-                    // the current K/V blocks are contiguous in `[s, d]` as well.
-                    let cur = k.seq * cache_dim;
-                    let dst_cur = dst_base + past_len * cache_dim;
-                    let src_cur = head * k.seq * cache_dim;
-                    present_k[dst_cur..dst_cur + cur]
-                        .copy_from_slice(&k.data[src_cur..src_cur + cur]);
-                    present_v[dst_cur..dst_cur + cur]
-                        .copy_from_slice(&v.data[src_cur..src_cur + cur]);
-                }
+            PRESENT_SCRATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // `fill_present` writes every attended row and explicitly zeroes the
+            // unattended tail, so the scratch never needs pre-zeroing.
+            let mut present_k = Vec::<f32>::with_capacity(present_len);
+            let mut present_v = Vec::<f32>::with_capacity(present_len);
+            // SAFETY: `fill_present` writes all `present_len` elements of both
+            // buffers — the past prefix, the current span and the zeroed tail
+            // together cover [0, present_sequence_length) for every (batch,
+            // kv-head) — before attention or the output narrow reads them.
+            unsafe {
+                present_k.set_len(present_len);
+                present_v.set_len(present_len);
             }
+            self.fill_present(
+                &mut present_k,
+                &mut present_v,
+                past_key.as_ref(),
+                past_value.as_ref(),
+                &k,
+                &v,
+                &past_lengths,
+                &totals,
+                present_sequence_length,
+                cache_dim,
+            );
             owned_present_k = present_k;
             owned_present_v = present_v;
             (&owned_present_k[..], &owned_present_v[..])
@@ -1027,13 +1689,80 @@ impl Kernel for GroupQueryAttentionKernel {
         let attention_work = attention_rows
             .saturating_mul(total_sequence_length)
             .saturating_mul(cache_dim);
+        let worker_count = crate::kernels::matmul_nbits::active_decode_worker_count();
+        // KV-group fusion (M=1 decode): every query head in a GQA group attends
+        // the *same* KV head over the *same* window, so scoring them one row at
+        // a time streams the KV cache `group` times per layer per token. At M=1
+        // the window is a GEMV (~2 flops per loaded float), so that repeat
+        // traffic — not the arithmetic — is the cost. `sdpa_decode_group` runs
+        // the whole group in one pass over K and V, cutting KV bytes by `group`
+        // while performing bit-identical arithmetic per head.
+        //
+        // The fusion costs parallelism: it collapses `batch * num_heads` tasks
+        // into `batch * kv_num_heads`. Measured on an 8-worker decode pool,
+        // starving the pool dominates the traffic saving by a wide margin — a
+        // 2-KV-head geometry runs ~2.6x *slower* fused, a 4-KV-head one ~1.7x
+        // slower. And while the attended KV still fits the last-level cache the
+        // repeat reads are cheap, so the saving does not pay for the fused
+        // path's score-buffer traffic. Both conditions must hold; see
+        // `group_fusion_saturates_pool` and `group_fusion_pays_for_traffic`.
+        //
+        // Measured end to end on Qwen3-0.6B-int4 at ~11.8k context with
+        // `ONNX_GENAI_CPU_DECODE_THREADS=8` (the only batch-1 configuration on a
+        // 16-core host where both gates open): median per-pair ratio 1.31x over
+        // 5 interleaved trials, token output identical in every run. Note this
+        // does not beat the *default* 16-worker per-head config (129 ms/token) —
+        // narrowing the pool to reach the gate costs more than the fusion
+        // returns at batch 1. It is a win within a given decode width, not a new
+        // best configuration, which is part of why the path is opt-in.
+        let attended_window = fused_attended_window(total_sequence_length, self.local_window_size);
+        let group_fused = q.seq == 1
+            && group > 1
+            && group_fusion_saturates_pool(q.batch * self.kv_num_heads, worker_count)
+            && group_fusion_pays_for_traffic(
+                attended_window,
+                cache_dim,
+                v.dim,
+                q.batch * self.kv_num_heads,
+            )
+            && group_fusion_enabled();
+        let compute_group = |b: usize, kvh: usize, out_block: &mut [f32], scores: &mut Vec<f32>| {
+            let causal_limit = query_starts[b];
+            let local_start = if self.local_window_size > 0 {
+                (causal_limit + 1).saturating_sub(self.local_window_size as usize)
+            } else {
+                0
+            };
+            let q_base = (b * self.num_heads + kvh * group) * cache_dim;
+            let q_group = &q.data[q_base..q_base + group * cache_dim];
+            let kv_head_base = (b * self.kv_num_heads + kvh) * present_sequence_length;
+            let k_head = &present_k
+                [kv_head_base * cache_dim..(kv_head_base + present_sequence_length) * cache_dim];
+            let v_head =
+                &present_v[kv_head_base * v.dim..(kv_head_base + present_sequence_length) * v.dim];
+            sdpa_decode_group(
+                q_group,
+                k_head,
+                v_head,
+                present_sequence_length,
+                group,
+                cache_dim,
+                v.dim,
+                local_start,
+                causal_limit + 1,
+                scale,
+                (self.softcap != 0.0).then_some(self.softcap),
+                SoftmaxExp::F64Intermediate,
+                out_block,
+                scores,
+            );
+        };
         // Flash-decoding (split-KV): when the attended window is long and the
         // decode pool has more workers than query heads, the per-head schedule
         // leaves cores idle (it parallelizes only over `attention_rows`). Split
         // each head's window into `split_count` contiguous KV chunks so those
         // idle cores stream the KV cache in parallel, then combine the per-chunk
         // softmax partials with the online-rescale reduction.
-        let worker_count = crate::kernels::matmul_nbits::active_decode_worker_count();
         let split_count = if attention_split_enabled()
             && attention_rows >= 1
             && worker_count > attention_rows
@@ -1121,6 +1850,42 @@ impl Kernel for GroupQueryAttentionKernel {
                     &mut y_bhsd[row_index * v_head_size..(row_index + 1) * v_head_size],
                 );
             }
+        } else if group_fused {
+            // One task per `(batch, kv_head)` group; each writes the `group`
+            // contiguous output rows of that group (`q_seq == 1`, so a query
+            // head's single output row sits at `(b * num_heads + qh) * v.dim`
+            // and the group's rows are adjacent).
+            let group_rows = q.batch * self.kv_num_heads;
+            GROUP_FUSED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if group_rows > 1 && attention_work >= MIN_PARALLEL_ATTENTION_WORK {
+                // One `group * window` score buffer per *worker*, not per task:
+                // the closure runs once per group, so allocating inside it
+                // would put a multi-hundred-KiB malloc in the decode hot loop.
+                thread_local! {
+                    static GROUP_SCORES: std::cell::RefCell<Vec<f32>> =
+                        const { std::cell::RefCell::new(Vec::new()) };
+                }
+                crate::kernels::matmul_nbits::decode_parallel_output_row_blocks(
+                    &mut y_bhsd,
+                    group * v.dim,
+                    group_rows,
+                    |row_index, out_block| {
+                        let b = row_index / self.kv_num_heads;
+                        let kvh = row_index % self.kv_num_heads;
+                        GROUP_SCORES.with(|scores| {
+                            compute_group(b, kvh, out_block, &mut scores.borrow_mut());
+                        });
+                    },
+                );
+            } else {
+                let mut scores = Vec::new();
+                for b in 0..q.batch {
+                    for kvh in 0..self.kv_num_heads {
+                        let base = (b * self.kv_num_heads + kvh) * group * v.dim;
+                        compute_group(b, kvh, &mut y_bhsd[base..base + group * v.dim], &mut scores);
+                    }
+                }
+            }
         } else if attention_rows > 1 && attention_work >= MIN_PARALLEL_ATTENTION_WORK {
             // Route through the active decode pool (the same resident workers the
             // MatMulNBits projections use). Under the persistent SPMD scope this
@@ -1177,10 +1942,10 @@ impl Kernel for GroupQueryAttentionKernel {
         } else {
             write_dense_f32_narrow("GroupQueryAttention", &mut outputs[0], &output)?;
         }
-        // In the in-place fast path the present outputs ARE the past buffer and
-        // were already updated in place above, so re-emitting them would be a
-        // redundant self-copy — skip it. The copy path materializes them here.
-        if !in_place {
+        // In the in-place and direct-write paths the present outputs ARE the
+        // buffers we just filled, so re-emitting them would be a redundant
+        // self-copy — skip it. Only the owned-scratch path materializes here.
+        if !in_place && !direct_present {
             if outputs.len() >= 2 {
                 if decode_fast_write {
                     write_decode_output(&mut outputs[1], present_k)?;
@@ -1207,6 +1972,19 @@ impl Kernel for GroupQueryAttentionKernel {
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
+    }
+
+    /// GQA FLOPs are `4 * head_size * batch * num_heads * seq_q * seq_k`
+    /// (see [`crate::kernels::flops::gqa_flops`]). We deliberately return `None`:
+    /// the dominant factor `seq_k` is the KV-cache occupancy, which the op
+    /// receives as the runtime **value** inputs `seqlens_k` (input 5) and
+    /// `total_sequence_length` (input 6), not as a static tensor shape. It
+    /// therefore cannot be known at kernel-build time. Per issue #995 the honest
+    /// representation of an unmeasurable quantity is `None`, never a fabricated
+    /// number; the cost model computes the real figure via `gqa_flops` once the
+    /// KV length is known at placement/runtime.
+    fn estimated_flops(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -2775,6 +3553,7 @@ mod tests {
         for (i, slot) in data.iter_mut().enumerate() {
             *slot = (i as f32) * 0.25 - 3.0;
         }
+
         for slot in data.iter_mut().skip(rows * half_dim) {
             *slot = f32::NAN;
         }
@@ -2783,6 +3562,31 @@ mod tests {
         assert_eq!(prefix.len(), rows * half_dim);
         for k in 0..rows * half_dim {
             let expected = half::f16::from_f32(data[k]).to_f32();
+            assert_eq!(prefix[k], expected, "prefix element {k}");
+        }
+        assert!(
+            prefix.iter().all(|v| v.is_finite()),
+            "poisoned tail rows leaked into the widened prefix"
+        );
+    }
+
+    #[test]
+    fn widen_rotary_prefix_bounds_bf16_to_row_prefix() {
+        let half_dim = 3usize;
+        let cache_rows = 40usize;
+        let rows = 4usize;
+        let mut data = vec![0.0f32; cache_rows * half_dim];
+        for (i, slot) in data.iter_mut().enumerate() {
+            *slot = (i as f32) * 0.25 - 3.0;
+        }
+        for slot in data.iter_mut().skip(rows * half_dim) {
+            *slot = f32::NAN;
+        }
+        let cache = Owned::bf16(&[cache_rows, half_dim], &data);
+        let prefix = super::widen_rotary_prefix("test", &cache.view(), rows, half_dim).unwrap();
+        assert_eq!(prefix.len(), rows * half_dim);
+        for k in 0..rows * half_dim {
+            let expected = half::bf16::from_f32(data[k]).to_f32();
             assert_eq!(prefix[k], expected, "prefix element {k}");
         }
         assert!(
@@ -3050,6 +3854,356 @@ mod tests {
                 (actual - expected).abs()
             );
         }
+    }
+
+    /// The KV-group-fused decode path must be *bit-identical* to the
+    /// per-query-head path and must actually be reached.
+    ///
+    /// The path is opt-in, so the test forces it on for its own duration. The
+    /// A/B is then driven through the reachability gate: the same inputs run on
+    /// a decode pool the fused schedule saturates (`batch * kv_num_heads >=
+    /// workers`) and on one it does not. The first must take the fused branch —
+    /// asserted against [`group_fused_count`], so the test cannot pass
+    /// vacuously — and both must agree to the last bit.
+    #[test]
+    fn group_fused_decode_is_bit_identical_to_per_head_decode() {
+        let _fusion = GroupFusionOverride::forced_on();
+        // Long enough that `group_fusion_pays_for_traffic` opens the gate
+        // (8 MiB of attended K+V per KV head at f32 width).
+        const PAST_SEQUENCE_LENGTH: usize = 8_192;
+        const TOTAL_SEQUENCE_LENGTH: usize = PAST_SEQUENCE_LENGTH + 1;
+        const QUERY_HEAD_COUNT: usize = 4;
+        const KEY_VALUE_HEAD_COUNT: usize = 2;
+        const HEAD_WIDTH: usize = 128;
+
+        let query: Vec<f32> = (0..QUERY_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0x7f01))
+            .collect();
+        let current_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0x7f02))
+            .collect();
+        let current_value: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0x7f03))
+            .collect();
+        let past_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * PAST_SEQUENCE_LENGTH * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0x7f04))
+            .collect();
+        let past_value: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * PAST_SEQUENCE_LENGTH * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0x7f05))
+            .collect();
+
+        // `local_window_size` and `softcap` are set so the fused path's masking
+        // and softcap branches are covered too, not just the plain causal case.
+        let run = |workers: usize| -> Vec<f32> {
+            let mut output = Owned::zeros_f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH]);
+            let mut present_key =
+                Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, TOTAL_SEQUENCE_LENGTH, HEAD_WIDTH]);
+            let mut present_value =
+                Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, TOTAL_SEQUENCE_LENGTH, HEAD_WIDTH]);
+            let kernel_attrs = [
+                ("local_window_size", Attribute::Int(8_192)),
+                ("softcap", Attribute::Float(30.0)),
+            ];
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .expect("test decode pool")
+                .install(|| {
+                    let kernel = gqa_kernel_with_heads(
+                        QUERY_HEAD_COUNT as i64,
+                        KEY_VALUE_HEAD_COUNT as i64,
+                        &kernel_attrs,
+                    );
+                    kernel
+                        .execute(
+                            &[
+                                Owned::f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH], &query).view(),
+                                Owned::f32(
+                                    &[1, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH],
+                                    &current_key,
+                                )
+                                .view(),
+                                Owned::f32(
+                                    &[1, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH],
+                                    &current_value,
+                                )
+                                .view(),
+                                Owned::f32(
+                                    &[1, KEY_VALUE_HEAD_COUNT, PAST_SEQUENCE_LENGTH, HEAD_WIDTH],
+                                    &past_key,
+                                )
+                                .view(),
+                                Owned::f32(
+                                    &[1, KEY_VALUE_HEAD_COUNT, PAST_SEQUENCE_LENGTH, HEAD_WIDTH],
+                                    &past_value,
+                                )
+                                .view(),
+                                Owned::i32(&[1], &[PAST_SEQUENCE_LENGTH as i32]).view(),
+                                Owned::i32(&[], &[TOTAL_SEQUENCE_LENGTH as i32]).view(),
+                            ],
+                            &mut [
+                                output.view_mut(),
+                                present_key.view_mut(),
+                                present_value.view_mut(),
+                            ],
+                        )
+                        .unwrap();
+                });
+            output.to_f32()
+        };
+
+        // `KEY_VALUE_HEAD_COUNT` fused tasks against 2 workers: gate open.
+        let before = group_fused_count();
+        let fused = run(2);
+        assert!(
+            group_fused_count() > before,
+            "fused decode path was never reached — the A/B would be vacuous"
+        );
+        // Same tasks against more workers than the fused schedule can fill:
+        // gate closed, per-query-head schedule.
+        let per_head = run(KEY_VALUE_HEAD_COUNT * 2);
+
+        assert_eq!(
+            fused.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            per_head.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "KV-group fusion must not change a single bit of the decode output"
+        );
+    }
+
+    /// The fused schedule is calibrated on one host's LLC and has no
+    /// model-level evidence for the batch >= 2 regime its gate admits, so it
+    /// must stay opt-in. Guards against someone flipping the default back.
+    #[test]
+    fn group_fusion_is_opt_in_by_default() {
+        if std::env::var("ONNX_GENAI_GQA_GROUP_FUSED").is_ok() {
+            // The caller opted in for this process; nothing to assert.
+            return;
+        }
+        let _serialise = GROUP_FUSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !group_fusion_enabled(),
+            "KV-group-fused decode must stay opt-in (ONNX_GENAI_GQA_GROUP_FUSED=1)"
+        );
+    }
+
+    /// The fusion trades parallel tasks for KV traffic, so it must only engage
+    /// while the collapsed schedule still covers every decode worker.
+    #[test]
+    fn group_fusion_gate_requires_a_saturated_decode_pool() {
+        // Qwen2.5-0.5B (2 KV heads) and Qwen2.5-7B (4) starve an 8-wide pool.
+        assert!(!group_fusion_saturates_pool(2, 8));
+        assert!(!group_fusion_saturates_pool(4, 8));
+        // Llama-3.1-8B / Qwen3-0.6B (8 KV heads) fill it exactly.
+        assert!(group_fusion_saturates_pool(8, 8));
+        // Batching restores saturation for a narrow-KV model.
+        assert!(group_fusion_saturates_pool(4 * 2, 8));
+        // A single-worker scope has no parallelism to lose.
+        assert!(group_fusion_saturates_pool(2, 1));
+    }
+
+    /// Below the last-level-cache crossover the repeat KV reads the fusion
+    /// removes are served from cache, so the fusion must stay off. The
+    /// threshold is `llc / fused_tasks`, so it is stated here relative to the
+    /// host's own reported cache rather than as a hard-coded byte count.
+    #[test]
+    fn group_fusion_gate_requires_out_of_cache_kv() {
+        const TASKS: usize = 8;
+        let _unpinned = FusedTrafficThresholdPin::bytes_per_head(0);
+        let per_head = group_fused_min_kv_bytes(TASKS);
+        // head_size 128 streams 1 KiB of K+V per attended token.
+        // Round the two sides independently so the assertions stay exact even
+        // if a host reports a cache size that is not a whole number of KiB per
+        // fused task.
+        let open_tokens = per_head.div_ceil(1024);
+        let closed_tokens = per_head.saturating_sub(1) / 1024;
+        assert!(!group_fusion_pays_for_traffic(
+            closed_tokens,
+            128,
+            128,
+            TASKS
+        ));
+        assert!(group_fusion_pays_for_traffic(open_tokens, 128, 128, TASKS));
+        // head_size 64 needs twice the window for the same bytes.
+        assert!(!group_fusion_pays_for_traffic(closed_tokens, 64, 64, TASKS));
+        assert!(group_fusion_pays_for_traffic(
+            2 * open_tokens,
+            64,
+            64,
+            TASKS
+        ));
+        // Asymmetric K/V head widths count both.
+        assert!(group_fusion_pays_for_traffic(open_tokens, 128, 192, TASKS));
+        // Degenerate inputs must not overflow into a spurious open gate.
+        assert!(!group_fusion_pays_for_traffic(0, 128, 128, TASKS));
+        assert!(group_fusion_pays_for_traffic(usize::MAX, 128, 128, TASKS));
+        assert!(group_fusion_pays_for_traffic(usize::MAX, 128, 128, 0));
+    }
+
+    /// The topology term may only ever *tighten* the calibrated threshold. This
+    /// is the safety property the whole change rests on: an unreadable cache,
+    /// an absurd cache, a zero task count - none of them may produce a gate
+    /// looser than the 8 MiB that was actually measured.
+    #[test]
+    fn topology_term_can_only_tighten_the_calibrated_threshold() {
+        let _unpinned = FusedTrafficThresholdPin::bytes_per_head(0);
+        for tasks in [0usize, 1, 2, 3, 8, 16, 64, 1024, usize::MAX] {
+            let threshold = group_fused_min_kv_bytes(tasks);
+            assert!(
+                threshold >= GROUP_FUSED_CALIBRATED_MIN_KV_BYTES,
+                "tasks={tasks} produced {threshold}, looser than the calibration"
+            );
+            // ...independent of whatever this host reports, including caches
+            // far larger and far smaller than any real part.
+            for llc in [0usize, 1, 16 << 10, 32 << 20, 256 << 20, usize::MAX] {
+                let threshold = min_kv_bytes_for(llc, tasks);
+                assert!(
+                    threshold >= GROUP_FUSED_CALIBRATED_MIN_KV_BYTES,
+                    "llc={llc} tasks={tasks} produced {threshold}"
+                );
+            }
+        }
+        // Monotone in the task count: more concurrent heads never demands a
+        // *larger* per-head working set.
+        let mut previous = usize::MAX;
+        for tasks in [1usize, 2, 4, 8, 16, 32] {
+            let threshold = group_fused_min_kv_bytes(tasks);
+            assert!(threshold <= previous, "threshold grew at tasks={tasks}");
+            previous = threshold;
+        }
+    }
+
+    /// Falsifier for the losing side, driven through the real computation
+    /// rather than only the test pin. On a large last-level cache the fixed
+    /// 8 MiB constant opened the gate while the aggregate KV still fit cache -
+    /// the regime the kernel sweep measures at 0.64x - 0.9x - and the topology
+    /// term exists to keep it shut there.
+    ///
+    /// The calibration host's own term is inert (32 MiB / 8 tasks = 4 MiB,
+    /// below the floor), so a synthetic cache size is the only way to exercise
+    /// it. Deleting the topology term makes this test fail.
+    #[test]
+    fn a_large_last_level_cache_keeps_the_gate_shut_inside_cache() {
+        const HUGE_LLC: usize = 256 << 20;
+        // 256 MiB LLC / 8 fused tasks = 32 MiB per head, four times the floor.
+        assert_eq!(min_kv_bytes_for(HUGE_LLC, 8), 32 << 20);
+        // 16 MiB per head still fits that cache in aggregate, so the fusion
+        // must be declined even though it clears the calibrated 8 MiB...
+        assert!(16 << 20 >= min_kv_bytes_for(0, 8));
+        assert!(16 << 20 < min_kv_bytes_for(HUGE_LLC, 8));
+        // ...and 32 MiB per head no longer fits, so it is admitted.
+        assert!(32 << 20 >= min_kv_bytes_for(HUGE_LLC, 8));
+
+        // The same statement end to end through the gate.
+        let _pin = FusedTrafficThresholdPin::bytes_per_head(min_kv_bytes_for(HUGE_LLC, 8));
+        // 16 MiB per head (16384 tokens at head_size 128) still fits that
+        // cache in aggregate, so the fusion must decline even though it clears
+        // the calibrated 8 MiB.
+        assert!(!group_fusion_pays_for_traffic(16_384, 128, 128, 8));
+        // 32 MiB per head no longer fits, so it opens.
+        assert!(group_fusion_pays_for_traffic(32_768, 128, 128, 8));
+    }
+
+    /// The topology term must halve when the concurrent task count doubles and
+    /// must be inert whenever it lands below the measured floor. Checked
+    /// against synthetic cache sizes so the result does not depend on the
+    /// runner's own topology.
+    #[test]
+    fn the_topology_term_scales_with_tasks_and_never_goes_below_the_floor() {
+        const HUGE_LLC: usize = 256 << 20;
+        assert_eq!(min_kv_bytes_for(HUGE_LLC, 4), 64 << 20);
+        assert_eq!(min_kv_bytes_for(HUGE_LLC, 8), 32 << 20);
+        assert_eq!(min_kv_bytes_for(HUGE_LLC, 16), 16 << 20);
+        // 256 / 32 = 8 MiB, exactly the floor; beyond that the floor wins.
+        assert_eq!(
+            min_kv_bytes_for(HUGE_LLC, 32),
+            GROUP_FUSED_CALIBRATED_MIN_KV_BYTES
+        );
+        assert_eq!(
+            min_kv_bytes_for(HUGE_LLC, 64),
+            GROUP_FUSED_CALIBRATED_MIN_KV_BYTES
+        );
+        // The calibration host: 32 MiB shared per CCX, 8 fused tasks for a
+        // batch-1 8-KV-head decode. The term is 4 MiB, so the floor holds and
+        // the measured behaviour is unchanged - the claim this PR rests on.
+        assert_eq!(
+            min_kv_bytes_for(32 << 20, 8),
+            GROUP_FUSED_CALIBRATED_MIN_KV_BYTES
+        );
+        // Degenerate inputs must not divide by zero or wrap.
+        assert_eq!(min_kv_bytes_for(HUGE_LLC, 0), HUGE_LLC);
+        assert_eq!(
+            min_kv_bytes_for(usize::MAX, usize::MAX),
+            GROUP_FUSED_CALIBRATED_MIN_KV_BYTES
+        );
+    }
+
+    /// The threshold has to be reproducible from the host's reported topology,
+    /// not from whatever a benchmark happened to leave in the environment.
+    #[test]
+    fn last_level_cache_probe_is_sane_and_parses_sysfs_units() {
+        let _unpinned = FusedTrafficThresholdPin::bytes_per_head(0);
+        assert_eq!(parse_cache_size("32768K"), Some(32 << 20));
+        assert_eq!(parse_cache_size("1024K"), Some(1 << 20));
+        assert_eq!(parse_cache_size("8M"), Some(8 << 20));
+        assert_eq!(parse_cache_size("1G"), Some(1 << 30));
+        assert_eq!(parse_cache_size("4096"), Some(4096));
+        assert_eq!(parse_cache_size(""), None);
+        assert_eq!(parse_cache_size("K"), None);
+        assert_eq!(parse_cache_size("12X"), None);
+        assert_eq!(parse_cache_size("99999999999999999999K"), None);
+        // Whatever the host reports, it must either be the documented
+        // "unreadable" sentinel - macOS, Windows and restricted containers have
+        // no `/sys/devices/system/cpu` at all - or a plausible cache size
+        // between an L1 and a terabyte. Asserting only the latter would fail
+        // CI on every non-Linux runner.
+        let llc = last_level_cache_bytes();
+        assert!(
+            llc == DEFAULT_LAST_LEVEL_CACHE_BYTES || (16 << 10..=1 << 40).contains(&llc),
+            "implausible last-level cache {llc}"
+        );
+        // The sentinel must be zero, so that it collapses to exactly the
+        // calibrated constant at *every* task count. Anchoring only the
+        // collapse at one task count would admit a non-zero sentinel that
+        // silently changes the fallback for small task counts.
+        assert_eq!(DEFAULT_LAST_LEVEL_CACHE_BYTES, 0);
+        for tasks in [0usize, 1, 2, 8, usize::MAX] {
+            assert_eq!(
+                min_kv_bytes_for(DEFAULT_LAST_LEVEL_CACHE_BYTES, tasks),
+                GROUP_FUSED_CALIBRATED_MIN_KV_BYTES,
+                "sentinel must not depend on the task count"
+            );
+        }
+    }
+
+    /// A sliding-window model streams its window, not its cache, so the traffic
+    /// gate must be fed the attended window — otherwise a long cache opens the
+    /// gate for a short window that is well below the crossover.
+    #[test]
+    fn fused_traffic_gate_sees_the_local_window_not_the_cache_length() {
+        // No local window: the whole cache is attended.
+        assert_eq!(fused_attended_window(8_192, 0), 8_192);
+        assert_eq!(fused_attended_window(8_192, -1), 8_192);
+        // A short sliding window over a long cache caps the attended tokens...
+        assert_eq!(fused_attended_window(32_768, 4_096), 4_096);
+        // ...and that is what closes the gate. Pin the threshold so the
+        // assertion does not depend on the runner's last-level cache.
+        let _pin = FusedTrafficThresholdPin::bytes_per_head(8 << 20);
+        assert!(group_fusion_pays_for_traffic(
+            fused_attended_window(32_768, 0),
+            128,
+            128,
+            8
+        ));
+        assert!(!group_fusion_pays_for_traffic(
+            fused_attended_window(32_768, 4_096),
+            128,
+            128,
+            8
+        ));
+        // A window longer than the cache cannot attend past the cache.
+        assert_eq!(fused_attended_window(512, 4_096), 512);
     }
 
     #[test]
@@ -3729,6 +4883,352 @@ mod tests {
         assert!(
             !kernel.detect_inplace_kv(&inputs, &outputs, present_seq, present_len, Some(&past_key)),
             "f16 caches must not take the f32-only in-place path"
+        );
+    }
+
+    /// Shared fixture for the direct-present tests: one decode step over a past
+    /// cache of `past_len` rows held in a buffer of `capacity` rows.
+    struct PresentCase {
+        query: Vec<f32>,
+        key: Vec<f32>,
+        value: Vec<f32>,
+        past_key: Vec<f32>,
+        past_value: Vec<f32>,
+        seqlens_k: Vec<i32>,
+        total: i32,
+        q_shape: [usize; 3],
+        kv_shape: [usize; 3],
+        past_shape: [usize; 4],
+        present_shape: [usize; 4],
+        out_shape: [usize; 3],
+    }
+
+    impl PresentCase {
+        fn new(
+            batch: usize,
+            heads: usize,
+            kv_heads: usize,
+            dim: usize,
+            past_len: usize,
+            capacity: usize,
+        ) -> Self {
+            let total = past_len + 1;
+            let make = |n: usize, salt: u64| -> Vec<f32> {
+                (0..n).map(|i| mixed_scale_value(i, salt)).collect()
+            };
+            Self {
+                query: make(batch * heads * dim, 0x11),
+                key: make(batch * kv_heads * dim, 0x22),
+                value: make(batch * kv_heads * dim, 0x33),
+                past_key: make(batch * kv_heads * capacity * dim, 0x44),
+                past_value: make(batch * kv_heads * capacity * dim, 0x55),
+                seqlens_k: vec![(total - 1) as i32; batch],
+                total: total as i32,
+                q_shape: [batch, 1, heads * dim],
+                kv_shape: [batch, 1, kv_heads * dim],
+                past_shape: [batch, kv_heads, capacity, dim],
+                present_shape: [batch, kv_heads, capacity.max(total), dim],
+                out_shape: [batch, 1, heads * dim],
+            }
+        }
+
+        /// Same geometry, but each batch carries its own `seqlens_k`, so the
+        /// attended prefix and the zeroed tail differ from row to row.
+        fn with_seqlens(
+            heads: usize,
+            kv_heads: usize,
+            dim: usize,
+            capacity: usize,
+            seqlens: &[i32],
+        ) -> Self {
+            let batch = seqlens.len();
+            let total = seqlens.iter().copied().max().unwrap_or(0) + 1;
+            let mut case = Self::new(batch, heads, kv_heads, dim, total as usize - 1, capacity);
+            case.seqlens_k = seqlens.to_vec();
+            case.total = total;
+            case
+        }
+
+        fn run(&self, kernel: &dyn Kernel) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+            let mut out = Owned::zeros_f32(&self.out_shape);
+            let mut present_key = Owned::zeros_f32(&self.present_shape);
+            let mut present_value = Owned::zeros_f32(&self.present_shape);
+            kernel
+                .execute(
+                    &[
+                        Owned::f32(&self.q_shape, &self.query).view(),
+                        Owned::f32(&self.kv_shape, &self.key).view(),
+                        Owned::f32(&self.kv_shape, &self.value).view(),
+                        Owned::f32(&self.past_shape, &self.past_key).view(),
+                        Owned::f32(&self.past_shape, &self.past_value).view(),
+                        Owned::i32(&[self.seqlens_k.len()], &self.seqlens_k).view(),
+                        Owned::i32(&[], &[self.total]).view(),
+                    ],
+                    &mut [
+                        out.view_mut(),
+                        present_key.view_mut(),
+                        present_value.view_mut(),
+                    ],
+                )
+                .unwrap();
+            (out.to_f32(), present_key.to_f32(), present_value.to_f32())
+        }
+    }
+
+    /// The pooled fill must produce exactly the bytes the single-threaded fill
+    /// does. The gate is lowered rather than the cache enlarged so the whole
+    /// present tensor stays small enough to compare element by element, and the
+    /// geometry uses per-batch-differing `seqlens_k` so every row has a
+    /// different attended length and a different zeroed tail — an off-by-one in
+    /// the `row_index -> (batch, kv-head)` mapping cannot survive it.
+    #[test]
+    fn pooled_present_fill_is_bit_identical_to_the_serial_fill() {
+        let serialised = present_test_guard();
+        let kernel = gqa_kernel_with_heads(8, 4, &[]);
+        // 4 batches x 4 kv-heads = 16 disjoint rows, capacity 24, dim 8.
+        let case = PresentCase::with_seqlens(8, 4, 8, 24, &[3, 11, 23, 17]);
+
+        let serial = {
+            let _gate = PresentParallelOverride::bytes_per_worker(&serialised, usize::MAX - 1);
+            case.run(kernel.as_ref())
+        };
+        let serial_fills = pooled_fill_count();
+        let pooled = {
+            let _gate = PresentParallelOverride::bytes_per_worker(&serialised, 1);
+            case.run(kernel.as_ref())
+        };
+
+        assert_eq!(serial.0, pooled.0, "attention output diverged");
+        assert_eq!(serial.1, pooled.1, "present_key diverged");
+        assert_eq!(serial.2, pooled.2, "present_value diverged");
+
+        // Falsifier for the gate itself: on any host with more than one decode
+        // worker the lowered threshold must actually have engaged the pooled
+        // arm, so the two arms above are not both the serial code path.
+        if crate::kernels::matmul_nbits::active_decode_worker_count() > 1 {
+            assert!(
+                pooled_fill_count() > serial_fills,
+                "lowered gate did not engage the pooled fill"
+            );
+        }
+    }
+
+    /// A half-precision past cache widened straight into f32 graph outputs is
+    /// the layout real models use, and it exercises `widen_run` on the direct
+    /// arm. It must still match the owned-scratch arm bit for bit, including
+    /// the per-batch tails.
+    #[test]
+    fn direct_present_matches_scratch_with_an_f16_past_cache() {
+        let serialised = present_test_guard();
+        let kernel = gqa_kernel_with_heads(4, 2, &[]);
+        let (batch, heads, kv_heads, dim, capacity) = (2usize, 4usize, 2usize, 8usize, 12usize);
+        let seqlens: [i32; 2] = [4, 9];
+        let total = seqlens.iter().copied().max().unwrap() + 1;
+        let past_bits: Vec<u16> = (0..batch * kv_heads * capacity * dim)
+            .map(|i| ((i * 37 + 11) % 30000) as u16)
+            .collect();
+        let make = |n: usize, salt: u64| -> Vec<f32> {
+            (0..n).map(|i| mixed_scale_value(i, salt)).collect()
+        };
+        let query = make(batch * heads * dim, 0x71);
+        let key = make(batch * kv_heads * dim, 0x72);
+        let value = make(batch * kv_heads * dim, 0x73);
+        let present_shape = [batch, kv_heads, capacity.max(total as usize), dim];
+
+        let run = || {
+            let mut out = Owned::zeros_f32(&[batch, 1, heads * dim]);
+            let mut present_key = Owned::zeros_f32(&present_shape);
+            let mut present_value = Owned::zeros_f32(&present_shape);
+            kernel
+                .execute(
+                    &[
+                        Owned::f32(&[batch, 1, heads * dim], &query).view(),
+                        Owned::f32(&[batch, 1, kv_heads * dim], &key).view(),
+                        Owned::f32(&[batch, 1, kv_heads * dim], &value).view(),
+                        Owned::f16_bits(&[batch, kv_heads, capacity, dim], &past_bits).view(),
+                        Owned::f16_bits(&[batch, kv_heads, capacity, dim], &past_bits).view(),
+                        Owned::i32(&[batch], &seqlens).view(),
+                        Owned::i32(&[], &[total]).view(),
+                    ],
+                    &mut [
+                        out.view_mut(),
+                        present_key.view_mut(),
+                        present_value.view_mut(),
+                    ],
+                )
+                .unwrap();
+            (out.to_f32(), present_key.to_f32(), present_value.to_f32())
+        };
+
+        let scratch = {
+            let _forced = PresentScratchOverride::forced(&serialised);
+            run()
+        };
+        let direct = run();
+        assert_eq!(scratch.0, direct.0, "attention output diverged");
+        assert_eq!(scratch.1, direct.1, "present_key diverged");
+        assert_eq!(scratch.2, direct.2, "present_value diverged");
+    }
+
+    /// Building the present cache inside the graph outputs must produce the
+    /// exact same bits as the owned-scratch path it replaced — attention output
+    /// and both present tensors. Covers the no-tail decode geometry.
+    #[test]
+    fn direct_present_is_bit_identical_to_owned_scratch() {
+        let serialised = present_test_guard();
+        let kernel = gqa_kernel_with_heads(8, 2, &[]);
+        let case = PresentCase::new(2, 8, 2, 16, 5, 6);
+
+        let scratch = {
+            let _forced = PresentScratchOverride::forced(&serialised);
+            let before = present_scratch_count();
+            let result = case.run(kernel.as_ref());
+            assert!(
+                present_scratch_count() > before,
+                "override must route through the owned-scratch path"
+            );
+            result
+        };
+
+        let before = present_direct_count();
+        let direct = case.run(kernel.as_ref());
+        assert!(
+            present_direct_count() > before,
+            "distinct contiguous f32 present outputs must take the direct path"
+        );
+
+        assert_eq!(
+            direct.0, scratch.0,
+            "attention output must be bit-identical"
+        );
+        assert_eq!(direct.1, scratch.1, "present_key must be bit-identical");
+        assert_eq!(direct.2, scratch.2, "present_value must be bit-identical");
+    }
+
+    /// Same equivalence when the cache buffer is larger than the live context,
+    /// i.e. there is an unattended tail. The direct path zeroes only the tail
+    /// rows instead of pre-zeroing the whole output, so this pins that the tail
+    /// really is zero and the prefix is untouched.
+    #[test]
+    fn direct_present_zeroes_only_the_unattended_tail() {
+        let serialised = present_test_guard();
+        const BATCH: usize = 1;
+        const KV_HEADS: usize = 2;
+        const DIM: usize = 8;
+        const PAST: usize = 3;
+        const CAPACITY: usize = 9;
+        let kernel = gqa_kernel_with_heads(4, KV_HEADS as i64, &[]);
+        let case = PresentCase::new(BATCH, 4, KV_HEADS, DIM, PAST, CAPACITY);
+
+        let scratch = {
+            let _forced = PresentScratchOverride::forced(&serialised);
+            case.run(kernel.as_ref())
+        };
+        let direct = case.run(kernel.as_ref());
+        assert_eq!(direct.0, scratch.0);
+        assert_eq!(direct.1, scratch.1);
+        assert_eq!(direct.2, scratch.2);
+
+        let total = PAST + 1;
+        for head in 0..BATCH * KV_HEADS {
+            let base = head * CAPACITY * DIM;
+            for row in total..CAPACITY {
+                let start = base + row * DIM;
+                assert!(
+                    direct.1[start..start + DIM].iter().all(|&x| x == 0.0),
+                    "present_key tail row {row} of head {head} must be zero"
+                );
+                assert!(
+                    direct.2[start..start + DIM].iter().all(|&x| x == 0.0),
+                    "present_value tail row {row} of head {head} must be zero"
+                );
+            }
+            // Row `PAST` is the appended current step; rows below it are past.
+            let appended = base + PAST * DIM;
+            assert!(
+                direct.1[appended..appended + DIM].iter().any(|&x| x != 0.0),
+                "the appended row must carry the current step's key"
+            );
+        }
+    }
+
+    /// The gate is structural: an f16 present output, a wrong-sized output, a
+    /// missing output slot and a present buffer that aliases an input all have
+    /// to decline to the owned-scratch path.
+    #[test]
+    fn direct_present_declines_on_dtype_size_arity_and_aliasing() {
+        let _serialised = present_test_guard();
+        const KV_HEADS: usize = 2;
+        const DIM: usize = 4;
+        const SEQ: usize = 3;
+        let kernel = GroupQueryAttentionKernel {
+            num_heads: 4,
+            kv_num_heads: KV_HEADS,
+            scale: None,
+            do_rotary: false,
+            rotary_interleaved: false,
+            local_window_size: -1,
+            softcap: 0.0,
+        };
+        let shape = [1usize, KV_HEADS, SEQ, DIM];
+        let present_len = KV_HEADS * SEQ * DIM;
+
+        let scalar = Owned::zeros_f32(&[1, 1, 4]);
+        let mut good_out = Owned::zeros_f32(&[1, 1, 16]);
+        let mut good_k = Owned::zeros_f32(&shape);
+        let mut good_v = Owned::zeros_f32(&shape);
+        let past_k = Owned::zeros_f32(&shape);
+        let past_v = Owned::zeros_f32(&shape);
+
+        let inputs = [
+            scalar.view(),
+            scalar.view(),
+            scalar.view(),
+            past_k.view(),
+            past_v.view(),
+            scalar.view(),
+            scalar.view(),
+        ];
+        {
+            let outputs = [good_out.view_mut(), good_k.view_mut(), good_v.view_mut()];
+            assert!(
+                kernel.detect_direct_present(&inputs, &outputs, present_len),
+                "distinct contiguous f32 present outputs must be accepted"
+            );
+            assert!(
+                !kernel.detect_direct_present(&inputs, &outputs, present_len + 1),
+                "a present_len mismatch must decline"
+            );
+            assert!(
+                !kernel.detect_direct_present(&inputs, &outputs[..2], present_len),
+                "a missing present_value slot must decline"
+            );
+        }
+
+        let mut f16_k = Owned::zeros(DataType::Float16, &shape);
+        {
+            let outputs = [good_out.view_mut(), f16_k.view_mut(), good_v.view_mut()];
+            assert!(
+                !kernel.detect_direct_present(&inputs, &outputs, present_len),
+                "an f16 present output needs the narrowing copy path"
+            );
+        }
+
+        // A present output that aliases the past input it reads from must
+        // decline here; exact aliasing is the in-place path's job.
+        let cpu = onnx_runtime_ir::DeviceId::cpu();
+        let strides = compute_contiguous_strides(&shape);
+        let aliased = TensorMut::new(
+            DevicePtrMut(past_k.bytes.as_ptr() as *mut std::ffi::c_void),
+            DataType::Float32,
+            &shape,
+            &strides,
+            cpu,
+        );
+        let outputs = [good_out.view_mut(), aliased, good_v.view_mut()];
+        assert!(
+            !kernel.detect_direct_present(&inputs, &outputs, present_len),
+            "a present output aliasing the past input must decline"
         );
     }
 }

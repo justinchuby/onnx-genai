@@ -1,4 +1,4 @@
-//! `onnx-genai-router` binary entry point (see `docs/DESIGN.md` §34.10).
+//! `onnx-genai-router` binary entry point (see `docs/architecture/DESIGN.md` §34.10).
 //!
 //! Loads a [`RouterConfig`] from YAML, builds the pure [`Router`], spawns the
 //! background node poller, and serves the `/router/*` API plus the reverse-proxy
@@ -22,7 +22,7 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(2);
     about = "Model-agnostic, session-aware router for onnx-genai inference clusters"
 )]
 struct Cli {
-    /// Path to the router YAML config (see docs/DESIGN.md §34.11).
+    /// Path to the router YAML config (see docs/architecture/DESIGN.md §34.11).
     #[arg(long, env = "ONNX_GENAI_ROUTER_CONFIG")]
     config: PathBuf,
 

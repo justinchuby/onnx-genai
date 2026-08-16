@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU parity tests for the cuDNN-backed ONNX `Conv` kernel.
 
 mod common;
@@ -220,17 +234,25 @@ fn assert_close(got: &[f32], expected: &[f32], tolerance: f32) {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn cudnn_conv_matches_cpu_for_padding_groups_and_f16() {
     let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
         Ok(Ok(ep)) => ep,
         Ok(Err(error)) => {
             eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
         Err(_) => {
             eprintln!("skip: CUDA runtime library loading panicked");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
 
@@ -343,17 +365,25 @@ fn cudnn_conv_matches_cpu_for_padding_groups_and_f16() {
     println!("cuDNN Conv f32/f16 padded and grouped-strided cases passed");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn cudnn_conv_matches_cpu_for_dilation() {
     let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
         Ok(Ok(ep)) => ep,
         Ok(Err(error)) => {
             eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
         Err(_) => {
             eprintln!("skip: CUDA runtime library loading panicked");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
 
@@ -390,11 +420,13 @@ fn cudnn_conv_matches_cpu_for_dilation() {
     println!("cuDNN Conv dilations=[2, 2] case passed");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn cuda_conv1d_matches_cpu_for_standard_grouped_and_causal_geometry() {
-    let Some(ep) = common::cuda_ep() else {
-        return;
-    };
+    let ep = common::require_cuda();
     let cases = [
         (
             "basic",

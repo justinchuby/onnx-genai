@@ -1,7 +1,7 @@
 //! # `onnx-runtime-session`
 //!
 //! The user-facing session and inference API for the ORT 2.0 runtime
-//! (see `docs/ORT2.md` §20). Design goal: **zero-config by default** — the user
+//! (see `docs/architecture/ORT2.md` §20). Design goal: **zero-config by default** — the user
 //! never has to know what an execution provider is; the runtime auto-detects
 //! hardware and picks a strategy.
 //!
@@ -29,11 +29,15 @@ pub use epcontext::{
 };
 pub use error::SessionError;
 pub use executor::{
-    CacheStats, CaptureDecline, CaptureDeclineReport, CapturePathKind, ControlFlowStats,
+    ActivationMemoryPlanStats, CacheStats, CaptureDecline, CaptureDeclineReport, CapturePathKind,
+    ControlFlowStats, DENSE_WEIGHT_PREFETCH_LOOKAHEAD_ENV, DensePrefetchGapStats,
     DeviceAllocationCounts, DeviceGraphCaptureResult, ExecutionProviderDecline,
-    ExecutionProviderFallbackReport, PrefetchStep, SeamReason, drive_double_buffer,
-    exec_phase_stats, plan_double_buffer, print_exec_phase_profile, reset_exec_phase_profile,
+    ExecutionProviderFallbackReport, PrefetchStep, SeamReason, dense_prefetch_gap_stats,
+    dense_weight_prefetch_lookahead_nodes, drive_double_buffer,
+    enable_exec_phase_profile_for_process, exec_phase_stats, plan_double_buffer,
+    print_exec_phase_profile, reset_dense_prefetch_gap_stats, reset_exec_phase_profile,
 };
+pub use onnx_runtime_ep_api::WorkspaceRequirement;
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
 };
@@ -409,7 +413,7 @@ pub enum DecodePrecision {
 }
 
 /// Graph-optimization level for the session's `optimize` pipeline stage
-/// (`docs/ORT2.md` §18). Selected via the generic `"optimization"` session
+/// (`docs/architecture/ORT2.md` §18). Selected via the generic `"optimization"` session
 /// option (see [`SessionBuilder::option`]).
 ///
 /// The default is [`OptimizationLevel::None`]: with optimization off the graph
@@ -1099,6 +1103,18 @@ impl InferenceSession {
         self.exec.decode_view_plan_counts()
     }
 
+    /// Most recent activation-memory planner measurement.
+    ///
+    /// Populated only by measured top-level eager runs, after concrete shapes
+    /// and zero-copy view aliases are known. Stage-2 replay and nested runs skip
+    /// re-planning and leave the last measured result. The planner's
+    /// `naive_bytes` is an upper-bound activation-owner baseline, not the
+    /// executor's exact current allocation behavior (in-place aliases and
+    /// sequences can allocate less).
+    pub fn activation_memory_plan_stats(&self) -> Option<ActivationMemoryPlanStats> {
+        self.exec.activation_memory_plan_stats()
+    }
+
     /// How many times the single-trip `Scan` inline dual-path
     /// (`ONNX_GENAI_SCAN_INLINE_SINGLE_TRIP`) engaged over this session's
     /// lifetime. `> 0` after a decode run proves the runtime `trip_count == 1`
@@ -1118,6 +1134,36 @@ impl InferenceSession {
         bindings: &mut [DeviceIoBinding],
     ) -> Result<Vec<Option<Tensor>>> {
         self.exec.run_with_device_bindings(inputs, bindings)
+    }
+
+    /// Prepare exact kernel workspace for a bound run without launching kernels.
+    pub fn prepare_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+        self.exec.prepare_with_device_bindings(inputs, bindings)
+    }
+
+    pub fn prepare_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
+        self.exec.prepare_mapped_growth(bytes, role)
+    }
+
+    pub fn release_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) {
+        self.exec.release_mapped_growth(bytes, role);
+    }
+
+    /// Locations of graph nodes that declare owned kernel workspace.
+    pub fn workspace_node_locations(&self) -> Vec<String> {
+        self.exec.workspace_node_locations()
     }
 
     /// Lazily build the decode-specialized inlined-body sibling executor
@@ -1266,6 +1312,35 @@ impl InferenceSession {
         )
     }
 
+    /// Allocate a persistent binding whose virtual allocation is larger than
+    /// the shape currently exposed to kernels.
+    ///
+    /// Lazy device allocators use `committed_ranges` to map only the parts that
+    /// are live. Eager allocators preserve the old behaviour and commit the
+    /// whole allocation, so callers must gate memory-sensitive use on
+    /// [`InferenceSession::commits_on_demand`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocate_device_binding_committed(
+        &self,
+        input_name: impl Into<String>,
+        output_name: Option<impl Into<String>>,
+        dtype: DataType,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+        allocation_bytes: usize,
+        committed_ranges: Vec<std::ops::Range<usize>>,
+    ) -> Result<DeviceIoBinding> {
+        self.exec.allocate_device_binding_committed(
+            input_name.into(),
+            output_name.map(Into::into),
+            dtype,
+            physical_shape,
+            logical_shape,
+            allocation_bytes,
+            committed_ranges,
+        )
+    }
+
     /// Bind a persistent buffer the **caller** allocated on this session's
     /// execution device.
     ///
@@ -1338,6 +1413,24 @@ impl InferenceSession {
         self.exec.reset_device_graph()
     }
 
+    /// Pin the fixed-capacity KV sequence-axis symbols CONSTANT so CUDA-graph
+    /// capture ADMITS the attention nodes (`GroupQueryAttention` in particular)
+    /// instead of vetoing each as a growing-seq eager seam. Returns the total
+    /// number of symbols pinned across this session's executors.
+    ///
+    /// Call this ONLY once the engine has bound fixed-capacity, device-resident
+    /// KV (physical `[.., max_len, ..]`, valid length read on-device) and CUDA
+    /// graphs are enabled — see
+    /// [`executor::Executor::pin_fixed_capacity_kv_capture_symbols`] for the full
+    /// correctness argument. A growing/paged KV decoder must NOT call this.
+    pub fn pin_fixed_capacity_kv_capture_symbols(&mut self) -> usize {
+        let mut pinned = self.exec.pin_fixed_capacity_kv_capture_symbols();
+        if let Some(inline) = self.decode_inline_exec.as_mut() {
+            pinned += inline.pin_fixed_capacity_kv_capture_symbols();
+        }
+        pinned
+    }
+
     /// Number of captured device-graph segments installed by the most recent
     /// [`Self::try_capture_with_device_bindings`] call.
     ///
@@ -1365,6 +1458,39 @@ impl InferenceSession {
 
     pub fn device_allocation_counts(&self) -> Option<DeviceAllocationCounts> {
         self.exec.device_allocation_counts()
+    }
+
+    /// Place any long-lived device memory this session's provider holds under
+    /// `governor`.
+    ///
+    /// A provider that keeps a standing pool -- the CUDA weight-residency cache
+    /// is one -- otherwise sizes it for itself, which is a second claim on
+    /// memory the governor is already dividing up. Returns the bytes now
+    /// governed; zero means this provider holds no standing pool.
+    /// Whether the memory behind this session commits physically as it is used.
+    ///
+    /// Answered by the allocator rather than by the backend, so a caller does
+    /// not need to know whether it is holding a native session or an ONNX
+    /// Runtime one -- both reach the same `DeviceAllocator` seam.
+    pub fn commits_on_demand(&self) -> bool {
+        self.exec.commits_on_demand()
+    }
+
+    pub fn adopt_memory_governor(
+        &self,
+        governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+        tier: onnx_runtime_memory_governor::Tier,
+        holder: onnx_runtime_memory_governor::HolderId,
+    ) -> Result<u64> {
+        Ok(self.exec.adopt_memory_governor(governor, tier, holder)?)
+    }
+
+    pub fn set_weight_residency_budget(&self, budget_bytes: u64) -> Result<Option<u64>> {
+        Ok(self.exec.set_weight_residency_budget(budget_bytes)?)
+    }
+
+    pub fn max_lazy_weight_working_set_bytes(&self) -> u64 {
+        self.exec.max_lazy_weight_working_set_bytes()
     }
 
     pub fn device_id(&self) -> onnx_runtime_ir::DeviceId {

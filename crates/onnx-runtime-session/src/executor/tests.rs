@@ -1,9 +1,10 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use onnx_runtime_ep_api::{
     CaptureSupport, Cost, EpConfig, EpError, ExecutionProviderCapabilities, Fence, Kernel,
     NegotiatedWeight,
 };
+use onnx_runtime_memory_governor::MemoryRole;
 
 use super::*;
 
@@ -361,6 +362,62 @@ fn decode_shaped_residual_graph() -> Graph {
     graph
 }
 
+fn view_shaped_activation_graph() -> Graph {
+    use onnx_runtime_ir::{TensorData, WeightRef};
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([4]));
+    graph.add_input(x);
+
+    let owned = graph.create_named_value("owned", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(x)], vec![owned]));
+
+    let shape = graph.create_named_value("shape", DataType::Int64, static_shape([2]));
+    graph.set_initializer(
+        shape,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            vec![2],
+            [2i64, 2].into_iter().flat_map(i64::to_le_bytes).collect(),
+        )),
+    );
+    let view = graph.create_named_value("view", DataType::Float32, static_shape([2, 2]));
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Reshape",
+        vec![Some(owned), Some(shape)],
+        vec![view],
+    ));
+
+    let live_use = graph.create_named_value("live_use", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Tanh",
+        vec![Some(owned)],
+        vec![live_use],
+    ));
+
+    let live_use_2d =
+        graph.create_named_value("live_use_2d", DataType::Float32, static_shape([2, 2]));
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Reshape",
+        vec![Some(live_use), Some(shape)],
+        vec![live_use_2d],
+    ));
+
+    let merged = graph.create_named_value("merged", DataType::Float32, static_shape([2, 2]));
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "Add",
+        vec![Some(view), Some(live_use_2d)],
+        vec![merged],
+    ));
+    graph.add_output(merged);
+    graph
+}
+
 /// Regression guard for the issue #85 class the reported native/CUDA decode
 /// scare pointed at: a still-live value (a residual input or a long-lived
 /// KV/cache carry) must never be aliased away by an earlier in-place op on a
@@ -405,6 +462,51 @@ fn compute_in_place_multilayer_decode_residual_is_byte_identical_and_fires() {
     );
 }
 
+#[test]
+fn activation_memory_planner_reports_static_decode_graph_savings() {
+    let values = Tensor::from_f32(&[4], &[-2.0, -0.5, 0.5, 2.0]).unwrap();
+    let weights = Arc::new(WeightStore::new());
+    let ep = auto_detect_cpu_ep().unwrap();
+    let mut exec = Executor::build(decode_shaped_residual_graph(), weights, ep).unwrap();
+
+    assert_eq!(
+        exec.activation_memory_plan_stats(),
+        None,
+        "build-time planning would be view-blind, so it must not publish stats"
+    );
+
+    exec.run(&[("x", &values)]).unwrap();
+    let run_stats = exec
+        .activation_memory_plan_stats()
+        .expect("run should refresh activation memory plan stats");
+    assert!(run_stats.complete, "run stats were deferred: {run_stats:?}");
+    assert!(run_stats.naive_bytes > run_stats.peak_bytes);
+    assert!(run_stats.savings_ratio > 0.0);
+}
+
+#[test]
+fn activation_memory_planner_uses_runtime_view_edges() {
+    let values = Tensor::from_f32(&[4], &[-2.0, -0.5, 0.5, 2.0]).unwrap();
+    let weights = Arc::new(WeightStore::new());
+    let ep = auto_detect_cpu_ep().unwrap();
+    let mut exec = Executor::build(view_shaped_activation_graph(), weights, ep).unwrap();
+
+    assert_eq!(
+        exec.activation_memory_plan_stats(),
+        None,
+        "load-time stats would see an empty ViewMap for this Reshape fixture"
+    );
+
+    exec.run(&[("x", &values)]).unwrap();
+    let run_stats = exec
+        .activation_memory_plan_stats()
+        .expect("run should measure after Reshape has reported view outputs");
+    assert!(run_stats.complete, "run stats were deferred: {run_stats:?}");
+    assert_eq!(run_stats.view_edges, 2);
+    assert_eq!(run_stats.assignments, 3);
+    assert_eq!(run_stats.naive_bytes, 48);
+}
+
 struct CaptureDecliningKernel;
 
 impl Kernel for CaptureDecliningKernel {
@@ -421,6 +523,214 @@ impl Kernel for CaptureDecliningKernel {
             "requires M==1 decode GEMV without group_indices; got a prefill signature",
         )
     }
+}
+
+// Mirrors the bypass kernels Harry flagged (`UnaryMathKernel`, `NotKernel`,
+// `BitwiseNotKernel`): returns `CaptureSupport::Supported` unconditionally and
+// deliberately does NOT override `set_capture_seq_independent`, so the kernel
+// alone would happily admit a classifier-disqualified growing node into capture.
+struct UnconditionalCaptureKernel;
+
+impl Kernel for UnconditionalCaptureKernel {
+    fn execute(
+        &self,
+        _inputs: &[TensorView],
+        _outputs: &mut [TensorMut],
+    ) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
+    fn capture_support(&self) -> CaptureSupport {
+        CaptureSupport::Supported
+    }
+}
+
+// Build a minimal two-node static `Identity` executor whose kernels are warmed,
+// then return it alongside the per-node kernel keys and the fully-resolved
+// concrete shape map. Callers rewrite one node's IR output shape and cached
+// kernel to stage a capture-admission scenario for `node_capture_reason`.
+#[cfg(test)]
+fn build_identity_capture_fixture() -> (Executor, Vec<KernelKey>, HashMap<ValueId, Vec<usize>>) {
+    use onnx_runtime_ir::static_shape;
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    for index in 0..2 {
+        let input = graph.create_named_value(
+            format!("input_{index}"),
+            DataType::Float32,
+            static_shape([1]),
+        );
+        let output = graph.create_named_value(
+            format!("output_{index}"),
+            DataType::Float32,
+            static_shape([1]),
+        );
+        graph.add_input(input);
+        graph.add_output(output);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(input)],
+            vec![output],
+        ));
+    }
+
+    let executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().expect("CPU EP"),
+    )
+    .expect("representative static graph");
+    let resolved = executor
+        .value_shapes
+        .iter()
+        .filter_map(|(&value, shape)| as_static_shape(shape).map(|shape| (value, shape)))
+        .collect::<HashMap<_, _>>();
+    let keys = executor
+        .plan
+        .iter()
+        .map(|plan| KernelKey {
+            node: plan.node_id.0,
+            shapes: plan
+                .inputs
+                .iter()
+                .map(|input| {
+                    input
+                        .map(|value| resolved[&value].clone())
+                        .unwrap_or_default()
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    (executor, keys, resolved)
+}
+
+// Round-7 central capture veto (PR #728): a classifier-DISQUALIFIED node (an
+// output shape references a GROWING KV/total-sequence-length symbol) wired to a
+// kernel that returns `CaptureSupport::Supported` unconditionally MUST still be
+// declined at the real capture-admission chokepoint (`node_capture_reason`). The
+// veto is applied BEFORE the kernel's own `capture_support()` is consulted, so no
+// bypass kernel can re-admit a disqualified node. Fail-pre (veto absent): the
+// node is admitted (`None`) because every structural check passes and the kernel
+// says Supported — silent decode corruption. Pass-post: `ClassifierDisqualified`.
+#[test]
+fn classifier_disqualified_node_is_vetoed_despite_supported_kernel() {
+    let (mut executor, keys, resolved) = build_identity_capture_fixture();
+
+    // Mint a GROWING KV-length symbol and mark node 0's OUTPUT shape as carrying
+    // it, so the build-time classifier disqualifies the node — independent of the
+    // concrete warmed extent still present in `resolved`.
+    let growing = executor.graph.create_symbol(None);
+    executor.capture_growing_symbols.insert(growing);
+    let disqualified_output = executor.plan[0].outputs[0];
+    executor.graph.value_mut(disqualified_output).shape =
+        vec![Dim::Symbolic(growing), Dim::Static(1)];
+
+    // The kernel alone would admit capture (unconditional Supported, no flag
+    // override) — exactly the bypass path Harry called out.
+    executor
+        .cache
+        .entries
+        .insert(keys[0].clone(), Box::new(UnconditionalCaptureKernel));
+
+    let decline = executor
+        .node_capture_reason(&executor.plan[0], &resolved)
+        .expect("classifier-disqualified node must be declined for capture");
+    assert_eq!(
+        decline.seam_reason,
+        Some(SeamReason::ClassifierDisqualified),
+        "the growing-symbol node must be vetoed centrally, not admitted by the kernel"
+    );
+}
+
+// Positive companion: a classifier-QUALIFIED (sequence-independent) node with the
+// same unconditional-`Supported` kernel is still admitted (`None`). The central
+// veto is strictly additive — it only ever declines disqualified nodes and never
+// suppresses a legitimately capturable one.
+#[test]
+fn classifier_qualified_node_with_supported_kernel_is_admitted() {
+    let (mut executor, keys, resolved) = build_identity_capture_fixture();
+
+    // No growing symbol touches this node's edges; the classifier qualifies it.
+    executor
+        .cache
+        .entries
+        .insert(keys[0].clone(), Box::new(UnconditionalCaptureKernel));
+
+    assert!(
+        executor
+            .node_capture_reason(&executor.plan[0], &resolved)
+            .is_none(),
+        "a sequence-independent node with a Supported kernel must remain capture-eligible"
+    );
+}
+
+// Round-8 veto-precedence fix (PR #728): a host control-flow node (`If`) that
+// ALSO references a GROWING symbol is disqualified by the classifier AND
+// classified as `HostControlFlowOrSequence` by the EP structural policy. The
+// structural HOST seam must WIN so the public capture-segmentation report labels
+// it a HOST round trip, not an eager DEVICE seam. Fail-pre (veto placed first, as
+// on HEAD 9555b354): `node_capture_reason` returns `ClassifierDisqualified` whose
+// `path_kind()` is `EagerDeviceSeam` — a host node mislabeled as a device seam.
+// Pass-post (veto reordered after structural): `HostControlFlowOrSequence` whose
+// `path_kind()` is `HostSeam`.
+#[test]
+fn disqualified_control_flow_node_reports_host_seam_not_device_seam() {
+    let (mut executor, keys, resolved) = build_identity_capture_fixture();
+
+    // Turn node 0 into a control-flow (`If`) node the EP structural policy
+    // classifies as `HostControlFlowOrSequence`.
+    executor.graph.node_mut(executor.plan[0].node_id).op_type = "If".to_string();
+    assert!(
+        is_control_flow_op(
+            &executor.graph.node(executor.plan[0].node_id).op_type,
+            &executor.graph.node(executor.plan[0].node_id).domain,
+        ),
+        "fixture node must be recognized as control flow"
+    );
+
+    // Also make it classifier-disqualified: an output shape references a GROWING
+    // KV/total-sequence-length symbol, so the veto would ALSO fire on this node.
+    let growing = executor.graph.create_symbol(None);
+    executor.capture_growing_symbols.insert(growing);
+    let disqualified_output = executor.plan[0].outputs[0];
+    executor.graph.value_mut(disqualified_output).shape =
+        vec![Dim::Symbolic(growing), Dim::Static(1)];
+    assert!(
+        !node_capture_seq_independent(
+            &executor.graph,
+            executor.graph.node(executor.plan[0].node_id),
+            &executor.capture_growing_symbols,
+        ),
+        "the growing-symbol output must make the node classifier-disqualified"
+    );
+
+    // A warmed unconditional-`Supported` kernel is present too; it must not matter
+    // because structural host classification precedes both the veto and the kernel.
+    executor
+        .cache
+        .entries
+        .insert(keys[0].clone(), Box::new(UnconditionalCaptureKernel));
+
+    let decline = executor
+        .node_capture_reason(&executor.plan[0], &resolved)
+        .expect("control-flow node must be declined for capture");
+    assert_eq!(
+        decline.seam_reason,
+        Some(SeamReason::HostControlFlowOrSequence),
+        "a disqualified control-flow node must report the HOST control-flow seam, \
+         not ClassifierDisqualified"
+    );
+    assert_eq!(
+        decline
+            .seam_reason
+            .expect("seam reason present")
+            .path_kind(),
+        CapturePathKind::HostSeam,
+        "the disqualified control-flow node must land on the HOST seam path, not an \
+         eager DEVICE seam"
+    );
 }
 
 #[test]
@@ -683,6 +993,926 @@ fn only_gqa_cache_inputs_use_physical_capacity_as_kernel_geometry() {
     assert!(!kernel_input_uses_physical_capacity(&attention, 4));
 }
 
+// C1 (build-time growing-symbol classifier, DENYLIST on BOTH edges): a pointwise
+// op is capture-eligible iff NEITHER any input NOR any output references a symbol
+// in the GROWING set (`compute_capture_growing_symbols`) — the KV/total-sequence
+// length symbols on attention `past`/`present` cache sequence axes. Benign FRESH
+// symbols (warm-decode-seeded non-growing extents) are absent from that set, so
+// ops carrying only batch/query-seq/fresh dims stay capturable, preserving the
+// 154→34 collapse.
+//
+// This test builds a synthetic decode graph (declared `inputs_embeds`/`logits`
+// I/O plus a GQA node minting a growing KV-length symbol) and asserts: an op
+// whose dims are batch/query-seq only is capturable, and an op that carries a
+// growing KV symbol on its OUTPUT stays eager. The first-hop input alias and the
+// harder downstream-consumer alias are covered by their own tests below
+// (`growing_symbol_alias_keeps_downstream_consumer_eager`). No model files, no
+// per-model hardcoding — growing membership, not dim position.
+#[test]
+fn growing_symbol_classifier_admits_pinned_and_rejects_growing_and_aliased_ops() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    // Interned symbols. `batch`/`seq` are pinned (never on a KV sequence axis);
+    // `seq_kv` GROWS each decode step (KV penultimate).
+    let batch = graph.create_symbol(None);
+    let seq = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    // Declared decode I/O: inputs_embeds `[batch, seq, 512]`, logits
+    // `[batch, seq, vocab]`.
+    let embeds = graph.create_named_value(
+        "inputs_embeds",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    graph.add_input(embeds);
+    // GQA past_key input (index 3): `[batch, kv_heads, seq_kv, head_dim]`.
+    let past_key = graph.create_named_value(
+        "past_key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+    );
+    graph.add_input(past_key);
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(32000)],
+    );
+    graph.add_output(logits);
+
+    let mut gqa = Node::new(
+        NodeId(0),
+        "GroupQueryAttention",
+        vec![
+            Some(embeds),
+            Some(embeds),
+            Some(embeds),
+            Some(past_key),
+            Some(past_key),
+        ],
+        vec![],
+    );
+    gqa.domain = "com.microsoft".to_string();
+    graph.insert_node(gqa);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&seq_kv),
+        "the growing KV-length symbol (past_key penultimate) must be collected, got {growing:?}"
+    );
+    assert!(
+        !growing.contains(&batch) && !growing.contains(&seq),
+        "batch/query-seq must NOT be growing, got {growing:?}"
+    );
+
+    // Positive: a pointwise op whose only symbolic dims are batch/seq (no growing
+    // symbol on any edge) is capture-eligible.
+    let pinned_out = graph.create_named_value(
+        "pinned_pointwise_out",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    let pinned_op = Node::new(NodeId(1), "Sigmoid", vec![Some(embeds)], vec![pinned_out]);
+    assert!(
+        node_capture_seq_independent(&graph, &pinned_op, &growing),
+        "an op whose only symbolic dims are batch/seq must be capturable"
+    );
+
+    // Negative: a pointwise op whose OUTPUT carries the growing KV-length symbol
+    // MUST stay eager (a different buffer extent every decode step).
+    let kv_out = graph.create_named_value(
+        "kv_pointwise_out",
+        DataType::Float32,
+        vec![sym(seq_kv), st(128)],
+    );
+    let kv_op = Node::new(NodeId(2), "Sigmoid", vec![Some(embeds)], vec![kv_out]);
+    assert!(
+        !node_capture_seq_independent(&graph, &kv_op, &growing),
+        "an op whose output carries the growing KV-length symbol must stay eager"
+    );
+}
+
+// Finding 1 (downstream-consumer alias — the hard case Harry called out).
+// Shape inference substitutes the lower-id representative when broadcasting two
+// distinct symbols (`context.rs::broadcast_dim`), so a growing KV symbol can be
+// unified INTO `batch` on an aliasing op's OUTPUT; a DOWNSTREAM pointwise op then
+// copies that shape, and BOTH its edges show only the pinned-looking `batch`.
+// Exact per-symbol membership on the raw growing set would wrongly admit that
+// consumer (silent decode corruption). `compute_capture_growing_symbols` closes
+// the growing set under that same unification, so `batch` is marked growing and
+// BOTH the aliasing op AND its downstream consumer stay EAGER. This asserts the
+// consumer, not just the first aliasing op — the exact hole the re-review flagged.
+#[test]
+fn growing_symbol_alias_keeps_downstream_consumer_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    let embeds =
+        graph.create_named_value("inputs_embeds", DataType::Float32, vec![sym(batch), st(64)]);
+    graph.add_input(embeds);
+    // GQA mints the growing `seq_kv` on past_key's penultimate axis.
+    let past_key = graph.create_named_value(
+        "past_key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+    );
+    graph.add_input(past_key);
+    let logits = graph.create_named_value("logits", DataType::Float32, vec![sym(batch), st(32000)]);
+    graph.add_output(logits);
+    let mut gqa = Node::new(
+        NodeId(0),
+        "GroupQueryAttention",
+        vec![
+            Some(embeds),
+            Some(embeds),
+            Some(embeds),
+            Some(past_key),
+            Some(past_key),
+        ],
+        vec![],
+    );
+    gqa.domain = "com.microsoft".to_string();
+    graph.insert_node(gqa);
+
+    // Aliasing broadcast op: input carries the growing `seq_kv`, the other input
+    // carries `batch`; inference unifies them and writes the lower-id
+    // representative (`batch`, created first) onto the OUTPUT `aliased_out`.
+    let kv_shaped =
+        graph.create_named_value("kv_shaped_in", DataType::Float32, vec![sym(seq_kv), st(64)]);
+    graph.add_input(kv_shaped);
+    let batch_shaped = graph.create_named_value(
+        "batch_shaped_in",
+        DataType::Float32,
+        vec![sym(batch), st(64)],
+    );
+    graph.add_input(batch_shaped);
+    let aliased_out =
+        graph.create_named_value("aliased_out", DataType::Float32, vec![sym(batch), st(64)]);
+    let aliased_op = Node::new(
+        NodeId(1),
+        "Add",
+        vec![Some(kv_shaped), Some(batch_shaped)],
+        vec![aliased_out],
+    );
+    graph.insert_node(aliased_op.clone());
+
+    // Downstream consumer: reads and re-emits ONLY the representative `batch` on
+    // both edges — no raw `seq_kv` anywhere on this op.
+    let consumer_out = graph.create_named_value(
+        "downstream_consumer_out",
+        DataType::Float32,
+        vec![sym(batch), st(64)],
+    );
+    let consumer_op = Node::new(
+        NodeId(2),
+        "Sigmoid",
+        vec![Some(aliased_out)],
+        vec![consumer_out],
+    );
+
+    // Drive REAL inference: the `Add` broadcast records union(seq_kv, batch) via
+    // the single `broadcast_dim` chokepoint, persisting it onto
+    // `graph.symbol_unifications` — the authoritative record the closure reads.
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference on the alias graph must succeed");
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&seq_kv),
+        "the growing KV symbol must be collected, got {growing:?}"
+    );
+    assert!(
+        growing.contains(&batch),
+        "the representative `batch` unified with a growing symbol must be in the CLOSED growing \
+         set, got {growing:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &aliased_op, &growing),
+        "the first-hop aliasing op must stay eager"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &consumer_op, &growing),
+        "the DOWNSTREAM consumer whose edges show only the representative must ALSO stay eager \
+         (this fails on an un-closed exact-membership denylist)"
+    );
+}
+
+// Finding 1, NON-elementwise aliasing (the escape Harry reproduced). Shape
+// inference substitutes the lower-id representative for two distinct symbols not
+// only in elementwise `broadcast`, but wherever any handler broadcasts — here a
+// `MatMul` batch-dim broadcast (`linalg.rs::matmul_shape` → `ctx.broadcast`):
+// `[seq_kv, M, K] @ [batch, K, N] -> [batch, M, N]` ERASES the growing `seq_kv`
+// batch symbol into the pinned-looking `batch`. A downstream pointwise op then
+// copies `[batch, M, N]` onto both edges. An elementwise-only closure (the prior
+// revision) does NOT union MatMul batch dims, so it wrongly admitted that
+// consumer — silent decode corruption. The authoritative
+// `Graph::symbol_unifications` record (populated at the single `broadcast_dim`
+// chokepoint that MatMul also funnels through) closes the growing set over
+// `union(seq_kv, batch)`, so `batch` is marked growing and the consumer stays
+// EAGER — with zero per-op enumeration in the executor. This drives REAL
+// inference so the record→close path is exercised end to end; it FAILS on
+// HEAD 817eee53 (elementwise-only closure ignores the MatMul alias).
+#[test]
+fn matmul_batch_alias_keeps_downstream_consumer_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    // `batch` is created first, so its id is lower and it becomes the surviving
+    // representative — the case where the growing symbol is genuinely erased.
+    let batch = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    // Declared `past_key` KV boundary mints the growing `seq_kv` (source-2 scan).
+    let past_key = graph.create_named_value(
+        "past_key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+    );
+    graph.add_input(past_key);
+
+    // MatMul batch-dim broadcast: lhs batch axis = growing `seq_kv`, rhs batch
+    // axis = `batch`; the contraction (last two) axes are static and match.
+    let lhs = graph.create_named_value("qk", DataType::Float32, vec![sym(seq_kv), st(8), st(16)]);
+    graph.add_input(lhs);
+    let rhs = graph.create_named_value("w", DataType::Float32, vec![sym(batch), st(16), st(32)]);
+    graph.add_input(rhs);
+    let matmul_out = graph.create_named_value(
+        "matmul_out",
+        DataType::Float32,
+        vec![sym(batch), st(8), st(32)],
+    );
+    let matmul = Node::new(
+        NodeId(0),
+        "MatMul",
+        vec![Some(lhs), Some(rhs)],
+        vec![matmul_out],
+    );
+    graph.insert_node(matmul);
+
+    // Downstream consumer sees ONLY the representative `batch` on both edges.
+    let consumer_out = graph.create_named_value(
+        "matmul_consumer_out",
+        DataType::Float32,
+        vec![sym(batch), st(8), st(32)],
+    );
+    let consumer = Node::new(
+        NodeId(1),
+        "Sigmoid",
+        vec![Some(matmul_out)],
+        vec![consumer_out],
+    );
+    graph.insert_node(consumer.clone());
+    graph.add_output(consumer_out);
+
+    // Real inference records union(seq_kv, batch) at the MatMul batch broadcast.
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference on the MatMul-alias graph must succeed");
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&seq_kv),
+        "the growing KV symbol must be collected, got {growing:?}"
+    );
+    assert!(
+        growing.contains(&batch),
+        "the representative `batch` a MatMul batch-dim broadcast unified with the growing \
+         `seq_kv` must be in the CLOSED growing set — this FAILS on an elementwise-only closure, \
+         got {growing:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &consumer, &growing),
+        "the downstream consumer whose edges show only the MatMul-aliased representative must \
+         stay EAGER"
+    );
+}
+
+// Round-4 escape (Harry): a DERIVED-symbol lineage loss. `Reshape([seq_kv,8],
+// [-1])` forms the derived expression `seq_kv*8`; `SymbolInterner::lower` interns
+// that non-bare expression to a BRAND-NEW fresh `SymbolId` and (pre-fix) records
+// NOTHING, so `symbol_unifications` carries no edge `seq_kv -> fresh`. A
+// downstream `Sigmoid` carrying only the fresh symbol was wrongly classified
+// capture-safe -> silent decode corruption. The fix records a derivation edge
+// `fresh -> seq_kv` at the `lower` chokepoint and closes the disqualifying set
+// over derivation edges, so the fresh symbol is disqualifying and the `Sigmoid`
+// stays EAGER. This drives REAL inference so the `lower`->record->close path is
+// exercised end to end; it FAILS on HEAD 571ea0d9 (no derivation provenance).
+#[test]
+fn reshape_derived_growing_symbol_keeps_downstream_consumer_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    // Declared `past_key` KV boundary mints the growing `seq_kv` (source-2 scan).
+    let past_key = graph.create_named_value(
+        "past_key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+    );
+    graph.add_input(past_key);
+
+    // A `[seq_kv, 8]` tensor carrying the growing symbol.
+    let kv2d = graph.create_named_value("kv2d", DataType::Float32, vec![sym(seq_kv), st(8)]);
+    graph.add_input(kv2d);
+
+    // Reshape target `[-1]` as an int64 initializer -> shape-data source. The
+    // derived output dim is `seq_kv*8`, which `lower` interns to a fresh symbol.
+    let target = graph.create_named_value("reshape_target", DataType::Int64, vec![st(1)]);
+    {
+        use onnx_runtime_ir::{TensorData, WeightRef};
+        graph.set_initializer(
+            target,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int64,
+                vec![1],
+                (-1i64).to_le_bytes().to_vec(),
+            )),
+        );
+    }
+    let reshaped = graph.create_named_value("reshaped", DataType::Float32, Shape::new());
+    let reshape = Node::new(
+        NodeId(0),
+        "Reshape",
+        vec![Some(kv2d), Some(target)],
+        vec![reshaped],
+    );
+    graph.insert_node(reshape);
+
+    // Downstream consumer sees only the derived (fresh) symbol on both edges.
+    let sig_out = graph.create_named_value("reshape_sig_out", DataType::Float32, Shape::new());
+    let consumer = Node::new(NodeId(1), "Sigmoid", vec![Some(reshaped)], vec![sig_out]);
+    graph.insert_node(consumer.clone());
+    graph.add_output(sig_out);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference on the reshape-derived graph must succeed");
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&seq_kv),
+        "the growing KV symbol must be collected, got {growing:?}"
+    );
+    // The reshape output's fresh derived symbol must be in the CLOSED set (it
+    // depends on the growing `seq_kv` via the recorded derivation edge).
+    let reshaped_dim = graph
+        .try_value(reshaped)
+        .and_then(|v| v.shape.first().copied());
+    let Some(Dim::Symbolic(derived)) = reshaped_dim else {
+        panic!("reshape output must be a derived symbolic dim, got {reshaped_dim:?}");
+    };
+    assert!(
+        growing.contains(&derived),
+        "the fresh symbol `seq_kv*8` derived from a growing symbol must be in the CLOSED \
+         disqualifying set (this FAILS on HEAD 571ea0d9 — no derivation provenance), got {growing:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &consumer, &growing),
+        "the downstream consumer of a growing-derived reshape output must stay EAGER"
+    );
+}
+
+// Same round-4 escape via `Flatten` (`transform.rs::flatten`), whose collapsed
+// axes form the derived product `prod(dims[axis..])`. `Flatten` of `[seq_kv, 8]`
+// at axis=1 keeps outer `seq_kv`, but at axis=0 forms `1 x (seq_kv*8)`; here we
+// flatten `[batch, seq_kv, 8]` at axis=1 so the trailing dim is the derived
+// `seq_kv*8`. Its fresh symbol must be disqualifying and the consumer EAGER.
+#[test]
+fn flatten_derived_growing_symbol_keeps_downstream_consumer_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    let past_key = graph.create_named_value(
+        "past_key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+    );
+    graph.add_input(past_key);
+
+    let kv3d = graph.create_named_value(
+        "kv3d",
+        DataType::Float32,
+        vec![sym(batch), sym(seq_kv), st(8)],
+    );
+    graph.add_input(kv3d);
+
+    // Flatten at axis=1 -> `[batch, seq_kv*8]`; the trailing dim is derived.
+    let flat = graph.create_named_value("flat", DataType::Float32, Shape::new());
+    let mut flatten = Node::new(NodeId(0), "Flatten", vec![Some(kv3d)], vec![flat]);
+    flatten.attributes.insert("axis".into(), Attribute::Int(1));
+    graph.insert_node(flatten);
+
+    let sig_out = graph.create_named_value("flatten_sig_out", DataType::Float32, Shape::new());
+    let consumer = Node::new(NodeId(1), "Sigmoid", vec![Some(flat)], vec![sig_out]);
+    graph.insert_node(consumer.clone());
+    graph.add_output(sig_out);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference on the flatten-derived graph must succeed");
+
+    let growing = compute_capture_growing_symbols(&graph);
+    let flat_dim = graph.try_value(flat).and_then(|v| v.shape.get(1).copied());
+    let Some(Dim::Symbolic(derived)) = flat_dim else {
+        panic!("flatten trailing dim must be a derived symbolic dim, got {flat_dim:?}");
+    };
+    assert!(
+        growing.contains(&derived),
+        "the fresh symbol `seq_kv*8` derived by Flatten from a growing symbol must be in the \
+         CLOSED disqualifying set (FAILS on HEAD 571ea0d9), got {growing:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &consumer, &growing),
+        "the downstream consumer of a growing-derived flatten output must stay EAGER"
+    );
+}
+
+// FAIL-SAFE (Step 2), part 1 — provenance RECOVERS a pinned-derived fresh
+// symbol. `Reshape([batch, 8], [-1])` derives `batch*8`, interned to a fresh
+// symbol whose recorded provenance traces ONLY to the pinned root `batch`. The
+// fail-safe classifier therefore does NOT disqualify it, so the consumer stays
+// CAPTURABLE — this is precisely why the fail-safe (with the Step-1 provenance
+// record) does not regress into the naive pinned-allowlist's segment collapse:
+// a fresh symbol built purely from pinned sources is provably pinned.
+#[test]
+fn failsafe_pinned_derived_fresh_symbol_stays_capturable() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+
+    let pinned_2d =
+        graph.create_named_value("pinned_2d", DataType::Float32, vec![sym(batch), st(8)]);
+    graph.add_input(pinned_2d);
+
+    let target = graph.create_named_value("reshape_target", DataType::Int64, vec![st(1)]);
+    {
+        use onnx_runtime_ir::{TensorData, WeightRef};
+        graph.set_initializer(
+            target,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int64,
+                vec![1],
+                (-1i64).to_le_bytes().to_vec(),
+            )),
+        );
+    }
+    let reshaped = graph.create_named_value("reshaped", DataType::Float32, Shape::new());
+    let reshape = Node::new(
+        NodeId(0),
+        "Reshape",
+        vec![Some(pinned_2d), Some(target)],
+        vec![reshaped],
+    );
+    graph.insert_node(reshape);
+
+    let sig_out = graph.create_named_value("sig_out", DataType::Float32, Shape::new());
+    let consumer = Node::new(NodeId(1), "Sigmoid", vec![Some(reshaped)], vec![sig_out]);
+    graph.insert_node(consumer.clone());
+    graph.add_output(sig_out);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference must succeed");
+
+    let derived = match graph
+        .try_value(reshaped)
+        .and_then(|v| v.shape.first().copied())
+    {
+        Some(Dim::Symbolic(s)) => s,
+        other => panic!("reshape output must be a derived symbolic dim, got {other:?}"),
+    };
+
+    let not_pinned = compute_not_pinned_symbols(&graph);
+    assert!(
+        !not_pinned.contains(&derived),
+        "a fresh symbol derived only from the pinned root `batch` must NOT be disqualifying \
+         under the fail-safe classifier, got {not_pinned:?}"
+    );
+    assert!(
+        node_capture_seq_independent(&graph, &consumer, &not_pinned),
+        "a consumer of a pinned-derived reshape output must stay CAPTURABLE under fail-safe"
+    );
+}
+
+// FAIL-SAFE (Step 2), part 2 — the structural win. An inference-minted symbol
+// with NO recorded provenance (here a permissive-broadcast degrade of two
+// unequal static extents `[batch,4] (+) [batch,5]`, standing in for any
+// data-dependent `NonZero`/`Range`/`Slice` fresh dim) is UNTRACEABLE. The
+// DENYLIST admits it (not proven growing ⇒ capturable) — the latent
+// silent-corruption hole. The FAIL-SAFE classifier disqualifies it (unknown ⇒
+// eager ⇒ safe), structurally eliminating the whole "unrecorded lineage site"
+// bug class without a per-site whack-a-mole fix.
+#[test]
+fn failsafe_untraceable_minted_symbol_is_eager_but_denylist_admits_it() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+
+    let a = graph.create_named_value("a", DataType::Float32, vec![sym(batch), st(4)]);
+    let b = graph.create_named_value("b", DataType::Float32, vec![sym(batch), st(5)]);
+    graph.add_input(a);
+    graph.add_input(b);
+    // Permissive broadcast of unequal, non-1 static extents mints an honest
+    // "unknown" fresh symbol with no provenance (context.rs `broadcast_dim`).
+    let added = graph.create_named_value("added", DataType::Float32, Shape::new());
+    let add = Node::new(NodeId(0), "Add", vec![Some(a), Some(b)], vec![added]);
+    graph.insert_node(add);
+
+    let sig_out = graph.create_named_value("sig_out", DataType::Float32, Shape::new());
+    let consumer = Node::new(NodeId(1), "Sigmoid", vec![Some(added)], vec![sig_out]);
+    graph.insert_node(consumer.clone());
+    graph.add_output(sig_out);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference must succeed");
+
+    let unknown = match graph.try_value(added).and_then(|v| v.shape.get(1).copied()) {
+        Some(Dim::Symbolic(s)) => s,
+        other => panic!("Add output last dim must be an unknown minted symbol, got {other:?}"),
+    };
+    assert!(
+        unknown.0
+            >= graph
+                .inference_symbol_floor
+                .expect("inference sets the floor"),
+        "the degrade symbol must be inference-minted (id above the floor)"
+    );
+
+    // DENYLIST: not growing, no provenance ⇒ capturable (the latent hole).
+    let denylist = compute_capture_growing_symbols(&graph);
+    assert!(
+        !denylist.contains(&unknown),
+        "the denylist does not disqualify an untraceable minted symbol, got {denylist:?}"
+    );
+    assert!(
+        node_capture_seq_independent(&graph, &consumer, &denylist),
+        "under the denylist the consumer of an untraceable symbol is (unsafely) capturable"
+    );
+
+    // FAIL-SAFE: untraceable minted symbol ⇒ disqualifying ⇒ consumer EAGER.
+    let not_pinned = compute_not_pinned_symbols(&graph);
+    assert!(
+        not_pinned.contains(&unknown),
+        "the fail-safe classifier must disqualify an untraceable minted symbol, got {not_pinned:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &consumer, &not_pinned),
+        "under fail-safe the consumer of an untraceable symbol must stay EAGER"
+    );
+}
+
+// Finding 2 (coverage of CompressedSparseAttention): CSA mints a growing
+// cache-record symbol from `total_sequence_length` on `outputs[1]`/`[3]`
+// (`[query[0], records, width]`). The `attention_kv_cache_slots` CSA entry
+// collects that symbol as GROWING, so any pointwise op consuming a CSA cache
+// tensor stays EAGER on the denylist — closing the finding-2 gap that the old
+// 3-op collector left open.
+#[test]
+fn csa_cache_record_symbol_keeps_consuming_ops_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq = graph.create_symbol(None);
+    let records = graph.create_symbol(None); // total_sequence_length-derived
+
+    let embeds = graph.create_named_value(
+        "inputs_embeds",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    graph.add_input(embeds);
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(32000)],
+    );
+    graph.add_output(logits);
+
+    // CSA output[1] cache record: `[query[0], records, width]`, penultimate =
+    // records (the growing total-sequence-length-derived axis).
+    let attn_out = graph.create_named_value(
+        "csa_attn",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    let cache_out = graph.create_named_value(
+        "csa_cache",
+        DataType::Float32,
+        vec![sym(batch), sym(records), st(64)],
+    );
+    let mut csa = Node::new(
+        NodeId(0),
+        "CompressedSparseAttention",
+        vec![Some(embeds)],
+        vec![attn_out, cache_out],
+    );
+    csa.domain = "pkg.nxrt".to_string();
+    graph.insert_node(csa);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&records),
+        "the CSA total_sequence_length-derived cache-record symbol must be GROWING, got {growing:?}"
+    );
+
+    // A pointwise op consuming the CSA cache tensor stays eager.
+    let cache_pointwise = graph.create_named_value(
+        "csa_cache_pointwise",
+        DataType::Float32,
+        vec![sym(batch), sym(records), st(64)],
+    );
+    let cache_op = Node::new(
+        NodeId(1),
+        "Relu",
+        vec![Some(cache_out)],
+        vec![cache_pointwise],
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &cache_op, &growing),
+        "an op consuming a CSA cache-record tensor must stay eager"
+    );
+}
+
+// Finding 2 (CSA ratio-4 output 5 `selections`): the dynamic ratio-4 variant
+// mints a fresh, growing `selections` symbol on the LAST axis of output 5
+// (`[query[0], index_heads, query_seq, selections]`,
+// custom_ops.rs::compressed_sparse_attention). The penultimate scan that covers
+// outputs 1/3 would miss it, so `KvCacheSlots::last_axis_outputs` collects the
+// trailing axis of output 5. A pointwise op consuming that `selections`-shaped
+// value must therefore stay EAGER.
+#[test]
+fn csa_output5_selections_symbol_keeps_consuming_ops_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq = graph.create_symbol(None);
+    let records = graph.create_symbol(None); // total_sequence_length-derived
+    let selections = graph.create_symbol(None); // output-5 last axis (fresh, growing)
+
+    let embeds = graph.create_named_value(
+        "inputs_embeds",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    graph.add_input(embeds);
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(32000)],
+    );
+    graph.add_output(logits);
+
+    // Six ratio-4 outputs. Output 0 = attention; outputs 1/3 = cache records
+    // (penultimate `records`); outputs 2/4 = static compressor tensors; output 5
+    // = `[query[0], index_heads, query_seq, selections]` (selections on LAST
+    // axis). Only `records` and `selections` are growing.
+    let out0 = graph.create_named_value(
+        "csa_attn",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    let out1 = graph.create_named_value(
+        "csa_cache",
+        DataType::Float32,
+        vec![sym(batch), sym(records), st(64)],
+    );
+    let out2 = graph.create_named_value(
+        "csa_comp",
+        DataType::Float32,
+        vec![sym(batch), st(8), st(2), st(128)],
+    );
+    let out3 = graph.create_named_value(
+        "csa_index",
+        DataType::Uint8,
+        vec![sym(batch), sym(records), st(8)],
+    );
+    let out4 = graph.create_named_value(
+        "csa_index_comp",
+        DataType::Float32,
+        vec![sym(batch), st(8), st(2), st(64)],
+    );
+    let out5 = graph.create_named_value(
+        "csa_selections",
+        DataType::Int32,
+        vec![sym(batch), st(8), sym(seq), sym(selections)],
+    );
+    let mut csa = Node::new(
+        NodeId(0),
+        "CompressedSparseAttention",
+        vec![Some(embeds)],
+        vec![out0, out1, out2, out3, out4, out5],
+    );
+    csa.domain = "pkg.nxrt".to_string();
+    graph.insert_node(csa);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&selections),
+        "the CSA output-5 last-axis `selections` symbol must be GROWING, got {growing:?}"
+    );
+    assert!(
+        growing.contains(&records),
+        "the CSA output-1/3 penultimate `records` symbol must be GROWING, got {growing:?}"
+    );
+
+    // A pointwise op consuming the CSA `selections`-shaped output stays eager.
+    let sel_pointwise = graph.create_named_value(
+        "csa_selections_pointwise",
+        DataType::Int32,
+        vec![sym(batch), st(8), sym(seq), sym(selections)],
+    );
+    let sel_op = Node::new(NodeId(1), "Sign", vec![Some(out5)], vec![sel_pointwise]);
+    assert!(
+        !node_capture_seq_independent(&graph, &sel_op, &growing),
+        "an op consuming the CSA output-5 `selections` axis must stay eager"
+    );
+}
+
+// Finding 2 (generic declared-KV-I/O coverage): even without any recognized
+// attention op, a model that declares a `present…` rank-4 KV output boundary
+// tensor (`[batch, kv_heads, present_seq, head_dim]`) has its growing sequence
+// symbol collected by the generic scan, so a pointwise op sized by it stays
+// eager. This is what makes finding-2 robust against unrecognized attention
+// variants without minting a per-op entry.
+#[test]
+fn generic_declared_present_kv_output_is_collected_as_growing() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let present_seq = graph.create_symbol(None);
+
+    // Declared `present.0.key` KV output with a rank-4 layout and a symbolic
+    // penultimate (sequence) axis — the ONNX GenAI KV-cache contract.
+    let present_key = graph.create_named_value(
+        "present.0.key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(present_seq), st(64)],
+    );
+    graph.add_output(present_key);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&present_seq),
+        "a declared present.* rank-4 KV output's sequence symbol must be GROWING, got {growing:?}"
+    );
+
+    let out = graph.create_named_value(
+        "kv_sized_out",
+        DataType::Float32,
+        vec![sym(batch), sym(present_seq), st(64)],
+    );
+    let op = Node::new(NodeId(0), "Sigmoid", vec![Some(present_key)], vec![out]);
+    assert!(
+        !node_capture_seq_independent(&graph, &op, &growing),
+        "an op sized by a declared present.* KV sequence symbol must stay eager"
+    );
+}
+
+// Design tradeoff of the growing DENYLIST (the accepted fallback): a benign
+// FRESH symbol — one warm-decode-seeded from a data-dependent extent, neither
+// batch/query-seq nor on a KV sequence axis — is NOT in the growing set, so an op
+// carrying it stays CAPTURABLE. This is deliberate and load-bearing: a pinned
+// ALLOWLIST would keep all such ops eager and dissolve the 154→34 collapse. Only
+// a genuinely growing dim disqualifies an op.
+#[test]
+fn benign_fresh_symbol_is_not_growing_and_stays_capturable() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq = graph.create_symbol(None);
+    let fresh = graph.create_symbol(None); // warm-seeded data-dependent extent
+
+    let embeds = graph.create_named_value(
+        "inputs_embeds",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    graph.add_input(embeds);
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(32000)],
+    );
+    graph.add_output(logits);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        !growing.contains(&fresh),
+        "a fresh non-KV symbol must NOT be growing, got {growing:?}"
+    );
+
+    let out = graph.create_named_value(
+        "fresh_out",
+        DataType::Float32,
+        vec![sym(batch), sym(fresh), st(128)],
+    );
+    let op = Node::new(NodeId(0), "Sigmoid", vec![Some(embeds)], vec![out]);
+    assert!(
+        node_capture_seq_independent(&graph, &op, &growing),
+        "an op carrying only a benign fresh (non-growing) symbol must stay capturable"
+    );
+}
+
+// A recurrent-state cache (GatedDeltaNet conv/recurrent state) has a STATIC
+// penultimate axis, so it must NOT contribute a growing symbol — the whole point
+// that lets GDN pointwise ops become capture-eligible. A pure-recurrent graph
+// with no attention KV cache yields an empty growing set (broaden all), which is
+// correct: nothing grows step-to-step.
+#[test]
+fn recurrent_state_shapes_contribute_no_growing_symbols() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let batch = graph.create_symbol(None);
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    // A fixed-capacity recurrent conv state: penultimate axis is STATIC.
+    let conv_state = graph.create_named_value(
+        "conv_state",
+        DataType::Float32,
+        vec![sym(batch), st(16), st(4), st(128)],
+    );
+    let q = graph.create_named_value("q", DataType::Float32, vec![sym(batch), st(1), st(512)]);
+    // A default-domain `Attention` node with the recurrent state at input 4:
+    // because its penultimate axis is static, no growing symbol is collected.
+    let attention = Node::new(
+        NodeId(0),
+        "Attention",
+        vec![Some(q), Some(q), Some(q), Some(q), Some(conv_state)],
+        vec![],
+    );
+    graph.insert_node(attention);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.is_empty(),
+        "a static-penultimate recurrent state must contribute no growing symbols, got {growing:?}"
+    );
+}
+
 #[test]
 fn only_capacity_aware_inputs_keep_physical_capacity() {
     let shape = Node::new(NodeId(0), "Shape", vec![], vec![]);
@@ -712,6 +1942,8 @@ fn only_capacity_aware_inputs_keep_physical_capacity() {
 
 struct WeightDeliveryKernel {
     deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    workspace_bytes: u64,
+    workspace_bytes_per_row: u64,
 }
 
 impl WeightDeliveryKernel {
@@ -731,6 +1963,30 @@ impl WeightDeliveryKernel {
 }
 
 impl Kernel for WeightDeliveryKernel {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+        let rows = inputs
+            .first()
+            .and_then(|input| input.shape.first())
+            .copied()
+            .unwrap_or(1) as u64;
+        let bytes = if self.workspace_bytes_per_row == 0 {
+            self.workspace_bytes
+        } else {
+            self.workspace_bytes_per_row
+                .checked_mul(rows)
+                .ok_or_else(|| EpError::KernelFailed("test workspace overflow".into()))?
+        };
+        Ok(WorkspaceRequirement {
+            bytes,
+            alignment: if rows >= 4 { 512 } else { 256 },
+            lifetime: WorkspaceLifetime::SessionPersistent,
+            role: onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+        })
+    }
+
     fn execute(
         &self,
         inputs: &[TensorView],
@@ -766,6 +2022,53 @@ impl Kernel for WeightDeliveryKernel {
     }
 }
 
+struct WorkspaceOnlyKernel {
+    bytes: u64,
+}
+
+impl Kernel for WorkspaceOnlyKernel {
+    fn workspace_requirement(
+        &self,
+        _inputs: &[TensorMetadata<'_>],
+    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+        Ok(WorkspaceRequirement {
+            bytes: self.bytes,
+            alignment: 256,
+            lifetime: WorkspaceLifetime::SessionPersistent,
+            role: MemoryRole::Workspace { step_scoped: false },
+        })
+    }
+
+    fn execute(
+        &self,
+        _inputs: &[TensorView],
+        _outputs: &mut [TensorMut],
+    ) -> onnx_runtime_ep_api::Result<()> {
+        Err(EpError::KernelFailed(
+            "test workspace-only kernel requires prepared workspace".into(),
+        ))
+    }
+
+    fn execute_with_workspace(
+        &self,
+        _inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        let workspace =
+            workspace.ok_or_else(|| EpError::KernelFailed("missing test workspace".into()))?;
+        if workspace.bytes() < self.bytes as usize {
+            return Err(EpError::KernelFailed(
+                "test workspace was undersized".into(),
+            ));
+        }
+        unsafe {
+            std::ptr::write_bytes(outputs[0].data.0.cast::<u8>(), 0, outputs[0].byte_size());
+        }
+        Ok(())
+    }
+}
+
 struct WeightDeliveryEp {
     cpu: CpuExecutionProvider,
     lazy: bool,
@@ -774,6 +2077,11 @@ struct WeightDeliveryEp {
     device: onnx_runtime_ir::DeviceId,
     allocations: Arc<AtomicUsize>,
     host_uploads: Arc<AtomicUsize>,
+    workspace_bytes: u64,
+    workspace_bytes_per_row: u64,
+    support_index_share_workspace: bool,
+    fail_next_allocation: Arc<AtomicBool>,
+    fail_allocation_size: Arc<AtomicUsize>,
 }
 
 impl WeightDeliveryEp {
@@ -819,6 +2127,11 @@ impl WeightDeliveryEp {
             device,
             allocations,
             host_uploads,
+            workspace_bytes: 0,
+            workspace_bytes_per_row: 0,
+            support_index_share_workspace: false,
+            fail_next_allocation: Arc::new(AtomicBool::new(false)),
+            fail_allocation_size: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -890,7 +2203,18 @@ impl ExecutionProvider for WeightDeliveryEp {
                 "OptionalContract requires [Float32, Undefined, Bool] input dtypes, got {input_dtypes:?}"
             ));
         }
+        if self.support_index_share_workspace
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
+            && op.op_type == "IndexShare"
+        {
+            return KernelMatch::Supported {
+                cost: Cost::ZERO,
+                required_input_layouts: None,
+                output_layouts: vec![TensorLayout::contiguous()],
+            };
+        }
         if LazyWeightBoundary::BlockQuantizedMoe.matches(&op.domain, &op.op_type)
+            || LazyWeightBoundary::MatMulNBits.matches(&op.domain, &op.op_type)
             || (op.is_default_domain() && op.op_type == "Identity")
         {
             KernelMatch::Supported {
@@ -909,16 +2233,42 @@ impl ExecutionProvider for WeightDeliveryEp {
 
     fn get_kernel(
         &self,
-        _op: &Node,
+        op: &Node,
         _shapes: &[Vec<usize>],
         _opset: u64,
     ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+        if self.support_index_share_workspace
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
+            && op.op_type == "IndexShare"
+        {
+            return Ok(Box::new(WorkspaceOnlyKernel {
+                bytes: self.workspace_bytes,
+            }));
+        }
         Ok(Box::new(WeightDeliveryKernel {
             deliveries: Arc::clone(&self.deliveries),
+            workspace_bytes: self.workspace_bytes,
+            workspace_bytes_per_row: self.workspace_bytes_per_row,
         }))
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
+        if self.fail_next_allocation.swap(false, Ordering::Relaxed) {
+            return Err(EpError::OutOfMemory {
+                requested: size,
+                available: 0,
+            });
+        }
+        if self
+            .fail_allocation_size
+            .compare_exchange(size, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Err(EpError::OutOfMemory {
+                requested: size,
+                available: 0,
+            });
+        }
         self.allocations.fetch_add(1, Ordering::Relaxed);
         if self.device.is_host_accessible() {
             return self.cpu.allocate(size, alignment);
@@ -996,6 +2346,44 @@ impl ExecutionProvider for WeightDeliveryEp {
         }
         self.copy_bytes(src.as_ptr().cast(), dst.as_mut_ptr(), dst.len())
     }
+
+    fn prefetch_lazy_weight(
+        &self,
+        _key: u64,
+        _weight: &onnx_runtime_ep_api::LazyWeight,
+        _source: &dyn onnx_runtime_ep_api::MmapRegionSource,
+    ) -> onnx_runtime_ep_api::Result<bool> {
+        self.deliveries.lock().unwrap().push("prefetch");
+        Ok(true)
+    }
+
+    fn reserve_workspace(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> onnx_runtime_ep_api::Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
+        assert_eq!(role, MemoryRole::Workspace { step_scoped: false });
+        self.deliveries.lock().unwrap().push("reserve_workspace");
+        // Static-bytes fixtures reserve exactly `workspace_bytes`. The per-row
+        // fixture (`workspace_bytes_per_row != 0`, e.g.
+        // `inference_session_fallback_workspace_grows_retries_and_reuses`)
+        // reserves `rows * per_row`, so the governed reservation legitimately
+        // scales with the input row count — 2048 for 2 rows, 4096 for 4. This
+        // method has no row count to recompute the exact figure, so it asserts
+        // the non-vacuous invariant that the reservation is a positive multiple
+        // of the per-row size (the exact bytes are separately pinned at each
+        // call site). A zero or mis-sized reservation still fails here.
+        if self.workspace_bytes_per_row == 0 {
+            assert_eq!(bytes, self.workspace_bytes);
+        } else {
+            assert!(
+                bytes != 0 && bytes.is_multiple_of(self.workspace_bytes_per_row),
+                "per-row workspace reservation {bytes} must be a positive multiple of {}",
+                self.workspace_bytes_per_row
+            );
+        }
+        Ok(None)
+    }
 }
 
 fn weight_delivery_fixture() -> (Graph, Arc<WeightStore>, std::path::PathBuf) {
@@ -1035,6 +2423,279 @@ fn weight_delivery_fixture() -> (Graph, Arc<WeightStore>, std::path::PathBuf) {
     node.domain = "pkg.nxrt".into();
     graph.insert_node(node);
     graph.add_output(output);
+
+    let mut store = WeightStore::new();
+    store.map_external(&path).unwrap();
+    (graph, Arc::new(store), path)
+}
+
+#[test]
+fn prepare_reserves_static_nested_qmoe_workspace_and_child_reuses_it() {
+    fn branch(name: &str) -> Graph {
+        let mut graph = Graph::new();
+        let input = graph.create_named_value(
+            format!("{name}_input"),
+            DataType::Float32,
+            static_shape([4]),
+        );
+        graph.set_initializer(
+            input,
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                DataType::Float32,
+                vec![4],
+                [1.0f32, 2.0, 3.0, 4.0]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            )),
+        );
+        let output = graph.create_named_value(
+            format!("{name}_output"),
+            DataType::Float32,
+            static_shape([4]),
+        );
+        let mut node = Node::new(
+            NodeId(0),
+            "BlockQuantizedMoE",
+            vec![Some(input)],
+            vec![output],
+        );
+        node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+        graph.insert_node(node);
+        graph.add_output(output);
+        graph
+    }
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    graph
+        .opset_imports
+        .insert(onnx_runtime_ir::RUNTIME_DOMAIN.into(), 1);
+    let cond = graph.create_named_value("cond", DataType::Bool, static_shape([]));
+    graph.add_input(cond);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([4]));
+    graph.add_output(output);
+    let if_id = NodeId(0);
+    graph.insert_node(Node::new(if_id, "If", vec![Some(cond)], vec![output]));
+    graph
+        .subgraphs
+        .insert((if_id, "then_branch".into()), branch("then"));
+    graph
+        .subgraphs
+        .insert((if_id, "else_branch".into()), branch("else"));
+
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ep = WeightDeliveryEp::new(false, deliveries);
+    ep.workspace_bytes = 4096;
+    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let cond = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
+    let requirement = executor
+        .prepare_with_device_bindings(&[("cond", &cond)], &mut [])
+        .unwrap();
+    assert_eq!(requirement.bytes, 4096);
+    assert_eq!(executor.persistent_workspace.as_ref().unwrap().bytes, 4096);
+
+    let output = executor.run(&[("cond", &cond)]).unwrap();
+    assert_eq!(output[0].to_vec_f32(), vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn prepare_reserves_static_index_share_workspace() {
+    let mut graph = Graph::new();
+    graph
+        .opset_imports
+        .insert(onnx_runtime_ir::RUNTIME_DOMAIN.into(), 1);
+    let q = graph.create_named_value("q", DataType::Float32, static_shape([1, 2, 3, 4]));
+    let k = graph.create_named_value("k", DataType::Float32, static_shape([1, 1, 3, 4]));
+    let v = graph.create_named_value("v", DataType::Float32, static_shape([1, 1, 3, 4]));
+    let selected =
+        graph.create_named_value("selected", DataType::Int64, static_shape([1, 1, 3, 2]));
+    for input in [q, k, v, selected] {
+        graph.add_input(input);
+    }
+    let out = graph.create_named_value("out", DataType::Float32, static_shape([1, 2, 3, 4]));
+    graph.add_output(out);
+    let mut node = Node::new(
+        NodeId(0),
+        "IndexShare",
+        vec![Some(q), Some(k), Some(v), None, None, Some(selected)],
+        vec![out],
+    );
+    node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+    graph.insert_node(node);
+
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ep = WeightDeliveryEp::new(false, Arc::clone(&deliveries));
+    ep.support_index_share_workspace = true;
+    ep.workspace_bytes = 768;
+    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let q_tensor = Tensor::zeros(DataType::Float32, vec![1, 2, 3, 4]).unwrap();
+    let k_tensor = Tensor::zeros(DataType::Float32, vec![1, 1, 3, 4]).unwrap();
+    let v_tensor = Tensor::zeros(DataType::Float32, vec![1, 1, 3, 4]).unwrap();
+    let selected_tensor = Tensor::from_i64(&[1, 1, 3, 2], &[0, 1, 0, 1, 0, 1]).unwrap();
+    let requirement = executor
+        .prepare_with_device_bindings(
+            &[
+                ("q", &q_tensor),
+                ("k", &k_tensor),
+                ("v", &v_tensor),
+                ("selected", &selected_tensor),
+            ],
+            &mut [],
+        )
+        .unwrap();
+    assert_eq!(requirement.bytes, 768);
+    assert_eq!(
+        requirement.role,
+        MemoryRole::Workspace { step_scoped: false }
+    );
+    assert_eq!(executor.persistent_workspace.as_ref().unwrap().bytes, 768);
+    assert_eq!(
+        deliveries.lock().unwrap().as_slice(),
+        ["reserve_workspace"],
+        "IndexShare prepare must use the governed workspace path instead of an internal raw allocation"
+    );
+}
+
+#[test]
+fn inference_session_fallback_workspace_grows_retries_and_reuses() {
+    let mut graph = Graph::new();
+    graph
+        .opset_imports
+        .insert(onnx_runtime_ir::RUNTIME_DOMAIN.into(), 1);
+    let rows = SymbolId(0);
+    let shape = vec![Dim::Symbolic(rows)];
+    let input = graph.create_named_value("input", DataType::Float32, shape.clone());
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, shape);
+    graph.add_output(output);
+    let mut node = Node::new(
+        NodeId(0),
+        "BlockQuantizedMoE",
+        vec![Some(input)],
+        vec![output],
+    );
+    node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+    graph.insert_node(node);
+
+    let inputs = crate::io_meta(&graph, &graph.inputs);
+    let outputs = crate::io_meta(&graph, &graph.outputs);
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ep = WeightDeliveryEp::new(false, deliveries);
+    ep.workspace_bytes_per_row = 1024;
+    let fail_size = Arc::clone(&ep.fail_allocation_size);
+    let exec = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let mut session = crate::InferenceSession {
+        inputs,
+        outputs,
+        model_metadata: crate::ModelMetadata::default(),
+        exec,
+        decode_inline_exec: None,
+        ep_context_config: crate::EpContextDumpConfig::default(),
+    };
+
+    let small = Tensor::from_f32(&[2], &[1.0, 2.0]).unwrap();
+    assert_eq!(
+        session.run(&[("input", &small)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0]
+    );
+    assert_eq!(
+        session.exec.persistent_workspace.as_ref().unwrap().bytes,
+        2048
+    );
+    assert_eq!(
+        session
+            .exec
+            .persistent_workspace
+            .as_ref()
+            .unwrap()
+            .alignment,
+        256
+    );
+
+    let large = Tensor::from_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    fail_size.store(4096, Ordering::Relaxed);
+    let _error = session
+        .run(&[("input", &large)])
+        .expect_err("workspace replacement allocation must fail once");
+    assert!(
+        session.exec.persistent_workspace.is_none(),
+        "failed growth must leave a valid empty slot"
+    );
+
+    assert_eq!(
+        session.run(&[("input", &large)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    let grown = session.exec.persistent_workspace.as_ref().unwrap();
+    assert_eq!(grown.bytes, 4096);
+    assert_eq!(grown.alignment, 512);
+    let ptr = grown.buffer.as_ptr();
+
+    assert_eq!(
+        session.run(&[("input", &small)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0]
+    );
+    let reused = session.exec.persistent_workspace.as_ref().unwrap();
+    assert_eq!(reused.bytes, 4096);
+    assert_eq!(reused.buffer.as_ptr(), ptr);
+}
+
+fn two_node_weight_delivery_fixture() -> (Graph, Arc<WeightStore>, std::path::PathBuf) {
+    static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap().join("target"))
+        .join("weight-handle-tests");
+    std::fs::create_dir_all(&root).unwrap();
+    let id = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+    let path = root.join(format!("matmul-nbits-pair-{}-{id}.bin", std::process::id()));
+    std::fs::write(&path, [1u8, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+    let first_weight = graph.create_named_value("first_weight", DataType::Uint8, static_shape([4]));
+    let second_weight =
+        graph.create_named_value("second_weight", DataType::Uint8, static_shape([4]));
+    graph.set_initializer(
+        first_weight,
+        WeightRef::External {
+            path: path.clone(),
+            offset: 0,
+            length: 4,
+            dtype: DataType::Uint8,
+            dims: vec![4],
+        },
+    );
+    graph.set_initializer(
+        second_weight,
+        WeightRef::External {
+            path: path.clone(),
+            offset: 4,
+            length: 4,
+            dtype: DataType::Uint8,
+            dims: vec![4],
+        },
+    );
+    let first_output = graph.create_named_value("first_output", DataType::Uint8, static_shape([4]));
+    let final_output = graph.create_named_value("final_output", DataType::Uint8, static_shape([4]));
+    let mut first = Node::new(
+        NodeId(0),
+        "MatMulNBits",
+        vec![Some(first_weight)],
+        vec![first_output],
+    );
+    first.domain = "com.microsoft".into();
+    graph.insert_node(first);
+    let mut second = Node::new(
+        NodeId(1),
+        "MatMulNBits",
+        vec![Some(second_weight), Some(first_output)],
+        vec![final_output],
+    );
+    second.domain = "com.microsoft".into();
+    graph.insert_node(second);
+    graph.add_output(final_output);
 
     let mut store = WeightStore::new();
     store.map_external(&path).unwrap();
@@ -1185,6 +2846,33 @@ fn executor_selects_lazy_or_resident_weight_delivery_from_ep_capability() {
         drop(executor);
         std::fs::remove_file(path).unwrap();
     }
+}
+
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "Miri cannot model the file-backed memmap2 mmap used by WeightStore::map_external"
+)]
+fn executor_prefetches_next_lazy_weight_before_current_node_runs() {
+    // This fixture deliberately uses an external initializer because the lazy
+    // weight production path requires mmap provenance. Miri rejects that mmap
+    // syscall before executor dispatch, so the Miri suite covers the pure
+    // executor prefetch machinery in `executor::prefetch::tests` instead.
+    let (graph, weights, path) = two_node_weight_delivery_fixture();
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ep: Arc<dyn ExecutionProvider> =
+        Arc::new(WeightDeliveryEp::new(true, Arc::clone(&deliveries)));
+    let mut executor = Executor::build(graph, weights, ep).unwrap();
+    let outputs = executor.run(&[]).unwrap();
+
+    assert_eq!(outputs[0].as_bytes(), &[5, 6, 7, 8]);
+    assert_eq!(
+        &*deliveries.lock().unwrap(),
+        &["prefetch", "lazy", "lazy"],
+        "the executor must drive a production lookahead call before dispatching node 0"
+    );
+    drop(executor);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -2416,6 +4104,16 @@ fn warm_decode_seeding_admits_previously_unresolved_capture_safe_node() {
     // captures). Disable the now-default-ON memo so this executor records the
     // warm shapes exactly as a capture-capable EP would at runtime.
     exec.set_decode_memo_enabled(false);
+
+    // This test isolates warm-decode SEEDING — the unresolved-shape → resolved
+    // transition that seeding is responsible for. The central classifier veto
+    // (PR #728, exercised by its own tests) is an orthogonal, additional gate:
+    // under the default fail-safe classifier the Range output's untraceable
+    // data-dependent length is disqualifying, which would mask the
+    // unresolved-shape seam this test asserts. Clear the disqualifying set so the
+    // seeding transition is the sole observable, matching the Denylist view in
+    // which a non-growing, replay-guarded extent is capture-safe.
+    exec.capture_growing_symbols.clear();
 
     let zero = Tensor::from_raw(DataType::Int64, vec![], &0i64.to_le_bytes()).unwrap();
     let four = Tensor::from_raw(DataType::Int64, vec![], &4i64.to_le_bytes()).unwrap();
@@ -4020,4 +5718,485 @@ fn a_misaligned_external_buffer_is_refused() {
         message.contains("alignment"),
         "the error must say the problem is alignment, got: {message}"
     );
+}
+
+// PR (GQA fixed-capacity KV capture pin): a `GroupQueryAttention` node reads its
+// past-KV inputs (3/4) as PHYSICAL CAPACITY and derives the valid attended
+// length on-device (`seqlens_k`), so when the engine binds the cache at a fixed
+// capacity the KV seq axis is CONSTANT across a captured replay. This locks the
+// pin: `collect_capacity_pinned_kv_symbols` picks up the GQA KV seq symbol,
+// `compute_capture_disqualifying_symbols_excluding` drops it (and its lineage
+// closure), and the GQA node PLUS a KV-cache-sized consumer become
+// capture-eligible — where without the pin they stay eager.
+#[test]
+fn gqa_fixed_capacity_kv_seq_symbol_is_pinned_and_admits_the_node() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    let embeds = graph.create_named_value(
+        "inputs_embeds",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(256)],
+    );
+    graph.add_input(embeds);
+    let past_key = graph.create_named_value(
+        "past_key_values.0.key",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    graph.add_input(past_key);
+    let past_value = graph.create_named_value(
+        "past_key_values.0.value",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    graph.add_input(past_value);
+    let attn_out = graph.create_named_value(
+        "attn_out",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(256)],
+    );
+    let present_key = graph.create_named_value(
+        "present.0.key",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    let present_value = graph.create_named_value(
+        "present.0.value",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    let mut gqa = Node::new(
+        NodeId(0),
+        "GroupQueryAttention",
+        vec![
+            Some(embeds),
+            Some(embeds),
+            Some(embeds),
+            Some(past_key),
+            Some(past_value),
+        ],
+        vec![attn_out, present_key, present_value],
+    );
+    gqa.domain = "com.microsoft".to_string();
+    graph.insert_node(gqa.clone());
+
+    let kv_out = graph.create_named_value(
+        "kv_sized_consumer_out",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    let kv_consumer = Node::new(NodeId(1), "Sigmoid", vec![Some(present_key)], vec![kv_out]);
+
+    // Baseline (no pin): the GQA node and the KV-sized consumer are BOTH vetoed.
+    let baseline = compute_capture_disqualifying_symbols(&graph);
+    assert!(
+        baseline.contains(&seq_kv),
+        "without the pin the GQA KV seq symbol must be disqualifying, got {baseline:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &gqa, &baseline),
+        "without the pin the GQA node must stay eager"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &kv_consumer, &baseline),
+        "without the pin the KV-cache-sized consumer must stay eager"
+    );
+
+    // The pin: GQA's fixed-capacity KV seq symbol is collected and excluded.
+    let pinned = collect_capacity_pinned_kv_symbols(&graph);
+    assert!(
+        pinned.contains(&seq_kv),
+        "the GQA fixed-capacity KV seq symbol must be pinned, got {pinned:?}"
+    );
+    let pinned_set = compute_capture_disqualifying_symbols_excluding(&graph, &pinned);
+    assert!(
+        !pinned_set.contains(&seq_kv),
+        "the pinned KV seq symbol must be excluded from the disqualifying set, got {pinned_set:?}"
+    );
+    assert!(
+        node_capture_seq_independent(&graph, &gqa, &pinned_set),
+        "with the pin the GQA node must be capture-eligible"
+    );
+    assert!(
+        node_capture_seq_independent(&graph, &kv_consumer, &pinned_set),
+        "with the pin a fixed-capacity-KV-sized consumer must be capture-eligible"
+    );
+
+    // Idempotent: re-deriving the pin from the graph yields the same set.
+    assert_eq!(
+        collect_capacity_pinned_kv_symbols(&graph),
+        pinned,
+        "the pin must be a pure, idempotent function of the graph"
+    );
+}
+
+// GUARD (don't blanket-disable the veto): a GENUINELY GROWING KV path — one whose
+// attention op does NOT read its cache as physical capacity — must NOT be pinned,
+// so its symbol stays disqualifying and the node stays eager.
+//
+// (1) A default-domain, CAUSAL `Attention` derives past length from the growing
+//     cache extent (not from a mask frontier), so its cache is not physical
+//     capacity: not pinned.
+// (2) `CompressedSparseAttention` has NO past-KV inputs (its records grow from
+//     total_sequence_length), so it cannot be a capacity form: not pinned.
+#[test]
+fn growing_kv_paths_are_not_pinned_and_stay_vetoed() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let attn_seq_kv = graph.create_symbol(None);
+    let csa_records = graph.create_symbol(None);
+
+    // (1) Causal default-domain Attention (growing-concat KV, no mask input at 3).
+    let q = graph.create_named_value("q", DataType::Float32, vec![sym(batch), st(1), st(512)]);
+    graph.add_input(q);
+    let attn_past_key = graph.create_named_value(
+        "attn_past_key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(attn_seq_kv), st(128)],
+    );
+    graph.add_input(attn_past_key);
+    let attn_past_value = graph.create_named_value(
+        "attn_past_value",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(attn_seq_kv), st(128)],
+    );
+    graph.add_input(attn_past_value);
+    let mut attention = Node::new(
+        NodeId(0),
+        "Attention",
+        vec![
+            Some(q),
+            Some(q),
+            Some(q),
+            None,
+            Some(attn_past_key),
+            Some(attn_past_value),
+        ],
+        vec![],
+    );
+    attention
+        .attributes
+        .insert("is_causal".into(), Attribute::Int(1));
+    graph.insert_node(attention);
+
+    // (2) CompressedSparseAttention: records grow on outputs 1/3, no past inputs.
+    let csa_q =
+        graph.create_named_value("csa_q", DataType::Float32, vec![sym(batch), st(1), st(512)]);
+    graph.add_input(csa_q);
+    let csa_records_out = graph.create_named_value(
+        "csa_records",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(csa_records), st(64)],
+    );
+    graph.add_output(csa_records_out);
+    let mut csa = Node::new(
+        NodeId(1),
+        "CompressedSparseAttention",
+        vec![Some(csa_q)],
+        vec![csa_q, csa_records_out, csa_q, csa_records_out],
+    );
+    csa.domain = "com.microsoft".to_string();
+    graph.insert_node(csa);
+
+    let pinned = collect_capacity_pinned_kv_symbols(&graph);
+    assert!(
+        !pinned.contains(&attn_seq_kv),
+        "a causal (growing-concat) Attention KV symbol must NOT be pinned, got {pinned:?}"
+    );
+    assert!(
+        !pinned.contains(&csa_records),
+        "a CSA records symbol (no past-KV inputs) must NOT be pinned, got {pinned:?}"
+    );
+
+    let set = compute_capture_disqualifying_symbols_excluding(&graph, &pinned);
+    assert!(
+        set.contains(&attn_seq_kv) && set.contains(&csa_records),
+        "genuinely growing KV symbols must stay disqualifying, got {set:?}"
+    );
+}
+
+// Executor-level integration of the pin: building a decode executor over a GQA
+// graph seeds the GQA KV seq symbol as disqualifying (every GQA layer eager);
+// after `pin_fixed_capacity_kv_capture_symbols` the symbol is excluded and the
+// pinned set is recorded. Locks the engine-facing entry point end to end.
+#[test]
+fn executor_pin_fixed_capacity_kv_admits_gqa() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    let q = graph.create_named_value("q", DataType::Float32, vec![sym(batch), st(1), st(256)]);
+    graph.add_input(q);
+    let past_key = graph.create_named_value(
+        "past_key_values.0.key",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    graph.add_input(past_key);
+    let past_value = graph.create_named_value(
+        "past_key_values.0.value",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    graph.add_input(past_value);
+    let attn_out = graph.create_named_value(
+        "attn_out",
+        DataType::Float32,
+        vec![sym(batch), st(1), st(256)],
+    );
+    graph.add_output(attn_out);
+    let present_key = graph.create_named_value(
+        "present.0.key",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    graph.add_output(present_key);
+    let present_value = graph.create_named_value(
+        "present.0.value",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    graph.add_output(present_value);
+    let mut gqa = Node::new(
+        NodeId(0),
+        "GroupQueryAttention",
+        vec![Some(q), Some(q), Some(q), Some(past_key), Some(past_value)],
+        vec![attn_out, present_key, present_value],
+    );
+    gqa.domain = "com.microsoft".to_string();
+    gqa.attributes.insert("num_heads".into(), Attribute::Int(8));
+    gqa.attributes
+        .insert("kv_num_heads".into(), Attribute::Int(2));
+    let gqa_node_id = gqa.id;
+    graph.insert_node(gqa);
+
+    let mut exec = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    let gqa_node = exec.graph.node(gqa_node_id).clone();
+    assert!(
+        exec.capture_growing_symbols.contains(&seq_kv),
+        "before the pin the GQA KV seq symbol must be disqualifying"
+    );
+    assert!(
+        !node_capture_seq_independent(&exec.graph, &gqa_node, &exec.capture_growing_symbols),
+        "before the pin the GQA node must be classifier-vetoed"
+    );
+
+    let pinned = exec.pin_fixed_capacity_kv_capture_symbols();
+    assert!(
+        pinned >= 1,
+        "at least the GQA KV seq symbol must be pinned, got {pinned}"
+    );
+    assert!(
+        exec.capacity_pinned_kv_symbols.contains(&seq_kv),
+        "the executor must record the pinned KV symbol"
+    );
+    assert!(
+        !exec.capture_growing_symbols.contains(&seq_kv),
+        "after the pin the KV seq symbol must be excluded from the disqualifying set"
+    );
+    assert!(
+        node_capture_seq_independent(&exec.graph, &gqa_node, &exec.capture_growing_symbols),
+        "after the pin the GQA node must be admitted to capture"
+    );
+}
+
+// === #1020: prepare-only workspace planning bounds the MLA context/sequence
+// axis instead of failing on it, while a genuinely unbounded axis still errors.
+// The DeepSeek-V2 MLA fixture is not on this machine, so these exercise the
+// resolution logic directly on synthetic graphs whose `::Attention` input has a
+// runtime-dependent context axis (the reported `v_model.Unsqueeze_16` shape).
+
+fn minimal_workspace_executor() -> Executor {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let a = graph.create_named_value("a", DataType::Float32, static_shape([1]));
+    graph.add_input(a);
+    let out = graph.create_named_value("out", DataType::Float32, static_shape([1]));
+    graph.add_output(out);
+    graph.insert_node(Node::new(NodeId(0), "Identity", vec![Some(a)], vec![out]));
+    Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap()
+}
+
+// An unresolved dim that IS a recognized context/sequence axis resolves to the
+// physically-allocated KV capacity (the extent bound to another growing symbol
+// this prepare call) — the #1020 fix. Mirrors `v_model.Unsqueeze_16`: an MLA
+// value-path sequence symbol shape inference never unified with the KV axis.
+#[test]
+fn prepare_workspace_binds_unresolved_context_axis_to_kv_capacity() {
+    let mut exec = minimal_workspace_executor();
+    let kv_seq = exec.graph.create_symbol(Some("total_seq".into()));
+    let v_seq = exec.graph.create_symbol(Some("v_seq".into()));
+    exec.capture_growing_symbols.insert(kv_seq);
+    exec.capture_growing_symbols.insert(v_seq);
+    let v = exec.graph.create_named_value(
+        "v_model.Unsqueeze_16",
+        DataType::Float32,
+        vec![
+            Dim::Static(1),
+            Dim::Static(16),
+            Dim::Symbolic(v_seq),
+            Dim::Static(128),
+        ],
+    );
+    exec.value_shapes
+        .insert(v, exec.graph.value(v).shape.clone());
+    // Only the KV axis is bound (to physical capacity 2048); `v_seq` is unbound.
+    let mut symbols = HashMap::new();
+    symbols.insert(kv_seq, 2048usize);
+    let node = Node::new(NodeId(40), "Attention", vec![Some(v)], vec![]);
+    let resolved = exec
+        .resolve_planned_workspace_input_shape(v, &symbols, NodeId(40), &node, 3)
+        .expect("a context/sequence axis must resolve to its bounded extent");
+    match resolved {
+        PlannedInputShape::Bounded { dims, applied } => {
+            assert_eq!(dims, vec![1, 16, 2048, 128]);
+            assert_eq!(applied, vec![(2, v_seq, AxisBound::KvCapacity(2048))]);
+        }
+        other => panic!("expected a bounded over-reservation, got {other:?}"),
+    }
+}
+
+// A context/sequence axis whose model-declared maximum EXCEEDS the currently
+// bound KV capacity is reserved against the LARGER of the two, so a bounded
+// reservation can never under-reserve (the corruption class #945/#947 warns of).
+#[test]
+fn prepare_workspace_context_axis_never_under_reserves_below_declared_max() {
+    let mut exec = minimal_workspace_executor();
+    let kv_seq = exec.graph.create_symbol(Some("total_seq".into()));
+    let v_seq = exec.graph.create_symbol(Some("v_seq".into()));
+    exec.graph.symbol_constraints.get_mut(&v_seq).unwrap().max = Some(8192);
+    exec.capture_growing_symbols.insert(kv_seq);
+    exec.capture_growing_symbols.insert(v_seq);
+    let v = exec.graph.create_named_value(
+        "v",
+        DataType::Float32,
+        vec![Dim::Static(1), Dim::Symbolic(v_seq), Dim::Static(16)],
+    );
+    exec.value_shapes
+        .insert(v, exec.graph.value(v).shape.clone());
+    let mut symbols = HashMap::new();
+    symbols.insert(kv_seq, 2048usize);
+    let node = Node::new(NodeId(1), "Attention", vec![Some(v)], vec![]);
+    let resolved = exec
+        .resolve_planned_workspace_input_shape(v, &symbols, NodeId(1), &node, 0)
+        .unwrap();
+    match resolved {
+        PlannedInputShape::Bounded { dims, applied } => {
+            assert_eq!(dims, vec![1, 8192, 16]);
+            assert_eq!(applied, vec![(1, v_seq, AxisBound::KvCapacity(8192))]);
+        }
+        other => panic!("expected a bounded over-reservation, got {other:?}"),
+    }
+}
+
+// An unresolved dim that carries its own configured maximum (a declared
+// `max_seq_len`-style ceiling) but is not a growing symbol is reserved against
+// that maximum.
+#[test]
+fn prepare_workspace_binds_unresolved_axis_to_configured_max() {
+    let mut exec = minimal_workspace_executor();
+    let seq = exec.graph.create_symbol(Some("seq_len".into()));
+    exec.graph.symbol_constraints.get_mut(&seq).unwrap().max = Some(4096);
+    let v = exec.graph.create_named_value(
+        "bounded_value",
+        DataType::Float32,
+        vec![Dim::Static(2), Dim::Symbolic(seq), Dim::Static(64)],
+    );
+    exec.value_shapes
+        .insert(v, exec.graph.value(v).shape.clone());
+    let symbols = HashMap::new();
+    let node = Node::new(NodeId(9), "Attention", vec![Some(v)], vec![]);
+    let resolved = exec
+        .resolve_planned_workspace_input_shape(v, &symbols, NodeId(9), &node, 1)
+        .unwrap();
+    match resolved {
+        PlannedInputShape::Bounded { dims, applied } => {
+            assert_eq!(dims, vec![2, 4096, 64]);
+            assert_eq!(applied, vec![(1, seq, AxisBound::ConfiguredMax(4096))]);
+        }
+        other => panic!("expected a bounded over-reservation, got {other:?}"),
+    }
+}
+
+// A dim that is unresolved for any OTHER reason — neither a known
+// context/sequence axis nor an axis with a configured maximum — must keep
+// failing. Reserving against a guess there would silently under-reserve.
+#[test]
+fn prepare_workspace_fails_on_unresolved_unbounded_axis() {
+    let mut exec = minimal_workspace_executor();
+    let mystery = exec.graph.create_symbol(Some("data_dependent".into()));
+    let v = exec.graph.create_named_value(
+        "mystery_value",
+        DataType::Float32,
+        vec![Dim::Static(4), Dim::Symbolic(mystery)],
+    );
+    exec.value_shapes
+        .insert(v, exec.graph.value(v).shape.clone());
+    let symbols = HashMap::new();
+    let node = Node::new(NodeId(7), "Attention", vec![Some(v)], vec![]);
+    let err = exec
+        .resolve_planned_workspace_input_shape(v, &symbols, NodeId(7), &node, 0)
+        .expect_err("a genuinely unbounded unresolved dim must still error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("genuinely unknown"),
+        "the error must name the unbounded-guess hazard, got: {msg}"
+    );
+    assert!(
+        msg.contains("data_dependent"),
+        "the error must name the unresolved symbol, got: {msg}"
+    );
+}
+
+// Regression guard: a fully-resolvable input still resolves EXACTLY (never via a
+// bound), so graphs that already resolved keep byte-identical reservations.
+#[test]
+fn prepare_workspace_exact_resolution_is_unchanged() {
+    let mut exec = minimal_workspace_executor();
+    let seq = exec.graph.create_symbol(Some("seq".into()));
+    let v = exec.graph.create_named_value(
+        "exact_value",
+        DataType::Float32,
+        vec![Dim::Static(1), Dim::Symbolic(seq), Dim::Static(8)],
+    );
+    exec.value_shapes
+        .insert(v, exec.graph.value(v).shape.clone());
+    let mut symbols = HashMap::new();
+    symbols.insert(seq, 12usize);
+    let node = Node::new(NodeId(3), "Attention", vec![Some(v)], vec![]);
+    let resolved = exec
+        .resolve_planned_workspace_input_shape(v, &symbols, NodeId(3), &node, 0)
+        .unwrap();
+    assert_eq!(resolved, PlannedInputShape::Exact(vec![1, 12, 8]));
+    assert_eq!(resolved.dims(), &[1, 12, 8]);
 }

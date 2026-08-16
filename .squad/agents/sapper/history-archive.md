@@ -87,7 +87,7 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 
 ## 2026-07-17T07:19:39Z — onnx-rs multi-device/sharding proto landing
 
-- Delivered `be68145`: seven IR13 device/sharding protobuf messages with Model/Node wiring, checker and codec round trips, and `docs/ONNX_RS_SPEC_COVERAGE.md`.
+- Delivered `be68145`: seven IR13 device/sharding protobuf messages with Model/Node wiring, checker and codec round trips, and `docs/architecture/ONNX_RS_SPEC_COVERAGE.md`.
 - Deckard's `b5ccd3c` correction made `SimpleShardedDimProto.dim` optional; Bryant 🟢 approved. Remaining parity gaps are in flight.
 - 2026-07-19: Landed BQMoE v1 CPU parity oracle and frozen ABI (`7f31162`).
 - 2026-07-19T07:55:00Z: CSA Phase B B0 device-state/stage-dispatch scaffolding merged at `9c56d9c` after numerical correction.
@@ -158,3 +158,52 @@ WP-B landed: Sapper's WP-B3 v3 admission fix landed at `3d84b9b`, making raw `Gr
 - 2026-07-28T00:55-07:00 follow-up: replaced the raw `(len, policy)` tail with `RewindRequest` to avoid an 8-argument helper and fixed remaining kv_bridge test call sites. Full engine lib tests now pass locally after staging the pinned ORT DLL beside the test binary.
 ## 2026-07-28T07:46:01+00:00 — Wave 5
 - PR #331 (`52b1fc59`) merged: added CUDA GatherND, SpaceToDepth, and EyeLike; #67 remains open for later coverage batches. Hallett independently approved the GPU parity and mutation-probe evidence.
+## 2026-07-26T22:38:02+00:00 — Mobius PR triage handoff
+
+- Prepared Mobius PRs #404/#423/#430 for Justin review without merging. #404 replacement branch `sapper/404-rebase` at `fa30534` resolves conflicts and review comments; #423 `squad/hythe-deepseek-moe-phase1` at `40846bb` and #430 `test/l4-l5-golden-new-models` at `d1d235e` have current review fixes, Ruff clean, and focused tests passing.
+
+## 2026-07-27T21:45:00-07:00 — Runtime fork rewind policy split
+
+- Revised PR #291 runner-backed rewind handling so the unsupported-runner policy is explicit and limited to the public session rewind API.
+- Internal speculative target rejection and draft realignment validation now use the allow-runner policy; public `restore_session`/`rewind_session_to` keep fail-closed ordering before session removal or token/KV mutation.
+- Updated the stale tiny PastPresent checkpoint test to expect the clean unsupported error and added model-free regression coverage for the speculative runner rewind policy boundary.
+- 2026-07-28T00:55-07:00 follow-up: replaced the raw `(len, policy)` tail with `RewindRequest` to avoid an 8-argument helper and fixed remaining kv_bridge test call sites. Full engine lib tests now pass locally after staging the pinned ORT DLL beside the test binary.
+
+## 2026-07-28T07:46:01+00:00 — Wave 5
+- PR #331 (`52b1fc59`) merged: added CUDA GatherND, SpaceToDepth, and EyeLike; #67 remains open for later coverage batches. Hallett independently approved the GPU parity and mutation-probe evidence.
+
+## 2026-08-11 — B2: ReleaseEpFactory ABI fix
+
+- Fixed `export_ep_factories!` macro: `ReleaseEpFactory` now returns `*mut OrtStatus` per `onnxruntime_ep_c_api.h:2669`, not `void`.
+- Caught panics now surface as error `OrtStatus` instead of being silently swallowed.
+
+## 2026-08-11 — CUDA plugin: resolve all four B4 implementation defects
+
+Resolved the four implementation defects from the B4 rubber-duck review:
+
+1. **Shared EP**: Added `ExportedFactory::shared_ep` (`Arc<Mutex<..>>`) so allocator, stream, and data transfer share a single `CudaExecutionProvider` and its `CUcontext`/`cudaStream_t`. Components track ownership via `owns_ep` flag.
+2. **CreateDataTransfer**: `factory_create_data_transfer` now creates `DeviceDataTransferFull` for device EPs with ORT API + EP API pointers. `CanCopy` classifies directions via `MemoryDevice_GetDeviceType`.
+3. **GetHandle**: `DeviceSyncStream::stream_handle` returns the real `cudaStream_t` from `CudaRuntime::stream_ptr()`.
+4. **Free size tracking**: `DeviceAllocator::alloc_sizes` (`Mutex<HashMap<usize, usize>>`) tracks allocation sizes across `Alloc`/`Free`.
+
+CPU path unchanged. 9 CUDA plugin tests pass (5 unit + 4 integration). All code compiles with and without `cuda` feature. **Unvalidated on hardware** — #768 tracks GPU validation.
+- Verified `CreateEpFactories` matches header — no second mismatch.
+- CPU and CUDA hand-written shims still return `void` — owners must update (not my files).
+- Told Chew to update ABI test type alias to `-> *mut ort::OrtStatus`.
+
+## 2026-08-11 — B2 follow-up: CPU shim ReleaseEpFactory fixed
+
+- Updated hand-written `ReleaseEpFactory` in `crates/onnx-runtime-ep-cpu-plugin/src/lib.rs` to return `*mut OrtStatus` (was `void`).
+- Panic path now surfaces as `panic_to_fail_status(...)` rather than being silently swallowed.
+- Shim stays hand-written because `CreateEpFactories` calls `create_ep_factories_with_registry` (not exposed via the macro); annotated with keep-in-sync comment mirroring the macro arm.
+- Audited `CreateEpFactories` — already returned `*mut OrtStatus`, no drift found.
+- CUDA shim is Iran's file; not touched.
+- Build: `cargo build -p onnx-runtime-ep-cpu-plugin` ✓. Tests: 154 lib + 9 parity ✓. Clippy clean ✓. fmt clean ✓.
+
+Full pre-compaction history in `history-archive.md`.
+
+## 2026-08-11 — B2/B3: docs/OperatorKernels.md + leakage sweep (#31974)
+
+- **B2:** Hand-edited `docs/OperatorKernels.md` in `/workspace/upstream/ort-bf16` to add `tensor(bfloat16)` to 5 CPU EP kernel entries. Generator script requires built Python bindings — impractical. Diff: 5 ins / 5 del, zero unrelated churn. U constraint for contrib LayerNorm/SimplifiedLayerNorm updated per current code (N1-dependent — may need revert if Iran rolls back MLFloat16 U=float).
+- **B3:** Swept full branch diff for internal leakage. Only hits are 4 persona references in test files (Luv's domain, already flagged). No leakage in `onnxruntime/core/**`, `onnxruntime/contrib_ops/**`, or `docs/**`. No upstream repo policy changed.
+

@@ -6,6 +6,7 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node, Shape};
 
 use super::check_arity;
+use super::sdpa::ScaleMode;
 use super::varlen_attention::{
     PackedAttentionSpec, compute_packed_attention, offsets as parse_offsets,
 };
@@ -263,9 +264,10 @@ impl Kernel for PackedVarlenAttentionKernel {
             kv_num_heads,
             head_size: query_dimensions.dimension,
             value_head_size: value_dimensions.dimension,
-            scale,
+            scale: ScaleMode::SplitSqrt(scale),
             is_causal: self.is_causal,
             softcap: self.softcap,
+            fast_path: false,
         })?;
         write_dense_f32_narrow(OP, &mut outputs[0], &output)
     }

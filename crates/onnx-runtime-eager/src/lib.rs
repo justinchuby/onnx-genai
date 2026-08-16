@@ -1,6 +1,6 @@
 //! # `onnx-runtime-eager`
 //!
-//! Eager (single-op) execution for the ORT 2.0 runtime (`docs/EAGER.md`).
+//! Eager (single-op) execution for the ORT 2.0 runtime (`docs/execution/EAGER.md`).
 //! Dispatch individual ONNX ops to execution-provider kernels **without building
 //! a graph** — a PyTorch-style experience with ONNX op semantics.
 //!
@@ -16,7 +16,7 @@
 //!   [`DataType`](onnx_runtime_ir::DataType),
 //!   [`Attribute`](onnx_runtime_ir::Attribute), …) from `onnx-runtime-ir`.
 //!
-//! ## Phase-1 scope (`docs/EAGER.md`)
+//! ## Phase-1 scope (`docs/execution/EAGER.md`)
 //!
 //! Implemented: [`EagerContext`], [`EagerContext::dispatch`] (single-op CPU
 //! dispatch), the [`DomainRegistry`](domain::DomainRegistry), opset resolution
@@ -52,11 +52,11 @@ pub use error::{EagerError, Result};
 pub use opset::{LATEST_ONNX_OPSET, resolve_opset};
 pub use tensor::Tensor;
 
-/// Default compiled-kernel cache capacity (`docs/EAGER.md` §13: per-process LRU,
+/// Default compiled-kernel cache capacity (`docs/execution/EAGER.md` §13: per-process LRU,
 /// 4096).
 const DEFAULT_CACHE_CAPACITY: usize = 4096;
 
-/// The process-wide eager execution context (`docs/EAGER.md` §10.1).
+/// The process-wide eager execution context (`docs/execution/EAGER.md` §10.1).
 ///
 /// Manages the available EPs, the domain registry, per-op shape inference, the
 /// compiled-kernel cache, and the default device. It is thread-safe via internal
@@ -71,11 +71,11 @@ pub struct EagerContext {
     pub(crate) domains: RwLock<DomainRegistry>,
     /// Per-op output shape/dtype inference (§9).
     pub(crate) inference: InferenceRegistry,
-    /// Default device for ops with no inputs (`docs/EAGER.md` §4.3 case 3).
+    /// Default device for ops with no inputs (`docs/execution/EAGER.md` §4.3 case 3).
     pub(crate) default_device: DeviceId,
 }
 
-/// Auto-detect the available execution providers (`docs/EAGER.md` §10.1
+/// Auto-detect the available execution providers (`docs/execution/EAGER.md` §10.1
 /// `detect_available_eps`).
 ///
 /// Phase-1: the always-available CPU EP only. Adding a GPU EP later is a matter
@@ -89,7 +89,7 @@ fn detect_available_eps() -> Result<Vec<Arc<dyn ExecutionProvider>>> {
 }
 
 impl EagerContext {
-    /// Initialize a context with auto-detected devices (`docs/EAGER.md` §10.1).
+    /// Initialize a context with auto-detected devices (`docs/execution/EAGER.md` §10.1).
     pub fn new() -> Result<Self> {
         let eps = detect_available_eps()?;
         let default_device = eps
@@ -105,12 +105,12 @@ impl EagerContext {
         })
     }
 
-    /// The default device for input-less ops (`docs/EAGER.md` §4.3).
+    /// The default device for input-less ops (`docs/execution/EAGER.md` §4.3).
     pub fn default_device(&self) -> DeviceId {
         self.default_device
     }
 
-    /// Register (or update) a custom domain's default opset (`docs/EAGER.md`
+    /// Register (or update) a custom domain's default opset (`docs/execution/EAGER.md`
     /// §6.1 `register_domain`).
     pub fn register_domain(&self, domain: &str, default_opset: u64) {
         self.domains
@@ -119,7 +119,7 @@ impl EagerContext {
             .register(domain, default_opset);
     }
 
-    /// All registered domains and their default opsets (`docs/EAGER.md` §6.1
+    /// All registered domains and their default opsets (`docs/execution/EAGER.md` §6.1
     /// `domains()`).
     pub fn domains(&self) -> Vec<(String, u64)> {
         self.domains
@@ -137,7 +137,7 @@ impl EagerContext {
     }
 
     /// Resolve the single target device from `inputs`; mixed devices are an
-    /// error (`docs/EAGER.md` §1.6 / §4.3, Design Decision).
+    /// error (`docs/execution/EAGER.md` §1.6 / §4.3, Design Decision).
     pub(crate) fn resolve_device(&self, inputs: &[&Tensor]) -> Result<DeviceId> {
         let devices: Vec<DeviceId> = inputs.iter().map(|t| t.device()).collect();
         resolve_device_from_ids(&devices, self.default_device)
@@ -153,7 +153,7 @@ impl EagerContext {
     }
 }
 
-/// Resolve a single device from a list of input devices (`docs/EAGER.md` §4.3):
+/// Resolve a single device from a list of input devices (`docs/execution/EAGER.md` §4.3):
 /// no inputs → `default`; all on one device → that device; otherwise a
 /// [`EagerError::MixedDeviceInputs`] error.
 ///
@@ -178,7 +178,7 @@ pub(crate) fn resolve_device_from_ids(devices: &[DeviceId], default: DeviceId) -
 
 static GLOBAL_CONTEXT: OnceLock<EagerContext> = OnceLock::new();
 
-/// Get or lazily initialize the process-global eager context (`docs/EAGER.md`
+/// Get or lazily initialize the process-global eager context (`docs/execution/EAGER.md`
 /// §10.2).
 pub fn global_context() -> &'static EagerContext {
     GLOBAL_CONTEXT.get_or_init(|| EagerContext::new().expect("failed to initialize eager context"))
@@ -227,7 +227,7 @@ mod tests {
     fn resolve_device_mixed_is_error() {
         // Fabricated CPU + CUDA device ids exercise the mixed-device guard even
         // though only a CPU EP exists (a real cross-device tensor is infeasible
-        // CPU-only), per docs/EAGER.md §1.6.
+        // CPU-only), per docs/execution/EAGER.md §1.6.
         use onnx_runtime_ir::DeviceType;
         let cpu = DeviceId::cpu();
         let cuda = DeviceId::new(DeviceType::Cuda, 0);

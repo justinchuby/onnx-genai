@@ -1,8 +1,22 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! On-GPU integration test for the cuBLASLt MatMul kernel.
 //!
-//! Gated on a real device: if no CUDA GPU is present (or the driver / cuBLASLt
-//! can't be loaded), the test prints `skip` and returns, so the crate still
-//! tests cleanly on non-GPU machines. On a GPU it runs f32 (integer, fractional,
+//! Gated on a real device: CPU-only CI reports these as ignored unless
+//! `gpu-tests` is enabled. Feature-enabled runs fail loudly if CUDA cannot run.
+//! On a GPU it runs f32 (integer, fractional,
 //! and batched) MatMuls and checks the numerics against an independently
 //! computed CPU reference.
 //!
@@ -211,13 +225,19 @@ fn approx_eq(a: &[f32], b: &[f32], tol: f32) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol)
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn matmul_f32_on_gpu_matches_cpu_reference() {
     let ep = match CudaExecutionProvider::new_default() {
         Ok(ep) => ep,
         Err(e) => {
             eprintln!("skip: no CUDA GPU available ({e})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
     println!("CUDA EP up on {:?}", ep.device_id());
@@ -286,13 +306,19 @@ fn matmul_f32_on_gpu_matches_cpu_reference() {
     println!("all cuBLASLt MatMul cases passed on {:?}", ep.device_id());
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn matmul_f32_gemv_matches_cublaslt_bitwise() {
     let ep = match CudaExecutionProvider::new_default() {
         Ok(ep) => ep,
         Err(e) => {
             eprintln!("skip: no CUDA GPU available ({e})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
 
@@ -316,13 +342,19 @@ fn matmul_f32_gemv_matches_cublaslt_bitwise() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn matmul_f32_gemv_is_capture_safe_after_warmup() {
     let ep = match CudaExecutionProvider::new_default() {
         Ok(ep) => ep,
         Err(e) => {
             eprintln!("skip: no CUDA GPU available ({e})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
     let rt = ep.runtime();
@@ -497,13 +529,19 @@ fn run_gpu_matmul_f16(
 /// The dense fp16 M==1 GEMV fast path (used by an fp16 language-model head)
 /// matches an independent CPU reference and is capture-eligible. Generic over
 /// `K`/`N`: nothing here is tied to a model dimension.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn matmul_f16_gemv_on_gpu_matches_cpu_reference() {
     let ep = match CudaExecutionProvider::new_default() {
         Ok(ep) => ep,
         Err(e) => {
             eprintln!("skip: no CUDA GPU available ({e})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
 
@@ -534,13 +572,19 @@ fn matmul_f16_gemv_on_gpu_matches_cpu_reference() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn matmul_rejects_unsupported_rank_and_dtype() {
     let ep = match CudaExecutionProvider::new_default() {
         Ok(ep) => ep,
         Err(e) => {
             eprintln!("skip: no CUDA GPU available ({e})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
     let dev = ep.device_id();

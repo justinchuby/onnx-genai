@@ -1,6 +1,6 @@
 //! `com.microsoft::FusedGemm`: the optimizer's fusion of `MatMul(A, B)`
 //! followed by a broadcasting `Add(_, bias)` and an elementwise `Relu` into a
-//! single node (`docs/ORT2.md` §18.2).
+//! single node (`docs/architecture/ORT2.md` §18.2).
 //!
 //! `Y = Relu(MatMul(A, B) + bias)`, where the matmul follows full numpy
 //! semantics (batched, broadcast leading dims, 1-D operand promotion), `bias`
@@ -146,7 +146,7 @@ mod tests {
         }
         let biased_owned = Owned::f32(&[2, 3], &biased);
         let mut expect = Owned::zeros_f32(&[2, 3]);
-        ReluKernel
+        ReluKernel::default()
             .execute(&[biased_owned.view()], &mut [expect.view_mut()])
             .unwrap();
 

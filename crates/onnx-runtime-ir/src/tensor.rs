@@ -170,7 +170,7 @@ pub struct SparseTensorData {
 }
 
 /// An ONNX `TypeProto`: the type of a value, which may be a tensor or a
-/// container of tensors (see `docs/ORT2.md` §3.2).
+/// container of tensors (see `docs/architecture/ORT2.md` §3.2).
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeProto {
     Tensor {
@@ -192,7 +192,7 @@ pub enum TypeProto {
 /// A reference to initializer (weight) data.
 ///
 /// Small weights may be inlined; large weights are memory-mapped from an
-/// external file at load time (see `docs/ORT2.md` §12). The IR only stores the
+/// external file at load time (see `docs/architecture/ORT2.md` §12). The IR only stores the
 /// *reference*; the loader/`onnx-runtime-memory` crate performs the mmap.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WeightRef {

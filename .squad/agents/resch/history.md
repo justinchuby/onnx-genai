@@ -1,4 +1,4 @@
-# Resch — History (compacted 2026-07-29)
+# Resch — History (compacted 2026-08-12)
 
 **Role:** Intel CPU Optimization Engineer for x86-64 CPU-EP performance, AVX2/AVX-512/VNNI, MLAS interplay, and int8 DP4A GEMV. Optimizations must be portable beyond one machine, benchmark-backed, and numerically matched to scalar/f64 references with regression tests.
 
@@ -17,16 +17,49 @@
 
 ## Recent work (current wave, ~2026-07-28/29)
 
-### 2026-07-27T10:40:00-07:00 — Platform-naming lint + x86 GEMM renames (PR #278)
-Renamed `simd_gemm.rs` → `x86_sgemm.rs` and `bf16_gemm.rs` → `x86_bf16.rs` with zero behavior change. Added `scripts/check_platform_naming.py`, a CI lint for single-arch cfg files lacking platform markers; it uses a portable-item check to avoid false positives, but cannot catch within-file missing implementations like the sdpa `dot_f32` case. Guard-break restored old names and failed; 945 tests passed, clippy green on aarch64/x86_64.
+## Historical context (2026-07-27 through 2026-08-11 early)
 
-### 2026-07-27 — Cross-Target Compilation Check (PR #319)
-Added `scripts/check_cross_compile.sh` for Roy's structural fix plan. It targets `x86_64-unknown-linux-gnu`, uses `--all-targets`, runs full offline crates on Ubuntu and an FFI-free subset on macOS, and teaches why `x86_64-apple-darwin` is insufficient. Guard-break synthetic `is_undilated` in onnx-runtime-ir failed under the new script. Known gaps: ep-cpu from macOS, runtime dispatch, Windows cfg via portable matrix.
+Jul-27 wave: platform-naming lint + x86 GEMM renames (PR #278); cross-target compilation check (PR #319); dispatch manifest lint; manifest backfill + inverse check. Aug-11 early wave: AVX2 LayerNorm kernel pilot + hardening (PR #31973); BFloat16 CPU LayerNorm/RMSNorm registration; RMSNorm mean-null skip (Gaff S1). Full entries in `history-archive.md`.
 
-### 2026-07-27T22:05:00-07:00 — Dispatch manifest lint
-Created `dispatch_manifest.toml` plus `scripts/check_dispatch_manifest.py`: declarative (op, variant, platform) → minimum tier + proving counter, CI-only and cross-EP ready. Seeded MatMul/Conv/SDPA/KernelDispatch claims, documented depthwise Conv and bf16 M≥2 exclusions, and proved guard-break by renaming `CONV_BNNS_TEST_HITS`. It would have caught 7/9 historical instances; misses compilation errors and unclaimed ops.
+## 2026-08-11 — Direct EP assignment assertions via Session_GetEpGraphAssignmentInfo
 
-### 2026-07-27T23:13:00-07:00 — Manifest backfill + inverse check
-Backfilled PR #324 claims (MaxPool→BNNS, Add→vDSP, MatMul f16 colmaj→NEON GEMV), added dilated MaxPool and BatchNorm fusion exclusions, and implemented inverse checking so any optimization counter without a manifest row fails CI. Fixed the AtomicU64 blind spot in both reachability and manifest lints. BatchNorm was documented as graph-level fusion elimination, not a dispatch-tier claim. Guard-breaks failed as intended; 973 CPU EP tests, 4 lints, and fmt were green.
+- **Deleted false claim** that ORT 1.27 lacked per-node provider attribution. The API
+  (`Session_GetEpGraphAssignmentInfo`) has existed since ORT 1.24 — confirmed in bindings.
+- Added `query_ep_assignment` helper and `assert_ops_assigned_to_our_ep` to plugin_ort_e2e.rs.
+- Enabled `session.record_ep_graph_assignment_info=1` in `conformance_setup`.
+- 8 conformance tests now directly assert node→EP assignment (Add, Mul, MatMul, Cast, Where).
+- `conformance_mixed_partition`: asserts NonZero is never on our EP (negative invariant).
+- `conformance_shape_f32`: soft-check (Shape may be constant-folded by ORT).
+- **Non-vacuity proved:** Forcing assertion on "Relu" (not our op) panics as expected.
+- **Task 2:** Replaced `unwrap_or(0)` with named `DIM_UNKNOWN` constant + loud invariant
+  documenting that kernels must not pre-allocate from compile-time shapes.
+- 269 passed, 0 failed across all 5 EP crates.
 
-Full pre-compaction history in `history-archive.md`.
+## 2026-08-11 — PR #762: Session_GetEpGraphAssignmentInfo wiring
+
+**Task:** Wire `Session_GetEpGraphAssignmentInfo` (present since ORT 1.24; corrected by Fact Checker).
+
+**Commit:** `e0ef1f0a8`
+
+- Enable `session.record_ep_graph_assignment_info=1` in `conformance_setup`.
+- Use `Session_GetEpGraphAssignmentInfo` → `EpAssignedSubgraph_GetEpName` → `EpAssignedNode_GetOperatorType` to query per-node EP assignment.
+- 8 conformance tests now assert specific ops assigned to `"cpu_ep"` (distinct from ORT's `"CPUExecutionProvider"` by exact string).
+- `DIM_UNKNOWN = 0` constant documented with invariant comment.
+- Non-vacuity: forced `"Relu"` assertion produces expected failure message.
+
+**Outcome:** Pris's sixth review found BL1 regression test still lacked fallback guard. Rachael hardened.
+
+## 2026-08-12 — PR #32001: Strict CLI validation for --use_apple_accelerate
+
+**Commit:** ec73d63a0e on `nxrt/mlas-apple-framework-option`
+
+Fixed the blocker where `build.py --use_apple_accelerate` only checked `is_macOS()`, allowing Intel Macs, x86_64 cross-compiles, iOS/tvOS/visionOS, and Mac Catalyst to silently pass through to CMake warn-and-disable — contradicting the PR body's "fails loudly" promise.
+
+Added validation in `build_args.py` (parser.error) and `build.py` (BuildError) rejecting all non-arm64 arches, iOS, tvOS, visionOS, and Catalyst. All Apple-target attrs accessed via `getattr()` to avoid `AttributeError` on non-macOS. 9 new test cases, all passing. macOS arm64 CI deferred to first kernel PR.
+
+## 2026-08-12 — PR #32001: Strict CLI validation consolidated (Zhora S1 resolution)
+
+- Holden's focused review found `build.py:881-897` BuildError block was dead code (never reached since `build_args.py` parser.error() exits first).
+- Zhora removed the dead copy; `build.py` now only appends the cmake arg with a comment pointing to `build_args.py` for validation.
+- Improved non-macOS error message: now reads "requires Apple Silicon host" to correctly distinguish wrong-OS from wrong-arch.
+- 13/13 tests pass unchanged. ruff clean. Head `3a0bd75aa3`. PR #32001 **ready for review**.

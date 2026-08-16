@@ -1,4 +1,4 @@
-//! The router's own HTTP API under `/router/*` (see `docs/DESIGN.md` §34.7).
+//! The router's own HTTP API under `/router/*` (see `docs/architecture/DESIGN.md` §34.7).
 //!
 //! Everything here is served by axum. Requests that do not match a `/router/*`
 //! route fall through to the [`crate::proxy`] reverse-proxy fallback.

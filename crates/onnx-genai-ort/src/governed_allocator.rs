@@ -188,6 +188,81 @@ impl GovernedAllocator {
     /// Returns an error rather than silently correcting the arguments, because
     /// a caller who passed `Tier::Device` believes their device budget is being
     /// charged.
+    /// A governed allocator over device memory, given the allocator that owns
+    /// it.
+    ///
+    /// # Why this is separate from [`new`]
+    ///
+    /// [`new`] backs itself with [`HostAllocator`] and then refuses any tier
+    /// but `Host`, which is right: letting it claim `Device` would hand ONNX
+    /// Runtime host pointers labelled as device memory, and ORT decides from
+    /// the memory info whether a pointer may be read on the host. The failure
+    /// would be silent and would look like a wrong answer rather than a bad
+    /// pointer.
+    ///
+    /// Taking `memory` up front removes that possibility: the tier and the
+    /// memory agree by construction rather than by a later call that might not
+    /// happen.
+    ///
+    /// # What it unblocks
+    ///
+    /// This is how the ONNX Runtime path reaches an allocator that commits
+    /// physically on demand. `GovernedAllocator` already forwards
+    /// [`DeviceAllocator::commits_on_demand`], so a session that registers one
+    /// of these answers the same question the native path does -- which is
+    /// what lets a consumer size a KV cache without knowing which backend it
+    /// got.
+    ///
+    /// [`new`]: Self::new
+    /// [`DeviceAllocator::commits_on_demand`]: onnx_runtime_memory_governor::DeviceAllocator::commits_on_demand
+    pub fn on_device(
+        memory_info: MemoryInfo,
+        memory: Arc<dyn DeviceAllocator>,
+        governor: Arc<dyn MemoryGovernor + Send + Sync>,
+        roles: AllocationRoles,
+        holder: HolderId,
+    ) -> crate::error::Result<Box<Self>> {
+        let tier = memory.device().tier;
+        if tier != Tier::Device {
+            return Err(crate::error::OrtError::InvalidArgument(format!(
+                "GovernedAllocator::on_device is for device memory, but the supplied allocator \
+                 serves {tier:?}; use GovernedAllocator::new for host memory"
+            )));
+        }
+        if memory_info.device_name == "Cpu" {
+            return Err(crate::error::OrtError::InvalidArgument(String::from(
+                "this allocator owns device memory but its memory info names 'Cpu'; ONNX \
+                 Runtime would let the host dereference pointers that are not host-readable. \
+                 Build it with MemoryInfo::cuda(device_id)",
+            )));
+        }
+        let mut allocator = Self::new(
+            MemoryInfo::cpu_device()?,
+            Arc::clone(&governor),
+            Tier::Host,
+            roles,
+            holder,
+        )?;
+        // Replace what `new` assumed: host memory info and a host allocator,
+        // neither of which is right here. Both are swapped together so no
+        // state exists where they disagree.
+        allocator.memory_info = memory_info;
+        allocator.state = Arc::new(GovernedAllocatorState {
+            governor,
+            memory,
+            tier,
+            roles,
+            holder,
+            live_bytes: AtomicU64::new(0),
+            live_count: AtomicUsize::new(0),
+            total_count: AtomicU64::new(0),
+            total_bytes: AtomicU64::new(0),
+            peak_bytes: AtomicU64::new(0),
+            reserve_count: AtomicU64::new(0),
+        });
+        Ok(allocator)
+    }
+
     pub fn new(
         memory_info: MemoryInfo,
         governor: Arc<dyn MemoryGovernor + Send + Sync>,
@@ -282,6 +357,16 @@ impl GovernedAllocator {
         Ok(self)
     }
     /// The pointer to hand ORT's registration API.
+    /// Whether the memory behind this allocator commits physically as it is
+    /// used.
+    ///
+    /// Forwards to whatever `with_memory` installed. This is what lets the
+    /// ONNX Runtime path answer the same question the native path does: the
+    /// `OrtAllocator` seam is a wrapper, and the property belongs to the
+    /// allocator underneath it rather than to the backend on top.
+    pub fn commits_on_demand(&self) -> bool {
+        self.state.memory.commits_on_demand()
+    }
     pub fn as_ort_allocator(&mut self) -> *mut onnx_genai_ort_sys::OrtAllocator {
         std::ptr::from_mut(&mut self.base)
     }
@@ -688,6 +773,93 @@ mod tests {
     use super::*;
     use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
     use std::sync::Mutex;
+
+    /// A device allocator must not be described to ONNX Runtime as host memory,
+    /// or the reverse.
+    ///
+    /// ORT decides from the memory info whether a pointer may be dereferenced
+    /// on the host. Getting this wrong does not produce a bad-pointer error --
+    /// it produces wrong numbers, or a read of device memory from the host that
+    /// happens to succeed on a unified-memory machine and not elsewhere.
+    ///
+    /// `on_device` takes the allocator up front precisely so the tier and the
+    /// memory cannot disagree; these pin the two ways a caller could still try.
+    #[test]
+    fn a_device_allocator_and_its_memory_info_must_agree() {
+        #[derive(Debug)]
+        struct FakeDevice;
+
+        // SAFETY: never allocates, so the non-overlap and validity guarantees
+        // hold vacuously.
+        impl DeviceAllocator for FakeDevice {
+            fn allocate(
+                &self,
+                _bytes: usize,
+                _align: usize,
+            ) -> std::result::Result<std::ptr::NonNull<u8>, onnx_runtime_memory_governor::MemoryError>
+            {
+                Err(onnx_runtime_memory_governor::MemoryError::InvalidRequest {
+                    tier: "device",
+                    requested: 0,
+                    reason: "test double",
+                })
+            }
+
+            unsafe fn deallocate(&self, _ptr: std::ptr::NonNull<u8>, _bytes: usize, _align: usize) {
+            }
+
+            fn device(&self) -> onnx_runtime_memory_governor::DeviceKey {
+                onnx_runtime_memory_governor::DeviceKey::device(0)
+            }
+
+            fn commits_on_demand(&self) -> bool {
+                true
+            }
+        }
+
+        let governor: Arc<dyn MemoryGovernor + Send + Sync> =
+            Arc::new(LedgerGovernor::new(LeaseLedger::new(1 << 20, 1 << 20, 0)));
+
+        // Device memory described as Cpu: refused.
+        let Ok(cpu_info) = MemoryInfo::cpu_device() else {
+            eprintln!("SKIPPED: ONNX Runtime unavailable; this test did NOT run");
+            return;
+        };
+        let error = match GovernedAllocator::on_device(
+            cpu_info,
+            Arc::new(FakeDevice),
+            Arc::clone(&governor),
+            AllocationRoles::default(),
+            HolderId::new(90),
+        ) {
+            Ok(_) => panic!("device memory must not be described as Cpu"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error}").contains("MemoryInfo::cuda"),
+            "the error should name the constructor that fixes it: {error}"
+        );
+
+        // Host memory offered to the device constructor: refused too, and by
+        // the allocator's own tier rather than by the memory info.
+        let Ok(cpu_info) = MemoryInfo::cpu_device() else {
+            return;
+        };
+        let error = match GovernedAllocator::on_device(
+            cpu_info,
+            Arc::new(HostAllocator),
+            governor,
+            AllocationRoles::default(),
+            HolderId::new(91),
+        ) {
+            Ok(_) => panic!("host memory does not belong in the device constructor"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error}").contains("GovernedAllocator::new"),
+            "the error should point at the host constructor: {error}"
+        );
+    }
 
     fn allocator(budget: u64) -> (Box<GovernedAllocator>, LedgerGovernor) {
         allocator_with(
@@ -1115,6 +1287,10 @@ mod tests {
     }
 
     impl onnx_runtime_memory_governor::MemoryGovernor for RecordingGovernor {
+        fn authority_id(&self) -> onnx_runtime_memory_governor::MemoryAuthorityId {
+            self.inner.authority_id()
+        }
+
         fn reserve(
             &self,
             tier: Tier,
@@ -1129,6 +1305,10 @@ mod tests {
 
         fn available(&self, tier: Tier) -> u64 {
             self.inner.available(tier)
+        }
+
+        fn used(&self, tier: Tier) -> u64 {
+            self.inner.used(tier)
         }
     }
 

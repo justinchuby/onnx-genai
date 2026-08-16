@@ -203,6 +203,9 @@ impl Kernel for ArgReduceKernel {
             })
         }
         .map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        if self.runtime.is_capturing()? {
+            return Ok(());
+        }
         self.runtime.synchronize()
     }
 

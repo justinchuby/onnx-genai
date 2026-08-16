@@ -302,6 +302,9 @@ impl FusedGeluKernel {
         // SAFETY: x/y cover n contiguous elements of `suffix` dtype; `bias` (when
         // has_bias) covers `width` elements and is only indexed as i % width.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        if self.runtime.is_capturing()? {
+            return Ok(());
+        }
         self.runtime.synchronize()
     }
 }

@@ -35,6 +35,7 @@ impl FloatDType {
 enum Storage {
     F32(Vec<f32>),
     U16(Vec<u16>),
+    U8(Vec<u8>),
     I64(Vec<i64>),
     I32(Vec<i32>),
 }
@@ -78,9 +79,23 @@ impl Tensor {
         Self::new(Storage::I64(values.to_vec()), DataType::Int64, shape)
     }
 
+    pub fn u8(shape: &[usize], values: &[u8]) -> Self {
+        assert_eq!(shape.iter().product::<usize>(), values.len());
+        Self::new(Storage::U8(values.to_vec()), DataType::Uint8, shape)
+    }
+
     pub fn i32(shape: &[usize], values: &[i32]) -> Self {
         assert_eq!(shape.iter().product::<usize>(), values.len());
         Self::new(Storage::I32(values.to_vec()), DataType::Int32, shape)
+    }
+
+    pub fn bool(shape: &[usize], values: &[bool]) -> Self {
+        assert_eq!(shape.iter().product::<usize>(), values.len());
+        Self::new(
+            Storage::U8(values.iter().map(|&b| b as u8).collect()),
+            DataType::Bool,
+            shape,
+        )
     }
 
     fn new(storage: Storage, dtype: DataType, shape: &[usize]) -> Self {
@@ -96,6 +111,7 @@ impl Tensor {
         match &self.storage {
             Storage::F32(values) => values.as_ptr().cast(),
             Storage::U16(values) => values.as_ptr().cast(),
+            Storage::U8(values) => values.as_ptr().cast(),
             Storage::I64(values) => values.as_ptr().cast(),
             Storage::I32(values) => values.as_ptr().cast(),
         }
@@ -105,6 +121,7 @@ impl Tensor {
         match &mut self.storage {
             Storage::F32(values) => values.as_mut_ptr().cast(),
             Storage::U16(values) => values.as_mut_ptr().cast(),
+            Storage::U8(values) => values.as_mut_ptr().cast(),
             Storage::I64(values) => values.as_mut_ptr().cast(),
             Storage::I32(values) => values.as_mut_ptr().cast(),
         }

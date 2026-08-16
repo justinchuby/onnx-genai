@@ -8,7 +8,7 @@
 //! while executing the tiles across a low-overhead pool that is created once and
 //! reused. QNBit callers can pass `multithread=true` to run one full-width
 //! `MlasQNBitGemmBatch` call and let MLAS partition N internally, matching ORT's
-//! intra-op threadpool shape. See `docs/MLAS_SYS_SPIKE.md` for the original
+//! intra-op threadpool shape. See `docs/performance/MLAS_SYS_SPIKE.md` for the original
 //! single-thread feasibility spike.
 
 use std::os::raw::c_int;
@@ -37,6 +37,25 @@ unsafe extern "C" {
         beta: f32,
         c: *mut f32,
         ldc: usize,
+    );
+
+    #[allow(clippy::too_many_arguments)]
+    fn mlas_qgemm_i32(
+        m: usize,
+        n: usize,
+        k: usize,
+        a_is_signed: c_int,
+        b_is_signed: c_int,
+        a: *const c_void,
+        lda: usize,
+        zero_point_a: u8,
+        b: *const c_void,
+        ldb: usize,
+        zero_point_b: *const u8,
+        per_column_zero_points: c_int,
+        c: *mut i32,
+        ldc: usize,
+        multithread: c_int,
     );
 
     fn mlas_sgemm_pack_b_size(trans_a: c_int, trans_b: c_int, n: usize, k: usize) -> usize;
@@ -72,6 +91,9 @@ unsafe extern "C" {
     /// Vectorized fused SiLU over `n` contiguous f32s. MLAS runtime-dispatches
     /// to its one-pass AVX-512F kernel when supported.
     fn mlas_compute_silu(input: *const f32, output: *mut f32, n: usize);
+    /// Row-wise softmax over `n` rows of `d` contiguous f32s, single-threaded,
+    /// using MLAS's SIMD max reduction and polynomial exp.
+    fn mlas_compute_softmax_in_place(data: *mut f32, n: usize, d: usize);
     fn mlas_eltwise_add(left: *const f32, right: *const f32, output: *mut f32, n: usize);
     fn mlas_compute_activation(
         kind: c_int,
@@ -234,6 +256,26 @@ type MlasParallelForFn = unsafe extern "C" fn(
 type MlasMaxThreadsFn = unsafe extern "C" fn(rust_ctx: *mut c_void) -> c_int;
 
 const MLAS_WORK_STEALING_THREADS_ENV: &str = "ONNX_GENAI_MLAS_THREADPOOL_THREADS";
+/// The CPU EP's thread-budget knob. `mlas-sys` sits *below* the EP and cannot
+/// depend on it, so the name lives here and the EP refers to *this* constant;
+/// `onnx-runtime-ep-cpu` static-asserts that its own `DECODE_THREADS_ENV`
+/// matches, so the two can never drift.
+///
+/// Without this, an embedder that asked the CPU EP for N threads still got a
+/// standalone-MLAS pool sized by [`default_mlas_thread_count`]'s own default,
+/// so the request was silently ignored for every `MlasGemmBatch` call.
+pub const CPU_DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
+/// Upper bound on the standalone pool, matching the previous `n.min(64)` cap on
+/// the explicit override.
+///
+/// A budget above this is clamped, which makes the standalone pool smaller than
+/// the CPU EP's persistent pool (that one clamps only to `available`). The
+/// divergence is reported once on stderr rather than applied silently.
+const MAX_MLAS_POOL_THREADS: usize = 64;
+
+/// Programmatic thread budget, mirroring the CPU EP's
+/// `set_decode_thread_budget`. Zero means unset.
+static POOL_THREAD_BUDGET: AtomicUsize = AtomicUsize::new(0);
 
 static MLAS_PARALLEL_FOR_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MLAS_PARALLEL_FOR_ITERATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -357,19 +399,121 @@ pub fn sqnbit_mlas_partitioning(
     }
 }
 
+/// Worker count for the standalone MLAS work-stealing pool.
+///
+/// Precedence, mirroring the CPU EP's own resolution order: the MLAS-specific
+/// pool override, then the programmatic budget from
+/// [`set_pool_thread_budget`], then the CPU EP's thread-budget environment
+/// variable, then [`resolve_default_mlas_threads`].
 fn default_mlas_thread_count() -> usize {
-    if let Ok(raw) = std::env::var(MLAS_WORK_STEALING_THREADS_ENV) {
-        if let Ok(n) = raw.trim().parse::<usize>() {
-            if n > 0 {
-                return n.min(64);
-            }
-        }
+    if let Some(threads) = thread_count_env(MLAS_WORK_STEALING_THREADS_ENV) {
+        return threads;
+    }
+    if let Some(threads) = pool_thread_budget() {
+        return threads;
+    }
+    if let Some(threads) = thread_count_env(CPU_DECODE_THREADS_ENV) {
+        return threads;
     }
 
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .clamp(1, 8)
+    resolve_default_mlas_threads(
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+    )
+}
+
+/// Set or clear a process-local worker budget for the standalone MLAS pool.
+///
+/// This is the programmatic equivalent of [`CPU_DECODE_THREADS_ENV`] and takes
+/// precedence over it. `onnx-runtime-ep-cpu::set_decode_thread_budget` forwards
+/// here so that a caller such as the CLI's `--cpu-cores` bounds dense
+/// `MlasGemmBatch` work too, on every OS -- not just Linux, where process
+/// affinity would otherwise shrink `available_parallelism` for us.
+///
+/// Pools are initialized lazily and keep their initial size for the process
+/// lifetime, so call this before the first GEMM. `Some(0)` is rejected.
+pub fn set_pool_thread_budget(threads: Option<usize>) -> Result<(), &'static str> {
+    if threads == Some(0) {
+        return Err("MLAS pool thread budget must be greater than zero");
+    }
+    POOL_THREAD_BUDGET.store(threads.unwrap_or(0), Ordering::Release);
+    Ok(())
+}
+
+fn pool_thread_budget() -> Option<usize> {
+    let threads = POOL_THREAD_BUDGET.load(Ordering::Acquire);
+    (threads > 0).then(|| clamp_pool_threads(threads))
+}
+
+/// The raw programmatic budget, before the [`MAX_MLAS_POOL_THREADS`] cap, or
+/// `None` when unset.
+///
+/// Exposed so higher layers can assert that their own budget actually reached
+/// this pool; it reports neither the env-var nor the automatic fallback, and
+/// deliberately mirrors the EP's `decode_threads_override` in returning the
+/// value as configured rather than as clamped.
+pub fn configured_pool_thread_budget() -> Option<usize> {
+    std::num::NonZeroUsize::new(POOL_THREAD_BUDGET.load(Ordering::Acquire))
+        .map(std::num::NonZeroUsize::get)
+}
+
+/// A budget of `0` means "no override" here, matching the CPU EP, which treats
+/// `ONNX_GENAI_CPU_DECODE_THREADS=0` as an opt-out back to automatic sizing.
+fn thread_count_env(name: &str) -> Option<usize> {
+    parse_thread_count(&std::env::var(name).ok()?)
+}
+
+/// Pure parser for a thread-count knob, split out so it can be tested without
+/// mutating the process environment (`setenv` races other threads' `getenv`).
+fn parse_thread_count(raw: &str) -> Option<usize> {
+    let threads = raw.trim().parse::<usize>().ok()?;
+    (threads > 0).then(|| clamp_pool_threads(threads))
+}
+
+fn clamp_pool_threads(threads: usize) -> usize {
+    if threads > MAX_MLAS_POOL_THREADS {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "mlas-sys: thread budget {threads} exceeds the standalone pool cap of \
+                 {MAX_MLAS_POOL_THREADS}; using {MAX_MLAS_POOL_THREADS} workers"
+            );
+        });
+    }
+    threads.min(MAX_MLAS_POOL_THREADS)
+}
+
+/// Default pool size: half the logical CPUs, but never fewer than the previous
+/// eight-worker ceiling allowed.
+///
+/// The old rule was `available.clamp(1, 8)`. That eight-worker cap belongs to
+/// the CPU EP's *flat Rayon* pool, whose per-op fork/join regresses past eight
+/// workers -- it does not apply here. This pool is persistent and work-stealing,
+/// so like the EP's persistent SPMD pool it keeps scaling with cores until the
+/// memory-bandwidth knee, measured at about half the logical CPUs.
+///
+/// Measured on a 32-vCPU/16-core EPYC 9V74 (f32 MatMul K=3584 N=3584 M=128,
+/// `native_min` over 15 runs after 5 warmups, ours/ORT at matched threads):
+///
+/// | requested threads | pool capped at 8 | pool sized to the request |
+/// |---|---|---|
+/// | 1--8 | 1.00--1.73x | unchanged (cap not binding) |
+/// | 16 | 2.08--2.48x slower | 1.24--1.44x slower |
+/// | 32 | 1.76--2.38x slower | **0.65--0.82x, i.e. faster than ORT** |
+///
+/// and with no thread flags at all: 1.85--2.64x slower at the old default
+/// versus 0.92--1.30x with this one.
+///
+/// `max` with `available.min(8)` keeps the rule monotone: no host ever gets
+/// *fewer* workers than the old default gave it, so small machines are
+/// unaffected and only hosts above 16 logical CPUs change.
+fn resolve_default_mlas_threads(available: usize) -> usize {
+    let available = available.max(1);
+    available
+        .div_ceil(2)
+        .max(available.min(8))
+        .min(MAX_MLAS_POOL_THREADS)
 }
 
 fn global_mlas_pool() -> Option<&'static WorkStealingThreadPool> {
@@ -464,8 +608,10 @@ pub struct MlasThreadPool {
 impl MlasThreadPool {
     /// Create a compatibility handle and initialize the process-global backing
     /// pool. The global pool's actual degree of parallelism is selected once at
-    /// first use (default: `available_parallelism().clamp(1, 8)`, override via
-    /// `ONNX_GENAI_MLAS_THREADPOOL_THREADS`), so this `thread_count` is retained
+    /// first use by [`default_mlas_thread_count`] --
+    /// `ONNX_GENAI_MLAS_THREADPOOL_THREADS`, then [`set_pool_thread_budget`],
+    /// then [`CPU_DECODE_THREADS_ENV`], then
+    /// [`resolve_default_mlas_threads`] -- so this `thread_count` is retained
     /// only for diagnostics/backward-compatible tests.
     pub fn new(thread_count: usize) -> std::io::Result<Self> {
         assert!(thread_count > 0, "thread_count must be non-zero");
@@ -528,6 +674,31 @@ pub fn compute_silu(input: &[f32], output: &mut [f32]) {
     // SAFETY: both slices are valid for `n` contiguous f32s; MLAS reads `input`
     // and writes `output`, and Rust's borrow rules prove they do not alias.
     unsafe { mlas_compute_silu(input.as_ptr(), output.as_mut_ptr(), input.len()) };
+}
+
+/// Row-wise in-place softmax, replacing a scalar `expf` loop: normalizes `n` rows of
+/// `d` contiguous f32s with MLAS's SIMD max reduction and polynomial exp — the
+/// same primitive ONNX Runtime's own Softmax and attention kernels use.
+///
+/// Single threaded; callers shard across threads themselves.
+///
+/// A row consisting entirely of `-inf` produces NaN, matching MLAS/ORT; callers
+/// that need the "fully masked row → zero" convention must screen for that case
+/// themselves.
+pub fn compute_softmax_in_place(data: &mut [f32], n: usize, d: usize) {
+    assert_eq!(
+        data.len(),
+        n.saturating_mul(d),
+        "compute_softmax_in_place expects exactly n*d elements"
+    );
+    if data.is_empty() {
+        return;
+    }
+    // SAFETY: `data` holds `n * d` contiguous f32s (asserted above) and is
+    // uniquely borrowed. MLAS's non-log softmax streams each row forward from
+    // input to output and then rescales the output, so a single buffer serving
+    // as both is well defined.
+    unsafe { mlas_compute_softmax_in_place(data.as_mut_ptr(), n, d) };
 }
 
 /// Compute contiguous Float32 elementwise addition with MLAS SIMD.
@@ -939,6 +1110,120 @@ pub fn sgemm_nn_packed(m: usize, a: &[f32], packed: &PackedB, c: &mut [f32]) {
     }
 }
 
+/// Zero points for an integer GEMM operand.
+#[derive(Debug, Clone, Copy)]
+pub enum QgemmZeroPoints<'a> {
+    /// One zero point for the whole tensor.
+    PerTensor(u8),
+    /// One zero point per column of `B`, i.e. `n` entries.
+    PerColumn(&'a [u8]),
+}
+
+/// Row-major integer GEMM producing the `i32` accumulator, `C = (A - za) * (B - zb)`.
+///
+/// `a` is `m x k` with row stride `k`, `b` is `k x n` with row stride `n`, and
+/// `c` is `m x n` with row stride `n` -- the same layout ONNX Runtime hands to
+/// MLAS for `MatMulInteger`/`QLinearMatMul`. Requantization is left to the
+/// caller, so the result is exactly the integer dot product with the zero
+/// points folded in.
+///
+/// `a_signed` / `b_signed` select the `i8` interpretation of the respective
+/// operand; the bytes are passed through unchanged either way. Zero-point bytes
+/// follow the same interpretation as the operand they belong to.
+///
+/// # Panics
+///
+/// Panics if any slice length disagrees with `m`, `n`, `k`, or if a per-column
+/// zero-point slice is not exactly `n` long.
+#[allow(clippy::too_many_arguments)]
+pub fn qgemm_i32(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[u8],
+    a_signed: bool,
+    zero_point_a: u8,
+    b: &[u8],
+    b_signed: bool,
+    zero_point_b: QgemmZeroPoints<'_>,
+    c: &mut [i32],
+) {
+    assert_eq!(a.len(), m * k, "A must be m*k bytes");
+    assert_eq!(b.len(), k * n, "B must be k*n bytes");
+    assert_eq!(c.len(), m * n, "C must be m*n i32");
+    if m == 0 || n == 0 {
+        return;
+    }
+    let (zero_point_b_ptr, per_column) = match zero_point_b {
+        QgemmZeroPoints::PerTensor(ref value) => (std::ptr::from_ref(value), 0),
+        QgemmZeroPoints::PerColumn(values) => {
+            assert_eq!(values.len(), n, "per-column zero points must be n long");
+            (values.as_ptr(), 1)
+        }
+    };
+    ensure_threading();
+    // SAFETY: the three slices are exactly the sizes asserted above, the zero
+    // point pointer is either a per-column slice of length `n` or a borrow of a
+    // local `u8` that outlives the call, and the shim writes only through `c`.
+    unsafe {
+        mlas_qgemm_i32(
+            m,
+            n,
+            k,
+            c_int::from(a_signed),
+            c_int::from(b_signed),
+            a.as_ptr().cast::<c_void>(),
+            k,
+            zero_point_a,
+            b.as_ptr().cast::<c_void>(),
+            n,
+            zero_point_b_ptr,
+            per_column,
+            c.as_mut_ptr(),
+            n,
+            c_int::from(mlas_threading_degree() > 1),
+        );
+    }
+}
+
+/// Whether this machine's `u8 x i8` integer GEMM kernel is exact.
+///
+/// On AVX2 without VNNI, MLAS's `u8 x i8` kernel multiplies raw bytes with
+/// `vpmaddubsw`, which sums *adjacent pairs* into an `i16` **with saturation**:
+/// `255 * -128 + 255 * -128 == -65280` clamps to `-32768`. Zero points are
+/// applied afterwards as row/column corrections, so the saturation is not
+/// recoverable and the result is silently approximate. VNNI (`vpdpbusd`) and
+/// AMX accumulate straight into `i32` and do not saturate; the other three
+/// signedness pairs are exact on every kernel we ship.
+///
+/// Rather than hard-code an ISA table -- which would be wrong on the next
+/// microarchitecture in either direction -- probe once with an input
+/// constructed to saturate, and believe the answer. A caller that requires bit
+/// exactness must consult this before routing `u8 x i8` here.
+pub fn qgemm_u8s8_is_exact() -> bool {
+    static EXACT: OnceLock<bool> = OnceLock::new();
+    *EXACT.get_or_init(|| {
+        // (255 * -128) + (255 * -128) = -65280, which is outside i16 range, so a
+        // pairwise-i16 kernel returns the clamped -32768 instead.
+        let a = [255u8, 255];
+        let b = [0x80u8, 0x80];
+        let mut c = [0i32];
+        qgemm_i32(
+            1,
+            1,
+            2,
+            &a,
+            false,
+            0,
+            &b,
+            true,
+            QgemmZeroPoints::PerTensor(0),
+            &mut c,
+        );
+        c[0] == -65280
+    })
+}
+
 /// Safe wrapper computing `C = A * B` for row-major matrices with no transpose.
 ///
 /// `a` is `m x k`, `b` is `k x n`, `c` is `m x n`. Uses `alpha = 1`,
@@ -1088,7 +1373,38 @@ pub struct SQNBitPackedB {
 unsafe impl Send for SQNBitPackedB {}
 unsafe impl Sync for SQNBitPackedB {}
 
+/// Live heap bytes currently retained by all [`SQNBitPackedB`] instances: the
+/// MLAS packed allocation plus the owned scale and zero-point copies. Maintained
+/// by construction/`Drop` so callers can compare the memory plan's *predicted*
+/// packed footprint against the bytes the kernels *actually* hold, in the same
+/// run (see the `MatMulNBits` accounting tests). This is heap only; it excludes
+/// the still-mapped on-disk weights and any GEMM workspace.
+static SQNBIT_PACKED_LIVE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Snapshot of [`SQNBIT_PACKED_LIVE_BYTES`]: the heap bytes all live
+/// `SQNBitPackedB` instances currently retain (packed buffer + scale copy +
+/// optional zero-point copy).
+pub fn sqnbit_packed_live_bytes() -> usize {
+    SQNBIT_PACKED_LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl SQNBitPackedB {
+    /// Heap bytes this instance owns: the packed allocation plus the scale and
+    /// optional zero-point copies MLAS's `Fp32` path consumes at GEMM time.
+    pub fn owned_heap_bytes(&self) -> usize {
+        self.layout.size()
+            + self.scale.capacity() * std::mem::size_of::<f32>()
+            + self.zp.as_ref().map_or(0, Vec::capacity)
+    }
+
+    fn account_alloc(&self) {
+        SQNBIT_PACKED_LIVE_BYTES.fetch_add(
+            self.owned_heap_bytes(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// Pack a blockwise-quantized B weight, returning `None` when MLAS reports
     /// no packing/kernel is available for this shape on the current host (the
     /// caller must then fall back to another path).
@@ -1123,7 +1439,7 @@ impl SQNBitPackedB {
                 zp_ptr,
             );
         }
-        Some(Self {
+        let packed = Self {
             ptr,
             layout,
             n,
@@ -1134,7 +1450,9 @@ impl SQNBitPackedB {
             has_zp,
             scale: scale.to_vec(),
             zp: zp.map(<[u8]>::to_vec),
-        })
+        };
+        packed.account_alloc();
+        Some(packed)
     }
 
     /// Reconstruct an MLAS packed weight from a previously packed buffer.
@@ -1164,7 +1482,7 @@ impl SQNBitPackedB {
         let ptr = unsafe { std::alloc::alloc(layout) };
         assert!(!ptr.is_null(), "SQNBit prepacked-B allocation failed");
         unsafe { std::ptr::copy_nonoverlapping(packed.as_ptr(), ptr, size) };
-        Some(Self {
+        let repacked = Self {
             ptr,
             layout,
             n,
@@ -1175,7 +1493,9 @@ impl SQNBitPackedB {
             has_zp,
             scale: scale.to_vec(),
             zp: zp.map(<[u8]>::to_vec),
-        })
+        };
+        repacked.account_alloc();
+        Some(repacked)
     }
 
     /// Serialized bytes of this host- and compute-type-specific MLAS layout.
@@ -1191,6 +1511,10 @@ impl SQNBitPackedB {
 
 impl Drop for SQNBitPackedB {
     fn drop(&mut self) {
+        SQNBIT_PACKED_LIVE_BYTES.fetch_sub(
+            self.owned_heap_bytes(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         unsafe { std::alloc::dealloc(self.ptr, self.layout) };
     }
 }
@@ -1447,6 +1771,71 @@ mod tests {
 
     fn assert_send_sync<T: Send + Sync>() {}
 
+    /// The durable heap a `CompFp32` int4 `SQNBitPackedB` retains is exactly the
+    /// packed buffer **plus** its owned scale (and, when asymmetric, zero-point)
+    /// copies -- and it is linear in `N`, so per-shard packs sum to the whole.
+    ///
+    /// This is the mlas-sys-level anchor for the CPU EP's packed-buffer
+    /// accounting: `mlas_sqnbit_scale_zp_bytes` predicts the scale/zp overhead as
+    /// `N*ceil(K/blk)*4 (+ N*ceil(ceil(K/blk)/2))`, and this test proves that
+    /// prediction equals what a real packed buffer actually holds. If MLAS ever
+    /// changed what a packed weight retains, this fails rather than letting the
+    /// predictor silently drift below the real footprint (the under-reporting
+    /// direction an admission gate must never take).
+    #[test]
+    fn sqnbit_fp32_owned_heap_equals_packed_plus_scale_zp() {
+        let comp = SQNBitComputeType::Fp32;
+        let (n, k, blk) = (4864usize, 896usize, 32usize);
+        if !sqnbit_gemm_available(4, blk, comp) {
+            eprintln!("SQNBit fp32 int4 unavailable on host; skipping");
+            return;
+        }
+        let blocks = k.div_ceil(blk);
+        for asymmetric in [false, true] {
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| ((i as f32 * 0.019 + 0.13).sin()) * 1.7)
+                .collect();
+            let (packed_b, scales, zps, _d) = quantize_int4(&weights, n, k, blk, asymmetric);
+            let zp_slice = zps.as_deref();
+            let packed_size = sqnbit_packed_b_size(n, k, 4, blk, asymmetric, comp).unwrap();
+            let scale_bytes = n * blocks * std::mem::size_of::<f32>();
+            let zp_bytes = zp_slice.map_or(0, <[u8]>::len);
+            let expected_owned = packed_size + scale_bytes + zp_bytes;
+
+            let whole =
+                SQNBitPackedB::new(n, k, 4, blk, comp, &packed_b, &scales, zp_slice).unwrap();
+            assert_eq!(
+                whole.owned_heap_bytes(),
+                expected_owned,
+                "asymmetric={asymmetric}: owned heap must be packed + scales (+ zp)"
+            );
+
+            // The packed buffer is linear in N for Fp32, so N-row shards sum to
+            // the whole -- the exact partition `build_mlas_shards` performs.
+            let shard_align = 16usize;
+            let target = shard_align * ((n / 8).div_ceil(shard_align)).max(1);
+            let mut shard_owned = 0usize;
+            let mut start = 0usize;
+            while start < n {
+                let len = target.min(n - start).max(1);
+                let ps = &packed_b[start * blocks * (blk / 2)..(start + len) * blocks * (blk / 2)];
+                let ss = &scales[start * blocks..(start + len) * blocks];
+                let zs = zp_slice.map(|z| {
+                    let per_row = blocks.div_ceil(2);
+                    &z[start * per_row..(start + len) * per_row]
+                });
+                let shard = SQNBitPackedB::new(len, k, 4, blk, comp, ps, ss, zs).unwrap();
+                shard_owned += shard.owned_heap_bytes();
+                start += len;
+            }
+            assert_eq!(
+                shard_owned,
+                whole.owned_heap_bytes(),
+                "asymmetric={asymmetric}: per-shard owned heap must sum to the whole"
+            );
+        }
+    }
+
     #[test]
     fn packed_b_is_send_sync() {
         assert_send_sync::<PackedB>();
@@ -1664,8 +2053,54 @@ mod tests {
         );
     }
 
+    /// The threadpool sentinel must not change results. `MlasGemmBatch`
+    /// partitions across threads, so this also guards against a partitioning
+    /// bug producing torn, zeroed or doubly-written output tiles.
+    #[test]
+    fn sgemm_nn_is_correct_when_parallelized() {
+        let (m, n, k) = (129usize, 257usize, 193usize); // deliberately odd
+        let a = seq(m * k, 0.5);
+        let b = seq(k * n, 1.5);
+        let mut got = vec![0.0f32; m * n];
+        sgemm_nn(m, n, k, &a, &b, &mut got);
+
+        let mut want = vec![0.0f32; m * n];
+        ref_sgemm(false, false, m, n, k, 1.0, &a, k, &b, n, 0.0, &mut want, n);
+
+        // Per-element bound from the actual accumulation magnitude rather than
+        // a flat relative epsilon: a flat bound scaled by |want| goes to zero
+        // as an output approaches zero, so a zeroed tile covering
+        // small-magnitude outputs could slip through. `sum |a*b|` is the
+        // quantity f32 rounding actually accumulates over.
+        //
+        // The constant is the standard forward error bound for a length-`k`
+        // dot product, `gamma_k = k*u / (1 - k*u)` with `u = EPSILON/2`,
+        // rounded up to `k * EPSILON`. Deliberately not tighter: MLAS is free
+        // to reassociate the sum (blocked accumulation, FMA contraction,
+        // different vector widths per ISA), so a bound derived from one host's
+        // accumulation order would be flaky elsewhere. It is still ~5 orders
+        // of magnitude below the value itself, so a zeroed or torn tile is
+        // caught.
+        let tol_scale = k as f32 * f32::EPSILON;
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum_abs = 0.0f32;
+                for p in 0..k {
+                    sum_abs += (a[i * k + p] * b[p * n + j]).abs();
+                }
+                let tol = tol_scale * sum_abs.max(f32::MIN_POSITIVE);
+                let (g, w) = (got[i * n + j], want[i * n + j]);
+                assert!(
+                    (g - w).abs() <= tol,
+                    "mismatch at ({i},{j}): got {g}, want {w}, tol {tol} \
+                     (sum|a*b| = {sum_abs})"
+                );
+            }
+        }
+    }
+
     /// Single-thread performance probe for the medium f32 MatMul shape
-    /// (32x512x512) recorded in docs/KERNEL_PERF.md. Ignored by default; run
+    /// (32x512x512) recorded in docs/performance/KERNEL_PERF.md. Ignored by default; run
     /// with:
     ///   cargo test -p mlas-sys --release -- --ignored --nocapture perf_sgemm_medium
     #[test]
@@ -1718,7 +2153,7 @@ mod tests {
              ({gflops_p:.1} GFLOP/s), checksum={checksum_p:.3}"
         );
         eprintln!(
-            "recorded baselines (docs/KERNEL_PERF.md): ORT 1-thread ~131 us, SimdX86 ~285 us"
+            "recorded baselines (docs/performance/KERNEL_PERF.md): ORT 1-thread ~131 us, SimdX86 ~285 us"
         );
     }
 
@@ -1760,7 +2195,7 @@ mod tests {
             );
         }
         eprintln!(
-            "recorded ORT baselines (docs/KERNEL_PERF.md): 1-thread ~131 us, 8-thread ~28-30 us"
+            "recorded ORT baselines (docs/performance/KERNEL_PERF.md): 1-thread ~131 us, 8-thread ~28-30 us"
         );
     }
 
@@ -3043,5 +3478,294 @@ mod tests {
 
             assert_eq!(back, input, "round-trip mismatch for channels={channels}");
         }
+    }
+
+    /// The standalone pool's default sizing rule must never hand a host *fewer*
+    /// workers than the previous `available.clamp(1, 8)` rule did, and must
+    /// scale past eight on hosts that have the cores.
+    ///
+    /// The old cap was inherited from the CPU EP's flat Rayon pool, whose per-op
+    /// fork/join regresses past eight workers. This pool is persistent and
+    /// work-stealing, so the cap only starved it: on a 32-vCPU host it left f32
+    /// MatMul 1.85--2.64x slower than ORT out of the box, versus 0.92--1.30x
+    /// once the pool is allowed half the machine.
+    #[test]
+    fn default_pool_size_is_monotone_against_the_old_eight_worker_rule() {
+        for available in 1..=256usize {
+            let old = available.clamp(1, 8);
+            let new = resolve_default_mlas_threads(available);
+            assert!(
+                new >= old,
+                "available={available}: new default {new} regresses below the old default {old}"
+            );
+            assert!(
+                new <= available.max(1),
+                "available={available}: new default {new} oversubscribes the host"
+            );
+            assert!(
+                new <= MAX_MLAS_POOL_THREADS,
+                "available={available}: new default {new} exceeds the pool cap"
+            );
+        }
+        // Pin the interesting points so a future edit cannot silently drift.
+        assert_eq!(resolve_default_mlas_threads(0), 1, "degenerate host");
+        assert_eq!(resolve_default_mlas_threads(1), 1);
+        assert_eq!(resolve_default_mlas_threads(4), 4, "small host unchanged");
+        assert_eq!(resolve_default_mlas_threads(8), 8, "old ceiling unchanged");
+        assert_eq!(resolve_default_mlas_threads(16), 8, "old ceiling unchanged");
+        assert_eq!(
+            resolve_default_mlas_threads(32),
+            16,
+            "half of a 32-vCPU host"
+        );
+        assert_eq!(resolve_default_mlas_threads(256), 64, "capped");
+    }
+
+    /// `ONNX_GENAI_CPU_DECODE_THREADS` is the CPU EP's thread-budget knob. The
+    /// standalone MLAS pool used to ignore it entirely, so asking the EP for N
+    /// threads left every `MlasGemmBatch` call on a differently-sized pool.
+    #[allow(clippy::too_many_arguments)]
+    fn qgemm_oracle(
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[u8],
+        a_signed: bool,
+        za: u8,
+        b: &[u8],
+        b_signed: bool,
+        zb: &[u8],
+    ) -> Vec<i32> {
+        let widen = |byte: u8, signed: bool| {
+            if signed {
+                i32::from(byte as i8)
+            } else {
+                i32::from(byte)
+            }
+        };
+        let za = widen(za, a_signed);
+        let mut c = vec![0i32; m * n];
+        for row in 0..m {
+            for column in 0..n {
+                let zb = widen(zb[column % zb.len()], b_signed);
+                let mut acc = 0i32;
+                for inner in 0..k {
+                    acc += (widen(a[row * k + inner], a_signed) - za)
+                        * (widen(b[inner * n + column], b_signed) - zb);
+                }
+                c[row * n + column] = acc;
+            }
+        }
+        c
+    }
+
+    /// MLAS's integer QGEMM must reproduce the plain integer dot product for
+    /// every signedness pair, including the `m == 1` decode row and shapes that
+    /// are not multiples of any kernel tile.
+    #[test]
+    fn qgemm_i32_matches_the_integer_oracle_for_every_signedness() {
+        // `u8 x i8` is the one pair a pairwise-i16 kernel can saturate; every
+        // other pair is exact on every kernel we ship, on every host. Asserting
+        // the exact pairs unconditionally is what makes this test a real check
+        // rather than a restatement of whatever the machine happens to do.
+        fn exact_here(a_signed: bool, b_signed: bool) -> bool {
+            !(!a_signed && b_signed) || qgemm_u8s8_is_exact()
+        }
+
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 33) as u8
+        };
+
+        for &(m, n, k) in &[
+            (1, 1, 1),
+            (1, 37, 61),
+            (3, 8, 4),
+            (5, 65, 129),
+            (16, 16, 32),
+        ] {
+            let a: Vec<u8> = (0..m * k).map(|_| next()).collect();
+            let b: Vec<u8> = (0..k * n).map(|_| next()).collect();
+            for &a_signed in &[false, true] {
+                for &b_signed in &[false, true] {
+                    let za = next();
+                    let zb = next();
+                    let mut got = vec![0i32; m * n];
+                    qgemm_i32(
+                        m,
+                        n,
+                        k,
+                        &a,
+                        a_signed,
+                        za,
+                        &b,
+                        b_signed,
+                        QgemmZeroPoints::PerTensor(zb),
+                        &mut got,
+                    );
+                    let want = qgemm_oracle(m, n, k, &a, a_signed, za, &b, b_signed, &[zb]);
+                    if exact_here(a_signed, b_signed) {
+                        assert_eq!(
+                            got, want,
+                            "per-tensor m={m} n={n} k={k} a_signed={a_signed} \
+                             b_signed={b_signed}"
+                        );
+                    }
+
+                    let zb_columns: Vec<u8> = (0..n).map(|_| next()).collect();
+                    let mut got = vec![0i32; m * n];
+                    qgemm_i32(
+                        m,
+                        n,
+                        k,
+                        &a,
+                        a_signed,
+                        za,
+                        &b,
+                        b_signed,
+                        QgemmZeroPoints::PerColumn(&zb_columns),
+                        &mut got,
+                    );
+                    let want = qgemm_oracle(m, n, k, &a, a_signed, za, &b, b_signed, &zb_columns);
+                    if exact_here(a_signed, b_signed) {
+                        assert_eq!(
+                            got, want,
+                            "per-column m={m} n={n} k={k} a_signed={a_signed} \
+                             b_signed={b_signed}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The probe must predict what the machine actually does. A probe that
+    /// always answered "exact" would silently license a lossy kernel, and one
+    /// that always answered "inexact" would give up the fast path for free.
+    #[test]
+    fn qgemm_u8s8_probe_agrees_with_what_the_machine_actually_computes() {
+        let (m, n, k) = (4, 24, 96);
+        let mut state = 0x0f1e_2d3c_4b5a_6978u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 33) as u8
+        };
+        // Full-range operands: `u8` near 255 against `i8` near -128 is exactly
+        // the pattern that overflows a pairwise `i16` accumulator.
+        let a: Vec<u8> = (0..m * k).map(|_| 192 | (next() >> 2)).collect();
+        let b: Vec<u8> = (0..k * n).map(|_| 0x80 | (next() >> 2)).collect();
+        let mut got = vec![0i32; m * n];
+        qgemm_i32(
+            m,
+            n,
+            k,
+            &a,
+            false,
+            0,
+            &b,
+            true,
+            QgemmZeroPoints::PerTensor(0),
+            &mut got,
+        );
+        let want = qgemm_oracle(m, n, k, &a, false, 0, &b, true, &[0]);
+        assert_eq!(
+            got == want,
+            qgemm_u8s8_is_exact(),
+            "the u8xi8 exactness probe disagrees with a deliberately saturating \
+             workload; probe said {}",
+            qgemm_u8s8_is_exact()
+        );
+    }
+
+    #[test]
+    fn qgemm_i32_tolerates_empty_shapes() {
+        let mut c: Vec<i32> = Vec::new();
+        qgemm_i32(
+            0,
+            4,
+            4,
+            &[],
+            false,
+            0,
+            &[0; 16],
+            false,
+            QgemmZeroPoints::PerTensor(0),
+            &mut c,
+        );
+        qgemm_i32(
+            4,
+            0,
+            4,
+            &[0; 16],
+            false,
+            0,
+            &[],
+            false,
+            QgemmZeroPoints::PerTensor(0),
+            &mut c,
+        );
+    }
+
+    #[test]
+    fn parse_thread_count_parses_and_clamps() {
+        // Deliberately tests the pure parser rather than `thread_count_env`:
+        // `std::env::set_var` races concurrent `getenv` in sibling tests (cargo
+        // runs lib tests multi-threaded), which is a data race even for
+        // distinct keys. The only thing `thread_count_env` adds is the
+        // `std::env::var` lookup.
+        assert_eq!(parse_thread_count("12"), Some(12));
+        assert_eq!(
+            parse_thread_count("  7  "),
+            Some(7),
+            "surrounding whitespace must be tolerated"
+        );
+        assert_eq!(
+            parse_thread_count("9999"),
+            Some(MAX_MLAS_POOL_THREADS),
+            "an absurd request must clamp, not oversubscribe"
+        );
+        for bad in ["0", "", "abc", "-4", "3.5", "18446744073709551616"] {
+            assert_eq!(
+                parse_thread_count(bad),
+                None,
+                "{bad:?} must fall through to the next precedence level"
+            );
+        }
+    }
+
+    #[test]
+    fn pool_thread_budget_round_trips_and_rejects_zero() {
+        // Serialized against the resolver test below by exercising only the
+        // atomic, which is process-local state this test fully owns and
+        // restores.
+        let previous = POOL_THREAD_BUDGET.load(Ordering::Acquire);
+        assert_eq!(
+            set_pool_thread_budget(Some(0)),
+            Err("MLAS pool thread budget must be greater than zero"),
+            "zero is the CPU EP's opt-out sentinel, not a legal pool size"
+        );
+
+        set_pool_thread_budget(Some(6)).expect("6 is a legal budget");
+        assert_eq!(pool_thread_budget(), Some(6));
+
+        set_pool_thread_budget(Some(9999)).expect("an absurd budget clamps");
+        assert_eq!(
+            pool_thread_budget(),
+            Some(MAX_MLAS_POOL_THREADS),
+            "the programmatic path must clamp exactly like the env path"
+        );
+
+        set_pool_thread_budget(None).expect("clearing is legal");
+        assert_eq!(
+            pool_thread_budget(),
+            None,
+            "a cleared budget must fall through to the next precedence level"
+        );
+        POOL_THREAD_BUDGET.store(previous, Ordering::Release);
     }
 }

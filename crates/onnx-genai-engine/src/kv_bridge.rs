@@ -2,6 +2,7 @@
 
 use crate::config::SessionId;
 use crate::decode::DecodeState;
+use crate::kv_sizing::{KvDimension, KvStorageType, KvTensorSpec};
 use crate::logits::TokenId;
 use crate::session::{DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
@@ -23,6 +24,16 @@ pub(crate) struct KvModelInfo {
     /// Per-layer KV geometry, indexed identically to [`KvModelInfo::layers`].
     /// Length equals the number of exported KV layers (post kv-sharing).
     pub(crate) layer_configs: Vec<LayerTensorConfig>,
+    /// Native past tensors, retained independently so asymmetric K/V geometry
+    /// and storage types are charged exactly as the allocator sizes them.
+    #[cfg_attr(
+        all(not(feature = "native-backend"), not(test)),
+        expect(
+            dead_code,
+            reason = "native KV tensors are consumed only by the native backend"
+        )
+    )]
+    pub(crate) native_kv_tensors: Vec<KvTensorSpec>,
     pub(crate) layers: Vec<KvLayerIo>,
 }
 
@@ -51,15 +62,15 @@ pub(crate) struct KvLayerIo {
 }
 
 /// One self-attention layer's four paged-KV port names, resolved WITHOUT
-/// reading any tensor name. `key_present_info` is the present KEY output's shape
-/// record, the authoritative source of this layer's `num_kv_heads`/`head_dim`
-/// geometry (read structurally from the ONNX shape, never from a name).
+/// reading any tensor name.
 struct ResolvedKvLayer {
     key_past: String,
     key_present: String,
     value_past: String,
     value_present: String,
     key_present_info: TensorInfo,
+    key_past_info: TensorInfo,
+    value_past_info: TensorInfo,
 }
 
 pub(crate) fn infer_kv_model_info(
@@ -77,6 +88,11 @@ pub(crate) fn infer_kv_model_info(
         .map(|layer| layer.key_present_info.clone())
         .collect::<Vec<_>>();
     let layer_configs = layer_configs_from_key_outputs(&key_outputs)?;
+    let native_kv_tensors = resolved_layers
+        .iter()
+        .flat_map(|layer| [&layer.key_past_info, &layer.value_past_info])
+        .map(native_kv_tensor_spec)
+        .collect::<anyhow::Result<Vec<_>>>()?;
     // Representative geometry (layer 0). The paged cache is built from the full
     // per-layer `layer_configs`; `tensor_config` remains a single-value view for
     // uniform-only consumers (connector payloads, num_layers/dtype).
@@ -100,8 +116,43 @@ pub(crate) fn infer_kv_model_info(
     Ok(Some(KvModelInfo {
         tensor_config: config,
         layer_configs,
+        native_kv_tensors,
         layers,
     }))
+}
+
+fn native_kv_tensor_spec(info: &TensorInfo) -> anyhow::Result<KvTensorSpec> {
+    if !is_supported_kv_dtype(info.dtype) {
+        anyhow::bail!(
+            "past KV input '{}' must be Float32, Float16, or BFloat16, got {:?}",
+            info.name,
+            info.dtype
+        );
+    }
+    let shape = info
+        .shape
+        .iter()
+        .enumerate()
+        .map(|(axis, &dim)| {
+            if dim >= 0 {
+                KvDimension::Fixed(dim as u64)
+            } else if axis == 0 {
+                KvDimension::PerSequenceBatch
+            } else {
+                KvDimension::Context
+            }
+        })
+        .collect();
+    Ok(KvTensorSpec {
+        name: info.name.clone(),
+        dtype: match info.dtype {
+            DataType::Float32 => KvStorageType::Float32,
+            DataType::Float16 => KvStorageType::Float16,
+            DataType::BFloat16 => KvStorageType::BFloat16,
+            _ => unreachable!("validated above"),
+        },
+        shape,
+    })
 }
 
 /// Resolve the paged-KV self-attention layer ports strictly from explicit
@@ -150,14 +201,16 @@ fn resolve_kv_layers(
     for ports in port_layers {
         let key_present_info = require_present_kv_output(graph, &ports.key_present)?;
         require_present_kv_output(graph, &ports.value_present)?;
-        require_kv_input(graph, &ports.key_past)?;
-        require_kv_input(graph, &ports.value_past)?;
+        let key_past_info = require_kv_input(graph, &ports.key_past)?;
+        let value_past_info = require_kv_input(graph, &ports.value_past)?;
         layers.push(ResolvedKvLayer {
             key_past: ports.key_past,
             key_present: ports.key_present,
             value_past: ports.value_past,
             value_present: ports.value_present,
             key_present_info,
+            key_past_info,
+            value_past_info,
         });
     }
     Ok(Some(layers))
@@ -235,11 +288,15 @@ fn require_present_kv_output(graph: &dyn GraphIo, name: &str) -> anyhow::Result<
 
 /// Validate that a declared past-KV input exists; errors name the exact missing
 /// `model.io.kv_inputs` port.
-fn require_kv_input(graph: &dyn GraphIo, name: &str) -> anyhow::Result<()> {
-    if !graph.inputs().iter().any(|input| input.name == name) {
-        anyhow::bail!("declared model.io.kv_inputs port '{name}' is not exposed by the graph");
-    }
-    Ok(())
+fn require_kv_input(graph: &dyn GraphIo, name: &str) -> anyhow::Result<TensorInfo> {
+    graph
+        .inputs()
+        .iter()
+        .find(|input| input.name == name)
+        .cloned()
+        .with_context(|| {
+            format!("declared model.io.kv_inputs port '{name}' is not exposed by the graph")
+        })
 }
 
 /// Build the per-layer KV geometry from each exported present-KV output shape.
@@ -971,6 +1028,55 @@ pub(crate) fn past_kv_from_payloads(
 /// int8) is skipped so a dtype mismatch can never corrupt injected output. The
 /// check uses the model's actual past-input dtype (not the coarser
 /// [`KvDType`], which folds fp16 into `F32`).
+/// Whether the ORT decoder `session` declares loop-carried recurrent state
+/// (hybrid conv/recurrent `fixed_state` alongside attention KV).
+///
+/// This mirrors the native [`has_recurrent_state`] gate (#700) onto the ORT
+/// paged-KV reuse path (#701). Paged / materialized-past reuse
+/// ([`load_materialized_past`]) restores only attention KV, so a hybrid
+/// recurrent model reused this way would run a fresh-zero recurrent/conv state
+/// against a reused attention prefix and silently emit wrong continuation
+/// logits (the #695 failure #700 fixed for the native backend). When this
+/// returns `true` the reuse decision must decline paged reuse and force a full
+/// recompute — correct, if slower — until per-prefix recurrent-state restore
+/// lands.
+///
+/// The signal is purely structural (RULES.md §2), never a model-name gate: a
+/// state counts as recurrent only when the model's I/O spec declares it as a
+/// loop-carried `state_pair` input AND that input's shape carries a static
+/// penultimate (feature) axis, exactly as the native path classifies declared
+/// state inputs. Attention KV past inputs carry a symbolic `past_sequence`
+/// length on that axis and are never declared as state pairs, so this is a
+/// guaranteed no-op for every attention-only model loadable today.
+///
+/// [`has_recurrent_state`]: crate::native_decode
+pub(crate) fn ort_session_has_recurrent_state(
+    session: &Session,
+    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+) -> bool {
+    let Some(state_pairs) = io.and_then(|io| io.state_pairs.as_ref()) else {
+        return false;
+    };
+    let declared = state_pairs
+        .iter()
+        .map(|pair| pair.input.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    session
+        .inputs()
+        .iter()
+        .filter(|info| declared.contains(info.name.as_str()))
+        .any(|info| is_recurrent_state_input_shape(&info.shape))
+}
+
+/// Structural test matching `native_decode::is_recurrent_state_shape` for the
+/// ORT session's concrete `i64` shapes: a declared loop-carried state input is
+/// a fixed-size recurrent state (replaced wholesale each step) rather than a
+/// growable KV cache when its sequence axis — the penultimate axis — is
+/// statically sized (`>= 0`) rather than symbolic (`< 0`).
+fn is_recurrent_state_input_shape(shape: &[i64]) -> bool {
+    shape.len() >= 2 && shape[shape.len() - 2] >= 0
+}
+
 pub(crate) fn kv_model_past_is_f32(session: &Session, kv_model: &KvModelInfo) -> bool {
     let Some(layer) = kv_model.layers.first() else {
         return false;
@@ -1039,6 +1145,60 @@ mod tests {
             page_size: 2,
             dtype: KvDType::F32,
         }
+    }
+
+    fn load_named_session(dir: &str, model_file: &str) -> anyhow::Result<(Environment, Session)> {
+        let environment = Environment::new("kv-bridge-tests")?;
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(dir)
+            .join(model_file);
+        let session = Session::new(
+            &environment,
+            &path,
+            SessionOptions::default().with_intra_op_threads(1),
+        )?;
+        Ok((environment, session))
+    }
+
+    #[test]
+    fn ort_recurrent_state_guard_is_noop_for_attention_only_model() -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        // An attention-only KV model declares no loop-carried `state_pairs`, so
+        // the #701 ORT paged-reuse guard must not trip: reuse stays enabled.
+        let (_environment, session) = load_session("tiny-llm")?;
+        let io = fixture_io("tiny-llm")?;
+        assert!(
+            !ort_session_has_recurrent_state(&session, Some(&io)),
+            "attention-only model must not be treated as recurrent (guard must be a no-op)"
+        );
+        // Absent I/O metadata is also treated as non-recurrent.
+        assert!(!ort_session_has_recurrent_state(&session, None));
+        Ok(())
+    }
+
+    #[test]
+    fn ort_recurrent_state_guard_trips_for_hybrid_recurrent_model() -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        // A hybrid decoder declares loop-carried `state_a.in` / `state_b.in`
+        // recurrent states (static penultimate axis) alongside its attention KV
+        // past inputs. The guard must trip so paged/materialized-past reuse is
+        // declined and a full recompute is forced (#701), mirroring the native
+        // `has_recurrent_state` gate (#700).
+        let (_environment, session) =
+            load_named_session("tiny-multiaxis-state-decoder", "decoder.onnx.textproto")?;
+        let io: onnx_genai_metadata::ModelIoSpec = serde_json::from_value(serde_json::json!({
+            "kv_inputs": ["past.3.key", "past.3.value", "past.11.key", "past.11.value"],
+            "state_pairs": [
+                {"input": "state_a.in", "output": "state_a.out"},
+                {"input": "state_b.in", "output": "state_b.out"},
+            ],
+        }))?;
+        assert!(
+            ort_session_has_recurrent_state(&session, Some(&io)),
+            "hybrid recurrent model must be gated out of ORT paged-KV reuse"
+        );
+        Ok(())
     }
 
     fn append_token(cache: &mut PagedKvCache, seq: SessionId, base: f32) {
@@ -1223,6 +1383,48 @@ mod tests {
         assert_eq!(configs[full_group_target].head_dim, 16);
         // A sliding group targeting layer 0 must pick (2, 8), not the full geometry.
         assert_eq!(configs[0].head_dim, 8);
+    }
+
+    #[test]
+    fn native_kv_specs_retain_asymmetric_past_tensor_geometry_and_dtype() -> anyhow::Result<()> {
+        let graph = onnx_genai_ort::GraphIoMetadata::new(
+            vec![
+                TensorInfo {
+                    name: "past_key_values.0.key".into(),
+                    dtype: DataType::Float16,
+                    shape: vec![-1, 2, -1, 4],
+                },
+                TensorInfo {
+                    name: "past_key_values.0.value".into(),
+                    dtype: DataType::Float32,
+                    shape: vec![-1, 2, -1, 8],
+                },
+            ],
+            vec![
+                TensorInfo {
+                    name: "present.0.key".into(),
+                    dtype: DataType::Float16,
+                    shape: vec![-1, 2, -1, 4],
+                },
+                TensorInfo {
+                    name: "present.0.value".into(),
+                    dtype: DataType::Float32,
+                    shape: vec![-1, 2, -1, 8],
+                },
+            ],
+        );
+        let io = fixture_io("tiny-llm")?;
+
+        let info = infer_kv_model_info(&graph, Some(&io), 16, KvDType::F32)?
+            .context("declared KV pairs should produce model info")?;
+
+        assert_eq!(info.native_kv_tensors.len(), 2);
+        assert_eq!(
+            crate::kv_sizing::kv_cache_bytes_for_tensors(&info.native_kv_tensors, 1)?,
+            80,
+            "f16 key (16 B/token) plus wider f32 value (64 B/token)"
+        );
+        Ok(())
     }
 
     #[test]
@@ -1614,7 +1816,7 @@ mod tests {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
         let io = fixture_io("tiny-llm")?;
-        let path = detect_model_decode_path(&session, Some(&io), None, None, Some(2), 0)?;
+        let path = detect_model_decode_path(&session, Some(&io), None, None, Some(2), None, 0)?;
         assert!(matches!(
             path,
             ModelDecodePath::PastPresent {
@@ -1638,7 +1840,7 @@ mod tests {
         // paged sliding-window path (shared_buffer: false), since the append-only
         // single shared buffer cannot express windowed eviction.
         assert!(matches!(
-            detect_model_decode_path(&session, Some(&io), Some(16), Some(16), Some(2), 0)?,
+            detect_model_decode_path(&session, Some(&io), Some(16), Some(16), Some(2), None, 0)?,
             ModelDecodePath::PastPresent {
                 shared_buffer: false,
                 max_len: None,
@@ -1646,6 +1848,83 @@ mod tests {
                 sink_tokens: None,
             }
         ));
+        Ok(())
+    }
+
+    /// Build a single-node GroupQueryAttention decoder graph. `Some(w)` carries a
+    /// real, graph-enforced `local_window_size`; `None` is global attention.
+    fn gqa_graph(local_window_size: Option<i64>) -> onnx_runtime_ir::Graph {
+        use onnx_runtime_ir::{Attribute, Graph, Node};
+        let mut graph = Graph::default();
+        graph.nodes.insert_with(|id| {
+            let mut node = Node::new(id, "GroupQueryAttention", vec![], vec![]);
+            node.domain = "com.microsoft".to_string();
+            if let Some(window) = local_window_size {
+                node.attributes
+                    .insert("local_window_size".to_string(), Attribute::Int(window));
+            }
+            node
+        });
+        graph
+    }
+
+    #[test]
+    fn vestigial_metadata_window_routes_to_shared_buffer() -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        let (_environment, session) = load_session("tiny-llm")?;
+        let io = fixture_io("tiny-llm")?;
+
+        // A window declared in metadata (Some(2)) but NOT enforced by the graph
+        // (GQA carries no local_window_size => global attention, like
+        // Muse-Glimmer) must be reclassified as global and reach the
+        // capture-stable shared-buffer / fixed-capacity KV path.
+        let global_graph = gqa_graph(None);
+        let path = detect_model_decode_path(
+            &session,
+            Some(&io),
+            Some(16),
+            Some(16),
+            Some(2),
+            Some(&global_graph),
+            0,
+        )?;
+        assert!(
+            matches!(
+                path,
+                ModelDecodePath::PastPresent {
+                    shared_buffer: true,
+                    max_len: Some(16),
+                    sliding_window: None,
+                    sink_tokens: None,
+                }
+            ),
+            "vestigial window must route to shared-buffer, got {path:?}"
+        );
+
+        // A window the graph actually enforces (GQA local_window_size > 0, real
+        // SWA) stays on the bounded paged windowed path — no regression.
+        let windowed_graph = gqa_graph(Some(2));
+        let windowed = detect_model_decode_path(
+            &session,
+            Some(&io),
+            Some(16),
+            Some(16),
+            Some(2),
+            Some(&windowed_graph),
+            0,
+        )?;
+        assert!(
+            matches!(
+                windowed,
+                ModelDecodePath::PastPresent {
+                    shared_buffer: false,
+                    max_len: None,
+                    sliding_window: Some(2),
+                    sink_tokens: None,
+                }
+            ),
+            "real graph-enforced window must stay on the paged windowed path, got {windowed:?}"
+        );
         Ok(())
     }
 

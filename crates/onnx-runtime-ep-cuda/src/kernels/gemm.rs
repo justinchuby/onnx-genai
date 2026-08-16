@@ -1,7 +1,7 @@
 //! `Gemm` (ONNX standard domain) on the GPU: `Y = alpha·A'·B' + beta·C`, where
 //! `A'`/`B'` are `A`/`B` optionally transposed per the `transA`/`transB`
 //! attributes and the optional bias `C` is unidirectionally broadcast to
-//! `[M, N]` (`docs/ORT2.md` §15.3; RULES.md #4 — GEMM stays on cuBLASLt).
+//! `[M, N]` (`docs/architecture/ORT2.md` §15.3; RULES.md #4 — GEMM stays on cuBLASLt).
 //!
 //! ## Design — reuse the proven cuBLASLt path
 //!
@@ -27,10 +27,13 @@ use std::sync::Arc;
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceRequirement, WorkspaceView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
-use crate::blas::{GemmDtype, GemmEx, WORKSPACE_BYTES, gemm_ex};
+use crate::blas::{self, GemmDtype, GemmEx};
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
@@ -182,7 +185,12 @@ fn bias_strides(c: &[usize], m: usize, n: usize) -> Result<(i32, i32)> {
 }
 
 impl GemmKernel {
-    fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         if !(2..=3).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep Gemm: expected 2 inputs (A,B) or 3 (A,B,C) and 1 output, \
@@ -265,8 +273,6 @@ impl GemmKernel {
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
-        let workspace = self.runtime.alloc_raw(WORKSPACE_BYTES)?;
-
         // Column-major Yᵀ[N,M] = alpha·(B')ᵀ·(A')ᵀ → row-major Y[M,N].
         let params = GemmEx {
             dtype: GemmDtype::F32,
@@ -290,12 +296,12 @@ impl GemmKernel {
         // planned shapes; `workspace` is live for the call; Y aliases neither A
         // nor B (distinct output buffer); the context is bound by `alloc_raw`.
         let gemm_res = unsafe {
-            gemm_ex(
+            blas::governed_gemm_ex(
                 self.runtime.blas(),
                 self.runtime.stream_ptr(),
                 &params,
                 workspace,
-                WORKSPACE_BYTES,
+                "Gemm",
             )
         };
 
@@ -312,12 +318,41 @@ impl GemmKernel {
             }
         });
 
-        let synced = bias_res.and_then(|()| self.runtime.synchronize());
+        bias_res.and_then(|()| self.runtime.synchronize())
+    }
 
-        // Always release the workspace, even on failure.
-        // SAFETY: `workspace` came from the `alloc_raw` above and is freed once.
-        let free = unsafe { self.runtime.free_raw(workspace) };
-        synced.and(free)
+    fn workspace_requirement_for(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
+        if !(2..=3).contains(&inputs.len()) {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        let a = &inputs[0];
+        let b = &inputs[1];
+        if a.dtype != DataType::Float32 || b.dtype != DataType::Float32 {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        let plan = plan_gemm(a.shape, b.shape, self.trans_a, self.trans_b)?;
+        let params = GemmEx {
+            dtype: GemmDtype::F32,
+            transa: plan.transa,
+            transb: plan.transb,
+            m: plan.n,
+            n: plan.m,
+            k: plan.k,
+            alpha: self.alpha,
+            beta: 0.0,
+            a: 1,
+            lda: plan.ldb_operand,
+            b: 1,
+            ldb: plan.lda_operand,
+            c: 1,
+            ldc: plan.n,
+            epilogue: None,
+        };
+        let bytes = blas::gemm_ex_workspace_bytes(self.runtime.blas(), &params)?;
+        Ok(blas::governed_workspace_requirement(bytes))
     }
 
     /// Launch the fused `Y += beta·C` broadcast bias epilogue.
@@ -370,7 +405,20 @@ impl GemmKernel {
 
 impl Kernel for GemmKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.run(inputs, outputs)
+        self.run(inputs, outputs, None)
+    }
+
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        self.workspace_requirement_for(inputs)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
     }
 
     fn supports_strided_input(&self, _idx: usize) -> bool {

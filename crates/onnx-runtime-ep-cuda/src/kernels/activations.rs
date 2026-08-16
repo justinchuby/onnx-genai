@@ -80,6 +80,29 @@ DEFINE_FOR_TYPE(__nv_bfloat16, bf16)
 #endif
 "#;
 
+// Integer Clip (opset-11 min/max arrive as inputs). Kept in a separate module
+// from the float activation kernels because the clamp is exact in the integer
+// domain — routing int32/int64 through the float `op_clip` above would lose
+// precision for magnitudes beyond 2^24.
+const INT_MODULE: &str = "clip_integer_v1";
+const INT_SRC: &str = r#"
+extern "C" __global__ void clip_i32(
+    const int* x, int* y, const int n, const long long lo, const long long hi) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        long long v = (long long)x[i];
+        v = v < lo ? lo : (v > hi ? hi : v);
+        y[i] = (int)v;
+    }
+}
+extern "C" __global__ void clip_i64(
+    const long long* x, long long* y, const int n, const long long lo, const long long hi) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        long long v = x[i];
+        y[i] = v < lo ? lo : (v > hi ? hi : v);
+    }
+}
+"#;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FloatDtype {
     F32,
@@ -267,6 +290,106 @@ impl ActivationKernel {
         })
     }
 
+    /// Read a single Int32/Int64 clip bound scalar back to the host as i64.
+    fn read_int_scalar(&self, name: &str, input: &TensorView) -> Result<i64> {
+        require_contiguous("Clip", name, input.is_contiguous())?;
+        if input.numel() != 1 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Clip: {name} must contain one integer value, got {}",
+                input.numel()
+            )));
+        }
+        let mut bytes = [0u8; 8];
+        let width = input.dtype.byte_size();
+        // SAFETY: dtype and numel checks prove the allocation covers one element.
+        unsafe {
+            self.runtime.dtoh(
+                &mut bytes[..width],
+                cuptr(input.data_ptr::<u8>() as *const c_void),
+            )?
+        };
+        Ok(match input.dtype {
+            DataType::Int32 => i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64,
+            DataType::Int64 => i64::from_ne_bytes(bytes),
+            other => {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep Clip: {name} dtype {other:?} is not an integer"
+                )));
+            }
+        })
+    }
+
+    /// Exact integer clamp for Int32/Int64 Clip (opset-11 min/max inputs).
+    fn run_int_clip(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let x = &inputs[0];
+        if outputs[0].dtype != x.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Clip: output dtype {:?} must equal input dtype {:?}",
+                outputs[0].dtype, x.dtype
+            )));
+        }
+        require_contiguous("Clip", "input", x.is_contiguous())?;
+        require_contiguous("Clip", "output", outputs[0].is_contiguous())?;
+        if outputs[0].shape != x.shape {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Clip: output shape {:?} must equal input shape {:?}",
+                outputs[0].shape, x.shape
+            )));
+        }
+
+        let (mut lo, mut hi) = (i64::MIN, i64::MAX);
+        if let Some(min) = inputs.get(1).filter(|input| !input.is_absent()) {
+            if min.dtype != x.dtype {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep Clip: min dtype {:?} must equal input dtype {:?}",
+                    min.dtype, x.dtype
+                )));
+            }
+            lo = self.read_int_scalar("min", min)?;
+        }
+        if let Some(max) = inputs.get(2).filter(|input| !input.is_absent()) {
+            if max.dtype != x.dtype {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep Clip: max dtype {:?} must equal input dtype {:?}",
+                    max.dtype, x.dtype
+                )));
+            }
+            hi = self.read_int_scalar("max", max)?;
+        }
+        if lo > hi {
+            return Err(EpError::KernelFailed(
+                "cuda_ep Clip: min must not exceed max".into(),
+            ));
+        }
+
+        let n = x.numel();
+        let n_i = i32::try_from(n)
+            .map_err(|_| EpError::KernelFailed(format!("cuda_ep Clip: {n} elements exceed i32")))?;
+        let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
+        let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+        let entry = match x.dtype {
+            DataType::Int32 => "clip_i32",
+            DataType::Int64 => "clip_i64",
+            _ => unreachable!("run_int_clip only reached for integer dtypes"),
+        };
+        let func = self.runtime.nvrtc_function(INT_MODULE, INT_SRC, entry)?;
+        let cfg = LaunchConfig {
+            grid_dim: (grid_for(n), 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        crate::trace::record_kernel_metrics(inputs, outputs, || n as u64);
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder.arg(&x_ptr).arg(&y_ptr).arg(&n_i).arg(&lo).arg(&hi);
+        // SAFETY: clip_i32/clip_i64 share the (x, y, n, lo, hi) signature; x/y
+        // cover n contiguous elements of the validated integer dtype.
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        if self.runtime.is_capturing()? {
+            return Ok(());
+        }
+        self.runtime.synchronize()
+    }
+
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         let op = self.op.name();
         let valid_arity = if matches!(self.op, ActivationOp::Clip { .. }) {
@@ -281,6 +404,14 @@ impl ActivationKernel {
                 inputs.len(),
                 outputs.len()
             )));
+        }
+
+        // Integer Clip runs an exact integer clamp; every other activation (and
+        // float Clip) uses the float kernels below.
+        if matches!(self.op, ActivationOp::Clip { .. })
+            && matches!(inputs[0].dtype, DataType::Int32 | DataType::Int64)
+        {
+            return self.run_int_clip(inputs, outputs);
         }
 
         let x = &inputs[0];
@@ -360,6 +491,9 @@ impl ActivationKernel {
         // SAFETY: every entry in SRC has the same (x, y, n, p0, p1) signature;
         // x/y cover n contiguous f32 elements, validated above.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        if self.runtime.is_capturing()? {
+            return Ok(());
+        }
         self.runtime.synchronize()
     }
 }

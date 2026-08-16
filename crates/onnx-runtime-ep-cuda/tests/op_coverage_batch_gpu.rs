@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU parity tests for the issue #67 CUDA op-coverage batch: the
 //! trigonometric/hyperbolic unary-math family (`Tan`, `Sinh`, `Cosh`, `Asin`,
 //! `Acos`, `Atan`, `Asinh`, `Acosh`, `Atanh`), the metadata/movement ops
@@ -304,17 +318,15 @@ fn run_cpu(
     output_bytes
 }
 
-fn cuda_ep() -> Option<CudaExecutionProvider> {
+fn require_cuda() -> CudaExecutionProvider {
     match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
-        Ok(Ok(ep)) => Some(ep),
-        Ok(Err(error)) => {
-            eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            None
-        }
-        Err(_) => {
-            eprintln!("skip: CUDA runtime library loading panicked");
-            None
-        }
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -330,9 +342,13 @@ fn assert_close(op: &str, dtype: DataType, got: &[f32], expected: &[f32], tolera
 
 /// Trigonometric / hyperbolic unary math parity across f32/f16/bf16, each op fed
 /// domain-safe values, compared element-wise against the CPU EP.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn trig_hyperbolic_unary_matches_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     // (op, domain-safe inputs).
     let cases: &[(&str, &[f32])] = &[
         ("Tan", &[-1.2, -0.4, 0.0, 0.5, 1.1]),
@@ -374,9 +390,13 @@ fn trig_hyperbolic_unary_matches_cpu() {
 
 /// `Identity` and `Flatten` are dtype-agnostic byte copies; assert exact byte
 /// equality with the CPU EP for float and integer payloads.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn identity_and_flatten_match_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let f32_values: Vec<f32> = (0..12).map(|v| v as f32 * 0.5 - 3.0).collect();
     let i64_values: Vec<i64> = (0..12).map(|v| (v as i64) * 7 - 5).collect();
 
@@ -407,9 +427,13 @@ fn identity_and_flatten_match_cpu() {
 }
 
 /// `Size` yields the input's element count as an Int64 scalar.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn size_matches_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let values: Vec<f32> = (0..24).map(|v| v as f32).collect();
     let inputs = [input(DataType::Float32, &[2, 3, 4], &values)];
     let outputs = [(DataType::Int64, vec![])];
@@ -424,9 +448,13 @@ fn size_matches_cpu() {
 /// `Trilu` upper/lower masks with several diagonal offsets and dtypes, compared
 /// byte-for-byte against the CPU EP over batched trailing 2-D matrices. `k` is a
 /// runtime Int64 scalar so the CUDA path exercises its device-scalar read.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn trilu_matches_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     // A batch of two 3x4 matrices with distinct values.
     let f32_values: Vec<f32> = (0..24).map(|v| v as f32 + 1.0).collect();
     let i64_values: Vec<i64> = (0..24).map(|v| (v as i64) + 1).collect();
@@ -503,9 +531,13 @@ fn reduce_out_shape(in_shape: &[usize], axes: &[i64], keepdims: bool) -> Vec<usi
 /// Extended f32 reductions across several axes / keepdims combinations, compared
 /// against the CPU EP element-wise. Inputs are strictly positive so `ReduceLogSum`
 /// (`log(sum(x))`) stays well defined.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn extended_reductions_match_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let in_shape = vec![2usize, 3, 4];
     let count: usize = in_shape.iter().product();
     // Positive, mildly varied magnitudes keep every reduction well conditioned.
@@ -550,9 +582,13 @@ fn extended_reductions_match_cpu() {
 
 /// `ReduceLogSumExp` with the opset-18 axes-*input* form (rather than an
 /// attribute) exercises the kernel's device-side axes read.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn reduce_log_sum_exp_axes_input_matches_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let in_shape = vec![2usize, 3, 4];
     let count: usize = in_shape.iter().product();
     let values: Vec<f32> = (0..count).map(|v| (v as f32 * 0.17) - 2.0).collect();
@@ -577,9 +613,13 @@ fn reduce_log_sum_exp_axes_input_matches_cpu() {
 /// CPU EP (and now the CUDA kernel) stabilizes as `m + log(sum(exp(x - m)))`.
 /// These inputs (≈90 and a wide negative-to-positive spread) return `+inf` under
 /// the old naive kernel, so this test fails on it and passes on the stable one.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn reduce_log_sum_exp_large_values_match_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     // Row 0: the classic overflow case `[90, 91, 92, 93]` (naive exp -> +inf).
     // Row 1: a wide spread mixing large negatives and positives; exp(120) also
     // overflows f32 (~3.4e38) without max-subtraction.
@@ -613,9 +653,13 @@ fn reduce_log_sum_exp_large_values_match_cpu() {
 
 /// `Swish` and `ThresholdedRelu` across f32/f16/bf16 with default and explicit
 /// `alpha`, compared against the CPU EP.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn extended_activations_match_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let values: &[f32] = &[-3.0, -1.5, -0.5, 0.0, 0.5, 1.5, 3.0];
     type ActivationCase = (&'static str, u64, Vec<(&'static str, Attribute)>);
     let cases: Vec<ActivationCase> = vec![
@@ -656,9 +700,13 @@ fn extended_activations_match_cpu() {
 
 /// `Sum` and `Mean` over a variadic, broadcasting input list across f32/f16/bf16,
 /// compared against the CPU EP.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn variadic_sum_mean_match_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     // Three operands with distinct broadcastable shapes -> output [2,3].
     let a: &[f32] = &[1.0, -2.0, 3.0, -4.0, 5.0, -6.0];
     let b: &[f32] = &[10.0, 20.0, 30.0];
@@ -716,9 +764,13 @@ fn decode_i64(bytes: &[u8]) -> Vec<i64> {
 /// `Mod` parity against the CPU EP: f32 (`fmod=1`), plus i32/i64 in both the
 /// C-truncated (`fmod=1`) and Python floor (`fmod=0`) modes, including negative
 /// dividends and divisors and a divide-by-zero (defined to yield 0).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn mod_matches_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
 
     // Float Mod requires fmod=1 per ONNX.
     let fa: &[f32] = &[5.3, -5.3, 7.5, -7.5, 2.0, -2.0];
@@ -788,9 +840,13 @@ fn mod_matches_cpu() {
 /// `IsInf` across f32/f16/bf16 with every detect_positive/detect_negative
 /// combination (plus the attribute defaults), fed +inf/-inf/NaN and finite
 /// values. Bool output is compared byte-for-byte with the CPU EP.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn is_inf_matches_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     // +inf, -inf, NaN, finite positive, finite negative, zero, -0.0.
     let values: &[f32] = &[
         f32::INFINITY,
@@ -833,9 +889,13 @@ fn is_inf_matches_cpu() {
 
 /// `IsNaN` across f32/f16/bf16, fed NaN/inf/finite values. Bool output compared
 /// byte-for-byte with the CPU EP. Also covers the empty-tensor edge case.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn is_nan_matches_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let values: &[f32] = &[
         f32::NAN,
         f32::INFINITY,
@@ -875,9 +935,13 @@ fn is_nan_matches_cpu() {
 /// per-channel, full, rank-0 scalar), compared element-wise against the CPU EP.
 /// Negative-input lanes exercise the `x * slope` branch; the slope itself is
 /// negative to make the two branches unambiguous.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn prelu_matches_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
 
     // X shape [2,3,4] with a mix of negative, zero, and positive lanes.
     let x_shape = vec![2usize, 3, 4];

@@ -1,4 +1,4 @@
-//! CPU GEMM backend selection (`docs/ORT2.md` §25.2 "CPU Backend Strategy").
+//! CPU GEMM backend selection (`docs/architecture/ORT2.md` §25.2 "CPU Backend Strategy").
 //!
 //! The hot f32 GEMM behind [`crate::kernels::matmul`] can be serviced by more
 //! than one implementation. [`CpuBackend`] names the family of backends from
@@ -24,7 +24,7 @@
 //! the Generic path. Nothing above the [`onnx_runtime_ep_api::Kernel`] trait
 //! observes which backend ran — the choice is an internal perf detail.
 
-/// The CPU GEMM backend family, per `docs/ORT2.md` §25.2.
+/// The CPU GEMM backend family, per `docs/architecture/ORT2.md` §25.2.
 ///
 /// Selection is done by [`CpuBackend::auto_detect`]; callers should not hardcode
 /// a variant so that the same binary adapts to the host it runs on.
@@ -59,7 +59,7 @@ pub enum CpuBackend {
 
 impl CpuBackend {
     /// Pick the best available backend for the current target and build, per
-    /// `docs/ORT2.md` §25.2.
+    /// `docs/architecture/ORT2.md` §25.2.
     ///
     /// * Android → `Xnnpack` (placeholder; Generic arithmetic today).
     /// * macOS / iOS → `Accelerate` (placeholder; Generic arithmetic today).

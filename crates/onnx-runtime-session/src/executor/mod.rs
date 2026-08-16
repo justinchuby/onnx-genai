@@ -1,4 +1,4 @@
-//! The sequential CPU executor (Track D, `docs/ORT2.md` §20, §11.3).
+//! The sequential CPU executor (Track D, `docs/architecture/ORT2.md` §20, §11.3).
 //!
 //! Turns a loaded [`Graph`] plus its live [`WeightStore`] into a runnable plan:
 //! resolve every value's concrete shape from the actual bound inputs at
@@ -45,12 +45,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider,
     ExternalMmapRegion, Kernel, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
-    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMut, TensorView, WeightHandle,
+    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
+    WeightHandle, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
 };
 
 type OptionalTensorSpecs = Vec<Option<(DataType, Vec<usize>)>>;
@@ -62,6 +64,7 @@ use onnx_runtime_ir::{
     WeightRef, as_static_shape, broadcast_shapes, compute_contiguous_strides, read_scalar_le,
 };
 use onnx_runtime_loader::WeightStore;
+use onnx_runtime_memory::{PlanOptions, PlanStatus, ViewMap, plan_activations};
 use onnx_runtime_optimizer::InitializerResolver;
 use onnx_runtime_shape_inference::{
     DimExpr, InferenceRegistry, MAX_SHAPE_DATA_ELEMS, MergePolicy, NodeIo, ShapeData,
@@ -118,6 +121,10 @@ mod phase_profile {
     #[cfg(test)]
     pub(super) fn force_enabled(on: bool) {
         STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    }
+
+    pub fn enable_for_process() {
+        STATE.store(2, Ordering::Relaxed);
     }
 
     /// Test-only snapshot of a phase's accumulated `(total_ns, count)`.
@@ -285,6 +292,40 @@ pub fn reset_exec_phase_profile() {
     phase_profile::reset();
 }
 
+/// Force executor phase profiling on for targeted per-step attribution.
+///
+/// This is deliberately process-wide because the phase profiler is itself
+/// process-wide. Callers use it only under explicit diagnostic env knobs before
+/// resetting and sampling a single decode step; production paths should leave
+/// the cheap env-gated default untouched.
+pub fn enable_exec_phase_profile_for_process() {
+    phase_profile::enable_for_process();
+}
+
+/// Activation-memory planner metrics from the most recent measured top-level run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ActivationMemoryPlanStats {
+    /// `true` when every activation owner had a concrete byte size and the
+    /// planner produced a reusable-slot plan.
+    pub complete: bool,
+    /// Concurrent peak bytes after liveness-based slot sharing.
+    pub peak_bytes: usize,
+    /// Planner upper bound that counts one buffer-owner allocation per activation.
+    /// This is not the executor's exact baseline: in-place aliases and sequence
+    /// storage can make the current executor allocate less.
+    pub naive_bytes: usize,
+    /// Fraction saved vs. the naive baseline: `1 - peak / naive`.
+    pub savings_ratio: f64,
+    /// Number of reusable backing slots in the complete plan.
+    pub num_slots: usize,
+    /// Number of buffer-owner values assigned to slots.
+    pub assignments: usize,
+    /// Number of zero-copy view aliases folded into source-owner liveness.
+    pub view_edges: usize,
+    /// Number of activation owners still missing concrete sizes when deferred.
+    pub unknown_sizes: usize,
+}
+
 pub(crate) fn host_dtype_alignment(dtype: DataType) -> usize {
     match dtype {
         DataType::Float16 | DataType::BFloat16 | DataType::Int16 | DataType::Uint16 => 2,
@@ -311,6 +352,59 @@ fn print_op_profile(total: Duration, timings: HashMap<String, (Duration, usize)>
     }
 }
 
+static DENSE_PREFETCH_GAP_JOINS: AtomicU64 = AtomicU64::new(0);
+static DENSE_PREFETCH_GAP_NODES: AtomicU64 = AtomicU64::new(0);
+static DENSE_PREFETCH_GAP_MAX: AtomicU64 = AtomicU64::new(0);
+
+pub const DENSE_WEIGHT_PREFETCH_LOOKAHEAD_ENV: &str =
+    "ONNX_GENAI_WEIGHT_OFFLOAD_PREFETCH_LOOKAHEAD_NODES";
+const DEFAULT_DENSE_WEIGHT_PREFETCH_LOOKAHEAD_NODES: usize = 1;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DensePrefetchGapStats {
+    pub joins: u64,
+    pub nodes_between_sum: u64,
+    pub nodes_between_max: u64,
+}
+
+pub fn dense_prefetch_gap_stats() -> DensePrefetchGapStats {
+    DensePrefetchGapStats {
+        joins: DENSE_PREFETCH_GAP_JOINS.load(Ordering::Relaxed),
+        nodes_between_sum: DENSE_PREFETCH_GAP_NODES.load(Ordering::Relaxed),
+        nodes_between_max: DENSE_PREFETCH_GAP_MAX.load(Ordering::Relaxed),
+    }
+}
+
+pub fn dense_weight_prefetch_lookahead_nodes() -> usize {
+    std::env::var(DENSE_WEIGHT_PREFETCH_LOOKAHEAD_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_DENSE_WEIGHT_PREFETCH_LOOKAHEAD_NODES)
+}
+
+pub fn reset_dense_prefetch_gap_stats() {
+    DENSE_PREFETCH_GAP_JOINS.store(0, Ordering::Relaxed);
+    DENSE_PREFETCH_GAP_NODES.store(0, Ordering::Relaxed);
+    DENSE_PREFETCH_GAP_MAX.store(0, Ordering::Relaxed);
+}
+
+fn record_dense_prefetch_gap(nodes_between: u64) {
+    DENSE_PREFETCH_GAP_JOINS.fetch_add(1, Ordering::Relaxed);
+    DENSE_PREFETCH_GAP_NODES.fetch_add(nodes_between, Ordering::Relaxed);
+    let mut current = DENSE_PREFETCH_GAP_MAX.load(Ordering::Relaxed);
+    while nodes_between > current {
+        match DENSE_PREFETCH_GAP_MAX.compare_exchange_weak(
+            current,
+            nodes_between,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// A per-node compiled entry: the structural facts the run loop needs without
 /// re-deriving them from the graph. Shapes are **not** baked here — they are
 /// resolved per run from the bound inputs (see module docs).
@@ -334,6 +428,8 @@ pub(crate) struct NodePlan {
     /// Inputs consumed for the final time by this node and therefore eligible for
     /// a kernel-authorized in-place overwrite after additional runtime guards.
     pub inplace_dead_inputs: Vec<bool>,
+    /// Lazy weight inputs this node may ask the EP to page at dispatch time.
+    pub lazy_weight_inputs: Vec<ValueId>,
 }
 
 /// Map a [`crate::sequence::SequenceError`] into an actionable `SessionError`.
@@ -512,6 +608,12 @@ impl Drop for Executor {
         for (_, buf) in self.buffers.drain() {
             let _ = self.ep.deallocate(buf);
         }
+        if let Some(workspace) = self.persistent_workspace.take() {
+            let _ = self.ep.deallocate(workspace.buffer);
+        }
+        if let Some(workspace) = self.step_workspace.take() {
+            let _ = self.ep.deallocate(workspace.buffer);
+        }
         self.shared_buffers.clear();
     }
 }
@@ -537,6 +639,8 @@ mod geometry;
 use dynamic_shapes::*;
 use geometry::*;
 mod bindings;
+#[cfg(test)]
+use bindings::{AxisBound, PlannedInputShape};
 mod build;
 mod capture;
 mod control_flow;

@@ -441,3 +441,40 @@ mod clone_value_tests {
         assert_eq!(cloned.to_vec_i64().expect("i64 out"), vec![9, 8, 7]);
     }
 }
+
+/// `clone_value` is the frame that aborted the `CLI ORT` job: it read a pooled
+/// tensor back as its element type every decode step, and the pooled tensor had
+/// been built from an empty `Vec<u8>` whose dangling pointer is 1-byte aligned.
+///
+/// The dtype matters here in a way that is easy to miss. `clone_value`'s sibling
+/// path builds empty tensors from `Vec<u16>` / `Vec<f32>`, whose dangling
+/// pointers are already 2- and 4-byte aligned, so those cases never aborted.
+/// Only the `Vec<u8>`-backed constructor produced a pointer too weakly aligned
+/// for its element type, which is why this covers every dtype `clone_value`
+/// dispatches on rather than only the one that failed.
+#[cfg(test)]
+mod empty_value_clone_tests {
+    use super::clone_value;
+    use onnx_genai_ort::{DataType, Value};
+
+    #[test]
+    fn cloning_an_empty_raw_bytes_tensor_succeeds_for_every_dispatched_dtype() {
+        for dtype in [
+            DataType::Float32,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Int64,
+            DataType::Int32,
+            DataType::Bool,
+            DataType::Uint8,
+        ] {
+            let value = Value::from_raw_bytes(Vec::new(), &[0, 8], dtype)
+                .unwrap_or_else(|e| panic!("build an empty {dtype:?} tensor: {e}"));
+            let cloned = clone_value(&value)
+                .unwrap_or_else(|e| panic!("clone an empty {dtype:?} tensor: {e:#}"));
+            assert_eq!(cloned.dtype(), dtype);
+            assert_eq!(cloned.shape(), &[0, 8], "{dtype:?}");
+            assert_eq!(cloned.numel(), 0, "{dtype:?}");
+        }
+    }
+}

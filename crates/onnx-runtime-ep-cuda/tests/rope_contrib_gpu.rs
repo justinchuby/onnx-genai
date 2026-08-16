@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU parity for `com.microsoft::RotaryEmbedding` (issue #67): the CUDA EP
 //! contrib RoPE (input order `X, position_ids, cos_cache, sin_cache`) checked
 //! tol-exact against the CPU EP oracle across fp32/fp16/bf16 on a non-trivial
@@ -6,7 +20,7 @@
 
 mod common;
 
-use common::{assert_close, cuda_ep, decode_floats, float_input, input, run_cpu, run_cuda};
+use common::{assert_close, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda};
 use onnx_runtime_ir::{Attribute, DataType};
 
 const OP: &str = "RotaryEmbedding";
@@ -65,9 +79,13 @@ fn check(ep: &onnx_runtime_ep_cuda::CudaExecutionProvider, dtype: DataType, inte
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn contrib_rotary_matches_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
         for interleaved in [0, 1] {
             check(&ep, dtype, interleaved);

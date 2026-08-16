@@ -162,17 +162,16 @@ async fn run_completion(
         request.max_tokens,
         handle.model_max_context,
     )?;
-    let result = collect_generation_result(
-        submit_completion(
-            &handle,
-            &state.sessions,
-            prepared.generation,
-            client_session_id.as_deref(),
-        )
-        .await?,
+    let generation = submit_completion(
+        &handle,
+        &state.sessions,
+        prepared.generation,
+        client_session_id.as_deref(),
     )
-    .await
-    .map_err(|err| ApiError::internal(format!("generation failed: {err}")))?;
+    .await?;
+    let result = collect_generation_result(generation.events)
+        .await
+        .map_err(generation_failure)?;
     crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
     let completion_tokens = result.token_ids.len();
     let logprobs = completion_logprobs(&result, &tokenizer, requested_logprobs)
@@ -219,13 +218,15 @@ async fn stream_completion(
         request.max_tokens,
         handle.model_max_context,
     )?;
-    let mut driver_rx = submit_completion(
+    let generation = submit_completion(
         &handle,
         &state.sessions,
         prepared.generation,
         client_session_id.as_deref(),
     )
     .await?;
+    await_driver_admission(generation.admission).await?;
+    let mut driver_rx = generation.events;
     crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
     let (tx, rx) = mpsc::channel(16);
 
@@ -253,8 +254,12 @@ async fn stream_completion(
                     }
                 }
                 Some(DriverEvent::Finished(result)) => break Ok(result),
-                Some(DriverEvent::Error(message)) => break Err(message),
-                None => break Err("generation stream ended before result".to_string()),
+                Some(DriverEvent::Error(error)) => break Err(error),
+                None => {
+                    break Err(DriverFailure::internal(
+                        "generation stream ended before result",
+                    ));
+                }
             }
         };
 
@@ -298,11 +303,12 @@ async fn stream_completion(
                 .await?;
             }
             Err(err) => {
+                let error = generation_failure(err);
                 tx.send(Ok(Event::default().event("error").data(
                     serde_json::to_string(&ErrorResponse {
                         error: ErrorBody {
-                            message: format!("generation failed: {err}"),
-                            kind: "server_error",
+                            message: error.message,
+                            kind: error.kind,
                         },
                     })?,
                 )))
@@ -427,7 +433,7 @@ async fn run_chat_completion(
 
     let session_for_count = session_lookup;
     let wants_constrained_json = request.wants_constrained_json();
-    let result = collect_generation_result(if handle.pipeline {
+    let generation = if handle.pipeline {
         handle
             .engine
             .generate_pipeline(generation_request, pipeline_input)
@@ -439,9 +445,10 @@ async fn run_chat_completion(
             .generate(session_lookup, generation_request)
             .await
             .map_err(map_generate_submit_error)?
-    })
-    .await
-    .map_err(|err| ApiError::internal(format!("generation failed: {err}")));
+    };
+    let result = collect_generation_result(generation.events)
+        .await
+        .map_err(generation_failure);
     crate::metrics::add_prompt_tokens(prompt_tokens);
 
     let session_token_count = if let Some(engine_session_id) = session_for_count {
@@ -584,7 +591,7 @@ async fn stream_chat_completion(
     } else {
         None
     };
-    let mut driver_rx = if handle.pipeline {
+    let generation = if handle.pipeline {
         handle
             .engine
             .generate_pipeline(generation_request, pipeline_input)
@@ -597,6 +604,8 @@ async fn stream_chat_completion(
             .await
             .map_err(map_generate_submit_error)?
     };
+    await_driver_admission(generation.admission).await?;
+    let mut driver_rx = generation.events;
     crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
 
     tokio::spawn(async move {
@@ -625,8 +634,12 @@ async fn stream_chat_completion(
                     }
                 }
                 Some(DriverEvent::Finished(result)) => break Ok(result),
-                Some(DriverEvent::Error(message)) => break Err(message),
-                None => break Err("generation stream ended before result".to_string()),
+                Some(DriverEvent::Error(error)) => break Err(error),
+                None => {
+                    break Err(DriverFailure::internal(
+                        "generation stream ended before result",
+                    ));
+                }
             }
         };
 
@@ -729,7 +742,8 @@ async fn stream_chat_completion(
                 }
             }
             Err(err)
-                if wants_constrained_json && json_constraint_stopped_incomplete_message(&err) =>
+                if wants_constrained_json
+                    && json_constraint_stopped_incomplete_message(&err.message) =>
             {
                 send_stream_chunk(
                     &tx,
@@ -739,11 +753,12 @@ async fn stream_chat_completion(
                 send_stream_chunk(&tx, done_chunk(&id, created, &model, "stop")).await?;
             }
             Err(err) => {
+                let error = generation_failure(err);
                 tx.send(Ok(Event::default().event("error").data(
                     serde_json::to_string(&ErrorResponse {
                         error: ErrorBody {
-                            message: format!("generation failed: {err}"),
-                            kind: "server_error",
+                            message: error.message,
+                            kind: error.kind,
                         },
                     })?,
                 )))
@@ -761,17 +776,123 @@ async fn stream_chat_completion(
     Ok(Sse::new(ReceiverStream::new(rx)))
 }
 
+async fn await_driver_admission(
+    admission: oneshot::Receiver<Result<(), DriverFailure>>,
+) -> Result<(), ApiError> {
+    match admission.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(generation_failure(error)),
+        Err(_) => Err(ApiError::internal(
+            "generation driver stopped before admission completed",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod stream_admission_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    fn memory_overload() -> DriverFailure {
+        DriverFailure {
+            message: "request_id=7 seq_id=9 available=1024 shortfall=2048".to_string(),
+            kind: DriverFailureKind::MemoryOverload,
+        }
+    }
+
+    async fn assert_streaming_overload_response() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(Err(memory_overload())).unwrap();
+
+        let error = match await_driver_admission(rx).await {
+            Err(error) => error,
+            Ok(()) => panic!("memory refusal must happen before constructing SSE"),
+        };
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["type"], "resource_limit_error");
+        assert_eq!(body["error"]["message"], MEMORY_OVERLOAD_MESSAGE);
+        assert!(!body.to_string().contains("request_id"));
+    }
+
+    #[tokio::test]
+    async fn streaming_completion_refusal_is_http_overload_before_sse() {
+        assert_streaming_overload_response().await;
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_refusal_is_http_overload_before_role_chunk() {
+        assert_streaming_overload_response().await;
+    }
+
+    #[tokio::test]
+    async fn accepted_stream_does_not_wait_for_first_token() {
+        let (admission_tx, admission_rx) = oneshot::channel();
+        let (_events_tx, mut events_rx) = mpsc::channel::<DriverEvent>(1);
+        admission_tx.send(Ok(())).unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            await_driver_admission(admission_rx),
+        )
+        .await
+        .expect("admission must not wait for output")
+        .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), events_rx.recv())
+                .await
+                .is_err(),
+            "the test driver deliberately delays its first event"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_admission_sender_fails_without_hanging() {
+        let (tx, rx) = oneshot::channel::<Result<(), DriverFailure>>();
+        drop(tx);
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            await_driver_admission(rx),
+        )
+        .await
+        .expect("dropped sender must resolve promptly")
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn continuous_row_refusal_is_internal_not_memory_overload() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(Err(DriverFailure::internal(
+            "continuous decode row assignment failed",
+        )))
+        .unwrap();
+
+        let error = await_driver_admission(rx).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.kind, "server_error");
+        assert_eq!(error.retry_after_secs, None);
+    }
+}
+
 pub(crate) async fn collect_generation_result(
     mut rx: mpsc::Receiver<DriverEvent>,
-) -> Result<GenerateResult, String> {
+) -> Result<GenerateResult, DriverFailure> {
     while let Some(event) = rx.recv().await {
         match event {
             DriverEvent::Token(_) => {}
             DriverEvent::Finished(result) => return Ok(result),
-            DriverEvent::Error(message) => return Err(message),
+            DriverEvent::Error(error) => return Err(error),
         }
     }
-    Err("generation stream ended before result".to_string())
+    Err(DriverFailure::internal(
+        "generation stream ended before result",
+    ))
 }
 
 fn preprocess_chat_audio(
@@ -1150,7 +1271,7 @@ async fn submit_completion(
     sessions: &SessionRegistry,
     generation: CompletionGeneration,
     client_session_id: Option<&str>,
-) -> Result<mpsc::Receiver<DriverEvent>, ApiError> {
+) -> Result<DriverGeneration, ApiError> {
     match generation {
         CompletionGeneration::Plain(request) => {
             let session_id = if let Some(id) = client_session_id {

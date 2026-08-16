@@ -1,4 +1,4 @@
-//! Device types and placement identifiers (see `docs/ORT2.md` §4.2).
+//! Device types and placement identifiers (see `docs/architecture/ORT2.md` §4.2).
 //!
 //! Device placement is a first-class annotation on every [`crate::Value`] and
 //! [`crate::Node`], enabling multi-device partitioning without side tables.

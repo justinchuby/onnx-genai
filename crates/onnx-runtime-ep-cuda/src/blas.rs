@@ -1,4 +1,4 @@
-//! cuBLASLt GEMM plumbing for the CUDA EP (`docs/ORT2.md` §15.3).
+//! cuBLASLt GEMM plumbing for the CUDA EP (`docs/architecture/ORT2.md` §15.3).
 //!
 //! This module owns the single hardest correctness detail in the crate: the
 //! **row-major ONNX ↔ column-major cuBLAS** mapping. Everything about the
@@ -52,7 +52,10 @@ use std::ffi::c_void;
 use cudarc::cublaslt::{result, sys};
 use cudarc::driver::sys::CUdeviceptr;
 
-use onnx_runtime_ep_api::{EpError, Result};
+use onnx_runtime_ep_api::{
+    EpError, Result, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+};
+use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::error::cublas_err;
 
@@ -175,23 +178,28 @@ impl MatmulDesc {
     fn set_epilogue(&self, epilogue: GemmEpilogue) -> Result<()> {
         let kind = epilogue.kind.as_cublas();
         let bias = epilogue.bias;
-        // SAFETY: `self.0` is live; both attribute buffers have the exact types
-        // and sizes required by cuBLASLt and remain live for each call.
+        // The bias address is execution data, not an algorithm-selection input.
+        // Prepare-only planning has no tensor pointers, so a zero sentinel sets
+        // the epilogue kind without a BIAS_POINTER; execution supplies the real
+        // address through the same descriptor builder.
         unsafe {
-            result::set_matmul_desc_attribute(
-                self.0,
-                sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
-                (&bias) as *const CUdeviceptr as *const c_void,
-                std::mem::size_of::<CUdeviceptr>(),
-            )
-            .map_err(|e| cublas_err("set MATMUL_DESC_BIAS_POINTER", e))?;
             result::set_matmul_desc_attribute(
                 self.0,
                 sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
                 (&kind) as *const sys::cublasLtEpilogue_t as *const c_void,
                 std::mem::size_of::<sys::cublasLtEpilogue_t>(),
             )
-            .map_err(|e| cublas_err("set MATMUL_DESC_EPILOGUE", e))
+            .map_err(|e| cublas_err("set MATMUL_DESC_EPILOGUE", e))?;
+            if bias != 0 {
+                result::set_matmul_desc_attribute(
+                    self.0,
+                    sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                    (&bias) as *const CUdeviceptr as *const c_void,
+                    std::mem::size_of::<CUdeviceptr>(),
+                )
+                .map_err(|e| cublas_err("set MATMUL_DESC_BIAS_POINTER", e))?;
+            }
+            Ok(())
         }
     }
 }
@@ -289,39 +297,45 @@ pub struct GemmEpilogue {
 ///
 /// Phase 2b: pool this per-stream instead of allocating it per call.
 pub const WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
+pub const WORKSPACE_ALIGNMENT: usize = 256;
 
-/// Execute `C = A · B` (row-major, optionally batched) on `stream` using the
-/// column-major mapping documented at the top of this module.
+/// Attribute exact cuBLASLt scratch to the one session-persistent shared slot.
 ///
-/// # Safety
-///
-/// * `handle` must be a live cuBLASLt handle.
-/// * `p.a`, `p.b`, `p.c` must be live device allocations large enough for all
-///   matrices addressed by the supplied element strides and `p.dtype`.
-/// * `workspace` must be a live device allocation of `workspace_bytes`.
-/// * `stream` must be a valid CUDA stream; the owning context must be current on
-///   the calling thread.
-/// * `p.c` must not alias `p.a` or `p.b`.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn gemm(
-    handle: &CublasLt,
-    stream: cudarc::driver::sys::CUstream,
-    p: &GemmParams,
-    workspace: CUdeviceptr,
+/// Kernels on the runtime's single CUDA stream execute sequentially, so their
+/// individual heuristic requirements merge as a peak rather than a sum.
+pub const fn governed_workspace_requirement(bytes: usize) -> WorkspaceRequirement {
+    if bytes == 0 {
+        WorkspaceRequirement::NONE
+    } else {
+        WorkspaceRequirement {
+            bytes: bytes as u64,
+            alignment: WORKSPACE_ALIGNMENT,
+            lifetime: WorkspaceLifetime::SessionPersistent,
+            role: MemoryRole::Workspace { step_scoped: false },
+        }
+    }
+}
+
+struct PlannedMatmul {
+    a_layout: MatrixLayout,
+    b_layout: MatrixLayout,
+    c_layout: MatrixLayout,
+    _desc: MatmulDesc,
+    algo: sys::cublasLtMatmulAlgo_t,
     workspace_bytes: usize,
-) -> Result<()> {
+}
+
+fn plan_gemm(handle: &CublasLt, p: &GemmParams) -> Result<PlannedMatmul> {
     if p.m == 0 || p.n == 0 || p.k == 0 || p.batch == 0 {
         return Err(EpError::KernelFailed(format!(
             "cuda_ep MatMul: degenerate GEMM dims M={} K={} N={} batch={}",
-            p.m, p.n, p.k, p.batch
+            p.m, p.k, p.n, p.batch
         )));
     }
 
     let dt = p.dtype.data_type();
-    let (m, n, k) = (p.n as u64, p.m as u64, p.k as u64); // swapped: see module docs
+    let (m, n, k) = (p.n as u64, p.m as u64, p.k as u64);
     let (lda, ldb, ldc) = (p.n as i64, p.k as i64, p.n as i64);
-
-    // op1 = B [N,K] (ld=N), op2 = A [K,M] (ld=K), out = C [N,M] (ld=N), all col-major.
     let a_layout = MatrixLayout::new(dt, m, k, lda)?;
     let b_layout = MatrixLayout::new(dt, k, n, ldb)?;
     let c_layout = MatrixLayout::new(dt, m, n, ldc)?;
@@ -330,21 +344,16 @@ pub unsafe fn gemm(
         let count = i32::try_from(p.batch).map_err(|_| {
             EpError::KernelFailed(format!("cuda_ep MatMul: batch {} exceeds i32", p.batch))
         })?;
-        // Strides are in ELEMENTS between consecutive matrices in the batch.
-        a_layout.set_batch(count, p.b_batch_stride as i64)?; // B matrices
-        b_layout.set_batch(count, p.a_batch_stride as i64)?; // A matrices
-        c_layout.set_batch(count, (p.m * p.n) as i64)?; // C matrices
+        a_layout.set_batch(count, p.b_batch_stride as i64)?;
+        b_layout.set_batch(count, p.a_batch_stride as i64)?;
+        c_layout.set_batch(count, (p.m * p.n) as i64)?;
     }
 
-    // Full-precision fp32 accumulation; scale (alpha/beta) type is f32.
     let desc = MatmulDesc::new(p.dtype.compute_type(), sys::cudaDataType_t::CUDA_R_32F)?;
     if let Some(epilogue) = p.epilogue {
         desc.set_epilogue(epilogue)?;
     }
-    // No transpose on either operand — the swap above already realises Cᵀ = Bᵀ·Aᵀ.
-
-    let pref = MatmulPref::new(workspace_bytes)?;
-
+    let pref = MatmulPref::new(WORKSPACE_BYTES)?;
     // SAFETY: all descriptor/layout handles are live for the duration of the call.
     let heuristic = unsafe {
         result::get_matmul_algo_heuristic(
@@ -366,35 +375,181 @@ pub unsafe fn gemm(
             e,
         )
     })?;
+    Ok(PlannedMatmul {
+        a_layout,
+        b_layout,
+        c_layout,
+        _desc: desc,
+        algo: heuristic.algo,
+        workspace_bytes: heuristic.workspaceSize,
+    })
+}
 
+/// Exact scratch selected by the cuBLASLt heuristic under [`WORKSPACE_BYTES`].
+///
+/// The 32 MiB constant is a performance ceiling, not a requirement. Planning
+/// and governed execution both call this same planner, then execution refuses a
+/// short buffer before submitting the matmul.
+pub fn gemm_workspace_bytes(handle: &CublasLt, p: &GemmParams) -> Result<usize> {
+    Ok(plan_gemm(handle, p)?.workspace_bytes)
+}
+
+unsafe fn launch_planned_gemm(
+    handle: &CublasLt,
+    stream: cudarc::driver::sys::CUstream,
+    p: &GemmParams,
+    plan: &PlannedMatmul,
+    workspace: CUdeviceptr,
+) -> Result<()> {
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
-
     // SAFETY: layouts/desc/algo are live; a/b/c/workspace are caller-guaranteed
-    // live device allocations of the right size; stream is valid. op1=B, op2=A.
+    // live device allocations of the right size; stream is valid.
     unsafe {
         result::matmul(
             handle.handle,
-            desc.0,
+            plan._desc.0,
             (&alpha) as *const f32 as *const c_void,
             (&beta) as *const f32 as *const c_void,
-            p.b as *const c_void, // op1 = B
-            a_layout.0,
-            p.a as *const c_void, // op2 = A
-            b_layout.0,
-            p.c as *const c_void, // C (input for beta*C; beta=0)
-            c_layout.0,
-            p.c as *mut c_void, // D (output)
-            c_layout.0,
-            (&heuristic.algo) as *const sys::cublasLtMatmulAlgo_t,
+            p.b as *const c_void,
+            plan.a_layout.0,
+            p.a as *const c_void,
+            plan.b_layout.0,
+            p.c as *const c_void,
+            plan.c_layout.0,
+            p.c as *mut c_void,
+            plan.c_layout.0,
+            (&plan.algo) as *const sys::cublasLtMatmulAlgo_t,
             workspace as *mut c_void,
-            workspace_bytes,
+            plan.workspace_bytes,
             stream as sys::cudaStream_t,
         )
     }
-    .map_err(|e| cublas_err("cublasLtMatmul", e))?;
+    .map_err(|e| cublas_err("cublasLtMatmul", e))
+}
 
-    Ok(())
+fn governed_workspace_ptr(
+    workspace: Option<WorkspaceView>,
+    required: usize,
+    op: &str,
+) -> Result<CUdeviceptr> {
+    if required == 0 {
+        return Ok(0);
+    }
+    let workspace = workspace.ok_or_else(|| {
+        EpError::KernelFailed(format!(
+            "cuda_ep {op}: governed cuBLASLt workspace requires {required} bytes, but none was supplied"
+        ))
+    })?;
+    if workspace.bytes() < required {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep {op}: governed cuBLASLt workspace requires {required} bytes, supplied {}",
+            workspace.bytes()
+        )));
+    }
+    Ok(workspace.ptr().0 as CUdeviceptr)
+}
+
+/// Execute `C = A · B` (row-major, optionally batched) on `stream` using the
+/// column-major mapping documented at the top of this module.
+///
+/// # Safety
+///
+/// * `handle` must be a live cuBLASLt handle.
+/// * `p.a`, `p.b`, `p.c` must be live device allocations large enough for all
+///   matrices addressed by the supplied element strides and `p.dtype`.
+/// * `workspace` must be a live device allocation of `workspace_bytes`.
+/// * `stream` must be a valid CUDA stream; the owning context must be current on
+///   the calling thread.
+/// * `p.c` must not alias `p.a` or `p.b`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm(
+    handle: &CublasLt,
+    stream: cudarc::driver::sys::CUstream,
+    p: &GemmParams,
+    workspace: CUdeviceptr,
+    workspace_bytes: usize,
+) -> Result<()> {
+    let plan = plan_gemm(handle, p)?;
+    if workspace_bytes < plan.workspace_bytes || (plan.workspace_bytes != 0 && workspace == 0) {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep MatMul: cuBLASLt selected {} workspace bytes, supplied {workspace_bytes}",
+            plan.workspace_bytes
+        )));
+    }
+
+    // SAFETY: forwarded from the caller after validating the selected size.
+    unsafe { launch_planned_gemm(handle, stream, p, &plan, workspace) }
+}
+
+/// Governed [`gemm`] adapter consuming an executor-prepared shared workspace.
+///
+/// # Safety
+///
+/// The tensor-pointer and stream requirements are identical to [`gemm`].
+pub unsafe fn governed_gemm(
+    handle: &CublasLt,
+    stream: cudarc::driver::sys::CUstream,
+    p: &GemmParams,
+    workspace: Option<WorkspaceView>,
+    op: &str,
+) -> Result<()> {
+    let plan = plan_gemm(handle, p)?;
+    let ptr = governed_workspace_ptr(workspace, plan.workspace_bytes, op)?;
+    // SAFETY: forwarded from the caller; `ptr` covers the exact selected bytes.
+    unsafe { launch_planned_gemm(handle, stream, p, &plan, ptr) }
+}
+
+/// A cuBLASLt plan (selected algorithm + its layouts/descriptor and workspace
+/// requirement) for one **fixed** GEMM shape, selected once and reusable across
+/// later launches — including CUDA-graph capture replays — with no further
+/// heuristic query, allocation, or synchronization. The caller pins the shape
+/// and supplies a persistent workspace of at least [`Self::workspace_bytes`]
+/// (see the capture-safe dense path in `kernels::matmul`).
+///
+/// For a given shape the plan reproduces [`governed_gemm`] exactly: both select
+/// the algorithm through the same [`plan_gemm`] heuristic, so caching changes
+/// only *when* the algorithm is chosen, never the arithmetic.
+pub struct CaptureGemmPlan(PlannedMatmul);
+
+// SAFETY: cuBLASLt layout/descriptor handles are context-independent host
+// objects; the algorithm is a plain value. Launches are serialized by the
+// owning kernel's plan mutex (same rationale as `F32GemvPlan`).
+unsafe impl Send for CaptureGemmPlan {}
+
+impl CaptureGemmPlan {
+    /// Workspace bytes the selected algorithm requires; the caller must supply a
+    /// persistent device buffer of at least this size to [`Self::launch`].
+    #[must_use]
+    pub fn workspace_bytes(&self) -> usize {
+        self.0.workspace_bytes
+    }
+
+    /// Launch the planned GEMM for `p` (which must have the same shape/dtype the
+    /// plan was selected for; only the `a`/`b`/`c` pointers may differ).
+    ///
+    /// # Safety
+    ///
+    /// Identical to [`gemm`]: `handle`/`stream` valid and current, `p.a`/`p.b`/
+    /// `p.c` live device allocations for the plan's shape, `workspace` a live
+    /// allocation of at least [`Self::workspace_bytes`] bytes (or 0 when that is
+    /// 0), and `p.c` not aliasing `p.a`/`p.b`.
+    pub unsafe fn launch(
+        &self,
+        handle: &CublasLt,
+        stream: cudarc::driver::sys::CUstream,
+        p: &GemmParams,
+        workspace: CUdeviceptr,
+    ) -> Result<()> {
+        // SAFETY: forwarded from the caller.
+        unsafe { launch_planned_gemm(handle, stream, p, &self.0, workspace) }
+    }
+}
+
+/// Select (once) a reusable [`CaptureGemmPlan`] for `p`'s shape via the same
+/// heuristic [`governed_gemm`] uses per call.
+pub fn plan_capture_gemm(handle: &CublasLt, p: &GemmParams) -> Result<CaptureGemmPlan> {
+    Ok(CaptureGemmPlan(plan_gemm(handle, p)?))
 }
 
 /// A single (non-batched) **column-major, native cuBLAS** GEMM request:
@@ -456,23 +611,7 @@ impl MatmulDesc {
     }
 }
 
-/// Execute one column-major `C = alpha·op(A)·op(B) + beta·C` on `stream`.
-///
-/// # Safety
-///
-/// * `handle` must be a live cuBLASLt handle.
-/// * `p.a`, `p.b`, `p.c` must be live device allocations large enough for the
-///   stated shapes / leading dims and `p.dtype`.
-/// * `workspace` must be a live device allocation of `workspace_bytes`.
-/// * `stream` must be valid and its owning context current on this thread.
-/// * `p.c` must not alias `p.a` or `p.b`.
-pub unsafe fn gemm_ex(
-    handle: &CublasLt,
-    stream: cudarc::driver::sys::CUstream,
-    p: &GemmEx,
-    workspace: CUdeviceptr,
-    workspace_bytes: usize,
-) -> Result<()> {
+fn plan_gemm_ex(handle: &CublasLt, p: &GemmEx) -> Result<PlannedMatmul> {
     if p.m == 0 || p.n == 0 || p.k == 0 {
         return Err(EpError::KernelFailed(format!(
             "cuda_ep attention GEMM: degenerate dims M={} N={} K={}",
@@ -481,9 +620,6 @@ pub unsafe fn gemm_ex(
     }
 
     let dt = p.dtype.data_type();
-
-    // Layout dims describe each operand **as stored** (before op): a
-    // transposed operand is physically `k × m` (A) / `n × k` (B).
     let (a_rows, a_cols) = if p.transa {
         (p.k as u64, p.m as u64)
     } else {
@@ -494,11 +630,9 @@ pub unsafe fn gemm_ex(
     } else {
         (p.k as u64, p.n as u64)
     };
-
     let a_layout = MatrixLayout::new(dt, a_rows, a_cols, p.lda as i64)?;
     let b_layout = MatrixLayout::new(dt, b_rows, b_cols, p.ldb as i64)?;
     let c_layout = MatrixLayout::new(dt, p.m as u64, p.n as u64, p.ldc as i64)?;
-
     let desc = MatmulDesc::new(p.dtype.compute_type(), sys::cudaDataType_t::CUDA_R_32F)?;
     desc.set_transpose(
         sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
@@ -511,9 +645,7 @@ pub unsafe fn gemm_ex(
     if let Some(epilogue) = p.epilogue {
         desc.set_epilogue(epilogue)?;
     }
-
-    let pref = MatmulPref::new(workspace_bytes)?;
-
+    let pref = MatmulPref::new(WORKSPACE_BYTES)?;
     // SAFETY: all descriptor/layout handles are live for the call.
     let heuristic = unsafe {
         result::get_matmul_algo_heuristic(
@@ -535,33 +667,173 @@ pub unsafe fn gemm_ex(
             e,
         )
     })?;
+    Ok(PlannedMatmul {
+        a_layout,
+        b_layout,
+        c_layout,
+        _desc: desc,
+        algo: heuristic.algo,
+        workspace_bytes: heuristic.workspaceSize,
+    })
+}
 
+/// Exact scratch selected for a column-major GEMM under [`WORKSPACE_BYTES`].
+pub fn gemm_ex_workspace_bytes(handle: &CublasLt, p: &GemmEx) -> Result<usize> {
+    Ok(plan_gemm_ex(handle, p)?.workspace_bytes)
+}
+
+unsafe fn launch_planned_gemm_ex(
+    handle: &CublasLt,
+    stream: cudarc::driver::sys::CUstream,
+    p: &GemmEx,
+    plan: &PlannedMatmul,
+    workspace: CUdeviceptr,
+) -> Result<()> {
     let alpha = p.alpha;
     let beta = p.beta;
-
-    // SAFETY: layouts/desc/algo live; a/b/c/workspace are caller-guaranteed live
-    // device allocations of the right size; stream valid; C aliases neither.
+    // SAFETY: layouts/desc/algo live; a/b/c/workspace are caller-guaranteed
+    // live device allocations of the right size; stream is valid.
     unsafe {
         result::matmul(
             handle.handle,
-            desc.0,
+            plan._desc.0,
             (&alpha) as *const f32 as *const c_void,
             (&beta) as *const f32 as *const c_void,
             p.a as *const c_void,
-            a_layout.0,
+            plan.a_layout.0,
             p.b as *const c_void,
-            b_layout.0,
+            plan.b_layout.0,
             p.c as *const c_void,
-            c_layout.0,
+            plan.c_layout.0,
             p.c as *mut c_void,
-            c_layout.0,
-            (&heuristic.algo) as *const sys::cublasLtMatmulAlgo_t,
+            plan.c_layout.0,
+            (&plan.algo) as *const sys::cublasLtMatmulAlgo_t,
             workspace as *mut c_void,
-            workspace_bytes,
+            plan.workspace_bytes,
             stream as sys::cudaStream_t,
         )
     }
-    .map_err(|e| cublas_err("cublasLtMatmul (attention)", e))?;
+    .map_err(|e| cublas_err("cublasLtMatmul (attention)", e))
+}
 
-    Ok(())
+/// Execute one column-major `C = alpha·op(A)·op(B) + beta·C` on `stream`.
+///
+/// # Safety
+///
+/// * `handle` must be a live cuBLASLt handle.
+/// * `p.a`, `p.b`, `p.c` must be live device allocations large enough for the
+///   stated shapes / leading dims and `p.dtype`.
+/// * `workspace` must be a live device allocation of `workspace_bytes`.
+/// * `stream` must be valid and its owning context current on this thread.
+/// * `p.c` must not alias `p.a` or `p.b`.
+pub unsafe fn gemm_ex(
+    handle: &CublasLt,
+    stream: cudarc::driver::sys::CUstream,
+    p: &GemmEx,
+    workspace: CUdeviceptr,
+    workspace_bytes: usize,
+) -> Result<()> {
+    let plan = plan_gemm_ex(handle, p)?;
+    if workspace_bytes < plan.workspace_bytes || (plan.workspace_bytes != 0 && workspace == 0) {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep attention GEMM: cuBLASLt selected {} workspace bytes, supplied {workspace_bytes}",
+            plan.workspace_bytes
+        )));
+    }
+
+    // SAFETY: forwarded from the caller after validating the selected size.
+    unsafe { launch_planned_gemm_ex(handle, stream, p, &plan, workspace) }
+}
+
+/// Governed [`gemm_ex`] adapter consuming an executor-prepared shared workspace.
+///
+/// # Safety
+///
+/// The tensor-pointer and stream requirements are identical to [`gemm_ex`].
+pub unsafe fn governed_gemm_ex(
+    handle: &CublasLt,
+    stream: cudarc::driver::sys::CUstream,
+    p: &GemmEx,
+    workspace: Option<WorkspaceView>,
+    op: &str,
+) -> Result<()> {
+    let plan = plan_gemm_ex(handle, p)?;
+    let ptr = governed_workspace_ptr(workspace, plan.workspace_bytes, op)?;
+    // SAFETY: forwarded from the caller; `ptr` covers the exact selected bytes.
+    unsafe { launch_planned_gemm_ex(handle, stream, p, &plan, ptr) }
+}
+
+#[cfg(test)]
+mod raw_workspace_allocation_guard {
+    use onnx_runtime_ep_api::DevicePtrMut;
+
+    use super::*;
+
+    #[test]
+    fn exact_requirement_is_persistent_and_shortfall_is_deterministic() {
+        let requirement = governed_workspace_requirement(96);
+        assert_eq!(requirement.bytes, 96);
+        assert_eq!(requirement.alignment, WORKSPACE_ALIGNMENT);
+        assert_eq!(requirement.lifetime, WorkspaceLifetime::SessionPersistent);
+        assert!(matches!(
+            requirement.role,
+            MemoryRole::Workspace { step_scoped: false }
+        ));
+
+        let short = WorkspaceView::new(DevicePtrMut(std::ptr::null_mut()), 95);
+        let error = governed_workspace_ptr(Some(short), 96, "test")
+            .expect_err("a short prepared slot must fail before cuBLASLt launch");
+        assert!(format!("{error}").contains("requires 96 bytes, supplied 95"));
+    }
+
+    #[test]
+    fn governed_gemm_sites_do_not_allocate_the_32_mib_ceiling_raw() {
+        let sites = [
+            ("fused_gemm.rs", include_str!("kernels/fused_gemm.rs")),
+            ("gemm.rs", include_str!("kernels/gemm.rs")),
+            ("matmul.rs", include_str!("kernels/matmul.rs")),
+            ("matmul_nbits.rs", include_str!("kernels/matmul_nbits.rs")),
+        ];
+        for (name, source) in sites {
+            let lines = source.lines().collect::<Vec<_>>();
+            for (index, line) in lines.iter().enumerate() {
+                if !line.contains("alloc_raw") {
+                    continue;
+                }
+                let end = (index + 4).min(lines.len());
+                let allocation = lines[index..end].join(" ");
+                assert!(
+                    !allocation.contains("WORKSPACE_BYTES"),
+                    "{name} reintroduced a raw allocation of the cuBLASLt 32 MiB ceiling near line {}; route it through the governed shared workspace",
+                    index + 1
+                );
+            }
+            assert!(
+                source.contains("fn workspace_requirement"),
+                "{name} must report its cuBLASLt scratch during prepare-only planning"
+            );
+            assert!(
+                source.contains("fn execute_with_workspace"),
+                "{name} must consume the executor-prepared shared workspace"
+            );
+            assert!(
+                source.contains("governed_gemm"),
+                "{name} must use the shared cuBLASLt governed adapter"
+            );
+        }
+
+        let bindings = include_str!("../../onnx-runtime-session/src/executor/bindings.rs");
+        for op in [
+            "MatMul",
+            "Gemm",
+            "MatMulNBits",
+            "FusedMatMulBias",
+            "FusedGemm",
+        ] {
+            assert!(
+                bindings.contains(op),
+                "{op} must remain in the centralized is_planned_workspace_node predicate"
+            );
+        }
+    }
 }

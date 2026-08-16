@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! Data-driven CUDA EP **conformance profile**.
 //!
 //! This suite treats the CPU execution provider as the reference oracle and
@@ -26,22 +40,24 @@
 //!   cannot silently leave an op unverified.
 //! * [`profile_has_no_duplicate_entries`].
 //!
-//! The GPU sweep ([`conformance_sweep_matches_cpu`]) graceful-skips without a
-//! CUDA device. Run it on a GPU box with:
+//! The GPU sweep ([`conformance_sweep_matches_cpu`]) is ignored unless
+//! `gpu-tests` is enabled. Run it on a GPU box with:
 //!
 //! ```bash
 //! CUDA_VISIBLE_DEVICES=0 cargo test -p onnx-runtime-ep-cuda --features cuda \
 //!     --test cuda_conformance_gpu
 //! ```
 //!
-//! See `docs/CUDA_COVERAGE.md` ("Conformance profile & GPU parity sweep").
+//! See `docs/execution/CUDA_COVERAGE.md` ("Conformance profile & GPU parity sweep").
 
 mod common;
 
 use std::collections::HashSet;
 use std::path::Path;
 
-use common::{Tensor, assert_close, cuda_ep, decode_floats, float_input, input, run_cpu, run_cuda};
+use common::{
+    Tensor, assert_close, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda,
+};
 use onnx_runtime_ep_cuda::{CUDA_COVERED_OPS, CudaExecutionProvider};
 use onnx_runtime_ir::{Attribute, DataType};
 
@@ -2683,7 +2699,7 @@ fn conformance_profile() -> Vec<ProfileEntry> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Coverage-of-coverage audits (no GPU required — run everywhere, incl. CI)
+// Coverage-of-coverage audits (ignored without gpu-tests; require CUDA when active)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Every op the CUDA EP claims to cover must have a conformance profile entry,
@@ -2692,8 +2708,13 @@ fn conformance_profile() -> Vec<ProfileEntry> {
 /// This is the highest-value guard: it fails the moment an op is added to
 /// `CUDA_COVERED_OPS` without a corresponding parity test — the "claimed but
 /// untested" defect class (e.g. the `ReduceLogSumExp` and bf16 misses).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn every_covered_op_has_a_conformance_entry() {
+    let _ep = require_cuda();
     let profile = conformance_profile();
     let profile_ops: HashSet<&str> = profile.iter().map(|e| e.op).collect();
     let covered: HashSet<&str> = CUDA_COVERED_OPS.iter().copied().collect();
@@ -2729,8 +2750,13 @@ fn every_covered_op_has_a_conformance_entry() {
 
 /// No op may appear twice in the profile, and every `Sweep` entry must carry at
 /// least one case.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn profile_has_no_duplicate_entries() {
+    let _ep = require_cuda();
     let profile = conformance_profile();
     let mut seen = HashSet::new();
     for entry in &profile {
@@ -2752,8 +2778,13 @@ fn profile_has_no_duplicate_entries() {
 /// Each `Dedicated` suite file must exist and actually name its op, so a
 /// deleted, renamed, or gutted suite cannot silently leave an op unverified
 /// while it stays in `CUDA_COVERED_OPS`.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn dedicated_suites_exist_and_name_their_op() {
+    let _ep = require_cuda();
     let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     for entry in conformance_profile() {
         if let Coverage::Dedicated { suite, note } = entry.coverage {
@@ -2778,7 +2809,7 @@ fn dedicated_suites_exist_and_name_their_op() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GPU parity sweep (graceful-skips without a CUDA device)
+// GPU parity sweep (ignored unless `gpu-tests` is enabled)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Run one inline case on CUDA and compare to the CPU oracle.
@@ -2837,10 +2868,14 @@ fn run_case(ep: &CudaExecutionProvider, case: &Case) {
 }
 
 /// Execute every inline `Sweep` case against the CPU oracle on the real GPU.
-/// Skips cleanly on a host without a CUDA device.
+/// Fails loudly on a host without a CUDA device when `gpu-tests` is enabled.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn conformance_sweep_matches_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let mut ran = 0usize;
     for entry in conformance_profile() {
         if let Coverage::Sweep(cases) = &entry.coverage {

@@ -1,6 +1,517 @@
 use super::*;
 
+/// Ops whose owned scratch is reserved by prepare-only planning (§736) so that
+/// capacity refusal surfaces before request admission rather than as a late
+/// device OOM. `BlockQuantizedMoE` (#747) reserves a session-persistent
+/// workspace; `IndexShare` (#751) reserves a session-persistent workspace;
+/// `com.microsoft::Attention` reserves a step-scoped Phase-2a scratch; the
+/// default-domain `Attention` (#736) reserves one route-sized composite covering
+/// its always-materialized f32 score matrix plus dense aliased K/V staging only
+/// when used — step-scoped on the per-call prefill/batched route,
+/// session-persistent on the capture-eligible single-token decode route (both
+/// classes, fixed-capacity append and absent present-output staging charge zero);
+/// `com.microsoft::GroupQueryAttention` (#736) reserves one session-persistent
+/// composite covering packed Q/K/V projection staging, route-required BSH↔BNSH
+/// transpose scratch, and its f32 reference score buffer; and the
+/// cuBLASLt GEMM family shares one session-persistent heuristic-sized peak. All
+/// report their exact bytes via [`Kernel::workspace_requirement`].
+pub(super) fn is_planned_workspace_node(node: &onnx_runtime_ir::Node) -> bool {
+    (node.domain.is_empty() && matches!(node.op_type.as_str(), "MatMul" | "Gemm" | "Attention"))
+        || (node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
+            && matches!(node.op_type.as_str(), "BlockQuantizedMoE" | "IndexShare"))
+        || (node.domain == "com.microsoft"
+            && matches!(
+                node.op_type.as_str(),
+                "Attention"
+                    | "GroupQueryAttention"
+                    | "MatMulNBits"
+                    | "FusedMatMulBias"
+                    | "FusedGemm"
+            ))
+}
+
+/// The justification for an upper bound applied to an otherwise-unresolved
+/// dimension during prepare-only workspace planning. Both variants are a
+/// *provable* ceiling on the dim's real extent, so reserving against them is
+/// correct by construction for a *reservation* (which needs "enough", not
+/// "exact"); a value that cannot be exceeded can never under-reserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AxisBound {
+    /// The symbol carries an explicit configured maximum (`max_seq_len`-style
+    /// declared ceiling on the axis); the real extent can never exceed it.
+    ConfiguredMax(usize),
+    /// A recognized context/sequence axis bounded by the physically-allocated
+    /// KV capacity established for this prepare call. Even a capacity-padded KV
+    /// tensor cannot exceed its own allocation, so this is a hard ceiling.
+    KvCapacity(usize),
+}
+
+impl AxisBound {
+    pub(super) fn extent(self) -> usize {
+        match self {
+            AxisBound::ConfiguredMax(n) | AxisBound::KvCapacity(n) => n,
+        }
+    }
+}
+
+/// Outcome of resolving one planned-workspace node input shape for prepare-only
+/// reservation. [`Self::Exact`] means every dim resolved by exact substitution
+/// (the ONLY outcome for graphs that already resolved before this change — so
+/// their reservations stay byte-identical). [`Self::Bounded`] means at least one
+/// context/sequence-axis dim was unresolved and reserved against a provable
+/// upper bound; the remaining outcome — unresolved *and* unbounded — is a hard
+/// error, never a silent guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PlannedInputShape {
+    Exact(Vec<usize>),
+    Bounded {
+        dims: Vec<usize>,
+        /// `(axis, symbol, applied bound)` for each over-reserved dim.
+        applied: Vec<(usize, SymbolId, AxisBound)>,
+    },
+}
+
+impl PlannedInputShape {
+    #[cfg(test)]
+    pub(super) fn dims(&self) -> &[usize] {
+        match self {
+            PlannedInputShape::Exact(dims) | PlannedInputShape::Bounded { dims, .. } => dims,
+        }
+    }
+
+    pub(super) fn into_dims(self) -> Vec<usize> {
+        match self {
+            PlannedInputShape::Exact(dims) | PlannedInputShape::Bounded { dims, .. } => dims,
+        }
+    }
+}
+
+/// Merge a per-node workspace requirement into the running peak for its
+/// lifetime class, keeping the largest byte count and the strictest alignment.
+fn merge_workspace_peak(peak: &mut WorkspaceRequirement, requirement: WorkspaceRequirement) {
+    if requirement.bytes > peak.bytes {
+        *peak = requirement;
+    } else if requirement.bytes == peak.bytes {
+        peak.alignment = peak.alignment.max(requirement.alignment);
+    }
+}
+
 impl Executor {
+    pub(crate) fn prepare_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
+        Ok(self.ep.prepare_mapped_growth(bytes, role)?)
+    }
+
+    pub(crate) fn release_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) {
+        self.ep.release_mapped_growth(bytes, role);
+    }
+
+    pub(crate) fn workspace_node_locations(&self) -> Vec<String> {
+        fn collect(graph: &Graph, scope: &str, out: &mut Vec<String>) {
+            for (node_id, node) in graph.nodes.iter() {
+                if is_planned_workspace_node(node) {
+                    out.push(format!(
+                        "{scope}node#{} '{}::{}'",
+                        node_id.0, node.domain, node.op_type
+                    ));
+                }
+            }
+            for ((node_id, attribute), child) in &graph.subgraphs {
+                collect(
+                    child,
+                    &format!("{scope}node#{}/{attribute}/", node_id.0),
+                    out,
+                );
+            }
+        }
+        let mut locations = Vec::new();
+        collect(&self.graph, "", &mut locations);
+        locations
+    }
+
+    /// Derive a *provable* upper bound for an unresolved symbolic axis, or
+    /// `None` when no justifiable ceiling exists (in which case the caller must
+    /// fail rather than guess). A reservation needs "enough", not "exact": any
+    /// value the real extent cannot exceed is correct by construction here.
+    ///
+    /// Two — and only two — ceilings are justifiable:
+    /// 1. A recognized context/sequence axis
+    ///    ([`Self::capture_growing_symbols`]) is bounded by the physically
+    ///    allocated KV capacity established for this prepare call (the max
+    ///    concrete extent bound to any growing symbol). This is the true ceiling
+    ///    even when the KV tensor is capacity-padded beyond the model's declared
+    ///    `max_seq_len`, so it is preferred; if the model *also* declares a
+    ///    larger maximum, the larger of the two is taken to never under-reserve.
+    /// 2. Any axis carrying its own configured maximum
+    ///    ([`SymbolConstraints::max`], the `max_seq_len`-style declared ceiling)
+    ///    is bounded by that maximum.
+    ///
+    /// Anything else — an unbound symbol that is neither a known sequence axis
+    /// nor carries a declared maximum — returns `None`: its extent is genuinely
+    /// unknown, and reserving against a guess would silently under-reserve
+    /// (memory corruption surfacing far from here), which is exactly the class
+    /// of bug this planner must refuse to introduce.
+    fn planned_axis_upper_bound(
+        &self,
+        symbol: SymbolId,
+        symbols: &HashMap<SymbolId, usize>,
+    ) -> Option<AxisBound> {
+        let declared_max = self
+            .graph
+            .symbol_constraints
+            .get(&symbol)
+            .and_then(|c| c.max);
+        if self.capture_growing_symbols.contains(&symbol)
+            && let Some(capacity) = self
+                .capture_growing_symbols
+                .iter()
+                .filter_map(|growing| symbols.get(growing).copied())
+                .max()
+        {
+            return Some(AxisBound::KvCapacity(
+                capacity.max(declared_max.unwrap_or(0)),
+            ));
+        }
+        declared_max.map(AxisBound::ConfiguredMax)
+    }
+
+    /// Resolve a planned-workspace node input shape for prepare-only reservation.
+    /// Prefers exact substitution; where a dim is unresolved *because it is a
+    /// context/sequence axis* (or otherwise carries a configured maximum), binds
+    /// it to a provable upper bound and reports the over-reservation. A dim
+    /// unresolved for any *other* reason is a hard error — there the extent is
+    /// genuinely unknown and a guess would under-reserve.
+    pub(super) fn resolve_planned_workspace_input_shape(
+        &self,
+        value: ValueId,
+        symbols: &HashMap<SymbolId, usize>,
+        node_id: NodeId,
+        node: &Node,
+        index: usize,
+    ) -> Result<PlannedInputShape> {
+        let shape = self.value_shapes.get(&value).ok_or_else(|| {
+            SessionError::Internal(format!(
+                "prepare-only workspace planning has no loader shape for input {index} of \
+                 node {} ('{}::{}')",
+                node_id.0, node.domain, node.op_type
+            ))
+        })?;
+        let mut dims = Vec::with_capacity(shape.len());
+        let mut applied = Vec::new();
+        for (axis, dim) in shape.iter().enumerate() {
+            match dim {
+                Dim::Static(n) => dims.push(*n),
+                Dim::Symbolic(symbol) => {
+                    if let Some(&bound) = symbols.get(symbol) {
+                        dims.push(bound);
+                    } else if let Some(axis_bound) = self.planned_axis_upper_bound(*symbol, symbols)
+                    {
+                        dims.push(axis_bound.extent());
+                        applied.push((axis, *symbol, axis_bound));
+                    } else {
+                        let value_name = self
+                            .graph
+                            .value(value)
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("value#{}", value.0));
+                        let symbol_name = self
+                            .symbol_name(*symbol)
+                            .unwrap_or_else(|| format!("symbol#{}", symbol.0));
+                        return Err(SessionError::Internal(format!(
+                            "prepare-only workspace planning cannot resolve input {index} \
+                             '{value_name}' for node {} ('{}::{}'): axis {axis} is symbolic \
+                             ('{symbol_name}') and unresolved, and is neither a context/sequence \
+                             axis bounded by max_seq_len/KV capacity nor an axis with a configured \
+                             maximum — its extent is genuinely unknown, so reserving against a \
+                             guess would under-reserve",
+                            node_id.0, node.domain, node.op_type
+                        )));
+                    }
+                }
+            }
+        }
+        if applied.is_empty() {
+            Ok(PlannedInputShape::Exact(dims))
+        } else {
+            Ok(PlannedInputShape::Bounded { dims, applied })
+        }
+    }
+
+    /// Resolve concrete metadata and reserve kernel workspace without executing
+    /// any graph node.
+    pub(crate) fn prepare_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<WorkspaceRequirement> {
+        self.workspace_preparation_required = true;
+        let external = self.prepare_external_bindings(bindings)?;
+        let symbols = self.bind_symbols(inputs, &external)?;
+        // Track one peak per lifetime class: session-persistent and step-scoped
+        // scratch live in separate executor slots, so a single peak cannot stand
+        // in for both when a graph mixes governed ops (e.g. QMoE + Attention).
+        let mut peak_persistent = WorkspaceRequirement::NONE;
+        let mut peak_step = WorkspaceRequirement::NONE;
+
+        for pi in 0..self.plan.len() {
+            let node_id = self.plan[pi].node_id;
+            let node = self.graph.node(node_id);
+            if !is_planned_workspace_node(node) {
+                continue;
+            }
+            let planned_shapes = self.plan[pi]
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| match input {
+                    None => Ok(PlannedInputShape::Exact(Vec::new())),
+                    Some(value) => self.resolve_planned_workspace_input_shape(
+                        *value, &symbols, node_id, node, index,
+                    ),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if std::env::var("ONNX_GENAI_LOG_WORKSPACE_BOUND").is_ok() {
+                for (index, planned) in planned_shapes.iter().enumerate() {
+                    if let PlannedInputShape::Bounded { dims, applied } = planned {
+                        eprintln!(
+                            "[onnx-genai-workspace] node {} ('{}::{}') input {index} \
+                             over-reserved against bounded axis: dims={dims:?} bounds={applied:?}",
+                            node_id.0, node.domain, node.op_type
+                        );
+                    }
+                }
+            }
+            let input_shapes = planned_shapes
+                .into_iter()
+                .map(PlannedInputShape::into_dims)
+                .collect::<Vec<_>>();
+            let constant_inputs = self.plan[pi]
+                .inputs
+                .iter()
+                .map(|input| {
+                    input.is_some_and(|value| self.graph.initializers.contains_key(&value))
+                })
+                .collect::<Vec<_>>();
+            let opset = effective_opset(&self.graph, node);
+            // Must match what dispatch computes for this node, or prepare-only
+            // planning would key a different kernel than execution uses.
+            let seq_independent =
+                node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
+            let (kernel, key) = self.cache.get_or_create(
+                node_id,
+                node,
+                &input_shapes,
+                &self.plan[pi].input_dtypes,
+                &constant_inputs,
+                opset,
+                seq_independent,
+                self.ep.as_ref(),
+            )?;
+            self.kernel_bindings[pi] = Some(key);
+            let metadata = input_shapes
+                .iter()
+                .zip(&self.plan[pi].input_dtypes)
+                .zip(&self.plan[pi].inputs)
+                .map(|((shape, dtype), input)| TensorMetadata::new(*dtype, shape, input.is_some()))
+                .collect::<Vec<_>>();
+            let requirement = kernel.workspace_requirement(&metadata)?;
+            if requirement.bytes == 0 {
+                continue;
+            }
+            match requirement.role {
+                onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped }
+                    if step_scoped
+                        == matches!(requirement.lifetime, WorkspaceLifetime::StepScoped) => {}
+                _ => {
+                    return Err(SessionError::Internal(format!(
+                        "node {} ('{}::{}') returned an inconsistent workspace role/lifetime",
+                        node_id.0, node.domain, node.op_type
+                    )));
+                }
+            }
+            let peak = match requirement.lifetime {
+                WorkspaceLifetime::SessionPersistent => &mut peak_persistent,
+                WorkspaceLifetime::StepScoped => &mut peak_step,
+            };
+            merge_workspace_peak(peak, requirement);
+        }
+        let child_graphs = self.graph.subgraphs.values().collect::<Vec<_>>();
+        for child in child_graphs {
+            self.collect_nested_workspace_requirement(
+                child,
+                &symbols,
+                "control-flow/",
+                &mut peak_persistent,
+                &mut peak_step,
+            )?;
+        }
+
+        Self::reserve_prepared_workspace(
+            self.ep.as_ref(),
+            &mut self.persistent_workspace,
+            peak_persistent,
+        )?;
+        Self::reserve_prepared_workspace(self.ep.as_ref(), &mut self.step_workspace, peak_step)?;
+
+        // Return the dominant requirement for callers that assert on a single
+        // reserved workspace; the two slots are prepared independently above.
+        Ok(if peak_persistent.bytes >= peak_step.bytes {
+            peak_persistent
+        } else {
+            peak_step
+        })
+    }
+
+    /// Reserve `peak` into `slot` against the device authority, reusing a
+    /// large-enough existing preparation. A zero requirement is a no-op.
+    fn reserve_prepared_workspace(
+        ep: &dyn ExecutionProvider,
+        slot: &mut Option<PreparedWorkspace>,
+        peak: WorkspaceRequirement,
+    ) -> Result<()> {
+        if peak.bytes == 0 {
+            return Ok(());
+        }
+        let bytes = usize::try_from(peak.bytes).map_err(|_| {
+            SessionError::Internal(format!(
+                "workspace requirement {} does not fit usize",
+                peak.bytes
+            ))
+        })?;
+        if slot
+            .as_ref()
+            .is_some_and(|prepared| prepared.bytes >= bytes && prepared.alignment >= peak.alignment)
+        {
+            return Ok(());
+        };
+        if let Some(old) = slot.take() {
+            ep.deallocate(old.buffer)?;
+        }
+        let target_mapped = ep.mapped_bytes_for_allocation(bytes, peak.alignment)?;
+        let mut grant = ep.prepare_mapped_growth(target_mapped, peak.role)?;
+        let lease = match ep.reserve_workspace(peak.bytes, peak.role) {
+            Ok(lease) => lease,
+            Err(error) => {
+                drop(grant);
+                return Err(error.into());
+            }
+        };
+        let fresh = match grant.take() {
+            Some(grant) => ep.allocate_with_mapped_growth(bytes, peak.alignment, grant)?,
+            None => ep.allocate(bytes, peak.alignment)?,
+        };
+        *slot = Some(PreparedWorkspace {
+            buffer: fresh,
+            _lease: lease,
+            bytes,
+            alignment: peak.alignment,
+        });
+        Ok(())
+    }
+
+    fn collect_nested_workspace_requirement(
+        &self,
+        graph: &Graph,
+        symbols: &HashMap<SymbolId, usize>,
+        scope: &str,
+        peak_persistent: &mut WorkspaceRequirement,
+        peak_step: &mut WorkspaceRequirement,
+    ) -> Result<()> {
+        for (node_id, node) in graph.nodes.iter() {
+            if !is_planned_workspace_node(node) {
+                continue;
+            }
+            let input_shapes = node
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    match input {
+                    None => Ok(Vec::new()),
+                    Some(value) => substitute(&graph.value(*value).shape, symbols).ok_or_else(|| {
+                        let value_name = graph
+                            .value(*value)
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("value#{}", value.0));
+                        SessionError::Internal(format!(
+                            "prepare-only workspace planning cannot resolve nested input {index} \
+                             '{value_name}' for {scope}node#{} ('{}::{}'); its formal/captured \
+                             shape is runtime-dependent and no exact graph-metadata bound is \
+                             available",
+                            node_id.0, node.domain, node.op_type
+                        ))
+                    }),
+                }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut kernel =
+                self.ep
+                    .get_kernel(node, &input_shapes, effective_opset(&self.graph, node))?;
+            let constant_inputs = node
+                .inputs
+                .iter()
+                .map(|input| input.is_some_and(|value| graph.initializers.contains_key(&value)))
+                .collect::<Vec<_>>();
+            kernel.set_constant_inputs(&constant_inputs);
+            let metadata = input_shapes
+                .iter()
+                .zip(&node.inputs)
+                .map(|(shape, input)| {
+                    let dtype = input
+                        .map(|value| graph.value(value).dtype)
+                        .unwrap_or(DataType::Undefined);
+                    TensorMetadata::new(dtype, shape, input.is_some())
+                })
+                .collect::<Vec<_>>();
+            let requirement = kernel.workspace_requirement(&metadata)?;
+            if requirement.bytes == 0 {
+                continue;
+            }
+            match requirement.role {
+                onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped }
+                    if step_scoped
+                        == matches!(requirement.lifetime, WorkspaceLifetime::StepScoped) => {}
+                _ => {
+                    return Err(SessionError::Internal(format!(
+                        "{scope}node#{} ('{}::{}') returned an inconsistent workspace role/lifetime",
+                        node_id.0, node.domain, node.op_type
+                    )));
+                }
+            }
+            let peak = match requirement.lifetime {
+                WorkspaceLifetime::SessionPersistent => &mut *peak_persistent,
+                WorkspaceLifetime::StepScoped => &mut *peak_step,
+            };
+            merge_workspace_peak(peak, requirement);
+        }
+        for ((node_id, attribute), child) in &graph.subgraphs {
+            self.collect_nested_workspace_requirement(
+                child,
+                symbols,
+                &format!("{scope}node#{}/{attribute}/", node_id.0),
+                peak_persistent,
+                peak_step,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn release_step_workspace(&mut self) -> Result<()> {
+        if let Some(workspace) = self.step_workspace.take() {
+            self.ep.deallocate(workspace.buffer)?;
+        }
+        Ok(())
+    }
+
     /// Bind the graph's symbols to concrete sizes from the actual bound-input
     /// shapes, validating rank and static dims and detecting symbol conflicts.
     pub(super) fn bind_symbols(
@@ -105,7 +616,9 @@ impl Executor {
     }
 
     pub(crate) fn run_outputs(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<SessionOutput>> {
-        self.run_scoped(inputs, &HashMap::new(), &ExternalBindings::default())?
+        let result = self.run_scoped(inputs, &HashMap::new(), &ExternalBindings::default());
+        self.release_step_workspace()?;
+        result?
             .into_iter()
             .map(|output| {
                 output.ok_or_else(|| {
@@ -123,7 +636,9 @@ impl Executor {
         bindings: &mut [DeviceIoBinding],
     ) -> Result<Vec<Option<Tensor>>> {
         let external = self.prepare_external_bindings(bindings)?;
-        self.run_scoped(inputs, &HashMap::new(), &external)?
+        let result = self.run_scoped(inputs, &HashMap::new(), &external);
+        self.release_step_workspace()?;
+        result?
             .into_iter()
             .map(|output| match output {
                 None => Ok(None),
@@ -142,7 +657,9 @@ impl Executor {
         bindings: &mut [DeviceIoBinding],
     ) -> Result<DeviceGraphCaptureResult> {
         let external = self.prepare_external_bindings(bindings)?;
-        match self.run_scoped_mode(inputs, &HashMap::new(), &external, RunMode::Capture)? {
+        let result = self.run_scoped_mode(inputs, &HashMap::new(), &external, RunMode::Capture);
+        self.release_step_workspace()?;
+        match result? {
             ScopedRunResult::Executed(outputs) => {
                 let mut tensors = Vec::with_capacity(outputs.len());
                 for output in outputs {
@@ -195,7 +712,9 @@ impl Executor {
             self.ep.replay_device_graph()?;
             return Ok(true);
         }
-        match self.run_scoped_mode(&[], &HashMap::new(), &external, RunMode::Replay)? {
+        let result = self.run_scoped_mode(&[], &HashMap::new(), &external, RunMode::Replay);
+        self.release_step_workspace()?;
+        match result? {
             // `run_scoped_mode` clears `capture_schedule` when a branch flip
             // retired the graph this step; report that so the caller re-arms.
             ScopedRunResult::Executed(_) => Ok(self.capture_schedule.is_some()),
@@ -240,6 +759,47 @@ impl Executor {
         self.ep
             .device_allocation_counts()
             .map(|(allocations, frees)| DeviceAllocationCounts { allocations, frees })
+    }
+
+    /// Place any long-lived device memory the provider holds under `governor`.
+    /// Whether the memory this executor's provider hands out commits
+    /// physically as it is used. See
+    /// [`DeviceAllocator::commits_on_demand`][d].
+    ///
+    /// [d]: onnx_runtime_memory_governor::DeviceAllocator::commits_on_demand
+    pub(crate) fn commits_on_demand(&self) -> bool {
+        self.ep.commits_on_demand()
+    }
+
+    pub(crate) fn adopt_memory_governor(
+        &self,
+        governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+        tier: onnx_runtime_memory_governor::Tier,
+        holder: onnx_runtime_memory_governor::HolderId,
+    ) -> onnx_runtime_ep_api::Result<u64> {
+        self.ep.adopt_memory_governor(governor, tier, holder)
+    }
+
+    pub(crate) fn set_weight_residency_budget(
+        &self,
+        budget_bytes: u64,
+    ) -> onnx_runtime_ep_api::Result<Option<u64>> {
+        self.ep.set_weight_residency_budget(budget_bytes)
+    }
+
+    pub(crate) fn max_lazy_weight_working_set_bytes(&self) -> u64 {
+        self.plan
+            .iter()
+            .map(|node| {
+                node.lazy_weight_inputs
+                    .iter()
+                    .filter_map(|value_id| self.weight_handles.get(value_id))
+                    .filter_map(|handle| handle.as_lazy())
+                    .map(|weight| weight.region_bytes_len() as u64)
+                    .sum()
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     pub(super) fn binding_signature(bindings: &[DeviceIoBinding]) -> Vec<DeviceBindingSignature> {
@@ -365,4 +925,51 @@ pub(super) fn required_binding_bytes(
             dims: physical_shape.to_vec(),
         }
     })
+}
+
+#[cfg(test)]
+mod planned_workspace_node_tests {
+    use super::*;
+    use onnx_runtime_ir::{Node, NodeId};
+
+    fn node(domain: &str, op_type: &str) -> Node {
+        let mut node = Node::new(NodeId(0), op_type, Vec::new(), Vec::new());
+        node.domain = domain.into();
+        node
+    }
+
+    #[test]
+    fn centralized_predicate_covers_the_governed_gemm_family() {
+        for (domain, op_type) in [
+            ("", "MatMul"),
+            ("", "Gemm"),
+            ("", "Attention"),
+            ("com.microsoft", "MatMulNBits"),
+            ("com.microsoft", "FusedMatMulBias"),
+            ("com.microsoft", "FusedGemm"),
+            ("com.microsoft", "Attention"),
+            ("com.microsoft", "GroupQueryAttention"),
+        ] {
+            assert!(
+                is_planned_workspace_node(&node(domain, op_type)),
+                "{domain}::{op_type} must be prepared before admission"
+            );
+        }
+        assert!(!is_planned_workspace_node(&node("", "Add")));
+    }
+
+    #[test]
+    fn same_lifetime_gemm_requirements_merge_as_one_peak_not_a_sum() {
+        let requirement = WorkspaceRequirement {
+            bytes: 32 * 1024 * 1024,
+            alignment: 256,
+            lifetime: WorkspaceLifetime::SessionPersistent,
+            role: onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+        };
+        let mut peak = WorkspaceRequirement::NONE;
+        for _ in 0..4 {
+            merge_workspace_peak(&mut peak, requirement);
+        }
+        assert_eq!(peak.bytes, requirement.bytes);
+    }
 }

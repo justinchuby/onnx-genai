@@ -1,5 +1,5 @@
 //! `Cast` / `CastLike`: element-wise dtype conversion on the GPU via
-//! runtime-compiled (NVRTC) kernels (`docs/CUDA_COVERAGE.md`, "Shape /
+//! runtime-compiled (NVRTC) kernels (`docs/execution/CUDA_COVERAGE.md`, "Shape /
 //! data-movement" row).
 //!
 //! ## Backend choice — custom NVRTC (trivial pointwise), and *why*
@@ -38,7 +38,7 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
@@ -302,6 +302,76 @@ impl CastKernel {
             self.runtime.synchronize()
         }
     }
+}
+
+/// Enqueue an element-wise dtype conversion between two raw device buffers of
+/// `n` elements on the EP stream, reusing the shared cast kernel (and its NVRTC
+/// module cache). Unlike [`CastKernel::run`] this is a low-level, stream-ordered
+/// primitive with **no** trailing synchronize, so other kernels can stage a
+/// tensor through a supported precision (e.g. `MatMulNBits` upcasting BFloat16
+/// activations/scales to Float16) without a per-call device sync. Callers own
+/// the buffer lifetimes and any required synchronization before freeing them.
+///
+/// # Safety
+/// `src_ptr`/`dst_ptr` must be live device allocations holding at least `n`
+/// elements of `src_dtype`/`dst_dtype` respectively, and both dtypes must be
+/// supported by the cast kernel (see [`is_supported`]).
+pub(crate) fn launch_cast_raw(
+    runtime: &CudaRuntime,
+    src_ptr: CUdeviceptr,
+    src_dtype: DataType,
+    dst_ptr: CUdeviceptr,
+    dst_dtype: DataType,
+    n: usize,
+) -> Result<()> {
+    if n == 0 {
+        return Ok(());
+    }
+    if !is_supported(src_dtype) || !is_supported(dst_dtype) {
+        return Err(not_implemented(format!(
+            "cuda_ep Cast: unsupported dtype pair {src_dtype:?} -> {dst_dtype:?}"
+        )));
+    }
+    let n_i = i32::try_from(n)
+        .map_err(|_| EpError::KernelFailed(format!("cuda_ep Cast: {n} elements exceed i32")))?;
+    let src_tag = src_dtype as i32;
+    let dst_tag = dst_dtype as i32;
+
+    let use_half = is_half(src_dtype) || is_half(dst_dtype);
+    let (module, entry, source) = if use_half {
+        (
+            CAST_HALF_MODULE,
+            "cast_half",
+            format!(
+                "#include <cuda_fp16.h>\n#include <cuda_bf16.h>\n{CAST_HELPERS}{CAST_HALF_ENTRY}"
+            ),
+        )
+    } else {
+        (
+            CAST_CORE_MODULE,
+            "cast_core",
+            format!("{CAST_HELPERS}{CAST_CORE_ENTRY}"),
+        )
+    };
+
+    let func = runtime.nvrtc_function(module, &source, entry)?;
+    let cfg = LaunchConfig {
+        grid_dim: (grid_for(n), 1, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = runtime.stream().launch_builder(&func);
+    builder
+        .arg(&src_ptr)
+        .arg(&dst_ptr)
+        .arg(&n_i)
+        .arg(&src_tag)
+        .arg(&dst_tag);
+    // SAFETY: `func` is the compiled cast entry; the (const uchar*, uchar*, int,
+    // int, int) argument list matches its signature; the caller guarantees
+    // `src_ptr`/`dst_ptr` are live device allocations of `n` elements.
+    unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch cast_raw", e))?;
+    Ok(())
 }
 
 impl Kernel for CastKernel {

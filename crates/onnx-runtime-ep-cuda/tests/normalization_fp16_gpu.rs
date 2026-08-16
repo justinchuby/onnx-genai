@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! fp16 activation parity for CUDA LayerNorm and RMSNorm.
 
 use half::f16;
@@ -256,6 +270,10 @@ fn test_values(norm_size: usize) -> (Vec<f16>, Vec<f16>, Vec<f32>, Vec<f16>, Vec
     (input, scale_half, scale_f32, bias_half, bias_f32)
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fp16_rmsnorm_parallel_reduction_matches_serial_f32_reference() {
     let norm_size = 896;
@@ -299,6 +317,10 @@ fn fp16_rmsnorm_parallel_reduction_matches_serial_f32_reference() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fp16_rmsnorm_fixed_multigroup_qk_shape_is_capture_supported() {
     // Qwen3 applies RMSNorm per attention head, so a single decode-step Q/K norm
@@ -356,6 +378,10 @@ fn fp16_rmsnorm_fixed_multigroup_qk_shape_is_capture_supported() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fp16_layernorm_matches_serial_f32_reference_for_half_and_float_affine() {
     let norm_size = 1024;

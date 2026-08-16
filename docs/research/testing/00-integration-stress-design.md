@@ -63,9 +63,20 @@ This inventory was checked against `tests/fixtures/` and the crate tree on 2026-
 
 ### Confirmed fixture inventory
 
+Convention (2026-08-14): committed inline-weight ONNX fixtures loaded through our
+own loader (`onnx_runtime_loader`, which auto-detects TextFormat via
+`is_textproto_path`) are stored as git-friendly `model.onnx.textproto`. Fixtures
+are kept as binary `model.onnx` only when they carry external weights
+(`model.onnx.data`), are executed by real ONNX Runtime (the `ort` C API cannot
+parse TextFormat), or are byte placeholders. The ~28
+`crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/*` EP-conformance fixtures are
+now textproto (the plugin test harness converts them in-memory to binary and
+loads via `CreateSessionFromArray`).
+
 | Fixture | Format on disk | Exercises | Usable by proposed stress? |
 |---|---|---|---|
 | `tiny-codec` | `encoder.onnx.textproto`, `vocoder.onnx.textproto` | Audio codec pipeline | Later modality/pipeline stress; not Phase 1. |
+| `tiny-deepseek-v2-qmoe-attention` | `model.onnx.textproto`, tokenizer, metadata, manifest, generator | DeepSeek-V2 tiny QMoE + Attention native decode | Native QMoE/attention golden-lock; already used by `deepseek_v2_tiny_qmoe_native_e2e.rs`. |
 | `tiny-diffusion` | textproto denoiser/VAE graphs | Diffusion pipeline | Later modality stress. |
 | `tiny-dit-diffusion` | textproto denoiser | DiT diffusion | Later modality stress. |
 | `tiny-eagle3` | `model.onnx.textproto`, manifest | Eagle/speculative-style model fixture | Slow speculative stress candidate. |

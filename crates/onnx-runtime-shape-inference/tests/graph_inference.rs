@@ -2219,3 +2219,110 @@ fn scan_carries_sequence_state_variable() {
         "a scan output stacks tensors and is never a container"
     );
 }
+
+/// Whether inference recorded a `(loser, winner)` unification between `x` and
+/// `y` (in either order) on the graph's authoritative record.
+fn unifies(graph: &Graph, x: onnx_runtime_ir::SymbolId, y: onnx_runtime_ir::SymbolId) -> bool {
+    graph
+        .symbol_unifications
+        .iter()
+        .any(|&(a, b)| (a == x && b == y) || (a == y && b == x))
+}
+
+// Path-B completeness: the authoritative `Graph::symbol_unifications` record is
+// populated at the single `broadcast_dim` chokepoint, so it captures symbol
+// substitutions from EVERY broadcasting handler — not just elementwise. This
+// exercises the two non-elementwise handlers the prior executor closure missed
+// (`MatMul` batch dims via `linalg.rs`, `Concat` non-concat axes via
+// `movement/concat_slice.rs`); `Einsum`/`Expand` funnel through the same
+// chokepoint and are covered by construction. Recording is additive: the
+// inferred output shape is byte-identical (uses the lower-id representative),
+// which these assertions also pin.
+#[test]
+fn broadcast_records_symbol_unification_for_matmul_batch_dims() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let a = graph.intern_symbol("a");
+    let b = graph.intern_symbol("b");
+    let lhs = graph.create_named_value(
+        "lhs",
+        DataType::Float32,
+        vec![Dim::Symbolic(a), Dim::Static(8), Dim::Static(16)],
+    );
+    let rhs = graph.create_named_value(
+        "rhs",
+        DataType::Float32,
+        vec![Dim::Symbolic(b), Dim::Static(16), Dim::Static(32)],
+    );
+    graph.add_input(lhs);
+    graph.add_input(rhs);
+    let out = graph.create_named_value("out", DataType::Float32, Shape::new());
+    graph.mark_value_shape_unknown(out);
+    graph.insert_node(node(0, "MatMul", vec![Some(lhs), Some(rhs)], vec![out]));
+    graph.add_output(out);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer MatMul with distinct symbolic batch dims");
+
+    // Inference behavior unchanged: the output batch dim is the lower-id rep.
+    let rep = if a.0 <= b.0 { a } else { b };
+    assert_eq!(
+        graph.value(out).shape,
+        vec![Dim::Symbolic(rep), Dim::Static(8), Dim::Static(32)],
+        "MatMul output must still use the lower-id representative (byte-identical inference)"
+    );
+    assert!(
+        unifies(&graph, a, b),
+        "the MatMul batch-dim broadcast must be recorded as an authoritative unification, got {:?}",
+        graph.symbol_unifications
+    );
+}
+
+#[test]
+fn broadcast_records_symbol_unification_for_concat_non_concat_axes() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let a = graph.intern_symbol("a");
+    let b = graph.intern_symbol("b");
+    // Concatenate along axis 1; the non-concat axis 0 broadcasts a and b.
+    let in0 = graph.create_named_value(
+        "in0",
+        DataType::Float32,
+        vec![Dim::Symbolic(a), Dim::Static(3)],
+    );
+    let in1 = graph.create_named_value(
+        "in1",
+        DataType::Float32,
+        vec![Dim::Symbolic(b), Dim::Static(5)],
+    );
+    graph.add_input(in0);
+    graph.add_input(in1);
+    let out = graph.create_named_value("out", DataType::Float32, Shape::new());
+    graph.mark_value_shape_unknown(out);
+    let mut concat = node(0, "Concat", vec![Some(in0), Some(in1)], vec![out]);
+    concat.attributes.insert("axis".into(), Attribute::Int(1));
+    graph.insert_node(concat);
+    graph.add_output(out);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer Concat with distinct symbolic non-concat dims");
+
+    let rep = if a.0 <= b.0 { a } else { b };
+    assert_eq!(
+        graph.value(out).shape,
+        vec![Dim::Symbolic(rep), Dim::Static(8)],
+        "Concat output non-concat axis must still use the lower-id representative"
+    );
+    assert!(
+        unifies(&graph, a, b),
+        "the Concat non-concat-axis broadcast must be recorded as an authoritative unification, \
+         got {:?}",
+        graph.symbol_unifications
+    );
+}

@@ -2,8 +2,8 @@
 
 use super::*;
 
-fn generate_uses_scheduler(backend: EngineDecodeBackend) -> bool {
-    backend != EngineDecodeBackend::Native
+fn generate_uses_scheduler(_backend: EngineDecodeBackend) -> bool {
+    true
 }
 
 fn generation_budget_cap(cap: ScheduledBudgetCap) -> GenerationBudgetCap {
@@ -14,6 +14,26 @@ fn generation_budget_cap(cap: ScheduledBudgetCap) -> GenerationBudgetCap {
         admitted_bytes: cap.admitted_bytes,
         available_bytes: cap.available_bytes,
     }
+}
+
+#[cfg(feature = "native-backend")]
+fn native_workspace_query_rows(
+    prompt_rows: usize,
+    plan: Option<&NativeSpeculationPlan>,
+    effective_max_new_tokens: usize,
+    max_context: Option<usize>,
+) -> usize {
+    let remaining_context = max_context
+        .map(|limit| limit.saturating_sub(prompt_rows))
+        .unwrap_or(effective_max_new_tokens);
+    let verify_rows = plan.map_or(0, |plan| {
+        crate::native_speculative::verification_width(
+            plan.width,
+            effective_max_new_tokens,
+            remaining_context,
+        )
+    });
+    prompt_rows.max(verify_rows)
 }
 
 fn metadata_eos_token_ids(metadata: &InferenceMetadata) -> Vec<TokenId> {
@@ -43,6 +63,48 @@ mod eos_tests {
 }
 
 impl Engine {
+    fn admit_generate_request_with_scheduler(
+        &mut self,
+        session_id: SessionId,
+        prompt_tokens: usize,
+        max_new_tokens: usize,
+        priority: Priority,
+    ) -> anyhow::Result<ScheduledRequest> {
+        let request_id = self.scheduler.enqueue_generate_request(
+            session_id,
+            prompt_tokens,
+            max_new_tokens,
+            priority,
+        );
+        let scheduled = match self.scheduler.drive_next_fcfs_result() {
+            Ok(Some(scheduled)) => scheduled,
+            Ok(None) => {
+                self.scheduler.cancel_request(request_id);
+                anyhow::bail!(
+                    "scheduler had no waiting request after enqueueing request {request_id} for session {session_id}"
+                );
+            }
+            Err(error) => {
+                self.scheduler.cancel_request(request_id);
+                return Err(error.into());
+            }
+        };
+        if scheduled.request_id != request_id || scheduled.seq_id != session_id {
+            self.scheduler.cancel_request(scheduled.request_id);
+            if scheduled.request_id != request_id {
+                self.scheduler.cancel_request(request_id);
+            }
+            anyhow::bail!(
+                "scheduler admitted request {} for session {}, expected request {} for session {}",
+                scheduled.request_id,
+                scheduled.seq_id,
+                request_id,
+                session_id
+            );
+        }
+        Ok(scheduled)
+    }
+
     fn default_eos_token_ids(&self) -> Vec<TokenId> {
         let mut ids = metadata_eos_token_ids(&self.metadata);
         for id in self.tokenizer.eos_token_ids() {
@@ -76,6 +138,7 @@ impl Engine {
     fn generate_native_cold_with_callback(
         &mut self,
         mut request: GenerateRequest,
+        mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.last_speculative_stats = SpeculativeStats::default();
@@ -92,40 +155,68 @@ impl Engine {
         }
         options.max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        let speculation_plan = native_speculation_plan(&options, &chain);
+        let scheduler_session_id = self.next_native_session_id();
+        let scheduled = self.admit_generate_request_with_scheduler(
+            scheduler_session_id,
+            prompt_tokens.len(),
+            options.max_new_tokens,
+            Priority::Normal,
+        )?;
+        let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
+        options.max_new_tokens = scheduled.max_tokens;
+        let workspace_query_rows = native_workspace_query_rows(
+            prompt_tokens.len(),
+            speculation_plan.as_ref(),
+            options.max_new_tokens,
+            options.max_context,
+        );
+        if let Err(error) = self
+            .native_session
+            .as_mut()
+            .context("native decoder session is unavailable")?
+            .prepare_generation_workspace_for_query_rows(&prompt_tokens, workspace_query_rows)
+        {
+            self.scheduler.complete(scheduler_session_id);
+            return Err(error);
+        }
+        if let Some(callback) = admission_callback.as_mut() {
+            callback();
+        }
 
         // Speculation ON (implemented greedy prompt-lookup) → the native
         // speculative driver. Every other request stays on the untouched plain
         // M=1 fast path below, preserving the 762 tok/s non-regression guarantee.
-        if let Some(plan) = native_speculation_plan(&options, &chain) {
+        let result = if let Some(plan) = speculation_plan {
             let mut stats = SpeculativeStats::default();
-            let native_session = self
-                .native_session
-                .as_mut()
-                .context("native decoder session is unavailable")?;
-            let mut driver = match plan.kind {
-                NativeSpeculationKind::PromptLookup { ngram, max_tokens } => {
-                    crate::native_speculative::NativeSpeculativeDriver::new_prompt_lookup(
-                        native_session,
-                        ngram,
-                        max_tokens,
-                        plan.width,
-                    )?
-                }
-                NativeSpeculationKind::SharedKv => {
-                    let proposer = self.native_shared_kv_proposer.as_mut().context(
-                        "native shared-KV speculation requested without a loaded proposer session",
-                    )?;
-                    crate::native_speculative::NativeSpeculativeDriver::new_shared_kv(
-                        native_session,
-                        &mut proposer.session,
-                        &proposer.embedder,
-                        &proposer.groups,
-                        proposer.hidden_size,
-                        plan.width,
-                    )?
-                }
-            };
-            let result = augment_backend_error(
+            let result = (|| {
+                let native_session = self
+                    .native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?;
+                let mut driver = match plan.kind {
+                    NativeSpeculationKind::PromptLookup { ngram, max_tokens } => {
+                        crate::native_speculative::NativeSpeculativeDriver::new_prompt_lookup(
+                            native_session,
+                            ngram,
+                            max_tokens,
+                            plan.width,
+                        )?
+                    }
+                    NativeSpeculationKind::SharedKv => {
+                        let proposer = self.native_shared_kv_proposer.as_mut().context(
+                            "native shared-KV speculation requested without a loaded proposer session",
+                        )?;
+                        crate::native_speculative::NativeSpeculativeDriver::new_shared_kv(
+                            native_session,
+                            &mut proposer.session,
+                            &proposer.embedder,
+                            &proposer.groups,
+                            proposer.hidden_size,
+                            plan.width,
+                        )?
+                    }
+                };
                 driver.generate(
                     &prompt_tokens,
                     &options,
@@ -133,33 +224,34 @@ impl Engine {
                     &self.tokenizer,
                     &mut stats,
                     callback,
-                ),
-                EngineDecodeBackend::Native,
-            );
+                )
+            })();
             self.last_speculative_stats = stats;
-            return result;
-        }
-
-        let native_session = self
-            .native_session
-            .as_mut()
-            .context("native decoder session is unavailable")?;
-        augment_backend_error(
+            result
+        } else {
+            let native_session = self
+                .native_session
+                .as_mut()
+                .context("native decoder session is unavailable")?;
             native_session.generate_with_callback(
                 &prompt_tokens,
                 &options,
                 &chain,
                 &self.tokenizer,
                 callback,
-            ),
-            EngineDecodeBackend::Native,
-        )
+            )
+        };
+        self.scheduler.complete(scheduler_session_id);
+        let mut result = augment_backend_error(result, EngineDecodeBackend::Native)?;
+        result.budget_cap = budget_cap;
+        Ok(result)
     }
 
     #[cfg(not(feature = "native-backend"))]
     fn generate_native_cold_with_callback(
         &mut self,
         _request: GenerateRequest,
+        _admission_callback: Option<&mut dyn FnMut()>,
         _callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         anyhow::bail!(
@@ -306,6 +398,22 @@ impl Engine {
             .and_then(crate::native_decode::NativeDecodeSession::cuda_kv_debug_stats)
     }
 
+    /// Mutable access to the engine-owned native decode session, if any.
+    ///
+    /// Exposed so measurement harnesses can drive the batch-N decode entry
+    /// points (`decode_greedy_batch`) against the *fully governed* session —
+    /// the one whose weight-offload policy carries the managed no-spill
+    /// stable-VA authority. A bare `load_with_resolved_io` session takes the
+    /// conservative pointer-unstable default and would decline capture by
+    /// construction, so a harness that wants to observe the real
+    /// capture-plus-streaming behaviour must go through the engine.
+    #[cfg(feature = "native-backend")]
+    pub fn native_decode_session_mut(
+        &mut self,
+    ) -> Option<&mut crate::native_decode::NativeDecodeSession> {
+        self.native_session.as_mut()
+    }
+
     /// Access the engine-owned Resource Governor handle.
     pub fn governor(&self) -> &EngineResourceGovernor {
         &self.governor
@@ -314,6 +422,27 @@ impl Engine {
     /// Convenience snapshot of configured and live resource state.
     pub fn resource_snapshot(&self) -> GovernorSnapshot {
         self.governor.snapshot()
+    }
+
+    /// Bytes by which the device memory ledger exceeds its live ceiling.
+    pub fn device_oversubscribed_bytes(&self) -> u64 {
+        self.governor.device_oversubscribed_bytes()
+    }
+
+    /// Static weight placement computed from `device_policy` at model load.
+    pub fn weight_placement_report(&self) -> Option<&WeightPlacementReport> {
+        #[cfg(feature = "native-backend")]
+        {
+            self.weight_placement.as_ref()
+        }
+        #[cfg(not(feature = "native-backend"))]
+        {
+            None
+        }
+    }
+
+    pub fn memory_strategy_plan(&self) -> &MemoryStrategyPlan {
+        &self.memory_strategy_plan
     }
 
     /// Change the live VRAM ceiling when runtime overrides are enabled.
@@ -384,6 +513,11 @@ impl Engine {
         self.connector.stats().clone()
     }
 
+    #[cfg(feature = "native-backend")]
+    pub fn recurrent_prefix_cache_stats(&self) -> RecurrentPrefixCacheStats {
+        self.native_recurrent_prefix_stats
+    }
+
     /// Generate the middle text for a fill-in-the-middle request.
     pub fn generate_fim(
         &mut self,
@@ -406,10 +540,23 @@ impl Engine {
         options: GenerateOptions,
         fim_config: &FimConfig,
     ) -> anyhow::Result<GenerateResult> {
+        self.generate_fim_with_config_and_callbacks(prefix, suffix, options, fim_config, None, None)
+    }
+
+    /// Generate FIM text and notify the caller immediately after scheduler admission.
+    pub fn generate_fim_with_config_and_callbacks(
+        &mut self,
+        prefix: impl AsRef<str>,
+        suffix: impl AsRef<str>,
+        options: GenerateOptions,
+        fim_config: &FimConfig,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
         let prompt = fim_config.format_prompt(prefix.as_ref(), suffix.as_ref());
         let mut request = GenerateRequest::new(prompt);
         request.options = self.fim_options(fim_config, options);
-        self.generate(request)
+        self.generate_with_callbacks(request, admission_callback, token_callback)
     }
 
     /// Generate text and optionally stream each generated token to `callback`.
@@ -418,29 +565,61 @@ impl Engine {
         request: GenerateRequest,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        if !generate_uses_scheduler(self.decode_backend) {
-            #[cfg(feature = "native-backend")]
-            {
-                // Speculation still runs cold: the native speculative paths own
-                // the KV cache themselves and cannot resume a shared prefix.
-                let native_spec_requested = request.options.speculative_mode.is_some()
-                    || request.options.num_speculative_tokens.is_some();
-                if request.options.cold_start || native_spec_requested {
-                    let result = self.generate_native_cold_with_callback(request, callback);
-                    self.native_active_session = None;
-                    return result;
-                }
-                let session_id = self.default_native_session()?;
-                return self
-                    .generate_native_in_session_with_callback(session_id, request, callback);
+        self.generate_with_callbacks(request, None, callback)
+    }
+
+    /// Generate text, notifying `admission_callback` after scheduler admission
+    /// and before backend execution, then streaming tokens to `token_callback`.
+    pub fn generate_with_callbacks(
+        &mut self,
+        request: GenerateRequest,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            // Speculation still runs cold: the native speculative paths own
+            // the KV cache themselves and cannot resume a shared prefix. Both
+            // cold and session-reusing paths still admit through the scheduler
+            // before touching the native backend.
+            let native_spec_requested = request.options.speculative_mode.is_some()
+                || request.options.num_speculative_tokens.is_some();
+            if request.options.cold_start || native_spec_requested {
+                let result = self.generate_native_cold_with_callback(
+                    request,
+                    admission_callback,
+                    token_callback,
+                );
+                self.native_active_session = None;
+                return result;
             }
+            let session_id = self.default_native_session()?;
+            return self.generate_native_in_session_with_callbacks(
+                session_id,
+                request,
+                admission_callback,
+                token_callback,
+            );
+        }
+        if !generate_uses_scheduler(self.decode_backend) {
             #[cfg(not(feature = "native-backend"))]
             {
-                return self.generate_native_cold_with_callback(request, callback);
+                return self.generate_native_cold_with_callback(
+                    request,
+                    admission_callback,
+                    token_callback,
+                );
             }
         }
         let session_id = self.create_session()?;
-        let result = self.generate_in_session_with_callback(session_id, request, callback);
+        let result = self.generate_in_session_with_priority_and_callback(
+            session_id,
+            request,
+            Priority::Normal,
+            None,
+            admission_callback,
+            token_callback,
+        );
         let close_result = self.close_session(session_id);
         match (result, close_result) {
             (Ok(result), Ok(())) => Ok(result),
@@ -466,7 +645,7 @@ impl Engine {
         priority: Priority,
     ) -> anyhow::Result<GenerateResult> {
         self.generate_in_session_with_priority_and_callback(
-            session_id, request, priority, None, None,
+            session_id, request, priority, None, None, None,
         )
     }
 
@@ -482,7 +661,26 @@ impl Engine {
             request,
             Priority::Normal,
             None,
+            None,
             callback,
+        )
+    }
+
+    /// Generate in a persistent session with an explicit admission notification.
+    pub fn generate_in_session_with_callbacks(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_in_session_with_priority_and_callback(
+            session_id,
+            request,
+            Priority::Normal,
+            None,
+            admission_callback,
+            token_callback,
         )
     }
 
@@ -506,6 +704,7 @@ impl Engine {
             Priority::Normal,
             Some(sampler),
             None,
+            None,
         )
     }
 
@@ -515,6 +714,7 @@ impl Engine {
         request: GenerateRequest,
         priority: Priority,
         mut custom_sampler: Option<Box<dyn Sampler>>,
+        mut admission_callback: Option<&mut dyn FnMut()>,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         #[cfg(feature = "native-backend")]
@@ -525,7 +725,12 @@ impl Engine {
             if custom_sampler.is_some() {
                 anyhow::bail!("custom samplers are not supported on the native backend");
             }
-            return self.generate_native_in_session_with_callback(session_id, request, callback);
+            return self.generate_native_in_session_with_callbacks(
+                session_id,
+                request,
+                admission_callback,
+                callback,
+            );
         }
         self.last_speculative_stats = SpeculativeStats::default();
         request.options.validate()?;
@@ -542,40 +747,17 @@ impl Engine {
         let max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
 
-        let request_id = self.scheduler.enqueue_generate_request(
+        let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
             prompt_tokens.len(),
             options.max_new_tokens,
             priority,
-        );
-        let scheduled = match self.scheduler.drive_next_fcfs_result() {
-            Ok(Some(scheduled)) => scheduled,
-            Ok(None) => {
-                self.scheduler.cancel_request(request_id);
-                anyhow::bail!(
-                    "scheduler had no waiting request after enqueueing request {request_id} for session {session_id}"
-                );
-            }
-            Err(error) => {
-                self.scheduler.cancel_request(request_id);
-                return Err(error.into());
-            }
-        };
-        if scheduled.request_id != request_id || scheduled.seq_id != session_id {
-            self.scheduler.cancel_request(scheduled.request_id);
-            if scheduled.request_id != request_id {
-                self.scheduler.cancel_request(request_id);
-            }
-            anyhow::bail!(
-                "scheduler admitted request {} for session {}, expected request {} for session {}",
-                scheduled.request_id,
-                scheduled.seq_id,
-                request_id,
-                session_id
-            );
-        }
+        )?;
         let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
         options.max_new_tokens = scheduled.max_tokens;
+        if let Some(callback) = admission_callback.as_mut() {
+            callback();
+        }
 
         let Some(mut state) = self.sessions.remove(&session_id) else {
             self.scheduler.complete(session_id);
@@ -1187,6 +1369,49 @@ impl Engine {
             || "native".to_string(),
             |session| session.execution_provider_status().summary(),
         )
+    /// Latest native activation-memory planner measurement, if the current
+    /// backend is native and has executed far enough to resolve concrete shapes.
+    pub fn activation_memory_plan_stats(&self) -> Option<crate::ActivationMemoryPlanSummary> {
+        #[cfg(feature = "native-backend")]
+        {
+            self.native_session
+                .as_ref()
+                .and_then(crate::native_decode::NativeDecodeSession::activation_memory_plan_stats)
+        }
+        #[cfg(not(feature = "native-backend"))]
+        {
+            None
+        }
+    }
+
+    /// Process-global CUDA VMM arena counters, when this build has the native
+    /// CUDA execution provider.
+    ///
+    /// `None` means the build cannot have an arena. All-zero means no arena was
+    /// ever built, which is the normal state without `ONNX_GENAI_CUDA_VMM` --
+    /// and is distinguishable from an arena that was built and never committed
+    /// anything (`reserved_bytes > 0, commits == 0`), which is the bug #659 hid
+    /// behind a log line for an entire release.
+    pub fn vmm_arena_stats(&self) -> Option<crate::VmmArenaStats> {
+        #[cfg(feature = "cuda")]
+        {
+            let stats = onnx_runtime_ep_cuda::vmm_allocator::global_vmm_stats();
+            Some(crate::VmmArenaStats {
+                commits: stats.commits,
+                releases: stats.releases,
+                committed_bytes: stats.committed_bytes,
+                reserved_bytes: stats.reserved_bytes,
+                peak_committed_bytes: stats.peak_committed_bytes,
+                allocations: stats.allocations,
+                ref_underflows: stats.ref_underflows,
+                byte_underflows: stats.byte_underflows,
+                unaccounted_committed_bytes: stats.unaccounted_committed_bytes,
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
     }
 
     /// Auto-detected fill-in-the-middle configuration, if the tokenizer declares one.
@@ -1298,6 +1523,7 @@ impl Engine {
             && state.decode_state.use_kv
             && self.kv_model.is_some()
             && self.kv_cache.page_table.tensor_config.is_some()
+            && !self.ort_session_has_recurrent_state()
         {
             let matched = self
                 .prefix_cache
@@ -1592,6 +1818,23 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))
     }
 
+    /// Whether the loaded ORT decoder declares loop-carried recurrent state, in
+    /// which case paged / materialized-past prefix reuse must be declined and a
+    /// full recompute forced (#701), mirroring the native `has_recurrent_state`
+    /// gate (#700). Returns `false` when no ORT session is loaded — the paged
+    /// reuse path requires one, so the guard cannot suppress a legitimate reuse.
+    fn ort_session_has_recurrent_state(&self) -> bool {
+        let Some(session) = self.session.as_deref() else {
+            return false;
+        };
+        let io = self
+            .metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.io.as_ref());
+        ort_session_has_recurrent_state(session, io)
+    }
+
     fn ensure_session_kv_current(
         &mut self,
         session_id: SessionId,
@@ -1839,13 +2082,14 @@ impl Engine {
         request: GenerateRequest,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        self.generate_native_in_session_impl(session_id, request, callback)
+        self.generate_native_in_session_with_callbacks(session_id, request, None, callback)
     }
 
-    fn generate_native_in_session_impl(
+    fn generate_native_in_session_with_callbacks(
         &mut self,
         session_id: SessionId,
         request: GenerateRequest,
+        mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.last_speculative_stats = SpeculativeStats::default();
@@ -1864,62 +2108,202 @@ impl Engine {
                 "native session generation does not support speculative decoding; use stateless generate() for native prompt-lookup/shared-KV speculation"
             );
         }
-
-        let active_matches = self.native_active_session == Some(session_id);
-        if !active_matches {
-            let native = self
-                .native_session
-                .as_mut()
-                .context("native decoder session is unavailable")?;
-            native.reset()?;
-            self.native_active_session = Some(session_id);
+        if !self.native_sessions.contains_key(&session_id) {
+            anyhow::bail!("session {session_id} not found");
+        }
+        let scheduled = self.admit_generate_request_with_scheduler(
+            session_id,
+            prompt_tokens.len(),
+            options.max_new_tokens,
+            Priority::Normal,
+        )?;
+        let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
+        options.max_new_tokens = scheduled.max_tokens;
+        if let Err(error) = self
+            .native_session
+            .as_mut()
+            .context("native decoder session is unavailable")?
+            .prepare_generation_workspace_preserving_state(&prompt_tokens)
+        {
+            self.scheduler.complete(session_id);
+            return Err(error);
+        }
+        if let Some(callback) = admission_callback.as_mut() {
+            callback();
         }
 
-        let prefix_len = {
-            let state = self
-                .native_sessions
-                .get(&session_id)
-                .with_context(|| format!("session {session_id} not found"))?;
-            common_prefix_len(&state.tokens, &prompt_tokens)
-        };
-
-        let result = {
-            let native = self
-                .native_session
-                .as_mut()
-                .context("native decoder session is unavailable")?;
-
-            let mut resume_from = if active_matches {
-                prefix_len.min(native.current_len())
-            } else {
-                0
-            };
-            if resume_from >= prompt_tokens.len() {
-                resume_from = prompt_tokens.len().saturating_sub(1);
+        let result = (|| -> anyhow::Result<GenerateResult> {
+            let active_matches = self.native_active_session == Some(session_id);
+            let semantic_prefix_len = options
+                .semantic_prefix_len
+                .filter(|&len| len > 0 && len < prompt_tokens.len());
+            if !active_matches {
+                let native = self
+                    .native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?;
+                native.reset()?;
+                self.native_active_session = Some(session_id);
             }
 
-            native.generate_incremental_with_callback(
-                &prompt_tokens,
-                resume_from,
-                &options,
-                &chain,
-                &self.tokenizer,
-                callback,
-            )?
-        };
-        let last_access = self.touch_native_session();
+            let prefix_len = {
+                let state = self
+                    .native_sessions
+                    .get(&session_id)
+                    .with_context(|| format!("session {session_id} not found"))?;
+                common_prefix_len(&state.tokens, &prompt_tokens)
+            };
 
-        let state = self
-            .native_sessions
-            .get_mut(&session_id)
-            .with_context(|| format!("session {session_id} not found"))?;
-        state.tokens.truncate(prefix_len);
-        state.tokens.extend_from_slice(&prompt_tokens[prefix_len..]);
-        state.tokens.extend_from_slice(&result.token_ids);
-        state.last_access = last_access;
-        self.evict_native_sessions(session_id);
+            let supports_past_snapshots = self
+                .native_session
+                .as_ref()
+                .is_some_and(|native| native.supports_past_snapshots());
+            let mut restored_prefix_len = None;
+            let mut should_store_semantic_snapshot = false;
+            if !active_matches
+                && supports_past_snapshots
+                && let Some(boundary) = semantic_prefix_len
+            {
+                self.native_recurrent_prefix_stats.lookups += 1;
+                if let Some((matched, snapshot)) = self
+                    .prefix_cache
+                    .lookup_snapshot::<NativePrefixSnapshot>(&prompt_tokens)
+                    .filter(|(matched, _)| *matched >= boundary && *matched < prompt_tokens.len())
+                {
+                    let native = self
+                        .native_session
+                        .as_mut()
+                        .context("native decoder session is unavailable")?;
+                    match native.restore_past_snapshot(&snapshot.snapshot) {
+                        Ok(()) => {
+                            self.native_recurrent_prefix_stats.hits += 1;
+                            self.native_recurrent_prefix_stats.restored_tokens += matched as u64;
+                            restored_prefix_len = Some(matched);
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                "skipping native recurrent prefix snapshot restore after failure: \
+                             {error:#}"
+                            );
+                        }
+                    }
+                } else {
+                    should_store_semantic_snapshot = true;
+                }
+            }
 
-        Ok(result)
+            if should_store_semantic_snapshot
+                && supports_past_snapshots
+                && let Some(boundary) = semantic_prefix_len
+            {
+                let snapshot = {
+                    let native = self
+                        .native_session
+                        .as_mut()
+                        .context("native decoder session is unavailable")?;
+                    native.prefill_prefix(&prompt_tokens[..boundary])?;
+                    native.snapshot_past()
+                };
+                match snapshot {
+                    Ok(snapshot) => {
+                        let reserve_snapshot = || {
+                            onnx_runtime_memory_governor::MemoryGovernor::reserve(
+                                self.governor.memory(),
+                                onnx_runtime_memory_governor::Tier::Host,
+                                snapshot.bytes(),
+                                Holder::RecurrentPrefixSnapshot.role(),
+                                Holder::RecurrentPrefixSnapshot.id(),
+                            )
+                        };
+                        let lease = match reserve_snapshot() {
+                            Ok(lease) => Some(lease),
+                            Err(first_error) if self.prefix_cache.evict_lru_snapshot() => {
+                                match reserve_snapshot() {
+                                    Ok(lease) => Some(lease),
+                                    Err(error) => {
+                                        tracing::debug!(
+                                            "skipping native recurrent prefix snapshot store; cannot \
+                                         reserve {} bytes after evicting an older snapshot: \
+                                         {first_error}; retry: {error}",
+                                            snapshot.bytes()
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                tracing::debug!(
+                                    "skipping native recurrent prefix snapshot store; cannot reserve \
+                                 {} bytes: {error}",
+                                    snapshot.bytes()
+                                );
+                                None
+                            }
+                        };
+                        if let Some(lease) = lease {
+                            self.prefix_cache.insert_snapshot(
+                                &prompt_tokens[..boundary],
+                                Arc::new(NativePrefixSnapshot {
+                                    snapshot,
+                                    _lease: lease,
+                                }),
+                            );
+                            self.native_recurrent_prefix_stats.stores += 1;
+                        }
+                        restored_prefix_len = Some(boundary);
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            "skipping native recurrent prefix snapshot store after snapshot failure: \
+                         {error:#}"
+                        );
+                    }
+                }
+            }
+
+            let mut result = {
+                let native = self
+                    .native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?;
+
+                let mut resume_from = if let Some(restored) = restored_prefix_len {
+                    restored
+                } else if active_matches {
+                    prefix_len.min(native.current_len())
+                } else {
+                    0
+                };
+                if resume_from >= prompt_tokens.len() {
+                    resume_from = prompt_tokens.len().saturating_sub(1);
+                }
+
+                native.generate_incremental_with_callback(
+                    &prompt_tokens,
+                    resume_from,
+                    &options,
+                    &chain,
+                    &self.tokenizer,
+                    callback,
+                )?
+            };
+            result.budget_cap = budget_cap;
+            let last_access = self.touch_native_session();
+
+            let state = self
+                .native_sessions
+                .get_mut(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?;
+            state.tokens.truncate(prefix_len);
+            state.tokens.extend_from_slice(&prompt_tokens[prefix_len..]);
+            state.tokens.extend_from_slice(&result.token_ids);
+            state.last_access = last_access;
+            self.evict_native_sessions(session_id);
+
+            Ok(result)
+        })();
+        self.scheduler.complete(session_id);
+        result
     }
 
     /// Deprecated native-only shim. Use [`Engine::rewind_session_by`].
@@ -1935,11 +2319,227 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "native-backend")]
+    use crate::ProcessorChain;
+    #[cfg(feature = "native-backend")]
+    use std::path::PathBuf;
 
     #[test]
-    fn ort_generate_uses_scheduler_but_native_generate_bypasses_it() {
+    fn ort_and_native_generation_use_scheduler_admission() {
         assert!(generate_uses_scheduler(EngineDecodeBackend::Ort));
-        assert!(!generate_uses_scheduler(EngineDecodeBackend::Native));
+        assert!(generate_uses_scheduler(EngineDecodeBackend::Native));
         assert!(generate_uses_scheduler(EngineDecodeBackend::Auto));
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn speculative_workspace_rows_follow_the_exact_runtime_plan() {
+        let chain = ProcessorChain::new();
+        let mut options = GenerateOptions {
+            greedy: true,
+            temperature: 0.0,
+            speculative_mode: Some(SpeculativeMode::PromptLookup {
+                ngram: 1,
+                max_tokens: 4,
+            }),
+            ..GenerateOptions::default()
+        };
+        let plan = native_speculation_plan(&options, &chain).unwrap();
+        assert_eq!(native_workspace_query_rows(1, Some(&plan), 8, None), 4);
+        assert_eq!(native_workspace_query_rows(8, Some(&plan), 8, None), 8);
+
+        options.num_speculative_tokens = Some(1024);
+        let widened = native_speculation_plan(&options, &chain).unwrap();
+        assert_eq!(widened.width, 1024);
+        assert_eq!(native_workspace_query_rows(1, Some(&widened), 1, None), 1);
+        assert_eq!(
+            native_workspace_query_rows(1, Some(&widened), 8, Some(3)),
+            2
+        );
+        let runtime_width = crate::native_speculative::verification_width(widened.width, 5, 3);
+        assert_eq!(
+            native_workspace_query_rows(1, Some(&widened), 5, Some(4)),
+            1usize.max(runtime_width)
+        );
+
+        options.num_speculative_tokens = None;
+        options.speculative_mode = Some(SpeculativeMode::SharedKv(
+            crate::config::SharedKvProposerConfig {
+                assistant_model: PathBuf::from("assistant.onnx"),
+                target_hidden_output: "hidden".to_string(),
+                input_embedding_weights: PathBuf::from("embedding.bin"),
+                backbone_hidden_size: 1,
+                vocab_size: 1,
+                num_speculative_tokens: 3,
+                shared_kv: Vec::new(),
+            },
+        ));
+        let shared_kv = native_speculation_plan(&options, &chain).unwrap();
+        assert_eq!(shared_kv.width, 4);
+        assert_eq!(native_workspace_query_rows(1, Some(&shared_kv), 8, None), 4);
+
+        assert_eq!(native_workspace_query_rows(3, None, 8, None), 3);
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_generate_rejects_over_kv_byte_budget_before_backend_run() -> anyhow::Result<()> {
+        let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json")
+            .canonicalize()?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+        let scheduler_config = onnx_genai_scheduler::SchedulerConfig {
+            bytes_per_token: Some(10),
+            ..onnx_genai_scheduler::SchedulerConfig::default()
+        };
+        let governor = EngineResourceGovernor::new(
+            ResourceLimits::default(),
+            false,
+            ModelKvConfig::known(10, 1),
+            0,
+        )?;
+        let mut engine = Engine {
+            decode_backend: EngineDecodeBackend::Native,
+            metadata: InferenceMetadata::default(),
+            metadata_hints: MetadataHints::default(),
+            kv_cache: PagedKvCache::new(1, 1),
+            prefix_cache: PrefixCache::new(),
+            token_prefix_cache: Vec::new(),
+            kv_model: None,
+            decode_path: ModelDecodePath::Legacy,
+            scheduler: Scheduler::with_byte_budget(
+                scheduler_config,
+                onnx_genai_scheduler::ByteBudget::new(10),
+            ),
+            governor,
+            sessions: HashMap::new(),
+            session: None,
+            native_session: None,
+            weight_placement: None,
+            memory_strategy_plan: MemoryStrategyPlan::unknown(0, None, "test engine fixture"),
+            native_sessions: HashMap::new(),
+            native_active_session: None,
+            native_session_counter: 0,
+            native_access_counter: 0,
+            native_default_session: None,
+            native_max_sessions: 8,
+            native_shared_kv_proposer: None,
+            native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
+            draft: None,
+            mtp: None,
+            eagle3: None,
+            shared_kv_proposer: None,
+            tokenizer,
+            fim_config: None,
+            num_speculative_tokens: 1,
+            speculative_mode: SpeculativeMode::None,
+            last_speculative_stats: SpeculativeStats::default(),
+            connector: ConnectorBridge::null(),
+            _environment: None,
+        };
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1]));
+        request.options.max_new_tokens = 1;
+        request.options.stop_on_eos = false;
+
+        let mut admitted = false;
+        let mut on_admitted = || admitted = true;
+        let error = engine
+            .generate_with_callbacks(request, Some(&mut on_admitted), None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("scheduler admission failed: KV byte budget"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("native decoder session is unavailable"),
+            "native backend was touched before scheduler admission rejected: {error}"
+        );
+        assert!(!admitted, "refused requests must not signal admission");
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_backend_batching_capability_reports_single_sequence() -> anyhow::Result<()> {
+        let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json")
+            .canonicalize()?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+        let governor = EngineResourceGovernor::new(
+            ResourceLimits::default(),
+            false,
+            ModelKvConfig::known(10, 1),
+            0,
+        )?;
+        // A native engine reports batch=1 even when the model's KV I/O shape
+        // (here StaticCache, which batches under ORT) would otherwise support
+        // batching: the cap is a property of the native decode path, not the
+        // model. This is the honesty guarantee -- capability is not read off the
+        // decode_path alone.
+        let mut engine = Engine {
+            decode_backend: EngineDecodeBackend::Native,
+            metadata: InferenceMetadata::default(),
+            metadata_hints: MetadataHints::default(),
+            kv_cache: PagedKvCache::new(1, 1),
+            prefix_cache: PrefixCache::new(),
+            token_prefix_cache: Vec::new(),
+            kv_model: None,
+            decode_path: ModelDecodePath::StaticCache { max_len: 16 },
+            scheduler: Scheduler::with_byte_budget(
+                onnx_genai_scheduler::SchedulerConfig::default(),
+                onnx_genai_scheduler::ByteBudget::new(10),
+            ),
+            governor,
+            sessions: HashMap::new(),
+            session: None,
+            native_session: None,
+            weight_placement: None,
+            memory_strategy_plan: MemoryStrategyPlan::unknown(0, None, "test engine fixture"),
+            native_sessions: HashMap::new(),
+            native_active_session: None,
+            native_session_counter: 0,
+            native_access_counter: 0,
+            native_default_session: None,
+            native_max_sessions: 8,
+            native_shared_kv_proposer: None,
+            native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
+            draft: None,
+            mtp: None,
+            eagle3: None,
+            shared_kv_proposer: None,
+            tokenizer,
+            fim_config: None,
+            num_speculative_tokens: 1,
+            speculative_mode: SpeculativeMode::None,
+            last_speculative_stats: SpeculativeStats::default(),
+            connector: ConnectorBridge::null(),
+            _environment: None,
+        };
+
+        let capability = engine.batching_capability();
+        assert_eq!(
+            capability.max_concurrent_sequences(),
+            Some(1),
+            "native decode path pins batch to 1"
+        );
+        assert!(!capability.supports_batching());
+        assert!(!capability.allows(2));
+        assert_eq!(capability.effective_max_batch(4), 1);
+        assert!(
+            capability.reason().contains("native"),
+            "reason must name the backend: {}",
+            capability.reason()
+        );
+        // Tie the reported capability to reality: the native engine cannot
+        // actually build a batched manager for more than one sequence.
+        assert!(
+            engine.continuous_batch_manager(2).is_err(),
+            "native backend must not build a >1 continuous batch manager"
+        );
+        Ok(())
     }
 }

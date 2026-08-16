@@ -188,3 +188,34 @@ Approved PR #282 after mutation-proven equivalence for tree speculative decoding
 
 ## 2026-07-28T17:40:00+0000
 Large-model recon documented 27B runtime and GPU-capacity blockers; Granite unfused MoE does not engage offload.
+
+---
+
+## Archive batch 2026-08-10/11 (ep-plugin-parity-cuda wave, pre-rejection)
+
+### 2026-08-10T21:15Z — EP provider readiness verification
+Verified provider inventory at HEAD `5fa8cb2a8`. 2 production EPs (CPU, CUDA). Metal/QNN out of scope. CUDA blocked: 9 missing OrtEp fields + no GPU toolkit. CPU plugin compile confirmed. ORT compatibility boundary: ORT 1.27.0 / API version 27. Docs: `EP_PLUGIN_EXPORT.md`, `EP_PLUGIN_EXPORT_ABI_TRUTH.md`, `EP_PLUGIN_EXPORT_INVENTORY.md`, `EP_PLUGIN_EXPORT_SECURITY_AUDIT.md`.
+
+### 2026-08-10T22:42Z — EP plugin export: final docs + PR
+Verified M1 passing at `bad3682`: 82 lib + 21 integration tests, clippy clean. `conformance_two_sessions` no longer ignored (UAF fixed). `docs/ep-plugin/EP_PLUGIN_EXPORT_PR.md` written; Holden verdict 🟡 YELLOW. Durable lesson: always re-run validation at HEAD; do not copy numbers from coordinator memo.
+
+### 2026-08-10T22:56Z — EP plugin PR doc accuracy sweep
+Full stale-claim sweep at `bad3682`. Removed mutex-poison cascade note (fixed). Updated conformance_two_sessions, stress cycles, Holden verdict, security table, validate_dims fix. 21 total tests, 0 ignored.
+
+### 2026-08-10T23:30Z — EP inventory, M2 state, §524 update
+HEAD `5fa8cb2a8`. M2 not yet committed (Pris, Deckard, Nabil untracked). §524: C ABI half complete; nxrt dynamic ABI unimplemented. Recommended two stacked PRs. Docs updated.
+
+### 2026-08-10T23:52Z — Milestone 2 documentation pass
+HEAD `5a5b40877`. M2 largely complete: parity (9 tests), f16/bf16 e2e, device surfaces, CUDA plugin scaffold. Two open items: M2-1 Leon stream leak, M2-2 doc. Clippy regression at `ep.rs:1041,1047`. nxrt dynamic ABI still not implemented.
+
+### 2026-08-11T00:00Z — Final doc correction pass (commit `3ab0ded68`)
+Leon M2-1/M2-2 fixed; clippy clean. 142 ep-plugin tests, 23 cpu-plugin tests. Removed stale clippy blocker paragraph. Both M1 and M2 green and mergeable.
+
+### 2026-08-11 — NXRT ABI doc + CUDA honest status (HEAD: `4212e090e`)
+Found nxrt-abi/nxrt-host crates not committed at HEAD `4212e090e`. Written `docs/architecture/NXRT_ABI.md` and `docs/execution/CUDA_EP_STATUS.md` (honest hardware-column ❌). Integration gap: Nabil vtable model vs Isidore opaque-handle model — incompatible protocols. §524 nxrt row 🔴.
+
+### 2026-08-11 — nxrt ABI Landing Documentation Pass (HEAD `99560c876`)
+ABI reconciled: vtable ownership, struct_size forward compat, NXRT_CAP_KNOWN_MASK. 30/30 abi tests, 9/10 host (env-var race). Conformance runner committed. Docs updated.
+
+### 2026-08-11T01:08Z — Stale-claims sweep (HEAD `087d34888`)
+Removed push-blocked / 9/10-failing / Pris-pending language. nxrt row ✅. §524 complete. 231 tests / 0 failures. CUDA unvalidated; prefetch_lazy_weight Ok(false) stub.

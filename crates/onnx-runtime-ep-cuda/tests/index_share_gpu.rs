@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU parity tests for `pkg.nxrt::IndexShare` v1.
 //!
 //! Each case builds a tiny single-node model with the `onnx-runtime-ir` graph
@@ -18,11 +32,12 @@
 //!   patterns — including ±inf — always pass, and the observed max |Δ| is
 //!   printed for the record.
 //!
-//! Tests skip cleanly when no CUDA device is present.
+//! CPU-only CI reports these tests as ignored unless `gpu-tests` is enabled.
 
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
+    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMetadata, TensorMut,
+    TensorView, WorkspaceView,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
@@ -104,13 +119,15 @@ struct OutputSpec {
     shape: Vec<usize>,
 }
 
-fn gpu() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -321,6 +338,40 @@ fn run_cpu(
     Ok(out_bufs)
 }
 
+fn workspace_view_for<'a>(
+    kernel: &dyn onnx_runtime_ep_api::Kernel,
+    input_views: &[TensorView],
+    buffer: &'a mut Option<DeviceBuffer>,
+    ep: &CudaExecutionProvider,
+) -> onnx_runtime_ep_api::Result<Option<WorkspaceView>> {
+    let metadata = input_views
+        .iter()
+        .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
+        .collect::<Vec<_>>();
+    let requirement = kernel.workspace_requirement(&metadata)?;
+    if requirement.bytes == 0 {
+        return Ok(None);
+    }
+    let bytes = usize::try_from(requirement.bytes).map_err(|_| {
+        onnx_runtime_ep_api::EpError::KernelFailed(format!(
+            "test workspace requirement {} does not fit usize",
+            requirement.bytes
+        ))
+    })?;
+    if buffer
+        .as_ref()
+        .is_none_or(|buffer| buffer.len() < bytes || buffer.alignment() < requirement.alignment)
+    {
+        if let Some(old) = buffer.take() {
+            ep.deallocate(old)?;
+        }
+        *buffer = Some(ep.allocate(bytes.max(1), requirement.alignment)?);
+    }
+    Ok(buffer
+        .as_mut()
+        .map(|buffer| WorkspaceView::new(DevicePtrMut(buffer.as_mut_ptr()), bytes)))
+}
+
 fn run_gpu(
     ep: &CudaExecutionProvider,
     graph: &Graph,
@@ -391,7 +442,9 @@ fn run_gpu(
             )
         })
         .collect();
-    let result = kernel.execute(&input_views, &mut out_views);
+    let mut workspace_buffer = None;
+    let workspace = workspace_view_for(kernel.as_ref(), &input_views, &mut workspace_buffer, ep)?;
+    let result = kernel.execute_with_workspace(&input_views, &mut out_views, workspace);
     drop(out_views);
     drop(input_views);
 
@@ -410,6 +463,9 @@ fn run_gpu(
         ep.deallocate(buffer)?;
     }
     for buffer in out_buffers.drain(..) {
+        ep.deallocate(buffer)?;
+    }
+    if let Some(buffer) = workspace_buffer {
         ep.deallocate(buffer)?;
     }
     result.map(|()| outputs)
@@ -496,9 +552,13 @@ fn sequence(count: usize, offset: f32) -> Vec<f32> {
         .collect()
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn selected_subset_and_trailing_padding_match_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -520,7 +580,7 @@ fn selected_subset_and_trailing_padding_match_cpu() {
 /// f32 CPU oracle fed the *exact* values obtained by rounding every input to
 /// the requested storage type first.
 fn low_precision_matches_exact_rounded_cpu(dtype: DataType, tolerance: f32) {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -571,19 +631,31 @@ fn low_precision_matches_exact_rounded_cpu(dtype: DataType, tolerance: f32) {
     eprintln!("{dtype:?} exact-rounded CPU parity: Y max|Δ|={delta}");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn f16_storage_matches_exact_rounded_cpu_oracle() {
     low_precision_matches_exact_rounded_cpu(DataType::Float16, 1e-3);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn bf16_storage_matches_exact_rounded_cpu_oracle() {
     low_precision_matches_exact_rounded_cpu(DataType::BFloat16, 1e-2);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_shared_indices_match_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 4,
         kv_heads: 2,
@@ -610,9 +682,13 @@ fn gqa_shared_indices_match_cpu() {
     eprintln!("gqa_shared_indices: Y max|Δ|={delta}");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn causal_and_padding_bias_composition_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 1,
         kv_heads: 1,
@@ -650,9 +726,13 @@ fn causal_and_padding_bias_composition_matches_cpu() {
     eprintln!("causal_padding_bias: Y max|Δ|={delta}");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn int32_indices_and_broadcast_bias_match_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 2,
         kv_heads: 1,
@@ -685,9 +765,13 @@ fn int32_indices_and_broadcast_bias_match_cpu() {
 /// single value everywhere), so the CUDA kernel must too. Guards against the
 /// claim-then-fail divergence where the gate (delegating to the CPU oracle)
 /// claims a scalar-bias node but the kernel rejects rank 0 at execution.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn scalar_bias_broadcasts_and_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -717,9 +801,13 @@ fn scalar_bias_broadcasts_and_matches_cpu() {
 
 /// prefill → decode → decode, threading present_key/present_value into the next
 /// step's past_key/past_value. Every step is checked against the CPU oracle.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn prefill_then_two_decodes_thread_present_to_past() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let head_size = 4;
     let q_heads = 4;
     let kv_heads = 2;
@@ -810,9 +898,13 @@ fn prefill_then_two_decodes_thread_present_to_past() {
     assert_eq!(past_seq, 8);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn single_output_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -831,9 +923,13 @@ fn single_output_matches_cpu() {
     eprintln!("single_output: Y max|Δ|={delta}");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn captured_f16_replay_is_byte_identical_to_eager_and_preserves_latch() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -935,6 +1031,8 @@ fn run_gpu_capture_replay(
         .iter()
         .map(|len| ep.allocate((*len).max(1), 256))
         .collect::<onnx_runtime_ep_api::Result<_>>()?;
+    let mut workspace_buffer = None;
+    let workspace = workspace_view_for(kernel.as_ref(), &input_views, &mut workspace_buffer, ep)?;
 
     let make_out_views = |out_buffers: &mut [DeviceBuffer]| -> Vec<TensorMut> {
         out_buffers
@@ -960,7 +1058,7 @@ fn run_gpu_capture_replay(
     // capture eligibility.
     {
         let mut out_views = make_out_views(&mut out_buffers);
-        kernel.execute(&input_views, &mut out_views)?;
+        kernel.execute_with_workspace(&input_views, &mut out_views, workspace)?;
     }
     runtime.synchronize()?;
     assert!(
@@ -997,7 +1095,7 @@ fn run_gpu_capture_replay(
             })?;
         }
         let mut out_views = make_out_views(&mut out_buffers);
-        let record = kernel.execute(&input_views, &mut out_views);
+        let record = kernel.execute_with_workspace(&input_views, &mut out_views, workspace);
         drop(out_views);
         // Always end capture to leave the stream clean, even on error.
         // SAFETY: `stream` is capturing; `graph_handle` is a valid out-pointer.
@@ -1051,6 +1149,9 @@ fn run_gpu_capture_replay(
     for buffer in out_buffers.drain(..) {
         ep.deallocate(buffer)?;
     }
+    if let Some(buffer) = workspace_buffer {
+        ep.deallocate(buffer)?;
+    }
     captured.map(|()| outputs)
 }
 
@@ -1059,9 +1160,13 @@ fn run_gpu_capture_replay(
 /// AND bit-parity (present cache) / tight-tolerance (`Y`) against the independent
 /// CPU oracle at every step. Threads each step's present_key/present_value into
 /// the next step's past_key/past_value, exactly like the eager sequence test.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn captured_prefill_then_two_decodes_match_eager_and_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let head_size = 4;
     let q_heads = 4;
     let kv_heads = 2;
@@ -1190,9 +1295,13 @@ fn captured_prefill_then_two_decodes_match_eager_and_cpu() {
 /// Eager execution rejects a malformed `selected_indices` row (an index that
 /// follows trailing `-1` padding) exactly like the CPU oracle, and the CUDA EP
 /// surfaces the same hard error rather than silently producing garbage.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn eager_rejects_invalid_indices() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -1221,6 +1330,10 @@ fn eager_rejects_invalid_indices() {
 /// issuing an out-of-bounds device load. Warmup uses a **valid** row (so capture
 /// is eligible and the scratch is sized); the captured replay then observes an
 /// out-of-range index written into the same stable index buffer.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn captured_replay_latches_capture_error_on_invalid_index() {
     use cudarc::driver::sys::{
@@ -1228,7 +1341,7 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
         cuGraphInstantiateWithFlags, cuGraphLaunch, cuStreamBeginCapture_v2, cuStreamEndCapture,
     };
 
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -1292,6 +1405,9 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
     let out_len = specs[0].shape.iter().product::<usize>() * specs[0].dtype.byte_size();
     let out_stride = compute_contiguous_strides(&specs[0].shape);
     let mut out_buffer = ep.allocate(out_len.max(1), 256).expect("alloc out");
+    let mut workspace_buffer = None;
+    let workspace = workspace_view_for(kernel.as_ref(), &input_views, &mut workspace_buffer, &ep)
+        .expect("workspace");
     let make_out = |buffer: &mut DeviceBuffer| -> Vec<TensorMut> {
         vec![TensorMut::new(
             DevicePtrMut(buffer.as_mut_ptr()),
@@ -1309,7 +1425,7 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
     {
         let mut out = make_out(&mut out_buffer);
         kernel
-            .execute(&input_views, &mut out)
+            .execute_with_workspace(&input_views, &mut out, workspace)
             .expect("warmup execute");
     }
     runtime.synchronize().expect("sync");
@@ -1346,7 +1462,7 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
             })?;
         }
         let mut out = make_out(&mut out_buffer);
-        let record = kernel.execute(&input_views, &mut out);
+        let record = kernel.execute_with_workspace(&input_views, &mut out, workspace);
         drop(out);
         // SAFETY: `stream` is capturing; `graph_handle` is a valid out-pointer.
         let end = unsafe { cuStreamEndCapture(stream, &mut graph_handle) }
@@ -1390,6 +1506,9 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
     runtime.reset_capture_error().expect("reset latch");
 
     ep.deallocate(out_buffer).expect("free out");
+    if let Some(buffer) = workspace_buffer {
+        ep.deallocate(buffer).expect("free workspace");
+    }
     for buffer in buffers.into_iter().flatten() {
         ep.deallocate(buffer).expect("free input");
     }
@@ -1403,9 +1522,13 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
 /// `attention_bias` frontier. The CUDA kernel derives that frontier on-device
 /// (capture-safe) and must reproduce the CPU oracle: `Y` within tolerance and
 /// the aliased present bit-exact.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn capacity_present_aliases_past_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     // Fixed capacity 5, one current token, logical valid length 4 (bias finite
     // for k in [0,4), -inf at k=4). write_pos = valid_len - current_seq = 3, so
     // the current token overwrites capacity row 3; row 4 is never gathered.

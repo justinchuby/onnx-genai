@@ -1,4 +1,4 @@
-//! Additional unary floating-point elementwise math kernels (`docs/ORT2.md` §4.4).
+//! Additional unary floating-point elementwise math kernels (`docs/architecture/ORT2.md` §4.4).
 //!
 //! These mirror the [`elementwise`](super::elementwise) unary family (a straight
 //! per-element map through [`to_dense_f32_widen`]/[`write_dense_f32_narrow`]) but
@@ -21,11 +21,12 @@
 //!   the same stability reason.
 //! * `Softsign` — `x / (1 + |x|)`.
 
-use crate::dtype::{to_dense, to_dense_f32_widen, write_dense, write_dense_f32_narrow};
+use crate::dtype::{to_dense, to_dense_f32_widen, write_dense};
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
+use super::simd_activations;
 
 /// The per-element operation for a unary math kernel.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -186,9 +187,19 @@ math_factory!(TanFactory, MathOp::Tan);
 
 impl UnaryMathKernel {
     fn execute_f32(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        let x = to_dense_f32_widen(self.op.name(), &inputs[0])?;
-        let y: Vec<f32> = x.iter().map(|&v| self.op.apply(v)).collect();
-        write_dense_f32_narrow(self.op.name(), &mut outputs[0], &y)
+        let name = self.op.name();
+        let x = to_dense_f32_widen(name, &inputs[0])?;
+        let op = self.op;
+        // Vectorised on AVX2+FMA; falls back to `MathOp::apply`'s exact scalar
+        // form otherwise. See `kernels::simd_activations`.
+        simd_activations::write_mapped(name, &mut outputs[0], &x, |x, y| match op {
+            MathOp::Sigmoid => simd_activations::sigmoid_f32_slice(x, y),
+            op => {
+                for (o, &v) in y.iter_mut().zip(x.iter()) {
+                    *o = op.apply(v);
+                }
+            }
+        })
     }
 }
 

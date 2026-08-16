@@ -18,3 +18,14 @@
 - Merged 14 decision inbox notes, wrote Deckard/Leon orchestration logs, updated session focus, and checked archive/history gates; no history file exceeded 15 KB.
 ## 2026-07-28T11:35:49Z — Decision-ledger compaction rebase lesson
 - Size-compaction of shared append-only files is not rebase-safe: concurrent appends can silently reinflate `.squad/decisions.md` while preserving a compacted header. Re-run compaction against tip immediately before merging a compaction PR.
+
+## 2026-08-12T00:15:00Z — MatMulNBits upstream workstream log
+
+- Merged 5 inbox drops (chew, cohaagen×2, gaff, sebastian) into decisions.md.
+- Added wave entry with 5 durable lessons to decisions.md.
+- Wrote 7 orchestration logs (provenance, cohaagen-audit, cohaagen-impl, sebastian, chew, gaff, coordinator).
+- Wrote session log `2026-08-12T00-15-00Z-matmulnbits-upstream.md`.
+- Updated histories: cohaagen, chew, gaff, sebastian.
+- Compacted chew (10→2 live dated entries), cohaagen (23→3), gaff (11→3) — all exceeded 8-entry threshold.
+- decisions.md: 33,989 → 37,127 bytes (under 50KB archive threshold; no archive needed).
+- Note: spawn prompt requested push to `squad/ep-plugin-parity-cuda`; charter's main-protection concern does not apply to this feature branch.

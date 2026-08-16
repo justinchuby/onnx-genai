@@ -13,14 +13,14 @@ pub mod policy;
 pub mod pressure;
 
 pub use byte_budget::{
-    BudgetSnapshot, ByteBudget, ByteBudgetError, ByteBudgetReservation,
+    AdmissionCeiling, BudgetSnapshot, ByteBudget, ByteBudgetError, ByteBudgetReservation,
     ReconfigureOutcome as ByteBudgetReconfigureOutcome,
 };
 pub use governor::{
     CapacityProvider, CapacityProviders, DerivedBudget, EvictionTier, FixedCapacity,
     GovernorReconfigureOutcome, GovernorSnapshot, ModelKvConfig, ResolvedLimits, ResourceError,
-    ResourceGovernor, ResourceLimit, ResourceLimits, TierSnapshot, VramBreakdown, derive_kv_budget,
-    resolve_limit,
+    ResourceGovernor, ResourceLimit, ResourceLimits, TierSnapshot, UnknownCapacity, VramBreakdown,
+    derive_kv_budget, resolve_limit,
 };
 pub use policy::FairSharePolicy;
 pub use pressure::{

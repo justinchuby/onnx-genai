@@ -1,6 +1,6 @@
 [package]
 name = "onnx-runtime-eager"
-description = "Eager (single-op) execution engine for the ORT 2.0 runtime: dispatch individual ONNX ops to EP kernels without building a graph (docs/EAGER.md)"
+description = "Eager (single-op) execution engine for the ORT 2.0 runtime: dispatch individual ONNX ops to EP kernels without building a graph (docs/execution/EAGER.md)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,3 +17,6 @@ thiserror = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+onnx-runtime-memory-governor = { workspace = true }

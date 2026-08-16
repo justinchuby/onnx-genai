@@ -1,7 +1,7 @@
 //! # `onnx-runtime-optimizer`
 //!
 //! Device-independent graph→graph optimization passes for the ORT 2.0 runtime
-//! (see `docs/ORT2.md` §18 "Optimization Passes"). This is the first Phase-2
+//! (see `docs/architecture/ORT2.md` §18 "Optimization Passes"). This is the first Phase-2
 //! crate: pure, safe Rust graph rewriting over [`onnx_runtime_ir`] — **no**
 //! CUDA, no ORT C library, no FFI.
 //!
@@ -25,7 +25,7 @@
 //!
 //! ### Deferred (Phase 2b / Phase 3)
 //!
-//! The full pipeline in `docs/ORT2.md` §18.1 also lists passes that depend on
+//! The full pipeline in `docs/architecture/ORT2.md` §18.1 also lists passes that depend on
 //! crates or analyses not yet built. They are intentionally **not** implemented
 //! here and are listed in [`default_passes`]'s source in their eventual
 //! pipeline position: `ShapeInference` (the loader owns inference for now),

@@ -1,8 +1,22 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU parity for issue #67 CUDA coverage batch 10.
 
 mod common;
 
-use common::{assert_close, cuda_ep, decode_floats, float_input, input, run_cpu, run_cuda};
+use common::{assert_close, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda};
 use onnx_runtime_ir::{Attribute, DataType};
 
 fn tolerance(dtype: DataType) -> f32 {
@@ -24,9 +38,13 @@ fn assert_float_outputs(label: &str, dtype: DataType, cuda: &[Vec<u8>], cpu: &[V
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn affine_grid_matches_cpu_for_two_and_three_dimensional_grids() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
         for (theta_shape, theta, size, output_shape, align_corners) in [
             (
@@ -59,9 +77,13 @@ fn affine_grid_matches_cpu_for_two_and_three_dimensional_grids() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn batch_normalization_matches_cpu_across_float_storage_types() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let x = [-3.0, -1.0, 2.0, 4.0, 0.5, 1.5, -2.5, 8.0];
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
         let inputs = vec![
@@ -79,9 +101,13 @@ fn batch_normalization_matches_cpu_across_float_storage_types() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn compress_matches_cpu_for_negative_axis_and_flattened_selection() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let axis_inputs = vec![
         input(DataType::Int32, &[2, 4], &[1i32, 2, 3, 4, 5, 6, 7, 8]),
         input(DataType::Bool, &[3], &[false, true, true]),
@@ -112,9 +138,13 @@ fn compress_matches_cpu_for_negative_axis_and_flattened_selection() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn dynamic_quantize_linear_matches_cpu_for_ranges_and_constants() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     for values in [
         vec![-5.0f32, -1.25, 0.0, 0.5, 4.0, 12.0],
         vec![3.25f32; 7],
@@ -141,7 +171,7 @@ fn dynamic_quantize_linear_matches_cpu_for_ranges_and_constants() {
 }
 
 fn global_pool_case(op: &str, opset: u64, attributes: &[(&str, Attribute)]) {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let values = [
         -3.0f32, 1.0, 2.0, 8.0, -4.0, 0.5, 3.0, 7.0, 6.0, -2.0, 1.5, 0.25,
     ];
@@ -154,24 +184,40 @@ fn global_pool_case(op: &str, opset: u64, attributes: &[(&str, Attribute)]) {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn global_average_pool_matches_cpu() {
     global_pool_case("GlobalAveragePool", 1, &[]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn global_max_pool_matches_cpu() {
     global_pool_case("GlobalMaxPool", 1, &[]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn global_lp_pool_matches_cpu_for_nondefault_p() {
     global_pool_case("GlobalLpPool", 2, &[("p", Attribute::Int(3))]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn lp_normalization_matches_cpu_for_negative_and_interior_axes() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let values = [
         1.0f32, -2.0, 3.0, 4.0, -5.0, 6.0, -7.0, 8.0, 9.0, -10.0, 11.0, 12.0,
     ];

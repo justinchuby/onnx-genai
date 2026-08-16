@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU parity for `com.microsoft::GatherBlockQuantized` (issue #67): the CUDA EP
 //! blockwise-quantized embedding lookup (already registered; this suite plus the
 //! `CUDA_COVERED_OPS` entry close the coverage-of-coverage gap). Checked against
@@ -7,7 +21,7 @@
 
 mod common;
 
-use common::{assert_close, cuda_ep, decode_floats, float_input, input, run_cpu, run_cuda};
+use common::{assert_close, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda};
 use onnx_runtime_ir::{Attribute, DataType};
 
 const OP: &str = "GatherBlockQuantized";
@@ -68,9 +82,13 @@ fn check(
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gather_block_quantized_bits8_matches_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     // 4 vocab rows × 16 hidden; block_size 16 → one block per row (4 blocks).
     let data: Vec<u8> = (0..64u16).map(|v| (v * 3 % 251) as u8).collect();
     let scales = [0.05f32, -0.1, 0.2, 0.03];
@@ -94,9 +112,13 @@ fn gather_block_quantized_bits8_matches_cpu() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gather_block_quantized_bits4_matches_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     // 4 rows × 32 logical (packed → 16 uint8 bytes per row), block_size 16 →
     // 2 blocks per row (even, so CPU per-row and CUDA global nibble-packing of
     // zero_points coincide — the layout real int4 embeddings export).

@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! CUDA correctness checks for standard ops needed by opset-24 models.
 
 use half::{bf16, f16};
@@ -29,17 +43,15 @@ fn tensor<T: Copy>(dtype: DataType, shape: &[usize], values: &[T]) -> Tensor {
     }
 }
 
-fn cuda_ep() -> Option<CudaExecutionProvider> {
+fn require_cuda() -> CudaExecutionProvider {
     match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
-        Ok(Ok(ep)) => Some(ep),
-        Ok(Err(error)) => {
-            eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            None
-        }
-        Err(_) => {
-            eprintln!("skip: CUDA runtime library loading panicked");
-            None
-        }
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -120,9 +132,13 @@ fn decode_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn constantofshape_opset24_fills_float_and_int_outputs() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let shape = tensor(DataType::Int64, &[2], &[2_i64, 3]);
 
     let mut float_node = Node::new(NodeId(0), "ConstantOfShape", vec![], vec![]);
@@ -175,9 +191,13 @@ fn gelu_tanh(x: f32) -> f32 {
                 .tanh())
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gelu_opset24_exact_and_tanh_include_fp16_and_bf16() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let x = [-3.0_f32, -1.0, -0.25, 0.0, 0.5, 2.0];
 
     let exact_node = Node::new(NodeId(0), "Gelu", vec![], vec![]);
@@ -247,9 +267,13 @@ fn gelu_opset24_exact_and_tanh_include_fp16_and_bf16() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn onehot_opset24_matches_scalar_oracle_with_negative_indices() {
-    let Some(ep) = cuda_ep() else { return };
+    let ep = require_cuda();
     let mut node = Node::new(NodeId(0), "OneHot", vec![], vec![]);
     node.attributes.insert("axis".into(), Attribute::Int(1));
     let got = decode_f32(&run(

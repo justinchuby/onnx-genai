@@ -7,6 +7,31 @@
 //!
 //! Design: reference the `ort` crate (pyke) for patterns, but use latest ORT directly.
 
+#[cfg(all(
+    feature = "cuda",
+    not(any(
+        feature = "cuda-12060",
+        feature = "cuda-12080",
+        feature = "cuda-12090",
+        feature = "cuda-13000"
+    ))
+))]
+compile_error!(
+    "onnx-genai CUDA build: no CUDA version selected. Enable exactly one of cuda-12060 | cuda-12080 | cuda-12090 | cuda-13000."
+);
+
+#[cfg(any(
+    all(feature = "cuda-12060", feature = "cuda-12080"),
+    all(feature = "cuda-12060", feature = "cuda-12090"),
+    all(feature = "cuda-12060", feature = "cuda-13000"),
+    all(feature = "cuda-12080", feature = "cuda-12090"),
+    all(feature = "cuda-12080", feature = "cuda-13000"),
+    all(feature = "cuda-12090", feature = "cuda-13000")
+))]
+compile_error!(
+    "onnx-genai CUDA build: multiple CUDA versions selected; cudarc bindings cannot compile with more than one. Enable exactly one of cuda-12060 | cuda-12080 | cuda-12090 | cuda-13000 (and set default-features = false on inter-crate deps if you override the default)."
+);
+
 pub mod allocator;
 pub mod binding;
 pub mod chat_template;
@@ -36,10 +61,11 @@ pub use binding::IoBinding;
 pub use chat_template::{ChatMessage, ChatRole, ChatTemplate};
 pub use component::{OrtComponentSession, OrtComponentSessionRef};
 pub use decode::{
-    BatchedDecodeSession, BatchedSharedBufferDecodeSession, BatchedStaticCacheDecodeSession,
-    DecodeKvMode, DecodeSession, DecodeSessionOptions, DeviceSampleParams,
-    SharedBufferBatchOptions, StaticCacheBindingMode, StaticCacheBufferInfo,
-    StaticCacheDecodeOptions, StaticCacheDecodeSession, StaticCacheSignature,
+    BatchStepLogits, BatchedDecodeSession, BatchedSharedBufferDecodeSession,
+    BatchedStaticCacheDecodeSession, DecodeKvMode, DecodeSession, DecodeSessionOptions,
+    DeviceSampleParams, LogitsD2hStats, SharedBufferBatchOptions, StaticCacheBindingMode,
+    StaticCacheBufferInfo, StaticCacheDecodeOptions, StaticCacheDecodeSession,
+    StaticCacheSignature,
 };
 pub use eagle3::{
     Eagle3DecodeOptions, Eagle3DecodeSession, Eagle3DraftKvMode, Eagle3HeadSignature,
@@ -49,7 +75,8 @@ pub use env::Environment;
 pub use error::{OrtError, Result};
 pub use loader::{
     ModelDirectory, PipelineModelDirectory, PipelineModels, PipelineTokenizerPaths,
-    graph_io_from_model_path, model_weight_bytes,
+    graph_io_from_model_path, graph_io_from_model_path_for_kv_pairs,
+    graph_io_from_model_path_for_names, model_weight_bytes,
 };
 pub use mtp::{
     MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadSignature, MtpStepOutput,

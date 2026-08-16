@@ -36,6 +36,43 @@ struct MappedFile {
 
 static NEXT_MAPPING_ID: AtomicUsize = AtomicUsize::new(1);
 
+impl WeightStore {
+    /// Total bytes of external-data file currently mapped by this store.
+    ///
+    /// This is *file* size, which is only an upper bound on the weights the
+    /// graph references — see [`ReferencedWeightBytes`]. Compare the two with
+    /// [`Self::unreferenced_external_bytes`] rather than treating either alone
+    /// as "how big is this model".
+    #[must_use]
+    pub fn mapped_external_bytes(&self) -> u64 {
+        self.mmaps
+            .values()
+            .map(|mapped| mapped.mmap.len() as u64)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Mapped external bytes that no initializer points at.
+    ///
+    /// Nonzero means the blob carries dead weight — most commonly an orphaned
+    /// prefix left by a re-export that appended fresh tensors without
+    /// truncating the original. It is worth surfacing because **nothing fails**
+    /// when it happens: the model loads and produces byte-identical output, so
+    /// the only symptom is a file twice the size it should be. `qwen14b-zp`
+    /// carried 8.32 GB of it (50.02% of the blob), which cost double the disk,
+    /// double the page-locked host RAM on the memory-mapped weight path, and —
+    /// before #856 — a weight budget derived from file length that was wrong by
+    /// exactly 2.00x (#853).
+    ///
+    /// Saturates at zero: a store may legitimately map a file whose declared
+    /// lengths exceed what is mapped (a truncated or shared blob), and that is
+    /// a different failure with its own error path.
+    #[must_use]
+    pub fn unreferenced_external_bytes(&self, referenced: &ReferencedWeightBytes) -> u64 {
+        self.mapped_external_bytes()
+            .saturating_sub(referenced.external)
+    }
+}
+
 /// Quantization geometry needed to interpret one expert's packed tensor slice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExpertQuantization {
@@ -589,6 +626,30 @@ impl WeightStore {
         Some((mmap.id, *offset, *length))
     }
 
+    /// Resolve a validated external-data region by stable mmap id.
+    ///
+    /// Lazy device weight paging carries this id instead of a path so the hot
+    /// page-in path can copy directly from the live mmap. That prevents the
+    /// WDDM offload failure mode where every page-in first rebuilt an owned host
+    /// tensor and spent most of decode time in redundant CPU materialization.
+    pub fn mmap_region_bytes(&self, mapping_id: usize, offset: usize, len: usize) -> Option<&[u8]> {
+        let mmap = self.mmaps.values().find(|mapped| mapped.id == mapping_id)?;
+        mmap.mmap.get(offset..offset.checked_add(len)?)
+    }
+
+    /// Return the whole live mmap backing `mapping_id`.
+    ///
+    /// The zero-copy hybrid (#864) registers an entire mapping once with
+    /// `cuMemHostRegister(READ_ONLY | DEVICEMAP)` so that every weight's device
+    /// pointer (from `cuMemHostGetDevicePointer`) is contiguous for its full
+    /// length — a per-weight registration would only be contiguous up to the
+    /// registration boundary, so a weight spanning two registrations would read
+    /// past valid device addresses.
+    pub fn mmap_full_bytes(&self, mapping_id: usize) -> Option<&[u8]> {
+        let mmap = self.mmaps.values().find(|mapped| mapped.id == mapping_id)?;
+        Some(&mmap.mmap[..])
+    }
+
     fn external_bytes(&self, path: &Path, offset: usize, length: usize) -> Option<&[u8]> {
         let mmap = self.mmaps.get(path)?;
         mmap.mmap.get(offset..offset.checked_add(length)?)
@@ -613,6 +674,74 @@ impl WeightStore {
             .insert(path.to_path_buf(), MappedFile { id, mmap });
         Ok(())
     }
+}
+
+/// Bytes of initializer payload the graph actually **references**, split into
+/// inline (inside the protobuf) and external (in sibling data files).
+///
+/// This exists because a model's on-disk size is only an upper bound on its
+/// weights. An external-data file may contain regions no initializer points at
+/// — most commonly when a re-export appends fresh tensors and never truncates
+/// the original, leaving an orphaned prefix. `qwen14b-zp` is exactly 50% such
+/// dead space, which made the runtime believe it had 2.00x more weights than it
+/// does and skewed every budget and residency decision derived from that number
+/// (#853).
+///
+/// Parses only the graph protobuf. It never opens, maps, or reads the external
+/// data files, so it stays cheap enough for the load-time budget path: the
+/// `.onnx` is typically a few MB even when the weights are tens of GB.
+///
+/// Initializers with an explicit `length` contribute that; external ones
+/// without a declared length fall back to the geometry implied by their shape
+/// and dtype, which is what [`resolve_initializer`] would use.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReferencedWeightBytes {
+    pub inline: u64,
+    pub external: u64,
+}
+
+impl ReferencedWeightBytes {
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.inline.saturating_add(self.external)
+    }
+}
+
+/// Sum the initializer payload [`ReferencedWeightBytes`] a model's graph
+/// references. See that type for why file size is not a substitute.
+#[must_use]
+pub fn referenced_weight_bytes(model: &ModelProto) -> ReferencedWeightBytes {
+    let mut totals = ReferencedWeightBytes::default();
+    let Some(graph) = model.graph.as_ref() else {
+        return totals;
+    };
+    for init in &graph.initializer {
+        let dims: Vec<usize> = init.dims.iter().map(|&d| d.max(0) as usize).collect();
+        let declared_geometry = DataType::from_onnx(init.data_type).and_then(|dtype| {
+            TensorData::from_raw(dtype, dims, Vec::new()).checked_expected_bytes()
+        });
+        if init.data_location == tensor_proto::DataLocation::External as i32 {
+            let declared_length = init
+                .external_data
+                .iter()
+                .find(|kv| kv.key == "length")
+                .and_then(|kv| kv.value.parse::<u64>().ok());
+            let bytes = declared_length
+                .or_else(|| declared_geometry.map(|bytes| bytes as u64))
+                .unwrap_or(0);
+            totals.external = totals.external.saturating_add(bytes);
+        } else {
+            // Inline payloads are already counted by the graph file's own size,
+            // but report them so a caller can tell the two apart.
+            let bytes = if init.raw_data.is_empty() {
+                declared_geometry.map_or(0, |bytes| bytes as u64)
+            } else {
+                init.raw_data.len() as u64
+            };
+            totals.inline = totals.inline.saturating_add(bytes);
+        }
+    }
+    totals
 }
 
 /// Resolve all initializers, memory-mapping external data relative to
@@ -896,6 +1025,135 @@ mod tests {
             .expect_err("overflowing external tensor geometry must be rejected");
         assert!(
             matches!(error, LoaderError::GraphBuild(message) if message.contains("geometry overflows"))
+        );
+
+        drop(store);
+        std::fs::remove_file(path).expect("remove external data");
+    }
+
+    #[test]
+    fn unreferenced_external_bytes_reports_an_orphaned_blob_prefix() {
+        // The failure this guards is silent: a blob that carries a superseded
+        // generation of weights still loads and still produces byte-identical
+        // output, so the only symptom is a file twice the size it should be.
+        // `qwen14b-zp` carried 8.32 GB of exactly this (50.02% of the blob) for
+        // months, and before #856 it made the runtime believe the model was
+        // 2.00x larger than it is (#853).
+        //
+        // The control that matters is the *nonzero* case: a check that only
+        // ever returns 0 on a healthy model proves nothing, so this maps a file
+        // whose second half is referenced and whose first half is not, and
+        // asserts the dead prefix is reported exactly.
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let model_dir = std::env::current_dir().expect("cwd").join("target");
+        std::fs::create_dir_all(&model_dir).expect("create target");
+        let file_name = format!("orphaned-prefix-blob-{}-{stamp}.bin", std::process::id());
+        let path = model_dir.join(&file_name);
+
+        // 256 bytes on disk; only the last 128 are referenced.
+        const BLOB_LEN: usize = 256;
+        const LIVE_LEN: usize = 128;
+        std::fs::write(&path, vec![0u8; BLOB_LEN]).expect("write external data");
+
+        let initializer = TensorProto {
+            name: "live".to_string(),
+            data_type: DataType::Uint8.to_onnx(),
+            dims: vec![LIVE_LEN as i64],
+            external_data: vec![
+                crate::proto::onnx::StringStringEntryProto {
+                    key: "location".to_string(),
+                    value: file_name,
+                },
+                crate::proto::onnx::StringStringEntryProto {
+                    key: "offset".to_string(),
+                    value: LIVE_LEN.to_string(),
+                },
+                crate::proto::onnx::StringStringEntryProto {
+                    key: "length".to_string(),
+                    value: LIVE_LEN.to_string(),
+                },
+            ],
+            data_location: tensor_proto::DataLocation::External as i32,
+            ..Default::default()
+        };
+
+        let mut store = WeightStore::new();
+        resolve_initializer(&mut store, &initializer, &model_dir).expect("resolve live tensor");
+
+        let model = ModelProto {
+            graph: Some(crate::proto::onnx::GraphProto {
+                initializer: vec![initializer],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let referenced = referenced_weight_bytes(&model);
+
+        assert_eq!(referenced.external, LIVE_LEN as u64);
+        assert_eq!(store.mapped_external_bytes(), BLOB_LEN as u64);
+        assert_eq!(
+            store.unreferenced_external_bytes(&referenced),
+            (BLOB_LEN - LIVE_LEN) as u64,
+            "the orphaned prefix must be reported, not rounded away"
+        );
+
+        drop(store);
+        std::fs::remove_file(path).expect("remove external data");
+    }
+
+    #[test]
+    fn unreferenced_external_bytes_is_zero_for_a_fully_referenced_blob() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let model_dir = std::env::current_dir().expect("cwd").join("target");
+        std::fs::create_dir_all(&model_dir).expect("create target");
+        let file_name = format!("packed-blob-{}-{stamp}.bin", std::process::id());
+        let path = model_dir.join(&file_name);
+
+        const BLOB_LEN: usize = 128;
+        std::fs::write(&path, vec![0u8; BLOB_LEN]).expect("write external data");
+
+        let initializer = TensorProto {
+            name: "live".to_string(),
+            data_type: DataType::Uint8.to_onnx(),
+            dims: vec![BLOB_LEN as i64],
+            external_data: vec![
+                crate::proto::onnx::StringStringEntryProto {
+                    key: "location".to_string(),
+                    value: file_name,
+                },
+                crate::proto::onnx::StringStringEntryProto {
+                    key: "offset".to_string(),
+                    value: "0".to_string(),
+                },
+                crate::proto::onnx::StringStringEntryProto {
+                    key: "length".to_string(),
+                    value: BLOB_LEN.to_string(),
+                },
+            ],
+            data_location: tensor_proto::DataLocation::External as i32,
+            ..Default::default()
+        };
+
+        let mut store = WeightStore::new();
+        resolve_initializer(&mut store, &initializer, &model_dir).expect("resolve live tensor");
+
+        let model = ModelProto {
+            graph: Some(crate::proto::onnx::GraphProto {
+                initializer: vec![initializer],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            store.unreferenced_external_bytes(&referenced_weight_bytes(&model)),
+            0
         );
 
         drop(store);

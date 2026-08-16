@@ -38,11 +38,13 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    DevicePtr, DevicePtrMut, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
 
 use super::softmax::resolve_axis;
 
@@ -371,6 +373,19 @@ extern "C" __global__ void rmsnorm_bf16(
     const int tid = threadIdx.x;
     const int nt = blockDim.x;
 
+    // Parallel f32 tree reduction of the mean-square. The bf16 activations
+    // upcast to f32 losslessly, then accumulate in f32 (matmul-free: just x*x),
+    // so precision is full-f32 throughout; only the *summation order* differs
+    // from the serial `rmsnorm_f32` reference (tree vs strict left-to-right).
+    // A pairwise tree is at least as accurate as sequential accumulation (lower
+    // error growth, O(log n) vs O(n)), and a per-element f64 oracle confirms the
+    // tree result is within a couple of ulp of the f64 ground-truth RMS. Because
+    // decode feeds an accuracy-level-4 int4 MatMulNBits (quantized activations),
+    // a sub-ulp normalization difference can still flip a downstream int8
+    // rounding boundary, so greedy token ids stay byte-exact for the first ~38
+    // steps then exhibit expected sub-ulp greedy sensitivity. The strict
+    // CPU-order serial path remains available via
+    // ONNX_GENAI_CUDA_DISABLE_NORM_CAST_FOLD=1 (routes back to rmsnorm_f32).
     float ss = 0.0f;
     for (int j = tid; j < norm_size; j += nt) {
         const float xv = __bfloat162float(x[base + j]);
@@ -398,6 +413,7 @@ extern "C" __global__ void rmsnorm_bf16(
 /// The residual sum supports right-aligned NumPy broadcasting for `skip`.
 const SKIP_RMSNORM_SRC: &str = r#"
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 __device__ __forceinline__ float load_skip_val(
     const void* values, const int is_half, const int index) {
@@ -406,7 +422,43 @@ __device__ __forceinline__ float load_skip_val(
         : ((const float*)values)[index];
 }
 
-template <bool DenseSkip>
+// Warp-shuffle tail of the launch-invariant `red[tid]` power-of-two tree.
+//
+// Precondition: `red[tid]` already holds this thread's fp32 partial and the
+// caller has executed a `__syncthreads()`. `nt` is a power of two (the block
+// size chosen by `reduction_launch_config`).
+//
+// The inter-warp offsets (>= 32) combine threads living in DIFFERENT warps, so
+// they must stay in shared memory with a `__syncthreads()` barrier. Once the
+// tree has collapsed to `offset == 32`, `red[0..31]` hold the 32 per-warp
+// partial sums. The remaining offsets 16,8,4,2,1 pair lane `tid` with lane
+// `tid+offset` ENTIRELY inside warp 0 — exactly the pairing and order that
+// `__shfl_down_sync(0xffffffff, v, offset)` produces — so warp 0 finishes the
+// reduction in registers, dropping 5 `__syncthreads` + 5 shared read/write
+// rounds. The accumulation order (and `__fadd_rn` round-to-nearest fp32 add) is
+// BIT-IDENTICAL to the full shared-memory tree; see the `warp_reduce` unit tests
+// which assert byte-for-byte equality of the `y` output flag-off vs flag-on.
+//
+// After this returns, `red[0]` holds the total for every thread to read.
+__device__ __forceinline__ float skip_rmsnorm_warp_tail(
+    float* red, const int tid, const int nt) {
+    for (int offset = nt >> 1; offset >= 32; offset >>= 1) {
+        if (tid < offset) red[tid] = __fadd_rn(red[tid], red[tid + offset]);
+        __syncthreads();
+    }
+    if (tid < 32) {
+        float v = (tid < nt) ? red[tid] : 0.0f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, o));
+        }
+        if (tid == 0) red[0] = v;
+    }
+    __syncthreads();
+    return red[0];
+}
+
+template <bool DenseSkip, bool WarpTail>
 __device__ __forceinline__ void skip_rmsnorm_f32_tpl(
     const float* input,
     const float* skip,
@@ -453,16 +505,24 @@ __device__ __forceinline__ void skip_rmsnorm_f32_tpl(
     }
 
     // Fixed block tree: every thread owns the same strided subsequence, then
-    // power-of-two offsets combine partials in a launch-invariant order.
+    // power-of-two offsets combine partials in a launch-invariant order. With
+    // WarpTail, the intra-warp offsets (<= 16) finish via __shfl_down_sync in
+    // registers — bit-identical pairing/order to the full shared tree.
     red[tid] = sum_squares;
     __syncthreads();
-    for (int offset = nt >> 1; offset > 0; offset >>= 1) {
-        if (tid < offset) {
-            red[tid] = __fadd_rn(red[tid], red[tid + offset]);
+    float reduced;
+    if (WarpTail) {
+        reduced = skip_rmsnorm_warp_tail(red, tid, nt);
+    } else {
+        for (int offset = nt >> 1; offset > 0; offset >>= 1) {
+            if (tid < offset) {
+                red[tid] = __fadd_rn(red[tid], red[tid + offset]);
+            }
+            __syncthreads();
         }
-        __syncthreads();
+        reduced = red[0];
     }
-    const float inv_std = 1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
+    const float inv_std = 1.0f / sqrtf(reduced / (float)norm_size + epsilon);
     if (tid == 0) {
         if (mean_out) mean_out[g] = 0.0f;
         if (invstd_out) invstd_out[g] = inv_std;
@@ -488,7 +548,27 @@ extern "C" __global__ void skip_rmsnorm_f32_dense(
     const int has_bias,
     const float epsilon)
 {
-    skip_rmsnorm_f32_tpl<true>(input, skip, gamma, bias, y, sum_out, mean_out,
+    skip_rmsnorm_f32_tpl<true, false>(input, skip, gamma, bias, y, sum_out, mean_out,
+        invstd_out, metadata, rank, num_groups, norm_size, has_bias, epsilon);
+}
+
+extern "C" __global__ void skip_rmsnorm_f32_dense_warp(
+    const float* input,
+    const float* skip,
+    const float* gamma,
+    const float* bias,
+    float* y,
+    float* sum_out,
+    float* mean_out,
+    float* invstd_out,
+    const unsigned long long* metadata,
+    const int rank,
+    const int num_groups,
+    const int norm_size,
+    const int has_bias,
+    const float epsilon)
+{
+    skip_rmsnorm_f32_tpl<true, true>(input, skip, gamma, bias, y, sum_out, mean_out,
         invstd_out, metadata, rank, num_groups, norm_size, has_bias, epsilon);
 }
 
@@ -508,8 +588,186 @@ extern "C" __global__ void skip_rmsnorm_f32(
     const int has_bias,
     const float epsilon)
 {
-    skip_rmsnorm_f32_tpl<false>(input, skip, gamma, bias, y, sum_out, mean_out,
+    skip_rmsnorm_f32_tpl<false, false>(input, skip, gamma, bias, y, sum_out, mean_out,
         invstd_out, metadata, rank, num_groups, norm_size, has_bias, epsilon);
+}
+
+extern "C" __global__ void skip_rmsnorm_f32_warp(
+    const float* input,
+    const float* skip,
+    const float* gamma,
+    const float* bias,
+    float* y,
+    float* sum_out,
+    float* mean_out,
+    float* invstd_out,
+    const unsigned long long* metadata,
+    const int rank,
+    const int num_groups,
+    const int norm_size,
+    const int has_bias,
+    const float epsilon)
+{
+    skip_rmsnorm_f32_tpl<false, true>(input, skip, gamma, bias, y, sum_out, mean_out,
+        invstd_out, metadata, rank, num_groups, norm_size, has_bias, epsilon);
+}
+
+// ── bf16 fused Add→RMSNorm, byte-exact with standalone `Add(bf16)` +
+// `rmsnorm_bf16`. Two invariants make it byte-exact:
+//   (1) the residual sum is rounded to bf16 BEFORE the RMS reduction — exactly
+//       what the standalone bf16 `Add` op writes (`__float2bfloat16_rn(
+//       f32(input) + f32(skip))`), so the value stored to `y`/`sum_out` (the
+//       residual reused by the next layer) is bit-identical, and the fp32
+//       mean-square accumulates over the SAME bf16-rounded operand rmsnorm_bf16
+//       would read back from DRAM;
+//   (2) the reduction is the identical fixed block tree rmsnorm_bf16 uses
+//       (strided per-thread partials over `blockDim.x` threads, then power-of-two
+//       shared-memory combine), launched with the same NORM_BLOCK config, so the
+//       summation ORDER matches bit-for-bit.
+// gamma is only a final multiplicand (never in the fp32 variance), so an fp32 or
+// bf16 gamma are both loaded at full precision.
+__device__ __forceinline__ float load_skip_bf16_param(
+    const void* values, const int is_bf16, const int index) {
+    return is_bf16
+        ? __bfloat162float(((const __nv_bfloat16*)values)[index])
+        : ((const float*)values)[index];
+}
+
+template <bool WarpTail>
+__device__ __forceinline__ void skip_rmsnorm_bf16_tpl(
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* skip,
+    const void*          gamma,
+    const void*          bias,       // null when absent
+    __nv_bfloat16*       y,
+    __nv_bfloat16*       sum_out,    // null when not requested
+    void*                mean_out,   // null when not requested (always zero)
+    void*                invstd_out, // null when not requested
+    const unsigned long long* metadata,
+    const int     rank,
+    const int     num_groups,
+    const int     norm_size,
+    const int     has_bias,
+    const int     dense_skip,
+    const int     gamma_is_bf16,
+    const int     bias_is_bf16,
+    const int     stat_is_bf16,
+    const float   epsilon)
+{
+    const int g = blockIdx.x;
+    if (g >= num_groups) return;
+    const size_t base = (size_t)g * norm_size;
+    const unsigned long long* shape = metadata;
+    const unsigned long long* skip_strides = metadata + rank;
+
+    extern __shared__ float red[];
+    const int tid = threadIdx.x;
+    const int nt  = blockDim.x;
+
+    // Pass 1: residual sum (rounded to bf16, stored) + fp32 mean-square over the
+    // rounded value. `ss += xv*xv` / `red[tid] += red[tid+off]` match rmsnorm_bf16
+    // exactly (both compile to fadd.rn/fmul.rn).
+    float ss = 0.0f;
+    for (int j = tid; j < norm_size; j += nt) {
+        unsigned long long skip_index = (unsigned long long)base + j;
+        if (!dense_skip) {
+            unsigned long long linear = skip_index;
+            skip_index = 0;
+            for (int d = rank - 1; d >= 0; --d) {
+                const unsigned long long coord = linear % shape[d];
+                linear /= shape[d];
+                skip_index += coord * skip_strides[d];
+            }
+        }
+        float sv = __bfloat162float(input[base + j]) + __bfloat162float(skip[skip_index]);
+        if (has_bias) sv += load_skip_bf16_param(bias, bias_is_bf16, j);
+        const __nv_bfloat16 svb = __float2bfloat16_rn(sv);
+        y[base + j] = svb;
+        if (sum_out) sum_out[base + j] = svb;
+        const float rounded = __bfloat162float(svb);
+        ss += rounded * rounded;
+    }
+    red[tid] = ss;
+    __syncthreads();
+    float reduced;
+    if (WarpTail) {
+        reduced = skip_rmsnorm_warp_tail(red, tid, nt);
+    } else {
+        for (int off = nt >> 1; off > 0; off >>= 1) {
+            if (tid < off) red[tid] += red[tid + off];
+            __syncthreads();
+        }
+        reduced = red[0];
+    }
+    const float inv_std = 1.0f / sqrtf(reduced / (float)norm_size + epsilon);
+    if (tid == 0) {
+        if (mean_out) {
+            if (stat_is_bf16) ((__nv_bfloat16*)mean_out)[g] = __float2bfloat16_rn(0.0f);
+            else ((float*)mean_out)[g] = 0.0f;
+        }
+        if (invstd_out) {
+            if (stat_is_bf16) ((__nv_bfloat16*)invstd_out)[g] = __float2bfloat16_rn(inv_std);
+            else ((float*)invstd_out)[g] = inv_std;
+        }
+    }
+    __syncthreads();
+
+    // Pass 2: scale by inv_std · gamma, round to bf16 — identical to rmsnorm_bf16.
+    for (int j = tid; j < norm_size; j += nt) {
+        const float o = __bfloat162float(y[base + j]) * inv_std
+            * load_skip_bf16_param(gamma, gamma_is_bf16, j);
+        y[base + j] = __float2bfloat16_rn(o);
+    }
+}
+
+extern "C" __global__ void skip_rmsnorm_bf16(
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* skip,
+    const void*          gamma,
+    const void*          bias,       // null when absent
+    __nv_bfloat16*       y,
+    __nv_bfloat16*       sum_out,    // null when not requested
+    void*                mean_out,   // null when not requested (always zero)
+    void*                invstd_out, // null when not requested
+    const unsigned long long* metadata,
+    const int     rank,
+    const int     num_groups,
+    const int     norm_size,
+    const int     has_bias,
+    const int     dense_skip,
+    const int     gamma_is_bf16,
+    const int     bias_is_bf16,
+    const int     stat_is_bf16,
+    const float   epsilon)
+{
+    skip_rmsnorm_bf16_tpl<false>(input, skip, gamma, bias, y, sum_out, mean_out,
+        invstd_out, metadata, rank, num_groups, norm_size, has_bias, dense_skip,
+        gamma_is_bf16, bias_is_bf16, stat_is_bf16, epsilon);
+}
+
+extern "C" __global__ void skip_rmsnorm_bf16_warp(
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* skip,
+    const void*          gamma,
+    const void*          bias,       // null when absent
+    __nv_bfloat16*       y,
+    __nv_bfloat16*       sum_out,    // null when not requested
+    void*                mean_out,   // null when not requested (always zero)
+    void*                invstd_out, // null when not requested
+    const unsigned long long* metadata,
+    const int     rank,
+    const int     num_groups,
+    const int     norm_size,
+    const int     has_bias,
+    const int     dense_skip,
+    const int     gamma_is_bf16,
+    const int     bias_is_bf16,
+    const int     stat_is_bf16,
+    const float   epsilon)
+{
+    skip_rmsnorm_bf16_tpl<true>(input, skip, gamma, bias, y, sum_out, mean_out,
+        invstd_out, metadata, rank, num_groups, norm_size, has_bias, dense_skip,
+        gamma_is_bf16, bias_is_bf16, stat_is_bf16, epsilon);
 }
 
 union SkipHalf4 {
@@ -633,6 +891,184 @@ extern "C" __global__ void skip_rmsnorm_f16_warp_half4(
             value1.y * inv_std * scale1y);
         y4[chunk] = output.raw;
     }
+}
+
+// Decode-shaped variant of `skip_rmsnorm_f16_warp_half4`. The warp path runs one
+// 32-lane warp per row, which saturates the machine only when there are many
+// rows (prefill). At decode there is a single row (num_groups == 1), so a lone
+// warp leaves the GPU almost entirely idle (measured 1.56% achieved occupancy,
+// Grid 1 x Block 32) and stalls ~92% of cycles on Long-Scoreboard global-load
+// latency with too few resident warps to hide it. This variant spreads the same
+// half4 chunks of one row across a full multi-warp block and reduces the
+// sum-of-squares through the file's launch-invariant `red[tid]` block tree, so
+// many warps are resident to hide the load latency. Same launch predicate as the
+// warp path (norm_size % 128 == 0, dense skip, no bias). The residual (`y` /
+// `sum_out`) is written per-chunk by exactly one thread with the identical
+// __hadd2 rounding, so it is byte-identical to the warp path; only the fp32
+// sum-of-squares reduction order differs, perturbing the shared 1/rms by ULPs.
+template <bool WarpTail>
+__device__ __forceinline__ void skip_rmsnorm_f16_block_half4_tpl(
+    const __half* input,
+    const __half* skip,
+    const void*   gamma,
+    const void*   bias,
+    __half*       y,
+    __half*       sum_out,
+    void*         mean_out,
+    void*         invstd_out,
+    const unsigned long long* metadata,
+    const int     rank,
+    const int     num_groups,
+    const int     norm_size,
+    const int     has_bias,
+    const int     dense_skip,
+    const int     gamma_is_half,
+    const int     bias_is_half,
+    const int     stat_is_half,
+    const float   epsilon)
+{
+    const int g = blockIdx.x;
+    if (g >= num_groups) return;
+    const size_t base = (size_t)g * norm_size;
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    const int chunks = norm_size >> 2;
+    const unsigned long long* input4 =
+        (const unsigned long long*)(input + base);
+    const unsigned long long* skip4 =
+        (const unsigned long long*)(skip + base);
+    const unsigned long long* gamma4 =
+        (const unsigned long long*)gamma;
+    unsigned long long* y4 = (unsigned long long*)(y + base);
+    unsigned long long* sum4 =
+        sum_out ? (unsigned long long*)(sum_out + base) : 0;
+
+    extern __shared__ float red[];
+    float ss = 0.0f;
+    for (int chunk = tid; chunk < chunks; chunk += nt) {
+        SkipHalf4 input_v;
+        SkipHalf4 skip_v;
+        SkipHalf4 residual;
+        input_v.raw = input4[chunk];
+        skip_v.raw = skip4[chunk];
+        residual.pair[0] = __hadd2(input_v.pair[0], skip_v.pair[0]);
+        residual.pair[1] = __hadd2(input_v.pair[1], skip_v.pair[1]);
+        y4[chunk] = residual.raw;
+        if (sum4) sum4[chunk] = residual.raw;
+        const float2 rounded0 = __half22float2(residual.pair[0]);
+        const float2 rounded1 = __half22float2(residual.pair[1]);
+        ss += rounded0.x * rounded0.x;
+        ss += rounded0.y * rounded0.y;
+        ss += rounded1.x * rounded1.x;
+        ss += rounded1.y * rounded1.y;
+    }
+
+    red[tid] = ss;
+    __syncthreads();
+    float reduced;
+    if (WarpTail) {
+        reduced = skip_rmsnorm_warp_tail(red, tid, nt);
+    } else {
+        for (int offset = nt >> 1; offset > 0; offset >>= 1) {
+            if (tid < offset) red[tid] += red[tid + offset];
+            __syncthreads();
+        }
+        reduced = red[0];
+    }
+    const float inv_std = 1.0f / sqrtf(reduced / (float)norm_size + epsilon);
+    if (tid == 0) {
+        if (mean_out) {
+            if (stat_is_half) ((__half*)mean_out)[g] = __float2half_rn(0.0f);
+            else ((float*)mean_out)[g] = 0.0f;
+        }
+        if (invstd_out) {
+            if (stat_is_half) ((__half*)invstd_out)[g] = __float2half_rn(inv_std);
+            else ((float*)invstd_out)[g] = inv_std;
+        }
+    }
+
+    const float* gamma_f = (const float*)gamma;
+    for (int chunk = tid; chunk < chunks; chunk += nt) {
+        SkipHalf4 residual;
+        SkipHalf4 output;
+        residual.raw = y4[chunk];
+        const float2 value0 = __half22float2(residual.pair[0]);
+        const float2 value1 = __half22float2(residual.pair[1]);
+        float scale0x, scale0y, scale1x, scale1y;
+        if (gamma_is_half) {
+            SkipHalf4 scale;
+            scale.raw = gamma4[chunk];
+            const float2 scale0 = __half22float2(scale.pair[0]);
+            const float2 scale1 = __half22float2(scale.pair[1]);
+            scale0x = scale0.x;
+            scale0y = scale0.y;
+            scale1x = scale1.x;
+            scale1y = scale1.y;
+        } else {
+            const int j = chunk << 2;
+            scale0x = gamma_f[j];
+            scale0y = gamma_f[j + 1];
+            scale1x = gamma_f[j + 2];
+            scale1y = gamma_f[j + 3];
+        }
+        output.pair[0] = __floats2half2_rn(
+            value0.x * inv_std * scale0x,
+            value0.y * inv_std * scale0y);
+        output.pair[1] = __floats2half2_rn(
+            value1.x * inv_std * scale1x,
+            value1.y * inv_std * scale1y);
+        y4[chunk] = output.raw;
+    }
+}
+
+extern "C" __global__ void skip_rmsnorm_f16_block_half4(
+    const __half* input,
+    const __half* skip,
+    const void*   gamma,
+    const void*   bias,
+    __half*       y,
+    __half*       sum_out,
+    void*         mean_out,
+    void*         invstd_out,
+    const unsigned long long* metadata,
+    const int     rank,
+    const int     num_groups,
+    const int     norm_size,
+    const int     has_bias,
+    const int     dense_skip,
+    const int     gamma_is_half,
+    const int     bias_is_half,
+    const int     stat_is_half,
+    const float   epsilon)
+{
+    skip_rmsnorm_f16_block_half4_tpl<false>(input, skip, gamma, bias, y, sum_out,
+        mean_out, invstd_out, metadata, rank, num_groups, norm_size, has_bias,
+        dense_skip, gamma_is_half, bias_is_half, stat_is_half, epsilon);
+}
+
+extern "C" __global__ void skip_rmsnorm_f16_block_half4_warp(
+    const __half* input,
+    const __half* skip,
+    const void*   gamma,
+    const void*   bias,
+    __half*       y,
+    __half*       sum_out,
+    void*         mean_out,
+    void*         invstd_out,
+    const unsigned long long* metadata,
+    const int     rank,
+    const int     num_groups,
+    const int     norm_size,
+    const int     has_bias,
+    const int     dense_skip,
+    const int     gamma_is_half,
+    const int     bias_is_half,
+    const int     stat_is_half,
+    const float   epsilon)
+{
+    skip_rmsnorm_f16_block_half4_tpl<true>(input, skip, gamma, bias, y, sum_out,
+        mean_out, invstd_out, metadata, rank, num_groups, norm_size, has_bias,
+        dense_skip, gamma_is_half, bias_is_half, stat_is_half, epsilon);
 }
 
 extern "C" __global__ void skip_rmsnorm_f16(
@@ -846,8 +1282,51 @@ extern "C" __global__ void skip_layernorm_f32(
 "#;
 
 const LAYERNORM_MODULE: &str = "layernorm_bf16_v2";
-const RMSNORM_MODULE: &str = "rmsnorm_bf16_v2";
-const SKIP_RMSNORM_MODULE: &str = "skip_rmsnorm_f16_warp_v5";
+const RMSNORM_MODULE: &str = "rmsnorm_bf16_v4";
+const SKIP_RMSNORM_MODULE: &str = "skip_rmsnorm_f16_warp_v6_block";
+
+/// Max `num_groups` (rows) that routes the fp16 half4 skip-RMSNorm through the
+/// multi-warp `skip_rmsnorm_f16_block_half4` variant instead of one warp per row.
+/// At decode there is a single row, and speculative verify runs a small query
+/// width (M<=8); both leave the one-warp-per-row grid so starved that the kernel
+/// hits ~1.6% occupancy and stalls on global-load latency. Filling one row
+/// across a whole block hides that latency. Above this many rows the warp path
+/// already has enough resident warps (one per row) to saturate, so prefill keeps
+/// the byte-for-byte warp kernel untouched.
+pub(crate) const SKIP_RMSNORM_BLOCK_MAX_GROUPS: u32 = 8;
+
+/// Threads per block for the decode `skip_rmsnorm_f16_block_half4` launch. Sized
+/// to put many warps on the single active SM to hide the Long-Scoreboard load
+/// latency; `reduction_launch_config` rounds this down to a device-legal power
+/// of two and sizes the `red[tid]` reduction's dynamic shared memory.
+const SKIP_RMSNORM_BLOCK_THREADS: u32 = 1024;
+
+/// Environment opt-out for the decode multi-warp block skip-RMSNorm, mirroring
+/// the other CUDA A/B switches. Any value other than unset/empty/`0` forces the
+/// one-warp half4 kernel even at decode (for A/B measurement or rollback).
+const SKIP_RMSNORM_BLOCK_DISABLE_ENV: &str = "ONNX_GENAI_CUDA_DISABLE_SKIP_RMSNORM_BLOCK";
+
+fn skip_rmsnorm_block_disabled() -> bool {
+    std::env::var_os(SKIP_RMSNORM_BLOCK_DISABLE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+/// Opt-in switch for the warp-shuffle tail of the skip-RMSNorm block-tree
+/// reduction. When set (any value other than unset/empty/`0`), the fused
+/// Add→RMSNorm block kernels finish the intra-warp offsets (<= 16) of the
+/// sum-of-squares reduction with `__shfl_down_sync` in registers instead of the
+/// shared-memory tree — dropping 5 `__syncthreads` + 5 shared read/write rounds
+/// per row. The pairing/order (and `__fadd_rn` rounding) is BIT-IDENTICAL to the
+/// full shared tree (proven by the `warp_reduce` byte-for-byte unit tests), so
+/// this is a pure launch-latency optimization with no numeric change. Default
+/// OFF (base kernels untouched) because decode throughput is knife-edge and the
+/// win must be measured per host before it becomes the default.
+const SKIP_RMSNORM_WARP_REDUCE_ENV: &str = "ONNX_GENAI_RMSNORM_WARP_REDUCE";
+
+fn skip_rmsnorm_warp_reduce_enabled() -> bool {
+    std::env::var_os(SKIP_RMSNORM_WARP_REDUCE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
 const SKIP_LAYERNORM_MODULE: &str = "skip_layernorm_f32";
 
 /// Threads per block for the norm reductions (power of two → exact tree reduce).
@@ -1514,6 +1993,7 @@ impl KernelFactory for SkipSimplifiedLayerNormFactory {
             epsilon,
             runtime: self.runtime.clone(),
             metadata: Mutex::new(SkipBroadcastMetadataCache::new(self.runtime.clone())),
+            bf16_scratch: Mutex::new(NormBf16Scratch::new(self.runtime.clone())),
             last_call_capture_safe: AtomicBool::new(false),
         }))
     }
@@ -1525,7 +2005,62 @@ pub struct SkipSimplifiedLayerNormKernel {
     epsilon: f32,
     runtime: Arc<CudaRuntime>,
     metadata: Mutex<SkipBroadcastMetadataCache>,
+    /// Persistent f32 staging arena for the BFloat16-via-Float32 path. Reused
+    /// across decode steps so the widen/narrow casts never `cudaMalloc`/`cudaFree`
+    /// on the hot path, which is what keeps the bf16 path graph-capture safe.
+    bf16_scratch: Mutex<NormBf16Scratch>,
     last_call_capture_safe: AtomicBool,
+}
+
+/// Persistent device arena that stages BFloat16 operands through Float32 without
+/// per-call allocation. Mirrors the `Bf16Scratch` pattern in `matmul_nbits`: a
+/// single grow-only buffer whose base address stays fixed across decode steps,
+/// so the casts recorded into a CUDA graph replay against a stable pointer.
+#[derive(Debug)]
+struct NormBf16Scratch {
+    runtime: Arc<CudaRuntime>,
+    ptr: CUdeviceptr,
+    cap: usize,
+}
+
+impl NormBf16Scratch {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
+            runtime,
+            ptr: 0,
+            cap: 0,
+        }
+    }
+
+    /// Ensure the arena holds at least `bytes`, returning its base pointer and
+    /// whether it had to (re)allocate. A growth event means the base pointer
+    /// moved, so a call that grows the arena is not capture-safe; steady decode
+    /// (fixed shapes) never grows after the first warm call.
+    fn ensure(&mut self, bytes: usize) -> Result<(CUdeviceptr, bool)> {
+        if bytes <= self.cap && self.ptr != 0 {
+            return Ok((self.ptr, false));
+        }
+        if self.ptr != 0 {
+            // SAFETY: exclusively owned; freed once before replacement. A grow
+            // only happens off the captured hot path (first warm call / shape
+            // change), so no queued replay references the old buffer.
+            unsafe { self.runtime.free_raw(self.ptr)? };
+            self.ptr = 0;
+        }
+        self.ptr = self.runtime.alloc_raw(bytes.max(1))?;
+        self.cap = bytes;
+        Ok((self.ptr, true))
+    }
+}
+
+impl Drop for NormBf16Scratch {
+    fn drop(&mut self) {
+        if self.ptr != 0 {
+            // SAFETY: this persistent buffer is exclusively owned by the kernel.
+            let _ = unsafe { self.runtime.free_raw(self.ptr) };
+            self.ptr = 0;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1603,6 +2138,301 @@ impl Drop for SkipBroadcastMetadataCache {
 }
 
 impl SkipSimplifiedLayerNormKernel {
+    /// BFloat16 activations: the fused Skip-RMS kernels are implemented for
+    /// Float16 and Float32 only, so the BFloat16 case is staged through Float32.
+    /// Every BFloat16 operand is losslessly widened into a scratch f32 buffer,
+    /// the f32 kernel path runs, and each result is narrowed back to its original
+    /// dtype. SkipSimplifiedLayerNormalization appears once per token (the final
+    /// norm), so the extra pointwise casts are negligible.
+    ///
+    /// The staging arena is **persistent** (a grow-only `NormBf16Scratch` reused
+    /// across decode steps), so the widen/narrow casts and the reused f32 kernel
+    /// issue no per-call `cudaMalloc`/`cudaFree` — a `cuMemFree` would otherwise
+    /// force a stream synchronize every token and serialize decode. With a stable
+    /// arena base and fixed decode shapes this whole path records and replays
+    /// inside a CUDA graph, so the final bf16 norm no longer forms an eager seam
+    /// that splits (and defeats) the captured decode graph.
+    fn run_bf16_via_f32(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        // Byte offset of each staged buffer within the persistent arena. bf16
+        // inputs and every output are widened to f32; non-bf16 inputs forward
+        // in place. Each buffer is 16-byte aligned so vectorized casts stay
+        // aligned.
+        let align = |bytes: usize| bytes.div_ceil(16) * 16;
+        let mut total = 0usize;
+        let mut input_offsets: Vec<Option<usize>> = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            if input.dtype == DataType::BFloat16 && !input.is_absent() {
+                input_offsets.push(Some(total));
+                total += align(input.numel().max(1) * 4);
+            } else {
+                input_offsets.push(None);
+            }
+        }
+        let mut output_offsets: Vec<usize> = Vec::with_capacity(outputs.len());
+        for output in outputs.iter() {
+            output_offsets.push(total);
+            total += align(output.numel().max(1) * 4);
+        }
+
+        // Hold the arena for the whole call: the widening casts, the reused f32
+        // kernel, and the narrowing casts all run stream-ordered against it.
+        let mut arena = self
+            .bf16_scratch
+            .lock()
+            .expect("cuda_ep SkipSimplifiedLayerNormalization bf16 scratch mutex poisoned");
+        let (base, grew) = arena.ensure(total)?;
+
+        let staged = (|| -> Result<()> {
+            // Widen every BFloat16 input into the arena; forward the rest.
+            let mut f32_inputs: Vec<TensorView> = Vec::with_capacity(inputs.len());
+            for (input, offset) in inputs.iter().zip(input_offsets.iter()) {
+                match offset {
+                    Some(off) => {
+                        let ptr = base + *off as CUdeviceptr;
+                        super::cast::launch_cast_raw(
+                            &self.runtime,
+                            cuptr(input.data_ptr::<u8>() as *const c_void),
+                            DataType::BFloat16,
+                            ptr,
+                            DataType::Float32,
+                            input.numel(),
+                        )?;
+                        f32_inputs.push(TensorView::new(
+                            DevicePtr(raw_ptr(ptr) as *const c_void),
+                            DataType::Float32,
+                            input.shape,
+                            input.strides,
+                            input.device,
+                        ));
+                    }
+                    None => f32_inputs.push(*input),
+                }
+            }
+
+            // Point every output slot at its f32 scratch region so the f32
+            // kernel writes into it; present outputs are narrowed back afterward.
+            let mut f32_outputs: Vec<TensorMut> = Vec::with_capacity(outputs.len());
+            for (output, off) in outputs.iter().zip(output_offsets.iter()) {
+                let ptr = base + *off as CUdeviceptr;
+                f32_outputs.push(TensorMut::new(
+                    DevicePtrMut(raw_ptr(ptr)),
+                    DataType::Float32,
+                    output.shape,
+                    output.strides,
+                    output.device,
+                ));
+            }
+
+            self.run(&f32_inputs, &mut f32_outputs)?;
+
+            // Narrow each present output back to its original dtype.
+            for (output, off) in outputs.iter_mut().zip(output_offsets.iter()) {
+                if output.is_absent() || output.numel() == 0 {
+                    continue;
+                }
+                let n = output.numel();
+                super::cast::launch_cast_raw(
+                    &self.runtime,
+                    base + *off as CUdeviceptr,
+                    DataType::Float32,
+                    cuptr(output.data_ptr_mut::<u8>() as *const c_void),
+                    output.dtype,
+                    n,
+                )?;
+            }
+            Ok(())
+        })();
+
+        // The inner `run` already latched `last_call_capture_safe` from its
+        // (f32) num_groups. A growth moves the arena base pointer, so a graph
+        // recorded against the old address would replay stale — but only a grow
+        // that happens *during capture recording* can corrupt a live graph. The
+        // first warm call (outside capture) always grows the arena to size it for
+        // the decode shape; that is expected and leaves the base fixed for every
+        // steady captured step, so it must stay capture-safe. Demote only when the
+        // grow races an in-progress capture (an un-pre-warmed shape). Steady
+        // decode never grows after warmup, so this never demotes on the hot path.
+        if staged.is_ok() && grew && self.runtime.is_capturing().unwrap_or(true) {
+            self.last_call_capture_safe.store(false, Ordering::Relaxed);
+        }
+        staged
+    }
+
+    /// Native byte-exact bf16 fused Skip-RMSNorm. Preconditions (checked by the
+    /// caller): input is bf16, the skip is dense (same element count), there is
+    /// no bias, and the bf16 NVRTC headers are available. Mirrors the f16 path's
+    /// validation but launches `skip_rmsnorm_bf16` with the same block-tree
+    /// reduction config as `rmsnorm_bf16`, so a folded `Add → RMSNorm` seam is
+    /// bit-identical to running the standalone `Add(bf16)` + `rmsnorm_bf16`.
+    fn run_bf16_native(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.last_call_capture_safe.store(false, Ordering::Relaxed);
+        let op = "SkipSimplifiedLayerNormalization";
+        let input = &inputs[0];
+        let skip = &inputs[1];
+        let gamma = &inputs[2];
+        if skip.dtype != DataType::BFloat16 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: skip dtype {:?} must match input dtype BFloat16",
+                skip.dtype
+            )));
+        }
+        if outputs[0].dtype != DataType::BFloat16 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: output dtype {:?} must match input dtype BFloat16",
+                outputs[0].dtype
+            )));
+        }
+        require_param_for_activation(op, "gamma", DataType::BFloat16, gamma.dtype)?;
+        require_contiguous(op, "input", input.is_contiguous())?;
+        require_contiguous(op, "skip", skip.is_contiguous())?;
+        require_contiguous(op, "gamma", gamma.is_contiguous())?;
+        require_contiguous(op, "output", outputs[0].is_contiguous())?;
+        self.runtime.require_nvrtc_half_headers(op)?;
+
+        let rank = input.shape.len();
+        if rank == 0 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: input must have rank >= 1"
+            )));
+        }
+        let norm_size = input.shape[rank - 1];
+        let num_groups: usize = input.shape[..rank - 1].iter().product();
+        if norm_size == 0 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: empty hidden (last) dimension"
+            )));
+        }
+        if gamma.shape != [norm_size] {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: gamma shape {:?} must equal [{norm_size}]",
+                gamma.shape
+            )));
+        }
+        let broadcast =
+            onnx_runtime_ir::broadcast_shapes(input.shape, skip.shape).map_err(EpError::Ir)?;
+        if broadcast != input.shape {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: skip shape {:?} is not broadcastable to input shape {:?}",
+                skip.shape, input.shape
+            )));
+        }
+        if outputs[0].shape != input.shape {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: output shape {:?} must equal input shape {:?}",
+                outputs[0].shape, input.shape
+            )));
+        }
+        if num_groups == 0 {
+            return Ok(());
+        }
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let elements = input.numel() as u64;
+            let groups = num_groups as u64;
+            elements
+                .saturating_mul(5)
+                .saturating_add(groups.saturating_mul(4))
+        });
+
+        // Optional Mean/InvStdDev stat outputs may be declared in bf16 (they are
+        // typically unused); track their precision so the kernel narrows.
+        let mean_ptr = optional_bf16_stat_ptr(op, "Mean", outputs, 1, num_groups)?;
+        let invstd_ptr = optional_bf16_stat_ptr(op, "InvStdDev", outputs, 2, num_groups)?;
+        let stat_is_bf16 = i32::from(
+            outputs
+                .get(1)
+                .is_some_and(|t| t.dtype == DataType::BFloat16)
+                || outputs
+                    .get(2)
+                    .is_some_and(|t| t.dtype == DataType::BFloat16),
+        );
+        let sum_ptr = match outputs.get_mut(3) {
+            None => 0u64,
+            Some(t) => {
+                if t.dtype != DataType::BFloat16 {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep {op}: input_skip_bias_sum dtype {:?} must match input dtype BFloat16",
+                        t.dtype
+                    )));
+                }
+                if t.shape != input.shape {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep {op}: input_skip_bias_sum shape {:?} must equal input shape {:?}",
+                        t.shape, input.shape
+                    )));
+                }
+                cuptr(t.data_ptr_mut::<u8>() as *const c_void)
+            }
+        };
+        let (groups_u, norm_i) = (
+            u32::try_from(num_groups).map_err(|_| dim_overflow(op, "num_groups", num_groups))?,
+            i32::try_from(norm_size).map_err(|_| dim_overflow(op, "norm_size", norm_size))?,
+        );
+        let rank_i = i32::try_from(rank).map_err(|_| dim_overflow(op, "rank", rank))?;
+        let input_ptr = cuptr(input.data_ptr::<u8>() as *const c_void);
+        let skip_ptr = cuptr(skip.data_ptr::<u8>() as *const c_void);
+        let gamma_ptr = cuptr(gamma.data_ptr::<u8>() as *const c_void);
+        let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+        let mut metadata = self
+            .metadata
+            .lock()
+            .expect("cuda_ep skip normalization metadata cache poisoned");
+        let metadata_ptr = metadata.reserve(input.shape, skip.shape)?;
+        let dense_skip = i32::from(skip.numel() == input.numel());
+        let bias_ptr = 0u64;
+        let has_bias = 0i32;
+        let gamma_is_bf16 = i32::from(gamma.dtype == DataType::BFloat16);
+        let bias_is_bf16 = 0i32;
+        let bf16_entry = if skip_rmsnorm_warp_reduce_enabled() {
+            "skip_rmsnorm_bf16_warp"
+        } else {
+            "skip_rmsnorm_bf16"
+        };
+        onnx_runtime_ep_api::record_kernel_variant!(
+            "skip_rmsnorm_bf16",
+            "SkipSimplifiedLayerNormalization hidden={norm_size}: native byte-exact bf16 \
+             (bf16-rounded residual sum, rmsnorm_bf16 block-tree reduction)"
+        );
+        let func =
+            self.runtime
+                .nvrtc_function(SKIP_RMSNORM_MODULE, SKIP_RMSNORM_SRC, bf16_entry)?;
+        let stream = self.runtime.stream();
+        let mut builder = stream.launch_builder(&func);
+        let groups_i = groups_u_i32(groups_u);
+        builder
+            .arg(&input_ptr)
+            .arg(&skip_ptr)
+            .arg(&gamma_ptr)
+            .arg(&bias_ptr)
+            .arg(&y_ptr)
+            .arg(&sum_ptr)
+            .arg(&mean_ptr)
+            .arg(&invstd_ptr)
+            .arg(&metadata_ptr)
+            .arg(&rank_i)
+            .arg(&groups_i)
+            .arg(&norm_i)
+            .arg(&has_bias)
+            .arg(&dense_skip)
+            .arg(&gamma_is_bf16)
+            .arg(&bias_is_bf16)
+            .arg(&stat_is_bf16)
+            .arg(&self.epsilon);
+        // Match `rmsnorm_bf16` exactly (same NORM_BLOCK block-tree reduction and
+        // f32 shared-memory bytes/thread) so the summation order is bit-identical.
+        let cfg = self.runtime.reduction_launch_config(
+            &func,
+            groups_u,
+            NORM_BLOCK,
+            std::mem::size_of::<f32>() as u32,
+        )?;
+        // SAFETY: all pointers reference validated device buffers; metadata holds
+        // two rank-length u64 arrays (output shape and skip strides).
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch skip_rmsnorm_bf16", e))?;
+        self.last_call_capture_safe
+            .store(num_groups == 1, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         self.last_call_capture_safe.store(false, Ordering::Relaxed);
         let op = "SkipSimplifiedLayerNormalization";
@@ -1617,6 +2447,23 @@ impl SkipSimplifiedLayerNormKernel {
         let skip = &inputs[1];
         let gamma = &inputs[2];
         let bias = inputs.get(3).filter(|bias| !bias.is_absent());
+        if input.dtype == DataType::BFloat16 {
+            // Native byte-exact fused bf16 skip-RMSNorm: rounds the residual sum
+            // to bf16 before the RMS reduction (so `y`/sum match a standalone
+            // `Add(bf16)` bit-for-bit) and reuses the identical block-tree
+            // reduction of `rmsnorm_bf16`. This is what lets `optimizer.rs` fold
+            // `Add → SimplifiedLayerNormalization` into a single skip node without
+            // perturbing the greedy token stream. Requires the bf16 NVRTC headers
+            // and (for the byte-exact contract) a dense skip with no bias; any
+            // exotic case falls back to the f32 staging path (Rule 11).
+            if self.runtime.require_nvrtc_half_headers(op).is_ok()
+                && skip.numel() == input.numel()
+                && bias.is_none()
+            {
+                return self.run_bf16_native(inputs, outputs);
+            }
+            return self.run_bf16_via_f32(inputs, outputs);
+        }
         require_f16_or_f32(op, "input", input.dtype)?;
         let is_half = input.dtype == DataType::Float16;
         if skip.dtype != input.dtype {
@@ -1756,14 +2603,44 @@ impl SkipSimplifiedLayerNormKernel {
             SkipRmsnormVariant::F16Generic => "skip_rmsnorm_f16_generic",
             SkipRmsnormVariant::F16WarpHalf4 => "skip_rmsnorm_f16_warp_half4",
         };
+        // Decode/speculative-verify grids (few rows) route the one-warp half4
+        // path through the multi-warp block kernel so the single row is spread
+        // over a whole block, hiding the Long-Scoreboard global-load latency the
+        // lone warp cannot. Prefill (many rows) keeps the byte-identical warp
+        // kernel. The residual/sum outputs stay byte-identical either way; only
+        // the fp32 sum-of-squares reduction order changes.
+        let use_skip_block = matches!(selection.variant, SkipRmsnormVariant::F16WarpHalf4)
+            && groups_u <= SKIP_RMSNORM_BLOCK_MAX_GROUPS
+            && !skip_rmsnorm_block_disabled();
+        // Opt-in warp-shuffle reduction tail (bit-identical, see
+        // `skip_rmsnorm_warp_reduce_enabled`). Only the block-tree kernels have a
+        // shared-memory tail to hoist into registers; the one-warp `warp_half4`
+        // and generic `skip_rmsnorm_f16` paths already reduce via `__shfl` and are
+        // left untouched.
+        let warp_reduce = skip_rmsnorm_warp_reduce_enabled();
+        let entry = if use_skip_block {
+            if warp_reduce {
+                "skip_rmsnorm_f16_block_half4_warp"
+            } else {
+                "skip_rmsnorm_f16_block_half4"
+            }
+        } else if warp_reduce {
+            match selection.variant {
+                SkipRmsnormVariant::F32Dense => "skip_rmsnorm_f32_dense_warp",
+                SkipRmsnormVariant::F32 => "skip_rmsnorm_f32_warp",
+                _ => selection.entry,
+            }
+        } else {
+            selection.entry
+        };
         onnx_runtime_ep_api::record_kernel_variant!(
             variant_name,
             "SkipSimplifiedLayerNormalization hidden={norm_size}: {}",
             selection.reason
         );
-        let func =
-            self.runtime
-                .nvrtc_function(SKIP_RMSNORM_MODULE, SKIP_RMSNORM_SRC, selection.entry)?;
+        let func = self
+            .runtime
+            .nvrtc_function(SKIP_RMSNORM_MODULE, SKIP_RMSNORM_SRC, entry)?;
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         let groups_i = groups_u_i32(groups_u);
@@ -1793,7 +2670,16 @@ impl SkipSimplifiedLayerNormKernel {
         }
         // SAFETY: all pointers reference validated device buffers; metadata has
         // two rank-length u64 arrays describing the output shape and skip strides.
-        let cfg = if is_half {
+        let cfg = if use_skip_block {
+            // Multi-warp block per row: `reduction_launch_config` sizes the
+            // power-of-two thread count and the `red[tid]` dynamic shared memory.
+            self.runtime.reduction_launch_config(
+                &func,
+                groups_u,
+                SKIP_RMSNORM_BLOCK_THREADS,
+                std::mem::size_of::<f32>() as u32,
+            )?
+        } else if is_half {
             LaunchConfig {
                 grid_dim: (groups_u, 1, 1),
                 block_dim: (32, 1, 1),
@@ -1811,19 +2697,21 @@ impl SkipSimplifiedLayerNormKernel {
                 std::mem::size_of::<f32>() as u32,
             )?
         };
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| driver_err(&format!("launch {}", selection.entry), e))?;
-        // Unlike the plain RMS/LayerNorm kernels, this fused residual norm is
-        // kept single-group for capture on purpose. It normalizes the hidden
-        // (last) axis per token, so decode — the only phase that captures — is
-        // always num_groups == 1; a fixed multi-group shape would only ever
-        // arise in the uncaptured prefill. Its capture drift is guarded by the
-        // shape-keyed `SkipBroadcastMetadataCache` (which rejects a shape change
-        // mid-capture) rather than a dtype-encoding `NormCaptureSignature`, so
-        // admitting multi-group here would broaden capture with no decode
-        // benefit and weaker drift detection. Left conservative by design.
-        self.last_call_capture_safe
-            .store(num_groups == 1, Ordering::Relaxed);
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        // Capture-safety at query-width > 1 (speculative-decode M=K). The launch
+        // grid is static (`groups_u` fixed for a fixed shape), no mid-kernel
+        // sync / host read-back / device alloc-free happens on the hot path, and
+        // the shape-keyed `SkipBroadcastMetadataCache` already rejects any
+        // shape change (which includes a change in `num_groups`, since it keys on
+        // the full input/skip shape) mid-capture — the same pre-warmed
+        // cold-miss safety valve the Marlin repack cache uses. So a fixed,
+        // pre-warmed M=K shape records and replays safely just like decode's
+        // M=1; the earlier `num_groups == 1` restriction was conservative, not a
+        // real capture hazard, and kept every batched (speculative-verify /
+        // prefill) node declaring KernelCaptureUnsupported. The bf16 staging path
+        // additionally demotes when its arena grows during capture (see
+        // `run_bf16_via_f32`).
+        self.last_call_capture_safe.store(true, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -1840,7 +2728,7 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
             onnx_runtime_ep_api::CaptureSupport::Supported
         } else {
             onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "SkipSimplifiedLayerNormalization shape/dtype signature does not match the warmed single-group capture signature",
+                "SkipSimplifiedLayerNormalization shape/dtype signature does not match the warmed capture signature (pre-warm the fixed M=K shape before capture)",
             )
         }
     }
@@ -2193,6 +3081,36 @@ fn optional_half_stat_ptr(
     }
 }
 
+/// Optional per-group stat output (Mean/InvStdDev) accepting bf16 or f32. The
+/// bf16 skip-RMSNorm path declares these unused outputs in the model's bf16
+/// activation dtype; the kernel narrows the stat write to match.
+fn optional_bf16_stat_ptr(
+    op: &str,
+    name: &str,
+    outputs: &mut [TensorMut],
+    idx: usize,
+    expect: usize,
+) -> Result<CUdeviceptr> {
+    match outputs.get_mut(idx) {
+        None => Ok(0),
+        Some(t) => {
+            if !matches!(t.dtype, DataType::BFloat16 | DataType::Float32) {
+                return Err(not_implemented(format!(
+                    "{op} with {name} dtype {:?} (expected bf16 or f32)",
+                    t.dtype
+                )));
+            }
+            if t.numel() != expect {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: {name} has {} elements, expected {expect}",
+                    t.numel()
+                )));
+            }
+            Ok(cuptr(t.data_ptr_mut::<u8>() as *const c_void))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use half::{bf16, f16};
@@ -2212,9 +3130,16 @@ mod tests {
         assert!(RMSNORM_SRC.contains("rmsnorm_bf16"));
         assert!(SKIP_LAYERNORM_SRC.contains("skip_layernorm_f32"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_bf16"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32_dense"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16_warp_half4"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16_block_half4"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16_block_half4_warp"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32_warp"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32_dense_warp"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_bf16_warp"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_warp_tail"));
     }
 
     #[test]
@@ -2288,7 +3213,7 @@ mod tests {
                 *sum += second * second;
             }
         }
-        if residual.len() % 2 != 0 {
+        if !residual.len().is_multiple_of(2) {
             let tail = residual[residual.len() - 1].to_f32();
             lanes[0] += tail * tail;
         }
@@ -2530,6 +3455,7 @@ mod tests {
                 epsilon: 1e-5,
                 runtime: runtime.clone(),
                 metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
+                bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
                 last_call_capture_safe: AtomicBool::new(false),
             };
             kernel.run(&inputs, &mut [output]).unwrap();
@@ -2672,6 +3598,7 @@ mod tests {
             epsilon: 1e-5,
             runtime: runtime.clone(),
             metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
+            bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
             last_call_capture_safe: AtomicBool::new(false),
         };
         kernel.run(&inputs, &mut outputs).unwrap();
@@ -2720,6 +3647,236 @@ mod tests {
         ] {
             ep.deallocate(buffer).unwrap();
         }
+    }
+
+    /// Byte-exactness gate for the native bf16 fused Skip-RMSNorm: its output and
+    /// residual sum must be bit-identical to the standalone decode path
+    /// (`Add(bf16)` then `rmsnorm_bf16`) that `optimizer.rs` folds away. This is
+    /// the numeric contract Chew gates: the fold only fires because the fused
+    /// kernel rounds the residual sum to bf16 before the RMS reduction and reuses
+    /// the identical block-tree summation, so no greedy token can diverge.
+    fn assert_bf16_skip_byte_exact(gamma_bf16: bool) {
+        let Ok(ep) = CudaExecutionProvider::new(0) else {
+            eprintln!("skipping bf16 skip RMSNorm byte-exactness test: CUDA unavailable");
+            return;
+        };
+        let hidden = 6656usize; // Muse-Glimmer-30B hidden size.
+        let shape = [1usize, hidden];
+        let strides = compute_contiguous_strides(&shape);
+        let gamma_shape = [hidden];
+        let gamma_strides = compute_contiguous_strides(&gamma_shape);
+        let runtime = ep.runtime();
+
+        let input: Vec<bf16> = (0..hidden)
+            .map(|i| bf16::from_f32(((i * 37 % 101) as f32 - 50.0) / 31.0))
+            .collect();
+        let skip: Vec<bf16> = (0..hidden)
+            .map(|i| bf16::from_f32(((i * 17 % 67) as f32 - 33.0) / 47.0))
+            .collect();
+        // gamma as f32 values; uploaded as bf16 or f32 depending on the case.
+        let gamma_f32: Vec<f32> = (0..hidden)
+            .map(|i| 0.75 + (i * 13 % 41) as f32 / 64.0)
+            .collect();
+
+        // Standalone reference: `Add(bf16)` rounds each residual, then
+        // `rmsnorm_bf16` normalizes it. Both are the exact production kernels.
+        let residual_ref: Vec<bf16> = input
+            .iter()
+            .zip(&skip)
+            .map(|(a, b)| bf16::from_f32(a.to_f32() + b.to_f32()))
+            .collect();
+
+        let bytes = std::mem::size_of_val(input.as_slice());
+        let gamma_bytes = if gamma_bf16 {
+            hidden * std::mem::size_of::<bf16>()
+        } else {
+            hidden * std::mem::size_of::<f32>()
+        };
+        let input_buffer = ep.allocate(bytes, 256).unwrap();
+        let skip_buffer = ep.allocate(bytes, 256).unwrap();
+        let residual_buffer = ep.allocate(bytes, 256).unwrap();
+        let gamma_buffer = ep.allocate(gamma_bytes, 256).unwrap();
+        let mut ref_out_buffer = ep.allocate(bytes, 256).unwrap();
+        let mut y_buffer = ep.allocate(bytes, 256).unwrap();
+        let mut sum_buffer = ep.allocate(bytes, 256).unwrap();
+        let mut mean_buffer = ep.allocate(std::mem::size_of::<f32>(), 256).unwrap();
+        let mut invstd_buffer = ep.allocate(std::mem::size_of::<f32>(), 256).unwrap();
+
+        let gamma_bf16_vec: Vec<bf16> = gamma_f32.iter().map(|v| bf16::from_f32(*v)).collect();
+        unsafe {
+            runtime
+                .htod(bf16_bytes(&input), cuptr(input_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(bf16_bytes(&skip), cuptr(skip_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(bf16_bytes(&residual_ref), cuptr(residual_buffer.as_ptr()))
+                .unwrap();
+            if gamma_bf16 {
+                runtime
+                    .htod(bf16_bytes(&gamma_bf16_vec), cuptr(gamma_buffer.as_ptr()))
+                    .unwrap();
+            } else {
+                runtime
+                    .htod(f32_bytes(&gamma_f32), cuptr(gamma_buffer.as_ptr()))
+                    .unwrap();
+            }
+        }
+
+        let gamma_dtype = if gamma_bf16 {
+            DataType::BFloat16
+        } else {
+            DataType::Float32
+        };
+        let gamma_view = TensorView::new(
+            DevicePtr(gamma_buffer.as_ptr()),
+            gamma_dtype,
+            &gamma_shape,
+            &gamma_strides,
+            ep.device_id(),
+        );
+
+        // Reference: standalone rmsnorm_bf16 over the pre-rounded residual.
+        RmsNormKernel {
+            axis: -1,
+            epsilon: 1e-5,
+            runtime: runtime.clone(),
+            warmed_signature: Mutex::new(None),
+            last_call_capture_safe: AtomicBool::new(false),
+        }
+        .run(
+            &[
+                TensorView::new(
+                    DevicePtr(residual_buffer.as_ptr()),
+                    DataType::BFloat16,
+                    &shape,
+                    &strides,
+                    ep.device_id(),
+                ),
+                gamma_view,
+            ],
+            &mut [TensorMut::new(
+                DevicePtrMut(ref_out_buffer.as_mut_ptr()),
+                DataType::BFloat16,
+                &shape,
+                &strides,
+                ep.device_id(),
+            )],
+        )
+        .unwrap();
+
+        // Fused native bf16 skip kernel over the raw input/skip.
+        let kernel = SkipSimplifiedLayerNormKernel {
+            epsilon: 1e-5,
+            runtime: runtime.clone(),
+            metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
+            bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
+            last_call_capture_safe: AtomicBool::new(false),
+        };
+        kernel
+            .run(
+                &[
+                    TensorView::new(
+                        DevicePtr(input_buffer.as_ptr()),
+                        DataType::BFloat16,
+                        &shape,
+                        &strides,
+                        ep.device_id(),
+                    ),
+                    TensorView::new(
+                        DevicePtr(skip_buffer.as_ptr()),
+                        DataType::BFloat16,
+                        &shape,
+                        &strides,
+                        ep.device_id(),
+                    ),
+                    gamma_view,
+                ],
+                &mut [
+                    TensorMut::new(
+                        DevicePtrMut(y_buffer.as_mut_ptr()),
+                        DataType::BFloat16,
+                        &shape,
+                        &strides,
+                        ep.device_id(),
+                    ),
+                    TensorMut::new(
+                        DevicePtrMut(mean_buffer.as_mut_ptr()),
+                        DataType::Float32,
+                        &[1usize],
+                        &[1i64],
+                        ep.device_id(),
+                    ),
+                    TensorMut::new(
+                        DevicePtrMut(invstd_buffer.as_mut_ptr()),
+                        DataType::Float32,
+                        &[1usize],
+                        &[1i64],
+                        ep.device_id(),
+                    ),
+                    TensorMut::new(
+                        DevicePtrMut(sum_buffer.as_mut_ptr()),
+                        DataType::BFloat16,
+                        &shape,
+                        &strides,
+                        ep.device_id(),
+                    ),
+                ],
+            )
+            .unwrap();
+        runtime.synchronize().unwrap();
+        assert!(
+            kernel.last_call_capture_safe.load(Ordering::Relaxed),
+            "native bf16 skip must stay capture-safe at num_groups==1"
+        );
+
+        let read_bf16 = |buffer: &onnx_runtime_ep_api::DeviceBuffer| -> Vec<u16> {
+            let mut raw = vec![0u8; bytes];
+            unsafe {
+                runtime.dtoh(&mut raw, cuptr(buffer.as_ptr())).unwrap();
+            }
+            raw.chunks_exact(2)
+                .map(|c| u16::from_ne_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let ref_bits = read_bf16(&ref_out_buffer);
+        let y_bits = read_bf16(&y_buffer);
+        let sum_bits = read_bf16(&sum_buffer);
+        let residual_ref_bits: Vec<u16> = residual_ref.iter().map(|v| v.to_bits()).collect();
+
+        assert_eq!(
+            sum_bits, residual_ref_bits,
+            "fused residual sum must be bit-identical to standalone Add(bf16) (gamma_bf16={gamma_bf16})"
+        );
+        assert_eq!(
+            y_bits, ref_bits,
+            "fused norm output must be bit-identical to standalone Add(bf16)+rmsnorm_bf16 (gamma_bf16={gamma_bf16})"
+        );
+
+        for buffer in [
+            input_buffer,
+            skip_buffer,
+            residual_buffer,
+            gamma_buffer,
+            ref_out_buffer,
+            y_buffer,
+            sum_buffer,
+            mean_buffer,
+            invstd_buffer,
+        ] {
+            ep.deallocate(buffer).unwrap();
+        }
+    }
+
+    #[test]
+    fn bf16_native_skip_rmsnorm_is_byte_exact_with_bf16_gamma() {
+        assert_bf16_skip_byte_exact(true);
+    }
+
+    #[test]
+    fn bf16_native_skip_rmsnorm_is_byte_exact_with_f32_gamma() {
+        assert_bf16_skip_byte_exact(false);
     }
 
     fn f32_bytes_mut(values: &mut [f32]) -> &mut [u8] {
@@ -2962,6 +4119,7 @@ mod tests {
                 epsilon: 1e-5,
                 runtime: runtime.clone(),
                 metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
+                bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
                 last_call_capture_safe: AtomicBool::new(false),
             };
             kernel.run(&inputs, &mut [output]).unwrap();
@@ -3138,14 +4296,28 @@ mod tests {
 
     #[test]
     fn fp16_skip_rmsnorm_source_uses_one_warp_without_shared_reduction() {
-        let start = SKIP_RMSNORM_SRC
-            .find("extern \"C\" __global__ void skip_rmsnorm_f16")
+        // The prefill (many-rows) fp16 skip path stays one warp per row with a
+        // pure warp-shuffle reduction. Scope the assertions to the warp kernel
+        // body only — the decode `skip_rmsnorm_f16_block_half4` variant that
+        // follows it deliberately uses a `__syncthreads` block-tree reduction.
+        let warp_start = SKIP_RMSNORM_SRC
+            .find("extern \"C\" __global__ void skip_rmsnorm_f16_warp_half4")
             .unwrap();
-        let source = &SKIP_RMSNORM_SRC[start..];
-        assert!(source.contains("__half2"));
-        assert!(source.contains("__shfl_down_sync"));
-        assert!(!source.contains("extern __shared__"));
-        assert!(!source.contains("__syncthreads"));
+        let block_start = SKIP_RMSNORM_SRC
+            .find("__device__ __forceinline__ void skip_rmsnorm_f16_block_half4_tpl")
+            .unwrap();
+        assert!(block_start > warp_start);
+        let warp_body = &SKIP_RMSNORM_SRC[warp_start..block_start];
+        assert!(warp_body.contains("__half2"));
+        assert!(warp_body.contains("__shfl_down_sync"));
+        assert!(!warp_body.contains("extern __shared__"));
+        assert!(!warp_body.contains("__syncthreads"));
+
+        // The decode block variant fans one row across a whole block and reduces
+        // through the file's launch-invariant `red[tid]` block tree.
+        let block_body = &SKIP_RMSNORM_SRC[block_start..];
+        assert!(block_body.contains("extern __shared__ float red[]"));
+        assert!(block_body.contains("__syncthreads"));
     }
 
     #[test]
@@ -3200,6 +4372,303 @@ mod tests {
                     "RMSNormalization"
                 }
             );
+        }
+    }
+
+    /// f64 numerical oracle for the bf16 `RMSNormalization` fold path at
+    /// Muse-Glimmer's decoder width (hidden = 6656, bf16 activations, f32 scale
+    /// — the exact shape `CudaDropNormalizationCasts` produces). This gates the
+    /// parallel f32 tree reduction in `rmsnorm_bf16`: the kernel output must
+    /// match a per-element f64 ground-truth RMS to within one bf16 ulp, and the
+    /// parallel tree mean-square must be at least as close to the f64 truth as
+    /// the strict left-to-right serial f32 order used by `rmsnorm_f32`. This is
+    /// the numerical justification (for Chew's precision gate) that the tree
+    /// reduction is a legitimate full-f32-precision reduction, not a regression.
+    #[test]
+    fn bf16_rmsnorm_tree_reduction_matches_f64_oracle_at_muse_glimmer_width() {
+        let ep = match CudaExecutionProvider::new_default() {
+            Ok(ep) => ep,
+            Err(error) => {
+                eprintln!("skip: no CUDA GPU/runtime available ({error})");
+                return;
+            }
+        };
+        let hidden = 6656usize;
+        let epsilon = 1e-6f32;
+        // Deterministic, mixed-magnitude activations that stress FP summation
+        // order (values span ~3 orders of magnitude, alternating sign).
+        let x_f32: Vec<f32> = (0..hidden)
+            .map(|i| {
+                let t = (i as f32) * 0.017_f32;
+                let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+                sign * (0.001 + (t.sin() * t.cos()).abs() * 3.0)
+            })
+            .collect();
+        let x_bf16: Vec<bf16> = x_f32.iter().map(|v| bf16::from_f32(*v)).collect();
+        // Gemma-style "+1" f32 scale (the fold leaves scale in f32).
+        let scale_f32: Vec<f32> = (0..hidden).map(|i| 1.0 + ((i % 7) as f32) * 0.03).collect();
+
+        let shape = [1usize, hidden];
+        let strides = compute_contiguous_strides(&shape);
+        let param_shape = [hidden];
+        let param_strides = compute_contiguous_strides(&param_shape);
+
+        let x_buffer = ep
+            .allocate(std::mem::size_of_val(x_bf16.as_slice()), 256)
+            .unwrap();
+        let scale_buffer = ep
+            .allocate(std::mem::size_of_val(scale_f32.as_slice()), 256)
+            .unwrap();
+        let mut out_buffer = ep
+            .allocate(std::mem::size_of_val(x_bf16.as_slice()), 256)
+            .unwrap();
+        let runtime = ep.runtime();
+        unsafe {
+            runtime
+                .htod(bf16_bytes(&x_bf16), cuptr(x_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(f32_bytes(&scale_f32), cuptr(scale_buffer.as_ptr()))
+                .unwrap();
+        }
+        let x = TensorView::new(
+            DevicePtr(x_buffer.as_ptr()),
+            DataType::BFloat16,
+            &shape,
+            &strides,
+            ep.device_id(),
+        );
+        let scale_view = TensorView::new(
+            DevicePtr(scale_buffer.as_ptr()),
+            DataType::Float32,
+            &param_shape,
+            &param_strides,
+            ep.device_id(),
+        );
+        let output = TensorMut::new(
+            DevicePtrMut(out_buffer.as_mut_ptr()),
+            DataType::BFloat16,
+            &shape,
+            &strides,
+            ep.device_id(),
+        );
+        RmsNormKernel {
+            axis: -1,
+            epsilon,
+            runtime: runtime.clone(),
+            warmed_signature: Mutex::new(None),
+            last_call_capture_safe: AtomicBool::new(false),
+        }
+        .run(&[x, scale_view], &mut [output])
+        .unwrap();
+        runtime.synchronize().unwrap();
+
+        let mut out_bytes = vec![0u8; std::mem::size_of_val(x_bf16.as_slice())];
+        unsafe {
+            runtime
+                .dtoh(&mut out_bytes, cuptr(out_buffer.as_ptr()))
+                .unwrap();
+        }
+        let out_bf16: Vec<bf16> = out_bytes
+            .chunks_exact(2)
+            .map(|raw| bf16::from_bits(u16::from_ne_bytes(raw.try_into().unwrap())))
+            .collect();
+
+        // The kernel upcasts the *stored* bf16 activations, so the oracle must
+        // use the same bf16-rounded values (not the original f32) as ground
+        // truth for the elements; the reduction itself is done in f64.
+        let x_ref: Vec<f64> = x_bf16.iter().map(|v| f64::from(v.to_f32())).collect();
+        let ms_f64: f64 = x_ref.iter().map(|v| v * v).sum::<f64>() / hidden as f64;
+        let inv_std_f64 = 1.0 / (ms_f64 + f64::from(epsilon)).sqrt();
+
+        // Kernel output vs f64 ground truth, measured in bf16 ulp.
+        let mut max_ulp = 0i32;
+        for i in 0..hidden {
+            let expect = x_ref[i] * inv_std_f64 * f64::from(scale_f32[i]);
+            let expect_bf16 = bf16::from_f32(expect as f32);
+            let ulp = (i32::from(out_bf16[i].to_bits()) - i32::from(expect_bf16.to_bits())).abs();
+            max_ulp = max_ulp.max(ulp);
+        }
+        assert!(
+            max_ulp <= 1,
+            "bf16 rmsnorm output diverges from f64 oracle by {max_ulp} bf16 ulp (want <= 1)"
+        );
+
+        // The parallel tree mean-square must be at least as close to f64 truth
+        // as the serial left-to-right f32 order. Reproduce both in f32.
+        let serial_ms: f32 = {
+            let mut ss = 0.0f32;
+            for v in &x_bf16 {
+                let f = v.to_f32();
+                ss += f * f;
+            }
+            ss / hidden as f32
+        };
+        let tree_ms: f32 = {
+            let mut level: Vec<f32> = x_bf16
+                .iter()
+                .map(|v| {
+                    let f = v.to_f32();
+                    f * f
+                })
+                .collect();
+            while level.len() > 1 {
+                let mut next = Vec::with_capacity(level.len().div_ceil(2));
+                let mut i = 0;
+                while i + 1 < level.len() {
+                    next.push(level[i] + level[i + 1]);
+                    i += 2;
+                }
+                if i < level.len() {
+                    next.push(level[i]);
+                }
+                level = next;
+            }
+            level[0] / hidden as f32
+        };
+        let serial_err = (f64::from(serial_ms) - ms_f64).abs();
+        let tree_err = (f64::from(tree_ms) - ms_f64).abs();
+        assert!(
+            tree_err <= serial_err * 1.000_001 + 1e-9,
+            "tree mean-square error {tree_err:e} exceeds serial error {serial_err:e}"
+        );
+    }
+
+    /// Run the fused skip-RMSNorm block kernel for `dtype`/`hidden` (dense skip,
+    /// no bias, num_groups == 1 — the decode shape) and return the raw `y` bytes.
+    /// The current process env decides whether the warp-shuffle reduction tail is
+    /// used, so a caller can compare flag-off vs flag-on byte-for-byte.
+    fn run_skip_rmsnorm_y_bits(
+        ep: &CudaExecutionProvider,
+        dtype: DataType,
+        hidden: usize,
+    ) -> Vec<u8> {
+        let shape = [1usize, hidden];
+        let strides = compute_contiguous_strides(&shape);
+        let gamma_shape = [hidden];
+        let gamma_strides = compute_contiguous_strides(&gamma_shape);
+        let elem = if dtype == DataType::Float32 { 4 } else { 2 };
+        let encode = |values: &[f32]| -> Vec<u8> {
+            match dtype {
+                DataType::Float32 => values.iter().flat_map(|v| v.to_ne_bytes()).collect(),
+                DataType::Float16 => values
+                    .iter()
+                    .flat_map(|v| f16::from_f32(*v).to_bits().to_ne_bytes())
+                    .collect(),
+                DataType::BFloat16 => values
+                    .iter()
+                    .flat_map(|v| bf16::from_f32(*v).to_bits().to_ne_bytes())
+                    .collect(),
+                _ => unreachable!(),
+            }
+        };
+        let input: Vec<f32> = (0..hidden)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 31.0)
+            .collect();
+        let skip: Vec<f32> = (0..hidden)
+            .map(|i| ((i * 17 % 67) as f32 - 33.0) / 47.0)
+            .collect();
+        let gamma: Vec<f32> = (0..hidden)
+            .map(|i| 0.75 + (i * 13 % 41) as f32 / 64.0)
+            .collect();
+        let input_bytes = encode(&input);
+        let skip_bytes = encode(&skip);
+        let gamma_bytes = encode(&gamma);
+        let bytes = hidden * elem;
+        let runtime = ep.runtime();
+        let input_buffer = ep.allocate(bytes, 256).unwrap();
+        let skip_buffer = ep.allocate(bytes, 256).unwrap();
+        let gamma_buffer = ep.allocate(bytes, 256).unwrap();
+        let mut y_buffer = ep.allocate(bytes, 256).unwrap();
+        unsafe {
+            runtime
+                .htod(&input_bytes, cuptr(input_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(&skip_bytes, cuptr(skip_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(&gamma_bytes, cuptr(gamma_buffer.as_ptr()))
+                .unwrap();
+        }
+        {
+            let inputs = [
+                TensorView::new(
+                    DevicePtr(input_buffer.as_ptr()),
+                    dtype,
+                    &shape,
+                    &strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(skip_buffer.as_ptr()),
+                    dtype,
+                    &shape,
+                    &strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(gamma_buffer.as_ptr()),
+                    dtype,
+                    &gamma_shape,
+                    &gamma_strides,
+                    ep.device_id(),
+                ),
+            ];
+            let output = TensorMut::new(
+                DevicePtrMut(y_buffer.as_mut_ptr()),
+                dtype,
+                &shape,
+                &strides,
+                ep.device_id(),
+            );
+            let kernel = SkipSimplifiedLayerNormKernel {
+                epsilon: 1e-5,
+                runtime: runtime.clone(),
+                metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
+                bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
+                last_call_capture_safe: AtomicBool::new(false),
+            };
+            kernel.run(&inputs, &mut [output]).unwrap();
+        }
+        runtime.synchronize().unwrap();
+        let mut out = vec![0u8; bytes];
+        unsafe {
+            runtime.dtoh(&mut out, cuptr(y_buffer.as_ptr())).unwrap();
+        }
+        ep.deallocate(input_buffer).unwrap();
+        ep.deallocate(skip_buffer).unwrap();
+        ep.deallocate(gamma_buffer).unwrap();
+        ep.deallocate(y_buffer).unwrap();
+        out
+    }
+
+    /// Parity gate for the opt-in warp-shuffle reduction tail
+    /// (`ONNX_GENAI_RMSNORM_WARP_REDUCE`). The intra-warp offsets finished by
+    /// `__shfl_down_sync` pair lanes in the SAME power-of-two order as the shared
+    /// tree, so the fp32 sum-of-squares — and therefore the entire `y` output —
+    /// must be BYTE-IDENTICAL flag-off vs flag-on across dtypes and block sizes.
+    #[test]
+    fn warp_reduce_tail_is_byte_identical_to_shared_tree() {
+        let Ok(ep) = CudaExecutionProvider::new(0) else {
+            eprintln!("skipping skip-RMSNorm warp-reduce parity test: CUDA unavailable");
+            return;
+        };
+        for dtype in [DataType::Float16, DataType::BFloat16, DataType::Float32] {
+            for hidden in [128usize, 256, 512, 2048, 4096] {
+                // SAFETY: single-threaded test; the kernel reads the flag at
+                // launch time, so toggling it between the two runs is sufficient.
+                unsafe { std::env::remove_var(SKIP_RMSNORM_WARP_REDUCE_ENV) };
+                let base = run_skip_rmsnorm_y_bits(&ep, dtype, hidden);
+                unsafe { std::env::set_var(SKIP_RMSNORM_WARP_REDUCE_ENV, "1") };
+                let warp = run_skip_rmsnorm_y_bits(&ep, dtype, hidden);
+                unsafe { std::env::remove_var(SKIP_RMSNORM_WARP_REDUCE_ENV) };
+                assert_eq!(
+                    base, warp,
+                    "dtype={dtype:?} hidden={hidden}: warp-reduce `y` must be \
+                     byte-identical to the shared-memory tree"
+                );
+            }
         }
     }
 }

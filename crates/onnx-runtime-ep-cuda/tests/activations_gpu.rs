@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU-vs-CPU checks for the CUDA Wave-4 activation kernels.
 
 use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView};
@@ -98,17 +112,25 @@ fn assert_close(got: &[f32], want: &[f32]) {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn wave4_activations_match_cpu_references() {
     let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
         Ok(Ok(ep)) => ep,
         Ok(Err(error)) => {
             eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
         Err(_) => {
             eprintln!("skip: CUDA runtime library loading panicked (library unavailable)");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
     let x = [-3.0, -1.0, -0.0, 0.0, 0.5, 2.0, f32::NAN];
@@ -154,17 +176,25 @@ fn wave4_activations_match_cpu_references() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn silu_matches_cpu_operation_order_exactly() {
     let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
         Ok(Ok(ep)) => ep,
         Ok(Err(error)) => {
             eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
         Err(_) => {
             eprintln!("skip: CUDA runtime library loading panicked (library unavailable)");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
     let x: [f32; 6] = [
@@ -189,17 +219,25 @@ fn silu_matches_cpu_operation_order_exactly() {
     assert_eq!(run(&ep, &silu, &x, None), expected);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn clip_optional_bounds_match_cpu_reference() {
     let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
         Ok(Ok(ep)) => ep,
         Ok(Err(error)) => {
             eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
         Err(_) => {
             eprintln!("skip: CUDA runtime library loading panicked (library unavailable)");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
     let x = [

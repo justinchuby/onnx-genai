@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GenerateRequest, GenerateResult, NativeDecodeDevice,
+    ResourceLimit, ResourceLimits,
 };
 
 const DEFAULT_MODEL_DIR: &str = "/home/justinchu/mobius/.scratch/qwen3-0.6b-int4-cuda-postfix";
@@ -142,11 +143,12 @@ fn offloaded_native_cuda_decode_is_token_identical_and_pages() -> anyhow::Result
     }
     onnx_runtime_ep_cuda::reset_global_offload_stats();
     // Lock the new default: with only WEIGHT_OFFLOAD=1 set (async var unset), the
-    // resolved policy uses the SYNCHRONOUS page-in. Async page-in is opt-in (#544
-    // follow-up: sync is faster in the eviction/thrash regime, measured A/B).
+    // resolved policy uses async page-in so dense lookahead can overlap the known
+    // next layer. The old synchronous path remains available via
+    // ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN=0 for A/B.
     assert!(
-        !onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env().async_pagein,
-        "async page-in must be opt-in: the default offload policy should be synchronous"
+        onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env().async_pagein,
+        "async page-in must be the default: otherwise dense prefetch cannot engage"
     );
     let offloaded_start = Instant::now();
     let offloaded = generate(&dir)?;
@@ -194,5 +196,91 @@ fn offloaded_native_cuda_decode_is_token_identical_and_pages() -> anyhow::Result
         offloaded_elapsed,
         baseline_elapsed.as_secs_f64() / offloaded_elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the real Qwen3-0.6B int4 postfix export and a CUDA device"]
+fn vram_limit_auto_enables_offload_or_fails_at_load() -> anyhow::Result<()> {
+    let Some(dir) = model_dir() else {
+        return Ok(());
+    };
+    if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
+        eprintln!("skipping VRAM-limit native CUDA e2e: CUDA unavailable: {error}");
+        return Ok(());
+    }
+
+    unsafe {
+        std::env::set_var("ONNX_GENAI_EP", "cuda");
+        std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_ENV);
+        std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_DEVICE_BYTES_ENV);
+    }
+    onnx_runtime_ep_cuda::reset_global_offload_stats();
+
+    let load = Engine::from_dir(
+        &dir,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            native_device: Some(NativeDecodeDevice::Cuda { index: Some(0) }),
+            limits: ResourceLimits {
+                vram_limit: ResourceLimit::Bytes(TINY_DEVICE_BUDGET_BYTES),
+                ..ResourceLimits::default()
+            },
+            ..EngineConfig::default()
+        },
+    );
+
+    let mut engine = match load {
+        Ok(engine) => engine,
+        Err(error) => {
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("cannot grant")
+                    || message.contains("requires")
+                    || message.contains("allows"),
+                "load failed, but not with admission arithmetic: {message}"
+            );
+            return Ok(());
+        }
+    };
+
+    let used = engine
+        .governor()
+        .leased_bytes_on(onnx_runtime_memory_governor::Tier::Device);
+    let limit = engine
+        .resource_snapshot()
+        .resolved_limits
+        .vram_bytes
+        .expect("native CUDA load resolves a measured device VRAM budget");
+    assert!(
+        used <= limit,
+        "load admitted {used} committed device bytes under a {limit} byte VRAM limit"
+    );
+
+    let mut request = GenerateRequest::new(PROMPT.to_string());
+    request.options.max_new_tokens = 1;
+    request.options.temperature = 0.0;
+    request.options.greedy = true;
+    request.options.stop_on_eos = false;
+    match engine.generate(request) {
+        Ok(_) => {
+            let stats = onnx_runtime_ep_cuda::global_offload_stats();
+            assert!(
+                stats.page_ins > 0,
+                "generation succeeded under a too-small explicit VRAM limit without automatic \
+                 weight offload: {stats:?}"
+            );
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("weight-residency cache")
+                    || message.contains("cannot grant")
+                    || message.contains("bytes beyond"),
+                "generation failed, but not with residency arithmetic: {message}"
+            );
+        }
+    }
+
     Ok(())
 }

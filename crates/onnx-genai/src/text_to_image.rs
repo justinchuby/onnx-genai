@@ -3,7 +3,7 @@
 //! Text-to-image rendering for declarative diffusion pipelines.
 //!
 //! This module turns a prompt plus sampling parameters into RGB images by
-//! driving a `kind: iterative` pipeline package (see [`docs/DIFFUSION.md`]):
+//! driving a `kind: iterative` pipeline package (see [`docs/genai/DIFFUSION.md`]):
 //!
 //! ```text
 //! text_encoder (prompt_only) -> denoiser (iterative) -> vae (final_only)
@@ -19,7 +19,7 @@
 //! supported through [`VaeDecoder`], which decodes the final latent with a
 //! standalone ONNX session.
 //!
-//! [`docs/DIFFUSION.md`]: https://github.com/justinchuby/onnx-genai/blob/main/docs/DIFFUSION.md
+//! [`docs/genai/DIFFUSION.md`]: https://github.com/justinchuby/onnx-genai/blob/main/docs/genai/DIFFUSION.md
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

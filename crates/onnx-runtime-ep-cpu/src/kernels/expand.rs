@@ -1,4 +1,4 @@
-//! `Expand`: broadcast the input to a target shape (`docs/ORT2.md` §4.4).
+//! `Expand`: broadcast the input to a target shape (`docs/architecture/ORT2.md` §4.4).
 //!
 //! ONNX `Expand` uses **bidirectional** (numpy) broadcasting between the input
 //! shape and the `shape` input; the resulting shape is the broadcast of the

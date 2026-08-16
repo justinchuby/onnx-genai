@@ -1,10 +1,24 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU parity tests for `pkg.nxrt::SparseKvGather` v1.
 //!
 //! Each case builds a tiny single-node model with the `onnx-runtime-ir` graph
 //! API, runs it through the CUDA EP, and compares the device output against the
 //! CPU reference kernel (for f32) or hand-computed expected records (for the
-//! f16/bf16 byte-copy paths the CPU op does not cover). Tests skip cleanly when
-//! no CUDA device is present.
+//! f16/bf16 byte-copy paths the CPU op does not cover). CPU-only CI reports
+//! these tests as ignored unless `gpu-tests` is enabled.
 
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
@@ -75,13 +89,15 @@ impl HostTensor {
     }
 }
 
-fn gpu() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -243,9 +259,13 @@ fn as_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn basic_gather_matches_cpu_and_expected() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     // cache [B=1,G=1,C=4,D=2], indices [1,1,1,4] selecting 2,0,2,3 (dup + order).
     let cache = HostTensor::f32(
         &[1, 1, 4, 2],
@@ -268,9 +288,13 @@ fn basic_gather_matches_cpu_and_expected() {
     assert_eq!(gpu_out, cpu_out);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn int32_indices_and_multibatch_group_match_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     // B=2, G=2, C=3, D=2; Q=2, K=3. Distinct values per (b,g) record.
     let mut cache_vals = Vec::new();
     for bg in 0..4 {
@@ -304,9 +328,13 @@ fn int32_indices_and_multibatch_group_match_cpu() {
     assert_eq!(gpu_out, cpu_out);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn valid_lengths_limits_gather_and_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let cache = HostTensor::f32(
         &[1, 1, 4, 2],
         &[0.0, 1.0, 10.0, 11.0, 20.0, 21.0, 30.0, 31.0],
@@ -329,9 +357,13 @@ fn valid_lengths_limits_gather_and_matches_cpu() {
     assert_eq!(gpu_out, cpu_out);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn index_at_or_beyond_valid_length_errors() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     // valid_lengths=3 makes index 3 out of range even though cache has 4 rows.
     let cache = HostTensor::f32(&[1, 1, 4, 2], &[0.0; 8]);
     let indices = HostTensor::i64(&[1, 1, 1, 3], &[0, 1, 3]);
@@ -351,9 +383,13 @@ fn index_at_or_beyond_valid_length_errors() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn negative_index_errors() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let cache = HostTensor::f32(&[1, 1, 4, 2], &[0.0; 8]);
     let indices = HostTensor::i64(&[1, 1, 1, 3], &[0, -1, 2]);
     let out_shape = [1, 1, 1, 3, 2];
@@ -366,9 +402,13 @@ fn negative_index_errors() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn empty_selection_yields_empty_output() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     // K=0 -> zero selected records, a valid empty contiguous output.
     let cache = HostTensor::f32(&[1, 1, 1, 2], &[1.0, 2.0]);
     let indices = HostTensor::i64(&[1, 1, 3, 0], &[]);
@@ -379,9 +419,13 @@ fn empty_selection_yields_empty_output() {
     assert!(gpu_out.is_empty());
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn zero_dim_valid_indices_match_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let cache = HostTensor::f32(&[1, 1, 3, 0], &[]);
     let indices = HostTensor::i64(&[1, 1, 2, 2], &[0, 2, 1, 0]);
     let valid = HostTensor::i64(&[1], &[3]);
@@ -394,9 +438,13 @@ fn zero_dim_valid_indices_match_cpu() {
     assert_eq!(gpu_out, cpu_out);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn zero_dim_negative_index_errors_like_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let cache = HostTensor::f32(&[1, 1, 3, 0], &[]);
     let indices = HostTensor::i64(&[1, 1, 1, 2], &[0, -1]);
     let out_shape = [1, 1, 1, 2, 0];
@@ -415,9 +463,13 @@ fn zero_dim_negative_index_errors_like_cpu() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn zero_dim_indices_at_or_above_cache_length_error_like_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let out_shape = [1, 1, 1, 1, 0];
     for index in [3, 4] {
         let cache = HostTensor::f32(&[1, 1, 3, 0], &[]);
@@ -439,9 +491,13 @@ fn zero_dim_indices_at_or_above_cache_length_error_like_cpu() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn f16_gather_matches_bit_exact_copy() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let values = [0.0f32, 1.5, -2.25, 3.0, 4.5, -5.5, 6.0, 7.75];
     let cache = HostTensor::f16(&[1, 1, 4, 2], &values);
     let indices = HostTensor::i64(&[1, 1, 1, 4], &[3, 0, 3, 1]);
@@ -457,9 +513,13 @@ fn f16_gather_matches_bit_exact_copy() {
     assert_eq!(got, [6.0, 7.75, 0.0, 1.5, 6.0, 7.75, -2.25, 3.0]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn bf16_gather_matches_bit_exact_copy() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let values = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
     let cache = HostTensor::bf16(&[1, 1, 3, 2], &values);
     let indices = HostTensor::i32(&[1, 1, 1, 3], &[2, 2, 0]);
@@ -474,9 +534,13 @@ fn bf16_gather_matches_bit_exact_copy() {
     assert_eq!(got, [5.0, 6.0, 5.0, 6.0, 1.0, 2.0]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn deepseek_kv_layout_shape_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     // Realistic compressed-sparse-attention decode geometry: a small head count
     // and head dim, a 130-wide candidate row (128 window + 2 compressed), and a
     // KV cache long enough to exercise the ring/compressed offset span.

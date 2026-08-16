@@ -159,6 +159,25 @@ extern "C" void MlasStandaloneParallelFor(
     }
 }
 
+// Non-null `MLAS_THREADPOOL` sentinel enabling MLAS's parallel branches.
+//
+// In the standalone (`BUILD_MLAS_NO_ONNXRUNTIME`) build there is no ORT
+// thread-pool class to instantiate, and MLAS never dereferences this pointer:
+// `MlasGetMaximumThreadCount` ignores it entirely and reports
+// `MlasStandaloneMaxThreads()`, while `MlasTrySimpleParallel` only tests it
+// against null to decide whether to hand the iterations to the registered Rust
+// work-stealing backend (see `MlasStandaloneParallelFor` above). Passing null
+// therefore does not merely skip a thread pool -- it forces MLAS's *serial*
+// fallback loop.
+//
+// Caveat inherited from the backend: `WorkStealingThreadPool::parallel_for`
+// takes a dispatch lock, so calling one of these GEMM entry points from
+// *inside* a work item already running on that pool would deadlock. No call
+// site does this today (MLAS drives the pool, never the reverse), but a future
+// caller that nests GEMMs must route the inner call around the pool.
+static MLAS_THREADPOOL* const kMlasParallelSentinel =
+    reinterpret_cast<MLAS_THREADPOOL*>(1);
+
 extern "C" void mlas_sgemm(
     int transA,   // 0 = no-transpose, 1 = transpose
     int transB,
@@ -190,7 +209,7 @@ extern "C" void mlas_sgemm(
         transB ? CblasTrans : CblasNoTrans,
         M, N, K,
         &data, 1,
-        /*ThreadPool=*/nullptr,
+        kMlasParallelSentinel,
         /*BackendKernelSelectorConfig=*/nullptr);
 }
 
@@ -391,7 +410,7 @@ extern "C" void mlas_sgemm_packed(
         transB ? CblasTrans : CblasNoTrans,
         M, N, K,
         &data, 1,
-        /*ThreadPool=*/nullptr,
+        kMlasParallelSentinel,
         /*BackendKernelSelectorConfig=*/nullptr);
 }
 
@@ -405,6 +424,28 @@ extern "C" void mlas_compute_logistic(
     size_t n)
 {
     MlasComputeLogistic(input, output, n);
+}
+
+// ---- Vectorized softmax ----------------------------------------------------
+// `n` independent rows of `d` contiguous floats, normalized in the same way
+// ONNX Runtime's own Softmax/attention kernels do: MLAS finds each row max with
+// a SIMD reduction and exponentiates with its polynomial `expf` approximation
+// instead of a scalar libm call. `ThreadPool` is null because every caller here
+// is already inside a parallel region and drives its own sharding.
+// Runs in place: for the non-log form MLAS streams `Input -> Output` element by
+// element and then rescales `Output` alone, so passing one buffer for both is
+// exactly what ONNX Runtime's own attention kernels do.
+extern "C" void mlas_compute_softmax_in_place(
+    float* data,
+    size_t n,
+    size_t d)
+{
+    MlasComputeSoftmax<float>(
+        data, data, n, d,
+        /*LogSoftmax=*/false,
+        /*SmoothSoftmax=*/false,
+        /*Sink=*/0.0f,
+        /*ThreadPool=*/nullptr);
 }
 
 // ---- Vectorized SiLU -------------------------------------------------------
@@ -666,4 +707,60 @@ extern "C" void mlas_nchwc_pool(
         input,
         output,
         thread_pool);
+}
+
+// ---- Integer QGEMM (QLinearMatMul / MatMulInteger) ----
+//
+// MLAS's quantized GEMM is already compiled into this crate (qgemm.cpp plus the
+// AVX2/SSE41/AMX/NEON/UDOT/SDOT/SMMLA kernels); only the binding was missing, so
+// `QLinearMatMul` fell back to a scalar accumulation loop.
+//
+// Layout matches ORT's own `MatMulInteger`/`QLinearMatMul` call: `A` is M-by-K
+// row-major with `lda == K`, `B` is K-by-N row-major with `ldb == N`, and `C` is
+// the M-by-N int32 accumulator with `ldc == N`. Requantization is left to the
+// caller (no `OutputProcessor`), so this returns exactly the integer dot product
+// with the zero points folded in.
+extern "C" void mlas_qgemm_i32(
+    size_t M,
+    size_t N,
+    size_t K,
+    int a_is_signed,
+    int b_is_signed,
+    const void* A,
+    size_t lda,
+    uint8_t zero_point_a,
+    const void* B,
+    size_t ldb,
+    const uint8_t* zero_point_b,
+    int per_column_zero_points,
+    int32_t* C,
+    size_t ldc,
+    int multithread)
+{
+    MLAS_GEMM_QUANT_SHAPE_PARAMS shape;
+    shape.M = M;
+    shape.N = N;
+    shape.K = K;
+    shape.AIsSigned = a_is_signed != 0;
+    shape.BIsSigned = b_is_signed != 0;
+    shape.IsAccumulateMode = false;
+
+    MLAS_GEMM_QUANT_DATA_PARAMS data;
+    data.A = static_cast<const uint8_t*>(A);
+    data.lda = lda;
+    data.ZeroPointA = zero_point_a;
+    data.B = B;
+    data.ldb = ldb;
+    data.ZeroPointB = zero_point_b;
+    data.BIsPacked = false;
+    data.PerColumnZeroPoints = per_column_zero_points != 0;
+    data.C = C;
+    data.ldc = ldc;
+    data.OutputProcessor = nullptr;
+
+    MlasGemmBatch(
+        shape,
+        &data,
+        1,
+        multithread != 0 ? kMlasParallelSentinel : nullptr);
 }

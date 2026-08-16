@@ -36,6 +36,7 @@ impl PipelineEngine {
     pub(crate) fn run_autoregressive(
         &mut self,
         pipeline_request: PipelineGenerateRequest,
+        admission: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<(GenerateResult, PipelineTensors)> {
         // Guard first: a non-autoregressive pipeline (single-pass / iterative
@@ -97,6 +98,13 @@ impl PipelineEngine {
                     &self.models,
                     &ar.decoder,
                     self.native_device.as_ref(),
+                    &self.memory_strategy_plan,
+                    #[cfg(feature = "cuda")]
+                    std::sync::Arc::new(
+                        self.native_cuda_authority
+                            .clone()
+                            .unwrap_or_else(|| self.resource_governor.device_authority()),
+                    ),
                 )?)
             } else {
                 None
@@ -131,6 +139,12 @@ impl PipelineEngine {
             &present,
             None,
         )?;
+        // Bind an empty tensor for any every_step component input left absent by
+        // an inactive prompt producer (e.g. the embedder's `image_features` when
+        // a text-only prompt never ran the vision encoder), so the per-step
+        // component still has every graph input bound — the empty image feed the
+        // muse_decode harness sends each step.
+        self.seed_absent_step_component_inputs(&ar.step_components, &present, &mut tensors)?;
 
         // Static routing from prompt-phase and per-step producers into the
         // decoder. Every non-self edge into the decoder is recomputed from the
@@ -222,6 +236,13 @@ impl PipelineEngine {
         // loaded and driven through the native nxrt backend, so the same decode
         // loop drives both backends through the trait with no forked code path.
         let native_step_components = &native_selection.step_components;
+        // Native every_step components load on the same device the native
+        // decoder targets, so an embeds-driven pipeline runs its embedder on the
+        // CUDA EP next to the decoder (matching `muse_decode`), not on CPU.
+        #[cfg(feature = "native-backend")]
+        let native_step_device = native_decoder_device(self.native_device.as_ref());
+        #[cfg(not(feature = "native-backend"))]
+        let native_step_device = crate::native_decode_device::NativeDecodeDevice::Cpu;
         let step_components = step_bindings
             .into_iter()
             .map(|binding| {
@@ -230,6 +251,7 @@ impl PipelineEngine {
                         &self.models,
                         &binding.component,
                         native_step_components,
+                        &native_step_device,
                     )?;
                 Ok((binding, component))
             })
@@ -273,6 +295,7 @@ impl PipelineEngine {
             };
         let mut backend = PipelineDecodeLoopBackend {
             decoder: decoder_component,
+            admission,
             paged: paged_mirror,
             pool: &mut tensors,
             step_components,

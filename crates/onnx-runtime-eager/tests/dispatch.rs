@@ -1,4 +1,4 @@
-//! End-to-end dispatch tests for `onnx-runtime-eager` (`docs/EAGER.md` Phase-1).
+//! End-to-end dispatch tests for `onnx-runtime-eager` (`docs/execution/EAGER.md` Phase-1).
 //!
 //! Each test drives a real op through the full 7-step dispatch flow — opset
 //! resolution, device resolution, kernel compile+cache, shape inference, output

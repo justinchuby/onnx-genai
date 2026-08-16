@@ -81,6 +81,15 @@ pub enum SeamReason {
     KernelNotWarmed,
     /// The selected device kernel explicitly opts out of capture.
     KernelCaptureUnsupported,
+    /// The build-time capture classifier disqualified this node: one of its
+    /// input or output shapes references a GROWING symbol (KV/total-sequence
+    /// length that increases each decode step). Capturing such a node bakes a
+    /// stale launch grid/count from the warmed extent into the replayed device
+    /// graph → silent decode corruption. This is an authoritative HARD VETO
+    /// applied centrally, independent of the kernel's own `capture_support()`
+    /// opinion, so no kernel returning `CaptureSupport::Supported` can re-admit
+    /// a disqualified node.
+    ClassifierDisqualified,
     /// The kernel aborted device-graph *recording* (e.g. it advertised capture
     /// support but issued a stream synchronize, which CUDA rejects mid-capture)
     /// and was quarantined to a forced eager seam so the rest of the graph can
@@ -97,6 +106,7 @@ impl SeamReason {
             | Self::UnresolvedInputShape
             | Self::KernelNotWarmed
             | Self::CaptureRecordingFailed
+            | Self::ClassifierDisqualified
             | Self::KernelCaptureUnsupported => CapturePathKind::EagerDeviceSeam,
         }
     }
@@ -430,6 +440,60 @@ pub(super) struct DeviceBindingSignature {
 }
 
 impl Executor {
+    /// Pin the fixed-capacity KV sequence-axis symbols CONSTANT so the capture
+    /// classifier ADMITS the attention nodes (`GroupQueryAttention`, capacity
+    /// `Attention`, `IndexShare`) into device-graph capture instead of vetoing
+    /// each as a growing-seq seam. Returns the number of symbols newly pinned.
+    ///
+    /// # Why this is correct
+    /// The build-time classifier ([`compute_capture_disqualifying_symbols`]) seeds
+    /// the KV present/past seq axis as GROWING from the STATIC graph shape, where
+    /// it is left symbolic. But when the engine binds fixed-capacity,
+    /// device-resident KV (physical `[.., max_len, ..]`, valid length read
+    /// on-device — GQA's `seqlens_k`), the attention kernel's launch grid is
+    /// capacity-sized (bounded by the physically-allocated `max_len`), NOT
+    /// growing-seq-sized. The present shape is `past_capacity.max(total)` =
+    /// `max_len` (a constant within the capture), and overflow is caught by
+    /// `total_len > max_len`. So every replayed step has an identical launch grid
+    /// — a captured replay is shape-static and correct. This mirrors the runtime
+    /// fixed-capacity present-shape widening the default-domain `Attention` path
+    /// already performs ([`super::dispatch`]), extended to the same effect for
+    /// `com.microsoft::GroupQueryAttention`.
+    ///
+    /// # Safety / guard preservation
+    /// Only [`collect_capacity_pinned_kv_symbols`] symbols are pinned: nodes whose
+    /// EVERY past-KV input is read as physical capacity
+    /// ([`super::geometry::kernel_input_uses_physical_capacity`]). A growing-concat
+    /// or paged KV form does not qualify and stays vetoed. This is invoked by the
+    /// engine ONLY when the runtime actually binds fixed-capacity KV and CUDA
+    /// graphs are enabled ([`DecodeCudaState::new`]); a growing/paged decoder
+    /// clears `graph_enabled` and never calls it. KV growth / capacity-bucket
+    /// rebucket invalidates and re-captures the graph (`invalidate_graph`), and a
+    /// binding-signature mismatch on replay is independently caught, so a pinned
+    /// symbol is never replayed against a stale grid.
+    pub(crate) fn pin_fixed_capacity_kv_capture_symbols(&mut self) -> usize {
+        let pinned = collect_capacity_pinned_kv_symbols(&self.graph);
+        if pinned.is_empty() {
+            return 0;
+        }
+        // Recompute the disqualifying set with the pinned KV seq axes treated as
+        // constant capacity, so their attention consumers are admitted.
+        self.capture_growing_symbols =
+            compute_capture_disqualifying_symbols_excluding(&self.graph, &pinned);
+        let count = pinned.len();
+        self.capacity_pinned_kv_symbols = pinned;
+        if std::env::var("ONNX_GENAI_LOG_GROWING_SYMBOLS").is_ok() {
+            eprintln!(
+                "[onnx-genai-capture] pinned {} fixed-capacity KV seq symbol(s): {:?}; \
+                 disqualifying set now {} symbol(s)",
+                count,
+                self.capacity_pinned_kv_symbols,
+                self.capture_growing_symbols.len(),
+            );
+        }
+        count
+    }
+
     /// Classify why one plan node cannot be recorded into a device graph, or
     /// `None` when it is capturable. Mirrors the per-node predicates the
     /// all-or-nothing audit used, but returns the reason instead of aborting so
@@ -586,6 +650,31 @@ impl Executor {
             inputs_resolved && outputs_resolved,
             "EP capture-region policy admitted a node with unresolved shapes"
         );
+        // CENTRAL HARD VETO — the build-time capture classifier is authoritative.
+        // If any input/output shape of this node references a GROWING symbol
+        // (KV/total-sequence length that increases each decode step), the node is
+        // capture-DISQUALIFIED: replaying it would bake a stale launch grid/count
+        // from the warmed extent into the device graph → silent decode
+        // corruption. This veto runs AFTER structural classification
+        // (`plan_capture_region` → host control-flow/sequence and unresolved-shape
+        // declines keep precedence, so a disqualified host node reports the HOST
+        // seam, not a device seam) but BEFORE the kernel admission check below, so
+        // a kernel that returns `CaptureSupport::Supported` unconditionally (and
+        // never stores the classifier flag) can NEVER re-admit a disqualified
+        // node. A node is capture-eligible only if (classifier says
+        // seq-independent) AND (kernel says Supported for the shape);
+        // over-declining is correctness-safe (extra eager nodes), under-declining
+        // is corruption, so we bias to veto.
+        if !node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols) {
+            return Some(CaptureDecline::node(
+                plan.node_id,
+                node,
+                SeamReason::ClassifierDisqualified,
+                "capture classifier disqualified this node: an input or output \
+                 shape depends on a growing (KV/total-sequence-length) symbol, so \
+                 capturing it would replay a stale launch grid — forced eager seam",
+            ));
+        }
         let input_shapes = plan
             .inputs
             .iter()

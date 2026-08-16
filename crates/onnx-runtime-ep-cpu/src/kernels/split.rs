@@ -1,5 +1,5 @@
 //! `Split`: divide one tensor along `axis` into several outputs
-//! (`docs/ORT2.md` §4.4).
+//! (`docs/architecture/ORT2.md` §4.4).
 //!
 //! The split sizes come from one of three sources, checked in ONNX precedence
 //! order: the opset-13+ `split` **input** (an `int64` tensor), the legacy

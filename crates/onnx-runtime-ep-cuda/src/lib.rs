@@ -1,6 +1,6 @@
 //! # `onnx-runtime-ep-cuda`
 //!
-//! The CUDA execution provider for the ORT 2.0 runtime (`docs/ORT2.md` §15 and
+//! The CUDA execution provider for the ORT 2.0 runtime (`docs/architecture/ORT2.md` §15 and
 //! §56 Phase 2). It implements [`onnx_runtime_ep_api::ExecutionProvider`] on top
 //! of [`cudarc`] (driver + cuBLASLt), mirroring the structure of the CPU EP.
 //!
@@ -23,7 +23,7 @@
 //!   tensor-core specialization and retained decode/unsupported-shape baselines.
 //!
 //! The full op → backend mapping matrix, remaining coverage, and the
-//! prioritised custom-kernel candidate list live in `docs/CUDA_COVERAGE.md`.
+//! prioritised custom-kernel candidate list live in `docs/execution/CUDA_COVERAGE.md`.
 //! Roadmap ops not yet wired (cuDNN softmax/norm, cub reductions, data-movement,
 //! FP8 and remaining fusion-node lowering return an actionable
 //! [`onnx_runtime_ep_api::EpError`].
@@ -55,19 +55,45 @@
 //! addresses in [`onnx_runtime_ep_api::DeviceBuffer`] and are never
 //! dereferenced on the host.
 
+#[cfg(not(any(
+    feature = "cuda-12060",
+    feature = "cuda-12080",
+    feature = "cuda-12090",
+    feature = "cuda-13000"
+)))]
+compile_error!(
+    "onnx-genai CUDA build: no CUDA version selected. Enable exactly one of cuda-12060 | cuda-12080 | cuda-12090 | cuda-13000."
+);
+
+#[cfg(any(
+    all(feature = "cuda-12060", feature = "cuda-12080"),
+    all(feature = "cuda-12060", feature = "cuda-12090"),
+    all(feature = "cuda-12060", feature = "cuda-13000"),
+    all(feature = "cuda-12080", feature = "cuda-12090"),
+    all(feature = "cuda-12080", feature = "cuda-13000"),
+    all(feature = "cuda-12090", feature = "cuda-13000")
+))]
+compile_error!(
+    "onnx-genai CUDA build: multiple CUDA versions selected; cudarc bindings cannot compile with more than one. Enable exactly one of cuda-12060 | cuda-12080 | cuda-12090 | cuda-13000 (and set default-features = false on inter-crate deps if you override the default)."
+);
+
 pub mod blas;
 pub mod capture;
 pub mod cudnn;
-pub mod device_allocator;
 mod dynamic_library;
 pub mod error;
 mod graph;
 pub mod kernels;
 mod optimizer;
+pub mod pinned_pool;
 pub mod provider;
 pub mod runtime;
 mod trace;
-pub mod virtual_memory;
+// Device memory moved to `onnx-runtime-cuda-memory`: an execution provider is
+// about operators, and where the memory came from is a separate question that
+// a caller with no interest in kernels may need to answer. Re-exported so the
+// move is not a breaking change for anyone already reaching for these paths.
+pub use onnx_runtime_cuda_memory::{device_allocator, virtual_memory, vmm_allocator};
 pub mod weight_paging;
 
 pub use capture::{require_subgraph_graph_capturable, subgraph_graph_capturable};
@@ -87,16 +113,28 @@ pub use kernels::group_query_attention::{
 pub use kernels::index_share::INDEX_SHARE_CAPTURE_ERROR_INDEX;
 pub use kernels::indexing::SCATTER_CAPTURE_ERROR_INDEX;
 pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;
-pub use kernels::{CUDA_COVERED_OPS, build_cuda_registry, build_cuda_registry_with_metrics};
-pub use provider::CudaExecutionProvider;
+pub use kernels::{
+    CUDA_COVERED_OPS, CudaOpDescriptor, build_cuda_registry, build_cuda_registry_descriptors,
+    build_cuda_registry_with_metrics, cuda_supported_dtypes_for_op,
+};
+pub use pinned_pool::{PinnedStagingPool, global_pinned_alloc_calls, global_pinned_reuses};
+pub use provider::{
+    CudaExecutionProvider, DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES, dynamic_kv_weight_lending_enabled,
+};
 pub use weight_paging::{
     CudaResidencyStats, CudaWeightPage, CudaWeightPager, CudaWeightResidency, DeviceOffloadPolicy,
-    GlobalOffloadStats, WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV, WEIGHT_OFFLOAD_DEVICE_BYTES_ENV,
-    WEIGHT_OFFLOAD_ENV, global_offload_stats, reset_global_offload_stats,
+    EvictOrderProbe, GlobalOffloadStats, WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV,
+    WEIGHT_OFFLOAD_BYTE_AWARE_ENV, WEIGHT_OFFLOAD_DEVICE_BYTES_ENV, WEIGHT_OFFLOAD_ENV,
+    WEIGHT_OFFLOAD_EVICT_ORDER_ENV, WEIGHT_OFFLOAD_SCAN_RESISTANT_ENV,
+    WEIGHT_OFFLOAD_ZERO_COPY_HYBRID_ENV, WeightKeyTrace, byte_aware_residency_from_env,
+    evict_order_probe_from_env, global_offload_stats, pinned_hot_set, reset_global_offload_stats,
+    weight_paging_key_trace, zero_copy_hybrid_from_env,
 };
 
-/// Number of additional u32 words required by the CUDA device argmax result buffer.
-pub fn device_argmax_scratch_words(elements: usize) -> usize {
-    kernels::device_argmax::scratch_words(elements)
+/// Number of additional u32 words the CUDA device argmax result buffer needs
+/// beyond its `2 × batch` header words, for `batch` sequences of `elements`
+/// logits each.
+pub fn device_argmax_scratch_words(elements: usize, batch: usize) -> usize {
+    kernels::device_argmax::scratch_words(elements, batch)
 }
 pub use runtime::{CudaAllocationCounts, CudaRuntime};
