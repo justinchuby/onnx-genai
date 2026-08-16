@@ -34,7 +34,15 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::Node;
 
 use super::{check_arity, to_dense_i64};
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::dtype::{
+    output_direct_write_eligible, slice_byte_range, to_dense_f32_widen, write_dense_f32_narrow,
+};
+
+/// Elements below which the rotation stays on one thread. RoPE is two multiplies
+/// and an add per element - firmly memory bound - so the crossover is set by the
+/// pool wake-up cost, not by arithmetic. A single llama3 decode step (32 heads x
+/// 128 dims = 4096 elements) stays serial; a 128-token prefill does not.
+const MIN_PARALLEL_ROTARY_ELEMENTS: usize = 64 * 1024;
 
 /// Floating-point RotaryEmbedding kernel carrying the resolved attributes.
 pub struct RotaryEmbeddingKernel {
@@ -242,45 +250,134 @@ impl Kernel for RotaryEmbeddingKernel {
             Ok(offset)
         };
 
-        // Flat index of element (b, h, s, d) in X's native layout.
-        let idx = |b: usize, h: usize, s: usize, d: usize| -> usize {
-            if is_4d {
-                // [B, H, S, D]
-                ((b * heads + h) * seq + s) * head_size + d
-            } else {
-                // [B, S, H*D]
-                (b * seq + s) * (heads * head_size) + h * head_size + d
-            }
-        };
-
-        let mut y = vec![0.0f32; x.len()];
+        // The cos/sin row for every (b, s) up front. Resolving it inside the
+        // rotation loop meant the fallible `position_ids` lookup could not be
+        // hoisted out of a parallel region, and it was re-done once per (b, s)
+        // per head anyway.
+        let mut cache_rows = vec![0usize; batch * seq];
         for b in 0..batch {
             for s in 0..seq {
-                let crow = cache_row(b, s)?;
+                cache_rows[b * seq + s] = cache_row(b, s)?;
+            }
+        }
+
+        let interleaved = self.interleaved;
+        // One head's rotation, given its `head_size`-long input and output
+        // runs and the (cos, sin) row for its position. Layout-independent:
+        // both callers below hand it contiguous per-head slices.
+        let rotate_head = |src: &[f32], dst: &mut [f32], crow: usize| {
+            let cos_row = &cos_cache[crow..crow + half];
+            let sin_row = &sin_cache[crow..crow + half];
+            if interleaved {
+                for k in 0..half {
+                    let (cos, sin) = (cos_row[k], sin_row[k]);
+                    let (x1, x2) = (src[2 * k], src[2 * k + 1]);
+                    dst[2 * k] = cos * x1 - sin * x2;
+                    dst[2 * k + 1] = sin * x1 + cos * x2;
+                }
+            } else {
+                // Split-half: the two operand runs and the two result runs are
+                // each contiguous, so this is four linear streams with no
+                // index arithmetic in the loop body.
+                let (lo_out, hi_out) = dst[..rotary_dim].split_at_mut(half);
+                let lo_in = &src[..half];
+                let hi_in = &src[half..rotary_dim];
+                for k in 0..half {
+                    let (cos, sin) = (cos_row[k], sin_row[k]);
+                    let (x1, x2) = (lo_in[k], hi_in[k]);
+                    lo_out[k] = cos * x1 - sin * x2;
+                    hi_out[k] = sin * x1 + cos * x2;
+                }
+            }
+            // Pass-through channels beyond the rotary sub-vector.
+            dst[rotary_dim..head_size].copy_from_slice(&src[rotary_dim..head_size]);
+        };
+
+        // Every input element is read exactly once, into the output element at
+        // the same flat position, so a contiguous f32 output that does not
+        // alias any input we read can be written straight through. That saves
+        // zeroing a full-tensor scratch buffer *and* copying it out - together
+        // the dominant cost of this kernel, which is otherwise two multiplies
+        // and an add per element.
+        let read_ranges: Vec<_> = [&*x, &*cos_cache, &*sin_cache]
+            .into_iter()
+            .map(slice_byte_range)
+            .collect();
+        let direct = output_direct_write_eligible(&mut outputs[0], x.len(), &read_ranges);
+        let mut owned;
+        let y: &mut [f32] = if direct {
+            // SAFETY: `output_direct_write_eligible` proved the buffer is a
+            // host-accessible contiguous Float32 tensor of exactly `x.len()`
+            // elements whose byte range is disjoint from every input read here.
+            unsafe { std::slice::from_raw_parts_mut(outputs[0].data_ptr_mut::<f32>(), x.len()) }
+        } else {
+            owned = vec![0.0f32; x.len()];
+            &mut owned
+        };
+        // Chunk the output so each task owns a disjoint, contiguous run in the
+        // tensor's *native* layout - `[B, H, S, D]` splits naturally per
+        // (b, h) plane, `[B, S, H·D]` per (b, s) row. That removes the
+        // per-element layout branch the old flat-index closure carried, and
+        // lets the outer loop fan out across the shared Rayon pool. ORT
+        // parallelizes the same transform.
+        let parallel = y.len() >= MIN_PARALLEL_ROTARY_ELEMENTS;
+        if is_4d {
+            // [B, H, S, D]: plane (b, h) is `seq * head_size` contiguous.
+            let plane = seq * head_size;
+            let fill = |bh: usize, out: &mut [f32]| {
+                let b = bh / heads;
+                let base = bh * plane;
+                for s in 0..seq {
+                    let off = s * head_size;
+                    rotate_head(
+                        &x[base + off..base + off + head_size],
+                        &mut out[off..off + head_size],
+                        cache_rows[b * seq + s],
+                    );
+                }
+            };
+            if parallel {
+                use rayon::prelude::*;
+                y.par_chunks_mut(plane).enumerate().for_each(|(bh, out)| {
+                    fill(bh, out);
+                });
+            } else {
+                for (bh, out) in y.chunks_mut(plane).enumerate() {
+                    fill(bh, out);
+                }
+            }
+        } else {
+            // [B, S, H·D]: row (b, s) is `heads * head_size` contiguous.
+            let row_len = heads * head_size;
+            let fill = |bs: usize, out: &mut [f32]| {
+                let base = bs * row_len;
+                let crow = cache_rows[bs];
                 for h in 0..heads {
-                    // Rotary sub-vector.
-                    for k in 0..half {
-                        let cos = cos_cache[crow + k];
-                        let sin = sin_cache[crow + k];
-                        let (d1, d2) = if self.interleaved {
-                            (2 * k, 2 * k + 1)
-                        } else {
-                            (k, k + half)
-                        };
-                        let x1 = x[idx(b, h, s, d1)];
-                        let x2 = x[idx(b, h, s, d2)];
-                        y[idx(b, h, s, d1)] = cos * x1 - sin * x2;
-                        y[idx(b, h, s, d2)] = sin * x1 + cos * x2;
-                    }
-                    // Pass-through channels beyond the rotary sub-vector.
-                    for d in rotary_dim..head_size {
-                        y[idx(b, h, s, d)] = x[idx(b, h, s, d)];
-                    }
+                    let off = h * head_size;
+                    rotate_head(
+                        &x[base + off..base + off + head_size],
+                        &mut out[off..off + head_size],
+                        crow,
+                    );
+                }
+            };
+            if parallel {
+                use rayon::prelude::*;
+                y.par_chunks_mut(row_len).enumerate().for_each(|(bs, out)| {
+                    fill(bs, out);
+                });
+            } else {
+                for (bs, out) in y.chunks_mut(row_len).enumerate() {
+                    fill(bs, out);
                 }
             }
         }
 
-        write_dense_f32_narrow("RotaryEmbedding", &mut outputs[0], &y)
+        if direct {
+            Ok(())
+        } else {
+            write_dense_f32_narrow("RotaryEmbedding", &mut outputs[0], y)
+        }
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -728,6 +825,208 @@ mod tests {
 
         for (a, b) in out_std.to_f32().iter().zip(out_contrib.to_f32().iter()) {
             assert!((a - b).abs() < 1e-6, "contrib {b} != standard {a}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+    use crate::kernels::testutil::Owned;
+
+    /// Independent scalar oracle written in the original flat-index style, so
+    /// it cross-checks the layout-specialised chunked loops rather than
+    /// restating them.
+    #[allow(clippy::too_many_arguments)]
+    fn reference(
+        x: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        batch: usize,
+        seq: usize,
+        heads: usize,
+        head_size: usize,
+        rotary_dim: usize,
+        interleaved: bool,
+        is_4d: bool,
+    ) -> Vec<f32> {
+        let half = rotary_dim / 2;
+        let idx = |b: usize, h: usize, s: usize, d: usize| -> usize {
+            if is_4d {
+                ((b * heads + h) * seq + s) * head_size + d
+            } else {
+                (b * seq + s) * (heads * head_size) + h * head_size + d
+            }
+        };
+        let mut y = vec![0.0f32; x.len()];
+        for b in 0..batch {
+            for s in 0..seq {
+                let crow = (b * seq + s) * half;
+                for h in 0..heads {
+                    for k in 0..half {
+                        let (c, sn) = (cos[crow + k], sin[crow + k]);
+                        let (d1, d2) = if interleaved {
+                            (2 * k, 2 * k + 1)
+                        } else {
+                            (k, k + half)
+                        };
+                        let x1 = x[idx(b, h, s, d1)];
+                        let x2 = x[idx(b, h, s, d2)];
+                        y[idx(b, h, s, d1)] = c * x1 - sn * x2;
+                        y[idx(b, h, s, d2)] = sn * x1 + c * x2;
+                    }
+                    for d in rotary_dim..head_size {
+                        y[idx(b, h, s, d)] = x[idx(b, h, s, d)];
+                    }
+                }
+            }
+        }
+        y
+    }
+
+    fn synthetic(n: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(2654435761).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((state >> 8) as f32 / (1u32 << 24) as f32) * 4.0 - 2.0
+            })
+            .collect()
+    }
+
+    /// Sweep both layouts, both rotation modes, full and partial rotary dims,
+    /// and sizes that straddle `MIN_PARALLEL_ROTARY_ELEMENTS` in both
+    /// directions. The fan-out chunks disjoint runs, so it must be exactly
+    /// bit-identical to the scalar oracle - not merely close.
+    #[test]
+    fn every_layout_and_size_matches_the_scalar_reference() {
+        for &(batch, seq, heads, head_size, rotary_dim) in &[
+            (1usize, 1usize, 4usize, 8usize, 8usize), // tiny, serial
+            (1, 1, 32, 128, 128),                     // llama3 decode step, serial
+            (1, 128, 32, 128, 128),                   // prefill, parallel
+            (2, 40, 6, 16, 8),                        // partial rotary, parallel-ish
+            (3, 7, 5, 12, 12),                        // nothing divides evenly
+        ] {
+            let half = rotary_dim / 2;
+            let n = batch * seq * heads * head_size;
+            let x = synthetic(n, (batch * 7 + seq) as u32);
+            let cos = synthetic(batch * seq * half, 11);
+            let sin = synthetic(batch * seq * half, 13);
+
+            for interleaved in [false, true] {
+                for is_4d in [false, true] {
+                    let shape: Vec<usize> = if is_4d {
+                        vec![batch, heads, seq, head_size]
+                    } else {
+                        vec![batch, seq, heads * head_size]
+                    };
+                    let xt = Owned::f32(&shape, &x);
+                    let pos: Vec<i64> = (0..(batch * seq) as i64).collect();
+                    let post = Owned::i64(&[batch, seq], &pos);
+                    let cost = Owned::f32(&[batch * seq, half], &cos);
+                    let sint = Owned::f32(&[batch * seq, half], &sin);
+                    let mut out = Owned::zeros_f32(&shape);
+
+                    let kernel = RotaryEmbeddingKernel {
+                        interleaved,
+                        num_heads: if is_4d { 0 } else { heads },
+                        rotary_embedding_dim: if rotary_dim == head_size {
+                            0
+                        } else {
+                            rotary_dim
+                        },
+                        contrib: true,
+                    };
+                    kernel
+                        .execute(
+                            &[xt.view(), post.view(), cost.view(), sint.view()],
+                            &mut [out.view_mut()],
+                        )
+                        .unwrap();
+
+                    let expect = reference(
+                        &x,
+                        &cos,
+                        &sin,
+                        batch,
+                        seq,
+                        heads,
+                        head_size,
+                        rotary_dim,
+                        interleaved,
+                        is_4d,
+                    );
+                    assert_eq!(
+                        out.to_f32(),
+                        expect,
+                        "b={batch} s={seq} h={heads} d={head_size} rd={rotary_dim} \
+                         interleaved={interleaved} is_4d={is_4d}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// RoPE's output binding may alias its `X` input. Every rotated pair reads
+    /// both halves before writing either, so an aliased output would corrupt
+    /// the second half; the direct-write guard must decline here.
+    #[test]
+    fn an_output_aliasing_its_input_matches_the_disjoint_result() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
+
+        let (batch, seq, heads, head_size) = (1usize, 64usize, 8usize, 64usize);
+        let n = batch * seq * heads * head_size;
+        let x = synthetic(n, 5);
+        let pos: Vec<i64> = (0..(batch * seq) as i64).collect();
+        let shape = [batch, seq, heads * head_size];
+        let f32c = DataType::Float32;
+        let cpu = DeviceId::cpu();
+        let strides = compute_contiguous_strides(&shape);
+
+        // Full rotation is elementwise alias-safe on its own; partial rotary
+        // adds a pass-through `copy_from_slice`, which is only sound when the
+        // guard has declined. Both are covered.
+        for rotary_dim in [head_size, head_size / 2] {
+            let half = rotary_dim / 2;
+            let cos = synthetic(batch * seq * half, 6);
+            let sin = synthetic(batch * seq * half, 7);
+            let post = Owned::i64(&[batch, seq], &pos);
+            let cost = Owned::f32(&[batch * seq, half], &cos);
+            let sint = Owned::f32(&[batch * seq, half], &sin);
+            let kernel = || RotaryEmbeddingKernel {
+                interleaved: false,
+                num_heads: heads,
+                rotary_embedding_dim: if rotary_dim == head_size {
+                    0
+                } else {
+                    rotary_dim
+                },
+                contrib: true,
+            };
+
+            let disjoint = {
+                let xt = Owned::f32(&shape, &x);
+                let mut out = Owned::zeros_f32(&shape);
+                kernel()
+                    .execute(
+                        &[xt.view(), post.view(), cost.view(), sint.view()],
+                        &mut [out.view_mut()],
+                    )
+                    .unwrap();
+                out.to_f32()
+            };
+
+            let mut shared = x.clone();
+            let in_ptr = shared.as_ptr() as *const std::ffi::c_void;
+            let out_ptr = shared.as_mut_ptr() as *mut std::ffi::c_void;
+            let xv = TensorView::new(DevicePtr(in_ptr), f32c, &shape, &strides, cpu);
+            let outv = TensorMut::new(DevicePtrMut(out_ptr), f32c, &shape, &strides, cpu);
+            kernel()
+                .execute(&[xv, post.view(), cost.view(), sint.view()], &mut [outv])
+                .unwrap();
+
+            assert_eq!(shared, disjoint, "rotary_dim={rotary_dim}");
         }
     }
 }
