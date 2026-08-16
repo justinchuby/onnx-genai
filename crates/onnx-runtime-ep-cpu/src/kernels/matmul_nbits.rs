@@ -2536,6 +2536,10 @@ pub fn set_decode_thread_budget(threads: Option<usize>) -> std::result::Result<(
     // `DECODE_THREADS_OVERRIDE`, so forward the budget explicitly. Without this
     // the budget would only reach dense `MlasGemmBatch` work on Linux, and only
     // indirectly, via the affinity mask shrinking `available_parallelism`.
+    //
+    // Forwarded after the store because the two layers reject exactly the same
+    // input (`Some(0)`, already rejected above), so this call cannot fail and
+    // the two budgets cannot diverge. Keep that invariant if either guard grows.
     #[cfg(feature = "mlas")]
     mlas_sys::set_pool_thread_budget(threads)?;
     Ok(())
@@ -12417,9 +12421,6 @@ mod tests {
         assert_eq!(resolve_decode_min(Some("1"), 96), 1);
     }
 
-    /// Serialize the few tests that mutate `NXRT_CPU_GEMM_BACKEND` so the global
-    /// backend override does not race concurrent test threads.
-    #[cfg(feature = "mlas")]
     /// The standalone MLAS pool cannot see `DECODE_THREADS_OVERRIDE`, so
     /// `set_decode_thread_budget` has to forward explicitly. Without the
     /// forwarding, `--cpu-cores N` bounded dense `MlasGemmBatch` work only on
@@ -12457,6 +12458,9 @@ mod tests {
         set_decode_thread_budget(restore).expect("restoring the prior budget");
     }
 
+    /// Serialize the few tests that mutate `NXRT_CPU_GEMM_BACKEND` so the global
+    /// backend override does not race concurrent test threads.
+    #[cfg(feature = "mlas")]
     fn backend_env_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))

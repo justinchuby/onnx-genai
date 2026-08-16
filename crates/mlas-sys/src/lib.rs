@@ -424,10 +424,13 @@ fn pool_thread_budget() -> Option<usize> {
     (threads > 0).then(|| clamp_pool_threads(threads))
 }
 
-/// The programmatic budget currently in effect, or `None` when unset.
+/// The raw programmatic budget, before the [`MAX_MLAS_POOL_THREADS`] cap, or
+/// `None` when unset.
 ///
 /// Exposed so higher layers can assert that their own budget actually reached
-/// this pool; it does not report the env-var or automatic fallbacks.
+/// this pool; it reports neither the env-var nor the automatic fallback, and
+/// deliberately mirrors the EP's `decode_threads_override` in returning the
+/// value as configured rather than as clamped.
 pub fn configured_pool_thread_budget() -> Option<usize> {
     std::num::NonZeroUsize::new(POOL_THREAD_BUDGET.load(Ordering::Acquire))
         .map(std::num::NonZeroUsize::get)
