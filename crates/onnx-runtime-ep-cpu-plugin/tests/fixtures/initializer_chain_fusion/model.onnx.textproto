@@ -1,0 +1,22 @@
+ir_version: 10
+graph {
+  node: [
+    { input: ["X", "W"] output: ["M"] op_type: "MatMul" },
+    { input: ["M", "B"] output: ["A"] op_type: "Add" },
+    { input: ["A"] output: ["Y"] op_type: "Relu" }
+  ]
+  name: "initializer_chain_fusion"
+  initializer: [
+    { dims: [4, 3] data_type: 1 name: "W" raw_data: "\000\000\200\077\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200\077\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200\077\000\000\200\077\000\000\200\077\000\000\200\077" },
+    { dims: [3] data_type: 1 name: "B" raw_data: "\000\000\200\277\000\000\000\077\000\000\000\100" }
+  ]
+  input: [{
+    name: "X"
+    type { tensor_type { elem_type: 1 shape { dim: [{ dim_value: 2 }, { dim_value: 4 }] } } }
+  }]
+  output: [{
+    name: "Y"
+    type { tensor_type { elem_type: 1 shape { dim: [{ dim_value: 2 }, { dim_value: 3 }] } } }
+  }]
+}
+opset_import: [{ version: 13 }]

@@ -928,21 +928,20 @@ fn claim_has_unroutable_internal_output(
         return false;
     }
     let claimed: std::collections::HashSet<_> = node_ids.iter().copied().collect();
-    let graph_outputs: std::collections::HashSet<_> = graph.outputs.iter().copied().collect();
 
     for &nid in node_ids {
         let Some(node) = graph.nodes.get(nid) else {
             return true;
         };
         for &produced in &node.outputs {
+            let Some(value) = graph.values.get(produced) else {
+                return true;
+            };
             let mut consumed_inside = false;
-            let mut consumed_outside = graph_outputs.contains(&produced);
-            for (other_id, other) in graph.nodes.iter() {
-                if !other.inputs.iter().flatten().any(|&v| v == produced) {
-                    continue;
-                }
-                if claimed.contains(&other_id) {
-                    consumed_inside |= other_id != nid;
+            let mut consumed_outside = value.is_graph_output;
+            for consumer in value.consumers.nodes() {
+                if claimed.contains(&consumer) {
+                    consumed_inside |= consumer != nid;
                 } else {
                     consumed_outside = true;
                 }
@@ -2027,16 +2026,24 @@ mod tests {
         let m = g.create_named_value("m", DataType::Float32, Shape::default());
         let y = g.create_named_value("y", DataType::Float32, Shape::default());
         g.add_output(y);
+        let bias = g.create_named_value("bias", DataType::Float32, Shape::default());
+        let a = g.create_named_value("a", DataType::Float32, Shape::default());
         let n_mm = g.insert_node(Node::new(
             NodeId(0),
             "MatMul",
             vec![Some(x), Some(w)],
             vec![m],
         ));
-        let n_relu = g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(m)], vec![y]));
+        let n_add = g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(m), Some(bias)],
+            vec![a],
+        ));
+        let n_relu = g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(a)], vec![y]));
         assert!(
-            !super::claim_has_unroutable_internal_output(&g, &[n_mm, n_relu]),
-            "an ordinary chain with an internal-only intermediate must keep its fusion"
+            !super::claim_has_unroutable_internal_output(&g, &[n_mm, n_add, n_relu]),
+            "an ordinary chain with internal-only intermediates must keep its fusion"
         );
     }
 

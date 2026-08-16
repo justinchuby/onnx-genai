@@ -3393,7 +3393,7 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
                 e -= 1;
             }
             let m = m & 0x3ff;
-            (sign << 31) | (((127 - 15 + 1 + e) as u32) << 23) | (m << 13)
+            (sign << 31) | (((127 - 15 + 2 + e) as u32) << 23) | (m << 13)
         }
         0x1f => (sign << 31) | (0xff << 23) | (man << 13),
         _ => (sign << 31) | ((exp + 127 - 15) << 23) | (man << 13),
@@ -3545,4 +3545,84 @@ fn assignment_policy_claims_exact_float16_gelu() {
         conformance_teardown(api, env, opts, session, "cpu_ep_gelu_exact_f16");
     }
     eprintln!("\n✅ assignment_policy_claims_exact_float16_gelu: PASSED");
+}
+
+/// The routing filter must not cost any fusion that actually worked.
+///
+/// `MatMul(W) + Add(B) + Relu`, both weights initializers, is the shape an
+/// over-broad filter would wrongly decline (an earlier draft that rejected every
+/// multi-node claim reading an initializer did exactly that, pushing all three
+/// nodes onto `CPUExecutionProvider`). ORT surfaces fused-subgraph initializers
+/// as subgraph inputs, so this routes fine and must stay one claimed subgraph.
+#[test]
+fn initializer_chain_still_fuses_into_one_claim() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/initializer_chain_fusion/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_init_chain", &model_path, false) })
+    else {
+        eprintln!(
+            "*** SKIPPED: initializer_chain_still_fuses_into_one_claim — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        eprintln!(
+            "  [init_chain] ours={:?}, others={:?}",
+            info.ops_on_our_ep(),
+            info.ops_not_on_our_ep()
+        );
+        assert!(
+            info.ops_not_on_our_ep().is_empty(),
+            "the whole MatMul+Add+Relu chain must stay fused on our EP; got: {:?}",
+            info.assignments
+        );
+
+        let mut x_data: [f32; 8] = [1.0, 2.0, 3.0, 4.0, -1.0, -2.0, -3.0, 0.5];
+        let x_shape: [i64; 2] = [2, 4];
+        let x_val = make_float_tensor(api, &mut x_data, &x_shape);
+
+        let input_names = [c"X".as_ptr()];
+        let output_names = [c"Y".as_ptr()];
+        let inputs: [*const ort::OrtValue; 1] = [x_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            1,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(initializer chain)");
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(initializer chain)");
+        let result = std::slice::from_raw_parts(data_ptr as *const f32, 6);
+
+        // W = [[1,0,0],[0,1,0],[0,0,1],[1,1,1]], B = [-1, 0.5, 2]
+        // row0: [1,2,3] + [4,4,4] = [5,6,7]  + B = [4, 6.5, 9]
+        // row1: [-1,-2,-3] + [0.5,0.5,0.5] = [-0.5,-1.5,-2.5] + B = [-1.5, -1, -0.5] -> relu 0
+        let expected: [f32; 6] = [4.0, 6.5, 9.0, 0.0, 0.0, 0.0];
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "output[{i}] = {got}, want {want}"
+            );
+        }
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_init_chain");
+    }
+    eprintln!("\n✅ initializer_chain_still_fuses_into_one_claim: PASSED");
 }
