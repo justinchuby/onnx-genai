@@ -75,3 +75,6 @@ pub use kernels::matmul_nbits::{
     matmul_nbits_decode_caches_dequant_f32, resident_dequant_f32_cache_bytes,
     set_resident_dequant_f32_cache_enabled,
 };
+// #1056: a resident, session-lifetime, weight-scaled buffer must be reportable
+// in bytes. The entry-count accessor stays for the benchmarks that assert reuse.
+pub use kernels::matmul::weight_transpose_cache_bytes;

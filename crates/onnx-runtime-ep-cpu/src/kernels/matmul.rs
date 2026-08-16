@@ -124,8 +124,19 @@ pub fn bnns_prefill_stats() -> (usize, u64) {
 
 /// Returns the number of entries in the process-global weight-transpose caches.
 /// (f16_entries, f32_entries). Used by benchmarks to verify cache reuse across turns.
+///
+/// For memory questions use [`weight_transpose_cache_bytes`] instead: an entry
+/// count cannot distinguish a cache holding kilobytes from one holding gigabytes.
 pub fn weight_transpose_cache_sizes() -> (usize, usize) {
     weight_transpose::cache_sizes()
+}
+
+/// Bytes of transposed weight held by the process-global weight-transpose caches.
+///
+/// Each entry is a full `K x N` copy of a constant weight kept for the session,
+/// so this scales with model size and belongs in the memory plan (#1056).
+pub fn weight_transpose_cache_bytes() -> usize {
+    weight_transpose::cache_bytes()
 }
 
 /// Evict all entries from the global weight-transpose caches.

@@ -111,6 +111,21 @@ impl<T: Copy + Default + Send + Sync> TransposeCache<T> {
         self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
+    /// Bytes of transposed weight this cache currently holds.
+    ///
+    /// Entry counts cannot answer "will this fit" (#1056): each entry is a full
+    /// `K x N` copy of a weight, so two caches with the same length can differ by
+    /// gigabytes. `Arc` clones are not double counted -- the map holds one `Arc`
+    /// per key and the byte total is over the map, not over live handles.
+    pub fn bytes(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|entry| entry.len() * std::mem::size_of::<T>())
+            .sum()
+    }
+
     /// Whether the cache holds no entries.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -228,6 +243,18 @@ pub fn cache_sizes() -> (usize, usize) {
     (WEIGHT_TRANSPOSE_F16.len(), WEIGHT_TRANSPOSE_F32.len())
 }
 
+/// Bytes of transposed weight held by the global caches, summed across both.
+///
+/// This is a resident, session-lifetime, weight-scaled allocation: one full
+/// `K x N` copy per transposed constant weight. #1056 requires such buffers to
+/// be reportable in bytes rather than in entry counts, because only bytes can
+/// answer whether they fit.
+pub fn cache_bytes() -> usize {
+    WEIGHT_TRANSPOSE_F16
+        .bytes()
+        .saturating_add(WEIGHT_TRANSPOSE_F32.bytes())
+}
+
 /// Evict every entry from both global caches.
 pub fn clear_all() {
     WEIGHT_TRANSPOSE_F16.clear();
@@ -258,6 +285,45 @@ mod tests {
     /// A private cache instance, so tests never race the process-global ones.
     fn cache() -> TransposeCache<f32> {
         TransposeCache::default()
+    }
+
+    /// #1056: the byte figure must equal the bytes actually held, so it can
+    /// answer "will this fit". An entry count cannot: two caches of length 2 can
+    /// differ by gigabytes.
+    ///
+    /// This asserts against the sum of the cached buffers' own lengths rather
+    /// than against a formula, so a future change to what gets stored per entry
+    /// cannot leave the reported number describing the old layout.
+    #[test]
+    fn cache_bytes_equals_the_bytes_actually_held() {
+        let cache = cache();
+        assert_eq!(cache.bytes(), 0, "an empty cache holds no bytes");
+
+        let mut small = vec![0.0f32; 4 * 8];
+        fill(&mut small, 1.0);
+        let mut large = vec![0.0f32; 64 * 32];
+        fill(&mut large, 2.0);
+
+        let a = cache.get_or_insert_transpose(&small, 4, 8).unwrap();
+        let b = cache.get_or_insert_transpose(&large, 64, 32).unwrap();
+
+        let expected = (a.len() + b.len()) * std::mem::size_of::<f32>();
+        assert_eq!(cache.bytes(), expected);
+        assert_eq!(cache.len(), 2);
+
+        // The point of bytes over entries: same length, wildly different cost.
+        assert!(
+            expected > 8 * cache.len(),
+            "entry count cannot stand in for byte cost"
+        );
+
+        // A hit must not double count: the map holds one Arc per key.
+        let again = cache.get_or_insert_transpose(&large, 64, 32).unwrap();
+        assert!(Arc::ptr_eq(&b, &again));
+        assert_eq!(cache.bytes(), expected, "a cache hit allocated nothing");
+
+        cache.clear();
+        assert_eq!(cache.bytes(), 0, "clearing releases the bytes it reported");
     }
 
     /// #845 falsifier — the grow case.
