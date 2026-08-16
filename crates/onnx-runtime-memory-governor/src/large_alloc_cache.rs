@@ -191,28 +191,13 @@ const SHARDS: usize = 8;
 fn process_memory_allowance() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let cgroup = [
-            "/sys/fs/cgroup/memory.max",
-            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-        ]
-        .iter()
-        .find_map(|path| {
-            let raw = std::fs::read_to_string(path).ok()?;
-            let trimmed = raw.trim();
-            if trimmed == "max" {
-                return None;
-            }
-            let value = trimmed.parse::<u64>().ok()?;
-            // cgroup v1 encodes "unlimited" as a huge page-aligned sentinel
-            // rather than a word, so treat implausible values as absent.
-            (value > 0 && value < (1 << 50)).then_some(value)
-        });
-        if cgroup.is_some() {
-            return cgroup;
+        if let Some(limit) = cgroup_limit_bytes() {
+            return Some(limit);
         }
         // MemAvailable is the kernel's own estimate of what can be handed out
         // without swapping, which is a better basis than MemTotal for deciding
-        // how much to sit on.
+        // how much to sit on. It describes the *machine*, so it is only correct
+        // once no cgroup limit applies.
         let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
         for key in ["MemAvailable:", "MemTotal:"] {
             if let Some(line) = meminfo.lines().find(|l| l.starts_with(key))
@@ -230,6 +215,108 @@ fn process_memory_allowance() -> Option<u64> {
     {
         None
     }
+}
+
+/// The memory limit of the cgroup this process is actually in.
+///
+/// # Why this is not just reading `/sys/fs/cgroup/memory.max`
+///
+/// That path is the limit of the cgroup *at the mount root*, which is the
+/// process's own cgroup only when the container runtime gave it a private
+/// cgroup namespace. It is not the process's cgroup under a systemd slice with
+/// `MemoryMax=`, nor in a container run with `cgroupns=host`, nor for anything
+/// nested — and in all of those cases falling through to `/proc/meminfo` reports
+/// the *host's* memory and hands the cache a budget the cgroup will never allow.
+/// That is precisely the OOM this function exists to avoid.
+///
+/// So the process's cgroup path is read from `/proc/self/cgroup` and resolved
+/// against the mount root. A leaf that reads `max` is not a limit but an
+/// inheritance: v2 enforces the *minimum* limit along the path to the root, so
+/// ancestors are walked and the smallest concrete value wins.
+#[cfg(target_os = "linux")]
+fn cgroup_limit_bytes() -> Option<u64> {
+    let self_cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    resolve_cgroup_limit(&self_cgroup, |path| std::fs::read_to_string(path).ok())
+}
+
+/// The cgroup-walking policy, with the filesystem passed in.
+///
+/// Kept independent of real I/O so it can be tested against layouts this machine
+/// does not have: a systemd slice with `MemoryMax=`, a `cgroupns=host`
+/// container, a v1 hierarchy, and a nested tree whose limit lives on an
+/// ancestor. Every one of those is a case where reading the mount root alone
+/// gives the wrong answer, and none of them is reproducible here.
+#[cfg(target_os = "linux")]
+fn resolve_cgroup_limit(
+    self_cgroup: &str,
+    read: impl Fn(&std::path::Path) -> Option<String>,
+) -> Option<u64> {
+    const ROOT: &str = "/sys/fs/cgroup";
+
+    /// cgroup v1 encodes "unlimited" as a huge page-aligned sentinel rather than
+    /// a word, so implausible values are treated as absent.
+    fn plausible(value: u64) -> Option<u64> {
+        (value > 0 && value < (1 << 50)).then_some(value)
+    }
+
+    let limit_at = |dir: &std::path::Path| -> Option<u64> {
+        ["memory.max", "memory.limit_in_bytes"]
+            .iter()
+            .filter_map(|file| {
+                let raw = read(&dir.join(file))?;
+                let trimmed = raw.trim();
+                if trimmed == "max" {
+                    return None;
+                }
+                plausible(trimmed.parse::<u64>().ok()?)
+            })
+            .min()
+    };
+
+    let mut smallest: Option<u64> = None;
+    let mut note = |found: Option<u64>| {
+        if let Some(limit) = found {
+            smallest = Some(smallest.map_or(limit, |held: u64| held.min(limit)));
+        }
+    };
+
+    for line in self_cgroup.lines() {
+        // v2: `0::<path>`. v1: `<id>:<controllers>:<path>`, where only the entry
+        // listing the memory controller is relevant.
+        let mut fields = line.splitn(3, ':');
+        let (Some(hierarchy), Some(controllers), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let v2 = hierarchy == "0" && controllers.is_empty();
+        if !v2 && !controllers.split(',').any(|c| c == "memory") {
+            continue;
+        }
+        // v1 puts each controller under its own directory; v2 is unified.
+        let base = if v2 {
+            std::path::PathBuf::from(ROOT)
+        } else {
+            std::path::Path::new(ROOT).join("memory")
+        };
+        // Walk from the mount root down to the process's own cgroup. v2 enforces
+        // the tightest limit anywhere on that path, and a leaf reading `max`
+        // simply inherits its parent's, so every level is consulted and the
+        // smallest concrete value wins.
+        let mut current = base;
+        note(limit_at(&current));
+        for segment in path.split('/').filter(|s| !s.is_empty()) {
+            current = current.join(segment);
+            note(limit_at(&current));
+        }
+    }
+
+    // The mount root itself, which is the whole answer when the runtime gave this
+    // process a private cgroup namespace, and the fallback when
+    // `/proc/self/cgroup` could not be read at all.
+    note(limit_at(std::path::Path::new(ROOT)));
+    note(limit_at(&std::path::Path::new(ROOT).join("memory")));
+    smallest
 }
 
 /// The retention budget to use when the caller did not pick one.
@@ -324,6 +411,13 @@ pub fn calibrate_floor_bytes() -> usize {
             let start = std::time::Instant::now();
             touch_cycle(size);
             *sample = start.elapsed().as_nanos() as f64;
+            // Checked per sample, not per rung: one rung near the top of the
+            // ladder touches 256 MiB six times, which on an allocator that stays
+            // resident all the way up would otherwise overrun the budget before
+            // the next rung's check could stop it.
+            if started.elapsed() > PROBE_BUDGET {
+                return FALLBACK_FLOOR_BYTES;
+            }
         }
         samples.sort_by(|a, b| a.partial_cmp(b).expect("durations are never NaN"));
         let pages = (size / 4096).max(1) as f64;
@@ -422,13 +516,24 @@ fn floor_from_env() -> usize {
     {
         return explicit;
     }
-    calibrate_floor_bytes()
+    calibrated_floor_bytes()
+}
+
+/// [`calibrate_floor_bytes`], measured once per process.
+///
+/// The answer is a property of the linked allocator, which cannot change while
+/// the process runs, but the probe is on the construction path of every
+/// execution provider — and a test suite builds hundreds of those. Measuring
+/// once keeps that from being hundreds of probes.
+pub fn calibrated_floor_bytes() -> usize {
+    static FLOOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(calibrate_floor_bytes)
 }
 
 impl<A: DeviceAllocator> LargeAllocCache<A> {
     /// Construct with an explicit budget and a calibrated floor.
     pub fn new(inner: A, budget_bytes: usize) -> Self {
-        Self::with_floor(inner, budget_bytes, calibrate_floor_bytes())
+        Self::with_floor(inner, budget_bytes, calibrated_floor_bytes())
     }
 
     /// Construct with both bounds given explicitly.
@@ -882,6 +987,20 @@ mod tests {
     }
 
     /// The body of the RSS test, run in a process of its own.
+    ///
+    /// # Why the blocks are held live together
+    ///
+    /// A first version of this worker allocated, touched and freed one block at
+    /// a time. That never put more than one block per shape into the pool, so
+    /// total retained bytes stayed far under the budget and the cap was never
+    /// exercised — mutation-testing showed the test still passed with the
+    /// admission check removed entirely, i.e. against an *unbounded* cache. It
+    /// was a leak detector wearing a bound detector's name.
+    ///
+    /// Holding a whole generation live and releasing it at once is what actually
+    /// loads the pool: each round offers far more bytes than the budget permits,
+    /// so an uncapped cache would retain all of them and grow without limit,
+    /// while a capped one admits what fits and frees the rest.
     #[cfg(target_os = "linux")]
     fn rss_probe_worker(budget: usize) {
         fn resident_bytes() -> u64 {
@@ -896,34 +1015,55 @@ mod tests {
         }
 
         let cache = LargeAllocCache::with_floor(HostAllocator, budget, TEST_FLOOR);
-        // Four distinct shapes, as a decode step produces, each well under the
-        // budget so all four can be retained at once.
-        let shapes = [TEST_FLOOR, TEST_FLOOR * 2, TEST_FLOOR * 3, TEST_FLOOR * 5];
 
-        let touch = |rounds: usize| {
-            for _ in 0..rounds {
-                for &bytes in &shapes {
-                    let ptr = cache.allocate(bytes, 64).expect("allocation succeeds");
-                    // SAFETY: `ptr` is live and uniquely owned for `bytes`.
-                    unsafe {
-                        std::ptr::write_bytes(ptr.as_ptr(), 0x11, bytes);
-                        cache.deallocate(ptr, bytes, 64);
-                    }
-                }
+        // Distinct shapes so they occupy distinct free lists across shards, and
+        // enough of them that one generation is several times the budget.
+        let shapes: Vec<usize> = (1..=24).map(|n| TEST_FLOOR * n).collect();
+        let per_generation: usize = shapes.iter().sum();
+        assert!(
+            per_generation > budget * 3,
+            "a generation ({per_generation} bytes) must far exceed the budget \
+             ({budget}) or the cap is never exercised"
+        );
+
+        let round = || {
+            // Every block of the generation is live at once, so freeing them all
+            // offers the pool more than it is allowed to keep.
+            let mut live = Vec::with_capacity(shapes.len());
+            for &bytes in &shapes {
+                let ptr = cache.allocate(bytes, 64).expect("allocation succeeds");
+                // SAFETY: `ptr` is live and uniquely owned for `bytes`.
+                unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0x11, bytes) };
+                live.push((ptr, bytes));
+            }
+            for (ptr, bytes) in live {
+                // SAFETY: each `ptr` came from `allocate` with this layout and is
+                // released exactly once.
+                unsafe { cache.deallocate(ptr, bytes, 64) };
             }
         };
 
         // Warm up so the steady-state working set is already resident when the
         // baseline is taken; otherwise ordinary first-touch growth reads as
         // leakage.
-        touch(50);
+        for _ in 0..20 {
+            round();
+        }
         let settled = resident_bytes();
-        touch(2_000);
+        for _ in 0..400 {
+            round();
+        }
         let after = resident_bytes();
 
         assert!(
             cache.stats().retained_bytes <= budget as u64,
-            "retained bytes exceeded the budget"
+            "retained bytes ({}) exceeded the budget ({budget})",
+            cache.stats().retained_bytes
+        );
+        assert!(
+            cache.stats().rejected > 0,
+            "no block was ever refused admission, so the budget cap was never \
+             exercised and this test cannot detect an unbounded cache"
         );
         println!("rss-growth-bytes={}", after.saturating_sub(settled));
     }
@@ -1028,6 +1168,119 @@ mod tests {
         );
         // Nothing could be established: fall back rather than guess low.
         assert_eq!(budget_for_allowance(None), DEFAULT_CACHE_BUDGET_BYTES);
+    }
+
+    /// The layouts where reading `/sys/fs/cgroup/memory.max` alone gives the
+    /// wrong answer. None of these is reproducible on the machine this was
+    /// written on, which is exactly why the resolver takes its filesystem as an
+    /// argument.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_cgroup_limit_is_found_wherever_the_process_actually_sits() {
+        fn fs(entries: &[(&str, &str)]) -> impl Fn(&std::path::Path) -> Option<String> {
+            let owned: Vec<(String, String)> = entries
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            move |path| {
+                let wanted = path.to_string_lossy();
+                owned
+                    .iter()
+                    .find(|(k, _)| k.as_str() == wanted)
+                    .map(|(_, v)| v.clone())
+            }
+        }
+
+        // A systemd slice with `MemoryMax=`: the limit is on an ancestor, the
+        // leaf inherits it, and the mount root has no `memory.max` at all. This
+        // is the case the previous root-only implementation missed entirely.
+        assert_eq!(
+            resolve_cgroup_limit(
+                "0::/user.slice/user-1002.slice/app.service\n",
+                fs(&[
+                    ("/sys/fs/cgroup/user.slice/memory.max", "max"),
+                    (
+                        "/sys/fs/cgroup/user.slice/user-1002.slice/memory.max",
+                        "1073741824"
+                    ),
+                    (
+                        "/sys/fs/cgroup/user.slice/user-1002.slice/app.service/memory.max",
+                        "max"
+                    ),
+                ]),
+            ),
+            Some(1024 * 1024 * 1024),
+            "a limit set on an ancestor slice must be found"
+        );
+
+        // Nested limits: v2 enforces the tightest one on the path, not the
+        // nearest.
+        assert_eq!(
+            resolve_cgroup_limit(
+                "0::/outer/inner\n",
+                fs(&[
+                    ("/sys/fs/cgroup/outer/memory.max", "536870912"),
+                    ("/sys/fs/cgroup/outer/inner/memory.max", "4294967296"),
+                ]),
+            ),
+            Some(512 * 1024 * 1024),
+            "the smallest limit on the path must win, not the innermost"
+        );
+
+        // A private cgroup namespace, where the process's path is `/` and the
+        // limit really is at the mount root.
+        assert_eq!(
+            resolve_cgroup_limit("0::/\n", fs(&[("/sys/fs/cgroup/memory.max", "268435456")]),),
+            Some(256 * 1024 * 1024)
+        );
+
+        // cgroup v1: a separate hierarchy per controller, and only the entry
+        // listing `memory` is relevant.
+        assert_eq!(
+            resolve_cgroup_limit(
+                "8:memory:/docker/abc\n7:cpu,cpuacct:/docker/abc\n",
+                fs(&[
+                    (
+                        "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+                        "134217728"
+                    ),
+                    (
+                        "/sys/fs/cgroup/cpu,cpuacct/docker/abc/memory.limit_in_bytes",
+                        "1024"
+                    ),
+                ]),
+            ),
+            Some(128 * 1024 * 1024),
+            "the cpu hierarchy must not be mistaken for a memory limit"
+        );
+
+        // v1's "unlimited" sentinel is a huge page-aligned number rather than a
+        // word, and must not be read as a real limit.
+        assert_eq!(
+            resolve_cgroup_limit(
+                "8:memory:/\n",
+                fs(&[(
+                    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                    "9223372036854771712"
+                )]),
+            ),
+            None
+        );
+
+        // Unlimited everywhere: fall through to the machine's own memory.
+        assert_eq!(
+            resolve_cgroup_limit(
+                "0::/user.slice\n",
+                fs(&[("/sys/fs/cgroup/user.slice/memory.max", "max")]),
+            ),
+            None
+        );
+
+        // `/proc/self/cgroup` unreadable: the mount root is still consulted.
+        assert_eq!(
+            resolve_cgroup_limit("", fs(&[("/sys/fs/cgroup/memory.max", "1048576")])),
+            Some(1024 * 1024)
+        );
     }
 
     /// A cgroup so small that an eighth of it is below one cached block. The

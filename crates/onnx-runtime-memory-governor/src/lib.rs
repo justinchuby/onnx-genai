@@ -80,7 +80,7 @@ pub use allocator::{
 };
 pub use large_alloc_cache::{
     DEFAULT_CACHE_BUDGET_BYTES, FALLBACK_FLOOR_BYTES, LargeAllocCache, LargeAllocCacheStats,
-    MAX_CACHED_BYTES, calibrate_floor_bytes, default_budget_bytes,
+    MAX_CACHED_BYTES, calibrate_floor_bytes, calibrated_floor_bytes, default_budget_bytes,
 };
 pub use shareability::{
     KvFragmentation, ModelKvGeometry, PrefixShareability, evaluate_geometry_shareability,

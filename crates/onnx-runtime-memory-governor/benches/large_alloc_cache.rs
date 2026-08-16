@@ -1,9 +1,10 @@
 //! Where is the recycling floor, measured rather than assumed?
 //!
-//! [`LargeAllocCache`] retains blocks from `MIN_CACHED_BYTES` upward on the
-//! premise that above the system allocator's mmap threshold every cycle costs a
-//! fresh mapping and a kernel-zeroed page fault. That premise is only true for
-//! part of the band. glibc raises `M_MMAP_THRESHOLD` to the size of an mmapped
+//! [`LargeAllocCache`] retains blocks from its floor upward on the premise that
+//! above the system allocator's mmap threshold every cycle costs a fresh mapping
+//! and a kernel-zeroed page fault. That premise is only true for part of the
+//! band, which is why the floor is calibrated
+//! (`calibrate_floor_bytes`) rather than fixed. glibc raises `M_MMAP_THRESHOLD` to the size of an mmapped
 //! chunk *when that chunk is freed* (`_int_free`, capped at
 //! `DEFAULT_MMAP_THRESHOLD_MAX` = 32 MiB on 64-bit), so a size that is allocated
 //! and released repeatedly stops being mmapped after its first cycle and is
