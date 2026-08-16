@@ -96,6 +96,10 @@ pub fn governs(op: &Node) -> bool {
     matches!(
         (op.domain.as_str(), op.op_type.as_str()),
         ("" | "ai.onnx", "Tanh" | "Sigmoid" | "Gelu" | "Sqrt" | "Erf")
+            | (
+                "" | "ai.onnx",
+                "Neg" | "Abs" | "Sign" | "Floor" | "Ceil" | "Round" | "Reciprocal" | "Softsign",
+            )
             | ("" | "ai.onnx", "MatMul" | "Gemm" | "QLinearMatMul")
             | ("com.microsoft", "MatMulNBits" | "RotaryEmbedding")
             | ("com.microsoft", "FastGelu" | "QuickGelu" | "BiasGelu")
@@ -234,6 +238,10 @@ pub fn claim_preference(
         Some(dt) => *dt,
         None => return ClaimPreference::Claim,
     };
+
+    if let Some(preference) = exact_unary_preference(op, shapes, dtype) {
+        return preference;
+    }
 
     if contrib_activation(op) {
         return match dtype {
@@ -425,6 +433,198 @@ fn matmul_weight_elements(op: &Node, shapes: &[Shape]) -> Option<usize> {
         .try_fold(1usize, |acc, dim| acc.checked_mul(dim?))
 }
 
+/// The measured claim thresholds for the bit-exact elementwise unary ops, or
+/// `None` when `op` is not one of them.
+///
+/// These eight ops are one instruction per element, so the whole question is
+/// whether an AVX2 kernel can outrun ORT's own vectorized loop by enough to pay
+/// for the partition boundary. The answer depends on both the element count and
+/// the dtype, and it is not the same answer twice.
+///
+/// # float32: a fixed ~1.2 us per-node overhead sets every threshold
+///
+/// Interleaved session-level A/B, AMD EPYC 9V74 (AVX2+FMA+F16C, no AVX-512),
+/// one thread, `taskset -c 0-15`, 31 reps, ratio = **ORT ns / ours** so
+/// **higher is better for us** (the inverse of the matmul tables above):
+///
+/// | n       |  Neg |  Abs | Sign | Ceil | Floor | Round | Recip | Softsign |
+/// |---------|-----:|-----:|-----:|-----:|------:|------:|------:|---------:|
+/// | 1024    | 0.93 | 0.94 | 0.95 | 0.88 |  0.86 |  0.89 |  0.90 |     0.90 |
+/// | 2048    | 0.95 | 0.95 | 1.15 | 0.93 |  0.89 |  0.92 |  0.93 |     0.92 |
+/// | 4096    | 0.96 | 0.97 | 1.53 | 0.97 |  0.91 |  0.94 |  0.95 |     0.94 |
+/// | 8192    | 0.98 | 0.99 | 2.10 | 1.14 |  1.06 |  0.97 |  0.98 |     0.94 |
+/// | 12288   | 0.99 | 1.00 | 2.9  | 1.29 |  1.16 |  1.07 |  1.01 |     1.03 |
+/// | 16384   | 1.00 | 1.01 | 3.5  | 1.40 |  1.25 |  1.15 |  1.10 |     1.10 |
+/// | 24576   | 1.01 | 1.02 | 4.6  | 1.55 |  1.38 |  1.28 |  1.19 |     1.19 |
+/// | 1048576 | 1.01 | 1.02 | 11.2 | 3.19 |  2.71 |  2.10 |  1.92 |     1.95 |
+///
+/// The shape of that table is one number: a claimed node costs ~1.2 us of fixed
+/// EP-boundary overhead that an ORT node does not pay. Every op is under 1.0
+/// until its own per-element saving has repaid that constant, which is why the
+/// crossovers are ordered by how much work the op does per element — `Sign`
+/// (ORT branches per element) repays it by 1536, `Reciprocal` and `Softsign`
+/// (ORT already vectorizes; we win only on the division) not until 16-24 K.
+///
+/// `Neg` and `Abs` never repay it at all. They are a single `xorps` per
+/// element, so both sides are purely memory-bound and the ceiling is 1.03x at
+/// 2 M elements — under this module's ">= 5% repeatable win" bar at *every*
+/// size measured. They are therefore deferred unconditionally, even though this
+/// crate now has a perfectly good AVX2 kernel for them. The kernel is still
+/// reachable through the native executor, which pays no such boundary.
+///
+/// # float16: the dtype inverts three of the answers
+///
+/// ORT's CPU EP has **no** float16 kernel for `Neg`, `Abs`, `Ceil`, `Floor`,
+/// `Reciprocal` or `Softsign` (checked against its own kernel registry via
+/// `get_all_opkernel_def`); it cast-wraps them to float32. It does have native
+/// float16 kernels for `Round` and `Sign`. Same rig, 31 reps:
+///
+/// | n       |  Neg |  Abs | Sign | Ceil | Floor | Round | Recip | Softsign |
+/// |---------|-----:|-----:|-----:|-----:|------:|------:|------:|---------:|
+/// | 1024    |    - |    - |    - |    - |     - |  1.17 |     - |        - |
+/// | 3072    | 0.85 | 0.87 | 0.65 | 0.99 |  0.97 |  1.95 |  0.90 |     0.89 |
+/// | 8192    |    - |    - |    - | 1.09 |  1.05 |     - |     - |        - |
+/// | 16384   |    - |    - |    - | 1.16 |  1.10 |     - |     - |        - |
+/// | 65536   | 0.75 | 0.76 | 0.35 | 1.35 |  1.26 |  8.92 |  1.00 |     0.96 |
+/// | 1048576 | 0.70 | 0.71 | 0.28 | 1.33 |  1.19 | 12.38 |  1.00 |     1.01 |
+///
+/// Two of those columns are worth stating plainly:
+///
+/// - **`Sign` inverts.** In float32 it is this module's best win (11.2x); in
+///   float16 it is its worst loss (0.28x), because ORT has a real float16
+///   `Sign` kernel and this EP widens to float32 first. So float16 `Sign` is
+///   deferred at every size. It is the one op here whose float32 and float16
+///   answers are opposites, and the reason this table is indexed by both.
+/// - **ORT's float16 `Round` is pathological** — 5.5 ms for 1 M elements
+///   against our 0.45 ms. That is a 12.4x win and it is kept at every size
+///   above 1024.
+///
+/// # What declining actually hands to ORT, measured rather than assumed
+///
+/// For the six float16 ops ORT has no kernel for, declining does **not** hand
+/// over a single node: ORT cast-wraps the node into `Cast`/op/`Cast`. The
+/// question this module has to answer is whether this EP then *reclaims* those
+/// `Cast` fragments, which is the trap documented for `Gelu` above. Probed
+/// node-by-node from ORT's own profile with this plugin loaded and declining,
+/// it does not — all three nodes land on `CPUExecutionProvider`. So for these
+/// primitive ops the choice really is "our float16 kernel" against "ORT's
+/// cast-wrapped float32 kernel", and it was measured both ways at 1 M
+/// elements:
+///
+/// | float16 op   | claimed | declined | kept     |
+/// |--------------|--------:|---------:|----------|
+/// | `Neg`        |   0.70x |    1.01x | declined |
+/// | `Abs`        |   0.71x |    1.01x | declined |
+/// | `Floor`      |   1.19x |    1.01x | claimed  |
+/// | `Ceil`       |   1.32x |        - | claimed  |
+/// | `Reciprocal` |   1.00x |    1.00x | declined |
+/// | `Softsign`   |   1.01x |    1.02x | declined |
+///
+/// `Neg` and `Abs` therefore defer in *both* float dtypes: they are a single
+/// `xorps` per element, so there is no arithmetic for a wider vector to save
+/// and the cast traffic ORT pays is still cheaper than this EP's node
+/// boundary. `Reciprocal` and `Softsign` are ties at 1 M and outright losses
+/// at 3072 (0.90x claimed against 1.03x declined), so there is no element
+/// count at which their claim pays for itself either.
+///
+/// # Everything else keeps the claim
+///
+/// bfloat16 is a capability claim (ORT has no bfloat16 kernel for any of these
+/// but `Sign`). The integer dtypes `Neg`/`Abs`/`Sign` admit are unmeasured and
+/// do not go through the float path this PR vectorized, so they are left alone.
+fn exact_unary_preference(op: &Node, shapes: &[Shape], dtype: DataType) -> Option<ClaimPreference> {
+    // float32 minimum element count for a >= 5% repeatable win, `None` = never.
+    //
+    // Each threshold is one measured step *beyond* the first point that clears
+    // the 5% bar, not the crossover itself: `Sign` crosses at 1536 and is gated
+    // at 2048, `Ceil` at 6144 -> 8192, `Floor` at 8192 -> 12288, `Round` at
+    // 12288 -> 16384, `Reciprocal` and `Softsign` at 16384 -> 24576. That costs
+    // a little of the win band on this machine and buys margin against the
+    // thresholds having been tuned to it -- these numbers come from one EPYC
+    // 9V74 at one thread, and a machine with a different cache hierarchy or a
+    // cheaper ORT node boundary would move every crossover right. The claimed
+    // region therefore starts at 1.14-1.19x measured here, not at 1.05x.
+    let f32_min: Option<usize> = match op.op_type.as_str() {
+        "Neg" | "Abs" => None,
+        "Sign" => Some(2048),
+        "Ceil" => Some(8192),
+        "Floor" => Some(12288),
+        "Round" => Some(16384),
+        "Reciprocal" | "Softsign" => Some(24576),
+        _ => return None,
+    };
+
+    // float16 has its own crossovers, and for three ops its own answer. See the
+    // "claimed vs declined" table above: `Neg`/`Abs` lose to ORT's cast-wrapped
+    // path at every size, `Sign` loses to a real ORT float16 kernel, and
+    // `Reciprocal`/`Softsign` never rise above a tie, so none of those five is
+    // worth a node boundary at any size. `Round` is the outlier the other way.
+    //
+    // These three sit *at* their crossover rather than one step beyond it,
+    // because the float16 measurements are spaced by powers of two and the next
+    // step would give away a much larger band than in float32. The narrowest
+    // claimed cell here is `Ceil` at 1.091x, still comfortably past the bar.
+    let f16_min: Option<usize> = match op.op_type.as_str() {
+        "Round" => Some(1024),
+        "Ceil" => Some(8192),
+        "Floor" => Some(16384),
+        _ => None,
+    };
+
+    let preference = match dtype {
+        DataType::Float32 => size_gated_claim(op, shapes, f32_min, "float32"),
+        DataType::Float16 => size_gated_claim(op, shapes, f16_min, "float16"),
+        _ => ClaimPreference::Claim,
+    };
+    Some(preference)
+}
+
+/// Claim iff the statically known element count reaches `min`.
+///
+/// `min` of `None` means no size wins. An unknown element count always defers:
+/// it could be either side of the crossover, and at decode these ops see one
+/// token's worth of elements, which is reliably the losing side.
+///
+/// Deferring is a clean handover for all eight. Probed node-by-node from ORT's
+/// own profile with this plugin loaded and declining, a declined node lands
+/// either as itself (float32, and float16 `Sign`) or as `Cast`/op/`Cast`
+/// (float16 otherwise) -- in both cases entirely on `CPUExecutionProvider`,
+/// never as fragments this EP reclaims. That is what separates these ops from
+/// the `Gelu` trap documented above, and it was measured rather than assumed.
+fn size_gated_claim(
+    op: &Node,
+    shapes: &[Shape],
+    min: Option<usize>,
+    dtype_name: &str,
+) -> ClaimPreference {
+    match (min, static_element_count(shapes)) {
+        (Some(min), Some(n)) if n >= min => ClaimPreference::Claim,
+        (Some(min), Some(_)) => ClaimPreference::defer(format!(
+            "this EP's AVX2 {} kernel is measured at or below ORT's {dtype_name} CPU path below \
+             {min} elements, where the fixed ~1.2 us per-node plugin boundary is not yet repaid",
+            op.op_type,
+        )),
+        (Some(min), None) => ClaimPreference::defer(format!(
+            "this node's element count is not statically known, and this EP's AVX2 {} kernel is \
+             measured slower than ORT's {dtype_name} CPU path below {min} elements",
+            op.op_type,
+        )),
+        (None, _) => ClaimPreference::defer(format!(
+            "this EP's AVX2 {} kernel is measured at or below ORT's {dtype_name} CPU path at \
+             every size benchmarked, so no element count justifies a node boundary",
+            op.op_type,
+        )),
+    }
+}
+
+/// Total element count of input 0 when every dimension is static.
+fn static_element_count(shapes: &[Shape]) -> Option<usize> {
+    shapes
+        .first()?
+        .iter()
+        .try_fold(1usize, |acc, dim| acc.checked_mul(dim.as_static()?))
+}
+
 /// The measured assignment matrix for `MatMul`/`Gemm`/`MatMulNBits`/
 /// `QLinearMatMul`, or `None` when `op` is not one of them.
 ///
@@ -583,7 +783,7 @@ mod tests {
     use super::*;
     use onnx_runtime_ir::{Attribute, Dim, NodeId, SymbolId, static_shape};
 
-    fn node(op_type: &str, attrs: &[(&str, &str)]) -> Node {
+    pub(super) fn node(op_type: &str, attrs: &[(&str, &str)]) -> Node {
         let mut n = Node::new(NodeId(0), op_type, vec![], vec![]);
         for (k, v) in attrs {
             n.attributes.insert(
@@ -594,11 +794,11 @@ mod tests {
         n
     }
 
-    fn shape(dims: &[usize]) -> Shape {
+    pub(super) fn shape(dims: &[usize]) -> Shape {
         static_shape(dims.iter().copied())
     }
 
-    fn dynamic_shape() -> Shape {
+    pub(super) fn dynamic_shape() -> Shape {
         vec![Dim::Static(1), Dim::Symbolic(SymbolId(0))]
     }
 
@@ -1374,6 +1574,181 @@ mod tests {
                 .is_claim(),
                 "{op} bfloat16 answer changed"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod exact_unary_policy_tests {
+    use super::tests::{dynamic_shape, node, shape};
+    use super::*;
+
+    /// Every float32 threshold in [`exact_unary_preference`], checked one
+    /// element either side of its crossover. The claimed side is a measured
+    /// 5%-or-better win and the deferred side is a measured loss, so a change
+    /// to any of these numbers has to come with a new measurement.
+    #[test]
+    fn float32_thresholds_match_the_measured_crossovers() {
+        for (op, min) in [
+            ("Sign", 2048usize),
+            ("Ceil", 8192),
+            ("Floor", 12288),
+            ("Round", 16384),
+            ("Reciprocal", 24576),
+            ("Softsign", 24576),
+        ] {
+            let n = node(op, &[]);
+            assert!(governs(&n), "{op} must be governed to have a threshold");
+            assert!(
+                claim_preference(&n, 21, &[shape(&[min])], &[DataType::Float32]).is_claim(),
+                "{op} must be claimed at its measured crossover {min}",
+            );
+            assert!(
+                !claim_preference(&n, 21, &[shape(&[min - 1])], &[DataType::Float32]).is_claim(),
+                "{op} must defer one element below its measured crossover {min}",
+            );
+        }
+    }
+
+    /// `Neg` and `Abs` are one `xorps` per element, so both sides are
+    /// memory-bound and the float32 ceiling is 1.03x at 2 M. Under the
+    /// ">= 5% win" bar there is no size at which the claim survives, in either
+    /// float dtype -- float16 was measured at 0.70x claimed against 1.01x
+    /// declined.
+    #[test]
+    fn memory_bound_ops_defer_at_every_size() {
+        for op in ["Neg", "Abs"] {
+            let n = node(op, &[]);
+            for len in [1usize, 1024, 65536, 1 << 20, 1 << 24] {
+                for dt in [DataType::Float32, DataType::Float16] {
+                    assert!(
+                        !claim_preference(&n, 21, &[shape(&[len])], &[dt]).is_claim(),
+                        "{dt:?} {op} must defer at {len} elements",
+                    );
+                }
+            }
+        }
+    }
+
+    /// The one op whose float16 answer is the opposite of its float32 one:
+    /// 11.2x for us in float32, 0.28x against us in float16, because ORT has a
+    /// native float16 kernel only for this op and `Round`.
+    #[test]
+    fn float16_sign_defers_where_float32_sign_claims() {
+        let n = node("Sign", &[]);
+        for len in [4096usize, 65536, 1 << 20] {
+            assert!(
+                claim_preference(&n, 21, &[shape(&[len])], &[DataType::Float32]).is_claim(),
+                "float32 Sign must claim at {len}",
+            );
+            assert!(
+                !claim_preference(&n, 21, &[shape(&[len])], &[DataType::Float16]).is_claim(),
+                "float16 Sign must defer at {len}",
+            );
+        }
+    }
+
+    /// ORT's float16 `Round` takes 5.5 ms where this EP takes 0.45 ms, and it
+    /// is the only float16 claim here justified by a win rather than by ORT
+    /// having no kernel at all.
+    #[test]
+    fn float16_round_keeps_its_measured_win() {
+        let n = node("Round", &[]);
+        for len in [1024usize, 65536, 1 << 20] {
+            assert!(
+                claim_preference(&n, 21, &[shape(&[len])], &[DataType::Float16]).is_claim(),
+                "float16 Round must claim at {len}",
+            );
+        }
+        assert!(
+            !claim_preference(&n, 21, &[shape(&[512])], &[DataType::Float16]).is_claim(),
+            "float16 Round measured 0.98x at 512 and must defer there",
+        );
+    }
+
+    /// A dynamic shape could be either side of the crossover, and at decode it
+    /// is reliably the losing side. Unknown means defer in both float dtypes --
+    /// except in bfloat16, where the claim is a capability rather than a
+    /// performance bet and declining would turn a working session into a
+    /// load-time failure.
+    #[test]
+    fn dynamic_shapes_fail_conservative_in_both_float_dtypes() {
+        for op in [
+            "Neg",
+            "Abs",
+            "Sign",
+            "Floor",
+            "Ceil",
+            "Round",
+            "Reciprocal",
+            "Softsign",
+        ] {
+            let n = node(op, &[]);
+            for dt in [DataType::Float32, DataType::Float16] {
+                assert!(
+                    !claim_preference(&n, 21, &[dynamic_shape()], &[dt]).is_claim(),
+                    "{dt:?} {op} must defer on an unknown element count",
+                );
+            }
+            assert!(
+                claim_preference(&n, 21, &[dynamic_shape()], &[DataType::BFloat16]).is_claim(),
+                "bfloat16 {op} is a capability claim: ORT has no bfloat16 kernel to defer to",
+            );
+        }
+    }
+
+    /// float16 has its own crossovers and, for three ops, its own answer.
+    /// Declining cast-wraps the node into `Cast`/op/`Cast` and this EP does
+    /// **not** reclaim the fragments, so the comparison is our float16 kernel
+    /// against ORT's cast-wrapped float32 one. `Floor`/`Ceil` win it above
+    /// their thresholds; `Reciprocal`/`Softsign` never rise above a tie and so
+    /// never claim.
+    #[test]
+    fn float16_thresholds_match_the_measured_crossovers() {
+        for (op, min) in [("Round", 1024usize), ("Ceil", 8192), ("Floor", 16384)] {
+            let n = node(op, &[]);
+            assert!(
+                claim_preference(&n, 21, &[shape(&[min])], &[DataType::Float16]).is_claim(),
+                "float16 {op} must be claimed at its measured crossover {min}",
+            );
+            assert!(
+                !claim_preference(&n, 21, &[shape(&[min - 1])], &[DataType::Float16]).is_claim(),
+                "float16 {op} must defer one element below its measured crossover {min}",
+            );
+        }
+    }
+
+    /// Five of the eight never justify a node boundary in float16, each for a
+    /// different measured reason: `Neg`/`Abs` lose to ORT's cast-wrapped path
+    /// (0.70x claimed against 1.01x declined), `Sign` loses to a real ORT
+    /// float16 kernel (0.28x), and `Reciprocal`/`Softsign` tie at best while
+    /// losing at small sizes (0.90x at 3072).
+    #[test]
+    fn float16_ops_without_a_win_never_claim() {
+        for op in ["Neg", "Abs", "Sign", "Reciprocal", "Softsign"] {
+            let n = node(op, &[]);
+            for len in [512usize, 8192, 65536, 1 << 20] {
+                assert!(
+                    !claim_preference(&n, 21, &[shape(&[len])], &[DataType::Float16]).is_claim(),
+                    "float16 {op} must defer at {len} elements",
+                );
+            }
+        }
+    }
+
+    /// The integer dtypes `Neg`/`Abs`/`Sign` admit never went through the
+    /// float path this module measured, so they keep the historical behaviour
+    /// rather than inheriting a float32 deferral.
+    #[test]
+    fn integer_dtypes_are_untouched_by_the_float_measurements() {
+        for op in ["Neg", "Abs", "Sign"] {
+            let n = node(op, &[]);
+            for dt in [DataType::Int32, DataType::Int64, DataType::Int8] {
+                assert!(
+                    claim_preference(&n, 21, &[shape(&[16])], &[dt]).is_claim(),
+                    "{op} in {dt:?} is unmeasured here and must keep the historical claim",
+                );
+            }
         }
     }
 }
