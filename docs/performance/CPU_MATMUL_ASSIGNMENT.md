@@ -78,6 +78,25 @@ This EP accepts any power-of-two `block_size >= 16`; ORT's CPU `MatMulNBits` `OR
 512-wide block would therefore turn a working session into a load failure, so those keep the claim
 regardless of the measured ratio -- the same safety rule the dense arm applies to dtypes ORT has no
 kernel for.
+
+This gate is evaluated **before every** `MatMulNBits` deferral, not only the 4-bit one. An 8-bit
+node that is statically wide *and* carries a block size ORT cannot build would otherwise escape
+through the row gate above and fail `ORT_ENFORCE` on the host;
+`wide_eight_bit_with_a_block_size_ort_rejects_stays_claimed` pins that ordering. `bits` needs no
+equivalent guard -- both runtimes accept exactly {2, 4, 8}.
+
+### 2-bit is deferred by extrapolation, and says so
+
+Only 4-bit and 8-bit `MatMulNBits` were measured. 2-bit is a valid contrib value that shares the
+dequant-then-GEMM structure and the threadpool with 4-bit, so it defers -- but its deferral reason
+states that it is extrapolated rather than borrowing 4-bit's numbers.
+
+### Rows are folded, not read from one dimension
+
+The row count of `[.., M, K]` is the product of every dimension but the last, so a statically
+batched `[4, 100, 3584]` is 400 rows and lands in the wide-prefill region even though no single
+dimension reaches 256. Any symbolic dimension anywhere in the batch makes the whole count unknown,
+which is the decode case and stays claimed.
 | `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 1 | 1.00 | 1.03 | defer |
 | `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 2 | 1.52 | 1.56 | defer |
 | `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 4 | 1.74 | 1.82 | defer |
