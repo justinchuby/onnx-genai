@@ -189,6 +189,16 @@ impl ShapeInference {
             | "Selu"
             | "Softplus"
             | "Softsign"
+            // `com.microsoft` shape-preserving activations. Absent from this
+            // table they resolve to `Declined`, and `GetCapability`'s
+            // fail-closed shape filter then drops the whole claim — so the EP
+            // never got these nodes at all, whatever `supports_op` said.
+            // `com.microsoft::Silu` is deliberately *not* listed: ORT 1.28 does
+            // not register it, so it is unreachable here and listing it would
+            // create an unmeasured claim the day that changes.
+            | "FastGelu"
+            | "QuickGelu"
+            | "BiasGelu"
             | "Cast"
             | "Identity"
             | "Dropout"
@@ -312,6 +322,16 @@ impl ShapeInference {
             | "Selu"
             | "Softplus"
             | "Softsign"
+            // `com.microsoft` shape-preserving activations. Absent from this
+            // table they resolve to `Declined`, and `GetCapability`'s
+            // fail-closed shape filter then drops the whole claim — so the EP
+            // never got these nodes at all, whatever `supports_op` said.
+            // `com.microsoft::Silu` is deliberately *not* listed: ORT 1.28 does
+            // not register it, so it is unreachable here and listing it would
+            // create an unmeasured claim the day that changes.
+            | "FastGelu"
+            | "QuickGelu"
+            | "BiasGelu"
             | "Cast"
             | "Identity"
             | "Dropout"
