@@ -423,46 +423,78 @@ mod tests {
     /// shared dense path instead of the strided walk, and must produce exactly
     /// the same values. The previous version of this test asserted the opposite
     /// dispatch; the values it never checked are asserted here.
+    ///
+    /// Dispatch is pinned by asserting the predicate itself rather than by
+    /// watching `ADD_SCALAR_TEST_HITS`: that counter is process-global and other
+    /// tests in the same binary increment it concurrently, so an equality
+    /// assertion on it would be racy. `AddKernel::execute` reaches the counter
+    /// only after `add_dense_fast_path` declines, and the two earlier arms
+    /// (`mlas`, vDSP) both require identical operand shapes, so a broadcasting
+    /// input that this predicate accepts provably never reaches the fallback.
     #[test]
     fn add_suffix_broadcast_uses_the_dense_fast_path() {
-        use std::sync::atomic::Ordering;
-        let before = super::ADD_SCALAR_TEST_HITS.load(Ordering::Relaxed);
         let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
         let b = Owned::f32(&[3], &[10., 20., 30.]);
+        let want = vec![11., 22., 33., 14., 25., 36.];
+
+        let mut direct = Owned::zeros_f32(&[2, 3]);
+        assert!(
+            crate::kernels::elementwise::add_dense_fast_path(
+                &[a.view(), b.view()],
+                &mut direct.view_mut()
+            ),
+            "suffix-broadcast Add was declined by the dense fast path"
+        );
+        assert_eq!(direct.to_f32(), want);
+
         let mut out = Owned::zeros_f32(&[2, 3]);
         AddKernel
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
-        assert_eq!(
-            super::ADD_SCALAR_TEST_HITS.load(Ordering::Relaxed),
-            before,
-            "suffix-broadcast Add fell through to the strided fallback"
-        );
-        assert_eq!(out.to_f32(), vec![11., 22., 33., 14., 25., 36.]);
+        assert_eq!(out.to_f32(), want);
     }
 
     /// Scalar operand on either side, which is what an inlined ONNX activation
-    /// function emits.
+    /// function emits. Dispatch is pinned the same way as the suffix case above.
     #[test]
     fn add_scalar_broadcast_uses_the_dense_fast_path() {
-        use std::sync::atomic::Ordering;
         let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
         let k = Owned::f32(&[], &[0.5]);
-        for (l, r, want) in [
-            (&a, &k, vec![1.5, 2.5, 3.5, 4.5, 5.5, 6.5]),
-            (&k, &a, vec![1.5, 2.5, 3.5, 4.5, 5.5, 6.5]),
-        ] {
-            let before = super::ADD_SCALAR_TEST_HITS.load(Ordering::Relaxed);
+        let want = vec![1.5, 2.5, 3.5, 4.5, 5.5, 6.5];
+        for (l, r) in [(&a, &k), (&k, &a)] {
+            let mut direct = Owned::zeros_f32(&[2, 3]);
+            assert!(
+                crate::kernels::elementwise::add_dense_fast_path(
+                    &[l.view(), r.view()],
+                    &mut direct.view_mut()
+                ),
+                "scalar-broadcast Add was declined by the dense fast path"
+            );
+            assert_eq!(direct.to_f32(), want);
+
             let mut out = Owned::zeros_f32(&[2, 3]);
             AddKernel
                 .execute(&[l.view(), r.view()], &mut [out.view_mut()])
                 .unwrap();
-            assert_eq!(
-                super::ADD_SCALAR_TEST_HITS.load(Ordering::Relaxed),
-                before,
-                "scalar-broadcast Add fell through to the strided fallback"
-            );
             assert_eq!(out.to_f32(), want);
         }
+    }
+
+    /// The decline side of the same predicate: an interior unit axis is not a
+    /// right-aligned suffix, so the fast path must refuse it outright (and leave
+    /// the output untouched) rather than compute a wrong answer.
+    #[test]
+    fn add_interior_broadcast_is_declined_by_the_dense_fast_path() {
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f32(&[2, 1], &[10., 20.]);
+        let mut out = Owned::zeros_f32(&[2, 3]);
+        assert!(
+            !crate::kernels::elementwise::add_dense_fast_path(
+                &[a.view(), b.view()],
+                &mut out.view_mut()
+            ),
+            "interior-axis broadcast was accepted by the dense fast path"
+        );
+        assert_eq!(out.to_f32(), vec![0.; 6]);
     }
 }
