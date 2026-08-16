@@ -510,6 +510,20 @@ static INT4_DIRECT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 static N16_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static KAI_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Serialises every test that reads a dispatch-probe counter against every
+/// test that can increment one.
+///
+/// The probe counters above are process-global while `cargo test` runs test
+/// functions on parallel threads, so a reachability test can otherwise observe
+/// *another* test's dispatch between its own before/after reads and conclude
+/// its kernel took a route it never took. That is not hypothetical: several
+/// tests call `kai_sdot_matmul_m1` directly, bypassing the route gate that
+/// makes the counter meaningful.
+///
+/// Poisoning is deliberately ignored: a panic in one probe test must surface
+/// as that test's own failure, not as a cascade of unrelated lock errors.
+#[cfg(test)]
+static DISPATCH_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(all(test, feature = "mlas"))]
 static MLAS_SQNBIT_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// Positive-proof counters for the zero-copy borrowed int4 decode path (#979).
@@ -7827,6 +7841,57 @@ fn error(message: impl Into<String>) -> EpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Take the dispatch-probe lock for the duration of a test that reads or
+    /// perturbs a `*_TEST_CALLS` counter. See `DISPATCH_PROBE_LOCK`.
+    fn lock_dispatch_probe() -> std::sync::MutexGuard<'static, ()> {
+        DISPATCH_PROBE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The bug this lock exists for, reproduced without needing the hardware
+    /// that exposed it.
+    ///
+    /// `matmulnbits_arm64_kai_qsi8_asymmetric_qwen_shape_is_reachable` reads a
+    /// process-global counter before and after its own call and concludes from
+    /// the delta which route its kernel took. Several *other* tests call
+    /// `kai_sdot_matmul_m1` directly, so on a parallel test runner the delta
+    /// could include a dispatch the observing test never made -- which is
+    /// exactly how it reported that an `accuracy_level = 0` kernel had reached
+    /// the activation-quantizing KAI route it is gated out of.
+    ///
+    /// Observers that hold the lock must see only their own dispatches. This
+    /// fails without the lock and is deterministic with it: every thread
+    /// asserts an exact delta, so any interleaving at all is caught.
+    #[test]
+    fn dispatch_probe_lock_hides_other_threads_dispatches() {
+        const OBSERVERS: usize = 8;
+        const DISPATCHES: usize = 32;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..OBSERVERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let _probe = lock_dispatch_probe();
+                        let before = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
+                        for _ in 0..DISPATCHES {
+                            KAI_SDOT_M1_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+                            std::thread::yield_now();
+                        }
+                        let observed = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) - before;
+                        assert_eq!(
+                            observed, DISPATCHES,
+                            "an observer holding the probe lock saw {observed} dispatches but \
+                             made {DISPATCHES}: another thread's route was attributed to it"
+                        );
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("probe observer must not panic");
+            }
+        });
+    }
     use crate::CpuExecutionProvider;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ep_api::ExecutionProvider;
@@ -8927,6 +8992,7 @@ mod tests {
     ))]
     #[test]
     fn matmulnbits_arm64_mlas_qnbit_reaches_qwen_decode_bits4_and_bits8() {
+        let _probe = lock_dispatch_probe();
         let (k, n) = (128usize, 256usize);
         let activations: Vec<f32> = (0..k)
             .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
@@ -9017,6 +9083,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn matmulnbits_arm64_kai_qsi4_block128_qwen_shapes_match_reference() {
+        let _probe = lock_dispatch_probe();
         #[cfg(feature = "mlas")]
         let _guard = backend_env_lock().lock().unwrap();
         if !std::arch::is_aarch64_feature_detected!("dotprod") {
@@ -9207,6 +9274,7 @@ mod tests {
 
     #[test]
     fn kai_sdot_qsi4_block128_asymmetric_qwen_shapes_match_reference() {
+        let _probe = lock_dispatch_probe();
         for &(k, n) in &[
             (1024usize, 1024usize),
             (1024, 3072),
@@ -9295,6 +9363,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn matmulnbits_arm64_kai_qsi4_asymmetric_qwen_shape_is_reachable() {
+        let _probe = lock_dispatch_probe();
         if !std::arch::is_aarch64_feature_detected!("dotprod") {
             return;
         }
@@ -10110,6 +10179,7 @@ mod tests {
 
     #[test]
     fn kai_sdot_qsi8_block128_asymmetric_qwen_shapes_match_reference() {
+        let _probe = lock_dispatch_probe();
         for &(k, n) in &[
             (1024usize, 1024usize),
             (1024, 3072),
@@ -10195,6 +10265,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn matmulnbits_arm64_kai_qsi8_asymmetric_qwen_shape_is_reachable() {
+        let _probe = lock_dispatch_probe();
         if !std::arch::is_aarch64_feature_detected!("dotprod") {
             return;
         }
@@ -12726,6 +12797,7 @@ mod tests {
     /// [`Int4Acc0RouteProbe::assert_fast_route`] on constant weights.
     #[test]
     fn matmulnbits_int4_acc0_dynamic_weight_keeps_borrowed_path() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (128, 16, 32);
         let a_values: Vec<f32> = (0..k)
             .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
@@ -13123,6 +13195,7 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn mlas_sqnbit_packing_decline_keeps_borrowed_path() {
+        let _probe = lock_dispatch_probe();
         let _guard = CACHE_FLAG_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
