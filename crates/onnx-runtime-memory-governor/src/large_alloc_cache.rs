@@ -116,8 +116,9 @@ use crate::allocator::{DeviceAllocator, DeviceKey, HostAllocator};
 /// three platforms this ships on draw it in three different places:
 ///
 /// * **glibc** — `_int_free` raises `mmap_threshold` to the size of any freed
-///   mmapped chunk up to `DEFAULT_MMAP_THRESHOLD_MAX`, which is
-///   `4 * 1024 * 1024 * sizeof(long) / 4` = **32 MiB** on 64-bit. Stably-sized
+///   mmapped chunk up to `DEFAULT_MMAP_THRESHOLD_MAX`, which glibc defines as
+///   `4 * 1024 * 1024 * sizeof(long)` = **32 MiB** on 64-bit (512 KiB on 32-bit,
+///   where `sizeof(long)` is 4). Stably-sized
 ///   blocks below that are arena-served from their second cycle on; blocks above
 ///   it are mmapped forever.
 /// * **musl** — mallocng services anything larger than its largest size class
@@ -998,7 +999,8 @@ mod tests {
     /// was a leak detector wearing a bound detector's name.
     ///
     /// Holding a whole generation live and releasing it at once is what actually
-    /// loads the pool: each round offers far more bytes than the budget permits,
+    /// loads the pool: one generation is 75 MiB against an 8 MiB budget, so each
+    /// round offers far more bytes than the budget permits,
     /// so an uncapped cache would retain all of them and grow without limit,
     /// while a capped one admits what fits and frees the rest.
     #[cfg(target_os = "linux")]
