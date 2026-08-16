@@ -44,6 +44,27 @@
 //! The margin rule is **>= 5% repeatable win at every measured thread count**;
 //! anything inside the noise band, and anything unmeasured, defers to ORT.
 //!
+//! # Deferring is only sound when the host has a kernel
+//!
+//! Two ways that assumption fails, both found by measurement rather than
+//! reasoning:
+//!
+//! 1. **The host has no kernel for the dtype.** ORT's CPU EP cannot run any of
+//!    these ops in bfloat16; declining turns a working session into a
+//!    `NOT_IMPLEMENTED` load failure.
+//! 2. **The host has no kernel for the *op*, and inlines it instead.** `Gelu`
+//!    is an ONNX function. Outside float32 ORT has no `Gelu` kernel, so
+//!    declining makes it inline the function body into
+//!    `Cast`/`Pow`/`Mul`/`Sum`/`Tanh`/`Sqrt` — and this EP then claims those
+//!    *ungoverned* constituents, which in float16 are far slower than ORT's.
+//!    Measured end-to-end, that path is **0.014x** for `Gelu(tanh)` and
+//!    0.024-0.049x for `Gelu(none)`, against 0.89x worst case for just keeping
+//!    the claim. An element-count cap on float16 `Gelu` was written, tested
+//!    that way, and deleted.
+//!
+//! So a deferral is only added once the profile shows the node actually landing
+//! on `CPUExecutionProvider` as a single node afterwards.
+//!
 //! # When deferral is unsound
 //!
 //! [`ClaimPreference::DeferToHost`] is a bet that the host has a kernel to run
@@ -74,10 +95,8 @@ pub fn governs(op: &Node) -> bool {
     )
 }
 
-/// Upper bound (inclusive) on element count for the f16 `Gelu(approximate=tanh)`
-/// claim.
-///
-/// Measured f16 `Gelu` ratios (ORT ns / ours, >1 means we win):
+/// Measured f16 `Gelu` ratios with the claim kept (ORT ns / ours, >1 means we
+/// win):
 ///
 /// | elements | 1 thread | 8 threads | 16 threads |
 /// |---------:|---------:|----------:|-----------:|
@@ -89,43 +108,16 @@ pub fn governs(op: &Node) -> bool {
 /// | 524288   | -        | -         | 1.01       |
 /// | 1048576  | 1.50     | 0.89      | -          |
 ///
-/// The win survives threading up to 262144 elements and stops surviving it
-/// after that, so that is the cap.
-const F16_GELU_TANH_MAX_ELEMENTS: usize = 262_144;
-
-/// Total element count of the first input, or `None` when the size is not
-/// knowable at capability time.
+/// A cap at 262144 — the last size whose win survives every thread count — was
+/// tried and **falsified end-to-end**, which is why this module has no size
+/// gate at all. See the function-inlining note below.
 ///
-/// An empty [`Shape`] is *not* treated as a rank-0 scalar here: `Shape` is a
-/// `Vec<Dim>`, and a value whose rank is unknown (no `TensorShapeProto` at all)
-/// arrives as the same empty vector. The two cases are indistinguishable, and
-/// only one of them is safe to size-gate on, so both defer.
-fn static_elements(shapes: &[Shape]) -> Option<usize> {
-    let shape = shapes.first()?;
-    if shape.is_empty() {
-        return None;
-    }
-    let mut n = 1usize;
-    for dim in shape.iter() {
-        n = n.checked_mul(dim.as_static()?)?;
-    }
-    Some(n)
-}
-
-/// Whether a `Gelu` node selects the tanh approximation.
-fn is_tanh_gelu(op: &Node) -> bool {
-    op.attr("approximate")
-        .and_then(|a| a.as_str())
-        .map(|s| s == "tanh")
-        .unwrap_or(false)
-}
-
 /// Whether this EP wants `op` handed to it by a plugin host, or would rather
 /// the host ran its own kernel.
 pub fn claim_preference(
     op: &Node,
     _opset: u64,
-    shapes: &[Shape],
+    _shapes: &[Shape],
     input_dtypes: &[DataType],
 ) -> ClaimPreference {
     if !governs(op) {
@@ -136,6 +128,21 @@ pub fn claim_preference(
         None => return ClaimPreference::Claim,
     };
 
+    // `Gelu` is an ONNX *function*, and ORT's CPU EP only has a real kernel for
+    // it in float32. In every other dtype, declining does not hand the node to
+    // an ORT kernel — ORT inlines the function body into
+    // `Cast`/`Pow`/`Mul`/`Sum`/`Tanh`/`Sqrt`, and this EP then claims the
+    // ungoverned constituents, which in float16 are far slower than ORT's.
+    // Profiled at 1048576 float16 elements, deferring `Gelu(tanh)` cost 553 ms
+    // of claimed `Mul`/`Pow`/`Sum` against ORT's 10.8 ms for the same nodes — a
+    // session ratio of 0.014x, against 0.89x worst case for simply keeping the
+    // claim. `Gelu(none)` measured 0.024-0.049x the same way. So outside
+    // float32 this is a capability claim like bfloat16's, not a performance
+    // bet: there is no faster host kernel to defer to.
+    if op.op_type == "Gelu" && dtype != DataType::Float32 {
+        return ClaimPreference::Claim;
+    }
+
     match dtype {
         // ORT's CPU EP has no bfloat16 kernel for any of these ops: without
         // this plugin the session fails to create at all
@@ -145,30 +152,13 @@ pub fn claim_preference(
         // load-time failure.
         DataType::BFloat16 => ClaimPreference::Claim,
 
-        DataType::Float16 => {
-            if op.op_type == "Gelu" && is_tanh_gelu(op) {
-                match static_elements(shapes) {
-                    Some(n) if n <= F16_GELU_TANH_MAX_ELEMENTS => ClaimPreference::Claim,
-                    Some(n) => ClaimPreference::defer(format!(
-                        "float16 Gelu(tanh) is measured faster than ORT only up to \
-                         {F16_GELU_TANH_MAX_ELEMENTS} elements (this node has {n}); above that \
-                         ORT's multi-threaded kernel wins (0.89x at 1048576 with 8 threads)"
-                    )),
-                    // A dynamic shape could be any size, including the sizes
-                    // where we lose. Fail conservative: there is no run-time
-                    // re-decision once ORT has committed the partition.
-                    None => ClaimPreference::defer(
-                        "float16 Gelu(tanh) is only faster than ORT up to a measured element \
-                         count, and this node's shape is not static at capability time",
-                    ),
-                }
-            } else {
-                ClaimPreference::defer(
-                    "measured slower than ORT's float16 CPU kernel at every size on x86-64 \
-                     AVX2 (0.59-0.96x); only Gelu(approximate=tanh) is competitive in float16",
-                )
-            }
-        }
+        // ORT has float16 kernels for these primitives (it casts to float32
+        // around them) and runs them faster: measured 0.59-0.96x before this
+        // policy, ~1.00x after. Deferring here is a real handover.
+        DataType::Float16 => ClaimPreference::defer(
+            "measured slower than ORT's float16 CPU kernel at every size on x86-64 AVX2 \
+             (0.59-0.96x), and ORT has a float16 kernel for this op to defer to",
+        ),
 
         // Float32 is where ORT is strongest: MLAS activation kernels plus
         // intra-op threading. Measured session-level ratios on AVX2 with one
@@ -248,51 +238,66 @@ mod tests {
     }
 
     #[test]
-    fn float16_claims_only_tanh_gelu_below_the_measured_cap() {
-        let g = node("Gelu", &[("approximate", "tanh")]);
-        for n in [1usize, 512, 3072, 65536, F16_GELU_TANH_MAX_ELEMENTS] {
-            assert!(
-                claim_preference(&g, 22, &[shape(&[1, n])], &[DataType::Float16]).is_claim(),
-                "float16 Gelu(tanh) n={n} is measured >=1.2x and must be claimed"
-            );
-        }
-        for n in [F16_GELU_TANH_MAX_ELEMENTS + 1, 1_048_576] {
-            let pref = claim_preference(&g, 22, &[shape(&[1, n])], &[DataType::Float16]);
-            assert!(!pref.is_claim(), "float16 Gelu(tanh) n={n} must defer");
+    fn float16_gelu_is_claimed_at_every_size_because_ort_would_inline_it() {
+        // ORT has no float16 `Gelu` kernel of either approximation. Declining
+        // makes it inline the function body, after which this EP claims the
+        // ungoverned float16 constituents at 0.014-0.049x. Size and shape are
+        // irrelevant to that: there is no host kernel to hand the node to.
+        for attrs in [
+            &[("approximate", "tanh")][..],
+            &[("approximate", "none")][..],
+            &[][..],
+        ] {
+            let g = node("Gelu", attrs);
+            for shp in [
+                shape(&[1, 1]),
+                shape(&[1, 262_144]),
+                shape(&[1, 1_048_576]),
+                shape(&[1, 64_000_000]),
+                dynamic_shape(),
+                Shape::new(),
+            ] {
+                assert!(
+                    claim_preference(&g, 22, &[shp], &[DataType::Float16]).is_claim(),
+                    "float16 Gelu {attrs:?} must be claimed — deferring costs 20-70x"
+                );
+            }
         }
     }
 
     #[test]
-    fn float16_exact_gelu_and_the_other_activations_defer() {
-        let exact = node("Gelu", &[("approximate", "none")]);
-        assert!(
-            !claim_preference(&exact, 22, &[shape(&[1, 3072])], &[DataType::Float16]).is_claim()
-        );
-        // No `approximate` attribute at all means the exact erf path.
-        let bare = node("Gelu", &[]);
-        assert!(
-            !claim_preference(&bare, 22, &[shape(&[1, 3072])], &[DataType::Float16]).is_claim()
-        );
+    fn float16_primitives_defer_because_ort_really_does_run_them() {
+        // Unlike `Gelu`, these are ops ORT's CPU EP has a float16 kernel for,
+        // so the profile shows a single node landing on `CPUExecutionProvider`
+        // and the measured session ratio goes 0.59-0.96x -> ~1.00x.
         for op in ["Tanh", "Sigmoid", "Sqrt", "Erf"] {
-            assert!(
-                !claim_preference(
-                    &node(op, &[]),
-                    22,
-                    &[shape(&[1, 3072])],
-                    &[DataType::Float16]
-                )
-                .is_claim(),
-                "{op} float16 must defer"
-            );
+            for shp in [shape(&[1, 3072]), shape(&[1, 1_048_576]), dynamic_shape()] {
+                assert!(
+                    !claim_preference(&node(op, &[]), 22, &[shp], &[DataType::Float16]).is_claim(),
+                    "{op} float16 must defer"
+                );
+            }
         }
     }
 
     #[test]
-    fn dynamic_shapes_fail_conservative_for_the_size_gated_claim() {
+    fn gelu_is_only_ever_deferred_in_float32() {
+        // float32 is the one dtype ORT has a real `Gelu` kernel for, verified
+        // by profile: a deferred f32 `Gelu` shows up as one `Gelu` node on
+        // `CPUExecutionProvider`, not as an inlined subgraph.
         let g = node("Gelu", &[("approximate", "tanh")]);
-        let pref = claim_preference(&g, 22, &[dynamic_shape()], &[DataType::Float16]);
-        assert!(!pref.is_claim());
-        assert!(pref.reason().unwrap().contains("not static"));
+        assert!(!claim_preference(&g, 22, &[shape(&[1, 3072])], &[DataType::Float32]).is_claim());
+        for dt in [
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Float64,
+            DataType::Int32,
+        ] {
+            assert!(
+                claim_preference(&g, 22, &[shape(&[1, 3072])], &[dt]).is_claim(),
+                "{dt:?} Gelu must be claimed — ORT would inline the function instead"
+            );
+        }
     }
 
     #[test]
@@ -331,17 +336,38 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_shape_is_treated_as_unknown_rank_not_as_a_scalar() {
-        // `Shape` is a `Vec<Dim>`: a rank-0 scalar and a value with no declared
-        // shape at all are the same empty vector. Sizing a claim on `n = 1`
-        // would let an unknown-rank tensor of any size through the f16 cap.
-        let g = node("Gelu", &[("approximate", "tanh")]);
-        let pref = claim_preference(&g, 22, &[Shape::new()], &[DataType::Float16]);
-        assert!(
-            !pref.is_claim(),
-            "an empty shape is not a size guarantee, got {pref:?}"
-        );
-        assert!(pref.reason().unwrap().contains("not static"));
+    fn no_decision_depends_on_shape() {
+        // Every threshold this module once had was falsified by end-to-end
+        // measurement, so the predicate is shape-blind by construction. Pinning
+        // that here keeps the ambiguity between a rank-0 scalar and an
+        // unknown-rank value (both are the empty `Vec<Dim>`) from ever becoming
+        // load-bearing again.
+        for op in ["Tanh", "Sigmoid", "Gelu", "Sqrt", "Erf"] {
+            for dt in [
+                DataType::Float32,
+                DataType::Float16,
+                DataType::BFloat16,
+                DataType::Float64,
+            ] {
+                let n = node(op, &[]);
+                let baseline = claim_preference(&n, 22, &[shape(&[1, 3072])], &[dt]).is_claim();
+                for shp in [
+                    Shape::new(),
+                    shape(&[]),
+                    shape(&[1]),
+                    shape(&[1, 64_000_000]),
+                    dynamic_shape(),
+                ] {
+                    assert_eq!(
+                        claim_preference(&n, 22, std::slice::from_ref(&shp), &[dt]).is_claim(),
+                        baseline,
+                        "{op}/{dt:?} changed its answer for shape {shp:?}"
+                    );
+                }
+                // No shapes supplied at all must agree too.
+                assert_eq!(claim_preference(&n, 22, &[], &[dt]).is_claim(), baseline);
+            }
+        }
     }
 
     #[test]

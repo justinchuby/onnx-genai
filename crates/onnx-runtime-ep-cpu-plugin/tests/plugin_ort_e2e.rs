@@ -3262,19 +3262,24 @@ fn assignment_policy_always_claims_bfloat16_activations() {
     }
 }
 
-/// The one claim that is a genuine performance bet: float16 `Gelu(tanh)` is
-/// measured 1.2-1.9x faster than ORT up to 262144 elements at 1, 8 and 16
-/// intra-op threads, and loses above that once ORT's thread pool takes over.
-/// Both sides of that boundary are asserted, because a threshold that is never
-/// exercised on its losing side is not a threshold.
+/// float16 `Gelu` must be claimed at **every** size, and the falsifier is the
+/// absence of an inlined function body.
+///
+/// ORT's CPU EP has no float16 `Gelu` kernel, so declining does not hand the
+/// node over — ORT inlines the `Gelu` function into
+/// `Cast`/`Pow`/`Mul`/`Sum`/`Tanh`/`Sqrt` and this EP claims the ungoverned
+/// float16 constituents, measured at 0.014-0.049x of plain ORT. An element-count
+/// cap was written and deleted for exactly this reason; this test is what
+/// stops it coming back. Both fixtures (3072 and 300000 elements) must show a
+/// single claimed `Gelu` and no decomposition artefacts.
 #[test]
-fn assignment_policy_gates_float16_gelu_on_element_count() {
+fn assignment_policy_claims_float16_gelu_without_inlining_it() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
 
-    for (tag, reg, want_ours) in [
-        ("small", "cpu_ep_gelu_small", true),
-        ("large", "cpu_ep_gelu_large", false),
+    for (tag, reg) in [
+        ("small", "cpu_ep_gelu_small"),
+        ("large", "cpu_ep_gelu_large"),
     ] {
         let model_path = PathBuf::from(manifest_dir).join(format!(
             "tests/fixtures/gelu_assignment_f16_{tag}/model.onnx.textproto"
@@ -3283,7 +3288,7 @@ fn assignment_policy_gates_float16_gelu_on_element_count() {
             (unsafe { conformance_setup(reg, &model_path, false) })
         else {
             eprintln!(
-                "*** SKIPPED: assignment_policy_gates_float16_gelu_on_element_count — \
+                "*** SKIPPED: assignment_policy_claims_float16_gelu_without_inlining_it — \
                  ORT or EP cdylib not found ***"
             );
             return;
@@ -3296,25 +3301,27 @@ fn assignment_policy_gates_float16_gelu_on_element_count() {
                 "  [gelu_f16_{tag}] ours={ours:?}, others={:?}",
                 info.ops_not_on_our_ep()
             );
-            if want_ours {
+            assert!(
+                ours.contains(&"Gelu"),
+                "float16 Gelu must be claimed at {tag} size — ORT has no float16 Gelu \
+                 kernel, so deferring inlines the function instead; got: {:?}",
+                info.assignments
+            );
+            // The decomposition signature: if ORT had inlined the function, the
+            // graph would contain `Pow`/`Sum`/`Mul` nodes that do not exist in
+            // the fixture. Their absence is what proves the claim held.
+            for artefact in ["Pow", "Sum", "Mul"] {
                 assert!(
-                    ours.contains(&"Gelu"),
-                    "float16 Gelu(tanh) below the measured cap is 1.5x ORT and must be \
-                     claimed; got: {:?}",
-                    info.assignments
-                );
-            } else {
-                assert!(
-                    !ours.contains(&"Gelu"),
-                    "float16 Gelu(tanh) above the measured cap loses to ORT's threaded \
-                     kernel and must not be claimed; got: {:?}",
+                    !ours.contains(&artefact) && !info.ops_not_on_our_ep().contains(&artefact),
+                    "float16 Gelu was inlined into its function body ('{artefact}' appeared) \
+                     — the claim did not hold; got: {:?}",
                     info.assignments
                 );
             }
             conformance_teardown(api, env, opts, session, reg);
         }
     }
-    eprintln!("\n✅ assignment_policy_gates_float16_gelu_on_element_count: PASSED");
+    eprintln!("\n✅ assignment_policy_claims_float16_gelu_without_inlining_it: PASSED");
 }
 
 /// Deferring assumes there is a host kernel to defer *to*. With
