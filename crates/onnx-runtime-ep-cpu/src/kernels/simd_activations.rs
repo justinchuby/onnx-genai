@@ -302,8 +302,12 @@ mod exp_c {
     pub(super) const P2: f32 = f32::from_bits(0x3D2A_ADAD);
     pub(super) const P3: f32 = f32::from_bits(0x3E2A_AA28);
     pub(super) const P4: f32 = f32::from_bits(0x3EFF_FFFB);
-    /// `poly_5` and `poly_6` are both exactly `1.0`; MLAS folds `poly_6` into
-    /// the overflow multiply, so only this one appears in the Horner chain.
+    /// MLAS stores a single `poly_56` field because the degree-5 and degree-6
+    /// coefficients are both exactly `1.0`. In `MlasComputeExpVector` — the
+    /// variant ported here — only one of them appears in the Horner chain; the
+    /// other is merged into the overflow-exponent multiply/add below, following
+    /// XNNPACK. (The reduced-range helper further down `compute.cpp` instead
+    /// applies `poly_56` twice, because it has no overflow term to fold into.)
     pub(super) const P56: f32 = 1.0;
     /// Exponent field clamps for the two-piece `2^m` reconstruction.
     pub(super) const MINIMUM_EXPONENT: i32 = 0xC100_0000u32 as i32;
@@ -409,9 +413,9 @@ pub(crate) fn sigmoid_f32_slice(input: &[f32], output: &mut [f32]) {
 /// 65536-point sweep of `[-110, 89]` the worst observed error against an `f64`
 /// reference is **1 ulp**, including through the subnormal range.
 ///
-/// Special values match `f32::exp` and ORT: `NaN` in gives `NaN` out (the input
-/// lane is blended back so the exponent arithmetic cannot manufacture a finite
-/// result), `+Inf` gives `+Inf`, `-Inf` gives `+0`, arguments above
+/// Special values match `f32::exp` and ORT: `NaN` in gives `NaN` out (see
+/// [`avx2::exp_full_ps`] — it falls out of the clamp's operand order rather
+/// than a mask), `+Inf` gives `+Inf`, `-Inf` gives `+0`, arguments above
 /// `88.7762626647950` overflow to `+Inf`, and arguments below
 /// `-103.9720840454` flush to `+0` through the subnormal range.
 pub(crate) fn exp_f32_slice(input: &[f32], output: &mut [f32]) {
@@ -988,10 +992,28 @@ mod avx2 {
     ///   clamped `normal` part and an `overflow` remainder, and the two are
     ///   applied at different points in the Horner chain. This is what lets
     ///   subnormal results come out right instead of flushing early.
-    /// * `NaN` lanes are blended back from the input. The reconstruction reads
-    ///   `biased` as an integer, and for a `NaN` argument that integer is
-    ///   meaningless — without the blend the arithmetic can and does
-    ///   manufacture a finite result.
+    /// # `NaN` survives without a mask, and the clamp's operand order is why
+    ///
+    /// The reconstruction reinterprets `biased` as an integer, and for a `NaN`
+    /// argument that integer is meaningless — so it is worth being explicit
+    /// about why a `NaN` cannot come out finite. `MINPS`/`MAXPS` return their
+    /// **second** operand when either input is unordered. Both clamp steps put
+    /// the value being clamped second (`min(UPPER, x)`, then `max(LOWER, v)`),
+    /// so a `NaN` argument passes through the clamp unchanged; the first
+    /// polynomial `fmadd(P0, v, P1)` then carries it into `p`, and every later
+    /// step multiplies or adds `p`, so the `NaN` reaches the result. It holds
+    /// for every payload and both signs, quiet and signalling alike, because
+    /// `NaN * anything` is `NaN` — including `NaN * 0` and `NaN * Inf`, the two
+    /// values the integer path can produce.
+    ///
+    /// **The operand order in the clamp is therefore load-bearing.** Rewriting
+    /// `min(UPPER, x)` as `min(x, UPPER)` would silently replace every `NaN`
+    /// with `UPPER_RANGE` and turn `exp(NaN)` into `+Inf`.
+    /// [`exp_tests::nan_propagates_instead_of_becoming_finite`] pins this.
+    ///
+    /// An explicit `_CMP_UNORD_Q` compare plus `blendv` was measured as the
+    /// alternative and cost about 10% of throughput at 256 K elements for no
+    /// behavioural difference.
     #[inline]
     #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn exp_full_ps(x: __m256) -> __m256 {
@@ -2621,8 +2643,10 @@ mod exp_tests {
         }
     }
 
-    /// Without the explicit blend the exponent reconstruction turns `NaN` into
-    /// a finite number, which is why this test exists as its own case.
+    /// `NaN` survives the exponent reconstruction only because of the clamp's
+    /// operand order — see [`avx2::exp_full_ps`]. Nothing in the arithmetic
+    /// makes that obvious, so it gets its own test, across both signs and both
+    /// quiet and signalling payloads.
     #[test]
     fn nan_propagates_instead_of_becoming_finite() {
         let payloads = [

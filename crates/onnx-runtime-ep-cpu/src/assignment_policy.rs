@@ -1864,7 +1864,7 @@ mod vectorised_but_slower_unary_tests {
     const OPS: [&str; 3] = ["Exp", "Log", "Softplus"];
 
     #[test]
-    fn all_four_are_governed() {
+    fn all_three_are_governed() {
         for op in OPS {
             assert!(governs(&node(op, &[])), "{op} must be governed");
         }

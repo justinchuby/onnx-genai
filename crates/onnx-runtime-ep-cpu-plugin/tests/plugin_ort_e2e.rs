@@ -4336,3 +4336,50 @@ fn float32_softplus_is_not_assigned_at_its_one_winning_cell() {
         "ORT must be running Softplus, got others={theirs:?}"
     );
 }
+
+/// Companion to `assignment_policy_yields_when_cpu_fallback_is_disabled`, for
+/// the *newer* `vectorised_but_slower_unary_preference` deferral.
+///
+/// The deferral for `Exp`/`Log`/`Softplus` is a performance choice, not a
+/// capability one: we can execute these correctly, we simply lose to ORT. So
+/// when the session disables CPU fallback there is nothing to defer *to*, and
+/// claiming is strictly better than failing session creation. This pins that
+/// the size-independent "always defer" path still respects that override — a
+/// regression here would surface as an unloadable session rather than as a
+/// slow one, which is far worse than the throughput it was protecting.
+#[test]
+fn exp_deferral_still_claims_when_cpu_fallback_is_disabled() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/exp_assignment_f32_large/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_exp_nofb", &model_path, true) })
+    else {
+        // `conformance_setup` panics instead of returning `None` when
+        // `NXRT_REQUIRE_ORT_TESTS=1`, so this arm is unreachable in CI.
+        eprintln!(
+            "*** SKIPPED: exp_deferral_still_claims_when_cpu_fallback_is_disabled — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours = info.ops_on_our_ep();
+        eprintln!(
+            "  [exp_nofb] ours={ours:?}, others={:?}",
+            info.ops_not_on_our_ep()
+        );
+        assert!(
+            ours.contains(&"Exp"),
+            "with cpu-ep fallback disabled there is nothing to defer to, so 'Exp' must be \
+             claimed despite the performance policy; got: {:?}",
+            info.assignments
+        );
+        conformance_teardown(api, env, opts, session, "cpu_ep_exp_nofb");
+    }
+    eprintln!("\n✅ exp_deferral_still_claims_when_cpu_fallback_is_disabled: PASSED");
+}
