@@ -235,16 +235,25 @@ type MlasMaxThreadsFn = unsafe extern "C" fn(rust_ctx: *mut c_void) -> c_int;
 
 const MLAS_WORK_STEALING_THREADS_ENV: &str = "ONNX_GENAI_MLAS_THREADPOOL_THREADS";
 /// The CPU EP's thread-budget knob. `mlas-sys` sits *below* the EP and cannot
-/// depend on it, so the name is duplicated here; keep it in sync with
-/// `onnx_runtime_ep_cpu::kernels::matmul_nbits::DECODE_THREADS_ENV`.
+/// depend on it, so the name lives here and the EP refers to *this* constant;
+/// `onnx-runtime-ep-cpu` static-asserts that its own `DECODE_THREADS_ENV`
+/// matches, so the two can never drift.
 ///
 /// Without this, an embedder that asked the CPU EP for N threads still got a
 /// standalone-MLAS pool sized by [`default_mlas_thread_count`]'s own default,
 /// so the request was silently ignored for every `MlasGemmBatch` call.
-const CPU_DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
+pub const CPU_DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
 /// Upper bound on the standalone pool, matching the previous `n.min(64)` cap on
 /// the explicit override.
+///
+/// A budget above this is clamped, which makes the standalone pool smaller than
+/// the CPU EP's persistent pool (that one clamps only to `available`). The
+/// divergence is reported once on stderr rather than applied silently.
 const MAX_MLAS_POOL_THREADS: usize = 64;
+
+/// Programmatic thread budget, mirroring the CPU EP's
+/// `set_decode_thread_budget`. Zero means unset.
+static POOL_THREAD_BUDGET: AtomicUsize = AtomicUsize::new(0);
 
 static MLAS_PARALLEL_FOR_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MLAS_PARALLEL_FOR_ITERATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -370,10 +379,15 @@ pub fn sqnbit_mlas_partitioning(
 
 /// Worker count for the standalone MLAS work-stealing pool.
 ///
-/// Precedence: the MLAS-specific override, then the CPU EP's thread budget,
-/// then [`resolve_default_mlas_threads`].
+/// Precedence, mirroring the CPU EP's own resolution order: the MLAS-specific
+/// pool override, then the programmatic budget from
+/// [`set_pool_thread_budget`], then the CPU EP's thread-budget environment
+/// variable, then [`resolve_default_mlas_threads`].
 fn default_mlas_thread_count() -> usize {
     if let Some(threads) = thread_count_env(MLAS_WORK_STEALING_THREADS_ENV) {
+        return threads;
+    }
+    if let Some(threads) = pool_thread_budget() {
         return threads;
     }
     if let Some(threads) = thread_count_env(CPU_DECODE_THREADS_ENV) {
@@ -387,10 +401,62 @@ fn default_mlas_thread_count() -> usize {
     )
 }
 
+/// Set or clear a process-local worker budget for the standalone MLAS pool.
+///
+/// This is the programmatic equivalent of [`CPU_DECODE_THREADS_ENV`] and takes
+/// precedence over it. `onnx-runtime-ep-cpu::set_decode_thread_budget` forwards
+/// here so that a caller such as the CLI's `--cpu-cores` bounds dense
+/// `MlasGemmBatch` work too, on every OS -- not just Linux, where process
+/// affinity would otherwise shrink `available_parallelism` for us.
+///
+/// Pools are initialized lazily and keep their initial size for the process
+/// lifetime, so call this before the first GEMM. `Some(0)` is rejected.
+pub fn set_pool_thread_budget(threads: Option<usize>) -> Result<(), &'static str> {
+    if threads == Some(0) {
+        return Err("MLAS pool thread budget must be greater than zero");
+    }
+    POOL_THREAD_BUDGET.store(threads.unwrap_or(0), Ordering::Release);
+    Ok(())
+}
+
+fn pool_thread_budget() -> Option<usize> {
+    let threads = POOL_THREAD_BUDGET.load(Ordering::Acquire);
+    (threads > 0).then(|| clamp_pool_threads(threads))
+}
+
+/// The programmatic budget currently in effect, or `None` when unset.
+///
+/// Exposed so higher layers can assert that their own budget actually reached
+/// this pool; it does not report the env-var or automatic fallbacks.
+pub fn configured_pool_thread_budget() -> Option<usize> {
+    std::num::NonZeroUsize::new(POOL_THREAD_BUDGET.load(Ordering::Acquire))
+        .map(std::num::NonZeroUsize::get)
+}
+
+/// A budget of `0` means "no override" here, matching the CPU EP, which treats
+/// `ONNX_GENAI_CPU_DECODE_THREADS=0` as an opt-out back to automatic sizing.
 fn thread_count_env(name: &str) -> Option<usize> {
-    let raw = std::env::var(name).ok()?;
+    parse_thread_count(&std::env::var(name).ok()?)
+}
+
+/// Pure parser for a thread-count knob, split out so it can be tested without
+/// mutating the process environment (`setenv` races other threads' `getenv`).
+fn parse_thread_count(raw: &str) -> Option<usize> {
     let threads = raw.trim().parse::<usize>().ok()?;
-    (threads > 0).then(|| threads.min(MAX_MLAS_POOL_THREADS))
+    (threads > 0).then(|| clamp_pool_threads(threads))
+}
+
+fn clamp_pool_threads(threads: usize) -> usize {
+    if threads > MAX_MLAS_POOL_THREADS {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "mlas-sys: thread budget {threads} exceeds the standalone pool cap of \
+                 {MAX_MLAS_POOL_THREADS}; using {MAX_MLAS_POOL_THREADS} workers"
+            );
+        });
+    }
+    threads.min(MAX_MLAS_POOL_THREADS)
 }
 
 /// Default pool size: half the logical CPUs, but never fewer than the previous
@@ -517,8 +583,10 @@ pub struct MlasThreadPool {
 impl MlasThreadPool {
     /// Create a compatibility handle and initialize the process-global backing
     /// pool. The global pool's actual degree of parallelism is selected once at
-    /// first use (default: `available_parallelism().clamp(1, 8)`, override via
-    /// `ONNX_GENAI_MLAS_THREADPOOL_THREADS`), so this `thread_count` is retained
+    /// first use by [`default_mlas_thread_count`] --
+    /// `ONNX_GENAI_MLAS_THREADPOOL_THREADS`, then [`set_pool_thread_budget`],
+    /// then [`CPU_DECODE_THREADS_ENV`], then
+    /// [`resolve_default_mlas_threads`] -- so this `thread_count` is retained
     /// only for diagnostics/backward-compatible tests.
     pub fn new(thread_count: usize) -> std::io::Result<Self> {
         assert!(thread_count > 0, "thread_count must be non-zero");
@@ -3189,34 +3257,60 @@ mod tests {
     /// standalone MLAS pool used to ignore it entirely, so asking the EP for N
     /// threads left every `MlasGemmBatch` call on a differently-sized pool.
     #[test]
-    fn thread_count_env_parses_and_clamps() {
-        // SAFETY: single-threaded test process section; the vars are restored
-        // before returning and no other test reads them.
-        unsafe {
-            std::env::set_var("ONNX_GENAI_MLAS_TEST_THREADS", "12");
-            assert_eq!(thread_count_env("ONNX_GENAI_MLAS_TEST_THREADS"), Some(12));
-            std::env::set_var("ONNX_GENAI_MLAS_TEST_THREADS", "  7  ");
+    fn parse_thread_count_parses_and_clamps() {
+        // Deliberately tests the pure parser rather than `thread_count_env`:
+        // `std::env::set_var` races concurrent `getenv` in sibling tests (cargo
+        // runs lib tests multi-threaded), which is a data race even for
+        // distinct keys. The only thing `thread_count_env` adds is the
+        // `std::env::var` lookup.
+        assert_eq!(parse_thread_count("12"), Some(12));
+        assert_eq!(
+            parse_thread_count("  7  "),
+            Some(7),
+            "surrounding whitespace must be tolerated"
+        );
+        assert_eq!(
+            parse_thread_count("9999"),
+            Some(MAX_MLAS_POOL_THREADS),
+            "an absurd request must clamp, not oversubscribe"
+        );
+        for bad in ["0", "", "abc", "-4", "3.5", "18446744073709551616"] {
             assert_eq!(
-                thread_count_env("ONNX_GENAI_MLAS_TEST_THREADS"),
-                Some(7),
-                "surrounding whitespace must be tolerated"
+                parse_thread_count(bad),
+                None,
+                "{bad:?} must fall through to the next precedence level"
             );
-            std::env::set_var("ONNX_GENAI_MLAS_TEST_THREADS", "9999");
-            assert_eq!(
-                thread_count_env("ONNX_GENAI_MLAS_TEST_THREADS"),
-                Some(MAX_MLAS_POOL_THREADS),
-                "an absurd request must clamp, not oversubscribe"
-            );
-            for bad in ["0", "", "abc", "-4"] {
-                std::env::set_var("ONNX_GENAI_MLAS_TEST_THREADS", bad);
-                assert_eq!(
-                    thread_count_env("ONNX_GENAI_MLAS_TEST_THREADS"),
-                    None,
-                    "{bad:?} must fall through to the next precedence level"
-                );
-            }
-            std::env::remove_var("ONNX_GENAI_MLAS_TEST_THREADS");
         }
-        assert_eq!(thread_count_env("ONNX_GENAI_MLAS_TEST_THREADS"), None);
+    }
+
+    #[test]
+    fn pool_thread_budget_round_trips_and_rejects_zero() {
+        // Serialized against the resolver test below by exercising only the
+        // atomic, which is process-local state this test fully owns and
+        // restores.
+        let previous = POOL_THREAD_BUDGET.load(Ordering::Acquire);
+        assert_eq!(
+            set_pool_thread_budget(Some(0)),
+            Err("MLAS pool thread budget must be greater than zero"),
+            "zero is the CPU EP's opt-out sentinel, not a legal pool size"
+        );
+
+        set_pool_thread_budget(Some(6)).expect("6 is a legal budget");
+        assert_eq!(pool_thread_budget(), Some(6));
+
+        set_pool_thread_budget(Some(9999)).expect("an absurd budget clamps");
+        assert_eq!(
+            pool_thread_budget(),
+            Some(MAX_MLAS_POOL_THREADS),
+            "the programmatic path must clamp exactly like the env path"
+        );
+
+        set_pool_thread_budget(None).expect("clearing is legal");
+        assert_eq!(
+            pool_thread_budget(),
+            None,
+            "a cleared budget must fall through to the next precedence level"
+        );
+        POOL_THREAD_BUDGET.store(previous, Ordering::Release);
     }
 }
