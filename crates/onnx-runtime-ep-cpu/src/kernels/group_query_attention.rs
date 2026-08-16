@@ -127,6 +127,62 @@ pub fn group_fused_count() -> usize {
     GROUP_FUSED_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Count of forwards that assembled the present KV cache straight inside the
+/// graph's `present_key`/`present_value` outputs.
+static PRESENT_DIRECT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Count of forwards that fell back to owned present scratch plus a copy out.
+static PRESENT_SCRATCH_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of forwards that built the present cache directly in the graph
+/// outputs (no owned scratch, no trailing copy). Reachability evidence for A/B
+/// runs, in the same spirit as [`group_fused_count`].
+pub fn present_direct_count() -> usize {
+    PRESENT_DIRECT_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Number of forwards that fell back to owned present scratch.
+pub fn present_scratch_count() -> usize {
+    PRESENT_SCRATCH_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only tri-state override of the direct-present gate: `-1` defers to the
+/// structural detection, `0` forces the owned-scratch fall-back.
+#[cfg(test)]
+static PRESENT_DIRECT_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Serialises tests that force the present path, so the override cannot leak
+/// into a test running concurrently in the same process.
+#[cfg(test)]
+static PRESENT_DIRECT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Forces the owned-scratch present path for the lifetime of the guard, so a
+/// test can A/B it against the direct-write path on identical inputs.
+#[cfg(test)]
+struct PresentScratchOverride {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl PresentScratchOverride {
+    fn forced() -> Self {
+        let guard = PRESENT_DIRECT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        PRESENT_DIRECT_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PresentScratchOverride {
+    fn drop(&mut self) {
+        PRESENT_DIRECT_OVERRIDE.store(-1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Serialises tests that force [`group_fusion_enabled`] on, so the override
 /// cannot leak into a test running concurrently in the same process.
 #[cfg(test)]
@@ -806,6 +862,142 @@ impl GroupQueryAttentionKernel {
         let pv_out = out_ptr(&outputs[2]);
         pk_in != 0 && pv_in != 0 && pk_in == pk_out && pv_in == pv_out && pk_in != pv_in
     }
+
+    /// Decide whether the present KV cache can be *assembled directly inside the
+    /// graph's `present_key`/`present_value` outputs* instead of being built in
+    /// owned scratch and then memcpy-ed out.
+    ///
+    /// Without a present==past binding the copy path paid for the whole cache
+    /// twice every step: once widening past+current into two `Vec<f32>`, and
+    /// once copying those `Vec`s into the outputs. The second pass is pure
+    /// overhead — the widen can target the output buffers themselves, which is
+    /// exactly the traffic ONNX Runtime's CPU GroupQueryAttention pays.
+    ///
+    /// The gate is structural and conservative: both present outputs must be
+    /// present, contiguous, `Float32`, and exactly `present_len` elements, they
+    /// must not overlap each other, and they must not overlap (or even share an
+    /// allocation with) any tensor the fill reads — query/key/value/past. The
+    /// exact-alias case is handled earlier by [`Self::detect_inplace_kv`]; any
+    /// other overlap declines to the owned-scratch path, so behaviour is
+    /// byte-identical either way.
+    fn detect_direct_present(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        present_len: usize,
+    ) -> bool {
+        use onnx_runtime_ir::DataType::Float32;
+        #[cfg(test)]
+        if PRESENT_DIRECT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return false;
+        }
+        if outputs.len() < 3 || present_len == 0 {
+            return false;
+        }
+        for out in [&outputs[1], &outputs[2]] {
+            if out.is_absent()
+                || out.dtype != Float32
+                || !out.is_contiguous()
+                || out.numel() != present_len
+                || out.validate().is_err()
+            {
+                return false;
+            }
+        }
+        let present_bytes = present_len * size_of::<f32>();
+        let out_span = |out: &TensorMut| {
+            let base = (out.data.0 as *const u8).wrapping_add(out.byte_offset) as usize;
+            (base, base.saturating_add(present_bytes))
+        };
+        let k_span = out_span(&outputs[1]);
+        let v_span = out_span(&outputs[2]);
+        if k_span.0 == 0 || v_span.0 == 0 {
+            return false;
+        }
+        let overlaps = |a: (usize, usize), b: (usize, usize)| a.0 < b.1 && b.0 < a.1;
+        if overlaps(k_span, v_span) {
+            return false;
+        }
+        let k_alloc = outputs[1].data.0 as usize;
+        let v_alloc = outputs[2].data.0 as usize;
+        for view in inputs.iter().take(5) {
+            if view.is_absent() {
+                continue;
+            }
+            // Same-allocation check first: it also covers strided views, whose
+            // `numel * byte_size` span can under-approximate their real extent.
+            let alloc = view.data.0 as usize;
+            if alloc == k_alloc || alloc == v_alloc {
+                return false;
+            }
+            let base = (view.data.0 as *const u8).wrapping_add(view.byte_offset) as usize;
+            let span = (
+                base,
+                base.saturating_add(view.numel() * view.dtype.byte_size().max(1)),
+            );
+            if overlaps(k_span, span) || overlaps(v_span, span) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Widen the past prefix and append the current step's K/V into `present_k`
+    /// and `present_v`, which are laid out BNSH-contiguous with
+    /// `present_sequence_length` rows per (batch, kv-head).
+    ///
+    /// Rows beyond a batch's logical `total` are padding that is emitted but
+    /// never attended; they are zeroed explicitly here so the caller never has
+    /// to pre-zero the whole buffer (which would defeat writing straight into a
+    /// graph output).
+    #[allow(clippy::too_many_arguments)]
+    fn fill_present(
+        &self,
+        present_k: &mut [f32],
+        present_v: &mut [f32],
+        past_key: Option<&PastCache>,
+        past_value: Option<&PastCache>,
+        k: &Bhsd,
+        v: &Bhsd,
+        past_lengths: &[usize],
+        totals: &[usize],
+        present_sequence_length: usize,
+        cache_dim: usize,
+    ) {
+        for (b, &past_len) in past_lengths.iter().enumerate() {
+            for h in 0..self.kv_num_heads {
+                let head = b * self.kv_num_heads + h;
+                let dst_base = head * present_sequence_length * cache_dim;
+                // `present_k`/`present_v` and the past caches are both
+                // BNSH-contiguous, so for a fixed (b, h) the `[s, d]` block is
+                // a single contiguous run in each: widen the whole past prefix
+                // directly into `present` (F16C for f16), skipping the separate
+                // owned widen + f32 copy the decode path used to pay every token.
+                if past_len > 0 {
+                    let copy = past_len * cache_dim;
+                    let pk = past_key.expect("past_len > 0 implies a past key cache");
+                    let pv = past_value.expect("past_len > 0 implies a past value cache");
+                    let src = head * pk.seq * cache_dim;
+                    pk.widen_run(src, &mut present_k[dst_base..dst_base + copy]);
+                    pv.widen_run(src, &mut present_v[dst_base..dst_base + copy]);
+                }
+                // Append the current token(s) directly after the past prefix;
+                // the current K/V blocks are contiguous in `[s, d]` as well.
+                let cur = k.seq * cache_dim;
+                let dst_cur = dst_base + past_len * cache_dim;
+                let src_cur = head * k.seq * cache_dim;
+                present_k[dst_cur..dst_cur + cur].copy_from_slice(&k.data[src_cur..src_cur + cur]);
+                present_v[dst_cur..dst_cur + cur].copy_from_slice(&v.data[src_cur..src_cur + cur]);
+                // Zero only the unattended tail rows [total, present_seq).
+                let tail_start = dst_base + totals[b] * cache_dim;
+                let tail_end = dst_base + present_sequence_length * cache_dim;
+                if tail_start < tail_end {
+                    present_k[tail_start..tail_end].fill(0.0);
+                    present_v[tail_start..tail_end].fill(0.0);
+                }
+            }
+        }
+    }
 }
 
 impl Kernel for GroupQueryAttentionKernel {
@@ -1064,8 +1256,10 @@ impl Kernel for GroupQueryAttentionKernel {
             past_key.as_ref(),
         );
 
-        // Owned present storage backs only the copy path; the in-place path
-        // writes straight into the aliased output buffer and never touches these.
+        // Owned present storage backs only the fall-back copy path; the in-place
+        // and direct-write paths fill the aliased/graph output buffers and never
+        // touch these.
+        let direct_present = !in_place && self.detect_direct_present(inputs, outputs, present_len);
         let owned_present_k: Vec<f32>;
         let owned_present_v: Vec<f32>;
         let (present_k, present_v): (&[f32], &[f32]) = if in_place {
@@ -1099,58 +1293,60 @@ impl Kernel for GroupQueryAttentionKernel {
                 }
             }
             (&*present_k, &*present_v)
+        } else if direct_present {
+            PRESENT_DIRECT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // No present==past binding, but the graph's present outputs are
+            // plain contiguous f32 buffers that overlap nothing we read: build
+            // the cache straight inside them and skip the trailing round-trip.
+            let pk_ptr = outputs[1].data_ptr_mut::<f32>();
+            let pv_ptr = outputs[2].data_ptr_mut::<f32>();
+            // SAFETY: `detect_direct_present` proved outputs[1]/[2] are valid,
+            // contiguous, non-absent f32 buffers of exactly `present_len`
+            // elements that do not overlap each other or any input this kernel
+            // reads. They are graph outputs, exclusively owned by this kernel
+            // invocation. `fill_present` writes every element in
+            // [0, present_sequence_length) per (batch, kv-head) before any read.
+            let present_k = unsafe { std::slice::from_raw_parts_mut(pk_ptr, present_len) };
+            let present_v = unsafe { std::slice::from_raw_parts_mut(pv_ptr, present_len) };
+            self.fill_present(
+                present_k,
+                present_v,
+                past_key.as_ref(),
+                past_value.as_ref(),
+                &k,
+                &v,
+                &past_lengths,
+                &totals,
+                present_sequence_length,
+                cache_dim,
+            );
+            (&*present_k, &*present_v)
         } else {
-            // A "tail" is any padding row beyond a batch's logical `total` that
-            // is emitted into the present output but never attended; those rows
-            // must be zero. In steady decode every batch's `total` exactly fills
-            // `present_sequence_length`, so the per-(b,h) loop below overwrites
-            // every element and pre-zeroing is pure waste — skip it in that case.
-            let has_tail = totals.iter().any(|&t| t < present_sequence_length);
-            let (mut present_k, mut present_v) = if has_tail {
-                (vec![0.0f32; present_len], vec![0.0f32; present_len])
-            } else {
-                let mut present_k = Vec::<f32>::with_capacity(present_len);
-                let mut present_v = Vec::<f32>::with_capacity(present_len);
-                // SAFETY: `!has_tail` ⇒ every batch's `total == present_sequence_length`,
-                // so for each `(b, h)` the loop below writes the past prefix
-                // `[0, past_len)` and the current span `[past_len, total)` =
-                // `[0, present_sequence_length)` rows, i.e. every element of both
-                // buffers, before any read (attention and the output narrow both
-                // run strictly after this loop). No uninitialized element is observed.
-                unsafe {
-                    present_k.set_len(present_len);
-                    present_v.set_len(present_len);
-                }
-                (present_k, present_v)
-            };
-            for (b, &past_len) in past_lengths.iter().enumerate() {
-                for h in 0..self.kv_num_heads {
-                    let head = b * self.kv_num_heads + h;
-                    let dst_base = head * present_sequence_length * cache_dim;
-                    // `present_k`/`present_v` and the past caches are both
-                    // BNSH-contiguous, so for a fixed (b, h) the `[s, d]` block is
-                    // a single contiguous run in each: widen the whole past prefix
-                    // directly into `present` (F16C for f16), skipping the separate
-                    // owned widen + f32 copy the decode path used to pay every token.
-                    if past_len > 0 {
-                        let copy = past_len * cache_dim;
-                        let pk = past_key.as_ref().unwrap();
-                        let pv = past_value.as_ref().unwrap();
-                        let src = head * pk.seq * cache_dim;
-                        pk.widen_run(src, &mut present_k[dst_base..dst_base + copy]);
-                        pv.widen_run(src, &mut present_v[dst_base..dst_base + copy]);
-                    }
-                    // Append the current token(s) directly after the past prefix;
-                    // the current K/V blocks are contiguous in `[s, d]` as well.
-                    let cur = k.seq * cache_dim;
-                    let dst_cur = dst_base + past_len * cache_dim;
-                    let src_cur = head * k.seq * cache_dim;
-                    present_k[dst_cur..dst_cur + cur]
-                        .copy_from_slice(&k.data[src_cur..src_cur + cur]);
-                    present_v[dst_cur..dst_cur + cur]
-                        .copy_from_slice(&v.data[src_cur..src_cur + cur]);
-                }
+            PRESENT_SCRATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // `fill_present` writes every attended row and explicitly zeroes the
+            // unattended tail, so the scratch never needs pre-zeroing.
+            let mut present_k = Vec::<f32>::with_capacity(present_len);
+            let mut present_v = Vec::<f32>::with_capacity(present_len);
+            // SAFETY: `fill_present` writes all `present_len` elements of both
+            // buffers — the past prefix, the current span and the zeroed tail
+            // together cover [0, present_sequence_length) for every (batch,
+            // kv-head) — before attention or the output narrow reads them.
+            unsafe {
+                present_k.set_len(present_len);
+                present_v.set_len(present_len);
             }
+            self.fill_present(
+                &mut present_k,
+                &mut present_v,
+                past_key.as_ref(),
+                past_value.as_ref(),
+                &k,
+                &v,
+                &past_lengths,
+                &totals,
+                present_sequence_length,
+                cache_dim,
+            );
             owned_present_k = present_k;
             owned_present_v = present_v;
             (&owned_present_k[..], &owned_present_v[..])
@@ -1448,10 +1644,10 @@ impl Kernel for GroupQueryAttentionKernel {
         } else {
             write_dense_f32_narrow("GroupQueryAttention", &mut outputs[0], &output)?;
         }
-        // In the in-place fast path the present outputs ARE the past buffer and
-        // were already updated in place above, so re-emitting them would be a
-        // redundant self-copy — skip it. The copy path materializes them here.
-        if !in_place {
+        // In the in-place and direct-write paths the present outputs ARE the
+        // buffers we just filled, so re-emitting them would be a redundant
+        // self-copy — skip it. Only the owned-scratch path materializes here.
+        if !in_place && !direct_present {
             if outputs.len() >= 2 {
                 if decode_fast_write {
                     write_decode_output(&mut outputs[1], present_k)?;
@@ -4228,6 +4424,237 @@ mod tests {
         assert!(
             !kernel.detect_inplace_kv(&inputs, &outputs, present_seq, present_len, Some(&past_key)),
             "f16 caches must not take the f32-only in-place path"
+        );
+    }
+
+    /// Shared fixture for the direct-present tests: one decode step over a past
+    /// cache of `past_len` rows held in a buffer of `capacity` rows.
+    struct PresentCase {
+        query: Vec<f32>,
+        key: Vec<f32>,
+        value: Vec<f32>,
+        past_key: Vec<f32>,
+        past_value: Vec<f32>,
+        seqlens_k: Vec<i32>,
+        total: i32,
+        q_shape: [usize; 3],
+        kv_shape: [usize; 3],
+        past_shape: [usize; 4],
+        present_shape: [usize; 4],
+        out_shape: [usize; 3],
+    }
+
+    impl PresentCase {
+        fn new(
+            batch: usize,
+            heads: usize,
+            kv_heads: usize,
+            dim: usize,
+            past_len: usize,
+            capacity: usize,
+        ) -> Self {
+            let total = past_len + 1;
+            let make = |n: usize, salt: u64| -> Vec<f32> {
+                (0..n).map(|i| mixed_scale_value(i, salt)).collect()
+            };
+            Self {
+                query: make(batch * heads * dim, 0x11),
+                key: make(batch * kv_heads * dim, 0x22),
+                value: make(batch * kv_heads * dim, 0x33),
+                past_key: make(batch * kv_heads * capacity * dim, 0x44),
+                past_value: make(batch * kv_heads * capacity * dim, 0x55),
+                seqlens_k: vec![(total - 1) as i32; batch],
+                total: total as i32,
+                q_shape: [batch, 1, heads * dim],
+                kv_shape: [batch, 1, kv_heads * dim],
+                past_shape: [batch, kv_heads, capacity, dim],
+                present_shape: [batch, kv_heads, capacity.max(total), dim],
+                out_shape: [batch, 1, heads * dim],
+            }
+        }
+
+        fn run(&self, kernel: &dyn Kernel) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+            let mut out = Owned::zeros_f32(&self.out_shape);
+            let mut present_key = Owned::zeros_f32(&self.present_shape);
+            let mut present_value = Owned::zeros_f32(&self.present_shape);
+            kernel
+                .execute(
+                    &[
+                        Owned::f32(&self.q_shape, &self.query).view(),
+                        Owned::f32(&self.kv_shape, &self.key).view(),
+                        Owned::f32(&self.kv_shape, &self.value).view(),
+                        Owned::f32(&self.past_shape, &self.past_key).view(),
+                        Owned::f32(&self.past_shape, &self.past_value).view(),
+                        Owned::i32(&[self.seqlens_k.len()], &self.seqlens_k).view(),
+                        Owned::i32(&[], &[self.total]).view(),
+                    ],
+                    &mut [
+                        out.view_mut(),
+                        present_key.view_mut(),
+                        present_value.view_mut(),
+                    ],
+                )
+                .unwrap();
+            (out.to_f32(), present_key.to_f32(), present_value.to_f32())
+        }
+    }
+
+    /// Building the present cache inside the graph outputs must produce the
+    /// exact same bits as the owned-scratch path it replaced — attention output
+    /// and both present tensors. Covers the no-tail decode geometry.
+    #[test]
+    fn direct_present_is_bit_identical_to_owned_scratch() {
+        let kernel = gqa_kernel_with_heads(8, 2, &[]);
+        let case = PresentCase::new(2, 8, 2, 16, 5, 6);
+
+        let scratch = {
+            let _forced = PresentScratchOverride::forced();
+            let before = present_scratch_count();
+            let result = case.run(kernel.as_ref());
+            assert!(
+                present_scratch_count() > before,
+                "override must route through the owned-scratch path"
+            );
+            result
+        };
+
+        let before = present_direct_count();
+        let direct = case.run(kernel.as_ref());
+        assert!(
+            present_direct_count() > before,
+            "distinct contiguous f32 present outputs must take the direct path"
+        );
+
+        assert_eq!(
+            direct.0, scratch.0,
+            "attention output must be bit-identical"
+        );
+        assert_eq!(direct.1, scratch.1, "present_key must be bit-identical");
+        assert_eq!(direct.2, scratch.2, "present_value must be bit-identical");
+    }
+
+    /// Same equivalence when the cache buffer is larger than the live context,
+    /// i.e. there is an unattended tail. The direct path zeroes only the tail
+    /// rows instead of pre-zeroing the whole output, so this pins that the tail
+    /// really is zero and the prefix is untouched.
+    #[test]
+    fn direct_present_zeroes_only_the_unattended_tail() {
+        const BATCH: usize = 1;
+        const KV_HEADS: usize = 2;
+        const DIM: usize = 8;
+        const PAST: usize = 3;
+        const CAPACITY: usize = 9;
+        let kernel = gqa_kernel_with_heads(4, KV_HEADS as i64, &[]);
+        let case = PresentCase::new(BATCH, 4, KV_HEADS, DIM, PAST, CAPACITY);
+
+        let scratch = {
+            let _forced = PresentScratchOverride::forced();
+            case.run(kernel.as_ref())
+        };
+        let direct = case.run(kernel.as_ref());
+        assert_eq!(direct.0, scratch.0);
+        assert_eq!(direct.1, scratch.1);
+        assert_eq!(direct.2, scratch.2);
+
+        let total = PAST + 1;
+        for head in 0..BATCH * KV_HEADS {
+            let base = head * CAPACITY * DIM;
+            for row in total..CAPACITY {
+                let start = base + row * DIM;
+                assert!(
+                    direct.1[start..start + DIM].iter().all(|&x| x == 0.0),
+                    "present_key tail row {row} of head {head} must be zero"
+                );
+                assert!(
+                    direct.2[start..start + DIM].iter().all(|&x| x == 0.0),
+                    "present_value tail row {row} of head {head} must be zero"
+                );
+            }
+            // Row `PAST` is the appended current step; rows below it are past.
+            let appended = base + PAST * DIM;
+            assert!(
+                direct.1[appended..appended + DIM].iter().any(|&x| x != 0.0),
+                "the appended row must carry the current step's key"
+            );
+        }
+    }
+
+    /// The gate is structural: an f16 present output, a wrong-sized output, a
+    /// missing output slot and a present buffer that aliases an input all have
+    /// to decline to the owned-scratch path.
+    #[test]
+    fn direct_present_declines_on_dtype_size_arity_and_aliasing() {
+        const KV_HEADS: usize = 2;
+        const DIM: usize = 4;
+        const SEQ: usize = 3;
+        let kernel = GroupQueryAttentionKernel {
+            num_heads: 4,
+            kv_num_heads: KV_HEADS,
+            scale: None,
+            do_rotary: false,
+            rotary_interleaved: false,
+            local_window_size: -1,
+            softcap: 0.0,
+        };
+        let shape = [1usize, KV_HEADS, SEQ, DIM];
+        let present_len = KV_HEADS * SEQ * DIM;
+
+        let scalar = Owned::zeros_f32(&[1, 1, 4]);
+        let mut good_out = Owned::zeros_f32(&[1, 1, 16]);
+        let mut good_k = Owned::zeros_f32(&shape);
+        let mut good_v = Owned::zeros_f32(&shape);
+        let past_k = Owned::zeros_f32(&shape);
+        let past_v = Owned::zeros_f32(&shape);
+
+        let inputs = [
+            scalar.view(),
+            scalar.view(),
+            scalar.view(),
+            past_k.view(),
+            past_v.view(),
+            scalar.view(),
+            scalar.view(),
+        ];
+        {
+            let outputs = [good_out.view_mut(), good_k.view_mut(), good_v.view_mut()];
+            assert!(
+                kernel.detect_direct_present(&inputs, &outputs, present_len),
+                "distinct contiguous f32 present outputs must be accepted"
+            );
+            assert!(
+                !kernel.detect_direct_present(&inputs, &outputs, present_len + 1),
+                "a present_len mismatch must decline"
+            );
+            assert!(
+                !kernel.detect_direct_present(&inputs, &outputs[..2], present_len),
+                "a missing present_value slot must decline"
+            );
+        }
+
+        let mut f16_k = Owned::zeros(DataType::Float16, &shape);
+        {
+            let outputs = [good_out.view_mut(), f16_k.view_mut(), good_v.view_mut()];
+            assert!(
+                !kernel.detect_direct_present(&inputs, &outputs, present_len),
+                "an f16 present output needs the narrowing copy path"
+            );
+        }
+
+        // A present output that aliases the past input it reads from must
+        // decline here; exact aliasing is the in-place path's job.
+        let cpu = onnx_runtime_ir::DeviceId::cpu();
+        let strides = compute_contiguous_strides(&shape);
+        let aliased = TensorMut::new(
+            DevicePtrMut(past_k.bytes.as_ptr() as *mut std::ffi::c_void),
+            DataType::Float32,
+            &shape,
+            &strides,
+            cpu,
+        );
+        let outputs = [good_out.view_mut(), aliased, good_v.view_mut()];
+        assert!(
+            !kernel.detect_direct_present(&inputs, &outputs, present_len),
+            "a present output aliasing the past input must decline"
         );
     }
 }
