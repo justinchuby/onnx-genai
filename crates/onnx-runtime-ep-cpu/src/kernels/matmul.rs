@@ -219,6 +219,13 @@ pub(crate) struct MatMulPrepack {
     dense: [OnceLock<Vec<f32>>; 2],
     #[cfg(feature = "mlas")]
     packed_b: OnceLock<mlas_sys::PackedB>,
+    /// MLAS-packed f32 panel built once from a constant **f16** B weight.
+    ///
+    /// The widened f32 copy is a temporary: it is consumed by `PackedB::new`
+    /// and dropped, so this costs one packed panel rather than the packed panel
+    /// plus a permanent 4*K*N dense copy the way `dense[1]` + `packed_b` would.
+    #[cfg(feature = "mlas")]
+    packed_b_from_half: OnceLock<Option<mlas_sys::PackedB>>,
     /// Lazily-computed transpose of the B weight matrix for the Accelerate
     /// column-parallel GEMV path, with the key it was computed for. Only
     /// populated for constant (model weight) inputs.
@@ -434,6 +441,50 @@ impl MatMulPrepack {
         (cached.len() == b_view.numel()).then(|| cached.as_slice())
     }
 
+    /// MLAS-packed B built by widening a constant f16 weight to f32 once.
+    ///
+    /// Returns `None` for a non-constant B: an activation would have to be
+    /// re-widened and re-packed on every call, which is the cost this exists to
+    /// remove, and caching it would be wrong the moment the activation changed.
+    #[cfg(feature = "mlas")]
+    fn packed_b_from_half(
+        &self,
+        view: &TensorView<'_>,
+        k: usize,
+        n: usize,
+    ) -> Result<Option<&mlas_sys::PackedB>> {
+        if !self.constant_inputs[1] {
+            return Ok(None);
+        }
+        if let Some(cached) = self.packed_b_from_half.get() {
+            return Ok(cached.as_ref());
+        }
+        let widened = to_dense_f32_widen("MatMul", view)?;
+        if widened.len() != k.saturating_mul(n) {
+            return Ok(None);
+        }
+        let packed = mlas_sys::PackedB::new(n, k, &widened);
+        drop(widened);
+        Ok(self
+            .packed_b_from_half
+            .get_or_init(|| Some(packed))
+            .as_ref())
+    }
+
+    /// Whether the once-widened MLAS pack for a constant f16 B has been built.
+    ///
+    /// Lets sibling modules' tests assert which route served a call; the field
+    /// itself stays private to this module.
+    #[cfg(test)]
+    pub(crate) fn half_pack_is_built(&self) -> bool {
+        #[cfg(feature = "mlas")]
+        {
+            self.packed_b_from_half.get().is_some_and(Option::is_some)
+        }
+        #[cfg(not(feature = "mlas"))]
+        false
+    }
+
     #[cfg(feature = "mlas")]
     fn packed_b(&self, b: &[f32], k: usize, n: usize) -> Option<&mlas_sys::PackedB> {
         self.constant_inputs[1].then(|| {
@@ -497,6 +548,55 @@ fn gemm_packed(
     assert_eq!(packed.dimensions(), (k, n));
     mlas_sys::sgemm_nn_packed(m, a, packed, c);
     Ok(())
+}
+
+/// f16 prefill through MLAS SGEMM on a once-widened, once-packed B.
+///
+/// The portable blocked half GEMM re-packs B into cache-sized panels on *every*
+/// call and drives them from a 4x8 microkernel on the global rayon pool. For a
+/// constant weight all of that is avoidable: ORT widens f16 to f32 and runs the
+/// same tuned SGEMM it uses for float, and the difference is not small.
+/// `128x3584x3584` MatMul measured 2.44x slower than ORT at one thread and
+/// 8.24x at eight, because our scaling was 2.2x where ORT's was 7.5x.
+///
+/// Widening B is paid once and the f32 copy is dropped immediately, so the
+/// steady-state footprint is one MLAS panel rather than a panel plus a
+/// permanent dense copy. Only A is widened per call: `M*K` against B's `K*N`.
+///
+/// Returns `None` — leaving the caller's existing path untouched — for a
+/// non-MLAS backend, a non-f16 operand, a non-contiguous or wrongly-sized B, an
+/// activation B, or `M <= 1`. `M = 1` is excluded because packing needs row
+/// reuse to pay for itself and the decode GEMV is already at parity with ORT.
+#[cfg(feature = "mlas")]
+pub(crate) fn try_packed_half_prefill(
+    prepack: &MatMulPrepack,
+    backend: CpuBackend,
+    a: &TensorView,
+    b: &TensorView,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Option<Vec<f32>>> {
+    if backend != CpuBackend::Mlas
+        || m <= 1
+        || a.dtype != onnx_runtime_ir::DataType::Float16
+        || b.dtype != onnx_runtime_ir::DataType::Float16
+        || !b.is_contiguous()
+        || b.numel() != k.saturating_mul(n)
+    {
+        return Ok(None);
+    }
+    b.validate()?;
+    let Some(packed) = prepack.packed_b_from_half(b, k, n)? else {
+        return Ok(None);
+    };
+    let a_dense = prepack.dense(0, a)?;
+    if a_dense.len() != m.saturating_mul(k) {
+        return Ok(None);
+    }
+    let mut result = vec![0.0f32; m * n];
+    gemm_packed(&a_dense, packed, &mut result, m, k, n)?;
+    Ok(Some(result))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -815,6 +915,24 @@ impl MatMulKernel {
                 half_gemv::gemv_f16_kn(&a_dense, b_bits, &mut result, geom.k, geom.n);
                 return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
             }
+        }
+
+        // f16 prefill through MLAS SGEMM on a once-widened, once-packed B.
+        // Shared with `Gemm`; see `try_packed_half_prefill`.
+        #[cfg(feature = "mlas")]
+        if numel(&geom.batch_shape) <= 1
+            && geom.b_promoted_rank == 2
+            && let Some(result) = try_packed_half_prefill(
+                &self.prepack,
+                backend,
+                &inputs[0],
+                &inputs[1],
+                geom.m,
+                geom.k,
+                geom.n,
+            )?
+        {
+            return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
         }
 
         // Dedicated half-precision path: contiguous f16/bf16 operands stay in
@@ -2579,6 +2697,156 @@ mod tests {
             ptr_before,
             "dense[1] cache was reallocated on the second execute"
         );
+    }
+
+    /// The f16 prefill route through MLAS SGEMM must agree with the widened
+    /// reference on shapes whose edges the packed kernel has to handle: `K` and
+    /// `N` are both odd and `N` is below a SIMD step, so the tails dominate.
+    ///
+    /// Also proves the route is actually taken. Without the `packed_b_from_half`
+    /// assertion this test would keep passing if the optimisation silently
+    /// stopped applying and the slow blocked path served the call instead.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn f16_prefill_through_mlas_matches_the_widened_reference() {
+        let (m, k, n) = (6usize, 37usize, 5usize);
+        // Multiples of 1/16 are exact in f16, so any mismatch is the kernel's
+        // arithmetic rather than the operands' rounding.
+        let a_data: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 7 % 23) as f32 - 11.0) / 16.0)
+            .collect();
+        let b_data: Vec<f32> = (0..k * n)
+            .map(|i| ((i * 13 % 31) as f32 - 15.0) / 16.0)
+            .collect();
+        let expected = naive_matmul(&a_data, &b_data, m, k, n);
+
+        let a = Owned::f16(&[m, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[m, n]);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        assert!(
+            kernel.prepack.packed_b_from_half.get().is_some(),
+            "a constant f16 B at M>1 must be widened and packed once, not repacked per call"
+        );
+        for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+            assert!(
+                (actual - want).abs() <= 1e-3,
+                "f16 prefill disagreed: got {actual}, want {want}"
+            );
+        }
+    }
+
+    /// The pack is built once and reused. A `OnceLock` that were re-initialised
+    /// per call would still be correct but would reintroduce the entire cost
+    /// this path exists to remove, and no numerical test would notice.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn f16_prefill_pack_is_built_once_across_calls() {
+        let (m, k, n) = (4usize, 16usize, 8usize);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 9) as f32 - 4.0) / 8.0).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
+        let a = Owned::f16(&[m, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+
+        let mut first = Owned::zeros_f32(&[m, n]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [first.view_mut()])
+            .unwrap();
+        let packed_before = kernel
+            .prepack
+            .packed_b_from_half
+            .get()
+            .expect("first execute must populate the pack")
+            .as_ref()
+            .expect("a constant B must pack") as *const _;
+
+        let mut second = Owned::zeros_f32(&[m, n]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [second.view_mut()])
+            .unwrap();
+        let packed_after = kernel
+            .prepack
+            .packed_b_from_half
+            .get()
+            .unwrap()
+            .as_ref()
+            .unwrap() as *const _;
+
+        assert_eq!(
+            packed_before, packed_after,
+            "the MLAS pack was rebuilt on the second execute"
+        );
+        assert_eq!(first.to_f32(), second.to_f32(), "repeated calls diverged");
+    }
+
+    /// An activation B must never be packed: the pack is only valid because a
+    /// constant weight never changes, and caching an activation would return a
+    /// stale product the moment the upstream op produced new values.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn f16_prefill_with_a_non_constant_b_is_correct_and_unpacked() {
+        let (m, k, n) = (3usize, 12usize, 6usize);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 9) as f32 - 4.0) / 8.0).collect();
+        let b1: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
+        let b2: Vec<f32> = b1.iter().map(|v| v + 0.25).collect();
+
+        let a = Owned::f16(&[m, k], &a_data);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, false]);
+
+        for b_data in [&b1, &b2] {
+            let b = Owned::f16(&[k, n], b_data);
+            let mut out = Owned::zeros_f32(&[m, n]);
+            kernel
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+            let expected = naive_matmul(&a_data, b_data, m, k, n);
+            for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+                assert!(
+                    (actual - want).abs() <= 1e-3,
+                    "non-constant f16 B disagreed: got {actual}, want {want}"
+                );
+            }
+            assert!(
+                kernel.prepack.packed_b_from_half.get().is_none(),
+                "an activation B must never be packed as a weight"
+            );
+        }
+    }
+
+    /// M=1 keeps the GEMV. Packing needs row reuse to pay for itself, and the
+    /// decode GEMV is memory-bound and already at parity with ORT, so building
+    /// a pack there would add cost and win nothing.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn f16_decode_does_not_build_the_prefill_pack() {
+        let (k, n) = (24usize, 8usize);
+        let a_data: Vec<f32> = (0..k).map(|i| ((i % 9) as f32 - 4.0) / 8.0).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
+        let a = Owned::f16(&[1, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        assert!(
+            kernel.prepack.packed_b_from_half.get().is_none(),
+            "M=1 must stay on the GEMV rather than building a prefill pack"
+        );
+        let expected = naive_matmul(&a_data, &b_data, 1, k, n);
+        for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+            assert!((actual - want).abs() <= 1e-3, "decode GEMV disagreed");
+        }
     }
 
     /// The x86 f16 decode GEMV must produce the same values as the blocked
