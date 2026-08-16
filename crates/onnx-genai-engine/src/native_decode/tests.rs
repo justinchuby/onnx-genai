@@ -1399,6 +1399,7 @@ fn build_cuda_decoder_with_fixed_state(
         NativeDecodeSession::from_session_with_cuda_options(
             session,
             NativeDecodeCudaOptions {
+                decode_batch: None,
                 kv_max_len: Some(max_len),
                 metadata_max_len: None,
                 graph_capture: Some(graph_capture),
@@ -2622,6 +2623,7 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
         model_dir.join("model.onnx"),
         NativeDecodeDevice::Cuda { index: Some(0) },
         NativeDecodeCudaOptions {
+            decode_batch: None,
             kv_max_len: Some(128),
             metadata_max_len: None,
             graph_capture: Some(false),
@@ -2643,6 +2645,7 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
         model_dir.join("model.onnx"),
         NativeDecodeDevice::Cuda { index: Some(0) },
         NativeDecodeCudaOptions {
+            decode_batch: None,
             kv_max_len: Some(128),
             metadata_max_len: None,
             graph_capture: Some(true),
@@ -2831,6 +2834,7 @@ fn native_cuda_verify_rewind_no_kv_corruption() -> anyhow::Result<()> {
             model_dir.join("model.onnx"),
             NativeDecodeDevice::Cuda { index: Some(0) },
             NativeDecodeCudaOptions {
+                decode_batch: None,
                 kv_max_len: Some(128),
                 metadata_max_len: None,
                 graph_capture: Some(graph),

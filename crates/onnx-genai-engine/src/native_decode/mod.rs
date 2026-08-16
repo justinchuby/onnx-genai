@@ -89,6 +89,18 @@ pub struct NativeDecodeCudaOptions {
     /// the pointer-unstable `alloc_raw`/`free_raw` path, so offload keeps forcing
     /// capture OFF as before.
     pub weight_offload_stable_va: Option<bool>,
+
+    /// Persistent decode batch extent, i.e. how many sequences one fused forward
+    /// advances (#750). `None` defers to `ONNX_GENAI_NATIVE_DECODE_BATCH`, which
+    /// itself defaults to `1`.
+    ///
+    /// This exists so batch-N can be *requested* rather than only enabled by an
+    /// environment variable: `--max-batch N` on the server is a supported option
+    /// that failed at startup because the capability was derived from a session
+    /// nobody had asked to build in batch shape (#1064). An explicit value wins
+    /// over the environment, so a caller who asks for a batch extent gets it or
+    /// gets an error, never a silent 1.
+    pub decode_batch: Option<usize>,
 }
 
 /// Stateful decoder-with-past adapter over the pure-Rust native runtime.

@@ -3252,21 +3252,19 @@ impl DecodeCudaState {
         mut graph_capture: GraphCaptureDecision,
         position_rank: usize,
         kv_layout: KvCommitLayout,
+        requested_batch: Option<usize>,
     ) -> anyhow::Result<Self> {
         let kv_commits_on_demand = session.commits_on_demand();
         // Stage 2b-impl-4 (#750): the persistent decode bindings are shaped for
-        // `batch` sequences and batch-N is now turned ON. The batch extent is
-        // resolved from `ONNX_GENAI_NATIVE_DECODE_BATCH` (default `1`) and is
-        // pinned for the whole session so CUDA-graph capture binds a stable batch
-        // shape (capture requires stable shapes). At the default `batch == 1`
+        // `batch` sequences and batch-N is now turned ON. The batch extent comes
+        // from `requested_batch` (how `--max-batch` reaches here) or, failing
+        // that, `ONNX_GENAI_NATIVE_DECODE_BATCH`, defaulting to `1`. It is pinned
+        // for the whole session so CUDA-graph capture binds a stable batch shape
+        // (capture requires stable shapes). At the default `batch == 1`
         // every emitted shape, IO binding, mask/token/position write, KV commit
         // geometry and device-argmax read-back is byte-identical to the previous
-        // hard-coded `1`, so decode stays the #750 byte-identity reference. Only
-        // an explicit `> 1` value binds a batch-N grid; the batch-N *caller* (a
-        // driver presenting N real sequences with N seeded KV states) is stage 2c
-        // — the reachable batch-N exercise here is the `decode_cuda_greedy_batch`
-        // entry point, driven by `profile_native --native-decode-batch-sweep`.
-        let batch = resolve_native_decode_batch()?;
+        // hard-coded `1`, so decode stays the #750 byte-identity reference.
+        let batch = resolve_native_decode_batch(requested_batch)?;
         // Seq-major KV addressing is capacity-independent at batch index 0 (the
         // only index native decode uses): token `t` always lands at
         // `t * kv_heads * head_dim`, and the baked `cache_capacity` scalar only
@@ -5093,15 +5091,27 @@ fn native_cuda_memset_zero(_dst: usize, _bytes: usize) -> anyhow::Result<()> {
     bail!("native CUDA KV growth requires the onnx-genai-engine `cuda` feature")
 }
 
-/// Resolve the persistent decode batch extent from `ONNX_GENAI_NATIVE_DECODE_BATCH`
-/// (stage 2b-impl-4, #750). Unset or empty resolves to `1` — the byte-identity
-/// default that keeps every current single-sequence entry point unchanged. A
-/// value `> 1` turns batch-N on: the KV / mask / input / position / logits
-/// bindings are shaped `[N, …]`, the token writer fans N selected tokens into N
-/// slots, and the device argmax reads N rows. The value is pinned for the whole
-/// session (capture requires a stable batch shape), so it is read exactly once
-/// at construction. `0` is rejected — a zero-width decode has no meaning.
-fn resolve_native_decode_batch() -> anyhow::Result<usize> {
+/// Resolve the persistent decode batch extent (stage 2b-impl-4, #750).
+///
+/// An explicit `configured` value — from `NativeDecodeCudaOptions::decode_batch`,
+/// which is how `--max-batch` reaches here — wins over
+/// `ONNX_GENAI_NATIVE_DECODE_BATCH`. Neither set resolves to `1`, the
+/// byte-identity default that keeps every current single-sequence entry point
+/// unchanged. A value `> 1` turns batch-N on: the KV / mask / input / position /
+/// logits bindings are shaped `[N, …]`, the token writer fans N selected tokens
+/// into N slots, and the device argmax reads N rows. The value is pinned for the
+/// whole session (capture requires a stable batch shape), so it is read exactly
+/// once at construction. `0` is rejected — a zero-width decode has no meaning.
+///
+/// Both sources are validated the same way, so an explicit request cannot bypass
+/// a check the environment variable is subject to.
+fn resolve_native_decode_batch(configured: Option<usize>) -> anyhow::Result<usize> {
+    if let Some(batch) = configured {
+        if batch == 0 {
+            bail!("native decode batch must be > 0, got 0");
+        }
+        return Ok(batch);
+    }
     match std::env::var("ONNX_GENAI_NATIVE_DECODE_BATCH") {
         Ok(raw) if !raw.trim().is_empty() => {
             let batch: usize = raw.trim().parse().with_context(|| {
@@ -5586,6 +5596,43 @@ mod device_kv_view_tests {
             wrong0, token0,
             "logical-stride read must diverge from the physical-stride read at H >= 2"
         );
+    }
+}
+
+#[cfg(test)]
+mod decode_batch_resolution_tests {
+    use super::resolve_native_decode_batch;
+
+    /// The default is 1, which is the #750 byte-identity reference: every shape,
+    /// binding and read-back at batch 1 matches the previous hard-coded value.
+    #[test]
+    fn nothing_requested_and_no_env_resolves_to_one() {
+        // Guard against a stray environment on the test host: this assertion is
+        // only meaningful when the variable is genuinely absent.
+        if std::env::var("ONNX_GENAI_NATIVE_DECODE_BATCH").is_ok() {
+            return;
+        }
+        assert_eq!(resolve_native_decode_batch(None).unwrap(), 1);
+    }
+
+    /// #1064: an explicit request must win over the environment, so `--max-batch`
+    /// is authoritative rather than advisory. Before this, batch-N could only be
+    /// turned on by an environment variable, and the server refused `--max-batch
+    /// N` because the capability was read from a session nobody had asked to
+    /// build in batch shape.
+    #[test]
+    fn an_explicit_request_is_honoured() {
+        assert_eq!(resolve_native_decode_batch(Some(4)).unwrap(), 4);
+        assert_eq!(resolve_native_decode_batch(Some(1)).unwrap(), 1);
+    }
+
+    /// A zero-width decode has no meaning, and both sources are validated the
+    /// same way — an explicit request must not bypass a check the environment
+    /// variable is subject to.
+    #[test]
+    fn zero_is_refused_from_either_source() {
+        let error = resolve_native_decode_batch(Some(0)).expect_err("zero-width decode");
+        assert!(error.to_string().contains("must be > 0"), "{error}");
     }
 }
 

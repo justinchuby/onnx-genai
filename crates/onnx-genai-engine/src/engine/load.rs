@@ -634,6 +634,7 @@ impl Engine {
                         &metadata,
                     ),
                     decode_precision: config.decode_precision,
+                    decode_batch: config.native_decode_batch,
                 },
             )
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?

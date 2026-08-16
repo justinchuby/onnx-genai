@@ -11,6 +11,9 @@ pub(crate) struct NativeDecodeLoadOptions<'a> {
     pub(crate) metadata_max_len: Option<usize>,
     pub(crate) key_sequence_lengths_policy: crate::decode::KeySequenceLengthsPolicy,
     pub(crate) decode_precision: DecodePrecision,
+    /// Persistent decode batch extent requested by the caller (`--max-batch`),
+    /// or `None` to defer to `ONNX_GENAI_NATIVE_DECODE_BATCH` (#1064).
+    pub(crate) decode_batch: Option<usize>,
 }
 
 fn native_metadata_max_len_from_model_path(path: &Path) -> Option<usize> {
@@ -176,6 +179,7 @@ impl NativeDecodeSession {
                         None
                     }
                 },
+                decode_batch: options.decode_batch,
             },
             options.io,
         )
@@ -228,6 +232,7 @@ impl NativeDecodeSession {
             path,
             device,
             NativeDecodeCudaOptions {
+                decode_batch: None,
                 kv_max_len: cuda_kv_max_len,
                 metadata_max_len,
                 graph_capture: None,
@@ -407,6 +412,7 @@ impl NativeDecodeSession {
         Self::from_session_with_cuda_options_and_io(
             session,
             NativeDecodeCudaOptions {
+                decode_batch: None,
                 kv_max_len: cuda_kv_max_len,
                 metadata_max_len: None,
                 graph_capture: None,
@@ -842,6 +848,7 @@ impl NativeDecodeSession {
                 graph_capture,
                 position_rank,
                 kv_layout,
+                cuda_options.decode_batch,
             )?)
         } else {
             None
