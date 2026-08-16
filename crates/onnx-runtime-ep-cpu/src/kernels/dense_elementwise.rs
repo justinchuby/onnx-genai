@@ -175,6 +175,12 @@ fn dispatch_dense_f16(
 
     #[cfg(not(target_arch = "aarch64"))]
     {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if crate::dtype::f16c::available() {
+            // SAFETY: `available()` confirmed `f16c` + `avx2`.
+            unsafe { elementwise_f16_f16c(op, src_u16, dst_u16) };
+            return Ok(());
+        }
         // Scalar widen/narrow fallback.
         for (d, &s) in dst_u16.iter_mut().zip(src_u16.iter()) {
             let v = half::f16::from_bits(s).to_f32();
@@ -184,6 +190,52 @@ fn dispatch_dense_f16(
     }
 
     Ok(())
+}
+
+/// Number of elements converted per staging pass.
+///
+/// Two `f32` staging buffers of this length are stack-allocated per call
+/// (8 KiB total at 1024), which stays inside L1 and inside the smaller stacks
+/// ORT's intra-op worker threads run on. Anything larger stops paying for
+/// itself: the conversion is memory-bound and the buffers must survive a call
+/// through `apply_f32_bulk`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const F16_STAGE_CHUNK: usize = 1024;
+
+/// x86 f16 path: F16C widen 8 f16→f32, apply the op's f32 bulk kernel, F16C
+/// narrow back, in `F16_STAGE_CHUNK`-element passes.
+///
+/// This replaces a scalar loop that called `half::f16::from_bits(..).to_f32()`
+/// and `half::f16::from_f32(..)` per element — software conversion that made
+/// every f16 elementwise op an order of magnitude slower than ORT's, even for
+/// ops whose arithmetic is a single comparison. aarch64 already had the NEON
+/// equivalent; x86 had the F16C primitives in `dtype` but nothing called them
+/// from here.
+///
+/// Numerically identical to the scalar loop it replaces: `_mm256_cvtph_ps` is
+/// exact for every f16, and `_mm256_cvtps_ph` with `_MM_FROUND_TO_NEAREST_INT`
+/// matches `half::f16::from_f32`'s round-to-nearest-even. The op itself sees
+/// the same `f32` values either way — but note it now sees them through
+/// `apply_f32_bulk` rather than `apply_f32_scalar`, so the two must agree
+/// (they do; the f32 dense path already relies on this).
+///
+/// # Safety
+/// The running CPU must support `f16c` + `avx2`; `src.len() == dst.len()`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn elementwise_f16_f16c(op: &dyn ElementwiseOp, src: &[u16], dst: &mut [u16]) {
+    let mut widened = [0.0f32; F16_STAGE_CHUNK];
+    let mut applied = [0.0f32; F16_STAGE_CHUNK];
+    for (src_chunk, dst_chunk) in src
+        .chunks(F16_STAGE_CHUNK)
+        .zip(dst.chunks_mut(F16_STAGE_CHUNK))
+    {
+        let len = src_chunk.len();
+        // SAFETY: caller guarantees f16c+avx2; the slices are equal length.
+        unsafe { crate::dtype::f16c::widen(src_chunk, &mut widened[..len]) };
+        op.apply_f32_bulk(&widened[..len], &mut applied[..len]);
+        // SAFETY: as above.
+        unsafe { crate::dtype::f16c::narrow(&applied[..len], dst_chunk) };
+    }
 }
 
 /// NEON f16 path: widen 4 f16→f32, apply op, narrow 4 f32→f16.
@@ -275,6 +327,13 @@ fn dispatch_dense_bf16(
 
     // bf16 has no native NEON comparison ops on current Apple Silicon.
     // Widen to f32, process in bulk, narrow back.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if crate::dtype::bf16x::available() {
+        // SAFETY: `available()` confirmed `avx2`.
+        unsafe { elementwise_bf16_avx2(op, src_u16, dst_u16) };
+        return Ok(());
+    }
+
     let mut f32_buf: Vec<f32> = src_u16
         .iter()
         .map(|&bits| half::bf16::from_bits(bits).to_f32())
@@ -287,6 +346,36 @@ fn dispatch_dense_bf16(
     }
 
     Ok(())
+}
+
+/// x86 bf16 path: AVX2 widen, apply, narrow, in staged chunks.
+///
+/// Besides vectorising the conversion this drops two whole-tensor heap
+/// allocations — the scalar path built a `Vec<f32>` of the entire tensor and
+/// then `clone()`d it, because `apply_f32_bulk` needs disjoint source and
+/// destination.
+///
+/// `widen_quieting`, not `widen`: it replaces `half::bf16::to_f32`, which
+/// quiets a signalling NaN. `narrow` matches `half::bf16::from_f32`'s
+/// round-to-nearest-even.
+///
+/// # Safety
+/// The running CPU must support `avx2`; `src.len() == dst.len()`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn elementwise_bf16_avx2(op: &dyn ElementwiseOp, src: &[u16], dst: &mut [u16]) {
+    let mut widened = [0.0f32; F16_STAGE_CHUNK];
+    let mut applied = [0.0f32; F16_STAGE_CHUNK];
+    for (src_chunk, dst_chunk) in src
+        .chunks(F16_STAGE_CHUNK)
+        .zip(dst.chunks_mut(F16_STAGE_CHUNK))
+    {
+        let len = src_chunk.len();
+        // SAFETY: caller guarantees avx2; the slices are equal length.
+        unsafe { crate::dtype::bf16x::widen_quieting(src_chunk, &mut widened[..len]) };
+        op.apply_f32_bulk(&widened[..len], &mut applied[..len]);
+        // SAFETY: as above.
+        unsafe { crate::dtype::bf16x::narrow(&applied[..len], dst_chunk) };
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -634,5 +723,142 @@ mod tests {
         assert_eq!(results[1], 0.0);
         assert_eq!(results[2], 0.0);
         assert_eq!(results[3], 1.0);
+    }
+}
+
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+mod x86_stage_tests {
+    use super::*;
+
+    /// Reference: the scalar `half` loop the F16C path replaced.
+    fn scalar_f16(op: &dyn ElementwiseOp, src: &[u16]) -> Vec<u16> {
+        src.iter()
+            .map(|&s| {
+                let v = half::f16::from_bits(s).to_f32();
+                half::f16::from_f32(op.apply_f32_scalar(v)).to_bits()
+            })
+            .collect()
+    }
+
+    /// Reference: the scalar `half` loop the AVX2 bf16 path replaced.
+    fn scalar_bf16(op: &dyn ElementwiseOp, src: &[u16]) -> Vec<u16> {
+        src.iter()
+            .map(|&s| {
+                let v = half::bf16::from_bits(s).to_f32();
+                half::bf16::from_f32(op.apply_f32_scalar(v)).to_bits()
+            })
+            .collect()
+    }
+
+    fn vector_f16(op: &dyn ElementwiseOp, src: &[u16]) -> Vec<u16> {
+        let mut dst = vec![0u16; src.len()];
+        // SAFETY: guarded by the caller's `available()` check.
+        unsafe { elementwise_f16_f16c(op, src, &mut dst) };
+        dst
+    }
+
+    fn vector_bf16(op: &dyn ElementwiseOp, src: &[u16]) -> Vec<u16> {
+        let mut dst = vec![0u16; src.len()];
+        // SAFETY: guarded by the caller's `available()` check.
+        unsafe { elementwise_bf16_avx2(op, src, &mut dst) };
+        dst
+    }
+
+    /// Every one of the 65536 f16 bit patterns — normals, subnormals, ±0, ±Inf,
+    /// and every NaN payload — must come back bit-identical to the scalar path.
+    /// Run over the full space at once so the input spans many staging chunks
+    /// and ends on a non-multiple-of-8 tail.
+    #[test]
+    fn f16_vector_path_is_bit_identical_over_the_whole_domain() {
+        if !crate::dtype::f16c::available() {
+            eprintln!("skipping: host lacks f16c/avx2");
+            return;
+        }
+        let all: Vec<u16> = (0..=u16::MAX).collect();
+        for (name, op) in ops() {
+            let want = scalar_f16(op.as_ref(), &all);
+            let got = vector_f16(op.as_ref(), &all);
+            for i in 0..all.len() {
+                assert_eq!(
+                    got[i], want[i],
+                    "{name}: f16 input {:#06x} gave {:#06x}, scalar gives {:#06x}",
+                    all[i], got[i], want[i]
+                );
+            }
+        }
+    }
+
+    /// Same, for bf16.
+    #[test]
+    fn bf16_vector_path_is_bit_identical_over_the_whole_domain() {
+        if !crate::dtype::bf16x::available() {
+            eprintln!("skipping: host lacks avx2");
+            return;
+        }
+        let all: Vec<u16> = (0..=u16::MAX).collect();
+        for (name, op) in ops() {
+            let want = scalar_bf16(op.as_ref(), &all);
+            let got = vector_bf16(op.as_ref(), &all);
+            for i in 0..all.len() {
+                assert_eq!(
+                    got[i], want[i],
+                    "{name}: bf16 input {:#06x} gave {:#06x}, scalar gives {:#06x}",
+                    all[i], got[i], want[i]
+                );
+            }
+        }
+    }
+
+    /// Lengths around the staging-chunk boundary and the 8-wide vector width,
+    /// so a tail-handling bug cannot hide behind a 65536-element run.
+    #[test]
+    fn f16_and_bf16_vector_paths_handle_every_tail_length() {
+        if !crate::dtype::f16c::available() {
+            eprintln!("skipping: host lacks f16c/avx2");
+            return;
+        }
+        let pattern: Vec<u16> = (0..=u16::MAX).step_by(7).collect();
+        let mut lengths: Vec<usize> = (0..=17).collect();
+        for base in [F16_STAGE_CHUNK, 2 * F16_STAGE_CHUNK] {
+            for d in 0..=8 {
+                lengths.push(base - d);
+                lengths.push(base + d);
+            }
+        }
+        for (name, op) in ops() {
+            for &len in &lengths {
+                let src = &pattern[..len.min(pattern.len())];
+                assert_eq!(
+                    vector_f16(op.as_ref(), src),
+                    scalar_f16(op.as_ref(), src),
+                    "{name}: f16 mismatch at length {len}"
+                );
+                assert_eq!(
+                    vector_bf16(op.as_ref(), src),
+                    scalar_bf16(op.as_ref(), src),
+                    "{name}: bf16 mismatch at length {len}"
+                );
+            }
+        }
+    }
+
+    fn ops() -> Vec<(&'static str, Box<dyn ElementwiseOp>)> {
+        vec![
+            ("Relu", Box::new(ReluOp)),
+            (
+                "Clip(-1,1)",
+                Box::new(ClipOp {
+                    minimum: -1.0,
+                    maximum: 1.0,
+                }),
+            ),
+            (
+                "Clip(0,inf)",
+                Box::new(ClipOp {
+                    minimum: 0.0,
+                    maximum: f32::INFINITY,
+                }),
+            ),
+        ]
     }
 }
