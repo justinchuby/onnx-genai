@@ -5194,6 +5194,173 @@ mod tests {
         );
     }
 
+    /// Batch > 1 with **ragged** `seqlens_k`, and a chunked prefill where the
+    /// step appends a multi-token span on top of an existing history.
+    ///
+    /// These two shapes exercise the only arithmetic in `append_and_widen_half`
+    /// that `batch = 1, q_seq = 1` leaves untested: the per-row
+    /// `b = row_index / kv_num_heads` fan-out into a `past_lengths[b]` that
+    /// differs between rows, and a `cur.seq > 1` append offset. A row-indexing
+    /// slip would corrupt one batch row's cache with another's tokens while
+    /// leaving every existing test green, so it is pinned explicitly.
+    ///
+    /// Both are checked against the copy path, which computes the same answer
+    /// through completely separate code (`fill_present` + the generic output
+    /// narrow). Values are exact in `f16` and `bf16`, so the comparison is
+    /// `assert_eq!`, not a tolerance.
+    #[allow(clippy::too_many_arguments)]
+    fn half_ragged_case(
+        kind: HalfKv,
+        batch: usize,
+        capacity: usize,
+        q_seq: usize,
+        totals: &[i32],
+        past_extent: usize,
+    ) {
+        let kernel = gqa_kernel(&[]);
+        let cpu = onnx_runtime_ir::DeviceId::cpu();
+        let dt = kind.dtype();
+        // The ONNX contract is `total_sequence_length == max(seqlens_k) + 1`
+        // regardless of `q_seq`; the kernel derives `past_len` as
+        // `total - k.seq` internally.
+        let seqlens: Vec<i32> = totals.iter().map(|t| t - 1).collect();
+        let total_max = *totals.iter().max().unwrap() as usize;
+        let cache_dim = IP_DIM;
+        let rows = batch * IP_KV_HEADS;
+
+        // Deterministic, half-exact values: small integers scaled by a dyadic
+        // fraction stay exact in both an 11-bit and an 8-bit mantissa.
+        let vals = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 7 + seed * 13) % 17) as f32 - 8.0) * 0.5)
+                .collect()
+        };
+        let query = vals(batch * q_seq * IP_NUM_HEADS * cache_dim, 1);
+        let cur_k = vals(batch * q_seq * IP_KV_HEADS * cache_dim, 2);
+        let cur_v = vals(batch * q_seq * IP_KV_HEADS * cache_dim, 3);
+        let past_k = vals(rows * past_extent * cache_dim, 4);
+        let past_v = vals(rows * past_extent * cache_dim, 5);
+
+        // --- copy arm: distinct f32 past and present, the reference path. ---
+        let present_seq = past_extent.max(total_max);
+        let mut copy_out = Owned::zeros_f32(&[batch, q_seq, IP_NUM_HEADS * cache_dim]);
+        let mut copy_pk = Owned::zeros_f32(&[batch, IP_KV_HEADS, present_seq, cache_dim]);
+        let mut copy_pv = Owned::zeros_f32(&[batch, IP_KV_HEADS, present_seq, cache_dim]);
+        let q_owned = Owned::f32(&[batch, q_seq, IP_NUM_HEADS * cache_dim], &query);
+        let ck = Owned::f32(&[batch, q_seq, IP_KV_HEADS * cache_dim], &cur_k);
+        let cv = Owned::f32(&[batch, q_seq, IP_KV_HEADS * cache_dim], &cur_v);
+        let pk32 = Owned::f32(&[batch, IP_KV_HEADS, past_extent, cache_dim], &past_k);
+        let pv32 = Owned::f32(&[batch, IP_KV_HEADS, past_extent, cache_dim], &past_v);
+        let sl = Owned::i32(&[batch], &seqlens);
+        let tsl = Owned::i32(&[], &[total_max as i32]);
+        kernel
+            .execute(
+                &[
+                    q_owned.view(),
+                    ck.view(),
+                    cv.view(),
+                    pk32.view(),
+                    pv32.view(),
+                    sl.view(),
+                    tsl.view(),
+                ],
+                &mut [copy_out.view_mut(), copy_pk.view_mut(), copy_pv.view_mut()],
+            )
+            .unwrap();
+        let (copy_out, copy_pk, copy_pv) = (copy_out.to_f32(), copy_pk.to_f32(), copy_pv.to_f32());
+
+        // --- append arm: one half capacity buffer bound as past AND present. ---
+        let cap_elems = rows * capacity * cache_dim;
+        let mut dense = vec![0.0f32; cap_elems];
+        let mut dense_v = vec![0.0f32; cap_elems];
+        for row in 0..rows {
+            for s in 0..past_extent.min(capacity) {
+                for x in 0..cache_dim {
+                    dense[(row * capacity + s) * cache_dim + x] =
+                        past_k[(row * past_extent + s) * cache_dim + x];
+                    dense_v[(row * capacity + s) * cache_dim + x] =
+                        past_v[(row * past_extent + s) * cache_dim + x];
+                }
+            }
+        }
+        let mut kbuf = vec![0u16; cap_elems];
+        let mut vbuf = vec![0u16; cap_elems];
+        kind.narrow_into(&dense, &mut kbuf);
+        kind.narrow_into(&dense_v, &mut vbuf);
+
+        let cap_shape = [batch, IP_KV_HEADS, capacity, cache_dim];
+        let cap_strides = compute_contiguous_strides(&cap_shape);
+        let kp = kbuf.as_mut_ptr() as *mut std::ffi::c_void;
+        let vp = vbuf.as_mut_ptr() as *mut std::ffi::c_void;
+        let mut half_out = Owned::zeros_f32(&[batch, q_seq, IP_NUM_HEADS * cache_dim]);
+        let before = present_inplace_half_count();
+        kernel
+            .execute(
+                &[
+                    q_owned.view(),
+                    ck.view(),
+                    cv.view(),
+                    TensorView::new(DevicePtr(kp), dt, &cap_shape, &cap_strides, cpu),
+                    TensorView::new(DevicePtr(vp), dt, &cap_shape, &cap_strides, cpu),
+                    sl.view(),
+                    tsl.view(),
+                ],
+                &mut [
+                    half_out.view_mut(),
+                    TensorMut::new(DevicePtrMut(kp), dt, &cap_shape, &cap_strides, cpu),
+                    TensorMut::new(DevicePtrMut(vp), dt, &cap_shape, &cap_strides, cpu),
+                ],
+            )
+            .unwrap();
+        assert!(
+            present_inplace_half_count() > before,
+            "{kind:?} batch={batch} q_seq={q_seq}: the append path must fire"
+        );
+        assert_eq!(
+            half_out.to_f32(),
+            copy_out,
+            "{kind:?} batch={batch} q_seq={q_seq}: attention output must match the copy path"
+        );
+
+        // Compare each row's own valid prefix: the two arms use different row
+        // strides (capacity vs present_seq), so a flat compare would be wrong.
+        let mut widened = vec![0.0f32; cap_elems];
+        let mut widened_v = vec![0.0f32; cap_elems];
+        kind.widen_into(&kbuf, &mut widened);
+        kind.widen_into(&vbuf, &mut widened_v);
+        for row in 0..rows {
+            let b = row / IP_KV_HEADS;
+            let valid = totals[b] as usize * cache_dim;
+            for (name, got, want) in [("key", &widened, &copy_pk), ("value", &widened_v, &copy_pv)]
+            {
+                assert_eq!(
+                    &got[row * capacity * cache_dim..row * capacity * cache_dim + valid],
+                    &want[row * present_seq * cache_dim..row * present_seq * cache_dim + valid],
+                    "{kind:?} batch={batch} q_seq={q_seq}: appended present_{name} row {row} \
+                     (batch {b}, valid {} tokens) must match the copy path",
+                    totals[b]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inplace_half_batch_with_ragged_seqlens_matches_copy_path() {
+        for kind in [HalfKv::F16, HalfKv::Bf16] {
+            // batch 2, per-row histories of 3 and 1 tokens, one new token each.
+            half_ragged_case(kind, 2, 6, 1, &[4, 2], 3);
+        }
+    }
+
+    #[test]
+    fn inplace_half_chunked_prefill_matches_copy_path() {
+        for kind in [HalfKv::F16, HalfKv::Bf16] {
+            // A 3-token chunk appended on top of a 2-token history, spare
+            // capacity left over: exercises `cur.seq > 1` with `past_len > 0`.
+            half_ragged_case(kind, 1, 8, 3, &[5], 2);
+        }
+    }
+
     #[test]
     fn inplace_decode_matches_copy_path_at_exact_capacity() {
         // capacity == total ⇒ the in-place buffer layout is identical to the
