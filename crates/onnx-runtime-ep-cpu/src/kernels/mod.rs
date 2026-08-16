@@ -365,6 +365,11 @@ pub mod gelu;
 pub mod gemm;
 pub mod group_query_attention;
 mod half_gemm;
+// The GEMV is an F16C/AVX2 kernel with no portable body: off x86 the decode
+// path is unchanged, so the module is not compiled at all rather than left as
+// dead code.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod half_gemv;
 pub mod hardmax;
 pub mod identity;
 pub mod index_share;
