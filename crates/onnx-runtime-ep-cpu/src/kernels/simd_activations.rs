@@ -21,17 +21,50 @@
 //!   `MlasTanhConstants` / `MlasLogisticConstants` (which MLAS in turn took
 //!   from Eigen), so a build using this path tracks ORT's own CPU output.
 //! * MLAS clamps its input to the polynomial's valid band and returns the
-//!   polynomial value at the clamp point. That is wrong for `±Inf`
-//!   (`sigmoid(-Inf)` would leak `1.5e-8` instead of `0`), so this module
-//!   *saturates* instead: outside the band the exact limit is substituted.
-//!   Because `tanh(9) = 1 - 3.0e-8` and `sigmoid(18) = 1 - 1.5e-8` both round
-//!   to `1.0f32`, saturation is strictly more accurate than clamping, not
-//!   less.
+//!   polynomial value at the clamp point; this module *saturates* instead,
+//!   substituting the exact limit outside the band. On this host the two
+//!   agree bit-for-bit everywhere they were probed, `±Inf` included: the
+//!   vendored `MlasComputeLogistic` returns exactly `0.0` for `sigmoid(-Inf)`
+//!   and for every `x <= -18`. That is not an underflow: at the clamp point
+//!   the rational evaluates to `-5.96e-8`, and `logistic.cpp`'s own *output*
+//!   clamp (`std::clamp((p / q) + 0.5f, 0.0f, 1.0f)`) pins that negative
+//!   value to `0.0`. Saturation is therefore an *equivalent* formulation that
+//!   makes the endpoints exact by construction rather than by that accident —
+//!   it is not a correctness win, and earlier revisions of this comment
+//!   wrongly claimed clamping leaked `1.5e-8` at `-Inf`. It is still the
+//!   formulation worth keeping: it is exact for any future constant set, and
+//!   it costs nothing measurable. Note that saturation is *not* correctly
+//!   rounded at the very edge of the `tanh` band: `sigmoid(18) = 1 - 1.523e-8`
+//!   does round to `1.0f32`, but `tanh(9) = 1 - 3.046e-8` rounds to
+//!   `0.99999994` (`0x3F7FFFFF`) because `3.046e-8` exceeds the `2.98e-8`
+//!   half-ulp threshold below `1.0`. `tanh` only rounds to `1.0f32` from
+//!   `|x| >= 9.010914` (the first f32 whose `tanh` does), so the substituted
+//!   `±1` is one ulp high on `9 < |x| < 9.010914`. MLAS and ORT return `1.0`
+//!   there too, the scaled error is `6.62e-9` against the module's asserted
+//!   `4e-7` bound, and the alternative in that range is the rational's own
+//!   out-of-range overshoot, so this is accepted rather than special-cased.
 //! * `NaN` propagates unchanged. Both the clamp (`maxps`/`minps` with the
 //!   value as the *second* operand, matching MLAS) and the saturation selects
-//!   (ordered compares, which are false for `NaN`) preserve it.
+//!   (ordered compares, which are false for `NaN`) preserve it. Measured
+//!   against ORT 1.28.0 CPU, the payload and sign survive exactly
+//!   (`0x7FC01234 -> 0x7FC01234`) and a signalling `NaN` is quieted with its
+//!   payload kept (`0x7F800001 -> 0x7FC00001`), on both the vector and the
+//!   scalar path.
 //! * Signed zero is preserved: the numerator is odd, so `p * (-0.0) = -0.0`
 //!   and `-0.0 / q = -0.0`.
+//! * **Two deliberate divergences from ORT**, both verified by running ORT
+//!   1.28.0 on identical inputs. Over 140 probed `(function, special value)`
+//!   pairs these are the only two disagreements; in 32 of the remaining pairs
+//!   this vector path matches ORT where the exact-libm scalar fallback does
+//!   not.
+//!     1. `tanh` is pinned to `[-1, 1]` (see the note at the pin site); ORT
+//!        returns `1.0000001` at `x = 8.442762`.
+//!     2. `tanh_gelu(-Inf)` and `quick_gelu(-Inf)` return `+0.0`, the
+//!        mathematical limit; ORT evaluates `-Inf * 0` and returns `NaN`.
+//!        ONNX does not specify either. The limit is pinned by
+//!        `gelu_special_values`; the scalar fallback and the f64 references
+//!        agree only because they carry the same explicit `-Inf` guard, so
+//!        that agreement documents intent rather than corroborating it.
 //!
 //! # ISA dependence
 //!
@@ -395,10 +428,17 @@ mod avx2 {
             q = _mm256_fmadd_ps(q, v2, _mm256_set1_ps(tanh_c::BETA_2));
             q = _mm256_fmadd_ps(q, v2, _mm256_set1_ps(tanh_c::BETA_0));
 
-            // The rational overshoots `tanh`'s mathematical range near the
-            // clamp point — `p/q` reaches `1.0000001` around `|x| = 8.99` —
-            // so pin it to `[-1, 1]`. MLAS ships the overshoot; downstream
-            // code is entitled to assume `|tanh| <= 1`, so we do not.
+            // The rational overshoots `tanh`'s mathematical range. Sweeping
+            // every f32 in `[8, 9]` through this exact FMA evaluation order,
+            // `p/q` exceeds `1.0` for 57 437 of them, spanning
+            // `[8.127431, 8.999997]` and peaking at `1.0000002` near
+            // `|x| = 8.4755`. ORT ships the overshoot — ORT 1.28.0 CPU
+            // `Tanh(8.442762)` returns `1.0000001` — and downstream code is
+            // entitled to assume `|tanh| <= 1`, so we pin to `[-1, 1]`. This
+            // is a deliberate, measured divergence from ORT in favour of the
+            // mathematical range. (The counts are FMA-specific: the same
+            // constants evaluated without fusion overshoot on only 26 503
+            // points over `[8.052297, 8.999964]`.)
             let poly = clamp_nan_preserving(_mm256_div_ps(p, q), -1.0, 1.0);
 
             // Saturate. Ordered compares are false for NaN, so NaN keeps the
