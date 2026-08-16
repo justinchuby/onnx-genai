@@ -223,6 +223,7 @@ const F16_STAGE_CHUNK: usize = 1024;
 /// The running CPU must support `f16c` + `avx2`; `src.len() == dst.len()`.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 unsafe fn elementwise_f16_f16c(op: &dyn ElementwiseOp, src: &[u16], dst: &mut [u16]) {
+    debug_assert_eq!(src.len(), dst.len(), "f16 staging needs equal lengths");
     let mut widened = [0.0f32; F16_STAGE_CHUNK];
     let mut applied = [0.0f32; F16_STAGE_CHUNK];
     for (src_chunk, dst_chunk) in src
@@ -356,13 +357,18 @@ fn dispatch_dense_bf16(
 /// destination.
 ///
 /// `widen_quieting`, not `widen`: it replaces `half::bf16::to_f32`, which
-/// quiets a signalling NaN. `narrow` matches `half::bf16::from_f32`'s
+/// quiets a signalling NaN, so this keeps the staged `f32` identical to what
+/// the scalar path produced. For `Relu` and `Clip` the choice is not observable
+/// — they propagate NaN unchanged and `narrow` re-quiets on the way out — but
+/// an op that inspected the payload, or a future caller that read the staging
+/// buffer, would see the difference. `narrow` matches `half::bf16::from_f32`'s
 /// round-to-nearest-even.
 ///
 /// # Safety
 /// The running CPU must support `avx2`; `src.len() == dst.len()`.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 unsafe fn elementwise_bf16_avx2(op: &dyn ElementwiseOp, src: &[u16], dst: &mut [u16]) {
+    debug_assert_eq!(src.len(), dst.len(), "bf16 staging needs equal lengths");
     let mut widened = [0.0f32; F16_STAGE_CHUNK];
     let mut applied = [0.0f32; F16_STAGE_CHUNK];
     for (src_chunk, dst_chunk) in src
@@ -766,8 +772,9 @@ mod x86_stage_tests {
 
     /// Every one of the 65536 f16 bit patterns — normals, subnormals, ±0, ±Inf,
     /// and every NaN payload — must come back bit-identical to the scalar path.
-    /// Run over the full space at once so the input spans many staging chunks
-    /// and ends on a non-multiple-of-8 tail.
+    /// Run over the full space at once so the input spans many staging chunks.
+    /// 65536 is a whole number of chunks and of vectors, so this test says
+    /// nothing about tails; `..._handle_every_tail_length` below covers those.
     #[test]
     fn f16_vector_path_is_bit_identical_over_the_whole_domain() {
         if !crate::dtype::f16c::available() {
