@@ -36,6 +36,22 @@ for onnx-genai WebGPU versus 201.60/221.82 tok/s for LM Studio Metal. The prior
 [`gqa-fixed`](2026-07-12-JustindeMacBook-Pro-gqa-fixed.md) report contains the
 fp16-GQA and Q4-CPU trajectory.
 
+## Operator-level comparison against the ORT CPU EP
+
+The reports above compare whole-runtime token throughput. A separate, narrower
+question is whether *this repo's* CPU execution provider beats the ORT CPU
+execution provider on the operators it claims, at production shapes.
+
+[`2026-08-15-cpu-ep-vs-ort-attention-moe.md`](2026-08-15-cpu-ep-vs-ort-attention-moe.md)
+holds that comparison for attention (`GroupQueryAttention`,
+`MultiHeadAttention`), the transforms that surround it (`Softmax`,
+`RotaryEmbedding`, KV-cache copies) and MoE, measured against a real ORT CPU
+session in the same process on the same graph and thread count. The harness is
+[`scripts/ort_ab/`](../../scripts/ort_ab/README.md).
+
+Kernel-vs-previous-kernel speedups are explicitly **not** accepted as evidence
+there: a kernel can get 8× faster and still be 3× slower than ORT.
+
 ## Methodology
 
 - Model family and size: Qwen2.5-0.5B-Instruct.
