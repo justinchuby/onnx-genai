@@ -31,8 +31,15 @@
 //!   it is not a correctness win, and earlier revisions of this comment
 //!   wrongly claimed clamping leaked `1.5e-8` at `-Inf`. It is still the
 //!   formulation worth keeping: it is exact for any future constant set, and
-//!   `tanh(9) = 1 - 3.0e-8` and `sigmoid(18) = 1 - 1.5e-8` both round to
-//!   `1.0f32`, so the substituted limits are the correctly rounded values.
+//!   it costs nothing measurable. Note that saturation is *not* correctly
+//!   rounded at the very edge of the `tanh` band: `sigmoid(18) = 1 - 1.523e-8`
+//!   does round to `1.0f32`, but `tanh(9) = 1 - 3.046e-8` rounds to
+//!   `0.99999994` (`0x3F7FFFFF`) because `3.046e-8` exceeds the `2.98e-8`
+//!   half-ulp threshold below `1.0`. `tanh` only rounds to `1.0f32` from
+//!   `|x| >= 9.010913`, so the substituted `±1` is one ulp high on
+//!   `9 < |x| < 9.010913`. MLAS and ORT return `1.0` there too, the scaled
+//!   error is `6.6e-9`, and the alternative in that range is the rational's
+//!   own out-of-range overshoot, so this is accepted rather than special-cased.
 //! * `NaN` propagates unchanged. Both the clamp (`maxps`/`minps` with the
 //!   value as the *second* operand, matching MLAS) and the saturation selects
 //!   (ordered compares, which are false for `NaN`) preserve it. Measured
@@ -52,8 +59,9 @@
 //!     2. `tanh_gelu(-Inf)` and `quick_gelu(-Inf)` return `+0.0`, the
 //!        mathematical limit; ORT evaluates `-Inf * 0` and returns `NaN`.
 //!        ONNX does not specify either. The limit is pinned by
-//!        `gelu_special_values` and is produced identically by this module's
-//!        scalar fallback and its f64 references, so it is kept.
+//!        `gelu_special_values`; the scalar fallback and the f64 references
+//!        agree only because they carry the same explicit `-Inf` guard, so
+//!        that agreement documents intent rather than corroborating it.
 //!
 //! # ISA dependence
 //!
@@ -417,13 +425,17 @@ mod avx2 {
             q = _mm256_fmadd_ps(q, v2, _mm256_set1_ps(tanh_c::BETA_2));
             q = _mm256_fmadd_ps(q, v2, _mm256_set1_ps(tanh_c::BETA_0));
 
-            // The rational overshoots `tanh`'s mathematical range: `p/q`
-            // exceeds `1.0` for 26 503 of the f32 values in `[8, 9]`, peaking
-            // at `1.0000002` near `|x| = 8.443`. ORT ships the overshoot —
-            // ORT 1.28.0 CPU `Tanh(8.442762)` returns `1.0000001` — and
-            // downstream code is entitled to assume `|tanh| <= 1`, so we pin
-            // to `[-1, 1]`. This is a deliberate, measured divergence from
-            // ORT in favour of the mathematical range.
+            // The rational overshoots `tanh`'s mathematical range. Sweeping
+            // every f32 in `[8, 9]` through this exact FMA evaluation order,
+            // `p/q` exceeds `1.0` for 57 437 of them, spanning
+            // `[8.127431, 8.999997]` and peaking at `1.0000002` near
+            // `|x| = 8.4755`. ORT ships the overshoot — ORT 1.28.0 CPU
+            // `Tanh(8.442762)` returns `1.0000001` — and downstream code is
+            // entitled to assume `|tanh| <= 1`, so we pin to `[-1, 1]`. This
+            // is a deliberate, measured divergence from ORT in favour of the
+            // mathematical range. (The counts are FMA-specific: the same
+            // constants evaluated without fusion overshoot on only 26 503
+            // points over `[8.052297, 8.999964]`.)
             let poly = clamp_nan_preserving(_mm256_div_ps(p, q), -1.0, 1.0);
 
             // Saturate. Ordered compares are false for NaN, so NaN keeps the
