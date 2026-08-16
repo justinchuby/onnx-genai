@@ -631,3 +631,159 @@ does not support deferral. A future deferral needs a fused-graph measurement.
 6. MoE grouped/batched GEMM was not attempted. The measured MoE gap in this
    session (1.1–2.4× at 8/16 threads) is a threading-granularity gap, not an
    arithmetic one.
+
+---
+
+# Phase 4 — the appendable KV cache
+
+## 12. Half-precision KV caches never got the O(1) append (#1083)
+
+### What was already there
+
+`GroupQueryAttention` has supported ORT's `past_present_share_buffer` contract
+for some time. When the caller binds the graph's `present_key`/`present_value`
+outputs onto the **same memory** as the `past_key`/`past_value` inputs at full
+physical capacity, `detect_inplace_kv`
+(`crates/onnx-runtime-ep-cpu/src/kernels/group_query_attention.rs`) recognises
+the aliasing structurally — identical origins, exact capacity, contiguous, K and
+V disjoint — and the step appends only the new token's rows. History is already
+resident; nothing is recopied.
+
+So Phase 4's requirement 1, "append the new token without recopying full
+history", was **half done before Phase 4 started**. The half that was missing is
+the half production uses.
+
+### The gap
+
+`detect_inplace_kv` accepted **contiguous f32 only**. Exported decoders ship
+their KV cache in `f16` (or `bf16`), so every real model failed the gate and fell
+back to the owned-scratch path, which makes two full passes over the entire
+cache on every decode step:
+
+1. `fill_present` widens the whole `f16` history into f32 scratch, then
+2. the trailing output writer narrows the whole f32 scratch back into the
+   graph's `present_*` outputs.
+
+Only step 2 is avoidable — the attention core genuinely needs f32 K/V — but it is
+the expensive one. It is a **write** across `2 · B · H_kv · S · D` elements that
+dirties the entire cache footprint every token, fed by an equally large f32 read.
+
+A test on the pre-#1083 base had even pinned the gap in place:
+`detect_inplace_kv_gate_rejects_f16_cache` asserted the rejection, with a comment
+explaining that "the append path only supports contiguous f32". It was describing
+a limitation, not a requirement. (#1083 keeps the test — the *f32* gate must
+still decline half-precision — and rewords the comment to point at
+`detect_inplace_kv_half`.)
+
+### What shipped
+
+`detect_inplace_kv_half` + `append_and_widen_half`. The gate is the same
+structural proof, extended with an encoding check: `f16` and `bf16` share a width
+but not a bit layout, so a mismatched past/present pair is declined rather than
+reinterpreted. When it fires, only the new rows are narrowed into the resident
+cache and `[0, total)` is widened back out for attention. The full-history narrow
+disappears.
+
+### Results — f16 decode, `append` ÷ `copy`, median of 4 independent sweeps
+
+Both arms are today's shipping kernel on the same geometry; the only difference
+is whether the caller bound `present` onto `past`. The `copy` arm is exactly what
+every half-precision model runs on `main`.
+
+| geometry | H_kv × D | kv=2048 | kv=4096 | kv=8192 | kv=16384 |
+|---|---|---|---|---|---|
+| qwen2.5-0.5b | 2 × 64 | 0.870 | 0.890 | 0.983 † | 0.945 † |
+| qwen3-0.6b | 8 × 128 | 0.761 | **0.504** | 0.669 | **0.600** |
+| llama-3.1-8b | 8 × 128 | 0.777 † | **0.554** | 0.692 | 0.684 |
+| qwen2.5-7b | 4 × 128 | 0.799 | 0.917 | 0.787 | 0.789 |
+
+† per-run ratio range reaches or crosses 1.0 across the 4 sweeps (0.91–1.03,
+0.92–1.06 and 0.77–1.03 respectively) — read these three as "no regression", not
+as a gain. Every other cell's range stays strictly below 1.0. Absolute medians and full dispersion are in
+PR #1083; all 16 cells are reported there, none omitted.
+
+The pattern is what the mechanism predicts: the win tracks cache size. The three
+wide-KV geometries (`H_kv · D` of 1024 or 512) gain 8–50%; `qwen2.5-0.5b`, whose
+`H_kv · D = 128` is the smallest in the set, gains 11–13% at short context and
+nothing measurable at long context, because the removed traffic is small next to
+the attention work.
+
+### Bytes removed — exact, not measured
+
+Per decode step per layer the eliminated narrow is `2 · B · H_kv · C · D` half
+writes plus the equally large f32 reads feeding it, replaced by
+`2 · B · H_kv · q_seq · D` half writes. At `q_seq = 1` that is a factor of `C`.
+For qwen3-0.6b at `C = 16384`: **≈67 MB of writes and ≈134 MB of reads removed
+per step per layer**.
+
+### What this is NOT
+
+**This is not an "ours beats ORT" result.** ORT CPU's GQA already appends in
+place under `past_present_share_buffer`; so did ours, for f32. This closes a
+parity gap on the dtype production actually ships. It does not open a lead, and
+it should not be quoted as one.
+
+## 13. The structural boundary: why `Concat`-shaped KV cannot append
+
+The GQA path above works because `GroupQueryAttention` takes the valid length as
+a runtime **value** input (`seqlens_k`, `total_sequence_length`), not from a
+tensor shape. That is what lets `past` and `present` both be declared at physical
+capacity `[B, H_kv, C, D]` while the kernel operates on `[0, total)`.
+
+Models that build their cache with a plain `Concat(past, new)` instead cannot do
+this, and the reason is not a missing optimisation — it is the binding ABI:
+
+* `ExternalValue` (`crates/onnx-runtime-session/src/executor/state.rs:638-646`)
+  carries `dtype, shape, accepts_subshape, ptr, len, alignment, device`. The one
+  knob that looks like it might help — `accepts_subshape` — is a bounded per-dim
+  `valid ≤ capacity` check (`accepts_output`), not strides. **There is no strides
+  field.** A device-bound value is always dense.
+* `DeviceIoBinding` (`crates/onnx-runtime-session/src/tensor.rs:316`) does carry
+  `physical_shape` (capacity) and `logical_shape` (valid prefix), and
+  `kernel_input_shape()` exposes the logical prefix to kernels. But because the
+  value is dense, a logical prefix is only *correct* when the growing axis is the
+  outermost one.
+* KV caches are `[B, H_kv, S, D]` — `S` is axis 2. A capacity-backed view of that
+  is `shape [B,H,S,D]` with strides `[H·C·D, C·D, D, 1]`, which is **not
+  expressible** as a dense `ExternalValue`. Every head's slab would need shifting.
+
+Consequently, for a `Concat`-shaped cache the history copy is semantically
+required inside a single `Run`: the caller owns `past`, `present` is a distinct
+graph output, and no legal aliasing makes the old bytes already correct at their
+destination. Eliding it would need one of:
+
+1. strides on `ExternalValue`/`DeviceIoBinding` — invasive, changes the binding
+   contract for every EP;
+2. a KV layout whose growth axis is outermost (`[S, B, H, D]`) — no exported
+   decoder uses one; or
+3. the GQA route above, which is what §12 extends.
+
+This is reported as a boundary rather than a to-do because options 1 and 2 are
+model/ABI changes, not kernel work. Phase 3's attempt to attack the same cost
+from the `Concat` kernel side (parallelising the copy) is recorded as a negative
+result in §8: no win in any of 15 cells and a non-overlapping regression at
+`kvcat_llama3_p1023` t=16.
+
+## 14. Phase 4 limitations
+
+* §12's gain is only reachable when the caller binds `present` onto `past`. A
+  session that lets the executor allocate a fresh `present` each step keeps the
+  copy path, byte-for-byte unchanged.
+* The §12 measurement is kernel-level, not a full ORT session A/B. That is
+  deliberate: the aliased binding is a property of *how the caller drives the
+  session*, and `scripts/ort_ab/ab.py` drives plain `session.run()`, which cannot
+  express it. Both arms are the shipping kernel, so this is our-old-path versus
+  our-new-path under one binding contract — not a kernel-vs-scalar proxy — but it
+  is also not evidence about ORT.
+* Criterion runs arms sequentially within a sweep. The interleaving here comes
+  from repeating the whole sweep four times under varying host load, not from
+  alternating arms inside one pass. On a contended host that matters: a
+  **preliminary** sweep — taken before the four reported above and not part of
+  their dispersion — showed two `qwen2.5-0.5b` cells *regressing* (ratios 1.285
+  at kv=4096 and 1.080 at kv=16384). The 4-sweep medians falsified both, and
+  neither regression is reproducible within the reported 0.81–0.93 and 0.92–1.06
+  ranges. The raw preliminary CSV no longer exists, so that pair of numbers is
+  recorded as provenance for why four sweeps are used, not as a result.
+* Phase 4 requirements 2–5 (grouped MoE GEMM, fused transpose-with-consumer,
+  the Softmax fusion-anchor session A/B, allocator-independent cache thresholds)
+  are not addressed here and remain open.
