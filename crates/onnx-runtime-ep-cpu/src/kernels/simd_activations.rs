@@ -256,7 +256,7 @@ mod erf_c {
     pub(super) const BIG_P6_MINUS_ONE: f32 = 1.28717512e-1;
 
     // Independent `exp` parameters, used only by the big branch.
-    pub(super) const EXP_LOWER_RANGE: f32 = -88.376_264;
+    pub(super) const EXP_LOWER_RANGE: f32 = -88.376_262_664_794_9;
     /// MLAS spells this `1.44269504088896341f`, which rounds to exactly
     /// `f32::consts::LOG2_E`.
     pub(super) const EXP_LOG2_RECIPROCAL: f32 = std::f32::consts::LOG2_E;
@@ -367,10 +367,22 @@ pub(crate) fn sigmoid_f32_slice(input: &[f32], output: &mut [f32]) {
 /// kernels evaluate via `MlasComputeErf`. It is a *faithfully rounded* `f32`
 /// approximation, not the correctly-rounded `libm::erf` the scalar fallback
 /// uses: see the module-level note on ISA dependence. Measured against an
-/// `f64` reference over a dense sweep the worst observed error is well inside
-/// 2 ulp, and against ORT 1.28.0 on identical inputs the two agree bit-for-bit
-/// wherever they were probed — which is the point of porting MLAS's
-/// coefficients rather than inventing a polynomial.
+/// `f64` reference over a dense sweep the worst observed error is 5.96e-8
+/// (1 ulp below `1.0`), and against ORT 1.28.0 on identical inputs the two
+/// agree bit-for-bit over 4M+ probed points — which is the point of porting
+/// MLAS's coefficients rather than inventing a polynomial.
+///
+/// # The `SIMD_MIN_LEN` seam
+///
+/// Slices shorter than [`SIMD_MIN_LEN`] take the correctly-rounded scalar
+/// fallback, so the *same* input value can differ by up to 1 ulp depending on
+/// how many elements the tensor has — measured at 286 of 2000 random values
+/// between a 31-element and a 40-element tensor. `Tanh` and `Sigmoid` have had
+/// exactly this seam since they were vectorised, and ORT has it too (MLAS
+/// dispatches its own scalar tail below the vector width). It is accepted for
+/// the same reason: 1 ulp is three orders of magnitude inside the conformance
+/// tolerance, and the alternative is making short tensors 20x slower to buy
+/// bit-stability nothing depends on.
 pub(crate) fn erf_f32_slice(input: &[f32], output: &mut [f32]) {
     dispatch!(input, output, erf_scalar, erf_avx2);
 }
@@ -692,7 +704,8 @@ mod avx2 {
         }
     }
 
-    /// `x·sigmoid(alpha·x)` over 8 lanes, with `x = -Inf` pinned to `0`.    #[inline]
+    /// `x·sigmoid(alpha·x)` over 8 lanes, with `x = -Inf` pinned to `0`.
+    #[inline]
     #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn quick_gelu_ps(x: __m256, alpha: __m256) -> __m256 {
         unsafe {

@@ -173,7 +173,7 @@ pub fn claim_preference(
         // Float32 is where ORT is strongest: MLAS activation kernels plus
         // intra-op threading. Measured session-level ratios on AVX2 with one
         // thread: Tanh 0.60-0.82x, Sigmoid 0.62-0.81x, Gelu(tanh) 0.64-0.79x,
-        // Gelu(none) 0.67-0.76x, Erf 0.58-0.74x. `Sqrt` is now 1.1-1.9x
+        // Gelu(none) 0.67-0.76x, Erf 0.66-0.74x. `Sqrt` is now 1.1-1.9x
         // single-threaded above ~8 K elements, but inverts to 0.30x at 16
         // threads, and the thread count is not visible here — so it loses under
         // the "must hold across thread counts" rule too.
