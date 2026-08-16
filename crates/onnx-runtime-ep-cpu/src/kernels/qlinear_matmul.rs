@@ -13,12 +13,104 @@ use crate::strided::numel;
 /// never trades measurable throughput for it.
 const PARALLEL_MIN_WORK: usize = 1 << 16;
 
-pub struct QLinearMatMulKernel;
+/// Identity a pre-packed constant `B` is only valid for.
+///
+/// MLAS chooses the packed layout from the shape and signedness, and the pack
+/// is built from one specific weight buffer, so all five have to match before a
+/// cached pack may be reused. `addr` is the weight's base address, which is
+/// stable for a graph initializer over the executor's lifetime.
+#[cfg(feature = "mlas")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct QgemmPackKey {
+    addr: usize,
+    k: usize,
+    n: usize,
+    a_signed: bool,
+    b_signed: bool,
+    /// Whether the packed bytes are the weight's own bytes or the sign-flipped
+    /// ones. A pack built from flipped bytes answers a different question, so
+    /// it must never be served to a call that did not flip.
+    flip_b: bool,
+}
+
+#[derive(Default)]
+pub struct QLinearMatMulKernel {
+    /// Which operands the graph guarantees are constant initializers. Only
+    /// index 3 (`B`) is consulted; the rest are carried so the array lines up
+    /// with the operand list.
+    constant_inputs: [bool; 8],
+    /// `B` pre-packed into MLAS's quantized kernel layout, built at most once.
+    ///
+    /// `None` inside the `OnceLock` records that MLAS declined to pack this
+    /// shape, so the unpacked path is used and no further attempt is made.
+    #[cfg(feature = "mlas")]
+    packed_b: std::sync::OnceLock<Option<(QgemmPackKey, mlas_sys::QgemmPackedB)>>,
+}
+
 pub struct QLinearMatMulFactory;
 
 impl KernelFactory for QLinearMatMulFactory {
     fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(QLinearMatMulKernel))
+        Ok(Box::new(QLinearMatMulKernel::default()))
+    }
+}
+
+impl QLinearMatMulKernel {
+    /// The identity a pack for this call would have, or `None` when `B` must
+    /// not be packed at all.
+    ///
+    /// Declines for a non-constant `B`, and for a batched `B` where each batch
+    /// is a different weight and one pack could not serve them.
+    #[cfg(feature = "mlas")]
+    fn pack_key(
+        &self,
+        b: &TensorView<'_>,
+        geometry: &Geometry,
+        plan: &QgemmPlan,
+    ) -> Option<QgemmPackKey> {
+        if !self.constant_inputs[3] {
+            return None;
+        }
+        if geometry.b_batch.iter().any(|&dimension| dimension != 1) {
+            return None;
+        }
+        Some(QgemmPackKey {
+            addr: b.data_ptr::<u8>() as usize,
+            k: geometry.k,
+            n: geometry.n,
+            a_signed: plan.a_signed,
+            b_signed: plan.b_signed,
+            flip_b: plan.flip_b,
+        })
+    }
+
+    /// An already-built pack for `key`, without building one.
+    ///
+    /// Separate from [`pack_build`](Self::pack_build) so a call that already
+    /// has a pack can skip densifying `B` entirely -- the dense bytes exist
+    /// only to feed the packer.
+    #[cfg(feature = "mlas")]
+    fn pack_lookup(&self, key: QgemmPackKey) -> Option<&mlas_sys::QgemmPackedB> {
+        self.packed_b
+            .get()?
+            .as_ref()
+            .and_then(|(cached, packed)| (*cached == key).then_some(packed))
+    }
+
+    /// Build the pack for `key` from `b_bytes`, at most once per kernel.
+    ///
+    /// A stored `None` records that MLAS declined this shape, so the unpacked
+    /// path serves every later call without another attempt.
+    #[cfg(feature = "mlas")]
+    fn pack_build(&self, key: QgemmPackKey, b_bytes: &[u8]) -> Option<&mlas_sys::QgemmPackedB> {
+        if b_bytes.len() != key.k.checked_mul(key.n)? {
+            return None;
+        }
+        let packed = mlas_sys::QgemmPackedB::new(key.n, key.k, b_bytes, key.a_signed, key.b_signed);
+        self.packed_b
+            .get_or_init(|| packed.map(|packed| (key, packed)))
+            .as_ref()
+            .and_then(|(cached, packed)| (*cached == key).then_some(packed))
     }
 }
 
@@ -195,6 +287,12 @@ fn dims_broadcastable(left: Dim, right: Dim) -> bool {
 }
 
 impl Kernel for QLinearMatMulKernel {
+    fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
+        for (index, is_constant) in self.constant_inputs.iter_mut().enumerate() {
+            *is_constant = constant_inputs.get(index).copied().unwrap_or(false);
+        }
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("QLinearMatMul", inputs, outputs, 8, 8, 1)?;
         let a = &inputs[0];
@@ -239,10 +337,26 @@ impl Kernel for QLinearMatMulKernel {
         // The fallback's widened copies are four bytes per element; the MLAS
         // route hands the raw bytes to the kernel. Materialize only what the
         // chosen path reads, so neither pays for the other's buffers.
-        let (a_bytes, b_bytes, a, b) = if qgemm.is_some() {
+        // A constant B is packed once. After that its dense bytes are dead --
+        // they exist only to feed the packer -- so skip the copy, which is
+        // `k * n` bytes on every call and dominates decode at large K and N.
+        #[cfg(feature = "mlas")]
+        let pack_key = qgemm
+            .as_ref()
+            .and_then(|plan| self.pack_key(&inputs[3], &geometry, plan));
+        #[cfg(feature = "mlas")]
+        let pack_ready = pack_key.is_some_and(|key| self.pack_lookup(key).is_some());
+        #[cfg(not(feature = "mlas"))]
+        let pack_ready = false;
+        #[cfg_attr(not(feature = "mlas"), allow(unused_mut))]
+        let (mut a_bytes, mut b_bytes, a, b) = if qgemm.is_some() {
             (
                 to_dense_bytes(&inputs[0])?,
-                to_dense_bytes(&inputs[3])?,
+                if pack_ready {
+                    Vec::new()
+                } else {
+                    to_dense_bytes(&inputs[3])?
+                },
                 Vec::new(),
                 Vec::new(),
             )
@@ -254,6 +368,25 @@ impl Kernel for QLinearMatMulKernel {
                 read_quantized(&inputs[3])?,
             )
         };
+        // Move any operand MLAS has no kernel for into the sign domain it does,
+        // before it is either packed or handed to the unpacked entry point.
+        #[cfg(feature = "mlas")]
+        if let Some(plan) = &qgemm {
+            if plan.flip_a {
+                flip_sign_domain(&mut a_bytes);
+            }
+            if plan.flip_b {
+                flip_sign_domain(&mut b_bytes);
+            }
+        }
+        // Loop-invariant: the pack depends only on the weight, not the batch.
+        #[cfg(feature = "mlas")]
+        let packed = pack_key.and_then(|key| match self.pack_lookup(key) {
+            Some(packed) => Some(packed),
+            None => self.pack_build(key, &b_bytes),
+        });
+        #[cfg(not(feature = "mlas"))]
+        let packed: Option<&()> = None;
         let (m, k, n) = (geometry.m, geometry.k, geometry.n);
         let mut output = Vec::with_capacity(geometry.result_len);
         let mut batch_index = vec![0; geometry.batch_shape.len()];
@@ -261,6 +394,7 @@ impl Kernel for QLinearMatMulKernel {
         // many-batch call allocates once rather than once per batch.
         let mut products: Vec<i32> = Vec::new();
         let mut b_zero_points: Vec<i32> = Vec::new();
+        let mut b_scales: Vec<f32> = Vec::new();
         for batch in 0..geometry.batch_count {
             let a_batch = geometry.a_batch_offset(&batch_index);
             let b_batch = geometry.b_batch_offset(&batch_index);
@@ -276,26 +410,38 @@ impl Kernel for QLinearMatMulKernel {
             }
             b_zero_points.clear();
             b_zero_points.extend((0..n).map(|column| b_quant.at(b_batch, column).1));
+            b_scales.clear();
+            b_scales.extend((0..n).map(|column| b_quant.at(b_batch, column).0));
 
             products.clear();
             products.resize(m * n, 0);
 
             if let Some(plan) = &qgemm {
-                plan.run(
-                    m,
-                    n,
-                    k,
-                    &a_bytes[a_offset..a_offset + m * k],
-                    &b_bytes[b_offset..b_offset + k * n],
-                    &b_zero_points,
-                    &mut products,
-                )?;
+                match packed {
+                    Some(packed) => plan.run_packed(
+                        m,
+                        n,
+                        k,
+                        &a_bytes[a_offset..a_offset + m * k],
+                        packed,
+                        &b_zero_points,
+                        &mut products,
+                    )?,
+                    None => plan.run(
+                        m,
+                        n,
+                        k,
+                        &a_bytes[a_offset..a_offset + m * k],
+                        &b_bytes[b_offset..b_offset + k * n],
+                        &b_zero_points,
+                        &mut products,
+                    )?,
+                }
                 requantize_rows(
                     &products,
                     &a_quant,
-                    &b_quant,
                     a_batch,
-                    b_batch,
+                    &b_scales,
                     n,
                     y_scale,
                     y_zero_point,
@@ -362,9 +508,8 @@ impl Kernel for QLinearMatMulKernel {
             requantize_rows(
                 &products,
                 &a_quant,
-                &b_quant,
                 a_batch,
-                b_batch,
+                &b_scales,
                 n,
                 y_scale,
                 y_zero_point,
@@ -529,8 +674,12 @@ fn read_quantized(view: &TensorView) -> Result<Vec<i32>> {
 /// that synthesizes quantization parameters cannot silently truncate one into
 /// a different kernel input; such a case declines to the exact loop instead.
 #[cfg(feature = "mlas")]
-fn zero_point_byte(value: i32, signed: bool) -> Option<u8> {
-    if signed {
+fn zero_point_byte(value: i32, signed: bool, flipped: bool) -> Option<u8> {
+    if flipped {
+        // The operand bytes were shifted by +128 in the unsigned domain, so the
+        // zero point shifts identically and `a - za` is unchanged.
+        i8::try_from(value).ok().map(|value| (value as u8) ^ 0x80)
+    } else if signed {
         i8::try_from(value).ok().map(|value| value as u8)
     } else {
         u8::try_from(value).ok()
@@ -553,12 +702,36 @@ fn zero_point_byte(value: i32, signed: bool) -> Option<u8> {
 ///   activations against `i8` weights can saturate. `qgemm_u8s8_is_exact()`
 ///   probes the running machine for exactly that, so the fast path is taken
 ///   only where it is exact, and VNNI/AMX hosts get it automatically.
+///
+/// Operand combinations outside that set are not declined but *translated*: an
+/// operand is reinterpreted in the unsigned domain by `XOR 0x80`, with `+128`
+/// applied to its zero point. `sum_k (a_k - za)(b_k - zb)` is a difference of
+/// integers, so shifting an operand and its zero point by the same constant
+/// leaves every accumulator bit-identical, and the call lands on the `u8 x u8`
+/// kernel this file already trusts as exact. Without it, `i8` activations sat
+/// on the scalar loop and lost to ONNX Runtime by 5-6x.
 #[cfg(feature = "mlas")]
 struct QgemmPlan {
+    /// Signedness handed to MLAS, i.e. *after* any flip.
     a_signed: bool,
     b_signed: bool,
+    /// Whether the caller must `XOR 0x80` the operand's bytes first.
+    flip_a: bool,
+    flip_b: bool,
     zero_point_a: u8,
     b_zero_point_bytes: std::cell::RefCell<Vec<u8>>,
+}
+
+/// Reinterpret quantized bytes in the opposite signedness domain.
+///
+/// `XOR 0x80` is `+128` modulo 256, i.e. exactly the `i8 <-> u8` bijection that
+/// preserves order. Applied to an operand *and* its zero point it cancels in
+/// `a - za`, which is why it is free of any accuracy cost.
+#[cfg(feature = "mlas")]
+fn flip_sign_domain(bytes: &mut [u8]) {
+    for byte in bytes.iter_mut() {
+        *byte ^= 0x80;
+    }
 }
 
 #[cfg(feature = "mlas")]
@@ -578,28 +751,56 @@ impl QgemmPlan {
         // MLAS documents (mlas.h, `MLAS_GEMM_QUANT_SHAPE_PARAMS`) that signed
         // activations are unsupported off ARM, and on ARM only alongside signed
         // weights. The generic kernel happens to answer correctly outside that
-        // envelope today, but relying on it would be relying on an accident, so
-        // stay inside the documented set and let the exact loop take the rest.
+        // envelope today, but relying on it would be relying on an accident.
         //
         // The ARM `i8 x i8` kernels accumulate through non-saturating `vmull` /
         // `vpadalq` / dot-product / SMMLA instructions, so unlike `u8 x i8` on
         // AVX2 they need no exactness probe. That is asserted unconditionally
         // by `qgemm_i32_matches_the_integer_oracle_for_every_signedness`, which
         // runs on every architecture including the aarch64 CI lanes.
-        let signed_activations_supported = cfg!(target_arch = "aarch64") && b_signed;
-        if a_signed && !signed_activations_supported {
-            return None;
-        }
-        if !a_signed && b_signed && !mlas_sys::qgemm_u8s8_is_exact() {
-            return None;
-        }
-        let zero_point_a = zero_point_byte(a_quant.at(0, 0).1, a_signed)?;
+        let native = if a_signed {
+            cfg!(target_arch = "aarch64") && b_signed
+        } else if b_signed {
+            mlas_sys::qgemm_u8s8_is_exact()
+        } else {
+            true
+        };
+        // Anything outside the native envelope is translated into `u8 x u8`
+        // rather than declined. Only the operands actually out of domain move.
+        let (flip_a, flip_b) = if native {
+            (false, false)
+        } else {
+            (a_signed, b_signed)
+        };
+        let zero_point_a = zero_point_byte(a_quant.at(0, 0).1, a_signed, flip_a)?;
         Some(Self {
-            a_signed,
-            b_signed,
+            a_signed: a_signed && !flip_a,
+            b_signed: b_signed && !flip_b,
+            flip_a,
+            flip_b,
             zero_point_a,
             b_zero_point_bytes: std::cell::RefCell::new(Vec::new()),
         })
+    }
+
+    /// The `b_zero_point` column vector as the bytes MLAS expects, in the same
+    /// sign domain the weight bytes were handed over in.
+    fn b_zero_point_bytes(&self, b_zero_points: &[i32], n: usize) -> Result<()> {
+        let mut bytes = self.b_zero_point_bytes.borrow_mut();
+        bytes.clear();
+        bytes.reserve(n);
+        for &value in b_zero_points {
+            bytes.push(
+                zero_point_byte(value, self.b_signed || self.flip_b, self.flip_b).ok_or_else(
+                    || {
+                        EpError::KernelFailed(format!(
+                            "QLinearMatMul: b_zero_point {value} does not fit the operand dtype"
+                        ))
+                    },
+                )?,
+            );
+        }
+        Ok(())
     }
 
     fn run(
@@ -612,16 +813,8 @@ impl QgemmPlan {
         b_zero_points: &[i32],
         products: &mut [i32],
     ) -> Result<()> {
-        let mut bytes = self.b_zero_point_bytes.borrow_mut();
-        bytes.clear();
-        bytes.reserve(n);
-        for &value in b_zero_points {
-            bytes.push(zero_point_byte(value, self.b_signed).ok_or_else(|| {
-                EpError::KernelFailed(format!(
-                    "QLinearMatMul: b_zero_point {value} does not fit the operand dtype"
-                ))
-            })?);
-        }
+        self.b_zero_point_bytes(b_zero_points, n)?;
+        let bytes = self.b_zero_point_bytes.borrow();
         mlas_sys::qgemm_i32(
             m,
             n,
@@ -631,6 +824,33 @@ impl QgemmPlan {
             self.zero_point_a,
             b,
             self.b_signed,
+            mlas_sys::QgemmZeroPoints::PerColumn(&bytes),
+            products,
+        );
+        Ok(())
+    }
+
+    /// [`run`](Self::run) against a `B` that was pre-packed once.
+    fn run_packed(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[u8],
+        packed: &mlas_sys::QgemmPackedB,
+        b_zero_points: &[i32],
+        products: &mut [i32],
+    ) -> Result<()> {
+        self.b_zero_point_bytes(b_zero_points, n)?;
+        let bytes = self.b_zero_point_bytes.borrow();
+        mlas_sys::qgemm_i32_packed(
+            m,
+            n,
+            k,
+            a,
+            self.a_signed,
+            self.zero_point_a,
+            packed,
             mlas_sys::QgemmZeroPoints::PerColumn(&bytes),
             products,
         );
@@ -659,48 +879,121 @@ impl QgemmPlan {
     ) -> Result<()> {
         unreachable!("QgemmPlan::select never yields a plan without the mlas feature")
     }
+
+    /// Unreachable without `mlas`: `packed` is always `None` there, so this
+    /// exists only to keep the dispatch in `execute` type-checking.
+    #[allow(clippy::too_many_arguments)]
+    fn run_packed(
+        &self,
+        _: usize,
+        _: usize,
+        _: usize,
+        _: &[u8],
+        _: &(),
+        _: &[i32],
+        _: &mut [i32],
+    ) -> Result<()> {
+        unreachable!("no pack exists without the mlas feature")
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Requantize the `i32` accumulators into the output dtype.
+///
+/// Rows are independent, so this appends into a pre-sized region and walks the
+/// rows in parallel once there is enough work to pay for the fork. Two
+/// properties are load-bearing and must not be traded for speed:
+///
+/// * the per-element arithmetic is still `a_scale * b_scale / y_scale` in that
+///   association, so results stay bit-identical to the serial version -- float
+///   multiply and divide do not reassociate;
+/// * each row writes only its own `n` bytes, so the output is identical
+///   whether the rows run serially or in parallel.
+///
+/// `b_scales` is the per-column scale gathered once per batch by the caller;
+/// looking it up per element was a `QuantParams::at` call inside the innermost
+/// loop.
 fn requantize_rows(
     products: &[i32],
     a_quant: &QuantParams,
-    b_quant: &QuantParams,
     a_batch: usize,
-    b_batch: usize,
+    b_scales: &[f32],
     n: usize,
     y_scale: f32,
     y_zero_point: i32,
     dtype: DataType,
     output: &mut Vec<u8>,
 ) -> Result<()> {
-    for (row, accumulators) in products.chunks_exact(n).enumerate() {
+    // Both supported dtypes are one byte wide, so the output length is known.
+    // Reject anything else once here rather than per element.
+    if !matches!(dtype, DataType::Int8 | DataType::Uint8) {
+        return Err(EpError::KernelFailed(format!(
+            "QLinearMatMul: unsupported output dtype {dtype:?}"
+        )));
+    }
+    let base = output.len();
+    output.resize(base + products.len(), 0);
+    let destination = &mut output[base..];
+
+    // `a_scale * b_scale / y_scale` is the same expression for every row when
+    // `a_scale` is per tensor, so evaluate it once per column instead of once
+    // per element. The association is untouched, so the products are the same
+    // `f32` bits -- this removes a division per output element, not a rounding
+    // step. A per-row `a_scale` genuinely varies by row and keeps the divide.
+    let shared_scales: Option<Vec<f32>> = (!a_quant.per_axis).then(|| {
+        let a_scale = a_quant.at(a_batch, 0).0;
+        b_scales
+            .iter()
+            .map(|&b_scale| a_scale * b_scale / y_scale)
+            .collect()
+    });
+
+    let requantize_row = |row: usize, accumulators: &[i32], bytes: &mut [u8]| {
         let a_scale = a_quant.at(a_batch, row).0;
-        for (column, &accumulated) in accumulators.iter().enumerate() {
-            let b_scale = b_quant.at(b_batch, column).0;
-            let scale = a_scale * b_scale / y_scale;
+        let quantize = |accumulated: i32, scale: f32, byte: &mut u8| {
             let value =
                 (accumulated as f32 * scale).round_ties_even() as i64 + i64::from(y_zero_point);
-            push_quantized(output, dtype, value)?;
+            *byte = match dtype {
+                DataType::Int8 => value.clamp(i8::MIN as i64, i8::MAX as i64) as i8 as u8,
+                _ => value.clamp(u8::MIN as i64, u8::MAX as i64) as u8,
+            };
+        };
+        match &shared_scales {
+            Some(scales) => {
+                for ((&accumulated, &scale), byte) in
+                    accumulators.iter().zip(scales).zip(bytes.iter_mut())
+                {
+                    quantize(accumulated, scale, byte);
+                }
+            }
+            None => {
+                for ((&accumulated, &b_scale), byte) in
+                    accumulators.iter().zip(b_scales).zip(bytes.iter_mut())
+                {
+                    quantize(accumulated, a_scale * b_scale / y_scale, byte);
+                }
+            }
+        }
+    };
+
+    if products.len() >= PARALLEL_MIN_WORK {
+        destination
+            .par_chunks_mut(n)
+            .zip(products.par_chunks_exact(n))
+            .enumerate()
+            .for_each(|(row, (bytes, accumulators))| {
+                requantize_row(row, accumulators, bytes);
+            });
+    } else {
+        for (row, (bytes, accumulators)) in destination
+            .chunks_mut(n)
+            .zip(products.chunks_exact(n))
+            .enumerate()
+        {
+            requantize_row(row, accumulators, bytes);
         }
     }
     Ok(())
-}
-
-fn push_quantized(bytes: &mut Vec<u8>, dtype: DataType, value: i64) -> Result<()> {
-    match dtype {
-        DataType::Int8 => {
-            bytes.push(value.clamp(i8::MIN as i64, i8::MAX as i64) as i8 as u8);
-            Ok(())
-        }
-        DataType::Uint8 => {
-            bytes.push(value.clamp(0, u8::MAX as i64) as u8);
-            Ok(())
-        }
-        other => Err(EpError::KernelFailed(format!(
-            "QLinearMatMul: unsupported output dtype {other:?}"
-        ))),
-    }
 }
 
 struct Geometry {
@@ -877,7 +1170,7 @@ mod tests {
 
     fn execute(inputs: [&Owned; 8], output_dtype: DataType, output_shape: &[usize]) -> Owned {
         let mut output = Owned::zeros(output_dtype, output_shape);
-        QLinearMatMulKernel
+        QLinearMatMulKernel::default()
             .execute(&inputs.map(|input| input.view()), &mut [output.view_mut()])
             .unwrap();
         output
@@ -1089,7 +1382,7 @@ mod tests {
         let y_scale = Owned::f32(&[], &[1.0]);
         let y_zero = Owned::u8(&[], &[0]);
         let mut out = Owned::zeros(DataType::Uint8, &[2, 1]);
-        let error = QLinearMatMulKernel
+        let error = QLinearMatMulKernel::default()
             .execute(
                 &[
                     a.view(),
@@ -1254,8 +1547,8 @@ mod tests {
     }
 
     /// Every decline below is a correctness rule, not a tuning knob: MLAS takes
-    /// a single `ZeroPointA`, documents signed activations as unsupported off
-    /// ARM, and can saturate `u8 x i8` in an `i16` pair accumulator.
+    /// a single `ZeroPointA`, and a zero point that does not fit the operand
+    /// dtype cannot be truncated.
     #[cfg(feature = "mlas")]
     #[test]
     fn qgemm_plan_declines_every_case_it_cannot_reproduce_exactly() {
@@ -1264,26 +1557,371 @@ mod tests {
             QgemmPlan::select(&quant_params(true, 128, 4), false, false, &geometry).is_none(),
             "per-row activation zero points have no MLAS equivalent"
         );
-        assert_eq!(
-            QgemmPlan::select(&quant_params(false, 128, 4), false, true, &geometry).is_some(),
-            mlas_sys::qgemm_u8s8_is_exact(),
-            "u8 x i8 may only be routed to MLAS where that kernel is exact"
-        );
-        let signed_activations_ok = cfg!(target_arch = "aarch64");
-        assert_eq!(
-            QgemmPlan::select(&quant_params(false, -1, 4), true, true, &geometry).is_some(),
-            signed_activations_ok,
-            "signed activations are documented as ARM-only"
-        );
-        assert!(
-            QgemmPlan::select(&quant_params(false, -1, 4), true, false, &geometry).is_none(),
-            "signed activations against unsigned weights are outside the \
-             documented envelope on every architecture"
-        );
         assert!(
             QgemmPlan::select(&quant_params(false, 300, 4), false, false, &geometry).is_none(),
             "a zero point that does not fit the operand dtype must fall back \
              rather than be truncated"
+        );
+        let empty = Geometry::new(&[0, 32], &[32, 8]).unwrap();
+        assert!(
+            QgemmPlan::select(&quant_params(false, 128, 4), false, false, &empty).is_none(),
+            "an empty shape has nothing to hand MLAS"
+        );
+    }
+
+    /// Every signedness combination must produce a plan, and every combination
+    /// MLAS has no kernel for must be reached by translating the offending
+    /// operand into the unsigned domain rather than by declining.
+    ///
+    /// This is the non-vacuity guard for
+    /// `qlinear_matmul_reordered_accumulation_is_bit_identical`: without it
+    /// the `i8` half of that sweep could silently be proving only that the
+    /// scalar fallback equals itself.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn signed_operands_are_translated_rather_than_declined() {
+        let geometry = Geometry::new(&[4, 32], &[32, 8]).unwrap();
+        let signed_activations_native = cfg!(target_arch = "aarch64");
+        let cases = [
+            // (a_signed, b_signed, expected flip_a, expected flip_b)
+            (false, false, false, false),
+            (false, true, false, !mlas_sys::qgemm_u8s8_is_exact()),
+            (
+                true,
+                true,
+                !signed_activations_native,
+                !signed_activations_native,
+            ),
+            (true, false, true, false),
+        ];
+        for (a_signed, b_signed, flip_a, flip_b) in cases {
+            // The zero point has to be legal in the operand's *own* dtype;
+            // that is what the flip then has to carry across.
+            let zero_point = if a_signed { -1 } else { 128 };
+            let plan = QgemmPlan::select(
+                &quant_params(false, zero_point, 4),
+                a_signed,
+                b_signed,
+                &geometry,
+            )
+            .unwrap_or_else(|| panic!("a_signed={a_signed} b_signed={b_signed} must yield a plan"));
+            assert_eq!(
+                (plan.flip_a, plan.flip_b),
+                (flip_a, flip_b),
+                "a_signed={a_signed} b_signed={b_signed}"
+            );
+            assert_eq!(
+                (plan.a_signed, plan.b_signed),
+                (a_signed && !flip_a, b_signed && !flip_b),
+                "a flipped operand must be handed to MLAS as unsigned"
+            );
+        }
+    }
+
+    /// Returns whether this kernel is holding a built pack.
+    #[cfg(all(test, feature = "mlas"))]
+    fn qlinear_pack_state(kernel: &QLinearMatMulKernel) -> Option<bool> {
+        kernel.packed_b.get().map(|slot| slot.is_some())
+    }
+
+    #[cfg(feature = "mlas")]
+    struct PackFixture {
+        a: Owned,
+        b: Owned,
+        m: usize,
+        n: usize,
+    }
+
+    /// Shapes big enough that MLAS actually accepts a pack, with values that
+    /// span the whole byte range so a wrong pack cannot coincidentally agree.
+    #[cfg(feature = "mlas")]
+    fn pack_fixture(m: usize, k: usize, n: usize, seed: usize) -> PackFixture {
+        PackFixture {
+            a: Owned::u8(
+                &[m, k],
+                &(0..m * k)
+                    .map(|i| ((i * 37 + seed * 11) % 256) as u8)
+                    .collect::<Vec<_>>(),
+            ),
+            b: Owned::u8(
+                &[k, n],
+                &(0..k * n)
+                    .map(|i| ((i * 91 + seed * 53 + 7) % 256) as u8)
+                    .collect::<Vec<_>>(),
+            ),
+            m,
+            n,
+        }
+    }
+
+    #[cfg(feature = "mlas")]
+    fn run_with(kernel: &QLinearMatMulKernel, fixture: &PackFixture) -> Owned {
+        let mut output = Owned::zeros(DataType::Uint8, &[fixture.m, fixture.n]);
+        let (a_scale, a_zero) = (Owned::f32(&[], &[0.02]), Owned::u8(&[], &[128]));
+        let (b_scale, b_zero) = (Owned::f32(&[], &[0.01]), Owned::u8(&[], &[127]));
+        let (y_scale, y_zero) = (Owned::f32(&[], &[0.05]), Owned::u8(&[], &[120]));
+        let inputs = [
+            fixture.a.view(),
+            a_scale.view(),
+            a_zero.view(),
+            fixture.b.view(),
+            b_scale.view(),
+            b_zero.view(),
+            y_scale.view(),
+            y_zero.view(),
+        ];
+        kernel.execute(&inputs, &mut [output.view_mut()]).unwrap();
+        output
+    }
+
+    /// A constant weight must be packed exactly once and then reused, and the
+    /// packed answer must equal the unpacked one bit for bit.
+    ///
+    /// Without the reuse this kernel re-packed and re-copied the whole `k * n`
+    /// weight on every call, which is what made decode 20x slower than ONNX
+    /// Runtime.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn a_constant_weight_is_packed_once_and_reused() {
+        let fixture = pack_fixture(3, 64, 96, 1);
+
+        let mut unpacked = QLinearMatMulKernel::default();
+        unpacked.set_constant_inputs(&[false; 8]);
+        let reference = run_with(&unpacked, &fixture);
+        assert!(
+            qlinear_pack_state(&unpacked).is_none(),
+            "a non-constant weight must never be packed: it can change under us"
+        );
+
+        let mut packed = QLinearMatMulKernel::default();
+        packed.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+        let first = run_with(&packed, &fixture);
+        assert_eq!(
+            qlinear_pack_state(&packed),
+            Some(true),
+            "MLAS must accept a pack for this shape, or the rest of this test \
+             proves nothing"
+        );
+        let second = run_with(&packed, &fixture);
+
+        assert_eq!(first.bytes, reference.bytes, "first packed call");
+        assert_eq!(second.bytes, reference.bytes, "reused packed call");
+    }
+
+    /// Reports the one-time cost of the pack against a steady-state call, at a
+    /// real decode shape, because the benchmark harness runs a parity check
+    /// before it starts timing and therefore never sees a first call.
+    ///
+    /// `#[ignore]` so CI does not pay for a 3584x3584 pack; run with
+    /// `cargo test --release --features mlas qlinear_pack_cost -- --ignored --nocapture`.
+    #[cfg(feature = "mlas")]
+    #[test]
+    #[ignore = "reports timings; not a pass/fail assertion"]
+    fn qlinear_pack_cost_report() {
+        let fixture = pack_fixture(1, 3584, 3584, 1);
+        let mut kernel = QLinearMatMulKernel::default();
+        kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+
+        let start = std::time::Instant::now();
+        let _ = run_with(&kernel, &fixture);
+        let cold = start.elapsed();
+        assert_eq!(qlinear_pack_state(&kernel), Some(true));
+
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            let _ = run_with(&kernel, &fixture);
+        }
+        let steady = start.elapsed() / 20;
+
+        let mut unpacked = QLinearMatMulKernel::default();
+        unpacked.set_constant_inputs(&[false; 8]);
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            let _ = run_with(&unpacked, &fixture);
+        }
+        let never_packed = start.elapsed() / 20;
+
+        println!(
+            "k=n=3584 m=1: cold(first call incl. pack)={cold:?} steady={steady:?} \
+             never-packed={never_packed:?}"
+        );
+    }
+
+    /// The pack is keyed on the weight's identity, so a second weight must
+    /// never be served the first one's pack. `addr` alone is not enough --
+    /// hence the shape and signedness in the key -- and a stale pack would be
+    /// a silent wrong answer, not a slowdown.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn a_different_weight_is_never_served_the_cached_pack() {
+        let first = pack_fixture(3, 64, 96, 1);
+        let second = pack_fixture(3, 64, 96, 2);
+        assert_ne!(
+            first.b.bytes, second.b.bytes,
+            "the two weights must actually differ"
+        );
+
+        let mut kernel = QLinearMatMulKernel::default();
+        kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+        let _ = run_with(&kernel, &first);
+        assert_eq!(qlinear_pack_state(&kernel), Some(true));
+        let served = run_with(&kernel, &second);
+
+        let mut fresh = QLinearMatMulKernel::default();
+        fresh.set_constant_inputs(&[false; 8]);
+        assert_eq!(
+            served.bytes,
+            run_with(&fresh, &second).bytes,
+            "the second weight must be computed from itself, not from the \
+             cached pack of the first"
+        );
+    }
+
+    /// The two pack guards shadow each other through `execute` -- a batched `B`
+    /// is refused by `pack_key` before `pack_build` can refuse its byte count
+    /// -- so each is falsified directly here instead of through a compound
+    /// injection.
+    ///
+    /// The length guard is not decoration: `QgemmPackedB::new` *asserts* on a
+    /// buffer that is not `k * n`, because it hands the pointer to MLAS, so
+    /// dropping the guard turns a graceful decline into a panic.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn each_pack_guard_declines_on_its_own() {
+        let mut kernel = QLinearMatMulKernel::default();
+        kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+        let plan_geometry = Geometry::new(&[3, 64], &[64, 96]).unwrap();
+        let plan =
+            QgemmPlan::select(&quant_params(false, 128, 4), false, false, &plan_geometry).unwrap();
+
+        let batched = Owned::u8(&[2, 64, 96], &vec![7u8; 2 * 64 * 96]);
+        let batched_geometry = Geometry::new(&[2, 3, 64], &[2, 64, 96]).unwrap();
+        assert!(
+            kernel
+                .pack_key(&batched.view(), &batched_geometry, &plan)
+                .is_none(),
+            "a per-batch weight has no single pack"
+        );
+
+        let flat = Owned::u8(&[64, 96], &vec![7u8; 64 * 96]);
+        let key = kernel
+            .pack_key(&flat.view(), &plan_geometry, &plan)
+            .expect("a constant 2-D weight is packable, or the rest is vacuous");
+        assert!(
+            kernel.pack_build(key, &[7u8; 8]).is_none(),
+            "a byte count that is not k * n must be declined, not packed"
+        );
+        assert!(
+            kernel.pack_build(key, &vec![7u8; 64 * 96]).is_some(),
+            "MLAS must accept this shape, or the decline above proves nothing"
+        );
+    }
+
+    /// A batched `B` is a different weight per batch, so one pack cannot serve
+    /// it: the kernel must decline to build one, and every batch must still be
+    /// computed from its own weight.
+    ///
+    /// Two independent guards refuse this -- the batch check in `pack_key` and
+    /// the `k * n` length check in `pack_build` -- so the assertion that
+    /// matters, and the one a single injection can falsify, is that batch 1 is
+    /// not answered with batch 0's weights.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn a_batched_weight_declines_the_pack() {
+        let (batches, m, k, n) = (2usize, 3usize, 64usize, 96usize);
+        let a = Owned::u8(
+            &[batches, m, k],
+            &(0..batches * m * k)
+                .map(|i| ((i * 37 + 11) % 256) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let b = Owned::u8(
+            &[batches, k, n],
+            &(0..batches * k * n)
+                .map(|i| ((i * 91 + 7) % 256) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let mut kernel = QLinearMatMulKernel::default();
+        kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+        let mut output = Owned::zeros(DataType::Uint8, &[batches, m, n]);
+        let (a_scale, a_zero) = (Owned::f32(&[], &[0.02]), Owned::u8(&[], &[128]));
+        let (b_scale, b_zero) = (Owned::f32(&[], &[0.01]), Owned::u8(&[], &[127]));
+        let (y_scale, y_zero) = (Owned::f32(&[], &[0.05]), Owned::u8(&[], &[120]));
+        kernel
+            .execute(
+                &[
+                    a.view(),
+                    a_scale.view(),
+                    a_zero.view(),
+                    b.view(),
+                    b_scale.view(),
+                    b_zero.view(),
+                    y_scale.view(),
+                    y_zero.view(),
+                ],
+                &mut [output.view_mut()],
+            )
+            .unwrap();
+        assert!(
+            qlinear_pack_state(&kernel).is_none(),
+            "a per-batch weight has no single pack"
+        );
+
+        let mut unpacked = QLinearMatMulKernel::default();
+        unpacked.set_constant_inputs(&[false; 8]);
+        let mut expected = Owned::zeros(DataType::Uint8, &[batches, m, n]);
+        unpacked
+            .execute(
+                &[
+                    a.view(),
+                    a_scale.view(),
+                    a_zero.view(),
+                    b.view(),
+                    b_scale.view(),
+                    b_zero.view(),
+                    y_scale.view(),
+                    y_zero.view(),
+                ],
+                &mut [expected.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(
+            output.bytes, expected.bytes,
+            "every batch must use its own weight"
+        );
+        assert_ne!(
+            output.bytes[..m * n],
+            output.bytes[m * n..],
+            "the two batches must actually differ, or serving batch 0's pack \
+             to batch 1 would be undetectable"
+        );
+    }
+
+    /// `XOR 0x80` must move the operand and its zero point by the same amount,
+    /// or the shift stops cancelling in `a - za` and every accumulator is off
+    /// by a multiple of `k`.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn the_sign_flip_moves_bytes_and_zero_points_together() {
+        for value in i8::MIN..=i8::MAX {
+            let mut byte = [value as u8];
+            flip_sign_domain(&mut byte);
+            assert_eq!(
+                i32::from(byte[0]),
+                i32::from(value) + 128,
+                "flipping {value} must land on its unsigned image"
+            );
+            assert_eq!(
+                zero_point_byte(i32::from(value), true, true),
+                Some(byte[0]),
+                "the zero point of {value} must move with it"
+            );
+        }
+        assert_eq!(
+            zero_point_byte(128, true, true),
+            None,
+            "a zero point outside the signed dtype must still be rejected, not \
+             wrapped by the flip"
         );
     }
 
@@ -1294,6 +1932,9 @@ mod tests {
             (1, 37, 65),
             (3, 64, 16),
             (5, 129, 33),
+            // Above `PARALLEL_MIN_WORK`, so `requantize_rows` forks. The
+            // parallel and serial row walks must agree bit for bit.
+            (96, 40, 900),
         ] {
             for per_axis in [false, true] {
                 // --- Uint8 ---

@@ -125,12 +125,24 @@ which is the decode case and stays claimed.
 | `MatMul` | f16 | 128 | 3584 | 8 | 7.77 | 8.77 | defer (noisy) |
 | `MatMul` | f16 | 128 | 3584 | 16 | 7.10 | 7.46 | defer |
 | `MatMul` | f16 | 128 | 3584 | 32 | 5.34 | 6.24 | defer |
-| `QLinearMatMul` | u8 x u8 | 1 | 3584 | 8 | 22.04 | 27.30 | defer |
-| `QLinearMatMul` | u8 x u8 | 128 | 3584 | 8 | 4.19 | 4.23 | defer |
-| `QLinearMatMul` | u8 x u8 | 512 | 3584 | 8 | 4.05 | 4.16 | defer |
-| `QLinearMatMul` | i8 x i8 | 1 | 3584 | 8 | 2.23 | 2.37 | defer |
-| `QLinearMatMul` | i8 x i8 | 128 | 3584 | 8 | 3.02 | 3.05 | defer |
-| `QLinearMatMul` | i8 x i8 | 512 | 3584 | 8 | 3.07 | 3.21 | defer |
+| `QLinearMatMul` | u8 x u8 | 1 | 3584 | 1 | 1.13 | 1.18 | defer |
+| `QLinearMatMul` | u8 x u8 | 1 | 3584 | 8 | 2.33 | 2.77 | defer |
+| `QLinearMatMul` | u8 x u8 | 1 | 3584 | 16 | 2.34 | 2.58 | defer |
+| `QLinearMatMul` | u8 x u8 | 128 | 3584 | 1 | 1.20 | 1.21 | defer |
+| `QLinearMatMul` | u8 x u8 | 128 | 3584 | 8 | 2.43 | 2.80 | defer |
+| `QLinearMatMul` | u8 x u8 | 128 | 3584 | 16 | 2.65 | 3.42 | defer |
+| `QLinearMatMul` | u8 x u8 | 512 | 3584 | 1 | 1.20 | 1.21 | defer |
+| `QLinearMatMul` | u8 x u8 | 512 | 3584 | 8 | 2.12 | 2.22 | defer |
+| `QLinearMatMul` | u8 x u8 | 512 | 3584 | 16 | 2.08 | 2.18 | defer |
+| `QLinearMatMul` | i8 x i8 | 1 | 3584 | 1 | **0.03** | 0.03 | **claim** |
+| `QLinearMatMul` | i8 x i8 | 1 | 3584 | 8 | **0.09** | 0.09 | **claim** |
+| `QLinearMatMul` | i8 x i8 | 1 | 3584 | 16 | **0.10** | 0.10 | **claim** |
+| `QLinearMatMul` | i8 x i8 | 128 | 3584 | 1 | **0.25** | 0.25 | **claim** |
+| `QLinearMatMul` | i8 x i8 | 128 | 3584 | 8 | **0.47** | 0.53 | **claim** |
+| `QLinearMatMul` | i8 x i8 | 128 | 3584 | 16 | **0.60** | 0.69 | **claim** |
+| `QLinearMatMul` | i8 x i8 | 512 | 3584 | 1 | **0.26** | 0.26 | **claim** |
+| `QLinearMatMul` | i8 x i8 | 512 | 3584 | 8 | **0.42** | 0.43 | **claim** |
+| `QLinearMatMul` | i8 x i8 | 512 | 3584 | 16 | **0.42** | 0.47 | **claim** |
 
 Ranges **outside** the measured region keep the historical claim, and the code says so explicitly:
 `K * N < 2^20`, symbolic/dynamic weight shapes, and dense dtypes other than f32/f16 (where a
@@ -158,20 +170,35 @@ casts around MLAS's f32 kernels; this EP's f16 path does not reach the same prim
 largest single dense loss in the matrix and the most tractable: the fix is to route f16 `MatMul`
 through the same MLAS `sgemm` the f32 path already uses, with a cast, rather than a bespoke kernel.
 
-### 3. Per-call packing — `QLinearMatMul`
+### 3. Per-call packing — `QLinearMatMul` (**fixed**)
 
-#1058 bound MLAS's integer QGEMM and took u8 x u8 from **27-119x** down to 3-4x. What remains is
-structural: **ORT pre-packs the constant B once at session init; this kernel packs inside every
-call.** At M=1 a 12.8 MB pack dominates a 1.7 ms call, which is the whole of the residual 22x.
-`QLinearMatMulFactory::create` ignores its `Node`, so the kernel is stateless and prepacking would
-need a constant-initializer hook with its own correctness surface (weight identity, **address
-reuse**, dynamic weights).
+#1058 bound MLAS's integer QGEMM and took u8 x u8 from **27-119x** down to 3-4x. What remained was
+structural: **ORT pre-packed the constant B once at session init; this kernel packed inside every
+call**, and additionally copied the whole `K * N` weight into a dense buffer on every call. At M=1 a
+12.8 MB pack and copy dominated a 1.7 ms call, which was the whole of the residual 22x.
 
-Signed x signed is separately capped: MLAS documents `AIsSigned` as unsupported off ARM
-(`mlas.h:610-611`), so on x86 only u8 x u8 reaches the fast path at all. On AVX2 without VNNI, u8 x
-i8 is additionally **not bit-exact** — `vpmaddubsw` sums adjacent products into a saturating i16, and
-`255*(-128) + 255*(-128)` clamps — so it is excluded by a runtime exactness probe rather than an ISA
-table, which lets VNNI/AMX hosts pick the fast path up automatically.
+That is now fixed. The kernel takes `set_constant_inputs`, keys a session-lifetime pack on the
+weight's full identity (address, `K`, `N`, both signedness flags, and whether the bytes were sign
+translated), and skips the dense copy entirely once the pack exists. Cold cost is repaid on the
+**first** call:
+
+| K = N = 3584, M = 1 | time |
+|---|---|
+| first call, including dense copy + MLAS pack | 6.35 ms |
+| every later call | 0.108 ms |
+| never-packed path (what every call used to cost) | 5.90 ms |
+
+Signedness is no longer a cap either. MLAS documents `AIsSigned` as unsupported off ARM
+(`mlas.h:610-611`), and on AVX2 without VNNI u8 x i8 is **not bit-exact** — `vpmaddubsw` sums
+adjacent products into a saturating i16, and `255*(-128) + 255*(-128)` clamps. Rather than decline
+those combinations to a scalar loop, the offending operand is now *translated* into the unsigned
+domain: `XOR 0x80` on its bytes and `+128` on its zero point. Since the kernel computes
+`sum_k (a_k - za)(b_k - zb)`, shifting an operand and its zero point by the same constant leaves
+every `i32` accumulator bit-identical, and the call lands on the `u8 x u8` kernel. i8 activations
+went from 5.5x slower than ORT to **1.7x-33x faster**, and are now claimed.
+
+What is left for u8 x u8 is thread scaling, not packing: 1.13-1.20x at one thread, widening to
+2.08-2.65x at sixteen — the same root cause as [parallel efficiency](#1-parallel-efficiency-not-kernel-quality--f32-dense-and-int4-matmulnbits).
 
 ## Precision
 

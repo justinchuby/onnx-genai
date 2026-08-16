@@ -764,3 +764,84 @@ extern "C" void mlas_qgemm_i32(
         1,
         multithread != 0 ? kMlasParallelSentinel : nullptr);
 }
+
+// ---- Pre-packed B for the quantized GEMM ------------------------------------
+//
+// `mlas_qgemm_i32` above leaves `BIsPacked = false`, so MLAS re-packs the whole
+// K-by-N weight into its kernel layout on every call. ORT instead pre-packs a
+// constant B once at session initialisation and sets `BIsPacked`. The packed
+// layout is chosen per kernel, so the pack is only valid for the same
+// `(N, K, AIsSigned, BIsSigned)` on the same machine -- it must never be
+// serialised or shared across processes.
+
+extern "C" size_t mlas_qgemm_pack_b_size(
+    size_t N,
+    size_t K,
+    int a_is_signed,
+    int b_is_signed)
+{
+    return MlasGemmPackBSize(N, K, a_is_signed != 0, b_is_signed != 0, nullptr);
+}
+
+extern "C" void mlas_qgemm_pack_b(
+    size_t N,
+    size_t K,
+    const void* B,
+    size_t ldb,
+    int a_is_signed,
+    int b_is_signed,
+    void* packed_b)
+{
+    MlasGemmPackB(
+        N, K,
+        static_cast<const uint8_t*>(B),
+        ldb,
+        a_is_signed != 0,
+        b_is_signed != 0,
+        packed_b);
+}
+
+extern "C" void mlas_qgemm_i32_packed(
+    size_t M,
+    size_t N,
+    size_t K,
+    int a_is_signed,
+    int b_is_signed,
+    const void* A,
+    size_t lda,
+    uint8_t zero_point_a,
+    const void* packed_b,
+    const uint8_t* zero_point_b,
+    int per_column_zero_points,
+    int32_t* C,
+    size_t ldc,
+    int multithread)
+{
+    MLAS_GEMM_QUANT_SHAPE_PARAMS shape;
+    shape.M = M;
+    shape.N = N;
+    shape.K = K;
+    shape.AIsSigned = a_is_signed != 0;
+    shape.BIsSigned = b_is_signed != 0;
+    shape.IsAccumulateMode = false;
+
+    MLAS_GEMM_QUANT_DATA_PARAMS data;
+    data.A = static_cast<const uint8_t*>(A);
+    data.lda = lda;
+    data.ZeroPointA = zero_point_a;
+    data.B = packed_b;
+    // Ignored when `BIsPacked`, but leave it consistent with the logical shape.
+    data.ldb = N;
+    data.ZeroPointB = zero_point_b;
+    data.BIsPacked = true;
+    data.PerColumnZeroPoints = per_column_zero_points != 0;
+    data.C = C;
+    data.ldc = ldc;
+    data.OutputProcessor = nullptr;
+
+    MlasGemmBatch(
+        shape,
+        &data,
+        1,
+        multithread != 0 ? kMlasParallelSentinel : nullptr);
+}
