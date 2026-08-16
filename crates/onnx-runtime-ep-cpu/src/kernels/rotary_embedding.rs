@@ -966,4 +966,67 @@ mod parallel_tests {
             }
         }
     }
+
+    /// RoPE's output binding may alias its `X` input. Every rotated pair reads
+    /// both halves before writing either, so an aliased output would corrupt
+    /// the second half; the direct-write guard must decline here.
+    #[test]
+    fn an_output_aliasing_its_input_matches_the_disjoint_result() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
+
+        let (batch, seq, heads, head_size) = (1usize, 64usize, 8usize, 64usize);
+        let n = batch * seq * heads * head_size;
+        let x = synthetic(n, 5);
+        let pos: Vec<i64> = (0..(batch * seq) as i64).collect();
+        let shape = [batch, seq, heads * head_size];
+        let f32c = DataType::Float32;
+        let cpu = DeviceId::cpu();
+        let strides = compute_contiguous_strides(&shape);
+
+        // Full rotation is elementwise alias-safe on its own; partial rotary
+        // adds a pass-through `copy_from_slice`, which is only sound when the
+        // guard has declined. Both are covered.
+        for rotary_dim in [head_size, head_size / 2] {
+            let half = rotary_dim / 2;
+            let cos = synthetic(batch * seq * half, 6);
+            let sin = synthetic(batch * seq * half, 7);
+            let post = Owned::i64(&[batch, seq], &pos);
+            let cost = Owned::f32(&[batch * seq, half], &cos);
+            let sint = Owned::f32(&[batch * seq, half], &sin);
+            let kernel = || RotaryEmbeddingKernel {
+                interleaved: false,
+                num_heads: heads,
+                rotary_embedding_dim: if rotary_dim == head_size {
+                    0
+                } else {
+                    rotary_dim
+                },
+                contrib: true,
+            };
+
+            let disjoint = {
+                let xt = Owned::f32(&shape, &x);
+                let mut out = Owned::zeros_f32(&shape);
+                kernel()
+                    .execute(
+                        &[xt.view(), post.view(), cost.view(), sint.view()],
+                        &mut [out.view_mut()],
+                    )
+                    .unwrap();
+                out.to_f32()
+            };
+
+            let mut shared = x.clone();
+            let in_ptr = shared.as_ptr() as *const std::ffi::c_void;
+            let out_ptr = shared.as_mut_ptr() as *mut std::ffi::c_void;
+            let xv = TensorView::new(DevicePtr(in_ptr), f32c, &shape, &strides, cpu);
+            let outv = TensorMut::new(DevicePtrMut(out_ptr), f32c, &shape, &strides, cpu);
+            kernel()
+                .execute(&[xv, post.view(), cost.view(), sint.view()], &mut [outv])
+                .unwrap();
+
+            assert_eq!(shared, disjoint, "rotary_dim={rotary_dim}");
+        }
+    }
 }

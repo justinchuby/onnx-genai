@@ -261,6 +261,11 @@ impl Kernel for SoftmaxKernel {
         });
 
         let len = numel(shape);
+        if len == 0 {
+            // Nothing to write, and `from_raw_parts_mut` below requires a
+            // non-null pointer even for a zero-length slice.
+            return Ok(());
+        }
         // Softmax reads every input element before writing the corresponding
         // output, so a f32 output buffer that does not alias the widened input
         // can be written straight through - saving a full-tensor scratch
@@ -698,5 +703,63 @@ mod vectorized_tests {
                 assert!((sum - 1.0).abs() <= 1e-6, "o={o} i={i} sums to {sum}");
             }
         }
+    }
+
+    /// The output binding may legitimately alias the input buffer (in-place
+    /// execution via device I/O bindings). Softmax rewrites each element after
+    /// reading it, so the direct-write path must decline and fall back to the
+    /// owned scratch; otherwise the row max/sum would be computed over
+    /// already-normalized values.
+    #[test]
+    fn an_output_aliasing_its_input_matches_the_disjoint_result() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
+
+        let (rows, cols) = (96usize, 128usize);
+        let src = synthetic(rows, cols, 21);
+
+        let disjoint = {
+            let x = Owned::f32(&[rows, cols], &src);
+            let mut out = Owned::zeros_f32(&[rows, cols]);
+            SoftmaxKernel {
+                axis: -1,
+                coerce_2d: false,
+            }
+            .execute(&[x.view()], &mut [out.view_mut()])
+            .unwrap();
+            out.to_f32()
+        };
+
+        let mut shared = src.clone();
+        let in_ptr = shared.as_ptr() as *const std::ffi::c_void;
+        let out_ptr = shared.as_mut_ptr() as *mut std::ffi::c_void;
+        let shape = [rows, cols];
+        let strides = compute_contiguous_strides(&shape);
+        let f32c = DataType::Float32;
+        let cpu = DeviceId::cpu();
+        let x = TensorView::new(DevicePtr(in_ptr), f32c, &shape, &strides, cpu);
+        let out = TensorMut::new(DevicePtrMut(out_ptr), f32c, &shape, &strides, cpu);
+        SoftmaxKernel {
+            axis: -1,
+            coerce_2d: false,
+        }
+        .execute(&[x], &mut [out])
+        .unwrap();
+
+        assert_eq!(shared, disjoint);
+    }
+
+    /// A zero-element tensor must not reach `from_raw_parts_mut`.
+    #[test]
+    fn a_zero_element_tensor_is_a_no_op() {
+        let x = Owned::zeros_f32(&[0, 8]);
+        let mut out = Owned::zeros_f32(&[0, 8]);
+        SoftmaxKernel {
+            axis: -1,
+            coerce_2d: false,
+        }
+        .execute(&[x.view()], &mut [out.view_mut()])
+        .unwrap();
+        assert!(out.to_f32().is_empty());
     }
 }
