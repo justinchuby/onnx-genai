@@ -41,6 +41,14 @@ use onnx_runtime_ir::Node;
 // costs more than the attention work on the decode pool.
 const MIN_PARALLEL_ATTENTION_WORK: usize = 160 * 1024;
 
+// Minimum bytes of present KV cache **per participating worker** before the
+// past->present widen is fanned out across the decode pool. Expressed per worker
+// rather than in total so the gate follows the machine: a wider pool needs a
+// proportionally larger cache before the copy outweighs the dispatch. Paired
+// A/B on a 16-thread host puts the crossover just under a 512 KiB share -- at
+// 256 KiB per worker the fan-out loses, at 1 MiB it wins by 1.3x-1.4x.
+const MIN_PARALLEL_PRESENT_BYTES_PER_WORKER: usize = 512 * 1024;
+
 // Flash-decoding (split-KV) engages only when a single head's attended KV window
 // is at least this long: below it the per-head path already parallelizes well
 // enough that the split's extra fork-join, per-call scratch allocation, and
@@ -964,37 +972,61 @@ impl GroupQueryAttentionKernel {
         present_sequence_length: usize,
         cache_dim: usize,
     ) {
-        for (b, &past_len) in past_lengths.iter().enumerate() {
-            for h in 0..self.kv_num_heads {
-                let head = b * self.kv_num_heads + h;
-                let dst_base = head * present_sequence_length * cache_dim;
-                // `present_k`/`present_v` and the past caches are both
-                // BNSH-contiguous, so for a fixed (b, h) the `[s, d]` block is
-                // a single contiguous run in each: widen the whole past prefix
-                // directly into `present` (F16C for f16), skipping the separate
-                // owned widen + f32 copy the decode path used to pay every token.
-                if past_len > 0 {
-                    let copy = past_len * cache_dim;
-                    let pk = past_key.expect("past_len > 0 implies a past key cache");
-                    let pv = past_value.expect("past_len > 0 implies a past value cache");
-                    let src = head * pk.seq * cache_dim;
-                    pk.widen_run(src, &mut present_k[dst_base..dst_base + copy]);
-                    pv.widen_run(src, &mut present_v[dst_base..dst_base + copy]);
-                }
-                // Append the current token(s) directly after the past prefix;
-                // the current K/V blocks are contiguous in `[s, d]` as well.
-                let cur = k.seq * cache_dim;
-                let dst_cur = dst_base + past_len * cache_dim;
-                let src_cur = head * k.seq * cache_dim;
-                present_k[dst_cur..dst_cur + cur].copy_from_slice(&k.data[src_cur..src_cur + cur]);
-                present_v[dst_cur..dst_cur + cur].copy_from_slice(&v.data[src_cur..src_cur + cur]);
-                // Zero only the unattended tail rows [total, present_seq).
-                let tail_start = dst_base + totals[b] * cache_dim;
-                let tail_end = dst_base + present_sequence_length * cache_dim;
-                if tail_start < tail_end {
-                    present_k[tail_start..tail_end].fill(0.0);
-                    present_v[tail_start..tail_end].fill(0.0);
-                }
+        let rows = past_lengths.len() * self.kv_num_heads;
+        let row_len = present_sequence_length * cache_dim;
+        // `present_*` and the past caches are both BNSH-contiguous, so for a
+        // fixed (batch, kv-head) the `[s, d]` block is a single contiguous run
+        // in each: widen the whole past prefix straight into `present` (F16C for
+        // f16), append the current step after it, then zero whatever unattended
+        // capacity is left. Each row touches a disjoint destination range, which
+        // is what lets the fan-out below be safe.
+        let fill_row = |row_index: usize, dst: &mut [f32], past: Option<&PastCache>, cur: &Bhsd| {
+            let b = row_index / self.kv_num_heads;
+            let past_len = past_lengths[b];
+            if past_len > 0 {
+                let cache = past.expect("a nonzero past length implies a past cache");
+                let src = row_index * cache.seq * cache_dim;
+                cache.widen_run(src, &mut dst[..past_len * cache_dim]);
+            }
+            let cur_len = cur.seq * cache_dim;
+            let cur_start = past_len * cache_dim;
+            let src_cur = row_index * cur.seq * cache_dim;
+            dst[cur_start..cur_start + cur_len]
+                .copy_from_slice(&cur.data[src_cur..src_cur + cur_len]);
+            let tail_start = totals[b] * cache_dim;
+            if tail_start < row_len {
+                dst[tail_start..row_len].fill(0.0);
+            }
+        };
+
+        // The fill is pure memory traffic, so it only pays to fan out once the
+        // cache is large enough that the copy dominates the dispatch. Below the
+        // threshold a single-threaded pass is both faster and cheaper.
+        let workers = crate::kernels::matmul_nbits::active_decode_worker_count().max(1);
+        let per_worker_bytes = row_len * size_of::<f32>() * rows.div_ceil(workers.min(rows.max(1)));
+        if rows > 1 && workers > 1 && per_worker_bytes >= MIN_PARALLEL_PRESENT_BYTES_PER_WORKER {
+            crate::kernels::matmul_nbits::decode_parallel_output_row_blocks(
+                present_k,
+                row_len,
+                rows,
+                |row_index, dst| fill_row(row_index, dst, past_key, k),
+            );
+            crate::kernels::matmul_nbits::decode_parallel_output_row_blocks(
+                present_v,
+                row_len,
+                rows,
+                |row_index, dst| fill_row(row_index, dst, past_value, v),
+            );
+        } else {
+            for row_index in 0..rows {
+                let base = row_index * row_len;
+                fill_row(row_index, &mut present_k[base..base + row_len], past_key, k);
+                fill_row(
+                    row_index,
+                    &mut present_v[base..base + row_len],
+                    past_value,
+                    v,
+                );
             }
         }
     }
