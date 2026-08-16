@@ -258,6 +258,12 @@ pub(crate) fn tanh_f32_slice(input: &[f32], output: &mut [f32]) {
 /// `x < 0 -> NaN`, `+Inf -> +Inf`, subnormals exact. Nothing here trades
 /// accuracy for speed; the win is eight lanes per instruction plus the caller
 /// no longer materialising an intermediate `Vec` per call.
+///
+/// Both instructions read the same `MXCSR`, so the equivalence also holds under
+/// flush-to-zero / denormals-are-zero: if the host process has set `FTZ`/`DAZ`
+/// then subnormals are flushed by the replacement exactly as they were by the
+/// code it replaces. "Subnormals exact" above is a statement about the default
+/// `MXCSR`, not a guarantee this kernel adds or removes.
 pub(crate) fn sqrt_f32_slice(input: &[f32], output: &mut [f32]) {
     dispatch!(input, output, f32::sqrt, sqrt_avx2);
 }
@@ -828,14 +834,16 @@ mod tests {
     /// the ones where a "fast" reciprocal-sqrt implementation would not. Every
     /// length in `0..=64` is covered so the 8-wide body and the masked tail are
     /// both exercised at every offset, and lengths below `SIMD_MIN_LEN` prove
-    /// the scalar dispatch arm agrees too.
+    /// the scalar dispatch arm agrees too. Negative inputs are interleaved so
+    /// the NaN-producing lanes run through the vector body as well, not only
+    /// through `sqrt_special_values`.
     #[test]
     fn sqrt_is_bit_identical_to_scalar_at_every_length() {
         let base: Vec<f32> = (0..64)
             .map(|i| {
                 // A spread that includes exact squares, non-squares, subnormals
                 // and values whose sqrt is not representable.
-                match i % 8 {
+                let v = match i % 8 {
                     0 => i as f32,
                     1 => 1.0 / (i as f32 + 1.0),
                     2 => (i as f32) * 1e-30,
@@ -844,7 +852,10 @@ mod tests {
                     5 => (i * i) as f32,
                     6 => 2.0f32.powi(i - 32),
                     _ => (i as f32) + 0.5,
-                }
+                };
+                // Every third lane is negative, so the vector body has to
+                // produce NaN in arbitrary lane positions.
+                if i % 3 == 1 { -v } else { v }
             })
             .collect();
         for len in 0..=64usize {

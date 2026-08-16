@@ -551,7 +551,14 @@ impl Kernel for UnaryKernel {
                 |x, y| match op {
                     UnOp::Tanh => simd_activations::tanh_f32_slice(x, y),
                     UnOp::Sqrt => simd_activations::sqrt_f32_slice(x, y),
-                    UnOp::Erf => unreachable!("Erf keeps the exact scalar path"),
+                    // Unreachable today (the gate above only admits the two
+                    // arms), but a scalar fallback beats a panic if the gate
+                    // and this match ever drift apart.
+                    UnOp::Erf => {
+                        for (o, v) in y.iter_mut().zip(x) {
+                            *o = op.apply(*v);
+                        }
+                    }
                 },
             );
         }
