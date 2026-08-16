@@ -441,6 +441,17 @@ impl NativeDecodeSession {
     /// derivation yields at least one recurrent state pair — the exact case the
     /// shape-inference path cannot resolve. Non-KV ports (token/mask/position/
     /// logits) are bound by conventional-name presence in the graph interface.
+    ///
+    /// The state-pair condition is enforced *here* rather than inside the shared
+    /// derivation. #1012 widened that derivation to fire on KV ports so a
+    /// DeepSeek-V2 MLA package, whose scalar `decoder.head_size` cannot express
+    /// asymmetric KV, gets a port contract instead of failing its load. That is
+    /// right for the genai-config path, whose caller has already established that
+    /// no contract exists — but it is wrong here, where returning `None` still
+    /// leaves a working shape-inference path. Letting it fire on dense graphs
+    /// silently auto-bound roles that this path is supposed to refuse, so a
+    /// decoder with genuinely ambiguous ports loaded against guessed bindings
+    /// instead of demanding `model.io`.
     fn derive_fallback_io(session: &InferenceSession) -> Option<ModelIoSpec> {
         let to_graph_tensor =
             |meta: &onnx_runtime_session::IoMeta| onnx_genai_genai_config::GraphTensorInfo {
@@ -459,7 +470,14 @@ impl NativeDecodeSession {
             inputs: session.inputs().iter().map(to_graph_tensor).collect(),
             outputs: session.outputs().iter().map(to_graph_tensor).collect(),
         };
-        onnx_genai_genai_config::GenAiConfig::derive_model_io_spec_from_graph(&graph)
+        onnx_genai_genai_config::GenAiConfig::derive_model_io_spec_from_graph(&graph).filter(
+            |derived| {
+                derived
+                    .state_pairs
+                    .as_ref()
+                    .is_some_and(|pairs| !pairs.is_empty())
+            },
+        )
     }
 
     fn from_session_with_cuda_options_and_io(
