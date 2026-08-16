@@ -74,6 +74,7 @@ clap = { workspace = true }
 # `transfer-probe` feature). `dynamic-loading` keeps the no-build-time-toolkit
 # property: the driver is dlopen'd at runtime. Exactly one `cuda-*` version is
 # selected transitively via this crate's `cuda-*` features (default 13.0).
+half = { workspace = true }
 cudarc = { version = "0.19", default-features = false, features = [
     "std",
     "driver",
