@@ -305,6 +305,45 @@ fn resolve_decode_min(raw: Option<&str>, available: usize) -> usize {
         .unwrap_or_else(|| default_sqnbit_decode_min(available))
 }
 
+/// Whether this host has a native int8 dot-product instruction behind the hand
+/// int4/int8 `accuracy_level = 4` decode kernels.
+///
+/// The `m < sqnbit_decode_min()` short-circuit in [`Kernel::try_mlas_sqnbit`]
+/// exists because the hand decode kernels beat MLAS SQNBit CompInt8 at small
+/// `m` while also avoiding MLAS's one-time packing. That is only true where the
+/// int8 accumulation is a single instruction:
+///
+/// * x86_64 needs AVX-VNNI or AVX-512-VNNI (`vpdpbusd`). Without it the AVX2
+///   fallback emulates the dot with `vpmaddubsw` + `vpmaddwd` + widening adds,
+///   and it loses badly. Measured on an AVX2-only AMD EPYC 9V74 against ORT
+///   1.27's CPU EP, both pinned to 8 intra-op threads, int4 block-32 M=1:
+///   0.762 ms on the hand path vs 0.079 ms once MLAS SQNBit takes the node --
+///   a 9.6x regression, or 16.1x vs ORT instead of 1.9x.
+/// * aarch64 is unconditionally true: NEON is baseline on ARM64, so
+///   [`DotKernel::Neon`]/[`DotKernel::NeonDot`] always have a real dot product
+///   and the previous behaviour is preserved exactly.
+/// * Every other architecture runs the scalar `DotKernel`, which has no dot
+///   product at all, so MLAS (when present) should take the node.
+///
+/// This deliberately reads the *selected* kernel rather than probing CPUID
+/// directly, so `ONNX_GENAI_CPU_DOT_KERNEL`-style overrides and the test
+/// harness stay consistent with what actually executes.
+#[cfg(feature = "mlas")]
+fn hand_int8_decode_has_native_dot() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        selected_dot_kernel().uses_vnni_int4_direct()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        true
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
 pub struct MatMulNBitsKernel {
     k: usize,
     n: usize,
@@ -1440,8 +1479,25 @@ impl MatMulNBitsKernel {
         // explicitly opted in on non-Apple ARM64, the vendored MLAS QNBit path
         // can serve accuracy-4 qsi4/qsi8 decode with the same KleidiAI kernels
         // ORT uses.
-        let hand_decode_is_fast =
-            self.bits == 4 && self.accuracy_level == 4 && !prefer_arm64_mlas_decode;
+        //
+        // "Fast" is a claim about the *host*, not about the source: the hand
+        // int4/int8 decode kernels are only competitive where the CPU has a
+        // native int8 dot product to dispatch to (see
+        // `hand_int8_decode_has_native_dot`). On a host without one they lose to
+        // MLAS SQNBit CompInt8 by an order of magnitude, so the short-circuit
+        // must not fire there.
+        //
+        // ...unless there is nothing to amortize MLAS's packing against.
+        // Without constant weights (`can_prepack == false`) the packed buffer
+        // cannot be cached in `mlas_shards`/`mlas_packed`, so MLAS would repack
+        // on *every* call -- measured at 55.8 ms for a 6.4 MB int4 weight
+        // (`ONNX_GENAI_PROFILE_MM=1`), against a sub-millisecond decode. Dynamic
+        // weights keep the hand path regardless of ISA; a slow kernel still
+        // beats repacking the whole weight per token.
+        let hand_decode_is_fast = self.bits == 4
+            && self.accuracy_level == 4
+            && !prefer_arm64_mlas_decode
+            && (!can_prepack || hand_int8_decode_has_native_dot());
         if m < sqnbit_decode_min() && hand_decode_is_fast {
             return Ok(None);
         }
@@ -8033,6 +8089,30 @@ mod tests {
             prepack_cache_ptr(&kernel).expect("selected accuracy-4 weight cache must be reused");
         assert_eq!(reused, cached);
         assert!(kernel.weight_nk.get().is_none());
+        // On a host whose hand int8 decode has no native dot product, MLAS
+        // SQNBit CompInt8 owns accuracy-4 decode instead (see
+        // `hand_int8_decode_has_native_dot`). The invariant under test -- one
+        // weight format, chosen once and reused, never the f32 expansion --
+        // holds either way; only *which* cache holds it differs.
+        #[cfg(feature = "mlas")]
+        if !hand_int8_decode_has_native_dot() {
+            assert!(
+                kernel
+                    .mlas_shards
+                    .get()
+                    .is_some_and(|shards| shards.is_some())
+                    || kernel
+                        .mlas_packed
+                        .get()
+                        .is_some_and(|packed| packed.is_some()),
+                "accuracy-4 decode must reach MLAS SQNBit where the hand int8 kernel has no native dot product"
+            );
+            assert!(
+                kernel.int8_weight.get().is_none(),
+                "MLAS-owned accuracy-4 decode must not also build the hand int8 weight"
+            );
+            return;
+        }
         assert_eq!(
             kernel.packed_int4_weight.get().is_some()
                 || kernel.packed_int4_n16_weight.get().is_some()
@@ -12910,12 +12990,24 @@ mod tests {
     }
 
     /// M-based hybrid routing gate: with an otherwise-eligible int4 case
-    /// (`accuracy_level == 4`, so the hand decode path is fast) and the MLAS
-    /// backend selected, `try_mlas_sqnbit` must still fall back (`Ok(None)`) for
-    /// `m` below the decode crossover (decode keeps the hand path) and serve
-    /// MLAS (`Ok(Some(()))`) for `m` at/above it (prefill). This regression-locks
-    /// the decode/prefill split. Uses the topology-derived default threshold; the
-    /// host must have an MLAS SQNBit int4 kernel or the assertions are skipped.
+    /// (`accuracy_level == 4`) and the MLAS backend selected, `try_mlas_sqnbit`
+    /// must fall back (`Ok(None)`) for `m` below the decode crossover -- decode
+    /// keeps the hand path -- and serve MLAS (`Ok(Some(()))`) for `m` at/above
+    /// it (prefill). This regression-locks the decode/prefill split. Uses the
+    /// topology-derived default threshold; the host must have an MLAS SQNBit
+    /// int4 kernel or the assertions are skipped.
+    ///
+    /// The decode half of the split is conditional on the host actually having a
+    /// native int8 dot product behind the hand kernels
+    /// (`hand_int8_decode_has_native_dot`). Where it does not, keeping decode on
+    /// the hand path is the *wrong* answer -- measured 9.6x slower than letting
+    /// MLAS take it -- so `Some(())` below the crossover is the expected result
+    /// there, and this test asserts that instead.
+    ///
+    /// Weights are declared constant (`can_prepack = true`) because that is the
+    /// only case where the ISA question is live: dynamic weights always keep the
+    /// hand path (see
+    /// `matmulnbits_accuracy4_dynamic_weight_decode_keeps_hand_path`).
     #[cfg(feature = "mlas")]
     #[test]
     fn matmulnbits_try_mlas_gates_decode_by_m_threshold() {
@@ -12963,7 +13055,7 @@ mod tests {
                     &scales_t.view(),
                     None,
                     None,
-                    false,
+                    true,
                     &a,
                     m,
                     None,
@@ -12983,11 +13075,107 @@ mod tests {
             }
         }
 
-        assert_eq!(
-            decode, None,
-            "m={below} (< {at}) must fall back to the hand int4 path",
-        );
+        if hand_int8_decode_has_native_dot() {
+            assert_eq!(
+                decode, None,
+                "m={below} (< {at}) must fall back to the hand int4 path when the host has a native int8 dot product",
+            );
+        } else {
+            assert_eq!(
+                decode,
+                Some(()),
+                "m={below} (< {at}) must route to MLAS SQNBit when the hand int8 kernel has no native dot product to dispatch to",
+            );
+        }
         assert_eq!(prefill, Some(()), "m={at} must route to MLAS SQNBit",);
+    }
+
+    /// The decode-crossover short-circuit must be a claim about the host, not a
+    /// constant: it may only fire where the hand int8 kernels have a real int8
+    /// dot product to dispatch to.
+    ///
+    /// The x86_64 arm cross-checks against **CPUID directly** rather than
+    /// against `selected_dot_kernel().uses_vnni_int4_direct()`, which is the
+    /// implementation itself and would be a tautology. Restricted to the default
+    /// selection: an explicit `ONNX_GENAI_CPU_DOT_KERNEL` override may
+    /// legitimately choose a weaker kernel than the hardware supports, and the
+    /// predicate must follow what actually executes, not what CPUID advertises.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn hand_int8_decode_native_dot_matches_host_capability() {
+        let has_native_dot = hand_int8_decode_has_native_dot();
+        #[cfg(target_arch = "x86_64")]
+        if std::env::var_os("ONNX_GENAI_CPU_DOT_KERNEL").is_none() {
+            let host_has_vnni = std::arch::is_x86_feature_detected!("avx512vnni")
+                || std::arch::is_x86_feature_detected!("avxvnni");
+            assert_eq!(
+                has_native_dot, host_has_vnni,
+                "x86_64 needs AVX-VNNI/AVX-512-VNNI (vpdpbusd); the AVX2 vpmaddubsw/vpmaddwd \
+                 emulation is not competitive with MLAS SQNBit CompInt8"
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        assert!(
+            has_native_dot,
+            "NEON is baseline on aarch64, so the hand decode path always has a dot product"
+        );
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        assert!(
+            !has_native_dot,
+            "the scalar DotKernel has no dot product, so MLAS should take the node"
+        );
+    }
+
+    /// The dynamic-weight decline: with non-constant `B` there is no
+    /// session-lifetime cache to amortize MLAS's packing against, so decode must
+    /// stay on the hand path even on a host with no native int8 dot product.
+    /// Repacking a multi-megabyte weight per token is worse than any kernel.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn matmulnbits_accuracy4_dynamic_weight_decode_keeps_hand_path() {
+        let (k, n, block_size) = (128, 16, 32);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let scales_t = Owned::f32(&[n, 4], &scales);
+        let b = Owned::u8(&[n, 4, 16], &packed);
+        let kernel = accuracy4_kernel(k, n, block_size);
+
+        let _guard = backend_env_lock().lock().unwrap();
+        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
+        // SAFETY: the backend env lock serializes readers/writers of this var.
+        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+
+        let a = pseudo(k, 0.8);
+        let mut result = vec![0.0f32; n];
+        let routed = kernel
+            .try_mlas_sqnbit(
+                &b.view(),
+                &scales_t.view(),
+                None,
+                None,
+                false, // can_prepack = false: dynamic weights
+                &a,
+                1,
+                None,
+                &mut result,
+            )
+            .unwrap();
+
+        // SAFETY: still holding the backend env lock; restore prior value.
+        unsafe {
+            match &previous {
+                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
+                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
+            }
+        }
+
+        assert_eq!(
+            routed, None,
+            "dynamic-weight accuracy-4 decode must keep the hand path: MLAS would repack the \
+             whole weight on every call with no cache to amortize it against"
+        );
     }
 
     /// Slow-hand-path decode routing: for `m == 1` with `bits == 4` but
