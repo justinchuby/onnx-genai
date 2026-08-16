@@ -5342,9 +5342,10 @@ fn borrowed_affine_int4_matmul(
 ) {
     debug_assert_eq!(activations.len(), m * k);
     debug_assert_eq!(result.len(), m * n);
-    // `dot_kernel` is consumed only by the `#[cfg(target_arch = "aarch64")]`
-    // fast paths below; discard it on other targets to avoid an unused-variable
-    // error under `-D warnings` (mirrors the sibling matmul helpers).
+    // `dot_kernel` drives the SIMD fast paths below: the `aarch64` NEON route
+    // and the `x86_64` AVX2/AVX-512 f32 route. On other targets it is unused, so
+    // discard it there to avoid an unused-variable error under `-D warnings`.
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let _ = dot_kernel;
     let bits = 4usize;
     let layout = NBitsLayout { bits, block_size };
@@ -5403,6 +5404,21 @@ fn borrowed_affine_int4_matmul(
                         sum += (dot - activation_sums[block] * zero_point) * scale;
                         continue;
                     }
+                    #[cfg(target_arch = "x86_64")]
+                    if valid == block_size && valid.is_multiple_of(32) {
+                        // Vectorised int4 unpack + f32 FMA for the x86 borrowed
+                        // path (issue #994). Falls through to the scalar loop
+                        // when the host has no AVX2 (`DotKernel::Scalar`), so
+                        // correctness never depends on the fast path existing.
+                        if let Some(vec_dot) = borrowed_int4_block_dot_x86(
+                            &activation[depth_start..depth_start + valid],
+                            block_values,
+                            dot_kernel,
+                        ) {
+                            sum += (vec_dot - activation_sums[block] * zero_point) * scale;
+                            continue;
+                        }
+                    }
                     dot = 0.0;
                     for (byte_index, &byte) in block_values.iter().enumerate() {
                         let within = byte_index * 2;
@@ -5420,6 +5436,175 @@ fn borrowed_affine_int4_matmul(
         };
         parallel_output_rows(output_row, k, compute);
     }
+}
+
+/// Whether the x86 SIMD borrowed int4 path (issue #994) is enabled. On by
+/// default; set `ONNX_GENAI_CPU_DISABLE_INT4_SIMD=1` to fall back to the scalar
+/// unpack loop. This is an A/B escape hatch so the vectorised kernel can be
+/// diffed against the scalar reference in the *same* binary (same-run A/B is
+/// more trustworthy than a cross-build comparison). Resolved once via a
+/// `OnceLock`, mirroring `arm64_int4_direct_enabled`, so the per-token decode
+/// path never takes the process-wide env lock or allocates.
+#[cfg(target_arch = "x86_64")]
+fn int4_borrowed_simd_enabled() -> bool {
+    #[cfg(test)]
+    {
+        // Tests exercise the SIMD path directly; the escape hatch is not read.
+        true
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("ONNX_GENAI_CPU_DISABLE_INT4_SIMD").map_or(true, |value| {
+                let value = value.trim();
+                value.is_empty() || value == "0"
+            })
+        })
+    }
+}
+
+/// Dispatch one int4 borrowed-path block dot (`sum(activation[j] * nibble[j])`,
+/// nibbles as raw `0..=15`) to the widest available x86 SIMD f32 kernel.
+///
+/// `activation.len()` must equal the (full) block length and be a multiple of
+/// 32; `packed` holds `activation.len() / 2` bytes in the same low-then-high
+/// nibble interleave the scalar loop reads. Returns `None` for
+/// [`DotKernel::Scalar`] (no AVX2) so the caller keeps the scalar reference.
+///
+/// This is the f32 analogue of the aarch64 `affine_int4_block32_dot_neon`
+/// route: the per-block scale and the zero-point correction stay in the caller,
+/// so symmetric (`zero_points = None`, implicit midpoint 8) and asymmetric
+/// weights both work unchanged. The nibble unpack and the multiply-accumulate
+/// are vectorised; nothing dequantised outlives the call, so the #979
+/// zero-copy footprint is preserved.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn borrowed_int4_block_dot_x86(
+    activation: &[f32],
+    packed: &[u8],
+    dot_kernel: DotKernel,
+) -> Option<f32> {
+    debug_assert_eq!(activation.len() % 32, 0);
+    debug_assert_eq!(packed.len(), activation.len() / 2);
+    if !int4_borrowed_simd_enabled() {
+        // A/B escape hatch: fall back to the scalar reference loop so the SIMD
+        // path can be diffed against it in the same binary (issue #994).
+        return None;
+    }
+    match dot_kernel {
+        // AVX-512F is a superset of AVX2; `Avx512Vnni` is selected only after
+        // `avx512f` was runtime-detected. Use the 512-bit f32 kernel.
+        DotKernel::Avx512Vnni => {
+            // SAFETY: selected_dot_kernel confirmed AVX2 + AVX-512F for this
+            // host, and the length invariants above hold.
+            Some(unsafe { borrowed_int4_block_dot_avx512(activation, packed) })
+        }
+        // Both plain AVX2 and AVX-VNNI hosts have AVX2 + FMA3 (FMA3 shipped
+        // with the first AVX2 cores); the borrowed path is f32, so VNNI's
+        // integer dot does not apply — the AVX2 f32 kernel serves both.
+        DotKernel::Avx2 | DotKernel::AvxVnni => {
+            // SAFETY: selected_dot_kernel confirmed AVX2 for this host, which
+            // implies FMA3, and the length invariants above hold.
+            Some(unsafe { borrowed_int4_block_dot_avx2(activation, packed) })
+        }
+        DotKernel::Scalar => None,
+    }
+}
+
+/// AVX2 + FMA int4 block dot for the borrowed path. Unpacks the packed nibbles
+/// into the natural `w[2i]=lo(byte i)`, `w[2i+1]=hi(byte i)` order, widens them
+/// to f32, and accumulates `activation[j] * w[j]` over the block. Processes the
+/// block in 32-lane chunks (16 packed bytes each) into a single 256-bit
+/// accumulator, so blocks larger than 32 (e.g. block-128) also vectorise.
+///
+/// The horizontal reduction reorders the additions relative to the scalar
+/// loop, so the f32 result can differ from the scalar reference by a few ULP;
+/// it is not a bit-identical transform. Callers rely on argmax stability, not
+/// on bit-identity (see the borrowed-path parity tests).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn borrowed_int4_block_dot_avx2(activation: &[f32], packed: &[u8]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mask = _mm_set1_epi8(0x0f);
+    let mut acc = _mm256_setzero_ps();
+    let chunks = activation.len() / 32;
+    for chunk in 0..chunks {
+        // SAFETY: `packed.len() == activation.len() / 2`, so 16 bytes per chunk
+        // are in bounds; loadu permits unaligned pointers.
+        let bytes = unsafe { _mm_loadu_si128(packed.as_ptr().add(chunk * 16).cast()) };
+        let low = _mm_and_si128(bytes, mask);
+        let high = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+        // Interleave low/high nibbles byte-wise to reproduce the scalar order
+        // w0=lo(b0), w1=hi(b0), w2=lo(b1), ...
+        let inter_lo = _mm_unpacklo_epi8(low, high); // weights 0..=15
+        let inter_hi = _mm_unpackhi_epi8(low, high); // weights 16..=31
+        let base = chunk * 32;
+        // Four groups of 8 weights: zero-extend u8 -> i32 -> f32, fmadd with the
+        // matching 8 activations.
+        let w0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(inter_lo));
+        // SAFETY: base + 32 <= activation.len(); loadu permits unaligned.
+        let a0 = unsafe { _mm256_loadu_ps(activation.as_ptr().add(base)) };
+        acc = _mm256_fmadd_ps(a0, w0, acc);
+
+        let w1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(inter_lo, 8)));
+        // SAFETY: base + 32 <= activation.len(); loadu permits unaligned.
+        let a1 = unsafe { _mm256_loadu_ps(activation.as_ptr().add(base + 8)) };
+        acc = _mm256_fmadd_ps(a1, w1, acc);
+
+        let w2 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(inter_hi));
+        // SAFETY: base + 32 <= activation.len(); loadu permits unaligned.
+        let a2 = unsafe { _mm256_loadu_ps(activation.as_ptr().add(base + 16)) };
+        acc = _mm256_fmadd_ps(a2, w2, acc);
+
+        let w3 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(inter_hi, 8)));
+        // SAFETY: base + 32 <= activation.len(); loadu permits unaligned.
+        let a3 = unsafe { _mm256_loadu_ps(activation.as_ptr().add(base + 24)) };
+        acc = _mm256_fmadd_ps(a3, w3, acc);
+    }
+    // Horizontal sum of the 8 f32 lanes.
+    let lo = _mm256_castps256_ps128(acc);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let sum4 = _mm_add_ps(lo, hi);
+    let sum2 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+    let sum1 = _mm_add_ss(sum2, _mm_shuffle_ps(sum2, sum2, 0x55));
+    _mm_cvtss_f32(sum1)
+}
+
+/// AVX-512F int4 block dot for the borrowed path. Same math and unpack as
+/// [`borrowed_int4_block_dot_avx2`], but widens 16 nibbles at a time into a
+/// 512-bit f32 accumulator. Selected only on hosts where `selected_dot_kernel`
+/// detected AVX-512F. Cannot be exercised on AVX2-only hardware; kept behind the
+/// runtime `Avx512Vnni` dispatch so AVX2-only builds never call it.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f")]
+unsafe fn borrowed_int4_block_dot_avx512(activation: &[f32], packed: &[u8]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mask = _mm_set1_epi8(0x0f);
+    let mut acc = _mm512_setzero_ps();
+    let chunks = activation.len() / 32;
+    for chunk in 0..chunks {
+        // SAFETY: `packed.len() == activation.len() / 2`, so 16 bytes per chunk
+        // are in bounds; loadu permits unaligned pointers.
+        let bytes = unsafe { _mm_loadu_si128(packed.as_ptr().add(chunk * 16).cast()) };
+        let low = _mm_and_si128(bytes, mask);
+        let high = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+        let inter_lo = _mm_unpacklo_epi8(low, high); // weights 0..=15
+        let inter_hi = _mm_unpackhi_epi8(low, high); // weights 16..=31
+        let base = chunk * 32;
+        // 16 nibbles per half -> 16 i32 -> 16 f32.
+        let w_lo = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(inter_lo));
+        let w_hi = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(inter_hi));
+        // SAFETY: base + 32 <= activation.len(); loadu permits unaligned.
+        let a_lo = unsafe { _mm512_loadu_ps(activation.as_ptr().add(base)) };
+        // SAFETY: base + 32 <= activation.len(); loadu permits unaligned.
+        let a_hi = unsafe { _mm512_loadu_ps(activation.as_ptr().add(base + 16)) };
+        acc = _mm512_fmadd_ps(a_lo, w_lo, acc);
+        acc = _mm512_fmadd_ps(a_hi, w_hi, acc);
+    }
+    _mm512_reduce_add_ps(acc)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -11505,6 +11690,47 @@ mod tests {
 
         assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
         probe.assert_fast_route(&kernel, false);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn borrowed_int4_block_dot_x86_matches_scalar_reference() {
+        // The x86 SIMD borrowed int4 block dot (#994) must reproduce the scalar
+        // `sum(activation[j] * nibble[j])` reference within f32 rounding for the
+        // block sizes the borrowed path feeds it (32 and multiples). Single-chunk
+        // (32) and multi-chunk (64/128) both exercise the accumulator loop.
+        fn scalar_dot(activation: &[f32], packed: &[u8]) -> f32 {
+            let mut dot = 0.0f32;
+            for (byte_index, &byte) in packed.iter().enumerate() {
+                dot += activation[2 * byte_index] * (byte & 0x0f) as f32;
+                dot += activation[2 * byte_index + 1] * (byte >> 4) as f32;
+            }
+            dot
+        }
+        let kernel = selected_dot_kernel();
+        if matches!(kernel, DotKernel::Scalar) {
+            return; // Host has no AVX2; the borrowed path uses the scalar loop.
+        }
+        for &len in &[32usize, 64, 128] {
+            let activation: Vec<f32> = (0..len)
+                .map(|i| ((i * 13 % 29) as f32 - 14.0) / 7.0)
+                .collect();
+            let packed: Vec<u8> = (0..len / 2)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(5))
+                .collect();
+            let simd = borrowed_int4_block_dot_x86(&activation, &packed, kernel)
+                .expect("non-scalar kernel returns Some");
+            let scalar = scalar_dot(&activation, &packed);
+            let tol = scalar.abs() * 1e-5 + 1e-4;
+            assert!(
+                (simd - scalar).abs() <= tol,
+                "len={len} kernel={kernel:?} simd={simd} scalar={scalar}"
+            );
+        }
+        // Scalar dispatch declines so the caller keeps the scalar reference.
+        assert!(
+            borrowed_int4_block_dot_x86(&[0.0f32; 32], &[0u8; 16], DotKernel::Scalar).is_none()
+        );
     }
 
     #[test]
