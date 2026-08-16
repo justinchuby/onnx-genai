@@ -190,7 +190,15 @@ const SHARDS: usize = 8;
 /// Returns `None` when nothing could be established, which on a non-Linux target
 /// is the normal answer — there the flat cap applies.
 fn process_memory_allowance() -> Option<u64> {
-    #[cfg(target_os = "linux")]
+    // Miri has no filesystem (isolation is on) and models no OS memory policy,
+    // so probing for one is both impossible and meaningless there. The flat cap
+    // applies instead; `resolve_cgroup_limit`'s own tests still run under Miri
+    // because they are I/O-free by construction.
+    #[cfg(miri)]
+    {
+        None
+    }
+    #[cfg(all(target_os = "linux", not(miri)))]
     {
         if let Some(limit) = cgroup_limit_bytes() {
             return Some(limit);
@@ -212,7 +220,7 @@ fn process_memory_allowance() -> Option<u64> {
         }
         None
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(not(target_os = "linux"), not(miri)))]
     {
         None
     }
@@ -396,6 +404,13 @@ pub fn calibrate_floor_bytes() -> usize {
     const FAULTING_NS_PER_PAGE: f64 = 60.0;
     /// Hard stop, so a pathological machine cannot make construction hang.
     const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+
+    // Miri interprets every store, so touching a 256 MiB ladder rung page by
+    // page would take minutes, and its modelled allocator has none of the
+    // adaptive behaviour the probe exists to detect. Report the static floor.
+    if cfg!(miri) {
+        return FALLBACK_FLOOR_BYTES;
+    }
 
     let started = std::time::Instant::now();
     let mut size = LADDER_START;
