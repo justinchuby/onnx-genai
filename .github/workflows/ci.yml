@@ -267,7 +267,20 @@ jobs:
       # x86_64-apple-darwin changes target_arch but leaves target_os="macos",
       # so cfg(target_os) errors are invisible.  This step uses a genuine Linux
       # target that exercises BOTH dimensions.  PR #317 proved the gap.
-      - name: Cross-target compile check (catches os-gating errors)
+      # The script also runs a second pass against aarch64-unknown-linux-gnu:
+      # every other blocking lane builds target_arch="x86_64", so items that
+      # are only reachable from cfg(target_arch="x86_64") code look live in all
+      # of them and are dead code on ARM64 (#1037 broke both ARM64 lanes that
+      # way).  That pass needs a real cross toolchain, not just a rustup
+      # target: ort-sys runs bindgen for the target, so clang needs arm64 libc
+      # headers, and onnx-runtime-cpuinfo's cmake build script compiles C for
+      # the target.  Without them the script hard-fails on CI rather than
+      # quietly checking a subset that excludes onnx-runtime-ep-cpu.
+      - name: Install the aarch64 cross toolchain for the cross-arch pass
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: Cross-target compile check (catches os- and arch-gating errors)
         run: bash scripts/check_cross_compile.sh
 
       # onnx-genai-engine's native decode path only compiles when this feature
