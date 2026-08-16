@@ -492,6 +492,108 @@ pub(crate) fn erf_gelu_bias_f32_slice(
 }
 
 // ---------------------------------------------------------------------------
+// Exact (bit-identical) elementwise kernels
+// ---------------------------------------------------------------------------
+//
+// Unlike the rest of this module these are **not** approximations. Each is a
+// sign-bit mask, an IEEE-754 division, or `vroundps` in an explicit rounding
+// mode, so the vector body, the masked tail and the scalar fallback all produce
+// bit-identical results — `-0.0`, `±Inf`, subnormals and NaN payloads included.
+// There is no `SIMD_MIN_LEN` accuracy seam here, only a throughput one.
+//
+// They needed their own kernels because `UnaryMathKernel::execute_f32` used to
+// hand `write_mapped` a closure that ran `MathOp::apply` — a 24-arm `match` —
+// *inside* the element loop. LLVM could not hoist it, so even `Neg`, which is
+// one `vxorps`, compiled to a per-element jump table. Measured against ORT that
+// put `Neg` at 0.049x at 1M elements while the plugin EP was claiming the op.
+// ---------------------------------------------------------------------------
+
+/// `y = -x`. Flips the sign bit; exact for every input, `NaN` keeps its payload
+/// with the sign flipped and `-0.0 -> +0.0`.
+pub(crate) fn neg_f32_slice(input: &[f32], output: &mut [f32]) {
+    dispatch!(input, output, |v: f32| -v, neg_avx2);
+}
+
+/// `y = |x|`. Clears the sign bit; exact, and `|NaN|` keeps its payload.
+pub(crate) fn abs_f32_slice(input: &[f32], output: &mut [f32]) {
+    dispatch!(input, output, f32::abs, abs_avx2);
+}
+
+/// `y = 1 / x`.
+///
+/// `vdivps`, **not** `vrcpps`: the reciprocal approximation carries only ~12
+/// bits and would break the bit-exactness this group promises. Division is
+/// correctly rounded, so this matches `1.0 / x` exactly, including
+/// `1/+0 = +Inf` and `1/-0 = -Inf`.
+pub(crate) fn reciprocal_f32_slice(input: &[f32], output: &mut [f32]) {
+    dispatch!(input, output, |v: f32| 1.0 / v, reciprocal_avx2);
+}
+
+/// `y = floor(x)`, `vroundps` mode 1 — identical to `f32::floor`.
+pub(crate) fn floor_f32_slice(input: &[f32], output: &mut [f32]) {
+    dispatch!(input, output, f32::floor, floor_avx2);
+}
+
+/// `y = ceil(x)`, `vroundps` mode 2 — identical to `f32::ceil`.
+pub(crate) fn ceil_f32_slice(input: &[f32], output: &mut [f32]) {
+    dispatch!(input, output, f32::ceil, ceil_avx2);
+}
+
+/// `y = round-half-to-even(x)`, `vroundps` mode 0.
+///
+/// ONNX `Round` is banker's rounding, which is `f32::round_ties_even` and
+/// `_MM_FROUND_TO_NEAREST_INT` — *not* `f32::round`, which rounds halves away
+/// from zero.
+pub(crate) fn round_ties_even_f32_slice(input: &[f32], output: &mut [f32]) {
+    dispatch!(input, output, f32::round_ties_even, round_ties_even_avx2);
+}
+
+/// ONNX `Sign`: `-1` / `0` / `+1`, with `sign(±0) = 0` and `sign(NaN) = NaN`.
+///
+/// Built from two *ordered* compares, which are false for `NaN`, so a `NaN`
+/// input falls through both selects and is returned unchanged — matching the
+/// scalar `is_nan()` branch bit-for-bit, payload included.
+pub(crate) fn sign_f32_slice(input: &[f32], output: &mut [f32]) {
+    dispatch!(input, output, sign_scalar, sign_avx2);
+}
+
+/// `y = x / (1 + |x|)`, ONNX `Softsign`.
+///
+/// One `vandps` and one `vdivps`, both exact, so this is bit-identical to the
+/// scalar form rather than an approximation of it.
+pub(crate) fn softsign_f32_slice(input: &[f32], output: &mut [f32]) {
+    dispatch!(input, output, softsign_scalar, softsign_avx2);
+}
+
+/// ONNX `Sign`: `-1` / `0` / `+1`, with `sign(±0) = +0` and `sign(NaN) = NaN`.
+///
+/// The `NaN` input is returned **unchanged**, payload and sign bit included.
+/// This function used to return the canonical `f32::NAN` instead, which
+/// silently rewrote `0xFFC01234` to `0x7FC01234`. ORT 1.28.0's CPU `Sign`
+/// preserves the input bit pattern (verified on both signs and a non-default
+/// payload), and so does the AVX2 path below — its ordered compares are all
+/// false for `NaN`, so the lane falls through every select. Canonicalising was
+/// the odd one out, and it is what made the two paths disagree.
+#[inline]
+pub(crate) fn sign_scalar(x: f32) -> f32 {
+    if x.is_nan() {
+        x
+    } else if x > 0.0 {
+        1.0
+    } else if x < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+/// ONNX `Softsign`: `x / (1 + |x|)`.
+#[inline]
+pub(crate) fn softsign_scalar(x: f32) -> f32 {
+    x / (1.0 + x.abs())
+}
+
+// ---------------------------------------------------------------------------
 // Scalar reference implementations
 //
 // These are the *exact* libm forms, not the polynomial. They are what runs
@@ -930,6 +1032,93 @@ unsafe fn sigmoid_avx2(input: &[f32], output: &mut [f32]) {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn sqrt_avx2(input: &[f32], output: &mut [f32]) {
     unsafe { avx2::map_ps(input, output, |v| core::arch::x86_64::_mm256_sqrt_ps(v)) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn neg_avx2(input: &[f32], output: &mut [f32]) {
+    use core::arch::x86_64::*;
+    // XOR the sign bit. `_mm256_sub_ps(zero, v)` would turn `-0.0` into `+0.0`
+    // correctly but map `NaN` through an arithmetic op; the mask is exact.
+    let sign = _mm256_set1_ps(-0.0);
+    unsafe { avx2::map_ps(input, output, |v| _mm256_xor_ps(v, sign)) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn abs_avx2(input: &[f32], output: &mut [f32]) {
+    use core::arch::x86_64::*;
+    let mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+    unsafe { avx2::map_ps(input, output, |v| _mm256_and_ps(v, mask)) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn reciprocal_avx2(input: &[f32], output: &mut [f32]) {
+    use core::arch::x86_64::*;
+    let one = _mm256_set1_ps(1.0);
+    unsafe { avx2::map_ps(input, output, |v| _mm256_div_ps(one, v)) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn floor_avx2(input: &[f32], output: &mut [f32]) {
+    use core::arch::x86_64::*;
+    unsafe { avx2::map_ps(input, output, |v| _mm256_floor_ps(v)) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn ceil_avx2(input: &[f32], output: &mut [f32]) {
+    use core::arch::x86_64::*;
+    unsafe { avx2::map_ps(input, output, |v| _mm256_ceil_ps(v)) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn round_ties_even_avx2(input: &[f32], output: &mut [f32]) {
+    use core::arch::x86_64::*;
+    unsafe {
+        avx2::map_ps(input, output, |v| {
+            _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(v)
+        })
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sign_avx2(input: &[f32], output: &mut [f32]) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let zero = _mm256_setzero_ps();
+        let one = _mm256_set1_ps(1.0);
+        let minus_one = _mm256_set1_ps(-1.0);
+        avx2::map_ps(input, output, |v| {
+            // `_CMP_GT_OQ`/`_CMP_LT_OQ` are *ordered*: both are false for NaN,
+            // so a NaN lane selects neither `±1` nor `0` and `v` survives.
+            let pos = _mm256_cmp_ps::<_CMP_GT_OQ>(v, zero);
+            let neg = _mm256_cmp_ps::<_CMP_LT_OQ>(v, zero);
+            // Zero (either sign) is ordered-equal to zero, so it takes this
+            // arm and yields `+0.0`, which is what ONNX `Sign` specifies.
+            let eq = _mm256_cmp_ps::<_CMP_EQ_OQ>(v, zero);
+            let out = _mm256_blendv_ps(v, zero, eq);
+            let out = _mm256_blendv_ps(out, one, pos);
+            _mm256_blendv_ps(out, minus_one, neg)
+        })
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn softsign_avx2(input: &[f32], output: &mut [f32]) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let one = _mm256_set1_ps(1.0);
+        let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+        avx2::map_ps(input, output, |v| {
+            _mm256_div_ps(v, _mm256_add_ps(one, _mm256_and_ps(v, abs_mask)))
+        })
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1916,6 +2105,210 @@ mod tests {
                 assert!(
                     f64::from((g - w).abs()) / f64::from(scale) <= GELU_BOUND,
                     "n={n} i={i}: {g} vs {w}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod exact_tests {
+    use super::*;
+
+    /// Every value a `f32` kernel can be asked about that is interesting to a
+    /// sign-bit mask, a division, or a rounding mode.
+    fn adversarial() -> Vec<f32> {
+        let mut v = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            1.5,
+            -1.5,
+            2.5,
+            -2.5,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x8000_0001),
+            f32::MAX,
+            f32::MIN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            f32::from_bits(0x7fc0_1234),
+            f32::from_bits(0xffc0_1234),
+            8_388_608.0,
+            -8_388_608.0,
+            16_777_216.0,
+        ];
+        let mut state = 0x1234_5678u32;
+        for _ in 0..4096 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let f = f32::from_bits(state);
+            if f.is_finite() {
+                v.push(f);
+            }
+            v.push((state as i32 as f32) / 1024.0);
+        }
+        v
+    }
+
+    /// Bit-compare a vector kernel against its scalar reference over the
+    /// adversarial set, at every length from 0 to `4 * SIMD_MIN_LEN` so the
+    /// masked tail, the scalar-fallback seam and the aligned body are all hit.
+    fn assert_bit_exact(
+        name: &str,
+        vector: impl Fn(&[f32], &mut [f32]),
+        scalar: impl Fn(f32) -> f32,
+    ) {
+        let values = adversarial();
+        for len in 0..=(4 * SIMD_MIN_LEN) {
+            for start in [0usize, 1, 7, 13] {
+                if start + len > values.len() {
+                    continue;
+                }
+                let x = &values[start..start + len];
+                let mut got = vec![0.0f32; len];
+                vector(x, &mut got);
+                for (i, (&g, &v)) in got.iter().zip(x).enumerate() {
+                    let want = scalar(v);
+                    assert_eq!(
+                        g.to_bits(),
+                        want.to_bits(),
+                        "{name}: len={len} start={start} i={i} x={v:e} ({:#010x}): \
+                         got {g:e} ({:#010x}), want {want:e} ({:#010x})",
+                        v.to_bits(),
+                        g.to_bits(),
+                        want.to_bits()
+                    );
+                }
+            }
+        }
+        // And once over the whole set, which is far longer than any threshold.
+        let mut got = vec![0.0f32; values.len()];
+        vector(&values, &mut got);
+        for (i, (&g, &v)) in got.iter().zip(&values).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                scalar(v).to_bits(),
+                "{name}: full sweep i={i} x={v:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn neg_is_bit_exact() {
+        assert_bit_exact("neg", neg_f32_slice, |v| -v);
+    }
+
+    #[test]
+    fn abs_is_bit_exact() {
+        assert_bit_exact("abs", abs_f32_slice, f32::abs);
+    }
+
+    #[test]
+    fn reciprocal_is_bit_exact() {
+        assert_bit_exact("reciprocal", reciprocal_f32_slice, |v| 1.0 / v);
+    }
+
+    #[test]
+    fn floor_is_bit_exact() {
+        assert_bit_exact("floor", floor_f32_slice, f32::floor);
+    }
+
+    #[test]
+    fn ceil_is_bit_exact() {
+        assert_bit_exact("ceil", ceil_f32_slice, f32::ceil);
+    }
+
+    #[test]
+    fn round_is_bit_exact_and_ties_to_even() {
+        assert_bit_exact(
+            "round_ties_even",
+            round_ties_even_f32_slice,
+            f32::round_ties_even,
+        );
+        // The property that separates ONNX `Round` from `f32::round`: halves
+        // go to the even neighbour, not away from zero. Long enough to be on
+        // the vector path.
+        let x: Vec<f32> = std::iter::repeat_n([-2.5f32, -1.5, -0.5, 0.5, 1.5, 2.5], 16)
+            .flatten()
+            .collect();
+        let mut got = vec![0.0f32; x.len()];
+        round_ties_even_f32_slice(&x, &mut got);
+        for chunk in got.chunks(6) {
+            assert_eq!(chunk, &[-2.0, -2.0, -0.0, 0.0, 2.0, 2.0]);
+        }
+    }
+
+    #[test]
+    fn sign_is_bit_exact_and_keeps_nan_payloads() {
+        assert_bit_exact("sign", sign_f32_slice, sign_scalar);
+        // Explicit: a NaN lane must come back as the *same* NaN, and both
+        // zeros must come back as `+0.0`, on the vector path.
+        let nan = f32::from_bits(0x7fc0_1234);
+        let neg_nan = f32::from_bits(0xffc0_1234);
+        let x: Vec<f32> = std::iter::repeat_n([nan, neg_nan, -0.0, 3.0, -3.0], 16)
+            .flatten()
+            .collect();
+        let mut got = vec![0.0f32; x.len()];
+        sign_f32_slice(&x, &mut got);
+        for chunk in got.chunks(5) {
+            // Matches ORT 1.28.0: the NaN comes back with its payload *and*
+            // sign bit intact, not canonicalised.
+            assert_eq!(chunk[0].to_bits(), nan.to_bits());
+            assert_eq!(chunk[1].to_bits(), neg_nan.to_bits());
+            assert_eq!(chunk[2].to_bits(), 0.0f32.to_bits());
+            assert_eq!(chunk[3], 1.0);
+            assert_eq!(chunk[4], -1.0);
+        }
+    }
+
+    #[test]
+    fn softsign_is_bit_exact() {
+        assert_bit_exact("softsign", softsign_f32_slice, softsign_scalar);
+    }
+
+    /// The exact group must not have the `SIMD_MIN_LEN` accuracy seam the
+    /// approximations do: a value's result cannot depend on how many elements
+    /// share the tensor with it.
+    #[test]
+    fn exact_kernels_have_no_length_seam() {
+        let values = adversarial();
+        type ExactKernel = fn(&[f32], &mut [f32]);
+        let kernels: [(&str, ExactKernel); 8] = [
+            ("neg", neg_f32_slice),
+            ("abs", abs_f32_slice),
+            ("reciprocal", reciprocal_f32_slice),
+            ("floor", floor_f32_slice),
+            ("ceil", ceil_f32_slice),
+            ("round", round_ties_even_f32_slice),
+            ("sign", sign_f32_slice),
+            ("softsign", softsign_f32_slice),
+        ];
+        for (name, k) in kernels {
+            // Below the threshold (scalar) and far above it (vector).
+            let short = &values[..SIMD_MIN_LEN - 1];
+            let mut got_short = vec![0.0f32; short.len()];
+            k(short, &mut got_short);
+
+            let long = &values[..SIMD_MIN_LEN * 8];
+            let mut got_long = vec![0.0f32; long.len()];
+            k(long, &mut got_long);
+
+            for i in 0..short.len() {
+                assert_eq!(
+                    got_short[i].to_bits(),
+                    got_long[i].to_bits(),
+                    "{name}: element {i} (x={:e}) differs between a {}-element and a \
+                     {}-element tensor — the exact group must have no length seam",
+                    short[i],
+                    short.len(),
+                    long.len()
                 );
             }
         }

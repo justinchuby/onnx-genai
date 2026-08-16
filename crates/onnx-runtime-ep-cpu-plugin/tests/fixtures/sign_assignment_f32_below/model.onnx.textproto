@@ -1,0 +1,32 @@
+ir_version: 10
+graph {
+  node: [
+    { input: ["X"] output: ["Z"] op_type: "Sign" }
+  ]
+  name: "sign_assignment_f32_below"
+  input: [
+  {
+    name: "X"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape { dim: [{ dim_value: 1 }, { dim_value: 1024 }] }
+      }
+    }
+  }
+  ]
+  output: [
+  {
+    name: "Z"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape { dim: [{ dim_value: 1 }, { dim_value: 1024 }] }
+      }
+    }
+  }
+  ]
+}
+opset_import: [{
+  version: 22
+}]
