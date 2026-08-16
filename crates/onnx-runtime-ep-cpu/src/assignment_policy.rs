@@ -112,6 +112,16 @@ pub fn governs(op: &Node) -> bool {
 /// tried and **falsified end-to-end**, which is why this module has no size
 /// gate at all. See the function-inlining note below.
 ///
+/// The `approximate="none"` variant used to be the outlier of this table at
+/// 0.059-0.414x, because it evaluated `libm::erf` in `f64` per element. With
+/// MLAS's `erf` polynomial ported into the AVX2 path it measures 0.898x /
+/// 1.064x / 0.908x / 0.917x / 0.927x / 0.898x at 512 / 3072 / 16384 / 65536 /
+/// 262144 / 1048576 float16 elements on one thread — a 2.9-15.2x lift on a
+/// range this module *does* claim, and the reason that claim is no longer an
+/// embarrassment. It is still slightly under 1.0 above 3072 elements, but the
+/// alternative measured 0.024-0.049x, so the claim remains the better of the
+/// two available options rather than a win in its own right.
+///
 /// Whether this EP wants `op` handed to it by a plugin host, or would rather
 /// the host ran its own kernel.
 pub fn claim_preference(
@@ -163,13 +173,21 @@ pub fn claim_preference(
         // Float32 is where ORT is strongest: MLAS activation kernels plus
         // intra-op threading. Measured session-level ratios on AVX2 with one
         // thread: Tanh 0.60-0.82x, Sigmoid 0.62-0.81x, Gelu(tanh) 0.64-0.79x,
-        // Gelu(none) 0.036-0.79x, Erf 0.023-0.77x. `Sqrt` is now 1.1-1.9x
+        // Gelu(none) 0.67-0.76x, Erf 0.58-0.74x. `Sqrt` is now 1.1-1.9x
         // single-threaded above ~8 K elements, but inverts to 0.30x at 16
         // threads, and the thread count is not visible here — so it loses under
         // the "must hold across thread counts" rule too.
+        //
+        // `Erf` and `Gelu(none)` used to sit at 0.022-0.25x, an order of
+        // magnitude worse than the rest, because both evaluated `libm::erf` in
+        // `f64` per element. Porting MLAS's own `erf` polynomial lifted them by
+        // 3-28x onto the same ~0.7x plateau as every other activation here.
+        // That plateau is not the transcendental any more: it is this kernel
+        // being single-threaded while ORT spreads the same elementwise work
+        // over its intra-op pool. Until that changes, deferring stays correct.
         DataType::Float32 => ClaimPreference::defer(
             "ORT's float32 MLAS kernel for this op is measured faster on x86-64 AVX2 at every \
-             size (0.02-0.87x session latency); ORT also threads elementwise work across the \
+             size (0.58-0.87x session latency); ORT also threads elementwise work across the \
              intra-op pool while this kernel is single-threaded",
         ),
 

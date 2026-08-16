@@ -9,10 +9,11 @@
 //!   broadcasting semantics stay identical across every binary op.
 //! * **Unary** — `Sqrt`, `Erf`, `Tanh`: a straight per-element map.
 //!
-//! Numerics target ONNX/NumPy exactly. `Erf` has no `std` intrinsic, so it uses
-//! the pure-Rust `libm::erf` (the correctly-rounded Sun/FreeBSD algorithm),
-//! keeping the crate FFI-free (libm is pure Rust, no `cc`) while matching the
-//! ONNX reference to < 1 ulp near zero.
+//! Numerics target ONNX/NumPy exactly. `Erf` has no `std` intrinsic: on
+//! AVX2+FMA it runs the ported MLAS polynomial in `kernels::simd_activations`
+//! (what ORT's own CPU kernel evaluates), and everywhere else the pure-Rust
+//! `libm::erf` (the correctly-rounded Sun/FreeBSD algorithm), keeping the crate
+//! FFI-free (libm is pure Rust, no `cc`).
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Attribute, DataType, Node};
@@ -752,19 +753,23 @@ impl Kernel for UnaryKernel {
         check_arity(self.op.name(), inputs, outputs, 1, 1, 1)?;
         let op = self.op;
         // Vectorised f32-domain fast path. `Float64` is excluded because it
-        // would round-trip through f32 and lose precision; `Erf` keeps its
-        // exact scalar form (see `kernels::simd_activations` for why `Erf` is
-        // deliberately not approximated).
+        // would round-trip through f32 and lose precision.
         //
         // `Sqrt` joins `Tanh` here for a different reason than the usual
         // speed-vs-accuracy trade: `vsqrtps` is the same correctly-rounded IEEE
         // square root as the `sqrtss` it replaces, so this is pure throughput.
+        // `Erf` follows ORT: its CPU kernel calls `MlasComputeErf`, whose
+        // faithfully-rounded polynomial this path ports (see
+        // `kernels::simd_activations::erf_f32_slice`). The scalar
+        // correctly-rounded `libm::erf` remains the fallback off AVX2.
+        //
         // The old `dispatch_float!`/`unary_typed` arm was the cost — it widened
         // element by element through the `FloatElem` trait, `collect()`ed a
         // whole `Vec<T>`, then copied that into the output, and the per-element
         // `match` on the runtime `UnOp` blocked vectorisation of even the plain
         // f32 case.
-        if matches!(op, UnOp::Tanh | UnOp::Sqrt) && inputs[0].dtype != DataType::Float64 {
+        if matches!(op, UnOp::Tanh | UnOp::Sqrt | UnOp::Erf) && inputs[0].dtype != DataType::Float64
+        {
             let x = to_dense_f32_widen(op.name(), &inputs[0])?;
             return simd_activations::write_mapped(
                 op.name(),
@@ -773,14 +778,7 @@ impl Kernel for UnaryKernel {
                 |x, y| match op {
                     UnOp::Tanh => simd_activations::tanh_f32_slice(x, y),
                     UnOp::Sqrt => simd_activations::sqrt_f32_slice(x, y),
-                    // Unreachable today (the gate above only admits the two
-                    // arms), but a scalar fallback beats a panic if the gate
-                    // and this match ever drift apart.
-                    UnOp::Erf => {
-                        for (o, v) in y.iter_mut().zip(x) {
-                            *o = op.apply(*v);
-                        }
-                    }
+                    UnOp::Erf => simd_activations::erf_f32_slice(x, y),
                 },
             );
         }
