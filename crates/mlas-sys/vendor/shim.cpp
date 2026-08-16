@@ -426,6 +426,28 @@ extern "C" void mlas_compute_logistic(
     MlasComputeLogistic(input, output, n);
 }
 
+// ---- Vectorized softmax ----------------------------------------------------
+// `n` independent rows of `d` contiguous floats, normalized in the same way
+// ONNX Runtime's own Softmax/attention kernels do: MLAS finds each row max with
+// a SIMD reduction and exponentiates with its polynomial `expf` approximation
+// instead of a scalar libm call. `ThreadPool` is null because every caller here
+// is already inside a parallel region and drives its own sharding.
+// Runs in place: for the non-log form MLAS streams `Input -> Output` element by
+// element and then rescales `Output` alone, so passing one buffer for both is
+// exactly what ONNX Runtime's own attention kernels do.
+extern "C" void mlas_compute_softmax_in_place(
+    float* data,
+    size_t n,
+    size_t d)
+{
+    MlasComputeSoftmax<float>(
+        data, data, n, d,
+        /*LogSoftmax=*/false,
+        /*SmoothSoftmax=*/false,
+        /*Sink=*/0.0f,
+        /*ThreadPool=*/nullptr);
+}
+
 // ---- Vectorized SiLU -------------------------------------------------------
 // MLAS selects its fused AVX-512F implementation at runtime when available,
 // with a portable logistic-then-multiply fallback on other architectures.

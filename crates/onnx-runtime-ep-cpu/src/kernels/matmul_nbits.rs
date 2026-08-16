@@ -147,6 +147,32 @@ mod mm_profile {
 /// Overrides the bounded M=1 decode pool size; set to `0` to use the global
 /// Rayon pool as an escape hatch.
 const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
+
+/// `mlas-sys` reads the same knob to size its standalone pool. Fail the build
+/// rather than let the two names drift apart silently.
+#[cfg(feature = "mlas")]
+const _: () = {
+    const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    assert!(
+        bytes_eq(
+            DECODE_THREADS_ENV.as_bytes(),
+            mlas_sys::CPU_DECODE_THREADS_ENV.as_bytes()
+        ),
+        "DECODE_THREADS_ENV must match mlas_sys::CPU_DECODE_THREADS_ENV"
+    );
+};
 /// Process-local override set by first-class callers such as the CLI. Zero means
 /// no override, so the environment variable and automatic default still apply.
 static DECODE_THREADS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
@@ -2521,6 +2547,16 @@ pub fn set_decode_thread_budget(threads: Option<usize>) -> std::result::Result<(
         return Err("CPU decode thread budget must be greater than zero");
     }
     DECODE_THREADS_OVERRIDE.store(threads.unwrap_or(0), Ordering::Release);
+    // The standalone MLAS pool sits below this crate and cannot read
+    // `DECODE_THREADS_OVERRIDE`, so forward the budget explicitly. Without this
+    // the budget would only reach dense `MlasGemmBatch` work on Linux, and only
+    // indirectly, via the affinity mask shrinking `available_parallelism`.
+    //
+    // Forwarded after the store because the two layers reject exactly the same
+    // input (`Some(0)`, already rejected above), so this call cannot fail and
+    // the two budgets cannot diverge. Keep that invariant if either guard grows.
+    #[cfg(feature = "mlas")]
+    mlas_sys::set_pool_thread_budget(threads)?;
     Ok(())
 }
 
@@ -12524,6 +12560,43 @@ mod tests {
         assert_eq!(resolve_decode_min(Some("32"), 96), 32);
         assert_eq!(resolve_decode_min(Some("  8 "), 96), 8);
         assert_eq!(resolve_decode_min(Some("1"), 96), 1);
+    }
+
+    /// The standalone MLAS pool cannot see `DECODE_THREADS_OVERRIDE`, so
+    /// `set_decode_thread_budget` has to forward explicitly. Without the
+    /// forwarding, `--cpu-cores N` bounded dense `MlasGemmBatch` work only on
+    /// Linux, and only indirectly via the affinity mask.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn set_decode_thread_budget_forwards_the_budget_to_the_standalone_mlas_pool() {
+        let _guard = backend_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let restore = decode_threads_override();
+
+        set_decode_thread_budget(Some(6)).expect("6 is a legal budget");
+        assert_eq!(
+            mlas_sys::configured_pool_thread_budget(),
+            Some(6),
+            "the MLAS pool must observe the EP's programmatic budget"
+        );
+
+        set_decode_thread_budget(None).expect("clearing is legal");
+        assert_eq!(
+            mlas_sys::configured_pool_thread_budget(),
+            None,
+            "clearing the EP budget must clear the MLAS pool budget too"
+        );
+
+        assert!(
+            set_decode_thread_budget(Some(0)).is_err(),
+            "zero stays the opt-out sentinel, not a legal pool size"
+        );
+        assert_eq!(
+            mlas_sys::configured_pool_thread_budget(),
+            None,
+            "a rejected budget must not reach the MLAS pool"
+        );
+
+        set_decode_thread_budget(restore).expect("restoring the prior budget");
     }
 
     /// Serialize the few tests that mutate `NXRT_CPU_GEMM_BACKEND` so the global

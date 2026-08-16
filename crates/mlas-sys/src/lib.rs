@@ -72,6 +72,9 @@ unsafe extern "C" {
     /// Vectorized fused SiLU over `n` contiguous f32s. MLAS runtime-dispatches
     /// to its one-pass AVX-512F kernel when supported.
     fn mlas_compute_silu(input: *const f32, output: *mut f32, n: usize);
+    /// Row-wise softmax over `n` rows of `d` contiguous f32s, single-threaded,
+    /// using MLAS's SIMD max reduction and polynomial exp.
+    fn mlas_compute_softmax_in_place(data: *mut f32, n: usize, d: usize);
     fn mlas_eltwise_add(left: *const f32, right: *const f32, output: *mut f32, n: usize);
     fn mlas_compute_activation(
         kind: c_int,
@@ -234,6 +237,26 @@ type MlasParallelForFn = unsafe extern "C" fn(
 type MlasMaxThreadsFn = unsafe extern "C" fn(rust_ctx: *mut c_void) -> c_int;
 
 const MLAS_WORK_STEALING_THREADS_ENV: &str = "ONNX_GENAI_MLAS_THREADPOOL_THREADS";
+/// The CPU EP's thread-budget knob. `mlas-sys` sits *below* the EP and cannot
+/// depend on it, so the name lives here and the EP refers to *this* constant;
+/// `onnx-runtime-ep-cpu` static-asserts that its own `DECODE_THREADS_ENV`
+/// matches, so the two can never drift.
+///
+/// Without this, an embedder that asked the CPU EP for N threads still got a
+/// standalone-MLAS pool sized by [`default_mlas_thread_count`]'s own default,
+/// so the request was silently ignored for every `MlasGemmBatch` call.
+pub const CPU_DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
+/// Upper bound on the standalone pool, matching the previous `n.min(64)` cap on
+/// the explicit override.
+///
+/// A budget above this is clamped, which makes the standalone pool smaller than
+/// the CPU EP's persistent pool (that one clamps only to `available`). The
+/// divergence is reported once on stderr rather than applied silently.
+const MAX_MLAS_POOL_THREADS: usize = 64;
+
+/// Programmatic thread budget, mirroring the CPU EP's
+/// `set_decode_thread_budget`. Zero means unset.
+static POOL_THREAD_BUDGET: AtomicUsize = AtomicUsize::new(0);
 
 static MLAS_PARALLEL_FOR_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MLAS_PARALLEL_FOR_ITERATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -357,19 +380,121 @@ pub fn sqnbit_mlas_partitioning(
     }
 }
 
+/// Worker count for the standalone MLAS work-stealing pool.
+///
+/// Precedence, mirroring the CPU EP's own resolution order: the MLAS-specific
+/// pool override, then the programmatic budget from
+/// [`set_pool_thread_budget`], then the CPU EP's thread-budget environment
+/// variable, then [`resolve_default_mlas_threads`].
 fn default_mlas_thread_count() -> usize {
-    if let Ok(raw) = std::env::var(MLAS_WORK_STEALING_THREADS_ENV) {
-        if let Ok(n) = raw.trim().parse::<usize>() {
-            if n > 0 {
-                return n.min(64);
-            }
-        }
+    if let Some(threads) = thread_count_env(MLAS_WORK_STEALING_THREADS_ENV) {
+        return threads;
+    }
+    if let Some(threads) = pool_thread_budget() {
+        return threads;
+    }
+    if let Some(threads) = thread_count_env(CPU_DECODE_THREADS_ENV) {
+        return threads;
     }
 
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .clamp(1, 8)
+    resolve_default_mlas_threads(
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+    )
+}
+
+/// Set or clear a process-local worker budget for the standalone MLAS pool.
+///
+/// This is the programmatic equivalent of [`CPU_DECODE_THREADS_ENV`] and takes
+/// precedence over it. `onnx-runtime-ep-cpu::set_decode_thread_budget` forwards
+/// here so that a caller such as the CLI's `--cpu-cores` bounds dense
+/// `MlasGemmBatch` work too, on every OS -- not just Linux, where process
+/// affinity would otherwise shrink `available_parallelism` for us.
+///
+/// Pools are initialized lazily and keep their initial size for the process
+/// lifetime, so call this before the first GEMM. `Some(0)` is rejected.
+pub fn set_pool_thread_budget(threads: Option<usize>) -> Result<(), &'static str> {
+    if threads == Some(0) {
+        return Err("MLAS pool thread budget must be greater than zero");
+    }
+    POOL_THREAD_BUDGET.store(threads.unwrap_or(0), Ordering::Release);
+    Ok(())
+}
+
+fn pool_thread_budget() -> Option<usize> {
+    let threads = POOL_THREAD_BUDGET.load(Ordering::Acquire);
+    (threads > 0).then(|| clamp_pool_threads(threads))
+}
+
+/// The raw programmatic budget, before the [`MAX_MLAS_POOL_THREADS`] cap, or
+/// `None` when unset.
+///
+/// Exposed so higher layers can assert that their own budget actually reached
+/// this pool; it reports neither the env-var nor the automatic fallback, and
+/// deliberately mirrors the EP's `decode_threads_override` in returning the
+/// value as configured rather than as clamped.
+pub fn configured_pool_thread_budget() -> Option<usize> {
+    std::num::NonZeroUsize::new(POOL_THREAD_BUDGET.load(Ordering::Acquire))
+        .map(std::num::NonZeroUsize::get)
+}
+
+/// A budget of `0` means "no override" here, matching the CPU EP, which treats
+/// `ONNX_GENAI_CPU_DECODE_THREADS=0` as an opt-out back to automatic sizing.
+fn thread_count_env(name: &str) -> Option<usize> {
+    parse_thread_count(&std::env::var(name).ok()?)
+}
+
+/// Pure parser for a thread-count knob, split out so it can be tested without
+/// mutating the process environment (`setenv` races other threads' `getenv`).
+fn parse_thread_count(raw: &str) -> Option<usize> {
+    let threads = raw.trim().parse::<usize>().ok()?;
+    (threads > 0).then(|| clamp_pool_threads(threads))
+}
+
+fn clamp_pool_threads(threads: usize) -> usize {
+    if threads > MAX_MLAS_POOL_THREADS {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "mlas-sys: thread budget {threads} exceeds the standalone pool cap of \
+                 {MAX_MLAS_POOL_THREADS}; using {MAX_MLAS_POOL_THREADS} workers"
+            );
+        });
+    }
+    threads.min(MAX_MLAS_POOL_THREADS)
+}
+
+/// Default pool size: half the logical CPUs, but never fewer than the previous
+/// eight-worker ceiling allowed.
+///
+/// The old rule was `available.clamp(1, 8)`. That eight-worker cap belongs to
+/// the CPU EP's *flat Rayon* pool, whose per-op fork/join regresses past eight
+/// workers -- it does not apply here. This pool is persistent and work-stealing,
+/// so like the EP's persistent SPMD pool it keeps scaling with cores until the
+/// memory-bandwidth knee, measured at about half the logical CPUs.
+///
+/// Measured on a 32-vCPU/16-core EPYC 9V74 (f32 MatMul K=3584 N=3584 M=128,
+/// `native_min` over 15 runs after 5 warmups, ours/ORT at matched threads):
+///
+/// | requested threads | pool capped at 8 | pool sized to the request |
+/// |---|---|---|
+/// | 1--8 | 1.00--1.73x | unchanged (cap not binding) |
+/// | 16 | 2.08--2.48x slower | 1.24--1.44x slower |
+/// | 32 | 1.76--2.38x slower | **0.65--0.82x, i.e. faster than ORT** |
+///
+/// and with no thread flags at all: 1.85--2.64x slower at the old default
+/// versus 0.92--1.30x with this one.
+///
+/// `max` with `available.min(8)` keeps the rule monotone: no host ever gets
+/// *fewer* workers than the old default gave it, so small machines are
+/// unaffected and only hosts above 16 logical CPUs change.
+fn resolve_default_mlas_threads(available: usize) -> usize {
+    let available = available.max(1);
+    available
+        .div_ceil(2)
+        .max(available.min(8))
+        .min(MAX_MLAS_POOL_THREADS)
 }
 
 fn global_mlas_pool() -> Option<&'static WorkStealingThreadPool> {
@@ -464,8 +589,10 @@ pub struct MlasThreadPool {
 impl MlasThreadPool {
     /// Create a compatibility handle and initialize the process-global backing
     /// pool. The global pool's actual degree of parallelism is selected once at
-    /// first use (default: `available_parallelism().clamp(1, 8)`, override via
-    /// `ONNX_GENAI_MLAS_THREADPOOL_THREADS`), so this `thread_count` is retained
+    /// first use by [`default_mlas_thread_count`] --
+    /// `ONNX_GENAI_MLAS_THREADPOOL_THREADS`, then [`set_pool_thread_budget`],
+    /// then [`CPU_DECODE_THREADS_ENV`], then
+    /// [`resolve_default_mlas_threads`] -- so this `thread_count` is retained
     /// only for diagnostics/backward-compatible tests.
     pub fn new(thread_count: usize) -> std::io::Result<Self> {
         assert!(thread_count > 0, "thread_count must be non-zero");
@@ -528,6 +655,31 @@ pub fn compute_silu(input: &[f32], output: &mut [f32]) {
     // SAFETY: both slices are valid for `n` contiguous f32s; MLAS reads `input`
     // and writes `output`, and Rust's borrow rules prove they do not alias.
     unsafe { mlas_compute_silu(input.as_ptr(), output.as_mut_ptr(), input.len()) };
+}
+
+/// Row-wise in-place softmax, replacing a scalar `expf` loop: normalizes `n` rows of
+/// `d` contiguous f32s with MLAS's SIMD max reduction and polynomial exp — the
+/// same primitive ONNX Runtime's own Softmax and attention kernels use.
+///
+/// Single threaded; callers shard across threads themselves.
+///
+/// A row consisting entirely of `-inf` produces NaN, matching MLAS/ORT; callers
+/// that need the "fully masked row → zero" convention must screen for that case
+/// themselves.
+pub fn compute_softmax_in_place(data: &mut [f32], n: usize, d: usize) {
+    assert_eq!(
+        data.len(),
+        n.saturating_mul(d),
+        "compute_softmax_in_place expects exactly n*d elements"
+    );
+    if data.is_empty() {
+        return;
+    }
+    // SAFETY: `data` holds `n * d` contiguous f32s (asserted above) and is
+    // uniquely borrowed. MLAS's non-log softmax streams each row forward from
+    // input to output and then rescales the output, so a single buffer serving
+    // as both is well defined.
+    unsafe { mlas_compute_softmax_in_place(data.as_mut_ptr(), n, d) };
 }
 
 /// Compute contiguous Float32 elementwise addition with MLAS SIMD.
@@ -3089,5 +3241,107 @@ mod tests {
 
             assert_eq!(back, input, "round-trip mismatch for channels={channels}");
         }
+    }
+
+    /// The standalone pool's default sizing rule must never hand a host *fewer*
+    /// workers than the previous `available.clamp(1, 8)` rule did, and must
+    /// scale past eight on hosts that have the cores.
+    ///
+    /// The old cap was inherited from the CPU EP's flat Rayon pool, whose per-op
+    /// fork/join regresses past eight workers. This pool is persistent and
+    /// work-stealing, so the cap only starved it: on a 32-vCPU host it left f32
+    /// MatMul 1.85--2.64x slower than ORT out of the box, versus 0.92--1.30x
+    /// once the pool is allowed half the machine.
+    #[test]
+    fn default_pool_size_is_monotone_against_the_old_eight_worker_rule() {
+        for available in 1..=256usize {
+            let old = available.clamp(1, 8);
+            let new = resolve_default_mlas_threads(available);
+            assert!(
+                new >= old,
+                "available={available}: new default {new} regresses below the old default {old}"
+            );
+            assert!(
+                new <= available.max(1),
+                "available={available}: new default {new} oversubscribes the host"
+            );
+            assert!(
+                new <= MAX_MLAS_POOL_THREADS,
+                "available={available}: new default {new} exceeds the pool cap"
+            );
+        }
+        // Pin the interesting points so a future edit cannot silently drift.
+        assert_eq!(resolve_default_mlas_threads(0), 1, "degenerate host");
+        assert_eq!(resolve_default_mlas_threads(1), 1);
+        assert_eq!(resolve_default_mlas_threads(4), 4, "small host unchanged");
+        assert_eq!(resolve_default_mlas_threads(8), 8, "old ceiling unchanged");
+        assert_eq!(resolve_default_mlas_threads(16), 8, "old ceiling unchanged");
+        assert_eq!(
+            resolve_default_mlas_threads(32),
+            16,
+            "half of a 32-vCPU host"
+        );
+        assert_eq!(resolve_default_mlas_threads(256), 64, "capped");
+    }
+
+    /// `ONNX_GENAI_CPU_DECODE_THREADS` is the CPU EP's thread-budget knob. The
+    /// standalone MLAS pool used to ignore it entirely, so asking the EP for N
+    /// threads left every `MlasGemmBatch` call on a differently-sized pool.
+    #[test]
+    fn parse_thread_count_parses_and_clamps() {
+        // Deliberately tests the pure parser rather than `thread_count_env`:
+        // `std::env::set_var` races concurrent `getenv` in sibling tests (cargo
+        // runs lib tests multi-threaded), which is a data race even for
+        // distinct keys. The only thing `thread_count_env` adds is the
+        // `std::env::var` lookup.
+        assert_eq!(parse_thread_count("12"), Some(12));
+        assert_eq!(
+            parse_thread_count("  7  "),
+            Some(7),
+            "surrounding whitespace must be tolerated"
+        );
+        assert_eq!(
+            parse_thread_count("9999"),
+            Some(MAX_MLAS_POOL_THREADS),
+            "an absurd request must clamp, not oversubscribe"
+        );
+        for bad in ["0", "", "abc", "-4", "3.5", "18446744073709551616"] {
+            assert_eq!(
+                parse_thread_count(bad),
+                None,
+                "{bad:?} must fall through to the next precedence level"
+            );
+        }
+    }
+
+    #[test]
+    fn pool_thread_budget_round_trips_and_rejects_zero() {
+        // Serialized against the resolver test below by exercising only the
+        // atomic, which is process-local state this test fully owns and
+        // restores.
+        let previous = POOL_THREAD_BUDGET.load(Ordering::Acquire);
+        assert_eq!(
+            set_pool_thread_budget(Some(0)),
+            Err("MLAS pool thread budget must be greater than zero"),
+            "zero is the CPU EP's opt-out sentinel, not a legal pool size"
+        );
+
+        set_pool_thread_budget(Some(6)).expect("6 is a legal budget");
+        assert_eq!(pool_thread_budget(), Some(6));
+
+        set_pool_thread_budget(Some(9999)).expect("an absurd budget clamps");
+        assert_eq!(
+            pool_thread_budget(),
+            Some(MAX_MLAS_POOL_THREADS),
+            "the programmatic path must clamp exactly like the env path"
+        );
+
+        set_pool_thread_budget(None).expect("clearing is legal");
+        assert_eq!(
+            pool_thread_budget(),
+            None,
+            "a cleared budget must fall through to the next precedence level"
+        );
+        POOL_THREAD_BUDGET.store(previous, Ordering::Release);
     }
 }

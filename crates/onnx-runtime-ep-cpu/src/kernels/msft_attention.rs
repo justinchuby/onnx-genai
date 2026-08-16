@@ -306,6 +306,11 @@ impl KeyMask for MsftAttnKeyMask<'_> {
         self.mask
             .bias(b, i, j, self.q_seq, self.total_seq, self.filter)
     }
+
+    #[inline]
+    fn is_identity(&self) -> bool {
+        matches!(self.mask, PadMask::None)
+    }
 }
 
 impl MsftAttentionKernel {
