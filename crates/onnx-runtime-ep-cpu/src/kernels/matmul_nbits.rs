@@ -1160,6 +1160,7 @@ impl Kernel for MatMulNBitsKernel {
                         self.n,
                         self.block_size,
                         dot_kernel,
+                        borrowed_int4_prefill_row_block(),
                     );
                     return;
                 }
@@ -6431,6 +6432,22 @@ fn borrowed_int4_prefill_block_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Number of activation rows tiled against each column in the prefill path
+/// (issue #1117 follow-up). `1` (default) keeps the row-outer structural
+/// traversal with no weight reuse; `R > 1` reuses each column's packed int4
+/// bytes across `R` rows (`R * k * 4` activation bytes stay L1-resident).
+/// Unproven: the reuse effect measured within run-to-run noise on qwen05b and
+/// showed no signal on qwen14b, so it defaults to 1. Override with
+/// `ONNX_GENAI_CPU_INT4_PREFILL_ROWS` only to measure the blocking factor.
+#[cfg(target_arch = "x86_64")]
+fn borrowed_int4_prefill_row_block() -> usize {
+    std::env::var("ONNX_GENAI_CPU_INT4_PREFILL_ROWS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&rows| rows >= 1)
+        .unwrap_or(1)
+}
+
 /// Structural borrowed int4 matmul for prefill (issue #1117). Reads the *same*
 /// zero-copy mmap int4 layout as [`borrowed_affine_int4_matmul`] with no
 /// resident packed buffer, but replaces that path's two per-token overheads:
@@ -6443,12 +6460,14 @@ fn borrowed_int4_prefill_block_enabled() -> bool {
 ///    inside its per-row loop. Here it is hoisted to one allocation of
 ///    `m * block_count` floats, independent of the weight size.
 ///
-/// This is deliberately *not* GEMM blocking: rows are visited outer-most, so a
-/// column's packed bytes are still re-read once per row (same weight traffic as
-/// the row-serial path). Reusing a column's bytes across a tile of rows is a
-/// separate, so-far-unproven change tracked as a follow-up to #1117 -- on the
-/// 0.5B model the reuse effect sat within run-to-run noise, so it is kept out
-/// of this change until it clears the baseline spread on a large model.
+/// By default (`row_block == 1`) this is *not* GEMM blocking: rows are visited
+/// outer-most, so a column's packed bytes are re-read once per row (same weight
+/// traffic as the row-serial path). Setting `ONNX_GENAI_CPU_INT4_PREFILL_ROWS`
+/// above 1 opts into reusing a column's bytes across a tile of `row_block`
+/// rows. That reuse is an unproven knob (issue #1117 follow-up): it sat within
+/// run-to-run noise on qwen05b and showed no signal on qwen14b (5-rep
+/// interleaved), so it defaults off and must not be enabled without a workload
+/// that measures the win past the baseline's spread.
 ///
 /// Each output element is computed with the identical float sequence as the
 /// row-serial path (via [`borrowed_int4_output_element`]); only the fork-join
@@ -6469,6 +6488,7 @@ fn borrowed_affine_int4_matmul_prefill(
     n: usize,
     block_size: usize,
     dot_kernel: DotKernel,
+    row_block: usize,
 ) {
     debug_assert_eq!(activations.len(), m * k);
     debug_assert_eq!(result.len(), m * n);
@@ -6477,6 +6497,7 @@ fn borrowed_affine_int4_matmul_prefill(
     let block_count = k.div_ceil(block_size);
     let packed_row_size = block_count * layout.packed_block_size();
     let zero_point_row_size = layout.zero_point_row_size(block_count);
+    let row_block = row_block.max(1);
 
     // Per-block activation sums, computed once for every row. The row-serial
     // path re-allocated this `Vec` inside its per-row loop (issue #1117); here
@@ -6508,37 +6529,44 @@ fn borrowed_affine_int4_matmul_prefill(
         }
         let jn = strip.min(n - j0);
         let result_base = result_ptr as *mut f32;
-        // Rows outer-most: this keeps the per-element k-reduction order and the
-        // weight-traffic profile identical to the row-serial path; only the
-        // fork-join count and the allocation change.
-        for i in 0..m {
-            let activation = &activations[i * k..(i + 1) * k];
-            let sums = &activation_sums[i * block_count..(i + 1) * block_count];
+        // Tile `row_block` rows against each column so the column's packed int4
+        // bytes are read once and reused across the tile. With `row_block == 1`
+        // this degenerates to the row-outer structural traversal (byte-identical
+        // and with the same weight traffic as the row-serial path).
+        let mut row_start = 0usize;
+        while row_start < m {
+            let row_end = (row_start + row_block).min(m);
             for j in j0..j0 + jn {
                 let packed_row = &packed[j * packed_row_size..(j + 1) * packed_row_size];
                 let zp_row = zero_points
                     .map(|zp| &zp[j * zero_point_row_size..(j + 1) * zero_point_row_size]);
                 let bias_value = bias.map_or(0.0, |values| values[j]);
-                let value = borrowed_int4_output_element(
-                    activation,
-                    sums,
-                    packed_row,
-                    zp_row,
-                    &scales,
-                    j * block_count,
-                    bias_value,
-                    layout,
-                    block_count,
-                    block_size,
-                    k,
-                    dot_kernel,
-                );
-                // SAFETY: `i < m` and `j < n`, so `i * n + j < m * n ==
-                // result.len()`; this strip owns column `j` exclusively.
-                unsafe {
-                    *result_base.add(i * n + j) = value;
+                let scale_base = j * block_count;
+                for i in row_start..row_end {
+                    let activation = &activations[i * k..(i + 1) * k];
+                    let sums = &activation_sums[i * block_count..(i + 1) * block_count];
+                    let value = borrowed_int4_output_element(
+                        activation,
+                        sums,
+                        packed_row,
+                        zp_row,
+                        &scales,
+                        scale_base,
+                        bias_value,
+                        layout,
+                        block_count,
+                        block_size,
+                        k,
+                        dot_kernel,
+                    );
+                    // SAFETY: `i < m` and `j < n`, so `i * n + j < m * n ==
+                    // result.len()`; this strip owns column `j` exclusively.
+                    unsafe {
+                        *result_base.add(i * n + j) = value;
+                    }
                 }
             }
+            row_start = row_end;
         }
     };
     if num_strips <= 1 || threads <= 1 {
@@ -9352,12 +9380,14 @@ mod tests {
         }
     }
 
-    /// The structural prefill kernel must be *byte-identical* to the row-serial
-    /// per-column path, not merely close: it only changes the fork-join
-    /// structure and hoists the activation-sum allocation, computing each
-    /// element with the same `borrowed_int4_output_element` reduction (issue
-    /// #1117). Covers single-row (`m == 1`), multi-row, and an odd `m` for
-    /// symmetric and asymmetric int4 and an `N` that is not a multiple of 4.
+    /// The prefill kernel must be *byte-identical* to the row-serial per-column
+    /// path for every `row_block`, not merely close: blocking only changes which
+    /// `(row, column)` pairs are co-resident and computes each element with the
+    /// same `borrowed_int4_output_element` reduction (issue #1117). Covers
+    /// single-row (`m == 1`), multi-row, and odd `m`/`row_block` combinations
+    /// whose last tile does not divide evenly (e.g. `m == 6`, `row_block == 4`
+    /// -> 4 + 2), for symmetric and asymmetric int4 and an `N` not a multiple
+    /// of 4.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn prefill_matches_per_column_borrowed_path_bit_identical() {
@@ -9404,28 +9434,35 @@ mod tests {
                     selected_dot_kernel(),
                 );
 
-                let mut got = vec![0.0f32; m * n];
-                borrowed_affine_int4_matmul_prefill(
-                    &activations,
-                    &packed,
-                    BorrowedScales::F32(&scales),
-                    zp_slice,
-                    Some(&bias),
-                    &mut got,
-                    m,
-                    k,
-                    n,
-                    block_size,
-                    selected_dot_kernel(),
-                );
-
-                for (index, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
-                    assert_eq!(
-                        a.to_bits(),
-                        b.to_bits(),
-                        "m={m} k={k} n={n} block={block_size} asym={asymmetric} \
-                         index {index}: per-column {a} vs prefill {b} not bit-identical"
+                // row_block == 1 is the structural (no-reuse) traversal; > 1
+                // exercises the blocking tiles, including tails that do not
+                // divide `m` evenly.
+                for &row_block in &[1usize, 2, 4, 8] {
+                    let mut got = vec![0.0f32; m * n];
+                    borrowed_affine_int4_matmul_prefill(
+                        &activations,
+                        &packed,
+                        BorrowedScales::F32(&scales),
+                        zp_slice,
+                        Some(&bias),
+                        &mut got,
+                        m,
+                        k,
+                        n,
+                        block_size,
+                        selected_dot_kernel(),
+                        row_block,
                     );
+
+                    for (index, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "m={m} k={k} n={n} block={block_size} rows={row_block} \
+                             asym={asymmetric} index {index}: per-column {a} vs \
+                             prefill {b} not bit-identical"
+                        );
+                    }
                 }
             }
         }
