@@ -477,6 +477,41 @@ extern "C" void mlas_compute_logistic(
     MlasComputeLogistic(input, output, n);
 }
 
+// ---- Vectorized tanh, erf and exact GELU -----------------------------------
+// The remaining MLAS transcendentals ONNX Runtime's own CPU activation kernels
+// call. Exposing them lets our elementwise kernels share the exact polynomial
+// ORT ships rather than carry a second, slower approximation of the same
+// function -- which also makes our output bit-identical to ORT's for these ops.
+//
+// All three are single-threaded; the caller drives any outer sharding, exactly
+// as `mlas_compute_logistic` above.
+extern "C" void mlas_compute_tanh(
+    const float* input,
+    float* output,
+    size_t n)
+{
+    MlasComputeTanh<float>(input, output, n);
+}
+
+extern "C" void mlas_compute_erf(
+    const float* input,
+    float* output,
+    size_t n)
+{
+    MlasComputeErf(input, output, n);
+}
+
+// NOTE: MLAS documents that Input and Output must not overlap for this one
+// (mlas.h:1166). The Rust wrapper takes `&[f32]` and `&mut [f32]`, so the
+// borrow checker already rules aliasing out.
+extern "C" void mlas_compute_gelu_erf(
+    const float* input,
+    float* output,
+    size_t n)
+{
+    MlasComputeGeluErf(input, output, n);
+}
+
 // ---- Vectorized softmax ----------------------------------------------------
 // `n` independent rows of `d` contiguous floats, normalized in the same way
 // ONNX Runtime's own Softmax/attention kernels do: MLAS finds each row max with
