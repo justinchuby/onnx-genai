@@ -1753,16 +1753,22 @@ fn ongpu_argmax_enabled() -> bool {
     )
 }
 
-/// Highest-index-on-ties argmax (`max_by` with `total_cmp` returns the LAST
-/// maximum). This matches the on-GPU `device_argmax` tie-break (highest global
-/// index) so the host reference and the device path are byte-identical even on
-/// the rare exact fp16 tie at the argmax.
-fn argmax_highest_index(row: &[f32]) -> u32 {
-    row.iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(i, _)| i as u32)
-        .expect("logits row must not be empty")
+/// Lowest-index-on-ties argmax: strict `>` from `-inf` keeps the FIRST maximum,
+/// matching the ONNX/ORT canonical greedy tie-break (`ArgMax` with
+/// `select_last_index=false`), the host sampler `sample_greedy` ("ties keep the
+/// lowest token id"), and the reconciled on-GPU `device_argmax` (lowest global
+/// index). The host reference and the device path are therefore byte-identical
+/// even on the rare exact fp16 tie at the argmax.
+fn argmax_lowest_index(row: &[f32]) -> u32 {
+    let mut best = f32::NEG_INFINITY;
+    let mut best_index = 0u32;
+    for (index, &value) in row.iter().enumerate() {
+        if value > best {
+            best = value;
+            best_index = index as u32;
+        }
+    }
+    best_index
 }
 
 /// Steady-window tok/s from per-token timestamps, excluding the first `skip`
@@ -1823,7 +1829,7 @@ fn greedy_decode_host(
     let mut times = Vec::with_capacity(max_new_tokens);
     let start = Instant::now();
     while generated.len() < max_new_tokens {
-        let token = argmax_highest_index(&logits);
+        let token = argmax_lowest_index(&logits);
         generated.push(token);
         times.push(start.elapsed());
         if eos.contains(&token) {
@@ -1842,7 +1848,8 @@ fn greedy_decode_host(
 /// with `decode_greedy_batch` (batch 1), which reduces over the vocab on the
 /// GPU and returns only the token id — no `[vocab]` logits D2H, no host
 /// reduction. Byte-identical to [`greedy_decode_host`] (device_argmax resolves
-/// ties to the same highest index). The prefill first token still comes from the
+/// ties to the same lowest index — the ONNX/ORT canonical). The prefill first
+/// token still comes from the
 /// prefill logits (one-time, outside the steady window) so both streams start
 /// from the same bootstrap.
 fn greedy_decode_ongpu(
@@ -1860,7 +1867,7 @@ fn greedy_decode_ongpu(
     let mut generated = Vec::with_capacity(max_new_tokens);
     let mut times = Vec::with_capacity(max_new_tokens);
     let start = Instant::now();
-    let mut token = argmax_highest_index(&base_logits);
+    let mut token = argmax_lowest_index(&base_logits);
     loop {
         generated.push(token);
         times.push(start.elapsed());
