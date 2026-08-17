@@ -1143,6 +1143,27 @@ impl Kernel for MatMulNBitsKernel {
             }
             with_decode_pool(|| {
                 #[cfg(target_arch = "x86_64")]
+                if borrowed_int4_prefill_block_enabled()
+                    && m >= 2
+                    && !matches!(dot_kernel, DotKernel::Scalar)
+                    && self.block_size.is_multiple_of(32)
+                {
+                    borrowed_affine_int4_matmul_prefill(
+                        &activations,
+                        packed,
+                        scales,
+                        borrowed_zero_points,
+                        bias.as_deref(),
+                        result,
+                        m,
+                        self.k,
+                        self.n,
+                        self.block_size,
+                        dot_kernel,
+                    );
+                    return;
+                }
+                #[cfg(target_arch = "x86_64")]
                 if borrowed_int4_nblock_enabled()
                     && !matches!(dot_kernel, DotKernel::Scalar)
                     && self.block_size.is_multiple_of(32)
@@ -6311,6 +6332,224 @@ unsafe fn borrowed_int4_nblock4_avx2(
     }
 }
 
+/// Compute one int4 borrowed-path output element `result[row][col]`.
+///
+/// This is the exact per-output float sequence the row-serial
+/// [`borrowed_affine_int4_matmul`] ran inline, factored out so the structural
+/// prefill path ([`borrowed_affine_int4_matmul_prefill`]) computes each
+/// `(row, column)` pair with the *identical* reduction. Changing the fork-join
+/// structure never touches a single element's own accumulation, so the two
+/// paths are byte-identical (issue #1117).
+///
+/// `scale_base` is `output_index * block_count`; `activation` and
+/// `activation_sums` are the slices for this element's row.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn borrowed_int4_output_element(
+    activation: &[f32],
+    activation_sums: &[f32],
+    packed_row: &[u8],
+    zp_row: Option<&[u8]>,
+    scales: &BorrowedScales<'_>,
+    scale_base: usize,
+    bias_value: f32,
+    layout: NBitsLayout,
+    block_count: usize,
+    block_size: usize,
+    k: usize,
+    dot_kernel: DotKernel,
+) -> f32 {
+    // On non-x86 targets `dot_kernel` drives no fast path; discard it to keep
+    // `-D warnings` happy, mirroring `borrowed_affine_int4_matmul`.
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = dot_kernel;
+    let mut sum = bias_value;
+    for block in 0..block_count {
+        let depth_start = block * block_size;
+        let valid = k.saturating_sub(depth_start).min(block_size);
+        let block_values = &packed_row
+            [block * layout.packed_block_size()..(block + 1) * layout.packed_block_size()];
+        let scale = scales.get(scale_base + block);
+        let zero_point = layout.zero_point(zp_row, block) as f32;
+        let mut dot;
+        #[cfg(target_arch = "aarch64")]
+        if valid == 32 && block_size == 32 {
+            // SAFETY: AArch64 guarantees NEON, and both slices contain one full block.
+            dot = unsafe {
+                affine_int4_block32_dot_neon(
+                    &activation[depth_start..depth_start + 32],
+                    block_values,
+                )
+            };
+            sum += (dot - activation_sums[block] * zero_point) * scale;
+            continue;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if valid == block_size && valid.is_multiple_of(32) {
+            // Vectorised int4 unpack + f32 FMA for the x86 borrowed path
+            // (issue #994). Falls through to the scalar loop when the host has
+            // no AVX2 (`DotKernel::Scalar`), so correctness never depends on the
+            // fast path existing.
+            if let Some(vec_dot) = borrowed_int4_block_dot_x86(
+                &activation[depth_start..depth_start + valid],
+                block_values,
+                dot_kernel,
+            ) {
+                sum += (vec_dot - activation_sums[block] * zero_point) * scale;
+                continue;
+            }
+        }
+        dot = 0.0;
+        for (byte_index, &byte) in block_values.iter().enumerate() {
+            let within = byte_index * 2;
+            if within < valid {
+                dot += activation[depth_start + within] * (byte & 0x0f) as f32;
+            }
+            if within + 1 < valid {
+                dot += activation[depth_start + within + 1] * (byte >> 4) as f32;
+            }
+        }
+        sum += (dot - activation_sums[block] * zero_point) * scale;
+    }
+    sum
+}
+
+/// A/B toggle for the structural borrowed int4 prefill matmul (issue #1117).
+/// `1`/`on` enables it for multi-row (prefill) activations; unset or `0`/`off`
+/// keeps the row-serial path. Default off so the shipped path is unchanged
+/// until the win is measured, exactly like the `#1104` N-block
+/// (`ONNX_GENAI_CPU_MM_INT4_NBLK`) and `#994` SIMD toggles. Read-only env probe
+/// -- production never mutates it at runtime.
+#[cfg(target_arch = "x86_64")]
+fn borrowed_int4_prefill_block_enabled() -> bool {
+    std::env::var("ONNX_GENAI_CPU_MM_INT4_PREFILL")
+        .ok()
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("off")
+        })
+        .unwrap_or(false)
+}
+
+/// Structural borrowed int4 matmul for prefill (issue #1117). Reads the *same*
+/// zero-copy mmap int4 layout as [`borrowed_affine_int4_matmul`] with no
+/// resident packed buffer, but replaces that path's two per-token overheads:
+///
+/// 1. The row-serial path runs one fork-join (`parallel_output_rows`) *per
+///    activation row*, so an `m`-token prefill pays `m` fork/join barriers.
+///    Here there is a single fork-join over disjoint column strips for the
+///    whole prefill.
+/// 2. The row-serial path re-allocates the per-block `activation_sums` `Vec`
+///    inside its per-row loop. Here it is hoisted to one allocation of
+///    `m * block_count` floats, independent of the weight size.
+///
+/// This is deliberately *not* GEMM blocking: rows are visited outer-most, so a
+/// column's packed bytes are still re-read once per row (same weight traffic as
+/// the row-serial path). Reusing a column's bytes across a tile of rows is a
+/// separate, so-far-unproven change tracked as a follow-up to #1117 -- on the
+/// 0.5B model the reuse effect sat within run-to-run noise, so it is kept out
+/// of this change until it clears the baseline spread on a large model.
+///
+/// Each output element is computed with the identical float sequence as the
+/// row-serial path (via [`borrowed_int4_output_element`]); only the fork-join
+/// structure and the allocation change, so results are byte-identical.
+/// Parallelism is over disjoint column strips, mirroring the column-strip GEMM
+/// in `accelerate_gemm`.
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_arch = "x86_64")]
+fn borrowed_affine_int4_matmul_prefill(
+    activations: &[f32],
+    packed: &[u8],
+    scales: BorrowedScales<'_>,
+    zero_points: Option<&[u8]>,
+    bias: Option<&[f32]>,
+    result: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    block_size: usize,
+    dot_kernel: DotKernel,
+) {
+    debug_assert_eq!(activations.len(), m * k);
+    debug_assert_eq!(result.len(), m * n);
+    let bits = 4usize;
+    let layout = NBitsLayout { bits, block_size };
+    let block_count = k.div_ceil(block_size);
+    let packed_row_size = block_count * layout.packed_block_size();
+    let zero_point_row_size = layout.zero_point_row_size(block_count);
+
+    // Per-block activation sums, computed once for every row. The row-serial
+    // path re-allocated this `Vec` inside its per-row loop (issue #1117); here
+    // it is one allocation of `m * block_count` floats, independent of the
+    // weight size, so it never scales with N or the packed bytes.
+    let mut activation_sums = vec![0.0f32; m * block_count];
+    for (row, sums) in activation_sums.chunks_exact_mut(block_count).enumerate() {
+        let activation = &activations[row * k..(row + 1) * k];
+        for (sum, blk) in sums.iter_mut().zip(activation.chunks(block_size)) {
+            *sum = blk.iter().sum::<f32>();
+        }
+    }
+
+    // Parallelise over disjoint column strips (mirrors the column-strip GEMM in
+    // `accelerate_gemm`) with a single fork-join for the whole prefill, instead
+    // of the row-serial path's `m` per-row fork-joins.
+    let threads = rayon::current_num_threads().max(1);
+    let strip = n.div_ceil(threads).max(1);
+    let num_strips = n.div_ceil(strip);
+    // SAFETY (raw pointer send): strip `t` writes only `result[i * n + j]` for
+    // `j` in `[j0, j0 + jn)` and `i` in `0..m`; disjoint column ranges never
+    // overlap. `par_chunks_mut` cannot partition a row-major matrix by columns,
+    // hence the raw pointer, exactly as in `accelerate_gemm`'s column strips.
+    let result_ptr = result.as_mut_ptr() as usize;
+    let run_strip = |t: usize| {
+        let j0 = t * strip;
+        if j0 >= n {
+            return;
+        }
+        let jn = strip.min(n - j0);
+        let result_base = result_ptr as *mut f32;
+        // Rows outer-most: this keeps the per-element k-reduction order and the
+        // weight-traffic profile identical to the row-serial path; only the
+        // fork-join count and the allocation change.
+        for i in 0..m {
+            let activation = &activations[i * k..(i + 1) * k];
+            let sums = &activation_sums[i * block_count..(i + 1) * block_count];
+            for j in j0..j0 + jn {
+                let packed_row = &packed[j * packed_row_size..(j + 1) * packed_row_size];
+                let zp_row = zero_points
+                    .map(|zp| &zp[j * zero_point_row_size..(j + 1) * zero_point_row_size]);
+                let bias_value = bias.map_or(0.0, |values| values[j]);
+                let value = borrowed_int4_output_element(
+                    activation,
+                    sums,
+                    packed_row,
+                    zp_row,
+                    &scales,
+                    j * block_count,
+                    bias_value,
+                    layout,
+                    block_count,
+                    block_size,
+                    k,
+                    dot_kernel,
+                );
+                // SAFETY: `i < m` and `j < n`, so `i * n + j < m * n ==
+                // result.len()`; this strip owns column `j` exclusively.
+                unsafe {
+                    *result_base.add(i * n + j) = value;
+                }
+            }
+        }
+    };
+    if num_strips <= 1 || threads <= 1 {
+        for t in 0..num_strips {
+            run_strip(t);
+        }
+    } else {
+        (0..num_strips).into_par_iter().for_each(run_strip);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn borrowed_affine_int4_matmul(
     activations: &[f32],
@@ -6361,55 +6600,21 @@ fn borrowed_affine_int4_matmul(
                     &zp[output_index * zero_point_row_size
                         ..(output_index + 1) * zero_point_row_size]
                 });
-                let mut sum = bias.map_or(0.0, |values| values[output_index]);
-                for block in 0..block_count {
-                    let depth_start = block * block_size;
-                    let valid = k.saturating_sub(depth_start).min(block_size);
-                    let block_values = &packed_row[block * layout.packed_block_size()
-                        ..(block + 1) * layout.packed_block_size()];
-                    let scale = scales.get(output_index * block_count + block);
-                    let zero_point = layout.zero_point(zp_row, block) as f32;
-                    let mut dot;
-                    #[cfg(target_arch = "aarch64")]
-                    if valid == 32 && block_size == 32 {
-                        // SAFETY: AArch64 guarantees NEON, and both slices contain one full block.
-                        dot = unsafe {
-                            affine_int4_block32_dot_neon(
-                                &activation[depth_start..depth_start + 32],
-                                block_values,
-                            )
-                        };
-                        sum += (dot - activation_sums[block] * zero_point) * scale;
-                        continue;
-                    }
-                    #[cfg(target_arch = "x86_64")]
-                    if valid == block_size && valid.is_multiple_of(32) {
-                        // Vectorised int4 unpack + f32 FMA for the x86 borrowed
-                        // path (issue #994). Falls through to the scalar loop
-                        // when the host has no AVX2 (`DotKernel::Scalar`), so
-                        // correctness never depends on the fast path existing.
-                        if let Some(vec_dot) = borrowed_int4_block_dot_x86(
-                            &activation[depth_start..depth_start + valid],
-                            block_values,
-                            dot_kernel,
-                        ) {
-                            sum += (vec_dot - activation_sums[block] * zero_point) * scale;
-                            continue;
-                        }
-                    }
-                    dot = 0.0;
-                    for (byte_index, &byte) in block_values.iter().enumerate() {
-                        let within = byte_index * 2;
-                        if within < valid {
-                            dot += activation[depth_start + within] * (byte & 0x0f) as f32;
-                        }
-                        if within + 1 < valid {
-                            dot += activation[depth_start + within + 1] * (byte >> 4) as f32;
-                        }
-                    }
-                    sum += (dot - activation_sums[block] * zero_point) * scale;
-                }
-                *output = sum;
+                let bias_value = bias.map_or(0.0, |values| values[output_index]);
+                *output = borrowed_int4_output_element(
+                    activation,
+                    &activation_sums,
+                    packed_row,
+                    zp_row,
+                    &scales,
+                    output_index * block_count,
+                    bias_value,
+                    layout,
+                    block_count,
+                    block_size,
+                    k,
+                    dot_kernel,
+                );
             }
         };
         parallel_output_rows(output_row, k, compute);
@@ -9141,6 +9346,85 @@ mod tests {
                         (a - b).abs() <= tolerance,
                         "m={m} k={k} n={n} block={block_size} asym={asymmetric} \
                          index {index}: per-column {a} vs n-blocked {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The structural prefill kernel must be *byte-identical* to the row-serial
+    /// per-column path, not merely close: it only changes the fork-join
+    /// structure and hoists the activation-sum allocation, computing each
+    /// element with the same `borrowed_int4_output_element` reduction (issue
+    /// #1117). Covers single-row (`m == 1`), multi-row, and an odd `m` for
+    /// symmetric and asymmetric int4 and an `N` that is not a multiple of 4.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn prefill_matches_per_column_borrowed_path_bit_identical() {
+        if matches!(selected_dot_kernel(), DotKernel::Scalar) {
+            // No AVX2 on this host; the structural prefill path is never selected.
+            return;
+        }
+        let mut rng: u64 = 0x243F6A8885A308D3;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng >> 40) as f32 / (1u32 << 24) as f32) - 0.5
+        };
+        // `m` values below exercise a single row, several full-strip rows, and
+        // odd row counts so no dimension assumption sneaks in.
+        for &(m, k, n, block_size) in &[
+            (1usize, 96usize, 13usize, 32usize),
+            (5, 128, 8, 32),
+            (6, 64, 7, 32),
+            (8, 256, 16, 128),
+            (3, 96, 5, 32),
+        ] {
+            for &asymmetric in &[false, true] {
+                let weights_nk: Vec<f32> = (0..n * k).map(|_| next()).collect();
+                let activations: Vec<f32> = (0..m * k).map(|_| next()).collect();
+                let (packed, scales, zps, _dequant) =
+                    quantize(&weights_nk, n, k, block_size, asymmetric);
+                let zp_slice = zps.as_deref();
+                let bias: Vec<f32> = (0..n).map(|_| next()).collect();
+
+                let mut expected = vec![0.0f32; m * n];
+                borrowed_affine_int4_matmul(
+                    &activations,
+                    &packed,
+                    BorrowedScales::F32(&scales),
+                    zp_slice,
+                    Some(&bias),
+                    &mut expected,
+                    m,
+                    k,
+                    n,
+                    block_size,
+                    selected_dot_kernel(),
+                );
+
+                let mut got = vec![0.0f32; m * n];
+                borrowed_affine_int4_matmul_prefill(
+                    &activations,
+                    &packed,
+                    BorrowedScales::F32(&scales),
+                    zp_slice,
+                    Some(&bias),
+                    &mut got,
+                    m,
+                    k,
+                    n,
+                    block_size,
+                    selected_dot_kernel(),
+                );
+
+                for (index, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "m={m} k={k} n={n} block={block_size} asym={asymmetric} \
+                         index {index}: per-column {a} vs prefill {b} not bit-identical"
                     );
                 }
             }
