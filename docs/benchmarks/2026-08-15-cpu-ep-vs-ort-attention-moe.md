@@ -1313,3 +1313,71 @@ work.
   in-place append (#1083) applies to the GQA-shaped cache, not this one.
 
 These are recorded as measured facts. No fix is claimed for either.
+
+## 21. Where a run actually goes: the boundary instrument
+
+§20 could show that the Transpose *kernel* is not the cost, but not what is,
+because `ONNX_GENAI_PROFILE_OPS` times per-node execution and nothing around it.
+That instrument now exists. The executor already had an env-gated phase
+profiler (`NXRT_EXEC_PHASE_PROFILE`); this adds a `bench_generic --phase-profile`
+flag that turns it on programmatically, resets it after warmups so the totals
+cover exactly `--runs` measured runs, and prints it - plus one new phase,
+`run_scoped.bind_inputs`, around the loop that uploads graph inputs.
+
+### 21.1 The decomposition
+
+`bench_generic --native-only --native-threads 16 --runs 30 --warmups 10
+--phase-profile`, microseconds per run. `plan_eager` is the whole node-execution
+plan - everything `ONNX_GENAI_PROFILE_OPS` sees. `bind_inputs` is a subset of
+`setup_total`.
+
+| graph | in | out | run | `setup_total` | of which `bind_inputs` | `collect_outputs` | `plan_eager` |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| `tr_llama3_s512` | 8 MiB | 8 MiB | 808 | 605.7 | **601.3** | 208.0 | 7.8 |
+| `tr_bert_b8_s128` | 3 MiB | 3 MiB | 570 | 346.8 | **341.1** | 218.8 | 7.6 |
+| `tr_whisper_s1500` | 7.3 MiB | 7.3 MiB | 866 | 647.6 | **642.2** | 217.4 | 8.1 |
+| `kvcat_llama3_p4095` | 32 MiB | 0 | 4151 | 1898.6 | **1678.5** | 2.2 | 2354.9 |
+| `kvcat_llama3_p8191` | 64 MiB | 0 | 7100 | 3480.9 | **3474.3** | 1.5 | 3610.7 |
+
+Read the first row: of a 0.808 ms run, **601 us is copying the 8 MiB input into
+an EP-owned buffer**, 208 us is materialising the 8 MiB strided graph output,
+and 7.8 us is every node in the graph. `bind_inputs` is 99.3% of `setup_total`
+on that row and 99.8% on the last one, so "setup" is not shape work, plan
+restoration or buffer sizing - those sum to about 5 us. It is one `memcpy`.
+Binding plus collecting is 100.2% of the `tr_llama3_s512` run and 98.7% of
+`tr_bert_b8_s128`; the excess over 100% is the phase profiler's own overhead
+against a separately timed wall clock, and it is the honest error bar on these
+rows.
+
+The `Concat` rows say the same thing from the other side. Their outputs are
+owned buffers, so `collect_outputs` is ~2 us and moves zero bytes; but they take
+two large past-KV inputs, and binding those is 1.7-3.5 ms - between 40% and 49%
+of the run, alongside a genuine 2.4-3.6 ms of `Concat`.
+
+### 21.2 Why the copy exists
+
+`Executor::prepare_run_buffers` ends with, for every graph input,
+`self.ep.copy_from_host(tensor.as_bytes(), buf)`. The EP owns its buffers and
+kernels write through them, so an input has to be inside one before the plan
+runs. ORT does not pay this: `Value` can borrow the caller's allocation, and its
+CPU EP reads the caller's memory directly.
+
+Closing that gap properly means letting a `DeviceBuffer` borrow host memory for
+the duration of a run, which is a lifetime and aliasing change to the EP ABI
+(the buffer must not outlive the caller's tensor, and no kernel may write
+through a borrowed input). That is not attempted here. What §22 does instead is
+make the copy that must happen cost less.
+
+### 21.3 What this changes about earlier sections
+
+* §20.1 said the residual was "session per-run work" and explicitly declined to
+  split it further. It is now split: for the Transpose graphs it is **60-74%
+  input binding, 25-38% output materialisation, ~1% nodes**. §20's conclusion is
+  unchanged and its caution is now discharged.
+* The single-node harness charges every graph two full tensor copies that a real
+  transformer forward would pay once for the whole model. Every ratio in this
+  document measured on a single-node graph is inflated by that, ours only. This
+  is a property of the benchmark, not of the runtime, and it is the reason the
+  §20.2 rows look so much worse than the §10 assignment evidence.
+* The `Concat` rows are *not* explained away by it: 3.2-3.9 ms of real kernel
+  time survives after the copies are accounted for. §13's boundary still binds.

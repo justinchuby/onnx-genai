@@ -388,14 +388,23 @@ impl Executor {
         }
 
         // --- Bind input bytes into their (now correctly sized) buffers ------
+        // Every graph input is copied host->EP here, once per run. For a large
+        // activation input that copy is the single biggest item in `setup_total`,
+        // so it gets its own phase and byte counter rather than being folded
+        // into the setup bucket where it cannot be told from shape work.
+        let _s = phase_span!("run_scoped.bind_inputs");
+        let mut input_bytes = 0usize;
         for (name, tensor) in inputs {
             let vid = self.input_index[*name];
             let buf = self
                 .buffers
                 .get_mut(&vid)
                 .expect("input value has a buffer");
-            self.ep.copy_from_host(tensor.as_bytes(), buf)?;
+            let bytes = tensor.as_bytes();
+            input_bytes += bytes.len();
+            self.ep.copy_from_host(bytes, buf)?;
         }
+        phase_profile::record("bind_inputs.host_bytes", input_bytes as u128);
         Ok(())
     }
 

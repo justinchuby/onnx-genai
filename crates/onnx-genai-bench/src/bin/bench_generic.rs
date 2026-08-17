@@ -26,6 +26,15 @@ struct Args {
     /// Override the first model input shape, for example 1,3,416,416.
     #[arg(long)]
     input_shape: Option<String>,
+    /// Report the native executor's per-run phase breakdown (setup, shape
+    /// resolution, buffer sizing, node execution, graph-output collection)
+    /// after the measured runs. Warmups are excluded: the accumulator is reset
+    /// once warmup finishes, so every printed total covers exactly `--runs`
+    /// native runs. This is the only way to attribute the part of a run that
+    /// the per-op profiler (`ONNX_GENAI_PROFILE_OPS=1`) leaves undifferentiated,
+    /// because that one times node execution and nothing around it.
+    #[arg(long)]
+    phase_profile: bool,
     /// Measure ORT only. Useful for recording a baseline when native loading or execution fails.
     #[arg(long)]
     ort_only: bool,
@@ -597,6 +606,12 @@ fn main() -> Result<()> {
     }
     validate_tolerance("rel-tolerance", args.rel_tolerance)?;
     validate_tolerance("abs-tolerance", args.abs_tolerance)?;
+    if args.phase_profile {
+        // Turn the executor's phase accounting on programmatically rather than
+        // through `NXRT_EXEC_PHASE_PROFILE`, so the flag works on its own and
+        // cannot be half-set by an inherited environment.
+        onnx_runtime_session::enable_exec_phase_profile_for_process();
+    }
     let input_shape = args
         .input_shape
         .as_deref()
@@ -715,6 +730,12 @@ fn main() -> Result<()> {
             std::hint::black_box(ort_session.run(&ort_inputs).context("ORT warmup")?);
         }
     }
+    if args.phase_profile {
+        // Warmups pay first-touch page faults and lazy plan construction that
+        // no measured run repeats. Counting them would attribute one-time cost
+        // to the steady state.
+        onnx_runtime_session::reset_exec_phase_profile();
+    }
     let mut native_samples = Vec::with_capacity(args.runs);
     let mut ort_samples = Vec::with_capacity(args.runs);
     for run in 0..args.runs {
@@ -756,6 +777,9 @@ fn main() -> Result<()> {
             native.spread(),
             if parity_pass { "PASS" } else { "FAIL" }
         );
+        if args.phase_profile {
+            onnx_runtime_session::print_exec_phase_profile();
+        }
         return Ok(());
     }
     let ort = Stats::from(ort_samples);
@@ -777,6 +801,9 @@ fn main() -> Result<()> {
         ort.spread(),
         if parity_pass { "PASS" } else { "FAIL" }
     );
+    if args.phase_profile {
+        onnx_runtime_session::print_exec_phase_profile();
+    }
     Ok(())
 }
 
