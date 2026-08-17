@@ -1206,7 +1206,7 @@ Phase 3 ratios. The reasoning was wrong in an important way.
 ### 20.1 The measurement
 
 `ONNX_GENAI_PROFILE_OPS=1 bench_generic --native-only --native-threads 16`, 30 runs,
-against the merged `main` (`0b6e2ce3a`):
+against the merged `main` (`86a2d6eb1`, the commit that merged #1099):
 
 | graph | output bytes | total node execution | of which Transpose | end-to-end native |
 |---|--:|--:|--:|--:|
