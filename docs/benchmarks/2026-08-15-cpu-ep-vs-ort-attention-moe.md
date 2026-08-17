@@ -631,3 +631,400 @@ does not support deferral. A future deferral needs a fused-graph measurement.
 6. MoE grouped/batched GEMM was not attempted. The measured MoE gap in this
    session (1.1–2.4× at 8/16 threads) is a threading-granularity gap, not an
    arithmetic one.
+
+---
+
+# Phase 4 — the appendable KV cache
+
+## 12. Half-precision KV caches never got the O(1) append (#1083)
+
+### What was already there
+
+`GroupQueryAttention` has supported ORT's `past_present_share_buffer` contract
+for some time. When the caller binds the graph's `present_key`/`present_value`
+outputs onto the **same memory** as the `past_key`/`past_value` inputs at full
+physical capacity, `detect_inplace_kv`
+(`crates/onnx-runtime-ep-cpu/src/kernels/group_query_attention.rs`) recognises
+the aliasing structurally — identical origins, exact capacity, contiguous, K and
+V disjoint — and the step appends only the new token's rows. History is already
+resident; nothing is recopied.
+
+So Phase 4's requirement 1, "append the new token without recopying full
+history", was **half done before Phase 4 started**. The half that was missing is
+the half production uses.
+
+### The gap
+
+`detect_inplace_kv` accepted **contiguous f32 only**. Exported decoders ship
+their KV cache in `f16` (or `bf16`), so every real model failed the gate and fell
+back to the owned-scratch path, which makes two full passes over the entire
+cache on every decode step:
+
+1. `fill_present` widens the whole `f16` history into f32 scratch, then
+2. the trailing output writer narrows the whole f32 scratch back into the
+   graph's `present_*` outputs.
+
+Only step 2 is avoidable — the attention core genuinely needs f32 K/V — but it is
+the expensive one. It is a **write** across `2 · B · H_kv · S · D` elements that
+dirties the entire cache footprint every token, fed by an equally large f32 read.
+
+A test on the pre-#1083 base had even pinned the gap in place:
+`detect_inplace_kv_gate_rejects_f16_cache` asserted the rejection, with a comment
+explaining that "the append path only supports contiguous f32". It was describing
+a limitation, not a requirement. (#1083 keeps the test — the *f32* gate must
+still decline half-precision — and rewords the comment to point at
+`detect_inplace_kv_half`.)
+
+### What shipped
+
+`detect_inplace_kv_half` + `append_and_widen_half`. The gate is the same
+structural proof, extended with an encoding check: `f16` and `bf16` share a width
+but not a bit layout, so a mismatched past/present pair is declined rather than
+reinterpreted. When it fires, only the new rows are narrowed into the resident
+cache and `[0, total)` is widened back out for attention. The full-history narrow
+disappears.
+
+### Results — f16 decode, `append` ÷ `copy`, median of 4 independent sweeps
+
+Both arms are today's shipping kernel on the same geometry; the only difference
+is whether the caller bound `present` onto `past`. The `copy` arm is exactly what
+every half-precision model runs on `main`.
+
+| geometry | H_kv × D | kv=2048 | kv=4096 | kv=8192 | kv=16384 |
+|---|---|---|---|---|---|
+| qwen2.5-0.5b | 2 × 64 | 0.870 | 0.890 | 0.983 † | 0.945 † |
+| qwen3-0.6b | 8 × 128 | 0.761 | **0.504** | 0.669 | **0.600** |
+| llama-3.1-8b | 8 × 128 | 0.777 † | **0.554** | 0.692 | 0.684 |
+| qwen2.5-7b | 4 × 128 | 0.799 | 0.917 | 0.787 | 0.789 |
+
+† per-run ratio range reaches or crosses 1.0 across the 4 sweeps (0.91–1.03,
+0.92–1.06 and 0.77–1.03 respectively) — read these three as "no regression", not
+as a gain. Every other cell's range stays strictly below 1.0. Absolute medians and full dispersion are in
+PR #1083; all 16 cells are reported there, none omitted.
+
+The pattern is what the mechanism predicts: the win tracks cache size. The three
+wide-KV geometries (`H_kv · D` of 1024 or 512) gain 8–50%; `qwen2.5-0.5b`, whose
+`H_kv · D = 128` is the smallest in the set, gains 11–13% at short context and
+nothing measurable at long context, because the removed traffic is small next to
+the attention work.
+
+### Bytes removed — exact, not measured
+
+Per decode step per layer the eliminated narrow is `2 · B · H_kv · C · D` half
+writes plus the equally large f32 reads feeding it, replaced by
+`2 · B · H_kv · q_seq · D` half writes. At `q_seq = 1` that is a factor of `C`.
+For qwen3-0.6b at `C = 16384`: **≈67 MB of writes and ≈134 MB of reads removed
+per step per layer**.
+
+### What this is NOT
+
+**This is not an "ours beats ORT" result.** ORT CPU's GQA already appends in
+place under `past_present_share_buffer`; so did ours, for f32. This closes a
+parity gap on the dtype production actually ships. It does not open a lead, and
+it should not be quoted as one.
+
+## 13. The structural boundary: why `Concat`-shaped KV cannot append
+
+The GQA path above works because `GroupQueryAttention` takes the valid length as
+a runtime **value** input (`seqlens_k`, `total_sequence_length`), not from a
+tensor shape. That is what lets `past` and `present` both be declared at physical
+capacity `[B, H_kv, C, D]` while the kernel operates on `[0, total)`.
+
+Models that build their cache with a plain `Concat(past, new)` instead cannot do
+this, and the reason is not a missing optimisation — it is the binding ABI:
+
+* `ExternalValue` (`crates/onnx-runtime-session/src/executor/state.rs:638-646`)
+  carries `dtype, shape, accepts_subshape, ptr, len, alignment, device`. The one
+  knob that looks like it might help — `accepts_subshape` — is a bounded per-dim
+  `valid ≤ capacity` check (`accepts_output`), not strides. **There is no strides
+  field.** A device-bound value is always dense.
+* `DeviceIoBinding` (`crates/onnx-runtime-session/src/tensor.rs:316`) does carry
+  `physical_shape` (capacity) and `logical_shape` (valid prefix), and
+  `kernel_input_shape()` exposes the logical prefix to kernels. But because the
+  value is dense, a logical prefix is only *correct* when the growing axis is the
+  outermost one.
+* KV caches are `[B, H_kv, S, D]` — `S` is axis 2. A capacity-backed view of that
+  is `shape [B,H,S,D]` with strides `[H·C·D, C·D, D, 1]`, which is **not
+  expressible** as a dense `ExternalValue`. Every head's slab would need shifting.
+
+Consequently, for a `Concat`-shaped cache the history copy is semantically
+required inside a single `Run`: the caller owns `past`, `present` is a distinct
+graph output, and no legal aliasing makes the old bytes already correct at their
+destination. Eliding it would need one of:
+
+1. strides on `ExternalValue`/`DeviceIoBinding` — invasive, changes the binding
+   contract for every EP;
+2. a KV layout whose growth axis is outermost (`[S, B, H, D]`) — no exported
+   decoder uses one; or
+3. the GQA route above, which is what §12 extends.
+
+This is reported as a boundary rather than a to-do because options 1 and 2 are
+model/ABI changes, not kernel work. Phase 3's attempt to attack the same cost
+from the `Concat` kernel side (parallelising the copy) is recorded as a negative
+result in §8: no win in any of 15 cells and a non-overlapping regression at
+`kvcat_llama3_p1023` t=16.
+
+## 14. Phase 4 limitations
+
+* §12's gain is only reachable when the caller binds `present` onto `past`. A
+  session that lets the executor allocate a fresh `present` each step keeps the
+  copy path, byte-for-byte unchanged.
+* The §12 measurement is kernel-level, not a full ORT session A/B. That is
+  deliberate: the aliased binding is a property of *how the caller drives the
+  session*, and `scripts/ort_ab/ab.py` drives plain `session.run()`, which cannot
+  express it. Both arms are the shipping kernel, so this is our-old-path versus
+  our-new-path under one binding contract — not a kernel-vs-scalar proxy — but it
+  is also not evidence about ORT.
+* Criterion runs arms sequentially within a sweep. The interleaving here comes
+  from repeating the whole sweep four times under varying host load, not from
+  alternating arms inside one pass. On a contended host that matters: a
+  **preliminary** sweep — taken before the four reported above and not part of
+  their dispersion — showed two `qwen2.5-0.5b` cells *regressing* (ratios 1.285
+  at kv=4096 and 1.080 at kv=16384). The 4-sweep medians falsified both, and
+  neither regression is reproducible within the reported 0.81–0.93 and 0.92–1.06
+  ranges. The raw preliminary CSV no longer exists, so that pair of numbers is
+  recorded as provenance for why four sweeps are used, not as a result.
+* Phase 4 requirements 2–5 (grouped MoE GEMM, fused transpose-with-consumer,
+  the Softmax fusion-anchor session A/B, allocator-independent cache thresholds)
+  are not addressed *in this section*. Requirement 4 is answered in §15 and
+  requirement 5 in §16; requirements 2 and 3 remain open (§17).
+
+## 15. The Softmax "fusion anchor" claim, finally measured (#1094)
+
+`assignment_policy.rs` kept its claim on `Softmax` even though the isolated node
+loses to ORT by 1.28–8.83x, on the grounds that it anchors the SDPA fusion. The
+module's own comment conceded the gap: *"a claim to defer it needs a fused-graph
+measurement this module does not have."* Phase 4 requirement 4 was to get that
+measurement.
+
+### The graph
+
+`scripts/ort_ab/gen_sdpa_region.py` (added in #1094) emits the full region the
+matcher wants — `MatMul → Div(scalar const) → [Add(mask)] → Softmax(axis=-1) →
+MatMul` — with K pre-transposed to `[B,H,D,S_kv]` so the score product is a plain
+`MatMul`. `ONNX_GENAI_PROFILE_OPS=1` confirms it collapses to a **single**
+`com.microsoft::FusedAttention` node at **99.8% of node time**. So this measures
+the fused region, not a proxy for it.
+
+### First answer: the region loses, badly
+
+Against a real ORT CPU session on identical graphs, options and thread counts —
+3 geometries × 3 phases × mask/nomask × {1,8,16} threads = 54 cells — the fused
+region lost in **48 of 54 cells**, by up to **22.8x**. Only 5 cells were ≥5%
+faster, all at 1 thread and all unmasked. (These are the `base` arm of the
+same-session A/B tabulated below, so they are directly comparable to the `new`
+column. An earlier single-arm session on the same graphs independently gave
+50 of 54 and 21.6x; the two agree, but only the same-session figures are quoted
+as results, because cross-session absolutes on this host drift >4x.)
+
+The shape of the loss was the clue: masked cells lost **1.07–22.8x** while
+unmasked cells spanned **0.91–12.6x**, and the **seven worst cells were all
+masked**. The mask was costing more than the attention.
+
+### Cause
+
+`FusedAttention` made three full passes over the score matrix, two of them
+serial:
+
+1. `for s in &mut scores { *s *= self.scale }` — serial, scalar.
+2. `broadcast_apply(mask, .., |i, v| scores[i] += v)` — serial, one indirect
+   closure call per element.
+3. `softmax_rows_in_place` — parallel.
+
+The score matrix is `batch·heads·seq_q·seq_k` floats: **33 MiB** for a 32-head
+512-token prefill. Two serial passes over 33 MiB is ~66 MiB of single-threaded
+memory traffic that no amount of softmax parallelism can shrink. That is the
+ceiling, and it is why the masked cells were so much worse — the mask pass was
+overhead the unmasked path never paid.
+
+### Fix and result (#1094)
+
+All three stages now run as one parallel fan-out over ~32 KiB row tiles, with
+each worker resolving its own mask offsets from a global row index rather than
+walking the mask serially from the start.
+
+Measured same-session and interleaved, this branch against **its own merge
+base**, both arms scored against ORT in the same process. 10 warmups, 30 runs,
+3 interleaved trials, medians. Cross-session absolutes on this host drift >4x,
+so only paired same-session ratios are reported.
+
+The **27 unmasked cells are a negative control**: without a mask the change only
+folds a scale multiply into the parallel fan-out and adds row tiling, neither of
+which should alter the cost, so their spread is this host's noise floor. (This
+is slightly weaker than a true no-op control — the tiling does change cache
+behaviour and parallel granularity on that path too — but empirically it did not
+move the median.)
+
+| group | cells | median | band |
+|---|---:|---:|---|
+| **control** (unmasked) | 27 | **1.00x** | 0.76x .. 1.10x |
+| masked | 27 | **1.26x** | 0.72x .. 8.44x |
+
+**25 of 27 masked cells improve beyond the control's best case (1.10x).** That
+threshold is a deliberately conservative empirical bound, not a confidence
+interval — with 27 control samples the observed maximum overstates the true
+noise ceiling. The separation here (median 1.26x vs 1.00x, with individual
+cells at 8x) is far too large for a more formal test to change the conclusion.
+
+Full matrix, all 54 cells, `native ÷ ORT` (lower is better, 1.00 = parity):
+
+| model | phase | mask | threads | base / ORT | new / ORT | new vs base |
+|---|---|---|---:|---:|---:|---:|
+| llama-3.1-8b | decode q1/kv1024 | mask | 1 | 1.127 | 1.009 | **1.12x** |
+| llama-3.1-8b | decode q1/kv1024 | mask | 8 | 6.355 | 5.646 | **1.13x** |
+| llama-3.1-8b | decode q1/kv1024 | mask | 16 | 9.343 | 8.357 | **1.12x** |
+| llama-3.1-8b | decode q1/kv1024 | nomask | 1 | 0.950 | 0.971 | **0.98x** |
+| llama-3.1-8b | decode q1/kv1024 | nomask | 8 | 6.337 | 6.221 | **1.02x** |
+| llama-3.1-8b | decode q1/kv1024 | nomask | 16 | 12.578 | 12.698 | **0.99x** |
+| llama-3.1-8b | decode q1/kv4096 | mask | 1 | 1.073 | 0.932 | **1.15x** |
+| llama-3.1-8b | decode q1/kv4096 | mask | 8 | 5.236 | 4.398 | **1.19x** |
+| llama-3.1-8b | decode q1/kv4096 | mask | 16 | 5.513 | 5.006 | **1.10x** |
+| llama-3.1-8b | decode q1/kv4096 | nomask | 1 | 0.932 | 0.932 | **1.00x** |
+| llama-3.1-8b | decode q1/kv4096 | nomask | 8 | 4.465 | 4.477 | **1.00x** |
+| llama-3.1-8b | decode q1/kv4096 | nomask | 16 | 5.090 | 5.242 | **0.97x** |
+| llama-3.1-8b | prefill q512/kv512 | mask | 1 | 3.171 | 1.069 | **2.97x** |
+| llama-3.1-8b | prefill q512/kv512 | mask | 8 | 17.382 | 3.055 | **5.69x** |
+| llama-3.1-8b | prefill q512/kv512 | mask | 16 | 17.126 | 3.279 | **5.22x** |
+| llama-3.1-8b | prefill q512/kv512 | nomask | 1 | 1.117 | 1.104 | **1.01x** |
+| llama-3.1-8b | prefill q512/kv512 | nomask | 8 | 3.028 | 3.091 | **0.98x** |
+| llama-3.1-8b | prefill q512/kv512 | nomask | 16 | 3.548 | 3.869 | **0.92x** |
+| qwen2.5-0.5b | decode q1/kv1024 | mask | 1 | 1.400 | 0.889 | **1.57x** |
+| qwen2.5-0.5b | decode q1/kv1024 | mask | 8 | 9.500 | 7.517 | **1.26x** |
+| qwen2.5-0.5b | decode q1/kv1024 | mask | 16 | 5.655 | 7.872 | **0.72x** |
+| qwen2.5-0.5b | decode q1/kv1024 | nomask | 1 | 0.912 | 1.156 | **0.79x** |
+| qwen2.5-0.5b | decode q1/kv1024 | nomask | 8 | 8.771 | 9.391 | **0.93x** |
+| qwen2.5-0.5b | decode q1/kv1024 | nomask | 16 | 9.291 | 9.737 | **0.95x** |
+| qwen2.5-0.5b | decode q1/kv4096 | mask | 1 | 1.348 | 0.929 | **1.45x** |
+| qwen2.5-0.5b | decode q1/kv4096 | mask | 8 | 6.884 | 5.497 | **1.25x** |
+| qwen2.5-0.5b | decode q1/kv4096 | mask | 16 | 7.924 | 6.692 | **1.18x** |
+| qwen2.5-0.5b | decode q1/kv4096 | nomask | 1 | 0.937 | 0.927 | **1.01x** |
+| qwen2.5-0.5b | decode q1/kv4096 | nomask | 8 | 5.924 | 5.580 | **1.06x** |
+| qwen2.5-0.5b | decode q1/kv4096 | nomask | 16 | 8.476 | 8.115 | **1.04x** |
+| qwen2.5-0.5b | prefill q512/kv512 | mask | 1 | 5.033 | 1.031 | **4.88x** |
+| qwen2.5-0.5b | prefill q512/kv512 | mask | 8 | 20.182 | 2.390 | **8.44x** |
+| qwen2.5-0.5b | prefill q512/kv512 | mask | 16 | 22.783 | 2.931 | **7.77x** |
+| qwen2.5-0.5b | prefill q512/kv512 | nomask | 1 | 1.097 | 1.096 | **1.00x** |
+| qwen2.5-0.5b | prefill q512/kv512 | nomask | 8 | 3.459 | 3.151 | **1.10x** |
+| qwen2.5-0.5b | prefill q512/kv512 | nomask | 16 | 3.638 | 4.792 | **0.76x** |
+| qwen3-0.6b | decode q1/kv1024 | mask | 1 | 1.107 | 0.952 | **1.16x** |
+| qwen3-0.6b | decode q1/kv1024 | mask | 8 | 19.460 | 15.039 | **1.29x** |
+| qwen3-0.6b | decode q1/kv1024 | mask | 16 | 10.791 | 9.691 | **1.11x** |
+| qwen3-0.6b | decode q1/kv1024 | nomask | 1 | 0.959 | 0.960 | **1.00x** |
+| qwen3-0.6b | decode q1/kv1024 | nomask | 8 | 7.716 | 9.431 | **0.82x** |
+| qwen3-0.6b | decode q1/kv1024 | nomask | 16 | 11.438 | 10.804 | **1.06x** |
+| qwen3-0.6b | decode q1/kv4096 | mask | 1 | 1.080 | 0.938 | **1.15x** |
+| qwen3-0.6b | decode q1/kv4096 | mask | 8 | 4.972 | 3.529 | **1.41x** |
+| qwen3-0.6b | decode q1/kv4096 | mask | 16 | 4.459 | 4.282 | **1.04x** |
+| qwen3-0.6b | decode q1/kv4096 | nomask | 1 | 0.929 | 0.937 | **0.99x** |
+| qwen3-0.6b | decode q1/kv4096 | nomask | 8 | 4.648 | 4.322 | **1.08x** |
+| qwen3-0.6b | decode q1/kv4096 | nomask | 16 | 4.307 | 4.282 | **1.01x** |
+| qwen3-0.6b | prefill q512/kv512 | mask | 1 | 3.173 | 1.018 | **3.12x** |
+| qwen3-0.6b | prefill q512/kv512 | mask | 8 | 16.355 | 2.670 | **6.13x** |
+| qwen3-0.6b | prefill q512/kv512 | mask | 16 | 17.325 | 2.951 | **5.87x** |
+| qwen3-0.6b | prefill q512/kv512 | nomask | 1 | 1.063 | 1.076 | **0.99x** |
+| qwen3-0.6b | prefill q512/kv512 | nomask | 8 | 2.929 | 2.840 | **1.03x** |
+| qwen3-0.6b | prefill q512/kv512 | nomask | 16 | 2.876 | 3.149 | **0.91x** |
+### Second answer: still decline it
+
+The fix is large — up to **8.44x** — and masked single-thread decode now beats
+ORT outright (0.889–1.009x, was 1.073–1.400x). It is not enough. **44 of 54
+cells are still slower than ORT**, 41 of them by ≥5%, and only 7 are ≥5% faster
+(base: 5). The worst remaining cells are **15.0x at 8 threads** and **12.7x at
+16 threads**, because the remaining time is in the QK and PV GEMMs and their
+thread scaling, not in the scale/mask/softmax stage that #1094 fixed.
+
+So the honest answer to requirement 4 is the one it anticipated: **the fused
+region does not clear the ≥5% bar, and should be declined to ORT wherever the
+Plugin EP has that option.** Keeping `Softmax` claimed *purely* to preserve a
+fusion that then loses is not justified by this data.
+
+The blocker is structural rather than a matter of will: `claim_preference(op,
+opset, shapes, input_dtypes)` in `assignment_policy.rs` is **per-node and has no
+graph context**, so "decline this whole region" is not expressible in it. Only
+`Softmax` itself can be deferred, which risks fragmenting the region — claim QK,
+defer Softmax, claim PV — and that fragmentation cost is *unmeasured*. Deferring
+on that basis would be trading a measured 3–15x loss for an unmeasured one.
+
+For the **native `InferenceSession`**, which has no ORT to decline to, #1094 is
+strictly the best available implementation and the right outcome regardless.
+
+## 16. Allocation-cache thresholds, calibrated rather than assumed (#1088)
+
+`large_alloc_cache.rs` carried `MIN_CACHED_BYTES = 256 KiB`, justified by a
+comment claiming glibc's dynamic `mmap` threshold adjustment *"does not apply to
+a request that is freed at the same size it was taken."* That is backwards.
+glibc's `_int_free`, on releasing an mmapped chunk, does exactly the opposite:
+
+```c
+if (!mp_.no_dyn_threshold
+    && chunksize_nomask(p) > mp_.mmap_threshold
+    && chunksize_nomask(p) <= DEFAULT_MMAP_THRESHOLD_MAX) {
+    mp_.mmap_threshold = chunksize(p);
+    mp_.trim_threshold = 2 * mp_.mmap_threshold;
+}
+```
+
+`DEFAULT_MMAP_THRESHOLD_MAX` is `4 * 1024 * 1024 * sizeof(long)` = **32 MiB** on
+64-bit. A stably-sized block *below* that is mmapped once and arena-served
+thereafter, so a cache on top of it adds only a mutex; above it the adaptation
+stops permanently and the cache is worth a great deal.
+
+A standalone C probe timing alloc + first-touch-every-page + free across
+256 KiB → 256 MiB found exactly that cliff: **~8 ns/page below 32 MiB, ~200
+ns/page above it**.
+
+Measured, cache ÷ system allocator (two independent sweeps):
+
+| size | system | cached | sweep 1 | sweep 2 | effect |
+|---|---:|---:|---:|---:|---|
+| 256 KiB | 401.0 ns | 463.6 ns | 1.156 | 1.032 | up to **16% slower** |
+| 1 MiB | 1.490 µs | 1.520 µs | 1.020 | 1.011 | neutral–2% slower |
+| 4 MiB | 7.547 µs | 7.453 µs | 0.987 | 1.016 | neutral |
+| 16 MiB | 29.69 µs | 30.10 µs | 1.014 | 1.000 | neutral |
+| 32 MiB | 2.736 ms | 60.39 µs | 0.022 | 0.022 | **45.3x faster** |
+| 64 MiB | 3.951 ms | 122.2 µs | 0.031 | 0.031 | **32.3x faster** |
+| 192 MiB | 12.71 ms | 389.3 µs | 0.031 | 0.029 | **32.6x faster** |
+
+Interleaved (4 live sizes): 1 MiB 0.997/1.013, 16 MiB 1.008/1.009, 64 MiB
+0.033/0.034. Eight threads: 256 KiB 0.978/1.022, 4 MiB 0.982/1.013, 64 MiB
+0.034/0.037.
+
+The old floor was therefore ~128x too low, and the cache was doing net harm
+across most of the range it was enabled for. This does not undercut #1075, whose
+motivating case was a 180 MB output well above the corrected floor.
+
+Rather than hardcode 32 MiB — which is a glibc constant, not a universal one —
+the floor is now **calibrated at runtime** by a bounded geometric-ladder probe
+(50 ms hard budget checked per sample, memoised per process), falling back to a
+per-platform constant if no cliff is found. This is also correct under
+`mallopt`/`MALLOC_MMAP_THRESHOLD_`, which disable the adaptation entirely:
+the probe observes the effect rather than assuming the mechanism.
+
+The budget is likewise topology-aware: `min(2 GiB, allowance/8)`, where the
+allowance walks `/proc/self/cgroup` root→leaf taking the smallest concrete
+limit before falling back to `MemAvailable`. Reading `/sys/fs/cgroup/memory.max`
+alone — the previous approach — finds the limit at the *mount root*, which is
+the process's own cgroup only under a private cgroup namespace; it is wrong
+under a systemd slice with `MemoryMax=`, under `cgroupns=host`, and for anything
+nested, and in each of those cases it hands the cache a budget the cgroup will
+never allow.
+
+## 17. Phase 4 limitations
+
+* §15's remaining gap — up to 15.0x at 8 threads and 12.7x at 16 — is in the
+  QK/PV GEMMs. #1094 does not touch them.
+* §15 recommends declining the fused region in the Plugin EP but **does not
+  implement it**, because `claim_preference` is per-node and the fragmentation
+  cost of deferring `Softmax` alone is unmeasured. Implementing the decline
+  without that measurement would substitute one unquantified loss for a
+  quantified one.
+* One masked cell in §15 regresses (qwen2.5-0.5b decode kv1024, 16 threads:
+  5.66x → 7.87x, i.e. 0.72x). It sits inside the control band (min 0.76x) on a
+  3-trial median of a sub-millisecond kernel, so it is read as noise — but it is
+  reported rather than dropped.
+* §16's cliff is measured on glibc/x86-64 only. The musl, macOS and Windows
+  fallback floors are reasoned from allocator design, **not measured**. The
+  runtime probe is what makes that acceptable: on any platform where the reasoning
+  is wrong, calibration overrides the constant.
+* Phase 4 requirements 2 (grouped MoE GEMM) and 3 (fused transpose-with-consumer)
+  remain **open and unstarted**. The §10 assignment matrix is unchanged by Phase 4.

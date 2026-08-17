@@ -1,0 +1,36 @@
+ir_version: 10
+graph {
+  node: [
+    {
+      input: ["X"] output: ["Z"] op_type: "QuickGelu" domain: "com.microsoft"
+      attribute: [{ name: "alpha" type: FLOAT f: 1.702 }]
+    }
+  ]
+  name: "quickgelu_assignment_f16"
+  input: [
+  {
+    name: "X"
+    type {
+      tensor_type {
+        elem_type: 10
+        shape { dim: [{ dim_value: 1 }, { dim_value: 8 }] }
+      }
+    }
+  }
+  ]
+  output: [
+  {
+    name: "Z"
+    type {
+      tensor_type {
+        elem_type: 10
+        shape { dim: [{ dim_value: 1 }, { dim_value: 8 }] }
+      }
+    }
+  }
+  ]
+}
+opset_import: [
+  { version: 22 },
+  { domain: "com.microsoft" version: 1 }
+]

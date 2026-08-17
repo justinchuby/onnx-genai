@@ -23,20 +23,23 @@
 //!
 //! Every stage reuses a shared single-source-of-truth helper: the batched
 //! [`matmul_dense`](super::matmul::matmul_dense) GEMM for both `Q·Kᵀ` and
-//! `probs·V`, [`broadcast_apply`](super::add::broadcast_apply) for the additive
-//! mask, and [`softmax_rows_in_place`](super::softmax::softmax_rows_in_place)
-//! for the last-axis softmax — the same numerically-stable (max-subtract)
-//! reduction the standalone `Softmax` kernel uses.
+//! `probs·V`, and
+//! [`scale_mask_softmax_rows`](super::softmax::scale_mask_softmax_rows) for the
+//! scale/mask/softmax stage — the same numerically-stable (max-subtract)
+//! reduction the standalone `Softmax` kernel uses, with the additive mask
+//! resolved through [`broadcast_effective_strides`](super::add::broadcast_effective_strides)
+//! so the broadcast is folded into the parallel fan-out rather than walked
+//! serially beforehand.
 
 use onnx_runtime_ep_api::{
     DeviceId, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
 };
 use onnx_runtime_ir::{DataType, Node, broadcast_shapes, compute_contiguous_strides};
 
-use super::add::broadcast_apply;
+use super::add::broadcast_effective_strides;
 use super::check_arity;
 use super::matmul::matmul_dense;
-use super::softmax::softmax_rows_in_place;
+use super::softmax::{MaskPlan, scale_mask_softmax_rows};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::numel;
 
@@ -112,7 +115,7 @@ impl Kernel for FusedAttentionKernel {
         // Stage 1: scores = Q · Kᵀ. When `k_transposed`, K is already Kᵀ and we
         // multiply as-is; otherwise expose Kᵀ as a strided view (swap the last
         // two axes) so the shared GEMM never copies to transpose.
-        let (mut scores, scores_shape) = if self.k_transposed {
+        let (scores, scores_shape) = if self.k_transposed {
             let s = matmul_dense(q, k)?;
             let shape = matmul_result_shape(q.shape, k.shape, "Q·K")?;
             (s, shape)
@@ -129,28 +132,43 @@ impl Kernel for FusedAttentionKernel {
             (s, shape)
         };
 
-        // Stage 2: scale, then (optional) additive mask — matching the graph
-        // order `(Q·Kᵀ) * scale` then `+ mask`.
-        for s in &mut scores {
-            *s *= self.scale;
-        }
-        if has_mask {
-            let mask = to_dense_f32_widen("FusedAttention", &inputs[3])?;
-            let mask_shape = inputs[3].shape;
-            broadcast_apply(&mask, mask_shape, &scores_shape, |i, val| scores[i] += val)?;
-        }
-
-        // Stage 3: last-axis softmax over each `[…, seq_q, seq_k]` row. Reuses
-        // the standalone Softmax kernel's numerically-stable slice reducer.
+        // Stages 2+3 fused: scale, optional additive mask, and the last-axis
+        // softmax in a single parallel pass over score rows.
+        //
+        // Previously these were three full passes over the score matrix — a
+        // serial scalar `*= scale`, a serial element-at-a-time broadcast add
+        // through a closure, and only then the (parallel) softmax. The score
+        // matrix is `batch·heads·seq_q·seq_k` floats, by far the largest buffer
+        // here (33 MiB for a 32-head 512-token prefill), so two serial passes
+        // over it capped the whole kernel's thread scaling: the masked cells
+        // could not go faster than their serial prologue no matter how many
+        // workers the softmax had. Folding them into the softmax fan-out means
+        // each row is scaled, masked and normalized while it is still hot in
+        // cache, and every element-touching stage is parallel.
         let seq_k = *scores_shape.last().unwrap();
         let n = numel(&scores_shape);
         let outer = n.checked_div(seq_k).unwrap_or(0);
-        // `scores` is dead after this point, so the softmax runs in place - a
-        // score matrix is `batch·heads·seq_q·seq_k` floats, easily the largest
-        // buffer in the kernel, and allocating a second one only to copy into
-        // it was pure overhead.
+        // `scores` is dead after this point, so the whole pipeline runs in
+        // place - allocating a second score-sized buffer only to copy into it
+        // was pure overhead.
         let mut probs = scores;
-        softmax_rows_in_place(&mut probs, outer, seq_k);
+        if has_mask {
+            let mask = to_dense_f32_widen("FusedAttention", &inputs[3])?;
+            let eff = broadcast_effective_strides(inputs[3].shape, &scores_shape)?;
+            scale_mask_softmax_rows(
+                &mut probs,
+                outer,
+                seq_k,
+                self.scale,
+                Some(MaskPlan {
+                    values: &mask,
+                    eff: &eff,
+                    scores_shape: &scores_shape,
+                }),
+            );
+        } else {
+            scale_mask_softmax_rows(&mut probs, outer, seq_k, self.scale, None);
+        }
 
         // Stage 4: out = probs · V. Wrap the dense `probs` buffer (contiguous
         // over `scores_shape`) as a view so the shared GEMM handles the batched
@@ -387,6 +405,156 @@ mod tests {
                 None,
             );
             approx(&got[b * sq * dv..(b + 1) * sq * dv], &want, 1e-6);
+        }
+    }
+
+    /// Deterministic pseudorandom stream so a failure is reproducible.
+    fn lcg(seed: u64, n: usize) -> Vec<f32> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+            })
+            .collect()
+    }
+
+    /// The scale/mask/softmax stage runs as one parallel fan-out, so every
+    /// worker resolves its own mask offsets from a *global* row index rather
+    /// than walking the mask serially from the start. This shape is large
+    /// enough to be split across both rayon chunks and row tiles, and the mask
+    /// differs per (batch, query) row by a wide margin, so any off-by-one in
+    /// that arithmetic makes a row attend to the wrong keys and shows up here.
+    #[test]
+    fn sdpa_masked_broadcast_matches_reference_across_parallel_chunks() {
+        // rows = b*h*sq = 512 (> MIN_PARALLEL_SOFTMAX_ROWS) and
+        // rows*sk = 524288 (> MIN_PARALLEL_SOFTMAX_ELEMENTS), so the work is
+        // split across workers. A 1024-key row is 4 KiB, so a `ROW_TILE_BYTES`
+        // tile holds only 8 rows and every worker also loops over tiles —
+        // including on a single-core host, where the whole 512 rows arrive as
+        // one serial run of 64 tiles.
+        let (b, h, sq, sk, d, dv) = (2usize, 4usize, 64usize, 1024usize, 4usize, 4usize);
+        let scale = 0.125f32;
+        let q = lcg(1, b * h * sq * d);
+        let k_nat = lcg(2, b * h * sk * d);
+        let v = lcg(3, b * h * sk * dv);
+
+        // Kᵀ per (batch, head): [b, h, d, sk].
+        let mut kt = vec![0.0f32; k_nat.len()];
+        for bh in 0..b * h {
+            for j in 0..sk {
+                for p in 0..d {
+                    kt[bh * d * sk + p * sk + j] = k_nat[bh * sk * d + j * d + p];
+                }
+            }
+        }
+
+        // Mask [b, 1, sq, sk] — broadcasts over heads, contiguous over keys.
+        // A causal-style cutoff that shifts with both batch and query row.
+        let mut mask = vec![0.0f32; b * sq * sk];
+        for bi in 0..b {
+            for i in 0..sq {
+                let cutoff = (i + 1) * sk / sq - bi * 3;
+                for j in 0..sk {
+                    mask[(bi * sq + i) * sk + j] = if j >= cutoff { -1.0e4 } else { 0.0 };
+                }
+            }
+        }
+
+        let qv = Owned::f32(&[b, h, sq, d], &q);
+        let kv = Owned::f32(&[b, h, d, sk], &kt);
+        let vv = Owned::f32(&[b, h, sk, dv], &v);
+        let mv = Owned::f32(&[b, 1, sq, sk], &mask);
+        let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
+        FusedAttentionKernel {
+            scale,
+            k_transposed: true,
+        }
+        .execute(
+            &[qv.view(), kv.view(), vv.view(), mv.view()],
+            &mut [out.view_mut()],
+        )
+        .unwrap();
+        let got = out.to_f32();
+
+        for bi in 0..b {
+            for hi in 0..h {
+                let bh = bi * h + hi;
+                let want = reference(
+                    &q[bh * sq * d..(bh + 1) * sq * d],
+                    sq,
+                    d,
+                    &k_nat[bh * sk * d..(bh + 1) * sk * d],
+                    sk,
+                    &v[bh * sk * dv..(bh + 1) * sk * dv],
+                    dv,
+                    scale,
+                    Some(&mask[bi * sq * sk..(bi + 1) * sq * sk]),
+                );
+                approx(&got[bh * sq * dv..(bh + 1) * sq * dv], &want, 1e-5);
+            }
+        }
+    }
+
+    /// A mask of extent 1 on the key axis takes the `step == 0` branch, where
+    /// one mask value is splatted across the whole score row. Same parallel
+    /// shape, so it also covers the chunk/tile split.
+    #[test]
+    fn sdpa_key_broadcast_mask_matches_reference() {
+        let (b, h, sq, sk, d, dv) = (2usize, 4usize, 16usize, 256usize, 4usize, 4usize);
+        let scale = 0.5f32;
+        let q = lcg(11, b * h * sq * d);
+        let k_nat = lcg(12, b * h * sk * d);
+        let v = lcg(13, b * h * sk * dv);
+        let mut kt = vec![0.0f32; k_nat.len()];
+        for bh in 0..b * h {
+            for j in 0..sk {
+                for p in 0..d {
+                    kt[bh * d * sk + p * sk + j] = k_nat[bh * sk * d + j * d + p];
+                }
+            }
+        }
+
+        // Mask [sq, 1]: right-aligns to the query axis, extent 1 over keys.
+        let per_row = lcg(14, sq);
+        let mut expanded = vec![0.0f32; sq * sk];
+        for i in 0..sq {
+            for j in 0..sk {
+                expanded[i * sk + j] = per_row[i];
+            }
+        }
+
+        let qv = Owned::f32(&[b, h, sq, d], &q);
+        let kv = Owned::f32(&[b, h, d, sk], &kt);
+        let vv = Owned::f32(&[b, h, sk, dv], &v);
+        let mv = Owned::f32(&[sq, 1], &per_row);
+        let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
+        FusedAttentionKernel {
+            scale,
+            k_transposed: true,
+        }
+        .execute(
+            &[qv.view(), kv.view(), vv.view(), mv.view()],
+            &mut [out.view_mut()],
+        )
+        .unwrap();
+        let got = out.to_f32();
+
+        for bh in 0..b * h {
+            let want = reference(
+                &q[bh * sq * d..(bh + 1) * sq * d],
+                sq,
+                d,
+                &k_nat[bh * sk * d..(bh + 1) * sk * d],
+                sk,
+                &v[bh * sk * dv..(bh + 1) * sk * dv],
+                dv,
+                scale,
+                Some(&expanded),
+            );
+            approx(&got[bh * sq * dv..(bh + 1) * sq * dv], &want, 1e-5);
         }
     }
 

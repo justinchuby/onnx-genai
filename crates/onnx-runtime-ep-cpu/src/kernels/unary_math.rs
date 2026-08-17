@@ -92,7 +92,7 @@ impl MathOp {
             MathOp::Reciprocal => 1.0 / x,
             MathOp::Exp => x.exp(),
             MathOp::Log => x.ln(),
-            MathOp::Sign => sign(x),
+            MathOp::Sign => simd_activations::sign_scalar(x),
             MathOp::Floor => x.floor(),
             MathOp::Ceil => x.ceil(),
             // ONNX Round is round-half-to-even, unlike Rust's `round` which
@@ -102,7 +102,7 @@ impl MathOp {
             MathOp::Cos => x.cos(),
             MathOp::Sigmoid => sigmoid(x),
             MathOp::Softplus => softplus(x),
-            MathOp::Softsign => x / (1.0 + x.abs()),
+            MathOp::Softsign => simd_activations::softsign_scalar(x),
             MathOp::Acos => x.acos(),
             MathOp::Acosh => x.acosh(),
             MathOp::Asin => x.asin(),
@@ -113,19 +113,6 @@ impl MathOp {
             MathOp::Sinh => x.sinh(),
             MathOp::Tan => x.tan(),
         }
-    }
-}
-
-/// ONNX `Sign`: `-1`/`0`/`+1`, with `sign(0) = 0` and `sign(NaN) = NaN`.
-fn sign(x: f32) -> f32 {
-    if x.is_nan() {
-        f32::NAN
-    } else if x > 0.0 {
-        1.0
-    } else if x < 0.0 {
-        -1.0
-    } else {
-        0.0
     }
 }
 
@@ -192,8 +179,24 @@ impl UnaryMathKernel {
         let op = self.op;
         // Vectorised on AVX2+FMA; falls back to `MathOp::apply`'s exact scalar
         // form otherwise. See `kernels::simd_activations`.
+        //
+        // Every arm resolves the operation *before* the element loop. The
+        // catch-all deliberately re-binds `op` so `apply`'s 24-arm `match` is
+        // still per-element there — but only for the libm-backed transcendentals
+        // where a call dominates the dispatch anyway. The ops that are one or
+        // two instructions get their own arm, because for those the per-element
+        // `match` was the entire cost (`Neg` measured 0.049x of ORT).
         simd_activations::write_mapped(name, &mut outputs[0], &x, |x, y| match op {
             MathOp::Sigmoid => simd_activations::sigmoid_f32_slice(x, y),
+            MathOp::Exp => simd_activations::exp_f32_slice(x, y),
+            MathOp::Neg => simd_activations::neg_f32_slice(x, y),
+            MathOp::Abs => simd_activations::abs_f32_slice(x, y),
+            MathOp::Reciprocal => simd_activations::reciprocal_f32_slice(x, y),
+            MathOp::Floor => simd_activations::floor_f32_slice(x, y),
+            MathOp::Ceil => simd_activations::ceil_f32_slice(x, y),
+            MathOp::Round => simd_activations::round_ties_even_f32_slice(x, y),
+            MathOp::Sign => simd_activations::sign_f32_slice(x, y),
+            MathOp::Softsign => simd_activations::softsign_f32_slice(x, y),
             op => {
                 for (o, &v) in y.iter_mut().zip(x.iter()) {
                     *o = op.apply(v);
