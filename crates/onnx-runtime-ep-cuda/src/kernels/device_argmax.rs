@@ -631,7 +631,10 @@ mod tests {
                     "M={m} random row {row}: f32 device argmax {} != host highest-index {want}",
                     f32_got[0]
                 );
-                assert_eq!(f32_got[1], 0, "M={m} random row {row}: unexpected capture-error");
+                assert_eq!(
+                    f32_got[1], 0,
+                    "M={m} random row {row}: unexpected capture-error"
+                );
                 // The values are fp16-exact, so the f16 kernel must agree exactly.
                 assert_eq!(
                     f16_got[0], want,
@@ -693,11 +696,11 @@ mod tests {
             // each batch exercises several boundary layouts independently.
             const STRIDE: usize = 256 * ((VOCAB + 1023) / 1024); // 38_144 for 152_064
             let boundary_configs: [[usize; 3]; 6] = [
-                [3, VOCAB / 2, VOCAB - 1],           // Wallace's exact {3, 76032, 152063}
-                [STRIDE - 1, STRIDE, STRIDE + 1],    // straddles the first seam
-                [3, STRIDE, 2 * STRIDE],             // 3-way across three partitions
+                [3, VOCAB / 2, VOCAB - 1],        // Wallace's exact {3, 76032, 152063}
+                [STRIDE - 1, STRIDE, STRIDE + 1], // straddles the first seam
+                [3, STRIDE, 2 * STRIDE],          // 3-way across three partitions
                 [2 * STRIDE - 1, 2 * STRIDE, 2 * STRIDE + 1], // straddles the second seam
-                [0, VOCAB / 3, VOCAB - 2],           // tail-adjacent highest
+                [0, VOCAB / 3, VOCAB - 2],        // tail-adjacent highest
                 [3 * STRIDE - 1, 3 * STRIDE, VOCAB - 1], // last seam + final index
             ];
             let boundary_rows: Vec<Vec<f32>> = (0..m)
@@ -718,7 +721,8 @@ mod tests {
                 .collect();
             let boundary_f32 = run_batch_case(&ep, &boundary_rows);
             let boundary_f16 = run_batch_case_f16(&ep, &boundary_rows);
-            for (row, (f32_got, f16_got)) in boundary_f32.iter().zip(boundary_f16.iter()).enumerate()
+            for (row, (f32_got, f16_got)) in
+                boundary_f32.iter().zip(boundary_f16.iter()).enumerate()
             {
                 let want = boundary_expected[row];
                 assert_eq!(
