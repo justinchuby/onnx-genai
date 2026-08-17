@@ -3695,6 +3695,41 @@ fn checked_storage_bytes_detects_byte_overflow() {
     );
 }
 
+#[test]
+fn dynamic_output_shapes_compress_counts_selected_values() {
+    use onnx_runtime_ir::Attribute;
+
+    let mut axis_node = Node::new(NodeId(0), "Compress", vec![], vec![]);
+    axis_node
+        .attributes
+        .insert("axis".into(), Attribute::Int(-1));
+    assert_eq!(
+        dynamic_output_shapes(
+            &axis_node,
+            &[vec![2, 4], vec![5]],
+            &[DataType::Float32, DataType::Bool],
+            &[None, Some(vec![1, 0, 1, 1, 1])],
+            &[],
+            11,
+        ),
+        Some(vec![vec![2, 3]]),
+        "condition entries beyond the selected axis must be ignored"
+    );
+
+    let flat_node = Node::new(NodeId(1), "Compress", vec![], vec![]);
+    assert_eq!(
+        dynamic_output_shapes(
+            &flat_node,
+            &[vec![2, 3], vec![4]],
+            &[DataType::Float32, DataType::Bool],
+            &[None, Some(vec![0, 1, 1, 0])],
+            &[],
+            11,
+        ),
+        Some(vec![vec![2]])
+    );
+}
+
 /// The data-dependent shape sizer must return exactly one shape per output
 /// so the run loop's `out_shapes[oi]` indexing can never misindex. Slice is
 /// single-output, so it returns a 1-element Vec; the run loop additionally

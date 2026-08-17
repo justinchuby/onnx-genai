@@ -69,9 +69,9 @@
 //! ## Supported vs. unimplemented
 //!
 //! * dtype: **f32, f16, and bf16** Q/K/V, cache, additive mask, and outputs.
-//!   All floating inputs must use the same dtype; a boolean attention mask is
-//!   exempt. Device f16/bf16 loads and stores are converted around fp32 score,
-//!   softmax, and value accumulators.
+//!   Q/K/V, cache, and outputs use one dtype; an additive mask may independently
+//!   use f32, f16, or bf16. Device f16/bf16 loads and stores are converted around
+//!   fp32 score, softmax, and value accumulators.
 //! * `qk_matmul_output_mode`: modes **0, 1, 2, 3** implemented per spec; any
 //!   other value errors.
 
@@ -468,12 +468,6 @@ pub(crate) fn unsupported_reason(
             "Attention: attn_mask dtype {mask_dtype:?} not supported (expected bool, f32, f16, or bf16 when provided)"
         )));
     }
-    if !matches!(mask_dtype, DataType::Undefined | DataType::Bool) && mask_dtype != dtype_at(0) {
-        return Some(Cow::Borrowed(
-            "Attention: floating attn_mask must use the same dtype as Q, K, and V on CUDA",
-        ));
-    }
-
     let past_key_dtype = dtype_at(4);
     let past_value_dtype = dtype_at(5);
     for dtype in [past_key_dtype, past_value_dtype] {
@@ -3036,5 +3030,29 @@ mod raw_allocation_guard {
             "default-domain Attention must not bypass the prepared composite with direct staged \
              K/V slot sizing; use `std_attention_workspace_layout` for both planning and execution."
         );
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_float32_additive_mask_for_half_attention() {
+        for activation_dtype in [DataType::Float16, DataType::BFloat16] {
+            assert!(
+                unsupported_reason(
+                    24,
+                    &[
+                        activation_dtype,
+                        activation_dtype,
+                        activation_dtype,
+                        DataType::Float32,
+                    ],
+                )
+                .is_none(),
+                "{activation_dtype:?} attention should accept an f32 additive mask"
+            );
+        }
     }
 }

@@ -49,6 +49,15 @@ extern "C" __global__ void range_i64(
        index < elements; index += (unsigned long long)gridDim.x * blockDim.x)
     output[index] = (long long)(start_value + index * delta_value);
 }
+extern "C" __global__ void range_i32(
+    const int* start, const int* delta, int* output,
+    unsigned long long elements) {
+  const unsigned int start_value = (unsigned int)*start;
+  const unsigned int delta_value = (unsigned int)*delta;
+  for (unsigned long long index = blockIdx.x * blockDim.x + threadIdx.x;
+       index < elements; index += (unsigned long long)gridDim.x * blockDim.x)
+    output[index] = (int)(start_value + (unsigned int)index * delta_value);
+}
 "#;
 
 pub struct RangeFactory {
@@ -140,7 +149,11 @@ impl Kernel for RangeKernel {
         let dtype = inputs[0].dtype;
         if !matches!(
             dtype,
-            DataType::Float32 | DataType::Float16 | DataType::BFloat16 | DataType::Int64
+            DataType::Float32
+                | DataType::Float16
+                | DataType::BFloat16
+                | DataType::Int32
+                | DataType::Int64
         ) {
             return Err(not_implemented(format!("Range for dtype {dtype:?}")));
         }
@@ -175,6 +188,11 @@ impl Kernel for RangeKernel {
                 i64::from_ne_bytes(values[1][..8].try_into().unwrap()),
                 i64::from_ne_bytes(values[2][..8].try_into().unwrap()),
             )?,
+            DataType::Int32 => int_count(
+                i32::from_ne_bytes(values[0][..4].try_into().unwrap()).into(),
+                i32::from_ne_bytes(values[1][..4].try_into().unwrap()).into(),
+                i32::from_ne_bytes(values[2][..4].try_into().unwrap()).into(),
+            )?,
             _ => unreachable!(),
         };
         if outputs[0].numel() != expected {
@@ -191,9 +209,12 @@ impl Kernel for RangeKernel {
             DataType::Float16 => "range_f16",
             DataType::BFloat16 => "range_bf16",
             DataType::Int64 => "range_i64",
+            DataType::Int32 => "range_i32",
             _ => unreachable!(),
         };
-        let function = self.runtime.nvrtc_function("range", SOURCE, entry)?;
+        let function = self
+            .runtime
+            .nvrtc_function("range_typed_v2", SOURCE, entry)?;
         let start_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let delta_ptr = cuptr(inputs[2].data_ptr::<u8>() as *const c_void);
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
