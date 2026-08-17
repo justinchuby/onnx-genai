@@ -302,6 +302,14 @@ struct Args {
     /// verified per step. Only used when `--speculative prompt-lookup`.
     #[arg(long, default_value_t = 4)]
     spec_tokens: usize,
+    /// Run the standalone base-decode on-GPU-argmax A/B benchmark: greedy decode
+    /// with the host argmax (logits D2H + host reduction) vs the on-GPU argmax
+    /// (`decode_greedy_batch`, no logits D2H), reporting tok/s for both and the
+    /// token divergence between them. Pure base-decode measurement — no
+    /// speculative / draft machinery. Selects the primary reported path via the
+    /// `ONNX_GENAI_ONGPU_ARGMAX` env flag (default OFF = host argmax).
+    #[arg(long, default_value_t = false)]
+    ongpu_argmax_bench: bool,
 }
 
 fn categorical_sampling_enabled(args: &Args) -> bool {
@@ -1733,6 +1741,231 @@ fn host_argmax(logits: &[f32]) -> u32 {
     best_index as u32
 }
 
+/// Opt-in on-GPU-argmax base-decode flag (`ONNX_GENAI_ONGPU_ARGMAX`). Default
+/// OFF. When ON, the base-decode greedy A/B benchmark reports the on-GPU-argmax
+/// (`decode_greedy_batch`) path as its primary throughput number; when OFF it
+/// reports the host-argmax path. Both paths are always measured and their token
+/// streams cross-checked for byte-identity regardless of the flag.
+fn ongpu_argmax_enabled() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_ONGPU_ARGMAX").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON")
+    )
+}
+
+/// Highest-index-on-ties argmax (`max_by` with `total_cmp` returns the LAST
+/// maximum). This matches the on-GPU `device_argmax` tie-break (highest global
+/// index) so the host reference and the device path are byte-identical even on
+/// the rare exact fp16 tie at the argmax.
+fn argmax_highest_index(row: &[f32]) -> u32 {
+    row.iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(i, _)| i as u32)
+        .expect("logits row must not be empty")
+}
+
+/// Steady-window tok/s from per-token timestamps, excluding the first `skip`
+/// emitted tokens (prefill / capture warmup) from the timed window.
+fn steady_tok_s(times: &[Duration], skip: usize) -> f64 {
+    if times.len() <= skip + 1 {
+        if times.len() < 2 {
+            return 0.0;
+        }
+        let wall = (times[times.len() - 1] - times[0]).as_secs_f64();
+        return if wall > 0.0 {
+            (times.len() - 1) as f64 / wall
+        } else {
+            0.0
+        };
+    }
+    let decode_tokens = times.len() - skip;
+    let wall = (times[times.len() - 1] - times[skip - 1]).as_secs_f64();
+    if wall > 0.0 {
+        decode_tokens as f64 / wall
+    } else {
+        0.0
+    }
+}
+
+/// Fraction of positions where two token streams differ (byte-identity check).
+fn token_divergence(a: &[u32], b: &[u32]) -> f64 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return if a.len() == b.len() { 0.0 } else { 1.0 };
+    }
+    let mut diff = 0usize;
+    for i in 0..n {
+        if a[i] != b[i] {
+            diff += 1;
+        }
+    }
+    diff += a.len().max(b.len()) - n;
+    diff as f64 / a.len().max(b.len()) as f64
+}
+
+/// Base-decode greedy with the HOST argmax: each step copies the full
+/// `[vocab]` fp16 logits to the host (`decode`) and reduces on the CPU. This is
+/// the pre-existing sampler path and the byte-identity reference.
+fn greedy_decode_host(
+    session: &mut NativeDecodeSession,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    eos: &[u32],
+    decode_skip: usize,
+) -> Result<(Vec<u32>, f64)> {
+    session.reset()?;
+    let mut logits = session
+        .decode(prompt_tokens, 0)?
+        .pop()
+        .context("greedy prefill produced no logits")?;
+    let mut generated = Vec::with_capacity(max_new_tokens);
+    let mut times = Vec::with_capacity(max_new_tokens);
+    let start = Instant::now();
+    while generated.len() < max_new_tokens {
+        let token = argmax_highest_index(&logits);
+        generated.push(token);
+        times.push(start.elapsed());
+        if eos.contains(&token) {
+            break;
+        }
+        let past = session.current_len();
+        logits = session
+            .decode(&[token], past)?
+            .pop()
+            .context("greedy decode produced no logits")?;
+    }
+    Ok((generated, steady_tok_s(&times, decode_skip)))
+}
+
+/// Base-decode greedy with the ON-GPU argmax: each step selects the next token
+/// with `decode_greedy_batch` (batch 1), which reduces over the vocab on the
+/// GPU and returns only the token id — no `[vocab]` logits D2H, no host
+/// reduction. Byte-identical to [`greedy_decode_host`] (device_argmax resolves
+/// ties to the same highest index). The prefill first token still comes from the
+/// prefill logits (one-time, outside the steady window) so both streams start
+/// from the same bootstrap.
+fn greedy_decode_ongpu(
+    session: &mut NativeDecodeSession,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    eos: &[u32],
+    decode_skip: usize,
+) -> Result<(Vec<u32>, f64)> {
+    session.reset()?;
+    let base_logits = session
+        .decode(prompt_tokens, 0)?
+        .pop()
+        .context("greedy prefill produced no logits")?;
+    let mut generated = Vec::with_capacity(max_new_tokens);
+    let mut times = Vec::with_capacity(max_new_tokens);
+    let start = Instant::now();
+    let mut token = argmax_highest_index(&base_logits);
+    loop {
+        generated.push(token);
+        times.push(start.elapsed());
+        if eos.contains(&token) || generated.len() >= max_new_tokens {
+            break;
+        }
+        let past = session.current_len();
+        token = session
+            .decode_greedy_batch(std::slice::from_ref(&token), past)?
+            .pop()
+            .context("device-argmax greedy decode produced no token")?;
+    }
+    Ok((generated, steady_tok_s(&times, decode_skip)))
+}
+
+/// Wrap a user prompt in the Qwen2.5 chat template so the instruct target
+/// produces a realistic assistant continuation.
+fn qwen_chat_wrap(user: &str) -> String {
+    format!(
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n\
+         <|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
+    )
+}
+
+/// Standalone base-decode on-GPU-argmax A/B benchmark. Measures greedy decode
+/// with the host argmax (logits D2H + host reduction) vs the on-GPU argmax
+/// (`decode_greedy_batch`, no logits D2H) over `--runs` runs, reports median
+/// tok/s for both, the net ratio, and the token divergence between the two
+/// streams (must be 0.000% — byte-identical). No speculative / draft machinery.
+fn run_ongpu_argmax_bench(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Result<()> {
+    let tokenizer_path = tokenizer_file(model_dir);
+    let tokenizer =
+        Tokenizer::from_file(&tokenizer_path).context("load tokenizer.json beside decoder")?;
+    let mut session = NativeDecodeSession::load_with_resolved_io(&model_file(model_dir), device)
+        .with_context(|| format!("load native decoder {}", model_dir.display()))?;
+
+    let prompt_text = qwen_chat_wrap(&args.prompt);
+    let prompt_tokens = tokenizer.encode(&prompt_text).context("tokenize prompt")?;
+    if prompt_tokens.is_empty() {
+        bail!("prompt tokenized to an empty sequence");
+    }
+    let eos: Vec<u32> = vec![151645, 151643];
+    let max_new = args.tokens;
+    let skip = args.decode_skip.max(1);
+    let primary_ongpu = ongpu_argmax_enabled();
+
+    println!(
+        "profile_native: ongpu-argmax-bench model={} layers={} prompt_tokens={} tokens={} \
+         warmups={} runs={} decode_skip={} ONNX_GENAI_ONGPU_ARGMAX={} (primary_path={})",
+        model_dir.display(),
+        session.kv_layer_count(),
+        prompt_tokens.len(),
+        max_new,
+        args.warmups,
+        args.runs,
+        skip,
+        if primary_ongpu { "1" } else { "0" },
+        if primary_ongpu { "ongpu" } else { "host" },
+    );
+
+    // Warmup both paths to arm CUDA-graph capture before timing.
+    for _ in 0..args.warmups {
+        let _ = greedy_decode_host(&mut session, &prompt_tokens, max_new.min(16), &eos, 1)?;
+        let _ = greedy_decode_ongpu(&mut session, &prompt_tokens, max_new.min(16), &eos, 1)?;
+    }
+
+    let mut host_rates = Vec::with_capacity(args.runs);
+    let mut ongpu_rates = Vec::with_capacity(args.runs);
+    let mut host_tokens_ref: Option<Vec<u32>> = None;
+    let mut ongpu_tokens_ref: Option<Vec<u32>> = None;
+    for _ in 0..args.runs {
+        let (host_tokens, host_rate) =
+            greedy_decode_host(&mut session, &prompt_tokens, max_new, &eos, skip)?;
+        let (ongpu_tokens, ongpu_rate) =
+            greedy_decode_ongpu(&mut session, &prompt_tokens, max_new, &eos, skip)?;
+        host_rates.push(host_rate);
+        ongpu_rates.push(ongpu_rate);
+        host_tokens_ref.get_or_insert(host_tokens);
+        ongpu_tokens_ref.get_or_insert(ongpu_tokens);
+    }
+
+    let host_median = median(&mut host_rates);
+    let ongpu_median = median(&mut ongpu_rates);
+    let host_tokens = host_tokens_ref.expect("at least one run");
+    let ongpu_tokens = ongpu_tokens_ref.expect("at least one run");
+    let divergence = token_divergence(&ongpu_tokens, &host_tokens);
+    let ratio = if host_median > 0.0 {
+        ongpu_median / host_median
+    } else {
+        0.0
+    };
+
+    println!(
+        "ongpu_argmax_bench: host_argmax={host_median:.2} tok/s ongpu_argmax={ongpu_median:.2} \
+         tok/s net={ratio:.4}x divergence={:.3}% generated_tokens={}",
+        divergence * 100.0,
+        host_tokens.len(),
+    );
+    println!(
+        "ongpu_argmax_bench: byte_identity={} (ongpu vs host greedy must be 0.000%)",
+        if divergence == 0.0 { "PASS" } else { "FAIL" },
+    );
+    Ok(())
+}
+
 /// One live sequence occupying a continuous-batch decode slot in the stage-3b
 /// mid-flight driver.
 struct MidFlightJob {
@@ -2774,6 +3007,13 @@ fn main() -> Result<()> {
     };
     if args.steady {
         return run_steady(
+            &args,
+            args.model.as_deref().expect("validated model argument"),
+            device,
+        );
+    }
+    if args.ongpu_argmax_bench {
+        return run_ongpu_argmax_bench(
             &args,
             args.model.as_deref().expect("validated model argument"),
             device,
