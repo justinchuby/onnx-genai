@@ -796,13 +796,19 @@ mod avx2 {
             // points over `[8.052297, 8.999964]`.)
             // The `[-1, 1]` clamp is also the saturation. Because the input was
             // already clamped to `[-9, 9]`, the largest argument the rational
-            // ever sees is `±9`, where `p/q` evaluates to `±1.0000001`; the
-            // clamp turns that into exactly `±1`. So every `|x| >= 9` — up to
-            // and including `±Inf` — already leaves here as exactly `±1`
-            // without a separate saturation step, and `NaN` survives because
-            // `maxps`/`minps` return their second operand on an unordered
-            // compare. `tanh_saturation_blend_is_redundant` proves this by
-            // sweeping all 1 047 527 424 finite `f32` with `|x| >= 9`.
+            // ever sees is `±9` — and there `p` and `q` come out bit-equal
+            // (`0x3fcd33e9`), so `p/q` is *exactly* `±1.0` and the clamp,
+            // being inclusive, returns it unchanged. The margin is equality,
+            // not slack: the overshoot to `1.0000001` happens strictly inside
+            // the range, near `|v| = 8.9999971`, and is what the clamp is
+            // actually for. So every `|x| >= 9` — up to and including `±Inf` —
+            // already leaves here as exactly `±1` without a separate
+            // saturation step, and `NaN` survives because `maxps`/`minps`
+            // return their second operand on an unordered compare.
+            // `saturation_blend_is_redundant_exhaustively` proves this over
+            // all 1 047 527 424 finite `f32` with `|x| >= 9`, under the
+            // default rounding mode (the property also holds under the other
+            // three, but only round-to-nearest is exercised in CI).
             clamp_nan_preserving(_mm256_div_ps(p, q), -1.0, 1.0)
         }
     }
@@ -838,12 +844,13 @@ mod avx2 {
 
             let poly = _mm256_add_ps(_mm256_div_ps(p, q), _mm256_set1_ps(0.5));
 
-            // As in `tanh_ps`, the `[0, 1]` clamp is also the saturation: the
-            // rational only ever sees `±18`, where `p/q + 0.5` lands outside
-            // `[0, 1]` on both ends, so `|x| >= 18` and `±Inf` already leave
-            // here as exactly `0` or `1`.
-            // `sigmoid_saturation_blend_is_redundant` proves this over all
-            // 1 039 138 816 finite `f32` with `|x| >= 18`.
+            // As in `tanh_ps`, the `[0, 1]` clamp is also the saturation. The
+            // rational only ever sees `±18`: at `+18` it gives exactly `1.0`,
+            // which the inclusive clamp passes through, and at `-18` it gives
+            // `-5.96e-8`, which the clamp pulls to `0.0`. Either way `|x| >=
+            // 18` and `±Inf` leave here saturated without a separate step.
+            // `saturation_blend_is_redundant_exhaustively` proves this over
+            // all 1 039 138 816 finite `f32` with `|x| >= 18`.
             clamp_nan_preserving(poly, 0.0, 1.0)
         }
     }
@@ -2858,10 +2865,13 @@ mod saturation_absorption {
             f32::NEG_INFINITY,
             f32::NAN,
             -f32::NAN,
+            // A signalling NaN and a non-canonical quiet payload: `blendv`
+            // looked at the sign bit and `andnot` looks at every bit, so the
+            // substitution is only safe if these pass through untouched too.
+            f32::from_bits(0x7F80_0001),
+            f32::from_bits(0xFFC0_DEAD),
             f32::MAX,
             f32::MIN,
-            1e30,
-            -1e30,
         ];
         assert_same(avx2::tanh_ps, tanh_ps_with_blend, &specials, "tanh");
         assert_same(
