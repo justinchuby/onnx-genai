@@ -4777,4 +4777,119 @@ mod tests {
             );
         }
     }
+
+    /// #1091 measurement harness: same-binary A/B for the dense f32 GEMM.
+    ///
+    /// Drives [`gemm_with_backend`] with the vendored `Mlas` kernel (#1045) and
+    /// the built-in `SimdX86` microkernel ([`x86_sgemm::sgemm_simd`]) over
+    /// LLM-representative f32 GEMM shapes so the kernel gap on *this* host can be
+    /// measured directly, rather than inherited from #1045's EPYC number. No
+    /// int4 model exercises this path (they route through `MatMulNBits`), so a
+    /// synthetic driver is the only way to exercise the f32 SGEMM at model
+    /// scale.
+    ///
+    /// One backend per process (env `GEMM_AB_ARM=mlas|simd|generic`) so an
+    /// external poller can attribute process CPU time and peak RSS to a single
+    /// arm; `both` runs all arms in one process for a quick in-run wall/GFLOP/s
+    /// speedup. `GEMM_AB_ITERS` (default 30) sets the min-timing repeat count;
+    /// `GEMM_AB_SHAPES="m,k,n;m,k,n"` overrides the preset shape list.
+    ///
+    /// Run: `cargo test -p onnx-runtime-ep-cpu --lib --release --features mlas \
+    ///   bench_f32_gemm_ab -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual perf harness (#1091); run explicitly"]
+    fn bench_f32_gemm_ab() {
+        use std::time::Instant;
+
+        // Qwen2.5-14B f32 shapes (hidden 5120, inter 13824, kv 1024, vocab
+        // 152064): the decode (m=1) and prefill (m=128) GEMMs a dense-f32 build
+        // of that model would run through this kernel.
+        let default_shapes: Vec<(usize, usize, usize)> = vec![
+            (1, 5120, 7168),     // decode: fused QKV proj (q 5120 + kv 2*1024)
+            (1, 5120, 5120),     // decode: o_proj
+            (1, 5120, 13824),    // decode: gate/up proj
+            (1, 13824, 5120),    // decode: down proj
+            (1, 5120, 152064),   // decode: lm_head
+            (128, 5120, 5120),   // prefill: o_proj
+            (128, 5120, 13824),  // prefill: gate/up proj
+            (128, 13824, 5120),  // prefill: down proj
+        ];
+        let shapes: Vec<(usize, usize, usize)> = match std::env::var("GEMM_AB_SHAPES") {
+            Ok(spec) if !spec.trim().is_empty() => spec
+                .split(';')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| {
+                    let parts: Vec<usize> =
+                        s.split(',').map(|p| p.trim().parse().unwrap()).collect();
+                    (parts[0], parts[1], parts[2])
+                })
+                .collect(),
+            _ => default_shapes,
+        };
+        let iters: usize = std::env::var("GEMM_AB_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        let arm = std::env::var("GEMM_AB_ARM").unwrap_or_else(|_| "both".to_string());
+
+        let mut state = 0x1234_5678_u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 2.0
+        };
+
+        // Backends compiled into this binary. `Mlas` only exists with the
+        // feature; `SimdX86` only on x86. Filter to what is available and to
+        // the requested arm.
+        let mut backends: Vec<(&str, CpuBackend)> = Vec::new();
+        #[cfg(feature = "mlas")]
+        backends.push(("mlas", CpuBackend::Mlas));
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        backends.push(("simd", CpuBackend::SimdX86));
+        backends.push(("generic", CpuBackend::Generic));
+        if arm != "both" {
+            backends.retain(|(name, _)| *name == arm);
+        }
+        assert!(!backends.is_empty(), "no backend matched GEMM_AB_ARM={arm}");
+
+        println!(
+            "f32 GEMM A/B (#1091): threads={} iters={} arm={}",
+            rayon::current_num_threads(),
+            iters,
+            arm
+        );
+
+        for &(m, k, n) in &shapes {
+            let a: Vec<f32> = (0..m * k).map(|_| next()).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| next()).collect();
+            let flops = 2.0 * m as f64 * k as f64 * n as f64;
+            let mut results: Vec<(&str, f64)> = Vec::new();
+            for &(name, backend) in &backends {
+                let mut c = vec![0.0f32; m * n];
+                // Warm up (page-in, first-touch, ISA dispatch).
+                gemm_with_backend(backend, &a, &b, &mut c, m, k, n).unwrap();
+                let mut best = f64::INFINITY;
+                for _ in 0..iters {
+                    let t = Instant::now();
+                    gemm_with_backend(backend, &a, &b, &mut c, m, k, n).unwrap();
+                    std::hint::black_box(&c);
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
+                results.push((name, best));
+            }
+            let g = |s: f64| flops / s / 1e9;
+            print!("  {m:>4}x{k:>6}x{n:>6}:");
+            for (name, s) in &results {
+                print!("  {name} {:>8.3} ms ({:>7.1} GF/s)", s * 1e3, g(*s));
+            }
+            // Report gap versus the built-in simd path when both are present.
+            if let (Some((_, mlas)), Some((_, simd))) = (
+                results.iter().find(|(n, _)| *n == "mlas"),
+                results.iter().find(|(n, _)| *n == "simd"),
+            ) {
+                print!("  simd/mlas={:.2}x", simd / mlas);
+            }
+            println!();
+        }
+    }
 }
