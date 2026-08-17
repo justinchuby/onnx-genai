@@ -180,7 +180,14 @@ fn compute_in_place_chain_is_byte_identical_and_fires() {
     let enabled_output = enabled.run(&[("input", &values)]).unwrap()[0]
         .as_bytes()
         .to_vec();
-    assert_eq!(enabled.compute_in_place_alias_count, 2);
+    // One alias, not two: the graph input is bound zero-copy (its buffer
+    // borrows the caller's `values` tensor), and a borrowed buffer must never
+    // be written, so `Tanh` cannot run in place on it. The intermediate value
+    // `first` is executor-owned and still aliases. Trading one in-place alias
+    // (which saves an allocation the run makes anyway on the next step) for
+    // eliminating a full host->EP copy of every graph input is the point of
+    // `bind_host_inputs`.
+    assert_eq!(enabled.compute_in_place_alias_count, 1);
 
     let mut disabled = Executor::build(inplace_chain_graph(false, false), weights, ep).unwrap();
     disabled.compute_in_place_enabled = false;

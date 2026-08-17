@@ -560,6 +560,11 @@ impl Executor {
                             && !ctx.views_meta.contains_key(&vid)
                             && !ctx.pinned.contains(&vid)
                             && !ctx.shared_buffers.contains_key(&vid)
+                            // A borrowed buffer aliases the caller's own input
+                            // tensor for this run (`bind_host_inputs`). Running
+                            // in place would write through it, mutating memory
+                            // this session does not own.
+                            && ctx.buffers.get(&vid).is_some_and(|b| !b.is_borrowed())
                             && !self.seq_elem_values.contains_key(&vid)
                             && info.dtype == output_dtypes[0]
                             && info.shape == output_shapes[0]
