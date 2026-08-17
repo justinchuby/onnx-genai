@@ -627,25 +627,31 @@ macro_rules! dispatch_mlas {
     }};
 }
 
-/// MLAS's `tanh`, clamped back into `[-1, 1]`.
+/// Why `Tanh` and `Sigmoid` do *not* have an MLAS route.
 ///
-/// `MlasComputeTanh` is a rational approximation that is not range-preserving:
-/// over a dense sweep of [-20, 20] it lands outside `[-1, 1]` for 2934 of
-/// 1048576 points, by up to 2 ulp (`tanh(-8.990999) = -1.0000001`). ORT's
-/// `Tanh` calls it directly and inherits that. Our pure-Rust kernel has always
-/// guaranteed the range, `monotonicity_within_documented_slack` asserts it, and
-/// downstream code is entitled to rely on it — `sqrt(1 - tanh²)` turns a 1-ulp
-/// overshoot into a NaN.
+/// They used to. MLAS's `MlasComputeTanh`/`MlasComputeLogistic` are not
+/// range-preserving — over a dense sweep of [-20, 20] tanh lands outside
+/// `[-1, 1]` for 2934 of 1048576 points (by up to 2 ulp) and logistic outside
+/// `[0, 1]` for 2. Our kernels guarantee the range and
+/// `monotonicity_within_documented_slack` asserts it, so the MLAS route had to
+/// re-read every block it had just written and clamp it.
 ///
-/// Clamping is never *less* accurate: the true `tanh` is inside `(-1, 1)`, so
-/// pulling an out-of-range value to the endpoint moves it toward the exact
-/// answer. NaN is preserved because all of `clamp`'s comparisons are false for
-/// NaN.
-#[cfg(feature = "mlas")]
-fn tanh_mlas(input: &[f32], output: &mut [f32]) {
-    mlas_clamped(input, output, mlas_sys::compute_tanh, -1.0, 1.0);
-}
-
+/// That fix-up pass is now more expensive than the polynomial it was buying.
+/// The two kernels used the *same* Eigen rational as MLAS even before this,
+/// and once the redundant saturation blends came out of them (#1121) the
+/// pure-Rust AVX2 path became outright faster than MLAS-plus-clamp. Measured on
+/// this host, `mlas`-off vs `mlas`-on p50, 1 thread:
+///
+/// | op      |  64 Ki |  256 Ki |    1 Mi |    4 Mi |
+/// |---------|-------:|--------:|--------:|--------:|
+/// | Tanh    | 32.5 / 36.2 | 105.6 / 146.7 | 438.4 / 469.4 | 1896 / 2226 |
+/// | Sigmoid | 31.2 / 38.3 | 113.7 / 129.3 | 408.9 / 525.8 | 1887 / 2268 |
+///
+/// The `mlas` route lost at every size — up to 1.39x on `Tanh` at 256 Ki — so
+/// it is gone and both builds now run the same kernel. `Erf` and exact `Gelu`
+/// keep theirs: `Erf` needs no fix-up at all and `Gelu`'s is a non-writing
+/// compare scan, and both still win (1.4-1.6x and 1.17x at 4 Mi).
+///
 /// Elements per MLAS + fix-up block.
 ///
 /// The fix-up passes below re-read the block MLAS just wrote. Run over the
@@ -654,40 +660,6 @@ fn tanh_mlas(input: &[f32], output: &mut [f32]) {
 /// block plus its input stays inside a 512 KiB L2 with room to spare.
 #[cfg(feature = "mlas")]
 const MLAS_FIXUP_BLOCK: usize = 8192;
-
-/// Run an MLAS kernel blockwise and clamp each block back into `[lo, hi]`
-/// while it is still hot in cache.
-#[cfg(feature = "mlas")]
-fn mlas_clamped(
-    input: &[f32],
-    output: &mut [f32],
-    kernel: fn(&[f32], &mut [f32]),
-    lo: f32,
-    hi: f32,
-) {
-    for (xs, ys) in input
-        .chunks(MLAS_FIXUP_BLOCK)
-        .zip(output.chunks_mut(MLAS_FIXUP_BLOCK))
-    {
-        kernel(xs, ys);
-        // `f32::clamp` measured faster here than a hand-written branch-free
-        // bit-select (0.43 vs 0.55 ns/elem for tanh at 4 Mi) — LLVM already
-        // lowers it to `vmaxps`/`vminps`, and NaN falls through untouched
-        // because every comparison against it is false.
-        for v in ys.iter_mut() {
-            *v = v.clamp(lo, hi);
-        }
-    }
-}
-
-/// MLAS's logistic, clamped back into `[0, 1]`.
-///
-/// Same story as [`tanh_mlas`] but milder: `MlasComputeLogistic` leaves the
-/// range for 2 of 1048576 points on the same sweep, by 1 ulp.
-#[cfg(feature = "mlas")]
-fn sigmoid_mlas(input: &[f32], output: &mut [f32]) {
-    mlas_clamped(input, output, mlas_sys::compute_logistic, 0.0, 1.0);
-}
 
 /// MLAS's exact GELU, with its one special-value divergence repaired.
 ///
@@ -712,7 +684,7 @@ fn sigmoid_mlas(input: &[f32], output: &mut [f32]) {
 /// vectorisable compare pass on the common all-finite path.
 #[cfg(feature = "mlas")]
 fn erf_gelu_mlas(input: &[f32], output: &mut [f32]) {
-    // Blocked for the same cache reason as `mlas_clamped`.
+    // Blocked so the repair scan reads each block while it is still in L1/L2.
     for (xs, ys) in input
         .chunks(MLAS_FIXUP_BLOCK)
         .zip(output.chunks_mut(MLAS_FIXUP_BLOCK))
@@ -739,7 +711,7 @@ fn erf_gelu_mlas(input: &[f32], output: &mut [f32]) {
 
 /// `y = tanh(x)`.
 pub(crate) fn tanh_f32_slice(input: &[f32], output: &mut [f32]) {
-    dispatch_mlas!(input, output, tanh_scalar, tanh_avx2, tanh_mlas);
+    dispatch!(input, output, tanh_scalar, tanh_avx2);
 }
 
 /// `y = √x`.
@@ -763,7 +735,7 @@ pub(crate) fn sqrt_f32_slice(input: &[f32], output: &mut [f32]) {
 
 /// `y = 1 / (1 + e^-x)`.
 pub(crate) fn sigmoid_f32_slice(input: &[f32], output: &mut [f32]) {
-    dispatch_mlas!(input, output, sigmoid_scalar, sigmoid_avx2, sigmoid_mlas);
+    dispatch!(input, output, sigmoid_scalar, sigmoid_avx2);
 }
 
 /// `y = e^x`.
@@ -3163,8 +3135,8 @@ mod mlas_ab {
 
             #[allow(clippy::type_complexity)]
             let cases: [(&str, fn(&[f32], &mut [f32]), fn(&[f32], &mut [f32])); 4] = [
-                ("Tanh", tanh_avx2_shim, tanh_mlas),
-                ("Sigmoid", sigmoid_avx2_shim, sigmoid_mlas),
+                ("Tanh", tanh_avx2_shim, tanh_mlas_ref),
+                ("Sigmoid", sigmoid_avx2_shim, sigmoid_mlas_ref),
                 ("Erf", erf_avx2_shim, mlas_sys::compute_erf),
                 ("GeluErf", erf_gelu_avx2_shim, erf_gelu_mlas),
             ];
@@ -3216,8 +3188,8 @@ mod mlas_ab {
 
         #[allow(clippy::type_complexity)]
         let cases: [(&str, fn(&[f32], &mut [f32]), fn(&[f32], &mut [f32])); 4] = [
-            ("Tanh", tanh_avx2_shim, tanh_mlas),
-            ("Sigmoid", sigmoid_avx2_shim, sigmoid_mlas),
+            ("Tanh", tanh_avx2_shim, tanh_mlas_ref),
+            ("Sigmoid", sigmoid_avx2_shim, sigmoid_mlas_ref),
             ("Erf", erf_avx2_shim, mlas_sys::compute_erf),
             ("GeluErf", erf_gelu_avx2_shim, erf_gelu_mlas),
         ];
@@ -3254,8 +3226,8 @@ mod mlas_ab {
 
         #[allow(clippy::type_complexity)]
         let cases: [(&str, fn(&[f32], &mut [f32]), fn(&[f32], &mut [f32])); 4] = [
-            ("Tanh", tanh_avx2_shim, tanh_mlas),
-            ("Sigmoid", sigmoid_avx2_shim, sigmoid_mlas),
+            ("Tanh", tanh_avx2_shim, tanh_mlas_ref),
+            ("Sigmoid", sigmoid_avx2_shim, sigmoid_mlas_ref),
             ("Erf", erf_avx2_shim, mlas_sys::compute_erf),
             ("GeluErf", erf_gelu_avx2_shim, erf_gelu_mlas),
         ];
@@ -3268,6 +3240,40 @@ mod mlas_ab {
             println!(
                 "{name}\tmaxabs={mabs:.3e}\tmaxulp={mulp}\t|y|>1: rust={over_rust} mlas={over_mlas}"
             );
+        }
+    }
+
+    /// What the removed `Tanh` MLAS route did: MLAS's kernel, then the clamp
+    /// back into `[-1, 1]` that its non-range-preserving rational requires.
+    ///
+    /// The route is gone from the dispatcher (the clamp pass costs more than
+    /// the polynomial saves — see the note above `dispatch_mlas!`), but it
+    /// stays here as the measurement reference `mlas_vs_rust_simd` reports
+    /// against, and as the thing the special-value and ULP sweeps pin us to.
+    fn tanh_mlas_ref(x: &[f32], y: &mut [f32]) {
+        mlas_clamped_ref(x, y, mlas_sys::compute_tanh, -1.0, 1.0);
+    }
+
+    /// Ditto for `Sigmoid` and `[0, 1]`.
+    fn sigmoid_mlas_ref(x: &[f32], y: &mut [f32]) {
+        mlas_clamped_ref(x, y, mlas_sys::compute_logistic, 0.0, 1.0);
+    }
+
+    /// Blocked so the clamp re-reads each block while it is still in L1/L2,
+    /// exactly as the shipped route used to.
+    fn mlas_clamped_ref(
+        input: &[f32],
+        output: &mut [f32],
+        kernel: fn(&[f32], &mut [f32]),
+        lo: f32,
+        hi: f32,
+    ) {
+        const BLOCK: usize = 8192;
+        for (xs, ys) in input.chunks(BLOCK).zip(output.chunks_mut(BLOCK)) {
+            kernel(xs, ys);
+            for v in ys.iter_mut() {
+                *v = v.clamp(lo, hi);
+            }
         }
     }
 
