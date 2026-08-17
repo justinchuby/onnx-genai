@@ -132,6 +132,27 @@ pub enum ShapeInference {
     },
     /// RotaryEmbedding — output same shape as input[0].
     RotaryEmbedding,
+    /// `com.microsoft::Attention`: packed-QKV attention.
+    ///
+    /// A different signature from [`Self::AttentionStd`], which is why the
+    /// opset-23 `ai.onnx::Attention` arm cannot cover it. Here input(0) is the
+    /// *unprojected* activation `(batch, seq, input_hidden)` and input(1) is
+    /// the fused projection weight `(input_hidden, q_hidden + k_hidden +
+    /// v_hidden)`, so the output width is `v_hidden` — not the input's last
+    /// dim, and not `weights.dim1`.
+    MsftAttention {
+        /// `qkv_hidden_sizes[2]` when the attribute is present, else
+        /// `weights.dim1 / 3` resolved from the input shape at Compute time.
+        v_hidden: Option<usize>,
+        num_heads: usize,
+        num_outputs: usize,
+    },
+    /// `com.microsoft::PackedMultiHeadAttention`: output
+    /// `[token_count, v_hidden]` = `[input[0].dim0, input[2].dim1]`.
+    ///
+    /// Tokens are packed across the batch with no padding, so the output is
+    /// rank-2 and neither dim can be read off input[0] alone.
+    PackedMultiHeadAttention,
     /// Standard `ai.onnx::Attention` (opset 23+): scaled dot-product attention.
     ///
     /// Q/K/V are rank-3 `(batch, seq, hidden)` or rank-4
@@ -242,6 +263,21 @@ impl ShapeInference {
             | "BitCount"
             | "Bernoulli"
             | "NegativeLogLikelihoodLoss"
+            // Shape-preserving ops on the attention / MoE / KV-cache path.
+            // Every one is registered by the CPU EP, and every one was absent
+            // here, so `GetCapability`'s fail-closed shape filter dropped the
+            // claim and ORT's CPU EP ran it -- the same silent mechanism that
+            // hid the activations until #1082 and the trigonometrics until
+            // #1097. `PackedMultiHeadAttention` is the sharpest case -- ORT
+            // has no CPU kernel for it at all, so giving it away cost a load
+            // failure rather than a slower run -- but ORT does run `MoE` and
+            // `QMoE` on CPU, so for those the decline was simply us not
+            // executing an op we implement.
+            | "MoE"
+            | "QMoE"
+            | "ScatterND"
+            | "ScatterElements"
+            | "Trilu"
             | "Clip" => Self::SameAsInput(0),
 
             // ── Shape-preserving normalisation ops ───────────────────────
@@ -289,6 +325,7 @@ impl ShapeInference {
             "Reshape" => Self::ReshapeData { allowzero: false },
             "Slice" => Self::SliceData,
             "RotaryEmbedding" => Self::RotaryEmbedding,
+            "PackedMultiHeadAttention" => Self::PackedMultiHeadAttention,
 
             // ── Ops that require attributes — Declined ────────────────────
             "Squeeze"
@@ -412,6 +449,14 @@ impl ShapeInference {
             | "InstanceNormalization"
             | "GroupNormalization"
             | "LpNormalization"
+            // Shape-preserving attention / MoE / KV-cache ops. See the note on
+            // the same list in `for_op`: absent from this table they resolve to
+            // `Declined` and `GetCapability` hands them to ORT's CPU EP.
+            | "MoE"
+            | "QMoE"
+            | "ScatterND"
+            | "ScatterElements"
+            | "Trilu"
             | "Clip" => Self::SameAsInput(0),
 
             // ── LayerNorm / SkipLayerNorm family ──────────────────────────
@@ -575,6 +620,28 @@ impl ShapeInference {
                 }
             }
             "RotaryEmbedding" => Self::RotaryEmbedding,
+            "PackedMultiHeadAttention" => Self::PackedMultiHeadAttention,
+
+            // `com.microsoft::Attention` — packed QKV, guarded on domain so the
+            // opset-23 `ai.onnx::Attention` arm below still owns its own
+            // signature. The output width is `v_hidden`, which the attribute
+            // gives directly when present; otherwise it is `weights.dim1 / 3`,
+            // resolved from the input shapes at Compute time because this
+            // entry point does not see them.
+            "Attention" if domain == "com.microsoft" => {
+                let num_heads = int_attr("num_heads").unwrap_or(0).max(0) as usize;
+                let v_hidden = ints_attr("qkv_hidden_sizes").and_then(|sizes| {
+                    // Malformed unless all three are present and positive; fall
+                    // back to the weight-derived split rather than trusting a
+                    // partial attribute.
+                    (sizes.len() == 3 && sizes.iter().all(|s| *s > 0)).then(|| sizes[2] as usize)
+                });
+                Self::MsftAttention {
+                    v_hidden,
+                    num_heads,
+                    num_outputs,
+                }
+            }
 
             // ── Standard attention (ai.onnx::Attention, opset 23+) ─────────
             "Attention" if domain.is_empty() || domain == "ai.onnx" => {
@@ -3323,6 +3390,96 @@ fn infer_shapes(
             Ok(vec![inputs[0].shape.to_vec()])
         }
 
+        ShapeInference::MsftAttention {
+            v_hidden,
+            num_heads,
+            num_outputs,
+        } => {
+            // input(0):   [B, S, input_hidden]   (unprojected activation)
+            // input(1):   [input_hidden, q_hidden + k_hidden + v_hidden]
+            // output(0):  [B, S, v_hidden]
+            // output(1):  present [2, B, num_heads, P + S, head_size]
+            if inputs.len() < 2 {
+                return Err("Attention: expected at least input and weights".into());
+            }
+            let x = inputs[0].shape;
+            if x.len() != 3 {
+                return Err(format!("Attention: input rank must be 3, got {}", x.len()));
+            }
+            let weights = inputs[1].shape;
+            if weights.len() != 2 {
+                return Err(format!(
+                    "Attention: weights rank must be 2, got {}",
+                    weights.len()
+                ));
+            }
+            // Without `qkv_hidden_sizes` the projection is split three ways, so
+            // an indivisible width is a malformed node rather than something to
+            // round.
+            let v = match v_hidden {
+                Some(v) => *v,
+                None => {
+                    if !weights[1].is_multiple_of(3) {
+                        return Err(format!(
+                            "Attention: weights dim1 {} is not divisible by 3 and \
+                             qkv_hidden_sizes is absent",
+                            weights[1]
+                        ));
+                    }
+                    weights[1] / 3
+                }
+            };
+            let mut outputs = vec![vec![x[0], x[1], v]];
+
+            if *num_outputs > 1 {
+                if *num_heads == 0 {
+                    return Err(
+                        "Attention: num_heads is required to shape the present output".into(),
+                    );
+                }
+                if !v.is_multiple_of(*num_heads) {
+                    return Err(format!(
+                        "Attention: v_hidden {v} is not divisible by num_heads {num_heads}"
+                    ));
+                }
+                let head_size = v / num_heads;
+                // `past` is input(4): [2, B, num_heads, past_seq, head_size].
+                let past_seq = inputs
+                    .get(4)
+                    .map(|p| if p.shape.len() >= 5 { p.shape[3] } else { 0 })
+                    .unwrap_or(0);
+                let present = vec![2, x[0], *num_heads, past_seq + x[1], head_size];
+                for _ in 1..*num_outputs {
+                    outputs.push(present.clone());
+                }
+            }
+            Ok(outputs)
+        }
+
+        ShapeInference::PackedMultiHeadAttention => {
+            // Tokens are packed with padding removed, so the output is rank-2:
+            // [token_count, v_hidden] = [query.dim0, value.dim1]. Neither dim
+            // can be read off input[0] alone, which is why this is not
+            // `SameAsInput(0)`.
+            if inputs.len() < 3 {
+                return Err(
+                    "PackedMultiHeadAttention: expected at least query, key and value".into(),
+                );
+            }
+            let q = inputs[0].shape;
+            let v = inputs[2].shape;
+            if q.is_empty() {
+                return Err("PackedMultiHeadAttention: query must not be rank-0".into());
+            }
+            if v.len() < 2 {
+                return Err(format!(
+                    "PackedMultiHeadAttention: value rank must be >= 2, got {}",
+                    v.len()
+                ));
+            }
+            Ok(vec![vec![q[0], v[1]]])
+        }
+
         ShapeInference::AttentionStd {
             q_num_heads,
             kv_num_heads,
@@ -3804,20 +3961,25 @@ mod tests {
     }
 
     #[test]
-    fn attention_std_for_node_reads_heads_and_declines_other_domains() {
+    fn attention_for_node_routes_each_domain_to_its_own_rule() {
         use onnx_runtime_ir::{Node, NodeId};
-        // Default-domain Attention is modelled.
+        // Default-domain Attention is the opset-23 signature.
         let node = Node::new(NodeId(0), "Attention", Vec::new(), Vec::new());
         assert!(matches!(
             ShapeInference::for_node(&node, &[], 1),
             ShapeInference::AttentionStd { .. }
         ));
-        // A foreign domain is not claimed by this arm.
+        // `com.microsoft::Attention` is a different operator -- its input is
+        // unprojected and the fused weight sets the output width -- so it must
+        // not fall into the opset-23 arm. It used to be `Declined` instead,
+        // which silently handed every node to ORT's CPU EP; it now has its own
+        // rule, and `plugin_ort_e2e`'s `msft_attention_assignment_f32` fixture
+        // is the end-to-end falsifier for that.
         let mut contrib = Node::new(NodeId(0), "Attention", Vec::new(), Vec::new());
         contrib.domain = "com.microsoft".into();
         assert!(matches!(
             ShapeInference::for_node(&contrib, &[], 1),
-            ShapeInference::Declined { .. }
+            ShapeInference::MsftAttention { .. }
         ));
     }
 

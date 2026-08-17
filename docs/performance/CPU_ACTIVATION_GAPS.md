@@ -151,6 +151,64 @@ sets identical by construction, and
 The lesson is that an inventory test is only as good as its source of truth.
 Two rounds of review passed on tests that enumerated the wrong set.
 
+**Filter 3, second failure mode — the dtype *union* is per-op, the kernel's rule
+is per-slot.** An entry advertises one set of dtypes for the whole op and every
+input slot is tested against it, so a mixed-dtype op is decided by whichever
+constraint is written last. `MatMulNBits` showed the union being too *wide*.
+The attention family shows it being too *narrow*, which is worse because it is
+silent: the ops map to `FLOAT_DTYPES`, but `RotaryEmbedding`'s `position_ids` is
+int64 and `GroupQueryAttention`'s `seqlens_k` / `total_sequence_length` are
+int32, so the integer slots failed the float test and **both ops were handed to
+ORT on every real session** while every pure-Rust test passed.
+`input_dtype_constraints_for_op` (`onnx-runtime-ep-cpu/src/kernels/mod.rs`) now
+carries per-slot tables for `RotaryEmbedding` in both domains — their slot
+orders differ — plus `GroupQueryAttention` (including `position_ids` at slot
+**9**, which a first pass missed because it only listed the two slots the
+fixtures happened to exercise), `MultiHeadAttention`, `com.microsoft::Attention`,
+`PackedMultiHeadAttention` (int32 `token_offset` / `cumulative_sequence_length`)
+and `QMoE` (uint8-packed experts and zero points).
+
+The union can also be too narrow without any mixed-dtype slot at all: `MoE`
+advertised **float32 only** while its kernel accepts float16 and bfloat16 too,
+so the f32 fixture passed and every production half-precision mixture was
+declined. A single dtype's worth of coverage is not coverage.
+
+Four of those six were found only after review asked for one real-ORT fixture
+per rescued op. **An inventory test that never opens a session cannot see this
+filter at all**, which is the same lesson as above arriving a third time.
+
+**Filter 4 — the kernel factory, which runs after assignment.** Clearing all
+three filters only gets as far as `get_kernel`. ORT stamps **schema defaults**
+onto a node before an EP sees it, so a factory that rejects an attribute it does
+not support must use ORT's default, not ONNX's zero: the contrib default for
+`smooth_softmax` is `-1`, and testing it for `!= 0` rejected every
+`GroupQueryAttention` node ORT ever resolved. A rejection here is a hard session
+failure rather than a fallback, so it is the most expensive of the four — and
+that cuts both ways. Making an op *reachable* can break a model that used to
+work: once `QMoE` was claimed, a column-wise (`block_size` absent) node that ORT
+had been running fine reached our factory and killed `CreateSession`. Review
+then found the same defect on `use_sparse_mixer=1` (Phi-3.5-MoE, GRIN-MoE) and
+on `smooth_softmax=1` (Gemma-style attention sink) — both of which ORT's CPU EP
+runs today — so it is a class, not three bugs.
+
+**Any capability limit a factory enforces must be mirrored in `supports_op`**,
+where a decline is still recoverable. The mirror is now structural rather than
+duplicated: each kernel's attribute validation lives in one function and the
+claim-time guard is that same function's error, so a new factory limit cannot
+fail to appear at claim time. `provider::tests::every_factory_attribute_rejection_is_mirrored_at_claim_time`
+asserts both halves for eleven hostile nodes and fails if they diverge. The
+guarantee is per-wired-op, though: within a wired op drift is impossible, but
+wiring an op is still discipline. An audit of the remaining factories found ten
+that reject something `supports_op` does not pre-check; none is a live
+regression, because each refuses only schema-invalid values or configurations
+ORT's own CPU kernel also refuses.
+
+The attention, MoE and KV-cache ops are now covered end-to-end by
+`plugin_ort_e2e`'s `ASSIGNMENT_FIXTURES` (38 graphs, all on our EP with
+`session.disable_cpu_ep_fallback=1`) and by
+`rope_and_gqa_execute_on_our_ep_and_match_ort_numerics`, which checks the two
+recovered ops against ORT's own kernels rather than only checking placement.
+
 **64 registered ops remain in the shape-table gap.** The list is not prose: it is asserted
 exactly by `every_registered_op_has_a_shape_rule_or_is_a_known_gap`
 (`crates/onnx-runtime-ep-cpu-plugin/tests/shape_inference_coverage.rs`), which
