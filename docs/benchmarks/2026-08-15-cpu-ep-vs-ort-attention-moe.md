@@ -1569,11 +1569,44 @@ comparison within a row.
   because their inputs are at or below the threshold or their runtime is
   dominated by real `Concat` work.
 * Nothing at or below 2 MiB is touched. Decode-shaped graphs - the ones §10
-  actually assigns - bind under a megabyte and take the serial path unchanged.
+  actually assigns - bind under a megabyte and take the serial path unchanged,
+  and after §22.6 they do not so much as query the Rayon pool.
 * No numerical change of any kind: the bytes written are identical, and a
   bit-identity falsifier plus a non-vacuity counter enforce it in CI.
 
-### 22.6 Re-verification after the review rework
+### 22.6 What CI caught that no benchmark would have
+
+The first version of the gate asked `host_copy_workers()` before it looked at
+the size. `host_copy_workers()` calls `rayon::current_num_threads()`, and that
+call **initialises the global Rayon pool**. So every process that bound a graph
+input started a thread pool, whatever the size of the copy - including processes
+that never run a parallel kernel at all.
+
+Nothing in §22 would have found this. Every benchmark here runs a model, and any
+model already has the pool up; the cost is invisible once it is paid. What found
+it was the Miri job, which reported UB inside `crossbeam-epoch`'s epoch reclaim
+during pool teardown in `onnx-runtime-session`'s `tensor::tests` and
+`sequence::tests` - test binaries that had previously never started Rayon.
+
+The UB is in crossbeam's provenance handling under Stacked Borrows, not in this
+change, but the change is what caused those binaries to execute it. Reproduced
+and bisected locally:
+
+| gate order | `tensor::tests` | `sequence::tests` | `prefetch` | `device_binding_tests` |
+|---|---|---|---|---|
+| workers, then size | **UB** | **UB** | ok | ok |
+| size, then workers | ok | ok | ok | ok |
+
+The fix is to decide on size first - a cached atomic load - and only ask about
+workers once a copy is known to be over the threshold. Below the threshold
+nothing touches Rayon, which is what the "decode-shaped graphs are untouched"
+claim was always supposed to mean.
+
+The lesson worth recording: a performance change can be neutral on every
+benchmark and still alter process-wide behaviour. The soundness job was the only
+instrument pointed at that.
+
+### 22.7 Re-verification after the review rework
 
 Review found that the threshold lookup ran `std::env::var` on *every* copy,
 before any size check - a locked `getenv` plus a `String` allocation charged to

@@ -250,6 +250,11 @@ fn host_copy_parallel_min_bytes() -> usize {
 
 /// Workers available to a host copy: the decode budget, never the raw machine.
 ///
+/// Only call this once a copy is known to be over the threshold:
+/// `rayon::current_num_threads()` initialises the global Rayon pool, so calling
+/// it on the small-copy path would spawn worker threads in processes that never
+/// run a parallel kernel.
+///
 /// `rayon::current_num_threads()` is the whole machine unless something bounded
 /// the global pool. `--native-threads` / `ONNX_GENAI_CPU_DECODE_THREADS` does
 /// bound it (`bound_process_to_decode_budget`), so reading the pool here
@@ -285,13 +290,19 @@ thread_local! {
 /// split than the caller may expect.
 fn copy_host_bytes(src: &[u8], dst: &mut [u8]) {
     debug_assert_eq!(src.len(), dst.len());
-    let workers = host_copy_workers();
-    if workers < 2 {
+    // Size first, and *only* size: this is a cached atomic load, whereas
+    // `host_copy_workers` calls `rayon::current_num_threads()`, which
+    // initialises the global Rayon pool on first use. Asking it here would
+    // spawn a thread pool in every process that binds a graph input, including
+    // ones that never run a parallel kernel. Below the threshold nothing may
+    // touch Rayon.
+    let threshold = host_copy_parallel_min_bytes();
+    if threshold == 0 || src.len() < threshold {
         dst.copy_from_slice(src);
         return;
     }
-    let threshold = host_copy_parallel_min_bytes();
-    if threshold == 0 || src.len() < threshold {
+    let workers = host_copy_workers();
+    if workers < 2 {
         dst.copy_from_slice(src);
         return;
     }
@@ -823,6 +834,37 @@ mod host_copy_tests {
             (1..=8).contains(&workers),
             "host copy fan-out {workers} left the measured 1..=8 range"
         );
+    }
+
+    /// A below-threshold copy must decide using size alone.
+    ///
+    /// `host_copy_workers` calls `rayon::current_num_threads()`, which
+    /// initialises the global Rayon pool. If the worker query ran before the
+    /// size gate, every process that binds a graph input would spawn a thread
+    /// pool - including ones that never run a parallel kernel. CI caught
+    /// exactly that: a session test binary that had never used Rayon started
+    /// one, and Miri then reported crossbeam-epoch's teardown as UB.
+    ///
+    /// This asserts the observable half of that property: with the threshold at
+    /// its calibrated value, a small copy is correct and stays serial. The
+    /// ordering itself is enforced by the Miri job, which is the real falsifier
+    /// and fails if the query moves back above the gate - `cargo test` gives no
+    /// ordering guarantee, so a process-global "was the pool started" assertion
+    /// would be answered by whichever other test ran first.
+    #[test]
+    fn a_small_copy_decides_on_size_alone() {
+        let src = ramp(4096);
+        let mut dst = vec![0u8; 4096];
+        with_threshold(HOST_COPY_PARALLEL_MIN_BYTES, || {
+            let before = parallel_copies_on_this_thread();
+            copy_host_bytes(&src, &mut dst);
+            assert_eq!(
+                parallel_copies_on_this_thread(),
+                before,
+                "a 4 KiB copy took the parallel path"
+            );
+        });
+        assert_eq!(dst, src);
     }
 
     /// End-to-end through the EP: a real upload larger than the threshold must
