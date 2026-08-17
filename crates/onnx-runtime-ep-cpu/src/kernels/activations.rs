@@ -321,20 +321,53 @@ fn silu_contiguous_f32(input: &TensorView, output: &mut TensorMut) -> bool {
 /// AVX-512F runtime path. Without `mlas` we keep the scalar reference.
 /// On aarch64 without `mlas`, a NEON-vectorized path processes 4 floats at a
 /// time using a Cephes-style exp polynomial (~28 ULP worst-case on [-87, 88]).
+/// Elements per MLAS + correction block.
+///
+/// 8192 f32 = 32 KiB, so a block and its input both stay inside L2 and the
+/// correction scan reads what MLAS just touched rather than making a second
+/// trip to DRAM.
+#[cfg(feature = "mlas")]
+const SILU_CORRECTION_BLOCK: usize = 8192;
+
+/// MLAS's fused SiLU with its out-of-band results corrected, blocked so the
+/// correction stays in cache.
+///
+/// MLAS's SIMD SiLU clamps its logistic input to [-18, 18] internally, so
+/// out-of-range or non-finite results need correction: `SiLU(-1e30)` would
+/// leak `sigmoid(-18) ~= 1.5e-8` instead of decaying to 0, and
+/// `SiLU(+/-Inf)`/`SiLU(NaN)` would be corrupted.
+///
+/// Whether a correction is needed depends only on the *input*, so the common
+/// all-in-band path never reads or writes the output a second time: a
+/// branch-free OR-reduction over the input decides, and the write loop is
+/// skipped entirely. The reduction is an accumulator rather than `any()`
+/// because `any()`'s early exit is a loop-carried control dependency that
+/// stops LLVM vectorising it.
+#[cfg(feature = "mlas")]
+fn silu_mlas_corrected(input: &[f32], output: &mut [f32]) {
+    for (xs, ys) in input
+        .chunks(SILU_CORRECTION_BLOCK)
+        .zip(output.chunks_mut(SILU_CORRECTION_BLOCK))
+    {
+        mlas_sys::compute_silu(xs, ys);
+        let mut needs_correction = 0u32;
+        for &x in xs {
+            needs_correction |= u32::from(!x.is_finite() || x.abs() > SILU_MLAS_SAFE_BOUND);
+        }
+        if needs_correction != 0 {
+            for (o, &i) in ys.iter_mut().zip(xs) {
+                if !i.is_finite() || i.abs() > SILU_MLAS_SAFE_BOUND {
+                    *o = silu(i);
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn silu_f32_slice(input: &[f32], output: &mut [f32]) {
     #[cfg(feature = "mlas")]
     {
-        // MLAS's SIMD SiLU clamps its logistic input to [-18, 18] internally, so
-        // out-of-range or non-finite results need correction (e.g.
-        // SiLU(-1e30) would leak sigmoid(-18)≈1.5e-8 instead of decaying to 0,
-        // and SiLU(±Inf)/SiLU(NaN) would be corrupted). Keep the existing exact
-        // scalar correction semantics outside MLAS's safe band.
-        mlas_sys::compute_silu(input, output);
-        for (output, &input) in output.iter_mut().zip(input) {
-            if !input.is_finite() || input.abs() > SILU_MLAS_SAFE_BOUND {
-                *output = silu(input);
-            }
-        }
+        crate::kernels::simd_activations::run_chunked(input, output, silu_mlas_corrected);
     }
     #[cfg(all(not(feature = "mlas"), target_arch = "aarch64"))]
     {
@@ -820,6 +853,181 @@ mod tests {
         for (got, input) in out.to_f32().into_iter().zip(logical) {
             let want = input * (1.0 / (1.0 + (-input).exp()));
             assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+        }
+    }
+}
+
+/// The MLAS-backed `SiLU` path must reach the pool and must keep the exact
+/// semantics of the whole-tensor correction loop it replaced.
+#[cfg(all(test, feature = "mlas"))]
+mod silu_parallel {
+    use super::*;
+    use crate::kernels::simd_activations::{PAR_MIN_LEN, parallel_dispatches};
+
+    /// Over `PAR_MIN_LEN` so the parallel branch is eligible, over several
+    /// correction blocks, and not a multiple of the block, the chunk size or
+    /// the lane count — so block and chunk boundaries land mid-run.
+    const N: usize = PAR_MIN_LEN + 4099;
+
+    /// What `silu_f32_slice` did before: MLAS over the whole tensor, then one
+    /// unconditional correction pass over the whole tensor.
+    fn reference(input: &[f32], output: &mut [f32]) {
+        mlas_sys::compute_silu(input, output);
+        for (o, &i) in output.iter_mut().zip(input) {
+            if !i.is_finite() || i.abs() > SILU_MLAS_SAFE_BOUND {
+                *o = silu(i);
+            }
+        }
+    }
+
+    /// Spans MLAS's safe band, both sides of the `+/-18` correction
+    /// threshold, and the special values the correction exists for. The
+    /// `+/-18` boundary itself is included, since `>` makes it in-band.
+    fn probe(len: usize) -> Vec<f32> {
+        let specials = [
+            f32::NAN,
+            -f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -0.0,
+            18.0,
+            -18.0,
+            18.000002,
+            -18.000002,
+            1e30,
+            -1e30,
+            f32::MAX,
+            f32::MIN,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+        ];
+        (0..len)
+            .map(|i| {
+                // Sprinkle the special values thinly and at irregular stride so
+                // they land at every lane, block and chunk offset, while the
+                // bulk stays in band and exercises the fast path.
+                if i % 1013 == 7 {
+                    specials[(i / 1013) % specials.len()]
+                } else {
+                    ((i % 2003) as f32 - 1000.0) / 51.0
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn blocked_correction_matches_the_whole_tensor_loop_bit_for_bit() {
+        let x = probe(N);
+        let mut want = vec![0.0f32; N];
+        reference(&x, &mut want);
+        let mut got = vec![0.0f32; N];
+        silu_f32_slice(&x, &mut got);
+
+        for (i, (&w, &g)) in want.iter().zip(&got).enumerate() {
+            if w.is_nan() && g.is_nan() {
+                continue;
+            }
+            assert_eq!(
+                w.to_bits(),
+                g.to_bits(),
+                "element {i} (input {:e}) differs: whole-tensor {w:e}, blocked {g:e}",
+                x[i]
+            );
+        }
+    }
+
+    #[test]
+    fn silu_reaches_run_chunked_parallel_branch() {
+        if rayon::current_num_threads() < 2 {
+            eprintln!(
+                "skipped: global pool is single-threaded, so run_chunked would take \
+                 its serial branch and this test could not fail"
+            );
+            return;
+        }
+        assert!(
+            rayon::current_thread_index().is_none(),
+            "this test must run outside the pool"
+        );
+        let x = vec![0.5f32; N];
+        let mut y = vec![0.0f32; N];
+
+        let before = parallel_dispatches();
+        silu_f32_slice(&x, &mut y);
+        assert!(
+            parallel_dispatches() > before,
+            "SiLU did not reach run_chunked's parallel branch, so it runs \
+             single-threaded no matter how large the pool is"
+        );
+    }
+
+    #[test]
+    fn silu_is_thread_count_invariant() {
+        let x = probe(N);
+        let mut serial = vec![0.0f32; N];
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool")
+            .install(|| silu_f32_slice(&x, &mut serial));
+
+        let mut parallel = vec![0.0f32; N];
+        silu_f32_slice(&x, &mut parallel);
+
+        for (i, (&s, &p)) in serial.iter().zip(&parallel).enumerate() {
+            if s.is_nan() && p.is_nan() {
+                continue;
+            }
+            assert_eq!(
+                s.to_bits(),
+                p.to_bits(),
+                "element {i}: splitting the slice changed the result \
+                 (serial {s:e}, parallel {p:e})"
+            );
+        }
+    }
+}
+
+/// What the chunked SiLU path is worth, measured against the serial one.
+///
+/// `Swish` (default domain, opset 24) is the ORT-visible spelling of SiLU and
+/// ORT 1.28 does implement it, so a session-level A/B is available and is
+/// reported in the PR that added this. This bench measures the narrower thing
+/// the change actually controls: the same kernel with the parallel split on and
+/// off, in one process, alternating to cancel drift, with no session, node
+/// dispatch or ORT scheduling in the way.
+#[cfg(all(test, feature = "mlas"))]
+mod silu_bench {
+    use super::*;
+    use crate::kernels::simd_activations::serial_scope;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "benchmark; run explicitly with --release --ignored --nocapture"]
+    fn silu_parallel_vs_serial() {
+        println!(
+            "n\tserial_us\tparallel_us\tspeedup\tthreads={}",
+            rayon::current_num_threads()
+        );
+        for n in [1usize << 20, 1 << 22, 1 << 24] {
+            let x: Vec<f32> = (0..n)
+                .map(|i| ((i % 2003) as f32 - 1000.0) / 51.0)
+                .collect();
+            let mut y = vec![0.0f32; n];
+            // Best-of, alternating, so a scheduling hiccup cannot land on one
+            // arm only.
+            let (mut ser, mut par) = (f64::MAX, f64::MAX);
+            for _ in 0..9 {
+                let t = Instant::now();
+                serial_scope(|| silu_f32_slice(&x, &mut y));
+                ser = ser.min(t.elapsed().as_secs_f64());
+                let t = Instant::now();
+                silu_f32_slice(&x, &mut y);
+                par = par.min(t.elapsed().as_secs_f64());
+            }
+            let (s, p) = (ser * 1e6, par * 1e6);
+            println!("{n}\t{s:.1}\t{p:.1}\t{:.2}x", s / p);
         }
     }
 }

@@ -184,6 +184,16 @@ const GEMV_F16_SCALES_F16_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16";
 /// path). Weights that actually carry zero points launch this `_zp` entry so
 /// only the asymmetric path pays for the extra per-block load.
 const GEMV_F16_SCALES_F16_ZP_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_zp";
+/// Prefetch-pipelined siblings of [`GEMV_F16_SCALES_F16_ENTRY`] /
+/// [`GEMV_F16_SCALES_F16_ZP_ENTRY`]. Same lane->nibble mapping, fp16
+/// accumulation, and reduction order (BYTE-IDENTICAL output), but a depth-4
+/// register shift register keeps 4 weight loads in flight per lane to hide the
+/// Long-Scoreboard global-load latency that dominates the single-warp kernel
+/// (ncu: ~75% of warp cycles stalled on the one in-flight 32-bit load). Selected
+/// by [`use_scales_f16_pipeline`] (default-on for the single-warp block-32 int4
+/// path; `ONNX_GENAI_GEMV_PIPELINE=0` forces the original entry for A/B).
+const GEMV_F16_SCALES_F16_PIPE_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_pipe";
+const GEMV_F16_SCALES_F16_ZP_PIPE_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_zp_pipe";
 const GEMV_F16_SCALES_F16_SPLITK_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_splitk";
 /// Split-K specialization for standalone fp16/scales-fp16 int4 GEMV. ncu showed
 /// the plain single-warp kernel can be grid-starved
@@ -2813,7 +2823,164 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp(
 }
 
 
-// Split-K int4 GEMV: K_SPLIT warps cooperate on one output column,
+// Prefetch-pipelined sibling of `matmul_nbits_gemv_f16_scales_f16_tpl`.
+//
+// The single-warp scales-fp16 GEMV is Long-Scoreboard bound: ncu on qwen2.5-14b
+// q/o (N=5120) shows ~8.9 active warps/scheduler but only ~0.97 eligible, with
+// ~75% of warp cycles stalled waiting for the one in-flight 32-bit weight load.
+// The math is not the bottleneck (SM ~41%, DRAM ~24% of an H200's 4.8 TB/s).
+//
+// This variant keeps the EXACT same lane->nibble mapping (lane owns 8 contiguous
+// nibbles at stride 256), the same fp16 `accumulate_int4x8_f16_zp` calls, and the
+// same accumulation order — so its output is BYTE-IDENTICAL to the single-warp
+// kernel. The only change is memory-level parallelism: a depth-PF register shift
+// register holds PF prefetched weight words so PF independent global loads are in
+// flight per lane, hiding the ~13-cycle load latency instead of stalling on it.
+// Register-resident (manual rotation, no dynamic-indexed array -> no local spill).
+template <bool HasZp>
+__device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_pipe_tpl(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round)
+{
+    (void)block_size;
+    (void)scales_fp16;
+    constexpr int PF = 2;  // prefetch depth (weight words in flight per lane)
+    const __half* __restrict__ scales =
+        reinterpret_cast<const __half*>(scales_raw);
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int columns_per_block = (int)blockDim.x >> 5;
+    const int column_base = (int)blockIdx.x * columns_per_block;
+    const int column = column_base + warp;
+
+    __half2 sum0 = __float2half2_rn(0.0f);
+    __half2 sum1 = __float2half2_rn(0.0f);
+    __half2 sum2 = __float2half2_rn(0.0f);
+    __half2 sum3 = __float2half2_rn(0.0f);
+    float tail = 0.0f;
+    if (column < n) {
+        const int lane_depth = lane * 8;
+        const __half* activation_ptr = activation + lane_depth;
+        const unsigned char* packed_ptr =
+            packed + (long)column * k_blocks * blob_size + lane * 4;
+        const __half* scale_ptr =
+            scales + (long)column * k_blocks + (lane >> 2);
+        // Number of full 8-nibble steps this lane walks (step s is valid iff
+        // s * 256 + lane_depth + 8 <= k), identical to the scalar loop bound.
+        const int nfull = (lane_depth + 8 <= k) ? ((k - lane_depth - 8) / 256 + 1) : 0;
+
+        // Load the k-th step's weight word (step stride is 128 packed bytes).
+        auto load_step = [&](int s) -> unsigned int {
+            return *reinterpret_cast<const unsigned int*>(packed_ptr + (long)s * 128);
+        };
+        // Prime the shift register with the first PF steps' words (independent
+        // loads -> they pipeline). Out-of-range slots are zero (never consumed).
+        unsigned int w0 = (0 < nfull) ? load_step(0) : 0u;
+        unsigned int w1 = (1 < nfull) ? load_step(1) : 0u;
+
+        int depth_base = 0;
+        for (int i = 0; i < nfull; ++i, depth_base += 256) {
+            const unsigned int packed_word = w0;
+            // Rotate the shift register and issue the load PF steps ahead BEFORE
+            // consuming the current word, so PF loads stay in flight.
+            const int pf = i + PF;
+            w0 = w1;
+            w1 = (pf < nfull) ? load_step(pf) : 0u;
+
+            const int block = (depth_base >> 5) + (lane >> 2);
+            const unsigned int sub2 =
+                block_sub2<HasZp>(zero_points, column, block, zp_row_bytes);
+            accumulate_int4x8_f16_zp(
+                packed_word, activation_ptr, *scale_ptr, sub2, sum0, sum1, sum2, sum3);
+            activation_ptr += 256;
+            scale_ptr += 8;
+        }
+        const int tail_depth = depth_base + lane_depth;
+        if (tail_depth < k) {
+            const unsigned int packed_word =
+                *reinterpret_cast<const unsigned int*>(packed_ptr + (long)nfull * 128);
+            const float scale = __half2float(*scale_ptr);
+            const int tail_block = (depth_base >> 5) + (lane >> 2);
+            const int zero_point =
+                block_zp<HasZp>(zero_points, column, tail_block, zp_row_bytes);
+            const int valid = min(8, k - tail_depth);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                if (i < valid) {
+                    const int q = (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                    tail += (float)q * __half2float(activation_ptr[i]) * scale;
+                }
+            }
+        }
+    }
+    const float2 value04 = __half22float2(sum0);
+    const float2 value15 = __half22float2(sum1);
+    const float2 value26 = __half22float2(sum2);
+    const float2 value37 = __half22float2(sum3);
+    float value = tail + value04.x;
+    value += value15.x;
+    value += value26.x;
+    value += value37.x;
+    value += value04.y;
+    value += value15.y;
+    value += value26.y;
+    value += value37.y;
+    value = warp_sum(value);
+    if (lane == 0 && column < n) {
+        output[column] = fold_bias_f16(value, bias, column, bias_post_round);
+    }
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_pipe(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round)
+{
+    matmul_nbits_gemv_f16_scales_f16_pipe_tpl<false>(activation, packed, scales_raw, zero_points, bias, output, k, n, block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16, bias_post_round);
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_pipe(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round)
+{
+    matmul_nbits_gemv_f16_scales_f16_pipe_tpl<true>(activation, packed, scales_raw, zero_points, bias, output, k, n, block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16, bias_post_round);
+}
 // each reducing a strided subset of the 256-wide K steps, then summing their
 // fp32 partials through shared memory. The launch grid is K_SPLIT x larger than
 // the single-warp `_zp` kernel, which fills the SMs on this grid-starved,
@@ -5389,11 +5556,13 @@ fn use_f16_symmetric_splitk(
     multiprocessor_count: u32,
     max_threads_per_block: u32,
 ) -> bool {
-    k >= 512
-        && k.is_multiple_of(32)
-        && max_threads_per_block >= GEMV_F16_LARGE_THREADS
-        && n < (multiprocessor_count.max(1) as usize)
-            .saturating_mul(F16_SYMMETRIC_SPLITK_TARGET_WARPS_PER_SM)
+    let eligible =
+        k >= 512 && k.is_multiple_of(32) && max_threads_per_block >= GEMV_F16_LARGE_THREADS;
+    if !eligible {
+        return false;
+    }
+    n < (multiprocessor_count.max(1) as usize)
+        .saturating_mul(F16_SYMMETRIC_SPLITK_TARGET_WARPS_PER_SM)
 }
 
 /// Warps-per-CTA (one warp reduces one output column) for the accuracy_level=4
@@ -5470,6 +5639,18 @@ fn gemv_foldscale_enabled() -> bool {
     matches!(
         std::env::var("ONNX_GENAI_GEMV_FOLDSCALE").ok().as_deref(),
         Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// Whether the single-warp block-32 scales-fp16 int4 decode GEMV takes the
+/// prefetch-pipelined entry (4 weight loads in flight per lane to hide the
+/// Long-Scoreboard global-load latency). Byte-identical to the original entry,
+/// so it is default-on; `ONNX_GENAI_GEMV_PIPELINE=0` (or `false`/`off`) forces
+/// the original single-load entry for A/B measurement.
+fn scales_f16_pipeline_enabled() -> bool {
+    !matches!(
+        std::env::var("ONNX_GENAI_GEMV_PIPELINE").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
     )
 }
 
@@ -8114,6 +8295,16 @@ impl MatMulNBitsKernel {
                 capabilities.max_threads_per_block(),
             );
         let use_scales_f16_splitk = use_scales_f16_zp_splitk || use_scales_f16_symmetric_splitk;
+        // Prefetch-pipeline routing for the SINGLE-WARP block-32 scales-fp16 int4
+        // GEMV (the entry taken when split-K is not selected). Byte-identical to
+        // the original entry (same mapping/math/order) but keeps 4 weight loads
+        // in flight per lane to hide the Long-Scoreboard latency that dominates
+        // it. Default-on; `ONNX_GENAI_GEMV_PIPELINE=0` forces the original entry.
+        let use_scales_f16_pipeline = self.block_size == 32
+            && scales_fp16
+            && matches!(selection.variant, F16GemvVariant::General)
+            && !use_scales_f16_splitk
+            && scales_f16_pipeline_enabled();
         // Fold-scale routing for the split-K decode GEMV: opt-in (default off)
         // via `ONNX_GENAI_GEMV_FOLDSCALE`. Folds the per-block scale into the
         // dequant, dropping the MAC's __hmul2. Only matters when the split-K
@@ -8188,6 +8379,8 @@ impl MatMulNBitsKernel {
                             } else {
                                 GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY
                             }
+                        } else if use_scales_f16_pipeline {
+                            GEMV_F16_SCALES_F16_ZP_PIPE_ENTRY
                         } else {
                             GEMV_F16_SCALES_F16_ZP_ENTRY
                         }
@@ -8198,6 +8391,8 @@ impl MatMulNBitsKernel {
                             } else {
                                 GEMV_F16_SCALES_F16_SPLITK_ENTRY
                             }
+                        } else if use_scales_f16_pipeline {
+                            GEMV_F16_SCALES_F16_PIPE_ENTRY
                         } else {
                             GEMV_F16_SCALES_F16_ENTRY
                         }
@@ -10366,6 +10561,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         scales_fp16: bool,
         interleave: bool,
         general_splitk: Option<bool>,
+        pipeline: Option<bool>,
     ) -> Option<Vec<f16>> {
         let runtime = runtime()?;
         if runtime
@@ -10516,12 +10712,18 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             } else {
                 std::env::remove_var("ONNX_GENAI_INTERLEAVE_DEQUANT");
             }
+            match pipeline {
+                Some(true) => std::env::set_var("ONNX_GENAI_GEMV_PIPELINE", "1"),
+                Some(false) => std::env::set_var("ONNX_GENAI_GEMV_PIPELINE", "0"),
+                None => std::env::remove_var("ONNX_GENAI_GEMV_PIPELINE"),
+            }
         }
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
         unsafe {
             std::env::remove_var("ONNX_GENAI_INTERLEAVE_DEQUANT");
             std::env::remove_var("ONNX_GENAI_GENERAL_SPLITK");
+            std::env::remove_var("ONNX_GENAI_GEMV_PIPELINE");
         }
         drop(_guard);
 
@@ -10566,7 +10768,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             (4096, 256, 64, true),
         ] {
             let Some(base) =
-                run_symmetric_block_raw(k, n, block_size, scales_fp16, false, Some(false))
+                run_symmetric_block_raw(k, n, block_size, scales_fp16, false, Some(false), None)
             else {
                 eprintln!(
                     "skipping interleaved dequant byte-identity test: CUDA runtime/headers \
@@ -10575,7 +10777,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 return;
             };
             let inter =
-                run_symmetric_block_raw(k, n, block_size, scales_fp16, true, Some(false)).unwrap();
+                run_symmetric_block_raw(k, n, block_size, scales_fp16, true, Some(false), None)
+                    .unwrap();
             ran = true;
             let mismatches = base
                 .iter()
@@ -10610,7 +10813,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             (8192, 128, 128, true),
         ] {
             let Some(base) =
-                run_symmetric_block_raw(k, n, block_size, scales_fp16, false, Some(true))
+                run_symmetric_block_raw(k, n, block_size, scales_fp16, false, Some(true), None)
             else {
                 eprintln!(
                     "skipping split-K wide interleaved byte-identity test: CUDA runtime/headers \
@@ -10619,7 +10822,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 return;
             };
             let inter =
-                run_symmetric_block_raw(k, n, block_size, scales_fp16, true, Some(true)).unwrap();
+                run_symmetric_block_raw(k, n, block_size, scales_fp16, true, Some(true), None)
+                    .unwrap();
             ran = true;
             let mismatches = base
                 .iter()
@@ -10638,7 +10842,67 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         );
     }
 
-    /// Op-level parity + capture-safety for the opt-in Marlin M>1 tensor-core
+    /// The prefetch-pipelined single-warp block-32 scales-fp16 int4 decode GEMV
+    /// (`matmul_nbits_gemv_f16_scales_f16_pipe`, default-on, `use_scales_f16_pipeline`)
+    /// must be BYTE-IDENTICAL to the original single-load entry it replaces
+    /// (`ONNX_GENAI_GEMV_PIPELINE=0`). The pipe variant only keeps extra weight
+    /// loads in flight per lane (memory-level parallelism to hide the Long
+    /// Scoreboard stall); it preserves the EXACT lane→nibble mapping, the same
+    /// `accumulate_int4x8_f16_zp` calls with the same fp16 arguments in the same
+    /// order, and the same fp16 accumulation — so every fp16 output must match
+    /// bit-for-bit. A single differing bit means the reschedule reassociated the
+    /// K-reduction and the byte-identity contract is broken. Covers the real
+    /// block-32 decode projection widths (Qwen2.5-14B q/o K=N=5120, the wide MLP
+    /// K=13824, a small attention shape, and a ragged-N tail) across fp16 and
+    /// fp32 scales.
+    #[test]
+    fn scales_f16_pipeline_is_bit_identical_to_scalar() {
+        let mut ran = false;
+        for (k, n) in [
+            (5120usize, 5120usize),
+            (5120, 13824),
+            (896, 896),
+            (896, 4870),
+        ] {
+            for scales_fp16 in [true, false] {
+                // The block-32 General single-warp path is the only one rerouted
+                // to the pipe entry; confirm the dims select it before comparing.
+                assert_eq!(
+                    select_f16_gemv_variant(k, n, 32, scales_fp16, false).variant,
+                    F16GemvVariant::General,
+                    "K={k} N={n} scales_fp16={scales_fp16} must select the General variant"
+                );
+                let Some(scalar) =
+                    run_symmetric_block_raw(k, n, 32, scales_fp16, false, None, Some(false))
+                else {
+                    eprintln!(
+                        "skipping scales-fp16 pipeline byte-identity test: CUDA runtime/headers \
+                         unavailable"
+                    );
+                    return;
+                };
+                let pipe = run_symmetric_block_raw(k, n, 32, scales_fp16, false, None, Some(true))
+                    .unwrap();
+                ran = true;
+                let mismatches = scalar
+                    .iter()
+                    .zip(pipe.iter())
+                    .filter(|(s, p)| s.to_bits() != p.to_bits())
+                    .count();
+                assert_eq!(
+                    mismatches, 0,
+                    "prefetch-pipelined scales-fp16 GEMV diverged from the scalar entry at \
+                     block-32 K={k} N={n} scales_fp16={scales_fp16}: {mismatches}/{n} fp16 \
+                     outputs differ"
+                );
+            }
+        }
+        assert!(
+            ran,
+            "scales-fp16 pipeline byte-identity test did not execute any case"
+        );
+    }
+
     /// GEMM. Drives the real `MatMulNBitsKernel::run` dispatch with
     /// `ONNX_GENAI_MARLIN_M_GT_1=1` so the `m > 1` seam routes to Marlin,
     /// exercising eligibility gating, the device repack + module-level cache, and

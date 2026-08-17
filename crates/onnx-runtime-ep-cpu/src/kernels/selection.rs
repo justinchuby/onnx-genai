@@ -179,7 +179,9 @@ fn clip_contiguous_f32(
     // range check proves it does not overlap the borrowed input.
     let output =
         unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), output_len) };
-    mlas_sys::compute_clip(&input, output, minimum, maximum);
+    crate::kernels::simd_activations::run_chunked(&input, output, |i, o| {
+        mlas_sys::compute_clip(i, o, minimum, maximum);
+    });
     Ok(true)
 }
 
