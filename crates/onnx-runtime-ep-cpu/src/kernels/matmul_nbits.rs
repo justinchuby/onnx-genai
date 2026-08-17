@@ -336,6 +336,42 @@ fn mlas_prefill_serial() -> bool {
     })
 }
 
+/// A/B escape hatch controlling the **unscoped** decode (`m == 1`, no persistent
+/// SPMD scope active) MLAS SQNBit dispatch.
+///
+/// The persistent decode pool pre-partitions a `MatMulNBits` weight into one
+/// MLAS shard per resident worker so a *scoped* decode can hand each worker a
+/// column range. A host that never enters that scope — the ORT plugin EP, any
+/// third-party runtime, or engine speculative/prefill work — inherits the shard
+/// layout anyway, and the pre-fix code ran those `W` shards *serially*, one MLAS
+/// `multithread=true` call after another, capping the GEMV at the persistent
+/// worker count no matter how many threads the host actually had. Measured on
+/// the plugin path (int4 block-32 K=N=2048 M=1, 32-vCPU EPYC): 0.376 ms that way
+/// vs 0.092 ms for a single full-width `multithread=true` call, which dispatches
+/// once to MLAS's own persistent [`mlas_sys::WorkStealingThreadPool`] — the
+/// low-overhead executor the EP already owns.
+///
+/// So when this returns `true` (the default) an unscoped `m == 1` int4 decode
+/// GEMV takes the single full-width `multithread=true` path instead of the
+/// per-worker shards, letting the EP reach its fast decode number without any
+/// caller cooperation (no `disable_persistent_decode_pool()` opt-out required).
+/// The math is byte-identical to the sharded path — row-major N-partitioning
+/// computes each output column independently, verified `max_ulp = 0` at the
+/// probe shape (see `unscoped_decode_shard_dispatch_perf`). Engine single-token
+/// decode always runs *inside* the SPMD scope, so it never takes this path and
+/// is unaffected. Set `ONNX_GENAI_CPU_MM_MLAS_UNSCOPED_DECODE_SERIAL=1` to
+/// restore the old per-worker serial-shard loop for A/B parity. Parsed once.
+#[cfg(feature = "mlas")]
+fn mlas_unscoped_decode_full_width() -> bool {
+    static UNSCOPED_FULL_WIDTH: OnceLock<bool> = OnceLock::new();
+    *UNSCOPED_FULL_WIDTH.get_or_init(|| {
+        !std::env::var("ONNX_GENAI_CPU_MM_MLAS_UNSCOPED_DECODE_SERIAL").is_ok_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0"
+        })
+    })
+}
+
 /// Smallest `m` (batch·seq row count) that routes int4 MatMulNBits to MLAS
 /// SQNBit; smaller `m` uses the hand int4/int8 decode path. Parsed once from
 /// `NXRT_SQNBIT_DECODE_MIN`, defaulting to [`default_sqnbit_decode_min`].
@@ -1937,7 +1973,20 @@ impl MatMulNBitsKernel {
         // where MLAS dynamically partitions N tiles across its persistent
         // work-stealing intra-op pool, for A/B profiling without changing the
         // default until correctness and throughput are proven.
-        let use_static_shards = can_prepack && !mlas_no_shard();
+        //
+        // #1138: an *unscoped* `m == 1` decode GEMV (no persistent SPMD scope
+        // active — the ORT plugin EP, a third-party host, or any caller that did
+        // not enter `with_decode_pool_scope`) skips the per-worker shards and
+        // takes the full-width `multithread=true` path below, dispatching once to
+        // MLAS's own persistent work-stealing pool instead of running the shards
+        // serially (which capped the GEMV at the persistent worker count). The
+        // engine's single-token decode always runs inside the SPMD scope, so it
+        // keeps the sharded fast path and is unaffected; byte-identical either
+        // way (`max_ulp = 0`). `ONNX_GENAI_CPU_MM_MLAS_UNSCOPED_DECODE_SERIAL=1`
+        // restores the old serial-shard dispatch for A/B parity.
+        let unscoped_decode_full_width =
+            m == 1 && mlas_unscoped_decode_full_width() && spmd_decode_active().is_none();
+        let use_static_shards = can_prepack && !mlas_no_shard() && !unscoped_decode_full_width;
         if use_static_shards {
             let shards = if let Some(shards) = self.mlas_shards.get() {
                 shards
@@ -2095,11 +2144,15 @@ impl MatMulNBitsKernel {
     ///   shards to the resident workers under one barrier -- each worker runs its
     ///   own shard's GEMV serially (`multithread=false`), so the whole projection
     ///   stays on the hot decode pool with no global-Rayon fork.
-    /// * Otherwise (prefill `m > 1`, or decode with no SPMD scope): run each shard
-    ///   with MLAS's own tile parallelism (`multithread=true`) writing its columns
-    ///   into the shared `[m, n]` output at stride `self.n`. With a single
-    ///   full-width shard (no SPMD pool) this is exactly the previous one-call
-    ///   `multithread=true` behaviour.
+    /// * Prefill (`m > 1`) with more than one live shard: issue ONE Rayon
+    ///   parallel pass over `(shard x m-row-block)` tiles, each running
+    ///   `multithread=false` on its own disjoint output window (A/B:
+    ///   `ONNX_GENAI_CPU_MM_MLAS_PREFILL_SERIAL=1` restores the old serial loop).
+    /// * A single full-width shard (no persistent pool), or `m == 1` with no
+    ///   active decode scope: one full-width `multithread=true` call. (Unscoped
+    ///   `m == 1` decode with a persistent pool built never reaches here — it
+    ///   takes the full-width fast path in [`Self::try_mlas_sqnbit`], see
+    ///   [`mlas_unscoped_decode_full_width`].)
     ///
     /// Row-major N-partitioning computes each output column independently of the
     /// others, so the concatenated result is bit-identical to a single full-width
@@ -2155,9 +2208,10 @@ impl MatMulNBitsKernel {
         // (verified `max_ulp = 0`). Tiling M as well as N keeps every core busy
         // when the shard count is below the host thread count, without needing a
         // second full-width packed weight. Gated on `m > 1 && active > 1`:
-        // decode (`m == 1`) with no SPMD scope and the single-shard no-pool case
-        // keep the original one-call path below (a single full-width
-        // `multithread=true` call is already optimal there).
+        // unscoped decode (`m == 1`, no SPMD scope) reaches the full-width fast
+        // path in `try_mlas_sqnbit` before shards are ever built, and the
+        // single-shard no-pool case keeps the original one-call path below (a
+        // single full-width `multithread=true` call is already optimal there).
         if m > 1 && active > 1 && !mlas_prefill_serial() {
             let n = self.n;
             let k = self.k;
@@ -14189,9 +14243,16 @@ mod tests {
 
         // Two distinct activation shapes -> two compiled kernel instances, the
         // exact duplication the shape-keyed kernel cache produces in a real
-        // autoregressive session (prefill `m > 1`, decode `m == 1`).
+        // autoregressive session (prefill `m > 1`, decode `m == 1`). The decode
+        // instance runs *inside* the persistent decode-pool scope, exactly as
+        // `onnx-genai-engine`'s single-token forward does (#1138): that keeps it
+        // on the shared per-worker shard buffer so prefill and decode still
+        // rendezvous on one packed allocation. (An *unscoped* `m == 1` decode —
+        // the ORT plugin path — instead takes the full-width fast path and would
+        // hold its own packed buffer; that is the tradeoff the plugin's
+        // `disable_persistent_decode_pool()` opt-out collapses back to one copy.)
         let prefill = run(3);
-        let decode = run(1);
+        let decode = with_decode_pool_scope(true, || run(1));
 
         let per_copy_predicted =
             mlas_sqnbit_packed_b_cache_bytes(4, block_size, 0, n, k, false, false, false)
@@ -16398,6 +16459,168 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #1138 A/B probe: the *unscoped* int4 M=1 decode GEMV under the three
+    /// per-worker-shard dispatch strategies, at the exact plugin-path shape
+    /// (int4 block-32, K=N=2048, M=1). Reproduces the mechanism the plugin's
+    /// `disable_persistent_decode_pool()` opt-out worked around and shows the
+    /// fix removes the need for it:
+    ///
+    /// * `serial_shards` — the pre-fix path: `W` per-worker shards run one after
+    ///   another, each `multithread=true` (what an unscoped host got with the
+    ///   persistent pool built). This is the slow arm.
+    /// * `parallel_shards` — a *rejected* alternative: the same `W` shards issued
+    ///   in ONE Rayon parallel pass, each `multithread=false`. Measured slower
+    ///   than `full_width` because the per-call Rayon fork-join dominates.
+    /// * `full_width` — **the fix** (and the reference fast path,
+    ///   `ONNX_GENAI_CPU_MM_MLAS_NO_SHARD` / no pool): a single full-width
+    ///   `multithread=true` GEMV that dispatches once to MLAS's own persistent
+    ///   work-stealing pool. This is what unscoped `m == 1` now takes.
+    ///
+    /// `full_width` should land far below both shard strategies. Byte-identity of
+    /// all three outputs is asserted (`max_ulp = 0`). Run with:
+    ///   cargo test -p onnx-runtime-ep-cpu --features mlas --release \
+    ///     unscoped_decode_shard_dispatch_perf -- --ignored --nocapture
+    #[cfg(feature = "mlas")]
+    #[test]
+    #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
+    fn unscoped_decode_shard_dispatch_perf() {
+        use std::time::Instant;
+
+        let (k, n, block_size) = (2048usize, 2048usize, 32usize);
+        let align = MLAS_SQNBIT_DECODE_SHARD_ALIGN;
+        let hw = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(1);
+        // Mirror the persistent-pool default worker count (~half the logical
+        // CPUs) that production shards the weight to.
+        let workers = (hw / 2).max(1);
+
+        let weights_nk = pseudo(n * k, 0.3);
+        let (packed_bytes, scales, _zps, _dq) = quantize(&weights_nk, n, k, block_size, false);
+        let comp = mlas_sys::SQNBitComputeType::Int8;
+
+        let k_blocks = k.div_ceil(block_size);
+        let blob = block_size / 2;
+
+        // Aligned near-even N segmentation, matching `output_segments_aligned`.
+        let units = n / align;
+        let base_units = units / workers;
+        let rem = units % workers;
+        let mut segments: Vec<(usize, usize)> = Vec::with_capacity(workers);
+        let mut start = 0usize;
+        for w in 0..workers {
+            let len = (base_units + usize::from(w < rem)) * align;
+            if len == 0 {
+                continue;
+            }
+            segments.push((start, len));
+            start += len;
+        }
+        assert_eq!(start, n, "segments must tile N exactly");
+
+        let shard_packs: Vec<(usize, usize, mlas_sys::SQNBitPackedB)> = segments
+            .iter()
+            .map(|&(start, len)| {
+                let pb = &packed_bytes[start * k_blocks * blob..(start + len) * k_blocks * blob];
+                let sc = &scales[start * k_blocks..(start + len) * k_blocks];
+                let pack = mlas_sys::SQNBitPackedB::new(len, k, 4, block_size, comp, pb, sc, None)
+                        .expect("MLAS SQNBit int4 shard must pack");
+                (start, len, pack)
+            })
+            .collect();
+        let full_pack =
+            mlas_sys::SQNBitPackedB::new(n, k, 4, block_size, comp, &packed_bytes, &scales, None)
+                .expect("MLAS SQNBit int4 full-width must pack");
+
+        let a = pseudo(k, 0.8);
+
+        struct OutBase(*mut f32);
+        unsafe impl Sync for OutBase {}
+
+        let serial_shards = |out: &mut [f32]| {
+            for &(start, len, ref pack) in &shard_packs {
+                let dst = &mut out[start..start + len];
+                mlas_sys::sqnbit_gemm(pack, 1, &a, None, dst, true);
+            }
+        };
+        let parallel_shards = |out: &mut [f32]| {
+            let base = OutBase(out.as_mut_ptr());
+            let base = &base;
+            shard_packs.par_iter().for_each(|&(start, len, ref pack)| {
+                // SAFETY: shards own disjoint contiguous `[start, start+len)`
+                // column ranges of the single `[1, n]` output.
+                let dst = unsafe { std::slice::from_raw_parts_mut(base.0.add(start), len) };
+                mlas_sys::sqnbit_gemm(pack, 1, &a, None, dst, false);
+            });
+        };
+        let full_width = |out: &mut [f32]| {
+            mlas_sys::sqnbit_gemm(&full_pack, 1, &a, None, out, true);
+        };
+
+        // Byte-identity across all three dispatch strategies.
+        let mut o_serial = vec![0.0f32; n];
+        let mut o_parallel = vec![0.0f32; n];
+        let mut o_full = vec![0.0f32; n];
+        serial_shards(&mut o_serial);
+        parallel_shards(&mut o_parallel);
+        full_width(&mut o_full);
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        assert_eq!(
+            bits(&o_serial),
+            bits(&o_parallel),
+            "parallel-shard dispatch must be byte-identical to the serial-shard loop",
+        );
+        let max_ulp = o_serial
+            .iter()
+            .zip(&o_full)
+            .map(|(a, b)| (a.to_bits() as i64 - b.to_bits() as i64).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        let full_identical = bits(&o_serial) == bits(&o_full);
+        eprintln!(
+            "#1138 full_width vs sharded: byte_identical={full_identical} max_ulp={max_ulp}"
+        );
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(hw)
+            .build()
+            .unwrap();
+        fn bench<F: FnMut(&mut [f32]) + Send>(
+            pool: &rayon::ThreadPool,
+            label: &str,
+            n: usize,
+            k: usize,
+            shards: usize,
+            hw: usize,
+            mut run: F,
+        ) {
+            pool.install(|| {
+                let mut out = vec![0.0f32; n];
+                for _ in 0..50 {
+                        run(&mut out);
+                }
+                let mut samples = [0.0f64; 5];
+                for s in samples.iter_mut() {
+                        let iters = 500u32;
+                        let start = Instant::now();
+                        for _ in 0..iters {
+                            run(&mut out);
+                        }
+                        *s = start.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                }
+                samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                eprintln!(
+                        "#1138 int4 M=1 K={k} N={n} shards={shards} hw={hw}t {label:16}: p50={:.3}ms",
+                        samples[2] / 1000.0,
+                );
+            });
+        }
+        let shards = shard_packs.len();
+        bench(&pool, "serial_shards", n, k, shards, hw, serial_shards);
+        bench(&pool, "parallel_shards", n, k, shards, hw, parallel_shards);
+        bench(&pool, "full_width", n, k, shards, hw, full_width);
     }
 
     /// Focused int4 M=1 GEMV micro-bench at Foundry Qwen3-0.6B block-128 decode
