@@ -97,6 +97,15 @@ The row count of `[.., M, K]` is the product of every dimension but the last, so
 batched `[4, 100, 3584]` is 400 rows and lands in the wide-prefill region even though no single
 dimension reaches 256. Any symbolic dimension anywhere in the batch makes the whole count unknown,
 which is the decode case and stays claimed.
+### Measured ranges below the 8-bit `MatMulNBits` win
+
+Same host, same harness, same convention: **p50/p90 are ours/ORT, lower is better**, so every number
+below 1.00 is a win and every number above it is a loss. Every range here is
+claimed and executed by this EP; the column records whether we currently beat ORT, not
+whether we hand the node over.
+
+| op | dtype / bits | M | K, N | threads | p50 | p90 | vs ORT |
+|---|---|---|---|---|---|---|---|
 | `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 1 | 1.00 | 1.03 | gap |
 | `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 2 | 1.52 | 1.56 | gap |
 | `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 4 | 1.74 | 1.82 | gap |
@@ -115,16 +124,33 @@ which is the decode case and stays claimed.
 | `MatMul` | f32 | 128 | 3584 | 1 | 0.97 | 1.03 | gap |
 | `MatMul` | f32 | 128 | 3584 | 2 | 2.11 | 2.35 | gap |
 | `MatMul` | f32 | 128 | 3584 | 4 | 1.77 | 1.79 | gap |
-| `MatMul` | f32 | 128 | 3584 | 8 | 1.38 | 2.49 | gap |
+| `MatMul` | f32 | 128 | 3584 | 8 | 2.76 | 2.85 | gap (noisy) |
 | `MatMul` | f32 | 128 | 3584 | 16 | 1.65 | 1.73 | gap |
 | `MatMul` | f32 | 128 | 3584 | 32 | 0.67 | 0.88 | gap |
-| `MatMul` | f16 | 1 | 3584 | 8 | 2.04 | 2.16 | gap |
-| `MatMul` | f16 | 128 | 3584 | 1 | 2.47 | 2.48 | gap |
-| `MatMul` | f16 | 128 | 3584 | 2 | 5.38 | 5.43 | gap |
-| `MatMul` | f16 | 128 | 3584 | 4 | 6.57 | 6.78 | gap |
-| `MatMul` | f16 | 128 | 3584 | 8 | 7.77 | 8.77 | gap (noisy) |
-| `MatMul` | f16 | 128 | 3584 | 16 | 7.10 | 7.46 | gap |
-| `MatMul` | f16 | 128 | 3584 | 32 | 5.34 | 6.24 | gap |
+| `MatMul` | f16 | 1 | 3584 | 1 | 0.86 | 0.96 | **win** (see note) |
+| `MatMul` | f16 | 1 | 3584 | 2 | 1.47 | 1.89 | gap |
+| `MatMul` | f16 | 1 | 3584 | 4 | 2.06 | 2.19 | gap |
+| `MatMul` | f16 | 1 | 3584 | 8 | 1.93 | 2.20 | gap |
+| `MatMul` | f16 | 1 | 3584 | 16 | 2.01 | 2.79 | gap |
+| `MatMul` | f16 | 1 | 3584 | 32 | 3.83 | 5.95 | gap (noisy) |
+| `MatMul` | f16 | 128 | 3584 | 1 | 1.00 | 1.01 | gap |
+| `MatMul` | f16 | 128 | 3584 | 2 | 1.68 | 1.69 | gap |
+| `MatMul` | f16 | 128 | 3584 | 4 | 1.76 | 1.80 | gap |
+| `MatMul` | f16 | 128 | 3584 | 8 | 1.72 | 1.77 | gap |
+| `MatMul` | f16 | 128 | 3584 | 16 | 1.30 | 1.62 | gap |
+| `MatMul` | f16 | 128 | 3584 | 32 | 0.91 | 1.46 | gap |
+| `Gemm` | f16 | 1 | 3584 | 1 | 0.86 | 0.94 | **win** (see note) |
+| `Gemm` | f16 | 1 | 3584 | 2 | 1.13 | 1.25 | gap |
+| `Gemm` | f16 | 1 | 3584 | 4 | 0.98 | 1.85 | gap |
+| `Gemm` | f16 | 1 | 3584 | 8 | 1.83 | 2.08 | gap |
+| `Gemm` | f16 | 1 | 3584 | 16 | 2.05 | 2.68 | gap |
+| `Gemm` | f16 | 1 | 3584 | 32 | 4.20 | 7.72 | gap (noisy) |
+| `Gemm` | f16 | 128 | 3584 | 1 | 1.03 | 1.03 | gap |
+| `Gemm` | f16 | 128 | 3584 | 2 | 1.82 | 1.83 | gap |
+| `Gemm` | f16 | 128 | 3584 | 4 | 1.90 | 1.91 | gap |
+| `Gemm` | f16 | 128 | 3584 | 8 | 1.86 | 2.24 | gap |
+| `Gemm` | f16 | 128 | 3584 | 16 | 1.44 | 1.46 | gap |
+| `Gemm` | f16 | 128 | 3584 | 32 | 1.19 | 1.35 | gap |
 | `QLinearMatMul` | u8 x u8 | 1 | 3584 | 1 | 1.13 | 1.18 | gap |
 | `QLinearMatMul` | u8 x u8 | 1 | 3584 | 8 | 2.33 | 2.77 | gap |
 | `QLinearMatMul` | u8 x u8 | 1 | 3584 | 16 | 2.34 | 2.58 | gap |
@@ -205,15 +231,47 @@ Amdahl direction is clear even though the decomposition is not.
 `qlinear_phase_report` (`#[ignore]`d and `#[cfg(feature = "mlas")]`, in `kernels/qlinear_matmul.rs`)
 reproduces the split.
 
-Because the thread count is **not visible at capability time**, a claim would have to hold at every
-count, and none of these do.
+The thread count is **not visible at capability time**, so there is no threshold that could have
+described this even if we still wanted one: the same shape wins at 1 thread and loses at 32. The
+only way out is to fix the parallel efficiency.
 
-### 2. A kernel gap — f16 dense
+### 2. A kernel gap — f16 dense (fixed by #1080; f16 now behaves like section 1)
 
-f16 is the only dense range that loses at **one** thread (2.47x), so it is not the scaling story. ORT
-casts around MLAS's f32 kernels; this EP's f16 path does not reach the same primitive. This is the
-largest single dense loss in the matrix and the most tractable: the fix is to route f16 `MatMul`
-through the same MLAS `sgemm` the f32 path already uses, with a cast, rather than a bespoke kernel.
+f16 used to be the only dense range that lost at **one** thread. ORT casts around MLAS's f32
+kernels; this EP's f16 path did not reach the same primitive, and `Gemm` had no f16 GEMV at all.
+#1080 routes constant-weight f16 `MatMul`/`Gemm` prefill through MLAS SGEMM with a once-only widened
+and packed `B`, and adds the missing GEMV.
+
+Same host, `K = N = 3584`, ours/ORT p50, lower is better:
+
+| | before #1080 | after #1080 | source of the "before" |
+|---|---:|---:|---|
+| `MatMul` f16 M=128, T=1 | 2.47 | **1.00** | this matrix, previous revision |
+| `MatMul` f16 M=128, T=4 | 6.57 | **1.76** | this matrix, previous revision |
+| `MatMul` f16 M=128, T=16 | 7.10 | **1.30** | this matrix, previous revision |
+| `Gemm` f16 M=1, T=1 | 6.57 | **0.86** | #1080's report |
+| `Gemm` f16 M=1, T=8 | 46.67 | **1.83** | #1080's report |
+
+The last two "before" figures are **not** re-measurements and could not be: `Gemm` had no f16 rows
+in this matrix because it had no f16 GEMV, and the pre-#1080 kernel no longer exists to re-run. They
+are quoted from #1080's report and are flagged so nobody mistakes them for a fresh measurement.
+
+The one-thread kernel gap is closed: f16 is at parity at `M = 128` (1.00 / 1.03) and is **parity to
+a modest win at `M = 1`** — 0.86 p50 for both `MatMul` and `Gemm` on the run recorded above, which
+is ~1.16x faster than ORT, but an independent re-run of `Gemm` M=1 T=1 on the same host gave 0.96,
+so the honest band is roughly **1.0x-1.16x**. It is no longer a loss, which is the point; the exact
+size of the win is inside this host's noise.
+
+**It is still a gap at higher thread counts.** f16 now loses at 2-16 threads exactly
+the way f32 and int4 do (0.98-2.06 at `M = 1`, 1.30-1.90 at `M = 128`; the single sub-1.00 entry is
+`Gemm` M=1 T=4 at 0.98, whose p90 is 1.85 and whose spread is 1.01, so it is noise and not a win). In other words f16 has
+stopped being a kernel-quality story and has joined the parallel-efficiency story in section 1. When
+section 1's per-call serial work is fixed, f16 should clear ORT at every thread count — the
+`M = 1`, `T = 1` win says the primitive is now the right one.
+
+The improvement stands on its own regardless: this EP runs its own f16 kernel in every mode, and
+#1080 reports that kernel as 2.4x-14.3x faster than its predecessor. That range is ours-before over ours-after, from #1080's own report — it is a different
+quantity from this table's ours/ORT ratios and cannot be re-derived by dividing them.
 
 ### 3. Per-call packing — `QLinearMatMul` (**fixed**)
 

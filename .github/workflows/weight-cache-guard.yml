@@ -1,0 +1,87 @@
+name: Weight cache guard
+
+# Seven session-lifetime, weight-scaled caches were found in the CPU EP (#1056),
+# and only three of them had ever been declared to the memory-strategy plan. Each
+# of the ungoverned ones was written by someone who did not know the rule existed:
+# a bare `OnceLock<Vec<T>>` field is easy to add and invisible to the plan. Two of
+# the three that were governed were governed only after doing damage -- one took a
+# 14B int4 model to ~66 GB, another took its peak working set from 8.17 GB to
+# 25.5 GB while the ledger read zero.
+#
+# The rule (#1056): any allocation that outlives a single kernel call and scales
+# with weight size must be declared to the plan before it is allocated, in the
+# bytes actually allocated, and must be declinable.
+#
+# `GovernedWeightCache<T>` makes that structural -- it has no `Default` and no
+# verdict-free constructor -- but nothing stops a new bare `OnceLock` field. This
+# job is the crude defence: the pattern was found by grep in twenty minutes, so a
+# grep can guard it. It flags *new* long-lived buffer fields in the CPU kernels
+# and asks the author to answer one question rather than blocking them.
+
+on:
+  pull_request:
+    paths:
+      - "crates/onnx-runtime-ep-cpu/src/kernels/**"
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  ungoverned-weight-cache:
+    name: New weight-derived caches must be governed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Flag new ungoverned long-lived buffers
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -uo pipefail
+
+          # Added lines only, in the CPU kernels, that declare a struct field
+          # holding an owned buffer for longer than a call. `GovernedWeightCache`
+          # is the sanctioned form and is excluded, as is the module that defines
+          # it and anything inside a #[cfg(test)] fixture.
+          added=$(git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" \
+                    -- crates/onnx-runtime-ep-cpu/src/kernels \
+                    ':(exclude)crates/onnx-runtime-ep-cpu/src/kernels/governed_weight_cache.rs' \
+                  | grep -E '^\+' \
+                  | grep -vE '^\+\+\+' \
+                  | grep -E 'OnceLock *<.*(Vec|Arc|Packed|Cache|Shard)|OnceCell *<.*(Vec|Arc|Packed|Cache|Shard)|LazyLock *< *.*Cache' \
+                  | grep -v 'GovernedWeightCache' \
+                  || true)
+
+          if [ -z "$added" ]; then
+            echo "No new ungoverned long-lived buffers."
+            exit 0
+          fi
+
+          echo "Found new long-lived buffer declarations:"
+          echo "$added"
+          echo
+
+          case ",$LABELS," in
+            *,weight-cache-reviewed,*)
+              echo "Carries the 'weight-cache-reviewed' label; the author has"
+              echo "confirmed these are accounted or do not scale with weight size."
+              exit 0
+              ;;
+          esac
+
+          echo "::error::This PR adds a long-lived owned buffer to a CPU kernel."
+          echo "::error::If it holds data derived from a model weight, it scales with model"
+          echo "::error::size and must be declared to the memory plan before it is allocated,"
+          echo "::error::in the bytes actually allocated, and must be declinable (#1056)."
+          echo "::error::Use GovernedWeightCache<T> (crates/onnx-runtime-ep-cpu/src/kernels/"
+          echo "::error::governed_weight_cache.rs); #1079 is a worked example of the predictor,"
+          echo "::error::the admission gate and the decline path."
+          echo "::error::If it does NOT scale with weight size -- a fixed-size scratch, a"
+          echo "::error::lookup table, a test fixture -- say so in the PR and add the"
+          echo "::error::'weight-cache-reviewed' label to record that judgement."
+          exit 1

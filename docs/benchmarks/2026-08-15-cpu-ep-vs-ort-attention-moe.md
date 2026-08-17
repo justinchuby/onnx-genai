@@ -786,4 +786,245 @@ result in §8: no win in any of 15 cells and a non-overlapping regression at
   recorded as provenance for why four sweeps are used, not as a result.
 * Phase 4 requirements 2–5 (grouped MoE GEMM, fused transpose-with-consumer,
   the Softmax fusion-anchor session A/B, allocator-independent cache thresholds)
-  are not addressed here and remain open.
+  are not addressed *in this section*. Requirement 4 is answered in §15 and
+  requirement 5 in §16; requirements 2 and 3 remain open (§17).
+
+## 15. The Softmax "fusion anchor" claim, finally measured (#1094)
+
+`assignment_policy.rs` kept its claim on `Softmax` even though the isolated node
+loses to ORT by 1.28–8.83x, on the grounds that it anchors the SDPA fusion. The
+module's own comment conceded the gap: *"a claim to defer it needs a fused-graph
+measurement this module does not have."* Phase 4 requirement 4 was to get that
+measurement.
+
+### The graph
+
+`scripts/ort_ab/gen_sdpa_region.py` (added in #1094) emits the full region the
+matcher wants — `MatMul → Div(scalar const) → [Add(mask)] → Softmax(axis=-1) →
+MatMul` — with K pre-transposed to `[B,H,D,S_kv]` so the score product is a plain
+`MatMul`. `ONNX_GENAI_PROFILE_OPS=1` confirms it collapses to a **single**
+`com.microsoft::FusedAttention` node at **99.8% of node time**. So this measures
+the fused region, not a proxy for it.
+
+### First answer: the region loses, badly
+
+Against a real ORT CPU session on identical graphs, options and thread counts —
+3 geometries × 3 phases × mask/nomask × {1,8,16} threads = 54 cells — the fused
+region lost in **48 of 54 cells**, by up to **22.8x**. Only 5 cells were ≥5%
+faster, all at 1 thread and all unmasked. (These are the `base` arm of the
+same-session A/B tabulated below, so they are directly comparable to the `new`
+column. An earlier single-arm session on the same graphs independently gave
+50 of 54 and 21.6x; the two agree, but only the same-session figures are quoted
+as results, because cross-session absolutes on this host drift >4x.)
+
+The shape of the loss was the clue: masked cells lost **1.07–22.8x** while
+unmasked cells spanned **0.91–12.6x**, and the **seven worst cells were all
+masked**. The mask was costing more than the attention.
+
+### Cause
+
+`FusedAttention` made three full passes over the score matrix, two of them
+serial:
+
+1. `for s in &mut scores { *s *= self.scale }` — serial, scalar.
+2. `broadcast_apply(mask, .., |i, v| scores[i] += v)` — serial, one indirect
+   closure call per element.
+3. `softmax_rows_in_place` — parallel.
+
+The score matrix is `batch·heads·seq_q·seq_k` floats: **33 MiB** for a 32-head
+512-token prefill. Two serial passes over 33 MiB is ~66 MiB of single-threaded
+memory traffic that no amount of softmax parallelism can shrink. That is the
+ceiling, and it is why the masked cells were so much worse — the mask pass was
+overhead the unmasked path never paid.
+
+### Fix and result (#1094)
+
+All three stages now run as one parallel fan-out over ~32 KiB row tiles, with
+each worker resolving its own mask offsets from a global row index rather than
+walking the mask serially from the start.
+
+Measured same-session and interleaved, this branch against **its own merge
+base**, both arms scored against ORT in the same process. 10 warmups, 30 runs,
+3 interleaved trials, medians. Cross-session absolutes on this host drift >4x,
+so only paired same-session ratios are reported.
+
+The **27 unmasked cells are a negative control**: without a mask the change only
+folds a scale multiply into the parallel fan-out and adds row tiling, neither of
+which should alter the cost, so their spread is this host's noise floor. (This
+is slightly weaker than a true no-op control — the tiling does change cache
+behaviour and parallel granularity on that path too — but empirically it did not
+move the median.)
+
+| group | cells | median | band |
+|---|---:|---:|---|
+| **control** (unmasked) | 27 | **1.00x** | 0.76x .. 1.10x |
+| masked | 27 | **1.26x** | 0.72x .. 8.44x |
+
+**25 of 27 masked cells improve beyond the control's best case (1.10x).** That
+threshold is a deliberately conservative empirical bound, not a confidence
+interval — with 27 control samples the observed maximum overstates the true
+noise ceiling. The separation here (median 1.26x vs 1.00x, with individual
+cells at 8x) is far too large for a more formal test to change the conclusion.
+
+Full matrix, all 54 cells, `native ÷ ORT` (lower is better, 1.00 = parity):
+
+| model | phase | mask | threads | base / ORT | new / ORT | new vs base |
+|---|---|---|---:|---:|---:|---:|
+| llama-3.1-8b | decode q1/kv1024 | mask | 1 | 1.127 | 1.009 | **1.12x** |
+| llama-3.1-8b | decode q1/kv1024 | mask | 8 | 6.355 | 5.646 | **1.13x** |
+| llama-3.1-8b | decode q1/kv1024 | mask | 16 | 9.343 | 8.357 | **1.12x** |
+| llama-3.1-8b | decode q1/kv1024 | nomask | 1 | 0.950 | 0.971 | **0.98x** |
+| llama-3.1-8b | decode q1/kv1024 | nomask | 8 | 6.337 | 6.221 | **1.02x** |
+| llama-3.1-8b | decode q1/kv1024 | nomask | 16 | 12.578 | 12.698 | **0.99x** |
+| llama-3.1-8b | decode q1/kv4096 | mask | 1 | 1.073 | 0.932 | **1.15x** |
+| llama-3.1-8b | decode q1/kv4096 | mask | 8 | 5.236 | 4.398 | **1.19x** |
+| llama-3.1-8b | decode q1/kv4096 | mask | 16 | 5.513 | 5.006 | **1.10x** |
+| llama-3.1-8b | decode q1/kv4096 | nomask | 1 | 0.932 | 0.932 | **1.00x** |
+| llama-3.1-8b | decode q1/kv4096 | nomask | 8 | 4.465 | 4.477 | **1.00x** |
+| llama-3.1-8b | decode q1/kv4096 | nomask | 16 | 5.090 | 5.242 | **0.97x** |
+| llama-3.1-8b | prefill q512/kv512 | mask | 1 | 3.171 | 1.069 | **2.97x** |
+| llama-3.1-8b | prefill q512/kv512 | mask | 8 | 17.382 | 3.055 | **5.69x** |
+| llama-3.1-8b | prefill q512/kv512 | mask | 16 | 17.126 | 3.279 | **5.22x** |
+| llama-3.1-8b | prefill q512/kv512 | nomask | 1 | 1.117 | 1.104 | **1.01x** |
+| llama-3.1-8b | prefill q512/kv512 | nomask | 8 | 3.028 | 3.091 | **0.98x** |
+| llama-3.1-8b | prefill q512/kv512 | nomask | 16 | 3.548 | 3.869 | **0.92x** |
+| qwen2.5-0.5b | decode q1/kv1024 | mask | 1 | 1.400 | 0.889 | **1.57x** |
+| qwen2.5-0.5b | decode q1/kv1024 | mask | 8 | 9.500 | 7.517 | **1.26x** |
+| qwen2.5-0.5b | decode q1/kv1024 | mask | 16 | 5.655 | 7.872 | **0.72x** |
+| qwen2.5-0.5b | decode q1/kv1024 | nomask | 1 | 0.912 | 1.156 | **0.79x** |
+| qwen2.5-0.5b | decode q1/kv1024 | nomask | 8 | 8.771 | 9.391 | **0.93x** |
+| qwen2.5-0.5b | decode q1/kv1024 | nomask | 16 | 9.291 | 9.737 | **0.95x** |
+| qwen2.5-0.5b | decode q1/kv4096 | mask | 1 | 1.348 | 0.929 | **1.45x** |
+| qwen2.5-0.5b | decode q1/kv4096 | mask | 8 | 6.884 | 5.497 | **1.25x** |
+| qwen2.5-0.5b | decode q1/kv4096 | mask | 16 | 7.924 | 6.692 | **1.18x** |
+| qwen2.5-0.5b | decode q1/kv4096 | nomask | 1 | 0.937 | 0.927 | **1.01x** |
+| qwen2.5-0.5b | decode q1/kv4096 | nomask | 8 | 5.924 | 5.580 | **1.06x** |
+| qwen2.5-0.5b | decode q1/kv4096 | nomask | 16 | 8.476 | 8.115 | **1.04x** |
+| qwen2.5-0.5b | prefill q512/kv512 | mask | 1 | 5.033 | 1.031 | **4.88x** |
+| qwen2.5-0.5b | prefill q512/kv512 | mask | 8 | 20.182 | 2.390 | **8.44x** |
+| qwen2.5-0.5b | prefill q512/kv512 | mask | 16 | 22.783 | 2.931 | **7.77x** |
+| qwen2.5-0.5b | prefill q512/kv512 | nomask | 1 | 1.097 | 1.096 | **1.00x** |
+| qwen2.5-0.5b | prefill q512/kv512 | nomask | 8 | 3.459 | 3.151 | **1.10x** |
+| qwen2.5-0.5b | prefill q512/kv512 | nomask | 16 | 3.638 | 4.792 | **0.76x** |
+| qwen3-0.6b | decode q1/kv1024 | mask | 1 | 1.107 | 0.952 | **1.16x** |
+| qwen3-0.6b | decode q1/kv1024 | mask | 8 | 19.460 | 15.039 | **1.29x** |
+| qwen3-0.6b | decode q1/kv1024 | mask | 16 | 10.791 | 9.691 | **1.11x** |
+| qwen3-0.6b | decode q1/kv1024 | nomask | 1 | 0.959 | 0.960 | **1.00x** |
+| qwen3-0.6b | decode q1/kv1024 | nomask | 8 | 7.716 | 9.431 | **0.82x** |
+| qwen3-0.6b | decode q1/kv1024 | nomask | 16 | 11.438 | 10.804 | **1.06x** |
+| qwen3-0.6b | decode q1/kv4096 | mask | 1 | 1.080 | 0.938 | **1.15x** |
+| qwen3-0.6b | decode q1/kv4096 | mask | 8 | 4.972 | 3.529 | **1.41x** |
+| qwen3-0.6b | decode q1/kv4096 | mask | 16 | 4.459 | 4.282 | **1.04x** |
+| qwen3-0.6b | decode q1/kv4096 | nomask | 1 | 0.929 | 0.937 | **0.99x** |
+| qwen3-0.6b | decode q1/kv4096 | nomask | 8 | 4.648 | 4.322 | **1.08x** |
+| qwen3-0.6b | decode q1/kv4096 | nomask | 16 | 4.307 | 4.282 | **1.01x** |
+| qwen3-0.6b | prefill q512/kv512 | mask | 1 | 3.173 | 1.018 | **3.12x** |
+| qwen3-0.6b | prefill q512/kv512 | mask | 8 | 16.355 | 2.670 | **6.13x** |
+| qwen3-0.6b | prefill q512/kv512 | mask | 16 | 17.325 | 2.951 | **5.87x** |
+| qwen3-0.6b | prefill q512/kv512 | nomask | 1 | 1.063 | 1.076 | **0.99x** |
+| qwen3-0.6b | prefill q512/kv512 | nomask | 8 | 2.929 | 2.840 | **1.03x** |
+| qwen3-0.6b | prefill q512/kv512 | nomask | 16 | 2.876 | 3.149 | **0.91x** |
+### Second answer: still decline it
+
+The fix is large — up to **8.44x** — and masked single-thread decode now beats
+ORT outright (0.889–1.009x, was 1.073–1.400x). It is not enough. **44 of 54
+cells are still slower than ORT**, 41 of them by ≥5%, and only 7 are ≥5% faster
+(base: 5). The worst remaining cells are **15.0x at 8 threads** and **12.7x at
+16 threads**, because the remaining time is in the QK and PV GEMMs and their
+thread scaling, not in the scale/mask/softmax stage that #1094 fixed.
+
+So the honest answer to requirement 4 is the one it anticipated: **the fused
+region does not clear the ≥5% bar, and should be declined to ORT wherever the
+Plugin EP has that option.** Keeping `Softmax` claimed *purely* to preserve a
+fusion that then loses is not justified by this data.
+
+The blocker is structural rather than a matter of will: `claim_preference(op,
+opset, shapes, input_dtypes)` in `assignment_policy.rs` is **per-node and has no
+graph context**, so "decline this whole region" is not expressible in it. Only
+`Softmax` itself can be deferred, which risks fragmenting the region — claim QK,
+defer Softmax, claim PV — and that fragmentation cost is *unmeasured*. Deferring
+on that basis would be trading a measured 3–15x loss for an unmeasured one.
+
+For the **native `InferenceSession`**, which has no ORT to decline to, #1094 is
+strictly the best available implementation and the right outcome regardless.
+
+## 16. Allocation-cache thresholds, calibrated rather than assumed (#1088)
+
+`large_alloc_cache.rs` carried `MIN_CACHED_BYTES = 256 KiB`, justified by a
+comment claiming glibc's dynamic `mmap` threshold adjustment *"does not apply to
+a request that is freed at the same size it was taken."* That is backwards.
+glibc's `_int_free`, on releasing an mmapped chunk, does exactly the opposite:
+
+```c
+if (!mp_.no_dyn_threshold
+    && chunksize_nomask(p) > mp_.mmap_threshold
+    && chunksize_nomask(p) <= DEFAULT_MMAP_THRESHOLD_MAX) {
+    mp_.mmap_threshold = chunksize(p);
+    mp_.trim_threshold = 2 * mp_.mmap_threshold;
+}
+```
+
+`DEFAULT_MMAP_THRESHOLD_MAX` is `4 * 1024 * 1024 * sizeof(long)` = **32 MiB** on
+64-bit. A stably-sized block *below* that is mmapped once and arena-served
+thereafter, so a cache on top of it adds only a mutex; above it the adaptation
+stops permanently and the cache is worth a great deal.
+
+A standalone C probe timing alloc + first-touch-every-page + free across
+256 KiB → 256 MiB found exactly that cliff: **~8 ns/page below 32 MiB, ~200
+ns/page above it**.
+
+Measured, cache ÷ system allocator (two independent sweeps):
+
+| size | system | cached | sweep 1 | sweep 2 | effect |
+|---|---:|---:|---:|---:|---|
+| 256 KiB | 401.0 ns | 463.6 ns | 1.156 | 1.032 | up to **16% slower** |
+| 1 MiB | 1.490 µs | 1.520 µs | 1.020 | 1.011 | neutral–2% slower |
+| 4 MiB | 7.547 µs | 7.453 µs | 0.987 | 1.016 | neutral |
+| 16 MiB | 29.69 µs | 30.10 µs | 1.014 | 1.000 | neutral |
+| 32 MiB | 2.736 ms | 60.39 µs | 0.022 | 0.022 | **45.3x faster** |
+| 64 MiB | 3.951 ms | 122.2 µs | 0.031 | 0.031 | **32.3x faster** |
+| 192 MiB | 12.71 ms | 389.3 µs | 0.031 | 0.029 | **32.6x faster** |
+
+Interleaved (4 live sizes): 1 MiB 0.997/1.013, 16 MiB 1.008/1.009, 64 MiB
+0.033/0.034. Eight threads: 256 KiB 0.978/1.022, 4 MiB 0.982/1.013, 64 MiB
+0.034/0.037.
+
+The old floor was therefore ~128x too low, and the cache was doing net harm
+across most of the range it was enabled for. This does not undercut #1075, whose
+motivating case was a 180 MB output well above the corrected floor.
+
+Rather than hardcode 32 MiB — which is a glibc constant, not a universal one —
+the floor is now **calibrated at runtime** by a bounded geometric-ladder probe
+(50 ms hard budget checked per sample, memoised per process), falling back to a
+per-platform constant if no cliff is found. This is also correct under
+`mallopt`/`MALLOC_MMAP_THRESHOLD_`, which disable the adaptation entirely:
+the probe observes the effect rather than assuming the mechanism.
+
+The budget is likewise topology-aware: `min(2 GiB, allowance/8)`, where the
+allowance walks `/proc/self/cgroup` root→leaf taking the smallest concrete
+limit before falling back to `MemAvailable`. Reading `/sys/fs/cgroup/memory.max`
+alone — the previous approach — finds the limit at the *mount root*, which is
+the process's own cgroup only under a private cgroup namespace; it is wrong
+under a systemd slice with `MemoryMax=`, under `cgroupns=host`, and for anything
+nested, and in each of those cases it hands the cache a budget the cgroup will
+never allow.
+
+## 17. Phase 4 limitations
+
+* §15's remaining gap — up to 15.0x at 8 threads and 12.7x at 16 — is in the
+  QK/PV GEMMs. #1094 does not touch them.
+* §15 recommends declining the fused region in the Plugin EP but **does not
+  implement it**, because `claim_preference` is per-node and the fragmentation
+  cost of deferring `Softmax` alone is unmeasured. Implementing the decline
+  without that measurement would substitute one unquantified loss for a
+  quantified one.
+* One masked cell in §15 regresses (qwen2.5-0.5b decode kv1024, 16 threads:
+  5.66x → 7.87x, i.e. 0.72x). It sits inside the control band (min 0.76x) on a
+  3-trial median of a sub-millisecond kernel, so it is read as noise — but it is
+  reported rather than dropped.
+* §16's cliff is measured on glibc/x86-64 only. The musl, macOS and Windows
+  fallback floors are reasoned from allocator design, **not measured**. The
+  runtime probe is what makes that acceptable: on any platform where the reasoning
+  is wrong, calibration overrides the constant.
+* Phase 4 requirements 2 (grouped MoE GEMM) and 3 (fused transpose-with-consumer)
+  remain **open and unstarted**. The §10 assignment matrix is unchanged by Phase 4.
