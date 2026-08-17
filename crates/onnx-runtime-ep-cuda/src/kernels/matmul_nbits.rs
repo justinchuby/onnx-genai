@@ -284,6 +284,20 @@ const GATE_UP_DECOMPOSED_SWIGLU_ZP_ENTRY: &str =
 const GATE_UP_SWIGLU_RMSNORM_ZP_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_zp";
 const GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_ZP_ENTRY: &str =
     "matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_zp";
+/// Fused-symmetric (`ONNX_GENAI_GATEUP_VEC`) specializations of the four
+/// SYMMETRIC paired gate/up SwiGLU entries. Byte-identical to the entries above
+/// — the dequant folds the `- 8` symmetric zero point into the magic-bias
+/// constants (see `int4x8_to_half2x4_sym8`), issuing four fewer `f16x2` ops per
+/// weight word to relieve the issue-bound decode GEMV. Selected by
+/// [`gate_up_vec_enabled`] (default-ON, byte-identical magic-bias-fold;
+/// `ONNX_GENAI_GATEUP_VEC=0` forces scalar for A/B). The asymmetric `_zp` entries
+/// have no `_vec` sibling: their per-block zero point cannot fold to a constant.
+const GATE_UP_SWIGLU_VEC_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu_vec";
+const GATE_UP_DECOMPOSED_SWIGLU_VEC_ENTRY: &str =
+    "matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_vec";
+const GATE_UP_SWIGLU_RMSNORM_VEC_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_vec";
+const GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_VEC_ENTRY: &str =
+    "matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_vec";
 const GATE_UP_SWIGLU_THREADS: u32 = 256;
 
 const DEQUANT_SRC: &str = r#"
@@ -1325,6 +1339,62 @@ __device__ __forceinline__ void int4x8_to_half2x4(
 {
     constexpr unsigned int fp16_eight = 0x48004800;
     int4x8_to_half2x4_sub(packed, values, fp16_eight);
+}
+
+// Fused symmetric int4 dequant: `(code - 8)` in fp16, emitting FOUR fewer
+// `f16x2` ALU ops per packed word than [`int4x8_to_half2x4`] by folding the
+// symmetric zero point (`- 8`) into the magic-bias-removal constants instead of
+// issuing it as a separate trailing `sub.f16x2` per element pair.
+//
+// BYTE-IDENTICAL to `int4x8_to_half2x4` (the `- 8` path): every intermediate is
+// an exactly-representable fp16 integer, so folding the two constant
+// subtractions into one changes no rounding:
+//   * bottom nibbles decode to `1024 + code` (exact in [1024, 1039]); the
+//     original does `(x - 1024) - 8`, this does `x - 1032` — `1032 = 0x6408` is
+//     exact and `(1024 + code) - 1032 = code - 8` with no intermediate rounding.
+//   * top nibbles decode to `1024 + 16*code`; the original fma `x*(1/16) - 64`
+//     yields the exact integer `code`, then `- 8`; this fuses to
+//     `x*(1/16) - 72` (`72 = 0xD480` exact). `x*(1/16)` is an exact power-of-two
+//     scale, so the single fma rounding lands on `code - 8` identically.
+// This is a pure instruction-count reduction for the issue-bound symmetric
+// paired gate/up decode GEMV — no reassociation, no math change.
+__device__ __forceinline__ void int4x8_to_half2x4_sym8(
+    const unsigned int packed,
+    __half2* values)
+{
+    unsigned int* h = reinterpret_cast<unsigned int*>(values);
+    constexpr unsigned int bottom_mask = 0x000f000f;
+    constexpr unsigned int top_mask = 0x00f000f0;
+    constexpr unsigned int fp16_magic = 0x64006400;
+    constexpr unsigned int lop3_lut = (0xf0 & 0xcc) | 0xaa;
+    const unsigned int top = packed >> 8;
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[0])
+                 : "r"(packed), "n"(bottom_mask), "n"(fp16_magic), "n"(lop3_lut));
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[1])
+                 : "r"(packed), "n"(top_mask), "n"(fp16_magic), "n"(lop3_lut));
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[2])
+                 : "r"(top), "n"(bottom_mask), "n"(fp16_magic), "n"(lop3_lut));
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[3])
+                 : "r"(top), "n"(top_mask), "n"(fp16_magic), "n"(lop3_lut));
+
+    // 1032 = 1024 (magic bias) + 8 (symmetric zero point); -72 = -64 - 8.
+    constexpr unsigned int fp16_1032 = 0x64086408;
+    constexpr unsigned int fp16_one_sixteenth = 0x2c002c00;
+    constexpr unsigned int fp16_neg72 = 0xd480d480;
+    asm volatile("sub.f16x2 %0, %1, %2;\n"
+                 : "=r"(h[0]) : "r"(h[0]), "r"(fp16_1032));
+    asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n"
+                 : "=r"(h[1])
+                 : "r"(h[1]), "r"(fp16_one_sixteenth), "r"(fp16_neg72));
+    asm volatile("sub.f16x2 %0, %1, %2;\n"
+                 : "=r"(h[2]) : "r"(h[2]), "r"(fp16_1032));
+    asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n"
+                 : "=r"(h[3])
+                 : "r"(h[3]), "r"(fp16_one_sixteenth), "r"(fp16_neg72));
 }
 
 // Pack a scalar block zero point (nibble in [0, 15]) into an fp16x2 subtrahend
@@ -2409,6 +2479,35 @@ __device__ __forceinline__ void accumulate_int4x8_f16_permuted_zp(
 {
     __half2 q[4];
     int4x8_to_half2x4_sub(packed, q, sub2);
+    const __half2 scale2 = __halves2half2(scale, scale);
+    sum0 = __hfma2(__hmul2(q[0], scale2),
+                   *reinterpret_cast<const __half2*>(&activation.x), sum0);
+    sum1 = __hfma2(__hmul2(q[1], scale2),
+                   *reinterpret_cast<const __half2*>(&activation.y), sum1);
+    sum2 = __hfma2(__hmul2(q[2], scale2),
+                   *reinterpret_cast<const __half2*>(&activation.z), sum2);
+    sum3 = __hfma2(__hmul2(q[3], scale2),
+                   *reinterpret_cast<const __half2*>(&activation.w), sum3);
+}
+
+// Fused-symmetric [`accumulate_int4x8_f16_permuted_zp`]: identical multiply-add
+// (same permuted activation, same `q * scale` fp16 FMA order into `sum0..3`) but
+// dequants with [`int4x8_to_half2x4_sym8`], which folds the `- 8` symmetric zero
+// point into the bias constants. The `q[i]` values are byte-identical to the
+// `sub2 == 8` path, so the accumulation is bit-for-bit the same while issuing
+// four fewer `f16x2` ops per word — the instruction-count win for the
+// issue-bound paired gate/up decode GEMV.
+__device__ __forceinline__ void accumulate_int4x8_f16_permuted_sym8(
+    const unsigned int packed,
+    const uint4& activation,
+    const __half scale,
+    __half2& sum0,
+    __half2& sum1,
+    __half2& sum2,
+    __half2& sum3)
+{
+    __half2 q[4];
+    int4x8_to_half2x4_sym8(packed, q);
     const __half2 scale2 = __halves2half2(scale, scale);
     sum0 = __hfma2(__hmul2(q[0], scale2),
                    *reinterpret_cast<const __half2*>(&activation.x), sum0);
@@ -3866,7 +3965,7 @@ __device__ __forceinline__ float gate_up_decomposed_silu_f32(float x)
 // (`fp16(gate_acc)`, `fp16(up_acc)`, then `fp16(silu(gate_h)*up_h)`) so greedy
 // decoding stays byte-identical. Register-only + warp shuffles: no shared
 // memory, so it is portable to sm_53+ and safe on small SMs (no >48KB opt-in).
-template <bool HasZp, bool Decomposed>
+template <bool HasZp, bool Decomposed, bool FusedSym = false>
 __device__ __forceinline__ void matmul_nbits_gemv_f16_gate_up_swiglu_tpl(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed_gate,
@@ -3920,12 +4019,22 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_gate_up_swiglu_tpl(
                 block_sub2<HasZp>(zero_points_up, column, block, zp_row_bytes);
             const unsigned int gate_word =
                 *reinterpret_cast<const unsigned int*>(packed_gate_ptr);
-            accumulate_int4x8_f16_permuted_zp(
-                gate_word, permuted, *scale_gate_ptr, gate_sub2, g0, g1, g2, g3);
             const unsigned int up_word =
                 *reinterpret_cast<const unsigned int*>(packed_up_ptr);
-            accumulate_int4x8_f16_permuted_zp(
-                up_word, permuted, *scale_up_ptr, up_sub2, u0, u1, u2, u3);
+            if constexpr (FusedSym && !HasZp) {
+                // Symmetric fast dequant: fold `- 8` into the bias constants
+                // (byte-identical, four fewer f16x2 ops/word). `gate_sub2`/
+                // `up_sub2` are the constant 8 here and go unused.
+                accumulate_int4x8_f16_permuted_sym8(
+                    gate_word, permuted, *scale_gate_ptr, g0, g1, g2, g3);
+                accumulate_int4x8_f16_permuted_sym8(
+                    up_word, permuted, *scale_up_ptr, u0, u1, u2, u3);
+            } else {
+                accumulate_int4x8_f16_permuted_zp(
+                    gate_word, permuted, *scale_gate_ptr, gate_sub2, g0, g1, g2, g3);
+                accumulate_int4x8_f16_permuted_zp(
+                    up_word, permuted, *scale_up_ptr, up_sub2, u0, u1, u2, u3);
+            }
             activation_ptr += 256;
             packed_gate_ptr += 128;
             packed_up_ptr += 128;
@@ -4073,7 +4182,47 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_zp(
     matmul_nbits_gemv_f16_gate_up_swiglu_tpl<true, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, output, k, n, k_blocks, blob_size, zp_row_bytes);
 }
 
-// Paired gate/up projection + SwiGLU with a fused RMS-normalization prologue.
+// Fused-symmetric (`ONNX_GENAI_GATEUP_VEC`) siblings of the two SYMMETRIC
+// gate/up SwiGLU entries above. Byte-identical — only the dequant folds the
+// `- 8` symmetric zero point into the bias constants (see
+// `int4x8_to_half2x4_sym8`), issuing four fewer f16x2 ops per weight word to
+// relieve the issue-bound decode GEMV. No asymmetric `_vec` variant: the `_zp`
+// entries carry a per-block zero point that cannot be folded to a constant.
+extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_vec(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed_gate,
+    const __half* __restrict__ scales_gate,
+    const unsigned char* __restrict__ packed_up,
+    const __half* __restrict__ scales_up,
+    const unsigned char* __restrict__ zero_points_gate,
+    const unsigned char* __restrict__ zero_points_up,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes)
+{
+    matmul_nbits_gemv_f16_gate_up_swiglu_tpl<false, false, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, output, k, n, k_blocks, blob_size, zp_row_bytes);
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_vec(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed_gate,
+    const __half* __restrict__ scales_gate,
+    const unsigned char* __restrict__ packed_up,
+    const __half* __restrict__ scales_up,
+    const unsigned char* __restrict__ zero_points_gate,
+    const unsigned char* __restrict__ zero_points_up,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes)
+{
+    matmul_nbits_gemv_f16_gate_up_swiglu_tpl<false, true, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, output, k, n, k_blocks, blob_size, zp_row_bytes);
+}
 // This is `matmul_nbits_gemv_f16_gate_up_swiglu` preceded by the exact prologue
 // of `matmul_nbits_gemv_f16_scales_f16_rmsnorm`: the block reduces the shared
 // activation (the residual sum the preceding GEMV epilogue already produced)
@@ -4084,7 +4233,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_zp(
 // `SkipSimplifiedLayerNormalization` through the paired kernel. Every arithmetic
 // step mirrors the standalone norm followed by the two-op gate/up SwiGLU, so
 // greedy tokens stay bit-for-bit identical.
-template <bool HasZp, bool Decomposed>
+template <bool HasZp, bool Decomposed, bool FusedSym = false>
 __device__ __forceinline__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed_gate,
@@ -4221,18 +4370,27 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl
             for (; depth_base + lane_depth + 8 <= k; depth_base += 256) {
                 const uint4 permuted = permute_activation_f16x8(activation_ptr);
                 const int block = (depth_base >> 5) + (lane >> 2);
-                const unsigned int gate_sub2 =
-                    block_sub2<HasZp>(zero_points_gate, column, block, zp_row_bytes);
-                const unsigned int up_sub2 =
-                    block_sub2<HasZp>(zero_points_up, column, block, zp_row_bytes);
                 const unsigned int gate_word =
                     *reinterpret_cast<const unsigned int*>(packed_gate_ptr);
-                accumulate_int4x8_f16_permuted_zp(
-                    gate_word, permuted, *scale_gate_ptr, gate_sub2, g0, g1, g2, g3);
                 const unsigned int up_word =
                     *reinterpret_cast<const unsigned int*>(packed_up_ptr);
-                accumulate_int4x8_f16_permuted_zp(
-                    up_word, permuted, *scale_up_ptr, up_sub2, u0, u1, u2, u3);
+                if constexpr (FusedSym) {
+                    // Symmetric fast dequant: fold `- 8` into the bias constants
+                    // (byte-identical, four fewer f16x2 ops/word).
+                    accumulate_int4x8_f16_permuted_sym8(
+                        gate_word, permuted, *scale_gate_ptr, g0, g1, g2, g3);
+                    accumulate_int4x8_f16_permuted_sym8(
+                        up_word, permuted, *scale_up_ptr, u0, u1, u2, u3);
+                } else {
+                    const unsigned int gate_sub2 = block_sub2<HasZp>(
+                        zero_points_gate, column, block, zp_row_bytes);
+                    const unsigned int up_sub2 = block_sub2<HasZp>(
+                        zero_points_up, column, block, zp_row_bytes);
+                    accumulate_int4x8_f16_permuted_zp(
+                        gate_word, permuted, *scale_gate_ptr, gate_sub2, g0, g1, g2, g3);
+                    accumulate_int4x8_f16_permuted_zp(
+                        up_word, permuted, *scale_up_ptr, up_sub2, u0, u1, u2, u3);
+                }
                 activation_ptr += 256;
                 packed_gate_ptr += 128;
                 packed_up_ptr += 128;
@@ -4344,6 +4502,53 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsno
     const float epsilon)
 {
     matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<false, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
+}
+
+// Fused-symmetric (`ONNX_GENAI_GATEUP_VEC`) siblings of the two SYMMETRIC
+// RMS-norm-fused gate/up SwiGLU entries — the dominant qwen2.5-14b decode
+// kernel is `..decomposed_swiglu_rmsnorm`. Byte-identical (folds the `- 8`
+// symmetric zero point into the dequant bias constants; see
+// `int4x8_to_half2x4_sym8`), only the issued instruction count drops.
+extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_vec(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed_gate,
+    const __half* __restrict__ scales_gate,
+    const unsigned char* __restrict__ packed_up,
+    const __half* __restrict__ scales_up,
+    const unsigned char* __restrict__ zero_points_gate,
+    const unsigned char* __restrict__ zero_points_up,
+    const void* __restrict__ gamma,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int gamma_is_half,
+    const float epsilon)
+{
+    matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<false, false, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_vec(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed_gate,
+    const __half* __restrict__ scales_gate,
+    const unsigned char* __restrict__ packed_up,
+    const __half* __restrict__ scales_up,
+    const unsigned char* __restrict__ zero_points_gate,
+    const unsigned char* __restrict__ zero_points_up,
+    const void* __restrict__ gamma,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int gamma_is_half,
+    const float epsilon)
+{
+    matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<false, true, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
 }
 
 extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_zp(
@@ -5650,6 +5855,25 @@ fn gemv_foldscale_enabled() -> bool {
 fn scales_f16_pipeline_enabled() -> bool {
     !matches!(
         std::env::var("ONNX_GENAI_GEMV_PIPELINE").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
+/// Whether the SYMMETRIC paired gate/up SwiGLU decode GEMV takes the
+/// fused-symmetric (`_vec`) entry, which folds the `- 8` symmetric zero point
+/// into the dequant bias constants and so issues four fewer `f16x2` ops per
+/// weight word. That kernel is the largest decode kernel on qwen2.5-14b and is
+/// issue-bound (ncu: ~28% DRAM, ~48% issue-active), so cutting issued
+/// instructions is the right lever (prefetch/`uint4` loads do not help: the
+/// loads are already 128B-coalesced per warp and strided per lane). The `_vec`
+/// entry is BYTE-IDENTICAL to the default entry — every dequant intermediate is
+/// an exactly-representable fp16 integer, so folding the two constant
+/// subtractions changes no rounding — so it is default-on;
+/// `ONNX_GENAI_GATEUP_VEC=0` (or `false`/`off`) forces the scalar entry for A/B
+/// measurement.
+fn gate_up_vec_enabled() -> bool {
+    !matches!(
+        std::env::var("ONNX_GENAI_GATEUP_VEC").ok().as_deref(),
         Some("0") | Some("false") | Some("off")
     )
 }
@@ -7968,11 +8192,17 @@ impl MatMulNBitsKernel {
             .require_nvrtc_half_headers("MatMulNBits fp16 gate/up SwiGLU GEMV")?;
         // Symmetric weights launch the `HasZp == false` entry, whose PTX drops the
         // per-block zero-point load entirely; only asymmetric weights pay for it.
-        let entry = match (self.decomposed_silu, zp_gate.is_some() || zp_up.is_some()) {
-            (true, true) => GATE_UP_DECOMPOSED_SWIGLU_ZP_ENTRY,
-            (true, false) => GATE_UP_DECOMPOSED_SWIGLU_ENTRY,
-            (false, true) => GATE_UP_SWIGLU_ZP_ENTRY,
-            (false, false) => GATE_UP_SWIGLU_ENTRY,
+        // When `ONNX_GENAI_GATEUP_VEC` is armed, the symmetric entries reroute to
+        // their byte-identical fused-symmetric `_vec` sibling (fewer issued ops).
+        let has_zp = zp_gate.is_some() || zp_up.is_some();
+        let vec = !has_zp && gate_up_vec_enabled();
+        let entry = match (self.decomposed_silu, has_zp, vec) {
+            (true, true, _) => GATE_UP_DECOMPOSED_SWIGLU_ZP_ENTRY,
+            (true, false, true) => GATE_UP_DECOMPOSED_SWIGLU_VEC_ENTRY,
+            (true, false, false) => GATE_UP_DECOMPOSED_SWIGLU_ENTRY,
+            (false, true, _) => GATE_UP_SWIGLU_ZP_ENTRY,
+            (false, false, true) => GATE_UP_SWIGLU_VEC_ENTRY,
+            (false, false, false) => GATE_UP_SWIGLU_ENTRY,
         };
         let function = self
             .runtime
@@ -8052,11 +8282,17 @@ impl MatMulNBitsKernel {
     ) -> Result<()> {
         self.runtime
             .require_nvrtc_half_headers("MatMulNBits fp16 gate/up SwiGLU RMS-norm GEMV")?;
-        let entry = match (self.decomposed_silu, zp_gate.is_some() || zp_up.is_some()) {
-            (true, true) => GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_ZP_ENTRY,
-            (true, false) => GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_ENTRY,
-            (false, true) => GATE_UP_SWIGLU_RMSNORM_ZP_ENTRY,
-            (false, false) => GATE_UP_SWIGLU_RMSNORM_ENTRY,
+        // `ONNX_GENAI_GATEUP_VEC` reroutes the symmetric RMS-norm-fused entries to
+        // their byte-identical fused-symmetric `_vec` sibling (fewer issued ops).
+        let has_zp = zp_gate.is_some() || zp_up.is_some();
+        let vec = !has_zp && gate_up_vec_enabled();
+        let entry = match (self.decomposed_silu, has_zp, vec) {
+            (true, true, _) => GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_ZP_ENTRY,
+            (true, false, true) => GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_VEC_ENTRY,
+            (true, false, false) => GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_ENTRY,
+            (false, true, _) => GATE_UP_SWIGLU_RMSNORM_ZP_ENTRY,
+            (false, false, true) => GATE_UP_SWIGLU_RMSNORM_VEC_ENTRY,
+            (false, false, false) => GATE_UP_SWIGLU_RMSNORM_ENTRY,
         };
         let function = self
             .runtime
@@ -14240,6 +14476,292 @@ extern "C" __global__ void ref_silu_mul_f16(
                     fused[index],
                     reference[index]
                 );
+            }
+        }
+    }
+
+    /// The fused-symmetric gate/up SwiGLU decode entries (`..gate_up*_vec`,
+    /// opt-in via `ONNX_GENAI_GATEUP_VEC=1`) must be RAW-16-BIT IDENTICAL to the
+    /// default symmetric entries. The `_vec` entries only fold the `- 8`
+    /// symmetric zero point into the dequant bias constants (see
+    /// `int4x8_to_half2x4_sym8`); every `q[i]` value is unchanged, so the fp16
+    /// multiply-add accumulation, the RMS-norm prologue, the SwiGLU rounding, and
+    /// thus `silu(gate)*up` must match bit-for-bit — and hence match M
+    /// independent M=1 greedy `_dsilu` GEMVs. A single argmax flip downstream
+    /// would start here. Covers plain + RMS-norm-fused, decomposed +
+    /// non-decomposed SiLU, fp16 AND fp32 gamma, the real Qwen2.5-14b gate/up
+    /// dims (K=5120, N=13824), and M in {1,4,6,8}.
+    #[test]
+    fn gate_up_swiglu_vec_is_bit_identical_to_scalar() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping gate/up SwiGLU _vec bit-identity test: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("matmul_nbits_gemv_f16")
+            .is_err()
+        {
+            eprintln!(
+                "skipping gate/up SwiGLU _vec bit-identity test: fp16 NVRTC headers unavailable"
+            );
+            return;
+        }
+
+        let epsilon = 1e-5f32;
+        for (m, k, n) in [
+            (1usize, 896usize, 2432usize),
+            (4, 3584, 4864),
+            (6, 5120, 13824),
+            (8, 5120, 13824),
+        ] {
+            let block_size = 32usize;
+            let k_blocks = k / block_size;
+            let blob_size = block_size / 2;
+
+            let mut state = 0x51de_face_c0de_1234u64 ^ ((m as u64) << 40);
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+
+            let pack = |next: &mut dyn FnMut() -> f32| -> Vec<u8> {
+                let mut quant = vec![0u8; n * k];
+                for value in quant.iter_mut() {
+                    *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+                }
+                let mut packed = vec![0u8; n * k_blocks * blob_size];
+                for col in 0..n {
+                    for block in 0..k_blocks {
+                        for pair in 0..blob_size {
+                            let low = quant[col * k + block * block_size + pair * 2] & 15;
+                            let high = quant[col * k + block * block_size + pair * 2 + 1] & 15;
+                            packed[(col * k_blocks + block) * blob_size + pair] = low | (high << 4);
+                        }
+                    }
+                }
+                packed
+            };
+
+            let activation: Vec<f16> = (0..m * k).map(|_| f16::from_f32(next())).collect();
+            let packed_gate = pack(&mut next);
+            let scales_gate: Vec<f16> = (0..n * k_blocks)
+                .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+                .collect();
+            let packed_up = pack(&mut next);
+            let scales_up: Vec<f16> = (0..n * k_blocks)
+                .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+                .collect();
+            let gamma_f32: Vec<f32> = (0..k).map(|_| 0.5 + 0.5 * (next() * 0.5 + 0.5)).collect();
+
+            let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+            let packed_gate_dev = runtime.alloc_raw(packed_gate.len()).unwrap();
+            let scales_gate_dev = runtime.alloc_raw(scales_gate.len() * 2).unwrap();
+            let packed_up_dev = runtime.alloc_raw(packed_up.len()).unwrap();
+            let scales_up_dev = runtime.alloc_raw(scales_up.len() * 2).unwrap();
+            // SAFETY: device buffers exactly cover their source slices.
+            unsafe {
+                runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+                runtime.htod(&packed_gate, packed_gate_dev).unwrap();
+                runtime
+                    .htod(as_bytes(&scales_gate), scales_gate_dev)
+                    .unwrap();
+                runtime.htod(&packed_up, packed_up_dev).unwrap();
+                runtime.htod(as_bytes(&scales_up), scales_up_dev).unwrap();
+            }
+
+            let device = DeviceId::cuda(0);
+            let a_shape = [m, k];
+            let a_strides = [k as i64, 1];
+            let b_shape = [n, k_blocks, blob_size];
+            let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+            let scales_shape = [n, k_blocks];
+            let scales_strides = [k_blocks as i64, 1];
+            let gamma_shape = [k];
+            let gamma_strides = [1i64];
+            let y_shape = [m, n];
+            let y_strides = [n as i64, 1];
+            let output_elements = m * n;
+
+            let activation_view = TensorView::new(
+                device_ptr(activation_dev),
+                DataType::Float16,
+                &a_shape,
+                &a_strides,
+                device,
+            );
+            let packed_gate_view = TensorView::new(
+                device_ptr(packed_gate_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            );
+            let scales_gate_view = TensorView::new(
+                device_ptr(scales_gate_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            );
+            let packed_up_view = TensorView::new(
+                device_ptr(packed_up_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            );
+            let scales_up_view = TensorView::new(
+                device_ptr(scales_up_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            );
+
+            // Every (rmsnorm, decomposed, gamma dtype) symmetric gate/up variant
+            // that has a `_vec` sibling, so the bit-identity gate covers all four
+            // fused-symmetric entries and both gamma widths.
+            for rmsnorm in [false, true] {
+                for decomposed in [false, true] {
+                    for gamma_dtype in [DataType::Float16, DataType::Float32] {
+                        if !rmsnorm && gamma_dtype == DataType::Float32 {
+                            // Gamma is only consumed by the RMS-norm prologue.
+                            continue;
+                        }
+                        let gamma_is_f32 = gamma_dtype == DataType::Float32;
+                        let gamma_bytes: Vec<u8> = if gamma_is_f32 {
+                            gamma_f32.iter().flat_map(|v| v.to_le_bytes()).collect()
+                        } else {
+                            gamma_f32
+                                .iter()
+                                .flat_map(|v| f16::from_f32(*v).to_le_bytes())
+                                .collect()
+                        };
+                        let gamma_dev = runtime.alloc_raw(gamma_bytes.len()).unwrap();
+                        // SAFETY: buffer sized to the gamma byte slice.
+                        unsafe {
+                            runtime.htod(&gamma_bytes, gamma_dev).unwrap();
+                        }
+                        let gamma_view = TensorView::new(
+                            device_ptr(gamma_dev),
+                            gamma_dtype,
+                            &gamma_shape,
+                            &gamma_strides,
+                            device,
+                        );
+
+                        let kernel = MatMulNBitsKernel {
+                            runtime: runtime.clone(),
+                            k,
+                            n,
+                            bits: 4,
+                            block_size,
+                            accuracy_level: 4,
+                            accuracy4_workspace: None,
+                            fold_bias_post_round: false,
+                            gate_up_swiglu: true,
+                            decomposed_silu: decomposed,
+                            rmsnorm_prologue: rmsnorm,
+                            rmsnorm_epsilon: epsilon,
+                            last_call_capture_safe: AtomicBool::new(false),
+                            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+                            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+                        };
+
+                        let run_once = |vec_on: bool| -> Vec<u16> {
+                            let out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
+                            let lock = INTERLEAVE_TEST_ENV_LOCK.get_or_init(|| Mutex::new(()));
+                            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                            // SAFETY: the env write is confined to this critical
+                            // section and removed before the lock is released.
+                            unsafe {
+                                std::env::set_var(
+                                    "ONNX_GENAI_GATEUP_VEC",
+                                    if vec_on { "1" } else { "0" },
+                                );
+                            }
+                            let out = TensorMut::new(
+                                device_ptr_mut(out_dev),
+                                DataType::Float16,
+                                &y_shape,
+                                &y_strides,
+                                device,
+                            );
+                            let mut outputs = [out];
+                            if rmsnorm {
+                                let inputs = [
+                                    activation_view,
+                                    packed_gate_view,
+                                    scales_gate_view,
+                                    packed_up_view,
+                                    scales_up_view,
+                                    gamma_view,
+                                ];
+                                kernel
+                                    .run_f16_gate_up_swiglu(&inputs, &mut outputs)
+                                    .unwrap();
+                            } else {
+                                let inputs = [
+                                    activation_view,
+                                    packed_gate_view,
+                                    scales_gate_view,
+                                    packed_up_view,
+                                    scales_up_view,
+                                ];
+                                kernel
+                                    .run_f16_gate_up_swiglu(&inputs, &mut outputs)
+                                    .unwrap();
+                            }
+                            runtime.synchronize().unwrap();
+                            unsafe {
+                                std::env::remove_var("ONNX_GENAI_GATEUP_VEC");
+                            }
+                            drop(_guard);
+
+                            let mut host = vec![f16::ZERO; output_elements];
+                            // SAFETY: buffer holds `output_elements` fp16 values.
+                            unsafe {
+                                runtime.dtoh(as_bytes_mut(&mut host), out_dev).unwrap();
+                                runtime.free_raw(out_dev).unwrap();
+                            }
+                            host.iter().map(|v| v.to_bits()).collect()
+                        };
+
+                        let reference = run_once(false);
+                        let fused = run_once(true);
+
+                        // SAFETY: gamma buffer no longer referenced.
+                        unsafe {
+                            runtime.free_raw(gamma_dev).unwrap();
+                        }
+
+                        for index in 0..output_elements {
+                            assert_eq!(
+                                fused[index],
+                                reference[index],
+                                "fused-symmetric gate/up _vec diverged at M={m}, K={k}, N={n}, \
+                                 rmsnorm={rmsnorm}, decomposed={decomposed}, \
+                                 gamma_f32={gamma_is_f32}, row={}, column={}: vec=0x{:04x} \
+                                 scalar=0x{:04x}",
+                                index / n,
+                                index % n,
+                                fused[index],
+                                reference[index]
+                            );
+                        }
+                    }
+                }
+            }
+
+            // SAFETY: shared input buffers are done after all variants ran.
+            unsafe {
+                runtime.free_raw(activation_dev).unwrap();
+                runtime.free_raw(packed_gate_dev).unwrap();
+                runtime.free_raw(scales_gate_dev).unwrap();
+                runtime.free_raw(packed_up_dev).unwrap();
+                runtime.free_raw(scales_up_dev).unwrap();
             }
         }
     }
