@@ -201,17 +201,47 @@ impl CpuExecutionProvider {
 /// ladder above was swept; `0` disables the parallel path entirely.
 const HOST_COPY_PARALLEL_MIN_BYTES: usize = 4 << 20;
 
+/// Parse an override string. Split out so it can be tested without touching
+/// process-global state.
+fn parse_host_copy_threshold(raw: Option<&str>) -> Option<usize> {
+    raw?.trim().parse::<usize>().ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread threshold override for tests.
+    ///
+    /// Tests must not use the environment variable: `cargo test` runs a
+    /// binary's tests on parallel threads, and `set_var` racing another
+    /// thread's `getenv` is a data race that Rust 2024 explicitly forbids.
+    /// A thread-local is race-free and needs no test serialisation.
+    static TEST_HOST_COPY_THRESHOLD: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// The active threshold, honouring the environment override.
 ///
-/// Read on every call rather than cached: a `OnceLock` here would make the
-/// first copy in a process fix the value for every later session, which breaks
-/// a sweep and makes the tests order-dependent. The read is a thread-local
-/// environment lookup against a copy that is already at least 24 MiB.
+/// The environment is read exactly once per process and cached, so this is a
+/// relaxed atomic load on every copy rather than a locked `getenv` plus a
+/// `String` allocation. That matters: the small-copy path this function gates
+/// is 4.8 us for a 0.125 MiB decode input, and an `env::var` miss is ~72 ns
+/// against it - on the path the change is supposed to leave alone. Caching is
+/// correct for the sweep that produced the table above because that sweep runs
+/// one process per arm.
 fn host_copy_parallel_min_bytes() -> usize {
-    std::env::var("ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
+    #[cfg(test)]
+    if let Some(forced) = TEST_HOST_COPY_THRESHOLD.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_host_copy_threshold(
+            std::env::var("ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES")
+                .ok()
+                .as_deref(),
+        )
         .unwrap_or(HOST_COPY_PARALLEL_MIN_BYTES)
+    })
 }
 
 /// Workers available to a host copy: the decode budget, never the raw machine.
@@ -219,29 +249,43 @@ fn host_copy_parallel_min_bytes() -> usize {
 /// `rayon::current_num_threads()` is the whole machine unless something bounded
 /// the global pool. `--native-threads` / `ONNX_GENAI_CPU_DECODE_THREADS` does
 /// bound it (`bound_process_to_decode_budget`), so reading the pool here
-/// respects an explicit budget while still capping at 8: a host copy is
-/// bandwidth-bound, the ladder above was measured at this cap, and widening the
-/// fan-out only adds workers to wake for the same DRAM.
+/// respects an explicit budget while still capping at 8. The cap is an a priori
+/// choice, not a measured optimum - a host copy is bandwidth-bound, so widening
+/// the fan-out should only add workers to wake for the same DRAM - and the whole
+/// ladder above was measured at this cap. No width sweep is included, so 8 is
+/// not demonstrated to beat 16.
 fn host_copy_workers() -> usize {
     rayon::current_num_threads().clamp(1, 8)
 }
 
-/// Test-only count of copies that actually took the parallel path.
+/// Test-only count of copies that actually took the parallel path, per thread.
 ///
 /// Without it a test that sets the threshold to 1 proves nothing on a machine
 /// whose Rayon pool is one worker wide - it would silently measure the serial
-/// path twice and pass. CI runners are exactly such machines.
+/// path twice and pass. CI runners are exactly such machines. It is
+/// thread-local, not a global atomic, so a concurrently running test cannot
+/// bump another test's count and make its non-vacuity check pass spuriously.
 #[cfg(test)]
-static PARALLEL_HOST_COPIES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static PARALLEL_HOST_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// `dst.copy_from_slice(src)`, split across the decode budget when that is
 /// faster and byte-for-byte identical either way.
+///
+/// May be called from inside a Rayon worker. The nested `par_chunks` then runs
+/// on the same global pool, which Rayon supports - the outer worker
+/// participates rather than blocking - so there is no deadlock, only a wider
+/// split than the caller may expect.
 fn copy_host_bytes(src: &[u8], dst: &mut [u8]) {
     debug_assert_eq!(src.len(), dst.len());
-    let threshold = host_copy_parallel_min_bytes();
     let workers = host_copy_workers();
-    if threshold == 0 || src.len() < threshold || workers < 2 {
+    if workers < 2 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let threshold = host_copy_parallel_min_bytes();
+    if threshold == 0 || src.len() < threshold {
         dst.copy_from_slice(src);
         return;
     }
@@ -249,7 +293,7 @@ fn copy_host_bytes(src: &[u8], dst: &mut [u8]) {
     // union is exactly `src`. `par_chunks_mut`/`par_chunks` walk the same
     // split, so chunk `i` of the destination receives chunk `i` of the source.
     #[cfg(test)]
-    PARALLEL_HOST_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PARALLEL_HOST_COPIES.with(|n| n.set(n.get() + 1));
     let chunk = src.len().div_ceil(workers);
     use rayon::prelude::*;
     dst.par_chunks_mut(chunk)
@@ -562,13 +606,15 @@ impl ExecutionProvider for CpuExecutionProvider {
     fn copy_from_host(&self, src: &[u8], dst: &mut DeviceBuffer) -> Result<()> {
         if !dst.device().is_host_accessible() {
             return Err(EpError::KernelFailed(format!(
-                "cpu_ep: host upload is not implemented for device {:?}",
+                "{}: host upload is not implemented for device {:?}",
+                self.name(),
                 dst.device()
             )));
         }
         if src.len() > dst.len() {
             return Err(EpError::KernelFailed(format!(
-                "cpu_ep: host upload of {} bytes exceeds destination {} bytes",
+                "{}: host upload of {} bytes exceeds destination {} bytes",
+                self.name(),
                 src.len(),
                 dst.len()
             )));
@@ -579,6 +625,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         // SAFETY: host accessibility and `src.len() <= dst.len()` are checked
         // above, and `dst` is uniquely borrowed, so this names a live host
         // allocation of at least `src.len()` bytes that nothing else aliases.
+        //
+        // The default implementation this overrides writes through the raw
+        // pointer instead of forming a slice, which avoids naming
+        // possibly-uninitialised memory as `&mut [u8]`. That distinction is
+        // immaterial for `u8`: it has no invalid bit patterns and no niche, so
+        // every byte of a fresh allocation is a valid `u8` whatever it holds,
+        // and the reference is only written through.
         let out =
             unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), src.len()) };
         copy_host_bytes(src, out);
@@ -633,16 +686,36 @@ impl ExecutionProvider for CpuExecutionProvider {
 #[cfg(test)]
 mod host_copy_tests {
     use super::{
-        HOST_COPY_PARALLEL_MIN_BYTES, PARALLEL_HOST_COPIES, copy_host_bytes,
-        host_copy_parallel_min_bytes, host_copy_workers,
+        HOST_COPY_PARALLEL_MIN_BYTES, PARALLEL_HOST_COPIES, TEST_HOST_COPY_THRESHOLD,
+        copy_host_bytes, host_copy_parallel_min_bytes, host_copy_workers,
+        parse_host_copy_threshold,
     };
     use onnx_runtime_ep_api::{DeviceType, ExecutionProvider};
-    use std::sync::atomic::Ordering;
 
     fn ramp(len: usize) -> Vec<u8> {
         (0..len)
             .map(|i| (i.wrapping_mul(31) ^ (i >> 5)) as u8)
             .collect()
+    }
+
+    /// Force the threshold for this thread only, restoring it afterwards even
+    /// on panic. Deliberately not the environment variable: `cargo test` runs
+    /// these on parallel threads, and `set_var` racing another thread's
+    /// `getenv` is a data race under Rust 2024 as well as a flake source.
+    fn with_threshold<R>(bytes: usize, f: impl FnOnce() -> R) -> R {
+        struct Restore(Option<usize>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_HOST_COPY_THRESHOLD.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(TEST_HOST_COPY_THRESHOLD.with(std::cell::Cell::get));
+        TEST_HOST_COPY_THRESHOLD.with(|c| c.set(Some(bytes)));
+        f()
+    }
+
+    fn parallel_copies_on_this_thread() -> usize {
+        PARALLEL_HOST_COPIES.with(std::cell::Cell::get)
     }
 
     /// The whole point: whichever side of the threshold a copy lands on, the
@@ -667,15 +740,12 @@ mod host_copy_tests {
             let mut serial = vec![0u8; len];
             let mut parallel = vec![0u8; len];
 
-            // SAFETY of the comparison: both paths are exercised explicitly by
-            // moving the threshold, not by hoping `len` lands on either side.
-            unsafe { std::env::set_var("ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES", "0") };
-            copy_host_bytes(&src, &mut serial);
-            unsafe { std::env::set_var("ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES", "1") };
-            let before = PARALLEL_HOST_COPIES.load(Ordering::Relaxed);
-            copy_host_bytes(&src, &mut parallel);
-            let took_parallel = PARALLEL_HOST_COPIES.load(Ordering::Relaxed) > before;
-            unsafe { std::env::remove_var("ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES") };
+            // Both paths are exercised explicitly by moving the threshold, not
+            // by hoping `len` lands on either side of it.
+            with_threshold(0, || copy_host_bytes(&src, &mut serial));
+            let before = parallel_copies_on_this_thread();
+            with_threshold(1, || copy_host_bytes(&src, &mut parallel));
+            let took_parallel = parallel_copies_on_this_thread() > before;
 
             // On a single-worker pool the "parallel" arm is the serial path and
             // proves nothing; say so rather than passing vacuously.
@@ -697,31 +767,45 @@ mod host_copy_tests {
     /// in-session ladder (see the constant's docs) measured 2 MiB inputs 3.7x
     /// *slower* with threads and 4 MiB inputs 1.4x faster, so the threshold has
     /// to land strictly between them. Retuning inside that band is fine;
-    /// moving outside it has to fail here rather than silently regress the
-    /// small-input path.
+    /// moving outside it has to fail the build.
+    ///
+    /// This is a compile-time check on purpose: a mis-tuned constant should
+    /// never get as far as a test run.
+    const _CALIBRATION_BAND: () = {
+        assert!(
+            HOST_COPY_PARALLEL_MIN_BYTES > 2 << 20,
+            "2 MiB inputs were 3.7x slower parallel in-session; the threshold must exclude them"
+        );
+        assert!(
+            HOST_COPY_PARALLEL_MIN_BYTES <= 4 << 20,
+            "4 MiB inputs were 1.4x faster parallel in-session; the threshold must admit them"
+        );
+    };
+
+    /// The override parser has to accept what the sweep passes it and reject
+    /// what it does not, or the ladder that produced the table above measured
+    /// nothing. Tested on the parser rather than through the environment so it
+    /// cannot race a concurrently running test.
     #[test]
-    fn the_threshold_excludes_the_size_that_measured_slower_with_threads() {
-        const {
-            assert!(
-                HOST_COPY_PARALLEL_MIN_BYTES > 2 << 20,
-                "2 MiB inputs were 3.7x slower parallel in-session; the threshold must exclude them"
-            );
-            assert!(
-                HOST_COPY_PARALLEL_MIN_BYTES <= 4 << 20,
-                "4 MiB inputs were 1.4x faster parallel in-session; the threshold must admit them"
-            );
-        }
+    fn the_override_parser_accepts_what_the_sweep_passes_it() {
+        assert_eq!(parse_host_copy_threshold(Some("12345")), Some(12345));
+        assert_eq!(parse_host_copy_threshold(Some("  0  ")), Some(0));
+        assert_eq!(parse_host_copy_threshold(None), None);
+        assert_eq!(parse_host_copy_threshold(Some("")), None);
+        assert_eq!(parse_host_copy_threshold(Some("-1")), None);
+        assert_eq!(parse_host_copy_threshold(Some("4MiB")), None);
     }
 
-    /// The override has to actually take effect, or the sweep that produced the
-    /// table above measured nothing.
+    /// A forced threshold has to actually reach `copy_host_bytes`, or every
+    /// other test here is measuring the default and proving nothing.
     #[test]
-    fn the_environment_override_replaces_the_calibrated_threshold() {
-        unsafe { std::env::set_var("ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES", "12345") };
-        let overridden = host_copy_parallel_min_bytes();
-        unsafe { std::env::remove_var("ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES") };
-        assert_eq!(overridden, 12345);
-        assert_eq!(host_copy_parallel_min_bytes(), HOST_COPY_PARALLEL_MIN_BYTES);
+    fn a_forced_threshold_replaces_the_calibrated_one() {
+        with_threshold(12345, || {
+            assert_eq!(host_copy_parallel_min_bytes(), 12345);
+        });
+        if std::env::var_os("ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES").is_none() {
+            assert_eq!(host_copy_parallel_min_bytes(), HOST_COPY_PARALLEL_MIN_BYTES);
+        }
     }
 
     /// The fan-out is capped at the width the ladder was measured with,
