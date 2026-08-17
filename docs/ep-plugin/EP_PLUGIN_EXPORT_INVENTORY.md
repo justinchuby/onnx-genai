@@ -26,7 +26,7 @@ Results (non-test, non-mock):
 
 **Non-EPs excluded from inventory:**
 - `crates/onnx-runtime-eager/` — orchestrator/dispatcher that holds `Vec<Arc<dyn ExecutionProvider>>`; implements no EP itself.
-- `crates/mlas-sys/` — vendored MLAS BLAS kernel library; a build dependency of `onnx-runtime-ep-cpu` under the `mlas` feature, not an EP.
+- `crates/mlas-sys/` — vendored MLAS BLAS kernel library; a dependency of `onnx-runtime-ep-cpu` under its default `mlas` feature, not an EP.
 - `../onnxruntime-mlx` — no such sibling directory exists in this workspace. No Metal/MLX EP reference found.
 
 **Production EPs subject to this inventory: 2** — CPU and CUDA.
@@ -47,7 +47,7 @@ Results (non-test, non-mock):
 | **Any `todo!()`/`unimplemented!`/stubs?** | **None found.** Every method either does real work or is an intentionally correct no-op or default decline. |
 | **Op coverage** | **166 entries** registered in `src/kernels/mod.rs` (verified with `grep -c "reg.register"` → 166). Domains: standard ONNX (`""`, opset-versioned: MatMul, Gemm, Softmax, LayerNorm, GatherND, Reshape, Cast, Conv, …), `com.microsoft` (MatMulNBits, QMoE, GatherBlockQuantized, FusedGemm, MultiHeadAttention, GQA, SkipSimplifiedLayerNorm, CausalConvWithState, RotaryEmbedding, …), `pkg.nxrt` (BlockQuantizedMatMul, BlockQuantizedMoE, IndexShare, VarlenAttention, PackedVarlenAttention, CompressedSparseAttention, …). |
 | **Device / memory model** | Host-only. Buffers are `malloc`/`free` via `onnx_runtime_memory_governor::HostAllocator` (swappable). All pointers are dereferenceable host pointers. No streams, no device context, no fences at runtime. |
-| **Build deps** | Pure-Rust by default; `--no-default-features` builds cleanly. Optional `mlas` feature adds `mlas-sys` and requires a C++ toolchain + cc crate. No CUDA toolkit. |
+| **Build deps** | Vendored MLAS (`mlas-sys`, via the default `mlas` feature) linked in as an *internal* backend of this EP — it requires a C++/asm toolchain + cc crate, and every MLAS symbol stays local to the cdylib (0 exported, 0 undefined), so nothing binds to ORT's own copy. `--no-default-features` builds a pure-Rust cdylib for hosts without that toolchain. No CUDA toolkit. |
 | **Readiness for outbound ORT plugin export** | ✅ **DONE (M1+M2)** — exported via `export_ep_factories!` macro in `crates/onnx-runtime-ep-cpu-plugin/`. The `as_ort_plugin()` hook in `provider.rs` still returns `None` (not used); the export path goes through the plugin cdylib crate, not through the trait hook. 23 ORT conformance tests pass including f16/bf16; dtype-aware capability claiming wired. |
 
 ---
@@ -74,7 +74,7 @@ Results (non-test, non-mock):
 | Crate | Why excluded |
 |---|---|
 | `onnx-runtime-eager` | Orchestrator; holds `Vec<Arc<dyn ExecutionProvider>>` (`lib.rs:67`). Dispatches to EPs, is not one. |
-| `mlas-sys` | BLAS kernel library (C++/asm). Optional backend for CPU EP's MatMul. Not an EP. |
+| `mlas-sys` | BLAS kernel library (C++/asm). Default-on internal backend for the CPU EP's MatMul. Not an EP. |
 | `LegacyOrtEp` (`onnx-runtime-ep-api/src/abi/mod.rs:160`) | **Inbound** adapter: loads an existing ORT plugin `.so` via `CreateEpFactories` and wraps it as a Rust `ExecutionProvider`. Direction is wrong for outbound export. |
 | `PluginExecutionProvider` (`onnx-runtime-session/src/plugin_provider.rs:72`) | **Inbound** bridge: claims subgraphs for a loaded plugin EP and delegates unclaimed ops to an embedded CPU EP. Not an in-repo EP to export. |
 | `onnxruntime-mlx` | Does not exist in this workspace. No reference found. |
@@ -159,7 +159,7 @@ Evidence:
 
 | EP | Crate | `impl EP`? | `todo!`/stubs | Op registrations | Memory model | Build deps | ORT export readiness |
 |---|---|---|---|---|---|---|---|
-| **CpuExecutionProvider** | `onnx-runtime-ep-cpu` | Yes (`provider.rs:118`) | None | **166** | Host-only, `malloc`/`free` | Pure Rust (mlas optional) | ✅ **DONE (M1+M2)** — `onnx-runtime-ep-cpu-plugin` is a working ORT plugin EP; 23 conformance tests pass including f16/bf16; dtype-aware capability claiming via `GetKernelRegistry` |
+| **CpuExecutionProvider** | `onnx-runtime-ep-cpu` | Yes (`provider.rs:118`) | None | **166** | Host-only, `malloc`/`free` | Rust + vendored MLAS (default; opt-out) | ✅ **DONE (M1+M2)** — `onnx-runtime-ep-cpu-plugin` is a working ORT plugin EP; 23 conformance tests pass including f16/bf16; dtype-aware capability claiming via `GetKernelRegistry` |
 | **CudaExecutionProvider** | `onnx-runtime-ep-cuda` | Yes (`provider.rs:513`) | `prefetch_lazy_weight` stub | **109** | Device pointers, streams, VMM | CUDA ≥ 12.6 at runtime (dynamic-loading build, no build-time dep) | 🟢 **H200-VALIDATED (#832)** — `onnx-runtime-ep-cuda-plugin` loads in ORT on an H200 and executes graphs on-device; it still fails closed (zero factories) without a GPU. All four implementation defects (B1–B4) are resolved. #768 tracks the residual items in `docs/execution/CUDA_EP_STATUS.md` §7. |
 | LegacyOrtEp | `onnx-runtime-ep-api` | Yes (inbound only) | — | — | Inbound adapter | — | Not a candidate |
 | PluginExecutionProvider | `onnx-runtime-session` | Yes (inbound bridge) | — | — | Inbound bridge | — | Not a candidate |

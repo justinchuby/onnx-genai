@@ -19,6 +19,10 @@
 //! silently passes on an empty comparison — `mlas_is_linked_in_a_default_build`
 //! fails a default build that lost MLAS.
 
+// Only the x86-64 MLAS GEMM comparison names a backend explicitly; every other
+// route is selected through `backend_ab`. Gated so aarch64 (where MLAS has no
+// GEMM route yet) does not fail the `-D warnings` cross-arch lane.
+#[cfg(all(feature = "mlas", target_arch = "x86_64"))]
 use onnx_runtime_ep_cpu::backend::CpuBackend;
 use onnx_runtime_ep_cpu::backend_ab;
 use onnx_runtime_ep_cpu::dispatch_ledger::{self, Backend, KernelFamily};

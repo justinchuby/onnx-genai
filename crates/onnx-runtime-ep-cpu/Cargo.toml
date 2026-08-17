@@ -104,5 +104,11 @@ harness = false
 name = "sdpa_simd"
 harness = false
 
+# The graduation gate: native and MLAS in one binary, interleaved, so a native
+# replacement has to be measured against the route it replaces.
+[[bench]]
+name = "native_vs_mlas"
+harness = false
+
 [lints]
 workspace = true

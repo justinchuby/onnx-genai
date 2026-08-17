@@ -1,4 +1,19 @@
-# Absorbing MLAS: reference implementation, not dependency
+# Absorbing MLAS: reference implementation, then replacement
+
+> **Partly superseded, 2026-08-17.** The *packaging* half of the direction below
+> was reversed by the repository owner: MLAS is now **on by default** inside our
+> CPU EP, as an internal backend library we call — never a delegation to ORT's
+> CPU EP. See [`CPU_MLAS_MIGRATION.md`](CPU_MLAS_MIGRATION.md) for the current
+> ownership boundary, dispatch ledger and graduation rule.
+>
+> The *method* below is not superseded and is what the migration depends on:
+> same-binary A/B, process CPU time, port the mechanism rather than the
+> dependency. Two things change in practice. Step 4 said to re-measure in a build
+> without the `mlas` feature "because that is what users run" — users now run the
+> MLAS build, so the comparison is native-vs-MLAS **in one binary**
+> (`cargo bench -p onnx-runtime-ep-cpu --bench native_vs_mlas`), which is
+> strictly better evidence than two builds. And absorption is no longer a
+> prerequisite for shipping speed; it is how we stop needing MLAS.
 
 **Direction, set 2026-08-16:** we do not bundle MLAS by default. We progressively
 absorb its optimizations into our own native kernels. MLAS stays in the tree as a
@@ -9,7 +24,7 @@ it.
 ## Why this became necessary
 
 A run of PRs won large CPU speedups by routing kernels to MLAS. None of them
-reached a default build: `mlas` is optional in `onnx-runtime-ep-cpu` and is absent
+reached a default build: `mlas` was optional in `onnx-runtime-ep-cpu` and absent
 from the default features of both the CLI and the server, and the CPU kernels
 carry the routes behind `#[cfg(feature = "mlas")]`.
 
@@ -17,6 +32,10 @@ No individual PR did anything wrong — each was measured honestly with
 `--features mlas`, and several said so. The problem was cumulative and structural:
 **the configuration we measured was not the configuration we shipped**, and nothing
 in the process noticed. Tracked as #1091.
+
+That defect is now closed from the other side: the default build *is* the
+measured build, and the pure-Rust configuration is the one carrying an explicit
+flag and its own CI lanes.
 
 There is a second reason, visible only on large models. The MLAS int4 route holds a
 packed weight copy at roughly 2× the int4 bytes. On a 14B model that is predicted at

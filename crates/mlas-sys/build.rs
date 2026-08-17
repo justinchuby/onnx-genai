@@ -49,6 +49,28 @@ fn main() {
     println!("cargo:rerun-if-changed=vendor/shim.cpp");
     println!("cargo:rerun-if-changed=vendor/mlas");
 
+    // The vendored sources cover x86-64 and aarch64 and nothing else. Anywhere
+    // else the code below would push `-msse2` and an AVX2 translation unit at a
+    // compiler that has never heard of either, and the build would die a few
+    // hundred lines later inside someone else's C++.
+    //
+    // This matters more than it used to: `mlas` is a *default* feature of
+    // `onnx-runtime-ep-cpu`, so an unsupported host now meets this on a plain
+    // `cargo build` rather than only when it asked for MLAS. Failing loudly with
+    // the opt-out in the message is the point -- quietly compiling a pure-Rust
+    // EP instead would hand the user a library an order of magnitude slower on
+    // quantized matmul without telling them.
+    if target_arch != "x86_64" && target_arch != "aarch64" {
+        panic!(
+            "mlas-sys has no vendored kernels for target architecture '{target_arch}' \
+             (supported: x86_64, aarch64).\n\
+             MLAS is on by default. Build without it:\n  \
+             cargo build -p onnx-runtime-ep-cpu --no-default-features --features full\n  \
+             cargo build -p onnx-runtime-ep-cpu-plugin --no-default-features\n\
+             For the Python wheel, set NXRT_EP_CPU_NO_MLAS=1."
+        );
+    }
+
     let includes = vec![
         vendor.clone(),
         lib.clone(),
@@ -105,8 +127,11 @@ fn main() {
     .iter()
     .map(|f| p.lib.join(f))
     .collect();
+    // fp16 NEON kernels need armv8.2-a+fp16, which the generic group does not
+    // ask for. Collected here and compiled as their own group below.
+    let mut arm64_fp16_sources: Vec<PathBuf> = Vec::new();
     if target_arch == "aarch64" {
-        let mut arm64_sources = vec![
+        let arm64_sources = vec![
             "halfgemm.cpp",
             "qdwconv_kernelsize.cpp",
             "halfgemm_kernel_neon.cpp",
@@ -125,7 +150,7 @@ fn main() {
         // Upstream MLAS intentionally leaves fp16 NEON helpers disabled on
         // Apple ARM64, so these TUs reference undeclared MlasLoad/StoreFloat16x8.
         if !is_apple_target {
-            arm64_sources.extend([
+            arm64_fp16_sources = [
                 "activate_fp16.cpp",
                 "pooling_fp16.cpp",
                 "hqnbitgemm_kernel_neon_fp16.cpp",
@@ -134,7 +159,10 @@ fn main() {
                 "halfgemm_kernel_neon_fp16.cpp",
                 "softmax_kernel_neon_fp16.cpp",
                 "eltwise_kernel_neon_fp16.cpp",
-            ]);
+            ]
+            .iter()
+            .map(|f| p.lib.join(f))
+            .collect();
         }
         generic.extend(arm64_sources.iter().map(|f| p.lib.join(f)));
     } else {
@@ -145,6 +173,23 @@ fn main() {
     p.compile_cpp("mlas_generic", &[], &generic);
 
     if target_arch == "aarch64" {
+        // `vaddq_f16` and friends are `always_inline` and refuse to inline into
+        // a translation unit compiled without the fp16 target feature, so these
+        // sources fail with "target specific option mismatch" rather than
+        // degrading. MSVC's ARM64 compiler exposes the fp16 intrinsics
+        // unconditionally and has no equivalent switch, so it keeps the generic
+        // flags. This is what makes `aarch64-unknown-linux-gnu` build at all:
+        // the cross-compile gate in `scripts/check_cross_compile.sh` reaches
+        // this crate now that `mlas` is a default feature.
+        let fp16_flags: &[&str] = if target_env == "msvc" {
+            &[]
+        } else {
+            &["-march=armv8.2-a+fp16"]
+        };
+        if !arm64_fp16_sources.is_empty() {
+            p.compile_cpp("mlas_arm64_fp16_cpp", fp16_flags, &arm64_fp16_sources);
+        }
+
         let dot_flags: &[&str] = if target_env == "msvc" {
             &[]
         } else {

@@ -37,6 +37,13 @@ pub const fn mlas_available() -> bool {
 /// The first entry is always a native route, so a caller can use
 /// `gemm_backends()[0]` as the correctness baseline without a `cfg`.
 pub fn gemm_backends() -> Vec<CpuBackend> {
+    // aarch64 has neither route to add today -- the SIMD GEMM is x86-only and
+    // MLAS's GEMM is reached through the x86-64 backend enum -- so `mut` is
+    // genuinely unused there rather than mistakenly so.
+    #[cfg_attr(
+        not(any(target_arch = "x86", target_arch = "x86_64")),
+        allow(unused_mut)
+    )]
     let mut backends = vec![CpuBackend::Generic];
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if crate::backend::has_simd_x86() {

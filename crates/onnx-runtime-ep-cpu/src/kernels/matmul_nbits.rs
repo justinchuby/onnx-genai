@@ -634,9 +634,14 @@ thread_local! {
 #[cfg(feature = "mlas")]
 #[inline]
 fn with_mlas_packed_caches<R>(f: impl FnOnce(&MlasPackedCaches) -> R) -> R {
+    // Exactly one of these blocks survives cfg-stripping, so whichever it is
+    // becomes the tail expression. An early `return` in the first would read
+    // more obviously but trips `needless_return` in the `cfg(test)` build --
+    // which is now a default-feature build, so it reaches the `-D warnings`
+    // lanes.
     #[cfg(test)]
     {
-        return MLAS_PACKED_TEST_LOCAL.with(|caches| f(caches));
+        MLAS_PACKED_TEST_LOCAL.with(|caches| f(caches))
     }
     #[cfg(not(test))]
     {
