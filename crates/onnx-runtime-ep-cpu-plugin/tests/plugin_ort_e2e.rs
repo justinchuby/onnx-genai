@@ -4415,7 +4415,7 @@ struct MatmulFamilyCase {
     /// Output name to fetch.
     output: &'static str,
     /// Element type of the output, one of the ONNX tensor element enums.
-    output_elem: u32,
+    output_elem: ort::ONNXTensorElementDataType,
     /// Whether ORT's own CPU EP can build a kernel for this node at all.
     ///
     /// `false` is not a limitation of the test — it is the point. ORT's CPU
@@ -4430,7 +4430,7 @@ struct MatmulFamilyCase {
 /// One runtime input: name, element type, dims and raw little-endian bytes.
 struct GeneratedInput {
     name: &'static str,
-    elem: u32,
+    elem: ort::ONNXTensorElementDataType,
     dims: Vec<i64>,
     data: Vec<u8>,
 }
@@ -4466,7 +4466,7 @@ fn printable_scale_blob(count: usize) -> String {
 }
 
 /// An ONNX TextFormat `type { tensor_type { .. } }` block.
-fn textproto_tensor_type(elem: u32, dims: &[i64]) -> String {
+fn textproto_tensor_type(elem: ort::ONNXTensorElementDataType, dims: &[i64]) -> String {
     let dims = dims
         .iter()
         .map(|d| format!("{{ dim_value: {d} }}"))
@@ -4476,7 +4476,7 @@ fn textproto_tensor_type(elem: u32, dims: &[i64]) -> String {
 }
 
 /// A named graph input declaration.
-fn textproto_value_info(name: &str, elem: u32, dims: &[i64]) -> String {
+fn textproto_value_info(name: &str, elem: ort::ONNXTensorElementDataType, dims: &[i64]) -> String {
     format!(
         "{{ name: \"{name}\" {} }}",
         textproto_tensor_type(elem, dims)
@@ -4484,7 +4484,12 @@ fn textproto_value_info(name: &str, elem: u32, dims: &[i64]) -> String {
 }
 
 /// A `raw_data` initializer whose payload is already TextFormat-safe.
-fn textproto_initializer(name: &str, elem: u32, dims: &[i64], raw: &str) -> String {
+fn textproto_initializer(
+    name: &str,
+    elem: ort::ONNXTensorElementDataType,
+    dims: &[i64],
+    raw: &str,
+) -> String {
     let dims = dims
         .iter()
         .map(|d| d.to_string())
@@ -4493,10 +4498,10 @@ fn textproto_initializer(name: &str, elem: u32, dims: &[i64], raw: &str) -> Stri
     format!("{{ name: \"{name}\" data_type: {elem} dims: [{dims}] raw_data: \"{raw}\" }}")
 }
 
-const ELEM_F32: u32 = ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
-const ELEM_U8: u32 = ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8;
-const ELEM_I8: u32 = ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8;
-const ELEM_F16: u32 = ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+const ELEM_F32: ort::ONNXTensorElementDataType = ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+const ELEM_U8: ort::ONNXTensorElementDataType = ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8;
+const ELEM_I8: ort::ONNXTensorElementDataType = ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8;
+const ELEM_F16: ort::ONNXTensorElementDataType = ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
 
 /// Deterministic activation values in `[-1, 1)`, varying along both axes so a
 /// transposed or mis-strided kernel cannot pass by symmetry.
@@ -4531,7 +4536,7 @@ fn f16_slice_to_bytes(values: &[f32]) -> Vec<u8> {
 fn dense_case(
     name: &'static str,
     op: &'static str,
-    elem: u32,
+    elem: ort::ONNXTensorElementDataType,
     m: usize,
     k: usize,
     n: usize,
@@ -4604,7 +4609,7 @@ fn nbits_case(
     n: usize,
     bits: u32,
     block_size: usize,
-    act_elem: u32,
+    act_elem: ort::ONNXTensorElementDataType,
     ort_can_build: bool,
 ) -> MatmulFamilyCase {
     assert!(
@@ -4865,7 +4870,7 @@ unsafe fn make_raw_tensor(
     api: *const ort::OrtApi,
     data: &mut [u8],
     dims: &[i64],
-    elem: u32,
+    elem: ort::ONNXTensorElementDataType,
 ) -> *mut ort::OrtValue {
     unsafe {
         let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
