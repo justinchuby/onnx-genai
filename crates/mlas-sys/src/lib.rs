@@ -4406,8 +4406,8 @@ mod tests {
                     QgemmScale::PerTensor(value) => *value,
                     QgemmScale::PerColumn(values) => values[index % n],
                 };
-                let value =
-                    (product as f32 * scale).round_ties_even() as i64 + i64::from(zero_point);
+                let value = ((product as f32 * scale).round_ties_even() as i64)
+                    .saturating_add(i64::from(zero_point));
                 if signed {
                     value.clamp(i8::MIN as i64, i8::MAX as i64) as i8 as u8
                 } else {
