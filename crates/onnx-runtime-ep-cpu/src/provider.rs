@@ -347,58 +347,40 @@ impl ExecutionProvider for CpuExecutionProvider {
         Ok(())
     }
 
-    /// Routing preference, kept deliberately apart from [`Self::supports_op`].
+    /// This EP never hands a node back to the host.
     ///
-    /// See [`crate::assignment_policy`] for the measured evidence behind each
-    /// deferral and for why a performance decline cannot live in `supports_op`.
-    fn claim_preference(
-        &self,
-        op: &Node,
-        opset: u64,
-        shapes: &[Shape],
-        input_dtypes: &[DataType],
-    ) -> ClaimPreference {
-        crate::assignment_policy::claim_preference(op, opset, shapes, input_dtypes)
-    }
-
-    /// Short-circuit the default adapter for the nodes the policy has no
-    /// opinion about.
+    /// # Why there is no performance-based decline
     ///
-    /// The default [`ExecutionProvider::claim_preference_node`] deep-clones
-    /// every input [`Shape`] before it can ask, and it runs for every node in
-    /// the graph. This policy governs five elementwise ops and the four
-    /// matmul-family ops; a transformer graph is mostly neither, so the cheap
-    /// `(domain, op_type)` test comes first and the allocation only happens
-    /// when the answer can differ from [`ClaimPreference::Claim`]. The matmul
-    /// ops do pay the clone, but only once per node at capability time.
+    /// An earlier design measured each op against ORT's CPU kernel and
+    /// returned [`ClaimPreference::DeferToHost`] for the shape/dtype ranges it
+    /// lost, so ORT's CPU EP ran those nodes instead. That is withdrawn as an
+    /// architectural rule: when this EP is selected it owns every node it
+    /// supports, and a range where it is slower than ORT is a kernel to
+    /// optimize, not a node to give away.
+    ///
+    /// The reasons are structural rather than about any single ratio. A
+    /// deferral splits the graph, so the session pays a partition boundary and
+    /// loses the fusion, prepack and buffer reuse that only hold inside one
+    /// partition — and mixed ownership makes latency depend on which side won a
+    /// microbenchmark on the machine the thresholds were tuned on. Selecting
+    /// this EP is a request for this EP.
+    ///
+    /// Overridden rather than inherited because the default
+    /// [`ExecutionProvider::claim_preference_node`] deep-clones every input
+    /// [`Shape`] and collects the input dtypes before it can ask, once per node
+    /// in the graph. Nothing here reads either, so the answer is returned
+    /// before that work happens.
+    ///
+    /// The measured ORT gaps this EP still has to close are tracked in
+    /// `docs/performance/CPU_ACTIVATION_GAPS.md`.
     fn claim_preference_node(
         &self,
         view: &onnx_runtime_ir::GraphView<'_>,
         node: onnx_runtime_ir::NodeIndex,
         opset: u64,
     ) -> ClaimPreference {
-        let ir_node = view.node(node);
-        if !crate::assignment_policy::governs(ir_node) {
-            return ClaimPreference::Claim;
-        }
-        let inputs = view.node_inputs(node);
-        let shapes = inputs
-            .iter()
-            .map(|input| {
-                input
-                    .map(|value| view.value(value).shape.clone())
-                    .unwrap_or_default()
-            })
-            .collect::<Vec<_>>();
-        let input_dtypes = inputs
-            .iter()
-            .map(|input| {
-                input
-                    .map(|value| view.value(value).dtype)
-                    .unwrap_or(DataType::Undefined)
-            })
-            .collect::<Vec<_>>();
-        crate::assignment_policy::claim_preference(ir_node, opset, &shapes, &input_dtypes)
+        let _ = (view, node, opset);
+        ClaimPreference::Claim
     }
 
     fn supports_op(

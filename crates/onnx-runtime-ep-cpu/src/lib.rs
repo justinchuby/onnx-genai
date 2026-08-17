@@ -28,7 +28,6 @@
 // dimensions often exceed Clippy's generic argument-count threshold.
 #![allow(clippy::too_many_arguments)]
 
-pub mod assignment_policy;
 pub mod backend;
 pub mod decode_affinity;
 pub mod decode_numa;

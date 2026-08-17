@@ -16,6 +16,9 @@ cc = "1"
 
 [dev-dependencies]
 rayon = "1"
+# Correctly-rounded `erf` for the transcendental smoke tests, so they pin the
+# mathematical function rather than MLAS's own polynomial.
+libm = "0.2"
 
 [[bench]]
 # Keep the executable name free of Windows Installer Detection keywords. In

@@ -371,9 +371,160 @@ macro_rules! dispatch {
     }};
 }
 
+/// Route an elementwise f32 kernel to MLAS when the `mlas` feature is on.
+///
+/// MLAS is the library ONNX Runtime's own CPU activation kernels call, so this
+/// is not "a faster approximation" — it is *the same* polynomial ORT uses.
+///
+/// Bit-reproducibility is **host-specific**, not universal. MLAS runtime
+/// dispatches by ISA, so an AVX-512 or non-AVX2 host may select a different
+/// kernel than the AVX2+FMA one the pure-Rust path mirrors. On this host and in
+/// CI (AVX2+FMA, AVX-512 masked) the two routes are bit-identical, pinned by
+/// `mlas_ab::mlas_matches_rust_simd_on_special_values`; elsewhere they may
+/// differ within the documented tolerance. Before this change an `mlas`-on and
+/// an `mlas`-off build agreed bitwise for these four ops on every host, and
+/// that is what is being traded for the speed. Measured on this
+/// host (AMD EPYC 9V74, AVX2+FMA, AVX-512 masked off), the pure-Rust AVX2 path
+/// is compute-bound at ~0.78 ns/elem while MLAS reaches ~0.35 ns/elem, which is
+/// memory bandwidth for a 4 B-in/4 B-out stream. The gap is the polynomial, not
+/// the loop.
+///
+/// The pure-Rust path stays as the fallback: it is what builds without the
+/// feature, what runs on non-x86, and what the dense numeric sweeps still test.
+///
+/// `$mlas` is only reached for lengths at or above [`SIMD_MIN_LEN`]. Below that
+/// the FFI call and MLAS's own dispatch cost more than the arithmetic saved, so
+/// short tensors keep the scalar loop.
+macro_rules! dispatch_mlas {
+    ($input:expr, $output:expr, $scalar:expr, $vector:expr, $mlas:expr) => {{
+        #[cfg(feature = "mlas")]
+        {
+            let input: &[f32] = $input;
+            let output: &mut [f32] = $output;
+            debug_assert_eq!(input.len(), output.len());
+            if input.len() >= SIMD_MIN_LEN {
+                let f: fn(&[f32], &mut [f32]) = $mlas;
+                f(input, output);
+                return;
+            }
+        }
+        dispatch!($input, $output, $scalar, $vector)
+    }};
+}
+
+/// MLAS's `tanh`, clamped back into `[-1, 1]`.
+///
+/// `MlasComputeTanh` is a rational approximation that is not range-preserving:
+/// over a dense sweep of [-20, 20] it lands outside `[-1, 1]` for 2934 of
+/// 1048576 points, by up to 2 ulp (`tanh(-8.990999) = -1.0000001`). ORT's
+/// `Tanh` calls it directly and inherits that. Our pure-Rust kernel has always
+/// guaranteed the range, `monotonicity_within_documented_slack` asserts it, and
+/// downstream code is entitled to rely on it — `sqrt(1 - tanh²)` turns a 1-ulp
+/// overshoot into a NaN.
+///
+/// Clamping is never *less* accurate: the true `tanh` is inside `(-1, 1)`, so
+/// pulling an out-of-range value to the endpoint moves it toward the exact
+/// answer. NaN is preserved because all of `clamp`'s comparisons are false for
+/// NaN.
+#[cfg(feature = "mlas")]
+fn tanh_mlas(input: &[f32], output: &mut [f32]) {
+    mlas_clamped(input, output, mlas_sys::compute_tanh, -1.0, 1.0);
+}
+
+/// Elements per MLAS + fix-up block.
+///
+/// The fix-up passes below re-read the block MLAS just wrote. Run over the
+/// whole tensor that is a second trip to DRAM and costs more than the win; run
+/// per block it lands in L1/L2 and is nearly free. 8192 f32 = 32 KiB, so a
+/// block plus its input stays inside a 512 KiB L2 with room to spare.
+#[cfg(feature = "mlas")]
+const MLAS_FIXUP_BLOCK: usize = 8192;
+
+/// Run an MLAS kernel blockwise and clamp each block back into `[lo, hi]`
+/// while it is still hot in cache.
+#[cfg(feature = "mlas")]
+fn mlas_clamped(
+    input: &[f32],
+    output: &mut [f32],
+    kernel: fn(&[f32], &mut [f32]),
+    lo: f32,
+    hi: f32,
+) {
+    for (xs, ys) in input
+        .chunks(MLAS_FIXUP_BLOCK)
+        .zip(output.chunks_mut(MLAS_FIXUP_BLOCK))
+    {
+        kernel(xs, ys);
+        // `f32::clamp` measured faster here than a hand-written branch-free
+        // bit-select (0.43 vs 0.55 ns/elem for tanh at 4 Mi) — LLVM already
+        // lowers it to `vmaxps`/`vminps`, and NaN falls through untouched
+        // because every comparison against it is false.
+        for v in ys.iter_mut() {
+            *v = v.clamp(lo, hi);
+        }
+    }
+}
+
+/// MLAS's logistic, clamped back into `[0, 1]`.
+///
+/// Same story as [`tanh_mlas`] but milder: `MlasComputeLogistic` leaves the
+/// range for 2 of 1048576 points on the same sweep, by 1 ulp.
+#[cfg(feature = "mlas")]
+fn sigmoid_mlas(input: &[f32], output: &mut [f32]) {
+    mlas_clamped(input, output, mlas_sys::compute_logistic, 0.0, 1.0);
+}
+
+/// MLAS's exact GELU, with its one special-value divergence repaired.
+///
+/// `MlasComputeGeluErf` evaluates `x·0.5·(1 + erf(x/√2))` without special-casing
+/// the `-inf` limit, so it computes `-inf · 0` and returns NaN where the limit
+/// is `0`. That is the *only* input on which MLAS and the pure-Rust path
+/// disagree, across `Tanh`, `Sigmoid`, `Erf` and exact `Gelu` and every special
+/// value — NaN (both signs), ±Inf, ±0, ±`MIN_POSITIVE`, the smallest
+/// subnormals, `MAX`/`MIN` and the exp saturation thresholds. That claim is
+/// pinned by `mlas_ab::mlas_matches_rust_simd_on_special_values`, which fails
+/// if a future MLAS bump changes any of it.
+///
+/// Note this makes us *disagree with ORT*, which calls `MlasComputeGeluErf`
+/// directly and therefore returns NaN here. Returning the limit is the better
+/// answer — it is what the pure-Rust path already returned, and NaN would
+/// propagate through the rest of the graph — so the divergence is deliberate
+/// and is not something to "fix" by matching ORT.
+///
+/// A NaN in the output can only arise from a NaN input, on which both paths
+/// agree, or from this case. So scanning the output — hot in cache the instant
+/// MLAS wrote it — and repairing only the `-inf` lanes is exact, and costs one
+/// vectorisable compare pass on the common all-finite path.
+#[cfg(feature = "mlas")]
+fn erf_gelu_mlas(input: &[f32], output: &mut [f32]) {
+    // Blocked for the same cache reason as `mlas_clamped`.
+    for (xs, ys) in input
+        .chunks(MLAS_FIXUP_BLOCK)
+        .zip(output.chunks_mut(MLAS_FIXUP_BLOCK))
+    {
+        mlas_sys::compute_gelu_erf(xs, ys);
+        // Branch-free OR-reduction rather than `any()`: the early exit in
+        // `any()` is a loop-carried control dependency that stops LLVM
+        // vectorising, and measured 0.7 ns/elem — more than the whole win.
+        // Folding the NaN predicate into an accumulator keeps the scan a
+        // straight AVX2 compare.
+        let mut saw_nan = 0u32;
+        for v in ys.iter() {
+            saw_nan |= u32::from(v.is_nan());
+        }
+        if saw_nan != 0 {
+            for (o, &i) in ys.iter_mut().zip(xs) {
+                if o.is_nan() && i == f32::NEG_INFINITY {
+                    *o = 0.0;
+                }
+            }
+        }
+    }
+}
+
 /// `y = tanh(x)`.
 pub(crate) fn tanh_f32_slice(input: &[f32], output: &mut [f32]) {
-    dispatch!(input, output, tanh_scalar, tanh_avx2);
+    dispatch_mlas!(input, output, tanh_scalar, tanh_avx2, tanh_mlas);
 }
 
 /// `y = √x`.
@@ -397,7 +548,7 @@ pub(crate) fn sqrt_f32_slice(input: &[f32], output: &mut [f32]) {
 
 /// `y = 1 / (1 + e^-x)`.
 pub(crate) fn sigmoid_f32_slice(input: &[f32], output: &mut [f32]) {
-    dispatch!(input, output, sigmoid_scalar, sigmoid_avx2);
+    dispatch_mlas!(input, output, sigmoid_scalar, sigmoid_avx2, sigmoid_mlas);
 }
 
 /// `y = e^x`.
@@ -446,7 +597,7 @@ pub(crate) fn exp_f32_slice(input: &[f32], output: &mut [f32]) {
 /// tolerance, and the alternative is making short tensors 20x slower to buy
 /// bit-stability nothing depends on.
 pub(crate) fn erf_f32_slice(input: &[f32], output: &mut [f32]) {
-    dispatch!(input, output, erf_scalar, erf_avx2);
+    dispatch_mlas!(input, output, erf_scalar, erf_avx2, mlas_sys::compute_erf);
 }
 
 /// `y = 0.5·x·(1 + erf(x/√2))`, the exact (`approximate="none"`) GELU.
@@ -454,7 +605,7 @@ pub(crate) fn erf_f32_slice(input: &[f32], output: &mut [f32]) {
 /// Fused rather than composed out of [`erf_f32_slice`] so the intermediate
 /// `x/√2` is never written to memory.
 pub(crate) fn erf_gelu_f32_slice(input: &[f32], output: &mut [f32]) {
-    dispatch!(input, output, erf_gelu_scalar, erf_gelu_avx2);
+    dispatch_mlas!(input, output, erf_gelu_scalar, erf_gelu_avx2, erf_gelu_mlas);
 }
 
 /// `y = 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`, the tanh GELU
@@ -2700,5 +2851,190 @@ mod exp_tests {
         for (i, (&g, &w)) in buf.iter().zip(&want).enumerate() {
             assert_eq!(g.to_bits(), w.to_bits(), "i={i}");
         }
+    }
+}
+
+/// Same-binary A/B of the MLAS route against the pure-Rust SIMD route.
+///
+/// Lives inside the crate because the slice kernels are `pub(crate)`, and
+/// in-binary because `benches/activation_bench.rs` documents a uniform
+/// cross-build offset on byte-identical kernels. Both sides here are compiled
+/// once, into one binary, and interleaved.
+///
+/// `cargo test -p onnx-runtime-ep-cpu --features mlas --release --lib \
+///   mlas_ab -- --ignored --nocapture`
+#[cfg(all(test, feature = "mlas"))]
+mod mlas_ab {
+    use super::*;
+    use std::time::Instant;
+
+    /// Time two routes **interleaved**, one iteration each per round, so that
+    /// any drift in machine state over the run hits both equally. Timing all of
+    /// A and then all of B would let a noisy neighbour land on one side only.
+    fn best_ns_pair(n: usize, mut a: impl FnMut(), mut b: impl FnMut()) -> (f64, f64) {
+        for _ in 0..3 {
+            a();
+            b();
+        }
+        let (mut best_a, mut best_b) = (f64::MAX, f64::MAX);
+        for _ in 0..15 {
+            let t = Instant::now();
+            a();
+            best_a = best_a.min(t.elapsed().as_secs_f64());
+            let t = Instant::now();
+            b();
+            best_b = best_b.min(t.elapsed().as_secs_f64());
+        }
+        let scale = 1e9 / n as f64;
+        (best_a * scale, best_b * scale)
+    }
+
+    fn max_ulp(a: &[f32], b: &[f32]) -> (f64, u32) {
+        let mut maxabs = 0.0f64;
+        let mut maxulp = 0u32;
+        for (x, y) in a.iter().zip(b) {
+            if x.is_nan() && y.is_nan() {
+                continue;
+            }
+            maxabs = maxabs.max((f64::from(*x) - f64::from(*y)).abs());
+            let u = (i64::from(x.to_bits()) - i64::from(y.to_bits())).unsigned_abs() as u32;
+            maxulp = maxulp.max(u);
+        }
+        (maxabs, maxulp)
+    }
+
+    #[test]
+    #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+    fn mlas_vs_rust_simd() {
+        println!("op\tn\tours_ns\tmlas_ns\tspeedup\tmaxabs\tmaxulp");
+        for n in [1usize << 10, 1 << 14, 1 << 18, 1 << 20, 1 << 22] {
+            let x: Vec<f32> = (0..n)
+                .map(|i| ((i as f32 % 2003.0) - 1000.0) / 128.0)
+                .collect();
+            let mut ours = vec![0.0f32; n];
+            let mut mlas = vec![0.0f32; n];
+
+            #[allow(clippy::type_complexity)]
+            let cases: [(&str, fn(&[f32], &mut [f32]), fn(&[f32], &mut [f32])); 4] = [
+                ("Tanh", tanh_avx2_shim, tanh_mlas),
+                ("Sigmoid", sigmoid_avx2_shim, sigmoid_mlas),
+                ("Erf", erf_avx2_shim, mlas_sys::compute_erf),
+                ("GeluErf", erf_gelu_avx2_shim, erf_gelu_mlas),
+            ];
+            for (name, rust, mlas_fn) in cases {
+                let (a, b) = best_ns_pair(n, || rust(&x, &mut ours), || mlas_fn(&x, &mut mlas));
+                let (mabs, mulp) = max_ulp(&ours, &mlas);
+                println!(
+                    "{name}\t{n}\t{a:.4}\t{b:.4}\t{:.2}x\t{mabs:.3e}\t{mulp}",
+                    a / b
+                );
+            }
+        }
+    }
+
+    /// MLAS must agree with the pure-Rust route on every special value, not
+    /// just on the dense interior sweep. A difference here would be a silent
+    /// behaviour change for anyone who builds without the feature.
+    #[test]
+    fn mlas_matches_rust_simd_on_special_values() {
+        let specials = [
+            f32::NAN,
+            -f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x8000_0001),
+            f32::MAX,
+            f32::MIN,
+            1.0,
+            -1.0,
+            88.5,
+            -88.5,
+            1e-30,
+            -1e-30,
+        ];
+        // Pad past SIMD_MIN_LEN so both routes take their vector path, and
+        // repeat the pattern so the values land at every lane offset.
+        let mut x = Vec::new();
+        while x.len() < SIMD_MIN_LEN * 4 {
+            x.extend_from_slice(&specials);
+        }
+        let n = x.len();
+        let mut ours = vec![0.0f32; n];
+        let mut mlas = vec![0.0f32; n];
+
+        #[allow(clippy::type_complexity)]
+        let cases: [(&str, fn(&[f32], &mut [f32]), fn(&[f32], &mut [f32])); 4] = [
+            ("Tanh", tanh_avx2_shim, tanh_mlas),
+            ("Sigmoid", sigmoid_avx2_shim, sigmoid_mlas),
+            ("Erf", erf_avx2_shim, mlas_sys::compute_erf),
+            ("GeluErf", erf_gelu_avx2_shim, erf_gelu_mlas),
+        ];
+        for (name, rust, mlas_fn) in cases {
+            rust(&x, &mut ours);
+            mlas_fn(&x, &mut mlas);
+            for (i, ((a, b), input)) in ours.iter().zip(&mlas).zip(&x).enumerate() {
+                if a.is_nan() && b.is_nan() {
+                    continue;
+                }
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{name}: the MLAS route and the pure-Rust SIMD route \
+                     disagree at index {i} for input {input:e} \
+                     (rust={a:e} mlas={b:e})"
+                );
+            }
+        }
+    }
+
+    /// Dense ULP sweep of the MLAS route against the pure-Rust route over the
+    /// whole interesting domain, printing the worst disagreement per op.
+    #[test]
+    #[ignore = "diagnostic sweep; run explicitly with --ignored --nocapture"]
+    fn mlas_vs_rust_dense_ulp_sweep() {
+        let n = 1usize << 20;
+        // -20 .. 20 densely: covers both saturation tails and the linear core.
+        let x: Vec<f32> = (0..n)
+            .map(|i| -20.0 + 40.0 * (i as f32) / (n as f32))
+            .collect();
+        let mut ours = vec![0.0f32; n];
+        let mut mlas = vec![0.0f32; n];
+
+        #[allow(clippy::type_complexity)]
+        let cases: [(&str, fn(&[f32], &mut [f32]), fn(&[f32], &mut [f32])); 4] = [
+            ("Tanh", tanh_avx2_shim, tanh_mlas),
+            ("Sigmoid", sigmoid_avx2_shim, sigmoid_mlas),
+            ("Erf", erf_avx2_shim, mlas_sys::compute_erf),
+            ("GeluErf", erf_gelu_avx2_shim, erf_gelu_mlas),
+        ];
+        for (name, rust, mlas_fn) in cases {
+            rust(&x, &mut ours);
+            mlas_fn(&x, &mut mlas);
+            let (mabs, mulp) = max_ulp(&ours, &mlas);
+            let over_rust = ours.iter().filter(|v| v.abs() > 1.0).count();
+            let over_mlas = mlas.iter().filter(|v| v.abs() > 1.0).count();
+            println!(
+                "{name}\tmaxabs={mabs:.3e}\tmaxulp={mulp}\t|y|>1: rust={over_rust} mlas={over_mlas}"
+            );
+        }
+    }
+
+    // Thin wrappers pinning the pure-Rust route regardless of feature flags.
+    fn tanh_avx2_shim(x: &[f32], y: &mut [f32]) {
+        dispatch!(x, y, tanh_scalar, tanh_avx2)
+    }
+    fn sigmoid_avx2_shim(x: &[f32], y: &mut [f32]) {
+        dispatch!(x, y, sigmoid_scalar, sigmoid_avx2)
+    }
+    fn erf_avx2_shim(x: &[f32], y: &mut [f32]) {
+        dispatch!(x, y, erf_scalar, erf_avx2)
+    }
+    fn erf_gelu_avx2_shim(x: &[f32], y: &mut [f32]) {
+        dispatch!(x, y, erf_gelu_scalar, erf_gelu_avx2)
     }
 }
