@@ -367,7 +367,7 @@ fn silu_mlas_corrected(input: &[f32], output: &mut [f32]) {
 pub(crate) fn silu_f32_slice(input: &[f32], output: &mut [f32]) {
     #[cfg(feature = "mlas")]
     {
-        crate::kernels::simd_activations::run_chunked(input, output, silu_mlas_corrected);
+        crate::kernels::simd_activations::run_chunked_fn(input, output, silu_mlas_corrected);
     }
     #[cfg(all(not(feature = "mlas"), target_arch = "aarch64"))]
     {
