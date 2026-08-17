@@ -2075,6 +2075,16 @@ unsafe extern "C" fn compute_execute(
         }
         let api_ref = unsafe { &*api };
 
+        // Lend ORT's intra-op pool to the kernels for this call. Ours would be
+        // a second pool on the same cores, and ORT's workers spin: at
+        // `intra_op = 16`, splitting a 1 Mi `Sqrt` across our rayon pool cost
+        // 252 -> 777 us against staying serial. Dropped at the end of the
+        // call, before `kernel_context` goes away.
+        //
+        // SAFETY: `kernel_context` is the context ORT handed this call and
+        // stays valid until it returns, which is after the guard is dropped.
+        let _host_pool = unsafe { crate::host_pool::install(api_ref, kernel_context) };
+
         // Memory info for intermediate scratch. On a device EP this is device
         // memory, so multi-node intermediates stay on the GPU (a host buffer
         // would make the next kernel dereference a host pointer as device →
