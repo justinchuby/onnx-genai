@@ -1602,6 +1602,14 @@ workers once a copy is known to be over the threshold. Below the threshold
 nothing touches Rayon, which is what the "decode-shaped graphs are untouched"
 claim was always supposed to mean.
 
+One caveat on calling the report a false positive. During review of this fix a
+full `-p onnx-runtime-ep-cpu --lib` run died with SIGSEGV once at process exit
+and then passed three times, on a host under heavy contention. That is not
+caused by this change - the parallel-copy tests start Rayon whatever the gate
+order - but it is the same teardown path Miri objects to, so "known false
+positive" may be understating it. Recorded here rather than dismissed; it is a
+dependency-level question, not one this section can settle.
+
 The lesson worth recording: a performance change can be neutral on every
 benchmark and still alter process-wide behaviour. The soundness job was the only
 instrument pointed at that.

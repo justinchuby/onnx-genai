@@ -845,14 +845,17 @@ mod host_copy_tests {
     /// exactly that: a session test binary that had never used Rayon started
     /// one, and Miri then reported crossbeam-epoch's teardown as UB.
     ///
-    /// This asserts the observable half of that property: with the threshold at
-    /// its calibrated value, a small copy is correct and stays serial. The
+    /// This asserts only the observable half of that property: with the
+    /// threshold at its calibrated value, a small copy is correct and stays
+    /// serial. It is named for what it observes, not for the ordering - it
+    /// would still pass with the gates swapped back, because the size gate
+    /// returns first either way. The
     /// ordering itself is enforced by the Miri job, which is the real falsifier
     /// and fails if the query moves back above the gate - `cargo test` gives no
     /// ordering guarantee, so a process-global "was the pool started" assertion
     /// would be answered by whichever other test ran first.
     #[test]
-    fn a_small_copy_decides_on_size_alone() {
+    fn a_small_copy_stays_serial() {
         let src = ramp(4096);
         let mut dst = vec![0u8; 4096];
         with_threshold(HOST_COPY_PARALLEL_MIN_BYTES, || {
