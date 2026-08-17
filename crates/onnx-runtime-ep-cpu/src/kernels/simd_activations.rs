@@ -370,12 +370,12 @@ fn note_parallel_dispatch() {
     PARALLEL_DISPATCHES.with(|c| c.set(c.get() + 1));
 }
 
-/// How many times this thread has reached [`run_chunked`]'s parallel branch.
 /// Chunk a whole-slice kernel that needs no captured state.
 ///
 /// Takes a `fn` pointer rather than `impl Fn` on purpose: every caller shares
 /// one instantiation, and that instantiation lives in this module. See
 /// `clip_chunked` for why that matters.
+#[cfg(feature = "mlas")]
 pub(crate) fn run_chunked_fn(input: &[f32], output: &mut [f32], body: fn(&[f32], &mut [f32])) {
     run_chunked(input, output, body);
 }
@@ -400,6 +400,7 @@ pub(crate) fn clip_chunked(input: &[f32], output: &mut [f32], minimum: f32, maxi
     });
 }
 
+/// How many times this thread has reached [`run_chunked`]'s parallel branch.
 #[cfg(test)]
 pub(crate) fn parallel_dispatches() -> usize {
     PARALLEL_DISPATCHES.with(std::cell::Cell::get)
@@ -3897,7 +3898,24 @@ mod chunking_instantiation_is_local {
                     for (i, line) in text.lines().enumerate() {
                         // `run_chunked_fn(` and `run_chunked_rows(` are fine: the
                         // first is not generic, the second is only used here.
-                        if line.contains("run_chunked(") {
+                        if line.trim_start().starts_with("//") {
+                            continue;
+                        }
+                        // Match the identifier on a word boundary, then require
+                        // the next non-space token to open a call or a
+                        // turbofish. That accepts `run_chunked(`, `run_chunked
+                        // ::<T>(` and `run_chunked ()`, while rejecting
+                        // `run_chunked_fn`, `run_chunked_rows`, test names like
+                        // `silu_reaches_run_chunked_parallel_branch`, and prose
+                        // inside string literals.
+                        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+                        let calls = line.match_indices("run_chunked").any(|(at, _)| {
+                            let before_ok =
+                                line[..at].chars().next_back().is_none_or(|c| !is_word(c));
+                            let rest = line[at + "run_chunked".len()..].trim_start();
+                            before_ok && (rest.starts_with('(') || rest.starts_with("::<"))
+                        });
+                        if calls {
                             offenders.push(format!("{}:{}", path.display(), i + 1));
                         }
                     }
@@ -3908,7 +3926,7 @@ mod chunking_instantiation_is_local {
             offenders.is_empty(),
             "run_chunked is generic and must only be instantiated inside \
              simd_activations.rs; instantiating it elsewhere repartitioned the \
-             crate's codegen units and cost 2.3x on Sqrt/Tanh/Sigmoid. Use \
+             crate's codegen units and cost up to 2.3x (Sqrt; 1.7-1.8x on Tanh and Sigmoid). Use \
              run_chunked_fn or add a wrapper next to clip_chunked instead. \
              Offending call sites: {offenders:?}"
         );
