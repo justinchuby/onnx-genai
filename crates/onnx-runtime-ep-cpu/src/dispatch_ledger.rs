@@ -317,7 +317,7 @@ pub const PLAN: &[PlanEntry] = &[
         dtypes: "int4 / int8 weights, f32 activations, f16 scales",
         isa: "native: AVX2/AVX-512/VNNI and NEON dot; MLAS SQNBit: its own dispatch",
         threads: "ours — the persistent SPMD decode pool shards N; MLAS is called per shard",
-        shape_gate: "M=1 decode is native (absorbed, #1104); prefill M>=NXRT_SQNBIT_PREFILL_MIN \
+        shape_gate: "M=1 decode is native (absorbed, #1104); M>=NXRT_SQNBIT_DECODE_MIN \
                      routes to MLAS SQNBit with a packed-B copy",
         graduation: Graduation::Partial(
             "int4 acc0 decode absorbed at 1.36x/1.56x vs the old borrowed path (#1104); \
