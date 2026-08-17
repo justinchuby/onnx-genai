@@ -198,10 +198,24 @@ pub(crate) const SIMD_MIN_LEN: usize = 32;
 /// | 131072 | 0.21x | 1.68x |
 /// | 262144 | 0.98x | 1.80x |
 ///
-/// (`Sqrt`, f32, ORT 1.28, one intra-op thread each, p50 of 200 interleaved
-/// runs.) The wake-up costs ~50 us and the work below a megabyte is worth less
+/// (`Sqrt`, f32, ORT 1.28.0. Both sides at `intra_op_num_threads = 1`; ours
+/// additionally at `RAYON_NUM_THREADS = 32`, so the comparison is our
+/// *parallel* kernel against single-threaded ORT — which is what makes the
+/// wake-up visible. p50 of 200 interleaved runs, our EP's assignment asserted
+/// from ORT's profiler.) The wake-up costs ~50 us and the work below a megabyte is worth less
 /// than that, so the old 16 Ki threshold turned a 1.2-1.8x win into a 5x loss
 /// on exactly the sizes a decode step uses.
+///
+/// One threshold for every kernel is a simplification, and a measured one.
+/// A later 16-thread sweep found the expensive kernels want it lower: dropping
+/// `PAR_MIN_LEN` to 256 Ki made `Gelu` 1.26-2.35x faster over 256 Ki - 2 Mi,
+/// `Erf` 1.23-1.78x and `FastGelu` 1.28-2.03x, while making `Sqrt` at 256 Ki
+/// *2.3x slower*. Break-even scales with per-element cost, and `Sqrt` — the
+/// cheapest, most bandwidth-bound kernel here — is the one this constant was
+/// derived from, so it is conservative for the transcendentals. Splitting it
+/// into a per-kernel cost class needs the class plumbed through four generic
+/// entry points and is left to a follow-up; this value is the safe one,
+/// because being too high costs throughput while being too low cost 5x.
 ///
 /// Kept well above [`SIMD_MIN_LEN`] so that every chunk is still long enough to
 /// take the vector path. That matters for more than speed: the scalar and
@@ -2937,8 +2951,12 @@ mod exp_tests {
 mod thread_invariance {
     use super::*;
 
-    /// Long enough to be split, and deliberately not a multiple of the chunk
-    /// size, the lane count or any row width used below.
+    /// Long enough to be split, and not a multiple of the chunk size or the
+    /// lane count. It *is* divisible by 3, so the width-3 case happens to
+    /// divide evenly; the adversarial coverage comes from width 4099, which
+    /// leaves a real partial final row, and from chunk boundaries that are not
+    /// multiples of 8 (262 146 and 262 336 for widths 3 and 11), which is what
+    /// would expose a cut made mid-row.
     const N: usize = 5 * PAR_MIN_LEN + 37;
 
     fn probe(len: usize) -> Vec<f32> {
