@@ -1644,10 +1644,13 @@ const HALF_WIDEN_MIN_M: usize = 16;
 /// so this is set to 256 elements: the smallest size that wins repeatably at
 /// *both* thread counts. Only the 64-element case loses, and only at `T=1`.
 ///
-/// The enormous `T=16` ratios are not a widening win, they are the blocked
-/// half GEMM dispatching parallel work for a problem far too small to repay a
-/// fork/join -- 0.27 ms to multiply an 8x8 matrix. Widening sidesteps that;
-/// fixing the half path's own small-work threshold is separate.
+/// The three-digit `T=16` ratios are noise-dominated in magnitude -- an
+/// independent run of the same sweep put the two smallest at 47x and 28x --
+/// but the direction is robust across runs. They are also not a widening win:
+/// they are the blocked half GEMM dispatching parallel work for a problem far
+/// too small to repay a fork/join (`gemm_impl` splits with `par_chunks_mut`
+/// whenever threads > 1, with no small-work guard). Widening sidesteps that;
+/// fixing the half path's own threshold is separate work.
 #[cfg(feature = "mlas")]
 const HALF_WIDEN_MIN_WEIGHT: usize = 256;
 
@@ -2777,6 +2780,20 @@ mod tests {
             "x86_64 + mlas must auto-detect Mlas, else this gate is dead code"
         );
 
+        // Pin the constants to the numbers their doc tables were measured at.
+        // Everything else here follows the constants, so without this a silent
+        // retune would move the dispatch boundary while every test still
+        // passed. If this fails, re-run `bench_f16_half_vs_widen` and update
+        // the tables rather than just bumping the expectation.
+        assert_eq!(
+            HALF_WIDEN_MIN_M, 16,
+            "M threshold moved off its measurement"
+        );
+        assert_eq!(
+            HALF_WIDEN_MIN_WEIGHT, 256,
+            "weight threshold moved off its measurement"
+        );
+
         // Big enough that HALF_WIDEN_MIN_WEIGHT is satisfied, so M alone decides.
         let (k, n) = (512usize, 512usize);
         assert!(k * n >= HALF_WIDEN_MIN_WEIGHT);
@@ -2941,6 +2958,10 @@ mod tests {
             (17, 130, 11),
             (5, 257, 2),
             (2, 0, 3),
+            // Exactly on each widening threshold, and one step below each.
+            (16, 16, 16),
+            (15, 16, 16),
+            (16, 15, 17),
         ];
         let mut state = 0x51A7_CAFE_u32;
         let mut next = || {
@@ -2977,10 +2998,12 @@ mod tests {
                     try_matmul_half(&a.view(), &b.view(), &geometry, CpuBackend::auto_detect())
                         .unwrap()
                         .is_some();
-                let expect_widen = cfg!(all(target_arch = "x86_64", feature = "mlas"))
-                    && dtype == DataType::Float16
-                    && m >= 16
-                    && k * n >= 256;
+                #[cfg(all(target_arch = "x86_64", feature = "mlas"))]
+                let expect_widen = dtype == DataType::Float16
+                    && m >= HALF_WIDEN_MIN_M
+                    && k * n >= HALF_WIDEN_MIN_WEIGHT;
+                #[cfg(not(all(target_arch = "x86_64", feature = "mlas")))]
+                let expect_widen = false;
                 assert_eq!(
                     took_half, !expect_widen,
                     "{dtype:?} {m}x{k}x{n}: unexpected route (half={took_half})"
