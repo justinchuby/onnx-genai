@@ -500,10 +500,10 @@ where
     // A host pool of *one* thread is the opposite case. It is not using the
     // machine, so there is nothing to contend with and our own pool is the
     // right tool: at `intra_op = 1`, rayon beat borrowing ORT's single thread
-    // by 2-9x over 1-4 Mi. `HostWidth` is observed rather than assumed, so
-    // each session gets the answer that is true for it.
+    // by 2-9x over 1-4 Mi. `prefer_host` decides which of the two a session is
+    // by watching whether the host's pool ever actually runs our chunks.
     if let Some(host) = onnx_runtime_ep_api::host_parallel::current()
-        && host.width() != onnx_runtime_ep_api::HostWidth::Serial
+        && host.prefer_host()
     {
         match host_chunk_len(len) {
             Some((chunk, count)) => {
@@ -617,7 +617,7 @@ where
         return;
     }
     if let Some(host) = onnx_runtime_ep_api::host_parallel::current()
-        && host.width() != onnx_runtime_ep_api::HostWidth::Serial
+        && host.prefer_host()
     {
         match host_chunk_len_rows(len, width) {
             Some((chunk, count)) => run_on_host(host, input, output, chunk, count, &body),
@@ -4210,34 +4210,36 @@ mod host_pool_split {
         });
     }
 
-    /// A host that has really been seen to use more than one thread.
-    static PARALLEL_WIDTH: std::sync::atomic::AtomicU8 =
-        std::sync::atomic::AtomicU8::new(host_parallel::WIDTH_PARALLEL);
+    /// A host pool that has been seen running our chunks on its own threads.
+    static HELPED: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(host_parallel::HOST_HELPED);
 
-    /// A host whose pool turned out to have no workers of its own.
-    static SERIAL_WIDTH: std::sync::atomic::AtomicU8 =
-        std::sync::atomic::AtomicU8::new(host_parallel::WIDTH_SERIAL);
+    /// A host pool that never has, past its opening burst of probes: the
+    /// kernels should keep the work on their own pool.
+    static NEVER_HELPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(
+        (host_parallel::PROBE_MIN << 16) | host_parallel::PROBE_MIN,
+    );
 
     fn fake_host() -> HostParallel {
         // SAFETY: `threaded_host` never dereferences its `host` argument, and
-        // the width cell is a `static`.
+        // the probe cell is a `static`.
         unsafe {
             HostParallel::new(
                 core::ptr::null_mut(),
                 threaded_host,
-                core::ptr::from_ref(&PARALLEL_WIDTH),
+                core::ptr::from_ref(&HELPED),
             )
         }
     }
 
-    /// The same host, but known to have a single thread.
-    fn serial_host_handle() -> HostParallel {
+    /// The same host, but one that has never been seen to help.
+    fn unhelpful_host() -> HostParallel {
         // SAFETY: as `fake_host`.
         unsafe {
             HostParallel::new(
                 core::ptr::null_mut(),
                 threaded_host,
-                core::ptr::from_ref(&SERIAL_WIDTH),
+                core::ptr::from_ref(&NEVER_HELPED),
             )
         }
     }
@@ -4361,11 +4363,11 @@ mod host_pool_split {
         assert!(want.iter().zip(&y).all(|(a, b)| a.to_bits() == b.to_bits()));
     }
 
-    /// A host pool with no workers is not using the machine, so ours may.
-    /// Borrowing its single thread instead measured 2-9x slower over 1-4 Mi at
-    /// `intra_op = 1`, so this is worth an assertion.
+    /// A host pool that has never been seen doing our work is not using the
+    /// machine, so ours may. Borrowing a single ORT thread instead measured
+    /// 2-9x slower over 1-4 Mi at `intra_op = 1`, so this is worth asserting.
     #[test]
-    fn a_serial_host_is_not_borrowed() {
+    fn an_unhelpful_host_is_not_borrowed() {
         if rayon::current_num_threads() < 2 {
             eprintln!("skipped: single-threaded rayon pool cannot show the difference");
             return;
@@ -4375,11 +4377,17 @@ mod host_pool_split {
         let mut y = vec![0.0f32; n];
         reset_dispatched();
         let before = parallel_dispatches();
-        host_parallel::scope(serial_host_handle(), || tanh_f32_slice(&x, &mut y));
+        // Past the opening burst with nothing to show for it, which is the
+        // steady state for a session whose host pool has no workers.
+        NEVER_HELPED.store(
+            (host_parallel::PROBE_MIN << 16) | host_parallel::PROBE_MIN,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        host_parallel::scope(unhelpful_host(), || tanh_f32_slice(&x, &mut y));
         assert_eq!(
             dispatched(),
             0,
-            "a one-thread host pool was borrowed anyway"
+            "an unhelpful host pool was borrowed anyway"
         );
         assert_eq!(
             parallel_dispatches() - before,

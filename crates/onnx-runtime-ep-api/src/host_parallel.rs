@@ -56,31 +56,34 @@
 //!   host's pool and stay serial instead of nesting.
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
-/// How many threads the host's pool turned out to have.
+/// Sentinel for "the host's pool has been seen doing our work".
 ///
-/// The host runtime does not tell us, and it matters: a pool of one is not
-/// using the machine, so ours may. Rather than probe — which would cost a
-/// dispatch per session to answer a question the next real dispatch answers
-/// for free — the implementation *observes* its own first dispatch and records
-/// the result here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HostWidth {
-    /// No dispatch has completed yet.
-    Unknown,
-    /// Every body ran on the dispatching thread: the host has no workers.
-    Serial,
-    /// At least one body ran on another thread.
-    Parallel,
-}
+/// The only *permanent* state, and it takes positive evidence to reach: a body
+/// ran on a thread that was not the one that dispatched it, which a pool with
+/// no workers can never produce. Nothing ever clears it.
+pub const HOST_HELPED: u32 = u32::MAX;
 
-/// Nothing observed yet.
-pub const WIDTH_UNKNOWN: u8 = 0;
-/// The host pool ran everything inline.
-pub const WIDTH_SERIAL: u8 = 1;
-/// The host pool used at least one other thread.
-pub const WIDTH_PARALLEL: u8 = 2;
+/// Dispatches a session probes back to back before it starts backing off.
+///
+/// A probe is deliberately made hard to fail — the implementation holds the
+/// calling thread's first index open so a worker that exists has time to claim
+/// another — but even so, a 16-thread ORT session answers only about half of
+/// them, because it hands its indices out dynamically and a caller that is not
+/// stalled drains them first. A burst of 32 turns that coin-flip into a
+/// certainty; getting it wrong the other way is the 3-10x mistake.
+pub const PROBE_BURST: u32 = 32;
+
+/// Gap between probes when the burst has produced nothing, before backoff.
+pub const PROBE_MIN: u32 = 16;
+
+/// Longest gap between probes once the host has never been seen to help.
+///
+/// Bounds the steady-state cost of asking on a session whose pool really is
+/// serial: one dispatch in a thousand runs on the host's single thread instead
+/// of ours.
+pub const PROBE_MAX: u32 = 1024;
 
 /// Runs `body(i)` for every `i` in `0..total` on the host's threads.
 ///
@@ -102,9 +105,9 @@ pub type HostParallelForFn =
 pub struct HostParallel {
     host: *mut c_void,
     run: HostParallelForFn,
-    /// Where the implementation records [`HostWidth`], or null if it never
-    /// will — in which case the pool is assumed parallel.
-    width: *const AtomicU8,
+    /// Where this session records whether the host's pool has ever helped,
+    /// and when to ask again. Null means "never ask, always use the host".
+    probe: *const AtomicU32,
 }
 
 impl core::fmt::Debug for HostParallel {
@@ -125,35 +128,90 @@ impl HostParallel {
     /// pointer. Installing it with [`scope`] is what bounds the first half;
     /// the second half is on the implementer.
     ///
-    /// `width` must be null or point at a cell that outlives this handle, and
-    /// that only ever holds [`WIDTH_UNKNOWN`], [`WIDTH_SERIAL`] or
-    /// [`WIDTH_PARALLEL`].
+    /// `probe` must be null or point at a cell that outlives this handle and
+    /// is shared by every handle for the same host pool. Start it at zero;
+    /// [`HOST_HELPED`] is the implementation's way of saying the pool has been
+    /// seen running our bodies on its own threads. This crate owns every other
+    /// value in it.
     pub const unsafe fn new(
         host: *mut c_void,
         run: HostParallelForFn,
-        width: *const AtomicU8,
+        probe: *const AtomicU32,
     ) -> Self {
-        Self { host, run, width }
+        Self { host, run, probe }
     }
 
-    /// What the last completed dispatch said about the host pool's width.
+    /// Whether this dispatch should go to the host's pool rather than ours.
     ///
-    /// [`HostWidth::Serial`] is the interesting answer: it means the host's
-    /// pool has no workers of its own, so borrowing it would serialise us for
-    /// nothing and our own pool is free to use the machine instead.
-    #[must_use]
-    pub fn width(&self) -> HostWidth {
-        if self.width.is_null() {
-            return HostWidth::Parallel;
+    /// Answering it needs a fact the host runtime will not tell us: whether
+    /// its pool has any workers. A session built with `intra_op = 1` has none,
+    /// and borrowing its single thread would serialise work our own pool could
+    /// spread over the machine — measured 2-9x slower over 1-4 Mi. A session
+    /// with a wide pool is the exact opposite: ours would be a *second* pool
+    /// on the same cores, and that measured 3-10x slower than borrowing.
+    ///
+    /// So ask the only question that has a trustworthy answer: *has the host's
+    /// pool ever actually run one of our bodies on another thread?* Only a
+    /// pool with workers can, so a "yes" is permanent and cannot be faked.
+    /// Until then this returns `false` — keeping the caller on its own pool,
+    /// which is what it did before this seam existed — except on the
+    /// occasional probe dispatch that gives the host a chance to answer.
+    ///
+    /// The first [`PROBE_BURST`] dispatches all ask, because at 16 threads a
+    /// single dispatch answering "nobody helped" is uninformative — it happens
+    /// 35% of the time — while a burst that long is answered almost surely.
+    /// After that, probes back off geometrically from [`PROBE_MIN`] to
+    /// [`PROBE_MAX`], so a session that really is serial settles at one probe
+    /// per thousand dispatches and still recovers if the burst was unlucky.
+    ///
+    /// Mutates the cell, so call it once per dispatch decision.
+    pub fn prefer_host(&self) -> bool {
+        let Some(cell) = self.probe_cell() else {
+            return true;
+        };
+        let mut seen = cell.load(Ordering::Relaxed);
+        loop {
+            if seen == HOST_HELPED {
+                return true;
+            }
+            let period = seen >> 16;
+            let countdown = seen & 0xFFFF;
+            let (next, probe) = if period == 0 {
+                // Still in the opening burst: ask every time, and count how
+                // many times asking has told us nothing.
+                let asked = countdown + 1;
+                let next = if asked >= PROBE_BURST {
+                    (PROBE_MIN << 16) | PROBE_MIN
+                } else {
+                    asked
+                };
+                (next, true)
+            } else if countdown == 0 {
+                // Probe now, and put the next one twice as far out.
+                let period = period.saturating_mul(2).min(PROBE_MAX);
+                ((period << 16) | period, true)
+            } else {
+                ((period << 16) | (countdown - 1), false)
+            };
+            match cell.compare_exchange_weak(seen, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return probe,
+                Err(current) => seen = current,
+            }
         }
+    }
+
+    /// Whether the host's pool has been seen running our work.
+    #[must_use]
+    pub fn helped(&self) -> bool {
+        self.probe_cell()
+            .is_none_or(|cell| cell.load(Ordering::Relaxed) == HOST_HELPED)
+    }
+
+    fn probe_cell(&self) -> Option<&AtomicU32> {
         // SAFETY: `new`'s contract puts the validity of this pointer on the
         // installer, and `scope` bounds it to the extent the handle is
         // reachable.
-        match unsafe { &*self.width }.load(Ordering::Relaxed) {
-            WIDTH_SERIAL => HostWidth::Serial,
-            WIDTH_PARALLEL => HostWidth::Parallel,
-            _ => HostWidth::Unknown,
-        }
+        (!self.probe.is_null()).then(|| unsafe { &*self.probe })
     }
 
     /// Runs `body(0..total)` on the host's pool and waits for all of it.
@@ -299,7 +357,7 @@ mod tests {
         unsafe { HostParallel::new(core::ptr::null_mut(), serial_host, core::ptr::null()) }
     }
 
-    fn with_width(cell: &AtomicU8) -> HostParallel {
+    fn with_probe(cell: &AtomicU32) -> HostParallel {
         // SAFETY: as `serial`, plus `cell` outlives every use below.
         unsafe {
             HostParallel::new(
@@ -311,25 +369,94 @@ mod tests {
     }
 
     #[test]
-    fn a_handle_without_a_width_cell_reads_as_parallel() {
-        assert_eq!(serial().width(), HostWidth::Parallel);
+    fn a_handle_without_a_probe_cell_always_uses_the_host() {
+        assert!(serial().prefer_host());
+        assert!(serial().helped());
     }
 
+    /// The opening burst asks every time: one silent dispatch is not evidence
+    /// of a serial pool, a run of 64 is.
     #[test]
-    fn width_reflects_the_cell() {
-        let cell = AtomicU8::new(WIDTH_UNKNOWN);
-        let host = with_width(&cell);
-        assert_eq!(host.width(), HostWidth::Unknown);
-        cell.store(WIDTH_SERIAL, Ordering::Relaxed);
-        assert_eq!(host.width(), HostWidth::Serial);
-        cell.store(WIDTH_PARALLEL, Ordering::Relaxed);
-        assert_eq!(host.width(), HostWidth::Parallel);
-        cell.store(200, Ordering::Relaxed);
-        assert_eq!(
-            host.width(),
-            HostWidth::Unknown,
-            "an unknown code is not a promise"
+    fn the_opening_burst_probes_every_dispatch() {
+        let cell = AtomicU32::new(0);
+        let host = with_probe(&cell);
+        for step in 0..PROBE_BURST {
+            assert!(host.prefer_host(), "dispatch {step} of the burst");
+        }
+        assert!(!host.prefer_host(), "the burst has to end somewhere");
+    }
+
+    /// Until the host has been seen helping, work stays on our pool -- which
+    /// is what the caller did before this seam existed.
+    #[test]
+    fn an_unhelpful_host_is_asked_less_and_less_often() {
+        let cell = AtomicU32::new(0);
+        let host = with_probe(&cell);
+        let mut gaps = Vec::new();
+        let mut gap = 0u32;
+        for _ in 0..8400 {
+            if host.prefer_host() {
+                gaps.push(gap);
+                gap = 0;
+            } else {
+                gap += 1;
+            }
+        }
+        let burst = usize::try_from(PROBE_BURST).unwrap();
+        assert!(
+            gaps[..burst].iter().all(|&g| g == 0),
+            "the opening burst asks on every dispatch"
         );
+        assert_eq!(
+            &gaps[burst..burst + 4],
+            &[PROBE_MIN, PROBE_MIN * 2, PROBE_MIN * 4, PROBE_MIN * 8],
+            "probes should back off geometrically once the burst is over"
+        );
+        assert!(
+            gaps.iter().all(|&g| g <= PROBE_MAX),
+            "the gap must stay bounded so a wrong guess still self-corrects"
+        );
+        assert_eq!(
+            *gaps.last().unwrap(),
+            PROBE_MAX,
+            "and it should settle at the cap"
+        );
+    }
+
+    /// One sighting of a worker thread is permanent: only a pool with workers
+    /// can produce it, so no later evidence can argue with it.
+    #[test]
+    fn a_helping_host_is_used_from_then_on() {
+        let cell = AtomicU32::new(0);
+        let host = with_probe(&cell);
+        assert!(!host.helped());
+        cell.store(HOST_HELPED, Ordering::Relaxed);
+        assert!(host.helped());
+        for _ in 0..1000 {
+            assert!(host.prefer_host());
+        }
+        assert_eq!(cell.load(Ordering::Relaxed), HOST_HELPED);
+    }
+
+    /// Two threads running the same session must not lose or double-count a
+    /// probe, and must never corrupt the cell into the sentinel.
+    #[test]
+    fn concurrent_dispatches_keep_the_cell_sane() {
+        let cell = AtomicU32::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let host = with_probe(&cell);
+                    for _ in 0..5000 {
+                        host.prefer_host();
+                    }
+                });
+            }
+        });
+        let seen = cell.load(Ordering::Relaxed);
+        assert_ne!(seen, HOST_HELPED, "no thread may invent the sentinel");
+        assert!((seen >> 16) <= PROBE_MAX);
+        assert!((seen & 0xFFFF) <= PROBE_MAX);
     }
 
     #[test]

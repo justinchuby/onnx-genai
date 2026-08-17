@@ -1036,14 +1036,14 @@ pub struct ExportedComputeInfo {
     /// CPU EP (and any host EP), which uses its inputs verbatim exactly as
     /// before.
     device_staging: Option<DeviceStaging>,
-    /// How wide ORT's intra-op pool turned out to be for this session.
+    /// Whether ORT's intra-op pool has ever been seen running our elementwise
+    /// chunks, and when to ask again if not.
     ///
     /// Lives here, rather than in a process-global, because a process may hold
     /// one session at `intra_op = 1` and another at `intra_op = 16`, and the
     /// right answer -- whether to borrow ORT's threads or use our own -- is
-    /// the opposite for each. Written once, by the first dispatch that has
-    /// more than one index; see `host_pool`.
-    host_pool_width: std::sync::atomic::AtomicU8,
+    /// the opposite for each. See `onnx_runtime_ep_api::host_parallel`.
+    host_pool_probe: std::sync::atomic::AtomicU32,
 }
 
 /// Everything `Compute` needs to stage host-resident boundary inputs onto the
@@ -1101,9 +1101,7 @@ impl ExportedComputeInfo {
             routing: None,
             workspace_plans,
             device_staging: None,
-            host_pool_width: std::sync::atomic::AtomicU8::new(
-                onnx_runtime_ep_api::host_parallel::WIDTH_UNKNOWN,
-            ),
+            host_pool_probe: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -2095,7 +2093,7 @@ unsafe extern "C" fn compute_execute(
         // SAFETY: `kernel_context` is the context ORT handed this call and
         // stays valid until it returns, which is after the guard is dropped.
         let _host_pool = unsafe {
-            crate::host_pool::install(api_ref, kernel_context, &exported.host_pool_width)
+            crate::host_pool::install(api_ref, kernel_context, &exported.host_pool_probe)
         };
 
         // Memory info for intermediate scratch. On a device EP this is device

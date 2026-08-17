@@ -23,9 +23,9 @@ use core::ffi::c_void;
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::HostParallel;
 use onnx_runtime_ep_api::host_parallel;
-use onnx_runtime_ep_api::host_parallel::{WIDTH_PARALLEL, WIDTH_SERIAL, WIDTH_UNKNOWN};
+use onnx_runtime_ep_api::host_parallel::HOST_HELPED;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// What [`ort_parallel_for`] needs to reach ORT, behind one `void*`.
 struct HostPool {
@@ -38,8 +38,9 @@ struct HostPool {
     ) -> *mut ort::OrtStatus,
     release_status: Option<unsafe extern "C" fn(*mut ort::OrtStatus)>,
     ctx: *mut ort::OrtKernelContext,
-    /// Where this session records how wide ORT's pool turned out to be.
-    width: *const AtomicU8,
+    /// Where this session records whether ORT's pool has ever helped, and
+    /// when to ask again.
+    probe: *const AtomicU32,
 }
 
 /// The closure a dispatch is running, plus somewhere to record what happened.
@@ -52,6 +53,9 @@ struct Task<'a> {
     caller: Option<std::thread::ThreadId>,
     /// Set when a body ran somewhere other than `caller`.
     saw_another_thread: AtomicBool,
+    /// Set once the calling thread has held its first index open, to give
+    /// ORT's workers a chance to claim one of the others.
+    stalled: AtomicBool,
 }
 
 /// Trampoline handed to ORT: one index of one dispatch.
@@ -67,13 +71,41 @@ unsafe extern "C" fn run_index(usr_data: *mut c_void, index: usize) {
     // it, and let `ort_parallel_for` re-raise on the calling thread once every
     // worker has finished.
     let task = unsafe { &*(usr_data.cast::<Task<'_>>()) };
-    if let Some(caller) = task.caller
-        && std::thread::current().id() != caller
-    {
-        task.saw_another_thread.store(true, Ordering::Relaxed);
+    if let Some(caller) = task.caller {
+        if std::thread::current().id() == caller {
+            // A probe that the calling thread simply drains tells us nothing:
+            // ORT hands its indices out dynamically, so a pool of sixteen
+            // looks exactly like a pool of one when the chunks are small.
+            // Hold the first index this thread takes for long enough that a
+            // worker which is going to help has time to claim another. Paid
+            // only on probe dispatches, and only until one of them answers.
+            if !task.stalled.swap(true, Ordering::Relaxed) {
+                stall(PROBE_STALL);
+            }
+        } else {
+            task.saw_another_thread.store(true, Ordering::Relaxed);
+        }
     }
     if std::panic::catch_unwind(AssertUnwindSafe(|| (task.body)(index))).is_err() {
         task.panicked.store(true, Ordering::Relaxed);
+    }
+}
+
+/// How long the calling thread holds its first index open on a probe.
+///
+/// Long enough to cover a sleeping worker's wake-up on this machine, short
+/// enough that a session whose pool really is serial barely notices: probes
+/// back off to one dispatch in a thousand, so this is ~0.1 us amortised.
+const PROBE_STALL: core::time::Duration = core::time::Duration::from_micros(100);
+
+/// Busy-waits for `how_long`.
+///
+/// Deliberately not a sleep: this runs on ORT's calling thread, and parking it
+/// would hand the core to the very workers whose presence is being tested.
+fn stall(how_long: core::time::Duration) {
+    let until = std::time::Instant::now() + how_long;
+    while std::time::Instant::now() < until {
+        std::hint::spin_loop();
     }
 }
 
@@ -87,13 +119,16 @@ unsafe fn ort_parallel_for(host: *mut c_void, total: usize, body: &(dyn Fn(usize
     let pool = unsafe { &*(host.cast::<HostPool>()) };
     // Only look at thread identities until the answer is in. A session runs
     // this on every dispatch, and `thread::current()` is not free.
-    let observing = total > 1
-        && unsafe { pool.width() }.is_some_and(|w| w.load(Ordering::Relaxed) == WIDTH_UNKNOWN);
+    // Watch which threads run the bodies until one of them is not ours. That
+    // sighting is the whole answer -- see `HostParallel::prefer_host` -- and
+    // once it is in, stop paying for `thread::current()` on every index.
+    let observing = total > 1 && !unsafe { pool.helped() };
     let task = Task {
         body,
         panicked: AtomicBool::new(false),
         caller: observing.then(|| std::thread::current().id()),
         saw_another_thread: AtomicBool::new(false),
+        stalled: AtomicBool::new(false),
     };
     // `num_batch = 0` means "no limit": ORT gives every index its own task and
     // its workers claim them dynamically. That is what we want, because we cut
@@ -109,19 +144,14 @@ unsafe fn ort_parallel_for(host: *mut c_void, total: usize, body: &(dyn Fn(usize
             (&raw const task).cast::<c_void>().cast_mut(),
         )
     };
-    if observing && status.is_null() {
-        // ORT ran every index; if none of them landed on another thread, its
-        // intra-op pool has no workers. Recorded per session, so a process
-        // with both a one-thread and a sixteen-thread session gets the right
-        // answer for each.
-        let observed = if task.saw_another_thread.load(Ordering::Relaxed) {
-            WIDTH_PARALLEL
-        } else {
-            WIDTH_SERIAL
-        };
-        if let Some(width) = unsafe { pool.width() } {
-            width.store(observed, Ordering::Relaxed);
-        }
+    if observing
+        && status.is_null()
+        && task.saw_another_thread.load(Ordering::Relaxed)
+        && let Some(probe) = unsafe { pool.probe() }
+    {
+        // Recorded per session, so a process holding both a one-thread and a
+        // sixteen-thread session gets the right answer for each.
+        probe.store(HOST_HELPED, Ordering::Relaxed);
     }
     if !status.is_null() {
         // The dispatch itself failed. Every index still has to run or the
@@ -142,14 +172,23 @@ unsafe fn ort_parallel_for(host: *mut c_void, total: usize, body: &(dyn Fn(usize
 }
 
 impl HostPool {
-    /// The session's width cell, if it has one.
+    /// The session's probe cell, if it has one.
     ///
     /// # Safety
     ///
     /// The pointer must still be valid, which `install`'s contract requires
     /// for as long as the guard is alive.
-    unsafe fn width(&self) -> Option<&AtomicU8> {
-        (!self.width.is_null()).then(|| unsafe { &*self.width })
+    unsafe fn probe(&self) -> Option<&AtomicU32> {
+        (!self.probe.is_null()).then(|| unsafe { &*self.probe })
+    }
+
+    /// Whether this session has already seen ORT run a body on its own thread.
+    ///
+    /// # Safety
+    ///
+    /// As [`HostPool::probe`].
+    unsafe fn helped(&self) -> bool {
+        unsafe { self.probe() }.is_none_or(|cell| cell.load(Ordering::Relaxed) == HOST_HELPED)
     }
 }
 
@@ -204,7 +243,7 @@ impl Drop for Guard {
 pub unsafe fn install(
     api: &ort::OrtApi,
     ctx: *mut ort::OrtKernelContext,
-    width: &AtomicU8,
+    probe: &AtomicU32,
 ) -> Guard {
     let (Some(parallel_for), false) = (api.KernelContext_ParallelFor, ctx.is_null()) else {
         return Guard::inert();
@@ -213,7 +252,7 @@ pub unsafe fn install(
         parallel_for,
         release_status: api.ReleaseStatus,
         ctx,
-        width: core::ptr::from_ref(width),
+        probe: core::ptr::from_ref(probe),
     });
     // SAFETY: the box outlives the handle (see `Guard`'s drop order), and
     // `ort_parallel_for` only ever reads the pointer back as a `*mut HostPool`.
@@ -221,7 +260,7 @@ pub unsafe fn install(
         HostParallel::new(
             (&raw const *pool).cast::<c_void>().cast_mut(),
             ort_parallel_for,
-            core::ptr::from_ref(width),
+            core::ptr::from_ref(probe),
         )
     };
     Guard {
@@ -233,6 +272,7 @@ pub unsafe fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onnx_runtime_ep_api::host_parallel::{PROBE_MAX, PROBE_MIN};
     use std::sync::atomic::AtomicUsize;
 
     /// Stands in for ORT: runs every index inline and reports success.
@@ -300,19 +340,26 @@ mod tests {
             usize,
             *mut c_void,
         ) -> *mut ort::OrtStatus,
-        width: &AtomicU8,
+        probe: &AtomicU32,
     ) -> HostPool {
         HostPool {
             parallel_for,
             release_status: None,
             ctx: core::ptr::null_mut(),
-            width: core::ptr::from_ref(width),
+            probe: core::ptr::from_ref(probe),
         }
     }
 
+    /// Only ever used to read a probe cell back through the public API.
+    ///
+    /// # Safety
+    ///
+    /// Trivially sound: it touches neither argument.
+    unsafe fn never_runs(_host: *mut c_void, _total: usize, _body: &(dyn Fn(usize) + Sync)) {}
+
     #[test]
     fn every_index_runs_once() {
-        let width = AtomicU8::new(WIDTH_UNKNOWN);
+        let width = AtomicU32::new(0);
         let mut pool = pool(inline_parallel_for, &width);
         let seen: Vec<AtomicUsize> = (0..5).map(|_| AtomicUsize::new(0)).collect();
         unsafe {
@@ -323,56 +370,148 @@ mod tests {
         assert!(seen.iter().all(|c| c.load(Ordering::Relaxed) == 1));
     }
 
-    /// An ORT that runs everything inline has no workers, and our own pool is
-    /// then free to use the machine. Getting this wrong in either direction
-    /// costs multiples: our pool alongside ORT's is 1.5-3.1x slower than
-    /// serial, and serial where ORT has no workers is 2-9x slower than ours.
+    /// The sighting that matters: a body ran somewhere other than the thread
+    /// that dispatched it, which only a pool with workers can do.
     #[test]
-    fn an_inline_host_is_observed_as_serial() {
-        let width = AtomicU8::new(WIDTH_UNKNOWN);
-        let mut pool = pool(inline_parallel_for, &width);
+    fn a_threaded_dispatch_latches_the_host_in() {
+        let probe = AtomicU32::new(0);
+        let mut pool = pool(threaded_parallel_for, &probe);
         unsafe { ort_parallel_for((&raw mut pool).cast::<c_void>(), 4, &|_| {}) };
-        assert_eq!(width.load(Ordering::Relaxed), WIDTH_SERIAL);
+        assert_eq!(probe.load(Ordering::Relaxed), HOST_HELPED);
     }
 
+    /// An ORT that ran everything inline has told us nothing. It happens on
+    /// 16-thread sessions too -- 35% of dispatches, in runs of up to 60 --
+    /// because ORT hands its indices out dynamically and the calling thread
+    /// can drain the queue before a worker wakes. Concluding "no workers" from
+    /// that would start our pool alongside ORT's, the 3-10x pathology.
     #[test]
-    fn a_threaded_host_is_observed_as_parallel() {
-        let width = AtomicU8::new(WIDTH_UNKNOWN);
-        let mut pool = pool(threaded_parallel_for, &width);
-        unsafe { ort_parallel_for((&raw mut pool).cast::<c_void>(), 4, &|_| {}) };
-        assert_eq!(width.load(Ordering::Relaxed), WIDTH_PARALLEL);
+    fn inline_dispatches_never_decide_anything() {
+        let probe = AtomicU32::new(0);
+        let mut pool = pool(inline_parallel_for, &probe);
+        for _ in 0..256 {
+            unsafe { ort_parallel_for((&raw mut pool).cast::<c_void>(), 4, &|_| {}) };
+        }
+        assert_eq!(probe.load(Ordering::Relaxed), 0, "silence is not evidence");
     }
 
-    /// One index proves nothing: even a sixteen-thread pool runs it inline.
+    /// Once latched, later dispatches stop paying for the observation, and
+    /// nothing can unlatch it.
     #[test]
-    fn a_single_index_dispatch_does_not_decide_the_width() {
-        let width = AtomicU8::new(WIDTH_UNKNOWN);
-        let mut pool = pool(inline_parallel_for, &width);
+    fn a_latched_host_is_not_revisited() {
+        let probe = AtomicU32::new(HOST_HELPED);
+        let mut pool = pool(inline_parallel_for, &probe);
+        for _ in 0..16 {
+            unsafe { ort_parallel_for((&raw mut pool).cast::<c_void>(), 4, &|_| {}) };
+        }
+        assert_eq!(probe.load(Ordering::Relaxed), HOST_HELPED);
+    }
+
+    /// One index cannot be split, so it proves nothing either way.
+    #[test]
+    fn a_single_index_dispatch_is_not_evidence() {
+        let probe = AtomicU32::new(0);
+        let mut pool = pool(threaded_parallel_for, &probe);
         unsafe { ort_parallel_for((&raw mut pool).cast::<c_void>(), 1, &|_| {}) };
-        assert_eq!(width.load(Ordering::Relaxed), WIDTH_UNKNOWN);
+        assert_eq!(probe.load(Ordering::Relaxed), 0);
     }
 
-    /// A refused dispatch says nothing about the pool either.
+    /// The stall must not run once a session has latched: it is a probe cost,
+    /// not a per-dispatch one.
     #[test]
-    fn a_refused_dispatch_does_not_decide_the_width() {
-        let width = AtomicU8::new(WIDTH_UNKNOWN);
-        let mut pool = pool(failing_parallel_for, &width);
-        unsafe { ort_parallel_for((&raw mut pool).cast::<c_void>(), 4, &|_| {}) };
-        assert_eq!(width.load(Ordering::Relaxed), WIDTH_UNKNOWN);
+    fn a_latched_session_pays_no_stall() {
+        let probe = AtomicU32::new(HOST_HELPED);
+        let mut pool = pool(inline_parallel_for, &probe);
+        let started = std::time::Instant::now();
+        for _ in 0..8 {
+            unsafe { ort_parallel_for((&raw mut pool).cast::<c_void>(), 4, &|_| {}) };
+        }
+        assert!(
+            started.elapsed() < PROBE_STALL,
+            "eight latched dispatches took longer than a single probe stall"
+        );
     }
 
-    /// Once decided, later dispatches stop paying for the observation.
+    /// And it must run at most once per probe, however many indices there are.
     #[test]
-    fn an_answered_width_is_not_revisited() {
-        let width = AtomicU8::new(WIDTH_PARALLEL);
-        let mut pool = pool(inline_parallel_for, &width);
-        unsafe { ort_parallel_for((&raw mut pool).cast::<c_void>(), 4, &|_| {}) };
-        assert_eq!(width.load(Ordering::Relaxed), WIDTH_PARALLEL);
+    fn a_probe_stalls_once_not_once_per_index() {
+        let probe = AtomicU32::new(0);
+        let mut pool = pool(inline_parallel_for, &probe);
+        let started = std::time::Instant::now();
+        unsafe { ort_parallel_for((&raw mut pool).cast::<c_void>(), 64, &|_| {}) };
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= PROBE_STALL,
+            "a probe has to give workers a chance"
+        );
+        assert!(
+            elapsed < PROBE_STALL * 4,
+            "the stall is per dispatch, not per index: {elapsed:?}"
+        );
+    }
+
+    /// A refused dispatch ran on our fallback path, not ORT's pool.
+    #[test]
+    fn a_refused_dispatch_is_not_evidence() {
+        let probe = AtomicU32::new(0);
+        let mut pool = pool(failing_parallel_for, &probe);
+        for _ in 0..8 {
+            unsafe { ort_parallel_for((&raw mut pool).cast::<c_void>(), 4, &|_| {}) };
+        }
+        assert_eq!(probe.load(Ordering::Relaxed), 0);
+    }
+
+    /// End to end through the public seam: a session whose pool helps ends up
+    /// preferring the host, and one whose pool never does keeps asking, but
+    /// rarely.
+    #[test]
+    fn the_probe_and_the_latch_agree() {
+        let probe = AtomicU32::new(0);
+        let mut threaded = pool(threaded_parallel_for, &probe);
+        // SAFETY: `never_runs` dereferences neither argument.
+        let handle = unsafe {
+            HostParallel::new(
+                core::ptr::null_mut(),
+                never_runs,
+                core::ptr::from_ref(&probe),
+            )
+        };
+        assert!(handle.prefer_host(), "the first dispatch always asks");
+        unsafe { ort_parallel_for((&raw mut threaded).cast::<c_void>(), 4, &|_| {}) };
+        assert!(handle.helped());
+        assert!(handle.prefer_host());
+
+        let quiet = AtomicU32::new(0);
+        let mut inline = pool(inline_parallel_for, &quiet);
+        // SAFETY: as above.
+        let handle = unsafe {
+            HostParallel::new(
+                core::ptr::null_mut(),
+                never_runs,
+                core::ptr::from_ref(&quiet),
+            )
+        };
+        let mut asks = 0;
+        for _ in 0..4096 {
+            if handle.prefer_host() {
+                asks += 1;
+                unsafe { ort_parallel_for((&raw mut inline).cast::<c_void>(), 4, &|_| {}) };
+            }
+        }
+        assert!(!handle.helped());
+        assert!(
+            (2..=4096 / usize::try_from(PROBE_MIN).unwrap()).contains(&asks),
+            "asked {asks} times in 4096 dispatches"
+        );
+        assert!(
+            asks * usize::try_from(PROBE_MAX).unwrap() >= 4096,
+            "a serial-looking session must still re-ask often enough to recover"
+        );
     }
 
     #[test]
     fn a_refused_dispatch_still_runs_every_index() {
-        let width = AtomicU8::new(WIDTH_UNKNOWN);
+        let width = AtomicU32::new(0);
         let mut pool = pool(failing_parallel_for, &width);
         let seen: Vec<AtomicUsize> = (0..5).map(|_| AtomicUsize::new(0)).collect();
         unsafe {
@@ -388,7 +527,7 @@ mod tests {
 
     #[test]
     fn a_panicking_body_does_not_unwind_into_ort() {
-        let width = AtomicU8::new(WIDTH_UNKNOWN);
+        let width = AtomicU32::new(0);
         let mut pool = pool(inline_parallel_for, &width);
         let ran = AtomicUsize::new(0);
         let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
@@ -407,7 +546,7 @@ mod tests {
     fn an_ort_without_parallel_for_installs_nothing() {
         let mut api: ort::OrtApi = unsafe { core::mem::zeroed() };
         api.KernelContext_ParallelFor = None;
-        let width = AtomicU8::new(WIDTH_UNKNOWN);
+        let width = AtomicU32::new(0);
         let guard = unsafe { install(&api, core::ptr::dangling_mut(), &width) };
         assert!(!guard.is_installed());
         assert!(host_parallel::current().is_none());
@@ -417,7 +556,7 @@ mod tests {
     fn a_null_context_installs_nothing() {
         let mut api: ort::OrtApi = unsafe { core::mem::zeroed() };
         api.KernelContext_ParallelFor = Some(inline_parallel_for);
-        let width = AtomicU8::new(WIDTH_UNKNOWN);
+        let width = AtomicU32::new(0);
         let guard = unsafe { install(&api, core::ptr::null_mut(), &width) };
         assert!(!guard.is_installed());
         assert!(host_parallel::current().is_none());
@@ -429,7 +568,7 @@ mod tests {
         api.KernelContext_ParallelFor = Some(inline_parallel_for);
         let seen: Vec<AtomicUsize> = (0..6).map(|_| AtomicUsize::new(0)).collect();
         {
-            let width = AtomicU8::new(WIDTH_UNKNOWN);
+            let width = AtomicU32::new(0);
             let guard = unsafe { install(&api, core::ptr::dangling_mut(), &width) };
             assert!(guard.is_installed());
             let host = host_parallel::current().expect("install publishes a handle");
@@ -448,7 +587,7 @@ mod tests {
     fn a_nested_install_restores_the_outer_handle() {
         let mut api: ort::OrtApi = unsafe { core::mem::zeroed() };
         api.KernelContext_ParallelFor = Some(inline_parallel_for);
-        let width = AtomicU8::new(WIDTH_UNKNOWN);
+        let width = AtomicU32::new(0);
         let outer = unsafe { install(&api, core::ptr::dangling_mut(), &width) };
         assert!(outer.is_installed());
         {
