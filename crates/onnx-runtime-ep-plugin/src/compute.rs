@@ -294,7 +294,11 @@ impl ShapeInference {
             // ── Elementwise ───────────────────────────────────────────────
             "Add" | "Sub" | "Mul" | "Div" | "Pow" | "Mod" | "And" | "Or" | "Xor" | "Equal"
             | "Greater" | "Less" | "GreaterOrEqual" | "LessOrEqual" | "BitShift" | "BitwiseAnd"
-            | "BitwiseOr" | "BitwiseXor" | "Max" | "Min" | "Mean" | "Sum" | "Where" => {
+            | "BitwiseOr" | "BitwiseXor" | "Max" | "Min" | "Mean" | "Sum" | "Where"
+            // `PRelu`'s slope is unidirectionally broadcastable to the
+            // input, so its result follows the same rule as the binary
+            // ops above.
+            | "PRelu" => {
                 Self::ElementwiseBroadcast
             }
 
@@ -322,16 +326,33 @@ impl ShapeInference {
             | "Selu"
             | "Softplus"
             | "Softsign"
-            // `com.microsoft` shape-preserving activations. Absent from this
-            // table they resolve to `Declined`, and `GetCapability`'s
-            // fail-closed shape filter then drops the whole claim — so the EP
-            // never got these nodes at all, whatever `supports_op` said.
-            // `com.microsoft::Silu` is deliberately *not* listed: ORT 1.28 does
-            // not register it, so it is unreachable here and listing it would
-            // create an unmeasured claim the day that changes.
+            // Trigonometric and hyperbolic unaries, plus the remaining
+            // shape-preserving activations. Every one is registered by the
+            // CPU EP (`onnx-runtime-ep-cpu`'s `kernels/mod.rs`) and every one
+            // was missing here, so the fail-closed shape filter in
+            // `GetCapability` dropped the claim and ORT ran them instead --
+            // silently, whatever `supports_op` answered.
+            | "Sin"
+            | "Cos"
+            | "Tan"
+            | "Asin"
+            | "Acos"
+            | "Atan"
+            | "Sinh"
+            | "Cosh"
+            | "Asinh"
+            | "Acosh"
+            | "Atanh"
+            | "ThresholdedRelu"
+            | "Swish"
+            // `com.microsoft` shape-preserving activations, same mechanism.
+            // `Silu` is listed even though ORT 1.28 does not register it:
+            // this EP does, and an op the host cannot run is precisely one it
+            // must never be handed.
             | "FastGelu"
             | "QuickGelu"
             | "BiasGelu"
+            | "Silu"
             | "Cast"
             | "Identity"
             | "Dropout"

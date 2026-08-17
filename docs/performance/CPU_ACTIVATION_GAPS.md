@@ -95,3 +95,45 @@ Two effects explain most of the table, and neither is the transcendental math:
 | `Exp` f32 | 0.14 | 0.82–0.92 | ported `MlasComputeExpVector` to AVX2 (#1093) |
 | bf16 ⇄ f32 conversion | scalar | 1.6–2.8× | bulk AVX2 conversion (#1041) |
 | `com.microsoft` activations unreachable | never ran | reachable | shape-inference table entries (#1082) |
+
+## Ops that still reach ORT despite being supported
+
+Removing the performance-based decline is not by itself enough to guarantee
+that selecting this EP keeps work off ORT's CPU EP. There is a second,
+independent mechanism.
+
+`GetCapability` runs a fail-closed filter that drops any claim containing a node
+whose `ShapeInference::for_node` returns `Declined`
+(`onnx-runtime-ep-plugin/src/ep.rs`). That table matches on op name and ends in
+`_ => Declined`, so **an op the CPU EP registers a kernel for, but which is
+absent from the table, is silently handed to ORT** — whatever `supports_op`
+answers. This is the same mechanism that made the `com.microsoft` activations
+unreachable until #1082.
+
+The activation, trigonometric and hyperbolic families were in that gap and are
+now listed: `Sin`, `Cos`, `Tan`, `Asin`, `Acos`, `Atan`, `Sinh`, `Cosh`,
+`Asinh`, `Acosh`, `Atanh`, `ThresholdedRelu`, `Swish`, `Silu`, `PRelu`.
+
+**66 registered ops remain in the gap.** They fall into three groups:
+
+1. **Genuinely undecidable, correctly declined** — the output shape is
+   data-dependent and cannot be inferred: `NonZero`, `Unique`, `Compress`,
+   `NonMaxSuppression`.
+2. **Internal ops that never appear in an input graph** — produced by our own
+   fusion passes, so they are not candidates at `GetCapability` time:
+   `FusedGemm`, `FusedAttention`, `FusedMatMulBias`, `LinearAttention`,
+   `CausalConvWithState`, `MoE`, `QMoE`.
+3. **Inferrable, but not yet written — this is the work.** `Split`, `Tile`,
+   `TopK`, `Pad`, `Resize`, `Expand`, `Flatten`, `ArgMax`, `ArgMin`, `MaxPool`,
+   `AveragePool`, the `Global*Pool` family, the whole `Reduce*` family,
+   `QuantizeLinear`, `DequantizeLinear`, `DynamicQuantizeLinear`,
+   `QLinearMatMul`, `ScatterND`, `ScatterElements`, `GatherElements`, `Range`,
+   `Size`, `OneHot`, `CumSum`, `CumProd`, `Trilu`, `Constant`,
+   `ConstantOfShape`, `CastLike`, `SpaceToDepth`, `Col2Im`, `ConvTranspose`,
+   `GridSample`, `GroupNormalization`, `CenterCropPad`, `EyeLike`, `DFT`, the
+   window functions, `AffineGrid`, `LpPool`, `BitwiseNot`.
+
+Group 3 is the reason this EP cannot yet claim that no supported node reaches
+ORT. Each entry needs real shape inference, and `QLinearMatMul` and
+`GroupNormalization` are the ones most likely to matter for a transformer
+workload.
