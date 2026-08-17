@@ -30,6 +30,9 @@ const LINEAR_BF16_ENTRY: &str = "qmoe_linear_bf16";
 const GATE_UP_ACTIVATE_F32_ENTRY: &str = "qmoe_gate_up_activate_f32";
 const GATE_UP_ACTIVATE_F16_ENTRY: &str = "qmoe_gate_up_activate_f16";
 const GATE_UP_ACTIVATE_BF16_ENTRY: &str = "qmoe_gate_up_activate_bf16";
+const GATE_UP_ACTIVATE_F32_OCC_ENTRY: &str = "qmoe_gate_up_activate_f32_occ";
+const GATE_UP_ACTIVATE_F16_OCC_ENTRY: &str = "qmoe_gate_up_activate_f16_occ";
+const GATE_UP_ACTIVATE_BF16_OCC_ENTRY: &str = "qmoe_gate_up_activate_bf16_occ";
 const COMBINE_F32_ENTRY: &str = "qmoe_combine_f32";
 const COMBINE_F16_ENTRY: &str = "qmoe_combine_f16";
 const COMBINE_BF16_ENTRY: &str = "qmoe_combine_bf16";
@@ -757,6 +760,64 @@ extern "C" __global__ void qmoe_gate_up_activate_bf16(
 }
 #endif
 
+// Occupancy-raised (`ONNX_GENAI_QMOE_OCC`) siblings of the fused gate/up expert
+// GEMV. `__launch_bounds__(256, QMOE_OCC_BLOCKS)` caps the register footprint so
+// more resident blocks fit per SM (measured default entry: 48 reg/thread ->
+// 5 blocks/SM = 62.5% theoretical, 50.8% achieved; the fused dual-GEMV+SwiGLU
+// body is DRAM-headroom-rich (16.8%) and Long-Scoreboard bound, so extra warps
+// hide the weight-load latency). Byte-identical to the default entry:
+// `__launch_bounds__` only constrains register allocation, so the accumulate
+// order, both `block_sum` reductions, and the SwiGLU are unchanged.
+#ifndef QMOE_OCC_BLOCKS
+#define QMOE_OCC_BLOCKS 6
+#endif
+
+#define QMOE_GATE_UP_OCC_ENTRY(NAME, TYPE)                                     \
+extern "C" __global__ void __launch_bounds__(256, QMOE_OCC_BLOCKS) NAME(       \
+    const TYPE* input,                                                         \
+    const int* selected_experts,                                              \
+    const unsigned char* fc1_packed,                                          \
+    const float* fc1_scales,                                                  \
+    const unsigned char* fc1_zero_points,                                     \
+    const float* fc1_bias,                                                    \
+    const unsigned char* fc3_packed,                                          \
+    const float* fc3_scales,                                                  \
+    const unsigned char* fc3_zero_points,                                     \
+    const float* fc3_bias,                                                    \
+    float* activated,                                                         \
+    const unsigned long long routes,                                          \
+    const int top_k,                                                          \
+    const int inter,                                                          \
+    const int fc1_out_features,                                               \
+    const int fc3_present,                                                    \
+    const int swiglu_fusion,                                                  \
+    const int in_features,                                                    \
+    const int fc1_packed_in,                                                  \
+    const int fc1_blocks,                                                     \
+    const int fc1_zero_point_bytes,                                           \
+    const int fc3_packed_in,                                                  \
+    const int fc3_blocks,                                                     \
+    const int fc3_zero_point_bytes,                                           \
+    const float alpha,                                                        \
+    const float beta,                                                         \
+    const float swiglu_limit)                                                 \
+{                                                                             \
+    qmoe_gate_up_activate_impl<TYPE, QMOE_BITS, QMOE_BLOCK_SIZE,               \
+        QMOE_HAS_ZERO_POINTS != 0>(                                           \
+        input, selected_experts, fc1_packed, fc1_scales, fc1_zero_points,      \
+        fc1_bias, fc3_packed, fc3_scales, fc3_zero_points, fc3_bias, activated,\
+        routes, top_k, inter, fc1_out_features, fc3_present, swiglu_fusion,    \
+        in_features, fc1_packed_in, fc1_blocks, fc1_zero_point_bytes,          \
+        fc3_packed_in, fc3_blocks, fc3_zero_point_bytes, alpha, beta,          \
+        swiglu_limit);                                                        \
+}
+
+QMOE_GATE_UP_OCC_ENTRY(qmoe_gate_up_activate_f32_occ, float)
+#ifdef QMOE_HAS_HALF
+QMOE_GATE_UP_OCC_ENTRY(qmoe_gate_up_activate_f16_occ, __half)
+QMOE_GATE_UP_OCC_ENTRY(qmoe_gate_up_activate_bf16_occ, __nv_bfloat16)
+#endif
+
 template <typename Output>
 __device__ __forceinline__ void qmoe_store(
     Output* output, unsigned long long index, float value);
@@ -856,6 +917,22 @@ struct QuantLayout {
     bits: usize,
     block_size: usize,
     has_zero_points: bool,
+}
+
+/// Whether the fused QMoE gate/up SwiGLU expert GEMV takes the occupancy-raised
+/// `_occ` entry (`__launch_bounds__(256, 6)` -> register footprint capped so
+/// more blocks are resident per SM). Measured on a DeepSeek-V2-Lite-shaped
+/// decode: the default entry is 48 reg/thread -> 5 blocks/SM (62.5% theoretical,
+/// 50.8% achieved), DRAM only 16.8%, Long-Scoreboard bound; the extra resident
+/// warps hide the int4 weight-load latency. Byte-identical to the default entry:
+/// `__launch_bounds__` only constrains register allocation, so the accumulate
+/// order, both `block_sum` reductions, and the SwiGLU are unchanged. Opt-in,
+/// DEFAULT-OFF; `ONNX_GENAI_QMOE_OCC=1` (or `true`/`on`) engages the `_occ` path.
+fn qmoe_gate_up_occ_enabled() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_QMOE_OCC").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
 }
 
 fn linear_module_source(layout: QuantLayout) -> (&'static str, &'static str) {
@@ -1030,6 +1107,14 @@ impl FloatDtype {
             Self::F32 => GATE_UP_ACTIVATE_F32_ENTRY,
             Self::F16 => GATE_UP_ACTIVATE_F16_ENTRY,
             Self::Bf16 => GATE_UP_ACTIVATE_BF16_ENTRY,
+        }
+    }
+
+    fn gate_up_activate_entry_occ(self) -> &'static str {
+        match self {
+            Self::F32 => GATE_UP_ACTIVATE_F32_OCC_ENTRY,
+            Self::F16 => GATE_UP_ACTIVATE_F16_OCC_ENTRY,
+            Self::Bf16 => GATE_UP_ACTIVATE_BF16_OCC_ENTRY,
         }
     }
 
@@ -2065,9 +2150,12 @@ impl QMoEKernel {
             has_zero_points: fc1.zero_points.is_some(),
         };
         let (module, source) = linear_module_source(layout);
-        let function =
-            self.runtime
-                .nvrtc_function(module, source, dtype.gate_up_activate_entry())?;
+        let entry = if qmoe_gate_up_occ_enabled() {
+            dtype.gate_up_activate_entry_occ()
+        } else {
+            dtype.gate_up_activate_entry()
+        };
+        let function = self.runtime.nvrtc_function(module, source, entry)?;
         let tasks = checked_product(&[routes, inter], "fused gate/up activation task count")?;
         let grid_x = self.linear_reduction_grid(tasks, routes)?;
         let config = self.runtime.reduction_launch_config(
