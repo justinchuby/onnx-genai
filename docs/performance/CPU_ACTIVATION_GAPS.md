@@ -102,8 +102,8 @@ Removing the performance-based decline is not by itself enough to guarantee
 that selecting this EP keeps work off ORT's CPU EP. There is a second,
 independent mechanism.
 
-`GetCapability` runs a fail-closed filter that drops any claim containing a node
-whose `ShapeInference::for_node` returns `Declined`
+`GetCapability` runs a fail-closed filter that drops any claim containing a
+node whose `ShapeInference::for_node` returns `Declined`
 (`onnx-runtime-ep-plugin/src/ep.rs`). That table matches on op name and ends in
 `_ => Declined`, so **an op the CPU EP registers a kernel for, but which is
 absent from the table, is silently handed to ORT** — whatever `supports_op`
@@ -111,29 +111,60 @@ answers. This is the same mechanism that made the `com.microsoft` activations
 unreachable until #1082.
 
 The activation, trigonometric and hyperbolic families were in that gap and are
-now listed: `Sin`, `Cos`, `Tan`, `Asin`, `Acos`, `Atan`, `Sinh`, `Cosh`,
+now covered: `Sin`, `Cos`, `Tan`, `Asin`, `Acos`, `Atan`, `Sinh`, `Cosh`,
 `Asinh`, `Acosh`, `Atanh`, `ThresholdedRelu`, `Swish`, `Silu`, `PRelu`.
 
-**66 registered ops remain in the gap.** They fall into three groups:
+**52 registered ops remain in the gap.** The list is not prose: it is asserted
+exactly by `every_registered_op_has_a_shape_rule_or_is_a_known_gap`
+(`crates/onnx-runtime-ep-cpu-plugin/tests/shape_inference_coverage.rs`), which
+enumerates the registry and fails if an op is added without a shape rule *or* a
+shape rule is added without updating the list. Read that test for the current
+contents; the summary below is the shape of it.
 
-1. **Genuinely undecidable, correctly declined** — the output shape is
-   data-dependent and cannot be inferred: `NonZero`, `Unique`, `Compress`,
-   `NonMaxSuppression`.
-2. **Internal ops that never appear in an input graph** — produced by our own
-   fusion passes, so they are not candidates at `GetCapability` time:
-   `FusedGemm`, `FusedAttention`, `FusedMatMulBias`, `LinearAttention`,
-   `CausalConvWithState`, `MoE`, `QMoE`.
-3. **Inferrable, but not yet written — this is the work.** `Split`, `Tile`,
-   `TopK`, `Pad`, `Resize`, `Expand`, `Flatten`, `ArgMax`, `ArgMin`, `MaxPool`,
-   `AveragePool`, the `Global*Pool` family, the whole `Reduce*` family,
-   `QuantizeLinear`, `DequantizeLinear`, `DynamicQuantizeLinear`,
-   `QLinearMatMul`, `ScatterND`, `ScatterElements`, `GatherElements`, `Range`,
-   `Size`, `OneHot`, `CumSum`, `CumProd`, `Trilu`, `Constant`,
-   `ConstantOfShape`, `CastLike`, `SpaceToDepth`, `Col2Im`, `ConvTranspose`,
-   `GridSample`, `GroupNormalization`, `CenterCropPad`, `EyeLike`, `DFT`, the
-   window functions, `AffineGrid`, `LpPool`, `BitwiseNot`.
+### 1. Data-dependent — correctly declined (16)
 
-Group 3 is the reason this EP cannot yet claim that no supported node reaches
-ORT. Each entry needs real shape inference, and `QLinearMatMul` and
-`GroupNormalization` are the ones most likely to matter for a transformer
-workload.
+The output shape is a function of an input's *values*, not its shape, so it
+cannot be inferred at capability time: `Compress`, `NonZero`, `Unique`,
+`NonMaxSuppression`, `ConstantOfShape`, `Expand`, `Range`, `Tile`, `OneHot`,
+`Pad`, `TopK`, `Split`, `Unsqueeze`, `BlackmanWindow`, `HammingWindow`,
+`HannWindow`.
+
+Most of these carry a **constant initializer** in practice — `Unsqueeze`'s
+`axes` and `Pad`'s `pads` are almost always constant folded inputs in a real
+transformer graph. A pass that resolves initializer values at capability time
+would let us claim them. Until one exists, declining is the honest answer, and
+`Unsqueeze` in particular is a frequent op we are handing over.
+
+### 2. Internal fusion ops — never candidates (13)
+
+Emitted by our own fusion passes, so they are created *after* capability and
+never appear in an input graph: `FusedGemm`, `FusedAttention`,
+`FusedMatMulBias`, `LinearAttention`, `CausalConvWithState`, and the `pkg.nxrt`
+ops `BlockQuantizedMatMul`, `BlockQuantizedMoE`, `CompressedSparseAttention`,
+`IndexShare`, `PackedVarlenAttention`, `SparseKvGather`, `VarlenAttention`.
+
+### 3. Inferrable but unwritten — this is the work (23)
+
+Real ops, in real input graphs, that we have a kernel for and hand to ORT
+anyway because nobody wrote the rule.
+
+**Shape-preserving; one line each.** `BitwiseNot`, `CastLike`, `CumProd`,
+`CumSum`, `DequantizeLinear`, `EyeLike`, `QuantizeLinear`, `ScatterElements`,
+`ScatterND`, `Trilu`. `QuantizeLinear`/`DequantizeLinear` are the ones that
+matter: they bracket every operator in a quantised model, so handing them over
+also fragments the partition around everything between them.
+
+**Inferrable from attributes or a fixed rule.** `ArgMax`, `ArgMin`, `Constant`,
+`DFT`, `DynamicQuantizeLinear`, `Flatten`, `GatherElements`, `QLinearMatMul`,
+`Size`.
+
+**Contrib ops needing a real rule.** `com.microsoft::Attention` — packed QKV
+with a different signature from `ai.onnx::Attention`, so the opset-23 arm
+deliberately does not cover it; this is the single highest-value entry in the
+list, because it is *the* attention op in exported GenAI models.
+`com.microsoft::MoE`, `com.microsoft::QMoE` and
+`com.microsoft::PackedMultiHeadAttention` are likewise read from exported
+models, not produced by our fusion passes.
+
+Groups 1 and 3 are why this EP cannot yet claim that no supported node reaches
+ORT.

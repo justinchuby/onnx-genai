@@ -161,9 +161,8 @@ impl ShapeInference {
             // ── Elementwise broadcast ops ─────────────────────────────────
             "Add" | "Sub" | "Mul" | "Div" | "Pow" | "Mod" | "And" | "Or" | "Xor" | "Equal"
             | "Greater" | "Less" | "GreaterOrEqual" | "LessOrEqual" | "BitShift" | "BitwiseAnd"
-            | "BitwiseOr" | "BitwiseXor" | "Max" | "Min" | "Mean" | "Sum" | "Where" => {
-                Self::ElementwiseBroadcast
-            }
+            | "BitwiseOr" | "BitwiseXor" | "Max" | "Min" | "Mean" | "Sum" | "Where"
+            | "PRelu" => Self::ElementwiseBroadcast,
 
             // ── Unary / shape-preserving ──────────────────────────────────
             "Relu"
@@ -189,16 +188,29 @@ impl ShapeInference {
             | "Selu"
             | "Softplus"
             | "Softsign"
+            // Trigonometric and hyperbolic ops. Unary and shape-preserving,
+            // so the name alone is enough.
+            | "Sin"
+            | "Cos"
+            | "Tan"
+            | "Asin"
+            | "Acos"
+            | "Atan"
+            | "Sinh"
+            | "Cosh"
+            | "Asinh"
+            | "Acosh"
+            | "Atanh"
+            | "ThresholdedRelu"
             // `com.microsoft` shape-preserving activations. Absent from this
             // table they resolve to `Declined`, and `GetCapability`'s
             // fail-closed shape filter then drops the whole claim — so the EP
             // never got these nodes at all, whatever `supports_op` said.
-            // `com.microsoft::Silu` is deliberately *not* listed: ORT 1.28 does
-            // not register it, so it is unreachable here and listing it would
-            // create an unmeasured claim the day that changes.
             | "FastGelu"
             | "QuickGelu"
             | "BiasGelu"
+            | "Silu"
+            | "Swish"
             | "Cast"
             | "Identity"
             | "Dropout"
