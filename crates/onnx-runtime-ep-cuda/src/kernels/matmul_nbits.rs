@@ -5556,9 +5556,8 @@ fn use_f16_symmetric_splitk(
     multiprocessor_count: u32,
     max_threads_per_block: u32,
 ) -> bool {
-    let eligible = k >= 512
-        && k.is_multiple_of(32)
-        && max_threads_per_block >= GEMV_F16_LARGE_THREADS;
+    let eligible =
+        k >= 512 && k.is_multiple_of(32) && max_threads_per_block >= GEMV_F16_LARGE_THREADS;
     if !eligible {
         return false;
     }
@@ -10778,7 +10777,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 return;
             };
             let inter =
-                run_symmetric_block_raw(k, n, block_size, scales_fp16, true, Some(false), None).unwrap();
+                run_symmetric_block_raw(k, n, block_size, scales_fp16, true, Some(false), None)
+                    .unwrap();
             ran = true;
             let mismatches = base
                 .iter()
@@ -10822,7 +10822,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 return;
             };
             let inter =
-                run_symmetric_block_raw(k, n, block_size, scales_fp16, true, Some(true), None).unwrap();
+                run_symmetric_block_raw(k, n, block_size, scales_fp16, true, Some(true), None)
+                    .unwrap();
             ran = true;
             let mismatches = base
                 .iter()
@@ -10880,8 +10881,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                     );
                     return;
                 };
-                let pipe =
-                    run_symmetric_block_raw(k, n, 32, scales_fp16, false, None, Some(true)).unwrap();
+                let pipe = run_symmetric_block_raw(k, n, 32, scales_fp16, false, None, Some(true))
+                    .unwrap();
                 ran = true;
                 let mismatches = scalar
                     .iter()
@@ -10901,7 +10902,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             "scales-fp16 pipeline byte-identity test did not execute any case"
         );
     }
-
 
     /// GEMM. Drives the real `MatMulNBitsKernel::run` dispatch with
     /// `ONNX_GENAI_MARLIN_M_GT_1=1` so the `m > 1` seam routes to Marlin,
