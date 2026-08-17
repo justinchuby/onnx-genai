@@ -6239,8 +6239,8 @@ unsafe fn borrowed_int4_nblock4_avx2(
             // Ragged or non-32-multiple tail block: scalar, matching the
             // per-column path's scalar fallback exactly.
             for c in 0..group {
-                let block_values = &packed_rows[c]
-                    [block * packed_block_size..(block + 1) * packed_block_size];
+                let block_values =
+                    &packed_rows[c][block * packed_block_size..(block + 1) * packed_block_size];
                 let scale = scales.get(scale_bases[c] + block);
                 let zero_point = layout.zero_point(zp_rows[c], block) as f32;
                 let mut dot = 0.0f32;
