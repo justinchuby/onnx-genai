@@ -607,6 +607,14 @@ fn main() -> Result<()> {
     validate_tolerance("rel-tolerance", args.rel_tolerance)?;
     validate_tolerance("abs-tolerance", args.abs_tolerance)?;
     if args.phase_profile {
+        if args.ort_only {
+            // The profiler only instruments the native executor, so this
+            // combination would enable it and then print nothing. Say so rather
+            // than emitting a silently empty report.
+            bail!(
+                "--phase-profile has no effect with --ort-only: the phase profiler instruments the native executor, not the ORT session"
+            );
+        }
         // Turn the executor's phase accounting on programmatically rather than
         // through `NXRT_EXEC_PHASE_PROFILE`, so the flag works on its own and
         // cannot be half-set by an inherited environment.
