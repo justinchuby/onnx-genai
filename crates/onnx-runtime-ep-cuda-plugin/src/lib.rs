@@ -79,6 +79,7 @@ mod cuda_impl {
                 // already resolved. This matches the CPU EP's fix for the same issue.
                 end_version: i32::MAX,
                 supported_dtypes: d.supported_dtypes,
+                input_dtype_constraints: &[],
             })
             .collect()
     }
