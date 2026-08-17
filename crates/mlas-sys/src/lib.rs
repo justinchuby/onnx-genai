@@ -40,6 +40,24 @@ unsafe extern "C" {
     );
 
     #[allow(clippy::too_many_arguments)]
+    fn mlas_sgemm_batch(
+        trans_a: c_int,
+        trans_b: c_int,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: *const *const f32,
+        lda: usize,
+        b: *const *const f32,
+        ldb: usize,
+        beta: f32,
+        c: *const *mut f32,
+        ldc: usize,
+        batch_size: usize,
+    );
+
+    #[allow(clippy::too_many_arguments)]
     fn mlas_qgemm_i32(
         m: usize,
         n: usize,
@@ -448,6 +466,19 @@ fn default_mlas_thread_count() -> usize {
             .map(usize::from)
             .unwrap_or(1),
     )
+}
+
+/// The worker count the process-global standalone MLAS pool resolves to.
+///
+/// Callers that interleave their own `rayon` passes with MLAS GEMMs use this to
+/// stay inside the same budget: `ONNX_GENAI_CPU_DECODE_THREADS` (and
+/// [`set_pool_thread_budget`]) bound MLAS but not `rayon`'s global pool, so a
+/// pass that fans out to every logical CPU would silently exceed the width the
+/// caller asked for.
+///
+/// This only *reports* the resolution; it does not create the pool.
+pub fn configured_pool_threads() -> usize {
+    default_mlas_thread_count().max(1)
 }
 
 /// Set or clear a process-local worker budget for the standalone MLAS pool.
@@ -1459,6 +1490,121 @@ pub fn sgemm(
     }
 }
 
+/// One GEMM inside a batched SGEMM. `M`, `N`, `K`, the transpose flags and
+/// every leading dimension are shared across the batch; only the operands and
+/// the output window differ.
+#[derive(Clone, Copy, Debug)]
+pub struct SgemmBatchItem<'a> {
+    /// `A` operand, at least `m * lda` floats (`k * lda` when `trans_a`).
+    pub a: &'a [f32],
+    /// `B` operand, at least `k * ldb` floats (`n * ldb` when `trans_b`).
+    pub b: &'a [f32],
+    /// Element offset of this item's `m * ldc` output window inside `c`.
+    pub c_offset: usize,
+}
+
+/// Batched row-major SGEMM: `C_i = alpha * op(A_i) * op(B_i) + beta * C_i`.
+///
+/// The point is not to save per-call overhead in C++, which is trivial, but to
+/// hand MLAS a single `MlasTrySimpleParallel` fan-out covering the whole batch.
+/// Issued one at a time, each small GEMM takes the work-stealing pool's
+/// dispatch lock and asks for a thread count derived from its own complexity
+/// alone; batched, MLAS spreads `ThreadsPerGemm * batch` work items across the
+/// pool in one dispatch (`sgemm.cpp`'s `MlasGemmBatch`). A grouped
+/// mixture-of-experts decode step is exactly this shape: `k` skinny GEMMs that
+/// individually look far too small to thread.
+///
+/// # Panics
+///
+/// Panics if any operand is too short for the declared dimensions, or if the
+/// items' output windows are not strictly ascending and disjoint - the
+/// invariant that makes handing out several `*mut f32` into one `&mut [f32]`
+/// sound.
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_batch(
+    trans_a: bool,
+    trans_b: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    items: &[SgemmBatchItem<'_>],
+    lda: usize,
+    ldb: usize,
+    beta: f32,
+    c: &mut [f32],
+    ldc: usize,
+) {
+    if items.is_empty() || m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    assert!(
+        lda >= if trans_a { m } else { k },
+        "sgemm_batch: lda {lda} is smaller than the packed row length"
+    );
+    assert!(
+        ldb >= if trans_b { k } else { n },
+        "sgemm_batch: ldb {ldb} is smaller than the packed row length"
+    );
+    assert!(ldc >= n, "sgemm_batch: ldc {ldc} is smaller than n {n}");
+    let a_min = if trans_a { k * lda } else { m * lda };
+    let b_min = if trans_b { n * ldb } else { k * ldb };
+    let c_window = m * ldc;
+    let mut previous_end = 0usize;
+    for (index, item) in items.iter().enumerate() {
+        assert!(
+            item.a.len() >= a_min,
+            "batched SGEMM item {index} A holds {} floats, needs {a_min}",
+            item.a.len()
+        );
+        assert!(
+            item.b.len() >= b_min,
+            "batched SGEMM item {index} B holds {} floats, needs {b_min}",
+            item.b.len()
+        );
+        assert!(
+            index == 0 || item.c_offset >= previous_end,
+            "batched SGEMM output windows must be ascending and disjoint: item \
+             {index} starts at {} but the previous window ends at {previous_end}",
+            item.c_offset
+        );
+        previous_end = item.c_offset + c_window;
+        assert!(
+            previous_end <= c.len(),
+            "batched SGEMM item {index} writes up to {previous_end}, C holds {}",
+            c.len()
+        );
+    }
+    ensure_threading();
+    let a_ptrs: Vec<*const f32> = items.iter().map(|i| i.a.as_ptr()).collect();
+    let b_ptrs: Vec<*const f32> = items.iter().map(|i| i.b.as_ptr()).collect();
+    // Sound because the loop above proved the windows are disjoint and in
+    // bounds, so no two raw pointers below can alias.
+    let c_base = c.as_mut_ptr();
+    let c_ptrs: Vec<*mut f32> = items
+        .iter()
+        .map(|i| unsafe { c_base.add(i.c_offset) })
+        .collect();
+    unsafe {
+        mlas_sgemm_batch(
+            trans_a as c_int,
+            trans_b as c_int,
+            m,
+            n,
+            k,
+            alpha,
+            a_ptrs.as_ptr(),
+            lda,
+            b_ptrs.as_ptr(),
+            ldb,
+            beta,
+            c_ptrs.as_ptr(),
+            ldc,
+            items.len(),
+        );
+    }
+}
+
 /// Blocked n-bit quantized GEMM compute type, mirroring MLAS's
 /// `MLAS_QNBIT_GEMM_COMPUTE_TYPE`. These are the two float-input variants used
 /// by the CPU `MatMulNBits` decode path.
@@ -1939,6 +2085,97 @@ mod tests {
     use super::*;
 
     fn assert_send_sync<T: Send + Sync>() {}
+
+    /// `sgemm_batch` must produce exactly what the same items produce
+    /// when issued one `sgemm` at a time. Batching only changes how MLAS
+    /// partitions threads, never the arithmetic, so this is a bit-exactness
+    /// assertion and not a tolerance check.
+    ///
+    /// The `transB` case is the one the grouped mixture-of-experts path uses:
+    /// expert weights arrive as `[out_features, in_features]`, i.e. already
+    /// transposed relative to what a plain `A*B` wants.
+    #[test]
+    fn batched_sgemm_is_bit_identical_to_serial_calls() {
+        for &(m, n, k, batch) in &[
+            (1usize, 96usize, 64usize, 8usize),
+            (3, 32, 48, 5),
+            (7, 17, 23, 2),
+            (1, 1, 1, 3),
+        ] {
+            for &trans_b in &[false, true] {
+                let ldb = if trans_b { k } else { n };
+                let a: Vec<f32> = (0..batch * m * k)
+                    .map(|i| ((i as f32) * 0.017).sin() * 1.3)
+                    .collect();
+                let banks: Vec<Vec<f32>> = (0..batch)
+                    .map(|e| {
+                        (0..n * k)
+                            .map(|i| ((i as f32 + e as f32 * 7.0) * 0.011).cos() * 0.9)
+                            .collect()
+                    })
+                    .collect();
+                let refs: Vec<&[f32]> = banks.iter().map(Vec::as_slice).collect();
+
+                let items: Vec<SgemmBatchItem<'_>> = refs
+                    .iter()
+                    .enumerate()
+                    .map(|(e, b)| SgemmBatchItem {
+                        a: &a[e * m * k..],
+                        b,
+                        c_offset: e * m * n,
+                    })
+                    .collect();
+                let mut batched = vec![0.0f32; batch * m * n];
+                sgemm_batch(
+                    false,
+                    trans_b,
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    &items,
+                    k,
+                    ldb,
+                    0.0,
+                    &mut batched,
+                    n,
+                );
+
+                let mut serial = vec![0.0f32; batch * m * n];
+                for (e, bank) in banks.iter().enumerate() {
+                    sgemm(
+                        false,
+                        trans_b,
+                        m,
+                        n,
+                        k,
+                        1.0,
+                        &a[e * m * k..],
+                        k,
+                        bank,
+                        ldb,
+                        0.0,
+                        &mut serial[e * m * n..],
+                        n,
+                    );
+                }
+                assert_eq!(
+                    batched, serial,
+                    "m={m} n={n} k={k} batch={batch} trans_b={trans_b}"
+                );
+            }
+        }
+    }
+
+    /// An empty batch is a no-op rather than a panic, so callers can hand over
+    /// a routing result in which no expert was selected.
+    #[test]
+    fn batched_sgemm_with_no_items_is_a_no_op() {
+        let _a = [1.0f32; 4];
+        let mut c = [7.0f32; 4];
+        sgemm_batch(false, true, 1, 4, 4, 1.0, &[], 4, 4, 0.0, &mut c, 4);
+        assert_eq!(c, [7.0; 4]);
+    }
 
     /// The durable heap a `CompFp32` int4 `SQNBitPackedB` retains is exactly the
     /// packed buffer **plus** its owned scale (and, when asymmetric, zero-point)

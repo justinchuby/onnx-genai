@@ -25,6 +25,7 @@
 #include <cstring>
 #include <functional>
 #include <new>
+#include <vector>
 
 namespace onnxruntime {
 struct MLFloat16 {
@@ -209,6 +210,56 @@ extern "C" void mlas_sgemm(
         transB ? CblasTrans : CblasNoTrans,
         M, N, K,
         &data, 1,
+        kMlasParallelSentinel,
+        /*BackendKernelSelectorConfig=*/nullptr);
+}
+
+// Batched SGEMM sharing `M`, `N`, `K`, the transpose flags and the leading
+// dimensions across every item; only the `A`, `B` and `C` base pointers differ.
+//
+// The point is not to save the per-call C++ overhead, which is trivial, but to
+// hand MLAS a single `MlasTrySimpleParallel` fan-out covering all `BatchSize`
+// GEMMs. Issued one at a time, a batch of small GEMMs takes the work-stealing
+// pool's dispatch lock once per GEMM and each dispatch asks for a thread count
+// derived from that one GEMM's complexity; batched, MLAS partitions
+// `ThreadsPerGemm * BatchSize` work items in one go (`sgemm.cpp:1561`).
+extern "C" void mlas_sgemm_batch(
+    int transA,
+    int transB,
+    size_t M,
+    size_t N,
+    size_t K,
+    float alpha,
+    const float* const* A,
+    size_t lda,
+    const float* const* B,
+    size_t ldb,
+    float beta,
+    float* const* C,
+    size_t ldc,
+    size_t batch_size)
+{
+    if (batch_size == 0) {
+        return;
+    }
+    std::vector<MLAS_SGEMM_DATA_PARAMS> data(batch_size);
+    for (size_t i = 0; i < batch_size; ++i) {
+        data[i].A = A[i];
+        data[i].lda = lda;
+        data[i].B = B[i];
+        data[i].ldb = ldb;
+        data[i].C = C[i];
+        data[i].ldc = ldc;
+        data[i].alpha = alpha;
+        data[i].beta = beta;
+        data[i].BIsPacked = false;
+    }
+
+    MlasGemmBatch(
+        transA ? CblasTrans : CblasNoTrans,
+        transB ? CblasTrans : CblasNoTrans,
+        M, N, K,
+        data.data(), batch_size,
         kMlasParallelSentinel,
         /*BackendKernelSelectorConfig=*/nullptr);
 }
