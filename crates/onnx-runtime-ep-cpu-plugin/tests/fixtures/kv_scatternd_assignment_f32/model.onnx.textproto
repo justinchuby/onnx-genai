@@ -1,0 +1,91 @@
+ir_version: 10
+graph {
+  node {
+    input: "cache"
+    input: "indices"
+    input: "updates"
+    output: "updated"
+    op_type: "ScatterND"
+  }
+  name: "kv_scatternd_assignment_f32"
+  input {
+    name: "cache"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 8
+          }
+          dim {
+            dim_value: 1024
+          }
+          dim {
+            dim_value: 128
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "indices"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 3
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "updates"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 128
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "updated"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 8
+          }
+          dim {
+            dim_value: 1024
+          }
+          dim {
+            dim_value: 128
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 16
+}

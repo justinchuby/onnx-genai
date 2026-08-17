@@ -80,37 +80,60 @@ pub struct MultiHeadAttentionKernel {
 /// Factory for [`MultiHeadAttentionKernel`], reading the contrib-op attributes.
 pub struct MultiHeadAttentionFactory;
 
+/// Why this kernel cannot run a given `MultiHeadAttention` node, if it cannot.
+///
+/// Answered at *claim* time: a rejection raised in the factory instead arrives
+/// after ORT has compiled the node onto this EP and is a hard session failure
+/// that no fallback recovers from. Implemented by running the factory's own
+/// attribute parse, so the two cannot disagree.
+pub(crate) fn unsupported_reason(node: &Node) -> Option<String> {
+    attributes_from_node(node).err().map(|e| e.to_string())
+}
+
+fn attributes_from_node(node: &Node) -> Result<MultiHeadAttentionKernel> {
+    let num_heads = node
+        .attr("num_heads")
+        .and_then(|a| a.as_int())
+        .ok_or_else(|| {
+            EpError::KernelFailed(
+                "MultiHeadAttention: missing required `num_heads` attribute".into(),
+            )
+        })?;
+    if num_heads <= 0 {
+        return Err(EpError::KernelFailed(format!(
+            "MultiHeadAttention: num_heads must be > 0, got {num_heads}"
+        )));
+    }
+    // Defensive, not load-bearing: ORT does not stamp this attribute (a
+    // real session was instrumented to confirm it arrives absent). But both
+    // ORT's kernels and ours read an explicit `scale = 0` as "use
+    // 1/sqrt(head_size)" rather than literally, so a zero taken at face
+    // value would zero every score silently. `> 0` is deliberately broader
+    // than ORT's `== 0`, since a negative scale is meaningless.
+    let scale = node
+        .attr("scale")
+        .and_then(|a| a.as_float())
+        .filter(|s| *s > 0.0);
+    let mask_filter_value = node
+        .attr("mask_filter_value")
+        .and_then(|a| a.as_float())
+        .unwrap_or(-10000.0);
+    let unidirectional = node
+        .attr("unidirectional")
+        .and_then(|a| a.as_int())
+        .unwrap_or(0)
+        == 1;
+    Ok(MultiHeadAttentionKernel {
+        num_heads: num_heads as usize,
+        scale,
+        mask_filter_value,
+        unidirectional,
+    })
+}
+
 impl KernelFactory for MultiHeadAttentionFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let num_heads = node
-            .attr("num_heads")
-            .and_then(|a| a.as_int())
-            .ok_or_else(|| {
-                EpError::KernelFailed(
-                    "MultiHeadAttention: missing required `num_heads` attribute".into(),
-                )
-            })?;
-        if num_heads <= 0 {
-            return Err(EpError::KernelFailed(format!(
-                "MultiHeadAttention: num_heads must be > 0, got {num_heads}"
-            )));
-        }
-        let scale = node.attr("scale").and_then(|a| a.as_float());
-        let mask_filter_value = node
-            .attr("mask_filter_value")
-            .and_then(|a| a.as_float())
-            .unwrap_or(-10000.0);
-        let unidirectional = node
-            .attr("unidirectional")
-            .and_then(|a| a.as_int())
-            .unwrap_or(0)
-            == 1;
-        Ok(Box::new(MultiHeadAttentionKernel {
-            num_heads: num_heads as usize,
-            scale,
-            mask_filter_value,
-            unidirectional,
-        }))
+        Ok(Box::new(attributes_from_node(node)?))
     }
 }
 
