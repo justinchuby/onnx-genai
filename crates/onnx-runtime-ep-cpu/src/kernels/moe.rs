@@ -7,6 +7,9 @@
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
+// Only the MLAS bucketing and the `#[cfg(test)]` reference algorithm still
+// need an ordered map; the driver itself orders by expert through `RoutingPlan`.
+#[cfg(any(feature = "mlas", test))]
 use std::collections::BTreeMap;
 
 use super::check_arity;
