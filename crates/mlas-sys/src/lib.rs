@@ -136,6 +136,15 @@ unsafe extern "C" {
     /// Vectorized fused SiLU over `n` contiguous f32s. MLAS runtime-dispatches
     /// to its one-pass AVX-512F kernel when supported.
     fn mlas_compute_silu(input: *const f32, output: *mut f32, n: usize);
+    /// Vectorized `tanh` over `n` contiguous f32s — the same polynomial ONNX
+    /// Runtime's own `Tanh` CPU kernel calls.
+    fn mlas_compute_tanh(input: *const f32, output: *mut f32, n: usize);
+    /// Vectorized `erf` over `n` contiguous f32s — the same polynomial ONNX
+    /// Runtime's own `Erf` CPU kernel calls.
+    fn mlas_compute_erf(input: *const f32, output: *mut f32, n: usize);
+    /// Vectorized exact (erf-based) GELU over `n` contiguous f32s. Input and
+    /// output must not overlap.
+    fn mlas_compute_gelu_erf(input: *const f32, output: *mut f32, n: usize);
     /// Row-wise softmax over `n` rows of `d` contiguous f32s, single-threaded,
     /// using MLAS's SIMD max reduction and polynomial exp.
     fn mlas_compute_softmax_in_place(data: *mut f32, n: usize, d: usize);
@@ -732,6 +741,65 @@ pub fn compute_silu(input: &[f32], output: &mut [f32]) {
     // SAFETY: both slices are valid for `n` contiguous f32s; MLAS reads `input`
     // and writes `output`, and Rust's borrow rules prove they do not alias.
     unsafe { mlas_compute_silu(input.as_ptr(), output.as_mut_ptr(), input.len()) };
+}
+
+/// Compute elementwise `tanh` over equal-length contiguous f32 slices using
+/// MLAS's SIMD polynomial — the same one ONNX Runtime's `Tanh` CPU kernel
+/// calls. MLAS dispatches by ISA at runtime, so which kernel runs (and hence
+/// the exact bits) depends on the host. Single threaded; callers shard
+/// across threads themselves.
+pub fn compute_tanh(input: &[f32], output: &mut [f32]) {
+    assert_eq!(
+        input.len(),
+        output.len(),
+        "compute_tanh input and output must have equal length"
+    );
+    if input.is_empty() {
+        return;
+    }
+    // SAFETY: both slices are valid for `n` contiguous f32s; MLAS reads `input`
+    // and writes `output`, and Rust's borrow rules prove they do not alias.
+    unsafe { mlas_compute_tanh(input.as_ptr(), output.as_mut_ptr(), input.len()) };
+}
+
+/// Compute elementwise `erf` over equal-length contiguous f32 slices using
+/// MLAS's SIMD polynomial — the same one ONNX Runtime's `Erf` CPU kernel
+/// calls. Which kernel runs depends on MLAS's runtime ISA dispatch.
+/// Single threaded; callers shard across threads themselves.
+pub fn compute_erf(input: &[f32], output: &mut [f32]) {
+    assert_eq!(
+        input.len(),
+        output.len(),
+        "compute_erf input and output must have equal length"
+    );
+    if input.is_empty() {
+        return;
+    }
+    // SAFETY: both slices are valid for `n` contiguous f32s; MLAS reads `input`
+    // and writes `output`, and Rust's borrow rules prove they do not alias.
+    unsafe { mlas_compute_erf(input.as_ptr(), output.as_mut_ptr(), input.len()) };
+}
+
+/// Compute elementwise exact GELU `x * 0.5 * (1 + erf(x / sqrt(2)))` over
+/// equal-length contiguous f32 slices, fused in one MLAS pass.
+///
+/// MLAS requires that input and output not overlap (`mlas.h:1166`); the
+/// `&[f32]` / `&mut [f32]` signature makes that unrepresentable.
+///
+/// Single threaded; callers shard across threads themselves.
+pub fn compute_gelu_erf(input: &[f32], output: &mut [f32]) {
+    assert_eq!(
+        input.len(),
+        output.len(),
+        "compute_gelu_erf input and output must have equal length"
+    );
+    if input.is_empty() {
+        return;
+    }
+    // SAFETY: both slices are valid for `n` contiguous f32s; MLAS reads `input`
+    // and writes `output`, and Rust's borrow rules prove they do not alias —
+    // which is also what discharges MLAS's no-overlap precondition.
+    unsafe { mlas_compute_gelu_erf(input.as_ptr(), output.as_mut_ptr(), input.len()) };
 }
 
 /// Row-wise in-place softmax, replacing a scalar `expf` loop: normalizes `n` rows of
