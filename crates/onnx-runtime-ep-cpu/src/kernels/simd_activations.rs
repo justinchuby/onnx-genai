@@ -302,17 +302,46 @@ fn par_chunk_len(len: usize, threads: usize) -> Option<usize> {
 /// makes the split independent of the machine, so the chunk boundaries (and
 /// therefore the bits) do not move when the session is reconfigured.
 ///
-/// [`PAR_MIN_CHUNK`] is still the floor, so a chunk is never too short to be
-/// worth dispatching or to stay on the vector path. The cap keeps a very long
-/// slice from turning into thousands of tiny tasks.
+/// [`HOST_MIN_CHUNK`] is the floor, so a chunk is never too short to be worth
+/// dispatching or to stay on the vector path; this cap is the other end, and
+/// keeps a very long slice from turning into thousands of tiny tasks. Raising
+/// it to 256 or 1024 measured within noise of 64 at every size swept, so 64 —
+/// four tasks per thread on a sixteen-thread session, enough for the host to
+/// balance with — is the one that dispatches least.
 const MAX_HOST_CHUNKS: usize = 64;
 
-/// Chunk length and count for the host-pool split, or `None` to stay serial.
+/// Length below which the host split is not worth dispatching.
+///
+/// Sixteen times lower than [`PAR_MIN_LEN`], and for a concrete reason: that
+/// constant pays for waking rayon's workers, and ORT's intra-op workers are
+/// already awake — they spin. Measured at `intra_op = 16` against ORT's own
+/// CPU EP, splitting a 256 Ki slice on the host pool instead of leaving it
+/// whole moved `Gelu` from 0.15x to 0.94x, `FastGelu` 0.11x to 0.64x, `Erf`
+/// 0.24x to 1.33x and `Sqrt` 0.19x to 0.91x. At 64 Ki the split still helps
+/// (`Tanh` 0.40x to 1.36x, `Relu` 0.61x to 1.12x); at 16 Ki it stopped
+/// mattering, every gate measuring within noise of every other, so this is the
+/// last length where the evidence is one-sided.
+const HOST_MIN_LEN: usize = 65_536;
+
+/// Shortest chunk worth handing to one of the host's threads.
+///
+/// [`PAR_MIN_CHUNK`] is 256 Ki because a rayon wake-up costs ~50 us. A host
+/// task costs a fraction of that, and the sweep is monotone in this direction:
+/// at `intra_op = 16` over 64 Ki - 1 Mi, dropping the floor from 256 Ki to
+/// 64 Ki to 16 Ki to 4 Ki improved almost every op at almost every size
+/// (`Erf` at 256 Ki: 0.18x, 0.33x, 0.79x, 1.02x against ORT; `Gelu`: 0.16x,
+/// 0.31x, 0.90x, 0.98x). 4 Ki is where it flattened.
+const HOST_MIN_CHUNK: usize = 4_096;
+
+/// Chunk length and count for the host-pool split, or `None` to stay whole.
 #[inline]
 fn host_chunk_len(len: usize) -> Option<(usize, usize)> {
+    if len < HOST_MIN_LEN {
+        return None;
+    }
     let chunk = len
         .div_ceil(MAX_HOST_CHUNKS)
-        .max(PAR_MIN_CHUNK)
+        .max(HOST_MIN_CHUNK)
         .next_multiple_of(8);
     (chunk < len).then(|| (chunk, len.div_ceil(chunk)))
 }
@@ -320,13 +349,13 @@ fn host_chunk_len(len: usize) -> Option<(usize, usize)> {
 /// [`host_chunk_len`] for the bias-fused kernels: whole multiples of `width`.
 #[inline]
 fn host_chunk_len_rows(len: usize, width: usize) -> Option<(usize, usize)> {
-    if width == 0 {
+    if width == 0 || len < HOST_MIN_LEN {
         return None;
     }
     let rows = len
         .div_ceil(width)
         .div_ceil(MAX_HOST_CHUNKS)
-        .max(PAR_MIN_CHUNK.div_ceil(width));
+        .max(HOST_MIN_CHUNK.div_ceil(width));
     let chunk = rows.checked_mul(width)?;
     (chunk < len).then(|| (chunk, len.div_ceil(chunk)))
 }
@@ -454,7 +483,7 @@ where
     // a 4096-element decode call cost ~1.4 us, which is more than the whole
     // call. Measured as a uniform 0.6-0.8x regression on every short case
     // until this check moved above it.
-    if len < PAR_MIN_LEN || force_serial() {
+    if len < HOST_MIN_LEN || force_serial() {
         body(input, output);
         return;
     }
@@ -464,15 +493,28 @@ where
         body(input, output);
         return;
     }
-    // Prefer the host's pool over ours whenever the host offered one. Ours
-    // would be a *second* pool on the same cores: measured 1.5-3.1x slower
-    // than staying serial at 1 Mi under an `intra_op = 16` session.
-    if let Some(host) = onnx_runtime_ep_api::host_parallel::current() {
-        if let Some((chunk, count)) = host_chunk_len(len) {
-            note_parallel_dispatch();
-            run_on_host(host, input, output, chunk, count, &body);
-            return;
+    // Prefer the host's pool over ours whenever the host has one. Ours would
+    // be a *second* pool on the same cores: measured 1.5-3.1x slower than
+    // staying serial at 1 Mi under an `intra_op = 16` session.
+    //
+    // A host pool of *one* thread is the opposite case. It is not using the
+    // machine, so there is nothing to contend with and our own pool is the
+    // right tool: at `intra_op = 1`, rayon beat borrowing ORT's single thread
+    // by 2-9x over 1-4 Mi. `HostWidth` is observed rather than assumed, so
+    // each session gets the answer that is true for it.
+    if let Some(host) = onnx_runtime_ep_api::host_parallel::current()
+        && host.width() != onnx_runtime_ep_api::HostWidth::Serial
+    {
+        match host_chunk_len(len) {
+            Some((chunk, count)) => {
+                note_parallel_dispatch();
+                run_on_host(host, input, output, chunk, count, &body);
+            }
+            None => body(input, output),
         }
+        return;
+    }
+    if len < PAR_MIN_LEN {
         body(input, output);
         return;
     }
@@ -533,11 +575,13 @@ pub(crate) fn run_chunked_fn(input: &[f32], output: &mut [f32], body: fn(&[f32],
 pub(crate) fn clip_chunked(input: &[f32], output: &mut [f32], minimum: f32, maximum: f32) {
     // Take the serial decision here, so the common short case is a direct call
     // instead of one through a closure the optimiser can no longer see into.
-    if input.len() < PAR_MIN_LEN
+    if input.len() < HOST_MIN_LEN
         || force_serial()
         || onnx_runtime_ep_api::host_parallel::in_host_task()
         || rayon::current_thread_index().is_some()
     {
+        // Short, or already on a worker: one direct call, with no closure for
+        // the optimiser to lose sight of.
         mlas_sys::compute_clip(input, output, minimum, maximum);
         return;
     }
@@ -564,7 +608,7 @@ where
     F: Fn(&[f32], &mut [f32]) + Sync + Send,
 {
     let len = input.len();
-    if len < PAR_MIN_LEN || width == 0 || force_serial() {
+    if len < HOST_MIN_LEN || width == 0 || force_serial() {
         body(input, output);
         return;
     }
@@ -572,11 +616,16 @@ where
         body(input, output);
         return;
     }
-    if let Some(host) = onnx_runtime_ep_api::host_parallel::current() {
-        if let Some((chunk, count)) = host_chunk_len_rows(len, width) {
-            run_on_host(host, input, output, chunk, count, &body);
-            return;
+    if let Some(host) = onnx_runtime_ep_api::host_parallel::current()
+        && host.width() != onnx_runtime_ep_api::HostWidth::Serial
+    {
+        match host_chunk_len_rows(len, width) {
+            Some((chunk, count)) => run_on_host(host, input, output, chunk, count, &body),
+            None => body(input, output),
         }
+        return;
+    }
+    if len < PAR_MIN_LEN {
         body(input, output);
         return;
     }
@@ -4161,14 +4210,41 @@ mod host_pool_split {
         });
     }
 
+    /// A host that has really been seen to use more than one thread.
+    static PARALLEL_WIDTH: std::sync::atomic::AtomicU8 =
+        std::sync::atomic::AtomicU8::new(host_parallel::WIDTH_PARALLEL);
+
+    /// A host whose pool turned out to have no workers of its own.
+    static SERIAL_WIDTH: std::sync::atomic::AtomicU8 =
+        std::sync::atomic::AtomicU8::new(host_parallel::WIDTH_SERIAL);
+
     fn fake_host() -> HostParallel {
-        // SAFETY: `threaded_host` never dereferences its `host` argument.
-        unsafe { HostParallel::new(core::ptr::null_mut(), threaded_host) }
+        // SAFETY: `threaded_host` never dereferences its `host` argument, and
+        // the width cell is a `static`.
+        unsafe {
+            HostParallel::new(
+                core::ptr::null_mut(),
+                threaded_host,
+                core::ptr::from_ref(&PARALLEL_WIDTH),
+            )
+        }
+    }
+
+    /// The same host, but known to have a single thread.
+    fn serial_host_handle() -> HostParallel {
+        // SAFETY: as `fake_host`.
+        unsafe {
+            HostParallel::new(
+                core::ptr::null_mut(),
+                threaded_host,
+                core::ptr::from_ref(&SERIAL_WIDTH),
+            )
+        }
     }
 
     /// Long enough to be split, and deliberately not a multiple of the chunk
     /// size, so the final chunk is short.
-    const N: usize = 3 * PAR_MIN_LEN + 37;
+    const N: usize = 5 * HOST_MIN_LEN + 37;
 
     fn probe(len: usize) -> Vec<f32> {
         (0..len)
@@ -4269,6 +4345,53 @@ mod host_pool_split {
         });
     }
 
+    /// Below the gate the slice stays whole even with a host installed: the
+    /// dispatch would cost more than the work it hands out.
+    #[test]
+    fn a_short_slice_is_not_dispatched() {
+        let n = HOST_MIN_LEN - 8;
+        let x = probe(n);
+        let mut y = vec![0.0f32; n];
+        reset_dispatched();
+        host_parallel::scope(fake_host(), || tanh_f32_slice(&x, &mut y));
+        assert_eq!(dispatched(), 0, "{n} elements should have stayed whole");
+
+        let mut want = vec![0.0f32; n];
+        serial_scope(|| tanh_f32_slice(&x, &mut want));
+        assert!(want.iter().zip(&y).all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+
+    /// A host pool with no workers is not using the machine, so ours may.
+    /// Borrowing its single thread instead measured 2-9x slower over 1-4 Mi at
+    /// `intra_op = 1`, so this is worth an assertion.
+    #[test]
+    fn a_serial_host_is_not_borrowed() {
+        if rayon::current_num_threads() < 2 {
+            eprintln!("skipped: single-threaded rayon pool cannot show the difference");
+            return;
+        }
+        let n = 2 * PAR_MIN_LEN;
+        let x = probe(n);
+        let mut y = vec![0.0f32; n];
+        reset_dispatched();
+        let before = parallel_dispatches();
+        host_parallel::scope(serial_host_handle(), || tanh_f32_slice(&x, &mut y));
+        assert_eq!(
+            dispatched(),
+            0,
+            "a one-thread host pool was borrowed anyway"
+        );
+        assert_eq!(
+            parallel_dispatches() - before,
+            1,
+            "the work should have gone to our own pool instead"
+        );
+
+        let mut want = vec![0.0f32; n];
+        serial_scope(|| tanh_f32_slice(&x, &mut want));
+        assert!(want.iter().zip(&y).all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+
     /// `serial_scope` has to keep suppressing the split on the host path too,
     /// or the f16/bf16 sandwich picks its measured regression back up.
     #[test]
@@ -4292,12 +4415,14 @@ mod host_pool_split {
             0,
             1,
             8,
-            PAR_MIN_CHUNK - 1,
+            HOST_MIN_CHUNK - 1,
+            HOST_MIN_CHUNK,
+            HOST_MIN_CHUNK + 1,
+            HOST_MIN_LEN - 1,
+            HOST_MIN_LEN,
+            HOST_MIN_LEN + 1,
             PAR_MIN_CHUNK,
-            PAR_MIN_CHUNK + 1,
-            PAR_MIN_LEN - 1,
             PAR_MIN_LEN,
-            PAR_MIN_LEN + 1,
             N,
             1 << 26,
             (1 << 26) + 13,
@@ -4306,7 +4431,8 @@ mod host_pool_split {
             if let Some((chunk, count)) = host_chunk_len(len) {
                 assert!(chunk < len, "chunk {chunk} !< len {len}");
                 assert_eq!(chunk % 8, 0, "chunk {chunk} is not a whole vector");
-                assert!(chunk >= PAR_MIN_CHUNK, "chunk {chunk} is too short");
+                assert!(len >= HOST_MIN_LEN, "split below the gate");
+                assert!(chunk >= HOST_MIN_CHUNK, "chunk {chunk} is too short");
                 assert!(chunk >= SIMD_MIN_LEN, "chunk {chunk} would go scalar");
                 assert_eq!(count, len.div_ceil(chunk));
                 assert!(
@@ -4319,12 +4445,19 @@ mod host_pool_split {
                 if let Some((chunk, count)) = host_chunk_len_rows(len, width) {
                     assert!(chunk < len, "rows: chunk {chunk} !< len {len}");
                     assert_eq!(chunk % width, 0, "rows: chunk {chunk} cuts width {width}");
-                    assert!(chunk >= PAR_MIN_CHUNK.min(len), "rows: chunk {chunk} short");
+                    assert!(len >= HOST_MIN_LEN, "rows: split below the gate");
+                    assert!(
+                        chunk >= HOST_MIN_CHUNK.min(len),
+                        "rows: chunk {chunk} short"
+                    );
                     assert_eq!(count, len.div_ceil(chunk));
                     assert!((count - 1) * chunk < len, "rows: empty final range");
                 }
             }
             assert_eq!(host_chunk_len_rows(len, 0), None, "width 0 must not split");
+            if len < HOST_MIN_LEN {
+                assert_eq!(host_chunk_len(len), None, "{len} is below the gate");
+            }
         }
     }
 }

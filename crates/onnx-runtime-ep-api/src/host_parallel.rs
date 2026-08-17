@@ -56,6 +56,31 @@
 //!   host's pool and stay serial instead of nesting.
 
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicU8, Ordering};
+
+/// How many threads the host's pool turned out to have.
+///
+/// The host runtime does not tell us, and it matters: a pool of one is not
+/// using the machine, so ours may. Rather than probe — which would cost a
+/// dispatch per session to answer a question the next real dispatch answers
+/// for free — the implementation *observes* its own first dispatch and records
+/// the result here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostWidth {
+    /// No dispatch has completed yet.
+    Unknown,
+    /// Every body ran on the dispatching thread: the host has no workers.
+    Serial,
+    /// At least one body ran on another thread.
+    Parallel,
+}
+
+/// Nothing observed yet.
+pub const WIDTH_UNKNOWN: u8 = 0;
+/// The host pool ran everything inline.
+pub const WIDTH_SERIAL: u8 = 1;
+/// The host pool used at least one other thread.
+pub const WIDTH_PARALLEL: u8 = 2;
 
 /// Runs `body(i)` for every `i` in `0..total` on the host's threads.
 ///
@@ -77,6 +102,9 @@ pub type HostParallelForFn =
 pub struct HostParallel {
     host: *mut c_void,
     run: HostParallelForFn,
+    /// Where the implementation records [`HostWidth`], or null if it never
+    /// will — in which case the pool is assumed parallel.
+    width: *const AtomicU8,
 }
 
 impl core::fmt::Debug for HostParallel {
@@ -96,8 +124,36 @@ impl HostParallel {
     /// `run` must honour the contract on [`HostParallelForFn`] for that
     /// pointer. Installing it with [`scope`] is what bounds the first half;
     /// the second half is on the implementer.
-    pub const unsafe fn new(host: *mut c_void, run: HostParallelForFn) -> Self {
-        Self { host, run }
+    ///
+    /// `width` must be null or point at a cell that outlives this handle, and
+    /// that only ever holds [`WIDTH_UNKNOWN`], [`WIDTH_SERIAL`] or
+    /// [`WIDTH_PARALLEL`].
+    pub const unsafe fn new(
+        host: *mut c_void,
+        run: HostParallelForFn,
+        width: *const AtomicU8,
+    ) -> Self {
+        Self { host, run, width }
+    }
+
+    /// What the last completed dispatch said about the host pool's width.
+    ///
+    /// [`HostWidth::Serial`] is the interesting answer: it means the host's
+    /// pool has no workers of its own, so borrowing it would serialise us for
+    /// nothing and our own pool is free to use the machine instead.
+    #[must_use]
+    pub fn width(&self) -> HostWidth {
+        if self.width.is_null() {
+            return HostWidth::Parallel;
+        }
+        // SAFETY: `new`'s contract puts the validity of this pointer on the
+        // installer, and `scope` bounds it to the extent the handle is
+        // reachable.
+        match unsafe { &*self.width }.load(Ordering::Relaxed) {
+            WIDTH_SERIAL => HostWidth::Serial,
+            WIDTH_PARALLEL => HostWidth::Parallel,
+            _ => HostWidth::Unknown,
+        }
     }
 
     /// Runs `body(0..total)` on the host's pool and waits for all of it.
@@ -238,8 +294,42 @@ mod tests {
     }
 
     fn serial() -> HostParallel {
-        // SAFETY: `serial_host` never dereferences its `host` argument.
-        unsafe { HostParallel::new(core::ptr::null_mut(), serial_host) }
+        // SAFETY: `serial_host` never dereferences its `host` argument, and a
+        // null width cell is explicitly allowed.
+        unsafe { HostParallel::new(core::ptr::null_mut(), serial_host, core::ptr::null()) }
+    }
+
+    fn with_width(cell: &AtomicU8) -> HostParallel {
+        // SAFETY: as `serial`, plus `cell` outlives every use below.
+        unsafe {
+            HostParallel::new(
+                core::ptr::null_mut(),
+                serial_host,
+                core::ptr::from_ref(cell),
+            )
+        }
+    }
+
+    #[test]
+    fn a_handle_without_a_width_cell_reads_as_parallel() {
+        assert_eq!(serial().width(), HostWidth::Parallel);
+    }
+
+    #[test]
+    fn width_reflects_the_cell() {
+        let cell = AtomicU8::new(WIDTH_UNKNOWN);
+        let host = with_width(&cell);
+        assert_eq!(host.width(), HostWidth::Unknown);
+        cell.store(WIDTH_SERIAL, Ordering::Relaxed);
+        assert_eq!(host.width(), HostWidth::Serial);
+        cell.store(WIDTH_PARALLEL, Ordering::Relaxed);
+        assert_eq!(host.width(), HostWidth::Parallel);
+        cell.store(200, Ordering::Relaxed);
+        assert_eq!(
+            host.width(),
+            HostWidth::Unknown,
+            "an unknown code is not a promise"
+        );
     }
 
     #[test]

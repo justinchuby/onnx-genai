@@ -45,7 +45,7 @@ pub mod weight;
 pub use abi::{LegacyOrtEp, PluginCompiledKernel, PluginExecutionPlan, SubgraphClaim};
 pub use epcontext::{EpContext, EpContextRegistry, build_ep_context_registry};
 pub use error::{EpError, Result};
-pub use host_parallel::HostParallel;
+pub use host_parallel::{HostParallel, HostWidth};
 pub use kernel::{
     ARG_BYTES, ARG_DEVICE, ARG_FLOPS, ARG_KERNEL_VARIANT, ARG_KERNEL_VARIANT_REASON,
     CAT_KERNEL_WORKER, CaptureSupport, ClaimPreference, Cost, Kernel, KernelInput, KernelMatch,
