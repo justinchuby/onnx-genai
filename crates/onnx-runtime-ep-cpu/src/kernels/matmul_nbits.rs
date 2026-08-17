@@ -16526,7 +16526,7 @@ mod tests {
                 let pb = &packed_bytes[start * k_blocks * blob..(start + len) * k_blocks * blob];
                 let sc = &scales[start * k_blocks..(start + len) * k_blocks];
                 let pack = mlas_sys::SQNBitPackedB::new(len, k, 4, block_size, comp, pb, sc, None)
-                        .expect("MLAS SQNBit int4 shard must pack");
+                    .expect("MLAS SQNBit int4 shard must pack");
                 (start, len, pack)
             })
             .collect();
@@ -16579,9 +16579,7 @@ mod tests {
             .max()
             .unwrap_or(0);
         let full_identical = bits(&o_serial) == bits(&o_full);
-        eprintln!(
-            "#1138 full_width vs sharded: byte_identical={full_identical} max_ulp={max_ulp}"
-        );
+        eprintln!("#1138 full_width vs sharded: byte_identical={full_identical} max_ulp={max_ulp}");
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(hw)
@@ -16599,21 +16597,21 @@ mod tests {
             pool.install(|| {
                 let mut out = vec![0.0f32; n];
                 for _ in 0..50 {
-                        run(&mut out);
+                    run(&mut out);
                 }
                 let mut samples = [0.0f64; 5];
                 for s in samples.iter_mut() {
-                        let iters = 500u32;
-                        let start = Instant::now();
-                        for _ in 0..iters {
-                            run(&mut out);
-                        }
-                        *s = start.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                    let iters = 500u32;
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        run(&mut out);
+                    }
+                    *s = start.elapsed().as_secs_f64() * 1e6 / iters as f64;
                 }
                 samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 eprintln!(
-                        "#1138 int4 M=1 K={k} N={n} shards={shards} hw={hw}t {label:16}: p50={:.3}ms",
-                        samples[2] / 1000.0,
+                    "#1138 int4 M=1 K={k} N={n} shards={shards} hw={hw}t {label:16}: p50={:.3}ms",
+                    samples[2] / 1000.0,
                 );
             });
         }
