@@ -15,10 +15,18 @@
 //!   `6×16` AVX2/FMA register microkernel + K/N cache blocking, parallelized
 //!   over column strips. Selected automatically with no cargo feature; falls
 //!   back to Generic when AVX2/FMA is absent.
-//! * **`Mlas`** (opt-in `mlas` feature on x86-64): vendored MLAS f32 SGEMM,
-//!   selected only with `NXRT_CPU_GEMM_BACKEND=mlas`. Multi-threaded — MLAS
-//!   partitions the GEMM and runs the tiles across the process Rayon pool — but
-//!   kept opt-in (not an automatic default) pending a later slice.
+//! * **`Mlas`** (the default `mlas` feature on x86-64): vendored MLAS f32
+//!   SGEMM, **auto-selected** on x86-64 whenever the feature is compiled in,
+//!   because it is still the fastest measured f32 GEMM here. Multi-threaded —
+//!   MLAS partitions the GEMM and runs the tiles across the process Rayon
+//!   pool. `NXRT_CPU_GEMM_BACKEND=generic|simd` selects a native route
+//!   instead, which is how `tests/native_vs_mlas_differential.rs` and
+//!   `benches/native_vs_mlas.rs` compare the two in one binary.
+//!
+//! `SimdX86` is therefore the route that runs on hosts built
+//! `--no-default-features --features full`, and the one that has to beat MLAS
+//! by the margin in `docs/performance/CPU_MLAS_MIGRATION.md` before MLAS can
+//! be dropped from this family.
 //!
 //! The batched / broadcast / 1-D-vector handling in [`matmul_dense`] is
 //! backend-agnostic; only the inner 2-D tile GEMM changes. The session also

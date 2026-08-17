@@ -243,7 +243,11 @@ pub const PLAN: &[PlanEntry] = &[
               native SimdX86 needs AVX2+FMA, native Generic needs nothing",
         threads: "MLAS partitions; tiles run on the mlas-sys work-stealing pool under the EP \
                   thread budget",
-        shape_gate: "all shapes on x86-64; NXRT_CPU_GEMM_BACKEND=generic|simd|mlas overrides",
+        shape_gate: "all shapes on x86-64; NXRT_CPU_GEMM_BACKEND=generic|simd|mlas overrides. \
+                     The native SimdX86 route additionally gates M=1 on \
+                     ONNX_GENAI_CPU_MM_SIMD_M1_GEMV (default off, #1116): on, it streams B in \
+                     place instead of packing panels reused zero times, which is 2.4x faster \
+                     native at 1x2048x2048 but still short of MLAS",
         graduation: Graduation::MlasBaseline,
     },
     PlanEntry {

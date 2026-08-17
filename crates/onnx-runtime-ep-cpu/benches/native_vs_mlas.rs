@@ -31,12 +31,31 @@
 //! Output is one tab-separated line per case, so two runs can be diffed:
 //!
 //! ```text
-//! family    case            native_ns  mlas_ns  ratio  verdict
+//! family  case  native_ns  mlas_ns  ratio  cpu_ratio  verdict
 //! ```
 //!
-//! `ratio` is `mlas / native`: above 1.0 means native is faster.
+//! `ratio` is `mlas / native` in **wall** time: above 1.0 means native is
+//! faster. `cpu_ratio` is the same quotient in **process CPU** time.
+//!
+//! # Why both clocks, and why the verdict uses wall
+//!
+//! These routes do not use the same number of threads. Our `x86_sgemm` GEMM
+//! parallelises over column strips on the Rayon pool; MLAS declines to
+//! parallelise some shapes (notably `M=1` decode, where the GEMV is
+//! bandwidth-bound and extra cores only add traffic). Judged on CPU time alone
+//! a native route that is *faster for the user* looks 10x worse purely because
+//! 32 workers each billed their share, which would block a graduation that
+//! should happen.
+//!
+//! Wall time is therefore the graduation criterion: it is the latency a token
+//! actually costs. CPU time is kept beside it because the opposite failure is
+//! just as real — a native route that "wins" by burning the whole machine
+//! regresses every concurrent session on the box. A large `ratio` with a small
+//! `cpu_ratio` means exactly that, and is a reason to look before graduating.
 
 use std::hint::black_box;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use onnx_runtime_ep_cpu::DispatchBackend;
 use onnx_runtime_ep_cpu::backend_ab;
@@ -52,13 +71,12 @@ const GRADUATION_RATIO: f64 = 1.05;
 /// two.
 const REPS: usize = 21;
 
-/// Process CPU time in seconds.
+/// Process CPU time in seconds, across all threads.
 ///
-/// Wall clock is the wrong instrument here. MLAS routes may use their own
-/// threading while the native baselines are serial, and a wall-clock
-/// comparison of those two would credit MLAS for parallelism this bench did
-/// not ask for, or penalise it for scheduling noise on a shared runner. CPU
-/// time counts the work actually done either way.
+/// Reported beside wall time rather than instead of it: CPU time counts the
+/// work actually done, so it catches a native route that only looks fast
+/// because it recruited every core, but it cannot by itself say whether a
+/// token got cheaper.
 #[cfg(unix)]
 fn cpu_seconds() -> f64 {
     // SAFETY: `getrusage` fills a fully-initialised `rusage` through the
@@ -71,81 +89,135 @@ fn cpu_seconds() -> f64 {
     seconds(usage.ru_utime) + seconds(usage.ru_stime)
 }
 
-/// Non-unix hosts fall back to wall clock, with the caveat above.
+/// Non-unix hosts have no cheap portable equivalent, so they report wall time
+/// only and print `-` for `cpu_ratio` rather than a number that is really the
+/// wall ratio again.
 #[cfg(not(unix))]
 fn cpu_seconds() -> f64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+    f64::NAN
+}
+
+/// Wall-clock seconds from a fixed process-local origin.
+fn wall_seconds() -> f64 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
+
+/// A paired measurement: latency and the machine-wide cost of achieving it.
+#[derive(Clone, Copy)]
+struct Timing {
+    wall: f64,
+    cpu: f64,
 }
 
 fn median(mut samples: Vec<f64>) -> f64 {
-    samples.sort_by(|a, b| a.partial_cmp(b).expect("timings are finite"));
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     samples[samples.len() / 2]
 }
 
-/// Run `a` and `b` interleaved `REPS` times and return their median seconds.
+/// Run `a` and `b` interleaved `REPS` times and return their median timings.
 ///
 /// Interleaving is what makes the pair comparable: a machine that slows down
 /// halfway through slows both routes down together, and the median of pairs
 /// absorbs it. Running all of A and then all of B does not.
-fn interleaved<A: FnMut(), B: FnMut()>(mut a: A, mut b: B, iters: usize) -> (f64, f64) {
+///
+/// Wall and CPU medians are taken independently. That is deliberate: each is a
+/// robust summary of its own distribution, and the alternative — picking the
+/// pair at the median wall sample — would report a CPU figure from a single
+/// repetition and inherit all of its noise.
+fn interleaved<A: FnMut(), B: FnMut()>(mut a: A, mut b: B, iters: usize) -> (Timing, Timing) {
     for _ in 0..3 {
         a();
         b();
     }
-    let mut a_samples = Vec::with_capacity(REPS);
-    let mut b_samples = Vec::with_capacity(REPS);
+    let mut a_wall = Vec::with_capacity(REPS);
+    let mut a_cpu = Vec::with_capacity(REPS);
+    let mut b_wall = Vec::with_capacity(REPS);
+    let mut b_cpu = Vec::with_capacity(REPS);
     for _ in 0..REPS {
-        let t0 = cpu_seconds();
+        let (w0, c0) = (wall_seconds(), cpu_seconds());
         for _ in 0..iters {
             a();
         }
-        let t1 = cpu_seconds();
+        let (w1, c1) = (wall_seconds(), cpu_seconds());
         for _ in 0..iters {
             b();
         }
-        let t2 = cpu_seconds();
-        a_samples.push(t1 - t0);
-        b_samples.push(t2 - t1);
+        let (w2, c2) = (wall_seconds(), cpu_seconds());
+        a_wall.push(w1 - w0);
+        a_cpu.push(c1 - c0);
+        b_wall.push(w2 - w1);
+        b_cpu.push(c2 - c1);
     }
-    (median(a_samples), median(b_samples))
+    (
+        Timing {
+            wall: median(a_wall),
+            cpu: median(a_cpu),
+        },
+        Timing {
+            wall: median(b_wall),
+            cpu: median(b_cpu),
+        },
+    )
 }
 
 /// One row of output, with the graduation rule applied.
-fn report(family: KernelFamily, case: &str, native_s: f64, mlas_s: Option<f64>, elems: f64) {
+fn report(family: KernelFamily, case: &str, native: Timing, mlas: Option<Timing>, elems: f64) {
     let ns = |s: f64| s * 1e9 / elems;
-    let Some(mlas_s) = mlas_s else {
+    let Some(mlas) = mlas else {
         println!(
-            "{}\t{case}\t{:.4}\t-\t-\tno-mlas",
+            "{}\t{case}\t{:.4}\t-\t-\t-\tno-mlas",
             family.name(),
-            ns(native_s)
+            ns(native.wall)
         );
         return;
     };
-    let ratio = if native_s > 0.0 {
-        mlas_s / native_s
-    } else {
-        f64::NAN
-    };
+    let quotient = |m: f64, n: f64| if n > 0.0 { m / n } else { f64::NAN };
+    let ratio = quotient(mlas.wall, native.wall);
+    let cpu_ratio = quotient(mlas.cpu, native.cpu);
     // `graduates` is the only claim this bench makes: it says the measurement
     // clears the bar, not that the replacement is correct. Correctness is
     // `tests/native_vs_mlas_differential.rs`; both are required.
     let verdict = if ratio >= GRADUATION_RATIO {
-        "native-graduates"
+        // A latency win bought with a large multiple of the machine is not
+        // free, so it is flagged rather than waved through. The threshold is
+        // the graduation ratio again: native may spend up to 5% more CPU per
+        // unit of work without comment.
+        if cpu_ratio.is_finite() && cpu_ratio < 1.0 / GRADUATION_RATIO {
+            "native-graduates-but-costs-more-cpu"
+        } else {
+            "native-graduates"
+        }
     } else if ratio >= 1.0 {
         "native-faster-but-under-5%"
     } else {
         "keep-mlas"
     };
+    let cpu_ratio = if cpu_ratio.is_finite() {
+        format!("{cpu_ratio:.3}")
+    } else {
+        "-".to_string()
+    };
     println!(
-        "{}\t{case}\t{:.4}\t{:.4}\t{ratio:.3}\t{verdict}",
+        "{}\t{case}\t{:.4}\t{:.4}\t{ratio:.3}\t{cpu_ratio}\t{verdict}",
         family.name(),
-        ns(native_s),
-        ns(mlas_s)
+        ns(native.wall),
+        ns(mlas.wall)
     );
+}
+
+/// The native GEMM route this host will actually measure.
+///
+/// Named in the output because a GEMM ratio is unreadable without it: the same
+/// table means "our AVX2 SGEMM trails MLAS" on one host and "our portable
+/// fallback trails MLAS" on a host without AVX2/FMA, and only the first is a
+/// finding about the kernel we ship.
+fn gemm_native_backend() -> onnx_runtime_ep_cpu::CpuBackend {
+    backend_ab::gemm_backends()
+        .into_iter()
+        .rev()
+        .find(|b| backend_ab::gemm_ledger_backend(*b) != DispatchBackend::Mlas)
+        .expect("gemm_backends always includes a native route")
 }
 
 fn bench_gemm() {
@@ -160,22 +232,13 @@ fn bench_gemm() {
         ("odd_37x1023x511", 37, 1023, 511),
     ];
 
-    let backends = backend_ab::gemm_backends();
-    let is_mlas = |b: onnx_runtime_ep_cpu::CpuBackend| {
-        backend_ab::gemm_ledger_backend(b) == DispatchBackend::Mlas
-    };
     // The *best* native route, not the portable one. Graduation is about
     // whether our own kernels can replace MLAS, and measuring a scalar
-    // reference against a vectorised MLAS answers a question nobody asked:
-    // `gemm_backends()` orders native routes weakest-first, so the last
-    // non-MLAS entry is the one a replacement would actually ship.
-    let native = backends
-        .iter()
-        .copied()
-        .rev()
-        .find(|b| !is_mlas(*b))
-        .expect("gemm_backends always includes a native route");
-    let mlas = backends.iter().copied().find(|b| is_mlas(*b));
+    // reference against a vectorised MLAS answers a question nobody asked.
+    let native = gemm_native_backend();
+    let mlas = backend_ab::gemm_backends()
+        .into_iter()
+        .find(|b| backend_ab::gemm_ledger_backend(*b) == DispatchBackend::Mlas);
 
     for (case, m, k, n) in cases {
         let a: Vec<f32> = (0..m * k)
@@ -336,10 +399,16 @@ fn bench_transcendentals() {
 fn main() {
     println!("# native vs MLAS, one binary, interleaved, median of {REPS} reps");
     println!(
-        "# mlas_linked={}  graduation_ratio={GRADUATION_RATIO}",
-        backend_ab::mlas_available()
+        "# mlas_linked={}  graduation_ratio={GRADUATION_RATIO}  threads={}",
+        backend_ab::mlas_available(),
+        rayon::current_num_threads()
     );
-    println!("family\tcase\tnative_ns_per_elem\tmlas_ns_per_elem\tratio\tverdict");
+    // Times are per unit of work, so shapes of different sizes are comparable:
+    // per multiply-accumulate for GEMM, per element for softmax and the
+    // transcendentals. `ratio` is wall, `cpu_ratio` is process CPU; both are
+    // mlas/native, so above 1.0 favours native.
+    println!("# gemm native backend = {:?}", gemm_native_backend());
+    println!("family\tcase\tnative_ns_per_unit\tmlas_ns_per_unit\tratio\tcpu_ratio\tverdict");
     bench_gemm();
     bench_softmax();
     bench_transcendentals();

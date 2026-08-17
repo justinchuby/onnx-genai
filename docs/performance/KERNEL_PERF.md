@@ -52,9 +52,12 @@ honest current gap is approximately 2–5×, not an unqualified default-thread
 comparison. Add, ReduceMean, and Gather are single-threaded internally and are
 reported as such. The next port target remains quantized MatMul.
 
-## Multi-threaded vendored MLAS (`NXRT_CPU_GEMM_BACKEND=mlas`)
+## Multi-threaded vendored MLAS (default on x86-64)
 
-The opt-in `mlas` feature (`CpuBackend::Mlas`, x86-64) now runs **multi-threaded**.
+The `mlas` feature (`CpuBackend::Mlas`, x86-64) is **on by default** and runs
+**multi-threaded**. `NXRT_CPU_GEMM_BACKEND=generic|simd` selects a native route
+instead; `--no-default-features --features full` drops MLAS from the build
+entirely. See `docs/performance/CPU_MLAS_MIGRATION.md`.
 MLAS's high-level `MlasGemmBatch` does its own cache-aware M/N tile partitioning
 and dispatches the tiles through `MlasTrySimpleParallel` /
 `MlasGetMaximumThreadCount`. In the standalone `BUILD_MLAS_NO_ONNXRUNTIME` build

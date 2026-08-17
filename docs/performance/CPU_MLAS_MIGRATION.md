@@ -179,9 +179,17 @@ Unpacked:
   in which case quantify the deviation against a reference and say so.
 - **5%, not "faster".** Measured with
   `cargo bench -p onnx-runtime-ep-cpu --bench native_vs_mlas`, which runs both
-  routes interleaved in one process and reports the median of 21 repetitions in
-  **process CPU time**, then prints the verdict per case:
-  `native-graduates` / `native-faster-but-under-5%` / `keep-mlas`.
+  routes interleaved in one process and reports the median of 21 repetitions,
+  then prints the verdict per case: `native-graduates` /
+  `native-faster-but-under-5%` / `keep-mlas`.
+- **On wall time, with CPU time beside it.** The two routes do not use the same
+  number of threads — our `x86_sgemm` parallelises over column strips while MLAS
+  declines to parallelise some shapes — so a CPU-time-only comparison would
+  block a graduation that genuinely lowers latency. Wall time decides. Process
+  CPU time is printed as `cpu_ratio` because the opposite failure is equally
+  real: a route that "wins" by recruiting the whole machine regresses every
+  concurrent session on the box, and the bench labels that
+  `native-graduates-but-costs-more-cpu` rather than passing it silently.
 - **Repeatable, outside noise.** Cross-worktree comparison on a shared runner
   showed a uniform 0.70–0.82× offset on *byte-identical* kernels — larger than
   most kernel wins. One binary, interleaved, or it does not count.
@@ -200,30 +208,73 @@ did not.
 ### Current gap, measured
 
 `cargo bench -p onnx-runtime-ep-cpu --bench native_vs_mlas`, Linux x86-64,
-AVX2, 32 cores, best native route vs MLAS, one binary, interleaved, median of
-21 reps, process CPU time. `ratio = mlas / native`; **above 1.0 means native is
+AVX2+FMA, 32 cores, one binary, interleaved, median of 21 reps. Native route is
+`SimdX86` (the AVX2 `x86_sgemm` we ship, not the portable fallback) for GEMM.
+Times are per unit of work — per multiply-accumulate for GEMM, per element
+otherwise. `ratio = mlas / native` in wall time; **above 1.0 means native is
 faster**.
 
-| family | case | native ns/elem | MLAS ns/elem | ratio | verdict |
-|---|---|---|---|---|---|
-| `matmul_f32` | decode 1×2048×2048 | 4.90 | 0.42 | 0.085 | keep-mlas |
-| `matmul_f32` | decode 1×4096×4096 | 3.61 | 1.45 | 0.402 | keep-mlas |
-| `matmul_f32` | 16×512×512 | 2.70 | 0.050 | 0.019 | keep-mlas |
-| `matmul_f32` | prefill 128×2048×2048 | 0.162 | 0.059 | 0.364 | keep-mlas |
-| `matmul_f32` | odd 37×1023×511 | 0.939 | 0.052 | 0.056 | keep-mlas |
-| `softmax` | decode 1×32000 | 50.6 | 5.58 | 0.110 | keep-mlas |
-| `softmax` | attn 32×512 | 50.3 | 5.74 | 0.114 | keep-mlas |
-| `softmax` | prefill 128×4096 | 50.5 | 5.86 | 0.116 | keep-mlas |
-| `activations` | erf 4 Ki | 13.7 | 8.13 | 0.594 | keep-mlas |
-| `activations` | erf 1 Mi | 8.00 | 5.74 | 0.718 | keep-mlas |
-| `activations` | gelu-exact 4 Ki | 15.7 | 11.7 | 0.742 | keep-mlas |
-| `activations` | gelu-exact 1 Mi | 8.46 | 7.34 | 0.868 | keep-mlas |
+| family | case | native ns/unit | MLAS ns/unit | ratio | cpu_ratio | verdict |
+|---|---|---|---|---|---|---|
+| `matmul_f32` | decode 1×2048×2048 | 0.194 | 0.028 | 0.146 | 0.088 | keep-mlas |
+| `matmul_f32` | decode 1×4096×4096 | 0.127 | 0.080 | 0.625 | 0.359 | keep-mlas |
+| `matmul_f32` | 16×512×512 | 0.111 | 0.005 | 0.046 | 0.022 | keep-mlas |
+| `matmul_f32` | prefill 128×2048×2048 | 0.0057 | 0.0038 | 0.662 | 0.363 | keep-mlas |
+| `matmul_f32` | odd 37×1023×511 | 0.037 | 0.004 | 0.108 | 0.044 | keep-mlas |
+| `softmax` | decode 1×32000 | 5.13 | 0.51 | 0.100 | 0.099 | keep-mlas |
+| `softmax` | attn 32×512 | 5.12 | 0.54 | 0.106 | 0.106 | keep-mlas |
+| `softmax` | prefill 128×4096 | 5.16 | 0.55 | 0.106 | 0.106 | keep-mlas |
+| `activations` | erf 4 Ki | 1.21 | 0.83 | 0.691 | 0.691 | keep-mlas |
+| `activations` | erf 1 Mi | 0.57 | 0.36 | 0.620 | 0.672 | keep-mlas |
+| `activations` | gelu-exact 4 Ki | 1.41 | 1.22 | 0.868 | 0.868 | keep-mlas |
+| `activations` | gelu-exact 1 Mi | 0.65 | 0.54 | 0.841 | 0.861 | keep-mlas |
 
 This is the honest state of the programme: **no family measured here is ready to
-graduate**, and the ratios say where the work is. Activations are within 1.2–1.7×
-— reachable. Softmax is ~9× off but the cause is known and structural (scalar
-`exp`). f32 GEMM is 2.5–20× off and is a multi-year target, which is exactly why
-MLAS shipping by default matters in the meantime.
+graduate**, and the ratios say where the work is. Activations are within
+1.15–1.6× — reachable. Softmax is ~9–10× off but the cause is known and
+structural (scalar `exp`). f32 GEMM is 1.5–22× off depending on shape, and the
+spread is the finding: `SimdX86` is closest at the large shapes it was tuned for
+(0.63–0.66 at 4096-decode and 128-prefill) and furthest at small and
+awkwardly-shaped ones, where MLAS's packing and blocking amortise better.
+
+Two caveats a future agent should not have to rediscover. First, these numbers
+were taken on a **busy shared 32-core container**; repeat runs of the same
+binary moved the GEMM ratios by up to 2× (`prefill_128x2048x2048` read 0.338,
+0.561 and 0.662 across three consecutive runs) while softmax and activations
+were stable to ~2%. Treat the GEMM row as an order of magnitude, not a
+measurement, and re-run on a quiet pinned host before acting on it. Second, this
+bench calls `gemm_with_backend` directly, so **neither** route gets the
+prepacked constant weights that `matmul_dense` gives them in a real session.
+That is deliberate — it compares the kernels rather than the caching — but it
+means the bench understates both routes at inference time, and it is not the
+instrument for judging the prepack path.
+
+The comparison against #1116's dense-f32 work is not contradictory for this
+reason: that task measured the shipped path with prepacking on a quiet laptop
+and found parity at prefill, while this measures the raw kernels on a noisy
+shared box. Both are true of what they measured.
+
+### The one absorption already built but not switched on
+
+#1116 ported the mechanism behind MLAS's `SgemmKernelM1Avx` — stream B in place
+at M=1 rather than packing panels that are reused zero times — into
+`x86_sgemm::sgemm_simd`, but left it behind `ONNX_GENAI_CPU_MM_SIMD_M1_GEMV`,
+default **off**, pending a measurement. This bench is that instrument, so here
+is the measurement, same binary, same session, toggle the only difference:
+
+| case | ratio, toggle off | ratio, toggle on | native time change |
+|---|---|---|---|
+| decode 1×2048×2048 | 0.146 | **0.337** | 0.194 → 0.0796 ns/MAC (**2.4× faster**) |
+| decode 1×4096×4096 | 0.625 | **0.843** | 0.127 → 0.104 ns/MAC (1.2× faster) |
+| prefill 128×2048×2048 | 0.662 | 0.566 | unchanged (toggle only affects M=1) |
+
+The toggle is a **large, one-sided, mechanism-explained win on the shape that
+dominates decode**, and it moves nothing else. It still does not reach 1.05 on
+this host, so it does not *graduate* MLAS away — but it is the shortest path to
+the first f32 GEMM graduation, and turning it on by default is the obvious next
+slice. Deliberately not done here: this PR is infrastructure, and flipping a
+kernel default is a kernel change that deserves its own before/after on a quiet
+pinned host, per the rule this document just wrote.
 
 ## What the default costs
 
