@@ -159,7 +159,9 @@ where
         return Ok(());
     }
     let mut y = vec![0.0f32; n];
-    f(x, &mut y);
+    // Serial on purpose: see `serial_scope`. This arm always ends in a full
+    // serial pass over `y`, so splitting the kernel only costs locality.
+    serial_scope(|| f(x, &mut y));
     write_dense_f32_narrow(op, out, &y)
 }
 
@@ -172,6 +174,211 @@ where
 /// `cfg`-gated.
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) const SIMD_MIN_LEN: usize = 32;
+
+/// Smallest slice length worth splitting across threads.
+///
+/// These kernels are memory-bound at length, so the payoff is real bandwidth,
+/// not arithmetic: one core cannot saturate this socket's memory controllers.
+/// Below the threshold the fork/join costs more than the work it hands out, so
+/// the split has to earn its place.
+///
+/// **This threshold is set by what the split costs inside a real session, not
+/// by what it costs in a benchmark loop.** A rayon worker parks when it runs
+/// out of work, and a session hands the pool one short burst per node with
+/// non-trivial gaps in between, so nearly every call pays to wake the pool
+/// again. A tight benchmark loop never sees that, because it keeps the workers
+/// spinning. Measured through a real ORT session, our EP against ORT's CPU EP
+/// on the same graph and the same input:
+///
+/// | elements | `PAR_MIN_LEN` 16 Ki | `PAR_MIN_LEN` 1 Mi |
+/// |---|---|---|
+/// | 16384 | 0.19x | 1.20x |
+/// | 32768 | 0.17x | 1.43x |
+/// | 65536 | 0.16x | 1.60x |
+/// | 131072 | 0.21x | 1.68x |
+/// | 262144 | 0.98x | 1.80x |
+///
+/// (`Sqrt`, f32, ORT 1.28.0. Both sides at `intra_op_num_threads = 1`; ours
+/// additionally at `RAYON_NUM_THREADS = 32`, so the comparison is our
+/// *parallel* kernel against single-threaded ORT — which is what makes the
+/// wake-up visible. p50 of 200 interleaved runs, our EP's assignment asserted
+/// from ORT's profiler.) The wake-up costs ~50 us and the work below a megabyte is worth less
+/// than that, so the old 16 Ki threshold turned a 1.2-1.8x win into a 5x loss
+/// on exactly the sizes a decode step uses.
+///
+/// One threshold for every kernel is a simplification, and a measured one.
+/// A later 16-thread sweep found the expensive kernels want it lower: dropping
+/// `PAR_MIN_LEN` to 256 Ki made `Gelu` 1.26-2.35x faster over 256 Ki - 2 Mi,
+/// `Erf` 1.23-1.78x and `FastGelu` 1.28-2.03x, while making `Sqrt` at 256 Ki
+/// *2.3x slower*. Break-even scales with per-element cost, and `Sqrt` — the
+/// cheapest, most bandwidth-bound kernel here — is the one this constant was
+/// derived from, so it is conservative for the transcendentals. Splitting it
+/// into a per-kernel cost class needs the class plumbed through four generic
+/// entry points and is left to a follow-up; this value is the safe one,
+/// because being too high costs throughput while being too low cost 5x.
+///
+/// Kept well above [`SIMD_MIN_LEN`] so that every chunk is still long enough to
+/// take the vector path. That matters for more than speed: the scalar and
+/// vector paths are not bit-identical for the approximated kernels, so a chunk
+/// that fell back to scalar would make the result depend on the thread count.
+const PAR_MIN_LEN: usize = 1_048_576;
+
+/// Minimum elements per thread.
+///
+/// A chunk shorter than this spends more time waking the worker that runs it
+/// than the worker saves. At the measured ~50 us wake-up and ~0.3 ns/element,
+/// break-even is around 160 Ki elements per chunk; 256 Ki keeps a margin and
+/// still splits a 4 Mi prefill sixteen ways.
+const PAR_MIN_CHUNK: usize = 262_144;
+
+thread_local! {
+    /// Set while a caller has to keep the f32 kernel on one thread.
+    ///
+    /// The f16/bf16 activations are a sandwich: widen the input into an f32
+    /// scratch, run the kernel, narrow the scratch back. Only the middle layer is
+    /// parallelisable here, and splitting just that layer measured *slower* than
+    /// leaving it alone — on a 2M-element prefill, Sqrt/f16 dropped to 0.59x and
+    /// Tanh/f16 to 0.79x against the same binary at one thread. Spreading the
+    /// scratch across sixteen private caches only to have a serial narrow pull all
+    /// 8 MB of it back costs more locality than the arithmetic saves, and it makes
+    /// the result wildly variable (bf16 prefill ranged 1.6-3.4 ns/element across
+    /// repeats where f32 held to +/-5%).
+    ///
+    /// So the narrow-output arm of `write_mapped_reading` runs the kernel under
+    /// this guard and takes the serial path, which is exactly what it did before.
+    /// The fix for f16/bf16 is to fuse widen, compute and narrow into a single
+    /// pass per chunk so each thread keeps its slice in L2 — a different change,
+    /// and one that has to be measured on its own.
+    static FORCE_SERIAL: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the elementwise kernels' parallel split disabled.
+///
+/// Restores the previous value on unwind as well as on return. A leaked flag
+/// would only cost speed, never correctness -- serial and parallel results are
+/// bit-identical -- but it would leave that thread quietly serialised for every
+/// later activation, which is a hard bug to find afterwards.
+pub(crate) fn serial_scope<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_SERIAL.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(FORCE_SERIAL.with(|c| c.replace(true)));
+    f()
+}
+
+#[inline]
+fn force_serial() -> bool {
+    FORCE_SERIAL.with(core::cell::Cell::get)
+}
+
+/// Chunk length for [`run_chunked`], or `None` to run the slice in one call.
+///
+/// Split out from the execution so the boundaries can be swept over thread
+/// counts this machine does not have. Rounding to eight lanes keeps every
+/// chunk on an AVX2 vector boundary, and the [`PAR_MIN_CHUNK`] floor keeps
+/// each one long enough to stay on the vector path — a chunk that fell back to
+/// scalar would round differently from its neighbours.
+#[inline]
+fn par_chunk_len(len: usize, threads: usize) -> Option<usize> {
+    if threads < 2 {
+        return None;
+    }
+    let chunk = len.div_ceil(threads).max(PAR_MIN_CHUNK).next_multiple_of(8);
+    (chunk < len).then_some(chunk)
+}
+
+/// Chunk length for [`run_chunked_rows`], always a whole multiple of `width`.
+#[inline]
+fn par_chunk_len_rows(len: usize, width: usize, threads: usize) -> Option<usize> {
+    if threads < 2 || width == 0 {
+        return None;
+    }
+    let rows = len
+        .div_ceil(width)
+        .div_ceil(threads)
+        .max(PAR_MIN_CHUNK.div_ceil(width));
+    let chunk = rows.checked_mul(width)?;
+    (chunk < len).then_some(chunk)
+}
+
+/// Split `input`/`output` across the rayon pool and run `body` on each chunk.
+///
+/// Elementwise ops are exactly chunk-independent, so this is bit-identical to
+/// running `body` over the whole slice — provided every chunk takes the same
+/// code path, which is why chunks are never shorter than [`PAR_MIN_CHUNK`] and
+/// are rounded to a multiple of eight lanes.
+///
+/// Falls back to a single call when the pool has one thread, when the slice is
+/// short, or when already inside a rayon worker: nesting a `par_chunks` inside
+/// an outer parallel region only adds scheduling overhead, since the outer
+/// region is already keeping the pool busy.
+#[inline]
+fn run_chunked<F>(input: &[f32], output: &mut [f32], body: F)
+where
+    F: Fn(&[f32], &mut [f32]) + Sync + Send,
+{
+    let len = input.len();
+    // Test the length *before* touching rayon. `current_num_threads` reaches
+    // the global registry, and initialising it spawns the pool; paying that on
+    // a 4096-element decode call cost ~1.4 us, which is more than the whole
+    // call. Measured as a uniform 0.6-0.8x regression on every short case
+    // until this check moved above it.
+    if len < PAR_MIN_LEN || force_serial() {
+        body(input, output);
+        return;
+    }
+    // Nesting a `par_chunks` inside an outer parallel region only adds
+    // scheduling overhead: the outer region is already keeping the pool busy.
+    if rayon::current_thread_index().is_some() {
+        body(input, output);
+        return;
+    }
+    let Some(chunk) = par_chunk_len(len, rayon::current_num_threads()) else {
+        body(input, output);
+        return;
+    };
+
+    use rayon::prelude::*;
+    output
+        .par_chunks_mut(chunk)
+        .zip(input.par_chunks(chunk))
+        .for_each(|(o, i)| body(i, o));
+}
+
+/// [`run_chunked`] for the bias-fused kernels, whose element mapping is
+/// `bias[i % width]`.
+///
+/// Chunks are whole multiples of `width`, so every chunk starts on a row
+/// boundary and its elements keep the same bias offsets they had in the
+/// un-split slice. A chunk cut mid-row would silently rotate the bias.
+#[inline]
+fn run_chunked_rows<F>(input: &[f32], output: &mut [f32], width: usize, body: F)
+where
+    F: Fn(&[f32], &mut [f32]) + Sync + Send,
+{
+    let len = input.len();
+    if len < PAR_MIN_LEN || width == 0 || force_serial() {
+        body(input, output);
+        return;
+    }
+    if rayon::current_thread_index().is_some() {
+        body(input, output);
+        return;
+    }
+    let Some(chunk) = par_chunk_len_rows(len, width, rayon::current_num_threads()) else {
+        body(input, output);
+        return;
+    };
+
+    use rayon::prelude::*;
+    output
+        .par_chunks_mut(chunk)
+        .zip(input.par_chunks(chunk))
+        .for_each(|(o, i)| body(i, o));
+}
 
 // ---------------------------------------------------------------------------
 // MLAS constants
@@ -359,15 +566,23 @@ macro_rules! dispatch {
         #[cfg(target_arch = "x86_64")]
         {
             if input.len() >= SIMD_MIN_LEN && vector_path_available() {
+                // The vector/scalar choice is made once, on the whole slice,
+                // and every chunk then inherits it. Deciding per chunk would
+                // let a short tail chunk take the scalar path, and the two are
+                // not bit-identical for the approximated kernels — results
+                // would start depending on the thread count.
+                //
                 // SAFETY: guarded by the runtime AVX2+FMA detection above.
-                unsafe { $vector(input, output) };
+                run_chunked(input, output, |i, o| unsafe { $vector(i, o) });
                 return;
             }
         }
         let scalar = $scalar;
-        for (o, &i) in output.iter_mut().zip(input) {
-            *o = scalar(i);
-        }
+        run_chunked(input, output, |i, o| {
+            for (o, &i) in o.iter_mut().zip(i) {
+                *o = scalar(i);
+            }
+        });
     }};
 }
 
@@ -621,13 +836,17 @@ pub(crate) fn quick_gelu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32
     {
         if input.len() >= SIMD_MIN_LEN && vector_path_available() {
             // SAFETY: guarded by the runtime AVX2+FMA detection above.
-            unsafe { quick_gelu_avx2(input, output, alpha) };
+            run_chunked(input, output, |i, o| unsafe {
+                quick_gelu_avx2(i, o, alpha)
+            });
             return;
         }
     }
-    for (o, &i) in output.iter_mut().zip(input) {
-        *o = quick_gelu_scalar(i, alpha);
-    }
+    run_chunked(input, output, |i, o| {
+        for (o, &i) in o.iter_mut().zip(i) {
+            *o = quick_gelu_scalar(i, alpha);
+        }
+    });
 }
 
 /// `tanh_gelu(x[i] + bias[i % width])` for every element, without ever
@@ -663,15 +882,19 @@ pub(crate) fn tanh_gelu_bias_f32_slice(
         if input.len() >= SIMD_MIN_LEN && vector_path_available() {
             // SAFETY: guarded by the runtime AVX2+FMA detection above; the
             // debug asserts above are the caller's contract.
-            unsafe { tanh_gelu_bias_avx2(input, bias, width, output) };
+            run_chunked_rows(input, output, width, |i, o| unsafe {
+                tanh_gelu_bias_avx2(i, bias, width, o)
+            });
             return;
         }
     }
-    for (row_in, row_out) in input.chunks(width).zip(output.chunks_mut(width)) {
-        for ((o, &v), &b) in row_out.iter_mut().zip(row_in).zip(bias) {
-            *o = tanh_gelu_scalar(v + b);
+    run_chunked_rows(input, output, width, |i, o| {
+        for (row_in, row_out) in i.chunks(width).zip(o.chunks_mut(width)) {
+            for ((o, &v), &b) in row_out.iter_mut().zip(row_in).zip(bias) {
+                *o = tanh_gelu_scalar(v + b);
+            }
         }
-    }
+    });
 }
 
 /// `erf_gelu(x[i] + bias[i % width])`, the `BiasGelu` contrib op.
@@ -693,15 +916,19 @@ pub(crate) fn erf_gelu_bias_f32_slice(
         if input.len() >= SIMD_MIN_LEN && vector_path_available() {
             // SAFETY: guarded by the runtime AVX2+FMA detection above; the
             // debug asserts above are the caller's contract.
-            unsafe { erf_gelu_bias_avx2(input, bias, width, output) };
+            run_chunked_rows(input, output, width, |i, o| unsafe {
+                erf_gelu_bias_avx2(i, bias, width, o)
+            });
             return;
         }
     }
-    for (row_in, row_out) in input.chunks(width).zip(output.chunks_mut(width)) {
-        for ((o, &v), &b) in row_out.iter_mut().zip(row_in).zip(bias) {
-            *o = erf_gelu_scalar(v + b);
+    run_chunked_rows(input, output, width, |i, o| {
+        for (row_in, row_out) in i.chunks(width).zip(o.chunks_mut(width)) {
+            for ((o, &v), &b) in row_out.iter_mut().zip(row_in).zip(bias) {
+                *o = erf_gelu_scalar(v + b);
+            }
         }
-    }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -945,14 +1172,22 @@ mod avx2 {
             // mathematical range. (The counts are FMA-specific: the same
             // constants evaluated without fusion overshoot on only 26 503
             // points over `[8.052297, 8.999964]`.)
-            let poly = clamp_nan_preserving(_mm256_div_ps(p, q), -1.0, 1.0);
-
-            // Saturate. Ordered compares are false for NaN, so NaN keeps the
-            // polynomial result, which is NaN.
-            let above = _mm256_cmp_ps(x, _mm256_set1_ps(tanh_c::UPPER), _CMP_GT_OQ);
-            let below = _mm256_cmp_ps(x, _mm256_set1_ps(tanh_c::LOWER), _CMP_LT_OQ);
-            let r = _mm256_blendv_ps(poly, _mm256_set1_ps(1.0), above);
-            _mm256_blendv_ps(r, _mm256_set1_ps(-1.0), below)
+            // The `[-1, 1]` clamp is also the saturation. Because the input was
+            // already clamped to `[-9, 9]`, the largest argument the rational
+            // ever sees is `±9` — and there `p` and `q` come out bit-equal
+            // (`0x3fcd33e9`), so `p/q` is *exactly* `±1.0` and the clamp,
+            // being inclusive, returns it unchanged. The margin is equality,
+            // not slack: the overshoot to `1.0000001` happens strictly inside
+            // the range, near `|v| = 8.9999971`, and is what the clamp is
+            // actually for. So every `|x| >= 9` — up to and including `±Inf` —
+            // already leaves here as exactly `±1` without a separate
+            // saturation step, and `NaN` survives because `maxps`/`minps`
+            // return their second operand on an unordered compare.
+            // `saturation_blend_is_redundant_exhaustively` proves this over
+            // all 1 047 527 424 finite `f32` with `|x| >= 9`, under the
+            // default rounding mode (the property also holds under the other
+            // three, but only round-to-nearest is exercised in CI).
+            clamp_nan_preserving(_mm256_div_ps(p, q), -1.0, 1.0)
         }
     }
 
@@ -986,12 +1221,15 @@ mod avx2 {
             q = _mm256_fmadd_ps(q, v2, _mm256_set1_ps(logistic_c::BETA_0));
 
             let poly = _mm256_add_ps(_mm256_div_ps(p, q), _mm256_set1_ps(0.5));
-            let poly = clamp_nan_preserving(poly, 0.0, 1.0);
 
-            let above = _mm256_cmp_ps(x, _mm256_set1_ps(logistic_c::UPPER), _CMP_GT_OQ);
-            let below = _mm256_cmp_ps(x, _mm256_set1_ps(logistic_c::LOWER), _CMP_LT_OQ);
-            let r = _mm256_blendv_ps(poly, _mm256_set1_ps(1.0), above);
-            _mm256_blendv_ps(r, _mm256_set1_ps(0.0), below)
+            // As in `tanh_ps`, the `[0, 1]` clamp is also the saturation. The
+            // rational only ever sees `±18`: at `+18` it gives exactly `1.0`,
+            // which the inclusive clamp passes through, and at `-18` it gives
+            // `-5.96e-8`, which the clamp pulls to `0.0`. Either way `|x| >=
+            // 18` and `±Inf` leave here saturated without a separate step.
+            // `saturation_blend_is_redundant_exhaustively` proves this over
+            // all 1 039 138 816 finite `f32` with `|x| >= 18`.
+            clamp_nan_preserving(poly, 0.0, 1.0)
         }
     }
 
@@ -1014,8 +1252,11 @@ mod avx2 {
                 _mm256_mul_ps(_mm256_set1_ps(0.5), x),
                 _mm256_add_ps(_mm256_set1_ps(1.0), t),
             );
+            // Blending against zero is an `andnot` of the compare mask, which
+            // is one uop where `vblendvps` is two on Zen. The mask is all-ones
+            // or all-zeros, so the two are exactly equivalent here.
             let neg_inf = _mm256_cmp_ps(x, _mm256_set1_ps(f32::NEG_INFINITY), _CMP_EQ_OQ);
-            _mm256_blendv_ps(y, _mm256_setzero_ps(), neg_inf)
+            _mm256_andnot_ps(neg_inf, y)
         }
     }
 
@@ -1026,8 +1267,11 @@ mod avx2 {
         unsafe {
             let s = sigmoid_ps(_mm256_mul_ps(alpha, x));
             let y = _mm256_mul_ps(x, s);
+            // Blending against zero is an `andnot` of the compare mask, which
+            // is one uop where `vblendvps` is two on Zen. The mask is all-ones
+            // or all-zeros, so the two are exactly equivalent here.
             let neg_inf = _mm256_cmp_ps(x, _mm256_set1_ps(f32::NEG_INFINITY), _CMP_EQ_OQ);
-            _mm256_blendv_ps(y, _mm256_setzero_ps(), neg_inf)
+            _mm256_andnot_ps(neg_inf, y)
         }
     }
 
@@ -1223,8 +1467,11 @@ mod avx2 {
                 _mm256_mul_ps(_mm256_set1_ps(0.5), x),
                 _mm256_add_ps(_mm256_set1_ps(1.0), e),
             );
+            // Blending against zero is an `andnot` of the compare mask, which
+            // is one uop where `vblendvps` is two on Zen. The mask is all-ones
+            // or all-zeros, so the two are exactly equivalent here.
             let neg_inf = _mm256_cmp_ps(x, _mm256_set1_ps(f32::NEG_INFINITY), _CMP_EQ_OQ);
-            _mm256_blendv_ps(y, _mm256_setzero_ps(), neg_inf)
+            _mm256_andnot_ps(neg_inf, y)
         }
     }
 
@@ -3036,5 +3283,430 @@ mod mlas_ab {
     }
     fn erf_gelu_avx2_shim(x: &[f32], y: &mut [f32]) {
         dispatch!(x, y, erf_gelu_scalar, erf_gelu_avx2)
+    }
+}
+
+/// Falsifiers for the saturation removed from `tanh_ps` / `sigmoid_ps`.
+///
+/// Both kernels used to follow the `[-1, 1]` / `[0, 1]` clamp with a pair of
+/// `vcmpps` + `vblendvps` that forced the saturated constant for `|x|` beyond
+/// the rational's clamp range. That step is redundant: the input clamp means
+/// the rational never sees an argument past `±9` / `±18`, and at those points
+/// the result is already outside the output clamp, so the clamp alone
+/// saturates. These tests keep the old sequence as a reference and assert the
+/// current kernels reproduce it bit for bit.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod saturation_absorption {
+    use super::*;
+    use std::arch::x86_64::*;
+
+    /// `tanh_ps` as it was written before the blends were removed.
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn tanh_ps_with_blend(x: __m256) -> __m256 {
+        unsafe {
+            let poly = avx2::tanh_ps(x);
+            let above = _mm256_cmp_ps(x, _mm256_set1_ps(tanh_c::UPPER), _CMP_GT_OQ);
+            let below = _mm256_cmp_ps(x, _mm256_set1_ps(tanh_c::LOWER), _CMP_LT_OQ);
+            let r = _mm256_blendv_ps(poly, _mm256_set1_ps(1.0), above);
+            _mm256_blendv_ps(r, _mm256_set1_ps(-1.0), below)
+        }
+    }
+
+    /// `sigmoid_ps` as it was written before the blends were removed.
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn sigmoid_ps_with_blend(x: __m256) -> __m256 {
+        unsafe {
+            let poly = avx2::sigmoid_ps(x);
+            let above = _mm256_cmp_ps(x, _mm256_set1_ps(logistic_c::UPPER), _CMP_GT_OQ);
+            let below = _mm256_cmp_ps(x, _mm256_set1_ps(logistic_c::LOWER), _CMP_LT_OQ);
+            let r = _mm256_blendv_ps(poly, _mm256_set1_ps(1.0), above);
+            _mm256_blendv_ps(r, _mm256_set1_ps(0.0), below)
+        }
+    }
+
+    /// Runs both forms over one vector of inputs and returns the two results.
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn pair(
+        lean: unsafe fn(__m256) -> __m256,
+        reference: unsafe fn(__m256) -> __m256,
+        input: &[f32; 8],
+    ) -> ([f32; 8], [f32; 8]) {
+        unsafe {
+            let v = _mm256_loadu_ps(input.as_ptr());
+            let mut a = [0.0f32; 8];
+            let mut b = [0.0f32; 8];
+            _mm256_storeu_ps(a.as_mut_ptr(), lean(v));
+            _mm256_storeu_ps(b.as_mut_ptr(), reference(v));
+            (a, b)
+        }
+    }
+
+    fn assert_same(
+        lean: unsafe fn(__m256) -> __m256,
+        reference: unsafe fn(__m256) -> __m256,
+        input: &[f32; 8],
+        what: &str,
+    ) {
+        let (a, b) = unsafe { pair(lean, reference, input) };
+        for i in 0..8 {
+            assert_eq!(
+                a[i].to_bits(),
+                b[i].to_bits(),
+                "{what}({:e}): without blend {:e} ({:08x}), with blend {:e} ({:08x})",
+                input[i],
+                a[i],
+                a[i].to_bits(),
+                b[i],
+                b[i].to_bits(),
+            );
+        }
+    }
+
+    /// Walks every `f32` in `[lo, hi]` by ULP, eight at a time, plus the
+    /// negation of each.
+    fn sweep(
+        lean: unsafe fn(__m256) -> __m256,
+        reference: unsafe fn(__m256) -> __m256,
+        lo: f32,
+        hi: f32,
+        what: &str,
+    ) -> u64 {
+        let (mut bits, end) = (lo.to_bits(), hi.to_bits());
+        let mut seen = 0u64;
+        while bits <= end {
+            let mut pos = [0.0f32; 8];
+            let mut neg = [0.0f32; 8];
+            for slot in 0..8 {
+                let b = (bits + slot as u32).min(end);
+                pos[slot] = f32::from_bits(b);
+                neg[slot] = -pos[slot];
+            }
+            assert_same(lean, reference, &pos, what);
+            assert_same(lean, reference, &neg, what);
+            seen += 8;
+            bits += 8;
+        }
+        seen
+    }
+
+    fn avx2() -> bool {
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+    }
+
+    #[test]
+    fn tanh_saturation_blend_is_redundant_near_the_boundary() {
+        if !avx2() {
+            return;
+        }
+        // Dense over the decade above the clamp, where an overshoot would show.
+        let n = sweep(avx2::tanh_ps, tanh_ps_with_blend, 9.0, 128.0, "tanh");
+        assert!(n > 32_000_000, "sweep covered only {n} values");
+    }
+
+    #[test]
+    fn sigmoid_saturation_blend_is_redundant_near_the_boundary() {
+        if !avx2() {
+            return;
+        }
+        let n = sweep(
+            avx2::sigmoid_ps,
+            sigmoid_ps_with_blend,
+            18.0,
+            256.0,
+            "sigmoid",
+        );
+        assert!(n > 20_000_000, "sweep covered only {n} values");
+    }
+
+    #[test]
+    fn saturation_blend_is_redundant_for_special_values() {
+        if !avx2() {
+            return;
+        }
+        let specials = [
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            // A signalling NaN and a non-canonical quiet payload: `blendv`
+            // looked at the sign bit and `andnot` looks at every bit, so the
+            // substitution is only safe if these pass through untouched too.
+            f32::from_bits(0x7F80_0001),
+            f32::from_bits(0xFFC0_DEAD),
+            f32::MAX,
+            f32::MIN,
+        ];
+        assert_same(avx2::tanh_ps, tanh_ps_with_blend, &specials, "tanh");
+        assert_same(
+            avx2::sigmoid_ps,
+            sigmoid_ps_with_blend,
+            &specials,
+            "sigmoid",
+        );
+
+        // Exactly at, and one ULP either side of, both clamp boundaries.
+        for &edge in &[tanh_c::LOWER, tanh_c::UPPER] {
+            let e = edge.to_bits();
+            let around = [
+                f32::from_bits(e - 2),
+                f32::from_bits(e - 1),
+                edge,
+                f32::from_bits(e + 1),
+                f32::from_bits(e + 2),
+                edge,
+                edge,
+                edge,
+            ];
+            assert_same(avx2::tanh_ps, tanh_ps_with_blend, &around, "tanh");
+        }
+        for &edge in &[logistic_c::LOWER, logistic_c::UPPER] {
+            let e = edge.to_bits();
+            let around = [
+                f32::from_bits(e - 2),
+                f32::from_bits(e - 1),
+                edge,
+                f32::from_bits(e + 1),
+                f32::from_bits(e + 2),
+                edge,
+                edge,
+                edge,
+            ];
+            assert_same(avx2::sigmoid_ps, sigmoid_ps_with_blend, &around, "sigmoid");
+        }
+    }
+
+    /// The complete proof: every finite `f32` past the clamp, both signs.
+    /// 1 047 527 424 values for `tanh` and 1 039 138 816 for `sigmoid`, which
+    /// is minutes in an unoptimised test build, so it is not run by default.
+    #[test]
+    #[ignore = "exhaustive; run with --ignored"]
+    fn saturation_blend_is_redundant_exhaustively() {
+        if !avx2() {
+            return;
+        }
+        sweep(avx2::tanh_ps, tanh_ps_with_blend, 9.0, f32::MAX, "tanh");
+        sweep(
+            avx2::sigmoid_ps,
+            sigmoid_ps_with_blend,
+            18.0,
+            f32::MAX,
+            "sigmoid",
+        );
+    }
+}
+
+/// Splitting an elementwise kernel across threads must not change its result.
+///
+/// This is not a tolerance check. Every kernel here is exactly
+/// chunk-independent, so a parallel run has to be **bit-identical** to a serial
+/// one — not merely close. The failure this guards against is a chunk that
+/// lands on a different code path (short enough to drop out of the vector
+/// path) or, for the bias kernels, one cut mid-row, which would rotate
+/// `bias[i % width]` for every element after the cut. Either would make output
+/// depend on the machine's core count.
+///
+/// Note on how the parallel side is obtained: `ThreadPool::install` runs its
+/// closure *on a pool worker*, which trips the nesting guard in
+/// [`run_chunked`] and silently serialises. So the parallel run is a plain
+/// direct call — the test binary's global pool is multi-threaded — and only
+/// the serial reference goes through a one-thread pool. An earlier version of
+/// this test used `install` for both sides; it passed even with the row
+/// alignment deliberately broken.
+#[cfg(test)]
+mod thread_invariance {
+    use super::*;
+
+    /// Long enough to be split, and not a multiple of the chunk size or the
+    /// lane count. It *is* divisible by 3, so the width-3 case happens to
+    /// divide evenly; the adversarial coverage comes from width 4099, which
+    /// leaves a real partial final row, and from chunk boundaries that are not
+    /// multiples of 8 (262 146 and 262 336 for widths 3 and 11), which is what
+    /// would expose a cut made mid-row.
+    const N: usize = 5 * PAR_MIN_LEN + 37;
+
+    fn probe(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let t = i as f32 / 991.0;
+                // Spans both saturation bands of every kernel here, plus the
+                // near-zero region where the polynomials are least alike.
+                (t.sin() * 24.0) + (i % 7) as f32 * 1e-7 - 3.0
+            })
+            .collect()
+    }
+
+    /// Runs `f` with the global pool serialised, i.e. what a one-core host
+    /// would compute.
+    fn serial<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool")
+            .install(f)
+    }
+
+    fn assert_same(name: &str, run: impl Fn(&[f32], &mut [f32]) + Sync) {
+        assert!(
+            rayon::current_num_threads() >= 2,
+            "global pool is single-threaded: this test would compare serial \
+             against serial and could not fail"
+        );
+        let x = probe(N);
+        let mut want = vec![0.0f32; N];
+        serial(|| run(&x, &mut want));
+
+        let mut got = vec![0.0f32; N];
+        run(&x, &mut got);
+
+        for (i, (&w, &g)) in want.iter().zip(&got).enumerate() {
+            assert_eq!(
+                w.to_bits(),
+                g.to_bits(),
+                "{name}: element {i} differs (serial {w:e}, parallel {g:e}) \
+                 — splitting the slice changed the result"
+            );
+        }
+    }
+
+    #[test]
+    fn unary_kernels_are_thread_count_invariant() {
+        assert_same("tanh", tanh_f32_slice);
+        assert_same("sqrt", sqrt_f32_slice);
+        assert_same("sigmoid", sigmoid_f32_slice);
+        assert_same("exp", exp_f32_slice);
+        assert_same("erf", erf_f32_slice);
+        assert_same("erf_gelu", erf_gelu_f32_slice);
+        assert_same("tanh_gelu", tanh_gelu_f32_slice);
+    }
+
+    #[test]
+    fn quick_gelu_is_thread_count_invariant() {
+        for alpha in [1.702f32, 1.0, -0.5] {
+            assert_same("quick_gelu", |x, y| quick_gelu_f32_slice(x, y, alpha));
+        }
+    }
+
+    /// Widths are chosen to be coprime with the lane count and not to divide
+    /// the chunk size, so a mid-row cut cannot go unnoticed.
+    #[test]
+    fn bias_kernels_are_thread_count_invariant() {
+        for width in [1usize, 3, 7, 11, 64, 4096, 4099] {
+            let bias: Vec<f32> = (0..width).map(|i| (i as f32) * 0.013 - 0.4).collect();
+            assert_same("tanh_gelu_bias", |x, y| {
+                tanh_gelu_bias_f32_slice(x, &bias, width, y)
+            });
+            assert_same("erf_gelu_bias", |x, y| {
+                erf_gelu_bias_f32_slice(x, &bias, width, y)
+            });
+        }
+    }
+
+    /// The execution above can only use the core count this machine happens to
+    /// have. The chunk policy is pure, so sweep it directly over thread counts
+    /// and lengths the host cannot produce, and assert the two invariants the
+    /// kernels depend on.
+    #[test]
+    fn chunk_policy_holds_across_thread_counts_and_lengths() {
+        for threads in [1usize, 2, 3, 4, 7, 16, 64, 256, 4096] {
+            for len in [
+                0,
+                1,
+                8,
+                PAR_MIN_CHUNK - 1,
+                PAR_MIN_CHUNK,
+                PAR_MIN_CHUNK + 1,
+                PAR_MIN_LEN - 1,
+                PAR_MIN_LEN,
+                PAR_MIN_LEN + 1,
+                N,
+                1 << 22,
+                (1 << 22) + 13,
+            ] {
+                if let Some(chunk) = par_chunk_len(len, threads) {
+                    assert!(chunk < len, "chunk {chunk} !< len {len}");
+                    assert_eq!(chunk % 8, 0, "chunk {chunk} is not a whole vector");
+                    assert!(
+                        chunk >= PAR_MIN_CHUNK,
+                        "chunk {chunk} could drop below the vector threshold"
+                    );
+                }
+                for width in [1usize, 3, 8, 64, 4099, PAR_MIN_LEN] {
+                    if let Some(chunk) = par_chunk_len_rows(len, width, threads) {
+                        assert!(chunk < len, "rows: chunk {chunk} !< len {len}");
+                        assert_eq!(
+                            chunk % width,
+                            0,
+                            "rows: chunk {chunk} cuts row width {width} in half"
+                        );
+                        assert!(
+                            chunk >= PAR_MIN_CHUNK.min(len),
+                            "rows: chunk {chunk} too short"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `serial_scope` is what keeps the f16/bf16 sandwich off the pool. If it
+    /// ever stopped suppressing the split, those paths would silently pick up
+    /// the measured 0.59-0.79x regression again with nothing to catch it.
+    #[test]
+    fn serial_scope_suppresses_the_split() {
+        assert!(!force_serial());
+        serial_scope(|| {
+            assert!(force_serial(), "guard did not take effect");
+            assert_eq!(
+                par_chunk_len_under_guard(1 << 20, 16),
+                None,
+                "run_chunked would still split inside serial_scope"
+            );
+        });
+        assert!(!force_serial(), "guard leaked past its scope");
+    }
+
+    /// Mirrors the two early-outs `run_chunked` applies before consulting the
+    /// policy, so the test above exercises the same condition the kernel does.
+    fn par_chunk_len_under_guard(len: usize, threads: usize) -> Option<usize> {
+        if len < PAR_MIN_LEN || force_serial() {
+            return None;
+        }
+        par_chunk_len(len, threads)
+    }
+
+    /// The guard must be restored even if the closure unwinds, or one panicking
+    /// kernel would serialise every later call on that thread for the rest of
+    /// the process -- silently, since results stay correct either way.
+    #[test]
+    fn serial_scope_is_restored_after_a_panic() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let r = std::panic::catch_unwind(|| serial_scope(|| panic!("boom")));
+        std::panic::set_hook(prev);
+
+        assert!(r.is_err(), "the panic should still propagate");
+        assert!(
+            !force_serial(),
+            "guard leaked across an unwind: this thread is now serial forever"
+        );
+    }
+
+    /// Nesting must restore the outer value, not reset to "parallel".
+    #[test]
+    fn serial_scope_nests() {
+        serial_scope(|| {
+            serial_scope(|| assert!(force_serial()));
+            assert!(force_serial(), "inner scope cleared the outer guard");
+        });
+        assert!(!force_serial());
+    }
+
+    /// A zero width would divide by zero; a width whose row count overflows
+    /// must not panic either.
+    #[test]
+    fn chunk_policy_rejects_degenerate_widths() {
+        assert_eq!(par_chunk_len_rows(N, 0, 8), None);
+        assert_eq!(par_chunk_len_rows(N, usize::MAX, 8), None);
+        assert_eq!(par_chunk_len(N, 0), None);
     }
 }
