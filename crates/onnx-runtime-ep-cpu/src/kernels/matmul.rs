@@ -1692,19 +1692,23 @@ pub(crate) fn reset_half_yielded_to_widened_calls() {
 ///
 /// End to end through the plugin (`bench_matmul_f16_m128`, `M=128, K=N=2048`,
 /// non-constant `B`, 5 interleaved rounds of before/after/ORT in one process,
-/// p50 ms, pinned to 16 physical cores), as `ours/ORT`:
+/// p50 ms, pinned to 16 physical cores), as `ours/ORT` so >1 means we lose.
+/// Ranges span three independent measurements, one of them by a reviewer on a
+/// separate build:
 ///
 /// | threads | before | after | gain |
 /// |---|---|---|---|
-/// | 1 | 28.38 / 14.41 = 1.97x | 15.15 / 14.41 = **1.05x** | 1.87x |
-/// | 16 | 6.570 / 1.999 = 3.29x | 4.180 / 1.999 = **2.09x** | 1.57x |
+/// | 1 | 1.97x--1.99x | **1.05x--1.08x** | 1.85x--1.87x |
+/// | 16 | 3.27x--3.29x | **2.03x--2.28x** | 1.44x--1.63x |
 ///
-/// `M=1` decode cannot reach this gate and measured unchanged (0.356 vs 0.360
-/// ms at `T=1`).
+/// `M=1` decode cannot reach this gate and measured unchanged (0.356 vs 0.353
+/// ms at `T=1`, inside run-to-run noise).
 ///
-/// `T=16` is still 2.09x off ORT. The residual is the per-call widen of a
-/// non-constant `B`: serial here, parallel in ORT. That is a separate change
-/// and this gate does not address it.
+/// `T=16` is still ~2x off ORT and is **not** claimed as competitive. The
+/// residual is the per-call widen of a non-constant `B`: serial here, parallel
+/// in ORT. Evidence: our `f16` costs ~2.2 ms more than our own `f32` at `T=16`
+/// but only ~1.6 ms more at `T=1`, so the conversion gets *worse* with threads.
+/// That is a separate change and this gate does not address it.
 fn widened_sgemm_beats_half_gemm(
     format: HalfFormat,
     geom: &MatMulGeometry,
