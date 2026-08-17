@@ -33,6 +33,8 @@ fn dense_bytes<'a>(view: &TensorView<'a>) -> Result<Cow<'a, [u8]>> {
         // bytes are consecutive from the byte origin. `u8` has no invalid bit
         // patterns.
         let bytes = unsafe { std::slice::from_raw_parts(view.data_ptr::<u8>(), len) };
+        #[cfg(test)]
+        BORROWED_INPUT_CALLS.with(|calls| calls.set(calls.get() + 1));
         return Ok(Cow::Borrowed(bytes));
     }
     to_dense_bytes(view).map(Cow::Owned)
@@ -77,6 +79,11 @@ thread_local! {
     /// perturbed by whatever else is running in parallel.
     static DIRECT_OUTPUT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static STAGED_OUTPUT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Counts the calls where `dense_bytes` handed back a borrow of the caller's
+    /// buffer rather than a private copy. A test that checks the caller's input
+    /// survived a call is only meaningful if the call actually borrowed it, so
+    /// this stops that test passing vacuously.
+    static BORROWED_INPUT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Where a batch's requantized output bytes are written.
@@ -451,17 +458,12 @@ impl Kernel for QLinearMatMulKernel {
         #[cfg_attr(not(feature = "mlas"), allow(unused_mut))]
         let (mut a_bytes, mut b_bytes, a, b) = if qgemm.is_some() {
             (
-                // Only a sign flip needs to own `A`; every other MLAS route
-                // reads it exactly as the caller laid it out, so a contiguous
-                // operand is borrowed rather than copied per call. The flip
-                // must never be applied in place: `A` is the caller's input.
-                #[cfg(feature = "mlas")]
-                if qgemm.as_ref().is_some_and(|plan| plan.flip_a) {
-                    Cow::Owned(to_dense_bytes(&inputs[0])?)
-                } else {
-                    dense_bytes(&inputs[0])?
-                },
-                #[cfg(not(feature = "mlas"))]
+                // Every MLAS route reads `A` exactly as the caller laid it
+                // out, so a contiguous operand is borrowed rather than copied
+                // per call. The one route that rewrites it -- the sign flip
+                // below -- goes through `Cow::to_mut`, which copies a borrowed
+                // operand first, so the caller's input is never written
+                // through.
                 dense_bytes(&inputs[0])?,
                 if pack_ready {
                     Vec::new()
@@ -1545,7 +1547,14 @@ mod tests {
 
     /// Borrowing `A` must never let the kernel write through to the caller's
     /// input. The sign-flip route is the one place that rewrites `A`'s bytes,
-    /// so it has to keep taking a private copy.
+    /// and it does so through `Cow::to_mut`, which copies a borrowed operand
+    /// before touching it. Replace that with a write to the borrowed slice and
+    /// this test fails.
+    ///
+    /// The borrow counter is asserted too, because the property is only under
+    /// test when the call really did borrow: if `dense_bytes` ever stopped
+    /// borrowing, the input would trivially survive and the test would pass
+    /// while proving nothing.
     #[cfg(feature = "mlas")]
     #[test]
     fn the_sign_flip_route_never_writes_through_to_the_callers_input() {
@@ -1562,12 +1571,18 @@ mod tests {
         let b_zero = Owned::u8(&[], &[130]);
         let y_scale = Owned::f32(&[], &[0.125]);
         let y_zero = i8(&[], &[-2]);
+        let borrows_before = BORROWED_INPUT_CALLS.with(|calls| calls.get());
         let _ = execute(
             [
                 &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
             ],
             DataType::Int8,
             &[8, 8],
+        );
+        assert_eq!(
+            BORROWED_INPUT_CALLS.with(|calls| calls.get()),
+            borrows_before + 1,
+            "the flip route no longer borrows A, so this test proves nothing"
         );
         assert_eq!(
             a.bytes, untouched,
