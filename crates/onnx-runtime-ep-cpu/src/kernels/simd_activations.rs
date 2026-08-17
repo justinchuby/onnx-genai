@@ -341,11 +341,35 @@ where
         return;
     };
 
+    note_parallel_dispatch();
+
     use rayon::prelude::*;
     output
         .par_chunks_mut(chunk)
         .zip(input.par_chunks(chunk))
         .for_each(|(o, i)| body(i, o));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Times *this* thread has handed work to the pool from [`run_chunked`].
+    ///
+    /// Thread-local rather than a global atomic so that concurrently running
+    /// tests cannot bump each other's count: the increment happens on the
+    /// calling thread, before the slice is split.
+    static PARALLEL_DISPATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline(always)]
+fn note_parallel_dispatch() {
+    #[cfg(test)]
+    PARALLEL_DISPATCHES.with(|c| c.set(c.get() + 1));
+}
+
+/// How many times this thread has reached [`run_chunked`]'s parallel branch.
+#[cfg(test)]
+fn parallel_dispatches() -> usize {
+    PARALLEL_DISPATCHES.with(std::cell::Cell::get)
 }
 
 /// [`run_chunked`] for the bias-fused kernels, whose element mapping is
@@ -622,7 +646,12 @@ macro_rules! dispatch_mlas {
             debug_assert_eq!(input.len(), output.len());
             if input.len() >= SIMD_MIN_LEN {
                 let f: fn(&[f32], &mut [f32]) = $mlas;
-                f(input, output);
+                // Through `run_chunked`, exactly like the pure-Rust routes.
+                // Calling `f(input, output)` directly here left every MLAS
+                // route single-threaded no matter how many threads the pool
+                // had, which cost 3.4-4.3x at 16 threads once the pure-Rust
+                // routes started parallelising.
+                run_chunked(input, output, f);
                 return;
             }
         }
@@ -3718,5 +3747,72 @@ mod thread_invariance {
         assert_eq!(par_chunk_len_rows(N, 0, 8), None);
         assert_eq!(par_chunk_len_rows(N, usize::MAX, 8), None);
         assert_eq!(par_chunk_len(N, 0), None);
+    }
+}
+
+/// Every activation entry point must reach the pool through [`run_chunked`],
+/// including the ones that hand the arithmetic to MLAS.
+///
+/// The MLAS route used to call its kernel on the whole tensor and return,
+/// skipping `run_chunked` entirely. Nothing caught it: the results were right,
+/// the thread-invariance tests passed (a route that never splits is trivially
+/// split-invariant), and the only symptom was that an `mlas`-on build stayed
+/// single-threaded while an `mlas`-off build scaled — worth 3.4-4.3x at 16
+/// threads on this host, in the configuration the wheel ships.
+///
+/// So this asserts the mechanism rather than the output: a tensor over
+/// `PAR_MIN_LEN`, submitted from outside the pool, must increment
+/// `run_chunked`'s parallel-branch counter.
+#[cfg(test)]
+mod parallel_reachability {
+    use super::*;
+
+    /// Over `PAR_MIN_LEN` so the parallel branch is eligible, and not a
+    /// multiple of the chunk size or the lane count.
+    const N: usize = PAR_MIN_LEN + 4099;
+
+    fn assert_parallelises(name: &str, run: impl Fn(&[f32], &mut [f32])) {
+        assert!(
+            rayon::current_num_threads() >= 2,
+            "global pool is single-threaded: run_chunked would take its serial \
+             branch for every kernel and this test could not fail"
+        );
+        assert!(
+            rayon::current_thread_index().is_none(),
+            "this test must run outside the pool: run_chunked deliberately \
+             stays serial when it is already inside a parallel region"
+        );
+
+        let x = vec![0.5f32; N];
+        let mut y = vec![0.0f32; N];
+
+        let before = parallel_dispatches();
+        run(&x, &mut y);
+        let after = parallel_dispatches();
+
+        assert!(
+            after > before,
+            "{name}: a {N}-element call did not reach run_chunked's parallel \
+             branch, so it runs single-threaded no matter how large the pool \
+             is. A kernel that calls its backend directly and returns will \
+             fail here."
+        );
+    }
+
+    #[test]
+    fn mlas_routed_kernels_still_go_through_run_chunked() {
+        // `Erf` and exact `Gelu` are the two that still take the MLAS route
+        // when the `mlas` feature is on, which is what the wheel ships.
+        assert_parallelises("erf", erf_f32_slice);
+        assert_parallelises("erf_gelu", erf_gelu_f32_slice);
+    }
+
+    #[test]
+    fn pure_rust_kernels_go_through_run_chunked() {
+        assert_parallelises("tanh", tanh_f32_slice);
+        assert_parallelises("sigmoid", sigmoid_f32_slice);
+        assert_parallelises("sqrt", sqrt_f32_slice);
+        assert_parallelises("tanh_gelu", tanh_gelu_f32_slice);
+        assert_parallelises("exp", exp_f32_slice);
     }
 }
