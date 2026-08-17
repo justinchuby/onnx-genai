@@ -10159,13 +10159,19 @@ mod tests {
                     MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) > before,
                     "{label}: bits={bits} block{block_size} asymmetric M=1 decode must route through MLAS QNBit",
                 );
+                // #1138/#1142: an *unscoped* `m == 1` decode (this test never
+                // enters `with_decode_pool_scope`) now skips the per-worker
+                // shards and takes the single full-width `multithread=true`
+                // call, so the residency contract is the mirror of what it was
+                // -- `mlas_packed` built, `mlas_shards` not. Asserting it here
+                // keeps a regression back to the serial-shard cap visible.
                 assert!(
-                    kernel.mlas_shards.get().and_then(Option::as_ref).is_some(),
-                    "{label}: bits={bits} block{block_size} must prepack MLAS QNBit shards for decode by default",
+                    kernel.mlas_packed.get().and_then(Option::as_ref).is_some(),
+                    "{label}: bits={bits} block{block_size} unscoped M=1 decode must prepack the full-width MLAS QNBit weight",
                 );
                 assert!(
-                    kernel.mlas_packed.get().is_none(),
-                    "{label}: bits={bits} block{block_size} should only use full-width MLAS when ONNX_GENAI_CPU_MM_MLAS_NO_SHARD=1",
+                    kernel.mlas_shards.get().and_then(Option::as_ref).is_none(),
+                    "{label}: bits={bits} block{block_size} unscoped M=1 decode must not build per-worker shards it would run serially",
                 );
                 assert!(
                     kernel.packed_kai_qsi4_weight.get().is_none()
@@ -10254,8 +10260,12 @@ mod tests {
                 .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
                 .unwrap();
             let used_kai = kernel.packed_kai_qsi4_weight.get().is_some();
+            // Either MLAS weight cache counts: #1142 routes an unscoped `m == 1`
+            // decode to the full-width `mlas_packed` weight instead of the
+            // per-worker `mlas_shards`, and this test runs unscoped.
             #[cfg(feature = "mlas")]
-            let used_mlas = kernel.mlas_shards.get().is_some();
+            let used_mlas = kernel.mlas_shards.get().and_then(Option::as_ref).is_some()
+                || kernel.mlas_packed.get().and_then(Option::as_ref).is_some();
             #[cfg(not(feature = "mlas"))]
             let used_mlas = false;
             // Whether a fast int4 route exists at all is per-OS policy:
@@ -10523,15 +10533,19 @@ mod tests {
         );
         assert!(
             kernel.packed_kai_qsi4_weight.get().is_some() || {
+                // Either MLAS weight cache: see the note in
+                // `matmulnbits_arm64_kai_qsi4_block128_qwen_shapes_match_reference`.
                 #[cfg(feature = "mlas")]
                 {
-                    kernel.mlas_shards.get().is_some()
+                    kernel.mlas_shards.get().and_then(Option::as_ref).is_some()
+                        || kernel.mlas_packed.get().and_then(Option::as_ref).is_some()
                 }
                 #[cfg(not(feature = "mlas"))]
                 {
                     false
                 }
-            }
+            },
+            "the shape reached a fast route but cached no weight for it"
         );
         assert!(kernel.int8_weight.get().is_none());
         assert_qai8dxp_close(&y.to_f32(), &expected);
@@ -16550,7 +16564,7 @@ mod tests {
                 let pb = &packed_bytes[start * k_blocks * blob..(start + len) * k_blocks * blob];
                 let sc = &scales[start * k_blocks..(start + len) * k_blocks];
                 let pack = mlas_sys::SQNBitPackedB::new(len, k, 4, block_size, comp, pb, sc, None)
-                        .expect("MLAS SQNBit int4 shard must pack");
+                    .expect("MLAS SQNBit int4 shard must pack");
                 (start, len, pack)
             })
             .collect();
@@ -16603,9 +16617,7 @@ mod tests {
             .max()
             .unwrap_or(0);
         let full_identical = bits(&o_serial) == bits(&o_full);
-        eprintln!(
-            "#1138 full_width vs sharded: byte_identical={full_identical} max_ulp={max_ulp}"
-        );
+        eprintln!("#1138 full_width vs sharded: byte_identical={full_identical} max_ulp={max_ulp}");
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(hw)
@@ -16623,21 +16635,21 @@ mod tests {
             pool.install(|| {
                 let mut out = vec![0.0f32; n];
                 for _ in 0..50 {
-                        run(&mut out);
+                    run(&mut out);
                 }
                 let mut samples = [0.0f64; 5];
                 for s in samples.iter_mut() {
-                        let iters = 500u32;
-                        let start = Instant::now();
-                        for _ in 0..iters {
-                            run(&mut out);
-                        }
-                        *s = start.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                    let iters = 500u32;
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        run(&mut out);
+                    }
+                    *s = start.elapsed().as_secs_f64() * 1e6 / iters as f64;
                 }
                 samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 eprintln!(
-                        "#1138 int4 M=1 K={k} N={n} shards={shards} hw={hw}t {label:16}: p50={:.3}ms",
-                        samples[2] / 1000.0,
+                    "#1138 int4 M=1 K={k} N={n} shards={shards} hw={hw}t {label:16}: p50={:.3}ms",
+                    samples[2] / 1000.0,
                 );
             });
         }
