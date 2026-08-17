@@ -65,6 +65,35 @@ pub(super) fn dynamic_output_shapes(
         );
     }
     match node.op_type.as_str() {
+        "Compress" if node.is_default_domain() => {
+            let input = input_shapes.first()?;
+            let condition = input_values.get(1)?.as_ref()?;
+            let (mut output, axis) = match node.attr("axis").and_then(Attribute::as_int) {
+                Some(raw_axis) => {
+                    let rank = input.len();
+                    let axis = if raw_axis < 0 {
+                        raw_axis + rank as i64
+                    } else {
+                        raw_axis
+                    };
+                    let axis = usize::try_from(axis).ok()?;
+                    if axis >= rank {
+                        return None;
+                    }
+                    (input.clone(), axis)
+                }
+                None => (
+                    vec![input.iter().try_fold(1usize, |n, &d| n.checked_mul(d))?],
+                    0,
+                ),
+            };
+            let inspected = output[axis].min(condition.len());
+            output[axis] = condition[..inspected]
+                .iter()
+                .filter(|&&selected| selected != 0)
+                .count();
+            Some(vec![output])
+        }
         "Resize" if node.is_default_domain() => {
             let input = input_shapes.first()?;
             let rank = input.len();

@@ -309,13 +309,14 @@ DEFINE_REDUCE_EXT(float, f32)
 DEFINE_REDUCE_EXT(__half, f16)
 DEFINE_REDUCE_EXT(__nv_bfloat16, bf16)
 
-extern "C" __global__ void reduce_i64_sum(
+extern "C" __global__ void reduce_i64(
     const long long* x,
     long long*       y,
     const long long* base_off,
     const long long* delta_off,
     const int        out_count,
     const int        reduce_count,
+    const int        op,
     const unsigned int* capture_error)
 {
     if (capture_error && *capture_error) return;
@@ -327,21 +328,70 @@ extern "C" __global__ void reduce_i64_sum(
     const int nt  = blockDim.x;
     const size_t base = (size_t)base_off[o];
 
-    long long acc = 0;
+    long long acc = (op == 1) ? (-9223372036854775807LL - 1LL)
+                              : (op == 2) ? 9223372036854775807LL : 0LL;
     for (int r = tid; r < reduce_count; r += nt) {
-        acc += x[base + (size_t)delta_off[r]];
+        const long long v = x[base + (size_t)delta_off[r]];
+        if (op == 1) acc = max(acc, v);
+        else if (op == 2) acc = min(acc, v);
+        else acc += v;
     }
     red_i64[tid] = acc;
     __syncthreads();
     for (int off = nt >> 1; off > 0; off >>= 1) {
-        if (tid < off) red_i64[tid] += red_i64[tid + off];
+        if (tid < off) {
+            const long long v = red_i64[tid + off];
+            if (op == 1) red_i64[tid] = max(red_i64[tid], v);
+            else if (op == 2) red_i64[tid] = min(red_i64[tid], v);
+            else red_i64[tid] += v;
+        }
         __syncthreads();
     }
     if (tid == 0) y[o] = red_i64[0];
 }
+
+extern "C" __global__ void reduce_i32(
+    const int* x,
+    int*       y,
+    const long long* base_off,
+    const long long* delta_off,
+    const int        out_count,
+    const int        reduce_count,
+    const int        op,
+    const unsigned int* capture_error)
+{
+    if (capture_error && *capture_error) return;
+    const int o = blockIdx.x;
+    if (o >= out_count) return;
+
+    extern __shared__ int red_i32[];
+    const int tid = threadIdx.x;
+    const int nt  = blockDim.x;
+    const size_t base = (size_t)base_off[o];
+
+    int acc = (op == 1) ? (-2147483647 - 1) : (op == 2) ? 2147483647 : 0;
+    for (int r = tid; r < reduce_count; r += nt) {
+        const int v = x[base + (size_t)delta_off[r]];
+        if (op == 1) acc = max(acc, v);
+        else if (op == 2) acc = min(acc, v);
+        else acc += v;
+    }
+    red_i32[tid] = acc;
+    __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) {
+            const int v = red_i32[tid + off];
+            if (op == 1) red_i32[tid] = max(red_i32[tid], v);
+            else if (op == 2) red_i32[tid] = min(red_i32[tid], v);
+            else red_i32[tid] += v;
+        }
+        __syncthreads();
+    }
+    if (tid == 0) y[o] = red_i32[0];
+}
 "#;
 
-const REDUCE_MODULE: &str = "reduce_f32";
+const REDUCE_MODULE: &str = "reduce_typed_v2";
 const REDUCE_ENTRY: &str = "reduce_f32";
 const REDUCE_F16_ENTRY: &str = "reduce_f16";
 const REDUCE_BF16_ENTRY: &str = "reduce_bf16";
@@ -351,7 +401,8 @@ const REDUCE_EXT_BF16_ENTRY: &str = "reduce_ext_bf16";
 const REDUCE_LOGSUMEXP_F32_ENTRY: &str = "reduce_logsumexp_f32";
 const REDUCE_LOGSUMEXP_F16_ENTRY: &str = "reduce_logsumexp_f16";
 const REDUCE_LOGSUMEXP_BF16_ENTRY: &str = "reduce_logsumexp_bf16";
-const REDUCE_I64_SUM_ENTRY: &str = "reduce_i64_sum";
+const REDUCE_I64_ENTRY: &str = "reduce_i64";
+const REDUCE_I32_ENTRY: &str = "reduce_i32";
 const REDUCE_VALIDATE_AXES_ENTRY: &str = "validate_reduce_axes_i64";
 pub const REDUCE_CAPTURE_ERROR_AXES: u32 = 128;
 
@@ -864,7 +915,9 @@ impl ReduceKernel {
         }
         let x = &inputs[0];
         let cudnn_op = self.op.cudnn_op();
-        let supported_dtype = if self.op == ReduceOp::Sum && x.dtype == DataType::Int64 {
+        let supported_dtype = if matches!(self.op, ReduceOp::Sum | ReduceOp::Max | ReduceOp::Min)
+            && matches!(x.dtype, DataType::Int32 | DataType::Int64)
+        {
             true
         } else if cudnn_op.is_some() {
             matches!(
@@ -881,8 +934,8 @@ impl ReduceKernel {
         };
         if !supported_dtype {
             return Err(not_implemented(format!(
-                "{op} with input dtype {:?} (sum supports i64/f32/f16/bf16; mean and \
-                 extended reductions support f32/f16/bf16; max/min are f32)",
+                "{op} with input dtype {:?} (sum/max/min support i32/i64/f32; sum/mean and \
+                 extended reductions support f32/f16/bf16)",
                 x.dtype
             )));
         }
@@ -1054,7 +1107,7 @@ impl ReduceKernel {
         // bf16 block reduce bakes the reduce mask into base/delta and never reads
         // the axes buffer, and any axes change flips the cache key (rejected by
         // `prepare` above during capture), so it needs no device validation.
-        if capturing && inputs.len() == 2 && x.dtype == DataType::Int64 {
+        if capturing && inputs.len() == 2 && matches!(x.dtype, DataType::Int32 | DataType::Int64) {
             self.validate_captured_axes(&inputs[1], expected_axes)?;
         }
         self.launch(
@@ -1135,7 +1188,9 @@ impl ReduceKernel {
         };
 
         let entry = if x.dtype == DataType::Int64 {
-            REDUCE_I64_SUM_ENTRY
+            REDUCE_I64_ENTRY
+        } else if x.dtype == DataType::Int32 {
+            REDUCE_I32_ENTRY
         } else if is_logsumexp {
             match x.dtype {
                 DataType::Float32 => REDUCE_LOGSUMEXP_F32_ENTRY,
@@ -1160,8 +1215,8 @@ impl ReduceKernel {
         let func = self
             .runtime
             .nvrtc_function(REDUCE_MODULE, REDUCE_SRC, entry)?;
-        let bytes_per_thread = if x.dtype == DataType::Int64 {
-            std::mem::size_of::<i64>() as u32
+        let bytes_per_thread = if matches!(x.dtype, DataType::Int32 | DataType::Int64) {
+            x.dtype.byte_size() as u32
         } else {
             std::mem::size_of::<f32>() as u32
         };
@@ -1178,8 +1233,8 @@ impl ReduceKernel {
             .arg(&out_i)
             .arg(&red_i);
         let (pre, combine, post) = ext_tags.unwrap_or((0, 0, 0));
-        if x.dtype == DataType::Int64 {
-            builder.arg(&capture_error);
+        if matches!(x.dtype, DataType::Int32 | DataType::Int64) {
+            builder.arg(&op_tag).arg(&capture_error);
         } else if is_logsumexp {
             // Dedicated two-pass kernel (max, then exp-sum); no pre/combine/post.
             builder.arg(&capture_error);
