@@ -415,8 +415,31 @@ impl Kernel for QLinearMatMulKernel {
             b_scales.clear();
             b_scales.extend((0..n).map(|column| b_quant.at(b_batch, column).0));
 
-            products.clear();
-            products.resize(m * n, 0);
+            // Decided before the accumulator is sized because the two paths
+            // want different buffers: the scalar gemm below accumulates into
+            // `products` and needs it zeroed, while MLAS overwrites every
+            // element it is given (the shim leaves `IsAccumulateMode` false, so
+            // the first `k` block runs in `ZeroMode`).
+            #[cfg(feature = "mlas")]
+            let fused = match &qgemm {
+                Some(_) => fused_scale(&a_quant, a_batch, &b_scales, y_scale, &mut combined_scales),
+                None => None,
+            };
+            #[cfg(not(feature = "mlas"))]
+            let fused: Option<()> = None;
+
+            if fused.is_some() {
+                // Only the length matters here. Growing through `vec![0; len]`
+                // reaches `alloc_zeroed`, which the allocator serves with fresh
+                // zero pages instead of a `memset` at these sizes; re-running
+                // the same shape reuses the buffer untouched.
+                if products.len() != m * n {
+                    products = vec![0i32; m * n];
+                }
+            } else {
+                products.clear();
+                products.resize(m * n, 0);
+            }
 
             if let Some(plan) = &qgemm {
                 // Requantize inside MLAS when the combined scale allows it, so
@@ -425,9 +448,7 @@ impl Kernel for QLinearMatMulKernel {
                 // which MLAS maps to the output minimum where the scalar loop
                 // maps it to the zero point -- keeps a call off this path.
                 #[cfg(feature = "mlas")]
-                if let Some(scale) =
-                    fused_scale(&a_quant, a_batch, &b_scales, y_scale, &mut combined_scales)
-                {
+                if let Some(scale) = fused {
                     let base = output.len();
                     output.resize(base + m * n, 0);
                     plan.run_requantized(
@@ -1071,8 +1092,14 @@ fn requantize_rows(
     let requantize_row = |row: usize, accumulators: &[i32], bytes: &mut [u8]| {
         let a_scale = a_quant.at(a_batch, row).0;
         let quantize = |accumulated: i32, scale: f32, byte: &mut u8| {
-            let value =
-                (accumulated as f32 * scale).round_ties_even() as i64 + i64::from(y_zero_point);
+            // `f32 as i64` already saturates, but adding the zero point to
+            // `i64::MAX` wraps in release and panics in debug, so a scale large
+            // enough to push the product past `2^63` used to produce the
+            // *opposite* end of the range.  Saturating here also makes this
+            // loop agree with MLAS -- which clamps in `f32`, where there is no
+            // such cliff -- for every finite scale, not just the small ones.
+            let value = ((accumulated as f32 * scale).round_ties_even() as i64)
+                .saturating_add(i64::from(y_zero_point));
             *byte = match dtype {
                 DataType::Int8 => value.clamp(i8::MIN as i64, i8::MAX as i64) as i8 as u8,
                 _ => value.clamp(u8::MIN as i64, u8::MAX as i64) as u8,
@@ -1272,8 +1299,8 @@ mod tests {
                             * f64::from(input.b_scales[b_quant_index]);
                         product += a * b;
                     }
-                    let quantized = (product / f64::from(input.y_scale)).round_ties_even() as i64
-                        + i64::from(input.y_zero);
+                    let quantized = ((product / f64::from(input.y_scale)).round_ties_even() as i64)
+                        .saturating_add(i64::from(input.y_zero));
                     output.push(match input.output_dtype {
                         DataType::Int8 => quantized.clamp(i8::MIN as i64, i8::MAX as i64),
                         DataType::Uint8 => quantized.clamp(0, u8::MAX as i64),
@@ -1522,6 +1549,181 @@ mod tests {
         assert_eq!(output_values(&out), expected);
     }
 
+    /// The per-tensor route is the one an M=1 decode takes, and it is the one
+    /// the split into `PerTensor`/`PerColumn` could silently get wrong, so it
+    /// gets its own bit-exact end-to-end check rather than riding on the
+    /// per-column test.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn the_fused_requantize_matches_the_reference_with_one_scale_for_the_whole_tensor() {
+        let (m, k, n) = (4usize, 6usize, 7usize);
+        let a_values: Vec<i32> = (0..m * k).map(|i| (i * 29 % 253) as i32).collect();
+        let b_values: Vec<i32> = (0..k * n).map(|i| (i * 61 % 239) as i32).collect();
+        let a = Owned::u8(
+            &[m, k],
+            &a_values.iter().map(|&v| v as u8).collect::<Vec<_>>(),
+        );
+        let b = Owned::u8(
+            &[k, n],
+            &b_values.iter().map(|&v| v as u8).collect::<Vec<_>>(),
+        );
+        let a_scale = Owned::f32(&[], &[0.02]);
+        let a_zero = Owned::u8(&[], &[130]);
+        let b_scale = Owned::f32(&[], &[0.03]);
+        let b_zero = Owned::u8(&[], &[120]);
+        let y_scale = Owned::f32(&[], &[0.25]);
+        let y_zero = Owned::u8(&[], &[96]);
+
+        let quant = QuantParams::load(
+            "a",
+            &a_scale.view(),
+            &a_zero.view(),
+            &[m, k],
+            QuantAxis::Row,
+        )
+        .unwrap();
+        let mut buffer = Vec::new();
+        assert!(
+            matches!(
+                fused_scale(&quant, 0, &vec![0.03; n], 0.25, &mut buffer),
+                Some(mlas_sys::QgemmScale::PerTensor(_))
+            ),
+            "this fixture must take the per-tensor fused path or it proves nothing"
+        );
+
+        let out = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Uint8,
+            &[m, n],
+        );
+        let expected = reference(Reference {
+            a: &a_values,
+            a_shape: &[m, k],
+            a_scales: &[0.02],
+            a_zeros: &[130],
+            b: &b_values,
+            b_shape: &[k, n],
+            b_scales: &[0.03],
+            b_zeros: &[120],
+            y_scale: 0.25,
+            y_zero: 96,
+            output_dtype: DataType::Uint8,
+        });
+        assert_eq!(output_values(&out), expected);
+    }
+
+    /// Signed output takes a different MLAS pack step and a different saturating
+    /// narrow, and `i8` is the half of the range the unsigned tests cannot see.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn the_fused_requantize_matches_the_reference_for_signed_output() {
+        let (m, k, n) = (3usize, 5usize, 9usize);
+        let a_values: Vec<i32> = (0..m * k).map(|i| (i * 31 % 251) as i32 - 125).collect();
+        let b_values: Vec<i32> = (0..k * n).map(|i| (i * 47 % 251) as i32 - 125).collect();
+        let a = i8(
+            &[m, k],
+            &a_values.iter().map(|&v| v as i8).collect::<Vec<_>>(),
+        );
+        let b = i8(
+            &[k, n],
+            &b_values.iter().map(|&v| v as i8).collect::<Vec<_>>(),
+        );
+        let b_scales: Vec<f32> = (0..n).map(|i| 0.02 * (1.0 + i as f32 * 0.11)).collect();
+        let b_zeros: Vec<i32> = (0..n).map(|i| (i * 7 % 61) as i32 - 30).collect();
+        let a_scale = Owned::f32(&[], &[0.04]);
+        let a_zero = i8(&[], &[-7]);
+        let b_scale = Owned::f32(&[n], &b_scales);
+        let b_zero = i8(&[n], &b_zeros.iter().map(|&v| v as i8).collect::<Vec<_>>());
+        let y_scale = Owned::f32(&[], &[0.5]);
+        let y_zero = i8(&[], &[-11]);
+
+        let quant = QuantParams::load(
+            "a",
+            &a_scale.view(),
+            &a_zero.view(),
+            &[m, k],
+            QuantAxis::Row,
+        )
+        .unwrap();
+        let mut buffer = Vec::new();
+        assert!(
+            fused_scale(&quant, 0, &b_scales, 0.5, &mut buffer).is_some(),
+            "signed output must reach the fused path"
+        );
+
+        let out = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Int8,
+            &[m, n],
+        );
+        let expected = reference(Reference {
+            a: &a_values,
+            a_shape: &[m, k],
+            a_scales: &[0.04],
+            a_zeros: &[-7],
+            b: &b_values,
+            b_shape: &[k, n],
+            b_scales: &b_scales,
+            b_zeros: &b_zeros,
+            y_scale: 0.5,
+            y_zero: -11,
+            output_dtype: DataType::Int8,
+        });
+        assert_eq!(output_values(&out), expected);
+    }
+
+    /// A *finite* combined scale can still push the product past `i64::MAX`.
+    /// MLAS clamps in `f32`, where there is no such cliff; the scalar loop has
+    /// to saturate to stay bit-identical instead of wrapping to the opposite
+    /// end of the range (and panicking in a debug build on the way).  The
+    /// per-row `a_scale` keeps this on the scalar loop, which is the path with
+    /// the cliff.
+    #[test]
+    fn a_finite_scale_past_the_i64_range_saturates_on_the_scalar_loop() {
+        let a_values = [10, 200, 7, 20];
+        let b_values = [3, 9, 5, 1];
+        let a = Owned::u8(&[2, 2], &a_values.map(|v| v as u8));
+        let b = Owned::u8(&[2, 2], &b_values.map(|v| v as u8));
+        let a_scale = Owned::f32(&[2], &[2.0e8, 2.0e8]);
+        let a_zero = Owned::u8(&[2], &[8, 8]);
+        let b_scale = Owned::f32(&[], &[1.0e8]);
+        let b_zero = Owned::u8(&[], &[2]);
+        let y_scale = Owned::f32(&[], &[1.0]);
+        let y_zero = Owned::u8(&[], &[100]);
+        let combined = 2.0e8f32 * 1.0e8 / 1.0;
+        assert!(
+            combined.is_finite() && (578.0f32 * combined) > 9.3e18,
+            "the fixture must stay finite and still exceed the i64 range"
+        );
+
+        let out = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Uint8,
+            &[2, 2],
+        );
+        let expected = reference(Reference {
+            a: &a_values,
+            a_shape: &[2, 2],
+            a_scales: &[2.0e8, 2.0e8],
+            a_zeros: &[8, 8],
+            b: &b_values,
+            b_shape: &[2, 2],
+            b_scales: &[1.0e8],
+            b_zeros: &[2],
+            y_scale: 1.0,
+            y_zero: 100,
+            output_dtype: DataType::Uint8,
+        });
+        assert_eq!(expected, [255, 0, 255, 0]);
+        assert_eq!(output_values(&out), expected);
+    }
+
     /// MLAS clamps the float before rounding, which agrees with the scalar loop
     /// for every finite scale but maps `NaN` to the output minimum where the
     /// scalar loop maps it to the zero point. Individual scales are already
@@ -1536,14 +1738,24 @@ mod tests {
         let b_values = [3, 9, 5, 1];
         let a = Owned::u8(&[2, 2], &a_values.map(|v| v as u8));
         let b = Owned::u8(&[2, 2], &b_values.map(|v| v as u8));
-        // `1e30 * 1e30` overflows f32 even though each factor is a perfectly
-        // legal scale on its own; the second column stays finite.
-        let a_scale = Owned::f32(&[], &[1e30]);
+        // `3e8 * 3e30` overflows f32 even though each factor is a legal scale
+        // on its own, while the second column stays finite at 0.075 -- so this
+        // also pins down that one bad column takes the *whole* call off the
+        // fused path instead of only its own column.
+        let a_scale = Owned::f32(&[], &[3.0e8]);
         let a_zero = Owned::u8(&[], &[8]);
-        let b_scales = [1e30f32, 0.25];
+        let b_scales = [3.0e30f32, 0.25];
+        assert!(
+            (3.0e8f32 * b_scales[0]).is_infinite(),
+            "column 0 must overflow"
+        );
+        assert!(
+            (3.0e8f32 * b_scales[1] / 1.0e9).is_finite(),
+            "column 1 must not"
+        );
         let b_scale = Owned::f32(&[2], &b_scales);
         let b_zero = Owned::u8(&[2], &[2, 4]);
-        let y_scale = Owned::f32(&[], &[1e-30]);
+        let y_scale = Owned::f32(&[], &[1.0e9]);
         let y_zero = Owned::u8(&[], &[100]);
 
         let quant = QuantParams::load(
@@ -1556,7 +1768,7 @@ mod tests {
         .unwrap();
         let mut buffer = Vec::new();
         assert!(
-            fused_scale(&quant, 0, &b_scales, 1e-30, &mut buffer).is_none(),
+            fused_scale(&quant, 0, &b_scales, 1.0e9, &mut buffer).is_none(),
             "an infinite combined scale must be declined"
         );
 
@@ -1570,16 +1782,19 @@ mod tests {
         let expected = reference(Reference {
             a: &a_values,
             a_shape: &[2, 2],
-            a_scales: &[1e30],
+            a_scales: &[3.0e8],
             a_zeros: &[8],
             b: &b_values,
             b_shape: &[2, 2],
             b_scales: &b_scales,
             b_zeros: &[2, 4],
-            y_scale: 1e-30,
+            y_scale: 1.0e9,
             y_zero: 100,
             output_dtype: DataType::Uint8,
         });
+        // The finite column must still carry real values, or the comparison
+        // would be two saturated columns agreeing about nothing.
+        assert_eq!(expected, [255, 58, 255, 97]);
         assert_eq!(output_values(&out), expected);
     }
 
