@@ -179,19 +179,43 @@ pub(crate) const SIMD_MIN_LEN: usize = 32;
 ///
 /// These kernels are memory-bound at length, so the payoff is real bandwidth,
 /// not arithmetic: one core cannot saturate this socket's memory controllers.
-/// Below the threshold the rayon fork/join costs more than the work it hands
-/// out, so the split has to earn its place — see `par_min_len` for how the
-/// value is chosen.
+/// Below the threshold the fork/join costs more than the work it hands out, so
+/// the split has to earn its place.
+///
+/// **This threshold is set by what the split costs inside a real session, not
+/// by what it costs in a benchmark loop.** A rayon worker parks when it runs
+/// out of work, and a session hands the pool one short burst per node with
+/// non-trivial gaps in between, so nearly every call pays to wake the pool
+/// again. A tight benchmark loop never sees that, because it keeps the workers
+/// spinning. Measured through a real ORT session, our EP against ORT's CPU EP
+/// on the same graph and the same input:
+///
+/// | elements | `PAR_MIN_LEN` 16 Ki | `PAR_MIN_LEN` 1 Mi |
+/// |---|---|---|
+/// | 16384 | 0.19x | 1.20x |
+/// | 32768 | 0.17x | 1.43x |
+/// | 65536 | 0.16x | 1.60x |
+/// | 131072 | 0.21x | 1.68x |
+/// | 262144 | 0.98x | 1.80x |
+///
+/// (`Sqrt`, f32, ORT 1.28, one intra-op thread each, p50 of 200 interleaved
+/// runs.) The wake-up costs ~50 us and the work below a megabyte is worth less
+/// than that, so the old 16 Ki threshold turned a 1.2-1.8x win into a 5x loss
+/// on exactly the sizes a decode step uses.
 ///
 /// Kept well above [`SIMD_MIN_LEN`] so that every chunk is still long enough to
 /// take the vector path. That matters for more than speed: the scalar and
 /// vector paths are not bit-identical for the approximated kernels, so a chunk
 /// that fell back to scalar would make the result depend on the thread count.
-const PAR_MIN_LEN: usize = 16_384;
+const PAR_MIN_LEN: usize = 1_048_576;
 
-/// Minimum elements per thread. A chunk shorter than this spends more time in
-/// cache-line ping-pong at its boundaries than it saves.
-const PAR_MIN_CHUNK: usize = 8_192;
+/// Minimum elements per thread.
+///
+/// A chunk shorter than this spends more time waking the worker that runs it
+/// than the worker saves. At the measured ~50 us wake-up and ~0.3 ns/element,
+/// break-even is around 160 Ki elements per chunk; 256 Ki keeps a margin and
+/// still splits a 4 Mi prefill sixteen ways.
+const PAR_MIN_CHUNK: usize = 262_144;
 
 thread_local! {
     /// Set while a caller has to keep the f32 kernel on one thread.
