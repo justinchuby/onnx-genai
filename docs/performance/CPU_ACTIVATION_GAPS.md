@@ -114,57 +114,69 @@ The activation, trigonometric and hyperbolic families were in that gap and are
 now covered: `Sin`, `Cos`, `Tan`, `Asin`, `Acos`, `Atan`, `Sinh`, `Cosh`,
 `Asinh`, `Acosh`, `Atanh`, `ThresholdedRelu`, `Swish`, `Silu`, `PRelu`.
 
-**52 registered ops remain in the gap.** The list is not prose: it is asserted
+**66 registered ops remain in the gap.** The list is not prose: it is asserted
 exactly by `every_registered_op_has_a_shape_rule_or_is_a_known_gap`
 (`crates/onnx-runtime-ep-cpu-plugin/tests/shape_inference_coverage.rs`), which
-enumerates the registry and fails if an op is added without a shape rule *or* a
-shape rule is added without updating the list. Read that test for the current
-contents; the summary below is the shape of it.
+enumerates `OpRegistry::keys()` — the same set `supports_op` consults — and
+fails if an op is registered without a shape rule *or* a shape rule is added
+without updating the list. Read that test for the current contents; the summary
+below is the shape of it.
 
-### 1. Data-dependent — correctly declined (16)
+### 1. Data-dependent — correctly declined (20)
 
 The output shape is a function of an input's *values*, not its shape, so it
 cannot be inferred at capability time: `Compress`, `NonZero`, `Unique`,
 `NonMaxSuppression`, `ConstantOfShape`, `Expand`, `Range`, `Tile`, `OneHot`,
-`Pad`, `TopK`, `Split`, `Unsqueeze`, `BlackmanWindow`, `HammingWindow`,
-`HannWindow`.
+`Pad`, `TopK`, `Split`, `Unsqueeze`, `Resize`, `AffineGrid`, `Col2Im`,
+`CenterCropPad`, `BlackmanWindow`, `HammingWindow`, `HannWindow`.
 
-Most of these carry a **constant initializer** in practice — `Unsqueeze`'s
-`axes` and `Pad`'s `pads` are almost always constant folded inputs in a real
-transformer graph. A pass that resolves initializer values at capability time
+Most carry a **constant initializer** in practice — `Unsqueeze`'s `axes`,
+`Pad`'s `pads` and `Resize`'s `sizes` are almost always constant-folded inputs
+in a real graph. A pass that resolves initializer values at capability time
 would let us claim them. Until one exists, declining is the honest answer, and
-`Unsqueeze` in particular is a frequent op we are handing over.
+`Unsqueeze` in particular is a frequent op we are handing over. `Split` is only
+*partly* undecidable: the equal-split case follows from `num_outputs` alone.
 
-### 2. Internal fusion ops — never candidates (13)
+### 2. Internal fusion ops — never candidates (10)
 
 Emitted by our own fusion passes, so they are created *after* capability and
 never appear in an input graph: `FusedGemm`, `FusedAttention`,
-`FusedMatMulBias`, `LinearAttention`, `CausalConvWithState`, and the `pkg.nxrt`
-ops `BlockQuantizedMatMul`, `BlockQuantizedMoE`, `CompressedSparseAttention`,
-`IndexShare`, `PackedVarlenAttention`, `SparseKvGather`, `VarlenAttention`.
+`FusedMatMulBias`, and the `pkg.nxrt` ops `BlockQuantizedMatMul`,
+`BlockQuantizedMoE`, `CompressedSparseAttention`, `IndexShare`,
+`PackedVarlenAttention`, `SparseKvGather`, `VarlenAttention`.
 
-### 3. Inferrable but unwritten — this is the work (23)
+### 3. Inferrable but unwritten — this is the work (36)
 
 Real ops, in real input graphs, that we have a kernel for and hand to ORT
 anyway because nobody wrote the rule.
 
 **Shape-preserving; one line each.** `BitwiseNot`, `CastLike`, `CumProd`,
-`CumSum`, `DequantizeLinear`, `EyeLike`, `QuantizeLinear`, `ScatterElements`,
-`ScatterND`, `Trilu`. `QuantizeLinear`/`DequantizeLinear` are the ones that
-matter: they bracket every operator in a quantised model, so handing them over
-also fragments the partition around everything between them.
+`CumSum`, `DequantizeLinear`, `EyeLike`, `GroupNormalization`,
+`QuantizeLinear`, `ScatterElements`, `ScatterND`, `Trilu`.
+`QuantizeLinear`/`DequantizeLinear` are the ones that matter: they bracket
+every operator in a quantised model, so handing them over also fragments the
+partition around everything between them.
+
+**Pooling and CNN geometry.** `MaxPool`, `AveragePool`, `GlobalMaxPool`,
+`GlobalAveragePool`, `GlobalLpPool`, `LpPool`, `ConvTranspose`, `GridSample`,
+`SpaceToDepth`. All inferrable from `kernel_shape`, `strides`, `pads`,
+`dilations` and `ceil_mode` — exactly what `build_conv` already does for
+`Conv`, which *is* covered.
 
 **Inferrable from attributes or a fixed rule.** `ArgMax`, `ArgMin`, `Constant`,
 `DFT`, `DynamicQuantizeLinear`, `Flatten`, `GatherElements`, `QLinearMatMul`,
 `Size`.
 
-**Contrib ops needing a real rule.** `com.microsoft::Attention` — packed QKV
-with a different signature from `ai.onnx::Attention`, so the opset-23 arm
-deliberately does not cover it; this is the single highest-value entry in the
-list, because it is *the* attention op in exported GenAI models.
+**Contrib and model ops needing a real rule.** `com.microsoft::Attention` —
+packed QKV with a different signature from `ai.onnx::Attention`, so the
+opset-23 arm deliberately does not cover it; this is the single highest-value
+entry, because it is *the* attention op in exported GenAI models.
 `com.microsoft::MoE`, `com.microsoft::QMoE` and
 `com.microsoft::PackedMultiHeadAttention` are likewise read from exported
-models, not produced by our fusion passes.
+models. `LinearAttention` (both domains) and `com.microsoft::CausalConvWithState`
+are the Qwen3.5 / Qwen3-Next hybrid linear-attention primitives — **ORT has no
+kernel for these at all**, so declining them does not get a faster
+implementation, it gets a load failure.
 
 Groups 1 and 3 are why this EP cannot yet claim that no supported node reaches
 ORT.
