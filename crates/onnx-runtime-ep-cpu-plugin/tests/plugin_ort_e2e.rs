@@ -783,6 +783,7 @@ unsafe fn conformance_setup(
     let mut session_options: *mut ort::OrtSessionOptions = ptr::null_mut();
     let status = unsafe { ((*api).CreateSessionOptions.unwrap())(&mut session_options) };
     unsafe { check_status(api, status, "CreateSessionOptions") };
+    unsafe { pin_intra_op_threads(api, session_options) };
 
     // Disable ORT's built-in CPU EP fallback — forces failure if our plugin EP
     // declines a node, proving the test is not vacuous.
@@ -4646,6 +4647,159 @@ unsafe fn run_generated_case(
     }
 }
 
+/// Parse a positive-integer benchmark knob, naming the variable in any panic.
+///
+/// Unset, empty, and whitespace-only all mean "not configured" and yield
+/// `None`; anything else must be a positive integer or the run aborts. A typo
+/// must never degrade silently into a default, because the resulting numbers
+/// would be reported as if they had been measured under the requested setting.
+fn positive_bench_env(name: &str, raw: Option<&str>) -> Option<u32> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let value: u32 = raw
+        .parse()
+        .unwrap_or_else(|_| panic!("{name} must be a positive integer, got {raw:?}"));
+    assert!(value > 0, "{name} must be a positive integer, got {value}");
+    Some(value)
+}
+
+/// Thread budget for a benchmark run, from `NXRT_MM_BENCH_THREADS`.
+///
+/// A shared box cannot be measured honestly at full width: whichever side runs
+/// while another tenant is busy loses cores it would otherwise have had, and
+/// ORT's intra-op pool spins, so it loses more than we do. Pinning both sides
+/// to the same small thread count removes that variable -- the comparison stops
+/// depending on how many cores the rest of the machine happened to leave free.
+///
+/// `None` (unset) keeps ORT's own default. Our side reads its budget from
+/// `ONNX_GENAI_MLAS_THREADPOOL_THREADS`; [`bench_pool_budgets_agree`] is what
+/// makes sure the caller set both.
+fn bench_thread_budget(raw: Option<&str>) -> Option<i32> {
+    let threads = positive_bench_env("NXRT_MM_BENCH_THREADS", raw)?;
+    Some(i32::try_from(threads).unwrap_or_else(|_| {
+        panic!("NXRT_MM_BENCH_THREADS exceeds ORT's intra-op thread count, got {threads}")
+    }))
+}
+
+/// Warmup runs before the timed loop, from `NXRT_MM_BENCH_WARMUP`.
+///
+/// The default of 3 pays prepack and the first page faults, which is enough for
+/// a steady-state kernel measurement but thin for anything thread-pool bound: a
+/// pool that parks between runs is measured in its cold-wake state. Raise it
+/// when the quantity under test is scaling rather than arithmetic.
+fn bench_warmup_runs(raw: Option<&str>) -> usize {
+    positive_bench_env("NXRT_MM_BENCH_WARMUP", raw).map_or(3, |n| n as usize)
+}
+
+/// Reject a half-pinned A/B, where one side is capped and the other is not.
+///
+/// This is the trap the whole change exists to close. `NXRT_MM_BENCH_THREADS`
+/// pins ORT's intra-op pool, which is what plain ORT computes MatMul on -- but
+/// our plugin's MatMul does *not* run there. It runs on the standalone MLAS
+/// pool, sized by `ONNX_GENAI_MLAS_THREADPOOL_THREADS`. Setting only the former
+/// therefore caps ORT while leaving us at full width, which flatters us by
+/// exactly the "how many cores were free" mechanism this change is meant to
+/// eliminate; setting only the latter does the reverse. Either way the printed
+/// ratio would be an artefact, so refuse to produce it.
+fn bench_pool_budgets_agree(ort_side: Option<&str>, our_side: Option<&str>) -> Result<(), String> {
+    let ort_threads = positive_bench_env("NXRT_MM_BENCH_THREADS", ort_side);
+    let our_threads = positive_bench_env("ONNX_GENAI_MLAS_THREADPOOL_THREADS", our_side);
+    match (ort_threads, our_threads) {
+        (None, None) => Ok(()),
+        (a, b) if a == b => Ok(()),
+        (a, b) => Err(format!(
+            "a pinned A/B needs both pools pinned to the same count, got \
+             NXRT_MM_BENCH_THREADS={} (ORT's intra-op pool) and \
+             ONNX_GENAI_MLAS_THREADPOOL_THREADS={} (our MLAS pool); \
+             pinning one side only measures the other side's core count",
+            a.map_or_else(|| "unset".to_owned(), |v| v.to_string()),
+            b.map_or_else(|| "unset".to_owned(), |v| v.to_string()),
+        )),
+    }
+}
+
+#[test]
+fn the_bench_thread_budget_reads_a_positive_count_and_ignores_an_unset_one() {
+    assert_eq!(bench_thread_budget(None), None);
+    assert_eq!(bench_thread_budget(Some("")), None);
+    assert_eq!(bench_thread_budget(Some("  ")), None);
+    assert_eq!(bench_thread_budget(Some(" 4 ")), Some(4));
+}
+
+#[test]
+#[should_panic(expected = "NXRT_MM_BENCH_THREADS must be a positive integer, got 0")]
+fn the_bench_thread_budget_rejects_zero_threads() {
+    bench_thread_budget(Some("0"));
+}
+
+#[test]
+#[should_panic(expected = "NXRT_MM_BENCH_THREADS must be a positive integer, got \"all\"")]
+fn the_bench_thread_budget_rejects_a_word() {
+    bench_thread_budget(Some("all"));
+}
+
+#[test]
+#[should_panic(expected = "NXRT_MM_BENCH_THREADS must be a positive integer, got \"-4\"")]
+fn the_bench_thread_budget_rejects_a_negative_count() {
+    bench_thread_budget(Some("-4"));
+}
+
+#[test]
+#[should_panic(expected = "NXRT_MM_BENCH_THREADS exceeds ORT's intra-op thread count")]
+fn the_bench_thread_budget_rejects_a_count_past_the_ort_api_width() {
+    // Parses as u32, does not fit ORT's `c_int`, so it must be caught after the
+    // parse rather than silently wrapping to a negative thread count.
+    bench_thread_budget(Some("3000000000"));
+}
+
+#[test]
+fn the_bench_warmup_defaults_to_three_and_takes_an_override() {
+    assert_eq!(bench_warmup_runs(None), 3);
+    assert_eq!(bench_warmup_runs(Some("")), 3);
+    assert_eq!(bench_warmup_runs(Some("10")), 10);
+}
+
+#[test]
+#[should_panic(expected = "NXRT_MM_BENCH_WARMUP must be a positive integer, got 0")]
+fn the_bench_warmup_rejects_zero_because_that_would_time_the_prepack() {
+    bench_warmup_runs(Some("0"));
+}
+
+#[test]
+fn a_pinned_ab_is_refused_unless_both_pools_are_pinned_alike() {
+    assert!(bench_pool_budgets_agree(None, None).is_ok());
+    assert!(bench_pool_budgets_agree(Some(""), Some("  ")).is_ok());
+    assert!(bench_pool_budgets_agree(Some("16"), Some("16")).is_ok());
+    assert!(bench_pool_budgets_agree(Some(" 8 "), Some("8")).is_ok());
+
+    let ort_only = bench_pool_budgets_agree(Some("16"), None).unwrap_err();
+    assert!(ort_only.contains("NXRT_MM_BENCH_THREADS=16"), "{ort_only}");
+    assert!(
+        ort_only.contains("ONNX_GENAI_MLAS_THREADPOOL_THREADS=unset"),
+        "{ort_only}"
+    );
+    assert!(bench_pool_budgets_agree(None, Some("16")).is_err());
+    assert!(bench_pool_budgets_agree(Some("16"), Some("8")).is_err());
+}
+
+/// Apply [`bench_thread_budget`] to a session-options handle.
+///
+/// Called from every [`conformance_setup`], not only the benchmark, so a
+/// conformance run under an explicit budget honours it too. That is a no-op
+/// when the variable is unset -- which is every non-benchmark caller, including
+/// CI -- and numeric parity does not depend on the thread count either way.
+unsafe fn pin_intra_op_threads(api: *const ort::OrtApi, options: *mut ort::OrtSessionOptions) {
+    let raw = std::env::var("NXRT_MM_BENCH_THREADS").ok();
+    let Some(threads) = bench_thread_budget(raw.as_deref()) else {
+        return;
+    };
+    let set = unsafe { (*api).SetIntraOpNumThreads }.expect("SetIntraOpNumThreads");
+    let status = unsafe { set(options, threads) };
+    unsafe { check_status(api, status, "SetIntraOpNumThreads") };
+}
+
 /// Create a session with **no** execution provider appended, so ORT's own CPU
 /// EP owns the whole graph. Returns the ORT error message on failure instead of
 /// panicking, because one case exists precisely to prove ORT cannot load it.
@@ -4661,6 +4815,7 @@ unsafe fn try_plain_ort_session(
         let mut options: *mut ort::OrtSessionOptions = ptr::null_mut();
         let status = ((*api).CreateSessionOptions.unwrap())(&mut options);
         check_status(api, status, "CreateSessionOptions(plain ORT)");
+        pin_intra_op_threads(api, options);
         let mut session: *mut ort::OrtSession = ptr::null_mut();
         let status = ort_session::create_session(api, env, options, model_path, &mut session);
         if status.is_null() {
@@ -5589,6 +5744,27 @@ fn plugin_path_ab_vs_plain_ort() {
         _ => (true, true),
     };
     let _lock = lock_ort_ep();
+    // Refuse a half-pinned comparison outright: the resulting ratio would be an
+    // artefact of one side's core count, and a printed warning next to a number
+    // is not a control.
+    if let Err(why) = bench_pool_budgets_agree(
+        std::env::var("NXRT_MM_BENCH_THREADS").ok().as_deref(),
+        std::env::var("ONNX_GENAI_MLAS_THREADPOOL_THREADS")
+            .ok()
+            .as_deref(),
+    ) {
+        panic!("{why}");
+    }
+    let warmup = bench_warmup_runs(std::env::var("NXRT_MM_BENCH_WARMUP").ok().as_deref());
+    // Self-describing output: a CSV row is worthless six weeks later if the
+    // thread budget it was measured under is not next to it.
+    println!(
+        "# side={} intra_op_threads={} ours_pool_threads={} iters={iters} warmup={warmup}",
+        if side.is_empty() { "both" } else { &side },
+        std::env::var("NXRT_MM_BENCH_THREADS").unwrap_or_else(|_| "ort-default".to_owned()),
+        std::env::var("ONNX_GENAI_MLAS_THREADPOOL_THREADS")
+            .unwrap_or_else(|_| "ep-default".to_owned()),
+    );
     println!(
         "case,ours_p50_ms,ort_p50_ms,ratio_p50,ours_p90_ms,ort_p90_ms,ratio_p90,cold_ours_ms,cold_ort_ms"
     );
@@ -5652,7 +5828,7 @@ fn plugin_path_ab_vs_plain_ort() {
                     &input_name_ptrs,
                     &values,
                     &output_name_ptrs,
-                    3,
+                    warmup,
                 );
             }
             if run_ort {
@@ -5662,7 +5838,7 @@ fn plugin_path_ab_vs_plain_ort() {
                     &input_name_ptrs,
                     &values,
                     &output_name_ptrs,
-                    3,
+                    warmup,
                 );
             }
 
