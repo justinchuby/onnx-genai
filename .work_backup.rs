@@ -986,39 +986,3 @@ mod silu_parallel {
         }
     }
 }
-
-/// What the chunked SiLU path is worth, measured against the serial one.
-///
-/// `Silu`/`Swish` have no single-op equivalent in ORT's CPU EP, so there is no
-/// session-level A/B for them the way there is for `Erf` or `Gelu`. This
-/// measures the thing the change actually controls: the same kernel with the
-/// parallel split on and off, in one process, alternating to cancel drift.
-#[cfg(all(test, feature = "mlas"))]
-mod silu_bench {
-    use super::*;
-    use crate::kernels::simd_activations::serial_scope;
-    use std::time::Instant;
-
-    #[test]
-    #[ignore = "benchmark; run explicitly with --release --ignored --nocapture"]
-    fn silu_parallel_vs_serial() {
-        println!("n\tserial_us\tparallel_us\tspeedup\tthreads={}", rayon::current_num_threads());
-        for n in [1usize << 20, 1 << 22, 1 << 24] {
-            let x: Vec<f32> = (0..n).map(|i| ((i % 2003) as f32 - 1000.0) / 51.0).collect();
-            let mut y = vec![0.0f32; n];
-            // Best-of, alternating, so a scheduling hiccup cannot land on one
-            // arm only.
-            let (mut ser, mut par) = (f64::MAX, f64::MAX);
-            for _ in 0..9 {
-                let t = Instant::now();
-                serial_scope(|| silu_f32_slice(&x, &mut y));
-                ser = ser.min(t.elapsed().as_secs_f64());
-                let t = Instant::now();
-                silu_f32_slice(&x, &mut y);
-                par = par.min(t.elapsed().as_secs_f64());
-            }
-            let (s, p) = (ser * 1e6, par * 1e6);
-            println!("{n}\t{s:.1}\t{p:.1}\t{:.2}x", s / p);
-        }
-    }
-}

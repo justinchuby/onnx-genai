@@ -221,7 +221,7 @@ pub(crate) const SIMD_MIN_LEN: usize = 32;
 /// take the vector path. That matters for more than speed: the scalar and
 /// vector paths are not bit-identical for the approximated kernels, so a chunk
 /// that fell back to scalar would make the result depend on the thread count.
-const PAR_MIN_LEN: usize = 1_048_576;
+pub(crate) const PAR_MIN_LEN: usize = 1_048_576;
 
 /// Minimum elements per thread.
 ///
@@ -315,8 +315,12 @@ fn par_chunk_len_rows(len: usize, width: usize, threads: usize) -> Option<usize>
 /// short, or when already inside a rayon worker: nesting a `par_chunks` inside
 /// an outer parallel region only adds scheduling overhead, since the outer
 /// region is already keeping the pool busy.
+///
+/// `pub(crate)` because it is not specific to this file: any elementwise f32
+/// kernel wants it, and the MLAS-backed `SiLU`/`Relu`/`Clip` paths in sibling
+/// modules were single-threaded for want of it.
 #[inline]
-fn run_chunked<F>(input: &[f32], output: &mut [f32], body: F)
+pub(crate) fn run_chunked<F>(input: &[f32], output: &mut [f32], body: F)
 where
     F: Fn(&[f32], &mut [f32]) + Sync + Send,
 {
@@ -368,7 +372,7 @@ fn note_parallel_dispatch() {
 
 /// How many times this thread has reached [`run_chunked`]'s parallel branch.
 #[cfg(test)]
-fn parallel_dispatches() -> usize {
+pub(crate) fn parallel_dispatches() -> usize {
     PARALLEL_DISPATCHES.with(std::cell::Cell::get)
 }
 
