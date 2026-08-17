@@ -354,8 +354,7 @@ pub(crate) struct DenseCacheEnabledScope {
 #[cfg(test)]
 impl DenseCacheEnabledScope {
     pub(crate) fn new(enabled: bool) -> Self {
-        let prev =
-            MATMUL_DENSE_CACHE_ENABLED_OVERRIDE.with(|cell| cell.replace(Some(enabled)));
+        let prev = MATMUL_DENSE_CACHE_ENABLED_OVERRIDE.with(|cell| cell.replace(Some(enabled)));
         Self { prev }
     }
 }
@@ -2127,7 +2126,11 @@ mod tests {
             let elem = dtype.byte_size();
             graph.set_initializer(
                 b,
-                WeightRef::Inline(TensorData::from_raw(dtype, vec![k, n], vec![0u8; k * n * elem])),
+                WeightRef::Inline(TensorData::from_raw(
+                    dtype,
+                    vec![k, n],
+                    vec![0u8; k * n * elem],
+                )),
             );
         }
         graph
@@ -2148,12 +2151,7 @@ mod tests {
             "f16 constant widens to a 4*k*n f32 copy"
         );
         assert_eq!(
-            matmul_dense_cache_predicted_bytes(&dense_matmul_graph(
-                k,
-                n,
-                DataType::BFloat16,
-                true
-            )),
+            matmul_dense_cache_predicted_bytes(&dense_matmul_graph(k, n, DataType::BFloat16, true)),
             bytes,
             "bf16 constant widens to a 4*k*n f32 copy"
         );
@@ -2163,12 +2161,7 @@ mod tests {
             "a contiguous f32 constant is borrowed zero-copy, nothing cached"
         );
         assert_eq!(
-            matmul_dense_cache_predicted_bytes(&dense_matmul_graph(
-                k,
-                n,
-                DataType::Float16,
-                false
-            )),
+            matmul_dense_cache_predicted_bytes(&dense_matmul_graph(k, n, DataType::Float16, false)),
             0,
             "a non-constant operand is never memoised as a weight"
         );
@@ -3206,7 +3199,10 @@ mod tests {
             kernel.prepack.packed_b.get().unwrap() as *const mlas_sys::PackedB,
             packed_ptr
         );
-        assert_eq!(kernel.prepack.dense[1].filled().unwrap().as_ptr(), dense_ptr);
+        assert_eq!(
+            kernel.prepack.dense[1].filled().unwrap().as_ptr(),
+            dense_ptr
+        );
         assert!(!kernel.prepack.dense[0].is_filled());
         assert_ne!(out1.to_f32(), out2.to_f32());
     }
