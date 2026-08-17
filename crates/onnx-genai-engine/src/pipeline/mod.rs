@@ -237,6 +237,7 @@ pub struct PipelineEngine {
     decode_backend: EngineDecodeBackend,
     max_sequence_length: Option<usize>,
     eos_token_ids: Vec<TokenId>,
+    generation_defaults: Option<onnx_genai_metadata::GenerationDefaults>,
     /// Autoregressive decode state; `None` for non-autoregressive pipelines
     /// (single-pass, iterative/diffusion) which produce tensors, not tokens.
     decoder_state: Option<DecodeState>,
@@ -579,6 +580,16 @@ fn pipeline_metadata_eos_token_ids(
         .collect()
 }
 
+fn pipeline_metadata_generation_defaults(
+    directory: &onnx_genai_ort::PipelineModelDirectory,
+) -> Option<onnx_genai_metadata::GenerationDefaults> {
+    directory
+        .metadata_path
+        .as_ref()
+        .and_then(|path| onnx_genai_metadata::load_metadata(path).ok())
+        .and_then(|metadata| metadata.generation)
+}
+
 /// Build the native device-KV [`PipelineDecoderComponent`] for `decoder`, loading
 /// its ONNX model as a [`NativeDecodeSession`](crate::native_decode::NativeDecodeSession)
 /// on the native backend so its KV cache stays session-resident across steps.
@@ -768,6 +779,11 @@ impl PipelineEngine {
         options.max_context.or(self.max_sequence_length)
     }
 
+    /// Model-authored sampling defaults declared by the pipeline package.
+    pub fn generation_defaults(&self) -> Option<&onnx_genai_metadata::GenerationDefaults> {
+        self.generation_defaults.as_ref()
+    }
+
     /// Execution-provider placement reported by the loaded component sessions.
     pub fn execution_provider_status(&self) -> String {
         let mut summaries = self
@@ -860,6 +876,7 @@ impl PipelineEngine {
             .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {e}"))?;
         let max_sequence_length = pipeline_metadata_max_len(&directory);
         let eos_token_ids = pipeline_metadata_eos_token_ids(&directory);
+        let generation_defaults = pipeline_metadata_generation_defaults(&directory);
         let model_weights_bytes =
             directory
                 .model_paths
@@ -1266,6 +1283,7 @@ impl PipelineEngine {
             },
             max_sequence_length,
             eos_token_ids,
+            generation_defaults,
             decoder_state,
             tokenizer_component,
             fixed_state_budget_bytes,
