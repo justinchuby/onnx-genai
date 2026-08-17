@@ -41,6 +41,56 @@ fn build_kernel_registry_entries() -> Vec<KernelRegistryEntry> {
         .collect()
 }
 
+/// Opt this process out of the persistent SPMD decode pool.
+///
+/// That pool exists for `onnx-genai-engine`'s native decode loop, which runs a
+/// whole decode step inside an SPMD scope so resident workers can take one
+/// output-column shard each under a single barrier. Nothing in the plugin path
+/// ever enters that scope: ONNX Runtime owns the graph, the schedule and the
+/// threads, and calls kernels one node at a time. What the plugin does inherit
+/// is the pool's costs -- resident workers competing with ORT's own intra-op
+/// pool, and a `MatMulNBits` weight pre-partitioned into one MLAS shard per
+/// persistent decode worker (`available_parallelism() / 2` by default -- 16 on
+/// the 32-vCPU host below), which then caps an unscoped decode GEMV at that
+/// worker count no matter how many threads the host has.
+///
+/// Measured on the plugin path (32 vCPU AMD EPYC 9V74, MLAS build, int4
+/// block-32, K=N=2048, M=1, p50 of 41 runs, each backend alone in its own
+/// process): 0.376 ms with the pool built against 0.092 ms without it, against
+/// ONNX Runtime's own CPU EP at 0.097 ms -- a 3.9x loss turned into a small
+/// win. Prefill (`m > 1`) is unaffected either way: it splits the shards into
+/// row blocks, so the shard count is not a thread ceiling there.
+///
+/// Setting `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL` explicitly still wins, so a
+/// host that wants the pool can ask for it.
+///
+/// This flips a default for the whole linked copy of `onnx-runtime-ep-cpu`.
+/// Today the cdylib has its own copy, separate from any native engine in the
+/// process; a future host that linked both against one copy would have to make
+/// this scope-aware rather than process-wide.
+pub fn disable_persistent_decode_pool() {
+    onnx_runtime_ep_cpu::decode_spmd::set_persistent_decode_pool_default(false);
+}
+
+/// Whether this library's process would build the persistent SPMD decode pool,
+/// as `1` (it would) or `0` (it would not).
+///
+/// Exists so a test on the other side of the cdylib boundary can observe the
+/// opt-out that [`disable_persistent_decode_pool`] performs. A test binary that
+/// merely links `onnx-runtime-ep-cpu` sees *its own* copy of the pool statics,
+/// not the ones ONNX Runtime's `dlopen`ed library uses, so only an export can
+/// answer this. Querying resolves the pool for the process, which is why this
+/// is a test hook and not something the EP itself calls.
+///
+/// # Safety
+///
+/// None: no arguments, no pointers. Declared `extern "C"` for the test's
+/// `dlsym`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_persistent_decode_pool_built() -> i32 {
+    i32::from(onnx_runtime_ep_cpu::decode_spmd::pools().is_some())
+}
+
 /// Leak a string to get a `&'static str` (the entries must live for the EP lifetime).
 fn leak_str(s: &str) -> &'static str {
     Box::leak(s.to_owned().into_boxed_str())
@@ -81,6 +131,9 @@ pub unsafe extern "C" fn CreateEpFactories(
     let out_factories_raw = out_factories;
     let out_num_raw = out_num;
     let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+        // Before any kernel can query the pool: this is the first call ONNX
+        // Runtime makes into the library.
+        disable_persistent_decode_pool();
         let entries = build_kernel_registry_entries();
         unsafe {
             onnx_runtime_ep_plugin::factory::create_ep_factories_with_registry(

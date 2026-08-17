@@ -5143,6 +5143,71 @@ opset_import: [{{ version: 17 }}, {{ domain: "com.microsoft" version: 1 }}]
 /// report nothing. A wiring that marks everything constant passes the first
 /// two assertions and fails the third — and would be a real bug, not merely a
 /// slower one, because a prepack of an activation must never outlive the call.
+/// ONNX Runtime's own copy of this library must not build the persistent SPMD
+/// decode pool.
+///
+/// `CreateEpFactories` opts the process out because nothing in the plugin path
+/// ever enters an SPMD decode scope, and a pool that is built but never
+/// dispatched to is pure cost: resident workers competing with ORT's intra-op
+/// pool, plus a `MatMulNBits` weight pre-split into one MLAS shard per decode
+/// worker, which caps an unscoped decode GEMV at that worker count. Measured
+/// 0.376 ms -> 0.092 ms on int4 block-32 K=N=2048 M=1, against ORT's CPU EP at
+/// 0.097 ms.
+///
+/// The sibling unit test in `decode_pool_optout.rs` can only prove the library
+/// plumbing: a test binary links its *own* copy of `onnx-runtime-ep-cpu`, whose
+/// pool statics are not the ones the `dlopen`ed cdylib uses. This test reads
+/// the answer back out of the library ORT actually loaded, after ORT has run a
+/// decode through it, so it fails if the `CreateEpFactories` call site is ever
+/// dropped.
+#[test]
+fn the_plugin_ep_disables_the_decode_pool_in_ort() {
+    let _lock = lock_ort_ep();
+    let ep_path = match find_ep_cdylib() {
+        Some(p) => p,
+        None => {
+            if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+                panic!("NXRT_REQUIRE_ORT_TESTS=1 but the EP cdylib is missing");
+            }
+            eprintln!("*** SKIPPED: EP cdylib not found ***");
+            return;
+        }
+    };
+    if std::env::var("ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL").is_ok() {
+        eprintln!("*** SKIPPED: the environment asks for a specific pool mode ***");
+        return;
+    }
+    // Same absolute path ORT registers, so this is the same mapping and the
+    // same statics -- not a second copy of the library.
+    let ep_lib = unsafe { libloading::Library::new(&ep_path) }.expect("dlopen EP cdylib");
+    let pool_built: libloading::Symbol<'_, unsafe extern "C" fn() -> i32> =
+        unsafe { ep_lib.get(b"nxrt_ep_persistent_decode_pool_built") }
+            .expect("nxrt_ep_persistent_decode_pool_built not exported");
+
+    let case = matmul_family_cases()
+        .into_iter()
+        .find(|c| c.name == "nbits4_decode")
+        .expect("case present");
+    let path = write_generated_model(case.name, &case.model);
+    let reg = "cpu_ep_decode_pool_optout";
+    let Some((_lib, api, env, opts, session)) = (unsafe { conformance_setup(reg, &path, true) })
+    else {
+        eprintln!("*** SKIPPED: ORT not found ***");
+        return;
+    };
+    unsafe {
+        run_generated_case(api, session, &case, "decode-pool-optout");
+        conformance_teardown(api, env, opts, session, reg);
+    }
+
+    assert_eq!(
+        unsafe { pool_built() },
+        0,
+        "ONNX Runtime's copy of the plugin built the persistent SPMD decode \
+         pool it never dispatches to; CreateEpFactories must opt the process out"
+    );
+}
+
 #[test]
 fn constant_weights_are_reported_to_kernels_as_constant() {
     let _lock = lock_ort_ep();
@@ -5424,6 +5489,11 @@ unsafe fn bench_runs(
 }
 
 fn percentile(samples: &mut [f64], p: f64) -> f64 {
+    if samples.is_empty() {
+        // A one-sided run (`NXRT_MM_BENCH_SIDE`) collects no samples for the
+        // other backend; report it as unmeasured rather than a number.
+        return f64::NAN;
+    }
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let idx = ((samples.len() - 1) as f64 * p).round() as usize;
     samples[idx]
@@ -5504,6 +5574,20 @@ fn plugin_path_ab_vs_plain_ort() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(31);
     let filter = std::env::var("NXRT_MM_BENCH_CASE").unwrap_or_default();
+    // Both sessions live in one process, so each side's thread pool is resident
+    // (and, while ORT's intra-op pool spins, actively burning cores) during the
+    // other side's timed runs. On a 32-vCPU host that is worth several times the
+    // measured cost: the same int4 m=128 case reports ORT at 0.98 ms when our
+    // sharded path runs beside it and 4.40 ms beside our full-width path.
+    // `NXRT_MM_BENCH_SIDE=ours|ort` runs one side only, so a two-process A/B can
+    // measure each backend with the machine to itself. Unset keeps the
+    // interleaved single-process comparison.
+    let side = std::env::var("NXRT_MM_BENCH_SIDE").unwrap_or_default();
+    let (run_ours, run_ort) = match side.as_str() {
+        "ours" => (true, false),
+        "ort" => (false, true),
+        _ => (true, true),
+    };
     let _lock = lock_ort_ep();
     println!(
         "case,ours_p50_ms,ort_p50_ms,ratio_p50,ours_p90_ms,ort_p90_ms,ratio_p90,cold_ours_ms,cold_ort_ms"
@@ -5561,45 +5645,56 @@ fn plugin_path_ab_vs_plain_ort() {
             let output_name_ptrs = [output_name.as_ptr()];
 
             // Warm both sides: first run pays prepack and page faults.
-            bench_runs(
-                api,
-                session,
-                &input_name_ptrs,
-                &values,
-                &output_name_ptrs,
-                3,
-            );
-            bench_runs(
-                api,
-                ort_session,
-                &input_name_ptrs,
-                &values,
-                &output_name_ptrs,
-                3,
-            );
+            if run_ours {
+                bench_runs(
+                    api,
+                    session,
+                    &input_name_ptrs,
+                    &values,
+                    &output_name_ptrs,
+                    3,
+                );
+            }
+            if run_ort {
+                bench_runs(
+                    api,
+                    ort_session,
+                    &input_name_ptrs,
+                    &values,
+                    &output_name_ptrs,
+                    3,
+                );
+            }
 
             // Interleave one iteration each so a drifting host load lands on
             // both sides rather than on whichever ran second.
             let mut ours = Vec::with_capacity(iters);
             let mut theirs = Vec::with_capacity(iters);
             for _ in 0..iters {
-                ours.extend(bench_runs(
-                    api,
-                    session,
-                    &input_name_ptrs,
-                    &values,
-                    &output_name_ptrs,
-                    1,
-                ));
-                theirs.extend(bench_runs(
-                    api,
-                    ort_session,
-                    &input_name_ptrs,
-                    &values,
-                    &output_name_ptrs,
-                    1,
-                ));
+                if run_ours {
+                    ours.extend(bench_runs(
+                        api,
+                        session,
+                        &input_name_ptrs,
+                        &values,
+                        &output_name_ptrs,
+                        1,
+                    ));
+                }
+                if run_ort {
+                    theirs.extend(bench_runs(
+                        api,
+                        ort_session,
+                        &input_name_ptrs,
+                        &values,
+                        &output_name_ptrs,
+                        1,
+                    ));
+                }
             }
+            // A one-sided run reports `NaN` for the side it did not measure, so
+            // a ratio can never be assembled from two different processes by
+            // accident; the caller compares the two p50 columns explicitly.
             let (o50, o90) = (percentile(&mut ours, 0.5), percentile(&mut ours, 0.9));
             let (t50, t90) = (percentile(&mut theirs, 0.5), percentile(&mut theirs, 0.9));
             println!(

@@ -1245,8 +1245,56 @@ pub(crate) fn persistence_mode_from_raw(raw: Option<&str>) -> PersistenceMode {
     }
 }
 
+/// Default when [`PERSISTENT_POOL_ENV`] is unset. `true` (the historical
+/// default) builds the persistent SPMD pool; a host that never enters an SPMD
+/// decode scope sets this to `false`.
+static PERSISTENT_POOL_DEFAULT: AtomicBool = AtomicBool::new(true);
+
+/// Opt this process out of (or back into) the persistent SPMD decode pool when
+/// [`PERSISTENT_POOL_ENV`] is unset.
+///
+/// The pool only pays off for a host that drives decode *inside* an SPMD scope
+/// (`onnx-genai-engine`'s native decode loop): resident workers, one barrier
+/// per projection, no fork/join. A host that never enters such a scope -- the
+/// plugin EP, where ONNX Runtime owns the graph and the threads -- gets only
+/// the costs: resident workers competing with ORT's own intra-op pool, and an
+/// MLAS weight partitioned into one shard per persistent decode worker
+/// (`available_parallelism() / 2` by default), which caps an unscoped decode
+/// GEMV at that worker count however many threads the host has.
+///
+/// Measured on the plugin path (32 vCPU AMD EPYC 9V74, MLAS build, int4
+/// block-32, K=N=2048, M=1, p50 of 41 runs, each backend alone in its process):
+/// 0.376 ms with the pool built against 0.092 ms without it, with ONNX
+/// Runtime's own CPU EP at 0.097 ms.
+///
+/// An explicit `PERSISTENT_POOL_ENV` setting always wins. Must be called before
+/// the first [`pools()`] query; afterwards the built layout is fixed for the
+/// process. `Relaxed` is sufficient because the only supported caller writes
+/// this during library initialization, before the host has created a session or
+/// spawned the threads that read it -- that handoff is the synchronisation.
+pub fn set_persistent_decode_pool_default(enabled: bool) {
+    PERSISTENT_POOL_DEFAULT.store(enabled, Ordering::Relaxed);
+}
+
+/// Resolve the persistence mode from the raw env value and the process default.
+/// An explicit setting always wins; the default only decides the unset case.
+/// Pure so the precedence is unit-tested without env races.
+pub(crate) fn resolve_persistence_mode(
+    raw: Option<&str>,
+    default_enabled: bool,
+) -> PersistenceMode {
+    match raw {
+        Some(value) => persistence_mode_from_raw(Some(value)),
+        None if !default_enabled => PersistenceMode::Off,
+        None => persistence_mode_from_raw(None),
+    }
+}
+
 fn persistence_mode() -> PersistenceMode {
-    persistence_mode_from_raw(std::env::var(PERSISTENT_POOL_ENV).ok().as_deref())
+    resolve_persistence_mode(
+        std::env::var(PERSISTENT_POOL_ENV).ok().as_deref(),
+        PERSISTENT_POOL_DEFAULT.load(Ordering::Relaxed),
+    )
 }
 
 /// Whether a persistence mode **builds** the persistent SPMD pool. Both `On`
@@ -1814,6 +1862,39 @@ pub(crate) fn auto_record_sample(path: AutoPath, elapsed: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host that never enters an SPMD decode scope (the plugin EP) turns the
+    /// pool off by default, and an explicit environment setting still wins in
+    /// both directions -- otherwise opting the plugin out would take the pool
+    /// away from anyone who asked for it by name.
+    #[test]
+    fn process_default_decides_only_the_unset_case() {
+        assert_eq!(
+            resolve_persistence_mode(None, true),
+            PersistenceMode::On,
+            "unset with the historical default builds the pool"
+        );
+        assert_eq!(
+            resolve_persistence_mode(None, false),
+            PersistenceMode::Off,
+            "unset with the pool opted out leaves decode on the flat path"
+        );
+        assert_eq!(
+            resolve_persistence_mode(Some("1"), false),
+            PersistenceMode::On,
+            "an explicit =1 wins over a process opt-out"
+        );
+        assert_eq!(
+            resolve_persistence_mode(Some("auto"), false),
+            PersistenceMode::Adaptive,
+            "an explicit =auto wins over a process opt-out"
+        );
+        assert_eq!(
+            resolve_persistence_mode(Some("0"), true),
+            PersistenceMode::Off,
+            "an explicit =0 wins over the historical default"
+        );
+    }
 
     fn two_group_pool() -> SpmdDecodePools {
         let shards = vec![
