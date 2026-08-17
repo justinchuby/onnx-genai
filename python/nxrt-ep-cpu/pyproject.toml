@@ -64,7 +64,7 @@ skip = "*-musllinux_*"
 # wheel is expected to carry the MLAS kernels wherever setup.py enables them,
 # and a silently-pure-Rust wheel is an order of magnitude slower on quantized
 # matmul. `_mlas_features()` is the single source of truth for both.
-test-command = 'python {project}/check_wheel.py'
+test-command = 'python {package}/check_wheel.py'
 
 [tool.cibuildwheel.linux]
 # manylinux container needs libclang (bindgen, via onnx-genai-ort-sys) and Rust.

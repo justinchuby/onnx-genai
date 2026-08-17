@@ -70,6 +70,7 @@ def build_features() -> str:
     Raises:
         FileNotFoundError: if the shared library was not packaged.
         OSError: if the library cannot be loaded.
+        AttributeError: if the bundled library predates this export.
     """
     handle = ctypes.CDLL(get_library_path())
     entry = handle.nxrt_ep_build_features

@@ -183,8 +183,8 @@ pub extern "C" fn nxrt_ep_reset_compiled_node_count() {
 
 // ─── Build identity ─────────────────────────────────────────────────────────
 
-/// The optional build features compiled into this cdylib, comma-separated, as
-/// a NUL-terminated static string (empty when there are none).
+/// The optional build features compiled into this cdylib, as a NUL-terminated
+/// static string: `"mlas"`, or empty when there are none.
 ///
 /// A packaged cdylib is opaque: nothing about the file says whether the
 /// vendored MLAS kernels were linked in, and the difference is an order of

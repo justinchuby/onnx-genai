@@ -397,6 +397,11 @@ pub fn find_plugin_cdylib_with_features(package: &str, features: &[&str]) -> Opt
     let mut guard = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Keyed by package *and* features because they are different builds, even
+    // though cargo writes both to the same `target/<profile>/<libname>`. One
+    // process asking for two feature sets would therefore rebuild over itself;
+    // no caller does (each test binary's feature set is a `cfg!` constant), and
+    // this key at least keeps the two answers from being silently conflated.
     let key = format!("{package}\u{1}{}", features.join(","));
     if let Some(cached) = guard.get(&key) {
         return cached.clone();
