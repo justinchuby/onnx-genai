@@ -1316,8 +1316,9 @@ work.
   not yet measured (§20.1), so that is the next instrument to build, before the next
   optimisation. **§21 builds that instrument and answers this**: for the Transpose graphs
   the per-run path is 60-74% input binding and 25-38% boundary materialisation. **§22
-  then attacks the input binding**, taking the Transpose graphs from 6.9-14.5x ORT to
-  3.0-5.8x ORT. Boundary materialisation is untouched and remains open.
+  then attacks the input binding**, taking the two Transpose graphs whose inputs clear
+  its threshold from 6.9-14.5x ORT to 3.0-5.8x ORT. Boundary materialisation is
+  untouched and remains open.
 * **`Concat` remains a genuine kernel cost** and remains bounded by §13: `ExternalValue`
   carries no strides, so a `Concat`-shaped KV cache cannot append in place. The Phase 4
   in-place append (#1083) applies to the GQA-shaped cache, not this one.
@@ -1476,8 +1477,10 @@ reflects waking sleeping workers on a contended host.
 
 The threshold is **4 MiB**: above every measured loss, at or below every measured
 win, one step clear of the cliff rather than sitting on it.
-`ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES` overrides it, and is read on every call
-rather than cached, so a test can move it.
+`ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES` overrides it, read once per process
+into a `OnceLock` - which is correct for this sweep because it runs one process
+per arm. Tests move the threshold through a thread-local override instead of the
+environment, so they cannot race each other.
 
 ### 22.2 The interleaved harness cannot resolve this effect
 
@@ -1558,7 +1561,8 @@ comparison within a row.
 
 ### 22.5 What this does and does not claim
 
-* The Transpose graphs go from 6.9-14.5x ORT to **3.0-5.8x ORT**. Still a loss;
+* The two Transpose graphs above the threshold - `tr_llama3_s512` and
+  `tr_whisper_s1500` - go from 6.9-14.5x ORT to **3.0-5.8x ORT**. Still a loss;
   a large fraction of what remains is `collect_outputs` (§21) and the
   single-node harness's double-copy artefact (§21.3).
 * `kvcat_llama3_p8191` improves 7-13%. The other `Concat` rows do not move,
@@ -1580,13 +1584,24 @@ were re-measured on the shipped version rather than assumed to carry over.
 
 Paired, same binary, one process per arm, 16-thread budget, `native` p50 in ms:
 
-| graph | per-tensor input | serial (5 reps) | parallel (5 reps) | ratio range |
-|---|---|---|---|---|
-| `tr_llama3_s512` | 8 MiB | 0.772 / 0.806 / 0.815 / 0.860 / 0.864 | 0.343 / 0.405 / 0.419 / 0.424 / 0.439 | 0.44-0.51 |
-| `tr_bert_b8_s128` (control) | 3 MiB | 0.514 / 0.531 / 0.535 | 0.520 / 0.542 / 0.546 | 0.97-1.06 |
-| `sm_decode_h32_kv1024` (control) | 0.125 MiB | 0.023 / 0.023 / 0.024 | 0.023 / 0.023 / 0.023 | 0.96-1.00 |
+Values are listed sorted, so they are marginals rather than paired samples. The
+ratio range is therefore the **widest ratio any pairing could produce** -
+`min(parallel) / max(serial)` to `max(parallel) / min(serial)` - which is the only
+bound the data supports, applied identically to every row.
 
-The `tr_llama3_s512` win survives the rework at every repetition, and the two
-control graphs - one just below the threshold, one two orders of magnitude below
-it - are unchanged, which is the direct falsifier for the regression the review
-identified: a per-call `env::var` would show on the 0.023 ms decode row.
+| graph | per-tensor input | reps | serial | parallel | ratio range |
+|---|---|--:|---|---|---|
+| `tr_llama3_s512` | 8 MiB | 5 | 0.772 / 0.806 / 0.815 / 0.860 / 0.864 | 0.343 / 0.405 / 0.419 / 0.424 / 0.439 | **0.40-0.57** |
+| `tr_bert_b8_s128` (control) | 3 MiB | 3 | 0.514 / 0.531 / 0.535 | 0.520 / 0.542 / 0.546 | 0.97-1.06 |
+| `sm_decode_h32_kv1024` (control) | 0.125 MiB | 3 | 0.023 / 0.023 / 0.024 | 0.023 / 0.023 / 0.023 | 0.96-1.00 |
+
+The `tr_llama3_s512` win survives the rework: even the worst pairing is 0.57, so
+every repetition is a win. The two control graphs - one just below the threshold,
+one two orders of magnitude below it - are flat.
+
+**The control rows are not a falsifier for the per-call `env::var` the review
+removed.** That call cost ~72 ns, which is 0.3% of the 23 us decode run - below
+this measurement's 1 us display resolution and well inside the row's own ~4%
+spread. The evidence that the read is now cached is the code, not this table.
+What these rows do show is that the reworked gate ordering did not disturb the
+below-threshold path, which is what they are here for.
