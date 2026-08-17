@@ -1026,5 +1026,173 @@ never allow.
   fallback floors are reasoned from allocator design, **not measured**. The
   runtime probe is what makes that acceptable: on any platform where the reasoning
   is wrong, calibration overrides the constant.
-* Phase 4 requirements 2 (grouped MoE GEMM) and 3 (fused transpose-with-consumer)
-  remain **open and unstarted**. The §10 assignment matrix is unchanged by Phase 4.
+* Phase 4 requirement 3 (fused transpose-with-consumer) remains **open**; see §19.
+  The §10 assignment matrix is unchanged by Phase 4.
+
+## 18. Grouped MoE expert GEMMs (#1099)
+
+### 18.1 Why MoE lost, and it was not arithmetic
+
+At `--native-threads 1` the CPU MoE operator was **at parity** with a real ORT CPU
+session on all nine synthetic production-shaped graphs: ratios 1.01-1.05. The entire
+gap opened up as threads were added. Native time for a 512-token Mixtral-shaped
+forward was 350.8 / 148.6 / 113.4 ms at 1 / 8 / 16 threads in the single-arm baseline run
+(the paired run in §18.3 measured 353.2 / 148.7 / 112.2 ms for the same cell - the same
+numbers inside session-to-session drift). Inverting Amdahl's law on those three points
+puts the **serial fraction at ~34%**.
+
+The serial 34% was everything except the GEMMs:
+
+* the per-expert gather, a row-at-a-time `extend_from_slice` into a fresh `Vec`;
+* the activation, which for gated SwiGLU built **three** additional `Vec`s element by
+  element with `push` - roughly 56 MiB of allocation and three passes for a single
+  512-token Mixtral forward;
+* the weighted scatter, a scalar `+=` loop.
+
+MLAS was already threading the expert GEMMs well. This is the same lesson as §15: the
+operator's cost was in the transforms around the arithmetic, not the arithmetic.
+
+### 18.2 What changed
+
+`RoutingPlan` flattens top-k routing into a slot ordering - every row routed to the
+lowest active expert first, then the next - which makes each expert's GEMM operand a
+contiguous window and every stage between routing and the output write a flat row-wise
+parallel map over one buffer. Experts whose groups hold the same number of rows are
+issued to MLAS as **one batched GEMM** through a new `mlas_sys::sgemm_batch` wrapper
+over `MlasGemmBatch`; that call issues a single `MlasTrySimpleParallel` fan-out of
+`ThreadsPerGemm * BatchSize` work items, so batching collapses N dispatches and N
+barriers into one. Both biases fold into a pass that already reads the result (FC1's
+into the activation, FC2's into the scatter), removing two full read-modify-write
+passes over the largest intermediates.
+
+Because slots are laid out by ascending expert, each output row still sums its
+contributions in ascending expert order, so the result is **bit-identical** to the
+per-expert loop rather than merely close - the tests assert on raw `Vec<f32>` equality.
+
+### 18.3 Full matrix, 27 cells, real ORT CPU session
+
+`ratio = native p50 / ORT p50`, **lower is better**. Interleaved arms, same host,
+same session options, same thread count on both sides, 5 warmups, 5 trials x 15 runs.
+Synthetic weights from `scripts/ort_ab/gen_moe.py` (public architecture dimensions,
+reduced expert counts, **no weights downloaded**).
+
+| model (h / inter / experts / top-k) | tokens | threads | ORT ratio before | ORT ratio after | native before | native after | native delta | driver |
+|---|--:|--:|--:|--:|--:|--:|--:|:--|
+| mixtral 1024/3584/8/top-2 | 1 | 1 | 1.033 [1.009-1.072] | **1.030** [1.005-1.033] | 3.2 ms | 3.2 ms | +1.1% | per-expert |
+| mixtral 1024/3584/8/top-2 | 1 | 8 | 0.683 [0.672-0.720] | **0.695** [0.671-0.704] | 2.3 ms | 2.3 ms | +0.3% | per-expert |
+| mixtral 1024/3584/8/top-2 | 1 | 16 | 0.658 [0.641-0.678] | **0.668** [0.666-0.677] | 2.2 ms | 2.2 ms | +1.3% | per-expert |
+| mixtral 1024/3584/8/top-2 | 32 | 1 | 1.023 [1.021-1.029] | **1.022** [1.018-1.025] | 52.1 ms | 52.3 ms | +0.2% | per-expert |
+| mixtral 1024/3584/8/top-2 | 32 | 8 | 2.074 [2.046-2.176] | **1.927** [1.585-2.099] | 17.8 ms | 18.0 ms | +1.3% | per-expert |
+| mixtral 1024/3584/8/top-2 | 32 | 16 | 1.713 [1.373-2.743] | **1.410** [1.230-1.714] | 16.4 ms | 14.8 ms | -9.5% | per-expert |
+| mixtral 1024/3584/8/top-2 | 512 | 1 | 1.052 [1.044-1.055] | **1.049** [1.038-1.049] | 353.2 ms | 351.4 ms | -0.5% | per-expert |
+| mixtral 1024/3584/8/top-2 | 512 | 8 | 2.536 [2.405-2.544] | **1.724** [1.167-1.729] | 148.7 ms | 101.1 ms | -32.0% | grouped |
+| mixtral 1024/3584/8/top-2 | 512 | 16 | 1.785 [1.727-1.889] | **1.004** [0.924-1.042] | 112.2 ms | 60.3 ms | -46.3% | grouped |
+| phi35moe 2048/6400/4/top-2 | 1 | 1 | 1.006 [1.000-1.006] | **0.999** [0.970-1.011] | 10.5 ms | 10.7 ms | +1.2% | per-expert |
+| phi35moe 2048/6400/4/top-2 | 1 | 8 | 0.786 [0.781-0.788] | **0.788** [0.779-0.790] | 8.8 ms | 8.9 ms | +0.7% | per-expert |
+| phi35moe 2048/6400/4/top-2 | 1 | 16 | 0.784 [0.782-1.007] | **0.793** [0.783-0.807] | 8.6 ms | 8.6 ms | +0.1% | per-expert |
+| phi35moe 2048/6400/4/top-2 | 32 | 1 | 1.014 [1.003-1.022] | **1.016** [1.007-1.024] | 119.9 ms | 120.0 ms | +0.1% | per-expert |
+| phi35moe 2048/6400/4/top-2 | 32 | 8 | 0.997 [0.973-1.015] | **0.890** [0.845-0.938] | 37.2 ms | 33.3 ms | -10.7% | grouped |
+| phi35moe 2048/6400/4/top-2 | 32 | 16 | 0.715 [0.706-0.728] | **0.671** [0.652-0.723] | 26.9 ms | 25.1 ms | -6.8% | grouped |
+| phi35moe 2048/6400/4/top-2 | 512 | 1 | 1.046 [1.039-1.198] | **1.042** [1.039-1.046] | 1118.0 ms | 1107.4 ms | -0.9% | per-expert |
+| phi35moe 2048/6400/4/top-2 | 512 | 8 | 1.065 [1.061-1.077] | **0.766** [0.760-0.775] | 409.2 ms | 297.6 ms | -27.3% | grouped |
+| phi35moe 2048/6400/4/top-2 | 512 | 16 | 0.707 [0.642-0.724] | **0.440** [0.427-0.442] | 280.3 ms | 170.3 ms | -39.3% | grouped |
+| qwen3moe 2048/768/16/top-8 | 1 | 1 | 1.012 [1.011-1.034] | **1.015** [1.004-1.027] | 5.4 ms | 5.4 ms | -0.1% | per-expert |
+| qwen3moe 2048/768/16/top-8 | 1 | 8 | 1.685 [1.504-1.756] | **1.720** [1.305-1.815] | 3.9 ms | 4.2 ms | +5.9% | per-expert |
+| qwen3moe 2048/768/16/top-8 | 1 | 16 | 1.304 [1.171-3.111] | **1.342** [1.157-1.368] | 4.2 ms | 4.1 ms | -1.1% | per-expert |
+| qwen3moe 2048/768/16/top-8 | 32 | 1 | 1.023 [1.021-1.025] | **1.015** [1.004-1.018] | 59.9 ms | 59.3 ms | -1.0% | per-expert |
+| qwen3moe 2048/768/16/top-8 | 32 | 8 | 1.944 [1.317-2.343] | **1.926** [1.910-1.966] | 20.7 ms | 20.0 ms | -3.5% | per-expert |
+| qwen3moe 2048/768/16/top-8 | 32 | 16 | 1.452 [1.185-1.598] | **1.418** [1.142-1.543] | 17.3 ms | 16.7 ms | -3.6% | per-expert |
+| qwen3moe 2048/768/16/top-8 | 512 | 1 | 1.035 [1.023-1.042] | **1.025** [1.022-1.029] | 532.4 ms | 527.5 ms | -0.9% | per-expert |
+| qwen3moe 2048/768/16/top-8 | 512 | 8 | 2.230 [1.683-2.244] | **1.644** [1.335-1.675] | 211.3 ms | 157.8 ms | -25.3% | grouped |
+| qwen3moe 2048/768/16/top-8 | 512 | 16 | 1.401 [1.086-1.520] | **0.729** [0.710-1.022] | 151.5 ms | 106.7 ms | -29.6% | grouped |
+
+### 18.4 What this bought, and what it did not
+
+Where the gate selects the grouped driver, native time drops **25-46%**: mixtral 512
+tok/16 thr 1.785 -> 1.004, phi35moe 512/16 0.707 -> 0.440, qwen3moe 512/16 1.401 ->
+0.729, and the three 8-thread 512-token cells fall 25-32%. Where the gate keeps the
+per-expert loop the two arms are algorithmically equivalent and produce bit-identical
+output - not literally the same code, since the after-arm still builds the routing plan -
+and 16 of those 19 cells move by <=1.3%, with the three outliers inside the baseline
+arm's own trial dispersion.
+
+**We still lose to ORT** on many-expert, narrow-intermediate shapes (Qwen3-MoE: 16
+experts, `inter` 768, top-8) at 1.34-1.93, on mixtral at 32 tokens (1.41-1.93), and on
+mixtral/qwen3 512 tokens at 8 threads (1.64-1.72). There each expert receives only a
+handful of rows and MLAS's per-GEMM threading is the limit; neither driver helps.
+Closing that needs a different decomposition - splitting one expert's GEMM across
+threads by `N` instead of splitting experts across threads - which was not attempted.
+**No general MoE superiority over ORT is claimed.**
+
+### 18.5 The gate, and why it is per-group work
+
+`use_grouped_driver` compares `(slots / groups) * hidden * (fc1_size + inter)` - the
+average GEMM work in *one* expert group - against `MOE_GROUPED_MIN_WORK` (3.0e8).
+Per-group rather than total, because the grouped driver's win is parallelising the
+gather/activation/scatter, which only matters once MLAS already saturates the machine
+inside each expert's own GEMM. Measured separation was 7.6e7 (losing) to 6.3e8
+(winning); the floor sits near the geometric mean of that 8x band.
+
+This is a **one-host calibration** (AMD EPYC 9V74, 16C/32T, 32 MiB L3 shared per 16
+CPUs, AVX2/FMA, no AVX-512), overridable with `ONNX_GENAI_MOE_GROUPED_MIN_WORK`. The
+falsifier `the_driver_gate_matches_the_measured_crossover` pins all nine calibration
+points, so changing the constant in a way that would flip a measured cell fails CI.
+
+Expert-weight prepacking (`MlasGemmPackB`) was considered and **rejected**: decode is
+bandwidth-bound on reading the expert bank, packing does not reduce bytes read, and it
+would double a 352 MiB weight bank.
+
+### 18.6 The cost: peak transient memory
+
+The grouped driver is not free. It materialises **whole-slot** intermediates at once -
+`gathered` (slots x hidden), `fc1_out` (slots x fc1_size), the optional `fc3_out` and
+`activated` (slots x inter each) and `expert_out` (slots x hidden) - where the per-expert
+loop held roughly one group's worth at a time. For a 512-token Phi-3.5-MoE-shaped prefill
+(hidden 2048, inter 6400, fc1_size 12800, top-2, 1024 slots) that is about **78 MiB** of
+transients against about **21 MiB** before, and it grows linearly with token count.
+
+This is a deliberate trade: the transients are what make every stage a flat parallel map.
+It is also the second reason the gate matters - below the floor the per-expert loop keeps
+both the old latency *and* the old peak. Anyone running many concurrent large-prefill
+sessions on a memory-tight host should raise `ONNX_GENAI_MOE_GROUPED_MIN_WORK`. Tiling the
+grouped driver by slot blocks would cap the peak and was not attempted here.
+
+### 18.7 Correction: the gate statistic changed after measurement
+
+The A/B matrix above was produced by a build whose gate used the **mean** rows per expert
+group. Review pointed out that a collapsed router - one expert taking most of the rows -
+still has one large GEMM to hide the elementwise stages behind, and the mean would hide
+it, so the shipped gate uses the **largest** group instead. Recomputing all 27 cells under
+both statistics selects the **same driver in every cell** (the benchmark routers are close
+to balanced, so mean and max differ by well under the 8x calibration band), which is why
+the matrix stands as measured. `the_gate_reads_the_largest_group_not_the_average` pins the
+difference on a deliberately skewed router so the statistic cannot silently revert.
+
+## 19. Phase 4 requirement 3: what is actually left in Transpose
+
+Requirement 3 asked for the remaining Transpose materialisation to be eliminated by
+fusing it into its consumer. Auditing the kernel at current `main` shows the framing
+needs correcting, and the correction matters for anyone picking this up:
+
+* `TransposeKernel::view_outputs` already returns a **zero-copy strided view**, so in
+  any graph where the consumer accepts strides there is no materialisation to remove.
+  `execute` runs only where materialisation is *mandatory* - principally when the
+  transpose result is a graph output.
+* That mandatory path is no longer naive. Phase 3 gave it permutation collapsing
+  (merging output axes that stay adjacent in the input and dropping unit axes), a
+  contiguous-block `block_move`, a cache-blocked 2-D transpose with a 64-element tile,
+  a batched 2-D variant for the `[..., S, H] <-> [..., H, S]` shapes every attention
+  layout collapses to, and a `rayon` fan-out above 256 KiB.
+
+So the residual gap on that path is **memory-bandwidth-bound**, and the only remaining
+structural lever is on the *consumer* side: `matmul.rs` declares
+`supports_strided_input = true` but then calls `to_dense_f32_widen`, materialising a
+contiguous copy internally. For the attention layouts this is avoidable in principle -
+a `BSNH -> BNSH` view has `head_dim` contiguous innermost and a uniform `num_heads *
+head_dim` row pitch, which is exactly a GEMM **leading dimension**, and each `(batch,
+head)` plane is one `MlasGemmBatch` item. Wiring that up would let QK and PV consume
+the transposed view with zero copies.
+
+That work is **designed but not landed**: it touches every dispatch path in a
+3,800-line kernel with prepacking, half-precision and Accelerate branches, and it needs
+its own paired A/B before any claim. It is recorded here rather than left implied.

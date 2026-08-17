@@ -151,7 +151,7 @@ sets identical by construction, and
 The lesson is that an inventory test is only as good as its source of truth.
 Two rounds of review passed on tests that enumerated the wrong set.
 
-**65 registered ops remain in the shape-table gap.** The list is not prose: it is asserted
+**64 registered ops remain in the shape-table gap.** The list is not prose: it is asserted
 exactly by `every_registered_op_has_a_shape_rule_or_is_a_known_gap`
 (`crates/onnx-runtime-ep-cpu-plugin/tests/shape_inference_coverage.rs`), which
 enumerates `OpRegistry::keys()` — the same set `supports_op` consults — and
@@ -182,7 +182,7 @@ never appear in an input graph: `FusedGemm`, `FusedAttention`,
 `BlockQuantizedMoE`, `CompressedSparseAttention`, `IndexShare`,
 `PackedVarlenAttention`, `SparseKvGather`, `VarlenAttention`.
 
-### 3. Inferrable but unwritten — this is the work (35)
+### 3. Inferrable but unwritten — this is the work (34)
 
 Real ops, in real input graphs, that we have a kernel for and hand to ORT
 anyway because nobody wrote the rule.
@@ -201,8 +201,10 @@ partition around everything between them.
 `Conv`, which *is* covered.
 
 **Inferrable from attributes or a fixed rule.** `ArgMax`, `ArgMin`, `Constant`,
-`DFT`, `DynamicQuantizeLinear`, `Flatten`, `GatherElements`, `QLinearMatMul`,
-`Size`.
+`DFT`, `DynamicQuantizeLinear`, `Flatten`, `GatherElements`, `Size`.
+
+`QLinearMatMul` left this group when `main` gave it a rule; the coverage test
+caught the stale entry on the merge, which is the drift check working.
 
 **Contrib and model ops needing a real rule.** `com.microsoft::Attention` —
 packed QKV with a different signature from `ai.onnx::Attention`, so the

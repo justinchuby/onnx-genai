@@ -264,6 +264,20 @@ jobs:
           --features mlas
           optimization_registry_excludes_nchwc_without_cnn_ops
 
+      # The MoE grouped driver hands several `*mut f32` out of one `&mut [f32]`
+      # to `MlasGemmBatch`, and its bit-exactness falsifiers are the only thing
+      # standing between a wrong batch offset and silently wrong logits.  Under
+      # the default feature set those tests compile the non-MLAS fallback, so
+      # the path that actually ships was going untested.  This runs them against
+      # the real MLAS batched GEMM.
+      - name: CPU EP MoE tests against real MLAS
+        run: >-
+          cargo test --locked
+          -p onnx-runtime-ep-cpu
+          --no-default-features
+          --features mlas
+          kernels::moe::
+
       # x86_64-apple-darwin changes target_arch but leaves target_os="macos",
       # so cfg(target_os) errors are invisible.  This step uses a genuine Linux
       # target that exercises BOTH dimensions.  PR #317 proved the gap.

@@ -120,17 +120,94 @@ static FLOAT_DTYPES: &[DataType] = &[
 /// Fail-closed default: only f32.
 static F32_ONLY: &[DataType] = &[DataType::Float32];
 
-/// The three dtypes the MLAS-backed kernels accept.
+/// Every dtype that appears on a `com.microsoft::MatMulNBits` edge.
 ///
-/// These compute in f32 and widen/narrow around it, so they cover f16 and bf16
-/// but genuinely cannot do f64 -- `ConvKernel::execute` rejects it outright.
-/// Distinct from [`FLOAT_DTYPES`], which includes `Float64`.
+/// This op is block-quantized, so it is *inherently* mixed-dtype: `A`, `scales`,
+/// the optional `bias` and `Y` are float, `B` and the optional `zero_points` are
+/// packed `uint8`, and the optional `g_idx` is `int32`. The plugin's node filter
+/// (`node_passes_dtype_filter`) requires **every** input and output dtype of a
+/// node to appear in this list, so declaring the float set alone silently
+/// excluded the op from every claim: an int4 decode graph ran on ORT's CPU
+/// kernels even when this EP was the selected one.
 ///
-/// Advertising `FLOAT_DTYPES` here would be an over-claim rather than a
+/// The float members are exactly what `require_float_compute_dtype` accepts for
+/// `A`/`scales`/`Y` in `matmul_nbits::MatMulNBitsKernel::execute`, and the
+/// integer members are exactly the `require_dtype` calls beside them, so this
+/// list is derived from the kernel rather than widened to make a test pass.
+static MATMUL_NBITS_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Uint8,
+    DataType::Int32,
+];
+
+/// The float dtypes `require_float_compute_dtype` accepts.
+///
+/// Also what the MLAS-backed `Conv` accepts. Those kernels compute in f32 and
+/// widen or narrow around it, so they cover f16 and bf16 but genuinely cannot
+/// do f64 -- `ConvKernel::execute` rejects it outright. Distinct from
+/// [`FLOAT_DTYPES`], which includes `Float64`.
+///
+/// Advertising `FLOAT_DTYPES` for such an op is an over-claim rather than a
 /// harmless one: the plugin turns this list into the `KernelRegistryEntry`
 /// dtype filter, so an f64 `Conv` would clear capability, get compiled, and
-/// then fail at `Run` instead of being reported as unsupported up front.
-static MLAS_FLOAT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16, DataType::BFloat16];
+/// then fail at `Run` instead of being reported unsupported up front.
+static FLOAT_COMPUTE_DTYPES: &[DataType] =
+    &[DataType::Float32, DataType::Float16, DataType::BFloat16];
+
+/// The two quantized storage dtypes `QLinearMatMul` operands may use.
+static QUANTIZED_STORAGE_DTYPES: &[DataType] = &[DataType::Uint8, DataType::Int8];
+
+static U8_ONLY: &[DataType] = &[DataType::Uint8];
+
+static I32_ONLY: &[DataType] = &[DataType::Int32];
+
+/// Per-input-slot dtype constraints for a mixed-dtype op.
+///
+/// `supported_dtypes_for_op` returns the *union* of the dtypes on an op's
+/// edges, and the node filter tests membership in that union. For a uniform op
+/// that is exact, but for a block-quantized op it is strictly weaker than the
+/// kernel's own rule: `MatMulNBits`'s union contains both `float16` and
+/// `uint8`, so a node with `float16` `zero_points` — which the ONNX contrib
+/// spec permits, and which ORT's own kernel accepts — passes the union test
+/// and is claimed, and then fails inside `execute` where the only outcome is a
+/// run-time error.
+///
+/// These lists restore the missing precision. A slot listed here is checked
+/// against its own set instead of the union; absent slots and slots not listed
+/// keep the union rule. They must stay in step with the `require_dtype` calls
+/// in the corresponding kernel's `execute`.
+pub fn input_dtype_constraints_for_op(
+    op_type: &str,
+    domain: &str,
+) -> &'static [(usize, &'static [DataType])] {
+    // A, B, scales, zero_points, g_idx, bias.
+    static MATMUL_NBITS_SLOTS: &[(usize, &[DataType])] = &[
+        (0, FLOAT_COMPUTE_DTYPES),
+        (1, U8_ONLY),
+        (2, FLOAT_COMPUTE_DTYPES),
+        (3, U8_ONLY),
+        (4, I32_ONLY),
+        (5, FLOAT_COMPUTE_DTYPES),
+    ];
+    // a, a_scale, a_zero_point, b, b_scale, b_zero_point, y_scale, y_zp.
+    static QLINEAR_MATMUL_SLOTS: &[(usize, &[DataType])] = &[
+        (0, QUANTIZED_STORAGE_DTYPES),
+        (1, F32_ONLY),
+        (2, QUANTIZED_STORAGE_DTYPES),
+        (3, QUANTIZED_STORAGE_DTYPES),
+        (4, F32_ONLY),
+        (5, QUANTIZED_STORAGE_DTYPES),
+        (6, F32_ONLY),
+        (7, QUANTIZED_STORAGE_DTYPES),
+    ];
+    match (op_type, domain) {
+        ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
+        ("QLinearMatMul", "") => QLINEAR_MATMUL_SLOTS,
+        _ => &[],
+    }
+}
 
 /// Determine the supported dtypes for a given (op_type, domain) based on the
 /// actual kernel dispatch implementation. Fail closed: unknown ops get f32 only.
@@ -311,7 +388,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
 
         ("SimplifiedLayerNormalization", "") | ("LinearAttention", "") => FLOAT_DTYPES,
 
-        ("MatMulNBits", "com.microsoft") => F32_ONLY,
+        ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_DTYPES,
         ("MoE", "com.microsoft") | ("QMoE", "com.microsoft") => F32_ONLY,
 
         // pkg.nxrt custom ops: f32-only (fail closed).
@@ -319,7 +396,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
 
         // CNN ops (feature-gated). `Conv` computes through MLAS in f32 and
         // rejects f64 in `ConvKernel::execute`, so it must not advertise it.
-        ("Conv", "") => MLAS_FLOAT_DTYPES,
+        ("Conv", "") => FLOAT_COMPUTE_DTYPES,
 
         // The rest of the CNN family dispatches through `dispatch_float!` and
         // does handle f64.
@@ -2028,6 +2105,42 @@ pub(crate) mod testutil {
 
 #[cfg(test)]
 mod tests {
+
+    /// The plugin EP's node filter refuses a node unless *every* input and
+    /// output dtype appears in this list, so a list written from the compute
+    /// dtype alone silently excludes the whole op. `MatMulNBits` carries a
+    /// `uint8` packed weight, an optional `uint8` zero-point and an optional
+    /// `int32` `g_idx` alongside its float activation.
+    #[test]
+    fn matmul_nbits_advertises_its_quantized_edge_dtypes() {
+        let dtypes = supported_dtypes_for_op("MatMulNBits", "com.microsoft");
+        for required in [
+            DataType::Float32,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Uint8,
+            DataType::Int32,
+        ] {
+            assert!(
+                dtypes.contains(&required),
+                "MatMulNBits must advertise {required:?}; without it the plugin EP's \
+                 dtype filter drops every node and ORT runs the op instead"
+            );
+        }
+    }
+
+    /// Same trap, other quantized matmul: `QLinearMatMul` mixes `uint8`/`int8`
+    /// operands with `float` scales.
+    #[test]
+    fn qlinear_matmul_advertises_its_quantized_edge_dtypes() {
+        let dtypes = supported_dtypes_for_op("QLinearMatMul", "");
+        for required in [DataType::Float32, DataType::Uint8, DataType::Int8] {
+            assert!(
+                dtypes.contains(&required),
+                "QLinearMatMul must advertise {required:?}"
+            );
+        }
+    }
     use super::*;
     use crate::strided::view_in_bounds;
     use testutil::Owned;
@@ -2577,7 +2690,7 @@ mod tests {
     /// passes, and it fails at `Run` instead of being declined up front.
     /// `Conv` is the live case -- it computes through MLAS in f32 and
     /// `ConvKernel::execute` rejects f64 outright, so it must advertise
-    /// `MLAS_FLOAT_DTYPES` and not `FLOAT_DTYPES`.
+    /// `FLOAT_COMPUTE_DTYPES` and not `FLOAT_DTYPES`.
     #[test]
     fn conv_does_not_advertise_a_dtype_its_kernel_rejects() {
         let dtypes = supported_dtypes_for_op("Conv", "");

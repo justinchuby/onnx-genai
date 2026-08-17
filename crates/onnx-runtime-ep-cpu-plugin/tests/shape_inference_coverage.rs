@@ -22,7 +22,7 @@
 
 use onnx_runtime_ep_cpu::kernels::build_cpu_registry;
 use onnx_runtime_ep_plugin::compute::ShapeInference;
-use onnx_runtime_ir::{Node, NodeId, ValueId};
+use onnx_runtime_ir::{Attribute, Node, NodeId, ValueId};
 
 /// Ops that resolve to `Declined` under the probe below, and therefore reach
 /// ORT's CPU EP rather than ours when they appear in a graph.
@@ -102,7 +102,6 @@ const DECLINED: &[(&str, &str)] = &[
     ("", "DynamicQuantizeLinear"), // y == input, scale/zero_point scalar
     ("", "Flatten"),               // 2-D, split at `axis` (default 1)
     ("", "GatherElements"),        // output shape == indices shape
-    ("", "QLinearMatMul"),         // MatMul semantics on the quantised operands
     ("", "Size"),                  // scalar
     //       Contrib ops that need a real rule written.
     ("com.microsoft", "Attention"), // packed QKV; a different signature from
@@ -136,31 +135,54 @@ const TEST_ONLY: &[&str] = &["TotallyFakeOp"];
 /// (`Unsqueeze`'s axes moved from attribute to input at 13, `ReductionFromInput`
 /// at 18). Sweeping them keeps the allowlist from encoding one arbitrary point.
 ///
-/// No attributes are supplied. That is deliberate: an attribute-dependent rule
-/// must fall back to the ONNX default when the attribute is absent, because a
-/// spec-legal graph may rely on that default. `for_node` already does this
-/// (`int_attr("axis").unwrap_or(..)`), so an op that declines only for want of
-/// an attribute has a rule that would decline on a real graph too.
+/// Attributes are swept, including the empty bundle. Most rules fall back to
+/// the ONNX default when an attribute is absent (`int_attr("axis")
+/// .unwrap_or(..)`), and the empty bundle keeps that honest. But a few rules
+/// genuinely cannot: `com.microsoft::MatMulNBits` derives its output width from
+/// `N`, and a node without `N` is malformed rather than defaulted, so `for_node`
+/// declines it. Probing that op with no attributes reports a gap that does not
+/// exist on any real graph. Supplying a plausible bundle is the more faithful
+/// model of production, and an op still counts as declining unless *some* point
+/// in the matrix yields a rule.
 fn declines(op_type: &str, domain: &str) -> bool {
     const OPSETS: &[i64] = &[1, 13, 18, 22, 23];
     const SHAPES: &[&[usize]] = &[&[8], &[4, 8], &[2, 3, 8], &[1, 3, 8, 8]];
+    /// The integer attributes `for_node` reads, with values consistent with
+    /// `SHAPES` (width 8, so `N`/`K` of 8 and a valid `axis`/`num_groups`).
+    const ATTR_BUNDLES: &[&[(&str, i64)]] = &[
+        &[],
+        &[
+            ("N", 8),
+            ("K", 8),
+            ("axis", 0),
+            ("num_groups", 1),
+            ("block_size", 32),
+            ("bits", 4),
+        ],
+    ];
 
     for &opset in OPSETS {
         for arity in 1..=4usize {
             for shape in SHAPES {
-                let inputs: Vec<Option<ValueId>> =
-                    (0..arity).map(|i| Some(ValueId(i as u32))).collect();
-                let mut node = Node::new(NodeId(0), op_type, inputs, vec![ValueId(100)]);
-                node.domain = domain.to_string();
-                node.version = Some(opset);
-                let input_shapes: Vec<Vec<Option<usize>>> = (0..arity)
-                    .map(|_| shape.iter().map(|&d| Some(d)).collect())
-                    .collect();
-                if !matches!(
-                    ShapeInference::for_node(&node, &input_shapes, 1),
-                    ShapeInference::Declined { .. }
-                ) {
-                    return false;
+                for attrs in ATTR_BUNDLES {
+                    let inputs: Vec<Option<ValueId>> =
+                        (0..arity).map(|i| Some(ValueId(i as u32))).collect();
+                    let mut node = Node::new(NodeId(0), op_type, inputs, vec![ValueId(100)]);
+                    node.domain = domain.to_string();
+                    node.version = Some(opset);
+                    for (name, value) in *attrs {
+                        node.attributes
+                            .insert((*name).to_string(), Attribute::Int(*value));
+                    }
+                    let input_shapes: Vec<Vec<Option<usize>>> = (0..arity)
+                        .map(|_| shape.iter().map(|&d| Some(d)).collect())
+                        .collect();
+                    if !matches!(
+                        ShapeInference::for_node(&node, &input_shapes, 1),
+                        ShapeInference::Declined { .. }
+                    ) {
+                        return false;
+                    }
                 }
             }
         }

@@ -19,6 +19,12 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 #[cfg(feature = "mlas")]
+use std::collections::HashMap;
+#[cfg(feature = "mlas")]
+use std::sync::Arc;
+#[cfg(feature = "mlas")]
+use std::sync::LazyLock;
+#[cfg(feature = "mlas")]
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -412,9 +418,9 @@ pub struct MatMulNBitsKernel {
     packed_u8_n16_weight: OnceLock<PackedN16SdotWeight>,
     packed_kai_qsi8_weight: OnceLock<PackedKaiSdotWeight>,
     #[cfg(feature = "mlas")]
-    mlas_shards: OnceLock<Option<Vec<Option<MlasShard>>>>,
+    mlas_shards: OnceLock<Option<Arc<Vec<Option<MlasShard>>>>>,
     #[cfg(feature = "mlas")]
-    mlas_packed: OnceLock<Option<MlasPreparedPacked>>,
+    mlas_packed: OnceLock<Option<Arc<MlasPreparedPacked>>>,
 }
 
 /// One contiguous output-column shard of an MLAS SQNBit-packed weight: columns
@@ -444,6 +450,219 @@ impl MlasPreparedPacked {
         }
     }
 }
+
+/// Identity of one MLAS SQNBit packed weight, shared across the shape-keyed
+/// kernel instances of a single `MatMulNBits` node (#1056 packed dedup).
+///
+/// The executor's kernel cache is shape-keyed, so an autoregressive decoder
+/// compiles two `MatMulNBits` instances for each node -- one for prefill
+/// (`m > 1`) and one for decode (`m == 1`). Before this key each instance packed
+/// its own full copy of the same weight, so the resident packed footprint was
+/// `2x` the single-copy cost (measured: a 169-boundary model packed 169 buffers
+/// on a 1-token run and 338 on a 48-token run). Because the packed buffer is a
+/// pure function of the source weight bytes and the pack parameters, both
+/// instances may share one allocation whenever they agree on every field here:
+///
+/// * **`addr`** -- the constant weight's mmap address, distinguishing weights;
+/// * **`n`, `k`, `bits`, `block_size`** -- the geometry, so a same-address
+///   different-shape weight (an allocator recycling a freed address) misses
+///   rather than serving the wrong bytes;
+/// * **`has_zero_points`** -- symmetric vs asymmetric pack (different contents);
+/// * **`comp_int8`** -- the [`mlas_sys::SQNBitComputeType`] discriminant, since
+///   `Int8` bakes scale/zero-point into per-block sums while `Fp32` keeps the
+///   nibbles only, so the packed layouts differ.
+///
+/// `addr` alone is **not** an identity: an allocator recycles a freed weight's
+/// address for a later same-shaped weight (the #845/#1079 hazard that cost a
+/// full debugging cycle). The shape fields close the different-shape case; the
+/// remaining same-address, same-shape, across-model-lifetimes window is a
+/// lifetime problem, closed by [`clear_mlas_packed_caches`] on `Executor` drop
+/// -- the exact boundary at which `weight_transpose::clear_all` runs. The
+/// N-shard partition is *not* a field because it is a pure function of the fixed
+/// process topology and `n` (see [`MatMulNBitsKernel::mlas_shard_segments`]), so
+/// two instances of one node always partition identically.
+#[cfg(feature = "mlas")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct MlasPackedKey {
+    addr: usize,
+    n: usize,
+    k: usize,
+    bits: usize,
+    block_size: usize,
+    has_zero_points: bool,
+    comp_int8: bool,
+}
+
+#[cfg(feature = "mlas")]
+impl MlasPackedKey {
+    fn new(
+        addr: usize,
+        n: usize,
+        k: usize,
+        bits: usize,
+        block_size: usize,
+        has_zero_points: bool,
+        comp: mlas_sys::SQNBitComputeType,
+    ) -> Self {
+        Self {
+            addr,
+            n,
+            k,
+            bits,
+            block_size,
+            has_zero_points,
+            comp_int8: matches!(comp, mlas_sys::SQNBitComputeType::Int8),
+        }
+    }
+}
+
+/// Process-global, weight-identity-keyed store of MLAS SQNBit packed weights,
+/// so the prefill and decode instances of one node share a single packed
+/// allocation instead of packing one copy each (#1056).
+///
+/// Two maps because the two MLAS routes hold different value types -- the
+/// N-sharded decode layout (`shards`) and the single full-width layout
+/// (`packed`, used by `weight_prepacked=1` and the `NO_SHARD` A/B) -- but a
+/// given node only ever populates one of them, and both are keyed by the same
+/// [`MlasPackedKey`]. Entries are `Arc` so a kernel-local `OnceLock` memo and
+/// the store share one allocation; the byte total (`SQNBIT_PACKED_LIVE_BYTES` in
+/// `mlas-sys`) counts each packed buffer once, so a shared entry is one copy.
+#[cfg(feature = "mlas")]
+#[derive(Default)]
+struct MlasPackedCaches {
+    shards: Mutex<HashMap<MlasPackedKey, Arc<Vec<Option<MlasShard>>>>>,
+    packed: Mutex<HashMap<MlasPackedKey, Arc<MlasPreparedPacked>>>,
+}
+
+#[cfg(feature = "mlas")]
+impl MlasPackedCaches {
+    /// Return the shared N-sharded pack for `key`, building it on a miss with
+    /// `build`. `build` runs only on a miss, so a decode instance whose prefill
+    /// sibling already packed the weight neither re-packs nor re-times it (the
+    /// pack-count halving of #1056). `build` returning `Ok(None)` means MLAS has
+    /// no kernel for the shape and nothing is cached.
+    fn get_or_build_shards(
+        &self,
+        key: MlasPackedKey,
+        build: impl FnOnce() -> Result<Option<Vec<Option<MlasShard>>>>,
+    ) -> Result<Option<Arc<Vec<Option<MlasShard>>>>> {
+        if let Some(hit) = self
+            .shards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+        {
+            return Ok(Some(hit));
+        }
+        let Some(built) = build()? else {
+            return Ok(None);
+        };
+        let arc = Arc::new(built);
+        // A concurrent racer may have inserted an identical entry meanwhile;
+        // keep whichever landed first so every reader shares one allocation.
+        Ok(Some(
+            self.shards
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(key)
+                .or_insert(arc)
+                .clone(),
+        ))
+    }
+
+    /// Full-width analogue of [`Self::get_or_build_shards`].
+    fn get_or_build_packed(
+        &self,
+        key: MlasPackedKey,
+        build: impl FnOnce() -> Result<Option<MlasPreparedPacked>>,
+    ) -> Result<Option<Arc<MlasPreparedPacked>>> {
+        if let Some(hit) = self
+            .packed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+        {
+            return Ok(Some(hit));
+        }
+        let Some(built) = build()? else {
+            return Ok(None);
+        };
+        let arc = Arc::new(built);
+        Ok(Some(
+            self.packed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(key)
+                .or_insert(arc)
+                .clone(),
+        ))
+    }
+
+    fn clear(&self) {
+        self.shards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.packed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+}
+
+/// The process-global packed store, the **only** store production uses.
+#[cfg(feature = "mlas")]
+static MLAS_PACKED_GLOBAL: LazyLock<MlasPackedCaches> = LazyLock::new(MlasPackedCaches::default);
+
+#[cfg(all(test, feature = "mlas"))]
+thread_local! {
+    /// Test-only, per-thread packed store. libtest runs each `#[test]` on its
+    /// own fresh thread, so a thread-local store is empty at the start of every
+    /// test and dropped when the test's thread ends. That gives each test a
+    /// private store -- a weight address freed by one test can never serve a
+    /// stale pack to another test on a different thread -- while a single test's
+    /// prefill and decode kernels (which run on that one test thread) still share
+    /// one entry, exactly as production does. Production never reads this; the
+    /// process-global store is the only writer of any global (#983/#1033/#1079).
+    static MLAS_PACKED_TEST_LOCAL: MlasPackedCaches = MlasPackedCaches::default();
+}
+
+/// Run `f` against the active packed store: the per-thread store under test, the
+/// process-global store in production.
+#[cfg(feature = "mlas")]
+#[inline]
+fn with_mlas_packed_caches<R>(f: impl FnOnce(&MlasPackedCaches) -> R) -> R {
+    #[cfg(test)]
+    {
+        return MLAS_PACKED_TEST_LOCAL.with(|caches| f(caches));
+    }
+    #[cfg(not(test))]
+    {
+        f(&MLAS_PACKED_GLOBAL)
+    }
+}
+
+/// Evict every shared MLAS SQNBit packed weight.
+///
+/// **Must** run when an `Executor` drops, for the same reason
+/// `weight_transpose::clear_all` does: the store is keyed on `(address, shape,
+/// pack params)`, which makes a stale hit impossible for a *different-shaped*
+/// weight, but a later model whose mmap places a same-shaped weight at a
+/// recycled address would still match. Clearing on `Executor` drop closes that
+/// window and bounds the store across model lifetimes. In production only the
+/// global store exists; the per-test thread-locals are cleared by their threads
+/// ending, so this is a no-op for them.
+#[cfg(feature = "mlas")]
+pub fn clear_mlas_packed_caches() {
+    MLAS_PACKED_GLOBAL.clear();
+}
+
+/// No-op stand-in when the `mlas` feature is off, so the executor's drop path
+/// can call it unconditionally.
+#[cfg(not(feature = "mlas"))]
+pub fn clear_mlas_packed_caches() {}
 
 /// N-tile alignment for the persistent-pool MLAS SQNBit decode shards.
 ///
@@ -547,6 +766,7 @@ struct PackedNBitsWeight {
     zero_points: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Copy)]
 enum BorrowedScales<'a> {
     F32(&'a [f32]),
     F16(&'a [half::f16]),
@@ -922,6 +1142,25 @@ impl Kernel for MatMulNBitsKernel {
                 BORROWED_INT4_ASYMMETRIC_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
             }
             with_decode_pool(|| {
+                #[cfg(target_arch = "x86_64")]
+                if borrowed_int4_nblock_enabled()
+                    && !matches!(dot_kernel, DotKernel::Scalar)
+                    && self.block_size.is_multiple_of(32)
+                {
+                    borrowed_affine_int4_matmul_nblock(
+                        &activations,
+                        packed,
+                        scales,
+                        borrowed_zero_points,
+                        bias.as_deref(),
+                        result,
+                        m,
+                        self.k,
+                        self.n,
+                        self.block_size,
+                    );
+                    return;
+                }
                 borrowed_affine_int4_matmul(
                     &activations,
                     packed,
@@ -1542,18 +1781,20 @@ impl MatMulNBitsKernel {
             }
 
             let owned;
-            let packed_weight = if can_prepack {
+            let packed_weight: &Option<Arc<MlasPreparedPacked>> = if can_prepack {
                 if let Some(weight) = self.mlas_packed.get() {
                     weight
                 } else {
-                    let weight = self.build_mlas_prepacked(packed, scales, zero_points, comp)?;
+                    let weight = self.shared_mlas_prepacked(packed, scales, zero_points, comp)?;
                     let _ = self.mlas_packed.set(weight);
                     self.mlas_packed
                         .get()
                         .expect("constant prepacked MatMulNBits weight was just initialized")
                 }
             } else {
-                owned = self.build_mlas_prepacked(packed, scales, zero_points, comp)?;
+                owned = self
+                    .build_mlas_prepacked(packed, scales, zero_points, comp)?
+                    .map(Arc::new);
                 &owned
             };
             let packed_weight = packed_weight.as_ref().ok_or_else(|| {
@@ -1680,10 +1921,7 @@ impl MatMulNBitsKernel {
             let shards = if let Some(shards) = self.mlas_shards.get() {
                 shards
             } else {
-                let built =
-                    mm_profile::time_prepack("mlas-shards", self.nbits_weight_bytes(), || {
-                        self.build_mlas_shards(packed, scales, zero_points, comp)
-                    })?;
+                let built = self.shared_mlas_shards(packed, scales, zero_points, comp)?;
                 let _ = self.mlas_shards.set(built);
                 self.mlas_shards
                     .get()
@@ -1702,10 +1940,7 @@ impl MatMulNBitsKernel {
             let cached = if let Some(cached) = self.mlas_packed.get() {
                 cached
             } else {
-                let built =
-                    mm_profile::time_prepack("mlas-packed", self.nbits_weight_bytes(), || {
-                        self.build_mlas_packed(packed, scales, zero_points, comp)
-                    })?;
+                let built = self.shared_mlas_packed(packed, scales, zero_points, comp)?;
                 let _ = self.mlas_packed.set(built);
                 self.mlas_packed
                     .get()
@@ -2058,6 +2293,94 @@ impl MatMulNBitsKernel {
         let k_blocks = self.k.div_ceil(self.block_size);
         let blob_size = self.block_size * self.bits / 8;
         self.n * k_blocks * blob_size
+    }
+
+    /// The shared-store identity of this node's packed weight, or `None` when the
+    /// weight is not a contiguous host buffer (so it has no stable address to key
+    /// on and cannot be shared). Only ever `Some` on the constant-weight
+    /// (`can_prepack`) route the callers already guard, where the initializer is
+    /// a contiguous mmap slice whose address is stable for the session.
+    #[cfg(feature = "mlas")]
+    fn mlas_packed_key(
+        &self,
+        packed: &TensorView,
+        has_zero_points: bool,
+        comp: mlas_sys::SQNBitComputeType,
+    ) -> Option<MlasPackedKey> {
+        let addr = contiguous_host_slice::<u8>(packed)?.as_ptr() as usize;
+        Some(MlasPackedKey::new(
+            addr,
+            self.n,
+            self.k,
+            self.bits,
+            self.block_size,
+            has_zero_points,
+            comp,
+        ))
+    }
+
+    /// The N-sharded pack for this node, shared across its prefill and decode
+    /// kernel instances via the weight-identity store (#1056). The one-time pack
+    /// (and its `ONNX_GENAI_PROFILE_MM` timing) runs only on the *first*
+    /// instance to reach it; the sibling instance takes the cached `Arc`, so the
+    /// runtime holds one packed copy per weight instead of two. Falls back to an
+    /// unshared owned pack only when the weight has no stable address to key on
+    /// (never on the constant route).
+    #[cfg(feature = "mlas")]
+    fn shared_mlas_shards(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        comp: mlas_sys::SQNBitComputeType,
+    ) -> Result<Option<Arc<Vec<Option<MlasShard>>>>> {
+        let build = || {
+            mm_profile::time_prepack("mlas-shards", self.nbits_weight_bytes(), || {
+                self.build_mlas_shards(packed, scales, zero_points, comp)
+            })
+        };
+        match self.mlas_packed_key(packed, zero_points.is_some(), comp) {
+            Some(key) => with_mlas_packed_caches(|caches| caches.get_or_build_shards(key, build)),
+            None => Ok(build()?.map(Arc::new)),
+        }
+    }
+
+    /// Full-width analogue of [`Self::shared_mlas_shards`] for the `NO_SHARD`
+    /// A/B route.
+    #[cfg(feature = "mlas")]
+    fn shared_mlas_packed(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        comp: mlas_sys::SQNBitComputeType,
+    ) -> Result<Option<Arc<MlasPreparedPacked>>> {
+        let build = || {
+            mm_profile::time_prepack("mlas-packed", self.nbits_weight_bytes(), || {
+                self.build_mlas_packed(packed, scales, zero_points, comp)
+            })
+        };
+        match self.mlas_packed_key(packed, zero_points.is_some(), comp) {
+            Some(key) => with_mlas_packed_caches(|caches| caches.get_or_build_packed(key, build)),
+            None => Ok(build()?.map(Arc::new)),
+        }
+    }
+
+    /// Full-width analogue of [`Self::shared_mlas_shards`] for the
+    /// `weight_prepacked=1` route (reconstructs an already-packed buffer).
+    #[cfg(feature = "mlas")]
+    fn shared_mlas_prepacked(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        comp: mlas_sys::SQNBitComputeType,
+    ) -> Result<Option<Arc<MlasPreparedPacked>>> {
+        let build = || self.build_mlas_prepacked(packed, scales, zero_points, comp);
+        match self.mlas_packed_key(packed, zero_points.is_some(), comp) {
+            Some(key) => with_mlas_packed_caches(|caches| caches.get_or_build_packed(key, build)),
+            None => Ok(build()?.map(Arc::new)),
+        }
     }
 
     /// Pack the constant int4 weight into one MLAS SQNBit shard per entry of
@@ -2764,33 +3087,35 @@ pub fn matmul_nbits_decode_caches_dequant_f32(
     true
 }
 
-/// How many times the CPU decode runtime materializes each MLAS SQNBit packed
-/// buffer over a session -- the multiplier that the earlier accounting missed.
+/// How many resident copies of each MLAS SQNBit packed buffer the CPU decode
+/// runtime holds over a session.
 ///
 /// The executor's kernel cache is **shape-keyed** (`KernelKey { node, shapes }`
 /// in `onnx-runtime-session/src/executor/kernel_cache.rs`): a `MatMulNBits`
 /// kernel is compiled and cached *per distinct resolved activation shape*. An
 /// autoregressive decoder presents exactly two activation shapes to each such
 /// node -- the prefill shape (`m == prompt_len`) and the decode shape
-/// (`m == 1`) -- so it compiles **two** kernel instances, and each instance
-/// packs its own full copy of the weight into its own `mlas_shards`
-/// `OnceLock`. Both copies stay resident for the whole session.
+/// (`m == 1`) -- so it compiles **two** kernel instances.
 ///
-/// This was measured directly on `qwen05b-symzp` (169 weight boundaries): a
-/// 1-token run packs 169 buffers, a multi-token run packs 338 = 2x169, and
-/// [`mlas_sys::sqnbit_packed_live_bytes`] holds both copies for the entire
-/// decode phase (it does not fall until process exit). Accounting a single copy
-/// therefore under-reports the resident footprint by 2x -- the dangerous
-/// (under-reporting) direction for an admission gate.
+/// Before #1056 each instance packed its own full copy of the weight into its
+/// own `mlas_shards` `OnceLock`, so a session held **two** copies (measured on
+/// `qwen05b-symzp`, 169 weight boundaries: a 1-token run packed 169 buffers, a
+/// multi-token run 338 = 2x169). #1056 makes the packed buffer **shared per
+/// weight**: both instances look it up in the weight-identity store
+/// ([`MlasPackedCaches`]) keyed on `(address, N, K, bits, block_size,
+/// has_zero_points, compute_type)`, so the first instance to reach it packs
+/// once and the sibling takes the same `Arc`. The session now holds **one**
+/// copy per weight, and `sqnbit_packed_live_bytes` reflects that (the
+/// multi-token run packs the *same* count as the 1-token run).
 ///
-/// It is a fixed upper bound for the autoregressive decode workload: a
-/// prefill-only run (no `m == 1` step) materializes one copy, so accounting two
-/// over-estimates, which only makes the gate decline sooner (safe). MLAS packs
-/// in *both* the prefill and decode instances (unlike the generic f32
-/// `weight_nk` cache, which is a decode-only `m == 1` materialization and is
-/// held once), so this multiplier applies to the MLAS packed buffer alone.
+/// This multiplier is therefore `1`: the accounting states the true single
+/// resident copy so the memory plan's prediction equals what the kernels
+/// actually retain. Keeping it as a named constant (rather than dropping the
+/// factor) documents that the shape-keyed duplication is intentionally
+/// deduplicated to one, and keeps the accounting and the allocation in lockstep
+/// -- change the sharing and this must change with it.
 #[cfg(feature = "mlas")]
-const MLAS_PACKED_DECODE_INSTANTIATIONS: u64 = 2;
+const MLAS_PACKED_DECODE_INSTANTIATIONS: u64 = 1;
 
 /// Bytes the owned scale (and optional zero-point) copies retained by a single
 /// [`mlas_sys::SQNBitPackedB`] add on top of the packed buffer.
@@ -2876,19 +3201,21 @@ fn mlas_sqnbit_packed_b_cache_bytes(
 
 /// Resident side-buffer bytes a single **constant-weight** `MatMulNBits` node
 /// holds for the session *beside* the on-disk weights, given its static
-/// attributes: either the MLAS SQNBit CompFp32 packed buffers (the packed
-/// weight plus its retained scale/zero-point copies, held once per compiled
-/// kernel instance) when the node takes that route, the fully-expanded f32
-/// `weight_nk` cache (`N * K * 4`, #971) when it takes the generic decode path,
-/// or zero for a truly zero-copy path (borrowed int4, 2-bit, int8, accuracy-4
-/// direct).
+/// attributes: either the MLAS SQNBit CompFp32 packed buffer (the packed
+/// weight plus its retained scale/zero-point copies, shared across the node's
+/// compiled kernel instances) when the node takes that route, the fully-expanded
+/// f32 `weight_nk` cache (`N * K * 4`, #971) when it takes the generic decode
+/// path, or zero for a truly zero-copy path (borrowed int4, 2-bit, int8,
+/// accuracy-4 direct).
 ///
 /// For the MLAS route the figure is [`MLAS_PACKED_DECODE_INSTANTIATIONS`] times
-/// the per-copy cost, because the shape-keyed kernel cache compiles a separate
-/// `MatMulNBits` instance for the prefill (`m > 1`) and decode (`m == 1`)
-/// activation shapes and each packs its own copy (see the constant's docs). The
-/// generic f32 `weight_nk` cache is a decode-only (`m == 1`) materialization and
-/// is held once, so no multiplier applies there.
+/// the per-copy cost. That multiplier is `1` since #1056: although the
+/// shape-keyed kernel cache still compiles a separate `MatMulNBits` instance for
+/// the prefill (`m > 1`) and decode (`m == 1`) activation shapes, both instances
+/// now share one packed buffer through the weight-identity store (see the
+/// constant's docs), so the session holds a single resident copy. The generic
+/// f32 `weight_nk` cache is likewise a decode-only (`m == 1`) materialization
+/// held once, so no multiplier applies there either.
 ///
 /// This is the single per-node authority [`resident_dequant_f32_cache_bytes`]
 /// sums over the graph so the memory plan's footprint accounting tracks what the
@@ -2940,10 +3267,11 @@ pub fn matmul_nbits_resident_side_cache_bytes(
 /// For every constant-weight `MatMulNBits` node this sums
 /// [`matmul_nbits_resident_side_cache_bytes`]: the fully-expanded f32 `weight_nk`
 /// cache (`N * K * 4`, #971) when the node takes the generic decode path, or the
-/// MLAS SQNBit CompFp32 packed buffers when it takes the `accuracy_level == 0`
+/// MLAS SQNBit CompFp32 packed buffer when it takes the `accuracy_level == 0`
 /// MLAS route -- the packed weight plus its retained scale/zero-point copies,
-/// counted [`MLAS_PACKED_DECODE_INSTANTIATIONS`] times because the shape-keyed
-/// kernel cache packs a copy for the prefill and decode activation shapes alike.
+/// counted [`MLAS_PACKED_DECODE_INSTANTIATIONS`] (`1`) time: the prefill and
+/// decode kernel instances share one packed buffer via the weight-identity
+/// store (#1056), so the weight is resident once.
 /// Nodes on a truly zero-copy path (borrowed int4, 2-bit, int8) contribute
 /// nothing, and non-constant-weight nodes never retain a session buffer (they
 /// rebuild a transient one per call) and are excluded.
@@ -3008,11 +3336,12 @@ pub fn resident_dequant_f32_cache_bytes(graph: &Graph) -> u64 {
 
 /// The heap bytes all live MLAS SQNBit packed weights currently retain: the
 /// packed buffers plus their owned scale and zero-point copies, summed across
-/// every kernel instance (so an autoregressive session's prefill and decode
-/// copies are both counted). This is the *actual* runtime figure that
-/// [`resident_dequant_f32_cache_bytes`]'s *prediction* must equal; the
-/// `matmul_nbits` accounting tests compare the two directly. Zero on a build
-/// without the `mlas` feature.
+/// every distinct packed allocation. Since #1056 a node's prefill and decode
+/// kernel instances share one packed buffer, so each weight is counted once --
+/// matching what [`resident_dequant_f32_cache_bytes`] now *predicts*. This is
+/// the *actual* runtime figure that prediction must equal; the `matmul_nbits`
+/// accounting tests compare the two directly. Zero on a build without the
+/// `mlas` feature.
 pub fn mlas_sqnbit_packed_live_bytes() -> u64 {
     #[cfg(feature = "mlas")]
     {
@@ -5768,6 +6097,220 @@ fn borrowed_scales<'a>(view: &TensorView<'a>) -> Option<BorrowedScales<'a>> {
     }
 }
 
+/// A/B toggle for the register-blocked ("N-blocked") borrowed int4 decode
+/// kernel that absorbs MLAS SQNBit CompFp32's activation-reuse locality without
+/// a resident packed copy. `1`/`on` enables it; unset or `0`/`off` keeps the
+/// per-column path. Default off so the shipped borrowed path is unchanged until
+/// the win is measured, exactly like the `ONNX_GENAI_CPU_MM_MLAS_QNBIT` and
+/// `#994` toggles that preceded it. Production is the only writer of process
+/// state here: this is a read-only env probe, never mutated at runtime.
+#[cfg(target_arch = "x86_64")]
+fn borrowed_int4_nblock_enabled() -> bool {
+    std::env::var("ONNX_GENAI_CPU_MM_INT4_NBLK")
+        .ok()
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("off")
+        })
+        .unwrap_or(false)
+}
+
+/// Register-blocked borrowed int4 matmul. Reads the *same* zero-copy mmap int4
+/// layout as [`borrowed_affine_int4_matmul`] (no repack, no resident copy), but
+/// processes up to four output columns together with four independent f32
+/// accumulators, loading each activation vector once and reusing it across the
+/// group. This mirrors MLAS SQNBit CompFp32's M==1 `NCols4` register blocking
+/// (`sqnbitgemm_kernel_avx2.cpp`), whose activation reuse and single
+/// end-of-column horizontal reduction are the two locality wins that do not
+/// depend on its prepacked buffer.
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_arch = "x86_64")]
+fn borrowed_affine_int4_matmul_nblock(
+    activations: &[f32],
+    packed: &[u8],
+    scales: BorrowedScales<'_>,
+    zero_points: Option<&[u8]>,
+    bias: Option<&[f32]>,
+    result: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    block_size: usize,
+) {
+    debug_assert_eq!(activations.len(), m * k);
+    debug_assert_eq!(result.len(), m * n);
+    let bits = 4usize;
+    let layout = NBitsLayout { bits, block_size };
+    let block_count = k.div_ceil(block_size);
+    let packed_row_size = block_count * layout.packed_block_size();
+    let zero_point_row_size = layout.zero_point_row_size(block_count);
+    for (activation, output_row) in activations.chunks_exact(k).zip(result.chunks_exact_mut(n)) {
+        let activation_sums = activation
+            .chunks(block_size)
+            .map(|block| block.iter().sum::<f32>())
+            .collect::<Vec<_>>();
+        let compute = |output_start: usize, outputs: &mut [f32]| {
+            let mut group_start = 0usize;
+            while group_start < outputs.len() {
+                let group = (outputs.len() - group_start).min(4);
+                let mut packed_rows: [&[u8]; 4] = [&[] as &[u8]; 4];
+                let mut scale_bases = [0usize; 4];
+                let mut zp_rows: [Option<&[u8]>; 4] = [None; 4];
+                let mut biases = [0.0f32; 4];
+                for j in 0..group {
+                    let output_index = output_start + group_start + j;
+                    packed_rows[j] = &packed
+                        [output_index * packed_row_size..(output_index + 1) * packed_row_size];
+                    scale_bases[j] = output_index * block_count;
+                    zp_rows[j] = zero_points.map(|zp| {
+                        &zp[output_index * zero_point_row_size
+                            ..(output_index + 1) * zero_point_row_size]
+                    });
+                    biases[j] = bias.map_or(0.0, |values| values[output_index]);
+                }
+                let mut out_buf = [0.0f32; 4];
+                // SAFETY: this function is only reached when `selected_dot_kernel`
+                // reported an AVX2-capable host (see the route in `compute`), so
+                // AVX2+FMA are available; every slice passed is bounds-checked
+                // above and the block loop never reads past `k`.
+                unsafe {
+                    borrowed_int4_nblock4_avx2(
+                        activation,
+                        &activation_sums,
+                        &packed_rows[..group],
+                        &scales,
+                        &scale_bases[..group],
+                        &zp_rows[..group],
+                        &biases[..group],
+                        layout,
+                        block_count,
+                        block_size,
+                        k,
+                        &mut out_buf[..group],
+                    );
+                }
+                outputs[group_start..group_start + group].copy_from_slice(&out_buf[..group]);
+                group_start += group;
+            }
+        };
+        parallel_output_rows(output_row, k, compute);
+    }
+}
+
+/// AVX2 + FMA register-blocked int4 kernel for up to four output columns.
+///
+/// For each K block it loads the block's activation vectors once and reuses
+/// them across every column in the group (MLAS's activation-reuse trick), folds
+/// the per-block scale into a running f32 accumulator via a single FMA, and
+/// carries the zero-point affine correction in scalar. A single horizontal
+/// reduction per column at the very end replaces the per-block reduction the
+/// per-column path pays. The nibble unpack is byte-for-byte the same as
+/// [`borrowed_int4_block_dot_avx2`], so results differ from that path only by
+/// f32 summation reassociation (a few ULP), never in nibble decode.
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn borrowed_int4_nblock4_avx2(
+    activation: &[f32],
+    activation_sums: &[f32],
+    packed_rows: &[&[u8]],
+    scales: &BorrowedScales<'_>,
+    scale_bases: &[usize],
+    zp_rows: &[Option<&[u8]>],
+    biases: &[f32],
+    layout: NBitsLayout,
+    block_count: usize,
+    block_size: usize,
+    k: usize,
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let group = packed_rows.len();
+    let mask = _mm_set1_epi8(0x0f);
+    let packed_block_size = layout.packed_block_size();
+    let mut acc = [_mm256_setzero_ps(); 4];
+    let mut correction = [0.0f32; 4];
+    let mut extra = [0.0f32; 4];
+    for block in 0..block_count {
+        let depth_start = block * block_size;
+        let valid = k.saturating_sub(depth_start).min(block_size);
+        if valid != block_size || !block_size.is_multiple_of(32) {
+            // Ragged or non-32-multiple tail block: scalar, matching the
+            // per-column path's scalar fallback exactly.
+            for c in 0..group {
+                let block_values = &packed_rows[c]
+                    [block * packed_block_size..(block + 1) * packed_block_size];
+                let scale = scales.get(scale_bases[c] + block);
+                let zero_point = layout.zero_point(zp_rows[c], block) as f32;
+                let mut dot = 0.0f32;
+                for (byte_index, &byte) in block_values.iter().enumerate() {
+                    let within = byte_index * 2;
+                    if within < valid {
+                        dot += activation[depth_start + within] * (byte & 0x0f) as f32;
+                    }
+                    if within + 1 < valid {
+                        dot += activation[depth_start + within + 1] * (byte >> 4) as f32;
+                    }
+                }
+                extra[c] += dot * scale;
+                correction[c] += scale * zero_point * activation_sums[block];
+            }
+            continue;
+        }
+        let chunks = block_size / 32;
+        let mut blk = [_mm256_setzero_ps(); 4];
+        for chunk in 0..chunks {
+            let base = depth_start + chunk * 32;
+            // SAFETY: `valid == block_size` and `base + 32 <= k`, so all four
+            // 8-lane loads stay within the activation row.
+            let a0 = unsafe { _mm256_loadu_ps(activation.as_ptr().add(base)) };
+            let a1 = unsafe { _mm256_loadu_ps(activation.as_ptr().add(base + 8)) };
+            let a2 = unsafe { _mm256_loadu_ps(activation.as_ptr().add(base + 16)) };
+            let a3 = unsafe { _mm256_loadu_ps(activation.as_ptr().add(base + 24)) };
+            for c in 0..group {
+                // SAFETY: 16 packed bytes per 32-lane chunk are in bounds for
+                // this column's block slice; loadu permits unaligned pointers.
+                let bytes = unsafe {
+                    _mm_loadu_si128(
+                        packed_rows[c]
+                            .as_ptr()
+                            .add(block * packed_block_size + chunk * 16)
+                            .cast(),
+                    )
+                };
+                let low = _mm_and_si128(bytes, mask);
+                let high = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+                let inter_lo = _mm_unpacklo_epi8(low, high);
+                let inter_hi = _mm_unpackhi_epi8(low, high);
+                let w0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(inter_lo));
+                let w1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(inter_lo, 8)));
+                let w2 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(inter_hi));
+                let w3 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(inter_hi, 8)));
+                blk[c] = _mm256_fmadd_ps(a0, w0, blk[c]);
+                blk[c] = _mm256_fmadd_ps(a1, w1, blk[c]);
+                blk[c] = _mm256_fmadd_ps(a2, w2, blk[c]);
+                blk[c] = _mm256_fmadd_ps(a3, w3, blk[c]);
+            }
+        }
+        for c in 0..group {
+            let scale = scales.get(scale_bases[c] + block);
+            let zero_point = layout.zero_point(zp_rows[c], block) as f32;
+            acc[c] = _mm256_fmadd_ps(blk[c], _mm256_set1_ps(scale), acc[c]);
+            correction[c] += scale * zero_point * activation_sums[block];
+        }
+    }
+    for c in 0..group {
+        let vector = acc[c];
+        let lo = _mm256_castps256_ps128(vector);
+        let hi = _mm256_extractf128_ps(vector, 1);
+        let sum4 = _mm_add_ps(lo, hi);
+        let sum2 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+        let sum1 = _mm_add_ss(sum2, _mm_shuffle_ps(sum2, sum2, 0x55));
+        out[c] = biases[c] + _mm_cvtss_f32(sum1) + extra[c] - correction[c];
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn borrowed_affine_int4_matmul(
     activations: &[f32],
@@ -8436,10 +8979,10 @@ mod tests {
                 // The packed buffer is a real resident allocation. The memory
                 // plan budgets the byte total this function returns, which must
                 // equal what the kernels actually hold across the session: the
-                // per-copy packed + scale/zp bytes, materialized once per
-                // shape-keyed kernel instance (prefill + decode). Not zero (the
-                // pre-#1027 blind spot), and not a bare single packed buffer (the
-                // #1051 2x under-report this test now guards).
+                // per-copy packed + scale/zp bytes. Since #1056 the prefill and
+                // decode kernel instances share one packed buffer, so this is a
+                // single copy -- not zero (the pre-#1027 blind spot), and not the
+                // 2x the #1051 accounting reported before the buffer was shared.
                 let packed_bytes = mlas_sys::sqnbit_packed_b_size(
                     kernel.n,
                     kernel.k,
@@ -8464,11 +9007,11 @@ mod tests {
                 assert_eq!(
                     accounted,
                     per_copy.saturating_mul(MLAS_PACKED_DECODE_INSTANTIATIONS),
-                    "the MLAS SQNBit packed buffer must be accounted for the memory plan (#1027) as the per-copy footprint times the prefill+decode instantiations (#1051)"
+                    "the MLAS SQNBit packed buffer must be accounted for the memory plan (#1027) as the single shared per-copy footprint (#1056)"
                 );
                 assert!(
                     accounted > packed_bytes as u64,
-                    "the accounted footprint must exceed a single bare packed buffer (it includes the retained scales and both kernel instantiations)"
+                    "the accounted footprint must exceed a bare packed buffer (it includes the retained scales/zero-points)"
                 );
                 return;
             }
@@ -8528,6 +9071,80 @@ mod tests {
             }
         }
         (packed, scales, asymmetric.then_some(zps), dequantized)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn nblock_matches_per_column_borrowed_path() {
+        // The register-blocked ("N-blocked") borrowed int4 kernel must produce
+        // the same result as the per-column borrowed path (up to f32
+        // reassociation), for symmetric and asymmetric int4, single- and
+        // multi-row activations, and an N that is not a multiple of 4 (tail
+        // group). Guarded to x86_64 because the kernel is x86-only.
+        if matches!(selected_dot_kernel(), DotKernel::Scalar) {
+            // No AVX2 on this host; the N-blocked path is never selected.
+            return;
+        }
+        let mut rng: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng >> 40) as f32 / (1u32 << 24) as f32) - 0.5
+        };
+        for &(m, k, n, block_size) in &[
+            (1usize, 96usize, 13usize, 32usize),
+            (1, 128, 8, 32),
+            (2, 64, 7, 32),
+            (1, 256, 16, 128),
+        ] {
+            for &asymmetric in &[false, true] {
+                let weights_nk: Vec<f32> = (0..n * k).map(|_| next()).collect();
+                let activations: Vec<f32> = (0..m * k).map(|_| next()).collect();
+                let (packed, scales, zps, _dequant) =
+                    quantize(&weights_nk, n, k, block_size, asymmetric);
+                let zp_slice = zps.as_deref();
+                let bias: Vec<f32> = (0..n).map(|_| next()).collect();
+
+                let mut expected = vec![0.0f32; m * n];
+                borrowed_affine_int4_matmul(
+                    &activations,
+                    &packed,
+                    BorrowedScales::F32(&scales),
+                    zp_slice,
+                    Some(&bias),
+                    &mut expected,
+                    m,
+                    k,
+                    n,
+                    block_size,
+                    selected_dot_kernel(),
+                );
+
+                let mut got = vec![0.0f32; m * n];
+                borrowed_affine_int4_matmul_nblock(
+                    &activations,
+                    &packed,
+                    BorrowedScales::F32(&scales),
+                    zp_slice,
+                    Some(&bias),
+                    &mut got,
+                    m,
+                    k,
+                    n,
+                    block_size,
+                );
+
+                for (index, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+                    let tolerance = 1e-3 * a.abs().max(1.0);
+                    assert!(
+                        (a - b).abs() <= tolerance,
+                        "m={m} k={k} n={n} block={block_size} asym={asymmetric} \
+                         index {index}: per-column {a} vs n-blocked {b}"
+                    );
+                }
+            }
+        }
     }
 
     fn reference(a: &[f32], weights_nk: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
@@ -13182,8 +13799,8 @@ mod tests {
     /// Sum the heap bytes the MLAS SQNBit shards a kernel packed actually hold
     /// (packed buffer + retained scale/zero-point copies), reading each shard's
     /// real [`mlas_sys::SQNBitPackedB::owned_heap_bytes`]. This is the *actual*
-    /// footprint one compiled kernel instance retains, read back deterministically
-    /// from that kernel (not the process-global counter, so parallel tests cannot
+    /// footprint the shared packed buffer retains, read back deterministically
+    /// from the kernel (not the process-global counter, so parallel tests cannot
     /// perturb it).
     #[cfg(feature = "mlas")]
     fn mlas_shards_owned_bytes(kernel: &MatMulNBitsKernel) -> u64 {
@@ -13201,20 +13818,33 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// #1027/#1051: the accounting the memory plan reads must equal the MLAS
-    /// packed bytes the kernels *actually* allocate -- predicted == actual, so an
-    /// admission gate is never fed an underestimate.
+    /// Identity of the shared `mlas_shards` allocation a kernel holds, so a test
+    /// can prove two kernel instances point at the *same* packed buffer (#1056
+    /// dedup) rather than two equal-but-distinct copies.
+    #[cfg(feature = "mlas")]
+    fn mlas_shards_arc_ptr(kernel: &MatMulNBitsKernel) -> Option<*const Vec<Option<MlasShard>>> {
+        kernel
+            .mlas_shards
+            .get()
+            .and_then(Option::as_ref)
+            .map(Arc::as_ptr)
+    }
+
+    /// #1027/#1051/#1056: the accounting the memory plan reads must equal the
+    /// MLAS packed bytes the kernels *actually* allocate -- predicted == actual,
+    /// so an admission gate is never fed an underestimate.
     ///
-    /// This asserts the tie at all three levels, against the real allocated
-    /// bytes rather than re-deriving `sqnbit_packed_b_size` (which would only
-    /// prove the predictor calls the same function it did before, the tautology
-    /// that let the 2x under-report through):
+    /// This asserts the tie against the real allocated bytes rather than
+    /// re-deriving `sqnbit_packed_b_size` (which would only prove the predictor
+    /// calls the same function it did before, the tautology that let the earlier
+    /// under-report through):
     ///
     ///   1. the per-copy predictor equals the packed + scale/zp bytes one
     ///      executed kernel instance retains;
-    ///   2. the per-node predictor equals the bytes **two** instances retain,
-    ///      because the shape-keyed kernel cache compiles a prefill (`m > 1`) and
-    ///      a decode (`m == 1`) instance and each packs its own copy;
+    ///   2. the prefill (`m > 1`) and decode (`m == 1`) instances -- the two the
+    ///      shape-keyed kernel cache compiles for one node from the *same*
+    ///      constant weight -- **share one packed allocation** (#1056), so the
+    ///      per-node predictor equals a **single** copy, not two;
     ///   3. the graph walker the plan calls
     ///      ([`resident_dequant_f32_cache_bytes`]) equals that same actual
     ///      session footprint.
@@ -13247,9 +13877,18 @@ mod tests {
             .collect();
         let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
 
-        // Execute one kernel instance at row count `m` so it packs its MLAS
-        // shards exactly as the decode runtime does, then return the kernel so
-        // its actual retained bytes can be read back.
+        // The constant weight (`b`) and its scales are built **once** and shared
+        // by both runs, exactly as the executor hands the same mmapped
+        // initializer to a node's prefill and decode kernel instances. That
+        // shared address is what lets the two instances rendezvous on one packed
+        // buffer; building a fresh copy per run (distinct addresses) would defeat
+        // the dedup the same way distinct weights do.
+        let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+        let scales_t = Owned::f32(&[n, blocks], &scales);
+
+        // Execute one kernel instance at row count `m` so it packs (or shares)
+        // its MLAS shards exactly as the decode runtime does, then return the
+        // kernel so its actual retained bytes can be read back.
         let run = |m: usize| -> MatMulNBitsKernel {
             let a_values: Vec<f32> = (0..m * k)
                 .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
@@ -13257,8 +13896,6 @@ mod tests {
             let mut kernel = test_kernel(k, n, block_size);
             kernel.set_constant_inputs(&[false, true, true]);
             let a = Owned::f32(&[m, k], &a_values);
-            let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
-            let scales_t = Owned::f32(&[n, blocks], &scales);
             let mut y = Owned::zeros_f32(&[m, n]);
             kernel
                 .execute(&[a.view(), b.view(), scales_t.view()], &mut [y.view_mut()])
@@ -13287,16 +13924,27 @@ mod tests {
         );
         assert_eq!(
             decode_actual, per_copy_predicted,
-            "the decode instance holds the same per-copy bytes as the prefill instance"
+            "the decode instance sees the same per-copy bytes as the prefill instance"
         );
 
-        // Per-node accounting must equal the bytes BOTH instances retain.
-        let session_actual = prefill_actual + decode_actual;
+        // #1056: the prefill and decode instances must share **one** packed
+        // allocation, not hold two equal-but-distinct copies. Proven by pointer
+        // identity of the shared `mlas_shards` `Arc`, so the equality above is
+        // one buffer read twice, not two buffers that happen to match.
+        assert_eq!(
+            mlas_shards_arc_ptr(&prefill),
+            mlas_shards_arc_ptr(&decode),
+            "prefill and decode instances of one node must share a single packed buffer (#1056)"
+        );
+
+        // Per-node accounting must equal the bytes the session actually retains:
+        // a single shared copy, because the two instances point at one buffer.
+        let session_actual = per_copy_predicted;
         let node_predicted =
             matmul_nbits_resident_side_cache_bytes(4, block_size, 0, n, k, false, false, false);
         assert_eq!(
             node_predicted, session_actual,
-            "per-node accounting must equal the two instances' actual packed bytes (the missed 2x)"
+            "per-node accounting must equal the one shared packed buffer's actual bytes (#1056)"
         );
 
         // The graph walker the memory plan actually calls must equal the same
