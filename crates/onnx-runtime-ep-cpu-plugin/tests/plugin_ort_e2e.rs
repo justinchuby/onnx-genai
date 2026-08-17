@@ -3872,9 +3872,14 @@ const ASSIGNMENT_FIXTURES: &[(&str, &str)] = &[
     ("gqa_rotary_pos_assignment_f32", "GroupQueryAttention"),
     ("msft_attention_assignment_f32", "Attention"),
     ("moe_assignment_f32", "MoE"),
-    // ORT has no CPU kernel for QMoE, MoE or PackedMultiHeadAttention, so for
-    // these three the shape-table decline bought a *load failure* rather than a
-    // slower run. Each was rescued by this change and each needs its own real
+    // f32 alone was not coverage: production mixtures are exported in half
+    // precision, and `MoE` advertised f32 only while its kernel widens f16 and
+    // bf16 to f32 and narrows on the way out. This row is the falsifier.
+    ("moe_assignment_f16", "MoE"),
+    // ORT has no CPU kernel for PackedMultiHeadAttention, so for that one the
+    // shape-table decline bought a *load failure* rather than a slower run; it
+    // does have CPU kernels for MoE and QMoE, so for those it was simply us not
+    // running an op we implement. Each was rescued here and each needs its own real
     // session to prove it, because the pure-Rust inventory test builds
     // synthetic nodes and never opens one -- it cannot see a dtype-filter or
     // kernel-factory rejection, which are exactly the layers that were
@@ -6000,5 +6005,57 @@ unsafe fn run_and_collect_f32(
             ((*api).ReleaseValue.unwrap())(out);
         }
         collected
+    }
+}
+
+/// A `QMoE` node this kernel cannot compute is declined at *claim* time, and
+/// the session still loads.
+///
+/// This is the one deliberate decline in the suite, and it is a **capability**
+/// answer rather than a performance one. ORT's schema leaves `block_size`
+/// without a default, so an absent attribute selects the column-wise form (one
+/// scale per output row); `qmoe.rs` implements only the blocked form. ORT's own
+/// CPU kernel runs the column-wise form, so the choice is not "us or nothing":
+///
+///   * decline at claim time  → ORT runs it, model works, we owe a kernel;
+///   * claim and fail in the factory → `CreateSession` dies and **no fallback
+///     recovers**, because ORT has already compiled the node onto this EP.
+///
+/// Making `QMoE` reachable at all is what created that second possibility, so
+/// this test pins the first. It is deliberately *not* in `ASSIGNMENT_FIXTURES`:
+/// it is the documented exception, and it should stop being one as soon as the
+/// column-wise path exists.
+#[test]
+fn column_wise_qmoe_is_declined_at_claim_time_not_failed_late() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/qmoe_columnwise_f32/model.onnx.textproto");
+    let reg = "cpu_ep_qmoe_columnwise";
+
+    // Fallback must stay *enabled*: the point is that ORT can still run this.
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup(reg, &model_path, false) })
+    else {
+        eprintln!("*** SKIPPED: qmoe_columnwise — ORT or EP cdylib not found ***");
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours = info.ops_on_our_ep();
+        assert!(
+            !ours.contains(&"QMoE"),
+            "column-wise QMoE was claimed; the factory then rejects it, which kills the \
+             session outright. Decline it in `qmoe::unsupported_reason` instead, or \
+             implement the column-wise path. Got: {:?}",
+            info.assignments
+        );
+        eprintln!(
+            "  [qmoe_columnwise_f32] declined at claim time, session loaded; ours={ours:?}, \
+             others={:?}",
+            info.ops_not_on_our_ep()
+        );
+        conformance_teardown(api, env, opts, session, reg);
     }
 }

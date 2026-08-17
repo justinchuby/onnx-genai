@@ -446,7 +446,13 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("SimplifiedLayerNormalization", "") | ("LinearAttention", "") => FLOAT_DTYPES,
 
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_DTYPES,
-        ("MoE", "com.microsoft") | ("QMoE", "com.microsoft") => F32_ONLY,
+        // `moe.rs` widens f16/bf16 to f32, computes, and narrows on the way
+        // out, so advertising f32 alone declined every realistic MoE node --
+        // production mixtures are exported in half precision. `QMoE` is f32 in
+        // and out with the experts carried as packed uint8, whose slots are
+        // listed in `input_dtype_constraints_for_op`.
+        ("MoE", "com.microsoft") => FLOAT_COMPUTE_DTYPES,
+        ("QMoE", "com.microsoft") => F32_ONLY,
 
         // pkg.nxrt custom ops: f32-only (fail closed).
         (_, "pkg.nxrt") => F32_ONLY,

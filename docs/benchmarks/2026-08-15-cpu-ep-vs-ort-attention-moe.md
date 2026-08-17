@@ -1691,9 +1691,10 @@ Three independent gates must all pass for a node to reach our kernels:
 **fail-closed shape-inference filter** that drops any claim whose node has no
 rule in `compute.rs`. That last one answers to neither of the first two, and it
 was giving away `com.microsoft::Attention`, `MoE`, `QMoE`,
-`PackedMultiHeadAttention`, `ScatterND`, `ScatterElements` and `Trilu` — three of
-which **ORT has no CPU kernel for at all**, so the "fallback" bought a load
-failure rather than a slower run.
+`PackedMultiHeadAttention`, `ScatterND`, `ScatterElements` and `Trilu`. For
+`PackedMultiHeadAttention`, which **ORT has no CPU kernel for at all**, that
+"fallback" bought a load failure rather than a slower run; for the rest it
+simply meant not running an op we implement.
 
 ### 23.2 Two decode ops were being handed to ORT by a dtype rule
 
@@ -1776,28 +1777,48 @@ decline. Every row is a real session with
 | `msft_attention_assignment_f32` | `com.microsoft::Attention` | silently declined | **ours** |
 | `packed_mha_assignment_f32` | `PackedMultiHeadAttention` | silently declined, then **ORT** (dtype union) | **ours** |
 | `moe_assignment_f32` | `MoE` | silently declined | **ours** |
+| `moe_assignment_f16` | `MoE` float16 | silently declined, then **ORT** (f32-only union) | **ours** |
 | `qmoe_assignment_f32` | `QMoE` | silently declined, then **ORT** (dtype union) | **ours** |
 | 23 pre-existing activation/norm fixtures | — | ours | **ours** |
 
-Four of those rows exist because review asked for them, and three of the four
+Six of those rows exist because review asked for them, and four of the six
 found a decline that was still live after the first pass: GQA's `position_ids`
 is optional input **9**, and listing only slots 5 and 6 left a `do_rotary` node
 with explicit int64 positions failing the float union; `QMoE`'s uint8-packed
 expert weights and `PackedMultiHeadAttention`'s int32 `token_offset` /
-`cumulative_sequence_length` did the same. The pure-Rust inventory test cannot
+`cumulative_sequence_length` did the same. And `MoE` advertised **float32
+only** while its kernel widens float16 and bfloat16 to f32 and narrows on the
+way out — so every *realistic* MoE node, which is half precision, was declined
+while the f32 fixture passed. One dtype's worth of coverage is not coverage.
+The pure-Rust inventory test cannot
 see any of these — it builds synthetic nodes and never opens an ORT session, so
 it is blind to the dtype filter and to the kernel factory. **Only a real session
 per op finds them, which is the argument for one fixture per rescued op rather
 than a representative sample.**
 
-`every_fixture_loads_with_cpu_fallback_disabled` runs the same 37 with
+`every_fixture_loads_with_cpu_fallback_disabled` runs the same 38 with
 `session.disable_cpu_ep_fallback=1`, so ORT is *forbidden* from placing a
-supported node on its own CPU EP: **37/37 load and 37/37 are assigned to us.**
-For `MoE`, `QMoE` and `PackedMultiHeadAttention` that is also the only way the
-graph can load at all: ORT has no CPU kernel for any of the three, so declining
-them bought `Could not find an implementation for PackedMultiHeadAttention(1)`
-rather than a slower run. (`com.microsoft::Attention` *does* have an ORT CPU
-kernel — an earlier draft of this section said otherwise.)
+supported node on its own CPU EP: **38/38 load and 38/38 are assigned to us.**
+**Correction, from review.** An earlier draft of this section claimed ORT has
+no CPU kernel for `MoE`, `QMoE` or `com.microsoft::Attention`. It has all three;
+the reviewer loaded *and ran* these very fixtures on ORT's
+`CPUExecutionProvider` under both 1.27 and 1.28. Only
+`PackedMultiHeadAttention` genuinely has none, which the falsifier shows
+directly: reverting `PACKED_MHA_SLOTS` does not hand the node to ORT, it fails
+session creation with `Could not find an implementation for
+PackedMultiHeadAttention(1)`. For the other ops the decline meant we were not
+running an operator we implement — bad, but not fatal.
+
+One fixture is deliberately **not** in that table:
+
+| fixture | op | on `main` | after | why excluded |
+|---|---|---|---|---|
+| `qmoe_columnwise_f32` | `QMoE`, `block_size` absent | ORT | ORT | no column-wise kernel here; see §23.6 |
+
+`column_wise_qmoe_is_declined_at_claim_time_not_failed_late` asserts it: the
+node lands on ORT, the session still loads, and — the point of the test — the
+decline happens in `supports_op` rather than in the kernel factory, where it
+would have been unrecoverable.
 
 ### 23.5 Assignment is not the guarantee — the arithmetic is
 
@@ -1818,15 +1839,36 @@ appended, so ORT resolves the node to its own contrib CPU kernel.
 Both attention outputs are at float32 rounding, and the KV cache is written
 bit-identically to ORT's.
 
-### 23.6 A capability gap this exposed
+### 23.6 Making an op reachable can break it: column-wise QMoE
 
-`QMoE`'s fixture had to be written with `block_size = 32`, because our kernel
-requires a power-of-two block of at least 16 and ORT's schema default of `0`
-selects the *column-wise* form (one scale per output row) that we do not
-implement. That is a genuine capability gap rather than a claim gap, and it is
-not one ORT can cover: it has no CPU `QMoE` kernel either, so such a node fails
-session creation whoever is asked. Listed here so it is not mistaken for
-something the assignment work fixed.
+`QMoE`'s fixture had to be written with `block_size = 32`, because this kernel
+implements only the blocked form while ORT's schema leaves `block_size` without
+a default — so an absent attribute means the *column-wise* form, one scale per
+output row. The first draft of this section assumed ORT could not run that
+either. **It can**, and review demonstrated it by loading and running the
+fixture on ORT's `CPUExecutionProvider` under 1.27 and 1.28.
+
+That turned a documented gap into a regression, and it is worth stating plainly
+because it is a hazard of this whole change:
+
+> Claiming an op is not free. `GetCapability` consults only the dtype and shape
+> filters; a rejection raised later, in the kernel factory, arrives **after** ORT
+> has compiled the node onto this EP, and **no fallback recovers from it**. So
+> making `QMoE` reachable also made a previously-working column-wise model die
+> at `CreateSession` with `block_size must be a power of two and at least 16,
+> got 0`.
+
+The fix is `qmoe::unsupported_reason`, consulted from `supports_op` at claim
+time, plus
+`plugin_ort_e2e::column_wise_qmoe_is_declined_at_claim_time_not_failed_late`,
+which asserts the session still loads and the node lands on ORT.
+
+**This is the one deliberate decline in the suite and it is a capability answer,
+not a performance one** — we have no column-wise implementation, and the choice
+is between ORT running the model and nobody running it. It is not an exception
+to §23's rule, which is about ranges where we are *slower*; it is an admission
+that we owe a kernel. It should stop being an exception as soon as the
+column-wise path exists.
 
 ### 23.7 What this does not fix
 

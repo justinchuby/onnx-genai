@@ -67,6 +67,35 @@ pub struct QMoEKernel {
     prefetch_experts: bool,
 }
 
+/// Why this kernel cannot run a given `QMoE` node, if it cannot.
+///
+/// This has to be answered at *claim* time, not in `create`. `GetCapability`
+/// consults only the dtype and shape filters; a rejection raised later, in the
+/// kernel factory, arrives after ORT has already compiled the node onto this EP
+/// and is a **hard session failure that no fallback recovers from** — strictly
+/// worse for the user than never claiming the node.
+///
+/// The one case is column-wise quantization. ORT's schema leaves `block_size`
+/// with no default, so an absent attribute means one scale per output row
+/// (`[experts, out_features]`), while this kernel implements only the blocked
+/// form (`[experts, out_features, in_features / block_size]`, block a power of
+/// two ≥ 16). ORT's own CPU kernel *does* run the column-wise form, so claiming
+/// and then failing would take a working model and kill it. Declining here is
+/// a capability answer, not a performance one; the fix is to implement the
+/// column-wise path, tracked in the benchmark doc's §23.6.
+pub(crate) fn unsupported_reason(node: &Node) -> Option<String> {
+    let block_size = node
+        .attr("block_size")
+        .and_then(|a| a.as_int())
+        .unwrap_or(0);
+    if block_size < 16 || !(block_size as usize).is_power_of_two() {
+        return Some(format!(
+            "QMoE: column-wise quantization (block_size {block_size}) is not implemented;              only a power-of-two block of at least 16 is supported"
+        ));
+    }
+    None
+}
+
 impl KernelFactory for QMoEFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let attributes = MoeAttributes::from_node(node)?;

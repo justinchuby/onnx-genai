@@ -463,6 +463,12 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "QMoE"
+            && op.domain == "com.microsoft"
+            && let Some(reason) = crate::kernels::qmoe::unsupported_reason(op)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "PackedMultiHeadAttention"
             && op.domain == "com.microsoft"
             && let Some(reason) = crate::kernels::packed_multi_head_attention::unsupported_reason(

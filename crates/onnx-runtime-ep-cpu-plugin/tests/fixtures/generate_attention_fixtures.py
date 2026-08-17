@@ -230,11 +230,37 @@ def main():
     gen_gqa_rotary_position_ids_assignment_f32()
     gen_msft_attention_assignment_f32()
     gen_moe_assignment_f32()
+    gen_moe_assignment_f16()
     gen_qmoe_assignment_f32()
+    gen_qmoe_columnwise_f32()
     gen_packed_mha_assignment_f32()
     gen_trilu_assignment_f32()
     gen_scatter_elements_assignment_f32()
     print("Done.")
+
+
+# ── MoE, float16 ─────────────────────────────────────────────────────────────
+# Review falsifier: production mixtures are exported in half precision, and
+# `moe.rs` widens f16/bf16 to f32 and narrows on the way out -- but the op
+# advertised f32 alone, so every realistic MoE node was declined while the f32
+# fixture passed. One dtype's worth of coverage is not coverage.
+def gen_moe_assignment_f16():
+    rows, hidden, experts, inter = 4, 32, 8, 64
+    x = vi("input", [rows, hidden], TensorProto.FLOAT16)
+    probs = vi("router_probs", [rows, experts], TensorProto.FLOAT16)
+    fc1_w = helper.make_tensor(
+        "fc1_w16", TensorProto.FLOAT16, [experts, inter, hidden],
+        b"\x00\x3c" * (experts * inter * hidden), raw=True)
+    fc2_w = helper.make_tensor(
+        "fc2_w16", TensorProto.FLOAT16, [experts, hidden, inter],
+        b"\x00\x3c" * (experts * hidden * inter), raw=True)
+    out = vi("output", [rows, hidden], TensorProto.FLOAT16)
+    node = helper.make_node(
+        "MoE", ["input", "router_probs", "fc1_w16", "", "fc2_w16"], ["output"],
+        domain=MS, k=2, activation_type="gelu")
+    save(finish([node], "moe_assignment_f16", [x, probs], [out], ms=True,
+                inits=[fc1_w, fc2_w]),
+         "moe_assignment_f16", check=False)
 
 
 # ── GroupQueryAttention with explicit int64 position_ids ─────────────────────
@@ -271,9 +297,10 @@ def gen_gqa_rotary_position_ids_assignment_f32():
 
 
 # ── QMoE ─────────────────────────────────────────────────────────────────────
-# ORT has no CPU kernel for this at all, so declining it bought a load failure
-# rather than a slower run. int4-packed experts, so the weight last dim is
-# halved and the scales carry the block structure.
+# ORT does have a CPU kernel for QMoE (review loaded and ran this fixture on
+# `CPUExecutionProvider` under 1.27 and 1.28), so declining it meant not running
+# an op we implement rather than a load failure. int4-packed experts, so the
+# weight last dim is halved and the scales carry the block structure.
 def gen_qmoe_assignment_f32():
     # Blocked quantization: our kernel supports block_size >= 16 (a power of
     # two), so the scales carry one column per block rather than one per row.
@@ -306,6 +333,41 @@ def gen_qmoe_assignment_f32():
     save(finish([node], "qmoe_assignment_f32", [x, probs], [out], ms=True,
                 inits=[fc1_w, fc1_s, fc2_w, fc2_s]),
          "qmoe_assignment_f32", check=False)
+
+
+# ── QMoE, column-wise (the one deliberate capability decline) ────────────────
+# `block_size` absent means one scale per output row, and this kernel
+# implements only the blocked form. ORT's CPU kernel *does* run this, so
+# claiming it and then failing in the factory would take a working model and
+# kill the session -- the decline has to happen at claim time instead.
+# `plugin_ort_e2e::column_wise_qmoe_is_declined_at_claim_time_not_failed_late`
+# is the regression test; the fix is to implement the column-wise path.
+def gen_qmoe_columnwise_f32():
+    rows, hidden, experts, inter = 4, 32, 4, 64
+    x = vi("input", [rows, hidden])
+    probs = vi("router_probs", [rows, experts])
+    fc1_w = helper.make_tensor(
+        "cw_fc1_w", TensorProto.UINT8, [experts, inter, hidden // 2],
+        b"\x11" * (experts * inter * hidden // 2), raw=True)
+    fc1_s = helper.make_tensor(
+        "cw_fc1_s", TensorProto.FLOAT, [experts, inter],
+        [0.01] * (experts * inter))
+    fc2_w = helper.make_tensor(
+        "cw_fc2_w", TensorProto.UINT8, [experts, hidden, inter // 2],
+        b"\x11" * (experts * hidden * inter // 2), raw=True)
+    fc2_s = helper.make_tensor(
+        "cw_fc2_s", TensorProto.FLOAT, [experts, hidden],
+        [0.01] * (experts * hidden))
+    out = vi("output", [rows, hidden])
+    node = helper.make_node(
+        "QMoE",
+        ["input", "router_probs", "cw_fc1_w", "cw_fc1_s", "", "cw_fc2_w",
+         "cw_fc2_s"],
+        ["output"],
+        domain=MS, k=2, activation_type="gelu", expert_weight_bits=4)
+    save(finish([node], "qmoe_columnwise_f32", [x, probs], [out], ms=True,
+                inits=[fc1_w, fc1_s, fc2_w, fc2_s]),
+         "qmoe_columnwise_f32", check=False)
 
 
 # ── PackedMultiHeadAttention ─────────────────────────────────────────────────

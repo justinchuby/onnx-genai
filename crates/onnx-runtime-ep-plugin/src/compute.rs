@@ -268,9 +268,11 @@ impl ShapeInference {
             // here, so `GetCapability`'s fail-closed shape filter dropped the
             // claim and ORT's CPU EP ran it -- the same silent mechanism that
             // hid the activations until #1082 and the trigonometrics until
-            // #1097. `MoE`/`QMoE` are the sharpest case: ORT has no CPU kernel
-            // for either, so giving them away does not buy a faster
-            // implementation, it costs a load failure.
+            // #1097. `PackedMultiHeadAttention` is the sharpest case -- ORT
+            // has no CPU kernel for it at all, so giving it away cost a load
+            // failure rather than a slower run -- but ORT does run `MoE` and
+            // `QMoE` on CPU, so for those the decline was simply us not
+            // executing an op we implement.
             | "MoE"
             | "QMoE"
             | "ScatterND"
