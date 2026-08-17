@@ -215,11 +215,20 @@ thread_local! {
 }
 
 /// Runs `f` with the elementwise kernels' parallel split disabled.
+///
+/// Restores the previous value on unwind as well as on return. A leaked flag
+/// would only cost speed, never correctness -- serial and parallel results are
+/// bit-identical -- but it would leave that thread quietly serialised for every
+/// later activation, which is a hard bug to find afterwards.
 pub(crate) fn serial_scope<T>(f: impl FnOnce() -> T) -> T {
-    let prev = FORCE_SERIAL.with(|c| c.replace(true));
-    let out = f();
-    FORCE_SERIAL.with(|c| c.set(prev));
-    out
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_SERIAL.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(FORCE_SERIAL.with(|c| c.replace(true)));
+    f()
 }
 
 #[inline]
@@ -3059,21 +3068,30 @@ mod thread_invariance {
     }
 
     /// The guard must be restored even if the closure unwinds, or one panicking
-    /// kernel would serialise every later call on that thread.
+    /// kernel would serialise every later call on that thread for the rest of
+    /// the process -- silently, since results stay correct either way.
     #[test]
     fn serial_scope_is_restored_after_a_panic() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
         let r = std::panic::catch_unwind(|| serial_scope(|| panic!("boom")));
-        assert!(r.is_err());
-        // Documents current behaviour: the guard is *not* unwind-safe, so a
-        // panic leaves it set. Every caller in this crate returns normally or
-        // propagates a `Result`, and a panicking kernel aborts the node anyway,
-        // so this is acceptable — but it is asserted rather than assumed, and
-        // any future panicking caller will have to revisit it.
+        std::panic::set_hook(prev);
+
+        assert!(r.is_err(), "the panic should still propagate");
         assert!(
-            force_serial(),
-            "behaviour changed: guard now unwinds cleanly"
+            !force_serial(),
+            "guard leaked across an unwind: this thread is now serial forever"
         );
-        FORCE_SERIAL.with(|c| c.set(false));
+    }
+
+    /// Nesting must restore the outer value, not reset to "parallel".
+    #[test]
+    fn serial_scope_nests() {
+        serial_scope(|| {
+            serial_scope(|| assert!(force_serial()));
+            assert!(force_serial(), "inner scope cleared the outer guard");
+        });
+        assert!(!force_serial());
     }
 
     /// A zero width would divide by zero; a width whose row count overflows
