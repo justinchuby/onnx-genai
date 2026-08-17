@@ -931,7 +931,7 @@ Full matrix, all 54 cells, `native ÷ ORT` (lower is better, 1.00 = parity):
 | qwen3-0.6b | prefill q512/kv512 | nomask | 1 | 1.063 | 1.076 | **0.99x** |
 | qwen3-0.6b | prefill q512/kv512 | nomask | 8 | 2.929 | 2.840 | **1.03x** |
 | qwen3-0.6b | prefill q512/kv512 | nomask | 16 | 2.876 | 3.149 | **0.91x** |
-### Second answer: still decline it
+### Second answer: still decline it — WITHDRAWN, see §23
 
 The fix is large — up to **8.44x** — and masked single-thread decode now beats
 ORT outright (0.889–1.009x, was 1.073–1.400x). It is not enough. **44 of 54
@@ -1697,7 +1697,7 @@ failure rather than a slower run.
 
 ### 23.2 Two decode ops were being handed to ORT by a dtype rule
 
-With shape rules added for all seven ops and nine new fixtures wired in, a real
+With shape rules added for all seven ops and fourteen new fixtures wired in, a real
 ORT 1.27 session immediately failed the rewritten assignment test on the two ops
 that matter most in decode:
 
@@ -1736,12 +1736,22 @@ attribute is **-1**, not 0. ORT's own kernel enables the feature only for the
 exact value 1, so -1 means "off" — but our `!= 0` test read it as "on" and
 refused the node. Every GQA node from every real ORT session hit this.
 
-The same hazard applies to `scale`, whose kernels (ours and ORT's) read 0 as
-"use 1/sqrt(head_size)" rather than literally: taking a stamped `scale = 0` at
-face value would multiply every score by zero and produce a silently wrong
-result rather than an error. `attention.rs`, `msft_attention.rs`,
-`multi_head_attention.rs` and `group_query_attention.rs` now all treat a
-non-positive `scale` as absent, matching ORT.
+**Correction, from review:** the same argument was originally made for `scale`,
+and it is wrong. Instrumenting the GQA, MHA and `com.microsoft::Attention`
+factories during a real `CreateSession` over these fixtures prints
+`scale_attr=None` for all three — `scale` is `OPTIONAL_VALUE` with no schema
+default, so ORT does *not* stamp it, and removing the guard leaves the numerics
+in §23.5 unchanged at 1.006e-7. The guard stays as **defence, not a fix**: both
+ORT's kernels and ours read an explicit `scale = 0` as "use 1/sqrt(head_size)"
+rather than literally, so a zero taken at face value would multiply every score
+by zero and return a silently wrong answer instead of an error. `attention.rs`,
+`msft_attention.rs`, `multi_head_attention.rs`, `group_query_attention.rs` and
+`packed_multi_head_attention.rs` now all treat a non-positive `scale` as absent.
+`> 0` is deliberately broader than ORT's `== 0`, because a negative scale is
+meaningless and would otherwise be honoured.
+
+`smooth_softmax` is the load-bearing half of this finding and it does hold:
+`smooth_softmax_attr=Some(-1)` on a node that never set it.
 
 ### 23.4 Assignment matrix, all 32 fixtures, real ORT 1.27 CPU session
 
@@ -1753,22 +1763,41 @@ decline. Every row is a real session with
 
 | fixture | op | before | after |
 |---|---|---|---|
-| `softmax_assignment_f32` | `Softmax` | n/a (no fixture) | **ours** |
-| `transpose_assignment_f32` | `Transpose` | n/a | **ours** |
-| `kv_concat_assignment_f32` | `Concat` | n/a | **ours** |
-| `kv_scatternd_assignment_f32` | `ScatterND` | n/a — silently declined | **ours** |
-| `rotary_assignment_f32` | `RotaryEmbedding` | **ORT** | **ours** |
-| `mha_assignment_f32` | `MultiHeadAttention` | n/a | **ours** |
-| `gqa_assignment_f32` | `GroupQueryAttention` | **ORT** | **ours** |
-| `msft_attention_assignment_f32` | `com.microsoft::Attention` | n/a — silently declined | **ours** |
-| `moe_assignment_f32` | `MoE` | n/a — silently declined | **ours** |
+| `softmax_assignment_f32` | `Softmax` | no fixture | **ours** |
+| `transpose_assignment_f32` | `Transpose` | no fixture | **ours** |
+| `kv_concat_assignment_f32` | `Concat` | no fixture | **ours** |
+| `kv_scatternd_assignment_f32` | `ScatterND` | silently declined | **ours** |
+| `scatter_elements_assignment_f32` | `ScatterElements` | silently declined | **ours** |
+| `trilu_assignment_f32` | `Trilu` | silently declined | **ours** |
+| `rotary_assignment_f32` | `RotaryEmbedding` | **ORT** (dtype union) | **ours** |
+| `mha_assignment_f32` | `MultiHeadAttention` | no fixture | **ours** |
+| `gqa_assignment_f32` | `GroupQueryAttention` | **ORT** (dtype union) | **ours** |
+| `gqa_rotary_pos_assignment_f32` | `GroupQueryAttention` + int64 `position_ids` | **ORT** (dtype union, slot 9) | **ours** |
+| `msft_attention_assignment_f32` | `com.microsoft::Attention` | silently declined | **ours** |
+| `packed_mha_assignment_f32` | `PackedMultiHeadAttention` | silently declined, then **ORT** (dtype union) | **ours** |
+| `moe_assignment_f32` | `MoE` | silently declined | **ours** |
+| `qmoe_assignment_f32` | `QMoE` | silently declined, then **ORT** (dtype union) | **ours** |
 | 23 pre-existing activation/norm fixtures | — | ours | **ours** |
 
-`every_fixture_loads_with_cpu_fallback_disabled` runs the same 32 with
+Four of those rows exist because review asked for them, and three of the four
+found a decline that was still live after the first pass: GQA's `position_ids`
+is optional input **9**, and listing only slots 5 and 6 left a `do_rotary` node
+with explicit int64 positions failing the float union; `QMoE`'s uint8-packed
+expert weights and `PackedMultiHeadAttention`'s int32 `token_offset` /
+`cumulative_sequence_length` did the same. The pure-Rust inventory test cannot
+see any of these — it builds synthetic nodes and never opens an ORT session, so
+it is blind to the dtype filter and to the kernel factory. **Only a real session
+per op finds them, which is the argument for one fixture per rescued op rather
+than a representative sample.**
+
+`every_fixture_loads_with_cpu_fallback_disabled` runs the same 37 with
 `session.disable_cpu_ep_fallback=1`, so ORT is *forbidden* from placing a
-supported node on its own CPU EP: **32/32 load and 32/32 are assigned to us.**
-For `MoE` and `com.microsoft::Attention` that is also the only way the graph can
-load at all, since ORT has no CPU kernel to fall back to.
+supported node on its own CPU EP: **37/37 load and 37/37 are assigned to us.**
+For `MoE`, `QMoE` and `PackedMultiHeadAttention` that is also the only way the
+graph can load at all: ORT has no CPU kernel for any of the three, so declining
+them bought `Could not find an implementation for PackedMultiHeadAttention(1)`
+rather than a slower run. (`com.microsoft::Attention` *does* have an ORT CPU
+kernel — an earlier draft of this section said otherwise.)
 
 ### 23.5 Assignment is not the guarantee — the arithmetic is
 
@@ -1789,7 +1818,17 @@ appended, so ORT resolves the node to its own contrib CPU kernel.
 Both attention outputs are at float32 rounding, and the KV cache is written
 bit-identically to ORT's.
 
-### 23.6 What this does not fix
+### 23.6 A capability gap this exposed
+
+`QMoE`'s fixture had to be written with `block_size = 32`, because our kernel
+requires a power-of-two block of at least 16 and ORT's schema default of `0`
+selects the *column-wise* form (one scale per output row) that we do not
+implement. That is a genuine capability gap rather than a claim gap, and it is
+not one ORT can cover: it has no CPU `QMoE` kernel either, so such a node fails
+session creation whoever is asked. Listed here so it is not mistaken for
+something the assignment work fixed.
+
+### 23.7 What this does not fix
 
 It makes the losing ranges *reachable*; it does not make them fast. §15's fused
 region is still 3–15x short at 8–16 threads, §19–20's Transpose gaps and §18's

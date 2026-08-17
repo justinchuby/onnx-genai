@@ -223,12 +223,35 @@ pub fn input_dtype_constraints_for_op(
     // X, cos_cache, sin_cache, position_ids.
     static ONNX_ROTARY_SLOTS: &[(usize, &[DataType])] = &[(3, INDEX_DTYPES)];
     // query, key, value, past_key, past_value, seqlens_k, total_sequence_length,
-    // cos_cache, sin_cache.
-    static GQA_SLOTS: &[(usize, &[DataType])] = &[(5, I32_ONLY), (6, INDEX_DTYPES)];
+    // cos_cache, sin_cache, position_ids. `seqlens_k` is strictly int32 (the
+    // kernel rejects anything else); the other two go through `to_dense_i64`.
+    // Slot 9 is optional and only present with `do_rotary`, but leaving it
+    // unlisted made a `do_rotary` GQA node with explicit int64 positions fail
+    // the float union and go to ORT -- the exact bug this table exists to stop.
+    static GQA_SLOTS: &[(usize, &[DataType])] =
+        &[(5, I32_ONLY), (6, INDEX_DTYPES), (9, INDEX_DTYPES)];
     // query, key, value, bias, key_padding_mask, attention_bias, past_key, past_value.
     static MHA_SLOTS: &[(usize, &[DataType])] = &[(4, INDEX_DTYPES)];
     // input, weights, bias, mask_index, past, attention_bias.
     static MSFT_ATTENTION_SLOTS: &[(usize, &[DataType])] = &[(3, INDEX_DTYPES)];
+    // query, key, value, bias, token_offset, cumulative_sequence_length.
+    // The last two are strictly int32 (`packed_multi_head_attention.rs`
+    // rejects anything else). ORT has no CPU kernel for this op, so failing
+    // the union here does not fall back -- it fails session creation.
+    static PACKED_MHA_SLOTS: &[(usize, &[DataType])] = &[(4, I32_ONLY), (5, I32_ONLY)];
+    // QMoE stores its experts int4/int8-packed in uint8, so the float union
+    // rejects the weight and zero-point slots outright. Slot order:
+    // input, router_probs, fc1_w, fc1_scales, fc1_bias, fc2_w, fc2_scales,
+    // fc2_bias, fc3_w, fc3_scales, fc3_bias, fc1_zp, fc2_zp, fc3_zp,
+    // router_weights. Mirrors the `require_dtype` calls in `qmoe.rs`.
+    static QMOE_SLOTS: &[(usize, &[DataType])] = &[
+        (2, U8_ONLY),
+        (5, U8_ONLY),
+        (8, U8_ONLY),
+        (11, U8_ONLY),
+        (12, U8_ONLY),
+        (13, U8_ONLY),
+    ];
     match (op_type, domain) {
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
         ("QLinearMatMul", "") => QLINEAR_MATMUL_SLOTS,
@@ -237,6 +260,8 @@ pub fn input_dtype_constraints_for_op(
         ("GroupQueryAttention", "com.microsoft") => GQA_SLOTS,
         ("MultiHeadAttention", "com.microsoft") => MHA_SLOTS,
         ("Attention", "com.microsoft") => MSFT_ATTENTION_SLOTS,
+        ("PackedMultiHeadAttention", "com.microsoft") => PACKED_MHA_SLOTS,
+        ("QMoE", "com.microsoft") => QMOE_SLOTS,
         _ => &[],
     }
 }

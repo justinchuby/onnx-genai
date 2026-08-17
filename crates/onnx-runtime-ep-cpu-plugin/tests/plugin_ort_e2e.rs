@@ -3865,8 +3865,24 @@ const ASSIGNMENT_FIXTURES: &[(&str, &str)] = &[
     ("rotary_assignment_f32", "RotaryEmbedding"),
     ("mha_assignment_f32", "MultiHeadAttention"),
     ("gqa_assignment_f32", "GroupQueryAttention"),
+    // `position_ids` is GQA's optional input *9*. Leaving that slot off the
+    // per-slot dtype table sent a `do_rotary` node with explicit int64
+    // positions to ORT even after the `seqlens_k` / `total_sequence_length`
+    // slots were fixed, so it gets its own row rather than being assumed.
+    ("gqa_rotary_pos_assignment_f32", "GroupQueryAttention"),
     ("msft_attention_assignment_f32", "Attention"),
     ("moe_assignment_f32", "MoE"),
+    // ORT has no CPU kernel for QMoE, MoE or PackedMultiHeadAttention, so for
+    // these three the shape-table decline bought a *load failure* rather than a
+    // slower run. Each was rescued by this change and each needs its own real
+    // session to prove it, because the pure-Rust inventory test builds
+    // synthetic nodes and never opens one -- it cannot see a dtype-filter or
+    // kernel-factory rejection, which are exactly the layers that were
+    // silently declining GQA and RoPE.
+    ("qmoe_assignment_f32", "QMoE"),
+    ("packed_mha_assignment_f32", "PackedMultiHeadAttention"),
+    ("trilu_assignment_f32", "Trilu"),
+    ("scatter_elements_assignment_f32", "ScatterElements"),
 ];
 
 /// The architectural rule, asserted directly: when this EP is loaded it takes

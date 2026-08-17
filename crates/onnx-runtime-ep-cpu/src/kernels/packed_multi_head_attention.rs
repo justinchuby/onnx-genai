@@ -49,6 +49,11 @@ impl KernelFactory for PackedMultiHeadAttentionFactory {
         if scale.is_some_and(|value| !value.is_finite()) {
             return Err(error("scale must be finite"));
         }
+        // Same rule as the other four attention kernels: an explicit
+        // non-positive scale means "use 1/sqrt(head_size)", not "multiply every
+        // score by zero". This op became reachable at the same time as they
+        // did, so it gets the same guard rather than a silently different one.
+        let scale = scale.filter(|value| *value > 0.0);
         Ok(Box::new(PackedMultiHeadAttentionKernel {
             num_heads,
             scale,

@@ -227,9 +227,135 @@ def main():
     gen_rotary_assignment_f32()
     gen_mha_assignment_f32()
     gen_gqa_assignment_f32()
+    gen_gqa_rotary_position_ids_assignment_f32()
     gen_msft_attention_assignment_f32()
     gen_moe_assignment_f32()
+    gen_qmoe_assignment_f32()
+    gen_packed_mha_assignment_f32()
+    gen_trilu_assignment_f32()
+    gen_scatter_elements_assignment_f32()
     print("Done.")
+
+
+# ── GroupQueryAttention with explicit int64 position_ids ─────────────────────
+# Review falsifier for the per-slot dtype table: `position_ids` is optional
+# input *9*, and leaving it off `GQA_SLOTS` made a `do_rotary` node with
+# explicit positions fail the float union and go to ORT -- the same class of
+# silent decline the table exists to stop, just one slot further out.
+def gen_gqa_rotary_position_ids_assignment_f32():
+    B, S, H, KV, D, P = 1, 1, 32, 8, 128, 1023
+    q = vi("query", [B, S, H * D])
+    k = vi("key", [B, S, KV * D])
+    v = vi("value", [B, S, KV * D])
+    pk = vi("past_key", [B, KV, P, D])
+    pv = vi("past_value", [B, KV, P, D])
+    seqlens = vi("seqlens_k", [B], TensorProto.INT32)
+    total = vi("total_sequence_length", [1], TensorProto.INT32)
+    cos = vi("cos_cache", [2048, D // 2])
+    sin = vi("sin_cache", [2048, D // 2])
+    pos = vi("position_ids", [B, S], TensorProto.INT64)
+    out = vi("output", [B, S, H * D])
+    prk = vi("present_key", [B, KV, P + S, D])
+    prv = vi("present_value", [B, KV, P + S, D])
+    node = helper.make_node(
+        "GroupQueryAttention",
+        ["query", "key", "value", "past_key", "past_value", "seqlens_k",
+         "total_sequence_length", "cos_cache", "sin_cache", "position_ids"],
+        ["output", "present_key", "present_value"],
+        domain=MS, num_heads=H, kv_num_heads=KV, do_rotary=1,
+    )
+    save(finish([node], "gqa_rotary_pos_assignment_f32",
+                [q, k, v, pk, pv, seqlens, total, cos, sin, pos],
+                [out, prk, prv], ms=True),
+         "gqa_rotary_pos_assignment_f32", check=False)
+
+
+# ── QMoE ─────────────────────────────────────────────────────────────────────
+# ORT has no CPU kernel for this at all, so declining it bought a load failure
+# rather than a slower run. int4-packed experts, so the weight last dim is
+# halved and the scales carry the block structure.
+def gen_qmoe_assignment_f32():
+    # Blocked quantization: our kernel supports block_size >= 16 (a power of
+    # two), so the scales carry one column per block rather than one per row.
+    # ORT's schema default of 0 selects the column-wise form, which this kernel
+    # does not implement -- a real capability gap, not a claim gap, and one ORT
+    # cannot cover either since it has no CPU QMoE kernel at all.
+    rows, hidden, experts, inter, block = 4, 32, 4, 64, 32
+    x = vi("input", [rows, hidden])
+    probs = vi("router_probs", [rows, experts])
+    fc1_w = helper.make_tensor(
+        "fc1_w", TensorProto.UINT8, [experts, inter, hidden // 2],
+        b"\x11" * (experts * inter * hidden // 2), raw=True)
+    fc1_s = helper.make_tensor(
+        "fc1_s", TensorProto.FLOAT, [experts, inter, hidden // block],
+        [0.01] * (experts * inter * (hidden // block)))
+    fc2_w = helper.make_tensor(
+        "fc2_w", TensorProto.UINT8, [experts, hidden, inter // 2],
+        b"\x11" * (experts * hidden * inter // 2), raw=True)
+    fc2_s = helper.make_tensor(
+        "fc2_s", TensorProto.FLOAT, [experts, hidden, inter // block],
+        [0.01] * (experts * hidden * (inter // block)))
+    out = vi("output", [rows, hidden])
+    node = helper.make_node(
+        "QMoE",
+        ["input", "router_probs", "fc1_w", "fc1_s", "", "fc2_w", "fc2_s"],
+        ["output"],
+        domain=MS, k=2, activation_type="gelu", expert_weight_bits=4,
+        block_size=block,
+    )
+    save(finish([node], "qmoe_assignment_f32", [x, probs], [out], ms=True,
+                inits=[fc1_w, fc1_s, fc2_w, fc2_s]),
+         "qmoe_assignment_f32", check=False)
+
+
+# ── PackedMultiHeadAttention ─────────────────────────────────────────────────
+# Rank-2 token-packed SDPA: output is [token_count, v_hidden], which is why it
+# cannot use the SameAsInput(0) rule the other rescued ops share.
+def gen_packed_mha_assignment_f32():
+    tokens, H, D, B = 8, 4, 16, 1
+    hidden = H * D
+    q = vi("query", [tokens, hidden])
+    k = vi("key", [tokens, hidden])
+    v = vi("value", [tokens, hidden])
+    token_offset = vi("token_offset", [B, tokens], TensorProto.INT32)
+    cumseq = vi("cumulative_sequence_length", [B + 1], TensorProto.INT32)
+    out = vi("output", [tokens, hidden])
+    node = helper.make_node(
+        "PackedMultiHeadAttention",
+        ["query", "key", "value", "", "token_offset",
+         "cumulative_sequence_length"],
+        ["output"], domain=MS, num_heads=H,
+    )
+    save(finish([node], "packed_mha_assignment_f32",
+                [q, k, v, token_offset, cumseq], [out], ms=True),
+         "packed_mha_assignment_f32", check=False)
+
+
+# ── Trilu ────────────────────────────────────────────────────────────────────
+# The causal-mask builder. Shape-preserving, so the rule is SameAsInput(0).
+def gen_trilu_assignment_f32():
+    x = vi("input", [1, 1, 128, 128])
+    out = vi("output", [1, 1, 128, 128])
+    k = helper.make_tensor("k", TensorProto.INT64, [], [0])
+    node = helper.make_node("Trilu", ["input", "k"], ["output"], upper=1)
+    save(finish([node], "trilu_assignment_f32", [x], [out], inits=[k]),
+         "trilu_assignment_f32")
+
+
+# ── ScatterElements ──────────────────────────────────────────────────────────
+# The other KV-cache write form, alongside ScatterND.
+def gen_scatter_elements_assignment_f32():
+    B, KV, T, D = 1, 8, 1024, 128
+    data = vi("data", [B, KV, T, D])
+    updates = vi("updates", [B, KV, 1, D])
+    indices = helper.make_tensor(
+        "indices", TensorProto.INT64, [B, KV, 1, D], [0] * (B * KV * D))
+    out = vi("output", [B, KV, T, D])
+    node = helper.make_node(
+        "ScatterElements", ["data", "indices", "updates"], ["output"], axis=2)
+    save(finish([node], "scatter_elements_assignment_f32",
+                [data, updates], [out], inits=[indices]),
+         "scatter_elements_assignment_f32")
 
 
 if __name__ == "__main__":

@@ -95,10 +95,12 @@ impl KernelFactory for MultiHeadAttentionFactory {
                 "MultiHeadAttention: num_heads must be > 0, got {num_heads}"
             )));
         }
-        // ORT materialises schema defaults onto a node before an EP sees it,
-        // and its own kernels read `scale == 0` as "use 1/sqrt(head_size)"
-        // rather than literally. Taking a zero scale at face value would zero
-        // every score, so a non-positive attribute means "absent" here too.
+        // Defensive, not load-bearing: ORT does not stamp this attribute (a
+        // real session was instrumented to confirm it arrives absent). But both
+        // ORT's kernels and ours read an explicit `scale = 0` as "use
+        // 1/sqrt(head_size)" rather than literally, so a zero taken at face
+        // value would zero every score silently. `> 0` is deliberately broader
+        // than ORT's `== 0`, since a negative scale is meaningless.
         let scale = node
             .attr("scale")
             .and_then(|a| a.as_float())

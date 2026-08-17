@@ -676,10 +676,15 @@ impl KernelFactory for GroupQueryAttentionFactory {
         Ok(Box::new(GroupQueryAttentionKernel {
             num_heads,
             kv_num_heads,
-            // Same schema-default hazard as `smooth_softmax`: ORT stamps
-            // `scale = 0` on every node, and its kernel reads 0 as "use
-            // 1/sqrt(head_size)". Taking it literally would scale the scores by
-            // zero, so treat a non-positive scale as absent.
+            // Defensive, not load-bearing: ORT does *not* stamp this
+            // attribute (it is OPTIONAL_VALUE with no schema default, and a
+            // real session was instrumented to confirm it arrives as absent).
+            // But both ORT's kernels and ours read an explicit `scale = 0` as
+            // "use 1/sqrt(head_size)" rather than literally, so a zero taken at
+            // face value would multiply every score by zero and return a
+            // silently wrong answer. `> 0` is deliberately broader than ORT's
+            // `== 0`: a negative scale is meaningless and would otherwise be
+            // honoured.
             scale: node
                 .attr("scale")
                 .and_then(|a| a.as_float())

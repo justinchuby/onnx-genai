@@ -162,8 +162,15 @@ int32, so the integer slots failed the float test and **both ops were handed to
 ORT on every real session** while every pure-Rust test passed.
 `input_dtype_constraints_for_op` (`onnx-runtime-ep-cpu/src/kernels/mod.rs`) now
 carries per-slot tables for `RotaryEmbedding` in both domains — their slot
-orders differ — plus `GroupQueryAttention`, `MultiHeadAttention` and
-`com.microsoft::Attention`.
+orders differ — plus `GroupQueryAttention` (including `position_ids` at slot
+**9**, which a first pass missed because it only listed the two slots the
+fixtures happened to exercise), `MultiHeadAttention`, `com.microsoft::Attention`,
+`PackedMultiHeadAttention` (int32 `token_offset` / `cumulative_sequence_length`)
+and `QMoE` (uint8-packed experts and zero points).
+
+Three of those five were found only after review asked for one real-ORT fixture
+per rescued op. **An inventory test that never opens a session cannot see this
+filter at all**, which is the same lesson as above arriving a third time.
 
 **Filter 4 — the kernel factory, which runs after assignment.** Clearing all
 three filters only gets as far as `get_kernel`. ORT stamps **schema defaults**
@@ -174,7 +181,7 @@ not support must use ORT's default, not ONNX's zero: the contrib default for
 failure rather than a fallback, so it is the most expensive of the four.
 
 The attention, MoE and KV-cache ops are now covered end-to-end by
-`plugin_ort_e2e`'s `ASSIGNMENT_FIXTURES` (32 graphs, all on our EP with
+`plugin_ort_e2e`'s `ASSIGNMENT_FIXTURES` (37 graphs, all on our EP with
 `session.disable_cpu_ep_fallback=1`) and by
 `rope_and_gqa_execute_on_our_ep_and_match_ort_numerics`, which checks the two
 recovered ops against ORT's own kernels rather than only checking placement.
