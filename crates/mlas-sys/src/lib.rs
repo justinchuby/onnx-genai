@@ -2118,7 +2118,18 @@ mod tests {
                     .collect();
                 let mut batched = vec![0.0f32; batch * m * n];
                 sgemm_batch(
-                    false, trans_b, m, n, k, 1.0, &items, k, ldb, 0.0, &mut batched, n,
+                    false,
+                    trans_b,
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    &items,
+                    k,
+                    ldb,
+                    0.0,
+                    &mut batched,
+                    n,
                 );
 
                 let mut serial = vec![0.0f32; batch * m * n];

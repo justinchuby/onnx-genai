@@ -554,8 +554,7 @@ fn grouped_linear(
             gemm(
                 &input[group.start * in_features..(group.start + group.len) * in_features],
                 &weights_kn,
-                &mut output
-                    [group.start * out_features..(group.start + group.len) * out_features],
+                &mut output[group.start * out_features..(group.start + group.len) * out_features],
                 group.len,
                 in_features,
                 out_features,
@@ -747,7 +746,14 @@ fn run_moe_grouped(
     );
 
     let mut expert_out = vec![0.0f32; slots * hidden];
-    grouped_linear(&activated, plan, fc2_weights, hidden, inter, &mut expert_out)?;
+    grouped_linear(
+        &activated,
+        plan,
+        fc2_weights,
+        hidden,
+        inter,
+        &mut expert_out,
+    )?;
     drop(activated);
 
     let (row_slots, slot_weight, slot_expert, k) = (
@@ -1893,13 +1899,33 @@ mod tests {
                         fc3_bias.as_deref(),
                     );
                     let grouped = run_moe_grouped(
-                        &plan, &x, &fc1, args.0, &fc2, args.1, args.2, args.3, fc1_size, HIDDEN,
-                        INTER, &attributes,
+                        &plan,
+                        &x,
+                        &fc1,
+                        args.0,
+                        &fc2,
+                        args.1,
+                        args.2,
+                        args.3,
+                        fc1_size,
+                        HIDDEN,
+                        INTER,
+                        &attributes,
                     )
                     .unwrap();
                     let per_expert = run_moe_per_expert(
-                        &plan, &x, &fc1, args.0, &fc2, args.1, args.2, args.3, fc1_size, HIDDEN,
-                        INTER, &attributes,
+                        &plan,
+                        &x,
+                        &fc1,
+                        args.0,
+                        &fc2,
+                        args.1,
+                        args.2,
+                        args.3,
+                        fc1_size,
+                        HIDDEN,
+                        INTER,
+                        &attributes,
                     )
                     .unwrap();
                     assert_eq!(
