@@ -356,6 +356,20 @@ mod tests {
         (batch * RESULT_BYTES) + scratch_words(elements, batch) * std::mem::size_of::<u32>()
     }
 
+    /// Force the freshly written input buffer to be coherent before the argmax
+    /// kernel reads it. In production the logits are produced on-device by the
+    /// lm_head GEMV on the same compute stream, so they are already ordered and
+    /// coherent. Constructed-tie tests instead feed logits via a host->device
+    /// copy into pooled VMM memory; the first kernel access after a buffer-state
+    /// change can otherwise observe a stale tail element (a memory-governor VMM
+    /// materialization artifact, not the reduction). A device->host readback of
+    /// the input synchronizes the stream and materializes those pages, giving the
+    /// argmax the same coherent view production always sees.
+    fn ensure_input_coherent(ep: &CudaExecutionProvider, input: &DeviceBuffer, bytes: usize) {
+        let mut scratch = vec![0_u8; bytes];
+        ep.copy_to_host(input, &mut scratch).unwrap();
+    }
+
     fn run_case(ep: &CudaExecutionProvider, logits: &[f32]) -> [u32; 2] {
         let bytes = logits
             .iter()
@@ -364,6 +378,7 @@ mod tests {
         let mut input = ep.allocate(bytes.len(), 256).unwrap();
         let mut output = ep.allocate(result_bytes(logits.len(), 1), 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
+        ensure_input_coherent(ep, &input, bytes.len());
         ep.device_argmax(&input, logits.len(), 1, DataType::Float32, &mut output)
             .unwrap();
         let mut result = [0_u8; RESULT_BYTES];
@@ -392,6 +407,7 @@ mod tests {
         let mut input = ep.allocate(bytes.len(), 256).unwrap();
         let mut output = ep.allocate(result_bytes(vocab, batch), 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
+        ensure_input_coherent(ep, &input, bytes.len());
         ep.device_argmax(&input, vocab, batch, DataType::Float32, &mut output)
             .unwrap();
         let mut header = vec![0_u8; batch * RESULT_BYTES];
@@ -418,6 +434,7 @@ mod tests {
         let mut input = ep.allocate(bytes.len(), 256).unwrap();
         let mut output = ep.allocate(result_bytes(logits.len(), 1), 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
+        ensure_input_coherent(ep, &input, bytes.len());
         ep.device_argmax(&input, logits.len(), 1, DataType::Float16, &mut output)
             .unwrap();
         let mut result = [0_u8; RESULT_BYTES];
@@ -446,6 +463,7 @@ mod tests {
         let mut input = ep.allocate(bytes.len(), 256).unwrap();
         let mut output = ep.allocate(result_bytes(vocab, batch), 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
+        ensure_input_coherent(ep, &input, bytes.len());
         ep.device_argmax(&input, vocab, batch, DataType::Float16, &mut output)
             .unwrap();
         let mut header = vec![0_u8; batch * RESULT_BYTES];
@@ -659,6 +677,64 @@ mod tests {
                 assert_eq!(
                     f16_got[0], want,
                     "M={m} tie row {row}: f16 device argmax {} != highest tied index {want}",
+                    f16_got[0]
+                );
+            }
+
+            // (c) Explicit partition-spanning ties. The partials kernel splits the
+            // vocab into grid-stride partitions of width `stride = 256 * ceil(VOCAB
+            // / 1024)`; a tie whose equal maxima land in DIFFERENT partitions is
+            // only resolved correctly if every reduction stage (warp -> block ->
+            // partition-partial -> finalize) breaks value ties toward the higher
+            // GLOBAL index. These fixed configs place equal maxima straddling the
+            // partition seams and spanning up to three partitions, including
+            // Wallace's exact {3, 76032, 152063} case at vocab 152064. The highest
+            // global index must win in every case. One config per row (cycled) so
+            // each batch exercises several boundary layouts independently.
+            const STRIDE: usize = 256 * ((VOCAB + 1023) / 1024); // 38_144 for 152_064
+            let boundary_configs: [[usize; 3]; 6] = [
+                [3, VOCAB / 2, VOCAB - 1],           // Wallace's exact {3, 76032, 152063}
+                [STRIDE - 1, STRIDE, STRIDE + 1],    // straddles the first seam
+                [3, STRIDE, 2 * STRIDE],             // 3-way across three partitions
+                [2 * STRIDE - 1, 2 * STRIDE, 2 * STRIDE + 1], // straddles the second seam
+                [0, VOCAB / 3, VOCAB - 2],           // tail-adjacent highest
+                [3 * STRIDE - 1, 3 * STRIDE, VOCAB - 1], // last seam + final index
+            ];
+            let boundary_rows: Vec<Vec<f32>> = (0..m)
+                .map(|row| {
+                    let cfg = boundary_configs[row % boundary_configs.len()];
+                    let mut logits = vec![-2.0_f32; VOCAB];
+                    for &p in &cfg {
+                        logits[p] = 7.0;
+                    }
+                    logits
+                })
+                .collect();
+            let boundary_expected: Vec<u32> = (0..m)
+                .map(|row| {
+                    let cfg = boundary_configs[row % boundary_configs.len()];
+                    *cfg.iter().max().unwrap() as u32
+                })
+                .collect();
+            let boundary_f32 = run_batch_case(&ep, &boundary_rows);
+            let boundary_f16 = run_batch_case_f16(&ep, &boundary_rows);
+            for (row, (f32_got, f16_got)) in boundary_f32.iter().zip(boundary_f16.iter()).enumerate()
+            {
+                let want = boundary_expected[row];
+                assert_eq!(
+                    f32_got[0], want,
+                    "M={m} boundary row {row}: f32 device argmax {} != highest global tied index {want} \
+                     (cross-partition finalize must keep the higher index)",
+                    f32_got[0]
+                );
+                assert_eq!(
+                    want,
+                    host_argmax(&boundary_rows[row]),
+                    "M={m} boundary row {row}: host highest-index disagrees with expected"
+                );
+                assert_eq!(
+                    f16_got[0], want,
+                    "M={m} boundary row {row}: f16 device argmax {} != highest global tied index {want}",
                     f16_got[0]
                 );
             }
