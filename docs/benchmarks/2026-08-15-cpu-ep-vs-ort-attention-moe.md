@@ -1036,8 +1036,10 @@ never allow.
 At `--native-threads 1` the CPU MoE operator was **at parity** with a real ORT CPU
 session on all nine synthetic production-shaped graphs: ratios 1.01-1.05. The entire
 gap opened up as threads were added. Native time for a 512-token Mixtral-shaped
-forward was 350.8 / 148.6 / 113.4 ms at 1 / 8 / 16 threads. Inverting Amdahl's law on
-those three points puts the **serial fraction at ~34%**.
+forward was 350.8 / 148.6 / 113.4 ms at 1 / 8 / 16 threads in the single-arm baseline run
+(the paired run in §18.3 measured 353.2 / 148.7 / 112.2 ms for the same cell - the same
+numbers inside session-to-session drift). Inverting Amdahl's law on those three points
+puts the **serial fraction at ~34%**.
 
 The serial 34% was everything except the GEMMs:
 
@@ -1109,8 +1111,10 @@ reduced expert counts, **no weights downloaded**).
 Where the gate selects the grouped driver, native time drops **25-46%**: mixtral 512
 tok/16 thr 1.785 -> 1.004, phi35moe 512/16 0.707 -> 0.440, qwen3moe 512/16 1.401 ->
 0.729, and the three 8-thread 512-token cells fall 25-32%. Where the gate keeps the
-per-expert loop the two arms run identical code; 16 of those 19 cells move by <=1.3%
-and the three outliers sit inside the baseline arm's own trial dispersion.
+per-expert loop the two arms are algorithmically equivalent and produce bit-identical
+output - not literally the same code, since the after-arm still builds the routing plan -
+and 16 of those 19 cells move by <=1.3%, with the three outliers inside the baseline
+arm's own trial dispersion.
 
 **We still lose to ORT** on many-expert, narrow-intermediate shapes (Qwen3-MoE: 16
 experts, `inter` 768, top-8) at 1.34-1.93, on mixtral at 32 tokens (1.41-1.93), and on
@@ -1137,6 +1141,32 @@ points, so changing the constant in a way that would flip a measured cell fails 
 Expert-weight prepacking (`MlasGemmPackB`) was considered and **rejected**: decode is
 bandwidth-bound on reading the expert bank, packing does not reduce bytes read, and it
 would double a 352 MiB weight bank.
+
+### 18.6 The cost: peak transient memory
+
+The grouped driver is not free. It materialises **whole-slot** intermediates at once -
+`gathered` (slots x hidden), `fc1_out` (slots x fc1_size), the optional `fc3_out` and
+`activated` (slots x inter each) and `expert_out` (slots x hidden) - where the per-expert
+loop held roughly one group's worth at a time. For a 512-token Phi-3.5-MoE-shaped prefill
+(hidden 2048, inter 6400, fc1_size 12800, top-2, 1024 slots) that is about **78 MiB** of
+transients against about **21 MiB** before, and it grows linearly with token count.
+
+This is a deliberate trade: the transients are what make every stage a flat parallel map.
+It is also the second reason the gate matters - below the floor the per-expert loop keeps
+both the old latency *and* the old peak. Anyone running many concurrent large-prefill
+sessions on a memory-tight host should raise `ONNX_GENAI_MOE_GROUPED_MIN_WORK`. Tiling the
+grouped driver by slot blocks would cap the peak and was not attempted here.
+
+### 18.7 Correction: the gate statistic changed after measurement
+
+The A/B matrix above was produced by a build whose gate used the **mean** rows per expert
+group. Review pointed out that a collapsed router - one expert taking most of the rows -
+still has one large GEMM to hide the elementwise stages behind, and the mean would hide
+it, so the shipped gate uses the **largest** group instead. Recomputing all 27 cells under
+both statistics selects the **same driver in every cell** (the benchmark routers are close
+to balanced, so mean and max differ by well under the 8x calibration band), which is why
+the matrix stands as measured. `the_gate_reads_the_largest_group_not_the_average` pins the
+difference on a deliberately skewed router so the statistic cannot silently revert.
 
 ## 19. Phase 4 requirement 3: what is actually left in Transpose
 

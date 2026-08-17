@@ -269,7 +269,7 @@ impl Kernel for MoEKernel {
         let router = to_dense_f32_widen("MoE", &inputs[1])?;
         let fc1 = to_dense_f32_widen("MoE", &inputs[2])?;
         let fc2 = to_dense_f32_widen("MoE", &inputs[4])?;
-        let plan = RoutingPlan::build(
+        let mut plan = RoutingPlan::build(
             &router,
             rows,
             experts,
@@ -277,6 +277,7 @@ impl Kernel for MoEKernel {
             self.attributes.normalize_routing_weights,
         );
         let driver = if use_grouped_driver(&plan, expected_fc1, hidden, inter) {
+            plan.build_row_slots();
             run_moe_grouped
         } else {
             run_moe_per_expert
@@ -459,24 +460,30 @@ impl RoutingPlan {
                 slot_weight.push(weight);
             }
         }
-        // Invert the layout so the final scatter can be a parallel map over
-        // *output* rows: two experts share an output row, so scattering by
-        // expert would race.
-        let mut row_slots = vec![u32::MAX; rows * k];
-        let mut filled = vec![0usize; rows];
-        for (slot, &row) in slot_row.iter().enumerate() {
-            let row = row as usize;
-            row_slots[row * k + filled[row]] = slot as u32;
-            filled[row] += 1;
-        }
         Self {
             rows,
             k,
             slot_row,
             slot_expert,
             slot_weight,
-            row_slots,
+            row_slots: Vec::new(),
             groups,
+        }
+    }
+
+    /// Invert the layout so the final scatter can be a parallel map over
+    /// *output* rows: two experts share an output row, so scattering by expert
+    /// would race.
+    ///
+    /// Only the grouped driver scatters that way, and this is an `rows * k`
+    /// allocation, so the per-expert driver does not pay for it.
+    fn build_row_slots(&mut self) {
+        self.row_slots = vec![u32::MAX; self.rows * self.k];
+        let mut filled = vec![0usize; self.rows];
+        for (slot, &row) in self.slot_row.iter().enumerate() {
+            let row = row as usize;
+            self.row_slots[row * self.k + filled[row]] = slot as u32;
+            filled[row] += 1;
         }
     }
 
@@ -598,21 +605,30 @@ fn use_grouped_driver(plan: &RoutingPlan, fc1_size: usize, hidden: usize, inter:
         // one with fewer intermediate buffers.
         return false;
     }
-    let rows_per_group = (plan.slots() / groups) as u64;
-    let work = rows_per_group
+    grouped_work_units(plan, fc1_size, hidden, inter) >= grouped_min_work()
+}
+
+/// The gate's work estimate, split out so it can be pinned by a test on a
+/// machine of any width.
+///
+/// The largest group rather than the mean: a collapsed router that sends most
+/// of its rows to one expert still has one large GEMM to hide the elementwise
+/// stages behind, and the mean would hide it.
+fn grouped_work_units(plan: &RoutingPlan, fc1_size: usize, hidden: usize, inter: usize) -> u64 {
+    let rows_per_group = plan.groups.iter().map(|group| group.len).max().unwrap_or(0) as u64;
+    rows_per_group
         .saturating_mul(hidden as u64)
-        .saturating_mul((fc1_size + inter) as u64);
-    work >= grouped_min_work()
+        .saturating_mul((fc1_size + inter) as u64)
 }
 
 fn grouped_min_work() -> u64 {
-    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("ONNX_GENAI_MOE_GROUPED_MIN_WORK")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(MOE_GROUPED_MIN_WORK)
-    })
+    // Deliberately not cached: the read is once per operator call, next to a
+    // multi-millisecond GEMM, and caching it in a `OnceLock` would let whichever
+    // test ran first freeze the value for the whole process.
+    std::env::var("ONNX_GENAI_MOE_GROUPED_MIN_WORK")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(MOE_GROUPED_MIN_WORK)
 }
 
 /// The per-expert driver: gather each expert's rows into a fresh buffer, run
@@ -706,6 +722,11 @@ fn run_moe_grouped(
     if slots == 0 || hidden == 0 {
         return Ok(output);
     }
+    debug_assert_eq!(
+        plan.row_slots.len(),
+        plan.rows * plan.k,
+        "run_moe_grouped needs the row->slot inversion; call build_row_slots first"
+    );
 
     let mut gathered = vec![0.0f32; slots * hidden];
     let slot_row = &plan.slot_row;
@@ -1891,13 +1912,14 @@ mod tests {
                     let fc1_bias = bias.then(|| ramp(EXPERTS * fc1_size, 7, 0.15, 0.11));
                     let fc2_bias = bias.then(|| ramp(EXPERTS * HIDDEN, 5, 0.1, 0.07));
                     let fc3_bias = (bias && uses_fc3).then(|| ramp(EXPERTS * INTER, 3, 0.05, 0.05));
-                    let plan = RoutingPlan::build(&router, rows, EXPERTS, k, true);
+                    let mut plan = RoutingPlan::build(&router, rows, EXPERTS, k, true);
                     let args = (
                         fc1_bias.as_deref(),
                         fc2_bias.as_deref(),
                         fc3.as_deref(),
                         fc3_bias.as_deref(),
                     );
+                    plan.build_row_slots();
                     let grouped = run_moe_grouped(
                         &plan,
                         &x,
@@ -1955,9 +1977,6 @@ mod tests {
             (2048, 768, 16, 8, 1, false),
             (2048, 6400, 4, 2, 1, false),
         ];
-        if moe_worker_budget() < 2 {
-            return;
-        }
         for &(hidden, inter, experts, k, tokens, expect) in &cells {
             // A uniform router spreads the tokens evenly over the experts,
             // which is what the synthetic benchmark graphs do.
@@ -1969,12 +1988,63 @@ mod tests {
             }
             let plan = RoutingPlan::build(&router, tokens, experts, k, true);
             let fc1_size = 2 * inter;
+            // Asserted on the work estimate rather than on `use_grouped_driver`
+            // so the test still means something on a single-core runner, where
+            // the driver always answers "per-expert" regardless of shape.
             assert_eq!(
-                use_grouped_driver(&plan, fc1_size, hidden, inter),
+                grouped_work_units(&plan, fc1_size, hidden, inter) >= grouped_min_work(),
                 expect,
                 "hidden={hidden} inter={inter} experts={experts} k={k} tokens={tokens}"
             );
+            if moe_worker_budget() >= 2 {
+                assert_eq!(
+                    use_grouped_driver(&plan, fc1_size, hidden, inter),
+                    expect,
+                    "driver disagrees with the work estimate"
+                );
+            }
         }
+    }
+
+    /// A collapsed router - one expert taking most of the rows while the rest
+    /// take one each - still has one large GEMM to hide the elementwise stages
+    /// behind, so the gate must look at the **largest** group and not the mean.
+    ///
+    /// This is the case the balanced-router calibration test cannot see: with
+    /// an even distribution every summary statistic agrees.
+    #[test]
+    fn the_gate_reads_the_largest_group_not_the_average() {
+        const EXPERTS: usize = 16;
+        const HIDDEN: usize = 2048;
+        const INTER: usize = 6400;
+        let rows = EXPERTS;
+        // Row 0 alone would be one row per expert; instead the first 16 rows all
+        // pick expert 0, and rows 1..16 each add one distinct second expert.
+        let mut router = vec![0.0f32; rows * EXPERTS];
+        for row in 0..rows {
+            router[row * EXPERTS] = 9.0;
+            router[row * EXPERTS + row] = 8.0;
+        }
+        let plan = RoutingPlan::build(&router, rows, EXPERTS, 2, true);
+        let largest = plan.groups.iter().map(|g| g.len).max().unwrap();
+        let mean = plan.slots() / plan.groups.len();
+        assert!(
+            largest >= 4 * mean.max(1),
+            "the fixture must be skewed: largest={largest} mean={mean}"
+        );
+        let fc1_size = 2 * INTER;
+        assert_eq!(
+            grouped_work_units(&plan, fc1_size, HIDDEN, INTER),
+            largest as u64 * HIDDEN as u64 * (fc1_size + INTER) as u64
+        );
+        assert!(
+            grouped_work_units(&plan, fc1_size, HIDDEN, INTER) >= grouped_min_work(),
+            "the dominant group is large enough for the grouped driver"
+        );
+        // The same shape summarised by the mean would fall below the floor, so
+        // this test fails if the statistic is ever changed back.
+        let mean_work = (mean as u64) * (HIDDEN as u64) * ((fc1_size + INTER) as u64);
+        assert!(mean_work < grouped_min_work());
     }
 
     /// The exact algorithm `run_moe_grouped` replaced: gather each expert's
@@ -2100,7 +2170,8 @@ mod tests {
                         fc3_bias.as_deref(),
                         &attributes,
                     );
-                    let plan = RoutingPlan::build(&router, rows, EXPERTS, k, true);
+                    let mut plan = RoutingPlan::build(&router, rows, EXPERTS, k, true);
+                    plan.build_row_slots();
                     let got = run_moe_grouped(
                         &plan,
                         &input,
@@ -2140,7 +2211,7 @@ mod tests {
             router[row * EXPERTS + (row % 3)] = 5.0;
             router[row * EXPERTS + ((row + 1) % 3)] = 4.0;
         }
-        let plan = RoutingPlan::build(&router, ROWS, EXPERTS, K, true);
+        let mut plan = RoutingPlan::build(&router, ROWS, EXPERTS, K, true);
         assert_eq!(plan.slots(), ROWS * K);
         assert_eq!(plan.groups.len(), 3, "only three experts are ever selected");
         let mut expected_start = 0;
@@ -2155,6 +2226,11 @@ mod tests {
             expected_start += group.len;
         }
         assert_eq!(expected_start, plan.slots());
+        assert!(
+            plan.row_slots.is_empty(),
+            "the inversion is only built for the driver that reads it"
+        );
+        plan.build_row_slots();
         // Every slot is reachable from exactly one `row_slots` entry.
         let mut seen = vec![0usize; plan.slots()];
         for &slot in &plan.row_slots {

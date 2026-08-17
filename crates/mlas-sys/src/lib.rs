@@ -1538,6 +1538,15 @@ pub fn sgemm_batch(
     if items.is_empty() || m == 0 || n == 0 || k == 0 {
         return;
     }
+    assert!(
+        lda >= if trans_a { m } else { k },
+        "sgemm_batch: lda {lda} is smaller than the packed row length"
+    );
+    assert!(
+        ldb >= if trans_b { k } else { n },
+        "sgemm_batch: ldb {ldb} is smaller than the packed row length"
+    );
+    assert!(ldc >= n, "sgemm_batch: ldc {ldc} is smaller than n {n}");
     let a_min = if trans_a { k * lda } else { m * lda };
     let b_min = if trans_b { n * ldb } else { k * ldb };
     let c_window = m * ldc;
@@ -2162,9 +2171,8 @@ mod tests {
     /// a routing result in which no expert was selected.
     #[test]
     fn batched_sgemm_with_no_items_is_a_no_op() {
-        let a = [1.0f32; 4];
+        let _a = [1.0f32; 4];
         let mut c = [7.0f32; 4];
-        let _ = a;
         sgemm_batch(false, true, 1, 4, 4, 1.0, &[], 4, 4, 0.0, &mut c, 4);
         assert_eq!(c, [7.0; 4]);
     }
