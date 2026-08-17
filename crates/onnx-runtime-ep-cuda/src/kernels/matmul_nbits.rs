@@ -307,6 +307,16 @@ const GATE_UP_SWIGLU_RMSNORM_VEC_OCC_ENTRY: &str =
     "matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_vec_occ";
 const GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_VEC_OCC_ENTRY: &str =
     "matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_vec_occ";
+/// Pre-permute (`ONNX_GENAI_GATEUP_PREPERM`) siblings of the two SYMMETRIC
+/// RMS-norm-fused `_vec_occ` entries. Same occupancy cap, but the activation is
+/// staged in weight-nibble interleaved order once so the main loop drops the
+/// per-K-iter `prmt.b32` that otherwise runs redundantly across all 8 warps.
+/// Byte-identical to the `_vec_occ` entries (the permute is value-preserving
+/// data movement only).
+const GATE_UP_SWIGLU_RMSNORM_VEC_OCC_PREPERM_ENTRY: &str =
+    "matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_vec_occ_preperm";
+const GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_VEC_OCC_PREPERM_ENTRY: &str =
+    "matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_vec_occ_preperm";
 const GATE_UP_SWIGLU_THREADS: u32 = 256;
 
 const DEQUANT_SRC: &str = r#"
@@ -2442,6 +2452,22 @@ __device__ __forceinline__ uint4 permute_activation_f16x8(
     return permuted;
 }
 
+// Loads the eight fp16 activations for one K-chunk already laid out in the
+// weight-nibble interleaved order the accumulators consume. With `PrePerm` the
+// staging step wrote that order into shared memory, so this is a single vector
+// load with no `prmt.b32`; otherwise it falls back to permuting on the fly.
+// Both paths yield byte-identical `uint4` contents.
+template <bool PrePerm>
+__device__ __forceinline__ uint4 load_gateup_activation_f16x8(
+    const __half* __restrict__ activation)
+{
+    if constexpr (PrePerm) {
+        return *reinterpret_cast<const uint4*>(activation);
+    } else {
+        return permute_activation_f16x8(activation);
+    }
+}
+
 __device__ __forceinline__ void accumulate_int4x8_f16_permuted(
     const unsigned int packed,
     const uint4& activation,
@@ -4242,7 +4268,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_vec(
 // `SkipSimplifiedLayerNormalization` through the paired kernel. Every arithmetic
 // step mirrors the standalone norm followed by the two-op gate/up SwiGLU, so
 // greedy tokens stay bit-for-bit identical.
-template <bool HasZp, bool Decomposed, bool FusedSym = false>
+template <bool HasZp, bool Decomposed, bool FusedSym = false, bool PrePerm = false>
 __device__ __forceinline__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed_gate,
@@ -4303,7 +4329,23 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl
     for (int j = tid; j < k; j += (int)blockDim.x) {
         const float residual = __half2float(activation[j]);
         const float scale = load_rmsnorm_gamma(gamma, gamma_is_half, j);
-        staged_activation[j] = __float2half((residual * inv_std) * scale);
+        const __half normalized = __float2half((residual * inv_std) * scale);
+        if constexpr (PrePerm) {
+            // Pre-permute: stage each element directly into the weight-nibble
+            // interleaved order that `permute_activation_f16x8` would otherwise
+            // produce, so the main loop reads a chunk with one vector load and
+            // NO per-iteration `prmt.b32`. That permute is loop-invariant across
+            // the K-iteration AND redundant across all 8 warps (each re-permutes
+            // the same shared activation); doing it once here removes 4 `prmt.b32`
+            // per K-iter per warp. Pure data movement — the fp16 bit patterns are
+            // unchanged, so every value entering an FMA is byte-identical. Within
+            // each aligned 8-wide chunk element i maps to slot
+            // `((i&3)<<1) | (i>>2)` (= {0,4,1,5,2,6,3,7} interleave).
+            const int dst = (j & ~7) | (((j & 3) << 1) | ((j >> 2) & 1));
+            staged_activation[dst] = normalized;
+        } else {
+            staged_activation[j] = normalized;
+        }
     }
     __syncthreads();
 
@@ -4351,7 +4393,7 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl
             unsigned int up_word_next =
                 *reinterpret_cast<const unsigned int*>(packed_up_ptr);
             for (; depth_base + lane_depth + 8 <= k; depth_base += 256) {
-                const uint4 permuted = permute_activation_f16x8(activation_ptr);
+                const uint4 permuted = load_gateup_activation_f16x8<PrePerm>(activation_ptr);
                 const int block = (depth_base >> 5) + (lane >> 2);
                 const unsigned int gate_sub2 =
                     block_sub2<HasZp>(zero_points_gate, column, block, zp_row_bytes);
@@ -4377,7 +4419,7 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl
             }
         } else {
             for (; depth_base + lane_depth + 8 <= k; depth_base += 256) {
-                const uint4 permuted = permute_activation_f16x8(activation_ptr);
+                const uint4 permuted = load_gateup_activation_f16x8<PrePerm>(activation_ptr);
                 const int block = (depth_base >> 5) + (lane >> 2);
                 const unsigned int gate_word =
                     *reinterpret_cast<const unsigned int*>(packed_gate_ptr);
@@ -4424,7 +4466,11 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 if (i < valid) {
-                    const float a = __half2float(activation_ptr[i]);
+                    // Under PrePerm the chunk is stored interleaved, so natural
+                    // element i lives at slot `((i&3)<<1) | (i>>2)`. Same fp16
+                    // value, so the tail stays byte-identical.
+                    const int ai = PrePerm ? (((i & 3) << 1) | ((i >> 2) & 1)) : i;
+                    const float a = __half2float(activation_ptr[ai]);
                     const int qg = (int)((gate_word >> (i * 4)) & 15u) - gate_zp;
                     const int qu = (int)((up_word >> (i * 4)) & 15u) - up_zp;
                     gate_tail += (float)qg * a * gate_scale;
@@ -4612,6 +4658,58 @@ matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_vec_occ(
     const float epsilon)
 {
     matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<false, true, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
+}
+
+// Pre-permute (`ONNX_GENAI_GATEUP_PREPERM`) siblings of the two SYMMETRIC
+// RMS-norm-fused `_vec_occ` entries. Same `__launch_bounds__(256, 8)` occupancy
+// cap PLUS `PrePerm == true`: the activation is staged into weight-nibble
+// interleaved order once, so the main loop drops the per-K-iter `prmt.b32`
+// (which otherwise runs redundantly in all 8 warps of the block). The permute is
+// pure value-preserving data movement, so the fp16 values entering every FMA —
+// and thus the accumulate order and RMS reduction — are unchanged, making this
+// BYTE-IDENTICAL to the `_vec_occ` entries.
+extern "C" __global__ void __launch_bounds__(256, 8)
+matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_vec_occ_preperm(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed_gate,
+    const __half* __restrict__ scales_gate,
+    const unsigned char* __restrict__ packed_up,
+    const __half* __restrict__ scales_up,
+    const unsigned char* __restrict__ zero_points_gate,
+    const unsigned char* __restrict__ zero_points_up,
+    const void* __restrict__ gamma,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int gamma_is_half,
+    const float epsilon)
+{
+    matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<false, false, true, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 8)
+matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_vec_occ_preperm(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed_gate,
+    const __half* __restrict__ scales_gate,
+    const unsigned char* __restrict__ packed_up,
+    const __half* __restrict__ scales_up,
+    const unsigned char* __restrict__ zero_points_gate,
+    const unsigned char* __restrict__ zero_points_up,
+    const void* __restrict__ gamma,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int gamma_is_half,
+    const float epsilon)
+{
+    matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<false, true, true, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
 }
 
 extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_zp(
@@ -5954,6 +6052,19 @@ fn gate_up_occ_enabled() -> bool {
     !matches!(
         std::env::var("ONNX_GENAI_GATEUP_OCC").ok().as_deref(),
         Some("0") | Some("false") | Some("off")
+    )
+}
+
+/// Whether the SYMMETRIC RMS-norm-fused gate/up SwiGLU decode GEMV takes the
+/// pre-permute `_vec_occ_preperm` entry: the activation is staged into
+/// weight-nibble interleaved order once so the main loop drops the per-K-iter
+/// `prmt.b32` that otherwise runs redundantly across all 8 warps. Byte-identical
+/// to the `_vec_occ` entry (value-preserving data movement only). DEFAULT-OFF,
+/// opt-in A/B lever; `ONNX_GENAI_GATEUP_PREPERM=1` (or `true`/`on`) engages it.
+fn gate_up_preperm_enabled() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_GATEUP_PREPERM").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
     )
 }
 
@@ -8365,10 +8476,14 @@ impl MatMulNBitsKernel {
         // their byte-identical fused-symmetric `_vec` sibling (fewer issued ops);
         // `ONNX_GENAI_GATEUP_OCC` further reroutes them to the `_vec_occ` sibling
         // (same body + `__launch_bounds__(256, 8)` to raise occupancy 62->83% and
-        // hide the Short-Scoreboard shared-load latency). Both are byte-identical.
+        // hide the Short-Scoreboard shared-load latency). `ONNX_GENAI_GATEUP_PREPERM`
+        // reroutes the `_vec_occ` entry to its `_vec_occ_preperm` sibling (stages
+        // the activation pre-permuted so the main loop drops the per-iter
+        // `prmt.b32`). All are byte-identical.
         let has_zp = zp_gate.is_some() || zp_up.is_some();
         let vec = !has_zp && gate_up_vec_enabled();
         let occ = !has_zp && gate_up_occ_enabled();
+        let preperm = occ && gate_up_preperm_enabled();
         let entry = match (self.decomposed_silu, has_zp, occ, vec) {
             (true, true, _, _) => GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_ZP_ENTRY,
             (true, false, true, _) => GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_VEC_OCC_ENTRY,
@@ -8378,6 +8493,17 @@ impl MatMulNBitsKernel {
             (false, false, true, _) => GATE_UP_SWIGLU_RMSNORM_VEC_OCC_ENTRY,
             (false, false, false, true) => GATE_UP_SWIGLU_RMSNORM_VEC_ENTRY,
             (false, false, false, false) => GATE_UP_SWIGLU_RMSNORM_ENTRY,
+        };
+        // The pre-permute sibling only exists for the two symmetric `_vec_occ`
+        // entries; `preperm` already implies `occ && !has_zp`.
+        let entry = if preperm {
+            if self.decomposed_silu {
+                GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_VEC_OCC_PREPERM_ENTRY
+            } else {
+                GATE_UP_SWIGLU_RMSNORM_VEC_OCC_PREPERM_ENTRY
+            }
+        } else {
+            entry
         };
         let function = self
             .runtime
@@ -14580,7 +14706,11 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// `__launch_bounds__(256, 8)`) is bit-identical to the scalar reference for
     /// the symmetric RMS-norm-fused kernels it applies to (it is a no-op for the
     /// non-RMS launch) — `__launch_bounds__` only constrains register
-    /// allocation, so the math is unchanged.
+    /// allocation, so the math is unchanged. Additionally asserts the pre-permute
+    /// `_vec_occ_preperm` path (`ONNX_GENAI_GATEUP_PREPERM`, activation staged in
+    /// weight-nibble order once) is bit-identical — the permute is value-
+    /// preserving data movement, so the fp16 values entering each FMA are the
+    /// same.
     #[test]
     fn gate_up_swiglu_vec_is_bit_identical_to_scalar() {
         let Some(runtime) = runtime() else {
@@ -14760,7 +14890,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
                         };
 
-                        let run_once = |vec_on: bool, occ_on: bool| -> Vec<u16> {
+                        let run_once = |vec_on: bool, occ_on: bool, preperm_on: bool| -> Vec<u16> {
                             let out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
                             let lock = INTERLEAVE_TEST_ENV_LOCK.get_or_init(|| Mutex::new(()));
                             let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -14774,6 +14904,10 @@ extern "C" __global__ void ref_silu_mul_f16(
                                 std::env::set_var(
                                     "ONNX_GENAI_GATEUP_OCC",
                                     if occ_on { "1" } else { "0" },
+                                );
+                                std::env::set_var(
+                                    "ONNX_GENAI_GATEUP_PREPERM",
+                                    if preperm_on { "1" } else { "0" },
                                 );
                             }
                             let out = TensorMut::new(
@@ -14812,6 +14946,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                             unsafe {
                                 std::env::remove_var("ONNX_GENAI_GATEUP_VEC");
                                 std::env::remove_var("ONNX_GENAI_GATEUP_OCC");
+                                std::env::remove_var("ONNX_GENAI_GATEUP_PREPERM");
                             }
                             drop(_guard);
 
@@ -14824,15 +14959,22 @@ extern "C" __global__ void ref_silu_mul_f16(
                             host.iter().map(|v| v.to_bits()).collect()
                         };
 
-                        let reference = run_once(false, false);
-                        let fused = run_once(true, false);
+                        let reference = run_once(false, false, false);
+                        let fused = run_once(true, false, false);
                         // Occupancy-raised `_vec_occ` path. The `_vec_occ` entries
                         // exist ONLY for the two symmetric RMS-norm-fused kernels,
                         // so this actually exercises `_vec_occ` when rmsnorm==true;
                         // for the non-rmsnorm launch `ONNX_GENAI_GATEUP_OCC` is a
                         // no-op and this simply re-checks the `_vec` path. Either
                         // way the result must stay bit-identical to the reference.
-                        let occ = run_once(true, true);
+                        let occ = run_once(true, true, false);
+                        // Pre-permute `_vec_occ_preperm` path (occ + PREPERM). Like
+                        // `_vec_occ` it exists ONLY for the symmetric RMS-norm-fused
+                        // kernels, so it is exercised when rmsnorm==true and is a
+                        // no-op (re-checks `_vec`) for the non-rmsnorm launch. The
+                        // permute is value-preserving, so it must stay bit-identical
+                        // to the reference.
+                        let preperm = run_once(true, true, true);
 
                         // SAFETY: gamma buffer no longer referenced.
                         unsafe {
@@ -14862,6 +15004,18 @@ extern "C" __global__ void ref_silu_mul_f16(
                                 index / n,
                                 index % n,
                                 occ[index],
+                                reference[index]
+                            );
+                            assert_eq!(
+                                preperm[index],
+                                reference[index],
+                                "pre-permute gate/up _vec_occ_preperm diverged at M={m}, K={k}, \
+                                 N={n}, rmsnorm={rmsnorm}, decomposed={decomposed}, \
+                                 gamma_f32={gamma_is_f32}, row={}, column={}: preperm=0x{:04x} \
+                                 scalar=0x{:04x}",
+                                index / n,
+                                index % n,
+                                preperm[index],
                                 reference[index]
                             );
                         }
