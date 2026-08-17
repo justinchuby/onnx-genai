@@ -181,6 +181,26 @@ pub extern "C" fn nxrt_ep_reset_compiled_node_count() {
     onnx_runtime_ep_plugin::ep::reset_compiled_node_count()
 }
 
+// ─── Build identity ─────────────────────────────────────────────────────────
+
+/// The optional build features compiled into this cdylib, comma-separated, as
+/// a NUL-terminated static string (empty when there are none).
+///
+/// A packaged cdylib is opaque: nothing about the file says whether the
+/// vendored MLAS kernels were linked in, and the difference is an order of
+/// magnitude on the quantized matmul paths. Exporting it lets the wheel's own
+/// smoke test assert that what shipped is what was intended, instead of
+/// discovering a pure-Rust build in production benchmarks.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_build_features() -> *const ::std::os::raw::c_char {
+    BUILD_FEATURES.as_ptr() as *const ::std::os::raw::c_char
+}
+
+#[cfg(feature = "mlas")]
+const BUILD_FEATURES: &[u8] = b"mlas\0";
+#[cfg(not(feature = "mlas"))]
+const BUILD_FEATURES: &[u8] = b"\0";
+
 /// Number of workspace **placement resolutions** since the last reset.
 ///
 /// Mirrors the CUDA plugin's accessor so the same validation harness runs

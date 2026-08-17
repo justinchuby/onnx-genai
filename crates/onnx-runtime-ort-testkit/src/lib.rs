@@ -380,20 +380,33 @@ fn cdylib_candidates(package: &str) -> Vec<PathBuf> {
 /// missing cdylib as fatal should wrap the result in [`require_or_skip`] or
 /// `.expect(..)`.
 pub fn find_plugin_cdylib(package: &str) -> Option<PathBuf> {
+    find_plugin_cdylib_with_features(package, &[])
+}
+
+/// Same as [`find_plugin_cdylib`], but the rebuild enables `features`.
+///
+/// Without this, `cargo test -p <pkg> --features <f>` builds the *test* binary
+/// with `<f>` and then this helper's `cargo build -p <pkg>` **overwrites** the
+/// cdylib with a default-feature build. The suite then measures and asserts
+/// against a library that has none of the code the feature selects — silently,
+/// and in the direction that hides regressions. Callers pass the features they
+/// were compiled with so the artifact under test matches the test binary.
+pub fn find_plugin_cdylib_with_features(package: &str, features: &[&str]) -> Option<PathBuf> {
     static CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(cached) = guard.get(package) {
+    let key = format!("{package}\u{1}{}", features.join(","));
+    if let Some(cached) = guard.get(&key) {
         return cached.clone();
     }
-    let resolved = resolve_plugin_cdylib(package);
-    guard.insert(package.to_string(), resolved.clone());
+    let resolved = resolve_plugin_cdylib(package, features);
+    guard.insert(key, resolved.clone());
     resolved
 }
 
-fn resolve_plugin_cdylib(package: &str) -> Option<PathBuf> {
+fn resolve_plugin_cdylib(package: &str, features: &[&str]) -> Option<PathBuf> {
     let env_var = plugin_path_env_var(package);
     if let Ok(p) = std::env::var(&env_var) {
         let path = PathBuf::from(p);
@@ -409,6 +422,9 @@ fn resolve_plugin_cdylib(package: &str) -> Option<PathBuf> {
             std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()),
         );
         cmd.args(["build", "-p", package]);
+        if !features.is_empty() {
+            cmd.args(["--features", &features.join(",")]);
+        }
         // Build into the same target dir / profile / triple this test binary
         // came from, or the "rebuild" would refresh a cdylib we never load.
         if let Some(layout) = build_layout() {

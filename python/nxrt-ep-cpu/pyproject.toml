@@ -60,7 +60,11 @@ nxrt_ep_cpu = ["*.so", "*.dll", "*.dylib"]
 # ABI-less build.
 build = "cp310-*"
 skip = "*-musllinux_*"
-test-command = 'python -c "import nxrt_ep_cpu, os; p=nxrt_ep_cpu.get_library_path(); assert os.path.exists(p), p; print(\"OK\", p)"'
+# Also asserts the bundled cdylib is the build this platform asked for: the
+# wheel is expected to carry the MLAS kernels wherever setup.py enables them,
+# and a silently-pure-Rust wheel is an order of magnitude slower on quantized
+# matmul. `_mlas_features()` is the single source of truth for both.
+test-command = 'python {project}/check_wheel.py'
 
 [tool.cibuildwheel.linux]
 # manylinux container needs libclang (bindgen, via onnx-genai-ort-sys) and Rust.
