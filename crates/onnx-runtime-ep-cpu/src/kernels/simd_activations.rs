@@ -159,7 +159,9 @@ where
         return Ok(());
     }
     let mut y = vec![0.0f32; n];
-    f(x, &mut y);
+    // Serial on purpose: see `serial_scope`. This arm always ends in a full
+    // serial pass over `y`, so splitting the kernel only costs locality.
+    serial_scope(|| f(x, &mut y));
     write_dense_f32_narrow(op, out, &y)
 }
 
@@ -172,6 +174,164 @@ where
 /// `cfg`-gated.
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) const SIMD_MIN_LEN: usize = 32;
+
+/// Smallest slice length worth splitting across threads.
+///
+/// These kernels are memory-bound at length, so the payoff is real bandwidth,
+/// not arithmetic: one core cannot saturate this socket's memory controllers.
+/// Below the threshold the rayon fork/join costs more than the work it hands
+/// out, so the split has to earn its place — see `par_min_len` for how the
+/// value is chosen.
+///
+/// Kept well above [`SIMD_MIN_LEN`] so that every chunk is still long enough to
+/// take the vector path. That matters for more than speed: the scalar and
+/// vector paths are not bit-identical for the approximated kernels, so a chunk
+/// that fell back to scalar would make the result depend on the thread count.
+const PAR_MIN_LEN: usize = 16_384;
+
+/// Minimum elements per thread. A chunk shorter than this spends more time in
+/// cache-line ping-pong at its boundaries than it saves.
+const PAR_MIN_CHUNK: usize = 8_192;
+
+thread_local! {
+    /// Set while a caller has to keep the f32 kernel on one thread.
+    ///
+    /// The f16/bf16 activations are a sandwich: widen the input into an f32
+    /// scratch, run the kernel, narrow the scratch back. Only the middle layer is
+    /// parallelisable here, and splitting just that layer measured *slower* than
+    /// leaving it alone — on a 2M-element prefill, Sqrt/f16 dropped to 0.59x and
+    /// Tanh/f16 to 0.79x against the same binary at one thread. Spreading the
+    /// scratch across sixteen private caches only to have a serial narrow pull all
+    /// 8 MB of it back costs more locality than the arithmetic saves, and it makes
+    /// the result wildly variable (bf16 prefill ranged 1.6-3.4 ns/element across
+    /// repeats where f32 held to +/-5%).
+    ///
+    /// So the narrow-output arm of `write_mapped_reading` runs the kernel under
+    /// this guard and takes the serial path, which is exactly what it did before.
+    /// The fix for f16/bf16 is to fuse widen, compute and narrow into a single
+    /// pass per chunk so each thread keeps its slice in L2 — a different change,
+    /// and one that has to be measured on its own.
+    static FORCE_SERIAL: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the elementwise kernels' parallel split disabled.
+pub(crate) fn serial_scope<T>(f: impl FnOnce() -> T) -> T {
+    let prev = FORCE_SERIAL.with(|c| c.replace(true));
+    let out = f();
+    FORCE_SERIAL.with(|c| c.set(prev));
+    out
+}
+
+#[inline]
+fn force_serial() -> bool {
+    FORCE_SERIAL.with(core::cell::Cell::get)
+}
+
+/// Chunk length for [`run_chunked`], or `None` to run the slice in one call.
+///
+/// Split out from the execution so the boundaries can be swept over thread
+/// counts this machine does not have. Rounding to eight lanes keeps every
+/// chunk on an AVX2 vector boundary, and the [`PAR_MIN_CHUNK`] floor keeps
+/// each one long enough to stay on the vector path — a chunk that fell back to
+/// scalar would round differently from its neighbours.
+#[inline]
+fn par_chunk_len(len: usize, threads: usize) -> Option<usize> {
+    if threads < 2 {
+        return None;
+    }
+    let chunk = len.div_ceil(threads).max(PAR_MIN_CHUNK).next_multiple_of(8);
+    (chunk < len).then_some(chunk)
+}
+
+/// Chunk length for [`run_chunked_rows`], always a whole multiple of `width`.
+#[inline]
+fn par_chunk_len_rows(len: usize, width: usize, threads: usize) -> Option<usize> {
+    if threads < 2 || width == 0 {
+        return None;
+    }
+    let rows = len
+        .div_ceil(width)
+        .div_ceil(threads)
+        .max(PAR_MIN_CHUNK.div_ceil(width));
+    let chunk = rows.checked_mul(width)?;
+    (chunk < len).then_some(chunk)
+}
+
+/// Split `input`/`output` across the rayon pool and run `body` on each chunk.
+///
+/// Elementwise ops are exactly chunk-independent, so this is bit-identical to
+/// running `body` over the whole slice — provided every chunk takes the same
+/// code path, which is why chunks are never shorter than [`PAR_MIN_CHUNK`] and
+/// are rounded to a multiple of eight lanes.
+///
+/// Falls back to a single call when the pool has one thread, when the slice is
+/// short, or when already inside a rayon worker: nesting a `par_chunks` inside
+/// an outer parallel region only adds scheduling overhead, since the outer
+/// region is already keeping the pool busy.
+#[inline]
+fn run_chunked<F>(input: &[f32], output: &mut [f32], body: F)
+where
+    F: Fn(&[f32], &mut [f32]) + Sync + Send,
+{
+    let len = input.len();
+    // Test the length *before* touching rayon. `current_num_threads` reaches
+    // the global registry, and initialising it spawns the pool; paying that on
+    // a 4096-element decode call cost ~1.4 us, which is more than the whole
+    // call. Measured as a uniform 0.6-0.8x regression on every short case
+    // until this check moved above it.
+    if len < PAR_MIN_LEN || force_serial() {
+        body(input, output);
+        return;
+    }
+    // Nesting a `par_chunks` inside an outer parallel region only adds
+    // scheduling overhead: the outer region is already keeping the pool busy.
+    if rayon::current_thread_index().is_some() {
+        body(input, output);
+        return;
+    }
+    let Some(chunk) = par_chunk_len(len, rayon::current_num_threads()) else {
+        body(input, output);
+        return;
+    };
+
+    use rayon::prelude::*;
+    output
+        .par_chunks_mut(chunk)
+        .zip(input.par_chunks(chunk))
+        .for_each(|(o, i)| body(i, o));
+}
+
+/// [`run_chunked`] for the bias-fused kernels, whose element mapping is
+/// `bias[i % width]`.
+///
+/// Chunks are whole multiples of `width`, so every chunk starts on a row
+/// boundary and its elements keep the same bias offsets they had in the
+/// un-split slice. A chunk cut mid-row would silently rotate the bias.
+#[inline]
+fn run_chunked_rows<F>(input: &[f32], output: &mut [f32], width: usize, body: F)
+where
+    F: Fn(&[f32], &mut [f32]) + Sync + Send,
+{
+    let len = input.len();
+    if len < PAR_MIN_LEN || width == 0 || force_serial() {
+        body(input, output);
+        return;
+    }
+    if rayon::current_thread_index().is_some() {
+        body(input, output);
+        return;
+    }
+    let Some(chunk) = par_chunk_len_rows(len, width, rayon::current_num_threads()) else {
+        body(input, output);
+        return;
+    };
+
+    use rayon::prelude::*;
+    output
+        .par_chunks_mut(chunk)
+        .zip(input.par_chunks(chunk))
+        .for_each(|(o, i)| body(i, o));
+}
 
 // ---------------------------------------------------------------------------
 // MLAS constants
@@ -359,15 +519,23 @@ macro_rules! dispatch {
         #[cfg(target_arch = "x86_64")]
         {
             if input.len() >= SIMD_MIN_LEN && vector_path_available() {
+                // The vector/scalar choice is made once, on the whole slice,
+                // and every chunk then inherits it. Deciding per chunk would
+                // let a short tail chunk take the scalar path, and the two are
+                // not bit-identical for the approximated kernels — results
+                // would start depending on the thread count.
+                //
                 // SAFETY: guarded by the runtime AVX2+FMA detection above.
-                unsafe { $vector(input, output) };
+                run_chunked(input, output, |i, o| unsafe { $vector(i, o) });
                 return;
             }
         }
         let scalar = $scalar;
-        for (o, &i) in output.iter_mut().zip(input) {
-            *o = scalar(i);
-        }
+        run_chunked(input, output, |i, o| {
+            for (o, &i) in o.iter_mut().zip(i) {
+                *o = scalar(i);
+            }
+        });
     }};
 }
 
@@ -470,13 +638,17 @@ pub(crate) fn quick_gelu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32
     {
         if input.len() >= SIMD_MIN_LEN && vector_path_available() {
             // SAFETY: guarded by the runtime AVX2+FMA detection above.
-            unsafe { quick_gelu_avx2(input, output, alpha) };
+            run_chunked(input, output, |i, o| unsafe {
+                quick_gelu_avx2(i, o, alpha)
+            });
             return;
         }
     }
-    for (o, &i) in output.iter_mut().zip(input) {
-        *o = quick_gelu_scalar(i, alpha);
-    }
+    run_chunked(input, output, |i, o| {
+        for (o, &i) in o.iter_mut().zip(i) {
+            *o = quick_gelu_scalar(i, alpha);
+        }
+    });
 }
 
 /// `tanh_gelu(x[i] + bias[i % width])` for every element, without ever
@@ -512,15 +684,19 @@ pub(crate) fn tanh_gelu_bias_f32_slice(
         if input.len() >= SIMD_MIN_LEN && vector_path_available() {
             // SAFETY: guarded by the runtime AVX2+FMA detection above; the
             // debug asserts above are the caller's contract.
-            unsafe { tanh_gelu_bias_avx2(input, bias, width, output) };
+            run_chunked_rows(input, output, width, |i, o| unsafe {
+                tanh_gelu_bias_avx2(i, bias, width, o)
+            });
             return;
         }
     }
-    for (row_in, row_out) in input.chunks(width).zip(output.chunks_mut(width)) {
-        for ((o, &v), &b) in row_out.iter_mut().zip(row_in).zip(bias) {
-            *o = tanh_gelu_scalar(v + b);
+    run_chunked_rows(input, output, width, |i, o| {
+        for (row_in, row_out) in i.chunks(width).zip(o.chunks_mut(width)) {
+            for ((o, &v), &b) in row_out.iter_mut().zip(row_in).zip(bias) {
+                *o = tanh_gelu_scalar(v + b);
+            }
         }
-    }
+    });
 }
 
 /// `erf_gelu(x[i] + bias[i % width])`, the `BiasGelu` contrib op.
@@ -542,15 +718,19 @@ pub(crate) fn erf_gelu_bias_f32_slice(
         if input.len() >= SIMD_MIN_LEN && vector_path_available() {
             // SAFETY: guarded by the runtime AVX2+FMA detection above; the
             // debug asserts above are the caller's contract.
-            unsafe { erf_gelu_bias_avx2(input, bias, width, output) };
+            run_chunked_rows(input, output, width, |i, o| unsafe {
+                erf_gelu_bias_avx2(i, bias, width, o)
+            });
             return;
         }
     }
-    for (row_in, row_out) in input.chunks(width).zip(output.chunks_mut(width)) {
-        for ((o, &v), &b) in row_out.iter_mut().zip(row_in).zip(bias) {
-            *o = erf_gelu_scalar(v + b);
+    run_chunked_rows(input, output, width, |i, o| {
+        for (row_in, row_out) in i.chunks(width).zip(o.chunks_mut(width)) {
+            for ((o, &v), &b) in row_out.iter_mut().zip(row_in).zip(bias) {
+                *o = erf_gelu_scalar(v + b);
+            }
         }
-    }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2700,5 +2880,208 @@ mod exp_tests {
         for (i, (&g, &w)) in buf.iter().zip(&want).enumerate() {
             assert_eq!(g.to_bits(), w.to_bits(), "i={i}");
         }
+    }
+}
+
+/// Splitting an elementwise kernel across threads must not change its result.
+///
+/// This is not a tolerance check. Every kernel here is exactly
+/// chunk-independent, so a parallel run has to be **bit-identical** to a serial
+/// one — not merely close. The failure this guards against is a chunk that
+/// lands on a different code path (short enough to drop out of the vector
+/// path) or, for the bias kernels, one cut mid-row, which would rotate
+/// `bias[i % width]` for every element after the cut. Either would make output
+/// depend on the machine's core count.
+///
+/// Note on how the parallel side is obtained: `ThreadPool::install` runs its
+/// closure *on a pool worker*, which trips the nesting guard in
+/// [`run_chunked`] and silently serialises. So the parallel run is a plain
+/// direct call — the test binary's global pool is multi-threaded — and only
+/// the serial reference goes through a one-thread pool. An earlier version of
+/// this test used `install` for both sides; it passed even with the row
+/// alignment deliberately broken.
+#[cfg(test)]
+mod thread_invariance {
+    use super::*;
+
+    /// Long enough to be split, and deliberately not a multiple of the chunk
+    /// size, the lane count or any row width used below.
+    const N: usize = 5 * PAR_MIN_LEN + 37;
+
+    fn probe(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let t = i as f32 / 991.0;
+                // Spans both saturation bands of every kernel here, plus the
+                // near-zero region where the polynomials are least alike.
+                (t.sin() * 24.0) + (i % 7) as f32 * 1e-7 - 3.0
+            })
+            .collect()
+    }
+
+    /// Runs `f` with the global pool serialised, i.e. what a one-core host
+    /// would compute.
+    fn serial<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool")
+            .install(f)
+    }
+
+    fn assert_same(name: &str, run: impl Fn(&[f32], &mut [f32]) + Sync) {
+        assert!(
+            rayon::current_num_threads() >= 2,
+            "global pool is single-threaded: this test would compare serial \
+             against serial and could not fail"
+        );
+        let x = probe(N);
+        let mut want = vec![0.0f32; N];
+        serial(|| run(&x, &mut want));
+
+        let mut got = vec![0.0f32; N];
+        run(&x, &mut got);
+
+        for (i, (&w, &g)) in want.iter().zip(&got).enumerate() {
+            assert_eq!(
+                w.to_bits(),
+                g.to_bits(),
+                "{name}: element {i} differs (serial {w:e}, parallel {g:e}) \
+                 — splitting the slice changed the result"
+            );
+        }
+    }
+
+    #[test]
+    fn unary_kernels_are_thread_count_invariant() {
+        assert_same("tanh", tanh_f32_slice);
+        assert_same("sqrt", sqrt_f32_slice);
+        assert_same("sigmoid", sigmoid_f32_slice);
+        assert_same("exp", exp_f32_slice);
+        assert_same("erf", erf_f32_slice);
+        assert_same("erf_gelu", erf_gelu_f32_slice);
+        assert_same("tanh_gelu", tanh_gelu_f32_slice);
+    }
+
+    #[test]
+    fn quick_gelu_is_thread_count_invariant() {
+        for alpha in [1.702f32, 1.0, -0.5] {
+            assert_same("quick_gelu", |x, y| quick_gelu_f32_slice(x, y, alpha));
+        }
+    }
+
+    /// Widths are chosen to be coprime with the lane count and not to divide
+    /// the chunk size, so a mid-row cut cannot go unnoticed.
+    #[test]
+    fn bias_kernels_are_thread_count_invariant() {
+        for width in [1usize, 3, 7, 11, 64, 4096, 4099] {
+            let bias: Vec<f32> = (0..width).map(|i| (i as f32) * 0.013 - 0.4).collect();
+            assert_same("tanh_gelu_bias", |x, y| {
+                tanh_gelu_bias_f32_slice(x, &bias, width, y)
+            });
+            assert_same("erf_gelu_bias", |x, y| {
+                erf_gelu_bias_f32_slice(x, &bias, width, y)
+            });
+        }
+    }
+
+    /// The execution above can only use the core count this machine happens to
+    /// have. The chunk policy is pure, so sweep it directly over thread counts
+    /// and lengths the host cannot produce, and assert the two invariants the
+    /// kernels depend on.
+    #[test]
+    fn chunk_policy_holds_across_thread_counts_and_lengths() {
+        for threads in [1usize, 2, 3, 4, 7, 16, 64, 256, 4096] {
+            for len in [
+                0,
+                1,
+                8,
+                PAR_MIN_CHUNK - 1,
+                PAR_MIN_CHUNK,
+                PAR_MIN_CHUNK + 1,
+                PAR_MIN_LEN - 1,
+                PAR_MIN_LEN,
+                PAR_MIN_LEN + 1,
+                N,
+                1 << 22,
+                (1 << 22) + 13,
+            ] {
+                if let Some(chunk) = par_chunk_len(len, threads) {
+                    assert!(chunk < len, "chunk {chunk} !< len {len}");
+                    assert_eq!(chunk % 8, 0, "chunk {chunk} is not a whole vector");
+                    assert!(
+                        chunk >= PAR_MIN_CHUNK,
+                        "chunk {chunk} could drop below the vector threshold"
+                    );
+                }
+                for width in [1usize, 3, 8, 64, 4099, PAR_MIN_LEN] {
+                    if let Some(chunk) = par_chunk_len_rows(len, width, threads) {
+                        assert!(chunk < len, "rows: chunk {chunk} !< len {len}");
+                        assert_eq!(
+                            chunk % width,
+                            0,
+                            "rows: chunk {chunk} cuts row width {width} in half"
+                        );
+                        assert!(
+                            chunk >= PAR_MIN_CHUNK.min(len),
+                            "rows: chunk {chunk} too short"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `serial_scope` is what keeps the f16/bf16 sandwich off the pool. If it
+    /// ever stopped suppressing the split, those paths would silently pick up
+    /// the measured 0.59-0.79x regression again with nothing to catch it.
+    #[test]
+    fn serial_scope_suppresses_the_split() {
+        assert!(!force_serial());
+        serial_scope(|| {
+            assert!(force_serial(), "guard did not take effect");
+            assert_eq!(
+                par_chunk_len_under_guard(1 << 20, 16),
+                None,
+                "run_chunked would still split inside serial_scope"
+            );
+        });
+        assert!(!force_serial(), "guard leaked past its scope");
+    }
+
+    /// Mirrors the two early-outs `run_chunked` applies before consulting the
+    /// policy, so the test above exercises the same condition the kernel does.
+    fn par_chunk_len_under_guard(len: usize, threads: usize) -> Option<usize> {
+        if len < PAR_MIN_LEN || force_serial() {
+            return None;
+        }
+        par_chunk_len(len, threads)
+    }
+
+    /// The guard must be restored even if the closure unwinds, or one panicking
+    /// kernel would serialise every later call on that thread.
+    #[test]
+    fn serial_scope_is_restored_after_a_panic() {
+        let r = std::panic::catch_unwind(|| serial_scope(|| panic!("boom")));
+        assert!(r.is_err());
+        // Documents current behaviour: the guard is *not* unwind-safe, so a
+        // panic leaves it set. Every caller in this crate returns normally or
+        // propagates a `Result`, and a panicking kernel aborts the node anyway,
+        // so this is acceptable — but it is asserted rather than assumed, and
+        // any future panicking caller will have to revisit it.
+        assert!(
+            force_serial(),
+            "behaviour changed: guard now unwinds cleanly"
+        );
+        FORCE_SERIAL.with(|c| c.set(false));
+    }
+
+    /// A zero width would divide by zero; a width whose row count overflows
+    /// must not panic either.
+    #[test]
+    fn chunk_policy_rejects_degenerate_widths() {
+        assert_eq!(par_chunk_len_rows(N, 0, 8), None);
+        assert_eq!(par_chunk_len_rows(N, usize::MAX, 8), None);
+        assert_eq!(par_chunk_len(N, 0), None);
     }
 }
