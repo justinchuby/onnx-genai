@@ -68,8 +68,31 @@ impl CPtr {
 /// microkernel. The caller must ensure the host supports AVX2 + FMA (checked by
 /// [`crate::backend::has_simd_x86`]); callers without it must use the generic
 /// fallback instead.
+///
+/// M==1 selection of the native GEMV ([`sgemm_simd_m1`]) is read once from the
+/// `ONNX_GENAI_CPU_MM_SIMD_M1_GEMV` toggle here; the actual dispatch lives in
+/// [`sgemm_simd_variant`] so the A/B harness can drive both variants in one
+/// process without touching process-global env state.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) fn sgemm_simd(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    sgemm_simd_variant(a, b, c, m, k, n, m1_gemv_enabled());
+}
+
+/// Backend body with the M==1 route decision passed in explicitly rather than
+/// read from env. `use_m1_gemv` only affects `m == 1`; for `m >= 2` the packed
+/// GEBP path is taken unconditionally, which is *why* the M=128 rows in the A/B
+/// harness are a valid control: an M==1-only route cannot move them.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sgemm_simd_variant(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    use_m1_gemv: bool,
+) {
     if m == 0 || n == 0 {
         return;
     }
@@ -83,14 +106,27 @@ pub(crate) fn sgemm_simd(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize
     // #1091: dedicated M=1 GEMV. MLAS routes M==1 away from its packed GEBP for
     // exactly this reason (`sgemm.cpp`): "The data from matrix B is not
     // referenced multiple times, so using a local packed buffer is a wasted
-    // memory copy." Our packed path below always calls `pack_b`, so at M=1 it
-    // pays a full read+write copy of B (K*N f32) that is reused zero times —
-    // the whole 2.2–4.6x decode gap measured against MLAS on AVX2. This GEMV
-    // streams B in place (each cache line read once, C in registers, A
-    // broadcast): no pack, no resident buffer, strictly less memory traffic.
-    // Behind a same-binary A/B toggle (default off) like #1104's nblk kernel,
-    // because it reassociates the f32 sum versus the packed path.
-    if m == 1 && m1_gemv_enabled() {
+    // memory copy." The packed path always calls `pack_b`, so at M=1 it pays a
+    // full read+write copy of B (K*N f32) that is reused zero times — the whole
+    // 2.2–4.6x decode gap measured against MLAS on AVX2. This GEMV streams B in
+    // place: no pack, no resident buffer, strictly less memory traffic. Behind
+    // a same-binary A/B toggle (default off) like #1104's nblk kernel, because
+    // it reassociates the f32 sum versus the packed path.
+    //
+    // Dispatch boundary (measured on this host, AVX2, process CPU time, control
+    // -gated so the M=128 prefill rows confirm the run was quiet — see
+    // `bench_f32_gemm_ab`). Per M=1 shape, gemv / packed CPU time:
+    //   1x5120x7168   0.50    1x5120x5120   0.34    1x5120x13824  0.43
+    //   1x13824x5120  0.42    1x5120x152064 0.34
+    // The GEMV strictly dominates the packed default on *every* decode shape
+    // (2.0-2.9x), so there is deliberately no fall-back to `sgemm_simd_packed`
+    // here: it would be uniformly slower. The only residual gap is versus MLAS
+    // (not our default), and only on the two largest shapes -- down_proj
+    // (K=13824, gemv/mlas 1.22) and lm_head (N=152064, gemv/mlas 1.18) -- where
+    // sequential B streaming trails MLAS's blocked M=1 asm; the other three win
+    // outright (0.68-0.93). That MLAS-only boundary is a known limit, not a
+    // regression against the code this build actually ships.
+    if m == 1 && use_m1_gemv {
         // SAFETY: `SimdX86` is only selected when the host has AVX2+FMA (see
         // `crate::backend::has_simd_x86`), the same guarantee `micro_6x16`
         // relies on; slice lengths are validated by the caller (`a.len()==k`,
@@ -101,6 +137,14 @@ pub(crate) fn sgemm_simd(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize
         return;
     }
 
+    sgemm_simd_packed(a, b, c, m, k, n);
+}
+
+/// Packed GEBP path: pack A into `MR`-row panels and B into `NR`-column L1
+/// panels, then drive the `6x16` microkernel over Rayon column strips. This is
+/// the correctness baseline for every `m` and the sole path for `m >= 2`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn sgemm_simd_packed(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     // Pack A once: one contiguous [k][MR] panel per MR-row block, zero-padded.
     let m_panels = m.div_ceil(MR);
     let mut apack = vec![0.0f32; m_panels * k * MR];

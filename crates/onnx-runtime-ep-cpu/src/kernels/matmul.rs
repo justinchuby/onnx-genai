@@ -4788,11 +4788,27 @@ mod tests {
     /// synthetic driver is the only way to exercise the f32 SGEMM at model
     /// scale.
     ///
-    /// One backend per process (env `GEMM_AB_ARM=mlas|simd|generic`) so an
-    /// external poller can attribute process CPU time and peak RSS to a single
-    /// arm; `both` runs all arms in one process for a quick in-run wall/GFLOP/s
-    /// speedup. `GEMM_AB_ITERS` (default 30) sets the min-timing repeat count;
-    /// `GEMM_AB_SHAPES="m,k,n;m,k,n"` overrides the preset shape list.
+    /// One backend per process (env `GEMM_AB_ARM=mlas|simd_packed|simd_gemv|
+    /// generic`) so an external poller can attribute process CPU time and peak
+    /// RSS to a single arm. The default `both` interleaves mlas + simd_packed +
+    /// simd_gemv **in one process**, back to back per shape, so every arm shares
+    /// the same machine conditions; it prints the ratio table and a control
+    /// check. `GEMM_AB_ITERS` (default 30) is the min-timing repeat count;
+    /// `GEMM_AB_SHAPES="m,k,n;m,k,n"` overrides the preset; `GEMM_AB_GENERIC=1`
+    /// adds the (slow) Generic arm; `GEMM_AB_CONTROL_PCT` (default 5) sets the
+    /// control drift threshold.
+    ///
+    /// ## The M>=2 rows are a built-in control
+    ///
+    /// The M=1 GEMV route only fires for `m == 1`; for `m >= 2` both the
+    /// `simd_packed` and `simd_gemv` arms execute the *identical* packed kernel
+    /// (`sgemm_simd_variant` ignores the flag). So on the M>=2 rows the
+    /// `gemv/packed` ratio is a direct, zero-cost measurement of run-to-run
+    /// noise: it must be ~1.0. If it drifts past `GEMM_AB_CONTROL_PCT`, the
+    /// machine was not quiet and **no conclusion may be drawn from that run** —
+    /// this makes "the box was busy" a measurement taken before concluding
+    /// rather than an excuse offered after. Adopt this pattern for every A/B
+    /// harness in the repo.
     ///
     /// Run: `cargo test -p onnx-runtime-ep-cpu --lib --release --features mlas \
     ///   bench_f32_gemm_ab -- --ignored --nocapture`.
@@ -4801,18 +4817,56 @@ mod tests {
     fn bench_f32_gemm_ab() {
         use std::time::Instant;
 
+        // Dispatch one kernel arm. Returns false if the arm is not compiled into
+        // this build (e.g. `mlas` without the feature), so the harness degrades
+        // cleanly. For `m >= 2`, `simd_packed` and `simd_gemv` are byte-for-byte
+        // the same call — that identity is what makes the control valid.
+        #[allow(unused_variables)]
+        fn run_kind(
+            kind: &str,
+            a: &[f32],
+            b: &[f32],
+            c: &mut [f32],
+            m: usize,
+            k: usize,
+            n: usize,
+        ) -> bool {
+            match kind {
+                "generic" => {
+                    gemm_with_backend(CpuBackend::Generic, a, b, c, m, k, n).unwrap();
+                    true
+                }
+                #[cfg(feature = "mlas")]
+                "mlas" => {
+                    gemm_with_backend(CpuBackend::Mlas, a, b, c, m, k, n).unwrap();
+                    true
+                }
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                "simd_packed" => {
+                    super::x86_sgemm::sgemm_simd_variant(a, b, c, m, k, n, false);
+                    true
+                }
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                "simd_gemv" => {
+                    super::x86_sgemm::sgemm_simd_variant(a, b, c, m, k, n, true);
+                    true
+                }
+                _ => false,
+            }
+        }
+
         // Qwen2.5-14B f32 shapes (hidden 5120, inter 13824, kv 1024, vocab
-        // 152064): the decode (m=1) and prefill (m=128) GEMMs a dense-f32 build
-        // of that model would run through this kernel.
+        // 152064). The M=1 rows are decode GEMVs; the M=128 rows are the prefill
+        // control (unaffected by the M=1 route — see the doc comment).
         let default_shapes: Vec<(usize, usize, usize)> = vec![
-            (1, 5120, 7168),     // decode: fused QKV proj (q 5120 + kv 2*1024)
-            (1, 5120, 5120),     // decode: o_proj
-            (1, 5120, 13824),    // decode: gate/up proj
-            (1, 13824, 5120),    // decode: down proj
-            (1, 5120, 152064),   // decode: lm_head
-            (128, 5120, 5120),   // prefill: o_proj
-            (128, 5120, 13824),  // prefill: gate/up proj
-            (128, 13824, 5120),  // prefill: down proj
+            (1, 5120, 7168),    // decode: fused QKV proj (q 5120 + kv 2*1024)
+            (1, 5120, 5120),    // decode: o_proj
+            (1, 5120, 13824),   // decode: gate/up proj
+            (1, 13824, 5120),   // decode: down proj
+            (1, 5120, 152064),  // decode: lm_head
+            (128, 5120, 5120),  // CONTROL prefill: o_proj
+            (128, 5120, 13824), // CONTROL prefill: gate/up proj
+            (128, 13824, 5120), // CONTROL prefill: down proj
         ];
         let shapes: Vec<(usize, usize, usize)> = match std::env::var("GEMM_AB_SHAPES") {
             Ok(spec) if !spec.trim().is_empty() => spec
@@ -4830,7 +4884,12 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(30);
+        let control_pct: f64 = std::env::var("GEMM_AB_CONTROL_PCT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5.0);
         let arm = std::env::var("GEMM_AB_ARM").unwrap_or_else(|_| "both".to_string());
+        let want_generic = std::env::var("GEMM_AB_GENERIC").is_ok();
 
         let mut state = 0x1234_5678_u32;
         let mut next = || {
@@ -4838,58 +4897,102 @@ mod tests {
             ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 2.0
         };
 
-        // Backends compiled into this binary. `Mlas` only exists with the
-        // feature; `SimdX86` only on x86. Filter to what is available and to
-        // the requested arm.
-        let mut backends: Vec<(&str, CpuBackend)> = Vec::new();
-        #[cfg(feature = "mlas")]
-        backends.push(("mlas", CpuBackend::Mlas));
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        backends.push(("simd", CpuBackend::SimdX86));
-        backends.push(("generic", CpuBackend::Generic));
-        if arm != "both" {
-            backends.retain(|(name, _)| *name == arm);
-        }
-        assert!(!backends.is_empty(), "no backend matched GEMM_AB_ARM={arm}");
+        // Arm order (interleaved per shape). Isolated single-arm mode selects
+        // just one, for external RSS / CPU-time attribution.
+        let arms: Vec<&str> = if arm == "both" {
+            let mut v = vec!["mlas", "simd_packed", "simd_gemv"];
+            if want_generic {
+                v.push("generic");
+            }
+            v
+        } else {
+            vec![arm.as_str()]
+        };
 
         println!(
-            "f32 GEMM A/B (#1091): threads={} iters={} arm={}",
+            "f32 GEMM A/B (#1091): threads={} iters={} arm={} control_pct={}",
             rayon::current_num_threads(),
             iters,
-            arm
+            arm,
+            control_pct
         );
+
+        // Collected control drift (|gemv/packed - 1|) over the M>=2 rows.
+        let mut worst_control_drift = 0.0f64;
+        let mut control_rows = 0usize;
 
         for &(m, k, n) in &shapes {
             let a: Vec<f32> = (0..m * k).map(|_| next()).collect();
             let b: Vec<f32> = (0..k * n).map(|_| next()).collect();
             let flops = 2.0 * m as f64 * k as f64 * n as f64;
-            let mut results: Vec<(&str, f64)> = Vec::new();
-            for &(name, backend) in &backends {
+            // Interleave arms at the *iteration* level, not the arm level: run
+            // every available arm once per round and keep each arm's min. A
+            // clean moment (or a load spike) then lands on all arms' minima
+            // together, so the M>=2 control ratio stays ~1.0 unless the machine
+            // is *continuously* loaded. Per-arm windows (arm A x40, then B x40)
+            // let sustained load during one arm's whole window bias that arm,
+            // which is exactly the noise the control is meant to catch.
+            let mut avail: Vec<&str> = Vec::new();
+            let mut cbufs: Vec<Vec<f32>> = Vec::new();
+            for &name in &arms {
                 let mut c = vec![0.0f32; m * n];
-                // Warm up (page-in, first-touch, ISA dispatch).
-                gemm_with_backend(backend, &a, &b, &mut c, m, k, n).unwrap();
-                let mut best = f64::INFINITY;
-                for _ in 0..iters {
-                    let t = Instant::now();
-                    gemm_with_backend(backend, &a, &b, &mut c, m, k, n).unwrap();
-                    std::hint::black_box(&c);
-                    best = best.min(t.elapsed().as_secs_f64());
+                if run_kind(name, &a, &b, &mut c, m, k, n) {
+                    avail.push(name); // arm compiled in; c now warmed up
+                    cbufs.push(c);
                 }
-                results.push((name, best));
             }
+            let mut best = vec![f64::INFINITY; avail.len()];
+            for _ in 0..iters {
+                for (i, &name) in avail.iter().enumerate() {
+                    let t = Instant::now();
+                    run_kind(name, &a, &b, &mut cbufs[i], m, k, n);
+                    std::hint::black_box(&cbufs[i]);
+                    best[i] = best[i].min(t.elapsed().as_secs_f64());
+                }
+            }
+            let times: Vec<(&str, f64)> =
+                avail.iter().copied().zip(best.iter().copied()).collect();
             let g = |s: f64| flops / s / 1e9;
-            print!("  {m:>4}x{k:>6}x{n:>6}:");
-            for (name, s) in &results {
-                print!("  {name} {:>8.3} ms ({:>7.1} GF/s)", s * 1e3, g(*s));
+            let get = |k: &str| times.iter().find(|(n, _)| *n == k).map(|(_, s)| *s);
+            let is_control = m >= 2;
+            print!(
+                "  {}{m:>4}x{k:>6}x{n:>6}:",
+                if is_control { "[CTL] " } else { "      " }
+            );
+            for (name, s) in &times {
+                print!("  {name} {:>8.3}ms ({:>6.1}GF/s)", s * 1e3, g(*s));
             }
-            // Report gap versus the built-in simd path when both are present.
-            if let (Some((_, mlas)), Some((_, simd))) = (
-                results.iter().find(|(n, _)| *n == "mlas"),
-                results.iter().find(|(n, _)| *n == "simd"),
-            ) {
-                print!("  simd/mlas={:.2}x", simd / mlas);
+            if let (Some(mlas), Some(packed), Some(gemv)) =
+                (get("mlas"), get("simd_packed"), get("simd_gemv"))
+            {
+                print!(
+                    "  | packed/mlas={:.2}x gemv/mlas={:.2}x gemv/packed={:.2}x",
+                    packed / mlas,
+                    gemv / mlas,
+                    gemv / packed
+                );
+                if is_control {
+                    let drift = (gemv / packed - 1.0).abs();
+                    worst_control_drift = worst_control_drift.max(drift);
+                    control_rows += 1;
+                }
             }
             println!();
+        }
+
+        if control_rows > 0 {
+            let pct = worst_control_drift * 100.0;
+            println!(
+                "CONTROL: {} M>=2 rows, worst |gemv/packed - 1| = {:.1}% (threshold {:.1}%) -> {}",
+                control_rows,
+                pct,
+                control_pct,
+                if pct > control_pct {
+                    "RUN NOT USABLE (machine not quiet; draw no conclusions)"
+                } else {
+                    "OK (run usable)"
+                }
+            );
         }
     }
 }
