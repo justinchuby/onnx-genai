@@ -1879,10 +1879,11 @@ pub(crate) fn unsupported_reason(node: &Node) -> Option<String> {
 }
 ```
 
-so a limit cannot be added to a factory without appearing at claim time too —
-drift is impossible by construction rather than by discipline. `supports_op`
-consults it for `MoE`, `QMoE`, `GroupQueryAttention`, `MultiHeadAttention`,
-`com.microsoft::Attention`, `ai.onnx::Attention` and
+so a limit cannot be added to one of these factories without appearing at claim
+time too. Be precise about the scope of that guarantee: **within a wired op**
+drift is impossible by construction; *wiring an op* is still discipline.
+`supports_op` consults it for `MoE`, `QMoE`, `GroupQueryAttention`,
+`MultiHeadAttention`, `com.microsoft::Attention`, `ai.onnx::Attention` and
 `PackedMultiHeadAttention`, which sweeps up the rest of the family in one go:
 GQA's quantized-KV and `qk_output` rejections, msft `Attention`'s `do_rotary`
 and `past_present_share_buffer`, `ai.onnx::Attention`'s `qk_matmul_output_mode`,
@@ -1899,6 +1900,15 @@ the session loads. Disabling the claim-time guard turns each of the three into
 STAGE [CreateSession] FAILED: Compile: get_kernel failed for node '' (MoE):
   MoE: use_sparse_mixer=1 is unsupported by the Phase-1 CPU reference kernel
 ```
+
+Review then audited the rest of the EP for the same defect and found ten other
+factories that reject something `supports_op` does not pre-check — `MatMulNBits`
+(`bits`, `block_size`), `Resize`, `Pad`, `GridSample`, `LpNormalization`,
+`Unique`, `BitShift`, `ConstantOfShape` and two `pkg.nxrt` internals. **None is
+a live regression**: each rejects only schema-invalid values or configurations
+ORT's own CPU kernel also refuses, and the reviewer could not construct a case
+ORT runs and we reject. They are recorded here so the next person does not have
+to redo the audit, and so the claim above is not read as EP-wide.
 
 **These are the only deliberate declines in the suite and every one is a
 capability answer, not a performance one** — we have no column-wise, sparse

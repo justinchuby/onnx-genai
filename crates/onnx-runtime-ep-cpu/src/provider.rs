@@ -1255,13 +1255,6 @@ mod tests {
                 ("num_heads", Attribute::Int(0)),
                 &[],
             ),
-            (
-                "PackedMultiHeadAttention",
-                "com.microsoft",
-                1,
-                ("scale", Attribute::Float(f32::INFINITY)),
-                &[("num_heads", Attribute::Int(4))],
-            ),
         ];
 
         for (op, domain, opset, (attr, value), extra) in cases {
@@ -1287,6 +1280,61 @@ mod tests {
                  `supports_op`."
             );
         }
+
+        // `PackedMultiHeadAttention` needs a fully-formed node rather than a
+        // table row. Its claim-time check inspects inputs, shapes and dtypes
+        // before it reaches the attribute mirror, so an attribute-only node
+        // declines for the *wrong* reason and the assertion would pass even
+        // with the mirror deleted — which is exactly what review demonstrated.
+        // Hence the explicit reason match.
+        let mut graph = Graph::new();
+        let value = |graph: &mut Graph, name: &str, dtype| {
+            Some(graph.create_named_value(name.to_string(), dtype, static_shape([])))
+        };
+        let inputs = vec![
+            value(&mut graph, "query", DataType::Float32),
+            value(&mut graph, "key", DataType::Float32),
+            value(&mut graph, "value", DataType::Float32),
+            None,
+            value(&mut graph, "token_offset", DataType::Int32),
+            value(&mut graph, "cumulative_sequence_length", DataType::Int32),
+        ];
+        let output =
+            graph.create_named_value("output".to_string(), DataType::Float32, static_shape([]));
+        let mut node = Node::new(NodeId(0), "PackedMultiHeadAttention", inputs, vec![output]);
+        node.domain = "com.microsoft".into();
+        node.attributes
+            .insert("num_heads".into(), Attribute::Int(2));
+        node.attributes
+            .insert("scale".into(), Attribute::Float(f32::INFINITY));
+        let shapes = [
+            static_shape([4, 8]),
+            static_shape([4, 8]),
+            static_shape([4, 8]),
+            static_shape([]),
+            static_shape([1, 4]),
+            static_shape([2]),
+        ];
+        let dtypes = [
+            DataType::Float32,
+            DataType::Float32,
+            DataType::Float32,
+            DataType::Float32,
+            DataType::Int32,
+            DataType::Int32,
+        ];
+        assert!(
+            ep.get_kernel(&node, &[], 1).is_err(),
+            "PackedMultiHeadAttention with a non-finite scale is expected to be a factory \
+             rejection"
+        );
+        let claim = ep.supports_op(&node, 1, &shapes, &dtypes, &[]);
+        let reason = claim.reason().unwrap_or_default().to_string();
+        assert!(
+            reason.contains("scale must be finite"),
+            "PackedMultiHeadAttention's attribute mirror was not reached; the node declined \
+             for `{reason}` instead, so this case would not catch the mirror being removed"
+        );
     }
 
     #[test]

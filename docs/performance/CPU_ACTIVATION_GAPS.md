@@ -196,7 +196,12 @@ where a decline is still recoverable. The mirror is now structural rather than
 duplicated: each kernel's attribute validation lives in one function and the
 claim-time guard is that same function's error, so a new factory limit cannot
 fail to appear at claim time. `provider::tests::every_factory_attribute_rejection_is_mirrored_at_claim_time`
-asserts both halves for eleven hostile nodes and fails if they diverge.
+asserts both halves for eleven hostile nodes and fails if they diverge. The
+guarantee is per-wired-op, though: within a wired op drift is impossible, but
+wiring an op is still discipline. An audit of the remaining factories found ten
+that reject something `supports_op` does not pre-check; none is a live
+regression, because each refuses only schema-invalid values or configurations
+ORT's own CPU kernel also refuses.
 
 The attention, MoE and KV-cache ops are now covered end-to-end by
 `plugin_ort_e2e`'s `ASSIGNMENT_FIXTURES` (38 graphs, all on our EP with
