@@ -3907,7 +3907,13 @@ mod chunking_instantiation_is_local {
                         // ::<T>(` and `run_chunked ()`, while rejecting
                         // `run_chunked_fn`, `run_chunked_rows`, test names like
                         // `silu_reaches_run_chunked_parallel_branch`, and prose
-                        // inside string literals.
+                        // that does not go on to open a call. It is a
+                        // heuristic, not a parser: a call spelled through an
+                        // aliased import, split across two lines, or generated
+                        // by a macro would slip past it, and the literal text
+                        // `run_chunked(` inside a string would trip it. It
+                        // catches the accidental case, which is a plain call
+                        // added in another module.
                         let is_word = |c: char| c.is_alphanumeric() || c == '_';
                         let calls = line.match_indices("run_chunked").any(|(at, _)| {
                             let before_ok =
