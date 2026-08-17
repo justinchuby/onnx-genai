@@ -1568,3 +1568,25 @@ comparison within a row.
   actually assigns - bind under a megabyte and take the serial path unchanged.
 * No numerical change of any kind: the bytes written are identical, and a
   bit-identity falsifier plus a non-vacuity counter enforce it in CI.
+
+### 22.6 Re-verification after the review rework
+
+Review found that the threshold lookup ran `std::env::var` on *every* copy,
+before any size check - a locked `getenv` plus a `String` allocation charged to
+the small-copy path this change claims to leave alone. The environment is now
+read once per process into a `OnceLock` and the cheap worker-count gate runs
+first. That is a material change to the measured code, so the headline cells
+were re-measured on the shipped version rather than assumed to carry over.
+
+Paired, same binary, one process per arm, 16-thread budget, `native` p50 in ms:
+
+| graph | per-tensor input | serial (5 reps) | parallel (5 reps) | ratio range |
+|---|---|---|---|---|
+| `tr_llama3_s512` | 8 MiB | 0.772 / 0.806 / 0.815 / 0.860 / 0.864 | 0.343 / 0.405 / 0.419 / 0.424 / 0.439 | 0.44-0.51 |
+| `tr_bert_b8_s128` (control) | 3 MiB | 0.514 / 0.531 / 0.535 | 0.520 / 0.542 / 0.546 | 0.97-1.06 |
+| `sm_decode_h32_kv1024` (control) | 0.125 MiB | 0.023 / 0.023 / 0.024 | 0.023 / 0.023 / 0.023 | 0.96-1.00 |
+
+The `tr_llama3_s512` win survives the rework at every repetition, and the two
+control graphs - one just below the threshold, one two orders of magnitude below
+it - are unchanged, which is the direct falsifier for the regression the review
+identified: a per-call `env::var` would show on the 0.023 ms decode row.
