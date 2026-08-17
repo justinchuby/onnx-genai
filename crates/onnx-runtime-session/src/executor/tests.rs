@@ -186,7 +186,7 @@ fn compute_in_place_chain_is_byte_identical_and_fires() {
     // `first` is executor-owned and still aliases. Trading one in-place alias
     // (which saves an allocation the run makes anyway on the next step) for
     // eliminating a full host->EP copy of every graph input is the point of
-    // `bind_host_inputs`.
+    // `prepare_run_buffers`.
     assert_eq!(enabled.compute_in_place_alias_count, 1);
 
     let mut disabled = Executor::build(inplace_chain_graph(false, false), weights, ep).unwrap();

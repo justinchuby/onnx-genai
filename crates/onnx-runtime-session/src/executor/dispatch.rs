@@ -561,7 +561,7 @@ impl Executor {
                             && !ctx.pinned.contains(&vid)
                             && !ctx.shared_buffers.contains_key(&vid)
                             // A borrowed buffer aliases the caller's own input
-                            // tensor for this run (`bind_host_inputs`). Running
+                            // tensor for this run (`prepare_run_buffers`). Running
                             // in place would write through it, mutating memory
                             // this session does not own.
                             && ctx.buffers.get(&vid).is_some_and(|b| !b.is_borrowed())
