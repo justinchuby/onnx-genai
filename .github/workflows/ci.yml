@@ -278,6 +278,19 @@ jobs:
           --features mlas
           kernels::moe::
 
+      # QLinearMatMul requantizes inside MLAS through the same output processor
+      # ORT uses, and the tests that pin that fused path bit-for-bit against the
+      # scalar loop only exist under `--features mlas`.  Nothing else in the
+      # pipeline runs them: the coverage lane builds this crate without MLAS and
+      # the ORT lane tests the plugin crate, not these unit tests.
+      - name: CPU EP QLinearMatMul tests against real MLAS
+        run: >-
+          cargo test --locked
+          -p onnx-runtime-ep-cpu
+          --no-default-features
+          --features mlas
+          kernels::qlinear_matmul::
+
       # x86_64-apple-darwin changes target_arch but leaves target_os="macos",
       # so cfg(target_os) errors are invisible.  This step uses a genuine Linux
       # target that exercises BOTH dimensions.  PR #317 proved the gap.
