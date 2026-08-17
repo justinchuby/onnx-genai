@@ -645,12 +645,19 @@ impl KernelFactory for GroupQueryAttentionFactory {
                 "GroupQueryAttention: qk_output is not yet supported".into(),
             ));
         }
-        if node
+        // ORT's schema default for this attribute is -1, not 0, and ORT
+        // materialises schema defaults onto the node before an EP ever sees it
+        // -- so every GQA node from a real ORT session arrives carrying
+        // `smooth_softmax = -1`. Its own kernel enables the feature only for
+        // the exact value 1 (`use_smooth_softmax_ = ... == 1`), so anything
+        // else means "off". Testing `!= 0` here rejected every ORT-resolved GQA
+        // node, which is why `plugin_ort_e2e`'s GQA assignment fixture is the
+        // regression test for this line.
+        let smooth_softmax = node
             .attr("smooth_softmax")
             .and_then(|a| a.as_int())
-            .unwrap_or(0)
-            != 0
-        {
+            .unwrap_or(0);
+        if smooth_softmax == 1 {
             return Err(EpError::KernelFailed(
                 "GroupQueryAttention: smooth_softmax is not yet supported".into(),
             ));
@@ -669,7 +676,14 @@ impl KernelFactory for GroupQueryAttentionFactory {
         Ok(Box::new(GroupQueryAttentionKernel {
             num_heads,
             kv_num_heads,
-            scale: node.attr("scale").and_then(|a| a.as_float()),
+            // Same schema-default hazard as `smooth_softmax`: ORT stamps
+            // `scale = 0` on every node, and its kernel reads 0 as "use
+            // 1/sqrt(head_size)". Taking it literally would scale the scores by
+            // zero, so treat a non-positive scale as absent.
+            scale: node
+                .attr("scale")
+                .and_then(|a| a.as_float())
+                .filter(|s| *s > 0.0),
             do_rotary: node.attr("do_rotary").and_then(|a| a.as_int()).unwrap_or(0) != 0,
             rotary_interleaved: node
                 .attr("rotary_interleaved")

@@ -77,7 +77,14 @@ pub struct AttentionFactory {
 
 impl KernelFactory for AttentionFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let scale = node.attr("scale").and_then(|a| a.as_float());
+        // ORT materialises schema defaults onto a node before an EP sees it,
+        // and its own kernels read `scale == 0` as "use 1/sqrt(head_size)"
+        // rather than literally. Taking a zero scale at face value would zero
+        // every score, so a non-positive attribute means "absent" here too.
+        let scale = node
+            .attr("scale")
+            .and_then(|a| a.as_float())
+            .filter(|s| *s > 0.0);
         let is_causal = node.attr("is_causal").and_then(|a| a.as_int()).unwrap_or(0) != 0;
         let q_num_heads = node
             .attr("q_num_heads")

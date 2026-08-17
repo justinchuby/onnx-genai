@@ -1,0 +1,65 @@
+ir_version: 10
+graph {
+  node {
+    input: "X"
+    output: "Z"
+    op_type: "Transpose"
+    attribute {
+      name: "perm"
+      ints: 0
+      ints: 2
+      ints: 1
+      ints: 3
+      type: INTS
+    }
+  }
+  name: "transpose_assignment_f32"
+  input {
+    name: "X"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 128
+          }
+          dim {
+            dim_value: 32
+          }
+          dim {
+            dim_value: 128
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "Z"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 32
+          }
+          dim {
+            dim_value: 128
+          }
+          dim {
+            dim_value: 128
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 13
+}

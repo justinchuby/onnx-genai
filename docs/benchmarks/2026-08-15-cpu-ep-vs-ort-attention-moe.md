@@ -581,8 +581,15 @@ are load-bearing. Within *this* session MoE is at parity at t=1 and loses
 
 ## 10. Assignment matrix after Phase 3
 
-What the **plugin** EP asks ORT to hand over. This does not affect a native
-`InferenceSession`, which has no host to defer to and runs every kernel.
+> **WITHDRAWN — see §23.** Every `defer` row in this table is void. The project
+> rule is now that a node this EP can execute is never handed to ORT's CPU EP,
+> whatever the measurement says, and a losing row is a kernel to fix rather than
+> a node to give away. The table is kept because the *ratios* are real evidence
+> and they are the work queue; the `claim` column is not the current behaviour.
+
+What the **plugin** EP asked ORT to hand over, as of Phase 3. This never
+affected a native `InferenceSession`, which has no host to defer to and runs
+every kernel.
 
 | op | dtype | claim | evidence |
 |---|---|---|---|
@@ -933,10 +940,13 @@ cells are still slower than ORT**, 41 of them by ≥5%, and only 7 are ≥5% fas
 16 threads**, because the remaining time is in the QK and PV GEMMs and their
 thread scaling, not in the scale/mask/softmax stage that #1094 fixed.
 
-So the honest answer to requirement 4 is the one it anticipated: **the fused
-region does not clear the ≥5% bar, and should be declined to ORT wherever the
-Plugin EP has that option.** Keeping `Softmax` claimed *purely* to preserve a
-fusion that then loses is not justified by this data.
+So the honest answer to requirement 4, *at the time*, was the one it
+anticipated: the fused region did not clear the ≥5% bar. The conclusion drawn
+from that — "decline it to ORT" — **is withdrawn (§23)**; the measurement is
+not. What the data actually establishes is that **the fused region is 3–15x
+short and that is the work**: Keeping `Softmax` claimed purely to preserve a fusion
+that then loses is not *justified* by this data — but it is now *required* by
+the rule in §23, so the only acceptable resolution is to close the gap.
 
 The blocker is structural rather than a matter of will: `claim_preference(op,
 opset, shapes, input_dtypes)` in `assignment_policy.rs` is **per-node and has no
@@ -1646,3 +1656,144 @@ this measurement's 1 us display resolution and well inside the row's own ~4%
 spread. The evidence that the read is now cached is the code, not this table.
 What these rows do show is that the reworked gate ordering did not disturb the
 below-threshold path, which is what they are here for.
+
+## 23. The rule changed: this EP never hands a node to ORT's CPU EP
+
+Phases 1–4 treated "decline to ORT" as a legitimate outcome for a range where we
+lose, and §10 and §15 above are written that way. That is no longer the project
+rule:
+
+> 我们的 cpu ep 不要分配到 ort cpu ep 上。用了我们的 cpu ep 就不要用 ort 的 cpu ep。但凡比 ort 慢的都要想方设法比 ort 快。
+>
+> *(Our CPU EP must not assign work onto ORT's CPU EP. If you are using our CPU
+> EP, do not use ORT's. Anything slower than ORT must be made faster than ORT,
+> by whatever means it takes.)*
+
+So a losing cell is a kernel to fix, not a node to give away, and every ratio in
+this document is now a work item rather than a justification. Nothing about the
+*measurements* changes — they were paired, interleaved, same-host and
+same-thread, and they still say what they said.
+
+### 23.1 The code-level declines were already gone; the silent one was not
+
+The perf-based decline was withdrawn before this section was written:
+`claim_preference_node` returns `Claim` unconditionally and `assignment_policy.rs`
+is deleted. Auditing what that actually guaranteed turned up two holes.
+
+**Hole 1 — the guarantee was untested for the operators this EP exists for.**
+`plugin_ort_e2e`'s `ASSIGNMENT_FIXTURES` covered 23 activation and normalisation
+graphs and *zero* attention, MoE, KV-cache, Softmax, Transpose or RoPE graphs.
+The rule was asserted where it was easy, not where it mattered.
+
+**Hole 2 — `GetCapability`'s shape filter is a third, silent decline layer.**
+Three independent gates must all pass for a node to reach our kernels:
+`supports_op` (dtype/shape capability), `claim_preference_node` (was perf), and a
+**fail-closed shape-inference filter** that drops any claim whose node has no
+rule in `compute.rs`. That last one answers to neither of the first two, and it
+was giving away `com.microsoft::Attention`, `MoE`, `QMoE`,
+`PackedMultiHeadAttention`, `ScatterND`, `ScatterElements` and `Trilu` — three of
+which **ORT has no CPU kernel for at all**, so the "fallback" bought a load
+failure rather than a slower run.
+
+### 23.2 Two decode ops were being handed to ORT by a dtype rule
+
+With shape rules added for all seven ops and nine new fixtures wired in, a real
+ORT 1.27 session immediately failed the rewritten assignment test on the two ops
+that matter most in decode:
+
+```
+2 of 32 fixtures were handed to ORT's CPU EP.
+  rotary_assignment_f32: 'RotaryEmbedding'      — ours=[], ORT was given ["RotaryEmbedding"]
+  gqa_assignment_f32:    'GroupQueryAttention'  — ours=[], ORT was given ["GroupQueryAttention"]
+```
+
+The cause is that the plugin advertises one *union* of dtypes per op and tests
+every input slot against it. Attention ops map to `FLOAT_DTYPES`, but
+`RotaryEmbedding`'s `position_ids` is int64 and `GroupQueryAttention`'s
+`seqlens_k` / `total_sequence_length` are int32, so the integer slots failed the
+float test and the claim was dropped. `input_dtype_constraints_for_op` already
+existed for the opposite problem (a union too *wide* for `MatMulNBits`); it just
+had no entries for the attention family. Adding the per-slot tables — with the
+`com.microsoft` and `ai.onnx` RoPE slot orders kept separate, because they differ
+— is what makes these two ops reachable at all.
+
+**This means §1's and #1078's RoPE and GQA plugin-path numbers describe an EP
+that was not running those ops.** Any plugin-path attention measurement taken
+before this fix needs re-taking.
+
+### 23.3 ORT stamps schema defaults on the node, and one of them is not 0
+
+With the dtype fix in, GQA still failed — at kernel construction:
+
+```
+STAGE [CreateSession] FAILED: get_kernel failed for node '' (GroupQueryAttention):
+  GroupQueryAttention: smooth_softmax is not yet supported (got -1)
+```
+
+The fixture never sets `smooth_softmax`. ORT materialises **schema defaults**
+onto a node before an EP sees it, and the contrib schema's default for that
+attribute is **-1**, not 0. ORT's own kernel enables the feature only for the
+exact value 1, so -1 means "off" — but our `!= 0` test read it as "on" and
+refused the node. Every GQA node from every real ORT session hit this.
+
+The same hazard applies to `scale`, whose kernels (ours and ORT's) read 0 as
+"use 1/sqrt(head_size)" rather than literally: taking a stamped `scale = 0` at
+face value would multiply every score by zero and produce a silently wrong
+result rather than an error. `attention.rs`, `msft_attention.rs`,
+`multi_head_attention.rs` and `group_query_attention.rs` now all treat a
+non-positive `scale` as absent, matching ORT.
+
+### 23.4 Assignment matrix, all 32 fixtures, real ORT 1.27 CPU session
+
+`no_supported_node_is_ever_left_to_the_ort_cpu_ep` collects every failure and
+asserts once, so a run reports the whole matrix instead of stopping at the first
+decline. Every row is a real session with
+`session.record_ep_graph_assignment_info=1`, queried through
+`Session_GetEpGraphAssignmentInfo`.
+
+| fixture | op | before | after |
+|---|---|---|---|
+| `softmax_assignment_f32` | `Softmax` | n/a (no fixture) | **ours** |
+| `transpose_assignment_f32` | `Transpose` | n/a | **ours** |
+| `kv_concat_assignment_f32` | `Concat` | n/a | **ours** |
+| `kv_scatternd_assignment_f32` | `ScatterND` | n/a — silently declined | **ours** |
+| `rotary_assignment_f32` | `RotaryEmbedding` | **ORT** | **ours** |
+| `mha_assignment_f32` | `MultiHeadAttention` | n/a | **ours** |
+| `gqa_assignment_f32` | `GroupQueryAttention` | **ORT** | **ours** |
+| `msft_attention_assignment_f32` | `com.microsoft::Attention` | n/a — silently declined | **ours** |
+| `moe_assignment_f32` | `MoE` | n/a — silently declined | **ours** |
+| 23 pre-existing activation/norm fixtures | — | ours | **ours** |
+
+`every_fixture_loads_with_cpu_fallback_disabled` runs the same 32 with
+`session.disable_cpu_ep_fallback=1`, so ORT is *forbidden* from placing a
+supported node on its own CPU EP: **32/32 load and 32/32 are assigned to us.**
+For `MoE` and `com.microsoft::Attention` that is also the only way the graph can
+load at all, since ORT has no CPU kernel to fall back to.
+
+### 23.5 Assignment is not the guarantee — the arithmetic is
+
+A claimed node that computes the wrong answer is worse than the deferral it
+replaced, so the two ops that were being handed away are also checked against
+the implementation they displaced. `rope_and_gqa_execute_on_our_ep_and_match_ort_numerics`
+runs each fixture twice over the same model file and the same input bytes: once
+with our EP appended and fallback disabled, once with our EP simply not
+appended, so ORT resolves the node to its own contrib CPU kernel.
+
+| fixture | output | values | max relative error vs ORT |
+|---|---|---|---|
+| `rotary_assignment_f32` | `output` | 4 096 | 1.182e-7 |
+| `gqa_assignment_f32` | `output` | 4 096 | 1.006e-7 |
+| `gqa_assignment_f32` | `present_key` | 1 048 576 | **0** |
+| `gqa_assignment_f32` | `present_value` | 1 048 576 | **0** |
+
+Both attention outputs are at float32 rounding, and the KV cache is written
+bit-identically to ORT's.
+
+### 23.6 What this does not fix
+
+It makes the losing ranges *reachable*; it does not make them fast. §15's fused
+region is still 3–15x short at 8–16 threads, §19–20's Transpose gaps and §18's
+MoE cells are unchanged, and #1078's own evidence has float32 RoPE losing 12/12
+cells at 1.53–17.21x. Under the rule above every one of those is now a kernel to
+fix with no exit, and the RoPE grid is first because it is the op that was being
+given away.

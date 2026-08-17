@@ -95,7 +95,14 @@ impl KernelFactory for MultiHeadAttentionFactory {
                 "MultiHeadAttention: num_heads must be > 0, got {num_heads}"
             )));
         }
-        let scale = node.attr("scale").and_then(|a| a.as_float());
+        // ORT materialises schema defaults onto a node before an EP sees it,
+        // and its own kernels read `scale == 0` as "use 1/sqrt(head_size)"
+        // rather than literally. Taking a zero scale at face value would zero
+        // every score, so a non-positive attribute means "absent" here too.
+        let scale = node
+            .attr("scale")
+            .and_then(|a| a.as_float())
+            .filter(|s| *s > 0.0);
         let mask_filter_value = node
             .attr("mask_filter_value")
             .and_then(|a| a.as_float())

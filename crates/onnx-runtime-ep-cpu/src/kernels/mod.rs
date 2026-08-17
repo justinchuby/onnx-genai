@@ -163,6 +163,9 @@ static U8_ONLY: &[DataType] = &[DataType::Uint8];
 
 static I32_ONLY: &[DataType] = &[DataType::Int32];
 
+/// Integer index/length inputs, matching `to_dense_i64`'s acceptance set.
+static INDEX_DTYPES: &[DataType] = &[DataType::Int64, DataType::Int32];
+
 /// Per-input-slot dtype constraints for a mixed-dtype op.
 ///
 /// `supported_dtypes_for_op` returns the *union* of the dtypes on an op's
@@ -178,6 +181,19 @@ static I32_ONLY: &[DataType] = &[DataType::Int32];
 /// against its own set instead of the union; absent slots and slots not listed
 /// keep the union rule. They must stay in step with the `require_dtype` calls
 /// in the corresponding kernel's `execute`.
+///
+/// The same mechanism also fixes the *opposite* failure, which is the more
+/// damaging one. `supported_dtypes_for_op` returns `FLOAT_DTYPES` for the
+/// attention family, because that is what their tensor edges carry -- but
+/// `RotaryEmbedding`'s `position_ids` is int64, and
+/// `GroupQueryAttention`'s `seqlens_k` / `total_sequence_length` are int32. The
+/// union test then rejects those slots and the node is silently handed to ORT's
+/// CPU EP, even though our kernel runs it. That contradicts this EP's contract
+/// (see `provider.rs::claim_preference_node`): a node we can execute is never
+/// delegated. Listing the integer slots explicitly is what makes the two most
+/// important decode ops in the engine reachable at all;
+/// `plugin_ort_e2e.rs::no_supported_node_is_ever_left_to_the_ort_cpu_ep` is the
+/// falsifier, and it caught both of them.
 pub fn input_dtype_constraints_for_op(
     op_type: &str,
     domain: &str,
@@ -202,9 +218,25 @@ pub fn input_dtype_constraints_for_op(
         (6, F32_ONLY),
         (7, QUANTIZED_STORAGE_DTYPES),
     ];
+    // X, position_ids, cos_cache, sin_cache.
+    static MSFT_ROTARY_SLOTS: &[(usize, &[DataType])] = &[(1, INDEX_DTYPES)];
+    // X, cos_cache, sin_cache, position_ids.
+    static ONNX_ROTARY_SLOTS: &[(usize, &[DataType])] = &[(3, INDEX_DTYPES)];
+    // query, key, value, past_key, past_value, seqlens_k, total_sequence_length,
+    // cos_cache, sin_cache.
+    static GQA_SLOTS: &[(usize, &[DataType])] = &[(5, I32_ONLY), (6, INDEX_DTYPES)];
+    // query, key, value, bias, key_padding_mask, attention_bias, past_key, past_value.
+    static MHA_SLOTS: &[(usize, &[DataType])] = &[(4, INDEX_DTYPES)];
+    // input, weights, bias, mask_index, past, attention_bias.
+    static MSFT_ATTENTION_SLOTS: &[(usize, &[DataType])] = &[(3, INDEX_DTYPES)];
     match (op_type, domain) {
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
         ("QLinearMatMul", "") => QLINEAR_MATMUL_SLOTS,
+        ("RotaryEmbedding", "com.microsoft") => MSFT_ROTARY_SLOTS,
+        ("RotaryEmbedding", "") => ONNX_ROTARY_SLOTS,
+        ("GroupQueryAttention", "com.microsoft") => GQA_SLOTS,
+        ("MultiHeadAttention", "com.microsoft") => MHA_SLOTS,
+        ("Attention", "com.microsoft") => MSFT_ATTENTION_SLOTS,
         _ => &[],
     }
 }
