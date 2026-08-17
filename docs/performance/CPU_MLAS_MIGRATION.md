@@ -216,18 +216,18 @@ faster**.
 
 | family | case | native ns/unit | MLAS ns/unit | ratio | cpu_ratio | verdict |
 |---|---|---|---|---|---|---|
-| `matmul_f32` | decode 1×2048×2048 | 0.194 | 0.028 | 0.146 | 0.088 | keep-mlas |
-| `matmul_f32` | decode 1×4096×4096 | 0.127 | 0.080 | 0.625 | 0.359 | keep-mlas |
-| `matmul_f32` | 16×512×512 | 0.111 | 0.005 | 0.046 | 0.022 | keep-mlas |
-| `matmul_f32` | prefill 128×2048×2048 | 0.0057 | 0.0038 | 0.662 | 0.363 | keep-mlas |
-| `matmul_f32` | odd 37×1023×511 | 0.037 | 0.004 | 0.108 | 0.044 | keep-mlas |
-| `softmax` | decode 1×32000 | 5.13 | 0.51 | 0.100 | 0.099 | keep-mlas |
-| `softmax` | attn 32×512 | 5.12 | 0.54 | 0.106 | 0.106 | keep-mlas |
-| `softmax` | prefill 128×4096 | 5.16 | 0.55 | 0.106 | 0.106 | keep-mlas |
-| `activations` | erf 4 Ki | 1.21 | 0.83 | 0.691 | 0.691 | keep-mlas |
-| `activations` | erf 1 Mi | 0.57 | 0.36 | 0.620 | 0.672 | keep-mlas |
-| `activations` | gelu-exact 4 Ki | 1.41 | 1.22 | 0.868 | 0.868 | keep-mlas |
-| `activations` | gelu-exact 1 Mi | 0.65 | 0.54 | 0.841 | 0.861 | keep-mlas |
+| `matmul_f32` | decode 1×2048×2048 | 0.1948 | 0.0288 | 0.148 | 0.089 | keep-mlas |
+| `matmul_f32` | decode 1×4096×4096 | 0.1332 | 0.0777 | 0.583 | 0.345 | keep-mlas |
+| `matmul_f32` | 16×512×512 | 0.1136 | 0.0051 | 0.045 | 0.019 | keep-mlas |
+| `matmul_f32` | prefill 128×2048×2048 | 0.0061 | 0.0039 | 0.641 | 0.383 | keep-mlas |
+| `matmul_f32` | odd 37×1023×511 | 0.0368 | 0.0040 | 0.110 | 0.035 | keep-mlas |
+| `softmax` | decode 1×32000 | 5.17 | 0.52 | 0.100 | 0.100 | keep-mlas |
+| `softmax` | attn 32×512 | 5.16 | 0.55 | 0.107 | 0.107 | keep-mlas |
+| `softmax` | prefill 128×4096 | 5.19 | 0.56 | 0.107 | 0.106 | keep-mlas |
+| `activations` | erf 4 Ki | 1.22 | 0.84 | 0.686 | 0.686 | keep-mlas |
+| `activations` | erf 1 Mi | 0.56 | 0.38 | 0.672 | 0.725 | keep-mlas |
+| `activations` | gelu-exact 4 Ki | 1.43 | 1.34 | 0.936 | 0.936 | keep-mlas |
+| `activations` | gelu-exact 1 Mi | 0.65 | 0.54 | 0.827 | 0.847 | keep-mlas |
 
 This is the honest state of the programme: **no family measured here is ready to
 graduate**, and the ratios say where the work is. Activations are within
@@ -283,8 +283,8 @@ Linux x86-64, gcc 13.3.0, cargo 1.97.1, release cdylib
 
 | | pure Rust | default (MLAS) | delta |
 |---|---|---|---|
-| cdylib size (release) | 7,550,176 B | 9,100,568 B | **+1,550,392 B (+20.5%)** |
-| MLAS symbols linked | 0 | 890 | all local — 0 exported, 0 undefined |
+| cdylib size (release) | 7,574,552 B | 9,166,600 B | **+1,592,048 B (+21.0%)** |
+| MLAS symbols linked | 0 | 897 | all local — 0 exported, 0 undefined |
 | one-time C++/asm compile | — | 70.2 s (`mlas-sys`, release, 32 cores) | **+70 s per target dir** |
 | incremental relink | 17.7 s | 16.7 s | within noise |
 
