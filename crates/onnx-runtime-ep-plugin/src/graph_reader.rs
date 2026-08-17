@@ -22,6 +22,14 @@ pub struct OutboundGraphReader {
     /// Owned copies of small int64 initializer tensors, keyed by value name.
     /// Used to resolve opset-13 Unsqueeze/Squeeze axes from constant inputs.
     initializer_int64: HashMap<String, Vec<i64>>,
+    /// Names of every initializer in this graph, whatever its dtype.
+    ///
+    /// ORT hands a fused node's subgraph over with its initializers listed as
+    /// *graph inputs* of that subgraph, so `is_graph_input` cannot distinguish
+    /// a weight from an activation at Compile time. This set can: it comes
+    /// from `Graph_GetInitializers`, which lists only the constants ORT owns
+    /// for the lifetime of the session.
+    initializer_names: HashSet<String>,
     /// Out-of-band set of ValueIds that represent absent optional output slots.
     /// This replaces the previous in-band string sentinel (`__absent_output_*`)
     /// which was forgeable from model content. ValueIds are graph-internal
@@ -154,6 +162,8 @@ impl OutboundGraphReader {
         // Read initializers and copy small int64 tensors into owned data.
         let initializer_int64 =
             unsafe { Self::read_initializers_int64(api, graph_ptr).unwrap_or_default() };
+        let initializer_names =
+            unsafe { Self::read_initializer_names(api, graph_ptr).unwrap_or_default() };
 
         let mut absent_outputs: HashSet<ValueId> = HashSet::new();
 
@@ -261,6 +271,7 @@ impl OutboundGraphReader {
             ort_index_to_node_id,
             ort_node_ptrs: ort_nodes,
             initializer_int64,
+            initializer_names,
             absent_outputs,
         })
     }
@@ -275,6 +286,12 @@ impl OutboundGraphReader {
     /// reader at graph construction time.
     pub fn absent_outputs(&self) -> &HashSet<ValueId> {
         &self.absent_outputs
+    }
+
+    /// Names of the graph's initializers, i.e. the values ORT keeps constant
+    /// for the whole session.
+    pub fn initializer_names(&self) -> &HashSet<String> {
+        &self.initializer_names
     }
 
     /// Access the owned int64 initializer data (copied from ORT during construction).
@@ -748,6 +765,55 @@ impl OutboundGraphReader {
     }
 
     // ─── Initializer reading ────────────────────────────────────────────
+
+    /// Read the names of every initializer, of any dtype, without touching
+    /// the tensor data.
+    ///
+    /// `read_initializers_int64` deliberately copies only small int64 tensors,
+    /// because it exists to resolve constant axes. Constant-weight detection
+    /// needs the opposite: every initializer, including a 1 GB `MatMulNBits`
+    /// `B`, and none of the bytes.
+    unsafe fn read_initializer_names(
+        api: *const ort::OrtApi,
+        graph: *const ort::OrtGraph,
+    ) -> Result<HashSet<String>, String> {
+        let get_num = unsafe { (*api).Graph_GetNumInitializers }
+            .ok_or("OrtApi.Graph_GetNumInitializers is null")?;
+        let mut num_init = 0usize;
+        let status = unsafe { get_num(graph, &mut num_init) };
+        Self::check(status)?;
+        if num_init == 0 {
+            return Ok(HashSet::new());
+        }
+
+        let get_inits = unsafe { (*api).Graph_GetInitializers }
+            .ok_or("OrtApi.Graph_GetInitializers is null")?;
+        let mut init_infos: Vec<*const ort::OrtValueInfo> = vec![ptr::null(); num_init];
+        let status = unsafe { get_inits(graph, init_infos.as_mut_ptr(), num_init) };
+        Self::check(status)?;
+
+        let get_name =
+            unsafe { (*api).GetValueInfoName }.ok_or("OrtApi.GetValueInfoName is null")?;
+        let mut names = HashSet::with_capacity(num_init);
+        for &info in &init_infos {
+            if info.is_null() {
+                continue;
+            }
+            let mut name_ptr: *const std::ffi::c_char = ptr::null();
+            let status = unsafe { get_name(info, &mut name_ptr) };
+            if !status.is_null() || name_ptr.is_null() {
+                Self::check(status).ok();
+                continue;
+            }
+            let name = unsafe { CStr::from_ptr(name_ptr) }
+                .to_string_lossy()
+                .into_owned();
+            if !name.is_empty() {
+                names.insert(name);
+            }
+        }
+        Ok(names)
+    }
 
     /// Read graph initializers and extract small int64 tensors as owned data.
     /// This copies the data during the callback frame; no ORT pointers are cached.

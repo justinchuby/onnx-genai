@@ -4403,6 +4403,7 @@ fn exp_deferral_still_claims_when_cpu_fallback_is_disabled() {
 // instead, which cargo provides per test binary and cleans with `cargo clean`.
 
 /// A generated matmul-family model plus everything needed to run it twice.
+#[derive(Clone)]
 struct MatmulFamilyCase {
     /// Fixture name; also the file stem under `CARGO_TARGET_TMPDIR`.
     name: &'static str,
@@ -4428,6 +4429,7 @@ struct MatmulFamilyCase {
 }
 
 /// One runtime input: name, element type, dims and raw little-endian bytes.
+#[derive(Clone)]
 struct GeneratedInput {
     name: &'static str,
     elem: ort::ONNXTensorElementDataType,
@@ -5012,6 +5014,34 @@ unsafe fn try_plain_ort_session(
     }
 }
 
+/// Byte width of one element of `elem`, for the element types this file
+/// generates.
+fn elem_byte_size(elem: ort::ONNXTensorElementDataType) -> usize {
+    match elem {
+        ELEM_F32 => 4,
+        ELEM_F16 => 2,
+        ELEM_U8 | ELEM_I8 => 1,
+        other => panic!("unhandled element type {other}"),
+    }
+}
+
+/// The same case with its activation tensor rotated by one whole element.
+///
+/// Rotating by an element rather than by a byte keeps every value a valid
+/// number of its dtype — a byte rotation of an f32 buffer would manufacture
+/// NaNs and denormals and turn a parity check into a float-corner-case test.
+fn with_rotated_activation(case: &MatmulFamilyCase) -> MatmulFamilyCase {
+    let mut rotated = case.clone();
+    let activation = &mut rotated.inputs[0];
+    let width = elem_byte_size(activation.elem);
+    assert!(
+        activation.data.len() > width,
+        "activation is a single element; rotating it is a no-op"
+    );
+    activation.data.rotate_left(width);
+    rotated
+}
+
 /// The matmul-family half of the architectural rule, asserted end to end.
 ///
 /// For every case this test, in one session with `session.disable_cpu_ep_fallback=1`:
@@ -5035,6 +5065,7 @@ unsafe fn try_plain_ort_session(
 fn no_matmul_family_node_escapes_to_the_ort_cpu_ep() {
     let _lock = lock_ort_ep();
     let mut checked = 0usize;
+    let mut sensitive = 0usize;
     for case in matmul_family_cases() {
         let path = write_generated_model(case.name, &case.model);
         let reg = format!("cpu_ep_mm_{}", case.name);
@@ -5134,6 +5165,72 @@ fn no_matmul_family_node_escapes_to_the_ort_cpu_ep() {
                         ort_out[worst_at],
                         case.tolerance
                     );
+
+                    // Second run, same sessions, different activations. The
+                    // EP now tells each kernel which of its inputs ORT holds
+                    // constant, and kernels use that to keep a prepacked
+                    // weight for the life of the session instead of rebuilding
+                    // it per call. Caching a weight is sound; caching anything
+                    // activation-derived is not, and the two are easy to
+                    // confuse in a kernel that only ever sees one input set.
+                    // Re-running the *same session* with rotated activations
+                    // separates them: a weight cache still matches ORT, a
+                    // stale activation cache returns the first answer.
+                    let rotated = with_rotated_activation(&case);
+                    let ours_second = run_generated_case(
+                        api,
+                        session,
+                        &rotated,
+                        &format!("Run({} rotated)", case.name),
+                    );
+                    let ort_second = run_generated_case(
+                        api,
+                        ort_session,
+                        &rotated,
+                        &format!("Run(ORT baseline {} rotated)", case.name),
+                    );
+                    // ORT is the oracle for whether this case can detect a
+                    // stale cache at all. A saturating u8 `QLinearMatMul`
+                    // output is unchanged by a one-element rotation for both
+                    // implementations, which makes the check vacuous *for that
+                    // case* rather than wrong; the suite-level counter below
+                    // is what keeps the sweep as a whole non-vacuous.
+                    let ort_moved = ort_second
+                        .iter()
+                        .zip(ort_out.iter())
+                        .any(|(a, b)| (a - b).abs() > case.tolerance);
+                    if ort_moved {
+                        sensitive += 1;
+                        assert!(
+                            ours_second
+                                .iter()
+                                .zip(ours_out.iter())
+                                .any(|(a, b)| (a - b).abs() > case.tolerance),
+                            "{}: ORT's result changed when the activation rotated and ours \
+                             did not — this EP returned a stale answer on the second run",
+                            case.name
+                        );
+                    }
+                    let mut worst_second = 0.0f32;
+                    let mut worst_second_at = 0usize;
+                    for (i, (a, b)) in ours_second.iter().zip(ort_second.iter()).enumerate() {
+                        let delta = (a - b).abs();
+                        if delta > worst_second {
+                            worst_second = delta;
+                            worst_second_at = i;
+                        }
+                    }
+                    assert!(
+                        worst_second <= case.tolerance,
+                        "{}: second run with new activations diverged from ORT — element \
+                         {worst_second_at} is {} against ORT's {} (delta {worst_second}, \
+                         tolerance {}). A per-session weight cache must not outlive the \
+                         activations it was used with",
+                        case.name,
+                        ours_second[worst_second_at],
+                        ort_second[worst_second_at],
+                        case.tolerance
+                    );
                     ((*api).ReleaseSession.unwrap())(ort_session);
                     ((*api).ReleaseSessionOptions.unwrap())(ort_opts);
                 }
@@ -5161,7 +5258,15 @@ fn no_matmul_family_node_escapes_to_the_ort_cpu_ep() {
             checked, 10,
             "every generated matmul case must have been run"
         );
-        eprintln!("\n✅ no_matmul_family_node_escapes_to_the_ort_cpu_ep: {checked} cases PASSED");
+        assert!(
+            sensitive >= 5,
+            "only {sensitive} of {checked} cases changed their result when the activation \
+             rotated, so the stale-cache half of this test is mostly vacuous"
+        );
+        eprintln!(
+            "\n✅ no_matmul_family_node_escapes_to_the_ort_cpu_ep: {checked} cases PASSED \
+             ({sensitive} of them activation-sensitive on the second run)"
+        );
     }
 }
 
@@ -5347,5 +5452,314 @@ opset_import: [{{ version: 17 }}, {{ domain: "com.microsoft" version: 1 }}]
         );
         eprintln!("  [nbits_float_zp] declined, still computed: {live} live outputs");
         conformance_teardown(api, env, opts, session, reg);
+    }
+}
+
+/// Weights must reach the kernels *labelled* as weights.
+///
+/// ORT gives a plugin EP a fused node whose initializers are inputs of that
+/// node and graph inputs of its subgraph, so at Compile time a 1 GB
+/// `MatMulNBits` `B` is shaped exactly like an activation. Every kernel that
+/// builds a prepack — `MatMulNBits`, `QLinearMatMul`, the f16 `MatMul` widening
+/// cache — decides whether that prepack may outlive the call from
+/// `Kernel::set_constant_inputs`, so getting this wrong silently converts a
+/// once-per-session cost into a per-token one, and in `MatMulNBits`'s case also
+/// selects a slower kernel (its MLAS SQNBit path is gated on the same flag).
+///
+/// No output comparison can see any of that, which is why the EP exports a
+/// counter and this test reads it from the very cdylib ORT loaded.
+///
+/// The cases are chosen to move the counter in opposite directions:
+/// symmetric `nbits4_decode` has two initializers (`B`, `scales`),
+/// asymmetric `nbits8_prefill` has three (`zero_points` as well), and
+/// `matmul_f32_decode` declares both operands as graph inputs so it must
+/// report nothing. A wiring that marks everything constant passes the first
+/// two assertions and fails the third — and would be a real bug, not merely a
+/// slower one, because a prepack of an activation must never outlive the call.
+#[test]
+fn constant_weights_are_reported_to_kernels_as_constant() {
+    let _lock = lock_ort_ep();
+    let ep_path = match find_ep_cdylib() {
+        Some(p) => p,
+        None => {
+            if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+                panic!("NXRT_REQUIRE_ORT_TESTS=1 but the EP cdylib is missing");
+            }
+            eprintln!("*** SKIPPED: EP cdylib not found ***");
+            return;
+        }
+    };
+    // Same absolute path ORT registers, so this is the same mapping and the
+    // same statics — not a second copy of the library.
+    let ep_lib = unsafe { libloading::Library::new(&ep_path) }.expect("dlopen EP cdylib");
+    let read: libloading::Symbol<'_, unsafe extern "C" fn() -> usize> =
+        unsafe { ep_lib.get(b"nxrt_ep_constant_weight_inputs") }
+            .expect("nxrt_ep_constant_weight_inputs not exported");
+    let reset: libloading::Symbol<'_, unsafe extern "C" fn()> =
+        unsafe { ep_lib.get(b"nxrt_ep_reset_constant_weight_inputs") }
+            .expect("nxrt_ep_reset_constant_weight_inputs not exported");
+
+    for (name, expected) in [
+        ("nbits4_decode", 2usize),
+        ("nbits8_prefill", 3usize),
+        ("matmul_f32_decode", 0usize),
+    ] {
+        let case = matmul_family_cases()
+            .into_iter()
+            .find(|c| c.name == name)
+            .expect("case present");
+        let path = write_generated_model(case.name, &case.model);
+        let reg = format!("cpu_ep_constflags_{}", case.name);
+        unsafe { reset() };
+        let Some((_lib, api, env, opts, session)) =
+            (unsafe { conformance_setup(&reg, &path, true) })
+        else {
+            eprintln!("*** SKIPPED: {name} — ORT not found ***");
+            return;
+        };
+        let observed = unsafe { read() };
+        assert_eq!(
+            observed, expected,
+            "{name}: this EP reported {observed} constant inputs, expected {expected}"
+        );
+        unsafe { conformance_teardown(api, env, opts, session, &reg) };
+        eprintln!("  [{name}] {observed} constant inputs reported");
+    }
+}
+
+// ─── Plugin-path A/B benchmark ────────────────────────────────────────────────
+
+/// Time `iters` `Run` calls over pre-created input tensors, returning
+/// per-iteration milliseconds.
+///
+/// Input `OrtValue`s are built once and reused so the measurement is the
+/// kernel plus ORT's per-run overhead, not the harness copying weights.
+///
+/// # Safety
+/// `api`, `session` and every pointer in `values` must be valid.
+unsafe fn bench_runs(
+    api: *const ort::OrtApi,
+    session: *mut ort::OrtSession,
+    input_name_ptrs: &[*const std::os::raw::c_char],
+    values: &[*const ort::OrtValue],
+    output_name_ptrs: &[*const std::os::raw::c_char],
+    iters: usize,
+) -> Vec<f64> {
+    let mut out = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+        let start = std::time::Instant::now();
+        unsafe {
+            let status = ((*api).Run.unwrap())(
+                session,
+                ptr::null(),
+                input_name_ptrs.as_ptr(),
+                values.as_ptr(),
+                values.len(),
+                output_name_ptrs.as_ptr(),
+                1,
+                &mut output,
+            );
+            check_status(api, status, "bench Run");
+            out.push(start.elapsed().as_secs_f64() * 1e3);
+            ((*api).ReleaseValue.unwrap())(output);
+        }
+    }
+    out
+}
+
+fn percentile(samples: &mut [f64], p: f64) -> f64 {
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let idx = ((samples.len() - 1) as f64 * p).round() as usize;
+    samples[idx]
+}
+
+/// Shapes worth measuring on the plugin path, at sizes a real decode/prefill
+/// step reaches rather than the smallest size that proves correctness.
+fn matmul_bench_cases() -> Vec<MatmulFamilyCase> {
+    vec![
+        dense_case(
+            "bench_matmul_f32_m1",
+            "MatMul",
+            ELEM_F32,
+            1,
+            2048,
+            2048,
+            1e-3,
+        ),
+        dense_case(
+            "bench_matmul_f32_m128",
+            "MatMul",
+            ELEM_F32,
+            128,
+            2048,
+            2048,
+            1e-3,
+        ),
+        dense_case(
+            "bench_matmul_f16_m1",
+            "MatMul",
+            ELEM_F16,
+            1,
+            2048,
+            2048,
+            5e-2,
+        ),
+        dense_case(
+            "bench_matmul_f16_m128",
+            "MatMul",
+            ELEM_F16,
+            128,
+            2048,
+            2048,
+            5e-2,
+        ),
+        nbits_case("bench_nbits4_m1", 1, 2048, 2048, 4, 32, ELEM_F32, true),
+        nbits_case("bench_nbits4_m128", 128, 2048, 2048, 4, 32, ELEM_F32, true),
+        nbits_case("bench_nbits4_f16_m1", 1, 2048, 2048, 4, 32, ELEM_F16, true),
+        nbits_case("bench_nbits8_m1", 1, 2048, 2048, 8, 32, ELEM_F32, true),
+        nbits_case("bench_nbits8_m256", 256, 2048, 2048, 8, 32, ELEM_F32, true),
+        qlinear_case("bench_qlinear_u8_m1", 1, 2048, 2048, false),
+        qlinear_case("bench_qlinear_u8_m128", 128, 2048, 2048, false),
+        qlinear_case("bench_qlinear_i8_m1", 1, 2048, 2048, true),
+    ]
+}
+
+/// Interleaved A/B of this EP against plain ORT **through the ORT session
+/// API**, which is the only path a real model takes.
+///
+/// Every previously published matmul ratio came from `bench_generic`, which
+/// drives the kernels natively. Those numbers stay valid as kernel-level
+/// measurements, but until the claim fixes landed the plugin path never
+/// reached the quantized kernels at all, so this is the first honest
+/// session-level comparison for `MatMulNBits` and `QLinearMatMul`.
+///
+/// Off by default: it takes minutes and this host is shared. Run with
+/// `NXRT_MM_BENCH=1 cargo test -p onnx-runtime-ep-cpu-plugin --release
+/// --test plugin_ort_e2e plugin_path_ab -- --nocapture --ignored`.
+#[test]
+#[ignore = "benchmark, not a correctness test"]
+fn plugin_path_ab_vs_plain_ort() {
+    if std::env::var("NXRT_MM_BENCH").as_deref() != Ok("1") {
+        eprintln!("set NXRT_MM_BENCH=1 to run the plugin-path A/B");
+        return;
+    }
+    let iters: usize = std::env::var("NXRT_MM_BENCH_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(31);
+    let filter = std::env::var("NXRT_MM_BENCH_CASE").unwrap_or_default();
+    let _lock = lock_ort_ep();
+    println!(
+        "case,ours_p50_ms,ort_p50_ms,ratio_p50,ours_p90_ms,ort_p90_ms,ratio_p90,cold_ours_ms,cold_ort_ms"
+    );
+    for case in matmul_bench_cases() {
+        if !filter.is_empty() && !case.name.contains(&filter) {
+            continue;
+        }
+        let path = write_generated_model(case.name, &case.model);
+        let reg = format!("cpu_ep_bench_{}", case.name);
+        let cold_ours = std::time::Instant::now();
+        let Some((_lib, api, env, opts, session)) =
+            (unsafe { conformance_setup(&reg, &path, true) })
+        else {
+            eprintln!(
+                "*** SKIPPED: {} — ORT or EP cdylib not found ***",
+                case.name
+            );
+            return;
+        };
+        let cold_ours = cold_ours.elapsed().as_secs_f64() * 1e3;
+
+        unsafe {
+            let info = query_ep_assignment(api, session);
+            assert!(
+                info.ops_on_our_ep().contains(&case.op),
+                "{}: not assigned to this EP, refusing to report a ratio",
+                case.name
+            );
+
+            let cold_ort = std::time::Instant::now();
+            let (ort_opts, ort_session) = match try_plain_ort_session(api, env, &path) {
+                Ok(pair) => pair,
+                Err(msg) => {
+                    eprintln!("{}: ORT cannot build this model ({msg})", case.name);
+                    conformance_teardown(api, env, opts, session, &reg);
+                    continue;
+                }
+            };
+            let cold_ort = cold_ort.elapsed().as_secs_f64() * 1e3;
+
+            let mut buffers: Vec<Vec<u8>> = case.inputs.iter().map(|i| i.data.clone()).collect();
+            let mut values: Vec<*const ort::OrtValue> = Vec::with_capacity(buffers.len());
+            for (input, buffer) in case.inputs.iter().zip(buffers.iter_mut()) {
+                values.push(make_raw_tensor(api, buffer, &input.dims, input.elem) as *const _);
+            }
+            let input_names: Vec<CString> = case
+                .inputs
+                .iter()
+                .map(|i| CString::new(i.name).unwrap())
+                .collect();
+            let input_name_ptrs: Vec<*const std::os::raw::c_char> =
+                input_names.iter().map(|c| c.as_ptr()).collect();
+            let output_name = CString::new(case.output).unwrap();
+            let output_name_ptrs = [output_name.as_ptr()];
+
+            // Warm both sides: first run pays prepack and page faults.
+            bench_runs(
+                api,
+                session,
+                &input_name_ptrs,
+                &values,
+                &output_name_ptrs,
+                3,
+            );
+            bench_runs(
+                api,
+                ort_session,
+                &input_name_ptrs,
+                &values,
+                &output_name_ptrs,
+                3,
+            );
+
+            // Interleave one iteration each so a drifting host load lands on
+            // both sides rather than on whichever ran second.
+            let mut ours = Vec::with_capacity(iters);
+            let mut theirs = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                ours.extend(bench_runs(
+                    api,
+                    session,
+                    &input_name_ptrs,
+                    &values,
+                    &output_name_ptrs,
+                    1,
+                ));
+                theirs.extend(bench_runs(
+                    api,
+                    ort_session,
+                    &input_name_ptrs,
+                    &values,
+                    &output_name_ptrs,
+                    1,
+                ));
+            }
+            let (o50, o90) = (percentile(&mut ours, 0.5), percentile(&mut ours, 0.9));
+            let (t50, t90) = (percentile(&mut theirs, 0.5), percentile(&mut theirs, 0.9));
+            println!(
+                "{},{o50:.4},{t50:.4},{:.3},{o90:.4},{t90:.4},{:.3},{cold_ours:.1},{cold_ort:.1}",
+                case.name,
+                o50 / t50,
+                o90 / t90,
+            );
+
+            for value in values {
+                ((*api).ReleaseValue.unwrap())(value as *mut _);
+            }
+            ((*api).ReleaseSession.unwrap())(ort_session);
+            ((*api).ReleaseSessionOptions.unwrap())(ort_opts);
+            conformance_teardown(api, env, opts, session, &reg);
+        }
     }
 }

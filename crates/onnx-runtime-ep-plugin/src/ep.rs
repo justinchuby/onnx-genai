@@ -72,6 +72,27 @@ pub fn reset_compiled_node_count() {
     COMPILED_NODE_COUNT.store(0, Ordering::Relaxed);
 }
 
+/// Global counter of node inputs this EP told a kernel to treat as
+/// session-lifetime constants (see [`constant_input_flags`]).
+///
+/// A weight that is not reported constant is not a correctness bug, which is
+/// exactly why it needs a counter: the kernel still computes the right answer,
+/// it just rebuilds its prepack on every `Run` — and `MatMulNBits` also drops
+/// to a slower kernel, because its MLAS SQNBit path is gated on the same flag.
+/// Nothing in an output comparison can see that, so the wiring is observed
+/// here instead.
+static CONSTANT_WEIGHT_INPUTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of node inputs reported to kernels as constant since process start.
+pub fn constant_weight_inputs() -> usize {
+    CONSTANT_WEIGHT_INPUTS.load(Ordering::Relaxed)
+}
+
+/// Resets the constant-weight-input counter to zero.
+pub fn reset_constant_weight_inputs() {
+    CONSTANT_WEIGHT_INPUTS.store(0, Ordering::Relaxed);
+}
+
 use crate::compute::ExportedComputeInfo;
 use crate::graph_reader::OutboundGraphReader;
 use crate::status::{fail_status, invalid_arg_status, ok_status};
@@ -766,7 +787,21 @@ fn ep_compile_inner(
             let opset = ir_graph.effective_opset(node).unwrap_or(0);
 
             match exported.ep.with(|ep| ep.get_kernel(node, &shapes, opset)) {
-                Ok(kernel) => {
+                Ok(mut kernel) => {
+                    // Tell the kernel which of its inputs are session-lifetime
+                    // constants. Without this every kernel sees all inputs as
+                    // runtime tensors and re-does its one-time weight work on
+                    // every `Run`: `MatMulNBits` repacks (or, worse, declines
+                    // the MLAS SQNBit path, which is gated on the same flag)
+                    // and `QLinearMatMul` re-packs B, turning a load-time cost
+                    // into a per-token cost.
+                    let constant_inputs =
+                        constant_input_flags(&view, node_idx, reader.initializer_names());
+                    CONSTANT_WEIGHT_INPUTS.fetch_add(
+                        constant_inputs.iter().filter(|c| **c).count(),
+                        Ordering::Relaxed,
+                    );
+                    kernel.set_constant_inputs(&constant_inputs);
                     let num_inputs = view.node_inputs(node_idx).len();
                     let num_outputs = view.node_outputs(node_idx).len();
 
@@ -915,6 +950,45 @@ fn ep_compile_inner(
     }
 
     ok_status()
+}
+
+/// Which inputs of `node` are session-lifetime constants.
+///
+/// A node input that ORT lists as an *initializer* is a weight: ORT owns the
+/// buffer, materializes it once at session creation and cannot change it
+/// between `Run` calls. That is exactly the contract
+/// [`onnx_runtime_ep_api::kernel::Kernel::set_constant_inputs`] expresses, and
+/// several kernels use it to decide whether a prepack may be built once and
+/// kept in the kernel instance (which lives as long as the session) instead of
+/// rebuilt on every call. `MatMulNBits` goes further and gates its MLAS SQNBit
+/// path on the same flag, so leaving it false does not merely repeat work — it
+/// selects a different, slower kernel.
+///
+/// The producer/`is_graph_input` test used elsewhere in this file cannot be
+/// reused here. It is correct for the whole-model graph at capability time,
+/// but ORT hands a *fused node's* subgraph over with the initializers it kept
+/// inside listed as graph inputs of that subgraph, so at Compile time every
+/// weight looks like an activation. `Graph_GetInitializers` still distinguishes
+/// them, which is why the flags are keyed by name against that set.
+///
+/// Absent optional inputs and unnamed values are never constant: there is
+/// nothing to cache and nothing to key a cache on.
+fn constant_input_flags(
+    view: &onnx_runtime_ir::GraphView<'_>,
+    node: NodeIndex,
+    initializer_names: &std::collections::HashSet<String>,
+) -> Vec<bool> {
+    view.node_inputs(node)
+        .iter()
+        .map(|input| {
+            input.is_some_and(|value| {
+                view.value(value)
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| initializer_names.contains(name))
+            })
+        })
+        .collect()
 }
 
 /// Whether every present input of `node` can be routed by the fused-subgraph
@@ -2072,6 +2146,79 @@ mod tests {
         assert!(
             super::node_inputs_all_routable(&view, add),
             "a node consuming only a graph input and a produced value is routable"
+        );
+    }
+
+    /// Constant-input flags must come from ORT's initializer list, not from
+    /// the producer/`is_graph_input` shape of the graph.
+    ///
+    /// This is the exact shape ORT hands a fused node's subgraph over in:
+    /// the weight has no producer *and* is listed as a graph input of the
+    /// subgraph, because it is an input of the fused node. Deriving the flag
+    /// the way `node_inputs_all_routable` derives routability marks every
+    /// weight non-constant, which costs `MatMulNBits` its prepack — and, since
+    /// its MLAS SQNBit path is gated on the same flag, its fast kernel too.
+    #[test]
+    fn initializers_are_constant_even_when_the_subgraph_calls_them_inputs() {
+        use onnx_runtime_ir::{Graph, GraphView, GraphViewCache, Node, NodeId, Shape};
+        let mut g = Graph::new();
+        let a = g.create_named_value("a", DataType::Float32, Shape::default());
+        let w = g.create_named_value("w", DataType::Uint8, Shape::default());
+        let scales = g.create_named_value("scales", DataType::Float32, Shape::default());
+        let y = g.create_named_value("y", DataType::Float32, Shape::default());
+        // Every input of the fused node is a graph input of the subgraph ORT
+        // hands over, weights included.
+        g.add_input(a);
+        g.add_input(w);
+        g.add_input(scales);
+        g.add_output(y);
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMulNBits",
+            vec![Some(a), Some(w), Some(scales), None],
+            vec![y],
+        ));
+
+        let cache = GraphViewCache::build(&g).unwrap();
+        let view = GraphView::new(&g, &cache);
+        let node = view.nodes().next().expect("one node");
+        let initializers: std::collections::HashSet<String> =
+            ["w".to_owned(), "scales".to_owned()].into_iter().collect();
+
+        assert_eq!(
+            super::constant_input_flags(&view, node, &initializers),
+            vec![false, true, true, false],
+            "weights are constant, the activation is not, and an absent optional \
+             input is not"
+        );
+    }
+
+    /// With no initializers, nothing is constant — including values that have
+    /// no producer. A subgraph whose weights ORT kept outside it must not have
+    /// its activations cached as if they were weights.
+    #[test]
+    fn nothing_is_constant_without_an_initializer_list() {
+        use onnx_runtime_ir::{Graph, GraphView, GraphViewCache, Node, NodeId, Shape};
+        let mut g = Graph::new();
+        let a = g.create_named_value("a", DataType::Float32, Shape::default());
+        let b = g.create_named_value("b", DataType::Float32, Shape::default());
+        let y = g.create_named_value("y", DataType::Float32, Shape::default());
+        g.add_input(a);
+        g.add_output(y);
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(a), Some(b)],
+            vec![y],
+        ));
+
+        let cache = GraphViewCache::build(&g).unwrap();
+        let view = GraphView::new(&g, &cache);
+        let node = view.nodes().next().expect("one node");
+        assert_eq!(
+            super::constant_input_flags(&view, node, &std::collections::HashSet::new()),
+            vec![false, false],
+            "a producerless value is only constant when ORT says it is an initializer"
         );
     }
 
