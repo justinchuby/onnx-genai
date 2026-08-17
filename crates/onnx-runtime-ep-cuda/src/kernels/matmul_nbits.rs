@@ -307,6 +307,15 @@ const GATE_UP_SWIGLU_RMSNORM_VEC_OCC_ENTRY: &str =
     "matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_vec_occ";
 const GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_VEC_OCC_ENTRY: &str =
     "matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_vec_occ";
+/// cp.async double-buffered (`ONNX_GENAI_GATEUP_CPASYNC`) siblings of the two
+/// SYMMETRIC RMS-norm-fused `_vec_occ` entries. Same body, launch bounds and
+/// accumulate order; the int4 weight stream is staged global->shared via
+/// `cp.async` one K-tile ahead to hide the Long-Scoreboard global-load latency.
+/// Byte-identical to `_vec_occ` (the staged bytes equal the direct-load words).
+const GATE_UP_SWIGLU_RMSNORM_VEC_OCC_CPASYNC_ENTRY: &str =
+    "matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_vec_occ_cpasync";
+const GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_VEC_OCC_CPASYNC_ENTRY: &str =
+    "matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_vec_occ_cpasync";
 const GATE_UP_SWIGLU_THREADS: u32 = 256;
 
 const DEQUANT_SRC: &str = r#"
@@ -4232,6 +4241,37 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_vec(
 {
     matmul_nbits_gemv_f16_gate_up_swiglu_tpl<false, true, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, output, k, n, k_blocks, blob_size, zp_row_bytes);
 }
+// --- cp.async helpers (`ONNX_GENAI_GATEUP_CPASYNC`). --------------------------
+// Hopper (sm_80+) asynchronous global->shared copy used to software-pipeline the
+// int4 weight stream in the symmetric gate/up decode GEMV. The dominant kernel
+// is Long-Scoreboard bound (~12.7 cycles/issue, ~52% of stall) waiting on the
+// per-lane 4-byte packed weight LDG; DRAM is only ~33% utilised, so the loads
+// are latency-exposed, not bandwidth-bound. `cp.async` issues the NEXT K-tile's
+// weight copy into a double-buffered shared slot while the current tile is
+// dequantised+accumulated, hiding the global-load latency behind compute WITHOUT
+// spending registers on in-flight data (unlike the register shift-register
+// prefetch, which raised registers and erased the win on this path). The copied
+// bytes are the exact same 32-bit words the direct load would have read, so the
+// dequant inputs — and therefore the fp16 accumulate order and the output — are
+// BYTE-IDENTICAL to the non-pipelined loop by construction.
+__device__ __forceinline__ void cp_async_ca_4(void* smem_dst, const void* gmem_src) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const unsigned int dst = (unsigned int)__cvta_generic_to_shared(smem_dst);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(dst), "l"(gmem_src));
+#endif
+}
+__device__ __forceinline__ void cp_async_commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+template <int N>
+__device__ __forceinline__ void cp_async_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+#endif
+}
+
 // This is `matmul_nbits_gemv_f16_gate_up_swiglu` preceded by the exact prologue
 // of `matmul_nbits_gemv_f16_scales_f16_rmsnorm`: the block reduces the shared
 // activation (the residual sum the preceding GEMV epilogue already produced)
@@ -4242,7 +4282,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_vec(
 // `SkipSimplifiedLayerNormalization` through the paired kernel. Every arithmetic
 // step mirrors the standalone norm followed by the two-op gate/up SwiGLU, so
 // greedy tokens stay bit-for-bit identical.
-template <bool HasZp, bool Decomposed, bool FusedSym = false>
+template <bool HasZp, bool Decomposed, bool FusedSym = false, bool CpAsync = false>
 __device__ __forceinline__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed_gate,
@@ -4375,6 +4415,68 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl
                 scale_gate_ptr += 8;
                 scale_up_ptr += 8;
             }
+        } else if constexpr (CpAsync) {
+            // Symmetric cp.async multi-stage-pipelined weight stream (CpAsync is
+            // only instantiated with FusedSym && !HasZp). The int4 gate/up words
+            // for the next `STAGES-1` K-tiles are asynchronously copied
+            // global->shared while the current tile is dequantised+accumulated, to
+            // hide the Long-Scoreboard global-load latency behind compute.
+            // cp.async parks the in-flight bytes in shared memory (not registers),
+            // so — unlike the register shift-register prefetch that spilled this
+            // path — occupancy is unchanged. The staged words are the exact 32-bit
+            // values the direct load would read, and the dequant/accumulate is the
+            // identical `_sym8` path, so the result is BYTE-IDENTICAL to the
+            // `_vec_occ` loop. Indexed by `tid` (0..255, launch_bounds(256,8)
+            // guarantees the block width), each thread copies and reads back only
+            // its own word.
+            constexpr int STAGES = 3;
+            __shared__ unsigned int gate_stage[STAGES][256];
+            __shared__ unsigned int up_stage[STAGES][256];
+            const unsigned char* load_gate = packed_gate_ptr;
+            const unsigned char* load_up = packed_up_ptr;
+            int load_depth = 0;
+            // Prime the pipeline with `STAGES-1` in-flight tiles.
+            for (int s = 0; s < STAGES - 1; ++s) {
+                if (load_depth + lane_depth + 8 <= k) {
+                    cp_async_ca_4(&gate_stage[s][tid], load_gate);
+                    cp_async_ca_4(&up_stage[s][tid], load_up);
+                }
+                cp_async_commit();
+                load_gate += 128;
+                load_up += 128;
+                load_depth += 256;
+            }
+            int rd = 0;
+            int wr = STAGES - 1;
+            for (; depth_base + lane_depth + 8 <= k; depth_base += 256) {
+                if (load_depth + lane_depth + 8 <= k) {
+                    cp_async_ca_4(&gate_stage[wr][tid], load_gate);
+                    cp_async_ca_4(&up_stage[wr][tid], load_up);
+                }
+                cp_async_commit();
+                load_gate += 128;
+                load_up += 128;
+                load_depth += 256;
+                // Leave `STAGES-1` groups in flight; the tile at `rd` has landed.
+                cp_async_wait<STAGES - 1>();
+                const uint4 permuted = permute_activation_f16x8(activation_ptr);
+                const unsigned int gate_word = gate_stage[rd][tid];
+                const unsigned int up_word = up_stage[rd][tid];
+                accumulate_int4x8_f16_permuted_sym8(
+                    gate_word, permuted, *scale_gate_ptr, g0, g1, g2, g3);
+                accumulate_int4x8_f16_permuted_sym8(
+                    up_word, permuted, *scale_up_ptr, u0, u1, u2, u3);
+                activation_ptr += 256;
+                packed_gate_ptr += 128;
+                packed_up_ptr += 128;
+                scale_gate_ptr += 8;
+                scale_up_ptr += 8;
+                rd += 1;
+                if (rd == STAGES) rd = 0;
+                wr += 1;
+                if (wr == STAGES) wr = 0;
+            }
+            cp_async_wait<0>();
         } else {
             for (; depth_base + lane_depth + 8 <= k; depth_base += 256) {
                 const uint4 permuted = permute_activation_f16x8(activation_ptr);
@@ -4612,6 +4714,57 @@ matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_vec_occ(
     const float epsilon)
 {
     matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<false, true, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
+}
+
+// cp.async double-buffered (`ONNX_GENAI_GATEUP_CPASYNC`) siblings of the two
+// SYMMETRIC RMS-norm-fused `_vec_occ` entries. Identical math, launch bounds and
+// accumulate order — the ONLY difference is the int4 weight stream is staged
+// global->shared via `cp.async` one K-tile ahead (see the `CpAsync` branch in
+// the template) to hide the Long-Scoreboard global-load latency behind compute.
+// The staged bytes equal the direct-load words, so it is BYTE-IDENTICAL to
+// `_vec_occ`. Symmetric only; the asymmetric `_zp` entries are untouched.
+extern "C" __global__ void __launch_bounds__(256, 8)
+matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_vec_occ_cpasync(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed_gate,
+    const __half* __restrict__ scales_gate,
+    const unsigned char* __restrict__ packed_up,
+    const __half* __restrict__ scales_up,
+    const unsigned char* __restrict__ zero_points_gate,
+    const unsigned char* __restrict__ zero_points_up,
+    const void* __restrict__ gamma,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int gamma_is_half,
+    const float epsilon)
+{
+    matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<false, false, true, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 8)
+matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_vec_occ_cpasync(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed_gate,
+    const __half* __restrict__ scales_gate,
+    const unsigned char* __restrict__ packed_up,
+    const __half* __restrict__ scales_up,
+    const unsigned char* __restrict__ zero_points_gate,
+    const unsigned char* __restrict__ zero_points_up,
+    const void* __restrict__ gamma,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int gamma_is_half,
+    const float epsilon)
+{
+    matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<false, true, true, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
 }
 
 extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_zp(
@@ -5954,6 +6107,31 @@ fn gate_up_occ_enabled() -> bool {
     !matches!(
         std::env::var("ONNX_GENAI_GATEUP_OCC").ok().as_deref(),
         Some("0") | Some("false") | Some("off")
+    )
+}
+
+/// Whether the SYMMETRIC RMS-norm-fused gate/up SwiGLU decode GEMV takes the
+/// cp.async multi-stage-pipelined `_vec_occ_cpasync` entry, which stages the
+/// int4 weight stream global->shared ahead of use to try to hide the
+/// Long-Scoreboard global-load latency (isolated ncu shows that stall is ~52% of
+/// warp cycles; DRAM is only ~33% utilised → latency-bound, not bandwidth-bound).
+///
+/// MEASURED NO-GO (kept default-OFF, preserved for reference only): on
+/// qwen2.5-14b the cp.async variant is ~2.3x SLOWER (isolated kernel 53 -> 120us)
+/// with DRAM util HALVED (33% -> 15%) and Long-Scoreboard RISING (12.7 -> 16.7
+/// cyc), for both 2- and 3-stage pipelines. For a once-used int4 weight stream
+/// with tiny per-tile compute, cp.async adds a global->shared->register
+/// round-trip plus extra issue (commit/wait/LDS) on an already issue-sensitive,
+/// 82%-occupancy kernel; the async copy has too little compute to overlap, and
+/// the #1139 occupancy win already saturates TLP-based latency hiding. It stays
+/// BYTE-IDENTICAL to `_vec_occ` (the staged bytes equal the direct-load words),
+/// so the flag is harmless, but it is NOT a win. Requires the occupancy path, so
+/// it only engages when `gate_up_occ_enabled()` is also on. Opt-in A/B via
+/// `ONNX_GENAI_GATEUP_CPASYNC=1` (or `true`/`on`).
+fn gate_up_cpasync_enabled() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_GATEUP_CPASYNC").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
     )
 }
 
@@ -8378,6 +8556,21 @@ impl MatMulNBitsKernel {
             (false, false, true, _) => GATE_UP_SWIGLU_RMSNORM_VEC_OCC_ENTRY,
             (false, false, false, true) => GATE_UP_SWIGLU_RMSNORM_VEC_ENTRY,
             (false, false, false, false) => GATE_UP_SWIGLU_RMSNORM_ENTRY,
+        };
+        // `ONNX_GENAI_GATEUP_CPASYNC` (default-OFF, opt-in A/B) reroutes the two
+        // SYMMETRIC `_vec_occ` entries to their cp.async double-buffered sibling,
+        // which stages the int4 weight stream global->shared one K-tile ahead to
+        // hide the Long-Scoreboard global-load latency. It requires the occupancy
+        // path (symmetric fold), so it only overrides when `_vec_occ` was chosen.
+        // Byte-identical to `_vec_occ`.
+        let entry = if occ && gate_up_cpasync_enabled() {
+            if self.decomposed_silu {
+                GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_VEC_OCC_CPASYNC_ENTRY
+            } else {
+                GATE_UP_SWIGLU_RMSNORM_VEC_OCC_CPASYNC_ENTRY
+            }
+        } else {
+            entry
         };
         let function = self
             .runtime
@@ -14580,7 +14773,10 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// `__launch_bounds__(256, 8)`) is bit-identical to the scalar reference for
     /// the symmetric RMS-norm-fused kernels it applies to (it is a no-op for the
     /// non-RMS launch) — `__launch_bounds__` only constrains register
-    /// allocation, so the math is unchanged.
+    /// allocation, so the math is unchanged. Also asserts the cp.async double-
+    /// buffered `_vec_occ_cpasync` path (`ONNX_GENAI_GATEUP_CPASYNC`) is bit-
+    /// identical — staging the int4 weight stream global->shared feeds the exact
+    /// same dequant words, so the fp16 accumulate is unchanged.
     #[test]
     fn gate_up_swiglu_vec_is_bit_identical_to_scalar() {
         let Some(runtime) = runtime() else {
@@ -14760,7 +14956,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
                         };
 
-                        let run_once = |vec_on: bool, occ_on: bool| -> Vec<u16> {
+                        let run_once = |vec_on: bool, occ_on: bool, cpasync_on: bool| -> Vec<u16> {
                             let out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
                             let lock = INTERLEAVE_TEST_ENV_LOCK.get_or_init(|| Mutex::new(()));
                             let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -14774,6 +14970,10 @@ extern "C" __global__ void ref_silu_mul_f16(
                                 std::env::set_var(
                                     "ONNX_GENAI_GATEUP_OCC",
                                     if occ_on { "1" } else { "0" },
+                                );
+                                std::env::set_var(
+                                    "ONNX_GENAI_GATEUP_CPASYNC",
+                                    if cpasync_on { "1" } else { "0" },
                                 );
                             }
                             let out = TensorMut::new(
@@ -14812,6 +15012,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                             unsafe {
                                 std::env::remove_var("ONNX_GENAI_GATEUP_VEC");
                                 std::env::remove_var("ONNX_GENAI_GATEUP_OCC");
+                                std::env::remove_var("ONNX_GENAI_GATEUP_CPASYNC");
                             }
                             drop(_guard);
 
@@ -14824,15 +15025,22 @@ extern "C" __global__ void ref_silu_mul_f16(
                             host.iter().map(|v| v.to_bits()).collect()
                         };
 
-                        let reference = run_once(false, false);
-                        let fused = run_once(true, false);
+                        let reference = run_once(false, false, false);
+                        let fused = run_once(true, false, false);
                         // Occupancy-raised `_vec_occ` path. The `_vec_occ` entries
                         // exist ONLY for the two symmetric RMS-norm-fused kernels,
                         // so this actually exercises `_vec_occ` when rmsnorm==true;
                         // for the non-rmsnorm launch `ONNX_GENAI_GATEUP_OCC` is a
                         // no-op and this simply re-checks the `_vec` path. Either
                         // way the result must stay bit-identical to the reference.
-                        let occ = run_once(true, true);
+                        let occ = run_once(true, true, false);
+                        // cp.async double-buffered `_vec_occ_cpasync` path. Like
+                        // `_vec_occ` it only engages for the symmetric RMS-norm-
+                        // fused kernels (requires occ); for the non-rmsnorm launch
+                        // the flag is a no-op and this re-checks the `_vec` path.
+                        // Staging the weight stream global->shared must not change
+                        // any dequant input, so it stays bit-identical.
+                        let cpasync = run_once(true, true, true);
 
                         // SAFETY: gamma buffer no longer referenced.
                         unsafe {
@@ -14862,6 +15070,18 @@ extern "C" __global__ void ref_silu_mul_f16(
                                 index / n,
                                 index % n,
                                 occ[index],
+                                reference[index]
+                            );
+                            assert_eq!(
+                                cpasync[index],
+                                reference[index],
+                                "cp.async gate/up _vec_occ_cpasync diverged at M={m}, K={k}, \
+                                 N={n}, rmsnorm={rmsnorm}, decomposed={decomposed}, \
+                                 gamma_f32={gamma_is_f32}, row={}, column={}: cpasync=0x{:04x} \
+                                 scalar=0x{:04x}",
+                                index / n,
+                                index % n,
+                                cpasync[index],
                                 reference[index]
                             );
                         }
