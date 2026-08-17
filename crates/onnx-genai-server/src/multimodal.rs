@@ -364,9 +364,9 @@ pub struct PipelineSetup {
 /// Resolve the prompt tokenizer and multimodal input contracts for `model_dir`,
 /// or `None` when the package does not structurally declare a pipeline.
 ///
-/// This opens the pipeline's ONNX components to read their declared input
-/// dtypes and shapes, then releases them; callers load the execution engine
-/// separately.
+/// This reads the pipeline components' declared graph I/O without creating ORT
+/// sessions or materializing weights; callers load the execution engine
+/// separately with their selected backend.
 pub fn load(model_dir: &Path) -> anyhow::Result<Option<PipelineSetup>> {
     let Some(directory) =
         PipelineModelDirectory::load_if_declared(model_dir).with_context(|| {
@@ -380,7 +380,12 @@ pub fn load(model_dir: &Path) -> anyhow::Result<Option<PipelineSetup>> {
     else {
         return Ok(None);
     };
-    let models = PipelineModels::load(model_dir).map_err(|error| {
+    let models = PipelineModels::load_with_ort_session_filter(
+        model_dir,
+        onnx_genai_ort::SessionOptions::default(),
+        |_| false,
+    )
+    .map_err(|error| {
         anyhow::anyhow!(
             "What: the pipeline components at {} could not be inspected. \
              Why: {error}. \
@@ -576,10 +581,16 @@ fn build_audio(
     models: &PipelineModels,
 ) -> anyhow::Result<Option<AudioInputSpec>> {
     let audio_inputs = models
-        .sessions
-        .iter()
-        .flat_map(|(component, session)| {
-            session.inputs().iter().filter_map(move |input| {
+        .directory
+        .model_paths
+        .keys()
+        .filter_map(|component| {
+            models
+                .graph_io(component)
+                .map(|graph| (component.as_str(), graph))
+        })
+        .flat_map(|(component, graph)| {
+            graph.inputs().iter().filter_map(move |input| {
                 (input.name == "input_features")
                     .then_some((format!("{component}.{}", input.name), input))
             })
@@ -617,9 +628,9 @@ fn resolve_image_output<'a>(
     metadata_endpoint: &str,
 ) -> anyhow::Result<Option<(String, &'a TensorInfo)>> {
     if let Some((component, input_name)) = metadata_endpoint.split_once('.')
-        && let Some(session) = models.sessions.get(component)
+        && let Some(graph) = models.graph_io(component)
     {
-        return Ok(session
+        return Ok(graph
             .inputs()
             .iter()
             .find(|input| input.name == input_name)
@@ -627,10 +638,16 @@ fn resolve_image_output<'a>(
     }
 
     let matches = models
-        .sessions
-        .iter()
-        .flat_map(|(component, session)| {
-            session
+        .directory
+        .model_paths
+        .keys()
+        .filter_map(|component| {
+            models
+                .graph_io(component)
+                .map(|graph| (component.as_str(), graph))
+        })
+        .flat_map(|(component, graph)| {
+            graph
                 .inputs()
                 .iter()
                 .filter(move |input| input.name == metadata_endpoint)
