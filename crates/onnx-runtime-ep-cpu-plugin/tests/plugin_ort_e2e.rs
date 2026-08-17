@@ -783,6 +783,7 @@ unsafe fn conformance_setup(
     let mut session_options: *mut ort::OrtSessionOptions = ptr::null_mut();
     let status = unsafe { ((*api).CreateSessionOptions.unwrap())(&mut session_options) };
     unsafe { check_status(api, status, "CreateSessionOptions") };
+    unsafe { pin_intra_op_threads(api, session_options) };
 
     // Disable ORT's built-in CPU EP fallback — forces failure if our plugin EP
     // declines a node, proving the test is not vacuous.
@@ -4646,6 +4647,63 @@ unsafe fn run_generated_case(
     }
 }
 
+/// Thread budget for a benchmark run, from `NXRT_MM_BENCH_THREADS`.
+///
+/// A shared box cannot be measured honestly at full width: whichever side runs
+/// while another tenant is busy loses cores it would otherwise have had, and
+/// ORT's intra-op pool spins, so it loses more than we do. Pinning both sides
+/// to the same small thread count removes that variable -- the comparison stops
+/// depending on how many cores the rest of the machine happened to leave free.
+///
+/// `None` (unset) keeps ORT's own default. Our side reads its budget from
+/// `ONNX_GENAI_MLAS_THREADPOOL_THREADS`, which the caller must set to the same
+/// value; the two live in different processes under `NXRT_MM_BENCH_SIDE`.
+fn bench_thread_budget(raw: Option<&str>) -> Option<i32> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let threads: i32 = raw.parse().unwrap_or_else(|_| {
+        panic!("NXRT_MM_BENCH_THREADS must be a positive integer, got {raw:?}")
+    });
+    assert!(
+        threads > 0,
+        "NXRT_MM_BENCH_THREADS must be a positive integer, got {threads}"
+    );
+    Some(threads)
+}
+
+#[test]
+fn the_bench_thread_budget_reads_a_positive_count_and_ignores_an_unset_one() {
+    assert_eq!(bench_thread_budget(None), None);
+    assert_eq!(bench_thread_budget(Some("")), None);
+    assert_eq!(bench_thread_budget(Some("  ")), None);
+    assert_eq!(bench_thread_budget(Some(" 4 ")), Some(4));
+}
+
+#[test]
+#[should_panic(expected = "NXRT_MM_BENCH_THREADS must be a positive integer")]
+fn the_bench_thread_budget_rejects_zero_threads() {
+    bench_thread_budget(Some("0"));
+}
+
+#[test]
+#[should_panic(expected = "NXRT_MM_BENCH_THREADS must be a positive integer")]
+fn the_bench_thread_budget_rejects_a_word() {
+    bench_thread_budget(Some("all"));
+}
+
+/// Apply [`bench_thread_budget`] to a session-options handle.
+unsafe fn pin_intra_op_threads(api: *const ort::OrtApi, options: *mut ort::OrtSessionOptions) {
+    let raw = std::env::var("NXRT_MM_BENCH_THREADS").ok();
+    let Some(threads) = bench_thread_budget(raw.as_deref()) else {
+        return;
+    };
+    let set = unsafe { (*api).SetIntraOpNumThreads }.expect("SetIntraOpNumThreads");
+    let status = unsafe { set(options, threads) };
+    unsafe { check_status(api, status, "SetIntraOpNumThreads") };
+}
+
 /// Create a session with **no** execution provider appended, so ORT's own CPU
 /// EP owns the whole graph. Returns the ORT error message on failure instead of
 /// panicking, because one case exists precisely to prove ORT cannot load it.
@@ -4661,6 +4719,7 @@ unsafe fn try_plain_ort_session(
         let mut options: *mut ort::OrtSessionOptions = ptr::null_mut();
         let status = ((*api).CreateSessionOptions.unwrap())(&mut options);
         check_status(api, status, "CreateSessionOptions(plain ORT)");
+        pin_intra_op_threads(api, options);
         let mut session: *mut ort::OrtSession = ptr::null_mut();
         let status = ort_session::create_session(api, env, options, model_path, &mut session);
         if status.is_null() {
@@ -5589,6 +5648,15 @@ fn plugin_path_ab_vs_plain_ort() {
         _ => (true, true),
     };
     let _lock = lock_ort_ep();
+    // Self-describing output: a CSV row is worthless six weeks later if the
+    // thread budget it was measured under is not next to it.
+    println!(
+        "# side={} intra_op_threads={} ours_pool_threads={}",
+        if side.is_empty() { "both" } else { &side },
+        std::env::var("NXRT_MM_BENCH_THREADS").unwrap_or_else(|_| "ort-default".to_owned()),
+        std::env::var("ONNX_GENAI_MLAS_THREADPOOL_THREADS")
+            .unwrap_or_else(|_| "ep-default".to_owned()),
+    );
     println!(
         "case,ours_p50_ms,ort_p50_ms,ratio_p50,ours_p90_ms,ort_p90_ms,ratio_p90,cold_ours_ms,cold_ort_ms"
     );
