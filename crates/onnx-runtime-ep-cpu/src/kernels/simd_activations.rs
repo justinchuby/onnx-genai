@@ -410,6 +410,60 @@ impl HostChunks {
     }
 }
 
+/// Runs `body` on the host runtime's pool if this session has one worth using.
+///
+/// Returns whether `body` was run at all; a `false` return leaves `output`
+/// untouched and the caller free to pick another split.
+///
+/// `#[inline(never)]` on purpose. Everything here is cold -- the decision is a
+/// relaxed load, and the split it guards only happens inside an ORT session
+/// whose pool has been proven parallel -- while `run_chunked`'s callers are the
+/// hottest elementwise kernels in the crate. Inlining it grew `run_chunked`
+/// enough to repartition codegen units: at `intra_op = 1` it cost `Relu` 34% at
+/// 1 Mi (236 -> 315 us) with no path change at all, the same failure mode as
+/// the instantiation note on `clip_chunked`.
+#[inline(never)]
+fn try_host<F>(input: &[f32], output: &mut [f32], body: &F) -> bool
+where
+    F: Fn(&[f32], &mut [f32]) + Sync + Send,
+{
+    let Some(host) = onnx_runtime_ep_api::host_parallel::current() else {
+        return false;
+    };
+    if !host.prefer_host() {
+        return false;
+    }
+    match host_chunk_len(input.len()) {
+        Some((chunk, count)) => {
+            note_parallel_dispatch();
+            run_on_host(host, input, output, chunk, count, body);
+        }
+        // Too short to split across the host's threads. Our own pool is not
+        // the answer either: it would be a second pool on the same cores.
+        None => body(input, output),
+    }
+    true
+}
+
+/// [`try_host`] for the row-shaped split. Outlined for the same reason.
+#[inline(never)]
+fn try_host_rows<F>(input: &[f32], output: &mut [f32], width: usize, body: &F) -> bool
+where
+    F: Fn(&[f32], &mut [f32]) + Sync + Send,
+{
+    let Some(host) = onnx_runtime_ep_api::host_parallel::current() else {
+        return false;
+    };
+    if !host.prefer_host() {
+        return false;
+    }
+    match host_chunk_len_rows(input.len(), width) {
+        Some((chunk, count)) => run_on_host(host, input, output, chunk, count, body),
+        None => body(input, output),
+    }
+    true
+}
+
 /// Splits `input`/`output` into `count` chunks of `chunk` and runs `body` on
 /// each one on the host runtime's pool.
 ///
@@ -502,16 +556,7 @@ where
     // right tool: at `intra_op = 1`, rayon beat borrowing ORT's single thread
     // by 2-9x over 1-4 Mi. `prefer_host` decides which of the two a session is
     // by watching whether the host's pool ever actually runs our chunks.
-    if let Some(host) = onnx_runtime_ep_api::host_parallel::current()
-        && host.prefer_host()
-    {
-        match host_chunk_len(len) {
-            Some((chunk, count)) => {
-                note_parallel_dispatch();
-                run_on_host(host, input, output, chunk, count, &body);
-            }
-            None => body(input, output),
-        }
+    if try_host(input, &mut *output, &body) {
         return;
     }
     if len < PAR_MIN_LEN {
@@ -616,13 +661,7 @@ where
         body(input, output);
         return;
     }
-    if let Some(host) = onnx_runtime_ep_api::host_parallel::current()
-        && host.prefer_host()
-    {
-        match host_chunk_len_rows(len, width) {
-            Some((chunk, count)) => run_on_host(host, input, output, chunk, count, &body),
-            None => body(input, output),
-        }
+    if try_host_rows(input, &mut *output, width, &body) {
         return;
     }
     if len < PAR_MIN_LEN {
@@ -4143,6 +4182,35 @@ mod chunking_instantiation_is_local {
              run_chunked_fn or add a wrapper next to clip_chunked instead. \
              Offending call sites: {offenders:?}"
         );
+    }
+
+    /// The host branch is cold, and inlining it into `run_chunked` costs 34%.
+    ///
+    /// `try_host`/`try_host_rows` decide with one relaxed load, and the split
+    /// they guard only runs inside an ORT session whose intra-op pool has been
+    /// proven parallel. `run_chunked`'s callers, meanwhile, are the hottest
+    /// elementwise kernels in the crate. When the branch was written inline,
+    /// `Relu` at 1 Mi and one thread went 236 -> 315 us with no runtime path
+    /// change at all -- the same codegen-unit repartitioning as above. Adding
+    /// an `eprintln!` for diagnosis moved it back to 237 us, which is how the
+    /// cause was identified. `#[inline(never)]` pins it.
+    #[test]
+    fn the_host_branch_stays_outlined() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/kernels/simd_activations.rs");
+        let text = std::fs::read_to_string(&path).expect("read source");
+        for name in ["fn try_host<F>", "fn try_host_rows<F>"] {
+            let at = text.find(name).unwrap_or_else(|| panic!("{name} exists"));
+            assert!(
+                text[..at]
+                    .lines()
+                    .next_back()
+                    .is_some_and(|l| l.trim() == "#[inline(never)]"),
+                "{name} must be preceded by #[inline(never)]: inlining the host \
+                 branch into run_chunked repartitioned codegen units and cost \
+                 Relu 34% at 1 Mi (236 -> 315 us) with no path change"
+            );
+        }
     }
 }
 
