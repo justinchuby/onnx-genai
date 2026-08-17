@@ -729,9 +729,7 @@ impl ConvKernel {
             _ => return,                                                 // Identity / unhandled
         };
         let input = output.to_vec();
-        crate::kernels::simd_activations::run_chunked(&input, output, |i, o| {
-            mlas_sys::compute_clip(i, o, minimum, maximum);
-        });
+        crate::kernels::simd_activations::clip_chunked(&input, output, minimum, maximum);
     }
 }
 

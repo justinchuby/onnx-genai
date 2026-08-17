@@ -6,6 +6,113 @@ use rayon::prelude::*;
 
 use super::{check_arity, to_dense_bytes, write_dense_bytes};
 use crate::strided::numel;
+use std::borrow::Cow;
+
+/// Borrow a tensor's bytes when they are already dense, copy them when they are
+/// not.
+///
+/// `to_dense_bytes` always allocates: it builds a zeroed `Vec` and then
+/// overwrites it, so a contiguous host operand costs an allocation, a
+/// `memset`, a copy and a `free` on every single call. For `A` that is `m * k`
+/// bytes per call -- 256 KiB at a 128x2048 prefill -- and on a busy pool that
+/// is far more expensive than it looks: freeing a fresh multi-page mapping
+/// forces a TLB shootdown to every core the process is running on, so the cost
+/// grows with the thread count. Measured on a 32-vCPU EPYC 9V74, the per-call
+/// `A` copy alone was 13 us at one thread and 136 us at sixteen.
+///
+/// The bytes are only borrowed when the view is host-accessible and
+/// contiguous, which is exactly when `to_dense_bytes` would have produced an
+/// identical copy of them.
+fn dense_bytes<'a>(view: &TensorView<'a>) -> Result<Cow<'a, [u8]>> {
+    if view.device.is_host_accessible() && view.is_contiguous() {
+        view.validate()?;
+        let len = numel(view.shape) * super::elem_size(view.dtype)?;
+        // SAFETY: the executor guarantees the view's backing allocation is live
+        // for `'a` and in bounds (ep-api safety invariant #1); `validate`
+        // accepted the shape/stride pair and `is_contiguous` means those `len`
+        // bytes are consecutive from the byte origin. `u8` has no invalid bit
+        // patterns.
+        let bytes = unsafe { std::slice::from_raw_parts(view.data_ptr::<u8>(), len) };
+        #[cfg(test)]
+        BORROWED_INPUT_CALLS.with(|calls| calls.set(calls.get() + 1));
+        return Ok(Cow::Borrowed(bytes));
+    }
+    to_dense_bytes(view).map(Cow::Owned)
+}
+
+/// Largest accumulator a thread keeps between calls, in bytes.
+///
+/// 32 MiB covers every accumulator up to an 8M-element result -- a 2048x4096
+/// output and everything smaller -- which is the range where the per-call
+/// allocation actually hurts. Anything larger is released rather than parked on
+/// a thread for the life of the process: at that size the GEMM itself dwarfs
+/// the allocation, so retaining it would trade real memory for nothing.
+const MAX_RETAINED_ACCUMULATOR_BYTES: usize = 32 << 20;
+
+thread_local! {
+    /// Per-thread scratch for the `i32` accumulator that the integer GEMM writes
+    /// before the values are requantized down to the output dtype.
+    ///
+    /// The accumulator is `m * n` i32 -- 1 MiB at a 128x2048 prefill -- and MLAS
+    /// first-touches every page of it from every worker thread. Allocating it per
+    /// call therefore buys a fresh mapping, a page fault per page, and on free a
+    /// TLB shootdown to every core the process is running on. Measured on a
+    /// 32-vCPU EPYC 9V74 at K=N=2048, M=128: re-allocating it per call cost
+    /// **301 us** with a 16-thread pool and nothing measurable with one thread,
+    /// which is why this only started to matter once the GEMM itself scaled.
+    ///
+    /// Thread-local rather than shared: `execute` takes `&self` and the executor
+    /// may run the same kernel on several threads at once, so a shared buffer would
+    /// need a lock that serialises exactly the calls this exists to speed up.
+    static ACCUMULATOR: std::cell::RefCell<Vec<i32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only counters proving which output route a call took. Without them a
+    /// test can only check the bytes, which both routes produce identically -- so a
+    /// silent regression to always-staging would pass every correctness test.
+    ///
+    /// Thread-local rather than global: the test harness gives each test its own
+    /// thread, so a count read here is this test's own calls and cannot be
+    /// perturbed by whatever else is running in parallel.
+    static DIRECT_OUTPUT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static STAGED_OUTPUT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Counts the calls where `dense_bytes` handed back a borrow of the caller's
+    /// buffer rather than a private copy. A test that checks the caller's input
+    /// survived a call is only meaningful if the call actually borrowed it, so
+    /// this stops that test passing vacuously.
+    static BORROWED_INPUT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Where a batch's requantized output bytes are written.
+///
+/// A contiguous, host-accessible output view is written **in place**: MLAS
+/// requantizes straight into the caller's tensor, so the kernel neither
+/// allocates a staging buffer, nor zeroes it, nor copies it back. A strided or
+/// non-host view cannot be handed to MLAS at all, so it is staged and
+/// scattered once at the end through `write_dense_bytes`, which is what every
+/// path did before.
+enum OutputSink<'a> {
+    Direct(&'a mut [u8]),
+    Staged(Vec<u8>),
+}
+
+impl OutputSink<'_> {
+    /// The `len` bytes this batch owns, starting at `base` in the result.
+    fn region(&mut self, base: usize, len: usize) -> &mut [u8] {
+        match self {
+            Self::Direct(bytes) => &mut bytes[base..base + len],
+            Self::Staged(bytes) => {
+                // The staged path grows batch by batch exactly as the previous
+                // `Vec` did, so a partially-filled result is byte-identical.
+                bytes.resize(base + len, 0);
+                &mut bytes[base..]
+            }
+        }
+    }
+}
 
 /// Multiply-accumulate count below which the integer accumulation runs on the
 /// calling thread. A rayon fork costs on the order of microseconds; this is the
@@ -351,7 +458,13 @@ impl Kernel for QLinearMatMulKernel {
         #[cfg_attr(not(feature = "mlas"), allow(unused_mut))]
         let (mut a_bytes, mut b_bytes, a, b) = if qgemm.is_some() {
             (
-                to_dense_bytes(&inputs[0])?,
+                // Every MLAS route reads `A` exactly as the caller laid it
+                // out, so a contiguous operand is borrowed rather than copied
+                // per call. The one route that rewrites it -- the sign flip
+                // below -- goes through `Cow::to_mut`, which copies a borrowed
+                // operand first, so the caller's input is never written
+                // through.
+                dense_bytes(&inputs[0])?,
                 if pack_ready {
                     Vec::new()
                 } else {
@@ -362,7 +475,7 @@ impl Kernel for QLinearMatMulKernel {
             )
         } else {
             (
-                Vec::new(),
+                Cow::Borrowed(&[][..]),
                 Vec::new(),
                 read_quantized(&inputs[0])?,
                 read_quantized(&inputs[3])?,
@@ -373,7 +486,7 @@ impl Kernel for QLinearMatMulKernel {
         #[cfg(feature = "mlas")]
         if let Some(plan) = &qgemm {
             if plan.flip_a {
-                flip_sign_domain(&mut a_bytes);
+                flip_sign_domain(a_bytes.to_mut());
             }
             if plan.flip_b {
                 flip_sign_domain(&mut b_bytes);
@@ -388,11 +501,37 @@ impl Kernel for QLinearMatMulKernel {
         #[cfg(not(feature = "mlas"))]
         let packed: Option<&()> = None;
         let (m, k, n) = (geometry.m, geometry.k, geometry.n);
-        let mut output = Vec::with_capacity(geometry.result_len);
+        // Requantizing into the caller's tensor removes a `result_len`
+        // allocation, its zero-fill, and the copy back out of it, per call.
+        let out_dtype = outputs[0].dtype;
+        let direct_output = outputs[0].device.is_host_accessible() && outputs[0].is_contiguous();
+        if direct_output {
+            outputs[0].validate()?;
+        }
+        let mut sink = if direct_output {
+            #[cfg(test)]
+            DIRECT_OUTPUT_CALLS.with(|calls| calls.set(calls.get() + 1));
+            // SAFETY: the executor provides an exclusive, in-bounds output
+            // buffer (ep-api safety invariant #1); `validate` accepted the
+            // shape/stride pair, `is_contiguous` means the `result_len` bytes
+            // are consecutive from the byte origin, and the shape was checked
+            // to equal `geometry.output_shape` above. Both supported output
+            // dtypes are one byte wide, so `result_len` bytes is the whole
+            // tensor.
+            OutputSink::Direct(unsafe {
+                std::slice::from_raw_parts_mut(outputs[0].data_ptr_mut::<u8>(), geometry.result_len)
+            })
+        } else {
+            #[cfg(test)]
+            STAGED_OUTPUT_CALLS.with(|calls| calls.set(calls.get() + 1));
+            OutputSink::Staged(Vec::with_capacity(geometry.result_len))
+        };
         let mut batch_index = vec![0; geometry.batch_shape.len()];
         // Hoisted out of the batch loop: both are re-filled per batch, so a
         // many-batch call allocates once rather than once per batch.
-        let mut products: Vec<i32> = Vec::new();
+        // The accumulator is borrowed from this thread's scratch, so a repeated
+        // shape reuses one already-faulted mapping instead of buying a new one.
+        let mut products: Vec<i32> = ACCUMULATOR.with(|cell| cell.take());
         let mut b_zero_points: Vec<i32> = Vec::new();
         let mut b_scales: Vec<f32> = Vec::new();
         #[cfg(feature = "mlas")]
@@ -449,8 +588,7 @@ impl Kernel for QLinearMatMulKernel {
                 // maps it to the zero point -- keeps a call off this path.
                 #[cfg(feature = "mlas")]
                 if let Some(scale) = fused {
-                    let base = output.len();
-                    output.resize(base + m * n, 0);
+                    let region = sink.region(batch * m * n, m * n);
                     plan.run_requantized(
                         m,
                         n,
@@ -465,8 +603,8 @@ impl Kernel for QLinearMatMulKernel {
                         },
                         &b_zero_points,
                         scale,
-                        &mut output[base..],
-                        outputs[0].dtype == DataType::Int8,
+                        region,
+                        out_dtype == DataType::Int8,
                         y_zero_point,
                         &mut products,
                     )?;
@@ -503,8 +641,8 @@ impl Kernel for QLinearMatMulKernel {
                     n,
                     y_scale,
                     y_zero_point,
-                    outputs[0].dtype,
-                    &mut output,
+                    out_dtype,
+                    sink.region(batch * m * n, m * n),
                 )?;
                 if batch + 1 < geometry.batch_count {
                     next_index(&geometry.batch_shape, &mut batch_index);
@@ -571,14 +709,24 @@ impl Kernel for QLinearMatMulKernel {
                 n,
                 y_scale,
                 y_zero_point,
-                outputs[0].dtype,
-                &mut output,
+                out_dtype,
+                sink.region(batch * m * n, m * n),
             )?;
             if batch + 1 < geometry.batch_count {
                 next_index(&geometry.batch_shape, &mut batch_index);
             }
         }
-        write_dense_bytes(&mut outputs[0], &output)
+        // Park the accumulator for the next call on this thread. An early
+        // error return skips this and simply drops it, which costs the next
+        // call one allocation and cannot affect a result.
+        if products.capacity() * std::mem::size_of::<i32>() <= MAX_RETAINED_ACCUMULATOR_BYTES {
+            ACCUMULATOR.with(|cell| cell.replace(products));
+        }
+        match sink {
+            // The direct sink already wrote every byte the caller asked for.
+            OutputSink::Direct(_) => Ok(()),
+            OutputSink::Staged(bytes) => write_dense_bytes(&mut outputs[0], &bytes),
+        }
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -1063,7 +1211,7 @@ fn requantize_rows(
     y_scale: f32,
     y_zero_point: i32,
     dtype: DataType,
-    output: &mut Vec<u8>,
+    destination: &mut [u8],
 ) -> Result<()> {
     // Both supported dtypes are one byte wide, so the output length is known.
     // Reject anything else once here rather than per element.
@@ -1072,9 +1220,13 @@ fn requantize_rows(
             "QLinearMatMul: unsupported output dtype {dtype:?}"
         )));
     }
-    let base = output.len();
-    output.resize(base + products.len(), 0);
-    let destination = &mut output[base..];
+    if destination.len() != products.len() {
+        return Err(EpError::KernelFailed(format!(
+            "QLinearMatMul: output region of {} bytes cannot hold {} accumulators",
+            destination.len(),
+            products.len()
+        )));
+    }
 
     // `a_scale * b_scale / y_scale` is the same expression for every row when
     // `a_scale` is per tensor, so evaluate it once per column instead of once
@@ -1242,6 +1394,7 @@ fn next_index(shape: &[usize], index: &mut [usize]) {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+    use onnx_runtime_ep_api::{DeviceId, DevicePtrMut};
     use onnx_runtime_ir::compute_contiguous_strides;
 
     fn i8(shape: &[usize], values: &[i8]) -> Owned {
@@ -1321,6 +1474,163 @@ mod tests {
             .execute(&inputs.map(|input| input.view()), &mut [output.view_mut()])
             .unwrap();
         output
+    }
+
+    /// A contiguous output must be requantized straight into the caller's
+    /// tensor, and a strided one must still be staged and scattered -- with
+    /// byte-identical results either way.
+    ///
+    /// The bytes alone cannot prove this: both routes produce the same answer,
+    /// which is the point. So the route counters are asserted too, otherwise a
+    /// regression that quietly always staged (re-introducing a `result_len`
+    /// allocation, its zero-fill and a copy on every call) would pass.
+    #[test]
+    fn a_contiguous_output_is_written_in_place_and_a_strided_one_is_staged() {
+        let a_values = [10, 14, 7, 20, 3, 11];
+        let a = Owned::u8(&[3, 2], &a_values.map(|value| value as u8));
+        let a_scale = Owned::f32(&[], &[0.5]);
+        let a_zero = Owned::u8(&[], &[8]);
+        let b_values = [3, 9, 5, 1];
+        let b = Owned::u8(&[2, 2], &b_values.map(|value| value as u8));
+        let b_scale = Owned::f32(&[2], &[0.25, 0.5]);
+        let b_zero = Owned::u8(&[2], &[2, 4]);
+        let y_scale = Owned::f32(&[], &[0.125]);
+        let y_zero = Owned::u8(&[], &[100]);
+        let inputs = [
+            &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+        ];
+
+        let before_direct = DIRECT_OUTPUT_CALLS.with(std::cell::Cell::get);
+        let contiguous = execute(inputs, DataType::Uint8, &[3, 2]);
+        assert_eq!(
+            DIRECT_OUTPUT_CALLS.with(std::cell::Cell::get),
+            before_direct + 1,
+            "a contiguous host output must be written in place, not staged"
+        );
+
+        // A column-major output view describes the same 3x2 logical tensor but
+        // cannot be handed to MLAS, so it must take the staging route.
+        let mut strided_bytes = vec![0u8; 6];
+        let shape = [3usize, 2];
+        let strides = [1i64, 3];
+        let before_staged = STAGED_OUTPUT_CALLS.with(std::cell::Cell::get);
+        {
+            let out = TensorMut::new(
+                DevicePtrMut(strided_bytes.as_mut_ptr().cast()),
+                DataType::Uint8,
+                &shape,
+                &strides,
+                DeviceId::cpu(),
+            );
+            QLinearMatMulKernel::default()
+                .execute(&inputs.map(|input| input.view()), &mut [out])
+                .unwrap();
+        }
+        assert_eq!(
+            STAGED_OUTPUT_CALLS.with(std::cell::Cell::get),
+            before_staged + 1,
+            "a strided output must be staged, because MLAS cannot scatter"
+        );
+
+        // Same logical values, transposed layout: element (row, col) of the
+        // strided buffer lives at `row + col * 3`.
+        for row in 0..3 {
+            for col in 0..2 {
+                assert_eq!(
+                    strided_bytes[row + col * 3],
+                    contiguous.bytes[row * 2 + col],
+                    "strided output disagrees with the in-place one at ({row}, {col})"
+                );
+            }
+        }
+    }
+
+    /// Borrowing `A` must never let the kernel write through to the caller's
+    /// input. The sign-flip route is the one place that rewrites `A`'s bytes,
+    /// and it does so through `Cow::to_mut`, which copies a borrowed operand
+    /// before touching it. Replace that with a write to the borrowed slice and
+    /// this test fails.
+    ///
+    /// The borrow counter is asserted too, because the property is only under
+    /// test when the call really did borrow: if `dense_bytes` ever stopped
+    /// borrowing, the input would trivially survive and the test would pass
+    /// while proving nothing.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn the_sign_flip_route_never_writes_through_to_the_callers_input() {
+        // Signed A against unsigned B is the combination that makes a plan flip
+        // one operand's sign domain.
+        let a_values: Vec<i8> = (0..64).map(|i| (i * 5 - 100) as i8).collect();
+        let a = i8(&[8, 8], &a_values);
+        let untouched = a.bytes.clone();
+        let a_scale = Owned::f32(&[], &[0.5]);
+        let a_zero = i8(&[], &[-3]);
+        let b_values: Vec<u8> = (0..64).map(|i| ((i * 11 + 3) % 256) as u8).collect();
+        let b = Owned::u8(&[8, 8], &b_values);
+        let b_scale = Owned::f32(&[], &[0.25]);
+        let b_zero = Owned::u8(&[], &[130]);
+        let y_scale = Owned::f32(&[], &[0.125]);
+        let y_zero = i8(&[], &[-2]);
+        let borrows_before = BORROWED_INPUT_CALLS.with(|calls| calls.get());
+        let _ = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Int8,
+            &[8, 8],
+        );
+        assert_eq!(
+            BORROWED_INPUT_CALLS.with(|calls| calls.get()),
+            borrows_before + 1,
+            "the flip route no longer borrows A, so this test proves nothing"
+        );
+        assert_eq!(
+            a.bytes, untouched,
+            "the kernel mutated the caller's A buffer in place"
+        );
+    }
+
+    /// A batched call writes each batch at its own offset. In place there is no
+    /// running `Vec::len` to lean on, so an off-by-one in the offset arithmetic
+    /// would scribble batches over each other -- which a single-batch test
+    /// cannot see.
+    #[test]
+    fn a_batched_call_lands_every_batch_at_its_own_offset_in_place() {
+        let a_values: Vec<u8> = (0..3 * 2 * 4).map(|i| ((i * 7 + 1) % 251) as u8).collect();
+        let a = Owned::u8(&[3, 2, 4], &a_values);
+        let a_scale = Owned::f32(&[], &[0.5]);
+        let a_zero = Owned::u8(&[], &[8]);
+        let b_values: Vec<u8> = (0..3 * 4 * 5).map(|i| ((i * 13 + 5) % 251) as u8).collect();
+        let b = Owned::u8(&[3, 4, 5], &b_values);
+        let b_scale = Owned::f32(&[], &[0.25]);
+        let b_zero = Owned::u8(&[], &[7]);
+        let y_scale = Owned::f32(&[], &[0.125]);
+        let y_zero = Owned::u8(&[], &[100]);
+        let batched = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Uint8,
+            &[3, 2, 5],
+        );
+
+        // Each batch computed on its own must equal that batch's slice.
+        for batch in 0..3 {
+            let a_slice = Owned::u8(&[2, 4], &a_values[batch * 8..batch * 8 + 8]);
+            let b_slice = Owned::u8(&[4, 5], &b_values[batch * 20..batch * 20 + 20]);
+            let single = execute(
+                [
+                    &a_slice, &a_scale, &a_zero, &b_slice, &b_scale, &b_zero, &y_scale, &y_zero,
+                ],
+                DataType::Uint8,
+                &[2, 5],
+            );
+            assert_eq!(
+                &batched.bytes[batch * 10..batch * 10 + 10],
+                &single.bytes[..],
+                "batch {batch} landed at the wrong offset"
+            );
+        }
     }
 
     fn output_values(output: &Owned) -> Vec<i64> {
@@ -2171,6 +2481,26 @@ mod tests {
         }
     }
 
+    /// Run the kernel into a caller-owned output, so a benchmark can separate
+    /// the kernel's cost from the cost of allocating its result.
+    #[cfg(feature = "mlas")]
+    fn run_into(kernel: &QLinearMatMulKernel, fixture: &PackFixture, output: &mut Owned) {
+        let (a_scale, a_zero) = (Owned::f32(&[], &[0.02]), Owned::u8(&[], &[128]));
+        let (b_scale, b_zero) = (Owned::f32(&[], &[0.01]), Owned::u8(&[], &[127]));
+        let (y_scale, y_zero) = (Owned::f32(&[], &[0.05]), Owned::u8(&[], &[120]));
+        let inputs = [
+            fixture.a.view(),
+            a_scale.view(),
+            a_zero.view(),
+            fixture.b.view(),
+            b_scale.view(),
+            b_zero.view(),
+            y_scale.view(),
+            y_zero.view(),
+        ];
+        kernel.execute(&inputs, &mut [output.view_mut()]).unwrap();
+    }
+
     #[cfg(feature = "mlas")]
     fn run_with(kernel: &QLinearMatMulKernel, fixture: &PackFixture) -> Owned {
         let mut output = Owned::zeros(DataType::Uint8, &[fixture.m, fixture.n]);
@@ -2267,6 +2597,17 @@ mod tests {
             }
             let whole = start.elapsed() / reps;
 
+            // Same kernel call, but the caller's output tensor is allocated
+            // once and reused. `whole - whole_reused` is what per-call
+            // allocation of the result costs, which is the part a real session
+            // pays through ORT's arena rather than through `Owned::zeros`.
+            let mut reused = Owned::zeros(DataType::Uint8, &[m, n]);
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
+                run_into(&kernel, &fixture, &mut reused);
+            }
+            let whole_reused = start.elapsed() / reps;
+
             let a_bytes = fixture.a.bytes.clone();
             let packed = kernel
                 .pack_lookup(
@@ -2316,12 +2657,105 @@ mod tests {
             }
             let gemm = start.elapsed() / reps;
 
-            let a_quant = quant_params(false, 128, 1);
-            let b_scales = vec![0.01f32; n];
-            let mut output = Vec::new();
+            // The fused primitive the kernel actually calls since the MLAS
+            // requantize landed, timed on its own. `fused - gemm` is what the
+            // requantize costs *inside* MLAS's threaded region; `whole - fused`
+            // is everything our wrapper adds around it. Without this split the
+            // two are indistinguishable and a wrapper cost looks like a slow
+            // kernel.
+            let mut fused_out = vec![0u8; m * n];
+            let fused_scales = vec![0.001f32; n];
+            for _ in 0..3 {
+                mlas_sys::qgemm_requantize(
+                    m,
+                    n,
+                    k,
+                    &a_bytes,
+                    false,
+                    128,
+                    mlas_sys::QgemmWeights::Packed(packed),
+                    mlas_sys::QgemmZeroPoints::PerColumn(&zeros),
+                    mlas_sys::QgemmScale::PerColumn(&fused_scales),
+                    &mut fused_out,
+                    false,
+                    120,
+                    &mut products,
+                );
+            }
             let start = std::time::Instant::now();
             for _ in 0..reps {
-                output.clear();
+                mlas_sys::qgemm_requantize(
+                    m,
+                    n,
+                    k,
+                    &a_bytes,
+                    false,
+                    128,
+                    mlas_sys::QgemmWeights::Packed(packed),
+                    mlas_sys::QgemmZeroPoints::PerColumn(&zeros),
+                    mlas_sys::QgemmScale::PerColumn(&fused_scales),
+                    &mut fused_out,
+                    false,
+                    120,
+                    &mut products,
+                );
+            }
+            let fused = start.elapsed() / reps;
+
+            // Same call, but A is re-materialised per iteration the way
+            // `execute` re-materialises it through `to_dense_bytes`. If this
+            // costs what the kernel costs, the per-call input copy is the gap.
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
+                let fresh_a = a_bytes.clone();
+                mlas_sys::qgemm_requantize(
+                    m,
+                    n,
+                    k,
+                    &fresh_a,
+                    false,
+                    128,
+                    mlas_sys::QgemmWeights::Packed(packed),
+                    mlas_sys::QgemmZeroPoints::PerColumn(&zeros),
+                    mlas_sys::QgemmScale::PerColumn(&fused_scales),
+                    &mut fused_out,
+                    false,
+                    120,
+                    &mut products,
+                );
+            }
+            let fused_fresh_a = start.elapsed() / reps;
+
+            // Same call, but the i32 accumulator is re-allocated per iteration
+            // the way `execute` re-allocates it. MLAS first-touches every page
+            // of it from every worker thread, so this is the other per-call
+            // buffer whose cost scales with the pool.
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
+                let mut fresh_c = vec![0i32; m * n];
+                mlas_sys::qgemm_requantize(
+                    m,
+                    n,
+                    k,
+                    &a_bytes,
+                    false,
+                    128,
+                    mlas_sys::QgemmWeights::Packed(packed),
+                    mlas_sys::QgemmZeroPoints::PerColumn(&zeros),
+                    mlas_sys::QgemmScale::PerColumn(&fused_scales),
+                    &mut fused_out,
+                    false,
+                    120,
+                    &mut fresh_c,
+                );
+            }
+            let fused_fresh_c = start.elapsed() / reps;
+
+            let a_quant = quant_params(false, 128, 1);
+            let b_scales = vec![0.01f32; n];
+            let mut output = vec![0u8; m * n];
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
                 requantize_rows(
                     &products,
                     &a_quant,
@@ -2358,14 +2792,13 @@ mod tests {
                 .checked_div(stats.parallel_for_calls)
                 .unwrap_or(0);
             println!(
-                "m={m} threads={}: whole={whole:?} gemm={gemm:?} requant={requant:?} \
-                 products-alloc={alloc:?} unattributed={:?} \
+                "m={m} threads={}: whole={whole:?} whole_reused={whole_reused:?} gemm={gemm:?} fused={fused:?} fused_fresh_a={fused_fresh_a:?} fused_fresh_c={fused_fresh_c:?} \
+                 mlas-requant={:?} wrapper={:?} scalar-requant={requant:?} \
+                 products-alloc={alloc:?} \
                  sched_per_call={sched_per_call} serial_fallback={}",
                 stats.pool_threads,
-                whole
-                    .saturating_sub(gemm)
-                    .saturating_sub(requant)
-                    .saturating_sub(alloc),
+                fused.saturating_sub(gemm),
+                whole_reused.saturating_sub(fused),
                 stats.serial_fallback_calls,
             );
         }
