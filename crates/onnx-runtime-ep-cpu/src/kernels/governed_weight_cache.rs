@@ -263,7 +263,10 @@ mod tests {
         assert!(declined.filled().is_none(), "declined holds nothing");
 
         let admitted = GovernedWeightCache::<f32>::new(CacheVerdict::admit(64));
-        assert!(admitted.filled().is_none(), "unfilled admitted holds nothing");
+        assert!(
+            admitted.filled().is_none(),
+            "unfilled admitted holds nothing"
+        );
         admitted
             .get_or_fill(|| vec![7.0; 16])
             .expect("admitted fills");
