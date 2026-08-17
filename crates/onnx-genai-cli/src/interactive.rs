@@ -373,6 +373,7 @@ pub(super) struct SessionSettings {
     /// platform defaults select.
     execution_provider: Option<String>,
     decode_backend: EngineDecodeBackend,
+    native_device: Option<onnx_genai::engine::native_decode_device::NativeDecodeDevice>,
     limits: onnx_genai::engine::ResourceLimits,
 }
 
@@ -383,6 +384,7 @@ impl SessionSettings {
             model_dir,
             execution_provider: None,
             decode_backend: config.decode_backend,
+            native_device: config.native_device,
             limits: config.limits,
         }
     }
@@ -390,6 +392,7 @@ impl SessionSettings {
     pub(super) fn to_config(&self) -> EngineConfig {
         EngineConfig {
             decode_backend: self.decode_backend,
+            native_device: self.native_device.clone(),
             limits: self.limits.clone(),
             ..EngineConfig::default()
         }
