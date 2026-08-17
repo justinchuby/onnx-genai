@@ -206,7 +206,8 @@ fn explicit_selection_error(attempts: String) -> String {
 fn report_loaded_library(loaded: &OrtLibrary) {
     if loaded.report_selection && REPORT_SELECTION.load(Ordering::Relaxed) {
         eprintln!(
-            "onnx-genai: selected ONNX Runtime {} (API {}) from {} ({})",
+            "onnx-genai: loaded ONNX Runtime support library {} (API {}) from {} ({}); \
+             this does not select the decode backend",
             loaded.version,
             loaded
                 .api_version
