@@ -1266,6 +1266,13 @@ Single-arm, merged `main`, same host, interleaved with a real ORT CPU session, 5
 `native p50 / ORT p50`**, lower is better; brackets give the min-max across the 5 trials.
 Nothing omitted.
 
+**These are pre-§22 numbers and the transform rows are now stale.** §22
+parallelises the input binding that §21 showed dominates these graphs, which
+moves the `tr_*` rows substantially. §22.4 gives the after-state, but in a
+different harness (separate processes) whose ORT denominators are not comparable
+to this table's, so the two must not be divided into each other. This table is
+kept as the measured before-state of the harness it was taken in.
+
 | graph | t=1 | t=8 | t=16 | native p50 @16 |
 |---|--:|--:|--:|--:|
 | `tr_bert_b8_s128` | 1.090 [1.056-1.133] | 3.188 [2.613-3.440] | 4.600 [3.846-5.314] | 0.558 ms |
@@ -1308,7 +1315,10 @@ work.
   would move all eight rows above; no operator change will. Which part of it dominates is
   not yet measured (§20.1), so that is the next instrument to build, before the next
   optimisation. **§21 builds that instrument and answers this**: for the Transpose graphs
-  the per-run path is 60-74% input binding and 25-38% boundary materialisation.
+  the per-run path is 60-74% input binding and 25-38% boundary materialisation. **§22
+  then attacks the input binding**, taking the two Transpose graphs whose inputs clear
+  its threshold from 6.9-14.5x ORT to 3.0-5.8x ORT. Boundary materialisation is
+  untouched and remains open.
 * **`Concat` remains a genuine kernel cost** and remains bounded by §13: `ExternalValue`
   carries no strides, so a `Concat`-shaped KV cache cannot append in place. The Phase 4
   in-place append (#1083) applies to the GQA-shaped cache, not this one.
@@ -1412,3 +1422,227 @@ claim about how much it would be worth.
   worse than the §10 assignment evidence.
 * The `Concat` rows are *not* explained away by it: 2.4-3.6 ms of real kernel
   time survives after the copies are accounted for. §13's boundary still binds.
+
+## 22. Parallelising the input binding copy
+
+§21 found that one single-threaded `memcpy` is 40-99% of `setup_total` on every
+graph measured. The copy itself cannot be removed without changing the EP ABI
+(§21.2), but on a 16-core host it does not have to run on one core.
+
+`CpuExecutionProvider` now overrides `ExecutionProvider::copy_from_host`. Below a
+threshold it is the previous `copy_from_slice`; above it the source and
+destination are split into equal chunks and copied by up to 8 Rayon workers.
+
+### 22.1 Calibrating the threshold: the micro-benchmark was wrong
+
+The first calibration was a standalone loop copying one buffer 25 times. It said
+the crossover was ~24 MiB and that an 8 MiB copy was **2.8x slower** in parallel,
+with a 28.8 GB/s serial rate. Setting the threshold to 24 MiB produced a 9%
+end-to-end win, which did not match the phase profile at all.
+
+The loop was measuring an **L3-resident** copy. In a real session the graph input
+was written once by the harness and evicted; the source is DRAM-cold. Sweeping
+the threshold *in-session* over a 13-point input-size ladder gives a completely
+different answer. `bind_inputs` microseconds, median of 3 interleaved
+repetitions, 16-thread budget, one process per arm:
+
+`input` is the **total** over a graph's inputs. The threshold is applied per
+tensor, so for the `kvcat_*` rows - which take two large past-KV tensors each -
+the size that actually decides the path is half the number shown.
+
+| graph | input | serial | parallel | parallel vs serial |
+|---|--:|--:|--:|---|
+| `sm_decode_h32_kv1024` | 0.125 MiB | 4.8 | 108.5 | 22.6x worse |
+| `sm_decode_h32_kv4096` | 0.5 MiB | 15.6 | 134.9 | 8.6x worse |
+| `sm_decode_h32_kv8192` | 1 MiB | 31.5 | 130.4 | 4.1x worse |
+| `rope_llama3_s1` | 2 MiB | 62.2 | 231.4 | 3.7x worse |
+| `tr_bert_b8_s128` | 3 MiB | 372.6 | 120.9 | **3.1x better** |
+| `rope_llama3_s128` | 4 MiB | 353.4 | 255.9 | 1.4x better |
+| `sm_bert_b8_s128` | 6 MiB | 391.8 | 126.1 | 3.1x better |
+| `tr_llama3_s512` | 8 MiB | 589.8 | 178.3 | 3.3x better |
+| `rope_llama3_s512` | 10 MiB | 718.0 | 314.9 | 2.3x better |
+| `kvcat_llama3_p2047` | 16 MiB | 698.8 | 645.6 | 1.08x better |
+| `kvcat_llama3_p4095` | 32 MiB | 1714.9 | 1525.6 | 1.12x better |
+| `kvcat_llama3_p8191` | 64 MiB | 3501.3 | 3032.9 | 1.15x better |
+| `kvcat_llama3_b8_p2047` | 128 MiB | 7377.6 | 7188.5 | 1.03x better |
+
+The cliff between 2 MiB and 3 MiB is **a cache-residency effect, not a size
+effect**. Immediately either side of it the serial rate collapses from 33-34 GB/s
+(2 MiB and below, an L3 rate) to 8-12 GB/s (3-4 MiB, a DRAM rate). That band
+describes the cliff only: the 0.125 MiB row is 27.3 GB/s, and above 4 MiB the
+serial rate climbs back to 14-24 GB/s as the fixed per-copy cost amortises. Byte
+count is only a proxy for "is the source in L3", and it is the only proxy
+available at the call site. Rayon fan-out costs about 110 us here - large, and it
+reflects waking sleeping workers on a contended host.
+
+The threshold is **4 MiB**: above every measured loss, at or below every measured
+win, one step clear of the cliff rather than sitting on it.
+`ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES` overrides it, read once per process
+into a `OnceLock` - which is correct for this sweep because it runs one process
+per arm. Tests move the threshold through a thread-local override instead of the
+environment, so they cannot race each other.
+
+### 22.2 The interleaved harness cannot resolve this effect
+
+The standard `scripts/ort_ab/ab.py` methodology used everywhere else in this
+document does not work here, and it is worth recording why rather than quietly
+switching designs.
+
+A 5-trial interleaved run showed large wins. A 9-trial run of the same cells
+showed **the opposite signs**. The tell is the control cells - `t=1`, where
+`host_copy_workers()` returns 1 and the parallel path is unreachable, and
+`tr_bert_b8_s128` at 3 MiB, which is below the threshold. Both are provably
+identical machine code in both arms, and both moved **+-8-13%**. That is the
+noise floor of this harness on this host, and the effect on the small graphs is
+inside it.
+
+There is a second, structural reason: `bench_generic` builds a native *and* an
+ORT session in one process, so ORT's intra-op pool is alive and competing for
+cores exactly when the parallel copy fans out. Interleaving arms within such a
+process measures the interaction, not the change.
+
+### 22.3 Paired native-only A/B (7 interleaved repetitions)
+
+Same binary, same process shape, one arm differing only by
+`ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES`. 16-thread budget. Negative is faster.
+
+| graph | per-tensor input | end-to-end | `bind_inputs` | per-rep ratio range |
+|---|---|--:|--:|---|
+| `tr_bert_b8_s128` (control, below threshold) | 3 MiB | +3.2% | -0.5% | 0.97-1.07 |
+| `tr_llama3_s512` | 8 MiB | **-50.6%** | **-67.1%** | 0.33-0.57 |
+| `tr_whisper_s1500` | 7.3 MiB | **-58.5%** | **-66.4%** | 0.36-0.56 |
+| `kvcat_llama3_p1023` | 4 MiB x2 | +1.4% | -0.6% | 0.97-1.10 |
+| `kvcat_llama3_p2047` | 8 MiB x2 | +3.2% | -3.3% | 0.93-1.10 |
+| `kvcat_llama3_p8191` | 32 MiB x2 | **-7.6%** | **-13.0%** | 0.88-0.93 |
+
+The two rows where `bind_inputs` was 74% of the run move by half; the rows where
+it was a third of a run dominated by real `Concat` work move by 7.6% or sit in
+the noise. That is the expected shape of an Amdahl bound, which is the main
+reason to believe the measurement.
+
+### 22.4 Three-arm ORT comparison (separate processes, 5 repetitions)
+
+Three separate processes per cell - serial-native-only, parallel-native-only,
+ORT-only - so no arm shares a process with another runtime's thread pool.
+Medians of 5 repetitions.
+
+| graph | t | ser ms | par ms | ort ms | ser/ort | par/ort | native gain |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| `tr_llama3_s512` | 8 | 0.736 | 0.204 | 0.067 | 10.985 | **3.045** | -72.3% |
+| `tr_llama3_s512` | 16 | 0.869 | 0.345 | 0.060 | 14.483 | **5.750** | -60.3% |
+| `tr_whisper_s1500` | 8 | 0.662 | 0.336 | 0.096 | 6.896 | **3.500** | -49.2% |
+| `tr_whisper_s1500` | 16 | 0.888 | 0.403 | 0.073 | 12.164 | **5.521** | -54.6% |
+| `tr_bert_b8_s128` | 8 | 0.386 | 0.380 | 0.134 | 2.881 | 2.836 | -1.6% |
+| `tr_bert_b8_s128` | 16 | 0.546 | 0.543 | 0.119 | 4.588 | 4.563 | -0.5% |
+| `kvcat_llama3_p1023` | 8 | 0.587 | 0.585 | 0.072 | 8.153 | 8.125 | -0.3% |
+| `kvcat_llama3_p1023` | 16 | 0.562 | 0.583 | 0.074 | 7.595 | 7.878 | +3.7% |
+| `kvcat_llama3_p2047` | 8 | 1.452 | 1.542 | 0.087 | 16.690 | 17.724 | +6.2% |
+| `kvcat_llama3_p2047` | 16 | 1.457 | 1.399 | 0.105 | 13.876 | 13.324 | -4.0% |
+| `kvcat_llama3_p4095` | 8 | 4.930 | 4.822 | 0.237 | 20.802 | 20.346 | -2.2% |
+| `kvcat_llama3_p4095` | 16 | 4.971 | 4.921 | 0.265 | 18.758 | 18.570 | -1.0% |
+| `kvcat_llama3_p8191` | 8 | 7.292 | 6.370 | 1.110 | 6.569 | **5.739** | -12.6% |
+| `kvcat_llama3_p8191` | 16 | 7.028 | 6.505 | 1.015 | 6.924 | **6.409** | -7.4% |
+| `kvcat_llama3_b8_p2047` | 8 | 15.272 | 14.699 | 2.949 | 5.179 | 4.984 | -3.8% |
+| `kvcat_llama3_b8_p2047` | 16 | 15.090 | 14.497 | 2.969 | 5.083 | 4.883 | -3.9% |
+
+This is the full matrix, every cell measured. Two cells regress: `kvcat_p2047`
+at 8 threads by **+6.2%** and `kvcat_p1023` at 16 threads by **+3.7%**. Both are
+inside the +-8-13% noise floor established in §22.2, both are graphs whose
+per-tensor input (8 MiB and 4 MiB) means only one of them can even reach the
+parallel path, and both have a flat paired native-only ratio in §22.3 (+3.2% and
++1.4%, per-rep ranges spanning 1.0). They are reported as regressions rather
+than explained away; no separate dispersion was collected for this table, so
+they cannot be excluded on this data alone.
+
+**These `ser/ort` ratios are not comparable to §20.2's.** §20.2 measured both
+runtimes in one process; here ORT runs alone and is much faster in absolute
+terms, so the denominators differ. Use §22.4 only for the `par/ort` vs `ser/ort`
+comparison within a row.
+
+### 22.5 What this does and does not claim
+
+* The two Transpose graphs above the threshold - `tr_llama3_s512` and
+  `tr_whisper_s1500` - go from 6.9-14.5x ORT to **3.0-5.8x ORT**. Still a loss;
+  a large fraction of what remains is `collect_outputs` (§21) and the
+  single-node harness's double-copy artefact (§21.3).
+* `kvcat_llama3_p8191` improves 7-13%. The other `Concat` rows do not move,
+  because their inputs are at or below the threshold or their runtime is
+  dominated by real `Concat` work.
+* Nothing at or below 2 MiB is touched. Decode-shaped graphs - the ones §10
+  actually assigns - bind under a megabyte and take the serial path unchanged,
+  and after §22.6 they do not so much as query the Rayon pool.
+* No numerical change of any kind: the bytes written are identical, and a
+  bit-identity falsifier plus a non-vacuity counter enforce it in CI.
+
+### 22.6 What CI caught that no benchmark would have
+
+The first version of the gate asked `host_copy_workers()` before it looked at
+the size. `host_copy_workers()` calls `rayon::current_num_threads()`, and that
+call **initialises the global Rayon pool**. So every process that bound a graph
+input started a thread pool, whatever the size of the copy - including processes
+that never run a parallel kernel at all.
+
+Nothing in §22 would have found this. Every benchmark here runs a model, and any
+model already has the pool up; the cost is invisible once it is paid. What found
+it was the Miri job, which reported UB inside `crossbeam-epoch`'s epoch reclaim
+during pool teardown in `onnx-runtime-session`'s `tensor::tests` and
+`sequence::tests` - test binaries that had previously never started Rayon.
+
+The UB is in crossbeam's provenance handling under Stacked Borrows, not in this
+change, but the change is what caused those binaries to execute it. Reproduced
+and bisected locally:
+
+| gate order | `tensor::tests` | `sequence::tests` | `prefetch` | `device_binding_tests` |
+|---|---|---|---|---|
+| workers, then size | **UB** | **UB** | ok | ok |
+| size, then workers | ok | ok | ok | ok |
+
+The fix is to decide on size first - a cached atomic load - and only ask about
+workers once a copy is known to be over the threshold. Below the threshold
+nothing touches Rayon, which is what the "decode-shaped graphs are untouched"
+claim was always supposed to mean.
+
+One caveat on calling the report a false positive. During review of this fix a
+full `-p onnx-runtime-ep-cpu --lib` run died with SIGSEGV once at process exit
+and then passed three times, on a host under heavy contention. That is not
+caused by this change - the parallel-copy tests start Rayon whatever the gate
+order - but it is the same teardown path Miri objects to, so "known false
+positive" may be understating it. Recorded here rather than dismissed; it is a
+dependency-level question, not one this section can settle.
+
+The lesson worth recording: a performance change can be neutral on every
+benchmark and still alter process-wide behaviour. The soundness job was the only
+instrument pointed at that.
+
+### 22.7 Re-verification after the review rework
+
+Review found that the threshold lookup ran `std::env::var` on *every* copy,
+before any size check - a locked `getenv` plus a `String` allocation charged to
+the small-copy path this change claims to leave alone. The environment is now
+read once per process into a `OnceLock` and the cheap worker-count gate runs
+first. That is a material change to the measured code, so the headline cells
+were re-measured on the shipped version rather than assumed to carry over.
+
+Paired, same binary, one process per arm, 16-thread budget, `native` p50 in ms:
+
+Values are listed sorted, so they are marginals rather than paired samples. The
+ratio range is therefore the **widest ratio any pairing could produce** -
+`min(parallel) / max(serial)` to `max(parallel) / min(serial)` - which is the only
+bound the data supports, applied identically to every row.
+
+| graph | per-tensor input | reps | serial | parallel | ratio range |
+|---|---|--:|---|---|---|
+| `tr_llama3_s512` | 8 MiB | 5 | 0.772 / 0.806 / 0.815 / 0.860 / 0.864 | 0.343 / 0.405 / 0.419 / 0.424 / 0.439 | **0.40-0.57** |
+| `tr_bert_b8_s128` (control) | 3 MiB | 3 | 0.514 / 0.531 / 0.535 | 0.520 / 0.542 / 0.546 | 0.97-1.06 |
+| `sm_decode_h32_kv1024` (control) | 0.125 MiB | 3 | 0.023 / 0.023 / 0.024 | 0.023 / 0.023 / 0.023 | 0.96-1.00 |
+
+The `tr_llama3_s512` win survives the rework: even the worst pairing is 0.57, so
+every repetition is a win. The two control graphs - one just below the threshold,
+one two orders of magnitude below it - are flat.
+
+**The control rows are not a falsifier for the per-call `env::var` the review
+removed.** That call cost ~72 ns, which is 0.3% of the 23 us decode run - below
+this measurement's 1 us display resolution and well inside the row's own ~4%
+spread. The evidence that the read is now cached is the code, not this table.
+What these rows do show is that the reworked gate ordering did not disturb the
+below-threshold path, which is what they are here for.
