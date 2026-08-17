@@ -147,6 +147,116 @@ impl CpuExecutionProvider {
     }
 }
 
+/// Smallest host copy worth splitting across threads.
+///
+/// Calibrated **in the session**, not in a micro-benchmark. A loop that copies
+/// the same buffer repeatedly measures an L3-resident copy and says the
+/// crossover is tens of MiB; the session copies a graph input that the previous
+/// run's output and intermediates have already evicted, so the read comes from
+/// DRAM and parallelises far earlier. Trusting the micro-benchmark set this
+/// threshold 6x too high and left a 3.3x win on the floor.
+///
+/// Measured with `bench_generic --phase-profile`, `run_scoped.bind_inputs`
+/// microseconds per run, 25 runs after 10 warmups, 16-thread decode budget,
+/// median of 3 interleaved repetitions on an AMD EPYC 9V74 (16C/32T, 32 MiB L3)
+/// shared with other tenants:
+///
+/// | graph | input | serial | parallel | parallel/serial |
+/// |---|--:|--:|--:|--:|
+/// | `sm_decode_h32_kv1024` | 0.125 MiB | **4.8 us** | 108.5 | 22.6x worse |
+/// | `sm_decode_h32_kv4096` | 0.5 MiB | **15.6** | 134.9 | 8.6x worse |
+/// | `sm_decode_h32_kv8192` | 1 MiB | **31.5** | 130.4 | 4.1x worse |
+/// | `rope_llama3_s1` | 2 MiB | **62.2** | 231.4 | 3.7x worse |
+/// | `tr_bert_b8_s128` | 3 MiB | 372.6 | **120.9** | 3.1x better |
+/// | `rope_llama3_s128` | 4 MiB | 353.4 | **255.9** | 1.4x better |
+/// | `sm_bert_b8_s128` | 6 MiB | 391.8 | **126.1** | 3.1x better |
+/// | `tr_llama3_s512` | 8 MiB | 589.8 | **178.3** | 3.3x better |
+/// | `rope_llama3_s512` | 10 MiB | 718.0 | **314.9** | 2.3x better |
+/// | `kvcat_llama3_p2047` | 16 MiB | 698.8 | **645.6** | 1.08x better |
+/// | `kvcat_llama3_p4095` | 32 MiB | 1714.9 | **1525.6** | 1.12x better |
+/// | `kvcat_llama3_p8191` | 64 MiB | 3501.3 | **3032.9** | 1.15x better |
+/// | `kvcat_llama3_b8_p2047` | 128 MiB | 7377.6 | **7188.5** | 1.03x better |
+///
+/// Two honest caveats about that table:
+///
+/// * The cliff between 2 MiB (3.7x worse) and 3 MiB (3.1x better) is not really
+///   a *size* effect. Below it the serial copy runs at 33-34 GB/s, which is a
+///   cache-resident rate; above it, at 8-12 GB/s, which is a DRAM rate. What the
+///   threshold actually separates is "the input survives in L3 between runs"
+///   from "it does not", and byte count is only a proxy for that. A model whose
+///   working set happens to stay resident above the threshold would pay the
+///   fan-out for nothing.
+/// * That fan-out is ~110 us here, which is large for Rayon and reflects a
+///   contended host where waking eight sleeping workers waits on the OS
+///   scheduler. On an idle machine it is smaller and the threshold could be
+///   lower; it is not tuned for the idle case because production hosts are not
+///   idle.
+///
+/// So the threshold sits at 4 MiB: above every measured loss, at or below every
+/// measured win, and one whole step clear of the 2 MiB cliff rather than
+/// balanced on it. The 3 MiB win is knowingly left on the floor to buy that
+/// margin.
+///
+/// `ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES` overrides it, which is how the
+/// ladder above was swept; `0` disables the parallel path entirely.
+const HOST_COPY_PARALLEL_MIN_BYTES: usize = 4 << 20;
+
+/// The active threshold, honouring the environment override.
+///
+/// Read on every call rather than cached: a `OnceLock` here would make the
+/// first copy in a process fix the value for every later session, which breaks
+/// a sweep and makes the tests order-dependent. The read is a thread-local
+/// environment lookup against a copy that is already at least 24 MiB.
+fn host_copy_parallel_min_bytes() -> usize {
+    std::env::var("ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(HOST_COPY_PARALLEL_MIN_BYTES)
+}
+
+/// Workers available to a host copy: the decode budget, never the raw machine.
+///
+/// `rayon::current_num_threads()` is the whole machine unless something bounded
+/// the global pool. `--native-threads` / `ONNX_GENAI_CPU_DECODE_THREADS` does
+/// bound it (`bound_process_to_decode_budget`), so reading the pool here
+/// respects an explicit budget while still capping at 8: a host copy is
+/// bandwidth-bound, the ladder above was measured at this cap, and widening the
+/// fan-out only adds workers to wake for the same DRAM.
+fn host_copy_workers() -> usize {
+    rayon::current_num_threads().clamp(1, 8)
+}
+
+/// Test-only count of copies that actually took the parallel path.
+///
+/// Without it a test that sets the threshold to 1 proves nothing on a machine
+/// whose Rayon pool is one worker wide - it would silently measure the serial
+/// path twice and pass. CI runners are exactly such machines.
+#[cfg(test)]
+static PARALLEL_HOST_COPIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `dst.copy_from_slice(src)`, split across the decode budget when that is
+/// faster and byte-for-byte identical either way.
+fn copy_host_bytes(src: &[u8], dst: &mut [u8]) {
+    debug_assert_eq!(src.len(), dst.len());
+    let threshold = host_copy_parallel_min_bytes();
+    let workers = host_copy_workers();
+    if threshold == 0 || src.len() < threshold || workers < 2 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    // Equal contiguous chunks, so no worker straddles the boundary and the
+    // union is exactly `src`. `par_chunks_mut`/`par_chunks` walk the same
+    // split, so chunk `i` of the destination receives chunk `i` of the source.
+    #[cfg(test)]
+    PARALLEL_HOST_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let chunk = src.len().div_ceil(workers);
+    use rayon::prelude::*;
+    dst.par_chunks_mut(chunk)
+        .zip(src.par_chunks(chunk))
+        .for_each(|(d, s)| d.copy_from_slice(s));
+}
+
 impl ExecutionProvider for CpuExecutionProvider {
     fn name(&self) -> &str {
         "cpu_ep"
@@ -436,6 +546,45 @@ impl ExecutionProvider for CpuExecutionProvider {
         Ok(())
     }
 
+    /// Host upload, parallelised above a calibrated size.
+    ///
+    /// The session copies every graph input through here once per run, so for
+    /// a large activation or KV-cache input this is the single biggest item in
+    /// a run - measured at 3.6 ms of a 7.3 ms `Concat` benchmark, moving 64 MiB
+    /// at 18.5 GB/s on one core. Splitting the copy across the decode budget
+    /// reaches roughly 37 GB/s on this host.
+    ///
+    /// It is *only* a win once the copy is large enough to pay for the
+    /// fan-out - below a few MiB the input is still cache-resident and one core
+    /// already saturates it, so splitting costs up to 22x. Hence the threshold,
+    /// and hence the base implementation stays exactly as it was below it. See
+    /// [`HOST_COPY_PARALLEL_MIN_BYTES`] for the measured ladder.
+    fn copy_from_host(&self, src: &[u8], dst: &mut DeviceBuffer) -> Result<()> {
+        if !dst.device().is_host_accessible() {
+            return Err(EpError::KernelFailed(format!(
+                "cpu_ep: host upload is not implemented for device {:?}",
+                dst.device()
+            )));
+        }
+        if src.len() > dst.len() {
+            return Err(EpError::KernelFailed(format!(
+                "cpu_ep: host upload of {} bytes exceeds destination {} bytes",
+                src.len(),
+                dst.len()
+            )));
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: host accessibility and `src.len() <= dst.len()` are checked
+        // above, and `dst` is uniquely borrowed, so this names a live host
+        // allocation of at least `src.len()` bytes that nothing else aliases.
+        let out =
+            unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), src.len()) };
+        copy_host_bytes(src, out);
+        Ok(())
+    }
+
     fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<()> {
         // Invariant #3: both endpoints must belong to this EP.
         assert_eq!(
@@ -478,6 +627,150 @@ impl ExecutionProvider for CpuExecutionProvider {
 
     fn sync(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod host_copy_tests {
+    use super::{
+        HOST_COPY_PARALLEL_MIN_BYTES, PARALLEL_HOST_COPIES, copy_host_bytes,
+        host_copy_parallel_min_bytes, host_copy_workers,
+    };
+    use onnx_runtime_ep_api::{DeviceType, ExecutionProvider};
+    use std::sync::atomic::Ordering;
+
+    fn ramp(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i.wrapping_mul(31) ^ (i >> 5)) as u8)
+            .collect()
+    }
+
+    /// The whole point: whichever side of the threshold a copy lands on, the
+    /// destination bytes are identical. A chunking bug that dropped, doubled or
+    /// misordered a boundary chunk would show here.
+    #[test]
+    fn the_parallel_and_serial_copies_produce_identical_bytes() {
+        // Sizes that straddle the chunk split awkwardly: primes, one byte over
+        // a chunk boundary, and a size that is not a multiple of the worker
+        // count.
+        for &len in &[
+            1usize,
+            7,
+            4095,
+            4096,
+            4097,
+            1 << 20,
+            (1 << 20) + 13,
+            3 * (1 << 20) + 1,
+        ] {
+            let src = ramp(len);
+            let mut serial = vec![0u8; len];
+            let mut parallel = vec![0u8; len];
+
+            // SAFETY of the comparison: both paths are exercised explicitly by
+            // moving the threshold, not by hoping `len` lands on either side.
+            unsafe { std::env::set_var("ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES", "0") };
+            copy_host_bytes(&src, &mut serial);
+            unsafe { std::env::set_var("ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES", "1") };
+            let before = PARALLEL_HOST_COPIES.load(Ordering::Relaxed);
+            copy_host_bytes(&src, &mut parallel);
+            let took_parallel = PARALLEL_HOST_COPIES.load(Ordering::Relaxed) > before;
+            unsafe { std::env::remove_var("ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES") };
+
+            // On a single-worker pool the "parallel" arm is the serial path and
+            // proves nothing; say so rather than passing vacuously.
+            if host_copy_workers() >= 2 {
+                assert!(
+                    took_parallel,
+                    "threshold 1 did not reach the parallel path at len {len}"
+                );
+            }
+            assert_eq!(serial, src, "serial copy is not the source at len {len}");
+            assert_eq!(
+                parallel, src,
+                "parallel copy diverges from the source at len {len}"
+            );
+        }
+    }
+
+    /// A falsifier for the calibration, not a restatement of the constant. The
+    /// in-session ladder (see the constant's docs) measured 2 MiB inputs 3.7x
+    /// *slower* with threads and 4 MiB inputs 1.4x faster, so the threshold has
+    /// to land strictly between them. Retuning inside that band is fine;
+    /// moving outside it has to fail here rather than silently regress the
+    /// small-input path.
+    #[test]
+    fn the_threshold_excludes_the_size_that_measured_slower_with_threads() {
+        const {
+            assert!(
+                HOST_COPY_PARALLEL_MIN_BYTES > 2 << 20,
+                "2 MiB inputs were 3.7x slower parallel in-session; the threshold must exclude them"
+            );
+            assert!(
+                HOST_COPY_PARALLEL_MIN_BYTES <= 4 << 20,
+                "4 MiB inputs were 1.4x faster parallel in-session; the threshold must admit them"
+            );
+        }
+    }
+
+    /// The override has to actually take effect, or the sweep that produced the
+    /// table above measured nothing.
+    #[test]
+    fn the_environment_override_replaces_the_calibrated_threshold() {
+        unsafe { std::env::set_var("ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES", "12345") };
+        let overridden = host_copy_parallel_min_bytes();
+        unsafe { std::env::remove_var("ONNX_GENAI_HOST_COPY_PARALLEL_MIN_BYTES") };
+        assert_eq!(overridden, 12345);
+        assert_eq!(host_copy_parallel_min_bytes(), HOST_COPY_PARALLEL_MIN_BYTES);
+    }
+
+    /// The fan-out is capped at the width the ladder was measured with,
+    /// regardless of how wide the Rayon pool is.
+    #[test]
+    fn the_worker_count_is_capped_at_the_measured_optimum() {
+        let workers = host_copy_workers();
+        assert!(
+            (1..=8).contains(&workers),
+            "host copy fan-out {workers} left the measured 1..=8 range"
+        );
+    }
+
+    /// End-to-end through the EP: a real upload larger than the threshold must
+    /// land every byte in the destination buffer.
+    #[test]
+    fn a_large_upload_through_the_provider_lands_every_byte() {
+        let ep = super::CpuExecutionProvider::new();
+        assert_eq!(ep.device_type(), DeviceType::Cpu);
+        let len = (HOST_COPY_PARALLEL_MIN_BYTES) + 4097;
+        let src = ramp(len);
+        let mut buf = ep.allocate(len, 64).expect("allocate");
+        ep.copy_from_host(&src, &mut buf).expect("upload");
+        // SAFETY: `buf` is a live host allocation of `len` bytes from this EP.
+        let got = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), len) };
+        assert_eq!(got, &src[..]);
+        ep.deallocate(buf).expect("free");
+    }
+
+    /// An upload smaller than the destination must not touch the tail, and one
+    /// larger than the destination must be rejected rather than overrun it.
+    #[test]
+    fn a_short_upload_leaves_the_tail_alone_and_an_oversized_one_is_rejected() {
+        let ep = super::CpuExecutionProvider::new();
+        let cap = 1 << 12;
+        let mut buf = ep.allocate(cap, 64).expect("allocate");
+        // SAFETY: `buf` is a live host allocation of `cap` bytes.
+        unsafe { std::ptr::write_bytes(buf.as_mut_ptr().cast::<u8>(), 0xAB, cap) };
+        let src = ramp(cap / 2);
+        ep.copy_from_host(&src, &mut buf).expect("short upload");
+        // SAFETY: as above.
+        let got = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), cap) };
+        assert_eq!(&got[..cap / 2], &src[..]);
+        assert!(
+            got[cap / 2..].iter().all(|&b| b == 0xAB),
+            "a short upload overwrote bytes past its own length"
+        );
+        assert!(ep.copy_from_host(&ramp(cap + 1), &mut buf).is_err());
+        ep.deallocate(buf).expect("free");
     }
 }
 
