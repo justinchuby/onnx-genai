@@ -161,6 +161,10 @@ impl CpuExecutionProvider {
 /// median of 3 interleaved repetitions on an AMD EPYC 9V74 (16C/32T, 32 MiB L3)
 /// shared with other tenants:
 ///
+/// `input` is the total over a graph's inputs; the `kvcat_*` rows take two large
+/// past-KV tensors each, so the per-tensor size that actually decides the path
+/// is half the figure shown.
+///
 /// | graph | input | serial | parallel | parallel/serial |
 /// |---|--:|--:|--:|--:|
 /// | `sm_decode_h32_kv1024` | 0.125 MiB | **4.8 us** | 108.5 | 22.6x worse |
@@ -258,15 +262,17 @@ fn host_copy_workers() -> usize {
     rayon::current_num_threads().clamp(1, 8)
 }
 
-/// Test-only count of copies that actually took the parallel path, per thread.
-///
-/// Without it a test that sets the threshold to 1 proves nothing on a machine
-/// whose Rayon pool is one worker wide - it would silently measure the serial
-/// path twice and pass. CI runners are exactly such machines. It is
-/// thread-local, not a global atomic, so a concurrently running test cannot
-/// bump another test's count and make its non-vacuity check pass spuriously.
 #[cfg(test)]
 thread_local! {
+    /// Test-only count of copies that actually took the parallel path, per
+    /// thread.
+    ///
+    /// Without it a test that sets the threshold to 1 proves nothing on a
+    /// machine whose Rayon pool is one worker wide - it would silently measure
+    /// the serial path twice and pass. CI runners are exactly such machines. It
+    /// is thread-local, not a global atomic, so a concurrently running test
+    /// cannot bump another test's count and make its non-vacuity check pass
+    /// spuriously.
     static PARALLEL_HOST_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 

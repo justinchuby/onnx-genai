@@ -1266,6 +1266,13 @@ Single-arm, merged `main`, same host, interleaved with a real ORT CPU session, 5
 `native p50 / ORT p50`**, lower is better; brackets give the min-max across the 5 trials.
 Nothing omitted.
 
+**These are pre-§22 numbers and the transform rows are now stale.** §22
+parallelises the input binding that §21 showed dominates these graphs, which
+moves the `tr_*` rows substantially. §22.4 gives the after-state, but in a
+different harness (separate processes) whose ORT denominators are not comparable
+to this table's, so the two must not be divided into each other. This table is
+kept as the measured before-state of the harness it was taken in.
+
 | graph | t=1 | t=8 | t=16 | native p50 @16 |
 |---|--:|--:|--:|--:|
 | `tr_bert_b8_s128` | 1.090 [1.056-1.133] | 3.188 [2.613-3.440] | 4.600 [3.846-5.314] | 0.558 ms |
@@ -1308,7 +1315,9 @@ work.
   would move all eight rows above; no operator change will. Which part of it dominates is
   not yet measured (§20.1), so that is the next instrument to build, before the next
   optimisation. **§21 builds that instrument and answers this**: for the Transpose graphs
-  the per-run path is 60-74% input binding and 25-38% boundary materialisation.
+  the per-run path is 60-74% input binding and 25-38% boundary materialisation. **§22
+  then attacks the input binding**, taking the Transpose graphs from 6.9-14.5x ORT to
+  3.0-5.8x ORT. Boundary materialisation is untouched and remains open.
 * **`Concat` remains a genuine kernel cost** and remains bounded by §13: `ExternalValue`
   carries no strides, so a `Concat`-shaped KV cache cannot append in place. The Phase 4
   in-place append (#1083) applies to the GQA-shaped cache, not this one.
@@ -1436,7 +1445,11 @@ the threshold *in-session* over a 13-point input-size ladder gives a completely
 different answer. `bind_inputs` microseconds, median of 3 interleaved
 repetitions, 16-thread budget, one process per arm:
 
-| graph | per-tensor input | serial | parallel | parallel vs serial |
+`input` is the **total** over a graph's inputs. The threshold is applied per
+tensor, so for the `kvcat_*` rows - which take two large past-KV tensors each -
+the size that actually decides the path is half the number shown.
+
+| graph | input | serial | parallel | parallel vs serial |
 |---|--:|--:|--:|---|
 | `sm_decode_h32_kv1024` | 0.125 MiB | 4.8 | 108.5 | 22.6x worse |
 | `sm_decode_h32_kv4096` | 0.5 MiB | 15.6 | 134.9 | 8.6x worse |
@@ -1453,10 +1466,13 @@ repetitions, 16-thread budget, one process per arm:
 | `kvcat_llama3_b8_p2047` | 128 MiB | 7377.6 | 7188.5 | 1.03x better |
 
 The cliff between 2 MiB and 3 MiB is **a cache-residency effect, not a size
-effect**: below it the serial rate is 33-34 GB/s, above it 8-12 GB/s. Byte count
-is only a proxy for "is the source in L3", and it is the only proxy available at
-the call site. Rayon fan-out costs about 110 us here - large, and it reflects
-waking sleeping workers on a contended host.
+effect**. Immediately either side of it the serial rate collapses from 33-34 GB/s
+(2 MiB and below, an L3 rate) to 8-12 GB/s (3-4 MiB, a DRAM rate). That band
+describes the cliff only: the 0.125 MiB row is 27.3 GB/s, and above 4 MiB the
+serial rate climbs back to 14-24 GB/s as the fixed per-copy cost amortises. Byte
+count is only a proxy for "is the source in L3", and it is the only proxy
+available at the call site. Rayon fan-out costs about 110 us here - large, and it
+reflects waking sleeping workers on a contended host.
 
 The threshold is **4 MiB**: above every measured loss, at or below every measured
 win, one step clear of the cliff rather than sitting on it.
@@ -1526,9 +1542,14 @@ Medians of 5 repetitions.
 | `kvcat_llama3_b8_p2047` | 8 | 15.272 | 14.699 | 2.949 | 5.179 | 4.984 | -3.8% |
 | `kvcat_llama3_b8_p2047` | 16 | 15.090 | 14.497 | 2.969 | 5.083 | 4.883 | -3.9% |
 
-This is the full matrix, every cell measured. No cell regresses beyond the +-6%
-dispersion of the control rows; the two `+6.2%` and `+3.7%` cells are single-rep
-noise on graphs whose paired native-only ratio (§22.3) is flat.
+This is the full matrix, every cell measured. Two cells regress: `kvcat_p2047`
+at 8 threads by **+6.2%** and `kvcat_p1023` at 16 threads by **+3.7%**. Both are
+inside the +-8-13% noise floor established in §22.2, both are graphs whose
+per-tensor input (8 MiB and 4 MiB) means only one of them can even reach the
+parallel path, and both have a flat paired native-only ratio in §22.3 (+3.2% and
++1.4%, per-rep ranges spanning 1.0). They are reported as regressions rather
+than explained away; no separate dispersion was collected for this table, so
+they cannot be excluded on this data alone.
 
 **These `ser/ort` ratios are not comparable to §20.2's.** §20.2 measured both
 runtimes in one process; here ORT runs alone and is much faster in absolute
@@ -1537,7 +1558,7 @@ comparison within a row.
 
 ### 22.5 What this does and does not claim
 
-* The Transpose graphs go from 11.0-14.5x ORT to **3.0-5.8x ORT**. Still a loss;
+* The Transpose graphs go from 6.9-14.5x ORT to **3.0-5.8x ORT**. Still a loss;
   a large fraction of what remains is `collect_outputs` (§21) and the
   single-node harness's double-copy artefact (§21.3).
 * `kvcat_llama3_p8191` improves 7-13%. The other `Concat` rows do not move,
