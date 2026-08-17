@@ -5527,6 +5527,194 @@ fn constant_weights_are_reported_to_kernels_as_constant() {
     }
 }
 
+/// A `MatMulNBits` whose `B` and `scales` are declared **both** as
+/// initializers and as graph inputs.
+///
+/// From ONNX IR version 4 that combination means the initializer is only a
+/// default: the caller may hand a different tensor in on any `Run`, and ORT
+/// says so in its load log ("Initializer B appears in graph inputs and will
+/// not be treated as constant value/weight"). `Graph_GetInitializers` still
+/// lists it — its own documentation says it "includes constant and
+/// non-constant initializers" — so a name-only membership test would call it a
+/// weight, and this crate would cache a prepack of the default for the life of
+/// the session.
+///
+/// Returns the case with every operand supplied at run time, plus a second
+/// `B` payload that produces different outputs.
+fn overridable_nbits_case() -> (MatmulFamilyCase, Vec<u8>) {
+    const M: usize = 1;
+    const K: usize = 64;
+    const N: usize = 64;
+    const BLOCK: usize = 32;
+    let blocks_per_col = K / BLOCK;
+    let blob = BLOCK / 2;
+    let b_elements = N * blocks_per_col * blob;
+    let scale_elements = N * blocks_per_col;
+    let b_dims = vec![N as i64, blocks_per_col as i64, blob as i64];
+    let scale_dims = vec![scale_elements as i64];
+    let a_dims = vec![M as i64, K as i64];
+
+    let default_b = printable_weight_blob(b_elements);
+    let scales = printable_scale_blob(scale_elements);
+    let model = format!(
+        r#"ir_version: 10
+graph {{
+  node: [{{
+    input: ["A", "B", "scales"]
+    output: ["Y"]
+    op_type: "MatMulNBits"
+    domain: "com.microsoft"
+    attribute: [
+      {{ name: "K" type: INT i: {K} }},
+      {{ name: "N" type: INT i: {N} }},
+      {{ name: "bits" type: INT i: 4 }},
+      {{ name: "block_size" type: INT i: {BLOCK} }}
+    ]
+  }}]
+  name: "nbits4_overridable"
+  initializer: [{}, {}]
+  input: [{}, {}, {}]
+  output: [{}]
+}}
+opset_import: [{{ version: 17 }}, {{ domain: "com.microsoft" version: 1 }}]
+"#,
+        textproto_initializer("B", ELEM_U8, &b_dims, &default_b),
+        textproto_initializer("scales", ELEM_F32, &scale_dims, &scales),
+        textproto_value_info("A", ELEM_F32, &a_dims),
+        textproto_value_info("B", ELEM_U8, &b_dims),
+        textproto_value_info("scales", ELEM_F32, &scale_dims),
+        textproto_value_info("Y", ELEM_F32, &[M as i64, N as i64]),
+    );
+
+    // Bit-complement of the default, so every 4-bit nibble changes and no
+    // output element can coincide by construction.
+    let other_b: Vec<u8> = default_b.as_bytes().iter().map(|b| !*b).collect();
+    let case = MatmulFamilyCase {
+        name: "nbits4_overridable",
+        op: "MatMulNBits",
+        model,
+        inputs: vec![
+            GeneratedInput {
+                name: "A",
+                elem: ELEM_F32,
+                dims: a_dims,
+                data: f32_slice_to_bytes(&activation_f32(M, K)),
+            },
+            GeneratedInput {
+                name: "B",
+                elem: ELEM_U8,
+                dims: b_dims,
+                data: default_b.as_bytes().to_vec(),
+            },
+            GeneratedInput {
+                name: "scales",
+                elem: ELEM_F32,
+                dims: scale_dims,
+                data: scales.as_bytes().to_vec(),
+            },
+        ],
+        output: "Y",
+        output_elem: ELEM_F32,
+        ort_can_build: true,
+        tolerance: 0.5,
+    };
+    (case, other_b)
+}
+
+/// An initializer the caller may override is **not** a constant weight, and
+/// overriding it must change the answer.
+///
+/// Two independent falsifiers, because either one alone is weak: the counter
+/// pins the classification (it reads 2 if membership is keyed on
+/// `Graph_GetInitializers` names alone), and the numeric check pins the
+/// consequence — a session-lifetime prepack of the default would return run
+/// one's answer for run two, which ORT, used here as the oracle, does not.
+#[test]
+fn an_overridable_initializer_is_not_treated_as_a_constant_weight() {
+    let _lock = lock_ort_ep();
+    let ep_path = match find_ep_cdylib() {
+        Some(p) => p,
+        None => {
+            if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+                panic!("NXRT_REQUIRE_ORT_TESTS=1 but the EP cdylib is missing");
+            }
+            eprintln!("*** SKIPPED: EP cdylib not found ***");
+            return;
+        }
+    };
+    let ep_lib = unsafe { libloading::Library::new(&ep_path) }.expect("dlopen EP cdylib");
+    let read: libloading::Symbol<'_, unsafe extern "C" fn() -> usize> =
+        unsafe { ep_lib.get(b"nxrt_ep_constant_weight_inputs") }
+            .expect("nxrt_ep_constant_weight_inputs not exported");
+    let reset: libloading::Symbol<'_, unsafe extern "C" fn()> =
+        unsafe { ep_lib.get(b"nxrt_ep_reset_constant_weight_inputs") }
+            .expect("nxrt_ep_reset_constant_weight_inputs not exported");
+
+    let (case, other_b) = overridable_nbits_case();
+    let mut overridden = case.clone();
+    overridden.inputs[1].data = other_b;
+    let path = write_generated_model(case.name, &case.model);
+    let reg = "cpu_ep_overridable_init";
+    unsafe { reset() };
+    let Some((_lib, api, env, opts, session)) = (unsafe { conformance_setup(reg, &path, true) })
+    else {
+        eprintln!("*** SKIPPED: ORT not found ***");
+        return;
+    };
+    let observed = unsafe { read() };
+    let ours_default = unsafe { run_generated_case(api, session, &case, "overridable/default") };
+    let ours_other = unsafe { run_generated_case(api, session, &overridden, "overridable/other") };
+    unsafe { conformance_teardown(api, env, opts, session, reg) };
+
+    assert_eq!(
+        observed, 0,
+        "an initializer that is also a graph input may be replaced on any Run, \
+         but this EP reported {observed} of them as constant weights"
+    );
+
+    // ORT as the oracle: same model, same two payloads, its own CPU EP.
+    let (ort_default, ort_other) = {
+        let Some((_lib2, api2, env2, opts2, session2)) =
+            (unsafe { conformance_setup("cpu_ep_overridable_oracle", &path, true) })
+        else {
+            eprintln!("*** SKIPPED: ORT not found for the oracle run ***");
+            return;
+        };
+        let plain = unsafe { try_plain_ort_session(api2, env2, &path) }
+            .expect("ORT can build this MatMulNBits");
+        let d = unsafe { run_generated_case(api2, plain.1, &case, "oracle/default") };
+        let o = unsafe { run_generated_case(api2, plain.1, &overridden, "oracle/other") };
+        unsafe {
+            ((*api2).ReleaseSession.unwrap())(plain.1);
+            ((*api2).ReleaseSessionOptions.unwrap())(plain.0);
+        }
+        unsafe { conformance_teardown(api2, env2, opts2, session2, "cpu_ep_overridable_oracle") };
+        (d, o)
+    };
+
+    assert!(
+        ort_default
+            .iter()
+            .zip(ort_other.iter())
+            .any(|(a, b)| (a - b).abs() > case.tolerance),
+        "the two B payloads must produce different outputs or this test proves nothing"
+    );
+    for (stage, ours, theirs) in [
+        ("default", &ours_default, &ort_default),
+        ("overridden", &ours_other, &ort_other),
+    ] {
+        assert_eq!(ours.len(), theirs.len(), "{stage}: output length");
+        for (i, (a, b)) in ours.iter().zip(theirs.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= case.tolerance,
+                "{stage}: element {i} is {a} but ORT says {b} — a stale prepack of the \
+                 default initializer would look exactly like this"
+            );
+        }
+    }
+    eprintln!("  [overridable] 0 constant inputs; both payloads match ORT");
+}
+
 // ─── Plugin-path A/B benchmark ────────────────────────────────────────────────
 
 /// Time `iters` `Run` calls over pre-created input tensors, returning

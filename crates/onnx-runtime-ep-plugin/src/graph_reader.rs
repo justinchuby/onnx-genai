@@ -22,13 +22,20 @@ pub struct OutboundGraphReader {
     /// Owned copies of small int64 initializer tensors, keyed by value name.
     /// Used to resolve opset-13 Unsqueeze/Squeeze axes from constant inputs.
     initializer_int64: HashMap<String, Vec<i64>>,
-    /// Names of every initializer in this graph, whatever its dtype.
+    /// Names of every **constant** initializer in this graph, whatever its
+    /// dtype.
     ///
     /// ORT hands a fused node's subgraph over with its initializers listed as
     /// *graph inputs* of that subgraph, so `is_graph_input` cannot distinguish
-    /// a weight from an activation at Compile time. This set can: it comes
-    /// from `Graph_GetInitializers`, which lists only the constants ORT owns
-    /// for the lifetime of the session.
+    /// a weight from an activation at Compile time. This set can.
+    ///
+    /// `Graph_GetInitializers` alone is not enough: its own documentation says
+    /// it "includes constant and non-constant initializers", and from ONNX IR
+    /// version 4 an initializer that is also declared as a graph input is only
+    /// a *default* — the caller may replace it at every `Run`. Caching a
+    /// prepack of one of those would return the default value's answer forever.
+    /// Membership here therefore also requires
+    /// `ValueInfo_IsConstantInitializer`.
     initializer_names: HashSet<String>,
     /// Out-of-band set of ValueIds that represent absent optional output slots.
     /// This replaces the previous in-band string sentinel (`__absent_output_*`)
@@ -766,13 +773,19 @@ impl OutboundGraphReader {
 
     // ─── Initializer reading ────────────────────────────────────────────
 
-    /// Read the names of every initializer, of any dtype, without touching
-    /// the tensor data.
+    /// Read the names of every **constant** initializer, of any dtype, without
+    /// touching the tensor data.
     ///
     /// `read_initializers_int64` deliberately copies only small int64 tensors,
     /// because it exists to resolve constant axes. Constant-weight detection
     /// needs the opposite: every initializer, including a 1 GB `MatMulNBits`
     /// `B`, and none of the bytes.
+    ///
+    /// Non-constant initializers — IR>=4 defaults for a matching graph input,
+    /// which the caller may override on any `Run` — are excluded. If ORT
+    /// cannot answer whether an initializer is constant, it is treated as
+    /// non-constant: the cost of a false negative is a repeated prepack, the
+    /// cost of a false positive is a wrong answer.
     unsafe fn read_initializer_names(
         api: *const ort::OrtApi,
         graph: *const ort::OrtGraph,
@@ -794,9 +807,20 @@ impl OutboundGraphReader {
 
         let get_name =
             unsafe { (*api).GetValueInfoName }.ok_or("OrtApi.GetValueInfoName is null")?;
+        let is_constant = unsafe { (*api).ValueInfo_IsConstantInitializer }
+            .ok_or("OrtApi.ValueInfo_IsConstantInitializer is null")?;
         let mut names = HashSet::with_capacity(num_init);
         for &info in &init_infos {
             if info.is_null() {
+                continue;
+            }
+            let mut constant = false;
+            let status = unsafe { is_constant(info, &mut constant) };
+            if !status.is_null() {
+                Self::check(status).ok();
+                continue;
+            }
+            if !constant {
                 continue;
             }
             let mut name_ptr: *const std::ffi::c_char = ptr::null();

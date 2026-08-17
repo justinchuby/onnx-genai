@@ -954,9 +954,12 @@ fn ep_compile_inner(
 
 /// Which inputs of `node` are session-lifetime constants.
 ///
-/// A node input that ORT lists as an *initializer* is a weight: ORT owns the
-/// buffer, materializes it once at session creation and cannot change it
-/// between `Run` calls. That is exactly the contract
+/// A node input that ORT lists as a *constant* initializer is a weight: ORT
+/// owns the buffer, materializes it once at session creation and cannot change
+/// it between `Run` calls. An IR>=4 initializer that also appears as a graph
+/// input is only a default value the caller may override per `Run`, and is
+/// deliberately not in that set (see `read_initializer_names`). That is the
+/// contract
 /// [`onnx_runtime_ep_api::kernel::Kernel::set_constant_inputs`] expresses, and
 /// several kernels use it to decide whether a prepack may be built once and
 /// kept in the kernel instance (which lives as long as the session) instead of
@@ -969,14 +972,16 @@ fn ep_compile_inner(
 /// but ORT hands a *fused node's* subgraph over with the initializers it kept
 /// inside listed as graph inputs of that subgraph, so at Compile time every
 /// weight looks like an activation. `Graph_GetInitializers` still distinguishes
-/// them, which is why the flags are keyed by name against that set.
+/// them, which is why the flags are keyed by name against that set — filtered
+/// to the entries `ValueInfo_IsConstantInitializer` accepts, because
+/// `Graph_GetInitializers` also lists IR>=4 defaults the caller may replace.
 ///
 /// Absent optional inputs and unnamed values are never constant: there is
 /// nothing to cache and nothing to key a cache on.
 fn constant_input_flags(
     view: &onnx_runtime_ir::GraphView<'_>,
     node: NodeIndex,
-    initializer_names: &std::collections::HashSet<String>,
+    constant_initializer_names: &std::collections::HashSet<String>,
 ) -> Vec<bool> {
     view.node_inputs(node)
         .iter()
@@ -985,7 +990,7 @@ fn constant_input_flags(
                 view.value(value)
                     .name
                     .as_deref()
-                    .is_some_and(|name| initializer_names.contains(name))
+                    .is_some_and(|name| constant_initializer_names.contains(name))
             })
         })
         .collect()
@@ -2159,7 +2164,7 @@ mod tests {
     /// weight non-constant, which costs `MatMulNBits` its prepack — and, since
     /// its MLAS SQNBit path is gated on the same flag, its fast kernel too.
     #[test]
-    fn initializers_are_constant_even_when_the_subgraph_calls_them_inputs() {
+    fn constant_initializers_are_flagged_even_when_the_subgraph_calls_them_inputs() {
         use onnx_runtime_ir::{Graph, GraphView, GraphViewCache, Node, NodeId, Shape};
         let mut g = Graph::new();
         let a = g.create_named_value("a", DataType::Float32, Shape::default());
@@ -2182,11 +2187,11 @@ mod tests {
         let cache = GraphViewCache::build(&g).unwrap();
         let view = GraphView::new(&g, &cache);
         let node = view.nodes().next().expect("one node");
-        let initializers: std::collections::HashSet<String> =
+        let constant_initializers: std::collections::HashSet<String> =
             ["w".to_owned(), "scales".to_owned()].into_iter().collect();
 
         assert_eq!(
-            super::constant_input_flags(&view, node, &initializers),
+            super::constant_input_flags(&view, node, &constant_initializers),
             vec![false, true, true, false],
             "weights are constant, the activation is not, and an absent optional \
              input is not"
