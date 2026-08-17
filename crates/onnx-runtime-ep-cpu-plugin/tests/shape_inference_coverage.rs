@@ -73,7 +73,6 @@ const DECLINED: &[(&str, &str)] = &[
     //
     //       Shape-preserving — output shape == input[0].shape. One line each.
     ("", "BitwiseNot"),
-    ("", "GroupNormalization"),
     ("", "CastLike"),
     ("", "CumProd"),
     ("", "CumSum"),
@@ -297,5 +296,133 @@ fn no_activation_or_norm_op_is_left_to_ort() {
         declining.is_empty(),
         "these activation/norm ops are registered but decline shape \
          inference, so they run on ORT's CPU EP: {declining:?}"
+    );
+}
+
+/// The shape table is not the only fail-closed filter in `GetCapability`.
+///
+/// `node_passes_dtype_filter` looks the node's op up in the plugin's
+/// `KernelRegistryEntry` list and returns `false` when there is no entry, so an
+/// op missing from that list is claimed by `supports_op` and then dropped —
+/// handed to ORT's CPU EP just as surely as a missing shape rule.
+///
+/// That list is derived from `build_cpu_registry_with_descriptors`, which used
+/// to record keys as they were registered. `register_cnn_ops` takes `&mut
+/// OpRegistry` and wrote past the recorder, so 18 ops were in the registry but
+/// not the descriptors — including `PRelu`, `BatchNormalization`,
+/// `InstanceNormalization` and `GroupNormalization`, all of which this EP is
+/// supposed to own. Descriptors are now derived from the registry itself, and
+/// this test holds the two together.
+#[test]
+fn every_registered_op_has_a_kernel_registry_entry() {
+    use onnx_runtime_ep_cpu::build_cpu_registry_with_descriptors;
+
+    let (registry, descriptors) = build_cpu_registry_with_descriptors();
+    let described: std::collections::BTreeSet<(String, String)> = descriptors
+        .iter()
+        .map(|d| (d.domain.clone(), d.op_type.clone()))
+        .collect();
+
+    let missing: Vec<String> = registry
+        .keys()
+        .filter(|k| !described.contains(&(k.domain.clone(), k.op_type.clone())))
+        .map(|k| format!("{}::{}", k.domain, k.op_type))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "{} registered ops have no kernel-registry entry, so the dtype filter \
+         fails closed on them and GetCapability hands them to ORT's CPU EP: \
+         {missing:?}",
+        missing.len()
+    );
+}
+
+/// The activation and normalisation ops this EP owns must clear *both*
+/// fail-closed filters, not just the shape one.
+///
+/// `no_activation_or_norm_op_is_left_to_ort` checked the shape table only, and
+/// passed while `PRelu` was being declined by the dtype filter in production.
+#[test]
+fn activation_and_norm_ops_clear_every_capability_filter() {
+    use onnx_runtime_ep_cpu::build_cpu_registry_with_descriptors;
+
+    /// Ops whose whole purpose is an activation or a normalisation. If one of
+    /// these reaches ORT's CPU EP, the EP is not doing its job.
+    ///
+    /// `Celu` and `Mish` are deliberately absent: this EP has no kernel for
+    /// either, so ORT running them is a missing feature rather than a decline.
+    /// They are tracked in `docs/performance/CPU_ACTIVATION_GAPS.md`; add them
+    /// here the moment a kernel lands, and this test will then hold them to the
+    /// same standard as the rest.
+    const OWNED: &[(&str, &str)] = &[
+        ("", "Tanh"),
+        ("", "Sigmoid"),
+        ("", "Erf"),
+        ("", "Sqrt"),
+        ("", "Exp"),
+        ("", "Gelu"),
+        ("", "Relu"),
+        ("", "LeakyRelu"),
+        ("", "PRelu"),
+        ("", "Elu"),
+        ("", "Selu"),
+        ("", "Softplus"),
+        ("", "Softsign"),
+        ("", "HardSigmoid"),
+        ("", "ThresholdedRelu"),
+        ("", "Swish"),
+        ("", "Softmax"),
+        ("", "LogSoftmax"),
+        ("", "LayerNormalization"),
+        ("", "RMSNormalization"),
+        ("", "BatchNormalization"),
+        ("", "InstanceNormalization"),
+        ("", "GroupNormalization"),
+        ("", "LpNormalization"),
+        ("com.microsoft", "FastGelu"),
+        ("com.microsoft", "QuickGelu"),
+        ("com.microsoft", "BiasGelu"),
+        ("com.microsoft", "Gelu"),
+        ("com.microsoft", "Silu"),
+        ("com.microsoft", "SkipLayerNormalization"),
+        ("com.microsoft", "SkipSimplifiedLayerNormalization"),
+        ("com.microsoft", "SimplifiedLayerNormalization"),
+    ];
+
+    let (registry, descriptors) = build_cpu_registry_with_descriptors();
+    let described: std::collections::BTreeSet<(String, String)> = descriptors
+        .iter()
+        .map(|d| (d.domain.clone(), d.op_type.clone()))
+        .collect();
+    let registered: std::collections::BTreeSet<(String, String)> = registry
+        .keys()
+        .map(|k| (k.domain.clone(), k.op_type.clone()))
+        .collect();
+
+    let mut problems = Vec::new();
+    for (domain, op) in OWNED {
+        let key = (domain.to_string(), op.to_string());
+        // Assert registration too: a deleted kernel would otherwise make this
+        // test pass by having nothing left to check.
+        if !registered.contains(&key) {
+            problems.push(format!("{domain}::{op}: not registered by the CPU EP"));
+            continue;
+        }
+        if !described.contains(&key) {
+            problems.push(format!(
+                "{domain}::{op}: no kernel-registry entry (dtype filter declines it)"
+            ));
+        }
+        if declines(op, domain) {
+            problems.push(format!(
+                "{domain}::{op}: no shape rule (shape filter declines it)"
+            ));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "these activation/normalisation ops would be handed to ORT's CPU EP:\n  {}",
+        problems.join("\n  ")
     );
 }

@@ -3829,6 +3829,16 @@ const ASSIGNMENT_FIXTURES: &[(&str, &str)] = &[
     ("biasgelu_assignment_f16", "BiasGelu"),
     ("gelu_assignment_f16_small", "Gelu"),
     ("gelu_assignment_f16_large", "Gelu"),
+    // `PRelu` and `GroupNormalization` are the ops the dtype filter was
+    // silently declining. Both are registered by this EP and both are its
+    // business, but `PRelu` had no kernel-registry entry (it is registered via
+    // `register_cnn_ops`, which wrote past the descriptor recorder) and
+    // `GroupNormalization` had no shape rule. Each cleared one filter and was
+    // dropped by the other, so the pure-Rust inventory tests passed while ORT
+    // ran them. These fixtures check the only thing that cannot be faked: what
+    // ORT reports as the node's assigned EP.
+    ("prelu_assignment_f32", "PRelu"),
+    ("groupnorm_assignment_f32", "GroupNormalization"),
     // Not an activation this EP tunes, and that is the point: `Sin` is
     // registered by the CPU EP but was missing from the plugin's
     // `ShapeInference` table, so `GetCapability`'s fail-closed shape filter

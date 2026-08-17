@@ -227,6 +227,7 @@ impl ShapeInference {
             | "Hardmax"
             | "BatchNormalization"
             | "InstanceNormalization"
+            | "GroupNormalization"
             | "LpNormalization" => Self::SameAsInput(0),
 
             // ── LayerNorm family: requires axis attribute for correct shape ──
@@ -377,6 +378,7 @@ impl ShapeInference {
             | "Hardmax"
             | "BatchNormalization"
             | "InstanceNormalization"
+            | "GroupNormalization"
             | "LpNormalization"
             | "Clip" => Self::SameAsInput(0),
 

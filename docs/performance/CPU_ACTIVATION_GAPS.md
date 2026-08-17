@@ -96,25 +96,62 @@ Two effects explain most of the table, and neither is the transcendental math:
 | bf16 ⇄ f32 conversion | scalar | 1.6–2.8× | bulk AVX2 conversion (#1041) |
 | `com.microsoft` activations unreachable | never ran | reachable | shape-inference table entries (#1082) |
 
+## Activations with no kernel at all
+
+Distinct from the sections below: these are not declines, they are missing
+features. ORT runs them because this EP has nothing to run.
+
+- **`Celu`** — ONNX opset 12. `max(0,x) + min(0, alpha*(exp(x/alpha)-1))`.
+- **`Mish`** — ONNX opset 18. `x * tanh(softplus(x))`.
+
+Both are cheap to add on top of the existing `exp`/`tanh` AVX2 primitives, and
+`activation_and_norm_ops_clear_every_capability_filter` has a comment naming
+them so they are added to that test the moment a kernel lands.
+
 ## Ops that still reach ORT despite being supported
 
 Removing the performance-based decline is not by itself enough to guarantee
-that selecting this EP keeps work off ORT's CPU EP. There is a second,
-independent mechanism.
+that selecting this EP keeps work off ORT's CPU EP. `GetCapability` runs
+**three** independent fail-closed filters, and a claim has to clear all of
+them. Deleting the policy addressed one; the other two were each found by
+review, after this document had already claimed the job was done.
 
-`GetCapability` runs a fail-closed filter that drops any claim containing a
-node whose `ShapeInference::for_node` returns `Declined`
+**Filter 1 — the assignment policy.** Removed. This was the performance-based
+decline.
+
+**Filter 2 — the shape table.** Drops any claim containing a node whose
+`ShapeInference::for_node` returns `Declined`
 (`onnx-runtime-ep-plugin/src/ep.rs`). That table matches on op name and ends in
 `_ => Declined`, so **an op the CPU EP registers a kernel for, but which is
 absent from the table, is silently handed to ORT** — whatever `supports_op`
 answers. This is the same mechanism that made the `com.microsoft` activations
-unreachable until #1082.
+unreachable until #1082. The activation, trigonometric and hyperbolic families
+were in that gap and are now covered: `Sin`, `Cos`, `Tan`, `Asin`, `Acos`,
+`Atan`, `Sinh`, `Cosh`, `Asinh`, `Acosh`, `Atanh`, `ThresholdedRelu`, `Swish`,
+`Silu`, `PRelu`, `GroupNormalization`.
 
-The activation, trigonometric and hyperbolic families were in that gap and are
-now covered: `Sin`, `Cos`, `Tan`, `Asin`, `Acos`, `Atan`, `Sinh`, `Cosh`,
-`Asinh`, `Acosh`, `Atanh`, `ThresholdedRelu`, `Swish`, `Silu`, `PRelu`.
+**Filter 3 — the dtype filter.** `node_passes_dtype_filter` looks the node's op
+up in the plugin's `KernelRegistryEntry` list and returns `false` when there is
+no entry. That list came from `build_cpu_registry_with_descriptors`, which
+recorded keys as they were registered — but `register_cnn_ops` takes `&mut
+OpRegistry` and wrote *past* the recorder. Eighteen ops were therefore in the
+registry and absent from the descriptors: `PRelu`, `BatchNormalization`,
+`InstanceNormalization`, `GroupNormalization`, `Conv`, the pooling family,
+`Resize`, `GridSample`, `AffineGrid`, `Col2Im`, `CenterCropPad`,
+`SpaceToDepth`, `ConvTranspose`. Every one was claimed by `supports_op` and
+then dropped at capability time.
 
-**66 registered ops remain in the gap.** The list is not prose: it is asserted
+`PRelu` is the sharpest case: it cleared the shape filter (added above) and was
+still declined by the dtype filter, so the pure-Rust inventory tests passed
+while real ORT ran the node. Descriptors are now derived from
+`OpRegistry::keys()` rather than a parallel recorded list, which makes the two
+sets identical by construction, and
+`every_registered_op_has_a_kernel_registry_entry` holds them together.
+
+The lesson is that an inventory test is only as good as its source of truth.
+Two rounds of review passed on tests that enumerated the wrong set.
+
+**65 registered ops remain in the shape-table gap.** The list is not prose: it is asserted
 exactly by `every_registered_op_has_a_shape_rule_or_is_a_known_gap`
 (`crates/onnx-runtime-ep-cpu-plugin/tests/shape_inference_coverage.rs`), which
 enumerates `OpRegistry::keys()` — the same set `supports_op` consults — and
@@ -145,14 +182,14 @@ never appear in an input graph: `FusedGemm`, `FusedAttention`,
 `BlockQuantizedMoE`, `CompressedSparseAttention`, `IndexShare`,
 `PackedVarlenAttention`, `SparseKvGather`, `VarlenAttention`.
 
-### 3. Inferrable but unwritten — this is the work (36)
+### 3. Inferrable but unwritten — this is the work (35)
 
 Real ops, in real input graphs, that we have a kernel for and hand to ORT
 anyway because nobody wrote the rule.
 
 **Shape-preserving; one line each.** `BitwiseNot`, `CastLike`, `CumProd`,
-`CumSum`, `DequantizeLinear`, `EyeLike`, `GroupNormalization`,
-`QuantizeLinear`, `ScatterElements`, `ScatterND`, `Trilu`.
+`CumSum`, `DequantizeLinear`, `EyeLike`, `QuantizeLinear`, `ScatterElements`,
+`ScatterND`, `Trilu`.
 `QuantizeLinear`/`DequantizeLinear` are the ones that matter: they bracket
 every operator in a quantised model, so handing them over also fragments the
 partition around everything between them.
