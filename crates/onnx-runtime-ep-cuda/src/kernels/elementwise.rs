@@ -147,6 +147,26 @@ extern "C" __global__ void NAME##_i64( \
     } \
 }
 
+#define DEFINE_BINARY_I32(NAME, EXPR) \
+extern "C" __global__ void NAME##_i32( \
+    const int* a, const int* b, int* y, \
+    const unsigned long long* metadata, const int rank, const unsigned long long n) { \
+    const unsigned long long* shape = metadata; \
+    const unsigned long long* a_strides = metadata + rank; \
+    const unsigned long long* b_strides = metadata + rank * 2; \
+    for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n; \
+         i += (unsigned long long)gridDim.x * blockDim.x) { \
+        unsigned long long linear = i, ai = 0, bi = 0; \
+        for (int d = rank - 1; d >= 0; --d) { \
+            unsigned long long coord = linear % shape[d]; \
+            linear /= shape[d]; \
+            ai += coord * a_strides[d]; \
+            bi += coord * b_strides[d]; \
+        } \
+        y[i] = (EXPR); \
+    } \
+}
+
 #define DEFINE_FOR_TYPE(TYPE, SUFFIX) \
 DEFINE_UNARY(relu, TYPE, SUFFIX) \
 DEFINE_UNARY(sqrt, TYPE, SUFFIX) \
@@ -169,8 +189,15 @@ DEFINE_SILU_MUL(float, f32)
 DEFINE_BINARY_I64(add, a[ai] + b[bi])
 DEFINE_BINARY_I64(sub, a[ai] - b[bi])
 DEFINE_BINARY_I64(mul, a[ai] * b[bi])
+DEFINE_BINARY_I64(div, a[ai] / b[bi])
 DEFINE_BINARY_I64(min, a[ai] < b[bi] ? a[ai] : b[bi])
 DEFINE_BINARY_I64(max, a[ai] > b[bi] ? a[ai] : b[bi])
+DEFINE_BINARY_I32(add, a[ai] + b[bi])
+DEFINE_BINARY_I32(sub, a[ai] - b[bi])
+DEFINE_BINARY_I32(mul, a[ai] * b[bi])
+DEFINE_BINARY_I32(div, a[ai] / b[bi])
+DEFINE_BINARY_I32(min, a[ai] < b[bi] ? a[ai] : b[bi])
+DEFINE_BINARY_I32(max, a[ai] > b[bi] ? a[ai] : b[bi])
 #ifdef NXRT_HAS_CUDA_HALF_HEADERS
 DEFINE_FOR_TYPE(__half, f16)
 DEFINE_FOR_TYPE(__nv_bfloat16, bf16)
@@ -271,7 +298,7 @@ extern "C" __global__ void decomposed_silu_bf16(
 /// NVRTC module names (one module holds all unary / all binary entries so a
 /// runtime compiles each source string at most once — see
 /// [`CudaRuntime::nvrtc_function`]).
-const POINTWISE_MODULE: &str = "elementwise_float_v3";
+const POINTWISE_MODULE: &str = "elementwise_float_v5";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FloatDtype {
@@ -793,10 +820,15 @@ impl BinaryKernel {
         }
         let a = &inputs[0];
         let b = &inputs[1];
-        let float_dtype = if a.dtype == DataType::Int64
+        let float_dtype = if matches!(a.dtype, DataType::Int32 | DataType::Int64)
             && matches!(
                 self.op,
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Min | BinaryOp::Max
+                BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Min
+                    | BinaryOp::Max
             ) {
             None
         } else {
@@ -834,7 +866,15 @@ impl BinaryKernel {
         })?;
         let entry = match float_dtype {
             Some(dtype) => self.op.entry(dtype),
-            None => format!("{}_i64", self.op.stem()),
+            None => format!(
+                "{}_{}",
+                self.op.stem(),
+                if a.dtype == DataType::Int32 {
+                    "i32"
+                } else {
+                    "i64"
+                }
+            ),
         };
         if self.op == BinaryOp::Mul {
             onnx_runtime_ep_api::record_kernel_variant!(
