@@ -72,97 +72,112 @@ pub struct MsftAttentionKernel {
 /// Factory for [`MsftAttentionKernel`], reading the contrib-op attributes.
 pub struct MsftAttentionFactory;
 
-impl KernelFactory for MsftAttentionFactory {
-    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let num_heads = node
-            .attr("num_heads")
-            .and_then(|a| a.as_int())
-            .ok_or_else(|| {
-                EpError::KernelFailed("Attention: missing required `num_heads` attribute".into())
-            })?;
-        if num_heads <= 0 {
-            return Err(EpError::KernelFailed(format!(
-                "Attention: num_heads must be > 0, got {num_heads}"
-            )));
-        }
+/// Why this kernel cannot run a given `com.microsoft::Attention` node, if it
+/// cannot.
+///
+/// Answered at *claim* time: a rejection raised in the factory instead arrives
+/// after ORT has compiled the node onto this EP and is a hard session failure
+/// that no fallback recovers from. Implemented by running the factory's own
+/// attribute parse, so the two cannot disagree.
+pub(crate) fn unsupported_reason(node: &Node) -> Option<String> {
+    attributes_from_node(node).err().map(|e| e.to_string())
+}
 
-        // Unsupported variants are rejected up front (typed error, not a panic).
-        if node.attr("do_rotary").and_then(|a| a.as_int()).unwrap_or(0) == 1 {
-            return Err(EpError::KernelFailed(
-                "Attention: `do_rotary` is not supported (fuse MHA + RotaryEmbedding instead, as \
+fn attributes_from_node(node: &Node) -> Result<MsftAttentionKernel> {
+    let num_heads = node
+        .attr("num_heads")
+        .and_then(|a| a.as_int())
+        .ok_or_else(|| {
+            EpError::KernelFailed("Attention: missing required `num_heads` attribute".into())
+        })?;
+    if num_heads <= 0 {
+        return Err(EpError::KernelFailed(format!(
+            "Attention: num_heads must be > 0, got {num_heads}"
+        )));
+    }
+
+    // Unsupported variants are rejected up front (typed error, not a panic).
+    if node.attr("do_rotary").and_then(|a| a.as_int()).unwrap_or(0) == 1 {
+        return Err(EpError::KernelFailed(
+            "Attention: `do_rotary` is not supported (fuse MHA + RotaryEmbedding instead, as \
                  ORT's CPU kernel requires)"
-                    .into(),
-            ));
-        }
-        if node
-            .attr("past_present_share_buffer")
-            .and_then(|a| a.as_int())
-            .unwrap_or(0)
-            == 1
-        {
-            return Err(EpError::KernelFailed(
-                "Attention: `past_present_share_buffer` (DecoderMaskedMHA buffer sharing) is not \
+                .into(),
+        ));
+    }
+    if node
+        .attr("past_present_share_buffer")
+        .and_then(|a| a.as_int())
+        .unwrap_or(0)
+        == 1
+    {
+        return Err(EpError::KernelFailed(
+            "Attention: `past_present_share_buffer` (DecoderMaskedMHA buffer sharing) is not \
                  supported"
-                    .into(),
-            ));
-        }
+                .into(),
+        ));
+    }
 
-        // Defensive, not load-bearing: ORT does not stamp this attribute (a
-        // real session was instrumented to confirm it arrives absent). But both
-        // ORT's kernels and ours read an explicit `scale = 0` as "use
-        // 1/sqrt(head_size)" rather than literally, so a zero taken at face
-        // value would zero every score silently. `> 0` is deliberately broader
-        // than ORT's `== 0`, since a negative scale is meaningless.
-        let scale = node
-            .attr("scale")
-            .and_then(|a| a.as_float())
-            .filter(|s| *s > 0.0);
-        let mask_filter_value = node
-            .attr("mask_filter_value")
-            .and_then(|a| a.as_float())
-            .unwrap_or(-10000.0);
-        let unidirectional = node
-            .attr("unidirectional")
-            .and_then(|a| a.as_int())
-            .unwrap_or(0)
-            == 1;
+    // Defensive, not load-bearing: ORT does not stamp this attribute (a
+    // real session was instrumented to confirm it arrives absent). But both
+    // ORT's kernels and ours read an explicit `scale = 0` as "use
+    // 1/sqrt(head_size)" rather than literally, so a zero taken at face
+    // value would zero every score silently. `> 0` is deliberately broader
+    // than ORT's `== 0`, since a negative scale is meaningless.
+    let scale = node
+        .attr("scale")
+        .and_then(|a| a.as_float())
+        .filter(|s| *s > 0.0);
+    let mask_filter_value = node
+        .attr("mask_filter_value")
+        .and_then(|a| a.as_float())
+        .unwrap_or(-10000.0);
+    let unidirectional = node
+        .attr("unidirectional")
+        .and_then(|a| a.as_int())
+        .unwrap_or(0)
+        == 1;
 
-        let qkv_hidden_sizes = match node.attr("qkv_hidden_sizes").and_then(|a| a.as_ints()) {
-            Some(sizes) => {
-                if sizes.len() != 3 {
+    let qkv_hidden_sizes = match node.attr("qkv_hidden_sizes").and_then(|a| a.as_ints()) {
+        Some(sizes) => {
+            if sizes.len() != 3 {
+                return Err(EpError::KernelFailed(format!(
+                    "Attention: qkv_hidden_sizes must have 3 elements, got {}",
+                    sizes.len()
+                )));
+            }
+            let n = num_heads;
+            for s in sizes {
+                if *s <= 0 || s % n != 0 {
                     return Err(EpError::KernelFailed(format!(
-                        "Attention: qkv_hidden_sizes must have 3 elements, got {}",
-                        sizes.len()
+                        "Attention: qkv_hidden_sizes element {s} must be > 0 and divisible by \
+                             num_heads {num_heads}"
                     )));
                 }
-                let n = num_heads;
-                for s in sizes {
-                    if *s <= 0 || s % n != 0 {
-                        return Err(EpError::KernelFailed(format!(
-                            "Attention: qkv_hidden_sizes element {s} must be > 0 and divisible by \
-                             num_heads {num_heads}"
-                        )));
-                    }
-                }
-                if sizes[0] != sizes[1] {
-                    return Err(EpError::KernelFailed(
-                        "Attention: qkv_hidden_sizes[0] (q_hidden) must equal qkv_hidden_sizes[1] \
-                         (k_hidden)"
-                            .into(),
-                    ));
-                }
-                Some([sizes[0] as usize, sizes[1] as usize, sizes[2] as usize])
             }
-            None => None,
-        };
+            if sizes[0] != sizes[1] {
+                return Err(EpError::KernelFailed(
+                    "Attention: qkv_hidden_sizes[0] (q_hidden) must equal qkv_hidden_sizes[1] \
+                         (k_hidden)"
+                        .into(),
+                ));
+            }
+            Some([sizes[0] as usize, sizes[1] as usize, sizes[2] as usize])
+        }
+        None => None,
+    };
 
-        Ok(Box::new(MsftAttentionKernel {
-            num_heads: num_heads as usize,
-            scale,
-            mask_filter_value,
-            unidirectional,
-            qkv_hidden_sizes,
-        }))
+    Ok(MsftAttentionKernel {
+        num_heads: num_heads as usize,
+        scale,
+        mask_filter_value,
+        unidirectional,
+        qkv_hidden_sizes,
+    })
+}
+
+impl KernelFactory for MsftAttentionFactory {
+    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(attributes_from_node(node)?))
     }
 }
 

@@ -233,6 +233,8 @@ def main():
     gen_moe_assignment_f16()
     gen_qmoe_assignment_f32()
     gen_qmoe_columnwise_f32()
+    gen_moe_sparse_mixer_f32()
+    gen_gqa_smooth_softmax_f32()
     gen_packed_mha_assignment_f32()
     gen_trilu_assignment_f32()
     gen_scatter_elements_assignment_f32()
@@ -368,6 +370,60 @@ def gen_qmoe_columnwise_f32():
     save(finish([node], "qmoe_columnwise_f32", [x, probs], [out], ms=True,
                 inits=[fc1_w, fc1_s, fc2_w, fc2_s]),
          "qmoe_columnwise_f32", check=False)
+
+
+# ── MoE, use_sparse_mixer=1 ──────────────────────────────────────────────────
+# Second review falsifier, same class as the column-wise QMoE one above. The
+# sparse-mixer router (Phi-3.5-MoE / GRIN-MoE) is rejected by
+# `MoeAttributes::from_node`, which runs in the kernel factory -- after ORT has
+# already compiled the node onto us, where no fallback recovers. ORT's own CPU
+# MoE kernel runs it, so the decline has to happen at claim time.
+# `plugin_ort_e2e::factory_only_capability_limits_are_declined_at_claim_time`
+# is the regression test; the fix is to implement the sparse mixer.
+def gen_moe_sparse_mixer_f32():
+    rows, hidden, experts, inter = 4, 32, 8, 64
+    x = vi("input", [rows, hidden])
+    probs = vi("router_probs", [rows, experts])
+    w1 = vi("fc1_experts_weights", [experts, inter, hidden])
+    w2 = vi("fc2_experts_weights", [experts, hidden, inter])
+    out = vi("output", [rows, hidden])
+    node = helper.make_node(
+        "MoE",
+        ["input", "router_probs", "fc1_experts_weights", "",
+         "fc2_experts_weights"],
+        ["output"],
+        domain=MS, k=2, activation_type="gelu", use_sparse_mixer=1)
+    save(finish([node], "moe_sparse_mixer_f32", [x, probs, w1, w2], [out], ms=True),
+         "moe_sparse_mixer_f32", check=False)
+
+
+# ── GroupQueryAttention, smooth_softmax=1 ────────────────────────────────────
+# Same class again. `smooth_softmax = 1` (Gemma-style attention sink) is
+# rejected in the GQA factory; ORT's CPU kernel implements it
+# (`use_smooth_softmax_ = ... == 1`), so claiming and then failing turns a model
+# that runs today into one that will not load.
+def gen_gqa_smooth_softmax_f32():
+    B, S, H, KV, D, P = 1, 1, 32, 8, 128, 1023
+    q = vi("query", [B, S, H * D])
+    k = vi("key", [B, S, KV * D])
+    v = vi("value", [B, S, KV * D])
+    pk = vi("past_key", [B, KV, P, D])
+    pv = vi("past_value", [B, KV, P, D])
+    seqlens = vi("seqlens_k", [B], TensorProto.INT32)
+    total = vi("total_sequence_length", [1], TensorProto.INT32)
+    out = vi("output", [B, S, H * D])
+    prk = vi("present_key", [B, KV, P + S, D])
+    prv = vi("present_value", [B, KV, P + S, D])
+    node = helper.make_node(
+        "GroupQueryAttention",
+        ["query", "key", "value", "past_key", "past_value", "seqlens_k",
+         "total_sequence_length"],
+        ["output", "present_key", "present_value"],
+        domain=MS, num_heads=H, kv_num_heads=KV, smooth_softmax=1,
+    )
+    save(finish([node], "gqa_smooth_softmax_f32",
+                [q, k, v, pk, pv, seqlens, total], [out, prk, prv], ms=True),
+         "gqa_smooth_softmax_f32", check=False)
 
 
 # ── PackedMultiHeadAttention ─────────────────────────────────────────────────

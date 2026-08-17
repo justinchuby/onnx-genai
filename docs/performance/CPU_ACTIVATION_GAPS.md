@@ -186,9 +186,17 @@ not support must use ORT's default, not ONNX's zero: the contrib default for
 failure rather than a fallback, so it is the most expensive of the four — and
 that cuts both ways. Making an op *reachable* can break a model that used to
 work: once `QMoE` was claimed, a column-wise (`block_size` absent) node that ORT
-had been running fine reached our factory and killed `CreateSession`. Any
-capability limit a factory enforces has to be mirrored in `supports_op`, where a
-decline is still recoverable.
+had been running fine reached our factory and killed `CreateSession`. Review
+then found the same defect on `use_sparse_mixer=1` (Phi-3.5-MoE, GRIN-MoE) and
+on `smooth_softmax=1` (Gemma-style attention sink) — both of which ORT's CPU EP
+runs today — so it is a class, not three bugs.
+
+**Any capability limit a factory enforces must be mirrored in `supports_op`**,
+where a decline is still recoverable. The mirror is now structural rather than
+duplicated: each kernel's attribute validation lives in one function and the
+claim-time guard is that same function's error, so a new factory limit cannot
+fail to appear at claim time. `provider::tests::every_factory_attribute_rejection_is_mirrored_at_claim_time`
+asserts both halves for eleven hostile nodes and fails if they diverge.
 
 The attention, MoE and KV-cache ops are now covered end-to-end by
 `plugin_ort_e2e`'s `ASSIGNMENT_FIXTURES` (38 graphs, all on our EP with

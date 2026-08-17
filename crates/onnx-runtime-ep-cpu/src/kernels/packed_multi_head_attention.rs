@@ -28,36 +28,50 @@ struct PackedMultiHeadAttentionKernel {
     scale: Option<f32>,
 }
 
+/// Why this kernel cannot run a given `PackedMultiHeadAttention` node, if it
+/// cannot.
+///
+/// Answered at *claim* time: a rejection raised in the factory instead arrives
+/// after ORT has compiled the node onto this EP and is a hard session failure.
+/// ORT has no CPU kernel for this op at all, so a decline here fails the load
+/// too — but with ORT's own `NOT_IMPLEMENTED` message rather than ours, and
+/// without the EP having claimed a node it cannot run. Implemented by running
+/// the factory's own attribute parse, so the two cannot disagree.
+pub(crate) fn unsupported_attribute_reason(node: &Node) -> Option<String> {
+    attributes_from_node(node).err().map(|e| e.to_string())
+}
+
+fn attributes_from_node(node: &Node) -> Result<PackedMultiHeadAttentionKernel> {
+    let num_heads = node
+        .attr("num_heads")
+        .and_then(|attribute| attribute.as_int())
+        .ok_or_else(|| error("missing required int attribute 'num_heads'"))?;
+    let num_heads = usize::try_from(num_heads)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| error(format!("num_heads must be positive, got {num_heads}")))?;
+    let scale = node
+        .attr("scale")
+        .map(|attribute| {
+            attribute
+                .as_float()
+                .ok_or_else(|| error("scale attribute must be a float"))
+        })
+        .transpose()?;
+    if scale.is_some_and(|value| !value.is_finite()) {
+        return Err(error("scale must be finite"));
+    }
+    // Same rule as the other four attention kernels: an explicit
+    // non-positive scale means "use 1/sqrt(head_size)", not "multiply every
+    // score by zero". This op became reachable at the same time as they
+    // did, so it gets the same guard rather than a silently different one.
+    let scale = scale.filter(|value| *value > 0.0);
+    Ok(PackedMultiHeadAttentionKernel { num_heads, scale })
+}
+
 impl KernelFactory for PackedMultiHeadAttentionFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let num_heads = node
-            .attr("num_heads")
-            .and_then(|attribute| attribute.as_int())
-            .ok_or_else(|| error("missing required int attribute 'num_heads'"))?;
-        let num_heads = usize::try_from(num_heads)
-            .ok()
-            .filter(|value| *value > 0)
-            .ok_or_else(|| error(format!("num_heads must be positive, got {num_heads}")))?;
-        let scale = node
-            .attr("scale")
-            .map(|attribute| {
-                attribute
-                    .as_float()
-                    .ok_or_else(|| error("scale attribute must be a float"))
-            })
-            .transpose()?;
-        if scale.is_some_and(|value| !value.is_finite()) {
-            return Err(error("scale must be finite"));
-        }
-        // Same rule as the other four attention kernels: an explicit
-        // non-positive scale means "use 1/sqrt(head_size)", not "multiply every
-        // score by zero". This op became reachable at the same time as they
-        // did, so it gets the same guard rather than a silently different one.
-        let scale = scale.filter(|value| *value > 0.0);
-        Ok(Box::new(PackedMultiHeadAttentionKernel {
-            num_heads,
-            scale,
-        }))
+        Ok(Box::new(attributes_from_node(node)?))
     }
 }
 
@@ -158,13 +172,8 @@ pub fn unsupported_reason(
             "cumulative_sequence_length length {cumulative_length} must equal token_offset batch {batch} + 1"
         ));
     }
-    if let Some(attribute) = node.attr("scale") {
-        let Some(scale) = attribute.as_float() else {
-            return fail("scale attribute must be a float".into());
-        };
-        if !scale.is_finite() {
-            return fail("scale must be finite".into());
-        }
+    if let Some(reason) = unsupported_attribute_reason(node) {
+        return fail(reason);
     }
     None
 }

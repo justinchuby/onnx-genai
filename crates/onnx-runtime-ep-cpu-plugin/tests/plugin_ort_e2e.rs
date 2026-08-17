@@ -6008,54 +6008,80 @@ unsafe fn run_and_collect_f32(
     }
 }
 
-/// A `QMoE` node this kernel cannot compute is declined at *claim* time, and
-/// the session still loads.
+/// Configurations these kernels cannot compute, each declined at *claim* time
+/// with the session still loading.
 ///
-/// This is the one deliberate decline in the suite, and it is a **capability**
-/// answer rather than a performance one. ORT's schema leaves `block_size`
-/// without a default, so an absent attribute selects the column-wise form (one
-/// scale per output row); `qmoe.rs` implements only the blocked form. ORT's own
-/// CPU kernel runs the column-wise form, so the choice is not "us or nothing":
+/// Every row is a **capability** answer rather than a performance one, and each
+/// mirrors a rejection its kernel factory raises. The mirroring is what matters:
 ///
 ///   * decline at claim time  → ORT runs it, model works, we owe a kernel;
 ///   * claim and fail in the factory → `CreateSession` dies and **no fallback
 ///     recovers**, because ORT has already compiled the node onto this EP.
 ///
-/// Making `QMoE` reachable at all is what created that second possibility, so
-/// this test pins the first. It is deliberately *not* in `ASSIGNMENT_FIXTURES`:
-/// it is the documented exception, and it should stop being one as soon as the
-/// column-wise path exists.
+/// Making these ops reachable at all is what created the second possibility, so
+/// this test pins the first. ORT's CPU EP runs all three configurations below,
+/// which is why claiming-then-failing would take a model that works today and
+/// make it unloadable.
+///
+/// | fixture | limit | where the factory raises it |
+/// |---|---|---|
+/// | `qmoe_columnwise_f32` | `block_size` absent → column-wise quantization | `qmoe.rs` |
+/// | `moe_sparse_mixer_f32` | `use_sparse_mixer=1` (Phi-3.5-MoE / GRIN-MoE) | `moe.rs` |
+/// | `gqa_smooth_softmax_f32` | `smooth_softmax=1` (attention sink) | `group_query_attention.rs` |
+///
+/// They are deliberately *not* in `ASSIGNMENT_FIXTURES`: they are the documented
+/// exceptions, and each should stop being one as soon as its kernel exists.
 #[test]
-fn column_wise_qmoe_is_declined_at_claim_time_not_failed_late() {
+fn factory_only_capability_limits_are_declined_at_claim_time() {
+    const CASES: &[(&str, &str, &str)] = &[
+        (
+            "qmoe_columnwise_f32",
+            "QMoE",
+            "`qmoe::unsupported_reason` (column-wise quantization)",
+        ),
+        (
+            "moe_sparse_mixer_f32",
+            "MoE",
+            "`moe::unsupported_reason` (use_sparse_mixer=1)",
+        ),
+        (
+            "gqa_smooth_softmax_f32",
+            "GroupQueryAttention",
+            "`group_query_attention::unsupported_reason` (smooth_softmax=1)",
+        ),
+    ];
+
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/qmoe_columnwise_f32/model.onnx.textproto");
-    let reg = "cpu_ep_qmoe_columnwise";
+    for (fixture, op, guard) in CASES {
+        let model_path = PathBuf::from(manifest_dir)
+            .join(format!("tests/fixtures/{fixture}/model.onnx.textproto"));
+        let reg = format!("cpu_ep_claim_time_{fixture}");
 
-    // Fallback must stay *enabled*: the point is that ORT can still run this.
-    let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup(reg, &model_path, false) })
-    else {
-        eprintln!("*** SKIPPED: qmoe_columnwise — ORT or EP cdylib not found ***");
-        return;
-    };
+        // Fallback must stay *enabled*: the point is that ORT can still run it.
+        let Some((_lib, api, env, opts, session)) =
+            (unsafe { conformance_setup(&reg, &model_path, false) })
+        else {
+            eprintln!("*** SKIPPED: {fixture} — ORT or EP cdylib not found ***");
+            return;
+        };
 
-    unsafe {
-        let info = query_ep_assignment(api, session);
-        let ours = info.ops_on_our_ep();
-        assert!(
-            !ours.contains(&"QMoE"),
-            "column-wise QMoE was claimed; the factory then rejects it, which kills the \
-             session outright. Decline it in `qmoe::unsupported_reason` instead, or \
-             implement the column-wise path. Got: {:?}",
-            info.assignments
-        );
-        eprintln!(
-            "  [qmoe_columnwise_f32] declined at claim time, session loaded; ours={ours:?}, \
-             others={:?}",
-            info.ops_not_on_our_ep()
-        );
-        conformance_teardown(api, env, opts, session, reg);
+        unsafe {
+            let info = query_ep_assignment(api, session);
+            let ours = info.ops_on_our_ep();
+            assert!(
+                !ours.contains(op),
+                "{fixture}: {op} was claimed, but the kernel factory rejects this \
+                 configuration, which kills the session outright rather than falling back. \
+                 Decline it in {guard}, or implement the missing path. Got: {:?}",
+                info.assignments
+            );
+            eprintln!(
+                "  [{fixture}] declined at claim time, session loaded; ours={ours:?}, \
+                 others={:?}",
+                info.ops_not_on_our_ep()
+            );
+            conformance_teardown(api, env, opts, session, &reg);
+        }
     }
 }

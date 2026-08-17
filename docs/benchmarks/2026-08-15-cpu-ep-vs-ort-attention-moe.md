@@ -1814,10 +1814,12 @@ One fixture is deliberately **not** in that table:
 | fixture | op | on `main` | after | why excluded |
 |---|---|---|---|---|
 | `qmoe_columnwise_f32` | `QMoE`, `block_size` absent | ORT | ORT | no column-wise kernel here; see §23.6 |
+| `moe_sparse_mixer_f32` | `MoE`, `use_sparse_mixer=1` | ORT | ORT | no sparse-mixer router here |
+| `gqa_smooth_softmax_f32` | `GQA`, `smooth_softmax=1` | ORT | ORT | no attention-sink softmax here |
 
-`column_wise_qmoe_is_declined_at_claim_time_not_failed_late` asserts it: the
-node lands on ORT, the session still loads, and — the point of the test — the
-decline happens in `supports_op` rather than in the kernel factory, where it
+`factory_only_capability_limits_are_declined_at_claim_time` asserts all three:
+the node lands on ORT, the session still loads, and — the point of the test —
+the decline happens in `supports_op` rather than in the kernel factory, where it
 would have been unrecoverable.
 
 ### 23.5 Assignment is not the guarantee — the arithmetic is
@@ -1839,7 +1841,7 @@ appended, so ORT resolves the node to its own contrib CPU kernel.
 Both attention outputs are at float32 rounding, and the KV cache is written
 bit-identically to ORT's.
 
-### 23.6 Making an op reachable can break it: column-wise QMoE
+### 23.6 Making an op reachable can break it: factory-only capability limits
 
 `QMoE`'s fixture had to be written with `block_size = 32`, because this kernel
 implements only the blocked form while ORT's schema leaves `block_size` without
@@ -1858,17 +1860,53 @@ because it is a hazard of this whole change:
 > at `CreateSession` with `block_size must be a power of two and at least 16,
 > got 0`.
 
-The fix is `qmoe::unsupported_reason`, consulted from `supports_op` at claim
-time, plus
-`plugin_ort_e2e::column_wise_qmoe_is_declined_at_claim_time_not_failed_late`,
-which asserts the session still loads and the node lands on ORT.
+A third review round showed this was not one bug but a **class**, and that the
+first fix had only patched one instance of it. Two more were live, both on
+attributes real models set, and both of which ORT's CPU EP runs today:
 
-**This is the one deliberate decline in the suite and it is a capability answer,
-not a performance one** — we have no column-wise implementation, and the choice
-is between ORT running the model and nobody running it. It is not an exception
-to §23's rule, which is about ranges where we are *slower*; it is an admission
-that we owe a kernel. It should stop being an exception as soon as the
-column-wise path exists.
+| op | attribute | who sets it | verified on ORT CPU |
+|---|---|---|---|
+| `QMoE` | `block_size` absent (column-wise) | ORT-quantized MoE exports | 1.27 and 1.28 |
+| `MoE` / `QMoE` | `use_sparse_mixer=1` | Phi-3.5-MoE, GRIN-MoE | 1.28 |
+| `GroupQueryAttention` | `smooth_softmax=1` | Gemma-style attention sink | 1.28 |
+
+The fix is structural rather than three more `if`s. Each kernel's attribute
+parsing is now a single function, and the claim-time guard *is* that function:
+
+```rust
+pub(crate) fn unsupported_reason(node: &Node) -> Option<String> {
+    attributes_from_node(node).err().map(|e| e.to_string())
+}
+```
+
+so a limit cannot be added to a factory without appearing at claim time too —
+drift is impossible by construction rather than by discipline. `supports_op`
+consults it for `MoE`, `QMoE`, `GroupQueryAttention`, `MultiHeadAttention`,
+`com.microsoft::Attention`, `ai.onnx::Attention` and
+`PackedMultiHeadAttention`, which sweeps up the rest of the family in one go:
+GQA's quantized-KV and `qk_output` rejections, msft `Attention`'s `do_rotary`
+and `past_present_share_buffer`, `ai.onnx::Attention`'s `qk_matmul_output_mode`,
+and `QMoE`'s `expert_weight_bits` / `quant_type`.
+
+Two tests pin it. `provider::tests::every_factory_attribute_rejection_is_mirrored_at_claim_time`
+is pure Rust — for eleven hostile nodes it asserts *both* that the factory
+rejects and that `supports_op` declines, so it fails if the two ever diverge —
+and `plugin_ort_e2e::factory_only_capability_limits_are_declined_at_claim_time`
+proves it against real ORT for the three fixtures above: the node lands on ORT,
+the session loads. Disabling the claim-time guard turns each of the three into
+
+```
+STAGE [CreateSession] FAILED: Compile: get_kernel failed for node '' (MoE):
+  MoE: use_sparse_mixer=1 is unsupported by the Phase-1 CPU reference kernel
+```
+
+**These are the only deliberate declines in the suite and every one is a
+capability answer, not a performance one** — we have no column-wise, sparse
+mixer or smooth-softmax implementation, and the choice for each is between ORT
+running the model and nobody running it. They are not exceptions to §23's rule,
+which is about ranges where we are *slower*; they are an admission that we owe
+three kernels. Each should stop being an exception as soon as its kernel
+exists.
 
 ### 23.7 What this does not fix
 

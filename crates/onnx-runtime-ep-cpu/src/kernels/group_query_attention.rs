@@ -598,109 +598,132 @@ pub struct GroupQueryAttentionKernel {
 
 pub struct GroupQueryAttentionFactory;
 
-impl KernelFactory for GroupQueryAttentionFactory {
-    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let required_heads = |name: &str| -> Result<usize> {
-            let value = node.attr(name).and_then(|a| a.as_int()).ok_or_else(|| {
-                EpError::KernelFailed(format!(
-                    "GroupQueryAttention: missing required `{name}` attribute"
-                ))
-            })?;
-            usize::try_from(value)
-                .ok()
-                .filter(|&v| v > 0)
-                .ok_or_else(|| {
-                    EpError::KernelFailed(format!("GroupQueryAttention: `{name}` must be > 0"))
-                })
-        };
-        let num_heads = required_heads("num_heads")?;
-        let kv_num_heads = required_heads("kv_num_heads")?;
-        if !num_heads.is_multiple_of(kv_num_heads) {
+/// Why this kernel cannot run a given `GroupQueryAttention` node, if it cannot.
+///
+/// Must be answered at *claim* time. `GetCapability` consults only the dtype
+/// and shape filters, so a rejection raised later, in the kernel factory,
+/// arrives after ORT has compiled the node onto this EP and is a **hard session
+/// failure that no fallback recovers from**. ORT's own CPU GQA kernel runs
+/// several configurations this one does not yet implement — `smooth_softmax=1`
+/// (Gemma-style), quantized KV caches, `qk_output` — so claiming and then
+/// failing would take a model that works today and kill it at `CreateSession`.
+///
+/// Implemented by running the factory's own attribute parse, so a limit cannot
+/// be added to [`attributes_from_node`] without appearing here too. These are
+/// capability answers, not performance ones: each is a kernel we owe, and none
+/// of them is a range where we are merely slower.
+pub(crate) fn unsupported_reason(node: &Node) -> Option<String> {
+    attributes_from_node(node).err().map(|e| e.to_string())
+}
+
+/// Every attribute check the factory performs, in one place.
+fn attributes_from_node(node: &Node) -> Result<GroupQueryAttentionKernel> {
+    let required_heads = |name: &str| -> Result<usize> {
+        let value = node.attr(name).and_then(|a| a.as_int()).ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "GroupQueryAttention: missing required `{name}` attribute"
+            ))
+        })?;
+        usize::try_from(value)
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or_else(|| {
+                EpError::KernelFailed(format!("GroupQueryAttention: `{name}` must be > 0"))
+            })
+    };
+    let num_heads = required_heads("num_heads")?;
+    let kv_num_heads = required_heads("kv_num_heads")?;
+    if !num_heads.is_multiple_of(kv_num_heads) {
+        return Err(EpError::KernelFailed(format!(
+            "GroupQueryAttention: num_heads {num_heads} must be a multiple of kv_num_heads {kv_num_heads}"
+        )));
+    }
+
+    for name in ["k_quant_type", "v_quant_type"] {
+        if let Some(value) = node.attr(name)
+            && value.as_str() != Some("NONE")
+        {
             return Err(EpError::KernelFailed(format!(
-                "GroupQueryAttention: num_heads {num_heads} must be a multiple of kv_num_heads {kv_num_heads}"
+                "GroupQueryAttention: `{name}` other than NONE is not yet supported by the f32 CPU kernel"
             )));
         }
+    }
+    if node
+        .attr("kv_cache_bit_width")
+        .and_then(|a| a.as_int())
+        .unwrap_or(0)
+        != 0
+    {
+        return Err(EpError::KernelFailed(
+            "GroupQueryAttention: quantized KV cache is not yet supported".into(),
+        ));
+    }
+    if node.attr("qk_output").and_then(|a| a.as_int()).unwrap_or(0) != 0 {
+        return Err(EpError::KernelFailed(
+            "GroupQueryAttention: qk_output is not yet supported".into(),
+        ));
+    }
+    // ORT's schema default for this attribute is -1, not 0, and ORT
+    // materialises schema defaults onto the node before an EP ever sees it
+    // -- so every GQA node from a real ORT session arrives carrying
+    // `smooth_softmax = -1`. Its own kernel enables the feature only for
+    // the exact value 1 (`use_smooth_softmax_ = ... == 1`), so anything
+    // else means "off". Testing `!= 0` here rejected every ORT-resolved GQA
+    // node, which is why `plugin_ort_e2e`'s GQA assignment fixture is the
+    // regression test for this line.
+    let smooth_softmax = node
+        .attr("smooth_softmax")
+        .and_then(|a| a.as_int())
+        .unwrap_or(0);
+    if smooth_softmax == 1 {
+        return Err(EpError::KernelFailed(
+            "GroupQueryAttention: smooth_softmax is not yet supported".into(),
+        ));
+    }
 
-        for name in ["k_quant_type", "v_quant_type"] {
-            if let Some(value) = node.attr(name)
-                && value.as_str() != Some("NONE")
-            {
-                return Err(EpError::KernelFailed(format!(
-                    "GroupQueryAttention: `{name}` other than NONE is not yet supported by the f32 CPU kernel"
-                )));
-            }
-        }
-        if node
-            .attr("kv_cache_bit_width")
+    let softcap = node
+        .attr("softcap")
+        .and_then(|a| a.as_float())
+        .unwrap_or(0.0);
+    if softcap < 0.0 {
+        return Err(EpError::KernelFailed(
+            "GroupQueryAttention: softcap must be non-negative".into(),
+        ));
+    }
+
+    Ok(GroupQueryAttentionKernel {
+        num_heads,
+        kv_num_heads,
+        // Defensive, not load-bearing: ORT does *not* stamp this
+        // attribute (it is OPTIONAL_VALUE with no schema default, and a
+        // real session was instrumented to confirm it arrives as absent).
+        // But both ORT's kernels and ours read an explicit `scale = 0` as
+        // "use 1/sqrt(head_size)" rather than literally, so a zero taken at
+        // face value would multiply every score by zero and return a
+        // silently wrong answer. `> 0` is deliberately broader than ORT's
+        // `== 0`: a negative scale is meaningless and would otherwise be
+        // honoured.
+        scale: node
+            .attr("scale")
+            .and_then(|a| a.as_float())
+            .filter(|s| *s > 0.0),
+        do_rotary: node.attr("do_rotary").and_then(|a| a.as_int()).unwrap_or(0) != 0,
+        rotary_interleaved: node
+            .attr("rotary_interleaved")
             .and_then(|a| a.as_int())
             .unwrap_or(0)
-            != 0
-        {
-            return Err(EpError::KernelFailed(
-                "GroupQueryAttention: quantized KV cache is not yet supported".into(),
-            ));
-        }
-        if node.attr("qk_output").and_then(|a| a.as_int()).unwrap_or(0) != 0 {
-            return Err(EpError::KernelFailed(
-                "GroupQueryAttention: qk_output is not yet supported".into(),
-            ));
-        }
-        // ORT's schema default for this attribute is -1, not 0, and ORT
-        // materialises schema defaults onto the node before an EP ever sees it
-        // -- so every GQA node from a real ORT session arrives carrying
-        // `smooth_softmax = -1`. Its own kernel enables the feature only for
-        // the exact value 1 (`use_smooth_softmax_ = ... == 1`), so anything
-        // else means "off". Testing `!= 0` here rejected every ORT-resolved GQA
-        // node, which is why `plugin_ort_e2e`'s GQA assignment fixture is the
-        // regression test for this line.
-        let smooth_softmax = node
-            .attr("smooth_softmax")
+            != 0,
+        local_window_size: node
+            .attr("local_window_size")
             .and_then(|a| a.as_int())
-            .unwrap_or(0);
-        if smooth_softmax == 1 {
-            return Err(EpError::KernelFailed(
-                "GroupQueryAttention: smooth_softmax is not yet supported".into(),
-            ));
-        }
+            .unwrap_or(-1),
+        softcap,
+    })
+}
 
-        let softcap = node
-            .attr("softcap")
-            .and_then(|a| a.as_float())
-            .unwrap_or(0.0);
-        if softcap < 0.0 {
-            return Err(EpError::KernelFailed(
-                "GroupQueryAttention: softcap must be non-negative".into(),
-            ));
-        }
-
-        Ok(Box::new(GroupQueryAttentionKernel {
-            num_heads,
-            kv_num_heads,
-            // Defensive, not load-bearing: ORT does *not* stamp this
-            // attribute (it is OPTIONAL_VALUE with no schema default, and a
-            // real session was instrumented to confirm it arrives as absent).
-            // But both ORT's kernels and ours read an explicit `scale = 0` as
-            // "use 1/sqrt(head_size)" rather than literally, so a zero taken at
-            // face value would multiply every score by zero and return a
-            // silently wrong answer. `> 0` is deliberately broader than ORT's
-            // `== 0`: a negative scale is meaningless and would otherwise be
-            // honoured.
-            scale: node
-                .attr("scale")
-                .and_then(|a| a.as_float())
-                .filter(|s| *s > 0.0),
-            do_rotary: node.attr("do_rotary").and_then(|a| a.as_int()).unwrap_or(0) != 0,
-            rotary_interleaved: node
-                .attr("rotary_interleaved")
-                .and_then(|a| a.as_int())
-                .unwrap_or(0)
-                != 0,
-            local_window_size: node
-                .attr("local_window_size")
-                .and_then(|a| a.as_int())
-                .unwrap_or(-1),
-            softcap,
-        }))
+impl KernelFactory for GroupQueryAttentionFactory {
+    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(attributes_from_node(node)?))
     }
 }
 

@@ -75,58 +75,60 @@ pub struct QMoEKernel {
 /// and is a **hard session failure that no fallback recovers from** — strictly
 /// worse for the user than never claiming the node.
 ///
-/// The one case is column-wise quantization. ORT's schema leaves `block_size`
-/// with no default, so an absent attribute means one scale per output row
-/// (`[experts, out_features]`), while this kernel implements only the blocked
-/// form (`[experts, out_features, in_features / block_size]`, block a power of
-/// two ≥ 16). ORT's own CPU kernel *does* run the column-wise form, so claiming
-/// and then failing would take a working model and kill it. Declining here is
-/// a capability answer, not a performance one; the fix is to implement the
-/// column-wise path, tracked in the benchmark doc's §23.6.
+/// The sharpest case is column-wise quantization. ORT's schema leaves
+/// `block_size` with no default, so an absent attribute means one scale per
+/// output row (`[experts, out_features]`), while this kernel implements only
+/// the blocked form (`[experts, out_features, in_features / block_size]`, block
+/// a power of two ≥ 16). ORT's own CPU kernel *does* run the column-wise form,
+/// so claiming and then failing would take a working model and kill it. The
+/// same is true of `use_sparse_mixer=1` and of non-integer `quant_type`.
+/// Declining here is a capability answer, not a performance one; the fix is to
+/// implement the missing paths, tracked in the benchmark doc's §23.6.
+///
+/// Implemented by running the factory's own attribute parse, so a limit cannot
+/// be added to `create` without appearing here too.
 pub(crate) fn unsupported_reason(node: &Node) -> Option<String> {
-    let block_size = node
-        .attr("block_size")
-        .and_then(|a| a.as_int())
-        .unwrap_or(0);
-    if block_size < 16 || !(block_size as usize).is_power_of_two() {
-        return Some(format!(
-            "QMoE: column-wise quantization (block_size {block_size}) is not implemented;              only a power-of-two block of at least 16 is supported"
-        ));
+    quantized_moe_attributes(node).err().map(|e| e.to_string())
+}
+
+/// Everything `QMoEFactory::create` validates, in one place so that
+/// [`unsupported_reason`] and the factory cannot disagree.
+fn quantized_moe_attributes(node: &Node) -> Result<(MoeAttributes, usize, usize)> {
+    let attributes = MoeAttributes::from_node(node)?;
+    let bits = int_attr(node, "expert_weight_bits", 4)?;
+    if !matches!(bits, 1 | 2 | 4 | 8) {
+        return Err(error(format!(
+            "expert_weight_bits must be one of {{1, 2, 4, 8}}, got {bits}"
+        )));
     }
-    None
+    let block_size = int_attr(node, "block_size", 0)?;
+    if block_size < 16 || !(block_size as usize).is_power_of_two() {
+        return Err(error(format!(
+            "block_size must be a power of two and at least 16, got {block_size}"
+        )));
+    }
+    let quant_type = match node.attr("quant_type") {
+        Some(attr) => attr
+            .as_str()
+            .ok_or_else(|| error("attribute quant_type must be a string"))?,
+        None => "int",
+    };
+    if quant_type != "int" {
+        return Err(error(format!(
+            "quant_type='{quant_type}' is unsupported; this kernel implements integer affine QMoE only"
+        )));
+    }
+    Ok((attributes, bits as usize, block_size as usize))
 }
 
 impl KernelFactory for QMoEFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let attributes = MoeAttributes::from_node(node)?;
-        let bits = int_attr(node, "expert_weight_bits", 4)?;
-        if !matches!(bits, 1 | 2 | 4 | 8) {
-            return Err(error(format!(
-                "expert_weight_bits must be one of {{1, 2, 4, 8}}, got {bits}"
-            )));
-        }
-        let block_size = int_attr(node, "block_size", 0)?;
-        if block_size < 16 || !(block_size as usize).is_power_of_two() {
-            return Err(error(format!(
-                "block_size must be a power of two and at least 16, got {block_size}"
-            )));
-        }
-        let quant_type = match node.attr("quant_type") {
-            Some(attr) => attr
-                .as_str()
-                .ok_or_else(|| error("attribute quant_type must be a string"))?,
-            None => "int",
-        };
-        if quant_type != "int" {
-            return Err(error(format!(
-                "quant_type='{quant_type}' is unsupported; this kernel implements integer affine QMoE only"
-            )));
-        }
+        let (attributes, bits, block_size) = quantized_moe_attributes(node)?;
         Ok(Box::new(QMoEKernel {
             layer_id: node.id.0,
             attributes,
-            bits: bits as usize,
-            block_size: block_size as usize,
+            bits,
+            block_size,
             weight_offload: WeightOffloadMode::from_env(),
             host_cache: self.host_cache.clone(),
             prefetch_experts: weight_offload_prefetch_default(),
