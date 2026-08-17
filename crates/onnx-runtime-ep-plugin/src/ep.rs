@@ -807,19 +807,33 @@ fn ep_compile_inner(
                         crate::compute::ShapeInference::for_node(node, &shapes_opt, num_outputs);
 
                     // Build input_slots: maps node input position → ORT index
-                    // (sequential for present inputs, None for absent).
+                    // (None for absent inputs).
+                    //
+                    // Indices are assigned per *distinct value*, not per
+                    // position. ORT's fused-node metadata carries a set of
+                    // input names, so a node that names the same value twice
+                    // is bound once and every later slot would otherwise be
+                    // shifted — the last one past the end of the array ORT
+                    // actually passes. That is not a corner case: a quantized
+                    // `QLinearMatMul` routinely shares one zero-point or scale
+                    // initializer between its `a`, `b` and `y` triples, and any
+                    // `Mul(x, x)`-shaped node does the same.
                     let mut ort_input_idx = 0usize;
+                    let mut value_to_ort_index: std::collections::HashMap<
+                        onnx_runtime_ir::ValueIndex,
+                        usize,
+                    > = std::collections::HashMap::new();
                     let input_slots: Vec<Option<usize>> = view
                         .node_inputs(node_idx)
                         .iter()
                         .map(|input| {
-                            if input.is_some() {
-                                let idx = ort_input_idx;
-                                ort_input_idx += 1;
-                                Some(idx)
-                            } else {
-                                None
-                            }
+                            input.map(|value| {
+                                *value_to_ort_index.entry(value).or_insert_with(|| {
+                                    let idx = ort_input_idx;
+                                    ort_input_idx += 1;
+                                    idx
+                                })
+                            })
                         })
                         .collect();
 

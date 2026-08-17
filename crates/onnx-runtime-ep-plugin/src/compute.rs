@@ -58,6 +58,29 @@ pub enum ShapeInference {
     SameAsInputMultiOutput { idx: usize, count: usize },
     /// MatMul / MatMulNBits semantics (handles 1-D, 2-D, batched-ND).
     MatMul,
+    /// `com.microsoft::MatMulNBits`: `A[.., K] x dequant(B)[K, N]`.
+    ///
+    /// Not [`Self::MatMul`]. `B` is the *packed* quantized weight, shaped
+    /// `[N, ceil(K / block_size), block_size * bits / 8]` — three dims that
+    /// have nothing to do with the GEMM's, so plain matmul broadcasting reads
+    /// `N` as a batch dim and `blob_size` as the output column count. The real
+    /// output is the activation's shape with its last dim replaced by the `N`
+    /// attribute, which is also what `onnx-runtime-shape-inference`'s
+    /// `quantized_matmul` rule computes for the native path.
+    MatMulNBits {
+        /// The `N` attribute: the dequantized weight's column count.
+        n: usize,
+    },
+    /// `QLinearMatMul`: `MatMul` semantics between input 0 and input **3**.
+    ///
+    /// The quantization parameters sit between the two operands
+    /// (`a, a_scale, a_zero_point, b, b_scale, b_zero_point, y_scale,
+    /// y_zero_point`), so [`Self::MatMul`]'s "inputs 0 and 1" reads `a_scale`
+    /// as the right-hand operand. Absent from this table the op resolves to
+    /// [`Self::Declined`], and the fail-closed shape filter in `GetCapability`
+    /// then drops the claim — which is what kept this EP from ever receiving a
+    /// `QLinearMatMul` node from a plugin host.
+    QLinearMatMul,
     /// Gemm: (trans_a, trans_b) flags.
     Gemm { trans_a: bool, trans_b: bool },
     /// Concat along `axis`.
@@ -229,7 +252,16 @@ impl ShapeInference {
             },
 
             // ── Matrix multiply ───────────────────────────────────────────
-            "MatMul" | "MatMulNBits" => Self::MatMul,
+            "MatMul" => Self::MatMul,
+            "QLinearMatMul" => Self::QLinearMatMul,
+            // `N` is an attribute, so the op-name-only entry point cannot
+            // resolve it and must decline rather than fall through to
+            // `Self::MatMul`, which would silently read the packed weight's
+            // `blob_size` as the output width.
+            "MatMulNBits" => Self::Declined {
+                op_type: op_type.to_string(),
+                domain: domain.to_string(),
+            },
 
             // ── Safe defaults for attribute-having ops ────────────────────
             "Concat" => Self::Concat { axis: 0 },
@@ -374,7 +406,18 @@ impl ShapeInference {
             }
 
             // ── MatMul ────────────────────────────────────────────────────
-            "MatMul" | "MatMulNBits" => Self::MatMul,
+            "MatMul" => Self::MatMul,
+            "QLinearMatMul" => Self::QLinearMatMul,
+            "MatMulNBits" => match int_attr("N").and_then(|n| usize::try_from(n).ok()) {
+                Some(n) if n > 0 => Self::MatMulNBits { n },
+                // A `MatMulNBits` without a usable `N` is malformed; the kernel
+                // factory rejects it at Compile time. Declining here keeps the
+                // claim from reaching that point at all.
+                _ => Self::Declined {
+                    op_type: op.to_string(),
+                    domain: domain.to_string(),
+                },
+            },
 
             // ── Gemm ──────────────────────────────────────────────────────
             "Gemm" => {
@@ -2372,14 +2415,27 @@ unsafe extern "C" fn compute_execute(
             let entry = &exported.entries[0];
             // Reconstruct positional inputs with absent sentinels so the
             // kernel sees the correct arity and position.
-            let mut kernel_inputs: Vec<_> = entry
-                .input_slots
-                .iter()
-                .map(|slot| match slot {
-                    Some(ort_idx) => inputs[*ort_idx].view(),
-                    None => TensorView::absent(DataType::Undefined),
-                })
-                .collect();
+            // Fail closed rather than indexing: a slot beyond ORT's input
+            // count means the compile-time slot map and the runtime binding
+            // disagree, and panicking across the C ABI inside `Compute` turns
+            // that into an opaque "internal panic" instead of a diagnosable
+            // session error.
+            let mut kernel_inputs: Vec<TensorView<'_>> =
+                Vec::with_capacity(entry.input_slots.len());
+            for (position, slot) in entry.input_slots.iter().enumerate() {
+                match slot {
+                    Some(ort_idx) => match inputs.get(*ort_idx) {
+                        Some(input) => kernel_inputs.push(input.view()),
+                        None => {
+                            return fail_status(&format!(
+                                "Compute: input slot {position} maps to ORT input {ort_idx}, but                                  ORT bound only {} input(s) to this fused node",
+                                inputs.len()
+                            ));
+                        }
+                    },
+                    None => kernel_inputs.push(TensorView::absent(DataType::Undefined)),
+                }
+            }
             let output_shapes = match infer_shapes(&entry.shape_inference, &kernel_inputs) {
                 Ok(s) => s,
                 Err(e) => {
@@ -2783,6 +2839,30 @@ fn infer_shapes(
             let a = inputs[0].shape;
             let b = inputs[1].shape;
             let shape = matmul_output_shape(a, b)?;
+            Ok(vec![shape])
+        }
+
+        ShapeInference::MatMulNBits { n } => {
+            let a = inputs
+                .first()
+                .ok_or_else(|| "MatMulNBits: expected >=1 input, got 0".to_string())?
+                .shape;
+            if a.is_empty() {
+                return Err("MatMulNBits: activation must have rank >= 1".to_string());
+            }
+            let mut shape = a.to_vec();
+            *shape.last_mut().expect("rank checked above") = *n;
+            Ok(vec![shape])
+        }
+
+        ShapeInference::QLinearMatMul => {
+            if inputs.len() < 4 {
+                return Err(format!(
+                    "QLinearMatMul: expected >=4 inputs (a, a_scale, a_zero_point, b), got {}",
+                    inputs.len()
+                ));
+            }
+            let shape = matmul_output_shape(inputs[0].shape, inputs[3].shape)?;
             Ok(vec![shape])
         }
 
@@ -3506,6 +3586,89 @@ unsafe extern "C" fn compute_release_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Matmul-family shape rules ─────────────────────────────────────────────
+    //
+    // These are the hardware-independent falsifiers for the two shape rules
+    // that decide whether `MatMulNBits` and `QLinearMatMul` can be claimed at
+    // all: `GetCapability` drops any claim whose strategy is `Declined`, and a
+    // wrong strategy is worse than none because it produces a plausible but
+    // incorrect output buffer.
+
+    fn u8_view<'a>(shape: &'a [usize], strides: &'a [i64]) -> TensorView<'a> {
+        TensorView::new(
+            DevicePtr(std::ptr::null()),
+            DataType::Uint8,
+            shape,
+            strides,
+            DeviceId::cpu(),
+        )
+    }
+
+    #[test]
+    fn matmul_nbits_shape_uses_the_n_attribute_not_the_packed_weight() {
+        // B is [N, blocks_per_col, blob_bytes] — nothing about its trailing
+        // dims is a matmul operand, so N must come from the attribute.
+        let a = view(&[1, 256], &[256, 1]);
+        let b = u8_view(&[4096, 8, 16], &[128, 16, 1]);
+        let scales = view(&[4096 * 8], &[1]);
+
+        let shapes = infer(&ShapeInference::MatMulNBits { n: 4096 }, &[a, b, scales])
+            .expect("MatMulNBits shape inference");
+        assert_eq!(shapes, vec![vec![1, 4096]]);
+
+        // Aliasing this op to plain `MatMul` — which is what the table used to
+        // do — broadcasts the activation against the *packed* weight and
+        // yields a wrong-rank, wrong-extent buffer. Pin the bad answer so the
+        // alias cannot come back unnoticed.
+        let wrong = infer(&ShapeInference::MatMul, &[a, b, scales])
+            .expect("plain MatMul over a packed weight");
+        assert_eq!(wrong, vec![vec![4096, 1, 16]]);
+        assert_ne!(wrong, vec![vec![1, 4096]]);
+    }
+
+    #[test]
+    fn matmul_nbits_shape_preserves_leading_activation_dims() {
+        let a = view(&[2, 3, 256], &[768, 256, 1]);
+        let b = u8_view(&[512, 8, 16], &[128, 16, 1]);
+        let shapes = infer(&ShapeInference::MatMulNBits { n: 512 }, &[a, b])
+            .expect("MatMulNBits shape inference");
+        assert_eq!(shapes, vec![vec![2, 3, 512]]);
+    }
+
+    #[test]
+    fn qlinear_matmul_shape_uses_inputs_zero_and_three() {
+        // a, a_scale, a_zero_point, b, b_scale, b_zero_point, y_scale, y_zp.
+        // Input 1 is a scalar, so a rule that read operands 0 and 1 — the
+        // plain-`MatMul` convention — could not produce [1, 4096] by accident.
+        let a = u8_view(&[1, 256], &[256, 1]);
+        let scalar = view(&[], &[]);
+        let b = u8_view(&[256, 4096], &[4096, 1]);
+        let inputs = [a, scalar, scalar, b, scalar, scalar, scalar, scalar];
+        let shapes =
+            infer(&ShapeInference::QLinearMatMul, &inputs).expect("QLinearMatMul shape inference");
+        assert_eq!(shapes, vec![vec![1, 4096]]);
+    }
+
+    #[test]
+    fn matmul_family_ops_resolve_to_their_own_strategies() {
+        assert!(matches!(
+            ShapeInference::for_op_domain("MatMul", ""),
+            ShapeInference::MatMul
+        ));
+        assert!(matches!(
+            ShapeInference::for_op_domain("QLinearMatMul", ""),
+            ShapeInference::QLinearMatMul
+        ));
+        // `MatMulNBits` needs the `N` attribute, which the op/domain-only
+        // table cannot see, so it must decline rather than fall back to the
+        // plain-matmul rule.
+        assert!(matches!(
+            ShapeInference::for_op_domain("MatMulNBits", "com.microsoft"),
+            ShapeInference::Declined { .. }
+        ));
+    }
+
     use onnx_runtime_ep_api::tensor::{DevicePtr, TensorView};
     use onnx_runtime_ir::{DataType, DeviceId};
 
