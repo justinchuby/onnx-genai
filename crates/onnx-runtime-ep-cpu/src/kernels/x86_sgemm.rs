@@ -349,7 +349,11 @@ unsafe fn gemv_m1_strip(
             let cbase = c.add(j0);
             let mut jj = 0usize;
             while jj + 8 <= nc {
-                let acc = _mm256_fmadd_ps(av, _mm256_loadu_ps(rp.add(jj)), _mm256_loadu_ps(cbase.add(jj)));
+                let acc = _mm256_fmadd_ps(
+                    av,
+                    _mm256_loadu_ps(rp.add(jj)),
+                    _mm256_loadu_ps(cbase.add(jj)),
+                );
                 _mm256_storeu_ps(cbase.add(jj), acc);
                 jj += 8;
             }

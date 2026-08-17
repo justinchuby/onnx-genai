@@ -4950,8 +4950,7 @@ mod tests {
                     best[i] = best[i].min(t.elapsed().as_secs_f64());
                 }
             }
-            let times: Vec<(&str, f64)> =
-                avail.iter().copied().zip(best.iter().copied()).collect();
+            let times: Vec<(&str, f64)> = avail.iter().copied().zip(best.iter().copied()).collect();
             let g = |s: f64| flops / s / 1e9;
             let get = |k: &str| times.iter().find(|(n, _)| *n == k).map(|(_, s)| *s);
             let is_control = m >= 2;
