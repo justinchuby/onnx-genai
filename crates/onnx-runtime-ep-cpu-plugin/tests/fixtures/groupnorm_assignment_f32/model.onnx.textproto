@@ -1,0 +1,35 @@
+ir_version: 10
+graph {
+  node: [
+    { input: ["X", "scale", "bias"] output: ["Z"] op_type: "GroupNormalization"
+      attribute: [ { name: "num_groups" i: 2 type: INT }, { name: "epsilon" f: 1e-5 type: FLOAT } ] }
+  ]
+  name: "groupnorm_assignment_f32"
+  initializer: [
+  { name: "scale" data_type: 1 dims: [ 4 ] float_data: [ 1.0, 1.1, 0.9, 1.2 ] },
+  { name: "bias"  data_type: 1 dims: [ 4 ] float_data: [ 0.0, 0.1, -0.1, 0.2 ] }
+  ]
+  input: [
+  {
+    name: "X"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape { dim: [{ dim_value: 2 }, { dim_value: 4 }, { dim_value: 64 }, { dim_value: 64 }] }
+      }
+    }
+  }
+  ]
+  output: [
+  {
+    name: "Z"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape { dim: [{ dim_value: 2 }, { dim_value: 4 }, { dim_value: 64 }, { dim_value: 64 }] }
+      }
+    }
+  }
+  ]
+}
+opset_import: [{ version: 22 }]
