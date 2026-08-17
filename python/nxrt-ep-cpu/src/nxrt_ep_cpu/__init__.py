@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 from pathlib import Path
 
 __all__ = [
@@ -73,9 +74,20 @@ def build_features() -> str:
         AttributeError: if the bundled library predates this export.
     """
     handle = ctypes.CDLL(get_library_path())
-    entry = handle.nxrt_ep_build_features
-    entry.restype = ctypes.c_char_p
-    return (entry() or b"").decode()
+    try:
+        entry = handle.nxrt_ep_build_features
+        entry.restype = ctypes.c_char_p
+        return (entry() or b"").decode()
+    finally:
+        # This query must not leave the library loaded: on Windows that would
+        # lock the file for the rest of the process.
+        try:
+            if sys.platform == "win32":
+                ctypes.windll.kernel32.FreeLibrary(ctypes.c_void_p(handle._handle))
+            else:
+                ctypes.CDLL(None).dlclose(ctypes.c_void_p(handle._handle))
+        except Exception:  # pragma: no cover - the value was already read
+            pass
 
 
 def register(session_options=None, registration_name: str = REGISTRATION_NAME):

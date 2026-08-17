@@ -133,6 +133,17 @@ def _build_cdylib() -> Path:
     )
 
 
+def _unload(handle: ctypes.CDLL) -> None:
+    """Best-effort release of a library loaded only to read its identity."""
+    try:
+        if sys.platform == "win32":
+            ctypes.windll.kernel32.FreeLibrary(ctypes.c_void_p(handle._handle))
+        else:
+            ctypes.CDLL(None).dlclose(ctypes.c_void_p(handle._handle))
+    except Exception:  # pragma: no cover - identity check already succeeded
+        pass
+
+
 def _verify_features(lib: Path) -> None:
     """Fail the build if the cdylib is not the one we asked cargo for.
 
@@ -145,14 +156,19 @@ def _verify_features(lib: Path) -> None:
     """
     expected = "mlas" if MLAS_FEATURE in CARGO_FEATURES else ""
     handle = ctypes.CDLL(os.fspath(lib))
-    entry = getattr(handle, "nxrt_ep_build_features", None)
-    if entry is None:
-        raise RuntimeError(
-            f"{lib} does not export nxrt_ep_build_features; it was built from "
-            "a source tree that predates the build-identity export"
-        )
-    entry.restype = ctypes.c_char_p
-    reported = (entry() or b"").decode()
+    try:
+        entry = getattr(handle, "nxrt_ep_build_features", None)
+        if entry is None:
+            raise RuntimeError(
+                f"{lib} does not export nxrt_ep_build_features; it was built from "
+                "a source tree that predates the build-identity export"
+            )
+        entry.restype = ctypes.c_char_p
+        reported = (entry() or b"").decode()
+    finally:
+        # Windows keeps a loaded DLL locked against replacement, and this build
+        # may go on to rebuild the same target directory.
+        _unload(handle)
     if reported != expected:
         raise RuntimeError(
             f"{lib} reports build features {reported!r} but this wheel asked "

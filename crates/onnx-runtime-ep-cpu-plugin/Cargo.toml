@@ -33,6 +33,7 @@ onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-std = { workspace = true }
+serde_yaml = { workspace = true }
 
 [lints]
 workspace = true

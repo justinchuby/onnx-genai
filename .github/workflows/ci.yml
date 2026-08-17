@@ -709,6 +709,18 @@ jobs:
       - name: Test onnx-runtime-ep-cpu-plugin (ORT gate)
         if: ${{ !cancelled() && runner.os == 'Linux' }}
         run: cargo test --locked --no-fail-fast -p onnx-runtime-ep-cpu-plugin
+      # The same suite against the *shipped* build. The wheel enables `mlas` on
+      # this platform, so the default-feature run above proves little about the
+      # library users install: with no features the build-identity assertion is
+      # trivially satisfied, the vendored C++ is not linked so the symbol
+      # leakage check has nothing to leak, and a testkit that rebuilds a
+      # feature-specific cdylib *without* its features -- the defect fixed
+      # alongside this step -- is only observable when features are requested.
+      - name: Test onnx-runtime-ep-cpu-plugin with MLAS (ORT gate)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: >-
+          cargo test --locked --no-fail-fast
+          -p onnx-runtime-ep-cpu-plugin --features mlas
       - name: Upload CLI ORT coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4
