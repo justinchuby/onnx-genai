@@ -794,14 +794,16 @@ mod avx2 {
             // mathematical range. (The counts are FMA-specific: the same
             // constants evaluated without fusion overshoot on only 26 503
             // points over `[8.052297, 8.999964]`.)
-            let poly = clamp_nan_preserving(_mm256_div_ps(p, q), -1.0, 1.0);
-
-            // Saturate. Ordered compares are false for NaN, so NaN keeps the
-            // polynomial result, which is NaN.
-            let above = _mm256_cmp_ps(x, _mm256_set1_ps(tanh_c::UPPER), _CMP_GT_OQ);
-            let below = _mm256_cmp_ps(x, _mm256_set1_ps(tanh_c::LOWER), _CMP_LT_OQ);
-            let r = _mm256_blendv_ps(poly, _mm256_set1_ps(1.0), above);
-            _mm256_blendv_ps(r, _mm256_set1_ps(-1.0), below)
+            // The `[-1, 1]` clamp is also the saturation. Because the input was
+            // already clamped to `[-9, 9]`, the largest argument the rational
+            // ever sees is `±9`, where `p/q` evaluates to `±1.0000001`; the
+            // clamp turns that into exactly `±1`. So every `|x| >= 9` — up to
+            // and including `±Inf` — already leaves here as exactly `±1`
+            // without a separate saturation step, and `NaN` survives because
+            // `maxps`/`minps` return their second operand on an unordered
+            // compare. `tanh_saturation_blend_is_redundant` proves this by
+            // sweeping all 1 047 527 424 finite `f32` with `|x| >= 9`.
+            clamp_nan_preserving(_mm256_div_ps(p, q), -1.0, 1.0)
         }
     }
 
@@ -835,12 +837,14 @@ mod avx2 {
             q = _mm256_fmadd_ps(q, v2, _mm256_set1_ps(logistic_c::BETA_0));
 
             let poly = _mm256_add_ps(_mm256_div_ps(p, q), _mm256_set1_ps(0.5));
-            let poly = clamp_nan_preserving(poly, 0.0, 1.0);
 
-            let above = _mm256_cmp_ps(x, _mm256_set1_ps(logistic_c::UPPER), _CMP_GT_OQ);
-            let below = _mm256_cmp_ps(x, _mm256_set1_ps(logistic_c::LOWER), _CMP_LT_OQ);
-            let r = _mm256_blendv_ps(poly, _mm256_set1_ps(1.0), above);
-            _mm256_blendv_ps(r, _mm256_set1_ps(0.0), below)
+            // As in `tanh_ps`, the `[0, 1]` clamp is also the saturation: the
+            // rational only ever sees `±18`, where `p/q + 0.5` lands outside
+            // `[0, 1]` on both ends, so `|x| >= 18` and `±Inf` already leave
+            // here as exactly `0` or `1`.
+            // `sigmoid_saturation_blend_is_redundant` proves this over all
+            // 1 039 138 816 finite `f32` with `|x| >= 18`.
+            clamp_nan_preserving(poly, 0.0, 1.0)
         }
     }
 
@@ -863,8 +867,11 @@ mod avx2 {
                 _mm256_mul_ps(_mm256_set1_ps(0.5), x),
                 _mm256_add_ps(_mm256_set1_ps(1.0), t),
             );
+            // Blending against zero is an `andnot` of the compare mask, which
+            // is one uop where `vblendvps` is two on Zen. The mask is all-ones
+            // or all-zeros, so the two are exactly equivalent here.
             let neg_inf = _mm256_cmp_ps(x, _mm256_set1_ps(f32::NEG_INFINITY), _CMP_EQ_OQ);
-            _mm256_blendv_ps(y, _mm256_setzero_ps(), neg_inf)
+            _mm256_andnot_ps(neg_inf, y)
         }
     }
 
@@ -875,8 +882,11 @@ mod avx2 {
         unsafe {
             let s = sigmoid_ps(_mm256_mul_ps(alpha, x));
             let y = _mm256_mul_ps(x, s);
+            // Blending against zero is an `andnot` of the compare mask, which
+            // is one uop where `vblendvps` is two on Zen. The mask is all-ones
+            // or all-zeros, so the two are exactly equivalent here.
             let neg_inf = _mm256_cmp_ps(x, _mm256_set1_ps(f32::NEG_INFINITY), _CMP_EQ_OQ);
-            _mm256_blendv_ps(y, _mm256_setzero_ps(), neg_inf)
+            _mm256_andnot_ps(neg_inf, y)
         }
     }
 
@@ -1072,8 +1082,11 @@ mod avx2 {
                 _mm256_mul_ps(_mm256_set1_ps(0.5), x),
                 _mm256_add_ps(_mm256_set1_ps(1.0), e),
             );
+            // Blending against zero is an `andnot` of the compare mask, which
+            // is one uop where `vblendvps` is two on Zen. The mask is all-ones
+            // or all-zeros, so the two are exactly equivalent here.
             let neg_inf = _mm256_cmp_ps(x, _mm256_set1_ps(f32::NEG_INFINITY), _CMP_EQ_OQ);
-            _mm256_blendv_ps(y, _mm256_setzero_ps(), neg_inf)
+            _mm256_andnot_ps(neg_inf, y)
         }
     }
 
@@ -2700,5 +2713,211 @@ mod exp_tests {
         for (i, (&g, &w)) in buf.iter().zip(&want).enumerate() {
             assert_eq!(g.to_bits(), w.to_bits(), "i={i}");
         }
+    }
+}
+
+/// Falsifiers for the saturation removed from `tanh_ps` / `sigmoid_ps`.
+///
+/// Both kernels used to follow the `[-1, 1]` / `[0, 1]` clamp with a pair of
+/// `vcmpps` + `vblendvps` that forced the saturated constant for `|x|` beyond
+/// the rational's clamp range. That step is redundant: the input clamp means
+/// the rational never sees an argument past `±9` / `±18`, and at those points
+/// the result is already outside the output clamp, so the clamp alone
+/// saturates. These tests keep the old sequence as a reference and assert the
+/// current kernels reproduce it bit for bit.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod saturation_absorption {
+    use super::*;
+    use std::arch::x86_64::*;
+
+    /// `tanh_ps` as it was written before the blends were removed.
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn tanh_ps_with_blend(x: __m256) -> __m256 {
+        unsafe {
+            let poly = avx2::tanh_ps(x);
+            let above = _mm256_cmp_ps(x, _mm256_set1_ps(tanh_c::UPPER), _CMP_GT_OQ);
+            let below = _mm256_cmp_ps(x, _mm256_set1_ps(tanh_c::LOWER), _CMP_LT_OQ);
+            let r = _mm256_blendv_ps(poly, _mm256_set1_ps(1.0), above);
+            _mm256_blendv_ps(r, _mm256_set1_ps(-1.0), below)
+        }
+    }
+
+    /// `sigmoid_ps` as it was written before the blends were removed.
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn sigmoid_ps_with_blend(x: __m256) -> __m256 {
+        unsafe {
+            let poly = avx2::sigmoid_ps(x);
+            let above = _mm256_cmp_ps(x, _mm256_set1_ps(logistic_c::UPPER), _CMP_GT_OQ);
+            let below = _mm256_cmp_ps(x, _mm256_set1_ps(logistic_c::LOWER), _CMP_LT_OQ);
+            let r = _mm256_blendv_ps(poly, _mm256_set1_ps(1.0), above);
+            _mm256_blendv_ps(r, _mm256_set1_ps(0.0), below)
+        }
+    }
+
+    /// Runs both forms over one vector of inputs and returns the two results.
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn pair(
+        lean: unsafe fn(__m256) -> __m256,
+        reference: unsafe fn(__m256) -> __m256,
+        input: &[f32; 8],
+    ) -> ([f32; 8], [f32; 8]) {
+        unsafe {
+            let v = _mm256_loadu_ps(input.as_ptr());
+            let mut a = [0.0f32; 8];
+            let mut b = [0.0f32; 8];
+            _mm256_storeu_ps(a.as_mut_ptr(), lean(v));
+            _mm256_storeu_ps(b.as_mut_ptr(), reference(v));
+            (a, b)
+        }
+    }
+
+    fn assert_same(
+        lean: unsafe fn(__m256) -> __m256,
+        reference: unsafe fn(__m256) -> __m256,
+        input: &[f32; 8],
+        what: &str,
+    ) {
+        let (a, b) = unsafe { pair(lean, reference, input) };
+        for i in 0..8 {
+            assert_eq!(
+                a[i].to_bits(),
+                b[i].to_bits(),
+                "{what}({:e}): without blend {:e} ({:08x}), with blend {:e} ({:08x})",
+                input[i],
+                a[i],
+                a[i].to_bits(),
+                b[i],
+                b[i].to_bits(),
+            );
+        }
+    }
+
+    /// Walks every `f32` in `[lo, hi]` by ULP, eight at a time, plus the
+    /// negation of each.
+    fn sweep(
+        lean: unsafe fn(__m256) -> __m256,
+        reference: unsafe fn(__m256) -> __m256,
+        lo: f32,
+        hi: f32,
+        what: &str,
+    ) -> u64 {
+        let (mut bits, end) = (lo.to_bits(), hi.to_bits());
+        let mut seen = 0u64;
+        while bits <= end {
+            let mut pos = [0.0f32; 8];
+            let mut neg = [0.0f32; 8];
+            for slot in 0..8 {
+                let b = (bits + slot as u32).min(end);
+                pos[slot] = f32::from_bits(b);
+                neg[slot] = -pos[slot];
+            }
+            assert_same(lean, reference, &pos, what);
+            assert_same(lean, reference, &neg, what);
+            seen += 8;
+            bits += 8;
+        }
+        seen
+    }
+
+    fn avx2() -> bool {
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+    }
+
+    #[test]
+    fn tanh_saturation_blend_is_redundant_near_the_boundary() {
+        if !avx2() {
+            return;
+        }
+        // Dense over the decade above the clamp, where an overshoot would show.
+        let n = sweep(avx2::tanh_ps, tanh_ps_with_blend, 9.0, 128.0, "tanh");
+        assert!(n > 32_000_000, "sweep covered only {n} values");
+    }
+
+    #[test]
+    fn sigmoid_saturation_blend_is_redundant_near_the_boundary() {
+        if !avx2() {
+            return;
+        }
+        let n = sweep(
+            avx2::sigmoid_ps,
+            sigmoid_ps_with_blend,
+            18.0,
+            256.0,
+            "sigmoid",
+        );
+        assert!(n > 20_000_000, "sweep covered only {n} values");
+    }
+
+    #[test]
+    fn saturation_blend_is_redundant_for_special_values() {
+        if !avx2() {
+            return;
+        }
+        let specials = [
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            f32::MAX,
+            f32::MIN,
+            1e30,
+            -1e30,
+        ];
+        assert_same(avx2::tanh_ps, tanh_ps_with_blend, &specials, "tanh");
+        assert_same(
+            avx2::sigmoid_ps,
+            sigmoid_ps_with_blend,
+            &specials,
+            "sigmoid",
+        );
+
+        // Exactly at, and one ULP either side of, both clamp boundaries.
+        for &edge in &[tanh_c::LOWER, tanh_c::UPPER] {
+            let e = edge.to_bits();
+            let around = [
+                f32::from_bits(e - 2),
+                f32::from_bits(e - 1),
+                edge,
+                f32::from_bits(e + 1),
+                f32::from_bits(e + 2),
+                edge,
+                edge,
+                edge,
+            ];
+            assert_same(avx2::tanh_ps, tanh_ps_with_blend, &around, "tanh");
+        }
+        for &edge in &[logistic_c::LOWER, logistic_c::UPPER] {
+            let e = edge.to_bits();
+            let around = [
+                f32::from_bits(e - 2),
+                f32::from_bits(e - 1),
+                edge,
+                f32::from_bits(e + 1),
+                f32::from_bits(e + 2),
+                edge,
+                edge,
+                edge,
+            ];
+            assert_same(avx2::sigmoid_ps, sigmoid_ps_with_blend, &around, "sigmoid");
+        }
+    }
+
+    /// The complete proof: every finite `f32` past the clamp, both signs.
+    /// 1 047 527 424 values for `tanh` and 1 039 138 816 for `sigmoid`, which
+    /// is minutes in an unoptimised test build, so it is not run by default.
+    #[test]
+    #[ignore = "exhaustive; run with --ignored"]
+    fn saturation_blend_is_redundant_exhaustively() {
+        if !avx2() {
+            return;
+        }
+        sweep(avx2::tanh_ps, tanh_ps_with_blend, 9.0, f32::MAX, "tanh");
+        sweep(
+            avx2::sigmoid_ps,
+            sigmoid_ps_with_blend,
+            18.0,
+            f32::MAX,
+            "sigmoid",
+        );
     }
 }
