@@ -12,16 +12,24 @@ categories = ["science", "hardware-support"]
 crate-type = ["cdylib", "lib"]
 
 [features]
-# Link the vendored ONNX Runtime MLAS kernels into the cdylib. ORT's own CPU
-# execution provider *is* MLAS, so a cdylib without this feature is not a
-# like-for-like build: the quantized matmul paths measure an order of magnitude
-# slower. The shipped wheel enables it on every target CI proves it builds on
-# (see python/nxrt-ep-cpu/setup.py); it stays off by default so a host with no
-# C++ toolchain can still build the cdylib.
+# The vendored ONNX Runtime MLAS kernels, linked into the cdylib as an
+# *internal* backend of our own CPU EP. ORT's built-in CPU EP is MLAS, so a
+# cdylib without this is not a like-for-like build: the quantized matmul paths
+# measure an order of magnitude slower. On by default (repository direction,
+# 2026-08-17); `--no-default-features` builds the pure-Rust cdylib for a host
+# with no C++ toolchain or a target the vendored sources do not cover.
+#
+# The `onnx-runtime-ep-cpu` dependencies below pin `default-features = false`
+# precisely so this switch works: with the EP's own defaults on, Cargo feature
+# unification would re-enable MLAS and `--no-default-features` would silently
+# be a no-op.
+default = ["mlas"]
 mlas = ["onnx-runtime-ep-cpu/mlas"]
 
 [dependencies]
-onnx-runtime-ep-cpu = { workspace = true }
+onnx-runtime-ep-cpu = { path = "../onnx-runtime-ep-cpu", version = "=0.1.0-dev.5", default-features = false, features = [
+    "full",
+] }
 onnx-runtime-ep-plugin = { path = "../onnx-runtime-ep-plugin", version = "=0.1.0-dev.5" }
 
 [dev-dependencies]
@@ -29,7 +37,9 @@ onnx-runtime-ort-testkit = { workspace = true }
 libloading = { workspace = true }
 onnx-genai-ort-sys = { workspace = true }
 onnx-runtime-ep-plugin = { path = "../onnx-runtime-ep-plugin", version = "=0.1.0-dev.5" }
-onnx-runtime-ep-cpu = { workspace = true }
+onnx-runtime-ep-cpu = { path = "../onnx-runtime-ep-cpu", version = "=0.1.0-dev.5", default-features = false, features = [
+    "full",
+] }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-std = { workspace = true }

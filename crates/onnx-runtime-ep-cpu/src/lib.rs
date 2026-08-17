@@ -5,19 +5,34 @@
 //! and hosts pure-Rust reference kernels for the Phase-1 op set (`MatMul`,
 //! `Add`, `Relu`, `Reshape`, `Transpose`, `Gather`, `LayerNormalization`).
 //!
-//! ## Backends: correctness baseline + SIMD fast path
+//! ## Backends: MLAS by default, native kernels absorbing it
 //!
 //! The GEMM hot spot is served through [`backend::CpuBackend`] (`docs/architecture/ORT2.md`
-//! §25.2). The **default** backend is a pure-Rust blocked, register-tiled,
-//! rayon-parallelized f32 GEMM — the portable, offline correctness baseline that
-//! compiles anywhere with no C++/FFI. On supported x86 hosts, the built-in
-//! `SimdX86` implementation provides the default fast path. Every backend lives behind the
-//! [`onnx_runtime_ep_api::Kernel`] trait, so neither the EP contract nor the
-//! session observes which one ran. See [`kernels::matmul`] for the hot spot.
+//! §25.2). The vendored **MLAS** kernels are compiled in by default (the `mlas`
+//! feature is part of `default`) and are the f32 GEMM route on x86-64. MLAS is
+//! an *internal backend library of this EP*: we keep full node ownership and
+//! call it ourselves. Nothing here delegates a node to ORT's built-in
+//! `CPUExecutionProvider`.
+//!
+//! Behind MLAS sit two always-compiled native paths: the built-in `SimdX86`
+//! MLAS-style microkernel for AVX2+FMA x86 hosts, and the portable `Generic`
+//! blocked rayon GEMM, which is the correctness baseline every other backend is
+//! differentially tested against (`tests/native_vs_mlas_differential.rs`).
+//! Every backend lives behind the [`onnx_runtime_ep_api::Kernel`] trait, so
+//! neither the EP contract nor the session observes which one ran. See
+//! [`kernels::matmul`] for the hot spot.
+//!
+//! `--no-default-features --features full` drops MLAS and keeps every operator
+//! group, for a host with no C++/asm toolchain.
+//!
+//! [`dispatch_ledger`] records, per kernel family, whether the route is native,
+//! MLAS, or ours-over-MLAS, together with the dtype / ISA / thread / shape
+//! evidence. `docs/performance/CPU_MLAS_MIGRATION.md` is the migration plan it
+//! tracks.
 //!
 //! ## `unsafe`
 //!
-//! The default (Generic) path is `unsafe`-minimal: the only `unsafe` is the raw
+//! The native (Generic) path is `unsafe`-minimal: the only `unsafe` is the raw
 //! device-buffer access the ep-api contract forces (aligned host
 //! `alloc`/`dealloc`, `memcpy`, and strided element reads/writes), each isolated
 //! and `SAFETY`-documented. The blocked rayon GEMM itself contains no `unsafe`;
@@ -29,9 +44,11 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod backend;
+pub mod backend_ab;
 pub mod decode_affinity;
 pub mod decode_numa;
 pub mod decode_spmd;
+pub mod dispatch_ledger;
 pub mod dtype;
 pub mod kernels;
 #[cfg(all(feature = "mlas", feature = "ops-cnn"))]
@@ -43,6 +60,7 @@ mod trace;
 pub mod weight_offload;
 
 pub use backend::CpuBackend;
+pub use dispatch_ledger::{Backend as DispatchBackend, KernelFamily, effective_backend};
 pub use kernels::qmoe::WeightOffloadHostCache;
 pub use kernels::{CpuOpDescriptor, build_cpu_registry_with_descriptors, supported_dtypes_for_op};
 pub use optimizer::{

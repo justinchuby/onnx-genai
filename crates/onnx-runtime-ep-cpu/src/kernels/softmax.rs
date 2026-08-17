@@ -268,15 +268,37 @@ fn parallel_rows_per_task(n: usize, d: usize) -> Option<usize> {
     Some(n.div_ceil(workers).max(1))
 }
 
-#[cfg(feature = "mlas")]
+/// Softmax one chunk of whole rows.
+///
+/// With `mlas` compiled in (the default) this is MLAS's SIMD row softmax; the
+/// native implementation below stays compiled either way so
+/// `tests/native_vs_mlas_differential.rs` can hold the two against each other
+/// in one binary, which is what keeps an absorption honest.
 fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
-    mlas_sys::compute_softmax_in_place(data, n, d);
+    crate::dispatch_ledger::record(crate::dispatch_ledger::Observation::elementwise(
+        crate::dispatch_ledger::KernelFamily::Softmax,
+        if cfg!(feature = "mlas") {
+            crate::dispatch_ledger::Backend::Mlas
+        } else {
+            crate::dispatch_ledger::Backend::Native
+        },
+        "f32",
+        data.len(),
+    ));
+    #[cfg(feature = "mlas")]
+    {
+        mlas_sys::compute_softmax_in_place(data, n, d);
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        softmax_rows_serial_native(data, n, d);
+    }
 }
 
-/// Portable fallback with the same semantics: subtract the row max, `exp`,
-/// normalize. Kept exact against the MLAS path by the parity tests below.
-#[cfg(not(feature = "mlas"))]
-fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
+/// Portable implementation with the same semantics: subtract the row max,
+/// `exp`, normalize. This is the correctness baseline the MLAS route is
+/// differentially tested against.
+pub fn softmax_rows_serial_native(data: &mut [f32], n: usize, d: usize) {
     for row in data.chunks_mut(d) {
         let mut max = f32::NEG_INFINITY;
         for &v in row.iter() {

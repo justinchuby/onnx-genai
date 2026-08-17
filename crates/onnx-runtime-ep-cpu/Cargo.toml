@@ -9,7 +9,15 @@ keywords = ["onnx", "cpu", "execution-provider", "inference", "runtime"]
 categories = ["science", "hardware-support"]
 
 [features]
-default = ["full"]
+# MLAS is part of the default CPU EP. It is an *internal* backend library of
+# this EP — we keep full node ownership and call MLAS ourselves; nothing here
+# delegates to ORT's built-in CPU execution provider. See
+# `docs/performance/CPU_MLAS_MIGRATION.md`.
+#
+# Opt out with `--no-default-features --features full` on a host with no
+# C++/asm toolchain, or on a target the vendored sources do not cover. That
+# combination keeps every operator group and drops only the MLAS backend.
+default = ["full", "mlas"]
 # Default-on compatibility umbrella. Minimal builds disable defaults and select
 # only the capability groups emitted by the operator-selection manifest.
 full = [
@@ -29,8 +37,9 @@ ops-transformer = []
 ops-cnn = []
 ops-quantized = []
 ops-sequence = []
-# Opt-in vendored MLAS f32/quantized kernels. Kept off by default so the
-# default elementwise dispatch/tests keep exercising the pure-Rust SIMD path.
+# Vendored MLAS f32/quantized kernels, linked *into this EP* as an internal
+# backend library. On by default via `default`; `full` deliberately does not
+# imply it so `--no-default-features --features full` is a clean opt-out.
 mlas = ["dep:mlas-sys"]
 # Temporary: within-GroupQueryAttention phase timing (widen/present/attn/out),
 # gated further at runtime by ONNX_GENAI_PROFILE_GQA=1. Off by default; adds no

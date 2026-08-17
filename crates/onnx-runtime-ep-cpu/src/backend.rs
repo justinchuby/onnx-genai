@@ -4,16 +4,20 @@
 //! than one implementation. [`CpuBackend`] names the family of backends from
 //! the ORT2 design and [`CpuBackend::auto_detect`] picks one at runtime:
 //!
-//! * On x86-64 hosts with AVX2 + FMA (detected at runtime) we use the built-in
-//!   **`SimdX86`** MLAS-style packed SIMD f32 GEMM — the default fast path with
-//!   no extra dependency and no cargo feature required.
-//! * With the `mlas` Cargo feature, `NXRT_CPU_GEMM_BACKEND=mlas` explicitly
-//!   selects the vendored, **multi-threaded** MLAS f32 GEMM on x86-64. MLAS
-//!   does its own cache-aware tile partitioning and dispatches the tiles across
-//!   the process Rayon pool (see `mlas-sys`), so it honours the same thread
-//!   budget as `SimdX86`/`Generic` without oversubscribing.
+//! * On x86-64 the default is the vendored, **multi-threaded** MLAS f32 GEMM
+//!   (`mlas` is part of this crate's `default` features). MLAS does its own
+//!   cache-aware tile partitioning and dispatches the tiles across the
+//!   `mlas-sys` work-stealing pool, so it honours the same thread budget as
+//!   `SimdX86`/`Generic` without oversubscribing. It is an *internal backend
+//!   library of this EP* — we keep node ownership and call it; nothing here
+//!   hands work to ORT's built-in CPU execution provider.
+//! * Built without MLAS (`--no-default-features --features full`), x86-64 hosts
+//!   with AVX2 + FMA (detected at runtime) use the built-in **`SimdX86`**
+//!   MLAS-style packed SIMD f32 GEMM, which needs no C++ toolchain.
 //! * Everything else falls back to the **Generic** pure-Rust blocked GEMM,
 //!   which compiles anywhere and is the correctness baseline.
+//! * `NXRT_CPU_GEMM_BACKEND=generic|simd|mlas` overrides the choice, which is
+//!   what the differential Native-vs-MLAS tests and the A/B benchmarks use.
 //!
 //! Half-precision MatMul/Gemm uses a separate portable blocked `f16`/`bf16`
 //! path with `f32` accumulation. It is backend-independent today; bf16 can
@@ -36,12 +40,11 @@ pub enum CpuBackend {
     /// on hosts without AVX2/FMA.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     SimdX86,
-    /// Vendored MLAS f32 SGEMM for x86-64. Available only with the `mlas`
-    /// Cargo feature and selected explicitly with `NXRT_CPU_GEMM_BACKEND=mlas`.
-    /// Multi-threaded: MLAS partitions the GEMM and runs the tiles on the
-    /// process Rayon pool. Kept opt-in (not auto-selected) until a later slice
-    /// decides whether to flip the default; doing so is a one-line change in
-    /// [`CpuBackend::auto_detect`].
+    /// Vendored MLAS f32 SGEMM for x86-64, compiled in by the default `mlas`
+    /// feature and auto-selected on x86-64. Multi-threaded: MLAS partitions the
+    /// GEMM and runs the tiles on the `mlas-sys` work-stealing pool.
+    /// `NXRT_CPU_GEMM_BACKEND=generic|simd` selects a native path instead,
+    /// which is how the differential tests compare the two.
     #[cfg(feature = "mlas")]
     Mlas,
     /// XNNPACK (Android mobile). Design placeholder — currently routes to
@@ -63,13 +66,13 @@ impl CpuBackend {
     ///
     /// * Android → `Xnnpack` (placeholder; Generic arithmetic today).
     /// * macOS / iOS → `Accelerate` (placeholder; Generic arithmetic today).
-    /// * Otherwise → vendored **`Mlas`** when the `mlas` Cargo feature is
-    ///   compiled on x86-64 (multi-threaded, and the fastest measured f32 GEMM
-    ///   path — see `docs/BENCH_CPU_F32_GEMM.md`); else the built-in `SimdX86`
-    ///   MLAS-style microkernel when the host is x86-64 with AVX2 + FMA; else
+    /// * Otherwise → vendored **`Mlas`** on x86-64, which is the default build
+    ///   (multi-threaded, and the fastest measured f32 GEMM path — see
+    ///   `docs/BENCH_CPU_F32_GEMM.md`); without the `mlas` feature, the built-in
+    ///   `SimdX86` microkernel when the host is x86-64 with AVX2 + FMA; else
     ///   `Generic`.
     ///
-    /// Flipping the f32 default to MLAS matters because dense-f32 decode is
+    /// Defaulting f32 to MLAS matters because dense-f32 decode is
     /// dominated (>95%) by MatMul, and MLAS's cache-aware tiling + threading
     /// beats the built-in `SimdX86` microkernel by a wide margin (measured 3-4x
     /// on Gemma-2-2B f32). The choice is host/build-derived only (no per-model

@@ -646,6 +646,14 @@ macro_rules! dispatch_mlas {
             debug_assert_eq!(input.len(), output.len());
             if input.len() >= SIMD_MIN_LEN {
                 let f: fn(&[f32], &mut [f32]) = $mlas;
+                $crate::dispatch_ledger::record($crate::dispatch_ledger::Observation::elementwise(
+                    $crate::dispatch_ledger::KernelFamily::Activations,
+                    // `run_chunked` and the special-value repair are ours; only
+                    // the inner transcendental is MLAS's.
+                    $crate::dispatch_ledger::Backend::NativeOverMlas,
+                    "f32",
+                    input.len(),
+                ));
                 // Through `run_chunked`, exactly like the pure-Rust routes.
                 // Calling `f(input, output)` directly here left every MLAS
                 // route single-threaded no matter how many threads the pool
@@ -655,6 +663,12 @@ macro_rules! dispatch_mlas {
                 return;
             }
         }
+        $crate::dispatch_ledger::record($crate::dispatch_ledger::Observation::elementwise(
+            $crate::dispatch_ledger::KernelFamily::Activations,
+            $crate::dispatch_ledger::Backend::Native,
+            "f32",
+            $input.len(),
+        ));
         dispatch!($input, $output, $scalar, $vector)
     }};
 }
@@ -820,12 +834,38 @@ pub(crate) fn erf_f32_slice(input: &[f32], output: &mut [f32]) {
     dispatch_mlas!(input, output, erf_scalar, erf_avx2, mlas_sys::compute_erf);
 }
 
+/// `Erf` on the native route only, whatever this build linked.
+///
+/// Kept callable in every build so [`crate::backend_ab`] can hold the native and
+/// MLAS routes against each other inside one process — the only way to measure
+/// or differentially test an absorption honestly.
+pub(crate) fn erf_f32_slice_native(input: &[f32], output: &mut [f32]) {
+    dispatch!(input, output, erf_scalar, erf_avx2);
+}
+
 /// `y = 0.5·x·(1 + erf(x/√2))`, the exact (`approximate="none"`) GELU.
 ///
 /// Fused rather than composed out of [`erf_f32_slice`] so the intermediate
 /// `x/√2` is never written to memory.
 pub(crate) fn erf_gelu_f32_slice(input: &[f32], output: &mut [f32]) {
     dispatch_mlas!(input, output, erf_gelu_scalar, erf_gelu_avx2, erf_gelu_mlas);
+}
+
+/// Exact `Gelu` on the native route only. See [`erf_f32_slice_native`].
+pub(crate) fn erf_gelu_f32_slice_native(input: &[f32], output: &mut [f32]) {
+    dispatch!(input, output, erf_gelu_scalar, erf_gelu_avx2);
+}
+
+/// Exact `Gelu` on the MLAS route only (repair pass included), for A/B.
+#[cfg(feature = "mlas")]
+pub(crate) fn erf_gelu_f32_slice_mlas(input: &[f32], output: &mut [f32]) {
+    run_chunked(input, output, erf_gelu_mlas);
+}
+
+/// `Erf` on the MLAS route only, for A/B.
+#[cfg(feature = "mlas")]
+pub(crate) fn erf_f32_slice_mlas(input: &[f32], output: &mut [f32]) {
+    run_chunked(input, output, mlas_sys::compute_erf);
 }
 
 /// `y = 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`, the tanh GELU
