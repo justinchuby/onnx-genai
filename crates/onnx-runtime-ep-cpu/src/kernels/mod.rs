@@ -120,6 +120,18 @@ static FLOAT_DTYPES: &[DataType] = &[
 /// Fail-closed default: only f32.
 static F32_ONLY: &[DataType] = &[DataType::Float32];
 
+/// The three dtypes the MLAS-backed kernels accept.
+///
+/// These compute in f32 and widen/narrow around it, so they cover f16 and bf16
+/// but genuinely cannot do f64 -- `ConvKernel::execute` rejects it outright.
+/// Distinct from [`FLOAT_DTYPES`], which includes `Float64`.
+///
+/// Advertising `FLOAT_DTYPES` here would be an over-claim rather than a
+/// harmless one: the plugin turns this list into the `KernelRegistryEntry`
+/// dtype filter, so an f64 `Conv` would clear capability, get compiled, and
+/// then fail at `Run` instead of being reported as unsupported up front.
+static MLAS_FLOAT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16, DataType::BFloat16];
+
 /// Determine the supported dtypes for a given (op_type, domain) based on the
 /// actual kernel dispatch implementation. Fail closed: unknown ops get f32 only.
 pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
@@ -305,9 +317,13 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         // pkg.nxrt custom ops: f32-only (fail closed).
         (_, "pkg.nxrt") => F32_ONLY,
 
-        // CNN ops (feature-gated).
-        ("Conv", "")
-        | ("ConvTranspose", "")
+        // CNN ops (feature-gated). `Conv` computes through MLAS in f32 and
+        // rejects f64 in `ConvKernel::execute`, so it must not advertise it.
+        ("Conv", "") => MLAS_FLOAT_DTYPES,
+
+        // The rest of the CNN family dispatches through `dispatch_float!` and
+        // does handle f64.
+        ("ConvTranspose", "")
         | ("AveragePool", "")
         | ("MaxPool", "")
         | ("GlobalAveragePool", "")
@@ -2552,6 +2568,26 @@ mod tests {
             reg.len(),
             "descriptor count must equal registry size exactly"
         );
+    }
+
+    /// Advertised dtypes must be what the kernel accepts, not a superset.
+    ///
+    /// The plugin turns these into the `KernelRegistryEntry` dtype filter, so
+    /// an over-claim is not harmless: ORT routes the node to us, capability
+    /// passes, and it fails at `Run` instead of being declined up front.
+    /// `Conv` is the live case -- it computes through MLAS in f32 and
+    /// `ConvKernel::execute` rejects f64 outright, so it must advertise
+    /// `MLAS_FLOAT_DTYPES` and not `FLOAT_DTYPES`.
+    #[test]
+    fn conv_does_not_advertise_a_dtype_its_kernel_rejects() {
+        let dtypes = supported_dtypes_for_op("Conv", "");
+        assert!(
+            !dtypes.contains(&DataType::Float64),
+            "Conv advertises f64 but ConvKernel::execute rejects it: {dtypes:?}"
+        );
+        for want in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            assert!(dtypes.contains(&want), "Conv must still advertise {want:?}");
+        }
     }
 
     /// The descriptor order is leaked into a `'static` slice handed to ORT, so
