@@ -1624,13 +1624,32 @@ fn output_overlaps_input(
 #[cfg(feature = "mlas")]
 const HALF_WIDEN_MIN_M: usize = 16;
 
-/// Minimum `K * N` before widening is considered at all.
+/// Minimum `B` size, in **elements** (`K * N`, not bytes), before widening is
+/// considered.
 ///
 /// Widening `B` costs a `4 * K * N` byte transient on every call when `B` is
-/// not a session constant. For a small `B` the tuned SGEMM has nothing to win
-/// back, so keep the allocation-free half path.
+/// not a session constant, so the intuition is that a small `B` cannot repay
+/// it. The sweep says otherwise: at `M = 16`, `half/widen` (>1 means widening
+/// wins) is
+///
+/// | K x N | elements | T=1 | T=16 |
+/// |---|---|---|---|
+/// | 8 x 8 | 64 | 0.88x (half wins) | 275x |
+/// | 16 x 16 | 256 | 1.16x | 229x |
+/// | 32 x 32 | 1024 | 1.21x | 35.9x |
+/// | 64 x 64 | 4096 | 1.42x | 33.2x |
+/// | 128 x 128 | 16384 | 1.48x | 16.3x |
+/// | 256 x 256 | 65536 | 1.52x | 7.8x |
+///
+/// so this is set to 256 elements: the smallest size that wins repeatably at
+/// *both* thread counts. Only the 64-element case loses, and only at `T=1`.
+///
+/// The enormous `T=16` ratios are not a widening win, they are the blocked
+/// half GEMM dispatching parallel work for a problem far too small to repay a
+/// fork/join -- 0.27 ms to multiply an 8x8 matrix. Widening sidesteps that;
+/// fixing the half path's own small-work threshold is separate.
 #[cfg(feature = "mlas")]
-const HALF_WIDEN_MIN_WEIGHT: usize = 256 * 1024;
+const HALF_WIDEN_MIN_WEIGHT: usize = 256;
 
 #[cfg(test)]
 thread_local! {
@@ -2816,7 +2835,7 @@ mod tests {
 
         // A small weight stays on the half path however large M is: the tuned
         // SGEMM has too little work to repay widening B.
-        let (k, n) = (16usize, 16usize);
+        let (k, n) = (8usize, 8usize);
         assert!(k * n < HALF_WIDEN_MIN_WEIGHT);
         let a_src: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 * 0.01).collect();
         let b_src: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 * 0.01).collect();
@@ -2888,14 +2907,23 @@ mod tests {
                 m < HALF_WIDEN_MIN_M
             );
 
-            let tolerance = 2e-3 * (k as f32).sqrt();
-            for (index, (&actual, &expected)) in got.iter().zip(oracle.iter()).enumerate() {
-                assert!(
-                    (actual - expected as f32).abs() <= tolerance,
-                    "M={m} index {index}: {actual} vs oracle {expected} \
-                     (tolerance {tolerance})"
-                );
-            }
+            let max_error = got
+                .iter()
+                .zip(oracle.iter())
+                .map(|(&actual, &expected)| (actual - expected as f32).abs())
+                .fold(0.0f32, f32::max);
+            // Measured max error here is 5.4e-7 / 1.2e-6 / 1.8e-6 for
+            // M=15/16/19, i.e. pure f32 accumulation noise over K=521 terms.
+            // 1e-4 leaves ~55x headroom for a different SGEMM tile order while
+            // staying far below the ~1e-2 a genuine defect would produce (f16
+            // accumulation, a dropped tail, a wrong tile) -- f16 inputs are
+            // only granular to ~1e-3, so anything real is orders of magnitude
+            // above this bound.
+            const MAX_ACCUMULATION_ERROR: f32 = 1e-4;
+            assert!(
+                max_error <= MAX_ACCUMULATION_ERROR,
+                "M={m}: max error {max_error:e} exceeds {MAX_ACCUMULATION_ERROR:e}"
+            );
         }
     }
 
@@ -2938,11 +2966,20 @@ mod tests {
                     _ => unreachable!(),
                 };
                 let geometry = matmul_geometry(&a.view(), &b.view()).unwrap();
-                assert!(
+                // f16 above the widening crossover deliberately declines here
+                // and is served by the tuned SGEMM instead; the value checks
+                // below are route-independent and cover both.
+                let took_half =
                     try_matmul_half(&a.view(), &b.view(), &geometry, CpuBackend::auto_detect())
                         .unwrap()
-                        .is_some(),
-                    "{dtype:?} should select the dedicated half GEMM"
+                        .is_some();
+                let expect_widen = cfg!(all(target_arch = "x86_64", feature = "mlas"))
+                    && dtype == DataType::Float16
+                    && m >= 16
+                    && k * n >= 256;
+                assert_eq!(
+                    took_half, !expect_widen,
+                    "{dtype:?} {m}x{k}x{n}: unexpected route (half={took_half})"
                 );
 
                 let mut expected = vec![0.0f32; m * n];
@@ -3206,6 +3243,16 @@ mod tests {
             (128, 2048, 2048),
             (256, 2048, 2048),
             (128, 3584, 3584),
+            // Weight sweep at the minimum claimed M, to site the weight guard.
+            (16, 8, 8),
+            (16, 16, 16),
+            (16, 32, 32),
+            (16, 48, 48),
+            (16, 64, 64),
+            (16, 96, 96),
+            (16, 128, 128),
+            (16, 130, 11),
+            (16, 256, 256),
         ] {
             let a_src: Vec<f32> = (0..m * k).map(|i| (i % 13) as f32 * 0.01 - 0.06).collect();
             let b_src: Vec<f32> = (0..k * n).map(|i| (i % 11) as f32 * 0.01 - 0.05).collect();
