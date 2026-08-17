@@ -103,6 +103,32 @@ unsafe extern "C" {
         multithread: c_int,
     );
 
+    #[allow(clippy::too_many_arguments)]
+    fn mlas_qgemm_requantize(
+        m: usize,
+        n: usize,
+        k: usize,
+        a_is_signed: c_int,
+        b_is_signed: c_int,
+        a: *const c_void,
+        lda: usize,
+        zero_point_a: u8,
+        b: *const c_void,
+        ldb: usize,
+        b_is_packed: c_int,
+        zero_point_b: *const u8,
+        per_column_zero_points: c_int,
+        c: *mut i32,
+        ldc: usize,
+        output: *mut c_void,
+        output_ld: usize,
+        output_is_signed: c_int,
+        scale: *const f32,
+        per_column_scale: c_int,
+        output_zero_point: i32,
+        multithread: c_int,
+    );
+
     fn mlas_sgemm_pack_b_size(trans_a: c_int, trans_b: c_int, n: usize, k: usize) -> usize;
     fn mlas_sgemm_pack_b(
         trans_a: c_int,
@@ -1449,6 +1475,147 @@ pub fn qgemm_i32_packed(
             per_column,
             c.as_mut_ptr(),
             n,
+            c_int::from(mlas_threading_degree() > 1),
+        );
+    }
+}
+
+/// The `B` operand of a requantizing quantized GEMM: either raw `k x n` bytes
+/// or a pack built once by [`QgemmPackedB::new`].
+#[derive(Clone, Copy)]
+pub enum QgemmWeights<'a> {
+    /// Row-major `k x n` bytes with row stride `n`.
+    Dense {
+        /// The weight bytes.
+        bytes: &'a [u8],
+        /// Whether the bytes are `i8` rather than `u8`.
+        signed: bool,
+    },
+    /// A pack MLAS built for this `(n, k, a_signed, b_signed)` on this machine.
+    Packed(&'a QgemmPackedB),
+}
+
+/// Output scale of a requantizing quantized GEMM.
+#[derive(Clone, Copy)]
+pub enum QgemmScale<'a> {
+    /// One scale for the whole result.
+    PerTensor(f32),
+    /// One scale per column of the result, i.e. `n` entries.
+    PerColumn(&'a [f32]),
+}
+
+/// Integer GEMM whose accumulator is requantized to bytes **inside** MLAS.
+///
+/// [`qgemm_i32`] returns the raw `i32` accumulator, which leaves the caller to
+/// walk the whole `m x n` array a second time to scale, round, offset and
+/// narrow it. ONNX Runtime does not do that: its `QLinearMatMul` passes MLAS a
+/// `MLAS_QGEMM_REQUANT_OUTPUT_PROCESSOR`, so each output tile is requantized as
+/// soon as the kernel produces it, while it is still in cache, and the final
+/// bytes land straight in the destination tensor. This is that path.
+///
+/// `c` is scratch: MLAS accumulates into it and requantizes it in place, so it
+/// must be `m * n` long, but its contents afterwards are unspecified and it
+/// does **not** need to be zeroed first.
+///
+/// Numerically the processor computes, per element,
+/// `clamp(round_ties_even(c * scale), lo - zp, hi - zp) + zp`, where `lo`/`hi`
+/// are the output dtype's bounds. Clamping the *float* before rounding and
+/// rounding before clamping agree for every finite input, because the clamp
+/// bounds are integers -- but they disagree on `NaN`, which this path maps to
+/// `lo` and a `round`-then-clamp scalar loop maps to `zp`. A caller that needs
+/// bit-identity with such a loop must therefore keep non-finite scales off this
+/// path; a finite scale can only produce `NaN` from a non-finite accumulator,
+/// which `i32` cannot hold.
+///
+/// # Panics
+///
+/// Panics if any slice length disagrees with `m`, `n`, `k`, if a per-column
+/// scale or zero point is not exactly `n` long, or if a pack was built for a
+/// different shape or signedness.
+#[allow(clippy::too_many_arguments)]
+pub fn qgemm_requantize(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[u8],
+    a_signed: bool,
+    zero_point_a: u8,
+    b: QgemmWeights<'_>,
+    zero_point_b: QgemmZeroPoints<'_>,
+    scale: QgemmScale<'_>,
+    output: &mut [u8],
+    output_signed: bool,
+    output_zero_point: i32,
+    c: &mut [i32],
+) {
+    assert_eq!(a.len(), m * k, "A must be m*k bytes");
+    assert_eq!(c.len(), m * n, "C must be m*n i32");
+    assert_eq!(output.len(), m * n, "output must be m*n bytes");
+    if m == 0 || n == 0 {
+        return;
+    }
+    let (b_ptr, b_signed, ldb, b_is_packed) = match b {
+        QgemmWeights::Dense { bytes, signed } => {
+            assert_eq!(bytes.len(), k * n, "B must be k*n bytes");
+            (bytes.as_ptr().cast::<c_void>(), signed, n, 0)
+        }
+        QgemmWeights::Packed(packed) => {
+            assert_eq!(
+                packed.identity(),
+                (k, n, a_signed, packed.b_signed),
+                "the packed B was built for a different shape or signedness"
+            );
+            (
+                packed.ptr.cast_const().cast::<c_void>(),
+                packed.b_signed,
+                n,
+                1,
+            )
+        }
+    };
+    let (zero_point_b_ptr, per_column_zero_points) = match zero_point_b {
+        QgemmZeroPoints::PerTensor(ref value) => (std::ptr::from_ref(value), 0),
+        QgemmZeroPoints::PerColumn(values) => {
+            assert_eq!(values.len(), n, "per-column zero points must be n long");
+            (values.as_ptr(), 1)
+        }
+    };
+    let (scale_ptr, per_column_scale) = match scale {
+        QgemmScale::PerTensor(ref value) => (std::ptr::from_ref(value), 0),
+        QgemmScale::PerColumn(values) => {
+            assert_eq!(values.len(), n, "per-column scales must be n long");
+            (values.as_ptr(), 1)
+        }
+    };
+    ensure_threading();
+    // SAFETY: every slice is exactly the size asserted above; the zero-point and
+    // scale pointers are either `n`-long slices or borrows of locals that
+    // outlive the call; a packed `B` owns a buffer MLAS itself sized and filled
+    // for this `(n, k, signedness)`; and the shim writes only through `c` and
+    // `output`, which are distinct `&mut` borrows.
+    unsafe {
+        mlas_qgemm_requantize(
+            m,
+            n,
+            k,
+            c_int::from(a_signed),
+            c_int::from(b_signed),
+            a.as_ptr().cast::<c_void>(),
+            k,
+            zero_point_a,
+            b_ptr,
+            ldb,
+            b_is_packed,
+            zero_point_b_ptr,
+            per_column_zero_points,
+            c.as_mut_ptr(),
+            n,
+            output.as_mut_ptr().cast::<c_void>(),
+            n,
+            c_int::from(output_signed),
+            scale_ptr,
+            per_column_scale,
+            output_zero_point,
             c_int::from(mlas_threading_degree() > 1),
         );
     }
@@ -4219,6 +4386,188 @@ mod tests {
         assert!(
             checked > 0,
             "no signedness/zero-point combination was exercised, so this test proved nothing"
+        );
+    }
+
+    /// The scalar requantization every caller would otherwise write by hand:
+    /// round to nearest, ties to even, offset by the zero point, clamp.
+    fn requantize_oracle(
+        products: &[i32],
+        scale: &QgemmScale<'_>,
+        n: usize,
+        zero_point: i32,
+        signed: bool,
+    ) -> Vec<u8> {
+        products
+            .iter()
+            .enumerate()
+            .map(|(index, &product)| {
+                let scale = match scale {
+                    QgemmScale::PerTensor(value) => *value,
+                    QgemmScale::PerColumn(values) => values[index % n],
+                };
+                let value =
+                    (product as f32 * scale).round_ties_even() as i64 + i64::from(zero_point);
+                if signed {
+                    value.clamp(i8::MIN as i64, i8::MAX as i64) as i8 as u8
+                } else {
+                    value.clamp(u8::MIN as i64, u8::MAX as i64) as u8
+                }
+            })
+            .collect()
+    }
+
+    /// The fused path must agree, byte for byte, with running the unfused
+    /// `qgemm_i32` and requantizing its accumulator in scalar Rust. If it does
+    /// not, a kernel that switches to it silently changes its output.
+    #[test]
+    fn qgemm_requantize_matches_the_unfused_accumulator_and_a_scalar_requantize() {
+        // `n` deliberately straddles MLAS's 16-column block so the tail path is
+        // exercised too, and `m > 1` so more than one output row is processed.
+        let (m, n, k) = (3usize, 19usize, 37usize);
+        let a: Vec<u8> = (0..m * k).map(|i| (i * 37 % 251) as u8).collect();
+        let b: Vec<u8> = (0..k * n).map(|i| (i * 53 % 241) as u8).collect();
+        let per_column_zero_points: Vec<u8> = (0..n).map(|i| (i * 11 % 97) as u8).collect();
+        let per_column_scales: Vec<f32> =
+            (0..n).map(|i| 1.0e-5 * (1.0 + i as f32 * 0.37)).collect();
+        let mut checked = 0usize;
+        for (a_signed, b_signed) in [(false, false), (false, true), (true, true)] {
+            if !a_signed && b_signed && !qgemm_u8s8_is_exact() {
+                continue;
+            }
+            let packed = QgemmPackedB::new(n, k, &b, a_signed, b_signed);
+            for zero_points in [
+                QgemmZeroPoints::PerTensor(13),
+                QgemmZeroPoints::PerColumn(&per_column_zero_points),
+            ] {
+                let mut products = vec![0i32; m * n];
+                qgemm_i32(
+                    m,
+                    n,
+                    k,
+                    &a,
+                    a_signed,
+                    7,
+                    &b,
+                    b_signed,
+                    zero_points,
+                    &mut products,
+                );
+                for scale in [
+                    QgemmScale::PerTensor(2.0e-5),
+                    QgemmScale::PerColumn(&per_column_scales),
+                ] {
+                    for (output_signed, output_zero_point) in [(false, 128), (true, -5)] {
+                        let want = requantize_oracle(
+                            &products,
+                            &scale,
+                            n,
+                            output_zero_point,
+                            output_signed,
+                        );
+                        for weights in [
+                            Some(QgemmWeights::Dense {
+                                bytes: &b,
+                                signed: b_signed,
+                            }),
+                            packed.as_ref().map(QgemmWeights::Packed),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            let mut scratch = vec![0i32; m * n];
+                            let mut got = vec![0u8; m * n];
+                            qgemm_requantize(
+                                m,
+                                n,
+                                k,
+                                &a,
+                                a_signed,
+                                7,
+                                weights,
+                                zero_points,
+                                scale,
+                                &mut got,
+                                output_signed,
+                                output_zero_point,
+                                &mut scratch,
+                            );
+                            assert_eq!(
+                                got, want,
+                                "fused requantize disagreed with the scalar oracle for \
+                                 a_signed={a_signed} b_signed={b_signed} \
+                                 output_signed={output_signed}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "no combination was exercised, so this test proved nothing"
+        );
+    }
+
+    /// Saturation is part of the contract: an accumulator that scales past the
+    /// output dtype's range must clamp, not wrap.
+    #[test]
+    fn qgemm_requantize_saturates_instead_of_wrapping() {
+        let (m, n, k) = (1usize, 8usize, 16usize);
+        // Maximum-magnitude activations against maximum-magnitude weights, with
+        // a scale large enough that every column overflows the byte range.
+        let a = vec![255u8; m * k];
+        let b = vec![255u8; k * n];
+        let mut scratch = vec![0i32; m * n];
+        let mut got = vec![0u8; m * n];
+        qgemm_requantize(
+            m,
+            n,
+            k,
+            &a,
+            false,
+            0,
+            QgemmWeights::Dense {
+                bytes: &b,
+                signed: false,
+            },
+            QgemmZeroPoints::PerTensor(0),
+            QgemmScale::PerTensor(1.0e6),
+            &mut got,
+            false,
+            0,
+            &mut scratch,
+        );
+        assert_eq!(
+            got,
+            vec![255u8; m * n],
+            "positive overflow must clamp to 255"
+        );
+
+        let mut got_signed = vec![0u8; m * n];
+        qgemm_requantize(
+            m,
+            n,
+            k,
+            &a,
+            false,
+            0,
+            QgemmWeights::Dense {
+                bytes: &b,
+                signed: false,
+            },
+            QgemmZeroPoints::PerTensor(0),
+            QgemmScale::PerTensor(-1.0e6),
+            &mut got_signed,
+            true,
+            0,
+            &mut scratch,
+        );
+        assert_eq!(
+            got_signed,
+            vec![(-128i8) as u8; m * n],
+            "negative overflow must clamp to -128"
         );
     }
 
