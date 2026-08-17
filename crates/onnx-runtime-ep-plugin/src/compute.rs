@@ -2428,7 +2428,9 @@ unsafe extern "C" fn compute_execute(
                         Some(input) => kernel_inputs.push(input.view()),
                         None => {
                             return fail_status(&format!(
-                                "Compute: input slot {position} maps to ORT input {ort_idx}, but                                  ORT bound only {} input(s) to this fused node",
+                                "Compute: input slot {position} maps to ORT input \
+                                 {ort_idx}, but ORT bound only {} input(s) to this \
+                                 fused node",
                                 inputs.len()
                             ));
                         }

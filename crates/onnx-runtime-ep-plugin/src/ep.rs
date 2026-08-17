@@ -93,6 +93,15 @@ pub struct KernelRegistryEntry {
     /// Supported element types for the `"T"` type-constraint parameter.
     /// Import from `kernel_ctx::CPU_EP_SUPPORTED_DTYPES` to keep in sync.
     pub supported_dtypes: &'static [DataType],
+    /// Per-input-slot dtype constraints, for ops whose edges are not uniform.
+    ///
+    /// `supported_dtypes` is a union, so on a mixed-dtype op it admits
+    /// combinations no kernel accepts — a `MatMulNBits` with `float16`
+    /// `zero_points` passes because both `float16` and `uint8` are somewhere in
+    /// the union. Each `(slot, dtypes)` entry here overrides the union for that
+    /// input position; unlisted and absent inputs keep the union rule. Empty
+    /// means "the union is exact", which is true for every uniform op.
+    pub input_dtype_constraints: &'static [(usize, &'static [DataType])],
 }
 
 /// A heap-allocated EP whose raw pointer is returned as `OrtEp*`.
@@ -589,7 +598,7 @@ pub(crate) fn node_passes_dtype_filter(
     let Some(entry) = entry else {
         return false;
     };
-    for input in &node.inputs {
+    for (slot, input) in node.inputs.iter().enumerate() {
         let Some(vid) = input else { continue };
         let Some(value) = ir_graph.values.get(*vid) else {
             continue;
@@ -597,7 +606,15 @@ pub(crate) fn node_passes_dtype_filter(
         if value.dtype == DataType::Undefined {
             return false;
         }
-        if !entry.supported_dtypes.contains(&value.dtype) {
+        // A per-slot constraint replaces the union for that position; without
+        // it a mixed-dtype op is claimed for combinations its kernel rejects,
+        // which turns a decline into a run-time failure.
+        let allowed = entry
+            .input_dtype_constraints
+            .iter()
+            .find(|(index, _)| *index == slot)
+            .map_or(entry.supported_dtypes, |(_, dtypes)| *dtypes);
+        if !allowed.contains(&value.dtype) {
             return false;
         }
     }
@@ -1677,6 +1694,7 @@ mod tests {
             since_version: 7,
             end_version: 21,
             supported_dtypes: CPU_EP_SUPPORTED_DTYPES,
+            input_dtype_constraints: &[],
         };
         assert_eq!(entry.op_type, "Add");
         assert!(entry.supported_dtypes.contains(&DataType::Float16));
@@ -1694,6 +1712,7 @@ mod tests {
             since_version: 7,
             end_version: 21,
             supported_dtypes: CPU_EP_SUPPORTED_DTYPES,
+            input_dtype_constraints: &[],
         }];
         let result = build_ort_kernel_registry(&entries, "test_ep");
         assert!(
@@ -1739,6 +1758,7 @@ mod tests {
             since_version: 7,
             end_version: 21,
             supported_dtypes: &[DataType::Float32, DataType::Float16],
+            input_dtype_constraints: &[],
         }];
         let (g, nid) = graph_with_node(
             "Add",
@@ -1765,6 +1785,7 @@ mod tests {
             since_version: 7,
             end_version: 21,
             supported_dtypes: &[DataType::Float32, DataType::Float16],
+            input_dtype_constraints: &[],
         }];
         let (g, nid) = graph_with_node(
             "Add",
@@ -1781,6 +1802,101 @@ mod tests {
         ));
     }
 
+    /// The union of an op's edge dtypes is not its kernel's rule.
+    ///
+    /// `com.microsoft::MatMulNBits` spec-allows `float16` `zero_points`, and
+    /// ORT's own kernel builds a session for one, but this EP's kernel accepts
+    /// only `uint8` there. Membership in the union would claim the node and
+    /// then fail inside `Compute`, where the only outcome is a run-time error
+    /// on a model that worked before. The per-slot list must decline it.
+    #[test]
+    fn dtype_filter_applies_per_slot_constraints() {
+        const FLOATS: &[DataType] = &[DataType::Float32, DataType::Float16, DataType::BFloat16];
+        let entries = vec![KernelRegistryEntry {
+            op_type: "MatMulNBits",
+            domain: "com.microsoft",
+            since_version: 1,
+            end_version: i32::MAX,
+            supported_dtypes: &[
+                DataType::Float32,
+                DataType::Float16,
+                DataType::BFloat16,
+                DataType::Uint8,
+                DataType::Int32,
+            ],
+            input_dtype_constraints: &[
+                (0, FLOATS),
+                (1, &[DataType::Uint8]),
+                (2, FLOATS),
+                (3, &[DataType::Uint8]),
+            ],
+        }];
+        let empty = std::collections::HashSet::new();
+
+        // A, B, scales, zero_points — all as the kernel requires.
+        let (good, good_id) = graph_with_node(
+            "MatMulNBits",
+            "com.microsoft",
+            &[
+                DataType::Float32,
+                DataType::Uint8,
+                DataType::Float32,
+                DataType::Uint8,
+            ],
+            &[DataType::Float32],
+        );
+        assert!(super::node_passes_dtype_filter(
+            good.nodes.get(good_id).unwrap(),
+            &good,
+            &entries,
+            &empty
+        ));
+
+        // float16 zero_points: in the union, wrong for slot 3.
+        let (bad, bad_id) = graph_with_node(
+            "MatMulNBits",
+            "com.microsoft",
+            &[
+                DataType::Float32,
+                DataType::Uint8,
+                DataType::Float32,
+                DataType::Float16,
+            ],
+            &[DataType::Float32],
+        );
+        assert!(
+            !super::node_passes_dtype_filter(
+                bad.nodes.get(bad_id).unwrap(),
+                &bad,
+                &entries,
+                &empty
+            ),
+            "a float16 zero_points node must not be claimed: the kernel rejects it"
+        );
+
+        // uint8 activation: also in the union, also wrong for slot 0.
+        let (swapped, swapped_id) = graph_with_node(
+            "MatMulNBits",
+            "com.microsoft",
+            &[
+                DataType::Uint8,
+                DataType::Uint8,
+                DataType::Float32,
+                DataType::Uint8,
+            ],
+            &[DataType::Float32],
+        );
+        assert!(
+            !super::node_passes_dtype_filter(
+                swapped.nodes.get(swapped_id).unwrap(),
+                &swapped,
+                &entries,
+                &empty
+            ),
+            "a uint8 activation must not be claimed"
+        );
+    }
+
     /// Node with Undefined dtype is NOT claimed (fail closed).
     #[test]
     fn dtype_filter_rejects_undefined_dtype() {
@@ -1790,6 +1906,7 @@ mod tests {
             since_version: 7,
             end_version: 21,
             supported_dtypes: &[DataType::Float32],
+            input_dtype_constraints: &[],
         }];
         let (g, nid) = graph_with_node("Add", "", &[DataType::Undefined], &[DataType::Float32]);
         let node = g.nodes.get(nid).unwrap();
@@ -1810,6 +1927,7 @@ mod tests {
             since_version: 7,
             end_version: 21,
             supported_dtypes: &[DataType::Float32],
+            input_dtype_constraints: &[],
         }];
         let (g, nid) = graph_with_node("UnknownOp", "", &[DataType::Float32], &[DataType::Float32]);
         let node = g.nodes.get(nid).unwrap();
@@ -1857,6 +1975,7 @@ mod tests {
             since_version: 7,
             end_version: 21,
             supported_dtypes: &[DataType::Float32],
+            input_dtype_constraints: &[],
         }];
 
         // Empty absent set — the forgery name should NOT grant exemption.

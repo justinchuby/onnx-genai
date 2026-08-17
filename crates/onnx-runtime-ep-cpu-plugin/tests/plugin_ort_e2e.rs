@@ -4398,7 +4398,7 @@ fn exp_deferral_still_claims_when_cpu_fallback_is_disabled() {
 //
 // The models are generated rather than committed. A weight tensor big enough
 // to reach the old threshold is ~0.5-1 MB, and ONNX TextFormat spells one byte
-// as up to four characters, so committing nine of them would add megabytes of
+// as up to four characters, so committing ten of them would add megabytes of
 // unreadable escapes to the tree. They are written under `CARGO_TARGET_TMPDIR`
 // instead, which cargo provides per test binary and cleans with `cargo clean`.
 
@@ -4805,12 +4805,13 @@ opset_import: [{{ version: 13 }}]
     }
 }
 
-/// The nine generated models, one per previously-deferred matmul-family range.
+/// The ten generated models, one per matmul-family range of interest.
 fn matmul_family_cases() -> Vec<MatmulFamilyCase> {
     // Every weight tensor below is exactly 2^20 elements (256x4096, 512x2048),
     // which is the smallest size the deleted policy called "measured" and
-    // therefore the smallest size at which it deferred. Under it, all nine of
-    // these ran on ORT's CPU EP except the two noted.
+    // therefore the smallest size at which it deferred. Before the claim fixes
+    // in this file's companion commit, every `MatMulNBits` and `QLinearMatMul`
+    // case here ran on ORT's CPU EP no matter what the policy said.
     vec![
         // Dense float32: deferred at 1 row and at 256.
         dense_case("matmul_f32_decode", "MatMul", ELEM_F32, 1, 256, 4096, 1e-3),
@@ -5156,5 +5157,190 @@ fn no_matmul_family_node_escapes_to_the_ort_cpu_ep() {
             "every generated matmul case must have been run"
         );
         eprintln!("\n✅ no_matmul_family_node_escapes_to_the_ort_cpu_ep: {checked} cases PASSED");
+    }
+}
+
+/// ORT's fused-node metadata carries a *set* of boundary inputs, so a node that
+/// names one value in two slots is bound once.
+///
+/// `Mul(X, X)` is the smallest graph that says so, and it says it about a graph
+/// input rather than an initializer — no constant-sharing pass, no
+/// initializer-dropping option, nothing but the dedup itself. Numbering ORT's
+/// inputs by node-input position instead of by value therefore walks one slot
+/// past the end of the array ORT actually passes, which used to surface across
+/// the C ABI as `Compute: internal panic`.
+#[test]
+fn a_node_that_names_one_value_twice_is_bound_once() {
+    let _lock = lock_ort_ep();
+    let n = 512usize;
+    let model = format!(
+        r#"ir_version: 10
+graph {{
+  node: [{{ input: ["X", "X"] output: ["Y"] op_type: "Mul" }}]
+  name: "mul_self"
+  input: [{}]
+  output: [{}]
+}}
+opset_import: [{{ version: 17 }}]
+"#,
+        textproto_value_info("X", ELEM_F32, &[n as i64]),
+        textproto_value_info("Y", ELEM_F32, &[n as i64]),
+    );
+    let values: Vec<f32> = (0..n).map(|i| (i as f32) * 0.5 - 64.0).collect();
+    let case = MatmulFamilyCase {
+        name: "mul_self",
+        op: "Mul",
+        model,
+        inputs: vec![GeneratedInput {
+            name: "X",
+            elem: ELEM_F32,
+            dims: vec![n as i64],
+            data: f32_slice_to_bytes(&values),
+        }],
+        output: "Y",
+        output_elem: ELEM_F32,
+        ort_can_build: true,
+        tolerance: 0.0,
+    };
+
+    let path = write_generated_model(case.name, &case.model);
+    let reg = "cpu_ep_mul_self";
+    let Some((_lib, api, env, opts, session)) = (unsafe { conformance_setup(reg, &path, true) })
+    else {
+        eprintln!("*** SKIPPED: mul_self — ORT or EP cdylib not found ***");
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        assert!(
+            info.ops_on_our_ep().contains(&"Mul"),
+            "mul_self: 'Mul' must run on this EP, got {:?}",
+            info.ops_on_our_ep()
+        );
+        let out = run_generated_case(api, session, &case, "Run(mul_self)");
+        assert_eq!(out.len(), n);
+        for (i, (got, want)) in out.iter().zip(values.iter()).enumerate() {
+            assert_eq!(
+                *got,
+                want * want,
+                "mul_self: element {i} is {got}, expected {}",
+                want * want
+            );
+        }
+        eprintln!("  [mul_self] {n} elements match x*x exactly");
+        conformance_teardown(api, env, opts, session, reg);
+    }
+}
+
+/// The documented edge of `MatMulNBits` support, pinned so it cannot become a
+/// crash again.
+///
+/// `com.microsoft::MatMulNBits` spec-allows `zero_points` in `uint8`, `int32`,
+/// `float16` or `float`, and ORT's own CPU kernel builds a session for each.
+/// This EP's kernel implements the packed `uint8` form only. Advertising the
+/// union of the op's edge dtypes was enough to get such a node *claimed*, after
+/// which `execute` failed with `zero_points must have dtype Uint8` — a model
+/// that used to produce an answer instead produced an error. The per-slot
+/// constraint list declines it at `GetCapability` instead.
+///
+/// This is a real remaining gap, not a resting place: the float zero-point
+/// form is a quantization semantic this EP does not yet implement, and it is
+/// tracked as such rather than papered over.
+#[test]
+fn a_float_zero_point_matmul_nbits_is_declined_not_claimed_and_failed() {
+    let _lock = lock_ort_ep();
+    let (n, k, block_size, bits) = (64usize, 64usize, 32usize, 4u32);
+    let blocks_per_col = k / block_size;
+    let blob = block_size * bits as usize / 8;
+    let scale_elements = n * blocks_per_col;
+    let model = format!(
+        r#"ir_version: 10
+graph {{
+  node: [{{
+    input: ["A", "B", "scales", "zero_points"]
+    output: ["Y"]
+    op_type: "MatMulNBits"
+    domain: "com.microsoft"
+    attribute: [
+      {{ name: "K" type: INT i: {k} }},
+      {{ name: "N" type: INT i: {n} }},
+      {{ name: "bits" type: INT i: {bits} }},
+      {{ name: "block_size" type: INT i: {block_size} }}
+    ]
+  }}]
+  name: "nbits_float_zp"
+  initializer: [{}, {}, {}]
+  input: [{}]
+  output: [{}]
+}}
+opset_import: [{{ version: 17 }}, {{ domain: "com.microsoft" version: 1 }}]
+"#,
+        textproto_initializer(
+            "B",
+            ELEM_U8,
+            &[n as i64, blocks_per_col as i64, blob as i64],
+            &printable_weight_blob(n * blocks_per_col * blob)
+        ),
+        textproto_initializer(
+            "scales",
+            ELEM_F32,
+            &[scale_elements as i64],
+            &printable_scale_blob(scale_elements)
+        ),
+        // f16 bits 0x4923 little-endian is the printable pair "#I".
+        textproto_initializer(
+            "zero_points",
+            ELEM_F16,
+            &[scale_elements as i64],
+            &"#I".repeat(scale_elements)
+        ),
+        textproto_value_info("A", ELEM_F32, &[1, k as i64]),
+        textproto_value_info("Y", ELEM_F32, &[1, n as i64]),
+    );
+
+    let case = MatmulFamilyCase {
+        name: "nbits_float_zp",
+        op: "MatMulNBits",
+        model,
+        inputs: vec![GeneratedInput {
+            name: "A",
+            elem: ELEM_F32,
+            dims: vec![1, k as i64],
+            data: f32_slice_to_bytes(&activation_f32(1, k)),
+        }],
+        output: "Y",
+        output_elem: ELEM_F32,
+        ort_can_build: true,
+        tolerance: 0.0,
+    };
+
+    let path = write_generated_model(case.name, &case.model);
+    let reg = "cpu_ep_nbits_float_zp";
+    // Fallback left available on purpose: the point is that the node is
+    // declined and still computed, not that the session dies.
+    let Some((_lib, api, env, opts, session)) = (unsafe { conformance_setup(reg, &path, false) })
+    else {
+        eprintln!("*** SKIPPED: nbits_float_zp — ORT or EP cdylib not found ***");
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        assert!(
+            !info.ops_on_our_ep().contains(&"MatMulNBits"),
+            "a float16 zero_points MatMulNBits must not be claimed — this EP's \
+             kernel accepts only packed uint8 zero points and would fail at Run"
+        );
+        let out = run_generated_case(api, session, &case, "Run(nbits_float_zp)");
+        let live = out.iter().filter(|v| v.is_finite() && **v != 0.0).count();
+        assert!(
+            live * 2 >= out.len(),
+            "nbits_float_zp: the model must still produce an answer, got {live} live \
+             of {} outputs",
+            out.len()
+        );
+        eprintln!("  [nbits_float_zp] declined, still computed: {live} live outputs");
+        conformance_teardown(api, env, opts, session, reg);
     }
 }

@@ -32,6 +32,10 @@ fn build_kernel_registry_entries() -> Vec<KernelRegistryEntry> {
                 // still match a model at opset 21).
                 end_version: i32::MAX,
                 supported_dtypes: d.supported_dtypes,
+                input_dtype_constraints:
+                    onnx_runtime_ep_cpu::kernels::input_dtype_constraints_for_op(
+                        &d.op_type, &d.domain,
+                    ),
             }
         })
         .collect()
