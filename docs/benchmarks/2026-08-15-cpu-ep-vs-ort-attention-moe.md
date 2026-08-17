@@ -1026,7 +1026,7 @@ never allow.
   fallback floors are reasoned from allocator design, **not measured**. The
   runtime probe is what makes that acceptable: on any platform where the reasoning
   is wrong, calibration overrides the constant.
-* Phase 4 requirement 3 (fused transpose-with-consumer) remains **open**; see §19.
+* Phase 4 requirement 3 (fused transpose-with-consumer) remains **open**; see §19 and §20.
   The §10 assignment matrix is unchanged by Phase 4.
 
 ## 18. Grouped MoE expert GEMMs (#1099)
@@ -1197,42 +1197,70 @@ That work is **designed but not landed**: it touches every dispatch path in a
 3,800-line kernel with prepacking, half-precision and Accelerate branches, and it needs
 its own paired A/B before any claim. It is recorded here rather than left implied.
 
-## 20. Correction: the Transpose "gap" was almost entirely graph-boundary I/O
+One correction to how this section was originally read: the consumer-side fusion above is
+worth doing, but it is **not** the lever for the Phase 3 single-node Transpose ratios.
+§20 measures those graphs and finds the Transpose node costs 0.002 ms of a 0.776 ms run -
+the gap is session per-run work at the graph boundary, not the kernel and not the
+consumer. Read §20 before acting on this section.
 
-§19 reasoned about the Transpose gap from the code. Phase 4 measured it instead, with
-the per-op profiler running on the same single-node benchmark graphs that produced the
-Phase 3 ratios. The reasoning was wrong in an important way.
+## 20. Correction: the Transpose "gap" was never the Transpose kernel
+
+The Phase 3 headline - "standalone Transpose is 2.5-9.5x behind ORT at 8/16 threads" -
+was never attributed to a component. §19 reasoned about it from the code without
+measuring it. Phase 4 measured it, with the per-op profiler running on the same
+single-node benchmark graphs that produced those ratios. The headline was attributing to
+the kernel a cost the kernel does not pay.
 
 ### 20.1 The measurement
 
 `ONNX_GENAI_PROFILE_OPS=1 bench_generic --native-only --native-threads 16`, 30 runs,
-against the merged `main` (`86a2d6eb1`, the commit that merged #1099):
+against the merged `main` (`86a2d6eb1`, the commit that merged #1099; this branch is
+based one commit later on `9b7a45860`/#1104, an int4-decode change that touches none of
+these paths). Per-op figures below are single-run means over the 30 runs, not medians
+across trials, and the `Concat` values in particular move by tens of percent between
+runs on this contended host - they are used only to separate "negligible" from
+"dominant", which is a margin they support by two orders of magnitude:
 
 | graph | output bytes | total node execution | of which Transpose | end-to-end native |
 |---|--:|--:|--:|--:|
 | `tr_llama3_s512` (1x512x32x128, `perm=[0,2,1,3]`) | 8 MiB | 0.006 ms | **0.002 ms** | 0.776 ms |
 | `tr_bert_b8_s128` (8x128x12x64) | 3 MiB | 0.007 ms | **0.002 ms** | 0.589 ms |
-| `tr_whisper_s1500` | 4.6 MiB | 0.007 ms | **0.002 ms** | 0.838 ms |
-| `kvcat_llama3_p4095` (2 x `Concat`) | 16 MiB | 1.637 ms | n/a (`Concat` 1.635 ms) | 5.121 ms |
-| `kvcat_llama3_p8191` (2 x `Concat`) | 32 MiB | 3.574 ms | n/a (`Concat` 3.572 ms) | 7.458 ms |
+| `tr_whisper_s1500` (1x1500x20x64, `perm=[0,2,1,3]`) | 7.3 MiB | 0.007 ms | **0.002 ms** | 0.838 ms |
+| `kvcat_llama3_p4095` (2 x `Concat`) | 2 x 16 MiB | 1.637 ms | n/a (`Concat` 1.635 ms) | 5.121 ms |
+| `kvcat_llama3_p8191` (2 x `Concat`) | 2 x 32 MiB | 3.574 ms | n/a (`Concat` 3.572 ms) | 7.458 ms |
 
 For every Transpose graph the **kernel accounts for under 0.4% of the run**. That is
-`view_outputs` doing its job: the operator returns a strided view and moves no bytes at
-all. The remaining 99.6% is the session feeding the input and materialising the graph
-output at the boundary - work that exists in the benchmark only because the graph *ends*
-at the transpose. In a real attention block the consumer takes the view and the copy
-never happens.
+`view_outputs` doing its job: `dispatch.rs` takes the view path before `execute` is ever
+called, the operator returns a permuted-stride alias over the same buffer, and it moves
+no bytes at all. An 8 MiB `permute_bytes` would cost 0.1-0.2 ms at any plausible
+bandwidth; 0.002 ms is only consistent with installing a view, so this is not the
+profiler mis-attributing a hidden copy.
 
-So the Phase 3 headline "standalone Transpose is 2.5-9.5x behind ORT at 8/16 threads" was
-never measuring the Transpose kernel. It was measuring our single-threaded graph-boundary
-copy against ORT's. Requirement 3's "avoid the operation, do not merely parallelise it"
-is, for in-graph transposes, **already satisfied** - and no amount of kernel work on
-`permute_bytes` could have moved those numbers.
+Be precise about the other 99.6%. `ONNX_GENAI_PROFILE_OPS` times **only per-node
+execution inside the eager plan**; everything outside that - input binding, the
+boundary materialisation of a strided graph output, allocation, and fixed per-run
+session work - lands in the residual undifferentiated. So what is proven is that **the
+kernel is not the cost**, and that the cost is session per-run work. It is *not* proven
+that the residual is all boundary copying: the end-to-end times do not scale with output
+bytes the way a copy-dominated residual would (3 MiB -> 0.589 ms but 8 MiB -> 0.776 ms),
+which says a fixed per-run component is folded in too. Decomposing the residual needs a
+boundary-only instrument that does not exist yet.
+
+Either way the Phase 3 headline was not measuring the Transpose kernel, and no amount of
+work on `permute_bytes` could have moved those numbers - that function is not on the
+path. Requirement 3's "avoid the operation, do not merely parallelise it" is satisfied
+**at the transpose node**: in-graph, the node itself moves zero bytes. It is *not*
+satisfied end-to-end, because the consumer can still force materialisation - `matmul.rs`
+declares `supports_strided_input = true` and then calls `to_dense_f32_widen` (§19). The
+zero-copy consumer is designed and unlanded; until it lands, "the copy never happens" is
+true of the transpose and false of the pair.
 
 ### 20.2 The full transform matrix as it stands today
 
 Single-arm, merged `main`, same host, interleaved with a real ORT CPU session, 5 warmups,
-5 trials x 15 runs. `ratio = native p50 / ORT p50`, lower is better. Nothing omitted.
+5 trials x 15 runs. Each cell is the **median across trials of the per-trial
+`native p50 / ORT p50`**, lower is better; brackets give the min-max across the 5 trials.
+Nothing omitted.
 
 | graph | t=1 | t=8 | t=16 | native p50 @16 |
 |---|--:|--:|--:|--:|
@@ -1249,27 +1277,33 @@ Two things are visible in every row and both matter more than any kernel:
 
 1. **At one thread we are within 1.09-2.77x**, and for the three Transpose graphs within
    1.09-1.45x. The gap opens only as threads are added.
-2. **Our native time does not improve with threads at all.** `tr_llama3_s512` goes 0.956
-   / 0.660 / 0.922 ms at 1 / 8 / 16; `kvcat_llama3_b8_p2047` goes 14.870 / 14.996 / 14.947
-   ms. ORT's time for the same graphs falls roughly 8x (`tr_llama3_s512`: 0.863 -> 0.127
-   -> 0.106 ms). ORT is not winning by having a better transpose; it is winning by
-   threading the part we run on one core.
+2. **Our native time does not scale with threads, and in several graphs regresses.**
+   `tr_llama3_s512` goes 0.956 / 0.660 / 0.922 ms at 1 / 8 / 16 - a 31% gain at 8 that is
+   given back at 16; `tr_bert_b8_s128` goes 0.208 -> 0.558 ms and `tr_whisper_s1500`
+   0.838 -> 1.020 ms from 1 to 16; `kvcat_llama3_b8_p2047` is flat at 14.870 / 14.996 /
+   14.947 ms. ORT's measured medians for the same graphs fall about 8x
+   (`tr_llama3_s512`: 0.870 -> 0.127 -> 0.109 ms). ORT is not winning by having a better
+   transpose; it is winning by threading the part we run on one core.
 
-Combining with §20.1: for the Transpose graphs the part we run on one core is the
-**graph-boundary materialisation**, not the kernel. For the `Concat` graphs the kernel is
-a real 32-70% of the run (1.635 ms of 5.121 ms; 3.572 ms of 7.458 ms) and the rest is
-again boundary I/O.
+Combining with §20.1: for the Transpose graphs the part we run on one core is session
+per-run work, not the kernel. For the `Concat` graphs the kernel is a real **32-48%** of
+the run (1.635 ms of 5.121 ms; 3.572 ms of 7.458 ms) - those two figures are the only
+ones measured, so no wider range is claimed - and the remainder is again session per-run
+work.
 
 ### 20.3 What this means for the remaining work
 
-* **Transpose: closed as a kernel problem.** In-graph transposes already move zero bytes.
-  The single-node benchmark cannot show that, which is a limitation of the harness, and
-  §19's proposal to teach `matmul.rs` layout-aware GEMM addresses a *different* case
-  (where a consumer forces materialisation anyway) that these graphs do not exercise.
-* **The real remaining lever is the session's boundary path**, which is single-threaded
-  and is charged to every small graph we benchmark. It inflates every single-node ratio
-  in this document, ours and nobody else's. Parallelising input feed and output
-  materialisation would move all eight rows above; no operator change will.
+* **Transpose: closed as a kernel problem.** In-graph the transpose node itself already
+  moves zero bytes. The single-node benchmark cannot show that, which is a limitation of
+  the harness. It does *not* follow that attention is copy-free: §19's proposal to teach
+  `matmul.rs` layout-aware GEMM addresses the consumer that still forces materialisation,
+  which is a real cost these graphs simply do not exercise. That work remains open.
+* **The real remaining lever is the session's per-run path** - input binding, boundary
+  materialisation and fixed setup - which does not thread and is charged to every small
+  graph we benchmark. It inflates every single-node ratio in this document. Attacking it
+  would move all eight rows above; no operator change will. Which part of it dominates is
+  not yet measured (§20.1), so that is the next instrument to build, before the next
+  optimisation.
 * **`Concat` remains a genuine kernel cost** and remains bounded by §13: `ExternalValue`
   carries no strides, so a `Concat`-shaped KV cache cannot append in place. The Phase 4
   in-place append (#1083) applies to the GQA-shaped cache, not this one.
