@@ -143,6 +143,16 @@ static MATMUL_NBITS_DTYPES: &[DataType] = &[
 ];
 
 /// The float dtypes `require_float_compute_dtype` accepts.
+///
+/// Also what the MLAS-backed `Conv` accepts. Those kernels compute in f32 and
+/// widen or narrow around it, so they cover f16 and bf16 but genuinely cannot
+/// do f64 -- `ConvKernel::execute` rejects it outright. Distinct from
+/// [`FLOAT_DTYPES`], which includes `Float64`.
+///
+/// Advertising `FLOAT_DTYPES` for such an op is an over-claim rather than a
+/// harmless one: the plugin turns this list into the `KernelRegistryEntry`
+/// dtype filter, so an f64 `Conv` would clear capability, get compiled, and
+/// then fail at `Run` instead of being reported unsupported up front.
 static FLOAT_COMPUTE_DTYPES: &[DataType] =
     &[DataType::Float32, DataType::Float16, DataType::BFloat16];
 
@@ -384,9 +394,13 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         // pkg.nxrt custom ops: f32-only (fail closed).
         (_, "pkg.nxrt") => F32_ONLY,
 
-        // CNN ops (feature-gated).
-        ("Conv", "")
-        | ("ConvTranspose", "")
+        // CNN ops (feature-gated). `Conv` computes through MLAS in f32 and
+        // rejects f64 in `ConvKernel::execute`, so it must not advertise it.
+        ("Conv", "") => FLOAT_COMPUTE_DTYPES,
+
+        // The rest of the CNN family dispatches through `dispatch_float!` and
+        // does handle f64.
+        ("ConvTranspose", "")
         | ("AveragePool", "")
         | ("MaxPool", "")
         | ("GlobalAveragePool", "")
@@ -798,40 +812,52 @@ pub fn build_cpu_registry() -> OpRegistry {
 /// type-constraint advertisement). The keys are derived from the exact same
 /// registration calls — not hand-maintained.
 pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor>) {
-    let (reg, keys) =
+    let (reg, _) =
         build_cpu_registry_recorded_inner(qmoe::default_weight_offload_host_cache().clone());
-    let descriptors = keys
-        .into_iter()
-        .map(|(op_type, domain, since_version)| {
-            let dtypes = supported_dtypes_for_op(&op_type, &domain);
-            CpuOpDescriptor {
-                op_type,
-                domain,
-                since_version,
-                supported_dtypes: dtypes,
-            }
+    let descriptors = descriptors_from_registry(&reg);
+    (reg, descriptors)
+}
+
+/// Derive one [`CpuOpDescriptor`] per entry in `reg`.
+///
+/// Reads the registry itself rather than a list accumulated during
+/// registration. Those two had drifted: `register_cnn_ops` takes `&mut
+/// OpRegistry` and so writes past the recording wrapper, which left 18 ops --
+/// `PRelu`, `BatchNormalization`, `InstanceNormalization`,
+/// `GroupNormalization`, `Conv`, and the pooling and resize family -- present
+/// in the registry but absent from the descriptors.
+///
+/// That gap was not cosmetic. The plugin turns these descriptors into the
+/// `KernelRegistryEntry` list, and `node_passes_dtype_filter` fails closed on
+/// an op with no entry, so every one of those 18 was claimed by `supports_op`
+/// and then dropped at capability time -- handing it to ORT's CPU EP, which is
+/// exactly what this EP must never do. Deriving from the registry makes the
+/// two sets identical by construction instead of by convention.
+fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
+    let mut descriptors: Vec<CpuOpDescriptor> = reg
+        .keys()
+        .map(|key| CpuOpDescriptor {
+            op_type: key.op_type.clone(),
+            domain: key.domain.clone(),
+            since_version: key.since_version,
+            supported_dtypes: supported_dtypes_for_op(&key.op_type, &key.domain),
         })
         .collect();
-    (reg, descriptors)
+    // `OpRegistry` iterates a hash map, so fix an order: callers leak these
+    // into a `'static` slice ORT reads, and an unstable order makes any
+    // downstream diff or snapshot test flap.
+    descriptors.sort_by(|a, b| {
+        (&a.domain, &a.op_type, a.since_version).cmp(&(&b.domain, &b.op_type, b.since_version))
+    });
+    descriptors
 }
 
 /// Build the CPU registry AND return keys, with a custom weight-offload cache.
 pub fn build_cpu_registry_with_descriptors_and_cache(
     host_cache: qmoe::WeightOffloadHostCache,
 ) -> (OpRegistry, Vec<CpuOpDescriptor>) {
-    let (reg, keys) = build_cpu_registry_recorded_inner(host_cache);
-    let descriptors = keys
-        .into_iter()
-        .map(|(op_type, domain, since_version)| {
-            let dtypes = supported_dtypes_for_op(&op_type, &domain);
-            CpuOpDescriptor {
-                op_type,
-                domain,
-                since_version,
-                supported_dtypes: dtypes,
-            }
-        })
-        .collect();
+    let (reg, _) = build_cpu_registry_recorded_inner(host_cache);
+    let descriptors = descriptors_from_registry(&reg);
     (reg, descriptors)
 }
 
@@ -2620,18 +2646,73 @@ mod tests {
 
     #[test]
     fn descriptors_derived_from_real_registry_not_hand_maintained() {
-        // Verify that the descriptor count matches the registry entry count
-        // (minus CNN ops that are directly registered without recording).
+        // Every registered op must have a descriptor -- not "close to", exactly.
+        //
+        // This used to allow a delta of up to 50 and documented CNN ops as the
+        // expected difference. That tolerance was hiding a real bug: the plugin
+        // builds its `KernelRegistryEntry` list from these descriptors and
+        // `node_passes_dtype_filter` fails closed on an op with no entry, so
+        // each of the 18 missing ops (`PRelu`, `BatchNormalization`,
+        // `InstanceNormalization`, `GroupNormalization`, `Conv`, pooling,
+        // `Resize`, ...) was claimed by `supports_op` and then silently handed
+        // back to ORT's CPU EP at capability time.
         let reg = build_cpu_registry();
         let (_reg2, descriptors) = shared_registry_with_descriptors();
-        // Descriptors should be close to registry len; CNN ops are the delta.
-        let delta = reg.len() as isize - descriptors.len() as isize;
+
+        let described: std::collections::BTreeSet<(&str, &str, u64)> = descriptors
+            .iter()
+            .map(|d| (d.op_type.as_str(), d.domain.as_str(), d.since_version))
+            .collect();
+        let missing: Vec<String> = reg
+            .keys()
+            .filter(|k| {
+                !described.contains(&(k.op_type.as_str(), k.domain.as_str(), k.since_version))
+            })
+            .map(|k| format!("{}::{}@{}", k.domain, k.op_type, k.since_version))
+            .collect();
         assert!(
-            (0..50).contains(&delta),
-            "descriptor count ({}) should be close to registry len ({}), delta={}",
+            missing.is_empty(),
+            "{} registered ops have no descriptor, so the plugin would decline \
+             them to ORT's CPU EP: {missing:?}",
+            missing.len()
+        );
+        assert_eq!(
             descriptors.len(),
             reg.len(),
-            delta
+            "descriptor count must equal registry size exactly"
+        );
+    }
+
+    /// Advertised dtypes must be what the kernel accepts, not a superset.
+    ///
+    /// The plugin turns these into the `KernelRegistryEntry` dtype filter, so
+    /// an over-claim is not harmless: ORT routes the node to us, capability
+    /// passes, and it fails at `Run` instead of being declined up front.
+    /// `Conv` is the live case -- it computes through MLAS in f32 and
+    /// `ConvKernel::execute` rejects f64 outright, so it must advertise
+    /// `FLOAT_COMPUTE_DTYPES` and not `FLOAT_DTYPES`.
+    #[test]
+    fn conv_does_not_advertise_a_dtype_its_kernel_rejects() {
+        let dtypes = supported_dtypes_for_op("Conv", "");
+        assert!(
+            !dtypes.contains(&DataType::Float64),
+            "Conv advertises f64 but ConvKernel::execute rejects it: {dtypes:?}"
+        );
+        for want in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            assert!(dtypes.contains(&want), "Conv must still advertise {want:?}");
+        }
+    }
+
+    /// The descriptor order is leaked into a `'static` slice handed to ORT, so
+    /// it must not depend on hash-map iteration order.
+    #[test]
+    fn descriptors_are_deterministically_ordered() {
+        let (_r, a) = build_cpu_registry_with_descriptors();
+        let (_r2, b) = build_cpu_registry_with_descriptors();
+        let key = |d: &CpuOpDescriptor| (d.domain.clone(), d.op_type.clone(), d.since_version);
+        assert_eq!(
+            a.iter().map(key).collect::<Vec<_>>(),
+            b.iter().map(key).collect::<Vec<_>>()
         );
     }
 }
