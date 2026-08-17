@@ -931,3 +931,78 @@ extern "C" void mlas_qgemm_i32_packed(
         1,
         multithread != 0 ? kMlasParallelSentinel : nullptr);
 }
+
+// ---- Fused requantizing quantized GEMM --------------------------------------
+//
+// `mlas_qgemm_i32`/`mlas_qgemm_i32_packed` leave `OutputProcessor` null, so the
+// caller gets the raw `int32_t` accumulator and has to walk the whole `M x N`
+// array again to scale, round, offset and narrow it to bytes. ONNX Runtime does
+// not: `QLinearMatMul` hands MLAS a `MLAS_QGEMM_REQUANT_OUTPUT_PROCESSOR`, which
+// MLAS invokes on each output tile as soon as the kernel produces it, while the
+// accumulators are still in cache, and writes the final `uint8_t`/`int8_t`
+// straight into the destination tensor.
+//
+// `C` is still required -- MLAS accumulates into it and then processes it in
+// place -- but the second full-array pass and the byte staging buffer both go
+// away, and the requantization itself runs MLAS's SIMD implementation rather
+// than a scalar loop.
+extern "C" void mlas_qgemm_requantize(
+    size_t M,
+    size_t N,
+    size_t K,
+    int a_is_signed,
+    int b_is_signed,
+    const void* A,
+    size_t lda,
+    uint8_t zero_point_a,
+    const void* B,
+    size_t ldb,
+    int b_is_packed,
+    const uint8_t* zero_point_b,
+    int per_column_zero_points,
+    int32_t* C,
+    size_t ldc,
+    void* output,
+    size_t output_ld,
+    int output_is_signed,
+    const float* scale,
+    int per_column_scale,
+    int32_t output_zero_point,
+    int multithread)
+{
+    MLAS_GEMM_QUANT_SHAPE_PARAMS shape;
+    shape.M = M;
+    shape.N = N;
+    shape.K = K;
+    shape.AIsSigned = a_is_signed != 0;
+    shape.BIsSigned = b_is_signed != 0;
+    shape.IsAccumulateMode = false;
+
+    MLAS_QGEMM_REQUANT_OUTPUT_PROCESSOR processor(
+        output,
+        output_ld,
+        nullptr,
+        scale,
+        per_column_scale != 0,
+        output_zero_point,
+        output_is_signed != 0);
+
+    MLAS_GEMM_QUANT_DATA_PARAMS data;
+    data.A = static_cast<const uint8_t*>(A);
+    data.lda = lda;
+    data.ZeroPointA = zero_point_a;
+    data.B = B;
+    data.ldb = b_is_packed != 0 ? N : ldb;
+    data.ZeroPointB = zero_point_b;
+    data.BIsPacked = b_is_packed != 0;
+    data.PerColumnZeroPoints = per_column_zero_points != 0;
+    data.C = C;
+    data.ldc = ldc;
+    data.OutputProcessor = &processor;
+
+    MlasGemmBatch(
+        shape,
+        &data,
+        1,
+        multithread != 0 ? kMlasParallelSentinel : nullptr);
+}

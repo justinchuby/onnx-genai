@@ -221,7 +221,7 @@ pub(crate) const SIMD_MIN_LEN: usize = 32;
 /// take the vector path. That matters for more than speed: the scalar and
 /// vector paths are not bit-identical for the approximated kernels, so a chunk
 /// that fell back to scalar would make the result depend on the thread count.
-const PAR_MIN_LEN: usize = 1_048_576;
+pub(crate) const PAR_MIN_LEN: usize = 1_048_576;
 
 /// Minimum elements per thread.
 ///
@@ -315,6 +315,10 @@ fn par_chunk_len_rows(len: usize, width: usize, threads: usize) -> Option<usize>
 /// short, or when already inside a rayon worker: nesting a `par_chunks` inside
 /// an outer parallel region only adds scheduling overhead, since the outer
 /// region is already keeping the pool busy.
+///
+/// `pub(crate)` because it is not specific to this file: any elementwise f32
+/// kernel wants it, and the MLAS-backed `SiLU`/`Relu`/`Clip` paths in sibling
+/// modules were single-threaded for want of it.
 #[inline]
 fn run_chunked<F>(input: &[f32], output: &mut [f32], body: F)
 where
@@ -341,11 +345,65 @@ where
         return;
     };
 
+    note_parallel_dispatch();
+
     use rayon::prelude::*;
     output
         .par_chunks_mut(chunk)
         .zip(input.par_chunks(chunk))
         .for_each(|(o, i)| body(i, o));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Times *this* thread has handed work to the pool from [`run_chunked`].
+    ///
+    /// Thread-local rather than a global atomic so that concurrently running
+    /// tests cannot bump each other's count: the increment happens on the
+    /// calling thread, before the slice is split.
+    static PARALLEL_DISPATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline(always)]
+fn note_parallel_dispatch() {
+    #[cfg(test)]
+    PARALLEL_DISPATCHES.with(|c| c.set(c.get() + 1));
+}
+
+/// Chunk a whole-slice kernel that needs no captured state.
+///
+/// Takes a `fn` pointer rather than `impl Fn` on purpose: every caller shares
+/// one instantiation, and that instantiation lives in this module. See
+/// `clip_chunked` for why that matters.
+#[cfg(feature = "mlas")]
+pub(crate) fn run_chunked_fn(input: &[f32], output: &mut [f32], body: fn(&[f32], &mut [f32])) {
+    run_chunked(input, output, body);
+}
+
+/// Chunked `Clip`, instantiated here rather than at the call site.
+///
+/// `run_chunked` is generic, and instantiating it from `selection.rs` moved
+/// enough code between codegen units that the AVX2 unary kernels in this
+/// module stopped being vectorised: `Sqrt` went 21 -> 48 us and `Tanh`
+/// 32 -> 55 us at n = 65536, with no runtime path change at all. Keeping every
+/// instantiation inside this module keeps the partitioning stable.
+#[cfg(feature = "mlas")]
+pub(crate) fn clip_chunked(input: &[f32], output: &mut [f32], minimum: f32, maximum: f32) {
+    // Take the serial decision here, so the common short case is a direct call
+    // instead of one through a closure the optimiser can no longer see into.
+    if input.len() < PAR_MIN_LEN || force_serial() || rayon::current_thread_index().is_some() {
+        mlas_sys::compute_clip(input, output, minimum, maximum);
+        return;
+    }
+    run_chunked(input, output, |i, o| {
+        mlas_sys::compute_clip(i, o, minimum, maximum);
+    });
+}
+
+/// How many times this thread has reached [`run_chunked`]'s parallel branch.
+#[cfg(test)]
+pub(crate) fn parallel_dispatches() -> usize {
+    PARALLEL_DISPATCHES.with(std::cell::Cell::get)
 }
 
 /// [`run_chunked`] for the bias-fused kernels, whose element mapping is
@@ -622,7 +680,12 @@ macro_rules! dispatch_mlas {
             debug_assert_eq!(input.len(), output.len());
             if input.len() >= SIMD_MIN_LEN {
                 let f: fn(&[f32], &mut [f32]) = $mlas;
-                f(input, output);
+                // Through `run_chunked`, exactly like the pure-Rust routes.
+                // Calling `f(input, output)` directly here left every MLAS
+                // route single-threaded no matter how many threads the pool
+                // had, which cost 3.4-4.3x at 16 threads once the pure-Rust
+                // routes started parallelising.
+                run_chunked(input, output, f);
                 return;
             }
         }
@@ -3556,11 +3619,13 @@ mod thread_invariance {
     }
 
     fn assert_same(name: &str, run: impl Fn(&[f32], &mut [f32]) + Sync) {
-        assert!(
-            rayon::current_num_threads() >= 2,
-            "global pool is single-threaded: this test would compare serial \
-             against serial and could not fail"
-        );
+        if rayon::current_num_threads() < 2 {
+            eprintln!(
+                "skipped {name}: global pool is single-threaded, so this test \
+                 would compare serial against serial and could not fail"
+            );
+            return;
+        }
         let x = probe(N);
         let mut want = vec![0.0f32; N];
         serial(|| run(&x, &mut want));
@@ -3718,5 +3783,158 @@ mod thread_invariance {
         assert_eq!(par_chunk_len_rows(N, 0, 8), None);
         assert_eq!(par_chunk_len_rows(N, usize::MAX, 8), None);
         assert_eq!(par_chunk_len(N, 0), None);
+    }
+}
+
+/// Every activation entry point must reach the pool through [`run_chunked`],
+/// including the ones that hand the arithmetic to MLAS.
+///
+/// The MLAS route used to call its kernel on the whole tensor and return,
+/// skipping `run_chunked` entirely. Nothing caught it: the results were right,
+/// the thread-invariance tests passed (a route that never splits is trivially
+/// split-invariant), and the only symptom was that an `mlas`-on build stayed
+/// single-threaded while an `mlas`-off build scaled — worth 3.4-4.3x at 16
+/// threads on this host, in the configuration the wheel ships.
+///
+/// So this asserts the mechanism rather than the output: a tensor over
+/// `PAR_MIN_LEN`, submitted from outside the pool, must increment
+/// `run_chunked`'s parallel-branch counter.
+#[cfg(test)]
+mod parallel_reachability {
+    use super::*;
+
+    /// Over `PAR_MIN_LEN` so the parallel branch is eligible, and not a
+    /// multiple of the chunk size or the lane count.
+    const N: usize = PAR_MIN_LEN + 4099;
+
+    fn assert_parallelises(name: &str, run: impl Fn(&[f32], &mut [f32])) {
+        if rayon::current_num_threads() < 2 {
+            eprintln!(
+                "skipped {name}: global pool is single-threaded, so run_chunked \
+                 would take its serial branch and this test could not fail"
+            );
+            return;
+        }
+        assert!(
+            rayon::current_thread_index().is_none(),
+            "this test must run outside the pool: run_chunked deliberately \
+             stays serial when it is already inside a parallel region"
+        );
+
+        let x = vec![0.5f32; N];
+        let mut y = vec![0.0f32; N];
+
+        let before = parallel_dispatches();
+        run(&x, &mut y);
+        let after = parallel_dispatches();
+
+        assert!(
+            after > before,
+            "{name}: a {N}-element call did not reach run_chunked's parallel \
+             branch, so it runs single-threaded no matter how large the pool \
+             is. A kernel that calls its backend directly and returns will \
+             fail here."
+        );
+    }
+
+    #[test]
+    fn mlas_routed_kernels_still_go_through_run_chunked() {
+        // `Erf` and exact `Gelu` are the two that still take the MLAS route
+        // when the `mlas` feature is on, which is what the wheel ships.
+        assert_parallelises("erf", erf_f32_slice);
+        assert_parallelises("erf_gelu", erf_gelu_f32_slice);
+    }
+
+    #[test]
+    fn pure_rust_kernels_go_through_run_chunked() {
+        assert_parallelises("tanh", tanh_f32_slice);
+        assert_parallelises("sigmoid", sigmoid_f32_slice);
+        assert_parallelises("sqrt", sqrt_f32_slice);
+        assert_parallelises("tanh_gelu", tanh_gelu_f32_slice);
+        assert_parallelises("exp", exp_f32_slice);
+    }
+}
+
+/// `run_chunked` is generic, and where it is *instantiated* changes codegen.
+///
+/// #1130 wrapped `Clip` in `run_chunked` from `selection.rs`. The runtime path
+/// for the other unary ops did not change by a single instruction, but moving
+/// that one instantiation across a module boundary repartitioned the crate's
+/// codegen units and the AVX2 unary kernels in this module stopped being
+/// vectorised. Measured at n = 65536, one thread, same machine, same commit
+/// except for that instantiation:
+///
+/// | op | instantiated here | instantiated in `selection.rs` |
+/// |---|---|---|
+/// | `Sqrt` | 21.5 us | 48.5 us |
+/// | `Tanh` | 30.4 us | 54.7 us |
+/// | `Sigmoid` | 32.2 us | 57.1 us |
+/// | `QuickGelu` | 42.6 us | 64.6 us |
+/// | `FastGelu` | 55.7 us | 79.2 us |
+///
+/// Nothing in the compiler promises that partitioning is stable, so the rule is
+/// mechanical rather than clever: `run_chunked` stays private to this module,
+/// and callers elsewhere go through `run_chunked_fn` or `clip_chunked`, which
+/// are instantiated here. This test enforces it, because the failure mode is a
+/// 2.3x slowdown in files the author never opened and no test result changes.
+#[cfg(test)]
+mod chunking_instantiation_is_local {
+    #[test]
+    fn no_module_outside_this_one_instantiates_run_chunked() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut stack = vec![dir];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).expect("read src") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_some_and(|e| e == "rs")
+                    && path.file_name().is_some_and(|f| f != "simd_activations.rs")
+                {
+                    let text = std::fs::read_to_string(&path).expect("read source");
+                    for (i, line) in text.lines().enumerate() {
+                        // `run_chunked_fn(` and `run_chunked_rows(` are fine: the
+                        // first is not generic, the second is only used here.
+                        if line.trim_start().starts_with("//") {
+                            continue;
+                        }
+                        // Match the identifier on a word boundary, then require
+                        // the next non-space token to open a call or a
+                        // turbofish. That accepts `run_chunked(`, `run_chunked
+                        // ::<T>(` and `run_chunked ()`, while rejecting
+                        // `run_chunked_fn`, `run_chunked_rows`, test names like
+                        // `silu_reaches_run_chunked_parallel_branch`, and prose
+                        // that does not go on to open a call. It is a
+                        // heuristic, not a parser: a call spelled through an
+                        // aliased import, split across two lines, or generated
+                        // by a macro would slip past it, and the literal text
+                        // `run_chunked(` inside a string would trip it. It
+                        // catches the accidental case, which is a plain call
+                        // added in another module.
+                        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+                        let calls = line.match_indices("run_chunked").any(|(at, _)| {
+                            let before_ok =
+                                line[..at].chars().next_back().is_none_or(|c| !is_word(c));
+                            let rest = line[at + "run_chunked".len()..].trim_start();
+                            before_ok && (rest.starts_with('(') || rest.starts_with("::<"))
+                        });
+                        if calls {
+                            offenders.push(format!("{}:{}", path.display(), i + 1));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "run_chunked is generic and must only be instantiated inside \
+             simd_activations.rs; instantiating it elsewhere repartitioned the \
+             crate's codegen units and cost up to 2.3x (Sqrt; 1.7-1.8x on Tanh and Sigmoid). Use \
+             run_chunked_fn or add a wrapper next to clip_chunked instead. \
+             Offending call sites: {offenders:?}"
+        );
     }
 }

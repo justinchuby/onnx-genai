@@ -336,6 +336,42 @@ fn mlas_prefill_serial() -> bool {
     })
 }
 
+/// A/B escape hatch controlling the **unscoped** decode (`m == 1`, no persistent
+/// SPMD scope active) MLAS SQNBit dispatch.
+///
+/// The persistent decode pool pre-partitions a `MatMulNBits` weight into one
+/// MLAS shard per resident worker so a *scoped* decode can hand each worker a
+/// column range. A host that never enters that scope — the ORT plugin EP, any
+/// third-party runtime, or engine speculative/prefill work — inherits the shard
+/// layout anyway, and the pre-fix code ran those `W` shards *serially*, one MLAS
+/// `multithread=true` call after another, capping the GEMV at the persistent
+/// worker count no matter how many threads the host actually had. Measured on
+/// the plugin path (int4 block-32 K=N=2048 M=1, 32-vCPU EPYC): 0.376 ms that way
+/// vs 0.092 ms for a single full-width `multithread=true` call, which dispatches
+/// once to MLAS's own persistent [`mlas_sys::WorkStealingThreadPool`] — the
+/// low-overhead executor the EP already owns.
+///
+/// So when this returns `true` (the default) an unscoped `m == 1` int4 decode
+/// GEMV takes the single full-width `multithread=true` path instead of the
+/// per-worker shards, letting the EP reach its fast decode number without any
+/// caller cooperation (no `disable_persistent_decode_pool()` opt-out required).
+/// The math is byte-identical to the sharded path — row-major N-partitioning
+/// computes each output column independently, verified `max_ulp = 0` at the
+/// probe shape (see `unscoped_decode_shard_dispatch_perf`). Engine single-token
+/// decode always runs *inside* the SPMD scope, so it never takes this path and
+/// is unaffected. Set `ONNX_GENAI_CPU_MM_MLAS_UNSCOPED_DECODE_SERIAL=1` to
+/// restore the old per-worker serial-shard loop for A/B parity. Parsed once.
+#[cfg(feature = "mlas")]
+fn mlas_unscoped_decode_full_width() -> bool {
+    static UNSCOPED_FULL_WIDTH: OnceLock<bool> = OnceLock::new();
+    *UNSCOPED_FULL_WIDTH.get_or_init(|| {
+        !std::env::var("ONNX_GENAI_CPU_MM_MLAS_UNSCOPED_DECODE_SERIAL").is_ok_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0"
+        })
+    })
+}
+
 /// Smallest `m` (batch·seq row count) that routes int4 MatMulNBits to MLAS
 /// SQNBit; smaller `m` uses the hand int4/int8 decode path. Parsed once from
 /// `NXRT_SQNBIT_DECODE_MIN`, defaulting to [`default_sqnbit_decode_min`].
@@ -1143,6 +1179,27 @@ impl Kernel for MatMulNBitsKernel {
             }
             with_decode_pool(|| {
                 #[cfg(target_arch = "x86_64")]
+                if borrowed_int4_prefill_block_enabled()
+                    && m >= 2
+                    && !matches!(dot_kernel, DotKernel::Scalar)
+                    && self.block_size.is_multiple_of(32)
+                {
+                    borrowed_affine_int4_matmul_prefill(
+                        &activations,
+                        packed,
+                        scales,
+                        borrowed_zero_points,
+                        bias.as_deref(),
+                        result,
+                        m,
+                        self.k,
+                        self.n,
+                        self.block_size,
+                        dot_kernel,
+                    );
+                    return;
+                }
+                #[cfg(target_arch = "x86_64")]
                 if borrowed_int4_nblock_enabled()
                     && !matches!(dot_kernel, DotKernel::Scalar)
                     && self.block_size.is_multiple_of(32)
@@ -1916,7 +1973,20 @@ impl MatMulNBitsKernel {
         // where MLAS dynamically partitions N tiles across its persistent
         // work-stealing intra-op pool, for A/B profiling without changing the
         // default until correctness and throughput are proven.
-        let use_static_shards = can_prepack && !mlas_no_shard();
+        //
+        // #1138: an *unscoped* `m == 1` decode GEMV (no persistent SPMD scope
+        // active — the ORT plugin EP, a third-party host, or any caller that did
+        // not enter `with_decode_pool_scope`) skips the per-worker shards and
+        // takes the full-width `multithread=true` path below, dispatching once to
+        // MLAS's own persistent work-stealing pool instead of running the shards
+        // serially (which capped the GEMV at the persistent worker count). The
+        // engine's single-token decode always runs inside the SPMD scope, so it
+        // keeps the sharded fast path and is unaffected; byte-identical either
+        // way (`max_ulp = 0`). `ONNX_GENAI_CPU_MM_MLAS_UNSCOPED_DECODE_SERIAL=1`
+        // restores the old serial-shard dispatch for A/B parity.
+        let unscoped_decode_full_width =
+            m == 1 && mlas_unscoped_decode_full_width() && spmd_decode_active().is_none();
+        let use_static_shards = can_prepack && !mlas_no_shard() && !unscoped_decode_full_width;
         if use_static_shards {
             let shards = if let Some(shards) = self.mlas_shards.get() {
                 shards
@@ -2074,11 +2144,15 @@ impl MatMulNBitsKernel {
     ///   shards to the resident workers under one barrier -- each worker runs its
     ///   own shard's GEMV serially (`multithread=false`), so the whole projection
     ///   stays on the hot decode pool with no global-Rayon fork.
-    /// * Otherwise (prefill `m > 1`, or decode with no SPMD scope): run each shard
-    ///   with MLAS's own tile parallelism (`multithread=true`) writing its columns
-    ///   into the shared `[m, n]` output at stride `self.n`. With a single
-    ///   full-width shard (no SPMD pool) this is exactly the previous one-call
-    ///   `multithread=true` behaviour.
+    /// * Prefill (`m > 1`) with more than one live shard: issue ONE Rayon
+    ///   parallel pass over `(shard x m-row-block)` tiles, each running
+    ///   `multithread=false` on its own disjoint output window (A/B:
+    ///   `ONNX_GENAI_CPU_MM_MLAS_PREFILL_SERIAL=1` restores the old serial loop).
+    /// * A single full-width shard (no persistent pool), or `m == 1` with no
+    ///   active decode scope: one full-width `multithread=true` call. (Unscoped
+    ///   `m == 1` decode with a persistent pool built never reaches here — it
+    ///   takes the full-width fast path in [`Self::try_mlas_sqnbit`], see
+    ///   [`mlas_unscoped_decode_full_width`].)
     ///
     /// Row-major N-partitioning computes each output column independently of the
     /// others, so the concatenated result is bit-identical to a single full-width
@@ -2134,9 +2208,10 @@ impl MatMulNBitsKernel {
         // (verified `max_ulp = 0`). Tiling M as well as N keeps every core busy
         // when the shard count is below the host thread count, without needing a
         // second full-width packed weight. Gated on `m > 1 && active > 1`:
-        // decode (`m == 1`) with no SPMD scope and the single-shard no-pool case
-        // keep the original one-call path below (a single full-width
-        // `multithread=true` call is already optimal there).
+        // unscoped decode (`m == 1`, no SPMD scope) reaches the full-width fast
+        // path in `try_mlas_sqnbit` before shards are ever built, and the
+        // single-shard no-pool case keeps the original one-call path below (a
+        // single full-width `multithread=true` call is already optimal there).
         if m > 1 && active > 1 && !mlas_prefill_serial() {
             let n = self.n;
             let k = self.k;
@@ -6311,6 +6386,224 @@ unsafe fn borrowed_int4_nblock4_avx2(
     }
 }
 
+/// Compute one int4 borrowed-path output element `result[row][col]`.
+///
+/// This is the exact per-output float sequence the row-serial
+/// [`borrowed_affine_int4_matmul`] ran inline, factored out so the structural
+/// prefill path ([`borrowed_affine_int4_matmul_prefill`]) computes each
+/// `(row, column)` pair with the *identical* reduction. Changing the fork-join
+/// structure never touches a single element's own accumulation, so the two
+/// paths are byte-identical (issue #1117).
+///
+/// `scale_base` is `output_index * block_count`; `activation` and
+/// `activation_sums` are the slices for this element's row.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn borrowed_int4_output_element(
+    activation: &[f32],
+    activation_sums: &[f32],
+    packed_row: &[u8],
+    zp_row: Option<&[u8]>,
+    scales: &BorrowedScales<'_>,
+    scale_base: usize,
+    bias_value: f32,
+    layout: NBitsLayout,
+    block_count: usize,
+    block_size: usize,
+    k: usize,
+    dot_kernel: DotKernel,
+) -> f32 {
+    // On non-x86 targets `dot_kernel` drives no fast path; discard it to keep
+    // `-D warnings` happy, mirroring `borrowed_affine_int4_matmul`.
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = dot_kernel;
+    let mut sum = bias_value;
+    for block in 0..block_count {
+        let depth_start = block * block_size;
+        let valid = k.saturating_sub(depth_start).min(block_size);
+        let block_values = &packed_row
+            [block * layout.packed_block_size()..(block + 1) * layout.packed_block_size()];
+        let scale = scales.get(scale_base + block);
+        let zero_point = layout.zero_point(zp_row, block) as f32;
+        let mut dot;
+        #[cfg(target_arch = "aarch64")]
+        if valid == 32 && block_size == 32 {
+            // SAFETY: AArch64 guarantees NEON, and both slices contain one full block.
+            dot = unsafe {
+                affine_int4_block32_dot_neon(
+                    &activation[depth_start..depth_start + 32],
+                    block_values,
+                )
+            };
+            sum += (dot - activation_sums[block] * zero_point) * scale;
+            continue;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if valid == block_size && valid.is_multiple_of(32) {
+            // Vectorised int4 unpack + f32 FMA for the x86 borrowed path
+            // (issue #994). Falls through to the scalar loop when the host has
+            // no AVX2 (`DotKernel::Scalar`), so correctness never depends on the
+            // fast path existing.
+            if let Some(vec_dot) = borrowed_int4_block_dot_x86(
+                &activation[depth_start..depth_start + valid],
+                block_values,
+                dot_kernel,
+            ) {
+                sum += (vec_dot - activation_sums[block] * zero_point) * scale;
+                continue;
+            }
+        }
+        dot = 0.0;
+        for (byte_index, &byte) in block_values.iter().enumerate() {
+            let within = byte_index * 2;
+            if within < valid {
+                dot += activation[depth_start + within] * (byte & 0x0f) as f32;
+            }
+            if within + 1 < valid {
+                dot += activation[depth_start + within + 1] * (byte >> 4) as f32;
+            }
+        }
+        sum += (dot - activation_sums[block] * zero_point) * scale;
+    }
+    sum
+}
+
+/// A/B toggle for the structural borrowed int4 prefill matmul (issue #1117).
+/// `1`/`on` enables it for multi-row (prefill) activations; unset or `0`/`off`
+/// keeps the row-serial path. Default off so the shipped path is unchanged
+/// until the win is measured, exactly like the `#1104` N-block
+/// (`ONNX_GENAI_CPU_MM_INT4_NBLK`) and `#994` SIMD toggles. Read-only env probe
+/// -- production never mutates it at runtime.
+#[cfg(target_arch = "x86_64")]
+fn borrowed_int4_prefill_block_enabled() -> bool {
+    std::env::var("ONNX_GENAI_CPU_MM_INT4_PREFILL")
+        .ok()
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("off")
+        })
+        .unwrap_or(false)
+}
+
+/// Structural borrowed int4 matmul for prefill (issue #1117). Reads the *same*
+/// zero-copy mmap int4 layout as [`borrowed_affine_int4_matmul`] with no
+/// resident packed buffer, but replaces that path's two per-token overheads:
+///
+/// 1. The row-serial path runs one fork-join (`parallel_output_rows`) *per
+///    activation row*, so an `m`-token prefill pays `m` fork/join barriers.
+///    Here there is a single fork-join over disjoint column strips for the
+///    whole prefill.
+/// 2. The row-serial path re-allocates the per-block `activation_sums` `Vec`
+///    inside its per-row loop. Here it is hoisted to one allocation of
+///    `m * block_count` floats, independent of the weight size.
+///
+/// This is deliberately *not* GEMM blocking: rows are visited outer-most, so a
+/// column's packed bytes are still re-read once per row (same weight traffic as
+/// the row-serial path). Reusing a column's bytes across a tile of rows is a
+/// separate, so-far-unproven change tracked as a follow-up to #1117 -- on the
+/// 0.5B model the reuse effect sat within run-to-run noise, so it is kept out
+/// of this change until it clears the baseline spread on a large model.
+///
+/// Each output element is computed with the identical float sequence as the
+/// row-serial path (via [`borrowed_int4_output_element`]); only the fork-join
+/// structure and the allocation change, so results are byte-identical.
+/// Parallelism is over disjoint column strips, mirroring the column-strip GEMM
+/// in `accelerate_gemm`.
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_arch = "x86_64")]
+fn borrowed_affine_int4_matmul_prefill(
+    activations: &[f32],
+    packed: &[u8],
+    scales: BorrowedScales<'_>,
+    zero_points: Option<&[u8]>,
+    bias: Option<&[f32]>,
+    result: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    block_size: usize,
+    dot_kernel: DotKernel,
+) {
+    debug_assert_eq!(activations.len(), m * k);
+    debug_assert_eq!(result.len(), m * n);
+    let bits = 4usize;
+    let layout = NBitsLayout { bits, block_size };
+    let block_count = k.div_ceil(block_size);
+    let packed_row_size = block_count * layout.packed_block_size();
+    let zero_point_row_size = layout.zero_point_row_size(block_count);
+
+    // Per-block activation sums, computed once for every row. The row-serial
+    // path re-allocated this `Vec` inside its per-row loop (issue #1117); here
+    // it is one allocation of `m * block_count` floats, independent of the
+    // weight size, so it never scales with N or the packed bytes.
+    let mut activation_sums = vec![0.0f32; m * block_count];
+    for (row, sums) in activation_sums.chunks_exact_mut(block_count).enumerate() {
+        let activation = &activations[row * k..(row + 1) * k];
+        for (sum, blk) in sums.iter_mut().zip(activation.chunks(block_size)) {
+            *sum = blk.iter().sum::<f32>();
+        }
+    }
+
+    // Parallelise over disjoint column strips (mirrors the column-strip GEMM in
+    // `accelerate_gemm`) with a single fork-join for the whole prefill, instead
+    // of the row-serial path's `m` per-row fork-joins.
+    let threads = rayon::current_num_threads().max(1);
+    let strip = n.div_ceil(threads).max(1);
+    let num_strips = n.div_ceil(strip);
+    // SAFETY (raw pointer send): strip `t` writes only `result[i * n + j]` for
+    // `j` in `[j0, j0 + jn)` and `i` in `0..m`; disjoint column ranges never
+    // overlap. `par_chunks_mut` cannot partition a row-major matrix by columns,
+    // hence the raw pointer, exactly as in `accelerate_gemm`'s column strips.
+    let result_ptr = result.as_mut_ptr() as usize;
+    let run_strip = |t: usize| {
+        let j0 = t * strip;
+        if j0 >= n {
+            return;
+        }
+        let jn = strip.min(n - j0);
+        let result_base = result_ptr as *mut f32;
+        // Rows outer-most: this keeps the per-element k-reduction order and the
+        // weight-traffic profile identical to the row-serial path; only the
+        // fork-join count and the allocation change.
+        for i in 0..m {
+            let activation = &activations[i * k..(i + 1) * k];
+            let sums = &activation_sums[i * block_count..(i + 1) * block_count];
+            for j in j0..j0 + jn {
+                let packed_row = &packed[j * packed_row_size..(j + 1) * packed_row_size];
+                let zp_row = zero_points
+                    .map(|zp| &zp[j * zero_point_row_size..(j + 1) * zero_point_row_size]);
+                let bias_value = bias.map_or(0.0, |values| values[j]);
+                let value = borrowed_int4_output_element(
+                    activation,
+                    sums,
+                    packed_row,
+                    zp_row,
+                    &scales,
+                    j * block_count,
+                    bias_value,
+                    layout,
+                    block_count,
+                    block_size,
+                    k,
+                    dot_kernel,
+                );
+                // SAFETY: `i < m` and `j < n`, so `i * n + j < m * n ==
+                // result.len()`; this strip owns column `j` exclusively.
+                unsafe {
+                    *result_base.add(i * n + j) = value;
+                }
+            }
+        }
+    };
+    if num_strips <= 1 || threads <= 1 {
+        for t in 0..num_strips {
+            run_strip(t);
+        }
+    } else {
+        (0..num_strips).into_par_iter().for_each(run_strip);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn borrowed_affine_int4_matmul(
     activations: &[f32],
@@ -6361,55 +6654,21 @@ fn borrowed_affine_int4_matmul(
                     &zp[output_index * zero_point_row_size
                         ..(output_index + 1) * zero_point_row_size]
                 });
-                let mut sum = bias.map_or(0.0, |values| values[output_index]);
-                for block in 0..block_count {
-                    let depth_start = block * block_size;
-                    let valid = k.saturating_sub(depth_start).min(block_size);
-                    let block_values = &packed_row[block * layout.packed_block_size()
-                        ..(block + 1) * layout.packed_block_size()];
-                    let scale = scales.get(output_index * block_count + block);
-                    let zero_point = layout.zero_point(zp_row, block) as f32;
-                    let mut dot;
-                    #[cfg(target_arch = "aarch64")]
-                    if valid == 32 && block_size == 32 {
-                        // SAFETY: AArch64 guarantees NEON, and both slices contain one full block.
-                        dot = unsafe {
-                            affine_int4_block32_dot_neon(
-                                &activation[depth_start..depth_start + 32],
-                                block_values,
-                            )
-                        };
-                        sum += (dot - activation_sums[block] * zero_point) * scale;
-                        continue;
-                    }
-                    #[cfg(target_arch = "x86_64")]
-                    if valid == block_size && valid.is_multiple_of(32) {
-                        // Vectorised int4 unpack + f32 FMA for the x86 borrowed
-                        // path (issue #994). Falls through to the scalar loop
-                        // when the host has no AVX2 (`DotKernel::Scalar`), so
-                        // correctness never depends on the fast path existing.
-                        if let Some(vec_dot) = borrowed_int4_block_dot_x86(
-                            &activation[depth_start..depth_start + valid],
-                            block_values,
-                            dot_kernel,
-                        ) {
-                            sum += (vec_dot - activation_sums[block] * zero_point) * scale;
-                            continue;
-                        }
-                    }
-                    dot = 0.0;
-                    for (byte_index, &byte) in block_values.iter().enumerate() {
-                        let within = byte_index * 2;
-                        if within < valid {
-                            dot += activation[depth_start + within] * (byte & 0x0f) as f32;
-                        }
-                        if within + 1 < valid {
-                            dot += activation[depth_start + within + 1] * (byte >> 4) as f32;
-                        }
-                    }
-                    sum += (dot - activation_sums[block] * zero_point) * scale;
-                }
-                *output = sum;
+                let bias_value = bias.map_or(0.0, |values| values[output_index]);
+                *output = borrowed_int4_output_element(
+                    activation,
+                    &activation_sums,
+                    packed_row,
+                    zp_row,
+                    &scales,
+                    output_index * block_count,
+                    bias_value,
+                    layout,
+                    block_count,
+                    block_size,
+                    k,
+                    dot_kernel,
+                );
             }
         };
         parallel_output_rows(output_row, k, compute);
@@ -9141,6 +9400,85 @@ mod tests {
                         (a - b).abs() <= tolerance,
                         "m={m} k={k} n={n} block={block_size} asym={asymmetric} \
                          index {index}: per-column {a} vs n-blocked {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The structural prefill kernel must be *byte-identical* to the row-serial
+    /// per-column path, not merely close: it only changes the fork-join
+    /// structure and hoists the activation-sum allocation, computing each
+    /// element with the same `borrowed_int4_output_element` reduction (issue
+    /// #1117). Covers single-row (`m == 1`), multi-row, and an odd `m` for
+    /// symmetric and asymmetric int4 and an `N` that is not a multiple of 4.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn prefill_matches_per_column_borrowed_path_bit_identical() {
+        if matches!(selected_dot_kernel(), DotKernel::Scalar) {
+            // No AVX2 on this host; the structural prefill path is never selected.
+            return;
+        }
+        let mut rng: u64 = 0x243F6A8885A308D3;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng >> 40) as f32 / (1u32 << 24) as f32) - 0.5
+        };
+        // `m` values below exercise a single row, several full-strip rows, and
+        // odd row counts so no dimension assumption sneaks in.
+        for &(m, k, n, block_size) in &[
+            (1usize, 96usize, 13usize, 32usize),
+            (5, 128, 8, 32),
+            (6, 64, 7, 32),
+            (8, 256, 16, 128),
+            (3, 96, 5, 32),
+        ] {
+            for &asymmetric in &[false, true] {
+                let weights_nk: Vec<f32> = (0..n * k).map(|_| next()).collect();
+                let activations: Vec<f32> = (0..m * k).map(|_| next()).collect();
+                let (packed, scales, zps, _dequant) =
+                    quantize(&weights_nk, n, k, block_size, asymmetric);
+                let zp_slice = zps.as_deref();
+                let bias: Vec<f32> = (0..n).map(|_| next()).collect();
+
+                let mut expected = vec![0.0f32; m * n];
+                borrowed_affine_int4_matmul(
+                    &activations,
+                    &packed,
+                    BorrowedScales::F32(&scales),
+                    zp_slice,
+                    Some(&bias),
+                    &mut expected,
+                    m,
+                    k,
+                    n,
+                    block_size,
+                    selected_dot_kernel(),
+                );
+
+                let mut got = vec![0.0f32; m * n];
+                borrowed_affine_int4_matmul_prefill(
+                    &activations,
+                    &packed,
+                    BorrowedScales::F32(&scales),
+                    zp_slice,
+                    Some(&bias),
+                    &mut got,
+                    m,
+                    k,
+                    n,
+                    block_size,
+                    selected_dot_kernel(),
+                );
+
+                for (index, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "m={m} k={k} n={n} block={block_size} asym={asymmetric} \
+                         index {index}: per-column {a} vs prefill {b} not bit-identical"
                     );
                 }
             }
@@ -13905,9 +14243,16 @@ mod tests {
 
         // Two distinct activation shapes -> two compiled kernel instances, the
         // exact duplication the shape-keyed kernel cache produces in a real
-        // autoregressive session (prefill `m > 1`, decode `m == 1`).
+        // autoregressive session (prefill `m > 1`, decode `m == 1`). The decode
+        // instance runs *inside* the persistent decode-pool scope, exactly as
+        // `onnx-genai-engine`'s single-token forward does (#1138): that keeps it
+        // on the shared per-worker shard buffer so prefill and decode still
+        // rendezvous on one packed allocation. (An *unscoped* `m == 1` decode —
+        // the ORT plugin path — instead takes the full-width fast path and would
+        // hold its own packed buffer; that is the tradeoff the plugin's
+        // `disable_persistent_decode_pool()` opt-out collapses back to one copy.)
         let prefill = run(3);
-        let decode = run(1);
+        let decode = with_decode_pool_scope(true, || run(1));
 
         let per_copy_predicted =
             mlas_sqnbit_packed_b_cache_bytes(4, block_size, 0, n, k, false, false, false)
@@ -16114,6 +16459,168 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #1138 A/B probe: the *unscoped* int4 M=1 decode GEMV under the three
+    /// per-worker-shard dispatch strategies, at the exact plugin-path shape
+    /// (int4 block-32, K=N=2048, M=1). Reproduces the mechanism the plugin's
+    /// `disable_persistent_decode_pool()` opt-out worked around and shows the
+    /// fix removes the need for it:
+    ///
+    /// * `serial_shards` — the pre-fix path: `W` per-worker shards run one after
+    ///   another, each `multithread=true` (what an unscoped host got with the
+    ///   persistent pool built). This is the slow arm.
+    /// * `parallel_shards` — a *rejected* alternative: the same `W` shards issued
+    ///   in ONE Rayon parallel pass, each `multithread=false`. Measured slower
+    ///   than `full_width` because the per-call Rayon fork-join dominates.
+    /// * `full_width` — **the fix** (and the reference fast path,
+    ///   `ONNX_GENAI_CPU_MM_MLAS_NO_SHARD` / no pool): a single full-width
+    ///   `multithread=true` GEMV that dispatches once to MLAS's own persistent
+    ///   work-stealing pool. This is what unscoped `m == 1` now takes.
+    ///
+    /// `full_width` should land far below both shard strategies. Byte-identity of
+    /// all three outputs is asserted (`max_ulp = 0`). Run with:
+    ///   cargo test -p onnx-runtime-ep-cpu --features mlas --release \
+    ///     unscoped_decode_shard_dispatch_perf -- --ignored --nocapture
+    #[cfg(feature = "mlas")]
+    #[test]
+    #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
+    fn unscoped_decode_shard_dispatch_perf() {
+        use std::time::Instant;
+
+        let (k, n, block_size) = (2048usize, 2048usize, 32usize);
+        let align = MLAS_SQNBIT_DECODE_SHARD_ALIGN;
+        let hw = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(1);
+        // Mirror the persistent-pool default worker count (~half the logical
+        // CPUs) that production shards the weight to.
+        let workers = (hw / 2).max(1);
+
+        let weights_nk = pseudo(n * k, 0.3);
+        let (packed_bytes, scales, _zps, _dq) = quantize(&weights_nk, n, k, block_size, false);
+        let comp = mlas_sys::SQNBitComputeType::Int8;
+
+        let k_blocks = k.div_ceil(block_size);
+        let blob = block_size / 2;
+
+        // Aligned near-even N segmentation, matching `output_segments_aligned`.
+        let units = n / align;
+        let base_units = units / workers;
+        let rem = units % workers;
+        let mut segments: Vec<(usize, usize)> = Vec::with_capacity(workers);
+        let mut start = 0usize;
+        for w in 0..workers {
+            let len = (base_units + usize::from(w < rem)) * align;
+            if len == 0 {
+                continue;
+            }
+            segments.push((start, len));
+            start += len;
+        }
+        assert_eq!(start, n, "segments must tile N exactly");
+
+        let shard_packs: Vec<(usize, usize, mlas_sys::SQNBitPackedB)> = segments
+            .iter()
+            .map(|&(start, len)| {
+                let pb = &packed_bytes[start * k_blocks * blob..(start + len) * k_blocks * blob];
+                let sc = &scales[start * k_blocks..(start + len) * k_blocks];
+                let pack = mlas_sys::SQNBitPackedB::new(len, k, 4, block_size, comp, pb, sc, None)
+                        .expect("MLAS SQNBit int4 shard must pack");
+                (start, len, pack)
+            })
+            .collect();
+        let full_pack =
+            mlas_sys::SQNBitPackedB::new(n, k, 4, block_size, comp, &packed_bytes, &scales, None)
+                .expect("MLAS SQNBit int4 full-width must pack");
+
+        let a = pseudo(k, 0.8);
+
+        struct OutBase(*mut f32);
+        unsafe impl Sync for OutBase {}
+
+        let serial_shards = |out: &mut [f32]| {
+            for &(start, len, ref pack) in &shard_packs {
+                let dst = &mut out[start..start + len];
+                mlas_sys::sqnbit_gemm(pack, 1, &a, None, dst, true);
+            }
+        };
+        let parallel_shards = |out: &mut [f32]| {
+            let base = OutBase(out.as_mut_ptr());
+            let base = &base;
+            shard_packs.par_iter().for_each(|&(start, len, ref pack)| {
+                // SAFETY: shards own disjoint contiguous `[start, start+len)`
+                // column ranges of the single `[1, n]` output.
+                let dst = unsafe { std::slice::from_raw_parts_mut(base.0.add(start), len) };
+                mlas_sys::sqnbit_gemm(pack, 1, &a, None, dst, false);
+            });
+        };
+        let full_width = |out: &mut [f32]| {
+            mlas_sys::sqnbit_gemm(&full_pack, 1, &a, None, out, true);
+        };
+
+        // Byte-identity across all three dispatch strategies.
+        let mut o_serial = vec![0.0f32; n];
+        let mut o_parallel = vec![0.0f32; n];
+        let mut o_full = vec![0.0f32; n];
+        serial_shards(&mut o_serial);
+        parallel_shards(&mut o_parallel);
+        full_width(&mut o_full);
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        assert_eq!(
+            bits(&o_serial),
+            bits(&o_parallel),
+            "parallel-shard dispatch must be byte-identical to the serial-shard loop",
+        );
+        let max_ulp = o_serial
+            .iter()
+            .zip(&o_full)
+            .map(|(a, b)| (a.to_bits() as i64 - b.to_bits() as i64).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        let full_identical = bits(&o_serial) == bits(&o_full);
+        eprintln!(
+            "#1138 full_width vs sharded: byte_identical={full_identical} max_ulp={max_ulp}"
+        );
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(hw)
+            .build()
+            .unwrap();
+        fn bench<F: FnMut(&mut [f32]) + Send>(
+            pool: &rayon::ThreadPool,
+            label: &str,
+            n: usize,
+            k: usize,
+            shards: usize,
+            hw: usize,
+            mut run: F,
+        ) {
+            pool.install(|| {
+                let mut out = vec![0.0f32; n];
+                for _ in 0..50 {
+                        run(&mut out);
+                }
+                let mut samples = [0.0f64; 5];
+                for s in samples.iter_mut() {
+                        let iters = 500u32;
+                        let start = Instant::now();
+                        for _ in 0..iters {
+                            run(&mut out);
+                        }
+                        *s = start.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                }
+                samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                eprintln!(
+                        "#1138 int4 M=1 K={k} N={n} shards={shards} hw={hw}t {label:16}: p50={:.3}ms",
+                        samples[2] / 1000.0,
+                );
+            });
+        }
+        let shards = shard_packs.len();
+        bench(&pool, "serial_shards", n, k, shards, hw, serial_shards);
+        bench(&pool, "parallel_shards", n, k, shards, hw, parallel_shards);
+        bench(&pool, "full_width", n, k, shards, hw, full_width);
     }
 
     /// Focused int4 M=1 GEMV micro-bench at Foundry Qwen3-0.6B block-128 decode

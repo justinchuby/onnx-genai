@@ -6,6 +6,113 @@ use rayon::prelude::*;
 
 use super::{check_arity, to_dense_bytes, write_dense_bytes};
 use crate::strided::numel;
+use std::borrow::Cow;
+
+/// Borrow a tensor's bytes when they are already dense, copy them when they are
+/// not.
+///
+/// `to_dense_bytes` always allocates: it builds a zeroed `Vec` and then
+/// overwrites it, so a contiguous host operand costs an allocation, a
+/// `memset`, a copy and a `free` on every single call. For `A` that is `m * k`
+/// bytes per call -- 256 KiB at a 128x2048 prefill -- and on a busy pool that
+/// is far more expensive than it looks: freeing a fresh multi-page mapping
+/// forces a TLB shootdown to every core the process is running on, so the cost
+/// grows with the thread count. Measured on a 32-vCPU EPYC 9V74, the per-call
+/// `A` copy alone was 13 us at one thread and 136 us at sixteen.
+///
+/// The bytes are only borrowed when the view is host-accessible and
+/// contiguous, which is exactly when `to_dense_bytes` would have produced an
+/// identical copy of them.
+fn dense_bytes<'a>(view: &TensorView<'a>) -> Result<Cow<'a, [u8]>> {
+    if view.device.is_host_accessible() && view.is_contiguous() {
+        view.validate()?;
+        let len = numel(view.shape) * super::elem_size(view.dtype)?;
+        // SAFETY: the executor guarantees the view's backing allocation is live
+        // for `'a` and in bounds (ep-api safety invariant #1); `validate`
+        // accepted the shape/stride pair and `is_contiguous` means those `len`
+        // bytes are consecutive from the byte origin. `u8` has no invalid bit
+        // patterns.
+        let bytes = unsafe { std::slice::from_raw_parts(view.data_ptr::<u8>(), len) };
+        #[cfg(test)]
+        BORROWED_INPUT_CALLS.with(|calls| calls.set(calls.get() + 1));
+        return Ok(Cow::Borrowed(bytes));
+    }
+    to_dense_bytes(view).map(Cow::Owned)
+}
+
+/// Largest accumulator a thread keeps between calls, in bytes.
+///
+/// 32 MiB covers every accumulator up to an 8M-element result -- a 2048x4096
+/// output and everything smaller -- which is the range where the per-call
+/// allocation actually hurts. Anything larger is released rather than parked on
+/// a thread for the life of the process: at that size the GEMM itself dwarfs
+/// the allocation, so retaining it would trade real memory for nothing.
+const MAX_RETAINED_ACCUMULATOR_BYTES: usize = 32 << 20;
+
+thread_local! {
+    /// Per-thread scratch for the `i32` accumulator that the integer GEMM writes
+    /// before the values are requantized down to the output dtype.
+    ///
+    /// The accumulator is `m * n` i32 -- 1 MiB at a 128x2048 prefill -- and MLAS
+    /// first-touches every page of it from every worker thread. Allocating it per
+    /// call therefore buys a fresh mapping, a page fault per page, and on free a
+    /// TLB shootdown to every core the process is running on. Measured on a
+    /// 32-vCPU EPYC 9V74 at K=N=2048, M=128: re-allocating it per call cost
+    /// **301 us** with a 16-thread pool and nothing measurable with one thread,
+    /// which is why this only started to matter once the GEMM itself scaled.
+    ///
+    /// Thread-local rather than shared: `execute` takes `&self` and the executor
+    /// may run the same kernel on several threads at once, so a shared buffer would
+    /// need a lock that serialises exactly the calls this exists to speed up.
+    static ACCUMULATOR: std::cell::RefCell<Vec<i32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only counters proving which output route a call took. Without them a
+    /// test can only check the bytes, which both routes produce identically -- so a
+    /// silent regression to always-staging would pass every correctness test.
+    ///
+    /// Thread-local rather than global: the test harness gives each test its own
+    /// thread, so a count read here is this test's own calls and cannot be
+    /// perturbed by whatever else is running in parallel.
+    static DIRECT_OUTPUT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static STAGED_OUTPUT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Counts the calls where `dense_bytes` handed back a borrow of the caller's
+    /// buffer rather than a private copy. A test that checks the caller's input
+    /// survived a call is only meaningful if the call actually borrowed it, so
+    /// this stops that test passing vacuously.
+    static BORROWED_INPUT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Where a batch's requantized output bytes are written.
+///
+/// A contiguous, host-accessible output view is written **in place**: MLAS
+/// requantizes straight into the caller's tensor, so the kernel neither
+/// allocates a staging buffer, nor zeroes it, nor copies it back. A strided or
+/// non-host view cannot be handed to MLAS at all, so it is staged and
+/// scattered once at the end through `write_dense_bytes`, which is what every
+/// path did before.
+enum OutputSink<'a> {
+    Direct(&'a mut [u8]),
+    Staged(Vec<u8>),
+}
+
+impl OutputSink<'_> {
+    /// The `len` bytes this batch owns, starting at `base` in the result.
+    fn region(&mut self, base: usize, len: usize) -> &mut [u8] {
+        match self {
+            Self::Direct(bytes) => &mut bytes[base..base + len],
+            Self::Staged(bytes) => {
+                // The staged path grows batch by batch exactly as the previous
+                // `Vec` did, so a partially-filled result is byte-identical.
+                bytes.resize(base + len, 0);
+                &mut bytes[base..]
+            }
+        }
+    }
+}
 
 /// Multiply-accumulate count below which the integer accumulation runs on the
 /// calling thread. A rayon fork costs on the order of microseconds; this is the
@@ -351,7 +458,13 @@ impl Kernel for QLinearMatMulKernel {
         #[cfg_attr(not(feature = "mlas"), allow(unused_mut))]
         let (mut a_bytes, mut b_bytes, a, b) = if qgemm.is_some() {
             (
-                to_dense_bytes(&inputs[0])?,
+                // Every MLAS route reads `A` exactly as the caller laid it
+                // out, so a contiguous operand is borrowed rather than copied
+                // per call. The one route that rewrites it -- the sign flip
+                // below -- goes through `Cow::to_mut`, which copies a borrowed
+                // operand first, so the caller's input is never written
+                // through.
+                dense_bytes(&inputs[0])?,
                 if pack_ready {
                     Vec::new()
                 } else {
@@ -362,7 +475,7 @@ impl Kernel for QLinearMatMulKernel {
             )
         } else {
             (
-                Vec::new(),
+                Cow::Borrowed(&[][..]),
                 Vec::new(),
                 read_quantized(&inputs[0])?,
                 read_quantized(&inputs[3])?,
@@ -373,7 +486,7 @@ impl Kernel for QLinearMatMulKernel {
         #[cfg(feature = "mlas")]
         if let Some(plan) = &qgemm {
             if plan.flip_a {
-                flip_sign_domain(&mut a_bytes);
+                flip_sign_domain(a_bytes.to_mut());
             }
             if plan.flip_b {
                 flip_sign_domain(&mut b_bytes);
@@ -388,13 +501,41 @@ impl Kernel for QLinearMatMulKernel {
         #[cfg(not(feature = "mlas"))]
         let packed: Option<&()> = None;
         let (m, k, n) = (geometry.m, geometry.k, geometry.n);
-        let mut output = Vec::with_capacity(geometry.result_len);
+        // Requantizing into the caller's tensor removes a `result_len`
+        // allocation, its zero-fill, and the copy back out of it, per call.
+        let out_dtype = outputs[0].dtype;
+        let direct_output = outputs[0].device.is_host_accessible() && outputs[0].is_contiguous();
+        if direct_output {
+            outputs[0].validate()?;
+        }
+        let mut sink = if direct_output {
+            #[cfg(test)]
+            DIRECT_OUTPUT_CALLS.with(|calls| calls.set(calls.get() + 1));
+            // SAFETY: the executor provides an exclusive, in-bounds output
+            // buffer (ep-api safety invariant #1); `validate` accepted the
+            // shape/stride pair, `is_contiguous` means the `result_len` bytes
+            // are consecutive from the byte origin, and the shape was checked
+            // to equal `geometry.output_shape` above. Both supported output
+            // dtypes are one byte wide, so `result_len` bytes is the whole
+            // tensor.
+            OutputSink::Direct(unsafe {
+                std::slice::from_raw_parts_mut(outputs[0].data_ptr_mut::<u8>(), geometry.result_len)
+            })
+        } else {
+            #[cfg(test)]
+            STAGED_OUTPUT_CALLS.with(|calls| calls.set(calls.get() + 1));
+            OutputSink::Staged(Vec::with_capacity(geometry.result_len))
+        };
         let mut batch_index = vec![0; geometry.batch_shape.len()];
         // Hoisted out of the batch loop: both are re-filled per batch, so a
         // many-batch call allocates once rather than once per batch.
-        let mut products: Vec<i32> = Vec::new();
+        // The accumulator is borrowed from this thread's scratch, so a repeated
+        // shape reuses one already-faulted mapping instead of buying a new one.
+        let mut products: Vec<i32> = ACCUMULATOR.with(|cell| cell.take());
         let mut b_zero_points: Vec<i32> = Vec::new();
         let mut b_scales: Vec<f32> = Vec::new();
+        #[cfg(feature = "mlas")]
+        let mut combined_scales: Vec<f32> = Vec::new();
         for batch in 0..geometry.batch_count {
             let a_batch = geometry.a_batch_offset(&batch_index);
             let b_batch = geometry.b_batch_offset(&batch_index);
@@ -413,10 +554,65 @@ impl Kernel for QLinearMatMulKernel {
             b_scales.clear();
             b_scales.extend((0..n).map(|column| b_quant.at(b_batch, column).0));
 
-            products.clear();
-            products.resize(m * n, 0);
+            // Decided before the accumulator is sized because the two paths
+            // want different buffers: the scalar gemm below accumulates into
+            // `products` and needs it zeroed, while MLAS overwrites every
+            // element it is given (the shim leaves `IsAccumulateMode` false, so
+            // the first `k` block runs in `ZeroMode`).
+            #[cfg(feature = "mlas")]
+            let fused = match &qgemm {
+                Some(_) => fused_scale(&a_quant, a_batch, &b_scales, y_scale, &mut combined_scales),
+                None => None,
+            };
+            #[cfg(not(feature = "mlas"))]
+            let fused: Option<()> = None;
+
+            if fused.is_some() {
+                // Only the length matters here. Growing through `vec![0; len]`
+                // reaches `alloc_zeroed`, which the allocator serves with fresh
+                // zero pages instead of a `memset` at these sizes; re-running
+                // the same shape reuses the buffer untouched.
+                if products.len() != m * n {
+                    products = vec![0i32; m * n];
+                }
+            } else {
+                products.clear();
+                products.resize(m * n, 0);
+            }
 
             if let Some(plan) = &qgemm {
+                // Requantize inside MLAS when the combined scale allows it, so
+                // each output tile is scaled while it is still in cache and the
+                // bytes land in `output` directly. Only a non-finite scale --
+                // which MLAS maps to the output minimum where the scalar loop
+                // maps it to the zero point -- keeps a call off this path.
+                #[cfg(feature = "mlas")]
+                if let Some(scale) = fused {
+                    let region = sink.region(batch * m * n, m * n);
+                    plan.run_requantized(
+                        m,
+                        n,
+                        k,
+                        &a_bytes[a_offset..a_offset + m * k],
+                        match packed {
+                            Some(packed) => mlas_sys::QgemmWeights::Packed(packed),
+                            None => mlas_sys::QgemmWeights::Dense {
+                                bytes: &b_bytes[b_offset..b_offset + k * n],
+                                signed: plan.b_signed,
+                            },
+                        },
+                        &b_zero_points,
+                        scale,
+                        region,
+                        out_dtype == DataType::Int8,
+                        y_zero_point,
+                        &mut products,
+                    )?;
+                    if batch + 1 < geometry.batch_count {
+                        next_index(&geometry.batch_shape, &mut batch_index);
+                    }
+                    continue;
+                }
                 match packed {
                     Some(packed) => plan.run_packed(
                         m,
@@ -445,8 +641,8 @@ impl Kernel for QLinearMatMulKernel {
                     n,
                     y_scale,
                     y_zero_point,
-                    outputs[0].dtype,
-                    &mut output,
+                    out_dtype,
+                    sink.region(batch * m * n, m * n),
                 )?;
                 if batch + 1 < geometry.batch_count {
                     next_index(&geometry.batch_shape, &mut batch_index);
@@ -513,14 +709,24 @@ impl Kernel for QLinearMatMulKernel {
                 n,
                 y_scale,
                 y_zero_point,
-                outputs[0].dtype,
-                &mut output,
+                out_dtype,
+                sink.region(batch * m * n, m * n),
             )?;
             if batch + 1 < geometry.batch_count {
                 next_index(&geometry.batch_shape, &mut batch_index);
             }
         }
-        write_dense_bytes(&mut outputs[0], &output)
+        // Park the accumulator for the next call on this thread. An early
+        // error return skips this and simply drops it, which costs the next
+        // call one allocation and cannot affect a result.
+        if products.capacity() * std::mem::size_of::<i32>() <= MAX_RETAINED_ACCUMULATOR_BYTES {
+            ACCUMULATOR.with(|cell| cell.replace(products));
+        }
+        match sink {
+            // The direct sink already wrote every byte the caller asked for.
+            OutputSink::Direct(_) => Ok(()),
+            OutputSink::Staged(bytes) => write_dense_bytes(&mut outputs[0], &bytes),
+        }
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -830,6 +1036,47 @@ impl QgemmPlan {
         Ok(())
     }
 
+    /// [`run`](Self::run) with the requantization fused into MLAS.
+    ///
+    /// Writes the final bytes into `output` and leaves `products` holding
+    /// unspecified scratch. `products` still has to be `m * n` long -- MLAS
+    /// accumulates there and requantizes in place -- but its prior contents are
+    /// irrelevant.
+    #[allow(clippy::too_many_arguments)]
+    fn run_requantized(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[u8],
+        b: mlas_sys::QgemmWeights<'_>,
+        b_zero_points: &[i32],
+        scale: mlas_sys::QgemmScale<'_>,
+        output: &mut [u8],
+        output_signed: bool,
+        output_zero_point: i32,
+        products: &mut [i32],
+    ) -> Result<()> {
+        self.b_zero_point_bytes(b_zero_points, n)?;
+        let bytes = self.b_zero_point_bytes.borrow();
+        mlas_sys::qgemm_requantize(
+            m,
+            n,
+            k,
+            a,
+            self.a_signed,
+            self.zero_point_a,
+            b,
+            mlas_sys::QgemmZeroPoints::PerColumn(&bytes),
+            scale,
+            output,
+            output_signed,
+            output_zero_point,
+            products,
+        );
+        Ok(())
+    }
+
     /// [`run`](Self::run) against a `B` that was pre-packed once.
     fn run_packed(
         &self,
@@ -913,6 +1160,48 @@ impl QgemmPlan {
 /// `b_scales` is the per-column scale gathered once per batch by the caller;
 /// looking it up per element was a `QuantParams::at` call inside the innermost
 /// loop.
+/// The scale MLAS's fused requantizer needs, or `None` when this call must keep
+/// using the scalar loop.
+///
+/// The fused processor computes `clamp(round(c * scale)) + zero_point` with one
+/// scale per tensor or per column. That covers every call MLAS accepts at all,
+/// because a per-row `a_scale` already keeps a call off the MLAS path -- but
+/// only for a *finite* scale: MLAS clamps the float before rounding, which
+/// agrees with rounding before clamping everywhere except `NaN`. Rather than
+/// change any output byte, a non-finite combined scale is declined here and the
+/// scalar loop, which maps `NaN` to the zero point, runs instead.
+///
+/// `buffer` is reused across batches so a per-column scale is not reallocated
+/// per call.
+#[cfg(feature = "mlas")]
+fn fused_scale<'a>(
+    a_quant: &QuantParams,
+    a_batch: usize,
+    b_scales: &[f32],
+    y_scale: f32,
+    buffer: &'a mut Vec<f32>,
+) -> Option<mlas_sys::QgemmScale<'a>> {
+    if a_quant.per_axis {
+        return None;
+    }
+    let a_scale = a_quant.at(a_batch, 0).0;
+    // A per-tensor `b_scale` was splatted into `b_scales`, so every entry is the
+    // same number: fold it once and let MLAS broadcast.
+    let uniform = b_scales.iter().all(|scale| *scale == b_scales[0]);
+    if uniform {
+        let scale = a_scale * b_scales[0] / y_scale;
+        return scale
+            .is_finite()
+            .then_some(mlas_sys::QgemmScale::PerTensor(scale));
+    }
+    buffer.clear();
+    buffer.extend(b_scales.iter().map(|&b_scale| a_scale * b_scale / y_scale));
+    buffer
+        .iter()
+        .all(|scale| scale.is_finite())
+        .then_some(mlas_sys::QgemmScale::PerColumn(buffer))
+}
+
 fn requantize_rows(
     products: &[i32],
     a_quant: &QuantParams,
@@ -922,7 +1211,7 @@ fn requantize_rows(
     y_scale: f32,
     y_zero_point: i32,
     dtype: DataType,
-    output: &mut Vec<u8>,
+    destination: &mut [u8],
 ) -> Result<()> {
     // Both supported dtypes are one byte wide, so the output length is known.
     // Reject anything else once here rather than per element.
@@ -931,9 +1220,13 @@ fn requantize_rows(
             "QLinearMatMul: unsupported output dtype {dtype:?}"
         )));
     }
-    let base = output.len();
-    output.resize(base + products.len(), 0);
-    let destination = &mut output[base..];
+    if destination.len() != products.len() {
+        return Err(EpError::KernelFailed(format!(
+            "QLinearMatMul: output region of {} bytes cannot hold {} accumulators",
+            destination.len(),
+            products.len()
+        )));
+    }
 
     // `a_scale * b_scale / y_scale` is the same expression for every row when
     // `a_scale` is per tensor, so evaluate it once per column instead of once
@@ -951,8 +1244,14 @@ fn requantize_rows(
     let requantize_row = |row: usize, accumulators: &[i32], bytes: &mut [u8]| {
         let a_scale = a_quant.at(a_batch, row).0;
         let quantize = |accumulated: i32, scale: f32, byte: &mut u8| {
-            let value =
-                (accumulated as f32 * scale).round_ties_even() as i64 + i64::from(y_zero_point);
+            // `f32 as i64` already saturates, but adding the zero point to
+            // `i64::MAX` wraps in release and panics in debug, so a scale large
+            // enough to push the product past `2^63` used to produce the
+            // *opposite* end of the range.  Saturating here also makes this
+            // loop agree with MLAS -- which clamps in `f32`, where there is no
+            // such cliff -- for every finite scale, not just the small ones.
+            let value = ((accumulated as f32 * scale).round_ties_even() as i64)
+                .saturating_add(i64::from(y_zero_point));
             *byte = match dtype {
                 DataType::Int8 => value.clamp(i8::MIN as i64, i8::MAX as i64) as i8 as u8,
                 _ => value.clamp(u8::MIN as i64, u8::MAX as i64) as u8,
@@ -1095,6 +1394,7 @@ fn next_index(shape: &[usize], index: &mut [usize]) {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+    use onnx_runtime_ep_api::{DeviceId, DevicePtrMut};
     use onnx_runtime_ir::compute_contiguous_strides;
 
     fn i8(shape: &[usize], values: &[i8]) -> Owned {
@@ -1152,8 +1452,8 @@ mod tests {
                             * f64::from(input.b_scales[b_quant_index]);
                         product += a * b;
                     }
-                    let quantized = (product / f64::from(input.y_scale)).round_ties_even() as i64
-                        + i64::from(input.y_zero);
+                    let quantized = ((product / f64::from(input.y_scale)).round_ties_even() as i64)
+                        .saturating_add(i64::from(input.y_zero));
                     output.push(match input.output_dtype {
                         DataType::Int8 => quantized.clamp(i8::MIN as i64, i8::MAX as i64),
                         DataType::Uint8 => quantized.clamp(0, u8::MAX as i64),
@@ -1174,6 +1474,163 @@ mod tests {
             .execute(&inputs.map(|input| input.view()), &mut [output.view_mut()])
             .unwrap();
         output
+    }
+
+    /// A contiguous output must be requantized straight into the caller's
+    /// tensor, and a strided one must still be staged and scattered -- with
+    /// byte-identical results either way.
+    ///
+    /// The bytes alone cannot prove this: both routes produce the same answer,
+    /// which is the point. So the route counters are asserted too, otherwise a
+    /// regression that quietly always staged (re-introducing a `result_len`
+    /// allocation, its zero-fill and a copy on every call) would pass.
+    #[test]
+    fn a_contiguous_output_is_written_in_place_and_a_strided_one_is_staged() {
+        let a_values = [10, 14, 7, 20, 3, 11];
+        let a = Owned::u8(&[3, 2], &a_values.map(|value| value as u8));
+        let a_scale = Owned::f32(&[], &[0.5]);
+        let a_zero = Owned::u8(&[], &[8]);
+        let b_values = [3, 9, 5, 1];
+        let b = Owned::u8(&[2, 2], &b_values.map(|value| value as u8));
+        let b_scale = Owned::f32(&[2], &[0.25, 0.5]);
+        let b_zero = Owned::u8(&[2], &[2, 4]);
+        let y_scale = Owned::f32(&[], &[0.125]);
+        let y_zero = Owned::u8(&[], &[100]);
+        let inputs = [
+            &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+        ];
+
+        let before_direct = DIRECT_OUTPUT_CALLS.with(std::cell::Cell::get);
+        let contiguous = execute(inputs, DataType::Uint8, &[3, 2]);
+        assert_eq!(
+            DIRECT_OUTPUT_CALLS.with(std::cell::Cell::get),
+            before_direct + 1,
+            "a contiguous host output must be written in place, not staged"
+        );
+
+        // A column-major output view describes the same 3x2 logical tensor but
+        // cannot be handed to MLAS, so it must take the staging route.
+        let mut strided_bytes = vec![0u8; 6];
+        let shape = [3usize, 2];
+        let strides = [1i64, 3];
+        let before_staged = STAGED_OUTPUT_CALLS.with(std::cell::Cell::get);
+        {
+            let out = TensorMut::new(
+                DevicePtrMut(strided_bytes.as_mut_ptr().cast()),
+                DataType::Uint8,
+                &shape,
+                &strides,
+                DeviceId::cpu(),
+            );
+            QLinearMatMulKernel::default()
+                .execute(&inputs.map(|input| input.view()), &mut [out])
+                .unwrap();
+        }
+        assert_eq!(
+            STAGED_OUTPUT_CALLS.with(std::cell::Cell::get),
+            before_staged + 1,
+            "a strided output must be staged, because MLAS cannot scatter"
+        );
+
+        // Same logical values, transposed layout: element (row, col) of the
+        // strided buffer lives at `row + col * 3`.
+        for row in 0..3 {
+            for col in 0..2 {
+                assert_eq!(
+                    strided_bytes[row + col * 3],
+                    contiguous.bytes[row * 2 + col],
+                    "strided output disagrees with the in-place one at ({row}, {col})"
+                );
+            }
+        }
+    }
+
+    /// Borrowing `A` must never let the kernel write through to the caller's
+    /// input. The sign-flip route is the one place that rewrites `A`'s bytes,
+    /// and it does so through `Cow::to_mut`, which copies a borrowed operand
+    /// before touching it. Replace that with a write to the borrowed slice and
+    /// this test fails.
+    ///
+    /// The borrow counter is asserted too, because the property is only under
+    /// test when the call really did borrow: if `dense_bytes` ever stopped
+    /// borrowing, the input would trivially survive and the test would pass
+    /// while proving nothing.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn the_sign_flip_route_never_writes_through_to_the_callers_input() {
+        // Signed A against unsigned B is the combination that makes a plan flip
+        // one operand's sign domain.
+        let a_values: Vec<i8> = (0..64).map(|i| (i * 5 - 100) as i8).collect();
+        let a = i8(&[8, 8], &a_values);
+        let untouched = a.bytes.clone();
+        let a_scale = Owned::f32(&[], &[0.5]);
+        let a_zero = i8(&[], &[-3]);
+        let b_values: Vec<u8> = (0..64).map(|i| ((i * 11 + 3) % 256) as u8).collect();
+        let b = Owned::u8(&[8, 8], &b_values);
+        let b_scale = Owned::f32(&[], &[0.25]);
+        let b_zero = Owned::u8(&[], &[130]);
+        let y_scale = Owned::f32(&[], &[0.125]);
+        let y_zero = i8(&[], &[-2]);
+        let borrows_before = BORROWED_INPUT_CALLS.with(|calls| calls.get());
+        let _ = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Int8,
+            &[8, 8],
+        );
+        assert_eq!(
+            BORROWED_INPUT_CALLS.with(|calls| calls.get()),
+            borrows_before + 1,
+            "the flip route no longer borrows A, so this test proves nothing"
+        );
+        assert_eq!(
+            a.bytes, untouched,
+            "the kernel mutated the caller's A buffer in place"
+        );
+    }
+
+    /// A batched call writes each batch at its own offset. In place there is no
+    /// running `Vec::len` to lean on, so an off-by-one in the offset arithmetic
+    /// would scribble batches over each other -- which a single-batch test
+    /// cannot see.
+    #[test]
+    fn a_batched_call_lands_every_batch_at_its_own_offset_in_place() {
+        let a_values: Vec<u8> = (0..3 * 2 * 4).map(|i| ((i * 7 + 1) % 251) as u8).collect();
+        let a = Owned::u8(&[3, 2, 4], &a_values);
+        let a_scale = Owned::f32(&[], &[0.5]);
+        let a_zero = Owned::u8(&[], &[8]);
+        let b_values: Vec<u8> = (0..3 * 4 * 5).map(|i| ((i * 13 + 5) % 251) as u8).collect();
+        let b = Owned::u8(&[3, 4, 5], &b_values);
+        let b_scale = Owned::f32(&[], &[0.25]);
+        let b_zero = Owned::u8(&[], &[7]);
+        let y_scale = Owned::f32(&[], &[0.125]);
+        let y_zero = Owned::u8(&[], &[100]);
+        let batched = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Uint8,
+            &[3, 2, 5],
+        );
+
+        // Each batch computed on its own must equal that batch's slice.
+        for batch in 0..3 {
+            let a_slice = Owned::u8(&[2, 4], &a_values[batch * 8..batch * 8 + 8]);
+            let b_slice = Owned::u8(&[4, 5], &b_values[batch * 20..batch * 20 + 20]);
+            let single = execute(
+                [
+                    &a_slice, &a_scale, &a_zero, &b_slice, &b_scale, &b_zero, &y_scale, &y_zero,
+                ],
+                DataType::Uint8,
+                &[2, 5],
+            );
+            assert_eq!(
+                &batched.bytes[batch * 10..batch * 10 + 10],
+                &single.bytes[..],
+                "batch {batch} landed at the wrong offset"
+            );
+        }
     }
 
     fn output_values(output: &Owned) -> Vec<i64> {
@@ -1331,6 +1788,376 @@ mod tests {
         }
         assert_eq!(expected, vec![108, 108, 153, 135, 154, 134, 129, 102]);
         assert_eq!(output_values(&out), expected);
+    }
+
+    /// The fused MLAS requantizer runs per output tile, so a width that is not
+    /// a multiple of its 16-column block exercises the tail path that a
+    /// round-numbered shape would hide. The bytes must still be exactly the
+    /// dequantize/matmul/requantize reference.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn the_fused_requantize_matches_the_reference_on_a_tail_shaped_output() {
+        let (m, k, n) = (3usize, 5usize, 19usize);
+        let a_values: Vec<i32> = (0..m * k).map(|i| (i * 37 % 251) as i32).collect();
+        let b_values: Vec<i32> = (0..k * n).map(|i| (i * 53 % 241) as i32).collect();
+        let a = Owned::u8(
+            &[m, k],
+            &a_values.iter().map(|&v| v as u8).collect::<Vec<_>>(),
+        );
+        let b = Owned::u8(
+            &[k, n],
+            &b_values.iter().map(|&v| v as u8).collect::<Vec<_>>(),
+        );
+        let b_scales: Vec<f32> = (0..n).map(|i| 0.01 * (1.0 + i as f32 * 0.37)).collect();
+        let b_zeros: Vec<i32> = (0..n).map(|i| (i * 11 % 97) as i32).collect();
+        let a_scale = Owned::f32(&[], &[0.03]);
+        let a_zero = Owned::u8(&[], &[128]);
+        let b_scale = Owned::f32(&[n], &b_scales);
+        let b_zero = Owned::u8(&[n], &b_zeros.iter().map(|&v| v as u8).collect::<Vec<_>>());
+        let y_scale = Owned::f32(&[], &[0.5]);
+        let y_zero = Owned::u8(&[], &[100]);
+
+        // This is what routes the call: without a `Some` here the assertion
+        // below would only be re-testing the scalar loop.
+        let quant = QuantParams::load(
+            "a",
+            &a_scale.view(),
+            &a_zero.view(),
+            &[m, k],
+            QuantAxis::Row,
+        )
+        .unwrap();
+        let mut buffer = Vec::new();
+        assert!(
+            matches!(
+                fused_scale(&quant, 0, &b_scales, 0.5, &mut buffer),
+                Some(mlas_sys::QgemmScale::PerColumn(_))
+            ),
+            "this shape must take the fused path or the test proves nothing"
+        );
+
+        let out = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Uint8,
+            &[m, n],
+        );
+        let expected = reference(Reference {
+            a: &a_values,
+            a_shape: &[m, k],
+            a_scales: &[0.03],
+            a_zeros: &[128],
+            b: &b_values,
+            b_shape: &[k, n],
+            b_scales: &b_scales,
+            b_zeros: &b_zeros,
+            y_scale: 0.5,
+            y_zero: 100,
+            output_dtype: DataType::Uint8,
+        });
+        assert_eq!(output_values(&out), expected);
+    }
+
+    /// The per-tensor route is the one an M=1 decode takes, and it is the one
+    /// the split into `PerTensor`/`PerColumn` could silently get wrong, so it
+    /// gets its own bit-exact end-to-end check rather than riding on the
+    /// per-column test.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn the_fused_requantize_matches_the_reference_with_one_scale_for_the_whole_tensor() {
+        let (m, k, n) = (4usize, 6usize, 7usize);
+        let a_values: Vec<i32> = (0..m * k).map(|i| (i * 29 % 253) as i32).collect();
+        let b_values: Vec<i32> = (0..k * n).map(|i| (i * 61 % 239) as i32).collect();
+        let a = Owned::u8(
+            &[m, k],
+            &a_values.iter().map(|&v| v as u8).collect::<Vec<_>>(),
+        );
+        let b = Owned::u8(
+            &[k, n],
+            &b_values.iter().map(|&v| v as u8).collect::<Vec<_>>(),
+        );
+        let a_scale = Owned::f32(&[], &[0.02]);
+        let a_zero = Owned::u8(&[], &[130]);
+        let b_scale = Owned::f32(&[], &[0.03]);
+        let b_zero = Owned::u8(&[], &[120]);
+        let y_scale = Owned::f32(&[], &[0.25]);
+        let y_zero = Owned::u8(&[], &[96]);
+
+        let quant = QuantParams::load(
+            "a",
+            &a_scale.view(),
+            &a_zero.view(),
+            &[m, k],
+            QuantAxis::Row,
+        )
+        .unwrap();
+        let mut buffer = Vec::new();
+        assert!(
+            matches!(
+                fused_scale(&quant, 0, &vec![0.03; n], 0.25, &mut buffer),
+                Some(mlas_sys::QgemmScale::PerTensor(_))
+            ),
+            "this fixture must take the per-tensor fused path or it proves nothing"
+        );
+
+        let out = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Uint8,
+            &[m, n],
+        );
+        let expected = reference(Reference {
+            a: &a_values,
+            a_shape: &[m, k],
+            a_scales: &[0.02],
+            a_zeros: &[130],
+            b: &b_values,
+            b_shape: &[k, n],
+            b_scales: &[0.03],
+            b_zeros: &[120],
+            y_scale: 0.25,
+            y_zero: 96,
+            output_dtype: DataType::Uint8,
+        });
+        assert_eq!(output_values(&out), expected);
+    }
+
+    /// Signed output takes a different MLAS pack step and a different saturating
+    /// narrow, and `i8` is the half of the range the unsigned tests cannot see.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn the_fused_requantize_matches_the_reference_for_signed_output() {
+        let (m, k, n) = (3usize, 5usize, 9usize);
+        let a_values: Vec<i32> = (0..m * k).map(|i| (i * 31 % 251) as i32 - 125).collect();
+        let b_values: Vec<i32> = (0..k * n).map(|i| (i * 47 % 251) as i32 - 125).collect();
+        let a = i8(
+            &[m, k],
+            &a_values.iter().map(|&v| v as i8).collect::<Vec<_>>(),
+        );
+        let b = i8(
+            &[k, n],
+            &b_values.iter().map(|&v| v as i8).collect::<Vec<_>>(),
+        );
+        let b_scales: Vec<f32> = (0..n).map(|i| 0.02 * (1.0 + i as f32 * 0.11)).collect();
+        let b_zeros: Vec<i32> = (0..n).map(|i| (i * 7 % 61) as i32 - 30).collect();
+        let a_scale = Owned::f32(&[], &[0.04]);
+        let a_zero = i8(&[], &[-7]);
+        let b_scale = Owned::f32(&[n], &b_scales);
+        let b_zero = i8(&[n], &b_zeros.iter().map(|&v| v as i8).collect::<Vec<_>>());
+        let y_scale = Owned::f32(&[], &[0.5]);
+        let y_zero = i8(&[], &[-11]);
+
+        let quant = QuantParams::load(
+            "a",
+            &a_scale.view(),
+            &a_zero.view(),
+            &[m, k],
+            QuantAxis::Row,
+        )
+        .unwrap();
+        let mut buffer = Vec::new();
+        assert!(
+            fused_scale(&quant, 0, &b_scales, 0.5, &mut buffer).is_some(),
+            "signed output must reach the fused path"
+        );
+
+        let out = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Int8,
+            &[m, n],
+        );
+        let expected = reference(Reference {
+            a: &a_values,
+            a_shape: &[m, k],
+            a_scales: &[0.04],
+            a_zeros: &[-7],
+            b: &b_values,
+            b_shape: &[k, n],
+            b_scales: &b_scales,
+            b_zeros: &b_zeros,
+            y_scale: 0.5,
+            y_zero: -11,
+            output_dtype: DataType::Int8,
+        });
+        assert_eq!(output_values(&out), expected);
+    }
+
+    /// A *finite* combined scale can still push the product past `i64::MAX`.
+    /// MLAS clamps in `f32`, where there is no such cliff; the scalar loop has
+    /// to saturate to stay bit-identical instead of wrapping to the opposite
+    /// end of the range (and panicking in a debug build on the way).  The
+    /// per-row `a_scale` keeps this on the scalar loop, which is the path with
+    /// the cliff.
+    #[test]
+    fn a_finite_scale_past_the_i64_range_saturates_on_the_scalar_loop() {
+        let a_values = [10, 200, 7, 20];
+        let b_values = [3, 9, 5, 1];
+        let a = Owned::u8(&[2, 2], &a_values.map(|v| v as u8));
+        let b = Owned::u8(&[2, 2], &b_values.map(|v| v as u8));
+        let a_scale = Owned::f32(&[2], &[2.0e8, 2.0e8]);
+        let a_zero = Owned::u8(&[2], &[8, 8]);
+        let b_scale = Owned::f32(&[], &[1.0e8]);
+        let b_zero = Owned::u8(&[], &[2]);
+        let y_scale = Owned::f32(&[], &[1.0]);
+        let y_zero = Owned::u8(&[], &[100]);
+        let combined = 2.0e8f32 * 1.0e8 / 1.0;
+        assert!(
+            combined.is_finite() && (578.0f32 * combined) > 9.3e18,
+            "the fixture must stay finite and still exceed the i64 range"
+        );
+
+        let out = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Uint8,
+            &[2, 2],
+        );
+        let expected = reference(Reference {
+            a: &a_values,
+            a_shape: &[2, 2],
+            a_scales: &[2.0e8, 2.0e8],
+            a_zeros: &[8, 8],
+            b: &b_values,
+            b_shape: &[2, 2],
+            b_scales: &[1.0e8],
+            b_zeros: &[2],
+            y_scale: 1.0,
+            y_zero: 100,
+            output_dtype: DataType::Uint8,
+        });
+        assert_eq!(expected, [255, 0, 255, 0]);
+        assert_eq!(output_values(&out), expected);
+    }
+
+    /// MLAS clamps the float before rounding, which agrees with the scalar loop
+    /// for every finite scale but maps `NaN` to the output minimum where the
+    /// scalar loop maps it to the zero point. Individual scales are already
+    /// validated as finite and positive, but their *product* can still overflow
+    /// to infinity, so the guard is on the combined scale -- and one overflowing
+    /// column has to take the whole call off the fused path, leaving the finite
+    /// columns exactly what the scalar loop produced before this path existed.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn a_non_finite_combined_scale_stays_on_the_scalar_loop() {
+        let a_values = [10, 200, 7, 20];
+        let b_values = [3, 9, 5, 1];
+        let a = Owned::u8(&[2, 2], &a_values.map(|v| v as u8));
+        let b = Owned::u8(&[2, 2], &b_values.map(|v| v as u8));
+        // `3e8 * 3e30` overflows f32 even though each factor is a legal scale
+        // on its own, while the second column stays finite at 0.075 -- so this
+        // also pins down that one bad column takes the *whole* call off the
+        // fused path instead of only its own column.
+        let a_scale = Owned::f32(&[], &[3.0e8]);
+        let a_zero = Owned::u8(&[], &[8]);
+        let b_scales = [3.0e30f32, 0.25];
+        assert!(
+            (3.0e8f32 * b_scales[0]).is_infinite(),
+            "column 0 must overflow"
+        );
+        assert!(
+            (3.0e8f32 * b_scales[1] / 1.0e9).is_finite(),
+            "column 1 must not"
+        );
+        let b_scale = Owned::f32(&[2], &b_scales);
+        let b_zero = Owned::u8(&[2], &[2, 4]);
+        let y_scale = Owned::f32(&[], &[1.0e9]);
+        let y_zero = Owned::u8(&[], &[100]);
+
+        let quant = QuantParams::load(
+            "a",
+            &a_scale.view(),
+            &a_zero.view(),
+            &[2, 2],
+            QuantAxis::Row,
+        )
+        .unwrap();
+        let mut buffer = Vec::new();
+        assert!(
+            fused_scale(&quant, 0, &b_scales, 1.0e9, &mut buffer).is_none(),
+            "an infinite combined scale must be declined"
+        );
+
+        let out = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Uint8,
+            &[2, 2],
+        );
+        let expected = reference(Reference {
+            a: &a_values,
+            a_shape: &[2, 2],
+            a_scales: &[3.0e8],
+            a_zeros: &[8],
+            b: &b_values,
+            b_shape: &[2, 2],
+            b_scales: &b_scales,
+            b_zeros: &[2, 4],
+            y_scale: 1.0e9,
+            y_zero: 100,
+            output_dtype: DataType::Uint8,
+        });
+        // The finite column must still carry real values, or the comparison
+        // would be two saturated columns agreeing about nothing.
+        assert_eq!(expected, [255, 58, 255, 97]);
+        assert_eq!(output_values(&out), expected);
+    }
+
+    /// A per-tensor `b_scale` is splatted across the column vector before it
+    /// reaches the requantizer. Folding it back to one number is what lets MLAS
+    /// broadcast instead of walking an `n`-long array, so the fold has to
+    /// recognise the splat -- and must not mistake a genuinely varying column
+    /// scale for one.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn fused_scale_folds_a_splatted_column_scale_and_keeps_a_varying_one() {
+        let quant = QuantParams {
+            scales: vec![0.5],
+            zero_points: vec![0],
+            axis_len: 1,
+            per_axis: false,
+        };
+        let mut buffer = Vec::new();
+        match fused_scale(&quant, 0, &[0.25, 0.25, 0.25], 0.5, &mut buffer) {
+            Some(mlas_sys::QgemmScale::PerTensor(scale)) => assert_eq!(scale, 0.25),
+            other => panic!(
+                "a splatted column scale must fold to one number, got {other:?}",
+                other = match other {
+                    Some(mlas_sys::QgemmScale::PerColumn(values)) =>
+                        format!("PerColumn({values:?})"),
+                    Some(mlas_sys::QgemmScale::PerTensor(value)) => format!("PerTensor({value})"),
+                    None => "None".to_string(),
+                }
+            ),
+        }
+        let mut buffer = Vec::new();
+        match fused_scale(&quant, 0, &[0.25, 0.5, 0.25], 0.5, &mut buffer) {
+            Some(mlas_sys::QgemmScale::PerColumn(values)) => {
+                assert_eq!(values, [0.25, 0.5, 0.25]);
+            }
+            _ => panic!("a varying column scale must stay per column"),
+        }
+    }
+
+    /// A per-row `a_scale` cannot be expressed as one scale per column, so it
+    /// must never reach the fused path -- the same restriction that keeps it
+    /// off MLAS's integer GEMM at all.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn fused_scale_declines_a_per_row_activation_scale() {
+        let quant = QuantParams {
+            scales: vec![0.5, 0.25],
+            zero_points: vec![0, 0],
+            axis_len: 2,
+            per_axis: true,
+        };
+        let mut buffer = Vec::new();
+        assert!(fused_scale(&quant, 0, &[0.25, 0.25], 0.5, &mut buffer).is_none());
     }
 
     #[test]
@@ -1654,6 +2481,26 @@ mod tests {
         }
     }
 
+    /// Run the kernel into a caller-owned output, so a benchmark can separate
+    /// the kernel's cost from the cost of allocating its result.
+    #[cfg(feature = "mlas")]
+    fn run_into(kernel: &QLinearMatMulKernel, fixture: &PackFixture, output: &mut Owned) {
+        let (a_scale, a_zero) = (Owned::f32(&[], &[0.02]), Owned::u8(&[], &[128]));
+        let (b_scale, b_zero) = (Owned::f32(&[], &[0.01]), Owned::u8(&[], &[127]));
+        let (y_scale, y_zero) = (Owned::f32(&[], &[0.05]), Owned::u8(&[], &[120]));
+        let inputs = [
+            fixture.a.view(),
+            a_scale.view(),
+            a_zero.view(),
+            fixture.b.view(),
+            b_scale.view(),
+            b_zero.view(),
+            y_scale.view(),
+            y_zero.view(),
+        ];
+        kernel.execute(&inputs, &mut [output.view_mut()]).unwrap();
+    }
+
     #[cfg(feature = "mlas")]
     fn run_with(kernel: &QLinearMatMulKernel, fixture: &PackFixture) -> Owned {
         let mut output = Owned::zeros(DataType::Uint8, &[fixture.m, fixture.n]);
@@ -1714,12 +2561,29 @@ mod tests {
     /// `#[ignore]`; run with
     /// `ONNX_GENAI_MLAS_THREADPOOL_THREADS=8 cargo test --release --features mlas \
     ///  qlinear_phase_report -- --ignored --nocapture`.
+    ///
+    /// `NXRT_QL_KN` picks the (square) K=N, `NXRT_QL_M` a comma-separated list
+    /// of M values, so the same report can be pointed at whichever shape a
+    /// model actually runs instead of only the built-in default.
     #[cfg(feature = "mlas")]
     #[test]
     #[ignore = "reports timings; not a pass/fail assertion"]
     fn qlinear_phase_report() {
-        let (k, n) = (3584usize, 3584usize);
-        for m in [1usize, 128, 512] {
+        let kn: usize = std::env::var("NXRT_QL_KN")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3584);
+        let (k, n) = (kn, kn);
+        let ms: Vec<usize> = std::env::var("NXRT_QL_M")
+            .ok()
+            .and_then(|value| {
+                value
+                    .split(',')
+                    .map(|part| part.trim().parse().ok())
+                    .collect::<Option<Vec<usize>>>()
+            })
+            .unwrap_or_else(|| vec![1, 128, 512]);
+        for m in ms {
             let fixture = pack_fixture(m, k, n, 1);
             let mut kernel = QLinearMatMulKernel::default();
             kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
@@ -1732,6 +2596,17 @@ mod tests {
                 let _ = run_with(&kernel, &fixture);
             }
             let whole = start.elapsed() / reps;
+
+            // Same kernel call, but the caller's output tensor is allocated
+            // once and reused. `whole - whole_reused` is what per-call
+            // allocation of the result costs, which is the part a real session
+            // pays through ORT's arena rather than through `Owned::zeros`.
+            let mut reused = Owned::zeros(DataType::Uint8, &[m, n]);
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
+                run_into(&kernel, &fixture, &mut reused);
+            }
+            let whole_reused = start.elapsed() / reps;
 
             let a_bytes = fixture.a.bytes.clone();
             let packed = kernel
@@ -1782,12 +2657,105 @@ mod tests {
             }
             let gemm = start.elapsed() / reps;
 
-            let a_quant = quant_params(false, 128, 1);
-            let b_scales = vec![0.01f32; n];
-            let mut output = Vec::new();
+            // The fused primitive the kernel actually calls since the MLAS
+            // requantize landed, timed on its own. `fused - gemm` is what the
+            // requantize costs *inside* MLAS's threaded region; `whole - fused`
+            // is everything our wrapper adds around it. Without this split the
+            // two are indistinguishable and a wrapper cost looks like a slow
+            // kernel.
+            let mut fused_out = vec![0u8; m * n];
+            let fused_scales = vec![0.001f32; n];
+            for _ in 0..3 {
+                mlas_sys::qgemm_requantize(
+                    m,
+                    n,
+                    k,
+                    &a_bytes,
+                    false,
+                    128,
+                    mlas_sys::QgemmWeights::Packed(packed),
+                    mlas_sys::QgemmZeroPoints::PerColumn(&zeros),
+                    mlas_sys::QgemmScale::PerColumn(&fused_scales),
+                    &mut fused_out,
+                    false,
+                    120,
+                    &mut products,
+                );
+            }
             let start = std::time::Instant::now();
             for _ in 0..reps {
-                output.clear();
+                mlas_sys::qgemm_requantize(
+                    m,
+                    n,
+                    k,
+                    &a_bytes,
+                    false,
+                    128,
+                    mlas_sys::QgemmWeights::Packed(packed),
+                    mlas_sys::QgemmZeroPoints::PerColumn(&zeros),
+                    mlas_sys::QgemmScale::PerColumn(&fused_scales),
+                    &mut fused_out,
+                    false,
+                    120,
+                    &mut products,
+                );
+            }
+            let fused = start.elapsed() / reps;
+
+            // Same call, but A is re-materialised per iteration the way
+            // `execute` re-materialises it through `to_dense_bytes`. If this
+            // costs what the kernel costs, the per-call input copy is the gap.
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
+                let fresh_a = a_bytes.clone();
+                mlas_sys::qgemm_requantize(
+                    m,
+                    n,
+                    k,
+                    &fresh_a,
+                    false,
+                    128,
+                    mlas_sys::QgemmWeights::Packed(packed),
+                    mlas_sys::QgemmZeroPoints::PerColumn(&zeros),
+                    mlas_sys::QgemmScale::PerColumn(&fused_scales),
+                    &mut fused_out,
+                    false,
+                    120,
+                    &mut products,
+                );
+            }
+            let fused_fresh_a = start.elapsed() / reps;
+
+            // Same call, but the i32 accumulator is re-allocated per iteration
+            // the way `execute` re-allocates it. MLAS first-touches every page
+            // of it from every worker thread, so this is the other per-call
+            // buffer whose cost scales with the pool.
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
+                let mut fresh_c = vec![0i32; m * n];
+                mlas_sys::qgemm_requantize(
+                    m,
+                    n,
+                    k,
+                    &a_bytes,
+                    false,
+                    128,
+                    mlas_sys::QgemmWeights::Packed(packed),
+                    mlas_sys::QgemmZeroPoints::PerColumn(&zeros),
+                    mlas_sys::QgemmScale::PerColumn(&fused_scales),
+                    &mut fused_out,
+                    false,
+                    120,
+                    &mut fresh_c,
+                );
+            }
+            let fused_fresh_c = start.elapsed() / reps;
+
+            let a_quant = quant_params(false, 128, 1);
+            let b_scales = vec![0.01f32; n];
+            let mut output = vec![0u8; m * n];
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
                 requantize_rows(
                     &products,
                     &a_quant,
@@ -1824,14 +2792,13 @@ mod tests {
                 .checked_div(stats.parallel_for_calls)
                 .unwrap_or(0);
             println!(
-                "m={m} threads={}: whole={whole:?} gemm={gemm:?} requant={requant:?} \
-                 products-alloc={alloc:?} unattributed={:?} \
+                "m={m} threads={}: whole={whole:?} whole_reused={whole_reused:?} gemm={gemm:?} fused={fused:?} fused_fresh_a={fused_fresh_a:?} fused_fresh_c={fused_fresh_c:?} \
+                 mlas-requant={:?} wrapper={:?} scalar-requant={requant:?} \
+                 products-alloc={alloc:?} \
                  sched_per_call={sched_per_call} serial_fallback={}",
                 stats.pool_threads,
-                whole
-                    .saturating_sub(gemm)
-                    .saturating_sub(requant)
-                    .saturating_sub(alloc),
+                fused.saturating_sub(gemm),
+                whole_reused.saturating_sub(fused),
                 stats.serial_fallback_calls,
             );
         }

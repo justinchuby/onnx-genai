@@ -43,6 +43,28 @@ including where a budget refuses everything else.
 Step 3 is where the value is. The instinct is to skip to "prepack like they do",
 which usually reintroduces the memory cost that made the dependency unattractive.
 
+### The intermediate finding is the deliverable
+
+Three absorptions in a row have found something different from what the brief
+predicted, and in all three the correction was worth more than the patch:
+
+| task | the brief predicted | measurement found |
+|---|---|---|
+| #1104 int4 decode | the win is **layout**, so a transient packing tile would be needed | **register/N-blocking** — no packing of any kind needed |
+| #1116 dense f32 | a **4.4× prefill gap** per #1045 | prefill already at 0.57–1.05× of MLAS; the entire gap is **M=1** |
+| #1126 int4 prefill | the cost is **missing GEMM blocking** | the reliable win is **per-row dispatch and allocation overhead**; blocking is at the noise floor |
+
+The lesson is not "briefs are unreliable" — each hypothesis was specific enough
+to direct a measurement that could refute it, which is exactly what a hypothesis
+is for. "Prefill is slow" would have produced nothing. The lesson is that the
+port should be written **after** the mechanism is known, and that an agent
+reporting "your hypothesis was wrong, here is what I measured instead" is
+delivering the most valuable part of the task, not failing it.
+
+Ask for the mechanism before the kernel. It is cheap to change a plan at that
+point and expensive afterwards — #1104's transient-tile design was abandoned as
+unnecessary rather than built and then found unnecessary.
+
 ## Case study: int4 decode (#1104)
 
 The gap on `MatMulNBits` int4 `accuracy_level=0` decode was **2.68×** before #1021
@@ -83,10 +105,19 @@ not worth building" is a good outcome and is harder to report than a patch.
 | technique | measured with MLAS | status |
 |---|---|---|
 | int4 acc0 decode (#1027) | up to 33× vs the old scalar path | **absorbed** (#1104) |
-| dense f32 MatMul, `MlasGemmBatch` (#1045) | 4.4×, ORT parity | in progress |
+| dense f32 M=1 GEMV (#1045) | claimed 4.4×; **does not reproduce** — see below | **absorbed** (#1116) |
 | QLinearMatMul integer GEMM (#1058, #1086) | 5–6× | not started |
 | acc-4 M=1 decode gating (#1028) | up to 15× | not started; win is specific to hosts *without* VNNI, so it is unmeasurable on an AVX-VNNI box |
 | MLAS pool sees the EP thread budget (#1054) | — | ours already; nothing to absorb |
+
+**On #1045's 4.4×:** it does not reproduce on the RTX 4060 laptop box. Measured
+with the toggle off, `simd/mlas` is 0.57–1.05× at M=128 — we were already at or
+ahead of MLAS at prefill shapes — while M=1 shapes were 1.71–2.82× behind. The
+entire reproducible gap was decode. #1116 closed it by *removing* work: MLAS
+declines to pack B at M==1 because "the data from matrix B is not referenced
+multiple times, so using a local packed buffer is a wasted memory copy", while
+`sgemm_simd` packed unconditionally. Inheriting the 4.4× figure would have sent
+someone optimising prefill, which was not the problem.
 
 Note on #1086's signedness translation: that one is **arithmetic, not MLAS**.
 Because the kernel computes `sum_k (a_k - za)(b_k - zb)`, shifting an operand and
