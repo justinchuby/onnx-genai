@@ -63,7 +63,7 @@ skip = "*-musllinux_*"
 # Also asserts the bundled cdylib is the build this platform asked for: the
 # wheel is expected to carry the MLAS kernels wherever setup.py enables them,
 # and a silently-pure-Rust wheel is an order of magnitude slower on quantized
-# matmul. `_mlas_features()` is the single source of truth for both.
+# matmul. `_mlas_enabled()` is the single source of truth for both.
 test-command = 'python {package}/check_wheel.py'
 
 [tool.cibuildwheel.linux]

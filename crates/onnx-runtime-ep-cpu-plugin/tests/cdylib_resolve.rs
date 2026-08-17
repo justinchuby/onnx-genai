@@ -11,16 +11,19 @@ use std::path::PathBuf;
 /// Cargo package that produces the cdylib these tests load.
 const PACKAGE: &str = "onnx-runtime-ep-cpu-plugin";
 
-/// Features to rebuild the cdylib with, mirroring this test binary's own.
+/// Cargo flags to rebuild the cdylib with, mirroring this test binary's own.
 ///
-/// `cargo test -p onnx-runtime-ep-cpu-plugin --features mlas` compiles the
-/// test with MLAS; without this the rebuild below would replace the cdylib
-/// with a default-feature build and the suite would load the wrong library.
-fn features() -> &'static [&'static str] {
+/// MLAS is a *default* feature, so the flag that needs reproducing is the
+/// opt-out: `cargo test -p onnx-runtime-ep-cpu-plugin --no-default-features`
+/// compiles the test without MLAS, and a rebuild that omitted the flag would
+/// overwrite the cdylib with an MLAS build. The suite would then load a
+/// library the test binary is not a copy of -- and in the direction that
+/// hides a broken opt-out, since the MLAS build passes the numeric tests.
+fn cargo_flags() -> &'static [&'static str] {
     if cfg!(feature = "mlas") {
-        &["mlas"]
-    } else {
         &[]
+    } else {
+        &["--no-default-features"]
     }
 }
 
@@ -30,7 +33,7 @@ fn features() -> &'static [&'static str] {
 ///
 /// Panics with an actionable message when the cdylib cannot be produced.
 pub fn find_cpu_plugin_cdylib() -> PathBuf {
-    onnx_runtime_ort_testkit::find_plugin_cdylib_with_features(PACKAGE, features()).unwrap_or_else(
+    onnx_runtime_ort_testkit::find_plugin_cdylib_with_flags(PACKAGE, cargo_flags()).unwrap_or_else(
         || {
             panic!(
                 "{PACKAGE} cdylib could not be located or built. \
@@ -43,5 +46,5 @@ pub fn find_cpu_plugin_cdylib() -> PathBuf {
 /// Same as [`find_cpu_plugin_cdylib`] but returns `None` for tests that skip
 /// when the cdylib is absent (e.g. e2e tests that also need real ORT).
 pub fn find_cpu_plugin_cdylib_optional() -> Option<PathBuf> {
-    onnx_runtime_ort_testkit::find_plugin_cdylib_with_features(PACKAGE, features())
+    onnx_runtime_ort_testkit::find_plugin_cdylib_with_flags(PACKAGE, cargo_flags())
 }

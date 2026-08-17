@@ -392,26 +392,47 @@ pub fn find_plugin_cdylib(package: &str) -> Option<PathBuf> {
 /// and in the direction that hides regressions. Callers pass the features they
 /// were compiled with so the artifact under test matches the test binary.
 pub fn find_plugin_cdylib_with_features(package: &str, features: &[&str]) -> Option<PathBuf> {
+    let mut flags: Vec<&str> = Vec::new();
+    let joined;
+    if !features.is_empty() {
+        joined = features.join(",");
+        flags.push("--features");
+        flags.push(&joined);
+    }
+    find_plugin_cdylib_with_flags(package, &flags)
+}
+
+/// Same as [`find_plugin_cdylib`], but the rebuild passes `flags` verbatim to
+/// `cargo build`.
+///
+/// [`find_plugin_cdylib_with_features`] can only ever *add* features, which
+/// stopped being sufficient once plugins began enabling things by default: a
+/// test binary compiled with `--no-default-features` has no feature to name, so
+/// the feature-based helper rebuilds the cdylib with defaults and the suite
+/// asserts against a library the test binary is not a copy of. Passing flags
+/// verbatim lets the caller reproduce its own build exactly, in both
+/// directions.
+pub fn find_plugin_cdylib_with_flags(package: &str, flags: &[&str]) -> Option<PathBuf> {
     static CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Keyed by package *and* features because they are different builds, even
+    // Keyed by package *and* flags because they are different builds, even
     // though cargo writes both to the same `target/<profile>/<libname>`. One
     // process asking for two feature sets would therefore rebuild over itself;
     // no caller does (each test binary's feature set is a `cfg!` constant), and
     // this key at least keeps the two answers from being silently conflated.
-    let key = format!("{package}\u{1}{}", features.join(","));
+    let key = format!("{package}\u{1}{}", flags.join("\u{1}"));
     if let Some(cached) = guard.get(&key) {
         return cached.clone();
     }
-    let resolved = resolve_plugin_cdylib(package, features);
+    let resolved = resolve_plugin_cdylib(package, flags);
     guard.insert(key, resolved.clone());
     resolved
 }
 
-fn resolve_plugin_cdylib(package: &str, features: &[&str]) -> Option<PathBuf> {
+fn resolve_plugin_cdylib(package: &str, flags: &[&str]) -> Option<PathBuf> {
     let env_var = plugin_path_env_var(package);
     if let Ok(p) = std::env::var(&env_var) {
         let path = PathBuf::from(p);
@@ -427,9 +448,7 @@ fn resolve_plugin_cdylib(package: &str, features: &[&str]) -> Option<PathBuf> {
             std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()),
         );
         cmd.args(["build", "-p", package]);
-        if !features.is_empty() {
-            cmd.args(["--features", &features.join(",")]);
-        }
+        cmd.args(flags);
         // Build into the same target dir / profile / triple this test binary
         // came from, or the "rebuild" would refresh a cdylib we never load.
         if let Some(layout) = build_layout() {

@@ -44,6 +44,7 @@ onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-std = { workspace = true }
 serde_yaml = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
