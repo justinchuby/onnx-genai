@@ -1219,7 +1219,11 @@ based one commit later on `9b7a45860`/#1104, an int4-decode change that touches 
 these paths). Per-op figures below are single-run means over the 30 runs, not medians
 across trials, and the `Concat` values in particular move by tens of percent between
 runs on this contended host - they are used only to separate "negligible" from
-"dominant", which is a margin they support by two orders of magnitude:
+"dominant", which is a margin they support by two orders of magnitude. The absolute
+end-to-end times in this table come from that instrumented single session and are **not**
+the §20.2 matrix numbers (which are ORT-interleaved medians over 5 trials x 15 runs); the
+two differ by 15-22% on the same graph and thread count, and only the *ratio* of kernel
+to run within this table is being used:
 
 | graph | output bytes | total node execution | of which Transpose | end-to-end native |
 |---|--:|--:|--:|--:|
