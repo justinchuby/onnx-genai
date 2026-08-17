@@ -467,6 +467,37 @@ fn compute_add_broadcast() {
 /// L1 (portable): Verify the two required symbols resolve via `dlsym`/`LoadLibrary`.
 ///
 /// This is the strongest portable assertion: if `dlsym` finds them, they are
+/// The cdylib reports the optional features it was built with.
+///
+/// A packaged cdylib is opaque, and the difference between an MLAS build and a
+/// pure-Rust one is an order of magnitude on the quantized matmul paths. The
+/// wheel's smoke test reads this symbol to prove what it shipped, so the
+/// symbol must exist, must be a valid C string, and must agree with the
+/// feature set this test binary was compiled with -- a stale string that
+/// always says "mlas" would make that proof worthless.
+#[test]
+fn l1_build_features_match_the_compiled_feature_set() {
+    let path = find_cdylib();
+    let lib = unsafe { Library::new(&path) }
+        .unwrap_or_else(|e| panic!("dlopen failed for {}: {e}", path.display()));
+    let features: libloading::Symbol<'_, unsafe extern "C" fn() -> *const std::os::raw::c_char> =
+        unsafe { lib.get(b"nxrt_ep_build_features") }
+            .expect("nxrt_ep_build_features not exported from cdylib");
+    let ptr = unsafe { features() };
+    assert!(!ptr.is_null(), "nxrt_ep_build_features returned null");
+    let reported = unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_str()
+        .expect("build features are ASCII");
+    let expected = if cfg!(feature = "mlas") { "mlas" } else { "" };
+    assert_eq!(
+        reported,
+        expected,
+        "the cdylib at {} reports features {reported:?} but this test binary was \
+         built with {expected:?}",
+        path.display()
+    );
+}
+
 /// genuinely exported and callable on this platform. Works on Linux, macOS, and
 /// Windows without requiring `nm`, `readelf`, or `dumpbin`.
 #[test]
@@ -580,6 +611,7 @@ fn l1_no_symbol_leakage() {
                 && *name != "nxrt_ep_reset_workspace_placement_queries"
                 && *name != "nxrt_ep_constant_weight_inputs"
                 && *name != "nxrt_ep_reset_constant_weight_inputs"
+                && *name != "nxrt_ep_build_features"
                 && !name.starts_with("_Z")
                 && !name.starts_with("__rust")
                 && !name.starts_with("__rdl_")
