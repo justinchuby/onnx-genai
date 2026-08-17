@@ -11,10 +11,18 @@ The cdylib exports the ORT plugin-EP C ABI (``CreateEpFactories`` /
 
 from __future__ import annotations
 
+import ctypes
 import os
+import sys
 from pathlib import Path
 
-__all__ = ["get_library_path", "register", "REGISTRATION_NAME", "__version__"]
+__all__ = [
+    "build_features",
+    "get_library_path",
+    "register",
+    "REGISTRATION_NAME",
+    "__version__",
+]
 
 __version__ = "0.1.0.dev5"
 
@@ -49,6 +57,37 @@ def get_library_path() -> str:
         f"Looked for: {', '.join(_LIB_NAMES)}. This usually means the wheel "
         "was built without the compiled cdylib."
     )
+
+
+def build_features() -> str:
+    """Return the optional build features compiled into the bundled cdylib.
+
+    ``"mlas"`` means the vendored ONNX Runtime MLAS kernels are linked in;
+    an empty string means the pure-Rust fallback paths, which are an order of
+    magnitude slower on the quantized matmul operators. A compiled library
+    otherwise says nothing about how it was built, so this is the only way to
+    tell an installed wheel apart from a fallback build.
+
+    Raises:
+        FileNotFoundError: if the shared library was not packaged.
+        OSError: if the library cannot be loaded.
+        AttributeError: if the bundled library predates this export.
+    """
+    handle = ctypes.CDLL(get_library_path())
+    try:
+        entry = handle.nxrt_ep_build_features
+        entry.restype = ctypes.c_char_p
+        return (entry() or b"").decode()
+    finally:
+        # This query must not leave the library loaded: on Windows that would
+        # lock the file for the rest of the process.
+        try:
+            if sys.platform == "win32":
+                ctypes.windll.kernel32.FreeLibrary(ctypes.c_void_p(handle._handle))
+            else:
+                ctypes.CDLL(None).dlclose(ctypes.c_void_p(handle._handle))
+        except Exception:  # pragma: no cover - the value was already read
+            pass
 
 
 def register(session_options=None, registration_name: str = REGISTRATION_NAME):
