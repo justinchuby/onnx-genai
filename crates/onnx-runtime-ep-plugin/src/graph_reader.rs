@@ -22,6 +22,21 @@ pub struct OutboundGraphReader {
     /// Owned copies of small int64 initializer tensors, keyed by value name.
     /// Used to resolve opset-13 Unsqueeze/Squeeze axes from constant inputs.
     initializer_int64: HashMap<String, Vec<i64>>,
+    /// Names of every **constant** initializer in this graph, whatever its
+    /// dtype.
+    ///
+    /// ORT hands a fused node's subgraph over with its initializers listed as
+    /// *graph inputs* of that subgraph, so `is_graph_input` cannot distinguish
+    /// a weight from an activation at Compile time. This set can.
+    ///
+    /// `Graph_GetInitializers` alone is not enough: its own documentation says
+    /// it "includes constant and non-constant initializers", and from ONNX IR
+    /// version 4 an initializer that is also declared as a graph input is only
+    /// a *default* — the caller may replace it at every `Run`. Caching a
+    /// prepack of one of those would return the default value's answer forever.
+    /// Membership here therefore also requires
+    /// `ValueInfo_IsConstantInitializer`.
+    constant_initializer_names: HashSet<String>,
     /// Out-of-band set of ValueIds that represent absent optional output slots.
     /// This replaces the previous in-band string sentinel (`__absent_output_*`)
     /// which was forgeable from model content. ValueIds are graph-internal
@@ -154,6 +169,8 @@ impl OutboundGraphReader {
         // Read initializers and copy small int64 tensors into owned data.
         let initializer_int64 =
             unsafe { Self::read_initializers_int64(api, graph_ptr).unwrap_or_default() };
+        let constant_initializer_names =
+            unsafe { Self::read_constant_initializer_names(api, graph_ptr).unwrap_or_default() };
 
         let mut absent_outputs: HashSet<ValueId> = HashSet::new();
 
@@ -261,6 +278,7 @@ impl OutboundGraphReader {
             ort_index_to_node_id,
             ort_node_ptrs: ort_nodes,
             initializer_int64,
+            constant_initializer_names,
             absent_outputs,
         })
     }
@@ -275,6 +293,17 @@ impl OutboundGraphReader {
     /// reader at graph construction time.
     pub fn absent_outputs(&self) -> &HashSet<ValueId> {
         &self.absent_outputs
+    }
+
+    /// Names of the graph's **constant** initializers, i.e. the values ORT
+    /// keeps fixed for the whole session.
+    ///
+    /// Deliberately not "every initializer": an IR>=4 initializer that also
+    /// appears as a graph input is only a default the caller may replace on
+    /// any `Run`, and is excluded. Anything keyed on this set may assume the
+    /// buffer never changes.
+    pub fn constant_initializer_names(&self) -> &HashSet<String> {
+        &self.constant_initializer_names
     }
 
     /// Access the owned int64 initializer data (copied from ORT during construction).
@@ -748,6 +777,72 @@ impl OutboundGraphReader {
     }
 
     // ─── Initializer reading ────────────────────────────────────────────
+
+    /// Read the names of every **constant** initializer, of any dtype, without
+    /// touching the tensor data.
+    ///
+    /// `read_initializers_int64` deliberately copies only small int64 tensors,
+    /// because it exists to resolve constant axes. Constant-weight detection
+    /// needs the opposite: every initializer, including a 1 GB `MatMulNBits`
+    /// `B`, and none of the bytes.
+    ///
+    /// Non-constant initializers — IR>=4 defaults for a matching graph input,
+    /// which the caller may override on any `Run` — are excluded. If ORT
+    /// cannot answer whether an initializer is constant, it is treated as
+    /// non-constant: the cost of a false negative is a repeated prepack, the
+    /// cost of a false positive is a wrong answer.
+    unsafe fn read_constant_initializer_names(
+        api: *const ort::OrtApi,
+        graph: *const ort::OrtGraph,
+    ) -> Result<HashSet<String>, String> {
+        let get_num = unsafe { (*api).Graph_GetNumInitializers }
+            .ok_or("OrtApi.Graph_GetNumInitializers is null")?;
+        let mut num_init = 0usize;
+        let status = unsafe { get_num(graph, &mut num_init) };
+        Self::check(status)?;
+        if num_init == 0 {
+            return Ok(HashSet::new());
+        }
+
+        let get_inits = unsafe { (*api).Graph_GetInitializers }
+            .ok_or("OrtApi.Graph_GetInitializers is null")?;
+        let mut init_infos: Vec<*const ort::OrtValueInfo> = vec![ptr::null(); num_init];
+        let status = unsafe { get_inits(graph, init_infos.as_mut_ptr(), num_init) };
+        Self::check(status)?;
+
+        let get_name =
+            unsafe { (*api).GetValueInfoName }.ok_or("OrtApi.GetValueInfoName is null")?;
+        let is_constant = unsafe { (*api).ValueInfo_IsConstantInitializer }
+            .ok_or("OrtApi.ValueInfo_IsConstantInitializer is null")?;
+        let mut names = HashSet::with_capacity(num_init);
+        for &info in &init_infos {
+            if info.is_null() {
+                continue;
+            }
+            let mut constant = false;
+            let status = unsafe { is_constant(info, &mut constant) };
+            if !status.is_null() {
+                Self::check(status).ok();
+                continue;
+            }
+            if !constant {
+                continue;
+            }
+            let mut name_ptr: *const std::ffi::c_char = ptr::null();
+            let status = unsafe { get_name(info, &mut name_ptr) };
+            if !status.is_null() || name_ptr.is_null() {
+                Self::check(status).ok();
+                continue;
+            }
+            let name = unsafe { CStr::from_ptr(name_ptr) }
+                .to_string_lossy()
+                .into_owned();
+            if !name.is_empty() {
+                names.insert(name);
+            }
+        }
+        Ok(names)
+    }
 
     /// Read graph initializers and extract small int64 tensors as owned data.
     /// This copies the data during the callback frame; no ORT pointers are cached.
