@@ -298,9 +298,16 @@ fn par_chunk_len(len: usize, threads: usize) -> Option<usize> {
 /// opposite: it is already spinning, we cannot ask ORT how many intra-op
 /// threads it was given, and `TrySimpleParallelFor` claims indices
 /// dynamically. So we cut by *size* rather than by thread count and let the
-/// host decide how many of its threads to point at the result — which also
-/// makes the split independent of the machine, so the chunk boundaries (and
-/// therefore the bits) do not move when the session is reconfigured.
+/// host decide how many of its threads to point at the result.
+///
+/// Cutting by size rather than by pool width is also a **correctness**
+/// property, not only a scheduling one: the chunk boundaries — and therefore
+/// the exact bit pattern of the output — depend only on `len`, never on how
+/// many intra-op threads the session happens to have. The same tensor produces
+/// the same bits whether it is run at `intra_op = 1` or `16`, so a result can
+/// never move when the session is reconfigured. Had we cut by pool width (as
+/// the rayon path does), reducing `intra_op` would re-chunk the slice and
+/// perturb the last-lane rounding of the split boundaries.
 ///
 /// [`HOST_MIN_CHUNK`] is the floor, so a chunk is never too short to be worth
 /// dispatching or to stay on the vector path; this cap is the other end, and
@@ -4537,3 +4544,375 @@ mod host_pool_split {
         }
     }
 }
+
+/// Interleaved three-arm micro-measurement for the host-pool split.
+///
+/// This is the arm that decides PR #1143: everything measured before compared
+/// *our rayon split against staying serial*, and serial won every row. Nothing
+/// showed that dispatching the split onto the **host's** pool — the change this
+/// PR actually makes — beats serial. This harness runs all three arms in one
+/// process, interleaved per rep, so between-arm drift on a shared box cannot
+/// flip the conclusion.
+///
+/// # Why a stand-in pool, and why it is trustworthy
+///
+/// A real ORT session cannot switch arms within one process — its rayon width
+/// is a process global and its host install is a code path — so the three arms
+/// are driven directly against the real `simd_activations` code paths. The one
+/// thing that has to be reproduced faithfully is *why* our rayon split loses
+/// under an ORT session: ORT's intra-op pool **spins**, so a second (rayon)
+/// pool alongside it oversubscribes the cores. The stand-in models exactly
+/// that — a persistent pool of workers that spin while idle (as ORT's do) and
+/// claim indices dynamically when dispatched (`num_batch = 0` semantics) — and
+/// it latches [`host_parallel::HOST_HELPED`] the honest way, by having a worker
+/// (not the dispatcher) run one of the chunks, so `prefer_host` reaches its
+/// steady state through the real mechanism rather than by fiat.
+///
+/// The `rayon split` arm is therefore a **built-in control**: its result is
+/// already known from the PR's nine-row table (serial wins at `intra_op = 16`).
+/// If this harness reproduces `rayon < serial`, the model is validated and its
+/// `host-pool` number can be trusted. If it does not, the run is unusable and
+/// we know it before drawing a conclusion.
+///
+/// Ignored by the normal gate; run with:
+/// `EP_BENCH=1 cargo test --release -p onnx-runtime-ep-cpu --lib three_arm_bench -- --nocapture --ignored --test-threads=1`
+#[cfg(test)]
+mod three_arm_bench {
+    use super::*;
+    use onnx_runtime_ep_api::HostParallel;
+    use onnx_runtime_ep_api::host_parallel;
+    use std::ffi::c_void;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// State shared between the dispatcher and the stand-in pool's workers.
+    ///
+    /// A dispatch publishes the body (as its two raw fat-pointer words) and the
+    /// index count, then bumps `generation`; workers pick the new generation up
+    /// and claim indices off `cursor` until it is drained, recording progress
+    /// in `done`. Everything is lock-free so idle workers can *spin*, which is
+    /// the property that makes a coexisting rayon pool oversubscribe.
+    struct Shared {
+        generation: AtomicUsize,
+        total: AtomicUsize,
+        cursor: AtomicUsize,
+        done: AtomicUsize,
+        body_data: AtomicUsize,
+        body_vtable: AtomicUsize,
+        stop: AtomicBool,
+        /// The probe cell `prefer_host` reads: starts at zero (opening burst)
+        /// and reaches `HOST_HELPED` the first time a worker runs a chunk.
+        probe: AtomicU32,
+        /// Set by a worker (never the dispatcher) when it runs a chunk, so the
+        /// dispatcher can latch the probe cell only on real positive evidence.
+        worker_helped: AtomicBool,
+    }
+
+    impl Shared {
+        fn new() -> Self {
+            Self {
+                generation: AtomicUsize::new(0),
+                total: AtomicUsize::new(0),
+                cursor: AtomicUsize::new(0),
+                done: AtomicUsize::new(0),
+                body_data: AtomicUsize::new(0),
+                body_vtable: AtomicUsize::new(0),
+                stop: AtomicBool::new(false),
+                probe: AtomicU32::new(0),
+                worker_helped: AtomicBool::new(false),
+            }
+        }
+
+        /// Claims and runs indices off `cursor` for the current generation.
+        ///
+        /// Shared by the workers and the calling thread — ORT's own
+        /// `ParallelFor` runs tasks on the caller too, so the calling thread is
+        /// one of the `intra_op` threads, not a spectator. A worker flags
+        /// `worker_helped` so the dispatcher can latch the probe cell.
+        ///
+        /// # Safety
+        ///
+        /// The published body pointer must still be valid, which the blocking
+        /// dispatch guarantees for its whole duration.
+        unsafe fn drain(&self, total: usize, is_worker: bool) {
+            let data = self.body_data.load(Ordering::Relaxed);
+            let vtable = self.body_vtable.load(Ordering::Relaxed);
+            // SAFETY: `data`/`vtable` are the two words of a `&(dyn Fn(usize) +
+            // Sync)` published under the `generation` release/acquire, and the
+            // referent outlives the dispatch.
+            let body: *const (dyn Fn(usize) + Sync) =
+                unsafe { core::mem::transmute([data, vtable]) };
+            let body = unsafe { &*body };
+            let mut ran = false;
+            loop {
+                let index = self.cursor.fetch_add(1, Ordering::Relaxed);
+                if index >= total {
+                    break;
+                }
+                body(index);
+                ran = true;
+                self.done.fetch_add(1, Ordering::Relaxed);
+            }
+            if is_worker && ran {
+                self.worker_helped.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// A persistent pool of spinning workers standing in for ORT's intra-op
+    /// pool. Sized so that `workers + 1` (the calling thread) equals the
+    /// modelled `intra_op_num_threads`.
+    struct SpinPool {
+        shared: Arc<Shared>,
+        handles: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl SpinPool {
+        fn new(workers: usize) -> Self {
+            let shared = Arc::new(Shared::new());
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                let shared = Arc::clone(&shared);
+                handles.push(std::thread::spawn(move || {
+                    let mut seen = 0usize;
+                    loop {
+                        if shared.stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let g = shared.generation.load(Ordering::Acquire);
+                        if g != seen {
+                            seen = g;
+                            let total = shared.total.load(Ordering::Relaxed);
+                            // SAFETY: the dispatch that bumped `generation` is
+                            // blocked until `done == total`, so the body it
+                            // published is alive for this whole drain.
+                            unsafe { shared.drain(total, true) };
+                        } else {
+                            // Idle: burn the core, exactly as ORT's workers do
+                            // between parallel regions. This is what makes the
+                            // rayon arm oversubscribe.
+                            std::hint::spin_loop();
+                        }
+                    }
+                }));
+            }
+            Self { shared, handles }
+        }
+
+        /// The `HostParallel` handle our kernels see.
+        fn handle(&self) -> HostParallel {
+            // SAFETY: `spin_dispatch` reads the host pointer back as
+            // `*const Shared`, and the probe pointer is the cell inside the same
+            // `Arc`. The `Arc` in `self` keeps both alive for as long as the
+            // handle is installed (the handle never escapes this struct).
+            unsafe {
+                HostParallel::new(
+                    Arc::as_ptr(&self.shared).cast::<c_void>().cast_mut(),
+                    spin_dispatch,
+                    core::ptr::from_ref(&self.shared.probe),
+                )
+            }
+        }
+    }
+
+    impl Drop for SpinPool {
+        fn drop(&mut self) {
+            self.shared.stop.store(true, Ordering::Relaxed);
+            for h in self.handles.drain(..) {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Publishes one dispatch and drives it to completion on the pool + caller.
+    ///
+    /// # Safety
+    ///
+    /// `host` must be the `*const Shared` produced by [`SpinPool::handle`].
+    unsafe fn spin_dispatch(host: *mut c_void, total: usize, body: &(dyn Fn(usize) + Sync)) {
+        let shared = unsafe { &*host.cast::<Shared>() };
+        let raw = body as *const (dyn Fn(usize) + Sync);
+        let [data, vtable]: [usize; 2] = unsafe { core::mem::transmute(raw) };
+        shared.worker_helped.store(false, Ordering::Relaxed);
+        shared.total.store(total, Ordering::Relaxed);
+        shared.cursor.store(0, Ordering::Relaxed);
+        shared.done.store(0, Ordering::Relaxed);
+        shared.body_data.store(data, Ordering::Relaxed);
+        shared.body_vtable.store(vtable, Ordering::Relaxed);
+        // Release the body/total stores to the workers, then help drain.
+        shared.generation.fetch_add(1, Ordering::Release);
+        // SAFETY: we published the body above and block below until every index
+        // is done, so it stays valid for the whole call.
+        unsafe { shared.drain(total, false) };
+        while shared.done.load(Ordering::Acquire) < total {
+            std::hint::spin_loop();
+        }
+        // Latch the probe the honest way: only if a worker (not this calling
+        // thread) actually ran a chunk. A pool with no workers can never set
+        // this, which is exactly the fact `prefer_host` is trying to learn.
+        if shared.worker_helped.load(Ordering::Relaxed) {
+            shared
+                .probe
+                .store(host_parallel::HOST_HELPED, Ordering::Relaxed);
+        }
+    }
+
+    /// A reproducible non-degenerate input in a range that exercises every
+    /// branch of the activation polynomials.
+    fn probe(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| (i as f32 / 977.0).sin() * 9.0 + (i % 13) as f32 * 1e-6 - 2.0)
+            .collect()
+    }
+
+    fn pct(sorted: &[Duration], num: usize, den: usize) -> Duration {
+        sorted[(sorted.len() * num / den).min(sorted.len() - 1)]
+    }
+
+    fn us(d: Duration) -> f64 {
+        d.as_secs_f64() * 1e6
+    }
+
+    type Kernel = fn(&[f32], &mut [f32]);
+
+    fn kernels() -> [(&'static str, Kernel); 2] {
+        [
+            ("Sqrt", sqrt_f32_slice as Kernel),
+            ("Gelu", erf_gelu_f32_slice as Kernel),
+        ]
+    }
+
+    /// The three arms at `intra_op = 16`, interleaved per rep.
+    #[test]
+    #[ignore = "measurement harness; run explicitly with EP_BENCH=1"]
+    fn three_arm_intra_op_16() {
+        if std::env::var("EP_BENCH").is_err() {
+            return;
+        }
+        const N: usize = 1 << 20; // 1 Mi f32
+        const REPS: usize = 201;
+        const WARMUP: usize = 25;
+        // The modelled intra-op width. Defaults to this box's physical core
+        // count (14) rather than the spec's 16, because the stand-in's spinning
+        // workers are *real* threads: on a 14-core box, 15 spinners + the caller
+        // already oversubscribe, which starves the serial baseline before the
+        // rayon arm even runs. Matching the core count gives every arm a clean
+        // core and keeps the rayon arm the only one that oversubscribes.
+        let intra_op: usize = std::env::var("EP_INTRA_OP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(14);
+
+        // (intra_op - 1) spinning workers + the calling thread == intra_op threads.
+        let pool = SpinPool::new(intra_op - 1);
+        let host = pool.handle();
+        let rayon_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(intra_op)
+            .build()
+            .expect("rayon pool");
+
+        let x = probe(N);
+        let mut out = vec![0.0f32; N];
+
+        println!("\n=== three-arm, intra_op = {intra_op}, N = 1 Mi f32, p50 us (p10..p90) ===");
+        println!(
+            "host stand-in: {} spinning workers + caller; rayon: {intra_op} threads",
+            intra_op - 1
+        );
+        for (name, kernel) in kernels() {
+            // Interleave the arms within one process: each rep samples all
+            // three back to back, so a busy neighbour hits every arm equally.
+            let arms = ["serial", "rayon split", "host-pool split"];
+            let mut samples: [Vec<Duration>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            for _ in 0..WARMUP + REPS {
+                let mut run_arm = |arm: usize| {
+                    let t = Instant::now();
+                    match arm {
+                        0 => serial_scope(|| kernel(&x, &mut out)),
+                        1 => rayon_pool.install(|| kernel(&x, &mut out)),
+                        _ => host_parallel::scope(host, || kernel(&x, &mut out)),
+                    }
+                    t.elapsed()
+                };
+                for (arm, bucket) in samples.iter_mut().enumerate() {
+                    let d = run_arm(arm);
+                    bucket.push(d);
+                }
+            }
+            // The host arm must have latched, or its numbers are the rayon
+            // fall-through, not the host path.
+            assert!(
+                host.helped(),
+                "{name}: the stand-in host was never seen to help; numbers invalid"
+            );
+            print!("{name:>5}: ");
+            let mut p50s = [0.0f64; 3];
+            for (i, arm) in arms.iter().enumerate() {
+                let s = &mut samples[i];
+                s.drain(..WARMUP);
+                s.sort_unstable();
+                p50s[i] = us(pct(s, 1, 2));
+                print!(
+                    "{arm} {:.0} ({:.0}..{:.0})  ",
+                    us(pct(s, 1, 2)),
+                    us(pct(s, 1, 10)),
+                    us(pct(s, 9, 10))
+                );
+            }
+            println!();
+            println!(
+                "       -> rayon/serial {:.2}x  host/serial {:.2}x  (control: rayon must be > 1x)",
+                p50s[1] / p50s[0],
+                p50s[2] / p50s[0]
+            );
+        }
+    }
+
+    /// The no-host fall-through on a free machine: rayon split must keep its
+    /// large win over serial at `intra_op = 1`. No stand-in pool, so nothing
+    /// spins and the machine is the native executor's to use.
+    #[test]
+    #[ignore = "measurement harness; run explicitly with EP_BENCH=1"]
+    fn no_host_fall_through_intra_op_1() {
+        if std::env::var("EP_BENCH").is_err() {
+            return;
+        }
+        const REPS: usize = 151;
+        const WARMUP: usize = 20;
+        println!("\n=== no-host fall-through, free machine, p50 us (p10..p90) ===");
+        for n_label in ["1 Mi", "4 Mi"] {
+            let n = if n_label == "1 Mi" { 1 << 20 } else { 1 << 22 };
+            let x = probe(n);
+            let mut out = vec![0.0f32; n];
+            for (name, kernel) in kernels() {
+                let mut ser = Vec::with_capacity(REPS);
+                let mut par = Vec::with_capacity(REPS);
+                for r in 0..WARMUP + REPS {
+                    let t = Instant::now();
+                    serial_scope(|| kernel(&x, &mut out));
+                    let ds = t.elapsed();
+                    let t = Instant::now();
+                    // No host installed and not inside rayon: run_chunked takes
+                    // the rayon fall-through on the global pool.
+                    kernel(&x, &mut out);
+                    let dp = t.elapsed();
+                    if r >= WARMUP {
+                        ser.push(ds);
+                        par.push(dp);
+                    }
+                }
+                ser.sort_unstable();
+                par.sort_unstable();
+                let (s, prl) = (pct(&ser, 1, 2), pct(&par, 1, 2));
+                println!(
+                    "{n_label} {name:>5}: serial {:.0}  rayon {:.0}  -> {:.2}x faster",
+                    us(s),
+                    us(prl),
+                    us(s) / us(prl)
+                );
+            }
+        }
+    }
+}
+
