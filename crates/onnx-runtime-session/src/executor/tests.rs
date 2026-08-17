@@ -6200,3 +6200,86 @@ fn prepare_workspace_exact_resolution_is_unchanged() {
     assert_eq!(resolved, PlannedInputShape::Exact(vec![1, 12, 8]));
     assert_eq!(resolved.dims(), &[1, 12, 8]);
 }
+
+// DeepSeek-V2-Lite's MoE gate flattens `[batch, sequence, hidden]` through
+// `Reshape([-1, hidden]) -> Cast -> MatMul`. The loader shape for the flattened
+// value is a derived symbol (`batch * sequence`) that is not directly bound as a
+// graph input, but the producer chain is statically shape-deterministic for the
+// current run. Prepare-only planning must recover that exact runtime extent
+// instead of falling back to a huge max-sequence reservation or rejecting it as
+// data-dependent.
+#[test]
+fn prepare_workspace_resolves_reshape_flatten_chain_exactly() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let batch = graph.create_symbol(Some("batch".into()));
+    let seq = graph.create_symbol(Some("sequence_len".into()));
+    let flat = graph.create_symbol(Some("batch_times_sequence".into()));
+    let x = graph.create_named_value(
+        "hidden",
+        DataType::Float32,
+        vec![Dim::Symbolic(batch), Dim::Symbolic(seq), Dim::Static(2048)],
+    );
+    graph.add_input(x);
+    let shape = graph.create_named_value("reshape_shape", DataType::Int64, static_shape([2]));
+    let mut constant = Node::new(NodeId(0), "Constant", vec![], vec![shape]);
+    constant
+        .attributes
+        .insert("value_ints".into(), Attribute::Ints(vec![-1, 2048]));
+    graph.insert_node(constant);
+    let reshaped = graph.create_named_value(
+        "v_model.layers.1.mlp.moe.Reshape_78",
+        DataType::Float32,
+        vec![Dim::Symbolic(flat), Dim::Static(2048)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Reshape",
+        vec![Some(x), Some(shape)],
+        vec![reshaped],
+    ));
+    let cast = graph.create_named_value(
+        "v_model.layers.1.mlp.moe.Cast_79",
+        DataType::Float32,
+        vec![Dim::Symbolic(flat), Dim::Static(2048)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Cast",
+        vec![Some(reshaped)],
+        vec![cast],
+    ));
+    let weight =
+        graph.create_named_value("gate.weight", DataType::Float32, static_shape([2048, 64]));
+    graph.add_input(weight);
+    let out = graph.create_named_value(
+        "gate",
+        DataType::Float32,
+        vec![Dim::Symbolic(flat), Dim::Static(64)],
+    );
+    graph.add_output(out);
+    let matmul = Node::new(
+        NodeId(3),
+        "MatMul",
+        vec![Some(cast), Some(weight)],
+        vec![out],
+    );
+    graph.insert_node(matmul.clone());
+
+    let mut exec = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+    exec.value_shapes
+        .insert(cast, exec.graph.value(cast).shape.clone());
+    let mut symbols = HashMap::new();
+    symbols.insert(batch, 1);
+    symbols.insert(seq, 5);
+
+    let resolved = exec
+        .resolve_planned_workspace_input_shape(cast, &symbols, NodeId(3), &matmul, 0)
+        .unwrap();
+    assert_eq!(resolved, PlannedInputShape::Exact(vec![5, 2048]));
+}
