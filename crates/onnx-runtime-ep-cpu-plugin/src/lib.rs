@@ -32,6 +32,10 @@ fn build_kernel_registry_entries() -> Vec<KernelRegistryEntry> {
                 // still match a model at opset 21).
                 end_version: i32::MAX,
                 supported_dtypes: d.supported_dtypes,
+                input_dtype_constraints:
+                    onnx_runtime_ep_cpu::kernels::input_dtype_constraints_for_op(
+                        &d.op_type, &d.domain,
+                    ),
             }
         })
         .collect()
@@ -154,6 +158,21 @@ pub unsafe extern "C" fn ReleaseEpFactory(
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_ep_compiled_node_count() -> usize {
     onnx_runtime_ep_plugin::ep::compiled_node_count()
+}
+
+/// Number of node inputs this EP reported to its kernels as session-lifetime
+/// constants. Read through `dlopen` by the plugin E2E suite to prove weights
+/// are recognised as weights on the ORT plugin path, where ORT presents a
+/// fused node's initializers as ordinary inputs.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_constant_weight_inputs() -> usize {
+    onnx_runtime_ep_plugin::ep::constant_weight_inputs()
+}
+
+/// Resets the constant-weight-input counter to zero.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_reset_constant_weight_inputs() {
+    onnx_runtime_ep_plugin::ep::reset_constant_weight_inputs()
 }
 
 /// Resets the compiled-node counter to zero.

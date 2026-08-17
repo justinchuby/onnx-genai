@@ -72,6 +72,27 @@ pub fn reset_compiled_node_count() {
     COMPILED_NODE_COUNT.store(0, Ordering::Relaxed);
 }
 
+/// Global counter of node inputs this EP told a kernel to treat as
+/// session-lifetime constants (see [`constant_input_flags`]).
+///
+/// A weight that is not reported constant is not a correctness bug, which is
+/// exactly why it needs a counter: the kernel still computes the right answer,
+/// it just rebuilds its prepack on every `Run` — and `MatMulNBits` also drops
+/// to a slower kernel, because its MLAS SQNBit path is gated on the same flag.
+/// Nothing in an output comparison can see that, so the wiring is observed
+/// here instead.
+static CONSTANT_WEIGHT_INPUTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of node inputs reported to kernels as constant since process start.
+pub fn constant_weight_inputs() -> usize {
+    CONSTANT_WEIGHT_INPUTS.load(Ordering::Relaxed)
+}
+
+/// Resets the constant-weight-input counter to zero.
+pub fn reset_constant_weight_inputs() {
+    CONSTANT_WEIGHT_INPUTS.store(0, Ordering::Relaxed);
+}
+
 use crate::compute::ExportedComputeInfo;
 use crate::graph_reader::OutboundGraphReader;
 use crate::status::{fail_status, invalid_arg_status, ok_status};
@@ -93,6 +114,15 @@ pub struct KernelRegistryEntry {
     /// Supported element types for the `"T"` type-constraint parameter.
     /// Import from `kernel_ctx::CPU_EP_SUPPORTED_DTYPES` to keep in sync.
     pub supported_dtypes: &'static [DataType],
+    /// Per-input-slot dtype constraints, for ops whose edges are not uniform.
+    ///
+    /// `supported_dtypes` is a union, so on a mixed-dtype op it admits
+    /// combinations no kernel accepts — a `MatMulNBits` with `float16`
+    /// `zero_points` passes because both `float16` and `uint8` are somewhere in
+    /// the union. Each `(slot, dtypes)` entry here overrides the union for that
+    /// input position; unlisted and absent inputs keep the union rule. Empty
+    /// means "the union is exact", which is true for every uniform op.
+    pub input_dtype_constraints: &'static [(usize, &'static [DataType])],
 }
 
 /// A heap-allocated EP whose raw pointer is returned as `OrtEp*`.
@@ -589,7 +619,7 @@ pub(crate) fn node_passes_dtype_filter(
     let Some(entry) = entry else {
         return false;
     };
-    for input in &node.inputs {
+    for (slot, input) in node.inputs.iter().enumerate() {
         let Some(vid) = input else { continue };
         let Some(value) = ir_graph.values.get(*vid) else {
             continue;
@@ -597,7 +627,15 @@ pub(crate) fn node_passes_dtype_filter(
         if value.dtype == DataType::Undefined {
             return false;
         }
-        if !entry.supported_dtypes.contains(&value.dtype) {
+        // A per-slot constraint replaces the union for that position; without
+        // it a mixed-dtype op is claimed for combinations its kernel rejects,
+        // which turns a decline into a run-time failure.
+        let allowed = entry
+            .input_dtype_constraints
+            .iter()
+            .find(|(index, _)| *index == slot)
+            .map_or(entry.supported_dtypes, |(_, dtypes)| *dtypes);
+        if !allowed.contains(&value.dtype) {
             return false;
         }
     }
@@ -749,7 +787,21 @@ fn ep_compile_inner(
             let opset = ir_graph.effective_opset(node).unwrap_or(0);
 
             match exported.ep.with(|ep| ep.get_kernel(node, &shapes, opset)) {
-                Ok(kernel) => {
+                Ok(mut kernel) => {
+                    // Tell the kernel which of its inputs are session-lifetime
+                    // constants. Without this every kernel sees all inputs as
+                    // runtime tensors and re-does its one-time weight work on
+                    // every `Run`: `MatMulNBits` repacks (or, worse, declines
+                    // the MLAS SQNBit path, which is gated on the same flag)
+                    // and `QLinearMatMul` re-packs B, turning a load-time cost
+                    // into a per-token cost.
+                    let constant_inputs =
+                        constant_input_flags(&view, node_idx, reader.constant_initializer_names());
+                    CONSTANT_WEIGHT_INPUTS.fetch_add(
+                        constant_inputs.iter().filter(|c| **c).count(),
+                        Ordering::Relaxed,
+                    );
+                    kernel.set_constant_inputs(&constant_inputs);
                     let num_inputs = view.node_inputs(node_idx).len();
                     let num_outputs = view.node_outputs(node_idx).len();
 
@@ -807,19 +859,33 @@ fn ep_compile_inner(
                         crate::compute::ShapeInference::for_node(node, &shapes_opt, num_outputs);
 
                     // Build input_slots: maps node input position → ORT index
-                    // (sequential for present inputs, None for absent).
+                    // (None for absent inputs).
+                    //
+                    // Indices are assigned per *distinct value*, not per
+                    // position. ORT's fused-node metadata carries a set of
+                    // input names, so a node that names the same value twice
+                    // is bound once and every later slot would otherwise be
+                    // shifted — the last one past the end of the array ORT
+                    // actually passes. That is not a corner case: a quantized
+                    // `QLinearMatMul` routinely shares one zero-point or scale
+                    // initializer between its `a`, `b` and `y` triples, and any
+                    // `Mul(x, x)`-shaped node does the same.
                     let mut ort_input_idx = 0usize;
+                    let mut value_to_ort_index: std::collections::HashMap<
+                        onnx_runtime_ir::ValueIndex,
+                        usize,
+                    > = std::collections::HashMap::new();
                     let input_slots: Vec<Option<usize>> = view
                         .node_inputs(node_idx)
                         .iter()
                         .map(|input| {
-                            if input.is_some() {
-                                let idx = ort_input_idx;
-                                ort_input_idx += 1;
-                                Some(idx)
-                            } else {
-                                None
-                            }
+                            input.map(|value| {
+                                *value_to_ort_index.entry(value).or_insert_with(|| {
+                                    let idx = ort_input_idx;
+                                    ort_input_idx += 1;
+                                    idx
+                                })
+                            })
                         })
                         .collect();
 
@@ -884,6 +950,50 @@ fn ep_compile_inner(
     }
 
     ok_status()
+}
+
+/// Which inputs of `node` are session-lifetime constants.
+///
+/// A node input that ORT lists as a *constant* initializer is a weight: ORT
+/// owns the buffer, materializes it once at session creation and cannot change
+/// it between `Run` calls. An IR>=4 initializer that also appears as a graph
+/// input is only a default value the caller may override per `Run`, and is
+/// deliberately not in that set (see `read_constant_initializer_names`). That is the
+/// contract
+/// [`onnx_runtime_ep_api::kernel::Kernel::set_constant_inputs`] expresses, and
+/// several kernels use it to decide whether a prepack may be built once and
+/// kept in the kernel instance (which lives as long as the session) instead of
+/// rebuilt on every call. `MatMulNBits` goes further and gates its MLAS SQNBit
+/// path on the same flag, so leaving it false does not merely repeat work — it
+/// selects a different, slower kernel.
+///
+/// The producer/`is_graph_input` test used elsewhere in this file cannot be
+/// reused here. It is correct for the whole-model graph at capability time,
+/// but ORT hands a *fused node's* subgraph over with the initializers it kept
+/// inside listed as graph inputs of that subgraph, so at Compile time every
+/// weight looks like an activation. `Graph_GetInitializers` still distinguishes
+/// them, which is why the flags are keyed by name against that set — filtered
+/// to the entries `ValueInfo_IsConstantInitializer` accepts, because
+/// `Graph_GetInitializers` also lists IR>=4 defaults the caller may replace.
+///
+/// Absent optional inputs and unnamed values are never constant: there is
+/// nothing to cache and nothing to key a cache on.
+fn constant_input_flags(
+    view: &onnx_runtime_ir::GraphView<'_>,
+    node: NodeIndex,
+    constant_initializer_names: &std::collections::HashSet<String>,
+) -> Vec<bool> {
+    view.node_inputs(node)
+        .iter()
+        .map(|input| {
+            input.is_some_and(|value| {
+                view.value(value)
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| constant_initializer_names.contains(name))
+            })
+        })
+        .collect()
 }
 
 /// Whether every present input of `node` can be routed by the fused-subgraph
@@ -1663,6 +1773,7 @@ mod tests {
             since_version: 7,
             end_version: 21,
             supported_dtypes: CPU_EP_SUPPORTED_DTYPES,
+            input_dtype_constraints: &[],
         };
         assert_eq!(entry.op_type, "Add");
         assert!(entry.supported_dtypes.contains(&DataType::Float16));
@@ -1680,6 +1791,7 @@ mod tests {
             since_version: 7,
             end_version: 21,
             supported_dtypes: CPU_EP_SUPPORTED_DTYPES,
+            input_dtype_constraints: &[],
         }];
         let result = build_ort_kernel_registry(&entries, "test_ep");
         assert!(
@@ -1725,6 +1837,7 @@ mod tests {
             since_version: 7,
             end_version: 21,
             supported_dtypes: &[DataType::Float32, DataType::Float16],
+            input_dtype_constraints: &[],
         }];
         let (g, nid) = graph_with_node(
             "Add",
@@ -1751,6 +1864,7 @@ mod tests {
             since_version: 7,
             end_version: 21,
             supported_dtypes: &[DataType::Float32, DataType::Float16],
+            input_dtype_constraints: &[],
         }];
         let (g, nid) = graph_with_node(
             "Add",
@@ -1767,6 +1881,101 @@ mod tests {
         ));
     }
 
+    /// The union of an op's edge dtypes is not its kernel's rule.
+    ///
+    /// `com.microsoft::MatMulNBits` spec-allows `float16` `zero_points`, and
+    /// ORT's own kernel builds a session for one, but this EP's kernel accepts
+    /// only `uint8` there. Membership in the union would claim the node and
+    /// then fail inside `Compute`, where the only outcome is a run-time error
+    /// on a model that worked before. The per-slot list must decline it.
+    #[test]
+    fn dtype_filter_applies_per_slot_constraints() {
+        const FLOATS: &[DataType] = &[DataType::Float32, DataType::Float16, DataType::BFloat16];
+        let entries = vec![KernelRegistryEntry {
+            op_type: "MatMulNBits",
+            domain: "com.microsoft",
+            since_version: 1,
+            end_version: i32::MAX,
+            supported_dtypes: &[
+                DataType::Float32,
+                DataType::Float16,
+                DataType::BFloat16,
+                DataType::Uint8,
+                DataType::Int32,
+            ],
+            input_dtype_constraints: &[
+                (0, FLOATS),
+                (1, &[DataType::Uint8]),
+                (2, FLOATS),
+                (3, &[DataType::Uint8]),
+            ],
+        }];
+        let empty = std::collections::HashSet::new();
+
+        // A, B, scales, zero_points — all as the kernel requires.
+        let (good, good_id) = graph_with_node(
+            "MatMulNBits",
+            "com.microsoft",
+            &[
+                DataType::Float32,
+                DataType::Uint8,
+                DataType::Float32,
+                DataType::Uint8,
+            ],
+            &[DataType::Float32],
+        );
+        assert!(super::node_passes_dtype_filter(
+            good.nodes.get(good_id).unwrap(),
+            &good,
+            &entries,
+            &empty
+        ));
+
+        // float16 zero_points: in the union, wrong for slot 3.
+        let (bad, bad_id) = graph_with_node(
+            "MatMulNBits",
+            "com.microsoft",
+            &[
+                DataType::Float32,
+                DataType::Uint8,
+                DataType::Float32,
+                DataType::Float16,
+            ],
+            &[DataType::Float32],
+        );
+        assert!(
+            !super::node_passes_dtype_filter(
+                bad.nodes.get(bad_id).unwrap(),
+                &bad,
+                &entries,
+                &empty
+            ),
+            "a float16 zero_points node must not be claimed: the kernel rejects it"
+        );
+
+        // uint8 activation: also in the union, also wrong for slot 0.
+        let (swapped, swapped_id) = graph_with_node(
+            "MatMulNBits",
+            "com.microsoft",
+            &[
+                DataType::Uint8,
+                DataType::Uint8,
+                DataType::Float32,
+                DataType::Uint8,
+            ],
+            &[DataType::Float32],
+        );
+        assert!(
+            !super::node_passes_dtype_filter(
+                swapped.nodes.get(swapped_id).unwrap(),
+                &swapped,
+                &entries,
+                &empty
+            ),
+            "a uint8 activation must not be claimed"
+        );
+    }
+
     /// Node with Undefined dtype is NOT claimed (fail closed).
     #[test]
     fn dtype_filter_rejects_undefined_dtype() {
@@ -1776,6 +1985,7 @@ mod tests {
             since_version: 7,
             end_version: 21,
             supported_dtypes: &[DataType::Float32],
+            input_dtype_constraints: &[],
         }];
         let (g, nid) = graph_with_node("Add", "", &[DataType::Undefined], &[DataType::Float32]);
         let node = g.nodes.get(nid).unwrap();
@@ -1796,6 +2006,7 @@ mod tests {
             since_version: 7,
             end_version: 21,
             supported_dtypes: &[DataType::Float32],
+            input_dtype_constraints: &[],
         }];
         let (g, nid) = graph_with_node("UnknownOp", "", &[DataType::Float32], &[DataType::Float32]);
         let node = g.nodes.get(nid).unwrap();
@@ -1843,6 +2054,7 @@ mod tests {
             since_version: 7,
             end_version: 21,
             supported_dtypes: &[DataType::Float32],
+            input_dtype_constraints: &[],
         }];
 
         // Empty absent set — the forgery name should NOT grant exemption.
@@ -1939,6 +2151,79 @@ mod tests {
         assert!(
             super::node_inputs_all_routable(&view, add),
             "a node consuming only a graph input and a produced value is routable"
+        );
+    }
+
+    /// Constant-input flags must come from ORT's initializer list, not from
+    /// the producer/`is_graph_input` shape of the graph.
+    ///
+    /// This is the exact shape ORT hands a fused node's subgraph over in:
+    /// the weight has no producer *and* is listed as a graph input of the
+    /// subgraph, because it is an input of the fused node. Deriving the flag
+    /// the way `node_inputs_all_routable` derives routability marks every
+    /// weight non-constant, which costs `MatMulNBits` its prepack — and, since
+    /// its MLAS SQNBit path is gated on the same flag, its fast kernel too.
+    #[test]
+    fn constant_initializers_are_flagged_even_when_the_subgraph_calls_them_inputs() {
+        use onnx_runtime_ir::{Graph, GraphView, GraphViewCache, Node, NodeId, Shape};
+        let mut g = Graph::new();
+        let a = g.create_named_value("a", DataType::Float32, Shape::default());
+        let w = g.create_named_value("w", DataType::Uint8, Shape::default());
+        let scales = g.create_named_value("scales", DataType::Float32, Shape::default());
+        let y = g.create_named_value("y", DataType::Float32, Shape::default());
+        // Every input of the fused node is a graph input of the subgraph ORT
+        // hands over, weights included.
+        g.add_input(a);
+        g.add_input(w);
+        g.add_input(scales);
+        g.add_output(y);
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMulNBits",
+            vec![Some(a), Some(w), Some(scales), None],
+            vec![y],
+        ));
+
+        let cache = GraphViewCache::build(&g).unwrap();
+        let view = GraphView::new(&g, &cache);
+        let node = view.nodes().next().expect("one node");
+        let constant_initializers: std::collections::HashSet<String> =
+            ["w".to_owned(), "scales".to_owned()].into_iter().collect();
+
+        assert_eq!(
+            super::constant_input_flags(&view, node, &constant_initializers),
+            vec![false, true, true, false],
+            "weights are constant, the activation is not, and an absent optional \
+             input is not"
+        );
+    }
+
+    /// With no initializers, nothing is constant — including values that have
+    /// no producer. A subgraph whose weights ORT kept outside it must not have
+    /// its activations cached as if they were weights.
+    #[test]
+    fn nothing_is_constant_without_an_initializer_list() {
+        use onnx_runtime_ir::{Graph, GraphView, GraphViewCache, Node, NodeId, Shape};
+        let mut g = Graph::new();
+        let a = g.create_named_value("a", DataType::Float32, Shape::default());
+        let b = g.create_named_value("b", DataType::Float32, Shape::default());
+        let y = g.create_named_value("y", DataType::Float32, Shape::default());
+        g.add_input(a);
+        g.add_output(y);
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(a), Some(b)],
+            vec![y],
+        ));
+
+        let cache = GraphViewCache::build(&g).unwrap();
+        let view = GraphView::new(&g, &cache);
+        let node = view.nodes().next().expect("one node");
+        assert_eq!(
+            super::constant_input_flags(&view, node, &std::collections::HashSet::new()),
+            vec![false, false],
+            "a producerless value is only constant when ORT says it is an initializer"
         );
     }
 
