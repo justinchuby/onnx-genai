@@ -534,6 +534,16 @@ fn l1_required_symbols_resolve() {
             });
     }
 
+    // `nxrt_ep_persistent_decode_pool_built` returns `i32`, not `usize`, so it
+    // cannot ride the loop above. It is the only proof that `CreateEpFactories`
+    // opted this process out of the persistent SPMD decode pool, and the test
+    // that reads it is ORT-gated; requiring the export here keeps a check that
+    // runs even when ONNX Runtime is unavailable.
+    let _pool_probe: libloading::Symbol<'_, unsafe extern "C" fn() -> i32> =
+        unsafe { lib.get(&b"nxrt_ep_persistent_decode_pool_built"[..]) }.unwrap_or_else(|e| {
+            panic!("nxrt_ep_persistent_decode_pool_built not exported from cdylib: {e}")
+        });
+
     eprintln!("✓ l1_required_symbols_resolve: CreateEpFactories ✓  ReleaseEpFactory ✓");
 }
 
