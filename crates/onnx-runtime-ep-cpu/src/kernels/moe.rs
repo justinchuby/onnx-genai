@@ -7,6 +7,9 @@
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
+// Only the MLAS bucketing and the `#[cfg(test)]` reference algorithm still
+// need an ordered map; the driver itself orders by expert through `RoutingPlan`.
+#[cfg(any(feature = "mlas", test))]
 use std::collections::BTreeMap;
 
 use super::check_arity;
@@ -269,53 +272,33 @@ impl Kernel for MoEKernel {
         let router = to_dense_f32_widen("MoE", &inputs[1])?;
         let fc1 = to_dense_f32_widen("MoE", &inputs[2])?;
         let fc2 = to_dense_f32_widen("MoE", &inputs[4])?;
-        let mut output = vec![0.0f32; rows * hidden];
-
-        let mut tasks = BTreeMap::<usize, Vec<(usize, f32)>>::new();
-        for row in 0..rows {
-            let route = routing_weights(
-                &router[row * experts..(row + 1) * experts],
-                None,
-                self.attributes.k,
-                self.attributes.normalize_routing_weights,
-            );
-            for (expert, route_weight) in route {
-                tasks.entry(expert).or_default().push((row, route_weight));
-            }
-        }
-        for (expert, expert_tasks) in tasks {
-            let mut grouped_input = Vec::with_capacity(expert_tasks.len() * hidden);
-            for &(row, _) in &expert_tasks {
-                grouped_input.extend_from_slice(&x[row * hidden..(row + 1) * hidden]);
-            }
-            let expert_out = run_expert_grouped(
-                &grouped_input,
-                expert_tasks.len(),
-                &fc1[expert * expected_fc1 * hidden..(expert + 1) * expected_fc1 * hidden],
-                fc1_bias
-                    .as_deref()
-                    .map(|b| &b[expert * expected_fc1..(expert + 1) * expected_fc1]),
-                &fc2[expert * hidden * inter..(expert + 1) * hidden * inter],
-                fc2_bias
-                    .as_deref()
-                    .map(|b| &b[expert * hidden..(expert + 1) * hidden]),
-                fc3.as_ref().map(|weights| {
-                    &weights[expert * inter * hidden..(expert + 1) * inter * hidden]
-                }),
-                fc3_bias
-                    .as_deref()
-                    .map(|b| &b[expert * inter..(expert + 1) * inter]),
-                expected_fc1,
-                hidden,
-                inter,
-                &self.attributes,
-            )?;
-            for (grouped_row, &(row, route_weight)) in expert_tasks.iter().enumerate() {
-                for h in 0..hidden {
-                    output[row * hidden + h] += route_weight * expert_out[grouped_row * hidden + h];
-                }
-            }
-        }
+        let mut plan = RoutingPlan::build(
+            &router,
+            rows,
+            experts,
+            self.attributes.k,
+            self.attributes.normalize_routing_weights,
+        );
+        let driver = if use_grouped_driver(&plan, expected_fc1, hidden, inter) {
+            plan.build_row_slots();
+            run_moe_grouped
+        } else {
+            run_moe_per_expert
+        };
+        let output = driver(
+            &plan,
+            &x,
+            &fc1,
+            fc1_bias.as_deref(),
+            &fc2,
+            fc2_bias.as_deref(),
+            fc3.as_deref(),
+            fc3_bias.as_deref(),
+            expected_fc1,
+            hidden,
+            inter,
+            &self.attributes,
+        )?;
         write_dense_f32_narrow("MoE", &mut outputs[0], &output)
     }
 
@@ -341,6 +324,579 @@ impl MoeAttributes {
         (self.activation == Activation::Swiglu && self.swiglu_fusion == 0)
             || (self.activation == Activation::Silu && has_fc3)
     }
+}
+
+/// Rows below this many elements stay on the calling thread: a `rayon`
+/// fan-out costs more than a few thousand floats of memcpy or activation.
+const MIN_PARALLEL_MOE_ELEMENTS: usize = 16 * 1024;
+
+/// Apply `f` to every `width`-wide row of `data`, in parallel once the pass is
+/// large enough to pay for the fan-out.
+///
+/// Every stage between the two expert GEMMs - the gather, the bias adds, the
+/// activation and the weighted scatter - is a row-wise map, and each was a
+/// serial scalar loop before. On a 512-token Mixtral-shaped forward those
+/// stages touch more bytes than the GEMMs do, so leaving them serial capped
+/// the whole operator's thread scaling regardless of how well MLAS threaded
+/// the GEMMs themselves.
+fn for_each_row<F>(data: &mut [f32], width: usize, f: F)
+where
+    F: Fn(usize, &mut [f32]) + Send + Sync,
+{
+    if width == 0 {
+        return;
+    }
+    let rows = data.len() / width;
+    match parallel_rows_per_task(rows, width) {
+        Some(rows_per_task) => {
+            use rayon::prelude::*;
+            data.par_chunks_mut(rows_per_task * width)
+                .enumerate()
+                .for_each(|(chunk, block)| {
+                    let base = chunk * rows_per_task;
+                    for (offset, row) in block.chunks_mut(width).enumerate() {
+                        f(base + offset, row);
+                    }
+                });
+        }
+        None => {
+            for (index, row) in data.chunks_mut(width).enumerate() {
+                f(index, row);
+            }
+        }
+    }
+}
+
+/// Whole rows per `rayon` task, or `None` to stay on the calling thread.
+///
+/// The task count is capped at the width the GEMMs themselves will use, not at
+/// `rayon`'s global pool size. `ONNX_GENAI_CPU_DECODE_THREADS` bounds MLAS but
+/// not `rayon`, so fanning these passes out to every logical CPU would run the
+/// operator wider than the caller asked for - and, measured against a real ORT
+/// session configured with the same width, would not be a like-for-like
+/// comparison.
+fn parallel_rows_per_task(rows: usize, width: usize) -> Option<usize> {
+    if rows < 2 || rows.saturating_mul(width) < MIN_PARALLEL_MOE_ELEMENTS {
+        return None;
+    }
+    let workers = moe_worker_budget().min(rows);
+    if workers < 2 {
+        return None;
+    }
+    Some(rows.div_ceil(workers).max(1))
+}
+
+fn moe_worker_budget() -> usize {
+    let rayon_workers = rayon::current_num_threads().max(1);
+    #[cfg(feature = "mlas")]
+    {
+        rayon_workers.min(mlas_sys::configured_pool_threads())
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        rayon_workers
+    }
+}
+
+/// One contiguous run of routed rows that share an expert.
+#[derive(Clone, Copy, Debug)]
+struct ExpertGroup {
+    expert: usize,
+    /// First slot of the run in the routed-row ordering.
+    start: usize,
+    /// Number of routed rows in the run.
+    len: usize,
+}
+
+/// Top-k routing flattened into a slot ordering: all rows routed to the lowest
+/// active expert first, then the next, and so on.
+///
+/// Laying the routed rows out this way is what lets every later stage be a flat
+/// row-wise map over one buffer, and it makes each expert's GEMM operand a
+/// contiguous window - the precondition for handing several experts to MLAS as
+/// a single batched GEMM.
+struct RoutingPlan {
+    rows: usize,
+    k: usize,
+    /// Source row for each slot.
+    slot_row: Vec<u32>,
+    /// Expert serving each slot, for the per-expert bias lookup.
+    slot_expert: Vec<u32>,
+    /// Routing weight for each slot.
+    slot_weight: Vec<f32>,
+    /// Slots serving each row, `k` entries per row, ascending by expert.
+    /// `u32::MAX` marks an unused entry.
+    row_slots: Vec<u32>,
+    groups: Vec<ExpertGroup>,
+}
+
+impl RoutingPlan {
+    fn build(router: &[f32], rows: usize, experts: usize, k: usize, normalize: bool) -> Self {
+        let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); experts];
+        for row in 0..rows {
+            for (expert, weight) in routing_weights(
+                &router[row * experts..(row + 1) * experts],
+                None,
+                k,
+                normalize,
+            ) {
+                per_expert[expert].push((row as u32, weight));
+            }
+        }
+        let total = per_expert.iter().map(Vec::len).sum::<usize>();
+        let mut slot_row = Vec::with_capacity(total);
+        let mut slot_expert = Vec::with_capacity(total);
+        let mut slot_weight = Vec::with_capacity(total);
+        let mut groups = Vec::new();
+        for (expert, assigned) in per_expert.iter().enumerate() {
+            if assigned.is_empty() {
+                continue;
+            }
+            groups.push(ExpertGroup {
+                expert,
+                start: slot_row.len(),
+                len: assigned.len(),
+            });
+            for &(row, weight) in assigned {
+                slot_row.push(row);
+                slot_expert.push(expert as u32);
+                slot_weight.push(weight);
+            }
+        }
+        Self {
+            rows,
+            k,
+            slot_row,
+            slot_expert,
+            slot_weight,
+            row_slots: Vec::new(),
+            groups,
+        }
+    }
+
+    /// Invert the layout so the final scatter can be a parallel map over
+    /// *output* rows: two experts share an output row, so scattering by expert
+    /// would race.
+    ///
+    /// Only the grouped driver scatters that way, and this is an `rows * k`
+    /// allocation, so the per-expert driver does not pay for it.
+    fn build_row_slots(&mut self) {
+        self.row_slots = vec![u32::MAX; self.rows * self.k];
+        let mut filled = vec![0usize; self.rows];
+        for (slot, &row) in self.slot_row.iter().enumerate() {
+            let row = row as usize;
+            self.row_slots[row * self.k + filled[row]] = slot as u32;
+            filled[row] += 1;
+        }
+    }
+
+    fn slots(&self) -> usize {
+        self.slot_row.len()
+    }
+}
+
+/// `output[slot, out_features] = input[slot, in_features] * weights[expert]ᵀ`
+/// for every routed slot.
+///
+/// Experts whose groups hold the same number of rows are issued as one batched
+/// MLAS GEMM. A decode step is the extreme case: `k` groups of exactly one row
+/// each, which individually look far too small for MLAS to thread and pay a
+/// full dispatch each.
+///
+/// The per-expert bias is deliberately **not** applied here. Both biases fold
+/// into a pass that already reads the result - FC1's into the activation,
+/// FC2's into the weighted scatter - which removes two full read-modify-write
+/// passes over the largest intermediates in the operator.
+fn grouped_linear(
+    input: &[f32],
+    plan: &RoutingPlan,
+    weights: &[f32],
+    out_features: usize,
+    in_features: usize,
+    output: &mut [f32],
+) -> Result<()> {
+    let expert_stride = out_features * in_features;
+    #[cfg(feature = "mlas")]
+    {
+        let mut by_len: BTreeMap<usize, Vec<&ExpertGroup>> = BTreeMap::new();
+        for group in &plan.groups {
+            by_len.entry(group.len).or_default().push(group);
+        }
+        for (len, groups) in by_len {
+            if len == 0 || out_features == 0 || in_features == 0 {
+                continue;
+            }
+            let items: Vec<mlas_sys::SgemmBatchItem<'_>> = groups
+                .iter()
+                .map(|group| mlas_sys::SgemmBatchItem {
+                    a: &input[group.start * in_features..],
+                    b: &weights[group.expert * expert_stride..(group.expert + 1) * expert_stride],
+                    c_offset: group.start * out_features,
+                })
+                .collect();
+            mlas_sys::sgemm_batch(
+                false,
+                true,
+                len,
+                out_features,
+                in_features,
+                1.0,
+                &items,
+                in_features,
+                in_features,
+                0.0,
+                output,
+                out_features,
+            );
+        }
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        for group in &plan.groups {
+            let mut weights_kn = vec![0.0f32; expert_stride];
+            let expert = &weights[group.expert * expert_stride..(group.expert + 1) * expert_stride];
+            for output_feature in 0..out_features {
+                for input_feature in 0..in_features {
+                    weights_kn[input_feature * out_features + output_feature] =
+                        expert[output_feature * in_features + input_feature];
+                }
+            }
+            gemm(
+                &input[group.start * in_features..(group.start + group.len) * in_features],
+                &weights_kn,
+                &mut output[group.start * out_features..(group.start + group.len) * out_features],
+                group.len,
+                in_features,
+                out_features,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Average GEMM work per expert group, in multiply-accumulates, below which
+/// the grouped driver is *not* used.
+///
+/// Measured, not derived. Against a real ORT CPU session on 9 synthetic
+/// production-shaped MoE graphs x 3 thread counts, the grouped driver wins
+/// decisively once each expert's own GEMMs are large (1.35x-1.57x less native
+/// time at 512 tokens) and loses by 5-16% when they are small: at that size
+/// MLAS's per-GEMM threading is already the limit, and the extra gather and
+/// scatter buffers cost more than parallelising the elementwise stages saves.
+/// The measured separation was 7.6e7 (losing) to 6.3e8 (winning) work units,
+/// so the floor sits near the geometric mean of that band.
+///
+/// This is a one-host calibration on an AMD EPYC 9V74 (16C/32T, 32 MiB L3).
+/// `ONNX_GENAI_MOE_GROUPED_MIN_WORK` overrides it; `0` forces the grouped
+/// driver on for every shape.
+const MOE_GROUPED_MIN_WORK: u64 = 300_000_000;
+
+/// Whether the grouped/batched driver is expected to beat the per-expert loop.
+///
+/// The discriminator is the work in *one* expert's GEMMs, not the total: the
+/// grouped driver's win comes from parallelising the gather, activation and
+/// scatter, which only matters once MLAS is already saturating the machine
+/// inside each expert's GEMM. `slots / groups` is the average rows per expert,
+/// and `fc1_size + inter` counts both the FC1(+FC3) and FC2 passes.
+fn use_grouped_driver(plan: &RoutingPlan, fc1_size: usize, hidden: usize, inter: usize) -> bool {
+    let groups = plan.groups.len();
+    if groups == 0 {
+        return true;
+    }
+    if moe_worker_budget() < 2 {
+        // Single-threaded: the two drivers measured identically, so prefer the
+        // one with fewer intermediate buffers.
+        return false;
+    }
+    grouped_work_units(plan, fc1_size, hidden, inter) >= grouped_min_work()
+}
+
+/// The gate's work estimate, split out so it can be pinned by a test on a
+/// machine of any width.
+///
+/// The largest group rather than the mean: a collapsed router that sends most
+/// of its rows to one expert still has one large GEMM to hide the elementwise
+/// stages behind, and the mean would hide it.
+fn grouped_work_units(plan: &RoutingPlan, fc1_size: usize, hidden: usize, inter: usize) -> u64 {
+    let rows_per_group = plan.groups.iter().map(|group| group.len).max().unwrap_or(0) as u64;
+    rows_per_group
+        .saturating_mul(hidden as u64)
+        .saturating_mul((fc1_size + inter) as u64)
+}
+
+fn grouped_min_work() -> u64 {
+    // Deliberately not cached: the read is once per operator call, next to a
+    // multi-millisecond GEMM, and caching it in a `OnceLock` would let whichever
+    // test ran first freeze the value for the whole process.
+    std::env::var("ONNX_GENAI_MOE_GROUPED_MIN_WORK")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(MOE_GROUPED_MIN_WORK)
+}
+
+/// The per-expert driver: gather each expert's rows into a fresh buffer, run
+/// the pair of expert GEMMs, then accumulate the weighted result.
+///
+/// Kept as the small-shape path. It allocates per expert and leaves the
+/// gather, activation and scatter serial, which is exactly the trade that wins
+/// when each expert only has a handful of rows.
+///
+/// Iterating `plan.groups` reproduces the ascending-expert order, and slots
+/// inside a group are in ascending row order, so this is **bit-identical** to
+/// the grouped driver rather than merely close.
+#[allow(clippy::too_many_arguments)]
+fn run_moe_per_expert(
+    plan: &RoutingPlan,
+    x: &[f32],
+    fc1_weights: &[f32],
+    fc1_bias: Option<&[f32]>,
+    fc2_weights: &[f32],
+    fc2_bias: Option<&[f32]>,
+    fc3_weights: Option<&[f32]>,
+    fc3_bias: Option<&[f32]>,
+    fc1_size: usize,
+    hidden: usize,
+    inter: usize,
+    attributes: &MoeAttributes,
+) -> Result<Vec<f32>> {
+    let mut output = vec![0.0f32; plan.rows * hidden];
+    if plan.slots() == 0 || hidden == 0 {
+        return Ok(output);
+    }
+    for group in &plan.groups {
+        let expert = group.expert;
+        let slots = group.start..group.start + group.len;
+        let mut grouped_input = Vec::with_capacity(group.len * hidden);
+        for slot in slots.clone() {
+            let source = plan.slot_row[slot] as usize * hidden;
+            grouped_input.extend_from_slice(&x[source..source + hidden]);
+        }
+        let expert_out = run_expert_grouped(
+            &grouped_input,
+            group.len,
+            &fc1_weights[expert * fc1_size * hidden..(expert + 1) * fc1_size * hidden],
+            fc1_bias.map(|b| &b[expert * fc1_size..(expert + 1) * fc1_size]),
+            &fc2_weights[expert * hidden * inter..(expert + 1) * hidden * inter],
+            fc2_bias.map(|b| &b[expert * hidden..(expert + 1) * hidden]),
+            fc3_weights.map(|w| &w[expert * inter * hidden..(expert + 1) * inter * hidden]),
+            fc3_bias.map(|b| &b[expert * inter..(expert + 1) * inter]),
+            fc1_size,
+            hidden,
+            inter,
+            attributes,
+        )?;
+        for (local, slot) in slots.enumerate() {
+            let row = plan.slot_row[slot] as usize;
+            let weight = plan.slot_weight[slot];
+            let src = &expert_out[local * hidden..(local + 1) * hidden];
+            let dst = &mut output[row * hidden..(row + 1) * hidden];
+            for (out, &value) in dst.iter_mut().zip(src) {
+                *out += weight * value;
+            }
+        }
+    }
+    Ok(output)
+}
+
+/// Run every routed row through its expert and scatter the weighted results
+/// back onto the output rows.
+///
+/// This is the whole operator between routing and the output write: gather,
+/// FC1 (+ optional FC3 gate), activation, FC2, weighted accumulation. Each
+/// stage is one pass over one buffer, so the only serial work left is the
+/// routing itself.
+#[allow(clippy::too_many_arguments)]
+fn run_moe_grouped(
+    plan: &RoutingPlan,
+    x: &[f32],
+    fc1_weights: &[f32],
+    fc1_bias: Option<&[f32]>,
+    fc2_weights: &[f32],
+    fc2_bias: Option<&[f32]>,
+    fc3_weights: Option<&[f32]>,
+    fc3_bias: Option<&[f32]>,
+    fc1_size: usize,
+    hidden: usize,
+    inter: usize,
+    attributes: &MoeAttributes,
+) -> Result<Vec<f32>> {
+    let slots = plan.slots();
+    let mut output = vec![0.0f32; plan.rows * hidden];
+    if slots == 0 || hidden == 0 {
+        return Ok(output);
+    }
+    debug_assert_eq!(
+        plan.row_slots.len(),
+        plan.rows * plan.k,
+        "run_moe_grouped needs the row->slot inversion; call build_row_slots first"
+    );
+
+    let mut gathered = vec![0.0f32; slots * hidden];
+    let slot_row = &plan.slot_row;
+    for_each_row(&mut gathered, hidden, |slot, row| {
+        let source = slot_row[slot] as usize * hidden;
+        row.copy_from_slice(&x[source..source + hidden]);
+    });
+
+    let mut fc1_out = vec![0.0f32; slots * fc1_size];
+    grouped_linear(&gathered, plan, fc1_weights, fc1_size, hidden, &mut fc1_out)?;
+
+    let gate_source = if attributes.uses_separate_gate(fc3_weights.is_some()) {
+        let mut fc3_out = vec![0.0f32; slots * inter];
+        grouped_linear(
+            &gathered,
+            plan,
+            fc3_weights.expect("validated separate gate FC3"),
+            inter,
+            hidden,
+            &mut fc3_out,
+        )?;
+        Some(fc3_out)
+    } else {
+        None
+    };
+    drop(gathered);
+
+    let activated = apply_activation(
+        fc1_out,
+        gate_source,
+        plan,
+        fc1_bias,
+        fc3_bias,
+        slots,
+        fc1_size,
+        inter,
+        attributes,
+    );
+
+    let mut expert_out = vec![0.0f32; slots * hidden];
+    grouped_linear(
+        &activated,
+        plan,
+        fc2_weights,
+        hidden,
+        inter,
+        &mut expert_out,
+    )?;
+    drop(activated);
+
+    let (row_slots, slot_weight, slot_expert, k) = (
+        &plan.row_slots,
+        &plan.slot_weight,
+        &plan.slot_expert,
+        plan.k,
+    );
+    for_each_row(&mut output, hidden, |row, destination| {
+        for &slot in &row_slots[row * k..(row + 1) * k] {
+            if slot == u32::MAX {
+                continue;
+            }
+            let slot = slot as usize;
+            let weight = slot_weight[slot];
+            let contribution = &expert_out[slot * hidden..(slot + 1) * hidden];
+            match fc2_bias {
+                Some(bias) => {
+                    let expert = slot_expert[slot] as usize;
+                    let bias = &bias[expert * hidden..(expert + 1) * hidden];
+                    for ((value, &source), &bias) in
+                        destination.iter_mut().zip(contribution).zip(bias)
+                    {
+                        *value += weight * (source + bias);
+                    }
+                }
+                None => {
+                    for (value, &source) in destination.iter_mut().zip(contribution) {
+                        *value += weight * source;
+                    }
+                }
+            }
+        }
+    });
+    Ok(output)
+}
+
+/// Collapse FC1 (and the optional FC3 gate) into the `inter`-wide activated
+/// tensor the second expert GEMM consumes.
+///
+/// The gated variants used to build the gate and linear halves as two fresh
+/// `Vec`s element by element and then a third for the result. For a
+/// 512-token Mixtral-shaped forward that is ~56 MiB of allocation and three
+/// serial passes; here it is one parallel pass that writes each half directly
+/// into the buffer it will be consumed from.
+#[allow(clippy::too_many_arguments)]
+fn apply_activation(
+    mut fc1_out: Vec<f32>,
+    gate_source: Option<Vec<f32>>,
+    plan: &RoutingPlan,
+    fc1_bias: Option<&[f32]>,
+    fc3_bias: Option<&[f32]>,
+    slots: usize,
+    fc1_size: usize,
+    inter: usize,
+    attributes: &MoeAttributes,
+) -> Vec<f32> {
+    let slot_expert = &plan.slot_expert;
+    fn expert_bias<'a>(
+        bias: Option<&'a [f32]>,
+        slot_expert: &[u32],
+        slot: usize,
+        width: usize,
+    ) -> Option<&'a [f32]> {
+        bias.map(|bias| {
+            let expert = slot_expert[slot] as usize;
+            &bias[expert * width..(expert + 1) * width]
+        })
+    }
+    let gated = attributes.activation == Activation::Swiglu
+        || (attributes.activation == Activation::Silu && gate_source.is_some());
+    if !gated {
+        for_each_row(&mut fc1_out, fc1_size, |slot, row| {
+            let bias = expert_bias(fc1_bias, slot_expert, slot, fc1_size);
+            for (index, value) in row.iter_mut().enumerate() {
+                let biased = *value + bias.map_or(0.0, |bias| bias[index]);
+                *value = activate(attributes.activation, biased);
+            }
+        });
+        return fc1_out;
+    }
+    let mut activated = vec![0.0f32; slots * inter];
+    match gate_source {
+        // Unfused gate: FC1 is the gate, FC3 the linear half.
+        Some(linear_part) => {
+            for_each_row(&mut activated, inter, |slot, row| {
+                let gate = &fc1_out[slot * inter..(slot + 1) * inter];
+                let linear = &linear_part[slot * inter..(slot + 1) * inter];
+                let gate_bias = expert_bias(fc1_bias, slot_expert, slot, inter);
+                let linear_bias = expert_bias(fc3_bias, slot_expert, slot, inter);
+                for (index, value) in row.iter_mut().enumerate() {
+                    let g = gate[index] + gate_bias.map_or(0.0, |bias| bias[index]);
+                    let l = linear[index] + linear_bias.map_or(0.0, |bias| bias[index]);
+                    *value = attributes.swiglu(g, l);
+                }
+            });
+        }
+        // Fused gate: FC1 is `2 * inter` wide, interleaved when
+        // `swiglu_fusion == 1` and split in halves when it is 2. The bias has
+        // the same width and the same interleaving.
+        None => {
+            let interleaved = attributes.swiglu_fusion == 1;
+            for_each_row(&mut activated, inter, |slot, row| {
+                let source = &fc1_out[slot * fc1_size..(slot + 1) * fc1_size];
+                let bias = expert_bias(fc1_bias, slot_expert, slot, fc1_size);
+                for (index, value) in row.iter_mut().enumerate() {
+                    let (gate_index, linear_index) = if interleaved {
+                        (2 * index, 2 * index + 1)
+                    } else {
+                        (index, inter + index)
+                    };
+                    let g = source[gate_index] + bias.map_or(0.0, |bias| bias[gate_index]);
+                    let l = source[linear_index] + bias.map_or(0.0, |bias| bias[linear_index]);
+                    *value = attributes.swiglu(g, l);
+                }
+            });
+        }
+    }
+    activated
 }
 
 /// Portable single-token reference expert: plain scalar dot products, no GEMM,
@@ -1317,6 +1873,375 @@ mod tests {
             }
         }
         dense
+    }
+
+    /// Both production drivers must agree **bit-for-bit**, because the choice
+    /// between them is a pure performance gate: a shape that crosses the
+    /// threshold must not change its numerics.
+    ///
+    /// The row counts cover both regimes - `rows == 1` puts every group at one
+    /// row (the batched-GEMM case), `rows == 37` with `k == 3` over 5 experts
+    /// produces groups of several different lengths.
+    #[test]
+    fn the_two_drivers_are_bit_identical() {
+        const HIDDEN: usize = 6;
+        const INTER: usize = 5;
+        const EXPERTS: usize = 5;
+        for &(rows, k) in &[(1usize, 2usize), (7, 1), (37, 3), (64, 5)] {
+            for &(activation, fusion) in &[
+                (Activation::Swiglu, 1),
+                (Activation::Swiglu, 0),
+                (Activation::Silu, 0),
+                (Activation::Gelu, 0),
+                (Activation::Relu, 0),
+            ] {
+                for &bias in &[false, true] {
+                    let attributes = MoeAttributes {
+                        k,
+                        activation,
+                        normalize_routing_weights: true,
+                        swiglu_fusion: fusion,
+                        activation_alpha: 1.702,
+                        activation_beta: 1.0,
+                        swiglu_limit: 7.0,
+                    };
+                    let fc1_size = attributes.checked_fc1_size(INTER, "MoE").unwrap();
+                    let uses_fc3 = attributes.uses_separate_gate(true);
+                    let x = ramp(rows * HIDDEN, 11, 0.5, 0.13);
+                    let router = ramp(rows * EXPERTS, 13, 0.4, 0.31);
+                    let fc1 = ramp(EXPERTS * fc1_size * HIDDEN, 17, 0.3, 0.017);
+                    let fc2 = ramp(EXPERTS * HIDDEN * INTER, 19, 0.2, 0.023);
+                    let fc3 = uses_fc3.then(|| ramp(EXPERTS * INTER * HIDDEN, 23, 0.25, 0.029));
+                    let fc1_bias = bias.then(|| ramp(EXPERTS * fc1_size, 7, 0.15, 0.11));
+                    let fc2_bias = bias.then(|| ramp(EXPERTS * HIDDEN, 5, 0.1, 0.07));
+                    let fc3_bias = (bias && uses_fc3).then(|| ramp(EXPERTS * INTER, 3, 0.05, 0.05));
+                    let mut plan = RoutingPlan::build(&router, rows, EXPERTS, k, true);
+                    let args = (
+                        fc1_bias.as_deref(),
+                        fc2_bias.as_deref(),
+                        fc3.as_deref(),
+                        fc3_bias.as_deref(),
+                    );
+                    plan.build_row_slots();
+                    let grouped = run_moe_grouped(
+                        &plan,
+                        &x,
+                        &fc1,
+                        args.0,
+                        &fc2,
+                        args.1,
+                        args.2,
+                        args.3,
+                        fc1_size,
+                        HIDDEN,
+                        INTER,
+                        &attributes,
+                    )
+                    .unwrap();
+                    let per_expert = run_moe_per_expert(
+                        &plan,
+                        &x,
+                        &fc1,
+                        args.0,
+                        &fc2,
+                        args.1,
+                        args.2,
+                        args.3,
+                        fc1_size,
+                        HIDDEN,
+                        INTER,
+                        &attributes,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        grouped, per_expert,
+                        "rows={rows} k={k} activation={activation:?} fusion={fusion} bias={bias}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The gate must pick the grouped driver exactly where it was measured to
+    /// win. These are the calibration points from the 27-cell ORT A/B: the
+    /// 512-token prefill shapes won by 1.35x-1.57x, the 1- and 32-token decode
+    /// shapes lost by 5-16%.
+    #[test]
+    fn the_driver_gate_matches_the_measured_crossover() {
+        // (hidden, inter, experts, k, tokens, expect_grouped)
+        let cells = [
+            (1024usize, 3584usize, 8usize, 2usize, 512usize, true),
+            (2048, 768, 16, 8, 512, true),
+            (2048, 6400, 4, 2, 512, true),
+            (2048, 6400, 4, 2, 32, true),
+            (1024, 3584, 8, 2, 32, false),
+            (2048, 768, 16, 8, 32, false),
+            (1024, 3584, 8, 2, 1, false),
+            (2048, 768, 16, 8, 1, false),
+            (2048, 6400, 4, 2, 1, false),
+        ];
+        for &(hidden, inter, experts, k, tokens, expect) in &cells {
+            // A uniform router spreads the tokens evenly over the experts,
+            // which is what the synthetic benchmark graphs do.
+            let mut router = vec![0.0f32; tokens * experts];
+            for row in 0..tokens {
+                for expert in 0..experts {
+                    router[row * experts + expert] = ((row + expert) % experts) as f32;
+                }
+            }
+            let plan = RoutingPlan::build(&router, tokens, experts, k, true);
+            let fc1_size = 2 * inter;
+            // Asserted on the work estimate rather than on `use_grouped_driver`
+            // so the test still means something on a single-core runner, where
+            // the driver always answers "per-expert" regardless of shape.
+            assert_eq!(
+                grouped_work_units(&plan, fc1_size, hidden, inter) >= grouped_min_work(),
+                expect,
+                "hidden={hidden} inter={inter} experts={experts} k={k} tokens={tokens}"
+            );
+            if moe_worker_budget() >= 2 {
+                assert_eq!(
+                    use_grouped_driver(&plan, fc1_size, hidden, inter),
+                    expect,
+                    "driver disagrees with the work estimate"
+                );
+            }
+        }
+    }
+
+    /// A collapsed router - one expert taking most of the rows while the rest
+    /// take one each - still has one large GEMM to hide the elementwise stages
+    /// behind, so the gate must look at the **largest** group and not the mean.
+    ///
+    /// This is the case the balanced-router calibration test cannot see: with
+    /// an even distribution every summary statistic agrees.
+    #[test]
+    fn the_gate_reads_the_largest_group_not_the_average() {
+        const EXPERTS: usize = 16;
+        const HIDDEN: usize = 2048;
+        const INTER: usize = 6400;
+        let rows = EXPERTS;
+        // Row 0 alone would be one row per expert; instead the first 16 rows all
+        // pick expert 0, and rows 1..16 each add one distinct second expert.
+        let mut router = vec![0.0f32; rows * EXPERTS];
+        for row in 0..rows {
+            router[row * EXPERTS] = 9.0;
+            router[row * EXPERTS + row] = 8.0;
+        }
+        let plan = RoutingPlan::build(&router, rows, EXPERTS, 2, true);
+        let largest = plan.groups.iter().map(|g| g.len).max().unwrap();
+        let mean = plan.slots() / plan.groups.len();
+        assert!(
+            largest >= 4 * mean.max(1),
+            "the fixture must be skewed: largest={largest} mean={mean}"
+        );
+        let fc1_size = 2 * INTER;
+        assert_eq!(
+            grouped_work_units(&plan, fc1_size, HIDDEN, INTER),
+            largest as u64 * HIDDEN as u64 * (fc1_size + INTER) as u64
+        );
+        assert!(
+            grouped_work_units(&plan, fc1_size, HIDDEN, INTER) >= grouped_min_work(),
+            "the dominant group is large enough for the grouped driver"
+        );
+        // The same shape summarised by the mean would fall below the floor, so
+        // this test fails if the statistic is ever changed back.
+        let mean_work = (mean as u64) * (HIDDEN as u64) * ((fc1_size + INTER) as u64);
+        assert!(mean_work < grouped_min_work());
+    }
+
+    /// The exact algorithm `run_moe_grouped` replaced: gather each expert's
+    /// rows into a fresh buffer, run `run_expert_grouped`, then accumulate the
+    /// weighted result into the output in ascending expert order.
+    #[allow(clippy::too_many_arguments)]
+    fn per_expert_loop_reference(
+        rows: usize,
+        hidden: usize,
+        inter: usize,
+        experts: usize,
+        fc1_size: usize,
+        input: &[f32],
+        router: &[f32],
+        fc1: &[f32],
+        fc2: &[f32],
+        fc3: Option<&[f32]>,
+        fc1_bias: Option<&[f32]>,
+        fc2_bias: Option<&[f32]>,
+        fc3_bias: Option<&[f32]>,
+        attributes: &MoeAttributes,
+    ) -> Vec<f32> {
+        let mut output = vec![0.0f32; rows * hidden];
+        let mut tasks = BTreeMap::<usize, Vec<(usize, f32)>>::new();
+        for row in 0..rows {
+            for (expert, weight) in routing_weights(
+                &router[row * experts..(row + 1) * experts],
+                None,
+                attributes.k,
+                attributes.normalize_routing_weights,
+            ) {
+                tasks.entry(expert).or_default().push((row, weight));
+            }
+        }
+        for (expert, expert_tasks) in tasks {
+            let mut grouped_input = Vec::with_capacity(expert_tasks.len() * hidden);
+            for &(row, _) in &expert_tasks {
+                grouped_input.extend_from_slice(&input[row * hidden..(row + 1) * hidden]);
+            }
+            let expert_out = run_expert_grouped(
+                &grouped_input,
+                expert_tasks.len(),
+                &fc1[expert * fc1_size * hidden..(expert + 1) * fc1_size * hidden],
+                fc1_bias.map(|b| &b[expert * fc1_size..(expert + 1) * fc1_size]),
+                &fc2[expert * hidden * inter..(expert + 1) * hidden * inter],
+                fc2_bias.map(|b| &b[expert * hidden..(expert + 1) * hidden]),
+                fc3.map(|w| &w[expert * inter * hidden..(expert + 1) * inter * hidden]),
+                fc3_bias.map(|b| &b[expert * inter..(expert + 1) * inter]),
+                fc1_size,
+                hidden,
+                inter,
+                attributes,
+            )
+            .unwrap();
+            for (grouped_row, &(row, weight)) in expert_tasks.iter().enumerate() {
+                for feature in 0..hidden {
+                    output[row * hidden + feature] +=
+                        weight * expert_out[grouped_row * hidden + feature];
+                }
+            }
+        }
+        output
+    }
+
+    /// The grouped/batched driver must be **bit-identical** to the per-expert
+    /// loop it replaced. Batching only changes how MLAS partitions threads and
+    /// the slot layout only changes where rows live, so any difference here is
+    /// a bug rather than a rounding artefact.
+    ///
+    /// The two row counts are the two regimes: `rows == 1` puts every group at
+    /// exactly one row, which is the uniform-length case that becomes a single
+    /// batched GEMM, while `rows == 37` with `k == 3` over 5 experts produces
+    /// groups of several different lengths, exercising the length bucketing,
+    /// the per-expert bias lookup and the multi-contribution scatter.
+    #[test]
+    fn grouped_driver_is_bit_identical_to_the_per_expert_loop() {
+        const HIDDEN: usize = 24;
+        const INTER: usize = 20;
+        const EXPERTS: usize = 5;
+        for &(rows, k) in &[(1usize, 3usize), (37, 3), (512, 2)] {
+            for &(activation, fusion, with_fc3) in &[
+                (Activation::Relu, 0usize, false),
+                (Activation::Gelu, 0, false),
+                (Activation::Silu, 0, true),
+                (Activation::Swiglu, 0, true),
+                (Activation::Swiglu, 1, false),
+                (Activation::Swiglu, 2, false),
+            ] {
+                for with_bias in [false, true] {
+                    let attributes = MoeAttributes {
+                        k,
+                        activation,
+                        normalize_routing_weights: true,
+                        swiglu_fusion: fusion,
+                        activation_alpha: 1.702,
+                        activation_beta: 1.0,
+                        swiglu_limit: 7.0,
+                    };
+                    let fc1_size = attributes.checked_fc1_size(INTER, "MoE").unwrap();
+                    let input = ramp(rows * HIDDEN, 23, 0.5, 0.031);
+                    let router = ramp(rows * EXPERTS, 17, 0.4, 0.11);
+                    let fc1 = ramp(EXPERTS * fc1_size * HIDDEN, 29, 0.5, 0.017);
+                    let fc2 = ramp(EXPERTS * HIDDEN * INTER, 31, 0.5, 0.013);
+                    let fc3 = with_fc3.then(|| ramp(EXPERTS * INTER * HIDDEN, 19, 0.5, 0.021));
+                    let fc1_bias = with_bias.then(|| ramp(EXPERTS * fc1_size, 11, 0.5, 0.07));
+                    let fc2_bias = with_bias.then(|| ramp(EXPERTS * HIDDEN, 13, 0.5, 0.05));
+                    let fc3_bias =
+                        (with_bias && with_fc3).then(|| ramp(EXPERTS * INTER, 7, 0.5, 0.03));
+
+                    let want = per_expert_loop_reference(
+                        rows,
+                        HIDDEN,
+                        INTER,
+                        EXPERTS,
+                        fc1_size,
+                        &input,
+                        &router,
+                        &fc1,
+                        &fc2,
+                        fc3.as_deref(),
+                        fc1_bias.as_deref(),
+                        fc2_bias.as_deref(),
+                        fc3_bias.as_deref(),
+                        &attributes,
+                    );
+                    let mut plan = RoutingPlan::build(&router, rows, EXPERTS, k, true);
+                    plan.build_row_slots();
+                    let got = run_moe_grouped(
+                        &plan,
+                        &input,
+                        &fc1,
+                        fc1_bias.as_deref(),
+                        &fc2,
+                        fc2_bias.as_deref(),
+                        fc3.as_deref(),
+                        fc3_bias.as_deref(),
+                        fc1_size,
+                        HIDDEN,
+                        INTER,
+                        &attributes,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        got, want,
+                        "rows={rows} k={k} activation={activation:?} fusion={fusion} \
+                         fc3={with_fc3} bias={with_bias}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The slot layout has to survive experts that are never selected and rows
+    /// whose top-k lands on a single expert repeatedly: `row_slots` is sized
+    /// `rows * k` and the scatter must skip the entries that stay unfilled.
+    #[test]
+    fn routing_plan_groups_are_contiguous_ascending_and_cover_every_slot() {
+        const ROWS: usize = 11;
+        const EXPERTS: usize = 6;
+        const K: usize = 2;
+        // Row `r` prefers experts `r % 3` - experts 3..6 are never routed to.
+        let mut router = vec![0.0f32; ROWS * EXPERTS];
+        for row in 0..ROWS {
+            router[row * EXPERTS + (row % 3)] = 5.0;
+            router[row * EXPERTS + ((row + 1) % 3)] = 4.0;
+        }
+        let mut plan = RoutingPlan::build(&router, ROWS, EXPERTS, K, true);
+        assert_eq!(plan.slots(), ROWS * K);
+        assert_eq!(plan.groups.len(), 3, "only three experts are ever selected");
+        let mut expected_start = 0;
+        let mut previous_expert = None;
+        for group in &plan.groups {
+            assert_eq!(group.start, expected_start);
+            assert!(previous_expert.is_none_or(|e| e < group.expert));
+            for slot in group.start..group.start + group.len {
+                assert_eq!(plan.slot_expert[slot] as usize, group.expert);
+            }
+            previous_expert = Some(group.expert);
+            expected_start += group.len;
+        }
+        assert_eq!(expected_start, plan.slots());
+        assert!(
+            plan.row_slots.is_empty(),
+            "the inversion is only built for the driver that reads it"
+        );
+        plan.build_row_slots();
+        // Every slot is reachable from exactly one `row_slots` entry.
+        let mut seen = vec![0usize; plan.slots()];
+        for &slot in &plan.row_slots {
+            if slot != u32::MAX {
+                seen[slot as usize] += 1;
+            }
+        }
+        assert!(seen.iter().all(|&count| count == 1));
     }
 
     fn ramp(len: usize, modulus: usize, offset: f32, scale: f32) -> Vec<f32> {

@@ -766,6 +766,7 @@ struct PackedNBitsWeight {
     zero_points: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Copy)]
 enum BorrowedScales<'a> {
     F32(&'a [f32]),
     F16(&'a [half::f16]),
@@ -1141,6 +1142,25 @@ impl Kernel for MatMulNBitsKernel {
                 BORROWED_INT4_ASYMMETRIC_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
             }
             with_decode_pool(|| {
+                #[cfg(target_arch = "x86_64")]
+                if borrowed_int4_nblock_enabled()
+                    && !matches!(dot_kernel, DotKernel::Scalar)
+                    && self.block_size.is_multiple_of(32)
+                {
+                    borrowed_affine_int4_matmul_nblock(
+                        &activations,
+                        packed,
+                        scales,
+                        borrowed_zero_points,
+                        bias.as_deref(),
+                        result,
+                        m,
+                        self.k,
+                        self.n,
+                        self.block_size,
+                    );
+                    return;
+                }
                 borrowed_affine_int4_matmul(
                     &activations,
                     packed,
@@ -6077,6 +6097,220 @@ fn borrowed_scales<'a>(view: &TensorView<'a>) -> Option<BorrowedScales<'a>> {
     }
 }
 
+/// A/B toggle for the register-blocked ("N-blocked") borrowed int4 decode
+/// kernel that absorbs MLAS SQNBit CompFp32's activation-reuse locality without
+/// a resident packed copy. `1`/`on` enables it; unset or `0`/`off` keeps the
+/// per-column path. Default off so the shipped borrowed path is unchanged until
+/// the win is measured, exactly like the `ONNX_GENAI_CPU_MM_MLAS_QNBIT` and
+/// `#994` toggles that preceded it. Production is the only writer of process
+/// state here: this is a read-only env probe, never mutated at runtime.
+#[cfg(target_arch = "x86_64")]
+fn borrowed_int4_nblock_enabled() -> bool {
+    std::env::var("ONNX_GENAI_CPU_MM_INT4_NBLK")
+        .ok()
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("off")
+        })
+        .unwrap_or(false)
+}
+
+/// Register-blocked borrowed int4 matmul. Reads the *same* zero-copy mmap int4
+/// layout as [`borrowed_affine_int4_matmul`] (no repack, no resident copy), but
+/// processes up to four output columns together with four independent f32
+/// accumulators, loading each activation vector once and reusing it across the
+/// group. This mirrors MLAS SQNBit CompFp32's M==1 `NCols4` register blocking
+/// (`sqnbitgemm_kernel_avx2.cpp`), whose activation reuse and single
+/// end-of-column horizontal reduction are the two locality wins that do not
+/// depend on its prepacked buffer.
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_arch = "x86_64")]
+fn borrowed_affine_int4_matmul_nblock(
+    activations: &[f32],
+    packed: &[u8],
+    scales: BorrowedScales<'_>,
+    zero_points: Option<&[u8]>,
+    bias: Option<&[f32]>,
+    result: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    block_size: usize,
+) {
+    debug_assert_eq!(activations.len(), m * k);
+    debug_assert_eq!(result.len(), m * n);
+    let bits = 4usize;
+    let layout = NBitsLayout { bits, block_size };
+    let block_count = k.div_ceil(block_size);
+    let packed_row_size = block_count * layout.packed_block_size();
+    let zero_point_row_size = layout.zero_point_row_size(block_count);
+    for (activation, output_row) in activations.chunks_exact(k).zip(result.chunks_exact_mut(n)) {
+        let activation_sums = activation
+            .chunks(block_size)
+            .map(|block| block.iter().sum::<f32>())
+            .collect::<Vec<_>>();
+        let compute = |output_start: usize, outputs: &mut [f32]| {
+            let mut group_start = 0usize;
+            while group_start < outputs.len() {
+                let group = (outputs.len() - group_start).min(4);
+                let mut packed_rows: [&[u8]; 4] = [&[] as &[u8]; 4];
+                let mut scale_bases = [0usize; 4];
+                let mut zp_rows: [Option<&[u8]>; 4] = [None; 4];
+                let mut biases = [0.0f32; 4];
+                for j in 0..group {
+                    let output_index = output_start + group_start + j;
+                    packed_rows[j] = &packed
+                        [output_index * packed_row_size..(output_index + 1) * packed_row_size];
+                    scale_bases[j] = output_index * block_count;
+                    zp_rows[j] = zero_points.map(|zp| {
+                        &zp[output_index * zero_point_row_size
+                            ..(output_index + 1) * zero_point_row_size]
+                    });
+                    biases[j] = bias.map_or(0.0, |values| values[output_index]);
+                }
+                let mut out_buf = [0.0f32; 4];
+                // SAFETY: this function is only reached when `selected_dot_kernel`
+                // reported an AVX2-capable host (see the route in `compute`), so
+                // AVX2+FMA are available; every slice passed is bounds-checked
+                // above and the block loop never reads past `k`.
+                unsafe {
+                    borrowed_int4_nblock4_avx2(
+                        activation,
+                        &activation_sums,
+                        &packed_rows[..group],
+                        &scales,
+                        &scale_bases[..group],
+                        &zp_rows[..group],
+                        &biases[..group],
+                        layout,
+                        block_count,
+                        block_size,
+                        k,
+                        &mut out_buf[..group],
+                    );
+                }
+                outputs[group_start..group_start + group].copy_from_slice(&out_buf[..group]);
+                group_start += group;
+            }
+        };
+        parallel_output_rows(output_row, k, compute);
+    }
+}
+
+/// AVX2 + FMA register-blocked int4 kernel for up to four output columns.
+///
+/// For each K block it loads the block's activation vectors once and reuses
+/// them across every column in the group (MLAS's activation-reuse trick), folds
+/// the per-block scale into a running f32 accumulator via a single FMA, and
+/// carries the zero-point affine correction in scalar. A single horizontal
+/// reduction per column at the very end replaces the per-block reduction the
+/// per-column path pays. The nibble unpack is byte-for-byte the same as
+/// [`borrowed_int4_block_dot_avx2`], so results differ from that path only by
+/// f32 summation reassociation (a few ULP), never in nibble decode.
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn borrowed_int4_nblock4_avx2(
+    activation: &[f32],
+    activation_sums: &[f32],
+    packed_rows: &[&[u8]],
+    scales: &BorrowedScales<'_>,
+    scale_bases: &[usize],
+    zp_rows: &[Option<&[u8]>],
+    biases: &[f32],
+    layout: NBitsLayout,
+    block_count: usize,
+    block_size: usize,
+    k: usize,
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let group = packed_rows.len();
+    let mask = _mm_set1_epi8(0x0f);
+    let packed_block_size = layout.packed_block_size();
+    let mut acc = [_mm256_setzero_ps(); 4];
+    let mut correction = [0.0f32; 4];
+    let mut extra = [0.0f32; 4];
+    for block in 0..block_count {
+        let depth_start = block * block_size;
+        let valid = k.saturating_sub(depth_start).min(block_size);
+        if valid != block_size || !block_size.is_multiple_of(32) {
+            // Ragged or non-32-multiple tail block: scalar, matching the
+            // per-column path's scalar fallback exactly.
+            for c in 0..group {
+                let block_values = &packed_rows[c]
+                    [block * packed_block_size..(block + 1) * packed_block_size];
+                let scale = scales.get(scale_bases[c] + block);
+                let zero_point = layout.zero_point(zp_rows[c], block) as f32;
+                let mut dot = 0.0f32;
+                for (byte_index, &byte) in block_values.iter().enumerate() {
+                    let within = byte_index * 2;
+                    if within < valid {
+                        dot += activation[depth_start + within] * (byte & 0x0f) as f32;
+                    }
+                    if within + 1 < valid {
+                        dot += activation[depth_start + within + 1] * (byte >> 4) as f32;
+                    }
+                }
+                extra[c] += dot * scale;
+                correction[c] += scale * zero_point * activation_sums[block];
+            }
+            continue;
+        }
+        let chunks = block_size / 32;
+        let mut blk = [_mm256_setzero_ps(); 4];
+        for chunk in 0..chunks {
+            let base = depth_start + chunk * 32;
+            // SAFETY: `valid == block_size` and `base + 32 <= k`, so all four
+            // 8-lane loads stay within the activation row.
+            let a0 = unsafe { _mm256_loadu_ps(activation.as_ptr().add(base)) };
+            let a1 = unsafe { _mm256_loadu_ps(activation.as_ptr().add(base + 8)) };
+            let a2 = unsafe { _mm256_loadu_ps(activation.as_ptr().add(base + 16)) };
+            let a3 = unsafe { _mm256_loadu_ps(activation.as_ptr().add(base + 24)) };
+            for c in 0..group {
+                // SAFETY: 16 packed bytes per 32-lane chunk are in bounds for
+                // this column's block slice; loadu permits unaligned pointers.
+                let bytes = unsafe {
+                    _mm_loadu_si128(
+                        packed_rows[c]
+                            .as_ptr()
+                            .add(block * packed_block_size + chunk * 16)
+                            .cast(),
+                    )
+                };
+                let low = _mm_and_si128(bytes, mask);
+                let high = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+                let inter_lo = _mm_unpacklo_epi8(low, high);
+                let inter_hi = _mm_unpackhi_epi8(low, high);
+                let w0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(inter_lo));
+                let w1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(inter_lo, 8)));
+                let w2 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(inter_hi));
+                let w3 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(inter_hi, 8)));
+                blk[c] = _mm256_fmadd_ps(a0, w0, blk[c]);
+                blk[c] = _mm256_fmadd_ps(a1, w1, blk[c]);
+                blk[c] = _mm256_fmadd_ps(a2, w2, blk[c]);
+                blk[c] = _mm256_fmadd_ps(a3, w3, blk[c]);
+            }
+        }
+        for c in 0..group {
+            let scale = scales.get(scale_bases[c] + block);
+            let zero_point = layout.zero_point(zp_rows[c], block) as f32;
+            acc[c] = _mm256_fmadd_ps(blk[c], _mm256_set1_ps(scale), acc[c]);
+            correction[c] += scale * zero_point * activation_sums[block];
+        }
+    }
+    for c in 0..group {
+        let vector = acc[c];
+        let lo = _mm256_castps256_ps128(vector);
+        let hi = _mm256_extractf128_ps(vector, 1);
+        let sum4 = _mm_add_ps(lo, hi);
+        let sum2 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+        let sum1 = _mm_add_ss(sum2, _mm_shuffle_ps(sum2, sum2, 0x55));
+        out[c] = biases[c] + _mm_cvtss_f32(sum1) + extra[c] - correction[c];
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn borrowed_affine_int4_matmul(
     activations: &[f32],
@@ -8837,6 +9071,80 @@ mod tests {
             }
         }
         (packed, scales, asymmetric.then_some(zps), dequantized)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn nblock_matches_per_column_borrowed_path() {
+        // The register-blocked ("N-blocked") borrowed int4 kernel must produce
+        // the same result as the per-column borrowed path (up to f32
+        // reassociation), for symmetric and asymmetric int4, single- and
+        // multi-row activations, and an N that is not a multiple of 4 (tail
+        // group). Guarded to x86_64 because the kernel is x86-only.
+        if matches!(selected_dot_kernel(), DotKernel::Scalar) {
+            // No AVX2 on this host; the N-blocked path is never selected.
+            return;
+        }
+        let mut rng: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng >> 40) as f32 / (1u32 << 24) as f32) - 0.5
+        };
+        for &(m, k, n, block_size) in &[
+            (1usize, 96usize, 13usize, 32usize),
+            (1, 128, 8, 32),
+            (2, 64, 7, 32),
+            (1, 256, 16, 128),
+        ] {
+            for &asymmetric in &[false, true] {
+                let weights_nk: Vec<f32> = (0..n * k).map(|_| next()).collect();
+                let activations: Vec<f32> = (0..m * k).map(|_| next()).collect();
+                let (packed, scales, zps, _dequant) =
+                    quantize(&weights_nk, n, k, block_size, asymmetric);
+                let zp_slice = zps.as_deref();
+                let bias: Vec<f32> = (0..n).map(|_| next()).collect();
+
+                let mut expected = vec![0.0f32; m * n];
+                borrowed_affine_int4_matmul(
+                    &activations,
+                    &packed,
+                    BorrowedScales::F32(&scales),
+                    zp_slice,
+                    Some(&bias),
+                    &mut expected,
+                    m,
+                    k,
+                    n,
+                    block_size,
+                    selected_dot_kernel(),
+                );
+
+                let mut got = vec![0.0f32; m * n];
+                borrowed_affine_int4_matmul_nblock(
+                    &activations,
+                    &packed,
+                    BorrowedScales::F32(&scales),
+                    zp_slice,
+                    Some(&bias),
+                    &mut got,
+                    m,
+                    k,
+                    n,
+                    block_size,
+                );
+
+                for (index, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+                    let tolerance = 1e-3 * a.abs().max(1.0);
+                    assert!(
+                        (a - b).abs() <= tolerance,
+                        "m={m} k={k} n={n} block={block_size} asym={asymmetric} \
+                         index {index}: per-column {a} vs n-blocked {b}"
+                    );
+                }
+            }
+        }
     }
 
     fn reference(a: &[f32], weights_nk: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {

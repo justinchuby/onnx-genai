@@ -127,6 +127,18 @@ impl<T> GovernedWeightCache<T> {
         self.entry.get().is_some()
     }
 
+    /// The cached buffer if it is already filled, without ever building it.
+    ///
+    /// Returns `None` when declined or not yet filled. This is the read-only
+    /// counterpart to [`Self::get_or_fill`] for a caller that has its own build
+    /// path (e.g. a kernel that widens transiently) and only wants to reuse an
+    /// existing session copy when one is present. It never runs a builder, so a
+    /// declined cache is indistinguishable here from an unfilled admitted one:
+    /// both yield `None`, which is exactly the "recompute per call" contract.
+    pub fn filled(&self) -> Option<&[T]> {
+        self.entry.get().map(Vec::as_slice)
+    }
+
     /// Return the cached buffer, filling it with `build` on first use.
     ///
     /// Returns `None` when the plan declined, and then `build` is **never
@@ -241,6 +253,24 @@ mod tests {
             "the type must be able to expose a prediction that is wrong, which is \
              how #1051's 2.4x under-report would have been caught"
         );
+    }
+
+    /// `filled` exposes an already-stored buffer without ever building it, and
+    /// yields `None` for a declined cache or one not yet filled.
+    #[test]
+    fn filled_returns_the_stored_buffer_and_never_builds() {
+        let declined = GovernedWeightCache::<f32>::new(CacheVerdict::decline(64));
+        assert!(declined.filled().is_none(), "declined holds nothing");
+
+        let admitted = GovernedWeightCache::<f32>::new(CacheVerdict::admit(64));
+        assert!(
+            admitted.filled().is_none(),
+            "unfilled admitted holds nothing"
+        );
+        admitted
+            .get_or_fill(|| vec![7.0; 16])
+            .expect("admitted fills");
+        assert_eq!(admitted.filled().map(<[f32]>::len), Some(16));
     }
 
     /// A failed build leaves the cache empty and is retried, rather than
