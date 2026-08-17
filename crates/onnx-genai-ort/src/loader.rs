@@ -387,7 +387,7 @@ pub struct PipelineModels {
     pub tokenizers: BTreeMap<String, Tokenizer>,
     pub shared_tokenizer: Option<Tokenizer>,
     pub directory: PipelineModelDirectory,
-    _environment: Environment,
+    _environment: Option<Environment>,
 }
 
 impl PipelineModels {
@@ -417,15 +417,19 @@ impl PipelineModels {
         build_ort_session: impl Fn(&str) -> bool,
     ) -> Result<Self> {
         let directory = PipelineModelDirectory::load(root)?;
-        let environment = Environment::new("onnx-genai-pipeline")?;
 
         let mut sessions = BTreeMap::new();
         let mut graph_io_metadata = BTreeMap::new();
+        let mut environment = None;
         for (name, path) in &directory.model_paths {
             if build_ort_session(name) {
+                let environment = match environment.as_ref() {
+                    Some(environment) => environment,
+                    None => environment.insert(Environment::new("onnx-genai-pipeline")?),
+                };
                 sessions.insert(
                     name.clone(),
-                    Session::new(&environment, path, options.clone())?,
+                    Session::new(environment, path, options.clone())?,
                 );
             } else {
                 graph_io_metadata.insert(name.clone(), graph_io_from_model_path(path)?);
