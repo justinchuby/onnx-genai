@@ -367,6 +367,25 @@ impl Drop for DenseCacheEnabledScope {
     }
 }
 
+/// How many times an autoregressive decode session materializes each populated
+/// `MatMulPrepack::dense` copy -- the shape-keyed instantiation multiplier that
+/// the first cut of this accounting (like #1051's before it) missed.
+///
+/// The executor's kernel cache is keyed by `(node, resolved_input_shapes)`, so a
+/// decoder compiles a `MatMul` node once for the prefill shape (`m > 1`) and
+/// once for the decode shape (`m == 1`), each a separate `MatMulPrepack` holding
+/// its own `dense`. The only operand that reaches `dense` is a constant non-f32
+/// `B` paired with an f32 `A`, and in that case both the prefill and the decode
+/// instance take the generic/direct-f32 GEMM that widens `B`, so **both** retain
+/// a `4 * numel` copy for the whole session. Measured directly by
+/// [`predicted_dense_bytes_equal_actual_after_matmul_execution`]: a prefill
+/// instance plus a decode instance of one f16-`B` node sum to exactly two
+/// copies. Accounting one copy under-reports the resident footprint by 2x -- the
+/// dangerous (under-reporting) direction for an admission gate. A prefill-only
+/// run holds one copy, so this over-estimates there, which is the safe direction
+/// (the gate declines sooner). Matches #1051's `MLAS_PACKED_DECODE_INSTANTIATIONS`.
+const MATMUL_DENSE_DECODE_INSTANTIATIONS: u64 = 2;
+
 /// Predicted bytes the per-kernel `MatMulPrepack::dense` caches will hold for
 /// `graph` once it has run -- the *prediction* the memory-strategy plan budgets
 /// for, whose accuracy the summed [`GovernedWeightCache::live_bytes`] of the
@@ -385,6 +404,30 @@ impl Drop for DenseCacheEnabledScope {
 /// to: **a constant operand whose dtype is a non-f32 float** (f16 / bf16 / f64).
 /// A contiguous f32 constant is borrowed zero-copy and contributes nothing.
 ///
+/// # The per-shape instantiation multiplier
+///
+/// The executor's kernel cache is **shape-keyed** (`KernelKey { node, shapes }`
+/// in `onnx-runtime-session/src/executor/kernel_cache.rs`): a `MatMul` kernel is
+/// compiled and cached *per distinct resolved activation shape*, and each
+/// instance is a *separate* `MatMulPrepack` with its own `dense` slot. Unlike
+/// the weight-transpose cache -- process-global and keyed on the weight address,
+/// so a second instantiation reuses the first -- the dense cache is per-instance,
+/// so its resident footprint is multiplied by the number of instantiations that
+/// widen the constant `B`.
+///
+/// An autoregressive decoder presents exactly two activation shapes to each such
+/// node: the prefill shape (`m > 1`) and the decode shape (`m == 1`). The only
+/// case that populates `dense` is a constant non-f32 `B` paired with an f32 `A`
+/// (a same-half `B`+`A` takes `try_matmul_half`, and both the `m == 1` GEMV and
+/// the MLAS half-prefill fast paths require `A` to be half, so they are skipped
+/// when `A` is f32) -- and in that case **both** the prefill instance (via the
+/// generic/direct-f32 GEMM) and the decode instance (via the same paths at
+/// `m == 1`) widen `B` and each retain their own `4 * numel` copy. So the
+/// session holds [`MATMUL_DENSE_DECODE_INSTANTIATIONS`] copies, not one. This is
+/// the same shape-keyed multiplier the MLAS SQNBit accounting missed and #1051
+/// corrected; counting one copy here would under-report the footprint by 2x --
+/// the dangerous (under-reporting) direction for an admission gate.
+///
 /// # Direction of error
 ///
 /// Per #1056 this predictor **over-predicts, never under-predicts**:
@@ -394,6 +437,14 @@ impl Drop for DenseCacheEnabledScope {
 ///   the true cost is zero while this still counts it. Whether the other operand
 ///   is half is not a graph-static property of the constant one, so counting is
 ///   the safe direction.
+/// * A prefill-only run (no `m == 1` step) instantiates one copy, so accounting
+///   [`MATMUL_DENSE_DECODE_INSTANTIATIONS`] over-estimates for that workload,
+///   which only makes the gate decline sooner (safe). Conversely, a session
+///   that presents *more* than two distinct activation shapes to a node (e.g.
+///   several prompt lengths across `generate` calls) could instantiate more than
+///   two copies; the multiplier follows #1051's convention of bounding the
+///   autoregressive decode workload at prefill + decode, and that residual is
+///   the same documented class as #1051's.
 /// * The one residual gap that cannot be closed from the graph is a **non-
 ///   contiguous f32** constant (a column-major weight): the kernel *would* cache
 ///   it (`to_dense_f32_widen` allocates), but `WeightRef` exposes no strides, so
@@ -406,18 +457,10 @@ impl Drop for DenseCacheEnabledScope {
 ///   over-counting every f32 weight, which would inflate the budget on the
 ///   overwhelmingly common contiguous-f32 case.
 ///
-/// The shape-keyed kernel cache instantiates a node once per activation shape
-/// (prefill `m > 1`, decode `m == 1`), and each instantiation is a *separate*
-/// `MatMulPrepack` with its own `dense` slot. Unlike the weight-transpose cache
-/// (which is process-global and keyed on the weight address, so a second
-/// instantiation reuses the first), the dense cache is per-instance. In
-/// practice, however, a constant operand that reaches `dense` is the `B` weight,
-/// and the paths that widen `B` to f32 (the generic f32 GEMM and the direct-f32
-/// output path) both densify identically across shapes; the number of retained
-/// copies equals the number of instantiations that actually take a `dense`-using
-/// path. The predicted-equals-actual test drives a single instantiation so the
-/// ratio is exactly 1.00; where multiple instantiations retain copies the plan
-/// over-predicts by counting once, which is the #1056-safe direction.
+/// The predicted-equals-actual test drives *both* a prefill and a decode
+/// instantiation of one node and sums their `live_bytes`, so the ratio it
+/// asserts is 1.00 against the multiplied prediction -- a test that saw only one
+/// instantiation could not defend against a dropped multiplier.
 pub fn matmul_dense_cache_predicted_bytes(graph: &Graph) -> u64 {
     let mut total = 0_u64;
     for node in graph.nodes.values() {
@@ -442,7 +485,10 @@ fn node_matmul_dense_cache_bytes(node: &Node, graph: &Graph) -> u64 {
     for index in 0..2 {
         total = total.saturating_add(dense_operand_cache_bytes(node, graph, index));
     }
-    total
+    // The shape-keyed kernel cache instantiates this node once per activation
+    // shape (prefill + decode), each holding its own `dense` copy; see
+    // [`MATMUL_DENSE_DECODE_INSTANTIATIONS`].
+    total.saturating_mul(MATMUL_DENSE_DECODE_INSTANTIATIONS)
 }
 
 /// Bytes `MatMulPrepack::dense(index, ..)` retains for one operand of `node`:
@@ -2088,12 +2134,14 @@ mod tests {
     }
 
     /// The predictor counts a constant operand iff it widens to an owned f32
-    /// copy: f16/bf16 constants cost `4*k*n`, a contiguous f32 constant is
-    /// borrowed zero-copy (0), and a non-constant operand is never cached (0).
+    /// copy: f16/bf16 constants cost `4*k*n` per instantiation and the
+    /// shape-keyed kernel cache holds [`MATMUL_DENSE_DECODE_INSTANTIATIONS`] of
+    /// them (prefill + decode), a contiguous f32 constant is borrowed zero-copy
+    /// (0), and a non-constant operand is never cached (0).
     #[test]
     fn dense_cache_predictor_counts_only_constant_non_f32_operands() {
         let (k, n) = (10usize, 7usize);
-        let bytes = (k * n * 4) as u64;
+        let bytes = (k * n * 4) as u64 * MATMUL_DENSE_DECODE_INSTANTIATIONS;
         assert_eq!(
             matmul_dense_cache_predicted_bytes(&dense_matmul_graph(k, n, DataType::Float16, true)),
             bytes,
@@ -2128,49 +2176,76 @@ mod tests {
 
     /// #1056 acceptance criterion 1: the predicted dense-cache bytes must equal
     /// the bytes actually held after a real run, ratio 1.00 — proven in one run
-    /// by comparing the plan's graph prediction against the executed kernel's
-    /// [`MatMulPrepack::dense_live_bytes`].
+    /// by comparing the plan's graph prediction against the *summed*
+    /// [`MatMulPrepack::dense_live_bytes`] of every kernel instantiation.
     ///
     /// The operand is a constant **f16** `B` with an **f32** `A`: `try_matmul_half`
     /// only fires when both operands share a half dtype, so this deterministically
     /// takes the generic f32 path that widens `B` through `dense(1)`, genuinely
     /// populating the cache (unlike the int4 / same-half models, which never do).
+    ///
+    /// Crucially it drives **two** instantiations — a prefill (`m > 1`) and a
+    /// decode (`m == 1`) — the way the shape-keyed kernel cache does, each a
+    /// separate `MatMulKernel` with its own `dense`. Both retain a copy, so the
+    /// live total is [`MATMUL_DENSE_DECODE_INSTANTIATIONS`] × `4*k*n`, and the
+    /// predictor must account for that multiplier or this ratio breaks. A test
+    /// that drove a single instantiation could not catch a dropped multiplier —
+    /// which is exactly #1051's defect.
     #[test]
     fn predicted_dense_bytes_equal_actual_after_matmul_execution() {
         // Thread-local admit so the process-global the concurrent tests read is
         // never touched (#1056 isolation). The verdict is read at construction,
-        // so the kernel is built inside the scope.
+        // so each kernel is built inside the scope.
         let _admit = DenseCacheEnabledScope::new(true);
 
-        let (m, k, n) = (4usize, 48usize, 33usize);
+        let (k, n) = (48usize, 33usize);
         let graph = dense_matmul_graph(k, n, DataType::Float16, true);
         let predicted = matmul_dense_cache_predicted_bytes(&graph);
-        assert_eq!(predicted, (k as u64) * (n as u64) * 4);
+        // The prediction budgets for both shape-keyed instantiations.
+        assert_eq!(
+            predicted,
+            (k as u64) * (n as u64) * 4 * MATMUL_DENSE_DECODE_INSTANTIATIONS
+        );
 
-        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.017).sin()).collect();
         let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.013).cos()).collect();
-        let a = Owned::f32(&[m, k], &a_data);
         let b = Owned::f16(&[k, n], &b_data);
-        let mut out = Owned::zeros_f32(&[m, n]);
-        let mut kernel = MatMulKernel::default();
-        kernel.set_constant_inputs(&[false, true]);
-        kernel
-            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
-            .unwrap();
 
-        let actual = kernel.prepack.dense_live_bytes();
+        // Mirror the executor's shape-keyed kernel cache: the SAME node compiled
+        // once per resolved activation shape (prefill m>1, decode m==1) yields a
+        // SEPARATE `MatMulKernel`/`MatMulPrepack`, each widening `B` into its own
+        // `dense`. We instantiate both and sum their live bytes.
+        let mut instances = 0u64;
+        let mut actual = 0u64;
+        for m in [4usize, 1usize] {
+            let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.017).sin()).collect();
+            let a = Owned::f32(&[m, k], &a_data);
+            let mut out = Owned::zeros_f32(&[m, n]);
+            let mut kernel = MatMulKernel::default();
+            kernel.set_constant_inputs(&[false, true]);
+            kernel
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+            assert!(
+                kernel.prepack.dense[1].is_filled(),
+                "the constant f16 B must be widened into the governed cache at m={m}"
+            );
+            assert!(
+                !kernel.prepack.dense[0].is_filled(),
+                "the contiguous f32 A is borrowed, never cached (m={m})"
+            );
+            actual += kernel.prepack.dense_live_bytes();
+            instances += 1;
+        }
+
+        // Empirically: both the prefill and decode instances retain a copy.
+        assert_eq!(
+            instances, MATMUL_DENSE_DECODE_INSTANTIATIONS,
+            "prefill + decode = two shape-keyed instantiations"
+        );
         assert_eq!(
             actual, predicted,
-            "predicted dense-cache bytes must equal the bytes actually held \
-             (ratio 1.00)"
-        );
-        assert!(
-            kernel.prepack.dense[1].is_filled(),
-            "the constant f16 B must be widened into the governed cache"
-        );
-        assert!(
-            !kernel.prepack.dense[0].is_filled(),
-            "the contiguous f32 A is borrowed, never cached"
+            "predicted dense-cache bytes must equal the summed bytes actually \
+             held across all instantiations (ratio 1.00)"
         );
     }
 
