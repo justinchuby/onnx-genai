@@ -374,8 +374,16 @@ macro_rules! dispatch {
 /// Route an elementwise f32 kernel to MLAS when the `mlas` feature is on.
 ///
 /// MLAS is the library ONNX Runtime's own CPU activation kernels call, so this
-/// is not "a faster approximation" — it is *the same* polynomial ORT uses, and
-/// our output becomes bit-identical to ORT's for these ops. Measured on this
+/// is not "a faster approximation" — it is *the same* polynomial ORT uses.
+///
+/// Bit-reproducibility is **host-specific**, not universal. MLAS runtime
+/// dispatches by ISA, so an AVX-512 or non-AVX2 host may select a different
+/// kernel than the AVX2+FMA one the pure-Rust path mirrors. On this host and in
+/// CI (AVX2+FMA, AVX-512 masked) the two routes are bit-identical, pinned by
+/// `mlas_ab::mlas_matches_rust_simd_on_special_values`; elsewhere they may
+/// differ within the documented tolerance. Before this change an `mlas`-on and
+/// an `mlas`-off build agreed bitwise for these four ops on every host, and
+/// that is what is being traded for the speed. Measured on this
 /// host (AMD EPYC 9V74, AVX2+FMA, AVX-512 masked off), the pure-Rust AVX2 path
 /// is compute-bound at ~0.78 ns/elem while MLAS reaches ~0.35 ns/elem, which is
 /// memory bandwidth for a 4 B-in/4 B-out stream. The gap is the polynomial, not
@@ -2860,17 +2868,25 @@ mod mlas_ab {
     use super::*;
     use std::time::Instant;
 
-    fn best_ns(n: usize, mut f: impl FnMut()) -> f64 {
+    /// Time two routes **interleaved**, one iteration each per round, so that
+    /// any drift in machine state over the run hits both equally. Timing all of
+    /// A and then all of B would let a noisy neighbour land on one side only.
+    fn best_ns_pair(n: usize, mut a: impl FnMut(), mut b: impl FnMut()) -> (f64, f64) {
         for _ in 0..3 {
-            f();
+            a();
+            b();
         }
-        let mut best = f64::MAX;
+        let (mut best_a, mut best_b) = (f64::MAX, f64::MAX);
         for _ in 0..15 {
             let t = Instant::now();
-            f();
-            best = best.min(t.elapsed().as_secs_f64());
+            a();
+            best_a = best_a.min(t.elapsed().as_secs_f64());
+            let t = Instant::now();
+            b();
+            best_b = best_b.min(t.elapsed().as_secs_f64());
         }
-        best * 1e9 / n as f64
+        let scale = 1e9 / n as f64;
+        (best_a * scale, best_b * scale)
     }
 
     fn max_ulp(a: &[f32], b: &[f32]) -> (f64, u32) {
@@ -2906,8 +2922,7 @@ mod mlas_ab {
                 ("GeluErf", erf_gelu_avx2_shim, erf_gelu_mlas),
             ];
             for (name, rust, mlas_fn) in cases {
-                let a = best_ns(n, || rust(&x, &mut ours));
-                let b = best_ns(n, || mlas_fn(&x, &mut mlas));
+                let (a, b) = best_ns_pair(n, || rust(&x, &mut ours), || mlas_fn(&x, &mut mlas));
                 let (mabs, mulp) = max_ulp(&ours, &mlas);
                 println!(
                     "{name}\t{n}\t{a:.4}\t{b:.4}\t{:.2}x\t{mabs:.3e}\t{mulp}",

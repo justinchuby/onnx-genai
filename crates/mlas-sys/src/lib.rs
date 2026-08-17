@@ -745,7 +745,8 @@ pub fn compute_silu(input: &[f32], output: &mut [f32]) {
 
 /// Compute elementwise `tanh` over equal-length contiguous f32 slices using
 /// MLAS's SIMD polynomial — the same one ONNX Runtime's `Tanh` CPU kernel
-/// calls, so results are bit-identical to ORT's. Single threaded; callers shard
+/// calls. MLAS dispatches by ISA at runtime, so which kernel runs (and hence
+/// the exact bits) depends on the host. Single threaded; callers shard
 /// across threads themselves.
 pub fn compute_tanh(input: &[f32], output: &mut [f32]) {
     assert_eq!(
@@ -762,7 +763,8 @@ pub fn compute_tanh(input: &[f32], output: &mut [f32]) {
 }
 
 /// Compute elementwise `erf` over equal-length contiguous f32 slices using
-/// MLAS's SIMD polynomial — the same one ONNX Runtime's `Erf` CPU kernel calls.
+/// MLAS's SIMD polynomial — the same one ONNX Runtime's `Erf` CPU kernel
+/// calls. Which kernel runs depends on MLAS's runtime ISA dispatch.
 /// Single threaded; callers shard across threads themselves.
 pub fn compute_erf(input: &[f32], output: &mut [f32]) {
     assert_eq!(
