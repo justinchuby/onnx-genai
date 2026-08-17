@@ -92,6 +92,4 @@ pub use kernels::matmul::{
 // `matmul_dense_cache_predicted_bytes` and, when it does not fit, declines it via
 // `set_matmul_dense_cache_enabled` (kernels then widen per call and retain
 // nothing, byte-identical output).
-pub use kernels::matmul::{
-    matmul_dense_cache_predicted_bytes, set_matmul_dense_cache_enabled,
-};
+pub use kernels::matmul::{matmul_dense_cache_predicted_bytes, set_matmul_dense_cache_enabled};
