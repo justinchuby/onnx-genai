@@ -51,8 +51,15 @@ __device__ __forceinline__ void argmax_update(
     unsigned int candidate_index,
     float& best,
     unsigned int& best_index) {
+  // Ties resolve to the HIGHEST index, matching the host reference argmax
+  // (`max_by(total_cmp)` returns the last equal-maximum element). fp16 verify
+  // logits carry ~1-ULP diffs versus the greedy step that create equal maxima
+  // at multiple indices; picking the lowest index there would select a
+  // different token than the greedy baseline and break byte-identity. The
+  // comparison is on the global index value, so this rule holds identically
+  // across the warp, block, and finalize reductions regardless of lane origin.
   if (candidate > best ||
-      (candidate == best && candidate_index < best_index)) {
+      (candidate == best && candidate_index > best_index)) {
     best = candidate;
     best_index = candidate_index;
   }
@@ -325,14 +332,24 @@ mod tests {
     }
 
     fn host_argmax(logits: &[f32]) -> u32 {
-        let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        if max_logit == f32::NEG_INFINITY {
-            return 0;
+        // Reference for the device kernel: skip NaN (the kernel skips NaN), take
+        // the maximum value, and resolve ties to the HIGHEST index — matching
+        // the host greedy reference `max_by(total_cmp)`, which returns the last
+        // equal-maximum element. An all-NaN row yields the sentinel index 0.
+        let mut best = f32::NEG_INFINITY;
+        let mut best_index = 0u32;
+        let mut seen = false;
+        for (index, &value) in logits.iter().enumerate() {
+            if value.is_nan() {
+                continue;
+            }
+            if !seen || value >= best {
+                best = value;
+                best_index = index as u32;
+                seen = true;
+            }
         }
-        logits
-            .iter()
-            .position(|&value| value == max_logit)
-            .unwrap_or(0) as u32
+        best_index
     }
 
     fn result_bytes(elements: usize, batch: usize) -> usize {
@@ -414,6 +431,39 @@ mod tests {
         values
     }
 
+    /// Batched f16 sibling of [`run_batch_case`]: rounds every row to fp16, runs
+    /// the whole `batch` in one launch, and reads back the per-row header. Used
+    /// by the tie-break gate to exercise the f16 partials kernel over M rows.
+    fn run_batch_case_f16(ep: &CudaExecutionProvider, rows: &[Vec<f32>]) -> Vec<[u32; 2]> {
+        let batch = rows.len();
+        let vocab = rows[0].len();
+        assert!(rows.iter().all(|row| row.len() == vocab));
+        let bytes = rows
+            .iter()
+            .flatten()
+            .flat_map(|&value| half::f16::from_f32(value).to_bits().to_ne_bytes())
+            .collect::<Vec<_>>();
+        let mut input = ep.allocate(bytes.len(), 256).unwrap();
+        let mut output = ep.allocate(result_bytes(vocab, batch), 256).unwrap();
+        ep.copy_from_host(&bytes, &mut input).unwrap();
+        ep.device_argmax(&input, vocab, batch, DataType::Float16, &mut output)
+            .unwrap();
+        let mut header = vec![0_u8; batch * RESULT_BYTES];
+        ep.copy_to_host(&output, &mut header).unwrap();
+        let out = (0..batch)
+            .map(|s| {
+                let base = s * RESULT_BYTES;
+                [
+                    u32::from_ne_bytes(header[base..base + 4].try_into().unwrap()),
+                    u32::from_ne_bytes(header[base + 4..base + 8].try_into().unwrap()),
+                ]
+            })
+            .collect();
+        ep.deallocate(input).unwrap();
+        ep.deallocate(output).unwrap();
+        out
+    }
+
     #[test]
     fn device_argmax_matches_host_for_151936_random_ties_and_nan() {
         let Some(ep) = gpu() else { return };
@@ -477,8 +527,8 @@ mod tests {
         // per-sequence stride: the maximum sits at a *different* position in
         // every row, each row is larger than one block's grid-stride reach so
         // multiple partials are reduced, and two rows carry a deliberate tie so
-        // the lowest-index tie-break is exercised per sequence rather than
-        // globally (stage 2b-impl-3, #750).
+        // the HIGHEST-index tie-break is exercised per sequence rather than
+        // globally.
         let vocab = 4096;
         let peaks = [17_usize, 4000, 128, 2049];
         let mut rows: Vec<Vec<f32>> = peaks
@@ -492,11 +542,11 @@ mod tests {
                 logits
             })
             .collect();
-        // Row 1 gets a tie at an *earlier* index than its peak; the lower index
+        // Row 1 gets a tie at an *earlier* index than its peak; the HIGHER index
         // must win, proving each sequence tie-breaks against its own partials.
-        rows[1][2500] = 9.0; // peak was 4000 → lower index 2500 must win
-        rows[3][900] = 9.0; // peak was 2049 → lower index 900 must win
-        let expected = [17_u32, 2500, 128, 900];
+        rows[1][2500] = 9.0; // tie {2500, 4000} → higher index 4000 must win
+        rows[3][900] = 9.0; // tie {900, 2049} → higher index 2049 must win
+        let expected = [17_u32, 4000, 128, 2049];
 
         let batched = run_batch_case(&ep, &rows);
         assert_eq!(batched.len(), rows.len());
@@ -514,6 +564,104 @@ mod tests {
                 *result, solo,
                 "batched row {row} diverged from the single-sequence argmax"
             );
+        }
+    }
+
+    /// The decisive byte-identity gate for the highest-index tie-break: the
+    /// device argmax must equal the host highest-index argmax for every row of
+    /// M∈{1,4,6,8} batches at a realistic vocab (152064), across (a) random
+    /// fp16-representable logits and (b) rows with DELIBERATELY CONSTRUCTED TIES
+    /// (multiple equal maxima at different indices) where the highest tied index
+    /// must win. A single row that resolved a tie to a lower index (the old
+    /// kernel behaviour) fails this test.
+    ///
+    /// The M rows are driven through the batched launch (one sequence per grid
+    /// row) so each row is an independent argmax; the M=1 batch is the
+    /// single-sequence path. Verification is against the host reference only —
+    /// the batched launch is the argmax contract under test and, unlike a tight
+    /// allocate/free `run_case` loop, it does not recycle a fresh per-call result
+    /// buffer through the pooled allocator on every row.
+    #[test]
+    fn device_argmax_highest_index_tiebreak_matches_host_for_vocab_152064() {
+        let Some(ep) = gpu() else { return };
+        const VOCAB: usize = 152_064;
+
+        for &m in &[1_usize, 4, 6, 8] {
+            // (a) Random rows, one distinct seed per row so a shared reduction
+            // buffer or wrong per-row stride is caught. Values are quantised to
+            // fp16 so the f32 and f16 kernels agree and ties occur naturally.
+            let random_rows: Vec<Vec<f32>> = (0..m)
+                .map(|row| {
+                    let mut seed = 0x9E37_79B9_u32
+                        .wrapping_mul(row as u32 + 1)
+                        .wrapping_add(0x1234_5);
+                    (0..VOCAB)
+                        .map(|_| {
+                            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            let unit = (seed >> 8) as f32 / (1_u32 << 24) as f32; // [0,1)
+                            half::f16::from_f32(unit * 8.0 - 4.0).to_f32()
+                        })
+                        .collect()
+                })
+                .collect();
+            let random_f32 = run_batch_case(&ep, &random_rows);
+            let random_f16 = run_batch_case_f16(&ep, &random_rows);
+            for (row, (f32_got, f16_got)) in random_f32.iter().zip(random_f16.iter()).enumerate() {
+                let want = host_argmax(&random_rows[row]);
+                assert_eq!(
+                    f32_got[0], want,
+                    "M={m} random row {row}: f32 device argmax {} != host highest-index {want}",
+                    f32_got[0]
+                );
+                assert_eq!(f32_got[1], 0, "M={m} random row {row}: unexpected capture-error");
+                // The values are fp16-exact, so the f16 kernel must agree exactly.
+                assert_eq!(
+                    f16_got[0], want,
+                    "M={m} random row {row}: f16 device argmax {} != host highest-index {want}",
+                    f16_got[0]
+                );
+            }
+
+            // (b) Constructed ties: a flat low background with three EQUAL maxima
+            // at ascending indices; the highest must win. The tie indices differ
+            // per row (and land in different grid-stride partials) so a globally
+            // shared or lowest-index reduction is falsified. Exercised on both
+            // the f32 and f16 partials kernels.
+            let tie_rows: Vec<Vec<f32>> = (0..m)
+                .map(|row| {
+                    let mut logits = vec![-1.0_f32; VOCAB];
+                    // Spread the three ties across the vocab, offset per row.
+                    let p0 = 3 + row * 7;
+                    let p1 = VOCAB / 2 + row * 101;
+                    let p2 = VOCAB - 1 - row * 53; // highest → must be selected
+                    for &p in &[p0, p1, p2] {
+                        logits[p] = 5.0;
+                    }
+                    logits
+                })
+                .collect();
+            let tie_expected: Vec<u32> = (0..m).map(|row| (VOCAB - 1 - row * 53) as u32).collect();
+            let tie_f32 = run_batch_case(&ep, &tie_rows);
+            let tie_f16 = run_batch_case_f16(&ep, &tie_rows);
+            for (row, (f32_got, f16_got)) in tie_f32.iter().zip(tie_f16.iter()).enumerate() {
+                let want = tie_expected[row];
+                assert_eq!(
+                    f32_got[0], want,
+                    "M={m} tie row {row}: f32 device argmax {} != highest tied index {want}",
+                    f32_got[0]
+                );
+                // The host reference must agree, closing the byte-identity loop.
+                assert_eq!(
+                    want,
+                    host_argmax(&tie_rows[row]),
+                    "M={m} tie row {row}: host highest-index disagrees with expected"
+                );
+                assert_eq!(
+                    f16_got[0], want,
+                    "M={m} tie row {row}: f16 device argmax {} != highest tied index {want}",
+                    f16_got[0]
+                );
+            }
         }
     }
 }
