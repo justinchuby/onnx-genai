@@ -1387,7 +1387,7 @@ impl MatMulKernel {
         // 16-bit storage and are packed in cache-sized panels for f32
         // accumulation. Bf16 may use the runtime-gated AVX-512 BF16 kernel;
         // every other host uses the portable blocked implementation.
-        if let Some(result) = try_matmul_half(&inputs[0], &inputs[1], &geom)? {
+        if let Some(result) = try_matmul_half(&inputs[0], &inputs[1], &geom, backend)? {
             return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
         }
 
@@ -1594,14 +1594,132 @@ fn output_overlaps_input(
     out_origin < in_end && in_start < out_end
 }
 
+/// Minimum `M` at which widening a contiguous `f16` GEMM to `f32` and running
+/// the tuned SGEMM beats the portable blocked half GEMM.
+///
+/// ORT reaches its `f16` MatMul time by widening to `f32` and reusing the same
+/// tuned SGEMM it uses for `f32`: measured on this host at `M=128, K=N=2048`,
+/// ORT spends 14.27 ms on `f16` and 14.39 ms on `f32` -- the same kernel. Our
+/// blocked half GEMM keeps operands in 16-bit storage to save bandwidth, which
+/// wins while the operands dominate, but it has no tuned microkernel, so once
+/// `M` grows enough for the GEMM to become compute-bound it loses badly.
+///
+/// `bench_f16_half_vs_widen`, pinned to 16 physical cores, `K=N=2048`, median
+/// of 5, two independent runs. Ratio is `half / widen`, so > 1 means widening
+/// wins:
+///
+/// | M | T=1 | T=16 |
+/// |---|---|---|
+/// | 2 | 0.67x, 0.61x (half wins) | 0.93x, 0.83x (half wins) |
+/// | 8 | 1.01x, 1.05x (tie) | 1.26x, 1.38x |
+/// | **16** | **1.33x, 1.30x** | **2.14x, 1.85x** |
+/// | 32 | 1.56x, 1.63x | 3.14x, 3.32x |
+/// | 128 | 1.90x, 2.00x | 3.47x, 3.30x |
+/// | 256 | 1.94x, 2.03x | 2.88x, 2.67x |
+///
+/// `M=16` is the first row that wins repeatably at *both* thread counts, so it
+/// is the threshold. `M=8` is a tie at `T=1` (1.01x/1.05x, inside noise) and is
+/// left on the half path rather than claimed. Below the threshold the blocked
+/// half GEMM is kept, so decode (`M=1`) is bit-for-bit unchanged.
+#[cfg(feature = "mlas")]
+const HALF_WIDEN_MIN_M: usize = 16;
+
+/// Minimum `K * N` before widening is considered at all.
+///
+/// Widening `B` costs a `4 * K * N` byte transient on every call when `B` is
+/// not a session constant. For a small `B` the tuned SGEMM has nothing to win
+/// back, so keep the allocation-free half path.
+#[cfg(feature = "mlas")]
+const HALF_WIDEN_MIN_WEIGHT: usize = 256 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of calls where [`try_matmul_half`] declined in favour of
+    /// the widened-`f32` SGEMM. Lets a test assert *which route* ran rather
+    /// than only that the numbers came out right.
+    static HALF_YIELDED_TO_WIDENED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn count_half_yielded_to_widened() {
+    #[cfg(test)]
+    HALF_YIELDED_TO_WIDENED.with(|c| c.set(c.get() + 1));
+}
+
+/// Number of times the current thread took the widened-`f32` SGEMM instead of
+/// the blocked half GEMM.
+#[cfg(all(test, feature = "mlas"))]
+pub(crate) fn half_yielded_to_widened_calls() -> u64 {
+    HALF_YIELDED_TO_WIDENED.with(|c| c.get())
+}
+
+#[cfg(all(test, feature = "mlas"))]
+pub(crate) fn reset_half_yielded_to_widened_calls() {
+    HALF_YIELDED_TO_WIDENED.with(|c| c.set(0));
+}
+
+/// Whether a contiguous half GEMM is better served by widening to dense `f32`
+/// and using the tuned SGEMM (see [`HALF_WIDEN_MIN_M`]).
+///
+/// Restricted to `f16`. `bf16` is left on the blocked half GEMM: it has a
+/// native AVX512-BF16 kernel whose crossover has not been measured, and
+/// widening it is a different (cheaper, shift-only) operation, so the `f16`
+/// measurement does not transfer.
+///
+/// Restricted to [`CpuBackend::Mlas`] because that is the only backend whose
+/// SGEMM was measured to beat the half path; every other backend keeps
+/// today's behaviour. `auto_detect` returns `Mlas` on x86-64 whenever the
+/// feature is compiled in, so this is the default path there.
+///
+/// End to end through the plugin (`bench_matmul_f16_m128`, `M=128, K=N=2048`,
+/// non-constant `B`, 5 interleaved rounds of before/after/ORT in one process,
+/// p50 ms, pinned to 16 physical cores), as `ours/ORT`:
+///
+/// | threads | before | after | gain |
+/// |---|---|---|---|
+/// | 1 | 28.38 / 14.41 = 1.97x | 15.15 / 14.41 = **1.05x** | 1.87x |
+/// | 16 | 6.570 / 1.999 = 3.29x | 4.180 / 1.999 = **2.09x** | 1.57x |
+///
+/// `M=1` decode cannot reach this gate and measured unchanged (0.356 vs 0.360
+/// ms at `T=1`).
+///
+/// `T=16` is still 2.09x off ORT. The residual is the per-call widen of a
+/// non-constant `B`: serial here, parallel in ORT. That is a separate change
+/// and this gate does not address it.
+fn widened_sgemm_beats_half_gemm(
+    format: HalfFormat,
+    geom: &MatMulGeometry,
+    backend: CpuBackend,
+) -> bool {
+    // `CpuBackend::Mlas` only exists with the feature compiled in; without it
+    // there is no measured-faster SGEMM to yield to, so keep the half GEMM.
+    #[cfg(feature = "mlas")]
+    {
+        format == HalfFormat::F16
+            && backend == CpuBackend::Mlas
+            && geom.m >= HALF_WIDEN_MIN_M
+            && geom.k.saturating_mul(geom.n) >= HALF_WIDEN_MIN_WEIGHT
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        let _ = (format, geom, backend);
+        false
+    }
+}
+
 /// Attempt the dedicated portable half GEMM path. Both operands must be
 /// contiguous and have the same `Float16` or `BFloat16` dtype. The operands stay
 /// in 16-bit storage until cache-panel packing, accumulation is always `f32`,
 /// and the caller narrows once into the requested output dtype.
+///
+/// Declines for a large-`M` `f16` GEMM, where widening to `f32` and using the
+/// tuned SGEMM is measurably faster -- see [`widened_sgemm_beats_half_gemm`].
+/// Every caller already falls through to that widened path.
 fn try_matmul_half(
     a: &TensorView,
     b: &TensorView,
     geom: &MatMulGeometry,
+    backend: CpuBackend,
 ) -> Result<Option<Vec<f32>>> {
     use onnx_runtime_ir::DataType;
 
@@ -1611,6 +1729,10 @@ fn try_matmul_half(
         _ => return Ok(None),
     };
     if !a.is_contiguous() || !b.is_contiguous() {
+        return Ok(None);
+    }
+    if widened_sgemm_beats_half_gemm(format, geom, backend) {
+        count_half_yielded_to_widened();
         return Ok(None);
     }
     a.validate()?;
@@ -1763,7 +1885,7 @@ fn half_gemm_tile(
 /// the fused `FusedMatMulBias` kernel.
 pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
     let geom = matmul_geometry(a, b)?;
-    if let Some(result) = try_matmul_half(a, b, &geom)? {
+    if let Some(result) = try_matmul_half(a, b, &geom, CpuBackend::auto_detect())? {
         return Ok(result);
     }
     matmul_dense_impl_with_geom(
@@ -1821,7 +1943,7 @@ fn matmul_dense_prepacked_with_backend(
     backend: CpuBackend,
 ) -> Result<Vec<f32>> {
     let geom = matmul_geometry(a, b)?;
-    if let Some(result) = try_matmul_half(a, b, &geom)? {
+    if let Some(result) = try_matmul_half(a, b, &geom, backend)? {
         return Ok(result);
     }
     matmul_dense_impl_with_geom(
@@ -2618,6 +2740,165 @@ mod tests {
         assert_eq!(out.to_f16_as_f32(), vec![58., 64., 139., 154.]);
     }
 
+    /// Falsifier for the [`HALF_WIDEN_MIN_M`] gate: asserts *which route* each
+    /// shape takes, not merely that the numbers are right. Both routes produce
+    /// near-identical results, so a value-only test cannot detect the gate
+    /// being mis-wired, inverted, or silently dead.
+    #[cfg(all(target_arch = "x86_64", feature = "mlas"))]
+    #[test]
+    fn f16_prefill_yields_to_widened_sgemm_only_above_the_measured_crossover() {
+        let backend = CpuBackend::auto_detect();
+        assert_eq!(
+            backend,
+            CpuBackend::Mlas,
+            "x86_64 + mlas must auto-detect Mlas, else this gate is dead code"
+        );
+
+        // Big enough that HALF_WIDEN_MIN_WEIGHT is satisfied, so M alone decides.
+        let (k, n) = (512usize, 512usize);
+        assert!(k * n >= HALF_WIDEN_MIN_WEIGHT);
+
+        for (m, expect_widen) in [
+            (1usize, false),
+            (HALF_WIDEN_MIN_M - 1, false),
+            (HALF_WIDEN_MIN_M, true),
+            (HALF_WIDEN_MIN_M + 1, true),
+        ] {
+            let a_src: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 * 0.01).collect();
+            let b_src: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 * 0.01).collect();
+            let a = Owned::f16(&[m, k], &a_src);
+            let b = Owned::f16(&[k, n], &b_src);
+            let geom = matmul_geometry(&a.view(), &b.view()).unwrap();
+
+            reset_half_yielded_to_widened_calls();
+            let took_half = try_matmul_half(&a.view(), &b.view(), &geom, backend)
+                .unwrap()
+                .is_some();
+            assert_eq!(
+                took_half, !expect_widen,
+                "M={m}: expected widen={expect_widen}, but half GEMM ran={took_half}"
+            );
+            assert_eq!(
+                half_yielded_to_widened_calls(),
+                u64::from(expect_widen),
+                "M={m}: yield counter disagrees with the taken route"
+            );
+        }
+
+        // bf16 is deliberately excluded: its crossover was never measured.
+        let m = HALF_WIDEN_MIN_M + 8;
+        let a_src: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 * 0.01).collect();
+        let b_src: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 * 0.01).collect();
+        let a = Owned::bf16(&[m, k], &a_src);
+        let b = Owned::bf16(&[k, n], &b_src);
+        let geom = matmul_geometry(&a.view(), &b.view()).unwrap();
+        reset_half_yielded_to_widened_calls();
+        assert!(
+            try_matmul_half(&a.view(), &b.view(), &geom, backend)
+                .unwrap()
+                .is_some(),
+            "bf16 must stay on the blocked half GEMM"
+        );
+        assert_eq!(half_yielded_to_widened_calls(), 0);
+
+        // A non-Mlas backend keeps today's behaviour at every M.
+        let a = Owned::f16(&[m, k], &a_src);
+        let b = Owned::f16(&[k, n], &b_src);
+        let geom = matmul_geometry(&a.view(), &b.view()).unwrap();
+        reset_half_yielded_to_widened_calls();
+        assert!(
+            try_matmul_half(&a.view(), &b.view(), &geom, CpuBackend::Generic)
+                .unwrap()
+                .is_some(),
+            "a backend with no tuned SGEMM must keep the half GEMM"
+        );
+        assert_eq!(half_yielded_to_widened_calls(), 0);
+
+        // A small weight stays on the half path however large M is: the tuned
+        // SGEMM has too little work to repay widening B.
+        let (k, n) = (16usize, 16usize);
+        assert!(k * n < HALF_WIDEN_MIN_WEIGHT);
+        let a_src: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 * 0.01).collect();
+        let b_src: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 * 0.01).collect();
+        let a = Owned::f16(&[m, k], &a_src);
+        let b = Owned::f16(&[k, n], &b_src);
+        let geom = matmul_geometry(&a.view(), &b.view()).unwrap();
+        reset_half_yielded_to_widened_calls();
+        assert!(
+            try_matmul_half(&a.view(), &b.view(), &geom, backend)
+                .unwrap()
+                .is_some(),
+            "a small B must keep the half GEMM"
+        );
+        assert_eq!(half_yielded_to_widened_calls(), 0);
+    }
+
+    /// The widened route must stay numerically sound across the crossover.
+    /// Widening `f16` to `f32` is exact, so both routes see identical inputs
+    /// and differ only in `f32` summation order; each is compared against an
+    /// `f64` oracle so neither route can drift without being caught.
+    #[cfg(all(target_arch = "x86_64", feature = "mlas"))]
+    #[test]
+    fn f16_widened_route_matches_an_f64_oracle_across_the_crossover() {
+        let backend = CpuBackend::auto_detect();
+        let (k, n) = (521usize, 517usize);
+        assert!(k * n >= HALF_WIDEN_MIN_WEIGHT, "shape must cross the gate");
+
+        let mut state = 0x0F16_51DEu32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 0.5
+        };
+
+        // Straddle the threshold, including odd M and a tail-heavy K/N.
+        for m in [HALF_WIDEN_MIN_M - 1, HALF_WIDEN_MIN_M, HALF_WIDEN_MIN_M + 3] {
+            let a_src: Vec<f32> = (0..m * k).map(|_| next()).collect();
+            let b_src: Vec<f32> = (0..k * n).map(|_| next()).collect();
+            let a = Owned::f16(&[m, k], &a_src);
+            let b = Owned::f16(&[k, n], &b_src);
+
+            // Oracle over the *rounded* f16 values, accumulated in f64.
+            let a_w: Vec<f64> = a_src
+                .iter()
+                .map(|&v| half::f16::from_f32(v).to_f32() as f64)
+                .collect();
+            let b_w: Vec<f64> = b_src
+                .iter()
+                .map(|&v| half::f16::from_f32(v).to_f32() as f64)
+                .collect();
+            let mut oracle = vec![0.0f64; m * n];
+            for row in 0..m {
+                for depth in 0..k {
+                    let av = a_w[row * k + depth];
+                    for column in 0..n {
+                        oracle[row * n + column] += av * b_w[depth * n + column];
+                    }
+                }
+            }
+
+            let geom = matmul_geometry(&a.view(), &b.view()).unwrap();
+            let got = matmul_dense(&a.view(), &b.view()).unwrap();
+            assert_eq!(got.len(), m * n);
+            // Confirm this shape really exercised the widened route.
+            reset_half_yielded_to_widened_calls();
+            assert_eq!(
+                try_matmul_half(&a.view(), &b.view(), &geom, backend)
+                    .unwrap()
+                    .is_some(),
+                m < HALF_WIDEN_MIN_M
+            );
+
+            let tolerance = 2e-3 * (k as f32).sqrt();
+            for (index, (&actual, &expected)) in got.iter().zip(oracle.iter()).enumerate() {
+                assert!(
+                    (actual - expected as f32).abs() <= tolerance,
+                    "M={m} index {index}: {actual} vs oracle {expected} \
+                     (tolerance {tolerance})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn matmul_half_dispatch_matches_widened_reference_across_irregular_shapes() {
         use onnx_runtime_ir::DataType;
@@ -2658,7 +2939,7 @@ mod tests {
                 };
                 let geometry = matmul_geometry(&a.view(), &b.view()).unwrap();
                 assert!(
-                    try_matmul_half(&a.view(), &b.view(), &geometry)
+                    try_matmul_half(&a.view(), &b.view(), &geometry, CpuBackend::auto_detect())
                         .unwrap()
                         .is_some(),
                     "{dtype:?} should select the dedicated half GEMM"
@@ -2884,6 +3165,79 @@ mod tests {
                 let rel = (got[row * n + col] - want).abs() / denom;
                 assert!(rel <= 3e-2, "K-tail mismatch at ({row},{col}): rel {rel}");
             }
+        }
+    }
+
+    /// Sweep that sets [`HALF_WIDEN_MIN_M`]: blocked half GEMM vs widening to
+    /// `f32` and running the tuned SGEMM, over the `M` grid at the ambient
+    /// thread count. Both arms run the exact code the two routes run, so the
+    /// crossover this prints is the crossover the gate must encode.
+    ///
+    /// Pin the run (`taskset -c 0-15`) and set `RAYON_NUM_THREADS`; an
+    /// oversubscribed pool inflates the parallel arm by ~2.6x on this host.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "microbench: run explicitly with --ignored --nocapture"]
+    fn bench_f16_half_vs_widen() {
+        use std::time::Instant;
+
+        fn median5(mut f: impl FnMut()) -> f64 {
+            f();
+            let mut v: Vec<f64> = (0..5)
+                .map(|_| {
+                    let t = Instant::now();
+                    f();
+                    t.elapsed().as_secs_f64() * 1e3
+                })
+                .collect();
+            v.sort_by(f64::total_cmp);
+            v[2]
+        }
+
+        let threads = rayon::current_num_threads();
+        println!("threads={threads}");
+        println!("M,K,N,half_ms,widen_ms,half/widen");
+        for &(m, k, n) in &[
+            (2usize, 2048usize, 2048usize),
+            (8, 2048, 2048),
+            (16, 2048, 2048),
+            (32, 2048, 2048),
+            (64, 2048, 2048),
+            (128, 2048, 2048),
+            (256, 2048, 2048),
+            (128, 3584, 3584),
+        ] {
+            let a_src: Vec<f32> = (0..m * k).map(|i| (i % 13) as f32 * 0.01 - 0.06).collect();
+            let b_src: Vec<f32> = (0..k * n).map(|i| (i % 11) as f32 * 0.01 - 0.05).collect();
+            let a = Owned::f16(&[m, k], &a_src);
+            let b = Owned::f16(&[k, n], &b_src);
+            let (av, bv) = (a.view(), b.view());
+            let geom = matmul_geometry(&av, &bv).unwrap();
+
+            // Arm 1: the blocked half GEMM, forced by asking for a backend the
+            // gate never yields for.
+            let half = median5(|| {
+                let out = try_matmul_half(&av, &bv, &geom, CpuBackend::Generic)
+                    .unwrap()
+                    .unwrap();
+                std::hint::black_box(&out);
+            });
+            // Arm 2: what every caller falls through to once the gate declines.
+            let widen = median5(|| {
+                let out = matmul_dense_impl_with_geom(
+                    to_dense_f32_widen("MatMul", &av).unwrap(),
+                    to_dense_f32_widen("MatMul", &bv).unwrap(),
+                    &geom,
+                    CpuBackend::auto_detect(),
+                    None,
+                )
+                .unwrap();
+                std::hint::black_box(&out);
+            });
+            println!(
+                "{m},{k},{n},{half:.4},{widen:.4},{:.2}",
+                half / widen.max(f64::MIN_POSITIVE)
+            );
         }
     }
 
