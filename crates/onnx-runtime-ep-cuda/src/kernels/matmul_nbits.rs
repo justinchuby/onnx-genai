@@ -298,6 +298,15 @@ const GATE_UP_DECOMPOSED_SWIGLU_VEC_ENTRY: &str =
 const GATE_UP_SWIGLU_RMSNORM_VEC_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_vec";
 const GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_VEC_ENTRY: &str =
     "matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_vec";
+/// Occupancy-raised (`ONNX_GENAI_GATEUP_OCC`) siblings of the two SYMMETRIC
+/// RMS-norm-fused `_vec` entries. Same kernel body + `__launch_bounds__(256, 8)`
+/// (32 regs → 8 blocks/SM, 100% theoretical vs 75% register-limited) to hide the
+/// Short-Scoreboard shared-load latency of the staged activation. Byte-identical
+/// to the `_vec` entries (register-allocation hint only).
+const GATE_UP_SWIGLU_RMSNORM_VEC_OCC_ENTRY: &str =
+    "matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_vec_occ";
+const GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_VEC_OCC_ENTRY: &str =
+    "matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_vec_occ";
 const GATE_UP_SWIGLU_THREADS: u32 = 256;
 
 const DEQUANT_SRC: &str = r#"
@@ -4551,6 +4560,60 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsno
     matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<false, true, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
 }
 
+// Occupancy-raised (`ONNX_GENAI_GATEUP_OCC`) siblings of the two SYMMETRIC
+// RMS-norm-fused `_vec` entries. IDENTICAL kernel body and math — the only
+// change is `__launch_bounds__(256, 8)`, which caps the register allocation at
+// 32 regs/thread so the SM can co-resident 8 blocks (100% theoretical vs 75%
+// register-limited). The dominant qwen2.5-14b decode kernel
+// (`..decomposed_swiglu_rmsnorm`) is Short-Scoreboard/shared-load-latency bound
+// (~51% of stall cycles waiting on the staged-activation LDS); the extra
+// resident warps hide that latency. `__launch_bounds__` only constrains
+// register allocation — same instruction stream, same fp16 accumulate order,
+// same RMS reduction — so it is BYTE-IDENTICAL to the `_vec` entries above.
+extern "C" __global__ void __launch_bounds__(256, 8)
+matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_vec_occ(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed_gate,
+    const __half* __restrict__ scales_gate,
+    const unsigned char* __restrict__ packed_up,
+    const __half* __restrict__ scales_up,
+    const unsigned char* __restrict__ zero_points_gate,
+    const unsigned char* __restrict__ zero_points_up,
+    const void* __restrict__ gamma,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int gamma_is_half,
+    const float epsilon)
+{
+    matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<false, false, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 8)
+matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_vec_occ(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed_gate,
+    const __half* __restrict__ scales_gate,
+    const unsigned char* __restrict__ packed_up,
+    const __half* __restrict__ scales_up,
+    const unsigned char* __restrict__ zero_points_gate,
+    const unsigned char* __restrict__ zero_points_up,
+    const void* __restrict__ gamma,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int gamma_is_half,
+    const float epsilon)
+{
+    matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<false, true, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
+}
+
 extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_zp(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed_gate,
@@ -5874,6 +5937,22 @@ fn scales_f16_pipeline_enabled() -> bool {
 fn gate_up_vec_enabled() -> bool {
     !matches!(
         std::env::var("ONNX_GENAI_GATEUP_VEC").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
+/// Whether the SYMMETRIC RMS-norm-fused gate/up SwiGLU decode GEMV takes the
+/// occupancy-raised `_vec_occ` entry (`__launch_bounds__(256, 8)` → 32 regs,
+/// 8 blocks/SM, 100% theoretical vs 75% register-limited). That kernel is the
+/// largest decode kernel on qwen2.5-14b and is Short-Scoreboard bound (~51% of
+/// stall cycles wait on the staged-activation shared load); the extra resident
+/// warps hide the latency (isolated ncu: 57.5 -> 54.0us, occupancy 62 -> 82%;
+/// E2E +2.6% on 14b). Byte-identical to the `_vec` entry — `__launch_bounds__`
+/// only constrains register allocation. DEFAULT-ON; `ONNX_GENAI_GATEUP_OCC=0`
+/// (or `false`/`off`) forces the non-occ path for A/B.
+fn gate_up_occ_enabled() -> bool {
+    !matches!(
+        std::env::var("ONNX_GENAI_GATEUP_OCC").ok().as_deref(),
         Some("0") | Some("false") | Some("off")
     )
 }
@@ -8283,16 +8362,22 @@ impl MatMulNBitsKernel {
         self.runtime
             .require_nvrtc_half_headers("MatMulNBits fp16 gate/up SwiGLU RMS-norm GEMV")?;
         // `ONNX_GENAI_GATEUP_VEC` reroutes the symmetric RMS-norm-fused entries to
-        // their byte-identical fused-symmetric `_vec` sibling (fewer issued ops).
+        // their byte-identical fused-symmetric `_vec` sibling (fewer issued ops);
+        // `ONNX_GENAI_GATEUP_OCC` further reroutes them to the `_vec_occ` sibling
+        // (same body + `__launch_bounds__(256, 8)` to raise occupancy 62->83% and
+        // hide the Short-Scoreboard shared-load latency). Both are byte-identical.
         let has_zp = zp_gate.is_some() || zp_up.is_some();
         let vec = !has_zp && gate_up_vec_enabled();
-        let entry = match (self.decomposed_silu, has_zp, vec) {
-            (true, true, _) => GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_ZP_ENTRY,
-            (true, false, true) => GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_VEC_ENTRY,
-            (true, false, false) => GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_ENTRY,
-            (false, true, _) => GATE_UP_SWIGLU_RMSNORM_ZP_ENTRY,
-            (false, false, true) => GATE_UP_SWIGLU_RMSNORM_VEC_ENTRY,
-            (false, false, false) => GATE_UP_SWIGLU_RMSNORM_ENTRY,
+        let occ = !has_zp && gate_up_occ_enabled();
+        let entry = match (self.decomposed_silu, has_zp, occ, vec) {
+            (true, true, _, _) => GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_ZP_ENTRY,
+            (true, false, true, _) => GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_VEC_OCC_ENTRY,
+            (true, false, false, true) => GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_VEC_ENTRY,
+            (true, false, false, false) => GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_ENTRY,
+            (false, true, _, _) => GATE_UP_SWIGLU_RMSNORM_ZP_ENTRY,
+            (false, false, true, _) => GATE_UP_SWIGLU_RMSNORM_VEC_OCC_ENTRY,
+            (false, false, false, true) => GATE_UP_SWIGLU_RMSNORM_VEC_ENTRY,
+            (false, false, false, false) => GATE_UP_SWIGLU_RMSNORM_ENTRY,
         };
         let function = self
             .runtime
@@ -14490,7 +14575,12 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// independent M=1 greedy `_dsilu` GEMVs. A single argmax flip downstream
     /// would start here. Covers plain + RMS-norm-fused, decomposed +
     /// non-decomposed SiLU, fp16 AND fp32 gamma, the real Qwen2.5-14b gate/up
-    /// dims (K=5120, N=13824), and M in {1,4,6,8}.
+    /// dims (K=5120, N=13824), and M in {1,4,6,8}. Also asserts the
+    /// occupancy-raised `_vec_occ` path (`ONNX_GENAI_GATEUP_OCC`,
+    /// `__launch_bounds__(256, 8)`) is bit-identical to the scalar reference for
+    /// the symmetric RMS-norm-fused kernels it applies to (it is a no-op for the
+    /// non-RMS launch) — `__launch_bounds__` only constrains register
+    /// allocation, so the math is unchanged.
     #[test]
     fn gate_up_swiglu_vec_is_bit_identical_to_scalar() {
         let Some(runtime) = runtime() else {
@@ -14670,7 +14760,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
                         };
 
-                        let run_once = |vec_on: bool| -> Vec<u16> {
+                        let run_once = |vec_on: bool, occ_on: bool| -> Vec<u16> {
                             let out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
                             let lock = INTERLEAVE_TEST_ENV_LOCK.get_or_init(|| Mutex::new(()));
                             let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -14680,6 +14770,10 @@ extern "C" __global__ void ref_silu_mul_f16(
                                 std::env::set_var(
                                     "ONNX_GENAI_GATEUP_VEC",
                                     if vec_on { "1" } else { "0" },
+                                );
+                                std::env::set_var(
+                                    "ONNX_GENAI_GATEUP_OCC",
+                                    if occ_on { "1" } else { "0" },
                                 );
                             }
                             let out = TensorMut::new(
@@ -14717,6 +14811,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                             runtime.synchronize().unwrap();
                             unsafe {
                                 std::env::remove_var("ONNX_GENAI_GATEUP_VEC");
+                                std::env::remove_var("ONNX_GENAI_GATEUP_OCC");
                             }
                             drop(_guard);
 
@@ -14729,8 +14824,15 @@ extern "C" __global__ void ref_silu_mul_f16(
                             host.iter().map(|v| v.to_bits()).collect()
                         };
 
-                        let reference = run_once(false);
-                        let fused = run_once(true);
+                        let reference = run_once(false, false);
+                        let fused = run_once(true, false);
+                        // Occupancy-raised `_vec_occ` path. The `_vec_occ` entries
+                        // exist ONLY for the two symmetric RMS-norm-fused kernels,
+                        // so this actually exercises `_vec_occ` when rmsnorm==true;
+                        // for the non-rmsnorm launch `ONNX_GENAI_GATEUP_OCC` is a
+                        // no-op and this simply re-checks the `_vec` path. Either
+                        // way the result must stay bit-identical to the reference.
+                        let occ = run_once(true, true);
 
                         // SAFETY: gamma buffer no longer referenced.
                         unsafe {
@@ -14748,6 +14850,18 @@ extern "C" __global__ void ref_silu_mul_f16(
                                 index / n,
                                 index % n,
                                 fused[index],
+                                reference[index]
+                            );
+                            assert_eq!(
+                                occ[index],
+                                reference[index],
+                                "occupancy-raised gate/up _vec_occ diverged at M={m}, K={k}, \
+                                 N={n}, rmsnorm={rmsnorm}, decomposed={decomposed}, \
+                                 gamma_f32={gamma_is_f32}, row={}, column={}: occ=0x{:04x} \
+                                 scalar=0x{:04x}",
+                                index / n,
+                                index % n,
+                                occ[index],
                                 reference[index]
                             );
                         }
