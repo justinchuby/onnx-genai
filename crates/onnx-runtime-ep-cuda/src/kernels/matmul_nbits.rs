@@ -289,13 +289,13 @@ const GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_ZP_ENTRY: &str =
 /// — the dequant folds the `- 8` symmetric zero point into the magic-bias
 /// constants (see `int4x8_to_half2x4_sym8`), issuing four fewer `f16x2` ops per
 /// weight word to relieve the issue-bound decode GEMV. Selected by
-/// [`gate_up_vec_enabled`] (opt-in, DEFAULT-OFF). The asymmetric `_zp` entries
+/// [`gate_up_vec_enabled`] (default-ON, byte-identical magic-bias-fold;
+/// `ONNX_GENAI_GATEUP_VEC=0` forces scalar for A/B). The asymmetric `_zp` entries
 /// have no `_vec` sibling: their per-block zero point cannot fold to a constant.
 const GATE_UP_SWIGLU_VEC_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu_vec";
 const GATE_UP_DECOMPOSED_SWIGLU_VEC_ENTRY: &str =
     "matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_vec";
-const GATE_UP_SWIGLU_RMSNORM_VEC_ENTRY: &str =
-    "matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_vec";
+const GATE_UP_SWIGLU_RMSNORM_VEC_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_vec";
 const GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_VEC_ENTRY: &str =
     "matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_vec";
 const GATE_UP_SWIGLU_THREADS: u32 = 256;
@@ -5868,12 +5868,13 @@ fn scales_f16_pipeline_enabled() -> bool {
 /// loads are already 128B-coalesced per warp and strided per lane). The `_vec`
 /// entry is BYTE-IDENTICAL to the default entry — every dequant intermediate is
 /// an exactly-representable fp16 integer, so folding the two constant
-/// subtractions changes no rounding. Opt in with `ONNX_GENAI_GATEUP_VEC=1` (or
-/// `true`/`on`); DEFAULT-OFF until the win is confirmed and promoted.
+/// subtractions changes no rounding — so it is default-on;
+/// `ONNX_GENAI_GATEUP_VEC=0` (or `false`/`off`) forces the scalar entry for A/B
+/// measurement.
 fn gate_up_vec_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("ONNX_GENAI_GATEUP_VEC").ok().as_deref(),
-        Some("1") | Some("true") | Some("on")
+        Some("0") | Some("false") | Some("off")
     )
 }
 
@@ -14671,8 +14672,7 @@ extern "C" __global__ void ref_silu_mul_f16(
 
                         let run_once = |vec_on: bool| -> Vec<u16> {
                             let out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
-                            let lock =
-                                INTERLEAVE_TEST_ENV_LOCK.get_or_init(|| Mutex::new(()));
+                            let lock = INTERLEAVE_TEST_ENV_LOCK.get_or_init(|| Mutex::new(()));
                             let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
                             // SAFETY: the env write is confined to this critical
                             // section and removed before the lock is released.
@@ -14739,7 +14739,8 @@ extern "C" __global__ void ref_silu_mul_f16(
 
                         for index in 0..output_elements {
                             assert_eq!(
-                                fused[index], reference[index],
+                                fused[index],
+                                reference[index],
                                 "fused-symmetric gate/up _vec diverged at M={m}, K={k}, N={n}, \
                                  rmsnorm={rmsnorm}, decomposed={decomposed}, \
                                  gamma_f32={gamma_is_f32}, row={}, column={}: vec=0x{:04x} \
