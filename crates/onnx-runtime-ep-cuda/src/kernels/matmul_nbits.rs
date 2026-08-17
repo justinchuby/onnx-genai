@@ -5946,14 +5946,14 @@ fn gate_up_vec_enabled() -> bool {
 /// 8 blocks/SM, 100% theoretical vs 75% register-limited). That kernel is the
 /// largest decode kernel on qwen2.5-14b and is Short-Scoreboard bound (~51% of
 /// stall cycles wait on the staged-activation shared load); the extra resident
-/// warps hide the latency (isolated ncu: 57.4 -> 53.0us, occupancy 62 -> 83%).
-/// Byte-identical to the `_vec` entry — `__launch_bounds__` only constrains
-/// register allocation. Opt in with `ONNX_GENAI_GATEUP_OCC=1` (or `true`/`on`);
-/// DEFAULT-OFF until the win is confirmed and promoted.
+/// warps hide the latency (isolated ncu: 57.5 -> 54.0us, occupancy 62 -> 82%;
+/// E2E +2.6% on 14b). Byte-identical to the `_vec` entry — `__launch_bounds__`
+/// only constrains register allocation. DEFAULT-ON; `ONNX_GENAI_GATEUP_OCC=0`
+/// (or `false`/`off`) forces the non-occ path for A/B.
 fn gate_up_occ_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("ONNX_GENAI_GATEUP_OCC").ok().as_deref(),
-        Some("1") | Some("true") | Some("on")
+        Some("0") | Some("false") | Some("off")
     )
 }
 
@@ -14576,10 +14576,11 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// would start here. Covers plain + RMS-norm-fused, decomposed +
     /// non-decomposed SiLU, fp16 AND fp32 gamma, the real Qwen2.5-14b gate/up
     /// dims (K=5120, N=13824), and M in {1,4,6,8}. Also asserts the
-    /// occupancy-raised `_vec_occ` path (`ONNX_GENAI_GATEUP_OCC=1`,
-    /// `__launch_bounds__(256, 8)`) is bit-identical to the scalar reference —
-    /// `__launch_bounds__` only constrains register allocation, so the math is
-    /// unchanged.
+    /// occupancy-raised `_vec_occ` path (`ONNX_GENAI_GATEUP_OCC`,
+    /// `__launch_bounds__(256, 8)`) is bit-identical to the scalar reference for
+    /// the symmetric RMS-norm-fused kernels it applies to (it is a no-op for the
+    /// non-RMS launch) — `__launch_bounds__` only constrains register
+    /// allocation, so the math is unchanged.
     #[test]
     fn gate_up_swiglu_vec_is_bit_identical_to_scalar() {
         let Some(runtime) = runtime() else {
@@ -14825,9 +14826,12 @@ extern "C" __global__ void ref_silu_mul_f16(
 
                         let reference = run_once(false, false);
                         let fused = run_once(true, false);
-                        // Occupancy-raised `_vec_occ` path (rmsnorm entries only;
-                        // for the non-rmsnorm launch the flag is a no-op and this
-                        // re-runs the `_vec` path, still bit-identical).
+                        // Occupancy-raised `_vec_occ` path. The `_vec_occ` entries
+                        // exist ONLY for the two symmetric RMS-norm-fused kernels,
+                        // so this actually exercises `_vec_occ` when rmsnorm==true;
+                        // for the non-rmsnorm launch `ONNX_GENAI_GATEUP_OCC` is a
+                        // no-op and this simply re-checks the `_vec` path. Either
+                        // way the result must stay bit-identical to the reference.
                         let occ = run_once(true, true);
 
                         // SAFETY: gamma buffer no longer referenced.
