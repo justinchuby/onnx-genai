@@ -619,7 +619,12 @@ macro_rules! dispatch_mlas {
             debug_assert_eq!(input.len(), output.len());
             if input.len() >= SIMD_MIN_LEN {
                 let f: fn(&[f32], &mut [f32]) = $mlas;
-                f(input, output);
+                // Through `run_chunked`, exactly like the pure-Rust routes.
+                // Calling `f(input, output)` directly here left every MLAS
+                // route single-threaded no matter how many threads the pool
+                // had, which cost 3.4-4.3x at 16 threads once the pure-Rust
+                // routes started parallelising.
+                run_chunked(input, output, f);
                 return;
             }
         }
