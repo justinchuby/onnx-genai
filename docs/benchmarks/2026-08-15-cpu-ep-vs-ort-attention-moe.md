@@ -1307,9 +1307,108 @@ work.
   graph we benchmark. It inflates every single-node ratio in this document. Attacking it
   would move all eight rows above; no operator change will. Which part of it dominates is
   not yet measured (§20.1), so that is the next instrument to build, before the next
-  optimisation.
+  optimisation. **§21 builds that instrument and answers this**: for the Transpose graphs
+  the per-run path is 60-74% input binding and 25-38% boundary materialisation.
 * **`Concat` remains a genuine kernel cost** and remains bounded by §13: `ExternalValue`
   carries no strides, so a `Concat`-shaped KV cache cannot append in place. The Phase 4
   in-place append (#1083) applies to the GQA-shaped cache, not this one.
 
 These are recorded as measured facts. No fix is claimed for either.
+
+## 21. Where a run actually goes: the boundary instrument
+
+§20 could show that the Transpose *kernel* is not the cost, but not what is,
+because `ONNX_GENAI_PROFILE_OPS` times per-node execution and nothing around it.
+That instrument now exists. The executor already had an env-gated phase
+profiler (`NXRT_EXEC_PHASE_PROFILE`); this adds a `bench_generic --phase-profile`
+flag that turns it on programmatically, resets it after warmups so the totals
+cover exactly `--runs` measured runs, and prints it - plus one new phase,
+`run_scoped.bind_inputs`, around the loop that uploads graph inputs.
+
+### 21.1 The decomposition
+
+`bench_generic --native-only --native-threads 16 --runs 30 --warmups 10
+--phase-profile`, microseconds per run, on the host described in §2. `plan_eager`
+is the whole node-execution plan - everything `ONNX_GENAI_PROFILE_OPS` sees.
+`bind_inputs` is a subset of `setup_total`. The column names are shortened from
+the emitted span names: the `[nxrt-phase]` dump prints
+`run_scoped.setup_total.top`, `run_scoped.bind_inputs`,
+`run_scoped.collect_outputs.top` and `run_scoped.plan_eager.top`.
+
+**`in` and `out` are host bytes actually moved**, not tensor size: `in` is what
+`bind_inputs` copies, `out` is what `collect_outputs` materialises. The `Concat`
+graphs show `out = 0` because their outputs are already owned buffers and need no
+materialisation, even though §20.1 lists the same graphs with 2 x 16 MiB and
+2 x 32 MiB of output *tensor*. `in` is the total over all of a graph's inputs;
+the `Concat` graphs have two large past-KV tensors each, so their per-tensor
+figure is half the number shown.
+
+| graph | in | out | run | `setup_total` | of which `bind_inputs` | `collect_outputs` | `plan_eager` |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| `tr_llama3_s512` | 8 MiB | 8 MiB | 808 | 605.7 | **601.3** | 208.0 | 7.8 |
+| `tr_bert_b8_s128` | 3 MiB | 3 MiB | 570 | 346.8 | **341.1** | 218.8 | 7.6 |
+| `tr_whisper_s1500` | 7.3 MiB | 7.3 MiB | 866 | 647.6 | **642.2** | 217.4 | 8.1 |
+| `kvcat_llama3_p4095` | 32 MiB | 0 | 4151 | 1898.6 | **1678.5** | 2.2 | 2354.9 |
+| `kvcat_llama3_p8191` | 64 MiB | 0 | 7100 | 3480.9 | **3474.3** | 1.5 | 3610.7 |
+
+Read the first row: of a 0.808 ms run, **601 us is copying the 8 MiB input into
+an EP-owned buffer**, 208 us is materialising the 8 MiB strided graph output,
+and 7.8 us is every node in the graph. `bind_inputs` is 99.3% of `setup_total`
+on that row and 99.8% on the last one, so "setup" is not shape work, plan
+restoration or buffer sizing - those sum to about 5 us. It is one `memcpy`.
+Binding plus collecting is 100.2% of the `tr_llama3_s512` run and 98.2% of
+`tr_bert_b8_s128`; the excess over 100% is the phase profiler's own overhead
+against a separately timed wall clock, and it is the honest error bar on these
+rows.
+
+Two caveats on this table. **These are means of one 30-run trial with no
+dispersion reported** - the profiler accumulates sums, not distributions - so
+§20.1's warning that `Concat` graphs move by tens of percent between runs still
+applies here: `plan_eager` for `kvcat_llama3_p4095` is 2.355 ms against §20.1's
+1.635 ms for the same graph and thread count, a 44% swing that is run-to-run
+noise, not a change. And **`kvcat_llama3_p4095` is the one row where
+`setup_total - bind_inputs` is not ~5 us**: it is 220 us, against 4.4-6.6 us on
+every other row, including the strictly larger `p8191`. That residual is
+unexplained and is left recorded rather than smoothed over.
+
+The `Concat` rows say the same thing from the other side. Their outputs are
+owned buffers, so `collect_outputs` is ~2 us and moves zero bytes; but they take
+two large past-KV inputs, and binding those is 1.7-3.5 ms - between 40% and 49%
+of the run, alongside a genuine 2.4-3.6 ms of `Concat`.
+
+### 21.2 Why the copy exists
+
+`Executor::prepare_run_buffers` ends with, for every graph input,
+`self.ep.copy_from_host(tensor.as_bytes(), buf)`. The EP owns its buffers and
+kernels write through them, so an input has to be inside one before the plan
+runs. ORT does not pay this: `Value` can borrow the caller's allocation, and its
+CPU EP reads the caller's memory directly.
+
+Closing that gap properly means letting a `DeviceBuffer` borrow host memory for
+the duration of a run, which is a lifetime and aliasing change to the EP ABI
+(the buffer must not outlive the caller's tensor, and no kernel may write
+through a borrowed input). That is not attempted here, and this section makes no
+claim about how much it would be worth.
+
+### 21.3 What this changes about earlier sections
+
+* §20.1 said the residual was "session per-run work" and explicitly declined to
+  split it further. It is now *partially* split: for the Transpose graphs it is
+  **60-74% input binding, 25-38% output materialisation, ~1% nodes**. §20's
+  conclusion is unchanged, but its caution is only half discharged.
+  `collect_outputs` is 208.0 / 218.8 / 217.4 us for 8 / 3 / 7.3 MiB of output -
+  essentially flat, not byte-proportional - so a fixed per-run cost (§6's per-run
+  mmap/munmap is the obvious candidate) is still folded into it, and this
+  instrument cannot separate that fixed cost from the copy inside it. Calling the
+  whole 208 us "output materialisation" is a label, not a measurement.
+* The single-node harness charges every graph two full tensor copies that a real
+  transformer forward would pay once for the whole model. Every ratio in this
+  document measured on a single-node graph is inflated by that, and - *asserted
+  from the ORT C API, not measured here* - ours only: an ORT CPU `Value` can be
+  constructed over the caller's buffer, so ORT has no equivalent of
+  `bind_inputs`. This instrument does not time ORT, so that half of the statement
+  is reasoning about an ABI rather than an observation. It is a property of the
+  benchmark, not of the runtime, and it is the reason the §20.2 rows look so much
+  worse than the §10 assignment evidence.
+* The `Concat` rows are *not* explained away by it: 2.4-3.6 ms of real kernel
+  time survives after the copies are accounted for. §13's boundary still binds.
