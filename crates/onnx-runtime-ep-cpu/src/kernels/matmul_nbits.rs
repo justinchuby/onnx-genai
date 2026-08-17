@@ -11329,7 +11329,7 @@ mod tests {
         let zero_points = zero_points.expect("asymmetric bits8 emits qzeros");
         let expected = reference(&activations, &dequantized, 1, k, n);
 
-        let run = |accuracy_level: i64| -> (Vec<f32>, bool) {
+        let run = |accuracy_level: i64| -> (Vec<f32>, bool, bool) {
             let (mut graph, node) = model_node(
                 &[1, k],
                 &[n, blocks, block_size],
@@ -11358,6 +11358,8 @@ mod tests {
             let zps = Owned::u8(&[n, blocks], &zero_points);
             let mut y = Owned::zeros_f32(&[1, n]);
             let before = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
+            #[cfg(feature = "mlas")]
+            let before_mlas = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed);
             kernel
                 .execute(
                     &[a.view(), b.view(), scales.view(), zps.view()],
@@ -11365,23 +11367,36 @@ mod tests {
                 )
                 .unwrap();
             let reached_kai = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before;
-            (y.to_f32(), reached_kai)
+            #[cfg(feature = "mlas")]
+            let reached_mlas = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) > before_mlas;
+            #[cfg(not(feature = "mlas"))]
+            let reached_mlas = false;
+            (y.to_f32(), reached_kai, reached_mlas)
         };
 
-        // accuracy_level = 4 (CompInt8): the int8 route is licensed, so it must
-        // be reached wherever production enables it. `arm64_kai_sdot_direct_enabled`
-        // is off on macOS/iOS, so reachability is asserted against that policy
-        // rather than unconditionally.
+        // accuracy_level = 4 (CompInt8): an int8 route is licensed, so one must
+        // be reached wherever production enables one. Two can serve this shape,
+        // and which one wins is a per-OS/per-build policy, not a universal:
+        // `arm64_kai_sdot_direct_enabled` is off on macOS/iOS, and with `mlas`
+        // linked `prefer_arm64_mlas_qnbit_decode` claims bits=8/block128/acc4/
+        // M=1 on non-Apple aarch64 *ahead* of KAI. Assert the contract -- some
+        // licensed CompInt8 route runs -- not one particular winner.
         let kai_enabled = DotKernel::arm64_kai_sdot_direct_enabled();
-        let (acc4, acc4_reached_kai) = run(4);
+        #[cfg(all(feature = "mlas", not(any(target_os = "macos", target_os = "ios"))))]
+        let mlas_qnbit_enabled = arm64_mlas_qnbit_decode_opted_in();
+        #[cfg(not(all(feature = "mlas", not(any(target_os = "macos", target_os = "ios")))))]
+        let mlas_qnbit_enabled = false;
+        let int8_route_enabled = kai_enabled || mlas_qnbit_enabled;
+        let (acc4, acc4_reached_kai, acc4_reached_mlas) = run(4);
+        let acc4_int8 = acc4_reached_kai || acc4_reached_mlas;
         assert_eq!(
-            acc4_reached_kai, kai_enabled,
-            "accuracy_level=4 KAI SDOT reachability must follow the documented per-OS policy \
-             (enabled={kai_enabled})"
+            acc4_int8, int8_route_enabled,
+            "accuracy_level=4 CompInt8 reachability must follow the documented per-OS policy \
+             (kai={kai_enabled} mlas_qnbit={mlas_qnbit_enabled})"
         );
-        if kai_enabled {
+        if acc4_int8 {
             // Downcast to the concrete kernel type is not available through the
-            // EP trait object; the counter above is the dispatch proof.
+            // EP trait object; the counters above are the dispatch proof.
             assert_qai8dxp_close(&acc4, &expected);
         }
 
@@ -11390,10 +11405,14 @@ mod tests {
         // the precision regression guard and runs on *every* aarch64 host,
         // including Apple silicon. Before the gate this shape ran CompInt8 on
         // non-Apple aarch64, where `arm64_kai_sdot_direct_enabled` defaults on.
-        let (acc0, acc0_reached_kai) = run(0);
+        let (acc0, acc0_reached_kai, acc0_reached_mlas) = run(0);
         assert!(
             !acc0_reached_kai,
             "accuracy_level=0 is CompFp32 and must not reach the activation-quantizing KAI SDOT route"
+        );
+        assert!(
+            !acc0_reached_mlas,
+            "accuracy_level=0 is CompFp32 and must not reach the activation-quantizing MLAS SQNBit route"
         );
         // `assert_close`'s absolute 1e-5 does not scale with K, and this shape
         // accumulates K=1024 products, so compare relative RMSE against the
@@ -11406,7 +11425,7 @@ mod tests {
             acc0_rel <= 1e-5,
             "accuracy_level=0 must reconstruct the fp32 oracle: relative RMSE {acc0_rel} exceeds 1e-5"
         );
-        if kai_enabled {
+        if acc4_int8 {
             // Self-calibrating: whatever this host's absolute error happens to
             // be, the CompFp32 route must be strictly more accurate than the
             // CompInt8 one. Only meaningful where acc4 actually took CompInt8.

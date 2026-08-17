@@ -316,12 +316,41 @@ jobs:
       # headers, and onnx-runtime-cpuinfo's cmake build script compiles C for
       # the target.  Without them the script hard-fails on CI rather than
       # quietly checking a subset that excludes onnx-runtime-ep-cpu.
+      #
+      # A third pass BUILDS the onnx-runtime-ep-cpu test binaries for aarch64.
+      # Clippy never links, which is how mlas-sys shipped an ARM64 build that
+      # compiled and could not link: build.rs assembled the MSVC ARM64 .asm
+      # sources and had no GNU/clang branch for the GAS .S sources, leaving
+      # MlasSgemmKernelZero, MlasGemvFloatKernel, MlasConvSymKernelNeon and
+      # ~30 more declared, called from dispatch tables, and never defined.
       - name: Install the aarch64 cross toolchain for the cross-arch pass
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
       - name: Cross-target compile check (catches os- and arch-gating errors)
         run: bash scripts/check_cross_compile.sh
+
+      # Compiling and linking ARM64 is not the same as running it.  The first
+      # time this suite executed on aarch64 it found three assertions that only
+      # ever held on x86-64 (NCHWc blocking, MLAS-vs-Rust bit-identity in the
+      # activation A/B, and which CompInt8 route wins MatMulNBits decode), all
+      # of which MLAS-by-default now makes reachable in production.  qemu-user
+      # is the cheap way to keep that signal without a scarce ARM runner.
+      #
+      # QEMU_LD_PREFIX is needed on top of the cargo runner: several parity
+      # tests re-exec their own binary, and the child goes through binfmt,
+      # which does not inherit the runner's -L.
+      - name: Install qemu-user for the aarch64 execution pass
+        run: sudo apt-get install -y qemu-user-static
+      - name: Run the CPU EP suite on aarch64 under qemu
+        env:
+          QEMU_LD_PREFIX: /usr/aarch64-linux-gnu
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
+        run: >-
+          cargo test --locked
+          --target aarch64-unknown-linux-gnu
+          -p onnx-runtime-ep-cpu --lib
 
       # onnx-genai-engine's native decode path only compiles when this feature
       # is on. Without this step a refactor can leave it uncompilable while

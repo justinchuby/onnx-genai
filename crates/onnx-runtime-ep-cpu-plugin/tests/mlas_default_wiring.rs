@@ -19,6 +19,7 @@
 
 mod cdylib_resolve;
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 fn manifest(crate_dir: &str) -> String {
@@ -118,7 +119,7 @@ fn exactly_one_mlas_sys_in_the_dependency_graph() {
         .expect("workspace root exists above this crate");
     let output =
         std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
-            .args(["metadata", "--format-version", "1", "--no-deps"])
+            .args(["metadata", "--format-version", "1", "--offline"])
             .current_dir(&workspace_root)
             .output();
 
@@ -143,18 +144,78 @@ fn exactly_one_mlas_sys_in_the_dependency_graph() {
 
     let metadata: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("cargo metadata emits JSON");
-    let copies: Vec<String> = metadata["packages"]
+
+    // Walk the *resolved* graph outward from this plugin rather than counting
+    // workspace members. `--no-deps` would list only the 54 crates in this
+    // repository, where `mlas-sys` is trivially unique no matter what the
+    // resolver did -- the duplicate this test exists to catch arrives from
+    // outside the workspace and would never appear there.
+    let id_of = |name: &str| -> Option<String> {
+        metadata["packages"]
+            .as_array()?
+            .iter()
+            .find(|package| package["name"] == name)
+            .and_then(|package| package["id"].as_str())
+            .map(str::to_string)
+    };
+    let version_of: HashMap<String, String> = metadata["packages"]
         .as_array()
         .expect("cargo metadata lists packages")
         .iter()
-        .filter(|package| package["name"] == "mlas-sys")
-        .map(|package| package["version"].as_str().unwrap_or("?").to_string())
+        .filter_map(|package| {
+            Some((
+                package["id"].as_str()?.to_string(),
+                format!(
+                    "{}@{}",
+                    package["name"].as_str()?,
+                    package["version"].as_str()?
+                ),
+            ))
+        })
+        .collect();
+    let edges: HashMap<String, Vec<String>> = metadata["resolve"]["nodes"]
+        .as_array()
+        .expect("a full `cargo metadata` carries a resolve graph")
+        .iter()
+        .filter_map(|node| {
+            Some((
+                node["id"].as_str()?.to_string(),
+                node["dependencies"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|dep| Some(dep.as_str()?.to_string()))
+                    .collect(),
+            ))
+        })
         .collect();
 
+    let root = id_of("onnx-runtime-ep-cpu-plugin").expect("this crate is in the metadata");
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue = vec![root];
+    let mut copies: Vec<String> = Vec::new();
+    while let Some(id) = queue.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if version_of
+            .get(&id)
+            .is_some_and(|nv| nv.starts_with("mlas-sys@"))
+        {
+            copies.push(version_of[&id].clone());
+        }
+        queue.extend(edges.get(&id).into_iter().flatten().cloned());
+    }
+
+    // The walk itself has to be load-bearing: a typo in the root name or a
+    // metadata format change would otherwise leave `copies` empty and pass.
+    assert!(
+        seen.len() > 1,
+        "reachability walk found no dependencies of the plugin at all -- the graph was not          traversed, so the count below would be meaningless"
+    );
     assert_eq!(
         copies.len(),
         1,
-        "expected exactly one mlas-sys in the workspace, found {}: {copies:?}",
+        "expected exactly one mlas-sys reachable from the shipped plugin, found {}: {copies:?}",
         copies.len()
     );
 }

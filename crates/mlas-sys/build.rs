@@ -28,6 +28,7 @@ struct Paths {
     asm: PathBuf,
     amd64_asm: PathBuf,
     arm64_asm: PathBuf,
+    aarch64_asm: PathBuf,
     kai: PathBuf,
     includes: Vec<PathBuf>,
 }
@@ -39,6 +40,7 @@ fn main() {
     let asm = lib.join("x86_64");
     let amd64_asm = lib.join("amd64");
     let arm64_asm = lib.join("arm64");
+    let aarch64_asm = lib.join("aarch64");
     let kai = root.join("vendor/mlas/kleidiai");
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
@@ -85,6 +87,7 @@ fn main() {
         asm,
         amd64_asm,
         arm64_asm,
+        aarch64_asm,
         kai,
         includes,
     };
@@ -159,6 +162,11 @@ fn main() {
                 "halfgemm_kernel_neon_fp16.cpp",
                 "softmax_kernel_neon_fp16.cpp",
                 "eltwise_kernel_neon_fp16.cpp",
+                // `platform.cpp` installs these into MLAS_PLATFORM
+                // unconditionally under MLAS_F16VEC_INTRINSICS_SUPPORTED, so
+                // omitting them breaks the link, not just the fp16 kernels.
+                "erf_neon_fp16.cpp",
+                "gelu_neon_fp16.cpp",
             ]
             .iter()
             .map(|f| p.lib.join(f))
@@ -218,11 +226,16 @@ fn main() {
             &[p.lib.join("sqnbitgemm_kernel_neon_int8_2bit.cpp")],
         );
 
-        p.compile_cpp(
-            "mlas_arm64_qnbit_i8mm_cpp",
-            i8mm_flags,
-            &[p.lib.join("sqnbitgemm_kernel_neon_int8_i8mm.cpp")],
-        );
+        let mut i8mm_sources = vec![p.lib.join("sqnbitgemm_kernel_neon_int8_i8mm.cpp")];
+        // `platform.cpp:780` wires the Ummla/Smmla integer GEMM dispatches in
+        // under `#if defined(__linux__)`, so those two TUs are link-required
+        // there and dead everywhere else. Matching the vendor's own guard keeps
+        // Apple and MSVC ARM64 from compiling code their platform never calls.
+        if target_os == "linux" {
+            i8mm_sources.push(p.lib.join("qgemm_kernel_ummla.cpp"));
+            i8mm_sources.push(p.lib.join("qgemm_kernel_smmla.cpp"));
+        }
+        p.compile_cpp("mlas_arm64_qnbit_i8mm_cpp", i8mm_flags, &i8mm_sources);
 
         p.compile_kleidiai_qnbit_c();
 
@@ -272,6 +285,69 @@ fn main() {
                     "SymQgemmS8KernelSdotLd64.asm",
                 ],
             );
+        } else {
+            // The GAS counterparts of the MASM list above. Without these the
+            // ARM64 link fails on `MlasConvSym*Kernel*`, `MlasSgemmKernel*`
+            // and friends: `convsym.cpp` builds dispatch tables of function
+            // pointers to them, so the C++ compiles and only the *link* breaks.
+            // `scripts/check_cross_compile.sh` runs `cargo clippy`, which never
+            // links, which is why this survived until MLAS became a default
+            // feature and something actually tried to produce an ARM64 binary.
+            //
+            // Split by the assembler extension each file needs. Every group was
+            // verified to assemble with `aarch64-linux-gnu-gcc`; the four
+            // failing without a flag fail loudly ("selected processor does not
+            // support ...") rather than silently emitting nothing.
+            p.compile_aarch64_asm(
+                "mlas_aarch64_asm",
+                &[],
+                &[
+                    "ConvSymS8KernelDot.S",
+                    "ConvSymS8KernelDotLd64.S",
+                    "ConvSymS8KernelNeon.S",
+                    "ConvSymU8KernelDot.S",
+                    "ConvSymU8KernelNeon.S",
+                    "DepthwiseQConvKernelSize9Neon.S",
+                    "DepthwiseQConvSymS8KernelNeon.S",
+                    "DepthwiseQConvSymU8KernelNeon.S",
+                    "QgemmS8S8KernelNeon.S",
+                    "QgemmS8S8KernelSdot.S",
+                    "QgemmU8X8KernelNeon.S",
+                    "QgemmU8X8KernelUdot.S",
+                    "SconvDepthwiseKernelNeon.S",
+                    "SconvKernelNeon.S",
+                    "SconvKernelNeonBf16.S",
+                    "SconvNchwcKernelNeon.S",
+                    "SconvPointwiseKernelNeon.S",
+                    "SconvPointwiseKernelNeonBf16.S",
+                    "SgemmKernelNeon.S",
+                    "SgemvKernelNeon.S",
+                    "SymQgemmS8KernelNeon.S",
+                    "SymQgemmS8KernelSdot.S",
+                    "SymQgemmS8KernelSdotLd64.S",
+                ],
+            );
+            p.compile_aarch64_asm(
+                "mlas_aarch64_asm_fp16",
+                &["-march=armv8.2-a+fp16"],
+                &["HalfGemmKernelNeon.S"],
+            );
+            // The i8mm and bf16 microkernels pair with the `__linux__`-only
+            // dispatches above. Verified on `aarch64-unknown-linux-gnu`; not
+            // enabled for Apple, where no runner exists here to prove the
+            // Mach-O assembler accepts them and where nothing references them.
+            if target_os == "linux" {
+                p.compile_aarch64_asm(
+                    "mlas_aarch64_asm_i8mm",
+                    &["-march=armv8.2-a+i8mm"],
+                    &["QgemmS8S8KernelSmmla.S", "QgemmU8X8KernelUmmla.S"],
+                );
+                p.compile_aarch64_asm(
+                    "mlas_aarch64_asm_bf16",
+                    &["-march=armv8.2-a+bf16"],
+                    &["SbgemmKernelNeon.S", "SconvDepthwiseKernelNeonBf16.S"],
+                );
+            }
         }
         emit_cpp_stdlib_link(&target_env, is_apple_target);
         return;
@@ -625,6 +701,29 @@ impl Paths {
                 self.asm.join(f)
             };
             assert!(path.exists(), "missing vendored asm: {}", path.display());
+            b.file(path);
+        }
+        b.compile(name);
+    }
+
+    /// Assemble GAS `.S` sources from `lib/aarch64` for non-MSVC ARM64 targets.
+    ///
+    /// Separate from [`Self::compile_asm`] because that one resolves `.S` under
+    /// `lib/x86_64` and `.asm` under `lib/arm64`, neither of which is where
+    /// these live.
+    fn compile_aarch64_asm(&self, name: &str, flags: &[&str], files: &[&str]) {
+        let mut b = self.base();
+        b.include(&self.aarch64_asm);
+        for f in flags {
+            b.flag(f);
+        }
+        for f in files {
+            let path = self.aarch64_asm.join(f);
+            assert!(
+                path.exists(),
+                "missing vendored aarch64 asm: {}",
+                path.display()
+            );
             b.file(path);
         }
         b.compile(name);

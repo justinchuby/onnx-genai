@@ -45,11 +45,31 @@
 # ARM64 lanes stay the execution signal; this is only the compile gate, and it
 # runs on an existing Linux job instead of a scarce ARM runner.
 #
+# The link dimension
+# ------------------
+# `cargo clippy` type-checks; it never links.  That blind spot hid a real
+# aarch64 break for as long as mlas-sys existed: build.rs assembled the MSVC
+# ARM64 `.asm` sources but had no GNU/clang branch for the GAS `.S` sources, so
+# `MlasConvSymKernelNeon`, `MlasSgemmKernelZero` and friends were declared,
+# called from convsym.cpp/sgemm.cpp dispatch tables, and never defined.  Every
+# aarch64 clippy pass reported clean; every aarch64 *binary* failed at the link
+# step with undefined references.  Nothing caught it because nothing linked an
+# ARM64 binary.  So there is now a third pass that builds (and therefore links)
+# the onnx-runtime-ep-cpu test binaries for aarch64.
+#
 # Known gaps
 # ----------
 # 1. Cannot catch RUNTIME dispatch errors (e.g. a backend enum arm that
 #    compiles but is never reached).  That is dispatch-reachability territory
-#    (check_dispatch_reachability.py).
+#    (check_dispatch_reachability.py).  Executing the ARM64 binaries is also
+#    out of scope here; run them under qemu-user, which needs both a runner and
+#    QEMU_LD_PREFIX so that tests re-executing their own binary can still find
+#    the aarch64 loader:
+#
+#      QEMU_LD_PREFIX=/usr/aarch64-linux-gnu \
+#      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+#      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64-static -L /usr/aarch64-linux-gnu" \
+#      cargo test --target aarch64-unknown-linux-gnu -p onnx-runtime-ep-cpu --lib
 # 2. On macOS local dev, crates with FFI build scripts (ort-sys, cpuinfo) fail
 #    cross-compilation because Linux system headers are unavailable.  The
 #    script falls back to the ort-sys-free subset.  CI (Linux) runs the full
@@ -284,6 +304,43 @@ fi
 
 echo ""
 echo "✓ Cross-arch check passed ($ARCH_SCOPE_NOTE)"
+
+# ─── Run the architecture LINK check ──────────────────────────────────────
+#
+# Clippy stops at type-checking, so a missing symbol definition is invisible to
+# both passes above.  Build the onnx-runtime-ep-cpu test binaries for aarch64
+# so the linker actually has to resolve every MLAS symbol the CPU EP calls.
+# Only possible where the cross toolchain exists; on GitHub Actions its absence
+# already exited 2 above.
+
+if [ -z "$ARCH_SKIPPED" ]; then
+    echo ""
+    echo "▶ Cross-arch LINK check (target: $ARCH_TARGET, crate: onnx-runtime-ep-cpu)"
+    echo "  Command: cargo build --locked --target $ARCH_TARGET -p onnx-runtime-ep-cpu --tests"
+    echo ""
+    if ! CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc         cargo build --locked --target "$ARCH_TARGET" -p onnx-runtime-ep-cpu --tests; then
+        echo "" >&2
+        echo "✗ Cross-arch LINK check FAILED." >&2
+        echo "" >&2
+        echo "  WHY THIS CHECK EXISTS:" >&2
+        echo "  cargo clippy type-checks but never links, so an MLAS symbol that is" >&2
+        echo "  declared and called but never assembled passes both passes above and" >&2
+        echo "  breaks every ARM64 binary.  mlas-sys/build.rs compiled the MSVC ARM64" >&2
+        echo "  .asm sources with no GNU/clang branch for the GAS .S sources, leaving" >&2
+        echo "  MlasConvSymKernelNeon and friends undefined on every aarch64 target." >&2
+        echo "" >&2
+        echo "  FIX: if the undefined symbols are MLAS ones, add the missing sources" >&2
+        echo "  to crates/mlas-sys/build.rs — see compile_aarch64_asm() for the" >&2
+        echo "  per-ISA-extension grouping the GAS sources need." >&2
+        exit 1
+    fi
+    echo ""
+    echo "✓ Cross-arch link check passed"
+else
+    echo ""
+    echo "  ⚠  Cross-arch LINK check skipped: needs the aarch64 cross toolchain."
+fi
+
 echo ""
 if [ -n "$ARCH_SKIPPED" ]; then
     echo "✓ Cross-compile check passed (target_os and target_arch dimensions)"

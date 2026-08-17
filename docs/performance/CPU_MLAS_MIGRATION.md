@@ -297,6 +297,81 @@ Requiring the toolchain is deliberate: a build that cannot compile MLAS should
 say so, not silently produce a cdylib that is 55–81× slower on the paths users
 notice. The opt-out below is the supported way to build without a C++ compiler.
 
+## Platform validation
+
+Flipping the default is what first required an ARM64 *binary*, and that exposed
+a latent break in `mlas-sys`.
+
+`crates/mlas-sys/build.rs` assembled the MSVC ARM64 `.asm` sources and had no
+GNU/clang branch for the GAS `.S` sources in `lib/aarch64/`. Those files define
+`MlasSgemmKernelZero`, `MlasSgemmKernelAdd`, `MlasGemvFloatKernel`,
+`MlasConvSymKernelNeon` and ~30 more, all of which `sgemm.cpp` and `convsym.cpp`
+call through dispatch tables. The C++ therefore *compiled* and only the *link*
+broke — and nothing linked an ARM64 binary, because `scripts/check_cross_compile.sh`
+ran `cargo clippy`, which stops at type-checking. This would have broken the
+Linux ARM64, Windows ARM64 and macOS ARM64 lanes.
+
+`build.rs` now assembles the GAS sources in four groups, because they do not
+share an ISA baseline (each requirement was probed against
+`aarch64-linux-gnu-gcc`, not guessed):
+
+| group | files | `-march` |
+|---|---|---|
+| baseline | 23 | none (two carry their own `.arch_extension bf16`) |
+| fp16 | `HalfGemmKernelNeon.S` | `armv8.2-a+fp16` |
+| i8mm | `QgemmS8S8KernelSmmla.S`, `QgemmU8X8KernelUmmla.S` | `armv8.2-a+i8mm` |
+| bf16 | `SbgemmKernelNeon.S`, `SconvDepthwiseKernelNeonBf16.S` | `armv8.2-a+bf16` |
+
+The i8mm and bf16 groups are Linux-gated, mirroring the vendor's own
+`#if defined(__linux__)` around `MlasGemmU8X8DispatchUmmla` /
+`MlasGemmS8S8DispatchSmmla` (`platform.cpp:780`) — and because the Mach-O
+assembler's acceptance of those directives is unverified here.
+
+`scripts/check_cross_compile.sh` gained a third pass that *builds* the
+`onnx-runtime-ep-cpu` test binaries for `aarch64-unknown-linux-gnu`, so the
+linker has to resolve every MLAS symbol the EP calls. Reverting `build.rs` makes
+that pass fail with the original undefined references, which is the evidence
+that the gate is real rather than decorative.
+
+| target | status | how |
+|---|---|---|
+| Linux x86-64 | tests, clippy, bench | native |
+| Linux aarch64 | **1300 lib tests pass**, clippy, link | `qemu-aarch64-static`, cross gcc 13 |
+| Windows x86-64 / ARM64 | build config only | no hardware here; CI lanes |
+| macOS arm64 | build config only | no hardware here; CI lanes |
+
+Executing the ARM64 tests needs `QEMU_LD_PREFIX` as well as a cargo runner —
+several parity tests re-exec their own binary, and the child goes through
+binfmt, which does not inherit the runner's `-L`:
+
+```console
+QEMU_LD_PREFIX=/usr/aarch64-linux-gnu \
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64-static -L /usr/aarch64-linux-gnu" \
+cargo test --target aarch64-unknown-linux-gnu -p onnx-runtime-ep-cpu --lib
+```
+
+Running these tests on ARM64 for the first time also corrected three claims that
+only ever held on x86-64:
+
+- The NCHWc layout-propagation tests asserted that blocked regions form. MLAS
+  implements NCHWc convolution for x86-64 only; on aarch64
+  `MlasNchwcGetBlockSize()` returns 1 and the pass deliberately does nothing.
+  They now assert the *documented fallback* on such a host — the graph comes
+  back untouched — rather than being skipped.
+- `mlas_matches_rust_simd_on_special_values` demanded bit-identity. That is a
+  real property on x86-64, where the pure-Rust route mirrors MLAS's AVX2
+  polynomial instruction for instruction, and it stays asserted there. On
+  aarch64 MLAS dispatches its own NEON kernels; the dense sweep measures the
+  worst disagreement at 4.8e-7 absolute, so that target gets a tolerance plus
+  exact NaN/infinity/signed-zero semantics, allowing for AdvSIMD's
+  flush-to-zero on subnormals.
+- `matmulnbits_arm64_kai_qsi8_asymmetric_qwen_shape_is_reachable` asserted that
+  KleidiAI SDOT specifically wins the bits=8/block128/M=1 decode. With MLAS
+  linked, `prefer_arm64_mlas_qnbit_decode` claims that shape first on non-Apple
+  aarch64. The contract is that *a licensed CompInt8 route* runs, not which one,
+  so it now matches its bits=4 sibling and accepts either.
+
 ## Opting out
 
 Two boundaries, both real, both tested in CI:

@@ -1066,14 +1066,16 @@ pub(crate) fn gemm_with_backend(
     k: usize,
     n: usize,
 ) -> Result<()> {
-    dispatch_ledger::record(dispatch_ledger::Observation::gemm(
-        dispatch_ledger::KernelFamily::MatMulF32,
-        ledger_backend(backend),
-        "f32",
-        m,
-        n,
-        k,
-    ));
+    dispatch_ledger::record_with(|| {
+        dispatch_ledger::Observation::gemm(
+            dispatch_ledger::KernelFamily::MatMulF32,
+            ledger_backend(backend),
+            "f32",
+            m,
+            n,
+            k,
+        )
+    });
     match backend {
         #[cfg(feature = "mlas")]
         CpuBackend::Mlas => {
@@ -3078,7 +3080,15 @@ mod tests {
             (5, 128, 256),
             (32, 512, 512),
         ];
-        assert_eq!(CpuBackend::auto_detect(), CpuBackend::Mlas);
+        // MLAS is the auto-detected f32 GEMM only where `auto_detect` can
+        // return it; on aarch64 and Apple this is `Generic`/`Accelerate` even
+        // in a full MLAS build. Assert against the same predicate the dispatch
+        // ledger uses so the two cannot disagree, and keep the numeric parity
+        // check below running on every target.
+        assert_eq!(
+            CpuBackend::auto_detect() == CpuBackend::Mlas,
+            crate::dispatch_ledger::gemm_backend_is_mlas()
+        );
         let mut state = 0x1234_abcd_u32;
         let mut next_f32 = || {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -3295,7 +3305,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "mlas")]
+    #[cfg(all(feature = "mlas", target_arch = "x86_64"))]
     #[test]
     fn mlas_selects_a_float_kernel_on_x86_64() {
         assert_ne!(mlas_sys::selected_float_kernel(), 0);

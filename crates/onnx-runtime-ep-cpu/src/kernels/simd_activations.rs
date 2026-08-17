@@ -650,14 +650,16 @@ macro_rules! dispatch_mlas {
             debug_assert_eq!(input.len(), output.len());
             if input.len() >= SIMD_MIN_LEN {
                 let f: fn(&[f32], &mut [f32]) = $mlas;
-                $crate::dispatch_ledger::record($crate::dispatch_ledger::Observation::elementwise(
-                    $crate::dispatch_ledger::KernelFamily::Activations,
-                    // `run_chunked` and the special-value repair are ours; only
-                    // the inner transcendental is MLAS's.
-                    $crate::dispatch_ledger::Backend::NativeOverMlas,
-                    "f32",
-                    input.len(),
-                ));
+                $crate::dispatch_ledger::record_with(|| {
+                    $crate::dispatch_ledger::Observation::elementwise(
+                        $crate::dispatch_ledger::KernelFamily::Activations,
+                        // `run_chunked` and the special-value repair are ours;
+                        // only the inner transcendental is MLAS's.
+                        $crate::dispatch_ledger::Backend::NativeOverMlas,
+                        "f32",
+                        input.len(),
+                    )
+                });
                 // Through `run_chunked`, exactly like the pure-Rust routes.
                 // Calling `f(input, output)` directly here left every MLAS
                 // route single-threaded no matter how many threads the pool
@@ -667,12 +669,14 @@ macro_rules! dispatch_mlas {
                 return;
             }
         }
-        $crate::dispatch_ledger::record($crate::dispatch_ledger::Observation::elementwise(
-            $crate::dispatch_ledger::KernelFamily::Activations,
-            $crate::dispatch_ledger::Backend::Native,
-            "f32",
-            $input.len(),
-        ));
+        $crate::dispatch_ledger::record_with(|| {
+            $crate::dispatch_ledger::Observation::elementwise(
+                $crate::dispatch_ledger::KernelFamily::Activations,
+                $crate::dispatch_ledger::Backend::Native,
+                "f32",
+                $input.len(),
+            )
+        });
         dispatch!($input, $output, $scalar, $vector)
     }};
 }
@@ -3228,9 +3232,31 @@ mod mlas_ab {
         }
     }
 
+    /// The largest absolute disagreement tolerated between the two routes on a
+    /// target where they are *not* the same polynomial.
+    ///
+    /// On x86-64 the pure-Rust route was written to mirror MLAS's AVX2 kernel
+    /// instruction for instruction, so the two are bit-identical and this
+    /// constant is unused. On aarch64 MLAS dispatches its own NEON kernels,
+    /// which are a different approximation of the same functions; the dense
+    /// sweep in `mlas_vs_rust_dense_ulp_sweep` measures the worst
+    /// disagreement over the whole domain at 4.8e-7 (Tanh 3.0e-7, Sigmoid
+    /// 1.8e-7, Erf 6.0e-8, GeluErf 4.8e-7), all of it last-bit noise in f32.
+    ///
+    /// Note that a ULP bound is the wrong instrument here: these functions
+    /// cross zero, and a bit-difference across the sign boundary reads as
+    /// ~8.7e8 ULP for an absolute difference of 1e-7.
+    const CROSS_ISA_ABS_TOL: f32 = 1e-6;
+
     /// MLAS must agree with the pure-Rust route on every special value, not
     /// just on the dense interior sweep. A difference here would be a silent
     /// behaviour change for anyone who builds without the feature.
+    ///
+    /// The *semantics* — NaN, the infinities, and signed zero — must match
+    /// exactly everywhere, the one architectural exception being AdvSIMD's
+    /// flush-to-zero on subnormals. Bit-identity of finite results is only
+    /// required on x86-64, where both routes are the same polynomial; see
+    /// [`CROSS_ISA_ABS_TOL`].
     #[test]
     fn mlas_matches_rust_simd_on_special_values() {
         let specials = [
@@ -3274,15 +3300,44 @@ mod mlas_ab {
             rust(&x, &mut ours);
             mlas_fn(&x, &mut mlas);
             for (i, ((a, b), input)) in ours.iter().zip(&mlas).zip(&x).enumerate() {
-                if a.is_nan() && b.is_nan() {
-                    continue;
-                }
-                assert_eq!(
-                    a.to_bits(),
-                    b.to_bits(),
+                let where_ = format!(
                     "{name}: the MLAS route and the pure-Rust SIMD route \
                      disagree at index {i} for input {input:e} \
                      (rust={a:e} mlas={b:e})"
+                );
+                if a.is_nan() && b.is_nan() {
+                    continue;
+                }
+                // Same polynomial on x86-64: nothing less than bit-identity
+                // would be a real result there.
+                if cfg!(target_arch = "x86_64") {
+                    assert_eq!(a.to_bits(), b.to_bits(), "{where_}");
+                    continue;
+                }
+                assert_eq!(a.is_nan(), b.is_nan(), "{where_} (NaN-ness differs)");
+                assert_eq!(
+                    a.is_infinite(),
+                    b.is_infinite(),
+                    "{where_} (infinite-ness differs)"
+                );
+                if !a.is_finite() {
+                    // The infinities are semantics, not precision.
+                    assert_eq!(a.to_bits(), b.to_bits(), "{where_}");
+                    continue;
+                }
+                // AdvSIMD flushes subnormals to zero, so `tanh(1e-45)` is 1e-45
+                // on the scalar-tail route and +0 through MLAS's NEON kernel.
+                // That is architectural, and 1e-45 is inside the tolerance
+                // below anyway; only *normal* zeros carry a sign contract.
+                let subnormal = |v: f32| v != 0.0 && v.abs() < f32::MIN_POSITIVE;
+                if (*a == 0.0 || *b == 0.0) && !subnormal(*a) && !subnormal(*b) {
+                    assert_eq!(a.to_bits(), b.to_bits(), "{where_} (signed zero)");
+                    continue;
+                }
+                assert!(
+                    (a - b).abs() <= CROSS_ISA_ABS_TOL,
+                    "{where_} by {:e}, over the {CROSS_ISA_ABS_TOL:e} tolerance",
+                    (a - b).abs()
                 );
             }
         }

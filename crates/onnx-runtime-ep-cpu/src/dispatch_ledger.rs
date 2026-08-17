@@ -21,7 +21,9 @@
 //! 2. **What actually ran?** [`record`] captures live [`Observation`]s so a test
 //!    or a benchmark can assert the route it believes it measured. Recording is
 //!    **off unless asked for** (`NXRT_CPU_DISPATCH_LEDGER=1`, or [`enable`]), so
-//!    a production decode loop pays one relaxed atomic load per route decision.
+//!    a production decode loop pays one relaxed atomic load per route decision
+//!    — provided dispatch sites use [`record_with`], which does not build the
+//!    evidence unless it will be kept.
 //!
 //! # Reading the plan
 //!
@@ -195,12 +197,47 @@ impl Graduation {
 /// the kernel already decides. What the tests enforce is that the ledger is
 /// *total*, *unique*, and *consistent with the build* — not that it restates
 /// the kernel's arithmetic.
+/// How a family's MLAS route is *reached*, which decides where it exists.
+///
+/// The `mlas` feature is not the whole gate. Two different mechanisms call into
+/// MLAS in this crate and they have different reachability:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteGate {
+    /// The kernel calls `mlas_sys::` directly under `#[cfg(feature = "mlas")]`.
+    /// MLAS ships NEON kernels as well as x86 ones, so these routes exist on
+    /// every target the crate builds for.
+    WhereverLinked,
+    /// The route is selected through [`crate::backend::CpuBackend::auto_detect`],
+    /// which returns `Mlas` only on x86-64, and only when the host is not
+    /// Android (`Xnnpack`) or Apple (`Accelerate`). On aarch64 Linux, Windows
+    /// ARM64 and macOS these families run a **native** GEMM no matter what the
+    /// feature says, and the ledger has to report that rather than the plan.
+    GemmBackend,
+}
+
+/// Whether [`crate::backend::CpuBackend::auto_detect`] can return `Mlas` here.
+///
+/// Kept as a `const fn` mirroring `auto_detect`'s own `cfg` arms so the ledger
+/// and the dispatcher cannot disagree; `gemm_families_report_the_reachable_route`
+/// asserts they do not.
+pub const fn gemm_backend_is_mlas() -> bool {
+    cfg!(all(
+        feature = "mlas",
+        target_arch = "x86_64",
+        not(target_os = "android"),
+        not(target_os = "macos"),
+        not(target_os = "ios")
+    ))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PlanEntry {
     /// The family this entry governs.
     pub family: KernelFamily,
     /// The route taken when the `mlas` feature is compiled in (the default).
     pub planned: Backend,
+    /// How the MLAS route is reached, and therefore on which targets it exists.
+    pub gate: RouteGate,
     /// Element types this route covers.
     pub dtypes: &'static str,
     /// Instruction-set evidence: what the route dispatches on at runtime.
@@ -214,17 +251,27 @@ pub struct PlanEntry {
 }
 
 impl PlanEntry {
-    /// The route this *build* can actually reach.
+    /// The route this *build*, on this *target*, can actually reach.
     ///
-    /// Without the `mlas` feature, MLAS is not linked, so every MLAS-bearing
-    /// plan degrades to [`Backend::Native`]. The native path is always present:
-    /// it is the correctness baseline every MLAS route is differentially tested
-    /// against.
+    /// Two ways a plan degrades to [`Backend::Native`]:
+    ///
+    /// * the `mlas` feature is off, so MLAS is not linked at all; or
+    /// * the family is reached through [`RouteGate::GemmBackend`] and this
+    ///   target is one where `auto_detect` never returns `Mlas` — aarch64,
+    ///   Apple, or Android. A ledger that reported `Mlas` for `MatMulF32` on
+    ///   Windows ARM64 would be stating the plan while the binary ran a native
+    ///   GEMM, which is the drift this module exists to prevent.
+    ///
+    /// The native path is always present: it is the correctness baseline every
+    /// MLAS route is differentially tested against.
     pub const fn effective(&self) -> Backend {
-        if cfg!(feature = "mlas") {
-            self.planned
-        } else {
-            Backend::Native
+        if !cfg!(feature = "mlas") {
+            return Backend::Native;
+        }
+        match self.gate {
+            RouteGate::WhereverLinked => self.planned,
+            RouteGate::GemmBackend if gemm_backend_is_mlas() => self.planned,
+            RouteGate::GemmBackend => Backend::Native,
         }
     }
 }
@@ -238,6 +285,7 @@ pub const PLAN: &[PlanEntry] = &[
     PlanEntry {
         family: KernelFamily::MatMulF32,
         planned: Backend::Mlas,
+        gate: RouteGate::GemmBackend,
         dtypes: "f32 (f16/bf16 widen to f32 and take the native blocked path)",
         isa: "MLAS runtime dispatch: AVX-512 / AVX2+FMA / SSE2 on x86-64, NEON on aarch64; \
               native SimdX86 needs AVX2+FMA, native Generic needs nothing",
@@ -253,6 +301,7 @@ pub const PLAN: &[PlanEntry] = &[
     PlanEntry {
         family: KernelFamily::GemmF32,
         planned: Backend::NativeOverMlas,
+        gate: RouteGate::GemmBackend,
         dtypes: "f32",
         isa: "same MLAS float dispatch as MatMulF32",
         threads: "MLAS partitions the GEMM; alpha/beta/bias epilogue is ours, single pass",
@@ -264,6 +313,7 @@ pub const PLAN: &[PlanEntry] = &[
     PlanEntry {
         family: KernelFamily::MatMulNBits,
         planned: Backend::NativeOverMlas,
+        gate: RouteGate::WhereverLinked,
         dtypes: "int4 / int8 weights, f32 activations, f16 scales",
         isa: "native: AVX2/AVX-512/VNNI and NEON dot; MLAS SQNBit: its own dispatch",
         threads: "ours — the persistent SPMD decode pool shards N; MLAS is called per shard",
@@ -277,6 +327,7 @@ pub const PLAN: &[PlanEntry] = &[
     PlanEntry {
         family: KernelFamily::QLinearMatMul,
         planned: Backend::Mlas,
+        gate: RouteGate::WhereverLinked,
         dtypes: "u8xu8, u8xi8 integer GEMM with i32 accumulation",
         isa: "MLAS QGemm dispatch (AVX2 / AVX-VNNI / AVX-512 VNNI, NEON udot/sdot)",
         threads: "MLAS partitions; requantization runs inside MLAS the way ORT does (#1125)",
@@ -287,6 +338,7 @@ pub const PLAN: &[PlanEntry] = &[
     PlanEntry {
         family: KernelFamily::Activations,
         planned: Backend::NativeOverMlas,
+        gate: RouteGate::WhereverLinked,
         dtypes: "f32 (f16/bf16 widen)",
         isa: "MLAS SIMD transcendentals; native NEON on aarch64, native scalar elsewhere",
         threads: "ours — run_chunked shards across the EP pool, MLAS is single-threaded per chunk",
@@ -299,6 +351,7 @@ pub const PLAN: &[PlanEntry] = &[
     PlanEntry {
         family: KernelFamily::Softmax,
         planned: Backend::Mlas,
+        gate: RouteGate::WhereverLinked,
         dtypes: "f32",
         isa: "MLAS SIMD exp/reduce dispatch",
         threads: "ours — rows are sharded across the EP pool, MLAS runs a shard serially",
@@ -308,6 +361,7 @@ pub const PLAN: &[PlanEntry] = &[
     PlanEntry {
         family: KernelFamily::Normalization,
         planned: Backend::Native,
+        gate: RouteGate::WhereverLinked,
         dtypes: "f32 / f16 / bf16",
         isa: "native SIMD (AVX2/AVX-512, NEON) with f32 accumulation",
         threads: "ours — rows sharded across the EP pool",
@@ -317,6 +371,7 @@ pub const PLAN: &[PlanEntry] = &[
     PlanEntry {
         family: KernelFamily::AttentionTranspose,
         planned: Backend::NativeOverMlas,
+        gate: RouteGate::WhereverLinked,
         dtypes: "f32 / f16 / bf16",
         isa: "native attention loops; MLAS SGEMM for the QK^T and PV products",
         threads: "ours — heads and sequence tiles are sharded by the EP pool",
@@ -327,6 +382,7 @@ pub const PLAN: &[PlanEntry] = &[
     PlanEntry {
         family: KernelFamily::Quantization,
         planned: Backend::NativeOverMlas,
+        gate: RouteGate::WhereverLinked,
         dtypes: "f32 <-> u8/i8/int4",
         isa: "MLAS quantize/dequantize SIMD; native block dequant for int4",
         threads: "ours",
@@ -336,6 +392,7 @@ pub const PLAN: &[PlanEntry] = &[
     PlanEntry {
         family: KernelFamily::MoE,
         planned: Backend::NativeOverMlas,
+        gate: RouteGate::WhereverLinked,
         dtypes: "int4 / int8 expert weights, f32 activations",
         isa: "inherits MatMulNBits dispatch",
         threads: "ours — experts are sharded across the EP pool",
@@ -346,6 +403,7 @@ pub const PLAN: &[PlanEntry] = &[
     PlanEntry {
         family: KernelFamily::Convolution,
         planned: Backend::Mlas,
+        gate: RouteGate::WhereverLinked,
         dtypes: "f32",
         isa: "MLAS NCHWc blocked convolution and its im2col/direct kernels",
         threads: "MLAS partitions; runs on the mlas-sys pool",
@@ -356,6 +414,7 @@ pub const PLAN: &[PlanEntry] = &[
     PlanEntry {
         family: KernelFamily::Pooling,
         planned: Backend::Mlas,
+        gate: RouteGate::WhereverLinked,
         dtypes: "f32",
         isa: "MLAS pooling kernels, including the NCHWc blocked variants",
         threads: "MLAS partitions",
@@ -365,6 +424,7 @@ pub const PLAN: &[PlanEntry] = &[
     PlanEntry {
         family: KernelFamily::Elementwise,
         planned: Backend::Native,
+        gate: RouteGate::WhereverLinked,
         dtypes: "all supported dtypes",
         isa: "native dense SIMD dispatch with a scalar fallback",
         threads: "ours — dense ranges sharded across the EP pool",
@@ -564,9 +624,11 @@ pub fn reset() {
 
 /// Record a routing decision.
 ///
-/// Costs one relaxed atomic load when recording is off, which is the production
-/// configuration. Call this at the point the route is *chosen*, not inside the
-/// inner loop.
+/// Takes an already-built [`Observation`], so the caller pays for gathering the
+/// evidence whether or not it is kept. On a kernel dispatch path use
+/// [`record_with`] instead; this form is for tests and for callers that already
+/// hold an observation. Call it where the route is *chosen*, not in an inner
+/// loop.
 #[inline]
 pub fn record(observation: Observation) {
     if !is_recording() {
@@ -575,6 +637,22 @@ pub fn record(observation: Observation) {
     if let Ok(mut entries) = log().lock() {
         entries.push(observation);
     }
+}
+
+/// Record an observation that is only *built* if recording is on.
+///
+/// Prefer this at kernel dispatch sites. `record(Observation::gemm(..))`
+/// evaluates its argument first, and building an [`Observation`] probes the
+/// host ISA and asks MLAS for its thread degree — an FFI call — so the
+/// "one relaxed atomic load when off" cost this module advertises was not what
+/// a production decode loop actually paid. With the closure, an off ledger
+/// costs the load and nothing else.
+#[inline]
+pub fn record_with(observation: impl FnOnce() -> Observation) {
+    if !is_recording() {
+        return;
+    }
+    record(observation());
 }
 
 /// Every observation recorded since the last [`reset`].
@@ -656,16 +734,26 @@ mod tests {
     /// Without MLAS linked, no family may claim an MLAS route: the symbols are
     /// not there. This is what makes `--no-default-features` a real opt-out
     /// rather than a label.
+    ///
+    /// With MLAS linked the plan holds only for [`RouteGate::WhereverLinked`]
+    /// families. The GEMM ones degrade on aarch64, Apple and Android even in a
+    /// full MLAS build, because `auto_detect` never offers them `Mlas` there —
+    /// `gemm_families_report_the_reachable_route` owns that half.
     #[test]
     fn effective_route_degrades_without_mlas() {
         for entry in PLAN {
-            if mlas_linked() {
-                assert_eq!(entry.effective(), entry.planned);
-            } else {
+            if !mlas_linked() {
                 assert_eq!(
                     entry.effective(),
                     Backend::Native,
                     "{} must degrade to native without the mlas feature",
+                    entry.family
+                );
+            } else if entry.gate == RouteGate::WhereverLinked {
+                assert_eq!(
+                    entry.effective(),
+                    entry.planned,
+                    "{} calls mlas-sys directly, so a linked build always reaches it",
                     entry.family
                 );
             }
@@ -674,6 +762,59 @@ mod tests {
 
     /// A graduated family has absorbed MLAS; it must not still plan an MLAS
     /// route. This is the invariant that keeps the ledger honest as families
+    /// The ledger's GEMM verdict must be the dispatcher's, on this target.
+    ///
+    /// `effective()` used to gate on the `mlas` feature alone, which made it
+    /// claim `Mlas` for `MatMulF32` on aarch64, Windows ARM64 and macOS —
+    /// targets where `auto_detect` returns `Generic` or `Accelerate` and MLAS
+    /// is never asked for a GEMM. A ledger that reports the plan instead of the
+    /// binary is worse than no ledger, so this compares the two directly rather
+    /// than restating `gemm_backend_is_mlas()`.
+    #[test]
+    fn gemm_families_report_the_reachable_route() {
+        let dispatcher_uses_mlas = {
+            #[cfg(feature = "mlas")]
+            {
+                crate::backend::CpuBackend::auto_detect() == crate::backend::CpuBackend::Mlas
+            }
+            #[cfg(not(feature = "mlas"))]
+            {
+                false
+            }
+        };
+        assert_eq!(
+            gemm_backend_is_mlas(),
+            dispatcher_uses_mlas,
+            "the ledger's cfg mirror of auto_detect has drifted from auto_detect itself"
+        );
+
+        for entry in PLAN.iter().filter(|e| e.gate == RouteGate::GemmBackend) {
+            let reaches_mlas = entry.effective() != Backend::Native;
+            assert_eq!(
+                reaches_mlas,
+                dispatcher_uses_mlas,
+                "{} reports {:?} but auto_detect gives {:?} on this target",
+                entry.family.name(),
+                entry.effective(),
+                crate::backend::CpuBackend::auto_detect()
+            );
+        }
+    }
+
+    /// Only the families that actually go through `CpuBackend` may claim that
+    /// gate. Everything else calls `mlas_sys::` directly and is reachable on
+    /// every target, so mislabelling one would silently suppress its MLAS route
+    /// from the ledger on ARM.
+    #[test]
+    fn only_the_cpu_backend_families_use_the_gemm_gate() {
+        let gated: Vec<&str> = PLAN
+            .iter()
+            .filter(|e| e.gate == RouteGate::GemmBackend)
+            .map(|e| e.family.name())
+            .collect();
+        assert_eq!(gated, vec!["matmul_f32", "gemm_f32"]);
+    }
+
     /// migrate.
     #[test]
     fn graduated_families_do_not_plan_mlas() {

@@ -271,6 +271,36 @@ fn transcendental_routes_agree_on_special_values() {
 
     let mut native = vec![f32::NAN; input.len()];
     backend_ab::gelu_native(&input, &mut native);
+
+    // The native invariants are asserted before the MLAS gate, not after it.
+    // With them below, a `--no-default-features` build returned from the gate
+    // having asserted nothing and still reported a pass -- exactly the vacuous
+    // green this file claims not to produce.
+    let neg_inf_at = input
+        .iter()
+        .position(|v| *v == f32::NEG_INFINITY)
+        .expect("the input carries -inf");
+    assert_eq!(
+        native[neg_inf_at], 0.0,
+        "gelu(-inf) must be 0 on the native route"
+    );
+    let pos_inf_at = input
+        .iter()
+        .position(|v| *v == f32::INFINITY)
+        .expect("the input carries +inf");
+    assert_eq!(
+        native[pos_inf_at],
+        f32::INFINITY,
+        "gelu(+inf) must be +inf on the native route"
+    );
+    for (index, value) in native.iter().enumerate() {
+        assert!(
+            !value.is_nan(),
+            "gelu({}) produced NaN on the native route",
+            input[index]
+        );
+    }
+
     let mut mlas = vec![f32::NAN; input.len()];
     if !backend_ab::gelu_mlas(&input, &mut mlas) {
         return;
@@ -295,14 +325,9 @@ fn transcendental_routes_agree_on_special_values() {
         );
     }
     // gelu(-inf) is 0, not NaN: this is the repair MLAS needs and we apply.
-    let neg_inf_at = input.iter().position(|v| *v == f32::NEG_INFINITY).unwrap();
     assert_eq!(
         mlas[neg_inf_at], 0.0,
         "gelu(-inf) must be 0 on the MLAS route"
-    );
-    assert_eq!(
-        native[neg_inf_at], 0.0,
-        "gelu(-inf) must be 0 on the native route"
     );
 }
 
@@ -359,6 +384,33 @@ fn effective_plan_matches_this_build() {
                 "{family} claims {effective} without MLAS linked"
             );
         }
+    }
+
+    // The other half of the claim, which the `!mlas_linked()` branch above
+    // cannot make: in a build that *does* link MLAS, at least one family has to
+    // reach it. Without this the whole ledger could report `Native` everywhere
+    // and every assertion here would still hold.
+    if dispatch_ledger::mlas_linked() {
+        let reaching: Vec<&KernelFamily> = KernelFamily::ALL
+            .iter()
+            .filter(|f| dispatch_ledger::effective_backend(**f) != Backend::Native)
+            .collect();
+        assert!(
+            !reaching.is_empty(),
+            "MLAS is linked but the plan says no family reaches it"
+        );
+    }
+
+    // The GEMM families are the ones whose reachability is target-dependent
+    // (`auto_detect` only returns `Mlas` on non-Apple, non-Android x86-64), so
+    // check the ledger against the dispatcher rather than against itself.
+    let gemm_is_mlas = dispatch_ledger::gemm_backend_is_mlas();
+    for family in [KernelFamily::MatMulF32, KernelFamily::GemmF32] {
+        assert_eq!(
+            dispatch_ledger::effective_backend(family) != Backend::Native,
+            gemm_is_mlas,
+            "{family} disagrees with what CpuBackend::auto_detect can reach here"
+        );
     }
     // Every family the A/B module covers must be a family the plan knows about.
     for family in backend_ab::AB_COVERED {

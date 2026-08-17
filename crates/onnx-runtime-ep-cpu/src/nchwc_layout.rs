@@ -924,6 +924,41 @@ mod tests {
             .expect("layout propagation pass");
     }
 
+    /// Whether this host has an MLAS blocked-convolution kernel.
+    ///
+    /// MLAS implements NCHWc convolution for x86-64 only; on aarch64
+    /// `MlasNchwcGetBlockSize()` returns 1 and [`NchwcLayoutPropagation::run`]
+    /// deliberately returns early. These tests assert the *propagation*, so
+    /// they only mean something where propagation can happen.
+    fn has_blocked_conv() -> bool {
+        mlas_sys::nchwc_block_size() >= 8
+    }
+
+    /// The documented behaviour on a host without a blocked-conv kernel: the
+    /// pass leaves the graph exactly as it found it.
+    ///
+    /// Asserting this is the honest alternative to skipping. Before `mlas`
+    /// became a default feature these tests never ran on aarch64 at all; now
+    /// they do, and a bare `return` would have turned three real assertions
+    /// into three green no-ops on every ARM64 lane.
+    fn assert_propagation_is_a_noop(graph: &mut Graph) {
+        let convs = count_op(graph, "Conv");
+        run_pass(graph);
+        assert_eq!(
+            count_op(graph, "Conv"),
+            convs,
+            "no blocked-conv kernel: every Conv must be left alone"
+        );
+        assert_eq!(count_op(graph, NCHWC_CONV_OP), 0, "no blocked Conv created");
+        assert_eq!(
+            count_op(graph, REORDER_TO_BLOCKED_OP),
+            0,
+            "no entry reorder without a blocked kernel to feed"
+        );
+        assert_eq!(count_op(graph, REORDER_TO_NCHW_OP), 0, "no exit reorder");
+        assert!(graph.validate().is_ok());
+    }
+
     /// A 3x3-same Conv weight value with `[out, in, 3, 3]`.
     fn weight(graph: &mut Graph, name: &str, out: usize, inn: usize) -> ValueId {
         graph.create_named_value(name, DataType::Float32, static_shape([out, inn, 3, 3]))
@@ -954,6 +989,10 @@ mod tests {
         graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(c2)], vec![r2]));
         graph.add_output(r2);
 
+        if !has_blocked_conv() {
+            assert_propagation_is_a_noop(&mut graph);
+            return;
+        }
         run_pass(&mut graph);
 
         assert_eq!(count_op(&graph, NCHWC_CONV_OP), 2, "both Convs blocked");
@@ -1001,6 +1040,10 @@ mod tests {
         ));
         graph.add_output(sum);
 
+        if !has_blocked_conv() {
+            assert_propagation_is_a_noop(&mut graph);
+            return;
+        }
         run_pass(&mut graph);
 
         assert_eq!(count_op(&graph, NCHWC_CONV_OP), 2);
@@ -1049,6 +1092,10 @@ mod tests {
         graph.insert_node(conv_node("conv2", c1, w2, c2));
         graph.add_output(c2);
 
+        if !has_blocked_conv() {
+            assert_propagation_is_a_noop(&mut graph);
+            return;
+        }
         run_pass(&mut graph);
 
         assert_eq!(count_op(&graph, NCHWC_CONV_OP), 2);

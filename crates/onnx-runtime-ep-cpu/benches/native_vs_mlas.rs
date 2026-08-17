@@ -175,6 +175,19 @@ fn report(family: KernelFamily, case: &str, native: Timing, mlas: Option<Timing>
     let quotient = |m: f64, n: f64| if n > 0.0 { m / n } else { f64::NAN };
     let ratio = quotient(mlas.wall, native.wall);
     let cpu_ratio = quotient(mlas.cpu, native.cpu);
+    // A native time of zero means the timer could not resolve it, not that
+    // native lost. `NaN >= 1.05` and `NaN >= 1.0` are both false, so without
+    // this the fastest possible result would be reported as `keep-mlas` — the
+    // one wrong answer this bench must never give.
+    if !ratio.is_finite() {
+        println!(
+            "{}\t{case}\t{:.4}\t{:.4}\t-\t-\tbelow-timer-resolution",
+            family.name(),
+            ns(native.wall),
+            ns(mlas.wall)
+        );
+        return;
+    }
     // `graduates` is the only claim this bench makes: it says the measurement
     // clears the bar, not that the replacement is correct. Correctness is
     // `tests/native_vs_mlas_differential.rs`; both are required.
