@@ -67,3 +67,61 @@ stderr — a fast way to find which op-type dominates before reaching for Nsight
   caveat it; pin a free GPU with `CUDA_VISIBLE_DEVICES`.
 - Verify byte/near-identity after any kernel change; split-K reorders fp32
   partials (near-equal, not bit-exact) — validate with tolerance tests.
+
+## Making a measurement trustworthy on a shared box
+
+This machine is shared with build agents, and the failure mode is not "numbers
+are a bit off" — it is publishing a conclusion that reverses when the box is
+quiet. Three habits, in increasing order of strength:
+
+**1. Measure CPU time, not wall clock.** `TotalProcessorTime` on the process is
+nearly contention-immune for a fixed thread count. Measured on this box: three
+identical runs of one configuration gave 39.3 / 25.8 / 16.1 s wall, while CPU
+time reproduced to ~2%. Peak RSS is per-process and reliable regardless.
+
+```powershell
+$p = Start-Process -FilePath $exe -ArgumentList @(...) -NoNewWindow -PassThru `
+     -RedirectStandardOutput out.txt -RedirectStandardError err.txt
+$peak = 0
+while (-not $p.HasExited) {
+  $ws = (Get-Process -Id $p.Id -ErrorAction SilentlyContinue).WorkingSet64
+  if ($ws -gt $peak) { $peak = $ws }
+  Start-Sleep -Milliseconds 200
+}
+$p.WaitForExit()
+"cpu=$($p.TotalProcessorTime.TotalSeconds)s peak=$([math]::Round($peak/1MB))MB"
+```
+
+Note `PeakWorkingSet64` reads 0 after exit, so poll while it runs, by PID (not
+by process name — that catches the wrong instance when several are alive).
+
+**2. Compare an effect against the spread of its own arm.** If the A/B
+difference is smaller than the gap between two runs of the *same* configuration,
+it is unmeasured — say so rather than reporting it. A 14B model showed ~20% wall
+spread within one arm; anything under ~1.3x there is noise.
+
+**3. Best: include a control arm the change provably cannot touch.** A harness
+that also measures a shape or path the toggle does not reach turns "the machine
+was busy" from an excuse into a measurement. If the control moves, the run is
+unusable and you know it *before* drawing a conclusion.
+
+This caught a real case: an M=1-only GEMV toggle was being evaluated, and the
+M=128 rows in the same harness — which that route cannot affect — moved 1.05x →
+0.70x and 0.72x → 0.92x between runs. That set a noise floor of ~1.5x and made
+an apparent single-shape regression unadjudicable. Without the control it would
+have been argued about; with it, the answer was simply "re-run when quiet".
+
+Prefer a control arm to extra repetitions: it costs one more shape in a harness
+you already have, and it is stronger evidence than a distribution.
+
+## Separating fixed cost from per-unit cost
+
+Differencing removes an intercept you cannot otherwise isolate:
+
+- **Decode per token:** run N and M tokens, take `(T(M) - T(N)) / (M - N)`. This
+  cancels model load and prefill entirely.
+- **Prefill per token:** run the *same* token count with two prompt lengths and
+  take the slope. This cancels model load, which otherwise dominates a short run.
+
+A single long run cannot separate these, and a single short run is almost all
+fixed cost. Both mistakes have been made here.
