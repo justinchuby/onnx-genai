@@ -588,6 +588,9 @@ macro_rules! dispatch {
 
 /// Route an elementwise f32 kernel to MLAS when the `mlas` feature is on.
 ///
+/// Only `Erf` and exact `Gelu` still take this route. `Tanh` and `Sigmoid`
+/// used to and no longer do — see the note below this macro for why.
+///
 /// MLAS is the library ONNX Runtime's own CPU activation kernels call, so this
 /// is not "a faster approximation" — it is *the same* polynomial ORT uses.
 ///
@@ -597,7 +600,7 @@ macro_rules! dispatch {
 /// CI (AVX2+FMA, AVX-512 masked) the two routes are bit-identical, pinned by
 /// `mlas_ab::mlas_matches_rust_simd_on_special_values`; elsewhere they may
 /// differ within the documented tolerance. Before this change an `mlas`-on and
-/// an `mlas`-off build agreed bitwise for these four ops on every host, and
+/// an `mlas`-off build agreed bitwise for these ops on every host, and
 /// that is what is being traded for the speed. Measured on this
 /// host (AMD EPYC 9V74, AVX2+FMA, AVX-512 masked off), the pure-Rust AVX2 path
 /// is compute-bound at ~0.78 ns/elem while MLAS reaches ~0.35 ns/elem, which is
@@ -627,31 +630,32 @@ macro_rules! dispatch_mlas {
     }};
 }
 
-/// Why `Tanh` and `Sigmoid` do *not* have an MLAS route.
-///
-/// They used to. MLAS's `MlasComputeTanh`/`MlasComputeLogistic` are not
-/// range-preserving — over a dense sweep of [-20, 20] tanh lands outside
-/// `[-1, 1]` for 2934 of 1048576 points (by up to 2 ulp) and logistic outside
-/// `[0, 1]` for 2. Our kernels guarantee the range and
-/// `monotonicity_within_documented_slack` asserts it, so the MLAS route had to
-/// re-read every block it had just written and clamp it.
-///
-/// That fix-up pass is now more expensive than the polynomial it was buying.
-/// The two kernels used the *same* Eigen rational as MLAS even before this,
-/// and once the redundant saturation blends came out of them (#1121) the
-/// pure-Rust AVX2 path became outright faster than MLAS-plus-clamp. Measured on
-/// this host, `mlas`-off vs `mlas`-on p50, 1 thread:
-///
-/// | op      |  64 Ki |  256 Ki |    1 Mi |    4 Mi |
-/// |---------|-------:|--------:|--------:|--------:|
-/// | Tanh    | 32.5 / 36.2 | 105.6 / 146.7 | 438.4 / 469.4 | 1896 / 2226 |
-/// | Sigmoid | 31.2 / 38.3 | 113.7 / 129.3 | 408.9 / 525.8 | 1887 / 2268 |
-///
-/// The `mlas` route lost at every size — up to 1.39x on `Tanh` at 256 Ki — so
-/// it is gone and both builds now run the same kernel. `Erf` and exact `Gelu`
-/// keep theirs: `Erf` needs no fix-up at all and `Gelu`'s is a non-writing
-/// compare scan, and both still win (1.4-1.6x and 1.17x at 4 Mi).
-///
+// Why `Tanh` and `Sigmoid` do *not* have an MLAS route.
+//
+// They used to. MLAS's `MlasComputeTanh`/`MlasComputeLogistic` are not
+// range-preserving — over a dense sweep of [-20, 20] tanh lands outside
+// `[-1, 1]` for 2934 of 1048576 points (by up to 2 ulp) and logistic outside
+// `[0, 1]` for 2. Our kernels guarantee the range and
+// `monotonicity_within_documented_slack` asserts it, so the MLAS route had to
+// re-read every block it had just written and clamp it.
+//
+// That fix-up pass is now more expensive than the polynomial it was buying.
+// The two kernels used the *same* Eigen rational as MLAS even before this,
+// and once the redundant saturation blends came out of them (#1121) the
+// pure-Rust AVX2 path became outright faster than MLAS-plus-clamp. Measured on
+// this host, `mlas`-off vs `mlas`-on p50, 1 thread:
+//
+// | op      |  64 Ki |  256 Ki |    1 Mi |    4 Mi |
+// |---------|-------:|--------:|--------:|--------:|
+// | Tanh    | 32.5 / 36.2 | 105.6 / 146.7 | 438.4 / 469.4 | 1896 / 2226 |
+// | Sigmoid | 31.2 / 38.3 | 113.7 / 129.3 | 408.9 / 525.8 | 1887 / 2268 |
+//
+// The `mlas` route lost at every size — up to 1.39x on `Tanh` at 256 Ki — so
+// it is gone and both builds now run the same kernel. `Erf` and exact `Gelu`
+// keep theirs: `Erf` needs no fix-up at all and `Gelu`'s is a non-writing
+// compare scan, and both still win (1.4-1.6x and 1.17x at 4 Mi).
+//
+
 /// Elements per MLAS + fix-up block.
 ///
 /// The fix-up passes below re-read the block MLAS just wrote. Run over the
