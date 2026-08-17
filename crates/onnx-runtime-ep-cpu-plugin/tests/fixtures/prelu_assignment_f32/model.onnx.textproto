@@ -1,0 +1,38 @@
+ir_version: 10
+graph {
+  node: [
+    { input: ["X", "slope"] output: ["Z"] op_type: "PRelu" }
+  ]
+  name: "prelu_assignment_f32"
+  initializer: [
+  {
+    name: "slope"
+    data_type: 1
+    dims: [ 8 ]
+    float_data: [ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 ]
+  }
+  ]
+  input: [
+  {
+    name: "X"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape { dim: [{ dim_value: 8192 }, { dim_value: 8 }] }
+      }
+    }
+  }
+  ]
+  output: [
+  {
+    name: "Z"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape { dim: [{ dim_value: 8192 }, { dim_value: 8 }] }
+      }
+    }
+  }
+  ]
+}
+opset_import: [{ version: 22 }]

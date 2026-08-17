@@ -1806,6 +1806,7 @@ name = "mlas-sys"
 version = "0.1.0-dev.5"
 dependencies = [
  "cc",
+ "libm",
  "rayon",
 ]
 
@@ -2426,6 +2427,7 @@ dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-ort-testkit",
  "onnx-std",
+ "serde_yaml",
 ]
 
 [[package]]
