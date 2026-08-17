@@ -491,6 +491,9 @@ impl Engine {
                 Ok(graph) => onnx_runtime_ep_cpu::resident_dequant_f32_cache_bytes(&graph)
                     .saturating_add(onnx_runtime_ep_cpu::weight_transpose_cache_predicted_bytes(
                         &graph,
+                    ))
+                    .saturating_add(onnx_runtime_ep_cpu::matmul_dense_cache_predicted_bytes(
+                        &graph,
                     )),
                 Err(_) => 0,
             }
@@ -563,6 +566,16 @@ impl Engine {
         // nothing (byte-identical output, only slower decode) instead of holding
         // the session-lifetime copies resident over budget.
         onnx_runtime_ep_cpu::set_weight_transpose_cache_enabled(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
+        // #1056: the per-kernel `MatMulPrepack::dense` widened-f32 cache (one
+        // resident `4 * K * N` f32 copy per constant operand that is not already
+        // contiguous f32 -- f16/bf16/f64 or strided) is the fourth buffer folded
+        // into `resident_f32_cache_bytes`, so the same verdict governs it. When
+        // declined, the `MatMul`/`FusedMatMulBias` kernels widen the operand per
+        // call and retain nothing (byte-identical output, only slower) instead of
+        // holding the session-lifetime copies resident over budget.
+        onnx_runtime_ep_cpu::set_matmul_dense_cache_enabled(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
         #[cfg(feature = "cuda")]
