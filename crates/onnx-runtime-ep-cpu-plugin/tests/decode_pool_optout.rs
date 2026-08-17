@@ -8,9 +8,14 @@
 ///
 /// Nothing in the plugin path enters an SPMD decode scope, so a built pool is
 /// pure cost: resident workers competing with ONNX Runtime's intra-op pool, and
-/// a `MatMulNBits` weight pre-split into one MLAS shard per decode worker,
-/// which caps a decode GEMV at that worker count. Measured 0.376 ms -> 0.108 ms
-/// on int4 block-32 K=N=2048 M=1 (ORT's CPU EP: 0.097 ms).
+/// a `MatMulNBits` weight pre-split into one MLAS shard per persistent decode
+/// worker, which caps an unscoped decode GEMV at that worker count. Measured
+/// 0.376 ms -> 0.092 ms on int4 block-32 K=N=2048 M=1 (ORT's CPU EP: 0.097 ms).
+///
+/// This covers the library plumbing only. The falsifier for the *call site* in
+/// `CreateEpFactories` is `the_plugin_ep_disables_the_decode_pool_in_ort` in
+/// `plugin_ort_e2e.rs`, which reads the answer back across the cdylib boundary
+/// after ONNX Runtime has loaded and used the library.
 #[test]
 fn the_plugin_ep_does_not_build_the_persistent_decode_pool() {
     assert!(

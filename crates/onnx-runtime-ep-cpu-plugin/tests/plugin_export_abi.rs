@@ -612,6 +612,7 @@ fn l1_no_symbol_leakage() {
                 && *name != "nxrt_ep_constant_weight_inputs"
                 && *name != "nxrt_ep_reset_constant_weight_inputs"
                 && *name != "nxrt_ep_build_features"
+                && *name != "nxrt_ep_persistent_decode_pool_built"
                 && !name.starts_with("_Z")
                 && !name.starts_with("__rust")
                 && !name.starts_with("__rdl_")

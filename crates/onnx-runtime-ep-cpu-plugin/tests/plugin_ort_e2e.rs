@@ -5143,6 +5143,71 @@ opset_import: [{{ version: 17 }}, {{ domain: "com.microsoft" version: 1 }}]
 /// report nothing. A wiring that marks everything constant passes the first
 /// two assertions and fails the third — and would be a real bug, not merely a
 /// slower one, because a prepack of an activation must never outlive the call.
+/// ONNX Runtime's own copy of this library must not build the persistent SPMD
+/// decode pool.
+///
+/// `CreateEpFactories` opts the process out because nothing in the plugin path
+/// ever enters an SPMD decode scope, and a pool that is built but never
+/// dispatched to is pure cost: resident workers competing with ORT's intra-op
+/// pool, plus a `MatMulNBits` weight pre-split into one MLAS shard per decode
+/// worker, which caps an unscoped decode GEMV at that worker count. Measured
+/// 0.376 ms -> 0.092 ms on int4 block-32 K=N=2048 M=1, against ORT's CPU EP at
+/// 0.097 ms.
+///
+/// The sibling unit test in `decode_pool_optout.rs` can only prove the library
+/// plumbing: a test binary links its *own* copy of `onnx-runtime-ep-cpu`, whose
+/// pool statics are not the ones the `dlopen`ed cdylib uses. This test reads
+/// the answer back out of the library ORT actually loaded, after ORT has run a
+/// decode through it, so it fails if the `CreateEpFactories` call site is ever
+/// dropped.
+#[test]
+fn the_plugin_ep_disables_the_decode_pool_in_ort() {
+    let _lock = lock_ort_ep();
+    let ep_path = match find_ep_cdylib() {
+        Some(p) => p,
+        None => {
+            if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+                panic!("NXRT_REQUIRE_ORT_TESTS=1 but the EP cdylib is missing");
+            }
+            eprintln!("*** SKIPPED: EP cdylib not found ***");
+            return;
+        }
+    };
+    if std::env::var("ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL").is_ok() {
+        eprintln!("*** SKIPPED: the environment asks for a specific pool mode ***");
+        return;
+    }
+    // Same absolute path ORT registers, so this is the same mapping and the
+    // same statics -- not a second copy of the library.
+    let ep_lib = unsafe { libloading::Library::new(&ep_path) }.expect("dlopen EP cdylib");
+    let pool_built: libloading::Symbol<'_, unsafe extern "C" fn() -> i32> =
+        unsafe { ep_lib.get(b"nxrt_ep_persistent_decode_pool_built") }
+            .expect("nxrt_ep_persistent_decode_pool_built not exported");
+
+    let case = matmul_family_cases()
+        .into_iter()
+        .find(|c| c.name == "nbits4_decode")
+        .expect("case present");
+    let path = write_generated_model(case.name, &case.model);
+    let reg = "cpu_ep_decode_pool_optout";
+    let Some((_lib, api, env, opts, session)) = (unsafe { conformance_setup(reg, &path, true) })
+    else {
+        eprintln!("*** SKIPPED: ORT not found ***");
+        return;
+    };
+    unsafe {
+        run_generated_case(api, session, &case, "decode-pool-optout");
+        conformance_teardown(api, env, opts, session, reg);
+    }
+
+    assert_eq!(
+        unsafe { pool_built() },
+        0,
+        "ONNX Runtime's copy of the plugin built the persistent SPMD decode \
+         pool it never dispatches to; CreateEpFactories must opt the process out"
+    );
+}
+
 #[test]
 fn constant_weights_are_reported_to_kernels_as_constant() {
     let _lock = lock_ort_ep();

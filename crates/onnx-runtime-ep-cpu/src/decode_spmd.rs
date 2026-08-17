@@ -1258,18 +1258,20 @@ static PERSISTENT_POOL_DEFAULT: AtomicBool = AtomicBool::new(true);
 /// per projection, no fork/join. A host that never enters such a scope -- the
 /// plugin EP, where ONNX Runtime owns the graph and the threads -- gets only
 /// the costs: resident workers competing with ORT's own intra-op pool, and an
-/// MLAS weight partitioned into one shard per decode worker, which caps a
-/// decode GEMV at the pool's worker count ([`MAX_TOPOLOGY_DECODE_THREADS`], 8)
-/// however many threads the host has.
+/// MLAS weight partitioned into one shard per persistent decode worker
+/// (`available_parallelism() / 2` by default), which caps an unscoped decode
+/// GEMV at that worker count however many threads the host has.
 ///
 /// Measured on the plugin path (32 vCPU AMD EPYC 9V74, MLAS build, int4
 /// block-32, K=N=2048, M=1, p50 of 41 runs, each backend alone in its process):
-/// 0.376 ms with the pool built against 0.108 ms without it, with ONNX
+/// 0.376 ms with the pool built against 0.092 ms without it, with ONNX
 /// Runtime's own CPU EP at 0.097 ms.
 ///
 /// An explicit `PERSISTENT_POOL_ENV` setting always wins. Must be called before
 /// the first [`pools()`] query; afterwards the built layout is fixed for the
-/// process.
+/// process. `Relaxed` is sufficient because the only supported caller writes
+/// this during library initialization, before the host has created a session or
+/// spawned the threads that read it -- that handoff is the synchronisation.
 pub fn set_persistent_decode_pool_default(enabled: bool) {
     PERSISTENT_POOL_DEFAULT.store(enabled, Ordering::Relaxed);
 }
