@@ -36,7 +36,7 @@ pub struct OutboundGraphReader {
     /// prepack of one of those would return the default value's answer forever.
     /// Membership here therefore also requires
     /// `ValueInfo_IsConstantInitializer`.
-    initializer_names: HashSet<String>,
+    constant_initializer_names: HashSet<String>,
     /// Out-of-band set of ValueIds that represent absent optional output slots.
     /// This replaces the previous in-band string sentinel (`__absent_output_*`)
     /// which was forgeable from model content. ValueIds are graph-internal
@@ -169,8 +169,8 @@ impl OutboundGraphReader {
         // Read initializers and copy small int64 tensors into owned data.
         let initializer_int64 =
             unsafe { Self::read_initializers_int64(api, graph_ptr).unwrap_or_default() };
-        let initializer_names =
-            unsafe { Self::read_initializer_names(api, graph_ptr).unwrap_or_default() };
+        let constant_initializer_names =
+            unsafe { Self::read_constant_initializer_names(api, graph_ptr).unwrap_or_default() };
 
         let mut absent_outputs: HashSet<ValueId> = HashSet::new();
 
@@ -278,7 +278,7 @@ impl OutboundGraphReader {
             ort_index_to_node_id,
             ort_node_ptrs: ort_nodes,
             initializer_int64,
-            initializer_names,
+            constant_initializer_names,
             absent_outputs,
         })
     }
@@ -295,10 +295,15 @@ impl OutboundGraphReader {
         &self.absent_outputs
     }
 
-    /// Names of the graph's initializers, i.e. the values ORT keeps constant
-    /// for the whole session.
-    pub fn initializer_names(&self) -> &HashSet<String> {
-        &self.initializer_names
+    /// Names of the graph's **constant** initializers, i.e. the values ORT
+    /// keeps fixed for the whole session.
+    ///
+    /// Deliberately not "every initializer": an IR>=4 initializer that also
+    /// appears as a graph input is only a default the caller may replace on
+    /// any `Run`, and is excluded. Anything keyed on this set may assume the
+    /// buffer never changes.
+    pub fn constant_initializer_names(&self) -> &HashSet<String> {
+        &self.constant_initializer_names
     }
 
     /// Access the owned int64 initializer data (copied from ORT during construction).
@@ -786,7 +791,7 @@ impl OutboundGraphReader {
     /// cannot answer whether an initializer is constant, it is treated as
     /// non-constant: the cost of a false negative is a repeated prepack, the
     /// cost of a false positive is a wrong answer.
-    unsafe fn read_initializer_names(
+    unsafe fn read_constant_initializer_names(
         api: *const ort::OrtApi,
         graph: *const ort::OrtGraph,
     ) -> Result<HashSet<String>, String> {

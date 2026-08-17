@@ -796,7 +796,7 @@ fn ep_compile_inner(
                     // and `QLinearMatMul` re-packs B, turning a load-time cost
                     // into a per-token cost.
                     let constant_inputs =
-                        constant_input_flags(&view, node_idx, reader.initializer_names());
+                        constant_input_flags(&view, node_idx, reader.constant_initializer_names());
                     CONSTANT_WEIGHT_INPUTS.fetch_add(
                         constant_inputs.iter().filter(|c| **c).count(),
                         Ordering::Relaxed,
@@ -958,7 +958,7 @@ fn ep_compile_inner(
 /// owns the buffer, materializes it once at session creation and cannot change
 /// it between `Run` calls. An IR>=4 initializer that also appears as a graph
 /// input is only a default value the caller may override per `Run`, and is
-/// deliberately not in that set (see `read_initializer_names`). That is the
+/// deliberately not in that set (see `read_constant_initializer_names`). That is the
 /// contract
 /// [`onnx_runtime_ep_api::kernel::Kernel::set_constant_inputs`] expresses, and
 /// several kernels use it to decide whether a prepack may be built once and
