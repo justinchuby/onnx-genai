@@ -863,6 +863,53 @@ impl NativeDecodeSession {
         past_len: usize,
         step_inputs: &[(String, Tensor)],
     ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+        // A generation runs *two* forward shapes against the same session with
+        // distinct governed-workspace lifetimes: the multi-token prefill/verify
+        // shape here, and the steady-state single-token decode step. The
+        // prepare-only planner reserves one workspace slot per *lifetime class*
+        // from the shapes it is handed, and default-domain `Attention` classifies
+        // its composite workspace by route — multi-row query (`q_seq > 1`) is the
+        // per-call StepScoped route, single-row query (`batch == 1, q_seq == 1`)
+        // is the capture-eligible SessionPersistent route. Preparing only the
+        // multi-row prefill shape therefore reserves the StepScoped slot and
+        // leaves the SessionPersistent slot empty, so the first single-token
+        // decode reaches the `Attention` node with an unprepared
+        // SessionPersistent workspace and fails (#1179). GQA/MoE sidestep this by
+        // charging SessionPersistent for both routes, but MHA does not.
+        //
+        // Reserve the decode route's SessionPersistent slot up front by driving
+        // one additional single-query-row pass. Workspace planning now binds the
+        // growing KV cache at its physical capacity (see
+        // `prepare_external_bindings_mode`), so this single-token pass reserves a
+        // SessionPersistent workspace sized for the full-capacity attended
+        // length — a valid upper bound for every single-token decode step until
+        // the KV cache rebuckets. `reserve_prepared_workspace` only ever grows a
+        // slot, so a model that already reserved a larger SessionPersistent slot
+        // for the prefill shape (GQA/MoE) sees this as a no-op; MHA needs the
+        // top-up. The subsequent prefill forward re-establishes the KV/mask
+        // device state before it executes, so the decode pass's residual
+        // single-token mask is not observed.
+        let prefill = self.run_cuda_workspace_prepare_pass(token_ids, past_len, step_inputs)?;
+        if token_ids.len() > 1 {
+            let last_token = &token_ids[token_ids.len() - 1..];
+            self.run_cuda_workspace_prepare_pass(last_token, 0, &[])
+                .context("prepare native CUDA single-token decode workspace")?;
+        }
+        Ok(prefill)
+    }
+
+    /// Resolve concrete metadata for one forward shape (`token_ids` at
+    /// `past_len`, plus any routed `step_inputs`) and reserve the governed
+    /// kernel workspace slots for it without executing any graph node. Shared by
+    /// the multi-token prefill/verify reservation and the single-token decode
+    /// top-up so both bind symbols and size workspaces through the identical
+    /// path.
+    fn run_cuda_workspace_prepare_pass(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        step_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
         if self.has_eager_step_inputs() {
             let workspace_nodes = self.session.workspace_node_locations();
             if workspace_nodes.is_empty() {
