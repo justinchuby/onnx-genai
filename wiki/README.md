@@ -29,7 +29,17 @@ the specifications, measured evidence, or accepted designs in `docs/`.
 - **Architecture:** [[architecture/Crate Architecture]]
 - **Runtime flow:** [[architecture/Inference Request Lifecycle]]
 - **Execution:** [[execution/Execution Backends]]
+- **EP contract:** [[execution/Execution Provider Contract]]
+- **CPU EP:** [[execution/CPU Execution Provider]]
+- **CUDA EP:** [[execution/CUDA Execution Provider]]
+- **Plugin EPs:** [[execution/Plugin Execution Providers]]
 - **Memory:** [[memory/Memory Management for Beginners]]
+- **Tracing:** [[observability/Tracing and Profiling]]
+- **Performance engineering:** [[performance/Performance Engineering Playbook]]
+- **API design:** [[api/API Design Principles]]
+- **Contracts:** [[contracts/Runtime Contracts]]
+- **Metadata:** [[metadata/Metadata Driven Runtime]]
+- **Model packages:** [[metadata/Model Packages and Variants]]
 - **Documentation:** [[start/Documentation Guide]]
 - **Wiki maintenance:** [[meta/Using this Wiki]]
 
@@ -41,10 +51,14 @@ Every note should:
 2. Include YAML frontmatter with `title`, `aliases`, `tags`, `status`,
    `created`, and `updated`.
 3. Begin with a short statement of the question the note answers.
-4. Use `[[wikilinks]]` instead of duplicating explanations across notes.
-5. Use Obsidian callouts for invariants, warnings, examples, and context.
-6. End with links to formal sources under `docs/` or relevant code.
-7. Clearly label proposed behavior; never present a target design as implemented.
+4. Answer one primary question and usually remain readable in roughly 5–10 minutes.
+5. Keep a longer tutorial when shortening it would force a beginner to chase
+   prerequisite explanations across other files.
+6. Use `[[wikilinks]]` instead of duplicating explanations across notes.
+7. Use Obsidian callouts for invariants, warnings, examples, and context.
+8. Make the note self-contained for its intended reader. Links to `docs/` and code
+   are evidence and implementation detail, not required homework.
+9. Clearly label proposed behavior; never present a target design as implemented.
 
 Notes may be written in the language that best serves their audience. English
 titles and paths are required even when the body is written in another language.
