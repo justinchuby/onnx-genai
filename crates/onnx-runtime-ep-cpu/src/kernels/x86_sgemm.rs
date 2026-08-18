@@ -577,9 +577,7 @@ mod tests {
     }
 
     /// #1091: the native M=1 GEMV must match the naive reference within f32
-    /// tolerance across tile-exact, tail, and multi-cache-line N shapes. Calls
-    /// the kernel directly (no env mutation) so it does not depend on the
-    /// process-global `ONNX_GENAI_CPU_MM_SIMD_M1_GEMV` toggle.
+    /// tolerance across tile-exact, tail, and multi-cache-line N shapes.
     fn check_m1(k: usize, n: usize) {
         if !has_simd_x86() {
             return;
@@ -690,31 +688,11 @@ mod tests {
         );
     }
 
-    /// The route is fixed at compile time, so two calls in the same process
-    /// cannot disagree -- and no environment variable can move it. A previous
-    /// version of this dispatch read `ONNX_GENAI_CPU_MM_SIMD_M1_GEMV` on every
-    /// call, which made the shipped path depend on process state (and cost a
-    /// locked env lookup per GEMM).
-    #[test]
-    fn no_environment_variable_can_change_the_m1_route() {
-        if !has_simd_x86() {
-            return;
-        }
-        let (k, n) = (128usize, 96usize);
-        let a = fill(k, 7);
-        let b = fill(k * n, 13);
-        let mut first = vec![0.0f32; n];
-        sgemm_simd(&a, &b, &mut first, 1, k, n);
-        // SAFETY: single-threaded test; nothing else reads the environment
-        // concurrently, and the variable is removed again before returning.
-        unsafe { std::env::set_var("ONNX_GENAI_CPU_MM_SIMD_M1_GEMV", "0") };
-        let mut second = vec![0.0f32; n];
-        sgemm_simd(&a, &b, &mut second, 1, k, n);
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("ONNX_GENAI_CPU_MM_SIMD_M1_GEMV") };
-        assert_eq!(
-            first, second,
-            "the M=1 route must not be readable from the environment"
-        );
-    }
+    // The route is a compile-time constant, so no environment variable can
+    // reach it. There is deliberately no test that sets
+    // `ONNX_GENAI_CPU_MM_SIMD_M1_GEMV` to prove that: `set_var` racing another
+    // thread's `getenv` is a data race, and this test binary runs its cases in
+    // parallel next to dozens of live `env::var` readers. The bit-exact
+    // comparison in `the_default_entry_point_routes_m1_to_the_gemv` pins the
+    // route without touching process state.
 }
