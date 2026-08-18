@@ -33,7 +33,7 @@ use super::sdpa::{
     sdpa_decode_row,
 };
 use super::{check_arity, to_dense_i64};
-use crate::dtype::{to_dense_f32_widen, widen_bf16_slice_into, write_dense_f32_narrow};
+use crate::dtype::{to_dense_f32_widen, widen_bf16_slice_quieting_into, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
@@ -871,7 +871,9 @@ enum PastSrc<'a> {
     F32(&'a [f32]),
     /// Contiguous `f16` cache (raw `u16` bits): the run is F16C/scalar widened.
     F16(&'a [u16]),
-    /// Non-contiguous or non-`f16`/`f32` cache widened once up front.
+    /// Contiguous `bf16` cache (raw `u16` bits): the run is shift-widened.
+    Bf16(&'a [u16]),
+    /// Non-contiguous, or a dtype with no borrowing arm, widened once up front.
     Dense(Vec<f32>),
 }
 
@@ -895,7 +897,11 @@ impl HalfKv {
     fn widen_into(self, src: &[u16], dst: &mut [f32]) {
         match self {
             HalfKv::F16 => crate::dtype::widen_f16_slice_into(src, dst),
-            HalfKv::Bf16 => crate::dtype::widen_bf16_slice_into(src, dst),
+            // Quieting, not the raw shift: the copy path widens the same cache
+            // through `to_dense_f32_widen` (i.e. `half::bf16::to_f32`), and the
+            // in-place path has to produce identical bits or the two disagree
+            // on signalling NaN.
+            HalfKv::Bf16 => crate::dtype::widen_bf16_slice_quieting_into(src, dst),
         }
     }
 
@@ -927,6 +933,10 @@ impl<'a> PastCache<'a> {
             // SAFETY: a validated contiguous Float16 view addresses exactly `len`
             // 2-byte elements; `half::f16` is `repr(transparent)` over `u16`.
             PastSrc::F16(unsafe { std::slice::from_raw_parts(view.data_ptr::<u16>(), len) })
+        } else if view.dtype == onnx_runtime_ir::DataType::BFloat16 && view.is_contiguous() {
+            // SAFETY: as the Float16 arm above -- a validated contiguous
+            // BFloat16 view addresses exactly `len` 2-byte elements.
+            PastSrc::Bf16(unsafe { std::slice::from_raw_parts(view.data_ptr::<u16>(), len) })
         } else {
             PastSrc::Dense(to_dense_f32_widen("GroupQueryAttention", view)?.into_owned())
         };
@@ -946,6 +956,9 @@ impl<'a> PastCache<'a> {
         match &self.src {
             PastSrc::F32(s) => dst.copy_from_slice(&s[start..start + len]),
             PastSrc::F16(s) => crate::dtype::widen_f16_slice_into(&s[start..start + len], dst),
+            PastSrc::Bf16(s) => {
+                crate::dtype::widen_bf16_slice_quieting_into(&s[start..start + len], dst)
+            }
             PastSrc::Dense(s) => dst.copy_from_slice(&s[start..start + len]),
         }
     }
@@ -1039,7 +1052,8 @@ fn widen_rotary_prefix(op: &str, view: &TensorView, rows: usize, half: usize) ->
         // 2-byte elements; BF16 widening is the exact high-half f32 bit shift.
         let src = unsafe { std::slice::from_raw_parts(view.data_ptr::<u16>(), count) };
         let mut dst = vec![0.0f32; count];
-        widen_bf16_slice_into(src, &mut dst);
+        // Quieting, to match the `to_dense_f32_widen` fallback below on sNaN.
+        widen_bf16_slice_quieting_into(src, &mut dst);
         return Ok(dst);
     }
     if view.dtype == onnx_runtime_ir::DataType::Float32 && view.is_contiguous() {
@@ -4961,6 +4975,143 @@ mod tests {
             copy_pv,
             "{kind:?} appended present_value prefix must match the copy path"
         );
+    }
+
+    /// Build a `TensorView` over `bits` for the `PastCache::from_cache`
+    /// classification tests below. `shape`/`strides` are borrowed by the view,
+    /// so the caller owns them.
+    fn half_cache_view<'a>(
+        bits: &'a [u16],
+        dtype: onnx_runtime_ir::DataType,
+        shape: &'a [usize],
+        strides: &'a [i64],
+    ) -> TensorView<'a> {
+        TensorView::new(
+            DevicePtr(bits.as_ptr() as *const std::ffi::c_void),
+            dtype,
+            shape,
+            strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        )
+    }
+
+    /// Row-major strides for a 4D cache shape.
+    fn cache_strides(shape: &[usize]) -> [i64; 4] {
+        [
+            (shape[1] * shape[2] * shape[3]) as i64,
+            (shape[2] * shape[3]) as i64,
+            shape[3] as i64,
+            1,
+        ]
+    }
+
+    /// A `bf16` cache must **borrow** its bits, exactly as `f16` does.
+    ///
+    /// Before this arm existed `bf16` fell through to `PastSrc::Dense`, which
+    /// calls `to_dense_f32_widen` over the *whole physical capacity* and keeps
+    /// the result in a fresh `Vec<f32>` — an O(capacity) allocation plus widen
+    /// on every decode step, immediately dropped by the append path that only
+    /// needed the new token's rows. `f16` never paid it. This asserts the two
+    /// half formats are now classified the same way, which is the entire point.
+    #[test]
+    fn a_contiguous_bf16_cache_borrows_its_bits_like_f16_does() {
+        use onnx_runtime_ir::DataType;
+        let (heads, seq, dim) = (2usize, 8usize, 4usize);
+        let bits = vec![0x3F80u16; heads * seq * dim];
+        let shape = [1, heads, seq, dim];
+        let strides = cache_strides(&shape);
+        for (dtype, label) in [(DataType::Float16, "f16"), (DataType::BFloat16, "bf16")] {
+            let view = half_cache_view(&bits, dtype, &shape, &strides);
+            let cache = PastCache::from_cache(&view, heads, "past_key").expect("classify cache");
+            assert!(
+                !matches!(cache.src, PastSrc::Dense(_)),
+                "{label}: a contiguous half cache must borrow, not widen the whole \
+                 capacity into an owned Vec every step"
+            );
+        }
+    }
+
+    /// A non-contiguous `bf16` cache still has to take the owned path — the
+    /// borrowing arm is guarded on contiguity, and dropping that guard would
+    /// read the wrong elements.
+    #[test]
+    fn a_strided_bf16_cache_still_takes_the_owned_dense_path() {
+        use onnx_runtime_ir::DataType;
+        let (heads, seq, dim) = (2usize, 4usize, 2usize);
+        let bits = vec![0x3F80u16; heads * seq * dim * 2];
+        let shape = [1, heads, seq, dim];
+        // Stride the innermost axis by 2 elements: a valid view over every other
+        // element, which is not contiguous.
+        let strides = [
+            (heads * seq * dim * 2) as i64,
+            (seq * dim * 2) as i64,
+            (dim * 2) as i64,
+            2,
+        ];
+        let view = half_cache_view(&bits, DataType::BFloat16, &shape, &strides);
+        let cache = PastCache::from_cache(&view, heads, "past_key").expect("classify cache");
+        assert!(
+            matches!(cache.src, PastSrc::Dense(_)),
+            "a strided bf16 cache must not be borrowed as if it were contiguous"
+        );
+    }
+
+    /// The borrowing arm must be bit-identical to the owned path it replaces.
+    /// The old path widened through `to_dense_f32_widen`, which reaches
+    /// `half::bf16::to_f32` and therefore *quiets* signalling NaN; the raw
+    /// shift in `widen_bf16_slice_into` does not. Those two spellings differ on
+    /// 126 of the 65536 patterns, so `widen_run` has to use the quieting
+    /// widen or this silently alters every bf16 decode.
+    ///
+    /// Swept exhaustively rather than over a hand-picked sample: an earlier
+    /// version of this test listed one NaN and happened to pick a *quiet* one,
+    /// so it passed against a non-quieting widen. Every pattern, no judgement.
+    #[test]
+    fn the_bf16_borrowing_arm_widens_bit_identically_to_the_owned_path() {
+        use onnx_runtime_ir::DataType;
+        let (heads, seq, dim) = (2usize, 4usize, 4usize);
+        // 65536 patterns laid out as whole [heads, seq, dim] blocks.
+        let block = heads * seq * dim;
+        let bits: Vec<u16> = (0..=u16::MAX).collect();
+        assert_eq!(bits.len() % block, 0, "sweep must tile the cache geometry");
+        let blocks = bits.len() / block;
+        let shape = [blocks, heads, seq, dim];
+        let strides = cache_strides(&shape);
+        let view = half_cache_view(&bits, DataType::BFloat16, &shape, &strides);
+        let cache = PastCache::from_cache(&view, heads, "past_key").expect("classify cache");
+        assert!(
+            matches!(cache.src, PastSrc::Bf16(_)),
+            "the sweep is only meaningful against the borrowing arm"
+        );
+        let owned = to_dense_f32_widen("GroupQueryAttention", &view).expect("owned widen");
+
+        // Walk several offsets and lengths so the run arithmetic is covered
+        // too, not just a single whole-buffer widen. The odd start/len pairs
+        // straddle the AVX2 8-lane body so the scalar tail is exercised.
+        let n = bits.len();
+        for (start, len) in [
+            (0usize, n),
+            (0, 1),
+            (3, 5),
+            (dim, dim * 2),
+            (7, n - 7),
+            (n - 3, 3),
+        ] {
+            let mut got = vec![0f32; len];
+            cache.widen_run(start, &mut got);
+            for (offset, value) in got.iter().enumerate() {
+                let expected = owned[start + offset];
+                assert_eq!(
+                    value.to_bits(),
+                    expected.to_bits(),
+                    "start={start} len={len} offset={offset}: borrowing arm widened \
+                     0x{:04X} to 0x{:08X} but the owned path gives 0x{:08X}",
+                    bits[start + offset],
+                    value.to_bits(),
+                    expected.to_bits()
+                );
+            }
+        }
     }
 
     #[test]
