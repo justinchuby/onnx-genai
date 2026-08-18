@@ -3437,3 +3437,121 @@ fn an_undeclared_input_of_the_same_shape_is_not_charged() {
         "the recurrent_state input is present in the graph but was not declared"
     );
 }
+
+/// Fill each `(batch, head)` block of a `[1, H, capacity, Dh]` cache with a
+/// value that identifies the block and row it came from, so a relocation that
+/// uses the wrong stride produces recognisably wrong numbers rather than
+/// plausible ones.
+fn kv_probe_value(block: usize, row: usize, lane: usize) -> f32 {
+    (block * 1_000_000 + row * 1_000 + lane) as f32
+}
+
+/// Growing the CPU KV cache must relocate every head, not just memcpy.
+///
+/// Capacity is axis 2 of `[B, H, capacity, Dh]`, so head `i` starts at
+/// `i * capacity * Dh`. Enlarging the capacity moves every head but the first;
+/// a flat copy would leave heads 1.. reading the previous head's tail. This
+/// test writes a distinct value per (head, row, lane), grows, and checks every
+/// live element lands at its new address.
+#[test]
+fn growing_the_cpu_kv_cache_relocates_every_head() {
+    let session = tiny_decoder(false);
+    let (heads, head_dim) = (3usize, 4usize);
+    let (capacity, live) = (8usize, 5usize);
+    let pairs = vec![(
+        "present.0.key".to_string(),
+        "past_key_values.0.key".to_string(),
+    )];
+    let mut binding = session
+        .allocate_device_binding(
+            pairs[0].1.clone(),
+            Some(pairs[0].0.clone()),
+            DataType::Float32,
+            vec![1, heads, capacity, head_dim],
+            vec![1, heads, live, head_dim],
+        )
+        .expect("allocate KV binding");
+
+    let mut seeded = vec![0f32; heads * capacity * head_dim];
+    for block in 0..heads {
+        for row in 0..live {
+            for lane in 0..head_dim {
+                seeded[block * capacity * head_dim + row * head_dim + lane] =
+                    kv_probe_value(block, row, lane);
+            }
+        }
+    }
+    let seeded_bytes: Vec<u8> = seeded.iter().flat_map(|v| v.to_le_bytes()).collect();
+    binding.write_bytes(0, &seeded_bytes).expect("seed cache");
+
+    let mut state = DecodeCpuKvState::from_parts_for_test(vec![binding], pairs, capacity, live);
+    state
+        .grow_to(&session, capacity + 1, live)
+        .expect("grow the cache");
+
+    // Doubling, so one grow covers well past the requested length.
+    assert_eq!(
+        state.max_len,
+        capacity * 2,
+        "growth must amortise, not creep"
+    );
+    let grown_capacity = state.max_len;
+    let grown = state.binding_for_test(0);
+    assert_eq!(
+        grown.physical_shape(),
+        [1, heads, grown_capacity, head_dim],
+        "physical shape must report the new capacity"
+    );
+    assert_eq!(
+        grown.logical_shape(),
+        [1, heads, live, head_dim],
+        "the live prefix length must survive the grow"
+    );
+
+    let raw = grown.read_bytes().expect("read grown cache");
+    let values: Vec<f32> = raw
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(values.len(), heads * grown_capacity * head_dim);
+    for block in 0..heads {
+        for row in 0..live {
+            for lane in 0..head_dim {
+                let got = values[block * grown_capacity * head_dim + row * head_dim + lane];
+                assert_eq!(
+                    got,
+                    kv_probe_value(block, row, lane),
+                    "head {block} row {row} lane {lane} did not survive the grow"
+                );
+            }
+        }
+    }
+}
+
+/// A grow that is already covered must not reallocate or disturb the cache.
+#[test]
+fn growing_within_the_existing_capacity_is_a_no_op() {
+    let session = tiny_decoder(false);
+    let pairs = vec![(
+        "present.0.key".to_string(),
+        "past_key_values.0.key".to_string(),
+    )];
+    let binding = session
+        .allocate_device_binding(
+            pairs[0].1.clone(),
+            Some(pairs[0].0.clone()),
+            DataType::Float32,
+            vec![1, 2, 16, 4],
+            vec![1, 2, 3, 4],
+        )
+        .expect("allocate KV binding");
+    let mut state = DecodeCpuKvState::from_parts_for_test(vec![binding], pairs, 16, 3);
+    let before = state.binding_for_test(0).device_ptr();
+    state.grow_to(&session, 16, 3).expect("no-op grow");
+    assert_eq!(state.max_len, 16);
+    assert_eq!(
+        state.binding_for_test(0).device_ptr(),
+        before,
+        "a grow within capacity must not reallocate"
+    );
+}
