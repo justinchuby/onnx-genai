@@ -1165,6 +1165,22 @@ pub(crate) fn mish_f32_slice(input: &[f32], output: &mut [f32]) {
     dispatch!(input, output, mish_scalar, mish_avx2);
 }
 
+/// `y = Elu(x, alpha)`.
+pub(crate) fn elu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32) {
+    debug_assert_eq!(input.len(), output.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if input.len() >= SIMD_MIN_LEN && vector_path_available() {
+            // SAFETY: guarded by the runtime AVX2+FMA detection above.
+            run_chunked(input, output, |i, o| unsafe { elu_avx2(i, o, alpha) });
+            return;
+        }
+    }
+    for (y, x) in output.iter_mut().zip(input) {
+        *y = elu_scalar(*x, alpha);
+    }
+}
+
 /// `y = max(0,x) + min(0, alpha·(exp(x/alpha) − 1))`, `Celu`.
 ///
 /// `alpha` must be non-zero; ONNX requires it and the reciprocal below would
@@ -1421,6 +1437,19 @@ pub(crate) fn celu_scalar(x: f32, alpha: f32) -> f32 {
         return x;
     }
     x.max(0.0) + (alpha * ((x / alpha).exp() - 1.0)).min(0.0)
+}
+
+/// `Elu(x) = x` for `x >= 0`, `alpha * (e^x - 1)` below it.
+///
+/// `exp(x) - 1` rather than `exp_m1(x)`, deliberately. `exp_m1` is the more
+/// accurate spelling near zero and is what `Activation::apply` used, but ORT
+/// evaluates `(x.exp() - 1)` and there is no AVX2 `expm1` to match it with, so
+/// a vector path would have to disagree with whichever one this returned. The
+/// two differ by at most a half-ulp of `1.0` (~6e-8) in absolute terms,
+/// comfortably inside this module's `4e-7` bound, and picking ORT's spelling
+/// makes the scalar path, the vector path and the oracle the same function.
+pub(crate) fn elu_scalar(x: f32, alpha: f32) -> f32 {
+    if x >= 0.0 { x } else { alpha * (x.exp() - 1.0) }
 }
 
 /// `Softplus(x) = ln(1 + e^x)`, in the stable form
@@ -1968,6 +1997,26 @@ mod avx2 {
         _mm256_blendv_ps(r, x, _mm256_cmp_ps(x, x, _CMP_UNORD_Q))
     }
 
+    /// `Elu(x) = x` for `x >= 0`, `alpha * (e^x - 1)` below it.
+    ///
+    /// `alpha` arrives pre-splatted; it is a node attribute, so it is
+    /// broadcast once per call rather than once per block.
+    ///
+    /// The compare is `x < 0` and ordered, which settles all three awkward
+    /// inputs at once: NaN answers false and is passed through as itself,
+    /// `-0.0` answers false and stays `-0.0` (matching the scalar's `x >= 0`),
+    /// and `-Inf` answers true and lands on `alpha * (0 - 1) = -alpha`.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn elu_ps(x: __m256, alpha: __m256) -> __m256 {
+        // SAFETY: `#[target_feature(enable = "avx2,fma")]` on this function is
+        // the same guarantee `exp_full_ps` asks for.
+        let ex = unsafe { exp_full_ps(x) };
+        let neg = _mm256_mul_ps(alpha, _mm256_sub_ps(ex, _mm256_set1_ps(1.0)));
+        let below = _mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_LT_OQ);
+        _mm256_blendv_ps(x, neg, below)
+    }
+
     /// `Celu(x) = max(0, x) + min(0, alpha * (exp(x / alpha) - 1))`.
     ///
     /// Evaluated exactly as ONNX writes it. `alpha` is reciprocated once by the
@@ -2290,6 +2339,20 @@ unsafe fn log_avx2(input: &[f32], output: &mut [f32]) {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn mish_avx2(input: &[f32], output: &mut [f32]) {
     unsafe { avx2::map_ps(input, output, |v| avx2::mish_ps(v)) }
+}
+
+/// `Elu` over a whole slice.
+///
+/// # Safety
+/// The host must support AVX2 and FMA.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn elu_avx2(input: &[f32], output: &mut [f32], alpha: f32) {
+    // SAFETY: the caller guarantees AVX2+FMA.
+    unsafe {
+        let a = core::arch::x86_64::_mm256_set1_ps(alpha);
+        avx2::map_ps(input, output, |v| avx2::elu_ps(v, a));
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2763,6 +2826,106 @@ mod tests {
             assert!(e <= LOG_BOUND, "log({xi:e}) = {got}, want {}", xi.ln());
         }
         assert!(worst > 0.0, "sweep did not exercise anything");
+    }
+
+    #[test]
+    fn elu_special_values() {
+        let mut x = special_inputs();
+        x.extend_from_slice(&[1.0, -1.0, 0.25]);
+        let mut o = vec![0.0f32; x.len()];
+        elu_f32_slice(&x, &mut o, 1.0);
+        // exp(-Inf) - 1 = -1, so Elu saturates at -alpha rather than diverging.
+        assert_eq!(o[PAD], -1.0, "elu(-Inf)");
+        // `x < 0` is false at -0, so -0 is passed through with its sign intact.
+        // This is where Elu and Celu part company: Celu's formula ends in an
+        // addition that destroys the sign, Elu's is a select that keeps it.
+        assert_eq!(o[PAD + 1].to_bits(), 0x8000_0000, "elu(-0) stays -0");
+        assert_eq!(
+            elu_scalar(-0.0, 1.0).to_bits(),
+            0x8000_0000,
+            "scalar elu(-0)"
+        );
+        assert_eq!(o[PAD + 2].to_bits(), 0, "elu(+0)");
+        assert_eq!(o[PAD + 3], f32::INFINITY, "elu(+Inf)");
+        // NaN answers false to an ordered `<`, so it takes the identity lane.
+        assert!(o[PAD + 4].is_nan(), "elu(NaN)");
+        assert_eq!(o[PAD + 5], -1.0, "elu(-MAX) saturates to -alpha");
+        assert_eq!(o[PAD + 6], f32::MAX, "elu(MAX)");
+        assert_eq!(o[PAD + 7], -1.0, "elu(-1e30)");
+        assert_eq!(o[PAD + 8], 1e30, "elu(1e30)");
+        for (&xi, &got) in x[x.len() - 3..].iter().zip(&o[x.len() - 3..]) {
+            let want = elu_scalar(xi, 1.0);
+            assert!(
+                (f64::from(got) - f64::from(want)).abs() <= 4e-7,
+                "elu({xi}) = {got}, want {want}"
+            );
+        }
+    }
+
+    /// The scalar fallback must answer exactly what the vector path answers.
+    ///
+    /// Reachable from outside by any tensor shorter than `SIMD_MIN_LEN` and by
+    /// every non-AVX2 host, so a divergence here would make the result depend
+    /// on the tensor's length and on which machine ran it.
+    #[test]
+    fn elu_scalar_path_agrees_with_the_vector_path() {
+        let specials = [
+            f32::NAN,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            -0.0,
+            0.0,
+            -1.0,
+            1.0,
+            -90.0,
+            0.25,
+        ];
+        assert!(
+            specials.len() < SIMD_MIN_LEN,
+            "the short slice must be short enough to take the scalar path"
+        );
+        for alpha in [0.25f32, 1.0, 2.0, 7.5] {
+            let mut short_out = vec![0.0f32; specials.len()];
+            elu_f32_slice(&specials, &mut short_out, alpha);
+
+            let mut long = vec![0.0f32; PAD];
+            long.extend_from_slice(&specials);
+            let mut long_out = vec![0.0f32; long.len()];
+            elu_f32_slice(&long, &mut long_out, alpha);
+
+            for (i, &x) in specials.iter().enumerate() {
+                let scalar = short_out[i];
+                let vector = long_out[PAD + i];
+                assert_eq!(
+                    scalar.is_nan(),
+                    vector.is_nan(),
+                    "elu({x}, alpha={alpha}): scalar {scalar}, vector {vector}"
+                );
+                if !scalar.is_nan() {
+                    assert_eq!(
+                        scalar.to_bits(),
+                        vector.to_bits(),
+                        "elu({x}, alpha={alpha}): scalar {scalar}, vector {vector}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn elu_matches_scalar_across_alphas() {
+        let x = grid(-90.0, 90.0, 20_003, &[]);
+        let mut o = vec![0.0f32; x.len()];
+        for alpha in [0.25f32, 0.5, 1.0, 2.0, 7.5] {
+            elu_f32_slice(&x, &mut o, alpha);
+            for (&xi, &got) in x.iter().zip(&o) {
+                let want = elu_scalar(xi, alpha);
+                let e = (f64::from(got) - f64::from(want)).abs() / f64::from(want).abs().max(1.0);
+                // As in Celu, alpha multiplies exp's rounding error directly.
+                let bound = 4e-7 * f64::from(alpha).max(1.0);
+                assert!(e <= bound, "elu({xi}, alpha={alpha}) = {got}, want {want}");
+            }
+        }
     }
 
     #[test]
