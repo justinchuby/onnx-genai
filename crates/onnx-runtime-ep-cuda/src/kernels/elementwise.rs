@@ -1712,9 +1712,8 @@ mod claim_probes {
         kernel.execute(&inputs, &mut outputs).unwrap();
         runtime.synchronize().unwrap();
         let mut out = vec![0i32; a.len()];
-        let out_bytes = unsafe {
-            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes)
-        };
+        let out_bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes) };
         unsafe { runtime.dtoh(out_bytes, out_dev).unwrap() };
         unsafe {
             runtime.free_raw(a_dev).unwrap();

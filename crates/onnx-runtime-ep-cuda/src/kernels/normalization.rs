@@ -4767,8 +4767,8 @@ mod tests {
 #[cfg(test)]
 mod claim_probes {
     use std::ffi::c_void;
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     use half::{bf16, f16};
     use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
@@ -4802,7 +4802,10 @@ mod claim_probes {
             eprintln!("skipping typed SkipLayerNorm GPU probe: CUDA runtime unavailable");
             return;
         };
-        if runtime.require_nvrtc_half_headers("SkipLayerNormalization").is_err() {
+        if runtime
+            .require_nvrtc_half_headers("SkipLayerNormalization")
+            .is_err()
+        {
             eprintln!("skipping typed SkipLayerNorm GPU probe: fp16 headers unavailable");
             return;
         }
@@ -4899,9 +4902,8 @@ mod claim_probes {
         kernel.run(&inputs, &mut outputs).unwrap();
         runtime.synchronize().unwrap();
         let mut out = vec![to_h(0.0); n];
-        let out_bytes = unsafe {
-            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes)
-        };
+        let out_bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes) };
         unsafe { runtime.dtoh(out_bytes, out_dev).unwrap() };
         unsafe {
             runtime.free_raw(in_dev).unwrap();

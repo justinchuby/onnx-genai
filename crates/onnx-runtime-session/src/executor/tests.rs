@@ -3818,7 +3818,10 @@ fn compress_runs_with_image_sized_condition_including_empty_and_full() {
             "selected count must set the Compress output extent"
         );
         let expected: Vec<f32> = selected.iter().map(|&i| i as f32).collect();
-        assert_eq!(out, expected, "Compress must gather exactly the selected rows");
+        assert_eq!(
+            out, expected,
+            "Compress must gather exactly the selected rows"
+        );
     }
 }
 

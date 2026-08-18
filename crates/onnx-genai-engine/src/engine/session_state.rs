@@ -145,19 +145,13 @@ pub(crate) fn rewind_to<S: SessionStore + ?Sized>(
 }
 
 /// Reset a session, clearing its logical tokens and backend KV.
-pub(crate) fn reset<S: SessionStore + ?Sized>(
-    store: &mut S,
-    id: SessionId,
-) -> anyhow::Result<()> {
+pub(crate) fn reset<S: SessionStore + ?Sized>(store: &mut S, id: SessionId) -> anyhow::Result<()> {
     require_session(store, id)?;
     store.reset(id)
 }
 
 /// Close a session and free its backend state.
-pub(crate) fn close<S: SessionStore + ?Sized>(
-    store: &mut S,
-    id: SessionId,
-) -> anyhow::Result<()> {
+pub(crate) fn close<S: SessionStore + ?Sized>(store: &mut S, id: SessionId) -> anyhow::Result<()> {
     require_session(store, id)?;
     store.close(id)
 }

@@ -245,8 +245,6 @@ impl SessionStore for NativeSessions<'_> {
     }
 }
 
-
-
 fn generation_budget_cap(cap: ScheduledBudgetCap) -> GenerationBudgetCap {
     GenerationBudgetCap {
         requested_max_new_tokens: cap.requested_max_tokens,
