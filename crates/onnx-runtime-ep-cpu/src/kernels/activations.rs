@@ -43,21 +43,22 @@ impl Activation {
             // has no `expm1` to match `exp_m1` with, and with ORT, which spells
             // it the same way. See `elu_scalar`.
             Self::Elu { alpha } => crate::kernels::simd_activations::elu_scalar(x, alpha),
+            // All four delegate to the slice module's scalars rather than
+            // spelling the formula twice: that is the only way the scalar
+            // fallback and the AVX2 kernel are guaranteed to answer the same
+            // thing for NaN and for signed zero, which is where transcribing
+            // an ONNX formula literally goes wrong.
             Self::LeakyRelu { alpha } => {
-                if x >= 0.0 {
-                    x
-                } else {
-                    alpha * x
-                }
+                crate::kernels::simd_activations::leaky_relu_scalar(x, alpha)
             }
-            Self::HardSigmoid { alpha, beta } => (alpha * x + beta).clamp(0.0, 1.0),
-            Self::Selu { alpha, gamma } => gamma * if x > 0.0 { x } else { alpha * x.exp_m1() },
+            Self::HardSigmoid { alpha, beta } => {
+                crate::kernels::simd_activations::hard_sigmoid_scalar(x, alpha, beta)
+            }
+            Self::Selu { alpha, gamma } => {
+                crate::kernels::simd_activations::selu_scalar(x, alpha, gamma)
+            }
             Self::ThresholdedRelu { alpha } => {
-                if x > alpha {
-                    x
-                } else {
-                    0.0
-                }
+                crate::kernels::simd_activations::thresholded_relu_scalar(x, alpha)
             }
             // Swish/SiLU: x·sigmoid(alpha·x), evaluated via the numerically
             // stable logistic to avoid overflow at large-magnitude inputs.
@@ -101,12 +102,16 @@ impl Activation {
             Self::HardSigmoid { alpha, beta } => {
                 (f64::from(alpha) * x + f64::from(beta)).clamp(0.0, 1.0)
             }
+            // `exp() - 1`, not `exp_m1`, for the same reason as the f32 path:
+            // at `x = -0` the two disagree on the sign of the result, and ORT
+            // answers `+0`. Keeping the f64 path on `exp_m1` would make the
+            // sign depend on the tensor's dtype.
             Self::Selu { alpha, gamma } => {
                 f64::from(gamma)
                     * if x > 0.0 {
                         x
                     } else {
-                        f64::from(alpha) * x.exp_m1()
+                        f64::from(alpha) * (x.exp() - 1.0)
                     }
             }
             Self::ThresholdedRelu { alpha } => {
@@ -317,6 +322,28 @@ impl Kernel for ActivationKernel {
             Activation::Elu { alpha } => contiguous_f32(&inputs[0], &mut outputs[0], |i, o| {
                 crate::kernels::simd_activations::elu_f32_slice(i, o, alpha);
             }),
+            Activation::LeakyRelu { alpha } => {
+                contiguous_f32(&inputs[0], &mut outputs[0], |i, o| {
+                    crate::kernels::simd_activations::leaky_relu_f32_slice(i, o, alpha);
+                })
+            }
+            Activation::HardSigmoid { alpha, beta } => {
+                contiguous_f32(&inputs[0], &mut outputs[0], |i, o| {
+                    crate::kernels::simd_activations::hard_sigmoid_f32_slice(i, o, alpha, beta);
+                })
+            }
+            Activation::ThresholdedRelu { alpha } => {
+                contiguous_f32(&inputs[0], &mut outputs[0], |i, o| {
+                    crate::kernels::simd_activations::thresholded_relu_f32_slice(i, o, alpha);
+                })
+            }
+            Activation::Selu { alpha, gamma } => {
+                contiguous_f32(&inputs[0], &mut outputs[0], |i, o| {
+                    crate::kernels::simd_activations::selu_f32_slice(i, o, alpha, gamma);
+                })
+            }
+            // `Swish(alpha)` with alpha != 1 is the only activation left on the
+            // generic path; `SwishFactory` canonicalises alpha == 1 to SiLU.
             _ => false,
         };
         if ran {
@@ -559,6 +586,45 @@ mod tests {
     /// only implementation a `double` model sees. It has to agree with the
     /// other two about NaN -- `f64::max`/`min` drop it exactly as the f32 ones
     /// do, and ORT propagates it.
+    /// `Selu(-0) = +0` in both dtypes, because ORT answers `+0`.
+    ///
+    /// The f32 path is pinned against ORT itself in the plugin's parity test;
+    /// this is the f64 arm, which no ORT comparison reaches (the parity models
+    /// are f32) and which used `exp_m1` -- the spelling that returns `-0` --
+    /// until this was fixed. Without it the sign of the answer would depend on
+    /// the tensor's dtype, which is not something a model author can see.
+    #[test]
+    fn selu_zero_sign_does_not_depend_on_dtype() {
+        let act = Activation::Selu {
+            alpha: 1.673_263_2,
+            gamma: 1.050_701,
+        };
+        assert_eq!(act.apply(-0.0f32).to_bits(), 0, "f32 Selu(-0) is +0");
+        assert_eq!(act.apply(0.0f32).to_bits(), 0, "f32 Selu(+0) is +0");
+        assert_eq!(act.apply_f64(-0.0f64).to_bits(), 0, "f64 Selu(-0) is +0");
+        assert_eq!(act.apply_f64(0.0f64).to_bits(), 0, "f64 Selu(+0) is +0");
+        // `Elu` and `LeakyRelu` are selects on `x < 0`, so `-0` takes the
+        // identity branch and keeps its sign in both dtypes. Pinned here so the
+        // contrast with `Selu` is deliberate rather than accidental.
+        for act in [
+            Activation::Elu { alpha: 1.0 },
+            Activation::LeakyRelu { alpha: 0.125 },
+        ] {
+            assert_eq!(
+                act.apply(-0.0f32).to_bits(),
+                0x8000_0000,
+                "f32 {}(-0) stays -0",
+                act.name()
+            );
+            assert_eq!(
+                act.apply_f64(-0.0f64).to_bits(),
+                0x8000_0000_0000_0000,
+                "f64 {}(-0) stays -0",
+                act.name()
+            );
+        }
+    }
+
     #[test]
     fn celu_and_mish_propagate_nan_on_every_path() {
         for alpha in [0.5f32, 1.0, 3.0] {

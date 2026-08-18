@@ -1165,6 +1165,78 @@ pub(crate) fn mish_f32_slice(input: &[f32], output: &mut [f32]) {
     dispatch!(input, output, mish_scalar, mish_avx2);
 }
 
+/// `y = LeakyRelu(x, alpha)`.
+pub(crate) fn leaky_relu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32) {
+    debug_assert_eq!(input.len(), output.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if input.len() >= SIMD_MIN_LEN && vector_path_available() {
+            // SAFETY: guarded by the runtime AVX2+FMA detection above.
+            run_chunked(input, output, |i, o| unsafe {
+                leaky_relu_avx2(i, o, alpha)
+            });
+            return;
+        }
+    }
+    for (y, x) in output.iter_mut().zip(input) {
+        *y = leaky_relu_scalar(*x, alpha);
+    }
+}
+
+/// `y = HardSigmoid(x, alpha, beta)`.
+pub(crate) fn hard_sigmoid_f32_slice(input: &[f32], output: &mut [f32], alpha: f32, beta: f32) {
+    debug_assert_eq!(input.len(), output.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if input.len() >= SIMD_MIN_LEN && vector_path_available() {
+            // SAFETY: guarded by the runtime AVX2+FMA detection above.
+            run_chunked(input, output, |i, o| unsafe {
+                hard_sigmoid_avx2(i, o, alpha, beta)
+            });
+            return;
+        }
+    }
+    for (y, x) in output.iter_mut().zip(input) {
+        *y = hard_sigmoid_scalar(*x, alpha, beta);
+    }
+}
+
+/// `y = ThresholdedRelu(x, alpha)`.
+pub(crate) fn thresholded_relu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32) {
+    debug_assert_eq!(input.len(), output.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if input.len() >= SIMD_MIN_LEN && vector_path_available() {
+            // SAFETY: guarded by the runtime AVX2+FMA detection above.
+            run_chunked(input, output, |i, o| unsafe {
+                thresholded_relu_avx2(i, o, alpha)
+            });
+            return;
+        }
+    }
+    for (y, x) in output.iter_mut().zip(input) {
+        *y = thresholded_relu_scalar(*x, alpha);
+    }
+}
+
+/// `y = Selu(x, alpha, gamma)`.
+pub(crate) fn selu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32, gamma: f32) {
+    debug_assert_eq!(input.len(), output.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if input.len() >= SIMD_MIN_LEN && vector_path_available() {
+            // SAFETY: guarded by the runtime AVX2+FMA detection above.
+            run_chunked(input, output, |i, o| unsafe {
+                selu_avx2(i, o, alpha, gamma)
+            });
+            return;
+        }
+    }
+    for (y, x) in output.iter_mut().zip(input) {
+        *y = selu_scalar(*x, alpha, gamma);
+    }
+}
+
 /// `y = Elu(x, alpha)`.
 pub(crate) fn elu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32) {
     debug_assert_eq!(input.len(), output.len());
@@ -1450,6 +1522,51 @@ pub(crate) fn celu_scalar(x: f32, alpha: f32) -> f32 {
 /// makes the scalar path, the vector path and the oracle the same function.
 pub(crate) fn elu_scalar(x: f32, alpha: f32) -> f32 {
     if x >= 0.0 { x } else { alpha * (x.exp() - 1.0) }
+}
+
+/// `LeakyRelu(x) = x` for `x >= 0`, `alpha * x` below it.
+///
+/// NaN answers false to `>= 0` and comes back out of `alpha * NaN` as NaN, so
+/// the sign of a quiet NaN payload is the only thing the two branches can
+/// disagree about -- and the vector path passes NaN through untouched, which
+/// is why the agreement test compares NaN by `is_nan()` and everything else
+/// bit for bit.
+pub(crate) fn leaky_relu_scalar(x: f32, alpha: f32) -> f32 {
+    if x < 0.0 { alpha * x } else { x }
+}
+
+/// `HardSigmoid(x) = max(0, min(1, alpha * x + beta))`.
+///
+/// `clamp` rather than `min`/`max`: Rust's `f32::min`/`max` are IEEE
+/// `minNum`/`maxNum` and return the *other* operand when one is NaN, so the
+/// literal ONNX spelling would answer `0` for a NaN input. `f32::clamp`
+/// returns NaN for a NaN input (it only panics when the *bounds* are NaN),
+/// which is what the AVX2 path does and what this EP does everywhere else.
+pub(crate) fn hard_sigmoid_scalar(x: f32, alpha: f32, beta: f32) -> f32 {
+    (alpha * x + beta).clamp(0.0, 1.0)
+}
+
+/// `ThresholdedRelu(x) = x` for `x > alpha`, `0` otherwise.
+pub(crate) fn thresholded_relu_scalar(x: f32, alpha: f32) -> f32 {
+    if x > alpha { x } else { 0.0 }
+}
+
+/// `Selu(x) = gamma * x` for `x > 0`, `gamma * alpha * (e^x - 1)` otherwise.
+///
+/// ONNX's predicate is `x > 0`, so `-0` goes down the *negative* branch. That
+/// used to be evaluated as `alpha * x.exp_m1()`, which preserves the sign and
+/// returns `-0`; written with `exp() - 1` -- the only spelling an AVX2 path
+/// can have, since there is no vector `expm1` -- the subtraction yields `+0`
+/// instead. Those are different answers, so the sign had to be settled by
+/// measurement rather than by preference: a signed-zero comparison against
+/// ORT's own Selu kernel says **ORT returns `+0`**, which means the old
+/// `exp_m1` scalar was the one that disagreed. This kernel matches ORT.
+pub(crate) fn selu_scalar(x: f32, alpha: f32, gamma: f32) -> f32 {
+    if x > 0.0 {
+        gamma * x
+    } else {
+        gamma * (alpha * (x.exp() - 1.0))
+    }
 }
 
 /// `Softplus(x) = ln(1 + e^x)`, in the stable form
@@ -1997,6 +2114,63 @@ mod avx2 {
         _mm256_blendv_ps(r, x, _mm256_cmp_ps(x, x, _CMP_UNORD_Q))
     }
 
+    /// `LeakyRelu(x) = x` for `x >= 0`, `alpha * x` below it.
+    ///
+    /// One ordered compare and one blend. NaN answers false to `x < 0` and is
+    /// passed through as itself; `-0.0` also answers false and keeps its sign,
+    /// matching the scalar's `x >= 0` identity branch.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn leaky_relu_ps(x: __m256, alpha: __m256) -> __m256 {
+        let below = _mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_LT_OQ);
+        _mm256_blendv_ps(x, _mm256_mul_ps(alpha, x), below)
+    }
+
+    /// `HardSigmoid(x) = max(0, min(1, alpha * x + beta))`.
+    ///
+    /// The operand order of both clamps is load-bearing: `minps a, b` and
+    /// `maxps a, b` return `b` whenever either operand is unordered, so the
+    /// value has to be the *second* operand for NaN to survive. Written the
+    /// other way round this returns `1` then `0` for a NaN input, silently.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn hard_sigmoid_ps(x: __m256, alpha: __m256, beta: __m256) -> __m256 {
+        let t = _mm256_fmadd_ps(alpha, x, beta);
+        let capped = _mm256_min_ps(_mm256_set1_ps(1.0), t);
+        _mm256_max_ps(_mm256_setzero_ps(), capped)
+    }
+
+    /// `ThresholdedRelu(x) = x` for `x > alpha`, `0` otherwise.
+    ///
+    /// NaN answers false to the ordered `>` and is therefore *not* passed
+    /// through: it becomes `0`, exactly as the scalar's `if x > alpha` does.
+    /// This is the one activation in this file where dropping NaN is the
+    /// correct answer rather than a bug, because the comparison, not the
+    /// arithmetic, decides the output.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn thresholded_relu_ps(x: __m256, alpha: __m256) -> __m256 {
+        let keep = _mm256_cmp_ps(x, alpha, _CMP_GT_OQ);
+        _mm256_and_ps(x, keep)
+    }
+
+    /// `Selu(x) = gamma * x` for `x > 0`, `gamma * alpha * (e^x - 1)` otherwise.
+    ///
+    /// The compare is `x <= 0` and ordered, which is ONNX's `x > 0` inverted:
+    /// both zeros take the exponential branch and come out `+0`, matching ORT
+    /// (see `selu_scalar`), while NaN answers false and is passed through the
+    /// identity branch as `gamma * NaN`.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn selu_ps(x: __m256, alpha: __m256, gamma: __m256) -> __m256 {
+        // SAFETY: `#[target_feature(enable = "avx2,fma")]` on this function is
+        // the same guarantee `exp_full_ps` asks for.
+        let ex = unsafe { exp_full_ps(x) };
+        let neg = _mm256_mul_ps(alpha, _mm256_sub_ps(ex, _mm256_set1_ps(1.0)));
+        let below = _mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_LE_OQ);
+        _mm256_mul_ps(gamma, _mm256_blendv_ps(x, neg, below))
+    }
+
     /// `Elu(x) = x` for `x >= 0`, `alpha * (e^x - 1)` below it.
     ///
     /// `alpha` arrives pre-splatted; it is a node attribute, so it is
@@ -2339,6 +2513,64 @@ unsafe fn log_avx2(input: &[f32], output: &mut [f32]) {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn mish_avx2(input: &[f32], output: &mut [f32]) {
     unsafe { avx2::map_ps(input, output, |v| avx2::mish_ps(v)) }
+}
+
+/// `LeakyRelu` over a whole slice.
+///
+/// # Safety
+/// The host must support AVX2 and FMA.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn leaky_relu_avx2(input: &[f32], output: &mut [f32], alpha: f32) {
+    // SAFETY: the caller guarantees AVX2+FMA.
+    unsafe {
+        let a = core::arch::x86_64::_mm256_set1_ps(alpha);
+        avx2::map_ps(input, output, |v| avx2::leaky_relu_ps(v, a));
+    }
+}
+
+/// `HardSigmoid` over a whole slice.
+///
+/// # Safety
+/// The host must support AVX2 and FMA.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn hard_sigmoid_avx2(input: &[f32], output: &mut [f32], alpha: f32, beta: f32) {
+    // SAFETY: the caller guarantees AVX2+FMA.
+    unsafe {
+        let a = core::arch::x86_64::_mm256_set1_ps(alpha);
+        let b = core::arch::x86_64::_mm256_set1_ps(beta);
+        avx2::map_ps(input, output, |v| avx2::hard_sigmoid_ps(v, a, b));
+    }
+}
+
+/// `ThresholdedRelu` over a whole slice.
+///
+/// # Safety
+/// The host must support AVX2 and FMA.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn thresholded_relu_avx2(input: &[f32], output: &mut [f32], alpha: f32) {
+    // SAFETY: the caller guarantees AVX2+FMA.
+    unsafe {
+        let a = core::arch::x86_64::_mm256_set1_ps(alpha);
+        avx2::map_ps(input, output, |v| avx2::thresholded_relu_ps(v, a));
+    }
+}
+
+/// `Selu` over a whole slice.
+///
+/// # Safety
+/// The host must support AVX2 and FMA.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn selu_avx2(input: &[f32], output: &mut [f32], alpha: f32, gamma: f32) {
+    // SAFETY: the caller guarantees AVX2+FMA.
+    unsafe {
+        let a = core::arch::x86_64::_mm256_set1_ps(alpha);
+        let g = core::arch::x86_64::_mm256_set1_ps(gamma);
+        avx2::map_ps(input, output, |v| avx2::selu_ps(v, a, g));
+    }
 }
 
 /// `Elu` over a whole slice.
@@ -2826,6 +3058,211 @@ mod tests {
             assert!(e <= LOG_BOUND, "log({xi:e}) = {got}, want {}", xi.ln());
         }
         assert!(worst > 0.0, "sweep did not exercise anything");
+    }
+
+    /// The four activations that moved off the generic scalar path together.
+    ///
+    /// Each one is checked at every special value *and* through the scalar
+    /// branch, because a slice shorter than `SIMD_MIN_LEN` (or any host
+    /// without AVX2) reaches a different function than the one the vector
+    /// tests exercise, and the two must not be distinguishable.
+    #[test]
+    fn leaky_relu_special_values() {
+        let mut x = special_inputs();
+        x.extend_from_slice(&[1.0, -1.0, 0.25]);
+        let mut o = vec![0.0f32; x.len()];
+        leaky_relu_f32_slice(&x, &mut o, 0.125);
+        assert_eq!(o[PAD], f32::NEG_INFINITY, "leaky(-Inf)");
+        assert_eq!(o[PAD + 1].to_bits(), 0x8000_0000, "leaky(-0) stays -0");
+        assert_eq!(o[PAD + 2].to_bits(), 0, "leaky(+0)");
+        assert_eq!(o[PAD + 3], f32::INFINITY, "leaky(+Inf)");
+        assert!(o[PAD + 4].is_nan(), "leaky(NaN)");
+        assert_eq!(o[PAD + 5], -f32::MAX * 0.125, "leaky(-MAX)");
+        assert_eq!(o[PAD + 6], f32::MAX, "leaky(MAX)");
+        assert_eq!(o[x.len() - 1], 0.25, "leaky(0.25)");
+        assert_eq!(o[x.len() - 2], -0.125, "leaky(-1)");
+    }
+
+    #[test]
+    fn hard_sigmoid_special_values() {
+        let mut x = special_inputs();
+        x.extend_from_slice(&[1.0, -1.0, 0.25]);
+        let mut o = vec![0.0f32; x.len()];
+        hard_sigmoid_f32_slice(&x, &mut o, 0.2, 0.5);
+        assert_eq!(o[PAD], 0.0, "hard_sigmoid(-Inf) clamps to 0");
+        assert_eq!(o[PAD + 1], 0.5, "hard_sigmoid(-0) = beta");
+        assert_eq!(o[PAD + 2], 0.5, "hard_sigmoid(+0) = beta");
+        assert_eq!(o[PAD + 3], 1.0, "hard_sigmoid(+Inf) clamps to 1");
+        // `minps`/`maxps` return their *second* operand when either is
+        // unordered, so a NaN here means the constants are on the correct side
+        // of both clamps. Written the other way round this is 0.
+        assert!(o[PAD + 4].is_nan(), "hard_sigmoid(NaN) stays NaN");
+        assert_eq!(o[PAD + 5], 0.0, "hard_sigmoid(-MAX)");
+        assert_eq!(o[PAD + 6], 1.0, "hard_sigmoid(MAX)");
+        for (&xi, &got) in x[x.len() - 3..].iter().zip(&o[x.len() - 3..]) {
+            let want = hard_sigmoid_scalar(xi, 0.2, 0.5);
+            assert!((got - want).abs() <= 1e-7, "hard_sigmoid({xi}) = {got}");
+        }
+    }
+
+    #[test]
+    fn thresholded_relu_special_values() {
+        let mut x = special_inputs();
+        x.extend_from_slice(&[1.0, -1.0, 0.25]);
+        let mut o = vec![0.0f32; x.len()];
+        thresholded_relu_f32_slice(&x, &mut o, 0.5);
+        assert_eq!(o[PAD], 0.0, "thresholded(-Inf)");
+        assert_eq!(o[PAD + 1], 0.0, "thresholded(-0)");
+        assert_eq!(o[PAD + 2], 0.0, "thresholded(+0)");
+        assert_eq!(o[PAD + 3], f32::INFINITY, "thresholded(+Inf)");
+        // The output is decided by an ordered compare, which NaN loses: 0 is
+        // the right answer here, not a lost NaN.
+        assert_eq!(o[PAD + 4], 0.0, "thresholded(NaN) is 0, by the compare");
+        assert_eq!(o[PAD + 5], 0.0, "thresholded(-MAX)");
+        assert_eq!(o[PAD + 6], f32::MAX, "thresholded(MAX)");
+        assert_eq!(o[x.len() - 3], 1.0, "thresholded(1) > alpha passes");
+        assert_eq!(o[x.len() - 1], 0.0, "thresholded(0.25) < alpha clears");
+    }
+
+    #[test]
+    fn selu_special_values() {
+        const A: f32 = 1.673_263_2;
+        const G: f32 = 1.050_701;
+        let mut x = special_inputs();
+        x.extend_from_slice(&[1.0, -1.0, 0.25]);
+        let mut o = vec![0.0f32; x.len()];
+        selu_f32_slice(&x, &mut o, A, G);
+        assert_eq!(o[PAD], -G * A, "selu(-Inf) saturates at -gamma*alpha");
+        // Both zeros take the exponential branch, where `exp(x) - 1` erases the
+        // sign -- and ORT's kernel does the same. Pinned in both directions so
+        // a future rewrite cannot quietly reintroduce `exp_m1`'s `-0`.
+        assert_eq!(o[PAD + 1].to_bits(), 0, "selu(-0) is +0, as in ORT");
+        assert_eq!(o[PAD + 2].to_bits(), 0, "selu(+0)");
+        assert_eq!(
+            selu_scalar(-0.0, A, G).to_bits(),
+            0,
+            "scalar selu(-0) is +0"
+        );
+        assert_eq!(o[PAD + 3], f32::INFINITY, "selu(+Inf)");
+        assert!(o[PAD + 4].is_nan(), "selu(NaN)");
+        assert_eq!(o[PAD + 5], -G * A, "selu(-MAX) saturates");
+        assert_eq!(o[PAD + 6], f32::MAX * G, "selu(MAX)");
+        // `+Inf` and `MAX` cannot tell the two branches apart -- `alpha > 1`, so
+        // the exponential branch overflows to `+Inf` there too. `1e30` can:
+        // the identity branch is finite, the exponential branch is not.
+        assert_eq!(o[PAD + 7], -G * A, "selu(-1e30) saturates");
+        assert_eq!(o[PAD + 8], 1e30 * G, "selu(1e30) takes the identity branch");
+        for (&xi, &got) in x[x.len() - 3..].iter().zip(&o[x.len() - 3..]) {
+            let want = selu_scalar(xi, A, G);
+            let e = (f64::from(got) - f64::from(want)).abs() / f64::from(want).abs().max(1.0);
+            assert!(e <= 4e-7, "selu({xi}) = {got}, want {want}");
+        }
+    }
+
+    /// Scalar branch versus vector branch, bit for bit, for all four.
+    #[test]
+    fn scalar_paths_agree_with_the_vector_paths() {
+        let specials = [
+            f32::NAN,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            -0.0,
+            0.0,
+            -1.0,
+            1.0,
+            -90.0,
+            0.25,
+        ];
+        assert!(
+            specials.len() < SIMD_MIN_LEN,
+            "the short slice must be short enough to take the scalar path"
+        );
+        let mut long_in = vec![0.0f32; PAD];
+        long_in.extend_from_slice(&specials);
+
+        let compare = |name: &str, run: &dyn Fn(&[f32], &mut [f32])| {
+            let mut short_out = vec![0.0f32; specials.len()];
+            run(&specials, &mut short_out);
+            let mut long_out = vec![0.0f32; long_in.len()];
+            run(&long_in, &mut long_out);
+            for (i, &x) in specials.iter().enumerate() {
+                let scalar = short_out[i];
+                let vector = long_out[PAD + i];
+                assert_eq!(
+                    scalar.is_nan(),
+                    vector.is_nan(),
+                    "{name}({x}): scalar {scalar}, vector {vector}"
+                );
+                if !scalar.is_nan() {
+                    assert_eq!(
+                        scalar.to_bits(),
+                        vector.to_bits(),
+                        "{name}({x}): scalar {scalar}, vector {vector}"
+                    );
+                }
+            }
+        };
+
+        for alpha in [0.01f32, 0.125, 1.0, 2.5] {
+            compare("leaky_relu", &|i, o| leaky_relu_f32_slice(i, o, alpha));
+            compare("thresholded_relu", &|i, o| {
+                thresholded_relu_f32_slice(i, o, alpha)
+            });
+            compare("selu", &|i, o| selu_f32_slice(i, o, alpha, 1.050_701));
+            for beta in [0.0f32, 0.5, 1.0] {
+                compare("hard_sigmoid", &|i, o| {
+                    hard_sigmoid_f32_slice(i, o, alpha, beta)
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn dense_sweeps_match_the_scalars() {
+        let x = grid(-90.0, 90.0, 20_003, &[]);
+        let mut o = vec![0.0f32; x.len()];
+
+        for alpha in [0.01f32, 0.125, 1.0, 2.5] {
+            leaky_relu_f32_slice(&x, &mut o, alpha);
+            for (&xi, &got) in x.iter().zip(&o) {
+                assert_eq!(
+                    got.to_bits(),
+                    leaky_relu_scalar(xi, alpha).to_bits(),
+                    "leaky_relu({xi}, {alpha}) is exact, so it must be bit-identical"
+                );
+            }
+
+            thresholded_relu_f32_slice(&x, &mut o, alpha);
+            for (&xi, &got) in x.iter().zip(&o) {
+                assert_eq!(
+                    got.to_bits(),
+                    thresholded_relu_scalar(xi, alpha).to_bits(),
+                    "thresholded_relu({xi}, {alpha}) is exact"
+                );
+            }
+
+            hard_sigmoid_f32_slice(&x, &mut o, alpha, 0.5);
+            for (&xi, &got) in x.iter().zip(&o) {
+                let want = hard_sigmoid_scalar(xi, alpha, 0.5);
+                // FMA in the vector path against a rounded multiply-then-add in
+                // the scalar one: equal to within one rounding of the product,
+                // not bit-identical.
+                assert!(
+                    (f64::from(got) - f64::from(want)).abs() <= 1e-7,
+                    "hard_sigmoid({xi}, {alpha}) = {got}, want {want}"
+                );
+            }
+
+            selu_f32_slice(&x, &mut o, alpha, 1.050_701);
+            for (&xi, &got) in x.iter().zip(&o) {
+                let want = selu_scalar(xi, alpha, 1.050_701);
+                let e = (f64::from(got) - f64::from(want)).abs() / f64::from(want).abs().max(1.0);
+                assert!(
+                    e <= 4e-7 * f64::from(alpha).max(1.0),
+                    "selu({xi}, {alpha}) = {got}, want {want}"
+                );
+            }
+        }
     }
 
     #[test]
