@@ -214,10 +214,7 @@ mod tests {
         // Four buffers fit; the fifth would exceed the process cap.
         let budget = GovernedAccumulatorBudget::new(1000, 4000);
         for expected in 1..=4 {
-            assert!(
-                budget.try_park(1000),
-                "buffer {expected} fits under the sum"
-            );
+            assert!(budget.try_park(1000), "buffer {expected} fits under the sum");
             assert_eq!(budget.live_bytes(), expected * 1000);
         }
         assert!(
