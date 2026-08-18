@@ -38,6 +38,7 @@ the specifications, measured evidence, or accepted designs in `docs/`.
 - **Performance engineering:** [[performance/Performance Engineering Playbook]]
 - **API design:** [[api/API Design Principles]]
 - **Contracts:** [[contracts/Runtime Contracts]]
+- **Formal verification:** [[contracts/Formal Verification with TLA+]]
 - **Metadata:** [[metadata/Metadata Driven Runtime]]
 - **Model packages:** [[metadata/Model Packages and Variants]]
 - **Documentation:** [[start/Documentation Guide]]

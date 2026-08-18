@@ -99,6 +99,7 @@ Every cross-module pointer needs:
 6. Runtime counters that expose underflow/unaccounted bytes.
 7. Versioned ABI records.
 8. Actionable failure at the earliest boundary.
+9. Model checking plus trace refinement for concurrency protocols.
 
 > [!warning] A green build is not integration evidence
 > Two components can compile against duplicated or disconnected contracts while
@@ -112,6 +113,7 @@ Every cross-module pointer needs:
 - [`NXRT_ABI.md`](../../docs/architecture/NXRT_ABI.md)
 - [`EP_CONFORMANCE.md`](../../docs/execution/EP_CONFORMANCE.md)
 - [`MODEL_METADATA.md`](../../docs/genai/MODEL_METADATA.md)
+- [TLA+ model index](../../specs/tla/README.md)
 
 ## Related notes
 
@@ -119,3 +121,4 @@ Every cross-module pointer needs:
 - [[memory/Memory Management for Beginners]]
 - [[metadata/Metadata Driven Runtime]]
 - [[execution/Plugin Execution Providers]]
+- [[contracts/Formal Verification with TLA+]]
