@@ -341,7 +341,7 @@ impl Executor {
         bindings: &mut [DeviceIoBinding],
     ) -> Result<WorkspaceRequirement> {
         self.workspace_preparation_required = true;
-        let external = self.prepare_external_bindings(bindings)?;
+        let external = self.prepare_external_bindings_mode(bindings, true)?;
         let symbols = self.bind_symbols(inputs, &external)?;
         // Track one peak per lifetime class: session-persistent and step-scoped
         // scratch live in separate executor slots, so a single peak cannot stand
@@ -908,6 +908,31 @@ impl Executor {
         &self,
         bindings: &mut [DeviceIoBinding],
     ) -> Result<ExternalBindings> {
+        self.prepare_external_bindings_mode(bindings, false)
+    }
+
+    /// As [`Self::prepare_external_bindings`], but when `plan_capacity` is set the
+    /// input value shapes bind a growing/logical-exposing input at its *physical
+    /// capacity* rather than its current logical prefix.
+    ///
+    /// This is used only by prepare-only workspace planning
+    /// ([`Self::prepare_with_device_bindings`]), which never executes a node: a
+    /// governed kernel workspace must be reserved for the *maximum* extent an
+    /// input reaches across the session, not the logical prefix bound at
+    /// preparation time. A binding that exposes its logical prefix
+    /// ([`DeviceIoBinding::exposes_logical_input_shape`]) — e.g. a growing-KV
+    /// decode cache that cannot be frozen to capacity — otherwise binds its
+    /// sequence symbol to the current (0/prefill) length, so the reserved
+    /// SessionPersistent decode workspace is sized far below what steady-state
+    /// decode consumes and later steps fault on the workspace invariant (#1179).
+    /// Sizing against physical capacity over-reserves (reserve ≥ consume), which
+    /// is exactly correct for a reservation; execution still binds the logical
+    /// prefix and fits under it.
+    pub(super) fn prepare_external_bindings_mode(
+        &self,
+        bindings: &mut [DeviceIoBinding],
+        plan_capacity: bool,
+    ) -> Result<ExternalBindings> {
         let mut external = ExternalBindings::default();
         for binding in bindings {
             let input_name = binding.input_name().to_string();
@@ -939,7 +964,11 @@ impl Executor {
                 })?;
                 let value = ExternalValue {
                     dtype,
-                    shape: binding.kernel_input_shape().to_vec(),
+                    shape: if plan_capacity {
+                        binding.physical_shape().to_vec()
+                    } else {
+                        binding.kernel_input_shape().to_vec()
+                    },
                     accepts_subshape: false,
                     ptr,
                     len,
