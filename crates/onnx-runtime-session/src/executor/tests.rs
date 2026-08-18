@@ -3019,6 +3019,112 @@ fn inference_session_fallback_workspace_grows_retries_and_reuses() {
     assert_eq!(reused.buffer.as_ptr(), ptr);
 }
 
+/// #1223: a *prepared* session must re-prepare its governed workspace when
+/// execution rebuckets to a larger shape bucket than preparation reserved for.
+///
+/// Preparation reserves one governed-workspace slot per lifetime class from the
+/// shapes it is handed, and — so a captured device graph can bake a stable
+/// pointer — a prepared session otherwise refuses to (re)allocate at execution
+/// time. That invariant only holds *within* one shape bucket. When decode grows
+/// past a bucket edge (or a prompt lands in a different bucket than its decode
+/// steps), the slot reserved under the old bucket's geometry can be undersized
+/// for the new one. Before the fix, the larger bucket failed the prepared-
+/// workspace invariant with "workspace invariant mismatch"; #1221 fixed the same
+/// failure mode *in-bucket* for `Attention` but scoped the cross-bucket case out.
+///
+/// This drives the exact gap on the executor's shared workspace path (not any
+/// one op-type): reserve a `SessionPersistent` per-row slot for a 2-row bucket,
+/// then execute a 4-row bucket. The rebucket lands on an eager dispatch (as it
+/// does on the real growing-KV decode path, which declines capture, and on the
+/// eager re-warm a capture-eligible model runs after a KV-growth graph
+/// invalidation), so the slot is re-prepared in place. Reverting the fix makes
+/// the 4-row execute fail with "workspace invariant mismatch".
+#[test]
+fn prepared_session_reprepares_workspace_when_execution_rebuckets() {
+    let mut graph = Graph::new();
+    graph
+        .opset_imports
+        .insert(onnx_runtime_ir::RUNTIME_DOMAIN.into(), 1);
+    let rows = SymbolId(0);
+    let shape = vec![Dim::Symbolic(rows)];
+    let input = graph.create_named_value("input", DataType::Float32, shape.clone());
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, shape);
+    graph.add_output(output);
+    let mut node = Node::new(
+        NodeId(0),
+        "BlockQuantizedMoE",
+        vec![Some(input)],
+        vec![output],
+    );
+    node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+    graph.insert_node(node);
+
+    let inputs = crate::io_meta(&graph, &graph.inputs);
+    let outputs = crate::io_meta(&graph, &graph.outputs);
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ep = WeightDeliveryEp::new(false, deliveries);
+    ep.workspace_bytes_per_row = 1024;
+    let exec = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let mut session = crate::InferenceSession {
+        inputs,
+        outputs,
+        model_metadata: crate::ModelMetadata::default(),
+        exec,
+        decode_inline_exec: None,
+        ep_context_config: crate::EpContextDumpConfig::default(),
+    };
+
+    // Bucket A: preparation reserves the SessionPersistent slot for a 2-row
+    // shape and latches "workspace preparation required", so execution may no
+    // longer lazily grow the slot within this bucket.
+    let bucket_a = Tensor::from_f32(&[2], &[1.0, 2.0]).unwrap();
+    session
+        .exec
+        .prepare_with_device_bindings(&[("input", &bucket_a)], &mut [])
+        .unwrap();
+    let reserved = session.exec.persistent_workspace.as_ref().unwrap();
+    assert_eq!(reserved.bytes, 2048);
+    assert_eq!(reserved.alignment, 256);
+    assert!(
+        session.exec.workspace_preparation_required,
+        "prepare must latch the prepared-workspace invariant"
+    );
+
+    // In-bucket execution still fits under the reservation.
+    assert_eq!(
+        session.run(&[("input", &bucket_a)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0]
+    );
+
+    // Bucket B: a larger bucket needs 4096 bytes at a tighter alignment than the
+    // 2-row reservation. Without the #1223 fix this eager rebucket dispatch
+    // fails the prepared-workspace invariant; with it, preparation is re-run in
+    // place and the slot grows.
+    let bucket_b = Tensor::from_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    assert_eq!(
+        session.run(&[("input", &bucket_b)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    let grown = session.exec.persistent_workspace.as_ref().unwrap();
+    assert_eq!(grown.bytes, 4096);
+    assert_eq!(grown.alignment, 512);
+    assert!(
+        session.exec.workspace_preparation_required,
+        "re-preparing on rebucket must not drop the prepared-workspace invariant"
+    );
+
+    // Rebucketing back down reuses the grown slot (a slot only ever grows).
+    assert_eq!(
+        session.run(&[("input", &bucket_a)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0]
+    );
+    assert_eq!(
+        session.exec.persistent_workspace.as_ref().unwrap().bytes,
+        4096
+    );
+}
+
 fn two_node_weight_delivery_fixture() -> (Graph, Arc<WeightStore>, std::path::PathBuf) {
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
     let root = std::env::var_os("CARGO_TARGET_DIR")
