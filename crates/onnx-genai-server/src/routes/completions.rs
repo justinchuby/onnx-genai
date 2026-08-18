@@ -3216,3 +3216,46 @@ mod channel_gate_tests {
         assert_eq!(gate.push(Some(" to=self<|message|>"), "x").reasoning, "");
     }
 }
+
+// The buffered (non-streamed) path does not go through the gate: it composes
+// `atem_reasoning_content` for the reasoning and `parse_assistant_output` for
+// the answer, exactly as `run_chat_completion` does. These assert that a
+// buffered turn reports its thinking on `reasoning_content` while keeping it out
+// of `content`, so the two paths agree instead of the buffered one silently
+// stripping reasoning as it did before #1197 was reversed.
+#[cfg(test)]
+mod buffered_reasoning_tests {
+    use super::*;
+
+    // The final buffered message reports the thinking beside the answer, and the
+    // answer is only the user channel — reasoning is never spliced into content.
+    #[test]
+    fn a_buffered_message_reports_reasoning_beside_the_answer() {
+        let output =
+            " to=self<|message|>weigh it<|eom|><|start|>assistant to=user<|message|>Hi<|eot|>"
+                .to_string();
+        assert_eq!(
+            atem_reasoning_content(&output).as_deref(),
+            Some("weigh it")
+        );
+        assert_eq!(
+            parse_assistant_output(output, "stop").content.as_deref(),
+            Some("Hi")
+        );
+    }
+
+    // A buffered turn that never reaches the user still reports what it thought,
+    // and its answer is empty rather than the reasoning leaking out as one.
+    #[test]
+    fn a_buffered_turn_that_never_answers_still_reports_its_thinking() {
+        let output = " to=self<|message|>still going<|eot|>".to_string();
+        assert_eq!(
+            atem_reasoning_content(&output).as_deref(),
+            Some("still going")
+        );
+        assert_eq!(
+            parse_assistant_output(output, "stop").content.as_deref(),
+            Some("")
+        );
+    }
+}

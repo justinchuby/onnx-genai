@@ -356,3 +356,30 @@ pub(crate) fn done_chunk(
         }],
     }
 }
+
+#[cfg(test)]
+mod reasoning_wire_tests {
+    use super::{content_chunk, reasoning_chunk};
+
+    // Reasoning rides on its own `reasoning_content` key and never touches
+    // `content`, so an OpenAI-compatible client that ignores the extra field
+    // sees the same answer stream as before while a reasoning-aware one can show
+    // the model working.
+    #[test]
+    fn a_reasoning_chunk_carries_reasoning_content_and_no_content() {
+        let chunk = reasoning_chunk("id", 0, "m", "weighing it".to_string());
+        let json = serde_json::to_string(&chunk).expect("serialize");
+        assert!(json.contains("\"reasoning_content\":\"weighing it\""), "{json}");
+        assert!(!json.contains("\"content\""), "{json}");
+    }
+
+    // An ordinary answer chunk omits `reasoning_content` entirely, so its wire
+    // shape is byte for byte what it was before the channel existed.
+    #[test]
+    fn a_content_chunk_omits_reasoning_content() {
+        let chunk = content_chunk("id", 0, "m", "Hi".to_string(), None);
+        let json = serde_json::to_string(&chunk).expect("serialize");
+        assert!(json.contains("\"content\":\"Hi\""), "{json}");
+        assert!(!json.contains("reasoning_content"), "{json}");
+    }
+}
