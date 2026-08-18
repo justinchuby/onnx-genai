@@ -5705,6 +5705,225 @@ fn percentile(samples: &mut [f64], p: f64) -> f64 {
     samples[idx]
 }
 
+/// A single-input elementwise case: one node, one tensor in, same shape out.
+///
+/// Reuses [`MatmulFamilyCase`], which is a single-node generated model plus its
+/// runtime inputs and nothing matmul-specific beyond its name.
+///
+/// `positive` maps the generated activations into `[0.5, 1.5]` for the ops that
+/// are undefined or uninteresting on negatives (`Sqrt`, `Log`); everything else
+/// gets the two-sided `[-1, 1]` range so saturating branches are exercised on
+/// both sides.
+///
+/// `tolerance` is inert for these: the only consumer of the unary cases is the
+/// timing A/B, which asserts assignment and then measures. Elementwise numerics
+/// are covered against closed forms in `onnx-runtime-ep-cpu`'s own kernel
+/// tests, not here.
+#[allow(clippy::too_many_arguments)]
+fn unary_case(
+    name: &'static str,
+    op: &'static str,
+    domain: &'static str,
+    elem: ort::ONNXTensorElementDataType,
+    len: usize,
+    opset: u64,
+    positive: bool,
+    tolerance: f32,
+) -> MatmulFamilyCase {
+    let dims = vec![1, len as i64];
+    let opset_imports = if domain.is_empty() {
+        format!("[{{ version: {opset} }}]")
+    } else {
+        format!("[{{ version: {opset} }}, {{ domain: \"{domain}\" version: 1 }}]")
+    };
+    let attrs = match op {
+        // `Gelu`'s default is already "none" (exact); spell whichever variant
+        // the case name promises so the model cannot silently drift.
+        "Gelu" if name.contains("_tanh") => {
+            " attribute: [{ name: \"approximate\" type: STRING s: \"tanh\" }]"
+        }
+        "Gelu" => " attribute: [{ name: \"approximate\" type: STRING s: \"none\" }]",
+        _ => "",
+    };
+    let model = format!(
+        r#"ir_version: 10
+graph {{
+  node: [{{ input: ["X"] output: ["Y"] op_type: "{op}" domain: "{domain}"{attrs} }}]
+  name: "{name}"
+  input: [{}]
+  output: [{}]
+}}
+opset_import: {opset_imports}
+"#,
+        textproto_value_info("X", elem, &dims),
+        textproto_value_info("Y", elem, &dims),
+    );
+    let mut x = activation_f32(1, len);
+    if positive {
+        for v in &mut x {
+            *v = v.abs() + 0.5;
+        }
+    }
+    let data = if elem == ELEM_F16 {
+        f16_slice_to_bytes(&x)
+    } else {
+        f32_slice_to_bytes(&x)
+    };
+    MatmulFamilyCase {
+        name,
+        op,
+        model,
+        inputs: vec![GeneratedInput {
+            name: "X",
+            elem,
+            dims,
+            data,
+        }],
+        output: "Y",
+        output_elem: elem,
+        ort_can_build: true,
+        tolerance,
+    }
+}
+
+/// The elementwise grid `CPU_ACTIVATION_GAPS.md` is written against, as
+/// session-level cases.
+///
+/// Two sizes: a decode-width row (4 Ki) where per-node dispatch overhead is
+/// still visible, and 1 Mi where the kernel is the whole cost. Both are the
+/// sizes the published ratio table uses, so a number from here is directly
+/// comparable to a number in that file.
+fn unary_bench_cases() -> Vec<MatmulFamilyCase> {
+    const K4: usize = 4096;
+    const M1: usize = 1 << 20;
+    vec![
+        unary_case(
+            "bench_tanh_f32_4k",
+            "Tanh",
+            "",
+            ELEM_F32,
+            K4,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_tanh_f32_1m",
+            "Tanh",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_sigmoid_f32_4k",
+            "Sigmoid",
+            "",
+            ELEM_F32,
+            K4,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_sigmoid_f32_1m",
+            "Sigmoid",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case("bench_erf_f32_4k", "Erf", "", ELEM_F32, K4, 17, false, 1e-4),
+        unary_case("bench_erf_f32_1m", "Erf", "", ELEM_F32, M1, 17, false, 1e-4),
+        unary_case(
+            "bench_gelu_tanh_f32_1m",
+            "Gelu",
+            "",
+            ELEM_F32,
+            M1,
+            20,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_gelu_exact_f32_1m",
+            "Gelu",
+            "",
+            ELEM_F32,
+            M1,
+            20,
+            false,
+            1e-4,
+        ),
+        unary_case("bench_exp_f32_1m", "Exp", "", ELEM_F32, M1, 17, false, 1e-4),
+        unary_case(
+            "bench_relu_f32_1m",
+            "Relu",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            0.0,
+        ),
+        unary_case(
+            "bench_sqrt_f32_4k",
+            "Sqrt",
+            "",
+            ELEM_F32,
+            K4,
+            17,
+            true,
+            1e-4,
+        ),
+        unary_case(
+            "bench_sqrt_f32_1m",
+            "Sqrt",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            true,
+            1e-4,
+        ),
+        unary_case(
+            "bench_quickgelu_f32_1m",
+            "QuickGelu",
+            "com.microsoft",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_fastgelu_f32_1m",
+            "FastGelu",
+            "com.microsoft",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_tanh_f16_1m",
+            "Tanh",
+            "",
+            ELEM_F16,
+            M1,
+            17,
+            false,
+            5e-3,
+        ),
+        unary_case("bench_exp_f16_1m", "Exp", "", ELEM_F16, M1, 17, false, 5e-3),
+    ]
+}
+
 /// Shapes worth measuring on the plugin path, at sizes a real decode/prefill
 /// step reaches rather than the smallest size that proves correctness.
 fn matmul_bench_cases() -> Vec<MatmulFamilyCase> {
@@ -5819,7 +6038,7 @@ fn plugin_path_ab_vs_plain_ort() {
     println!(
         "case,ours_p50_ms,ort_p50_ms,ratio_p50,ours_p90_ms,ort_p90_ms,ratio_p90,cold_ours_ms,cold_ort_ms"
     );
-    for case in matmul_bench_cases() {
+    for case in matmul_bench_cases().into_iter().chain(unary_bench_cases()) {
         if !filter.is_empty() && !case.name.contains(&filter) {
             continue;
         }

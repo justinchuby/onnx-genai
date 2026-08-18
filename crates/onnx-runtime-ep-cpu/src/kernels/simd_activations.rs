@@ -4221,6 +4221,79 @@ mod chunking_instantiation_is_local {
     }
 }
 
+/// The same hazard from the other side: keeping `run_chunked` private stops one
+/// *known* way of repartitioning the crate, but the compiler is free to split it
+/// sixteen ways regardless, and by default it does. Measured on the release
+/// profile, this crate built as one codegen unit against the default sixteen:
+///
+/// | case (1 thread, p50 of 5 interleaved runs) | 16 CGUs | 1 CGU | ratio |
+/// |---|---|---|---|
+/// | `Sqrt` f32, 4096 elems | 0.639 ns/elem | 0.241 | 2.65x |
+/// | `Tanh` f32, 4096 elems | 0.728 | 0.381 | 1.91x |
+/// | `Sigmoid` f32, 4096 elems | 0.729 | 0.392 | 1.86x |
+/// | `Sqrt` f16, 4096 elems | 0.907 | 0.511 | 1.78x |
+/// | `Tanh` f32, 2 Mi elems | 0.202 | 0.099 | 2.04x |
+/// | `QuickGelu` f32, 16 elems (control) | 8.56 | 8.66 | 0.99x |
+///
+/// 77 of 105 measured cases move by more than 1.15x; the ones that do not are
+/// the 16-element shapes, where dispatch rather than the loop is the cost. That
+/// is the signature of a de-vectorized inner loop, not of noise.
+///
+/// So the workspace pins `codegen-units = 1` for this package. That is a build
+/// setting a rebase can drop without any test noticing, which is exactly how the
+/// same class of regression reached `main` before, so this test reads it back.
+#[cfg(test)]
+mod codegen_units_are_pinned {
+    /// Both shipping profiles must still build this crate as a single codegen
+    /// unit.
+    ///
+    /// `bench` is checked too because a per-package override does not inherit
+    /// from `release`, so dropping it would leave `cargo bench` measuring the
+    /// de-vectorized build -- the one place a wrong number is most expensive.
+    #[test]
+    fn the_workspace_pins_one_codegen_unit_for_this_crate() {
+        for profile in ["release", "bench"] {
+            assert_pinned(profile);
+        }
+    }
+
+    fn assert_pinned(profile: &str) {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/<pkg> has a workspace root two levels up")
+            .join("Cargo.toml");
+        let text = std::fs::read_to_string(&manifest)
+            .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+        let header = format!("[profile.{profile}.package.onnx-runtime-ep-cpu]");
+        let Some(start) = text.find(&header) else {
+            panic!(
+                "{} no longer contains {header}; building this crate as the \
+                 default sixteen codegen units de-vectorizes the AVX2 \
+                 elementwise kernels and costs up to 2.65x",
+                manifest.display()
+            );
+        };
+        let section = &text[start + header.len()..];
+        let section = &section[..section.find("\n[").unwrap_or(section.len())];
+        let pinned = section.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("codegen-units")
+                && line.split_once('=').is_some_and(|(_, value)| {
+                    // Tolerate an inline comment: the most likely future edit to
+                    // this line is someone explaining it, and a guard that fails
+                    // on its own documentation teaches people to delete it.
+                    let value = value.split('#').next().unwrap_or(value);
+                    value.trim().trim_end_matches(',') == "1"
+                })
+        });
+        assert!(
+            pinned,
+            "{header} exists but does not set `codegen-units = 1`; found:{section}"
+        );
+    }
+}
+
 /// The host-pool split: what happens when ORT lends us its intra-op threads.
 ///
 /// The production host is ORT's `KernelContext_ParallelFor`, which needs a
