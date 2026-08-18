@@ -478,6 +478,7 @@ async fn run_chat_completion(
                     assistant_output_text(&result, &tokenizer),
                     default_finish_reason,
                 )
+                .aligned_to(&request)
             } else {
                 ParsedAssistantOutput {
                     content: Some(result.text),
@@ -662,11 +663,12 @@ async fn stream_chat_completion(
         match result {
             Ok(result) => {
                 if let Some(requested_top_logprobs) = requested_top_logprobs {
-                    let tool_calls = if buffer_for_tool_detection {
+                    let mut tool_calls = if buffer_for_tool_detection {
                         parse_tool_calls(&assistant_output_text(&result, &tokenizer))
                     } else {
                         Vec::new()
                     };
+                    align_tool_calls(&mut tool_calls, &request);
                     if tool_calls.is_empty() {
                         send_chat_logprob_chunks(
                             &tx,
@@ -695,7 +697,8 @@ async fn stream_chat_completion(
                     let parsed = parse_assistant_output(
                         assistant_output_text(&result, &tokenizer),
                         finish_reason_label(&result.finish_reason),
-                    );
+                    )
+                    .aligned_to(&request);
                     if let Some(tool_calls) = parsed.tool_calls {
                         send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
                     } else {
@@ -1991,6 +1994,46 @@ pub struct ParsedAssistantOutput {
     pub finish_reason: &'static str,
 }
 
+impl ParsedAssistantOutput {
+    /// Point every parsed call at a tool the caller actually offered.
+    fn aligned_to(mut self, request: &ChatCompletionRequest) -> Self {
+        if let Some(calls) = self.tool_calls.as_deref_mut() {
+            align_tool_calls(calls, request);
+        }
+        self
+    }
+}
+
+/// Resolve a namespaced call back to the tool the caller offered.
+///
+/// This package's own tool instructions carry a namespaced example
+/// (`example_tool_name.example_function_name`), so a model offered a bare name
+/// sometimes answers with a qualified one. The namespace is the model's
+/// spelling, not the caller's, and a client can only dispatch a name it
+/// offered — it rejects anything else as an unavailable tool. So when the
+/// qualified name is not on offer but its final segment is, the call names that
+/// tool and is resolved to it. Anything else is left untouched for the caller
+/// to reject, because inventing a target it never offered would be worse than
+/// the error it already knows how to report.
+fn align_tool_calls(calls: &mut [ChatMessageToolCall], request: &ChatCompletionRequest) {
+    let Some(offered) = tools_offered_to_model(request) else {
+        return;
+    };
+    let names_a_tool =
+        |name: &str| -> bool { offered.iter().any(|tool| tool.function.name == name) };
+    for call in calls {
+        if names_a_tool(&call.function.name) {
+            continue;
+        }
+        let Some((_, suffix)) = call.function.name.rsplit_once('.') else {
+            continue;
+        };
+        if names_a_tool(suffix) {
+            call.function.name = suffix.to_string();
+        }
+    }
+}
+
 pub fn parse_assistant_output(
     output: String,
     default_finish_reason: &'static str,
@@ -2802,6 +2845,99 @@ mod output_budget_tests {
         assert_eq!(
             reserved_output_tokens(&request(json!({"max_tokens": 512})), 4096),
             512
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_name_alignment_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn request_offering(names: &[&str]) -> ChatCompletionRequest {
+        let tools: Vec<_> = names
+            .iter()
+            .map(|name| json!({"type": "function", "function": {"name": name}}))
+            .collect();
+        serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools
+        }))
+        .expect("request")
+    }
+
+    fn call(name: &str) -> ChatMessageToolCall {
+        serde_json::from_value(json!({
+            "id": "call_0",
+            "type": "function",
+            "function": {"name": name, "arguments": "{}"}
+        }))
+        .expect("call")
+    }
+
+    fn aligned(name: &str, offered: &[&str]) -> String {
+        let mut calls = vec![call(name)];
+        align_tool_calls(&mut calls, &request_offering(offered));
+        calls.remove(0).function.name
+    }
+
+    // The package's tool instructions show a namespaced example, so the model
+    // sometimes qualifies a bare name. The client only knows the name it
+    // offered, and rejects anything else as an unavailable tool.
+    #[test]
+    fn a_namespaced_call_resolves_to_the_offered_tool() {
+        assert_eq!(aligned("glob.glob", &["glob", "read"]), "glob");
+        assert_eq!(aligned("functions.read", &["glob", "read"]), "read");
+    }
+
+    // A name the caller offered is never rewritten, even when it contains a dot.
+    #[test]
+    fn an_offered_name_is_left_alone() {
+        assert_eq!(aligned("glob", &["glob"]), "glob");
+        assert_eq!(aligned("fs.read", &["fs.read", "read"]), "fs.read");
+    }
+
+    // A suffix that names nothing on offer stays as the model spelled it, so
+    // the caller reports the unavailable tool it already knows how to report
+    // rather than dispatching one it never offered.
+    #[test]
+    fn an_unknown_call_is_left_for_the_caller_to_reject() {
+        assert_eq!(aligned("shell.exec", &["glob", "read"]), "shell.exec");
+        assert_eq!(aligned("wander", &["glob", "read"]), "wander");
+    }
+
+    // Suffix resolution is safe only because it matches a call's final segment
+    // against an offered tool's *whole* name, so the resolved target is always a
+    // single offered name and never a choice between two. When two offered tools
+    // merely share a final segment (`fs.read`, `net.read`) and the model writes a
+    // third namespace (`svc.read`), the bare segment `read` is offered by
+    // neither, so the call is left alone for the caller to reject rather than
+    // being resolved arbitrarily to one of them.
+    #[test]
+    fn a_shared_final_segment_is_not_resolved_arbitrarily() {
+        assert_eq!(aligned("svc.read", &["fs.read", "net.read"]), "svc.read");
+        // An exact offer still wins and is never rewritten to the other.
+        assert_eq!(aligned("net.read", &["fs.read", "net.read"]), "net.read");
+    }
+
+    // The whole path a real turn travels: an ATEM tool call the model spelled
+    // with a namespace it was never offered is parsed and then resolved to the
+    // offered tool, so the client dispatches it instead of rejecting `glob.glob`.
+    #[test]
+    fn a_namespaced_atem_call_dispatches_through_the_full_parse_path() {
+        let output = "to=functions.glob<|message|>\
+             <atem:invoke name=\"glob.glob\">\
+             <atem:parameter name=\"pattern\">*.rs</atem:parameter>\
+             </atem:invoke>"
+            .to_string();
+        let parsed =
+            parse_assistant_output(output, "stop").aligned_to(&request_offering(&["glob", "read"]));
+        let calls = parsed.tool_calls.expect("an ATEM invoke is a tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].function.name, "glob",
+            "the namespaced call is dispatched to the offered flat tool"
         );
     }
 }
