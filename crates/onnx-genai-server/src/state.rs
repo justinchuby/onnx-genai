@@ -24,7 +24,7 @@ use crate::{
     session::SessionRegistry,
 };
 
-const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
+pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
 const DEFAULT_MAX_SESSIONS: usize = 256;
 const DEFAULT_MAX_QUEUE_DEPTH: usize = 256;
 const DEFAULT_MAX_BATCH: usize = 4;
