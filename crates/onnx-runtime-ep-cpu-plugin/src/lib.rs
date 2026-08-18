@@ -234,6 +234,23 @@ pub extern "C" fn nxrt_ep_reset_compiled_node_count() {
     onnx_runtime_ep_plugin::ep::reset_compiled_node_count()
 }
 
+/// Number of node kernels this EP has **executed** since the last reset.
+///
+/// The compiled-node counter above says ORT assigned us the node; this one says
+/// our kernel is what ran when the session was executed. The no-defer rule
+/// needs both: assignment without execution is not ownership, and an output
+/// that matches ORT proves nothing about which EP produced it.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_executed_node_count() -> usize {
+    onnx_runtime_ep_plugin::compute::executed_node_count()
+}
+
+/// Resets the executed-node counter to zero.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_reset_executed_node_count() {
+    onnx_runtime_ep_plugin::compute::reset_executed_node_count()
+}
+
 // ─── Build identity ─────────────────────────────────────────────────────────
 
 /// The optional build features compiled into this cdylib, as a NUL-terminated

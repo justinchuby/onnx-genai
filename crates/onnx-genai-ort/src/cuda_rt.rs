@@ -63,21 +63,15 @@ unsafe impl Sync for CudaRt {}
 
 static CUDART: OnceLock<std::result::Result<CudaRt, String>> = OnceLock::new();
 
-/// Candidate `cudart` library names, most specific first. Windows ships
-/// versioned DLLs (`cudart64_12.dll` for CUDA 12.x, older `cudart64_120.dll`),
-/// while the bare name lets the platform loader resolve `libcudart.so` on Linux
-/// or a name already on the search path.
-const CUDART_CANDIDATES: &[&str] = &[
-    "cudart64_12.dll",
-    "cudart64_120.dll",
-    "cudart",
-    "libcudart.so.12",
-    "libcudart.so",
-];
-
 fn load() -> std::result::Result<CudaRt, String> {
     let mut last_err = String::from("no candidate library names were tried");
-    for name in CUDART_CANDIDATES {
+    // Canonical `cudart` candidate names for this host, shared with the CUDA
+    // EP's own loader via `onnx-genai-cuda-version-guard` so the two can never
+    // drift (see issue #1180). Previously each crate kept its own list; when
+    // they disagreed the failure surfaced as the *last* candidate tried (e.g. a
+    // Linux `.so` name failing on Windows), reading like "this machine has no
+    // CUDA" rather than "this list is stale".
+    for name in onnx_genai_cuda_version_guard::cudart_candidates() {
         // SAFETY: loading a shared library can run initializers; `cudart` is a
         // trusted NVIDIA runtime that the CUDA EP already loads in-process.
         let lib = match unsafe { Library::new(name) } {

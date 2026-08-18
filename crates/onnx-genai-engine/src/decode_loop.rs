@@ -6,8 +6,8 @@ use crate::config::{
 };
 use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
 use crate::processors::{
-    ensure_constrained_finish, finish_reason_after_token, is_device_portable_chain,
-    select_next_token, select_next_token_with_rng, select_next_token_with_sampler,
+    ensure_constrained_finish, finish_reason_after_token, select_next_token,
+    select_next_token_with_rng, select_next_token_with_sampler,
 };
 use crate::sampling::{Sampler, SamplingRng};
 use onnx_genai_ort::Tokenizer;
@@ -166,22 +166,18 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
         .map(Some);
     }
 
-    // A custom sampler replaces the default greedy/categorical selection, so the
-    // device fast paths must be bypassed to give the sampler processed logits.
-    let greedy_fastpath = chain.is_empty()
-        && options.top_logprobs.is_none()
-        && (options.greedy || options.temperature == 0.0)
-        && state.custom_sampler.is_none()
-        && backend.greedy_fastpath_supported();
-    // Keep greedy behavior on its existing argmax path. The sampled path is only
-    // for categorical decoding whose processor chain the device sampler supports.
-    let sampled_fastpath = !greedy_fastpath
-        && !options.greedy
-        && options.temperature != 0.0
-        && options.top_logprobs.is_none()
-        && state.custom_sampler.is_none()
-        && is_device_portable_chain(chain)
-        && backend.sampled_fastpath_supported();
+    // The device-sampling verdict for this request. Lifting it into
+    // `device_sampling_plan` keeps this loop and the continuous-batch per-row
+    // router reading one predicate instead of two drifting inline copies.
+    let plan = crate::processors::device_sampling_plan(
+        chain,
+        options,
+        state.custom_sampler.is_some(),
+        backend.greedy_fastpath_supported(),
+        backend.sampled_fastpath_supported(),
+    );
+    let greedy_fastpath = matches!(plan, crate::processors::DeviceSamplingPlan::Greedy);
+    let sampled_fastpath = matches!(plan, crate::processors::DeviceSamplingPlan::Sampled);
 
     let sampled_params = sampled_fastpath.then(|| onnx_genai_ort::DeviceSampleParams {
         temperature: options.temperature,

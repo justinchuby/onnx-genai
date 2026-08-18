@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use super::check_arity;
 use super::gelu::tanh_gelu;
 #[cfg(not(feature = "mlas"))]
-use super::matmul::gemm;
+use super::matmul::gemm_bt;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -577,17 +577,10 @@ fn grouped_linear(
     #[cfg(not(feature = "mlas"))]
     {
         for group in &plan.groups {
-            let mut weights_kn = vec![0.0f32; expert_stride];
             let expert = &weights[group.expert * expert_stride..(group.expert + 1) * expert_stride];
-            for output_feature in 0..out_features {
-                for input_feature in 0..in_features {
-                    weights_kn[input_feature * out_features + output_feature] =
-                        expert[output_feature * in_features + input_feature];
-                }
-            }
-            gemm(
+            gemm_bt(
                 &input[group.start * in_features..(group.start + group.len) * in_features],
-                &weights_kn,
+                expert,
                 &mut output[group.start * out_features..(group.start + group.len) * out_features],
                 group.len,
                 in_features,
@@ -1084,11 +1077,12 @@ pub(super) fn run_expert_grouped(
 /// `output[rows, out_features] = input[rows, in_features] * weightsᵀ (+ bias)`.
 ///
 /// Expert weights arrive as `[out_features, in_features]`, i.e. already
-/// transposed relative to what a plain `A*B` GEMM wants. MLAS takes `transB`
-/// directly, so the fast path hands it the weights as they are. The portable
-/// path still has to materialize `[in_features, out_features]`, which for a
-/// Mixtral-sized expert is a 29 MiB strided scatter per call - the single
-/// largest term in the whole operator before this.
+/// transposed relative to what a plain `A*B` GEMM wants. Both arms consume that
+/// native `[n][k]` layout directly: MLAS via its `transB` flag, and the portable
+/// path via [`gemm_bt`], whose dot-product inner loop is *contiguous along `k`*
+/// for both operands. Neither materializes the `[in_features, out_features]`
+/// copy the old portable path built - a 29 MiB strided scatter per call for a
+/// Mixtral-sized expert, previously the single largest term in the operator.
 fn linear_grouped(
     input: &[f32],
     rows: usize,
@@ -1120,16 +1114,9 @@ fn linear_grouped(
     }
     #[cfg(not(feature = "mlas"))]
     {
-        let mut weights_kn = vec![0.0f32; weights_nk.len()];
-        for output_feature in 0..out_features {
-            for input_feature in 0..in_features {
-                weights_kn[input_feature * out_features + output_feature] =
-                    weights_nk[output_feature * in_features + input_feature];
-            }
-        }
-        gemm(
+        gemm_bt(
             input,
-            &weights_kn,
+            weights_nk,
             &mut output,
             rows,
             in_features,
@@ -2572,5 +2559,48 @@ mod tests {
         let weights_nk = ramp(4 * 3, 13, 0.2, 0.05);
         let got = linear_grouped(&[], 0, &weights_nk, None, 4, 3).unwrap();
         assert!(got.is_empty());
+    }
+
+    /// Pin the grouped driver's linear stage - the decode-critical path that
+    /// now feeds expert weights straight into `gemm_bt` in their native
+    /// `[out][in]` layout - against a hand-rolled transposed multiply computed
+    /// the old way (dot each slot's input with the expert's `[out][in]` rows).
+    /// This runs for both the MLAS and non-MLAS arms.
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn grouped_linear_matches_a_hand_rolled_transposed_gemm() {
+        const EXPERTS: usize = 3;
+        const IN: usize = 10;
+        const OUT: usize = 7;
+        const ROWS: usize = 6;
+        // k = 1 routing in a mixed pattern so the three experts interleave.
+        let mut router = vec![0.0f32; ROWS * EXPERTS];
+        for row in 0..ROWS {
+            router[row * EXPERTS + (row % EXPERTS)] = 5.0;
+        }
+        let plan = RoutingPlan::build(&router, ROWS, EXPERTS, 1, true);
+        let slots = plan.slots();
+        let input = ramp(slots * IN, 31, 0.3, 0.05);
+        // Expert weights in ORT canonical `[experts][out][in]` layout.
+        let weights = ramp(EXPERTS * OUT * IN, 29, 0.2, 0.04);
+
+        let mut output = vec![0.0f32; slots * OUT];
+        grouped_linear(&input, &plan, &weights, OUT, IN, &mut output).unwrap();
+
+        let stride = OUT * IN;
+        let mut want = vec![0.0f32; slots * OUT];
+        for group in &plan.groups {
+            let expert = &weights[group.expert * stride..(group.expert + 1) * stride];
+            for slot in group.start..group.start + group.len {
+                for o in 0..OUT {
+                    let mut acc = 0.0f32;
+                    for i in 0..IN {
+                        acc += input[slot * IN + i] * expert[o * IN + i];
+                    }
+                    want[slot * OUT + o] = acc;
+                }
+            }
+        }
+        assert_close(&output, &want);
     }
 }

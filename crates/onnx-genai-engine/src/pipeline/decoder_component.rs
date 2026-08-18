@@ -85,6 +85,18 @@ pub(crate) trait PipelineDecoderComponent {
     /// Number of always-retained sink tokens under a sliding window.
     fn sink_tokens(&self) -> usize;
 
+    /// Current KV prefix length retained by this decoder, when the backend owns
+    /// a rewindable session-resident cache.
+    fn current_kv_len(&self) -> Option<usize> {
+        None
+    }
+
+    /// Rewind a session-resident KV cache to `target_len`. Returns `false` for
+    /// backends that cannot retain their decoder object across requests.
+    fn rewind_kv(&mut self, _target_len: usize) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Whether this decoder can mirror its present KV into the paged cache and be
     /// re-seeded from a materialized paged prefix, so the pipeline may drive it
     /// on the paged (cross-request KV reuse) path rather than the fresh-decode
@@ -420,6 +432,15 @@ impl PipelineDecoderComponent for NativePipelineDecoder {
 
     fn sink_tokens(&self) -> usize {
         0
+    }
+
+    fn current_kv_len(&self) -> Option<usize> {
+        Some(self.session.current_len())
+    }
+
+    fn rewind_kv(&mut self, target_len: usize) -> anyhow::Result<bool> {
+        self.session.rewind(target_len)?;
+        Ok(true)
     }
 
     fn supports_paged_kv(&self) -> bool {

@@ -174,6 +174,10 @@ unsafe extern "C" {
     /// Row-wise softmax over `n` rows of `d` contiguous f32s, single-threaded,
     /// using MLAS's SIMD max reduction and polynomial exp.
     fn mlas_compute_softmax_in_place(data: *mut f32, n: usize, d: usize);
+    /// Out-of-place row-wise softmax: read `input`, write `output`. Bit-identical
+    /// to a `copy(input -> output)` followed by [`mlas_compute_softmax_in_place`],
+    /// but without the copy. `input` and `output` must not overlap.
+    fn mlas_compute_softmax(input: *const f32, output: *mut f32, n: usize, d: usize);
     fn mlas_eltwise_add(left: *const f32, right: *const f32, output: *mut f32, n: usize);
     fn mlas_compute_activation(
         kind: c_int,
@@ -853,6 +857,32 @@ pub fn compute_softmax_in_place(data: &mut [f32], n: usize, d: usize) {
     unsafe { mlas_compute_softmax_in_place(data.as_mut_ptr(), n, d) };
 }
 
+/// Out-of-place row-wise softmax: `input` and `output` are both `n * d`
+/// contiguous f32s and must not overlap. Bit-identical to copying `input` into
+/// `output` and calling [`compute_softmax_in_place`], without the copy.
+///
+/// Single threaded; callers shard across threads themselves.
+pub fn compute_softmax(input: &[f32], output: &mut [f32], n: usize, d: usize) {
+    let len = n.saturating_mul(d);
+    assert_eq!(
+        input.len(),
+        len,
+        "compute_softmax expects n*d input elements"
+    );
+    assert_eq!(
+        output.len(),
+        len,
+        "compute_softmax expects n*d output elements"
+    );
+    if input.is_empty() {
+        return;
+    }
+    // SAFETY: `input` and `output` each hold `n * d` contiguous f32s (asserted
+    // above); `&[f32]`/`&mut [f32]` cannot alias, so the disjointness MLAS
+    // requires for the out-of-place form is guaranteed by the borrow checker.
+    unsafe { mlas_compute_softmax(input.as_ptr(), output.as_mut_ptr(), n, d) };
+}
+
 /// Compute contiguous Float32 elementwise addition with MLAS SIMD.
 pub fn eltwise_add(left: &[f32], right: &[f32], output: &mut [f32]) {
     assert_eq!(left.len(), right.len());
@@ -1450,8 +1480,10 @@ impl QgemmPackedB {
 
 impl Drop for QgemmPackedB {
     fn drop(&mut self) {
-        QGEMM_PACKED_LIVE_BYTES
-            .fetch_sub(self.owned_heap_bytes(), std::sync::atomic::Ordering::Relaxed);
+        QGEMM_PACKED_LIVE_BYTES.fetch_sub(
+            self.owned_heap_bytes(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // SAFETY: `ptr`/`layout` are the pair returned by `alloc_zeroed` in
         // `new` and this runs at most once.
         unsafe { std::alloc::dealloc(self.ptr, self.layout) };

@@ -303,13 +303,35 @@ impl Executor {
             None => (vid, TensorLayout::contiguous(), 0),
         };
         if !self.shared_buffers.contains_key(&root) {
-            let buffer = self
+            // A borrowed buffer aliases the caller's input tensor and is only
+            // valid for the current run (`prepare_run_buffers`). Sequence
+            // storage outlives the run - it is reinstated by
+            // `restore_shared_buffers` on the *next* one - so promoting the
+            // alias would leave a handle to freed caller memory. Copy the bytes
+            // into a fresh owned allocation instead; the alias itself stays
+            // installed and is unbound normally at the end of the run.
+            let buffer = if self
                 .buffers
-                .remove(&root)
-                .ok_or_else(|| SessionError::SequenceOp {
-                    op: "Sequence".to_string(),
-                    reason: format!("tensor value#{} has no live backing buffer", vid.0),
-                })?;
+                .get(&root)
+                .is_some_and(onnx_runtime_ep_api::DeviceBuffer::is_borrowed)
+            {
+                let borrowed = &self.buffers[&root];
+                let len = borrowed.len();
+                let mut owned = self.ep.allocate(len.max(1), borrowed.alignment())?;
+                // SAFETY: only host-accessible buffers are ever borrowed, so
+                // the alias addresses `len` initialized, readable host bytes.
+                let src =
+                    unsafe { std::slice::from_raw_parts(borrowed.as_ptr().cast::<u8>(), len) };
+                self.ep.copy_from_host(src, &mut owned)?;
+                owned
+            } else {
+                self.buffers
+                    .remove(&root)
+                    .ok_or_else(|| SessionError::SequenceOp {
+                        op: "Sequence".to_string(),
+                        reason: format!("tensor value#{} has no live backing buffer", vid.0),
+                    })?
+            };
             let storage = SharedTensorBuffer::new(Arc::clone(&self.ep), buffer);
             self.buffers.insert(root, storage.alias());
             self.shared_buffers.insert(root, storage);

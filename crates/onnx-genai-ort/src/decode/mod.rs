@@ -177,6 +177,38 @@ pub enum BatchStepLogits {
     ///
     /// [`take_row`]: BatchStepLogits::take_row
     HostRows(Vec<Option<Vec<f32>>>),
+    /// Logits that are still resident in device memory for this step. Instead of
+    /// eagerly copying the whole `[B, vocab]` batch to the host, the manager
+    /// routes each row through [`DeviceRowLogits`]: device-portable rows are
+    /// sampled entirely on the device (only a 4-byte token id crosses the bus)
+    /// and only the rows that genuinely need the full vocabulary — history
+    /// dependent processors, logprobs — are copied to the host on demand. This
+    /// is the seam that lets a mixed batch pay `(host-required rows) x vocab x 4`
+    /// bytes instead of `(all rows) x vocab x 4`.
+    Device(Box<dyn DeviceRowLogits>),
+}
+
+/// One decode step's logits, still resident in device memory, exposing per-row
+/// device selection.
+///
+/// A continuous-batch manager consults this to route each row independently:
+/// [`Self::sample_row`] selects a token entirely on the device (copying back
+/// only the 4-byte token id) for device-portable rows, while
+/// [`Self::copy_row_to_host`] copies one row's full `[vocab]` logits to the host
+/// for the rows that need host-side processors or logprobs. This mirrors the
+/// single-row [`crate::device_sampler::DeviceSampler`] shape already used by the
+/// captured-decode fast path, lifted to the batched seam.
+pub trait DeviceRowLogits: Send {
+    /// Number of rows carried by this step's buffer.
+    fn rows(&self) -> usize;
+    /// Vocabulary length of each row.
+    fn vocab(&self) -> usize;
+    /// Select one token id for `row` entirely on the device, applying `params`.
+    /// Only the 4-byte token id is copied back to the host.
+    fn sample_row(&mut self, row: usize, params: &DeviceSampleParams) -> Result<u32>;
+    /// Copy `row`'s full `[vocab]` logits to the host. Paid only for rows that
+    /// need the whole vocabulary host-side.
+    fn copy_row_to_host(&mut self, row: usize) -> Result<Vec<f32>>;
 }
 
 impl BatchStepLogits {
@@ -201,6 +233,7 @@ impl BatchStepLogits {
                     ))
                 })
             }
+            BatchStepLogits::Device(device) => device.copy_row_to_host(row),
         }
     }
 }
@@ -261,12 +294,21 @@ pub trait BatchedDecodeSession<'a> {
 /// backend that round-trips logits to the host each step.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LogitsD2hStats {
-    /// Total bytes transferred device→host across all steps.
+    /// Total bytes transferred device→host for full per-row vocabularies. On the
+    /// native host-logits seam this is every row every step; under the batched
+    /// per-row router it is only the rows that needed the whole vocabulary
+    /// (`host-required rows x vocab x 4`).
     pub bytes: u128,
     /// Total wall time of those transfers.
     pub time: std::time::Duration,
     /// Number of steps that performed a logits read.
     pub steps: u64,
+    /// Rows whose full vocabulary was copied to the host (the expensive D2H).
+    pub rows_host_copied: u64,
+    /// Rows selected entirely on the device, copying back only the token id.
+    pub rows_device_sampled: u64,
+    /// Bytes transferred device→host for device-sampled token ids (4 per row).
+    pub token_id_bytes: u128,
 }
 
 mod shared_batch;

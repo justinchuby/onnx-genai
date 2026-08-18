@@ -6,8 +6,28 @@ on:
   push:
     branches:
       - main
+    # Not a required check. paths-ignore only applies to push/pull_request,
+    # so schedule and workflow_dispatch runs below are unaffected.
+    paths-ignore:
+      - "docs/**"
+      - "wiki/**"
+      - "site/**"
+      - "**/*.md"
+      - "**/*.mdx"
+      - "**/*.markdown"
+      - "LICENSE"
+      - "NOTICE"
   pull_request:
     types: [opened, synchronize, reopened]
+    paths-ignore:
+      - "docs/**"
+      - "wiki/**"
+      - "site/**"
+      - "**/*.md"
+      - "**/*.mdx"
+      - "**/*.markdown"
+      - "LICENSE"
+      - "NOTICE"
   workflow_dispatch:
 
 concurrency:

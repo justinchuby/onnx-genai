@@ -30,6 +30,9 @@ const LINEAR_BF16_ENTRY: &str = "qmoe_linear_bf16";
 const GATE_UP_ACTIVATE_F32_ENTRY: &str = "qmoe_gate_up_activate_f32";
 const GATE_UP_ACTIVATE_F16_ENTRY: &str = "qmoe_gate_up_activate_f16";
 const GATE_UP_ACTIVATE_BF16_ENTRY: &str = "qmoe_gate_up_activate_bf16";
+const GATE_UP_ACTIVATE_F32_OCC_ENTRY: &str = "qmoe_gate_up_activate_f32_occ";
+const GATE_UP_ACTIVATE_F16_OCC_ENTRY: &str = "qmoe_gate_up_activate_f16_occ";
+const GATE_UP_ACTIVATE_BF16_OCC_ENTRY: &str = "qmoe_gate_up_activate_bf16_occ";
 const COMBINE_F32_ENTRY: &str = "qmoe_combine_f32";
 const COMBINE_F16_ENTRY: &str = "qmoe_combine_f16";
 const COMBINE_BF16_ENTRY: &str = "qmoe_combine_bf16";
@@ -244,7 +247,7 @@ template <typename Input>
 __device__ __forceinline__ float qmoe_load(
     const Input* input, unsigned long long index);
 
-template <typename Input, int BlockSize, bool HasZeroPoints>
+template <typename Input, int BlockSize, bool HasZeroPoints, bool ReadOnly = false>
 __device__ __forceinline__ float qmoe_int4_chunk(
     const Input* input,
     const unsigned char* packed,
@@ -259,17 +262,25 @@ __device__ __forceinline__ float qmoe_int4_chunk(
 {
     // Int4 rows are multiples of eight packed bytes because block sizes are
     // powers of two >= 16, and chunk depths advance by eight values.
-    const unsigned int packed_values =
-        *reinterpret_cast<const unsigned int*>(
-            packed + expert_row * packed_in + depth / 2);
+    // When `ReadOnly`, the packed weights, scales, and zero points are routed
+    // through the read-only data cache (`__ldg`): bit-for-bit identical to a
+    // plain load -- same bytes, same decode -- but it cuts the int4 weight-load
+    // latency the fused gate/up GEMV is Long-Scoreboard bound on. Only the
+    // fused gate/up path opts in; the fc2 `qmoe_linear` path measured a
+    // regression under `__ldg`, so it keeps the default cached load.
+    const unsigned int* packed_ptr =
+        reinterpret_cast<const unsigned int*>(packed + expert_row * packed_in + depth / 2);
+    const unsigned int packed_values = ReadOnly ? __ldg(packed_ptr) : *packed_ptr;
     const int block = depth / BlockSize;
     int zero_point = 8;
     if (HasZeroPoints) {
-        const unsigned char packed_zero =
-            zero_points[expert_row * zero_point_bytes + block / 2];
+        const unsigned char* zero_ptr =
+            &zero_points[expert_row * zero_point_bytes + block / 2];
+        const unsigned char packed_zero = ReadOnly ? __ldg(zero_ptr) : *zero_ptr;
         zero_point = (packed_zero >> ((block & 1) * 4)) & 15;
     }
-    const float scale = scales[expert_row * blocks + block];
+    const float* scale_ptr = &scales[expert_row * blocks + block];
+    const float scale = ReadOnly ? __ldg(scale_ptr) : *scale_ptr;
     float value = 0.0f;
 #pragma unroll
     for (int offset = 0; offset < 8; ++offset) {
@@ -593,11 +604,11 @@ __device__ void qmoe_gate_up_activate_impl(
         for (int chunk = (int)threadIdx.x;
              chunk < chunks;
              chunk += (int)blockDim.x) {
-            gate += qmoe_int4_chunk<Input, BlockSize, HasZeroPoints>(
+            gate += qmoe_int4_chunk<Input, BlockSize, HasZeroPoints, true>(
                 input, fc1_packed, fc1_scales, fc1_zero_points, input_base,
                 gate_expert_row, chunk * 8, fc1_packed_in, fc1_blocks,
                 fc1_zero_point_bytes);
-            linear += qmoe_int4_chunk<Input, BlockSize, HasZeroPoints>(
+            linear += qmoe_int4_chunk<Input, BlockSize, HasZeroPoints, true>(
                 input, fc3_present ? fc3_packed : fc1_packed,
                 fc3_present ? fc3_scales : fc1_scales,
                 fc3_present ? fc3_zero_points : fc1_zero_points, input_base,
@@ -757,6 +768,69 @@ extern "C" __global__ void qmoe_gate_up_activate_bf16(
 }
 #endif
 
+// Occupancy-raised (`ONNX_GENAI_QMOE_OCC`) siblings of the fused gate/up expert
+// GEMV. `__launch_bounds__(256, QMOE_OCC_BLOCKS)` caps the register footprint so
+// more resident blocks fit per SM. Re-measured on the DeepSeek-V2-Lite-shaped
+// decode (64 experts, top-6, int4 block-16, f32 activations) on H200: the
+// default entry is 54 reg/thread -> 4 blocks/SM = 50% theoretical, 43.3%
+// achieved, DRAM only 9.1%, Long-Scoreboard bound on the int4 weight loads.
+// `(256, 6)` caps 54->40 reg/thread (spill-free, ncu local ld/st = 0) -> 6
+// blocks/SM, 75% theoretical / 63.8% achieved, kernel duration 42.3->37.8 us
+// (-10.6%). `(256, 8)` reaches 32 reg/100% theoretical but spills 1.22 MB and
+// regresses to 43.5 us -- the register-granularity trap -- so 6 is shipped.
+// Byte-identical to the default entry: `__launch_bounds__` only constrains
+// register allocation, so the accumulate order, both `block_sum` reductions,
+// and the SwiGLU are unchanged.
+#ifndef QMOE_OCC_BLOCKS
+#define QMOE_OCC_BLOCKS 6
+#endif
+
+#define QMOE_GATE_UP_OCC_ENTRY(NAME, TYPE)                                     \
+extern "C" __global__ void __launch_bounds__(256, QMOE_OCC_BLOCKS) NAME(       \
+    const TYPE* input,                                                         \
+    const int* selected_experts,                                              \
+    const unsigned char* fc1_packed,                                          \
+    const float* fc1_scales,                                                  \
+    const unsigned char* fc1_zero_points,                                     \
+    const float* fc1_bias,                                                    \
+    const unsigned char* fc3_packed,                                          \
+    const float* fc3_scales,                                                  \
+    const unsigned char* fc3_zero_points,                                     \
+    const float* fc3_bias,                                                    \
+    float* activated,                                                         \
+    const unsigned long long routes,                                          \
+    const int top_k,                                                          \
+    const int inter,                                                          \
+    const int fc1_out_features,                                               \
+    const int fc3_present,                                                    \
+    const int swiglu_fusion,                                                  \
+    const int in_features,                                                    \
+    const int fc1_packed_in,                                                  \
+    const int fc1_blocks,                                                     \
+    const int fc1_zero_point_bytes,                                           \
+    const int fc3_packed_in,                                                  \
+    const int fc3_blocks,                                                     \
+    const int fc3_zero_point_bytes,                                           \
+    const float alpha,                                                        \
+    const float beta,                                                         \
+    const float swiglu_limit)                                                 \
+{                                                                             \
+    qmoe_gate_up_activate_impl<TYPE, QMOE_BITS, QMOE_BLOCK_SIZE,               \
+        QMOE_HAS_ZERO_POINTS != 0>(                                           \
+        input, selected_experts, fc1_packed, fc1_scales, fc1_zero_points,      \
+        fc1_bias, fc3_packed, fc3_scales, fc3_zero_points, fc3_bias, activated,\
+        routes, top_k, inter, fc1_out_features, fc3_present, swiglu_fusion,    \
+        in_features, fc1_packed_in, fc1_blocks, fc1_zero_point_bytes,          \
+        fc3_packed_in, fc3_blocks, fc3_zero_point_bytes, alpha, beta,          \
+        swiglu_limit);                                                        \
+}
+
+QMOE_GATE_UP_OCC_ENTRY(qmoe_gate_up_activate_f32_occ, float)
+#ifdef QMOE_HAS_HALF
+QMOE_GATE_UP_OCC_ENTRY(qmoe_gate_up_activate_f16_occ, __half)
+QMOE_GATE_UP_OCC_ENTRY(qmoe_gate_up_activate_bf16_occ, __nv_bfloat16)
+#endif
+
 template <typename Output>
 __device__ __forceinline__ void qmoe_store(
     Output* output, unsigned long long index, float value);
@@ -856,6 +930,27 @@ struct QuantLayout {
     bits: usize,
     block_size: usize,
     has_zero_points: bool,
+}
+
+/// Whether the fused QMoE gate/up SwiGLU expert GEMV takes the occupancy-raised
+/// `_occ` entry (`__launch_bounds__(256, 6)` -> register footprint capped so
+/// more blocks are resident per SM). Re-measured on a DeepSeek-V2-Lite-shaped
+/// decode (H200): the default entry is 54 reg/thread -> 4 blocks/SM (50%
+/// theoretical, 43.3% achieved), DRAM only 9.1%, Long-Scoreboard bound; the
+/// `(256, 6)` cap drops it to 40 reg/thread (spill-free) -> 6 blocks/SM (75%
+/// theoretical, 63.8% achieved), duration 42.3->37.8 us (-10.6%). The extra
+/// resident warps hide the int4 weight-load latency. Byte-identical to the
+/// default entry: `__launch_bounds__` only constrains register allocation, so
+/// the accumulate order, both `block_sum` reductions, and the SwiGLU are
+/// unchanged. Now DEFAULT-ON after the H200 E2E A/B confirmed a consistent
+/// V2-Lite decode gain (124.6 -> 126.6 tok/s) with the golden decode lock
+/// unchanged; set `ONNX_GENAI_QMOE_OCC=0` (or `false`/`off`) to force the
+/// unbounded entry for A/B or regression bisection.
+fn qmoe_gate_up_occ_enabled() -> bool {
+    !matches!(
+        std::env::var("ONNX_GENAI_QMOE_OCC").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
 }
 
 fn linear_module_source(layout: QuantLayout) -> (&'static str, &'static str) {
@@ -1030,6 +1125,14 @@ impl FloatDtype {
             Self::F32 => GATE_UP_ACTIVATE_F32_ENTRY,
             Self::F16 => GATE_UP_ACTIVATE_F16_ENTRY,
             Self::Bf16 => GATE_UP_ACTIVATE_BF16_ENTRY,
+        }
+    }
+
+    fn gate_up_activate_entry_occ(self) -> &'static str {
+        match self {
+            Self::F32 => GATE_UP_ACTIVATE_F32_OCC_ENTRY,
+            Self::F16 => GATE_UP_ACTIVATE_F16_OCC_ENTRY,
+            Self::Bf16 => GATE_UP_ACTIVATE_BF16_OCC_ENTRY,
         }
     }
 
@@ -2137,9 +2240,12 @@ impl QMoEKernel {
             has_zero_points: fc1.zero_points.is_some(),
         };
         let (module, source) = linear_module_source(layout);
-        let function =
-            self.runtime
-                .nvrtc_function(module, source, dtype.gate_up_activate_entry())?;
+        let entry = if qmoe_gate_up_occ_enabled() {
+            dtype.gate_up_activate_entry_occ()
+        } else {
+            dtype.gate_up_activate_entry()
+        };
+        let function = self.runtime.nvrtc_function(module, source, entry)?;
         let tasks = checked_product(&[routes, inter], "fused gate/up activation task count")?;
         let grid_x = self.linear_reduction_grid(tasks, routes)?;
         let config = self.runtime.reduction_launch_config(

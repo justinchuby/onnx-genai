@@ -11,6 +11,222 @@ use super::interactive::{Backend, GENERATING, INTERRUPT_REQUESTED, Interrupted, 
 use super::{live_turn, profile};
 use profile::RunProfile;
 
+#[derive(Debug, Clone)]
+pub(super) struct ResponseConfig {
+    initial_header: String,
+    content_header: String,
+    reasoning_header: String,
+    start_token: String,
+    message_token: String,
+    close_tokens: Vec<String>,
+    start_token_id: Option<u32>,
+    message_token_id: Option<u32>,
+    close_token_ids: Vec<(u32, String)>,
+}
+
+pub(super) fn load_response_config(model_dir: &Path, raw: bool) -> Option<ResponseConfig> {
+    if raw {
+        return None;
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(model_dir.join("tokenizer_config.json")).ok()?)
+            .ok()?;
+    let template = value.get("response_template")?;
+    let start_anchor = template.get("start_anchor")?.as_str()?;
+    let (start_token, initial_header) = split_leading_special_token(start_anchor)?;
+    let fields = template.get("fields")?;
+    let content_open = fields.get("content")?.get("open_pattern")?.as_str()?;
+    let reasoning_open = fields
+        .get("reasoning_content")?
+        .get("open_pattern")?
+        .as_str()?;
+    let (content_header, message_token) = split_open_pattern(content_open)?;
+    let (reasoning_header, reasoning_message_token) = split_open_pattern(reasoning_open)?;
+    if reasoning_message_token != message_token {
+        return None;
+    }
+    let mut close_tokens = Vec::new();
+    for field_name in ["content", "reasoning_content"] {
+        let close = fields.get(field_name)?.get("close")?;
+        match close {
+            serde_json::Value::String(token) => push_unique(&mut close_tokens, token),
+            serde_json::Value::Array(tokens) => {
+                for token in tokens {
+                    push_unique(&mut close_tokens, token.as_str()?);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(ResponseConfig {
+        initial_header,
+        content_header,
+        reasoning_header,
+        start_token,
+        message_token,
+        close_tokens,
+        start_token_id: None,
+        message_token_id: None,
+        close_token_ids: Vec::new(),
+    })
+}
+
+fn split_leading_special_token(value: &str) -> Option<(String, String)> {
+    let end = value.find("|>")? + 2;
+    Some((value[..end].to_string(), value[end..].to_string()))
+}
+
+fn split_open_pattern(pattern: &str) -> Option<(String, String)> {
+    let literal = pattern.replace("\\|", "|");
+    let marker_start = literal.rfind("<|")?;
+    let marker = &literal[marker_start..];
+    marker
+        .ends_with("|>")
+        .then(|| (literal[..marker_start].to_string(), marker.to_string()))
+}
+
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_string());
+    }
+}
+
+/// Bind the template's marker strings to token ids, withdrawing structured mode
+/// entirely when the tokenizer cannot represent the marker the parser depends on.
+///
+/// This is the only entry point: [`ResponseConfig::bind_token_ids`] is private to
+/// this module so a caller cannot bind without also applying the check.
+pub(super) fn bind_response_tokens(response: &mut Option<ResponseConfig>, backend: &Backend) {
+    let Some(config) = response.as_mut() else {
+        return;
+    };
+    config.bind_token_ids(backend);
+    if !config.is_parseable() {
+        *response = None;
+    }
+}
+
+impl ResponseConfig {
+    /// A template is only parseable once its message marker resolves to a token id.
+    ///
+    /// The parser starts in [`ResponseState::Header`] and leaves it solely on that
+    /// id, so an unbound marker traps every token in the header and excludes all of
+    /// them from the reply -- the caller receives an empty string with no error.
+    /// Falling back to raw output shows the markers as text, which is a poorer
+    /// presentation but an honest one; silence is neither.
+    fn is_parseable(&self) -> bool {
+        self.message_token_id.is_some()
+    }
+
+    fn bind_token_ids(&mut self, backend: &Backend) {
+        self.start_token_id = backend.single_token_id(&self.start_token);
+        self.message_token_id = backend.single_token_id(&self.message_token);
+        self.close_token_ids = self
+            .close_tokens
+            .iter()
+            .filter_map(|token| backend.single_token_id(token).map(|id| (id, token.clone())))
+            .collect();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseState {
+    Header,
+    Content,
+    Reasoning,
+    Other,
+}
+
+struct ResponseStream<'a> {
+    config: &'a ResponseConfig,
+    state: ResponseState,
+    header: String,
+}
+
+struct ResponseOutput {
+    text: String,
+    is_reasoning: bool,
+    include_in_reply: bool,
+}
+
+impl<'a> ResponseStream<'a> {
+    fn new(config: &'a ResponseConfig) -> Self {
+        Self {
+            config,
+            state: ResponseState::Header,
+            header: config.initial_header.clone(),
+        }
+    }
+
+    fn push(&mut self, token: &GenerateToken) -> ResponseOutput {
+        let empty = || ResponseOutput {
+            text: String::new(),
+            is_reasoning: false,
+            include_in_reply: false,
+        };
+        if self.config.start_token_id == Some(token.token_id) {
+            self.state = ResponseState::Header;
+            self.header.clear();
+            return ResponseOutput {
+                text: self.config.start_token.clone(),
+                is_reasoning: false,
+                include_in_reply: false,
+            };
+        }
+        if let Some((_, close_token)) = self
+            .config
+            .close_token_ids
+            .iter()
+            .find(|(id, _)| *id == token.token_id)
+        {
+            let was_reasoning = self.state == ResponseState::Reasoning;
+            self.state = ResponseState::Other;
+            return ResponseOutput {
+                text: format!("{close_token}\n"),
+                is_reasoning: was_reasoning,
+                include_in_reply: false,
+            };
+        }
+        if self.config.message_token_id == Some(token.token_id)
+            && self.state == ResponseState::Header
+        {
+            self.state = if self.header.ends_with(&self.config.content_header) {
+                ResponseState::Content
+            } else if self.header.ends_with(&self.config.reasoning_header) {
+                ResponseState::Reasoning
+            } else {
+                ResponseState::Other
+            };
+            return ResponseOutput {
+                text: format!("{}\n", self.config.message_token),
+                is_reasoning: self.state == ResponseState::Reasoning,
+                include_in_reply: false,
+            };
+        }
+        match self.state {
+            ResponseState::Header => {
+                self.header.push_str(&token.text);
+                ResponseOutput {
+                    text: token.text.clone(),
+                    is_reasoning: false,
+                    include_in_reply: false,
+                }
+            }
+            ResponseState::Content => ResponseOutput {
+                text: token.text.clone(),
+                is_reasoning: false,
+                include_in_reply: true,
+            },
+            ResponseState::Reasoning => ResponseOutput {
+                text: token.text.clone(),
+                is_reasoning: true,
+                include_in_reply: false,
+            },
+            ResponseState::Other => empty(),
+        }
+    }
+}
+
 /// The reasoning convention a loaded model declares.
 #[derive(Debug, Clone)]
 pub(super) struct ReasoningConfig {
@@ -258,10 +474,15 @@ pub(super) fn run_generation_turn(
     stream: bool,
     profile: Option<&mut RunProfile>,
     reasoning: Option<&ReasoningConfig>,
+    response: Option<&ResponseConfig>,
     live: Option<&mut live_turn::LiveTurn>,
 ) -> anyhow::Result<String> {
     INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
     GENERATING.store(true, Ordering::SeqCst);
+    // Guarantees the streaming flag is cleared and any diagnostics buffered
+    // while generating are flushed however this turn exits: the normal return
+    // below, a `?` early-return from the finalization writes, or a panic unwind.
+    let _flush_guard = crate::FlushGuard;
     backend.reset_reuse_stats();
 
     let prompt_tokens = turn.prompt_tokens;
@@ -289,9 +510,11 @@ pub(super) fn run_generation_turn(
     // Reasoning is dimmed as it streams so a reader can tell a model's thinking
     // from its answer. Only on a terminal: escape codes in a pipe would corrupt
     // the text a caller is parsing.
-    let dim_reasoning = stream && reasoning.is_some() && io::stdout().is_terminal();
+    let dim_reasoning =
+        stream && (reasoning.is_some() || response.is_some()) && io::stdout().is_terminal();
     let mut reasoning_stream = reasoning
         .map(|config| ReasoningStream::new(config.markers.clone(), config.opened_by_template));
+    let mut response_stream = response.map(ResponseStream::new);
     let mut dimmed = false;
     let mut live = live.filter(|live| stream && live.is_active());
     // Numbers move faster than a reader can follow, and every update costs a
@@ -305,10 +528,25 @@ pub(super) fn run_generation_turn(
         // Timed here, at the point the token reaches the caller, because that
         // is the latency a user actually experiences.
         timings.token();
-        let token_text = visible_token_text(&token, reasoning);
-        output.push_str(&token_text);
+        let response_output = response_stream.as_mut().map(|tracker| tracker.push(&token));
+        let token_text = if let Some(response_output) = response_output.as_ref() {
+            response_output.text.clone()
+        } else {
+            visible_token_text(&token, reasoning)
+        };
+        if response_output
+            .as_ref()
+            .is_none_or(|response_output| response_output.include_in_reply)
+        {
+            output.push_str(&token_text);
+        }
         if stream {
-            let segments = if let Some(tracker) = reasoning_stream.as_mut() {
+            let segments = if let Some(response_output) = response_output {
+                vec![ReasoningChunk {
+                    text: response_output.text,
+                    is_reasoning: response_output.is_reasoning,
+                }]
+            } else if let Some(tracker) = reasoning_stream.as_mut() {
                 tracker.push_segments(&token_text)
             } else {
                 vec![ReasoningChunk {
@@ -390,6 +628,7 @@ pub(super) fn run_generation_turn(
         }
     }
     GENERATING.store(false, Ordering::SeqCst);
+    crate::flush_deferred_tracing()?;
     timings.finish();
     let budget_cap = result.as_ref().ok().and_then(|result| result.budget_cap);
     if let Some(cap) = budget_cap {
@@ -432,6 +671,131 @@ pub(super) fn display_paths(paths: &[PathBuf]) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn an_unbound_message_token_traps_every_token_in_the_header_and_empties_the_reply() {
+        let config = ResponseConfig {
+            message_token_id: None,
+            ..atem_config()
+        };
+        let tokens = [(10, " to=user"), (23, ""), (13, "answer"), (8, "")];
+        let mut stream = ResponseStream::new(&config);
+        let reply = tokens
+            .into_iter()
+            .map(|(token_id, text)| {
+                stream.push(&GenerateToken {
+                    token_id,
+                    text: text.to_string(),
+                    finish_reason: None,
+                })
+            })
+            .filter(|output| output.include_in_reply)
+            .map(|output| output.text)
+            .collect::<String>();
+
+        assert_eq!(
+            reply, "",
+            "this is the hazard bind_response_tokens exists to prevent: with no \
+             message-token id the parser never leaves its header state, so a \
+             perfectly good generation is reported to the caller as an empty reply"
+        );
+        assert!(!config.is_parseable());
+    }
+
+    #[test]
+    fn structured_mode_is_withdrawn_when_the_message_token_does_not_resolve() {
+        assert!(
+            atem_config().is_parseable(),
+            "a fully bound template must stay in structured mode"
+        );
+        assert!(
+            !ResponseConfig {
+                message_token_id: None,
+                ..atem_config()
+            }
+            .is_parseable(),
+            "an unbound message marker must withdraw structured mode so the caller \
+             falls back to raw output rather than receiving silence"
+        );
+        assert!(
+            ResponseConfig {
+                start_token_id: None,
+                close_token_ids: Vec::new(),
+                ..atem_config()
+            }
+            .is_parseable(),
+            "only the message marker is load-bearing; withdrawing on the optional \
+             markers would drop structured mode for templates that parse fine"
+        );
+    }
+
+    fn atem_config() -> ResponseConfig {
+        ResponseConfig {
+            initial_header: "assistant".to_string(),
+            content_header: "to=user".to_string(),
+            reasoning_header: "to=self".to_string(),
+            start_token: "<|start|>".to_string(),
+            message_token: "<|message|>".to_string(),
+            close_tokens: vec!["<|eom|>".to_string(), "<|eot|>".to_string()],
+            start_token_id: Some(22),
+            message_token_id: Some(23),
+            close_token_ids: vec![(7, "<|eom|>".to_string()), (8, "<|eot|>".to_string())],
+        }
+    }
+
+    #[test]
+    fn response_stream_formats_atem_channels_and_keeps_only_answer_for_history() {
+        let config = ResponseConfig {
+            initial_header: "assistant".to_string(),
+            content_header: "to=user".to_string(),
+            reasoning_header: "to=self".to_string(),
+            start_token: "<|start|>".to_string(),
+            message_token: "<|message|>".to_string(),
+            close_tokens: vec!["<|eom|>".to_string(), "<|eot|>".to_string()],
+            start_token_id: Some(22),
+            message_token_id: Some(23),
+            close_token_ids: vec![(7, "<|eom|>".to_string()), (8, "<|eot|>".to_string())],
+        };
+        let tokens = [
+            (10, " to=self"),
+            (23, ""),
+            (11, "thinking"),
+            (7, ""),
+            (22, ""),
+            (12, "assistant to=user"),
+            (23, ""),
+            (13, "answer"),
+            (8, ""),
+        ];
+        let mut stream = ResponseStream::new(&config);
+        let outputs = tokens
+            .into_iter()
+            .map(|(token_id, text)| {
+                stream.push(&GenerateToken {
+                    token_id,
+                    text: text.to_string(),
+                    finish_reason: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        let displayed = outputs
+            .iter()
+            .map(|output| output.text.as_str())
+            .collect::<String>();
+        let reply = outputs
+            .iter()
+            .filter(|output| output.include_in_reply)
+            .map(|output| output.text.as_str())
+            .collect::<String>();
+
+        assert_eq!(
+            displayed,
+            " to=self<|message|>\nthinking<|eom|>\n\
+             <|start|>assistant to=user<|message|>\nanswer<|eot|>\n"
+        );
+        assert!(outputs[2].is_reasoning);
+        assert_eq!(reply, "answer");
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::current_dir().unwrap().join(format!(

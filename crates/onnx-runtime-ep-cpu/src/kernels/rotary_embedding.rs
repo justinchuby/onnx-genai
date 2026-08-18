@@ -37,12 +37,209 @@ use super::{check_arity, to_dense_i64};
 use crate::dtype::{
     output_direct_write_eligible, slice_byte_range, to_dense_f32_widen, write_dense_f32_narrow,
 };
+use crate::task_runtime;
 
 /// Elements below which the rotation stays on one thread. RoPE is two multiplies
 /// and an add per element - firmly memory bound - so the crossover is set by the
 /// pool wake-up cost, not by arithmetic. A single llama3 decode step (32 heads x
 /// 128 dims = 4096 elements) stays serial; a 128-token prefill does not.
 const MIN_PARALLEL_ROTARY_ELEMENTS: usize = 64 * 1024;
+
+/// Smallest output run, in f32 elements, worth handing to its own Rayon task.
+///
+/// RoPE moves 8 bytes per element (one read, one write) for three flops, so a
+/// task's runtime is set by bandwidth: 16 Ki elements is 128 KiB of traffic,
+/// roughly 2 us on one core here. Rayon's split-and-join costs ~0.5 us per
+/// task, so this keeps scheduling under ~25% of the work even in the worst
+/// case, while still leaving enough tasks to balance across the pool.
+///
+/// Chunking per `(b, h)` plane or per `(b, s)` row - the natural layout unit -
+/// was measured at one task per 4096 elements, which made the parallel path
+/// *slower* than serial at every thread count (t=1 162 us vs 126 us, t=16
+/// 195 us vs 127 us on `rope_llama3_s128`). Tasks must aggregate whole units
+/// until they clear this bar.
+const MIN_ROTARY_TASK_ELEMENTS: usize = 16 * 1024;
+
+/// The fewest layout units (`[B,H,S,D]` planes or `[B,S,H*D]` rows) of
+/// `unit_elems` each that are worth handing to another thread.
+///
+/// This is a *floor*, not a task size. The task runtime owns the balance
+/// question -- it knows the pool width, and its tasks are claimed dynamically
+/// rather than assigned up front, so a straggler strands one task instead of a
+/// whole static share. All this kernel has to say is how small a task may get
+/// before the fan-out costs more than the work, which is
+/// [`MIN_ROTARY_TASK_ELEMENTS`] worth of units.
+///
+/// Passing `total_units` back (the serial shape) is how the caller expresses
+/// "do not split this at all"; see [`MIN_PARALLEL_ROTARY_ELEMENTS`].
+fn rotary_min_units_per_task(unit_elems: usize) -> usize {
+    MIN_ROTARY_TASK_ELEMENTS.div_ceil(unit_elems.max(1)).max(1)
+}
+
+// ─── Rotation inner loops ───────────────────────────────────────────────────
+//
+// Both arms compute the same expression the ONNX reference does:
+//
+//     real = cos*x1 - sin*x2      imag = sin*x1 + cos*x2
+//
+// The AVX2 arms deliberately use separate `_mm256_mul_ps` + `_mm256_sub_ps` /
+// `_mm256_add_ps` rather than FMA. FMA would drop the intermediate rounding of
+// `cos*x1`, which makes the vector and scalar tails disagree in the last ulp on
+// the same tensor - a parity failure that is a nuisance to chase and buys
+// nothing here, because this kernel is bandwidth-bound (8 bytes moved per 3
+// flops), not issue-bound. Vectorising is worth ~1.8x; fusing the multiply is
+// not measurable.
+
+/// `interleaved=0` (GPT-NeoX): rotate the two contiguous halves of the rotary
+/// sub-vector against each other.
+#[inline]
+fn rotate_split_half(
+    lo_in: &[f32],
+    hi_in: &[f32],
+    lo_out: &mut [f32],
+    hi_out: &mut [f32],
+    cos_row: &[f32],
+    sin_row: &[f32],
+) {
+    let half = lo_out.len();
+    debug_assert_eq!(hi_out.len(), half);
+    debug_assert!(lo_in.len() >= half && hi_in.len() >= half);
+    debug_assert!(cos_row.len() >= half && sin_row.len() >= half);
+
+    let mut k = 0;
+    #[cfg(target_arch = "x86_64")]
+    if vector_rotation_available() {
+        // SAFETY: guarded by the runtime AVX2 probe (the arms use no FMA and
+        // no AVX-512); every slice is asserted at least `half` long and the
+        // loop reads 8 lanes at a time only while `k + 8 <= half`.
+        k = unsafe { avx2::split_half(lo_in, hi_in, lo_out, hi_out, cos_row, sin_row, half) };
+    }
+    while k < half {
+        let (cos, sin) = (cos_row[k], sin_row[k]);
+        let (x1, x2) = (lo_in[k], hi_in[k]);
+        lo_out[k] = cos * x1 - sin * x2;
+        hi_out[k] = sin * x1 + cos * x2;
+        k += 1;
+    }
+}
+
+/// `interleaved=1` (GPT-J): rotate adjacent even/odd channel pairs.
+#[inline]
+fn rotate_interleaved(src: &[f32], dst: &mut [f32], cos_row: &[f32], sin_row: &[f32]) {
+    let half = dst.len() / 2;
+    debug_assert!(src.len() >= 2 * half);
+    debug_assert!(cos_row.len() >= half && sin_row.len() >= half);
+
+    let mut k = 0;
+    #[cfg(target_arch = "x86_64")]
+    if vector_rotation_available() {
+        // SAFETY: guarded by the runtime AVX2 probe (the arms use no FMA and
+        // no AVX-512); the vector loop reads and writes `2 * 8` lanes only
+        // while `k + 8 <= half`, and `src`/`dst` are asserted at least
+        // `2 * half` long.
+        k = unsafe { avx2::interleaved(src, dst, cos_row, sin_row, half) };
+    }
+    while k < half {
+        let (cos, sin) = (cos_row[k], sin_row[k]);
+        let (x1, x2) = (src[2 * k], src[2 * k + 1]);
+        dst[2 * k] = cos * x1 - sin * x2;
+        dst[2 * k + 1] = sin * x1 + cos * x2;
+        k += 1;
+    }
+}
+
+/// Whether the AVX2 rotation arms are live on this machine.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[inline]
+fn vector_rotation_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use std::arch::x86_64::*;
+
+    /// Eight split-half pairs per iteration. Returns the number of `k` values
+    /// consumed, leaving the tail to the scalar loop.
+    ///
+    /// # Safety
+    /// Caller must have verified AVX2 support and that every slice holds at
+    /// least `half` elements.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn split_half(
+        lo_in: &[f32],
+        hi_in: &[f32],
+        lo_out: &mut [f32],
+        hi_out: &mut [f32],
+        cos_row: &[f32],
+        sin_row: &[f32],
+        half: usize,
+    ) -> usize {
+        unsafe {
+            let mut k = 0;
+            while k + 8 <= half {
+                let c = _mm256_loadu_ps(cos_row.as_ptr().add(k));
+                let s = _mm256_loadu_ps(sin_row.as_ptr().add(k));
+                let x1 = _mm256_loadu_ps(lo_in.as_ptr().add(k));
+                let x2 = _mm256_loadu_ps(hi_in.as_ptr().add(k));
+                let real = _mm256_sub_ps(_mm256_mul_ps(c, x1), _mm256_mul_ps(s, x2));
+                let imag = _mm256_add_ps(_mm256_mul_ps(s, x1), _mm256_mul_ps(c, x2));
+                _mm256_storeu_ps(lo_out.as_mut_ptr().add(k), real);
+                _mm256_storeu_ps(hi_out.as_mut_ptr().add(k), imag);
+                k += 8;
+            }
+            k
+        }
+    }
+
+    /// Eight interleaved pairs per iteration: de-interleave 16 lanes into
+    /// even/odd registers, rotate, re-interleave.
+    ///
+    /// # Safety
+    /// Caller must have verified AVX2 support and that `src`/`dst` hold at
+    /// least `2 * half` elements and `cos_row`/`sin_row` at least `half`.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn interleaved(
+        src: &[f32],
+        dst: &mut [f32],
+        cos_row: &[f32],
+        sin_row: &[f32],
+        half: usize,
+    ) -> usize {
+        unsafe {
+            // `_mm256_shuffle_ps` works within each 128-bit lane, so gathering
+            // the even (or odd) channels of 16 consecutive floats leaves them
+            // in the order [0,1,4,5,2,3,6,7]. That permutation is its own
+            // inverse, so the same index vector both straightens the operands
+            // and pre-scrambles the results for `unpack`.
+            let lanes = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
+            let mut k = 0;
+            while k + 8 <= half {
+                let a = _mm256_loadu_ps(src.as_ptr().add(2 * k));
+                let b = _mm256_loadu_ps(src.as_ptr().add(2 * k + 8));
+                let x1 = _mm256_permutevar8x32_ps(_mm256_shuffle_ps::<0b1000_1000>(a, b), lanes);
+                let x2 = _mm256_permutevar8x32_ps(_mm256_shuffle_ps::<0b1101_1101>(a, b), lanes);
+                let c = _mm256_loadu_ps(cos_row.as_ptr().add(k));
+                let s = _mm256_loadu_ps(sin_row.as_ptr().add(k));
+                let real = _mm256_sub_ps(_mm256_mul_ps(c, x1), _mm256_mul_ps(s, x2));
+                let imag = _mm256_add_ps(_mm256_mul_ps(s, x1), _mm256_mul_ps(c, x2));
+                let rp = _mm256_permutevar8x32_ps(real, lanes);
+                let ip = _mm256_permutevar8x32_ps(imag, lanes);
+                _mm256_storeu_ps(dst.as_mut_ptr().add(2 * k), _mm256_unpacklo_ps(rp, ip));
+                _mm256_storeu_ps(dst.as_mut_ptr().add(2 * k + 8), _mm256_unpackhi_ps(rp, ip));
+                k += 8;
+            }
+            k
+        }
+    }
+}
 
 /// Floating-point RotaryEmbedding kernel carrying the resolved attributes.
 pub struct RotaryEmbeddingKernel {
@@ -269,25 +466,20 @@ impl Kernel for RotaryEmbeddingKernel {
             let cos_row = &cos_cache[crow..crow + half];
             let sin_row = &sin_cache[crow..crow + half];
             if interleaved {
-                for k in 0..half {
-                    let (cos, sin) = (cos_row[k], sin_row[k]);
-                    let (x1, x2) = (src[2 * k], src[2 * k + 1]);
-                    dst[2 * k] = cos * x1 - sin * x2;
-                    dst[2 * k + 1] = sin * x1 + cos * x2;
-                }
+                rotate_interleaved(&src[..rotary_dim], &mut dst[..rotary_dim], cos_row, sin_row);
             } else {
                 // Split-half: the two operand runs and the two result runs are
                 // each contiguous, so this is four linear streams with no
                 // index arithmetic in the loop body.
                 let (lo_out, hi_out) = dst[..rotary_dim].split_at_mut(half);
-                let lo_in = &src[..half];
-                let hi_in = &src[half..rotary_dim];
-                for k in 0..half {
-                    let (cos, sin) = (cos_row[k], sin_row[k]);
-                    let (x1, x2) = (lo_in[k], hi_in[k]);
-                    lo_out[k] = cos * x1 - sin * x2;
-                    hi_out[k] = sin * x1 + cos * x2;
-                }
+                rotate_split_half(
+                    &src[..half],
+                    &src[half..rotary_dim],
+                    lo_out,
+                    hi_out,
+                    cos_row,
+                    sin_row,
+                );
             }
             // Pass-through channels beyond the rotary sub-vector.
             dst[rotary_dim..head_size].copy_from_slice(&src[rotary_dim..head_size]);
@@ -320,7 +512,9 @@ impl Kernel for RotaryEmbeddingKernel {
         // per-element layout branch the old flat-index closure carried, and
         // lets the outer loop fan out across the shared Rayon pool. ORT
         // parallelizes the same transform.
-        let parallel = y.len() >= MIN_PARALLEL_ROTARY_ELEMENTS;
+        // Below this the fan-out cannot pay for itself, and the runtime is told
+        // so by asking for one task's worth of units per task.
+        let splittable = y.len() >= MIN_PARALLEL_ROTARY_ELEMENTS;
         if is_4d {
             // [B, H, S, D]: plane (b, h) is `seq * head_size` contiguous.
             let plane = seq * head_size;
@@ -336,16 +530,13 @@ impl Kernel for RotaryEmbeddingKernel {
                     );
                 }
             };
-            if parallel {
-                use rayon::prelude::*;
-                y.par_chunks_mut(plane).enumerate().for_each(|(bh, out)| {
-                    fill(bh, out);
-                });
+            let units = (batch * heads).max(1);
+            let min_units = if splittable {
+                rotary_min_units_per_task(plane)
             } else {
-                for (bh, out) in y.chunks_mut(plane).enumerate() {
-                    fill(bh, out);
-                }
-            }
+                units
+            };
+            task_runtime::chunks_mut(y, plane, min_units, fill);
         } else {
             // [B, S, H·D]: row (b, s) is `heads * head_size` contiguous.
             let row_len = heads * head_size;
@@ -361,16 +552,13 @@ impl Kernel for RotaryEmbeddingKernel {
                     );
                 }
             };
-            if parallel {
-                use rayon::prelude::*;
-                y.par_chunks_mut(row_len).enumerate().for_each(|(bs, out)| {
-                    fill(bs, out);
-                });
+            let units = (batch * seq).max(1);
+            let min_units = if splittable {
+                rotary_min_units_per_task(row_len)
             } else {
-                for (bs, out) in y.chunks_mut(row_len).enumerate() {
-                    fill(bs, out);
-                }
-            }
+                units
+            };
+            task_runtime::chunks_mut(y, row_len, min_units, fill);
         }
 
         if direct {
@@ -906,6 +1094,13 @@ mod parallel_tests {
             (1, 128, 32, 128, 128),                   // prefill, parallel
             (2, 40, 6, 16, 8),                        // partial rotary, parallel-ish
             (3, 7, 5, 12, 12),                        // nothing divides evenly
+            // Parallel *and* indivisible: 130 rows over a 4-row task tiling
+            // leaves a 2-row final slab, so the `task * per_task + i` index
+            // arithmetic is checked against a short chunk rather than only the
+            // exact multiples the common shapes happen to produce.
+            (1, 130, 32, 128, 128),
+            // Same for the 4D plane path: 34 planes do not divide evenly.
+            (2, 66, 17, 64, 64),
         ] {
             let half = rotary_dim / 2;
             let n = batch * seq * heads * head_size;
@@ -1028,5 +1223,160 @@ mod parallel_tests {
 
             assert_eq!(shared, disjoint, "rotary_dim={rotary_dim}");
         }
+    }
+}
+
+#[cfg(test)]
+mod vector_arm_tests {
+    use super::*;
+
+    /// The AVX2 arms must agree with the scalar arms **bit for bit**, not just
+    /// to a tolerance: a run that splits a tensor differently across tasks (a
+    /// different thread count, a different chunk size) would otherwise produce
+    /// a different answer for the same graph, and the A/B parity check would
+    /// flip on scheduling alone. This is why the vector arms avoid FMA.
+    fn scalar_split_half(
+        lo_in: &[f32],
+        hi_in: &[f32],
+        cos_row: &[f32],
+        sin_row: &[f32],
+        half: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut lo = vec![0.0f32; half];
+        let mut hi = vec![0.0f32; half];
+        for k in 0..half {
+            let (c, s) = (cos_row[k], sin_row[k]);
+            let (x1, x2) = (lo_in[k], hi_in[k]);
+            lo[k] = c * x1 - s * x2;
+            hi[k] = s * x1 + c * x2;
+        }
+        (lo, hi)
+    }
+
+    fn scalar_interleaved(src: &[f32], cos_row: &[f32], sin_row: &[f32], half: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; 2 * half];
+        for k in 0..half {
+            let (c, s) = (cos_row[k], sin_row[k]);
+            let (x1, x2) = (src[2 * k], src[2 * k + 1]);
+            out[2 * k] = c * x1 - s * x2;
+            out[2 * k + 1] = s * x1 + c * x2;
+        }
+        out
+    }
+
+    fn ramp(n: usize, seed: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| ((i as f32) * 0.017 + seed).sin() * 3.0 - 0.5)
+            .collect()
+    }
+
+    #[test]
+    fn avx2_split_half_is_bit_identical_to_the_scalar_loop() {
+        // Sweep `half` so the scalar tail runs at *every* residue mod 8, not
+        // just the convenient ones: 1..9 covers 1-7 and 0, and the larger
+        // values re-check the residues after several full vector iterations.
+        for half in [
+            1usize, 2, 3, 4, 5, 6, 7, 8, 9, 13, 14, 15, 16, 20, 31, 32, 63, 64, 65, 127, 128,
+        ] {
+            let lo_in = ramp(half, 0.3);
+            let hi_in = ramp(half, 1.7);
+            let cos_row = ramp(half, 2.9);
+            let sin_row = ramp(half, 4.1);
+            let (want_lo, want_hi) = scalar_split_half(&lo_in, &hi_in, &cos_row, &sin_row, half);
+            let mut got_lo = vec![0.0f32; half];
+            let mut got_hi = vec![0.0f32; half];
+            rotate_split_half(&lo_in, &hi_in, &mut got_lo, &mut got_hi, &cos_row, &sin_row);
+            assert_eq!(
+                got_lo.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want_lo.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "split-half real part diverged at half={half}"
+            );
+            assert_eq!(
+                got_hi.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want_hi.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "split-half imag part diverged at half={half}"
+            );
+        }
+    }
+
+    #[test]
+    fn avx2_interleaved_is_bit_identical_to_the_scalar_loop() {
+        // The interleaved arm de-interleaves with a lane permutation that is
+        // its own inverse; a wrong index vector still produces plausible
+        // magnitudes, so this compares every element rather than a norm.
+        for half in [
+            1usize, 2, 3, 4, 5, 6, 7, 8, 9, 13, 14, 15, 16, 20, 31, 32, 63, 64, 65,
+        ] {
+            let src = ramp(2 * half, 0.11);
+            let cos_row = ramp(half, 5.3);
+            let sin_row = ramp(half, 6.7);
+            let want = scalar_interleaved(&src, &cos_row, &sin_row, half);
+            let mut got = vec![0.0f32; 2 * half];
+            rotate_interleaved(&src, &mut got, &cos_row, &sin_row);
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "interleaved rotation diverged at half={half} (vector arm live: {})",
+                vector_rotation_available()
+            );
+        }
+    }
+
+    #[test]
+    fn task_chunking_covers_every_unit_exactly_once() {
+        // The grain floor feeds `task_runtime::chunks_mut`, so an off-by-one
+        // silently drops or double-writes a row. Check that the runtime's tiling
+        // is a partition for a wide range of shapes and pool widths.
+        for total in [1usize, 2, 3, 5, 8, 31, 32, 128, 512, 4096] {
+            for unit in [64usize, 512, 4096, 32768] {
+                let min_units = rotary_min_units_per_task(unit);
+                assert!(min_units >= 1, "min_units={min_units} unit={unit}");
+                let mut data = vec![0u32; total * unit];
+                task_runtime::chunks_mut(&mut data, unit, min_units, |index, slab| {
+                    for value in slab {
+                        *value = index as u32 + 1;
+                    }
+                });
+                for index in 0..total {
+                    assert!(
+                        data[index * unit..(index + 1) * unit]
+                            .iter()
+                            .all(|&v| v == index as u32 + 1),
+                        "tiling total={total} unit={unit} lost unit {index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_serial_request_never_splits_the_rotation() {
+        // Measured: fanning 128 tasks out over a one-worker pool cost 36us of
+        // pure Rayon bookkeeping on `rope_llama3_s128` (162us vs 126us). The
+        // serial shape must be reachable, and the kernel reaches it by asking
+        // for every unit in one task.
+        assert_eq!(
+            task_runtime::testing::planned_backend(128, 128),
+            task_runtime::Backend::Serial
+        );
+        assert_eq!(
+            task_runtime::testing::planned_backend(4096, 4096),
+            task_runtime::Backend::Serial
+        );
+    }
+
+    #[test]
+    fn tasks_clear_the_minimum_work_bar() {
+        // 128 rows of 4096 elements must not become 128 tasks.
+        let per = rotary_min_units_per_task(4096);
+        assert!(
+            per * 4096 >= MIN_ROTARY_TASK_ELEMENTS,
+            "task of {} elements is below the {MIN_ROTARY_TASK_ELEMENTS}-element bar",
+            per * 4096
+        );
+        // Tiny units must be aggregated hard rather than shipped one per task.
+        assert!(rotary_min_units_per_task(8) * 8 >= MIN_ROTARY_TASK_ELEMENTS);
+        // A unit that already clears the bar is never aggregated further.
+        assert_eq!(rotary_min_units_per_task(MIN_ROTARY_TASK_ELEMENTS * 2), 1);
     }
 }

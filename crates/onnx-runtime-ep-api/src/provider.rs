@@ -9,12 +9,40 @@ use onnx_runtime_ir::{
 
 use crate::epcontext::EpContext;
 use crate::error::{EpError, Result};
-use crate::kernel::{ClaimPreference, Kernel, KernelMatch};
+use crate::kernel::{Kernel, KernelMatch};
 use crate::weight::ExecutionProviderCapabilities;
 
 /// Index of an EP within an [`crate::registry::EpRegistry`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct EpId(pub u32);
+
+/// Tie-break policy for [`ExecutionProvider::device_argmax`] when two or more
+/// logits share the maximum value.
+///
+/// The default ([`ArgmaxTieBreak::LowestIndex`]) matches the canonical ONNX
+/// `ArgMax` operator (`select_last_index=false`) and the host greedy references
+/// `sample_greedy` / `argmax_logits_tensor` ("ties keep the lowest token id"),
+/// which is the base-decode / ORT byte-identity contract.
+/// [`ArgmaxTieBreak::HighestIndex`] instead keeps the highest token id on ties,
+/// matching Rust's `Iterator::max_by` (returns the LAST maximal element) as used
+/// by the engine/reference greedy `max_by` probes, and ONNX `ArgMax` with
+/// `select_last_index=true`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum ArgmaxTieBreak {
+    /// Ties resolve to the lowest token id (first maximal element).
+    #[default]
+    LowestIndex,
+    /// Ties resolve to the highest token id (last maximal element).
+    HighestIndex,
+}
+
+impl ArgmaxTieBreak {
+    /// Whether ties select the LAST (highest-index) maximal element.
+    #[must_use]
+    pub fn select_last_index(self) -> bool {
+        matches!(self, ArgmaxTieBreak::HighestIndex)
+    }
+}
 
 /// Opaque, namespaced configuration passed to [`ExecutionProvider::initialize`].
 #[derive(Clone, Debug, Default)]
@@ -487,57 +515,6 @@ pub trait ExecutionProvider: Send + Sync {
         self.supports_op(view.node(node), opset, &shapes, &input_dtypes, &layouts)
     }
 
-    /// Whether this EP *wants* a node it is already able to run.
-    ///
-    /// Consulted only by the plugin capability path, after [`Self::supports_op`]
-    /// has said the node is runnable. It exists so an EP can decline to take a
-    /// node away from the host runtime when the host's own kernel is measurably
-    /// faster for that shape/dtype/ISA, without pretending the node is
-    /// unsupported: the native executor turns a statically-shaped
-    /// [`KernelMatch::Unsupported`] into a hard session error, so correctness
-    /// and routing preference cannot share one signal.
-    ///
-    /// Defaults to [`ClaimPreference::Claim`], preserving the historical
-    /// "support implies claim" behaviour for every EP that does not override it.
-    fn claim_preference(
-        &self,
-        op: &Node,
-        opset: u64,
-        shapes: &[Shape],
-        input_dtypes: &[DataType],
-    ) -> ClaimPreference {
-        let _ = (op, opset, shapes, input_dtypes);
-        ClaimPreference::Claim
-    }
-
-    /// [`Self::claim_preference`] through the same structural graph lens
-    /// [`Self::supports_node`] uses.
-    fn claim_preference_node(
-        &self,
-        view: &GraphView<'_>,
-        node: NodeIndex,
-        opset: u64,
-    ) -> ClaimPreference {
-        let inputs = view.node_inputs(node);
-        let shapes = inputs
-            .iter()
-            .map(|input| {
-                input
-                    .map(|value| view.value(value).shape.clone())
-                    .unwrap_or_default()
-            })
-            .collect::<Vec<_>>();
-        let input_dtypes = inputs
-            .iter()
-            .map(|input| {
-                input
-                    .map(|value| view.value(value).dtype)
-                    .unwrap_or(DataType::Undefined)
-            })
-            .collect::<Vec<_>>();
-        self.claim_preference(view.node(node), opset, &shapes, &input_dtypes)
-    }
-
     /// Get or create a kernel for `op` specialized to concrete `shapes`.
     ///
     /// `opset` is the effective operator-set version for `op`'s domain in the
@@ -744,6 +721,10 @@ pub trait ExecutionProvider: Send + Sync {
     /// `s`, two native-endian u32 values at word offset `2*s`: the token id, then
     /// the latching device capture-error bitmask. At `batch == 1` this is the
     /// previous single-sequence contract byte-for-byte.
+    ///
+    /// `tie_break` selects which token id wins when several logits share the
+    /// maximum value; see [`ArgmaxTieBreak`]. [`ArgmaxTieBreak::LowestIndex`] is
+    /// the base-decode / ORT byte-identity default.
     fn device_argmax(
         &self,
         _logits: &DeviceBuffer,
@@ -751,6 +732,7 @@ pub trait ExecutionProvider: Send + Sync {
         _batch: usize,
         _dtype: DataType,
         _result: &mut DeviceBuffer,
+        _tie_break: ArgmaxTieBreak,
     ) -> Result<()> {
         Err(EpError::KernelFailed(format!(
             "{}: device argmax is not supported",

@@ -1,0 +1,528 @@
+{
+ "model": "granite-3.0-1b-a400m-instruct (f16 dense Mobius)",
+ "n_keys": 768,
+ "expert_mib": {
+  "granite_int4_0p75": 0.75,
+  "target_16": 16.0
+ },
+ "assumed_bw_gbps": {
+  "pcie": 26.0,
+  "nvme": 6.0,
+  "dram": 80.0
+ },
+ "vram_ratios": [
+  0.05,
+  0.1,
+  0.25
+ ],
+ "dram_ratios": [
+  0.0,
+  0.25,
+  0.5,
+  1.0,
+  2.0
+ ],
+ "workloads": {
+  "english_prose": {
+   "v0.05_d0.0": {
+    "bv": 38,
+    "bd": 0,
+    "ssd_capacity_per_tok": 180.390625,
+    "ssd_compulsory_per_tok": 11.609375,
+    "dram_pcie_per_tok": 0.0,
+    "ssd_cap_bytes_mib_16": 2886.25,
+    "ssd_total_bytes_mib_16": 3072.0,
+    "dram_bytes_mib_16": 0.0,
+    "est_ms_per_tok_16": 500.0
+   },
+   "v0.05_d0.25": {
+    "bv": 38,
+    "bd": 192,
+    "ssd_capacity_per_tok": 91.0625,
+    "ssd_compulsory_per_tok": 11.609375,
+    "dram_pcie_per_tok": 89.328125,
+    "ssd_cap_bytes_mib_16": 1457.0,
+    "ssd_total_bytes_mib_16": 1642.75,
+    "dram_bytes_mib_16": 1429.25,
+    "est_ms_per_tok_16": 321.05744190705127
+   },
+   "v0.05_d0.5": {
+    "bv": 38,
+    "bd": 384,
+    "ssd_capacity_per_tok": 50.5625,
+    "ssd_compulsory_per_tok": 11.609375,
+    "dram_pcie_per_tok": 129.828125,
+    "ssd_cap_bytes_mib_16": 809.0,
+    "ssd_total_bytes_mib_16": 994.75,
+    "dram_bytes_mib_16": 2077.25,
+    "est_ms_per_tok_16": 239.9276342147436
+   },
+   "v0.05_d1.0": {
+    "bv": 38,
+    "bd": 768,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 11.609375,
+    "dram_pcie_per_tok": 180.390625,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 185.75,
+    "dram_bytes_mib_16": 2886.25,
+    "est_ms_per_tok_16": 138.6405749198718
+   },
+   "v0.05_d2.0": {
+    "bv": 38,
+    "bd": 1536,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 11.609375,
+    "dram_pcie_per_tok": 180.390625,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 185.75,
+    "dram_bytes_mib_16": 2886.25,
+    "est_ms_per_tok_16": 138.6405749198718
+   },
+   "v0.1_d0.0": {
+    "bv": 77,
+    "bd": 0,
+    "ssd_capacity_per_tok": 180.390625,
+    "ssd_compulsory_per_tok": 11.609375,
+    "dram_pcie_per_tok": 0.0,
+    "ssd_cap_bytes_mib_16": 2886.25,
+    "ssd_total_bytes_mib_16": 3072.0,
+    "dram_bytes_mib_16": 0.0,
+    "est_ms_per_tok_16": 500.0
+   },
+   "v0.1_d0.25": {
+    "bv": 77,
+    "bd": 192,
+    "ssd_capacity_per_tok": 88.0,
+    "ssd_compulsory_per_tok": 11.609375,
+    "dram_pcie_per_tok": 92.390625,
+    "ssd_cap_bytes_mib_16": 1408.0,
+    "ssd_total_bytes_mib_16": 1593.75,
+    "dram_bytes_mib_16": 1478.25,
+    "est_ms_per_tok_16": 314.9226262019231
+   },
+   "v0.1_d0.5": {
+    "bv": 77,
+    "bd": 384,
+    "ssd_capacity_per_tok": 39.390625,
+    "ssd_compulsory_per_tok": 11.609375,
+    "dram_pcie_per_tok": 141.0,
+    "ssd_cap_bytes_mib_16": 630.25,
+    "ssd_total_bytes_mib_16": 816.0,
+    "dram_bytes_mib_16": 2256.0,
+    "est_ms_per_tok_16": 217.54807692307693
+   },
+   "v0.1_d1.0": {
+    "bv": 77,
+    "bd": 768,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 11.609375,
+    "dram_pcie_per_tok": 180.390625,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 185.75,
+    "dram_bytes_mib_16": 2886.25,
+    "est_ms_per_tok_16": 138.6405749198718
+   },
+   "v0.1_d2.0": {
+    "bv": 77,
+    "bd": 1536,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 11.609375,
+    "dram_pcie_per_tok": 180.390625,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 185.75,
+    "dram_bytes_mib_16": 2886.25,
+    "est_ms_per_tok_16": 138.6405749198718
+   },
+   "v0.25_d0.0": {
+    "bv": 192,
+    "bd": 0,
+    "ssd_capacity_per_tok": 111.921875,
+    "ssd_compulsory_per_tok": 11.609375,
+    "dram_pcie_per_tok": 0.0,
+    "ssd_cap_bytes_mib_16": 1790.75,
+    "ssd_total_bytes_mib_16": 1976.5,
+    "dram_bytes_mib_16": 0.0,
+    "est_ms_per_tok_16": 321.6959635416667
+   },
+   "v0.25_d0.25": {
+    "bv": 192,
+    "bd": 192,
+    "ssd_capacity_per_tok": 58.203125,
+    "ssd_compulsory_per_tok": 11.609375,
+    "dram_pcie_per_tok": 53.71875,
+    "ssd_cap_bytes_mib_16": 931.25,
+    "ssd_total_bytes_mib_16": 1117.0,
+    "dram_bytes_mib_16": 859.5,
+    "est_ms_per_tok_16": 214.08628806089743
+   },
+   "v0.25_d0.5": {
+    "bv": 192,
+    "bd": 384,
+    "ssd_capacity_per_tok": 15.078125,
+    "ssd_compulsory_per_tok": 11.609375,
+    "dram_pcie_per_tok": 96.84375,
+    "ssd_cap_bytes_mib_16": 241.25,
+    "ssd_total_bytes_mib_16": 427.0,
+    "dram_bytes_mib_16": 1549.5,
+    "est_ms_per_tok_16": 127.69806690705128
+   },
+   "v0.25_d1.0": {
+    "bv": 192,
+    "bd": 768,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 11.609375,
+    "dram_pcie_per_tok": 111.921875,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 185.75,
+    "dram_bytes_mib_16": 1790.75,
+    "est_ms_per_tok_16": 97.49348958333333
+   },
+   "v0.25_d2.0": {
+    "bv": 192,
+    "bd": 1536,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 11.609375,
+    "dram_pcie_per_tok": 111.921875,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 185.75,
+    "dram_bytes_mib_16": 1790.75,
+    "est_ms_per_tok_16": 97.49348958333333
+   }
+  },
+  "code": {
+   "v0.05_d0.0": {
+    "bv": 38,
+    "bd": 0,
+    "ssd_capacity_per_tok": 181.3125,
+    "ssd_compulsory_per_tok": 10.6875,
+    "dram_pcie_per_tok": 0.0,
+    "ssd_cap_bytes_mib_16": 2901.0,
+    "ssd_total_bytes_mib_16": 3072.0,
+    "dram_bytes_mib_16": 0.0,
+    "est_ms_per_tok_16": 500.0
+   },
+   "v0.05_d0.25": {
+    "bv": 38,
+    "bd": 192,
+    "ssd_capacity_per_tok": 113.515625,
+    "ssd_compulsory_per_tok": 10.6875,
+    "dram_pcie_per_tok": 67.796875,
+    "ssd_cap_bytes_mib_16": 1816.25,
+    "ssd_total_bytes_mib_16": 1987.25,
+    "dram_bytes_mib_16": 1084.75,
+    "est_ms_per_tok_16": 364.1889523237179
+   },
+   "v0.05_d0.5": {
+    "bv": 38,
+    "bd": 384,
+    "ssd_capacity_per_tok": 25.078125,
+    "ssd_compulsory_per_tok": 10.6875,
+    "dram_pcie_per_tok": 156.234375,
+    "ssd_cap_bytes_mib_16": 401.25,
+    "ssd_total_bytes_mib_16": 572.25,
+    "dram_bytes_mib_16": 2499.75,
+    "est_ms_per_tok_16": 187.03049879807693
+   },
+   "v0.05_d1.0": {
+    "bv": 38,
+    "bd": 768,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 10.6875,
+    "dram_pcie_per_tok": 181.3125,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 171.0,
+    "dram_bytes_mib_16": 2901.0,
+    "est_ms_per_tok_16": 136.79387019230768
+   },
+   "v0.05_d2.0": {
+    "bv": 38,
+    "bd": 1536,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 10.6875,
+    "dram_pcie_per_tok": 181.3125,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 171.0,
+    "dram_bytes_mib_16": 2901.0,
+    "est_ms_per_tok_16": 136.79387019230768
+   },
+   "v0.1_d0.0": {
+    "bv": 77,
+    "bd": 0,
+    "ssd_capacity_per_tok": 181.3125,
+    "ssd_compulsory_per_tok": 10.6875,
+    "dram_pcie_per_tok": 0.0,
+    "ssd_cap_bytes_mib_16": 2901.0,
+    "ssd_total_bytes_mib_16": 3072.0,
+    "dram_bytes_mib_16": 0.0,
+    "est_ms_per_tok_16": 500.0
+   },
+   "v0.1_d0.25": {
+    "bv": 77,
+    "bd": 192,
+    "ssd_capacity_per_tok": 112.3125,
+    "ssd_compulsory_per_tok": 10.6875,
+    "dram_pcie_per_tok": 69.0,
+    "ssd_cap_bytes_mib_16": 1797.0,
+    "ssd_total_bytes_mib_16": 1968.0,
+    "dram_bytes_mib_16": 1104.0,
+    "est_ms_per_tok_16": 361.77884615384613
+   },
+   "v0.1_d0.5": {
+    "bv": 77,
+    "bd": 384,
+    "ssd_capacity_per_tok": 17.125,
+    "ssd_compulsory_per_tok": 10.6875,
+    "dram_pcie_per_tok": 164.1875,
+    "ssd_cap_bytes_mib_16": 274.0,
+    "ssd_total_bytes_mib_16": 445.0,
+    "dram_bytes_mib_16": 2627.0,
+    "est_ms_per_tok_16": 171.0987580128205
+   },
+   "v0.1_d1.0": {
+    "bv": 77,
+    "bd": 768,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 10.6875,
+    "dram_pcie_per_tok": 181.3125,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 171.0,
+    "dram_bytes_mib_16": 2901.0,
+    "est_ms_per_tok_16": 136.79387019230768
+   },
+   "v0.1_d2.0": {
+    "bv": 77,
+    "bd": 1536,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 10.6875,
+    "dram_pcie_per_tok": 181.3125,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 171.0,
+    "dram_bytes_mib_16": 2901.0,
+    "est_ms_per_tok_16": 136.79387019230768
+   },
+   "v0.25_d0.0": {
+    "bv": 192,
+    "bd": 0,
+    "ssd_capacity_per_tok": 131.921875,
+    "ssd_compulsory_per_tok": 10.6875,
+    "dram_pcie_per_tok": 0.0,
+    "ssd_cap_bytes_mib_16": 2110.75,
+    "ssd_total_bytes_mib_16": 2281.75,
+    "dram_bytes_mib_16": 0.0,
+    "est_ms_per_tok_16": 371.3785807291667
+   },
+   "v0.25_d0.25": {
+    "bv": 192,
+    "bd": 192,
+    "ssd_capacity_per_tok": 40.109375,
+    "ssd_compulsory_per_tok": 10.6875,
+    "dram_pcie_per_tok": 91.8125,
+    "ssd_cap_bytes_mib_16": 641.75,
+    "ssd_total_bytes_mib_16": 812.75,
+    "dram_bytes_mib_16": 1469.0,
+    "est_ms_per_tok_16": 187.45930989583334
+   },
+   "v0.25_d0.5": {
+    "bv": 192,
+    "bd": 384,
+    "ssd_capacity_per_tok": 1.484375,
+    "ssd_compulsory_per_tok": 10.6875,
+    "dram_pcie_per_tok": 130.4375,
+    "ssd_cap_bytes_mib_16": 23.75,
+    "ssd_total_bytes_mib_16": 194.75,
+    "dram_bytes_mib_16": 2087.0,
+    "est_ms_per_tok_16": 110.08551181891028
+   },
+   "v0.25_d1.0": {
+    "bv": 192,
+    "bd": 768,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 10.6875,
+    "dram_pcie_per_tok": 131.921875,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 171.0,
+    "dram_bytes_mib_16": 2110.75,
+    "est_ms_per_tok_16": 107.11200420673077
+   },
+   "v0.25_d2.0": {
+    "bv": 192,
+    "bd": 1536,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 10.6875,
+    "dram_pcie_per_tok": 131.921875,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 171.0,
+    "dram_bytes_mib_16": 2110.75,
+    "est_ms_per_tok_16": 107.11200420673077
+   }
+  },
+  "math": {
+   "v0.05_d0.0": {
+    "bv": 38,
+    "bd": 0,
+    "ssd_capacity_per_tok": 180.703125,
+    "ssd_compulsory_per_tok": 11.296875,
+    "dram_pcie_per_tok": 0.0,
+    "ssd_cap_bytes_mib_16": 2891.25,
+    "ssd_total_bytes_mib_16": 3072.0,
+    "dram_bytes_mib_16": 0.0,
+    "est_ms_per_tok_16": 500.0
+   },
+   "v0.05_d0.25": {
+    "bv": 38,
+    "bd": 192,
+    "ssd_capacity_per_tok": 96.0,
+    "ssd_compulsory_per_tok": 11.296875,
+    "dram_pcie_per_tok": 84.703125,
+    "ssd_cap_bytes_mib_16": 1536.0,
+    "ssd_total_bytes_mib_16": 1716.75,
+    "dram_bytes_mib_16": 1355.25,
+    "est_ms_per_tok_16": 330.322265625
+   },
+   "v0.05_d0.5": {
+    "bv": 38,
+    "bd": 384,
+    "ssd_capacity_per_tok": 57.328125,
+    "ssd_compulsory_per_tok": 11.296875,
+    "dram_pcie_per_tok": 123.375,
+    "ssd_cap_bytes_mib_16": 917.25,
+    "ssd_total_bytes_mib_16": 1098.0,
+    "dram_bytes_mib_16": 1974.0,
+    "est_ms_per_tok_16": 252.85456730769232
+   },
+   "v0.05_d1.0": {
+    "bv": 38,
+    "bd": 768,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 11.296875,
+    "dram_pcie_per_tok": 180.703125,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 180.75,
+    "dram_bytes_mib_16": 2891.25,
+    "est_ms_per_tok_16": 138.01457331730768
+   },
+   "v0.05_d2.0": {
+    "bv": 38,
+    "bd": 1536,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 11.296875,
+    "dram_pcie_per_tok": 180.703125,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 180.75,
+    "dram_bytes_mib_16": 2891.25,
+    "est_ms_per_tok_16": 138.01457331730768
+   },
+   "v0.1_d0.0": {
+    "bv": 77,
+    "bd": 0,
+    "ssd_capacity_per_tok": 180.703125,
+    "ssd_compulsory_per_tok": 11.296875,
+    "dram_pcie_per_tok": 0.0,
+    "ssd_cap_bytes_mib_16": 2891.25,
+    "ssd_total_bytes_mib_16": 3072.0,
+    "dram_bytes_mib_16": 0.0,
+    "est_ms_per_tok_16": 500.0
+   },
+   "v0.1_d0.25": {
+    "bv": 77,
+    "bd": 192,
+    "ssd_capacity_per_tok": 93.09375,
+    "ssd_compulsory_per_tok": 11.296875,
+    "dram_pcie_per_tok": 87.609375,
+    "ssd_cap_bytes_mib_16": 1489.5,
+    "ssd_total_bytes_mib_16": 1670.25,
+    "dram_bytes_mib_16": 1401.75,
+    "est_ms_per_tok_16": 324.50045072115387
+   },
+   "v0.1_d0.5": {
+    "bv": 77,
+    "bd": 384,
+    "ssd_capacity_per_tok": 42.921875,
+    "ssd_compulsory_per_tok": 11.296875,
+    "dram_pcie_per_tok": 137.78125,
+    "ssd_cap_bytes_mib_16": 686.75,
+    "ssd_total_bytes_mib_16": 867.5,
+    "dram_bytes_mib_16": 2204.5,
+    "est_ms_per_tok_16": 223.99589342948718
+   },
+   "v0.1_d1.0": {
+    "bv": 77,
+    "bd": 768,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 11.296875,
+    "dram_pcie_per_tok": 180.703125,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 180.75,
+    "dram_bytes_mib_16": 2891.25,
+    "est_ms_per_tok_16": 138.01457331730768
+   },
+   "v0.1_d2.0": {
+    "bv": 77,
+    "bd": 1536,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 11.296875,
+    "dram_pcie_per_tok": 180.703125,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 180.75,
+    "dram_bytes_mib_16": 2891.25,
+    "est_ms_per_tok_16": 138.01457331730768
+   },
+   "v0.25_d0.0": {
+    "bv": 192,
+    "bd": 0,
+    "ssd_capacity_per_tok": 117.34375,
+    "ssd_compulsory_per_tok": 11.296875,
+    "dram_pcie_per_tok": 0.0,
+    "ssd_cap_bytes_mib_16": 1877.5,
+    "ssd_total_bytes_mib_16": 2058.25,
+    "dram_bytes_mib_16": 0.0,
+    "est_ms_per_tok_16": 335.0016276041667
+   },
+   "v0.25_d0.25": {
+    "bv": 192,
+    "bd": 192,
+    "ssd_capacity_per_tok": 63.765625,
+    "ssd_compulsory_per_tok": 11.296875,
+    "dram_pcie_per_tok": 53.578125,
+    "ssd_cap_bytes_mib_16": 1020.25,
+    "ssd_total_bytes_mib_16": 1201.0,
+    "dram_bytes_mib_16": 857.25,
+    "est_ms_per_tok_16": 227.67365284455127
+   },
+   "v0.25_d0.5": {
+    "bv": 192,
+    "bd": 384,
+    "ssd_capacity_per_tok": 18.21875,
+    "ssd_compulsory_per_tok": 11.296875,
+    "dram_pcie_per_tok": 99.125,
+    "ssd_cap_bytes_mib_16": 291.5,
+    "ssd_total_bytes_mib_16": 472.25,
+    "dram_bytes_mib_16": 1586.0,
+    "est_ms_per_tok_16": 136.43391927083331
+   },
+   "v0.25_d1.0": {
+    "bv": 192,
+    "bd": 768,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 11.296875,
+    "dram_pcie_per_tok": 117.34375,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 180.75,
+    "dram_bytes_mib_16": 1877.5,
+    "est_ms_per_tok_16": 99.93802584134616
+   },
+   "v0.25_d2.0": {
+    "bv": 192,
+    "bd": 1536,
+    "ssd_capacity_per_tok": 0.0,
+    "ssd_compulsory_per_tok": 11.296875,
+    "dram_pcie_per_tok": 117.34375,
+    "ssd_cap_bytes_mib_16": 0.0,
+    "ssd_total_bytes_mib_16": 180.75,
+    "dram_bytes_mib_16": 1877.5,
+    "est_ms_per_tok_16": 99.93802584134616
+   }
+  }
+ }
+}

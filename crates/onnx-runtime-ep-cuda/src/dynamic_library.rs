@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use libloading::Library;
+use onnx_genai_cuda_version_guard::{HostOs, cudart_candidates_for};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CudaLibrary {
@@ -71,16 +72,30 @@ fn target_arch() -> TargetArch {
     }
 }
 
+/// Map this crate's [`TargetOs`] onto the version-guard [`HostOs`] selector used
+/// by the canonical `cudart` candidate table.
+fn host_os(os: TargetOs) -> HostOs {
+    match os {
+        TargetOs::Linux => HostOs::Linux,
+        TargetOs::Macos => HostOs::Macos,
+        TargetOs::Windows => HostOs::Windows,
+        TargetOs::Other => HostOs::Other,
+    }
+}
+
 pub(crate) fn candidates(library: CudaLibrary) -> &'static [&'static str] {
     candidates_for(target_os(), library)
 }
 
 fn candidates_for(os: TargetOs, library: CudaLibrary) -> &'static [&'static str] {
     match (os, library) {
+        // The CUDA runtime (`cudart`) candidate list is the single canonical
+        // table in `onnx-genai-cuda-version-guard`, shared with `onnx-genai-ort`'s
+        // dynamically-loaded cudart shim so the two loaders can never drift
+        // (see issue #1180).
+        (os, CudaLibrary::Runtime) => cudart_candidates_for(host_os(os)),
+
         (TargetOs::Linux, CudaLibrary::Driver) => &["libcuda.so.1", "libcuda.so"],
-        (TargetOs::Linux, CudaLibrary::Runtime) => {
-            &["libcudart.so.13", "libcudart.so.12", "libcudart.so"]
-        }
         (TargetOs::Linux, CudaLibrary::Cublas) => {
             &["libcublas.so.13", "libcublas.so.12", "libcublas.so"]
         }
@@ -96,7 +111,6 @@ fn candidates_for(os: TargetOs, library: CudaLibrary) -> &'static [&'static str]
         }
 
         (TargetOs::Macos, CudaLibrary::Driver) => &["libcuda.dylib"],
-        (TargetOs::Macos, CudaLibrary::Runtime) => &["libcudart.dylib"],
         (TargetOs::Macos, CudaLibrary::Cublas) => &["libcublas.dylib"],
         (TargetOs::Macos, CudaLibrary::CublasLt) => &["libcublasLt.dylib"],
         (TargetOs::Macos, CudaLibrary::Cudnn) => &["libcudnn.dylib"],
@@ -104,9 +118,6 @@ fn candidates_for(os: TargetOs, library: CudaLibrary) -> &'static [&'static str]
         (TargetOs::Macos, CudaLibrary::Cupti) => &["libcupti.dylib"],
 
         (TargetOs::Windows, CudaLibrary::Driver) => &["nvcuda.dll"],
-        (TargetOs::Windows, CudaLibrary::Runtime) => {
-            &["cudart64_13.dll", "cudart64_12.dll", "cudart.dll"]
-        }
         (TargetOs::Windows, CudaLibrary::Cublas) => {
             &["cublas64_13.dll", "cublas64_12.dll", "cublas.dll"]
         }
@@ -455,7 +466,7 @@ mod tests {
     fn generates_linux_cuda_names() {
         assert_eq!(
             candidates_for(TargetOs::Linux, CudaLibrary::Runtime),
-            ["libcudart.so.13", "libcudart.so.12", "libcudart.so"]
+            onnx_genai_cuda_version_guard::CUDART_CANDIDATES_LINUX
         );
         assert_eq!(
             candidates_for(TargetOs::Linux, CudaLibrary::Cupti),
@@ -479,7 +490,7 @@ mod tests {
     fn generates_windows_cuda_names() {
         assert_eq!(
             candidates_for(TargetOs::Windows, CudaLibrary::Runtime),
-            ["cudart64_13.dll", "cudart64_12.dll", "cudart.dll"]
+            onnx_genai_cuda_version_guard::CUDART_CANDIDATES_WINDOWS
         );
         assert!(candidates_for(TargetOs::Windows, CudaLibrary::Cudnn).contains(&"cudnn64_9.dll"));
         assert!(

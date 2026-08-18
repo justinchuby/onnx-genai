@@ -1,0 +1,334 @@
+{
+ "model": "granite-3.0-1b-a400m-instruct (f16 dense Mobius)",
+ "num_layers": 24,
+ "num_experts": 32,
+ "top_k": 8,
+ "n_keys": 768,
+ "budget_ratios": [
+  0.1,
+  0.25,
+  0.5,
+  0.75,
+  0.9
+ ],
+ "expert_sizes_mib": {
+  "granite_int4_0p75": 0.75,
+  "target_16": 16.0
+ },
+ "workloads": {
+  "english_prose": {
+   "0.1": {
+    "budget": 77,
+    "accesses": 12288,
+    "page_ins": {
+     "oracle": 8395,
+     "random": 11760,
+     "fifo": 12288,
+     "lru": 12288,
+     "lfu": 10184,
+     "static_pin": 9435,
+     "hybrid": 11968,
+     "equal_oracle": 8708,
+     "equal_lru": 10613
+    }
+   },
+   "0.25": {
+    "budget": 192,
+    "accesses": 12288,
+    "page_ins": {
+     "oracle": 4547,
+     "random": 8836,
+     "fifo": 8565,
+     "lru": 6590,
+     "lfu": 7595,
+     "static_pin": 6648,
+     "hybrid": 6585,
+     "equal_oracle": 6590,
+     "equal_lru": 6590
+    }
+   },
+   "0.5": {
+    "budget": 384,
+    "accesses": 12288,
+    "page_ins": {
+     "oracle": 1978,
+     "random": 4933,
+     "fifo": 4625,
+     "lru": 4459,
+     "lfu": 3951,
+     "static_pin": 3051,
+     "hybrid": 4454,
+     "equal_oracle": 2393,
+     "equal_lru": 3831
+    }
+   },
+   "0.75": {
+    "budget": 576,
+    "accesses": 12288,
+    "page_ins": {
+     "oracle": 938,
+     "random": 2109,
+     "fifo": 2230,
+     "lru": 1700,
+     "lfu": 1534,
+     "static_pin": 766,
+     "hybrid": 1695,
+     "equal_oracle": 1053,
+     "equal_lru": 1619
+    }
+   },
+   "0.9": {
+    "budget": 691,
+    "accesses": 12288,
+    "page_ins": {
+     "oracle": 756,
+     "random": 1054,
+     "fifo": 1244,
+     "lru": 858,
+     "lfu": 842,
+     "static_pin": 104,
+     "hybrid": 853,
+     "equal_oracle": 769,
+     "equal_lru": 868
+    }
+   }
+  },
+  "code": {
+   "0.1": {
+    "budget": 77,
+    "accesses": 12288,
+    "page_ins": {
+     "oracle": 8438,
+     "random": 11856,
+     "fifo": 12288,
+     "lru": 12288,
+     "lfu": 9864,
+     "static_pin": 8864,
+     "hybrid": 11904,
+     "equal_oracle": 9096,
+     "equal_lru": 10907
+    }
+   },
+   "0.25": {
+    "budget": 192,
+    "accesses": 12288,
+    "page_ins": {
+     "oracle": 4724,
+     "random": 9119,
+     "fifo": 9420,
+     "lru": 7949,
+     "lfu": 6954,
+     "static_pin": 5546,
+     "hybrid": 7943,
+     "equal_oracle": 7949,
+     "equal_lru": 7949
+    }
+   },
+   "0.5": {
+    "budget": 384,
+    "accesses": 12288,
+    "page_ins": {
+     "oracle": 1367,
+     "random": 4085,
+     "fifo": 4157,
+     "lru": 3221,
+     "lfu": 2491,
+     "static_pin": 1808,
+     "hybrid": 3215,
+     "equal_oracle": 1689,
+     "equal_lru": 2573
+    }
+   },
+   "0.75": {
+    "budget": 576,
+    "accesses": 12288,
+    "page_ins": {
+     "oracle": 684,
+     "random": 1039,
+     "fifo": 1297,
+     "lru": 779,
+     "lfu": 842,
+     "static_pin": 214,
+     "hybrid": 773,
+     "equal_oracle": 764,
+     "equal_lru": 944
+    }
+   },
+   "0.9": {
+    "budget": 691,
+    "accesses": 12288,
+    "page_ins": {
+     "oracle": 684,
+     "random": 684,
+     "fifo": 684,
+     "lru": 684,
+     "lfu": 684,
+     "static_pin": 0,
+     "hybrid": 678,
+     "equal_oracle": 684,
+     "equal_lru": 689
+    }
+   }
+  },
+  "math": {
+   "0.1": {
+    "budget": 77,
+    "accesses": 12288,
+    "page_ins": {
+     "oracle": 8429,
+     "random": 11788,
+     "fifo": 12288,
+     "lru": 12288,
+     "lfu": 10100,
+     "static_pin": 9289,
+     "hybrid": 11904,
+     "equal_oracle": 8745,
+     "equal_lru": 10645
+    }
+   },
+   "0.25": {
+    "budget": 192,
+    "accesses": 12288,
+    "page_ins": {
+     "oracle": 4876,
+     "random": 9092,
+     "fifo": 8665,
+     "lru": 6886,
+     "lfu": 7345,
+     "static_pin": 6303,
+     "hybrid": 6880,
+     "equal_oracle": 6886,
+     "equal_lru": 6886
+    }
+   },
+   "0.5": {
+    "budget": 384,
+    "accesses": 12288,
+    "page_ins": {
+     "oracle": 2107,
+     "random": 5130,
+     "fifo": 5372,
+     "lru": 4800,
+     "lfu": 3671,
+     "static_pin": 2728,
+     "hybrid": 4794,
+     "equal_oracle": 2546,
+     "equal_lru": 4068
+    }
+   },
+   "0.75": {
+    "budget": 576,
+    "accesses": 12288,
+    "page_ins": {
+     "oracle": 948,
+     "random": 2101,
+     "fifo": 2689,
+     "lru": 1884,
+     "lfu": 1393,
+     "static_pin": 580,
+     "hybrid": 1878,
+     "equal_oracle": 1072,
+     "equal_lru": 1734
+    }
+   },
+   "0.9": {
+    "budget": 691,
+    "accesses": 12288,
+    "page_ins": {
+     "oracle": 723,
+     "random": 914,
+     "fifo": 1299,
+     "lru": 759,
+     "lfu": 754,
+     "static_pin": 35,
+     "hybrid": 753,
+     "equal_oracle": 753,
+     "equal_lru": 833
+    }
+   }
+  }
+ },
+ "cross_prompt_static_pin": {
+  "english_prose": {
+   "0.1": {
+    "budget": 77,
+    "cross": 0.82666015625,
+    "insample": 0.767822265625
+   },
+   "0.25": {
+    "budget": 192,
+    "cross": 0.6446940104166666,
+    "insample": 0.541015625
+   },
+   "0.5": {
+    "budget": 384,
+    "cross": 0.367431640625,
+    "insample": 0.248291015625
+   },
+   "0.75": {
+    "budget": 576,
+    "cross": 0.14900716145833334,
+    "insample": 0.062337239583333336
+   },
+   "0.9": {
+    "budget": 691,
+    "cross": 0.051106770833333336,
+    "insample": 0.008463541666666666
+   }
+  },
+  "code": {
+   "0.1": {
+    "budget": 77,
+    "cross": 0.7766927083333334,
+    "insample": 0.7213541666666666
+   },
+   "0.25": {
+    "budget": 192,
+    "cross": 0.5681966145833334,
+    "insample": 0.4513346354166667
+   },
+   "0.5": {
+    "budget": 384,
+    "cross": 0.27685546875,
+    "insample": 0.14713541666666666
+   },
+   "0.75": {
+    "budget": 576,
+    "cross": 0.09651692708333333,
+    "insample": 0.017415364583333332
+   },
+   "0.9": {
+    "budget": 691,
+    "cross": 0.026529947916666668,
+    "insample": 0.0
+   }
+  },
+  "math": {
+   "0.1": {
+    "budget": 77,
+    "cross": 0.7884928385416666,
+    "insample": 0.7559407552083334
+   },
+   "0.25": {
+    "budget": 192,
+    "cross": 0.5857747395833334,
+    "insample": 0.512939453125
+   },
+   "0.5": {
+    "budget": 384,
+    "cross": 0.3052571614583333,
+    "insample": 0.22200520833333334
+   },
+   "0.75": {
+    "budget": 576,
+    "cross": 0.10286458333333333,
+    "insample": 0.047200520833333336
+   },
+   "0.9": {
+    "budget": 691,
+    "cross": 0.027587890625,
+    "insample": 0.0028483072916666665
+   }
+  }
+ }
+}

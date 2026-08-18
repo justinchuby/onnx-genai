@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "Example workload for scripts/benchmark_muse_native_local.py.",
+    "Every path is relative to the working directory the script runs from.",
+    "Copy this file and point it at a real package; it is a template, not a",
+    "measurement, and the harness validates it before loading anything."
+  ],
+  "runtime": {
+    "onnxruntime": "1.28.0",
+    "cudnn_flash_attention": false
+  },
+  "workload": {
+    "prompt": "Describe this image.",
+    "rendered_prompt": "<|user|>\nDescribe this image.<|end|>\n<|assistant|>\n",
+    "prompt_ids_file": "benchmarks/native_decode_example_prompt_ids.json",
+    "prompt_tokens": 12,
+    "image": null,
+    "max_new_tokens": 128,
+    "decode_skip": 8,
+    "warmups": 1,
+    "runs": 5
+  },
+  "sampling": {
+    "do_sample": false,
+    "temperature": 1.0,
+    "top_k": 1,
+    "top_p": 1.0
+  }
+}

@@ -96,6 +96,18 @@ mod mm_profile {
     pub fn time_gemv<T>(f: impl FnOnce() -> T) -> T {
         timed(&GEMV_NS, f)
     }
+
+    /// The default build shares the NT prefill call site with MLAS but has no
+    /// reporter for the `gemv` phase — [`tick`] is the MLAS f16 decode split —
+    /// so this is a pass-through rather than a counter nothing ever prints. It
+    /// exists so the shared call site stays `cfg`-free; the phase that carries
+    /// the default build's story (`dequant-nk` vs `dequant-kn`) is reported by
+    /// [`time_prepack`], which is not gated.
+    #[cfg(not(feature = "mlas"))]
+    #[inline]
+    pub fn time_gemv<T>(f: impl FnOnce() -> T) -> T {
+        f()
+    }
     #[cfg(feature = "mlas")]
     pub fn time_narrow<T>(f: impl FnOnce() -> T) -> T {
         timed(&NARROW_NS, f)
@@ -2109,18 +2121,23 @@ impl MatMulNBitsKernel {
 
         // C[m, n] = A[m, k] * B_nk[n, k]^T -- reads the Nk weight as the
         // transposed operand without materializing a Kn copy. Bit-identical to
-        // the direct-`Kn` dense GEMM the caller would otherwise run.
-        super::matmul::gemm_nt_with_backend(
-            backend,
-            activations,
-            weight_nk,
-            result,
-            m,
-            self.k,
-            self.n,
-        )?;
+        // the direct-`Kn` dense GEMM the caller would otherwise run. Timed on
+        // the same `gemv` phase the `Kn` route reports, so a profile taken
+        // across the two routes compares like with like.
+        mm_profile::time_gemv(|| {
+            super::matmul::gemm_nt_with_backend(
+                backend,
+                activations,
+                weight_nk,
+                result,
+                m,
+                self.k,
+                self.n,
+            )
+        })?;
         Ok(true)
     }
+
     /// Run a pre-partitioned MLAS SQNBit GEMV (`self.n` split into contiguous
     /// output-column shards, one per decode worker).
     ///
@@ -3013,6 +3030,26 @@ fn decode_threads_override() -> Option<usize> {
         .map(std::num::NonZeroUsize::get)
 }
 
+/// The CPU decode thread budget, if one was configured explicitly.
+///
+/// Returns the programmatic override set by [`set_decode_thread_budget`] when
+/// present, otherwise a positive `ONNX_GENAI_CPU_DECODE_THREADS`, otherwise
+/// `None`. Unlike [`configured_persistent_decode_threads`] this applies no
+/// default: `None` means "nobody asked for a specific width", which is what a
+/// caller needs to know before substituting a default of its own.
+///
+/// `0` (the documented opt-out) reads as `None` for the same reason — it is a
+/// request to *not* size a pool from this knob.
+pub fn decode_thread_budget() -> Option<usize> {
+    decode_threads_override().or_else(|| {
+        std::env::var(DECODE_THREADS_ENV)
+            .ok()?
+            .parse::<usize>()
+            .ok()
+            .filter(|threads| *threads > 0)
+    })
+}
+
 /// Enable or disable the resident dequantized-f32 decode cache for the process.
 ///
 /// The memory-strategy plan calls this before the native decode session is
@@ -3750,7 +3787,10 @@ fn decode_affinity_cpus(threads: usize) -> std::result::Result<Option<Vec<usize>
 fn report_decode_affinity_policy(message: &str) {
     static REPORTED: OnceLock<()> = OnceLock::new();
     if REPORTED.set(()).is_ok() {
-        eprintln!("onnx-genai: decode affinity policy: {message}");
+        eprintln!(
+            "onnx-genai: native CPU worker affinity policy: {message}. \
+             This configures CPU kernels only and does not select the decode backend"
+        );
     }
 }
 
