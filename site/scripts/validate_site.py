@@ -1,61 +1,134 @@
 #!/usr/bin/env python3
-"""Validate a built Quartz site as mounted at a GitHub Pages project path."""
+"""Validate generated Quartz links, project paths, and reviewed runtime URLs."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import re
-import subprocess
 import sys
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse, urlunsplit
+
+SITE_ORIGIN = "https://www.justinchuby.com"
+LANDING_TITLE = "onnx-genai Knowledge Base"
+REQUIRED_PAGE = "README.html"
+
+ALLOWED_EXTERNAL_SCRIPTS = frozenset(
+    {
+        "https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js",
+        "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/copy-tex.min.js",
+        "https://cdn.jsdelivr.net/npm/pixi.js@8.19.0/dist/pixi.js",
+    }
+)
+ALLOWED_EXTERNAL_STYLES = frozenset(
+    {"https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css"}
+)
+ALLOWED_RUNTIME_URLS = ALLOWED_EXTERNAL_SCRIPTS | ALLOWED_EXTERNAL_STYLES
+
+RUNTIME_URL = re.compile(
+    r"""(?:https:)?//cdn\.jsdelivr\.net/[^"'`()<>\s]+""",
+    re.IGNORECASE,
+)
+ORIGIN_ROOT_PATTERNS = {
+    "content-index fetch": re.compile(
+        r"""(?:fetch\(|new URL\()\s*["']/static/contentIndex\.json"""
+    ),
+    "URL constructor": re.compile(r"""new URL\(\s*["']/["']?\s*\+"""),
+    "href assignment": re.compile(r"""\.href\s*=\s*["']/["']?\s*\+"""),
+}
 
 
-class LinkParser(HTMLParser):
+class PageParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self.urls: list[str] = []
-        self.inline_scripts: list[str] = []
         self.script_sources: list[str] = []
+        self.stylesheets: list[str] = []
+        self.inline_scripts: list[str] = []
         self.has_body = False
         self.body_base_path: str | None = None
-        self._script_body: list[str] | None = None
+        self.has_article = False
+        self.article_text = ""
+        self.title: str | None = None
+        self.canonical: str | None = None
+        self.meta_refresh = False
+        self.noindex = False
+        self._article_depth = 0
+        self._article_data: list[str] = []
+        self._script_data: list[str] | None = None
+        self._title_data: list[str] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
         if tag == "body":
             self.has_body = True
             self.body_base_path = attributes.get("data-basepath")
-        if tag in {"a", "link"} and attributes.get("href"):
-            self.urls.append(attributes["href"] or "")
-        if tag in {"img", "script", "source"} and attributes.get("src"):
-            self.urls.append(attributes["src"] or "")
+        elif tag == "article":
+            self.has_article = True
+            self._article_depth += 1
+        elif tag == "title" and self.title is None:
+            self._title_data = []
+        elif tag == "meta":
+            if (attributes.get("http-equiv") or "").lower() == "refresh":
+                self.meta_refresh = True
+            if (attributes.get("name") or "").lower() == "robots":
+                directives = {
+                    value.strip().lower()
+                    for value in (attributes.get("content") or "").split(",")
+                }
+                self.noindex = "noindex" in directives
+
+        if tag == "link":
+            rel = {value.lower() for value in (attributes.get("rel") or "").split()}
+            href = attributes.get("href") or ""
+            if "canonical" in rel and href:
+                self.canonical = href
+            if "stylesheet" in rel and href:
+                self.stylesheets.append(href)
+
         if tag == "script":
             source = attributes.get("src")
             if source:
                 self.script_sources.append(source)
             else:
-                self._script_body = []
+                self._script_data = []
+
+        if tag in {"a", "link"} and attributes.get("href"):
+            self.urls.append(attributes["href"] or "")
+        if tag in {"img", "script", "source"} and attributes.get("src"):
+            self.urls.append(attributes["src"] or "")
 
     def handle_data(self, data: str) -> None:
-        if self._script_body is not None:
-            self._script_body.append(data)
+        if self._article_depth:
+            self._article_data.append(data)
+        if self._script_data is not None:
+            self._script_data.append(data)
+        if self._title_data is not None:
+            self._title_data.append(data)
 
     def handle_endtag(self, tag: str) -> None:
-        if tag == "script" and self._script_body is not None:
-            self.inline_scripts.append("".join(self._script_body))
-            self._script_body = None
+        if tag == "article" and self._article_depth:
+            self._article_depth -= 1
+            if self._article_depth == 0:
+                self.article_text = "".join(self._article_data).strip()
+        elif tag == "script" and self._script_data is not None:
+            self.inline_scripts.append("".join(self._script_data))
+            self._script_data = None
+        elif tag == "title" and self._title_data is not None:
+            self.title = "".join(self._title_data).strip()
+            self._title_data = None
+
+
+def page_url(html: Path, public: Path, base_path: str) -> str:
+    relative = html.relative_to(public).as_posix()
+    return base_path if relative == "index.html" else f"{base_path}{relative.removesuffix('.html')}"
 
 
 def output_candidates(public: Path, deployed_path: str, base_path: str) -> list[Path]:
     if deployed_path == base_path.rstrip("/"):
         return [public / "index.html"]
     relative = unquote(deployed_path[len(base_path) :]).lstrip("/")
-    if not relative:
-        return [public / "index.html"]
     path = public / PurePosixPath(relative)
     if deployed_path.endswith("/"):
         candidates = [path / "index.html"]
@@ -63,324 +136,83 @@ def output_candidates(public: Path, deployed_path: str, base_path: str) -> list[
         candidates = [path]
     else:
         candidates = [Path(f"{path}.html"), path / "index.html"]
-    safe_candidates: list[Path] = []
+    result = []
     for candidate in candidates:
         try:
             candidate.resolve().relative_to(public)
         except ValueError:
             continue
-        safe_candidates.append(candidate)
-    return safe_candidates
+        result.append(candidate.resolve())
+    return result
 
 
-def page_url(html: Path, public: Path, base_path: str) -> str:
-    relative = html.relative_to(public).as_posix()
-    if relative == "index.html":
-        return base_path
-    return f"{base_path}{relative.removesuffix('.html')}"
-
-
-RUNTIME_ROOT_PATTERNS = {
-    "origin-root content index": re.compile(
-        r"""(?:fetch\(|new URL\()\s*["']/static/contentIndex\.json"""
-    ),
-    "origin-root URL constructor": re.compile(r"""new URL\(\s*["']/["']?\s*\+"""),
-    "origin-root href assignment": re.compile(r"""\.href\s*=\s*["']/["']?\s*\+"""),
-}
-
-# jsDelivr npm URL parsing. Executable references may be absolute or
-# scheme-relative; normalize those browser-equivalent forms for policy, but
-# reject raw or decoded dot segments before URL normalization can erase an
-# attempted package/path escape.
-JSDELIVR_NPM_REFERENCE = re.compile(
-    r"""(?:(?:https?:)?//cdn\.jsdelivr\.net/npm/)"""
-    r"""(?P<tail>[^"'()<>\s]+)""",
-    re.IGNORECASE,
-)
-EXACT_SEMVER_PATTERN = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?")
-
-# Local bundling means Graph's d3/pixi.js have zero legitimate jsDelivr
-# references in production. The only reviewed runtime exception is the exact
-# KaTeX copy-tex asset emitted by Quartz's latex plugin.
-JSDELIVR_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
-    ("katex", "0.16.11"): frozenset({"dist/contrib/copy-tex.min.js"}),
-}
-
-
-def _strip_query_fragment(value: str) -> str:
-    return re.split(r"[?#]", value, maxsplit=1)[0]
-
-
-def _decoded_dot_segment(segment: str) -> bool:
-    candidate = segment
-    for _ in range(4):
-        if candidate in {".", ".."}:
-            return True
-        decoded = unquote(candidate)
-        if decoded == candidate:
-            return False
-        candidate = decoded
-    return candidate in {".", ".."}
-
-
-def _parse_jsdelivr_tail(tail: str) -> tuple[str | None, str | None, str | None, bool]:
-    has_query_fragment = _strip_query_fragment(tail) != tail
-    path = _strip_query_fragment(tail)
-    segments = path.split("/")
-    if any(_decoded_dot_segment(segment) for segment in segments):
-        return None, None, None, True
-    if has_query_fragment:
-        return None, None, None, True
-    if not segments or not segments[0]:
-        return None, None, None, False
-
-    if segments[0].startswith("@"):
-        if len(segments) < 2 or not segments[1]:
-            return None, None, None, False
-        package_base = f"{segments[0]}/{segments[1].split('@', 1)[0]}"
-        version = None
-        if "@" in segments[1]:
-            _, version = segments[1].rsplit("@", 1)
-        asset_segments = segments[2:]
-        return package_base, version, "/".join(asset_segments), False
-
-    package_segment = segments[0]
-    package = package_segment
-    version = None
-    if "@" in package_segment:
-        package, version = package_segment.rsplit("@", 1)
-    asset_path = "/".join(segments[1:])
-    return package, version, asset_path, False
-
-
-def mutable_cdn_references(source: str) -> int:
-    count = 0
-    for match in JSDELIVR_NPM_REFERENCE.finditer(source):
-        package, version, asset_path, has_dot_segment = _parse_jsdelivr_tail(match["tail"])
-        if has_dot_segment:
-            count += 1
-            continue
-        if (
-            package is not None
-            and version is not None
-            and EXACT_SEMVER_PATTERN.fullmatch(version) is not None
-            and asset_path in JSDELIVR_ALLOWLIST.get((package, version), frozenset())
-        ):
-            continue
-        count += 1
-    return count
-
-
-AUDIT_SCRIPT = Path(__file__).resolve().parent.parent / "quartz" / "scripts" / "audit-runtime-resources.mjs"
-VENDOR_MANIFEST_RELATIVE = PurePosixPath("static/vendor/manifest.json")
-
-
-def sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def run_resource_audit(
-    public: Path,
-    expected_base_path: str,
-    documents: list[tuple[Path, LinkParser]],
-    errors: set[str],
-) -> dict[str, object]:
-    """Run the deterministic AST/resource-graph audit and fold its findings
-    into `errors`.
-
-    This is the non-vacuous replacement for substring-counting Search,
-    Graph, Explorer, the local ESM loader, and Graph's vendor import edges:
-    site/quartz/scripts/audit-runtime-resources.mjs starts at generated HTML
-    scripts/inline bodies, follows reachable imports/load edges, parses only
-    that reachable script graph into real ASTs, prunes provably unreachable
-    branches, and only counts a signature as "functional" when something
-    downstream actually depends on it. A comment, unused string, unreferenced
-    decoy bundle, or dead `if (false) {...}` placeholder cannot satisfy any of
-    these checks. Graph's local vendor assets are cross-checked here against
-    the sha256 recorded in the build-emitted `static/vendor/manifest.json`, so
-    the manifest itself cannot be hand-edited without also matching real
-    deployed bytes.
-    """
-    manifest_path = public / VENDOR_MANIFEST_RELATIVE
-    inline_payload = json.dumps(
-        {
-            "documents": [
-                {
-                    "html": html.relative_to(public).as_posix(),
-                    "scriptSources": document.script_sources,
-                    "inlineScripts": [
-                        {
-                            "id": f"{html.relative_to(public).as_posix()}#{index}",
-                            "source": source,
-                        }
-                        for index, source in enumerate(document.inline_scripts)
-                    ],
-                }
-                for html, document in documents
-            ]
-        }
+def normalized_external_url(raw_url: str) -> str | None:
+    candidate = f"https:{raw_url}" if raw_url.startswith("//") else raw_url
+    parsed = urlparse(candidate)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        return None
+    if parsed.username or parsed.password or parsed.port or parsed.params:
+        return None
+    return urlunsplit(
+        ("https", parsed.hostname.lower(), parsed.path, parsed.query, parsed.fragment)
     )
-    try:
-        result = subprocess.run(
-            ["node", str(AUDIT_SCRIPT), str(public), expected_base_path, str(manifest_path)],
-            input=inline_payload,
-            capture_output=True,
-            text=True,
-            check=False,
+
+
+def validate_external_url(
+    raw_url: str, allowed: frozenset[str], context: str, errors: set[str]
+) -> str | None:
+    normalized = normalized_external_url(raw_url)
+    if normalized is None or normalized not in allowed:
+        errors.add(f"{context}: unreviewed external runtime URL: {raw_url}")
+        return None
+    return normalized
+
+
+def validate_runtime_source(
+    source: str, context: str, base_path: str, errors: set[str]
+) -> set[str]:
+    found: set[str] = set()
+    for description, pattern in ORIGIN_ROOT_PATTERNS.items():
+        if pattern.search(source):
+            errors.add(f"{context}: origin-root {description} bypasses {base_path}")
+    for match in RUNTIME_URL.finditer(source):
+        raw_url = match.group(0).rstrip(";,")
+        normalized = validate_external_url(
+            raw_url, ALLOWED_RUNTIME_URLS, context, errors
         )
-    except OSError as error:
-        errors.add(f"runtime resource audit could not run node: {error}")
-        return {}
-    if result.returncode != 0:
-        errors.add(
-            f"runtime resource audit failed (exit {result.returncode}): "
-            f"{result.stderr.strip() or result.stdout.strip()}"
-        )
-        return {}
-    try:
-        audit = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
-        errors.add(f"runtime resource audit produced invalid JSON: {error}")
-        return {}
-    if "manifestError" in audit:
-        errors.add(f"runtime resource audit: {audit['manifestError']}")
-        return {}
-
-    for entry in audit.get("parseErrors", []):
-        errors.add(f"{entry['file']}: runtime bundle failed to parse: {entry['message']}")
-
-    for entry in audit.get("resourceGraph", {}).get("errors", []):
-        errors.add(f"runtime resource graph: {entry}")
-
-    manifest = audit.get("manifest", {})
-    assets = manifest.get("assets", [])
-    if not assets:
-        errors.add(f"{manifest_path}: vendor manifest declares no assets")
-    for asset in assets:
-        asset_path = public / asset["file"]
-        if not asset_path.is_file():
-            errors.add(f"missing local Graph runtime asset: {asset_path}")
-            continue
-        actual_hash = sha256_file(asset_path)
-        if actual_hash != asset.get("sha256"):
-            errors.add(
-                f"{asset_path}: content hash does not match build manifest {manifest_path} "
-                f"(expected {asset.get('sha256')}, found {actual_hash})"
-            )
-        edge = audit.get("vendorEdges", {}).get(asset["url"], {"edges": 0, "dead": 0})
-        if edge.get("edges", 0) == 0:
-            hint = " (only found in dead/unreachable code)" if edge.get("dead", 0) else ""
-            errors.add(f"postscript.js: missing reachable Graph import edge to {asset['url']}{hint}")
-
-    for surface, counts in audit.get("surfaces", {}).items():
-        if counts.get("functional", 0) == 0:
-            hints = []
-            if counts.get("vacuous", 0):
-                hints.append(f"{counts['vacuous']} vacuous (result discarded)")
-            if counts.get("dead", 0):
-                hints.append(f"{counts['dead']} dead/unreachable")
-            suffix = f" (found only: {', '.join(hints)})" if hints else ""
-            errors.add(f"postscript.js: missing {surface} runtime surface{suffix}")
-
-    if not audit.get("loaderNames"):
-        errors.add(
-            "postscript.js: missing local ESM script-loader function "
-            "(createElement('script') + type='module' + DOM append)"
-        )
-
-    fetch_entries = audit.get("sharedFetchData", [])
-    for entry in fetch_entries:
-        if entry.get("parseError"):
-            errors.add(f"{entry['id']}: inline script failed to parse: {entry['parseError']}")
-    for html, document in documents:
-        if not document.has_body:
-            continue
-        prefix = f"{html.relative_to(public).as_posix()}#"
-        page_entries = [entry for entry in fetch_entries if entry["id"].startswith(prefix)]
-        if sum(entry.get("functional", 0) for entry in page_entries) == 0:
-            hints = []
-            vacuous = sum(entry.get("vacuous", 0) for entry in page_entries)
-            dead = sum(entry.get("dead", 0) for entry in page_entries)
-            if vacuous:
-                hints.append(f"{vacuous} vacuous")
-            if dead:
-                hints.append(f"{dead} dead/unreachable")
-            suffix = f" (found only: {', '.join(hints)})" if hints else ""
-            errors.add(f"{html}: missing inline shared fetchData runtime surface{suffix}")
-
-    return audit
+        if normalized:
+            found.add(normalized)
+    return found
 
 
-def validate_runtime(
+def validate_landing(
     public: Path,
-    expected_base_path: str,
-    documents: list[tuple[Path, LinkParser]],
+    base_path: str,
+    documents: dict[Path, PageParser],
+    inbound: dict[Path, set[Path]],
     errors: set[str],
-) -> dict[str, int]:
-    scripts = sorted(public.rglob("*.js"))
-    origin_root_count = 0
-    mutable_cdn_count = 0
-    bundle_present: set[Path] = set()
-    for script in scripts:
-        source = script.read_text(encoding="utf-8")
-        bundle_present.add(script)
-        for description, pattern in RUNTIME_ROOT_PATTERNS.items():
-            matches = pattern.findall(source)
-            origin_root_count += len(matches)
-            if matches:
-                errors.add(f"{script}: {description} bypasses {expected_base_path}")
-        matches = mutable_cdn_references(source)
-        mutable_cdn_count += matches
-        if matches:
-            errors.add(f"{script}: mutable jsDelivr npm runtime dependency")
+) -> None:
+    index = (public / "index.html").resolve()
+    page = documents.get(index)
+    if page is None:
+        errors.add("missing public/index.html landing page")
+        return
+    if page.meta_refresh or page.noindex:
+        errors.add("public/index.html must be rendered content, not a redirect/noindex stub")
+    if not page.has_body or not page.has_article or len(page.article_text) < 100:
+        errors.add("public/index.html must contain a substantive rendered article")
+    if page.title != LANDING_TITLE:
+        errors.add(f"public/index.html title is {page.title!r}, expected {LANDING_TITLE!r}")
+    expected = f"{SITE_ORIGIN}{base_path}"
+    if not page.canonical or urljoin(expected, page.canonical).rstrip("/") != expected.rstrip("/"):
+        errors.add(f"public/index.html canonical URL must resolve to {expected}")
 
-    required_bundles = (public / "prescript.js", public / "postscript.js")
-    for bundle in required_bundles:
-        if bundle not in bundle_present:
-            errors.add(f"missing required runtime bundle: {bundle}")
-
-    inline_script_count = 0
-    for html, document in documents:
-        inline_script_count += len(document.inline_scripts)
-        for source in document.inline_scripts:
-            for description, pattern in RUNTIME_ROOT_PATTERNS.items():
-                matches = pattern.findall(source)
-                origin_root_count += len(matches)
-                if matches:
-                    errors.add(f"{html}: inline {description} bypasses {expected_base_path}")
-            matches = mutable_cdn_references(source)
-            mutable_cdn_count += matches
-            if matches:
-                errors.add(f"{html}: inline mutable jsDelivr npm runtime dependency")
-        for source in document.script_sources:
-            matches = mutable_cdn_references(source)
-            if matches:
-                mutable_cdn_count += matches
-                errors.add(f"{html}: external script uses mutable jsDelivr npm dependency")
-
-    audit = run_resource_audit(public, expected_base_path, documents, errors)
-    surfaces = audit.get("surfaces", {}) if audit else {}
-    vendor_edges = audit.get("vendorEdges", {}) if audit else {}
-    manifest_assets = audit.get("manifest", {}).get("assets", []) if audit else []
-    fetch_entries = audit.get("sharedFetchData", []) if audit else []
-
-    return {
-        "bundles": len(scripts),
-        "reachable_bundles": audit.get("bundleCount", 0) if audit else 0,
-        "ignored_bundles": len(audit.get("resourceGraph", {}).get("ignoredScripts", []))
-        if audit
-        else 0,
-        "inline_scripts": inline_script_count,
-        "inline_fetch": sum(entry.get("functional", 0) for entry in fetch_entries),
-        "origin_root": origin_root_count,
-        "mutable_cdn": mutable_cdn_count,
-        "local_vendor_assets": sum(
-            1 for asset in manifest_assets if (public / asset["file"]).is_file()
-        ),
-        "local_vendor_references": sum(edge.get("edges", 0) for edge in vendor_edges.values()),
-        "module_loaders": len(audit.get("loaderNames", [])) if audit else 0,
-        **{name: counts.get("functional", 0) for name, counts in surfaces.items()},
-    }
+    readme = (public / REQUIRED_PAGE).resolve()
+    readme_page = documents.get(readme)
+    if readme_page is None or not readme_page.has_body or not readme_page.has_article:
+        errors.add(f"{REQUIRED_PAGE} must remain a separate rendered wiki note")
+    elif not inbound.get(readme):
+        errors.add(f"{REQUIRED_PAGE} must be linked from another generated page")
 
 
 def main() -> int:
@@ -388,71 +220,107 @@ def main() -> int:
     parser.add_argument("public", type=Path)
     parser.add_argument("base_path")
     args = parser.parse_args()
+
     public = args.public.resolve()
     base_path = f"/{args.base_path.strip('/')}/"
     html_files = sorted(public.rglob("*.html"))
     errors: set[str] = set()
-    checked = 0
-    body_pages = 0
-    documents: list[tuple[Path, LinkParser]] = []
-
-    if not (public / "index.html").is_file():
-        errors.add("missing public/index.html landing page")
+    documents: dict[Path, PageParser] = {}
+    inbound: dict[Path, set[Path]] = {}
+    referenced_scripts: set[Path] = set()
+    reviewed_urls: set[str] = set()
+    checked_links = 0
 
     for html in html_files:
-        document = LinkParser()
-        document.feed(html.read_text(encoding="utf-8"))
-        documents.append((html, document))
-        if document.has_body:
-            body_pages += 1
-            if document.body_base_path != base_path.rstrip("/"):
-                errors.add(
-                    f"{html}: body data-basepath is {document.body_base_path!r}, "
-                    f"expected {base_path.rstrip('/')!r}"
-                )
-        current_url = f"https://justinchuby.github.io{page_url(html, public, base_path)}"
-        for raw_url in document.urls:
+        page = PageParser()
+        page.feed(html.read_text(encoding="utf-8"))
+        resolved_html = html.resolve()
+        documents[resolved_html] = page
+        current_url = f"{SITE_ORIGIN}{page_url(html, public, base_path)}"
+
+        if page.has_body and page.body_base_path != base_path.rstrip("/"):
+            errors.add(
+                f"{html}: body data-basepath is {page.body_base_path!r}, "
+                f"expected {base_path.rstrip('/')!r}"
+            )
+
+        for raw_url in page.urls:
+            if not raw_url or raw_url.startswith("#"):
+                continue
             parsed = urlparse(raw_url)
             if parsed.scheme in {"data", "mailto", "tel", "javascript"}:
                 continue
             if parsed.netloc and parsed.hostname != "justinchuby.github.io":
                 continue
-            if parsed.scheme in {"http", "https"} and parsed.hostname != "justinchuby.github.io":
-                continue
-            if raw_url.startswith("#") or not raw_url:
-                continue
-            checked += 1
-            resolved = urlparse(urljoin(current_url, raw_url))
-            if resolved.path != base_path.rstrip("/") and not resolved.path.startswith(base_path):
+            checked_links += 1
+            deployed = urlparse(urljoin(current_url, raw_url)).path
+            if deployed != base_path.rstrip("/") and not deployed.startswith(base_path):
                 errors.add(f"{html}: internal URL escapes {base_path}: {raw_url}")
                 continue
-            candidates = output_candidates(public, resolved.path, base_path)
-            if not any(candidate.is_file() for candidate in candidates):
+            candidates = output_candidates(public, deployed, base_path)
+            target = next((candidate for candidate in candidates if candidate.is_file()), None)
+            if target is None:
                 errors.add(f"{html}: missing internal target: {raw_url}")
+                continue
+            inbound.setdefault(target, set()).add(resolved_html)
 
-    if body_pages == 0:
-        errors.add("no generated page has a body for runtime navigation")
-    runtime = validate_runtime(public, base_path, documents, errors)
+        for raw_url in page.script_sources:
+            parsed = urlparse(raw_url)
+            if parsed.netloc:
+                normalized = validate_external_url(
+                    raw_url, ALLOWED_EXTERNAL_SCRIPTS, str(html), errors
+                )
+                if normalized:
+                    reviewed_urls.add(normalized)
+                continue
+            deployed = urlparse(urljoin(current_url, raw_url)).path
+            target = next(
+                (
+                    candidate
+                    for candidate in output_candidates(public, deployed, base_path)
+                    if candidate.is_file()
+                ),
+                None,
+            )
+            if target is not None and target.suffix == ".js":
+                referenced_scripts.add(target)
+
+        for raw_url in page.stylesheets:
+            if urlparse(raw_url).netloc:
+                normalized = validate_external_url(
+                    raw_url, ALLOWED_EXTERNAL_STYLES, str(html), errors
+                )
+                if normalized:
+                    reviewed_urls.add(normalized)
+
+        for index, source in enumerate(page.inline_scripts):
+            reviewed_urls.update(
+                validate_runtime_source(
+                    source, f"{html} inline script {index}", base_path, errors
+                )
+            )
+
+    for script in sorted(referenced_scripts):
+        reviewed_urls.update(
+            validate_runtime_source(
+                script.read_text(encoding="utf-8"), str(script), base_path, errors
+            )
+        )
+
+    validate_landing(public, base_path, documents, inbound, errors)
     if errors:
         print("\n".join(sorted(errors)), file=sys.stderr)
-        print(f"Found {len(errors)} generated site link error(s).", file=sys.stderr)
+        print(f"Found {len(errors)} generated site validation error(s).", file=sys.stderr)
         return 1
+
     print(
-        f"Validated {checked} generated internal link(s)/asset(s) across "
-        f"{len(html_files)} HTML page(s) and {runtime['bundles']} runtime bundle(s) "
-        f"at {base_path}."
+        f"Validated {checked_links} internal link(s)/asset(s) across "
+        f"{len(html_files)} HTML page(s) at {base_path}; "
+        f"{len(referenced_scripts)} referenced local script(s) exist."
     )
     print(
-        f"Runtime audit: {runtime['inline_scripts']} inline script body(s), "
-        f"{runtime['inline_fetch']} shared fetchData surface(s), "
-        f"Search={runtime['Search']}, Graph={runtime['Graph']}, "
-        f"Explorer={runtime['Explorer']}, forbidden origin-root="
-        f"{runtime['origin_root']}, mutable CDN={runtime['mutable_cdn']}, "
-        f"local vendor assets={runtime['local_vendor_assets']}, "
-        f"local vendor references={runtime['local_vendor_references']}, "
-        f"module loaders={runtime['module_loaders']}, "
-        f"reachable bundles={runtime['reachable_bundles']}, "
-        f"ignored unreferenced bundles={runtime['ignored_bundles']}."
+        "Reviewed external runtime URL(s): "
+        + ", ".join(sorted(reviewed_urls))
     )
     return 0
 
