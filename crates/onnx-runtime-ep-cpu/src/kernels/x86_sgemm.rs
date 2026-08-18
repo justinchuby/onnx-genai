@@ -211,6 +211,185 @@ fn sgemm_simd_packed(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n:
     });
 }
 
+/// Transposed-B ("NT") entry point: `c[m,n] = a[m,k] @ b_nk[n,k]^T`, where
+/// `b_nk` is `[n, k]` row-major (output row `n` at offset `n*k`, unit stride
+/// over `k`). This is the layout the int4 `MatMulNBits` decode path already
+/// caches (`weight_nk`), so routing prefill through here lets the batched GEMM
+/// reuse that one contiguous dequant instead of materializing a second,
+/// transposed `[k, n]` copy — the strided-scatter `Kn` pass that dominated
+/// large-model time-to-first-token (#959).
+///
+/// **Bit-identical to `sgemm_simd(a, b_kn, c, m, k, n)`** on the `[k, n]`
+/// transpose `b_kn` of `b_nk` (i.e. `b_kn[p*n + j] == b_nk[j*k + p]`): the
+/// NT B-packer ([`pack_b_nt`]) produces the exact same packed panels the NN
+/// packer ([`pack_b`]) would from `b_kn`, and the same [`pack_a`],
+/// [`micro_6x16`] and K-panel order run over them, so every output element's
+/// f32 accumulation sequence is unchanged. The only thing that moves is *how*
+/// B reaches the pack buffer: MLAS's trick, ported natively — a contiguous
+/// read of one `b_nk` row into an L1-resident tile at pack time, not a
+/// full-array stride-`n` scatter.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) fn sgemm_simd_nt(a: &[f32], b_nk: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        for v in c.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+    sgemm_simd_nt_packed(a, b_nk, c, m, k, n);
+}
+
+/// Packed GEBP path for the transposed-B GEMM. Mirrors [`sgemm_simd_packed`]
+/// exactly — same A packing, same column-strip / K-panel blocking, same
+/// microkernel — except each strip packs its B panels from the `[n, k]`
+/// operand via [`pack_b_nt`] rather than from a `[k, n]` operand via
+/// [`pack_b`]. Because the packed panels are byte-for-byte identical to the NN
+/// path's, so is the result.
+///
+/// Column strips are the unit of parallelism. When this runs inside an ORT
+/// session an intra-op host pool is installed ([`onnx_runtime_ep_api::host_parallel`]);
+/// the strips are dispatched onto *that* pool instead of forking a second
+/// (rayon) pool beside ORT's spinning workers (#1143). With no host installed
+/// — the native executor, which owns the machine — the strips run on rayon as
+/// before. The strip decomposition does not affect any output element's
+/// reduction order, so the choice of pool is numerically transparent.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn sgemm_simd_nt_packed(a: &[f32], b_nk: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    // Pack A once: one contiguous [k][MR] panel per MR-row block, zero-padded.
+    let m_panels = m.div_ceil(MR);
+    let mut apack = vec![0.0f32; m_panels * k * MR];
+    pack_a(a, &mut apack, m, k);
+
+    // Choose an NR-aligned column strip width: enough strips for load balance
+    // while keeping each packed B panel cache-friendly (same policy as the NN
+    // packed path).
+    let n_panels = n.div_ceil(NR);
+    let threads = rayon::current_num_threads().max(1);
+    let target_tasks = threads.saturating_mul(8).max(1);
+    let panels_per_strip = n_panels.div_ceil(target_tasks).clamp(1, 16);
+    let strip_cols = panels_per_strip * NR;
+    let strip_count = n.div_ceil(strip_cols);
+
+    let cptr = CPtr(c.as_mut_ptr());
+    let apack = &apack;
+
+    // One column strip `[j0, j0+nc)` of C: pack its B panels from `b_nk` and
+    // drive the microkernel across every K-panel. Each strip writes a disjoint
+    // set of columns, so tasks never alias.
+    let run_strip = move |s: usize| {
+        let j0 = s * strip_cols;
+        let nc = strip_cols.min(n - j0);
+        let strip_panels = nc.div_ceil(NR);
+        let mut bpack = vec![0.0f32; KC * strip_panels * NR];
+        // SAFETY: `cptr` addresses the caller's `c`; this task only writes
+        // columns [j0, j0+nc), disjoint from every other strip.
+        let c_base = cptr.get();
+
+        let mut pc = 0usize;
+        while pc < k {
+            let kc = KC.min(k - pc);
+            pack_b_nt(b_nk, &mut bpack, k, pc, kc, j0, nc);
+            let first = pc == 0;
+
+            for ip in 0..m_panels {
+                let i0 = ip * MR;
+                let mr = MR.min(m - i0);
+                let apanel = &apack[ip * k * MR + pc * MR..ip * k * MR + pc * MR + kc * MR];
+                let mut jr = 0usize;
+                let mut jp = 0usize;
+                while jr < nc {
+                    let nr = NR.min(nc - jr);
+                    let bpanel = &bpack[jp * KC * NR..jp * KC * NR + kc * NR];
+                    // SAFETY: AVX2/FMA verified by the caller; `c_base` points at
+                    // valid `m*n` storage and (i0,j0+jr) with (mr,nr) stays in
+                    // bounds; this strip owns these columns exclusively.
+                    unsafe {
+                        micro_6x16(
+                            apanel.as_ptr(),
+                            bpanel.as_ptr(),
+                            c_base.add(i0 * n + j0 + jr),
+                            n,
+                            kc,
+                            mr,
+                            nr,
+                            first,
+                        );
+                    }
+                    jr += NR;
+                    jp += 1;
+                }
+            }
+            pc += KC;
+        }
+    };
+
+    dispatch_strips(strip_count, &run_strip);
+}
+
+/// Dispatch `strip_count` independent column strips across a thread pool.
+///
+/// Prefers the host runtime's own pool when one is installed and has been seen
+/// to help (an ORT intra-op pool — #1143): forking a rayon pool beside ORT's
+/// spinning workers oversubscribes the cores. Falls back to rayon when there is
+/// no host (the native executor) or the host's pool has no workers. A strip
+/// reached from inside a host task keeps running on that task's thread rather
+/// than nesting a second split.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn dispatch_strips(strip_count: usize, run_strip: &(dyn Fn(usize) + Sync)) {
+    use onnx_runtime_ep_api::host_parallel;
+
+    if !host_parallel::in_host_task()
+        && let Some(host) = host_parallel::current()
+        && host.prefer_host()
+    {
+        host.run(strip_count, run_strip);
+        return;
+    }
+    (0..strip_count).into_par_iter().for_each(run_strip);
+}
+
+/// Pack a `kc x nc` block of the transposed operand `b_nk` (`[n, k]`
+/// row-major) into `NR`-column panels, producing the *same* bytes
+/// [`pack_b`] would from the `[k, n]` transpose. For output column
+/// `col = j0 + jp*NR + c`, `b_nk` row `col` is contiguous over `k`, so the
+/// `kc` depths for that column are read with unit stride (`b_nk[col*k + pc ..]`)
+/// and scattered into the L1-resident pack tile at stride `NR`. That is the
+/// whole transpose, done as a pack-time reshape of a tile already in cache
+/// rather than a stride-`n` scatter across the full array.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn pack_b_nt(
+    b_nk: &[f32],
+    bpack: &mut [f32],
+    k: usize,
+    pc: usize,
+    kc: usize,
+    j0: usize,
+    nc: usize,
+) {
+    let n_panels = nc.div_ceil(NR);
+    for jp in 0..n_panels {
+        let jcol = j0 + jp * NR;
+        let nr = NR.min(nc - jp * NR);
+        let dst = &mut bpack[jp * KC * NR..jp * KC * NR + kc * NR];
+        for c in 0..nr {
+            // `b_nk` row `jcol + c` is contiguous over the K dimension.
+            let src = &b_nk[(jcol + c) * k + pc..(jcol + c) * k + pc + kc];
+            for (p, &value) in src.iter().enumerate() {
+                dst[p * NR + c] = value;
+            }
+        }
+        // Zero-pad columns [nr, NR) so the microkernel needs no masking.
+        if nr < NR {
+            for p in 0..kc {
+                dst[p * NR + nr..p * NR + NR].fill(0.0);
+            }
+        }
+    }
+}
+
 /// A/B toggle for the #1091 native M=1 GEMV that absorbs MLAS's `SgemmKernelM1`
 /// mechanism (stream B in place, no packed buffer) into the built-in `SimdX86`
 /// backend. `1`/`on` enables it; unset or `0`/`off` keeps the packed GEBP path
@@ -651,5 +830,197 @@ mod tests {
             max_err <= 1e-3 * (1.0 + max_ref),
             "m1 GEMV vs packed max abs error {max_err} exceeds tolerance (max_ref {max_ref})"
         );
+    }
+
+    /// Transpose a `[k, n]` row-major matrix into the `[n, k]` row-major
+    /// ("Nk") layout the NT kernel reads: `b_nk[j*k + p] == b_kn[p*n + j]`.
+    fn transpose_kn_to_nk(b_kn: &[f32], k: usize, n: usize) -> Vec<f32> {
+        let mut b_nk = vec![0.0f32; n * k];
+        for p in 0..k {
+            for j in 0..n {
+                b_nk[j * k + p] = b_kn[p * n + j];
+            }
+        }
+        b_nk
+    }
+
+    /// The NT kernel (`c = a @ b_nk^T`) must be **bit-identical** to the NN
+    /// packed path (`c = a @ b_kn`) on the transpose of `b_nk`. The NT B-packer
+    /// produces the same packed panels the NN packer would, and the same
+    /// microkernel and K-panel order run over them, so the f32 accumulation
+    /// sequence — and therefore every bit of the result — is unchanged. This is
+    /// stricter than a tolerance check and is the property `MatMulNBits` prefill
+    /// relies on to reuse its cached `Nk` dequant.
+    fn check_nt_bit_identical(m: usize, k: usize, n: usize) {
+        if !has_simd_x86() {
+            return; // No AVX2/FMA: the SIMD path is never selected here.
+        }
+        let a = fill(m * k, 2);
+        let b_kn = fill(k * n, 13);
+        let b_nk = transpose_kn_to_nk(&b_kn, k, n);
+
+        // NN reference: force the packed path (never the M=1 GEMV) so the
+        // comparison is packed-vs-packed for every m.
+        let mut expect = vec![0.0f32; m * n];
+        sgemm_simd_packed(&a, &b_kn, &mut expect, m, k, n);
+
+        let mut got = vec![0.0f32; m * n];
+        sgemm_simd_nt(&a, &b_nk, &mut got, m, k, n);
+
+        for (idx, (g, e)) in got.iter().zip(expect.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                e.to_bits(),
+                "NT vs NN packed not bit-identical for {m}x{k}x{n} at {idx}: got {g}, expect {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn nt_matches_nn_packed_bit_identical() {
+        // Exact tile multiples and a multi-KC-panel K.
+        check_nt_bit_identical(12, 64, 32);
+        check_nt_bit_identical(9, KC * 2 + 13, 48);
+        // Tail shapes: m, k, n not multiples of MR(6)/NR(16)/8; the corners
+        // where an NT packer's zero-padding and edge stores would break.
+        for &m in &[1usize, 2, 7, 33] {
+            for &n in &[1usize, 3, 63, 64, 65] {
+                check_nt_bit_identical(m, 40, n);
+            }
+        }
+        check_nt_bit_identical(7, 33, 17);
+        check_nt_bit_identical(5, 1, 5);
+    }
+
+    /// Randomized differential sweep: NT vs NN packed over a spread of odd
+    /// shapes must be bit-identical every time.
+    #[test]
+    fn nt_matches_nn_packed_randomized() {
+        if !has_simd_x86() {
+            return;
+        }
+        // A small LCG so the shapes are reproducible without an rng dep.
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let mut next = |bound: usize| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            1 + (state >> 33) as usize % bound
+        };
+        for _ in 0..64 {
+            let m = next(40);
+            let k = next(300);
+            let n = next(200);
+            check_nt_bit_identical(m, k, n);
+        }
+    }
+
+    #[test]
+    fn nt_zero_dims() {
+        let mut c = vec![1.0f32; 4];
+        sgemm_simd_nt(&[], &[], &mut c, 0, 3, 4); // m=0: leaves c untouched
+        assert_eq!(&c[..4], &[1.0, 1.0, 1.0, 1.0]);
+        sgemm_simd_nt(&[1.0], &[], &mut c, 2, 0, 2); // k=0: zeros c
+        assert_eq!(&c[..4], &[0.0, 0.0, 0.0, 0.0]);
+    }
+
+    /// Microbenchmark for the NT prefill route (#959, #1091). Quantifies, at
+    /// real decode-layer shapes, the term this change removes: the strided
+    /// `Kn` materialization (each K step written at stride N — the scatter #959
+    /// measured at ~2.9x the contiguous `Nk` pass and degrading with N), plus
+    /// the NN vs NT GEMM cost over the same data. The NT route reuses the
+    /// contiguous `Nk` weight the decode path already caches, so the whole `Kn`
+    /// pass goes to zero. Bit-identity (NT == NN on the transpose) is asserted
+    /// in the same harness so the timing is never taken on a wrong result.
+    ///
+    /// Ignored by default (a benchmark, not a correctness gate). Run with:
+    /// `cargo test --release -p onnx-runtime-ep-cpu --lib nt_prefill_bench \
+    ///   -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+    fn nt_prefill_bench() {
+        use std::time::Instant;
+
+        // Representative decode-projection shapes (K x N), prefill row count m.
+        let shapes = [(5120usize, 5120usize), (5120, 13824), (13824, 5120)];
+        let m = 16usize;
+        let reps = 7;
+
+        for (k, n) in shapes {
+            // The natural contiguous [n, k] weight the decode path caches.
+            let b_nk = fill(n * k, 21);
+            let a = fill(m * k, 4);
+
+            // Correctness: NT over b_nk must equal NN over its [k, n] transpose.
+            let b_kn = transpose_kn_to_nk(&b_nk, n, k); // reuse: [n,k]->[k,n]
+            let mut nn = vec![0.0f32; m * n];
+            let mut nt = vec![0.0f32; m * n];
+            sgemm_simd_packed(&a, &b_kn, &mut nn, m, k, n);
+            sgemm_simd_nt(&a, &b_nk, &mut nt, m, k, n);
+            assert_eq!(nn, nt, "NT vs NN not bit-identical at {m}x{k}x{n}");
+
+            // Time the strided-scatter Kn materialization the NT route removes:
+            // building the [k, n] transpose from [n, k] (element weight[out,depth]
+            // written at index depth*n+out) — the shape of the `dequant-kn` pass.
+            let mut kn_scatter = vec![0.0f32; k * n];
+            let scatter = |dst: &mut [f32]| {
+                for out in 0..n {
+                    let row = &b_nk[out * k..out * k + k];
+                    for (depth, &v) in row.iter().enumerate() {
+                        dst[depth * n + out] = v;
+                    }
+                }
+            };
+            let bench = |label: &str, mut f: Box<dyn FnMut() + '_>| {
+                let mut samples: Vec<f64> = (0..reps)
+                    .map(|_| {
+                        let t = Instant::now();
+                        f();
+                        t.elapsed().as_secs_f64() * 1e3
+                    })
+                    .collect();
+                samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let best = samples[0];
+                let worst = samples[reps - 1];
+                let median = samples[reps / 2];
+                eprintln!(
+                    "  {label:<14} best={best:7.3}ms median={median:7.3}ms worst={worst:7.3}ms"
+                );
+                best
+            };
+
+            eprintln!(
+                "shape m={m} k={k} n={n} (weight {} MiB f32):",
+                (n * k * 4) >> 20
+            );
+            let kn_ms = bench(
+                "dequant-kn*",
+                Box::new(|| {
+                    scatter(&mut kn_scatter);
+                    std::hint::black_box(&kn_scatter);
+                }),
+            );
+            let nn_ms = bench(
+                "NN gemm",
+                Box::new(|| {
+                    sgemm_simd_packed(&a, &b_kn, &mut nn, m, k, n);
+                    std::hint::black_box(&nn);
+                }),
+            );
+            let nt_ms = bench(
+                "NT gemm",
+                Box::new(|| {
+                    sgemm_simd_nt(&a, &b_nk, &mut nt, m, k, n);
+                    std::hint::black_box(&nt);
+                }),
+            );
+            eprintln!(
+                "  old (dequant-kn* + NN) = {:.3}ms  ->  new (NT, kn removed) = {:.3}ms  \
+                 [dequant-kn* is a plain f32 transpose; the int4 dequant it stands in for \
+                 is ~2.9x heavier per #959]",
+                kn_ms + nn_ms,
+                nt_ms
+            );
+        }
     }
 }

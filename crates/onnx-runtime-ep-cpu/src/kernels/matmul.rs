@@ -1085,6 +1085,69 @@ pub(crate) fn gemm_with_backend(
     }
 }
 
+/// Whether a transposed-B ("NT") dense GEMM — `c[m,n] = a[m,k] @ b_nk[n,k]^T`,
+/// reading the weight in its natural `[n, k]` layout with no `[k, n]` copy — is
+/// available for `backend`. This is the single legality predicate shared by the
+/// MLAS and native `MatMulNBits` prefill routes (see [`gemm_nt_with_backend`]);
+/// keeping it in one place stops the two build configurations from drifting.
+pub(crate) fn nt_gemm_supported(backend: CpuBackend) -> bool {
+    match backend {
+        #[cfg(feature = "mlas")]
+        CpuBackend::Mlas => true,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        CpuBackend::SimdX86 => true,
+        _ => {
+            let _ = backend;
+            false
+        }
+    }
+}
+
+/// Transposed-B dense GEMM: `c[m,n] = a[m,k] @ b_nk[n,k]^T`, where `b_nk` is
+/// `[n, k]` row-major. **Bit-identical** to `gemm_with_backend(backend, a,
+/// b_kn, c, m, k, n)` on the `[k, n]` transpose `b_kn` of `b_nk`, for every
+/// backend [`nt_gemm_supported`] accepts — the property `MatMulNBits` prefill
+/// relies on to reuse its cached `[n, k]` dequant instead of building a
+/// transposed copy.
+///
+/// * `Mlas`: MLAS's cache-tiled SGEMM with `trans_b` (`ldb = k`) reads `b_nk`
+///   as the transposed operand directly.
+/// * `SimdX86`: the native NT SGEMM ([`x86_sgemm::sgemm_simd_nt`]), which packs
+///   the same B panels the NN path would and drives the same microkernel.
+///
+/// `backend` must satisfy [`nt_gemm_supported`]; callers gate on it, and an
+/// unsupported backend here is a caller bug rather than a runtime condition.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_nt_with_backend(
+    backend: CpuBackend,
+    a: &[f32],
+    b_nk: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<()> {
+    match backend {
+        #[cfg(feature = "mlas")]
+        CpuBackend::Mlas => {
+            // C[m, n] = A[m, k] * B_nk[n, k]^T. `trans_b` with `ldb = k` reads
+            // the Nk weight as the transposed operand without materializing a
+            // Kn copy.
+            mlas_sys::sgemm(false, true, m, n, k, 1.0, a, k, b_nk, k, 0.0, c, n);
+            Ok(())
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        CpuBackend::SimdX86 => {
+            x86_sgemm::sgemm_simd_nt(a, b_nk, c, m, k, n);
+            Ok(())
+        }
+        _ => Err(EpError::KernelFailed(format!(
+            "gemm_nt_with_backend called for backend {backend:?} without a transposed-B GEMM; \
+             callers must gate on nt_gemm_supported"
+        ))),
+    }
+}
+
 // Register microkernel tile: MR rows x NR cols of C accumulated in registers.
 const MR: usize = 4;
 const NR: usize = 4;
