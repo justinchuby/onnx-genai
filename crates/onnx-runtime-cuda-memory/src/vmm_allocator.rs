@@ -49,7 +49,6 @@
 //!
 //! [`CudaDeviceAllocator`]: crate::device_allocator::CudaDeviceAllocator
 
-use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,7 +56,7 @@ use std::sync::{Arc, Mutex};
 
 use onnx_runtime_memory_governor::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HolderId, MappedPhysicalCapacityToken,
-    MechanismId, MemoryAuthorityId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole,
+    MemoryAuthorityId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, ReleaseReport,
     SharedDevicePrefix, SharedMapping, SharedPrefixCommitInfo, Tier,
     VirtualBacking as MemoryVirtualBacking,
 };
@@ -168,6 +167,21 @@ static GLOBAL_REF_UNDERFLOWS: AtomicU64 = AtomicU64::new(0);
 /// actually the opposite. Clamping keeps the reading sane; this counter is how
 /// the underlying fault stays visible rather than being smoothed away.
 static GLOBAL_BYTE_UNDERFLOWS: AtomicU64 = AtomicU64::new(0);
+/// Times a not-yet-live allocation's mid-construction rollback could not
+/// fully release every granule it had provisionally claimed, and the
+/// address range was deliberately leaked (left out of the free list) rather
+/// than given back while still genuinely committed.
+///
+/// Always zero in a correct run against healthy hardware. This only ever
+/// increments when the underlying CUDA release itself fails during a
+/// rollback that has not yet handed any live pointer to a caller -- there is
+/// no live allocation to retry the release through, so the safe action is to
+/// leak the address range (never let a *different* allocation collide with
+/// memory this call could not prove was released) rather than either corrupt
+/// free-list/tracking state or build unwinding-unsafe retry machinery onto a
+/// path with no caller-visible handle to retry from (#1186 Phase 2 review,
+/// round 5 finding 3).
+static GLOBAL_ROLLBACK_LEAKS: AtomicU64 = AtomicU64::new(0);
 /// Committed bytes the arena could not move from its private startup ledger
 /// into the adopted governor.
 ///
@@ -242,6 +256,14 @@ pub struct GlobalVmmStats {
     /// will not see it through the governor and can therefore over-admit later
     /// work.
     pub unaccounted_committed_bytes: u64,
+    /// Times a not-yet-live allocation's mid-construction rollback could not
+    /// fully release a provisional granule claim and deliberately leaked the
+    /// address range instead.
+    ///
+    /// **Anything but zero on healthy hardware is worth investigating**, but
+    /// it is a bounded address-space leak, not a correctness fault: see
+    /// `GLOBAL_ROLLBACK_LEAKS`.
+    pub rollback_leaks: u64,
 }
 
 /// Read the process-global VMM arena counters.
@@ -260,6 +282,7 @@ pub fn global_vmm_stats() -> GlobalVmmStats {
         ref_underflows: GLOBAL_REF_UNDERFLOWS.load(Ordering::Relaxed),
         byte_underflows: GLOBAL_BYTE_UNDERFLOWS.load(Ordering::Relaxed),
         unaccounted_committed_bytes: GLOBAL_UNACCOUNTED_COMMITTED_BYTES.load(Ordering::Relaxed),
+        rollback_leaks: GLOBAL_ROLLBACK_LEAKS.load(Ordering::Relaxed),
     }
 }
 
@@ -275,6 +298,7 @@ pub fn reset_global_vmm_stats() {
     GLOBAL_REF_UNDERFLOWS.store(0, Ordering::Relaxed);
     GLOBAL_BYTE_UNDERFLOWS.store(0, Ordering::Relaxed);
     GLOBAL_UNACCOUNTED_COMMITTED_BYTES.store(0, Ordering::Relaxed);
+    GLOBAL_ROLLBACK_LEAKS.store(0, Ordering::Relaxed);
 }
 
 fn note_commit(granularity: usize) {
@@ -1120,8 +1144,71 @@ impl CudaVmmAllocator {
         unmapped
     }
 
-    fn release_committed_granules(&self, arena: &mut Arena, granules: &BTreeSet<usize>) {
-        self.release_granules(arena, granules);
+    /// Roll back a not-yet-live span during `allocate_committed`'s
+    /// mid-construction failure paths.
+    ///
+    /// No live pointer has been handed to any caller at this point (the span
+    /// was never inserted into `arena.spans.live`), so there is nothing to
+    /// retry through and no accounting caller could double-release. If every
+    /// provisionally claimed granule genuinely releases, the address range is
+    /// given back to the free list as before. If reconciliation finds any
+    /// granule whose release did not complete, the address range is
+    /// deliberately **not** given back -- handing it to a new allocation
+    /// while CUDA still considers part of it mapped would let that new
+    /// allocation collide with memory this call could not prove was freed.
+    /// The leak is bounded to this one rollback and is recorded via
+    /// [`GLOBAL_ROLLBACK_LEAKS`] rather than silently disappearing (#1186
+    /// Phase 2 review, round 5 finding 3).
+    fn rollback_uncommitted_span(
+        &self,
+        arena: &mut Arena,
+        offset: usize,
+        bytes: usize,
+        granules: &BTreeSet<usize>,
+    ) {
+        let (unresolved, _unmapped) = self.release_granules_reconciled(arena, granules);
+        if unresolved.is_empty() {
+            arena.spans.give_back(offset, bytes);
+        } else {
+            GLOBAL_ROLLBACK_LEAKS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Release every granule in `granules`, returning the physical bytes
+    /// genuinely released alongside the subset of `granules` whose release
+    /// did **not** actually complete — these remain owned and must stay
+    /// tracked by whichever span still claims them.
+    ///
+    /// [`Self::release_granules_report`] already leaves `granule_refs`
+    /// unchanged for a granule whose sole (ref count `1`) release attempt
+    /// fails: the granule is never zeroed unless
+    /// [`onnx_runtime_virtual_memory::VirtualBacking::release`] actually
+    /// succeeds for it. This snapshots each granule's ref count before that
+    /// call and compares it to the ref count after: a granule whose count
+    /// dropped resolved this span's claim on it (either it was genuinely
+    /// unmapped, or another span still holds it and this span's share of it
+    /// is simply gone); a granule whose count is unchanged did not resolve
+    /// -- its release either failed or hit the ref-underflow bug case -- and
+    /// must not be treated as though it were (#1186 Phase 2 review, round 5
+    /// finding 3).
+    fn release_granules_reconciled(
+        &self,
+        arena: &mut Arena,
+        granules: &BTreeSet<usize>,
+    ) -> (BTreeSet<usize>, u64) {
+        let before: Vec<u32> = granules
+            .iter()
+            .map(|&granule| arena.spans.granule_refs[granule])
+            .collect();
+        let unmapped = self.release_granules_report(arena, granules);
+        let mut unresolved = BTreeSet::new();
+        for (&granule, &before_ref) in granules.iter().zip(before.iter()) {
+            let after_ref = arena.spans.granule_refs[granule];
+            if before_ref > 0 && after_ref == before_ref {
+                unresolved.insert(granule);
+            }
+        }
+        (unresolved, unmapped)
     }
 
     /// Estimate new authority-owned physical bytes needed to back a live span.
@@ -1214,20 +1301,40 @@ impl CudaVmmAllocator {
         Ok(commit)
     }
 
-    /// Release a live allocation and report physical bytes actually unmapped.
-    pub fn deallocate_span(&self, ptr: NonNull<u8>) -> u64 {
+    /// Release a live allocation and report the outcome.
+    ///
+    /// Reconciles free-list/tracking state under the same arena-lock
+    /// acquisition that performs the release, so the address is given back
+    /// to the free list if and only if every granule this span claimed
+    /// genuinely released: giving it back unconditionally (as a prior
+    /// version of this method did) let a granule whose release failed be
+    /// silently orphaned from tracking while a concurrent allocation reused
+    /// its address, corrupting both (#1186 Phase 2 review, round 5 finding
+    /// 1).
+    pub fn deallocate_span(&self, ptr: NonNull<u8>) -> ReleaseReport {
         let mut arena = self.lock();
         let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
         let address = ptr.as_ptr() as usize;
         let Some(offset) = address.checked_sub(base) else {
-            return 0;
+            return ReleaseReport::complete(0);
         };
-        let Some(live) = arena.spans.live.remove(&offset) else {
-            return 0;
+        let Some(mut live) = arena.spans.live.remove(&offset) else {
+            return ReleaseReport::complete(0);
         };
-        let unmapped = self.release_granules_report(&mut arena, &live.committed);
-        arena.spans.give_back(offset, live.len);
-        unmapped
+        let (unresolved, unmapped) = self.release_granules_reconciled(&mut arena, &live.committed);
+        if unresolved.is_empty() {
+            arena.spans.give_back(offset, live.len);
+            ReleaseReport::complete(unmapped)
+        } else {
+            // Some granule's release did not complete: this span's claim on
+            // it is still real, so the span stays tracked at the same
+            // offset and the address is not given back -- reusing it now
+            // would collide a new allocation with memory this call could
+            // not actually release.
+            live.committed = unresolved;
+            arena.spans.live.insert(offset, live);
+            ReleaseReport::partial(unmapped)
+        }
     }
 
     /// Declare a CUDA graph capture (or replay window) open on this allocator.
@@ -1746,8 +1853,8 @@ impl DeviceAllocator for CudaVmmAllocator {
         ptr: NonNull<u8>,
         _bytes: usize,
         _align: usize,
-    ) -> u64 {
-        self.deallocate_span(ptr)
+    ) -> Result<ReleaseReport, MemoryError> {
+        Ok(self.deallocate_span(ptr))
     }
 
     fn device(&self) -> DeviceKey {
@@ -1777,16 +1884,6 @@ impl DeviceAllocator for CudaVmmAllocator {
     /// [`impl SharedMapping`]: #impl-SharedMapping-for-CudaVmmAllocator
     fn as_shared_mapping(&self) -> Option<&dyn SharedMapping> {
         self.backing.physical_pool().is_some().then_some(self)
-    }
-
-    /// `Some(MechanismId::of(self))`: `CudaVmmAllocator` is a concrete,
-    /// `'static` type, and every capability it advertises through
-    /// `as_virtual_backing`/`as_shared_mapping` returns `self` — so its own
-    /// identity is exactly what a caller needs to prove a capability
-    /// genuinely came from this allocator (#1186 Phase 2 review, round 4
-    /// finding 2).
-    fn mechanism_id(&self) -> Option<MechanismId> {
-        Some(MechanismId::of(self))
     }
 }
 
@@ -1832,8 +1929,7 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
         let mut committed = BTreeSet::new();
         for range in committed_ranges {
             if range.start > range.end || range.end > bytes {
-                self.release_committed_granules(&mut arena, &committed);
-                arena.spans.give_back(offset, bytes);
+                self.rollback_uncommitted_span(&mut arena, offset, bytes, &committed);
                 return Err(invalid(
                     bytes,
                     format!(
@@ -1854,8 +1950,7 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
             let claimed = match self.claim_granules(&mut arena, granules) {
                 Ok(claimed) => claimed,
                 Err(error) => {
-                    self.release_committed_granules(&mut arena, &committed);
-                    arena.spans.give_back(offset, bytes);
+                    self.rollback_uncommitted_span(&mut arena, offset, bytes, &committed);
                     return Err(error);
                 }
             };
@@ -1889,8 +1984,8 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
         ptr: NonNull<u8>,
         _allocation_bytes: usize,
         _align: usize,
-    ) -> u64 {
-        self.deallocate_span(ptr)
+    ) -> Result<ReleaseReport, MemoryError> {
+        Ok(self.deallocate_span(ptr))
     }
 
     fn commit_allocation_range(
@@ -1998,7 +2093,7 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
         _align: usize,
         byte_offset: usize,
         bytes: usize,
-    ) -> Result<u64, MemoryError> {
+    ) -> Result<ReleaseReport, MemoryError> {
         let end = byte_offset.checked_add(bytes).ok_or_else(|| {
             invalid(
                 allocation_bytes,
@@ -2014,7 +2109,7 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
             ));
         }
         if bytes == 0 {
-            return Ok(0);
+            return Ok(ReleaseReport::complete(0));
         }
         let mut arena = self.lock();
         let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
@@ -2052,13 +2147,25 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
                 start >= absolute_start && start < absolute_end
             })
             .collect::<BTreeSet<_>>();
-        let unmapped = self.release_granules_report(&mut arena, &releasable);
+        // Reconcile, not unconditionally remove: a granule whose release did
+        // not actually complete must stay in `committed` so this span keeps
+        // its claim on it, rather than being silently forgotten while the
+        // granule remains genuinely allocated (#1186 Phase 2 review, round 5
+        // finding 3, applied to decommit for the same reason `deallocate_span`
+        // needed it).
+        let (unresolved, unmapped) = self.release_granules_reconciled(&mut arena, &releasable);
         if let Some(live) = arena.spans.live.get_mut(&offset) {
             for granule in releasable {
-                live.committed.remove(&granule);
+                if !unresolved.contains(&granule) {
+                    live.committed.remove(&granule);
+                }
             }
         }
-        Ok(unmapped)
+        if unresolved.is_empty() {
+            Ok(ReleaseReport::complete(unmapped))
+        } else {
+            Ok(ReleaseReport::partial(unmapped))
+        }
     }
 
     fn allocation_committed_bytes(
@@ -2079,10 +2186,6 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
             .get(&offset)
             .map(|live| live.committed.len() * arena.spans.granularity)
             .unwrap_or(allocation_bytes)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -2188,12 +2291,8 @@ impl SharedMapping for CudaVmmAllocator {
         ptr: NonNull<u8>,
         _allocation_bytes: usize,
         _align: usize,
-    ) -> u64 {
-        self.deallocate_span(ptr)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
+    ) -> Result<ReleaseReport, MemoryError> {
+        Ok(self.deallocate_span(ptr))
     }
 }
 

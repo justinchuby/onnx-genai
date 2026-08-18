@@ -30,10 +30,10 @@
 // ── Re-exports from onnx-runtime-memory-api ──────────────────────────────
 pub use onnx_runtime_memory_api::allocator::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator, MappedAllocation,
-    SharedDevicePrefix, SharedPrefixCommitInfo,
+    ReleaseReport, SharedDevicePrefix, SharedPrefixCommitInfo,
 };
 pub use onnx_runtime_memory_api::capability::{
-    MechanismId, SharedMapping, VirtualBacking, capability_shares_mechanism,
+    DeviceMemoryMechanism, SharedMapping, VirtualBacking,
 };
 
 #[cfg(test)]

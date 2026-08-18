@@ -75,9 +75,9 @@ pub mod large_alloc_cache;
 pub mod shareability;
 
 pub use allocator::{
-    AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator, MappedAllocation,
-    MechanismId, SharedDevicePrefix, SharedMapping, SharedPrefixCommitInfo, VirtualBacking,
-    capability_shares_mechanism,
+    AllocationCommitRange, DeviceAllocator, DeviceKey, DeviceMemoryMechanism, HostAllocator,
+    MappedAllocation, ReleaseReport, SharedDevicePrefix, SharedMapping, SharedPrefixCommitInfo,
+    VirtualBacking,
 };
 pub use large_alloc_cache::{
     DEFAULT_CACHE_BUDGET_BYTES, FALLBACK_FLOOR_BYTES, LargeAllocCache, LargeAllocCacheStats,

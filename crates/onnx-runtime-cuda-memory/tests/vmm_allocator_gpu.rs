@@ -137,7 +137,9 @@ fn deallocate_committed_through_the_capability_reports_the_real_unmapped_bytes()
 
     // SAFETY: `ptr` came from this same capability's `allocate_committed`
     // above and is still live; this is its single release.
-    let unmapped = unsafe { virtual_backing.deallocate_committed(ptr, 4096, 256) };
+    let unmapped = unsafe { virtual_backing.deallocate_committed(ptr, 4096, 256) }
+        .expect("deallocate_committed reports a genuine release, not a failed one")
+        .unmapped_bytes;
 
     assert_eq!(
         unmapped as usize, committed,
@@ -196,8 +198,15 @@ fn grant_capacity_commits_with_exact_headroom_and_no_pool() {
     grant.commit_bytes(granule).expect("mapped attribution");
     assert_eq!(governor.used(Tier::Device), granule);
     let unmapped = allocator.deallocate_span(pointer);
-    assert_eq!(unmapped, granule, "a nonshared allocation unmaps itself");
-    assert_eq!(requester.unmap(unmapped), unmapped);
+    assert_eq!(
+        unmapped.unmapped_bytes, granule,
+        "a nonshared allocation unmaps itself"
+    );
+    assert!(unmapped.complete, "a nonshared release always completes");
+    assert_eq!(
+        requester.unmap(unmapped.unmapped_bytes),
+        unmapped.unmapped_bytes
+    );
     assert_eq!(requester.mapped_bytes(), 0);
     assert_eq!(governor.used(Tier::Device), 0);
 }
@@ -256,7 +265,7 @@ fn mapped_allocation_rejects_a_different_arena_zone() {
     assert!(error.to_string().contains("different allowance"), "{error}");
     assert_eq!(allocator.committed_and_reserved().0, granule as usize);
     let unmapped = allocator.deallocate_span(first.allocation);
-    arena_zone.unmap(unmapped);
+    arena_zone.unmap(unmapped.unmapped_bytes);
 }
 
 #[cfg_attr(
@@ -316,14 +325,20 @@ fn adjacent_shared_granule_consumes_mapped_growth_once() {
             (first.allocation, second.allocation)
         };
         let early_unmapped = allocator.deallocate_span(early);
-        assert_eq!(early_unmapped, 0, "the surviving workspace retains mapping");
-        requester.unmap(early_unmapped);
+        assert_eq!(
+            early_unmapped.unmapped_bytes, 0,
+            "the surviving workspace retains mapping"
+        );
+        requester.unmap(early_unmapped.unmapped_bytes);
         assert_eq!(requester.mapped_bytes(), granule);
         assert_eq!(allocator.committed_and_reserved().0, granule as usize);
 
         let last_unmapped = allocator.deallocate_span(last);
-        assert_eq!(last_unmapped, granule, "last reference owns the unmap");
-        requester.unmap(last_unmapped);
+        assert_eq!(
+            last_unmapped.unmapped_bytes, granule,
+            "last reference owns the unmap"
+        );
+        requester.unmap(last_unmapped.unmapped_bytes);
         assert_eq!(requester.mapped_bytes(), 0);
         assert_eq!(allocator.committed_and_reserved().0, 0);
         assert_eq!(governor.used(Tier::Device), 0);
@@ -457,7 +472,8 @@ fn decommit_range_rolls_back_late_commits_without_releasing_prefix() {
     assert_eq!(
         allocator
             .decommit_allocation_range(pointer, len, 256, granularity, granularity)
-            .expect("rollback late growth commit"),
+            .expect("rollback late growth commit")
+            .unmapped_bytes,
         granularity as u64
     );
     assert_eq!(
@@ -503,7 +519,8 @@ fn decommit_misaligned_growth_tail_releases_new_granules_only() {
     assert_eq!(
         allocator
             .decommit_allocation_range(pointer, len, 256, old_bytes, granularity)
-            .expect("rollback starts at a non-granule-aligned old bucket"),
+            .expect("rollback starts at a non-granule-aligned old bucket")
+            .unmapped_bytes,
         granularity as u64
     );
     assert_eq!(

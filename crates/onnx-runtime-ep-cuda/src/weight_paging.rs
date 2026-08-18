@@ -1374,9 +1374,10 @@ impl CudaWeightPage {
                                 0,
                                 self.len,
                             )
+                            .map(|report| report.unmapped_bytes)
                             .unwrap_or(0)
                     } else {
-                        allocator.deallocate_span(ptr)
+                        allocator.deallocate_span(ptr).unmapped_bytes
                     };
                     allowance.unmap(unmapped);
                     let _ = GLOBAL_WEIGHT_MAPPED_BYTES.fetch_update(

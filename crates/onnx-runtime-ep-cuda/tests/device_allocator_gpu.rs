@@ -269,7 +269,7 @@ fn a_zero_byte_allocation_is_freed_with_the_size_it_was_allocated_with() {
     let inner = require_cuda_allocator();
     let strict = Arc::new(StrictSizes::new(inner));
     let provider = provider
-        .with_memory(Arc::clone(&strict) as Arc<dyn DeviceAllocator>)
+        .with_memory(Arc::clone(&strict))
         .expect("an allocator for this EP's own device must be accepted");
 
     let buffer = provider

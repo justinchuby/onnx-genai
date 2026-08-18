@@ -35,132 +35,189 @@
 //! mixing a capability obtained from one allocator with a pointer allocated by
 //! another) can still check `device()` itself before trusting the two belong
 //! together.
+//!
+//! `DeviceKey` equality alone does not prove a `VirtualBacking`/`SharedMapping`
+//! genuinely belongs to a *particular* allocator, since two unrelated
+//! mechanisms on the same device compare equal by `DeviceKey`. See
+//! [`DeviceMemoryMechanism`] for how a caller that must bind allocation and
+//! capability together — so release can never be mixed across mechanisms —
+//! gets that guarantee structurally, at construction, rather than by
+//! comparing identities at the point of use.
 
-use std::any::{Any, TypeId};
 use std::ptr::NonNull;
 
 use crate::MemoryError;
 use crate::allocator::{
-    AllocationCommitRange, DeviceAllocator, DeviceKey, SharedDevicePrefix, SharedPrefixCommitInfo,
+    AllocationCommitRange, DeviceAllocator, DeviceKey, ReleaseReport, SharedDevicePrefix,
+    SharedPrefixCommitInfo,
 };
 
-/// A concrete mechanism's stable, unforgeable identity.
+/// One device memory mechanism, bundling its ordinary allocator with
+/// whichever optional capabilities it genuinely has — all guaranteed, by
+/// construction, to be views of the exact same concrete value.
 ///
-/// Two different [`DeviceAllocator`] instances must never compare equal
-/// here, and one concrete instance must always compare equal to itself —
-/// including across the different trait-object references a caller might
-/// hold to it (its own `&dyn DeviceAllocator`, and any `&dyn
-/// VirtualBacking`/`&dyn SharedMapping` it returns from
-/// `as_virtual_backing`/`as_shared_mapping`). This is exactly what
-/// [`capability_shares_mechanism`] compares, through
-/// [`DeviceAllocator::mechanism_id`].
+/// # Why this exists
 ///
-/// # Why not upcast `&dyn DeviceAllocator` to `&dyn Any` directly
+/// [`DeviceAllocator::as_virtual_backing`]/[`DeviceAllocator::as_shared_mapping`]
+/// are how any `&dyn DeviceAllocator` discovers its own optional
+/// capabilities. That works when a type answers honestly, but nothing stops
+/// a composing wrapper from advertising a *different*, foreign object's
+/// capability as if it were its own — which would let a pointer produced
+/// through that capability be released through a mechanism that never
+/// produced it. Two earlier designs tried to police that from the outside,
+/// by identity: first an `Any` supertrait forcing every allocator to be
+/// `'static` (#1186 Phase 2 review, round 4 finding 2), then a self-reported
+/// `MechanismId` token compared at the point of use — rejected because an
+/// implementation can misreport a foreign object's identity as its own, and
+/// because pointer/`TypeId` uniqueness is not actually guaranteed for
+/// zero-sized or address-reusing types, and because a legitimate delegating
+/// wrapper could be wrongly rejected by an overly strict comparison (#1186
+/// Phase 2 review, round 5 finding 4).
 ///
-/// An earlier design (#1186 Phase 2 review, round 3) added `Any` as a
-/// supertrait of [`DeviceAllocator`] so a `&dyn DeviceAllocator` could be
-/// upcast to `&dyn Any` and compared by data pointer and [`TypeId`].
-/// `Any: 'static`, so that supertrait transitively forced *every*
-/// `DeviceAllocator` implementation to be `'static` — a real regression
-/// against "minimal ordinary contract", since it rejected an otherwise
-/// valid allocator that borrows non-`'static` data, such as one built over
-/// a caller-owned arena reference (#1186 Phase 2 review, round 4 finding 2).
+/// `DeviceMemoryMechanism` sidesteps identity checking entirely. Its
+/// constructors are generic over one concrete `T`, and every field is
+/// populated by cloning the *same* `Arc<T>` and coercing it to a different
+/// trait-object type. There is no way to call
+/// [`with_virtual_backing`](Self::with_virtual_backing) with an allocator and
+/// a *different* object's `VirtualBacking` — the function only accepts one
+/// `Arc<T>` argument, and `T` itself must implement both traits. A
+/// mismatched composition is a type error, not a check a caller could get
+/// wrong or an implementation could defeat.
 ///
-/// `MechanismId` itself carries no lifetime parameter: it stores an untyped
-/// data pointer and a [`TypeId`], both plain, lifetime-free values.
-/// Constructing one does still require the value it is computed from to be
-/// `'static` (`TypeId::of` requires it), but that requirement now falls only
-/// on the specific, concrete [`DeviceAllocator::mechanism_id`] override that
-/// opts in — never on the trait itself, and never on an implementation that
-/// has no capability to identify and simply keeps the default `None`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MechanismId {
-    ptr: *const (),
-    type_id: TypeId,
+/// A provider that stores a `DeviceMemoryMechanism` (rather than a bare
+/// `Arc<dyn DeviceAllocator>`) resolves exactly one mechanism, once, and every
+/// capability it later discovers through this bundle is structurally
+/// guaranteed to belong to that same mechanism — see
+/// `onnx_runtime_ep_cuda`'s `CudaExecutionProvider::with_memory`.
+#[derive(Clone)]
+pub struct DeviceMemoryMechanism {
+    allocator: std::sync::Arc<dyn DeviceAllocator>,
+    virtual_backing: Option<std::sync::Arc<dyn VirtualBacking>>,
+    shared_mapping: Option<std::sync::Arc<dyn SharedMapping>>,
 }
 
-impl MechanismId {
-    /// Compute the identity of a concrete, `'static` mechanism from its own
-    /// reference to itself.
-    ///
-    /// Call this as `MechanismId::of(self)` from inside a concrete type's
-    /// own [`DeviceAllocator::mechanism_id`] override (or an equivalent
-    /// override on [`VirtualBacking`]/[`SharedMapping`] for a capability
-    /// object that is a distinct value from the allocator) — never from
-    /// outside through a trait object, which is the one thing this design
-    /// exists to avoid requiring.
-    pub fn of<T: Any>(value: &T) -> Self {
-        Self {
-            ptr: (value as *const T).cast(),
-            type_id: TypeId::of::<T>(),
-        }
-    }
-
-    /// Compute the identity of a capability object already reached through
-    /// [`VirtualBacking::as_any`]/[`SharedMapping::as_any`].
-    pub fn of_dyn(value: &dyn Any) -> Self {
-        Self {
-            ptr: (value as *const dyn Any).cast(),
-            type_id: value.type_id(),
-        }
+impl std::fmt::Debug for DeviceMemoryMechanism {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceMemoryMechanism")
+            .field("allocator", &self.allocator)
+            .field("has_virtual_backing", &self.virtual_backing.is_some())
+            .field("has_shared_mapping", &self.shared_mapping.is_some())
+            .finish()
     }
 }
 
-/// Whether `capability`, discovered from `allocator`, is genuinely the same
-/// concrete mechanism as `allocator` itself — not a different internal object
-/// that merely reports a matching [`DeviceKey`].
-///
-/// [`DeviceKey`] alone is not strong enough identity to bind a capability to
-/// the allocator it came from: two unrelated arenas on the same device
-/// compare equal by `DeviceKey`. This instead compares each side's
-/// [`MechanismId`] — a data pointer paired with a concrete [`TypeId`], which
-/// together cannot be produced by accident (see `MechanismId`'s own
-/// documentation for why the pointer alone is forgeable and the `TypeId`
-/// closes that gap).
-///
-/// `allocator.mechanism_id()` must be `Some` and equal `capability`'s own
-/// `MechanismId` (via [`MechanismId::of_dyn`]) for this to return `true`. An
-/// allocator that never overrides [`DeviceAllocator::mechanism_id`] (the
-/// default `None`) can never share a mechanism with anything through this
-/// check — which is the correct, conservative answer for a type that has
-/// opted out of identity-checked capabilities entirely, not a false
-/// rejection.
-///
-/// Every capability implementation this crate ships (`CudaVmmAllocator`'s
-/// `as_virtual_backing`/`as_shared_mapping`, paired with its own
-/// `mechanism_id` override) reports the same identity for the allocator and
-/// for the capability object it hands out, so this always holds for them;
-/// this exists to let a caller reject, rather than trust, an allocator
-/// composed so that its ordinary [`DeviceAllocator::allocate`]/
-/// [`DeviceAllocator::deallocate`] and its advertised capability are backed
-/// by two different objects — which would let a pointer produced through
-/// the capability be freed through a mechanism that never produced it
-/// (#1186 Phase 2 review, round 1 finding 1; round 3 finding 1 closed the
-/// pointer-only version of this check; round 4 finding 2 moved the identity
-/// off a blanket `Any` supertrait and onto this opt-in method).
-///
-/// [`TypeId`]: std::any::TypeId
-///
-/// # Example
-///
-/// ```
-/// use std::any::Any;
-/// use onnx_runtime_memory_api::allocator::{DeviceAllocator, DeviceKey, HostAllocator};
-/// use onnx_runtime_memory_api::capability::capability_shares_mechanism;
-///
-/// let allocator = HostAllocator;
-/// let allocator_ref: &dyn DeviceAllocator = &allocator;
-/// let other: &dyn Any = &allocator; // a different reference to the *same* value
-/// assert!(capability_shares_mechanism(allocator_ref, other));
-///
-/// let unrelated = HostAllocator;
-/// let unrelated_ref: &dyn Any = &unrelated;
-/// assert!(!capability_shares_mechanism(allocator_ref, unrelated_ref));
-/// ```
-pub fn capability_shares_mechanism(allocator: &dyn DeviceAllocator, capability: &dyn Any) -> bool {
-    allocator
-        .mechanism_id()
-        .is_some_and(|id| id == MechanismId::of_dyn(capability))
+impl DeviceMemoryMechanism {
+    /// An eager mechanism with neither optional capability.
+    pub fn eager<T: DeviceAllocator + 'static>(allocator: std::sync::Arc<T>) -> Self {
+        Self {
+            allocator,
+            virtual_backing: None,
+            shared_mapping: None,
+        }
+    }
+
+    /// A mechanism with the lazy commit/decommit capability, and nothing
+    /// else, structurally guaranteed to be a view of the same value as the
+    /// allocator itself.
+    pub fn with_virtual_backing<T>(allocator: std::sync::Arc<T>) -> Self
+    where
+        T: DeviceAllocator + VirtualBacking + 'static,
+    {
+        let clone_of_allocator = std::sync::Arc::clone(&allocator);
+        let virtual_backing: std::sync::Arc<dyn VirtualBacking> = clone_of_allocator;
+        Self {
+            allocator,
+            virtual_backing: Some(virtual_backing),
+            shared_mapping: None,
+        }
+    }
+
+    /// A mechanism with the shared-physical-prefix capability, and nothing
+    /// else, structurally guaranteed to be a view of the same value as the
+    /// allocator itself.
+    pub fn with_shared_mapping<T>(allocator: std::sync::Arc<T>) -> Self
+    where
+        T: DeviceAllocator + SharedMapping + 'static,
+    {
+        let clone_of_allocator = std::sync::Arc::clone(&allocator);
+        let shared_mapping: std::sync::Arc<dyn SharedMapping> = clone_of_allocator;
+        Self {
+            allocator,
+            virtual_backing: None,
+            shared_mapping: Some(shared_mapping),
+        }
+    }
+
+    /// A mechanism with both optional capabilities, all structurally
+    /// guaranteed to be views of the same value as the allocator itself.
+    pub fn with_virtual_backing_and_shared_mapping<T>(allocator: std::sync::Arc<T>) -> Self
+    where
+        T: DeviceAllocator + VirtualBacking + SharedMapping + 'static,
+    {
+        let clone_for_virtual_backing = std::sync::Arc::clone(&allocator);
+        let clone_for_shared_mapping = std::sync::Arc::clone(&allocator);
+        let virtual_backing: std::sync::Arc<dyn VirtualBacking> = clone_for_virtual_backing;
+        let shared_mapping: std::sync::Arc<dyn SharedMapping> = clone_for_shared_mapping;
+        Self {
+            allocator,
+            virtual_backing: Some(virtual_backing),
+            shared_mapping: Some(shared_mapping),
+        }
+    }
+}
+
+impl DeviceAllocator for DeviceMemoryMechanism {
+    fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
+        self.allocator.allocate(bytes, align)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+        // SAFETY: forwarded under this method's identical contract.
+        unsafe { self.allocator.deallocate(ptr, bytes, align) };
+    }
+
+    fn device(&self) -> DeviceKey {
+        self.allocator.device()
+    }
+
+    unsafe fn deallocate_with_unmapped(
+        &self,
+        ptr: NonNull<u8>,
+        bytes: usize,
+        align: usize,
+    ) -> Result<ReleaseReport, MemoryError> {
+        // Deliberately does *not* forward to `self.allocator.deallocate_with_unmapped`:
+        // that would re-enter `T`'s own `as_virtual_backing`/`as_shared_mapping`,
+        // which is exactly the self-reported discovery this bundle exists to
+        // route around. Going through `Self::as_virtual_backing`/
+        // `Self::as_shared_mapping` below instead uses this bundle's own,
+        // structurally-guaranteed capability views.
+        match self.as_virtual_backing() {
+            // SAFETY: forwarded under this method's identical contract.
+            Some(virtual_backing) => unsafe {
+                virtual_backing.deallocate_committed(ptr, bytes, align)
+            },
+            None => match self.as_shared_mapping() {
+                // SAFETY: forwarded under this method's identical contract.
+                Some(shared_mapping) => unsafe {
+                    shared_mapping.release_shared_mapping(ptr, bytes, align)
+                },
+                None => {
+                    // SAFETY: forwarded under this method's identical contract.
+                    unsafe { self.allocator.deallocate(ptr, bytes, align) };
+                    Ok(ReleaseReport::complete(0))
+                }
+            },
+        }
+    }
+
+    fn as_virtual_backing(&self) -> Option<&dyn VirtualBacking> {
+        self.virtual_backing.as_deref()
+    }
+
+    fn as_shared_mapping(&self) -> Option<&dyn SharedMapping> {
+        self.shared_mapping.as_deref()
+    }
 }
 
 /// Lazy commit/decommit over an allocator's own reservations.
@@ -186,13 +243,18 @@ pub fn capability_shares_mechanism(allocator: &dyn DeviceAllocator, capability: 
 ///   routing release through the same capability reference that produced the
 ///   pointer (rather than re-deriving a release path from the owning
 ///   allocator) is what makes "the mechanism that allocated this is the
-///   mechanism that frees it" true by construction instead of by convention —
-///   see [`capability_shares_mechanism`] for why `DeviceKey` alone cannot
-///   prove that on its own. Reports the number of bytes whose physical
-///   mapping actually transitioned from committed to uncommitted, the same
+///   mechanism that frees it" true by construction instead of by convention
+///   — see [`crate::capability::DeviceMemoryMechanism`] for why a
+///   `DeviceKey` match alone cannot prove that. Returns a
+///   [`ReleaseReport`] with the number of bytes whose physical mapping
+///   actually transitioned from committed to uncommitted, the same
 ///   accounting [`decommit_allocation_range`](Self::decommit_allocation_range)
 ///   reports, so a mapped-zone refund is never silently lost the way an
-///   always-zero default would lose it.
+///   always-zero default would lose it — and `complete: false` whenever any
+///   part of the release did not finish, so a caller never mistakes a
+///   partial release for a done one and never proceeds to reuse or
+///   otherwise treat the allocation as gone (#1186 Phase 2 review, round 5
+///   findings 2-3).
 /// * `commit_allocation_range(s)` maps additional bytes of an existing
 ///   allocation that were not already committed. Committing a byte range that
 ///   is already committed is a no-op for that range.
@@ -232,16 +294,43 @@ pub trait VirtualBacking: Send + Sync {
     ) -> Result<NonNull<u8>, MemoryError>;
 
     /// Release an allocation obtained from
-    /// [`allocate_committed`](Self::allocate_committed), reporting the number
-    /// of bytes whose physical mapping actually transitioned from committed
-    /// to uncommitted.
+    /// [`allocate_committed`](Self::allocate_committed).
+    ///
+    /// # Contract
+    ///
+    /// This is one atomic release transaction, not "unmap, then separately
+    /// deallocate": it must be the *entire* release for the identified
+    /// allocation. `Ok(report)` covers both a full release
+    /// (`report.complete == true`) and a partial one
+    /// (`report.complete == false`); `report.unmapped_bytes` is always the
+    /// true, final count of bytes this call itself released, whether the
+    /// release was full or partial — never discarded, never re-reported by a
+    /// later call. `Err` is reserved for a call that touched nothing at all
+    /// (an unrecognized pointer, wrong device, or similar precondition
+    /// violation).
+    ///
+    /// When `report.complete` is `false`, the allocation (or its remaining,
+    /// unreleased portion) is still live: this virtual address must not be
+    /// returned to any free list or handed to a new allocation, and must not
+    /// be passed to a plain [`DeviceAllocator::deallocate`]. The exact same
+    /// `ptr`/`allocation_bytes`/`align` may be passed to this same method
+    /// again to retry the remainder.
+    ///
+    /// A prior version of this contract returned a bare `u64`, in which `0`
+    /// could mean either "nothing was mapped" or "the release failed" —
+    /// ambiguity that let a caller's chained, unconditional release proceed
+    /// even when nothing had actually been confirmed released (#1186 Phase 2
+    /// review, round 5 findings 1-2).
     ///
     /// # Safety
     ///
     /// `ptr`, `allocation_bytes`, and `align` must identify one live
     /// allocation this same capability's `allocate_committed` produced, and
     /// must not be released twice — the same requirements
-    /// [`DeviceAllocator::deallocate`] places on its own `ptr`/`bytes`/`align`.
+    /// [`DeviceAllocator::deallocate`] places on its own `ptr`/`bytes`/`align`,
+    /// except that a `report.complete == false` outcome from a prior call
+    /// leaves the identified allocation live for exactly one purpose: a
+    /// retry through this same method.
     ///
     /// [`DeviceAllocator::deallocate`]: crate::allocator::DeviceAllocator::deallocate
     unsafe fn deallocate_committed(
@@ -249,7 +338,7 @@ pub trait VirtualBacking: Send + Sync {
         ptr: NonNull<u8>,
         allocation_bytes: usize,
         align: usize,
-    ) -> u64;
+    ) -> Result<ReleaseReport, MemoryError>;
 
     /// Ensure `offset..offset + bytes` in an existing allocation is
     /// physically backed.
@@ -269,7 +358,10 @@ pub trait VirtualBacking: Send + Sync {
     /// allocator whose ranges can share physical granules (so committing them
     /// together claims each shared granule only once) should override this
     /// to do so atomically rather than one range at a time.
-    fn commit_allocation_ranges(&self, ranges: &[AllocationCommitRange]) -> Result<(), MemoryError> {
+    fn commit_allocation_ranges(
+        &self,
+        ranges: &[AllocationCommitRange],
+    ) -> Result<(), MemoryError> {
         for range in ranges {
             self.commit_allocation_range(
                 range.ptr,
@@ -304,9 +396,17 @@ pub trait VirtualBacking: Send + Sync {
     fn mapped_bytes_for_allocation(&self, bytes: usize, align: usize) -> Result<u64, MemoryError>;
 
     /// Release physical backing from a byte range in an existing allocation
-    /// while keeping its virtual address reserved. Returns the number of
-    /// bytes whose physical mapping actually transitioned from committed to
-    /// uncommitted.
+    /// while keeping its virtual address reserved.
+    ///
+    /// Returns a [`ReleaseReport`] with the same "no `0`-versus-failure
+    /// conflation, never a stale or partial-as-if-complete number" contract
+    /// as [`deallocate_committed`](Self::deallocate_committed):
+    /// `report.unmapped_bytes` is the number of bytes whose physical mapping
+    /// actually transitioned from committed to uncommitted in this call
+    /// (never the number of bytes requested), and `report.complete` is
+    /// `false` whenever any granule in the requested range could not be
+    /// released — in that case those specific granules remain committed and
+    /// tracked exactly as before this call, safe to retry.
     fn decommit_allocation_range(
         &self,
         ptr: NonNull<u8>,
@@ -314,7 +414,7 @@ pub trait VirtualBacking: Send + Sync {
         align: usize,
         offset: usize,
         bytes: usize,
-    ) -> Result<u64, MemoryError>;
+    ) -> Result<ReleaseReport, MemoryError>;
 
     /// Physical bytes currently committed for this allocation.
     fn allocation_committed_bytes(
@@ -323,13 +423,6 @@ pub trait VirtualBacking: Send + Sync {
         allocation_bytes: usize,
         align: usize,
     ) -> usize;
-
-    /// Downcast hook for a caller that needs the concrete implementation
-    /// (for instance, to reach a governor-specific atomic capacity-token
-    /// path that is not part of this trait — see
-    /// `onnx_runtime_cuda_memory::CudaVmmAllocator`'s inherent
-    /// `allocate_committed_with_capacity`).
-    fn as_any(&self) -> &dyn Any;
 }
 
 /// Shared physical handles mappable, read-only, into many allocations at
@@ -360,21 +453,23 @@ pub trait VirtualBacking: Send + Sync {
 /// * `commit_shared_prefix` maps `prefix` read-only into a live allocation
 ///   and never mis-maps: it errors rather than mapping over an already
 ///   committed region, mixing devices, or mixing pool authorities.
-/// * `release_shared_mapping` atomically clears the shared-mapping bookkeeping
-///   for one allocation and reports exactly the bytes that transitioned from
-///   mapped to unmapped in that single call, so that mapped cost this
-///   capability created is never lost the way an always-zero default would
-///   lose it, and is never reported from a stale snapshot the way a
-///   query-then-clear pair would risk under concurrency — symmetric with
+/// * `release_shared_mapping` is the **entire** release for an allocation
+///   reached through this capability: one atomic transaction that both
+///   clears the shared-mapping bookkeeping and gives back whatever backs the
+///   allocation, reporting exactly the bytes that transitioned from mapped
+///   to unmapped in that single call. It is symmetric with
 ///   [`VirtualBacking::deallocate_committed`]'s release report, and required
 ///   for the same reason: `SharedMapping` and `VirtualBacking` are
 ///   independent capabilities, so a mechanism that implements only this one
 ///   and not `VirtualBacking` must not be able to inherit
 ///   [`DeviceAllocator::deallocate_with_unmapped`]'s eager-correct default of
 ///   zero once it has mapped shared cost into an allocation (#1186 Phase 2
-///   review, round 3 finding 2), and must not be able to refund the same
-///   mapped bytes twice, or refund bytes a concurrent or failed release never
-///   actually released (#1186 Phase 2 review, round 4 finding 1).
+///   review, round 3 finding 2), must not be able to refund the same mapped
+///   bytes twice or refund bytes a concurrent or failed release never
+///   actually released (round 4 finding 1), and must never leave a window
+///   in which the address is available for reuse while a caller still
+///   believes the release is theirs to retry, or vice versa (round 5
+///   finding 1).
 ///
 /// [`DeviceAllocator::as_shared_mapping`]: crate::allocator::DeviceAllocator::as_shared_mapping
 /// [`DeviceAllocator::deallocate_with_unmapped`]: crate::allocator::DeviceAllocator::deallocate_with_unmapped
@@ -384,7 +479,10 @@ pub trait SharedMapping: Send + Sync {
     fn device(&self) -> DeviceKey;
 
     /// Create a pinned, read-only shared prefix of `bytes`.
-    fn create_shared_prefix(&self, bytes: usize) -> Result<Box<dyn SharedDevicePrefix>, MemoryError>;
+    fn create_shared_prefix(
+        &self,
+        bytes: usize,
+    ) -> Result<Box<dyn SharedDevicePrefix>, MemoryError>;
 
     /// Estimate the incremental **owned** physical bytes to admit one more
     /// sharer of `prefix`.
@@ -400,18 +498,22 @@ pub trait SharedMapping: Send + Sync {
         byte_offset: usize,
     ) -> Result<SharedPrefixCommitInfo, MemoryError>;
 
-    /// Atomically release the shared-mapping bookkeeping for the allocation
-    /// at `ptr` and report exactly the bytes that transitioned from mapped
-    /// to unmapped as a result of **this** call.
+    /// Atomically release the allocation at `ptr` — clearing its
+    /// shared-mapping bookkeeping *and* giving back whatever backs it — as
+    /// one mechanism transaction, and report exactly the bytes that
+    /// transitioned from mapped to unmapped as a result of **this** call.
     ///
     /// [`DeviceAllocator::deallocate_with_unmapped`]'s default calls this
-    /// whenever [`DeviceAllocator::as_shared_mapping`] returns `Some`, so a
-    /// mechanism that implements `SharedMapping` alone (not
-    /// [`VirtualBacking`]) still reports its mapped-zone refund at release
-    /// time instead of silently losing it. A mechanism that also implements
+    /// instead of [`DeviceAllocator::deallocate`] whenever
+    /// [`DeviceAllocator::as_shared_mapping`] returns `Some` — never in
+    /// addition to it — so a mechanism that implements `SharedMapping` alone
+    /// (not [`VirtualBacking`]) reports its mapped-zone refund at release
+    /// time instead of silently losing it, and so no caller ever reaches a
+    /// freed address through a second, unconditional release (#1186 Phase 2
+    /// review, round 5 finding 1). A mechanism that also implements
     /// `VirtualBacking` and tracks commitment and sharing together (as
     /// `CudaVmmAllocator` does) may release through
-    /// [`VirtualBacking::deallocate_committed`] instead — never through the
+    /// `VirtualBacking::deallocate_committed` instead — never through the
     /// base `deallocate_with_unmapped` default — but must still answer this
     /// correctly for a caller that reaches it directly through
     /// `as_shared_mapping`, even if that means conservatively reporting the
@@ -421,311 +523,74 @@ pub trait SharedMapping: Send + Sync {
     ///
     /// # Contract
     ///
-    /// This is a release operation, not a query: it must atomically observe
-    /// and clear whatever bookkeeping tracks this allocation's shared-mapped
-    /// bytes, under one mechanism synchronization boundary (a lock, a
-    /// compare-and-swap loop, or equivalent) so no concurrent caller can
-    /// observe the accounting between the read and the clear. A prior
-    /// version of this contract split those two steps into a pure query
-    /// method and a separate `deallocate` call; that gap let a concurrent
-    /// mapping change, a cached free, or a failed release be reported as if
-    /// it had actually happened (#1186 Phase 2 review, round 4 finding 1).
+    /// This is a release operation, not a query followed by one: the byte
+    /// count, the shared-mapping bookkeeping clear, and the underlying
+    /// unmap/deallocate must all happen under one mechanism synchronization
+    /// boundary (a lock, a compare-and-swap loop, or equivalent), so no
+    /// concurrent caller can observe the address as reusable before this
+    /// call has fully accounted for and released it, and no concurrent
+    /// caller can cause this call to report bytes it did not itself release.
+    /// A prior version of this contract queried mapped bytes and released
+    /// separately (round 4 finding 1), and a later one queried them inside
+    /// this call but still let a subsequent, unconditional
+    /// `deallocate` run a second time over the same, now-possibly-reused
+    /// address (round 5 finding 1) — both are exactly what "one mechanism
+    /// transaction" rules out.
+    ///
+    /// `Ok(report)` covers both a full release (`report.complete == true`,
+    /// the address is now free for reuse) and a partial one
+    /// (`report.complete == false`, the allocation's unreleased remainder is
+    /// still live and not eligible for reuse). `report.unmapped_bytes` is
+    /// always the true, final count of bytes this call itself released — for
+    /// a `ptr` whose shared mapping was already fully released by a prior
+    /// call, or that never had one, that count is `0` with
+    /// `complete: true`. `Err` is reserved for a call that touched nothing
+    /// (an unrecognized pointer, wrong device, or similar precondition
+    /// violation) — never used to mean "released zero bytes".
     ///
     /// * **Exact once**: a `ptr` whose shared mapping this call has already
-    ///   released must report `0` on every subsequent call — it must not be
-    ///   possible to refund the same bytes twice.
-    /// * **Failure refunds zero and preserves state**: if the underlying
-    ///   release cannot complete, this returns `0` and leaves the mapping
-    ///   bookkeeping exactly as it was, so a caller may safely retry.
+    ///   fully released reports `unmapped_bytes: 0, complete: true` on every
+    ///   subsequent call — it is never possible to refund the same bytes
+    ///   twice.
+    /// * **Failure preserves state**: if the underlying release cannot
+    ///   complete, this returns `Ok(ReleaseReport::partial(bytes_actually_released))`
+    ///   (never treating an untouched remainder as released) and leaves
+    ///   everything it did not release exactly as it was, so a caller may
+    ///   safely retry with the same `ptr`/`allocation_bytes`/`align`.
     /// * **Concurrency**: multiple threads calling this for the same `ptr`
     ///   must divide the true mapped total exactly once among them (any
-    ///   ordering is fine; double-counting or losing bytes is not).
-    /// * Returns `0` for a `ptr` with no live shared mapping.
+    ///   ordering is fine; double-counting or losing bytes is not), and must
+    ///   never let one thread observe the address as free while another is
+    ///   still mid-release.
     ///
     /// # Safety
     ///
     /// `ptr`, `allocation_bytes`, and `align` must identify one live
     /// allocation this capability (or the allocator it belongs to) produced.
+    /// A `report.complete == false` outcome from a prior call leaves the
+    /// identified allocation live for exactly one purpose: a retry through
+    /// this same method.
     unsafe fn release_shared_mapping(
         &self,
         ptr: NonNull<u8>,
         allocation_bytes: usize,
         align: usize,
-    ) -> u64;
-
-    /// Downcast hook for a caller that needs the concrete implementation.
-    fn as_any(&self) -> &dyn Any;
+    ) -> Result<ReleaseReport, MemoryError>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::any::Any;
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use crate::allocator::HostAllocator;
 
-    /// A trivial `VirtualBacking` that is never actually called: it exists
-    /// only so its address can be compared, never so its methods run.
-    #[derive(Debug, Default)]
-    struct Marker;
-
-    impl VirtualBacking for Marker {
-        fn device(&self) -> DeviceKey {
-            DeviceKey::device(0)
-        }
-
-        fn allocate_committed(
-            &self,
-            _bytes: usize,
-            _align: usize,
-            _committed_ranges: &[std::ops::Range<usize>],
-        ) -> Result<NonNull<u8>, MemoryError> {
-            unimplemented!("test double: never called")
-        }
-
-        unsafe fn deallocate_committed(
-            &self,
-            _ptr: NonNull<u8>,
-            _allocation_bytes: usize,
-            _align: usize,
-        ) -> u64 {
-            unimplemented!("test double: never called")
-        }
-
-        fn commit_allocation_range(
-            &self,
-            _ptr: NonNull<u8>,
-            _allocation_bytes: usize,
-            _align: usize,
-            _offset: usize,
-            _bytes: usize,
-        ) -> Result<(), MemoryError> {
-            unimplemented!("test double: never called")
-        }
-
-        fn mapped_bytes_for_allocation_ranges(
-            &self,
-            _ranges: &[AllocationCommitRange],
-        ) -> Result<u64, MemoryError> {
-            unimplemented!("test double: never called")
-        }
-
-        fn mapped_bytes_for_allocation(&self, _bytes: usize, _align: usize) -> Result<u64, MemoryError> {
-            unimplemented!("test double: never called")
-        }
-
-        fn decommit_allocation_range(
-            &self,
-            _ptr: NonNull<u8>,
-            _allocation_bytes: usize,
-            _align: usize,
-            _offset: usize,
-            _bytes: usize,
-        ) -> Result<u64, MemoryError> {
-            unimplemented!("test double: never called")
-        }
-
-        fn allocation_committed_bytes(
-            &self,
-            _ptr: NonNull<u8>,
-            _allocation_bytes: usize,
-            _align: usize,
-        ) -> usize {
-            unimplemented!("test double: never called")
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    /// Genuinely returns itself as its own `VirtualBacking`, the way a real
-    /// combined allocator/capability type does — as opposed to
-    /// `OffsetZeroComposite` below, which returns an *embedded* object that
-    /// merely shares its address.
-    #[derive(Debug, Default)]
-    struct HonestSelfReporter;
-
-    impl DeviceAllocator for HonestSelfReporter {
-        fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
-            HostAllocator.allocate(bytes, align)
-        }
-
-        unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
-            // SAFETY: forwarded under this method's identical contract.
-            unsafe { HostAllocator.deallocate(ptr, bytes, align) };
-        }
-
-        fn device(&self) -> DeviceKey {
-            DeviceKey::device(0)
-        }
-
-        fn as_virtual_backing(&self) -> Option<&dyn VirtualBacking> {
-            Some(self)
-        }
-
-        fn mechanism_id(&self) -> Option<MechanismId> {
-            Some(MechanismId::of(self))
-        }
-    }
-
-    impl VirtualBacking for HonestSelfReporter {
-        fn device(&self) -> DeviceKey {
-            DeviceKey::device(0)
-        }
-
-        fn allocate_committed(
-            &self,
-            _bytes: usize,
-            _align: usize,
-            _committed_ranges: &[std::ops::Range<usize>],
-        ) -> Result<NonNull<u8>, MemoryError> {
-            unimplemented!("test double: never called")
-        }
-
-        unsafe fn deallocate_committed(
-            &self,
-            _ptr: NonNull<u8>,
-            _allocation_bytes: usize,
-            _align: usize,
-        ) -> u64 {
-            unimplemented!("test double: never called")
-        }
-
-        fn commit_allocation_range(
-            &self,
-            _ptr: NonNull<u8>,
-            _allocation_bytes: usize,
-            _align: usize,
-            _offset: usize,
-            _bytes: usize,
-        ) -> Result<(), MemoryError> {
-            unimplemented!("test double: never called")
-        }
-
-        fn mapped_bytes_for_allocation_ranges(
-            &self,
-            _ranges: &[AllocationCommitRange],
-        ) -> Result<u64, MemoryError> {
-            unimplemented!("test double: never called")
-        }
-
-        fn mapped_bytes_for_allocation(&self, _bytes: usize, _align: usize) -> Result<u64, MemoryError> {
-            unimplemented!("test double: never called")
-        }
-
-        fn decommit_allocation_range(
-            &self,
-            _ptr: NonNull<u8>,
-            _allocation_bytes: usize,
-            _align: usize,
-            _offset: usize,
-            _bytes: usize,
-        ) -> Result<u64, MemoryError> {
-            unimplemented!("test double: never called")
-        }
-
-        fn allocation_committed_bytes(
-            &self,
-            _ptr: NonNull<u8>,
-            _allocation_bytes: usize,
-            _align: usize,
-        ) -> usize {
-            unimplemented!("test double: never called")
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    /// The exact composite the round-3 review flagged: `#[repr(C)]` puts
-    /// `foreign` at byte offset zero, so `&composite as *const _ as *const
-    /// ()` and `&composite.foreign as *const _ as *const ()` are the same
-    /// address, even though `foreign` is a distinct, embedded object with its
-    /// own type — not `composite` itself. Overrides `mechanism_id` with its
-    /// own (wrapper) identity so the rejection test below is non-vacuous: it
-    /// proves the `TypeId` mismatch defeats the address collision, not merely
-    /// that the wrapper lacks identity support at all.
-    #[repr(C)]
-    #[derive(Debug)]
-    struct OffsetZeroComposite {
-        foreign: Marker,
-        _extra: u64,
-    }
-
-    impl DeviceAllocator for OffsetZeroComposite {
-        fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
-            HostAllocator.allocate(bytes, align)
-        }
-
-        unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
-            // SAFETY: forwarded under this method's identical contract.
-            unsafe { HostAllocator.deallocate(ptr, bytes, align) };
-        }
-
-        fn device(&self) -> DeviceKey {
-            DeviceKey::device(0)
-        }
-
-        fn as_virtual_backing(&self) -> Option<&dyn VirtualBacking> {
-            // Deliberately the embedded first field, not `self`.
-            Some(&self.foreign)
-        }
-
-        fn mechanism_id(&self) -> Option<MechanismId> {
-            // Deliberately the composite's own identity, not `self.foreign`'s
-            // — proving the rejection below comes from a genuine `TypeId`
-            // mismatch, not from `OffsetZeroComposite` having opted out of
-            // identity entirely.
-            Some(MechanismId::of(self))
-        }
-    }
-
-    #[test]
-    fn genuine_self_reference_still_shares_mechanism() {
-        let allocator = HonestSelfReporter;
-        let allocator_ref: &dyn DeviceAllocator = &allocator;
-        let virtual_backing = allocator_ref.as_virtual_backing().expect("advertised");
-        assert!(
-            capability_shares_mechanism(allocator_ref, virtual_backing.as_any()),
-            "an allocator that honestly returns `Some(self)` (through its own field, reached by \
-             address) must still be recognized as sharing its own mechanism"
-        );
-    }
-
-    #[test]
-    fn offset_zero_embedded_capability_is_not_treated_as_the_same_mechanism() {
-        let composite = OffsetZeroComposite {
-            foreign: Marker,
-            _extra: 0,
-        };
-
-        // Non-vacuous: prove the address collision this test exists to guard
-        // against is real, not a hypothetical.
-        let composite_addr = &composite as *const OffsetZeroComposite as *const ();
-        let foreign_addr = &composite.foreign as *const Marker as *const ();
-        assert!(
-            std::ptr::eq(composite_addr, foreign_addr),
-            "test setup did not reproduce the offset-zero address collision `#[repr(C)]` is \
-             supposed to guarantee"
-        );
-
-        let allocator_ref: &dyn DeviceAllocator = &composite;
-        let virtual_backing = allocator_ref.as_virtual_backing().expect("advertised");
-        assert!(
-            !capability_shares_mechanism(allocator_ref, virtual_backing.as_any()),
-            "a foreign `VirtualBacking` embedded at a wrapper's offset zero must never be \
-             treated as the wrapper's own mechanism just because their addresses coincide \
-             (#1186 Phase 2 review, round 3 finding 1)"
-        );
-    }
-
-    /// A `SharedMapping`-only allocator: no `VirtualBacking` at all, so its
-    /// `deallocate_with_unmapped` is the base `DeviceAllocator` default —
-    /// proving that default now folds in shared-mapping bytes rather than
-    /// silently reporting zero (#1186 Phase 2 review, round 3 finding 2).
+    /// A `SharedDevicePrefix` test double whose "physical" size is whatever
+    /// the test wants to model.
     #[derive(Debug)]
     struct FakeSharedPrefix {
         bytes: u64,
@@ -753,29 +618,45 @@ mod tests {
         }
     }
 
+    /// A `SharedMapping`-only allocator: no `VirtualBacking` at all, so its
+    /// `deallocate_with_unmapped` is the base `DeviceAllocator` default —
+    /// proving that default now folds in shared-mapping bytes rather than
+    /// silently reporting zero (#1186 Phase 2 review, round 3 finding 2),
+    /// and that `release_shared_mapping` is this allocation's *entire*
+    /// release — bookkeeping and the underlying free together, exactly once
+    /// (#1186 Phase 2 review, round 5 finding 1).
     #[derive(Debug, Default)]
     struct SharedOnlyAllocator {
+        /// Addresses of allocations still live through this allocator.
+        /// Doubles as the idempotency gate for `release_shared_mapping`: a
+        /// second call for the same `ptr` finds nothing here and takes the
+        /// safe no-op branch instead of freeing twice.
+        live: Mutex<HashSet<usize>>,
         /// Address of a live allocation -> shared-mapped bytes currently
-        /// mapped into it. Stands in for whatever bookkeeping a real
-        /// `SharedMapping`-only mechanism would keep. `HashMap::remove` gives
-        /// atomic read-and-clear under one lock acquisition: a second call
-        /// finds nothing and returns `0`, and concurrent calls serialize
-        /// through the same lock, so at most one caller ever observes the
-        /// mapped bytes for a given `ptr` (#1186 Phase 2 review, round 4
-        /// finding 1).
+        /// mapped into it.
         mapped: Mutex<HashMap<usize, u64>>,
         /// When `true`, the next `release_shared_mapping` call simulates a
-        /// failed release: it returns `0` without touching `mapped`, proving
-        /// state is preserved for a legitimate retry.
-        fail_next_release: std::sync::atomic::AtomicBool,
+        /// failed release: it reports a partial, zero-byte outcome without
+        /// touching `live`/`mapped`, proving state is preserved for a
+        /// legitimate retry.
+        fail_next_release: AtomicBool,
     }
 
     impl DeviceAllocator for SharedOnlyAllocator {
         fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
-            HostAllocator.allocate(bytes, align)
+            let ptr = HostAllocator.allocate(bytes, align)?;
+            self.live
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(ptr.as_ptr() as usize);
+            Ok(ptr)
         }
 
         unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+            self.live
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&(ptr.as_ptr() as usize));
             // SAFETY: forwarded under this method's identical contract.
             unsafe { HostAllocator.deallocate(ptr, bytes, align) };
         }
@@ -796,11 +677,19 @@ mod tests {
             DeviceKey::device(0)
         }
 
-        fn create_shared_prefix(&self, bytes: usize) -> Result<Box<dyn SharedDevicePrefix>, MemoryError> {
-            Ok(Box::new(FakeSharedPrefix { bytes: bytes as u64 }))
+        fn create_shared_prefix(
+            &self,
+            bytes: usize,
+        ) -> Result<Box<dyn SharedDevicePrefix>, MemoryError> {
+            Ok(Box::new(FakeSharedPrefix {
+                bytes: bytes as u64,
+            }))
         }
 
-        fn incremental_owned_bytes_for_shared_prefix(&self, prefix: &dyn SharedDevicePrefix) -> u64 {
+        fn incremental_owned_bytes_for_shared_prefix(
+            &self,
+            prefix: &dyn SharedDevicePrefix,
+        ) -> u64 {
             prefix.committed_physical_bytes()
         }
 
@@ -826,29 +715,39 @@ mod tests {
         unsafe fn release_shared_mapping(
             &self,
             ptr: NonNull<u8>,
-            _allocation_bytes: usize,
-            _align: usize,
-        ) -> u64 {
-            if self
-                .fail_next_release
-                .swap(false, std::sync::atomic::Ordering::AcqRel)
-            {
-                // Simulated failure: report nothing released, and leave
-                // `mapped` untouched so a legitimate retry still finds it.
-                return 0;
+            allocation_bytes: usize,
+            align: usize,
+        ) -> Result<ReleaseReport, MemoryError> {
+            if self.fail_next_release.swap(false, Ordering::AcqRel) {
+                // Simulated failure: nothing was actually released, and
+                // `live`/`mapped` are left untouched so a legitimate retry
+                // still finds them.
+                return Ok(ReleaseReport::partial(0));
             }
-            // `remove` performs the read and the clear as one operation under
-            // one lock acquisition: a concurrent or repeated call for the
-            // same key can never observe the entry both times.
-            self.mapped
+            let key = ptr.as_ptr() as usize;
+            // `remove` is the read-and-clear liveness check as one atomic
+            // step: a second or concurrent call for the same key finds
+            // nothing and takes the branch below instead of freeing again
+            // (#1186 Phase 2 review, round 5 finding 1).
+            let was_live = self
+                .live
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&(ptr.as_ptr() as usize))
-                .unwrap_or(0)
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
+                .remove(&key);
+            if !was_live {
+                return Ok(ReleaseReport::complete(0));
+            }
+            let mapped = self
+                .mapped
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&key)
+                .unwrap_or(0);
+            // SAFETY: `key` was found live and removed atomically above, so
+            // exactly one caller reaches this deallocate for a given `ptr`
+            // — this call is that allocation's entire release.
+            unsafe { HostAllocator.deallocate(ptr, allocation_bytes, align) };
+            Ok(ReleaseReport::complete(mapped))
         }
     }
 
@@ -867,23 +766,27 @@ mod tests {
 
         // `SharedOnlyAllocator` does not override `deallocate_with_unmapped`,
         // so this reaches `DeviceAllocator`'s default — which must consult
-        // `as_shared_mapping` rather than silently returning zero.
+        // `as_shared_mapping` rather than silently returning zero, and must
+        // treat that call as the allocation's entire release rather than
+        // also calling plain `deallocate` afterward.
         // SAFETY: `ptr` came from this allocator's own `allocate` above with
         // matching `bytes`/`align`, and is released exactly once here.
-        let unmapped = unsafe { allocator.deallocate_with_unmapped(ptr, BYTES, 8) };
+        let report = unsafe { allocator.deallocate_with_unmapped(ptr, BYTES, 8) }
+            .expect("a live, correctly-identified allocation must not be rejected");
         assert_eq!(
-            unmapped, BYTES as u64,
+            report,
+            ReleaseReport::complete(BYTES as u64),
             "the base `deallocate_with_unmapped` default must report the shared-mapping bytes \
-             it is about to release, exactly once, not silently drop them to zero (#1186 Phase \
-             2 review, round 3 finding 2)"
+             it released, exactly once, not silently drop them to zero (#1186 Phase 2 review, \
+             round 3 finding 2)"
         );
     }
 
-    /// Calls `release_shared_mapping` directly (bypassing
-    /// `deallocate_with_unmapped`/`deallocate`, which would free the
-    /// underlying host memory) to isolate the release-accounting contract
-    /// itself: exact-once, failure-preserves-state, and concurrent-sum
-    /// correctness (#1186 Phase 2 review, round 4 finding 1).
+    /// Calls `release_shared_mapping` directly (still the allocation's
+    /// entire release, including the underlying free) to isolate the
+    /// release-accounting contract itself: exact-once, failure-preserves-
+    /// state, and concurrent-sum correctness (#1186 Phase 2 review, round 4
+    /// finding 1; report shape updated for round 5 findings 1-2).
     #[test]
     fn release_shared_mapping_is_exact_once() {
         let allocator = SharedOnlyAllocator::default();
@@ -897,25 +800,32 @@ mod tests {
             .expect("commit");
 
         // SAFETY: `ptr` identifies a live allocation this capability mapped.
-        let first = unsafe { shared_mapping.release_shared_mapping(ptr, BYTES, 8) };
-        assert_eq!(first, BYTES as u64, "the first release must refund the full mapped amount");
-
-        // SAFETY: calling the release operation again on the same `ptr` is
-        // exactly the scenario this test proves is safe: the bookkeeping was
-        // already cleared by the first call.
-        let second = unsafe { shared_mapping.release_shared_mapping(ptr, BYTES, 8) };
+        let first =
+            unsafe { shared_mapping.release_shared_mapping(ptr, BYTES, 8) }.expect("first release");
         assert_eq!(
-            second, 0,
-            "a second release of the same mapping must never refund the same bytes twice \
-             (#1186 Phase 2 review, round 4 finding 1)"
+            first,
+            ReleaseReport::complete(BYTES as u64),
+            "the first release must refund the full mapped amount and complete"
         );
 
-        // SAFETY: releases the actual host allocation exactly once.
-        unsafe { allocator.deallocate(ptr, BYTES, 8) };
+        // SAFETY: calling the release operation again on the same `ptr` is
+        // exactly the scenario this test proves is safe: the bookkeeping
+        // (and the underlying allocation) were already fully released by
+        // the first call, so this must be a safe, zero-effect no-op rather
+        // than a second free of already-freed memory.
+        let second = unsafe { shared_mapping.release_shared_mapping(ptr, BYTES, 8) }
+            .expect("second release");
+        assert_eq!(
+            second,
+            ReleaseReport::complete(0),
+            "a second release of an already-fully-released mapping must never refund the same \
+             bytes twice, and must not attempt to free the allocation again (#1186 Phase 2 \
+             review, round 4 finding 1; round 5 finding 1)"
+        );
     }
 
     #[test]
-    fn release_shared_mapping_failure_refunds_zero_and_preserves_state() {
+    fn release_shared_mapping_failure_preserves_state_for_retry() {
         let allocator = SharedOnlyAllocator::default();
         const BYTES: usize = 4096;
         let ptr = allocator.allocate(BYTES, 8).expect("host allocation");
@@ -926,36 +836,35 @@ mod tests {
             .commit_shared_prefix(prefix.as_ref(), ptr, BYTES, 0)
             .expect("commit");
 
-        allocator
-            .fail_next_release
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        allocator.fail_next_release.store(true, Ordering::SeqCst);
         // SAFETY: `ptr` identifies a live allocation; a simulated failure
-        // must not mutate any release-relevant state.
-        let failed = unsafe { shared_mapping.release_shared_mapping(ptr, BYTES, 8) };
+        // must not mutate any release-relevant state, and must not free the
+        // allocation.
+        let failed = unsafe { shared_mapping.release_shared_mapping(ptr, BYTES, 8) }
+            .expect("failed release");
         assert_eq!(
-            failed, 0,
-            "a failed release must refund zero, not the bytes it failed to release \
-             (#1186 Phase 2 review, round 4 finding 1)"
+            failed,
+            ReleaseReport::partial(0),
+            "a failed release must report a partial, zero-byte outcome — never `0` used to mean \
+             success, and never treated as license to free the allocation anyway (#1186 Phase 2 \
+             review, round 4 finding 1; round 5 finding 2)"
         );
 
         // SAFETY: the retry below is the legitimate use of a still-live
-        // mapping the failed call above must have preserved.
-        let retried = unsafe { shared_mapping.release_shared_mapping(ptr, BYTES, 8) };
+        // mapping the failed call above must have preserved; it also
+        // performs this allocation's actual, one-time free.
+        let retried =
+            unsafe { shared_mapping.release_shared_mapping(ptr, BYTES, 8) }.expect("retry");
         assert_eq!(
-            retried, BYTES as u64,
+            retried,
+            ReleaseReport::complete(BYTES as u64),
             "a retry after a failed release must still see the mapping the failed call did not \
-             actually clear"
+             actually clear, and must be the allocation's real, final release"
         );
-
-        // SAFETY: releases the actual host allocation exactly once.
-        unsafe { allocator.deallocate(ptr, BYTES, 8) };
     }
 
     #[test]
     fn concurrent_release_shared_mapping_calls_sum_to_exactly_the_mapped_bytes() {
-        use std::sync::Arc;
-        use std::thread;
-
         let allocator = Arc::new(SharedOnlyAllocator::default());
         const BYTES: usize = 4096;
         let ptr = allocator.allocate(BYTES, 8).expect("host allocation");
@@ -971,30 +880,548 @@ mod tests {
         let handles: Vec<_> = (0..THREADS)
             .map(|_| {
                 let allocator = Arc::clone(&allocator);
-                thread::spawn(move || {
+                std::thread::spawn(move || {
                     let ptr = NonNull::new(ptr_addr as *mut u8).expect("non-null");
                     let shared_mapping = allocator.as_shared_mapping().expect("advertised");
-                    // SAFETY: `ptr` identifies the one live allocation shared
-                    // across these threads; only one call is expected to
-                    // observe a non-zero mapping, which is exactly the
-                    // property this test proves.
+                    // SAFETY: `ptr` identifies the one live allocation
+                    // shared across these threads; only one call is
+                    // expected to observe a live mapping and perform the
+                    // real release, which is exactly the property this
+                    // test proves, and no thread frees anything more than
+                    // once.
                     unsafe { shared_mapping.release_shared_mapping(ptr, BYTES, 8) }
+                        .expect("release")
                 })
             })
             .collect();
 
-        let total: u64 = handles
+        let reports: Vec<ReleaseReport> = handles
             .into_iter()
             .map(|handle| handle.join().expect("thread panicked"))
-            .sum();
+            .collect();
+        let total: u64 = reports.iter().map(|report| report.unmapped_bytes).sum();
+        let completions = reports.iter().filter(|report| report.complete).count();
         assert_eq!(
             total, BYTES as u64,
             "concurrent releases of the same mapping must divide the true mapped total exactly \
-             once — no double-counting and no lost bytes (#1186 Phase 2 review, round 4 finding 1)"
+             once — no double-counting and no lost bytes (#1186 Phase 2 review, round 4 finding \
+             1)"
+        );
+        assert_eq!(
+            completions, THREADS,
+            "every call reports `complete`: real work happens in exactly one of them, and the \
+             rest correctly observe \"already fully released\" as a complete, zero-effect no-op \
+             rather than a failure (#1186 Phase 2 review, round 5 finding 1)"
+        );
+    }
+
+    /// A `SharedMapping`-only allocator whose release can be forced to
+    /// release only part of a multi-chunk mapping in one call — standing in
+    /// for a real partial CUDA failure (some granules unmap, a later one
+    /// does not) — proving the base `deallocate_with_unmapped` default
+    /// forwards a partial release report unchanged rather than treating it
+    /// as done, or as license to free the allocation anyway (#1186 Phase 2
+    /// review, round 5 findings 1-2).
+    #[derive(Debug, Default)]
+    struct PartialReleaseAllocator {
+        live: Mutex<HashSet<usize>>,
+        /// Address of a live allocation -> remaining unreleased chunk sizes,
+        /// in release order. `release_shared_mapping` releases exactly one
+        /// chunk per call and reports `complete: false` while chunks remain.
+        chunks: Mutex<HashMap<usize, Vec<u64>>>,
+    }
+
+    impl DeviceAllocator for PartialReleaseAllocator {
+        fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
+            let ptr = HostAllocator.allocate(bytes, align)?;
+            self.live
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(ptr.as_ptr() as usize);
+            Ok(ptr)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+            self.live
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&(ptr.as_ptr() as usize));
+            // SAFETY: forwarded under this method's identical contract.
+            unsafe { HostAllocator.deallocate(ptr, bytes, align) };
+        }
+
+        fn device(&self) -> DeviceKey {
+            DeviceKey::device(0)
+        }
+
+        fn as_shared_mapping(&self) -> Option<&dyn SharedMapping> {
+            Some(self)
+        }
+    }
+
+    impl SharedMapping for PartialReleaseAllocator {
+        fn device(&self) -> DeviceKey {
+            DeviceKey::device(0)
+        }
+
+        fn create_shared_prefix(
+            &self,
+            bytes: usize,
+        ) -> Result<Box<dyn SharedDevicePrefix>, MemoryError> {
+            Ok(Box::new(FakeSharedPrefix {
+                bytes: bytes as u64,
+            }))
+        }
+
+        fn incremental_owned_bytes_for_shared_prefix(
+            &self,
+            prefix: &dyn SharedDevicePrefix,
+        ) -> u64 {
+            prefix.committed_physical_bytes()
+        }
+
+        fn commit_shared_prefix(
+            &self,
+            prefix: &dyn SharedDevicePrefix,
+            ptr: NonNull<u8>,
+            _allocation_bytes: usize,
+            _byte_offset: usize,
+        ) -> Result<SharedPrefixCommitInfo, MemoryError> {
+            let total = prefix.mapped_bytes() as u64;
+            let half = total / 2;
+            self.chunks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(ptr.as_ptr() as usize, vec![total - half, half]);
+            Ok(SharedPrefixCommitInfo {
+                additional_owned_bytes: 0,
+                newly_mapped_bytes: total,
+                granules: 2,
+            })
+        }
+
+        unsafe fn release_shared_mapping(
+            &self,
+            ptr: NonNull<u8>,
+            allocation_bytes: usize,
+            align: usize,
+        ) -> Result<ReleaseReport, MemoryError> {
+            let key = ptr.as_ptr() as usize;
+            let mut guard = self
+                .chunks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(remaining) = guard.get_mut(&key) else {
+                return Ok(ReleaseReport::complete(0));
+            };
+            // Releases at most one chunk per call, standing in for one
+            // granule (or one batch of granules) genuinely unmapping per
+            // underlying CUDA call.
+            let released = remaining.pop().unwrap_or(0);
+            let complete = remaining.is_empty();
+            if complete {
+                guard.remove(&key);
+                drop(guard);
+                let was_live = self
+                    .live
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&key);
+                if was_live {
+                    // SAFETY: this is the last chunk; the allocation's
+                    // entire release completes in this call.
+                    unsafe { HostAllocator.deallocate(ptr, allocation_bytes, align) };
+                }
+            }
+            Ok(ReleaseReport {
+                unmapped_bytes: released,
+                complete,
+            })
+        }
+    }
+
+    #[test]
+    fn partial_shared_mapping_release_through_the_default_path_never_falls_through_to_deallocate() {
+        let allocator = PartialReleaseAllocator::default();
+        const BYTES: usize = 4096;
+        let ptr = allocator.allocate(BYTES, 8).expect("host allocation");
+
+        let shared_mapping = allocator.as_shared_mapping().expect("advertised");
+        let prefix = shared_mapping.create_shared_prefix(BYTES).expect("prefix");
+        shared_mapping
+            .commit_shared_prefix(prefix.as_ref(), ptr, BYTES, 0)
+            .expect("commit");
+
+        // SAFETY: `ptr` came from this allocator's own `allocate` above; the
+        // partial outcome below leaves it live, so nothing here double-frees.
+        let first = unsafe { allocator.deallocate_with_unmapped(ptr, BYTES, 8) }
+            .expect("a partial release is not a precondition violation");
+        assert!(
+            !first.complete,
+            "one chunk out of two releasing must be reported as incomplete, not silently \
+             treated as done (#1186 Phase 2 review, round 5 finding 2)"
         );
 
-        // SAFETY: releases the actual host allocation exactly once.
-        unsafe { allocator.deallocate(ptr, BYTES, 8) };
+        // Prove the allocation is genuinely still live: a base default that
+        // (incorrectly) fell through to plain `deallocate` after a partial
+        // release would make this a use-after-free under Miri/ASan; writing
+        // through it here is the cheapest available proof without those
+        // tools.
+        unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0xAB, BYTES) };
+
+        // SAFETY: retries the remainder through the same public path; `ptr`
+        // is still the one live allocation from above.
+        let second = unsafe { allocator.deallocate_with_unmapped(ptr, BYTES, 8) }
+            .expect("retry after partial release");
+        assert!(second.complete, "the retry must complete the release");
+        assert_eq!(
+            first.unmapped_bytes + second.unmapped_bytes,
+            BYTES as u64,
+            "the two partial reports together must account for exactly the mapped total — \
+             neither call may lose or double-count bytes"
+        );
+        // No further `deallocate` call: `second` already performed the
+        // allocation's one and only real free.
+    }
+
+    /// A minimal mechanism implementing every capability at once, standing
+    /// in for a real combined type like `CudaVmmAllocator`. Used to prove
+    /// [`DeviceMemoryMechanism`]'s constructors bind every capability view
+    /// to the exact same concrete value structurally, not by a runtime
+    /// identity check a caller or implementor could get wrong (#1186 Phase
+    /// 2 review, round 5 finding 4).
+    #[derive(Debug, Default)]
+    struct CombinedMechanism {
+        committed: Mutex<HashMap<usize, usize>>,
+    }
+
+    impl DeviceAllocator for CombinedMechanism {
+        fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
+            let ptr = HostAllocator.allocate(bytes, align)?;
+            self.committed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(ptr.as_ptr() as usize, bytes);
+            Ok(ptr)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+            self.committed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&(ptr.as_ptr() as usize));
+            // SAFETY: forwarded under this method's identical contract.
+            unsafe { HostAllocator.deallocate(ptr, bytes, align) };
+        }
+
+        fn device(&self) -> DeviceKey {
+            DeviceKey::device(0)
+        }
+    }
+
+    impl VirtualBacking for CombinedMechanism {
+        fn device(&self) -> DeviceKey {
+            DeviceKey::device(0)
+        }
+
+        fn allocate_committed(
+            &self,
+            bytes: usize,
+            align: usize,
+            _committed_ranges: &[std::ops::Range<usize>],
+        ) -> Result<NonNull<u8>, MemoryError> {
+            DeviceAllocator::allocate(self, bytes, align)
+        }
+
+        unsafe fn deallocate_committed(
+            &self,
+            ptr: NonNull<u8>,
+            allocation_bytes: usize,
+            align: usize,
+        ) -> Result<ReleaseReport, MemoryError> {
+            // SAFETY: forwarded under this method's identical contract.
+            unsafe { DeviceAllocator::deallocate(self, ptr, allocation_bytes, align) };
+            Ok(ReleaseReport::complete(allocation_bytes as u64))
+        }
+
+        fn commit_allocation_range(
+            &self,
+            _ptr: NonNull<u8>,
+            _allocation_bytes: usize,
+            _align: usize,
+            _offset: usize,
+            _bytes: usize,
+        ) -> Result<(), MemoryError> {
+            Ok(())
+        }
+
+        fn mapped_bytes_for_allocation_ranges(
+            &self,
+            ranges: &[AllocationCommitRange],
+        ) -> Result<u64, MemoryError> {
+            Ok(ranges.iter().map(|range| range.bytes as u64).sum())
+        }
+
+        fn mapped_bytes_for_allocation(
+            &self,
+            bytes: usize,
+            _align: usize,
+        ) -> Result<u64, MemoryError> {
+            Ok(bytes as u64)
+        }
+
+        fn decommit_allocation_range(
+            &self,
+            _ptr: NonNull<u8>,
+            _allocation_bytes: usize,
+            _align: usize,
+            _offset: usize,
+            _bytes: usize,
+        ) -> Result<ReleaseReport, MemoryError> {
+            Ok(ReleaseReport::complete(0))
+        }
+
+        fn allocation_committed_bytes(
+            &self,
+            ptr: NonNull<u8>,
+            allocation_bytes: usize,
+            _align: usize,
+        ) -> usize {
+            self.committed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&(ptr.as_ptr() as usize))
+                .copied()
+                .unwrap_or(allocation_bytes)
+        }
+    }
+
+    impl SharedMapping for CombinedMechanism {
+        fn device(&self) -> DeviceKey {
+            DeviceKey::device(0)
+        }
+
+        fn create_shared_prefix(
+            &self,
+            bytes: usize,
+        ) -> Result<Box<dyn SharedDevicePrefix>, MemoryError> {
+            Ok(Box::new(FakeSharedPrefix {
+                bytes: bytes as u64,
+            }))
+        }
+
+        fn incremental_owned_bytes_for_shared_prefix(
+            &self,
+            _prefix: &dyn SharedDevicePrefix,
+        ) -> u64 {
+            0
+        }
+
+        fn commit_shared_prefix(
+            &self,
+            prefix: &dyn SharedDevicePrefix,
+            _ptr: NonNull<u8>,
+            _allocation_bytes: usize,
+            _byte_offset: usize,
+        ) -> Result<SharedPrefixCommitInfo, MemoryError> {
+            Ok(SharedPrefixCommitInfo {
+                additional_owned_bytes: 0,
+                newly_mapped_bytes: prefix.mapped_bytes() as u64,
+                granules: 1,
+            })
+        }
+
+        unsafe fn release_shared_mapping(
+            &self,
+            ptr: NonNull<u8>,
+            allocation_bytes: usize,
+            align: usize,
+        ) -> Result<ReleaseReport, MemoryError> {
+            // SAFETY: forwarded under this method's identical contract.
+            unsafe { DeviceAllocator::deallocate(self, ptr, allocation_bytes, align) };
+            Ok(ReleaseReport::complete(0))
+        }
+    }
+
+    #[test]
+    fn device_memory_mechanism_eager_has_no_optional_capability() {
+        let mechanism = DeviceMemoryMechanism::eager(Arc::new(HostAllocator));
+        assert!(mechanism.as_virtual_backing().is_none());
+        assert!(mechanism.as_shared_mapping().is_none());
+
+        let ptr = mechanism.allocate(64, 8).expect("granted");
+        // SAFETY: `ptr` came from this mechanism's own `allocate` above.
+        let report =
+            unsafe { mechanism.deallocate_with_unmapped(ptr, 64, 8) }.expect("eager release");
+        assert_eq!(
+            report,
+            ReleaseReport::complete(0),
+            "an eager mechanism with neither optional capability must report the trivial, \
+             unambiguous complete-zero release"
+        );
+    }
+
+    #[test]
+    fn device_memory_mechanism_binds_every_capability_view_to_the_same_object() {
+        let concrete = Arc::new(CombinedMechanism::default());
+        let concrete_addr = Arc::as_ptr(&concrete) as *const ();
+        let mechanism =
+            DeviceMemoryMechanism::with_virtual_backing_and_shared_mapping(Arc::clone(&concrete));
+
+        let virtual_backing = mechanism.as_virtual_backing().expect("advertised");
+        let shared_mapping = mechanism.as_shared_mapping().expect("advertised");
+        assert_eq!(
+            (virtual_backing as *const dyn VirtualBacking).cast::<()>(),
+            concrete_addr,
+            "the bundle's VirtualBacking view must be the exact same value the allocator is, \
+             guaranteed by construction rather than by a runtime identity check a caller or \
+             implementor could get wrong (#1186 Phase 2 review, round 5 finding 4)"
+        );
+        assert_eq!(
+            (shared_mapping as *const dyn SharedMapping).cast::<()>(),
+            concrete_addr,
+            "the bundle's SharedMapping view must likewise be the same value"
+        );
+    }
+
+    #[test]
+    fn device_memory_mechanism_with_only_one_capability_leaves_the_other_none() {
+        let concrete = Arc::new(CombinedMechanism::default());
+        // `concrete` genuinely implements `SharedMapping` too, but this
+        // bundle is constructed with only `with_virtual_backing`: the other
+        // capability must not leak through just because the concrete type
+        // happens to support it. A provider's chosen construction is the
+        // only source of truth for what the bundle exposes.
+        let mechanism = DeviceMemoryMechanism::with_virtual_backing(concrete);
+        assert!(mechanism.as_virtual_backing().is_some());
+        assert!(
+            mechanism.as_shared_mapping().is_none(),
+            "a bundle built through `with_virtual_backing` must not also expose `SharedMapping` \
+             just because the concrete type happens to implement it"
+        );
+    }
+
+    /// A delegating wrapper around `CombinedMechanism`, standing in for a
+    /// real decorator (metrics, logging, retry) that forwards every call to
+    /// an inner mechanism. Implements every trait itself — rather than the
+    /// bundle being handed the inner value directly — to prove composition
+    /// works correctly for a genuine wrapper, not only for a mechanism that
+    /// happens to be the innermost concrete type (#1186 Phase 2 review,
+    /// round 5 finding 4: "legitimate wrappers can be wrongly rejected"
+    /// under the old identity-check design; under this design there is
+    /// nothing to reject).
+    #[derive(Debug, Default)]
+    struct DelegatingWrapper {
+        inner: CombinedMechanism,
+    }
+
+    impl DeviceAllocator for DelegatingWrapper {
+        fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
+            self.inner.allocate(bytes, align)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+            // SAFETY: forwarded under this method's identical contract.
+            unsafe { self.inner.deallocate(ptr, bytes, align) }
+        }
+
+        fn device(&self) -> DeviceKey {
+            DeviceAllocator::device(&self.inner)
+        }
+    }
+
+    impl VirtualBacking for DelegatingWrapper {
+        fn device(&self) -> DeviceKey {
+            VirtualBacking::device(&self.inner)
+        }
+
+        fn allocate_committed(
+            &self,
+            bytes: usize,
+            align: usize,
+            committed_ranges: &[std::ops::Range<usize>],
+        ) -> Result<NonNull<u8>, MemoryError> {
+            self.inner
+                .allocate_committed(bytes, align, committed_ranges)
+        }
+
+        unsafe fn deallocate_committed(
+            &self,
+            ptr: NonNull<u8>,
+            allocation_bytes: usize,
+            align: usize,
+        ) -> Result<ReleaseReport, MemoryError> {
+            // SAFETY: forwarded under this method's identical contract.
+            unsafe {
+                self.inner
+                    .deallocate_committed(ptr, allocation_bytes, align)
+            }
+        }
+
+        fn commit_allocation_range(
+            &self,
+            ptr: NonNull<u8>,
+            allocation_bytes: usize,
+            align: usize,
+            offset: usize,
+            bytes: usize,
+        ) -> Result<(), MemoryError> {
+            self.inner
+                .commit_allocation_range(ptr, allocation_bytes, align, offset, bytes)
+        }
+
+        fn mapped_bytes_for_allocation_ranges(
+            &self,
+            ranges: &[AllocationCommitRange],
+        ) -> Result<u64, MemoryError> {
+            self.inner.mapped_bytes_for_allocation_ranges(ranges)
+        }
+
+        fn mapped_bytes_for_allocation(
+            &self,
+            bytes: usize,
+            align: usize,
+        ) -> Result<u64, MemoryError> {
+            self.inner.mapped_bytes_for_allocation(bytes, align)
+        }
+
+        fn decommit_allocation_range(
+            &self,
+            ptr: NonNull<u8>,
+            allocation_bytes: usize,
+            align: usize,
+            offset: usize,
+            bytes: usize,
+        ) -> Result<ReleaseReport, MemoryError> {
+            self.inner
+                .decommit_allocation_range(ptr, allocation_bytes, align, offset, bytes)
+        }
+
+        fn allocation_committed_bytes(
+            &self,
+            ptr: NonNull<u8>,
+            allocation_bytes: usize,
+            align: usize,
+        ) -> usize {
+            self.inner
+                .allocation_committed_bytes(ptr, allocation_bytes, align)
+        }
+    }
+
+    #[test]
+    fn device_memory_mechanism_accepts_a_transparent_delegating_wrapper() {
+        let wrapper = Arc::new(DelegatingWrapper::default());
+        let mechanism = DeviceMemoryMechanism::with_virtual_backing(Arc::clone(&wrapper));
+
+        let ptr = mechanism.allocate(64, 8).expect("granted");
+        let virtual_backing = mechanism.as_virtual_backing().expect("advertised");
+        // SAFETY: `ptr` came from this mechanism's own `allocate` above.
+        let report = unsafe { virtual_backing.deallocate_committed(ptr, 64, 8) }.expect("release");
+        assert!(
+            report.complete && report.unmapped_bytes == 64,
+            "a genuine delegating wrapper must compose through the bundle exactly like a \
+             non-wrapped mechanism would"
+        );
     }
 
     /// An arena a `DeviceAllocator` implementation can borrow from without
@@ -1012,9 +1439,13 @@ mod tests {
     unsafe impl Sync for BorrowedArena {}
 
     /// A `DeviceAllocator` that borrows its backing arena rather than owning
-    /// it — the exact shape round 3's `Any` supertrait would have rejected,
-    /// since `&'a BorrowedArena` is not `'static` for any `'a` shorter than
-    /// `'static`.
+    /// it — a shape a supertrait imposing `'static` (whether `Any`, as
+    /// round 3 tried, or a `MechanismId`-bearing scheme requiring `Any`)
+    /// would reject, since `&'a BorrowedArena` is not `'static` for any `'a`
+    /// shorter than `'static`. `DeviceMemoryMechanism` requires `'static`
+    /// only on its own constructors — never on the base `DeviceAllocator`
+    /// trait itself — so this type still implements the minimal ordinary
+    /// contract directly.
     #[derive(Debug)]
     struct BorrowedAllocator<'a> {
         arena: &'a BorrowedArena,
@@ -1042,10 +1473,10 @@ mod tests {
             DeviceKey::device(0)
         }
 
-        // Deliberately does not override `mechanism_id`, `as_virtual_backing`,
-        // or `as_shared_mapping`: a borrowed, non-`'static` allocator is
-        // exactly the kind of type that should be able to implement only the
-        // minimal ordinary contract and nothing more.
+        // Deliberately does not override `as_virtual_backing` or
+        // `as_shared_mapping`: a borrowed, non-`'static` allocator is
+        // exactly the kind of type that should be able to implement only
+        // the minimal ordinary contract and nothing more.
     }
 
     #[test]
@@ -1053,8 +1484,9 @@ mod tests {
         let arena = BorrowedArena::default();
         let allocator = BorrowedAllocator { arena: &arena };
 
-        // This line is the actual proof: `DeviceAllocator` no longer requires
-        // `Any`, so a trait object over a non-`'static` reference compiles.
+        // This line is the actual proof: `DeviceAllocator` imposes no `Any`
+        // or other `'static` bound, so a trait object over a non-`'static`
+        // reference compiles.
         let as_dyn: &dyn DeviceAllocator = &allocator;
 
         let ptr = as_dyn.allocate(64, 8).expect("borrowed allocation");
@@ -1065,9 +1497,10 @@ mod tests {
             "allocate must still run through the borrowed arena"
         );
         assert!(
-            as_dyn.mechanism_id().is_none(),
-            "an allocator that never overrides `mechanism_id` must report `None`, not be forced \
-             to fabricate an identity (#1186 Phase 2 review, round 4 finding 2)"
+            as_dyn.as_virtual_backing().is_none() && as_dyn.as_shared_mapping().is_none(),
+            "an allocator that never overrides either optional capability method must report \
+             `None` for both, not be forced to fabricate an identity or a capability (#1186 \
+             Phase 2 review, round 4 finding 2)"
         );
 
         // SAFETY: `ptr` came from this allocator's own `allocate` above with

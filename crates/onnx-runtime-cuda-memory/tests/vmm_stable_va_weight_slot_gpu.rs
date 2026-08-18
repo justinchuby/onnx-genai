@@ -223,7 +223,7 @@ fn captured_read_from_stable_va_tracks_repaged_physical_granules() {
             .decommit_allocation_range(slot, GRANULE, 256, 0, GRANULE)
             .expect("decommit slot granule (page-out)");
         assert_eq!(
-            unmapped, GRANULE as u64,
+            unmapped.unmapped_bytes, GRANULE as u64,
             "page-out must unmap exactly the one granule"
         );
         assert_eq!(
