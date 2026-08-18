@@ -1,6 +1,6 @@
 # Decisions — live standing directives
 
-Last consolidated: 2026-08-18T16:44Z (Scribe processed Tycho #1180 CUDA lib-name inbox drop; prior detailed 2026-08 narrative remains archived in `.squad/decisions-archive/2026-08.md` to keep the live ledger below 20KB.)
+Last consolidated: 2026-08-18T17:11Z (Scribe processed Deckard GQA head-size inbox drop; detailed 2026-08 narrative remains archived in `.squad/decisions-archive/2026-08.md` to keep the live ledger below 20KB.)
 
 Standing governance rules and active directives. Full narrative is archived; keep this file to current decisions plus durable rules.
 
@@ -46,6 +46,57 @@ For int4 GEMV/QMoE reductions, CPU bit-identity is not an oracle when accumulati
 ## CUDA availability directive
 
 The primary Windows development box has a working RTX 4060 CUDA path even though `nvcc`, `CUDA_PATH`, and default PATH probes may fail. A complete CUDA 13 runtime is available under anaconda site-packages; agents must distinguish absent from misconfigured before claiming CUDA is unavailable. On that box, add the `cu13` and `cudnn` bin directories to PATH and build with `--features native-cuda`.
+
+### 2026-08-18: general head-size fused f32 GQA decode kernel (was head_size=256)
+
+**By:** Deckard
+
+**What:** GO. Generalized the f32 fused split-K GQA decode fast path over head size
+instead of special-casing 256. The kernel is now templated on dims-per-lane
+`DPL = ceil(head_dim / 32)`; the launcher selects the exact tier (1..=8) so each
+head keeps its minimal register footprint. `supported()` covers head_dim 1..=256.
+
+- Correctness (byte-identical / f64 CPU-reference oracle), same tolerance as the
+  original head<=128 test (max_abs<1e-3, max_rel<5e-3). All GQA 8/2, cache lengths
+  spanning the split-K boundaries:
+    head64  (dpl2): max_abs=1.19e-7  max_rel=2.49e-7
+    head80  (dpl3): max_abs=1.19e-7  max_rel=2.55e-7
+    head96  (dpl3): max_abs=1.19e-7  max_rel=2.43e-7
+    head112 (dpl4): max_abs=1.79e-7  max_rel=3.58e-7
+    head128 (dpl4): max_abs=1.49e-7  max_rel=3.04e-7
+    head192 (dpl6): max_abs=1.19e-7  max_rel=2.51e-7
+    head256 (dpl8): max_abs=1.79e-7  max_rel=4.15e-7
+  (non-multiple-of-32 dims 80/96/112 correctly mask partial lanes.)
+
+- Perf headline (qwen3.5-2b-text, head_dim=256, idle H200, native, tokens=128
+  warmups=2 runs=5 --steady --decode-skip 1, medians of 5):
+    BEFORE (gqa_attention_reference_f32): 102.31 tok/s (9.774 ms/token)
+    AFTER  (fused, dpl8):                 170.97 tok/s (5.849 ms/token)  -> 1.67x
+  nsys: gqa_attention_reference_f32 share 31.2% -> 1.1% (only warmup calls remain).
+
+- Regression guard (qwen3-0.6b, head_dim=128): DPL4 baseline 316.06 tok/s vs
+  templated dpl4 312-316 tok/s across repeats -> statistically identical (the
+  templated dpl4 path compiles to the same code as the pre-change DPL=4 kernel;
+  no register regression). A naive single-tier DPL=8 kernel measured 314.69 —
+  also within noise on this model, but the per-DPL specialization guarantees no
+  regression on attention-bound shapes/longer contexts.
+
+**Why:** head_dim=256 previously fell to the serial reference kernel (nsys #1
+decode hotspot, 31.2%). Parameterizing over DPL removes the fallback for the
+whole common head-size set (64/80/96/112/128/192/256) with one kernel, keeps
+small heads at their original register footprint, and is byte-identical-eligible.
+
+**Scoped follow-up (NOT in this PR): asymmetric v_head_dim != qk_head_dim
+(Gemma dual-head / DeepSeek MLA).** Audited: the f32 decode kernel and the entire
+`group_query_attention.rs` op thread a single `head_size` for Q/K/V. Standard ONNX
+`com.microsoft.GroupQueryAttention` is symmetric, so no runtime model needs this
+today. Adding it would require: (1) split `head_size` into `qk_head_size` (query,
+key, butterfly dot-product loop) and `v_head_size` (value accumulate `acc[]`,
+`warp_acc`, scratch stride, output write) in `gqa_decode.rs`; (2) a second template
+param so `q_reg` is sized by `ceil(qk/32)` and `acc`/output by `ceil(v/32)`
+(entry matrix grows to DPL_QK x DPL_V); (3) thread a separate `v_head_dim` through
+`gqa_decode::run()` and the GQA op call site + KV-cache/RoPE prep. Deferred to keep
+this PR scoped; the win here (symmetric heads) covers every model we currently run.
 
 ### 2026-08-18: #1180 — single CUDA lib-name table
 **By:** Tycho
@@ -176,40 +227,6 @@ one-line guard fails it with `workspace invariant mismatch: execute requires 409
 bytes aligned to 512, prepared 2048 bytes aligned to 256`; with the fix it grows
 in place and passes. `cargo test -p onnx-runtime-session --lib` = 186 passed;
 clippy + rustfmt clean.
-
-## 2026-08-18 — V2-Lite MoE CUDA graph-capture and workspace fixes merged
-
-PR #1181 landed on `main` as `c9c7f64c`, unlocking V2-Lite graph capture by fixing the additive-mask `_d1` workspace-planner path; Wallace measured capture ON vs eager OFF byte-identical over 320 tokens, **101.80 vs 56.94 tok/s = 1.79×**.
-
-A separate long-context Engine `Attention` workspace under-plan then surfaced around KV-capacity growth. PR #1189 landed on `main` as `b416a3e0`, fixing Engine/native CUDA single-token decode to re-run governed workspace preparation whenever `ensure_capacity` grows the KV/mask bucket. Leon's A/B on the real V2-Lite path generated 340 token-identical tokens in eager and capture; eager measured 47.32 tok/s, capture 89.69 tok/s with captures=2, replays=336, fallbacks=0. Rachael approved the fix as strictly gated on capacity growth and correctly placed before eager/capture execution.
-
-## 2026-08-18 — DeepSeek-V2-Lite Native-vs-ORT row closed
-
-Wallace measured the real 27-layer DeepSeek-V2-Lite int4 QMoE export under pinned ORT CUDA 1.27 and identical base-decode conditions. Native CUDA serves the model on GPU at **57.15 tok/s eager** and **101.68 tok/s captured**. Stock ORT CUDA EP cannot run the 26 `com.microsoft::QMoE` nodes on GPU; with CPU fallback it inserts 104 host/device Memcpy nodes and reaches **0.17 tok/s**, while strict no-fallback refuses the graph. ORT + CUDA graph is categorically N/A because the graph is split across CPU and GPU. Frame the row as a hard capability gap: native is the only measured GPU engine for int4 QMoE here.
-
-## 2026-08-18 — ORT-fairness dense int4 reconfirmed
-
-Wallace reconfirmed the 2026-08-17 dense int4 Native-vs-ORT decomposition from the opposite direction by trying to enable ORT CUDA graph mode on the same three production exports. True graph-vs-graph is unattainable: Phi-4-mini hard-rejects ORT graph capture because control-flow nodes cannot be supported by CUDAExecutionProvider; qwen2.5-7b aborts at runtime with `ort_value must contain a constructed tensor`; qwen2.5-14b-zp accepts the flag but effectively no-ops because CPU-assigned shape nodes fragment capture (eager 96.9 vs graph 98.7 tok/s, byte-identical).
-
-Eager-vs-eager medians again show this is architectural, not a broad per-kernel native win: Phi native/ORT **0.85×**, qwen2.5-7b **0.77×**, qwen2.5-14b-zp **1.19×**. Keep the deployment headline that native captured decode leads ORT eager **1.33× / 1.14× / 1.83×**, but always label it as CUDA-graph capture plus on-GPU argmax that ORT structurally cannot apply on these dynamic-KV int4 exports.
-
-## 2026-08-18 — Gate-3 speculative verify remains shelved after Marlin
-
-Luv re-probed Deckard's Gate-3 B\* framework on current `main` `923dc592` after Marlin landed. Captured verify break-even `B*=C_verify(M=K)/C_decode(M=1)` is still **NO-GO**: qwen2.5-14b-zp reports **17.5× / 18.4× / 20.0×** for K=2/4/8, and qwen2.5-7b reports **14.9× / 15.7× / 17.4×**. This is worse than the 2026-08-14 baseline (~8.5×) and far above the ≤~2 GO gate, so n-gram/prompt-lookup, EAGLE/MTP, and model-draft speculative-decode work stays shelved.
-
-This updates the earlier spec-decode arc rather than reopening it: the old #957 cheap GQA/SkipSimplifiedLayerNorm residual seams no longer appear as M>1 `KernelCaptureUnsupported` blockers. The measured blocker is now solely `MatMulNBits` at M>1 launching `matmul_nbits_gemm_f16` eagerly; Marlin's capture-safe M>1 int4 GEMM is not selected for this MatMulNBits path. Reconsider only after a graph-safe M>1 MatMulNBits/Marlin path exists and this exact B\* probe is rerun.
-
-## 2026-08-18 — Gate-3 Marlin M>1 opt-in follow-up still NO-GO
-
-Luv re-ran the Gate-3 B\* verify-cost probe with `ONNX_GENAI_MARLIN_M_GT_1=1` and no code changes as a follow-up to the earlier post-Marlin Gate-3 NO-GO. The env gate fixed the capture problem completely: qwen2.5-14b-zp capture segments dropped **96→1**, qwen2.5-7b **29→1**, `KernelCaptureUnsupported` seams disappeared, K=8 byte-identity passed, and the hot path switched to `matmul_nbits_marlin_gemm_f16_splitk`.
-
-The decision does **not** change: speculative decode remains shelved. B\* improved but is still NO-GO at **5.19× / 5.19× / 5.79×** for qwen2.5-14b-zp and **4.64× / 4.71× / 5.23×** for qwen2.5-7b at K=2/4/8, above the ≥~4 kill gate and far above the ≤~2 GO target. The spec-decode family — model-draft, n-gram/prompt-lookup, EAGLE/MTP — is now mined out across the three probes. Residual cost is Marlin M>1 GEMM/repack/reduce (`matmul_nbits_marlin_repack` observed in the hot path), not graph fragmentation.
-
-## 2026-08-18 — Marlin M>1 default flip mined out
-
-Luv completed the real prefill/TTFT A/B for `ONNX_GENAI_MARLIN_M_GT_1=1` versus the portable tiled GEMM path, closing the thread opened by the two prior Gate-3 Marlin entries: “Gate-3 speculative verify remains shelved after Marlin” and “Gate-3 Marlin M>1 opt-in follow-up still NO-GO.” The verdict is **NO-GO to flip the default**: Marlin M>1 stays opt-in.
-
-E2E `profile_native` TTFT showed only marginal-to-neutral qwen2.5-14b-zp movement (**0.976× / 0.988× / 0.999×** Marlin/portable at M=128/512/2048) and neutral-to-worse qwen2.5-7b movement (**1.005× / 1.013× / 1.001×**). Argmax matched every arm, but full-vocab token-0 logprob dumps were not byte-identical (max Δ **0.017** qwen14, **0.168** qwen7), so the silent-default byte-identity bar fails. Treat the Marlin-M>1 vein as mined out: not a spec-decode win, not a prefill/TTFT win, and not eligible for a silent default.
 
 ## 2026-08-18 — Marlin M>1 now default ON; byte-identity bar relaxed to argmax stability
 
