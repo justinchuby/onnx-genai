@@ -155,6 +155,8 @@ python scripts/moe_expert_cache_sim.py      # -> scripts/moe_cache_sim_results.j
 - Paging cost / granule floor (the mechanism question this feeds):
   [`2026-08-18-moe-per-expert-paging-churn.md`](2026-08-18-moe-per-expert-paging-churn.md)
 - The open question this closes: [`docs/memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md`](../memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md)
+- Follow-up (tiering, concentration curve, route-aware scheduling):
+  [`2026-08-18-moe-tiering-and-route-aware-scheduling.md`](2026-08-18-moe-tiering-and-route-aware-scheduling.md)
 - Scripts: [`scripts/dump_moe_expert_trace.py`](../../scripts/dump_moe_expert_trace.py),
   [`scripts/moe_expert_cache_sim.py`](../../scripts/moe_expert_cache_sim.py),
   [`scripts/moe_cache_sim_results.json`](../../scripts/moe_cache_sim_results.json)
