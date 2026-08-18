@@ -6,6 +6,8 @@ tags:
   - wiki
   - index
 status: maintained
+created: 2026-08-17
+updated: 2026-08-17
 ---
 
 # onnx-genai Wiki
@@ -23,14 +25,21 @@ the specifications, measured evidence, or accepted designs in `docs/`.
 
 ## Maps of content
 
+- **Start here:** [[start/Repository Map]]
+- **Architecture:** [[architecture/Crate Architecture]]
+- **Runtime flow:** [[architecture/Inference Request Lifecycle]]
+- **Execution:** [[execution/Execution Backends]]
 - **Memory:** [[memory/Memory Management for Beginners]]
+- **Documentation:** [[start/Documentation Guide]]
+- **Wiki maintenance:** [[meta/Using this Wiki]]
 
 ## Note conventions
 
 Every note should:
 
 1. Use an English filename and `title` so links remain stable across languages.
-2. Include YAML frontmatter with `title`, `aliases`, `tags`, and `status`.
+2. Include YAML frontmatter with `title`, `aliases`, `tags`, `status`,
+   `created`, and `updated`.
 3. Begin with a short statement of the question the note answers.
 4. Use `[[wikilinks]]` instead of duplicating explanations across notes.
 5. Use Obsidian callouts for invariants, warnings, examples, and context.
@@ -39,3 +48,11 @@ Every note should:
 
 Notes may be written in the language that best serves their audience. English
 titles and paths are required even when the body is written in another language.
+
+> [!note] Creation and modification dates
+> Obsidian can display the version-controlled `created` and `updated` properties
+> in the Properties view. Obsidian also knows local filesystem creation and
+> modification times, but those are not durable across clones, checkouts, and
+> rebases. Core Obsidian does not automatically maintain custom `updated`
+> frontmatter on every edit; update it with the note, or use a configured
+> automation/plugin. See [[meta/Using this Wiki]].
