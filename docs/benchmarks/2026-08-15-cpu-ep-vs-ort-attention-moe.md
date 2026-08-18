@@ -2119,6 +2119,40 @@ physical core within the compact set, which needs SMT sibling discovery
 (`/sys/devices/system/cpu/cpuN/topology/thread_siblings_list`) that
 `decode_affinity` does not currently do.
 
+### 26.2.1 (a) is now fixed, and (b) alone still blocks
+
+#1184 made the pool genuinely multi-dispatcher: `dispatch` claims the single job
+slot with a compare-exchange and a losing caller runs the same shards inline on
+its own thread, which is the identical computation because the shards already
+partition their output by global worker index. That closed (a) as a correctness
+matter, and the review confirmed the failure was reproducible - deleting the
+claim gate makes the two-dispatcher test *hang* rather than fail, which is why
+the hazard had gone unnoticed.
+
+It did **not** make the routing landable. Re-wiring `RotaryEmbedding`'s fan-out
+through the pool on top of #1184 and running the paired grid again reproduces
+the bistability of §26.2(b) intact, and worse than before:
+
+| model | t | rayon (base) | hot pool |
+|---|---|---|---|
+| rope_llama3_s128 | 8 | 5.456 | 11.313 |
+| rope_llama3_s128 | 16 | 9.457 `[6.4-23.1]` | **72.704** `[20.7-86.6]` |
+| rope_gptj_il_s128 | 16 | 6.247 | **55.751** `[29.0-85.7]` |
+| rope_gptj_il_s512 | 16 | 5.445 | **1.232** `[1.08-35.6]` |
+| rope_llama3_b8_s1 | 16 | 0.807 | **0.622** |
+| rope_llama3_s512 | 16 | 30.771 | **18.385** |
+
+Both directions in one grid, with dispersion bands wider than the medians. That
+is not a tuning problem, and the bottom three rows are not a partial win - they
+are the same bistable system landing on its other mode. Nothing here is
+publishable as a ratio.
+
+So the ordering is settled: **(b) is the binding constraint, not (a)**. Capping
+*spinning* workers at one per physical core inside the compact mask - which
+needs the SMT sibling discovery `decode_affinity` does not do - has to land
+before the hot-pool routing can be evaluated at all, let alone merged. Until
+then the t=8/16 column stays where it is, and the RoPE fan-out stays on Rayon.
+
 ### 26.3 What this means for the remaining §23.7 rows
 
 Softmax, Transpose, Concat and the MoE cells should not be attacked as separate
@@ -2127,8 +2161,84 @@ of their arithmetic; their t=8/16 numbers are mostly measuring thread wake-up.
 Any per-kernel tuning done against the t=16 column now is tuning against the
 scheduler, and will have to be redone.
 
+Per §26.2.1 that now reads more sharply: the scheduler work itself is blocked
+behind SMT-aware spin capping, so *neither* the per-kernel tuning nor the
+hot-pool routing is the next move.
+
 The exception is §11.5's paged/appendable KV cache. `Concat` re-copying the full
 history every token is a real algorithmic cost that no scheduler change touches,
 and §8 already established that parallelising `ConcatKernel` is a dead end. That
 remains the largest genuinely structural gap and is independent of all of the
 above.
+
+## 27. Where the CPU EP actually stands
+
+Full transform + KV-concat grid on `main` at `f2e6ad97d`, paired interleaved
+against a real ORT 1.27 CPU session, one driver invocation, 5 trials × 60 runs ×
+15 warmups. Ratio is native/ORT p50, **lower is better**, and `< 1.000` is a win.
+
+| model | t=1 | t=8 | t=16 |
+|---|---|---|---|
+| kvcat_llama3_b8_p2047 | **0.883** | 2.203 | 2.250 |
+| kvcat_llama3_p1023 | 1.002 | 4.672 | 3.930 |
+| kvcat_llama3_p2047 | **0.968** | 3.545 | 3.878 |
+| kvcat_llama3_p4095 | 1.706 | 5.075 | 6.633 |
+| kvcat_llama3_p8191 | 1.004 | 2.824 | 2.955 |
+| rope_gptj_il_s1 | 1.300 | 1.290 | 1.287 |
+| rope_gptj_il_s128 | **0.878** | 3.864 | 5.800 |
+| rope_gptj_il_s512 | **0.962** | 3.018 | 5.773 |
+| rope_llama3_b8_s1 | 1.160 | 1.261 | **0.874** |
+| rope_llama3_s1 | 1.295 | 1.295 | 1.295 |
+| rope_llama3_s128 | 1.022 | 4.657 | 17.557 |
+| rope_llama3_s512 | 1.024 | 3.589 | 5.230 |
+| sm_bert_b8_s128 | 1.246 | 3.294 | 5.179 |
+| sm_decode_h32_kv1024 | 1.177 | 1.987 | 2.051 |
+| sm_decode_h32_kv2048 | 1.183 | 2.648 | 3.015 |
+| sm_decode_h32_kv4096 | 1.188 | 4.143 | 4.268 |
+| sm_decode_h32_kv8192 | 1.214 | 5.423 | 6.776 |
+| sm_prefill_h32_s512 | 1.328 | 2.539 | 2.655 |
+| sm_whisper_cross | 1.374 | 2.933 | 3.059 |
+| tr_bert_b8_s128 | **0.607** | 1.068 | 1.715 |
+| tr_llama3_s512 | **0.820** | 2.796 | 4.292 |
+| tr_whisper_s1500 | **0.984** | 2.311 | 3.413 |
+
+**8 of 66 cells win. 58 lose. Parity 330/330 PASS.**
+
+Read by column rather than by row, which is the whole point of §26:
+
+| threads | wins | median ratio |
+|---|---|---|
+| 1 | 8 / 22 | ~1.02 |
+| 8 | 0 / 22 | ~3.0 |
+| 16 | 1 / 22 | ~3.6 |
+
+At **t=1** the kernels are at parity - median 1.02, eight outright wins, and the
+worst cell is 1.706. That column is a fair measure of the arithmetic, and it
+says the arithmetic is broadly competitive. At **t=8 and t=16** the median is
+3-3.6× with almost no wins. The kernels did not get worse; the scheduling did.
+
+Two caveats on this table, stated rather than buried. The host is shared and
+contended, so absolute numbers drift between runs - `rope_llama3_s128` at t=16
+reads 17.557 here and 9.457 in the §26.2.1 grid taken later the same session.
+Only ratios from a single driver invocation are comparable, which is why the
+arms are interleaved. And cells whose native p50 is under ~100 µs
+(`rope_*_s1`, `rope_llama3_b8_s1`) are overhead-dominated, which is why they sit
+near a flat ~1.3 at every thread count instead of scaling.
+
+### 27.1 The honest blocker list
+
+1. **SMT-aware spin capping** (§26.2.1) - blocks the entire t=8/16 column, which
+   is 58 of the 66 losing cells. Nothing else in this list can be measured
+   cleanly until it lands.
+2. **Paged/appendable KV cache** (§11.5) - the `kvcat_*` rows re-copy the whole
+   history per token. Independent of (1); the only structural item that is
+   actionable right now.
+3. **Fused transpose-with-consumer** (§7, §19, §20) - `tr_*` wins at t=1 by
+   reading and writing less, and that advantage should compose into QK/PV/MoE
+   rather than being spent on a standalone node.
+4. **Grouped/batched MoE GEMM** (§18) - not in this grid; measured separately at
+   1.47-2.37× on qwen3-moe e16 top-8.
+5. **Fused-attention session A/B** (§15) - the `sm_*` rows here are isolated
+   single-node graphs. Softmax has to win inside a real fused SDPA region.
+6. **Output/intermediate arena** (§21.3) - #1146 removed the input half;
+   `collect_outputs` remains.
