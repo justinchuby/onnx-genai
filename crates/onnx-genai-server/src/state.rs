@@ -731,6 +731,11 @@ fn build_pipeline_handle(
         authorities,
     )?;
     let multimodal = crate::multimodal::build(&directory, engine.models())?;
+    // The package's own `generation` block is the pipeline's declared sampling
+    // regime, so honor it exactly as the CLI does. Without it every request
+    // decodes greedily at the OpenAI schema defaults, and a model that ships
+    // `do_sample: true` degenerates into repetition.
+    let generation_defaults = engine.generation_defaults().cloned();
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
         model_dir: model_dir.to_path_buf(),
@@ -738,10 +743,7 @@ fn build_pipeline_handle(
         tokenizer: Arc::new(tokenizer),
         chat_template: chat_template.map(Arc::new),
         model_max_context,
-        // A pipeline's sampling is governed by its plan, not a single decoder's
-        // declared `search` block, so it carries no model-level defaults (this
-        // mirrors the CLI, whose `Backend::Pipeline` reports `None`).
-        generation_defaults: None,
+        generation_defaults,
         fim_config: None,
         pipeline: true,
         multimodal: Some(multimodal),

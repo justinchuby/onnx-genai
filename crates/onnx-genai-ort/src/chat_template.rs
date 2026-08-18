@@ -92,6 +92,14 @@ pub struct ChatMessage {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Value>,
+    /// OpenAI's optional message `name`, which tool templates read to label a
+    /// tool result with the function that produced it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The assistant tool call this message answers, which tool templates use
+    /// to recover the function name when the caller sends no `name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -100,6 +108,8 @@ impl ChatMessage {
             role: role.into(),
             content: content.into(),
             tool_calls: None,
+            name: None,
+            tool_call_id: None,
         }
     }
 
@@ -117,6 +127,14 @@ impl ChatMessage {
 
     pub fn with_tool_calls(mut self, tool_calls: Value) -> Self {
         self.tool_calls = Some(tool_calls);
+        self
+    }
+
+    /// Attach the OpenAI tool-result identity a template needs to name the
+    /// function a `tool` message answers.
+    pub fn with_tool_result(mut self, name: Option<String>, tool_call_id: Option<String>) -> Self {
+        self.name = name;
+        self.tool_call_id = tool_call_id;
         self
     }
 }
@@ -140,6 +158,19 @@ impl ChatTemplate {
     pub fn builtin_default() -> Self {
         Self {
             template: DEFAULT_CHAT_TEMPLATE.to_string(),
+            bos_token: None,
+            eos_token: None,
+        }
+    }
+
+    /// A `ChatTemplate` backed by an explicit Jinja source, carrying no
+    /// `bos_token`/`eos_token` of its own.
+    ///
+    /// Lets a caller render against a template it already holds — one embedded
+    /// in a package manifest, say — instead of a model directory on disk.
+    pub fn from_source(template: impl Into<String>) -> Self {
+        Self {
+            template: template.into(),
             bos_token: None,
             eos_token: None,
         }
@@ -203,6 +234,25 @@ impl ChatTemplate {
         tools: Option<&str>,
         add_generation_prompt: bool,
     ) -> Result<String> {
+        self.render_with_reasoning_effort(messages, tools, add_generation_prompt, None)
+    }
+
+    /// Render chat messages, selecting how much the model should reason first.
+    ///
+    /// A reasoning model's template decides how much thinking to request from a
+    /// keyword the caller supplies, defaulting to its own (often maximal) value
+    /// when none arrives — which is why an agent's turn can otherwise spend its
+    /// whole token budget thinking. There are two spellings of that keyword in
+    /// the wild, `reasoning_effort` and `reasoning_strength`, for one concept,
+    /// so the caller's choice is exposed under both and the template reads
+    /// whichever it was authored against.
+    pub fn render_with_reasoning_effort(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&str>,
+        add_generation_prompt: bool,
+        reasoning_effort: Option<&str>,
+    ) -> Result<String> {
         let tools = match tools {
             Some(tools) => serde_json::from_str::<Value>(tools).map_err(|err| {
                 OrtError::InvalidArgument(format!("invalid tools JSON for chat template: {err}"))
@@ -232,6 +282,8 @@ impl ChatTemplate {
                 messages => messages,
                 tools => tools,
                 add_generation_prompt => add_generation_prompt,
+                reasoning_effort => reasoning_effort,
+                reasoning_strength => reasoning_effort,
                 bos_token => self.bos_token.as_deref().unwrap_or_default(),
                 eos_token => self.eos_token.as_deref().unwrap_or_default(),
             })
@@ -407,6 +459,55 @@ mod tests {
             template.render(&[], None, false).unwrap(),
             "true|true|true|b| keep "
         );
+    }
+
+    // Tool-calling templates name each result from the message's `name`, or
+    // resolve it from `tool_call_id` against the assistant call it answers.
+    // Both must survive into the render context.
+    #[test]
+    fn render_exposes_tool_result_identity() {
+        let template = ChatTemplate {
+            template: "{% for m in messages %}{{ m.get('name') or m.get('tool_call_id') or '?' }}|{% endfor %}"
+                .to_string(),
+            bos_token: None,
+            eos_token: None,
+        };
+        let messages = [
+            ChatMessage::new(ChatRole::Tool, "named")
+                .with_tool_result(Some("get_weather".to_string()), None),
+            ChatMessage::new(ChatRole::Tool, "by id")
+                .with_tool_result(None, Some("call_0".to_string())),
+            ChatMessage::user("plain"),
+        ];
+
+        assert_eq!(
+            template.render(&messages, None, false).unwrap(),
+            "get_weather|call_0|?|"
+        );
+    }
+
+    // Reasoning templates read one of two spellings of the same keyword, and a
+    // template that reads neither is unaffected by the caller's choice.
+    #[test]
+    fn render_exposes_reasoning_effort_under_both_spellings() {
+        let template = ChatTemplate {
+            template: concat!(
+                "{{ reasoning_effort if reasoning_effort is defined and reasoning_effort else 'unset' }}",
+                "|{{ reasoning_strength if reasoning_strength is defined and reasoning_strength else 'unset' }}"
+            )
+            .to_string(),
+            bos_token: None,
+            eos_token: None,
+        };
+
+        assert_eq!(
+            template
+                .render_with_reasoning_effort(&[], None, false, Some("low"))
+                .unwrap(),
+            "low|low"
+        );
+        // An unset effort leaves the template on its own default.
+        assert_eq!(template.render(&[], None, false).unwrap(), "unset|unset");
     }
 
     #[test]
