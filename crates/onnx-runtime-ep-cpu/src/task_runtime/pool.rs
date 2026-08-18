@@ -719,10 +719,13 @@ mod tests {
             dispatchers * 20 * per as u64,
             "tasks run does not match tasks published"
         );
-        assert!(
-            after.tasks - before.tasks > after.tasks_by_dispatcher - before.tasks_by_dispatcher,
-            "workers ran none of the concurrent fan-outs"
-        );
+        // Deliberately no assertion that a *worker* ran some of this. A
+        // dispatcher drains its own slot greedily, so "at least one task landed
+        // off-thread" is a scheduling outcome, not an invariant, and asserting
+        // it here would be the timing assertion `workers_actually_participate`
+        // exists to avoid. What this test owns is that concurrent dispatchers
+        // do not corrupt each other: every task runs exactly once and the
+        // totals add up, both checked above.
     }
 
     #[test]

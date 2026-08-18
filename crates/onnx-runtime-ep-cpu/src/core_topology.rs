@@ -258,6 +258,13 @@ fn parse_cpu_list(list: &str) -> Vec<usize> {
             if let (Ok(start), Ok(end)) =
                 (start.trim().parse::<usize>(), end.trim().parse::<usize>())
                 && start <= end
+                // A range is materialised, so a malformed one is an allocation
+                // and not just a wrong answer: `0-4294967295` from a container
+                // shim or an emulated sysfs would try to push four billion
+                // entries. Nothing downstream can use a CPU id this large --
+                // `physical_cores_within` intersects with the affinity mask --
+                // so dropping the whole range is both safe and cheap.
+                && end - start < MAX_CPU_LIST_SPAN
             {
                 cpus.extend(start..=end);
             }
@@ -267,6 +274,12 @@ fn parse_cpu_list(list: &str) -> Vec<usize> {
     }
     cpus
 }
+
+/// Widest `a-b` run [`parse_cpu_list`] will expand. Comfortably above any real
+/// machine (the largest shipping x86 socket is three digits of threads) and far
+/// below anything that costs real memory.
+#[cfg(any(target_os = "linux", test))]
+const MAX_CPU_LIST_SPAN: usize = 1 << 16;
 
 #[cfg(target_vendor = "apple")]
 fn apple_sysctl_usize(name: &std::ffi::CStr) -> Option<usize> {
@@ -557,6 +570,14 @@ mod tests {
         // A reversed range is malformed; it must yield nothing rather than
         // panicking or looping.
         assert_eq!(parse_cpu_list("5-2"), Vec::<usize>::new());
+        // An absurdly wide range is malformed too, and this one is expensive
+        // rather than merely wrong: expanding it would allocate. Drop it, and
+        // keep the well-formed siblings either side of it.
+        assert_eq!(parse_cpu_list("0-4294967295"), Vec::<usize>::new());
+        assert_eq!(parse_cpu_list("0,1-4294967295,7"), vec![0, 7]);
+        // The bound is on the span, not on the endpoints: a narrow range high
+        // up is still parsed.
+        assert_eq!(parse_cpu_list("1000000-1000001"), vec![1_000_000, 1_000_001]);
     }
 
     #[test]
