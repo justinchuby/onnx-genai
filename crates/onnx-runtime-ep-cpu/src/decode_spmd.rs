@@ -297,10 +297,13 @@ impl SharedState {
         }
     }
 
-    /// Spin-wait until every node's workers have finished the published op. The
-    /// dispatcher is a single, never-idle thread that needs the results the
-    /// instant they land, so it spins (with a yield backstop for stragglers under
-    /// oversubscription) rather than parking.
+    /// Spin-wait until every node's workers have finished the published op.
+    ///
+    /// There is exactly one dispatcher at a time -- enforced by
+    /// [`SharedState::dispatching`], which callers claim through
+    /// [`DispatchClaim::try_claim`] before publishing. It is never idle and
+    /// needs the results the instant they land, so it spins (with a yield
+    /// backstop for stragglers under oversubscription) rather than parking.
     fn wait(&self) {
         let mut spins = 0u32;
         loop {
@@ -2734,6 +2737,11 @@ mod tests {
 /// closure (silently wrong tensors, no crash), and -- more often -- the
 /// pending counters never draining, hanging `wait` forever. The pool spins in
 /// `wait`, so the hang burns every core until the process is killed.
+///
+/// Only the last two tests here are falsifiers for the gate itself: the first
+/// three hold no contention, so they pass with or without it. They cover the
+/// RAII guard's own contract (exclusivity, release-on-unwind) and the ordinary
+/// single-dispatcher partition, which is worth pinning separately.
 #[cfg(test)]
 mod dispatch_claim_tests {
     use super::*;
