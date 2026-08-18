@@ -1331,10 +1331,72 @@ pub(crate) enum OperandMemInfo {
 struct PlacementSources<'a> {
     /// Kernel-context input indices bound to ORT for *this* node. Outputs are
     /// deliberately absent; see [`operand_mem_info`].
-    ort_inputs: &'a [usize],
+    ort_inputs: OrtOperands<'a>,
     /// Memory info to fall back to when the node binds no ORT inputs at all
     /// (every operand is a fused-subgraph intermediate).
-    subgraph_fallback: Option<*const ort::OrtMemoryInfo>,
+    subgraph_fallback: SubgraphFallback<'a>,
+}
+
+/// Where [`operand_mem_info`] gets its fallback memory info when a node binds
+/// no ORT inputs at all.
+///
+/// Resolving it means walking every kernel-context input and asking ORT for its
+/// `OrtMemoryInfo` (see [`device_mem_info`]) — six FFI calls for a one-input
+/// node. The routed path resolves it once per `Run` and reuses it across the
+/// nodes, so it passes [`Resolved`](Self::Resolved). The single-node path has
+/// exactly one consumer, which reads it only for a node with no ORT-bound
+/// operands at all, so it passes [`Deferred`](Self::Deferred) and an
+/// elementwise dispatch never makes the calls.
+#[derive(Clone, Copy)]
+enum SubgraphFallback<'a> {
+    /// Already resolved by the caller.
+    Resolved(Option<*const ort::OrtMemoryInfo>),
+    /// Resolve from the kernel context on demand, with this staging context.
+    Deferred(Option<&'a DeviceStaging>),
+}
+
+/// The ORT-bound operands of a node, in either of the two shapes a caller
+/// already has them in.
+///
+/// Placement is resolved for a vanishing fraction of dispatches -- only past
+/// [`prepare_workspace`]'s zero-byte and lifetime gates -- so a caller holding
+/// a slot map should not have to flatten it into a fresh `Vec` on every `Run`
+/// just to describe operands that will not be looked at. Both spellings
+/// iterate the same present ORT indices in the same order.
+#[derive(Clone, Copy)]
+enum OrtOperands<'a> {
+    /// Already-resolved kernel-context input indices.
+    Resolved(&'a [usize]),
+    /// A node's input slots, `None` for an absent optional input. Absent slots
+    /// bind no ORT input and are skipped.
+    Slots(&'a [Option<usize>]),
+}
+
+impl<'a> OrtOperands<'a> {
+    /// The present ORT input indices, in slot order.
+    fn indices(self) -> OrtOperandIter<'a> {
+        match self {
+            Self::Resolved(v) => OrtOperandIter::Resolved(v.iter()),
+            Self::Slots(v) => OrtOperandIter::Slots(v.iter()),
+        }
+    }
+}
+
+/// Iterator over [`OrtOperands`]; see [`OrtOperands::indices`].
+enum OrtOperandIter<'a> {
+    Resolved(std::slice::Iter<'a, usize>),
+    Slots(std::slice::Iter<'a, Option<usize>>),
+}
+
+impl Iterator for OrtOperandIter<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            Self::Resolved(it) => it.next().copied(),
+            Self::Slots(it) => it.by_ref().find_map(|slot| *slot),
+        }
+    }
 }
 
 /// Number of times a node's workspace placement has been **resolved**.
@@ -1454,8 +1516,13 @@ unsafe fn operand_mem_info(
     sources: PlacementSources<'_>,
 ) -> OperandMemInfo {
     WORKSPACE_PLACEMENT_QUERIES.fetch_add(1, Ordering::Relaxed);
-    let Some((&first_idx, rest)) = sources.ort_inputs.split_first() else {
-        return match sources.subgraph_fallback {
+    let mut rest = sources.ort_inputs.indices();
+    let Some(first_idx) = rest.next() else {
+        let fallback = match sources.subgraph_fallback {
+            SubgraphFallback::Resolved(ptr) => ptr,
+            SubgraphFallback::Deferred(staging) => unsafe { device_mem_info(api, ctx, staging) },
+        };
+        return match fallback {
             Some(ptr) => OperandMemInfo::FromIntermediates(ptr),
             None => OperandMemInfo::Unavailable,
         };
@@ -1463,13 +1530,14 @@ unsafe fn operand_mem_info(
     let Some(first) = (unsafe { ort_input_mem_info(api, ctx, first_idx) }) else {
         return OperandMemInfo::Unavailable;
     };
-    if rest.is_empty() {
+    let mut rest = rest.peekable();
+    if rest.peek().is_none() {
         return OperandMemInfo::Uniform(first);
     }
     let Some(compare) = api.CompareMemoryInfo else {
         return OperandMemInfo::Unavailable;
     };
-    for &idx in rest {
+    for idx in rest {
         let Some(other) = (unsafe { ort_input_mem_info(api, ctx, idx) }) else {
             return OperandMemInfo::Unavailable;
         };
@@ -1534,10 +1602,26 @@ fn staging_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ONNX_GENAI_PLUGIN_TRANSFER_TRACE").as_deref() == Ok("1"))
 }
 
+/// Emit one staging-trace line, formatting the arguments only when the trace is
+/// on.
+///
+/// The gate has to come first: the bare `staging_log(&format!(..))` spelling
+/// builds and drops a `String` on every call whether or not anyone is
+/// listening, and one of these sites is on the per-`Run` dispatch path.
+macro_rules! staging_log {
+    ($($arg:tt)*) => {
+        if staging_trace_enabled() {
+            staging_log(&format!($($arg)*));
+        }
+    };
+}
+
 /// Emit one staging-trace line. Goes to stderr (buffered by pipes, so it can be
 /// lost when the process hangs) *and*, when `ONNX_GENAI_PLUGIN_TRANSFER_TRACE_FILE`
 /// is set, is appended to that file with an immediate flush — the file path is
 /// the only trace that survives a boundary hang. No-op unless the trace is on.
+///
+/// Prefer the [`staging_log!`] macro: it checks the gate before formatting.
 fn staging_log(msg: &str) {
     if !staging_trace_enabled() {
         return;
@@ -1681,54 +1765,50 @@ unsafe fn stage_host_boundary_inputs(
 ) -> Result<(), String> {
     // First pass: which operands are host-resident data operands needing upload?
     let mut to_stage: Vec<usize> = Vec::new();
-    staging_log(&format!(
+    staging_log!(
         "[plugin/staging #982] {label}: enter operands={} host_operands={:?}",
         ort_indices.len(),
         host_operands
-    ));
+    );
     for (p, slot) in ort_indices.iter().enumerate() {
         let Some(ort_idx) = *slot else {
-            staging_log(&format!(
-                "[plugin/staging #982] {label}: op[{p}] skip (not ORT-bound)"
-            ));
+            staging_log!("[plugin/staging #982] {label}: op[{p}] skip (not ORT-bound)");
             continue;
         };
         if host_operands.contains(&p) {
-            staging_log(&format!(
+            staging_log!(
                 "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (host control operand)"
-            ));
+            );
             continue;
         }
         let view = &kernel_inputs[p];
         if view.is_absent() || view.data.0.is_null() {
-            staging_log(&format!(
+            staging_log!(
                 "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (absent/null)"
-            ));
+            );
             continue;
         }
         let numel: usize = view.shape.iter().product();
         if numel == 0 || view.dtype.byte_size() == 0 {
-            staging_log(&format!(
-                "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (empty)"
-            ));
+            staging_log!("[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (empty)");
             continue;
         }
         let Some(mem_info) = (unsafe { ort_input_mem_info(api, ctx, ort_idx) }) else {
-            staging_log(&format!(
+            staging_log!(
                 "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (no mem info)"
-            ));
+            );
             continue;
         };
         let dev_type = unsafe { mem_info_device_type(api, mem_info) };
         if unsafe { mem_info_is_device(api, mem_info) } {
-            staging_log(&format!(
+            staging_log!(
                 "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (already device, dev_type={dev_type:?})"
-            ));
+            );
             continue; // already on device — nothing to do
         }
-        staging_log(&format!(
+        staging_log!(
             "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} HOST (dev_type={dev_type:?}) → will stage"
-        ));
+        );
         to_stage.push(p);
     }
 
@@ -1759,10 +1839,10 @@ unsafe fn stage_host_boundary_inputs(
         && let Some(recon) = staging.recon_mem_info.as_ref()
     {
         device_mi = recon.ptr;
-        staging_log(&format!(
+        staging_log!(
             "[plugin/staging #982] {label}: no device OrtValue found; \
              falling back to reconstructed EP memory info recon={device_mi:?}"
-        ));
+        );
     }
     if device_mi.is_null() {
         return Err(format!(
@@ -1781,19 +1861,17 @@ unsafe fn stage_host_boundary_inputs(
         let byte_len = numel * view.dtype.byte_size();
         let dst = unsafe { alloc_scratch(api, ctx, device_mi, byte_len) }
             .map_err(|e| format!("{label}: staging scratch alloc failed: {e}"))?;
-        staging_log(&format!(
+        staging_log!(
             "[plugin/staging #982] {label}: staging op[{p}] byte_len={byte_len} \
              mem_dev={mem_dev:?} dst={dst:?} — issuing host→device upload"
-        ));
+        );
         // SAFETY: the source is a host tensor of `byte_len` contiguous bytes
         // (ORT-provided, contiguous strides); `dst` is device scratch of the
         // same size.
         let src = unsafe { std::slice::from_raw_parts(view.data.0.cast::<u8>(), byte_len) };
         unsafe { staging.copier.copy_host_to_device(src, dst) }
             .map_err(|e| format!("{label}: host→device upload failed: {e}"))?;
-        staging_log(&format!(
-            "[plugin/staging #982] {label}: op[{p}] host→device upload complete"
-        ));
+        staging_log!("[plugin/staging #982] {label}: op[{p}] host→device upload complete");
         kernel_inputs[p].data = DevicePtr(dst.cast_const());
     }
 
@@ -2169,12 +2247,12 @@ unsafe extern "C" fn compute_execute(
             return fail_status("Compute: no kernels compiled for this subgraph");
         }
 
-        staging_log(&format!(
+        staging_log!(
             "[plugin/staging #982] compute_execute enter: entries={} routing={} device_staging={}",
             exported.entries.len(),
             exported.routing.is_some(),
             exported.device_staging.is_some()
-        ));
+        );
 
         let api = crate::status::host_api();
         if api.is_null() {
@@ -2194,34 +2272,6 @@ unsafe extern "C" fn compute_execute(
             crate::host_pool::install(api_ref, kernel_context, &exported.host_pool_probe)
         };
 
-        // Memory info for intermediate scratch. On a device EP this is device
-        // memory, so multi-node intermediates stay on the GPU (a host buffer
-        // would make the next kernel dereference a host pointer as device →
-        // CUDA_ERROR_ILLEGAL_ADDRESS). `None` falls back to host buffers.
-        let scratch_mem_info =
-            unsafe { device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref()) };
-
-        // Where a routed subgraph's *intermediates* are allocated.
-        //
-        // Device memory is not optional: a device kernel handed a host pointer
-        // dereferences it as device memory. Host memory is different — the
-        // intermediate only has to be readable by the next kernel on this
-        // thread, and `KernelContext_GetScratchBuffer` is a much worse way to
-        // get it than the Rust allocator. ORT's host scratch goes through an
-        // aligned allocation that glibc always services with a fresh `mmap`
-        // for buffers of this size, so every intermediate is a new mapping,
-        // first-touch page-faulted while the kernel writes it and unmapped at
-        // the end of the `Run`. Measured on an 8-node f32 `Relu` chain of
-        // 262144 elements (1 MiB per intermediate), one thread: 3246 us
-        // through ORT scratch vs 383 us through host buffers, an 8.5x
-        // difference on identical kernels, against ORT's own 220 us for the
-        // same graph. So: device memory when the resolved memory info is a
-        // device, host buffers otherwise.
-        let intermediate_scratch = match scratch_mem_info {
-            Some(mem_info) if unsafe { mem_info_is_device(api_ref, mem_info) } => Some(mem_info),
-            _ => None,
-        };
-
         let inputs = match unsafe { read_inputs(api_ref, kernel_context) } {
             Ok(v) => v,
             Err(e) => return fail_status(&format!("Compute: {e}")),
@@ -2229,6 +2279,42 @@ unsafe extern "C" fn compute_execute(
 
         if let Some(routing) = &exported.routing {
             // ── Routed multi-node path ────────────────────────────────────
+            // Resolved here rather than before the branch: on the
+            // single-node path nothing below reads it, and resolving it costs
+            // an ORT memory-info query per kernel-context input on every
+            // `Run`. The single-node path's one potential consumer takes it as
+            // `SubgraphFallback::Deferred` instead.
+            // Memory info for intermediate scratch. On a device EP this is device
+            // memory, so multi-node intermediates stay on the GPU (a host buffer
+            // would make the next kernel dereference a host pointer as device →
+            // CUDA_ERROR_ILLEGAL_ADDRESS). `None` falls back to host buffers.
+            let scratch_mem_info = unsafe {
+                device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref())
+            };
+
+            // Where a routed subgraph's *intermediates* are allocated.
+            //
+            // Device memory is not optional: a device kernel handed a host pointer
+            // dereferences it as device memory. Host memory is different — the
+            // intermediate only has to be readable by the next kernel on this
+            // thread, and `KernelContext_GetScratchBuffer` is a much worse way to
+            // get it than the Rust allocator. ORT's host scratch goes through an
+            // aligned allocation that glibc always services with a fresh `mmap`
+            // for buffers of this size, so every intermediate is a new mapping,
+            // first-touch page-faulted while the kernel writes it and unmapped at
+            // the end of the `Run`. Measured on an 8-node f32 `Relu` chain of
+            // 262144 elements (1 MiB per intermediate), one thread: 3246 us
+            // through ORT scratch vs 383 us through host buffers, an 8.5x
+            // difference on identical kernels, against ORT's own 220 us for the
+            // same graph. So: device memory when the resolved memory info is a
+            // device, host buffers otherwise.
+            let intermediate_scratch = match scratch_mem_info {
+                Some(mem_info) if unsafe { mem_info_is_device(api_ref, mem_info) } => {
+                    Some(mem_info)
+                }
+                _ => None,
+            };
+
             if routing.input_sources.len() != exported.entries.len()
                 || routing.output_sinks.len() != exported.entries.len()
             {
@@ -2357,7 +2443,14 @@ unsafe extern "C" fn compute_execute(
                     match sink {
                         NodeOutputSink::Ort(ort_idx) => {
                             match unsafe {
-                                allocate_output(api_ref, kernel_context, *ort_idx, shape, out_dtype)
+                                allocate_output(
+                                    api_ref,
+                                    kernel_context,
+                                    *ort_idx,
+                                    shape,
+                                    out_dtype,
+                                    exported.device_staging.is_some(),
+                                )
                             } {
                                 Ok(out) => ort_outputs.push(out),
                                 Err(e) => {
@@ -2514,8 +2607,8 @@ unsafe extern "C" fn compute_execute(
                         api_ref,
                         kernel_context,
                         PlacementSources {
-                            ort_inputs: &node_ort_operands,
-                            subgraph_fallback: scratch_mem_info,
+                            ort_inputs: OrtOperands::Resolved(&node_ort_operands),
+                            subgraph_fallback: SubgraphFallback::Resolved(scratch_mem_info),
                         },
                         &*entry.kernel,
                         plans,
@@ -2647,7 +2740,14 @@ unsafe extern "C" fn compute_execute(
                     }
                 };
                 match unsafe {
-                    allocate_output(api_ref, kernel_context, ort_out_idx, shape, out_dtype)
+                    allocate_output(
+                        api_ref,
+                        kernel_context,
+                        ort_out_idx,
+                        shape,
+                        out_dtype,
+                        exported.device_staging.is_some(),
+                    )
                 } {
                     Ok(out) => {
                         owned_outputs.push(out);
@@ -2680,15 +2780,31 @@ unsafe extern "C" fn compute_execute(
             }
             // Build output views in node-output order so the kernel sees the
             // full arity including absent scratch slots.
-            let absent_shapes: Vec<Vec<usize>> = output_shapes.clone();
-            let absent_strides_storage: Vec<Vec<i64>> = absent_shapes
-                .iter()
-                .map(|s| contiguous_strides(s))
-                .collect();
-            // First, get mutable views of all ORT outputs in order.
-            let mut ort_views: Vec<TensorMut<'_>> =
-                owned_outputs.iter_mut().map(|o| o.view_mut()).collect();
-            let mut ort_view_iter = ort_views.drain(..);
+            //
+            // The shape/stride storage below exists only to back the absent
+            // slots' `TensorMut`s, so it is built only when there are any. A
+            // node with no absent outputs -- every elementwise op, which is
+            // most of what reaches this path -- used to pay a clone of every
+            // output shape plus a fresh stride vector per output on every
+            // single `Run`, to lend them to nobody.
+            let has_absent = !absent_bufs.is_empty();
+            let absent_shapes: Vec<Vec<usize>> = if has_absent {
+                output_shapes.clone()
+            } else {
+                Vec::new()
+            };
+            let absent_strides_storage: Vec<Vec<i64>> = if has_absent {
+                absent_shapes
+                    .iter()
+                    .map(|s| contiguous_strides(s))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // Views of the ORT outputs, in order, taken lazily: collecting them
+            // into a `Vec` first and immediately draining it allocated a second
+            // vector of views per call for nothing.
+            let mut ort_view_iter = owned_outputs.iter_mut().map(|o| o.view_mut());
             let mut output_views: Vec<TensorMut<'_>> = Vec::with_capacity(slot_map.len());
             for (slot_idx, kind) in slot_map.iter().enumerate() {
                 match kind {
@@ -2724,15 +2840,15 @@ unsafe extern "C" fn compute_execute(
             // The single-node subgraph's operands are this node's operands, but
             // only the present ones are ORT-bound. Placement is resolved lazily
             // inside `prepare_workspace`, past the zero-byte and lifetime gates.
-            let node_ort_operands: Vec<usize> =
-                entry.input_slots.iter().flatten().copied().collect();
             let workspace = match unsafe {
                 prepare_workspace(
                     api_ref,
                     kernel_context,
                     PlacementSources {
-                        ort_inputs: &node_ort_operands,
-                        subgraph_fallback: scratch_mem_info,
+                        ort_inputs: OrtOperands::Slots(&entry.input_slots),
+                        subgraph_fallback: SubgraphFallback::Deferred(
+                            exported.device_staging.as_ref(),
+                        ),
                     },
                     &*entry.kernel,
                     plans,
