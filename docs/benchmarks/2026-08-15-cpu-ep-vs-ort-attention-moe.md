@@ -2972,3 +2972,67 @@ the idle bound failed with 1.31 s of CPU over a 750 ms window.
 path reads an environment variable for test purposes, and the tests do not race
 on a global by construction: `isolated_pool` builds a private pool rather than
 reconfiguring the shared one.
+
+### 31.7 RoPE and Softmax, moved onto it
+
+Real ORT A/B, one driver invocation per pair, 7 trials × 7 runs. Ratio is
+native ÷ ORT, lower is better, `base>new`:
+
+| cell | t=1 | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|---|
+| rope_llama3_s128 | 0.78>0.77 | 1.74>1.34 | 2.36>1.35 | 4.61>1.61 | 7.18>1.39 | 39.40>1.15 |
+| rope_llama3_s512 | 0.94>0.92 | 1.52>1.32 | 1.68>1.39 | 3.49>1.92 | 4.47>1.90 | 26.72>2.34 |
+| rope_gptj_il_s128 | 0.87>0.87 | 1.72>1.28 | 2.14>1.53 | 3.78>1.54 | 6.68>1.50 | 51.31>3.40 |
+| rope_gptj_il_s512 | 0.98>0.98 | 1.63>1.36 | 1.83>1.35 | 3.38>2.00 | 4.83>1.76 | 24.37>2.68 |
+| sm_bert_b8_s128 | 1.26>1.29 | 2.04>1.63 | 2.12>1.67 | 3.62>1.93 | 5.56>2.58 | 3.72>2.44 |
+| sm_prefill_h32_s512 | 1.33>1.34 | 2.21>2.14 | 2.33>1.45 | 2.54>2.06 | 2.54>2.23 | 5.58>1.53 |
+| sm_whisper_cross | 1.36>1.38 | 2.25>2.28 | 2.50>2.58 | 3.00>2.57 | 2.54>2.79 | 1.75>1.85 |
+
+Our own native milliseconds for the same runs, which is the honest view of what
+*we* changed — the ratio also moves when ORT moves, and ORT's spread on this
+shared host reaches 50% on the small cells:
+
+| cell | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|
+| rope_llama3_s128 | 0.126>0.091 | 0.103>0.067 | 0.151>0.051 | 0.233>0.043 | 2.239>0.148 |
+| rope_llama3_s512 | 0.415>0.351 | 0.242>0.193 | 0.359>0.169 | 0.382>0.128 | 2.918>0.221 |
+| rope_gptj_il_s128 | 0.137>0.103 | 0.104>0.077 | 0.132>0.052 | 0.248>0.046 | 3.711>0.170 |
+| rope_gptj_il_s512 | 0.429>0.402 | 0.253>0.211 | 0.354>0.212 | 0.452>0.140 | 3.505>0.251 |
+| sm_bert_b8_s128 | 0.908>0.883 | 0.491>0.461 | 0.476>0.334 | 0.617>0.262 | 3.536>0.328 |
+
+Up to **15× at 32 threads** and **5.4× at 16**. The largest wins are in the
+widest columns, which is where §26 said the park cost was worst — the prediction
+and the measurement agree, which is the main reason to believe the mechanism.
+
+The decode-shaped cells are deliberately unmoved: `rope_*_s1` and
+`sm_decode_h32_kv*` are below the parallel threshold and run serially in both
+arms, flat to within noise at every width. A one-token RoPE should not be
+fanning out and still does not.
+
+### 31.7.1 The scar: an unrelated edit de-vectorised the activations
+
+Rewiring RoPE and Softmax made **`Tanh` and `Sigmoid` 2× slower at one thread**,
+in a file the change did not touch, on inputs that never reach a parallel path.
+
+`avx2::map_ps` takes the per-vector kernel as `impl Fn(__m256) -> __m256` and
+calls it once per eight lanes. Its body is a couple of hundred bytes of
+polynomial, which sits right at the inliner's threshold, so whether it inlined
+came out of a cost model with the whole crate in view — and an edit anywhere
+could flip it. `nm -S` is what caught it: `tanh_avx2` went from one 511-byte
+function to a 5-byte shim calling an outlined `map_ps` calling an outlined
+216-byte closure. Tanh `[32,4096]` 0.053 → 0.100 ms, Sigmoid 0.054 → 0.104 ms.
+
+Two things about this are worth keeping:
+
+1. **`codegen-units = 1` does not prevent it.** It is already pinned for this
+   package (#1174) for exactly this class of bug. One codegen unit still leaves
+   the inline decision to a cost model. The fix has to be `#[inline(always)]`.
+2. **The A/B grid nearly published it as a scheduler result.** The first
+   activation grid showed 74 regressed cells, including at t=1 where no
+   scheduling happens. The t=1 column is what made it obviously not a scheduler
+   effect. Any grid that only reports the widths it is trying to improve would
+   have attributed this to the runtime.
+
+`#[inline(always)]` and `#[target_feature]` cannot coexist in Rust, which is why
+neither helper carries the latter; every caller is already inside an `avx2,fma`
+function, so the features arrive with the inline.
