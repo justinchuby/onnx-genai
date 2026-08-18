@@ -14854,10 +14854,22 @@ extern "C" __global__ void ref_silu_mul_f16(
             gemv_kernel
                 .run_f16_gate_up_swiglu(&inputs, &mut outputs)
                 .unwrap();
+            // Capture-safety tracks the decode-GEMV *routing*, not a fixed
+            // M==1 rule. `05e1fd10` could only capture M==1 because every M>1
+            // gate/up-SwiGLU reached the scratch-allocating prefill path
+            // (`alloc_raw`), which cannot be recorded into a CUDA graph. The
+            // small-M loop now dispatches `1 < m <= decode_gemv_loop_max_m()`
+            // as per-row capture-safe M==1 GEMV launches (each byte-identical
+            // to M==1), so those M are *genuinely* capture-safe; only
+            // `m > decode_gemv_loop_max_m()` still falls to the uncapturable
+            // prefill GEMM. The invariant is narrowed to exactly that range,
+            // not deleted.
             assert_eq!(
                 gemv_kernel.last_call_capture_safe.load(Ordering::Relaxed),
-                m == 1,
-                "only M=1 decode may be advertised capture-safe"
+                (1..=decode_gemv_loop_max_m()).contains(&m),
+                "capture-safe iff the decode-GEMV routing is per-row M==1 \
+                 launches: M==1 or small-batch M<=decode_gemv_loop_max_m(); \
+                 M>window still reaches the uncapturable prefill GEMM"
             );
             runtime.synchronize().unwrap();
 
@@ -15255,10 +15267,23 @@ extern "C" __global__ void ref_silu_mul_f16(
                         .unwrap();
                 }
             }
+            // Capture-safety tracks the decode-GEMV *routing*, not a fixed
+            // M==1 rule (see the companion note on the non-rmsnorm assertion
+            // above). `05e1fd10` could only capture M==1 because every M>1
+            // fused gate/up-SwiGLU with an RMS-norm prologue reached
+            // `launch_gate_up_swiglu_rmsnorm_prefill`, which normalizes into
+            // freshly `alloc_raw`'d scratch and so cannot be graph-recorded.
+            // The small-M loop now dispatches `1 < m <= decode_gemv_loop_max_m()`
+            // as per-row capture-safe M==1 fused kernels (each byte-identical
+            // to M==1), making those M genuinely capture-safe; only
+            // `m > decode_gemv_loop_max_m()` still reaches the scratch prefill
+            // path. Narrowed to exactly that range, not deleted.
             assert_eq!(
                 fused_swiglu.last_call_capture_safe.load(Ordering::Relaxed),
-                m == 1,
-                "only M=1 decode may be advertised capture-safe"
+                (1..=decode_gemv_loop_max_m()).contains(&m),
+                "capture-safe iff the decode-GEMV routing is per-row M==1 \
+                 launches: M==1 or small-batch M<=decode_gemv_loop_max_m(); \
+                 M>window still reaches the uncapturable prefill GEMM"
             );
             runtime.synchronize().unwrap();
 
