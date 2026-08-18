@@ -553,3 +553,78 @@ identical bytes in the same accumulate order → bit-identical fp32 partials.
 **Verdict: GO.** Byte-identical + real positive delta. Selective `ReadOnly` scoping
 is a standing lesson: profile the helper's callers separately before applying
 cache hints uniformly. **Merged PR #1323.**
+
+---
+
+### 2026-08-18: Port ORT int4 decode-GEMV ideas into QMoE expert GEMVs — NO-GO (occupancy spill; kernels already at M=1 decode roofline)
+
+**By:** Deckard
+
+**What:** Studied ORT's int4 decode-GEMV machinery (`moe_gemv_device.cuh`,
+`fpA_intB_gemv`, `matmul_nbits`) and evaluated porting each idea into the hand-rolled
+NVRTC QMoE expert-GEMV kernels (`qmoe_gate_up_activate_f32`, `qmoe_linear_f32`)
+on DeepSeek-V2-Lite int4 (H200, PINNED). Four ideas examined: (1) issue all weight
+loads before consuming any ("batching"); (2) interleaved weight layout for coalesced
+loads; (3) raise occupancy via `__launch_bounds__` on `qmoe_linear`; (4) vectorized
+128-bit loads + K-paired hfma2.
+
+**Evidence:**
+- Idea 1 (load batching) was ported byte-identically (128-tok md5 match) but
+  **REGRESSED** gate_up 34.18 µs → 40.96 µs (+19.8%). ncu root cause: 40 reg/thread
+  at 6 blk/SM (register-limited by `__launch_bounds__(256,6)` from #1323); holding a
+  second live weight struct spills past the 40-reg cap → occupancy loss > added MLP.
+- Idea 2 (layout interleave): already inapplicable — our loads are fully coalesced
+  (thread t reads packed[row×packed_in + t×4], 128B transactions/warp).
+- Idea 3 (launch_bounds on linear): ncu shows `qmoe_linear_f32` at **8 blk/SM = the
+  64-warp hardware ceiling**, 85.4% achieved occupancy. Zero headroom.
+- Idea 4 (vec2/hfma2): not byte-identical (K-pairing reorders accumulation); would
+  increase register pressure — same failure mode as idea 1; not pursued.
+
+**Roofline read:** both QMoE expert GEMVs are memory-LATENCY bound (DRAM ~10–11%),
+already at max occupancy. ORT's residual edge is a different kernel structure
+(register-tiled CUTLASS GEMV) suited to its dispatch model, not ours.
+
+**Verdict:** NO-GO. No PR opened. Both QMoE GEMV micro-opt levers (per-load ORT ideas
+and prior `__ldg`/occupancy work in #1323) are now exhausted. Both kernels are at the
+M=1 decode roofline: occupancy-max, latency-bound, irreducible weight traffic.
+Further QMoE gains require reducing WEIGHT BYTES (lower-bit format — numeric risk,
+model/format change), not kernel restructuring. **Next lever: `attention_row` (12.4%,
+24.7 µs), the largest untouched non-dense decode kernel.**
+
+---
+
+### 2026-08-18: Fuse QMoE expert pipeline (gate_up→fc2) to eliminate intermediate DRAM round-trip — NO-GO (premise refuted; fusion destroys occupancy)
+
+**By:** Deckard
+
+**What:** Investigated fusing `qmoe_gate_up_activate` → `qmoe_linear` (the M=1 decode
+expert pipeline) to eliminate the intermediate-activation DRAM round-trip and amortize
+routing/scale metadata reads. This was the "next lever" recommended in the ORT-ideas
+NO-GO above. Profiled and quantified traffic before touching code.
+
+**Evidence (ncu, per launch, H200 GPU3 pinned):**
+| Kernel | DRAM read (int4 weights) | DRAM write (intermediate) | dur |
+|---|---|---|---|
+| qmoe_gate_up_activate_f32_occ | 18.54 MB | 20.99 KB | 35.65 µs |
+| qmoe_linear_f32 | 9.31 MB | 256 B | 30.69 µs |
+
+- Combined traffic = **27.85 MB**, dominated by irreducible int4 expert-weight reads.
+  Fusion does NOT reduce weight traffic — every expert's fc1/fc3/fc2 weights must
+  still be read once.
+- The intermediate round-trip fusion targets = 20.99 KB write = **0.075% of DRAM
+  traffic**. The fc2-side read is served from L2 (not DRAM). Metadata (6 ints = 24 B)
+  saves < 0.01% — unmeasurable.
+- True fusion collapses the grid to ~6 blocks/route (vs 8448 + 12288 separate blocks),
+  destroying the occupancy that hides weight-load latency — the exact mechanism tuned
+  by #1323. SM occupancy ~4.5% vs current occupancy-max.
+
+**Roofline:** 18.54 MB in 35.65 µs = 520 GB/s ≈ 11% of H200 HBM3 → latency-bound,
+consistent with prior ncu. Fusion is doubly counterproductive: saves ≤0.075% traffic,
+wrecks latency hiding.
+
+**Verdict:** NO-GO. No PR opened. This closes the second and final QMoE decode lever
+(traffic reduction / fusion). Combined with the ORT-ideas NO-GO above, **both QMoE
+decode optimization levers are now exhausted with quantitative evidence.** The kernels
+are at the M=1 decode roofline (occupancy-max, latency-bound, traffic irreducible to
+int4 expert weights). Further QMoE gains require a lower-bit weight format — a
+model/format change, not kernel work. **Next lever: `attention_row` (12.4%, 24.7 µs).**
