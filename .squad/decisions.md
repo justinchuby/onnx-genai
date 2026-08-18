@@ -210,3 +210,41 @@ The decision does **not** change: speculative decode remains shelved. B\* improv
 Luv completed the real prefill/TTFT A/B for `ONNX_GENAI_MARLIN_M_GT_1=1` versus the portable tiled GEMM path, closing the thread opened by the two prior Gate-3 Marlin entries: “Gate-3 speculative verify remains shelved after Marlin” and “Gate-3 Marlin M>1 opt-in follow-up still NO-GO.” The verdict is **NO-GO to flip the default**: Marlin M>1 stays opt-in.
 
 E2E `profile_native` TTFT showed only marginal-to-neutral qwen2.5-14b-zp movement (**0.976× / 0.988× / 0.999×** Marlin/portable at M=128/512/2048) and neutral-to-worse qwen2.5-7b movement (**1.005× / 1.013× / 1.001×**). Argmax matched every arm, but full-vocab token-0 logprob dumps were not byte-identical (max Δ **0.017** qwen14, **0.168** qwen7), so the silent-default byte-identity bar fails. Treat the Marlin-M>1 vein as mined out: not a spec-decode win, not a prefill/TTFT win, and not eligible for a silent default.
+
+## 2026-08-18 — Marlin M>1 now default ON; byte-identity bar relaxed to argmax stability
+
+Supersedes “Marlin M>1 default flip mined out” (2026-08-18). `ONNX_GENAI_MARLIN_M_GT_1`
+now defaults **ON**, and `ONNX_GENAI_MARLIN_SPLITK` moves to opt-in (default OFF).
+
+The earlier NO-GO rested on two findings. The first — that the win is marginal —
+was measured only on qwen2.5-14b/7b (0.976–1.013x). It does not generalize: on an
+A100-SXM4-80GB (SM80) serving Muse-Glimmer-30B int4, measured end-to-end through
+the server with both arms on one binary, a 3247-token prompt goes **37.5s → 16.1s
+(2.33x)**, prefill 87 → 202 tok/s; 1647 tok 23.7s → 10.4s; 647 tok 9.4s → 4.7s.
+Neutral on some models and 2.33x on others argues for a default plus an opt-out,
+not for hiding the win behind a variable nobody sets.
+
+The second finding — full-vocab token-0 logprobs are not byte-identical (max Δ
+0.017 qwen14, 0.168 qwen7 at M=128/512/2048) — **stands, and is not attributable
+to split-K**. `choose_split_k` returns 1 for `m > SPLITK_MAX_M` (32), so prefill
+never elected a split; that divergence is the direct tensor-core kernel's
+accumulation order versus the tiled GEMM. An earlier draft of this change claimed
+otherwise and was wrong.
+
+So this entry records a deliberate **relaxation of the bar**, not a claim that the
+bar is met: the shipping default is now *argmax-stable* rather than
+*bit-identical*. Greedy token streams match (validated by `marlin_m_gt_1_e2e.rs`
+parity plus an 826-token spot check across the flip: identical answer, one
+sentence reworded at a near-tie). Consumers of the *distribution* rather than the
+selected token — a logprobs API, beam search, spec-decode acceptance ratios —
+should set `ONNX_GENAI_MARLIN_M_GT_1=0`.
+
+Split-K goes opt-in because flipping the parent ON would otherwise newly ship a
+second, independent divergence source (its fixed-order fp32 partial reduction) to
+every default deployment. It is inert for prefill by construction; the shapes it
+governs are M<=32 speculative verify, which is separately shelved. Recover it
+with `ONNX_GENAI_MARLIN_SPLITK=1`.
+
+Not addressed: Marlin is no longer the prefill bottleneck. With it on,
+`MatMulNBits` is ~20% of a prefill forward (GEMMs at ~74 TFLOPS); attention and
+elementwise ops are the other ~80%.

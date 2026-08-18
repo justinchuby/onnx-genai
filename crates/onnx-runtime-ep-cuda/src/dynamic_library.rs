@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use libloading::Library;
-use onnx_genai_cuda_version_guard::{cudart_candidates_for, HostOs};
+use onnx_genai_cuda_version_guard::{HostOs, cudart_candidates_for};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CudaLibrary {
