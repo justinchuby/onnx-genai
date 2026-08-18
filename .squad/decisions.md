@@ -56,3 +56,77 @@ A separate long-context Engine `Attention` workspace under-plan then surfaced ar
 ## 2026-08-18 — DeepSeek-V2-Lite Native-vs-ORT row closed
 
 Wallace measured the real 27-layer DeepSeek-V2-Lite int4 QMoE export under pinned ORT CUDA 1.27 and identical base-decode conditions. Native CUDA serves the model on GPU at **57.15 tok/s eager** and **101.68 tok/s captured**. Stock ORT CUDA EP cannot run the 26 `com.microsoft::QMoE` nodes on GPU; with CPU fallback it inserts 104 host/device Memcpy nodes and reaches **0.17 tok/s**, while strict no-fallback refuses the graph. ORT + CUDA graph is categorically N/A because the graph is split across CPU and GPU. Frame the row as a hard capability gap: native is the only measured GPU engine for int4 QMoE here.
+
+## 2026-08-18 — GLM-4-9B int4 graph-capture scope
+
+# Wallace — GLM-4-9B int4: does the graph-capture moat already extend? → 🟢 YES (captures clean today)
+
+- Author: Wallace (inference-engine specialist)
+- Date: 2026-08-18T04:03Z
+- Worktree: fresh detached off `origin/main` @ `b416a3e0` (incl. #1171 classifier, #1181 `_d1`, #1189 Engine long-context fix).
+- Model: real GLM-4-9B int4 (dense GQA, partial-RoPE) —
+  `/home/justinchu/glm-e2e-artifacts/cohaagen-glm-4-9b-int4-cuda-post434` (`model.onnx` + 6.7 GB `.onnx.data`).
+- GPU: H200, `CUDA_VISIBLE_DEVICES=6` (nvidia-smi first — all 8 idle 0 MiB/0%; quiet box).
+- Base decode, single-stream greedy, `ONNX_GENAI_ONGPU_ARGMAX=1` both arms. NOT spec-decode.
+
+## VERDICT: 🟢 GO — GLM-4-9B ALREADY captures cleanly, no code change needed
+The graph-capture stack we landed for V2-Lite (classifier #1171 + `_d1` #1181 + long-context #1189)
+**already covers GLM-4-9B today.** Capture engages with **no classifier/planner bail**, is
+**byte-identical** to eager, and delivers **1.64×**.
+
+## Capture engagement (question 1)
+`ONNX_GENAI_CUDA_GRAPH=1` → capture ENGAGES, no decline/fallback:
+```
+cuda_graph: enabled=true captures=3 replays=185 fallbacks=0 invalidations=3
+cuda_graph_measured:            captures=2 replays=124 fallbacks=0 invalidations=2
+```
+- `captures>0`, `replays>0`, `fallbacks=0` → the classifier's capacity-form gate accepts GLM's
+  attention-mask topology (present-KV inputs present; mask does not escape as a graph output), and the
+  workspace planner does NOT under-plan (no prepare-only refusal). No bail to root-cause.
+- (The `invalidations=3` are the expected steady-state recaptures as the KV/seq extent grows during
+  warmup; they settle — `fallbacks=0` throughout, and the measured window shows stable replays.)
+
+## A/B: byte-identity + tok/s (question 2)
+**Byte-identity: 0.000% divergence** — capture-ON vs eager token streams compared position-by-position
+over **256 generated tokens**, identical (0/256). (Repo also carries an independent golden lock
+`crates/onnx-genai-engine/tests/glm4_9b_decode_lock.rs` asserting native-CUDA == golden greedy.)
+
+tok/s, medians of 5 interleaved rounds, 128 tok, on-GPU argmax both arms:
+| arm | median tok/s | range | pstdev |
+|---|---:|---:|---:|
+| capture ON (`CUDA_GRAPH=1`) | **211.74** | 211.57–212.48 | 0.33 |
+| eager (`CUDA_GRAPH=0`) | **128.82** | 128.24–129.05 | 0.29 |
+
+- **ratio = 1.64× (capture/eager)**
+- zero-arm-overlap confirmed: min(capON)=211.57 > max(eager)=129.05 → clean separation.
+
+## Notes / honest caveats
+- **Eager baseline moved up.** The task's quoted 98.2 tok/s GLM eager is an older figure; on
+  `b416a3e0` (post #1189, on-GPU argmax) eager is **128.8 tok/s** and capture is **211.7 tok/s** on
+  this H200. The 1.64× lever is the durable number; both absolute figures are higher than the prior
+  baseline (later kernels + argmax + this GPU). Reported honestly rather than reconciled to the old value.
+- **No bail to scope.** Unlike the V2-Lite `_d1` case (which needed Leon's planner recovery before
+  capture engaged), GLM-4-9B requires **nothing** — it is a dense GQA graph whose attention-mask cone
+  already terminates at a genuine capacity-form `Attention[3]` with present-KV, so the #1171 classifier
+  passes it. No `geometry.rs`/`bindings.rs` change needed; Leon/Deckard have nothing to implement here.
+- Base decode, greedy, opt-in flag (`ONNX_GENAI_CUDA_GRAPH`, default-OFF). No spec-decode. No source edits.
+
+## Standing-table implication
+GLM-4-9B int4 is native-only (ORT can't load it — dense int4 export ORT rejects, same capability class
+as V2-Lite QMoE). The capture moat therefore extends the native-only lead further:
+**native GLM-4-9B = 128.8 tok/s eager / 211.7 tok/s captured (1.64×), byte-identical, opt-in.**
+
+## Reproduce
+```bash
+source /home/justinchu/onnx-genai/.cudaenv.sh
+export CUDA_VISIBLE_DEVICES=6 ONNX_GENAI_ONGPU_ARGMAX=1
+M=/home/justinchu/glm-e2e-artifacts/cohaagen-glm-4-9b-int4-cuda-post434
+ONNX_GENAI_CUDA_GRAPH=1 profile_native --model $M --ep cuda --steady --warmups 1 --runs 3 --tokens 128  # 211.7, captures=3 replays=185 fallbacks=0
+ONNX_GENAI_CUDA_GRAPH=0 profile_native --model $M --ep cuda --steady --warmups 1 --runs 3 --tokens 128  # 128.8
+# byte-identity: dump generated_token_ids at --tokens 256 for both, diff position-by-position -> 0/256
+```
+
+## Constraints honored
+Fresh detached worktree off `origin/main b416a3e0`; no `git add -A`; no source edits (measure + scope only);
+pinned idle GPU6 after nvidia-smi; base decode only; opt-in flag, no default flip; no /tmp writes; no
+stray procs left; GPU returned to idle.
