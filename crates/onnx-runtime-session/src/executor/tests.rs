@@ -6792,3 +6792,287 @@ fn dropping_an_executor_with_a_parked_input_buffer_leaks_nothing() {
         "dropping the executor leaked the parked input buffer"
     );
 }
+
+fn int64_initializer(graph: &mut Graph, name: &str, dims: Vec<usize>, values: &[i64]) -> ValueId {
+    use onnx_runtime_ir::{TensorData, WeightRef};
+
+    let value = graph.create_named_value(name, DataType::Int64, static_shape(dims.clone()));
+    graph.set_initializer(
+        value,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            dims,
+            values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        )),
+    );
+    value
+}
+
+fn f32_scalar_initializer(graph: &mut Graph, name: &str, value: f32) -> ValueId {
+    use onnx_runtime_ir::{TensorData, WeightRef};
+
+    let tensor = graph.create_named_value(name, DataType::Float32, static_shape([]));
+    graph.set_initializer(
+        tensor,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Float32,
+            vec![],
+            value.to_le_bytes().to_vec(),
+        )),
+    );
+    tensor
+}
+
+// DeepSeek-V2-Lite's graph-capture additive mask builds a query x key bias via
+// CumSum/Unsqueeze/.../Where->Cast->Unsqueeze. ONNX shape inference leaves the
+// query axis as a fresh internal `_d1` symbol, but its extent is exactly the
+// current `input_ids` sequence length: Slice(CumSum(attention_mask),
+// Shape(attention_mask)[1] - Shape(input_ids)[1], Shape(attention_mask)[1]).
+// Capture prepare must recover that exact query axis rather than treating it as
+// data-dependent or reserving a max-sequence-sized guess.
+#[test]
+fn prepare_workspace_resolves_deepseek_additive_mask_query_axis_exactly() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let batch = graph.create_symbol(Some("batch".into()));
+    let total = graph.create_symbol(Some("past_seq_len + seq_len".into()));
+    let seq = graph.create_symbol(Some("sequence_len".into()));
+    let query = graph.create_symbol(Some("_d1".into()));
+
+    let input_ids = graph.create_named_value(
+        "input_ids",
+        DataType::Int64,
+        vec![Dim::Symbolic(batch), Dim::Symbolic(seq)],
+    );
+    graph.add_input(input_ids);
+    let attention_mask = graph.create_named_value(
+        "attention_mask",
+        DataType::Int64,
+        vec![Dim::Symbolic(batch), Dim::Symbolic(total)],
+    );
+    graph.add_input(attention_mask);
+    let axis_1 = int64_initializer(&mut graph, "const_1d_1", vec![1], &[1]);
+    let axis_2 = int64_initializer(&mut graph, "const_1d_2", vec![1], &[2]);
+    let one = int64_initializer(&mut graph, "const_1_i64", vec![], &[1]);
+
+    let cumsum = graph.create_named_value(
+        "v_model.CumSum_5",
+        DataType::Int64,
+        vec![Dim::Symbolic(batch), Dim::Symbolic(total)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "CumSum",
+        vec![Some(attention_mask), Some(one)],
+        vec![cumsum],
+    ));
+    let unsqueeze_6 = graph.create_named_value(
+        "v_model.Unsqueeze_6",
+        DataType::Int64,
+        vec![Dim::Symbolic(batch), Dim::Static(1), Dim::Symbolic(total)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Unsqueeze",
+        vec![Some(cumsum), Some(axis_1)],
+        vec![unsqueeze_6],
+    ));
+    let input_len = graph.create_named_value("v_model.Shape_7", DataType::Int64, static_shape([1]));
+    let mut shape_input = Node::new(NodeId(2), "Shape", vec![Some(input_ids)], vec![input_len]);
+    shape_input
+        .attributes
+        .insert("start".into(), Attribute::Int(1));
+    shape_input
+        .attributes
+        .insert("end".into(), Attribute::Int(2));
+    graph.insert_node(shape_input);
+    let mask_len = graph.create_named_value("v_model.Shape_8", DataType::Int64, static_shape([1]));
+    let mut shape_mask = Node::new(
+        NodeId(3),
+        "Shape",
+        vec![Some(attention_mask)],
+        vec![mask_len],
+    );
+    shape_mask
+        .attributes
+        .insert("start".into(), Attribute::Int(1));
+    shape_mask
+        .attributes
+        .insert("end".into(), Attribute::Int(2));
+    graph.insert_node(shape_mask);
+    let start = graph.create_named_value("v_model.Sub_9", DataType::Int64, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "Sub",
+        vec![Some(mask_len), Some(input_len)],
+        vec![start],
+    ));
+    let sliced = graph.create_named_value(
+        "v_model.Slice_10",
+        DataType::Int64,
+        vec![Dim::Symbolic(batch), Dim::Symbolic(query)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(5),
+        "Slice",
+        vec![Some(cumsum), Some(start), Some(mask_len), Some(axis_1)],
+        vec![sliced],
+    ));
+    let unsqueeze_11 = graph.create_named_value(
+        "v_model.Unsqueeze_11",
+        DataType::Int64,
+        vec![Dim::Symbolic(batch), Dim::Symbolic(query), Dim::Static(1)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(6),
+        "Unsqueeze",
+        vec![Some(sliced), Some(axis_2)],
+        vec![unsqueeze_11],
+    ));
+    let ge = graph.create_named_value(
+        "v_model.GreaterOrEqual_12",
+        DataType::Bool,
+        vec![
+            Dim::Symbolic(batch),
+            Dim::Symbolic(query),
+            Dim::Symbolic(total),
+        ],
+    );
+    graph.insert_node(Node::new(
+        NodeId(7),
+        "GreaterOrEqual",
+        vec![Some(unsqueeze_11), Some(unsqueeze_6)],
+        vec![ge],
+    ));
+    let unsqueeze_13 = graph.create_named_value(
+        "v_model.Unsqueeze_13",
+        DataType::Int64,
+        vec![Dim::Symbolic(batch), Dim::Static(1), Dim::Symbolic(total)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(8),
+        "Unsqueeze",
+        vec![Some(attention_mask), Some(axis_1)],
+        vec![unsqueeze_13],
+    ));
+    let cast_14 = graph.create_named_value(
+        "v_model.Cast_14",
+        DataType::Bool,
+        vec![Dim::Symbolic(batch), Dim::Static(1), Dim::Symbolic(total)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(9),
+        "Cast",
+        vec![Some(unsqueeze_13)],
+        vec![cast_14],
+    ));
+    let and = graph.create_named_value(
+        "v_model.And_15",
+        DataType::Bool,
+        vec![
+            Dim::Symbolic(batch),
+            Dim::Symbolic(query),
+            Dim::Symbolic(total),
+        ],
+    );
+    graph.insert_node(Node::new(
+        NodeId(10),
+        "And",
+        vec![Some(cast_14), Some(ge)],
+        vec![and],
+    ));
+    let zero = f32_scalar_initializer(&mut graph, "const_0.0_f32", 0.0);
+    let neg = f32_scalar_initializer(&mut graph, "const_-65504.0_f32", -65504.0);
+    let where_out = graph.create_named_value(
+        "v_model.Where_16",
+        DataType::Float32,
+        vec![
+            Dim::Symbolic(batch),
+            Dim::Symbolic(query),
+            Dim::Symbolic(total),
+        ],
+    );
+    graph.insert_node(Node::new(
+        NodeId(11),
+        "Where",
+        vec![Some(and), Some(zero), Some(neg)],
+        vec![where_out],
+    ));
+    let cast_17 = graph.create_named_value(
+        "v_model.Cast_17",
+        DataType::Float16,
+        vec![
+            Dim::Symbolic(batch),
+            Dim::Symbolic(query),
+            Dim::Symbolic(total),
+        ],
+    );
+    graph.insert_node(Node::new(
+        NodeId(12),
+        "Cast",
+        vec![Some(where_out)],
+        vec![cast_17],
+    ));
+    let mask = graph.create_named_value(
+        "v_model.Unsqueeze_18",
+        DataType::Float16,
+        vec![
+            Dim::Symbolic(batch),
+            Dim::Static(1),
+            Dim::Symbolic(query),
+            Dim::Symbolic(total),
+        ],
+    );
+    graph.insert_node(Node::new(
+        NodeId(13),
+        "Unsqueeze",
+        vec![Some(cast_17), Some(axis_1)],
+        vec![mask],
+    ));
+    let attention = Node::new(
+        NodeId(14),
+        "Attention",
+        vec![None, None, None, Some(mask)],
+        vec![],
+    );
+    graph.insert_node(attention.clone());
+
+    let mut exec = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+    for value in [
+        input_ids,
+        attention_mask,
+        cumsum,
+        unsqueeze_6,
+        input_len,
+        mask_len,
+        start,
+        sliced,
+        unsqueeze_11,
+        ge,
+        unsqueeze_13,
+        cast_14,
+        and,
+        zero,
+        neg,
+        where_out,
+        cast_17,
+        mask,
+    ] {
+        exec.value_shapes
+            .insert(value, exec.graph.value(value).shape.clone());
+    }
+    let mut symbols = HashMap::new();
+    symbols.insert(batch, 1);
+    symbols.insert(seq, 1);
+    symbols.insert(total, 2048);
+
+    let resolved = exec
+        .resolve_planned_workspace_input_shape(mask, &symbols, NodeId(14), &attention, 3)
+        .unwrap();
+    assert_eq!(resolved, PlannedInputShape::Exact(vec![1, 1, 1, 2048]));
+}
