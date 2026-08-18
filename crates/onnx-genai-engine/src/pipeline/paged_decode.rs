@@ -84,7 +84,7 @@ pub(crate) struct PipelineDecodeLoopBackend<'a, 'admission> {
     /// same loop drives the ORT decoder (via [`OrtPipelineDecoder`]) or, in a
     /// follow-up, a native decoder keeping KV device-resident — one code path,
     /// no forked native copy (mirrors the Inc1 every_step seam, but stateful).
-    pub(crate) decoder: Box<dyn PipelineDecoderComponent + 'a>,
+    pub(crate) decoder: &'a mut dyn PipelineDecoderComponent,
     /// One-shot admission notification fired only after the first decoder step's
     /// exact routed inputs have successfully prepared governed workspace.
     pub(crate) admission: Option<&'admission mut dyn FnMut()>,

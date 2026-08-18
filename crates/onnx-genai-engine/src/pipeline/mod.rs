@@ -252,6 +252,11 @@ pub struct PipelineEngine {
     /// Only used when the decoder's KV cannot be paged; the paged cache below
     /// supersedes it, because it holds many prefixes instead of one.
     retained: Option<RetainedContext>,
+    /// Native decoder retained across sequential requests. Its CUDA KV bindings
+    /// stay device-resident in their original dtype (including BF16); `retained`
+    /// identifies the exact token prefix those bindings contain.
+    #[cfg(feature = "native-backend")]
+    native_retained_decoder: Option<Box<dyn PipelineDecoderComponent>>,
     /// Paged KV for the decoder, when its `present.*` outputs describe a layout
     /// the page table can address.
     paged: Option<PipelinePagedKv>,
@@ -1245,6 +1250,8 @@ impl PipelineEngine {
             )),
             memoizable_components,
             retained: None,
+            #[cfg(feature = "native-backend")]
+            native_retained_decoder: None,
             paged,
             native_device: config.native_device.clone(),
             native_prompt_sessions: RefCell::new(BTreeMap::new()),
