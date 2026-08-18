@@ -1370,9 +1370,13 @@ impl Engine {
             |session| session.execution_provider_status().summary(),
         )
     }
-
     /// Latest native activation-memory planner measurement, if the current
     /// backend is native and has executed far enough to resolve concrete shapes.
+    ///
+    /// Returns `None` unless the planner is switched on, which it is not by
+    /// default: set `NXRT_ACTIVATION_MEMORY_PLAN=1` (or
+    /// `NXRT_EXEC_PHASE_PROFILE=1`) first. Being native and having executed is
+    /// necessary but not sufficient.
     pub fn activation_memory_plan_stats(&self) -> Option<crate::ActivationMemoryPlanSummary> {
         #[cfg(feature = "native-backend")]
         {

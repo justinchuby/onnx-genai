@@ -24,7 +24,8 @@ use crate::pipeline_cache::{
 };
 use crate::processors::build_processor_chain;
 use crate::{
-    EngineDecodeBackend, GeneratePrompt, GenerateRequest, GenerateResult, GenerateTokenCallback,
+    EngineDecodeBackend, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
+    GenerateTokenCallback, StopSequence,
 };
 use anyhow::Context;
 use onnx_genai_kv::{PagedKvCache, PrefixCache, SequenceId};
@@ -236,6 +237,8 @@ pub struct PipelineEngine {
     plan: PipelinePlan,
     decode_backend: EngineDecodeBackend,
     generation_defaults: Option<onnx_genai_metadata::GenerationDefaults>,
+    max_sequence_length: Option<usize>,
+    eos_token_ids: Vec<TokenId>,
     /// Autoregressive decode state; `None` for non-autoregressive pipelines
     /// (single-pass, iterative/diffusion) which produce tensors, not tokens.
     decoder_state: Option<DecodeState>,
@@ -564,6 +567,7 @@ fn pipeline_metadata_max_len(directory: &onnx_genai_ort::PipelineModelDirectory)
     {
         return Some(len);
     }
+
     onnx_genai_genai_config::find_in_dir(&directory.root)
         .and_then(|path| onnx_genai_genai_config::load(&path).ok())
         .and_then(|config| config.max_sequence_length())
@@ -591,6 +595,21 @@ fn pipeline_metadata_generation_defaults(
         .as_ref()
         .and_then(|path| onnx_genai_metadata::load_metadata(path).ok())
         .and_then(|metadata| metadata.generation)
+}
+
+fn pipeline_metadata_eos_token_ids(
+    directory: &onnx_genai_ort::PipelineModelDirectory,
+) -> Vec<TokenId> {
+    directory
+        .metadata_path
+        .as_ref()
+        .and_then(|path| onnx_genai_metadata::load_metadata(path).ok())
+        .and_then(|metadata| metadata.tokens)
+        .and_then(|tokens| tokens.eos_token_id)
+        .into_iter()
+        .flatten()
+        .filter_map(|id| TokenId::try_from(id).ok())
+        .collect()
 }
 
 /// Build the native device-KV [`PipelineDecoderComponent`] for `decoder`, loading
@@ -781,6 +800,12 @@ impl PipelineEngine {
         self.generation_defaults.as_ref()
     }
 
+    /// Effective context limit for a request, combining the package metadata
+    /// with an explicit per-request override.
+    pub fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
+        options.max_context.or(self.max_sequence_length)
+    }
+
     /// Execution-provider placement reported by the loaded component sessions.
     pub fn execution_provider_status(&self) -> String {
         let mut summaries = self
@@ -873,6 +898,8 @@ impl PipelineEngine {
             .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {e}"))?;
         let prefill_chunk_size = pipeline_metadata_prefill_chunk_size(&directory);
         let generation_defaults = pipeline_metadata_generation_defaults(&directory);
+        let max_sequence_length = pipeline_metadata_max_len(&directory);
+        let eos_token_ids = pipeline_metadata_eos_token_ids(&directory);
         let model_weights_bytes =
             directory
                 .model_paths
@@ -1278,6 +1305,8 @@ impl PipelineEngine {
                 PipelineBackend::Native => EngineDecodeBackend::Native,
             },
             generation_defaults,
+            max_sequence_length,
+            eos_token_ids,
             decoder_state,
             tokenizer_component,
             fixed_state_budget_bytes,

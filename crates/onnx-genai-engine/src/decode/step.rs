@@ -191,7 +191,7 @@ pub(crate) fn run_decode_step_with_extra(
             let value = if retained_past_len == 0 {
                 empty_past_value(info)?
             } else {
-                clone_value(decode_state.past.get(&info.name).with_context(|| {
+                clone_value(decode_state.past().get(&info.name).with_context(|| {
                     format!("missing cached KV tensor for input '{}'", info.name)
                 })?)?
             };
@@ -245,14 +245,17 @@ pub(crate) fn run_decode_step_with_extra(
     })?;
 
     if decode_state.use_kv {
-        decode_state.past.clear();
+        let mut next_past = HashMap::new();
         for (name, value) in session.output_names().iter().zip(outputs.iter()) {
             if let Some(past_name) = decode_state.present_to_past.get(name) {
-                decode_state
-                    .past
-                    .insert(past_name.clone(), clone_value(value)?);
+                next_past.insert(past_name.clone(), clone_value(value)?);
             }
         }
+        // The KV now covers every token processed so far; set the tensors and
+        // their absolute length together so the state owns a length that cannot
+        // drift from `past`. A windowed step then trims the physical rows in
+        // place without changing this absolute count.
+        decode_state.set_past(next_past, past_len + seq_len);
         decode_state.apply_window_after_step(session, past_len + seq_len, total_len)?;
     }
     if !decode_state.io.state_pairs.is_empty() {

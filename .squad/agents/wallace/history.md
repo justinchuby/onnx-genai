@@ -66,3 +66,10 @@ Full pre-compaction history in `history-archive.md`.
 - Scoped real GLM-4-9B int4 dense GQA decode and found the existing V2-Lite capture stack already covers it with no code change: captures=3, replays=185, fallbacks=0.
 - Capture and eager streams were byte-identical over 256 tokens; capture measured 211.74 tok/s vs eager 128.82 tok/s (1.64×), with zero overlap across rounds on H200 GPU6.
 - Durable framing: GLM extends the native-only capture moat today; report as opt-in graph-capture capability on native CUDA, not as a new implementation task.
+
+## 2026-08-18T04:45Z — ORT-fairness graph-mode reconfirmation
+
+- Reconfirmed the 2026-08-17 dense int4 fairness decomposition by attempting ORT CUDA graph mode on Phi-4-mini, qwen2.5-7b, and qwen2.5-14b-zp.
+- Graph-vs-graph remains unattainable: Phi hard-rejects control flow, qwen7b errors on an unconstructed `ort_value`, and qwen14b-zp accepts graph mode but no-ops due to CPU shape nodes.
+- Eager-vs-eager native/ORT is 0.85× / 0.77× / 1.19×; keep the 1.33× / 1.14× / 1.83× deployment headline only with the architectural capture + on-GPU argmax asterisk.
+
