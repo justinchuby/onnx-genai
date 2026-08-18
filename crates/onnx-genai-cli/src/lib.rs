@@ -792,7 +792,10 @@ fn init_tracing() {
         .with_writer(io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                // INFO spans can arrive between streamed tokens and visually
+                // split a reply on a shared terminal. Keep normal interactive
+                // output stable; operators can still opt in with RUST_LOG=info.
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .try_init();
 }
