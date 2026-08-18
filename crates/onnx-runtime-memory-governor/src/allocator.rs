@@ -1,138 +1,29 @@
 //! The allocator seam: raw memory, from wherever the caller says.
 //!
-//! # Why this is separate from [`MemoryGovernor`](crate::MemoryGovernor)
+//! # Relationship with `onnx-runtime-memory-api`
 //!
-//! A governor decides *whether* bytes may be taken. An allocator decides *where
-//! they come from*. Those are different questions with different answers per
-//! device, and conflating them means a caller who wants to supply one has to
-//! supply both.
+//! The primitive data types ([`AllocationCommitRange`], [`DeviceKey`],
+//! [`MappedAllocation`], [`SharedPrefixCommitInfo`]) and the
+//! [`SharedDevicePrefix`] trait are defined in `onnx-runtime-memory-api` and
+//! re-exported here for backward compatibility.
 //!
-//! # Why it lives in this crate
-//!
-//! This crate has no dependencies, and both backends already depend on it. The
-//! ONNX Runtime binding does not depend on the native execution-provider API,
-//! nor the reverse — so an allocator contract defined in either one could not be
-//! shared. Defined here, a single implementation serves both:
-//!
-//! ```text
-//!                   ┌──────────────────────┐
-//!   user supplies → │   dyn DeviceAllocator │ ← we supply HostAllocator
-//!                   └──────────┬───────────┘
-//!                     ┌────────┴────────┐
-//!            ORT      │                 │      native
-//!    OrtAllocator vtable          ExecutionProvider::allocate
-//! ```
-//!
-//! The alternative is writing every allocator twice — and the one that matters
-//! is a CUDA arena, which is not a thing to write twice.
-//!
-//! # Raw, deliberately
-//!
-//! The signatures are pointers and sizes rather than a buffer type, because the
-//! two backends have *different* buffer types: ONNX Runtime's `Alloc` returns a
-//! bare `void*`, and the native side wraps allocations in a `DeviceBuffer` that
-//! carries device, size, alignment and ownership. Raw is what both can express;
-//! each side wraps it in its own richer type on the way out.
+//! The [`DeviceAllocator`] trait and [`HostAllocator`] remain in this crate
+//! because `DeviceAllocator::allocate_committed_with_capacity` and
+//! `DeviceAllocator::commit_allocation_ranges_with_capacity` accept a
+//! [`MappedPhysicalCapacityToken`], a governor-specific type coupled to
+//! [`LeaseLedger`](crate::LeaseLedger). Splitting those methods into an
+//! extension trait requires changing the `&dyn DeviceAllocator` dispatch sites
+//! and is deferred to Phase 2 (#1186).
 
-use std::any::Any;
 use std::fmt::Debug;
 use std::ptr::NonNull;
 
 use crate::{MappedPhysicalCapacityToken, MemoryError, Tier};
 
-#[derive(Clone, Copy, Debug)]
-pub struct AllocationCommitRange {
-    pub ptr: NonNull<u8>,
-    pub allocation_bytes: usize,
-    pub align: usize,
-    pub offset: usize,
-    pub bytes: usize,
-}
-
-#[derive(Debug)]
-pub struct MappedAllocation<T> {
-    pub allocation: T,
-    pub newly_mapped_bytes: u64,
-}
-
-/// Which physical device memory comes from.
-///
-/// A `Tier` says *how far away* memory is; this says *which one*. Two CUDA
-/// devices are the same tier and different allocators, and an allocator that
-/// could not tell them apart would let a pointer from one be freed by the other.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct DeviceKey {
-    /// How far the memory is from compute.
-    pub tier: Tier,
-    /// Which device of that tier, zero-based. Always `0` for host memory.
-    pub index: u32,
-}
-
-impl DeviceKey {
-    /// The host.
-    pub const HOST: Self = Self {
-        tier: Tier::Host,
-        index: 0,
-    };
-
-    /// Accelerator `index`.
-    pub const fn device(index: u32) -> Self {
-        Self {
-            tier: Tier::Device,
-            index,
-        }
-    }
-}
-
-/// A pinned, read-only shared prefix: physical device memory created **once**
-/// and mappable into many allocations at **zero** incremental owned bytes
-/// (#777).
-///
-/// This is the allocator-agnostic handle a KV path holds when it declares "this
-/// token prefix is shared" and pins it once, then maps it into each subsequent
-/// sequence with [`DeviceAllocator::commit_shared_prefix`]. It is deliberately
-/// opaque: the concrete backing (CUDA VMM physical handles today) lives in the
-/// allocator crate, downcast through [`SharedDevicePrefix::as_any`] by the
-/// allocator that produced it. Detection (hashing) and copy-on-write at
-/// divergence are **not** part of this contract — a shared prefix is read-only
-/// for the union lifetime of its sharers.
-pub trait SharedDevicePrefix: Send + Sync + Debug {
-    /// Device address of the owner's writable window. The prefix content is
-    /// filled here **once**, before it is shared read-only into sequences.
-    fn device_ptr(&self) -> u64;
-
-    /// Physical device bytes this prefix owns — charged **once**, on the owned
-    /// axis, however many sequences share it. This is the reported *physical*
-    /// cost, never nominal content bytes.
-    fn committed_physical_bytes(&self) -> u64;
-
-    /// The granule-rounded byte length the prefix actually spans.
-    fn mapped_bytes(&self) -> usize;
-
-    /// Bytes requested at construction, before granule rounding.
-    fn requested_bytes(&self) -> usize;
-
-    /// Downcast hook: the allocator that produced this handle recovers its
-    /// concrete type to map it. A prefix presented to a different allocator is
-    /// refused rather than mis-mapped.
-    fn as_any(&self) -> &dyn Any;
-}
-
-/// The accounting outcome of mapping a [`SharedDevicePrefix`] into one
-/// allocation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SharedPrefixCommitInfo {
-    /// Physical bytes newly *owned* by mapping the prefix here.
-    ///
-    /// Always **zero**: the prefix's granules were charged once when it was
-    /// created, so admitting the Nth sharer costs only its *private* bytes.
-    pub additional_owned_bytes: u64,
-    /// Physical bytes newly *mapped* into this allocation's reservation — one
-    /// mapping of already-owned physical memory, reported on the mapped axis.
-    pub newly_mapped_bytes: u64,
-    /// Granules mapped read-only into the allocation.
-    pub granules: usize,
-}
+// ── Re-exports from onnx-runtime-memory-api ──────────────────────────────
+pub use onnx_runtime_memory_api::allocator::{
+    AllocationCommitRange, DeviceKey, MappedAllocation, SharedDevicePrefix, SharedPrefixCommitInfo,
+};
 
 /// Somewhere raw memory comes from.
 ///
@@ -176,18 +67,23 @@ pub struct SharedPrefixCommitInfo {
 /// claim should hold a [`MemoryLease`] alongside its allocator rather than
 /// expect the allocator to account for it.
 ///
+/// # Governor coupling note
+///
+/// The [`allocate_committed_with_capacity`] and
+/// [`commit_allocation_ranges_with_capacity`] methods accept a
+/// [`MappedPhysicalCapacityToken`], which is a governor-specific type. This
+/// coupling is identified for extraction in Phase 2 of #1186.
+///
 /// [`MemoryGovernor`]: crate::MemoryGovernor
 /// [`MemoryLease`]: crate::MemoryLease
+/// [`allocate_committed_with_capacity`]: DeviceAllocator::allocate_committed_with_capacity
+/// [`commit_allocation_ranges_with_capacity`]: DeviceAllocator::commit_allocation_ranges_with_capacity
 pub trait DeviceAllocator: Send + Sync + Debug {
     /// Take `bytes` aligned to `align`.
     fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError>;
 
     /// Reserve one allocation while committing only the byte ranges the caller
     /// says are live.
-    ///
-    /// Eager allocators cannot separate those two acts, so the default keeps
-    /// the old contract and commits the whole allocation. Lazy allocators may
-    /// override this and pair it with [`DeviceAllocator::commit_allocation_range`].
     fn allocate_committed(
         &self,
         bytes: usize,
@@ -218,11 +114,6 @@ pub trait DeviceAllocator: Send + Sync + Debug {
 
     /// Ensure `offset..offset + bytes` in an existing allocation is physically
     /// backed.
-    ///
-    /// The default is a no-op because [`DeviceAllocator::allocate`] and the
-    /// default [`DeviceAllocator::allocate_committed`] already committed the
-    /// whole allocation. Lazy allocators override this to grow the physical
-    /// commitment without moving the pointer.
     fn commit_allocation_range(
         &self,
         ptr: NonNull<u8>,
@@ -236,9 +127,6 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     }
 
     /// Commit several allocation ranges as one allocator transaction.
-    ///
-    /// Lazy allocators override this to union shared physical granules under a
-    /// single lock. The eager/default implementation preserves compatibility.
     fn commit_allocation_ranges(
         &self,
         ranges: &[AllocationCommitRange],
@@ -283,11 +171,6 @@ pub trait DeviceAllocator: Send + Sync + Debug {
 
     /// Release physical backing from a byte range in an existing allocation
     /// while keeping its virtual address reserved.
-    ///
-    /// The default is a no-op because eager allocators cannot partially unmap
-    /// allocations. Lazy allocators may override this so callers can roll back
-    /// a failed multi-buffer growth without leaving committed bytes charged.
-    /// Returns the physical bytes whose global mapping reference reached zero.
     fn decommit_allocation_range(
         &self,
         ptr: NonNull<u8>,
@@ -301,11 +184,6 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     }
 
     /// Physical bytes currently claimed by this allocation.
-    ///
-    /// Eager allocators return the allocation length because every byte is
-    /// backed from birth. Lazy allocators override this so tests and profilers
-    /// can assert on bytes that are attributable to one binding rather than on
-    /// process-global activity from unrelated workspaces.
     fn allocation_committed_bytes(
         &self,
         ptr: NonNull<u8>,
@@ -318,36 +196,6 @@ pub trait DeviceAllocator: Send + Sync + Debug {
 
     /// Whether this allocator commits physical memory as it is used rather
     /// than when it is requested.
-    ///
-    /// # Why a consumer needs to know
-    ///
-    /// A component holding memory whose size it knows only as a worst case --
-    /// a KV cache sized at the model's full context, say -- has to choose
-    /// between two bad options when the allocator commits eagerly. Reserve the
-    /// worst case and refuse models that a short conversation would never grow
-    /// into; or reserve nothing and discover the shortfall at an allocation
-    /// mid-generation.
-    ///
-    /// When the allocator commits on demand the choice goes away: memory is
-    /// charged as it is genuinely taken, so the worst case becomes a *ceiling
-    /// to check* rather than a claim to hold. On a small machine that is the
-    /// difference between "this model does not fit" and "this model fits until
-    /// it actually needs the memory".
-    ///
-    /// # Why it lives here and not on an execution provider
-    ///
-    /// The allocator is the thing that commits, and it is the piece every
-    /// backend has. Asking a provider would answer only for the paths that go
-    /// through one; asking the allocator answers for ONNX Runtime too, whose
-    /// `OrtAllocator` seam wraps one of these.
-    ///
-    /// # Contract
-    ///
-    /// `false` is the safe answer and the default: a consumer that believes
-    /// this will under-reserve. Return `true` only when the allocator really
-    /// does map physical memory lazily **and** charges a governor as it does
-    /// so. Saying `true` without the second half turns an accounting question
-    /// into an out-of-memory crash.
     fn commits_on_demand(&self) -> bool {
         false
     }
@@ -364,8 +212,6 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     /// Free an allocation and report bytes whose global mapping reference
     /// count transitioned from one to zero.
     ///
-    /// Eager allocators have no shared-granule attribution and return zero.
-    ///
     /// # Safety
     ///
     /// `ptr`, `bytes`, and `align` must identify one live allocation returned
@@ -376,16 +222,7 @@ pub trait DeviceAllocator: Send + Sync + Debug {
         0
     }
 
-    /// Create a pinned, read-only shared prefix of `bytes`, charged **once** on
-    /// the owned axis, for mapping into many allocations with
-    /// [`commit_shared_prefix`](DeviceAllocator::commit_shared_prefix).
-    ///
-    /// The default refuses: a shared prefix is defined by physical-handle
-    /// identity across reservations, which only an allocator that owns its
-    /// physical granules (a CUDA VMM arena) can provide. Eager allocators — and
-    /// any allocator without a physical-handle pool — return an error here
-    /// rather than mis-map, so an unsupported request faults loudly at the seam
-    /// instead of silently producing private copies.
+    /// Create a pinned, read-only shared prefix of `bytes`.
     fn create_shared_prefix(
         &self,
         bytes: usize,
@@ -399,11 +236,7 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     }
 
     /// Estimate the incremental **owned** physical bytes to admit one more
-    /// sharer of `prefix` — zero for an allocator that already owns the prefix's
-    /// granules.
-    ///
-    /// This is the admission-facing statement (#745): the shared bytes are
-    /// charged once, so the Nth request costs only its private continuation.
+    /// sharer of `prefix`.
     fn incremental_owned_bytes_for_shared_prefix(&self, prefix: &dyn SharedDevicePrefix) -> u64 {
         let _ = prefix;
         0
@@ -411,13 +244,6 @@ pub trait DeviceAllocator: Send + Sync + Debug {
 
     /// Map `prefix` into the live allocation `ptr` at `byte_offset`,
     /// **read-only**, taking one reference per shared granule.
-    ///
-    /// The prefix's physical memory is already owned, so this maps existing
-    /// memory: it charges **zero** incremental owned bytes and keeps the shared
-    /// granules alive until the last sharer (or the prefix owner) leaves. The
-    /// default refuses for the same reason [`create_shared_prefix`] does.
-    ///
-    /// [`create_shared_prefix`]: DeviceAllocator::create_shared_prefix
     fn commit_shared_prefix(
         &self,
         prefix: &dyn SharedDevicePrefix,
@@ -442,12 +268,7 @@ pub trait DeviceAllocator: Send + Sync + Debug {
 ///
 /// The default for host tiers, and a deliberately thin one: the system allocator
 /// already pools with per-thread caches, so a pool layered on top adds a lock
-/// without removing one. Measured, an arena over this was slower than this.
-///
-/// Device memory is the opposite case — `cudaMalloc` is a synchronising driver
-/// call in the microseconds with no thread cache — so a device implementation of
-/// this trait will need an arena. That is why the trait exists rather than this
-/// being hard-coded.
+/// without removing one.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HostAllocator;
 
@@ -476,13 +297,9 @@ impl DeviceAllocator for HostAllocator {
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
         let Ok(layout) = std::alloc::Layout::from_size_align(bytes.max(1), align) else {
-            // Unreachable for a pointer this allocator produced, since the same
-            // layout was valid on the way in. Leaking beats freeing with a
-            // layout that does not match.
             return;
         };
-        // SAFETY: delegated to this method's contract -- the pointer came from
-        // `allocate` with this exact layout.
+        // SAFETY: delegated to this method's contract.
         unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) };
     }
 
@@ -495,21 +312,11 @@ impl DeviceAllocator for HostAllocator {
 mod tests {
     use super::*;
 
-    /// `commits_on_demand` is opaque: a caller asks the allocator, not the
-    /// backend.
-    ///
-    /// It lives on this trait rather than on an execution provider because the
-    /// allocator is the thing that commits, and it is the piece every backend
-    /// has. `GovernedAllocator` forwards it, so a session running on ONNX
-    /// Runtime answers the same question the native path does -- which is what
-    /// lets a consumer size a KV cache without knowing which backend it got.
     #[test]
     fn an_allocator_reports_whether_it_commits_on_demand() {
         #[derive(Debug)]
         struct Stub(bool);
 
-        // SAFETY: never allocates, so the non-overlap and validity guarantees
-        // hold vacuously.
         impl DeviceAllocator for Stub {
             fn allocate(&self, _bytes: usize, _align: usize) -> Result<NonNull<u8>, MemoryError> {
                 Err(MemoryError::InvalidRequest {
@@ -533,7 +340,6 @@ mod tests {
         #[derive(Debug)]
         struct Silent;
 
-        // SAFETY: as above.
         impl DeviceAllocator for Silent {
             fn allocate(&self, _bytes: usize, _align: usize) -> Result<NonNull<u8>, MemoryError> {
                 Err(MemoryError::InvalidRequest {
@@ -552,19 +358,15 @@ mod tests {
 
         assert!(
             !Silent.commits_on_demand(),
-            "an allocator that says nothing must be treated as committing eagerly: a consumer \
-             that believes otherwise will under-reserve"
+            "an allocator that says nothing must be treated as committing eagerly"
         );
 
-        // Through a trait object, which is how every real consumer holds one.
         let lazy: &dyn DeviceAllocator = &Stub(true);
         let eager: &dyn DeviceAllocator = &Stub(false);
         assert!(lazy.commits_on_demand());
         assert!(!eager.commits_on_demand());
     }
 
-    /// The host allocator honours the alignment it is asked for, whatever the
-    /// size. Kernels are entitled to assume it.
     #[test]
     fn host_allocations_are_aligned_as_requested() {
         let allocator = HostAllocator;
@@ -575,28 +377,19 @@ mod tests {
                 0,
                 "{bytes} bytes at {align}-byte alignment came back misaligned"
             );
-            // SAFETY: exactly what allocate returned.
             unsafe { allocator.deallocate(ptr, bytes, align) };
         }
     }
 
-    /// A zero-byte request still yields a usable, non-null pointer.
-    ///
-    /// `std::alloc` rejects a zero-sized layout, so this has to be handled
-    /// rather than passed through. Returning null would be indistinguishable
-    /// from failure at every call site.
     #[test]
     fn a_zero_byte_request_is_not_a_failure() {
         let allocator = HostAllocator;
         let ptr = allocator
             .allocate(0, 64)
             .expect("zero bytes is not an error");
-        // SAFETY: as returned.
         unsafe { allocator.deallocate(ptr, 0, 64) };
     }
 
-    /// An impossible alignment is refused rather than panicking inside
-    /// `Layout`.
     #[test]
     fn a_bad_alignment_is_refused_with_a_reason() {
         let allocator = HostAllocator;
@@ -609,14 +402,11 @@ mod tests {
         );
     }
 
-    /// Memory is writable for its whole extent, and two allocations do not
-    /// overlap.
     #[test]
     fn allocations_are_distinct_and_writable() {
         let allocator = HostAllocator;
         let first = allocator.allocate(256, 64).expect("granted");
         let second = allocator.allocate(256, 64).expect("granted");
-        // SAFETY: both are live allocations of 256 bytes.
         unsafe {
             std::ptr::write_bytes(first.as_ptr(), 0x11, 256);
             std::ptr::write_bytes(second.as_ptr(), 0x22, 256);
@@ -629,8 +419,6 @@ mod tests {
         }
     }
 
-    /// Host memory says it is host memory. Callers decide whether a pointer may
-    /// be dereferenced on the CPU from this.
     #[test]
     fn the_host_allocator_reports_the_host() {
         assert_eq!(HostAllocator.device(), DeviceKey::HOST);

@@ -87,6 +87,9 @@ pub use shareability::{
     evaluate_prefix_shareability,
 };
 
+// ── Re-exports from onnx-runtime-memory-api ──────────────────────────────
+pub use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
+
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
@@ -137,71 +140,11 @@ impl std::fmt::Display for MemoryAuthorityId {
     }
 }
 
-/// Where the bytes physically live.
-///
-/// Ordered from fastest to slowest, which is also the demotion order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Tier {
-    /// Accelerator memory (VRAM).
-    Device,
-    /// Host RAM.
-    Host,
-    /// Spill file on disk.
-    Disk,
-}
+// `Tier` is re-exported from `onnx-runtime-memory-api`; see the `pub use`
+// block above. The definition formerly here was moved to that crate as part
+// of the Phase 1 memory-API extraction (#1186).
 
-impl Tier {
-    /// Every tier, fastest first.
-    pub const ALL: [Tier; 3] = [Tier::Device, Tier::Host, Tier::Disk];
-
-    /// Stable index for array-backed per-tier state.
-    const fn index(self) -> usize {
-        match self {
-            Tier::Device => 0,
-            Tier::Host => 1,
-            Tier::Disk => 2,
-        }
-    }
-
-    /// Human-facing name used in error messages.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Tier::Device => "device",
-            Tier::Host => "host",
-            Tier::Disk => "disk",
-        }
-    }
-}
-
-/// What a reservation is *for*.
-///
-/// The governor reads this; it never infers purpose from allocation size or
-/// timing, because that is guessing. Roles are what make an eviction order
-/// expressible rather than hardcoded.
-///
-/// Deliberately carries no sequence or session identity. Under G3 the governor
-/// asks a *holder* to release bytes and the holder chooses which of its own
-/// sequences to give up, so the governor never has to reason about sequences —
-/// and this crate never has to depend on the KV layer to name one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MemoryRole {
-    /// Long-lived per-sequence KV. Migratable, and the usual eviction target
-    /// after weights.
-    KvCache,
-    /// Scratch space for computation.
-    Workspace {
-        /// Released wholesale at the end of the step that took it. Step-scoped
-        /// workspace is never migrated, because nothing would be gained before
-        /// it is freed anyway.
-        step_scoped: bool,
-    },
-    /// Model parameters. Immutable and shareable, so the cheapest thing to
-    /// demote first: it can always be re-read from the package on disk.
-    Weights,
-    /// Intermediate activations for one graph execution. The hottest and
-    /// shortest-lived class.
-    Activation,
-}
+// `MemoryRole` is re-exported from `onnx-runtime-memory-api`.
 
 /// Identifies a component that holds leases, so the governor can ask it to
 /// release under pressure.
@@ -226,72 +169,7 @@ impl std::fmt::Display for HolderId {
     }
 }
 
-/// Why a reservation could not be granted.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum MemoryError {
-    /// The tier does not have room, and no holder released enough.
-    #[error(
-        "cannot reserve {requested} bytes of {tier} memory for {role:?}: {used} of {limit} bytes \
-         are already leased, leaving {available}; free memory by closing sessions, lower the \
-         demand, or raise the {tier} limit"
-    )]
-    TierExhausted {
-        /// Which tier ran out.
-        tier: &'static str,
-        /// What the caller asked for.
-        requested: u64,
-        /// Bytes leased before this request.
-        used: u64,
-        /// The tier ceiling.
-        limit: u64,
-        /// `limit - used`.
-        available: u64,
-        /// The role that was refused.
-        role: MemoryRole,
-    },
-    /// The request itself is not representable.
-    #[error("cannot reserve {requested} bytes of {tier} memory: {reason}")]
-    InvalidRequest {
-        /// Which tier was addressed.
-        tier: &'static str,
-        /// What the caller asked for.
-        requested: u64,
-        /// What is wrong with it.
-        reason: &'static str,
-    },
-    /// The request was well formed and within budget, but the allocator behind
-    /// the tier refused it for a reason of its own.
-    ///
-    /// Distinct from [`MemoryError::TierExhausted`], which means *we* declined,
-    /// and from [`MemoryError::InvalidRequest`], which means the caller asked
-    /// for something impossible. This one carries the backing allocator's own
-    /// account of the failure, which is usually the only thing that identifies
-    /// it: a driver that is out of memory and a driver that has no context both
-    /// fail an allocation, and calling them both "out of memory" sends the next
-    /// person to read the log in the wrong direction.
-    #[error("cannot allocate {requested} bytes of {tier} memory: {reason}")]
-    AllocationFailed {
-        /// Which tier was addressed.
-        tier: &'static str,
-        /// What the caller asked for.
-        requested: u64,
-        /// What the backing allocator said.
-        reason: String,
-    },
-    /// A well-formed capacity transfer or backing claim could not make enough
-    /// governed bytes available.
-    #[error(
-        "cannot make {requested} bytes of {tier} capacity available for {role:?}: only \
-         {available} bytes became available; {detail}"
-    )]
-    CapacityUnavailable {
-        tier: &'static str,
-        requested: u64,
-        available: u64,
-        role: MemoryRole,
-        detail: String,
-    },
-}
+// `MemoryError` is re-exported from `onnx-runtime-memory-api`.
 
 /// Per-tier accounting shared by a governor and every lease it has granted.
 ///

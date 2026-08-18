@@ -1,0 +1,15 @@
+[package]
+name = "onnx-runtime-memory-api"
+description = "Foundational memory mechanism contracts: allocator traits, device keys, and shared-prefix types used by every memory-aware crate in the workspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "memory", "allocator", "runtime", "inference"]
+categories = ["memory-management", "science"]
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
