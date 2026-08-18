@@ -45,6 +45,7 @@ mod flat_autoregressive;
 mod iterative;
 mod nested_autoregressive;
 mod paged_decode;
+mod prefix_reuse;
 mod routing;
 mod schedulers;
 #[cfg(feature = "native-backend")]
