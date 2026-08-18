@@ -187,6 +187,18 @@ def main() -> None:
     build_rotary(
         out / "rope_llama3_b8_s1.onnx", batch=8, num_heads=32, head_dim=128, seq=1
     )
+    # GPT-J convention (interleaved=1) rotates adjacent even/odd channels
+    # instead of the two halves, which is a different inner loop with a
+    # different vectorisation. Cover it at decode and prefill lengths.
+    for seq in (1, 128, 512):
+        build_rotary(
+            out / f"rope_gptj_il_s{seq}.onnx",
+            batch=1,
+            num_heads=32,
+            head_dim=128,
+            seq=seq,
+            interleaved=True,
+        )
 
     # --- KV-cache append copies ----------------------------------------
     for past in (1023, 2047, 4095, 8191):
