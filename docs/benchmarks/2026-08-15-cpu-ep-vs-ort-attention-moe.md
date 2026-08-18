@@ -2381,3 +2381,98 @@ forward regardless.
 Beam reorder still does not exist for CPU or CUDA; `num_beams` is passthrough
 metadata and the decode loop is single-sequence. Nothing in Phase 8 changed
 that, and no claim about beam search should be made from this work.
+
+## 29. Phase 9: Softmax was paying for a copy ORT never makes (#1219)
+
+### 29.1 The defect
+
+`softmax_rows` - the shared entry point every `Softmax` node reaches, and the one
+`scale_mask_softmax_rows` and `softmax_slices` route through - began with
+
+    dst.copy_from_slice(src);
+    softmax_rows_in_place(dst, n, d);
+
+That is a full extra read+write pass over the tensor before any arithmetic happens. On
+`sm_prefill_h32_s512` the logit block is 33 MiB, so each inference moved **66 MiB** of
+traffic that produced no result. ORT never pays it: it hands `MlasComputeSoftmax` the
+graph input and output buffers directly.
+
+This is the whole explanation for §9's and §27's standing Softmax losses. The kernel's
+arithmetic was never the problem, and no amount of vectorising the reducer would have
+found it - the cost was in the line before the reducer was called.
+
+### 29.2 The fix
+
+Compute out-of-place. The reducer already traverses each row twice (once for the max,
+once for the exponent sum), so writing into `dst` on the final pass instead of
+pre-seeding `dst` with a copy is free. `softmax_rows_serial_out(src, dst, n, d)` takes
+the two buffers separately and has both a pure-Rust and an MLAS arm.
+
+Aliasing was already handled upstream and did not need new guards:
+`output_direct_write_eligible` refuses the direct-write slice when input and output
+overlap, so `softmax_rows` is only ever handed disjoint buffers. The pre-existing test
+`an_output_aliasing_its_input_matches_the_disjoint_result` covers that path.
+
+### 29.3 Result
+
+Paired interleaved A/B, one driver invocation, 3 repetitions x 40 runs x 15 warmups,
+`--native-threads 1 --ort-intra-threads 1`, base arm built from `origin/main` in a
+separate worktree. Median `native/ort`, lower is better:
+
+| model | before | after |
+|---|---|---|
+| sm_prefill_h32_s512 | 1.318 | **0.924** |
+| sm_bert_b8_s128 | 1.242 | 1.033 |
+| sm_decode_h32_kv1024 | 1.174 | 1.015 |
+| sm_decode_h32_kv2048 | 1.291 | 1.026 |
+| sm_decode_h32_kv4096 | 1.183 | 1.028 |
+| sm_decode_h32_kv8192 | 1.199 | 1.035 |
+
+Parity 36/36 PASS, `max_abs=0` in every cell.
+
+**What this does not claim.** One shape is won outright. The other five moved from a
+17-29% loss to a 1.5-3.5% loss. They are *not* won. The remaining few percent on those
+shapes is unattributed and is the next thing to chase on this axis.
+
+### 29.4 A measurement caveat that applies to this whole document
+
+`onnx-genai-bench` declares `required-features = ["mlas"]`, so `bench_generic` can only
+be built with MLAS linked in. Every ratio published in this document - including §27's
+66-cell grid - was therefore produced by the **MLAS-linked build**, and where a kernel
+has an MLAS arm (`softmax_rows_serial` does) that arm is what was measured.
+
+`mlas` is **not** a default feature of `onnx-runtime-ep-cpu`. The build that ships runs
+the pure-Rust arm. For this change that distinction does not affect the conclusion,
+because the removed copy sat at the shared, arm-agnostic `softmax_rows` call site and
+both arms lose it identically. But it does mean the *magnitude* of the win on the
+production build is unmeasured, and no ratio in this document should be read as a
+statement about a non-MLAS build until the harness can produce one. Fixing that -
+relaxing `required-features` so `bench_generic` can build both arms - is open work.
+
+### 29.5 Review finding: the bit-identity claim had no in-tree assertion
+
+The adversarial review of #1219 accepted the change but noted that its central claim -
+that the out-of-place form is bit-identical to the copy-then-in-place form - rested on
+prose. Every existing test compared with a `1e-6` tolerance over finite synthetic
+logits, and the non-finite tests exercised `softmax_rows_in_place`, not `softmax_rows`.
+
+That gap matters here specifically because the in-place reducer is vectorised and the
+out-of-place path is not, so the two `exp` implementations have to agree on the
+non-finite lanes exactly. `out_of_place_softmax_is_bit_identical_on_pathological_rows`
+now compares raw bits over fully masked rows, `+inf`-max rows, quiet, signalling and
+negative-payload NaNs, and denormals.
+
+Two things are worth recording about writing it:
+
+* The first falsifier chosen - guarding the normalisation with
+  `if sum == 0.0 { 0.0 }` - **did not trip the test**, and the reason was that the
+  test's own doc comment was wrong. A fully masked row does not normalise `0.0/0.0`:
+  the row max is `-inf`, so `exp(-inf - -inf)` is `exp(NaN)` and the sum is NaN, never
+  zero. The NaN arrives by propagation, not by division. A falsifier that fails to fire
+  is not evidence the test is vacuous - it can equally mean the falsifier is
+  inapplicable - and the only way to tell the two apart is to work out *why*.
+* The test carries an explicit non-vacuity guard asserting those rows still produce NaN
+  at all, so a future change that quietly made every row finite would fail loudly
+  instead of leaving a bit comparison that is trivially true. This is the third vacuous
+  or near-vacuous test caught in this effort (§28.2 has the other two); assume the
+  default state of a new test is vacuous until a falsifier has been run against it.
