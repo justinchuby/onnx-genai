@@ -1141,10 +1141,16 @@ pub(crate) fn gemm_nt_with_backend(
             x86_sgemm::sgemm_simd_nt(a, b_nk, c, m, k, n);
             Ok(())
         }
-        _ => Err(EpError::KernelFailed(format!(
-            "gemm_nt_with_backend called for backend {backend:?} without a transposed-B GEMM; \
-             callers must gate on nt_gemm_supported"
-        ))),
+        _ => {
+            // On a build with neither NT arm compiled in (e.g. aarch64 without
+            // `mlas`) none of the operands are read; bind them so the arch
+            // gating does not turn every parameter into an unused variable.
+            let _ = (a, b_nk, c, m, k, n);
+            Err(EpError::KernelFailed(format!(
+                "gemm_nt_with_backend called for backend {backend:?} without a transposed-B GEMM; \
+                 callers must gate on nt_gemm_supported"
+            )))
+        }
     }
 }
 
