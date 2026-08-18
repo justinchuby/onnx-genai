@@ -120,11 +120,13 @@ mod feature_default_guard {
     /// becomes possible again, so fail loudly here.
     #[test]
     fn mlas_is_not_a_default_feature() {
-        assert!(
-            !cfg!(feature = "mlas"),
-            "this test runs in a default-feature build, so `mlas` being on means \
-             it was added to the crate's default features: production would then \
-             ship MLAS and every benchmark arm label would be wrong"
-        );
+        const {
+            assert!(
+                !cfg!(feature = "mlas"),
+                "this test runs in a default-feature build, so `mlas` being on means \
+                 it was added to the crate's default features: production would then \
+                 ship MLAS and every benchmark arm label would be wrong"
+            );
+        }
     }
 }

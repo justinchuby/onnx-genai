@@ -1030,7 +1030,19 @@ mod vectorized_tests {
     /// quieting, diverging from the reference on 126 of 65536 patterns - and the
     /// tolerance-based tests above would not catch its analogue here, so this
     /// compares raw bits.
+    ///
+    /// Not Miri-tractable, for two independent reasons, both measured rather
+    /// than assumed. Miri reports `is_x86_feature_detected!("avx2") == false`,
+    /// so it only ever runs the scalar fallback and cannot validate the AVX2
+    /// kernel this test exists to police. And Miri deliberately returns a
+    /// nondeterministic approximation for libm calls - two evaluations of
+    /// `(-0.5f32).exp()` in one Miri process gave `0x3f1b4595` and
+    /// `0x3f1b4599` - plus a nondeterministic NaN sign/payload per operation,
+    /// so *any* bit-identity assertion over `exp` fails there by construction,
+    /// with a seed-dependent lane. Hardware `exp` and hardware NaN propagation
+    /// are both deterministic, which is why this holds off Miri.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: no AVX2, and nondeterministic libm/NaN results")]
     fn out_of_place_softmax_is_bit_identical_on_pathological_rows() {
         const D: usize = 8;
         let rows: Vec<Vec<f32>> = vec![
