@@ -226,7 +226,9 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     unsafe fn deallocate_with_unmapped(&self, ptr: NonNull<u8>, bytes: usize, align: usize) -> u64 {
         let unmapped = match self.as_shared_mapping() {
             // SAFETY: forwarded under this method's identical contract.
-            Some(shared_mapping) => unsafe { shared_mapping.release_shared_mapping(ptr, bytes, align) },
+            Some(shared_mapping) => unsafe {
+                shared_mapping.release_shared_mapping(ptr, bytes, align)
+            },
             None => 0,
         };
         // SAFETY: forwarded under this method's identical contract.

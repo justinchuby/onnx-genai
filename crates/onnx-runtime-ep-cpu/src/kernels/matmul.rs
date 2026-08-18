@@ -6009,12 +6009,22 @@ mod tests {
             (4, 96, 2),   // exactly one tile, no tail
             (9, 33, 11),  // leftover row + odd trailing column
             (16, 256, 8),
-            // k > KC (=256) forces multi-panel accumulation in tile_4x2:
-            (16, 512, 8), // exactly two full K-panels, no tail
-            (12, 520, 6), // three K-panels (256+256+8), no tail
-            (8, 300, 4),  // two K-panels, last kc=44 with a k%8 tail
-            (8, 259, 4),  // two K-panels, last kc=3 (all scalar tail)
-            (13, 577, 7), // leftover rows + odd col + multi-panel + tail
+            // Large `k`. There is no K blocking: `tile_4x2` reduces the whole
+            // of `k` in one pass, so these cover a long single-pass reduction
+            // and its `k % 8` scalar tail, not a panelled accumulation.
+            (16, 512, 8), // long reduction, no tail
+            (12, 520, 6), // long reduction, no tail
+            (8, 300, 4),  // long reduction with a k%8 tail
+            (8, 259, 4),  // reduction whose tail is 3 lanes, all scalar
+            (13, 577, 7), // leftover rows + odd trailing column + k tail
+            // The only blocking in `gemm_bt` is over columns, and it engages
+            // at `n * k > NC_KB` (65536). Every shape above stays under that,
+            // so without these the column-panel sweep - the change that turned
+            // the largest prefill shape from a regression into a win - would
+            // be covered by nothing but the 629 MiB integration fixtures.
+            (8, 2000, 64),  // several full column panels
+            (10, 2001, 70), // column panels with a short final panel, k tail
+            (1, 2000, 40),  // the decode row, multi-panel
         ];
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(1)

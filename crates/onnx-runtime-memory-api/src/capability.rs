@@ -269,7 +269,10 @@ pub trait VirtualBacking: Send + Sync {
     /// allocator whose ranges can share physical granules (so committing them
     /// together claims each shared granule only once) should override this
     /// to do so atomically rather than one range at a time.
-    fn commit_allocation_ranges(&self, ranges: &[AllocationCommitRange]) -> Result<(), MemoryError> {
+    fn commit_allocation_ranges(
+        &self,
+        ranges: &[AllocationCommitRange],
+    ) -> Result<(), MemoryError> {
         for range in ranges {
             self.commit_allocation_range(
                 range.ptr,
@@ -384,7 +387,10 @@ pub trait SharedMapping: Send + Sync {
     fn device(&self) -> DeviceKey;
 
     /// Create a pinned, read-only shared prefix of `bytes`.
-    fn create_shared_prefix(&self, bytes: usize) -> Result<Box<dyn SharedDevicePrefix>, MemoryError>;
+    fn create_shared_prefix(
+        &self,
+        bytes: usize,
+    ) -> Result<Box<dyn SharedDevicePrefix>, MemoryError>;
 
     /// Estimate the incremental **owned** physical bytes to admit one more
     /// sharer of `prefix`.
@@ -511,7 +517,11 @@ mod tests {
             unimplemented!("test double: never called")
         }
 
-        fn mapped_bytes_for_allocation(&self, _bytes: usize, _align: usize) -> Result<u64, MemoryError> {
+        fn mapped_bytes_for_allocation(
+            &self,
+            _bytes: usize,
+            _align: usize,
+        ) -> Result<u64, MemoryError> {
             unimplemented!("test double: never called")
         }
 
@@ -611,7 +621,11 @@ mod tests {
             unimplemented!("test double: never called")
         }
 
-        fn mapped_bytes_for_allocation(&self, _bytes: usize, _align: usize) -> Result<u64, MemoryError> {
+        fn mapped_bytes_for_allocation(
+            &self,
+            _bytes: usize,
+            _align: usize,
+        ) -> Result<u64, MemoryError> {
             unimplemented!("test double: never called")
         }
 
@@ -796,11 +810,19 @@ mod tests {
             DeviceKey::device(0)
         }
 
-        fn create_shared_prefix(&self, bytes: usize) -> Result<Box<dyn SharedDevicePrefix>, MemoryError> {
-            Ok(Box::new(FakeSharedPrefix { bytes: bytes as u64 }))
+        fn create_shared_prefix(
+            &self,
+            bytes: usize,
+        ) -> Result<Box<dyn SharedDevicePrefix>, MemoryError> {
+            Ok(Box::new(FakeSharedPrefix {
+                bytes: bytes as u64,
+            }))
         }
 
-        fn incremental_owned_bytes_for_shared_prefix(&self, prefix: &dyn SharedDevicePrefix) -> u64 {
+        fn incremental_owned_bytes_for_shared_prefix(
+            &self,
+            prefix: &dyn SharedDevicePrefix,
+        ) -> u64 {
             prefix.committed_physical_bytes()
         }
 
@@ -898,7 +920,10 @@ mod tests {
 
         // SAFETY: `ptr` identifies a live allocation this capability mapped.
         let first = unsafe { shared_mapping.release_shared_mapping(ptr, BYTES, 8) };
-        assert_eq!(first, BYTES as u64, "the first release must refund the full mapped amount");
+        assert_eq!(
+            first, BYTES as u64,
+            "the first release must refund the full mapped amount"
+        );
 
         // SAFETY: calling the release operation again on the same `ptr` is
         // exactly the scenario this test proves is safe: the bookkeeping was
