@@ -109,6 +109,9 @@ class ValidateSiteTest(unittest.TestCase):
         include_expected_runtime: bool = True,
         write_manifest: bool = True,
         include_runtime_scripts: bool = True,
+        head: str = "",
+        landing_title: str | None = None,
+        required_pages: tuple[str, ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         if "<body" not in body:
             body = f'<body data-basepath="/onnx-genai">{body}</body>'
@@ -119,18 +122,20 @@ class ValidateSiteTest(unittest.TestCase):
             else ""
         )
         inline = f"<script>{inline_runtime}</script>" if inline_runtime is not None else ""
-        (self.public / "index.html").write_text(body + runtime_scripts + inline, encoding="utf-8")
+        (self.public / "index.html").write_text(
+            head + body + runtime_scripts + inline, encoding="utf-8"
+        )
         runtime = (SAFE_RUNTIME if include_expected_runtime else "") + runtime_extra
         (self.public / "postscript.js").write_text(runtime, encoding="utf-8")
         (self.public / "prescript.js").write_text("window.addCleanup = () => {}", encoding="utf-8")
         if write_manifest:
             self.write_manifest()
-        return subprocess.run(
-            ["python3", str(VALIDATOR), str(self.public), "/onnx-genai/"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        command = ["python3", str(VALIDATOR), str(self.public), "/onnx-genai/"]
+        if landing_title is not None:
+            command += ["--landing-title", landing_title]
+        for page in required_pages:
+            command += ["--require-page", page]
+        return subprocess.run(command, check=False, capture_output=True, text=True)
 
     # ------------------------------------------------------------------
     # Pre-existing link/base-path/origin-root/inline-surface coverage.
@@ -850,6 +855,536 @@ class ValidateSiteTest(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    # ------------------------------------------------------------------
+    # Executable CDN host/namespace policy. jsDelivr serves the same mutable
+    # package namespace from several hostnames and as ESM through esm.run, so
+    # hostnames are canonicalized (lowercase, trailing dot stripped) before
+    # matching. Allowlisting stays narrower than detection: only the exact
+    # canonical host + `/npm/` namespace + reviewed package/version/asset the
+    # pinned latex plugin actually emits is approved.
+    # ------------------------------------------------------------------
+
+    def test_rejects_fastly_host_exact_allowlisted_katex_asset(self) -> None:
+        """An alternate jsDelivr mirror must not inherit the canonical
+        host's reviewed KaTeX allowlist entry."""
+        result = self.run_validator(
+            '<script src="https://fastly.jsdelivr.net/npm/katex@0.16.11'
+            '/dist/contrib/copy-tex.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_gcore_host_exact_allowlisted_katex_asset(self) -> None:
+        result = self.run_validator(
+            '<script src="https://gcore.jsdelivr.net/npm/katex@0.16.11'
+            '/dist/contrib/copy-tex.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_testingcf_host_exact_allowlisted_katex_asset(self) -> None:
+        result = self.run_validator(
+            '<script src="https://testingcf.jsdelivr.net/npm/katex@0.16.11'
+            '/dist/contrib/copy-tex.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_fastly_host_d3_bundle(self) -> None:
+        result = self.run_validator(
+            '<script src="https://fastly.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_gcore_host_pixi_bundle(self) -> None:
+        result = self.run_validator(
+            '<script src="https://gcore.jsdelivr.net/npm/pixi.js@8.19.0/dist/pixi.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_testingcf_host_floating_range_bundle(self) -> None:
+        result = self.run_validator(
+            '<script src="https://testingcf.jsdelivr.net/npm/d3@^7/dist/d3.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_scheme_relative_alternate_host_script(self) -> None:
+        result = self.run_validator(
+            '<script src="//fastly.jsdelivr.net/npm/katex@0.16.11'
+            '/dist/contrib/copy-tex.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_uppercase_canonical_host_allowlisted_asset(self) -> None:
+        """`CDN.JSDELIVR.NET` is the same origin to a browser, but it is not
+        the reviewed canonical emission, so it is detected and rejected."""
+        result = self.run_validator(
+            '<script src="https://CDN.JSDELIVR.NET/npm/katex@0.16.11'
+            '/dist/contrib/copy-tex.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_trailing_dot_canonical_host_allowlisted_asset(self) -> None:
+        """A trailing DNS root dot resolves to the same origin and must not
+        bypass the host policy."""
+        result = self.run_validator(
+            '<script src="https://cdn.jsdelivr.net./npm/katex@0.16.11'
+            '/dist/contrib/copy-tex.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_uppercase_alternate_host_d3_script(self) -> None:
+        result = self.run_validator(
+            '<script src="https://Fastly.JSDelivr.NET/npm/d3@7/dist/d3.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_esm_run_bare_package_script(self) -> None:
+        """`esm.run` always resolves a package specifier to jsDelivr's latest
+        matching build, so every reference to it is mutable."""
+        result = self.run_validator('<script src="https://esm.run/d3" type="module"></script>')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_esm_run_exact_version_script(self) -> None:
+        result = self.run_validator(
+            '<script src="https://esm.run/katex@0.16.11/dist/contrib/copy-tex.min.js"'
+            ' type="module"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_esm_run_bare_specifier_inline_import(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            inline_runtime=SAFE_INLINE + ';import("https://esm.run/d3")',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("inline mutable jsDelivr", result.stderr)
+
+    def test_rejects_esm_run_scheme_relative_inline_string(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            inline_runtime=SAFE_INLINE + ';const url = "//esm.run/pixi.js@8"',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("inline mutable jsDelivr", result.stderr)
+
+    def test_rejects_esm_run_with_query_variant(self) -> None:
+        result = self.run_validator(
+            '<script src="https://esm.run/d3@7.9.0?bundle" type="module"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_gh_namespace_script(self) -> None:
+        """The `/gh/` namespace serves arbitrary GitHub refs and is outside
+        the reviewed `/npm/` namespace even on the canonical host."""
+        result = self.run_validator(
+            '<script src="https://cdn.jsdelivr.net/gh/jquery/jquery@main/dist/jquery.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_gh_namespace_with_exact_tag(self) -> None:
+        result = self.run_validator(
+            '<script src="https://cdn.jsdelivr.net/gh/katex/katex@0.16.11'
+            '/dist/contrib/copy-tex.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_wp_namespace_script(self) -> None:
+        result = self.run_validator(
+            '<script src="https://cdn.jsdelivr.net/wp/some-plugin/trunk/js/script.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_alternate_host_static_import_in_reachable_bundle(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra='import "https://fastly.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js";'
+            + SAFE_RUNTIME,
+            include_expected_runtime=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mutable jsDelivr", result.stderr)
+
+    def test_rejects_alternate_host_dynamic_import_in_reachable_bundle(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra='import("https://gcore.jsdelivr.net/npm/pixi.js@8");' + SAFE_RUNTIME,
+            include_expected_runtime=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mutable jsDelivr", result.stderr)
+
+    def test_rejects_alternate_host_dot_segment_escape(self) -> None:
+        result = self.run_validator(
+            '<script src="https://testingcf.jsdelivr.net/npm/katex@0.16.11'
+            '/%2e%2e/d3@7/dist/d3.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external script uses mutable jsDelivr", result.stderr)
+
+    def test_rejects_alternate_host_inline_string_reference(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            inline_runtime=SAFE_INLINE
+            + ';const url = "https://testingcf.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("inline mutable jsDelivr", result.stderr)
+
+    def test_accepts_canonical_host_reviewed_asset_alongside_other_origins(self) -> None:
+        """Non-jsDelivr third-party origins are not silently promoted into the
+        executable allowlist, and the reviewed canonical KaTeX script keeps
+        passing next to an unrelated preconnect hint."""
+        result = self.run_validator(
+            '<link rel="preconnect" href="https://cdnjs.cloudflare.com">'
+            '<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11'
+            '/dist/contrib/copy-tex.min.js"></script>'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    # ------------------------------------------------------------------
+    # Third-party stylesheet policy. External `<link rel="stylesheet">`
+    # hrefs are a real runtime load surface, so they carry their own exact
+    # allowlist instead of being implicitly out of scope.
+    # ------------------------------------------------------------------
+
+    def test_accepts_allowlisted_third_party_stylesheet(self) -> None:
+        result = self.run_validator(
+            '<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11'
+            '/dist/katex.min.css">'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_accepts_local_relative_stylesheet(self) -> None:
+        (self.public / "index.css").write_text("body{}", encoding="utf-8")
+        result = self.run_validator('<link rel="stylesheet" href="/onnx-genai/index.css">')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_unapproved_version_of_third_party_stylesheet(self) -> None:
+        result = self.run_validator(
+            '<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.10'
+            '/dist/katex.min.css">'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("third-party stylesheet is not allowlisted", result.stderr)
+
+    def test_rejects_alternate_host_third_party_stylesheet(self) -> None:
+        result = self.run_validator(
+            '<link rel="stylesheet" href="https://fastly.jsdelivr.net/npm/katex@0.16.11'
+            '/dist/katex.min.css">'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("third-party stylesheet is not allowlisted", result.stderr)
+
+    def test_rejects_unrelated_origin_third_party_stylesheet(self) -> None:
+        result = self.run_validator(
+            '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/katex/'
+            '0.16.11/katex.min.css">'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("third-party stylesheet is not allowlisted", result.stderr)
+
+    def test_rejects_scheme_relative_unapproved_stylesheet(self) -> None:
+        result = self.run_validator(
+            '<link rel="stylesheet" href="//esm.run/katex@0.16.11/dist/katex.min.css">'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("third-party stylesheet is not allowlisted", result.stderr)
+
+    # ------------------------------------------------------------------
+    # Loader lexical identity: vendor/import edges are keyed to the AST node
+    # of the binding actually in lexical scope at the call site, never to a
+    # function name. Minified bundles reuse short names across scopes.
+    # ------------------------------------------------------------------
+
+    def test_rejects_same_name_loader_defined_in_another_scope(self) -> None:
+        """Two `d` functions in distinct lexical scopes: only the one that is
+        never reachable has loader behavior, while the reachable calls go to a
+        same-name pass-through. Name-only credit would accept this."""
+        decoy_scope_loader = (
+            "function wrapper(){"
+            'function d(o){var s=document.createElement("script");'
+            's.src=o;s.type="module";document.head.appendChild(s);'
+            "}"
+            f'd("{D3_URL}");d("{PIXI_URL}");'
+            "}"
+            "function d(o){return o;}"
+            f'd("{D3_URL}");d("{PIXI_URL}");'
+        )
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra=decoy_scope_loader
+            + SEARCH_RUNTIME
+            + GRAPH_SURFACE_RUNTIME
+            + EXPLORER_RUNTIME,
+            include_expected_runtime=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"missing reachable Graph import edge to {D3_URL}", result.stderr)
+        self.assertIn(f"missing reachable Graph import edge to {PIXI_URL}", result.stderr)
+        self.assertIn("missing local ESM script-loader function", result.stderr)
+
+    def test_rejects_loader_name_shadowed_by_parameter_at_call_site(self) -> None:
+        """A real top-level loader `d` must not credit calls made to an
+        unrelated `d` parameter that shadows it in an inner scope."""
+        shadowed = (
+            'function d(o){var s=document.createElement("script");'
+            's.src=o;s.type="module";document.head.appendChild(s);}'
+            f'function run(d){{d("{D3_URL}");d("{PIXI_URL}");}}'
+            "run(function(o){return o;});"
+        )
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra=shadowed + SEARCH_RUNTIME + GRAPH_SURFACE_RUNTIME + EXPLORER_RUNTIME,
+            include_expected_runtime=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"missing reachable Graph import edge to {D3_URL}", result.stderr)
+        self.assertIn(f"missing reachable Graph import edge to {PIXI_URL}", result.stderr)
+
+    def test_rejects_same_name_loader_credit_from_dead_code(self) -> None:
+        """Unreachable calls to a same-name non-loader must not be reported
+        as dead evidence for the real loader either."""
+        dead_scope = (
+            "function wrapper(){"
+            'function d(o){var s=document.createElement("script");'
+            's.src=o;s.type="module";document.head.appendChild(s);'
+            "}return d;}"
+            "function d(o){return o;}"
+            f'if(false){{d("{D3_URL}");d("{PIXI_URL}");}}'
+        )
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra=dead_scope + SEARCH_RUNTIME + GRAPH_SURFACE_RUNTIME + EXPLORER_RUNTIME,
+            include_expected_runtime=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"missing reachable Graph import edge to {D3_URL}", result.stderr)
+        self.assertNotIn("only found in dead/unreachable code", result.stderr)
+
+    def test_accepts_scoped_loader_binding_invoked_in_its_own_scope(self) -> None:
+        """The positive counterpart: a loader declared inside an invoked
+        function, called through the binding that is lexically in scope."""
+        scoped_loader = (
+            "function init(){"
+            'function d(o){var s=document.createElement("script");'
+            's.src=o;s.type="module";document.head.appendChild(s);'
+            "}"
+            f'd("{D3_URL}");d("{PIXI_URL}");'
+            "}"
+            "init();"
+        )
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra=scoped_loader
+            + SEARCH_RUNTIME
+            + GRAPH_SURFACE_RUNTIME
+            + EXPLORER_RUNTIME,
+            include_expected_runtime=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_accepts_top_level_loader_with_unrelated_same_name_inner_function(self) -> None:
+        """The real production shape: a top-level loader plus an unrelated
+        same-name function in a nested scope must still validate."""
+        mixed = (
+            'function d(o){var s=document.createElement("script");'
+            's.src=o;s.type="module";document.head.appendChild(s);}'
+            "function other(){function d(x){return x;}return d(1);}"
+            f'd("{D3_URL}");d("{PIXI_URL}");other();'
+        )
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra=mixed + SEARCH_RUNTIME + GRAPH_SURFACE_RUNTIME + EXPLORER_RUNTIME,
+            include_expected_runtime=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    # ------------------------------------------------------------------
+    # Root landing semantics: `public/index.html` must be rendered content,
+    # not a permalink/alias redirect stub, and named pages must stay emitted
+    # and reachable.
+    # ------------------------------------------------------------------
+
+    LANDING_TITLE = "onnx-genai Knowledge Base"
+
+    def landing_head(
+        self,
+        title: str | None = None,
+        canonical: str | None = "/onnx-genai/",
+        extra_meta: str = "",
+    ) -> str:
+        head = "<!DOCTYPE html><html lang=\"en-us\"><head>"
+        head += f"<title>{self.LANDING_TITLE if title is None else title}</title>"
+        if canonical is not None:
+            head += f'<link rel="canonical" href="{canonical}">'
+        return head + extra_meta + "</head>"
+
+    def landing_body(self, article_text: str | None = None, links: str = "") -> str:
+        text = article_text if article_text is not None else "Knowledge base landing copy. " * 12
+        return (
+            '<body data-basepath="/onnx-genai">'
+            f"<article><h1>{self.LANDING_TITLE}</h1><p>{text}</p>{links}</article>"
+            "</body>"
+        )
+
+    def write_linked_page(self, name: str, with_body: bool = True) -> None:
+        content = (
+            '<body data-basepath="/onnx-genai"><article><p>Wiki conventions.</p></article></body>'
+            f"<script>{SAFE_INLINE}</script>"
+            if with_body
+            else '<meta http-equiv="refresh" content="0; url=./index">'
+        )
+        (self.public / name).write_text(content, encoding="utf-8")
+
+    def test_accepts_rendered_landing_page(self) -> None:
+        result = self.run_validator(
+            self.landing_body(),
+            head=self.landing_head(),
+            landing_title=self.LANDING_TITLE,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Landing audit:", result.stdout)
+
+    def test_accepts_relative_landing_canonical(self) -> None:
+        result = self.run_validator(
+            self.landing_body(),
+            head=self.landing_head(canonical="./"),
+            landing_title=self.LANDING_TITLE,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_meta_refresh_landing_stub(self) -> None:
+        """The `permalink: index` alias hack emits exactly this: a titled,
+        noindex meta-refresh document with no rendered body."""
+        stub = (
+            "<!DOCTYPE html><html lang=\"en-us\"><head><title>README</title>"
+            '<link rel="canonical" href="./README">'
+            '<meta name="robots" content="noindex">'
+            '<meta http-equiv="refresh" content="0; url=./README">'
+            "</head></html>"
+        )
+        result = self.run_validator(
+            "",
+            head=stub,
+            include_runtime_scripts=False,
+            inline_runtime=None,
+            landing_title=self.LANDING_TITLE,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("meta-refresh redirect stub", result.stderr)
+        self.assertIn("landing page is marked noindex", result.stderr)
+
+    def test_rejects_noindex_landing_page(self) -> None:
+        result = self.run_validator(
+            self.landing_body(),
+            head=self.landing_head(extra_meta='<meta name="robots" content="noindex, nofollow">'),
+            landing_title=self.LANDING_TITLE,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("landing page is marked noindex", result.stderr)
+
+    def test_rejects_landing_title_mismatch(self) -> None:
+        result = self.run_validator(
+            self.landing_body(),
+            head=self.landing_head(title="README"),
+            landing_title=self.LANDING_TITLE,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("landing title is 'README'", result.stderr)
+
+    def test_rejects_landing_without_rendered_article(self) -> None:
+        result = self.run_validator(
+            '<body data-basepath="/onnx-genai"><p>Knowledge base landing copy.</p></body>',
+            head=self.landing_head(),
+            landing_title=self.LANDING_TITLE,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no rendered article", result.stderr)
+
+    def test_rejects_landing_with_thin_article(self) -> None:
+        result = self.run_validator(
+            self.landing_body(article_text="Hi"),
+            head=self.landing_head(),
+            landing_title=self.LANDING_TITLE,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rendered character(s), expected at least", result.stderr)
+
+    def test_rejects_landing_canonical_pointing_at_another_page(self) -> None:
+        self.write_linked_page("README.html")
+        result = self.run_validator(
+            self.landing_body(links='<a href="/onnx-genai/README">README</a>'),
+            head=self.landing_head(canonical="/onnx-genai/README"),
+            landing_title=self.LANDING_TITLE,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("canonical URL is", result.stderr)
+
+    def test_rejects_landing_without_canonical(self) -> None:
+        result = self.run_validator(
+            self.landing_body(),
+            head=self.landing_head(canonical=None),
+            landing_title=self.LANDING_TITLE,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("declares no canonical URL", result.stderr)
+
+    def test_accepts_required_linked_page(self) -> None:
+        self.write_linked_page("README.html")
+        result = self.run_validator(
+            self.landing_body(links='<a href="/onnx-genai/README">Wiki conventions</a>'),
+            head=self.landing_head(),
+            landing_title=self.LANDING_TITLE,
+            required_pages=("README.html",),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_missing_required_page(self) -> None:
+        result = self.run_validator(
+            self.landing_body(),
+            head=self.landing_head(),
+            landing_title=self.LANDING_TITLE,
+            required_pages=("README.html",),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing required generated page: README.html", result.stderr)
+
+    def test_rejects_unlinked_required_page(self) -> None:
+        self.write_linked_page("README.html")
+        result = self.run_validator(
+            self.landing_body(),
+            head=self.landing_head(),
+            landing_title=self.LANDING_TITLE,
+            required_pages=("README.html",),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is not linked from any other page: README.html", result.stderr)
+
+    def test_rejects_required_page_without_body(self) -> None:
+        self.write_linked_page("README.html", with_body=False)
+        result = self.run_validator(
+            self.landing_body(links='<a href="/onnx-genai/README">Wiki conventions</a>'),
+            head=self.landing_head(),
+            landing_title=self.LANDING_TITLE,
+            required_pages=("README.html",),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("has no rendered body: README.html", result.stderr)
 
 
 if __name__ == "__main__":
