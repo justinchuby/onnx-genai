@@ -133,6 +133,41 @@ async fn chat(fixture: &FixtureDir, content: Value, max_tokens: usize) -> (Statu
     )
 }
 
+#[tokio::test]
+async fn pipeline_chat_ignores_client_session_header() {
+    let fixture = FixtureDir::new(128);
+    let state =
+        AppState::load(&fixture.0, Some("tiny-packed-vlm".to_string())).expect("load fixture");
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Session-Id", "opencode-session")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-packed-vlm",
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                image_part(data_uri([255, 0, 0])),
+                                {"type": "text", "text": "hello"}
+                            ]
+                        }],
+                        "max_tokens": 1,
+                        "temperature": 0.0
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("server response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 fn image_part(uri: String) -> Value {
     json!({"type": "image_url", "image_url": {"url": uri}})
 }

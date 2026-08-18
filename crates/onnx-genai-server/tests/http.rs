@@ -731,6 +731,51 @@ fn parser_converts_mistral_tool_call_array() {
 }
 
 #[test]
+fn parser_converts_atem_tool_call_blocks() {
+    let calls = parse_tool_calls(
+        r#"<atem:function_calls>
+<atem:invoke name="bash">
+<atem:parameter name="command">{"cmd":"printf ok"}</atem:parameter>
+<atem:parameter name="description">run a command</atem:parameter>
+</atem:invoke>
+</atem:function_calls>"#,
+    );
+
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "bash");
+    let arguments: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    assert_eq!(arguments["command"]["cmd"], "printf ok");
+    assert_eq!(arguments["description"], "run a command");
+}
+
+#[test]
+fn parser_returns_only_atem_user_channel_content() {
+    let parsed = parse_assistant_output(
+        "<|start|>assistant to=self<|message|>private reasoning<|eom|>\
+         <|start|>assistant to=user<|message|>final answer<|eot|>"
+            .to_string(),
+        "stop",
+    );
+
+    assert_eq!(parsed.content.as_deref(), Some("final answer"));
+    assert!(parsed.tool_calls.is_none());
+}
+
+// A turn truncated inside the private reasoning channel produced no answer, so
+// the client sees empty content rather than the model's reasoning.
+#[test]
+fn parser_withholds_atem_reasoning_without_a_user_channel() {
+    let parsed = parse_assistant_output(
+        "<|start|>assistant to=self<|message|>private reasoning that ran long".to_string(),
+        "length",
+    );
+
+    assert_eq!(parsed.content.as_deref(), Some(""));
+    assert!(parsed.tool_calls.is_none());
+    assert_eq!(parsed.finish_reason, "length");
+}
+
+#[test]
 fn parser_prefers_arguments_over_parameters() {
     let calls = parse_tool_calls(
         r#"<|python_tag|>{"name":"choose","arguments":{"source":"arguments"},"parameters":{"source":"parameters"}}"#,

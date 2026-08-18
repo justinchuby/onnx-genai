@@ -333,12 +333,13 @@ pub(crate) async fn chat_completions(
 ) -> Result<Response, ApiError> {
     let handle = resolve_model(&state.registry, &request.model).await?;
     validate_request(&request, &state.config)?;
-    let session_id = session_id_from_headers(&headers)?;
-    if handle.pipeline && session_id.is_some() {
-        return Err(ApiError::bad_request(
-            "X-Session-Id is not supported by pipeline models",
-        ));
-    }
+    let requested_session_id = session_id_from_headers(&headers)?;
+    // OpenAI-compatible clients such as OpenCode attach their own session key
+    // while still resending the complete message history. Pipeline engines
+    // already retain and rewind their one device-resident context internally,
+    // so ignore the transport hint instead of rejecting an otherwise valid
+    // stateless request.
+    let session_id = (!handle.pipeline).then_some(requested_session_id).flatten();
     let image_urls = request.image_urls();
     let input_audio = request.input_audio();
     // One admission policy, shared with the CLI, so both front ends accept and
@@ -469,7 +470,10 @@ async fn run_chat_completion(
             let logprobs = chat_logprobs(&result, &tokenizer, requested_top_logprobs)
                 .map_err(|err| ApiError::internal(format!("logprobs conversion failed: {err}")))?;
             let parsed = if tools_parseable_from_output(&request) {
-                parse_assistant_output(result.text, default_finish_reason)
+                parse_assistant_output(
+                    assistant_output_text(&result, &tokenizer),
+                    default_finish_reason,
+                )
             } else {
                 ParsedAssistantOutput {
                     content: Some(result.text),
@@ -506,6 +510,7 @@ async fn run_chat_completion(
                 content: content.map(ChatMessageContent::Text),
                 tool_calls,
                 tool_call_id: None,
+                name: None,
             },
             finish_reason,
             logprobs,
@@ -647,7 +652,7 @@ async fn stream_chat_completion(
             Ok(result) => {
                 if let Some(requested_top_logprobs) = requested_top_logprobs {
                     let tool_calls = if buffer_for_tool_detection {
-                        parse_tool_calls(&result.text)
+                        parse_tool_calls(&assistant_output_text(&result, &tokenizer))
                     } else {
                         Vec::new()
                     };
@@ -675,30 +680,31 @@ async fn stream_chat_completion(
                         send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
                     }
                 } else if buffer_for_tool_detection {
-                    if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
-                        buffered_text.push_str(&stop_buffer.flush());
-                    }
-                    let tool_calls = parse_tool_calls(&buffered_text);
-                    if tool_calls.is_empty() {
-                        if !buffered_text.is_empty() {
+                    let parsed = parse_assistant_output(
+                        assistant_output_text(&result, &tokenizer),
+                        finish_reason_label(&result.finish_reason),
+                    );
+                    if let Some(tool_calls) = parsed.tool_calls {
+                        send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
+                    } else {
+                        let content = parsed.content.unwrap_or_else(|| {
+                            if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
+                                buffered_text.push_str(&stop_buffer.flush());
+                            }
+                            buffered_text
+                        });
+                        if !content.is_empty() {
                             send_stream_chunk(
                                 &tx,
-                                content_chunk(&id, created, &model, buffered_text, None),
+                                content_chunk(&id, created, &model, content, None),
                             )
                             .await?;
                         }
                         send_stream_chunk(
                             &tx,
-                            done_chunk(
-                                &id,
-                                created,
-                                &model,
-                                finish_reason_label(&result.finish_reason),
-                            ),
+                            done_chunk(&id, created, &model, parsed.finish_reason),
                         )
                         .await?;
-                    } else {
-                        send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
                     }
                 } else if wants_constrained_json {
                     if !result.text.is_empty() {
@@ -1518,7 +1524,12 @@ fn chat_sampling_overrides(request: &ChatCompletionRequest) -> SamplingOverrides
         greedy,
         temperature: Some(request.temperature),
         top_p: Some(request.top_p),
-        top_k: Some(request.top_k),
+        // `top_k` is an extension the OpenAI schema never carries, and 0 is its
+        // "disabled" sentinel rather than a caller's choice. Treat an absent
+        // `top_k` as unspecified so a package that declares one keeps it,
+        // instead of every OpenAI client silently widening the model to the
+        // full vocabulary.
+        top_k: (request.top_k > 0).then_some(request.top_k),
     }
 }
 
@@ -1642,6 +1653,58 @@ fn build_session_prompt(messages: &[ChatMessage], image_placeholder: Option<&str
         .unwrap_or_default()
 }
 
+/// Translate one OpenAI chat message into the value a chat template renders.
+///
+/// Tool identity travels with the message because a tool-calling template names
+/// each result from the `name`, or resolves it from the `tool_call_id` against
+/// the assistant call it answers; dropping either renders an unnamed result.
+fn template_message(
+    message: &ChatMessage,
+    image_placeholder: Option<&str>,
+) -> anyhow::Result<TemplateChatMessage> {
+    let mut template_message = TemplateChatMessage::new(
+        message.role.as_str(),
+        message
+            .content
+            .as_ref()
+            .map(|content| content.render(image_placeholder))
+            .unwrap_or_default(),
+    )
+    .with_tool_result(message.name.clone(), message.tool_call_id.clone());
+    if let Some(tool_calls) = &message.tool_calls {
+        template_message = template_message.with_tool_calls(template_tool_calls(tool_calls)?);
+    }
+    Ok(template_message)
+}
+
+/// Assistant tool calls in the shape Hugging Face chat templates expect.
+///
+/// OpenAI carries `function.arguments` as a JSON *string*, while chat templates
+/// index it as a mapping (`args.items()`), and the jinja sandbox cannot parse a
+/// string back into one. So decode the arguments here, where the wire format is
+/// known, and leave anything that is not a JSON object as the original string
+/// rather than guessing at a shape the caller did not send.
+fn template_tool_calls(tool_calls: &[ChatMessageToolCall]) -> anyhow::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(tool_calls)?;
+    for call in value.as_array_mut().into_iter().flatten() {
+        let Some(arguments) = call
+            .pointer("/function/arguments")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let Ok(decoded @ serde_json::Value::Object(_)) =
+            serde_json::from_str::<serde_json::Value>(arguments)
+        else {
+            continue;
+        };
+        if let Some(slot) = call.pointer_mut("/function/arguments") {
+            *slot = decoded;
+        }
+    }
+    Ok(value)
+}
+
 fn render_prompt(
     request: &ChatCompletionRequest,
     chat_template: Option<&ChatTemplate>,
@@ -1651,27 +1714,18 @@ fn render_prompt(
         let messages = request
             .messages
             .iter()
-            .map(|message| {
-                let mut template_message = TemplateChatMessage::new(
-                    message.role.as_str(),
-                    message
-                        .content
-                        .as_ref()
-                        .map(|content| content.render(image_placeholder))
-                        .unwrap_or_default(),
-                );
-                if let Some(tool_calls) = &message.tool_calls {
-                    template_message =
-                        template_message.with_tool_calls(serde_json::to_value(tool_calls)?);
-                }
-                Ok(template_message)
-            })
+            .map(|message| template_message(message, image_placeholder))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let tools_json = tools_offered_to_model(request)
             .map(serde_json::to_string)
             .transpose()?;
         return chat_template
-            .render(&messages, tools_json.as_deref(), true)
+            .render_with_reasoning_effort(
+                &messages,
+                tools_json.as_deref(),
+                true,
+                request.reasoning_effort.map(ReasoningEffort::as_str),
+            )
             .map_err(|err| anyhow::anyhow!("chat template render failed: {err}"));
     }
     Ok(build_prompt(request))
@@ -1729,9 +1783,11 @@ fn tool_choice_prompt(tool_choice: &ToolChoice) -> String {
 }
 
 pub fn parse_tool_calls(output: &str) -> Vec<ChatMessageToolCall> {
-    // Model families do not normally mix formats. When they do, use Qwen,
-    // Llama, then Mistral order so generated call IDs remain deterministic.
-    let parsed_calls = extract_qwen_tool_calls(output)
+    // Model families do not normally mix formats. When they do, use ATEM,
+    // Qwen, Llama, then Mistral order so generated call IDs remain deterministic.
+    let parsed_calls = extract_atem_tool_calls(output)
+        .into_iter()
+        .chain(extract_qwen_tool_calls(output))
         .into_iter()
         .chain(extract_llama_tool_calls(output))
         .chain(extract_mistral_tool_calls(output));
@@ -1742,6 +1798,64 @@ pub fn parse_tool_calls(output: &str) -> Vec<ChatMessageToolCall> {
         }
     }
     calls
+}
+
+fn extract_atem_tool_calls(output: &str) -> Vec<serde_json::Value> {
+    const INVOKE: &str = "<atem:invoke";
+    const INVOKE_CLOSE: &str = "</atem:invoke>";
+    const PARAMETER: &str = "<atem:parameter";
+    const PARAMETER_CLOSE: &str = "</atem:parameter>";
+
+    let mut calls = Vec::new();
+    let mut rest = output;
+    while let Some(start) = rest.find(INVOKE) {
+        rest = &rest[start + INVOKE.len()..];
+        let Some(tag_end) = rest.find('>') else {
+            break;
+        };
+        let Some(name) = tag_attribute(&rest[..tag_end], "name") else {
+            rest = &rest[tag_end + 1..];
+            continue;
+        };
+        rest = &rest[tag_end + 1..];
+        let Some(invoke_end) = rest.find(INVOKE_CLOSE) else {
+            break;
+        };
+        let body = &rest[..invoke_end];
+        let mut arguments = serde_json::Map::new();
+        let mut parameters = body;
+        while let Some(parameter_start) = parameters.find(PARAMETER) {
+            parameters = &parameters[parameter_start + PARAMETER.len()..];
+            let Some(parameter_tag_end) = parameters.find('>') else {
+                break;
+            };
+            let Some(key) = tag_attribute(&parameters[..parameter_tag_end], "name") else {
+                parameters = &parameters[parameter_tag_end + 1..];
+                continue;
+            };
+            parameters = &parameters[parameter_tag_end + 1..];
+            let Some(parameter_end) = parameters.find(PARAMETER_CLOSE) else {
+                break;
+            };
+            let raw_value = &parameters[..parameter_end];
+            let value = serde_json::from_str(raw_value.trim())
+                .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()));
+            arguments.insert(key, value);
+            parameters = &parameters[parameter_end + PARAMETER_CLOSE.len()..];
+        }
+        calls.push(serde_json::json!({
+            "name": name,
+            "arguments": arguments,
+        }));
+        rest = &rest[invoke_end + INVOKE_CLOSE.len()..];
+    }
+    calls
+}
+
+fn tag_attribute(tag: &str, attribute: &str) -> Option<String> {
+    let marker = format!("{attribute}=\"");
+    let value = tag.split_once(&marker)?.1;
+    Some(value.split_once('"')?.0.to_string())
 }
 
 fn extract_qwen_tool_calls(output: &str) -> Vec<serde_json::Value> {
@@ -1825,7 +1939,7 @@ pub fn parse_assistant_output(
     let tool_calls = parse_tool_calls(&output);
     if tool_calls.is_empty() {
         ParsedAssistantOutput {
-            content: Some(output),
+            content: Some(atem_visible_content(&output).unwrap_or(output)),
             tool_calls: None,
             finish_reason: default_finish_reason,
         }
@@ -1835,6 +1949,44 @@ pub fn parse_assistant_output(
             tool_calls: Some(tool_calls),
             finish_reason: "tool_calls",
         }
+    }
+}
+
+/// Private ATEM reasoning channel, which a client must never be shown.
+const ATEM_REASONING_CHANNEL: &str = "to=self<|message|>";
+/// The ATEM channel addressed to the caller, i.e. the visible answer.
+const ATEM_USER_CHANNEL: &str = "to=user<|message|>";
+
+/// The part of an ATEM turn a client may see, or `None` for output that carries
+/// no ATEM channel at all.
+///
+/// A turn is a sequence of addressed channels, and only the one addressed to the
+/// user is an answer. A turn that ends before reaching it — truncated by the
+/// token budget, say — therefore produced no answer, and yields empty content
+/// rather than leaking the model's private reasoning as if it were one.
+fn atem_visible_content(output: &str) -> Option<String> {
+    if let Some((_, answer)) = output.rsplit_once(ATEM_USER_CHANNEL) {
+        let end = ["<|eot|>", "<|eom|>"]
+            .into_iter()
+            .filter_map(|marker| answer.find(marker))
+            .min()
+            .unwrap_or(answer.len());
+        return Some(answer[..end].to_string());
+    }
+    output.contains(ATEM_REASONING_CHANNEL).then(String::new)
+}
+
+fn assistant_output_text(result: &GenerateResult, tokenizer: &Tokenizer) -> String {
+    let Ok(with_special_tokens) = tokenizer.decode_with_special_tokens(&result.token_ids) else {
+        return result.text.clone();
+    };
+    if with_special_tokens.contains(ATEM_USER_CHANNEL)
+        || with_special_tokens.contains(ATEM_REASONING_CHANNEL)
+        || with_special_tokens.contains("<atem:invoke")
+    {
+        with_special_tokens
+    } else {
+        result.text.clone()
     }
 }
 
@@ -2105,6 +2257,86 @@ fn text_completion_id() -> String {
 }
 
 #[cfg(test)]
+mod prompt_rendering_tests {
+    use super::*;
+    use serde_json::json;
+
+    // A tool result reaches the template with the identity the caller sent, so
+    // a tool-calling template can name the function it answers.
+    #[test]
+    fn tool_result_identity_reaches_the_template() {
+        let message: ChatMessage = serde_json::from_value(json!({
+            "role": "tool",
+            "content": "42",
+            "tool_call_id": "call_0",
+            "name": "get_weather"
+        }))
+        .unwrap();
+
+        let rendered = template_message(&message, None).unwrap();
+
+        assert_eq!(rendered.name.as_deref(), Some("get_weather"));
+        assert_eq!(rendered.tool_call_id.as_deref(), Some("call_0"));
+    }
+
+    // Chat templates index `function.arguments` as a mapping, so the JSON
+    // string OpenAI puts on the wire is decoded before rendering.
+    #[test]
+    fn assistant_tool_call_arguments_render_as_a_mapping() {
+        let message: ChatMessage = serde_json::from_value(json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_0",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}
+            }, {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "echo", "arguments": "not json"}
+            }]
+        }))
+        .unwrap();
+
+        let rendered = template_message(&message, None).unwrap();
+        let calls = rendered.tool_calls.expect("tool calls");
+
+        assert_eq!(calls[0]["function"]["arguments"]["command"], "ls");
+        assert_eq!(calls[1]["function"]["arguments"], "not json");
+    }
+
+    // A reasoning model's template reads the caller's effort; without it the
+    // template stays on its own default, which is often maximal.
+    #[test]
+    fn reasoning_effort_reaches_the_template() {
+        let template = ChatTemplate::from_source(
+            "{{ reasoning_strength if reasoning_strength is defined and reasoning_strength else 'default' }}",
+        );
+        let request = |extra: serde_json::Value| -> ChatCompletionRequest {
+            let mut body = json!({ "model": "m", "messages": [{"role": "user", "content": "hi"}] });
+            let object = body.as_object_mut().unwrap();
+            for (key, value) in extra.as_object().unwrap() {
+                object.insert(key.clone(), value.clone());
+            }
+            serde_json::from_value(body).unwrap()
+        };
+
+        assert_eq!(
+            render_prompt(
+                &request(json!({ "reasoning_effort": "low" })),
+                Some(&template),
+                None
+            )
+            .unwrap(),
+            "low"
+        );
+        assert_eq!(
+            render_prompt(&request(json!({})), Some(&template), None).unwrap(),
+            "default"
+        );
+    }
+}
+
+#[cfg(test)]
 mod sampling_resolution_tests {
     use super::*;
     use serde_json::json;
@@ -2124,6 +2356,13 @@ mod sampling_resolution_tests {
             no_repeat_ngram_size: None,
             diversity_penalty: None,
             early_stopping: None,
+        }
+    }
+
+    fn declared_top_k(top_k: usize) -> GenerationDefaults {
+        GenerationDefaults {
+            top_k: Some(top_k),
+            ..declared(Some(true), None)
         }
     }
 
@@ -2172,6 +2411,27 @@ mod sampling_resolution_tests {
             &chat_sampling_overrides(&cold),
         );
         assert!(options.greedy, "temperature 0 forces greedy over the model");
+    }
+
+    // `top_k` is absent from the OpenAI schema, so a client that never mentions
+    // it must not disable a model's declared top_k with the 0 sentinel.
+    #[test]
+    fn silent_chat_request_keeps_model_top_k() {
+        let request = chat_request(json!({}));
+        let mut options = build_generate_options(&request);
+        options.resolve_sampling_defaults(
+            Some(&declared_top_k(64)),
+            &chat_sampling_overrides(&request),
+        );
+        assert_eq!(options.top_k, 64, "a silent request keeps declared top_k");
+
+        let explicit = chat_request(json!({ "top_k": 5 }));
+        let mut options = build_generate_options(&explicit);
+        options.resolve_sampling_defaults(
+            Some(&declared_top_k(64)),
+            &chat_sampling_overrides(&explicit),
+        );
+        assert_eq!(options.top_k, 5, "an explicit top_k still wins");
     }
 
     // A silent completion request likewise adopts the model's declared regime.

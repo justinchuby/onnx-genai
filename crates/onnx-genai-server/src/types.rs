@@ -134,6 +134,10 @@ pub struct ChatCompletionRequest {
     pub logprobs: bool,
     #[serde(default)]
     pub top_logprobs: Option<usize>,
+    /// How much a reasoning model should think before answering; `None` leaves
+    /// the model's chat template on its own default.
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,6 +164,32 @@ pub struct CompletionRequest {
     pub stop: Option<StopInput>,
     #[serde(default)]
     pub logprobs: Option<usize>,
+}
+
+/// How much a reasoning model should think before answering, in OpenAI's
+/// `reasoning_effort` vocabulary.
+///
+/// A closed set rather than a free string so an unsupported spelling is
+/// rejected with the accepted values instead of silently leaving the model on
+/// its own default, which for a reasoning model is often maximal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 impl ChatCompletionRequest {
@@ -211,6 +241,10 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ChatMessageToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// OpenAI's optional message `name`; on a `tool` message it names the
+    /// function that produced the result, which tool templates render.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
