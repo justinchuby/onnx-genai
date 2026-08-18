@@ -8399,6 +8399,85 @@ impl MatMulNBitsKernel {
             return Ok(());
         }
         if m > 1 {
+            // Small-batch decode fast path (mirrors the plain-GEMV loop in
+            // `run_f16`): for M within the crossover window, loop the capture-safe
+            // M==1 fused gate/up SwiGLU GEMV once per row instead of the tiled
+            // prefill GEMM. Each row is computed byte-identically to a
+            // single-sequence (M==1) fused SwiGLU decode of that row, and every
+            // per-row launch is static-grid, allocation- and sync-free, so the
+            // batch decode graph captures it as part of the whole-subgraph capture
+            // instead of fragmenting into an eager seam. This is the node that
+            // otherwise leaves batch-N (M>=2) decode capturing as many segments as
+            // there are MLP layers, whose per-step eager replay dominates the
+            // M>=2 step cost. Streaming is unaffected: the resident gate/up weight
+            // is read M times from VRAM, not re-streamed (HtoD 1/N amortization
+            // intact).
+            if m <= decode_gemv_loop_max_m() {
+                onnx_runtime_ep_api::record_kernel_variant!(
+                    "gate_up_swiglu_batched_loop",
+                    "M={} small-batch decode: {} single-row fused gate/up SwiGLU GEMV launches \
+                     (one per row), each byte-identical to M==1 decode; keeps the batch decode \
+                     graph a single captured subgraph instead of a per-MLP-layer eager seam",
+                    m,
+                    m
+                );
+                self.last_call_capture_safe.store(true, Ordering::Relaxed);
+                let a_base = inputs[0].data_ptr::<u8>();
+                let y_base = outputs[0].data_ptr_mut::<u8>();
+                let a_row_shape = [1usize, self.k];
+                let a_row_strides = [self.k as i64, 1];
+                let y_row_shape = [1usize, self.n];
+                let y_row_strides = [self.n as i64, 1];
+                let a_row_bytes = self.k * 2; // fp16 activation
+                let y_row_bytes = self.n * 2; // fp16 output
+                for row in 0..m {
+                    let a_row = TensorView::new(
+                        DevicePtr(a_base.wrapping_add(row * a_row_bytes) as *const c_void),
+                        DataType::Float16,
+                        &a_row_shape,
+                        &a_row_strides,
+                        inputs[0].device,
+                    );
+                    let mut y_row = TensorMut::new(
+                        DevicePtrMut(y_base.wrapping_add(row * y_row_bytes) as *mut c_void),
+                        DataType::Float16,
+                        &y_row_shape,
+                        &y_row_strides,
+                        outputs[0].device,
+                    );
+                    if let Some(gamma) = gamma {
+                        self.launch_gate_up_swiglu_rmsnorm(
+                            &a_row,
+                            &inputs[1],
+                            &inputs[2],
+                            &inputs[3],
+                            &inputs[4],
+                            zp_gate,
+                            zp_up,
+                            gamma,
+                            &mut y_row,
+                            k_blocks,
+                            blob_size,
+                            zp_row_bytes,
+                        )?;
+                    } else {
+                        self.launch_gate_up_swiglu(
+                            &a_row,
+                            &inputs[1],
+                            &inputs[2],
+                            &inputs[3],
+                            &inputs[4],
+                            zp_gate,
+                            zp_up,
+                            &mut y_row,
+                            k_blocks,
+                            blob_size,
+                            zp_row_bytes,
+                        )?;
+                    }
+                }
+                return Ok(());
+            }
             self.last_call_capture_safe.store(false, Ordering::Relaxed);
             // Opt-in Marlin int4 tensor-core path for the paired gate/up MLP:
             // both projections run on tensor cores, then the same fp16 SiluMul
