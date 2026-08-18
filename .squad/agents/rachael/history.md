@@ -50,3 +50,44 @@ All five red CI jobs trace to pre-existing `onnx-genai-server` failure on `main`
 - 4 new tests (android, build_wasm, build_wasm_static_lib, rv64). Test count: 13→17.
 - Documented Catalyst/macabi CMake limitation: `PLATFORM_NAME` comes from external toolchain, no reliable direct-CMake detection.
 - Commit: `184f76a00e`. PR left in draft for Opus review.
+
+## 2026-08-17T16:25Z — PR #1134 GEMV streaming review approved
+
+- Approved `squad/gemv-streaming @ b6a5648c` after verifying the prefetch pipeline preserves lane/depth mapping, fp16 accumulation order, zp/no-zp behavior, dispatch guard safety, and leaves argmax tie-break untouched.
+- Reran targeted CUDA validation: bit-identity test 1/1 and GEMV suite 11/11.
+- Outcome: correctness/numerics gate green; PR #1134 merged.
+
+## 2026-08-17T17:10Z — Review: gateup-vec SwiGLU bias-fold (PR #1137), 🟢 APPROVE default-ON
+
+- Reviewed `e54cae31` (`matmul_nbits.rs` only). Verdict 🟢 APPROVE; default-ON SAFE.
+- Verified the magic-bias fold is exact, not approximate: independently checked all nibble codes 0..15 in fp16 — folded `x-1032` / `fma x*(1/16) -72` produce identical raw fp16 bits to scalar `code-8`. Constants exact fp16 (`0x6408`, `0xd480`, `1/16=0x2c00`).
+- Confirmed accumulation order, lane→nibble mapping, RMS prologue, SwiGLU epilogue, and argmax/tie-break unchanged; `_vec` dispatch is symmetric-only and asymmetric `_zp` routes to existing kernels. Reran targeted CUDA tests on idle GPU0: bit-identity test 1/1, `gate_up` suite 10 passed.
+- Non-blocking: unit-test comment overstates M>1 as `_vec` coverage (M>1 → prefill/Marlin). Wording noise, not a blocker. Merged as `70cc06ad`.
+
+## 2026-08-17T18:05Z — Review: gateup-occ occupancy-raise (PR #1139), 🟢 APPROVE default-ON
+
+- Reviewed `squad/gateup-rms-stage @ 11a01fae` (`matmul_nbits.rs` only, author Luv). Verdict 🟢 APPROVE; default-ON SAFE.
+- Key: `_vec_occ` wrapper bodies are character-for-character identical to their `_vec` parents after the signature — same `matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<false,{decomposed},true>(...)` instantiation, same args; only source diff is `__launch_bounds__(256, 8)` + symbol name. No math/reduction/accumulation-order change; body uses explicit fp16 FMA / fixed source-order reductions (not contraction-sensitive), so launch_bounds is storage placement only.
+- Dispatch symmetric-only (`occ = !has_zp && gate_up_occ_enabled()`); `_zp` inputs select the existing asymmetric kernel first. Argmax/tie-break untouched. Reran on idle GPU0: bit-identity test 1/1; `gate_up` suite 10 passed, 3 ignored.
+- Non-blocking: `_vec_occ` only on RMS-fused decode path → broad test comment slightly overstates coverage (genuinely exercised for eligible M=1 RMS; no-op for non-RMS / M>1). Luv tightened the wording in the default-ON flip. Merged as `0636a759`.
+
+## 2026-08-17T18:40Z — Review: gateup-preperm byte-identical, shelved on perf
+
+- Reviewed `squad/gateup-preperm @ 6629f0aa`; 🟢 APPROVE on byte-identity because hoisted staging supplies exactly the old post-permute bits, preserving RMS reduction, fp16 FMA accumulation order, symmetric-RMS-only dispatch, and argmax behavior. Wallace safety was GREEN, but perf was NO-GO, so coordinator shelved/not merged.
+## 2026-08-18T00:35Z — V2-Lite planner/oracle gates closed
+
+- Issued the initial 🔴 on the silent DeepSeek-V2-Lite golden move, then 🟢 accepted the oracle-policy reframe with four conditions, then 🟢 approved the final combined planner + QMoE oracle artifact.
+- Established precedent: int4 GEMV/QMoE CPU bit-identity is not the oracle when CPU and CUDA use different f32 accumulation orders; use f64-bounded evidence plus deterministic backend output and explicit golden rationale.
+- Final merge: PR #1150 landed on `main` at squash `e075a715`; reviewer lockout was honored throughout.
+
+
+## 2026-08-18T03:15Z — QMoE/classifier/planner review gates closed
+
+- Approved Luv's default-OFF QMoE occupancy lever (#1167) with a non-blocking scope caveat.
+- Rejected Deckard's first V2-Lite mask classifier for two safety blockers and enforced reviewer lockout; re-approved Wallace's tightened revision after present-KV and root graph-output negative tests.
+- Approved Leon's `_d1` additive-mask query-axis workspace-planner fix (#1181) as exact and fail-closed; Wallace's hardware A/B then closed the DeepSeek MoE performance mandate at 1.79× capture/eager with 0.000% divergence.
+## 2026-08-18T04:15Z — Review gate approved Engine long-context workspace fix (#1189)
+
+- Approved PR #1189 after checking the capacity-growth gate, persistent-binding reprepare, and all reachable single-token Engine decode placements.
+- Verdict: 🟢 APPROVE; steady-state decode is not disturbed because the new reprepare path is a no-op unless `ensure_capacity` reports growth.
+- The reviewed evidence supports Leon's real V2-Lite A/B: eager/capture streams token-identical through the long-context bucket transition.

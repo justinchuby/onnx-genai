@@ -1,7 +1,9 @@
 //! `QLinearMatMul`: integer matrix multiplication with linear quantization.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Dim, Node, Shape, broadcast_shapes, compute_contiguous_strides};
+use onnx_runtime_ir::{
+    DataType, Dim, Graph, Node, Shape, broadcast_shapes, compute_contiguous_strides,
+};
 use rayon::prelude::*;
 
 use super::{check_arity, to_dense_bytes, write_dense_bytes};
@@ -40,14 +42,52 @@ fn dense_bytes<'a>(view: &TensorView<'a>) -> Result<Cow<'a, [u8]>> {
     to_dense_bytes(view).map(Cow::Owned)
 }
 
-/// Largest accumulator a thread keeps between calls, in bytes.
+/// Largest accumulator a single thread keeps between calls, in bytes.
 ///
 /// 32 MiB covers every accumulator up to an 8M-element result -- a 2048x4096
 /// output and everything smaller -- which is the range where the per-call
 /// allocation actually hurts. Anything larger is released rather than parked on
 /// a thread for the life of the process: at that size the GEMM itself dwarfs
 /// the allocation, so retaining it would trade real memory for nothing.
+///
+/// This is a **per-thread** figure. The buffer is parked on every worker thread
+/// that ever runs the kernel, so the naive process-wide exposure would be
+/// `MAX_RETAINED_ACCUMULATOR_BYTES x threads` -- 1 GiB on a 32-vCPU box, 4 GiB
+/// on a 128-vCPU server. That multiplier (the thread count) is precisely the
+/// variable the reuse optimisation scales with, so it must not be left out of
+/// the ceiling. See [`MAX_PROCESS_ACCUMULATOR_BYTES`].
 const MAX_RETAINED_ACCUMULATOR_BYTES: usize = 32 << 20;
+
+/// Hard ceiling on the accumulator scratch summed across **all** worker
+/// threads.
+///
+/// The per-thread cap above bounds one buffer; this bounds the sum, so the
+/// process-wide exposure is `min(128 MiB, 32 MiB x threads)` -- a flat 128 MiB
+/// once four or more threads park a full buffer, and it does *not* grow with the
+/// vCPU count. Arithmetic, stated explicitly rather than left implicit:
+///
+/// * 4-vCPU box:  4 x 32 MiB = 128 MiB (at the cap)
+/// * 20-vCPU box: min(128 MiB, 640 MiB) = **128 MiB** (was 640 MiB)
+/// * 32-vCPU box: min(128 MiB, 1 GiB)   = **128 MiB** (was 1 GiB)
+/// * 128-vCPU box: min(128 MiB, 4 GiB)  = **128 MiB** (was 4 GiB)
+///
+/// Threads beyond the fourth that want to park a full 32 MiB buffer are refused
+/// and recompute the buffer per call (byte-identical output, only slower). 128
+/// MiB of transient integer-GEMM scratch is defensible independent of model
+/// size and vCPU count, which is the property the per-thread-only bound lacked.
+const MAX_PROCESS_ACCUMULATOR_BYTES: usize = 128 << 20;
+
+/// Process-wide, declinable budget governing the parked accumulator scratch
+/// across every worker thread (#1056). `live_bytes()` reports the sum actually
+/// parked, so a wrong ceiling is detectable in one run rather than argued from a
+/// formula -- and a single-thread test cannot move it past one buffer, which is
+/// why the test that defends it drives multiple threads.
+pub(crate) static ACCUMULATOR_BUDGET:
+    crate::kernels::governed_accumulator_budget::GovernedAccumulatorBudget =
+    crate::kernels::governed_accumulator_budget::GovernedAccumulatorBudget::new(
+        MAX_RETAINED_ACCUMULATOR_BYTES as u64,
+        MAX_PROCESS_ACCUMULATOR_BYTES as u64,
+    );
 
 thread_local! {
     /// Per-thread scratch for the `i32` accumulator that the integer GEMM writes
@@ -64,8 +104,169 @@ thread_local! {
     /// Thread-local rather than shared: `execute` takes `&self` and the executor
     /// may run the same kernel on several threads at once, so a shared buffer would
     /// need a lock that serialises exactly the calls this exists to speed up.
+    /// Retention is still bounded process-wide, not just per thread: parking is
+    /// admitted through [`ACCUMULATOR_BUDGET`], which caps the sum across all
+    /// threads (see [`MAX_PROCESS_ACCUMULATOR_BYTES`]).
     static ACCUMULATOR: std::cell::RefCell<Vec<i32>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Tell the CPU EP whether the memory plan admitted the process-wide
+/// accumulator scratch budget (#1056). When declined, the kernel parks nothing
+/// and reallocates the `i32` accumulator per call -- byte-identical output, only
+/// slower -- instead of retaining up to [`MAX_PROCESS_ACCUMULATOR_BYTES`] across
+/// the worker pool for the life of the process.
+pub fn set_qlinear_accumulator_budget_admitted(admitted: bool) {
+    ACCUMULATOR_BUDGET.set_admitted(admitted);
+}
+
+/// Bytes the parked accumulator scratch currently holds, summed across every
+/// worker thread. This is the figure a predicted ceiling is checked against
+/// (#1056); a single-thread run cannot move it past one buffer.
+pub fn qlinear_accumulator_live_bytes() -> u64 {
+    ACCUMULATOR_BUDGET.live_bytes()
+}
+
+/// Retune the process-wide accumulator scratch ceiling. Exposed for deployment
+/// tuning and for the RSS measurement harness, which contrasts the bounded
+/// ceiling against the pre-fix per-thread-only behaviour (`u64::MAX`).
+pub fn set_qlinear_accumulator_process_cap_bytes(bytes: u64) {
+    ACCUMULATOR_BUDGET.set_process_cap_bytes(bytes);
+}
+
+/// The process-wide accumulator scratch ceiling currently in force.
+pub fn qlinear_accumulator_process_cap_bytes() -> u64 {
+    ACCUMULATOR_BUDGET.process_cap_bytes()
+}
+
+/// Predicted resident bytes the accumulator scratch budget will hold for
+/// `graph`, for the memory plan to fold into its resident total.
+///
+/// The budget is a **fixed** process-wide pool ([`MAX_PROCESS_ACCUMULATOR_BYTES`]),
+/// not a per-weight cache, so its ceiling does not scale with the number of
+/// `QLinearMatMul` nodes: one node that reaches the parking path can fill the
+/// whole pool across the thread count, and more nodes share the same pool. The
+/// prediction is therefore the flat process cap when the graph contains any
+/// `QLinearMatMul`, and zero otherwise (a model with none never parks). This is
+/// the honest ceiling -- the process exposure, not a per-buffer figure silent
+/// about the thread multiplier.
+pub fn qlinear_accumulator_budget_predicted_bytes(graph: &Graph) -> u64 {
+    let has_qlinear_matmul = graph
+        .nodes
+        .values()
+        .any(|node| node.is_default_domain() && node.op_type == "QLinearMatMul");
+    if has_qlinear_matmul {
+        MAX_PROCESS_ACCUMULATOR_BYTES as u64
+    } else {
+        0
+    }
+}
+
+/// Whether the constant-`B` pre-pack is admitted. Stored inverted so an unset
+/// process (the atomic's `false` default meaning "not disabled") keeps the fast
+/// packed route, matching the sibling `set_mlas_sqnbit_packing_enabled` gate.
+static QLINEAR_PACKED_B_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Tell the CPU EP whether the memory plan admitted the constant-`B` MLAS
+/// pre-pack (#1056). The pre-pack is a session-lifetime, weight-scaled buffer
+/// (`packed_b`); it merged ungoverned in `ac394fd6`. When declined, the kernel
+/// densifies `B` and takes the unpacked GEMM per call -- byte-identical output,
+/// only slower -- and retains no packed copy. Available regardless of the
+/// `mlas` feature so the engine can wire it unconditionally; without `mlas`
+/// there is no packing and the flag is inert.
+pub fn set_qlinear_packed_b_enabled(enabled: bool) {
+    QLINEAR_PACKED_B_DISABLED.store(!enabled, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(feature = "mlas")]
+fn qlinear_packed_b_enabled() -> bool {
+    !QLINEAR_PACKED_B_DISABLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Heap bytes the constant-`B` pre-packs currently hold across all kernels --
+/// the figure the [`qlinear_packed_b_predicted_bytes`] prediction is checked
+/// against (#1056). Zero without the `mlas` feature (nothing is ever packed).
+pub fn qlinear_packed_b_live_bytes() -> u64 {
+    #[cfg(feature = "mlas")]
+    {
+        mlas_sys::qgemm_packed_live_bytes() as u64
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        0
+    }
+}
+
+/// How many times a shape-keyed kernel cache materializes each `packed_b`.
+///
+/// The executor's kernel cache is keyed by `(node, resolved_input_shapes)`, so
+/// an autoregressive decoder compiles a `QLinearMatMul` node once for the
+/// prefill shape (`m > 1`) and once for the decode shape (`m == 1`), each a
+/// separate `QLinearMatMulKernel` holding its own `packed_b`. Both pack the same
+/// constant `B`, so the session holds two packed copies, not one -- the same
+/// shape-keyed multiplier #1051 corrected for the MLAS SQNBit buffer. Counting
+/// one copy would under-report by 2x, the dangerous direction for an admission
+/// gate; a prefill-only run holds one copy, so this over-estimates there, which
+/// only makes the gate decline sooner (safe).
+#[cfg(feature = "mlas")]
+const QLINEAR_PACKED_B_DECODE_INSTANTIATIONS: u64 = 2;
+
+/// Predicted resident bytes the constant-`B` pre-packs will hold for `graph`,
+/// for the memory plan to fold into its resident total (#1056).
+///
+/// For each `QLinearMatMul` whose `B` (input index 3) is a rank-2 constant
+/// initializer, this is the exact MLAS packed size for that `k x n` weight times
+/// [`QLINEAR_PACKED_B_DECODE_INSTANTIATIONS`]. `A`'s signedness is not a
+/// graph-static property (it is an activation), so the size is taken as the max
+/// over both `a_signed` possibilities -- the over-predicting (safe) direction.
+/// Zero without the `mlas` feature, where nothing is ever packed.
+pub fn qlinear_packed_b_predicted_bytes(graph: &Graph) -> u64 {
+    #[cfg(not(feature = "mlas"))]
+    {
+        let _ = graph;
+        0
+    }
+    #[cfg(feature = "mlas")]
+    {
+        let mut total = 0_u64;
+        for node in graph.nodes.values() {
+            total = total.saturating_add(node_qlinear_packed_b_bytes(node, graph));
+        }
+        total
+    }
+}
+
+/// Per-node contribution to [`qlinear_packed_b_predicted_bytes`]. Mirrors the
+/// packing condition in [`QLinearMatMulKernel::pack_key`]: a constant, rank-2
+/// `B`. The batched-`B` decline is not visible from a rank-2 initializer, so it
+/// need not be re-checked here.
+#[cfg(feature = "mlas")]
+fn node_qlinear_packed_b_bytes(node: &Node, graph: &Graph) -> u64 {
+    if !node.is_default_domain() || node.op_type != "QLinearMatMul" {
+        return 0;
+    }
+    let Some(Some(b_value)) = node.inputs.get(3).copied() else {
+        return 0;
+    };
+    let Some(weight) = graph.initializers.get(&b_value) else {
+        return 0;
+    };
+    let dims = weight.dims();
+    if dims.len() != 2 {
+        return 0;
+    }
+    let (k, n) = (dims[0], dims[1]);
+    let b_signed = weight.dtype() == DataType::Int8;
+    // A is an activation, so its signedness is unknown here; the packed size can
+    // differ with it, so take the larger of the two -- the safe (over-predicting)
+    // direction per #1056.
+    let packed = [false, true]
+        .into_iter()
+        .filter_map(|a_signed| mlas_sys::qgemm_pack_b_size(n, k, a_signed, b_signed))
+        .max()
+        .unwrap_or(0) as u64;
+    packed.saturating_mul(QLINEAR_PACKED_B_DECODE_INSTANTIATIONS)
 }
 
 #[cfg(test)]
@@ -167,7 +368,9 @@ impl QLinearMatMulKernel {
     /// not be packed at all.
     ///
     /// Declines for a non-constant `B`, and for a batched `B` where each batch
-    /// is a different weight and one pack could not serve them.
+    /// is a different weight and one pack could not serve them. Also declines
+    /// when the memory plan has not admitted the pre-pack (#1056), in which case
+    /// the unpacked GEMM densifies `B` per call and retains nothing.
     #[cfg(feature = "mlas")]
     fn pack_key(
         &self,
@@ -175,6 +378,9 @@ impl QLinearMatMulKernel {
         geometry: &Geometry,
         plan: &QgemmPlan,
     ) -> Option<QgemmPackKey> {
+        if !qlinear_packed_b_enabled() {
+            return None;
+        }
         if !self.constant_inputs[3] {
             return None;
         }
@@ -531,7 +737,10 @@ impl Kernel for QLinearMatMulKernel {
         // many-batch call allocates once rather than once per batch.
         // The accumulator is borrowed from this thread's scratch, so a repeated
         // shape reuses one already-faulted mapping instead of buying a new one.
+        // Taking it out of the thread-local returns its reservation to the
+        // process-wide budget; it is re-reserved at the end iff it still fits.
         let mut products: Vec<i32> = ACCUMULATOR.with(|cell| cell.take());
+        ACCUMULATOR_BUDGET.release((products.capacity() * std::mem::size_of::<i32>()) as u64);
         let mut b_zero_points: Vec<i32> = Vec::new();
         let mut b_scales: Vec<f32> = Vec::new();
         #[cfg(feature = "mlas")]
@@ -719,7 +928,14 @@ impl Kernel for QLinearMatMulKernel {
         // Park the accumulator for the next call on this thread. An early
         // error return skips this and simply drops it, which costs the next
         // call one allocation and cannot affect a result.
-        if products.capacity() * std::mem::size_of::<i32>() <= MAX_RETAINED_ACCUMULATOR_BYTES {
+        //
+        // Parking is admitted through the process-wide budget, not a per-thread
+        // constant: it succeeds only when this buffer is within the per-thread
+        // cap *and* the sum parked across every worker thread stays within
+        // `MAX_PROCESS_ACCUMULATOR_BYTES`. A refused buffer is dropped and
+        // recomputed next call (byte-identical), so the process footprint no
+        // longer scales with the thread count.
+        if ACCUMULATOR_BUDGET.try_park((products.capacity() * std::mem::size_of::<i32>()) as u64) {
             ACCUMULATOR.with(|cell| cell.replace(products));
         }
         match sink {
@@ -1474,6 +1690,102 @@ mod tests {
             .execute(&inputs.map(|input| input.view()), &mut [output.view_mut()])
             .unwrap();
         output
+    }
+
+    /// The parked accumulator scratch must be bounded across the **whole
+    /// process**, not per thread. This is the defect the review named: a per-
+    /// thread cap is silent about the `x threads` multiplier, so the real
+    /// ceiling was `32 MiB x threads` (1 GiB on a 32-vCPU box).
+    ///
+    /// A single-instantiation test structurally cannot observe that multiplier
+    /// -- that is exactly how #1100 slipped through -- so this drives the kernel
+    /// from **many worker threads at once** and checks the summed retention.
+    ///
+    /// # How to falsify it
+    ///
+    /// The assertion that fails when the fix is reverted is the process-cap one:
+    /// make `GovernedAccumulatorBudget::try_park` ignore `process_cap_bytes`
+    /// (the per-thread-only bound the PR replaced) and every one of the N worker
+    /// threads parks a full buffer, so `qlinear_accumulator_live_bytes()` climbs
+    /// to `N x per_thread_buffer` -- far over the process cap -- and the upper-
+    /// bound assertion below fails. Restored, the sum is capped and it passes.
+    #[test]
+    fn the_parked_accumulator_is_bounded_process_wide_not_per_thread() {
+        use std::sync::Mutex;
+        // Serialise against any other test that also drives large parked
+        // buffers so the reset below opens a clean window; the *upper*-bound
+        // assertion holds regardless, being enforced inside `try_park`.
+        static SERIALISE: Mutex<()> = Mutex::new(());
+        let _guard = SERIALISE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // `m * n` just under the 32 MiB per-thread cap so a full buffer is
+        // admitted (a buffer *over* the cap is released -- tested separately),
+        // while four of them saturate the 128 MiB process cap.
+        let (m, k, n) = (2000usize, 64usize, 4096usize);
+        let buffer_bytes = (m * n * std::mem::size_of::<i32>()) as u64;
+        assert!(
+            buffer_bytes < MAX_RETAINED_ACCUMULATOR_BYTES as u64,
+            "a single buffer must fit the per-thread cap or nothing parks"
+        );
+
+        let threads = 8usize;
+        assert!(
+            (threads as u64) * buffer_bytes > MAX_PROCESS_ACCUMULATOR_BYTES as u64,
+            "the pool must want to park more than the process cap allows, or \
+             the bound is never exercised"
+        );
+
+        let a = Owned::u8(&[m, k], &vec![130u8; m * k]);
+        let a_scale = Owned::f32(&[], &[0.5]);
+        let a_zero = Owned::u8(&[], &[128]);
+        let b = Owned::u8(&[k, n], &vec![120u8; k * n]);
+        let b_scale = Owned::f32(&[], &[0.25]);
+        let b_zero = Owned::u8(&[], &[127]);
+        let y_scale = Owned::f32(&[], &[64.0]);
+        let y_zero = Owned::u8(&[], &[100]);
+        let inputs = [
+            &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+        ];
+
+        ACCUMULATOR_BUDGET.set_admitted(true);
+        ACCUMULATOR_BUDGET.reset_for_test();
+
+        let kernel = QLinearMatMulKernel::default();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("build a dedicated pool");
+        // `broadcast` runs the closure once on every worker thread, so each of
+        // the `threads` workers runs a full `execute` and parks its own
+        // thread-local accumulator -- the multi-thread drive the bound needs.
+        pool.broadcast(|_| {
+            let mut output = Owned::zeros(DataType::Uint8, &[m, n]);
+            kernel
+                .execute(&inputs.map(|input| input.view()), &mut [output.view_mut()])
+                .expect("kernel runs");
+        });
+
+        let live = qlinear_accumulator_live_bytes();
+
+        // The fix: the sum parked across all worker threads is bounded by the
+        // process cap, not `threads x per_thread_buffer`.
+        assert!(
+            live <= MAX_PROCESS_ACCUMULATOR_BYTES as u64,
+            "parked accumulator bytes {live} exceeded the process cap {MAX_PROCESS_ACCUMULATOR_BYTES} \
+             -- the per-thread bound multiplied by the thread count"
+        );
+        // Non-vacuity: more than one thread parked, so this genuinely observed
+        // the multiplier a single-instantiation test cannot. If the kernel ever
+        // stopped parking, this catches it too.
+        assert!(
+            live >= 2 * buffer_bytes,
+            "expected several threads to have parked ({buffer_bytes} bytes each), saw only \
+             {live} -- the test is not exercising multi-thread retention"
+        );
+
+        ACCUMULATOR_BUDGET.reset_for_test();
     }
 
     /// A contiguous output must be requantized straight into the caller's

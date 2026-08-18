@@ -1103,6 +1103,14 @@ pub struct ExportedComputeInfo {
     /// CPU EP (and any host EP), which uses its inputs verbatim exactly as
     /// before.
     device_staging: Option<DeviceStaging>,
+    /// Whether ORT's intra-op pool has ever been seen running our elementwise
+    /// chunks, and when to ask again if not.
+    ///
+    /// Lives here, rather than in a process-global, because a process may hold
+    /// one session at `intra_op = 1` and another at `intra_op = 16`, and the
+    /// right answer -- whether to borrow ORT's threads or use our own -- is
+    /// the opposite for each. See `onnx_runtime_ep_api::host_parallel`.
+    host_pool_probe: std::sync::atomic::AtomicU32,
 }
 
 /// Everything `Compute` needs to stage host-resident boundary inputs onto the
@@ -1160,6 +1168,7 @@ impl ExportedComputeInfo {
             routing: None,
             workspace_plans,
             device_staging: None,
+            host_pool_probe: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -1355,6 +1364,37 @@ pub fn workspace_placement_queries() -> usize {
 /// Reset the workspace placement counter. For tests and diagnostics only.
 pub fn reset_workspace_placement_queries() {
     WORKSPACE_PLACEMENT_QUERIES.store(0, Ordering::Relaxed);
+}
+
+/// Cumulative count of node kernels **this EP actually executed** inside a
+/// `Run`, across every compiled subgraph.
+///
+/// Distinct from [`crate::ep::compiled_node_count`], and the distinction is the
+/// point. That counter is an *assignment* signal: it says ORT gave this EP the
+/// node at session-build time. This one is an *execution* signal: it says our
+/// kernel ran for that node during `Run`. Only the pair is a proof that
+/// selecting this EP kept the work here — a node can be assigned to us and
+/// still not be the thing that produced the output (a partition that never
+/// runs, an ORT-side constant fold, or a future short-circuit), and nothing in
+/// an output comparison against ORT can tell those apart, because agreeing
+/// with ORT is exactly what a correct kernel does.
+///
+/// Deliberately not `cfg(test)`-gated, for the same reason as
+/// [`WORKSPACE_PLACEMENT_QUERIES`]: the only way to observe it is a real ORT
+/// `Run` against the shipped cdylib, which is compiled without `cfg(test)`.
+/// Cost is one relaxed increment per node per `Run` — unmeasurable next to a
+/// kernel dispatch, and it is the counter the no-defer rule is checked with.
+static EXECUTED_NODE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of node kernels this EP has executed since process start (see
+/// [`EXECUTED_NODE_COUNT`]).
+pub fn executed_node_count() -> usize {
+    EXECUTED_NODE_COUNT.load(Ordering::Relaxed)
+}
+
+/// Reset the executed-node counter. For tests and diagnostics only.
+pub fn reset_executed_node_count() {
+    EXECUTED_NODE_COUNT.store(0, Ordering::Relaxed);
 }
 
 /// Derive the memory device of **one node's own operands**.
@@ -2142,6 +2182,18 @@ unsafe extern "C" fn compute_execute(
         }
         let api_ref = unsafe { &*api };
 
+        // Lend ORT's intra-op pool to the kernels for this call. Ours would be
+        // a second pool on the same cores, and ORT's workers spin: at
+        // `intra_op = 16`, splitting a 1 Mi `Sqrt` across our rayon pool cost
+        // 252 -> 777 us against staying serial. Dropped at the end of the
+        // call, before `kernel_context` goes away.
+        //
+        // SAFETY: `kernel_context` is the context ORT handed this call and
+        // stays valid until it returns, which is after the guard is dropped.
+        let _host_pool = unsafe {
+            crate::host_pool::install(api_ref, kernel_context, &exported.host_pool_probe)
+        };
+
         // Memory info for intermediate scratch. On a device EP this is device
         // memory, so multi-node intermediates stay on the GPU (a host buffer
         // would make the next kernel dereference a host pointer as device →
@@ -2482,6 +2534,7 @@ unsafe extern "C" fn compute_execute(
                 ) {
                     return fail_status(&format!("Compute: kernel execution failed: {e}"));
                 }
+                EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
 
                 // Store new intermediate buffers.
                 for (buf_idx, buf) in new_bufs {
@@ -2697,6 +2750,7 @@ unsafe extern "C" fn compute_execute(
             {
                 return fail_status(&format!("Compute: kernel execution failed: {e}"));
             }
+            EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
         } else {
             return fail_status(
                 "Compute: multi-node subgraph requires SubgraphRouting — \

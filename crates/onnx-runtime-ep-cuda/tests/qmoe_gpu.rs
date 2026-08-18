@@ -637,6 +637,114 @@ fn error_metrics(actual: &[f32], expected: &[f32]) -> (f32, u32) {
     )
 }
 
+fn host_f32(tensor: &HostTensor) -> Vec<f32> {
+    tensor
+        .bytes
+        .chunks_exact(4)
+        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+        .collect()
+}
+
+/// f64 truth for an identity-activation, symmetric int4 QMoE forward.
+///
+/// This mirrors the dense `int8_f64_reference` philosophy (evaluate every
+/// dequant+FMA in f64) but walks the *expert path*: top-k softmax routing,
+/// two chained int4 GEMVs (fc1 -> identity -> fc2), and the routing-weighted
+/// expert combination. `identity` activation keeps the expert body a pure pair
+/// of int4 dot-product reductions, so the only source of CPU-vs-CUDA drift is
+/// the reduction order of those GEMVs -- exactly the reassociation that tips
+/// borderline argmaxes in DeepSeek-V2-Lite. Returns per-output
+/// `(reference, fc2_sum_abs)` so the caller can form a roundoff envelope.
+///
+/// Restricted to symmetric int4, identity activation, no fc3/bias/aggregation
+/// so the reference is exact-by-construction and cannot silently mismodel the
+/// kernel. `case_inputs` quantizes expert weights with `block_size = 16`.
+fn qmoe_identity_f64_reference(case: Case, inputs: &[Option<HostTensor>]) -> Vec<(f64, f64)> {
+    assert_eq!(case.activation, "identity");
+    assert!(
+        !case.affine,
+        "reference assumes symmetric int4 (zero-point = 8)"
+    );
+    assert!(
+        !case.fc3 && !case.biases && !case.router_weights,
+        "reference assumes a plain fc1->identity->fc2 expert body"
+    );
+    let (hidden, inter, experts, bits) = (case.hidden, case.inter, case.experts, case.bits);
+    let block = 16usize; // case_inputs quantizes expert weights with block_size = 16
+    let pack = 8 / bits;
+    let zero = 1i32 << (bits - 1); // symmetric zero-point (8 for int4)
+    let mask = (1u16 << bits) - 1;
+    let x = host_f32(inputs[0].as_ref().unwrap());
+    let router = host_f32(inputs[1].as_ref().unwrap());
+    let fc1_packed = &inputs[2].as_ref().unwrap().bytes;
+    let fc1_scales = host_f32(inputs[3].as_ref().unwrap());
+    let fc2_packed = &inputs[5].as_ref().unwrap().bytes;
+    let fc2_scales = host_f32(inputs[6].as_ref().unwrap());
+
+    let dequant = |packed: &[u8],
+                   scales: &[f32],
+                   expert: usize,
+                   out_features: usize,
+                   in_features: usize,
+                   output: usize,
+                   depth: usize|
+     -> f64 {
+        let row = expert * out_features + output;
+        let packed_in = in_features / pack;
+        let byte = packed[row * packed_in + depth / pack];
+        let nibble = i32::from((u16::from(byte) >> ((depth % pack) * bits)) & mask);
+        let scale = f64::from(scales[row * (in_features / block) + depth / block]);
+        f64::from(nibble - zero) * scale
+    };
+
+    let mut out = vec![(0.0f64, 0.0f64); case.rows * hidden];
+    for row in 0..case.rows {
+        let logits = &router[row * experts..(row + 1) * experts];
+        // Identical top-k rule to routing_weights(): total_cmp desc, index asc.
+        let mut selected: Vec<usize> = (0..experts).collect();
+        selected.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
+        selected.truncate(case.top_k);
+        let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exponentials: Vec<f64> = logits
+            .iter()
+            .map(|&value| (f64::from(value) - f64::from(max_logit)).exp())
+            .collect();
+        let denominator: f64 = if case.normalize {
+            selected.iter().map(|&i| exponentials[i]).sum()
+        } else {
+            exponentials.iter().sum()
+        };
+        for &expert in &selected {
+            let weight = exponentials[expert] / denominator;
+            // fc1: y[j] = sum_d x[d] * dequant(W1[e, j, d]); identity activation.
+            let mut activated = vec![0.0f64; inter];
+            for j in 0..inter {
+                let mut acc = 0.0f64;
+                for d in 0..hidden {
+                    acc += f64::from(x[row * hidden + d])
+                        * dequant(fc1_packed, &fc1_scales, expert, inter, hidden, j, d);
+                }
+                activated[j] = acc;
+            }
+            // fc2: o[h] = sum_j activated[j] * dequant(W2[e, h, j]).
+            for h in 0..hidden {
+                let mut acc = 0.0f64;
+                let mut sum_abs = 0.0f64;
+                for (j, &value) in activated.iter().enumerate() {
+                    let term =
+                        value * dequant(fc2_packed, &fc2_scales, expert, hidden, inter, h, j);
+                    acc += term;
+                    sum_abs += term.abs();
+                }
+                let slot = &mut out[row * hidden + h];
+                slot.0 += weight * acc;
+                slot.1 += weight.abs() * sum_abs;
+            }
+        }
+    }
+    out
+}
+
 fn compare(case: Case, dtype: DataType) -> (f32, u32) {
     let ep = require_cuda();
     let gpu_inputs = case_inputs(case, dtype);
@@ -930,6 +1038,89 @@ fn qmoe_int4_top2_symmetric_matches_cpu() {
     eprintln!("QMoE int4 top-2 CPU/CUDA max_abs_diff={max_abs:e} max_ulp_diff={max_ulp}");
 }
 
+/// f64-reference parity for the int4 QMoE expert GEMV -- the QMoE analogue of the
+/// dense `run_int8_f64_reference_parity`. Proves the native-CUDA expert reduction
+/// is within an f64 tree-reduction roundoff bound (not "whatever CUDA produced"),
+/// and reports the CPU-vs-CUDA-vs-f64 gap: the sequential CPU fold drifts further
+/// from f64 truth than the CUDA tree reduction, so where a borderline top-k argmax
+/// flips (as in DeepSeek-V2-Lite token 5) native CUDA is the more-accurate stream.
+///
+/// `top_k == 1` isolates the pure single-expert two-GEMV body (routing weight is
+/// exactly 1.0 under normalize); `top_k == 2` additionally exercises the
+/// softmax-weighted expert combination. Symmetric int4, identity activation.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_int4_identity_expert_gemv_within_f64_roundoff() {
+    let ep = require_cuda();
+    for top_k in [1usize, 2] {
+        let case = Case {
+            experts: 8,
+            rows: 1,
+            hidden: 512,
+            inter: 512,
+            bits: 4,
+            top_k,
+            activation: "identity",
+            swiglu_fusion: 0,
+            affine: false,
+            fc3: false,
+            biases: false,
+            normalize: true,
+            router_weights: false,
+        };
+        let inputs = case_inputs(case, DataType::Float32);
+        let cpu = run_cpu(case, &inputs);
+        let gpu = run_gpu(&ep, case, &inputs, DataType::Float32).unwrap();
+        let reference = qmoe_identity_f64_reference(case, &inputs);
+        assert_eq!(gpu.len(), reference.len());
+        assert_eq!(cpu.len(), reference.len());
+
+        let mut max_gpu_f64 = 0.0f64;
+        let mut max_cpu_f64 = 0.0f64;
+        for (index, ((&g, &c), &(reference, sum_abs))) in
+            gpu.iter().zip(&cpu).zip(&reference).enumerate()
+        {
+            let gpu_error = (f64::from(g) - reference).abs();
+            let cpu_error = (f64::from(c) - reference).abs();
+            max_gpu_f64 = max_gpu_f64.max(gpu_error);
+            max_cpu_f64 = max_cpu_f64.max(cpu_error);
+
+            // Two chained int4 GEMVs (fc1 -> identity -> fc2), each dequant a
+            // product (2 roundings) and each K-reduction a log-depth tree over the
+            // hidden/inter lanes. ~(log2(hidden) + log2(inter) + products +
+            // scale/route) roundings envelope the fp32 path; keep generous margin
+            // for contraction/codegen differences across SMs.
+            let tolerance = (sum_abs * f64::from(f32::EPSILON) * 32.0).max(1e-6);
+            assert!(
+                gpu_error <= tolerance,
+                "top_k={top_k} index {index}: CUDA={g}, f64={reference}, error={gpu_error:e}, \
+                 roundoff_bound={tolerance:e}, CPU={c}, CPU_error={cpu_error:e}"
+            );
+
+            // Sequential CPU fold: up to (hidden + inter) reduction roundings plus
+            // the same products; a deliberately loose two-sided envelope.
+            let cpu_tolerance = (sum_abs * f64::from(f32::EPSILON) * 200.0).max(1e-6);
+            assert!(
+                cpu_error <= cpu_tolerance,
+                "top_k={top_k} index {index}: CPU={c}, f64={reference}, error={cpu_error:e}, \
+                 sequential_bound={cpu_tolerance:e}, CUDA={g}"
+            );
+        }
+        // Absolute regression tripwire complementing the conditioning-scaled bound.
+        assert!(
+            max_gpu_f64 < 1e-4,
+            "top_k={top_k}: CUDA/f64 max_abs_diff={max_gpu_f64:e} exceeds the 1e-4 regression guard"
+        );
+        eprintln!(
+            "QMoE int4 identity expert-GEMV top_k={top_k}: \
+             CUDA/f64 max_abs_diff={max_gpu_f64:e}; CPU/f64 max_abs_diff={max_cpu_f64:e}"
+        );
+    }
+}
+
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
@@ -1211,4 +1402,108 @@ fn qmoe_prefill_handles_empty_experts_and_all_routes_to_one_expert() {
     let expected = run_cpu(case, &inputs);
     let actual = run_gpu(&ep, case, &inputs, DataType::Float32).unwrap();
     assert_conforms(&actual, &expected, case, DataType::Float32);
+}
+
+// ---------------------------------------------------------------------------
+// QMoE expert-GEMV microbench + byte-identity A/B (Luv, squad/qmoe-vec).
+//
+// Realistic DeepSeek-V2-Lite-shaped decode case for profiling `qmoe_linear`
+// (hidden=2048, moe_intermediate=1408, 64 experts, top-6). The bench is opt-in
+// (set QMOE_BENCH=1) so ordinary `cargo test` runs skip the heavy loop; ncu
+// filters the launches with `-k qmoe_linear`.
+// ---------------------------------------------------------------------------
+
+fn deepseek_v2_lite_decode_case() -> Case {
+    Case {
+        experts: 64,
+        rows: 1,
+        hidden: 2048,
+        inter: 1408,
+        bits: 4,
+        top_k: 6,
+        activation: "swiglu",
+        swiglu_fusion: 0,
+        affine: false,
+        fc3: true,
+        biases: false,
+        normalize: true,
+        router_weights: true,
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_deepseek_decode_bench() {
+    let ep = require_cuda();
+    let case = deepseek_v2_lite_decode_case();
+    let dtype = DataType::Float16;
+    let inputs = case_inputs(case, dtype);
+    // Warm the NVRTC cache + capture workspace.
+    let _ = run_gpu(&ep, case, &inputs, dtype).unwrap();
+    if std::env::var("QMOE_BENCH").is_err() {
+        // Under ncu we only need the launches; skip the wall-clock loop.
+        let _ = run_gpu(&ep, case, &inputs, dtype).unwrap();
+        return;
+    }
+    let iters = 60usize;
+    let mut samples = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let start = std::time::Instant::now();
+        let _ = run_gpu(&ep, case, &inputs, dtype).unwrap();
+        samples.push(start.elapsed().as_secs_f64() * 1e3);
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = samples[samples.len() / 2];
+    let flag = std::env::var("ONNX_GENAI_QMOE_OCC").unwrap_or_else(|_| "unset".into());
+    eprintln!(
+        "QMOE_BENCH deepseek-v2-lite decode: median_e2e={median:.4} ms (iters={iters}, \
+         ONNX_GENAI_QMOE_OCC={flag}, dtype={dtype:?})"
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_occ_is_bit_identical() {
+    // Byte-identity gate for the `ONNX_GENAI_QMOE_OCC` expert-GEMV variant:
+    // the `_occ` (`__launch_bounds__`) path must reproduce the default path
+    // bit-for-bit (0 differing bits) across dtypes and shapes.
+    //
+    // Coverage note: `_occ` only rebinds the fused gate/up SwiGLU expert GEMV,
+    // which is a decode-only (rows==1, routes<=16) launch. The rows>1 arm here
+    // routes through the grouped prefill path where the flag is a no-op, so it
+    // is an unchanged-output guard rather than genuine `_occ` coverage; rows==1
+    // is what actually exercises the `_occ` kernel.
+    let ep = require_cuda();
+    for &rows in &[1usize, 4, 6, 8] {
+        let mut case = deepseek_v2_lite_decode_case();
+        case.rows = rows;
+        for &dtype in &[DataType::Float16, DataType::BFloat16, DataType::Float32] {
+            let inputs = case_inputs(case, dtype);
+            // SAFETY: single-threaded test; the flag only selects a kernel entry.
+            unsafe { std::env::set_var("ONNX_GENAI_QMOE_OCC", "0") };
+            let base = run_gpu(&ep, case, &inputs, dtype).unwrap();
+            unsafe { std::env::set_var("ONNX_GENAI_QMOE_OCC", "1") };
+            let vec_path = run_gpu(&ep, case, &inputs, dtype).unwrap();
+            unsafe { std::env::remove_var("ONNX_GENAI_QMOE_OCC") };
+            assert_eq!(base.len(), vec_path.len());
+            let mismatches = base
+                .iter()
+                .zip(&vec_path)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                mismatches,
+                0,
+                "ONNX_GENAI_QMOE_OCC diverged from default: {mismatches} of {} elements \
+                 differ (rows={rows}, dtype={dtype:?})",
+                base.len()
+            );
+        }
+    }
 }

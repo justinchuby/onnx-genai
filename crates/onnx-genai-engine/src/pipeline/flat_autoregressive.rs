@@ -4,7 +4,70 @@
 //! decode driver and its paged-sequence and prefix-reuse helpers.
 
 use super::paged_decode::{PagedMirror, PipelineDecodeLoopBackend};
+use super::prefix_reuse::{KvPrefixStore, ReusedPrefix, apply_prefix_reuse};
 use super::*;
+
+/// A native decoder's session-resident KV, as a [`KvPrefixStore`].
+struct NativeKvStore<'a>(&'a mut dyn PipelineDecoderComponent);
+
+impl KvPrefixStore for NativeKvStore<'_> {
+    fn current_kv_len(&self) -> usize {
+        // `None` means the backend keeps nothing across turns, which is the
+        // same starting point as an empty cache.
+        self.0.current_kv_len().unwrap_or(0)
+    }
+
+    fn use_kv(&self) -> bool {
+        self.0.use_kv()
+    }
+
+    fn rewind_to(&mut self, target: usize) -> anyhow::Result<bool> {
+        self.0.rewind_kv(target)
+    }
+
+    fn reset(&mut self) -> anyhow::Result<()> {
+        // A decoder that cannot rewind to empty must not keep a cache the next
+        // turn would read as its prefix, so a decline is an error here rather
+        // than a silent carry-over.
+        if self.0.rewind_kv(0)? {
+            return Ok(());
+        }
+        anyhow::bail!("native decoder declined to reset its KV cache")
+    }
+}
+
+/// ORT's past tensors, held by the pipeline rather than the decoder, as a
+/// [`KvPrefixStore`]. `current` is tracked outside the state, so it is passed
+/// in rather than read back.
+struct OrtKvStore<'a> {
+    state: &'a mut Option<DecodeState>,
+    current: usize,
+}
+
+impl KvPrefixStore for OrtKvStore<'_> {
+    fn current_kv_len(&self) -> usize {
+        self.current
+    }
+
+    fn use_kv(&self) -> bool {
+        self.state.as_ref().is_some_and(|state| state.use_kv)
+    }
+
+    fn rewind_to(&mut self, target: usize) -> anyhow::Result<bool> {
+        let Some(state) = self.state.as_mut() else {
+            return Ok(false);
+        };
+        state.truncate_past(self.current, target)
+    }
+
+    fn reset(&mut self) -> anyhow::Result<()> {
+        // Dropping the state is how ORT empties its cache: a fresh one is built
+        // below for every turn that reuses nothing.
+        *self.state = None;
+        Ok(())
+    }
+}
+
 impl PipelineEngine {
     /// Resolve which components a flat autoregressive decode drives natively,
     /// unifying the pure-native backend and the hybrid env-flag injection so both
@@ -94,18 +157,21 @@ impl PipelineEngine {
         // the still-unwired case is reported as Inc-D.
         let mut native_decoder_component: Option<Box<dyn PipelineDecoderComponent + 'static>> =
             if use_native_decoder {
-                Some(build_native_pipeline_decoder(
-                    &self.models,
-                    &ar.decoder,
-                    self.native_device.as_ref(),
-                    &self.memory_strategy_plan,
-                    #[cfg(feature = "cuda")]
-                    std::sync::Arc::new(
-                        self.native_cuda_authority
-                            .clone()
-                            .unwrap_or_else(|| self.resource_governor.device_authority()),
-                    ),
-                )?)
+                match self.native_retained_decoder.take() {
+                    Some(decoder) => Some(decoder),
+                    None => Some(build_native_pipeline_decoder(
+                        &self.models,
+                        &ar.decoder,
+                        self.native_device.as_ref(),
+                        &self.memory_strategy_plan,
+                        #[cfg(feature = "cuda")]
+                        std::sync::Arc::new(
+                            self.native_cuda_authority
+                                .clone()
+                                .unwrap_or_else(|| self.resource_governor.device_authority()),
+                        ),
+                    )?),
+                }
             } else {
                 None
             };
@@ -119,10 +185,36 @@ impl PipelineEngine {
         let paged_enabled = self.paged.is_some()
             && inputs_digest.is_some()
             && (!use_native_decoder || native_supports_paging);
-        let reused = if paged_enabled || use_native_decoder {
-            0
+        // One prefix-reuse policy for every backend (`prefix_reuse`): the
+        // shared-prefix question and the decision it feeds are identical, so
+        // only the cache mechanism is chosen here. A native decoder rewinds its
+        // session-resident KV; ORT slices pipeline-held past tensors.
+        let shared = match (inputs_digest, self.retained.as_ref()) {
+            (Some(inputs), Some(retained)) => retained.reusable_prefix(inputs, &prompt_tokens),
+            _ => 0,
+        };
+        let retained_len = self.retained.as_ref().map_or(0, |r| r.tokens.len());
+        let positions_are_linear = self.positions_are_linear();
+        let reused = if paged_enabled {
+            ReusedPrefix::NONE
+        } else if use_native_decoder {
+            match native_decoder_component.as_mut() {
+                Some(decoder) => apply_prefix_reuse(
+                    &mut NativeKvStore(decoder.as_mut()),
+                    shared,
+                    positions_are_linear,
+                )?,
+                None => ReusedPrefix::NONE,
+            }
         } else {
-            self.reusable_prefix_len(inputs_digest, &prompt_tokens)
+            apply_prefix_reuse(
+                &mut OrtKvStore {
+                    state: &mut self.decoder_state,
+                    current: retained_len,
+                },
+                shared,
+                positions_are_linear,
+            )?
         };
         // Any failure below leaves the decoder KV in an unknown state, so the
         // retention is dropped now and only re-established on success.
@@ -160,8 +252,8 @@ impl PipelineEngine {
         // tensor covering the whole prompt. Prefilling only a suffix would hand
         // it positions for tokens it is not being given, so such a pipeline
         // recomputes rather than reuses.
-        let reused = if reused > 0 && self.decoder_positions_are_routed(&decoder_in_edges) {
-            0
+        let reused = if !reused.is_empty() && self.decoder_positions_are_routed(&decoder_in_edges) {
+            ReusedPrefix::NONE
         } else {
             reused
         };
@@ -203,11 +295,11 @@ impl PipelineEngine {
                 Self::admit_paged_sequence(paged, state, decoder, inputs, &prompt_tokens)?
             };
             paged_session = Some((seq, inputs));
-            reused = shared;
+            reused = ReusedPrefix::from_paged_admission(shared);
         }
 
         let chain = build_processor_chain(&options, Some(self.tokenizer()?))?;
-        if reused == 0 && paged_session.is_none() {
+        if reused.is_empty() && paged_session.is_none() {
             self.decoder_state = Some(Self::new_decoder_state(
                 &self.models,
                 &ar.decoder,
@@ -273,8 +365,9 @@ impl PipelineEngine {
             }),
             _ => None,
         };
-        let decoder_component: Box<dyn PipelineDecoderComponent + '_> =
-            if let Some(native) = native_decoder_component {
+        let mut ort_decoder_component: Option<Box<dyn PipelineDecoderComponent + '_>> = None;
+        let decoder_component: &mut dyn PipelineDecoderComponent =
+            if let Some(native) = native_decoder_component.as_deref_mut() {
                 // Built (and, on a shared prefix, already KV-seeded) up front.
                 native
             } else {
@@ -286,12 +379,15 @@ impl PipelineEngine {
                     .models
                     .session(&ar.decoder)
                     .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
-                Box::new(OrtPipelineDecoder::new(
+                ort_decoder_component = Some(Box::new(OrtPipelineDecoder::new(
                     decoder,
                     self.decoder_state
                         .as_mut()
                         .expect("autoregressive pipeline has decode state"),
-                ))
+                )));
+                ort_decoder_component
+                    .as_deref_mut()
+                    .expect("ORT decoder component was just initialized")
             };
         let mut backend = PipelineDecodeLoopBackend {
             decoder: decoder_component,
@@ -302,15 +398,16 @@ impl PipelineEngine {
             decoder_in_edges,
             static_cross_kv,
             context_tokens: prompt_tokens,
-            retained_len: reused,
+            retained_len: reused.len(),
             prompt_len: 0,
             generated_count: 0,
-            kv_len: reused,
+            kv_len: reused.len(),
+            prefill_chunk_size: self.prefill_chunk_size,
         };
         // Prefill only what the retained KV does not already cover.
         backend.prompt_len = backend.context_tokens.len() - backend.retained_len;
         let prefilled = backend.prompt_len;
-        let mut loop_state = DecodeLoopState::new(reused, options.seed, options.top_logprobs);
+        let mut loop_state = DecodeLoopState::new(reused.len(), options.seed, options.top_logprobs);
         // Taken without `?` so a failed generation still releases its sequence
         // below: an abandoned sequence holds its pages out of the pool for the
         // life of the process.
@@ -346,9 +443,11 @@ impl PipelineEngine {
         // needed downstream has been copied out above, so release it explicitly
         // before the paged-sequence retirement and the `tensors` move below.
         drop(backend);
+        drop(ort_decoder_component);
         let result = match result {
             Ok(result) => result,
             Err(error) => {
+                self.native_retained_decoder = None;
                 if let Some(paged) = self.paged.as_mut() {
                     paged.discard_active();
                 }
@@ -358,7 +457,7 @@ impl PipelineEngine {
 
         self.component_cache
             .borrow_mut()
-            .note_prefix_reuse(reused, prefilled);
+            .note_prefix_reuse(reused.len(), prefilled);
         match paged_session {
             // Publish what this generation computed so the next request can
             // attach to it, then let go of the sequence.
@@ -371,6 +470,21 @@ impl PipelineEngine {
                         inputs,
                         tokens: final_context,
                     });
+                    // Retain the decoder only here, under exactly the condition
+                    // that refreshed `retained`. The next request rewinds this
+                    // KV to a prefix length derived from `retained`, so a
+                    // decoder kept without a matching `retained` would have its
+                    // contents described by a stale context -- reusing another
+                    // request's KV as this one's prefix, silently and with
+                    // plausible output. Reachable whenever a request is not
+                    // digestible (`digest_request_identity` returns `None` for
+                    // an input `absorb_value` cannot canonicalize) or does not
+                    // use KV: those requests would leave `retained` untouched
+                    // while overwriting the KV it claims to describe. Dropping
+                    // the decoder only costs the reuse.
+                    if use_native_decoder {
+                        self.native_retained_decoder = native_decoder_component;
+                    }
                 }
             }
         }
@@ -577,53 +691,5 @@ impl PipelineEngine {
         decoder_in_edges
             .iter()
             .any(|(_, port)| port == position_input)
-    }
-
-    /// How many leading prompt tokens the retained decoder KV can serve.
-    ///
-    /// Zero whenever anything about the request's identity changed, whenever
-    /// the prompt shares no leading token with the retained context, or
-    /// whenever the attachments could not be digested.
-    ///
-    /// When the prompt diverges part-way, the retained KV is first truncated to
-    /// the shared head. Truncation can decline — an opaque past with no
-    /// identifiable sequence axis, or fixed loop-carried state — in which case
-    /// nothing is reused and the turn is recomputed.
-    fn reusable_prefix_len(&mut self, inputs: Option<Digest>, prompt_tokens: &[TokenId]) -> usize {
-        let (Some(inputs), Some(retained)) = (inputs, self.retained.as_ref()) else {
-            return 0;
-        };
-        let retained_len = retained.tokens.len();
-        let shared = retained.reusable_prefix(inputs, prompt_tokens);
-        let Some(state) = self.decoder_state.as_mut() else {
-            return 0;
-        };
-        if !state.use_kv || shared == 0 {
-            return 0;
-        }
-        if shared == retained_len {
-            return shared;
-        }
-        // Extending keeps the carried position state valid; truncating does not,
-        // and only a linear continuation can be rebuilt from the absolute past
-        // length alone. A model that carries or is handed its coordinates would
-        // resume from positions describing tokens that no longer exist.
-        if !self.positions_are_linear() {
-            self.decoder_state = None;
-            return 0;
-        }
-        let Some(state) = self.decoder_state.as_mut() else {
-            return 0;
-        };
-        match state.truncate_past(retained_len, shared) {
-            Ok(true) => shared,
-            // Declining to truncate is a normal outcome, and so is a failed
-            // slice: either way the KV is no longer trustworthy for reuse, so
-            // the state is dropped and the turn recomputes from scratch.
-            _ => {
-                self.decoder_state = None;
-                0
-            }
-        }
     }
 }

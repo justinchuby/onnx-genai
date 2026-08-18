@@ -116,6 +116,61 @@ pub fn assert_native_matches_golden(
     Ok(())
 }
 
+#[allow(dead_code)]
+pub fn assert_native_long_context_eager_and_capture_match_prefix(
+    model_dir_env: &str,
+    prompt: &str,
+    token_count: usize,
+    expected_prefix: &[u32],
+) -> anyhow::Result<()> {
+    let Some(model_dir) = cuda_model_dir(model_dir_env) else {
+        return Ok(());
+    };
+    unsafe {
+        std::env::set_var("ONNX_GENAI_CUDA_GRAPH", "0");
+    }
+    let eager = generate(
+        &model_dir,
+        EngineDecodeBackend::Native,
+        Some(NativeDecodeDevice::Cuda { index: Some(0) }),
+        DecodePrecision::Model,
+        prompt,
+        token_count,
+    )?;
+    assert_eq!(
+        eager.len(),
+        token_count,
+        "{model_dir_env} eager native CUDA long-context generation stopped early"
+    );
+    assert_eq!(
+        &eager[..expected_prefix.len()],
+        expected_prefix,
+        "{model_dir_env} eager native CUDA long-context prefix drifted"
+    );
+
+    unsafe {
+        std::env::set_var("ONNX_GENAI_CUDA_GRAPH", "1");
+    }
+    let captured = generate(
+        &model_dir,
+        EngineDecodeBackend::Native,
+        Some(NativeDecodeDevice::Cuda { index: Some(0) }),
+        DecodePrecision::Model,
+        prompt,
+        token_count,
+    )?;
+    assert_eq!(
+        captured.len(),
+        token_count,
+        "{model_dir_env} captured native CUDA long-context generation stopped early"
+    );
+    assert_eq!(
+        captured, eager,
+        "{model_dir_env} native CUDA long-context capture diverged from eager"
+    );
+    Ok(())
+}
+
 fn cuda_model_dir(model_dir_env: &str) -> Option<PathBuf> {
     let Some(model_dir) = std::env::var_os(model_dir_env).map(PathBuf::from) else {
         eprintln!("skipping decode lock: set {model_dir_env}");

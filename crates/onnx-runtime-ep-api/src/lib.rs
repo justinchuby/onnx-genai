@@ -18,6 +18,7 @@
 //! * [`tensor`] — [`TensorView`] / [`TensorMut`] zero-copy device views.
 //! * [`weight`] — capability-negotiated lazy [`WeightHandle`] delivery.
 //! * [`abi`] — ORT graph ABI bridge for legacy plugin EPs (Phase 2).
+//! * [`host_parallel`] — the host runtime's own thread pool, borrowed per compute call.
 
 // This crate hands raw pointers across an FFI boundary, so keeping a Rust
 // value alive past its scope is a recurring temptation. It is almost never the
@@ -34,6 +35,7 @@
 
 pub mod abi;
 pub mod epcontext;
+pub mod host_parallel;
 pub mod kernel;
 pub mod provider;
 pub mod registry;
@@ -43,9 +45,10 @@ pub mod weight;
 pub use abi::{LegacyOrtEp, PluginCompiledKernel, PluginExecutionPlan, SubgraphClaim};
 pub use epcontext::{EpContext, EpContextRegistry, build_ep_context_registry};
 pub use error::{EpError, Result};
+pub use host_parallel::HostParallel;
 pub use kernel::{
     ARG_BYTES, ARG_DEVICE, ARG_FLOPS, ARG_KERNEL_VARIANT, ARG_KERNEL_VARIANT_REASON,
-    CAT_KERNEL_WORKER, CaptureSupport, ClaimPreference, Cost, Kernel, KernelInput, KernelMatch,
+    CAT_KERNEL_WORKER, CaptureSupport, Cost, Kernel, KernelInput, KernelMatch,
     KernelVariantSelection, TensorMetadata, ViewOutput, WorkspaceLifetime, WorkspaceRequirement,
     WorkspaceView, kernel_variant_tracing_enabled, kernel_worker_span, record_kernel_metrics,
     record_kernel_variant_selection, record_kernel_variant_stage_selection, structural_input_bytes,

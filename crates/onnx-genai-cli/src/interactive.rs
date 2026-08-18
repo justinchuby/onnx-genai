@@ -325,7 +325,15 @@ pub(super) fn install_ctrlc_handler() {
                     EXIT_ARMED.store(true, Ordering::SeqCst);
                     eprintln!("\n^C  (press Ctrl-C again to exit)");
                 }
-                InterruptAction::Exit => std::process::exit(EXIT_INTERRUPTED),
+                InterruptAction::Exit => {
+                    // This runs on the signal-handler thread and terminates the
+                    // process without unwinding the generating thread, so the
+                    // `FlushGuard` on that stack never drops. Flush the buffered
+                    // diagnostics here so a double Ctrl-C during a turn does not
+                    // silently discard the whole turn's logs.
+                    let _ = crate::flush_deferred_tracing();
+                    std::process::exit(EXIT_INTERRUPTED)
+                }
             }
         });
         if let Err(error) = result {
@@ -373,6 +381,7 @@ pub(super) struct SessionSettings {
     /// platform defaults select.
     execution_provider: Option<String>,
     decode_backend: EngineDecodeBackend,
+    native_device: Option<onnx_genai::engine::native_decode_device::NativeDecodeDevice>,
     limits: onnx_genai::engine::ResourceLimits,
 }
 
@@ -383,6 +392,7 @@ impl SessionSettings {
             model_dir,
             execution_provider: None,
             decode_backend: config.decode_backend,
+            native_device: config.native_device,
             limits: config.limits,
         }
     }
@@ -390,6 +400,7 @@ impl SessionSettings {
     pub(super) fn to_config(&self) -> EngineConfig {
         EngineConfig {
             decode_backend: self.decode_backend,
+            native_device: self.native_device.clone(),
             limits: self.limits.clone(),
             ..EngineConfig::default()
         }
@@ -770,19 +781,16 @@ impl Backend {
     pub(super) fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
         match self {
             Self::Text(engine) => engine.effective_max_context(options),
-            Self::Pipeline(_) => options.max_context,
+            Self::Pipeline(pipeline) => pipeline.engine.effective_max_context(options),
         }
     }
 
     /// The model author's declared generation defaults, when the loaded package
-    /// ships them. Single-model text engines expose their `genai_config.json`
-    /// `search` block or native inference metadata `generation` block; pipelines
-    /// report `None` (their sampling is governed by the pipeline plan, not a
-    /// single decoder's declared defaults).
+    /// ships them.
     pub(super) fn generation_defaults(&self) -> Option<&GenerationDefaults> {
         match self {
             Self::Text(engine) => engine.metadata().generation.as_ref(),
-            Self::Pipeline(_) => None,
+            Self::Pipeline(pipeline) => pipeline.engine.generation_defaults(),
         }
     }
 
@@ -816,15 +824,25 @@ impl Backend {
                     .map_err(|error| match required {
                         // A multimodal package can require its non-text input;
                         // say so rather than leaving a bare "missing input".
-                        Some(modality) if attachments == 0 => error.context(format!(
-                            "the turn carried no attachment, but this model declares {modality} input. \
-                             How: attach one with `/{modality} <path>` in the REPL, or `--{modality} <path>` on the command line."
-                        )),
+                        Some(modality)
+                            if attachments == 0 && is_missing_required_input(&error) =>
+                        {
+                            error.context(format!(
+                                "the turn carried no attachment, but this model declares {modality} input. \
+                                 How: attach one with `/{modality} <path>` in the REPL, or `--{modality} <path>` on the command line."
+                            ))
+                        }
                         _ => error,
                     })
             }
         }
     }
+}
+
+fn is_missing_required_input(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with("input not found: "))
 }
 
 pub(super) fn apply_context_sized_max_new_tokens(
@@ -1544,6 +1562,17 @@ pub(super) fn stage_attachment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_input_not_found_errors_are_classified_as_missing_required_input() {
+        let missing =
+            anyhow::anyhow!("input not found: pixel_values").context("decoder forward failed");
+        assert!(is_missing_required_input(&missing));
+
+        let oom = anyhow::anyhow!("cuda_ep: cuMemAlloc: CUDA_ERROR_OUT_OF_MEMORY")
+            .context("decoder forward failed");
+        assert!(!is_missing_required_input(&oom));
+    }
 
     #[test]
     fn tty_mode_enables_live_stats_by_default() {

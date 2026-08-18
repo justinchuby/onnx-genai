@@ -23,8 +23,8 @@
 //!    so `DeviceBuffer` is soundly `Send`/`Sync` (documented in ep-api).
 
 use onnx_runtime_ep_api::{
-    ClaimPreference, Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, Fence, Kernel,
-    KernelMatch, OpRegistry, Result, deny, structural_input_bytes,
+    Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, Fence, Kernel, KernelMatch,
+    OpRegistry, Result, deny, structural_input_bytes,
 };
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
 
@@ -352,11 +352,10 @@ impl ExecutionProvider for CpuExecutionProvider {
     /// # Why there is no performance-based decline
     ///
     /// An earlier design measured each op against ORT's CPU kernel and
-    /// returned [`ClaimPreference::DeferToHost`] for the shape/dtype ranges it
-    /// lost, so ORT's CPU EP ran those nodes instead. That is withdrawn as an
-    /// architectural rule: when this EP is selected it owns every node it
-    /// supports, and a range where it is slower than ORT is a kernel to
-    /// optimize, not a node to give away.
+    /// declined the shape/dtype ranges it lost, so ORT's CPU EP ran those
+    /// nodes instead. That is withdrawn as an architectural rule: when this EP
+    /// is selected it owns every node it supports, and a range where it is
+    /// slower than ORT is a kernel to optimize, not a node to give away.
     ///
     /// The reasons are structural rather than about any single ratio. A
     /// deferral splits the graph, so the session pays a partition boundary and
@@ -365,24 +364,14 @@ impl ExecutionProvider for CpuExecutionProvider {
     /// microbenchmark on the machine the thresholds were tuned on. Selecting
     /// this EP is a request for this EP.
     ///
-    /// Overridden rather than inherited because the default
-    /// [`ExecutionProvider::claim_preference_node`] deep-clones every input
-    /// [`Shape`] and collects the input dtypes before it can ask, once per node
-    /// in the graph. Nothing here reads either, so the answer is returned
-    /// before that work happens.
+    /// There is no longer a routing-preference hook to override: the
+    /// `ClaimPreference` type and the `claim_preference`/`claim_preference_node`
+    /// trait methods were deleted from `onnx-runtime-ep-api`, so
+    /// [`ExecutionProvider::supports_op`] is the only claim-time answer and a
+    /// deferral cannot be reintroduced by overriding a default.
     ///
     /// The measured ORT gaps this EP still has to close are tracked in
     /// `docs/performance/CPU_ACTIVATION_GAPS.md`.
-    fn claim_preference_node(
-        &self,
-        view: &onnx_runtime_ir::GraphView<'_>,
-        node: onnx_runtime_ir::NodeIndex,
-        opset: u64,
-    ) -> ClaimPreference {
-        let _ = (view, node, opset);
-        ClaimPreference::Claim
-    }
-
     fn supports_op(
         &self,
         op: &Node,

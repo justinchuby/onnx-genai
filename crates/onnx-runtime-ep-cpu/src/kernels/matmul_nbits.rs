@@ -3766,7 +3766,10 @@ fn decode_affinity_cpus(threads: usize) -> std::result::Result<Option<Vec<usize>
 fn report_decode_affinity_policy(message: &str) {
     static REPORTED: OnceLock<()> = OnceLock::new();
     if REPORTED.set(()).is_ok() {
-        eprintln!("onnx-genai: decode affinity policy: {message}");
+        eprintln!(
+            "onnx-genai: native CPU worker affinity policy: {message}. \
+             This configures CPU kernels only and does not select the decode backend"
+        );
     }
 }
 

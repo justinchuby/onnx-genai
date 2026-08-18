@@ -757,6 +757,28 @@ pub fn widen_bf16_slice_into(src: &[u16], dst: &mut [f32]) {
     }
 }
 
+/// Widen contiguous `bf16` bit patterns into `f32` exactly as
+/// `half::bf16::to_f32` does, quieting signalling NaN.
+///
+/// The quieting counterpart to [`widen_bf16_slice_into`]. Use this one when
+/// replacing a widen that previously reached `half::bf16::to_f32` — typically
+/// via [`to_dense_f32_widen`] — because the raw shift and `half` disagree on
+/// the 126 signalling-NaN patterns, and swapping in the raw shift would
+/// silently change the bits every downstream kernel sees. Use the raw
+/// [`widen_bf16_slice_into`] only where no such contract exists.
+pub fn widen_bf16_slice_quieting_into(src: &[u16], dst: &mut [f32]) {
+    debug_assert_eq!(src.len(), dst.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if bf16x::available() {
+        // SAFETY: `bf16x::available()` confirmed `avx2`; lengths match.
+        unsafe { bf16x::widen_quieting(src, dst) };
+        return;
+    }
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d = half::bf16::from_bits(s).to_f32();
+    }
+}
+
 /// Narrow contiguous `f32` values into `f16` bit patterns.
 ///
 /// Counterpart to [`widen_f16_slice_into`]: F16C `vcvtps2ph` on x86 with F16C +

@@ -1,5 +1,6 @@
 //! Hugging Face chat-template rendering.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::path::Path;
 
@@ -220,7 +221,8 @@ impl ChatTemplate {
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_filter("tojson", minijinja::filters::tojson);
         env.add_function("raise_exception", raise_exception);
-        env.add_template("chat", &self.template)
+        let template_source = normalize_hf_jinja(&self.template);
+        env.add_template("chat", &template_source)
             .map_err(|err| OrtError::InvalidArgument(format!("invalid chat template: {err}")))?;
         let template = env
             .get_template("chat")
@@ -234,6 +236,62 @@ impl ChatTemplate {
                 eos_token => self.eos_token.as_deref().unwrap_or_default(),
             })
             .map_err(|err| OrtError::InvalidArgument(format!("chat template render failed: {err}")))
+    }
+}
+
+/// Parenthesize the single-keyword conditional form emitted by some Hugging
+/// Face templates, such as `namespace(name=value if value else '')`.
+///
+/// Jinja2 accepts that expression directly. MiniJinja parses the `if` as a new
+/// call argument unless the conditional value is parenthesized.
+fn normalize_hf_jinja(template: &str) -> Cow<'_, str> {
+    let mut normalized = None::<String>;
+    let mut copied = 0;
+    let mut search_from = 0;
+
+    while let Some(relative_start) = template[search_from..].find("namespace(") {
+        let start = search_from + relative_start;
+        let body_start = start + "namespace(".len();
+        let Some(relative_end) = template[body_start..].find(')') else {
+            break;
+        };
+        let end = body_start + relative_end;
+        let body = &template[body_start..end];
+        let Some((name, value)) = body.split_once('=') else {
+            search_from = end + 1;
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        let is_single_keyword = !name.is_empty()
+            && name
+                .chars()
+                .all(|character| character == '_' || character.is_ascii_alphanumeric())
+            && !value.contains(',');
+        let is_unparenthesized_conditional = value.contains(" if ")
+            && value.contains(" else ")
+            && !(value.starts_with('(') && value.ends_with(')'));
+        if !is_single_keyword || !is_unparenthesized_conditional {
+            search_from = end + 1;
+            continue;
+        }
+
+        let output = normalized.get_or_insert_with(|| String::with_capacity(template.len() + 2));
+        output.push_str(&template[copied..body_start]);
+        output.push_str(name);
+        output.push_str("=(");
+        output.push_str(value);
+        output.push_str("))");
+        copied = end + 1;
+        search_from = end + 1;
+    }
+
+    match normalized {
+        Some(mut normalized) => {
+            normalized.push_str(&template[copied..]);
+            Cow::Owned(normalized)
+        }
+        None => Cow::Borrowed(template),
     }
 }
 
@@ -348,6 +406,31 @@ mod tests {
         assert_eq!(
             template.render(&[], None, false).unwrap(),
             "true|true|true|b| keep "
+        );
+    }
+
+    #[test]
+    fn render_supports_hf_conditional_namespace_keyword() {
+        let template = ChatTemplate {
+            template: concat!(
+                "{% set tcid = 'call-1' %}",
+                "{% set state = namespace(name=tcid if tcid else '') %}",
+                "{{ state.name }}"
+            )
+            .to_string(),
+            bos_token: None,
+            eos_token: None,
+        };
+
+        assert_eq!(template.render(&[], None, false).unwrap(), "call-1");
+        assert_eq!(
+            template.source(),
+            concat!(
+                "{% set tcid = 'call-1' %}",
+                "{% set state = namespace(name=tcid if tcid else '') %}",
+                "{{ state.name }}"
+            ),
+            "compatibility normalization must not mutate the model template"
         );
     }
 

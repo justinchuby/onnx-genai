@@ -77,3 +77,13 @@ default flip.
 
 ## 2026-08-15 — glm int4 decode second act in flight
 After #978 split-K and #981 block SkipRMSNorm landed, the post-#981 base-floor read was overturned by the ORT GEMV head-to-head: ORT streams the same gate_up int4 GEMV at 2.42 TB/s vs native 0.92 TB/s with similar tiling/occupancy. Current program: `squad/int4-gemv-wideload` on GPU6, byte-identical 128-bit synchronous wide-load GEMV preserving per-lane accumulation order; target ~180-236 tok/s base decode and ORT base parity. cp.async M=1 remains a measured NO-GO.
+## 2026-08-18T01:35Z — Assigned V2-Lite graph-capture unlock
+
+- New implementation target: topology-gated capacity-policy fix for V2-Lite's additive attention-mask builder so CUDA graph capture can engage on MoE without regressing GLM-5.2 logical-width masks.
+- Expected surface is executor geometry/build tests plus capture eligibility, not CUDA kernels; Rachael review and Wallace byte-identity/perf validation are required.
+
+## 2026-08-18T03:15Z — V2-Lite classifier lockout episode recorded
+
+- Authored the first V2-Lite additive-mask capacity classifier for CUDA graph capture; the target topology and GLM-5.2 exclusion were directionally correct.
+- Rachael rejected the artifact for two safety blockers: non-capacity Attention could be blessed, and a root graph-output mask escape was not rejected. Strict reviewer lockout was honored, so Deckard did not revise the rejected artifact.
+- Wallace owned the revision, tightened both cases with negative tests, and Rachael approved; #1171 merged as `bc1e97ff`.

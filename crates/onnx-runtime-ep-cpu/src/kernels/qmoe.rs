@@ -354,6 +354,33 @@ impl Kernel for QMoEKernel {
                 self.attributes.k,
                 self.attributes.normalize_routing_weights,
             );
+            // Investigation probe (default-OFF): mirror of the CUDA route dump so
+            // a CPU-vs-CUDA run can be diffed for benign borderline-argmax
+            // reassociation vs a real router top-k divergence.
+            if std::env::var_os("ONNX_GENAI_QMOE_ROUTE_DUMP").is_some() {
+                static CALL: AtomicU64 = AtomicU64::new(0);
+                let call = CALL.fetch_add(1, Ordering::Relaxed);
+                let row_logits = &router[checked_range(row, experts, "router row")?];
+                let order: Vec<usize> = route.iter().map(|&(e, _)| e).collect();
+                let mut sorted = order.clone();
+                sorted.sort_unstable();
+                let selected_set: std::collections::HashSet<usize> =
+                    order.iter().copied().collect();
+                let min_selected = order
+                    .iter()
+                    .map(|&e| row_logits[e])
+                    .fold(f32::INFINITY, f32::min);
+                let max_rejected = (0..experts)
+                    .filter(|e| !selected_set.contains(e))
+                    .map(|e| row_logits[e])
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let margin = min_selected - max_rejected;
+                eprintln!(
+                    "QMOE_ROUTE_CPU call={call} row={row} order={order:?} set={sorted:?} \
+                     min_sel_logit={min_selected:.8e} max_rej_logit={max_rejected:.8e} \
+                     margin={margin:.8e}"
+                );
+            }
             for &(expert, route_weight) in &route {
                 *token_counts.entry(expert).or_insert(0usize) += 1;
                 tasks

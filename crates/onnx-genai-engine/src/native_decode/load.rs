@@ -345,11 +345,13 @@ impl NativeDecodeSession {
         if let Some(policy) = cuda_offload_policy {
             options.weight_offload_stable_va = Some(policy.enabled && policy.managed_no_spill);
         }
+        let requested_cuda = matches!(&device, NativeDecodeDevice::Cuda { .. });
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
             NativeDecodeDevice::Plugin { .. } => DevicePreference::Cpu,
         };
+        let path = path.as_ref();
         let mut builder = InferenceSession::builder().model(path).device(preference);
         #[cfg(feature = "cuda")]
         if let (NativeDecodeDevice::Cuda { index }, Some(governor)) = (&device, cuda_governor) {
@@ -379,6 +381,13 @@ impl NativeDecodeSession {
             builder = builder.execution_provider(Arc::new(ep));
         }
         let session = builder.build().context("load native decoder model")?;
+        if requested_cuda && let Some(report) = session.execution_provider_fallback_report() {
+            tracing::warn!(
+                model = %path.display(),
+                fallback = %report,
+                "native CUDA decoder fell back to CPU"
+            );
+        }
         Self::from_session_with_cuda_options_and_io(session, options, io)
     }
 

@@ -27,6 +27,12 @@ pub(crate) struct Executor {
     /// The concrete shape each live buffer in [`Self::buffers`] is currently
     /// sized for — the reuse key for run-scoped buffers.
     pub(super) buffer_shapes: HashMap<ValueId, Vec<usize>>,
+    /// Owned input buffers parked for the duration of one run while
+    /// [`Self::buffers`] instead holds a read-only *borrowed* handle over the
+    /// caller's host tensor (see `prepare_run_buffers`). Always drained back into
+    /// `buffers` before `run_scoped_mode` returns, so it is empty between runs
+    /// and no borrowed handle ever outlives the `&Tensor` it aliases.
+    pub(super) parked_input_buffers: Vec<(ValueId, DeviceBuffer)>,
     /// Loader-produced (possibly symbolic) shape of every value.
     pub(super) value_shapes: HashMap<ValueId, Shape>,
     /// Element type of every value.
