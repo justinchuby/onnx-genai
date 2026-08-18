@@ -106,3 +106,25 @@ pub use kernels::qlinear_matmul::{
     qlinear_packed_b_predicted_bytes, set_qlinear_accumulator_budget_admitted,
     set_qlinear_accumulator_process_cap_bytes, set_qlinear_packed_b_enabled,
 };
+
+#[cfg(test)]
+mod feature_default_guard {
+    /// `mlas` must stay off by default.
+    ///
+    /// The vendored MLAS kernels are a research/reference arm, not what ships.
+    /// This matters beyond a build flag: `bench_generic` used to *require* the
+    /// feature, so every published A/B ratio measured the reference arm while
+    /// being read as a production number, and the production pure-Rust softmax
+    /// turned out to be about 9x ORT rather than the ~1.0 the tables showed.
+    /// If a default build ever links MLAS again, the same class of mistake
+    /// becomes possible again, so fail loudly here.
+    #[test]
+    fn mlas_is_not_a_default_feature() {
+        assert!(
+            !cfg!(feature = "mlas"),
+            "this test runs in a default-feature build, so `mlas` being on means \
+             it was added to the crate's default features: production would then \
+             ship MLAS and every benchmark arm label would be wrong"
+        );
+    }
+}

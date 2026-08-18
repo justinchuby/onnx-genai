@@ -82,8 +82,15 @@ const MIN_PARALLEL_SOFTMAX_ELEMENTS: usize = 16 * 1024;
 /// operator is worth vectorising at all: the scalar form costs one `f32::exp`
 /// libm call per element. With `mlas` this hands each row to `MlasComputeSoftmax`
 /// — the *same* primitive ONNX Runtime's own `Softmax` and attention kernels
-/// use, which finds the row max, evaluates `exp` through a polynomial on 8
-/// lanes at a time and normalizes, in one pass over the row.
+/// use, which finds the row max, evaluates `exp` and normalizes in one pass
+/// over the row.
+///
+/// The `exp` is only vectorised when the optional `mlas` feature is on, which
+/// it is **not** by default. The shipping build evaluates `f32::exp` one
+/// element at a time, and that is worth about 9x against ORT on a standalone
+/// `Softmax`. Fixing it is tracked separately; this comment previously claimed
+/// an 8-lane polynomial unconditionally, which was only ever true of the MLAS
+/// arm.
 ///
 /// Rows are independent, so the outer loop fans out across the shared Rayon
 /// pool once the tensor is large enough to pay for it. ORT parallelizes the
