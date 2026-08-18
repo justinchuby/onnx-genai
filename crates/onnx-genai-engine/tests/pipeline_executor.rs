@@ -1,4 +1,6 @@
-use onnx_genai_engine::{Engine, EngineConfig, GeneratePrompt, GenerateRequest};
+use onnx_genai_engine::{
+    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, PipelineEngine,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +21,8 @@ fn pipeline_fixture() -> anyhow::Result<PathBuf> {
     fs::write(
         root.join("inference_metadata.yaml"),
         r#"
+model:
+  max_sequence_length: 16
 pipeline:
   models:
     decoder:
@@ -54,6 +58,24 @@ fn token_request(tokens: Vec<u32>, max_new_tokens: usize) -> GenerateRequest {
     request.options.temperature = 0.0;
     request.options.stop_on_eos = false;
     request
+}
+
+#[test]
+fn pipeline_exposes_declared_context_limit() -> anyhow::Result<()> {
+    let engine =
+        PipelineEngine::from_dir_with_config(&pipeline_fixture()?, EngineConfig::default())?;
+    assert_eq!(
+        engine.effective_max_context(&GenerateOptions::default()),
+        Some(16)
+    );
+    assert_eq!(
+        engine.effective_max_context(&GenerateOptions {
+            max_context: Some(8),
+            ..GenerateOptions::default()
+        }),
+        Some(8)
+    );
+    Ok(())
 }
 
 #[test]
