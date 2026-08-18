@@ -4,7 +4,7 @@
 //! decode driver and its paged-sequence and prefix-reuse helpers.
 
 use super::paged_decode::{PagedMirror, PipelineDecodeLoopBackend};
-use super::prefix_reuse::{KvPrefixStore, apply_prefix_reuse};
+use super::prefix_reuse::{KvPrefixStore, ReusedPrefix, apply_prefix_reuse};
 use super::*;
 
 /// A native decoder's session-resident KV, as a [`KvPrefixStore`].
@@ -196,7 +196,7 @@ impl PipelineEngine {
         let retained_len = self.retained.as_ref().map_or(0, |r| r.tokens.len());
         let positions_are_linear = self.positions_are_linear();
         let reused = if paged_enabled {
-            0
+            ReusedPrefix::NONE
         } else if use_native_decoder {
             match native_decoder_component.as_mut() {
                 Some(decoder) => apply_prefix_reuse(
@@ -204,7 +204,7 @@ impl PipelineEngine {
                     shared,
                     positions_are_linear,
                 )?,
-                None => 0,
+                None => ReusedPrefix::NONE,
             }
         } else {
             apply_prefix_reuse(
@@ -252,8 +252,8 @@ impl PipelineEngine {
         // tensor covering the whole prompt. Prefilling only a suffix would hand
         // it positions for tokens it is not being given, so such a pipeline
         // recomputes rather than reuses.
-        let reused = if reused > 0 && self.decoder_positions_are_routed(&decoder_in_edges) {
-            0
+        let reused = if !reused.is_empty() && self.decoder_positions_are_routed(&decoder_in_edges) {
+            ReusedPrefix::NONE
         } else {
             reused
         };
@@ -295,11 +295,11 @@ impl PipelineEngine {
                 Self::admit_paged_sequence(paged, state, decoder, inputs, &prompt_tokens)?
             };
             paged_session = Some((seq, inputs));
-            reused = shared;
+            reused = ReusedPrefix::from_paged_admission(shared);
         }
 
         let chain = build_processor_chain(&options, Some(self.tokenizer()?))?;
-        if reused == 0 && paged_session.is_none() {
+        if reused.is_empty() && paged_session.is_none() {
             self.decoder_state = Some(Self::new_decoder_state(
                 &self.models,
                 &ar.decoder,
@@ -398,16 +398,16 @@ impl PipelineEngine {
             decoder_in_edges,
             static_cross_kv,
             context_tokens: prompt_tokens,
-            retained_len: reused,
+            retained_len: reused.len(),
             prompt_len: 0,
             generated_count: 0,
-            kv_len: reused,
+            kv_len: reused.len(),
             prefill_chunk_size: self.prefill_chunk_size,
         };
         // Prefill only what the retained KV does not already cover.
         backend.prompt_len = backend.context_tokens.len() - backend.retained_len;
         let prefilled = backend.prompt_len;
-        let mut loop_state = DecodeLoopState::new(reused, options.seed, options.top_logprobs);
+        let mut loop_state = DecodeLoopState::new(reused.len(), options.seed, options.top_logprobs);
         // Taken without `?` so a failed generation still releases its sequence
         // below: an abandoned sequence holds its pages out of the pool for the
         // life of the process.
@@ -457,7 +457,7 @@ impl PipelineEngine {
 
         self.component_cache
             .borrow_mut()
-            .note_prefix_reuse(reused, prefilled);
+            .note_prefix_reuse(reused.len(), prefilled);
         match paged_session {
             // Publish what this generation computed so the next request can
             // attach to it, then let go of the sequence.

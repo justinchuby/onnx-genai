@@ -13,6 +13,41 @@
 //! had. Neither omission could show up as a crash — a prefix-reuse bug produces
 //! fluent text conditioned on the wrong context.
 
+/// A prefix length that came from the shared policy.
+///
+/// This is the DRY mechanism, not decoration. The field is private and the
+/// only constructors live in this module, so a new backend **cannot produce a
+/// reuse length at all** without going through [`apply_prefix_reuse`] — the
+/// exact mistake that produced two divergent copies of this policy in the
+/// first place is now a compile error rather than a review catch.
+///
+/// If you find yourself wanting a fourth constructor, that is the signal to
+/// stop: you are about to add a second policy. Extend [`plan_prefix_reuse`]
+/// instead, so every backend gets the change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReusedPrefix(usize);
+
+impl ReusedPrefix {
+    /// Nothing carried over; the turn prefills the whole prompt.
+    pub(crate) const NONE: Self = Self(0);
+
+    /// The paged cache admits its own shared prefix through `claim_paged_prefix`,
+    /// which is already a single implementation both backends share. It is a
+    /// different *source* of a prefix, not a different policy.
+    pub(crate) fn from_paged_admission(len: usize) -> Self {
+        Self(len)
+    }
+
+    /// Tokens the turn may skip re-prefilling.
+    pub(crate) fn len(self) -> usize {
+        self.0
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
 /// What the KV cache must become before this turn can reuse a prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrefixDecision {
@@ -97,7 +132,7 @@ pub(crate) fn apply_prefix_reuse<S: KvPrefixStore + ?Sized>(
     store: &mut S,
     shared: usize,
     positions_are_linear: bool,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<ReusedPrefix> {
     let decision = plan_prefix_reuse(
         shared,
         store.current_kv_len(),
@@ -107,15 +142,15 @@ pub(crate) fn apply_prefix_reuse<S: KvPrefixStore + ?Sized>(
     match decision {
         PrefixDecision::Reset => {
             store.reset()?;
-            Ok(0)
+            Ok(ReusedPrefix::NONE)
         }
-        PrefixDecision::Keep(len) => Ok(len),
+        PrefixDecision::Keep(len) => Ok(ReusedPrefix(len)),
         PrefixDecision::Rewind(len) => {
             if store.rewind_to(len)? {
-                Ok(len)
+                Ok(ReusedPrefix(len))
             } else {
                 store.reset()?;
-                Ok(0)
+                Ok(ReusedPrefix::NONE)
             }
         }
     }
@@ -212,7 +247,7 @@ mod tests {
             use_kv: true,
             ..FakeStore::default()
         };
-        assert_eq!(apply_prefix_reuse(&mut store, 8, true)?, 8);
+        assert_eq!(apply_prefix_reuse(&mut store, 8, true)?.len(), 8);
         assert_eq!(store.rewound_to, None, "a kept prefix needs no rewind");
         assert!(!store.was_reset);
         Ok(())
@@ -228,7 +263,7 @@ mod tests {
             rewind_declines: true,
             ..FakeStore::default()
         };
-        assert_eq!(apply_prefix_reuse(&mut store, 5, true)?, 0);
+        assert!(apply_prefix_reuse(&mut store, 5, true)?.is_empty());
         assert_eq!(store.rewound_to, Some(5));
         assert!(store.was_reset, "a declined rewind must reset");
         Ok(())
@@ -241,8 +276,88 @@ mod tests {
             use_kv: true,
             ..FakeStore::default()
         };
-        assert_eq!(apply_prefix_reuse(&mut store, 0, true)?, 0);
+        assert!(apply_prefix_reuse(&mut store, 0, true)?.is_empty());
         assert!(store.was_reset);
         Ok(())
+    }
+
+    /// Files allowed to drive the KV-rewind primitives directly.
+    ///
+    /// `flat_autoregressive.rs` holds the two `KvPrefixStore` adapters, which
+    /// are the sanctioned mechanism half of this module. `state.rs` defines
+    /// `truncate_past` and exercises it in its own unit tests.
+    const KV_REWIND_CALLERS: [&str; 3] = [
+        "pipeline\\flat_autoregressive.rs",
+        "pipeline\\prefix_reuse.rs",
+        "decode\\state.rs",
+    ];
+
+    /// The primitives that mutate or inspect a KV cache's length. Reaching for
+    /// one of these outside the adapters means reimplementing prefix reuse.
+    const KV_REWIND_PRIMITIVES: [&str; 3] = [".rewind_kv(", ".truncate_past(", ".current_kv_len("];
+
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("crate src is readable") {
+            let path = entry.expect("readable entry").path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The DRY tripwire.
+    ///
+    /// A second copy of this policy cannot appear without calling one of the
+    /// KV primitives, so confining those calls to the adapters confines the
+    /// policy to this module. This runs under `cargo test`, so it cannot be
+    /// missed by not looking at CI.
+    ///
+    /// If this fails, the fix is to route the new backend through
+    /// [`apply_prefix_reuse`] and add a [`KvPrefixStore`] adapter -- **not** to
+    /// add the offending file to `KV_REWIND_CALLERS`. Widening the allowlist is
+    /// how the duplication this module exists to prevent gets back in.
+    #[test]
+    fn the_kv_rewind_primitives_are_only_driven_by_the_shared_policy() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = Vec::new();
+        rust_sources(&src, &mut sources);
+        assert!(
+            sources.len() > 10,
+            "the source scan found almost nothing, so it cannot be trusted to \
+             have looked: {} files under {}",
+            sources.len(),
+            src.display()
+        );
+
+        let mut offenders = Vec::new();
+        for path in sources {
+            let relative = path.strip_prefix(&src).expect("scanned under src");
+            let display = relative.display().to_string().replace('/', "\\");
+            if KV_REWIND_CALLERS
+                .iter()
+                .any(|allowed| display.ends_with(allowed))
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("source is readable");
+            for (line_number, line) in text.lines().enumerate() {
+                for primitive in KV_REWIND_PRIMITIVES {
+                    if line.contains(primitive) {
+                        offenders.push(format!("{display}:{} {}", line_number + 1, line.trim()));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these call a KV-rewind primitive outside the `KvPrefixStore` \
+             adapters, which is how prefix reuse gets reimplemented per \
+             backend. Route them through `apply_prefix_reuse` instead of \
+             widening `KV_REWIND_CALLERS`:\n{}",
+            offenders.join("\n")
+        );
     }
 }
