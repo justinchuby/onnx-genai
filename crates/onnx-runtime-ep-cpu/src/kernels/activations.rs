@@ -18,6 +18,8 @@ enum Activation {
     ThresholdedRelu { alpha: f32 },
     Swish { alpha: f32 },
     Silu,
+    Celu { alpha: f32 },
+    Mish,
 }
 
 impl Activation {
@@ -30,6 +32,8 @@ impl Activation {
             Self::ThresholdedRelu { .. } => "ThresholdedRelu",
             Self::Swish { .. } => "Swish",
             Self::Silu => "Silu",
+            Self::Celu { .. } => "Celu",
+            Self::Mish => "Mish",
         }
     }
 
@@ -71,6 +75,13 @@ impl Activation {
                 x * s
             }
             Self::Silu => silu(x),
+            // Shared with the slice path rather than transcribed again: the
+            // literal ONNX formula loses NaN through `f32::max`/`min`, and one
+            // copy of that guard is easier to keep true than two.
+            Self::Celu { alpha } => crate::kernels::simd_activations::celu_scalar(x, alpha),
+            // Mish(x) = x * tanh(softplus(x)), with softplus in its stable
+            // form so large `x` neither overflows nor loses the identity.
+            Self::Mish => x * (x.max(0.0) + (-x.abs()).exp().ln_1p()).tanh(),
         }
     }
 
@@ -119,6 +130,18 @@ impl Activation {
                 x * s
             }
             Self::Silu => silu_f64(x),
+            Self::Celu { alpha } => {
+                // See `simd_activations::celu_scalar`: `max`/`min` return the
+                // other operand for NaN, so without this the f64 path -- which
+                // every `Float64` tensor takes -- would answer `0.0` where ORT
+                // and the f32 paths answer NaN.
+                if x.is_nan() {
+                    return x;
+                }
+                let a = f64::from(alpha);
+                x.max(0.0) + (a * ((x / a).exp() - 1.0)).min(0.0)
+            }
+            Self::Mish => x * (x.max(0.0) + (-x.abs()).exp().ln_1p()).tanh(),
         }
     }
 }
@@ -169,6 +192,8 @@ pub struct SeluFactory;
 pub struct ThresholdedReluFactory;
 pub struct SwishFactory;
 pub struct SiluFactory;
+pub struct CeluFactory;
+pub struct MishFactory;
 
 impl KernelFactory for EluFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
@@ -245,6 +270,27 @@ impl KernelFactory for SwishFactory {
     }
 }
 
+impl KernelFactory for CeluFactory {
+    fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let alpha = node.attr("alpha").and_then(|a| a.as_float()).unwrap_or(1.0);
+        // ONNX requires alpha != 0 (the definition divides by it). A model that
+        // ships 0 would otherwise reach a division by zero in the kernel, so
+        // fall back to the documented default rather than produce Inf/NaN.
+        let alpha = if alpha == 0.0 { 1.0 } else { alpha };
+        Ok(Box::new(ActivationKernel {
+            activation: Activation::Celu { alpha },
+        }))
+    }
+}
+
+impl KernelFactory for MishFactory {
+    fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(ActivationKernel {
+            activation: Activation::Mish,
+        }))
+    }
+}
+
 impl KernelFactory for SiluFactory {
     fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(ActivationKernel {
@@ -272,6 +318,14 @@ impl Kernel for ActivationKernel {
         let y = if matches!(self.activation, Activation::Silu) {
             let mut output = vec![0.0; input.len()];
             silu_f32_slice(&input, &mut output);
+            output
+        } else if let Activation::Celu { alpha } = self.activation {
+            let mut output = vec![0.0; input.len()];
+            crate::kernels::simd_activations::celu_f32_slice(&input, &mut output, alpha);
+            output
+        } else if matches!(self.activation, Activation::Mish) {
+            let mut output = vec![0.0; input.len()];
+            crate::kernels::simd_activations::mish_f32_slice(&input, &mut output);
             output
         } else {
             input
@@ -473,6 +527,27 @@ mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ir::{Attribute, NodeId};
+
+    /// `Float64` tensors never touch the SIMD kernels, so `apply_f64` is the
+    /// only implementation a `double` model sees. It has to agree with the
+    /// other two about NaN -- `f64::max`/`min` drop it exactly as the f32 ones
+    /// do, and ORT propagates it.
+    #[test]
+    fn celu_and_mish_propagate_nan_on_every_path() {
+        for alpha in [0.5f32, 1.0, 3.0] {
+            let act = Activation::Celu { alpha };
+            assert!(act.apply(f32::NAN).is_nan(), "f32 Celu(NaN), alpha={alpha}");
+            assert!(
+                act.apply_f64(f64::NAN).is_nan(),
+                "f64 Celu(NaN), alpha={alpha}"
+            );
+        }
+        assert!(Activation::Mish.apply(f32::NAN).is_nan(), "f32 Mish(NaN)");
+        assert!(
+            Activation::Mish.apply_f64(f64::NAN).is_nan(),
+            "f64 Mish(NaN)"
+        );
+    }
 
     #[test]
     fn activation_formulas_and_defaults() {

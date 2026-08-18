@@ -792,6 +792,37 @@ mod erf_c {
     pub(super) const EXP_C: f32 = 1.25829120e7;
 }
 
+#[cfg(target_arch = "x86_64")]
+/// Cephes `logf` constants.
+///
+/// These are the same coefficients Eigen's `plog` carries, which is what ORT's
+/// CPU `Log` ultimately evaluates, so matching them is what buys us parity
+/// rather than merely accuracy.
+#[cfg(target_arch = "x86_64")]
+mod log_c {
+    /// `sqrt(0.5)`. The mantissa is folded into `[sqrt(0.5), sqrt(2))` around
+    /// this point so the polynomial argument `f = m - 1` stays small and
+    /// symmetric about zero.
+    pub(super) const SQRT_HALF: f32 = core::f32::consts::FRAC_1_SQRT_2;
+    pub(super) const P0: f32 = 7.037_683_6E-2;
+    pub(super) const P1: f32 = -1.151_461_0E-1;
+    pub(super) const P2: f32 = 1.167_699_9E-1;
+    pub(super) const P3: f32 = -1.242_014_1E-1;
+    pub(super) const P4: f32 = 1.424_932_3E-1;
+    pub(super) const P5: f32 = -1.666_805_8E-1;
+    pub(super) const P6: f32 = 2.000_071_5E-1;
+    pub(super) const P7: f32 = -2.499_999_4E-1;
+    pub(super) const P8: f32 = 3.333_333_1E-1;
+    /// `ln 2` split so that `e * LN2_HI` is exact for every `e` a `f32`
+    /// exponent can hold; `LN2_LO` carries the remainder.
+    pub(super) const LN2_HI: f32 = 0.693_359_38;
+    pub(super) const LN2_LO: f32 = -2.121_944_4E-4;
+    /// Denormal inputs have no usable exponent field, so they are scaled by
+    /// `2^25` first and `25` is subtracted from the recovered exponent.
+    pub(super) const DENORM_SCALE: f32 = 33_554_432.0;
+    pub(super) const DENORM_EXP: f32 = 25.0;
+}
+
 /// `MlasExpConstants` (`onnxruntime/core/mlas/lib/compute.cpp`), the parameter
 /// set behind `MlasComputeExp`.
 ///
@@ -1121,6 +1152,41 @@ pub(crate) fn tanh_gelu_f32_slice(input: &[f32], output: &mut [f32]) {
     dispatch!(input, output, tanh_gelu_scalar, tanh_gelu_avx2);
 }
 
+/// `y = ln(x)`.
+///
+/// Vectorised rather than left to `f32::ln`: `Log` was the last unary op in
+/// this module still taking a `libm` call per element.
+pub(crate) fn log_f32_slice(input: &[f32], output: &mut [f32]) {
+    dispatch!(input, output, log_scalar, log_avx2);
+}
+
+/// `y = x·tanh(softplus(x))`, `Mish`.
+pub(crate) fn mish_f32_slice(input: &[f32], output: &mut [f32]) {
+    dispatch!(input, output, mish_scalar, mish_avx2);
+}
+
+/// `y = max(0,x) + min(0, alpha·(exp(x/alpha) − 1))`, `Celu`.
+///
+/// `alpha` must be non-zero; ONNX requires it and the reciprocal below would
+/// otherwise be infinite.
+pub(crate) fn celu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32) {
+    debug_assert_eq!(input.len(), output.len());
+    debug_assert!(alpha != 0.0);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if input.len() >= SIMD_MIN_LEN && vector_path_available() {
+            // SAFETY: guarded by the runtime AVX2+FMA detection above.
+            run_chunked(input, output, |i, o| unsafe { celu_avx2(i, o, alpha) });
+            return;
+        }
+    }
+    run_chunked(input, output, |i, o| {
+        for (o, &i) in o.iter_mut().zip(i) {
+            *o = celu_scalar(i, alpha);
+        }
+    });
+}
+
 /// `y = x·sigmoid(alpha·x)`, the `QuickGelu` / Swish form.
 pub(crate) fn quick_gelu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32) {
     debug_assert_eq!(input.len(), output.len());
@@ -1334,6 +1400,40 @@ pub(crate) fn softsign_scalar(x: f32) -> f32 {
 // ---------------------------------------------------------------------------
 
 #[inline]
+/// `ln(x)`, the scalar reference for [`log_f32_slice`].
+fn log_scalar(x: f32) -> f32 {
+    x.ln()
+}
+
+/// `Celu(x) = max(0, x) + min(0, alpha * (exp(x / alpha) - 1))`.
+///
+/// This is ONNX's definition evaluated literally, which is also what ORT does.
+/// `alpha` is required to be non-zero by the spec.
+pub(crate) fn celu_scalar(x: f32, alpha: f32) -> f32 {
+    // Transcribing the formula literally is not enough. Rust's `f32::max` and
+    // `f32::min` are IEEE-754 `maxNum`/`minNum`: they return the *other*
+    // operand when one is NaN, so both terms collapse to zero and `Celu(NaN)`
+    // comes out `0.0`. ORT propagates NaN, and so does `celu_ps` (whose
+    // `maxps` keeps it) -- without this guard the answer would depend on
+    // whether the slice was long enough for the vector path and on whether the
+    // host has AVX2, which is exactly what `dispatch!` exists to prevent.
+    if x.is_nan() {
+        return x;
+    }
+    x.max(0.0) + (alpha * ((x / alpha).exp() - 1.0)).min(0.0)
+}
+
+/// `Softplus(x) = ln(1 + e^x)`, in the stable form
+/// `max(x, 0) + ln(1 + e^-|x|)`.
+fn softplus_scalar(x: f32) -> f32 {
+    x.max(0.0) + (-x.abs()).exp().ln_1p()
+}
+
+/// `Mish(x) = x * tanh(softplus(x))`.
+fn mish_scalar(x: f32) -> f32 {
+    x * softplus_scalar(x).tanh()
+}
+
 fn tanh_scalar(x: f32) -> f32 {
     x.tanh()
 }
@@ -1392,7 +1492,7 @@ fn quick_gelu_scalar(x: f32, alpha: f32) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
-    use super::{GELU_B, GELU_C, erf_c, exp_c, logistic_c, tanh_c};
+    use super::{GELU_B, GELU_C, erf_c, exp_c, log_c, logistic_c, tanh_c};
     use core::arch::x86_64::*;
 
     /// `[-1; 7] ++ [0; 8]`. Loading 8 lanes at offset `7 - rem` yields a mask
@@ -1768,6 +1868,153 @@ mod avx2 {
         p
     }
 
+    /// `ln(x)` for eight lanes, the Cephes decomposition.
+    ///
+    /// `x = m * 2^e` with `m` folded into `[sqrt(0.5), sqrt(2))`, then
+    /// `ln x = ln m + e ln 2`, with `ln m` from a degree-8 polynomial in
+    /// `f = m - 1`. `ln 2` is split `HI + LO` so `e * HI` is exact.
+    ///
+    /// Denormals are handled rather than flushed: they carry no usable exponent
+    /// field, so they are pre-scaled by `2^25` and `25` is taken back off the
+    /// recovered exponent. That keeps the whole subnormal range accurate
+    /// instead of returning `-Inf` for it.
+    ///
+    /// Every IEEE special is restored by a final blend, because the bit
+    /// surgery in the middle destroys them:
+    ///
+    /// | input | result |
+    /// |---|---|
+    /// | `+Inf` | `+Inf` |
+    /// | `±0` | `-Inf` |
+    /// | `x < 0` | `NaN` |
+    /// | `NaN` | that same `NaN`, payload intact |
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn log_ps(x: __m256) -> __m256 {
+        let zero = _mm256_setzero_ps();
+
+        // Denormals (and only denormals: the compare is ordered, so NaN
+        // and negatives answer false, and they are overwritten at the end
+        // anyway) get scaled into the normal range first.
+        let is_denorm = _mm256_and_ps(
+            _mm256_cmp_ps(x, _mm256_set1_ps(f32::MIN_POSITIVE), _CMP_LT_OQ),
+            _mm256_cmp_ps(x, zero, _CMP_GT_OQ),
+        );
+        let scale = _mm256_blendv_ps(
+            _mm256_set1_ps(1.0),
+            _mm256_set1_ps(log_c::DENORM_SCALE),
+            is_denorm,
+        );
+        let scaled = _mm256_mul_ps(x, scale);
+        let exp_fix = _mm256_and_ps(is_denorm, _mm256_set1_ps(log_c::DENORM_EXP));
+
+        let bits = _mm256_castps_si256(scaled);
+        // 126, not 127: the mantissa below is forced into [0.5, 1) rather than
+        // [1, 2), so `x == m * 2^(field - 126)`. Using the usual 127 bias here
+        // costs exactly one `ln 2` and is invisible near `x = 1`, which is why
+        // it has to be caught at the top of the range (`ln(f32::MAX)`).
+        let raw_exp = _mm256_sub_epi32(_mm256_srli_epi32::<23>(bits), _mm256_set1_epi32(126));
+        let mut e = _mm256_sub_ps(_mm256_cvtepi32_ps(raw_exp), exp_fix);
+
+        // Mantissa into [0.5, 1): keep the fraction field, force the
+        // exponent field to 126.
+        let m = _mm256_or_ps(
+            _mm256_and_ps(
+                scaled,
+                _mm256_castsi256_ps(_mm256_set1_epi32(0x807f_ffffu32 as i32)),
+            ),
+            _mm256_set1_ps(0.5),
+        );
+
+        // Fold to [sqrt(0.5), sqrt(2)): below the split point, double the
+        // mantissa and borrow one from the exponent.
+        let lt = _mm256_cmp_ps(m, _mm256_set1_ps(log_c::SQRT_HALF), _CMP_LT_OQ);
+        e = _mm256_sub_ps(e, _mm256_and_ps(lt, _mm256_set1_ps(1.0)));
+        let f = _mm256_sub_ps(_mm256_add_ps(m, _mm256_and_ps(lt, m)), _mm256_set1_ps(1.0));
+
+        let z = _mm256_mul_ps(f, f);
+        let mut poly = _mm256_set1_ps(log_c::P0);
+        poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(log_c::P1));
+        poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(log_c::P2));
+        poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(log_c::P3));
+        poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(log_c::P4));
+        poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(log_c::P5));
+        poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(log_c::P6));
+        poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(log_c::P7));
+        poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(log_c::P8));
+        poly = _mm256_mul_ps(poly, _mm256_mul_ps(f, z));
+
+        poly = _mm256_fmadd_ps(e, _mm256_set1_ps(log_c::LN2_LO), poly);
+        poly = _mm256_fnmadd_ps(z, _mm256_set1_ps(0.5), poly);
+        let mut r = _mm256_add_ps(f, poly);
+        r = _mm256_fmadd_ps(e, _mm256_set1_ps(log_c::LN2_HI), r);
+
+        // Specials, innermost first.
+        let nan = _mm256_set1_ps(f32::NAN);
+        r = _mm256_blendv_ps(
+            r,
+            _mm256_set1_ps(f32::INFINITY),
+            _mm256_cmp_ps(x, _mm256_set1_ps(f32::INFINITY), _CMP_EQ_OQ),
+        );
+        // `-0.0 < 0.0` is false in IEEE, so both zeros land here and both
+        // give `-Inf`, which is what `f32::ln` does.
+        r = _mm256_blendv_ps(
+            r,
+            _mm256_set1_ps(f32::NEG_INFINITY),
+            _mm256_cmp_ps(x, zero, _CMP_EQ_OQ),
+        );
+        r = _mm256_blendv_ps(r, nan, _mm256_cmp_ps(x, zero, _CMP_LT_OQ));
+        // Pass the original through so the payload survives.
+        _mm256_blendv_ps(r, x, _mm256_cmp_ps(x, x, _CMP_UNORD_Q))
+    }
+
+    /// `Celu(x) = max(0, x) + min(0, alpha * (exp(x / alpha) - 1))`.
+    ///
+    /// Evaluated exactly as ONNX writes it. `alpha` is reciprocated once by the
+    /// caller so the per-element cost is a multiply rather than a divide.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn celu_ps(x: __m256, alpha: __m256, inv_alpha: __m256) -> __m256 {
+        unsafe {
+            let zero = _mm256_setzero_ps();
+            let e = exp_full_ps(_mm256_mul_ps(x, inv_alpha));
+            let neg = _mm256_mul_ps(alpha, _mm256_sub_ps(e, _mm256_set1_ps(1.0)));
+            // Operand order is load-bearing: `maxps a, b` returns `b` when
+            // either operand is NaN, so `max(x, zero)` would quietly turn NaN
+            // into 0. Passing `x` second propagates it, matching the scalar
+            // reference. Same argument for `minps` on the negative half.
+            _mm256_add_ps(_mm256_max_ps(zero, x), _mm256_min_ps(zero, neg))
+        }
+    }
+
+    /// `Softplus(x) = ln(1 + e^x)` in the stable form `max(x,0) + ln(1+e^-|x|)`.
+    ///
+    /// The `-|x|` argument means the exponential never overflows, so the only
+    /// rounding that matters is `1 + e^-|x|` losing the tail for large `|x|` —
+    /// where the result is dominated by `max(x,0)` anyway.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn softplus_ps(x: __m256) -> __m256 {
+        unsafe {
+            let zero = _mm256_setzero_ps();
+            let abs = _mm256_andnot_ps(_mm256_set1_ps(-0.0), x);
+            let e = exp_full_ps(_mm256_sub_ps(zero, abs));
+            // `max(zero, x)`, not `max(x, zero)`: see `celu_ps`. Here it is
+            // NaN propagation that depends on it.
+            _mm256_add_ps(
+                _mm256_max_ps(zero, x),
+                log_ps(_mm256_add_ps(_mm256_set1_ps(1.0), e)),
+            )
+        }
+    }
+
+    /// `Mish(x) = x * tanh(softplus(x))`.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn mish_ps(x: __m256) -> __m256 {
+        unsafe { _mm256_mul_ps(x, tanh_ps(softplus_ps(x))) }
+    }
+
     /// `2^k` for integer-valued `k`, built by biasing and shifting into the
     /// exponent field (`MlasPowerOf2Float32x4`).
     #[inline]
@@ -2030,6 +2277,28 @@ unsafe fn quick_gelu_avx2(input: &[f32], output: &mut [f32], alpha: f32) {
     unsafe {
         let a = core::arch::x86_64::_mm256_set1_ps(alpha);
         avx2::map_ps(input, output, |v| avx2::quick_gelu_ps(v, a))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn log_avx2(input: &[f32], output: &mut [f32]) {
+    unsafe { avx2::map_ps(input, output, |v| avx2::log_ps(v)) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn mish_avx2(input: &[f32], output: &mut [f32]) {
+    unsafe { avx2::map_ps(input, output, |v| avx2::mish_ps(v)) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn celu_avx2(input: &[f32], output: &mut [f32], alpha: f32) {
+    unsafe {
+        let a = core::arch::x86_64::_mm256_set1_ps(alpha);
+        let inv = core::arch::x86_64::_mm256_set1_ps(1.0 / alpha);
+        avx2::map_ps(input, output, |v| avx2::celu_ps(v, a, inv))
     }
 }
 
@@ -2408,6 +2677,228 @@ mod tests {
                     "sqrt mismatch at len={len} index={i} input={v:e}"
                 );
             }
+        }
+    }
+
+    /// `log`'s error is relative to the *result*, not the input: `ln(1e-38)`
+    /// is `-87.3`, where one ulp is `7.6e-6` and the shared `scaled_err`
+    /// (which divides by `max(|x|,1)`) would call that a huge error. Divide by
+    /// the reference magnitude instead, flooring at 1 so the region around
+    /// `x = 1` — where `ln` legitimately passes through zero — stays an
+    /// absolute test.
+    fn log_err(got: f32, want: f32) -> f64 {
+        if (got.is_nan() && want.is_nan()) || got == want {
+            return 0.0;
+        }
+        (f64::from(got) - f64::from(want)).abs() / f64::from(want).abs().max(1.0)
+    }
+
+    const LOG_BOUND: f64 = 2e-7;
+
+    #[test]
+    fn log_special_values() {
+        let mut x = special_inputs();
+        x.extend_from_slice(&[1.0, std::f32::consts::E, 0.5]);
+        let mut o = vec![0.0f32; x.len()];
+        log_f32_slice(&x, &mut o);
+        assert!(o[PAD].is_nan(), "log(-Inf) is NaN");
+        assert_eq!(o[PAD + 1], f32::NEG_INFINITY, "log(-0) is -Inf");
+        assert_eq!(o[PAD + 2], f32::NEG_INFINITY, "log(+0) is -Inf");
+        assert_eq!(o[PAD + 3], f32::INFINITY, "log(+Inf) is +Inf");
+        assert!(o[PAD + 4].is_nan(), "log(NaN)");
+        assert!(o[PAD + 5].is_nan(), "log(-MAX) is NaN");
+        assert!(log_err(o[PAD + 6], f32::MAX.ln()) <= LOG_BOUND);
+        assert!(o[PAD + 7].is_nan(), "log(-1e30) is NaN");
+        assert!(log_err(o[PAD + 8], 1e30f32.ln()) <= LOG_BOUND);
+        assert_eq!(o[x.len() - 3], 0.0, "log(1) is exactly 0");
+        assert!(log_err(o[x.len() - 2], 1.0) <= LOG_BOUND, "log(e) is 1");
+        assert!(log_err(o[x.len() - 1], 0.5f32.ln()) <= LOG_BOUND);
+    }
+
+    /// The vector path must not flush subnormals: it scales them into the
+    /// normal range instead, so the whole subnormal decade stays accurate.
+    #[test]
+    fn log_handles_subnormals() {
+        let mut x = vec![0.0f32; PAD];
+        x.extend_from_slice(&[
+            f32::from_bits(1),
+            f32::from_bits(2),
+            f32::from_bits(0x0000_0f00),
+            f32::from_bits(0x007f_ffff),
+            f32::MIN_POSITIVE,
+        ]);
+        let mut o = vec![0.0f32; x.len()];
+        log_f32_slice(&x, &mut o);
+        for (&xi, &got) in x[PAD..].iter().zip(&o[PAD..]) {
+            let want = xi.ln();
+            assert!(
+                got.is_finite(),
+                "log({xi:e}) returned {got}, so a subnormal was flushed"
+            );
+            let e = log_err(got, want);
+            assert!(e <= LOG_BOUND, "log({xi:e}): {got} vs {want}, err {e:e}");
+        }
+    }
+
+    #[test]
+    fn log_dense_sweep_matches_scalar() {
+        // Spread over the whole positive exponent range, not just [0,1]: the
+        // exponent reconstruction is the part most likely to be wrong.
+        let mut x: Vec<f32> = (0..200_003)
+            .map(|i| {
+                let t = i as f32 / 200_002.0;
+                (t * 176.0 - 88.0).exp2()
+            })
+            .collect();
+        x.extend(grid(1e-6, 20.0, 100_003, &[]));
+        x.extend(grid(0.9, 1.1, 50_003, &[]));
+        let mut o = vec![0.0f32; x.len()];
+        log_f32_slice(&x, &mut o);
+        let mut worst = 0.0f64;
+        for (&xi, &got) in x.iter().zip(&o) {
+            let e = log_err(got, xi.ln());
+            if e > worst {
+                worst = e;
+            }
+            assert!(e <= LOG_BOUND, "log({xi:e}) = {got}, want {}", xi.ln());
+        }
+        assert!(worst > 0.0, "sweep did not exercise anything");
+    }
+
+    #[test]
+    fn celu_special_values() {
+        let mut x = special_inputs();
+        x.extend_from_slice(&[1.0, -1.0, 0.25]);
+        let mut o = vec![0.0f32; x.len()];
+        celu_f32_slice(&x, &mut o, 1.0);
+        // Celu(-Inf) = 0 + min(0, 1*(exp(-Inf)-1)) = -1.
+        assert_eq!(o[PAD], -1.0, "celu(-Inf)");
+        // Celu(x) = max(0, x) + min(0, alpha * (exp(x / alpha) - 1)). At x = -0
+        // both terms are zero, and IEEE-754 round-to-nearest addition of two
+        // zeros yields -0 only when *both* are -0. Here the right-hand term is
+        // exp(-0) - 1 = +0, so the sign is destroyed by the formula itself --
+        // for the scalar reference and for ORT exactly as for us. Pin both.
+        assert_eq!(o[PAD + 1].to_bits(), 0, "celu(-0) is +0");
+        assert_eq!(celu_scalar(-0.0, 1.0).to_bits(), 0, "scalar celu(-0) is +0");
+        assert_eq!(o[PAD + 2], 0.0, "celu(+0)");
+        assert_eq!(o[PAD + 3], f32::INFINITY, "celu(+Inf)");
+        assert!(o[PAD + 4].is_nan(), "celu(NaN)");
+        assert_eq!(o[PAD + 5], -1.0, "celu(-MAX) saturates to -alpha");
+        assert_eq!(o[PAD + 6], f32::MAX, "celu(MAX)");
+        for (&xi, &got) in x[x.len() - 3..].iter().zip(&o[x.len() - 3..]) {
+            let want = celu_scalar(xi, 1.0);
+            assert!(
+                (f64::from(got) - f64::from(want)).abs() <= 4e-7,
+                "celu({xi}) = {got}, want {want}"
+            );
+        }
+    }
+
+    /// The scalar fallback must answer exactly what the vector path answers.
+    ///
+    /// `special_inputs()` pads to `SIMD_MIN_LEN`, so every other special-value
+    /// test in this file takes the vector path -- which is how `celu_scalar`
+    /// silently turning NaN into `0.0` survived being written. A slice shorter
+    /// than `SIMD_MIN_LEN` is the only way to reach the scalar branch from
+    /// outside, and it is reached in production by small tensors and by any
+    /// host without AVX2. Which one runs must not be observable.
+    #[test]
+    fn celu_scalar_path_agrees_with_the_vector_path() {
+        let specials = [
+            f32::NAN,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            -0.0,
+            0.0,
+            -1.0,
+            1.0,
+            -30.0,
+            0.25,
+        ];
+        assert!(
+            specials.len() < SIMD_MIN_LEN,
+            "the short slice must be short enough to take the scalar path"
+        );
+        for alpha in [0.25f32, 1.0, 2.0, 7.5] {
+            let mut short_out = vec![0.0f32; specials.len()];
+            celu_f32_slice(&specials, &mut short_out, alpha);
+
+            let mut long = vec![0.0f32; PAD];
+            long.extend_from_slice(&specials);
+            let mut long_out = vec![0.0f32; long.len()];
+            celu_f32_slice(&long, &mut long_out, alpha);
+
+            for (i, &x) in specials.iter().enumerate() {
+                let scalar = short_out[i];
+                let vector = long_out[PAD + i];
+                assert_eq!(
+                    scalar.is_nan(),
+                    vector.is_nan(),
+                    "celu({x}, alpha={alpha}): scalar {scalar}, vector {vector}"
+                );
+                if !scalar.is_nan() {
+                    assert_eq!(
+                        scalar.to_bits(),
+                        vector.to_bits(),
+                        "celu({x}, alpha={alpha}): scalar {scalar}, vector {vector}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn celu_matches_scalar_across_alphas() {
+        let x = grid(-30.0, 30.0, 20_003, &[]);
+        let mut o = vec![0.0f32; x.len()];
+        for alpha in [0.25f32, 0.5, 1.0, 2.0, 7.5] {
+            celu_f32_slice(&x, &mut o, alpha);
+            for (&xi, &got) in x.iter().zip(&o) {
+                let want = celu_scalar(xi, alpha);
+                let e = (f64::from(got) - f64::from(want)).abs() / f64::from(want).abs().max(1.0);
+                // The negative half is alpha * (exp(u) - 1), so alpha directly
+                // multiplies the rounding error of exp: at alpha = 7.5 a
+                // half-ulp slip in exp shows up as ~7.5 half-ulps here. The
+                // bound therefore has to scale with alpha rather than pretend
+                // the amplification is not real.
+                let bound = 4e-7 * f64::from(alpha).max(1.0);
+                assert!(
+                    e <= bound,
+                    "celu({xi}, alpha={alpha}) = {got}, want {want}, err {e:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mish_special_values() {
+        let mut x = special_inputs();
+        x.extend_from_slice(&[1.0, -1.0, 0.0]);
+        let mut o = vec![0.0f32; x.len()];
+        mish_f32_slice(&x, &mut o);
+        // softplus(-Inf) = 0, tanh(0) = 0, so x*0 with x = -Inf is NaN --
+        // which is what the scalar reference produces too.
+        assert_eq!(
+            o[PAD].is_nan(),
+            mish_scalar(f32::NEG_INFINITY).is_nan(),
+            "mish(-Inf) must agree with the scalar reference"
+        );
+        assert_eq!(o[PAD + 1].to_bits(), (-0.0f32).to_bits(), "mish(-0) is -0");
+        assert_eq!(o[PAD + 2], 0.0, "mish(+0)");
+        assert_eq!(o[PAD + 3], f32::INFINITY, "mish(+Inf)");
+        assert!(o[PAD + 4].is_nan(), "mish(NaN)");
+        assert_eq!(o[PAD + 6], f32::MAX, "mish(MAX) = MAX");
+    }
+
+    #[test]
+    fn mish_dense_sweep_matches_scalar() {
+        let x = grid(-30.0, 30.0, 200_003, &[]);
+        let mut o = vec![0.0f32; x.len()];
+        mish_f32_slice(&x, &mut o);
+        for (&xi, &got) in x.iter().zip(&o) {
+            let want = mish_scalar(xi);
+            let e = (f64::from(got) - f64::from(want)).abs() / f64::from(xi).abs().max(1.0);
+            assert!(e <= 6e-7, "mish({xi}) = {got}, want {want}, err {e:e}");
         }
     }
 
