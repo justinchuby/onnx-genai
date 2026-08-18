@@ -195,11 +195,13 @@ fn accumulate_products_scalar(
     }
 }
 
-/// `products` as a pointer that column-block tasks may share.
+/// `products` as a pointer that the block tasks may share.
 ///
-/// Every task writes only the columns of its own block, for every row, so no
-/// two tasks address the same `i32`. Column blocks rather than row blocks
-/// because `m == 1` is the decode shape and has no rows to split.
+/// A task owns the rectangle `[m0, m0 + mc) x [n0, n0 + nc)` and writes nothing
+/// outside it. Column starts are multiples of `block_width` and row starts are
+/// multiples of `block_height`, with `nc <= block_width` and `mc <=
+/// block_height`, so the rectangles tile the output and no two tasks address
+/// the same `i32`.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
 struct ProductsPtr(*mut i32);
@@ -348,7 +350,9 @@ unsafe fn accumulate_products_avx2(
                 let rows = MR.min(m0 + mc - r0);
                 for tile in 0..tiles {
                     let c0 = n0 + tile * NR;
-                    let width = NR.min(n - c0);
+                    // From `nc`, as in `pack_panel`, so a `block_width` that is
+                    // not a multiple of `NR` cannot make the two disagree.
+                    let width = NR.min(nc - tile * NR);
                     // SAFETY: AVX2 as above. The tile reads `panel_pairs`
                     // pairs from tile `tile`, which `pack_panel` just wrote,
                     // and `a_pairs[(r0 + r) * pairs + p]` for `r < rows <= MR`
