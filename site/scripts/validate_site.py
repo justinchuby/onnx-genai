@@ -88,45 +88,83 @@ RUNTIME_ROOT_PATTERNS = {
     "origin-root href assignment": re.compile(r"""\.href\s*=\s*["']/["']?\s*\+"""),
 }
 
-# jsDelivr npm URL parsing.
-#
-# A package/version boundary is any of: `/`, end-of-string, `?`, or `#` (a
-# trailing `/` is NOT required, unlike the previous pattern, which missed
-# bare executable URLs such as `.../npm/d3@7` or `.../npm/d3` with no
-# trailing path segment, and any `?query`/`#fragment` suffix). Scoped
-# packages (`@scope/name`) are parsed as a single package identifier so a
-# `@version` suffix is never mistaken for part of the scope/name.
-JSDELIVR_NPM_PATTERN = re.compile(
-    r"""https?://cdn\.jsdelivr\.net/npm/"""
-    r"""(?P<package>@[^/@?#"'\s]+/[^@/?#"'\s]+|[^@/?#"'\s]+)"""
-    r"""(?:@(?P<version>[^/?#"'\s]*))?""",
+# jsDelivr npm URL parsing. Executable references may be absolute or
+# scheme-relative; normalize those browser-equivalent forms for policy, but
+# reject raw or decoded dot segments before URL normalization can erase an
+# attempted package/path escape.
+JSDELIVR_NPM_REFERENCE = re.compile(
+    r"""(?:(?:https?:)?//cdn\.jsdelivr\.net/npm/)"""
+    r"""(?P<tail>[^"'()<>\s]+)""",
     re.IGNORECASE,
 )
 EXACT_SEMVER_PATTERN = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?")
 
-# Runtime executable jsDelivr references must be exact immutable semver
-# *and* the exact package must be individually reviewed and allowlisted --
-# an exact-semver shape alone is not sufficient, otherwise a prefix,
-# prerelease, or an unrelated package could ride along on a coincidentally
-# well-formed version string. Local bundling means Graph's d3/pixi.js have
-# zero legitimate jsDelivr references in production (see
-# integrate-graph-runtime.mjs); the only currently reviewed exception is the
-# pinned `latex` Quartz plugin's KaTeX copy-tex asset, embedded at the exact
-# commit recorded in quartz.lock.json.
-JSDELIVR_ALLOWLIST: dict[str, frozenset[str]] = {
-    "katex": frozenset({"0.16.11"}),
+# Local bundling means Graph's d3/pixi.js have zero legitimate jsDelivr
+# references in production. The only reviewed runtime exception is the exact
+# KaTeX copy-tex asset emitted by Quartz's latex plugin.
+JSDELIVR_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
+    ("katex", "0.16.11"): frozenset({"dist/contrib/copy-tex.min.js"}),
 }
+
+
+def _strip_query_fragment(value: str) -> str:
+    return re.split(r"[?#]", value, maxsplit=1)[0]
+
+
+def _decoded_dot_segment(segment: str) -> bool:
+    candidate = segment
+    for _ in range(4):
+        if candidate in {".", ".."}:
+            return True
+        decoded = unquote(candidate)
+        if decoded == candidate:
+            return False
+        candidate = decoded
+    return candidate in {".", ".."}
+
+
+def _parse_jsdelivr_tail(tail: str) -> tuple[str | None, str | None, str | None, bool]:
+    has_query_fragment = _strip_query_fragment(tail) != tail
+    path = _strip_query_fragment(tail)
+    segments = path.split("/")
+    if any(_decoded_dot_segment(segment) for segment in segments):
+        return None, None, None, True
+    if has_query_fragment:
+        return None, None, None, True
+    if not segments or not segments[0]:
+        return None, None, None, False
+
+    if segments[0].startswith("@"):
+        if len(segments) < 2 or not segments[1]:
+            return None, None, None, False
+        package_base = f"{segments[0]}/{segments[1].split('@', 1)[0]}"
+        version = None
+        if "@" in segments[1]:
+            _, version = segments[1].rsplit("@", 1)
+        asset_segments = segments[2:]
+        return package_base, version, "/".join(asset_segments), False
+
+    package_segment = segments[0]
+    package = package_segment
+    version = None
+    if "@" in package_segment:
+        package, version = package_segment.rsplit("@", 1)
+    asset_path = "/".join(segments[1:])
+    return package, version, asset_path, False
 
 
 def mutable_cdn_references(source: str) -> int:
     count = 0
-    for match in JSDELIVR_NPM_PATTERN.finditer(source):
-        package = match["package"]
-        version = match["version"]
+    for match in JSDELIVR_NPM_REFERENCE.finditer(source):
+        package, version, asset_path, has_dot_segment = _parse_jsdelivr_tail(match["tail"])
+        if has_dot_segment:
+            count += 1
+            continue
         if (
-            version is not None
+            package is not None
+            and version is not None
             and EXACT_SEMVER_PATTERN.fullmatch(version) is not None
-            and version in JSDELIVR_ALLOWLIST.get(package, frozenset())
+            and asset_path in JSDELIVR_ALLOWLIST.get((package, version), frozenset())
         ):
             continue
         count += 1
@@ -152,23 +190,33 @@ def run_resource_audit(
 
     This is the non-vacuous replacement for substring-counting Search,
     Graph, Explorer, the local ESM loader, and Graph's vendor import edges:
-    site/quartz/scripts/audit-runtime-resources.mjs parses every emitted
-    `*.js` bundle (and every inline `<script>` body) into a real AST, prunes
-    provably unreachable/dead branches, and only counts a signature as
-    "functional" when something downstream actually depends on it. A
-    comment, an unused string, or a dead `if (false) {...}` placeholder
-    cannot satisfy any of these checks. Graph's local vendor assets are
-    cross-checked here against the sha256 recorded in the build-emitted
-    `static/vendor/manifest.json`, so the manifest itself cannot be
-    hand-edited without also matching real deployed bytes.
+    site/quartz/scripts/audit-runtime-resources.mjs starts at generated HTML
+    scripts/inline bodies, follows reachable imports/load edges, parses only
+    that reachable script graph into real ASTs, prunes provably unreachable
+    branches, and only counts a signature as "functional" when something
+    downstream actually depends on it. A comment, unused string, unreferenced
+    decoy bundle, or dead `if (false) {...}` placeholder cannot satisfy any of
+    these checks. Graph's local vendor assets are cross-checked here against
+    the sha256 recorded in the build-emitted `static/vendor/manifest.json`, so
+    the manifest itself cannot be hand-edited without also matching real
+    deployed bytes.
     """
     manifest_path = public / VENDOR_MANIFEST_RELATIVE
     inline_payload = json.dumps(
         {
-            "inlineScripts": [
-                {"id": f"{html.relative_to(public).as_posix()}#{index}", "source": source}
+            "documents": [
+                {
+                    "html": html.relative_to(public).as_posix(),
+                    "scriptSources": document.script_sources,
+                    "inlineScripts": [
+                        {
+                            "id": f"{html.relative_to(public).as_posix()}#{index}",
+                            "source": source,
+                        }
+                        for index, source in enumerate(document.inline_scripts)
+                    ],
+                }
                 for html, document in documents
-                for index, source in enumerate(document.inline_scripts)
             ]
         }
     )
@@ -200,6 +248,9 @@ def run_resource_audit(
 
     for entry in audit.get("parseErrors", []):
         errors.add(f"{entry['file']}: runtime bundle failed to parse: {entry['message']}")
+
+    for entry in audit.get("resourceGraph", {}).get("errors", []):
+        errors.add(f"runtime resource graph: {entry}")
 
     manifest = audit.get("manifest", {})
     assets = manifest.get("assets", [])
@@ -315,6 +366,10 @@ def validate_runtime(
 
     return {
         "bundles": len(scripts),
+        "reachable_bundles": audit.get("bundleCount", 0) if audit else 0,
+        "ignored_bundles": len(audit.get("resourceGraph", {}).get("ignoredScripts", []))
+        if audit
+        else 0,
         "inline_scripts": inline_script_count,
         "inline_fetch": sum(entry.get("functional", 0) for entry in fetch_entries),
         "origin_root": origin_root_count,
@@ -360,6 +415,8 @@ def main() -> int:
             parsed = urlparse(raw_url)
             if parsed.scheme in {"data", "mailto", "tel", "javascript"}:
                 continue
+            if parsed.netloc and parsed.hostname != "justinchuby.github.io":
+                continue
             if parsed.scheme in {"http", "https"} and parsed.hostname != "justinchuby.github.io":
                 continue
             if raw_url.startswith("#") or not raw_url:
@@ -393,7 +450,9 @@ def main() -> int:
         f"{runtime['origin_root']}, mutable CDN={runtime['mutable_cdn']}, "
         f"local vendor assets={runtime['local_vendor_assets']}, "
         f"local vendor references={runtime['local_vendor_references']}, "
-        f"module loaders={runtime['module_loaders']}."
+        f"module loaders={runtime['module_loaders']}, "
+        f"reachable bundles={runtime['reachable_bundles']}, "
+        f"ignored unreferenced bundles={runtime['ignored_bundles']}."
     )
     return 0
 

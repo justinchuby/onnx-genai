@@ -108,11 +108,18 @@ class ValidateSiteTest(unittest.TestCase):
         inline_runtime: str | None = SAFE_INLINE,
         include_expected_runtime: bool = True,
         write_manifest: bool = True,
+        include_runtime_scripts: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         if "<body" not in body:
             body = f'<body data-basepath="/onnx-genai">{body}</body>'
+        runtime_scripts = (
+            '<script src="/onnx-genai/prescript.js"></script>'
+            '<script src="/onnx-genai/postscript.js"></script>'
+            if include_runtime_scripts
+            else ""
+        )
         inline = f"<script>{inline_runtime}</script>" if inline_runtime is not None else ""
-        (self.public / "index.html").write_text(body + inline, encoding="utf-8")
+        (self.public / "index.html").write_text(body + runtime_scripts + inline, encoding="utf-8")
         runtime = (SAFE_RUNTIME if include_expected_runtime else "") + runtime_extra
         (self.public / "postscript.js").write_text(runtime, encoding="utf-8")
         (self.public / "prescript.js").write_text("window.addCleanup = () => {}", encoding="utf-8")
@@ -285,6 +292,77 @@ class ValidateSiteTest(unittest.TestCase):
         self.assertIn("missing Search runtime surface", result.stderr)
         self.assertIn("vacuous", result.stderr)
 
+    def test_rejects_unused_selector_binding(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra=(
+                loader_runtime()
+                + 'var searchEl=document.querySelector(".search-container");'
+                + GRAPH_SURFACE_RUNTIME
+                + EXPLORER_RUNTIME
+            ),
+            include_expected_runtime=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing Search runtime surface", result.stderr)
+        self.assertIn("vacuous", result.stderr)
+
+    def test_accepts_selector_binding_consumed_by_behavior(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra=loader_runtime() + SEARCH_RUNTIME + GRAPH_SURFACE_RUNTIME + EXPLORER_RUNTIME,
+            include_expected_runtime=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_selector_after_statically_decisive_return(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra=(
+                loader_runtime()
+                + "(()=>{if(true)return;"
+                + SEARCH_RUNTIME
+                + "})();"
+                + GRAPH_SURFACE_RUNTIME
+                + EXPLORER_RUNTIME
+            ),
+            include_expected_runtime=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing Search runtime surface", result.stderr)
+        self.assertIn("dead/unreachable", result.stderr)
+
+    def test_accepts_selector_inside_invoked_function(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra=(
+                loader_runtime()
+                + "function wireSearch(){"
+                + SEARCH_RUNTIME
+                + "}wireSearch();"
+                + GRAPH_SURFACE_RUNTIME
+                + EXPLORER_RUNTIME
+            ),
+            include_expected_runtime=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_selector_inside_never_called_function(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra=(
+                loader_runtime()
+                + "function wireSearch(){"
+                + SEARCH_RUNTIME
+                + "}"
+                + GRAPH_SURFACE_RUNTIME
+                + EXPLORER_RUNTIME
+            ),
+            include_expected_runtime=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing Search runtime surface", result.stderr)
+
     def test_rejects_missing_graph_import_edge(self) -> None:
         """A real, reachable script-loader that is only ever called for one
         of the two vendor assets must fail: Graph's loader must have real
@@ -337,9 +415,132 @@ class ValidateSiteTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing local ESM script-loader function", result.stderr)
 
+    def test_rejects_independent_manifest_url_calls_without_loader_edge(self) -> None:
+        fake_loader = (
+            'function d(o){var s=document.createElement("script");'
+            's.src=o,s.type="module";document.head.appendChild(s);}'
+            "function other(o){return o;}"
+            f'other("{D3_URL}");other("{PIXI_URL}");'
+        )
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra=fake_loader + SEARCH_RUNTIME + GRAPH_SURFACE_RUNTIME + EXPLORER_RUNTIME,
+            include_expected_runtime=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"missing reachable Graph import edge to {D3_URL}", result.stderr)
+
+    def test_rejects_loader_with_constant_about_blank_src(self) -> None:
+        fake_loader = (
+            'function d(o){var s=document.createElement("script");'
+            's.src="about:blank";s.type="module";document.head.appendChild(s);}'
+            f'd("{D3_URL}");d("{PIXI_URL}");'
+        )
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra=fake_loader + SEARCH_RUNTIME + GRAPH_SURFACE_RUNTIME + EXPLORER_RUNTIME,
+            include_expected_runtime=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing local ESM script-loader function", result.stderr)
+
+    def test_rejects_loader_when_manifest_url_is_wrong_parameter(self) -> None:
+        fake_loader = (
+            'function d(o,src){var s=document.createElement("script");'
+            's.src=src;s.type="module";document.head.appendChild(s);}'
+            f'd("{D3_URL}","about:blank");d("{PIXI_URL}","about:blank");'
+        )
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra=fake_loader + SEARCH_RUNTIME + GRAPH_SURFACE_RUNTIME + EXPLORER_RUNTIME,
+            include_expected_runtime=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"missing reachable Graph import edge to {D3_URL}", result.stderr)
+
+    def test_rejects_loader_with_overwritten_src_before_append(self) -> None:
+        fake_loader = (
+            'function d(o){var s=document.createElement("script");'
+            's.src=o;s.src="about:blank";s.type="module";document.head.appendChild(s);}'
+            f'd("{D3_URL}");d("{PIXI_URL}");'
+        )
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra=fake_loader + SEARCH_RUNTIME + GRAPH_SURFACE_RUNTIME + EXPLORER_RUNTIME,
+            include_expected_runtime=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing local ESM script-loader function", result.stderr)
+
+    def test_rejects_loader_that_appends_separate_script_object(self) -> None:
+        fake_loader = (
+            'function d(o){var s=document.createElement("script");var t=document.createElement("script");'
+            's.src=o;t.type="module";document.head.appendChild(t);}'
+            f'd("{D3_URL}");d("{PIXI_URL}");'
+        )
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra=fake_loader + SEARCH_RUNTIME + GRAPH_SURFACE_RUNTIME + EXPLORER_RUNTIME,
+            include_expected_runtime=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing local ESM script-loader function", result.stderr)
+
+    def test_accepts_loader_alias_dataflow_to_appended_src(self) -> None:
+        alias_loader = (
+            'function d(o){var local=o;var s=document.createElement("script");'
+            's.src=local;s.type="module";document.head.appendChild(s);}'
+            f'd("{D3_URL}");d("{PIXI_URL}");'
+        )
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra=alias_loader + SEARCH_RUNTIME + GRAPH_SURFACE_RUNTIME + EXPLORER_RUNTIME,
+            include_expected_runtime=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_accepts_functional_runtime(self) -> None:
         result = self.run_validator("<p>Wiki</p>")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_unreferenced_decoy_bundle_as_runtime_evidence(self) -> None:
+        (self.public / "decoy.js").write_text(SAFE_RUNTIME, encoding="utf-8")
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra="true;",
+            include_expected_runtime=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing Search runtime surface", result.stderr)
+        self.assertIn(f"missing reachable Graph import edge to {D3_URL}", result.stderr)
+
+    def test_accepts_referenced_root_importing_functional_child(self) -> None:
+        (self.public / "child.js").write_text(SAFE_RUNTIME, encoding="utf-8")
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra='import "./child.js";',
+            include_expected_runtime=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_missing_html_referenced_script(self) -> None:
+        result = self.run_validator('<script src="/onnx-genai/missing.js"></script><p>Wiki</p>')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing referenced/imported script: missing.js", result.stderr)
+
+    def test_rejects_html_script_path_escape(self) -> None:
+        result = self.run_validator('<script src="/onnx-genai/../escape.js"></script><p>Wiki</p>')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("local URL escapes /onnx-genai", result.stderr)
+
+    def test_rejects_missing_static_import(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra='import "./missing-child.js";' + SAFE_RUNTIME,
+            include_expected_runtime=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing referenced/imported script: missing-child.js", result.stderr)
 
     def test_rejects_missing_vendor_manifest(self) -> None:
         result = self.run_validator("<p>Wiki</p>", write_manifest=False)
@@ -352,7 +553,10 @@ class ValidateSiteTest(unittest.TestCase):
         hand-edit, or a corrupted asset) validation must fail rather than
         trust the manifest blindly."""
         (self.public / "index.html").write_text(
-            f'<body data-basepath="/onnx-genai"><p>Wiki</p></body><script>{SAFE_INLINE}</script>',
+            '<body data-basepath="/onnx-genai"><p>Wiki</p></body>'
+            '<script src="/onnx-genai/prescript.js"></script>'
+            '<script src="/onnx-genai/postscript.js"></script>'
+            f"<script>{SAFE_INLINE}</script>",
             encoding="utf-8",
         )
         (self.public / "postscript.js").write_text(SAFE_RUNTIME, encoding="utf-8")
@@ -392,6 +596,29 @@ class ValidateSiteTest(unittest.TestCase):
         self.assertIn("missing inline shared fetchData runtime surface", result.stderr)
         self.assertIn("dead/unreachable", result.stderr)
 
+    def test_rejects_inline_never_called_fetch_closure(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            inline_runtime='const fetchData = () => fetch("/onnx-genai/static/contentIndex.json")',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing inline shared fetchData runtime surface", result.stderr)
+
+    def test_accepts_inline_invoked_fetch_closure(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            inline_runtime='const fetchData = (() => fetch("/onnx-genai/static/contentIndex.json"))()',
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_inline_short_circuited_fetch_data(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            inline_runtime='const fetchData = false && fetch("/onnx-genai/static/contentIndex.json")',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing inline shared fetchData runtime surface", result.stderr)
+
     # ------------------------------------------------------------------
     # Hardened jsDelivr URL parsing: package/version boundary is `/`,
     # end-of-string, `?`, or `#` -- not only `/`. Exact-version allowlisting
@@ -403,10 +630,20 @@ class ValidateSiteTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("mutable jsDelivr", result.stderr)
 
+    def test_rejects_scheme_relative_floating_major_cdn_script(self) -> None:
+        result = self.run_validator('<script src="//cdn.jsdelivr.net/npm/d3@7"></script>')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mutable jsDelivr", result.stderr)
+
     def test_rejects_bare_floating_major_cdn_script_with_query(self) -> None:
         result = self.run_validator(
             '<script src="https://cdn.jsdelivr.net/npm/d3@7?min"></script>'
         )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mutable jsDelivr", result.stderr)
+
+    def test_rejects_scheme_relative_floating_major_cdn_script_with_query(self) -> None:
+        result = self.run_validator('<script src="//cdn.jsdelivr.net/npm/d3@7?min"></script>')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("mutable jsDelivr", result.stderr)
 
@@ -500,6 +737,79 @@ class ValidateSiteTest(unittest.TestCase):
             '<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/copy-tex.min.js"></script>'
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_accepts_scheme_relative_reviewed_exact_allowlisted_cdn_script(self) -> None:
+        result = self.run_validator(
+            '<script src="//cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/copy-tex.min.js"></script>'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_allowlisted_package_with_different_asset_path(self) -> None:
+        result = self.run_validator(
+            '<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mutable jsDelivr", result.stderr)
+
+    def test_rejects_allowlisted_asset_with_query(self) -> None:
+        result = self.run_validator(
+            '<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/copy-tex.min.js?module"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mutable jsDelivr", result.stderr)
+
+    def test_rejects_allowlisted_asset_with_fragment(self) -> None:
+        result = self.run_validator(
+            '<script src="//cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/copy-tex.min.js#sha256-abc"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mutable jsDelivr", result.stderr)
+
+    def test_rejects_raw_dot_segment_cdn_package_escape(self) -> None:
+        result = self.run_validator(
+            '<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/../d3@7/dist/d3.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mutable jsDelivr", result.stderr)
+
+    def test_rejects_encoded_dot_segment_cdn_package_escape(self) -> None:
+        result = self.run_validator(
+            '<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/%2e%2e/d3@7/dist/d3.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mutable jsDelivr", result.stderr)
+
+    def test_rejects_double_encoded_dot_segment_cdn_package_escape(self) -> None:
+        result = self.run_validator(
+            '<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/%252e%252e/d3@7/dist/d3.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mutable jsDelivr", result.stderr)
+
+    def test_rejects_single_dot_segment_cdn_package_escape(self) -> None:
+        result = self.run_validator(
+            '<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/%2e/dist/contrib/copy-tex.min.js"></script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mutable jsDelivr", result.stderr)
+
+    def test_rejects_inline_string_floating_cdn_reference(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            inline_runtime=SAFE_INLINE + ';const url = "https://cdn.jsdelivr.net/npm/d3@7"',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("inline mutable jsDelivr", result.stderr)
+
+    def test_rejects_static_import_floating_cdn_reference(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            runtime_extra='import "https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js";'
+            + SAFE_RUNTIME,
+            include_expected_runtime=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mutable jsDelivr", result.stderr)
 
     def test_rejects_inline_floating_cdn_import(self) -> None:
         result = self.run_validator(
