@@ -993,16 +993,8 @@ fn validate_request(
             )));
         }
     }
-    if !request.temperature.is_finite() || request.temperature < 0.0 {
-        return Err(ApiError::bad_request(
-            "temperature must be finite and non-negative",
-        ));
-    }
-    if !request.top_p.is_finite() || request.top_p < 0.0 {
-        return Err(ApiError::bad_request(
-            "top_p must be finite and non-negative",
-        ));
-    }
+    validate_sampling_range(request.temperature, "temperature")?;
+    validate_sampling_range(request.top_p, "top_p")?;
     if !request.min_p.is_finite() || !(0.0..=1.0).contains(&request.min_p) {
         return Err(ApiError::bad_request(
             "min_p must be finite and between 0 and 1",
@@ -1099,16 +1091,8 @@ fn validate_completion_request(
             config.max_output_tokens
         )));
     }
-    if !request.temperature.is_finite() || request.temperature < 0.0 {
-        return Err(ApiError::bad_request(
-            "temperature must be finite and non-negative",
-        ));
-    }
-    if !request.top_p.is_finite() || request.top_p < 0.0 {
-        return Err(ApiError::bad_request(
-            "top_p must be finite and non-negative",
-        ));
-    }
+    validate_sampling_range(request.temperature, "temperature")?;
+    validate_sampling_range(request.top_p, "top_p")?;
     if !request.min_p.is_finite() || !(0.0..=1.0).contains(&request.min_p) {
         return Err(ApiError::bad_request(
             "min_p must be finite and between 0 and 1",
@@ -1378,8 +1362,8 @@ fn tokenize_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<usize, ApiErro
 fn build_completion_options(request: &CompletionRequest, tokenizer: &Tokenizer) -> GenerateOptions {
     let mut options = GenerateOptions {
         max_new_tokens: request.max_tokens,
-        temperature: request.temperature,
-        top_p: request.top_p,
+        temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
+        top_p: request.top_p.unwrap_or(NEUTRAL_SAMPLING),
         min_p: request.min_p,
         frequency_penalty: request.frequency_penalty,
         presence_penalty: request.presence_penalty,
@@ -1401,13 +1385,8 @@ fn build_completion_options(request: &CompletionRequest, tokenizer: &Tokenizer) 
 /// knob the completions schema exposes) is an explicit request to sample.
 /// Otherwise the greedy decision is deferred (`None`) so a model that declares
 /// `do_sample: true` samples instead of looping under forced greedy.
-///
-/// `temperature` and `top_p` are passed as explicit values because the
-/// OpenAI-compatible schema always supplies them (with documented defaults) and
-/// has no "unspecified" state, so the API defaults win over any model-declared
-/// temperature/top_p; only the greedy decision defers to the model.
 fn completion_sampling_overrides(request: &CompletionRequest) -> SamplingOverrides {
-    let greedy = if request.temperature == 0.0 {
+    let greedy = if request.temperature == Some(0.0) {
         Some(true)
     } else if request.min_p > 0.0 {
         Some(false)
@@ -1416,8 +1395,8 @@ fn completion_sampling_overrides(request: &CompletionRequest) -> SamplingOverrid
     };
     SamplingOverrides {
         greedy,
-        temperature: Some(request.temperature),
-        top_p: Some(request.top_p),
+        temperature: request.temperature,
+        top_p: request.top_p,
         top_k: None,
     }
 }
@@ -1503,8 +1482,8 @@ fn build_generate_options(
         || request.xtc_probability > 0.0;
     let mut options = GenerateOptions {
         max_new_tokens: output_budget,
-        temperature: request.temperature,
-        top_p: request.top_p,
+        temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
+        top_p: request.top_p.unwrap_or(NEUTRAL_SAMPLING),
         top_k: request.top_k,
         min_p: request.min_p,
         top_a: request.top_a,
@@ -1512,7 +1491,7 @@ fn build_generate_options(
         repetition_penalty: request.repetition_penalty,
         frequency_penalty: request.frequency_penalty,
         presence_penalty: request.presence_penalty,
-        greedy: request.temperature == 0.0 || !stochastic_sampling_requested,
+        greedy: request.temperature == Some(0.0) || !stochastic_sampling_requested,
         seed: request.seed,
         dry: (request.dry_multiplier > 0.0).then(|| DryConfig {
             multiplier: request.dry_multiplier,
@@ -1576,7 +1555,7 @@ fn chat_sampling_overrides(request: &ChatCompletionRequest) -> SamplingOverrides
         || request.typical_p < 1.0
         || request.mirostat > 0
         || request.xtc_probability > 0.0;
-    let greedy = if request.temperature == 0.0 {
+    let greedy = if request.temperature == Some(0.0) {
         Some(true)
     } else if requests_sampling {
         Some(false)
@@ -1585,14 +1564,34 @@ fn chat_sampling_overrides(request: &ChatCompletionRequest) -> SamplingOverrides
     };
     SamplingOverrides {
         greedy,
-        temperature: Some(request.temperature),
-        top_p: Some(request.top_p),
+        // An absent field is a caller with no opinion, not a caller choosing
+        // the schema's documented default, so a package that declares its own
+        // temperature or top-p keeps it. An agent client typically sends
+        // neither; overriding both with 1.0 widened every such model to its
+        // full distribution, which is how a long agent turn degenerates.
+        temperature: request.temperature,
+        top_p: request.top_p,
         // `top_k` is an extension the OpenAI schema never carries, and 0 is its
         // "disabled" sentinel rather than a caller's choice. Treat an absent
         // `top_k` as unspecified so a package that declares one keeps it,
         // instead of every OpenAI client silently widening the model to the
         // full vocabulary.
         top_k: (request.top_k > 0).then_some(request.top_k),
+    }
+}
+
+/// Neutral value for a sampling control the caller left unset, used only where
+/// options are built without resolving them against the package's declaration.
+const NEUTRAL_SAMPLING: f32 = 1.0;
+
+/// Reject a sampling control the caller actually sent; an absent one is the
+/// package's business rather than a value to judge.
+fn validate_sampling_range(value: Option<f32>, field: &str) -> Result<(), ApiError> {
+    match value {
+        Some(value) if !value.is_finite() || value < 0.0 => Err(ApiError::bad_request(format!(
+            "{field} must be finite and non-negative"
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -2565,9 +2564,10 @@ mod sampling_resolution_tests {
             &chat_sampling_overrides(&request),
         );
         assert!(!options.greedy, "model do_sample=true must disable greedy");
-        // The OpenAI-compatible temperature default wins over the model's
-        // declared temperature (the schema always supplies a value).
-        assert_eq!(options.temperature, 1.0);
+        assert_eq!(
+            options.temperature, 0.6,
+            "a silent request keeps the declared temperature"
+        );
     }
 
     // An explicit sampling control keeps its meaning against a greedy model, and
@@ -2618,8 +2618,8 @@ mod sampling_resolution_tests {
         let request: CompletionRequest =
             serde_json::from_value(json!({ "model": "m", "prompt": "hi" })).unwrap();
         let mut options = GenerateOptions {
-            temperature: request.temperature,
-            top_p: request.top_p,
+            temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
+            top_p: request.top_p.unwrap_or(NEUTRAL_SAMPLING),
             ..GenerateOptions::default()
         };
         assert!(options.greedy, "completions default to greedy");
@@ -2628,6 +2628,65 @@ mod sampling_resolution_tests {
             &completion_sampling_overrides(&request),
         );
         assert!(!options.greedy, "model do_sample=true must disable greedy");
+        assert_eq!(
+            options.temperature, 0.6,
+            "a silent request keeps the declared temperature"
+        );
+    }
+
+    // An agent client sends neither field, and the schema's documented 1.0
+    // defaults used to be forwarded as the caller's choice, silently widening
+    // every such model to its full distribution.
+    #[test]
+    fn a_silent_request_keeps_the_declared_temperature_and_top_p() {
+        let silent = chat_sampling_overrides(&chat_request(json!({})));
+        assert_eq!(silent.temperature, None);
+        assert_eq!(silent.top_p, None);
+
+        let explicit = chat_sampling_overrides(&chat_request(json!({
+            "temperature": 0.2,
+            "top_p": 0.5
+        })));
+        assert_eq!(explicit.temperature, Some(0.2));
+        assert_eq!(explicit.top_p, Some(0.5));
+    }
+
+    // Zero temperature is still how OpenAI clients ask for determinism, and it
+    // has to keep winning over a package that declares sampling.
+    #[test]
+    fn an_explicit_zero_temperature_still_forces_greedy() {
+        let request = chat_request(json!({ "temperature": 0.0 }));
+        let mut options = build_generate_options(&request, DEFAULT_MAX_OUTPUT_TOKENS);
+        options.resolve_sampling_defaults(
+            Some(&declared(Some(true), Some(0.6))),
+            &chat_sampling_overrides(&request),
+        );
+
+        assert!(options.greedy, "an explicit zero temperature is greedy");
+        assert_eq!(options.temperature, 0.0);
+    }
+
+    // The subtle case the Option distinction exists for: a caller that sends the
+    // schema's own default value (1.0) has still made an explicit choice, so it
+    // must override a package that declares a different temperature — absent is
+    // "no opinion", a sent 1.0 is an opinion that happens to equal the default.
+    #[test]
+    fn an_explicit_default_valued_temperature_still_overrides_the_package() {
+        let request = chat_request(json!({ "temperature": 1.0 }));
+        assert_eq!(
+            chat_sampling_overrides(&request).temperature,
+            Some(1.0),
+            "an explicitly sent 1.0 is a choice, not absence"
+        );
+        let mut options = build_generate_options(&request, DEFAULT_MAX_OUTPUT_TOKENS);
+        options.resolve_sampling_defaults(
+            Some(&declared(Some(true), Some(0.6))),
+            &chat_sampling_overrides(&request),
+        );
+        assert_eq!(
+            options.temperature, 1.0,
+            "a caller's explicit 1.0 wins over the package's declared 0.6"
+        );
     }
 }
 
