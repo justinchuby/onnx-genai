@@ -400,11 +400,23 @@ impl PipelineEngine {
                         inputs,
                         tokens: final_context,
                     });
+                    // Retain the decoder only here, under exactly the condition
+                    // that refreshed `retained`. The next request rewinds this
+                    // KV to a prefix length derived from `retained`, so a
+                    // decoder kept without a matching `retained` would have its
+                    // contents described by a stale context -- reusing another
+                    // request's KV as this one's prefix, silently and with
+                    // plausible output. Reachable whenever a request is not
+                    // digestible (`digest_request_identity` returns `None` for
+                    // an input `absorb_value` cannot canonicalize) or does not
+                    // use KV: those requests would leave `retained` untouched
+                    // while overwriting the KV it claims to describe. Dropping
+                    // the decoder only costs the reuse.
+                    if use_native_decoder {
+                        self.native_retained_decoder = native_decoder_component;
+                    }
                 }
             }
-        }
-        if use_native_decoder && paged_session.is_none() {
-            self.native_retained_decoder = native_decoder_component;
         }
         Ok((result, tensors))
     }
