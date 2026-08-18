@@ -1806,6 +1806,7 @@ name = "mlas-sys"
 version = "0.1.0-dev.5"
 dependencies = [
  "cc",
+ "libm",
  "rayon",
 ]
 
@@ -2030,6 +2031,7 @@ dependencies = [
  "clap",
  "criterion",
  "cudarc",
+ "half",
  "onnx-genai-engine",
  "onnx-genai-kv",
  "onnx-genai-metadata",
@@ -2426,6 +2428,7 @@ dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-ort-testkit",
  "onnx-std",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -2551,6 +2554,7 @@ dependencies = [
 name = "onnx-runtime-memory-governor"
 version = "0.1.0-dev.5"
 dependencies = [
+ "criterion",
  "thiserror 2.0.19",
 ]
 
@@ -2618,6 +2622,7 @@ dependencies = [
  "onnx-runtime-shape-inference",
  "onnx-runtime-tracer",
  "prost",
+ "rayon",
  "thiserror 2.0.19",
 ]
 

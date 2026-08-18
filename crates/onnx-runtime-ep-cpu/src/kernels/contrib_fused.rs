@@ -6,9 +6,9 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
-use super::gelu::{exact_gelu, tanh_gelu};
 use super::layernorm::layer_norm_dense;
 use super::rmsnorm::rms_norm_dense;
+use super::simd_activations;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 fn require_fused_float_dtype(op: &str, inputs: &[TensorView], outputs: &[TensorMut]) -> Result<()> {
@@ -102,12 +102,21 @@ impl Kernel for BiasGeluKernel {
         let x = to_dense_f32_widen("BiasGelu", &inputs[0])?;
         let bias = to_dense_f32_widen("BiasGelu", &inputs[1])?;
         let width = last_dim_bias(inputs[0].shape, &bias, "BiasGelu")?;
-        let y = x
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| exact_gelu(v + bias[i % width]))
-            .collect::<Vec<_>>();
-        write_dense_f32_narrow("BiasGelu", &mut outputs[0], &y)
+        if width == 0 {
+            // A zero last dimension means the tensor is empty, so there is
+            // nothing to compute and no bias row to broadcast.
+            return write_dense_f32_narrow("BiasGelu", &mut outputs[0], &[]);
+        }
+        // Bias folded in-register, exactly as `FastGelu` does — see
+        // `kernels::simd_activations::erf_gelu_bias_f32_slice`. `bias` may
+        // borrow the input tensor's storage, so it is declared as a read range.
+        simd_activations::write_mapped_reading(
+            "BiasGelu",
+            &mut outputs[0],
+            &x,
+            &[crate::dtype::slice_byte_range(&bias)],
+            |x, y| simd_activations::erf_gelu_bias_f32_slice(x, &bias, width, y),
+        )
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -138,12 +147,25 @@ impl Kernel for FastGeluKernel {
             .as_deref()
             .map(|b| last_dim_bias(inputs[0].shape, b, "FastGelu"))
             .transpose()?;
-        let y = x
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| tanh_gelu(v + bias.as_ref().map_or(0.0, |b| b[i % width.unwrap()])))
-            .collect::<Vec<_>>();
-        write_dense_f32_narrow("FastGelu", &mut outputs[0], &y)
+        // The bias is a broadcast over the last dimension. Fuse it into the
+        // activation rather than materialising `x + bias`, so the op stays at
+        // one read and one write of the tensor. See `kernels::simd_activations`.
+        match (bias.as_deref(), width) {
+            // The fused kernel re-reads `bias` for every row, and when the bias
+            // tensor is contiguous f32 that slice borrows its storage — so it
+            // has to be declared as a read range too, or a direct write could
+            // clobber it mid-kernel.
+            (Some(bias), Some(width)) if width != 0 => simd_activations::write_mapped_reading(
+                "FastGelu",
+                &mut outputs[0],
+                &x,
+                &[crate::dtype::slice_byte_range(bias)],
+                |x, y| simd_activations::tanh_gelu_bias_f32_slice(x, bias, width, y),
+            ),
+            _ => simd_activations::write_mapped("FastGelu", &mut outputs[0], &x, |x, y| {
+                simd_activations::tanh_gelu_f32_slice(x, y)
+            }),
+        }
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -172,23 +194,11 @@ impl Kernel for QuickGeluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("QuickGelu", inputs, outputs, 1, 1, 1)?;
         require_fused_float_dtype("QuickGelu", inputs, outputs)?;
-        let y = to_dense_f32_widen("QuickGelu", &inputs[0])?
-            .iter()
-            .map(|&x| {
-                if x == f32::NEG_INFINITY {
-                    return 0.0;
-                }
-                let z = self.alpha * x;
-                let sigmoid = if z >= 0.0 {
-                    1.0 / (1.0 + (-z).exp())
-                } else {
-                    let e = z.exp();
-                    e / (1.0 + e)
-                };
-                x * sigmoid
-            })
-            .collect::<Vec<_>>();
-        write_dense_f32_narrow("QuickGelu", &mut outputs[0], &y)
+        let x = to_dense_f32_widen("QuickGelu", &inputs[0])?;
+        let alpha = self.alpha;
+        simd_activations::write_mapped("QuickGelu", &mut outputs[0], &x, |x, y| {
+            simd_activations::quick_gelu_f32_slice(x, y, alpha)
+        })
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {

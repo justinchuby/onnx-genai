@@ -37,11 +37,14 @@ pub enum CpuBackend {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     SimdX86,
     /// Vendored MLAS f32 SGEMM for x86-64. Available only with the `mlas`
-    /// Cargo feature and selected explicitly with `NXRT_CPU_GEMM_BACKEND=mlas`.
-    /// Multi-threaded: MLAS partitions the GEMM and runs the tiles on the
-    /// process Rayon pool. Kept opt-in (not auto-selected) until a later slice
-    /// decides whether to flip the default; doing so is a one-line change in
-    /// [`CpuBackend::auto_detect`].
+    /// Cargo feature. Multi-threaded: MLAS partitions the GEMM and runs the
+    /// tiles on the process Rayon pool.
+    ///
+    /// This is the **default** on x86-64 whenever the feature is compiled in --
+    /// [`CpuBackend::auto_detect`] returns it without needing
+    /// `NXRT_CPU_GEMM_BACKEND=mlas`, which only forces it. Kernels that gate
+    /// behaviour on `== Mlas` (for example the `f16` prefill widening in
+    /// `matmul`) are therefore live by default, not dead code.
     #[cfg(feature = "mlas")]
     Mlas,
     /// XNNPACK (Android mobile). Design placeholder — currently routes to

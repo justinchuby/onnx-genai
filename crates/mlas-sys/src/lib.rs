@@ -39,6 +39,96 @@ unsafe extern "C" {
         ldc: usize,
     );
 
+    #[allow(clippy::too_many_arguments)]
+    fn mlas_sgemm_batch(
+        trans_a: c_int,
+        trans_b: c_int,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: *const *const f32,
+        lda: usize,
+        b: *const *const f32,
+        ldb: usize,
+        beta: f32,
+        c: *const *mut f32,
+        ldc: usize,
+        batch_size: usize,
+    );
+
+    #[allow(clippy::too_many_arguments)]
+    fn mlas_qgemm_i32(
+        m: usize,
+        n: usize,
+        k: usize,
+        a_is_signed: c_int,
+        b_is_signed: c_int,
+        a: *const c_void,
+        lda: usize,
+        zero_point_a: u8,
+        b: *const c_void,
+        ldb: usize,
+        zero_point_b: *const u8,
+        per_column_zero_points: c_int,
+        c: *mut i32,
+        ldc: usize,
+        multithread: c_int,
+    );
+
+    fn mlas_qgemm_pack_b_size(n: usize, k: usize, a_is_signed: c_int, b_is_signed: c_int) -> usize;
+    fn mlas_qgemm_pack_b(
+        n: usize,
+        k: usize,
+        b: *const c_void,
+        ldb: usize,
+        a_is_signed: c_int,
+        b_is_signed: c_int,
+        packed_b: *mut c_void,
+    );
+    fn mlas_qgemm_i32_packed(
+        m: usize,
+        n: usize,
+        k: usize,
+        a_is_signed: c_int,
+        b_is_signed: c_int,
+        a: *const c_void,
+        lda: usize,
+        zero_point_a: u8,
+        packed_b: *const c_void,
+        zero_point_b: *const u8,
+        per_column_zero_points: c_int,
+        c: *mut i32,
+        ldc: usize,
+        multithread: c_int,
+    );
+
+    #[allow(clippy::too_many_arguments)]
+    fn mlas_qgemm_requantize(
+        m: usize,
+        n: usize,
+        k: usize,
+        a_is_signed: c_int,
+        b_is_signed: c_int,
+        a: *const c_void,
+        lda: usize,
+        zero_point_a: u8,
+        b: *const c_void,
+        ldb: usize,
+        b_is_packed: c_int,
+        zero_point_b: *const u8,
+        per_column_zero_points: c_int,
+        c: *mut i32,
+        ldc: usize,
+        output: *mut c_void,
+        output_ld: usize,
+        output_is_signed: c_int,
+        scale: *const f32,
+        per_column_scale: c_int,
+        output_zero_point: i32,
+        multithread: c_int,
+    );
+
     fn mlas_sgemm_pack_b_size(trans_a: c_int, trans_b: c_int, n: usize, k: usize) -> usize;
     fn mlas_sgemm_pack_b(
         trans_a: c_int,
@@ -72,6 +162,22 @@ unsafe extern "C" {
     /// Vectorized fused SiLU over `n` contiguous f32s. MLAS runtime-dispatches
     /// to its one-pass AVX-512F kernel when supported.
     fn mlas_compute_silu(input: *const f32, output: *mut f32, n: usize);
+    /// Vectorized `tanh` over `n` contiguous f32s — the same polynomial ONNX
+    /// Runtime's own `Tanh` CPU kernel calls.
+    fn mlas_compute_tanh(input: *const f32, output: *mut f32, n: usize);
+    /// Vectorized `erf` over `n` contiguous f32s — the same polynomial ONNX
+    /// Runtime's own `Erf` CPU kernel calls.
+    fn mlas_compute_erf(input: *const f32, output: *mut f32, n: usize);
+    /// Vectorized exact (erf-based) GELU over `n` contiguous f32s. Input and
+    /// output must not overlap.
+    fn mlas_compute_gelu_erf(input: *const f32, output: *mut f32, n: usize);
+    /// Row-wise softmax over `n` rows of `d` contiguous f32s, single-threaded,
+    /// using MLAS's SIMD max reduction and polynomial exp.
+    fn mlas_compute_softmax_in_place(data: *mut f32, n: usize, d: usize);
+    /// Out-of-place row-wise softmax: read `input`, write `output`. Bit-identical
+    /// to a `copy(input -> output)` followed by [`mlas_compute_softmax_in_place`],
+    /// but without the copy. `input` and `output` must not overlap.
+    fn mlas_compute_softmax(input: *const f32, output: *mut f32, n: usize, d: usize);
     fn mlas_eltwise_add(left: *const f32, right: *const f32, output: *mut f32, n: usize);
     fn mlas_compute_activation(
         kind: c_int,
@@ -234,6 +340,26 @@ type MlasParallelForFn = unsafe extern "C" fn(
 type MlasMaxThreadsFn = unsafe extern "C" fn(rust_ctx: *mut c_void) -> c_int;
 
 const MLAS_WORK_STEALING_THREADS_ENV: &str = "ONNX_GENAI_MLAS_THREADPOOL_THREADS";
+/// The CPU EP's thread-budget knob. `mlas-sys` sits *below* the EP and cannot
+/// depend on it, so the name lives here and the EP refers to *this* constant;
+/// `onnx-runtime-ep-cpu` static-asserts that its own `DECODE_THREADS_ENV`
+/// matches, so the two can never drift.
+///
+/// Without this, an embedder that asked the CPU EP for N threads still got a
+/// standalone-MLAS pool sized by [`default_mlas_thread_count`]'s own default,
+/// so the request was silently ignored for every `MlasGemmBatch` call.
+pub const CPU_DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
+/// Upper bound on the standalone pool, matching the previous `n.min(64)` cap on
+/// the explicit override.
+///
+/// A budget above this is clamped, which makes the standalone pool smaller than
+/// the CPU EP's persistent pool (that one clamps only to `available`). The
+/// divergence is reported once on stderr rather than applied silently.
+const MAX_MLAS_POOL_THREADS: usize = 64;
+
+/// Programmatic thread budget, mirroring the CPU EP's
+/// `set_decode_thread_budget`. Zero means unset.
+static POOL_THREAD_BUDGET: AtomicUsize = AtomicUsize::new(0);
 
 static MLAS_PARALLEL_FOR_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MLAS_PARALLEL_FOR_ITERATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -357,19 +483,134 @@ pub fn sqnbit_mlas_partitioning(
     }
 }
 
+/// Worker count for the standalone MLAS work-stealing pool.
+///
+/// Precedence, mirroring the CPU EP's own resolution order: the MLAS-specific
+/// pool override, then the programmatic budget from
+/// [`set_pool_thread_budget`], then the CPU EP's thread-budget environment
+/// variable, then [`resolve_default_mlas_threads`].
 fn default_mlas_thread_count() -> usize {
-    if let Ok(raw) = std::env::var(MLAS_WORK_STEALING_THREADS_ENV) {
-        if let Ok(n) = raw.trim().parse::<usize>() {
-            if n > 0 {
-                return n.min(64);
-            }
-        }
+    if let Some(threads) = thread_count_env(MLAS_WORK_STEALING_THREADS_ENV) {
+        return threads;
+    }
+    if let Some(threads) = pool_thread_budget() {
+        return threads;
+    }
+    if let Some(threads) = thread_count_env(CPU_DECODE_THREADS_ENV) {
+        return threads;
     }
 
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .clamp(1, 8)
+    resolve_default_mlas_threads(
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+    )
+}
+
+/// The worker count the process-global standalone MLAS pool resolves to.
+///
+/// Callers that interleave their own `rayon` passes with MLAS GEMMs use this to
+/// stay inside the same budget: `ONNX_GENAI_CPU_DECODE_THREADS` (and
+/// [`set_pool_thread_budget`]) bound MLAS but not `rayon`'s global pool, so a
+/// pass that fans out to every logical CPU would silently exceed the width the
+/// caller asked for.
+///
+/// This only *reports* the resolution; it does not create the pool.
+pub fn configured_pool_threads() -> usize {
+    default_mlas_thread_count().max(1)
+}
+
+/// Set or clear a process-local worker budget for the standalone MLAS pool.
+///
+/// This is the programmatic equivalent of [`CPU_DECODE_THREADS_ENV`] and takes
+/// precedence over it. `onnx-runtime-ep-cpu::set_decode_thread_budget` forwards
+/// here so that a caller such as the CLI's `--cpu-cores` bounds dense
+/// `MlasGemmBatch` work too, on every OS -- not just Linux, where process
+/// affinity would otherwise shrink `available_parallelism` for us.
+///
+/// Pools are initialized lazily and keep their initial size for the process
+/// lifetime, so call this before the first GEMM. `Some(0)` is rejected.
+pub fn set_pool_thread_budget(threads: Option<usize>) -> Result<(), &'static str> {
+    if threads == Some(0) {
+        return Err("MLAS pool thread budget must be greater than zero");
+    }
+    POOL_THREAD_BUDGET.store(threads.unwrap_or(0), Ordering::Release);
+    Ok(())
+}
+
+fn pool_thread_budget() -> Option<usize> {
+    let threads = POOL_THREAD_BUDGET.load(Ordering::Acquire);
+    (threads > 0).then(|| clamp_pool_threads(threads))
+}
+
+/// The raw programmatic budget, before the [`MAX_MLAS_POOL_THREADS`] cap, or
+/// `None` when unset.
+///
+/// Exposed so higher layers can assert that their own budget actually reached
+/// this pool; it reports neither the env-var nor the automatic fallback, and
+/// deliberately mirrors the EP's `decode_threads_override` in returning the
+/// value as configured rather than as clamped.
+pub fn configured_pool_thread_budget() -> Option<usize> {
+    std::num::NonZeroUsize::new(POOL_THREAD_BUDGET.load(Ordering::Acquire))
+        .map(std::num::NonZeroUsize::get)
+}
+
+/// A budget of `0` means "no override" here, matching the CPU EP, which treats
+/// `ONNX_GENAI_CPU_DECODE_THREADS=0` as an opt-out back to automatic sizing.
+fn thread_count_env(name: &str) -> Option<usize> {
+    parse_thread_count(&std::env::var(name).ok()?)
+}
+
+/// Pure parser for a thread-count knob, split out so it can be tested without
+/// mutating the process environment (`setenv` races other threads' `getenv`).
+fn parse_thread_count(raw: &str) -> Option<usize> {
+    let threads = raw.trim().parse::<usize>().ok()?;
+    (threads > 0).then(|| clamp_pool_threads(threads))
+}
+
+fn clamp_pool_threads(threads: usize) -> usize {
+    if threads > MAX_MLAS_POOL_THREADS {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "mlas-sys: thread budget {threads} exceeds the standalone pool cap of \
+                 {MAX_MLAS_POOL_THREADS}; using {MAX_MLAS_POOL_THREADS} workers"
+            );
+        });
+    }
+    threads.min(MAX_MLAS_POOL_THREADS)
+}
+
+/// Default pool size: half the logical CPUs, but never fewer than the previous
+/// eight-worker ceiling allowed.
+///
+/// The old rule was `available.clamp(1, 8)`. That eight-worker cap belongs to
+/// the CPU EP's *flat Rayon* pool, whose per-op fork/join regresses past eight
+/// workers -- it does not apply here. This pool is persistent and work-stealing,
+/// so like the EP's persistent SPMD pool it keeps scaling with cores until the
+/// memory-bandwidth knee, measured at about half the logical CPUs.
+///
+/// Measured on a 32-vCPU/16-core EPYC 9V74 (f32 MatMul K=3584 N=3584 M=128,
+/// `native_min` over 15 runs after 5 warmups, ours/ORT at matched threads):
+///
+/// | requested threads | pool capped at 8 | pool sized to the request |
+/// |---|---|---|
+/// | 1--8 | 1.00--1.73x | unchanged (cap not binding) |
+/// | 16 | 2.08--2.48x slower | 1.24--1.44x slower |
+/// | 32 | 1.76--2.38x slower | **0.65--0.82x, i.e. faster than ORT** |
+///
+/// and with no thread flags at all: 1.85--2.64x slower at the old default
+/// versus 0.92--1.30x with this one.
+///
+/// `max` with `available.min(8)` keeps the rule monotone: no host ever gets
+/// *fewer* workers than the old default gave it, so small machines are
+/// unaffected and only hosts above 16 logical CPUs change.
+fn resolve_default_mlas_threads(available: usize) -> usize {
+    let available = available.max(1);
+    available
+        .div_ceil(2)
+        .max(available.min(8))
+        .min(MAX_MLAS_POOL_THREADS)
 }
 
 fn global_mlas_pool() -> Option<&'static WorkStealingThreadPool> {
@@ -464,8 +705,10 @@ pub struct MlasThreadPool {
 impl MlasThreadPool {
     /// Create a compatibility handle and initialize the process-global backing
     /// pool. The global pool's actual degree of parallelism is selected once at
-    /// first use (default: `available_parallelism().clamp(1, 8)`, override via
-    /// `ONNX_GENAI_MLAS_THREADPOOL_THREADS`), so this `thread_count` is retained
+    /// first use by [`default_mlas_thread_count`] --
+    /// `ONNX_GENAI_MLAS_THREADPOOL_THREADS`, then [`set_pool_thread_budget`],
+    /// then [`CPU_DECODE_THREADS_ENV`], then
+    /// [`resolve_default_mlas_threads`] -- so this `thread_count` is retained
     /// only for diagnostics/backward-compatible tests.
     pub fn new(thread_count: usize) -> std::io::Result<Self> {
         assert!(thread_count > 0, "thread_count must be non-zero");
@@ -528,6 +771,116 @@ pub fn compute_silu(input: &[f32], output: &mut [f32]) {
     // SAFETY: both slices are valid for `n` contiguous f32s; MLAS reads `input`
     // and writes `output`, and Rust's borrow rules prove they do not alias.
     unsafe { mlas_compute_silu(input.as_ptr(), output.as_mut_ptr(), input.len()) };
+}
+
+/// Compute elementwise `tanh` over equal-length contiguous f32 slices using
+/// MLAS's SIMD polynomial — the same one ONNX Runtime's `Tanh` CPU kernel
+/// calls. MLAS dispatches by ISA at runtime, so which kernel runs (and hence
+/// the exact bits) depends on the host. Single threaded; callers shard
+/// across threads themselves.
+pub fn compute_tanh(input: &[f32], output: &mut [f32]) {
+    assert_eq!(
+        input.len(),
+        output.len(),
+        "compute_tanh input and output must have equal length"
+    );
+    if input.is_empty() {
+        return;
+    }
+    // SAFETY: both slices are valid for `n` contiguous f32s; MLAS reads `input`
+    // and writes `output`, and Rust's borrow rules prove they do not alias.
+    unsafe { mlas_compute_tanh(input.as_ptr(), output.as_mut_ptr(), input.len()) };
+}
+
+/// Compute elementwise `erf` over equal-length contiguous f32 slices using
+/// MLAS's SIMD polynomial — the same one ONNX Runtime's `Erf` CPU kernel
+/// calls. Which kernel runs depends on MLAS's runtime ISA dispatch.
+/// Single threaded; callers shard across threads themselves.
+pub fn compute_erf(input: &[f32], output: &mut [f32]) {
+    assert_eq!(
+        input.len(),
+        output.len(),
+        "compute_erf input and output must have equal length"
+    );
+    if input.is_empty() {
+        return;
+    }
+    // SAFETY: both slices are valid for `n` contiguous f32s; MLAS reads `input`
+    // and writes `output`, and Rust's borrow rules prove they do not alias.
+    unsafe { mlas_compute_erf(input.as_ptr(), output.as_mut_ptr(), input.len()) };
+}
+
+/// Compute elementwise exact GELU `x * 0.5 * (1 + erf(x / sqrt(2)))` over
+/// equal-length contiguous f32 slices, fused in one MLAS pass.
+///
+/// MLAS requires that input and output not overlap (`mlas.h:1166`); the
+/// `&[f32]` / `&mut [f32]` signature makes that unrepresentable.
+///
+/// Single threaded; callers shard across threads themselves.
+pub fn compute_gelu_erf(input: &[f32], output: &mut [f32]) {
+    assert_eq!(
+        input.len(),
+        output.len(),
+        "compute_gelu_erf input and output must have equal length"
+    );
+    if input.is_empty() {
+        return;
+    }
+    // SAFETY: both slices are valid for `n` contiguous f32s; MLAS reads `input`
+    // and writes `output`, and Rust's borrow rules prove they do not alias —
+    // which is also what discharges MLAS's no-overlap precondition.
+    unsafe { mlas_compute_gelu_erf(input.as_ptr(), output.as_mut_ptr(), input.len()) };
+}
+
+/// Row-wise in-place softmax, replacing a scalar `expf` loop: normalizes `n` rows of
+/// `d` contiguous f32s with MLAS's SIMD max reduction and polynomial exp — the
+/// same primitive ONNX Runtime's own Softmax and attention kernels use.
+///
+/// Single threaded; callers shard across threads themselves.
+///
+/// A row consisting entirely of `-inf` produces NaN, matching MLAS/ORT; callers
+/// that need the "fully masked row → zero" convention must screen for that case
+/// themselves.
+pub fn compute_softmax_in_place(data: &mut [f32], n: usize, d: usize) {
+    assert_eq!(
+        data.len(),
+        n.saturating_mul(d),
+        "compute_softmax_in_place expects exactly n*d elements"
+    );
+    if data.is_empty() {
+        return;
+    }
+    // SAFETY: `data` holds `n * d` contiguous f32s (asserted above) and is
+    // uniquely borrowed. MLAS's non-log softmax streams each row forward from
+    // input to output and then rescales the output, so a single buffer serving
+    // as both is well defined.
+    unsafe { mlas_compute_softmax_in_place(data.as_mut_ptr(), n, d) };
+}
+
+/// Out-of-place row-wise softmax: `input` and `output` are both `n * d`
+/// contiguous f32s and must not overlap. Bit-identical to copying `input` into
+/// `output` and calling [`compute_softmax_in_place`], without the copy.
+///
+/// Single threaded; callers shard across threads themselves.
+pub fn compute_softmax(input: &[f32], output: &mut [f32], n: usize, d: usize) {
+    let len = n.saturating_mul(d);
+    assert_eq!(
+        input.len(),
+        len,
+        "compute_softmax expects n*d input elements"
+    );
+    assert_eq!(
+        output.len(),
+        len,
+        "compute_softmax expects n*d output elements"
+    );
+    if input.is_empty() {
+        return;
+    }
+    // SAFETY: `input` and `output` each hold `n * d` contiguous f32s (asserted
+    // above); `&[f32]`/`&mut [f32]` cannot alias, so the disjointness MLAS
+    // requires for the out-of-place form is guaranteed by the borrow checker.
+    unsafe { mlas_compute_softmax(input.as_ptr(), output.as_mut_ptr(), n, d) };
 }
 
 /// Compute contiguous Float32 elementwise addition with MLAS SIMD.
@@ -939,6 +1292,441 @@ pub fn sgemm_nn_packed(m: usize, a: &[f32], packed: &PackedB, c: &mut [f32]) {
     }
 }
 
+/// Zero points for an integer GEMM operand.
+#[derive(Debug, Clone, Copy)]
+pub enum QgemmZeroPoints<'a> {
+    /// One zero point for the whole tensor.
+    PerTensor(u8),
+    /// One zero point per column of `B`, i.e. `n` entries.
+    PerColumn(&'a [u8]),
+}
+
+/// Row-major integer GEMM producing the `i32` accumulator, `C = (A - za) * (B - zb)`.
+///
+/// `a` is `m x k` with row stride `k`, `b` is `k x n` with row stride `n`, and
+/// `c` is `m x n` with row stride `n` -- the same layout ONNX Runtime hands to
+/// MLAS for `MatMulInteger`/`QLinearMatMul`. Requantization is left to the
+/// caller, so the result is exactly the integer dot product with the zero
+/// points folded in.
+///
+/// `a_signed` / `b_signed` select the `i8` interpretation of the respective
+/// operand; the bytes are passed through unchanged either way. Zero-point bytes
+/// follow the same interpretation as the operand they belong to.
+///
+/// # Panics
+///
+/// Panics if any slice length disagrees with `m`, `n`, `k`, or if a per-column
+/// zero-point slice is not exactly `n` long.
+#[allow(clippy::too_many_arguments)]
+pub fn qgemm_i32(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[u8],
+    a_signed: bool,
+    zero_point_a: u8,
+    b: &[u8],
+    b_signed: bool,
+    zero_point_b: QgemmZeroPoints<'_>,
+    c: &mut [i32],
+) {
+    assert_eq!(a.len(), m * k, "A must be m*k bytes");
+    assert_eq!(b.len(), k * n, "B must be k*n bytes");
+    assert_eq!(c.len(), m * n, "C must be m*n i32");
+    if m == 0 || n == 0 {
+        return;
+    }
+    let (zero_point_b_ptr, per_column) = match zero_point_b {
+        QgemmZeroPoints::PerTensor(ref value) => (std::ptr::from_ref(value), 0),
+        QgemmZeroPoints::PerColumn(values) => {
+            assert_eq!(values.len(), n, "per-column zero points must be n long");
+            (values.as_ptr(), 1)
+        }
+    };
+    ensure_threading();
+    // SAFETY: the three slices are exactly the sizes asserted above, the zero
+    // point pointer is either a per-column slice of length `n` or a borrow of a
+    // local `u8` that outlives the call, and the shim writes only through `c`.
+    unsafe {
+        mlas_qgemm_i32(
+            m,
+            n,
+            k,
+            c_int::from(a_signed),
+            c_int::from(b_signed),
+            a.as_ptr().cast::<c_void>(),
+            k,
+            zero_point_a,
+            b.as_ptr().cast::<c_void>(),
+            n,
+            zero_point_b_ptr,
+            per_column,
+            c.as_mut_ptr(),
+            n,
+            c_int::from(mlas_threading_degree() > 1),
+        );
+    }
+}
+
+/// A constant quantized `B` pre-packed into MLAS's kernel layout.
+///
+/// [`qgemm_i32`] leaves `BIsPacked` unset, so MLAS re-packs the whole `k x n`
+/// weight on every call. ORT pre-packs a constant weight once at session
+/// initialisation instead; this is the same thing.
+///
+/// The packed layout is chosen by the kernel MLAS dispatches to, so a pack is
+/// only valid for the same `(n, k, a_signed, b_signed)` **on the same machine**.
+/// It must never be serialised, cached to disk, or shared across processes.
+pub struct QgemmPackedB {
+    ptr: *mut u8,
+    layout: std::alloc::Layout,
+    n: usize,
+    k: usize,
+    a_signed: bool,
+    b_signed: bool,
+}
+
+// SAFETY: the buffer is written once during `new` and only ever read afterwards
+// (MLAS takes it as `const void*`), so sharing it across threads is sound. This
+// mirrors `PackedB` above.
+unsafe impl Send for QgemmPackedB {}
+unsafe impl Sync for QgemmPackedB {}
+
+/// Live heap bytes currently retained by all [`QgemmPackedB`] instances -- the
+/// MLAS packed allocation only (there is no owned scale/zp copy for the integer
+/// GEMM). Maintained by construction/`Drop` so a caller can compare the memory
+/// plan's *predicted* packed footprint against the bytes the kernels *actually*
+/// hold, in the same run. Mirrors [`SQNBIT_PACKED_LIVE_BYTES`].
+static QGEMM_PACKED_LIVE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Snapshot of [`QGEMM_PACKED_LIVE_BYTES`]: the heap bytes all live
+/// [`QgemmPackedB`] instances currently retain.
+pub fn qgemm_packed_live_bytes() -> usize {
+    QGEMM_PACKED_LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The exact MLAS packed-B buffer size for a constant quantized B, or `None`
+/// when MLAS reports no packed layout for this shape/signedness on the current
+/// host (the caller then uses the unpacked path). Lets the memory plan predict
+/// the pre-pack footprint before any weight is packed.
+pub fn qgemm_pack_b_size(n: usize, k: usize, a_signed: bool, b_signed: bool) -> Option<usize> {
+    if n == 0 || k == 0 {
+        return None;
+    }
+    // SAFETY: a pure size query with no pointer arguments.
+    let size =
+        unsafe { mlas_qgemm_pack_b_size(n, k, c_int::from(a_signed), c_int::from(b_signed)) };
+    (size != 0).then_some(size)
+}
+
+impl QgemmPackedB {
+    /// Pack a row-major `k x n` quantized B (`ldb == n`).
+    ///
+    /// Returns `None` when MLAS reports no packed layout for this shape and
+    /// signedness combination, which is its documented way of saying "call the
+    /// unpacked path"; callers must then keep using [`qgemm_i32`].
+    pub fn new(n: usize, k: usize, b: &[u8], a_signed: bool, b_signed: bool) -> Option<Self> {
+        assert_eq!(b.len(), k * n, "B must be k*n bytes");
+        if n == 0 || k == 0 {
+            return None;
+        }
+        // SAFETY: a pure size query with no pointer arguments.
+        let size =
+            unsafe { mlas_qgemm_pack_b_size(n, k, c_int::from(a_signed), c_int::from(b_signed)) };
+        if size == 0 {
+            return None;
+        }
+        let layout = std::alloc::Layout::from_size_align(size, 64).ok()?;
+        // SAFETY: `size` is non-zero, so the layout is non-zero-sized.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "packed quantized-B allocation failed");
+        // SAFETY: `b` is `k * n` bytes as asserted, `ldb = n` matches the
+        // row-major layout, and `ptr` addresses `size` writable bytes -- the
+        // exact size MLAS just asked for.
+        unsafe {
+            mlas_qgemm_pack_b(
+                n,
+                k,
+                b.as_ptr().cast::<c_void>(),
+                n,
+                c_int::from(a_signed),
+                c_int::from(b_signed),
+                ptr.cast::<c_void>(),
+            );
+        }
+        QGEMM_PACKED_LIVE_BYTES.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        Some(Self {
+            ptr,
+            layout,
+            n,
+            k,
+            a_signed,
+            b_signed,
+        })
+    }
+
+    /// Heap bytes this pack retains: the MLAS packed allocation.
+    pub fn owned_heap_bytes(&self) -> usize {
+        self.layout.size()
+    }
+
+    /// The logical `(k, n)` dimensions and `(a_signed, b_signed)` this pack was
+    /// built for. A caller must not use it for any other combination.
+    pub fn identity(&self) -> (usize, usize, bool, bool) {
+        (self.k, self.n, self.a_signed, self.b_signed)
+    }
+}
+
+impl Drop for QgemmPackedB {
+    fn drop(&mut self) {
+        QGEMM_PACKED_LIVE_BYTES.fetch_sub(
+            self.owned_heap_bytes(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // SAFETY: `ptr`/`layout` are the pair returned by `alloc_zeroed` in
+        // `new` and this runs at most once.
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+    }
+}
+
+/// [`qgemm_i32`] against a B that was pre-packed by [`QgemmPackedB::new`].
+///
+/// Panics if `packed` was built for a different shape or signedness, which
+/// would otherwise make MLAS read the wrong layout.
+#[allow(clippy::too_many_arguments)]
+pub fn qgemm_i32_packed(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[u8],
+    a_signed: bool,
+    zero_point_a: u8,
+    packed: &QgemmPackedB,
+    zero_point_b: QgemmZeroPoints<'_>,
+    c: &mut [i32],
+) {
+    assert_eq!(a.len(), m * k, "A must be m*k bytes");
+    assert_eq!(c.len(), m * n, "C must be m*n i32");
+    assert_eq!(
+        packed.identity(),
+        (k, n, a_signed, packed.b_signed),
+        "the packed B was built for a different shape or signedness"
+    );
+    if m == 0 || n == 0 {
+        return;
+    }
+    let (zero_point_b_ptr, per_column) = match zero_point_b {
+        QgemmZeroPoints::PerTensor(ref value) => (std::ptr::from_ref(value), 0),
+        QgemmZeroPoints::PerColumn(values) => {
+            assert_eq!(values.len(), n, "per-column zero points must be n long");
+            (values.as_ptr(), 1)
+        }
+    };
+    ensure_threading();
+    // SAFETY: `a` and `c` are exactly the sizes asserted above, `packed` owns a
+    // buffer MLAS itself sized and filled for this `(n, k, signedness)`, the
+    // zero point pointer is either an `n`-long slice or a borrow of a local that
+    // outlives the call, and the shim writes only through `c`.
+    unsafe {
+        mlas_qgemm_i32_packed(
+            m,
+            n,
+            k,
+            c_int::from(a_signed),
+            c_int::from(packed.b_signed),
+            a.as_ptr().cast::<c_void>(),
+            k,
+            zero_point_a,
+            packed.ptr.cast::<c_void>(),
+            zero_point_b_ptr,
+            per_column,
+            c.as_mut_ptr(),
+            n,
+            c_int::from(mlas_threading_degree() > 1),
+        );
+    }
+}
+
+/// The `B` operand of a requantizing quantized GEMM: either raw `k x n` bytes
+/// or a pack built once by [`QgemmPackedB::new`].
+#[derive(Clone, Copy)]
+pub enum QgemmWeights<'a> {
+    /// Row-major `k x n` bytes with row stride `n`.
+    Dense {
+        /// The weight bytes.
+        bytes: &'a [u8],
+        /// Whether the bytes are `i8` rather than `u8`.
+        signed: bool,
+    },
+    /// A pack MLAS built for this `(n, k, a_signed, b_signed)` on this machine.
+    Packed(&'a QgemmPackedB),
+}
+
+/// Output scale of a requantizing quantized GEMM.
+#[derive(Clone, Copy)]
+pub enum QgemmScale<'a> {
+    /// One scale for the whole result.
+    PerTensor(f32),
+    /// One scale per column of the result, i.e. `n` entries.
+    PerColumn(&'a [f32]),
+}
+
+/// Integer GEMM whose accumulator is requantized to bytes **inside** MLAS.
+///
+/// [`qgemm_i32`] returns the raw `i32` accumulator, which leaves the caller to
+/// walk the whole `m x n` array a second time to scale, round, offset and
+/// narrow it. ONNX Runtime does not do that: its `QLinearMatMul` passes MLAS a
+/// `MLAS_QGEMM_REQUANT_OUTPUT_PROCESSOR`, so each output tile is requantized as
+/// soon as the kernel produces it, while it is still in cache, and the final
+/// bytes land straight in the destination tensor. This is that path.
+///
+/// `c` is scratch: MLAS accumulates into it and requantizes it in place, so it
+/// must be `m * n` long, but its contents afterwards are unspecified and it
+/// does **not** need to be zeroed first.
+///
+/// Numerically the processor computes, per element,
+/// `clamp(round_ties_even(c * scale), lo - zp, hi - zp) + zp`, where `lo`/`hi`
+/// are the output dtype's bounds. Clamping the *float* before rounding and
+/// rounding before clamping agree for every finite input, because the clamp
+/// bounds are integers -- but they disagree on `NaN`, which this path maps to
+/// `lo` and a `round`-then-clamp scalar loop maps to `zp`. A caller that needs
+/// bit-identity with such a loop must therefore keep non-finite scales off this
+/// path; a finite scale can only produce `NaN` from a non-finite accumulator,
+/// which `i32` cannot hold.
+///
+/// # Panics
+///
+/// Panics if any slice length disagrees with `m`, `n`, `k`, if a per-column
+/// scale or zero point is not exactly `n` long, or if a pack was built for a
+/// different shape or signedness.
+#[allow(clippy::too_many_arguments)]
+pub fn qgemm_requantize(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[u8],
+    a_signed: bool,
+    zero_point_a: u8,
+    b: QgemmWeights<'_>,
+    zero_point_b: QgemmZeroPoints<'_>,
+    scale: QgemmScale<'_>,
+    output: &mut [u8],
+    output_signed: bool,
+    output_zero_point: i32,
+    c: &mut [i32],
+) {
+    assert_eq!(a.len(), m * k, "A must be m*k bytes");
+    assert_eq!(c.len(), m * n, "C must be m*n i32");
+    assert_eq!(output.len(), m * n, "output must be m*n bytes");
+    if m == 0 || n == 0 {
+        return;
+    }
+    let (b_ptr, b_signed, ldb, b_is_packed) = match b {
+        QgemmWeights::Dense { bytes, signed } => {
+            assert_eq!(bytes.len(), k * n, "B must be k*n bytes");
+            (bytes.as_ptr().cast::<c_void>(), signed, n, 0)
+        }
+        QgemmWeights::Packed(packed) => {
+            assert_eq!(
+                packed.identity(),
+                (k, n, a_signed, packed.b_signed),
+                "the packed B was built for a different shape or signedness"
+            );
+            (
+                packed.ptr.cast_const().cast::<c_void>(),
+                packed.b_signed,
+                n,
+                1,
+            )
+        }
+    };
+    let (zero_point_b_ptr, per_column_zero_points) = match zero_point_b {
+        QgemmZeroPoints::PerTensor(ref value) => (std::ptr::from_ref(value), 0),
+        QgemmZeroPoints::PerColumn(values) => {
+            assert_eq!(values.len(), n, "per-column zero points must be n long");
+            (values.as_ptr(), 1)
+        }
+    };
+    let (scale_ptr, per_column_scale) = match scale {
+        QgemmScale::PerTensor(ref value) => (std::ptr::from_ref(value), 0),
+        QgemmScale::PerColumn(values) => {
+            assert_eq!(values.len(), n, "per-column scales must be n long");
+            (values.as_ptr(), 1)
+        }
+    };
+    ensure_threading();
+    // SAFETY: every slice is exactly the size asserted above; the zero-point and
+    // scale pointers are either `n`-long slices or borrows of locals that
+    // outlive the call; a packed `B` owns a buffer MLAS itself sized and filled
+    // for this `(n, k, signedness)`; and the shim writes only through `c` and
+    // `output`, which are distinct `&mut` borrows.
+    unsafe {
+        mlas_qgemm_requantize(
+            m,
+            n,
+            k,
+            c_int::from(a_signed),
+            c_int::from(b_signed),
+            a.as_ptr().cast::<c_void>(),
+            k,
+            zero_point_a,
+            b_ptr,
+            ldb,
+            b_is_packed,
+            zero_point_b_ptr,
+            per_column_zero_points,
+            c.as_mut_ptr(),
+            n,
+            output.as_mut_ptr().cast::<c_void>(),
+            n,
+            c_int::from(output_signed),
+            scale_ptr,
+            per_column_scale,
+            output_zero_point,
+            c_int::from(mlas_threading_degree() > 1),
+        );
+    }
+}
+
+/// Whether this machine's `u8 x i8` integer GEMM kernel is exact.
+///
+/// On AVX2 without VNNI, MLAS's `u8 x i8` kernel multiplies raw bytes with
+/// `vpmaddubsw`, which sums *adjacent pairs* into an `i16` **with saturation**:
+/// `255 * -128 + 255 * -128 == -65280` clamps to `-32768`. Zero points are
+/// applied afterwards as row/column corrections, so the saturation is not
+/// recoverable and the result is silently approximate. VNNI (`vpdpbusd`) and
+/// AMX accumulate straight into `i32` and do not saturate; the other three
+/// signedness pairs are exact on every kernel we ship.
+///
+/// Rather than hard-code an ISA table -- which would be wrong on the next
+/// microarchitecture in either direction -- probe once with an input
+/// constructed to saturate, and believe the answer. A caller that requires bit
+/// exactness must consult this before routing `u8 x i8` here.
+pub fn qgemm_u8s8_is_exact() -> bool {
+    static EXACT: OnceLock<bool> = OnceLock::new();
+    *EXACT.get_or_init(|| {
+        // (255 * -128) + (255 * -128) = -65280, which is outside i16 range, so a
+        // pairwise-i16 kernel returns the clamped -32768 instead.
+        let a = [255u8, 255];
+        let b = [0x80u8, 0x80];
+        let mut c = [0i32];
+        qgemm_i32(
+            1,
+            1,
+            2,
+            &a,
+            false,
+            0,
+            &b,
+            true,
+            QgemmZeroPoints::PerTensor(0),
+            &mut c,
+        );
+        c[0] == -65280
+    })
+}
+
 /// Safe wrapper computing `C = A * B` for row-major matrices with no transpose.
 ///
 /// `a` is `m x k`, `b` is `k x n`, `c` is `m x n`. Uses `alpha = 1`,
@@ -1001,6 +1789,121 @@ pub fn sgemm(
             beta,
             c.as_mut_ptr(),
             ldc,
+        );
+    }
+}
+
+/// One GEMM inside a batched SGEMM. `M`, `N`, `K`, the transpose flags and
+/// every leading dimension are shared across the batch; only the operands and
+/// the output window differ.
+#[derive(Clone, Copy, Debug)]
+pub struct SgemmBatchItem<'a> {
+    /// `A` operand, at least `m * lda` floats (`k * lda` when `trans_a`).
+    pub a: &'a [f32],
+    /// `B` operand, at least `k * ldb` floats (`n * ldb` when `trans_b`).
+    pub b: &'a [f32],
+    /// Element offset of this item's `m * ldc` output window inside `c`.
+    pub c_offset: usize,
+}
+
+/// Batched row-major SGEMM: `C_i = alpha * op(A_i) * op(B_i) + beta * C_i`.
+///
+/// The point is not to save per-call overhead in C++, which is trivial, but to
+/// hand MLAS a single `MlasTrySimpleParallel` fan-out covering the whole batch.
+/// Issued one at a time, each small GEMM takes the work-stealing pool's
+/// dispatch lock and asks for a thread count derived from its own complexity
+/// alone; batched, MLAS spreads `ThreadsPerGemm * batch` work items across the
+/// pool in one dispatch (`sgemm.cpp`'s `MlasGemmBatch`). A grouped
+/// mixture-of-experts decode step is exactly this shape: `k` skinny GEMMs that
+/// individually look far too small to thread.
+///
+/// # Panics
+///
+/// Panics if any operand is too short for the declared dimensions, or if the
+/// items' output windows are not strictly ascending and disjoint - the
+/// invariant that makes handing out several `*mut f32` into one `&mut [f32]`
+/// sound.
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_batch(
+    trans_a: bool,
+    trans_b: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    items: &[SgemmBatchItem<'_>],
+    lda: usize,
+    ldb: usize,
+    beta: f32,
+    c: &mut [f32],
+    ldc: usize,
+) {
+    if items.is_empty() || m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    assert!(
+        lda >= if trans_a { m } else { k },
+        "sgemm_batch: lda {lda} is smaller than the packed row length"
+    );
+    assert!(
+        ldb >= if trans_b { k } else { n },
+        "sgemm_batch: ldb {ldb} is smaller than the packed row length"
+    );
+    assert!(ldc >= n, "sgemm_batch: ldc {ldc} is smaller than n {n}");
+    let a_min = if trans_a { k * lda } else { m * lda };
+    let b_min = if trans_b { n * ldb } else { k * ldb };
+    let c_window = m * ldc;
+    let mut previous_end = 0usize;
+    for (index, item) in items.iter().enumerate() {
+        assert!(
+            item.a.len() >= a_min,
+            "batched SGEMM item {index} A holds {} floats, needs {a_min}",
+            item.a.len()
+        );
+        assert!(
+            item.b.len() >= b_min,
+            "batched SGEMM item {index} B holds {} floats, needs {b_min}",
+            item.b.len()
+        );
+        assert!(
+            index == 0 || item.c_offset >= previous_end,
+            "batched SGEMM output windows must be ascending and disjoint: item \
+             {index} starts at {} but the previous window ends at {previous_end}",
+            item.c_offset
+        );
+        previous_end = item.c_offset + c_window;
+        assert!(
+            previous_end <= c.len(),
+            "batched SGEMM item {index} writes up to {previous_end}, C holds {}",
+            c.len()
+        );
+    }
+    ensure_threading();
+    let a_ptrs: Vec<*const f32> = items.iter().map(|i| i.a.as_ptr()).collect();
+    let b_ptrs: Vec<*const f32> = items.iter().map(|i| i.b.as_ptr()).collect();
+    // Sound because the loop above proved the windows are disjoint and in
+    // bounds, so no two raw pointers below can alias.
+    let c_base = c.as_mut_ptr();
+    let c_ptrs: Vec<*mut f32> = items
+        .iter()
+        .map(|i| unsafe { c_base.add(i.c_offset) })
+        .collect();
+    unsafe {
+        mlas_sgemm_batch(
+            trans_a as c_int,
+            trans_b as c_int,
+            m,
+            n,
+            k,
+            alpha,
+            a_ptrs.as_ptr(),
+            lda,
+            b_ptrs.as_ptr(),
+            ldb,
+            beta,
+            c_ptrs.as_ptr(),
+            ldc,
+            items.len(),
         );
     }
 }
@@ -1088,7 +1991,38 @@ pub struct SQNBitPackedB {
 unsafe impl Send for SQNBitPackedB {}
 unsafe impl Sync for SQNBitPackedB {}
 
+/// Live heap bytes currently retained by all [`SQNBitPackedB`] instances: the
+/// MLAS packed allocation plus the owned scale and zero-point copies. Maintained
+/// by construction/`Drop` so callers can compare the memory plan's *predicted*
+/// packed footprint against the bytes the kernels *actually* hold, in the same
+/// run (see the `MatMulNBits` accounting tests). This is heap only; it excludes
+/// the still-mapped on-disk weights and any GEMM workspace.
+static SQNBIT_PACKED_LIVE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Snapshot of [`SQNBIT_PACKED_LIVE_BYTES`]: the heap bytes all live
+/// `SQNBitPackedB` instances currently retain (packed buffer + scale copy +
+/// optional zero-point copy).
+pub fn sqnbit_packed_live_bytes() -> usize {
+    SQNBIT_PACKED_LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl SQNBitPackedB {
+    /// Heap bytes this instance owns: the packed allocation plus the scale and
+    /// optional zero-point copies MLAS's `Fp32` path consumes at GEMM time.
+    pub fn owned_heap_bytes(&self) -> usize {
+        self.layout.size()
+            + self.scale.capacity() * std::mem::size_of::<f32>()
+            + self.zp.as_ref().map_or(0, Vec::capacity)
+    }
+
+    fn account_alloc(&self) {
+        SQNBIT_PACKED_LIVE_BYTES.fetch_add(
+            self.owned_heap_bytes(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// Pack a blockwise-quantized B weight, returning `None` when MLAS reports
     /// no packing/kernel is available for this shape on the current host (the
     /// caller must then fall back to another path).
@@ -1123,7 +2057,7 @@ impl SQNBitPackedB {
                 zp_ptr,
             );
         }
-        Some(Self {
+        let packed = Self {
             ptr,
             layout,
             n,
@@ -1134,7 +2068,9 @@ impl SQNBitPackedB {
             has_zp,
             scale: scale.to_vec(),
             zp: zp.map(<[u8]>::to_vec),
-        })
+        };
+        packed.account_alloc();
+        Some(packed)
     }
 
     /// Reconstruct an MLAS packed weight from a previously packed buffer.
@@ -1164,7 +2100,7 @@ impl SQNBitPackedB {
         let ptr = unsafe { std::alloc::alloc(layout) };
         assert!(!ptr.is_null(), "SQNBit prepacked-B allocation failed");
         unsafe { std::ptr::copy_nonoverlapping(packed.as_ptr(), ptr, size) };
-        Some(Self {
+        let repacked = Self {
             ptr,
             layout,
             n,
@@ -1175,7 +2111,9 @@ impl SQNBitPackedB {
             has_zp,
             scale: scale.to_vec(),
             zp: zp.map(<[u8]>::to_vec),
-        })
+        };
+        repacked.account_alloc();
+        Some(repacked)
     }
 
     /// Serialized bytes of this host- and compute-type-specific MLAS layout.
@@ -1191,6 +2129,10 @@ impl SQNBitPackedB {
 
 impl Drop for SQNBitPackedB {
     fn drop(&mut self) {
+        SQNBIT_PACKED_LIVE_BYTES.fetch_sub(
+            self.owned_heap_bytes(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         unsafe { std::alloc::dealloc(self.ptr, self.layout) };
     }
 }
@@ -1447,6 +2389,162 @@ mod tests {
 
     fn assert_send_sync<T: Send + Sync>() {}
 
+    /// `sgemm_batch` must produce exactly what the same items produce
+    /// when issued one `sgemm` at a time. Batching only changes how MLAS
+    /// partitions threads, never the arithmetic, so this is a bit-exactness
+    /// assertion and not a tolerance check.
+    ///
+    /// The `transB` case is the one the grouped mixture-of-experts path uses:
+    /// expert weights arrive as `[out_features, in_features]`, i.e. already
+    /// transposed relative to what a plain `A*B` wants.
+    #[test]
+    fn batched_sgemm_is_bit_identical_to_serial_calls() {
+        for &(m, n, k, batch) in &[
+            (1usize, 96usize, 64usize, 8usize),
+            (3, 32, 48, 5),
+            (7, 17, 23, 2),
+            (1, 1, 1, 3),
+        ] {
+            for &trans_b in &[false, true] {
+                let ldb = if trans_b { k } else { n };
+                let a: Vec<f32> = (0..batch * m * k)
+                    .map(|i| ((i as f32) * 0.017).sin() * 1.3)
+                    .collect();
+                let banks: Vec<Vec<f32>> = (0..batch)
+                    .map(|e| {
+                        (0..n * k)
+                            .map(|i| ((i as f32 + e as f32 * 7.0) * 0.011).cos() * 0.9)
+                            .collect()
+                    })
+                    .collect();
+                let refs: Vec<&[f32]> = banks.iter().map(Vec::as_slice).collect();
+
+                let items: Vec<SgemmBatchItem<'_>> = refs
+                    .iter()
+                    .enumerate()
+                    .map(|(e, b)| SgemmBatchItem {
+                        a: &a[e * m * k..],
+                        b,
+                        c_offset: e * m * n,
+                    })
+                    .collect();
+                let mut batched = vec![0.0f32; batch * m * n];
+                sgemm_batch(
+                    false,
+                    trans_b,
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    &items,
+                    k,
+                    ldb,
+                    0.0,
+                    &mut batched,
+                    n,
+                );
+
+                let mut serial = vec![0.0f32; batch * m * n];
+                for (e, bank) in banks.iter().enumerate() {
+                    sgemm(
+                        false,
+                        trans_b,
+                        m,
+                        n,
+                        k,
+                        1.0,
+                        &a[e * m * k..],
+                        k,
+                        bank,
+                        ldb,
+                        0.0,
+                        &mut serial[e * m * n..],
+                        n,
+                    );
+                }
+                assert_eq!(
+                    batched, serial,
+                    "m={m} n={n} k={k} batch={batch} trans_b={trans_b}"
+                );
+            }
+        }
+    }
+
+    /// An empty batch is a no-op rather than a panic, so callers can hand over
+    /// a routing result in which no expert was selected.
+    #[test]
+    fn batched_sgemm_with_no_items_is_a_no_op() {
+        let _a = [1.0f32; 4];
+        let mut c = [7.0f32; 4];
+        sgemm_batch(false, true, 1, 4, 4, 1.0, &[], 4, 4, 0.0, &mut c, 4);
+        assert_eq!(c, [7.0; 4]);
+    }
+
+    /// The durable heap a `CompFp32` int4 `SQNBitPackedB` retains is exactly the
+    /// packed buffer **plus** its owned scale (and, when asymmetric, zero-point)
+    /// copies -- and it is linear in `N`, so per-shard packs sum to the whole.
+    ///
+    /// This is the mlas-sys-level anchor for the CPU EP's packed-buffer
+    /// accounting: `mlas_sqnbit_scale_zp_bytes` predicts the scale/zp overhead as
+    /// `N*ceil(K/blk)*4 (+ N*ceil(ceil(K/blk)/2))`, and this test proves that
+    /// prediction equals what a real packed buffer actually holds. If MLAS ever
+    /// changed what a packed weight retains, this fails rather than letting the
+    /// predictor silently drift below the real footprint (the under-reporting
+    /// direction an admission gate must never take).
+    #[test]
+    fn sqnbit_fp32_owned_heap_equals_packed_plus_scale_zp() {
+        let comp = SQNBitComputeType::Fp32;
+        let (n, k, blk) = (4864usize, 896usize, 32usize);
+        if !sqnbit_gemm_available(4, blk, comp) {
+            eprintln!("SQNBit fp32 int4 unavailable on host; skipping");
+            return;
+        }
+        let blocks = k.div_ceil(blk);
+        for asymmetric in [false, true] {
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| ((i as f32 * 0.019 + 0.13).sin()) * 1.7)
+                .collect();
+            let (packed_b, scales, zps, _d) = quantize_int4(&weights, n, k, blk, asymmetric);
+            let zp_slice = zps.as_deref();
+            let packed_size = sqnbit_packed_b_size(n, k, 4, blk, asymmetric, comp).unwrap();
+            let scale_bytes = n * blocks * std::mem::size_of::<f32>();
+            let zp_bytes = zp_slice.map_or(0, <[u8]>::len);
+            let expected_owned = packed_size + scale_bytes + zp_bytes;
+
+            let whole =
+                SQNBitPackedB::new(n, k, 4, blk, comp, &packed_b, &scales, zp_slice).unwrap();
+            assert_eq!(
+                whole.owned_heap_bytes(),
+                expected_owned,
+                "asymmetric={asymmetric}: owned heap must be packed + scales (+ zp)"
+            );
+
+            // The packed buffer is linear in N for Fp32, so N-row shards sum to
+            // the whole -- the exact partition `build_mlas_shards` performs.
+            let shard_align = 16usize;
+            let target = shard_align * ((n / 8).div_ceil(shard_align)).max(1);
+            let mut shard_owned = 0usize;
+            let mut start = 0usize;
+            while start < n {
+                let len = target.min(n - start).max(1);
+                let ps = &packed_b[start * blocks * (blk / 2)..(start + len) * blocks * (blk / 2)];
+                let ss = &scales[start * blocks..(start + len) * blocks];
+                let zs = zp_slice.map(|z| {
+                    let per_row = blocks.div_ceil(2);
+                    &z[start * per_row..(start + len) * per_row]
+                });
+                let shard = SQNBitPackedB::new(len, k, 4, blk, comp, ps, ss, zs).unwrap();
+                shard_owned += shard.owned_heap_bytes();
+                start += len;
+            }
+            assert_eq!(
+                shard_owned,
+                whole.owned_heap_bytes(),
+                "asymmetric={asymmetric}: per-shard owned heap must sum to the whole"
+            );
+        }
+    }
+
     #[test]
     fn packed_b_is_send_sync() {
         assert_send_sync::<PackedB>();
@@ -1662,6 +2760,52 @@ mod tests {
             id, expected,
             "MLAS f32 GEMM dispatch did not match host ISA"
         );
+    }
+
+    /// The threadpool sentinel must not change results. `MlasGemmBatch`
+    /// partitions across threads, so this also guards against a partitioning
+    /// bug producing torn, zeroed or doubly-written output tiles.
+    #[test]
+    fn sgemm_nn_is_correct_when_parallelized() {
+        let (m, n, k) = (129usize, 257usize, 193usize); // deliberately odd
+        let a = seq(m * k, 0.5);
+        let b = seq(k * n, 1.5);
+        let mut got = vec![0.0f32; m * n];
+        sgemm_nn(m, n, k, &a, &b, &mut got);
+
+        let mut want = vec![0.0f32; m * n];
+        ref_sgemm(false, false, m, n, k, 1.0, &a, k, &b, n, 0.0, &mut want, n);
+
+        // Per-element bound from the actual accumulation magnitude rather than
+        // a flat relative epsilon: a flat bound scaled by |want| goes to zero
+        // as an output approaches zero, so a zeroed tile covering
+        // small-magnitude outputs could slip through. `sum |a*b|` is the
+        // quantity f32 rounding actually accumulates over.
+        //
+        // The constant is the standard forward error bound for a length-`k`
+        // dot product, `gamma_k = k*u / (1 - k*u)` with `u = EPSILON/2`,
+        // rounded up to `k * EPSILON`. Deliberately not tighter: MLAS is free
+        // to reassociate the sum (blocked accumulation, FMA contraction,
+        // different vector widths per ISA), so a bound derived from one host's
+        // accumulation order would be flaky elsewhere. It is still ~5 orders
+        // of magnitude below the value itself, so a zeroed or torn tile is
+        // caught.
+        let tol_scale = k as f32 * f32::EPSILON;
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum_abs = 0.0f32;
+                for p in 0..k {
+                    sum_abs += (a[i * k + p] * b[p * n + j]).abs();
+                }
+                let tol = tol_scale * sum_abs.max(f32::MIN_POSITIVE);
+                let (g, w) = (got[i * n + j], want[i * n + j]);
+                assert!(
+                    (g - w).abs() <= tol,
+                    "mismatch at ({i},{j}): got {g}, want {w}, tol {tol} \
+                     (sum|a*b| = {sum_abs})"
+                );
+            }
+        }
     }
 
     /// Single-thread performance probe for the medium f32 MatMul shape
@@ -3043,5 +4187,553 @@ mod tests {
 
             assert_eq!(back, input, "round-trip mismatch for channels={channels}");
         }
+    }
+
+    /// The standalone pool's default sizing rule must never hand a host *fewer*
+    /// workers than the previous `available.clamp(1, 8)` rule did, and must
+    /// scale past eight on hosts that have the cores.
+    ///
+    /// The old cap was inherited from the CPU EP's flat Rayon pool, whose per-op
+    /// fork/join regresses past eight workers. This pool is persistent and
+    /// work-stealing, so the cap only starved it: on a 32-vCPU host it left f32
+    /// MatMul 1.85--2.64x slower than ORT out of the box, versus 0.92--1.30x
+    /// once the pool is allowed half the machine.
+    #[test]
+    fn default_pool_size_is_monotone_against_the_old_eight_worker_rule() {
+        for available in 1..=256usize {
+            let old = available.clamp(1, 8);
+            let new = resolve_default_mlas_threads(available);
+            assert!(
+                new >= old,
+                "available={available}: new default {new} regresses below the old default {old}"
+            );
+            assert!(
+                new <= available.max(1),
+                "available={available}: new default {new} oversubscribes the host"
+            );
+            assert!(
+                new <= MAX_MLAS_POOL_THREADS,
+                "available={available}: new default {new} exceeds the pool cap"
+            );
+        }
+        // Pin the interesting points so a future edit cannot silently drift.
+        assert_eq!(resolve_default_mlas_threads(0), 1, "degenerate host");
+        assert_eq!(resolve_default_mlas_threads(1), 1);
+        assert_eq!(resolve_default_mlas_threads(4), 4, "small host unchanged");
+        assert_eq!(resolve_default_mlas_threads(8), 8, "old ceiling unchanged");
+        assert_eq!(resolve_default_mlas_threads(16), 8, "old ceiling unchanged");
+        assert_eq!(
+            resolve_default_mlas_threads(32),
+            16,
+            "half of a 32-vCPU host"
+        );
+        assert_eq!(resolve_default_mlas_threads(256), 64, "capped");
+    }
+
+    /// `ONNX_GENAI_CPU_DECODE_THREADS` is the CPU EP's thread-budget knob. The
+    /// standalone MLAS pool used to ignore it entirely, so asking the EP for N
+    /// threads left every `MlasGemmBatch` call on a differently-sized pool.
+    #[allow(clippy::too_many_arguments)]
+    fn qgemm_oracle(
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[u8],
+        a_signed: bool,
+        za: u8,
+        b: &[u8],
+        b_signed: bool,
+        zb: &[u8],
+    ) -> Vec<i32> {
+        let widen = |byte: u8, signed: bool| {
+            if signed {
+                i32::from(byte as i8)
+            } else {
+                i32::from(byte)
+            }
+        };
+        let za = widen(za, a_signed);
+        let mut c = vec![0i32; m * n];
+        for row in 0..m {
+            for column in 0..n {
+                let zb = widen(zb[column % zb.len()], b_signed);
+                let mut acc = 0i32;
+                for inner in 0..k {
+                    acc += (widen(a[row * k + inner], a_signed) - za)
+                        * (widen(b[inner * n + column], b_signed) - zb);
+                }
+                c[row * n + column] = acc;
+            }
+        }
+        c
+    }
+
+    /// MLAS's integer QGEMM must reproduce the plain integer dot product for
+    /// every signedness pair, including the `m == 1` decode row and shapes that
+    /// are not multiples of any kernel tile.
+    #[test]
+    fn qgemm_i32_matches_the_integer_oracle_for_every_signedness() {
+        // `u8 x i8` is the one pair a pairwise-i16 kernel can saturate; every
+        // other pair is exact on every kernel we ship, on every host. Asserting
+        // the exact pairs unconditionally is what makes this test a real check
+        // rather than a restatement of whatever the machine happens to do.
+        fn exact_here(a_signed: bool, b_signed: bool) -> bool {
+            !(!a_signed && b_signed) || qgemm_u8s8_is_exact()
+        }
+
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 33) as u8
+        };
+
+        for &(m, n, k) in &[
+            (1, 1, 1),
+            (1, 37, 61),
+            (3, 8, 4),
+            (5, 65, 129),
+            (16, 16, 32),
+        ] {
+            let a: Vec<u8> = (0..m * k).map(|_| next()).collect();
+            let b: Vec<u8> = (0..k * n).map(|_| next()).collect();
+            for &a_signed in &[false, true] {
+                for &b_signed in &[false, true] {
+                    let za = next();
+                    let zb = next();
+                    let mut got = vec![0i32; m * n];
+                    qgemm_i32(
+                        m,
+                        n,
+                        k,
+                        &a,
+                        a_signed,
+                        za,
+                        &b,
+                        b_signed,
+                        QgemmZeroPoints::PerTensor(zb),
+                        &mut got,
+                    );
+                    let want = qgemm_oracle(m, n, k, &a, a_signed, za, &b, b_signed, &[zb]);
+                    if exact_here(a_signed, b_signed) {
+                        assert_eq!(
+                            got, want,
+                            "per-tensor m={m} n={n} k={k} a_signed={a_signed} \
+                             b_signed={b_signed}"
+                        );
+                    }
+
+                    let zb_columns: Vec<u8> = (0..n).map(|_| next()).collect();
+                    let mut got = vec![0i32; m * n];
+                    qgemm_i32(
+                        m,
+                        n,
+                        k,
+                        &a,
+                        a_signed,
+                        za,
+                        &b,
+                        b_signed,
+                        QgemmZeroPoints::PerColumn(&zb_columns),
+                        &mut got,
+                    );
+                    let want = qgemm_oracle(m, n, k, &a, a_signed, za, &b, b_signed, &zb_columns);
+                    if exact_here(a_signed, b_signed) {
+                        assert_eq!(
+                            got, want,
+                            "per-column m={m} n={n} k={k} a_signed={a_signed} \
+                             b_signed={b_signed}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The probe must predict what the machine actually does. A probe that
+    /// always answered "exact" would silently license a lossy kernel, and one
+    /// that always answered "inexact" would give up the fast path for free.
+    #[test]
+    fn qgemm_u8s8_probe_agrees_with_what_the_machine_actually_computes() {
+        let (m, n, k) = (4, 24, 96);
+        let mut state = 0x0f1e_2d3c_4b5a_6978u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 33) as u8
+        };
+        // Full-range operands: `u8` near 255 against `i8` near -128 is exactly
+        // the pattern that overflows a pairwise `i16` accumulator.
+        let a: Vec<u8> = (0..m * k).map(|_| 192 | (next() >> 2)).collect();
+        let b: Vec<u8> = (0..k * n).map(|_| 0x80 | (next() >> 2)).collect();
+        let mut got = vec![0i32; m * n];
+        qgemm_i32(
+            m,
+            n,
+            k,
+            &a,
+            false,
+            0,
+            &b,
+            true,
+            QgemmZeroPoints::PerTensor(0),
+            &mut got,
+        );
+        let want = qgemm_oracle(m, n, k, &a, false, 0, &b, true, &[0]);
+        assert_eq!(
+            got == want,
+            qgemm_u8s8_is_exact(),
+            "the u8xi8 exactness probe disagrees with a deliberately saturating \
+             workload; probe said {}",
+            qgemm_u8s8_is_exact()
+        );
+    }
+
+    /// A pre-packed B must give bit-identical `i32` accumulators to the
+    /// unpacked path, for every signedness MLAS supports here and for both
+    /// zero-point layouts.
+    ///
+    /// Bit-identical is the right bar: the pack only changes B's memory layout,
+    /// not the arithmetic, so any difference is a packing bug rather than a
+    /// tolerable reordering.
+    #[test]
+    fn qgemm_packed_b_is_bit_identical_to_the_unpacked_path() {
+        let (m, n, k) = (5usize, 19usize, 37usize);
+        let a: Vec<u8> = (0..m * k).map(|i| (i * 37 % 251) as u8).collect();
+        let b: Vec<u8> = (0..k * n).map(|i| (i * 53 % 241) as u8).collect();
+        let mut checked = 0usize;
+        for (a_signed, b_signed) in [(false, false), (false, true), (true, true)] {
+            if !a_signed && b_signed && !qgemm_u8s8_is_exact() {
+                continue;
+            }
+            let Some(packed) = QgemmPackedB::new(n, k, &b, a_signed, b_signed) else {
+                continue;
+            };
+            assert_eq!(packed.identity(), (k, n, a_signed, b_signed));
+            let zero_point_a = 7u8;
+            let per_column: Vec<u8> = (0..n).map(|i| (i * 11 % 97) as u8).collect();
+            for zero_points in [
+                QgemmZeroPoints::PerTensor(13),
+                QgemmZeroPoints::PerColumn(&per_column),
+            ] {
+                let mut want = vec![0i32; m * n];
+                qgemm_i32(
+                    m,
+                    n,
+                    k,
+                    &a,
+                    a_signed,
+                    zero_point_a,
+                    &b,
+                    b_signed,
+                    zero_points,
+                    &mut want,
+                );
+                let mut got = vec![0i32; m * n];
+                qgemm_i32_packed(
+                    m,
+                    n,
+                    k,
+                    &a,
+                    a_signed,
+                    zero_point_a,
+                    &packed,
+                    zero_points,
+                    &mut got,
+                );
+                assert_eq!(
+                    got, want,
+                    "packed and unpacked qgemm disagreed for a_signed={a_signed} \
+                     b_signed={b_signed}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "no signedness/zero-point combination was exercised, so this test proved nothing"
+        );
+    }
+
+    /// The scalar requantization every caller would otherwise write by hand:
+    /// round to nearest, ties to even, offset by the zero point, clamp.
+    fn requantize_oracle(
+        products: &[i32],
+        scale: &QgemmScale<'_>,
+        n: usize,
+        zero_point: i32,
+        signed: bool,
+    ) -> Vec<u8> {
+        products
+            .iter()
+            .enumerate()
+            .map(|(index, &product)| {
+                let scale = match scale {
+                    QgemmScale::PerTensor(value) => *value,
+                    QgemmScale::PerColumn(values) => values[index % n],
+                };
+                let value = ((product as f32 * scale).round_ties_even() as i64)
+                    .saturating_add(i64::from(zero_point));
+                if signed {
+                    value.clamp(i8::MIN as i64, i8::MAX as i64) as i8 as u8
+                } else {
+                    value.clamp(u8::MIN as i64, u8::MAX as i64) as u8
+                }
+            })
+            .collect()
+    }
+
+    /// The fused path must agree, byte for byte, with running the unfused
+    /// `qgemm_i32` and requantizing its accumulator in scalar Rust. If it does
+    /// not, a kernel that switches to it silently changes its output.
+    #[test]
+    fn qgemm_requantize_matches_the_unfused_accumulator_and_a_scalar_requantize() {
+        // `n` deliberately straddles MLAS's 16-column block so the tail path is
+        // exercised too, and `m > 1` so more than one output row is processed.
+        let (m, n, k) = (3usize, 19usize, 37usize);
+        let a: Vec<u8> = (0..m * k).map(|i| (i * 37 % 251) as u8).collect();
+        let b: Vec<u8> = (0..k * n).map(|i| (i * 53 % 241) as u8).collect();
+        let per_column_zero_points: Vec<u8> = (0..n).map(|i| (i * 11 % 97) as u8).collect();
+        let per_column_scales: Vec<f32> =
+            (0..n).map(|i| 1.0e-5 * (1.0 + i as f32 * 0.37)).collect();
+        let mut checked = 0usize;
+        for (a_signed, b_signed) in [(false, false), (false, true), (true, true)] {
+            if !a_signed && b_signed && !qgemm_u8s8_is_exact() {
+                continue;
+            }
+            let packed = QgemmPackedB::new(n, k, &b, a_signed, b_signed);
+            for zero_points in [
+                QgemmZeroPoints::PerTensor(13),
+                QgemmZeroPoints::PerColumn(&per_column_zero_points),
+            ] {
+                let mut products = vec![0i32; m * n];
+                qgemm_i32(
+                    m,
+                    n,
+                    k,
+                    &a,
+                    a_signed,
+                    7,
+                    &b,
+                    b_signed,
+                    zero_points,
+                    &mut products,
+                );
+                for scale in [
+                    QgemmScale::PerTensor(2.0e-5),
+                    QgemmScale::PerColumn(&per_column_scales),
+                ] {
+                    for (output_signed, output_zero_point) in [(false, 128), (true, -5)] {
+                        let want = requantize_oracle(
+                            &products,
+                            &scale,
+                            n,
+                            output_zero_point,
+                            output_signed,
+                        );
+                        for weights in [
+                            Some(QgemmWeights::Dense {
+                                bytes: &b,
+                                signed: b_signed,
+                            }),
+                            packed.as_ref().map(QgemmWeights::Packed),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            let mut scratch = vec![0i32; m * n];
+                            let mut got = vec![0u8; m * n];
+                            qgemm_requantize(
+                                m,
+                                n,
+                                k,
+                                &a,
+                                a_signed,
+                                7,
+                                weights,
+                                zero_points,
+                                scale,
+                                &mut got,
+                                output_signed,
+                                output_zero_point,
+                                &mut scratch,
+                            );
+                            assert_eq!(
+                                got, want,
+                                "fused requantize disagreed with the scalar oracle for \
+                                 a_signed={a_signed} b_signed={b_signed} \
+                                 output_signed={output_signed}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "no combination was exercised, so this test proved nothing"
+        );
+    }
+
+    /// Saturation is part of the contract: an accumulator that scales past the
+    /// output dtype's range must clamp, not wrap.
+    #[test]
+    fn qgemm_requantize_saturates_instead_of_wrapping() {
+        let (m, n, k) = (1usize, 8usize, 16usize);
+        // Maximum-magnitude activations against maximum-magnitude weights, with
+        // a scale large enough that every column overflows the byte range.
+        let a = vec![255u8; m * k];
+        let b = vec![255u8; k * n];
+        let mut scratch = vec![0i32; m * n];
+        let mut got = vec![0u8; m * n];
+        qgemm_requantize(
+            m,
+            n,
+            k,
+            &a,
+            false,
+            0,
+            QgemmWeights::Dense {
+                bytes: &b,
+                signed: false,
+            },
+            QgemmZeroPoints::PerTensor(0),
+            QgemmScale::PerTensor(1.0e6),
+            &mut got,
+            false,
+            0,
+            &mut scratch,
+        );
+        assert_eq!(
+            got,
+            vec![255u8; m * n],
+            "positive overflow must clamp to 255"
+        );
+
+        let mut got_signed = vec![0u8; m * n];
+        qgemm_requantize(
+            m,
+            n,
+            k,
+            &a,
+            false,
+            0,
+            QgemmWeights::Dense {
+                bytes: &b,
+                signed: false,
+            },
+            QgemmZeroPoints::PerTensor(0),
+            QgemmScale::PerTensor(-1.0e6),
+            &mut got_signed,
+            true,
+            0,
+            &mut scratch,
+        );
+        assert_eq!(
+            got_signed,
+            vec![(-128i8) as u8; m * n],
+            "negative overflow must clamp to -128"
+        );
+    }
+
+    #[test]
+    fn qgemm_packed_b_declines_empty_shapes() {
+        assert!(QgemmPackedB::new(0, 4, &[], false, false).is_none());
+        assert!(QgemmPackedB::new(4, 0, &[], false, false).is_none());
+    }
+
+    #[test]
+    fn qgemm_packed_b_is_send_sync() {
+        assert_send_sync::<QgemmPackedB>();
+    }
+
+    #[test]
+    fn qgemm_i32_tolerates_empty_shapes() {
+        let mut c: Vec<i32> = Vec::new();
+        qgemm_i32(
+            0,
+            4,
+            4,
+            &[],
+            false,
+            0,
+            &[0; 16],
+            false,
+            QgemmZeroPoints::PerTensor(0),
+            &mut c,
+        );
+        qgemm_i32(
+            4,
+            0,
+            4,
+            &[0; 16],
+            false,
+            0,
+            &[],
+            false,
+            QgemmZeroPoints::PerTensor(0),
+            &mut c,
+        );
+    }
+
+    #[test]
+    fn parse_thread_count_parses_and_clamps() {
+        // Deliberately tests the pure parser rather than `thread_count_env`:
+        // `std::env::set_var` races concurrent `getenv` in sibling tests (cargo
+        // runs lib tests multi-threaded), which is a data race even for
+        // distinct keys. The only thing `thread_count_env` adds is the
+        // `std::env::var` lookup.
+        assert_eq!(parse_thread_count("12"), Some(12));
+        assert_eq!(
+            parse_thread_count("  7  "),
+            Some(7),
+            "surrounding whitespace must be tolerated"
+        );
+        assert_eq!(
+            parse_thread_count("9999"),
+            Some(MAX_MLAS_POOL_THREADS),
+            "an absurd request must clamp, not oversubscribe"
+        );
+        for bad in ["0", "", "abc", "-4", "3.5", "18446744073709551616"] {
+            assert_eq!(
+                parse_thread_count(bad),
+                None,
+                "{bad:?} must fall through to the next precedence level"
+            );
+        }
+    }
+
+    #[test]
+    fn pool_thread_budget_round_trips_and_rejects_zero() {
+        // Serialized against the resolver test below by exercising only the
+        // atomic, which is process-local state this test fully owns and
+        // restores.
+        let previous = POOL_THREAD_BUDGET.load(Ordering::Acquire);
+        assert_eq!(
+            set_pool_thread_budget(Some(0)),
+            Err("MLAS pool thread budget must be greater than zero"),
+            "zero is the CPU EP's opt-out sentinel, not a legal pool size"
+        );
+
+        set_pool_thread_budget(Some(6)).expect("6 is a legal budget");
+        assert_eq!(pool_thread_budget(), Some(6));
+
+        set_pool_thread_budget(Some(9999)).expect("an absurd budget clamps");
+        assert_eq!(
+            pool_thread_budget(),
+            Some(MAX_MLAS_POOL_THREADS),
+            "the programmatic path must clamp exactly like the env path"
+        );
+
+        set_pool_thread_budget(None).expect("clearing is legal");
+        assert_eq!(
+            pool_thread_budget(),
+            None,
+            "a cleared budget must fall through to the next precedence level"
+        );
+        POOL_THREAD_BUDGET.store(previous, Ordering::Release);
     }
 }

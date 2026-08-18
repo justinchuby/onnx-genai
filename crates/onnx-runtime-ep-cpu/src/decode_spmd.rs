@@ -227,6 +227,37 @@ struct SharedState {
     /// A poisoned pool rejects this and every later dispatch instead of hanging
     /// forever waiting for a worker that has unwound.
     poisoned_worker: AtomicUsize,
+    /// Set while one thread owns the publish/wait protocol above.
+    ///
+    /// `job` is a **single slot** and the `node_pending` counters are a single
+    /// barrier, so the whole `publish` -> `wait` sequence is one critical
+    /// section over the entire worker set. Two threads running it at once would
+    /// overwrite each other's job pointer and both sets of workers would run
+    /// whichever closure landed last -- producing *silently wrong tensors*
+    /// rather than a crash or a hang, since each shard writes a disjoint output
+    /// region and the barrier still balances.
+    ///
+    /// [`SpmdDecodePools::dispatch`] claims this with a compare-exchange and
+    /// runs the shards inline when the claim fails, so a second dispatcher
+    /// degrades to serial instead of corrupting the first. This also makes a
+    /// re-entrant dispatch (a shard closure that itself dispatches) run inline
+    /// rather than deadlock against the barrier it is already inside.
+    ///
+    /// Padded onto its own line, which is not optional. It is written twice per
+    /// op by the dispatcher while every worker polls `shutdown` in its wait
+    /// loop, so sharing a line with those fields makes each claim invalidate
+    /// all 16 workers' copies. Empty 16-worker dispatch, best of 7 x 20k,
+    /// three alternating rounds:
+    ///
+    /// | variant | ns/dispatch |
+    /// |---|---|
+    /// | ungated (pre-fix) | 908 / 903 / 907 |
+    /// | gated, padded | 898 / 881 / 898 |
+    /// | gated, unpadded | 1452 / 1497 / 1432 |
+    ///
+    /// Padded, the gate costs nothing measurable. Unpadded it costs ~60%, which
+    /// at ~400 barriers per token is ~230 us/token of pure coherency traffic.
+    dispatching: Padded<AtomicBool>,
     shutdown: AtomicBool,
 }
 
@@ -266,10 +297,13 @@ impl SharedState {
         }
     }
 
-    /// Spin-wait until every node's workers have finished the published op. The
-    /// dispatcher is a single, never-idle thread that needs the results the
-    /// instant they land, so it spins (with a yield backstop for stragglers under
-    /// oversubscription) rather than parking.
+    /// Spin-wait until every node's workers have finished the published op.
+    ///
+    /// There is exactly one dispatcher at a time -- enforced by
+    /// [`SharedState::dispatching`], which callers claim through
+    /// [`DispatchClaim::try_claim`] before publishing. It is never idle and
+    /// needs the results the instant they land, so it spins (with a yield
+    /// backstop for stragglers under oversubscription) rather than parking.
     fn wait(&self) {
         let mut spins = 0u32;
         loop {
@@ -343,6 +377,37 @@ impl SharedState {
                  ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL or restart the process"
             );
         }
+    }
+}
+
+/// Exclusive ownership of the pool's single job slot and barrier.
+///
+/// Claiming and releasing live together here so the two halves cannot drift
+/// apart: the only way to construct one is [`DispatchClaim::try_claim`], and
+/// `Drop` releases on every exit including an unwind. A leaked claim would send
+/// every later dispatch inline forever, so the panic path matters.
+struct DispatchClaim<'a> {
+    shared: &'a SharedState,
+}
+
+impl<'a> DispatchClaim<'a> {
+    /// Take exclusive ownership, or `None` if another thread already holds it.
+    ///
+    /// Acquire on success pairs with the Release in `Drop`, so the new owner
+    /// observes the previous op's completion before overwriting the job slot.
+    fn try_claim(shared: &'a SharedState) -> Option<Self> {
+        shared
+            .dispatching
+            .0
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self { shared })
+    }
+}
+
+impl Drop for DispatchClaim<'_> {
+    fn drop(&mut self) {
+        self.shared.dispatching.0.store(false, Ordering::Release);
     }
 }
 
@@ -449,6 +514,7 @@ impl SpmdDecodePools {
             worker_node,
             ready: AtomicUsize::new(0),
             poisoned_worker: AtomicUsize::new(0),
+            dispatching: Padded(AtomicBool::new(false)),
             shutdown: AtomicBool::new(false),
         });
 
@@ -550,11 +616,31 @@ impl SpmdDecodePools {
         }
     }
 
+    /// Run every shard of `job` on this thread, in global worker order.
+    ///
+    /// The shard closures partition their output into disjoint regions indexed
+    /// by global worker index, so running all of them on one thread is exactly
+    /// the same computation as broadcasting them -- only serial. This is the
+    /// fallback when the pool's single publish/wait slot is already claimed.
+    fn dispatch_inline<F>(&self, job: &F)
+    where
+        F: Fn(usize) + Sync,
+    {
+        for global_index in 0..self.total_workers {
+            job(global_index);
+        }
+    }
+
     /// Broadcast `job` to the workers and block until all have finished.
     ///
     /// `job(global_worker_index)` runs the shard owned by that worker. The
     /// dispatcher (this thread) does not compute; it only publishes and waits,
     /// mirroring an external `pool.install` where the caller blocks.
+    ///
+    /// The pool has one job slot and one barrier, so it can serve one
+    /// dispatcher at a time. When another thread already owns them this runs
+    /// the shards inline instead of waiting or racing -- see
+    /// [`SharedState::dispatching`].
     fn dispatch<F>(&self, job: &F)
     where
         F: Fn(usize) + Sync,
@@ -582,12 +668,19 @@ impl SpmdDecodePools {
             let job = unsafe { &*data.cast::<F>() };
             job(global_index);
         }
+        // The pool serves one dispatcher at a time; a second one runs the same
+        // shards inline rather than racing for the slot.
+        let Some(claim) = DispatchClaim::try_claim(shared) else {
+            self.dispatch_inline(job);
+            return;
+        };
         let job = Job {
             data: std::ptr::from_ref(job).cast(),
             call: call::<F>,
         };
         shared.publish(job, &self.node_worker_counts);
         shared.wait();
+        drop(claim);
         shared.panic_if_poisoned();
     }
 
@@ -1245,8 +1338,56 @@ pub(crate) fn persistence_mode_from_raw(raw: Option<&str>) -> PersistenceMode {
     }
 }
 
+/// Default when [`PERSISTENT_POOL_ENV`] is unset. `true` (the historical
+/// default) builds the persistent SPMD pool; a host that never enters an SPMD
+/// decode scope sets this to `false`.
+static PERSISTENT_POOL_DEFAULT: AtomicBool = AtomicBool::new(true);
+
+/// Opt this process out of (or back into) the persistent SPMD decode pool when
+/// [`PERSISTENT_POOL_ENV`] is unset.
+///
+/// The pool only pays off for a host that drives decode *inside* an SPMD scope
+/// (`onnx-genai-engine`'s native decode loop): resident workers, one barrier
+/// per projection, no fork/join. A host that never enters such a scope -- the
+/// plugin EP, where ONNX Runtime owns the graph and the threads -- gets only
+/// the costs: resident workers competing with ORT's own intra-op pool, and an
+/// MLAS weight partitioned into one shard per persistent decode worker
+/// (`available_parallelism() / 2` by default), which caps an unscoped decode
+/// GEMV at that worker count however many threads the host has.
+///
+/// Measured on the plugin path (32 vCPU AMD EPYC 9V74, MLAS build, int4
+/// block-32, K=N=2048, M=1, p50 of 41 runs, each backend alone in its process):
+/// 0.376 ms with the pool built against 0.092 ms without it, with ONNX
+/// Runtime's own CPU EP at 0.097 ms.
+///
+/// An explicit `PERSISTENT_POOL_ENV` setting always wins. Must be called before
+/// the first [`pools()`] query; afterwards the built layout is fixed for the
+/// process. `Relaxed` is sufficient because the only supported caller writes
+/// this during library initialization, before the host has created a session or
+/// spawned the threads that read it -- that handoff is the synchronisation.
+pub fn set_persistent_decode_pool_default(enabled: bool) {
+    PERSISTENT_POOL_DEFAULT.store(enabled, Ordering::Relaxed);
+}
+
+/// Resolve the persistence mode from the raw env value and the process default.
+/// An explicit setting always wins; the default only decides the unset case.
+/// Pure so the precedence is unit-tested without env races.
+pub(crate) fn resolve_persistence_mode(
+    raw: Option<&str>,
+    default_enabled: bool,
+) -> PersistenceMode {
+    match raw {
+        Some(value) => persistence_mode_from_raw(Some(value)),
+        None if !default_enabled => PersistenceMode::Off,
+        None => persistence_mode_from_raw(None),
+    }
+}
+
 fn persistence_mode() -> PersistenceMode {
-    persistence_mode_from_raw(std::env::var(PERSISTENT_POOL_ENV).ok().as_deref())
+    resolve_persistence_mode(
+        std::env::var(PERSISTENT_POOL_ENV).ok().as_deref(),
+        PERSISTENT_POOL_DEFAULT.load(Ordering::Relaxed),
+    )
 }
 
 /// Whether a persistence mode **builds** the persistent SPMD pool. Both `On`
@@ -1814,6 +1955,39 @@ pub(crate) fn auto_record_sample(path: AutoPath, elapsed: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host that never enters an SPMD decode scope (the plugin EP) turns the
+    /// pool off by default, and an explicit environment setting still wins in
+    /// both directions -- otherwise opting the plugin out would take the pool
+    /// away from anyone who asked for it by name.
+    #[test]
+    fn process_default_decides_only_the_unset_case() {
+        assert_eq!(
+            resolve_persistence_mode(None, true),
+            PersistenceMode::On,
+            "unset with the historical default builds the pool"
+        );
+        assert_eq!(
+            resolve_persistence_mode(None, false),
+            PersistenceMode::Off,
+            "unset with the pool opted out leaves decode on the flat path"
+        );
+        assert_eq!(
+            resolve_persistence_mode(Some("1"), false),
+            PersistenceMode::On,
+            "an explicit =1 wins over a process opt-out"
+        );
+        assert_eq!(
+            resolve_persistence_mode(Some("auto"), false),
+            PersistenceMode::Adaptive,
+            "an explicit =auto wins over a process opt-out"
+        );
+        assert_eq!(
+            resolve_persistence_mode(Some("0"), true),
+            PersistenceMode::Off,
+            "an explicit =0 wins over the historical default"
+        );
+    }
 
     fn two_group_pool() -> SpmdDecodePools {
         let shards = vec![
@@ -2553,5 +2727,166 @@ mod tests {
         assert_eq!(median_ns(&mut [5]), 5);
         assert_eq!(median_ns(&mut [30, 10, 20]), 20);
         assert_eq!(median_ns(&mut [10, 40, 20, 30]), 30);
+    }
+}
+
+/// The pool exposes one job slot and one barrier. Before the claim gate, two
+/// threads dispatching at once overwrote each other's job pointer and each
+/// other's pending counts. Both failure modes were observed by deleting the
+/// gate and re-running these tests: shards running the *other* thread's
+/// closure (silently wrong tensors, no crash), and -- more often -- the
+/// pending counters never draining, hanging `wait` forever. The pool spins in
+/// `wait`, so the hang burns every core until the process is killed.
+///
+/// Only the last two tests here are falsifiers for the gate itself: the first
+/// three hold no contention, so they pass with or without it. They cover the
+/// RAII guard's own contract (exclusivity, release-on-unwind) and the ordinary
+/// single-dispatcher partition, which is worth pinning separately.
+#[cfg(test)]
+mod dispatch_claim_tests {
+    use super::*;
+    use std::sync::Barrier;
+    use std::sync::atomic::AtomicU32;
+
+    /// A dispatch whose shards all run, exactly once each, is the property the
+    /// single job slot silently violated under a concurrent second dispatcher.
+    fn assert_each_shard_ran_once(counts: &[AtomicU32]) {
+        for (index, count) in counts.iter().enumerate() {
+            assert_eq!(
+                count.load(Ordering::Relaxed),
+                1,
+                "shard {index} ran {} times, expected exactly 1",
+                count.load(Ordering::Relaxed)
+            );
+        }
+    }
+
+    #[test]
+    fn an_uncontended_dispatch_releases_the_claim_for_the_next_one() {
+        let shared = SharedState {
+            node_sense: Vec::new(),
+            job: UnsafeCell::new(None),
+            node_pending: Vec::new(),
+            worker_node: Vec::new(),
+            ready: AtomicUsize::new(0),
+            poisoned_worker: AtomicUsize::new(0),
+            dispatching: Padded(AtomicBool::new(false)),
+            shutdown: AtomicBool::new(false),
+        };
+        {
+            let claim = DispatchClaim::try_claim(&shared)
+                .expect("an unclaimed pool must hand out the claim");
+            assert!(
+                DispatchClaim::try_claim(&shared).is_none(),
+                "a held claim must be exclusive; a second claimant would \
+                 publish into the same job slot"
+            );
+            drop(claim);
+        }
+        assert!(
+            DispatchClaim::try_claim(&shared).is_some(),
+            "a released claim must let the next dispatch use the pool; leaking \
+             it would send every later dispatch inline forever"
+        );
+    }
+
+    #[test]
+    fn a_panic_inside_the_critical_section_still_releases_the_claim() {
+        let shared = SharedState {
+            node_sense: Vec::new(),
+            job: UnsafeCell::new(None),
+            node_pending: Vec::new(),
+            worker_node: Vec::new(),
+            ready: AtomicUsize::new(0),
+            poisoned_worker: AtomicUsize::new(0),
+            dispatching: Padded(AtomicBool::new(false)),
+            shutdown: AtomicBool::new(false),
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _claim = DispatchClaim::try_claim(&shared).expect("claim available");
+            panic!("a worker poisoned the pool");
+        }));
+        assert!(result.is_err());
+        assert!(
+            DispatchClaim::try_claim(&shared).is_some(),
+            "unwinding out of the critical section must release the claim"
+        );
+    }
+
+    #[test]
+    fn every_shard_of_a_dispatch_runs_exactly_once() {
+        let Some(pools) = pools() else {
+            return;
+        };
+        let counts: Vec<AtomicU32> = (0..pools.total_workers)
+            .map(|_| AtomicU32::new(0))
+            .collect();
+        pools.dispatch(&|index: usize| {
+            counts[index].fetch_add(1, Ordering::Relaxed);
+        });
+        assert_each_shard_ran_once(&counts);
+    }
+
+    /// The regression itself: two threads dispatching at the same instant. On
+    /// the unguarded pool the loser's shards ran the winner's closure, so its
+    /// own counters came back short (and the winner's over-counted). With the
+    /// gate the loser runs inline and both see a complete, exact partition.
+    #[test]
+    fn two_threads_dispatching_at_once_each_get_their_own_complete_partition() {
+        let Some(pools) = pools() else {
+            return;
+        };
+        let workers = pools.total_workers;
+        let start = Barrier::new(2);
+        let left: Vec<AtomicU32> = (0..workers).map(|_| AtomicU32::new(0)).collect();
+        let right: Vec<AtomicU32> = (0..workers).map(|_| AtomicU32::new(0)).collect();
+        thread::scope(|scope| {
+            for counts in [&left, &right] {
+                scope.spawn(|| {
+                    start.wait();
+                    for _ in 0..64 {
+                        pools.dispatch(&|index: usize| {
+                            counts[index].fetch_add(1, Ordering::Relaxed);
+                        });
+                    }
+                });
+            }
+        });
+        for (side, counts) in [("left", &left), ("right", &right)] {
+            for (index, count) in counts.iter().enumerate() {
+                assert_eq!(
+                    count.load(Ordering::Relaxed),
+                    64,
+                    "{side} shard {index} ran {} times across 64 dispatches, \
+                     expected 64 -- a shard that ran the other thread's closure \
+                     is the silent-corruption failure this gate prevents",
+                    count.load(Ordering::Relaxed)
+                );
+            }
+        }
+    }
+
+    /// A shard closure that dispatches again used to deadlock: the inner
+    /// `publish` overwrote the job the outer barrier was still waiting on. The
+    /// gate turns re-entrancy into inline execution.
+    #[test]
+    fn a_reentrant_dispatch_runs_inline_instead_of_deadlocking() {
+        let Some(pools) = pools() else {
+            return;
+        };
+        let workers = pools.total_workers;
+        let inner: Vec<AtomicU32> = (0..workers).map(|_| AtomicU32::new(0)).collect();
+        let outer = AtomicU32::new(0);
+        pools.dispatch(&|index: usize| {
+            if index != 0 {
+                return;
+            }
+            outer.fetch_add(1, Ordering::Relaxed);
+            pools.dispatch(&|nested: usize| {
+                inner[nested].fetch_add(1, Ordering::Relaxed);
+            });
+        });
+        assert_eq!(outer.load(Ordering::Relaxed), 1);
+        assert_each_shard_ran_once(&inner);
     }
 }

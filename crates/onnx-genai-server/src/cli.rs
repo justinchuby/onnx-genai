@@ -141,6 +141,17 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
     if let Some(vram_limit) = args.vram_limit {
         engine_config.limits.vram_limit = vram_limit;
     }
+    // #1064: `--max-batch N` is what *requests* the native persistent decode
+    // batch extent. Previously the extent could only be turned on by
+    // `ONNX_GENAI_NATIVE_DECODE_BATCH`, so `--max-batch N` was refused at
+    // startup: the batching capability was derived from a decode session nobody
+    // had asked to build in batch shape, which always reported 1. Only values
+    // above 1 are passed through, so the single-sequence default stays exactly as
+    // it was. The ORT backend ignores this field and keeps its own batching.
+    #[cfg(feature = "native-backend")]
+    if let Some(max_batch) = args.max_batch.filter(|&batch| batch > 1) {
+        engine_config.native_decode_batch = Some(max_batch);
+    }
 
     ServerConfig {
         node_id: args.node_id.clone().unwrap_or_else(default_node_id),
@@ -198,6 +209,48 @@ mod tests {
     struct TestCli {
         #[command(flatten)]
         serve: ServeArgs,
+    }
+
+    /// #1064: `--max-batch N` must *shape the decode session*, not merely be
+    /// checked against a capability derived from a session built for one
+    /// sequence. Before this, batch-N could only be enabled by
+    /// `ONNX_GENAI_NATIVE_DECODE_BATCH`, so `--max-batch 4` was refused at
+    /// startup with "this backend decodes at most 1 sequence(s) concurrently".
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn serve_max_batch_requests_the_native_decode_batch_extent() {
+        let cli = TestCli::parse_from(["test", "--model", "model-dir", "--max-batch", "4"]);
+
+        assert_eq!(
+            server_config_from_args(&cli.serve)
+                .engine_config
+                .native_decode_batch,
+            Some(4)
+        );
+    }
+
+    /// The single-sequence default must stay exactly as it was: neither an
+    /// omitted flag nor an explicit `1` may shape a batch grid, since batch 1 is
+    /// the #750 byte-identity reference.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn serve_leaves_single_sequence_decode_untouched() {
+        let omitted = TestCli::parse_from(["test", "--model", "model-dir"]);
+        let explicit_one =
+            TestCli::parse_from(["test", "--model", "model-dir", "--max-batch", "1"]);
+
+        assert_eq!(
+            server_config_from_args(&omitted.serve)
+                .engine_config
+                .native_decode_batch,
+            None
+        );
+        assert_eq!(
+            server_config_from_args(&explicit_one.serve)
+                .engine_config
+                .native_decode_batch,
+            None
+        );
     }
 
     #[test]

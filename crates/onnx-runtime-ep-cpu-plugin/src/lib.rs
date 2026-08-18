@@ -32,9 +32,63 @@ fn build_kernel_registry_entries() -> Vec<KernelRegistryEntry> {
                 // still match a model at opset 21).
                 end_version: i32::MAX,
                 supported_dtypes: d.supported_dtypes,
+                input_dtype_constraints:
+                    onnx_runtime_ep_cpu::kernels::input_dtype_constraints_for_op(
+                        &d.op_type, &d.domain,
+                    ),
             }
         })
         .collect()
+}
+
+/// Opt this process out of the persistent SPMD decode pool.
+///
+/// That pool exists for `onnx-genai-engine`'s native decode loop, which runs a
+/// whole decode step inside an SPMD scope so resident workers can take one
+/// output-column shard each under a single barrier. Nothing in the plugin path
+/// ever enters that scope: ONNX Runtime owns the graph, the schedule and the
+/// threads, and calls kernels one node at a time. What the plugin does inherit
+/// is the pool's costs -- resident workers competing with ORT's own intra-op
+/// pool, and a `MatMulNBits` weight pre-partitioned into one MLAS shard per
+/// persistent decode worker (`available_parallelism() / 2` by default -- 16 on
+/// the 32-vCPU host below), which then caps an unscoped decode GEMV at that
+/// worker count no matter how many threads the host has.
+///
+/// Measured on the plugin path (32 vCPU AMD EPYC 9V74, MLAS build, int4
+/// block-32, K=N=2048, M=1, p50 of 41 runs, each backend alone in its own
+/// process): 0.376 ms with the pool built against 0.092 ms without it, against
+/// ONNX Runtime's own CPU EP at 0.097 ms -- a 3.9x loss turned into a small
+/// win. Prefill (`m > 1`) is unaffected either way: it splits the shards into
+/// row blocks, so the shard count is not a thread ceiling there.
+///
+/// Setting `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL` explicitly still wins, so a
+/// host that wants the pool can ask for it.
+///
+/// This flips a default for the whole linked copy of `onnx-runtime-ep-cpu`.
+/// Today the cdylib has its own copy, separate from any native engine in the
+/// process; a future host that linked both against one copy would have to make
+/// this scope-aware rather than process-wide.
+pub fn disable_persistent_decode_pool() {
+    onnx_runtime_ep_cpu::decode_spmd::set_persistent_decode_pool_default(false);
+}
+
+/// Whether this library's process would build the persistent SPMD decode pool,
+/// as `1` (it would) or `0` (it would not).
+///
+/// Exists so a test on the other side of the cdylib boundary can observe the
+/// opt-out that [`disable_persistent_decode_pool`] performs. A test binary that
+/// merely links `onnx-runtime-ep-cpu` sees *its own* copy of the pool statics,
+/// not the ones ONNX Runtime's `dlopen`ed library uses, so only an export can
+/// answer this. Querying resolves the pool for the process, which is why this
+/// is a test hook and not something the EP itself calls.
+///
+/// # Safety
+///
+/// None: no arguments, no pointers. Declared `extern "C"` for the test's
+/// `dlsym`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_persistent_decode_pool_built() -> i32 {
+    i32::from(onnx_runtime_ep_cpu::decode_spmd::pools().is_some())
 }
 
 /// Leak a string to get a `&'static str` (the entries must live for the EP lifetime).
@@ -77,6 +131,9 @@ pub unsafe extern "C" fn CreateEpFactories(
     let out_factories_raw = out_factories;
     let out_num_raw = out_num;
     let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+        // Before any kernel can query the pool: this is the first call ONNX
+        // Runtime makes into the library.
+        disable_persistent_decode_pool();
         let entries = build_kernel_registry_entries();
         unsafe {
             onnx_runtime_ep_plugin::factory::create_ep_factories_with_registry(
@@ -156,11 +213,63 @@ pub extern "C" fn nxrt_ep_compiled_node_count() -> usize {
     onnx_runtime_ep_plugin::ep::compiled_node_count()
 }
 
+/// Number of node inputs this EP reported to its kernels as session-lifetime
+/// constants. Read through `dlopen` by the plugin E2E suite to prove weights
+/// are recognised as weights on the ORT plugin path, where ORT presents a
+/// fused node's initializers as ordinary inputs.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_constant_weight_inputs() -> usize {
+    onnx_runtime_ep_plugin::ep::constant_weight_inputs()
+}
+
+/// Resets the constant-weight-input counter to zero.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_reset_constant_weight_inputs() {
+    onnx_runtime_ep_plugin::ep::reset_constant_weight_inputs()
+}
+
 /// Resets the compiled-node counter to zero.
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_ep_reset_compiled_node_count() {
     onnx_runtime_ep_plugin::ep::reset_compiled_node_count()
 }
+
+/// Number of node kernels this EP has **executed** since the last reset.
+///
+/// The compiled-node counter above says ORT assigned us the node; this one says
+/// our kernel is what ran when the session was executed. The no-defer rule
+/// needs both: assignment without execution is not ownership, and an output
+/// that matches ORT proves nothing about which EP produced it.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_executed_node_count() -> usize {
+    onnx_runtime_ep_plugin::compute::executed_node_count()
+}
+
+/// Resets the executed-node counter to zero.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_reset_executed_node_count() {
+    onnx_runtime_ep_plugin::compute::reset_executed_node_count()
+}
+
+// ─── Build identity ─────────────────────────────────────────────────────────
+
+/// The optional build features compiled into this cdylib, as a NUL-terminated
+/// static string: `"mlas"`, or empty when there are none.
+///
+/// A packaged cdylib is opaque: nothing about the file says whether the
+/// vendored MLAS kernels were linked in, and the difference is an order of
+/// magnitude on the quantized matmul paths. Exporting it lets the wheel's own
+/// smoke test assert that what shipped is what was intended, instead of
+/// discovering a pure-Rust build in production benchmarks.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_build_features() -> *const ::std::os::raw::c_char {
+    BUILD_FEATURES.as_ptr() as *const ::std::os::raw::c_char
+}
+
+#[cfg(feature = "mlas")]
+const BUILD_FEATURES: &[u8] = b"mlas\0";
+#[cfg(not(feature = "mlas"))]
+const BUILD_FEATURES: &[u8] = b"\0";
 
 /// Number of workspace **placement resolutions** since the last reset.
 ///

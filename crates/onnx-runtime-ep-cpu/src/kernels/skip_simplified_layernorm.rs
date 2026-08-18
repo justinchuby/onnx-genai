@@ -93,6 +93,12 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
         let writes_inv_std = outputs
             .get(2)
             .is_some_and(|output| is_stats_shape(output.shape, shape));
+        // `input_skip_bias_sum` is optional. Materialize the whole X-shaped sum
+        // only when the graph actually consumes it; otherwise one reusable
+        // `hidden`-sized row scratch stays resident in L1 across every group.
+        let writes_sum = outputs.get(3).is_some_and(|output| output.shape == shape);
+        let sum_output_is_direct =
+            writes_sum && outputs[3].dtype == DataType::Float32 && outputs[3].is_contiguous();
         if inputs[1].shape == shape
             && inputs[0].is_contiguous()
             && inputs[1].is_contiguous()
@@ -103,35 +109,53 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
             && outputs[0].shape == shape
             && outputs[0].dtype == DataType::Float32
             && outputs[0].is_contiguous()
-            && outputs.get(3).is_some_and(|output| {
-                output.shape == shape && output.dtype == DataType::Float32 && output.is_contiguous()
-            })
+            && (sum_output_is_direct || !writes_sum)
         {
             let (output, remaining) = outputs.split_at_mut(1);
             let output = &mut output[0];
-            let (stats_outputs, sum_output) = remaining.split_at_mut(2);
-            let sum_output = &mut sum_output[0];
             output.validate()?;
-            sum_output.validate()?;
+            // `remaining` is `outputs[1..]`: at most `mean`, `inv_std_var` and
+            // `input_skip_bias_sum`. A node may bind as few as one output, so
+            // split defensively instead of assuming all four are present.
+            let (stats_outputs, sum_outputs) = if remaining.len() > 2 {
+                remaining.split_at_mut(2)
+            } else {
+                let len = remaining.len();
+                remaining.split_at_mut(len)
+            };
 
-            // SAFETY: validated contiguous f32 output views each describe exactly
+            // SAFETY: a validated contiguous f32 output view describes exactly
             // `input.len()` writable elements. Kernel output views are exclusive
             // and disjoint by the EP API contract.
             let output = unsafe {
                 std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), input.len())
             };
-            let sum_output = unsafe {
-                std::slice::from_raw_parts_mut(sum_output.data_ptr_mut::<f32>(), input.len())
+            let mut sum_scratch;
+            // `sum_stride` is `hidden` when each group owns a distinct row of
+            // the X-shaped output tensor, and 0 when every group reuses the
+            // single scratch row.
+            let (sum_buffer, sum_stride): (&mut [f32], usize) = if sum_output_is_direct {
+                let sum_output = &mut sum_outputs[0];
+                sum_output.validate()?;
+                // SAFETY: as above for the primary output.
+                let sum_output = unsafe {
+                    std::slice::from_raw_parts_mut(sum_output.data_ptr_mut::<f32>(), input.len())
+                };
+                (sum_output, hidden)
+            } else {
+                sum_scratch = vec![0.0f32; hidden];
+                (&mut sum_scratch, 0)
             };
 
             let mut inv_std_vars = writes_inv_std.then(|| vec![0.0f32; groups]);
-            for (group, (((input_row, skip_row), sum_row), normalized)) in input
+            for (group, (input_row, normalized)) in input
                 .chunks_exact(hidden)
-                .zip(skip.chunks_exact(hidden))
-                .zip(sum_output.chunks_exact_mut(hidden))
                 .zip(output.chunks_exact_mut(hidden))
                 .enumerate()
             {
+                let skip_row = &skip[group * hidden..group * hidden + hidden];
+                let sum_base = group * sum_stride;
+                let sum_row = &mut sum_buffer[sum_base..sum_base + hidden];
                 let square_sum = crate::kernels::simd_sumsq::assemble_and_sum_of_squares(
                     input_row,
                     skip_row,
@@ -159,38 +183,70 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
             return Ok(());
         }
 
+        // General path: a narrowing/strided output, or a broadcasting `skip`.
+        // `skip` is resolved one row at a time — the previous implementation
+        // unravelled every *element* through `rank` integer divisions, which
+        // cost more than the normalization itself.
         let skip_strides = broadcast_strides(inputs[1].shape, shape, OP)?;
-        let input_strides = row_major_strides(shape);
-        let mut sum = vec![0.0f32; input.len()];
-        for (flat, value) in sum.iter_mut().enumerate() {
-            let mut rem = flat;
-            let mut skip_index = 0;
-            for axis in 0..shape.len() {
-                let coord = rem / input_strides[axis];
-                rem %= input_strides[axis];
-                skip_index += coord * skip_strides[axis];
-            }
-            *value = input[flat]
-                + skip[skip_index]
-                + bias.as_ref().map_or(0.0, |values| values[flat % hidden]);
-        }
+        let rank = shape.len();
+        let skip_last_stride = skip_strides[rank - 1];
+        let group_shape = &shape[..rank - 1];
+        let group_skip_strides = &skip_strides[..rank - 1];
 
         let mut output = vec![0.0f32; input.len()];
+        let mut sum_scratch = vec![0.0f32; if writes_sum { input.len() } else { hidden }];
+        let sum_stride = if writes_sum { hidden } else { 0 };
         let mut inv_std_vars = writes_inv_std.then(|| vec![0.0f32; groups]);
+        // Coordinates over the leading (group) axes, advanced odometer-style so
+        // the per-row `skip` base is maintained without any division.
+        let mut group_coords = vec![0usize; group_shape.len()];
+        let mut skip_base = 0usize;
+        // When `skip` broadcasts along the normalized axis there is one scalar
+        // per row. Materializing it into a row lets every path in this kernel
+        // share one reduction, so a broadcast `skip` and its expansion agree
+        // bit-for-bit on every ISA.
+        let mut broadcast_skip_row = if skip_last_stride == 0 {
+            vec![0.0f32; hidden]
+        } else {
+            Vec::new()
+        };
         for group in 0..groups {
-            let base = group * hidden;
-            let row = &sum[base..base + hidden];
-            let variance = crate::kernels::simd_sumsq::sum_of_squares(row) / hidden as f32;
+            let input_row = &input[group * hidden..group * hidden + hidden];
+            let sum_base = group * sum_stride;
+            let sum_row = &mut sum_scratch[sum_base..sum_base + hidden];
+            let skip_row = if skip_last_stride == 1 {
+                &skip[skip_base..skip_base + hidden]
+            } else {
+                broadcast_skip_row.fill(skip[skip_base]);
+                &broadcast_skip_row
+            };
+            let square_sum = crate::kernels::simd_sumsq::assemble_and_sum_of_squares(
+                input_row,
+                skip_row,
+                bias.as_deref(),
+                sum_row,
+            );
+            let variance = square_sum / hidden as f32;
             let inv_std_var = 1.0 / (variance + self.epsilon).sqrt();
             if let Some(values) = inv_std_vars.as_mut() {
                 values[group] = inv_std_var;
             }
             crate::kernels::simd_normalize::normalize_and_scale(
-                row,
-                &mut output[base..base + hidden],
+                sum_row,
+                &mut output[group * hidden..group * hidden + hidden],
                 inv_std_var,
                 &gamma,
             );
+            // Advance the odometer to the next group's `skip` row.
+            for axis in (0..group_shape.len()).rev() {
+                group_coords[axis] += 1;
+                skip_base += group_skip_strides[axis];
+                if group_coords[axis] < group_shape[axis] {
+                    break;
+                }
+                skip_base -= group_coords[axis] * group_skip_strides[axis];
+                group_coords[axis] = 0;
+            }
         }
 
         write_dense_f32_narrow(OP, &mut outputs[0], &output)?;
@@ -200,8 +256,8 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
         if let Some(inv_std_vars) = inv_std_vars {
             write_dense_f32_narrow(OP, &mut outputs[2], &inv_std_vars)?;
         }
-        if outputs.get(3).is_some_and(|output| output.shape == shape) {
-            write_dense_f32_narrow(OP, &mut outputs[3], &sum)?;
+        if writes_sum {
+            write_dense_f32_narrow(OP, &mut outputs[3], &sum_scratch)?;
         }
         Ok(())
     }
@@ -743,6 +799,294 @@ mod tests {
         );
         for (got, expected) in output.to_bf16_as_f32().iter().zip(&want) {
             assert!((got - expected).abs() < 1e-2);
+        }
+    }
+
+    /// Deterministic pseudo-random values covering positive/negative magnitudes.
+    fn values(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as i32 - (1 << 23)) as f32 * (1.0 / (1 << 20) as f32)
+            })
+            .collect()
+    }
+
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|value| value.to_bits()).collect()
+    }
+
+    /// Binding `input_skip_bias_sum` selects a different internal buffer for the
+    /// assembled row; it must not perturb the primary output by even one bit.
+    #[test]
+    fn skip_simplified_layer_norm_sum_binding_is_output_bit_identical() {
+        for shape in [
+            vec![1usize, 1, 896],
+            vec![1, 1, 4096],
+            vec![1, 7, 3],
+            vec![2, 3, 1537],
+            vec![5],
+            vec![2, 2, 3, 17],
+        ] {
+            let hidden = *shape.last().unwrap();
+            let len: usize = shape.iter().product();
+            let groups = len / hidden;
+            let mut stats_shape = shape.clone();
+            *stats_shape.last_mut().unwrap() = 1;
+            for with_bias in [false, true] {
+                let input = Owned::f32(&shape, &values(len, 11));
+                let skip = Owned::f32(&shape, &values(len, 29));
+                let gamma = Owned::f32(&[hidden], &values(hidden, 43));
+                let bias = Owned::f32(&[hidden], &values(hidden, 71));
+                let mut inputs = vec![input.view(), skip.view(), gamma.view()];
+                if with_bias {
+                    inputs.push(bias.view());
+                }
+
+                let mut only_output = Owned::zeros_f32(&shape);
+                SkipSimplifiedLayerNormKernel { epsilon: 1e-5 }
+                    .execute(&inputs, &mut [only_output.view_mut()])
+                    .unwrap();
+
+                let mut full_output = Owned::zeros_f32(&shape);
+                let mut mean = Owned::zeros_f32(&stats_shape);
+                let mut inv_std = Owned::zeros_f32(&stats_shape);
+                let mut sum = Owned::zeros_f32(&shape);
+                SkipSimplifiedLayerNormKernel { epsilon: 1e-5 }
+                    .execute(
+                        &inputs,
+                        &mut [
+                            full_output.view_mut(),
+                            mean.view_mut(),
+                            inv_std.view_mut(),
+                            sum.view_mut(),
+                        ],
+                    )
+                    .unwrap();
+
+                assert_eq!(
+                    bits(&only_output.to_f32()),
+                    bits(&full_output.to_f32()),
+                    "shape {shape:?} bias={with_bias}: output differs when the \
+                     residual-sum slot is bound"
+                );
+                assert_eq!(mean.to_f32(), vec![0.0f32; groups]);
+                // The residual sum must equal input + skip (+ bias) exactly.
+                let expected_sum: Vec<f32> = input
+                    .to_f32()
+                    .iter()
+                    .zip(skip.to_f32().iter())
+                    .enumerate()
+                    .map(|(index, (&x, &s))| {
+                        x + s
+                            + if with_bias {
+                                gamma_free_bias(&bias.to_f32(), index, hidden)
+                            } else {
+                                0.0
+                            }
+                    })
+                    .collect();
+                assert_eq!(bits(&sum.to_f32()), bits(&expected_sum), "shape {shape:?}");
+            }
+        }
+    }
+
+    fn gamma_free_bias(bias: &[f32], index: usize, hidden: usize) -> f32 {
+        bias[index % hidden]
+    }
+
+    /// A broadcasting `skip` must produce exactly what the materially expanded
+    /// `skip` produces — the row-resolution fast path replaced a per-element
+    /// index unravel, so every broadcast form needs a bit-exact guard.
+    #[test]
+    fn skip_simplified_layer_norm_broadcast_matches_expanded_skip() {
+        // `hidden` must cross the 8-lane accumulator width used by
+        // `simd_sumsq`: below it the lane-parallel reduction degenerates to a
+        // serial remainder loop and cannot distinguish accumulation orders.
+        for hidden in [5usize, 8, 33, 128] {
+            let shape = [2usize, 3, hidden];
+            let len: usize = shape.iter().product();
+            let input_data = values(len, 101);
+            let gamma_data = values(hidden, 103);
+
+            for skip_shape in [
+                vec![hidden],
+                vec![1, hidden],
+                vec![3, hidden],
+                vec![1, 3, hidden],
+                vec![2, 1, hidden],
+                vec![2, 3, hidden],
+                vec![1],
+                vec![3, 1],
+                vec![2, 3, 1],
+            ] {
+                let skip_len: usize = skip_shape.iter().product();
+                let skip_data = values(skip_len, 107);
+
+                // Materialize the broadcast by hand, right-aligned NumPy rules.
+                let offset = shape.len() - skip_shape.len();
+                let mut expanded = vec![0.0f32; len];
+                for (flat, slot) in expanded.iter_mut().enumerate() {
+                    let mut remainder = flat;
+                    let mut coords = [0usize; 3];
+                    for axis in (0..shape.len()).rev() {
+                        coords[axis] = remainder % shape[axis];
+                        remainder /= shape[axis];
+                    }
+                    let mut source = 0usize;
+                    let mut stride = 1usize;
+                    for axis in (0..skip_shape.len()).rev() {
+                        let coord = if skip_shape[axis] == 1 {
+                            0
+                        } else {
+                            coords[offset + axis]
+                        };
+                        source += coord * stride;
+                        stride *= skip_shape[axis];
+                    }
+                    *slot = skip_data[source];
+                }
+
+                let input = Owned::f32(&shape, &input_data);
+                let gamma = Owned::f32(&[hidden], &gamma_data);
+                let broadcast_skip = Owned::f32(&skip_shape, &skip_data);
+                let expanded_skip = Owned::f32(&shape, &expanded);
+
+                let mut broadcast_output = Owned::zeros_f32(&shape);
+                SkipSimplifiedLayerNormKernel { epsilon: 1e-5 }
+                    .execute(
+                        &[input.view(), broadcast_skip.view(), gamma.view()],
+                        &mut [broadcast_output.view_mut()],
+                    )
+                    .unwrap();
+
+                let mut expanded_output = Owned::zeros_f32(&shape);
+                SkipSimplifiedLayerNormKernel { epsilon: 1e-5 }
+                    .execute(
+                        &[input.view(), expanded_skip.view(), gamma.view()],
+                        &mut [expanded_output.view_mut()],
+                    )
+                    .unwrap();
+
+                assert_eq!(
+                    bits(&broadcast_output.to_f32()),
+                    bits(&expanded_output.to_f32()),
+                    "hidden {hidden}, skip shape {skip_shape:?} does not match its expansion"
+                );
+            }
+        }
+    }
+
+    /// f16/bf16 outputs take the narrowing path, which previously reassembled
+    /// every element through an index unravel. Pin it against the f32 kernel.
+    #[test]
+    fn skip_simplified_layer_norm_narrowed_output_matches_narrowed_f32() {
+        let shape = [2usize, 129];
+        let len: usize = shape.iter().product();
+        let hidden = shape[1];
+        let input_data = values(len, 211);
+        let skip_data = values(len, 223);
+        let gamma_data = values(hidden, 227);
+
+        let mut reference_output = Owned::zeros_f32(&shape);
+        SkipSimplifiedLayerNormKernel { epsilon: 1e-5 }
+            .execute(
+                &[
+                    Owned::f32(&shape, &input_data).view(),
+                    Owned::f32(&shape, &skip_data).view(),
+                    Owned::f32(&[hidden], &gamma_data).view(),
+                ],
+                &mut [reference_output.view_mut()],
+            )
+            .unwrap();
+        let reference_output = reference_output.to_f32();
+
+        let mut narrowed = Owned::zeros(DataType::Float16, &shape);
+        SkipSimplifiedLayerNormKernel { epsilon: 1e-5 }
+            .execute(
+                &[
+                    Owned::f32(&shape, &input_data).view(),
+                    Owned::f32(&shape, &skip_data).view(),
+                    Owned::f32(&[hidden], &gamma_data).view(),
+                ],
+                &mut [narrowed.view_mut()],
+            )
+            .unwrap();
+        let expected: Vec<f32> = reference_output
+            .iter()
+            .map(|&value| half::f16::from_f32(value).to_f32())
+            .collect();
+        assert_eq!(narrowed.to_f16_as_f32(), expected);
+    }
+
+    /// NaN / +-Inf / denormal inputs must propagate identically whether or not
+    /// the residual-sum output is bound.
+    #[test]
+    fn skip_simplified_layer_norm_propagates_non_finite_and_denormals() {
+        let hidden = 8;
+        let shape = [2usize, hidden];
+        let input_data = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MIN_POSITIVE / 4.0,
+            -f32::MIN_POSITIVE / 4.0,
+            0.0,
+            -0.0,
+            1.0,
+            1e30,
+            -1e30,
+            1e-30,
+            -1e-30,
+            f32::MAX,
+            f32::MIN,
+            2.0,
+            -2.0,
+        ];
+        let skip_data = [0.5f32; 16];
+        let gamma_data = [1.0f32; 8];
+
+        let mut short = Owned::zeros_f32(&shape);
+        SkipSimplifiedLayerNormKernel { epsilon: 1e-5 }
+            .execute(
+                &[
+                    Owned::f32(&shape, &input_data).view(),
+                    Owned::f32(&shape, &skip_data).view(),
+                    Owned::f32(&[hidden], &gamma_data).view(),
+                ],
+                &mut [short.view_mut()],
+            )
+            .unwrap();
+
+        let mut long = Owned::zeros_f32(&shape);
+        let mut mean = Owned::zeros_f32(&[2, 1]);
+        let mut inv_std = Owned::zeros_f32(&[2, 1]);
+        let mut sum = Owned::zeros_f32(&shape);
+        SkipSimplifiedLayerNormKernel { epsilon: 1e-5 }
+            .execute(
+                &[
+                    Owned::f32(&shape, &input_data).view(),
+                    Owned::f32(&shape, &skip_data).view(),
+                    Owned::f32(&[hidden], &gamma_data).view(),
+                ],
+                &mut [
+                    long.view_mut(),
+                    mean.view_mut(),
+                    inv_std.view_mut(),
+                    sum.view_mut(),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(bits(&short.to_f32()), bits(&long.to_f32()));
+        // Row 0 contains NaN/Inf, so every normalized element there is non-finite.
+        assert!(short.to_f32()[..hidden].iter().all(|v| !v.is_finite()));
+        for (index, (&got, &x)) in sum.to_f32().iter().zip(&input_data).enumerate() {
+            let want = x + 0.5;
+            assert_eq!(got.to_bits(), want.to_bits(), "residual sum at {index}");
         }
     }
 }

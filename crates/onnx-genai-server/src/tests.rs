@@ -17,7 +17,7 @@ use axum::{
 use onnx_genai::engine::EngineDecodeBackend;
 use onnx_genai::{Engine, EngineConfig};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, io::Cursor, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, fs, io::Cursor, path::PathBuf, time::Duration};
 use tokio::{sync::mpsc, time::timeout};
 use tower::ServiceExt;
 
@@ -2395,6 +2395,52 @@ async fn multimodal_input_expands_the_prompt_and_binds_the_declared_endpoint() {
     );
 }
 
+#[test]
+fn pipeline_setup_inspects_native_only_graph_without_ort_session() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-native-sub4-engine");
+    let fixture = tempfile::tempdir().expect("create fixture directory");
+    fs::copy(
+        source.join("model.onnx.textproto"),
+        fixture.path().join("model.onnx.textproto"),
+    )
+    .expect("copy native-only model");
+    fs::copy(
+        source.join("tokenizer.json"),
+        fixture.path().join("tokenizer.json"),
+    )
+    .expect("copy tokenizer");
+    fs::write(
+        fixture.path().join("inference_metadata.yaml"),
+        r#"
+pipeline:
+  models:
+    decoder:
+      filename: model.onnx.textproto
+      type: decoder
+      tokenizer: tokenizer.json
+      io:
+        token_input: input_ids
+        attention_mask_input: attention_mask
+        position_ids_input: position_ids
+        logits_output: logits
+        kv_inputs: [past_key_values.0.key, past_key_values.0.value]
+        kv_outputs: [present.0.key, present.0.value]
+  strategy:
+    kind: autoregressive
+    decoder: decoder
+"#,
+    )
+    .expect("write pipeline metadata");
+
+    let setup = crate::multimodal::load(fixture.path())
+        .expect("graph-only setup inspection must not ask ORT to load native-only operators")
+        .expect("fixture declares a pipeline");
+    assert!(setup.multimodal.vision.is_none());
+    assert!(setup.multimodal.audio.is_none());
+    assert_eq!(setup.tokenizer_path, fixture.path().join("tokenizer.json"));
+}
+
 #[tokio::test]
 async fn image_load_and_preprocess_populates_num_tiles() {
     let spec = crate::image_input::VisionInputSpec::from_input(
@@ -4038,9 +4084,13 @@ async fn resource_snapshots_are_answered_during_a_batch_not_deferred() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
     let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
 
+    // The mirror is what the driver refreshes between steps; a batch in flight
+    // holds `&mut Engine`, so the answer has to come from here.
+    let mirror = std::sync::Mutex::new(Some(engine.resource_snapshot()));
+
     let (reply, rx) = tokio::sync::oneshot::channel();
     let deferred = crate::driver::handle_or_defer_during_batch(
-        &engine,
+        &mirror,
         crate::driver::DriverCommand::ResourceSnapshot(reply),
     );
 
@@ -4054,8 +4104,30 @@ async fn resource_snapshots_are_answered_during_a_batch_not_deferred() {
         .expect("the snapshot itself failed");
 }
 
-/// The complement: commands that *reconfigure* the engine must still be parked until the
-/// batch drains. This pins the helper's contract to "answer read-only observability",
+/// Before the driver has ever refreshed the mirror there is nothing truthful to
+/// report, so the snapshot must be deferred rather than answered with a
+/// fabricated or default value.
+#[tokio::test]
+async fn an_empty_snapshot_mirror_defers_rather_than_fabricating() {
+    let mirror: std::sync::Mutex<Option<onnx_genai_engine::GovernorSnapshot>> =
+        std::sync::Mutex::new(None);
+
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    let deferred = crate::driver::handle_or_defer_during_batch(
+        &mirror,
+        crate::driver::DriverCommand::ResourceSnapshot(reply),
+    );
+
+    assert!(
+        matches!(
+            deferred,
+            Some(crate::driver::DriverCommand::ResourceSnapshot(_))
+        ),
+        "an unpopulated mirror must defer, not invent a snapshot"
+    );
+}
+
+/// The complement: commands that *reconfigure* the engine must still be parked until the/// batch drains. This pins the helper's contract to "answer read-only observability",
 /// not "answer anything".
 #[tokio::test]
 async fn mutating_commands_are_still_deferred() {
@@ -4063,9 +4135,11 @@ async fn mutating_commands_are_still_deferred() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
     let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
 
+    let mirror = std::sync::Mutex::new(Some(engine.resource_snapshot()));
+
     let (reply, _rx) = tokio::sync::oneshot::channel();
     let deferred = crate::driver::handle_or_defer_during_batch(
-        &engine,
+        &mirror,
         crate::driver::DriverCommand::SetVramLimit {
             limit: onnx_genai_engine::ResourceLimit::Auto,
             reply,

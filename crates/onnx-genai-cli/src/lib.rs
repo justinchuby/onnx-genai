@@ -28,6 +28,8 @@
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::{Mutex, OnceLock};
 
 use clap::{ArgAction, Args, Parser, Subcommand};
 
@@ -53,6 +55,7 @@ use interactive::{
 };
 use model_inspection::{list, show, version};
 use onnx_genai::engine::EngineDecodeBackend;
+use onnx_genai::engine::native_decode_device::NativeDecodeDevice;
 use onnx_genai::text_to_audio::TextToAudioRequest;
 use onnx_genai::text_to_image::{TextToImageRequest, VaeDecoder};
 use onnx_genai::{EngineConfig, GenerateOptions, SamplingOverrides, StopSequence};
@@ -268,6 +271,52 @@ struct EngineArgs {
     /// Host RAM ceiling for the warm offload tier, in the same format.
     #[arg(long, value_name = "LIMIT", value_parser = parse_limit)]
     host_ram_limit: Option<onnx_genai::engine::ResourceLimit>,
+
+    /// Device the native decode backend runs on: `cpu`, `cuda`, `cuda:N`, or
+    /// `auto`.
+    ///
+    /// `auto` (the default) takes the device from the model's declared execution
+    /// providers. Most exported models declare none, which resolves to the CPU —
+    /// so on a machine with a GPU, `--backend native` alone will still run on the
+    /// CPU unless you say `--device cuda` (#1064). Ignored by the ORT backend,
+    /// which selects providers from the model's own session options.
+    #[arg(long, value_name = "auto|cpu|cuda[:N]", value_parser = parse_native_device)]
+    device: Option<NativeDeviceChoice>,
+}
+
+/// A `--device` value. `Auto` is distinct from an absent flag only in intent;
+/// both defer to the model's declared providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeDeviceChoice {
+    Auto,
+    Cpu,
+    Cuda(Option<u32>),
+}
+
+/// Parse a `--device` value.
+///
+/// Refuses anything else rather than silently falling back: a user who asks for
+/// a device they cannot have should be told, not quietly given the CPU. That
+/// silent fallback is exactly what #1064 documents.
+fn parse_native_device(input: &str) -> Result<NativeDeviceChoice, String> {
+    let raw = input.trim();
+    let lowered = raw.to_ascii_lowercase();
+    match lowered.as_str() {
+        "auto" => Ok(NativeDeviceChoice::Auto),
+        "cpu" => Ok(NativeDeviceChoice::Cpu),
+        "cuda" | "gpu" => Ok(NativeDeviceChoice::Cuda(None)),
+        _ => match lowered.strip_prefix("cuda:") {
+            Some(index) => index
+                .parse::<u32>()
+                .map(|index| NativeDeviceChoice::Cuda(Some(index)))
+                .map_err(|_| {
+                    format!("'{raw}' is not a valid device: expected a CUDA index, as in 'cuda:0'")
+                }),
+            None => Err(format!(
+                "'{raw}' is not a valid device: expected 'auto', 'cpu', 'cuda', or 'cuda:N'"
+            )),
+        },
+    }
 }
 
 impl EngineArgs {
@@ -281,6 +330,15 @@ impl EngineArgs {
         }
         if let Some(limit) = self.host_ram_limit {
             config.limits.host_ram_limit = limit;
+        }
+        match self.device {
+            None | Some(NativeDeviceChoice::Auto) => {}
+            Some(NativeDeviceChoice::Cpu) => {
+                config.native_device = Some(NativeDecodeDevice::Cpu);
+            }
+            Some(NativeDeviceChoice::Cuda(index)) => {
+                config.native_device = Some(NativeDecodeDevice::Cuda { index });
+            }
         }
         config
     }
@@ -733,12 +791,85 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         // Diagnostics go to stderr: stdout carries the command's actual output
         // (generated text, transcripts), which is routinely piped and parsed.
-        .with_writer(io::stderr)
+        .with_writer(DeferredStderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .try_init();
+}
+
+static DEFERRED_TRACING: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+
+struct DeferredStderr;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DeferredStderr {
+    type Writer = DeferredStderrWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        DeferredStderrWriter
+    }
+}
+
+struct DeferredStderrWriter;
+
+impl Write for DeferredStderrWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if interactive::GENERATING.load(Ordering::SeqCst) {
+            DEFERRED_TRACING
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .map_err(|_| io::Error::other("deferred tracing buffer is poisoned"))?
+                .extend_from_slice(bytes);
+            return Ok(bytes.len());
+        }
+        flush_deferred_tracing()?;
+        io::stderr().write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !interactive::GENERATING.load(Ordering::SeqCst) {
+            flush_deferred_tracing()?;
+            io::stderr().flush()?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn flush_deferred_tracing() -> io::Result<()> {
+    let Some(buffer) = DEFERRED_TRACING.get() else {
+        return Ok(());
+    };
+    let bytes = {
+        let mut buffer = buffer
+            .lock()
+            .map_err(|_| io::Error::other("deferred tracing buffer is poisoned"))?;
+        std::mem::take(&mut *buffer)
+    };
+    if !bytes.is_empty() {
+        let mut stderr = io::stderr().lock();
+        stderr.write_all(&bytes)?;
+        stderr.flush()?;
+    }
+    Ok(())
+}
+
+/// Clears the streaming flag and flushes any diagnostics buffered during a turn
+/// when it drops, so the buffer is drained on *every* exit from
+/// [`run_generation_turn`](crate::output::run_generation_turn) — a normal
+/// return, a `?` early-return while finalizing the reply, or a panic unwind —
+/// not just the happy path.
+///
+/// The forced `process::exit` taken on a double Ctrl-C cannot run this: it
+/// terminates the process from the signal-handler thread without unwinding the
+/// generating thread's stack, so that path flushes explicitly before exiting.
+pub(crate) struct FlushGuard;
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        interactive::GENERATING.store(false, Ordering::SeqCst);
+        let _ = flush_deferred_tracing();
+    }
 }
 
 /// Parse `args` (an argv vector whose first element is the program name) and run
@@ -775,6 +906,47 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn flush_guard_drains_buffered_diagnostics_when_a_turn_exits_early() {
+        // Simulate a turn in progress: the streaming flag is set and diagnostics
+        // have been buffered by the deferred tracing writer instead of reaching
+        // stderr live.
+        interactive::GENERATING.store(true, Ordering::SeqCst);
+        DEFERRED_TRACING
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .extend_from_slice(b"buffered diagnostic\n");
+
+        // Reproduce a `?` early-return out of the finalization sequence while a
+        // `FlushGuard` is live on the stack, exactly as a broken-pipe write error
+        // from `emit_reasoning_segment` / `live.draw` / `live.finish` would.
+        fn finalize_then_fail() -> io::Result<()> {
+            let _flush_guard = FlushGuard;
+            Err(io::Error::other("stdout write failed during finalization"))?;
+            Ok(())
+        }
+        assert!(finalize_then_fail().is_err());
+
+        // The guard must have drained the buffer (flushed it to the sink) and
+        // cleared the streaming flag despite the early return, so diagnostics are
+        // never silently lost.
+        let buffered = DEFERRED_TRACING
+            .get()
+            .expect("buffer was initialized")
+            .lock()
+            .unwrap()
+            .len();
+        assert_eq!(
+            buffered, 0,
+            "FlushGuard left diagnostics buffered after an early return"
+        );
+        assert!(
+            !interactive::GENERATING.load(Ordering::SeqCst),
+            "FlushGuard left the streaming flag set after an early return"
+        );
+    }
 
     #[test]
     fn generate_accepts_positional_model_and_prompt_flag() {
@@ -1725,6 +1897,7 @@ mod tests {
 
         let summary = interactive::SessionSummary {
             settings: &settings,
+            execution_provider: "cpu".to_string(),
             resolved_decode_backend: EngineDecodeBackend::Ort,
             sampling,
             history: &history,
@@ -1777,6 +1950,7 @@ mod tests {
 
         let summary = interactive::SessionSummary {
             settings: &settings,
+            execution_provider: "cpu".to_string(),
             resolved_decode_backend: EngineDecodeBackend::Ort,
             sampling,
             history: &[],
@@ -1793,7 +1967,171 @@ mod tests {
     }
 
     #[test]
+    fn session_summary_reports_loaded_provider_status() {
+        let settings =
+            interactive::SessionSettings::new(PathBuf::from("models/tiny"), &EngineArgs::default());
+        let usage = interactive::SessionUsage::default();
+        let summary = interactive::SessionSummary {
+            settings: &settings,
+            execution_provider: "cpu (CPU session fallback); skipped: webgpu, coreml".to_string(),
+            resolved_decode_backend: EngineDecodeBackend::Ort,
+            sampling: GenerateOptions::default(),
+            history: &[],
+            usage: &usage,
+        }
+        .to_string();
+
+        assert!(
+            summary.contains(
+                "execution provider: cpu (CPU session fallback); skipped: webgpu, coreml"
+            ),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn generate_profile_provider_comes_from_live_command_profile() -> anyhow::Result<()> {
+        let model = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let dir = temp_dir("generate-live-profile");
+        let profile = dir.join("profile.json");
+
+        run(vec![
+            "onnx-genai".to_string(),
+            "--profile-json".to_string(),
+            profile.display().to_string(),
+            "generate".to_string(),
+            model.display().to_string(),
+            "--prompt".to_string(),
+            "hi".to_string(),
+            "--max-new-tokens".to_string(),
+            "1".to_string(),
+            "--no-stats".to_string(),
+            "--cpu-cores".to_string(),
+            "1".to_string(),
+        ])?;
+
+        assert_eq!(profile_execution_provider(&profile)?, "cpu");
+        fs::remove_dir_all(dir).unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn transcribe_profile_provider_comes_from_live_command_profile() -> anyhow::Result<()> {
+        let model = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-whisper")
+            .canonicalize()?;
+        let audio = model.join("tiny.wav");
+        let dir = temp_dir("transcribe-live-profile");
+        let profile = dir.join("profile.json");
+
+        run(vec![
+            "onnx-genai".to_string(),
+            "--profile-json".to_string(),
+            profile.display().to_string(),
+            "transcribe".to_string(),
+            model.display().to_string(),
+            audio.display().to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+            "--cpu-cores".to_string(),
+            "1".to_string(),
+        ])?;
+
+        assert_eq!(profile_execution_provider(&profile)?, "cpu");
+        fs::remove_dir_all(dir).unwrap();
+        Ok(())
+    }
+
+    fn profile_execution_provider(path: &Path) -> anyhow::Result<String> {
+        let value: serde_json::Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+        Ok(value["execution_provider"]
+            .as_str()
+            .expect("profile must include execution_provider")
+            .to_string())
+    }
+
+    #[test]
     fn a_toggle_reports_when_given_nothing_and_refuses_nonsense() {}
+
+    /// `--device` exists because `--backend native` alone silently ran on the CPU
+    /// on a GPU machine: device selection came only from the model's declared
+    /// execution providers, and typical exports declare none (#1064). Measured
+    /// 0 MiB of GPU memory across a whole native run before this flag existed.
+    #[test]
+    fn a_device_can_be_asked_for_explicitly_and_nonsense_is_refused() {
+        assert_eq!(parse_native_device("auto"), Ok(NativeDeviceChoice::Auto));
+        assert_eq!(parse_native_device("cpu"), Ok(NativeDeviceChoice::Cpu));
+        assert_eq!(
+            parse_native_device("cuda"),
+            Ok(NativeDeviceChoice::Cuda(None))
+        );
+        assert_eq!(
+            parse_native_device("CUDA:1"),
+            Ok(NativeDeviceChoice::Cuda(Some(1))),
+            "device names are case-insensitive"
+        );
+
+        // Refused rather than quietly resolved to the CPU: a silent fallback is
+        // the behaviour this flag exists to end.
+        let error = parse_native_device("cuda:x").expect_err("not a device index");
+        assert!(error.contains("cuda:0"), "{error}");
+        let error = parse_native_device("tpu").expect_err("not a device");
+        assert!(
+            error.contains("'auto', 'cpu', 'cuda', or 'cuda:N'"),
+            "{error}"
+        );
+    }
+
+    /// The flag has to reach `EngineConfig`, not merely parse. Absent and `auto`
+    /// both leave the engine's own resolution untouched.
+    #[test]
+    fn the_device_flag_reaches_the_engine_config() {
+        let args = EngineArgs::default();
+        assert!(
+            args.to_config().native_device.is_none(),
+            "an absent --device must not override the model's declared providers"
+        );
+
+        let auto = EngineArgs {
+            device: Some(NativeDeviceChoice::Auto),
+            ..EngineArgs::default()
+        };
+        assert!(auto.to_config().native_device.is_none());
+
+        let cuda = EngineArgs {
+            device: Some(NativeDeviceChoice::Cuda(Some(1))),
+            ..EngineArgs::default()
+        };
+        assert_eq!(
+            cuda.to_config().native_device,
+            Some(NativeDecodeDevice::Cuda { index: Some(1) })
+        );
+
+        let cpu = EngineArgs {
+            device: Some(NativeDeviceChoice::Cpu),
+            ..EngineArgs::default()
+        };
+        assert_eq!(cpu.to_config().native_device, Some(NativeDecodeDevice::Cpu));
+    }
+
+    #[test]
+    fn interactive_session_preserves_the_requested_native_device() {
+        let args = EngineArgs {
+            backend: EngineDecodeBackend::Native,
+            device: Some(NativeDeviceChoice::Cuda(Some(3))),
+            ..EngineArgs::default()
+        };
+        let settings = interactive::SessionSettings::new(PathBuf::from("models/tiny"), &args);
+
+        let config = settings.to_config();
+        assert_eq!(config.decode_backend, EngineDecodeBackend::Native);
+        assert_eq!(
+            config.native_device,
+            Some(NativeDecodeDevice::Cuda { index: Some(3) })
+        );
+    }
 
     #[test]
     fn decode_backends_are_named_by_the_engine_not_guessed() {

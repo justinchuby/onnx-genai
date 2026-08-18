@@ -8,14 +8,14 @@ use onnx_genai::text_to_audio;
 use onnx_genai::text_to_image;
 use onnx_genai_server::multimodal;
 
-use super::commands::resolved_default_providers;
 use super::interactive::{
     Backend, EXIT_INTERRUPTED, ReplInputMode, TurnInput, apply_context_sized_max_new_tokens,
     context_exhaustion_error, context_window_is_full, initial_repl_show_stats,
     install_ctrlc_handler, is_interrupt_error, repl_input_mode, warn_missing_context_limit,
 };
 use super::output::{
-    build_turn_prompt, detect_reasoning, emit_stats_line, load_chat_template, run_generation_turn,
+    bind_response_tokens, build_turn_prompt, detect_reasoning, emit_stats_line, load_chat_template,
+    load_response_config, run_generation_turn,
 };
 use super::profile::{self, RunProfile};
 use super::{GenerateArgs, ProfileArgs, decode_backend_name, resolve_model_dir};
@@ -24,8 +24,7 @@ pub(super) fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::R
     install_ctrlc_handler();
     args.cpu.apply()?;
     let model_dir = resolve_model_dir(&args.model);
-    let mut profile = RunProfile::new(model_dir.display().to_string());
-    profile.execution_provider = resolved_default_providers();
+    let profile = RunProfile::new(model_dir.display().to_string());
     let output_kind = generate_output_kind(&args)?;
     let input_mode = repl_input_mode(io::stdin().is_terminal(), io::stdout().is_terminal());
     let show_stats = initial_generate_show_stats(input_mode, args.no_stats, output_kind);
@@ -93,6 +92,7 @@ fn generate_text(
 
     let load_started = std::time::Instant::now();
     let mut backend = Backend::load(model_dir, args.engine.to_config())?;
+    profile.execution_provider = backend.execution_provider_status();
     profile.decode_backend = Some(decode_backend_name(backend.decode_backend()).to_string());
     profile.phase("model load", load_started.elapsed());
     // Honor the model's declared sampling regime (e.g. a reasoning model that
@@ -130,12 +130,15 @@ fn generate_text(
     let offload_before = cuda_offload_stats();
     let mut reasoning = detect_reasoning(template.as_ref());
     backend.bind_reasoning_marker_tokens(&mut reasoning);
+    let mut response = load_response_config(model_dir, args.sampling.raw);
+    bind_response_tokens(&mut response, &backend);
     match run_generation_turn(
         &mut backend,
         turn,
         args.stream,
         Some(&mut profile),
         reasoning.as_ref(),
+        response.as_ref(),
         None,
     ) {
         Ok(output) => {
@@ -391,6 +394,7 @@ fn generate_image(
             )
         })?;
 
+    profile.execution_provider = engine.execution_provider_status();
     profile.decode_backend = Some(decode_backend_name(engine.decode_backend()).to_string());
     profile.phase("model load", load_started.elapsed());
     let render_started = std::time::Instant::now();
@@ -471,6 +475,7 @@ fn generate_audio(
     })?;
     let load_started = std::time::Instant::now();
     let mut engine = PipelineEngine::from_dir_with_config(model_dir, args.engine.to_config())?;
+    profile.execution_provider = engine.execution_provider_status();
     profile.decode_backend = Some(decode_backend_name(engine.decode_backend()).to_string());
     profile.phase("model load", load_started.elapsed());
 

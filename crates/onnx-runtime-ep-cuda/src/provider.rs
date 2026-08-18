@@ -26,7 +26,8 @@ use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{
     Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, ExecutionProviderCapabilities, Fence,
-    Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, deny, structural_input_bytes,
+    HostToDeviceCopier, Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, deny,
+    structural_input_bytes,
 };
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
 
@@ -35,6 +36,28 @@ use crate::kernels::csa_checkpoint::CsaMetrics;
 use crate::optimizer::cuda_optimization_passes;
 use crate::runtime::{CudaRuntime, cuptr};
 use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy};
+
+/// A minimal synchronous host→device uploader backed by the shared CUDA
+/// runtime. Handed to the plugin's fused executor via
+/// [`ExecutionProvider::host_to_device_copier`] so it can stage host-resident
+/// boundary inputs into device scratch on an interspersed CPU→GPU partition
+/// (#982). Holding an `Arc<CudaRuntime>` — not the EP — keeps EP teardown
+/// semantics unchanged: the runtime is already kept alive by every live kernel.
+struct CudaHostToDeviceCopier {
+    runtime: Arc<CudaRuntime>,
+}
+
+impl HostToDeviceCopier for CudaHostToDeviceCopier {
+    unsafe fn copy_host_to_device(&self, src: &[u8], dst: *mut std::ffi::c_void) -> Result<()> {
+        if src.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: `dst` is a live device allocation of at least `src.len()`
+        // bytes (ORT device scratch on this runtime's device), per the trait
+        // contract. `htod` is synchronous, so the bytes are resident on return.
+        unsafe { self.runtime.htod(src, cuptr(dst)) }
+    }
+}
 
 /// Default VRAM budget for the device weight-offload residency cache when
 /// `ONNX_GENAI_WEIGHT_OFFLOAD` is enabled without an explicit
@@ -560,6 +583,18 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn device_id(&self) -> DeviceId {
         self.device
+    }
+
+    fn memory_vendor_id(&self) -> u32 {
+        // NVIDIA PCI vendor id — must match the value the plugin factory used
+        // to register the CUDA device allocator's `OrtMemoryInfo` (#982).
+        0x10DE
+    }
+
+    fn host_to_device_copier(&self) -> Option<std::sync::Arc<dyn HostToDeviceCopier>> {
+        Some(std::sync::Arc::new(CudaHostToDeviceCopier {
+            runtime: Arc::clone(&self.runtime),
+        }))
     }
 
     /// Advertise the `nxrt` weight-paging capability only when device weight
@@ -1237,8 +1272,46 @@ impl ExecutionProvider for CudaExecutionProvider {
         batch: usize,
         dtype: DataType,
         result: &mut DeviceBuffer,
+        tie_break: onnx_runtime_ep_api::ArgmaxTieBreak,
     ) -> Result<()> {
-        crate::kernels::device_argmax::launch(&self.runtime, logits, elements, batch, dtype, result)
+        crate::kernels::device_argmax::launch(
+            &self.runtime,
+            logits,
+            elements,
+            batch,
+            dtype,
+            result,
+            tie_break.select_last_index(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn device_token_writer(
+        &self,
+        result: &DeviceBuffer,
+        input_ids: &DeviceBuffer,
+        position_ids: &DeviceBuffer,
+        attention_mask: &DeviceBuffer,
+        scratch: &DeviceBuffer,
+        capacity: usize,
+        next_position: i64,
+        mask_len: usize,
+        write_position: bool,
+        step: u32,
+    ) -> Result<()> {
+        crate::kernels::device_token_writer::launch(
+            &self.runtime,
+            result,
+            input_ids,
+            position_ids,
+            attention_mask,
+            scratch,
+            capacity,
+            next_position,
+            mask_len,
+            write_position,
+            step,
+        )
     }
 
     fn copy_from_host(&self, src: &[u8], dst: &mut DeviceBuffer) -> Result<()> {

@@ -170,7 +170,9 @@ fn assert_marlin_matches_tiled(dir: &Path, label: &str) -> anyhow::Result<()> {
     // SAFETY: ignored e2e test runs serially; no concurrent readers of the flag.
     unsafe {
         std::env::set_var("ONNX_GENAI_EP", "cuda");
-        std::env::remove_var("ONNX_GENAI_MARLIN_M_GT_1");
+        // Marlin M>1 is default-ON, so the tiled reference arm opts out
+        // explicitly; unsetting the variable would select Marlin for both arms.
+        std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "0");
     }
     let tiled = generate(dir)?;
 
@@ -199,9 +201,21 @@ fn assert_marlin_matches_tiled(dir: &Path, label: &str) -> anyhow::Result<()> {
     let mut probes: Vec<Vec<u32>> = Vec::new();
     if diverges {
         eprintln!("[{label}] streams diverge — probing whether the first divergence is a near-tie");
-        for _ in 0..TIE_PROBE_RUNS {
-            probes.push(generate(dir)?.token_ids);
+        // These probes must re-run the *tiled reference* to expose its own
+        // run-to-run nondeterminism, so they opt out of the (default-ON) Marlin
+        // path for the duration of the loop.
+        // SAFETY: ignored e2e test runs serially; no concurrent readers.
+        unsafe {
+            std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "0");
         }
+        let collected = (0..TIE_PROBE_RUNS)
+            .map(|_| generate(dir).map(|run| run.token_ids))
+            .collect::<anyhow::Result<Vec<_>>>();
+        // SAFETY: clear regardless of the result so it cannot leak.
+        unsafe {
+            std::env::remove_var("ONNX_GENAI_MARLIN_M_GT_1");
+        }
+        probes = collected?;
     }
 
     match classify_parity(&tiled.token_ids, &marlin.token_ids, &probes) {

@@ -89,6 +89,18 @@ pub struct NativeDecodeCudaOptions {
     /// the pointer-unstable `alloc_raw`/`free_raw` path, so offload keeps forcing
     /// capture OFF as before.
     pub weight_offload_stable_va: Option<bool>,
+
+    /// Persistent decode batch extent, i.e. how many sequences one fused forward
+    /// advances (#750). `None` defers to `ONNX_GENAI_NATIVE_DECODE_BATCH`, which
+    /// itself defaults to `1`.
+    ///
+    /// This exists so batch-N can be *requested* rather than only enabled by an
+    /// environment variable: `--max-batch N` on the server is a supported option
+    /// that failed at startup because the capability was derived from a session
+    /// nobody had asked to build in batch shape (#1064). An explicit value wins
+    /// over the environment, so a caller who asks for a batch extent gets it or
+    /// gets an error, never a silent 1.
+    pub decode_batch: Option<usize>,
 }
 
 /// Stateful decoder-with-past adapter over the pure-Rust native runtime.
@@ -681,6 +693,44 @@ impl NativeDecodeSession {
             .map(|state| state.debug_stats(&self.session))
     }
 
+    /// Number of captured device-graph segments installed by the most recent
+    /// capture on the main decode graph slot (1 = whole-subgraph capture that
+    /// reaches the zero-host-work replay fast path; >=2 = a segmented capture
+    /// whose replay must interleave eager seam-node execution every step). This
+    /// is the batch-decode `M>=2` cliff signal: batch=1 typically captures as a
+    /// single graph while `M>=2` fragments into segments.
+    pub fn captured_graph_segment_count(&self) -> usize {
+        self.session.captured_graph_segment_count()
+    }
+
+    /// One `op_type[seam_reason]xN` summary per eager seam node that split the
+    /// most recent segmented capture on the main decode graph slot — the root
+    /// cause of a `>1`-segment graph. Empty for a whole-subgraph capture.
+    pub fn captured_graph_seam_summary(&self) -> Option<String> {
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for decline in self.session.capture_segmentation() {
+            let seam = decline
+                .seam_reason
+                .map(|reason| format!("{reason:?}"))
+                .unwrap_or_else(|| "graph".to_string());
+            *counts
+                .entry(format!("{}[{}]", decline.op_type, seam))
+                .or_default() += 1;
+        }
+        if counts.is_empty() {
+            None
+        } else {
+            Some(
+                counts
+                    .into_iter()
+                    .map(|(key, count)| format!("{key}x{count}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        }
+    }
+
     pub fn cuda_graph_fallback_reason(&self) -> Option<&str> {
         self.cuda
             .as_ref()
@@ -996,6 +1046,14 @@ impl NativeDecodeSession {
         self.cuda.as_ref().map(DecodeCudaState::batch).unwrap_or(1)
     }
 
+    /// The hard physical KV capacity (`max_len`) of the persistent CUDA decode
+    /// bindings, if a CUDA decode session is bound. This is the ceiling a
+    /// continuous-batch manager clamps per-request context limits to. `None` when
+    /// there is no CUDA session (the batched path is unavailable anyway).
+    pub fn batch_kv_max_len(&self) -> Option<usize> {
+        self.cuda.as_ref().map(DecodeCudaState::hard_max_len)
+    }
+
     /// Run one target step with arbitrary named tensors supplied by pipeline
     /// routing. Generated roles (token ids, attention mask, and position ids)
     /// come from `ModelIoSpec`; every other non-KV graph input is resolved by its
@@ -1120,10 +1178,13 @@ impl NativeDecodeSession {
             bail!("native generation requires at least one prompt token");
         }
         self.reset()?;
+        let device_loop_k = self.device_token_loop_k();
         let mut backend = NativeLoopAdapter {
             session: self,
             prompt_tokens: prompt_tokens.to_vec(),
             pending_tokens: prompt_tokens.to_vec(),
+            device_loop_k,
+            lookahead: std::collections::VecDeque::new(),
         };
         let mut state = DecodeLoopState::new(0, options.seed, options.top_logprobs);
         run_decode_loop(
@@ -1229,10 +1290,13 @@ impl NativeDecodeSession {
                 "incremental generation requires at least one new token beyond the cached prefix"
             );
         }
+        let device_loop_k = self.device_token_loop_k();
         let mut backend = NativeLoopAdapter {
             session: self,
             prompt_tokens: prompt_tokens.to_vec(),
             pending_tokens: new_tokens.to_vec(),
+            device_loop_k,
+            lookahead: std::collections::VecDeque::new(),
         };
         let mut state = DecodeLoopState::new(resume_from, options.seed, options.top_logprobs);
         run_decode_loop(

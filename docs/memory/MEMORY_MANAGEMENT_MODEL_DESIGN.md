@@ -274,8 +274,39 @@ replaced on its own.
 | **Accounting and arbitration** | `HostGovernor` / `DeviceMemoryAuthority` inside `ProcessMemoryManager` | Says whether capacity may be taken and by whom, keeps the ledger, issues pressure tickets. | Take bytes directly — see I6. It never chooses a victim. |
 | **Policy** | the **holders**: `ModelResidency`, `StateBundle` / `KvPageStore`, arenas | Decides what is hot, warm or cold; picks victims under pressure; calls the mechanism to map or release. | Assume it can have capacity without a grant. |
 
-**Offloading is a holder concern.** For weights it belongs to `ModelResidency`:
-which tensors are pinned, which are streamed, which are evicted, and in what
+**Kernels are holders too, and this is where the model kept leaking.** A kernel
+that keeps a derived copy of a weight for the session — a dequantised expansion, a
+packed buffer, a transpose — is a residency policy, whether or not it was written
+as one. Three such buffers were found in the CPU path in a single day, all of them
+invisible to the ledger:
+
+| buffer | size | found in |
+|---|---|---|
+| resident f32 dequant cache | ~8× the packed weight | #971 / #979, governed since #987 |
+| MLAS SQNBit packed buffer | ~2× the int4 bytes | #1027, governed by #1051 |
+| weight transpose cache | 1× the f32 weight | #1035 widened its use; #1056 |
+
+The rule, filed as #1056: **any allocation that outlives a single kernel call and
+scales with weight size must be declared to the plan before it is allocated, in the
+bytes actually allocated, and must be declinable.** Three consequences worth
+stating separately, because each was learned by getting it wrong:
+
+- **Declare, don't discover.** The plan admits or declines up front; declining must
+  fall back to a path that works. For all three the fallback already existed
+  (on-the-fly dequant, borrowed zero-copy int4, transpose-per-call), which is why
+  governing them cost nothing in capability.
+- **Account the bytes actually allocated, not a model of them.** Where prediction
+  and allocation are separate pieces of code, a test must pin them to each other in
+  one run. #1051's first attempt reported 40% of the truth because it modelled the
+  allocation; the missing factors were an owned scale copy and the shape-keyed
+  `KernelCache` instantiating prefill and decode separately. **Under-reporting is
+  worse than not reporting** — zero is obviously blind and gets caught, 40% passes
+  the admission check and then overruns the budget.
+- **Test against footprint, never a proxy.** "This field stayed empty" is not "the
+  process did not grow"; #1027 argued its invariant held that way while peak RSS
+  tripled.
+
+**Offloading is a holder concern.** For weights it belongs to `ModelResidency`:which tensors are pinned, which are streamed, which are evicted, and in what
 order. The authority says "give me N bytes back" and leaves the choice of victim
 to the holder. The allocator maps what it is told to map. A third party can
 substitute its own residency policy while leaving the ledger and the VMM layer
@@ -409,6 +440,16 @@ from #944 reports `reads_per_step` directly, so this is measurable rather than
 assumed — and it should be measured before any MoE-specific residency policy is
 designed.
 
+> **Update (2026-08-18):** it has now been measured. See
+> [`MOE_OFFLOAD_ARCHITECTURE.md`](MOE_OFFLOAD_ARCHITECTURE.md) (and #1321/#1322/#1326/#1331).
+> The result refines the dense conclusion rather than overturning it: the OS page
+> cache captures **83–88%** of the achievable win whenever the routing-hot expert
+> set fits in DRAM cache (LRU exploits skew for free, because frequent ≈ recent),
+> and a routing-aware pin earns its complexity **only** once the hot set exceeds
+> cache — the oversubscribed regime, ~45 GB hot-set on a 64 GB box (inferred). The
+> dense `reads_per_step = 1.000` case is that same page-cache regime with no reuse,
+> which is why nothing clever was possible and the OS won by ~30×.
+
 For dense models the only thing that changes the floor is **batching**, because
 it changes `W` per token rather than the bandwidth: `N` sequences sharing one
 fused forward read each weight once for `N` tokens, measured at `1/N` with a
@@ -422,13 +463,27 @@ and it is on a different axis from everything above: instead of asking how to mo
 weights more cleverly, ask **whether a given operation should run where its
 weights already are.**
 
-The extreme case is the embedding lookup. It is a gather: one row of `hidden`
-values per token, and essentially no arithmetic. Running it on the device with
-non-resident weights means moving the whole table — 389,283,840 B on the 14B, the
-same tensor isolated as key 919 in #945 — to produce about 10 KB of output. At
-the ~5 GB/s seen in streaming runs that is ~78 ms per token to do no work. No
-prefetch, admission policy or residency scheme improves it, because the transfer
-*is* the cost. The only correct answer is not to move the weights.
+The cleanest *statement* of the principle is the embedding lookup. It is a gather:
+one row of `hidden` values per token, and essentially no arithmetic (`F ~ 0`). If
+its table were non-resident, running it on the device would mean moving the whole
+table to produce about 10 KB of output — pure transfer, no work — which no
+prefetch, admission policy or residency scheme improves, because the transfer
+*is* the cost.
+
+**Measured correction (do not repeat the earlier attribution error).** In our
+quantised Qwen exports the embedding gather is *not* the streamed tensor, so it is
+not an instance of the lever we can exploit here. `model.embed_tokens.qweight` is
+consumed by `GatherBlockQuantized`, which is **not** a `LazyWeightBoundary`, so it
+is never paged: it is **resident** and streams *nothing* per token (verified on
+`qwen14b-zp`, RTX 4060: of 867 lazy-weight handles, zero are named
+`embed_tokens`). The 389,283,840 B (`152064 x 5120 x 0.5`, INT4) observed
+streaming every step at key 919 in #945 is a *different* tensor — `lm_head.weight`,
+consumed by `MatMulNBits`, the vocab projection — which does real arithmetic, not
+a gather. At ~5 GB/s that 389 MB is ~78 ms per token, but it is the output
+projection being streamed, not the embedding. So the gather remains a correct
+illustration of `F ~ 0`; it is simply already on the right side of the line
+(resident) and there is nothing to move. The real placement candidate on these
+exports is `lm_head` (see below). Recorded in #1299.
 
 The general rule, which is the per-operation form of the bandwidth floor above:
 
@@ -446,8 +501,18 @@ F / C_slow  <  W / B_link  +  F / C_fast
 A gather has `F ~ 0`, so the condition holds whenever the weights are not
 resident. A `lm_head` GEMV on the 14B is `2 x 5120 x 152064 ~ 1.557 GFLOP`
 against 389 MB, which is close enough to the boundary that it must be measured
-rather than argued. Anything compute-dense — attention, an MLP over many tokens —
-fails the condition, and its weights should move.
+rather than argued. **It has now been measured on the CPU side (#1013, x86):** the
+real int4 `MatMulNBits` decode kernel on the `#979` borrowed symmetric-int4 path
+(`accuracy_level=0`) is a *scalar* unpack-convert-FMA loop with no SIMD on x86 and
+peaks at ~0.78 GB/s — 1.6% of the 49.28 GB/s STREAM ceiling — so CPU `lm_head`
+compute is ~500 ms, not the ~8 ms the roofline assumed. The criterion therefore
+**inverts**: moving `lm_head` to the GPU (~33 ms) is ~15x cheaper than computing
+it on the host. Host-placing `lm_head` is a net loss with the current CPU kernel.
+The one gap #1013 leaves open is the `mlas` / `accuracy_level=4` (MLAS SQNBit,
+prepacked) path, which it deliberately did not measure; a SIMD/prepacked kernel
+could shift the number, but nothing in the default path today survives the
+inversion. Anything compute-dense — attention, an MLP over many tokens — fails the
+condition, and its weights should move.
 
 Two consequences worth stating:
 
@@ -463,9 +528,16 @@ Two consequences worth stating:
 exactly what this requires, and as of today the plugin-EP path hangs when it has
 them (#982), which is why whole-graph-or-nothing claiming is the current default.
 Placement also crosses a captured region — CUDA graph capture is load-bearing here
-(#854/#867), and a per-token excursion to another device may break it. That
-interaction is unknown and should be checked before anything is built, because it
-could invalidate the approach on the native path entirely. Tracked in #994.
+(#854/#867). That interaction **has now been checked on the native path**
+(RTX 4060, #1300): a per-token device→host→device excursion is compatible with
+native CUDA graph capture *only as an eager seam between captured segments* — the
+existing segmented-capture machinery handles it and replays token-exact — and is
+**illegal inside** an active capture, because a host-consuming D2H forces a stream
+sync that invalidates the in-flight graph. Priced directly, the seam costs
+~45–90 µs/token on the 4060. So the native interaction does **not** invalidate the
+approach; it constrains the mechanism to segment seams. This says nothing about
+#982: the plugin-EP interspersed-partition hang is untouched and still gates that
+path. Tracked in #994.
 
 **Unmeasured:** every figure above comes from discrete GPUs — WDDM on an
 RTX 4060 and Linux on an H200. True unified memory (Apple Silicon, an APU with
@@ -528,7 +600,7 @@ names the measurement that established the need.
 | **Virtual-memory capability and granule** | Flat VMM vs blocks-plus-table vs static contiguous | 2 MiB CUDA granule; committed/useful ratio drives the choice | Known to the allocator, not reported |
 | **Resident vs host read bandwidth for the access pattern** | How much residency is worth, and therefore hot-set sizing | Sequential proxy 11.41 GB/s vs real strided GEMV ~5.6 GB/s — a 2x error in the sizing input (#877 → #880) | Absent |
 | **Budget enforcement** — does this EP apply a memory limit, or only observe one | Whether `--vram-limit` is a bound or a suggestion, and whether the runtime may report it as binding | ORT accepts a limit and reports weights at 258.6% of it with no action, while native CUDA honours the same request (#955) | Absent; silently `advisory_only` on ORT |
-| **Per-op weight residency** — where each operation's weights currently live | Whether an op should run here at all, or on the device its weights are already on (see "Placement: move the computation to the data") | An embedding gather moves 389 MB to produce ~10 KB; the transfer is the entire cost (#994) | Absent; placement is by op support only |
+| **Per-op weight residency** — where each operation's weights currently live | Whether an op should run here at all, or on the device its weights are already on (see "Placement: move the computation to the data") | The 389 MB/token streamed at key 919 is `lm_head.weight` (`MatMulNBits`), not the embedding gather, which is resident (#1299); host-placing that GEMV inverts against the CPU int4 kernel (#1013) | Absent; placement is by op support only |
 | **KV layout preference as a stride descriptor** | Which physical KV form to bind | EPs differ; a growing enum imposed by the runtime cannot express it (#783) | A runtime-side enum |
 | **Reclaim capability** | Whether an EP-side holder can answer pressure at all (C5) | — | Absent; no pressure path into the EP |
 

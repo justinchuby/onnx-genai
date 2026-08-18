@@ -8,9 +8,15 @@
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
+use std::borrow::Cow;
+
 use super::add::broadcast_apply;
 use super::check_arity;
 use super::half_gemm::{self, HalfFormat, MatrixLayout};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use super::half_gemv;
+use super::matmul::{self, MatMulPrepack};
+use super::weight_transpose::transpose_row_major;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 /// f32 Gemm kernel carrying its scalar/transpose attributes.
@@ -19,6 +25,9 @@ pub struct GemmKernel {
     beta: f32,
     trans_a: bool,
     trans_b: bool,
+    /// Densification and weight-transpose memos for constant (initializer)
+    /// operands, shared with `MatMul` so both ops cache a given weight once.
+    prepack: MatMulPrepack,
 }
 
 /// Factory reading `alpha`/`beta` (default 1.0) and `transA`/`transB`
@@ -36,11 +45,77 @@ impl KernelFactory for GemmFactory {
             beta,
             trans_a,
             trans_b,
+            prepack: MatMulPrepack::default(),
         }))
     }
 }
 
+impl GemmKernel {
+    /// The f16 decode GEMV and prefill packed-SGEMM routes, in that order.
+    ///
+    /// Returns `None` whenever neither applies, leaving the portable blocked
+    /// half GEMM to serve the call exactly as before.
+    fn try_half_fast_path(
+        &self,
+        a: &TensorView,
+        b: &TensorView,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        if a.dtype != DataType::Float16 || b.dtype != DataType::Float16 {
+            return Ok(None);
+        }
+
+        // Decode: read B in place as f16 rather than widening K*N floats for a
+        // single row. Memory-bound, and measured at parity with ORT in MatMul.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if m == 1
+            && b.is_contiguous()
+            && b.numel() == k.saturating_mul(n)
+            && half_gemv::simd_available()
+        {
+            b.validate()?;
+            let a_dense = self.prepack.dense(0, a)?;
+            if a_dense.len() == k {
+                // SAFETY: `b` was just validated as a contiguous Float16 view
+                // whose element count equals `k * n`. `f16` is transparent over
+                // `u16`, so reading its storage as raw bit patterns is sound,
+                // and the view outlives this call.
+                let b_bits = unsafe { std::slice::from_raw_parts(b.data_ptr::<u16>(), k * n) };
+                let mut result = vec![0.0f32; n];
+                half_gemv::gemv_f16_kn(&a_dense, b_bits, &mut result, k, n);
+                return Ok(Some(result));
+            }
+        }
+
+        #[cfg(feature = "mlas")]
+        {
+            matmul::try_packed_half_prefill(
+                &self.prepack,
+                crate::backend::CpuBackend::auto_detect(),
+                a,
+                b,
+                m,
+                k,
+                n,
+            )
+        }
+        #[cfg(not(feature = "mlas"))]
+        {
+            // Off x86 the decode GEMV above is compiled out too, so without
+            // MLAS neither fast path exists and the dimensions go unread.
+            let _ = (m, k, n);
+            Ok(None)
+        }
+    }
+}
+
 impl Kernel for GemmKernel {
+    fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
+        self.prepack.set_constant_inputs(constant_inputs);
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Gemm", inputs, outputs, 2, 3, 1)?;
         let a_shape = inputs[0].shape;
@@ -81,7 +156,29 @@ impl Kernel for GemmKernel {
             flops
         });
 
-        let mut out = if let Some(mut half_output) =
+        // f16 fast paths, shared with `MatMul`. Only the untransposed case
+        // qualifies: both read B in its stored [K, N] order, and materialising
+        // a transpose first would give back what they save.
+        //
+        // Without these, an f16 `Gemm` falls into the portable blocked half
+        // GEMM, which is the worst dense region measured anywhere in this EP:
+        // at K=N=3584 it was 6.57x slower than ORT at M=1/1 thread and 46.67x
+        // at M=1/8 threads, because that path never scales with thread count on
+        // a single-row problem (10.07 ms at 1 thread, 10.26 ms at 8).
+        let half_fast_path: Option<Vec<f32>> = if self.trans_a || self.trans_b {
+            None
+        } else {
+            self.try_half_fast_path(&inputs[0], &inputs[1], m, k, n)?
+        };
+
+        let mut out = if let Some(mut half_output) = half_fast_path {
+            if self.alpha != 1.0 {
+                for value in &mut half_output {
+                    *value *= self.alpha;
+                }
+            }
+            half_output
+        } else if let Some(mut half_output) =
             try_half_gemm(&inputs[0], &inputs[1], m, k, n, self.trans_a, self.trans_b)?
         {
             if self.alpha != 1.0 {
@@ -91,36 +188,34 @@ impl Kernel for GemmKernel {
             }
             half_output
         } else {
-            let a = to_dense_f32_widen("Gemm", &inputs[0])?;
-            let b = to_dense_f32_widen("Gemm", &inputs[1])?;
+            let a = self.prepack.dense(0, &inputs[0])?;
+            let b = self.prepack.dense(1, &inputs[1])?;
 
-            // Accessors into the row-major dense buffers, applying transposition.
-            let a_at = |i: usize, p: usize| -> f32 {
-                if self.trans_a {
-                    a[p * m + i] // A stored [K,M]
-                } else {
-                    a[i * k + p] // A stored [M,K]
-                }
+            // The shared GEMM consumes row-major `A[M,K]` and `B[K,N]`, so an
+            // operand stored transposed is materialized in that layout first.
+            // The transposes are O(M*K) and O(K*N) against an O(M*N*K) product,
+            // and a constant `B` is transposed once per session and memoized.
+            let a_rm: Cow<'_, [f32]> = if self.trans_a {
+                Cow::Owned(transpose_row_major(&a, k, m))
+            } else {
+                a
             };
-            let b_at = |p: usize, j: usize| -> f32 {
-                if self.trans_b {
-                    b[j * k + p] // B stored [N,K]
-                } else {
-                    b[p * n + j] // B stored [K,N]
+            let b_rm: Cow<'_, [f32]> = if self.trans_b {
+                match self.prepack.transposed_b(&b, n, k) {
+                    Some(cached) => Cow::Borrowed(cached),
+                    None => Cow::Owned(transpose_row_major(&b, n, k)),
                 }
+            } else {
+                b
             };
 
             let mut output = vec![0.0f32; m * n];
-            for i in 0..m {
-                for p in 0..k {
-                    let aip = self.alpha * a_at(i, p);
-                    if aip == 0.0 {
-                        continue;
-                    }
-                    let row = &mut output[i * n..i * n + n];
-                    for (j, cell) in row.iter_mut().enumerate() {
-                        *cell += aip * b_at(p, j);
-                    }
+            if m != 0 && n != 0 && k != 0 {
+                matmul::gemm(&a_rm, &b_rm, &mut output, m, k, n)?;
+            }
+            if self.alpha != 1.0 {
+                for value in &mut output {
+                    *value *= self.alpha;
                 }
             }
             output
@@ -198,6 +293,7 @@ fn try_half_gemm(
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+    use onnx_runtime_ir::{Attribute, Graph, NodeId, TensorData, WeightRef};
 
     #[allow(clippy::too_many_arguments)]
     fn gemm(
@@ -215,6 +311,7 @@ mod tests {
             beta,
             trans_a: ta,
             trans_b: tb,
+            prepack: MatMulPrepack::default(),
         };
         let mut ins = vec![a.view(), b.view()];
         if let Some(c) = c {
@@ -300,11 +397,140 @@ mod tests {
             beta: 1.0,
             trans_a: false,
             trans_b: false,
+            prepack: MatMulPrepack::default(),
         }
         .execute(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
         .unwrap();
         // [[58,64],[139,154]] + [[10,20],[10,20]]
         assert_eq!(out.to_f16_as_f32(), vec![68., 84., 149., 174.]);
+    }
+
+    /// Builds a `Gemm` whose B is a constant weight, runs it, and returns the
+    /// output together with whether the packed f16 route served the call.
+    fn run_half_gemm(
+        m: usize,
+        k: usize,
+        n: usize,
+        a_data: &[f32],
+        b_data: &[f32],
+        trans_b: bool,
+    ) -> (Vec<f32>, bool) {
+        let a = Owned::f16(&[m, k], a_data);
+        let b = if trans_b {
+            Owned::f16(&[n, k], b_data)
+        } else {
+            Owned::f16(&[k, n], b_data)
+        };
+        let mut out = Owned::zeros_f32(&[m, n]);
+        let mut kernel = GemmKernel {
+            alpha: 1.0,
+            beta: 1.0,
+            trans_a: false,
+            trans_b,
+            prepack: MatMulPrepack::default(),
+        };
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let packed = kernel.prepack.half_pack_is_built();
+        (out.to_f32(), packed)
+    }
+
+    fn reference_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut c = vec![0.0f32; m * n];
+        for i in 0..m {
+            for p in 0..k {
+                for j in 0..n {
+                    c[i * n + j] += a[i * k + p] * b[p * n + j];
+                }
+            }
+        }
+        c
+    }
+
+    /// An f16 `Gemm` prefill with a constant weight takes the packed SGEMM
+    /// route and agrees with the reference. `K` and `N` are odd and `N` is
+    /// under a SIMD step, so the packed kernel's tails carry the result.
+    ///
+    /// The `packed` assertion is what makes this a performance test as well as
+    /// a numerical one: without it the test would keep passing if the call
+    /// silently fell back to the blocked path that measured 2.46x slower than
+    /// ORT at one thread and 7.16x at eight.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn gemm_f16_prefill_takes_the_packed_route() {
+        let (m, k, n) = (6usize, 37usize, 5usize);
+        // Multiples of 1/16 are exact in f16, so a mismatch is arithmetic.
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 7 % 23) as f32 - 11.0) / 16.0)
+            .collect();
+        let b: Vec<f32> = (0..k * n)
+            .map(|i| ((i * 13 % 31) as f32 - 15.0) / 16.0)
+            .collect();
+        let (out, packed) = run_half_gemm(m, k, n, &a, &b, false);
+        // `execute` resolves its backend by auto-detection, and only MLAS has a
+        // pack to build; elsewhere the blocked path serves the call correctly.
+        assert_eq!(
+            packed,
+            crate::backend::CpuBackend::auto_detect() == crate::backend::CpuBackend::Mlas,
+            "a constant f16 B at M>1 must be widened and packed once on MLAS"
+        );
+        for (actual, want) in out.iter().zip(reference_matmul(&a, &b, m, k, n).iter()) {
+            assert!(
+                (actual - want).abs() <= 1e-3,
+                "f16 Gemm prefill disagreed: got {actual}, want {want}"
+            );
+        }
+    }
+
+    /// `M = 1` takes the in-place f16 GEMV instead: it reads B as 16-bit rather
+    /// than widening `K*N` floats for a single row, and must not build a pack.
+    #[test]
+    fn gemm_f16_decode_takes_the_gemv_not_the_pack() {
+        let (k, n) = (37usize, 5usize);
+        let a: Vec<f32> = (0..k)
+            .map(|i| ((i * 7 % 23) as f32 - 11.0) / 16.0)
+            .collect();
+        let b: Vec<f32> = (0..k * n)
+            .map(|i| ((i * 13 % 31) as f32 - 15.0) / 16.0)
+            .collect();
+        let (out, packed) = run_half_gemm(1, k, n, &a, &b, false);
+        assert!(
+            !packed,
+            "M=1 must stay on the GEMV rather than building a pack"
+        );
+        for (actual, want) in out.iter().zip(reference_matmul(&a, &b, 1, k, n).iter()) {
+            assert!(
+                (actual - want).abs() <= 1e-3,
+                "f16 Gemm decode disagreed: got {actual}, want {want}"
+            );
+        }
+    }
+
+    /// A transposed B keeps the blocked half GEMM. Both fast paths read B in
+    /// its stored [K, N] order, so materialising a transpose first would give
+    /// back exactly what they save.
+    #[test]
+    fn gemm_f16_transposed_b_keeps_the_blocked_path() {
+        let (m, k, n) = (4usize, 6usize, 3usize);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 9) as f32 - 4.0) / 8.0).collect();
+        // B^T is [n, k]; build the [k, n] logical view for the reference.
+        let bt: Vec<f32> = (0..n * k).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
+        let mut b = vec![0.0f32; k * n];
+        for row in 0..n {
+            for col in 0..k {
+                b[col * n + row] = bt[row * k + col];
+            }
+        }
+        let (out, packed) = run_half_gemm(m, k, n, &a, &bt, true);
+        assert!(!packed, "a transposed B must not enter the packed route");
+        for (actual, want) in out.iter().zip(reference_matmul(&a, &b, m, k, n).iter()) {
+            assert!(
+                (actual - want).abs() <= 1e-3,
+                "transposed f16 Gemm disagreed: got {actual}, want {want}"
+            );
+        }
     }
 
     #[test]
@@ -317,6 +543,7 @@ mod tests {
             beta: 1.0,
             trans_a: false,
             trans_b: false,
+            prepack: MatMulPrepack::default(),
         }
         .execute(&[a.view(), b.view()], &mut [out.view_mut()])
         .unwrap();
@@ -350,6 +577,7 @@ mod tests {
             beta: -0.5,
             trans_a: true,
             trans_b: true,
+            prepack: MatMulPrepack::default(),
         };
 
         for dtype in [DataType::Float16, DataType::BFloat16] {
@@ -429,5 +657,438 @@ mod tests {
                 "{dtype:?} transposed Gemm max error {max_error} exceeds {tolerance}"
             );
         }
+    }
+
+    /// Reference `Y = alpha * A' * B' + beta * C`, written the obvious way. The
+    /// production path now reshapes both operands and calls the shared GEMM
+    /// backend, so this is what proves the reshaping is right for every
+    /// transpose combination.
+    #[allow(clippy::too_many_arguments)]
+    fn reference(
+        alpha: f32,
+        beta: f32,
+        ta: bool,
+        tb: bool,
+        a: &[f32],
+        b: &[f32],
+        bias: Option<&[f32]>,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    let av = if ta { a[p * m + i] } else { a[i * k + p] };
+                    let bv = if tb { b[j * k + p] } else { b[p * n + j] };
+                    acc += av * bv;
+                }
+                out[i * n + j] = alpha * acc;
+                if let Some(bias) = bias {
+                    out[i * n + j] += beta * bias[j];
+                }
+            }
+        }
+        out
+    }
+
+    fn pseudo(len: usize, seed: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| (i as f32 * 0.7 + seed).sin() * 1.5)
+            .collect()
+    }
+
+    /// The reshape-and-dispatch rewrite has to hold for every `transA`/`transB`
+    /// combination, for `alpha != 1` (which used to be folded into `A` and is
+    /// now applied to the product), for a broadcast bias, and for shapes that
+    /// are not multiples of any register tile -- `K = 67` and `N = 33` land in
+    /// the microkernel's edge handling, which is exactly where a layout mistake
+    /// hides.
+    #[test]
+    fn gemm_matches_reference_across_transposes_and_odd_shapes() {
+        for &(m, k, n) in &[
+            (1usize, 67usize, 33usize),
+            (5, 64, 32),
+            (3, 1, 7),
+            (17, 129, 65),
+        ] {
+            for &ta in &[false, true] {
+                for &tb in &[false, true] {
+                    for &alpha in &[1.0f32, 0.5] {
+                        let a_values = pseudo(m * k, 0.1);
+                        let b_values = pseudo(k * n, 0.3);
+                        let bias = pseudo(n, 0.9);
+                        let a_shape = if ta { [k, m] } else { [m, k] };
+                        let b_shape = if tb { [n, k] } else { [k, n] };
+                        let a = Owned::f32(&a_shape, &a_values);
+                        let b = Owned::f32(&b_shape, &b_values);
+                        let c = Owned::f32(&[n], &bias);
+                        let mut out = Owned::zeros_f32(&[m, n]);
+                        gemm(alpha, 1.0, ta, tb, &a, &b, Some(&c), &mut out);
+
+                        let expected = reference(
+                            alpha,
+                            1.0,
+                            ta,
+                            tb,
+                            &a_values,
+                            &b_values,
+                            Some(&bias),
+                            m,
+                            k,
+                            n,
+                        );
+                        let got = out.to_f32();
+                        let max_error = got
+                            .iter()
+                            .zip(&expected)
+                            .map(|(actual, want)| (actual - want).abs())
+                            .fold(0.0f32, f32::max);
+                        assert!(
+                            max_error <= 1e-4,
+                            "m={m} k={k} n={n} transA={ta} transB={tb} alpha={alpha}: \
+                             max error {max_error} against the reference"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Repeated execution of one kernel must keep returning the same answer.
+    ///
+    /// A constant `B` with `transB = 1` is transposed once and memoized in the
+    /// process-global weight-transpose cache, keyed by source address and shape.
+    /// A stale or mis-keyed entry would show up here as a second call that
+    /// disagrees with the first -- the failure mode #845 was filed for.
+    #[test]
+    fn gemm_constant_transposed_weight_is_stable_across_calls() {
+        let (m, k, n) = (2usize, 48usize, 24usize);
+        let a_values = pseudo(m * k, 0.2);
+        let b_values = pseudo(n * k, 0.6);
+        let a = Owned::f32(&[m, k], &a_values);
+        let b = Owned::f32(&[n, k], &b_values);
+
+        let mut kernel = GemmKernel {
+            alpha: 1.0,
+            beta: 1.0,
+            trans_a: false,
+            trans_b: true,
+            prepack: MatMulPrepack::default(),
+        };
+        kernel.set_constant_inputs(&[false, true]);
+
+        let expected = reference(1.0, 1.0, false, true, &a_values, &b_values, None, m, k, n);
+        for round in 0..3 {
+            let mut out = Owned::zeros_f32(&[m, n]);
+            kernel
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+            let got = out.to_f32();
+            let max_error = got
+                .iter()
+                .zip(&expected)
+                .map(|(actual, want)| (actual - want).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_error <= 1e-4,
+                "round {round}: cached transposed weight gave max error {max_error}"
+            );
+        }
+    }
+
+    /// Structural proof that `Gemm` delegates to the shared backend, with no
+    /// timing involved.
+    ///
+    /// With `alpha = 1`, no bias and no transposes, `Gemm` is exactly
+    /// `matmul::gemm` plus buffer plumbing, so its output must be **bit**
+    /// identical to calling that backend directly. A scalar re-implementation
+    /// would have to reproduce the blocked, register-tiled, rayon-partitioned
+    /// summation order of `gemm_generic`/`x86_sgemm` float-for-float to pass
+    /// this, which is precisely the property the removed triple loop lacked:
+    /// it accumulated row-at-a-time and rounded differently.
+    ///
+    /// This runs in CI on every platform, unlike the timing guard below.
+    #[test]
+    fn gemm_output_is_bit_identical_to_the_shared_backend() {
+        let (m, k, n) = (7usize, 96usize, 48usize);
+        let a_values = pseudo(m * k, 0.4);
+        let b_values = pseudo(k * n, 0.8);
+
+        let mut expected = vec![0.0f32; m * n];
+        matmul::gemm(&a_values, &b_values, &mut expected, m, k, n).unwrap();
+
+        let a = Owned::f32(&[m, k], &a_values);
+        let b = Owned::f32(&[k, n], &b_values);
+        let mut out = Owned::zeros_f32(&[m, n]);
+        gemm(1.0, 1.0, false, false, &a, &b, None, &mut out);
+
+        assert_eq!(
+            out.to_f32(),
+            expected,
+            "Gemm is no longer computing its f32 product with matmul::gemm"
+        );
+    }
+
+    /// Performance regression guard, not a benchmark.
+    ///
+    /// The defect this file's rewrite fixes was structural: `Gemm` computed its
+    /// product with a scalar triple loop while every other f32 matrix multiply
+    /// in the EP used the shared, SIMD, multi-threaded backend, which measured
+    /// 30x-1053x slower than ORT depending on shape. Reintroducing a scalar loop
+    /// would not fail any correctness test, so the guard is a wall-clock ratio
+    /// against `matmul::gemm` on the same data: `Gemm` may pay for reshaping its
+    /// operands, but it may not be in a different performance class.
+    ///
+    /// Ignored by default -- timing on a shared CI runner is not a gate -- and
+    /// run explicitly with `--ignored`.
+    #[test]
+    #[ignore = "timing-sensitive; run explicitly with --ignored"]
+    fn gemm_stays_within_reach_of_the_shared_backend() {
+        use std::time::Instant;
+
+        let (m, k, n) = (64usize, 512usize, 512usize);
+        let a_values = pseudo(m * k, 0.2);
+        let b_values = pseudo(k * n, 0.6);
+        let a = Owned::f32(&[m, k], &a_values);
+        let b = Owned::f32(&[k, n], &b_values);
+
+        let mut direct = vec![0.0f32; m * n];
+        for _ in 0..3 {
+            matmul::gemm(&a_values, &b_values, &mut direct, m, k, n).unwrap();
+        }
+        let started = Instant::now();
+        for _ in 0..10 {
+            matmul::gemm(&a_values, &b_values, &mut direct, m, k, n).unwrap();
+        }
+        let backend = started.elapsed();
+
+        let mut out = Owned::zeros_f32(&[m, n]);
+        for _ in 0..3 {
+            gemm(1.0, 1.0, false, false, &a, &b, None, &mut out);
+        }
+        let started = Instant::now();
+        for _ in 0..10 {
+            gemm(1.0, 1.0, false, false, &a, &b, None, &mut out);
+        }
+        let kernel = started.elapsed();
+
+        // 8x is deliberately loose: this catches "fell back to a scalar loop"
+        // (two to three orders of magnitude) without failing on a noisy runner.
+        assert!(
+            kernel.as_secs_f64() <= backend.as_secs_f64() * 8.0 + 1e-3,
+            "Gemm took {kernel:?} against {backend:?} for the same product; \
+             it is no longer using the shared GEMM backend"
+        );
+    }
+
+    /// Serializes the tests that read the process-global weight-transpose cache
+    /// bytes or toggle its admission flag, so they never observe each other's
+    /// entries or setting under Rust's parallel test harness (#1056). Analogous
+    /// to `matmul_nbits`'s `CACHE_FLAG_TEST_LOCK`.
+    static TRANSPOSE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Build a single-node `Gemm` graph with a constant `[n, k]` `B` initializer
+    /// and `transB = 1`, for driving [`weight_transpose_cache_predicted_bytes`].
+    /// The initializer's *bytes* are irrelevant (the predictor reads only its
+    /// dims), so they are left zeroed; the executed kernel below uses its own
+    /// `Owned` `B` carrying real data.
+    fn trans_b_gemm_graph(n: usize, k: usize) -> Graph {
+        use onnx_runtime_ir::static_shape;
+        let mut graph = Graph::new();
+        let a = graph.create_named_value("A", DataType::Float32, static_shape([1, k]));
+        let b = graph.create_named_value("B", DataType::Float32, static_shape([n, k]));
+        let y = graph.create_named_value("Y", DataType::Float32, static_shape([1, n]));
+        graph.add_input(a);
+        graph.add_input(b);
+        let mut node = Node::new(NodeId(0), "Gemm", vec![Some(a), Some(b)], vec![y]);
+        node.attributes.insert("transB".into(), Attribute::Int(1));
+        graph.insert_node(node);
+        graph.add_output(y);
+        graph.set_initializer(
+            b,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![n, k],
+                vec![0u8; n * k * 4],
+            )),
+        );
+        graph
+    }
+
+    /// #1056 acceptance criterion: the predicted transpose-cache bytes must
+    /// equal the bytes actually held after a real run, ratio 1.00.
+    ///
+    /// This runs the constant-weight `transB` `Gemm` kernel through the `Kernel`
+    /// trait at *two* activation shapes (prefill `m = 4`, decode `m = 1`) — the
+    /// exact duplication the shape-keyed kernel cache produces in an
+    /// autoregressive session — and asserts that the process-global cache grows
+    /// by the predicted amount *once*, proving effect (b) from #1051 (per-
+    /// instantiation copies) does **not** apply here: the global cache keys on
+    /// the weight address, so the decode instance hits the prefill entry.
+    #[test]
+    fn predicted_transpose_bytes_equal_actual_after_gemm_execution() {
+        let _guard = TRANSPOSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Thread-local admit: never mutates the process-global the concurrent
+        // `transposed_b` tests read (#1056 isolation).
+        let _admit = crate::kernels::weight_transpose::CacheEnabledScope::new(true);
+
+        // Distinctive geometry so a stray same-shaped entry cannot alias it.
+        let (n, k) = (37usize, 91usize);
+        let graph = trans_b_gemm_graph(n, k);
+        let predicted = matmul::weight_transpose_cache_predicted_bytes(&graph);
+        assert_eq!(
+            predicted,
+            (n as u64) * (k as u64) * 4,
+            "one f32 [k,n] transpose per constant transB Gemm weight"
+        );
+
+        // One `B` buffer, shared by both kernel instances, so both key the
+        // global cache identically.
+        let b_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.013).sin()).collect();
+        let b = Owned::f32(&[n, k], &b_data);
+        let b_ptr = b.view().data_ptr::<f32>();
+
+        // Evict any stale entry a since-freed weight of these dims may have left
+        // at this recycled address, so the first `run` below is a genuine miss
+        // and the byte total grows by `predicted` (rather than silently hitting a
+        // pre-existing entry and asserting against no growth). Safe: no live
+        // concurrent allocation can share `b_ptr`.
+        crate::kernels::weight_transpose::f32_cache_evict(b_ptr, n, k);
+
+        let run = |m: usize| -> Vec<f32> {
+            let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.007).cos()).collect();
+            let a = Owned::f32(&[m, k], &a_data);
+            let mut y = Owned::zeros_f32(&[m, n]);
+            let mut kernel = GemmKernel {
+                alpha: 1.0,
+                beta: 1.0,
+                trans_a: false,
+                trans_b: true,
+                prepack: MatMulPrepack::default(),
+            };
+            kernel.set_constant_inputs(&[false, true]);
+            kernel
+                .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+                .unwrap();
+            y.to_f32()
+        };
+
+        let before = matmul::weight_transpose_cache_bytes();
+        let _prefill = run(4);
+        let _decode = run(1);
+        let after = matmul::weight_transpose_cache_bytes();
+
+        // The process-global byte total is shared across the parallel test
+        // harness, so a *concurrent* test caching an unrelated weight can also
+        // grow it. Measure the bytes held for THIS weight directly by re-keying
+        // the global cache with the exact `B` pointer the kernel used (a
+        // constant, contiguous f32 input densifies to a borrow of its own
+        // buffer, so `dense(1)` and this query share one address): a hit returns
+        // the entry the two runs installed, never a fresh allocation.
+        //
+        // SAFETY: `b` is a live, contiguous `[n, k]` f32 tensor for the whole
+        // test, so its data pointer addresses exactly `n * k` f32 values.
+        let b_slice = unsafe { std::slice::from_raw_parts(b.view().data_ptr::<f32>(), n * k) };
+        let entry = crate::kernels::weight_transpose::cached_transpose_f32(b_slice, n, k)
+            .expect("the executed kernel cached this constant weight's transpose");
+        let actual = (entry.len() * std::mem::size_of::<f32>()) as u64;
+        assert_eq!(
+            actual, predicted,
+            "predicted transpose-cache bytes must equal the bytes actually held \
+             for this weight (ratio 1.00); two shape instantiations retain one \
+             shared copy"
+        );
+        // And that copy is genuinely part of the global total the plan budgets.
+        assert!(
+            after >= before + predicted as usize,
+            "the cached transpose must be reflected in the global byte total"
+        );
+    }
+
+    /// #1056 decline contract: when the cache is declined, a constant `transB`
+    /// `Gemm` weight retains **nothing** (the transpose is recomputed per call
+    /// and freed), and the result is byte-identical to the admitted run — a pure
+    /// performance tradeoff, never a numerical one.
+    #[test]
+    fn declined_transpose_cache_retains_nothing_and_is_byte_identical() {
+        let _guard = TRANSPOSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // A fresh `B` never seen by the global cache. Built once so its data
+        // pointer is stable across both runs and can be probed by exact key.
+        let (n, k, m) = (29usize, 53usize, 3usize);
+        let b_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.019).sin()).collect();
+        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.011).cos()).collect();
+        let b = Owned::f32(&[n, k], &b_data);
+        // `b` outlives every use of this pointer below and is a contiguous
+        // `[n, k]` f32 tensor, so the key names exactly this weight.
+        let b_ptr = b.view().data_ptr::<f32>();
+
+        // Address reuse hygiene: the cache keys on `(addr, K, N)`, and an earlier
+        // (now-freed) weight of the same dims could have been recycled onto this
+        // exact address, leaving a stale entry that would make the probe below a
+        // false positive. Evict that key first so the "before" state is
+        // deterministically empty. Safe under the parallel harness: no *live*
+        // concurrent allocation can share `b_ptr`, so the only entry this can
+        // touch is a stale one nobody is using.
+        crate::kernels::weight_transpose::f32_cache_evict(b_ptr, n, k);
+        assert!(
+            !crate::kernels::weight_transpose::f32_cache_contains(b_ptr, n, k),
+            "precondition: this weight's key must start absent"
+        );
+
+        let run = || -> Vec<f32> {
+            let a = Owned::f32(&[m, k], &a_data);
+            let mut y = Owned::zeros_f32(&[m, n]);
+            let mut kernel = GemmKernel {
+                alpha: 1.0,
+                beta: 1.0,
+                trans_a: false,
+                trans_b: true,
+                prepack: MatMulPrepack::default(),
+            };
+            kernel.set_constant_inputs(&[false, true]);
+            kernel
+                .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+                .unwrap();
+            y.to_f32()
+        };
+
+        // Declined: this weight's transpose must not be resident afterward.
+        // Probe the exact `(addr, n, k)` key the kernel installs (it calls
+        // `transposed_b(&b, n, k)`) rather than a global byte total, so a
+        // concurrent test caching an unrelated weight cannot mask a leak.
+        let declined = {
+            let _decline = crate::kernels::weight_transpose::CacheEnabledScope::new(false);
+            let out = run();
+            assert!(
+                !crate::kernels::weight_transpose::f32_cache_contains(b_ptr, n, k),
+                "a declined transpose cache must retain nothing for this weight"
+            );
+            out
+        };
+
+        // Admitted: byte-identical output (transpose is the same math either
+        // way) and now this weight *is* resident, confirming the two paths
+        // differ only in retention, not in numerics.
+        let admitted = {
+            let _admit = crate::kernels::weight_transpose::CacheEnabledScope::new(true);
+            let out = run();
+            assert!(
+                crate::kernels::weight_transpose::f32_cache_contains(b_ptr, n, k),
+                "an admitted transpose cache must retain this weight"
+            );
+            out
+        };
+        assert_eq!(
+            declined, admitted,
+            "declining the transpose cache must not change results"
+        );
     }
 }

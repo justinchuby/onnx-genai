@@ -16,9 +16,10 @@
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use onnx_genai_ort_sys as ort;
+use onnx_runtime_ep_api::HostToDeviceCopier;
 use onnx_runtime_ep_api::kernel::{
     Kernel, TensorMetadata, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
@@ -57,6 +58,29 @@ pub enum ShapeInference {
     SameAsInputMultiOutput { idx: usize, count: usize },
     /// MatMul / MatMulNBits semantics (handles 1-D, 2-D, batched-ND).
     MatMul,
+    /// `com.microsoft::MatMulNBits`: `A[.., K] x dequant(B)[K, N]`.
+    ///
+    /// Not [`Self::MatMul`]. `B` is the *packed* quantized weight, shaped
+    /// `[N, ceil(K / block_size), block_size * bits / 8]` — three dims that
+    /// have nothing to do with the GEMM's, so plain matmul broadcasting reads
+    /// `N` as a batch dim and `blob_size` as the output column count. The real
+    /// output is the activation's shape with its last dim replaced by the `N`
+    /// attribute, which is also what `onnx-runtime-shape-inference`'s
+    /// `quantized_matmul` rule computes for the native path.
+    MatMulNBits {
+        /// The `N` attribute: the dequantized weight's column count.
+        n: usize,
+    },
+    /// `QLinearMatMul`: `MatMul` semantics between input 0 and input **3**.
+    ///
+    /// The quantization parameters sit between the two operands
+    /// (`a, a_scale, a_zero_point, b, b_scale, b_zero_point, y_scale,
+    /// y_zero_point`), so [`Self::MatMul`]'s "inputs 0 and 1" reads `a_scale`
+    /// as the right-hand operand. Absent from this table the op resolves to
+    /// [`Self::Declined`], and the fail-closed shape filter in `GetCapability`
+    /// then drops the claim — which is what kept this EP from ever receiving a
+    /// `QLinearMatMul` node from a plugin host.
+    QLinearMatMul,
     /// Gemm: (trans_a, trans_b) flags.
     Gemm { trans_a: bool, trans_b: bool },
     /// Concat along `axis`.
@@ -108,6 +132,27 @@ pub enum ShapeInference {
     },
     /// RotaryEmbedding — output same shape as input[0].
     RotaryEmbedding,
+    /// `com.microsoft::Attention`: packed-QKV attention.
+    ///
+    /// A different signature from [`Self::AttentionStd`], which is why the
+    /// opset-23 `ai.onnx::Attention` arm cannot cover it. Here input(0) is the
+    /// *unprojected* activation `(batch, seq, input_hidden)` and input(1) is
+    /// the fused projection weight `(input_hidden, q_hidden + k_hidden +
+    /// v_hidden)`, so the output width is `v_hidden` — not the input's last
+    /// dim, and not `weights.dim1`.
+    MsftAttention {
+        /// `qkv_hidden_sizes[2]` when the attribute is present, else
+        /// `weights.dim1 / 3` resolved from the input shape at Compute time.
+        v_hidden: Option<usize>,
+        num_heads: usize,
+        num_outputs: usize,
+    },
+    /// `com.microsoft::PackedMultiHeadAttention`: output
+    /// `[token_count, v_hidden]` = `[input[0].dim0, input[2].dim1]`.
+    ///
+    /// Tokens are packed across the batch with no padding, so the output is
+    /// rank-2 and neither dim can be read off input[0] alone.
+    PackedMultiHeadAttention,
     /// Standard `ai.onnx::Attention` (opset 23+): scaled dot-product attention.
     ///
     /// Q/K/V are rank-3 `(batch, seq, hidden)` or rank-4
@@ -160,9 +205,8 @@ impl ShapeInference {
             // ── Elementwise broadcast ops ─────────────────────────────────
             "Add" | "Sub" | "Mul" | "Div" | "Pow" | "Mod" | "And" | "Or" | "Xor" | "Equal"
             | "Greater" | "Less" | "GreaterOrEqual" | "LessOrEqual" | "BitShift" | "BitwiseAnd"
-            | "BitwiseOr" | "BitwiseXor" | "Max" | "Min" | "Mean" | "Sum" | "Where" => {
-                Self::ElementwiseBroadcast
-            }
+            | "BitwiseOr" | "BitwiseXor" | "Max" | "Min" | "Mean" | "Sum" | "Where"
+            | "PRelu" => Self::ElementwiseBroadcast,
 
             // ── Unary / shape-preserving ──────────────────────────────────
             "Relu"
@@ -185,9 +229,34 @@ impl ShapeInference {
             | "HardSwish"
             | "LeakyRelu"
             | "Elu"
+            | "Celu"
             | "Selu"
+            | "Mish"
             | "Softplus"
             | "Softsign"
+            // Trigonometric and hyperbolic ops. Unary and shape-preserving,
+            // so the name alone is enough.
+            | "Sin"
+            | "Cos"
+            | "Tan"
+            | "Asin"
+            | "Acos"
+            | "Atan"
+            | "Sinh"
+            | "Cosh"
+            | "Asinh"
+            | "Acosh"
+            | "Atanh"
+            | "ThresholdedRelu"
+            // `com.microsoft` shape-preserving activations. Absent from this
+            // table they resolve to `Declined`, and `GetCapability`'s
+            // fail-closed shape filter then drops the whole claim — so the EP
+            // never got these nodes at all, whatever `supports_op` said.
+            | "FastGelu"
+            | "QuickGelu"
+            | "BiasGelu"
+            | "Silu"
+            | "Swish"
             | "Cast"
             | "Identity"
             | "Dropout"
@@ -196,6 +265,21 @@ impl ShapeInference {
             | "BitCount"
             | "Bernoulli"
             | "NegativeLogLikelihoodLoss"
+            // Shape-preserving ops on the attention / MoE / KV-cache path.
+            // Every one is registered by the CPU EP, and every one was absent
+            // here, so `GetCapability`'s fail-closed shape filter dropped the
+            // claim and ORT's CPU EP ran it -- the same silent mechanism that
+            // hid the activations until #1082 and the trigonometrics until
+            // #1097. `PackedMultiHeadAttention` is the sharpest case -- ORT
+            // has no CPU kernel for it at all, so giving it away cost a load
+            // failure rather than a slower run -- but ORT does run `MoE` and
+            // `QMoE` on CPU, so for those the decline was simply us not
+            // executing an op we implement.
+            | "MoE"
+            | "QMoE"
+            | "ScatterND"
+            | "ScatterElements"
+            | "Trilu"
             | "Clip" => Self::SameAsInput(0),
 
             // ── Shape-preserving normalisation ops ───────────────────────
@@ -204,6 +288,7 @@ impl ShapeInference {
             | "Hardmax"
             | "BatchNormalization"
             | "InstanceNormalization"
+            | "GroupNormalization"
             | "LpNormalization" => Self::SameAsInput(0),
 
             // ── LayerNorm family: requires axis attribute for correct shape ──
@@ -218,7 +303,16 @@ impl ShapeInference {
             },
 
             // ── Matrix multiply ───────────────────────────────────────────
-            "MatMul" | "MatMulNBits" => Self::MatMul,
+            "MatMul" => Self::MatMul,
+            "QLinearMatMul" => Self::QLinearMatMul,
+            // `N` is an attribute, so the op-name-only entry point cannot
+            // resolve it and must decline rather than fall through to
+            // `Self::MatMul`, which would silently read the packed weight's
+            // `blob_size` as the output width.
+            "MatMulNBits" => Self::Declined {
+                op_type: op_type.to_string(),
+                domain: domain.to_string(),
+            },
 
             // ── Safe defaults for attribute-having ops ────────────────────
             "Concat" => Self::Concat { axis: 0 },
@@ -233,6 +327,7 @@ impl ShapeInference {
             "Reshape" => Self::ReshapeData { allowzero: false },
             "Slice" => Self::SliceData,
             "RotaryEmbedding" => Self::RotaryEmbedding,
+            "PackedMultiHeadAttention" => Self::PackedMultiHeadAttention,
 
             // ── Ops that require attributes — Declined ────────────────────
             "Squeeze"
@@ -283,7 +378,11 @@ impl ShapeInference {
             // ── Elementwise ───────────────────────────────────────────────
             "Add" | "Sub" | "Mul" | "Div" | "Pow" | "Mod" | "And" | "Or" | "Xor" | "Equal"
             | "Greater" | "Less" | "GreaterOrEqual" | "LessOrEqual" | "BitShift" | "BitwiseAnd"
-            | "BitwiseOr" | "BitwiseXor" | "Max" | "Min" | "Mean" | "Sum" | "Where" => {
+            | "BitwiseOr" | "BitwiseXor" | "Max" | "Min" | "Mean" | "Sum" | "Where"
+            // `PRelu`'s slope is unidirectionally broadcastable to the
+            // input, so its result follows the same rule as the binary
+            // ops above.
+            | "PRelu" => {
                 Self::ElementwiseBroadcast
             }
 
@@ -308,9 +407,38 @@ impl ShapeInference {
             | "HardSwish"
             | "LeakyRelu"
             | "Elu"
+            | "Celu"
             | "Selu"
+            | "Mish"
             | "Softplus"
             | "Softsign"
+            // Trigonometric and hyperbolic unaries, plus the remaining
+            // shape-preserving activations. Every one is registered by the
+            // CPU EP (`onnx-runtime-ep-cpu`'s `kernels/mod.rs`) and every one
+            // was missing here, so the fail-closed shape filter in
+            // `GetCapability` dropped the claim and ORT ran them instead --
+            // silently, whatever `supports_op` answered.
+            | "Sin"
+            | "Cos"
+            | "Tan"
+            | "Asin"
+            | "Acos"
+            | "Atan"
+            | "Sinh"
+            | "Cosh"
+            | "Asinh"
+            | "Acosh"
+            | "Atanh"
+            | "ThresholdedRelu"
+            | "Swish"
+            // `com.microsoft` shape-preserving activations, same mechanism.
+            // `Silu` is listed even though ORT 1.28 does not register it:
+            // this EP does, and an op the host cannot run is precisely one it
+            // must never be handed.
+            | "FastGelu"
+            | "QuickGelu"
+            | "BiasGelu"
+            | "Silu"
             | "Cast"
             | "Identity"
             | "Dropout"
@@ -323,7 +451,16 @@ impl ShapeInference {
             | "Hardmax"
             | "BatchNormalization"
             | "InstanceNormalization"
+            | "GroupNormalization"
             | "LpNormalization"
+            // Shape-preserving attention / MoE / KV-cache ops. See the note on
+            // the same list in `for_op`: absent from this table they resolve to
+            // `Declined` and `GetCapability` hands them to ORT's CPU EP.
+            | "MoE"
+            | "QMoE"
+            | "ScatterND"
+            | "ScatterElements"
+            | "Trilu"
             | "Clip" => Self::SameAsInput(0),
 
             // ── LayerNorm / SkipLayerNorm family ──────────────────────────
@@ -353,7 +490,18 @@ impl ShapeInference {
             }
 
             // ── MatMul ────────────────────────────────────────────────────
-            "MatMul" | "MatMulNBits" => Self::MatMul,
+            "MatMul" => Self::MatMul,
+            "QLinearMatMul" => Self::QLinearMatMul,
+            "MatMulNBits" => match int_attr("N").and_then(|n| usize::try_from(n).ok()) {
+                Some(n) if n > 0 => Self::MatMulNBits { n },
+                // A `MatMulNBits` without a usable `N` is malformed; the kernel
+                // factory rejects it at Compile time. Declining here keeps the
+                // claim from reaching that point at all.
+                _ => Self::Declined {
+                    op_type: op.to_string(),
+                    domain: domain.to_string(),
+                },
+            },
 
             // ── Gemm ──────────────────────────────────────────────────────
             "Gemm" => {
@@ -476,6 +624,28 @@ impl ShapeInference {
                 }
             }
             "RotaryEmbedding" => Self::RotaryEmbedding,
+            "PackedMultiHeadAttention" => Self::PackedMultiHeadAttention,
+
+            // `com.microsoft::Attention` — packed QKV, guarded on domain so the
+            // opset-23 `ai.onnx::Attention` arm below still owns its own
+            // signature. The output width is `v_hidden`, which the attribute
+            // gives directly when present; otherwise it is `weights.dim1 / 3`,
+            // resolved from the input shapes at Compute time because this
+            // entry point does not see them.
+            "Attention" if domain == "com.microsoft" => {
+                let num_heads = int_attr("num_heads").unwrap_or(0).max(0) as usize;
+                let v_hidden = ints_attr("qkv_hidden_sizes").and_then(|sizes| {
+                    // Malformed unless all three are present and positive; fall
+                    // back to the weight-derived split rather than trusting a
+                    // partial attribute.
+                    (sizes.len() == 3 && sizes.iter().all(|s| *s > 0)).then(|| sizes[2] as usize)
+                });
+                Self::MsftAttention {
+                    v_hidden,
+                    num_heads,
+                    num_outputs,
+                }
+            }
 
             // ── Standard attention (ai.onnx::Attention, opset 23+) ─────────
             "Attention" if domain.is_empty() || domain == "ai.onnx" => {
@@ -930,6 +1100,57 @@ pub struct ExportedComputeInfo {
     /// [`ExportedComputeInfo::new`] so it is always exactly as long as
     /// `entries`.
     workspace_plans: Vec<WorkspacePlanCache>,
+    /// Device staging context (#982). `Some` only for a device EP: it lets
+    /// `Compute` upload a host-resident boundary input into device scratch
+    /// before launching a device kernel, on an interspersed CPU→device
+    /// partition where ORT never inserts the host→device copy. `None` for the
+    /// CPU EP (and any host EP), which uses its inputs verbatim exactly as
+    /// before.
+    device_staging: Option<DeviceStaging>,
+    /// Whether ORT's intra-op pool has ever been seen running our elementwise
+    /// chunks, and when to ask again if not.
+    ///
+    /// Lives here, rather than in a process-global, because a process may hold
+    /// one session at `intra_op = 1` and another at `intra_op = 16`, and the
+    /// right answer -- whether to borrow ORT's threads or use our own -- is
+    /// the opposite for each. See `onnx_runtime_ep_api::host_parallel`.
+    host_pool_probe: std::sync::atomic::AtomicU32,
+}
+
+/// Everything `Compute` needs to stage host-resident boundary inputs onto the
+/// EP's device (#982): a synchronous uploader and a reconstructed device
+/// `OrtMemoryInfo` used as a fallback allocation target when no device-resident
+/// `OrtValue` is otherwise visible in the call.
+struct DeviceStaging {
+    copier: Arc<dyn HostToDeviceCopier>,
+    /// Reconstructed device memory info, matching the one the plugin factory
+    /// registered the device allocator against. Used only when neither an
+    /// input nor an output of the node yields a device `OrtMemoryInfo`.
+    recon_mem_info: Option<ReconstructedMemInfo>,
+}
+
+/// Owns an `OrtMemoryInfo` rebuilt via `CreateMemoryInfo_V2`, released on drop.
+struct ReconstructedMemInfo {
+    ptr: *const ort::OrtMemoryInfo,
+}
+
+// SAFETY: the pointer is read-only after construction and released only on drop.
+unsafe impl Send for ReconstructedMemInfo {}
+unsafe impl Sync for ReconstructedMemInfo {}
+
+impl Drop for ReconstructedMemInfo {
+    fn drop(&mut self) {
+        if self.ptr.is_null() {
+            return;
+        }
+        let api = crate::status::host_api();
+        if api.is_null() {
+            return;
+        }
+        if let Some(release) = unsafe { (*api).ReleaseMemoryInfo } {
+            unsafe { release(self.ptr.cast_mut()) };
+        }
+    }
 }
 
 /// Per-session state created by `CreateState`.
@@ -950,7 +1171,28 @@ impl ExportedComputeInfo {
             entries,
             routing: None,
             workspace_plans,
+            device_staging: None,
+            host_pool_probe: std::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    /// Attach the device staging context (#982) captured at compile time from a
+    /// device EP. Given a `copier`, this also reconstructs the device
+    /// `OrtMemoryInfo` (from `allocator_name`, `device_type`, `vendor_id`) that
+    /// serves as the fallback scratch target for all-host-input nodes. A CPU EP
+    /// never calls this, so its `device_staging` stays `None`.
+    pub fn set_device_staging(
+        &mut self,
+        copier: Arc<dyn HostToDeviceCopier>,
+        allocator_name: &str,
+        device_type: ort::OrtMemoryInfoDeviceType,
+        vendor_id: u32,
+    ) {
+        let recon_mem_info = reconstruct_device_mem_info(allocator_name, device_type, vendor_id);
+        self.device_staging = Some(DeviceStaging {
+            copier,
+            recon_mem_info,
+        });
     }
 
     /// Attach a subgraph routing table (for multi-node fused subgraphs).
@@ -1003,7 +1245,40 @@ unsafe extern "C" fn compute_create_state(
 unsafe fn device_mem_info(
     api: &ort::OrtApi,
     ctx: *mut ort::OrtKernelContext,
+    staging: Option<&DeviceStaging>,
 ) -> Option<*const ort::OrtMemoryInfo> {
+    // A routed subgraph's intermediates must be allocated in *device* memory so
+    // the device kernels that produce and consume them dereference valid device
+    // pointers. On an interspersed CPU→device partition, kernel-context input 0
+    // may be a *host* boundary input (#982), so we must not assume input 0 lives
+    // on the device — scan every input for a genuinely device-resident one.
+    if let Some(get_count) = api.KernelContext_GetInputCount {
+        let mut count: usize = 0;
+        let status = unsafe { get_count(ctx, &mut count) };
+        if status.is_null() {
+            for i in 0..count {
+                if let Some(mi) = unsafe { ort_input_mem_info(api, ctx, i) }
+                    && unsafe { mem_info_is_device(api, mi) }
+                {
+                    return Some(mi);
+                }
+            }
+        }
+    }
+    // No device-resident input (e.g. every boundary input is host): if this is a
+    // device EP, fall back to the reconstructed EP device memory info — the same
+    // recipe the plugin factory registered its device allocator against — so
+    // intermediates still land on the device instead of silently on the host.
+    if let Some(staging) = staging
+        && let Some(recon) = staging.recon_mem_info.as_ref()
+        && !recon.ptr.is_null()
+    {
+        return Some(recon.ptr);
+    }
+    // Host EP (no device staging context): preserve the historical behavior of
+    // using input 0's memory info. For a host EP this is host memory, which is
+    // exactly where its intermediates belong, so host-only partitions are
+    // unchanged by the #982 device-staging work.
     unsafe { ort_input_mem_info(api, ctx, 0) }
 }
 
@@ -1093,6 +1368,37 @@ pub fn workspace_placement_queries() -> usize {
 /// Reset the workspace placement counter. For tests and diagnostics only.
 pub fn reset_workspace_placement_queries() {
     WORKSPACE_PLACEMENT_QUERIES.store(0, Ordering::Relaxed);
+}
+
+/// Cumulative count of node kernels **this EP actually executed** inside a
+/// `Run`, across every compiled subgraph.
+///
+/// Distinct from [`crate::ep::compiled_node_count`], and the distinction is the
+/// point. That counter is an *assignment* signal: it says ORT gave this EP the
+/// node at session-build time. This one is an *execution* signal: it says our
+/// kernel ran for that node during `Run`. Only the pair is a proof that
+/// selecting this EP kept the work here — a node can be assigned to us and
+/// still not be the thing that produced the output (a partition that never
+/// runs, an ORT-side constant fold, or a future short-circuit), and nothing in
+/// an output comparison against ORT can tell those apart, because agreeing
+/// with ORT is exactly what a correct kernel does.
+///
+/// Deliberately not `cfg(test)`-gated, for the same reason as
+/// [`WORKSPACE_PLACEMENT_QUERIES`]: the only way to observe it is a real ORT
+/// `Run` against the shipped cdylib, which is compiled without `cfg(test)`.
+/// Cost is one relaxed increment per node per `Run` — unmeasurable next to a
+/// kernel dispatch, and it is the counter the no-defer rule is checked with.
+static EXECUTED_NODE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of node kernels this EP has executed since process start (see
+/// [`EXECUTED_NODE_COUNT`]).
+pub fn executed_node_count() -> usize {
+    EXECUTED_NODE_COUNT.load(Ordering::Relaxed)
+}
+
+/// Reset the executed-node counter. For tests and diagnostics only.
+pub fn reset_executed_node_count() {
+    EXECUTED_NODE_COUNT.store(0, Ordering::Relaxed);
 }
 
 /// Derive the memory device of **one node's own operands**.
@@ -1217,6 +1523,285 @@ unsafe fn alloc_scratch(
         return Err("KernelContext_GetScratchBuffer returned null".into());
     }
     Ok(out)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Host→device boundary-input staging (#982)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// `true` when `ONNX_GENAI_PLUGIN_TRANSFER_TRACE=1` asks the input-staging path
+/// to print, *before* each synchronous host→device upload, which operand it is
+/// staging, the memory-info source it resolved, and the destination pointer —
+/// so a hang inside the driver memcpy can be named to the exact call (#982).
+fn staging_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ONNX_GENAI_PLUGIN_TRANSFER_TRACE").as_deref() == Ok("1"))
+}
+
+/// Emit one staging-trace line. Goes to stderr (buffered by pipes, so it can be
+/// lost when the process hangs) *and*, when `ONNX_GENAI_PLUGIN_TRANSFER_TRACE_FILE`
+/// is set, is appended to that file with an immediate flush — the file path is
+/// the only trace that survives a boundary hang. No-op unless the trace is on.
+fn staging_log(msg: &str) {
+    if !staging_trace_enabled() {
+        return;
+    }
+    eprintln!("{msg}");
+    use std::io::Write as _;
+    let _ = std::io::stderr().flush();
+    if let Ok(path) = std::env::var("ONNX_GENAI_PLUGIN_TRANSFER_TRACE_FILE")
+        && let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+    {
+        let _ = writeln!(f, "{msg}");
+        let _ = f.flush();
+    }
+}
+
+/// Reconstruct the device `OrtMemoryInfo` the plugin factory registered the
+/// device allocator against (`GetSupportedDevices` uses the same
+/// `CreateMemoryInfo_V2` recipe). ORT keys its allocator lookup by the
+/// `OrtDevice` fields — device type, vendor id, device id, memory type — so a
+/// memory info rebuilt with matching fields resolves to the same allocator in
+/// `KernelContext_GetScratchBuffer`. `device_id` is 0 to match the factory.
+///
+/// Returns `None` if the API is unavailable; the caller then falls back to a
+/// device memory info sourced from a live `OrtValue`.
+fn reconstruct_device_mem_info(
+    allocator_name: &str,
+    device_type: ort::OrtMemoryInfoDeviceType,
+    vendor_id: u32,
+) -> Option<ReconstructedMemInfo> {
+    let api = crate::status::host_api();
+    if api.is_null() {
+        return None;
+    }
+    let create = unsafe { (*api).CreateMemoryInfo_V2 }?;
+    let name = std::ffi::CString::new(allocator_name).ok()?;
+    let mut ptr: *mut ort::OrtMemoryInfo = std::ptr::null_mut();
+    let status = unsafe {
+        create(
+            name.as_ptr(),
+            device_type,
+            vendor_id,
+            0,
+            ort::OrtDeviceMemoryType_DEFAULT,
+            0,
+            ort::OrtDeviceAllocator,
+            &mut ptr,
+        )
+    };
+    if !status.is_null() {
+        if let Some(release) = unsafe { (*api).ReleaseStatus } {
+            unsafe { release(status) };
+        }
+        return None;
+    }
+    if ptr.is_null() {
+        return None;
+    }
+    Some(ReconstructedMemInfo { ptr })
+}
+
+/// Device type ORT placed a memory info on, or `None` if unreadable.
+///
+/// # Safety
+///
+/// `api` and `mem_info` must be valid.
+unsafe fn mem_info_device_type(
+    api: &ort::OrtApi,
+    mem_info: *const ort::OrtMemoryInfo,
+) -> Option<ort::OrtMemoryInfoDeviceType> {
+    let f = api.MemoryInfoGetDeviceType?;
+    let mut out: ort::OrtMemoryInfoDeviceType = ort::OrtMemoryInfoDeviceType_CPU;
+    unsafe { f(mem_info, &mut out) };
+    Some(out)
+}
+
+/// Whether a memory info denotes non-host (device) memory.
+///
+/// # Safety
+///
+/// `api` and `mem_info` must be valid.
+unsafe fn mem_info_is_device(api: &ort::OrtApi, mem_info: *const ort::OrtMemoryInfo) -> bool {
+    matches!(
+        unsafe { mem_info_device_type(api, mem_info) },
+        Some(t) if t != ort::OrtMemoryInfoDeviceType_CPU
+    )
+}
+
+/// Node-operand positions that a kernel legitimately reads on **host** — the
+/// shape/index/axes control operands `infer_shapes` dereferences via
+/// `read_i64_tensor`. These are the `OrtMemTypeCPUInput`-style operands that
+/// must **never** be uploaded to the device: they are supposed to stay on host,
+/// and staging them would both waste a copy and hand the host-reading path a
+/// device pointer. Every other host-resident input of a device kernel is a data
+/// operand that crossed a CPU→device boundary and must be staged (#982).
+fn host_operand_indices(strategy: &ShapeInference) -> &'static [usize] {
+    match strategy {
+        ShapeInference::ReshapeData { .. } => &[1],
+        ShapeInference::SliceData => &[1, 2, 3, 4],
+        ShapeInference::ReductionFromInput { .. } => &[1],
+        _ => &[],
+    }
+}
+
+/// Stage every host-resident **data** operand of one node into device scratch,
+/// substituting the device pointer into `kernel_inputs` in place (#982).
+///
+/// For each operand position `p`:
+///  - skipped if it is not ORT-bound (`ort_indices[p]` is `None`) — intermediate
+///    buffers already live on the device;
+///  - skipped if it is a host-required control operand (`host_operands`);
+///  - skipped if absent or zero-length;
+///  - skipped if ORT already placed it on the device.
+///
+/// A host-resident data operand is uploaded into ORT device scratch (freed by
+/// ORT after `Compute`, past the stream sync, so the async kernel that reads it
+/// cannot outlive the buffer) and `kernel_inputs[p].data` is repointed at it.
+///
+/// The scratch is allocated against a device `OrtMemoryInfo` resolved, in order,
+/// from: a device-resident ORT input, a device-resident node output, then the
+/// reconstructed EP device memory info. If a data operand needs staging but no
+/// device memory info can be found, this fails closed rather than launching a
+/// device kernel on a host pointer.
+///
+/// # Safety
+///
+/// `api` and `ctx` must be valid; `ort_indices[p]`, when `Some`, must be a valid
+/// kernel-context input index for `ctx`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn stage_host_boundary_inputs(
+    api: &ort::OrtApi,
+    ctx: *mut ort::OrtKernelContext,
+    staging: &DeviceStaging,
+    kernel_inputs: &mut [TensorView<'_>],
+    ort_indices: &[Option<usize>],
+    host_operands: &[usize],
+    output_mem_infos: &[*const ort::OrtMemoryInfo],
+    label: &str,
+) -> Result<(), String> {
+    // First pass: which operands are host-resident data operands needing upload?
+    let mut to_stage: Vec<usize> = Vec::new();
+    staging_log(&format!(
+        "[plugin/staging #982] {label}: enter operands={} host_operands={:?}",
+        ort_indices.len(),
+        host_operands
+    ));
+    for (p, slot) in ort_indices.iter().enumerate() {
+        let Some(ort_idx) = *slot else {
+            staging_log(&format!(
+                "[plugin/staging #982] {label}: op[{p}] skip (not ORT-bound)"
+            ));
+            continue;
+        };
+        if host_operands.contains(&p) {
+            staging_log(&format!(
+                "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (host control operand)"
+            ));
+            continue;
+        }
+        let view = &kernel_inputs[p];
+        if view.is_absent() || view.data.0.is_null() {
+            staging_log(&format!(
+                "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (absent/null)"
+            ));
+            continue;
+        }
+        let numel: usize = view.shape.iter().product();
+        if numel == 0 || view.dtype.byte_size() == 0 {
+            staging_log(&format!(
+                "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (empty)"
+            ));
+            continue;
+        }
+        let Some(mem_info) = (unsafe { ort_input_mem_info(api, ctx, ort_idx) }) else {
+            staging_log(&format!(
+                "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (no mem info)"
+            ));
+            continue;
+        };
+        let dev_type = unsafe { mem_info_device_type(api, mem_info) };
+        if unsafe { mem_info_is_device(api, mem_info) } {
+            staging_log(&format!(
+                "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (already device, dev_type={dev_type:?})"
+            ));
+            continue; // already on device — nothing to do
+        }
+        staging_log(&format!(
+            "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} HOST (dev_type={dev_type:?}) → will stage"
+        ));
+        to_stage.push(p);
+    }
+
+    if to_stage.is_empty() {
+        return Ok(());
+    }
+
+    // Resolve a device memory info to allocate scratch against.
+    let mut device_mi: *const ort::OrtMemoryInfo = std::ptr::null();
+    for slot in ort_indices.iter() {
+        if let Some(ort_idx) = *slot
+            && let Some(mi) = unsafe { ort_input_mem_info(api, ctx, ort_idx) }
+            && unsafe { mem_info_is_device(api, mi) }
+        {
+            device_mi = mi;
+            break;
+        }
+    }
+    if device_mi.is_null() {
+        for &mi in output_mem_infos {
+            if !mi.is_null() && unsafe { mem_info_is_device(api, mi) } {
+                device_mi = mi;
+                break;
+            }
+        }
+    }
+    if device_mi.is_null()
+        && let Some(recon) = staging.recon_mem_info.as_ref()
+    {
+        device_mi = recon.ptr;
+        staging_log(&format!(
+            "[plugin/staging #982] {label}: no device OrtValue found; \
+             falling back to reconstructed EP memory info recon={device_mi:?}"
+        ));
+    }
+    if device_mi.is_null() {
+        return Err(format!(
+            "{label}: a host-resident boundary input must be uploaded to the \
+             device, but no device memory info is available (no device-resident \
+             operand and no reconstructed EP memory info). Refusing to launch a \
+             device kernel on a host pointer."
+        ));
+    }
+
+    // Second pass: upload and repoint.
+    let mem_dev = unsafe { mem_info_device_type(api, device_mi) };
+    for p in to_stage {
+        let view = &kernel_inputs[p];
+        let numel: usize = view.shape.iter().product();
+        let byte_len = numel * view.dtype.byte_size();
+        let dst = unsafe { alloc_scratch(api, ctx, device_mi, byte_len) }
+            .map_err(|e| format!("{label}: staging scratch alloc failed: {e}"))?;
+        staging_log(&format!(
+            "[plugin/staging #982] {label}: staging op[{p}] byte_len={byte_len} \
+             mem_dev={mem_dev:?} dst={dst:?} — issuing host→device upload"
+        ));
+        // SAFETY: the source is a host tensor of `byte_len` contiguous bytes
+        // (ORT-provided, contiguous strides); `dst` is device scratch of the
+        // same size.
+        let src = unsafe { std::slice::from_raw_parts(view.data.0.cast::<u8>(), byte_len) };
+        unsafe { staging.copier.copy_host_to_device(src, dst) }
+            .map_err(|e| format!("{label}: host→device upload failed: {e}"))?;
+        staging_log(&format!(
+            "[plugin/staging #982] {label}: op[{p}] host→device upload complete"
+        ));
+        kernel_inputs[p].data = DevicePtr(dst.cast_const());
+    }
+
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1588,17 +2173,58 @@ unsafe extern "C" fn compute_execute(
             return fail_status("Compute: no kernels compiled for this subgraph");
         }
 
+        staging_log(&format!(
+            "[plugin/staging #982] compute_execute enter: entries={} routing={} device_staging={}",
+            exported.entries.len(),
+            exported.routing.is_some(),
+            exported.device_staging.is_some()
+        ));
+
         let api = crate::status::host_api();
         if api.is_null() {
             return fail_status("Compute: host ORT API not available");
         }
         let api_ref = unsafe { &*api };
 
+        // Lend ORT's intra-op pool to the kernels for this call. Ours would be
+        // a second pool on the same cores, and ORT's workers spin: at
+        // `intra_op = 16`, splitting a 1 Mi `Sqrt` across our rayon pool cost
+        // 252 -> 777 us against staying serial. Dropped at the end of the
+        // call, before `kernel_context` goes away.
+        //
+        // SAFETY: `kernel_context` is the context ORT handed this call and
+        // stays valid until it returns, which is after the guard is dropped.
+        let _host_pool = unsafe {
+            crate::host_pool::install(api_ref, kernel_context, &exported.host_pool_probe)
+        };
+
         // Memory info for intermediate scratch. On a device EP this is device
         // memory, so multi-node intermediates stay on the GPU (a host buffer
         // would make the next kernel dereference a host pointer as device →
         // CUDA_ERROR_ILLEGAL_ADDRESS). `None` falls back to host buffers.
-        let scratch_mem_info = unsafe { device_mem_info(api_ref, kernel_context) };
+        let scratch_mem_info =
+            unsafe { device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref()) };
+
+        // Where a routed subgraph's *intermediates* are allocated.
+        //
+        // Device memory is not optional: a device kernel handed a host pointer
+        // dereferences it as device memory. Host memory is different — the
+        // intermediate only has to be readable by the next kernel on this
+        // thread, and `KernelContext_GetScratchBuffer` is a much worse way to
+        // get it than the Rust allocator. ORT's host scratch goes through an
+        // aligned allocation that glibc always services with a fresh `mmap`
+        // for buffers of this size, so every intermediate is a new mapping,
+        // first-touch page-faulted while the kernel writes it and unmapped at
+        // the end of the `Run`. Measured on an 8-node f32 `Relu` chain of
+        // 262144 elements (1 MiB per intermediate), one thread: 3246 us
+        // through ORT scratch vs 383 us through host buffers, an 8.5x
+        // difference on identical kernels, against ORT's own 220 us for the
+        // same graph. So: device memory when the resolved memory info is a
+        // device, host buffers otherwise.
+        let intermediate_scratch = match scratch_mem_info {
+            Some(mem_info) if unsafe { mem_info_is_device(api_ref, mem_info) } => Some(mem_info),
+            _ => None,
+        };
 
         let inputs = match unsafe { read_inputs(api_ref, kernel_context) } {
             Ok(v) => v,
@@ -1618,6 +2244,13 @@ unsafe extern "C" fn compute_execute(
                 .num_intermediate_buffers)
                 .map(|_| None)
                 .collect();
+
+            // Last node that reads each intermediate buffer. A buffer whose
+            // last reader has run is dead and its storage can be handed
+            // straight back to the next allocation, so a chain of N nodes
+            // cycles a couple of buffers instead of touching N fresh ones.
+            let last_reader =
+                last_reader_per_buffer(&routing.input_sources, routing.num_intermediate_buffers);
 
             for (node_idx, entry) in exported.entries.iter().enumerate() {
                 let sources = &routing.input_sources[node_idx];
@@ -1753,21 +2386,51 @@ unsafe extern "C" fn compute_execute(
                     }
                 }
 
+                // Stage host-resident boundary inputs onto the device before
+                // this node launches (#982). Buffer/absent operands are skipped
+                // inside the helper (only ORT-bound inputs can be host
+                // boundaries); host-required control operands are excluded.
+                if let Some(staging) = exported.device_staging.as_ref() {
+                    let ort_indices: Vec<Option<usize>> = sources
+                        .iter()
+                        .map(|src| match src {
+                            NodeInputSource::Ort(i) => Some(*i),
+                            NodeInputSource::Buffer(_) | NodeInputSource::Absent => None,
+                        })
+                        .collect();
+                    let output_mem_infos: Vec<*const ort::OrtMemoryInfo> =
+                        ort_outputs.iter().map(|o| o.mem_info).collect();
+                    if let Err(e) = unsafe {
+                        stage_host_boundary_inputs(
+                            api_ref,
+                            kernel_context,
+                            staging,
+                            &mut kernel_inputs,
+                            &ort_indices,
+                            host_operand_indices(&entry.shape_inference),
+                            &output_mem_infos,
+                            &format!("Compute: node {node_idx}"),
+                        )
+                    } {
+                        return fail_status(&e);
+                    }
+                }
+
                 // Build mutable output views: ORT outputs first, then buffer outputs.
                 let mut ort_out_views: Vec<_> =
                     ort_outputs.iter_mut().map(|o| o.view_mut()).collect();
 
                 // For buffer-sink outputs, allocate the IntermediateBuf and get a
-                // mutable pointer into it. Prefer ORT scratch memory (device
-                // memory on a device EP) so intermediates live where the kernels
-                // execute; fall back to a host buffer only when no device memory
-                // info is available (e.g. the CPU EP or an input-less subgraph).
+                // mutable pointer into it. Device EPs take ORT scratch memory so
+                // intermediates live where the kernels execute; host EPs take a
+                // plain host buffer, which is both correct and measurably faster
+                // than ORT's host scratch allocator (see `intermediate_scratch`).
                 let mut new_bufs: Vec<(usize, IntermediateBuf)> = Vec::new();
                 for (buf_idx, shape, dtype) in &buf_writes {
                     let numel: usize = shape.iter().product();
                     let byte_len = dtype.byte_size() * numel;
                     let strides = contiguous_strides(shape);
-                    let (data, scratch_ptr) = match scratch_mem_info {
+                    let (data, scratch_ptr) = match intermediate_scratch {
                         Some(mem_info) => {
                             match unsafe {
                                 alloc_scratch(api_ref, kernel_context, mem_info, byte_len)
@@ -1780,7 +2443,7 @@ unsafe extern "C" fn compute_execute(
                                 }
                             }
                         }
-                        None => (vec![0u8; byte_len], std::ptr::null_mut()),
+                        None => (take_host_intermediate(byte_len), std::ptr::null_mut()),
                     };
                     new_bufs.push((
                         *buf_idx,
@@ -1875,6 +2538,7 @@ unsafe extern "C" fn compute_execute(
                 ) {
                     return fail_status(&format!("Compute: kernel execution failed: {e}"));
                 }
+                EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
 
                 // Store new intermediate buffers.
                 for (buf_idx, buf) in new_bufs {
@@ -1883,22 +2547,56 @@ unsafe extern "C" fn compute_execute(
                             "Compute: buffer index {buf_idx} out of range"
                         ));
                     }
+                    if let Some(stale) = intermediates[buf_idx].take() {
+                        recycle_host_intermediate(stale.data);
+                    }
                     intermediates[buf_idx] = Some(buf);
                 }
+
+                // Retire every buffer this node was the last reader of. Doing
+                // it here — rather than at the end of the subgraph — is what
+                // lets the next node's allocation land on storage that is
+                // still hot in cache.
+                for (buf_idx, last) in last_reader.iter().enumerate() {
+                    if *last == Some(node_idx)
+                        && let Some(dead) = intermediates[buf_idx].take()
+                    {
+                        recycle_host_intermediate(dead.data);
+                    }
+                }
+            }
+
+            for slot in intermediates.drain(..).flatten() {
+                recycle_host_intermediate(slot.data);
             }
         } else if exported.entries.len() == 1 {
             // ── Fast path: single-kernel subgraph ─────────────────────────
             let entry = &exported.entries[0];
             // Reconstruct positional inputs with absent sentinels so the
             // kernel sees the correct arity and position.
-            let kernel_inputs: Vec<_> = entry
-                .input_slots
-                .iter()
-                .map(|slot| match slot {
-                    Some(ort_idx) => inputs[*ort_idx].view(),
-                    None => TensorView::absent(DataType::Undefined),
-                })
-                .collect();
+            // Fail closed rather than indexing: a slot beyond ORT's input
+            // count means the compile-time slot map and the runtime binding
+            // disagree, and panicking across the C ABI inside `Compute` turns
+            // that into an opaque "internal panic" instead of a diagnosable
+            // session error.
+            let mut kernel_inputs: Vec<TensorView<'_>> =
+                Vec::with_capacity(entry.input_slots.len());
+            for (position, slot) in entry.input_slots.iter().enumerate() {
+                match slot {
+                    Some(ort_idx) => match inputs.get(*ort_idx) {
+                        Some(input) => kernel_inputs.push(input.view()),
+                        None => {
+                            return fail_status(&format!(
+                                "Compute: input slot {position} maps to ORT input \
+                                 {ort_idx}, but ORT bound only {} input(s) to this \
+                                 fused node",
+                                inputs.len()
+                            ));
+                        }
+                    },
+                    None => kernel_inputs.push(TensorView::absent(DataType::Undefined)),
+                }
+            }
             let output_shapes = match infer_shapes(&entry.shape_inference, &kernel_inputs) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1962,6 +2660,27 @@ unsafe extern "C" fn compute_execute(
                     Err(e) => return fail_status(&format!("Compute: {e}")),
                 }
                 ort_out_idx += 1;
+            }
+            // Stage host-resident boundary inputs onto the device before the
+            // kernel launches (#982). No-op for a host EP (device_staging is
+            // None) or when every operand already lives where it should.
+            if let Some(staging) = exported.device_staging.as_ref() {
+                let output_mem_infos: Vec<*const ort::OrtMemoryInfo> =
+                    owned_outputs.iter().map(|o| o.mem_info).collect();
+                if let Err(e) = unsafe {
+                    stage_host_boundary_inputs(
+                        api_ref,
+                        kernel_context,
+                        staging,
+                        &mut kernel_inputs,
+                        &entry.input_slots,
+                        host_operand_indices(&entry.shape_inference),
+                        &output_mem_infos,
+                        "Compute: node 0",
+                    )
+                } {
+                    return fail_status(&e);
+                }
             }
             // Build output views in node-output order so the kernel sees the
             // full arity including absent scratch slots.
@@ -2035,6 +2754,7 @@ unsafe extern "C" fn compute_execute(
             {
                 return fail_status(&format!("Compute: kernel execution failed: {e}"));
             }
+            EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
         } else {
             return fail_status(
                 "Compute: multi-node subgraph requires SubgraphRouting — \
@@ -2048,6 +2768,124 @@ unsafe extern "C" fn compute_execute(
 }
 
 /// Build a contiguous stride array from a shape (C-order, innermost stride = 1).
+/// How many retired host intermediates one thread keeps for reuse.
+///
+/// A routed subgraph's live set is bounded by its widest cut, which is small
+/// for the elementwise chains this path actually sees. Eight slots cover those
+/// without letting a pathological graph pin an unbounded amount of memory: past
+/// the cap, retired buffers are simply dropped.
+const HOST_INTERMEDIATE_POOL_SLOTS: usize = 8;
+
+thread_local! {
+    /// Retired host intermediate storage, per thread.
+    ///
+    /// Thread-local rather than shared: `Compute` runs on whichever thread ORT
+    /// calls it from, and a shared pool would need a lock on the hot path to
+    /// buy nothing — buffers are only ever reused by the call that retired
+    /// them or a later call on the same thread.
+    static HOST_INTERMEDIATE_POOL: std::cell::RefCell<Vec<Vec<u8>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Storage for one host intermediate of `len` bytes, reusing a retired buffer
+/// when one is large enough.
+///
+/// The returned bytes are initialized but **not** guaranteed to be zero when a
+/// retired buffer is reused. That is deliberate, and it is not a weakening of
+/// what kernels may assume: an output routed to an ORT sink already arrives as
+/// whatever `KernelContext_GetOutput` handed back, which ORT does not zero, and
+/// the single-kernel path has always worked that way. Producing the same
+/// contract for buffer sinks makes a kernel that fails to write its whole
+/// output fail the same way wherever it sits in a partition, instead of only
+/// when it happens to be the last node. Re-zeroing on every reuse costs a full
+/// `memset` of the tensor — measured at 0.586x of ORT for an 8-node 1 MiB f32
+/// `Relu` chain against 0.801x without it.
+///
+/// Debug builds do fill reused storage, with a poison pattern rather than
+/// zeros, so a kernel that leaves part of its output unwritten fails loudly in
+/// tests instead of inheriting something plausible.
+fn take_host_intermediate(len: usize) -> Vec<u8> {
+    HOST_INTERMEDIATE_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        match pool.iter().position(|buf| buf.capacity() >= len) {
+            Some(pos) => {
+                let mut buf = pool.swap_remove(pos);
+                if buf.len() < len {
+                    buf.resize(len, 0);
+                } else {
+                    buf.truncate(len);
+                }
+                // Debug builds hand back a poison pattern rather than whatever
+                // the previous tenant left. A kernel that fails to write part
+                // of its output then produces an obviously wrong value in every
+                // test run instead of a plausible stale one, which is the
+                // failure this relaxation would otherwise make quieter. `0xFF`
+                // because it is the loudest pattern available: it reads as NaN
+                // in every float width and as -1 in every signed integer width,
+                // so it survives a tolerance comparison. Release builds skip
+                // it — that write is the whole cost being avoided.
+                #[cfg(debug_assertions)]
+                buf.fill(0xFF);
+                buf
+            }
+            None => vec![0u8; len],
+        }
+    })
+}
+
+/// Hand a dead host intermediate back for reuse.
+///
+/// Buffers backed by ORT scratch have an empty `data` vector — they carry a
+/// borrowed `scratch_ptr` instead — so they are dropped here rather than
+/// pooled.
+fn recycle_host_intermediate(buf: Vec<u8>) {
+    if buf.capacity() == 0 {
+        return;
+    }
+    HOST_INTERMEDIATE_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < HOST_INTERMEDIATE_POOL_SLOTS {
+            pool.push(buf);
+        }
+    });
+}
+
+/// Empty this thread's pool.
+///
+/// Only for tests: the pool is per-thread, and libtest may run several tests on
+/// one thread, so a test that asserts *which* buffer comes back has to start
+/// from a known state rather than inherit whatever an earlier test retired.
+#[cfg(test)]
+fn drain_host_intermediate_pool() {
+    HOST_INTERMEDIATE_POOL.with(|pool| pool.borrow_mut().clear());
+}
+
+/// For each intermediate buffer, the highest node index that reads it, or
+/// `None` when no node does.
+///
+/// `None` covers two real cases: a buffer index no node consumes (the producer
+/// also routes that output to an ORT sink), and an out-of-range index in a
+/// malformed routing table. Both mean "nothing keeps this alive", which is the
+/// conservative answer for a liveness bound — a buffer is retired only after
+/// its recorded last reader has run, so a missing entry can never retire a
+/// buffer early.
+fn last_reader_per_buffer(
+    input_sources: &[Vec<NodeInputSource>],
+    num_buffers: usize,
+) -> Vec<Option<usize>> {
+    let mut last = vec![None; num_buffers];
+    for (node_idx, sources) in input_sources.iter().enumerate() {
+        for src in sources {
+            if let NodeInputSource::Buffer(b) = src
+                && let Some(slot) = last.get_mut(*b)
+            {
+                *slot = Some(node_idx);
+            }
+        }
+    }
+    last
+}
+
 fn contiguous_strides(shape: &[usize]) -> Vec<i64> {
     let mut strides = vec![1i64; shape.len()];
     for i in (0..shape.len().saturating_sub(1)).rev() {
@@ -2163,6 +3001,30 @@ fn infer_shapes(
             let a = inputs[0].shape;
             let b = inputs[1].shape;
             let shape = matmul_output_shape(a, b)?;
+            Ok(vec![shape])
+        }
+
+        ShapeInference::MatMulNBits { n } => {
+            let a = inputs
+                .first()
+                .ok_or_else(|| "MatMulNBits: expected >=1 input, got 0".to_string())?
+                .shape;
+            if a.is_empty() {
+                return Err("MatMulNBits: activation must have rank >= 1".to_string());
+            }
+            let mut shape = a.to_vec();
+            *shape.last_mut().expect("rank checked above") = *n;
+            Ok(vec![shape])
+        }
+
+        ShapeInference::QLinearMatMul => {
+            if inputs.len() < 4 {
+                return Err(format!(
+                    "QLinearMatMul: expected >=4 inputs (a, a_scale, a_zero_point, b), got {}",
+                    inputs.len()
+                ));
+            }
+            let shape = matmul_output_shape(inputs[0].shape, inputs[3].shape)?;
             Ok(vec![shape])
         }
 
@@ -2586,6 +3448,96 @@ fn infer_shapes(
             Ok(vec![inputs[0].shape.to_vec()])
         }
 
+        ShapeInference::MsftAttention {
+            v_hidden,
+            num_heads,
+            num_outputs,
+        } => {
+            // input(0):   [B, S, input_hidden]   (unprojected activation)
+            // input(1):   [input_hidden, q_hidden + k_hidden + v_hidden]
+            // output(0):  [B, S, v_hidden]
+            // output(1):  present [2, B, num_heads, P + S, head_size]
+            if inputs.len() < 2 {
+                return Err("Attention: expected at least input and weights".into());
+            }
+            let x = inputs[0].shape;
+            if x.len() != 3 {
+                return Err(format!("Attention: input rank must be 3, got {}", x.len()));
+            }
+            let weights = inputs[1].shape;
+            if weights.len() != 2 {
+                return Err(format!(
+                    "Attention: weights rank must be 2, got {}",
+                    weights.len()
+                ));
+            }
+            // Without `qkv_hidden_sizes` the projection is split three ways, so
+            // an indivisible width is a malformed node rather than something to
+            // round.
+            let v = match v_hidden {
+                Some(v) => *v,
+                None => {
+                    if !weights[1].is_multiple_of(3) {
+                        return Err(format!(
+                            "Attention: weights dim1 {} is not divisible by 3 and \
+                             qkv_hidden_sizes is absent",
+                            weights[1]
+                        ));
+                    }
+                    weights[1] / 3
+                }
+            };
+            let mut outputs = vec![vec![x[0], x[1], v]];
+
+            if *num_outputs > 1 {
+                if *num_heads == 0 {
+                    return Err(
+                        "Attention: num_heads is required to shape the present output".into(),
+                    );
+                }
+                if !v.is_multiple_of(*num_heads) {
+                    return Err(format!(
+                        "Attention: v_hidden {v} is not divisible by num_heads {num_heads}"
+                    ));
+                }
+                let head_size = v / num_heads;
+                // `past` is input(4): [2, B, num_heads, past_seq, head_size].
+                let past_seq = inputs
+                    .get(4)
+                    .map(|p| if p.shape.len() >= 5 { p.shape[3] } else { 0 })
+                    .unwrap_or(0);
+                let present = vec![2, x[0], *num_heads, past_seq + x[1], head_size];
+                for _ in 1..*num_outputs {
+                    outputs.push(present.clone());
+                }
+            }
+            Ok(outputs)
+        }
+
+        ShapeInference::PackedMultiHeadAttention => {
+            // Tokens are packed with padding removed, so the output is rank-2:
+            // [token_count, v_hidden] = [query.dim0, value.dim1]. Neither dim
+            // can be read off input[0] alone, which is why this is not
+            // `SameAsInput(0)`.
+            if inputs.len() < 3 {
+                return Err(
+                    "PackedMultiHeadAttention: expected at least query, key and value".into(),
+                );
+            }
+            let q = inputs[0].shape;
+            let v = inputs[2].shape;
+            if q.is_empty() {
+                return Err("PackedMultiHeadAttention: query must not be rank-0".into());
+            }
+            if v.len() < 2 {
+                return Err(format!(
+                    "PackedMultiHeadAttention: value rank must be >= 2, got {}",
+                    v.len()
+                ));
+            }
+            Ok(vec![vec![q[0], v[1]]])
+        }
+
         ShapeInference::AttentionStd {
             q_num_heads,
             kv_num_heads,
@@ -2886,6 +3838,89 @@ unsafe extern "C" fn compute_release_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Matmul-family shape rules ─────────────────────────────────────────────
+    //
+    // These are the hardware-independent falsifiers for the two shape rules
+    // that decide whether `MatMulNBits` and `QLinearMatMul` can be claimed at
+    // all: `GetCapability` drops any claim whose strategy is `Declined`, and a
+    // wrong strategy is worse than none because it produces a plausible but
+    // incorrect output buffer.
+
+    fn u8_view<'a>(shape: &'a [usize], strides: &'a [i64]) -> TensorView<'a> {
+        TensorView::new(
+            DevicePtr(std::ptr::null()),
+            DataType::Uint8,
+            shape,
+            strides,
+            DeviceId::cpu(),
+        )
+    }
+
+    #[test]
+    fn matmul_nbits_shape_uses_the_n_attribute_not_the_packed_weight() {
+        // B is [N, blocks_per_col, blob_bytes] — nothing about its trailing
+        // dims is a matmul operand, so N must come from the attribute.
+        let a = view(&[1, 256], &[256, 1]);
+        let b = u8_view(&[4096, 8, 16], &[128, 16, 1]);
+        let scales = view(&[4096 * 8], &[1]);
+
+        let shapes = infer(&ShapeInference::MatMulNBits { n: 4096 }, &[a, b, scales])
+            .expect("MatMulNBits shape inference");
+        assert_eq!(shapes, vec![vec![1, 4096]]);
+
+        // Aliasing this op to plain `MatMul` — which is what the table used to
+        // do — broadcasts the activation against the *packed* weight and
+        // yields a wrong-rank, wrong-extent buffer. Pin the bad answer so the
+        // alias cannot come back unnoticed.
+        let wrong = infer(&ShapeInference::MatMul, &[a, b, scales])
+            .expect("plain MatMul over a packed weight");
+        assert_eq!(wrong, vec![vec![4096, 1, 16]]);
+        assert_ne!(wrong, vec![vec![1, 4096]]);
+    }
+
+    #[test]
+    fn matmul_nbits_shape_preserves_leading_activation_dims() {
+        let a = view(&[2, 3, 256], &[768, 256, 1]);
+        let b = u8_view(&[512, 8, 16], &[128, 16, 1]);
+        let shapes = infer(&ShapeInference::MatMulNBits { n: 512 }, &[a, b])
+            .expect("MatMulNBits shape inference");
+        assert_eq!(shapes, vec![vec![2, 3, 512]]);
+    }
+
+    #[test]
+    fn qlinear_matmul_shape_uses_inputs_zero_and_three() {
+        // a, a_scale, a_zero_point, b, b_scale, b_zero_point, y_scale, y_zp.
+        // Input 1 is a scalar, so a rule that read operands 0 and 1 — the
+        // plain-`MatMul` convention — could not produce [1, 4096] by accident.
+        let a = u8_view(&[1, 256], &[256, 1]);
+        let scalar = view(&[], &[]);
+        let b = u8_view(&[256, 4096], &[4096, 1]);
+        let inputs = [a, scalar, scalar, b, scalar, scalar, scalar, scalar];
+        let shapes =
+            infer(&ShapeInference::QLinearMatMul, &inputs).expect("QLinearMatMul shape inference");
+        assert_eq!(shapes, vec![vec![1, 4096]]);
+    }
+
+    #[test]
+    fn matmul_family_ops_resolve_to_their_own_strategies() {
+        assert!(matches!(
+            ShapeInference::for_op_domain("MatMul", ""),
+            ShapeInference::MatMul
+        ));
+        assert!(matches!(
+            ShapeInference::for_op_domain("QLinearMatMul", ""),
+            ShapeInference::QLinearMatMul
+        ));
+        // `MatMulNBits` needs the `N` attribute, which the op/domain-only
+        // table cannot see, so it must decline rather than fall back to the
+        // plain-matmul rule.
+        assert!(matches!(
+            ShapeInference::for_op_domain("MatMulNBits", "com.microsoft"),
+            ShapeInference::Declined { .. }
+        ));
+    }
+
     use onnx_runtime_ep_api::tensor::{DevicePtr, TensorView};
     use onnx_runtime_ir::{DataType, DeviceId};
 
@@ -2984,20 +4019,25 @@ mod tests {
     }
 
     #[test]
-    fn attention_std_for_node_reads_heads_and_declines_other_domains() {
+    fn attention_for_node_routes_each_domain_to_its_own_rule() {
         use onnx_runtime_ir::{Node, NodeId};
-        // Default-domain Attention is modelled.
+        // Default-domain Attention is the opset-23 signature.
         let node = Node::new(NodeId(0), "Attention", Vec::new(), Vec::new());
         assert!(matches!(
             ShapeInference::for_node(&node, &[], 1),
             ShapeInference::AttentionStd { .. }
         ));
-        // A foreign domain is not claimed by this arm.
+        // `com.microsoft::Attention` is a different operator -- its input is
+        // unprojected and the fused weight sets the output width -- so it must
+        // not fall into the opset-23 arm. It used to be `Declined` instead,
+        // which silently handed every node to ORT's CPU EP; it now has its own
+        // rule, and `plugin_ort_e2e`'s `msft_attention_assignment_f32` fixture
+        // is the end-to-end falsifier for that.
         let mut contrib = Node::new(NodeId(0), "Attention", Vec::new(), Vec::new());
         contrib.domain = "com.microsoft".into();
         assert!(matches!(
             ShapeInference::for_node(&contrib, &[], 1),
-            ShapeInference::Declined { .. }
+            ShapeInference::MsftAttention { .. }
         ));
     }
 
@@ -3713,6 +4753,124 @@ mod tests {
             NodeInputSource::Buffer(0)
         ));
         assert!(matches!(routing.output_sinks[1][0], NodeOutputSink::Ort(0)));
+    }
+
+    // ── Intermediate buffer liveness and recycling ────────────────────────────
+
+    #[test]
+    fn last_reader_marks_the_final_consumer_of_each_buffer() {
+        // node0: ORT[0] → Buffer[0]; node1: Buffer[0] → Buffer[1];
+        // node2: Buffer[1] → ORT[0]. Buffer 0 dies after node1, buffer 1 after
+        // node2.
+        let sources = vec![
+            vec![NodeInputSource::Ort(0)],
+            vec![NodeInputSource::Buffer(0)],
+            vec![NodeInputSource::Buffer(1)],
+        ];
+        assert_eq!(
+            super::last_reader_per_buffer(&sources, 2),
+            vec![Some(1), Some(2)]
+        );
+    }
+
+    #[test]
+    fn last_reader_takes_the_highest_index_when_a_buffer_is_read_twice() {
+        // A buffer feeding both a later node and a much later node must stay
+        // alive until the *last* one has run, or the second read sees storage
+        // that has already been handed to another node.
+        let sources = vec![
+            vec![NodeInputSource::Ort(0)],
+            vec![NodeInputSource::Buffer(0)],
+            vec![NodeInputSource::Ort(1)],
+            vec![NodeInputSource::Buffer(0), NodeInputSource::Buffer(1)],
+        ];
+        assert_eq!(
+            super::last_reader_per_buffer(&sources, 2),
+            vec![Some(3), Some(3)]
+        );
+    }
+
+    #[test]
+    fn last_reader_is_none_for_unread_and_out_of_range_buffers() {
+        // Buffer 1 is never read (its producer also routes the output to ORT),
+        // and buffer 7 does not exist. Neither may be reported as live.
+        let sources = vec![
+            vec![NodeInputSource::Ort(0)],
+            vec![NodeInputSource::Buffer(0), NodeInputSource::Buffer(7)],
+            vec![NodeInputSource::Absent],
+        ];
+        assert_eq!(
+            super::last_reader_per_buffer(&sources, 2),
+            vec![Some(1), None]
+        );
+    }
+
+    #[test]
+    fn recycled_intermediate_storage_is_reused_without_reallocating() {
+        super::drain_host_intermediate_pool();
+        // The point of the pool is address reuse: a retired buffer must come
+        // back on the next request of the same size, so a chain of nodes keeps
+        // rewriting storage that is still in cache.
+        let first = super::take_host_intermediate(4096);
+        let addr = first.as_ptr() as usize;
+        super::recycle_host_intermediate(first);
+        let second = super::take_host_intermediate(4096);
+        assert_eq!(second.as_ptr() as usize, addr);
+        assert_eq!(second.len(), 4096);
+        super::recycle_host_intermediate(second);
+    }
+
+    #[test]
+    fn a_recycled_buffer_serves_a_smaller_request_at_the_requested_length() {
+        super::drain_host_intermediate_pool();
+        let big = super::take_host_intermediate(8192);
+        let addr = big.as_ptr() as usize;
+        super::recycle_host_intermediate(big);
+        let small = super::take_host_intermediate(64);
+        assert_eq!(small.as_ptr() as usize, addr);
+        // Length is what the caller asked for — `byte_len` bounds every
+        // `from_raw_parts` built from this buffer, so an over-long slice would
+        // be a real out-of-bounds view.
+        assert_eq!(small.len(), 64);
+        super::recycle_host_intermediate(small);
+    }
+
+    #[test]
+    fn a_request_larger_than_every_pooled_buffer_allocates_fresh_zeroed_storage() {
+        super::drain_host_intermediate_pool();
+        let seed = super::take_host_intermediate(32);
+        super::recycle_host_intermediate(seed);
+        let big = super::take_host_intermediate(1 << 20);
+        assert_eq!(big.len(), 1 << 20);
+        assert!(big.iter().all(|b| *b == 0));
+        super::recycle_host_intermediate(big);
+    }
+
+    #[test]
+    fn scratch_backed_buffers_are_not_pooled() {
+        super::drain_host_intermediate_pool();
+        // A scratch-backed IntermediateBuf carries an empty `data` vector and a
+        // borrowed pointer it does not own. Pooling that empty vector would
+        // fill a slot with nothing usable.
+        super::recycle_host_intermediate(Vec::new());
+        let taken = super::take_host_intermediate(16);
+        assert_eq!(taken.len(), 16);
+        assert!(taken.capacity() >= 16);
+        super::recycle_host_intermediate(taken);
+    }
+
+    #[test]
+    fn the_pool_is_bounded() {
+        super::drain_host_intermediate_pool();
+        let bufs: Vec<Vec<u8>> = (0..super::HOST_INTERMEDIATE_POOL_SLOTS * 4)
+            .map(|_| super::take_host_intermediate(128))
+            .collect();
+        for b in bufs {
+            super::recycle_host_intermediate(b);
+        }
+        super::HOST_INTERMEDIATE_POOL.with(|pool| {
+            assert!(pool.borrow().len() <= super::HOST_INTERMEDIATE_POOL_SLOTS);
+        });
     }
 
     // ── CreateState / ReleaseState lifecycle ──────────────────────────────────

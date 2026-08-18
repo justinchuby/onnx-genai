@@ -1,0 +1,141 @@
+# Absorbing MLAS: reference implementation, not dependency
+
+**Direction, set 2026-08-16:** we do not bundle MLAS by default. We progressively
+absorb its optimizations into our own native kernels. MLAS stays in the tree as a
+*measurement reference* — a second implementation in the same process that lets us
+measure exactly how far our kernel is from a good one — and nothing ships behind
+it.
+
+## Why this became necessary
+
+A run of PRs won large CPU speedups by routing kernels to MLAS. None of them
+reached a default build: `mlas` is optional in `onnx-runtime-ep-cpu` and is absent
+from the default features of both the CLI and the server, and the CPU kernels
+carry the routes behind `#[cfg(feature = "mlas")]`.
+
+No individual PR did anything wrong — each was measured honestly with
+`--features mlas`, and several said so. The problem was cumulative and structural:
+**the configuration we measured was not the configuration we shipped**, and nothing
+in the process noticed. Tracked as #1091.
+
+There is a second reason, visible only on large models. The MLAS int4 route holds a
+packed weight copy at roughly 2× the int4 bytes. On a 14B model that is predicted at
+16.7 GB, over the residency ceiling, so the memory plan declines it (#1051) and the
+model gets nothing. **The model that most needs the speed is the one that cannot
+afford the memory.** A technique that allocates nothing is available everywhere,
+including where a budget refuses everything else.
+
+## The method that works
+
+1. **Keep both paths in one binary**, behind a same-binary A/B environment toggle.
+   This is the step that makes everything else possible: without both
+   implementations in one process, on one host, under one load, the gap is not
+   measurable and every absorption would be asserted rather than verified.
+2. **Measure the gap in process CPU time**, never wall clock. This host varies
+   enough that identical configurations have measured 39.3 / 25.8 / 16.1 s wall
+   while `TotalProcessorTime` reproduced to ~2%. Report peak RSS beside every
+   timing, polled by PID while the process runs.
+3. **Read the reference against ours to find the mechanism.** Not to copy code —
+   to answer "why is it faster", in terms specific enough to port.
+4. **Port the mechanism, not the dependency**, and re-measure in a build that does
+   *not* have the `mlas` feature, because that is what users run.
+
+Step 3 is where the value is. The instinct is to skip to "prepack like they do",
+which usually reintroduces the memory cost that made the dependency unattractive.
+
+### The intermediate finding is the deliverable
+
+Three absorptions in a row have found something different from what the brief
+predicted, and in all three the correction was worth more than the patch:
+
+| task | the brief predicted | measurement found |
+|---|---|---|
+| #1104 int4 decode | the win is **layout**, so a transient packing tile would be needed | **register/N-blocking** — no packing of any kind needed |
+| #1116 dense f32 | a **4.4× prefill gap** per #1045 | prefill already at 0.57–1.05× of MLAS; the entire gap is **M=1** |
+| #1126 int4 prefill | the cost is **missing GEMM blocking** | the reliable win is **per-row dispatch and allocation overhead**; blocking is at the noise floor |
+
+The lesson is not "briefs are unreliable" — each hypothesis was specific enough
+to direct a measurement that could refute it, which is exactly what a hypothesis
+is for. "Prefill is slow" would have produced nothing. The lesson is that the
+port should be written **after** the mechanism is known, and that an agent
+reporting "your hypothesis was wrong, here is what I measured instead" is
+delivering the most valuable part of the task, not failing it.
+
+Ask for the mechanism before the kernel. It is cheap to change a plan at that
+point and expensive afterwards — #1104's transient-tile design was abandoned as
+unnecessary rather than built and then found unnecessary.
+
+## Case study: int4 decode (#1104)
+
+The gap on `MatMulNBits` int4 `accuracy_level=0` decode was **2.68×** before #1021
+vectorised our borrowed path, and **1.25×** after. #1104 closed roughly 83% of what
+remained.
+
+The mechanism turned out to be **register/N-blocking, not layout**:
+
+| | ours (before) | MLAS |
+|---|---|---|
+| output columns per pass | 1 | 4 |
+| accumulators | 1 | 4 |
+| activation vector loads | reloaded per column | loaded once, reused across the group |
+| horizontal reduction | per block | one per column |
+
+Only the shuffle-free nibble unpack is tied to MLAS's prepacked buffer, and that
+contribution measured **under the noise floor**. So the port needed no repack and
+no resident copy.
+
+Measured on a build **without** the `mlas` feature, process CPU time, peak RSS
+polled by PID:
+
+| model | before | after | gain | peak RSS |
+|---|---|---|---|---|
+| qwen05b-symzp | 0.763 CPU s/tok | 0.560 | 1.36× | unchanged |
+| qwen14b-symzp | 14.24 CPU s/tok | 9.14 | **1.56×** | 8196 → 8155 MB |
+
+Output byte-identical on symmetric, asymmetric and 14B models.
+
+**The methodological lesson is the durable part.** The brief for that task assumed
+the win was layout, and proposed a transient per-thread packing tile as the way to
+get locality without a resident copy. Measuring first showed the assumption was
+wrong and made the workaround unnecessary rather than clever. A measured "this is
+not worth building" is a good outcome and is harder to report than a patch.
+
+## Ledger
+
+| technique | measured with MLAS | status |
+|---|---|---|
+| int4 acc0 decode (#1027) | up to 33× vs the old scalar path | **absorbed** (#1104) |
+| dense f32 M=1 GEMV (#1045) | claimed 4.4×; **does not reproduce** — see below | **absorbed** (#1116) |
+| QLinearMatMul integer GEMM (#1058, #1086) | 5–6× | not started |
+| acc-4 M=1 decode gating (#1028) | up to 15× | not started; win is specific to hosts *without* VNNI, so it is unmeasurable on an AVX-VNNI box |
+| MLAS pool sees the EP thread budget (#1054) | — | ours already; nothing to absorb |
+
+**On #1045's 4.4×:** it does not reproduce on the RTX 4060 laptop box. Measured
+with the toggle off, `simd/mlas` is 0.57–1.05× at M=128 — we were already at or
+ahead of MLAS at prefill shapes — while M=1 shapes were 1.71–2.82× behind. The
+entire reproducible gap was decode. #1116 closed it by *removing* work: MLAS
+declines to pack B at M==1 because "the data from matrix B is not referenced
+multiple times, so using a local packed buffer is a wasted memory copy", while
+`sgemm_simd` packed unconditionally. Inheriting the 4.4× figure would have sent
+someone optimising prefill, which was not the problem.
+
+Note on #1086's signedness translation: that one is **arithmetic, not MLAS**.
+Because the kernel computes `sum_k (a_k - za)(b_k - zb)`, shifting an operand and
+its zero point by the same constant leaves every `i32` accumulator bit-identical,
+so an unsupported `u8 × i8` combination can be moved into the supported unsigned
+domain exactly. It ports directly into a native kernel and should.
+
+## Constraints that apply to every absorption
+
+- **Any resident buffer must be governed** under #1056: declared to the memory plan
+  before allocation, in the bytes actually allocated, and declinable. Use
+  `GovernedWeightCache<T>`; a new bare `OnceLock` buffer is flagged by
+  `.github/workflows/weight-cache-guard.yml`.
+- **Anything cached per kernel instance is retained at least twice.** The
+  executor's `KernelCache` is shape-keyed, so prefill (`m > 1`) and decode
+  (`m == 1`) are separate instances with separate caches. Prefer a process-global
+  cache keyed on weight identity, cleared at `Executor` drop.
+- **Byte-identity is the default requirement.** An f32 GEMM change alters
+  accumulation order and may not preserve it; if it cannot, quantify the deviation
+  against a reference and say so. A numerical change shipped as a performance
+  change is how a correctness regression enters unnoticed.

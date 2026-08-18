@@ -129,6 +129,15 @@ PR*.md
 # Scratch buffers used when moving a block of code between files.
 .block.txt
 
+# Quartz wiki site build state. The engine and lockfiles are committed under
+# site/quartz; dependencies, installed plugins, caches, and output are not.
+/site/quartz/node_modules/
+/site/quartz/public/
+/site/quartz/.quartz/
+/site/quartz/.quartz-cache/
+/site/quartz/**/.quartz-cache/
+/site/quartz/tsconfig.tsbuildinfo
+
 # seq-major microbenchmark scratch crate
 /bench-seqmajor/target/
 bench-bins/

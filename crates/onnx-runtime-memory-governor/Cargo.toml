@@ -11,5 +11,12 @@ categories = ["memory-management", "science"]
 [dependencies]
 thiserror = { workspace = true }
 
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "large_alloc_cache"
+harness = false
+
 [lints]
 workspace = true

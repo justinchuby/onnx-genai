@@ -120,6 +120,152 @@ static FLOAT_DTYPES: &[DataType] = &[
 /// Fail-closed default: only f32.
 static F32_ONLY: &[DataType] = &[DataType::Float32];
 
+/// Every dtype that appears on a `com.microsoft::MatMulNBits` edge.
+///
+/// This op is block-quantized, so it is *inherently* mixed-dtype: `A`, `scales`,
+/// the optional `bias` and `Y` are float, `B` and the optional `zero_points` are
+/// packed `uint8`, and the optional `g_idx` is `int32`. The plugin's node filter
+/// (`node_passes_dtype_filter`) requires **every** input and output dtype of a
+/// node to appear in this list, so declaring the float set alone silently
+/// excluded the op from every claim: an int4 decode graph ran on ORT's CPU
+/// kernels even when this EP was the selected one.
+///
+/// The float members are exactly what `require_float_compute_dtype` accepts for
+/// `A`/`scales`/`Y` in `matmul_nbits::MatMulNBitsKernel::execute`, and the
+/// integer members are exactly the `require_dtype` calls beside them, so this
+/// list is derived from the kernel rather than widened to make a test pass.
+static MATMUL_NBITS_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Uint8,
+    DataType::Int32,
+];
+
+/// The float dtypes `require_float_compute_dtype` accepts.
+///
+/// Also what the MLAS-backed `Conv` accepts. Those kernels compute in f32 and
+/// widen or narrow around it, so they cover f16 and bf16 but genuinely cannot
+/// do f64 -- `ConvKernel::execute` rejects it outright. Distinct from
+/// [`FLOAT_DTYPES`], which includes `Float64`.
+///
+/// Advertising `FLOAT_DTYPES` for such an op is an over-claim rather than a
+/// harmless one: the plugin turns this list into the `KernelRegistryEntry`
+/// dtype filter, so an f64 `Conv` would clear capability, get compiled, and
+/// then fail at `Run` instead of being reported unsupported up front.
+static FLOAT_COMPUTE_DTYPES: &[DataType] =
+    &[DataType::Float32, DataType::Float16, DataType::BFloat16];
+
+/// The two quantized storage dtypes `QLinearMatMul` operands may use.
+static QUANTIZED_STORAGE_DTYPES: &[DataType] = &[DataType::Uint8, DataType::Int8];
+
+static U8_ONLY: &[DataType] = &[DataType::Uint8];
+
+static I32_ONLY: &[DataType] = &[DataType::Int32];
+
+/// Integer index/length inputs, matching `to_dense_i64`'s acceptance set.
+static INDEX_DTYPES: &[DataType] = &[DataType::Int64, DataType::Int32];
+
+/// Per-input-slot dtype constraints for a mixed-dtype op.
+///
+/// `supported_dtypes_for_op` returns the *union* of the dtypes on an op's
+/// edges, and the node filter tests membership in that union. For a uniform op
+/// that is exact, but for a block-quantized op it is strictly weaker than the
+/// kernel's own rule: `MatMulNBits`'s union contains both `float16` and
+/// `uint8`, so a node with `float16` `zero_points` — which the ONNX contrib
+/// spec permits, and which ORT's own kernel accepts — passes the union test
+/// and is claimed, and then fails inside `execute` where the only outcome is a
+/// run-time error.
+///
+/// These lists restore the missing precision. A slot listed here is checked
+/// against its own set instead of the union; absent slots and slots not listed
+/// keep the union rule. They must stay in step with the `require_dtype` calls
+/// in the corresponding kernel's `execute`.
+///
+/// The same mechanism also fixes the *opposite* failure, which is the more
+/// damaging one. `supported_dtypes_for_op` returns `FLOAT_DTYPES` for the
+/// attention family, because that is what their tensor edges carry -- but
+/// `RotaryEmbedding`'s `position_ids` is int64, and
+/// `GroupQueryAttention`'s `seqlens_k` / `total_sequence_length` are int32. The
+/// union test then rejects those slots and the node is silently handed to ORT's
+/// CPU EP, even though our kernel runs it. That contradicts this EP's contract
+/// (see `provider.rs::supports_op`): a node we can execute is never
+/// delegated. Listing the integer slots explicitly is what makes the two most
+/// important decode ops in the engine reachable at all;
+/// `plugin_ort_e2e.rs::no_supported_node_is_ever_left_to_the_ort_cpu_ep` is the
+/// falsifier, and it caught both of them.
+pub fn input_dtype_constraints_for_op(
+    op_type: &str,
+    domain: &str,
+) -> &'static [(usize, &'static [DataType])] {
+    // A, B, scales, zero_points, g_idx, bias.
+    static MATMUL_NBITS_SLOTS: &[(usize, &[DataType])] = &[
+        (0, FLOAT_COMPUTE_DTYPES),
+        (1, U8_ONLY),
+        (2, FLOAT_COMPUTE_DTYPES),
+        (3, U8_ONLY),
+        (4, I32_ONLY),
+        (5, FLOAT_COMPUTE_DTYPES),
+    ];
+    // a, a_scale, a_zero_point, b, b_scale, b_zero_point, y_scale, y_zp.
+    static QLINEAR_MATMUL_SLOTS: &[(usize, &[DataType])] = &[
+        (0, QUANTIZED_STORAGE_DTYPES),
+        (1, F32_ONLY),
+        (2, QUANTIZED_STORAGE_DTYPES),
+        (3, QUANTIZED_STORAGE_DTYPES),
+        (4, F32_ONLY),
+        (5, QUANTIZED_STORAGE_DTYPES),
+        (6, F32_ONLY),
+        (7, QUANTIZED_STORAGE_DTYPES),
+    ];
+    // X, position_ids, cos_cache, sin_cache.
+    static MSFT_ROTARY_SLOTS: &[(usize, &[DataType])] = &[(1, INDEX_DTYPES)];
+    // X, cos_cache, sin_cache, position_ids.
+    static ONNX_ROTARY_SLOTS: &[(usize, &[DataType])] = &[(3, INDEX_DTYPES)];
+    // query, key, value, past_key, past_value, seqlens_k, total_sequence_length,
+    // cos_cache, sin_cache, position_ids. `seqlens_k` is strictly int32 (the
+    // kernel rejects anything else); the other two go through `to_dense_i64`.
+    // Slot 9 is optional and only present with `do_rotary`, but leaving it
+    // unlisted made a `do_rotary` GQA node with explicit int64 positions fail
+    // the float union and go to ORT -- the exact bug this table exists to stop.
+    static GQA_SLOTS: &[(usize, &[DataType])] =
+        &[(5, I32_ONLY), (6, INDEX_DTYPES), (9, INDEX_DTYPES)];
+    // query, key, value, bias, key_padding_mask, attention_bias, past_key, past_value.
+    static MHA_SLOTS: &[(usize, &[DataType])] = &[(4, INDEX_DTYPES)];
+    // input, weights, bias, mask_index, past, attention_bias.
+    static MSFT_ATTENTION_SLOTS: &[(usize, &[DataType])] = &[(3, INDEX_DTYPES)];
+    // query, key, value, bias, token_offset, cumulative_sequence_length.
+    // The last two are strictly int32 (`packed_multi_head_attention.rs`
+    // rejects anything else). ORT has no CPU kernel for this op, so failing
+    // the union here does not fall back -- it fails session creation.
+    static PACKED_MHA_SLOTS: &[(usize, &[DataType])] = &[(4, I32_ONLY), (5, I32_ONLY)];
+    // QMoE stores its experts int4/int8-packed in uint8, so the float union
+    // rejects the weight and zero-point slots outright. Slot order:
+    // input, router_probs, fc1_w, fc1_scales, fc1_bias, fc2_w, fc2_scales,
+    // fc2_bias, fc3_w, fc3_scales, fc3_bias, fc1_zp, fc2_zp, fc3_zp,
+    // router_weights. Mirrors the `require_dtype` calls in `qmoe.rs`.
+    static QMOE_SLOTS: &[(usize, &[DataType])] = &[
+        (2, U8_ONLY),
+        (5, U8_ONLY),
+        (8, U8_ONLY),
+        (11, U8_ONLY),
+        (12, U8_ONLY),
+        (13, U8_ONLY),
+    ];
+    match (op_type, domain) {
+        ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
+        ("QLinearMatMul", "") => QLINEAR_MATMUL_SLOTS,
+        ("RotaryEmbedding", "com.microsoft") => MSFT_ROTARY_SLOTS,
+        ("RotaryEmbedding", "") => ONNX_ROTARY_SLOTS,
+        ("GroupQueryAttention", "com.microsoft") => GQA_SLOTS,
+        ("MultiHeadAttention", "com.microsoft") => MHA_SLOTS,
+        ("Attention", "com.microsoft") => MSFT_ATTENTION_SLOTS,
+        ("PackedMultiHeadAttention", "com.microsoft") => PACKED_MHA_SLOTS,
+        ("QMoE", "com.microsoft") => QMOE_SLOTS,
+        _ => &[],
+    }
+}
+
 /// Determine the supported dtypes for a given (op_type, domain) based on the
 /// actual kernel dispatch implementation. Fail closed: unknown ops get f32 only.
 pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
@@ -199,7 +345,9 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("LeakyRelu", "")
         | ("HardSigmoid", "")
         | ("Selu", "")
-        | ("ThresholdedRelu", "") => FLOAT_DTYPES,
+        | ("ThresholdedRelu", "")
+        | ("Celu", "")
+        | ("Mish", "") => FLOAT_DTYPES,
 
         // Softmax, LogSoftmax, ReduceMean, LayerNorm, etc.: float-only.
         ("Softmax", "")
@@ -299,15 +447,25 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
 
         ("SimplifiedLayerNormalization", "") | ("LinearAttention", "") => FLOAT_DTYPES,
 
-        ("MatMulNBits", "com.microsoft") => F32_ONLY,
-        ("MoE", "com.microsoft") | ("QMoE", "com.microsoft") => F32_ONLY,
+        ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_DTYPES,
+        // `moe.rs` widens f16/bf16 to f32, computes, and narrows on the way
+        // out, so advertising f32 alone declined every realistic MoE node --
+        // production mixtures are exported in half precision. `QMoE` is f32 in
+        // and out with the experts carried as packed uint8, whose slots are
+        // listed in `input_dtype_constraints_for_op`.
+        ("MoE", "com.microsoft") => FLOAT_COMPUTE_DTYPES,
+        ("QMoE", "com.microsoft") => F32_ONLY,
 
         // pkg.nxrt custom ops: f32-only (fail closed).
         (_, "pkg.nxrt") => F32_ONLY,
 
-        // CNN ops (feature-gated).
-        ("Conv", "")
-        | ("ConvTranspose", "")
+        // CNN ops (feature-gated). `Conv` computes through MLAS in f32 and
+        // rejects f64 in `ConvKernel::execute`, so it must not advertise it.
+        ("Conv", "") => FLOAT_COMPUTE_DTYPES,
+
+        // The rest of the CNN family dispatches through `dispatch_float!` and
+        // does handle f64.
+        ("ConvTranspose", "")
         | ("AveragePool", "")
         | ("MaxPool", "")
         | ("GlobalAveragePool", "")
@@ -365,6 +523,13 @@ pub mod gelu;
 pub mod gemm;
 pub mod group_query_attention;
 mod half_gemm;
+// The GEMV is an F16C/AVX2 kernel with no portable body: off x86 the decode
+// path is unchanged, so the module is not compiled at all rather than left as
+// dead code.
+pub mod governed_accumulator_budget;
+pub mod governed_weight_cache;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod half_gemv;
 pub mod hardmax;
 pub mod identity;
 pub mod index_share;
@@ -399,6 +564,7 @@ pub mod sdpa;
 pub mod selection;
 pub mod sequence;
 pub mod shape;
+pub mod simd_activations;
 pub mod simd_normalize;
 pub mod simd_quant;
 pub mod simd_sumsq;
@@ -498,6 +664,8 @@ pub const PHASE1_OPS: &[&str] = &[
     "Elu",
     "LeakyRelu",
     "HardSigmoid",
+    "Celu",
+    "Mish",
     // Logical / selection.
     "And",
     "Or",
@@ -712,40 +880,52 @@ pub fn build_cpu_registry() -> OpRegistry {
 /// type-constraint advertisement). The keys are derived from the exact same
 /// registration calls — not hand-maintained.
 pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor>) {
-    let (reg, keys) =
+    let (reg, _) =
         build_cpu_registry_recorded_inner(qmoe::default_weight_offload_host_cache().clone());
-    let descriptors = keys
-        .into_iter()
-        .map(|(op_type, domain, since_version)| {
-            let dtypes = supported_dtypes_for_op(&op_type, &domain);
-            CpuOpDescriptor {
-                op_type,
-                domain,
-                since_version,
-                supported_dtypes: dtypes,
-            }
+    let descriptors = descriptors_from_registry(&reg);
+    (reg, descriptors)
+}
+
+/// Derive one [`CpuOpDescriptor`] per entry in `reg`.
+///
+/// Reads the registry itself rather than a list accumulated during
+/// registration. Those two had drifted: `register_cnn_ops` takes `&mut
+/// OpRegistry` and so writes past the recording wrapper, which left 18 ops --
+/// `PRelu`, `BatchNormalization`, `InstanceNormalization`,
+/// `GroupNormalization`, `Conv`, and the pooling and resize family -- present
+/// in the registry but absent from the descriptors.
+///
+/// That gap was not cosmetic. The plugin turns these descriptors into the
+/// `KernelRegistryEntry` list, and `node_passes_dtype_filter` fails closed on
+/// an op with no entry, so every one of those 18 was claimed by `supports_op`
+/// and then dropped at capability time -- handing it to ORT's CPU EP, which is
+/// exactly what this EP must never do. Deriving from the registry makes the
+/// two sets identical by construction instead of by convention.
+fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
+    let mut descriptors: Vec<CpuOpDescriptor> = reg
+        .keys()
+        .map(|key| CpuOpDescriptor {
+            op_type: key.op_type.clone(),
+            domain: key.domain.clone(),
+            since_version: key.since_version,
+            supported_dtypes: supported_dtypes_for_op(&key.op_type, &key.domain),
         })
         .collect();
-    (reg, descriptors)
+    // `OpRegistry` iterates a hash map, so fix an order: callers leak these
+    // into a `'static` slice ORT reads, and an unstable order makes any
+    // downstream diff or snapshot test flap.
+    descriptors.sort_by(|a, b| {
+        (&a.domain, &a.op_type, a.since_version).cmp(&(&b.domain, &b.op_type, b.since_version))
+    });
+    descriptors
 }
 
 /// Build the CPU registry AND return keys, with a custom weight-offload cache.
 pub fn build_cpu_registry_with_descriptors_and_cache(
     host_cache: qmoe::WeightOffloadHostCache,
 ) -> (OpRegistry, Vec<CpuOpDescriptor>) {
-    let (reg, keys) = build_cpu_registry_recorded_inner(host_cache);
-    let descriptors = keys
-        .into_iter()
-        .map(|(op_type, domain, since_version)| {
-            let dtypes = supported_dtypes_for_op(&op_type, &domain);
-            CpuOpDescriptor {
-                op_type,
-                domain,
-                since_version,
-                supported_dtypes: dtypes,
-            }
-        })
-        .collect();
+    let (reg, _) = build_cpu_registry_recorded_inner(host_cache);
+    let descriptors = descriptors_from_registry(&reg);
     (reg, descriptors)
 }
 
@@ -1165,6 +1345,16 @@ fn build_cpu_registry_recorded_inner(
     rec.register(OpKey::new("Sinh", "", 1), Box::new(unary_math::SinhFactory));
     rec.register(OpKey::new("Tan", "", 1), Box::new(unary_math::TanFactory));
     rec.register(OpKey::new("Elu", "", 1), Box::new(activations::EluFactory));
+    // Celu is opset 12, Mish opset 18 -- registering at their introducing
+    // opset keeps older models routing to whatever handled them before.
+    rec.register(
+        OpKey::new("Celu", "", 12),
+        Box::new(activations::CeluFactory),
+    );
+    rec.register(
+        OpKey::new("Mish", "", 18),
+        Box::new(activations::MishFactory),
+    );
     rec.register(
         OpKey::new("LeakyRelu", "", 1),
         Box::new(activations::LeakyReluFactory),
@@ -1592,6 +1782,26 @@ pub fn to_dense_bytes(view: &TensorView) -> Result<Vec<u8>> {
     }
     // Byte origin of the element at logical index 0 (applies `byte_offset`).
     let origin = view.data_ptr::<u8>();
+    if view.is_contiguous() {
+        // Contiguous row-major: the byte origin addresses `n * esize`
+        // consecutive bytes, so one bulk copy replaces the per-element strided
+        // walk. The walk below costs an `elem_offset` dot product, a
+        // one-element `copy_nonoverlapping`, and a `next_index` carry chain per
+        // element, which dominates whole-tensor reads of large weights -- a
+        // 3584x3584 `Uint8` operand is 12.8M iterations of that loop. This
+        // mirrors the fast paths `to_dense_f32` and `write_dense_bytes` already
+        // have; `to_dense_bytes` was the one whole-tensor mover missing it.
+        //
+        // SAFETY: identical read assumptions to the strided loop below -- the
+        // validated view describes `n * esize` readable, contiguous bytes
+        // starting at `origin`, bounds-checked against the backing allocation by
+        // the owning EP (ep-api safety invariant #1). `u8` has no invalid bit
+        // patterns and `out` is a fresh, uniquely-owned buffer of the same
+        // length, so the regions cannot overlap.
+        let src = unsafe { std::slice::from_raw_parts(origin, n * esize) };
+        out.copy_from_slice(src);
+        return Ok(out);
+    }
     let mut idx = vec![0usize; view.shape.len()];
     let mut w = 0usize;
     loop {
@@ -1631,6 +1841,23 @@ pub fn write_dense_bytes(out: &mut TensorMut, data: &[u8]) -> Result<()> {
         return Ok(());
     }
     let origin = out.data_ptr_mut::<u8>();
+    if out.is_contiguous() {
+        // Contiguous row-major output: write `n * esize` consecutive bytes in
+        // one bulk copy instead of the per-element strided walk below, which
+        // costs an `elem_offset` dot product, a one-element
+        // `copy_nonoverlapping`, and a `next_index` carry chain per element.
+        // Counterpart to the fast path in `to_dense_bytes`.
+        //
+        // SAFETY: identical write assumptions to the strided loop below -- the
+        // validated output view describes `n * esize` writable, contiguous bytes
+        // starting at `origin`, bounds-checked against the backing allocation by
+        // the owning EP (ep-api safety invariant #1). `data.len()` was checked to
+        // equal `n * esize` above, so every byte is written exactly once, and
+        // `data` is a caller-owned buffer distinct from the output allocation.
+        let dst = unsafe { std::slice::from_raw_parts_mut(origin, n * esize) };
+        dst.copy_from_slice(data);
+        return Ok(());
+    }
     let strides = out.strides;
     let shape = out.shape;
     let mut idx = vec![0usize; shape.len()];
@@ -1956,6 +2183,42 @@ pub(crate) mod testutil {
 
 #[cfg(test)]
 mod tests {
+
+    /// The plugin EP's node filter refuses a node unless *every* input and
+    /// output dtype appears in this list, so a list written from the compute
+    /// dtype alone silently excludes the whole op. `MatMulNBits` carries a
+    /// `uint8` packed weight, an optional `uint8` zero-point and an optional
+    /// `int32` `g_idx` alongside its float activation.
+    #[test]
+    fn matmul_nbits_advertises_its_quantized_edge_dtypes() {
+        let dtypes = supported_dtypes_for_op("MatMulNBits", "com.microsoft");
+        for required in [
+            DataType::Float32,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Uint8,
+            DataType::Int32,
+        ] {
+            assert!(
+                dtypes.contains(&required),
+                "MatMulNBits must advertise {required:?}; without it the plugin EP's \
+                 dtype filter drops every node and ORT runs the op instead"
+            );
+        }
+    }
+
+    /// Same trap, other quantized matmul: `QLinearMatMul` mixes `uint8`/`int8`
+    /// operands with `float` scales.
+    #[test]
+    fn qlinear_matmul_advertises_its_quantized_edge_dtypes() {
+        let dtypes = supported_dtypes_for_op("QLinearMatMul", "");
+        for required in [DataType::Float32, DataType::Uint8, DataType::Int8] {
+            assert!(
+                dtypes.contains(&required),
+                "QLinearMatMul must advertise {required:?}"
+            );
+        }
+    }
     use super::*;
     use crate::strided::view_in_bounds;
     use testutil::Owned;
@@ -2005,6 +2268,164 @@ mod tests {
         let mut out = backing.view_mut();
         write_dense_f32(&mut out, &[1., 2., 3., 4., 5., 6.]).unwrap();
         assert_eq!(backing.to_f32(), vec![1., 2., 3., 4., 5., 6.]);
+    }
+
+    /// Transcription of the pre-bulk-copy `to_dense_bytes` body: the
+    /// per-element strided walk with no contiguity fast path. This is the
+    /// oracle the bulk-copy path must reproduce byte for byte.
+    fn to_dense_bytes_via_strided_walk(view: &TensorView) -> Vec<u8> {
+        let esize = elem_size(view.dtype).unwrap();
+        let n = numel(view.shape);
+        let mut out = vec![0u8; n * esize];
+        if n == 0 {
+            return out;
+        }
+        let origin = view.data_ptr::<u8>();
+        let mut idx = vec![0usize; view.shape.len()];
+        let mut w = 0usize;
+        loop {
+            let byte_off = elem_offset(view.strides, &idx) * esize as isize;
+            // SAFETY: same in-shape, in-bounds read as the production walk.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    origin.offset(byte_off),
+                    out.as_mut_ptr().add(w),
+                    esize,
+                );
+            }
+            w += esize;
+            if !next_index(view.shape, &mut idx) {
+                break;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn to_dense_bytes_bulk_copy_matches_the_strided_walk() {
+        // The contiguous fast path must be byte-identical to the walk it
+        // replaces. Odd dimensions and a rank-3 shape exercise the carry chain;
+        // the payload spans the full `u8` range so a truncation or sign bug
+        // could not hide.
+        for shape in [
+            vec![7usize],
+            vec![3, 5],
+            vec![2, 3, 7],
+            vec![1, 41],
+            vec![41, 1],
+        ] {
+            let n: usize = shape.iter().product();
+            let data: Vec<u8> = (0..n).map(|i| (i.wrapping_mul(37) % 256) as u8).collect();
+            let owned = Owned::u8(&shape, &data);
+            let view = owned.view();
+            assert!(view.is_contiguous(), "{shape:?} should be contiguous");
+            assert_eq!(
+                to_dense_bytes(&view).unwrap(),
+                to_dense_bytes_via_strided_walk(&view),
+                "bulk copy diverged from the strided walk for {shape:?}"
+            );
+            assert_eq!(to_dense_bytes(&view).unwrap(), data, "payload changed");
+        }
+    }
+
+    #[test]
+    fn to_dense_bytes_still_gathers_a_strided_view() {
+        // Backing [2,3] row-major exposed as transposed [3,2] with strides
+        // [1,3]: not contiguous, so the fast path must be skipped and the
+        // gather must still apply the strides. Without this the fast path could
+        // be reached unconditionally and every test above would still pass.
+        let owned = Owned::u8(&[2, 3], &[1, 2, 3, 4, 5, 6]).with_view(&[3, 2], &[1, 3]);
+        let view = owned.view();
+        assert!(!view.is_contiguous());
+        assert_eq!(to_dense_bytes(&view).unwrap(), vec![1, 4, 2, 5, 3, 6]);
+        assert_eq!(
+            to_dense_bytes(&view).unwrap(),
+            to_dense_bytes_via_strided_walk(&view)
+        );
+    }
+
+    #[test]
+    fn to_dense_bytes_reads_multi_byte_elements_whole() {
+        // `esize > 1` is where a byte/element unit mix-up in the bulk copy
+        // shows up: it must copy `n * esize` bytes, not `n`.
+        let data: Vec<i64> = vec![-1, 0, i64::MAX, i64::MIN, 7, -9];
+        let owned = Owned::i64(&[2, 3], &data);
+        let view = owned.view();
+        let dense = to_dense_bytes(&view).unwrap();
+        assert_eq!(dense.len(), 6 * 8);
+        assert_eq!(dense, to_dense_bytes_via_strided_walk(&view));
+        assert_eq!(dense, owned.bytes);
+    }
+
+    #[test]
+    fn write_dense_bytes_bulk_copy_and_scatter_agree_with_their_layouts() {
+        // The same payload written through a contiguous output (fast path) and
+        // through a transposed output (strided scatter) must land in storage
+        // the way each layout dictates, so the fast path cannot be taken
+        // unconditionally.
+        let payload: Vec<u8> = (1..=6u8).collect();
+
+        let mut contiguous = Owned::u8(&[2, 3], &[0; 6]);
+        write_dense_bytes(&mut contiguous.view_mut(), &payload).unwrap();
+        assert_eq!(contiguous.bytes, payload);
+
+        let mut strided = Owned::u8(&[2, 3], &[0; 6]).with_view(&[3, 2], &[1, 3]);
+        write_dense_bytes(&mut strided.view_mut(), &payload).unwrap();
+        assert_eq!(strided.bytes, vec![1, 3, 5, 2, 4, 6]);
+    }
+
+    #[test]
+    fn write_dense_bytes_round_trips_multi_byte_elements() {
+        let data: Vec<i64> = vec![-1, 0, i64::MAX, i64::MIN, 7, -9];
+        let source = Owned::i64(&[2, 3], &data);
+        let dense = to_dense_bytes(&source.view()).unwrap();
+
+        let mut sink = Owned::i64(&[2, 3], &[0; 6]);
+        write_dense_bytes(&mut sink.view_mut(), &dense).unwrap();
+        assert_eq!(sink.to_i64(), data);
+        assert_eq!(sink.bytes, source.bytes);
+    }
+
+    #[test]
+    fn to_dense_bytes_honors_a_nonzero_byte_offset() {
+        // The fast path must read from the *element origin*
+        // (`data + byte_offset`), not from the allocation base. `Owned::view`
+        // builds a zero-offset view, so construct the offset view directly.
+        // Both paths route through `data_ptr`, but nothing else here pins that
+        // down for the bulk copy.
+        let backing = Owned::u8(&[6], &[10, 20, 30, 40, 50, 60]);
+        let shape = [3usize];
+        let strides = [1i64];
+        let mut view = TensorView::new(
+            onnx_runtime_ep_api::DevicePtr(backing.bytes.as_ptr() as *const std::ffi::c_void),
+            DataType::Uint8,
+            &shape,
+            &strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        );
+        view.byte_offset = 2;
+        assert!(view.is_contiguous());
+        assert_eq!(to_dense_bytes(&view).unwrap(), vec![30, 40, 50]);
+        assert_eq!(
+            to_dense_bytes(&view).unwrap(),
+            to_dense_bytes_via_strided_walk(&view)
+        );
+    }
+
+    #[test]
+    fn to_dense_bytes_handles_a_rank_zero_scalar() {
+        // `numel([]) == 1` and `is_contiguous([], [])` is true, so a scalar
+        // takes the fast path with `n * esize == esize`.
+        let owned = Owned::i64(&[], &[-7]);
+        let view = owned.view();
+        assert!(view.is_contiguous());
+        let dense = to_dense_bytes(&view).unwrap();
+        assert_eq!(dense.len(), 8);
+        assert_eq!(dense, to_dense_bytes_via_strided_walk(&view));
+
+        let mut sink = Owned::i64(&[], &[0]);
+        write_dense_bytes(&mut sink.view_mut(), &dense).unwrap();
+        assert_eq!(sink.to_i64(), vec![-7]);
     }
 
     #[test]
@@ -2303,18 +2724,73 @@ mod tests {
 
     #[test]
     fn descriptors_derived_from_real_registry_not_hand_maintained() {
-        // Verify that the descriptor count matches the registry entry count
-        // (minus CNN ops that are directly registered without recording).
+        // Every registered op must have a descriptor -- not "close to", exactly.
+        //
+        // This used to allow a delta of up to 50 and documented CNN ops as the
+        // expected difference. That tolerance was hiding a real bug: the plugin
+        // builds its `KernelRegistryEntry` list from these descriptors and
+        // `node_passes_dtype_filter` fails closed on an op with no entry, so
+        // each of the 18 missing ops (`PRelu`, `BatchNormalization`,
+        // `InstanceNormalization`, `GroupNormalization`, `Conv`, pooling,
+        // `Resize`, ...) was claimed by `supports_op` and then silently handed
+        // back to ORT's CPU EP at capability time.
         let reg = build_cpu_registry();
         let (_reg2, descriptors) = shared_registry_with_descriptors();
-        // Descriptors should be close to registry len; CNN ops are the delta.
-        let delta = reg.len() as isize - descriptors.len() as isize;
+
+        let described: std::collections::BTreeSet<(&str, &str, u64)> = descriptors
+            .iter()
+            .map(|d| (d.op_type.as_str(), d.domain.as_str(), d.since_version))
+            .collect();
+        let missing: Vec<String> = reg
+            .keys()
+            .filter(|k| {
+                !described.contains(&(k.op_type.as_str(), k.domain.as_str(), k.since_version))
+            })
+            .map(|k| format!("{}::{}@{}", k.domain, k.op_type, k.since_version))
+            .collect();
         assert!(
-            (0..50).contains(&delta),
-            "descriptor count ({}) should be close to registry len ({}), delta={}",
+            missing.is_empty(),
+            "{} registered ops have no descriptor, so the plugin would decline \
+             them to ORT's CPU EP: {missing:?}",
+            missing.len()
+        );
+        assert_eq!(
             descriptors.len(),
             reg.len(),
-            delta
+            "descriptor count must equal registry size exactly"
+        );
+    }
+
+    /// Advertised dtypes must be what the kernel accepts, not a superset.
+    ///
+    /// The plugin turns these into the `KernelRegistryEntry` dtype filter, so
+    /// an over-claim is not harmless: ORT routes the node to us, capability
+    /// passes, and it fails at `Run` instead of being declined up front.
+    /// `Conv` is the live case -- it computes through MLAS in f32 and
+    /// `ConvKernel::execute` rejects f64 outright, so it must advertise
+    /// `FLOAT_COMPUTE_DTYPES` and not `FLOAT_DTYPES`.
+    #[test]
+    fn conv_does_not_advertise_a_dtype_its_kernel_rejects() {
+        let dtypes = supported_dtypes_for_op("Conv", "");
+        assert!(
+            !dtypes.contains(&DataType::Float64),
+            "Conv advertises f64 but ConvKernel::execute rejects it: {dtypes:?}"
+        );
+        for want in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            assert!(dtypes.contains(&want), "Conv must still advertise {want:?}");
+        }
+    }
+
+    /// The descriptor order is leaked into a `'static` slice handed to ORT, so
+    /// it must not depend on hash-map iteration order.
+    #[test]
+    fn descriptors_are_deterministically_ordered() {
+        let (_r, a) = build_cpu_registry_with_descriptors();
+        let (_r2, b) = build_cpu_registry_with_descriptors();
+        let key = |d: &CpuOpDescriptor| (d.domain.clone(), d.op_type.clone(), d.since_version);
+        assert_eq!(
+            a.iter().map(key).collect::<Vec<_>>(),
+            b.iter().map(key).collect::<Vec<_>>()
         );
     }
 }

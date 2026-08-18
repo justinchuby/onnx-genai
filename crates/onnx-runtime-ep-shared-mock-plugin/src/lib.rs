@@ -622,6 +622,7 @@ pub fn kernel_registry_entries() -> Vec<KernelRegistryEntry> {
             since_version: 7,
             end_version: i32::MAX,
             supported_dtypes: SUPPORTED_DTYPES,
+            input_dtype_constraints: &[],
         })
         .collect()
 }

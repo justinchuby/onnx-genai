@@ -736,6 +736,21 @@ impl DeviceIoBinding {
         batch: usize,
         result: &mut DeviceIoBinding,
     ) -> Result<()> {
+        self.device_argmax_with_tie_break(
+            elements,
+            batch,
+            result,
+            onnx_runtime_ep_api::ArgmaxTieBreak::LowestIndex,
+        )
+    }
+
+    pub fn device_argmax_with_tie_break(
+        &self,
+        elements: usize,
+        batch: usize,
+        result: &mut DeviceIoBinding,
+        tie_break: onnx_runtime_ep_api::ArgmaxTieBreak,
+    ) -> Result<()> {
         if !matches!(self.dtype, DataType::Float32 | DataType::Float16)
             || result.dtype != DataType::Uint32
         {
@@ -755,6 +770,61 @@ impl DeviceIoBinding {
             batch,
             self.dtype,
             result.buffer_mut(),
+            tie_break,
+        )?)
+    }
+
+    /// Fold the just-selected greedy token into the persistent decode bindings
+    /// device-to-device for the native CUDA device-token-loop. `self` is the
+    /// device-argmax result binding (`result[0]` = token id, `result[1]` =
+    /// capture-error word). The token is written as an `i64` into `input_ids`,
+    /// `next_position` into `position_ids`, a `1` into `attention_mask` at
+    /// `next_position` (guarded by the binding's mask width), the token is
+    /// appended to `scratch[step]`, and the capture-error word is OR-ed into
+    /// `scratch[capacity]`. No host sync is issued; the caller drains `scratch`
+    /// once per chain. All bindings must belong to the same execution provider.
+    #[allow(clippy::too_many_arguments)]
+    pub fn device_token_writer(
+        &self,
+        input_ids: &DeviceIoBinding,
+        position_ids: Option<&DeviceIoBinding>,
+        attention_mask: &DeviceIoBinding,
+        scratch: &DeviceIoBinding,
+        capacity: usize,
+        next_position: i64,
+        mask_len: usize,
+        step: u32,
+    ) -> Result<()> {
+        if self.dtype != DataType::Uint32 || scratch.dtype != DataType::Uint32 {
+            return Err(SessionError::Internal(format!(
+                "device token writer requires u32 result/scratch, got {:?} and {:?}",
+                self.dtype, scratch.dtype
+            )));
+        }
+        let write_position = position_ids.is_some();
+        // When the model has no persistent position_ids binding (position is
+        // derived from the mask), reuse input_ids as a harmless stand-in buffer
+        // and gate the position write off in the kernel.
+        let position_binding = position_ids.unwrap_or(input_ids);
+        for binding in [input_ids, position_binding, attention_mask, scratch] {
+            if !Arc::ptr_eq(&self.allocator, &binding.allocator) {
+                return Err(SessionError::Internal(
+                    "device token writer bindings must belong to the same execution provider"
+                        .into(),
+                ));
+            }
+        }
+        Ok(self.allocator.device_token_writer(
+            self.buffer(),
+            input_ids.buffer(),
+            position_binding.buffer(),
+            attention_mask.buffer(),
+            scratch.buffer(),
+            capacity,
+            next_position,
+            mask_len,
+            write_position,
+            step,
         )?)
     }
 
@@ -914,6 +984,62 @@ impl Tensor {
             // and the allocation is at least `expected` bytes because that is
             // what was requested.
             unsafe { std::ptr::write_bytes(dst, 0, expected) };
+        }
+        Ok(Self::from_owned_buffer(allocator, dtype, shape, buffer))
+    }
+
+    /// Allocate a host tensor and let `fill` write its bytes in place.
+    ///
+    /// The alternative is to build the bytes in a `Vec` and hand them to
+    /// [`from_raw`], which allocates the same bytes twice and memcpys between
+    /// them -- the objection [`zeros`] already records, and the reason `zeros`
+    /// exists. It matters most on the view-graph-output path, where the producer
+    /// is a strided gather whose result is the tensor and nothing else: there
+    /// the second allocation and copy are the entire remaining overhead of
+    /// materializing the output.
+    ///
+    /// `fill` receives exactly `storage_bytes(numel)` bytes of **uninitialized**
+    /// memory as a `&mut [u8]` and **must write every one of them**. Reading an
+    /// uninitialized `u8` is undefined behaviour -- Miri rejects it -- so this
+    /// is a hard obligation on the caller, not a "you get arbitrary bytes"
+    /// convenience. The only caller is the view-materialization path, whose
+    /// gather writes `numel * esize` bytes in disjoint blocks covering the whole
+    /// destination; `gather_view_into`'s falsifiers (`no_output_byte_is_left_
+    /// unwritten`, and the parallel-vs-serial bit-identity test) exist to keep
+    /// that true.
+    ///
+    /// If `fill` panics the buffer is dropped without reaching
+    /// [`ExecutionProvider::deallocate`], which per the ep-api contract leaks it
+    /// rather than double-freeing. That is the same behaviour as any other
+    /// panic between `allocate` and tensor construction, and is why `fill`
+    /// should stay a straight-line writer.
+    pub(crate) fn from_host_fill(
+        dtype: DataType,
+        shape: Vec<usize>,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<Self> {
+        let expected =
+            checked_expected_bytes(dtype, &shape).ok_or_else(|| SessionError::ShapeOverflow {
+                value: "Tensor::from_host_fill".to_string(),
+                dims: shape.clone(),
+            })?;
+        let allocator = shared_cpu_ep();
+        let layout = TensorLayout::contiguous();
+        let mut buffer = allocator.allocate(expected.max(1), layout.alignment)?;
+        assert!(
+            buffer.device().is_host_accessible(),
+            "from_host_fill on non-host device {:?}",
+            buffer.device()
+        );
+        if expected > 0 {
+            // SAFETY: host-accessible device (asserted); `as_mut_ptr` comes from
+            // a unique `&mut buffer` with no alias, and the allocation is at
+            // least `expected` bytes because that is what was requested. `u8` has
+            // no invalid bit patterns, so a `&mut [u8]` over it is valid before
+            // it is written.
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut u8, expected) };
+            fill(dst);
         }
         Ok(Self::from_owned_buffer(allocator, dtype, shape, buffer))
     }

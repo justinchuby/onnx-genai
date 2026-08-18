@@ -90,7 +90,22 @@ struct ContinuousBatchRow {
     chain: ProcessorChain,
     max_context: Option<usize>,
     state: DecodeLoopState,
-    pending_logits: Option<Vec<f32>>,
+    pending: Option<RowPending>,
+}
+
+/// A row's prepared next-token input after one decode step.
+///
+/// The per-row router decides this at extraction time so `advance_row` never
+/// has to reason about device residency: a device-portable row already holds
+/// the token id selected on the device (no host logits ever materialized),
+/// while a host-required row carries the full `[vocab]` logits its chain and
+/// logprobs need.
+enum RowPending {
+    /// Full host logits; the row's processor chain and sampler run in
+    /// `advance_row`.
+    HostLogits(Vec<f32>),
+    /// The token id already selected entirely on the device.
+    DeviceToken(TokenId),
 }
 
 impl ContinuousBatchRow {
@@ -181,6 +196,15 @@ pub struct ContinuousBatchManager<'a> {
     admissions: VecDeque<ContinuousBatchAdmission>,
     events: VecDeque<ContinuousBatchEvent>,
     next_handle: usize,
+    /// Device→host logits transfer accounting for the per-row router. Populated
+    /// only when the backend hands back a device-resident buffer
+    /// ([`onnx_genai_ort::decode::BatchStepLogits::Device`]); it counts the full
+    /// vocabulary copies paid for host-required rows separately from the 4-byte
+    /// token ids read back for device-sampled rows, so a caller can prove a
+    /// mixed batch moved `(host-required rows) x vocab x 4` bytes rather than
+    /// `(all rows) x vocab x 4`.
+    routed_stats: onnx_genai_ort::decode::LogitsD2hStats,
+    used_device_routing: bool,
 }
 
 impl<'a> ContinuousBatchManager<'a> {
@@ -209,6 +233,8 @@ impl<'a> ContinuousBatchManager<'a> {
             admissions: VecDeque::new(),
             events: VecDeque::new(),
             next_handle: 0,
+            routed_stats: onnx_genai_ort::decode::LogitsD2hStats::default(),
+            used_device_routing: false,
         })
     }
 
@@ -264,7 +290,7 @@ impl<'a> ContinuousBatchManager<'a> {
             .enumerate()
             .filter_map(|(row_index, row)| {
                 row.as_ref()
-                    .and_then(|row| row.pending_logits.is_some().then_some(row_index))
+                    .and_then(|row| row.pending.is_some().then_some(row_index))
             })
             .collect::<Vec<_>>();
 
@@ -331,6 +357,25 @@ impl<'a> ContinuousBatchManager<'a> {
         !self.has_pending_work() && self.events.is_empty()
     }
 
+    /// Cumulative device→host logits transfer cost of the backend driving this
+    /// manager.
+    ///
+    /// When the backend hands back a device-resident logits buffer, the per-row
+    /// router owns the transfers and this returns the router's accounting: full
+    /// vocabulary copies charged only to host-required rows, plus the 4-byte
+    /// token ids read back for device-sampled rows. Otherwise it reports the
+    /// backend's own cost — the native host-logits seam round-trips every row
+    /// each step, and the ORT backends keep logits host-side and report `None`,
+    /// so a caller can quote the manager's honest D2H cost or tell that the
+    /// backend pays none.
+    pub fn logits_d2h_stats(&self) -> Option<onnx_genai_ort::decode::LogitsD2hStats> {
+        if self.used_device_routing {
+            Some(self.routed_stats)
+        } else {
+            self.decode.logits_d2h_stats()
+        }
+    }
+
     fn max_context_for_request(&self, options: &GenerateOptions) -> Option<usize> {
         let configured = self.metadata_max_context.or(options.max_context);
         Some(configured.map_or(self.static_max_len, |limit| limit.min(self.static_max_len)))
@@ -372,30 +417,41 @@ impl<'a> ContinuousBatchManager<'a> {
             chain: pending.chain,
             max_context: pending.max_context,
             state: loop_state,
-            pending_logits: None,
+            pending: None,
         };
         self.rows[row_index] = Some(row);
         Ok(())
     }
 
     fn advance_row(&mut self, row: &mut ContinuousBatchRow) -> anyhow::Result<bool> {
-        let mut logits = row
-            .pending_logits
+        let token_id = match row
+            .pending
             .take()
-            .context("active continuous row has no pending logits")?;
-        let context = row.processor_context();
-        let token_id = select_next_token_with_rng(
-            &mut logits,
-            &context,
-            &row.options,
-            &row.chain,
-            &mut row.state.rng,
-        );
-        if let (Some(top_logprobs), Some(logprobs)) =
-            (row.options.top_logprobs, row.state.logprobs.as_mut())
+            .context("active continuous row has no pending token")?
         {
-            logprobs.push(logprob_for_token(&logits, token_id, top_logprobs));
-        }
+            // The row was sampled entirely on the device; its token id is
+            // already selected and no host logits were ever materialized. The
+            // request RNG was advanced when the token was drawn (`take_row_pending`),
+            // so the seeded stream matches the host path.
+            RowPending::DeviceToken(token_id) => token_id,
+            RowPending::HostLogits(mut logits) => {
+                let context = row.processor_context();
+                let token_id = select_next_token_with_rng(
+                    &mut logits,
+                    &context,
+                    &row.options,
+                    &row.chain,
+                    &mut row.state.rng,
+                );
+                if let (Some(top_logprobs), Some(logprobs)) =
+                    (row.options.top_logprobs, row.state.logprobs.as_mut())
+                {
+                    logprobs.push(logprob_for_token(&logits, token_id, top_logprobs));
+                }
+                token_id
+            }
+        };
+
         row.context_tokens.push(token_id);
 
         let mut emitted_token = None;
@@ -457,12 +513,79 @@ impl<'a> ContinuousBatchManager<'a> {
         }
     }
 
+    /// Note that a decode step produced device-resident logits so the manager's
+    /// D2H accounting (not the backend's) is authoritative for `logits_d2h_stats`.
+    fn account_device_step(&mut self, logits: &onnx_genai_ort::decode::BatchStepLogits) {
+        if matches!(logits, onnx_genai_ort::decode::BatchStepLogits::Device(_)) {
+            self.used_device_routing = true;
+            self.routed_stats.steps += 1;
+        }
+    }
+
+    /// Route one row's step logits: sample device-portable rows entirely on the
+    /// device (only a 4-byte token id crosses the bus) and copy the full
+    /// `[vocab]` row to the host only for rows that need it (history-dependent
+    /// processors, logprobs). `buf_index` indexes the step's logits buffer
+    /// (active-row order after `step_active`, physical row after `step_select`);
+    /// `row_index` indexes `self.rows`.
+    ///
+    /// For a host-only backend (`Ort`/`HostRows`) every row is `Host`, so this
+    /// is exactly the previous demux with no behavior change. The per-row win is
+    /// realized only when the backend hands back a `Device` buffer.
+    fn take_row_pending(
+        &mut self,
+        logits: &mut onnx_genai_ort::decode::BatchStepLogits,
+        row_index: usize,
+        buf_index: usize,
+    ) -> anyhow::Result<()> {
+        let device_available = matches!(logits, onnx_genai_ort::decode::BatchStepLogits::Device(_));
+        let row = self.rows[row_index]
+            .as_mut()
+            .context("continuous row is not assigned")?;
+        let plan = crate::processors::device_sampling_plan(
+            &row.chain,
+            &row.options,
+            row.state.custom_sampler.is_some(),
+            device_available,
+            device_available,
+        );
+        match plan {
+            crate::processors::DeviceSamplingPlan::Greedy
+            | crate::processors::DeviceSamplingPlan::Sampled => {
+                let params = onnx_genai_ort::DeviceSampleParams {
+                    temperature: row.options.temperature,
+                    top_k: row.options.top_k,
+                    top_p: row.options.top_p,
+                    min_p: row.options.min_p,
+                    greedy: matches!(plan, crate::processors::DeviceSamplingPlan::Greedy),
+                    // Draw from the same request RNG as the host categorical path
+                    // so the seeded token stream is identical whether the row is
+                    // routed to the device or the host.
+                    rng_value: row.state.rng.value_for(&row.options),
+                };
+                let token = device_sample_row(logits, buf_index, &params)?;
+                row.pending = Some(RowPending::DeviceToken(token));
+                self.routed_stats.rows_device_sampled += 1;
+                self.routed_stats.token_id_bytes += u128::from(TOKEN_ID_BYTES);
+            }
+            crate::processors::DeviceSamplingPlan::Host => {
+                let host = take_row_logits(logits, buf_index, 0)?;
+                if device_available {
+                    self.routed_stats.bytes += host.len() as u128 * u128::from(LOGIT_BYTES);
+                    self.routed_stats.rows_host_copied += 1;
+                }
+                row.pending = Some(RowPending::HostLogits(host));
+            }
+        }
+        Ok(())
+    }
+
     fn decode_next_pending_rows(&mut self) -> anyhow::Result<()> {
         let advancing_rows = self
             .rows
             .iter()
             .flatten()
-            .filter(|row| row.pending_logits.is_none())
+            .filter(|row| row.pending.is_none())
             .map(|row| row.physical_row)
             .collect::<Vec<_>>();
         if advancing_rows.is_empty() {
@@ -490,16 +613,14 @@ impl<'a> ContinuousBatchManager<'a> {
                 position_ids[active_index] = row_len as i64;
                 completes_context[active_index] = row_len + 1 == row.context_tokens.len();
             }
-            let logits = self
+            let mut logits = self
                 .decode
                 .step_active(&input_ids, &position_ids)
                 .map_err(|e| anyhow::anyhow!("Continuous active static-cache step failed: {e}"))?;
+            self.account_device_step(&logits);
             for (active_index, logical_row) in active_rows.into_iter().enumerate() {
                 if completes_context[active_index] {
-                    let row = self.rows[logical_row]
-                        .as_mut()
-                        .context("active continuous row is not assigned")?;
-                    row.pending_logits = Some(row_logits(&logits, active_index, 0)?);
+                    self.take_row_pending(&mut logits, logical_row, active_index)?;
                 }
             }
             return Ok(());
@@ -510,7 +631,7 @@ impl<'a> ContinuousBatchManager<'a> {
         let mut advance_rows = vec![false; self.max_batch()];
         let mut completes_context = vec![false; self.max_batch()];
         for row in self.rows.iter().flatten() {
-            if row.pending_logits.is_none() {
+            if row.pending.is_none() {
                 let row_len = self
                     .decode
                     .row_len(row.physical_row)
@@ -527,14 +648,20 @@ impl<'a> ContinuousBatchManager<'a> {
                 completes_context[row.physical_row] = row_len + 1 == row.context_tokens.len();
             }
         }
-        let logits = self
+        let mut logits = self
             .decode
             .step_select(&input_ids, &position_ids, &advance_rows)
             .map_err(|e| anyhow::anyhow!("Continuous static-cache decode step failed: {e}"))?;
-        for row in self.rows.iter_mut().flatten() {
-            if advance_rows[row.physical_row] && completes_context[row.physical_row] {
-                row.pending_logits = Some(row_logits(&logits, row.physical_row, 0)?);
-            }
+        self.account_device_step(&logits);
+        let extract_rows = self
+            .rows
+            .iter()
+            .flatten()
+            .filter(|row| advance_rows[row.physical_row] && completes_context[row.physical_row])
+            .map(|row| row.physical_row)
+            .collect::<Vec<_>>();
+        for physical_row in extract_rows {
+            self.take_row_pending(&mut logits, physical_row, physical_row)?;
         }
         Ok(())
     }
@@ -710,20 +837,40 @@ impl Engine {
     /// Report how many sequences this engine's decode path can advance in a
     /// single shared forward pass, and why.
     ///
-    /// The answer is derived from the resolved decode backend and the model-I/O
-    /// [`ModelDecodePath`], **not** from whether an ORT decoder session happens
-    /// to be present. That distinction is the whole point: on the native backend
-    /// [`Self::continuous_batch_manager`] always fails because there is no ORT
-    /// decoder session, but the honest reason is that native decode pins batch
-    /// and query-seq to 1 as a structural invariant (`native_decode/cuda.rs`),
-    /// not that a session is momentarily missing.
+    /// The answer is derived from the resolved decode backend, the model-I/O
+    /// [`ModelDecodePath`], and — on the native backend — the actually-bound CUDA
+    /// persistent batch extent, **not** from whether an ORT decoder session
+    /// happens to be present. On the native backend the answer stays consistent
+    /// with what [`Self::continuous_batch_manager`] will build: batch 1 pins to a
+    /// single sequence (a structural invariant of `native_decode/cuda.rs`), while
+    /// a session pinned to batch >= 2 reports that many concurrent sequences.
     pub fn batching_capability(&self) -> BatchingCapability {
-        // The native decode path advances exactly one sequence per step
-        // regardless of the model's KV I/O shape, so it is answered first and
-        // unconditionally. `native_decode/cuda.rs` pins both the batch dimension
-        // and the query-sequence dimension to 1 as a structural decode
-        // invariant, which is not a tunable.
+        // The native decode path advances one sequence per step *unless* it is
+        // running a CUDA persistent batch session pinned to batch >= 2 (via
+        // `ONNX_GENAI_NATIVE_DECODE_BATCH`), in which case #750 wired the
+        // continuous-batch manager onto it and it advances that many sequences per
+        // fused forward. Without such a session the batch and query-seq axes are
+        // pinned to 1 as a structural decode invariant (`native_decode/cuda.rs`),
+        // which is not a tunable — so the answer is derived from the actual bound
+        // session, not the model's KV I/O shape, and it stays consistent with what
+        // `continuous_batch_manager` will actually build.
         if self.decode_backend == EngineDecodeBackend::Native {
+            #[cfg(feature = "native-backend")]
+            if let Some(batch) = self
+                .native_session
+                .as_ref()
+                .map(crate::native_decode::NativeDecodeSession::native_decode_batch)
+                .filter(|&batch| batch >= 2)
+            {
+                return BatchingCapability {
+                    max_concurrent_sequences: Some(batch),
+                    reason: format!(
+                        "the native CUDA persistent decode session is pinned to batch {batch}: \
+                         the continuous-batch manager advances up to {batch} sequences per fused \
+                         forward (ONNX_GENAI_NATIVE_DECODE_BATCH)"
+                    ),
+                };
+            }
             return BatchingCapability {
                 max_concurrent_sequences: Some(1),
                 reason: "the native decode backend advances exactly one sequence \
@@ -770,74 +917,57 @@ impl Engine {
     }
 
     /// Create a lower-level continuous-batch manager for incremental serving.
+    ///
+    /// Takes `&mut self` because the native backend drives the manager over a
+    /// `&mut NativeDecodeSession` — every decode step mutates the persistent
+    /// device bindings — while the ORT backends only need `&self.session`; a
+    /// single `&mut self` entry point serves both without disadvantaging either
+    /// (the ORT branch takes a shared borrow of `self.session` out of the `&mut`,
+    /// the native branch a mutable borrow of `self.native_session`, disjoint from
+    /// the shared borrow of `self.tokenizer`).
     pub fn continuous_batch_manager(
-        &self,
+        &mut self,
         max_batch: usize,
     ) -> anyhow::Result<ContinuousBatchManager<'_>> {
         if max_batch == 0 {
             anyhow::bail!("continuous batch max_batch must be greater than zero");
         }
-        // Native backend: refuse structurally with the honest reason, not the
-        // misleading "session unavailable" (there is deliberately no ORT decoder
-        // session on the native path). `ContinuousBatchManager` drives a *ragged*
-        // `BatchedDecodeSession`: per-row `row_len`, `assign_row`/`deactivate_row`,
-        // `step_select` with a per-row `advance_rows` mask and per-row
-        // `position_ids`, and host `[B, 1, vocab]` logits fed to the host sampler
-        // (`advance_row` -> `select_next_token_with_rng`).
-        //
-        // Stage 3a (#750) generalized the native CUDA persistent batch path
-        // *geometry* to ragged: `DecodeCudaState` now carries a per-row
-        // `row_lens`, `extend_mask_ragged` writes each row its own mask window,
-        // and `decode_cuda_greedy_batch_ragged` steps each row at its own
-        // `position_ids[r] = past_lens[r]` with a per-row `advances` mask, so
-        // genuinely different-length rows share one fused forward (verified by
-        // `profile_native --ragged-solo-equivalence-prompts`).
-        //
-        // Stage 3b (#750) then built the two seams stage 3a still lacked, on the
-        // native `NativeDecodeSession`/`DecodeCudaState` layer:
-        //   * host logits — `decode_greedy_batch_ragged_logits` reads the full
-        //     `[batch, 1, vocab]` logits back to the host (one `[vocab]` row per
-        //     slot) for a real sampler, without deleting the device-argmax fast
-        //     path that keeps greedy decode cheap; and
-        //   * mid-flight backfill — `assign_batch_row`/`deactivate_batch_row`
-        //     retire a finished row and reset a single slot's cursor + mask window
-        //     to length 0 while its peers keep their captured graph.
-        // Both are validated end-to-end by
-        // `profile_native --mid-flight-solo-equivalence-prompts`: rows admitted
-        // into recycled slots mid-flight are byte-identical to the same prompts
-        // run solo at batch 1, and CUDA-graph capture survives admission
-        // (assign/deactivate are host-side mask/length writes into the already
-        // bound persistent bindings, so they force no recapture).
-        //
-        // What still blocks *wiring the manager onto native* is not the geometry
-        // or the seams but the shape of `BatchedDecodeSession` itself, which is
-        // ORT-`Value`-typed: `step_select`/`step_active` return an
-        // `onnx_genai_ort::Value` that the manager demuxes with
-        // `BatchedStaticCacheDecodeSession::row_logits`, whereas the native seam
-        // returns host `Vec<Vec<f32>>`. Bridging them means either wrapping native
-        // host logits back into an ORT `Value` (pulling ORT into the native
-        // logits path) or generalizing the trait's logits type across both ORT
-        // impls and the manager — a cross-crate refactor beyond stage 3b's scope.
-        // Additionally `continuous_batch_manager(&self)` hands the manager an
-        // immutable borrow, but the native seams require `&mut NativeDecodeSession`
-        // (every decode step mutates device bindings), so a native wiring also
-        // needs a `&mut self` entry point. Until the trait's logits type and the
-        // borrow seam are reconciled, the manager cannot drive native even though
-        // both stage-3b seams it needs now exist and are gated.
+        // Native backend (#750 stage 4): wire the manager onto the native CUDA
+        // persistent batch path. Stage 3a made the fused forward ragged (per-row
+        // `row_lens`/`position_ids`/mask window) and stage 3b built the two seams
+        // this needs — host `[B, 1, vocab]` logits via
+        // `decode_greedy_batch_ragged_logits` (the device-argmax fast path is
+        // untouched and stays the greedy default) and mid-flight
+        // `assign_batch_row`/`deactivate_batch_row` backfill that leaves peers'
+        // captured graph intact. The remaining gap was purely the trait shape:
+        // `BatchedDecodeSession::step_*` used to return an ORT `Value`, whereas
+        // the native seam returns host `Vec<Vec<f32>>`. That is now reconciled by
+        // `BatchStepLogits`, whose `HostRows` variant carries the native seam's
+        // per-row logits and is *moved* out by `take_row` — so the throughput path
+        // adds no logits copy on top of its single D2H read — while the ORT
+        // `Value` variant keeps the exact previous demux. `NativeBatchedDecodeSession`
+        // adapts the `&mut NativeDecodeSession` seams to the trait.
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            let metadata_max_context = self
+                .metadata
+                .model
+                .as_ref()
+                .and_then(|model| model.max_sequence_length);
+            let tokenizer = &self.tokenizer;
+            let session = self.native_session.as_mut().context(
+                "continuous batching on the native backend requires an engine-owned native \
+                 decode session; none is loaded",
+            )?;
+            let decode: Box<dyn BatchedDecodeSession<'_> + '_> =
+                Box::new(NativeBatchedDecodeSession::new(session, max_batch)?);
+            return ContinuousBatchManager::new(decode, tokenizer, metadata_max_context, max_batch);
+        }
+        #[cfg(not(feature = "native-backend"))]
         if self.decode_backend == EngineDecodeBackend::Native {
             anyhow::bail!(
-                "continuous batching is unavailable on the native decode backend: the \
-                 ContinuousBatchManager consumes an ORT-`Value`-typed BatchedDecodeSession (its \
-                 `step_select`/`step_active` return `onnx_genai_ort::Value`, demuxed by \
-                 `BatchedStaticCacheDecodeSession::row_logits`), and it borrows the engine \
-                 immutably. Stage 3b (#750) landed the two native seams it needs — host \
-                 `[B, 1, vocab]` logits via `decode_greedy_batch_ragged_logits` (device-argmax \
-                 fast path preserved) and mid-flight `assign_batch_row`/`deactivate_batch_row` \
-                 backfill, both verified byte-identical to solo by \
-                 `profile_native --mid-flight-solo-equivalence-prompts` with CUDA-graph capture \
-                 surviving admission — but those seams return host `Vec<Vec<f32>>` and require \
-                 `&mut NativeDecodeSession`, so wiring the manager still needs the trait's logits \
-                 type generalized off ORT `Value` and a `&mut self` manager entry point."
+                "continuous batching on the native decode backend requires building \
+                 onnx-genai-engine with the 'native-backend' feature"
             );
         }
         let session = self
@@ -1216,6 +1346,234 @@ fn row_logits(
         .map_err(|e| anyhow::anyhow!("Failed to extract row logits: {e}"))
 }
 
+/// Extract one row's logits from a [`BatchStepLogits`] produced by the batched
+/// decode trait. This is a copy on the ORT path (unchanged demux cost) and a
+/// move on the native host-logits path, so wiring the manager onto the native
+/// backend adds no logits copy beyond the single device→host read the seam
+/// already performs.
+fn take_row_logits(
+    logits: &mut onnx_genai_ort::decode::BatchStepLogits,
+    row: usize,
+    seq_index: usize,
+) -> anyhow::Result<Vec<f32>> {
+    logits
+        .take_row(row, seq_index)
+        .map_err(|e| anyhow::anyhow!("Failed to extract row logits: {e}"))
+}
+
+/// Bytes copied device→host for one full `f32` logit.
+const LOGIT_BYTES: u32 = 4;
+/// Bytes copied device→host for one device-sampled token id (`u32`).
+const TOKEN_ID_BYTES: u32 = 4;
+
+/// Sample one row entirely on the device from a device-resident step buffer,
+/// returning the selected token id (only 4 bytes cross the bus). Only ever
+/// called for the [`onnx_genai_ort::decode::BatchStepLogits::Device`] variant,
+/// which the per-row router selects via [`crate::processors::device_sampling_plan`].
+fn device_sample_row(
+    logits: &mut onnx_genai_ort::decode::BatchStepLogits,
+    row: usize,
+    params: &onnx_genai_ort::DeviceSampleParams,
+) -> anyhow::Result<TokenId> {
+    match logits {
+        onnx_genai_ort::decode::BatchStepLogits::Device(device) => device
+            .sample_row(row, params)
+            .map_err(|e| anyhow::anyhow!("Failed to device-sample continuous row {row}: {e}")),
+        _ => anyhow::bail!("device_sample_row requires a device-resident logits buffer"),
+    }
+}
+
+/// Adapts the native CUDA persistent batch decode seams
+/// (`NativeDecodeSession::decode_greedy_batch_ragged_logits`,
+/// `assign_batch_row`/`deactivate_batch_row`, `active_batch_rows`,
+/// `batch_row_len`) to [`BatchedDecodeSession`] so a [`ContinuousBatchManager`]
+/// can drive the native backend exactly as it drives the ORT sessions.
+///
+/// The per-row host logits the seam already reads back are handed to the manager
+/// as [`onnx_genai_ort::decode::BatchStepLogits::HostRows`], which `take_row`
+/// *moves* out — the throughput path pays only its single `[B, 1, vocab]`
+/// device→host read, no extra copy. The cumulative cost of that read is exposed
+/// through [`onnx_genai_ort::decode::BatchedDecodeSession::logits_d2h_stats`] so
+/// a caller can report the manager's honest D2H cost.
+#[cfg(feature = "native-backend")]
+struct NativeBatchedDecodeSession<'a> {
+    session: &'a mut crate::native_decode::NativeDecodeSession,
+    batch: usize,
+    max_len: usize,
+    d2h: onnx_genai_ort::decode::LogitsD2hStats,
+}
+
+#[cfg(feature = "native-backend")]
+impl<'a> NativeBatchedDecodeSession<'a> {
+    fn new(
+        session: &'a mut crate::native_decode::NativeDecodeSession,
+        max_batch: usize,
+    ) -> anyhow::Result<Self> {
+        let batch = session.native_decode_batch();
+        if batch < 2 {
+            anyhow::bail!(
+                "continuous batching on the native backend requires a CUDA persistent decode \
+                 session pinned to batch >= 2 (set ONNX_GENAI_NATIVE_DECODE_BATCH); this session \
+                 bound batch {batch}"
+            );
+        }
+        if max_batch != batch {
+            anyhow::bail!(
+                "native continuous batch max_batch {max_batch} must equal the pinned native \
+                 decode batch extent {batch} (set ONNX_GENAI_NATIVE_DECODE_BATCH={max_batch}); \
+                 the manager owns every physical decode row"
+            );
+        }
+        let max_len = session.batch_kv_max_len().context(
+            "native continuous batching requires a CUDA decode session with a known KV max_len",
+        )?;
+        Ok(Self {
+            session,
+            batch,
+            max_len,
+            d2h: onnx_genai_ort::decode::LogitsD2hStats::default(),
+        })
+    }
+
+    fn accumulate_d2h(&mut self, step: &crate::native_decode::RaggedLogitsStep) {
+        self.d2h.bytes += step.d2h_bytes as u128;
+        self.d2h.time += step.d2h_time;
+        self.d2h.steps += 1;
+    }
+}
+
+#[cfg(feature = "native-backend")]
+fn native_token_ids(next_token_ids: &[i64]) -> onnx_genai_ort::Result<Vec<crate::logits::TokenId>> {
+    next_token_ids
+        .iter()
+        .map(|&id| {
+            crate::logits::TokenId::try_from(id).map_err(|_| {
+                onnx_genai_ort::OrtError::InvalidArgument(format!(
+                    "native continuous batch token id {id} is out of range for u32"
+                ))
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "native-backend")]
+fn native_past_lens(position_ids: &[i64]) -> onnx_genai_ort::Result<Vec<usize>> {
+    position_ids
+        .iter()
+        .map(|&pos| {
+            usize::try_from(pos).map_err(|_| {
+                onnx_genai_ort::OrtError::InvalidArgument(format!(
+                    "native continuous batch position id {pos} is negative or out of range"
+                ))
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "native-backend")]
+fn native_err(context: &str, err: anyhow::Error) -> onnx_genai_ort::OrtError {
+    onnx_genai_ort::OrtError::InvalidArgument(format!("{context}: {err:#}"))
+}
+
+#[cfg(feature = "native-backend")]
+impl<'a> BatchedDecodeSession<'a> for NativeBatchedDecodeSession<'a> {
+    fn batch_size(&self) -> usize {
+        self.batch
+    }
+
+    fn max_len(&self) -> usize {
+        self.max_len
+    }
+
+    fn row_len(&self, row: usize) -> onnx_genai_ort::Result<usize> {
+        self.session
+            .batch_row_len(row)
+            .map_err(|e| native_err("native continuous row_len", e))
+    }
+
+    fn active_rows(&self) -> Vec<usize> {
+        self.session.active_batch_rows()
+    }
+
+    fn deactivate_row(&mut self, row: usize) -> onnx_genai_ort::Result<()> {
+        self.session
+            .deactivate_batch_row(row)
+            .map_err(|e| native_err("native continuous deactivate_row", e))
+    }
+
+    fn assign_row(&mut self, row: usize) -> onnx_genai_ort::Result<()> {
+        self.session
+            .assign_batch_row(row)
+            .map_err(|e| native_err("native continuous assign_row", e))
+    }
+
+    fn step_select(
+        &mut self,
+        next_token_ids: &[i64],
+        position_ids: &[i64],
+        advance_rows: &[bool],
+    ) -> onnx_genai_ort::Result<onnx_genai_ort::decode::BatchStepLogits> {
+        let tokens = native_token_ids(next_token_ids)?;
+        let past_lens = native_past_lens(position_ids)?;
+        let step = self
+            .session
+            .decode_greedy_batch_ragged_logits(&tokens, &past_lens, advance_rows)
+            .map_err(|e| native_err("native continuous step_select", e))?;
+        self.accumulate_d2h(&step);
+        // Physical-row indexed: `logits[slot]` is slot `slot`'s row. Move each
+        // row into the trait's owned container — no per-row copy.
+        Ok(onnx_genai_ort::decode::BatchStepLogits::HostRows(
+            step.logits.into_iter().map(Some).collect(),
+        ))
+    }
+
+    fn step_active(
+        &mut self,
+        next_token_ids: &[i64],
+        position_ids: &[i64],
+    ) -> onnx_genai_ort::Result<onnx_genai_ort::decode::BatchStepLogits> {
+        let active = self.session.active_batch_rows();
+        if next_token_ids.len() != active.len() || position_ids.len() != active.len() {
+            return Err(onnx_genai_ort::OrtError::InvalidArgument(format!(
+                "native continuous step_active expects one input per active row: {} active, \
+                 {} tokens, {} positions",
+                active.len(),
+                next_token_ids.len(),
+                position_ids.len()
+            )));
+        }
+        // Expand active-order inputs to full physical-slot arrays the ragged seam
+        // expects (empty slots are held at advance=false so they neither grow nor
+        // perturb the active rows).
+        let tokens_active = native_token_ids(next_token_ids)?;
+        let past_active = native_past_lens(position_ids)?;
+        let mut tokens = vec![0_u32; self.batch];
+        let mut past_lens = vec![0_usize; self.batch];
+        let mut advances = vec![false; self.batch];
+        for (active_index, &slot) in active.iter().enumerate() {
+            tokens[slot] = tokens_active[active_index];
+            past_lens[slot] = past_active[active_index];
+            advances[slot] = true;
+        }
+        let mut step = self
+            .session
+            .decode_greedy_batch_ragged_logits(&tokens, &past_lens, &advances)
+            .map_err(|e| native_err("native continuous step_active", e))?;
+        self.accumulate_d2h(&step);
+        // Gather into active-row order, moving each row out of the physical-slot
+        // vector (no per-row copy).
+        let mut rows = Vec::with_capacity(active.len());
+        for &slot in &active {
+            rows.push(Some(std::mem::take(&mut step.logits[slot])));
+        }
+        Ok(onnx_genai_ort::decode::BatchStepLogits::HostRows(rows))
+    }
+
+    fn logits_d2h_stats(&self) -> Option<onnx_genai_ort::decode::LogitsD2hStats> {
+        Some(self.d2h)
+    }
+}
+
 fn collect_batch_results(
     results: Vec<Option<GenerateResult>>,
 ) -> anyhow::Result<Vec<GenerateResult>> {
@@ -1232,8 +1590,8 @@ fn collect_batch_results(
 mod tests {
     use super::*;
     use crate::sampling::sample_categorical;
+    use onnx_genai_ort::OrtError;
     use onnx_genai_ort::decode::BatchedDecodeSession;
-    use onnx_genai_ort::{OrtError, Value};
     use std::path::Path;
 
     struct RejectAssignDecode;
@@ -1270,7 +1628,7 @@ mod tests {
             _next_token_ids: &[i64],
             _position_ids: &[i64],
             _advance_rows: &[bool],
-        ) -> onnx_genai_ort::Result<Value> {
+        ) -> onnx_genai_ort::Result<onnx_genai_ort::decode::BatchStepLogits> {
             unreachable!("a rejected row must never decode")
         }
 
@@ -1278,7 +1636,7 @@ mod tests {
             &mut self,
             _next_token_ids: &[i64],
             _position_ids: &[i64],
-        ) -> onnx_genai_ort::Result<Value> {
+        ) -> onnx_genai_ort::Result<onnx_genai_ort::decode::BatchStepLogits> {
             unreachable!("a rejected row must never decode")
         }
     }
@@ -1315,7 +1673,7 @@ mod tests {
             _next_token_ids: &[i64],
             _position_ids: &[i64],
             _advance_rows: &[bool],
-        ) -> onnx_genai_ort::Result<Value> {
+        ) -> onnx_genai_ort::Result<onnx_genai_ort::decode::BatchStepLogits> {
             unreachable!("admission must not require backend generation")
         }
 
@@ -1323,7 +1681,7 @@ mod tests {
             &mut self,
             _next_token_ids: &[i64],
             _position_ids: &[i64],
-        ) -> onnx_genai_ort::Result<Value> {
+        ) -> onnx_genai_ort::Result<onnx_genai_ort::decode::BatchStepLogits> {
             unreachable!("admission must not require backend generation")
         }
     }
@@ -1411,5 +1769,340 @@ mod tests {
         assert!(manager.cancel_pending(handle));
         assert!(!manager.has_pending_work());
         assert!(manager.poll_admissions().is_empty());
+    }
+
+    // ---- Per-row device routing (#1022) ---------------------------------
+
+    use crate::sampling::sample_greedy;
+    use onnx_genai_ort::decode::{BatchStepLogits, DeviceRowLogits};
+    use std::collections::HashMap;
+
+    /// A device-resident logits buffer stand-in.
+    ///
+    /// It runs the *host* reference selection so a device-routed row is provably
+    /// byte-identical to the host path for the same RNG draw (the routing seam,
+    /// not the device kernel, is what this exercises — the CUDA filter math has
+    /// its own host-oracle parity in `device_sampler.rs`). Accounting lives in
+    /// the manager, so this only has to select tokens and hand back rows.
+    struct MockDeviceRowLogits {
+        logits: Vec<Vec<f32>>,
+        vocab: usize,
+    }
+
+    impl DeviceRowLogits for MockDeviceRowLogits {
+        fn rows(&self) -> usize {
+            self.logits.len()
+        }
+
+        fn vocab(&self) -> usize {
+            self.vocab
+        }
+
+        fn sample_row(
+            &mut self,
+            row: usize,
+            params: &onnx_genai_ort::DeviceSampleParams,
+        ) -> onnx_genai_ort::Result<u32> {
+            let logits = &self.logits[row];
+            let token = if params.greedy {
+                sample_greedy(logits)
+            } else {
+                sample_categorical(logits, params.rng_value)
+            };
+            Ok(token)
+        }
+
+        fn copy_row_to_host(&mut self, row: usize) -> onnx_genai_ort::Result<Vec<f32>> {
+            Ok(self.logits[row].clone())
+        }
+    }
+
+    /// Scripted batched backend that returns fixed per-row logits every step,
+    /// either as a device-resident buffer (`device = true`) or as host rows.
+    /// A one-token prompt makes the first decode step complete each row's
+    /// context, so `step()` immediately produces routed pending tokens.
+    struct ScriptedBatchDecode {
+        batch: usize,
+        vocab: usize,
+        max_len: usize,
+        row_len: Vec<usize>,
+        active: Vec<bool>,
+        row_logits: Vec<Vec<f32>>,
+        device: bool,
+    }
+
+    impl ScriptedBatchDecode {
+        fn new(row_logits: Vec<Vec<f32>>, vocab: usize, device: bool) -> Self {
+            let batch = row_logits.len();
+            Self {
+                batch,
+                vocab,
+                max_len: 4096,
+                row_len: vec![0; batch],
+                active: vec![false; batch],
+                row_logits,
+                device,
+            }
+        }
+
+        fn wrap(&self, buffer: Vec<Vec<f32>>) -> BatchStepLogits {
+            if self.device {
+                BatchStepLogits::Device(Box::new(MockDeviceRowLogits {
+                    logits: buffer,
+                    vocab: self.vocab,
+                }))
+            } else {
+                BatchStepLogits::HostRows(buffer.into_iter().map(Some).collect())
+            }
+        }
+    }
+
+    impl<'a> BatchedDecodeSession<'a> for ScriptedBatchDecode {
+        fn batch_size(&self) -> usize {
+            self.batch
+        }
+
+        fn max_len(&self) -> usize {
+            self.max_len
+        }
+
+        fn row_len(&self, row: usize) -> onnx_genai_ort::Result<usize> {
+            Ok(self.row_len[row])
+        }
+
+        fn active_rows(&self) -> Vec<usize> {
+            (0..self.batch).filter(|&r| self.active[r]).collect()
+        }
+
+        fn deactivate_row(&mut self, row: usize) -> onnx_genai_ort::Result<()> {
+            self.active[row] = false;
+            Ok(())
+        }
+
+        fn assign_row(&mut self, row: usize) -> onnx_genai_ort::Result<()> {
+            self.active[row] = true;
+            self.row_len[row] = 0;
+            Ok(())
+        }
+
+        fn step_select(
+            &mut self,
+            _next_token_ids: &[i64],
+            _position_ids: &[i64],
+            advance_rows: &[bool],
+        ) -> onnx_genai_ort::Result<BatchStepLogits> {
+            // Physical-row indexed buffer.
+            let buffer = (0..self.batch)
+                .map(|r| self.row_logits[r].clone())
+                .collect();
+            for row in 0..self.batch {
+                if self.active[row] && advance_rows.get(row).copied().unwrap_or(false) {
+                    self.row_len[row] += 1;
+                }
+            }
+            Ok(self.wrap(buffer))
+        }
+
+        fn step_active(
+            &mut self,
+            _next_token_ids: &[i64],
+            _position_ids: &[i64],
+        ) -> onnx_genai_ort::Result<BatchStepLogits> {
+            // Active-row ordered buffer.
+            let active = self.active_rows();
+            let buffer = active.iter().map(|&r| self.row_logits[r].clone()).collect();
+            for &row in &active {
+                self.row_len[row] += 1;
+            }
+            Ok(self.wrap(buffer))
+        }
+    }
+
+    fn one_hot(vocab: usize, token: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; vocab];
+        v[token] = 10.0;
+        v
+    }
+
+    fn greedy_req(prompt: TokenId) -> GenerateRequest {
+        GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(vec![prompt]),
+            options: GenerateOptions {
+                greedy: true,
+                stop_on_eos: false,
+                max_new_tokens: 6,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A MIXED batch: some rows are device-portable and some genuinely need the
+    /// full host vocabulary. This is the property #1022 locks in — it fails
+    /// today (all rows go to the host), fails again under a naive whole-batch
+    /// fallback, and passes only under per-row routing: exactly the
+    /// host-required rows pay the `vocab x 4` copy while the device-portable
+    /// rows copy back only a 4-byte token id.
+    #[test]
+    fn mixed_batch_moves_only_host_required_rows() {
+        let tokenizer = test_tokenizer();
+        let vocab = 8usize;
+        let row_logits = vec![
+            one_hot(vocab, 1),
+            one_hot(vocab, 2),
+            one_hot(vocab, 3),
+            one_hot(vocab, 4),
+        ];
+        let decode = ScriptedBatchDecode::new(row_logits, vocab, true);
+        let mut manager =
+            ContinuousBatchManager::new(Box::new(decode), &tokenizer, None, 4).unwrap();
+
+        // Rows 0,1: greedy → device-portable. Row 2: repetition penalty (a
+        // history-dependent processor) → host-required. Row 3: top_logprobs →
+        // host-required. Submission order fills physical rows 0..3 in order.
+        manager.submit(greedy_req(1)).unwrap();
+        manager.submit(greedy_req(1)).unwrap();
+        let mut penalty = greedy_req(1);
+        penalty.options.repetition_penalty = 1.2;
+        manager.submit(penalty).unwrap();
+        let mut logprobs = greedy_req(1);
+        logprobs.options.top_logprobs = Some(2);
+        manager.submit(logprobs).unwrap();
+
+        manager.step().unwrap();
+
+        let stats = manager
+            .logits_d2h_stats()
+            .expect("device-routing manager reports its own D2H accounting");
+        let vocab_bytes = vocab as u128 * u128::from(LOGIT_BYTES);
+        assert_eq!(stats.rows_host_copied, 2, "only the 2 host rows are copied");
+        assert_eq!(
+            stats.rows_device_sampled, 2,
+            "the 2 greedy rows sample on device"
+        );
+        assert_eq!(
+            stats.bytes,
+            2 * vocab_bytes,
+            "moved bytes must equal (host-required rows) x vocab x 4"
+        );
+        assert_ne!(
+            stats.bytes,
+            4 * vocab_bytes,
+            "must NOT copy the whole batch (that is the defect #1022 removes)"
+        );
+        assert_eq!(stats.token_id_bytes, 2 * u128::from(TOKEN_ID_BYTES));
+        assert_eq!(stats.steps, 1);
+    }
+
+    /// An all-host batch keeps paying the full per-row copy — routing does not
+    /// change behavior when nothing qualifies (the naive whole-batch cost).
+    #[test]
+    fn all_host_batch_still_copies_every_row() {
+        let tokenizer = test_tokenizer();
+        let vocab = 8usize;
+        let decode =
+            ScriptedBatchDecode::new(vec![one_hot(vocab, 1), one_hot(vocab, 2)], vocab, true);
+        let mut manager =
+            ContinuousBatchManager::new(Box::new(decode), &tokenizer, None, 2).unwrap();
+        for _ in 0..2 {
+            let mut req = greedy_req(1);
+            req.options.repetition_penalty = 1.2; // forces host for every row
+            manager.submit(req).unwrap();
+        }
+        manager.step().unwrap();
+        let stats = manager.logits_d2h_stats().unwrap();
+        assert_eq!(stats.rows_host_copied, 2);
+        assert_eq!(stats.rows_device_sampled, 0);
+        assert_eq!(stats.bytes, 2 * vocab as u128 * u128::from(LOGIT_BYTES));
+    }
+
+    fn drive_to_completion(manager: &mut ContinuousBatchManager) -> HashMap<usize, Vec<TokenId>> {
+        let mut tokens: HashMap<usize, Vec<TokenId>> = HashMap::new();
+        let mut guard = 0;
+        while manager.has_pending_work() {
+            manager.step().unwrap();
+            for event in manager.poll() {
+                if let ContinuousBatchEvent::Token { handle, token } = event {
+                    tokens.entry(handle.id).or_default().push(token.token_id);
+                }
+            }
+            guard += 1;
+            assert!(guard < 1000, "runaway decode loop");
+        }
+        tokens
+    }
+
+    /// Device-routed rows must produce the SAME token stream as the pure-host
+    /// path for the same RNG draw — both greedy (argmax) and seeded categorical
+    /// rows, alongside a host-required repetition-penalty row that is never
+    /// device-routed in either configuration.
+    #[test]
+    fn device_routing_matches_host_token_stream() {
+        let tokenizer = test_tokenizer();
+        let vocab = 8usize;
+        // Row 0: greedy. Row 1: seeded categorical (device-portable, empty
+        // chain). Row 2: repetition penalty (host-required in both configs).
+        let build_requests = || {
+            let mut greedy = greedy_req(1);
+            greedy.options.seed = Some(7);
+            let categorical = GenerateRequest {
+                prompt: GeneratePrompt::TokenIds(vec![1]),
+                options: GenerateOptions {
+                    greedy: false,
+                    temperature: 1.0,
+                    seed: Some(7),
+                    stop_on_eos: false,
+                    max_new_tokens: 6,
+                    ..Default::default()
+                },
+            };
+            let mut penalty = greedy_req(1);
+            penalty.options.repetition_penalty = 1.3;
+            penalty.options.seed = Some(7);
+            vec![greedy, categorical, penalty]
+        };
+        let logits = || {
+            vec![
+                one_hot(vocab, 3),
+                vec![1.0, 2.0, 0.5, 3.0, 2.5, 0.1, 1.5, 0.2],
+                one_hot(vocab, 5),
+            ]
+        };
+
+        let mut device_manager = ContinuousBatchManager::new(
+            Box::new(ScriptedBatchDecode::new(logits(), vocab, true)),
+            &tokenizer,
+            None,
+            3,
+        )
+        .unwrap();
+        let mut host_manager = ContinuousBatchManager::new(
+            Box::new(ScriptedBatchDecode::new(logits(), vocab, false)),
+            &tokenizer,
+            None,
+            3,
+        )
+        .unwrap();
+        for req in build_requests() {
+            device_manager.submit(req).unwrap();
+        }
+        for req in build_requests() {
+            host_manager.submit(req).unwrap();
+        }
+
+        let device_tokens = drive_to_completion(&mut device_manager);
+        let host_tokens = drive_to_completion(&mut host_manager);
+
+        assert_eq!(
+            device_tokens, host_tokens,
+            "per-row device routing must not change the token stream vs the host path"
+        );
+        // The device run must have actually routed the two portable rows on the
+        // device (otherwise this would trivially pass by taking the host path).
+        let stats = device_manager.logits_d2h_stats().unwrap();
+        assert!(
+            stats.rows_device_sampled > 0,
+            "expected device sampling to occur; got {stats:?}"
+        );
+        assert!(host_manager.logits_d2h_stats().is_none() || !host_manager.used_device_routing);
     }
 }

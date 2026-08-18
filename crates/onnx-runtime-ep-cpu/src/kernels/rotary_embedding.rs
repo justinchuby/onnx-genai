@@ -34,7 +34,212 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::Node;
 
 use super::{check_arity, to_dense_i64};
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::dtype::{
+    output_direct_write_eligible, slice_byte_range, to_dense_f32_widen, write_dense_f32_narrow,
+};
+use crate::task_runtime;
+
+/// Elements below which the rotation stays on one thread. RoPE is two multiplies
+/// and an add per element - firmly memory bound - so the crossover is set by the
+/// pool wake-up cost, not by arithmetic. A single llama3 decode step (32 heads x
+/// 128 dims = 4096 elements) stays serial; a 128-token prefill does not.
+const MIN_PARALLEL_ROTARY_ELEMENTS: usize = 64 * 1024;
+
+/// Smallest output run, in f32 elements, worth handing to its own Rayon task.
+///
+/// RoPE moves 8 bytes per element (one read, one write) for three flops, so a
+/// task's runtime is set by bandwidth: 16 Ki elements is 128 KiB of traffic,
+/// roughly 2 us on one core here. Rayon's split-and-join costs ~0.5 us per
+/// task, so this keeps scheduling under ~25% of the work even in the worst
+/// case, while still leaving enough tasks to balance across the pool.
+///
+/// Chunking per `(b, h)` plane or per `(b, s)` row - the natural layout unit -
+/// was measured at one task per 4096 elements, which made the parallel path
+/// *slower* than serial at every thread count (t=1 162 us vs 126 us, t=16
+/// 195 us vs 127 us on `rope_llama3_s128`). Tasks must aggregate whole units
+/// until they clear this bar.
+const MIN_ROTARY_TASK_ELEMENTS: usize = 16 * 1024;
+
+/// The fewest layout units (`[B,H,S,D]` planes or `[B,S,H*D]` rows) of
+/// `unit_elems` each that are worth handing to another thread.
+///
+/// This is a *floor*, not a task size. The task runtime owns the balance
+/// question -- it knows the pool width, and its tasks are claimed dynamically
+/// rather than assigned up front, so a straggler strands one task instead of a
+/// whole static share. All this kernel has to say is how small a task may get
+/// before the fan-out costs more than the work, which is
+/// [`MIN_ROTARY_TASK_ELEMENTS`] worth of units.
+///
+/// Passing `total_units` back (the serial shape) is how the caller expresses
+/// "do not split this at all"; see [`MIN_PARALLEL_ROTARY_ELEMENTS`].
+fn rotary_min_units_per_task(unit_elems: usize) -> usize {
+    MIN_ROTARY_TASK_ELEMENTS.div_ceil(unit_elems.max(1)).max(1)
+}
+
+// ─── Rotation inner loops ───────────────────────────────────────────────────
+//
+// Both arms compute the same expression the ONNX reference does:
+//
+//     real = cos*x1 - sin*x2      imag = sin*x1 + cos*x2
+//
+// The AVX2 arms deliberately use separate `_mm256_mul_ps` + `_mm256_sub_ps` /
+// `_mm256_add_ps` rather than FMA. FMA would drop the intermediate rounding of
+// `cos*x1`, which makes the vector and scalar tails disagree in the last ulp on
+// the same tensor - a parity failure that is a nuisance to chase and buys
+// nothing here, because this kernel is bandwidth-bound (8 bytes moved per 3
+// flops), not issue-bound. Vectorising is worth ~1.8x; fusing the multiply is
+// not measurable.
+
+/// `interleaved=0` (GPT-NeoX): rotate the two contiguous halves of the rotary
+/// sub-vector against each other.
+#[inline]
+fn rotate_split_half(
+    lo_in: &[f32],
+    hi_in: &[f32],
+    lo_out: &mut [f32],
+    hi_out: &mut [f32],
+    cos_row: &[f32],
+    sin_row: &[f32],
+) {
+    let half = lo_out.len();
+    debug_assert_eq!(hi_out.len(), half);
+    debug_assert!(lo_in.len() >= half && hi_in.len() >= half);
+    debug_assert!(cos_row.len() >= half && sin_row.len() >= half);
+
+    let mut k = 0;
+    #[cfg(target_arch = "x86_64")]
+    if vector_rotation_available() {
+        // SAFETY: guarded by the runtime AVX2 probe (the arms use no FMA and
+        // no AVX-512); every slice is asserted at least `half` long and the
+        // loop reads 8 lanes at a time only while `k + 8 <= half`.
+        k = unsafe { avx2::split_half(lo_in, hi_in, lo_out, hi_out, cos_row, sin_row, half) };
+    }
+    while k < half {
+        let (cos, sin) = (cos_row[k], sin_row[k]);
+        let (x1, x2) = (lo_in[k], hi_in[k]);
+        lo_out[k] = cos * x1 - sin * x2;
+        hi_out[k] = sin * x1 + cos * x2;
+        k += 1;
+    }
+}
+
+/// `interleaved=1` (GPT-J): rotate adjacent even/odd channel pairs.
+#[inline]
+fn rotate_interleaved(src: &[f32], dst: &mut [f32], cos_row: &[f32], sin_row: &[f32]) {
+    let half = dst.len() / 2;
+    debug_assert!(src.len() >= 2 * half);
+    debug_assert!(cos_row.len() >= half && sin_row.len() >= half);
+
+    let mut k = 0;
+    #[cfg(target_arch = "x86_64")]
+    if vector_rotation_available() {
+        // SAFETY: guarded by the runtime AVX2 probe (the arms use no FMA and
+        // no AVX-512); the vector loop reads and writes `2 * 8` lanes only
+        // while `k + 8 <= half`, and `src`/`dst` are asserted at least
+        // `2 * half` long.
+        k = unsafe { avx2::interleaved(src, dst, cos_row, sin_row, half) };
+    }
+    while k < half {
+        let (cos, sin) = (cos_row[k], sin_row[k]);
+        let (x1, x2) = (src[2 * k], src[2 * k + 1]);
+        dst[2 * k] = cos * x1 - sin * x2;
+        dst[2 * k + 1] = sin * x1 + cos * x2;
+        k += 1;
+    }
+}
+
+/// Whether the AVX2 rotation arms are live on this machine.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[inline]
+fn vector_rotation_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use std::arch::x86_64::*;
+
+    /// Eight split-half pairs per iteration. Returns the number of `k` values
+    /// consumed, leaving the tail to the scalar loop.
+    ///
+    /// # Safety
+    /// Caller must have verified AVX2 support and that every slice holds at
+    /// least `half` elements.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn split_half(
+        lo_in: &[f32],
+        hi_in: &[f32],
+        lo_out: &mut [f32],
+        hi_out: &mut [f32],
+        cos_row: &[f32],
+        sin_row: &[f32],
+        half: usize,
+    ) -> usize {
+        unsafe {
+            let mut k = 0;
+            while k + 8 <= half {
+                let c = _mm256_loadu_ps(cos_row.as_ptr().add(k));
+                let s = _mm256_loadu_ps(sin_row.as_ptr().add(k));
+                let x1 = _mm256_loadu_ps(lo_in.as_ptr().add(k));
+                let x2 = _mm256_loadu_ps(hi_in.as_ptr().add(k));
+                let real = _mm256_sub_ps(_mm256_mul_ps(c, x1), _mm256_mul_ps(s, x2));
+                let imag = _mm256_add_ps(_mm256_mul_ps(s, x1), _mm256_mul_ps(c, x2));
+                _mm256_storeu_ps(lo_out.as_mut_ptr().add(k), real);
+                _mm256_storeu_ps(hi_out.as_mut_ptr().add(k), imag);
+                k += 8;
+            }
+            k
+        }
+    }
+
+    /// Eight interleaved pairs per iteration: de-interleave 16 lanes into
+    /// even/odd registers, rotate, re-interleave.
+    ///
+    /// # Safety
+    /// Caller must have verified AVX2 support and that `src`/`dst` hold at
+    /// least `2 * half` elements and `cos_row`/`sin_row` at least `half`.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn interleaved(
+        src: &[f32],
+        dst: &mut [f32],
+        cos_row: &[f32],
+        sin_row: &[f32],
+        half: usize,
+    ) -> usize {
+        unsafe {
+            // `_mm256_shuffle_ps` works within each 128-bit lane, so gathering
+            // the even (or odd) channels of 16 consecutive floats leaves them
+            // in the order [0,1,4,5,2,3,6,7]. That permutation is its own
+            // inverse, so the same index vector both straightens the operands
+            // and pre-scrambles the results for `unpack`.
+            let lanes = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
+            let mut k = 0;
+            while k + 8 <= half {
+                let a = _mm256_loadu_ps(src.as_ptr().add(2 * k));
+                let b = _mm256_loadu_ps(src.as_ptr().add(2 * k + 8));
+                let x1 = _mm256_permutevar8x32_ps(_mm256_shuffle_ps::<0b1000_1000>(a, b), lanes);
+                let x2 = _mm256_permutevar8x32_ps(_mm256_shuffle_ps::<0b1101_1101>(a, b), lanes);
+                let c = _mm256_loadu_ps(cos_row.as_ptr().add(k));
+                let s = _mm256_loadu_ps(sin_row.as_ptr().add(k));
+                let real = _mm256_sub_ps(_mm256_mul_ps(c, x1), _mm256_mul_ps(s, x2));
+                let imag = _mm256_add_ps(_mm256_mul_ps(s, x1), _mm256_mul_ps(c, x2));
+                let rp = _mm256_permutevar8x32_ps(real, lanes);
+                let ip = _mm256_permutevar8x32_ps(imag, lanes);
+                _mm256_storeu_ps(dst.as_mut_ptr().add(2 * k), _mm256_unpacklo_ps(rp, ip));
+                _mm256_storeu_ps(dst.as_mut_ptr().add(2 * k + 8), _mm256_unpackhi_ps(rp, ip));
+                k += 8;
+            }
+            k
+        }
+    }
+}
 
 /// Floating-point RotaryEmbedding kernel carrying the resolved attributes.
 pub struct RotaryEmbeddingKernel {
@@ -242,45 +447,125 @@ impl Kernel for RotaryEmbeddingKernel {
             Ok(offset)
         };
 
-        // Flat index of element (b, h, s, d) in X's native layout.
-        let idx = |b: usize, h: usize, s: usize, d: usize| -> usize {
-            if is_4d {
-                // [B, H, S, D]
-                ((b * heads + h) * seq + s) * head_size + d
-            } else {
-                // [B, S, H*D]
-                (b * seq + s) * (heads * head_size) + h * head_size + d
-            }
-        };
-
-        let mut y = vec![0.0f32; x.len()];
+        // The cos/sin row for every (b, s) up front. Resolving it inside the
+        // rotation loop meant the fallible `position_ids` lookup could not be
+        // hoisted out of a parallel region, and it was re-done once per (b, s)
+        // per head anyway.
+        let mut cache_rows = vec![0usize; batch * seq];
         for b in 0..batch {
             for s in 0..seq {
-                let crow = cache_row(b, s)?;
-                for h in 0..heads {
-                    // Rotary sub-vector.
-                    for k in 0..half {
-                        let cos = cos_cache[crow + k];
-                        let sin = sin_cache[crow + k];
-                        let (d1, d2) = if self.interleaved {
-                            (2 * k, 2 * k + 1)
-                        } else {
-                            (k, k + half)
-                        };
-                        let x1 = x[idx(b, h, s, d1)];
-                        let x2 = x[idx(b, h, s, d2)];
-                        y[idx(b, h, s, d1)] = cos * x1 - sin * x2;
-                        y[idx(b, h, s, d2)] = sin * x1 + cos * x2;
-                    }
-                    // Pass-through channels beyond the rotary sub-vector.
-                    for d in rotary_dim..head_size {
-                        y[idx(b, h, s, d)] = x[idx(b, h, s, d)];
-                    }
-                }
+                cache_rows[b * seq + s] = cache_row(b, s)?;
             }
         }
 
-        write_dense_f32_narrow("RotaryEmbedding", &mut outputs[0], &y)
+        let interleaved = self.interleaved;
+        // One head's rotation, given its `head_size`-long input and output
+        // runs and the (cos, sin) row for its position. Layout-independent:
+        // both callers below hand it contiguous per-head slices.
+        let rotate_head = |src: &[f32], dst: &mut [f32], crow: usize| {
+            let cos_row = &cos_cache[crow..crow + half];
+            let sin_row = &sin_cache[crow..crow + half];
+            if interleaved {
+                rotate_interleaved(&src[..rotary_dim], &mut dst[..rotary_dim], cos_row, sin_row);
+            } else {
+                // Split-half: the two operand runs and the two result runs are
+                // each contiguous, so this is four linear streams with no
+                // index arithmetic in the loop body.
+                let (lo_out, hi_out) = dst[..rotary_dim].split_at_mut(half);
+                rotate_split_half(
+                    &src[..half],
+                    &src[half..rotary_dim],
+                    lo_out,
+                    hi_out,
+                    cos_row,
+                    sin_row,
+                );
+            }
+            // Pass-through channels beyond the rotary sub-vector.
+            dst[rotary_dim..head_size].copy_from_slice(&src[rotary_dim..head_size]);
+        };
+
+        // Every input element is read exactly once, into the output element at
+        // the same flat position, so a contiguous f32 output that does not
+        // alias any input we read can be written straight through. That saves
+        // zeroing a full-tensor scratch buffer *and* copying it out - together
+        // the dominant cost of this kernel, which is otherwise two multiplies
+        // and an add per element.
+        let read_ranges: Vec<_> = [&*x, &*cos_cache, &*sin_cache]
+            .into_iter()
+            .map(slice_byte_range)
+            .collect();
+        let direct = output_direct_write_eligible(&mut outputs[0], x.len(), &read_ranges);
+        let mut owned;
+        let y: &mut [f32] = if direct {
+            // SAFETY: `output_direct_write_eligible` proved the buffer is a
+            // host-accessible contiguous Float32 tensor of exactly `x.len()`
+            // elements whose byte range is disjoint from every input read here.
+            unsafe { std::slice::from_raw_parts_mut(outputs[0].data_ptr_mut::<f32>(), x.len()) }
+        } else {
+            owned = vec![0.0f32; x.len()];
+            &mut owned
+        };
+        // Chunk the output so each task owns a disjoint, contiguous run in the
+        // tensor's *native* layout - `[B, H, S, D]` splits naturally per
+        // (b, h) plane, `[B, S, H·D]` per (b, s) row. That removes the
+        // per-element layout branch the old flat-index closure carried, and
+        // lets the outer loop fan out across the shared Rayon pool. ORT
+        // parallelizes the same transform.
+        // Below this the fan-out cannot pay for itself, and the runtime is told
+        // so by asking for one task's worth of units per task.
+        let splittable = y.len() >= MIN_PARALLEL_ROTARY_ELEMENTS;
+        if is_4d {
+            // [B, H, S, D]: plane (b, h) is `seq * head_size` contiguous.
+            let plane = seq * head_size;
+            let fill = |bh: usize, out: &mut [f32]| {
+                let b = bh / heads;
+                let base = bh * plane;
+                for s in 0..seq {
+                    let off = s * head_size;
+                    rotate_head(
+                        &x[base + off..base + off + head_size],
+                        &mut out[off..off + head_size],
+                        cache_rows[b * seq + s],
+                    );
+                }
+            };
+            let units = (batch * heads).max(1);
+            let min_units = if splittable {
+                rotary_min_units_per_task(plane)
+            } else {
+                units
+            };
+            task_runtime::chunks_mut(y, plane, min_units, fill);
+        } else {
+            // [B, S, H·D]: row (b, s) is `heads * head_size` contiguous.
+            let row_len = heads * head_size;
+            let fill = |bs: usize, out: &mut [f32]| {
+                let base = bs * row_len;
+                let crow = cache_rows[bs];
+                for h in 0..heads {
+                    let off = h * head_size;
+                    rotate_head(
+                        &x[base + off..base + off + head_size],
+                        &mut out[off..off + head_size],
+                        crow,
+                    );
+                }
+            };
+            let units = (batch * seq).max(1);
+            let min_units = if splittable {
+                rotary_min_units_per_task(row_len)
+            } else {
+                units
+            };
+            task_runtime::chunks_mut(y, row_len, min_units, fill);
+        }
+
+        if direct {
+            Ok(())
+        } else {
+            write_dense_f32_narrow("RotaryEmbedding", &mut outputs[0], y)
+        }
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -729,5 +1014,369 @@ mod tests {
         for (a, b) in out_std.to_f32().iter().zip(out_contrib.to_f32().iter()) {
             assert!((a - b).abs() < 1e-6, "contrib {b} != standard {a}");
         }
+    }
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+    use crate::kernels::testutil::Owned;
+
+    /// Independent scalar oracle written in the original flat-index style, so
+    /// it cross-checks the layout-specialised chunked loops rather than
+    /// restating them.
+    #[allow(clippy::too_many_arguments)]
+    fn reference(
+        x: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        batch: usize,
+        seq: usize,
+        heads: usize,
+        head_size: usize,
+        rotary_dim: usize,
+        interleaved: bool,
+        is_4d: bool,
+    ) -> Vec<f32> {
+        let half = rotary_dim / 2;
+        let idx = |b: usize, h: usize, s: usize, d: usize| -> usize {
+            if is_4d {
+                ((b * heads + h) * seq + s) * head_size + d
+            } else {
+                (b * seq + s) * (heads * head_size) + h * head_size + d
+            }
+        };
+        let mut y = vec![0.0f32; x.len()];
+        for b in 0..batch {
+            for s in 0..seq {
+                let crow = (b * seq + s) * half;
+                for h in 0..heads {
+                    for k in 0..half {
+                        let (c, sn) = (cos[crow + k], sin[crow + k]);
+                        let (d1, d2) = if interleaved {
+                            (2 * k, 2 * k + 1)
+                        } else {
+                            (k, k + half)
+                        };
+                        let x1 = x[idx(b, h, s, d1)];
+                        let x2 = x[idx(b, h, s, d2)];
+                        y[idx(b, h, s, d1)] = c * x1 - sn * x2;
+                        y[idx(b, h, s, d2)] = sn * x1 + c * x2;
+                    }
+                    for d in rotary_dim..head_size {
+                        y[idx(b, h, s, d)] = x[idx(b, h, s, d)];
+                    }
+                }
+            }
+        }
+        y
+    }
+
+    fn synthetic(n: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(2654435761).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((state >> 8) as f32 / (1u32 << 24) as f32) * 4.0 - 2.0
+            })
+            .collect()
+    }
+
+    /// Sweep both layouts, both rotation modes, full and partial rotary dims,
+    /// and sizes that straddle `MIN_PARALLEL_ROTARY_ELEMENTS` in both
+    /// directions. The fan-out chunks disjoint runs, so it must be exactly
+    /// bit-identical to the scalar oracle - not merely close.
+    #[test]
+    fn every_layout_and_size_matches_the_scalar_reference() {
+        for &(batch, seq, heads, head_size, rotary_dim) in &[
+            (1usize, 1usize, 4usize, 8usize, 8usize), // tiny, serial
+            (1, 1, 32, 128, 128),                     // llama3 decode step, serial
+            (1, 128, 32, 128, 128),                   // prefill, parallel
+            (2, 40, 6, 16, 8),                        // partial rotary, parallel-ish
+            (3, 7, 5, 12, 12),                        // nothing divides evenly
+            // Parallel *and* indivisible: 130 rows over a 4-row task tiling
+            // leaves a 2-row final slab, so the `task * per_task + i` index
+            // arithmetic is checked against a short chunk rather than only the
+            // exact multiples the common shapes happen to produce.
+            (1, 130, 32, 128, 128),
+            // Same for the 4D plane path: 34 planes do not divide evenly.
+            (2, 66, 17, 64, 64),
+        ] {
+            let half = rotary_dim / 2;
+            let n = batch * seq * heads * head_size;
+            let x = synthetic(n, (batch * 7 + seq) as u32);
+            let cos = synthetic(batch * seq * half, 11);
+            let sin = synthetic(batch * seq * half, 13);
+
+            for interleaved in [false, true] {
+                for is_4d in [false, true] {
+                    let shape: Vec<usize> = if is_4d {
+                        vec![batch, heads, seq, head_size]
+                    } else {
+                        vec![batch, seq, heads * head_size]
+                    };
+                    let xt = Owned::f32(&shape, &x);
+                    let pos: Vec<i64> = (0..(batch * seq) as i64).collect();
+                    let post = Owned::i64(&[batch, seq], &pos);
+                    let cost = Owned::f32(&[batch * seq, half], &cos);
+                    let sint = Owned::f32(&[batch * seq, half], &sin);
+                    let mut out = Owned::zeros_f32(&shape);
+
+                    let kernel = RotaryEmbeddingKernel {
+                        interleaved,
+                        num_heads: if is_4d { 0 } else { heads },
+                        rotary_embedding_dim: if rotary_dim == head_size {
+                            0
+                        } else {
+                            rotary_dim
+                        },
+                        contrib: true,
+                    };
+                    kernel
+                        .execute(
+                            &[xt.view(), post.view(), cost.view(), sint.view()],
+                            &mut [out.view_mut()],
+                        )
+                        .unwrap();
+
+                    let expect = reference(
+                        &x,
+                        &cos,
+                        &sin,
+                        batch,
+                        seq,
+                        heads,
+                        head_size,
+                        rotary_dim,
+                        interleaved,
+                        is_4d,
+                    );
+                    assert_eq!(
+                        out.to_f32(),
+                        expect,
+                        "b={batch} s={seq} h={heads} d={head_size} rd={rotary_dim} \
+                         interleaved={interleaved} is_4d={is_4d}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// RoPE's output binding may alias its `X` input. Every rotated pair reads
+    /// both halves before writing either, so an aliased output would corrupt
+    /// the second half; the direct-write guard must decline here.
+    #[test]
+    fn an_output_aliasing_its_input_matches_the_disjoint_result() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
+
+        let (batch, seq, heads, head_size) = (1usize, 64usize, 8usize, 64usize);
+        let n = batch * seq * heads * head_size;
+        let x = synthetic(n, 5);
+        let pos: Vec<i64> = (0..(batch * seq) as i64).collect();
+        let shape = [batch, seq, heads * head_size];
+        let f32c = DataType::Float32;
+        let cpu = DeviceId::cpu();
+        let strides = compute_contiguous_strides(&shape);
+
+        // Full rotation is elementwise alias-safe on its own; partial rotary
+        // adds a pass-through `copy_from_slice`, which is only sound when the
+        // guard has declined. Both are covered.
+        for rotary_dim in [head_size, head_size / 2] {
+            let half = rotary_dim / 2;
+            let cos = synthetic(batch * seq * half, 6);
+            let sin = synthetic(batch * seq * half, 7);
+            let post = Owned::i64(&[batch, seq], &pos);
+            let cost = Owned::f32(&[batch * seq, half], &cos);
+            let sint = Owned::f32(&[batch * seq, half], &sin);
+            let kernel = || RotaryEmbeddingKernel {
+                interleaved: false,
+                num_heads: heads,
+                rotary_embedding_dim: if rotary_dim == head_size {
+                    0
+                } else {
+                    rotary_dim
+                },
+                contrib: true,
+            };
+
+            let disjoint = {
+                let xt = Owned::f32(&shape, &x);
+                let mut out = Owned::zeros_f32(&shape);
+                kernel()
+                    .execute(
+                        &[xt.view(), post.view(), cost.view(), sint.view()],
+                        &mut [out.view_mut()],
+                    )
+                    .unwrap();
+                out.to_f32()
+            };
+
+            let mut shared = x.clone();
+            let in_ptr = shared.as_ptr() as *const std::ffi::c_void;
+            let out_ptr = shared.as_mut_ptr() as *mut std::ffi::c_void;
+            let xv = TensorView::new(DevicePtr(in_ptr), f32c, &shape, &strides, cpu);
+            let outv = TensorMut::new(DevicePtrMut(out_ptr), f32c, &shape, &strides, cpu);
+            kernel()
+                .execute(&[xv, post.view(), cost.view(), sint.view()], &mut [outv])
+                .unwrap();
+
+            assert_eq!(shared, disjoint, "rotary_dim={rotary_dim}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod vector_arm_tests {
+    use super::*;
+
+    /// The AVX2 arms must agree with the scalar arms **bit for bit**, not just
+    /// to a tolerance: a run that splits a tensor differently across tasks (a
+    /// different thread count, a different chunk size) would otherwise produce
+    /// a different answer for the same graph, and the A/B parity check would
+    /// flip on scheduling alone. This is why the vector arms avoid FMA.
+    fn scalar_split_half(
+        lo_in: &[f32],
+        hi_in: &[f32],
+        cos_row: &[f32],
+        sin_row: &[f32],
+        half: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut lo = vec![0.0f32; half];
+        let mut hi = vec![0.0f32; half];
+        for k in 0..half {
+            let (c, s) = (cos_row[k], sin_row[k]);
+            let (x1, x2) = (lo_in[k], hi_in[k]);
+            lo[k] = c * x1 - s * x2;
+            hi[k] = s * x1 + c * x2;
+        }
+        (lo, hi)
+    }
+
+    fn scalar_interleaved(src: &[f32], cos_row: &[f32], sin_row: &[f32], half: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; 2 * half];
+        for k in 0..half {
+            let (c, s) = (cos_row[k], sin_row[k]);
+            let (x1, x2) = (src[2 * k], src[2 * k + 1]);
+            out[2 * k] = c * x1 - s * x2;
+            out[2 * k + 1] = s * x1 + c * x2;
+        }
+        out
+    }
+
+    fn ramp(n: usize, seed: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| ((i as f32) * 0.017 + seed).sin() * 3.0 - 0.5)
+            .collect()
+    }
+
+    #[test]
+    fn avx2_split_half_is_bit_identical_to_the_scalar_loop() {
+        // Sweep `half` so the scalar tail runs at *every* residue mod 8, not
+        // just the convenient ones: 1..9 covers 1-7 and 0, and the larger
+        // values re-check the residues after several full vector iterations.
+        for half in [
+            1usize, 2, 3, 4, 5, 6, 7, 8, 9, 13, 14, 15, 16, 20, 31, 32, 63, 64, 65, 127, 128,
+        ] {
+            let lo_in = ramp(half, 0.3);
+            let hi_in = ramp(half, 1.7);
+            let cos_row = ramp(half, 2.9);
+            let sin_row = ramp(half, 4.1);
+            let (want_lo, want_hi) = scalar_split_half(&lo_in, &hi_in, &cos_row, &sin_row, half);
+            let mut got_lo = vec![0.0f32; half];
+            let mut got_hi = vec![0.0f32; half];
+            rotate_split_half(&lo_in, &hi_in, &mut got_lo, &mut got_hi, &cos_row, &sin_row);
+            assert_eq!(
+                got_lo.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want_lo.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "split-half real part diverged at half={half}"
+            );
+            assert_eq!(
+                got_hi.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want_hi.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "split-half imag part diverged at half={half}"
+            );
+        }
+    }
+
+    #[test]
+    fn avx2_interleaved_is_bit_identical_to_the_scalar_loop() {
+        // The interleaved arm de-interleaves with a lane permutation that is
+        // its own inverse; a wrong index vector still produces plausible
+        // magnitudes, so this compares every element rather than a norm.
+        for half in [
+            1usize, 2, 3, 4, 5, 6, 7, 8, 9, 13, 14, 15, 16, 20, 31, 32, 63, 64, 65,
+        ] {
+            let src = ramp(2 * half, 0.11);
+            let cos_row = ramp(half, 5.3);
+            let sin_row = ramp(half, 6.7);
+            let want = scalar_interleaved(&src, &cos_row, &sin_row, half);
+            let mut got = vec![0.0f32; 2 * half];
+            rotate_interleaved(&src, &mut got, &cos_row, &sin_row);
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "interleaved rotation diverged at half={half} (vector arm live: {})",
+                vector_rotation_available()
+            );
+        }
+    }
+
+    #[test]
+    fn task_chunking_covers_every_unit_exactly_once() {
+        // The grain floor feeds `task_runtime::chunks_mut`, so an off-by-one
+        // silently drops or double-writes a row. Check that the runtime's tiling
+        // is a partition for a wide range of shapes and pool widths.
+        for total in [1usize, 2, 3, 5, 8, 31, 32, 128, 512, 4096] {
+            for unit in [64usize, 512, 4096, 32768] {
+                let min_units = rotary_min_units_per_task(unit);
+                assert!(min_units >= 1, "min_units={min_units} unit={unit}");
+                let mut data = vec![0u32; total * unit];
+                task_runtime::chunks_mut(&mut data, unit, min_units, |index, slab| {
+                    for value in slab {
+                        *value = index as u32 + 1;
+                    }
+                });
+                for index in 0..total {
+                    assert!(
+                        data[index * unit..(index + 1) * unit]
+                            .iter()
+                            .all(|&v| v == index as u32 + 1),
+                        "tiling total={total} unit={unit} lost unit {index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_serial_request_never_splits_the_rotation() {
+        // Measured: fanning 128 tasks out over a one-worker pool cost 36us of
+        // pure Rayon bookkeeping on `rope_llama3_s128` (162us vs 126us). The
+        // serial shape must be reachable, and the kernel reaches it by asking
+        // for every unit in one task.
+        assert_eq!(
+            task_runtime::testing::planned_backend(128, 128),
+            task_runtime::Backend::Serial
+        );
+        assert_eq!(
+            task_runtime::testing::planned_backend(4096, 4096),
+            task_runtime::Backend::Serial
+        );
+    }
+
+    #[test]
+    fn tasks_clear_the_minimum_work_bar() {
+        // 128 rows of 4096 elements must not become 128 tasks.
+        let per = rotary_min_units_per_task(4096);
+        assert!(
+            per * 4096 >= MIN_ROTARY_TASK_ELEMENTS,
+            "task of {} elements is below the {MIN_ROTARY_TASK_ELEMENTS}-element bar",
+            per * 4096
+        );
+        // Tiny units must be aggregated hard rather than shipped one per task.
+        assert!(rotary_min_units_per_task(8) * 8 >= MIN_ROTARY_TASK_ELEMENTS);
+        // A unit that already clears the bar is never aggregated further.
+        assert_eq!(rotary_min_units_per_task(MIN_ROTARY_TASK_ELEMENTS * 2), 1);
     }
 }

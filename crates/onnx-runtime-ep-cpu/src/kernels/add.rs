@@ -24,21 +24,15 @@ impl KernelFactory for AddFactory {
     }
 }
 
-/// Broadcast a dense row-major `src` of `src_shape` onto `out_shape`, calling
-/// `f` with `(flat_out_index, src_value)` for every output element.
+/// Effective stride of each `out_shape` axis into a dense row-major `src_shape`
+/// buffer, with 0 on every broadcast axis.
 ///
-/// Implements numpy broadcasting: `src_shape` is right-aligned to `out_shape`
-/// and any axis of extent 1 (or missing) contributes stride 0. Generic over the
-/// element type `T` so every arithmetic kernel shares one broadcast walk.
-pub fn broadcast_apply<T: Copy>(
-    src: &[T],
-    src_shape: &[usize],
-    out_shape: &[usize],
-    mut f: impl FnMut(usize, T),
-) -> Result<()> {
+/// Factored out of [`broadcast_apply`] so kernels that fuse a broadcast into a
+/// larger parallel pass — rather than walking the output element by element —
+/// share exactly the same numpy right-alignment and compatibility checks.
+pub fn broadcast_effective_strides(src_shape: &[usize], out_shape: &[usize]) -> Result<Vec<i64>> {
     let out_rank = out_shape.len();
     let src_strides = compute_contiguous_strides(src_shape);
-    // Effective stride of each output axis into `src` (0 where broadcast).
     let mut eff = vec![0i64; out_rank];
     for axis in 0..out_rank {
         // Corresponding axis in src (right-aligned); absent => broadcast.
@@ -61,6 +55,23 @@ pub fn broadcast_apply<T: Copy>(
             ));
         }
     }
+    Ok(eff)
+}
+
+/// Broadcast a dense row-major `src` of `src_shape` onto `out_shape`, calling
+/// `f` with `(flat_out_index, src_value)` for every output element.
+///
+/// Implements numpy broadcasting: `src_shape` is right-aligned to `out_shape`
+/// and any axis of extent 1 (or missing) contributes stride 0. Generic over the
+/// element type `T` so every arithmetic kernel shares one broadcast walk.
+pub fn broadcast_apply<T: Copy>(
+    src: &[T],
+    src_shape: &[usize],
+    out_shape: &[usize],
+    mut f: impl FnMut(usize, T),
+) -> Result<()> {
+    let eff = broadcast_effective_strides(src_shape, out_shape)?;
+    let out_rank = out_shape.len();
     let n = numel(out_shape);
     if n == 0 {
         return Ok(());
@@ -100,6 +111,13 @@ impl Kernel for AddKernel {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         if add_vdsp_f32(inputs, &mut outputs[0])? {
             ADD_VDSP_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+        // Shared with Sub/Mul/Div so there is exactly one dense binary walk in
+        // the EP; covers same-shape and suffix-broadcast (including a scalar)
+        // operands. Without it even a same-shape f32 Add fell to `add_typed`,
+        // which allocates a whole-tensor accumulator and walks it three times.
+        if super::elementwise::add_dense_fast_path(inputs, &mut outputs[0]) {
             return Ok(());
         }
         ADD_SCALAR_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -390,12 +408,16 @@ mod tests {
         assert_eq!(out.to_f32(), vec![11., 22., 33., 44., 55., 66.]);
     }
 
+    /// An **interior** size-1 axis is not a right-aligned suffix, so it cannot
+    /// be expressed as a repeat of a contiguous block and must still reach the
+    /// general strided fallback. This is what keeps `add_dense_fast_path` from
+    /// being applied unconditionally.
     #[test]
-    fn add_broadcast_uses_scalar_fallback() {
+    fn add_interior_broadcast_uses_scalar_fallback() {
         use std::sync::atomic::Ordering;
         let before = super::ADD_SCALAR_TEST_HITS.load(Ordering::Relaxed);
         let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
-        let b = Owned::f32(&[3], &[10., 20., 30.]);
+        let b = Owned::f32(&[2, 1], &[10., 20.]);
         let mut out = Owned::zeros_f32(&[2, 3]);
         AddKernel
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
@@ -403,7 +425,87 @@ mod tests {
         let after = super::ADD_SCALAR_TEST_HITS.load(Ordering::Relaxed);
         assert!(
             after > before,
-            "Broadcasting Add did not reach scalar fallback"
+            "Interior-axis broadcasting Add did not reach the scalar fallback"
         );
+        assert_eq!(out.to_f32(), vec![11., 12., 13., 24., 25., 26.]);
+    }
+
+    /// A right-aligned suffix broadcast (`[2, 3] <- [2, 3] + [3]`) now takes the
+    /// shared dense path instead of the strided walk, and must produce exactly
+    /// the same values. The previous version of this test asserted the opposite
+    /// dispatch; the values it never checked are asserted here.
+    ///
+    /// Dispatch is pinned by asserting the predicate itself rather than by
+    /// watching `ADD_SCALAR_TEST_HITS`: that counter is process-global and other
+    /// tests in the same binary increment it concurrently, so an equality
+    /// assertion on it would be racy. `AddKernel::execute` reaches the counter
+    /// only after `add_dense_fast_path` declines, and the two earlier arms
+    /// (`mlas`, vDSP) both require identical operand shapes, so a broadcasting
+    /// input that this predicate accepts provably never reaches the fallback.
+    #[test]
+    fn add_suffix_broadcast_uses_the_dense_fast_path() {
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f32(&[3], &[10., 20., 30.]);
+        let want = vec![11., 22., 33., 14., 25., 36.];
+
+        let mut direct = Owned::zeros_f32(&[2, 3]);
+        assert!(
+            crate::kernels::elementwise::add_dense_fast_path(
+                &[a.view(), b.view()],
+                &mut direct.view_mut()
+            ),
+            "suffix-broadcast Add was declined by the dense fast path"
+        );
+        assert_eq!(direct.to_f32(), want);
+
+        let mut out = Owned::zeros_f32(&[2, 3]);
+        AddKernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f32(), want);
+    }
+
+    /// Scalar operand on either side, which is what an inlined ONNX activation
+    /// function emits. Dispatch is pinned the same way as the suffix case above.
+    #[test]
+    fn add_scalar_broadcast_uses_the_dense_fast_path() {
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let k = Owned::f32(&[], &[0.5]);
+        let want = vec![1.5, 2.5, 3.5, 4.5, 5.5, 6.5];
+        for (l, r) in [(&a, &k), (&k, &a)] {
+            let mut direct = Owned::zeros_f32(&[2, 3]);
+            assert!(
+                crate::kernels::elementwise::add_dense_fast_path(
+                    &[l.view(), r.view()],
+                    &mut direct.view_mut()
+                ),
+                "scalar-broadcast Add was declined by the dense fast path"
+            );
+            assert_eq!(direct.to_f32(), want);
+
+            let mut out = Owned::zeros_f32(&[2, 3]);
+            AddKernel
+                .execute(&[l.view(), r.view()], &mut [out.view_mut()])
+                .unwrap();
+            assert_eq!(out.to_f32(), want);
+        }
+    }
+
+    /// The decline side of the same predicate: an interior unit axis is not a
+    /// right-aligned suffix, so the fast path must refuse it outright (and leave
+    /// the output untouched) rather than compute a wrong answer.
+    #[test]
+    fn add_interior_broadcast_is_declined_by_the_dense_fast_path() {
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f32(&[2, 1], &[10., 20.]);
+        let mut out = Owned::zeros_f32(&[2, 3]);
+        assert!(
+            !crate::kernels::elementwise::add_dense_fast_path(
+                &[a.view(), b.view()],
+                &mut out.view_mut()
+            ),
+            "interior-axis broadcast was accepted by the dense fast path"
+        );
+        assert_eq!(out.to_f32(), vec![0.; 6]);
     }
 }

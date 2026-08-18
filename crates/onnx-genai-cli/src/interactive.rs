@@ -29,8 +29,8 @@ use super::commands::{
     render_repl_help, set_trace_recording,
 };
 use super::output::{
-    build_turn_prompt, detect_reasoning, display_paths, emit_stats_line, load_chat_template,
-    run_generation_turn,
+    bind_response_tokens, build_turn_prompt, detect_reasoning, display_paths, emit_stats_line,
+    load_chat_template, load_response_config, run_generation_turn,
 };
 use super::{EngineArgs, ProfileArgs, RunArgs, decode_backend_name, resolve_model_dir};
 use super::{live_turn, pages, profile};
@@ -325,7 +325,15 @@ pub(super) fn install_ctrlc_handler() {
                     EXIT_ARMED.store(true, Ordering::SeqCst);
                     eprintln!("\n^C  (press Ctrl-C again to exit)");
                 }
-                InterruptAction::Exit => std::process::exit(EXIT_INTERRUPTED),
+                InterruptAction::Exit => {
+                    // This runs on the signal-handler thread and terminates the
+                    // process without unwinding the generating thread, so the
+                    // `FlushGuard` on that stack never drops. Flush the buffered
+                    // diagnostics here so a double Ctrl-C during a turn does not
+                    // silently discard the whole turn's logs.
+                    let _ = crate::flush_deferred_tracing();
+                    std::process::exit(EXIT_INTERRUPTED)
+                }
             }
         });
         if let Err(error) = result {
@@ -373,6 +381,7 @@ pub(super) struct SessionSettings {
     /// platform defaults select.
     execution_provider: Option<String>,
     decode_backend: EngineDecodeBackend,
+    native_device: Option<onnx_genai::engine::native_decode_device::NativeDecodeDevice>,
     limits: onnx_genai::engine::ResourceLimits,
 }
 
@@ -383,6 +392,7 @@ impl SessionSettings {
             model_dir,
             execution_provider: None,
             decode_backend: config.decode_backend,
+            native_device: config.native_device,
             limits: config.limits,
         }
     }
@@ -390,6 +400,7 @@ impl SessionSettings {
     pub(super) fn to_config(&self) -> EngineConfig {
         EngineConfig {
             decode_backend: self.decode_backend,
+            native_device: self.native_device.clone(),
             limits: self.limits.clone(),
             ..EngineConfig::default()
         }
@@ -401,27 +412,6 @@ impl SessionSettings {
         match &self.execution_provider {
             Some(name) => SessionOptions::with_execution_provider(ep_selection(name.clone())),
             None => SessionOptions::default(),
-        }
-    }
-
-    /// The providers a session built from these settings actually runs on, in
-    /// priority order.
-    ///
-    /// Resolved rather than echoed back: with no explicit choice the provider
-    /// comes from the environment *or* from platform auto-selection (Metal on
-    /// Apple Silicon), and reporting the request instead of the result would
-    /// name CPU for a session running on the GPU.
-    pub(super) fn resolved_providers(&self) -> String {
-        let options = self.to_session_options();
-        let names = options
-            .execution_providers
-            .iter()
-            .map(|provider| provider.selection.name.as_str())
-            .collect::<Vec<_>>();
-        if names.is_empty() {
-            "cpu".to_string()
-        } else {
-            names.join(", ")
         }
     }
 
@@ -452,6 +442,7 @@ impl SessionUsage {
 /// diagnostics without echoing conversation content.
 pub(super) struct SessionSummary<'a> {
     pub(super) settings: &'a SessionSettings,
+    pub(super) execution_provider: String,
     pub(super) resolved_decode_backend: EngineDecodeBackend,
     /// The sampling policy resolved for the current backend — the *same* value a
     /// generated turn uses, produced by [`resolve_session_sampling`]. Held
@@ -506,7 +497,7 @@ impl fmt::Display for SessionSummary<'_> {
         writeln!(
             formatter,
             "  execution provider: {}",
-            self.settings.resolved_providers()
+            self.execution_provider
         )?;
         writeln!(
             formatter,
@@ -672,6 +663,15 @@ impl Backend {
         }
     }
 
+    /// Execution-provider placement reported by the loaded model, not by the
+    /// requested settings.
+    pub(super) fn execution_provider_status(&self) -> String {
+        match self {
+            Self::Text(engine) => engine.execution_provider_status(),
+            Self::Pipeline(pipeline) => pipeline.engine.execution_provider_status(),
+        }
+    }
+
     /// KV-cache accounting from the engine's resource governor.
     ///
     /// Only a single-model engine runs a governor; a pipeline reports nothing
@@ -781,19 +781,16 @@ impl Backend {
     pub(super) fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
         match self {
             Self::Text(engine) => engine.effective_max_context(options),
-            Self::Pipeline(_) => options.max_context,
+            Self::Pipeline(pipeline) => pipeline.engine.effective_max_context(options),
         }
     }
 
     /// The model author's declared generation defaults, when the loaded package
-    /// ships them. Single-model text engines expose their `genai_config.json`
-    /// `search` block or native inference metadata `generation` block; pipelines
-    /// report `None` (their sampling is governed by the pipeline plan, not a
-    /// single decoder's declared defaults).
+    /// ships them.
     pub(super) fn generation_defaults(&self) -> Option<&GenerationDefaults> {
         match self {
             Self::Text(engine) => engine.metadata().generation.as_ref(),
-            Self::Pipeline(_) => None,
+            Self::Pipeline(pipeline) => pipeline.engine.generation_defaults(),
         }
     }
 
@@ -827,15 +824,25 @@ impl Backend {
                     .map_err(|error| match required {
                         // A multimodal package can require its non-text input;
                         // say so rather than leaving a bare "missing input".
-                        Some(modality) if attachments == 0 => error.context(format!(
-                            "the turn carried no attachment, but this model declares {modality} input. \
-                             How: attach one with `/{modality} <path>` in the REPL, or `--{modality} <path>` on the command line."
-                        )),
+                        Some(modality)
+                            if attachments == 0 && is_missing_required_input(&error) =>
+                        {
+                            error.context(format!(
+                                "the turn carried no attachment, but this model declares {modality} input. \
+                                 How: attach one with `/{modality} <path>` in the REPL, or `--{modality} <path>` on the command line."
+                            ))
+                        }
                         _ => error,
                     })
             }
         }
     }
+}
+
+fn is_missing_required_input(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with("input not found: "))
 }
 
 pub(super) fn apply_context_sized_max_new_tokens(
@@ -1043,6 +1050,8 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
     let mut template = load_chat_template(&model_dir, raw_mode);
     let mut reasoning = detect_reasoning(template.as_ref());
     backend.bind_reasoning_marker_tokens(&mut reasoning);
+    let mut response = load_response_config(&model_dir, raw_mode);
+    bind_response_tokens(&mut response, &backend);
     let mut warned_missing_context_limit = false;
 
     eprintln!(
@@ -1178,6 +1187,8 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                                 template = load_chat_template(&model_dir, raw_mode);
                                 reasoning = detect_reasoning(template.as_ref());
                                 backend.bind_reasoning_marker_tokens(&mut reasoning);
+                                response = load_response_config(&model_dir, raw_mode);
+                                bind_response_tokens(&mut response, &backend);
                                 warned_missing_context_limit = false;
                                 // A conversation is about the model that held
                                 // it; replaying it into a different model would
@@ -1200,6 +1211,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                         "{}",
                         SessionSummary {
                             settings: &settings,
+                            execution_provider: backend.execution_provider_status(),
                             resolved_decode_backend: backend.decode_backend(),
                             sampling: resolve_session_sampling(
                                 &sampling_options,
@@ -1218,6 +1230,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                     "{}",
                     SessionSummary {
                         settings: &settings,
+                        execution_provider: backend.execution_provider_status(),
                         resolved_decode_backend: backend.decode_backend(),
                         sampling: resolve_session_sampling(
                             &sampling_options,
@@ -1262,7 +1275,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                     }
                     None => println!(
                         "execution provider {} (available: {})",
-                        settings.resolved_providers(),
+                        backend.execution_provider_status(),
                         available_execution_providers().join(", ")
                     ),
                 }
@@ -1293,6 +1306,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                         "{}",
                         SessionSummary {
                             settings: &settings,
+                            execution_provider: backend.execution_provider_status(),
                             resolved_decode_backend: backend.decode_backend(),
                             sampling: resolve_session_sampling(
                                 &sampling_options,
@@ -1329,6 +1343,8 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                 template = load_chat_template(&model_dir, raw_mode);
                 reasoning = detect_reasoning(template.as_ref());
                 backend.bind_reasoning_marker_tokens(&mut reasoning);
+                response = load_response_config(&model_dir, raw_mode);
+                bind_response_tokens(&mut response, &backend);
                 println!("raw mode {}", if raw_mode { "enabled" } else { "disabled" });
                 None
             }
@@ -1432,7 +1448,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
         };
 
         let mut profile = RunProfile::new(model_dir.display().to_string());
-        profile.execution_provider = settings.resolved_providers();
+        profile.execution_provider = backend.execution_provider_status();
         profile.decode_backend = Some(decode_backend_name(backend.decode_backend()).to_string());
         profile.phase("model load", load_elapsed);
         profile.prompt_tokens = Some(prompt_tokens);
@@ -1450,6 +1466,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
             true,
             Some(&mut profile),
             reasoning.as_ref(),
+            response.as_ref(),
             // Live rendering follows `/stats`: it is what puts moving numbers
             // under the reply, and a session that did not ask for them keeps the
             // plain streaming path untouched.
@@ -1552,6 +1569,17 @@ pub(super) fn stage_attachment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_input_not_found_errors_are_classified_as_missing_required_input() {
+        let missing =
+            anyhow::anyhow!("input not found: pixel_values").context("decoder forward failed");
+        assert!(is_missing_required_input(&missing));
+
+        let oom = anyhow::anyhow!("cuda_ep: cuMemAlloc: CUDA_ERROR_OUT_OF_MEMORY")
+            .context("decoder forward failed");
+        assert!(!is_missing_required_input(&oom));
+    }
 
     #[test]
     fn tty_mode_enables_live_stats_by_default() {

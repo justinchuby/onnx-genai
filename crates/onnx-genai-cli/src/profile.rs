@@ -1464,6 +1464,7 @@ mod tests {
     #[test]
     fn the_json_report_is_parseable_and_carries_the_headline_numbers() {
         let mut profile = RunProfile::new("m".to_string());
+        profile.execution_provider = "cpu (CPU session fallback); skipped: webgpu".to_string();
         profile.phase("model load", Duration::from_millis(120));
         profile.counter("denoise steps", 25.0, "steps");
         profile.timings = timings(200, &[50, 50]);
@@ -1474,6 +1475,10 @@ mod tests {
             serde_json::from_str(&profile.to_json()).expect("the report must be valid JSON");
 
         assert_eq!(value["model"], "m");
+        assert_eq!(
+            value["execution_provider"],
+            "cpu (CPU session fallback); skipped: webgpu"
+        );
         assert_eq!(value["prompt_tokens"], 7);
         assert_eq!(value["generated_tokens"], 3);
         assert_eq!(value["finish_reason"], "stop");
@@ -1481,6 +1486,12 @@ mod tests {
         assert!((value["denoise_steps"].as_f64().unwrap() - 25.0).abs() < 1e-6);
         assert!((value["time_to_first_token_ms"].as_f64().unwrap() - 200.0).abs() < 1e-6);
         assert!(value["decode_tokens_per_second"].as_f64().unwrap() > 0.0);
+
+        let text = profile.to_text();
+        assert!(
+            text.contains("cpu (CPU session fallback); skipped: webgpu"),
+            "{text}"
+        );
     }
 
     #[test]

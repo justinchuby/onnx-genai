@@ -3,30 +3,16 @@
 //!
 //! Emitted by the optimizer's GELU fusion (`onnx_runtime_optimizer::fusion`),
 //! which collapses the op-by-op `Mul/Div → Erf → Add → Mul` decomposition into
-//! a single node. The error function is the SAME `erf` helper the standalone
-//! `Erf` kernel uses (`super::elementwise::erf`), so the fused op is numerically
-//! identical to the decomposition it replaces.
+//! a single node. The error function is the SAME one the standalone `Erf`
+//! kernel uses (`kernels::simd_activations`, which dispatches to the ported
+//! MLAS polynomial on AVX2+FMA and to `libm::erf` otherwise), so the fused op
+//! stays numerically identical to the decomposition it replaces.
 
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
 use super::check_arity;
-use super::elementwise::erf;
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
-
-/// `1/√2`, evaluated in `f64` to match the `erf` argument precision.
-const FRAC_1_SQRT_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
-
-/// Exact GELU of one element: `0.5·x·(1 + erf(x / √2))`. The inner scale and
-/// error function are computed in `f64` (as the `Erf` kernel does) and the
-/// result rounded to `f32`.
-pub(crate) fn exact_gelu(x: f32) -> f32 {
-    if x == f32::NEG_INFINITY {
-        return 0.0;
-    }
-    let xf = x as f64;
-    (0.5 * xf * (1.0 + erf(xf * FRAC_1_SQRT_2))) as f32
-}
+use crate::dtype::to_dense_f32_widen;
 
 /// `√(2/π)`, the outer scale of the tanh GELU approximation, in `f64`.
 const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
@@ -66,8 +52,12 @@ impl Kernel for GeluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Gelu", inputs, outputs, 1, 1, 1)?;
         let x = to_dense_f32_widen("Gelu", &inputs[0])?;
-        let y: Vec<f32> = x.iter().map(|&v| exact_gelu(v)).collect();
-        write_dense_f32_narrow("Gelu", &mut outputs[0], &y)
+        super::simd_activations::write_mapped(
+            "Gelu",
+            &mut outputs[0],
+            &x,
+            super::simd_activations::erf_gelu_f32_slice,
+        )
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -110,12 +100,19 @@ impl Kernel for StdGeluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Gelu", inputs, outputs, 1, 1, 1)?;
         let x = to_dense_f32_widen("Gelu", &inputs[0])?;
-        let y: Vec<f32> = if self.tanh {
-            x.iter().map(|&v| tanh_gelu(v)).collect()
-        } else {
-            x.iter().map(|&v| exact_gelu(v)).collect()
-        };
-        write_dense_f32_narrow("Gelu", &mut outputs[0], &y)
+        let tanh = self.tanh;
+        super::simd_activations::write_mapped("Gelu", &mut outputs[0], &x, |x, y| {
+            if tanh {
+                // Vectorised on AVX2+FMA; see `kernels::simd_activations`.
+                super::simd_activations::tanh_gelu_f32_slice(x, y);
+            } else {
+                // Also vectorised: the AVX2 path ports MLAS's `erf`, which is
+                // exactly what ORT's own `Gelu(approximate="none")` CPU kernel
+                // evaluates. Off AVX2 this falls back to the `libm::erf` form
+                // below, unchanged.
+                super::simd_activations::erf_gelu_f32_slice(x, y);
+            }
+        })
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -130,6 +127,7 @@ impl Kernel for StdGeluKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernels::elementwise::erf;
     use crate::kernels::testutil::Owned;
 
     #[test]

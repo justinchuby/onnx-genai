@@ -477,11 +477,30 @@ impl Engine {
         // (which owns the kernel dispatch) how many extra bytes the cache costs,
         // rather than re-deriving the rule here where it would drift from the
         // kernel (#947). CUDA decode uses different kernels, so it never applies.
+        //
+        // #1056: the weight-transpose cache is the third such buffer. It holds
+        // one full `K x N` f32/f16 copy per transposed constant weight for the
+        // session (populated on all platforms by `Gemm` with `transB`, and on
+        // Apple also by `MatMul`). We ask the CPU EP to predict its bytes from
+        // the same graph and fold them into the resident total, so the single
+        // admission verdict below governs it alongside the other two.
         let resident_f32_cache_bytes = if native_cuda_load {
             0
         } else {
             match onnx_runtime_loader::load_model(&model_directory.model_path) {
-                Ok(graph) => onnx_runtime_ep_cpu::resident_dequant_f32_cache_bytes(&graph),
+                Ok(graph) => onnx_runtime_ep_cpu::resident_dequant_f32_cache_bytes(&graph)
+                    .saturating_add(onnx_runtime_ep_cpu::weight_transpose_cache_predicted_bytes(
+                        &graph,
+                    ))
+                    .saturating_add(onnx_runtime_ep_cpu::matmul_dense_cache_predicted_bytes(
+                        &graph,
+                    ))
+                    .saturating_add(
+                        onnx_runtime_ep_cpu::qlinear_accumulator_budget_predicted_bytes(&graph),
+                    )
+                    .saturating_add(onnx_runtime_ep_cpu::qlinear_packed_b_predicted_bytes(
+                        &graph,
+                    )),
                 Err(_) => 0,
             }
         };
@@ -534,6 +553,49 @@ impl Engine {
         onnx_runtime_ep_cpu::set_resident_dequant_f32_cache_enabled(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
+        // #1027: the int4 accuracy_level=0 MLAS SQNBit route holds a packed
+        // buffer (CompFp32 packs to ~1x the int4 bytes) plus its retained scale
+        // copy, and the shape-keyed kernel cache materializes one per prefill
+        // and decode activation shape -- ~2.5x the int4 bytes beside the mapped
+        // weight for the session (#1051 corrected the earlier per-copy under-
+        // count). Its bytes are folded into `resident_f32_cache_bytes`, so the
+        // admission verdict governs it: when declined, the kernel keeps the
+        // borrowed zero-copy int4 path (byte-identical, only slower on x86)
+        // instead of doubling the weight footprint.
+        onnx_runtime_ep_cpu::set_mlas_sqnbit_packing_enabled(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
+        // #1056: the weight-transpose cache (one resident `K x N` f32/f16 copy
+        // per transposed constant weight) is the third buffer folded into
+        // `resident_f32_cache_bytes`, so the same verdict governs it. When
+        // declined, the `MatMul`/`Gemm` kernels transpose per call and retain
+        // nothing (byte-identical output, only slower decode) instead of holding
+        // the session-lifetime copies resident over budget.
+        onnx_runtime_ep_cpu::set_weight_transpose_cache_enabled(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
+        // #1056: the per-kernel `MatMulPrepack::dense` widened-f32 cache (one
+        // resident `4 * K * N` f32 copy per constant operand that is not already
+        // contiguous f32 -- f16/bf16/f64 or strided) is the fourth buffer folded
+        // into `resident_f32_cache_bytes`, so the same verdict governs it. When
+        // declined, the `MatMul`/`FusedMatMulBias` kernels widen the operand per
+        // call and retain nothing (byte-identical output, only slower) instead of
+        // holding the session-lifetime copies resident over budget.
+        onnx_runtime_ep_cpu::set_matmul_dense_cache_enabled(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
+        // #1133: the QLinearMatMul process-wide accumulator scratch budget and
+        // the constant-`B` MLAS pre-pack are the fifth and sixth buffers folded
+        // into `resident_f32_cache_bytes`, governed by the same verdict. When
+        // declined, the kernel reallocates the `i32` accumulator per call and
+        // takes the unpacked GEMM (densifying `B` per call) -- byte-identical
+        // output, only slower -- instead of retaining either buffer over budget.
+        onnx_runtime_ep_cpu::set_qlinear_accumulator_budget_admitted(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
+        onnx_runtime_ep_cpu::set_qlinear_packed_b_enabled(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
         #[cfg(feature = "cuda")]
         let cuda_offload_resolution =
             cuda_offload_resolution_from_plan(&native_device, &memory_strategy_plan);
@@ -554,12 +616,18 @@ impl Engine {
         );
         #[cfg(feature = "cuda")]
         tracing::info!(
+            // The device actually resolved, not the compiled-in feature. This
+            // line used to say "CUDA" on every run of a CUDA-enabled build,
+            // including ones that resolved to the CPU because the model declared
+            // no execution provider -- which reads as confirmation that you are
+            // on the GPU when you are not (#1064).
+            device = ?native_device,
             managed_no_spill = cuda_offload_resolution
                 .is_some_and(|resolution| resolution.policy.managed_no_spill),
             dynamic_lending = dynamic_lending_enabled(),
             governed_physical_pool,
             weight_reservation_bytes,
-            "resolved CUDA device-memory strategy before governor creation"
+            "resolved device-memory strategy before governor creation"
         );
         #[cfg(not(feature = "cuda"))]
         let weight_reservation_bytes = device_weight_reservation_for(
@@ -616,6 +684,7 @@ impl Engine {
                         &metadata,
                     ),
                     decode_precision: config.decode_precision,
+                    decode_batch: config.native_decode_batch,
                 },
             )
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?

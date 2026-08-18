@@ -196,6 +196,67 @@ pub(crate) fn is_device_portable_chain(chain: &ProcessorChain) -> bool {
     })
 }
 
+/// How a single request's next token can be selected: entirely on the device
+/// (copying back only a 4-byte token id) or on the host from the full
+/// vocabulary.
+///
+/// This is the one authoritative answer to "can this row be sampled on device".
+/// The single-request decode loop ([`crate::decode_loop`]) and the continuous
+/// batch manager's per-row router both call [`device_sampling_plan`], so a new
+/// disqualifying condition is added in exactly one place instead of drifting
+/// between two inline copies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeviceSamplingPlan {
+    /// Greedy (argmax) selection on the device.
+    Greedy,
+    /// Categorical selection with the device-portable filter pipeline
+    /// (temperature / top-k / top-p / min-p) on the device.
+    Sampled,
+    /// The row needs the full host logits: a history-dependent processor
+    /// (repetition/frequency/presence penalty, grammar, stop sequences), a
+    /// `top_logprobs` request, a custom sampler, a non-portable chain, or a
+    /// backend that cannot sample on the device.
+    Host,
+}
+
+/// Decide whether `options` + `chain` can be sampled on the device.
+///
+/// `has_custom_sampler` disqualifies the device path because a foreign sampler
+/// must see processed host logits. `greedy_fastpath_supported` and
+/// `sampled_fastpath_supported` are the backend's device-sampling capabilities;
+/// when both are false the verdict is always [`DeviceSamplingPlan::Host`].
+pub(crate) fn device_sampling_plan(
+    chain: &ProcessorChain,
+    options: &GenerateOptions,
+    has_custom_sampler: bool,
+    greedy_fastpath_supported: bool,
+    sampled_fastpath_supported: bool,
+) -> DeviceSamplingPlan {
+    // A custom sampler replaces the default greedy/categorical selection, so the
+    // device fast paths must be bypassed to give the sampler processed logits.
+    let greedy = chain.is_empty()
+        && options.top_logprobs.is_none()
+        && (options.greedy || options.temperature == 0.0)
+        && !has_custom_sampler
+        && greedy_fastpath_supported;
+    if greedy {
+        return DeviceSamplingPlan::Greedy;
+    }
+    // Keep greedy behavior on its existing argmax path. The sampled path is only
+    // for categorical decoding whose processor chain the device sampler supports.
+    let sampled = !options.greedy
+        && options.temperature != 0.0
+        && options.top_logprobs.is_none()
+        && !has_custom_sampler
+        && is_device_portable_chain(chain)
+        && sampled_fastpath_supported;
+    if sampled {
+        DeviceSamplingPlan::Sampled
+    } else {
+        DeviceSamplingPlan::Host
+    }
+}
+
 pub(crate) fn load_fim_config_from_model_dir(
     model_dir: &Path,
 ) -> anyhow::Result<Option<FimConfig>> {
@@ -388,5 +449,132 @@ mod device_portability_tests {
                 chain.names()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod device_sampling_plan_tests {
+    use super::*;
+    use crate::config::GenerateOptions;
+
+    fn empty_chain() -> ProcessorChain {
+        build_processor_chain(&GenerateOptions::default(), None).expect("empty chain builds")
+    }
+
+    fn history_chain() -> ProcessorChain {
+        let options = GenerateOptions {
+            repetition_penalty: 1.2,
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, None).expect("penalty chain builds");
+        assert!(!chain.is_empty(), "repetition penalty must add a processor");
+        assert!(
+            !is_device_portable_chain(&chain),
+            "repetition penalty must be non-portable"
+        );
+        chain
+    }
+
+    fn greedy_options() -> GenerateOptions {
+        GenerateOptions {
+            greedy: true,
+            ..Default::default()
+        }
+    }
+
+    fn sampled_options() -> GenerateOptions {
+        GenerateOptions {
+            greedy: false,
+            temperature: 1.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn greedy_options_with_support_and_empty_chain_plan_greedy() {
+        assert_eq!(
+            device_sampling_plan(&empty_chain(), &greedy_options(), false, true, true),
+            DeviceSamplingPlan::Greedy
+        );
+    }
+
+    #[test]
+    fn sampled_options_with_support_and_portable_chain_plan_sampled() {
+        assert_eq!(
+            device_sampling_plan(&empty_chain(), &sampled_options(), false, true, true),
+            DeviceSamplingPlan::Sampled
+        );
+    }
+
+    // Each disqualifying condition, applied on its own, must force the host
+    // verdict. These pin the predicate so a new caller (the continuous-batch
+    // per-row router) cannot silently route a host-only request to the device.
+
+    #[test]
+    fn top_logprobs_forces_host() {
+        let mut greedy = greedy_options();
+        greedy.top_logprobs = Some(3);
+        assert_eq!(
+            device_sampling_plan(&empty_chain(), &greedy, false, true, true),
+            DeviceSamplingPlan::Host
+        );
+        let mut sampled = sampled_options();
+        sampled.top_logprobs = Some(3);
+        assert_eq!(
+            device_sampling_plan(&empty_chain(), &sampled, false, true, true),
+            DeviceSamplingPlan::Host
+        );
+    }
+
+    #[test]
+    fn custom_sampler_forces_host() {
+        assert_eq!(
+            device_sampling_plan(&empty_chain(), &greedy_options(), true, true, true),
+            DeviceSamplingPlan::Host
+        );
+        assert_eq!(
+            device_sampling_plan(&empty_chain(), &sampled_options(), true, true, true),
+            DeviceSamplingPlan::Host
+        );
+    }
+
+    #[test]
+    fn non_empty_or_non_portable_chain_forces_host() {
+        // A history-dependent processor makes the chain non-empty (disqualifies
+        // greedy) and non-portable (disqualifies sampled).
+        assert_eq!(
+            device_sampling_plan(&history_chain(), &greedy_options(), false, true, true),
+            DeviceSamplingPlan::Host
+        );
+        assert_eq!(
+            device_sampling_plan(&history_chain(), &sampled_options(), false, true, true),
+            DeviceSamplingPlan::Host
+        );
+    }
+
+    #[test]
+    fn backend_without_support_forces_host() {
+        assert_eq!(
+            device_sampling_plan(&empty_chain(), &greedy_options(), false, false, false),
+            DeviceSamplingPlan::Host
+        );
+        assert_eq!(
+            device_sampling_plan(&empty_chain(), &sampled_options(), false, false, false),
+            DeviceSamplingPlan::Host
+        );
+    }
+
+    #[test]
+    fn greedy_needs_greedy_support_specifically() {
+        // Sampled support alone does not license the greedy path, and greedy
+        // support alone does not license the sampled path.
+        assert_eq!(
+            device_sampling_plan(&empty_chain(), &greedy_options(), false, false, true),
+            DeviceSamplingPlan::Host
+        );
+        assert_eq!(
+            device_sampling_plan(&empty_chain(), &sampled_options(), false, true, false),
+            DeviceSamplingPlan::Host
+        );
     }
 }

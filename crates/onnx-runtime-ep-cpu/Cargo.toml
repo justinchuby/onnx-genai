@@ -83,5 +83,17 @@ onnx-runtime-operator-selection = { workspace = true }
 name = "kernels"
 harness = false
 
+[[bench]]
+name = "activation_bench"
+harness = false
+
+[[bench]]
+name = "gqa_decode"
+harness = false
+
+[[bench]]
+name = "sdpa_simd"
+harness = false
+
 [lints]
 workspace = true

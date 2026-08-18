@@ -16,6 +16,34 @@ use crate::weight::ExecutionProviderCapabilities;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct EpId(pub u32);
 
+/// Tie-break policy for [`ExecutionProvider::device_argmax`] when two or more
+/// logits share the maximum value.
+///
+/// The default ([`ArgmaxTieBreak::LowestIndex`]) matches the canonical ONNX
+/// `ArgMax` operator (`select_last_index=false`) and the host greedy references
+/// `sample_greedy` / `argmax_logits_tensor` ("ties keep the lowest token id"),
+/// which is the base-decode / ORT byte-identity contract.
+/// [`ArgmaxTieBreak::HighestIndex`] instead keeps the highest token id on ties,
+/// matching Rust's `Iterator::max_by` (returns the LAST maximal element) as used
+/// by the engine/reference greedy `max_by` probes, and ONNX `ArgMax` with
+/// `select_last_index=true`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum ArgmaxTieBreak {
+    /// Ties resolve to the lowest token id (first maximal element).
+    #[default]
+    LowestIndex,
+    /// Ties resolve to the highest token id (last maximal element).
+    HighestIndex,
+}
+
+impl ArgmaxTieBreak {
+    /// Whether ties select the LAST (highest-index) maximal element.
+    #[must_use]
+    pub fn select_last_index(self) -> bool {
+        matches!(self, ArgmaxTieBreak::HighestIndex)
+    }
+}
+
 /// Opaque, namespaced configuration passed to [`ExecutionProvider::initialize`].
 #[derive(Clone, Debug, Default)]
 pub struct EpConfig {
@@ -343,6 +371,28 @@ impl StructuralCaptureDecline {
     }
 }
 
+/// Uploads host bytes into a raw device address for a device EP.
+///
+/// This is the narrow capability the plugin's fused-subgraph executor needs to
+/// stage a host-resident boundary input into device memory when ORT runs an
+/// interspersed CPU→device partition and never inserts the host→device copy
+/// itself (issue #982). It is deliberately smaller than the full
+/// [`ExecutionProvider`] surface — a device address and a length — so it can be
+/// captured once at compile time and stored on the executor without holding an
+/// EP reference (which would change EP teardown semantics).
+///
+/// Implementations must perform a **synchronous** upload: on return the bytes
+/// are resident at `dst`, so the caller may launch a kernel that reads them.
+pub trait HostToDeviceCopier: Send + Sync {
+    /// Copy `src` host bytes into device destination `dst`.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must point to a live device allocation, on this copier's device,
+    /// of at least `src.len()` bytes.
+    unsafe fn copy_host_to_device(&self, src: &[u8], dst: *mut c_void) -> Result<()>;
+}
+
 /// The core EP interface. Every backend crate implements this (§4.1).
 pub trait ExecutionProvider: Send + Sync {
     /// EP identifier (snake_case, e.g. `"cpu_ep"`, `"cuda_ep"`).
@@ -350,6 +400,26 @@ pub trait ExecutionProvider: Send + Sync {
 
     fn device_type(&self) -> DeviceType;
     fn device_id(&self) -> DeviceId;
+
+    /// PCI vendor id of this EP's device memory (0 = generic/host). Used by the
+    /// plugin executor to reconstruct the device `OrtMemoryInfo` ORT registered
+    /// the device allocator against, as a fallback for staging host-resident
+    /// boundary inputs when no device-resident `OrtValue` is otherwise visible
+    /// (issue #982). Host EPs keep the default.
+    fn memory_vendor_id(&self) -> u32 {
+        0
+    }
+
+    /// A synchronous host→device uploader, or `None` for host EPs.
+    ///
+    /// Device EPs return a small [`HostToDeviceCopier`] the plugin's fused
+    /// executor captures at compile time and uses to stage host-resident
+    /// boundary inputs into device scratch before launching a device kernel
+    /// (issue #982). Returning `None` (the default) opts an EP out of staging
+    /// entirely: its inputs are used verbatim, exactly as before.
+    fn host_to_device_copier(&self) -> Option<std::sync::Arc<dyn HostToDeviceCopier>> {
+        None
+    }
 
     /// Optional executor-to-EP capabilities. Stock EPs advertise none and
     /// continue receiving resident [`crate::TensorView`] inputs.
@@ -651,6 +721,10 @@ pub trait ExecutionProvider: Send + Sync {
     /// `s`, two native-endian u32 values at word offset `2*s`: the token id, then
     /// the latching device capture-error bitmask. At `batch == 1` this is the
     /// previous single-sequence contract byte-for-byte.
+    ///
+    /// `tie_break` selects which token id wins when several logits share the
+    /// maximum value; see [`ArgmaxTieBreak`]. [`ArgmaxTieBreak::LowestIndex`] is
+    /// the base-decode / ORT byte-identity default.
     fn device_argmax(
         &self,
         _logits: &DeviceBuffer,
@@ -658,9 +732,40 @@ pub trait ExecutionProvider: Send + Sync {
         _batch: usize,
         _dtype: DataType,
         _result: &mut DeviceBuffer,
+        _tie_break: ArgmaxTieBreak,
     ) -> Result<()> {
         Err(EpError::KernelFailed(format!(
             "{}: device argmax is not supported",
+            self.name()
+        )))
+    }
+
+    /// Fold the just-selected greedy token (from a prior [`device_argmax`],
+    /// `result[0]`) into the persistent decode bindings device-to-device, for
+    /// the native CUDA device-token-loop: write the token as an `i64` into
+    /// `input_ids`, write `next_position` into `position_ids`, set the mask `1`
+    /// at `next_position` (guarded by `mask_len`), append the token to
+    /// `scratch[step]`, and OR the shared capture-error word (`result[1]`) into
+    /// `scratch[capacity]`. No host sync — the caller drains `scratch` once per
+    /// chain. EPs without device kernels reject the request.
+    ///
+    /// [`device_argmax`]: ExecutionProvider::device_argmax
+    #[allow(clippy::too_many_arguments)]
+    fn device_token_writer(
+        &self,
+        _result: &DeviceBuffer,
+        _input_ids: &DeviceBuffer,
+        _position_ids: &DeviceBuffer,
+        _attention_mask: &DeviceBuffer,
+        _scratch: &DeviceBuffer,
+        _capacity: usize,
+        _next_position: i64,
+        _mask_len: usize,
+        _write_position: bool,
+        _step: u32,
+    ) -> Result<()> {
+        Err(EpError::KernelFailed(format!(
+            "{}: device token writer is not supported",
             self.name()
         )))
     }

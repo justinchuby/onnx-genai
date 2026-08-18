@@ -650,13 +650,16 @@ pub struct MemoryStrategyPlan {
     pub inferred_strategy: MemoryStrategy,
     pub weight_access_pattern: WeightAccessPattern,
     pub total_weight_bytes: u64,
-    /// Resident dequantized-f32 decode-cache bytes folded into
-    /// [`Self::total_weight_bytes`] when the cache is admitted (#971). Zero on
-    /// backends/models that never take the native CPU f32 decode path.
+    /// Resident side-buffer bytes folded into [`Self::total_weight_bytes`] when
+    /// admitted: the dequantized-f32 decode cache (#971) and/or the int4
+    /// `accuracy_level == 0` MLAS SQNBit packed buffer (#1027), both held for the
+    /// session beside the on-disk weights. Zero on backends/models that take
+    /// neither native CPU path.
     pub resident_f32_cache_bytes: u64,
-    /// Whether the plan admitted the resident f32 decode cache. When `false` the
-    /// runtime declined it (expanded footprint over budget) and the kernels
-    /// dequantize on the fly instead of holding the ~8x expansion (#971). Always
+    /// Whether the plan admitted the resident side buffers above. When `false`
+    /// the runtime declined them (expanded footprint over budget): the f32 cache
+    /// dequantizes on the fly and the MLAS int4 route falls back to the borrowed
+    /// zero-copy path, so only the on-disk weights are held (#971, #1027). Always
     /// `true` when [`Self::resident_f32_cache_bytes`] is zero.
     pub f32_weight_cache_admitted: bool,
     pub kv_bytes_per_token: Option<u64>,
@@ -819,6 +822,16 @@ pub struct EngineConfig {
     /// Native decoder device override. `None` follows the execution provider in
     /// [`onnx_genai_ort::SessionOptions`], including `ONNX_GENAI_EP`.
     pub native_device: Option<crate::native_decode_device::NativeDecodeDevice>,
+    /// Persistent native decode batch extent: how many sequences one fused
+    /// forward advances (#750). `None` defers to
+    /// `ONNX_GENAI_NATIVE_DECODE_BATCH`, which defaults to `1`.
+    ///
+    /// Setting it is what makes batch-N *requestable* rather than only
+    /// environment-enabled. The server's `--max-batch` sets it, so a caller who
+    /// asks for concurrent decoding either gets a session shaped for it or gets
+    /// an error -- previously the request was refused because the capability was
+    /// read from a session nobody had asked to build in batch shape (#1064).
+    pub native_decode_batch: Option<usize>,
     /// Decoder-wide numeric precision for the native decode session
     /// (see [`onnx_runtime_session::DecodePrecision`]). Defaults to
     /// [`DecodePrecision::Model`](onnx_runtime_session::DecodePrecision::Model)
@@ -878,6 +891,7 @@ impl Default for EngineConfig {
         Self {
             decode_backend: EngineDecodeBackend::Auto,
             native_device: None,
+            native_decode_batch: None,
             #[cfg(feature = "native-backend")]
             decode_precision: onnx_runtime_session::DecodePrecision::Model,
             page_size: 16,

@@ -68,8 +68,32 @@ impl CPtr {
 /// microkernel. The caller must ensure the host supports AVX2 + FMA (checked by
 /// [`crate::backend::has_simd_x86`]); callers without it must use the generic
 /// fallback instead.
+///
+/// `m == 1` takes the native GEMV ([`sgemm_simd_m1`]); every other `m` takes
+/// the packed GEBP path. The dispatch itself lives in [`sgemm_simd_variant`],
+/// which still accepts the route as an argument so the A/B harness can drive
+/// both in one process — but production no longer has a choice to make, and
+/// there is no env probe on this call.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) fn sgemm_simd(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    sgemm_simd_variant(a, b, c, m, k, n, true);
+}
+
+/// Backend body with the M==1 route decision passed in explicitly rather than
+/// read from env. `use_m1_gemv` only affects `m == 1`; for `m >= 2` the packed
+/// GEBP path is taken unconditionally, which is *why* the M=128 rows in the A/B
+/// harness are a valid control: an M==1-only route cannot move them.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sgemm_simd_variant(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    use_m1_gemv: bool,
+) {
     if m == 0 || n == 0 {
         return;
     }
@@ -80,6 +104,54 @@ pub(crate) fn sgemm_simd(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize
         return;
     }
 
+    // #1091: dedicated M=1 GEMV. MLAS routes M==1 away from its packed GEBP for
+    // exactly this reason (`sgemm.cpp`): "The data from matrix B is not
+    // referenced multiple times, so using a local packed buffer is a wasted
+    // memory copy." The packed path always calls `pack_b`, so at M=1 it pays a
+    // full read+write copy of B (K*N f32) that is reused zero times — the whole
+    // 2.2–4.6x decode gap measured against MLAS on AVX2. This GEMV streams B in
+    // place: no pack, no resident buffer, strictly less memory traffic.
+    //
+    // Dispatch boundary (measured on this host, AVX2, process CPU time, control
+    // -gated so the M=128 prefill rows confirm the run was quiet — see
+    // `bench_f32_gemm_ab`). Per M=1 shape, gemv / packed CPU time:
+    //   1x5120x7168   0.50    1x5120x5120   0.34    1x5120x13824  0.43
+    //   1x13824x5120  0.42    1x5120x152064 0.34
+    // The GEMV strictly dominates the packed default on *every* decode shape
+    // (2.0-2.9x), so there is deliberately no fall-back to `sgemm_simd_packed`
+    // here: it would be uniformly slower. The only residual gap is versus MLAS
+    // (not our default), and only on the two largest shapes -- down_proj
+    // (K=13824, gemv/mlas 1.22) and lm_head (N=152064, gemv/mlas 1.18) -- where
+    // sequential B streaming trails MLAS's blocked M=1 asm; the other three win
+    // outright (0.68-0.93). That MLAS-only boundary is a known limit, not a
+    // regression against the code this build actually ships.
+    //
+    // #1091 landed this behind a default-off env toggle "until the win is
+    // measured". It has now been measured end to end, through an ORT session
+    // rather than a kernel driver: at `1x2048x2048`, f32, one thread on each
+    // side, `ours/ORT` p50 goes 7.57 -> 1.18 with this route on, while the
+    // M=128 prefill row -- which cannot reach it -- stays at 1.03. So the route
+    // is the default and `use_m1_gemv` survives only as the A/B harness's
+    // handle on the path it replaced.
+    if m == 1 && use_m1_gemv {
+        // SAFETY: `SimdX86` is only selected when the host has AVX2+FMA (see
+        // `crate::backend::has_simd_x86`), the same guarantee `micro_6x16`
+        // relies on; slice lengths are validated by the caller (`a.len()==k`,
+        // `b.len()==k*n`, `c.len()==n`).
+        unsafe {
+            sgemm_simd_m1(a, b, c, k, n);
+        }
+        return;
+    }
+
+    sgemm_simd_packed(a, b, c, m, k, n);
+}
+
+/// Packed GEBP path: pack A into `MR`-row panels and B into `NR`-column L1
+/// panels, then drive the `6x16` microkernel over Rayon column strips. This is
+/// the correctness baseline for every `m` and the sole path for `m >= 2`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn sgemm_simd_packed(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     // Pack A once: one contiguous [k][MR] panel per MR-row block, zero-padded.
     let m_panels = m.div_ceil(MR);
     let mut apack = vec![0.0f32; m_panels * k * MR];
@@ -144,6 +216,143 @@ pub(crate) fn sgemm_simd(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize
             pc += KC;
         }
     });
+}
+
+/// Native M=1 SGEMV: `c[1,n] = a[1,k] @ b[k,n]` (overwrite), reading B in place.
+///
+/// Port of the *mechanism* behind MLAS `SgemmKernelM1Avx` (not its code): for a
+/// single output row, matrix B is streamed exactly once, so MLAS deliberately
+/// skips the packed-panel copy the general kernel uses. We mirror that — no
+/// `pack_b`, no scratch, no resident buffer. Columns are tiled 32-wide so four
+/// independent `__m256` accumulators hide the FMA latency chain (MLAS unrolls
+/// K by 4 for the same reason); each 64-byte B cache line is read once and
+/// fully consumed by a 16-lane tile. Rayon parallelizes over disjoint column
+/// strips, so each task overwrites its own region of `c` with no aliasing.
+///
+/// # Safety
+/// The host must support AVX2 + FMA (guaranteed by `SimdX86` selection). `a`
+/// must address `k` f32, `b` `k*n` f32, `c` `n` f32.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sgemm_simd_m1(a: &[f32], b: &[f32], c: &mut [f32], k: usize, n: usize) {
+    // Column strips are the unit of parallelism; width is a multiple of 32 so
+    // every task starts on a 32-lane group boundary. A minimum of 8 groups
+    // (256 columns) keeps the sequential B runs long enough to prefetch while
+    // still giving ~2 tasks per worker for load balance.
+    let threads = rayon::current_num_threads().max(1);
+    let groups = n.div_ceil(32);
+    let target_tasks = threads.saturating_mul(2).max(1);
+    let groups_per_strip = groups.div_ceil(target_tasks).max(8);
+    let strip_cols = groups_per_strip * 32;
+    let strip_count = n.div_ceil(strip_cols);
+
+    let cptr = CPtr(c.as_mut_ptr());
+
+    (0..strip_count).into_par_iter().for_each(|s| {
+        let j0 = s * strip_cols;
+        let nc = strip_cols.min(n - j0);
+        // SAFETY: this strip writes only columns [j0, j0+nc) of `c`, disjoint
+        // from every other strip; AVX2+FMA verified by the caller; the B reads
+        // `b[p*n + col + lane]` stay within `k*n` because `col+lane < n`. `a`
+        // and `b` are shared read-only (`&[f32]` is `Sync`).
+        unsafe {
+            gemv_m1_strip(a.as_ptr(), b.as_ptr(), cptr.get(), k, n, j0, nc);
+        }
+    });
+}
+
+/// One column strip `[j0, j0+nc)` of the M=1 GEMV. See [`sgemm_simd_m1`].
+///
+/// K-outer / N-inner with **sequential** B streaming, mirroring MLAS
+/// `SgemmKernelM1Avx` (`ProcessRowLoop4` over K unrolled ×4, `ProcessColumnLoop`
+/// over N): for a group of up to 4 K-rows we sweep the whole strip contiguously,
+/// so each B row is read front-to-back (hardware-prefetch friendly) exactly
+/// once. C is accumulated in place across the `ceil(K/4)` groups and stays in
+/// cache because a strip is sized to the pool, not to N. This is the layout
+/// that matters for wide outputs (e.g. the 152064-wide lm_head), where a
+/// column-major GEMV would stride B by `N` and thrash the TLB.
+///
+/// # Safety
+/// AVX2+FMA required. `a` addresses `k` f32; `b` addresses `k*n` f32; `c`
+/// addresses `n` f32 and this call writes only `[j0, j0+nc)`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemv_m1_strip(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    k: usize,
+    n: usize,
+    j0: usize,
+    nc: usize,
+) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    unsafe {
+        // Zero this strip's output; we then accumulate into it across K-groups.
+        for j in 0..nc {
+            *c.add(j0 + j) = 0.0;
+        }
+
+        let mut p = 0usize;
+        // K unrolled by 4: one contiguous sweep of the strip per 4 B-rows,
+        // amortising the C load/store over four FMAs (MLAS's ProcessRowLoop4).
+        while p + 4 <= k {
+            let a0 = _mm256_broadcast_ss(&*a.add(p));
+            let a1 = _mm256_broadcast_ss(&*a.add(p + 1));
+            let a2 = _mm256_broadcast_ss(&*a.add(p + 2));
+            let a3 = _mm256_broadcast_ss(&*a.add(p + 3));
+            let r0 = b.add(p * n + j0);
+            let r1 = b.add((p + 1) * n + j0);
+            let r2 = b.add((p + 2) * n + j0);
+            let r3 = b.add((p + 3) * n + j0);
+            let cbase = c.add(j0);
+            let mut jj = 0usize;
+            while jj + 8 <= nc {
+                let mut acc = _mm256_loadu_ps(cbase.add(jj));
+                acc = _mm256_fmadd_ps(a0, _mm256_loadu_ps(r0.add(jj)), acc);
+                acc = _mm256_fmadd_ps(a1, _mm256_loadu_ps(r1.add(jj)), acc);
+                acc = _mm256_fmadd_ps(a2, _mm256_loadu_ps(r2.add(jj)), acc);
+                acc = _mm256_fmadd_ps(a3, _mm256_loadu_ps(r3.add(jj)), acc);
+                _mm256_storeu_ps(cbase.add(jj), acc);
+                jj += 8;
+            }
+            while jj < nc {
+                let col = j0 + jj;
+                *c.add(col) += *a.add(p) * *r0.add(jj)
+                    + *a.add(p + 1) * *r1.add(jj)
+                    + *a.add(p + 2) * *r2.add(jj)
+                    + *a.add(p + 3) * *r3.add(jj);
+                jj += 1;
+            }
+            p += 4;
+        }
+        // K remainder (0..3 rows): one sequential sweep each.
+        while p < k {
+            let av = _mm256_broadcast_ss(&*a.add(p));
+            let rp = b.add(p * n + j0);
+            let cbase = c.add(j0);
+            let mut jj = 0usize;
+            while jj + 8 <= nc {
+                let acc = _mm256_fmadd_ps(
+                    av,
+                    _mm256_loadu_ps(rp.add(jj)),
+                    _mm256_loadu_ps(cbase.add(jj)),
+                );
+                _mm256_storeu_ps(cbase.add(jj), acc);
+                jj += 8;
+            }
+            while jj < nc {
+                *c.add(j0 + jj) += *a.add(p) * *rp.add(jj);
+                jj += 1;
+            }
+            p += 1;
+        }
+    }
 }
 
 /// Pack A into `MR`-row panels: `apack[panel][p*MR + r] = a[(panel*MR+r)*k + p]`,
@@ -366,4 +575,124 @@ mod tests {
         sgemm_simd(&[1.0], &[], &mut c, 2, 0, 2); // k=0: zeros c
         assert_eq!(&c[..4], &[0.0, 0.0, 0.0, 0.0]);
     }
+
+    /// #1091: the native M=1 GEMV must match the naive reference within f32
+    /// tolerance across tile-exact, tail, and multi-cache-line N shapes.
+    fn check_m1(k: usize, n: usize) {
+        if !has_simd_x86() {
+            return;
+        }
+        let a = fill(k, 3);
+        let b = fill(k * n, 11);
+        let expect = reference(&a, &b, 1, k, n);
+        let mut got = vec![0.0f32; n];
+        // SAFETY: has_simd_x86() confirmed AVX2+FMA; slices are sized 1*k / k*n / n.
+        unsafe {
+            sgemm_simd_m1(&a, &b, &mut got, k, n);
+        }
+        for (idx, (g, e)) in got.iter().zip(expect.iter()).enumerate() {
+            let tol = 1e-3 * (1.0 + e.abs());
+            assert!(
+                (g - e).abs() <= tol,
+                "m1 mismatch at {idx} for 1x{k}x{n}: got {g}, expect {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn m1_gemv_shapes() {
+        check_m1(64, 32); // exact 32-col group
+        check_m1(128, 16); // two 8-col tiles, no 32-group
+        check_m1(96, 40); // one 32-group + 8-tile
+        check_m1(50, 37); // 32-group + tail scalar (37 = 32 + 5)
+        check_m1(1, 3); // tiny, all scalar tail
+        check_m1(512, 5120); // model-scale decode width
+    }
+
+    /// The M=1 GEMV must agree with the packed path within f32 tolerance — they
+    /// differ only by summation reassociation, never in which products are
+    /// summed. The packed side is reached through `sgemm_simd_variant(.., false)`
+    /// rather than `sgemm_simd`, because `sgemm_simd` now *is* the GEMV at
+    /// `m == 1`; comparing it against itself would prove nothing.
+    #[test]
+    fn m1_route_matches_packed_within_tolerance() {
+        if !has_simd_x86() {
+            return;
+        }
+        let (k, n) = (300usize, 517usize);
+        let a = fill(k, 5);
+        let b = fill(k * n, 9);
+        let mut packed = vec![0.0f32; n];
+        sgemm_simd_variant(&a, &b, &mut packed, 1, k, n, false);
+        let mut gemv = vec![0.0f32; n];
+        // SAFETY: AVX2+FMA confirmed; sizes match 1*k / k*n / n.
+        unsafe {
+            sgemm_simd_m1(&a, &b, &mut gemv, k, n);
+        }
+        let max_ref = packed.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let max_err = gemv
+            .iter()
+            .zip(packed.iter())
+            .fold(0.0f32, |m, (&g, &p)| m.max((g - p).abs()));
+        assert!(
+            max_err <= 1e-3 * (1.0 + max_ref),
+            "m1 GEMV vs packed max abs error {max_err} exceeds tolerance (max_ref {max_ref})"
+        );
+        // ...and the two really are different code, so the tolerance check
+        // above is not comparing one path with itself.
+        assert_ne!(
+            packed, gemv,
+            "packed and GEMV produced identical bits; one of the two routes was \
+             not taken and the tolerance assertion is vacuous"
+        );
+    }
+
+    /// What the public entry point actually does at `m == 1`.
+    ///
+    /// The route used to be an env toggle that defaulted to the packed path, so
+    /// the shipped binary never reached the GEMV. Nothing else in this file
+    /// fails if that regresses -- `m1_gemv_shapes` calls the kernel directly and
+    /// `m1_route_matches_packed_within_tolerance` names both routes explicitly
+    /// -- which is exactly why this test exists, and why it asserts bit
+    /// equality with the GEMV rather than a tolerance against the packed path.
+    #[test]
+    fn the_default_entry_point_routes_m1_to_the_gemv() {
+        if !has_simd_x86() {
+            return;
+        }
+        let (k, n) = (300usize, 517usize);
+        let a = fill(k, 5);
+        let b = fill(k * n, 9);
+        let mut shipped = vec![0.0f32; n];
+        sgemm_simd(&a, &b, &mut shipped, 1, k, n);
+        let mut gemv = vec![0.0f32; n];
+        // SAFETY: AVX2+FMA confirmed; sizes match 1*k / k*n / n.
+        unsafe {
+            sgemm_simd_m1(&a, &b, &mut gemv, k, n);
+        }
+        assert_eq!(
+            shipped, gemv,
+            "sgemm_simd must take the M=1 GEMV, bit for bit"
+        );
+
+        // The M>=2 rows are the control: the GEMV cannot reach them, so the
+        // shipped entry must still be the packed kernel there.
+        let a2 = fill(2 * k, 5);
+        let mut shipped2 = vec![0.0f32; 2 * n];
+        sgemm_simd(&a2, &b, &mut shipped2, 2, k, n);
+        let mut packed2 = vec![0.0f32; 2 * n];
+        sgemm_simd_variant(&a2, &b, &mut packed2, 2, k, n, false);
+        assert_eq!(
+            shipped2, packed2,
+            "M>=2 must still be the packed GEBP path, bit for bit"
+        );
+    }
+
+    // The route is a compile-time constant, so no environment variable can
+    // reach it. There is deliberately no test that sets
+    // `ONNX_GENAI_CPU_MM_SIMD_M1_GEMV` to prove that: `set_var` racing another
+    // thread's `getenv` is a data race, and this test binary runs its cases in
+    // parallel next to dozens of live `env::var` readers. The bit-exact
+    // comparison in `the_default_entry_point_routes_m1_to_the_gemv` pins the
+    // route without touching process state.
 }

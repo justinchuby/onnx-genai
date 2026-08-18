@@ -27,13 +27,19 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Node, broadcast_shapes, compute_contiguous_strides};
+use onnx_runtime_ir::{
+    Attribute, DataType, Graph, Node, broadcast_shapes, compute_contiguous_strides,
+};
 use rayon::prelude::*;
 
 use super::check_arity;
+use super::governed_weight_cache::{CacheVerdict, GovernedWeightCache};
 use super::half_gemm::{self, HalfFormat, MatrixLayout};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use super::half_gemv;
 use super::weight_transpose::{self, WeightTransposeKey};
 use crate::backend::CpuBackend;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
@@ -122,8 +128,126 @@ pub fn bnns_prefill_stats() -> (usize, u64) {
 
 /// Returns the number of entries in the process-global weight-transpose caches.
 /// (f16_entries, f32_entries). Used by benchmarks to verify cache reuse across turns.
+///
+/// For memory questions use [`weight_transpose_cache_bytes`] instead: an entry
+/// count cannot distinguish a cache holding kilobytes from one holding gigabytes.
 pub fn weight_transpose_cache_sizes() -> (usize, usize) {
     weight_transpose::cache_sizes()
+}
+
+/// Bytes of transposed weight held by the process-global weight-transpose caches.
+///
+/// Each entry is a full `K x N` copy of a constant weight kept for the session,
+/// so this scales with model size and belongs in the memory plan (#1056).
+pub fn weight_transpose_cache_bytes() -> usize {
+    weight_transpose::cache_bytes()
+}
+
+/// Admit (`true`) or decline (`false`) the process-global weight-transpose
+/// caches for the rest of the session (#1056).
+///
+/// When declined, the `MatMul`/`Gemm` kernels compute each constant-weight
+/// transpose per call and retain nothing, so the resident, session-lifetime,
+/// weight-scaled `K x N` copies never accrue. The engine calls this once at
+/// load from the memory-strategy plan's verdict, beside the identical gates for
+/// the resident dequant f32 cache (#987) and the MLAS SQNBit packed buffer
+/// (#1051), so one admission decision governs all three buffers. Declining is a
+/// pure performance tradeoff: the transpose is byte-identical whether cached or
+/// recomputed, so generated tokens are unchanged.
+pub fn set_weight_transpose_cache_enabled(enabled: bool) {
+    weight_transpose::set_cache_enabled(enabled);
+}
+
+/// Predicted bytes the process-global weight-transpose caches will hold for
+/// `graph` once it has run — the *prediction* the memory-strategy plan budgets
+/// for, whose accuracy [`weight_transpose_cache_bytes`] measures after the fact.
+///
+/// # What actually populates the cache
+///
+/// The cache holds one f32/f16 `N x K` transpose per **constant** (initializer)
+/// weight that a kernel feeds through [`weight_transpose::cached_transpose_f32`]
+/// / [`weight_transpose::cached_transpose_f16`]. The precise callers, and hence
+/// this predictor, are platform-split because the transpose is only consumed by
+/// the CPU EP's fast paths:
+///
+/// * **All platforms — `Gemm` with `transB != 0`** (`gemm.rs`
+///   `GemmKernel::execute`, the `transposed_b(&b, n, k)` call added in #1035):
+///   a constant `B` stored `[N, K]` is transposed once to the `[K, N]` the
+///   shared GEMM consumes and cached as **f32** (`gemm.rs` first widens `B` to
+///   dense f32 via `MatMulPrepack::dense`). Cost `N * K * 4` bytes. A
+///   non-constant `B`, or `transB == 0`, never caches. When both operands are
+///   f16/bf16 the node takes the half path (`try_half_gemm`) and does not
+///   transpose; this predictor still counts it (over-predicts, never under —
+///   the #1056-mandated safe direction), because whether `A` is half is not a
+///   graph-static property here.
+///
+/// * **Apple only — `MatMul` / `FusedMatMulBias` with a constant `B`**
+///   (`matmul.rs` `execute_with_backend` and `fused_matmul_bias.rs`, all guarded
+///   by `#[cfg(any(target_os = "macos", target_os = "ios"))]`): the Accelerate
+///   GEMV / thin-M paths cache the transpose as **f16** (`N * K * 2`, raw `u16`
+///   bit patterns) for a contiguous Float16 `B`, else **f32** (`N * K * 4`).
+///   These call sites are compiled out on x86/Windows, so this predictor's
+///   Apple arm is likewise `cfg`-gated: a binary predicts exactly what its own
+///   kernels will allocate.
+///
+/// The shape-keyed kernel cache instantiates a node once per activation shape
+/// (prefill `m > 1`, decode `m == 1`), but every instance keys the *global*
+/// cache on `(weight address, K, N)`, so the second instantiation hits the
+/// existing entry and allocates nothing extra. Unlike the MLAS packed buffer
+/// (#1051), the transpose is therefore held once per weight, not once per
+/// instantiation — no per-copy multiplier applies.
+pub fn weight_transpose_cache_predicted_bytes(graph: &Graph) -> u64 {
+    let mut total = 0_u64;
+    for node in graph.nodes.values() {
+        total = total.saturating_add(node_weight_transpose_cache_bytes(node, graph));
+    }
+    total
+}
+
+/// Element count of a node's constant 2-D `B` initializer (input index 1), or
+/// `None` when `B` is absent, non-constant, or not rank-2. Shared by both arms
+/// of [`weight_transpose_cache_predicted_bytes`].
+fn constant_b_numel(node: &Node, graph: &Graph) -> Option<(u64, DataType)> {
+    let b_value = (*node.inputs.get(1)?)?;
+    let weight = graph.initializers.get(&b_value)?;
+    let dims = weight.dims();
+    if dims.len() != 2 {
+        return None;
+    }
+    let numel = (dims[0] as u64).checked_mul(dims[1] as u64)?;
+    Some((numel, weight.dtype()))
+}
+
+/// Per-node contribution to [`weight_transpose_cache_predicted_bytes`]. Mirrors
+/// exactly the kernel call sites documented there.
+fn node_weight_transpose_cache_bytes(node: &Node, graph: &Graph) -> u64 {
+    if !node.is_default_domain() {
+        return 0;
+    }
+    // All platforms: `Gemm` with `transB != 0` transposes a constant `B[N,K]`
+    // to `[K,N]` and caches it as f32 (`gemm.rs:119`).
+    if node.op_type == "Gemm" {
+        let trans_b = node.attr("transB").and_then(Attribute::as_int).unwrap_or(0) != 0;
+        if !trans_b {
+            return 0;
+        }
+        let Some((numel, _dtype)) = constant_b_numel(node, graph) else {
+            return 0;
+        };
+        return numel.saturating_mul(4);
+    }
+    // Apple only: `MatMul` / `FusedMatMulBias` cache a constant `B`'s transpose
+    // in the Accelerate paths (see the function docs). Compiled out elsewhere so
+    // the predictor matches the kernels actually present in this binary.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if node.op_type == "MatMul" || node.op_type == "FusedMatMulBias" {
+        let Some((numel, dtype)) = constant_b_numel(node, graph) else {
+            return 0;
+        };
+        let elem = if dtype == DataType::Float16 { 2 } else { 4 };
+        return numel.saturating_mul(elem);
+    }
+    0
 }
 
 /// Evict all entries from the global weight-transpose caches.
@@ -135,6 +259,265 @@ pub fn weight_transpose_cache_sizes() -> (usize, usize) {
 /// remaining lifetime window and bounds cache growth across model lifetimes.
 pub fn clear_weight_transpose_caches() {
     weight_transpose::clear_all();
+}
+
+// ---------------------------------------------------------------------------
+// #1056: governance for the per-kernel `MatMulPrepack::dense` widened-f32 cache.
+// ---------------------------------------------------------------------------
+//
+// `MatMulPrepack::dense` keeps a session-lifetime `4 * K * N` f32 copy of a
+// **constant** operand whenever that operand is not already a contiguous f32
+// view -- i.e. whenever `to_dense_f32_widen` has to allocate (f16/bf16/f64, or a
+// strided f32). A contiguous f32 constant is borrowed zero-copy and nothing is
+// retained, which is why this buffer is dormant on the int4 / f32-contiguous
+// models we exercise most and was never reported to the plan. It is nonetheless
+// a resident, weight-scaled buffer and so must be declinable (#1056), exactly
+// like the resident dequant f32 cache (#987), the MLAS SQNBit packed buffer
+// (#1051), and the weight-transpose cache (#1079).
+//
+// The admission verdict is a process-global that production writes once, at
+// load, from the memory-strategy plan. Tests must never write it (that is the
+// #983 / #1033 / #1079 "passes alone, fails in company" trap); they use the
+// thread-local [`DenseCacheEnabledScope`] instead, which leaves the global
+// untouched and restores on drop even on panic.
+
+/// Admission verdict for the per-kernel `MatMulPrepack::dense` widened-f32
+/// caches. Defaults to enabled so the out-of-box path is unchanged.
+static MATMUL_DENSE_CACHE_ENABLED: AtomicBool = AtomicBool::new(true);
+
+thread_local! {
+    /// Test-only, per-thread override of the dense-cache admission verdict.
+    /// `None` defers to the process-global; `Some(v)` forces `v` on **this
+    /// thread only**, so one test's decline cannot leak into another test
+    /// running concurrently on a different worker thread. Set exclusively
+    /// through [`DenseCacheEnabledScope`]. Production never touches this.
+    static MATMUL_DENSE_CACHE_ENABLED_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Admit (`true`) or decline (`false`) the per-kernel `MatMulPrepack::dense`
+/// widened-f32 caches for the rest of the session (#1056).
+///
+/// When declined, `MatMulPrepack::dense` widens the constant operand transiently
+/// on each call and frees it, so the resident, session-lifetime `4 * K * N`
+/// copies never accrue. The engine calls this once at load from the
+/// memory-strategy plan's verdict, beside the identical gates for the resident
+/// dequant f32 cache (#987), the MLAS SQNBit packed buffer (#1051), and the
+/// weight-transpose cache (#1079), so one admission decision governs all four
+/// buffers. Declining is a pure performance tradeoff: the widened f32 is
+/// byte-identical whether cached or recomputed, so generated tokens are
+/// unchanged.
+///
+/// This is the **production** entry point. Because it writes a process-global
+/// every worker thread reads, tests must not call it; they use
+/// [`DenseCacheEnabledScope`].
+pub fn set_matmul_dense_cache_enabled(enabled: bool) {
+    MATMUL_DENSE_CACHE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether the `MatMulPrepack::dense` caches are currently admitted, honouring a
+/// test-only thread-local override ([`DenseCacheEnabledScope`]) over the global.
+pub(crate) fn matmul_dense_cache_enabled() -> bool {
+    if let Some(forced) = MATMUL_DENSE_CACHE_ENABLED_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    MATMUL_DENSE_CACHE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// The verdict a freshly-built [`MatMulPrepack`] slot carries, derived from the
+/// current admission gate. The predicted byte figure is per-*graph* (see
+/// [`matmul_dense_cache_predicted_bytes`]) rather than per-slot, because a
+/// prepack does not know `K`/`N` until an operand arrives; the slot therefore
+/// carries only the admit/decline decision, and [`GovernedWeightCache::live_bytes`]
+/// reports what it actually holds so a prediction can be checked against reality.
+fn dense_cache_verdict() -> CacheVerdict {
+    if matmul_dense_cache_enabled() {
+        CacheVerdict::admit(0)
+    } else {
+        CacheVerdict::decline(0)
+    }
+}
+
+/// RAII, thread-local scoping of the dense-cache admission verdict for tests
+/// (#1056). Constructing one forces [`matmul_dense_cache_enabled`] to `enabled`
+/// on the current thread until dropped, restoring the previous value even on
+/// panic. Because the override is thread-local, a test scoping a decline here
+/// does not race the other `MatMulPrepack` tests running concurrently.
+///
+/// The verdict is read at `MatMulPrepack` construction, so a test must build its
+/// kernel *inside* the scope for the decline to take effect.
+#[cfg(test)]
+pub(crate) struct DenseCacheEnabledScope {
+    prev: Option<bool>,
+}
+
+#[cfg(test)]
+impl DenseCacheEnabledScope {
+    pub(crate) fn new(enabled: bool) -> Self {
+        let prev = MATMUL_DENSE_CACHE_ENABLED_OVERRIDE.with(|cell| cell.replace(Some(enabled)));
+        Self { prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for DenseCacheEnabledScope {
+    fn drop(&mut self) {
+        MATMUL_DENSE_CACHE_ENABLED_OVERRIDE.with(|cell| cell.set(self.prev));
+    }
+}
+
+/// How many times an autoregressive decode session materializes each populated
+/// `MatMulPrepack::dense` copy -- the shape-keyed instantiation multiplier that
+/// the first cut of this accounting (like #1051's before it) missed.
+///
+/// The executor's kernel cache is keyed by `(node, resolved_input_shapes)`, so a
+/// decoder compiles a `MatMul` node once for the prefill shape (`m > 1`) and
+/// once for the decode shape (`m == 1`), each a separate `MatMulPrepack` holding
+/// its own `dense`. The only operand that reaches `dense` is a constant non-f32
+/// `B` paired with an f32 `A`, and in that case both the prefill and the decode
+/// instance take the generic/direct-f32 GEMM that widens `B`, so **both** retain
+/// a `4 * numel` copy for the whole session. Measured directly by
+/// [`predicted_dense_bytes_equal_actual_after_matmul_execution`]: a prefill
+/// instance plus a decode instance of one f16-`B` node sum to exactly two
+/// copies. Accounting one copy under-reports the resident footprint by 2x -- the
+/// dangerous (under-reporting) direction for an admission gate. A prefill-only
+/// run holds one copy, so this over-estimates there, which is the safe direction
+/// (the gate declines sooner). Matches #1051's `MLAS_PACKED_DECODE_INSTANTIATIONS`.
+const MATMUL_DENSE_DECODE_INSTANTIATIONS: u64 = 2;
+
+/// Predicted bytes the per-kernel `MatMulPrepack::dense` caches will hold for
+/// `graph` once it has run -- the *prediction* the memory-strategy plan budgets
+/// for, whose accuracy the summed [`GovernedWeightCache::live_bytes`] of the
+/// executed kernels measures after the fact.
+///
+/// # What actually populates the cache
+///
+/// `MatMulPrepack::dense(index, view)` caches iff the operand is **constant**
+/// (a graph initializer, tracked by `set_constant_inputs`) **and**
+/// `to_dense_f32_widen` returns an owned buffer -- that is, the operand is *not*
+/// an already-contiguous f32 view (see `dtype::to_dense_f32_widen`). The cached
+/// buffer is a `Vec<f32>` of `numel` elements, so it costs `4 * numel` bytes.
+///
+/// A graph initializer's stored layout is contiguous (`WeightRef` carries only
+/// dtype and dims, no strides), so from the graph the caching condition reduces
+/// to: **a constant operand whose dtype is a non-f32 float** (f16 / bf16 / f64).
+/// A contiguous f32 constant is borrowed zero-copy and contributes nothing.
+///
+/// # The per-shape instantiation multiplier
+///
+/// The executor's kernel cache is **shape-keyed** (`KernelKey { node, shapes }`
+/// in `onnx-runtime-session/src/executor/kernel_cache.rs`): a `MatMul` kernel is
+/// compiled and cached *per distinct resolved activation shape*, and each
+/// instance is a *separate* `MatMulPrepack` with its own `dense` slot. Unlike
+/// the weight-transpose cache -- process-global and keyed on the weight address,
+/// so a second instantiation reuses the first -- the dense cache is per-instance,
+/// so its resident footprint is multiplied by the number of instantiations that
+/// widen the constant `B`.
+///
+/// An autoregressive decoder presents exactly two activation shapes to each such
+/// node: the prefill shape (`m > 1`) and the decode shape (`m == 1`). The only
+/// case that populates `dense` is a constant non-f32 `B` paired with an f32 `A`
+/// (a same-half `B`+`A` takes `try_matmul_half`, and both the `m == 1` GEMV and
+/// the MLAS half-prefill fast paths require `A` to be half, so they are skipped
+/// when `A` is f32) -- and in that case **both** the prefill instance (via the
+/// generic/direct-f32 GEMM) and the decode instance (via the same paths at
+/// `m == 1`) widen `B` and each retain their own `4 * numel` copy. So the
+/// session holds [`MATMUL_DENSE_DECODE_INSTANTIATIONS`] copies, not one. This is
+/// the same shape-keyed multiplier the MLAS SQNBit accounting missed and #1051
+/// corrected; counting one copy here would under-report the footprint by 2x --
+/// the dangerous (under-reporting) direction for an admission gate.
+///
+/// # Direction of error
+///
+/// Per #1056 this predictor **over-predicts, never under-predicts**:
+///
+/// * When both operands are the *same* half dtype and contiguous, the node
+///   takes the packed half path (`try_matmul_half`) and never calls `dense`, so
+///   the true cost is zero while this still counts it. Whether the other operand
+///   is half is not a graph-static property of the constant one, so counting is
+///   the safe direction.
+/// * A prefill-only run (no `m == 1` step) instantiates one copy, so accounting
+///   [`MATMUL_DENSE_DECODE_INSTANTIATIONS`] over-estimates for that workload,
+///   which only makes the gate decline sooner (safe). Conversely, a session
+///   that presents *more* than two distinct activation shapes to a node (e.g.
+///   several prompt lengths across `generate` calls) could instantiate more than
+///   two copies; the multiplier follows #1051's convention of bounding the
+///   autoregressive decode workload at prefill + decode, and that residual is
+///   the same documented class as #1051's.
+/// * The one residual gap that cannot be closed from the graph is a **non-
+///   contiguous f32** constant (a column-major weight): the kernel *would* cache
+///   it (`to_dense_f32_widen` allocates), but `WeightRef` exposes no strides, so
+///   it is indistinguishable from a contiguous f32 constant here and is *not*
+///   counted -- a potential under-prediction. No such operand occurs in the
+///   models this repo exercises (the documented column-major weight, the lm_head
+///   projection, is f16 and so *is* counted via the dtype rule); if f32
+///   column-major MatMul weights ever appear, the loader must expose their
+///   layout for this predictor to see them. Documented rather than silently
+///   over-counting every f32 weight, which would inflate the budget on the
+///   overwhelmingly common contiguous-f32 case.
+///
+/// The predicted-equals-actual test drives *both* a prefill and a decode
+/// instantiation of one node and sums their `live_bytes`, so the ratio it
+/// asserts is 1.00 against the multiplied prediction -- a test that saw only one
+/// instantiation could not defend against a dropped multiplier.
+pub fn matmul_dense_cache_predicted_bytes(graph: &Graph) -> u64 {
+    let mut total = 0_u64;
+    for node in graph.nodes.values() {
+        total = total.saturating_add(node_matmul_dense_cache_bytes(node, graph));
+    }
+    total
+}
+
+/// Per-node contribution to [`matmul_dense_cache_predicted_bytes`]. Mirrors the
+/// caching condition in [`MatMulPrepack::dense`] exactly.
+fn node_matmul_dense_cache_bytes(node: &Node, graph: &Graph) -> u64 {
+    // Only the f32 `MatMul` kernel and its bias-fused variant own a
+    // `MatMulPrepack`; every other op either has no dense cache or (MatMulNBits)
+    // is accounted separately. FusedMatMulBias is included because the optimiser
+    // may already have fused a `MatMul + Add` before this predictor runs, and it
+    // holds the identical `dense` cache.
+    if !node.is_default_domain() || (node.op_type != "MatMul" && node.op_type != "FusedMatMulBias")
+    {
+        return 0;
+    }
+    let mut total = 0_u64;
+    for index in 0..2 {
+        total = total.saturating_add(dense_operand_cache_bytes(node, graph, index));
+    }
+    // The shape-keyed kernel cache instantiates this node once per activation
+    // shape (prefill + decode), each holding its own `dense` copy; see
+    // [`MATMUL_DENSE_DECODE_INSTANTIATIONS`].
+    total.saturating_mul(MATMUL_DENSE_DECODE_INSTANTIATIONS)
+}
+
+/// Bytes `MatMulPrepack::dense(index, ..)` retains for one operand of `node`:
+/// `4 * numel` for a constant non-f32-float initializer, else 0. See
+/// [`matmul_dense_cache_predicted_bytes`] for the reasoning.
+fn dense_operand_cache_bytes(node: &Node, graph: &Graph, index: usize) -> u64 {
+    let Some(Some(value)) = node.inputs.get(index) else {
+        return 0;
+    };
+    let Some(weight) = graph.initializers.get(value) else {
+        return 0;
+    };
+    // A contiguous f32 constant is borrowed zero-copy (no cache). Only float
+    // dtypes reach `dense` (`to_dense_f32_widen` rejects non-float), and every
+    // non-f32 float widens to an owned `4 * numel` f32 copy.
+    let widens_to_owned = matches!(
+        weight.dtype(),
+        DataType::Float16 | DataType::BFloat16 | DataType::Float64
+    );
+    if !widens_to_owned {
+        return 0;
+    }
+    let numel = weight
+        .dims()
+        .iter()
+        .try_fold(1_u64, |acc, &dim| acc.checked_mul(dim as u64));
+    match numel {
+        Some(numel) => numel.saturating_mul(4),
+        None => u64::MAX,
+    }
 }
 
 /// Pre-compute and cache the f16 transpose of a weight matrix.
@@ -200,12 +583,22 @@ pub unsafe fn precompute_f32_weight_transpose(data_ptr: *const f32, k: usize, n:
 /// in the global cache rather than recomputing it. Each memo stores the
 /// [`WeightTransposeKey`] it was filled for, so it is validated against the
 /// operand actually being multiplied on every call (#845).
-#[derive(Default)]
 pub(crate) struct MatMulPrepack {
     constant_inputs: [bool; 2],
-    dense: [OnceLock<Vec<f32>>; 2],
+    /// Session-lifetime widened-f32 copy of a constant operand, governed by the
+    /// memory plan (#1056): filled only under an admitting verdict, and reports
+    /// its own held bytes via [`GovernedWeightCache::live_bytes`]. Only populated
+    /// when the operand is not already contiguous f32 (see [`Self::dense`]).
+    dense: [GovernedWeightCache<f32>; 2],
     #[cfg(feature = "mlas")]
     packed_b: OnceLock<mlas_sys::PackedB>,
+    /// MLAS-packed f32 panel built once from a constant **f16** B weight.
+    ///
+    /// The widened f32 copy is a temporary: it is consumed by `PackedB::new`
+    /// and dropped, so this costs one packed panel rather than the packed panel
+    /// plus a permanent 4*K*N dense copy the way `dense[1]` + `packed_b` would.
+    #[cfg(feature = "mlas")]
+    packed_b_from_half: OnceLock<Option<(WeightTransposeKey, mlas_sys::PackedB)>>,
     /// Lazily-computed transpose of the B weight matrix for the Accelerate
     /// column-parallel GEMV path, with the key it was computed for. Only
     /// populated for constant (model weight) inputs.
@@ -235,13 +628,59 @@ pub(crate) struct MatMulPrepack {
     contiguous_b_f16: OnceLock<Arc<Vec<u16>>>,
 }
 
+impl Default for MatMulPrepack {
+    /// Build a prepack whose `dense` slots carry the current admission verdict
+    /// (#1056). Manual rather than derived because [`GovernedWeightCache`] has no
+    /// `Default`: an unaccounted cache must be impossible to construct by
+    /// accident, so every slot is stamped with the plan's admit/decline decision
+    /// at birth (read here from the process-global gate the engine set at load).
+    fn default() -> Self {
+        let verdict = dense_cache_verdict();
+        Self {
+            constant_inputs: [false; 2],
+            dense: [
+                GovernedWeightCache::new(verdict),
+                GovernedWeightCache::new(verdict),
+            ],
+            #[cfg(feature = "mlas")]
+            packed_b: OnceLock::new(),
+            #[cfg(feature = "mlas")]
+            packed_b_from_half: OnceLock::new(),
+            transposed_b: OnceLock::new(),
+            transposed_b_f16: OnceLock::new(),
+            contiguous_b_f16: OnceLock::new(),
+        }
+    }
+}
+
 impl MatMulPrepack {
+    /// Total bytes the `dense` widened-f32 caches currently hold across both
+    /// operand slots -- the figure a prediction is checked against (#1056).
+    #[cfg(test)]
+    pub(crate) fn dense_live_bytes(&self) -> u64 {
+        self.dense[0]
+            .live_bytes()
+            .saturating_add(self.dense[1].live_bytes())
+    }
+
     pub(crate) fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
         for (index, is_constant) in self.constant_inputs.iter_mut().enumerate() {
             *is_constant = constant_inputs.get(index).copied().unwrap_or(false);
         }
     }
 
+    /// Widen a MatMul operand to dense f32, reusing a session-lifetime copy for
+    /// a constant operand when the memory plan admits it (#1056).
+    ///
+    /// A non-constant operand, or one already stored as contiguous f32, is
+    /// handled exactly as before: `to_dense_f32_widen` borrows contiguous f32
+    /// zero-copy and only allocates a transient for the widening cases.
+    ///
+    /// For a constant operand that must be widened (`Cow::Owned`), the widened
+    /// buffer is retained in the governed cache **iff the plan admitted it**.
+    /// When declined, [`GovernedWeightCache`] stores nothing, and this returns
+    /// the freshly-widened `Cow::Owned` for the caller to use and drop at the end
+    /// of the call -- byte-identical output, only recomputed each time.
     pub(crate) fn dense<'a>(
         &'a self,
         index: usize,
@@ -250,19 +689,25 @@ impl MatMulPrepack {
         if !self.constant_inputs[index] {
             return to_dense_f32_widen("MatMul", view);
         }
-        if let Some(cached) = self.dense[index].get() {
+        if let Some(cached) = self.dense[index].filled() {
             return Ok(Cow::Borrowed(cached));
         }
 
         match to_dense_f32_widen("MatMul", view)? {
             Cow::Borrowed(dense) => Ok(Cow::Borrowed(dense)),
             Cow::Owned(dense) => {
-                let _ = self.dense[index].set(dense);
-                Ok(Cow::Borrowed(
-                    self.dense[index]
-                        .get()
-                        .expect("constant MatMul prepack was just initialized"),
-                ))
+                if self.dense[index].verdict().is_admitted() {
+                    // Admitted: retain the widened copy for the session and hand
+                    // back a borrow of it. `get_or_fill` builds exactly once.
+                    let cached = self.dense[index]
+                        .get_or_fill(|| dense)
+                        .expect("an admitted governed cache fills its buffer");
+                    Ok(Cow::Borrowed(cached))
+                } else {
+                    // Declined: keep nothing resident; the caller owns and frees
+                    // this transient widen at the end of the call.
+                    Ok(Cow::Owned(dense))
+                }
             }
         }
     }
@@ -284,6 +729,15 @@ impl MatMulPrepack {
     )]
     pub(crate) fn transposed_b(&self, b: &[f32], k: usize, n: usize) -> Option<&[f32]> {
         if !self.constant_inputs[1] {
+            return None;
+        }
+        // #1056: when the plan declines the transpose cache, hand back `None` so
+        // the caller recomputes a transient transpose per call (freed at the end
+        // of the call) rather than memoizing an `Arc` in this kernel instance —
+        // that per-instance memo would survive the session and, multiplied by
+        // the shape-keyed kernel-cache instantiations, is exactly the resident
+        // footprint the decline is meant to shed.
+        if !weight_transpose::cache_enabled() {
             return None;
         }
         let key = WeightTransposeKey::new(b.as_ptr(), k, n);
@@ -321,6 +775,10 @@ impl MatMulPrepack {
         use onnx_runtime_ir::DataType;
         if !self.constant_inputs[1] || b_view.dtype != DataType::Float16 || !b_view.is_contiguous()
         {
+            return None;
+        }
+        // #1056: declined cache -> recompute per call, retain nothing.
+        if !weight_transpose::cache_enabled() {
             return None;
         }
         // The caller derives `k` from A and `n` from B, so operands that
@@ -421,6 +879,60 @@ impl MatMulPrepack {
         (cached.len() == b_view.numel()).then(|| cached.as_slice())
     }
 
+    /// MLAS-packed B built by widening a constant f16 weight to f32 once.
+    ///
+    /// Returns `None` for a non-constant B: an activation would have to be
+    /// re-widened and re-packed on every call, which is the cost this exists to
+    /// remove, and caching it would be wrong the moment the activation changed.
+    #[cfg(feature = "mlas")]
+    fn packed_b_from_half(
+        &self,
+        view: &TensorView<'_>,
+        k: usize,
+        n: usize,
+    ) -> Result<Option<&mlas_sys::PackedB>> {
+        if !self.constant_inputs[1] {
+            return Ok(None);
+        }
+        // Defence in depth, mirroring `transposed_b`: a memo is only served
+        // back for the exact weight it was built from. Today the executor's
+        // kernel cache keys on node and input shapes and a constant input is a
+        // graph initializer whose address is stable, so the key can only ever
+        // match; the check exists so that broadening "constant" later fails
+        // loudly instead of silently returning another tensor's pack.
+        let key = WeightTransposeKey::new(view.data_ptr::<u16>(), k, n);
+        if let Some(cached) = self.packed_b_from_half.get() {
+            return Ok(cached
+                .as_ref()
+                .and_then(|(cached_key, packed)| (*cached_key == key).then_some(packed)));
+        }
+        let widened = to_dense_f32_widen("MatMul", view)?;
+        if key.numel() != Some(widened.len()) {
+            return Ok(None);
+        }
+        let packed = mlas_sys::PackedB::new(n, k, &widened);
+        drop(widened);
+        Ok(self
+            .packed_b_from_half
+            .get_or_init(|| Some((key, packed)))
+            .as_ref()
+            .and_then(|(cached_key, packed)| (*cached_key == key).then_some(packed)))
+    }
+
+    /// Whether the once-widened MLAS pack for a constant f16 B has been built.
+    ///
+    /// Lets sibling modules' tests assert which route served a call; the field
+    /// itself stays private to this module.
+    #[cfg(test)]
+    pub(crate) fn half_pack_is_built(&self) -> bool {
+        #[cfg(feature = "mlas")]
+        {
+            self.packed_b_from_half.get().is_some_and(Option::is_some)
+        }
+        #[cfg(not(feature = "mlas"))]
+        false
+    }
+
     #[cfg(feature = "mlas")]
     fn packed_b(&self, b: &[f32], k: usize, n: usize) -> Option<&mlas_sys::PackedB> {
         self.constant_inputs[1].then(|| {
@@ -484,6 +996,55 @@ fn gemm_packed(
     assert_eq!(packed.dimensions(), (k, n));
     mlas_sys::sgemm_nn_packed(m, a, packed, c);
     Ok(())
+}
+
+/// f16 prefill through MLAS SGEMM on a once-widened, once-packed B.
+///
+/// The portable blocked half GEMM re-packs B into cache-sized panels on *every*
+/// call and drives them from a 4x8 microkernel on the global rayon pool. For a
+/// constant weight all of that is avoidable: ORT widens f16 to f32 and runs the
+/// same tuned SGEMM it uses for float, and the difference is not small.
+/// `128x3584x3584` MatMul measured 2.44x slower than ORT at one thread and
+/// 8.24x at eight, because our scaling was 2.2x where ORT's was 7.5x.
+///
+/// Widening B is paid once and the f32 copy is dropped immediately, so the
+/// steady-state footprint is one MLAS panel rather than a panel plus a
+/// permanent dense copy. Only A is widened per call: `M*K` against B's `K*N`.
+///
+/// Returns `None` — leaving the caller's existing path untouched — for a
+/// non-MLAS backend, a non-f16 operand, a non-contiguous or wrongly-sized B, an
+/// activation B, or `M <= 1`. `M = 1` is excluded because packing needs row
+/// reuse to pay for itself and the decode GEMV is already at parity with ORT.
+#[cfg(feature = "mlas")]
+pub(crate) fn try_packed_half_prefill(
+    prepack: &MatMulPrepack,
+    backend: CpuBackend,
+    a: &TensorView,
+    b: &TensorView,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Option<Vec<f32>>> {
+    if backend != CpuBackend::Mlas
+        || m <= 1
+        || a.dtype != onnx_runtime_ir::DataType::Float16
+        || b.dtype != onnx_runtime_ir::DataType::Float16
+        || !b.is_contiguous()
+        || b.numel() != k.saturating_mul(n)
+    {
+        return Ok(None);
+    }
+    b.validate()?;
+    let Some(packed) = prepack.packed_b_from_half(b, k, n)? else {
+        return Ok(None);
+    };
+    let a_dense = prepack.dense(0, a)?;
+    if a_dense.len() != m.saturating_mul(k) {
+        return Ok(None);
+    }
+    let mut result = vec![0.0f32; m * n];
+    gemm_packed(&a_dense, packed, &mut result, m, k, n)?;
+    Ok(Some(result))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -671,6 +1232,412 @@ fn micro_kernel(
     }
 }
 
+/// Layout-aware 2-D GEMM: `c[m,n] = a[m,k] * bt[n,k]ᵀ` (overwrite), i.e.
+/// `c[i][j] = Σ_p a[i*k + p] * bt[j*k + p]`.
+///
+/// `a` is `m*k` row-major, **`bt` is `n*k` row-major** — B stored transposed as
+/// `[n][k]` — and `c` is `m*n` row-major. This is exactly the layout MoE expert
+/// weights already have (`[out_features][in_features]`), so the caller never has
+/// to materialize the `[k][n]` copy that plain [`gemm`] would need. It is also a
+/// *better* layout for the dot-product formulation: both operands are contiguous
+/// along `k`, so the inner loop is a pure contiguous dot product.
+///
+/// Parallelized identically to [`gemm_generic`]: row blocks of `c` across the
+/// process Rayon pool, or column strips when `m` is smaller than the pool. The
+/// per-block inner kernel dispatches to an AVX2+FMA path at runtime (with a
+/// portable scalar fallback), mirroring the softmax kernel's structure. Result
+/// is bit-plausible against a scalar reference within f32 tolerance.
+#[cfg(not(feature = "mlas"))]
+pub(crate) fn gemm_bt(
+    a: &[f32],
+    bt: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<()> {
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    let threads = rayon::current_num_threads();
+    if threads > 1 && m < threads && n > 1 {
+        gemm_bt_col_parallel(a, bt, c, m, k, n, threads);
+        return Ok(());
+    }
+    let mc = if threads <= 1 {
+        MAX_MC.min(m)
+    } else {
+        let target_tasks = threads.saturating_mul(2);
+        let rows = m.div_ceil(target_tasks).clamp(1, MAX_MC);
+        if rows == 1 {
+            1
+        } else {
+            rows.div_ceil(MR).saturating_mul(MR).min(MAX_MC)
+        }
+    };
+    // Parallelize over disjoint row blocks of `c`; each block reads shared,
+    // immutable `a`/`bt`. `for_each_init` opens one worker-lane span per worker
+    // rather than reopening it per block, matching [`gemm_generic`].
+    c.par_chunks_mut(mc * n).enumerate().for_each_init(
+        || crate::trace::worker_span("MatMul.gemm_bt.row_block"),
+        |_span, (blk, c_block)| {
+            let i0 = blk * mc;
+            let rows = c_block.len() / n; // last block may be short
+            let a_block = &a[i0 * k..i0 * k + rows * k];
+            gemm_bt_block(a_block, bt, c_block, rows, k, n);
+        },
+    );
+    Ok(())
+}
+
+/// Column-strip parallel counterpart of [`gemm_bt`], selected when `m` is below
+/// the pool size so row-block parallelism would under-fill it. Unlike
+/// [`gemm_generic_col_parallel`], no strided B copy is needed: a strip of output
+/// columns `[j0, j0+strip)` is exactly the contiguous `bt` rows
+/// `bt[j0*k .. (j0+strip)*k]`, so each task borrows its slice directly and only
+/// the small result scatter is serial.
+#[cfg(not(feature = "mlas"))]
+fn gemm_bt_col_parallel(
+    a: &[f32],
+    bt: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    threads: usize,
+) {
+    let cols_per_strip = n.div_ceil(threads).max(1);
+    let strips: Vec<(usize, usize)> = (0..n)
+        .step_by(cols_per_strip)
+        .map(|j0| (j0, cols_per_strip.min(n - j0)))
+        .collect();
+    let results: Vec<(usize, usize, Vec<f32>)> = strips
+        .into_par_iter()
+        .map(|(j0, strip_n)| {
+            let bt_strip = &bt[j0 * k..(j0 + strip_n) * k];
+            let mut c_strip = vec![0.0f32; m * strip_n];
+            gemm_bt_block(a, bt_strip, &mut c_strip, m, k, strip_n);
+            (j0, strip_n, c_strip)
+        })
+        .collect();
+    for (j0, strip_n, c_strip) in results {
+        for row in 0..m {
+            c[row * n + j0..row * n + j0 + strip_n]
+                .copy_from_slice(&c_strip[row * strip_n..row * strip_n + strip_n]);
+        }
+    }
+}
+
+/// Compute `c[rows,n] = a[rows,k] * bt[n,k]ᵀ` (overwrite) for one row block,
+/// dispatching to the AVX2+FMA kernel when the host supports it.
+#[cfg(not(feature = "mlas"))]
+fn gemm_bt_block(a: &[f32], bt: &[f32], c: &mut [f32], rows: usize, k: usize, n: usize) {
+    if rows == 0 || n == 0 {
+        return;
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if gemm_bt_avx2::available() {
+            // SAFETY: the branch proves the running CPU has AVX2+FMA. `a` is
+            // `rows*k`, `bt` is `n*k`, `c` is `rows*n`, all row-major, so every
+            // pointer the kernel forms from `(rows, k, n)` is in bounds.
+            unsafe {
+                gemm_bt_avx2::block(a.as_ptr(), bt.as_ptr(), c.as_mut_ptr(), rows, k, n);
+            }
+            return;
+        }
+    }
+    gemm_bt_block_scalar(a, bt, c, rows, k, n);
+}
+
+/// Portable scalar reference block: the fallback for non-x86 targets and for x86
+/// without AVX2+FMA. Contains no `unsafe`. Overwrites each `c[i][j]` with the
+/// contiguous dot product `Σ_p a[i][p] * bt[j][p]` (so `k == 0` writes 0).
+#[cfg(not(feature = "mlas"))]
+fn gemm_bt_block_scalar(a: &[f32], bt: &[f32], c: &mut [f32], rows: usize, k: usize, n: usize) {
+    for i in 0..rows {
+        let arow = &a[i * k..i * k + k];
+        let crow = &mut c[i * n..i * n + n];
+        for (j, cv) in crow.iter_mut().enumerate() {
+            let brow = &bt[j * k..j * k + k];
+            let mut sum = 0.0f32;
+            for p in 0..k {
+                sum += arow[p] * brow[p];
+            }
+            *cv = sum;
+        }
+    }
+}
+
+/// AVX2+FMA inner kernel for [`gemm_bt`]: `c[i][j] = Σ_p a[i][p] * bt[j][p]` on
+/// eight `k`-lanes at once. Runtime-detected exactly like the softmax kernel,
+/// with `loadu`/`storeu`-style unaligned access (no alignment assumed) and a
+/// scalar tail for `k % 8`.
+///
+/// Interior `4×2` tiles of `c` are held in eight `__m256` accumulators (four
+/// A rows × two B rows), reusing each loaded B vector across the four rows and
+/// each loaded A vector across the two columns; the eight independent
+/// accumulators hide FMA latency. Edge rows (`rows % 4`, which includes the
+/// `m == 1` decode case) and the odd trailing column (`n % 2`) fall to a
+/// four-accumulator contiguous dot product — itself a good GEMV.
+#[cfg(all(
+    not(feature = "mlas"),
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+mod gemm_bt_avx2 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    /// Runtime detection: AVX2 (256-bit float ops) and FMA (the accumulation).
+    #[inline]
+    pub fn available() -> bool {
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+    }
+
+    /// Horizontal sum of the eight lanes.
+    ///
+    /// # Safety
+    /// AVX must be available (implied by AVX2 on the calling path).
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn hsum(v: __m256) -> f32 {
+        let hi = _mm256_extractf128_ps::<1>(v);
+        let lo = _mm256_castps256_ps128(v);
+        let s = _mm_add_ps(lo, hi);
+        let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        let s = _mm_add_ss(s, _mm_shuffle_ps::<0x55>(s, s));
+        _mm_cvtss_f32(s)
+    }
+
+    /// Contiguous dot product `Σ_{p<k} a[p] * b[p]` with four independent
+    /// accumulators (32-wide unroll) to hide FMA latency, then a scalar tail.
+    ///
+    /// # Safety
+    /// AVX2+FMA available; `a` and `b` are each valid for `k` f32 reads.
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn dot(a: *const f32, b: *const f32, k: usize) -> f32 {
+        unsafe {
+            let mut acc0 = _mm256_setzero_ps();
+            let mut acc1 = _mm256_setzero_ps();
+            let mut acc2 = _mm256_setzero_ps();
+            let mut acc3 = _mm256_setzero_ps();
+            let mut p = 0usize;
+            while p + 32 <= k {
+                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(p)), _mm256_loadu_ps(b.add(p)), acc0);
+                acc1 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(a.add(p + 8)),
+                    _mm256_loadu_ps(b.add(p + 8)),
+                    acc1,
+                );
+                acc2 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(a.add(p + 16)),
+                    _mm256_loadu_ps(b.add(p + 16)),
+                    acc2,
+                );
+                acc3 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(a.add(p + 24)),
+                    _mm256_loadu_ps(b.add(p + 24)),
+                    acc3,
+                );
+                p += 32;
+            }
+            while p + 8 <= k {
+                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(p)), _mm256_loadu_ps(b.add(p)), acc0);
+                p += 8;
+            }
+            let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+            let mut sum = hsum(acc);
+            while p < k {
+                sum += *a.add(p) * *b.add(p);
+                p += 1;
+            }
+            sum
+        }
+    }
+
+    /// One interior `4×2` tile: `c[i+ii][j+jj] = Σ_p a[i+ii][p] * bt[j+jj][p]`
+    /// for `ii<4`, `jj<2`, held in eight `__m256` accumulators over the full
+    /// `k`-loop and finished with a scalar tail (`k % 8`). Each B vector is
+    /// reused across the four A rows and each A vector across the two B rows, so
+    /// the tile issues eight independent FMAs per eight-lane step — enough
+    /// in-flight accumulators to hide FMA latency — and pays exactly one
+    /// horizontal reduction per output cell. Because the reduction is along `k`
+    /// (the SIMD lanes hold `k`-partials, not `C`-partials), `k` is *not* cache
+    /// blocked here; the reuse of a large `bt` is instead recovered by column
+    /// blocking in [`block`], which keeps one reduction per tile.
+    ///
+    /// # Safety
+    /// AVX2+FMA available. Rows `i..i+4` of `a` (`a` is `_*k`), rows `j..j+2` of
+    /// `bt` (`bt` is `_*k`) and elements `(i+ii)*n + j+jj` of `c` are all valid.
+    #[target_feature(enable = "avx2,fma")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn tile_4x2(
+        a: *const f32,
+        bt: *const f32,
+        c: *mut f32,
+        k: usize,
+        n: usize,
+        i: usize,
+        j: usize,
+    ) {
+        unsafe {
+            let a0 = a.add(i * k);
+            let a1 = a.add((i + 1) * k);
+            let a2 = a.add((i + 2) * k);
+            let a3 = a.add((i + 3) * k);
+            let b0 = bt.add(j * k);
+            let b1 = bt.add((j + 1) * k);
+
+            let mut c00 = _mm256_setzero_ps();
+            let mut c01 = _mm256_setzero_ps();
+            let mut c10 = _mm256_setzero_ps();
+            let mut c11 = _mm256_setzero_ps();
+            let mut c20 = _mm256_setzero_ps();
+            let mut c21 = _mm256_setzero_ps();
+            let mut c30 = _mm256_setzero_ps();
+            let mut c31 = _mm256_setzero_ps();
+
+            let mut p = 0usize;
+            while p + 8 <= k {
+                let vb0 = _mm256_loadu_ps(b0.add(p));
+                let vb1 = _mm256_loadu_ps(b1.add(p));
+                let va = _mm256_loadu_ps(a0.add(p));
+                c00 = _mm256_fmadd_ps(va, vb0, c00);
+                c01 = _mm256_fmadd_ps(va, vb1, c01);
+                let va = _mm256_loadu_ps(a1.add(p));
+                c10 = _mm256_fmadd_ps(va, vb0, c10);
+                c11 = _mm256_fmadd_ps(va, vb1, c11);
+                let va = _mm256_loadu_ps(a2.add(p));
+                c20 = _mm256_fmadd_ps(va, vb0, c20);
+                c21 = _mm256_fmadd_ps(va, vb1, c21);
+                let va = _mm256_loadu_ps(a3.add(p));
+                c30 = _mm256_fmadd_ps(va, vb0, c30);
+                c31 = _mm256_fmadd_ps(va, vb1, c31);
+                p += 8;
+            }
+
+            let mut s00 = hsum(c00);
+            let mut s01 = hsum(c01);
+            let mut s10 = hsum(c10);
+            let mut s11 = hsum(c11);
+            let mut s20 = hsum(c20);
+            let mut s21 = hsum(c21);
+            let mut s30 = hsum(c30);
+            let mut s31 = hsum(c31);
+            while p < k {
+                let x0 = *b0.add(p);
+                let x1 = *b1.add(p);
+                let y0 = *a0.add(p);
+                s00 += y0 * x0;
+                s01 += y0 * x1;
+                let y1 = *a1.add(p);
+                s10 += y1 * x0;
+                s11 += y1 * x1;
+                let y2 = *a2.add(p);
+                s20 += y2 * x0;
+                s21 += y2 * x1;
+                let y3 = *a3.add(p);
+                s30 += y3 * x0;
+                s31 += y3 * x1;
+                p += 1;
+            }
+
+            *c.add(i * n + j) = s00;
+            *c.add(i * n + j + 1) = s01;
+            *c.add((i + 1) * n + j) = s10;
+            *c.add((i + 1) * n + j + 1) = s11;
+            *c.add((i + 2) * n + j) = s20;
+            *c.add((i + 2) * n + j + 1) = s21;
+            *c.add((i + 3) * n + j) = s30;
+            *c.add((i + 3) * n + j + 1) = s31;
+        }
+    }
+
+    /// Compute `c[rows,n] = a[rows,k] * bt[n,k]ᵀ` (overwrite).
+    ///
+    /// Interior `4×2` tiles are swept **column-block first**: a panel of `NC_KB`
+    /// KiB worth of `bt` columns (`nc` rows of the `[n][k]` matrix) is pinned in
+    /// cache while all row bands reuse it, then the panel advances. Without this,
+    /// each row band re-streams the whole `[n × k]` `bt` from DRAM, so for a
+    /// `bt` larger than L3 (e.g. the 52 MiB Phi-3.5-MoE experts) large-token
+    /// prefill becomes DRAM-bound and loses to a one-shot transpose+GEMM. The
+    /// tile still reduces along `k` in one pass (one horizontal sum per cell),
+    /// so — unlike K blocking — column blocking adds no reduction overhead. The
+    /// odd trailing column (`n % 2`) and edge rows (`rows % 4`, incl. the
+    /// `rows == 1` decode case) then run as full-`k` [`dot`]s.
+    ///
+    /// # Safety
+    /// AVX2+FMA available. `a` is valid for `rows*k` reads, `bt` for `n*k`
+    /// reads, and `c` for `rows*n` writes, all row-major.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn block(
+        a: *const f32,
+        bt: *const f32,
+        c: *mut f32,
+        rows: usize,
+        k: usize,
+        n: usize,
+    ) {
+        unsafe {
+            let r4 = rows - rows % 4;
+            let n2 = n - n % 2;
+
+            // Column-block width: keep one `bt` panel near L2-resident so the
+            // row-band sweep reuses it instead of re-reading all of `bt` per
+            // band. Round down to an even count (the tile is 2 columns wide) and
+            // keep at least one tile.
+            const NC_KB: usize = 256;
+            let bytes_per_col = k.saturating_mul(4).max(1);
+            let mut nc = (NC_KB * 1024) / bytes_per_col;
+            nc &= !1;
+            if nc < 2 {
+                nc = 2;
+            }
+
+            // Interior tiles: column panel outer, row band inner, so the pinned
+            // `bt` panel is reused across every row band before it is evicted.
+            let mut j0 = 0usize;
+            while j0 < n2 {
+                let jend = (j0 + nc).min(n2);
+                let mut i = 0usize;
+                while i < r4 {
+                    let mut j = j0;
+                    while j < jend {
+                        tile_4x2(a, bt, c, k, n, i, j);
+                        j += 2;
+                    }
+                    i += 4;
+                }
+                j0 = jend;
+            }
+
+            // Odd trailing column of the interior rows (single full-k dot each).
+            if n2 < n {
+                let mut i = 0usize;
+                while i < r4 {
+                    for ii in 0..4 {
+                        *c.add((i + ii) * n + n2) = dot(a.add((i + ii) * k), bt.add(n2 * k), k);
+                    }
+                    i += 4;
+                }
+            }
+
+            // Edge rows (`rows % 4`, incl. the `rows == 1` decode case): a
+            // full-k dot for every column.
+            let mut i = r4;
+            while i < rows {
+                for j in 0..n {
+                    *c.add(i * n + j) = dot(a.add(i * k), bt.add(j * k), k);
+                }
+                i += 1;
+            }
+        }
+    }
+}
+
 impl Kernel for MatMulKernel {
     fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
         self.prepack.set_constant_inputs(constant_inputs);
@@ -765,11 +1732,68 @@ impl MatMulKernel {
             }
         }
 
+        // x86 FP16 storage GEMV: the mirror of the Accelerate path above.
+        // `try_matmul_half` packs both operands into cache-sized panels, which
+        // pays for itself only when a panel of B is reused across several rows
+        // of A. At M=1 there is no reuse, so the packing is pure overhead on a
+        // memory-bound problem. Must precede `try_matmul_half` for the same
+        // reason the Accelerate block does.
+        //
+        // B is read in place, in its stored [K, N] order — deliberately *not*
+        // through `transposed_b_f16`. `try_matmul_half` allocates no weight
+        // copy, so a transpose cache here would add a permanent 2*K*N bytes
+        // (272 MB for a 896x151936 lm_head) that the path it replaces never
+        // paid. Reading in place also keeps this available for a
+        // non-constant B, which a prepacked transpose could not serve.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if geom.m == 1
+            && numel(&geom.batch_shape) <= 1
+            && geom.b_promoted_rank == 2
+            && inputs[0].dtype == onnx_runtime_ir::DataType::Float16
+            && inputs[1].dtype == onnx_runtime_ir::DataType::Float16
+            && inputs[1].is_contiguous()
+            && inputs[1].numel() == geom.k.saturating_mul(geom.n)
+            && half_gemv::simd_available()
+        {
+            inputs[1].validate()?;
+            let a_dense = self.prepack.dense(0, &inputs[0])?;
+            if a_dense.len() == geom.k {
+                // SAFETY: `inputs[1]` was just validated as a contiguous
+                // Float16 view whose element count equals `k * n`. `f16` is
+                // transparent over `u16`, so reading its storage as raw bit
+                // patterns is sound, and the view outlives this call.
+                let b_bits = unsafe {
+                    std::slice::from_raw_parts(inputs[1].data_ptr::<u16>(), geom.k * geom.n)
+                };
+                let mut result = vec![0.0f32; geom.n];
+                half_gemv::gemv_f16_kn(&a_dense, b_bits, &mut result, geom.k, geom.n);
+                return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
+            }
+        }
+
+        // f16 prefill through MLAS SGEMM on a once-widened, once-packed B.
+        // Shared with `Gemm`; see `try_packed_half_prefill`.
+        #[cfg(feature = "mlas")]
+        if numel(&geom.batch_shape) <= 1
+            && geom.b_promoted_rank == 2
+            && let Some(result) = try_packed_half_prefill(
+                &self.prepack,
+                backend,
+                &inputs[0],
+                &inputs[1],
+                geom.m,
+                geom.k,
+                geom.n,
+            )?
+        {
+            return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
+        }
+
         // Dedicated half-precision path: contiguous f16/bf16 operands stay in
         // 16-bit storage and are packed in cache-sized panels for f32
         // accumulation. Bf16 may use the runtime-gated AVX-512 BF16 kernel;
         // every other host uses the portable blocked implementation.
-        if let Some(result) = try_matmul_half(&inputs[0], &inputs[1], &geom)? {
+        if let Some(result) = try_matmul_half(&inputs[0], &inputs[1], &geom, backend)? {
             return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
         }
 
@@ -976,14 +2000,158 @@ fn output_overlaps_input(
     out_origin < in_end && in_start < out_end
 }
 
+/// Minimum `M` at which widening a contiguous `f16` GEMM to `f32` and running
+/// the tuned SGEMM beats the portable blocked half GEMM.
+///
+/// ORT reaches its `f16` MatMul time by widening to `f32` and reusing the same
+/// tuned SGEMM it uses for `f32`: measured on this host at `M=128, K=N=2048`,
+/// ORT spends 14.27 ms on `f16` and 14.39 ms on `f32` -- the same kernel. Our
+/// blocked half GEMM keeps operands in 16-bit storage to save bandwidth, which
+/// wins while the operands dominate, but it has no tuned microkernel, so once
+/// `M` grows enough for the GEMM to become compute-bound it loses badly.
+///
+/// `bench_f16_half_vs_widen`, pinned to 16 physical cores, `K=N=2048`, median
+/// of 5, two independent runs. Ratio is `half / widen`, so > 1 means widening
+/// wins:
+///
+/// | M | T=1 | T=16 |
+/// |---|---|---|
+/// | 2 | 0.67x, 0.61x (half wins) | 0.93x, 0.83x (half wins) |
+/// | 8 | 1.01x, 1.05x (tie) | 1.26x, 1.38x |
+/// | **16** | **1.33x, 1.30x** | **2.14x, 1.85x** |
+/// | 32 | 1.56x, 1.63x | 3.14x, 3.32x |
+/// | 128 | 1.90x, 2.00x | 3.47x, 3.30x |
+/// | 256 | 1.94x, 2.03x | 2.88x, 2.67x |
+///
+/// `M=16` is the first row that wins repeatably at *both* thread counts, so it
+/// is the threshold. `M=8` is a tie at `T=1` (1.01x/1.05x, inside noise) and is
+/// left on the half path rather than claimed. Below the threshold the blocked
+/// half GEMM is kept, so decode (`M=1`) is bit-for-bit unchanged.
+#[cfg(feature = "mlas")]
+const HALF_WIDEN_MIN_M: usize = 16;
+
+/// Minimum `B` size, in **elements** (`K * N`, not bytes), before widening is
+/// considered.
+///
+/// Widening `B` costs a `4 * K * N` byte transient on every call when `B` is
+/// not a session constant, so the intuition is that a small `B` cannot repay
+/// it. The sweep says otherwise: at `M = 16`, `half/widen` (>1 means widening
+/// wins) is
+///
+/// | K x N | elements | T=1 | T=16 |
+/// |---|---|---|---|
+/// | 8 x 8 | 64 | 0.88x (half wins) | 275x |
+/// | 16 x 16 | 256 | 1.16x | 229x |
+/// | 32 x 32 | 1024 | 1.21x | 35.9x |
+/// | 64 x 64 | 4096 | 1.42x | 33.2x |
+/// | 128 x 128 | 16384 | 1.48x | 16.3x |
+/// | 256 x 256 | 65536 | 1.52x | 7.8x |
+///
+/// so this is set to 256 elements: the smallest size that wins repeatably at
+/// *both* thread counts. Only the 64-element case loses, and only at `T=1`.
+///
+/// The three-digit `T=16` ratios are noise-dominated in magnitude -- an
+/// independent run of the same sweep put the two smallest at 47x and 28x --
+/// but the direction is robust across runs. They are also not a widening win:
+/// they are the blocked half GEMM dispatching parallel work for a problem far
+/// too small to repay a fork/join (`gemm_impl` splits with `par_chunks_mut`
+/// whenever threads > 1, with no small-work guard). Widening sidesteps that;
+/// fixing the half path's own threshold is separate work.
+#[cfg(feature = "mlas")]
+const HALF_WIDEN_MIN_WEIGHT: usize = 256;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of calls where [`try_matmul_half`] declined in favour of
+    /// the widened-`f32` SGEMM. Lets a test assert *which route* ran rather
+    /// than only that the numbers came out right.
+    static HALF_YIELDED_TO_WIDENED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn count_half_yielded_to_widened() {
+    #[cfg(test)]
+    HALF_YIELDED_TO_WIDENED.with(|c| c.set(c.get() + 1));
+}
+
+/// Number of times the current thread took the widened-`f32` SGEMM instead of
+/// the blocked half GEMM.
+#[cfg(all(test, feature = "mlas"))]
+pub(crate) fn half_yielded_to_widened_calls() -> u64 {
+    HALF_YIELDED_TO_WIDENED.with(|c| c.get())
+}
+
+#[cfg(all(test, feature = "mlas"))]
+pub(crate) fn reset_half_yielded_to_widened_calls() {
+    HALF_YIELDED_TO_WIDENED.with(|c| c.set(0));
+}
+
+/// Whether a contiguous half GEMM is better served by widening to dense `f32`
+/// and using the tuned SGEMM (see [`HALF_WIDEN_MIN_M`]).
+///
+/// Restricted to `f16`. `bf16` is left on the blocked half GEMM: it has a
+/// native AVX512-BF16 kernel whose crossover has not been measured, and
+/// widening it is a different (cheaper, shift-only) operation, so the `f16`
+/// measurement does not transfer.
+///
+/// Restricted to [`CpuBackend::Mlas`] because that is the only backend whose
+/// SGEMM was measured to beat the half path; every other backend keeps
+/// today's behaviour. `auto_detect` returns `Mlas` on x86-64 whenever the
+/// feature is compiled in, so this is the default path there.
+///
+/// End to end through the plugin (`bench_matmul_f16_m128`, `M=128, K=N=2048`,
+/// non-constant `B`, 5 interleaved rounds of before/after/ORT in one process,
+/// p50 ms, pinned to 16 physical cores), as `ours/ORT` so >1 means we lose.
+/// Ranges span three independent measurements, one of them by a reviewer on a
+/// separate build:
+///
+/// | threads | before | after | gain |
+/// |---|---|---|---|
+/// | 1 | 1.97x--1.99x | **1.05x--1.08x** | 1.85x--1.87x |
+/// | 16 | 3.27x--3.29x | **2.03x--2.28x** | 1.44x--1.63x |
+///
+/// `M=1` decode cannot reach this gate and measured unchanged (0.356 vs 0.353
+/// ms at `T=1`, inside run-to-run noise).
+///
+/// `T=16` is still ~2x off ORT and is **not** claimed as competitive. The
+/// residual is the per-call widen of a non-constant `B`: serial here, parallel
+/// in ORT. Evidence: our `f16` costs ~2.2 ms more than our own `f32` at `T=16`
+/// but only ~1.6 ms more at `T=1`, so the conversion gets *worse* with threads.
+/// That is a separate change and this gate does not address it.
+fn widened_sgemm_beats_half_gemm(
+    format: HalfFormat,
+    geom: &MatMulGeometry,
+    backend: CpuBackend,
+) -> bool {
+    // `CpuBackend::Mlas` only exists with the feature compiled in; without it
+    // there is no measured-faster SGEMM to yield to, so keep the half GEMM.
+    #[cfg(feature = "mlas")]
+    {
+        format == HalfFormat::F16
+            && backend == CpuBackend::Mlas
+            && geom.m >= HALF_WIDEN_MIN_M
+            && geom.k.saturating_mul(geom.n) >= HALF_WIDEN_MIN_WEIGHT
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        let _ = (format, geom, backend);
+        false
+    }
+}
+
 /// Attempt the dedicated portable half GEMM path. Both operands must be
 /// contiguous and have the same `Float16` or `BFloat16` dtype. The operands stay
 /// in 16-bit storage until cache-panel packing, accumulation is always `f32`,
 /// and the caller narrows once into the requested output dtype.
+///
+/// Declines for a large-`M` `f16` GEMM, where widening to `f32` and using the
+/// tuned SGEMM is measurably faster -- see [`widened_sgemm_beats_half_gemm`].
+/// Every caller already falls through to that widened path.
 fn try_matmul_half(
     a: &TensorView,
     b: &TensorView,
     geom: &MatMulGeometry,
+    backend: CpuBackend,
 ) -> Result<Option<Vec<f32>>> {
     use onnx_runtime_ir::DataType;
 
@@ -993,6 +2161,10 @@ fn try_matmul_half(
         _ => return Ok(None),
     };
     if !a.is_contiguous() || !b.is_contiguous() {
+        return Ok(None);
+    }
+    if widened_sgemm_beats_half_gemm(format, geom, backend) {
+        count_half_yielded_to_widened();
         return Ok(None);
     }
     a.validate()?;
@@ -1145,7 +2317,7 @@ fn half_gemm_tile(
 /// the fused `FusedMatMulBias` kernel.
 pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
     let geom = matmul_geometry(a, b)?;
-    if let Some(result) = try_matmul_half(a, b, &geom)? {
+    if let Some(result) = try_matmul_half(a, b, &geom, CpuBackend::auto_detect())? {
         return Ok(result);
     }
     matmul_dense_impl_with_geom(
@@ -1203,7 +2375,7 @@ fn matmul_dense_prepacked_with_backend(
     backend: CpuBackend,
 ) -> Result<Vec<f32>> {
     let geom = matmul_geometry(a, b)?;
-    if let Some(result) = try_matmul_half(a, b, &geom)? {
+    if let Some(result) = try_matmul_half(a, b, &geom, backend)? {
         return Ok(result);
     }
     matmul_dense_impl_with_geom(
@@ -1487,6 +2659,181 @@ fn broadcast_offset(bidx: &[usize], batch: &[usize], batch_strides: &[i64]) -> u
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+
+    // --- #1056: MatMulPrepack::dense governance ---------------------------
+
+    /// A single-`MatMul` graph whose `B` (input index 1) is a `[k, n]`
+    /// initializer of `dtype` when `constant`, else a plain activation input,
+    /// for driving [`matmul_dense_cache_predicted_bytes`].
+    fn dense_matmul_graph(k: usize, n: usize, dtype: DataType, constant: bool) -> Graph {
+        use onnx_runtime_ir::{NodeId, TensorData, WeightRef, static_shape};
+        let mut graph = Graph::new();
+        let a = graph.create_named_value("A", DataType::Float32, static_shape([1, k]));
+        let b = graph.create_named_value("B", dtype, static_shape([k, n]));
+        let y = graph.create_named_value("Y", DataType::Float32, static_shape([1, n]));
+        graph.add_input(a);
+        graph.add_input(b);
+        let node = Node::new(NodeId(0), "MatMul", vec![Some(a), Some(b)], vec![y]);
+        graph.insert_node(node);
+        graph.add_output(y);
+        if constant {
+            let elem = dtype.byte_size();
+            graph.set_initializer(
+                b,
+                WeightRef::Inline(TensorData::from_raw(
+                    dtype,
+                    vec![k, n],
+                    vec![0u8; k * n * elem],
+                )),
+            );
+        }
+        graph
+    }
+
+    /// The predictor counts a constant operand iff it widens to an owned f32
+    /// copy: f16/bf16 constants cost `4*k*n` per instantiation and the
+    /// shape-keyed kernel cache holds [`MATMUL_DENSE_DECODE_INSTANTIATIONS`] of
+    /// them (prefill + decode), a contiguous f32 constant is borrowed zero-copy
+    /// (0), and a non-constant operand is never cached (0).
+    #[test]
+    fn dense_cache_predictor_counts_only_constant_non_f32_operands() {
+        let (k, n) = (10usize, 7usize);
+        let bytes = (k * n * 4) as u64 * MATMUL_DENSE_DECODE_INSTANTIATIONS;
+        assert_eq!(
+            matmul_dense_cache_predicted_bytes(&dense_matmul_graph(k, n, DataType::Float16, true)),
+            bytes,
+            "f16 constant widens to a 4*k*n f32 copy"
+        );
+        assert_eq!(
+            matmul_dense_cache_predicted_bytes(&dense_matmul_graph(k, n, DataType::BFloat16, true)),
+            bytes,
+            "bf16 constant widens to a 4*k*n f32 copy"
+        );
+        assert_eq!(
+            matmul_dense_cache_predicted_bytes(&dense_matmul_graph(k, n, DataType::Float32, true)),
+            0,
+            "a contiguous f32 constant is borrowed zero-copy, nothing cached"
+        );
+        assert_eq!(
+            matmul_dense_cache_predicted_bytes(&dense_matmul_graph(k, n, DataType::Float16, false)),
+            0,
+            "a non-constant operand is never memoised as a weight"
+        );
+    }
+
+    /// #1056 acceptance criterion 1: the predicted dense-cache bytes must equal
+    /// the bytes actually held after a real run, ratio 1.00 — proven in one run
+    /// by comparing the plan's graph prediction against the *summed*
+    /// [`MatMulPrepack::dense_live_bytes`] of every kernel instantiation.
+    ///
+    /// The operand is a constant **f16** `B` with an **f32** `A`: `try_matmul_half`
+    /// only fires when both operands share a half dtype, so this deterministically
+    /// takes the generic f32 path that widens `B` through `dense(1)`, genuinely
+    /// populating the cache (unlike the int4 / same-half models, which never do).
+    ///
+    /// Crucially it drives **two** instantiations — a prefill (`m > 1`) and a
+    /// decode (`m == 1`) — the way the shape-keyed kernel cache does, each a
+    /// separate `MatMulKernel` with its own `dense`. Both retain a copy, so the
+    /// live total is [`MATMUL_DENSE_DECODE_INSTANTIATIONS`] × `4*k*n`, and the
+    /// predictor must account for that multiplier or this ratio breaks. A test
+    /// that drove a single instantiation could not catch a dropped multiplier —
+    /// which is exactly #1051's defect.
+    #[test]
+    fn predicted_dense_bytes_equal_actual_after_matmul_execution() {
+        // Thread-local admit so the process-global the concurrent tests read is
+        // never touched (#1056 isolation). The verdict is read at construction,
+        // so each kernel is built inside the scope.
+        let _admit = DenseCacheEnabledScope::new(true);
+
+        let (k, n) = (48usize, 33usize);
+        let graph = dense_matmul_graph(k, n, DataType::Float16, true);
+        let predicted = matmul_dense_cache_predicted_bytes(&graph);
+        // The prediction budgets for both shape-keyed instantiations.
+        assert_eq!(
+            predicted,
+            (k as u64) * (n as u64) * 4 * MATMUL_DENSE_DECODE_INSTANTIATIONS
+        );
+
+        let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.013).cos()).collect();
+        let b = Owned::f16(&[k, n], &b_data);
+
+        // Mirror the executor's shape-keyed kernel cache: the SAME node compiled
+        // once per resolved activation shape (prefill m>1, decode m==1) yields a
+        // SEPARATE `MatMulKernel`/`MatMulPrepack`, each widening `B` into its own
+        // `dense`. We instantiate both and sum their live bytes.
+        let mut instances = 0u64;
+        let mut actual = 0u64;
+        for m in [4usize, 1usize] {
+            let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.017).sin()).collect();
+            let a = Owned::f32(&[m, k], &a_data);
+            let mut out = Owned::zeros_f32(&[m, n]);
+            let mut kernel = MatMulKernel::default();
+            kernel.set_constant_inputs(&[false, true]);
+            kernel
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+            assert!(
+                kernel.prepack.dense[1].is_filled(),
+                "the constant f16 B must be widened into the governed cache at m={m}"
+            );
+            assert!(
+                !kernel.prepack.dense[0].is_filled(),
+                "the contiguous f32 A is borrowed, never cached (m={m})"
+            );
+            actual += kernel.prepack.dense_live_bytes();
+            instances += 1;
+        }
+
+        // Empirically: both the prefill and decode instances retain a copy.
+        assert_eq!(
+            instances, MATMUL_DENSE_DECODE_INSTANTIATIONS,
+            "prefill + decode = two shape-keyed instantiations"
+        );
+        assert_eq!(
+            actual, predicted,
+            "predicted dense-cache bytes must equal the summed bytes actually \
+             held across all instantiations (ratio 1.00)"
+        );
+    }
+
+    /// #1056 decline contract: when the cache is declined, a constant operand
+    /// retains **nothing** (widened per call and freed), and the result is
+    /// byte-identical to the admitted run — a pure performance tradeoff, never a
+    /// numerical one.
+    #[test]
+    fn declined_dense_cache_retains_nothing_and_is_byte_identical() {
+        let (m, k, n) = (4usize, 40usize, 24usize);
+        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.011).cos()).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.019).sin()).collect();
+
+        let run = |enabled: bool| -> (Vec<f32>, u64) {
+            // Thread-local scope; the kernel reads the verdict at construction.
+            let _scope = DenseCacheEnabledScope::new(enabled);
+            let a = Owned::f32(&[m, k], &a_data);
+            let b = Owned::f16(&[k, n], &b_data);
+            let mut out = Owned::zeros_f32(&[m, n]);
+            let mut kernel = MatMulKernel::default();
+            kernel.set_constant_inputs(&[false, true]);
+            kernel
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+            (out.to_f32(), kernel.prepack.dense_live_bytes())
+        };
+
+        let (admitted_out, admitted_bytes) = run(true);
+        let (declined_out, declined_bytes) = run(false);
+
+        assert_eq!(
+            admitted_bytes,
+            (k * n * 4) as u64,
+            "admitted holds exactly one 4*k*n f32 copy"
+        );
+        assert_eq!(declined_bytes, 0, "declined retains nothing resident");
+        assert_eq!(
+            admitted_out, declined_out,
+            "output must be byte-identical whether the cache is admitted or declined"
+        );
+    }
 
     #[test]
     fn matmul_zero_batch_returns_empty_without_panicking() {
@@ -1825,6 +3172,188 @@ mod tests {
         assert_eq!(out.to_f16_as_f32(), vec![58., 64., 139., 154.]);
     }
 
+    /// Falsifier for the [`HALF_WIDEN_MIN_M`] gate: asserts *which route* each
+    /// shape takes, not merely that the numbers are right. Both routes produce
+    /// near-identical results, so a value-only test cannot detect the gate
+    /// being mis-wired, inverted, or silently dead.
+    #[cfg(all(target_arch = "x86_64", feature = "mlas"))]
+    #[test]
+    fn f16_prefill_yields_to_widened_sgemm_only_above_the_measured_crossover() {
+        let backend = CpuBackend::auto_detect();
+        assert_eq!(
+            backend,
+            CpuBackend::Mlas,
+            "x86_64 + mlas must auto-detect Mlas, else this gate is dead code"
+        );
+
+        // Pin the constants to the numbers their doc tables were measured at.
+        // Everything else here follows the constants, so without this a silent
+        // retune would move the dispatch boundary while every test still
+        // passed. If this fails, re-run `bench_f16_half_vs_widen` and update
+        // the tables rather than just bumping the expectation.
+        assert_eq!(
+            HALF_WIDEN_MIN_M, 16,
+            "M threshold moved off its measurement"
+        );
+        assert_eq!(
+            HALF_WIDEN_MIN_WEIGHT, 256,
+            "weight threshold moved off its measurement"
+        );
+
+        // Big enough that HALF_WIDEN_MIN_WEIGHT is satisfied, so M alone decides.
+        let (k, n) = (512usize, 512usize);
+        assert!(k * n >= HALF_WIDEN_MIN_WEIGHT);
+
+        for (m, expect_widen) in [
+            (1usize, false),
+            (HALF_WIDEN_MIN_M - 1, false),
+            (HALF_WIDEN_MIN_M, true),
+            (HALF_WIDEN_MIN_M + 1, true),
+        ] {
+            let a_src: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 * 0.01).collect();
+            let b_src: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 * 0.01).collect();
+            let a = Owned::f16(&[m, k], &a_src);
+            let b = Owned::f16(&[k, n], &b_src);
+            let geom = matmul_geometry(&a.view(), &b.view()).unwrap();
+
+            reset_half_yielded_to_widened_calls();
+            let took_half = try_matmul_half(&a.view(), &b.view(), &geom, backend)
+                .unwrap()
+                .is_some();
+            assert_eq!(
+                took_half, !expect_widen,
+                "M={m}: expected widen={expect_widen}, but half GEMM ran={took_half}"
+            );
+            assert_eq!(
+                half_yielded_to_widened_calls(),
+                u64::from(expect_widen),
+                "M={m}: yield counter disagrees with the taken route"
+            );
+        }
+
+        // bf16 is deliberately excluded: its crossover was never measured.
+        let m = HALF_WIDEN_MIN_M + 8;
+        let a_src: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 * 0.01).collect();
+        let b_src: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 * 0.01).collect();
+        let a = Owned::bf16(&[m, k], &a_src);
+        let b = Owned::bf16(&[k, n], &b_src);
+        let geom = matmul_geometry(&a.view(), &b.view()).unwrap();
+        reset_half_yielded_to_widened_calls();
+        assert!(
+            try_matmul_half(&a.view(), &b.view(), &geom, backend)
+                .unwrap()
+                .is_some(),
+            "bf16 must stay on the blocked half GEMM"
+        );
+        assert_eq!(half_yielded_to_widened_calls(), 0);
+
+        // A non-Mlas backend keeps today's behaviour at every M.
+        let a = Owned::f16(&[m, k], &a_src);
+        let b = Owned::f16(&[k, n], &b_src);
+        let geom = matmul_geometry(&a.view(), &b.view()).unwrap();
+        reset_half_yielded_to_widened_calls();
+        assert!(
+            try_matmul_half(&a.view(), &b.view(), &geom, CpuBackend::Generic)
+                .unwrap()
+                .is_some(),
+            "a backend with no tuned SGEMM must keep the half GEMM"
+        );
+        assert_eq!(half_yielded_to_widened_calls(), 0);
+
+        // A small weight stays on the half path however large M is: the tuned
+        // SGEMM has too little work to repay widening B.
+        let (k, n) = (8usize, 8usize);
+        assert!(k * n < HALF_WIDEN_MIN_WEIGHT);
+        let a_src: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 * 0.01).collect();
+        let b_src: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 * 0.01).collect();
+        let a = Owned::f16(&[m, k], &a_src);
+        let b = Owned::f16(&[k, n], &b_src);
+        let geom = matmul_geometry(&a.view(), &b.view()).unwrap();
+        reset_half_yielded_to_widened_calls();
+        assert!(
+            try_matmul_half(&a.view(), &b.view(), &geom, backend)
+                .unwrap()
+                .is_some(),
+            "a small B must keep the half GEMM"
+        );
+        assert_eq!(half_yielded_to_widened_calls(), 0);
+    }
+
+    /// The widened route must stay numerically sound across the crossover.
+    /// Widening `f16` to `f32` is exact, so both routes see identical inputs
+    /// and differ only in `f32` summation order; each is compared against an
+    /// `f64` oracle so neither route can drift without being caught.
+    #[cfg(all(target_arch = "x86_64", feature = "mlas"))]
+    #[test]
+    fn f16_widened_route_matches_an_f64_oracle_across_the_crossover() {
+        let backend = CpuBackend::auto_detect();
+        let (k, n) = (521usize, 517usize);
+        assert!(k * n >= HALF_WIDEN_MIN_WEIGHT, "shape must cross the gate");
+
+        let mut state = 0x0F16_51DEu32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 0.5
+        };
+
+        // Straddle the threshold, including odd M and a tail-heavy K/N.
+        for m in [HALF_WIDEN_MIN_M - 1, HALF_WIDEN_MIN_M, HALF_WIDEN_MIN_M + 3] {
+            let a_src: Vec<f32> = (0..m * k).map(|_| next()).collect();
+            let b_src: Vec<f32> = (0..k * n).map(|_| next()).collect();
+            let a = Owned::f16(&[m, k], &a_src);
+            let b = Owned::f16(&[k, n], &b_src);
+
+            // Oracle over the *rounded* f16 values, accumulated in f64.
+            let a_w: Vec<f64> = a_src
+                .iter()
+                .map(|&v| half::f16::from_f32(v).to_f32() as f64)
+                .collect();
+            let b_w: Vec<f64> = b_src
+                .iter()
+                .map(|&v| half::f16::from_f32(v).to_f32() as f64)
+                .collect();
+            let mut oracle = vec![0.0f64; m * n];
+            for row in 0..m {
+                for depth in 0..k {
+                    let av = a_w[row * k + depth];
+                    for column in 0..n {
+                        oracle[row * n + column] += av * b_w[depth * n + column];
+                    }
+                }
+            }
+
+            let geom = matmul_geometry(&a.view(), &b.view()).unwrap();
+            let got = matmul_dense(&a.view(), &b.view()).unwrap();
+            assert_eq!(got.len(), m * n);
+            // Confirm this shape really exercised the widened route.
+            reset_half_yielded_to_widened_calls();
+            assert_eq!(
+                try_matmul_half(&a.view(), &b.view(), &geom, backend)
+                    .unwrap()
+                    .is_some(),
+                m < HALF_WIDEN_MIN_M
+            );
+
+            let max_error = got
+                .iter()
+                .zip(oracle.iter())
+                .map(|(&actual, &expected)| (actual - expected as f32).abs())
+                .fold(0.0f32, f32::max);
+            // Measured max error here is 5.4e-7 / 1.2e-6 / 1.8e-6 for
+            // M=15/16/19, i.e. pure f32 accumulation noise over K=521 terms.
+            // 1e-4 leaves ~55x headroom for a different SGEMM tile order while
+            // staying far below the ~1e-2 a genuine defect would produce (f16
+            // accumulation, a dropped tail, a wrong tile) -- f16 inputs are
+            // only granular to ~1e-3, so anything real is orders of magnitude
+            // above this bound.
+            const MAX_ACCUMULATION_ERROR: f32 = 1e-4;
+            assert!(
+                max_error <= MAX_ACCUMULATION_ERROR,
+                "M={m}: max error {max_error:e} exceeds {MAX_ACCUMULATION_ERROR:e}"
+            );
+        }
+    }
+
     #[test]
     fn matmul_half_dispatch_matches_widened_reference_across_irregular_shapes() {
         use onnx_runtime_ir::DataType;
@@ -1835,6 +3364,10 @@ mod tests {
             (17, 130, 11),
             (5, 257, 2),
             (2, 0, 3),
+            // Exactly on each widening threshold, and one step below each.
+            (16, 16, 16),
+            (15, 16, 16),
+            (16, 15, 17),
         ];
         let mut state = 0x51A7_CAFE_u32;
         let mut next = || {
@@ -1864,11 +3397,22 @@ mod tests {
                     _ => unreachable!(),
                 };
                 let geometry = matmul_geometry(&a.view(), &b.view()).unwrap();
-                assert!(
-                    try_matmul_half(&a.view(), &b.view(), &geometry)
+                // f16 above the widening crossover deliberately declines here
+                // and is served by the tuned SGEMM instead; the value checks
+                // below are route-independent and cover both.
+                let took_half =
+                    try_matmul_half(&a.view(), &b.view(), &geometry, CpuBackend::auto_detect())
                         .unwrap()
-                        .is_some(),
-                    "{dtype:?} should select the dedicated half GEMM"
+                        .is_some();
+                #[cfg(all(target_arch = "x86_64", feature = "mlas"))]
+                let expect_widen = dtype == DataType::Float16
+                    && m >= HALF_WIDEN_MIN_M
+                    && k * n >= HALF_WIDEN_MIN_WEIGHT;
+                #[cfg(not(all(target_arch = "x86_64", feature = "mlas")))]
+                let expect_widen = false;
+                assert_eq!(
+                    took_half, !expect_widen,
+                    "{dtype:?} {m}x{k}x{n}: unexpected route (half={took_half})"
                 );
 
                 let mut expected = vec![0.0f32; m * n];
@@ -2091,6 +3635,89 @@ mod tests {
                 let rel = (got[row * n + col] - want).abs() / denom;
                 assert!(rel <= 3e-2, "K-tail mismatch at ({row},{col}): rel {rel}");
             }
+        }
+    }
+
+    /// Sweep that sets [`HALF_WIDEN_MIN_M`]: blocked half GEMM vs widening to
+    /// `f32` and running the tuned SGEMM, over the `M` grid at the ambient
+    /// thread count. Both arms run the exact code the two routes run, so the
+    /// crossover this prints is the crossover the gate must encode.
+    ///
+    /// Pin the run (`taskset -c 0-15`) and set `RAYON_NUM_THREADS`; an
+    /// oversubscribed pool inflates the parallel arm by ~2.6x on this host.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "microbench: run explicitly with --ignored --nocapture"]
+    fn bench_f16_half_vs_widen() {
+        use std::time::Instant;
+
+        fn median5(mut f: impl FnMut()) -> f64 {
+            f();
+            let mut v: Vec<f64> = (0..5)
+                .map(|_| {
+                    let t = Instant::now();
+                    f();
+                    t.elapsed().as_secs_f64() * 1e3
+                })
+                .collect();
+            v.sort_by(f64::total_cmp);
+            v[2]
+        }
+
+        let threads = rayon::current_num_threads();
+        println!("threads={threads}");
+        println!("M,K,N,half_ms,widen_ms,half/widen");
+        for &(m, k, n) in &[
+            (2usize, 2048usize, 2048usize),
+            (8, 2048, 2048),
+            (16, 2048, 2048),
+            (32, 2048, 2048),
+            (64, 2048, 2048),
+            (128, 2048, 2048),
+            (256, 2048, 2048),
+            (128, 3584, 3584),
+            // Weight sweep at the minimum claimed M, to site the weight guard.
+            (16, 8, 8),
+            (16, 16, 16),
+            (16, 32, 32),
+            (16, 48, 48),
+            (16, 64, 64),
+            (16, 96, 96),
+            (16, 128, 128),
+            (16, 130, 11),
+            (16, 256, 256),
+        ] {
+            let a_src: Vec<f32> = (0..m * k).map(|i| (i % 13) as f32 * 0.01 - 0.06).collect();
+            let b_src: Vec<f32> = (0..k * n).map(|i| (i % 11) as f32 * 0.01 - 0.05).collect();
+            let a = Owned::f16(&[m, k], &a_src);
+            let b = Owned::f16(&[k, n], &b_src);
+            let (av, bv) = (a.view(), b.view());
+            let geom = matmul_geometry(&av, &bv).unwrap();
+
+            // Arm 1: the blocked half GEMM, forced by asking for a backend the
+            // gate never yields for.
+            let half = median5(|| {
+                let out = try_matmul_half(&av, &bv, &geom, CpuBackend::Generic)
+                    .unwrap()
+                    .unwrap();
+                std::hint::black_box(&out);
+            });
+            // Arm 2: what every caller falls through to once the gate declines.
+            let widen = median5(|| {
+                let out = matmul_dense_impl_with_geom(
+                    to_dense_f32_widen("MatMul", &av).unwrap(),
+                    to_dense_f32_widen("MatMul", &bv).unwrap(),
+                    &geom,
+                    CpuBackend::auto_detect(),
+                    None,
+                )
+                .unwrap();
+                std::hint::black_box(&out);
+            });
+            println!(
+                "{m},{k},{n},{half:.4},{widen:.4},{:.2}",
+                half / widen.max(f64::MIN_POSITIVE)
+            );
         }
     }
 
@@ -2387,7 +4014,7 @@ mod tests {
             )
             .unwrap();
         let packed_ptr = kernel.prepack.packed_b.get().unwrap() as *const mlas_sys::PackedB;
-        let dense_ptr = kernel.prepack.dense[1].get().unwrap().as_ptr();
+        let dense_ptr = kernel.prepack.dense[1].filled().unwrap().as_ptr();
 
         let a2_data: Vec<f32> = (0..5 * 17)
             .map(|i| ((i as f32 * 0.07).cos()) * 0.2)
@@ -2406,8 +4033,11 @@ mod tests {
             kernel.prepack.packed_b.get().unwrap() as *const mlas_sys::PackedB,
             packed_ptr
         );
-        assert_eq!(kernel.prepack.dense[1].get().unwrap().as_ptr(), dense_ptr);
-        assert!(kernel.prepack.dense[0].get().is_none());
+        assert_eq!(
+            kernel.prepack.dense[1].filled().unwrap().as_ptr(),
+            dense_ptr
+        );
+        assert!(!kernel.prepack.dense[0].is_filled());
         assert_ne!(out1.to_f32(), out2.to_f32());
     }
 
@@ -2496,8 +4126,8 @@ mod tests {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         assert!(kernel.prepack.transposed_b_f16.get().is_some());
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        assert!(kernel.prepack.dense[1].get().is_some());
-        assert!(kernel.prepack.dense[0].get().is_none());
+        assert!(kernel.prepack.dense[1].is_filled());
+        assert!(!kernel.prepack.dense[0].is_filled());
 
         // Capture the cache pointer *before* the second execute so the
         // comparison below is a real guard: it proves the first call populated
@@ -2505,7 +4135,7 @@ mod tests {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let ptr_before = kernel.prepack.transposed_b_f16.get().unwrap().1.as_ptr();
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        let ptr_before = kernel.prepack.dense[1].get().unwrap().as_ptr();
+        let ptr_before = kernel.prepack.dense[1].filled().unwrap().as_ptr();
 
         let a2 = Owned::f32(&[1, 2], &[4., 5.]);
         let mut out2 = Owned::zeros_f32(&[1, 2]);
@@ -2523,10 +4153,419 @@ mod tests {
         );
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         assert_eq!(
-            kernel.prepack.dense[1].get().unwrap().as_ptr(),
+            kernel.prepack.dense[1].filled().unwrap().as_ptr(),
             ptr_before,
             "dense[1] cache was reallocated on the second execute"
         );
+    }
+
+    /// The f16 prefill route through MLAS SGEMM must agree with the widened
+    /// reference on shapes whose edges the packed kernel has to handle: `K` and
+    /// `N` are both odd and `N` is below a SIMD step, so the tails dominate.
+    ///
+    /// Also proves the route is actually taken. Without the `packed_b_from_half`
+    /// assertion this test would keep passing if the optimisation silently
+    /// stopped applying and the slow blocked path served the call instead.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn f16_prefill_through_mlas_matches_the_widened_reference() {
+        let (m, k, n) = (6usize, 37usize, 5usize);
+        // Multiples of 1/16 are exact in f16, so any mismatch is the kernel's
+        // arithmetic rather than the operands' rounding.
+        let a_data: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 7 % 23) as f32 - 11.0) / 16.0)
+            .collect();
+        let b_data: Vec<f32> = (0..k * n)
+            .map(|i| ((i * 13 % 31) as f32 - 15.0) / 16.0)
+            .collect();
+        let expected = naive_matmul(&a_data, &b_data, m, k, n);
+
+        let a = Owned::f16(&[m, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[m, n]);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        // `execute` resolves its backend by auto-detection, and only MLAS has a
+        // pack to build; elsewhere the blocked path serves the call correctly.
+        assert_eq!(
+            kernel.prepack.packed_b_from_half.get().is_some(),
+            crate::backend::CpuBackend::auto_detect() == crate::backend::CpuBackend::Mlas,
+            "a constant f16 B at M>1 must be widened and packed once on MLAS, \
+             not repacked per call"
+        );
+        for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+            assert!(
+                (actual - want).abs() <= 1e-3,
+                "f16 prefill disagreed: got {actual}, want {want}"
+            );
+        }
+    }
+
+    /// The pack is built once and reused. A `OnceLock` that were re-initialised
+    /// per call would still be correct but would reintroduce the entire cost
+    /// this path exists to remove, and no numerical test would notice.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn f16_prefill_pack_is_built_once_across_calls() {
+        let (m, k, n) = (4usize, 16usize, 8usize);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 9) as f32 - 4.0) / 8.0).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
+        let a = Owned::f16(&[m, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut prepack = MatMulPrepack::default();
+        prepack.set_constant_inputs(&[false, true]);
+        // Forced dispatch: whether the pack is reused is a property of the
+        // memo, not of which backend auto-detection happens to pick here.
+        let backend = crate::backend::CpuBackend::Mlas;
+
+        let first = try_packed_half_prefill(&prepack, backend, &a.view(), &b.view(), m, k, n)
+            .unwrap()
+            .expect("a constant f16 B at M>1 must take the packed route");
+        let packed_before = prepack
+            .packed_b_from_half
+            .get()
+            .expect("the first call must populate the pack")
+            .as_ref()
+            .expect("a constant B must pack") as *const _;
+
+        let second = try_packed_half_prefill(&prepack, backend, &a.view(), &b.view(), m, k, n)
+            .unwrap()
+            .expect("the second call must also take the packed route");
+        let packed_after = prepack.packed_b_from_half.get().unwrap().as_ref().unwrap() as *const _;
+
+        assert_eq!(
+            packed_before, packed_after,
+            "the MLAS pack was rebuilt on the second call"
+        );
+        assert_eq!(first, second, "repeated calls diverged");
+    }
+
+    /// An activation B must never be packed: the pack is only valid because a
+    /// constant weight never changes, and caching an activation would return a
+    /// stale product the moment the upstream op produced new values.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn f16_prefill_with_a_non_constant_b_is_correct_and_unpacked() {
+        let (m, k, n) = (3usize, 12usize, 6usize);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 9) as f32 - 4.0) / 8.0).collect();
+        let b1: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
+        let b2: Vec<f32> = b1.iter().map(|v| v + 0.25).collect();
+
+        let a = Owned::f16(&[m, k], &a_data);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, false]);
+
+        for b_data in [&b1, &b2] {
+            let b = Owned::f16(&[k, n], b_data);
+            let mut out = Owned::zeros_f32(&[m, n]);
+            kernel
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+            let expected = naive_matmul(&a_data, b_data, m, k, n);
+            for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+                assert!(
+                    (actual - want).abs() <= 1e-3,
+                    "non-constant f16 B disagreed: got {actual}, want {want}"
+                );
+            }
+            assert!(
+                kernel.prepack.packed_b_from_half.get().is_none(),
+                "an activation B must never be packed as a weight"
+            );
+        }
+    }
+
+    /// M=1 keeps the GEMV. Packing needs row reuse to pay for itself, and the
+    /// decode GEMV is memory-bound and already at parity with ORT, so building
+    /// a pack there would add cost and win nothing.
+    /// A second, different weight at the same `[k, n]` must never be served
+    /// the first weight's pack.
+    ///
+    /// The executor keys its kernel cache on node and input shapes and a
+    /// constant input is a graph initializer with a stable address, so this
+    /// cannot happen today. The guard is defence in depth: it makes any future
+    /// broadening of "constant" degrade to the slow-but-correct blocked path
+    /// rather than silently returning another tensor's product.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn a_different_weight_is_never_served_the_cached_pack() {
+        let (m, k, n) = (3usize, 12usize, 4usize);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 5) as f32 - 2.0) / 8.0).collect();
+        let first: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
+        let second: Vec<f32> = first.iter().map(|value| value + 1.0).collect();
+        let a = Owned::f16(&[m, k], &a_data);
+        let b_first = Owned::f16(&[k, n], &first);
+        let b_second = Owned::f16(&[k, n], &second);
+        let mut prepack = MatMulPrepack::default();
+        prepack.set_constant_inputs(&[false, true]);
+
+        // Forced dispatch: the guard is hardware-independent, so assert it on
+        // every target rather than only where auto-detection picks MLAS.
+        let backend = crate::backend::CpuBackend::Mlas;
+        let served =
+            try_packed_half_prefill(&prepack, backend, &a.view(), &b_first.view(), m, k, n)
+                .unwrap()
+                .expect("the first weight builds and uses the pack");
+        let want_first = naive_matmul(&a_data, &first, m, k, n);
+        for (actual, want) in served.iter().zip(want_first.iter()) {
+            assert!((actual - want).abs() <= 1e-3, "first weight disagreed");
+        }
+
+        let reused =
+            try_packed_half_prefill(&prepack, backend, &a.view(), &b_second.view(), m, k, n)
+                .unwrap();
+        assert!(
+            reused.is_none(),
+            "a weight the pack was not built for must be declined, not served \
+             the cached pack; got a result that would be the first weight's"
+        );
+    }
+
+    /// Calls the shared helper directly at `M = 1`, bypassing the decode GEMV
+    /// that both kernels try first.
+    ///
+    /// `f16_decode_does_not_build_the_prefill_pack` and its `Gemm` twin only
+    /// fail under a compound injection, because at `M = 1` the GEMV returns
+    /// before the helper is ever reached. This one falsifies the `m <= 1` gate
+    /// on its own: remove it and the assertion below sees `Some`.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn the_packed_prefill_helper_declines_a_single_row() {
+        let (k, n) = (24usize, 8usize);
+        let a = Owned::f16(
+            &[1, k],
+            &(0..k).map(|i| (i % 5) as f32 / 8.0).collect::<Vec<_>>(),
+        );
+        let b = Owned::f16(
+            &[k, n],
+            &(0..k * n).map(|i| (i % 7) as f32 / 8.0).collect::<Vec<_>>(),
+        );
+        let mut prepack = MatMulPrepack::default();
+        prepack.set_constant_inputs(&[false, true]);
+        let single_row = try_packed_half_prefill(
+            &prepack,
+            crate::backend::CpuBackend::Mlas,
+            &a.view(),
+            &b.view(),
+            1,
+            k,
+            n,
+        )
+        .unwrap();
+        assert!(
+            single_row.is_none(),
+            "packing needs row reuse to pay for itself, so M=1 must be declined"
+        );
+        assert!(
+            !prepack.half_pack_is_built(),
+            "a declined call must not leave a pack behind"
+        );
+
+        // The same weight at M=2 is accepted, so the decline above is the row
+        // count and not some unrelated rejection.
+        let a2 = Owned::f16(
+            &[2, k],
+            &(0..2 * k).map(|i| (i % 5) as f32 / 8.0).collect::<Vec<_>>(),
+        );
+        let two_rows = try_packed_half_prefill(
+            &prepack,
+            crate::backend::CpuBackend::Mlas,
+            &a2.view(),
+            &b.view(),
+            2,
+            k,
+            n,
+        )
+        .unwrap();
+        assert!(two_rows.is_some(), "M=2 must take the packed route");
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn f16_decode_does_not_build_the_prefill_pack() {
+        let (k, n) = (24usize, 8usize);
+        let a_data: Vec<f32> = (0..k).map(|i| ((i % 9) as f32 - 4.0) / 8.0).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
+        let a = Owned::f16(&[1, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        assert!(
+            kernel.prepack.packed_b_from_half.get().is_none(),
+            "M=1 must stay on the GEMV rather than building a prefill pack"
+        );
+        let expected = naive_matmul(&a_data, &b_data, 1, k, n);
+        for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+            assert!((actual - want).abs() <= 1e-3, "decode GEMV disagreed");
+        }
+    }
+
+    /// The x86 f16 decode GEMV must produce the same values as the blocked
+    /// half GEMM it now preempts.
+    ///
+    /// `N = 5` is below the kernel's 8-lane SIMD step, so the whole stripe
+    /// runs through the scalar tail; `K = 137` is a long odd contraction.
+    /// Together they exercise the edges the blocked kernel never sees.
+    #[test]
+    fn f16_decode_gemv_agrees_with_the_blocked_half_gemm() {
+        let k = 137usize;
+        let n = 5usize;
+        // Multiples of 1/16 are exact in f16, so any mismatch is the kernel's
+        // rather than the operands' rounding.
+        let a_data: Vec<f32> = (0..k)
+            .map(|i| ((i * 7 % 23) as f32 - 11.0) / 16.0)
+            .collect();
+        let b_data: Vec<f32> = (0..k * n)
+            .map(|i| ((i * 13 % 31) as f32 - 15.0) / 16.0)
+            .collect();
+
+        let expected = naive_matmul(&a_data, &b_data, 1, k, n);
+
+        let a = Owned::f16(&[1, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+            assert!(
+                (actual - want).abs() <= 1e-3,
+                "f16 decode GEMV disagreed: got {actual}, want {want}"
+            );
+        }
+    }
+
+    /// A non-constant f16 B must still be handled correctly. Unlike the
+    /// Accelerate GEMV, this kernel reads B in place rather than through a
+    /// weight cache, so an activation B is a *supported* input here, not a
+    /// fallthrough — and it must never be memoised as a weight.
+    #[test]
+    fn f16_decode_with_a_non_constant_weight_is_correct_and_uncached() {
+        let k = 40usize;
+        let n = 3usize;
+        let a_data: Vec<f32> = (0..k).map(|i| ((i % 9) as f32 - 4.0) / 8.0).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
+        let expected = naive_matmul(&a_data, &b_data, 1, k, n);
+
+        let a = Owned::f16(&[1, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, false]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        assert!(
+            kernel.prepack.transposed_b_f16.get().is_none(),
+            "an activation B must never be memoised as a weight transpose"
+        );
+        assert!(
+            !kernel.prepack.dense[1].is_filled(),
+            "an activation B must never be memoised as a dense weight"
+        );
+        for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+            assert!((actual - want).abs() <= 1e-3, "got {actual}, want {want}");
+        }
+    }
+
+    /// A non-contiguous B must be declined by the dispatch guard: the kernel
+    /// reads `B` as a flat `k * n` slice, so a strided view would be read with
+    /// the wrong layout. Pinned as a negative test because the guard is the
+    /// only thing standing between a strided weight and a silently wrong
+    /// answer.
+    #[test]
+    fn f16_decode_declines_a_non_contiguous_weight_and_stays_correct() {
+        let k = 6usize;
+        let n = 4usize;
+        // Build B as the transpose of a [n, k] buffer so the [k, n] view is
+        // genuinely strided rather than merely offset.
+        let mut bt_data = vec![0.0f32; n * k];
+        let mut b_data = vec![0.0f32; k * n];
+        for p in 0..k {
+            for j in 0..n {
+                let v = ((p * n + j) % 9) as f32 / 8.0 - 0.5;
+                b_data[p * n + j] = v;
+                bt_data[j * k + p] = v;
+            }
+        }
+        let a_data: Vec<f32> = (0..k).map(|i| (i % 5) as f32 / 4.0 - 0.5).collect();
+        let expected = naive_matmul(&a_data, &b_data, 1, k, n);
+
+        let a = Owned::f16(&[1, k], &a_data);
+        let bt = Owned::f16(&[n, k], &bt_data);
+        let mut b_view = bt.view();
+        let shape = [k, n];
+        let strided = [1i64, k as i64];
+        b_view.shape = &shape;
+        b_view.strides = &strided;
+        assert!(
+            !b_view.is_contiguous(),
+            "test must present a genuinely strided B"
+        );
+
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b_view], &mut [out.view_mut()])
+            .unwrap();
+
+        for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+            assert!(
+                (actual - want).abs() <= 1e-3,
+                "strided B gave {actual}, want {want}"
+            );
+        }
+    }
+
+    /// The GEMV must not allocate a weight copy: it reads B straight from the
+    /// stored `[K, N]` layout. Pinned because a transposed variant would cost
+    /// a permanent `2 * K * N` bytes that `try_matmul_half` never paid.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn f16_decode_gemv_does_not_cache_a_copy_of_the_weight() {
+        let k = 64usize;
+        let n = 8usize;
+        let a_data: Vec<f32> = (0..k).map(|i| ((i % 5) as f32 - 2.0) / 4.0).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 11) as f32 - 5.0) / 8.0).collect();
+
+        let a = Owned::f16(&[1, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = MatMulKernel::default();
+        // B *is* a constant here: even so, no weight copy may be materialised.
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        let expected = naive_matmul(&a_data, &b_data, 1, k, n);
+        for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+            assert!((actual - want).abs() <= 1e-3, "got {actual}, want {want}");
+        }
+        if half_gemv::simd_available() {
+            assert!(
+                kernel.prepack.transposed_b_f16.get().is_none(),
+                "the GEMV must read B in place, not through a transpose cache"
+            );
+            assert!(
+                !kernel.prepack.dense[1].is_filled(),
+                "the GEMV must not widen B to f32"
+            );
+        }
     }
 
     // --- Direct f32 output path (Option A) --------------------------------
@@ -3571,5 +5610,442 @@ mod tests {
                 "thin-M NEON path at [{m},{k}]×[{k},{n}]: relative error {rel_err:.2e} exceeds 1e-5"
             );
         }
+    }
+
+    /// #1091 measurement harness: same-binary A/B for the dense f32 GEMM.
+    ///
+    /// Drives [`gemm_with_backend`] with the vendored `Mlas` kernel (#1045) and
+    /// the built-in `SimdX86` microkernel ([`x86_sgemm::sgemm_simd`]) over
+    /// LLM-representative f32 GEMM shapes so the kernel gap on *this* host can be
+    /// measured directly, rather than inherited from #1045's EPYC number. No
+    /// int4 model exercises this path (they route through `MatMulNBits`), so a
+    /// synthetic driver is the only way to exercise the f32 SGEMM at model
+    /// scale.
+    ///
+    /// One backend per process (env `GEMM_AB_ARM=mlas|simd_packed|simd_gemv|
+    /// generic`) so an external poller can attribute process CPU time and peak
+    /// RSS to a single arm. The default `both` interleaves mlas + simd_packed +
+    /// simd_gemv **in one process**, back to back per shape, so every arm shares
+    /// the same machine conditions; it prints the ratio table and a control
+    /// check. `GEMM_AB_ITERS` (default 30) is the min-timing repeat count;
+    /// `GEMM_AB_SHAPES="m,k,n;m,k,n"` overrides the preset; `GEMM_AB_GENERIC=1`
+    /// adds the (slow) Generic arm; `GEMM_AB_CONTROL_PCT` (default 5) sets the
+    /// control drift threshold.
+    ///
+    /// ## The M>=2 rows are a built-in control
+    ///
+    /// The M=1 GEMV route only fires for `m == 1`; for `m >= 2` both the
+    /// `simd_packed` and `simd_gemv` arms execute the *identical* packed kernel
+    /// (`sgemm_simd_variant` ignores the flag). So on the M>=2 rows the
+    /// `gemv/packed` ratio is a direct, zero-cost measurement of run-to-run
+    /// noise: it must be ~1.0. If it drifts past `GEMM_AB_CONTROL_PCT`, the
+    /// machine was not quiet and **no conclusion may be drawn from that run** —
+    /// this makes "the box was busy" a measurement taken before concluding
+    /// rather than an excuse offered after. Adopt this pattern for every A/B
+    /// harness in the repo.
+    ///
+    /// Run: `cargo test -p onnx-runtime-ep-cpu --lib --release --features mlas \
+    ///   bench_f32_gemm_ab -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual perf harness (#1091); run explicitly"]
+    fn bench_f32_gemm_ab() {
+        use std::time::Instant;
+
+        // Dispatch one kernel arm. Returns false if the arm is not compiled into
+        // this build (e.g. `mlas` without the feature), so the harness degrades
+        // cleanly. For `m >= 2`, `simd_packed` and `simd_gemv` are byte-for-byte
+        // the same call — that identity is what makes the control valid.
+        #[allow(unused_variables)]
+        fn run_kind(
+            kind: &str,
+            a: &[f32],
+            b: &[f32],
+            c: &mut [f32],
+            m: usize,
+            k: usize,
+            n: usize,
+        ) -> bool {
+            match kind {
+                "generic" => {
+                    gemm_with_backend(CpuBackend::Generic, a, b, c, m, k, n).unwrap();
+                    true
+                }
+                #[cfg(feature = "mlas")]
+                "mlas" => {
+                    gemm_with_backend(CpuBackend::Mlas, a, b, c, m, k, n).unwrap();
+                    true
+                }
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                "simd_packed" => {
+                    super::x86_sgemm::sgemm_simd_variant(a, b, c, m, k, n, false);
+                    true
+                }
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                "simd_gemv" => {
+                    super::x86_sgemm::sgemm_simd_variant(a, b, c, m, k, n, true);
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        // Qwen2.5-14B f32 shapes (hidden 5120, inter 13824, kv 1024, vocab
+        // 152064). The M=1 rows are decode GEMVs; the M=128 rows are the prefill
+        // control (unaffected by the M=1 route — see the doc comment).
+        let default_shapes: Vec<(usize, usize, usize)> = vec![
+            (1, 5120, 7168),    // decode: fused QKV proj (q 5120 + kv 2*1024)
+            (1, 5120, 5120),    // decode: o_proj
+            (1, 5120, 13824),   // decode: gate/up proj
+            (1, 13824, 5120),   // decode: down proj
+            (1, 5120, 152064),  // decode: lm_head
+            (128, 5120, 5120),  // CONTROL prefill: o_proj
+            (128, 5120, 13824), // CONTROL prefill: gate/up proj
+            (128, 13824, 5120), // CONTROL prefill: down proj
+        ];
+        let shapes: Vec<(usize, usize, usize)> = match std::env::var("GEMM_AB_SHAPES") {
+            Ok(spec) if !spec.trim().is_empty() => spec
+                .split(';')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| {
+                    let parts: Vec<usize> =
+                        s.split(',').map(|p| p.trim().parse().unwrap()).collect();
+                    (parts[0], parts[1], parts[2])
+                })
+                .collect(),
+            _ => default_shapes,
+        };
+        let iters: usize = std::env::var("GEMM_AB_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        let control_pct: f64 = std::env::var("GEMM_AB_CONTROL_PCT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5.0);
+        let arm = std::env::var("GEMM_AB_ARM").unwrap_or_else(|_| "both".to_string());
+        let want_generic = std::env::var("GEMM_AB_GENERIC").is_ok();
+
+        let mut state = 0x1234_5678_u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 2.0
+        };
+
+        // Arm order (interleaved per shape). Isolated single-arm mode selects
+        // just one, for external RSS / CPU-time attribution.
+        let arms: Vec<&str> = if arm == "both" {
+            let mut v = vec!["mlas", "simd_packed", "simd_gemv"];
+            if want_generic {
+                v.push("generic");
+            }
+            v
+        } else {
+            vec![arm.as_str()]
+        };
+
+        println!(
+            "f32 GEMM A/B (#1091): threads={} iters={} arm={} control_pct={}",
+            rayon::current_num_threads(),
+            iters,
+            arm,
+            control_pct
+        );
+
+        // Collected control drift (|gemv/packed - 1|) over the M>=2 rows.
+        let mut worst_control_drift = 0.0f64;
+        let mut control_rows = 0usize;
+
+        for &(m, k, n) in &shapes {
+            let a: Vec<f32> = (0..m * k).map(|_| next()).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| next()).collect();
+            let flops = 2.0 * m as f64 * k as f64 * n as f64;
+            // Interleave arms at the *iteration* level, not the arm level: run
+            // every available arm once per round and keep each arm's min. A
+            // clean moment (or a load spike) then lands on all arms' minima
+            // together, so the M>=2 control ratio stays ~1.0 unless the machine
+            // is *continuously* loaded. Per-arm windows (arm A x40, then B x40)
+            // let sustained load during one arm's whole window bias that arm,
+            // which is exactly the noise the control is meant to catch.
+            let mut avail: Vec<&str> = Vec::new();
+            let mut cbufs: Vec<Vec<f32>> = Vec::new();
+            for &name in &arms {
+                let mut c = vec![0.0f32; m * n];
+                if run_kind(name, &a, &b, &mut c, m, k, n) {
+                    avail.push(name); // arm compiled in; c now warmed up
+                    cbufs.push(c);
+                }
+            }
+            let mut best = vec![f64::INFINITY; avail.len()];
+            for _ in 0..iters {
+                for (i, &name) in avail.iter().enumerate() {
+                    let t = Instant::now();
+                    run_kind(name, &a, &b, &mut cbufs[i], m, k, n);
+                    std::hint::black_box(&cbufs[i]);
+                    best[i] = best[i].min(t.elapsed().as_secs_f64());
+                }
+            }
+            let times: Vec<(&str, f64)> = avail.iter().copied().zip(best.iter().copied()).collect();
+            let g = |s: f64| flops / s / 1e9;
+            let get = |k: &str| times.iter().find(|(n, _)| *n == k).map(|(_, s)| *s);
+            let is_control = m >= 2;
+            print!(
+                "  {}{m:>4}x{k:>6}x{n:>6}:",
+                if is_control { "[CTL] " } else { "      " }
+            );
+            for (name, s) in &times {
+                print!("  {name} {:>8.3}ms ({:>6.1}GF/s)", s * 1e3, g(*s));
+            }
+            if let (Some(mlas), Some(packed), Some(gemv)) =
+                (get("mlas"), get("simd_packed"), get("simd_gemv"))
+            {
+                print!(
+                    "  | packed/mlas={:.2}x gemv/mlas={:.2}x gemv/packed={:.2}x",
+                    packed / mlas,
+                    gemv / mlas,
+                    gemv / packed
+                );
+                if is_control {
+                    let drift = (gemv / packed - 1.0).abs();
+                    worst_control_drift = worst_control_drift.max(drift);
+                    control_rows += 1;
+                }
+            }
+            println!();
+        }
+
+        if control_rows > 0 {
+            let pct = worst_control_drift * 100.0;
+            println!(
+                "CONTROL: {} M>=2 rows, worst |gemv/packed - 1| = {:.1}% (threshold {:.1}%) -> {}",
+                control_rows,
+                pct,
+                control_pct,
+                if pct > control_pct {
+                    "RUN NOT USABLE (machine not quiet; draw no conclusions)"
+                } else {
+                    "OK (run usable)"
+                }
+            );
+        }
+    }
+
+    /// Independent scalar oracle for [`gemm_bt`]: `c[i][j] = Σ_p a[i][p]*bt[j][p]`
+    /// with left-to-right accumulation, sharing no code with production.
+    #[cfg(not(feature = "mlas"))]
+    #[allow(clippy::needless_range_loop)]
+    fn naive_bt(a: &[f32], bt: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut c = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += a[i * k + p] * bt[j * k + p];
+                }
+                c[i * n + j] = sum;
+            }
+        }
+        c
+    }
+
+    /// Small deterministic LCG stream in `[-0.125, 0.125)`, matching the style of
+    /// [`matmul_generic_block_boundaries_match_naive_reference`].
+    #[cfg(not(feature = "mlas"))]
+    fn lcg_stream(seed: u32) -> impl FnMut() -> f32 {
+        let mut state = seed;
+        move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 0.25
+        }
+    }
+
+    /// `gemm_bt` must match the independent naive oracle across every shape that
+    /// exercises the `4×2` interior tile, the `dot` edge/GEMV path, `k % 8`
+    /// tails, odd `n`, leftover rows (`rows % 4`), the `m == 1` decode case and
+    /// `n == 1`.
+    #[cfg(not(feature = "mlas"))]
+    #[test]
+    fn gemm_bt_matches_naive_reference_across_shapes() {
+        // (m, k, n): full tiles, tails, odd n, decode rows, single row/col.
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (1, 1, 1),     // smallest
+            (1, 7, 1),     // m=1, n=1, k tail (7 % 8)
+            (1, 8, 5),     // m=1, exact k block, odd n
+            (1, 9, 5),     // m=1, k tail 1, odd n
+            (1, 1024, 64), // decode: single token, large k
+            (1, 300, 300), // decode: rectangular
+            (4, 16, 2),    // exactly one interior tile
+            (4, 17, 2),    // interior tile + k tail
+            (5, 16, 2),    // 1 full row band + 1 leftover row
+            (7, 33, 9),    // 3 leftover rows, k tail, odd n
+            (8, 8, 8),     // two full row bands
+            (13, 64, 5),   // leftover rows + odd n
+            (3, 100, 1),   // all leftover rows, single column
+            (6, 1, 4),     // k = 1 (tail only, no 8-block)
+            (4, 3, 2),     // k < 8 (all tail)
+            (2, 5, 3),
+            (129, 130, 131), // large: row-block / col-parallel + all edges
+        ];
+        for &(m, k, n) in SHAPES {
+            let mut ra = lcg_stream(0x1234_5678 ^ (m as u32).wrapping_mul(2_654_435_761));
+            let mut rb = lcg_stream(0x9E37_79B9 ^ (n as u32).wrapping_mul(40_503));
+            let a: Vec<f32> = (0..m * k).map(|_| ra()).collect();
+            let bt: Vec<f32> = (0..n * k).map(|_| rb()).collect();
+            let want = naive_bt(&a, &bt, m, k, n);
+            let mut got = vec![f32::NAN; m * n];
+            gemm_bt(&a, &bt, &mut got, m, k, n).unwrap();
+            for (idx, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-3,
+                    "shape {m}x{k}x{n} index {idx}: got {g}, want {w}"
+                );
+            }
+        }
+    }
+
+    /// The zero-extent guards must leave a correctly sized result and never
+    /// panic on the chunking math: `m == 0` and `n == 0` produce empty products
+    /// and `k == 0` produces all-zero dot products.
+    #[cfg(not(feature = "mlas"))]
+    #[test]
+    fn gemm_bt_handles_zero_extents() {
+        // m == 0: nothing to write.
+        let mut c: Vec<f32> = Vec::new();
+        gemm_bt(&[], &[0.1, 0.2, 0.3, 0.4], &mut c, 0, 4, 1).unwrap();
+        assert!(c.is_empty());
+
+        // n == 0: nothing to write.
+        let mut c: Vec<f32> = Vec::new();
+        gemm_bt(&[0.1, 0.2, 0.3, 0.4], &[], &mut c, 2, 2, 0).unwrap();
+        assert!(c.is_empty());
+
+        // k == 0: every dot product is the empty sum, i.e. exactly 0.
+        let mut c = vec![7.0f32; 3 * 5];
+        gemm_bt(&[], &[], &mut c, 3, 0, 5).unwrap();
+        assert!(c.iter().all(|&v| v == 0.0), "k == 0 must zero every output");
+    }
+
+    /// Pin the portable scalar fallback [`gemm_bt_block_scalar`] (the non-x86 /
+    /// no-AVX2 path) directly against the naive oracle, since the host normally
+    /// takes the AVX2 path and would never exercise it.
+    #[cfg(not(feature = "mlas"))]
+    #[test]
+    fn gemm_bt_block_scalar_matches_naive_reference() {
+        const SHAPES: &[(usize, usize, usize)] = &[(1, 7, 1), (4, 17, 3), (7, 33, 9), (13, 5, 4)];
+        for &(m, k, n) in SHAPES {
+            let mut ra = lcg_stream(0x0BAD_F00D ^ (k as u32));
+            let mut rb = lcg_stream(0xFEED_BEEF ^ (n as u32));
+            let a: Vec<f32> = (0..m * k).map(|_| ra()).collect();
+            let bt: Vec<f32> = (0..n * k).map(|_| rb()).collect();
+            let want = naive_bt(&a, &bt, m, k, n);
+            let mut got = vec![f32::NAN; m * n];
+            gemm_bt_block_scalar(&a, &bt, &mut got, m, k, n);
+            for (idx, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-3,
+                    "scalar shape {m}x{k}x{n} index {idx}: got {g}, want {w}"
+                );
+            }
+        }
+    }
+
+    /// The exact oracle the task asks for: `gemm_bt` on the native `[n][k]`
+    /// weight layout must equal the *removed* production path — materialize the
+    /// `[k][n]` transpose, then run the plain `gemm`. Values must match within a
+    /// tight f32 tolerance (only the summation order differs).
+    #[cfg(not(feature = "mlas"))]
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn gemm_bt_matches_transpose_then_gemm() {
+        // Small-m shapes exercise the `dot` GEMV path; the large-m shapes force
+        // the row-block driver so the `4×2` tile kernel (and its `k` tail) runs.
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (1, 96, 40),
+            (5, 7, 9),
+            (12, 64, 20),
+            (4, 16, 2),
+            (40, 130, 34),
+            (64, 96, 48),
+        ];
+        for &(m, k, n) in SHAPES {
+            let mut ra = lcg_stream(0xA5A5_1234 ^ (m as u32));
+            let mut rb = lcg_stream(0x5A5A_9876 ^ (n as u32));
+            let a: Vec<f32> = (0..m * k).map(|_| ra()).collect();
+            // `bt` is the expert layout `[n][k]` (i.e. `[out][in]`).
+            let bt: Vec<f32> = (0..n * k).map(|_| rb()).collect();
+
+            // Reference: the old path — transpose `bt` into `[k][n]`, plain gemm.
+            let mut b_kn = vec![0.0f32; k * n];
+            for out in 0..n {
+                for inp in 0..k {
+                    b_kn[inp * n + out] = bt[out * k + inp];
+                }
+            }
+            let mut reference = vec![0.0f32; m * n];
+            gemm(&a, &b_kn, &mut reference, m, k, n).unwrap();
+
+            let mut got = vec![f32::NAN; m * n];
+            gemm_bt(&a, &bt, &mut got, m, k, n).unwrap();
+            for (idx, (&g, &r)) in got.iter().zip(&reference).enumerate() {
+                assert!(
+                    (g - r).abs() <= 1e-3,
+                    "shape {m}x{k}x{n} index {idx}: gemm_bt {g}, transpose+gemm {r}"
+                );
+            }
+        }
+    }
+
+    /// Deterministically exercise the `4×2` tile kernel and its `k` tail. A
+    /// single-thread Rayon pool forces the row-block driver (the
+    /// `native-threads=1` production path), so every `m >= 4` shape runs through
+    /// `tile_4x2` regardless of the ambient pool width - the ambient pool would
+    /// otherwise split small `m`/`n` into one-row / one-column tasks that never
+    /// reach the tile. Checked against the independent naive oracle.
+    #[cfg(not(feature = "mlas"))]
+    #[test]
+    fn gemm_bt_tile_kernel_matches_naive_single_threaded() {
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (8, 17, 4),   // two tile bands, k tail, even n
+            (12, 130, 6), // k tail 2
+            (4, 96, 2),   // exactly one tile, no tail
+            (9, 33, 11),  // leftover row + odd trailing column
+            (16, 256, 8),
+            // Large `k`. There is no K blocking: `tile_4x2` reduces the whole
+            // of `k` in one pass, so these cover a long single-pass reduction
+            // and its `k % 8` scalar tail, not a panelled accumulation.
+            (16, 512, 8), // long reduction, no tail
+            (12, 520, 6), // long reduction, no tail
+            (8, 300, 4),  // long reduction with a k%8 tail
+            (8, 259, 4),  // reduction whose tail is 3 lanes, all scalar
+            (13, 577, 7), // leftover rows + odd trailing column + k tail
+            // The only blocking in `gemm_bt` is over columns, and it engages
+            // at `n * k > NC_KB` (65536). Every shape above stays under that,
+            // so without these the column-panel sweep - the change that turned
+            // the largest prefill shape from a regression into a win - would
+            // be covered by nothing but the 629 MiB integration fixtures.
+            (8, 2000, 64),  // several full column panels
+            (10, 2001, 70), // column panels with a short final panel, k tail
+            (1, 2000, 40),  // the decode row, multi-panel
+        ];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            for &(m, k, n) in SHAPES {
+                let mut ra = lcg_stream(0x00C0_FFEE ^ (m as u32));
+                let mut rb = lcg_stream(0xB16B_00B5 ^ (n as u32));
+                let a: Vec<f32> = (0..m * k).map(|_| ra()).collect();
+                let bt: Vec<f32> = (0..n * k).map(|_| rb()).collect();
+                let want = naive_bt(&a, &bt, m, k, n);
+                let mut got = vec![f32::NAN; m * n];
+                gemm_bt(&a, &bt, &mut got, m, k, n).unwrap();
+                for (idx, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 1e-3,
+                        "tile shape {m}x{k}x{n} index {idx}: got {g}, want {w}"
+                    );
+                }
+            }
+        });
     }
 }

@@ -10,8 +10,9 @@ use super::*;
 
 #[test]
 fn phase_profile_gating_and_accumulation() {
-    // Single test (not two) so the process-global enable flag is never
-    // toggled concurrently by a sibling test under the parallel runner.
+    // The process-global gates have no per-test isolation, so every test that
+    // writes them takes this lock.
+    let _globals = phase_profile::globals_lock();
 
     // Disabled: a span records nothing and never captures a timestamp.
     phase_profile::force_enabled(false);
@@ -54,8 +55,40 @@ fn phase_profile_gating_and_accumulation() {
         "reset must clear this test's accumulated phase stats"
     );
 
+    // Turning on phase profiling must **not** turn on the activation-memory
+    // planner. The planner re-plans every activation on every run - work the
+    // shipped runtime never does - so while `--phase-profile` enabled it the
+    // profiler perturbed the run it was measuring, by about 3% on a softmax
+    // decode, and reported its own cost back as a phase of that run.
+    //
+    // The two gates are separate on purpose: `enable_for_process` (what
+    // `--phase-profile` calls) drives only the profiler, while the planner
+    // reads the environment. Asserted here rather than in a sibling test so
+    // the process-global enable flag stays owned by this one test, per the
+    // note at the top. Skipped when the environment already asks for planning,
+    // because then the separation is not observable.
+    let env_requests_planning = ["NXRT_ACTIVATION_MEMORY_PLAN", "NXRT_EXEC_PHASE_PROFILE"]
+        .iter()
+        .any(|key| std::env::var(key).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")));
+    if !env_requests_planning {
+        phase_profile::force_activation_plan_enabled(false);
+        phase_profile::enable_for_process();
+        assert!(phase_profile::enabled());
+        assert!(
+            !phase_profile::activation_plan_enabled(),
+            "phase profiling must not drag the activation-memory planner in \
+             with it: the planner costs about a third of a small run and would \
+             be charged to the run it is supposed to be measuring"
+        );
+        // The explicit opt-in still works, so the capability is decoupled from
+        // phase profiling rather than lost.
+        phase_profile::enable_activation_plan_for_process();
+        assert!(phase_profile::activation_plan_enabled());
+    }
+
     // Restore the default (disabled) state so other tests stay inert.
     phase_profile::force_enabled(false);
+    phase_profile::force_activation_plan_enabled(false);
 }
 
 // A produced top-level output is handed to the caller by moving its host
@@ -180,7 +213,14 @@ fn compute_in_place_chain_is_byte_identical_and_fires() {
     let enabled_output = enabled.run(&[("input", &values)]).unwrap()[0]
         .as_bytes()
         .to_vec();
-    assert_eq!(enabled.compute_in_place_alias_count, 2);
+    // One alias, not two: the graph input is bound zero-copy (its buffer
+    // borrows the caller's `values` tensor), and a borrowed buffer must never
+    // be written, so `Tanh` cannot run in place on it. The intermediate value
+    // `first` is executor-owned and still aliases. Trading one in-place alias
+    // (which saves an allocation the run makes anyway on the next step) for
+    // eliminating a full host->EP copy of every graph input is the point of
+    // `prepare_run_buffers`.
+    assert_eq!(enabled.compute_in_place_alias_count, 1);
 
     let mut disabled = Executor::build(inplace_chain_graph(false, false), weights, ep).unwrap();
     disabled.compute_in_place_enabled = false;
@@ -464,6 +504,13 @@ fn compute_in_place_multilayer_decode_residual_is_byte_identical_and_fires() {
 
 #[test]
 fn activation_memory_planner_reports_static_decode_graph_savings() {
+    // The planner is off by default, in tests as in production, so a test that
+    // needs its stats asks for them explicitly. The guard takes the globals
+    // lock (the gate is a process-global atomic) and clears the gate again on
+    // drop, including on panic - leaving it set would let a reader test that
+    // does not take the lock observe a planner this test switched on.
+    let _planner = phase_profile::ActivationPlanForTest::on();
+
     let values = Tensor::from_f32(&[4], &[-2.0, -0.5, 0.5, 2.0]).unwrap();
     let weights = Arc::new(WeightStore::new());
     let ep = auto_detect_cpu_ep().unwrap();
@@ -486,6 +533,13 @@ fn activation_memory_planner_reports_static_decode_graph_savings() {
 
 #[test]
 fn activation_memory_planner_uses_runtime_view_edges() {
+    // The planner is off by default, in tests as in production, so a test that
+    // needs its stats asks for them explicitly. The guard takes the globals
+    // lock (the gate is a process-global atomic) and clears the gate again on
+    // drop, including on panic - leaving it set would let a reader test that
+    // does not take the lock observe a planner this test switched on.
+    let _planner = phase_profile::ActivationPlanForTest::on();
+
     let values = Tensor::from_f32(&[4], &[-2.0, -0.5, 0.5, 2.0]).unwrap();
     let weights = Arc::new(WeightStore::new());
     let ep = auto_detect_cpu_ep().unwrap();
@@ -1940,6 +1994,330 @@ fn only_capacity_aware_inputs_keep_physical_capacity() {
     assert!(!kernel_input_uses_padded_capacity(&indexer_cast, 0));
 }
 
+// A capacity-form default-domain `Attention`: mask at input 3, KV cache at
+// inputs 4/5, no `is_causal` attribute — so it derives the valid length from the
+// mask frontier and binds the KV cache at physical capacity.
+fn capacity_form_attention(id: u32, q: ValueId, mask: ValueId, out: ValueId) -> Node {
+    Node::new(
+        NodeId(id),
+        "Attention",
+        vec![Some(q), Some(q), Some(q), Some(mask), Some(q), Some(q)],
+        vec![out],
+    )
+}
+
+#[test]
+fn capacity_form_attention_mask_input_classifier() {
+    // The mask slot (input 3) of a capacity-form `Attention` is a valid frozen-mask
+    // leaf; input 3 of a causal-attribute `Attention` (which reads the cache extent
+    // as the valid length) is not, and neither is a non-mask slot.
+    let q = ValueId(0);
+    let capacity = capacity_form_attention(0, q, q, q);
+    assert!(is_capacity_form_attention_mask_input(&capacity, 3));
+    assert!(!is_capacity_form_attention_mask_input(&capacity, 0));
+    assert!(!is_capacity_form_attention_mask_input(&capacity, 4));
+
+    let mut causal = capacity_form_attention(1, q, q, q);
+    causal
+        .attributes
+        .insert("is_causal".into(), Attribute::Int(1));
+    assert!(
+        !is_capacity_form_attention_mask_input(&causal, 3),
+        "an is_causal Attention reads the cache extent as valid length, not the mask frontier"
+    );
+}
+
+// Build the standard additive causal-mask builder cone feeding a capacity-form
+// `Attention` (the DeepSeek-V2-Lite / MLA topology). Returns the graph and the
+// `attention_mask` binding value id.
+fn v2lite_mask_builder_graph() -> (Graph, ValueId) {
+    use onnx_runtime_ir::static_shape;
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let q = graph.create_named_value("q", DataType::Float32, sh());
+
+    // Causal branch: attention_mask → CumSum → Unsqueeze → GreaterOrEqual.
+    let cumsum = graph.create_named_value("cumsum", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "CumSum",
+        vec![Some(mask)],
+        vec![cumsum],
+    ));
+    let unsq0 = graph.create_named_value("unsq0", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Unsqueeze",
+        vec![Some(cumsum)],
+        vec![unsq0],
+    ));
+    let ge = graph.create_named_value("ge", DataType::Bool, sh());
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "GreaterOrEqual",
+        vec![Some(unsq0)],
+        vec![ge],
+    ));
+
+    // Padding branch: attention_mask → Unsqueeze → Cast(bool).
+    let unsq1 = graph.create_named_value("unsq1", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Unsqueeze",
+        vec![Some(mask)],
+        vec![unsq1],
+    ));
+    let padbool = graph.create_named_value("padbool", DataType::Bool, sh());
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "Cast",
+        vec![Some(unsq1)],
+        vec![padbool],
+    ));
+
+    // And → Where(0/-inf) → Cast(fp16) → Unsqueeze → additive mask bias.
+    let and = graph.create_named_value("and", DataType::Bool, sh());
+    graph.insert_node(Node::new(
+        NodeId(5),
+        "And",
+        vec![Some(ge), Some(padbool)],
+        vec![and],
+    ));
+    let where_o = graph.create_named_value("where", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(6),
+        "Where",
+        vec![Some(and)],
+        vec![where_o],
+    ));
+    let cast_o = graph.create_named_value("cast", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(7),
+        "Cast",
+        vec![Some(where_o)],
+        vec![cast_o],
+    ));
+    let mask_bias = graph.create_named_value("mask_bias", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(8),
+        "Unsqueeze",
+        vec![Some(cast_o)],
+        vec![mask_bias],
+    ));
+
+    // Benign physical-extent read.
+    let shp = graph.create_named_value("shp", DataType::Int64, sh());
+    graph.insert_node(Node::new(NodeId(9), "Shape", vec![Some(mask)], vec![shp]));
+
+    // Two capacity-form Attention layers both consuming the shared mask bias.
+    let attn0 = graph.create_named_value("attn0", DataType::Float32, sh());
+    graph.insert_node(capacity_form_attention(10, q, mask_bias, attn0));
+    let attn1 = graph.create_named_value("attn1", DataType::Float32, sh());
+    graph.insert_node(capacity_form_attention(11, q, mask_bias, attn1));
+    graph.add_output(attn0);
+    graph.add_output(attn1);
+
+    (graph, mask)
+}
+
+#[test]
+fn vestigial_window_mask_builder_routes_to_padded_capacity() {
+    // The full additive-mask builder (prefix-sensitive CumSum/Unsqueeze included)
+    // terminating at capacity-form `Attention` inputs is padded-capacity-safe: the
+    // frozen physical-width mask yields a byte-identical additive bias.
+    let (graph, mask) = v2lite_mask_builder_graph();
+    assert!(
+        mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "vestigial-window additive-mask builder → capacity-form Attention must route padded-safe"
+    );
+}
+
+#[test]
+fn minimal_cast_to_capacity_attention_routes_to_padded_capacity() {
+    use onnx_runtime_ir::static_shape;
+    // The tiny-fixture shape: attention_mask → Cast(bool) → capacity-form Attention.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let q = graph.create_named_value("q", DataType::Float32, sh());
+    let bool_mask = graph.create_named_value("attn_mask_bool", DataType::Bool, sh());
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Cast",
+        vec![Some(mask)],
+        vec![bool_mask],
+    ));
+    let attn = graph.create_named_value("attn", DataType::Float32, sh());
+    graph.insert_node(capacity_form_attention(1, q, bool_mask, attn));
+    graph.add_output(attn);
+    assert!(mask_binding_feeds_capacity_form_attention(&graph, mask));
+}
+
+#[test]
+fn glm_indexer_add_mask_keeps_logical_width() {
+    use onnx_runtime_ir::static_shape;
+    // GLM-5.2's indexer branch mixes the mask with a logical-width score through
+    // Cast→Add. `Add` is not an additive-mask-builder op, so the cone is rejected
+    // and the mask keeps exposing its logical valid length (regression guard).
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let score = graph.create_named_value("indexer_score", DataType::Float32, sh());
+    let cast = graph.create_named_value("cast", DataType::Float32, sh());
+    graph.insert_node(Node::new(NodeId(0), "Cast", vec![Some(mask)], vec![cast]));
+    let add = graph.create_named_value("add", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Add",
+        vec![Some(cast), Some(score)],
+        vec![add],
+    ));
+    graph.add_output(add);
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "GLM-5.2 indexer Add mask must NOT be classified padded-safe"
+    );
+}
+
+#[test]
+fn mask_builder_without_capacity_attention_is_rejected() {
+    use onnx_runtime_ir::static_shape;
+    // A mask cone that ends at an is_causal Attention (reads cache extent as valid
+    // length), or reaches no Attention at all, must not be classified padded-safe.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let q = graph.create_named_value("q", DataType::Float32, sh());
+    let cast = graph.create_named_value("cast", DataType::Float32, sh());
+    graph.insert_node(Node::new(NodeId(0), "Cast", vec![Some(mask)], vec![cast]));
+    let attn = graph.create_named_value("attn", DataType::Float32, sh());
+    let mut causal = capacity_form_attention(1, q, cast, attn);
+    causal
+        .attributes
+        .insert("is_causal".into(), Attribute::Int(1));
+    graph.insert_node(causal);
+    graph.add_output(attn);
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "an is_causal terminal Attention is not a capacity-form mask consumer"
+    );
+}
+
+#[test]
+fn mask_feeding_only_shape_is_not_padded_capacity_via_topology() {
+    use onnx_runtime_ir::static_shape;
+    // A mask that reaches no capacity-form Attention (only Shape) is not blessed by
+    // the topology path: `reached_attention` stays false.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let shp = graph.create_named_value("shp", DataType::Int64, sh());
+    graph.insert_node(Node::new(NodeId(0), "Shape", vec![Some(mask)], vec![shp]));
+    graph.add_output(shp);
+    assert!(!mask_binding_feeds_capacity_form_attention(&graph, mask));
+}
+
+#[test]
+fn mask_feeding_non_builder_consumer_is_rejected() {
+    use onnx_runtime_ir::static_shape;
+    // A mask consumed by an arbitrary op (here MatMul) that is neither a shape read,
+    // a builder op, nor a capacity-form Attention input disqualifies the binding.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+    let mask = graph.create_named_value("attention_mask", DataType::Float32, sh());
+    graph.add_input(mask);
+    let w = graph.create_named_value("w", DataType::Float32, sh());
+    let mm = graph.create_named_value("mm", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "MatMul",
+        vec![Some(mask), Some(w)],
+        vec![mm],
+    ));
+    graph.add_output(mm);
+    assert!(!mask_binding_feeds_capacity_form_attention(&graph, mask));
+}
+
+#[test]
+fn mask_builder_to_attention_without_past_kv_is_rejected() {
+    use onnx_runtime_ir::static_shape;
+    // A masked, non-causal default-domain `Attention` with only q/k/v/mask (no
+    // past_key/past_value KV binding at inputs 4/5) is NOT a capacity-form leaf:
+    // the CUDA `Attention` kernel's fixed-capacity append contract requires both
+    // past caches. The cone must reach no valid capacity-form Attention, so the
+    // mask keeps exposing its logical valid length.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let q = graph.create_named_value("q", DataType::Float32, sh());
+    let cast = graph.create_named_value("cast", DataType::Float32, sh());
+    graph.insert_node(Node::new(NodeId(0), "Cast", vec![Some(mask)], vec![cast]));
+    // Attention with q/k/v/mask only — no KV cache at inputs 4/5.
+    let attn = graph.create_named_value("attn", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Attention",
+        vec![Some(q), Some(q), Some(q), Some(cast)],
+        vec![attn],
+    ));
+    graph.add_output(attn);
+    // Sanity: the leaf classifier itself rejects the KV-less Attention.
+    let kvless = graph.node(NodeId(1));
+    assert!(
+        !is_capacity_form_attention_mask_input(kvless, 3),
+        "an Attention without past_key/past_value is not a capacity-form leaf"
+    );
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "a mask cone reaching only a KV-less Attention must not be padded-safe"
+    );
+}
+
+#[test]
+fn mask_binding_that_is_graph_output_is_rejected() {
+    use onnx_runtime_ir::static_shape;
+    // The mask binding itself is ALSO a graph output while feeding the builder to
+    // a capacity-form Attention. Freezing it to physical width would leak the
+    // padded `max_len` into the output escape, so the root must be rejected too.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let q = graph.create_named_value("q", DataType::Float32, sh());
+    let bool_mask = graph.create_named_value("attn_mask_bool", DataType::Bool, sh());
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Cast",
+        vec![Some(mask)],
+        vec![bool_mask],
+    ));
+    let attn = graph.create_named_value("attn", DataType::Float32, sh());
+    graph.insert_node(capacity_form_attention(1, q, bool_mask, attn));
+    graph.add_output(attn);
+    // The mask binding escapes as a graph output as well.
+    graph.add_output(mask);
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "a mask binding that is itself a graph output must not be padded-safe"
+    );
+}
+
 struct WeightDeliveryKernel {
     deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,
     workspace_bytes: u64,
@@ -2641,6 +3019,112 @@ fn inference_session_fallback_workspace_grows_retries_and_reuses() {
     assert_eq!(reused.buffer.as_ptr(), ptr);
 }
 
+/// #1223: a *prepared* session must re-prepare its governed workspace when
+/// execution rebuckets to a larger shape bucket than preparation reserved for.
+///
+/// Preparation reserves one governed-workspace slot per lifetime class from the
+/// shapes it is handed, and — so a captured device graph can bake a stable
+/// pointer — a prepared session otherwise refuses to (re)allocate at execution
+/// time. That invariant only holds *within* one shape bucket. When decode grows
+/// past a bucket edge (or a prompt lands in a different bucket than its decode
+/// steps), the slot reserved under the old bucket's geometry can be undersized
+/// for the new one. Before the fix, the larger bucket failed the prepared-
+/// workspace invariant with "workspace invariant mismatch"; #1221 fixed the same
+/// failure mode *in-bucket* for `Attention` but scoped the cross-bucket case out.
+///
+/// This drives the exact gap on the executor's shared workspace path (not any
+/// one op-type): reserve a `SessionPersistent` per-row slot for a 2-row bucket,
+/// then execute a 4-row bucket. The rebucket lands on an eager dispatch (as it
+/// does on the real growing-KV decode path, which declines capture, and on the
+/// eager re-warm a capture-eligible model runs after a KV-growth graph
+/// invalidation), so the slot is re-prepared in place. Reverting the fix makes
+/// the 4-row execute fail with "workspace invariant mismatch".
+#[test]
+fn prepared_session_reprepares_workspace_when_execution_rebuckets() {
+    let mut graph = Graph::new();
+    graph
+        .opset_imports
+        .insert(onnx_runtime_ir::RUNTIME_DOMAIN.into(), 1);
+    let rows = SymbolId(0);
+    let shape = vec![Dim::Symbolic(rows)];
+    let input = graph.create_named_value("input", DataType::Float32, shape.clone());
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, shape);
+    graph.add_output(output);
+    let mut node = Node::new(
+        NodeId(0),
+        "BlockQuantizedMoE",
+        vec![Some(input)],
+        vec![output],
+    );
+    node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+    graph.insert_node(node);
+
+    let inputs = crate::io_meta(&graph, &graph.inputs);
+    let outputs = crate::io_meta(&graph, &graph.outputs);
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ep = WeightDeliveryEp::new(false, deliveries);
+    ep.workspace_bytes_per_row = 1024;
+    let exec = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let mut session = crate::InferenceSession {
+        inputs,
+        outputs,
+        model_metadata: crate::ModelMetadata::default(),
+        exec,
+        decode_inline_exec: None,
+        ep_context_config: crate::EpContextDumpConfig::default(),
+    };
+
+    // Bucket A: preparation reserves the SessionPersistent slot for a 2-row
+    // shape and latches "workspace preparation required", so execution may no
+    // longer lazily grow the slot within this bucket.
+    let bucket_a = Tensor::from_f32(&[2], &[1.0, 2.0]).unwrap();
+    session
+        .exec
+        .prepare_with_device_bindings(&[("input", &bucket_a)], &mut [])
+        .unwrap();
+    let reserved = session.exec.persistent_workspace.as_ref().unwrap();
+    assert_eq!(reserved.bytes, 2048);
+    assert_eq!(reserved.alignment, 256);
+    assert!(
+        session.exec.workspace_preparation_required,
+        "prepare must latch the prepared-workspace invariant"
+    );
+
+    // In-bucket execution still fits under the reservation.
+    assert_eq!(
+        session.run(&[("input", &bucket_a)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0]
+    );
+
+    // Bucket B: a larger bucket needs 4096 bytes at a tighter alignment than the
+    // 2-row reservation. Without the #1223 fix this eager rebucket dispatch
+    // fails the prepared-workspace invariant; with it, preparation is re-run in
+    // place and the slot grows.
+    let bucket_b = Tensor::from_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    assert_eq!(
+        session.run(&[("input", &bucket_b)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    let grown = session.exec.persistent_workspace.as_ref().unwrap();
+    assert_eq!(grown.bytes, 4096);
+    assert_eq!(grown.alignment, 512);
+    assert!(
+        session.exec.workspace_preparation_required,
+        "re-preparing on rebucket must not drop the prepared-workspace invariant"
+    );
+
+    // Rebucketing back down reuses the grown slot (a slot only ever grows).
+    assert_eq!(
+        session.run(&[("input", &bucket_a)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0]
+    );
+    assert_eq!(
+        session.exec.persistent_workspace.as_ref().unwrap().bytes,
+        4096
+    );
+}
+
 fn two_node_weight_delivery_fixture() -> (Graph, Arc<WeightStore>, std::path::PathBuf) {
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
     let root = std::env::var_os("CARGO_TARGET_DIR")
@@ -3315,6 +3799,168 @@ fn checked_storage_bytes_detects_byte_overflow() {
         checked_storage_bytes(DataType::Float32, 4, || "v".into(), &[4]).unwrap(),
         16
     );
+}
+
+#[test]
+fn dynamic_output_shapes_compress_counts_selected_values() {
+    use onnx_runtime_ir::Attribute;
+
+    let mut axis_node = Node::new(NodeId(0), "Compress", vec![], vec![]);
+    axis_node
+        .attributes
+        .insert("axis".into(), Attribute::Int(-1));
+    assert_eq!(
+        dynamic_output_shapes(
+            &axis_node,
+            &[vec![2, 4], vec![5]],
+            &[DataType::Float32, DataType::Bool],
+            &[None, Some(vec![1, 0, 1, 1, 1])],
+            &[],
+            11,
+        ),
+        Some(vec![vec![2, 3]]),
+        "condition entries beyond the selected axis must be ignored"
+    );
+
+    let flat_node = Node::new(NodeId(1), "Compress", vec![], vec![]);
+    assert_eq!(
+        dynamic_output_shapes(
+            &flat_node,
+            &[vec![2, 3], vec![4]],
+            &[DataType::Float32, DataType::Bool],
+            &[None, Some(vec![0, 1, 1, 0])],
+            &[],
+            11,
+        ),
+        Some(vec![vec![2]])
+    );
+}
+
+#[test]
+fn compress_condition_allows_image_sized_boolean_vectors() {
+    let image_condition = MAX_SHAPE_DATA_ELEMS + 1;
+    assert!(bounded_compress_condition(
+        DataType::Bool,
+        &[image_condition]
+    ));
+    assert!(!bounded_shape_input(DataType::Bool, &[image_condition]));
+    assert!(!bounded_compress_condition(
+        DataType::Int64,
+        &[image_condition]
+    ));
+    assert!(!bounded_compress_condition(
+        DataType::Bool,
+        &[(1 << 20) + 1]
+    ));
+}
+
+/// #1195 behavioural falsification. A `Compress` whose boolean condition is
+/// longer than `MAX_SHAPE_DATA_ELEMS` (an image-sized mask) must still resolve
+/// its data-dependent output shape and run to completion. Before the fix the
+/// condition was rejected by the ordinary shape-data bound, so
+/// `resolve_node_outputs` handed `dynamic_output_shapes` a `None` condition and
+/// the run failed with `UnresolvedShape { op: "Compress" }`. Reverting the
+/// dispatch routing (`compress_condition_i64` for `Compress` input 1 back to
+/// `shape_input_i64`) makes this test go RED, while the shipped predicate-only
+/// test stays green. The empty/full cases also cover the all-false and all-true
+/// condition boundaries through the real resolve + kernel path.
+#[test]
+fn compress_runs_with_image_sized_condition_including_empty_and_full() {
+    use onnx_runtime_ir::{Attribute, TensorData};
+
+    let n = MAX_SHAPE_DATA_ELEMS + 500; // 1524: past the shape-data bound, under 1<<20.
+    assert!(n > MAX_SHAPE_DATA_ELEMS);
+
+    // (selected indices, expected output length)
+    let scenarios: Vec<(Vec<usize>, usize)> = vec![
+        (vec![0, 7, n - 1], 3), // sparse selection spanning the ends
+        (Vec::new(), 0),        // all-false -> empty output
+        ((0..n).collect(), n),  // all-true  -> full output
+    ];
+
+    for (selected, expected_len) in scenarios {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+
+        let x = graph.create_named_value("x", DataType::Float32, static_shape([n]));
+        graph.add_input(x);
+
+        let mut cond_bytes = vec![0u8; n];
+        for &i in &selected {
+            cond_bytes[i] = 1;
+        }
+        let cond = graph.create_named_value("cond", DataType::Bool, static_shape([n]));
+        graph.set_initializer(
+            cond,
+            WeightRef::Inline(TensorData::from_raw(DataType::Bool, vec![n], cond_bytes)),
+        );
+
+        // A symbolic output extent keeps the shape unresolved after static
+        // inference, so the data-dependent resolve path (and the #1195 routing)
+        // is the only thing that can size the output.
+        let extent = graph.create_symbol(None);
+        let y = graph.create_named_value("y", DataType::Float32, vec![Dim::Symbolic(extent)]);
+        let mut node = Node::new(NodeId(0), "Compress", vec![Some(x), Some(cond)], vec![y]);
+        node.attributes.insert("axis".into(), Attribute::Int(0));
+        graph.insert_node(node);
+        graph.add_output(y);
+
+        let mut executor = Executor::build(
+            graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+
+        let x_data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let x_val = Tensor::from_f32(&[n], &x_data).unwrap();
+        let outputs = executor
+            .run(&[("x", &x_val)])
+            .expect("an image-sized Compress condition must resolve its output shape");
+        let out = outputs[0].to_vec_f32();
+        assert_eq!(
+            out.len(),
+            expected_len,
+            "selected count must set the Compress output extent"
+        );
+        let expected: Vec<f32> = selected.iter().map(|&i| i as f32).collect();
+        assert_eq!(
+            out, expected,
+            "Compress must gather exactly the selected rows"
+        );
+    }
+}
+
+/// Boundary behaviour of the Compress output-extent count that the #1195 sizer
+/// feeds an image-sized condition into: the count clamps to the axis length when
+/// the condition is longer, counts only the provided entries when it is shorter,
+/// and spans the empty (all-false) and full (all-true) ends.
+#[test]
+fn dynamic_output_shapes_compress_boundary_counts() {
+    use onnx_runtime_ir::Attribute;
+
+    let mut node = Node::new(NodeId(0), "Compress", vec![], vec![]);
+    node.attributes.insert("axis".into(), Attribute::Int(0));
+
+    let count = |cond: Vec<i64>, axis_dim: usize| {
+        dynamic_output_shapes(
+            &node,
+            &[vec![axis_dim], vec![cond.len()]],
+            &[DataType::Float32, DataType::Bool],
+            &[None, Some(cond)],
+            &[],
+            17,
+        )
+    };
+
+    // Condition longer than the axis: entries past the axis length are ignored.
+    assert_eq!(count(vec![1, 1, 1, 1, 1], 3), Some(vec![vec![3]]));
+    // Condition shorter than the axis: only the provided entries are counted.
+    assert_eq!(count(vec![1, 0, 1], 6), Some(vec![vec![2]]));
+    // All-false selects nothing: an empty output extent.
+    assert_eq!(count(vec![0, 0, 0, 0], 4), Some(vec![vec![0]]));
+    // All-true selects the whole axis.
+    assert_eq!(count(vec![1, 1, 1, 1], 4), Some(vec![vec![4]]));
 }
 
 /// The data-dependent shape sizer must return exactly one shape per output
@@ -6023,4 +6669,725 @@ fn executor_pin_fixed_capacity_kv_admits_gqa() {
         node_capture_seq_independent(&exec.graph, &gqa_node, &exec.capture_growing_symbols),
         "after the pin the GQA node must be admitted to capture"
     );
+}
+
+// === #1020: prepare-only workspace planning bounds the MLA context/sequence
+// axis instead of failing on it, while a genuinely unbounded axis still errors.
+// The DeepSeek-V2 MLA fixture is not on this machine, so these exercise the
+// resolution logic directly on synthetic graphs whose `::Attention` input has a
+// runtime-dependent context axis (the reported `v_model.Unsqueeze_16` shape).
+
+fn minimal_workspace_executor() -> Executor {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let a = graph.create_named_value("a", DataType::Float32, static_shape([1]));
+    graph.add_input(a);
+    let out = graph.create_named_value("out", DataType::Float32, static_shape([1]));
+    graph.add_output(out);
+    graph.insert_node(Node::new(NodeId(0), "Identity", vec![Some(a)], vec![out]));
+    Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap()
+}
+
+// An unresolved dim that IS a recognized context/sequence axis resolves to the
+// physically-allocated KV capacity (the extent bound to another growing symbol
+// this prepare call) — the #1020 fix. Mirrors `v_model.Unsqueeze_16`: an MLA
+// value-path sequence symbol shape inference never unified with the KV axis.
+#[test]
+fn prepare_workspace_binds_unresolved_context_axis_to_kv_capacity() {
+    let mut exec = minimal_workspace_executor();
+    let kv_seq = exec.graph.create_symbol(Some("total_seq".into()));
+    let v_seq = exec.graph.create_symbol(Some("v_seq".into()));
+    exec.capture_growing_symbols.insert(kv_seq);
+    exec.capture_growing_symbols.insert(v_seq);
+    let v = exec.graph.create_named_value(
+        "v_model.Unsqueeze_16",
+        DataType::Float32,
+        vec![
+            Dim::Static(1),
+            Dim::Static(16),
+            Dim::Symbolic(v_seq),
+            Dim::Static(128),
+        ],
+    );
+    exec.value_shapes
+        .insert(v, exec.graph.value(v).shape.clone());
+    // Only the KV axis is bound (to physical capacity 2048); `v_seq` is unbound.
+    let mut symbols = HashMap::new();
+    symbols.insert(kv_seq, 2048usize);
+    let node = Node::new(NodeId(40), "Attention", vec![Some(v)], vec![]);
+    let resolved = exec
+        .resolve_planned_workspace_input_shape(v, &symbols, NodeId(40), &node, 3)
+        .expect("a context/sequence axis must resolve to its bounded extent");
+    match resolved {
+        PlannedInputShape::Bounded { dims, applied } => {
+            assert_eq!(dims, vec![1, 16, 2048, 128]);
+            assert_eq!(applied, vec![(2, v_seq, AxisBound::KvCapacity(2048))]);
+        }
+        other => panic!("expected a bounded over-reservation, got {other:?}"),
+    }
+}
+
+// A context/sequence axis whose model-declared maximum EXCEEDS the currently
+// bound KV capacity is reserved against the LARGER of the two, so a bounded
+// reservation can never under-reserve (the corruption class #945/#947 warns of).
+#[test]
+fn prepare_workspace_context_axis_never_under_reserves_below_declared_max() {
+    let mut exec = minimal_workspace_executor();
+    let kv_seq = exec.graph.create_symbol(Some("total_seq".into()));
+    let v_seq = exec.graph.create_symbol(Some("v_seq".into()));
+    exec.graph.symbol_constraints.get_mut(&v_seq).unwrap().max = Some(8192);
+    exec.capture_growing_symbols.insert(kv_seq);
+    exec.capture_growing_symbols.insert(v_seq);
+    let v = exec.graph.create_named_value(
+        "v",
+        DataType::Float32,
+        vec![Dim::Static(1), Dim::Symbolic(v_seq), Dim::Static(16)],
+    );
+    exec.value_shapes
+        .insert(v, exec.graph.value(v).shape.clone());
+    let mut symbols = HashMap::new();
+    symbols.insert(kv_seq, 2048usize);
+    let node = Node::new(NodeId(1), "Attention", vec![Some(v)], vec![]);
+    let resolved = exec
+        .resolve_planned_workspace_input_shape(v, &symbols, NodeId(1), &node, 0)
+        .unwrap();
+    match resolved {
+        PlannedInputShape::Bounded { dims, applied } => {
+            assert_eq!(dims, vec![1, 8192, 16]);
+            assert_eq!(applied, vec![(1, v_seq, AxisBound::KvCapacity(8192))]);
+        }
+        other => panic!("expected a bounded over-reservation, got {other:?}"),
+    }
+}
+
+// An unresolved dim that carries its own configured maximum (a declared
+// `max_seq_len`-style ceiling) but is not a growing symbol is reserved against
+// that maximum.
+#[test]
+fn prepare_workspace_binds_unresolved_axis_to_configured_max() {
+    let mut exec = minimal_workspace_executor();
+    let seq = exec.graph.create_symbol(Some("seq_len".into()));
+    exec.graph.symbol_constraints.get_mut(&seq).unwrap().max = Some(4096);
+    let v = exec.graph.create_named_value(
+        "bounded_value",
+        DataType::Float32,
+        vec![Dim::Static(2), Dim::Symbolic(seq), Dim::Static(64)],
+    );
+    exec.value_shapes
+        .insert(v, exec.graph.value(v).shape.clone());
+    let symbols = HashMap::new();
+    let node = Node::new(NodeId(9), "Attention", vec![Some(v)], vec![]);
+    let resolved = exec
+        .resolve_planned_workspace_input_shape(v, &symbols, NodeId(9), &node, 1)
+        .unwrap();
+    match resolved {
+        PlannedInputShape::Bounded { dims, applied } => {
+            assert_eq!(dims, vec![2, 4096, 64]);
+            assert_eq!(applied, vec![(1, seq, AxisBound::ConfiguredMax(4096))]);
+        }
+        other => panic!("expected a bounded over-reservation, got {other:?}"),
+    }
+}
+
+// A dim that is unresolved for any OTHER reason — neither a known
+// context/sequence axis nor an axis with a configured maximum — must keep
+// failing. Reserving against a guess there would silently under-reserve.
+#[test]
+fn prepare_workspace_fails_on_unresolved_unbounded_axis() {
+    let mut exec = minimal_workspace_executor();
+    let mystery = exec.graph.create_symbol(Some("data_dependent".into()));
+    let v = exec.graph.create_named_value(
+        "mystery_value",
+        DataType::Float32,
+        vec![Dim::Static(4), Dim::Symbolic(mystery)],
+    );
+    exec.value_shapes
+        .insert(v, exec.graph.value(v).shape.clone());
+    let symbols = HashMap::new();
+    let node = Node::new(NodeId(7), "Attention", vec![Some(v)], vec![]);
+    let err = exec
+        .resolve_planned_workspace_input_shape(v, &symbols, NodeId(7), &node, 0)
+        .expect_err("a genuinely unbounded unresolved dim must still error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("genuinely unknown"),
+        "the error must name the unbounded-guess hazard, got: {msg}"
+    );
+    assert!(
+        msg.contains("data_dependent"),
+        "the error must name the unresolved symbol, got: {msg}"
+    );
+}
+
+// Regression guard: a fully-resolvable input still resolves EXACTLY (never via a
+// bound), so graphs that already resolved keep byte-identical reservations.
+#[test]
+fn prepare_workspace_exact_resolution_is_unchanged() {
+    let mut exec = minimal_workspace_executor();
+    let seq = exec.graph.create_symbol(Some("seq".into()));
+    let v = exec.graph.create_named_value(
+        "exact_value",
+        DataType::Float32,
+        vec![Dim::Static(1), Dim::Symbolic(seq), Dim::Static(8)],
+    );
+    exec.value_shapes
+        .insert(v, exec.graph.value(v).shape.clone());
+    let mut symbols = HashMap::new();
+    symbols.insert(seq, 12usize);
+    let node = Node::new(NodeId(3), "Attention", vec![Some(v)], vec![]);
+    let resolved = exec
+        .resolve_planned_workspace_input_shape(v, &symbols, NodeId(3), &node, 0)
+        .unwrap();
+    assert_eq!(resolved, PlannedInputShape::Exact(vec![1, 12, 8]));
+    assert_eq!(resolved.dims(), &[1, 12, 8]);
+}
+
+// DeepSeek-V2-Lite's MoE gate flattens `[batch, sequence, hidden]` through
+// `Reshape([-1, hidden]) -> Cast -> MatMul`. The loader shape for the flattened
+// value is a derived symbol (`batch * sequence`) that is not directly bound as a
+// graph input, but the producer chain is statically shape-deterministic for the
+// current run. Prepare-only planning must recover that exact runtime extent
+// instead of falling back to a huge max-sequence reservation or rejecting it as
+// data-dependent.
+#[test]
+fn prepare_workspace_resolves_reshape_flatten_chain_exactly() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let batch = graph.create_symbol(Some("batch".into()));
+    let seq = graph.create_symbol(Some("sequence_len".into()));
+    let flat = graph.create_symbol(Some("batch_times_sequence".into()));
+    let x = graph.create_named_value(
+        "hidden",
+        DataType::Float32,
+        vec![Dim::Symbolic(batch), Dim::Symbolic(seq), Dim::Static(2048)],
+    );
+    graph.add_input(x);
+    let shape = graph.create_named_value("reshape_shape", DataType::Int64, static_shape([2]));
+    let mut constant = Node::new(NodeId(0), "Constant", vec![], vec![shape]);
+    constant
+        .attributes
+        .insert("value_ints".into(), Attribute::Ints(vec![-1, 2048]));
+    graph.insert_node(constant);
+    let reshaped = graph.create_named_value(
+        "v_model.layers.1.mlp.moe.Reshape_78",
+        DataType::Float32,
+        vec![Dim::Symbolic(flat), Dim::Static(2048)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Reshape",
+        vec![Some(x), Some(shape)],
+        vec![reshaped],
+    ));
+    let cast = graph.create_named_value(
+        "v_model.layers.1.mlp.moe.Cast_79",
+        DataType::Float32,
+        vec![Dim::Symbolic(flat), Dim::Static(2048)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Cast",
+        vec![Some(reshaped)],
+        vec![cast],
+    ));
+    let weight =
+        graph.create_named_value("gate.weight", DataType::Float32, static_shape([2048, 64]));
+    graph.add_input(weight);
+    let out = graph.create_named_value(
+        "gate",
+        DataType::Float32,
+        vec![Dim::Symbolic(flat), Dim::Static(64)],
+    );
+    graph.add_output(out);
+    let matmul = Node::new(
+        NodeId(3),
+        "MatMul",
+        vec![Some(cast), Some(weight)],
+        vec![out],
+    );
+    graph.insert_node(matmul.clone());
+
+    let mut exec = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+    exec.value_shapes
+        .insert(cast, exec.graph.value(cast).shape.clone());
+    let mut symbols = HashMap::new();
+    symbols.insert(batch, 1);
+    symbols.insert(seq, 5);
+
+    let resolved = exec
+        .resolve_planned_workspace_input_shape(cast, &symbols, NodeId(3), &matmul, 0)
+        .unwrap();
+    assert_eq!(resolved, PlannedInputShape::Exact(vec![5, 2048]));
+}
+
+/// A borrowed input buffer must never escape into cross-run sequence storage.
+///
+/// `read_seq_element` promotes a value's buffer into a `SharedTensorBuffer` that
+/// `restore_shared_buffers` reinstates on the *next* run. A zero-copy input
+/// alias is only valid for the run that created it, so promoting the alias
+/// would leave `buffers[input]` pointing at a caller tensor that has already
+/// been dropped — and the next `copy_from_host` would write through it.
+///
+/// Falsifier: delete the `is_borrowed` branch in `read_seq_element` and this
+/// test fails on the `!is_borrowed()` assertion (and, with a differently
+/// aligned second input, aborts inside the allocator).
+#[test]
+fn sequence_promotion_never_retains_a_borrowed_input_alias() {
+    use onnx_runtime_ir::{TensorData, WeightRef, static_shape};
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([2]));
+    graph.add_input(input);
+    let zero = graph.create_named_value("zero", DataType::Int64, static_shape([]));
+    graph.set_initializer(
+        zero,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            vec![],
+            0i64.to_le_bytes().to_vec(),
+        )),
+    );
+    let seq = graph.create_value(DataType::Float32, static_shape([]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "SequenceConstruct",
+        vec![Some(input)],
+        vec![seq],
+    ));
+    let at = graph.create_value(DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "SequenceAt",
+        vec![Some(seq), Some(zero)],
+        vec![at],
+    ));
+    graph.add_output(at);
+
+    let mut executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    let vid = executor.input_index["input"];
+    let first = Tensor::from_f32(&[2], &[1.0, 2.0]).unwrap();
+    let first_ptr = first.as_bytes().as_ptr() as usize;
+    assert_eq!(
+        executor.run(&[("input", &first)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0]
+    );
+    drop(first);
+
+    let installed = &executor.buffers[&vid];
+    assert!(
+        !installed.is_borrowed(),
+        "input buffer is still a borrowed alias after the run that borrowed it"
+    );
+    assert_ne!(
+        installed.as_ptr() as usize,
+        first_ptr,
+        "input buffer still points at the (now dropped) caller tensor"
+    );
+
+    // A second run must read the new tensor, not stale storage, and must not
+    // write through any retained alias.
+    let second = Tensor::from_f32(&[2], &[3.0, 4.0]).unwrap();
+    assert_eq!(
+        executor.run(&[("input", &second)]).unwrap()[0].to_vec_f32(),
+        vec![3.0, 4.0]
+    );
+    assert!(!executor.buffers[&vid].is_borrowed());
+    assert!(executor.parked_input_buffers.is_empty());
+}
+
+/// Dropping an executor must return every buffer it owns to the allocator,
+/// including one parked while a zero-copy input alias stood in its slot.
+///
+/// `unbind_borrowed_inputs` restores parked buffers on the normal and error
+/// paths, but a panic unwinding out of a run drops the `Executor` with them
+/// still parked, and `Drop` only drained `self.buffers`. A counting allocator
+/// makes the leak observable: `live` must return to its pre-run value.
+///
+/// Falsifier: delete the `parked_input_buffers` drain in `Drop for Executor`
+/// and the final assertion fails with `live=1`.
+#[test]
+fn dropping_an_executor_with_a_parked_input_buffer_leaks_nothing() {
+    use onnx_runtime_memory_governor::{DeviceAllocator, DeviceKey, HostAllocator, MemoryError};
+    use std::ptr::NonNull;
+
+    #[derive(Debug, Default)]
+    struct CountingAllocator {
+        inner: HostAllocator,
+        live: AtomicUsize,
+        allocated: AtomicUsize,
+    }
+
+    impl DeviceAllocator for CountingAllocator {
+        fn device(&self) -> DeviceKey {
+            self.inner.device()
+        }
+
+        fn allocate(
+            &self,
+            bytes: usize,
+            align: usize,
+        ) -> std::result::Result<NonNull<u8>, MemoryError> {
+            let ptr = self.inner.allocate(bytes, align)?;
+            self.live.fetch_add(1, Ordering::SeqCst);
+            self.allocated.fetch_add(1, Ordering::SeqCst);
+            Ok(ptr)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            // SAFETY: forwarded under this method's contract — `ptr`/`bytes`/
+            // `align` are the triple `allocate` above returned from `inner`.
+            unsafe { self.inner.deallocate(ptr, bytes, align) };
+        }
+    }
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([64]));
+    graph.add_input(input);
+    let out = graph.create_named_value("out", DataType::Float32, static_shape([64]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(input)], vec![out]));
+    graph.add_output(out);
+
+    let counting = Arc::new(CountingAllocator::default());
+    let mut ep = CpuExecutionProvider::new().with_memory(counting.clone());
+    ep.initialize(&Default::default()).unwrap();
+
+    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let vid = executor.input_index["input"];
+
+    let tensor = Tensor::from_f32(&[64], &vec![1.0f32; 64]).unwrap();
+    executor.run(&[("input", &tensor)]).unwrap();
+    assert!(
+        counting.allocated.load(Ordering::SeqCst) > 0,
+        "the run allocated nothing through the counting allocator, so this \
+         test could not observe a leak"
+    );
+
+    // Park the input's owned buffer exactly as `prepare_run_buffers` does when
+    // it installs a zero-copy alias, then drop the executor mid-run. Nothing
+    // else may reach `unbind_borrowed_inputs`.
+    let bytes = tensor.as_bytes();
+    let device = executor.buffers[&vid].device();
+    // SAFETY: `tensor` outlives `executor`, and the handle is never written or
+    // deallocated — it is dropped by `Drop for Executor`, where a borrowed
+    // handle is a no-op free.
+    let borrowed = unsafe {
+        DeviceBuffer::from_borrowed_parts(
+            bytes.as_ptr() as *mut std::ffi::c_void,
+            device,
+            bytes.len(),
+            TensorLayout::contiguous().alignment,
+        )
+    };
+    let owned = std::mem::replace(executor.buffers.get_mut(&vid).unwrap(), borrowed);
+    executor.parked_input_buffers.push((vid, owned));
+
+    drop(executor);
+    assert_eq!(
+        counting.live.load(Ordering::SeqCst),
+        0,
+        "dropping the executor leaked the parked input buffer"
+    );
+}
+
+fn int64_initializer(graph: &mut Graph, name: &str, dims: Vec<usize>, values: &[i64]) -> ValueId {
+    use onnx_runtime_ir::{TensorData, WeightRef};
+
+    let value = graph.create_named_value(name, DataType::Int64, static_shape(dims.clone()));
+    graph.set_initializer(
+        value,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            dims,
+            values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        )),
+    );
+    value
+}
+
+fn f32_scalar_initializer(graph: &mut Graph, name: &str, value: f32) -> ValueId {
+    use onnx_runtime_ir::{TensorData, WeightRef};
+
+    let tensor = graph.create_named_value(name, DataType::Float32, static_shape([]));
+    graph.set_initializer(
+        tensor,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Float32,
+            vec![],
+            value.to_le_bytes().to_vec(),
+        )),
+    );
+    tensor
+}
+
+// DeepSeek-V2-Lite's graph-capture additive mask builds a query x key bias via
+// CumSum/Unsqueeze/.../Where->Cast->Unsqueeze. ONNX shape inference leaves the
+// query axis as a fresh internal `_d1` symbol, but its extent is exactly the
+// current `input_ids` sequence length: Slice(CumSum(attention_mask),
+// Shape(attention_mask)[1] - Shape(input_ids)[1], Shape(attention_mask)[1]).
+// Capture prepare must recover that exact query axis rather than treating it as
+// data-dependent or reserving a max-sequence-sized guess.
+#[test]
+fn prepare_workspace_resolves_deepseek_additive_mask_query_axis_exactly() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let batch = graph.create_symbol(Some("batch".into()));
+    let total = graph.create_symbol(Some("past_seq_len + seq_len".into()));
+    let seq = graph.create_symbol(Some("sequence_len".into()));
+    let query = graph.create_symbol(Some("_d1".into()));
+
+    let input_ids = graph.create_named_value(
+        "input_ids",
+        DataType::Int64,
+        vec![Dim::Symbolic(batch), Dim::Symbolic(seq)],
+    );
+    graph.add_input(input_ids);
+    let attention_mask = graph.create_named_value(
+        "attention_mask",
+        DataType::Int64,
+        vec![Dim::Symbolic(batch), Dim::Symbolic(total)],
+    );
+    graph.add_input(attention_mask);
+    let axis_1 = int64_initializer(&mut graph, "const_1d_1", vec![1], &[1]);
+    let axis_2 = int64_initializer(&mut graph, "const_1d_2", vec![1], &[2]);
+    let one = int64_initializer(&mut graph, "const_1_i64", vec![], &[1]);
+
+    let cumsum = graph.create_named_value(
+        "v_model.CumSum_5",
+        DataType::Int64,
+        vec![Dim::Symbolic(batch), Dim::Symbolic(total)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "CumSum",
+        vec![Some(attention_mask), Some(one)],
+        vec![cumsum],
+    ));
+    let unsqueeze_6 = graph.create_named_value(
+        "v_model.Unsqueeze_6",
+        DataType::Int64,
+        vec![Dim::Symbolic(batch), Dim::Static(1), Dim::Symbolic(total)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Unsqueeze",
+        vec![Some(cumsum), Some(axis_1)],
+        vec![unsqueeze_6],
+    ));
+    let input_len = graph.create_named_value("v_model.Shape_7", DataType::Int64, static_shape([1]));
+    let mut shape_input = Node::new(NodeId(2), "Shape", vec![Some(input_ids)], vec![input_len]);
+    shape_input
+        .attributes
+        .insert("start".into(), Attribute::Int(1));
+    shape_input
+        .attributes
+        .insert("end".into(), Attribute::Int(2));
+    graph.insert_node(shape_input);
+    let mask_len = graph.create_named_value("v_model.Shape_8", DataType::Int64, static_shape([1]));
+    let mut shape_mask = Node::new(
+        NodeId(3),
+        "Shape",
+        vec![Some(attention_mask)],
+        vec![mask_len],
+    );
+    shape_mask
+        .attributes
+        .insert("start".into(), Attribute::Int(1));
+    shape_mask
+        .attributes
+        .insert("end".into(), Attribute::Int(2));
+    graph.insert_node(shape_mask);
+    let start = graph.create_named_value("v_model.Sub_9", DataType::Int64, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "Sub",
+        vec![Some(mask_len), Some(input_len)],
+        vec![start],
+    ));
+    let sliced = graph.create_named_value(
+        "v_model.Slice_10",
+        DataType::Int64,
+        vec![Dim::Symbolic(batch), Dim::Symbolic(query)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(5),
+        "Slice",
+        vec![Some(cumsum), Some(start), Some(mask_len), Some(axis_1)],
+        vec![sliced],
+    ));
+    let unsqueeze_11 = graph.create_named_value(
+        "v_model.Unsqueeze_11",
+        DataType::Int64,
+        vec![Dim::Symbolic(batch), Dim::Symbolic(query), Dim::Static(1)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(6),
+        "Unsqueeze",
+        vec![Some(sliced), Some(axis_2)],
+        vec![unsqueeze_11],
+    ));
+    let ge = graph.create_named_value(
+        "v_model.GreaterOrEqual_12",
+        DataType::Bool,
+        vec![
+            Dim::Symbolic(batch),
+            Dim::Symbolic(query),
+            Dim::Symbolic(total),
+        ],
+    );
+    graph.insert_node(Node::new(
+        NodeId(7),
+        "GreaterOrEqual",
+        vec![Some(unsqueeze_11), Some(unsqueeze_6)],
+        vec![ge],
+    ));
+    let unsqueeze_13 = graph.create_named_value(
+        "v_model.Unsqueeze_13",
+        DataType::Int64,
+        vec![Dim::Symbolic(batch), Dim::Static(1), Dim::Symbolic(total)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(8),
+        "Unsqueeze",
+        vec![Some(attention_mask), Some(axis_1)],
+        vec![unsqueeze_13],
+    ));
+    let cast_14 = graph.create_named_value(
+        "v_model.Cast_14",
+        DataType::Bool,
+        vec![Dim::Symbolic(batch), Dim::Static(1), Dim::Symbolic(total)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(9),
+        "Cast",
+        vec![Some(unsqueeze_13)],
+        vec![cast_14],
+    ));
+    let and = graph.create_named_value(
+        "v_model.And_15",
+        DataType::Bool,
+        vec![
+            Dim::Symbolic(batch),
+            Dim::Symbolic(query),
+            Dim::Symbolic(total),
+        ],
+    );
+    graph.insert_node(Node::new(
+        NodeId(10),
+        "And",
+        vec![Some(cast_14), Some(ge)],
+        vec![and],
+    ));
+    let zero = f32_scalar_initializer(&mut graph, "const_0.0_f32", 0.0);
+    let neg = f32_scalar_initializer(&mut graph, "const_-65504.0_f32", -65504.0);
+    let where_out = graph.create_named_value(
+        "v_model.Where_16",
+        DataType::Float32,
+        vec![
+            Dim::Symbolic(batch),
+            Dim::Symbolic(query),
+            Dim::Symbolic(total),
+        ],
+    );
+    graph.insert_node(Node::new(
+        NodeId(11),
+        "Where",
+        vec![Some(and), Some(zero), Some(neg)],
+        vec![where_out],
+    ));
+    let cast_17 = graph.create_named_value(
+        "v_model.Cast_17",
+        DataType::Float16,
+        vec![
+            Dim::Symbolic(batch),
+            Dim::Symbolic(query),
+            Dim::Symbolic(total),
+        ],
+    );
+    graph.insert_node(Node::new(
+        NodeId(12),
+        "Cast",
+        vec![Some(where_out)],
+        vec![cast_17],
+    ));
+    let mask = graph.create_named_value(
+        "v_model.Unsqueeze_18",
+        DataType::Float16,
+        vec![
+            Dim::Symbolic(batch),
+            Dim::Static(1),
+            Dim::Symbolic(query),
+            Dim::Symbolic(total),
+        ],
+    );
+    graph.insert_node(Node::new(
+        NodeId(13),
+        "Unsqueeze",
+        vec![Some(cast_17), Some(axis_1)],
+        vec![mask],
+    ));
+    let attention = Node::new(
+        NodeId(14),
+        "Attention",
+        vec![None, None, None, Some(mask)],
+        vec![],
+    );
+    graph.insert_node(attention.clone());
+
+    let mut exec = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+    for value in [
+        input_ids,
+        attention_mask,
+        cumsum,
+        unsqueeze_6,
+        input_len,
+        mask_len,
+        start,
+        sliced,
+        unsqueeze_11,
+        ge,
+        unsqueeze_13,
+        cast_14,
+        and,
+        zero,
+        neg,
+        where_out,
+        cast_17,
+        mask,
+    ] {
+        exec.value_shapes
+            .insert(value, exec.graph.value(value).shape.clone());
+    }
+    let mut symbols = HashMap::new();
+    symbols.insert(batch, 1);
+    symbols.insert(seq, 1);
+    symbols.insert(total, 2048);
+
+    let resolved = exec
+        .resolve_planned_workspace_input_shape(mask, &symbols, NodeId(14), &attention, 3)
+        .unwrap();
+    assert_eq!(resolved, PlannedInputShape::Exact(vec![1, 1, 1, 2048]));
 }

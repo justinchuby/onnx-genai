@@ -2,6 +2,17 @@
 # schedule, and manual dispatch. Coverage instrumentation runs where it is
 # informative; Windows ARM64 keeps platform tests but skips coverage because the
 # coverage signal duplicates x64/macOS while owning the critical path.
+#
+# `changes` classifies whether a pull_request/push touched anything other than
+# docs/wiki/site content. When it did not, every Rust job below is skipped
+# rather than run. GitHub reports a skipped job with conclusion "skipped",
+# which counts as passing for required status checks (unlike a workflow that
+# never triggers at all, which would leave a required check pending forever)
+# -- see https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks
+# So "Fast (Linux x86_64)" and "Rust quality" -- the two required checks --
+# still report a conclusion on every PR, just without doing the expensive
+# work when nothing but docs changed. Schedule and workflow_dispatch runs are
+# unaffected: `changes` doesn't run for them, so docs_only stays unset/false.
 name: CI
 
 on:
@@ -25,8 +36,80 @@ env:
   CARGO_LLVM_COV_VERSION: "0.8.7"
 
 jobs:
+  changes:
+    name: Detect change scope
+    runs-on: ubuntu-latest
+    # Only classify pull_request/push diffs. schedule and workflow_dispatch
+    # runs skip this job entirely, so `needs.changes.outputs.docs_only` is
+    # empty for them and every `if: needs.changes.outputs.docs_only != 'true'`
+    # below evaluates true -- full CI, unchanged.
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Classify docs-only vs. code changes
+        id: filter
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          # Defaults to docs_only=false (full CI) on any ambiguity: unknown
+          # event, missing SHAs, an unusable diff range, or an empty diff.
+          # Only an explicit, fully-classified all-docs diff flips it to true.
+          docs_only=false
+
+          is_docs_path() {
+            case "$1" in
+              docs/*|wiki/*|site/*|*.md|*.mdx|*.markdown|LICENSE|NOTICE)
+                return 0 ;;
+              *)
+                return 1 ;;
+            esac
+          }
+
+          files=""
+          case "$EVENT_NAME" in
+            pull_request)
+              if [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+                files="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || true)"
+              fi
+              ;;
+            push)
+              if [ -n "${BEFORE_SHA:-}" ] \
+                && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
+                && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+                files="$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" 2>/dev/null || true)"
+              fi
+              ;;
+          esac
+
+          if [ -n "$files" ]; then
+            docs_only=true
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              if ! is_docs_path "$f"; then
+                docs_only=false
+                break
+              fi
+            done <<< "$files"
+          fi
+
+          echo "Changed files ($EVENT_NAME):"
+          echo "$files"
+          echo "docs_only=$docs_only"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+
   fast-linux:
     name: Fast (Linux x86_64)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -70,6 +153,11 @@ jobs:
           python-version: "3.12"
       - name: Install Python test dependencies
         run: python -m pip install --upgrade numpy onnxscript
+      - name: Native benchmark harness self-test
+        # Needs no GPU, no CUDA toolkit and no runtime package, but it does need
+        # numpy: the defect it guards is a numpy array compared against a list,
+        # so a lane without numpy would skip the only cases that catch it.
+        run: python scripts/benchmark_muse_native_local.py --self-test --require-numpy
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Build Linux offline crates
@@ -140,6 +228,8 @@ jobs:
 
   rust-quality:
     name: Rust quality
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -264,10 +354,50 @@ jobs:
           --features mlas
           optimization_registry_excludes_nchwc_without_cnn_ops
 
+      # The MoE grouped driver hands several `*mut f32` out of one `&mut [f32]`
+      # to `MlasGemmBatch`, and its bit-exactness falsifiers are the only thing
+      # standing between a wrong batch offset and silently wrong logits.  Under
+      # the default feature set those tests compile the non-MLAS fallback, so
+      # the path that actually ships was going untested.  This runs them against
+      # the real MLAS batched GEMM.
+      - name: CPU EP MoE tests against real MLAS
+        run: >-
+          cargo test --locked
+          -p onnx-runtime-ep-cpu
+          --no-default-features
+          --features mlas
+          kernels::moe::
+
+      # QLinearMatMul requantizes inside MLAS through the same output processor
+      # ORT uses, and the tests that pin that fused path bit-for-bit against the
+      # scalar loop only exist under `--features mlas`.  Nothing else in the
+      # pipeline runs them: the coverage lane builds this crate without MLAS and
+      # the ORT lane tests the plugin crate, not these unit tests.
+      - name: CPU EP QLinearMatMul tests against real MLAS
+        run: >-
+          cargo test --locked
+          -p onnx-runtime-ep-cpu
+          --no-default-features
+          --features mlas
+          kernels::qlinear_matmul::
+
       # x86_64-apple-darwin changes target_arch but leaves target_os="macos",
       # so cfg(target_os) errors are invisible.  This step uses a genuine Linux
       # target that exercises BOTH dimensions.  PR #317 proved the gap.
-      - name: Cross-target compile check (catches os-gating errors)
+      # The script also runs a second pass against aarch64-unknown-linux-gnu:
+      # every other blocking lane builds target_arch="x86_64", so items that
+      # are only reachable from cfg(target_arch="x86_64") code look live in all
+      # of them and are dead code on ARM64 (#1037 broke both ARM64 lanes that
+      # way).  That pass needs a real cross toolchain, not just a rustup
+      # target: ort-sys runs bindgen for the target, so clang needs arm64 libc
+      # headers, and onnx-runtime-cpuinfo's cmake build script compiles C for
+      # the target.  Without them the script hard-fails on CI rather than
+      # quietly checking a subset that excludes onnx-runtime-ep-cpu.
+      - name: Install the aarch64 cross toolchain for the cross-arch pass
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: Cross-target compile check (catches os- and arch-gating errors)
         run: bash scripts/check_cross_compile.sh
 
       # onnx-genai-engine's native decode path only compiles when this feature
@@ -280,8 +410,19 @@ jobs:
           -p onnx-genai-engine --features native-backend
           -- -D warnings
 
+      # The shipped nxrt-ep-cpu wheel enables the vendored MLAS kernels on this
+      # platform (python/nxrt-ep-cpu/setup.py: MLAS_TARGETS). ORT's own CPU EP
+      # *is* MLAS, so without them the quantized matmul paths measure an order
+      # of magnitude slower -- but the feature also compiles C++/asm that no
+      # other lane links into this cdylib. If that stops building here, the
+      # wheel stops building at release time, when it is most expensive.
+      - name: Build the shipped CPU plugin cdylib with MLAS
+        run: cargo build --locked -p onnx-runtime-ep-cpu-plugin --features mlas
+
   rust-coverage:
     name: Rust coverage (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -351,6 +492,16 @@ jobs:
       # derived from cargo metadata and the commented deny-list in
       # `.github/scripts/workspace_test_packages.py`, so new offline workspace
       # crates are tested by default.
+      # The shipped nxrt-ep-cpu wheel enables the vendored MLAS kernels on this
+      # platform (python/nxrt-ep-cpu/setup.py: MLAS_TARGETS). ORT's own CPU EP
+      # *is* MLAS, so without them the quantized matmul paths measure an order
+      # of magnitude slower -- but the feature also compiles C++/asm that no
+      # other lane links into this cdylib. If that stops building here, the
+      # wheel stops building at release time, when it is most expensive.
+      - name: Build the shipped CPU plugin cdylib with MLAS
+        if: runner.os != 'Linux'
+        run: cargo build --locked -p onnx-runtime-ep-cpu-plugin --features mlas
+
       - name: Test cross-platform offline crates with coverage
         run: >-
           cargo llvm-cov --locked --codecov --output-path codecov-offline.json
@@ -381,6 +532,8 @@ jobs:
 
   rust-windows-arm64:
     name: Rust (Windows ARM64)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: windows-11-arm
     env:
       CARGO_TERM_COLOR: always
@@ -421,6 +574,15 @@ jobs:
         run: python -m pip install --upgrade numpy onnxscript
       - name: Build mlas-sys on Windows ARM64
         run: cargo build --locked --target aarch64-pc-windows-msvc -p mlas-sys
+
+      # The shipped nxrt-ep-cpu wheel enables the vendored MLAS kernels on this
+      # platform (python/nxrt-ep-cpu/setup.py: MLAS_TARGETS). ORT's own CPU EP
+      # *is* MLAS, so without them the quantized matmul paths measure an order
+      # of magnitude slower -- but the feature also compiles C++/asm that no
+      # other lane links into this cdylib. If that stops building here, the
+      # wheel stops building at release time, when it is most expensive.
+      - name: Build the shipped CPU plugin cdylib with MLAS
+        run: cargo build --locked --target aarch64-pc-windows-msvc -p onnx-runtime-ep-cpu-plugin --features mlas
       # Platform execution is the signal here; coverage for most of these
       # offline crates is already reported by x64/macOS lanes, and ARM64
       # instrumentation owned the critical path.
@@ -463,6 +625,8 @@ jobs:
 
   ep-conformance:
     name: EP conformance (Linux x86_64)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -528,6 +692,8 @@ jobs:
 
   cli-ort:
     name: CLI ORT (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -638,9 +804,34 @@ jobs:
       # required-features = ["cuda", "native-backend"] and are not selected here.
       - name: Test onnx-genai-engine native backend
         run: cargo test --locked -p onnx-genai-engine --features native-backend
+      # `!cancelled()` rather than the implicit `success()`: this is the only
+      # job that sets `NXRT_REQUIRE_ORT_TESTS=1` with ORT present, so it is the
+      # only place the EP-assignment falsifiers run fail-closed rather than
+      # skipping themselves. (Other jobs do compile and run this crate, but
+      # without ORT those tests skip internally.) An unrelated failure in an
+      # earlier step would otherwise skip this one and leave the plugin's ORT
+      # interop unverified for that run. The job still fails if either step
+      # fails, so no gate is weakened.
+      #
+      # Tradeoff: this also runs after a *setup* failure — if the ORT download
+      # in `Build onnx-genai-cli` fails, this step now goes red for that
+      # reason rather than being skipped. It cannot false-green, so the cost is
+      # an extra red on an already-red job.
       - name: Test onnx-runtime-ep-cpu-plugin (ORT gate)
-        if: runner.os == 'Linux'
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
         run: cargo test --locked --no-fail-fast -p onnx-runtime-ep-cpu-plugin
+      # The same suite against the *shipped* build. The wheel enables `mlas` on
+      # this platform, so the default-feature run above proves little about the
+      # library users install: with no features the build-identity assertion is
+      # trivially satisfied, the vendored C++ is not linked so the symbol
+      # leakage check has nothing to leak, and a testkit that rebuilds a
+      # feature-specific cdylib *without* its features -- the defect fixed
+      # alongside this step -- is only observable when features are requested.
+      - name: Test onnx-runtime-ep-cpu-plugin with MLAS (ORT gate)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: >-
+          cargo test --locked --no-fail-fast
+          -p onnx-runtime-ep-cpu-plugin --features mlas
       - name: Upload CLI ORT coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4
@@ -654,6 +845,8 @@ jobs:
 
   cuda-compile-linux:
     name: CUDA compile (Linux x86_64)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -721,6 +914,8 @@ jobs:
 
   cuda-compile-windows:
     name: CUDA compile (Windows x86_64)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: windows-latest
     env:
       CARGO_TERM_COLOR: always

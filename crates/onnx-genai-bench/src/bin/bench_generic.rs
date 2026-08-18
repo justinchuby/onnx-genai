@@ -26,6 +26,21 @@ struct Args {
     /// Override the first model input shape, for example 1,3,416,416.
     #[arg(long)]
     input_shape: Option<String>,
+    /// Report the native executor's per-run phase breakdown (setup, shape
+    /// resolution, buffer sizing, node execution, graph-output collection)
+    /// after the measured runs. Warmups are excluded: the accumulator is reset
+    /// once warmup finishes, so every printed total covers exactly `--runs`
+    /// native runs. This is the only way to attribute the part of a run that
+    /// the per-op profiler (`ONNX_GENAI_PROFILE_OPS=1`) leaves undifferentiated,
+    /// because that one times node execution and nothing around it.
+    ///
+    /// Does not enable the activation-memory planner. That planner re-plans
+    /// every activation on every run - work the shipped runtime never does -
+    /// so while this flag switched it on, the profiler perturbed what it was
+    /// measuring and then reported its own cost back as a phase of the run.
+    /// Set `NXRT_ACTIVATION_MEMORY_PLAN=1` to opt into it deliberately.
+    #[arg(long)]
+    phase_profile: bool,
     /// Measure ORT only. Useful for recording a baseline when native loading or execution fails.
     #[arg(long)]
     ort_only: bool,
@@ -33,13 +48,48 @@ struct Args {
     /// runs native alone so ORT's intra-op threadpool is not spinning and polluting native samples.
     #[arg(long)]
     native_only: bool,
+    /// ORT `intra_op_num_threads` for the timed session. `0` keeps ORT's default
+    /// (one thread per logical core), which is what a user gets out of the box;
+    /// set it to the native decode-pool width for a thread-matched comparison.
+    #[arg(long, default_value_t = 0)]
+    ort_intra_threads: i32,
+    /// ORT `inter_op_num_threads` for the timed session. `0` keeps ORT's
+    /// default. Single-node benchmarks have no parallel subgraphs, so this only
+    /// matters for multi-node graphs where ORT's inter-op pool is an advantage
+    /// the native EP does not have.
+    #[arg(long, default_value_t = 0)]
+    ort_inter_threads: i32,
+    /// Native CPU decode-pool width. `0` leaves `ONNX_GENAI_CPU_DECODE_THREADS`
+    /// exactly as inherited. Any other value sets it before the session is
+    /// built, so a thread-matched A/B is enforced by this tool rather than by
+    /// the operator remembering to export the variable.
+    #[arg(long, default_value_t = 0)]
+    native_threads: usize,
     /// Relative tolerance used for Float32 output parity.
     #[arg(long, default_value_t = 1e-3)]
     rel_tolerance: f32,
     /// Absolute tolerance used for Float32 output parity.
     #[arg(long, default_value_t = 1e-4)]
     abs_tolerance: f32,
+    /// Relative tolerance used for Float16 output parity. Defaults to 4 f16 ULP
+    /// (f16 epsilon is 2^-10 ~= 9.8e-4, so the f32 default of 1e-3 is barely
+    /// one ULP and would pass almost any pair of f16 values, making the check
+    /// vacuous). Absolute tolerance is scaled the same way.
+    #[arg(long, default_value_t = 4.0 * F16_EPSILON)]
+    f16_rel_tolerance: f32,
+    /// Absolute tolerance used for Float16 output parity. See
+    /// `--f16-rel-tolerance`.
+    #[arg(long, default_value_t = F16_EPSILON)]
+    f16_abs_tolerance: f32,
 }
+
+/// Machine epsilon of IEEE binary16 (`2^-10`). f16 carries a 10-bit mantissa,
+/// so two f16 values that differ by one ULP near 1.0 differ by this much.
+const F16_EPSILON: f32 = 9.765_625e-4;
+
+/// The native CPU EP's decode-pool width knob. Read once into a `OnceLock` by
+/// the EP, so it must be set before the first session is built.
+const NATIVE_DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
 
 struct InputPair {
     name: String,
@@ -151,6 +201,30 @@ fn synthetic_i64(count: usize) -> Vec<i64> {
     (0..count).map(|index| (index % 17) as i64).collect()
 }
 
+/// Float16 bit patterns for the same values [`synthetic_f32`] produces, so a
+/// Float16 graph is fed the numerically closest version of the f32 input.
+fn synthetic_f16_bits(count: usize) -> Vec<u16> {
+    synthetic_f32(count)
+        .into_iter()
+        .map(|value| half::f16::from_f32(value).to_bits())
+        .collect()
+}
+
+/// Unsigned 8-bit inputs spread over the whole quantized range (QLinearMatMul
+/// and friends interpret these through a scale/zero-point, so the raw spread
+/// matters more than the float value).
+fn synthetic_u8(count: usize) -> Vec<u8> {
+    (0..count)
+        .map(|index| (index.wrapping_mul(37) % 251) as u8)
+        .collect()
+}
+
+fn synthetic_i8_bytes(count: usize) -> Vec<u8> {
+    (0..count)
+        .map(|index| (((index.wrapping_mul(37) % 251) as i32 - 125) as i8) as u8)
+        .collect()
+}
+
 fn synthetic_i32(count: usize) -> Vec<i32> {
     (0..count).map(|index| (index % 17) as i32).collect()
 }
@@ -219,9 +293,32 @@ fn build_inputs(
                         Value::from_raw_bytes(bytes, &ort_shape, OrtDataType::Int32)?,
                     )
                 }
+                (NativeDataType::Float16, OrtDataType::Float16) => {
+                    let bits = synthetic_f16_bits(count);
+                    let bytes = bits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+                    (
+                        Tensor::from_raw(NativeDataType::Float16, shape.clone(), &bytes)?,
+                        Value::from_slice_f16_bits(&bits, &ort_shape)?,
+                    )
+                }
+                (NativeDataType::Uint8, OrtDataType::Uint8) => {
+                    let bytes = synthetic_u8(count);
+                    (
+                        Tensor::from_raw(NativeDataType::Uint8, shape.clone(), &bytes)?,
+                        Value::from_raw_bytes(bytes, &ort_shape, OrtDataType::Uint8)?,
+                    )
+                }
+                (NativeDataType::Int8, OrtDataType::Int8) => {
+                    let bytes = synthetic_i8_bytes(count);
+                    (
+                        Tensor::from_raw(NativeDataType::Int8, shape.clone(), &bytes)?,
+                        Value::from_raw_bytes(bytes, &ort_shape, OrtDataType::Int8)?,
+                    )
+                }
                 (native, ort) => bail!(
                     "input '{}' has unsupported or mismatched dtype: native={native:?} ORT={ort:?}; \
-                     bench_generic currently synthesizes Float32, Int32, and Int64 inputs",
+                     bench_generic currently synthesizes Float32, Float16, Int32, Int64, Uint8, \
+                     and Int8 inputs",
                     input.name
                 ),
             };
@@ -294,11 +391,43 @@ fn run_ort_only(
     Ok(())
 }
 
+/// Largest absolute and relative gap between two f32 sequences, plus whether
+/// every element is inside `abs_tolerance + rel_tolerance * max(|a|, |b|)`.
+fn compare_f32(
+    native: &[f32],
+    ort: &[f32],
+    abs_tolerance: f32,
+    rel_tolerance: f32,
+) -> (f32, f32, bool) {
+    let mut max_abs = 0.0_f32;
+    let mut max_rel = 0.0_f32;
+    let mut pass = true;
+    for (&native, &ort) in native.iter().zip(ort) {
+        if native == ort {
+            continue;
+        }
+        if !native.is_finite() || !ort.is_finite() {
+            max_abs = f32::INFINITY;
+            max_rel = f32::INFINITY;
+            pass = false;
+            continue;
+        }
+        let abs = (native - ort).abs();
+        let rel = abs / native.abs().max(ort.abs()).max(f32::MIN_POSITIVE);
+        max_abs = max_abs.max(abs);
+        max_rel = max_rel.max(rel);
+        pass &= abs <= abs_tolerance + rel_tolerance * native.abs().max(ort.abs());
+    }
+    (max_abs, max_rel, pass)
+}
+
 fn compare_outputs(
     native: &[Tensor],
     ort: &[Value],
     abs_tolerance: f32,
     rel_tolerance: f32,
+    f16_abs_tolerance: f32,
+    f16_rel_tolerance: f32,
 ) -> Result<Vec<OutputDiff>> {
     if native.len() != ort.len() {
         bail!(
@@ -327,32 +456,71 @@ fn compare_outputs(
             }
             match (native.dtype, ort.dtype()) {
                 (NativeDataType::Float32, OrtDataType::Float32) => {
-                    let native = native.to_vec_f32();
-                    let ort = ort.to_vec_f32()?;
-                    let mut max_abs = 0.0_f32;
-                    let mut max_rel = 0.0_f32;
-                    let mut pass = true;
-                    for (&native, &ort) in native.iter().zip(&ort) {
-                        if native == ort {
-                            continue;
-                        }
-                        if !native.is_finite() || !ort.is_finite() {
-                            max_abs = f32::INFINITY;
-                            max_rel = f32::INFINITY;
-                            pass = false;
-                            continue;
-                        }
-                        let abs = (native - ort).abs();
-                        let rel = abs / native.abs().max(ort.abs()).max(f32::MIN_POSITIVE);
-                        max_abs = max_abs.max(abs);
-                        max_rel = max_rel.max(rel);
-                        pass &= abs <= abs_tolerance + rel_tolerance * native.abs().max(ort.abs());
-                    }
+                    let (max_abs, max_rel, pass) = compare_f32(
+                        &native.to_vec_f32(),
+                        &ort.to_vec_f32()?,
+                        abs_tolerance,
+                        rel_tolerance,
+                    );
                     Ok(OutputDiff {
                         index,
                         max_abs,
                         max_rel,
                         pass,
+                    })
+                }
+                (NativeDataType::Float16, OrtDataType::Float16) => {
+                    let widen = |bits: &[u16]| -> Vec<f32> {
+                        bits.iter()
+                            .map(|&bits| half::f16::from_bits(bits).to_f32())
+                            .collect()
+                    };
+                    let native_bits: Vec<u16> = native
+                        .as_bytes()
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                        .collect();
+                    // f16-scaled tolerances: the f32 defaults are ~1 f16 ULP,
+                    // which would pass almost any pair of f16 values and make
+                    // the parity check meaningless.
+                    let (max_abs, max_rel, pass) = compare_f32(
+                        &widen(&native_bits),
+                        &widen(&ort.to_vec_f16_bits()?),
+                        f16_abs_tolerance,
+                        f16_rel_tolerance,
+                    );
+                    Ok(OutputDiff {
+                        index,
+                        max_abs,
+                        max_rel,
+                        pass,
+                    })
+                }
+                (NativeDataType::Uint8, OrtDataType::Uint8)
+                | (NativeDataType::Int8, OrtDataType::Int8) => {
+                    // Quantized outputs are exact integers: any mismatch is a
+                    // real disagreement, so report the largest code-unit gap and
+                    // require zero of them.
+                    let ort_bytes = ort.to_raw_bytes()?;
+                    let signed = native.dtype == NativeDataType::Int8;
+                    let max_abs = native
+                        .as_bytes()
+                        .iter()
+                        .zip(&ort_bytes)
+                        .map(|(&native, &ort)| {
+                            if signed {
+                                ((native as i8) as i32 - (ort as i8) as i32).unsigned_abs()
+                            } else {
+                                (native as i32 - ort as i32).unsigned_abs()
+                            }
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    Ok(OutputDiff {
+                        index,
+                        max_abs: max_abs as f32,
+                        max_rel: 0.0,
+                        pass: max_abs == 0,
                     })
                 }
                 (NativeDataType::Int64, OrtDataType::Int64) => {
@@ -403,6 +571,56 @@ fn median_ms(mut samples: Vec<f64>) -> f64 {
     samples[samples.len() / 2]
 }
 
+/// p50/p90/min of one runtime's samples. p90 uses the nearest-rank definition
+/// (`ceil(0.9 * n)`-th smallest), so a 10-run comparison reports the 9th
+/// sample rather than interpolating; dispersion is reported as p90/p50 so a
+/// noisy shared host is visible in the record instead of hidden by the median.
+#[derive(Clone, Copy)]
+struct Stats {
+    p50: f64,
+    p90: f64,
+    min: f64,
+}
+
+impl Stats {
+    /// Nearest-rank percentiles over `samples`, which must be non-empty (the
+    /// caller bails on `--runs 0`; this asserts rather than panicking on an
+    /// out-of-bounds index if a future caller filters samples down to nothing).
+    fn from(mut samples: Vec<f64>) -> Self {
+        assert!(
+            !samples.is_empty(),
+            "Stats::from requires at least one timing sample"
+        );
+        samples.sort_by(f64::total_cmp);
+        let rank = ((samples.len() as f64) * 0.9).ceil().max(1.0) as usize;
+        Self {
+            p50: samples[samples.len() / 2],
+            p90: samples[rank.min(samples.len()) - 1],
+            min: samples[0],
+        }
+    }
+
+    fn spread(&self) -> f64 {
+        self.p90 / self.p50
+    }
+}
+
+/// Which CPU-kernel arm this binary was built with.
+///
+/// Printed on every result line because the distinction is not cosmetic: `mlas`
+/// is not a default feature of `onnx-runtime-ep-cpu`, so an MLAS-linked build
+/// does not measure what ships. This binary used to *require* the `mlas`
+/// feature, which meant every ratio ever published from it came from the
+/// research arm while being read as a production number. Labelling the arm in
+/// the output makes that impossible to do again by accident.
+fn build_arm() -> &'static str {
+    if cfg!(feature = "mlas") {
+        "mlas-reference"
+    } else {
+        "native"
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.runs == 0 {
@@ -410,6 +628,20 @@ fn main() -> Result<()> {
     }
     validate_tolerance("rel-tolerance", args.rel_tolerance)?;
     validate_tolerance("abs-tolerance", args.abs_tolerance)?;
+    if args.phase_profile {
+        if args.ort_only {
+            // The profiler only instruments the native executor, so this
+            // combination would enable it and then print nothing. Say so rather
+            // than emitting a silently empty report.
+            bail!(
+                "--phase-profile has no effect with --ort-only: the phase profiler instruments the native executor, not the ORT session"
+            );
+        }
+        // Turn the executor's phase accounting on programmatically rather than
+        // through `NXRT_EXEC_PHASE_PROFILE`, so the flag works on its own and
+        // cannot be half-set by an inherited environment.
+        onnx_runtime_session::enable_exec_phase_profile_for_process();
+    }
     let input_shape = args
         .input_shape
         .as_deref()
@@ -417,10 +649,30 @@ fn main() -> Result<()> {
         .transpose()
         .map_err(anyhow::Error::msg)?;
 
+    // Set the native decode-pool width *before* anything builds a session: the
+    // EP reads `ONNX_GENAI_CPU_DECODE_THREADS` once into a `OnceLock`, so a
+    // later write would be ignored and silently produce an unmatched A/B.
+    if args.native_threads > 0 {
+        // SAFETY: single-threaded startup, before any session, thread pool or
+        // other reader of the process environment exists.
+        unsafe { std::env::set_var(NATIVE_DECODE_THREADS_ENV, args.native_threads.to_string()) };
+    }
+    let native_threads = std::env::var(NATIVE_DECODE_THREADS_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "default".to_string());
+
     let environment = Environment::new("bench-generic")?;
-    let ort_intra_threads = if args.native_only { 1 } else { 0 };
-    let ort_options = SessionOptions::with_execution_provider(ep_selection("cpu"))
+    let ort_intra_threads = if args.ort_intra_threads > 0 {
+        args.ort_intra_threads
+    } else if args.native_only {
+        1
+    } else {
+        0
+    };
+    let mut ort_options = SessionOptions::with_execution_provider(ep_selection("cpu"))
         .with_intra_op_threads(ort_intra_threads);
+    ort_options.inter_op_num_threads = args.ort_inter_threads;
     let ort_session = Session::new(&environment, &args.model, ort_options)
         .with_context(|| format!("load ORT CPU session from {}", args.model.display()))?;
     println!("model: {}", args.model.display());
@@ -468,6 +720,8 @@ fn main() -> Result<()> {
         &ort_reference,
         args.abs_tolerance,
         args.rel_tolerance,
+        args.f16_abs_tolerance,
+        args.f16_rel_tolerance,
     )?;
     for diff in &diffs {
         println!(
@@ -506,6 +760,12 @@ fn main() -> Result<()> {
             std::hint::black_box(ort_session.run(&ort_inputs).context("ORT warmup")?);
         }
     }
+    if args.phase_profile {
+        // Warmups pay first-touch page faults and lazy plan construction that
+        // no measured run repeats. Counting them would attribute one-time cost
+        // to the steady state.
+        onnx_runtime_session::reset_exec_phase_profile();
+    }
     let mut native_samples = Vec::with_capacity(args.runs);
     let mut ort_samples = Vec::with_capacity(args.runs);
     for run in 0..args.runs {
@@ -534,25 +794,48 @@ fn main() -> Result<()> {
         }
     }
 
-    let native_ms = median_ms(native_samples);
+    let native = Stats::from(native_samples);
     if args.native_only {
         println!(
-            "result: native={native_ms:.3} ms ({:.2} infer/s) ort=skipped native-only=true \
-             parity={}",
-            1_000.0 / native_ms,
+            "result: native={:.3} ms ({:.2} infer/s) native_p90={:.3} ms native_min={:.3} ms \
+             native_spread={:.2} native_threads={native_threads} ort=skipped native-only=true \
+             arm={} parity={}",
+            native.p50,
+            1_000.0 / native.p50,
+            native.p90,
+            native.min,
+            native.spread(),
+            build_arm(),
             if parity_pass { "PASS" } else { "FAIL" }
         );
+        if args.phase_profile {
+            onnx_runtime_session::print_exec_phase_profile();
+        }
         return Ok(());
     }
-    let ort_ms = median_ms(ort_samples);
+    let ort = Stats::from(ort_samples);
     println!(
-        "result: native={native_ms:.3} ms ({:.2} infer/s) ort={ort_ms:.3} ms \
-         ({:.2} infer/s) native/ort={:.3} parity={}",
-        1_000.0 / native_ms,
-        1_000.0 / ort_ms,
-        native_ms / ort_ms,
+        "result: native={:.3} ms ({:.2} infer/s) ort={:.3} ms ({:.2} infer/s) \
+         native/ort={:.3} native_p90={:.3} ort_p90={:.3} native_min={:.3} ort_min={:.3} \
+         native_spread={:.2} ort_spread={:.2} native_threads={native_threads} \
+         ort_intra_threads={ort_intra_threads} arm={} parity={}",
+        native.p50,
+        1_000.0 / native.p50,
+        ort.p50,
+        1_000.0 / ort.p50,
+        native.p50 / ort.p50,
+        native.p90,
+        ort.p90,
+        native.min,
+        ort.min,
+        native.spread(),
+        ort.spread(),
+        build_arm(),
         if parity_pass { "PASS" } else { "FAIL" }
     );
+    if args.phase_profile {
+        onnx_runtime_session::print_exec_phase_profile();
+    }
     Ok(())
 }
 
@@ -597,9 +880,50 @@ mod tests {
     fn non_finite_output_mismatches_fail_parity() {
         let native = Tensor::from_f32(&[3], &[f32::INFINITY, f32::NEG_INFINITY, f32::NAN]).unwrap();
         let ort = Value::from_slice_f32(&[1.0, f32::INFINITY, f32::NAN], &[3]).unwrap();
-        let diffs = compare_outputs(&[native], &[ort], 1e-4, 1e-3).unwrap();
+        let diffs = compare_outputs(
+            &[native],
+            &[ort],
+            1e-4,
+            1e-3,
+            F16_EPSILON,
+            4.0 * F16_EPSILON,
+        )
+        .unwrap();
         assert!(!diffs[0].pass);
         assert_eq!(diffs[0].max_abs, f32::INFINITY);
+    }
+
+    /// The f32 defaults are ~1 f16 ULP, so reusing them for Float16 outputs
+    /// makes the parity check vacuous: two f16 values a single representable
+    /// step apart would "match". The f16 defaults must be loose enough to
+    /// tolerate f16 rounding but tight enough to still reject a real
+    /// disagreement.
+    #[test]
+    fn f16_parity_tolerances_reject_real_disagreement_and_accept_rounding() {
+        assert!(
+            4.0 * F16_EPSILON > F16_EPSILON,
+            "the f16 relative tolerance must exceed one f16 ULP"
+        );
+        // One f16 ULP apart near 1.0: rounding noise, must pass.
+        let near = half::f16::from_f32(1.0);
+        let next = half::f16::from_bits(near.to_bits() + 1);
+        let (_, _, pass) = compare_f32(
+            &[near.to_f32()],
+            &[next.to_f32()],
+            F16_EPSILON,
+            4.0 * F16_EPSILON,
+        );
+        assert!(pass, "one f16 ULP of rounding must not fail parity");
+        // 1% apart: ~10 f16 ULP, a real disagreement, must fail.
+        let (_, _, pass) = compare_f32(&[1.0], &[1.01], F16_EPSILON, 4.0 * F16_EPSILON);
+        assert!(
+            !pass,
+            "a 1% disagreement is ~10 f16 ULP and must fail parity"
+        );
+        // ...and would have passed under a tolerance an order of magnitude
+        // looser, which is what makes the 4-ULP choice meaningful.
+        let (_, _, pass) = compare_f32(&[1.0], &[1.01], F16_EPSILON, 5e-2);
+        assert!(pass, "control: 5e-2 is too loose to catch a 1% gap");
     }
 
     #[test]

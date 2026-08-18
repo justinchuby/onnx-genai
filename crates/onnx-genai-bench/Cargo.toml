@@ -87,6 +87,7 @@ clap = { workspace = true }
 # `transfer-probe` feature). `dynamic-loading` keeps the no-build-time-toolkit
 # property: the driver is dlopen'd at runtime. Exactly one `cuda-*` version is
 # selected transitively via this crate's `cuda-*` features (default 13.0).
+half = { workspace = true }
 cudarc = { version = "0.19", default-features = false, features = [
     "std",
     "driver",
@@ -147,7 +148,13 @@ required-features = ["bench-native"]
 
 [[bin]]
 name = "bench_generic"
-required-features = ["mlas"]
+# `bench-native`, not `mlas`. This binary has no MLAS-specific code, and while
+# it required the `mlas` feature it could only ever be built with MLAS linked -
+# so every A/B ratio ever published from it measured the research arm, not the
+# arm that ships. `mlas` is not a default feature of `onnx-runtime-ep-cpu`.
+# Build the production arm with `--features bench-native`, and the reference
+# arm with `--features mlas`.
+required-features = ["bench-native"]
 
 [[bin]]
 name = "cuda_place"

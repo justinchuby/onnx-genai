@@ -281,6 +281,14 @@ struct Args {
     /// backfill actually occurs.
     #[arg(long, default_value_t = 2)]
     mid_flight_batch: usize,
+    /// Drive `--mid-flight-solo-equivalence-prompts` through the real
+    /// `ContinuousBatchManager` on the native backend (#750 stage 4) instead of
+    /// the hand-rolled slot driver. This proves the *manager* — not a bespoke
+    /// harness — admits rows mid-flight and reproduces each solo stream, and it
+    /// reports the manager's capture stats and honest logits D2H cost. The gate
+    /// still rejects a run where every row was admitted at step 0.
+    #[arg(long, default_value_t = false)]
+    mid_flight_via_manager: bool,
     /// Speculative decoding mode. `prompt-lookup` enables native n-gram
     /// speculation (exact verification; lossless vs greedy). Only supported on
     /// the single-model native `--steady` path; rejected with `--pipeline`.
@@ -294,6 +302,14 @@ struct Args {
     /// verified per step. Only used when `--speculative prompt-lookup`.
     #[arg(long, default_value_t = 4)]
     spec_tokens: usize,
+    /// Run the standalone base-decode on-GPU-argmax A/B benchmark: greedy decode
+    /// with the host argmax (logits D2H + host reduction) vs the on-GPU argmax
+    /// (`decode_greedy_batch`, no logits D2H), reporting tok/s for both and the
+    /// token divergence between them. Pure base-decode measurement — no
+    /// speculative / draft machinery. Selects the primary reported path via the
+    /// `ONNX_GENAI_ONGPU_ARGMAX` env flag (default OFF = host argmax).
+    #[arg(long, default_value_t = false)]
+    ongpu_argmax_bench: bool,
 }
 
 fn categorical_sampling_enabled(args: &Args) -> bool {
@@ -571,6 +587,12 @@ fn print_cuda_observability(
         if let Some(report) = &stats.graph.fallback_report {
             println!("cuda_graph_fallback_report: {report}");
         }
+        if stats.graph.device_token_loop_k > 0 || stats.graph.device_token_loop_steps > 0 {
+            println!(
+                "device_token_loop: k={} chained_steps={}",
+                stats.graph.device_token_loop_k, stats.graph.device_token_loop_steps
+            );
+        }
     }
 }
 
@@ -658,12 +680,13 @@ fn print_weight_offload_observability(emitted_tokens: u64) {
     print_weight_offload_amortization(&stats, emitted_tokens);
     println!(
         "weight_offload_timing: materialize_ms={:.3} htod_ms={:.3} \
-         admit_sync_ms={:.3} vram_alloc_ms={:.3} vram_free_ms={:.3}",
+         admit_sync_ms={:.3} vram_alloc_ms={:.3} vram_free_ms={:.3} vram_free_sync_ms={:.3}",
         stats.materialize_ns as f64 / 1_000_000.0,
         stats.htod_ns as f64 / 1_000_000.0,
         stats.admit_sync_ns as f64 / 1_000_000.0,
         stats.vram_alloc_ns as f64 / 1_000_000.0,
-        stats.vram_free_ns as f64 / 1_000_000.0
+        stats.vram_free_ns as f64 / 1_000_000.0,
+        stats.vram_free_sync_ns as f64 / 1_000_000.0
     );
     println!(
         "weight_offload_physical: budget_bytes={} mapped_physical_bytes={} \
@@ -1026,12 +1049,15 @@ fn run_native_decode_batch_sweep(
         let before_measured = session.cuda_kv_debug_stats();
 
         let mut row0_stream = Vec::with_capacity(tokens);
+        let mut step_ms: Vec<f64> = Vec::with_capacity(tokens);
         for step in 0..tokens {
             let inputs = vec![step_token; batch];
             let past_len = context + step;
+            let step_start = std::time::Instant::now();
             let rows = session
                 .decode_greedy_batch(&inputs, past_len)
                 .with_context(|| format!("batch {batch} decode step {step}"))?;
+            step_ms.push(step_start.elapsed().as_secs_f64() * 1000.0);
             if rows.len() != batch {
                 bail!(
                     "batch {batch} decode step {step} returned {} rows, expected {batch}",
@@ -1055,6 +1081,33 @@ fn run_native_decode_batch_sweep(
         println!(
             "native_decode_batch_row_identity: batch={batch} all_rows_equal_row0=true steps={tokens}"
         );
+        // Throughput instrument (#750 large-model amortization line). Per-step
+        // wall time is noisy on this box under weight-streaming pressure (the OS
+        // pages our own VMM granules, #863), so report the MEDIAN ms/step with
+        // the full min-max range rather than a mean, and derive tok/s from the
+        // median. `per_row_tok_s` is one sequence's rate; `aggregate_tok_s`
+        // (per_row × batch) is the batch's produced-token rate — the quantity
+        // that should climb toward N× if the fused forward truly reads each
+        // weight once per step regardless of N. Read the contention-invariant
+        // `htod_bytes` counter beside this to confirm the mechanism (#884).
+        if !step_ms.is_empty() {
+            let mut sorted = step_ms.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median_ms = sorted[sorted.len() / 2];
+            let min_ms = sorted[0];
+            let max_ms = sorted[sorted.len() - 1];
+            let per_row_tok_s = if median_ms > 0.0 {
+                1000.0 / median_ms
+            } else {
+                0.0
+            };
+            let aggregate_tok_s = per_row_tok_s * batch as f64;
+            println!(
+                "native_decode_batch_throughput: batch={batch} steps={tokens} \
+                 median_ms_per_step={median_ms:.3} range_ms=[{min_ms:.3},{max_ms:.3}] \
+                 per_row_tok_s={per_row_tok_s:.2} aggregate_tok_s={aggregate_tok_s:.2}"
+            );
+        }
         println!("native_decode_batch_row0_stream: batch={batch} {row0_stream:?}");
         match &batch1_reference {
             None if batch == 1 => batch1_reference = Some(row0_stream.clone()),
@@ -1123,6 +1176,23 @@ fn run_native_decode_batch_sweep(
             if let Some(decision) = &stats.graph.growth_decision {
                 println!("native_decode_batch_cuda_graph_growth: batch={batch} {decision}");
             }
+        }
+
+        // Whole-subgraph vs segmented capture: batch=1 typically captures as a
+        // single graph (segments=1 -> zero-host-work replay), while M>=2 can
+        // fragment into segments whose replay interleaves eager seam-node
+        // execution every step. `segments>1` at batch>=2 with the seam summary
+        // naming the culprit op is the localized root cause of the M>=2 decode
+        // step-cost cliff (per-step executor work instead of a bare graph relaunch).
+        {
+            let segments = session.captured_graph_segment_count();
+            let seams = session
+                .captured_graph_seam_summary()
+                .unwrap_or_else(|| "none".to_string());
+            println!(
+                "native_decode_batch_cuda_graph_segments: batch={batch} segments={segments} \
+                 seam_nodes={seams}"
+            );
         }
 
         // Weight-streaming amortization: emitted tokens = steps × rows, so
@@ -1719,6 +1789,238 @@ fn host_argmax(logits: &[f32]) -> u32 {
     best_index as u32
 }
 
+/// Opt-in on-GPU-argmax base-decode flag (`ONNX_GENAI_ONGPU_ARGMAX`). Default
+/// OFF. When ON, the base-decode greedy A/B benchmark reports the on-GPU-argmax
+/// (`decode_greedy_batch`) path as its primary throughput number; when OFF it
+/// reports the host-argmax path. Both paths are always measured and their token
+/// streams cross-checked for byte-identity regardless of the flag.
+fn ongpu_argmax_enabled() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_ONGPU_ARGMAX").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON")
+    )
+}
+
+/// Lowest-index-on-ties argmax: strict `>` from `-inf` keeps the FIRST maximum,
+/// matching the ONNX/ORT canonical greedy tie-break (`ArgMax` with
+/// `select_last_index=false`), the host sampler `sample_greedy` ("ties keep the
+/// lowest token id"), and the reconciled on-GPU `device_argmax` (lowest global
+/// index). The host reference and the device path are therefore byte-identical
+/// even on the rare exact fp16 tie at the argmax.
+fn argmax_lowest_index(row: &[f32]) -> u32 {
+    let mut best = f32::NEG_INFINITY;
+    let mut best_index = 0u32;
+    for (index, &value) in row.iter().enumerate() {
+        if value > best {
+            best = value;
+            best_index = index as u32;
+        }
+    }
+    best_index
+}
+
+/// Steady-window tok/s from per-token timestamps, excluding the first `skip`
+/// emitted tokens (prefill / capture warmup) from the timed window.
+fn steady_tok_s(times: &[Duration], skip: usize) -> f64 {
+    if times.len() <= skip + 1 {
+        if times.len() < 2 {
+            return 0.0;
+        }
+        let wall = (times[times.len() - 1] - times[0]).as_secs_f64();
+        return if wall > 0.0 {
+            (times.len() - 1) as f64 / wall
+        } else {
+            0.0
+        };
+    }
+    let decode_tokens = times.len() - skip;
+    let wall = (times[times.len() - 1] - times[skip - 1]).as_secs_f64();
+    if wall > 0.0 {
+        decode_tokens as f64 / wall
+    } else {
+        0.0
+    }
+}
+
+/// Fraction of positions where two token streams differ (byte-identity check).
+fn token_divergence(a: &[u32], b: &[u32]) -> f64 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return if a.len() == b.len() { 0.0 } else { 1.0 };
+    }
+    let mut diff = 0usize;
+    for i in 0..n {
+        if a[i] != b[i] {
+            diff += 1;
+        }
+    }
+    diff += a.len().max(b.len()) - n;
+    diff as f64 / a.len().max(b.len()) as f64
+}
+
+/// Base-decode greedy with the HOST argmax: each step copies the full
+/// `[vocab]` fp16 logits to the host (`decode`) and reduces on the CPU. This is
+/// the pre-existing sampler path and the byte-identity reference.
+fn greedy_decode_host(
+    session: &mut NativeDecodeSession,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    eos: &[u32],
+    decode_skip: usize,
+) -> Result<(Vec<u32>, f64)> {
+    session.reset()?;
+    let mut logits = session
+        .decode(prompt_tokens, 0)?
+        .pop()
+        .context("greedy prefill produced no logits")?;
+    let mut generated = Vec::with_capacity(max_new_tokens);
+    let mut times = Vec::with_capacity(max_new_tokens);
+    let start = Instant::now();
+    while generated.len() < max_new_tokens {
+        let token = argmax_lowest_index(&logits);
+        generated.push(token);
+        times.push(start.elapsed());
+        if eos.contains(&token) {
+            break;
+        }
+        let past = session.current_len();
+        logits = session
+            .decode(&[token], past)?
+            .pop()
+            .context("greedy decode produced no logits")?;
+    }
+    Ok((generated, steady_tok_s(&times, decode_skip)))
+}
+
+/// Base-decode greedy with the ON-GPU argmax: each step selects the next token
+/// with `decode_greedy_batch` (batch 1), which reduces over the vocab on the
+/// GPU and returns only the token id — no `[vocab]` logits D2H, no host
+/// reduction. Byte-identical to [`greedy_decode_host`] (device_argmax resolves
+/// ties to the same lowest index — the ONNX/ORT canonical). The prefill first
+/// token still comes from the
+/// prefill logits (one-time, outside the steady window) so both streams start
+/// from the same bootstrap.
+fn greedy_decode_ongpu(
+    session: &mut NativeDecodeSession,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    eos: &[u32],
+    decode_skip: usize,
+) -> Result<(Vec<u32>, f64)> {
+    session.reset()?;
+    let base_logits = session
+        .decode(prompt_tokens, 0)?
+        .pop()
+        .context("greedy prefill produced no logits")?;
+    let mut generated = Vec::with_capacity(max_new_tokens);
+    let mut times = Vec::with_capacity(max_new_tokens);
+    let start = Instant::now();
+    let mut token = argmax_lowest_index(&base_logits);
+    loop {
+        generated.push(token);
+        times.push(start.elapsed());
+        if eos.contains(&token) || generated.len() >= max_new_tokens {
+            break;
+        }
+        let past = session.current_len();
+        token = session
+            .decode_greedy_batch(std::slice::from_ref(&token), past)?
+            .pop()
+            .context("device-argmax greedy decode produced no token")?;
+    }
+    Ok((generated, steady_tok_s(&times, decode_skip)))
+}
+
+/// Wrap a user prompt in the Qwen2.5 chat template so the instruct target
+/// produces a realistic assistant continuation.
+fn qwen_chat_wrap(user: &str) -> String {
+    format!(
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n\
+         <|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
+    )
+}
+
+/// Standalone base-decode on-GPU-argmax A/B benchmark. Measures greedy decode
+/// with the host argmax (logits D2H + host reduction) vs the on-GPU argmax
+/// (`decode_greedy_batch`, no logits D2H) over `--runs` runs, reports median
+/// tok/s for both, the net ratio, and the token divergence between the two
+/// streams (must be 0.000% — byte-identical). No speculative / draft machinery.
+fn run_ongpu_argmax_bench(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Result<()> {
+    let tokenizer_path = tokenizer_file(model_dir);
+    let tokenizer =
+        Tokenizer::from_file(&tokenizer_path).context("load tokenizer.json beside decoder")?;
+    let mut session = NativeDecodeSession::load_with_resolved_io(&model_file(model_dir), device)
+        .with_context(|| format!("load native decoder {}", model_dir.display()))?;
+
+    let prompt_text = qwen_chat_wrap(&args.prompt);
+    let prompt_tokens = tokenizer.encode(&prompt_text).context("tokenize prompt")?;
+    if prompt_tokens.is_empty() {
+        bail!("prompt tokenized to an empty sequence");
+    }
+    let eos: Vec<u32> = vec![151645, 151643];
+    let max_new = args.tokens;
+    let skip = args.decode_skip.max(1);
+    let primary_ongpu = ongpu_argmax_enabled();
+
+    println!(
+        "profile_native: ongpu-argmax-bench model={} layers={} prompt_tokens={} tokens={} \
+         warmups={} runs={} decode_skip={} ONNX_GENAI_ONGPU_ARGMAX={} (primary_path={})",
+        model_dir.display(),
+        session.kv_layer_count(),
+        prompt_tokens.len(),
+        max_new,
+        args.warmups,
+        args.runs,
+        skip,
+        if primary_ongpu { "1" } else { "0" },
+        if primary_ongpu { "ongpu" } else { "host" },
+    );
+
+    // Warmup both paths to arm CUDA-graph capture before timing.
+    for _ in 0..args.warmups {
+        let _ = greedy_decode_host(&mut session, &prompt_tokens, max_new.min(16), &eos, 1)?;
+        let _ = greedy_decode_ongpu(&mut session, &prompt_tokens, max_new.min(16), &eos, 1)?;
+    }
+
+    let mut host_rates = Vec::with_capacity(args.runs);
+    let mut ongpu_rates = Vec::with_capacity(args.runs);
+    let mut host_tokens_ref: Option<Vec<u32>> = None;
+    let mut ongpu_tokens_ref: Option<Vec<u32>> = None;
+    for _ in 0..args.runs {
+        let (host_tokens, host_rate) =
+            greedy_decode_host(&mut session, &prompt_tokens, max_new, &eos, skip)?;
+        let (ongpu_tokens, ongpu_rate) =
+            greedy_decode_ongpu(&mut session, &prompt_tokens, max_new, &eos, skip)?;
+        host_rates.push(host_rate);
+        ongpu_rates.push(ongpu_rate);
+        host_tokens_ref.get_or_insert(host_tokens);
+        ongpu_tokens_ref.get_or_insert(ongpu_tokens);
+    }
+
+    let host_median = median(&mut host_rates);
+    let ongpu_median = median(&mut ongpu_rates);
+    let host_tokens = host_tokens_ref.expect("at least one run");
+    let ongpu_tokens = ongpu_tokens_ref.expect("at least one run");
+    let divergence = token_divergence(&ongpu_tokens, &host_tokens);
+    let ratio = if host_median > 0.0 {
+        ongpu_median / host_median
+    } else {
+        0.0
+    };
+
+    println!(
+        "ongpu_argmax_bench: host_argmax={host_median:.2} tok/s ongpu_argmax={ongpu_median:.2} \
+         tok/s net={ratio:.4}x divergence={:.3}% generated_tokens={}",
+        divergence * 100.0,
+        host_tokens.len(),
+    );
+    println!(
+        "ongpu_argmax_bench: byte_identity={} (ongpu vs host greedy must be 0.000%)",
+        if divergence == 0.0 { "PASS" } else { "FAIL" },
+    );
+    Ok(())
+}
+
 /// One live sequence occupying a continuous-batch decode slot in the stage-3b
 /// mid-flight driver.
 struct MidFlightJob {
@@ -2066,6 +2368,332 @@ fn run_native_decode_mid_flight_solo_equivalence(
             "mid-flight solo-equivalence FAILED: a row admitted into a recycled slot diverged from \
              its solo batch-1 stream — slot reuse leaked stale KV, mask, or position across the \
              admission boundary"
+        );
+    }
+    Ok(())
+}
+
+/// Stage 4 (#750) mid-flight solo-equivalence gate driven through the **real**
+/// [`onnx_genai_engine::ContinuousBatchManager`] on the native CUDA backend.
+///
+/// The sibling `run_native_decode_mid_flight_solo_equivalence` hand-drives the
+/// native seams (`assign_batch_row`/`deactivate_batch_row`/
+/// `decode_greedy_batch_ragged_logits`) directly, so it proves the seams are
+/// correct but *not* that the manager wires them correctly. This gate closes
+/// that gap: it builds a batch-`K` native engine, calls
+/// `engine.continuous_batch_manager(K)`, submits every prompt as a greedy
+/// `GenerateRequest`, and drives `manager.step()` to completion. The manager —
+/// not this harness — owns admission (`admit_available_rows` → `assign_row`),
+/// sampling (host `[B, 1, vocab]` logits through `BatchStepLogits::HostRows`),
+/// and eviction (`deactivate_row`). Each request's `GenerateResult::token_ids`
+/// must be byte-identical to the same prompt run **alone** at batch 1, and the
+/// manager must admit at least one request at step > 0 (a run where every row
+/// started at step 0 is rejected). Capture stats and the manager's logits D2H
+/// cost are reported so the reader can confirm capture survived admission and
+/// see the honest per-step transfer cost.
+fn run_native_decode_mid_flight_manager_solo_equivalence(
+    model_dir: &Path,
+    device: NativeDecodeDevice,
+    decode_precision: DecodePrecision,
+    tokenizer: &Tokenizer,
+    prompt_spec: &str,
+    batch: usize,
+    gen_tokens: usize,
+) -> Result<()> {
+    use onnx_genai_engine::{ContinuousBatchAdmission, ContinuousBatchEvent, GeneratePrompt};
+
+    let own_pid = std::process::id();
+    report_foreign_compute_apps(own_pid);
+
+    if batch < 2 {
+        bail!("--mid-flight-batch must be at least 2 (a single slot cannot demonstrate backfill)");
+    }
+    if gen_tokens < 2 {
+        bail!("--tokens must be at least 2 for the mid-flight gate");
+    }
+
+    let prompt_texts: Vec<&str> = prompt_spec
+        .split("||")
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect();
+    if prompt_texts.len() <= batch {
+        bail!(
+            "--mid-flight-solo-equivalence-prompts needs strictly more than --mid-flight-batch \
+             ({batch}) prompts so a waiting request is actually admitted into a freed slot \
+             mid-flight (got {})",
+            prompt_texts.len()
+        );
+    }
+    let mut prompts: Vec<Vec<u32>> = Vec::with_capacity(prompt_texts.len());
+    for text in &prompt_texts {
+        let tokens = tokenizer
+            .encode(text)
+            .with_context(|| format!("tokenize mid-flight prompt {text:?}"))?;
+        if tokens.is_empty() {
+            bail!("mid-flight prompt {text:?} tokenized to an empty sequence");
+        }
+        prompts.push(tokens);
+    }
+    let requests = prompts.len();
+    // Stagger the per-request generation lengths so rows retire at different
+    // steps and backfill is genuinely mid-flight, matching the hand-driven gate.
+    let gen_targets: Vec<usize> = (0..requests).map(|i| 1 + (i % gen_tokens)).collect();
+    let lens: Vec<usize> = prompts.iter().map(Vec::len).collect();
+    println!(
+        "native_decode_mid_flight_manager_solo_equivalence: own_pid={own_pid} requests={requests} \
+         batch={batch} row_lens={lens:?} gen_targets={gen_targets:?} max_gen_tokens={gen_tokens}"
+    );
+
+    // 1) Solo reference: each prompt alone at batch 1 for its own gen_target,
+    // using the device-argmax path (decode_greedy_batch). Byte-identical to the
+    // hand-driven gate's reference.
+    // SAFETY: single-threaded benchmark setup.
+    unsafe {
+        std::env::set_var("ONNX_GENAI_NATIVE_DECODE_BATCH", "1");
+    }
+    let mut solo_engine = build_governed_batch_engine(model_dir, &device, decode_precision, 1)?;
+    let solo_session = solo_engine
+        .native_decode_session_mut()
+        .expect("batch-1 native session");
+    let mut solo_streams: Vec<Vec<u32>> = Vec::with_capacity(requests);
+    for (req, prompt) in prompts.iter().enumerate() {
+        let stream =
+            drive_uniform_batch(solo_session, std::slice::from_ref(prompt), gen_targets[req])?;
+        let stream = stream.into_iter().next().expect("one solo row");
+        println!(
+            "native_decode_mid_flight_manager_solo_equivalence_solo: req={req} prompt_len={} \
+             gen_target={} stream={stream:?}",
+            prompt.len(),
+            gen_targets[req]
+        );
+        solo_streams.push(stream);
+    }
+    drop(solo_engine);
+
+    // 2) Real manager over a batch-K native engine. The manager owns every
+    // physical decode row: it deactivates all rows at construction, admits from
+    // its FIFO queue into freed slots at the start of every step, samples from
+    // host logits, and evicts finished rows.
+    // SAFETY: single-threaded benchmark setup.
+    unsafe {
+        std::env::set_var("ONNX_GENAI_NATIVE_DECODE_BATCH", batch.to_string());
+    }
+    let mut batch_engine =
+        build_governed_batch_engine(model_dir, &device, decode_precision, batch)?;
+    let mut manager = batch_engine
+        .continuous_batch_manager(batch)
+        .context("build native ContinuousBatchManager (the #750 stage-4 wiring under test)")?;
+
+    // Submit every request as a greedy generation. `temperature = 0.0` and
+    // `greedy = true` force lowest-index argmax (the exact tie-break the native
+    // device argmax uses), and `stop_on_eos = false` makes the manager generate
+    // exactly `gen_target` tokens like `drive_uniform_batch` — so the streams are
+    // compared on equal footing.
+    let mut handle_to_req: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::with_capacity(requests);
+    for (req, prompt) in prompts.iter().enumerate() {
+        let options = GenerateOptions {
+            max_new_tokens: gen_targets[req],
+            temperature: 0.0,
+            greedy: true,
+            stop_on_eos: false,
+            ..GenerateOptions::default()
+        };
+        let request = GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(prompt.clone()),
+            options,
+        };
+        let handle = manager
+            .submit(request)
+            .with_context(|| format!("submit mid-flight request {req} to the manager"))?;
+        if handle_to_req.insert(handle.id, req).is_some() {
+            bail!(
+                "manager returned a duplicate handle id {} for req {req}",
+                handle.id
+            );
+        }
+    }
+
+    let mut admitted_at: Vec<Option<usize>> = vec![None; requests];
+    let mut finished_at: Vec<Option<usize>> = vec![None; requests];
+    let mut completed: Vec<Option<Vec<u32>>> = vec![None; requests];
+    let mut mid_flight_admissions = 0usize;
+
+    let record_admissions = |admissions: Vec<ContinuousBatchAdmission>,
+                             step: usize,
+                             admitted_at: &mut [Option<usize>],
+                             mid_flight_admissions: &mut usize|
+     -> Result<()> {
+        for admission in admissions {
+            match admission {
+                ContinuousBatchAdmission::Assigned { handle } => {
+                    let req = *handle_to_req
+                        .get(&handle.id)
+                        .with_context(|| format!("admission for unknown handle {}", handle.id))?;
+                    if admitted_at[req].is_none() {
+                        admitted_at[req] = Some(step);
+                        if step > 0 {
+                            *mid_flight_admissions += 1;
+                        }
+                    }
+                }
+                ContinuousBatchAdmission::Rejected { handle, error } => {
+                    let req = handle_to_req.get(&handle.id).copied();
+                    bail!("manager rejected admission for req {req:?}: {error:#}");
+                }
+            }
+        }
+        Ok(())
+    };
+
+    // Drain anything queued at submit time (a prompt at the context limit is
+    // admitted + finished during submit). These count as step-0 admissions.
+    record_admissions(
+        manager.poll_admissions(),
+        0,
+        &mut admitted_at,
+        &mut mid_flight_admissions,
+    )?;
+    for event in manager.poll() {
+        if let ContinuousBatchEvent::Finished { handle, result } = event {
+            let req = *handle_to_req
+                .get(&handle.id)
+                .with_context(|| format!("finish for unknown handle {}", handle.id))?;
+            completed[req] = Some(result.token_ids.clone());
+            finished_at[req] = Some(0);
+        }
+    }
+
+    let max_steps = requests * (gen_tokens + 64) + 1024;
+    let mut step = 0usize;
+    while manager.has_pending_work() {
+        if step >= max_steps {
+            bail!(
+                "manager mid-flight gate exceeded {max_steps} steps without draining — likely a \
+                 stuck row"
+            );
+        }
+        manager
+            .step()
+            .with_context(|| format!("manager.step() at step {step}"))?;
+        record_admissions(
+            manager.poll_admissions(),
+            step,
+            &mut admitted_at,
+            &mut mid_flight_admissions,
+        )?;
+        for event in manager.poll() {
+            if let ContinuousBatchEvent::Finished { handle, result } = event {
+                let req = *handle_to_req
+                    .get(&handle.id)
+                    .with_context(|| format!("finish for unknown handle {}", handle.id))?;
+                completed[req] = Some(result.token_ids.clone());
+                finished_at[req] = Some(step);
+            }
+        }
+        step += 1;
+    }
+
+    // Report the manager's honest logits D2H cost (the native host-logits seam
+    // reads `[B, 1, vocab]` each step). `BatchStepLogits::HostRows` is *moved*
+    // into the manager's rows, so the manager adds no copy on top of this read.
+    if let Some(d2h) = manager.logits_d2h_stats() {
+        let d2h_ms = d2h.time.as_secs_f64() * 1000.0;
+        let per_step_kb = if d2h.steps > 0 {
+            (d2h.bytes as f64 / d2h.steps as f64) / 1024.0
+        } else {
+            0.0
+        };
+        println!(
+            "native_decode_mid_flight_manager_solo_equivalence_d2h: steps={} \
+             total_logits_d2h_bytes={} total_d2h_ms={d2h_ms:.3} per_step_logits_kb={per_step_kb:.1} \
+             (manager moves each host row into its slot; no copy on top of this read)",
+            d2h.steps, d2h.bytes
+        );
+    } else {
+        println!(
+            "native_decode_mid_flight_manager_solo_equivalence_d2h: backend reported no logits \
+             D2H (unexpected for the native host-logits seam)"
+        );
+    }
+
+    // Capture must survive mid-flight admission: assign/deactivate are host-side
+    // mask/length writes, so no recapture is forced. Read the stats after the
+    // manager is dropped to release its &mut borrow of the session.
+    drop(manager);
+    let capture = batch_engine
+        .native_decode_session_mut()
+        .and_then(|session| session.cuda_kv_debug_stats())
+        .map(|stats| {
+            (
+                stats.graph.enabled,
+                stats.graph.captures,
+                stats.graph.replays,
+                stats.graph.fallbacks,
+                stats.graph.invalidations,
+            )
+        });
+    if let Some((enabled, captures, replays, fallbacks, invalidations)) = capture {
+        println!(
+            "native_decode_mid_flight_manager_solo_equivalence_capture: graph_enabled={enabled} \
+             captures={captures} replays={replays} fallbacks={fallbacks} \
+             invalidations={invalidations} (assign/deactivate are host-side writes through the \
+             manager; any invalidations are KV-growth boundaries, not admissions)"
+        );
+    }
+    drop(batch_engine);
+    // SAFETY: single-threaded teardown.
+    unsafe {
+        std::env::remove_var("ONNX_GENAI_NATIVE_DECODE_BATCH");
+    }
+
+    // Visibility: prove rows were admitted mid-flight (step > 0), not all at step 0.
+    for req in 0..requests {
+        println!(
+            "native_decode_mid_flight_manager_solo_equivalence_admission: req={req} prompt_len={} \
+             gen_target={} admitted_at_step={:?} finished_at_step={:?}",
+            lens[req], gen_targets[req], admitted_at[req], finished_at[req]
+        );
+    }
+    if mid_flight_admissions == 0 {
+        bail!(
+            "manager mid-flight gate is worthless: every request was admitted at step 0 (no row \
+             was backfilled into a freed slot while peers kept decoding). Increase the prompt \
+             count or reduce --mid-flight-batch."
+        );
+    }
+
+    // Assert every request's manager-produced stream is byte-identical to solo.
+    let mut all_match = true;
+    for req in 0..requests {
+        let solo = &solo_streams[req];
+        let batched = completed[req]
+            .as_ref()
+            .with_context(|| format!("manager mid-flight request {req} never finished"))?;
+        let matches = solo == batched;
+        all_match &= matches;
+        println!(
+            "native_decode_mid_flight_manager_solo_equivalence_row: req={req} prompt_len={} \
+             admitted_at_step={:?} matches_solo={matches} batch_stream={batched:?}",
+            lens[req], admitted_at[req]
+        );
+        if !matches {
+            println!(
+                "native_decode_mid_flight_manager_solo_equivalence_detail: req={req} solo={solo:?} \
+                 batch={batched:?}"
+            );
+        }
+    }
+    println!(
+        "native_decode_mid_flight_manager_solo_equivalence_result: requests={requests} \
+         batch={batch} mid_flight_admissions={mid_flight_admissions} all_rows_match_solo={all_match}"
+    );
+    if !all_match {
+        bail!(
+            "manager mid-flight solo-equivalence FAILED: a row admitted into a recycled slot by \
+             the manager diverged from its solo batch-1 stream — the manager wiring leaked stale \
+             KV, mask, or position across the admission boundary"
         );
     }
     Ok(())
@@ -2439,6 +3067,13 @@ fn main() -> Result<()> {
             device,
         );
     }
+    if args.ongpu_argmax_bench {
+        return run_ongpu_argmax_bench(
+            &args,
+            args.model.as_deref().expect("validated model argument"),
+            device,
+        );
+    }
     let tokenizer_path = if args.synthetic {
         fixture_path("tiny-gemma4-assistant").join("tokenizer.json")
     } else {
@@ -2535,6 +3170,17 @@ fn main() -> Result<()> {
             .as_deref()
             .expect("validated model argument")
             .to_path_buf();
+        if args.mid_flight_via_manager {
+            return run_native_decode_mid_flight_manager_solo_equivalence(
+                &model_dir,
+                device.clone(),
+                args.decode_precision.into(),
+                &tokenizer,
+                &prompt_spec,
+                args.mid_flight_batch,
+                args.tokens,
+            );
+        }
         return run_native_decode_mid_flight_solo_equivalence(
             &model_dir,
             device.clone(),

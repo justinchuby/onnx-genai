@@ -1748,9 +1748,30 @@ impl GenAiConfig {
         use onnx_genai_metadata::{LoopStatePair, ModelIoSpec};
 
         let derived = Self::derive_decoder_io_from_graph(graph)?;
-        // Safety gate: only the recurrent-hybrid case the shape-inference path
-        // cannot handle. Pure-dense decoders (no state pairs) keep `io = None`.
-        if derived.state_pairs.is_empty() {
+        // Safety gate: derive only when the graph actually yielded KV ports.
+        //
+        // This used to require a non-empty `state_pairs`, i.e. the recurrent
+        // hybrid case, on the reasoning that pure-dense decoders keep
+        // `io = None` and use the shape-inference path. But the only caller
+        // (`maybe_fill_hybrid_io_from_graph`) runs *after* a declared or
+        // pattern-expanded `io` block has already been established, and returns
+        // early when one exists. So reaching here with a dense graph means the
+        // config produced no port contract at all, and returning `None` does not
+        // preserve a working path — it leaves the model with no KV geometry and
+        // fails the load with "per-layer KV page geometry is unknown".
+        //
+        // That is what blocks DeepSeek-V2 (MLA, #1012): its `genai_config.json`
+        // declares a single `decoder.head_size: 128` and no `model.io`, while its
+        // KV is asymmetric — key head_size 192 (qk_nope 128 + qk_rope 64), value
+        // 128. A scalar cannot express that, but the graph shapes can, and
+        // `kv_cache_bytes_for_tensors` already sums each tensor independently,
+        // so asymmetry needs no new arithmetic once the specs exist.
+        //
+        // Gating on KV ports instead keeps the property that matters: we never
+        // manufacture a geometry. A graph that yields no KV ports still returns
+        // `None` and still fails loudly, rather than loading against a guessed
+        // budget — the failure mode of #947.
+        if derived.kv_inputs.is_empty() || derived.kv_outputs.is_empty() {
             return None;
         }
         let input_names: BTreeSet<&str> = graph.inputs.iter().map(|t| t.name.as_str()).collect();
@@ -1767,6 +1788,10 @@ impl GenAiConfig {
                 update: Some("replace".to_owned()),
             })
             .collect::<Vec<_>>();
+        // A dense decoder has no recurrent state; say so with `None` rather than
+        // an empty list, so downstream cannot read "declared, and empty" as
+        // different from "not applicable".
+        let state_pairs = (!state_pairs.is_empty()).then_some(state_pairs);
         Some(ModelIoSpec {
             sequence_source: None,
             kv_ownership: None,
@@ -1784,7 +1809,7 @@ impl GenAiConfig {
             cross_kv_inputs: None,
             cross_kv_outputs: None,
             kv_update: None,
-            state_pairs: Some(state_pairs),
+            state_pairs,
             optional_inputs: std::collections::BTreeMap::new(),
             static_cache: None,
         })

@@ -105,7 +105,7 @@ file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
 description = "1x1 pointwise Conv with weight > E-core L1 (64KB) and spatial reuse N <= IC*6 bypasses BNNS for direct cblas_sgemm. Apple-only: there is no BNNS to bypass elsewhere."
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SDPA — aarch64
+# SDPA — aarch64 and x86
 # ═══════════════════════════════════════════════════════════════════════════════
 
 [[claim]]
@@ -113,10 +113,20 @@ op = "SDPA"
 variant = "default"
 platform = "aarch64"
 minimum_tier = "tier2"
-counter = "SDPA_NEON_TEST_HITS"
+counter = "SDPA_SIMD_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/sdpa.rs"
 description = "SDPA uses NEON-accelerated dot/axpy on aarch64"
-# Proves: sdpa_dispatcher_reaches_neon_on_aarch64
+# Proves: sdpa_dispatcher_reaches_simd_path
+
+[[claim]]
+op = "SDPA"
+variant = "default"
+platform = "x86_64"
+minimum_tier = "tier2"
+counter = "SDPA_SIMD_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/sdpa.rs"
+description = "SDPA uses AVX2+FMA dot/axpy on x86 when has_simd_x86(); pre-AVX2 hosts fall back to the scalar oracle"
+# Proves: sdpa_dispatcher_reaches_simd_path
 
 [[claim]]
 op = "SDPA"

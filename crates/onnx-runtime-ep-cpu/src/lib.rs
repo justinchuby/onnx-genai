@@ -29,6 +29,7 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod backend;
+pub mod core_topology;
 pub mod decode_affinity;
 pub mod decode_numa;
 pub mod decode_spmd;
@@ -39,6 +40,7 @@ pub mod nchwc_layout;
 pub mod optimizer;
 pub mod provider;
 pub mod strided;
+pub mod task_runtime;
 mod trace;
 pub mod weight_offload;
 
@@ -72,6 +74,68 @@ pub use kernels::matmul_nbits::bound_process_to_decode_budget;
 pub use kernels::matmul_nbits::set_decode_thread_budget;
 pub use kernels::matmul_nbits::with_decode_pool_scope;
 pub use kernels::matmul_nbits::{
-    matmul_nbits_decode_caches_dequant_f32, resident_dequant_f32_cache_bytes,
-    set_resident_dequant_f32_cache_enabled,
+    matmul_nbits_decode_caches_dequant_f32, matmul_nbits_resident_side_cache_bytes,
+    mlas_sqnbit_packed_live_bytes, resident_dequant_f32_cache_bytes,
+    set_mlas_sqnbit_packing_enabled, set_resident_dequant_f32_cache_enabled,
 };
+// #1056: a resident, session-lifetime, weight-scaled buffer must be reportable
+// in bytes. The entry-count accessor stays for the benchmarks that assert reuse.
+pub use kernels::group_query_attention::{present_inplace_count, present_inplace_half_count};
+pub use kernels::matmul::weight_transpose_cache_bytes;
+// #1056: the transpose cache is now *governed*, not just reported: the plan
+// budgets `weight_transpose_cache_predicted_bytes` and, when it does not fit,
+// declines it via `set_weight_transpose_cache_enabled` (kernels then transpose
+// per call and retain nothing).
+pub use kernels::matmul::{
+    set_weight_transpose_cache_enabled, weight_transpose_cache_predicted_bytes,
+};
+// #1056: the per-kernel `MatMulPrepack::dense` widened-f32 cache is the fourth
+// resident, weight-scaled buffer brought under the plan. The plan budgets
+// `matmul_dense_cache_predicted_bytes` and, when it does not fit, declines it via
+// `set_matmul_dense_cache_enabled` (kernels then widen per call and retain
+// nothing, byte-identical output).
+pub use kernels::matmul::{matmul_dense_cache_predicted_bytes, set_matmul_dense_cache_enabled};
+// #1133: the QLinearMatMul per-thread `i32` accumulator scratch was bounded by a
+// per-buffer constant but parked on every worker thread, so the real ceiling was
+// `32 MiB x threads`. It is now a process-wide, declinable budget: the plan
+// budgets `qlinear_accumulator_budget_predicted_bytes` and declines it via
+// `set_qlinear_accumulator_budget_admitted` (kernels then reallocate per call,
+// byte-identical). The constant-`B` MLAS pre-pack (`packed_b`, ungoverned since
+// `ac394fd6`) is the second buffer in the same kernel brought under the plan.
+pub use kernels::qlinear_matmul::{
+    qlinear_accumulator_budget_predicted_bytes, qlinear_accumulator_live_bytes,
+    qlinear_accumulator_process_cap_bytes, qlinear_packed_b_live_bytes,
+    qlinear_packed_b_predicted_bytes, set_qlinear_accumulator_budget_admitted,
+    set_qlinear_accumulator_process_cap_bytes, set_qlinear_packed_b_enabled,
+};
+
+#[cfg(test)]
+mod feature_default_guard {
+    /// `mlas` must stay off by default.
+    ///
+    /// The vendored MLAS kernels are a research/reference arm, not what ships.
+    /// This matters beyond a build flag: `bench_generic` used to *require* the
+    /// feature, so every published A/B ratio measured the reference arm while
+    /// being read as a production number, and the production pure-Rust softmax
+    /// turned out to be about 9x ORT rather than the ~1.0 the tables showed.
+    /// If a default build ever links MLAS again, the same class of mistake
+    /// becomes possible again, so fail loudly here.
+    /// Deliberately a *runtime* assert over `cfg!`, not a `const` block.
+    /// Cargo features are additive and indistinguishable at `cfg` time, so a
+    /// compile-time assert cannot tell "`mlas` became a default" from "`mlas`
+    /// was explicitly requested" - it fires on both, and CI's MLAS reference
+    /// lanes (`--features mlas` for `kernels::moe::` and
+    /// `kernels::qlinear_matmul::`) then fail to *compile* the test target.
+    /// As a runtime test it only runs in the default-feature build, which is
+    /// exactly the configuration whose feature set it is policing.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn mlas_is_not_a_default_feature() {
+        assert!(
+            !cfg!(feature = "mlas"),
+            "this test runs in a default-feature build, so `mlas` being on means \
+             it was added to the crate's default features: production would then \
+             ship MLAS and every benchmark arm label would be wrong"
+        );
+    }
+}

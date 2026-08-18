@@ -24,7 +24,8 @@ use crate::pipeline_cache::{
 };
 use crate::processors::build_processor_chain;
 use crate::{
-    EngineDecodeBackend, GeneratePrompt, GenerateRequest, GenerateResult, GenerateTokenCallback,
+    EngineDecodeBackend, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
+    GenerateTokenCallback, StopSequence,
 };
 use anyhow::Context;
 use onnx_genai_kv::{PagedKvCache, PrefixCache, SequenceId};
@@ -45,6 +46,7 @@ mod flat_autoregressive;
 mod iterative;
 mod nested_autoregressive;
 mod paged_decode;
+mod prefix_reuse;
 mod routing;
 mod schedulers;
 #[cfg(feature = "native-backend")]
@@ -234,6 +236,9 @@ pub struct PipelineEngine {
     memory_strategy_plan: MemoryStrategyPlan,
     plan: PipelinePlan,
     decode_backend: EngineDecodeBackend,
+    generation_defaults: Option<onnx_genai_metadata::GenerationDefaults>,
+    max_sequence_length: Option<usize>,
+    eos_token_ids: Vec<TokenId>,
     /// Autoregressive decode state; `None` for non-autoregressive pipelines
     /// (single-pass, iterative/diffusion) which produce tensors, not tokens.
     decoder_state: Option<DecodeState>,
@@ -252,6 +257,13 @@ pub struct PipelineEngine {
     /// Only used when the decoder's KV cannot be paged; the paged cache below
     /// supersedes it, because it holds many prefixes instead of one.
     retained: Option<RetainedContext>,
+    /// Native decoder retained across sequential requests. Its CUDA KV bindings
+    /// stay device-resident in their original dtype (including BF16); `retained`
+    /// identifies the exact token prefix those bindings contain.
+    native_retained_decoder: Option<Box<dyn PipelineDecoderComponent>>,
+    /// Maximum suffix tokens sent through one native prefill graph invocation.
+    /// Declared by `model.runtime_configurable.chunked_prefill`.
+    prefill_chunk_size: Option<usize>,
     /// Paged KV for the decoder, when its `present.*` outputs describe a layout
     /// the page table can address.
     paged: Option<PipelinePagedKv>,
@@ -555,9 +567,49 @@ fn pipeline_metadata_max_len(directory: &onnx_genai_ort::PipelineModelDirectory)
     {
         return Some(len);
     }
+
     onnx_genai_genai_config::find_in_dir(&directory.root)
         .and_then(|path| onnx_genai_genai_config::load(&path).ok())
         .and_then(|config| config.max_sequence_length())
+}
+
+fn pipeline_metadata_prefill_chunk_size(
+    directory: &onnx_genai_ort::PipelineModelDirectory,
+) -> Option<usize> {
+    directory
+        .metadata_path
+        .as_ref()
+        .and_then(|path| onnx_genai_metadata::load_metadata(path).ok())
+        .and_then(|metadata| metadata.model)
+        .and_then(|model| model.runtime_configurable)
+        .and_then(|runtime| runtime.chunked_prefill)
+        .and_then(|chunked| chunked.chunk_size)
+        .filter(|size| *size > 0)
+}
+
+fn pipeline_metadata_generation_defaults(
+    directory: &onnx_genai_ort::PipelineModelDirectory,
+) -> Option<onnx_genai_metadata::GenerationDefaults> {
+    directory
+        .metadata_path
+        .as_ref()
+        .and_then(|path| onnx_genai_metadata::load_metadata(path).ok())
+        .and_then(|metadata| metadata.generation)
+}
+
+fn pipeline_metadata_eos_token_ids(
+    directory: &onnx_genai_ort::PipelineModelDirectory,
+) -> Vec<TokenId> {
+    directory
+        .metadata_path
+        .as_ref()
+        .and_then(|path| onnx_genai_metadata::load_metadata(path).ok())
+        .and_then(|metadata| metadata.tokens)
+        .and_then(|tokens| tokens.eos_token_id)
+        .into_iter()
+        .flatten()
+        .filter_map(|id| TokenId::try_from(id).ok())
+        .collect()
 }
 
 /// Build the native device-KV [`PipelineDecoderComponent`] for `decoder`, loading
@@ -743,6 +795,34 @@ impl PipelineEngine {
         self.decode_backend
     }
 
+    /// Model-authored sampling defaults declared by the pipeline package.
+    pub fn generation_defaults(&self) -> Option<&onnx_genai_metadata::GenerationDefaults> {
+        self.generation_defaults.as_ref()
+    }
+
+    /// Effective context limit for a request, combining the package metadata
+    /// with an explicit per-request override.
+    pub fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
+        options.max_context.or(self.max_sequence_length)
+    }
+
+    /// Execution-provider placement reported by the loaded component sessions.
+    pub fn execution_provider_status(&self) -> String {
+        let mut summaries = self
+            .models
+            .sessions
+            .values()
+            .map(|session| session.execution_provider_status().summary())
+            .collect::<Vec<_>>();
+        summaries.sort();
+        summaries.dedup();
+        if summaries.is_empty() {
+            "native".to_string()
+        } else {
+            summaries.join("; ")
+        }
+    }
+
     /// Load a pipeline with explicit session options, chiefly to pin the
     /// execution provider.
     ///
@@ -816,6 +896,10 @@ impl PipelineEngine {
         )?;
         let directory = PipelineModelDirectory::load(pipeline_dir)
             .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {e}"))?;
+        let prefill_chunk_size = pipeline_metadata_prefill_chunk_size(&directory);
+        let generation_defaults = pipeline_metadata_generation_defaults(&directory);
+        let max_sequence_length = pipeline_metadata_max_len(&directory);
+        let eos_token_ids = pipeline_metadata_eos_token_ids(&directory);
         let model_weights_bytes =
             directory
                 .model_paths
@@ -991,6 +1075,13 @@ impl PipelineEngine {
         // pass 0 bytes and thus always report admitted).
         #[cfg(feature = "native-backend")]
         onnx_runtime_ep_cpu::set_resident_dequant_f32_cache_enabled(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
+        // #1027: same admission verdict governs the int4 accuracy_level=0 MLAS
+        // SQNBit packed buffer (folded into `resident_f32_cache_bytes`); when
+        // declined the kernel keeps the borrowed zero-copy int4 path.
+        #[cfg(feature = "native-backend")]
+        onnx_runtime_ep_cpu::set_mlas_sqnbit_packing_enabled(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
         #[cfg(all(feature = "cuda", feature = "native-backend"))]
@@ -1213,6 +1304,9 @@ impl PipelineEngine {
                 PipelineBackend::Ort => EngineDecodeBackend::Ort,
                 PipelineBackend::Native => EngineDecodeBackend::Native,
             },
+            generation_defaults,
+            max_sequence_length,
+            eos_token_ids,
             decoder_state,
             tokenizer_component,
             fixed_state_budget_bytes,
@@ -1221,6 +1315,8 @@ impl PipelineEngine {
             )),
             memoizable_components,
             retained: None,
+            native_retained_decoder: None,
+            prefill_chunk_size,
             paged,
             native_device: config.native_device.clone(),
             native_prompt_sessions: RefCell::new(BTreeMap::new()),

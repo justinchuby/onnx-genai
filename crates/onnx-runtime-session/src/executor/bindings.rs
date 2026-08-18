@@ -30,6 +30,62 @@ pub(super) fn is_planned_workspace_node(node: &onnx_runtime_ir::Node) -> bool {
             ))
 }
 
+/// The justification for an upper bound applied to an otherwise-unresolved
+/// dimension during prepare-only workspace planning. Both variants are a
+/// *provable* ceiling on the dim's real extent, so reserving against them is
+/// correct by construction for a *reservation* (which needs "enough", not
+/// "exact"); a value that cannot be exceeded can never under-reserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AxisBound {
+    /// The symbol carries an explicit configured maximum (`max_seq_len`-style
+    /// declared ceiling on the axis); the real extent can never exceed it.
+    ConfiguredMax(usize),
+    /// A recognized context/sequence axis bounded by the physically-allocated
+    /// KV capacity established for this prepare call. Even a capacity-padded KV
+    /// tensor cannot exceed its own allocation, so this is a hard ceiling.
+    KvCapacity(usize),
+}
+
+impl AxisBound {
+    pub(super) fn extent(self) -> usize {
+        match self {
+            AxisBound::ConfiguredMax(n) | AxisBound::KvCapacity(n) => n,
+        }
+    }
+}
+
+/// Outcome of resolving one planned-workspace node input shape for prepare-only
+/// reservation. [`Self::Exact`] means every dim resolved by exact substitution
+/// (the ONLY outcome for graphs that already resolved before this change — so
+/// their reservations stay byte-identical). [`Self::Bounded`] means at least one
+/// context/sequence-axis dim was unresolved and reserved against a provable
+/// upper bound; the remaining outcome — unresolved *and* unbounded — is a hard
+/// error, never a silent guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PlannedInputShape {
+    Exact(Vec<usize>),
+    Bounded {
+        dims: Vec<usize>,
+        /// `(axis, symbol, applied bound)` for each over-reserved dim.
+        applied: Vec<(usize, SymbolId, AxisBound)>,
+    },
+}
+
+impl PlannedInputShape {
+    #[cfg(test)]
+    pub(super) fn dims(&self) -> &[usize] {
+        match self {
+            PlannedInputShape::Exact(dims) | PlannedInputShape::Bounded { dims, .. } => dims,
+        }
+    }
+
+    pub(super) fn into_dims(self) -> Vec<usize> {
+        match self {
+            PlannedInputShape::Exact(dims) | PlannedInputShape::Bounded { dims, .. } => dims,
+        }
+    }
+}
+
 /// Merge a per-node workspace requirement into the running peak for its
 /// lifetime class, keeping the largest byte count and the strictest alignment.
 fn merge_workspace_peak(peak: &mut WorkspaceRequirement, requirement: WorkspaceRequirement) {
@@ -41,6 +97,288 @@ fn merge_workspace_peak(peak: &mut WorkspaceRequirement, requirement: WorkspaceR
 }
 
 impl Executor {
+    fn constant_i64_values(&self, value: ValueId) -> Option<Vec<i64>> {
+        if let Some(WeightRef::Inline(tensor)) = self.graph.initializers.get(&value) {
+            return match tensor.dtype {
+                DataType::Int64 => onnx_runtime_ir::read_vec_le::<i64>(&tensor.data).ok(),
+                DataType::Int32 => onnx_runtime_ir::read_vec_le::<i32>(&tensor.data)
+                    .ok()
+                    .map(|values| values.into_iter().map(i64::from).collect()),
+                _ => None,
+            };
+        }
+        let producer = self.graph.value(value).producer?;
+        let node = self.graph.node(producer);
+        if !node.domain.is_empty() || node.op_type != "Constant" {
+            return None;
+        }
+        if let Some(values) = node.attr("value_ints").and_then(Attribute::as_ints) {
+            return Some(values.to_vec());
+        }
+        match node.attr("value") {
+            Some(Attribute::Tensor(tensor)) if tensor.dtype == DataType::Int64 => {
+                onnx_runtime_ir::read_vec_le::<i64>(&tensor.data).ok()
+            }
+            Some(Attribute::Tensor(tensor)) if tensor.dtype == DataType::Int32 => {
+                onnx_runtime_ir::read_vec_le::<i32>(&tensor.data)
+                    .ok()
+                    .map(|values| values.into_iter().map(i64::from).collect())
+            }
+            _ => None,
+        }
+    }
+
+    fn normalize_i64_axis(axis: i64, rank: usize) -> Option<usize> {
+        let rank = i64::try_from(rank).ok()?;
+        let axis = if axis < 0 {
+            axis.checked_add(rank)?
+        } else {
+            axis
+        };
+        if (0..rank).contains(&axis) {
+            usize::try_from(axis).ok()
+        } else {
+            None
+        }
+    }
+
+    fn normalize_i64_bound(bound: i64, len: usize) -> Option<i64> {
+        let len = i64::try_from(len).ok()?;
+        let bound = if bound < 0 {
+            bound.checked_add(len)?
+        } else {
+            bound
+        };
+        Some(bound.clamp(0, len))
+    }
+
+    fn exact_runtime_i64_vector(
+        &self,
+        value: ValueId,
+        symbols: &HashMap<SymbolId, usize>,
+        depth: usize,
+    ) -> Option<Vec<i64>> {
+        if depth >= 16 {
+            return None;
+        }
+        if let Some(values) = self.constant_i64_values(value) {
+            return Some(values);
+        }
+        let producer = self.graph.value(value).producer?;
+        let node = self.graph.node(producer);
+        match (node.domain.as_str(), node.op_type.as_str()) {
+            ("", "Shape") => {
+                let input = node.inputs.first().copied().flatten()?;
+                let shape = self.exact_runtime_value_shape(input, symbols, depth + 1)?;
+                let rank = i64::try_from(shape.len()).ok()?;
+                let start = node.attr("start").and_then(Attribute::as_int).unwrap_or(0);
+                let end = node.attr("end").and_then(Attribute::as_int).unwrap_or(rank);
+                let start = Self::normalize_i64_bound(start, shape.len())?;
+                let end = Self::normalize_i64_bound(end, shape.len())?;
+                if end < start {
+                    return None;
+                }
+                shape
+                    .get(usize::try_from(start).ok()?..usize::try_from(end).ok()?)?
+                    .iter()
+                    .map(|&dim| i64::try_from(dim).ok())
+                    .collect()
+            }
+            ("", "Sub") => {
+                let lhs = node.inputs.first().copied().flatten()?;
+                let rhs = node.inputs.get(1).copied().flatten()?;
+                let lhs = self.exact_runtime_i64_vector(lhs, symbols, depth + 1)?;
+                let rhs = self.exact_runtime_i64_vector(rhs, symbols, depth + 1)?;
+                let len = lhs.len().max(rhs.len());
+                if !(lhs.len() == len || lhs.len() == 1) || !(rhs.len() == len || rhs.len() == 1) {
+                    return None;
+                }
+                (0..len)
+                    .map(|i| {
+                        let a = lhs[if lhs.len() == 1 { 0 } else { i }];
+                        let b = rhs[if rhs.len() == 1 { 0 } else { i }];
+                        a.checked_sub(b)
+                    })
+                    .collect()
+            }
+            _ => None,
+        }
+    }
+
+    fn broadcast_shapes(lhs: &[usize], rhs: &[usize]) -> Option<Vec<usize>> {
+        let rank = lhs.len().max(rhs.len());
+        let mut out = Vec::with_capacity(rank);
+        for i in 0..rank {
+            let a = lhs
+                .len()
+                .checked_sub(i + 1)
+                .and_then(|axis| lhs.get(axis))
+                .copied()
+                .unwrap_or(1);
+            let b = rhs
+                .len()
+                .checked_sub(i + 1)
+                .and_then(|axis| rhs.get(axis))
+                .copied()
+                .unwrap_or(1);
+            let dim = match (a, b) {
+                (a, b) if a == b => a,
+                (1, b) => b,
+                (a, 1) => a,
+                _ => return None,
+            };
+            out.push(dim);
+        }
+        out.reverse();
+        Some(out)
+    }
+
+    fn exact_runtime_value_shape(
+        &self,
+        value: ValueId,
+        symbols: &HashMap<SymbolId, usize>,
+        depth: usize,
+    ) -> Option<Vec<usize>> {
+        if let Some(shape) = self
+            .value_shapes
+            .get(&value)
+            .and_then(|shape| substitute(shape, symbols))
+        {
+            return Some(shape);
+        }
+        if depth >= 16 {
+            return None;
+        }
+        let producer = self.graph.value(value).producer?;
+        let node = self.graph.node(producer);
+        match (node.domain.as_str(), node.op_type.as_str()) {
+            ("", "Cast" | "CastLike" | "Identity" | "CumSum") => {
+                let input = node.inputs.first().copied().flatten()?;
+                self.exact_runtime_value_shape(input, symbols, depth + 1)
+            }
+            ("", "Unsqueeze") => {
+                let input = node.inputs.first().copied().flatten()?;
+                let mut shape = self.exact_runtime_value_shape(input, symbols, depth + 1)?;
+                let axes = if let Some(axes) = node.attr("axes").and_then(Attribute::as_ints) {
+                    axes.to_vec()
+                } else {
+                    let axes = node.inputs.get(1).copied().flatten()?;
+                    self.constant_i64_values(axes)?
+                };
+                let output_rank = shape.len().checked_add(axes.len())?;
+                let mut axes = axes
+                    .into_iter()
+                    .map(|axis| Self::normalize_i64_axis(axis, output_rank))
+                    .collect::<Option<Vec<_>>>()?;
+                axes.sort_unstable();
+                axes.dedup();
+                if axes.len() != output_rank - shape.len() {
+                    return None;
+                }
+                for axis in axes {
+                    shape.insert(axis, 1);
+                }
+                Some(shape)
+            }
+            ("", "Slice") => {
+                let data = node.inputs.first().copied().flatten()?;
+                let starts = node.inputs.get(1).copied().flatten()?;
+                let ends = node.inputs.get(2).copied().flatten()?;
+                let shape = self.exact_runtime_value_shape(data, symbols, depth + 1)?;
+                let starts = self.exact_runtime_i64_vector(starts, symbols, depth + 1)?;
+                let ends = self.exact_runtime_i64_vector(ends, symbols, depth + 1)?;
+                let axes = match node.inputs.get(3).copied().flatten() {
+                    Some(axes) => self.constant_i64_values(axes)?,
+                    None => (0..i64::try_from(starts.len()).ok()?).collect(),
+                };
+                let steps = match node.inputs.get(4).copied().flatten() {
+                    Some(steps) => self.constant_i64_values(steps)?,
+                    None => vec![1; axes.len()],
+                };
+                if starts.len() != axes.len()
+                    || ends.len() != axes.len()
+                    || steps.len() != axes.len()
+                {
+                    return None;
+                }
+                let mut output = shape.clone();
+                for ((&start, &end), (&axis, &step)) in
+                    starts.iter().zip(&ends).zip(axes.iter().zip(&steps))
+                {
+                    if step <= 0 {
+                        return None;
+                    }
+                    let axis = Self::normalize_i64_axis(axis, shape.len())?;
+                    let start = Self::normalize_i64_bound(start, shape[axis])?;
+                    let end = Self::normalize_i64_bound(end, shape[axis])?;
+                    let len = if end <= start {
+                        0
+                    } else {
+                        let span = usize::try_from(end.checked_sub(start)?).ok()?;
+                        let step = usize::try_from(step).ok()?;
+                        span.div_ceil(step)
+                    };
+                    output[axis] = len;
+                }
+                Some(output)
+            }
+            ("", "And" | "GreaterOrEqual") => {
+                let lhs = node.inputs.first().copied().flatten()?;
+                let rhs = node.inputs.get(1).copied().flatten()?;
+                let lhs = self.exact_runtime_value_shape(lhs, symbols, depth + 1)?;
+                let rhs = self.exact_runtime_value_shape(rhs, symbols, depth + 1)?;
+                Self::broadcast_shapes(&lhs, &rhs)
+            }
+            ("", "Where") => {
+                let condition = node.inputs.first().copied().flatten()?;
+                let x = node.inputs.get(1).copied().flatten()?;
+                let y = node.inputs.get(2).copied().flatten()?;
+                let condition = self.exact_runtime_value_shape(condition, symbols, depth + 1)?;
+                let x = self.exact_runtime_value_shape(x, symbols, depth + 1)?;
+                let y = self.exact_runtime_value_shape(y, symbols, depth + 1)?;
+                let xy = Self::broadcast_shapes(&x, &y)?;
+                Self::broadcast_shapes(&condition, &xy)
+            }
+            ("", "Reshape") => {
+                let data = node.inputs.first().copied().flatten()?;
+                let target = node.inputs.get(1).copied().flatten()?;
+                let data_shape = self.exact_runtime_value_shape(data, symbols, depth + 1)?;
+                let target = self.constant_i64_values(target)?;
+                let data_elements = data_shape
+                    .iter()
+                    .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
+                let mut output = Vec::with_capacity(target.len());
+                let mut infer_axis = None;
+                let mut known_elements = 1usize;
+                for (axis, &dim) in target.iter().enumerate() {
+                    let resolved = match dim {
+                        -1 => {
+                            if infer_axis.replace(axis).is_some() {
+                                return None;
+                            }
+                            1
+                        }
+                        0 => *data_shape.get(axis)?,
+                        n if n > 0 => usize::try_from(n).ok()?,
+                        _ => return None,
+                    };
+                    known_elements = known_elements.checked_mul(resolved)?;
+                    output.push(resolved);
+                }
+                if let Some(axis) = infer_axis {
+                    if known_elements == 0 || !data_elements.is_multiple_of(known_elements) {
+                        return None;
+                    }
+                    output[axis] = data_elements / known_elements;
+                } else if known_elements != data_elements {
+                    return None;
+                }
+                Some(output)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn prepare_mapped_growth(
         &self,
         bytes: u64,
@@ -80,6 +418,118 @@ impl Executor {
         locations
     }
 
+    /// Derive a *provable* upper bound for an unresolved symbolic axis, or
+    /// `None` when no justifiable ceiling exists (in which case the caller must
+    /// fail rather than guess). A reservation needs "enough", not "exact": any
+    /// value the real extent cannot exceed is correct by construction here.
+    ///
+    /// Two — and only two — ceilings are justifiable:
+    /// 1. A recognized context/sequence axis
+    ///    ([`Self::capture_growing_symbols`]) is bounded by the physically
+    ///    allocated KV capacity established for this prepare call (the max
+    ///    concrete extent bound to any growing symbol). This is the true ceiling
+    ///    even when the KV tensor is capacity-padded beyond the model's declared
+    ///    `max_seq_len`, so it is preferred; if the model *also* declares a
+    ///    larger maximum, the larger of the two is taken to never under-reserve.
+    /// 2. Any axis carrying its own configured maximum
+    ///    ([`SymbolConstraints::max`], the `max_seq_len`-style declared ceiling)
+    ///    is bounded by that maximum.
+    ///
+    /// Anything else — an unbound symbol that is neither a known sequence axis
+    /// nor carries a declared maximum — returns `None`: its extent is genuinely
+    /// unknown, and reserving against a guess would silently under-reserve
+    /// (memory corruption surfacing far from here), which is exactly the class
+    /// of bug this planner must refuse to introduce.
+    fn planned_axis_upper_bound(
+        &self,
+        symbol: SymbolId,
+        symbols: &HashMap<SymbolId, usize>,
+    ) -> Option<AxisBound> {
+        let declared_max = self
+            .graph
+            .symbol_constraints
+            .get(&symbol)
+            .and_then(|c| c.max);
+        if self.capture_growing_symbols.contains(&symbol)
+            && let Some(capacity) = self
+                .capture_growing_symbols
+                .iter()
+                .filter_map(|growing| symbols.get(growing).copied())
+                .max()
+        {
+            return Some(AxisBound::KvCapacity(
+                capacity.max(declared_max.unwrap_or(0)),
+            ));
+        }
+        declared_max.map(AxisBound::ConfiguredMax)
+    }
+
+    /// Resolve a planned-workspace node input shape for prepare-only reservation.
+    /// Prefers exact substitution; where a dim is unresolved *because it is a
+    /// context/sequence axis* (or otherwise carries a configured maximum), binds
+    /// it to a provable upper bound and reports the over-reservation. A dim
+    /// unresolved for any *other* reason is a hard error — there the extent is
+    /// genuinely unknown and a guess would under-reserve.
+    pub(super) fn resolve_planned_workspace_input_shape(
+        &self,
+        value: ValueId,
+        symbols: &HashMap<SymbolId, usize>,
+        node_id: NodeId,
+        node: &Node,
+        index: usize,
+    ) -> Result<PlannedInputShape> {
+        if let Some(dims) = self.exact_runtime_value_shape(value, symbols, 0) {
+            return Ok(PlannedInputShape::Exact(dims));
+        }
+        let shape = self.value_shapes.get(&value).ok_or_else(|| {
+            SessionError::Internal(format!(
+                "prepare-only workspace planning has no loader shape for input {index} of \
+                 node {} ('{}::{}')",
+                node_id.0, node.domain, node.op_type
+            ))
+        })?;
+        let mut dims = Vec::with_capacity(shape.len());
+        let mut applied = Vec::new();
+        for (axis, dim) in shape.iter().enumerate() {
+            match dim {
+                Dim::Static(n) => dims.push(*n),
+                Dim::Symbolic(symbol) => {
+                    if let Some(&bound) = symbols.get(symbol) {
+                        dims.push(bound);
+                    } else if let Some(axis_bound) = self.planned_axis_upper_bound(*symbol, symbols)
+                    {
+                        dims.push(axis_bound.extent());
+                        applied.push((axis, *symbol, axis_bound));
+                    } else {
+                        let value_name = self
+                            .graph
+                            .value(value)
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("value#{}", value.0));
+                        let symbol_name = self
+                            .symbol_name(*symbol)
+                            .unwrap_or_else(|| format!("symbol#{}", symbol.0));
+                        return Err(SessionError::Internal(format!(
+                            "prepare-only workspace planning cannot resolve input {index} \
+                             '{value_name}' for node {} ('{}::{}'): axis {axis} is symbolic \
+                             ('{symbol_name}') and unresolved, and is neither a context/sequence \
+                             axis bounded by max_seq_len/KV capacity nor an axis with a configured \
+                             maximum — its extent is genuinely unknown, so reserving against a \
+                             guess would under-reserve",
+                            node_id.0, node.domain, node.op_type
+                        )));
+                    }
+                }
+            }
+        }
+        if applied.is_empty() {
+            Ok(PlannedInputShape::Exact(dims))
+        } else {
+            Ok(PlannedInputShape::Bounded { dims, applied })
+        }
+    }
+
     /// Resolve concrete metadata and reserve kernel workspace without executing
     /// any graph node.
     pub(crate) fn prepare_with_device_bindings(
@@ -88,9 +538,8 @@ impl Executor {
         bindings: &mut [DeviceIoBinding],
     ) -> Result<WorkspaceRequirement> {
         self.workspace_preparation_required = true;
-        let external = self.prepare_external_bindings(bindings)?;
+        let external = self.prepare_external_bindings_mode(bindings, true)?;
         let symbols = self.bind_symbols(inputs, &external)?;
-        let resolved = self.resolve_soft(&symbols);
         // Track one peak per lifetime class: session-persistent and step-scoped
         // scratch live in separate executor slots, so a single peak cannot stand
         // in for both when a graph mixes governed ops (e.g. QMoE + Attention).
@@ -103,28 +552,32 @@ impl Executor {
             if !is_planned_workspace_node(node) {
                 continue;
             }
-            let input_shapes = self.plan[pi]
+            let planned_shapes = self.plan[pi]
                 .inputs
                 .iter()
                 .enumerate()
                 .map(|(index, input)| match input {
-                    None => Ok(Vec::new()),
-                    Some(value) => resolved.get(value).cloned().ok_or_else(|| {
-                        let value_name = self
-                            .graph
-                            .value(*value)
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| format!("value#{}", value.0));
-                        SessionError::Internal(format!(
-                            "prepare-only workspace planning cannot resolve input {index} \
-                             '{value_name}' for node {} ('{}::{}'); its shape is runtime-dependent \
-                             and no exact graph-metadata bound is available",
-                            node_id.0, node.domain, node.op_type
-                        ))
-                    }),
+                    None => Ok(PlannedInputShape::Exact(Vec::new())),
+                    Some(value) => self.resolve_planned_workspace_input_shape(
+                        *value, &symbols, node_id, node, index,
+                    ),
                 })
                 .collect::<Result<Vec<_>>>()?;
+            if std::env::var("ONNX_GENAI_LOG_WORKSPACE_BOUND").is_ok() {
+                for (index, planned) in planned_shapes.iter().enumerate() {
+                    if let PlannedInputShape::Bounded { dims, applied } = planned {
+                        eprintln!(
+                            "[onnx-genai-workspace] node {} ('{}::{}') input {index} \
+                             over-reserved against bounded axis: dims={dims:?} bounds={applied:?}",
+                            node_id.0, node.domain, node.op_type
+                        );
+                    }
+                }
+            }
+            let input_shapes = planned_shapes
+                .into_iter()
+                .map(PlannedInputShape::into_dims)
+                .collect::<Vec<_>>();
             let constant_inputs = self.plan[pi]
                 .inputs
                 .iter()
@@ -652,6 +1105,31 @@ impl Executor {
         &self,
         bindings: &mut [DeviceIoBinding],
     ) -> Result<ExternalBindings> {
+        self.prepare_external_bindings_mode(bindings, false)
+    }
+
+    /// As [`Self::prepare_external_bindings`], but when `plan_capacity` is set the
+    /// input value shapes bind a growing/logical-exposing input at its *physical
+    /// capacity* rather than its current logical prefix.
+    ///
+    /// This is used only by prepare-only workspace planning
+    /// ([`Self::prepare_with_device_bindings`]), which never executes a node: a
+    /// governed kernel workspace must be reserved for the *maximum* extent an
+    /// input reaches across the session, not the logical prefix bound at
+    /// preparation time. A binding that exposes its logical prefix
+    /// ([`DeviceIoBinding::exposes_logical_input_shape`]) — e.g. a growing-KV
+    /// decode cache that cannot be frozen to capacity — otherwise binds its
+    /// sequence symbol to the current (0/prefill) length, so the reserved
+    /// SessionPersistent decode workspace is sized far below what steady-state
+    /// decode consumes and later steps fault on the workspace invariant (#1179).
+    /// Sizing against physical capacity over-reserves (reserve ≥ consume), which
+    /// is exactly correct for a reservation; execution still binds the logical
+    /// prefix and fits under it.
+    pub(super) fn prepare_external_bindings_mode(
+        &self,
+        bindings: &mut [DeviceIoBinding],
+        plan_capacity: bool,
+    ) -> Result<ExternalBindings> {
         let mut external = ExternalBindings::default();
         for binding in bindings {
             let input_name = binding.input_name().to_string();
@@ -683,7 +1161,11 @@ impl Executor {
                 })?;
                 let value = ExternalValue {
                     dtype,
-                    shape: binding.kernel_input_shape().to_vec(),
+                    shape: if plan_capacity {
+                        binding.physical_shape().to_vec()
+                    } else {
+                        binding.kernel_input_shape().to_vec()
+                    },
                     accepts_subshape: false,
                     ptr,
                     len,
