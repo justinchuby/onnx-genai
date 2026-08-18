@@ -2001,6 +2001,23 @@ mod tests {
     }
 
     #[test]
+    fn interactive_session_preserves_the_requested_native_device() {
+        let args = EngineArgs {
+            backend: EngineDecodeBackend::Native,
+            device: Some(NativeDeviceChoice::Cuda(Some(3))),
+            ..EngineArgs::default()
+        };
+        let settings = interactive::SessionSettings::new(PathBuf::from("models/tiny"), &args);
+
+        let config = settings.to_config();
+        assert_eq!(config.decode_backend, EngineDecodeBackend::Native);
+        assert_eq!(
+            config.native_device,
+            Some(NativeDecodeDevice::Cuda { index: Some(3) })
+        );
+    }
+
+    #[test]
     fn decode_backends_are_named_by_the_engine_not_guessed() {
         assert_eq!(parse_decode_backend("auto"), Ok(EngineDecodeBackend::Auto));
         assert_eq!(parse_decode_backend("ort"), Ok(EngineDecodeBackend::Ort));
