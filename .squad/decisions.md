@@ -156,3 +156,144 @@ The decision does **not** change: speculative decode remains shelved. B\* improv
 Luv completed the real prefill/TTFT A/B for `ONNX_GENAI_MARLIN_M_GT_1=1` versus the portable tiled GEMM path, closing the thread opened by the two prior Gate-3 Marlin entries: “Gate-3 speculative verify remains shelved after Marlin” and “Gate-3 Marlin M>1 opt-in follow-up still NO-GO.” The verdict is **NO-GO to flip the default**: Marlin M>1 stays opt-in.
 
 E2E `profile_native` TTFT showed only marginal-to-neutral qwen2.5-14b-zp movement (**0.976× / 0.988× / 0.999×** Marlin/portable at M=128/512/2048) and neutral-to-worse qwen2.5-7b movement (**1.005× / 1.013× / 1.001×**). Argmax matched every arm, but full-vocab token-0 logprob dumps were not byte-identical (max Δ **0.017** qwen14, **0.168** qwen7), so the silent-default byte-identity bar fails. Treat the Marlin-M>1 vein as mined out: not a spec-decode win, not a prefill/TTFT win, and not eligible for a silent default.
+
+## 2026-08-18 — Wallace small-model and different-architecture GPU probe
+
+### 2026-08-18: Different-architecture GPU probe — qwen3.5 (hybrid linear-attn) + Phi-3.5 + small qwen2.5 regression sanity
+
+**By:** Wallace (inference-engine specialist)
+
+**What (this addendum — the user steer: pivot off qwen2.5 to genuinely DIFFERENT architectures):**
+Regression-sanity re-confirmed the two small qwen2.5 rows below are unchanged (native capture wins:
+0.5b 1053.5 ≥ ORT 572; 1.5b 692.6 ≥ ORT 436 — no regression). Then pivoted to NEW architectures on the
+same H200/GPU7, same fairness pinning (native `ONNX_GENAI_ONGPU_ARGMAX=1`; ORT `ONNX_GENAI_ORT_LIB` →
+`.ort-cuda-1.27` CUDA build + `ONNX_GENAI_EP_FALLBACK=1`; 128 tok, warmups 2, `--steady --decode-skip 1`,
+medians of 5). Worktree `.worktrees/wallace-small-probe` @ `origin/main 774b256c`, measure-only.
+
+**Models probed:**
+| Model | Arch | Export | Native CUDA EP? |
+|---|---|---|---|
+| qwen3.5-2b-text (`.../qwen3.5-2b-text-generic-cpu-1/v1`) | **hybrid linear attn** (18 `linear_attention` + 6 `full_attention`, DeltaNet/mamba-style: `CausalConvWithState`+`LinearAttention` ops, `attn_output_gate`, GQA 8/2, head_dim 256) | int4 weights, **fp32 activations** (generic-cpu) | ✅ loads, runs fully on GPU, **captures** |
+| Phi-3.5-mini-instruct (`.../Phi-3.5-mini-instruct-generic-cpu-2/v2`) | dense GQA, hidden 3072, head 96 | int4-rtn-blk32, fp32 acts | ❌ **native load FAILS — `If` control-flow op unsupported** |
+| qwen3.5-9b (`.../qwen3.5-9b-generic-cpu-2/v2`) | multimodal (embedding+text+vision, `inputs_embeds` path) | int4, fp32 acts | ⚠️ not measured — profile_native harness expects a single decoder .onnx; multimodal split needs the embeds pipeline (harness limitation, not an EP gap) |
+
+**qwen3.5-2b standing row (tok/s, H200, int4-wt/fp32-act, 128 tok, greedy; medians of 5):**
+| Model | native_cap | native_eager (+argmax) | ORT eager | eager-vs-eager | capture-vs-eager | capture uplift |
+|---|--:|--:|--:|:--:|:--:|:--:|
+| qwen3.5-2b hybrid | **100.9** (sd 0.46) | 67.5 (sd 0.96) | 61.2 (sd 4.24, noisy) | 1.10× (overlaps) | **1.65×** (clean) | 1.49× |
+
+**Verdict — qwen3.5 hybrid FLIPS the small-qwen2.5 story, and surfaces genuinely NEW levers:**
+- **Native runs the entire hybrid graph (linear-attn conv + recurrent-state + full-attn) on GPU and
+  captures it cleanly** (`captures replays fallbacks=0`), eager 67.5 → capture 100.9. **ORT CUDA EP
+  CANNOT keep the linear-attention ops on GPU** — it inserts **25 Memcpy nodes** and falls nodes to CPU
+  (log: "25 Memcpy nodes added… might be unable to run CUDA graph"; strict-no-fallback init *errors*,
+  only runs with EP fallback). So ORT is structurally handicapped on qwen3.5 (like the DeepSeek-QMoE
+  finding, milder): ~61 tok/s, high variance. Native beats ORT in BOTH framings here (eager 1.10×
+  within noise; capture 1.65× clean) — UNLIKE qwen2.5 where native eager LOST. Root cause of the flip:
+  ORT lacks GPU kernels for the `LinearAttention`/`CausalConvWithState` contrib ops; native has them.
+- **NEW LEVER #1 — the linear-attention path is NOT the bottleneck (it's efficient).** nsys on native
+  eager: `linear_attention_f32` = 5.8% + `causal_conv_with_state_f32` = 0.8% (≈6.6% combined). The repo's
+  linear-attn kernels are cheap. So the "linear-attention decode inefficiency" the mandate worried about
+  does NOT exist here — that path is well-optimized.
+- **NEW LEVER #2 (the real headroom) — this export runs entirely in FP32.** Every kernel carries the
+  `_f32` suffix (vs qwen2.5's `_f16`). The ONNX export is int4-weight / **fp32-activation** (generic-cpu
+  profile: all KV, conv_state, recurrent_state, logits are `FLOAT`). fp32 activations ≈ 2× the
+  bandwidth/FLOPs of fp16 on the compute-bound parts. A proper fp16/CUDA-profile export (or on-the-fly
+  fp16 activation casting) is a large, unclaimed lever the qwen2.5 (fp16 cuda-gpu-4) campaign never saw.
+- **NEW LEVER #3 — the full-attention layers use an unoptimized REFERENCE kernel.** `gqa_attention_reference_f32`
+  is the **#1 hotspot at 31.2%** (avg 328 µs/call). head_dim=256 falls outside the fused
+  `gqa_decode_attention_f16` fast path qwen2.5 (head 128/64) hits → reference fallback. Extending the
+  fused GQA decode kernel to head_size=256 (+ fp16) would kill ~⅓ of decode time.
+- **NEW LEVER #4 — giant vocab lm_head.** vocab **248320** (1.6× qwen2.5's 152k); the lm_head GEMV
+  `matmul_nbits_gemv_int8_f32` = 730 µs/step, 11.6%, in fp32. On-GPU argmax already applied; fp16 + a
+  wider-K GEMV would help.
+- **Support-gap finding (Phi-3.5-mini generic-cpu):** native decode backend does not support the **`If`**
+  control-flow op present in this export (all its other ops — MatMulNBits, GroupQueryAttention,
+  SkipSimplifiedLayerNorm, Sigmoid — are supported). Same control-flow class that blocks ORT CUDA-graph
+  on Phi. Needs `ONNX_GENAI_BACKEND=ort` to run, or native `If`/subgraph support to be added.
+
+**Bottom line for the campaign:** qwen3.5 hybrid is a NEW native win vs ORT (ORT can't place linear-attn
+on GPU; native runs + captures it, 1.65×). But it also exposes that our qwen3.5 support currently runs
+the *generic-cpu fp32 export* — the biggest untapped lever is an fp16 path + a fused head_size=256 GQA
+decode kernel (kills the 31% reference-attention hotspot). Linear-attention itself is already efficient.
+Owners: fp16-activation path + head256 fused GQA decode → CUDA-kernel owner (Leon/Deckard), reviewer-gated.
+
+---
+
+### 2026-08-18: Small-model (qwen2.5-0.5b / 1.5b) native-vs-ORT GPU decode probe — the launch-bound regime
+
+**By:** Wallace (inference-engine specialist)
+
+**What:**
+Benchmarked two never-measured small Foundry Local CUDA-GPU models — qwen2.5-0.5b-instruct
+and qwen2.5-1.5b-instruct int4 (`~/.foundry/cache/models/Microsoft/qwen2.5-{0.5b,1.5b}-instruct-cuda-gpu-4/v4`)
+— base decode, single-stream greedy, on an idle H200. Same fairness-correct methodology as the
+now.md standing table: native `ONNX_GENAI_ONGPU_ARGMAX=1`; ORT pinned to the genuine CUDA build
+(`ONNX_GENAI_ORT_LIB=$ORT_ROOT/lib/libonnxruntime.so` = `.ort-cuda-1.27`, `ONNX_GENAI_EP_FALLBACK=1`
+— no conda CPU false baseline; CUDAExecutionProvider confirmed). 128 tok, warmups 2, `--steady
+--decode-skip 1`, medians of 5 rounds (`--runs 3` each). Fresh worktree off `origin/main 774b256c`.
+GPU pinned `CUDA_VISIBLE_DEVICES=7` (nvidia-smi: all 8 idle first).
+
+**Standing-table rows (tok/s, H200, int4, 128 tok, greedy; medians of 5, sd in-line):**
+
+| Model | native_cap (capture) | native_eager (+argmax) | ORT eager | eager-vs-eager (ne/oe) | capture-vs-eager (nc/oe) | capture uplift (nc/ne) |
+|---|---:|---:|---:|:--:|:--:|:--:|
+| qwen2.5-0.5b | **1053.5** (sd 0.97) | 321.5 (sd 1.22) | 572.0 (sd 6.88) | **0.56×** (ORT faster) | **1.84×** | **3.28×** |
+| qwen2.5-1.5b | **692.6** (sd 1.02) | 324.8 (sd 0.89) | 435.7 (sd 1.45) | **0.75×** (ORT faster) | **1.59×** | **2.13×** |
+
+Overlap checks clean: capture-vs-eager min_native_cap > max_ort_eager on both (1053>585, 692>436).
+eager-vs-eager decisively ORT: min_ort_eager > max_native_eager on both (568>323, 432>326).
+
+**Verdict:**
+- **Deployment default (graph capture ON, our shipping config): native WINS big — 1.84× (0.5b) and
+  1.59× (1.5b) over ORT's best (eager).** The capture moat is *largest in the small regime*: uplift
+  3.28× on 0.5b and 2.13× on 1.5b, vs only ~1.5× on the 7b/14b. So native has HEADROOM here and still
+  beats ORT under the deployment default. This is the strongest capture win in the whole campaign.
+- **BUT eager-vs-eager (pure per-kernel), native LOSES to ORT on both small models — 0.56× (0.5b) and
+  0.75× (1.5b).** This is a real, honest regime where our per-kernel/per-step path is behind ORT. It
+  extends the pattern from the dense trio (native eager also lost on Phi 0.85× and qwen7b 0.77×; only
+  qwen14b-zp won eager 1.19×) — and the smaller the model, the WORSE native eager looks relative to ORT.
+
+**Why (root cause — a NEW headroom lever, quantified):**
+Native eager decode is **fixed-per-step-overhead (launch/host-sync) bound** in the small regime:
+- native_eager throughput is **model-size-INVARIANT**: 321.5 tok/s (0.5b) vs 324.8 tok/s (1.5b) — a
+  flat **~3.1 ms/step floor** across a 3× model-size change. A compute-bound path would scale with size.
+  ORT eager DOES scale (1.75 → 2.30 ms/step) and native_cap DOES scale (0.95 → 1.44 ms/step) — only
+  native *eager* is pinned. That flat floor is the signature of fixed per-step overhead dominating.
+- **nsys (`--cuda-graph-trace=node`) on 0.5b native eager confirms it:** total GPU kernel busy ≈ 101 ms
+  over 128 decode steps = **~0.79 ms/step GPU-active vs 3.11 ms/step wall → only ~25% GPU-active**,
+  ~75% is host-side gaps between launches. No single kernel dominates (largest is the lm_head
+  `matmul_nbits_gemv_f16_scales_f16_pipe` at 79.7 µs/step = ~10% of GPU time); it's **death-by-many-
+  small-launches** — ~48 `matmul_nbits_gemv` + 48 `skip_rmsnorm` + 24 attention kernels per step, each
+  2–5 µs, so per-launch overhead (~2 µs) rivals the kernel itself. This is precisely the regime CUDA
+  graph capture was built for: capture collapses the ~2.16 ms/step of host launch/sync overhead
+  (3.11 → 0.95 ms/step on 0.5b), landing native_cap near the GPU-active floor.
+
+**The lever:** native's eager per-step overhead (~2 ms fixed, ~75% of a small-model step) is the gap.
+Options if we ever want eager competitive on small models (NOT needed for the deployment claim, which
+is capture-ON): reduce host-side launch overhead — kernel fusion (fuse the per-layer gemv/rmsnorm
+chains further), fewer host round-trips / stream syncs per step, or a lighter dispatch path. But the
+honest framing: **for shipping (capture ON) native already wins 1.6–1.8× and this is the biggest
+capture headroom we've measured — the small regime is a native STRENGTH via capture, and an eager
+WEAKNESS via per-step overhead.** Same architectural story as the dense/ORT-fairness decomposition:
+the moat is graph-capture + on-GPU argmax, not per-kernel eager speed.
+
+**Notes:**
+- Did not pursue the `v4-bs128` 0.5b variant: it's a batch-128 export, irrelevant to this single-
+  stream per-step-overhead question (v4 already gave a decisive result).
+- ORT could not be graph-captured here either (consistent with the 2026-08-18 graph-vs-graph finding:
+  ORT CUDA-graph structurally blocked on these dynamic-KV int4 decode exports) — so ORT's best is eager,
+  which is the column compared. Base decode greedy only; not a spec-decode basis.
+
+**Reproduce:**
+```bash
+source /home/justinchu/onnx-genai/.cudaenv.sh
+export CUDA_VISIBLE_DEVICES=7 ONNX_GENAI_ONGPU_ARGMAX=1 \
+       ONNX_GENAI_ORT_LIB=$ORT_ROOT/lib/libonnxruntime.so ONNX_GENAI_EP_FALLBACK=1
+M=~/.foundry/cache/models/Microsoft/qwen2.5-0.5b-instruct-cuda-gpu-4/v4
+ONNX_GENAI_CUDA_GRAPH=1 target/release/profile_native --model $M --ep cuda --backend native --tokens 128 --warmups 2 --runs 5 --steady --decode-skip 1  # native capture
+ONNX_GENAI_CUDA_GRAPH=0 target/release/profile_native --model $M --ep cuda --backend native --tokens 128 --warmups 2 --runs 5 --steady --decode-skip 1  # native eager
+ONNX_GENAI_CUDA_GRAPH=0 target/release/profile_native --model $M --ep cuda --backend ort    --tokens 128 --warmups 2 --runs 5 --steady --decode-skip 1  # ORT eager
+```
+Worktree `.worktrees/wallace-small-probe` @ `origin/main 774b256c`; profile_native built
+`--features bench-native,bench-ort,cuda`. No source edits, no commits (measure-only). GPU7 returned idle.
