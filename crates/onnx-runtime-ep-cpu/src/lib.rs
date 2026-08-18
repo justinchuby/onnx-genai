@@ -92,3 +92,16 @@ pub use kernels::matmul::{
 // `set_matmul_dense_cache_enabled` (kernels then widen per call and retain
 // nothing, byte-identical output).
 pub use kernels::matmul::{matmul_dense_cache_predicted_bytes, set_matmul_dense_cache_enabled};
+// #1133: the QLinearMatMul per-thread `i32` accumulator scratch was bounded by a
+// per-buffer constant but parked on every worker thread, so the real ceiling was
+// `32 MiB x threads`. It is now a process-wide, declinable budget: the plan
+// budgets `qlinear_accumulator_budget_predicted_bytes` and declines it via
+// `set_qlinear_accumulator_budget_admitted` (kernels then reallocate per call,
+// byte-identical). The constant-`B` MLAS pre-pack (`packed_b`, ungoverned since
+// `ac394fd6`) is the second buffer in the same kernel brought under the plan.
+pub use kernels::qlinear_matmul::{
+    qlinear_accumulator_budget_predicted_bytes, qlinear_accumulator_live_bytes,
+    qlinear_accumulator_process_cap_bytes, qlinear_packed_b_live_bytes,
+    qlinear_packed_b_predicted_bytes, set_qlinear_accumulator_budget_admitted,
+    set_qlinear_accumulator_process_cap_bytes, set_qlinear_packed_b_enabled,
+};
