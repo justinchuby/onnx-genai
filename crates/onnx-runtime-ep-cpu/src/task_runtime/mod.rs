@@ -270,18 +270,29 @@ fn task_range(total: usize, tasks: usize, task: usize) -> (usize, usize) {
     (start, start + len)
 }
 
-/// Runs `body(chunk_index, chunk)` over `data.chunks_mut(chunk)` in parallel.
+/// Runs `body(first_chunk_index, run)` over `data` split into fixed-size chunks,
+/// where each task receives its whole contiguous **run** of chunks at once.
 ///
-/// The common shape in this crate: a `[T]` output split into fixed-size rows,
-/// each written by one thread. `min_chunks_per_task` is the smallest number of
-/// chunks worth handing to another thread.
+/// Use this when the per-call cost is not negligible — an MLAS entry point, a
+/// packing step, anything with a prologue. Splitting `data` into many small
+/// chunks and calling the body once per chunk pays that prologue once per chunk;
+/// this pays it once per task while still giving the runtime many chunks to
+/// balance with.
+///
+/// The run's length is a whole number of chunks except for the last task, whose
+/// final chunk is short when `chunk` does not divide `data.len()`.
 ///
 /// Returns which [`Backend`] served the fan-out.
 ///
 /// # Panics
 ///
 /// Panics if `chunk` is zero, and propagates a panic from `body`.
-pub fn chunks_mut<T, F>(data: &mut [T], chunk: usize, min_chunks_per_task: usize, body: F) -> Backend
+pub fn chunk_runs_mut<T, F>(
+    data: &mut [T],
+    chunk: usize,
+    min_chunks_per_task: usize,
+    body: F,
+) -> Backend
 where
     T: Send,
     F: Fn(usize, &mut [T]) + Sync,
@@ -298,13 +309,37 @@ where
     // slices. The pointer outlives the fan-out because `for_each_range` blocks.
     let base = SendMutPtr(data.as_mut_ptr());
     for_each_range(chunks, min_chunks_per_task.max(1), move |start, end| {
-        for index in start..end {
-            let offset = index * chunk;
-            let this = chunk.min(len - offset);
-            // SAFETY: `offset + this <= len`, and `index` is visited by exactly
-            // one task, so this `&mut` is unique for its lifetime.
-            let slice = unsafe { std::slice::from_raw_parts_mut(base.as_ptr().add(offset), this) };
-            body(index, slice);
+        let offset = start * chunk;
+        let run = (end * chunk).min(len) - offset;
+        // SAFETY: `offset + run <= len`, and `start..end` is visited by exactly
+        // one task, so this `&mut` is unique for its lifetime.
+        let slice = unsafe { std::slice::from_raw_parts_mut(base.as_ptr().add(offset), run) };
+        body(start, slice);
+    })
+}
+
+/// Runs `body(chunk_index, chunk)` over `data.chunks_mut(chunk)` in parallel.
+///
+/// The common shape in this crate: a `[T]` output split into fixed-size rows,
+/// each written by one thread. `min_chunks_per_task` is the smallest number of
+/// chunks worth handing to another thread.
+///
+/// Reach for [`chunk_runs_mut`] instead when the body has a per-call prologue
+/// worth amortising over a task's whole run.
+///
+/// Returns which [`Backend`] served the fan-out.
+///
+/// # Panics
+///
+/// Panics if `chunk` is zero, and propagates a panic from `body`.
+pub fn chunks_mut<T, F>(data: &mut [T], chunk: usize, min_chunks_per_task: usize, body: F) -> Backend
+where
+    T: Send,
+    F: Fn(usize, &mut [T]) + Sync,
+{
+    chunk_runs_mut(data, chunk, min_chunks_per_task, |first, run| {
+        for (offset, piece) in run.chunks_mut(chunk).enumerate() {
+            body(first + offset, piece);
         }
     })
 }
@@ -613,6 +648,34 @@ mod tests {
             chunks_mut(&mut serial, 13, 1, fill);
         }
         assert_eq!(parallel, serial);
+    }
+
+    #[test]
+    fn chunk_runs_are_whole_contiguous_spans() {
+        // The property `chunks_mut` cannot offer: one body call per task, over
+        // the task's entire run, so a per-call prologue is paid once.
+        for (len, chunk) in [(0usize, 4usize), (1, 4), (16, 4), (17, 4), (100_000, 7)] {
+            let mut data = vec![0u32; len];
+            let calls = AtomicUsize::new(0);
+            chunk_runs_mut(&mut data, chunk, 1, |first, run| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                assert!(
+                    run.len() % chunk == 0 || first * chunk + run.len() == len,
+                    "a non-final run of {} is not a whole number of {chunk}-chunks",
+                    run.len()
+                );
+                for (offset, value) in run.iter_mut().enumerate() {
+                    *value = (first * chunk + offset) as u32 + 1;
+                }
+            });
+            let expected: Vec<u32> = (0..len).map(|i| i as u32 + 1).collect();
+            assert_eq!(data, expected, "len {len} chunk {chunk}");
+            let chunks = len.div_ceil(chunk);
+            assert!(
+                calls.load(Ordering::Relaxed) <= chunks.max(1),
+                "len {len} chunk {chunk} called the body more often than there are chunks"
+            );
+        }
     }
 
     #[test]
