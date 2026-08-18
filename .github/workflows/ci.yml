@@ -2,6 +2,17 @@
 # schedule, and manual dispatch. Coverage instrumentation runs where it is
 # informative; Windows ARM64 keeps platform tests but skips coverage because the
 # coverage signal duplicates x64/macOS while owning the critical path.
+#
+# `changes` classifies whether a pull_request/push touched anything other than
+# docs/wiki/site content. When it did not, every Rust job below is skipped
+# rather than run. GitHub reports a skipped job with conclusion "skipped",
+# which counts as passing for required status checks (unlike a workflow that
+# never triggers at all, which would leave a required check pending forever)
+# -- see https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks
+# So "Fast (Linux x86_64)" and "Rust quality" -- the two required checks --
+# still report a conclusion on every PR, just without doing the expensive
+# work when nothing but docs changed. Schedule and workflow_dispatch runs are
+# unaffected: `changes` doesn't run for them, so docs_only stays unset/false.
 name: CI
 
 on:
@@ -25,8 +36,80 @@ env:
   CARGO_LLVM_COV_VERSION: "0.8.7"
 
 jobs:
+  changes:
+    name: Detect change scope
+    runs-on: ubuntu-latest
+    # Only classify pull_request/push diffs. schedule and workflow_dispatch
+    # runs skip this job entirely, so `needs.changes.outputs.docs_only` is
+    # empty for them and every `if: needs.changes.outputs.docs_only != 'true'`
+    # below evaluates true -- full CI, unchanged.
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Classify docs-only vs. code changes
+        id: filter
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          # Defaults to docs_only=false (full CI) on any ambiguity: unknown
+          # event, missing SHAs, an unusable diff range, or an empty diff.
+          # Only an explicit, fully-classified all-docs diff flips it to true.
+          docs_only=false
+
+          is_docs_path() {
+            case "$1" in
+              docs/*|wiki/*|site/*|*.md|*.mdx|*.markdown|LICENSE|NOTICE)
+                return 0 ;;
+              *)
+                return 1 ;;
+            esac
+          }
+
+          files=""
+          case "$EVENT_NAME" in
+            pull_request)
+              if [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+                files="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || true)"
+              fi
+              ;;
+            push)
+              if [ -n "${BEFORE_SHA:-}" ] \
+                && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
+                && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+                files="$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" 2>/dev/null || true)"
+              fi
+              ;;
+          esac
+
+          if [ -n "$files" ]; then
+            docs_only=true
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              if ! is_docs_path "$f"; then
+                docs_only=false
+                break
+              fi
+            done <<< "$files"
+          fi
+
+          echo "Changed files ($EVENT_NAME):"
+          echo "$files"
+          echo "docs_only=$docs_only"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+
   fast-linux:
     name: Fast (Linux x86_64)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -70,6 +153,11 @@ jobs:
           python-version: "3.12"
       - name: Install Python test dependencies
         run: python -m pip install --upgrade numpy onnxscript
+      - name: Native benchmark harness self-test
+        # Needs no GPU, no CUDA toolkit and no runtime package, but it does need
+        # numpy: the defect it guards is a numpy array compared against a list,
+        # so a lane without numpy would skip the only cases that catch it.
+        run: python scripts/benchmark_muse_native_local.py --self-test --require-numpy
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Build Linux offline crates
@@ -140,6 +228,8 @@ jobs:
 
   rust-quality:
     name: Rust quality
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -331,6 +421,8 @@ jobs:
 
   rust-coverage:
     name: Rust coverage (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -440,6 +532,8 @@ jobs:
 
   rust-windows-arm64:
     name: Rust (Windows ARM64)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: windows-11-arm
     env:
       CARGO_TERM_COLOR: always
@@ -531,6 +625,8 @@ jobs:
 
   ep-conformance:
     name: EP conformance (Linux x86_64)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -596,6 +692,8 @@ jobs:
 
   cli-ort:
     name: CLI ORT (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -747,6 +845,8 @@ jobs:
 
   cuda-compile-linux:
     name: CUDA compile (Linux x86_64)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -814,6 +914,8 @@ jobs:
 
   cuda-compile-windows:
     name: CUDA compile (Windows x86_64)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: windows-latest
     env:
       CARGO_TERM_COLOR: always

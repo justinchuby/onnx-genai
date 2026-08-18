@@ -72,4 +72,8 @@ Full pre-compaction history in `history-archive.md`.
 - Reconfirmed the 2026-08-17 dense int4 fairness decomposition by attempting ORT CUDA graph mode on Phi-4-mini, qwen2.5-7b, and qwen2.5-14b-zp.
 - Graph-vs-graph remains unattainable: Phi hard-rejects control flow, qwen7b errors on an unconstructed `ort_value`, and qwen14b-zp accepts graph mode but no-ops due to CPU shape nodes.
 - Eager-vs-eager native/ORT is 0.85× / 0.77× / 1.19×; keep the 1.33× / 1.14× / 1.83× deployment headline only with the architectural capture + on-GPU argmax asterisk.
+## 2026-08-18T15:58:57Z — Different-architecture GPU probe
 
+- Probed qwen3.5-2b hybrid linear-attn, Phi-3.5-mini, and qwen3.5-9b multimodal paths in background, measure-only mode with no commits.
+- Verdict: qwen3.5-2b flips small-qwen2.5 eager framing because native owns GPU kernels/capture for linear-attn ops while ORT falls back; native eager/capture are 1.10×/1.65× vs ORT eager.
+- Follow-up lever: fp16 activations plus fused head_size=256 GQA decode to remove the 31% reference-attention hotspot; Phi needs native `If`/subgraph support and qwen3.5-9b needs a multimodal harness path.

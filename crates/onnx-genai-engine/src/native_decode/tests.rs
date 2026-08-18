@@ -1249,13 +1249,13 @@ fn build_cuda_decoder(
     max_len: usize,
     aux: AuxOutput,
 ) -> anyhow::Result<NativeDecodeSession> {
-    build_cuda_decoder_with_fixed_state(graph_capture, max_len, aux, false)
+    build_cuda_decoder_with_fixed_state(graph_capture, Some(max_len), aux, false)
 }
 
 #[cfg(feature = "cuda")]
 fn build_cuda_decoder_with_fixed_state(
     graph_capture: bool,
-    max_len: usize,
+    kv_max_len: Option<usize>,
     aux: AuxOutput,
     fixed_state: bool,
 ) -> anyhow::Result<NativeDecodeSession> {
@@ -1392,7 +1392,7 @@ fn build_cuda_decoder_with_fixed_state(
         }]);
         NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
             session,
-            Some(max_len),
+            kv_max_len,
             Some(&io),
         )
     } else {
@@ -1400,7 +1400,7 @@ fn build_cuda_decoder_with_fixed_state(
             session,
             NativeDecodeCudaOptions {
                 decode_batch: None,
-                kv_max_len: Some(max_len),
+                kv_max_len,
                 metadata_max_len: None,
                 graph_capture: Some(graph_capture),
                 weight_offload_enabled: None,
@@ -1408,6 +1408,137 @@ fn build_cuda_decoder_with_fixed_state(
             },
         )
     }
+}
+
+/// Build the synthetic single-layer CUDA decoder with **no** KV length bound:
+/// neither an explicit `kv_max_len` nor model `metadata_max_len`, so
+/// `resolve_cuda_kv_capacity` returns the deliberate `usize::MAX` "unbounded
+/// until growth fails" sentinel. This is the shape a model with no declared
+/// `max_sequence_length` produces on the non-VMM native-CUDA decode path. We go
+/// through the `fixed_state` builder purely because it declares the graph
+/// `model.io` ports explicitly via `tiny_decoder_io()`; the default (non-VMM)
+/// KV path is unaffected by the extra recurrent state pair, so
+/// `kv_commits_on_demand` stays false and this reproduces the metadata-less
+/// non-VMM construction exactly.
+#[cfg(feature = "cuda")]
+fn build_cuda_decoder_unbounded() -> anyhow::Result<NativeDecodeSession> {
+    build_cuda_decoder_with_fixed_state(false, None, AuxOutput::StaticUnit, true)
+}
+
+/// Regression for the first-bad-commit #682 (`9fd7ee56`): `DecodeCudaState::new`
+/// computed `full_mask_bytes = batch × capacity.max_len × size_of::<i64>()`
+/// unconditionally. For a model with no `max_sequence_length` metadata,
+/// `capacity.max_len` is `usize::MAX` (the intended "unbounded until growth
+/// fails" sentinel), so that product overflowed and aborted construction with
+/// `full CUDA mask reservation size overflow` — even on the non-VMM path, whose
+/// mask binding never uses the full-reservation extent at all. The fix computes
+/// `full_mask_bytes` only inside the `kv_commits_on_demand` (VMM) branch that
+/// consumes it. This test drives the real construction and goes RED (with that
+/// exact overflow error) if the computation is hoisted back out of the branch.
+#[cfg(feature = "cuda")]
+#[test]
+fn native_cuda_decoder_constructs_with_unbounded_metadata_less_capacity() -> anyhow::Result<()> {
+    if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+        eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+        return Ok(());
+    }
+
+    let session = build_cuda_decoder_unbounded().context(
+        "native CUDA decoder must construct on the non-VMM path when the KV capacity is \
+         unbounded (a model with no max_sequence_length metadata)",
+    )?;
+
+    let state = session.cuda.as_ref().expect("CUDA decode state");
+    // The unbounded sentinel must survive into the resolved capacity — this is
+    // the value whose reservation multiply overflowed before the fix.
+    assert_eq!(
+        state.capacity.max_len,
+        usize::MAX,
+        "a metadata-less model must keep the unbounded-until-growth-fails sentinel"
+    );
+    // The mask binding still exists and is the non-VMM full `[1, max_len]`
+    // allocation (bindings[0] is the attention mask island).
+    assert!(
+        !state.bindings.is_empty(),
+        "the attention-mask binding must be constructed"
+    );
+    Ok(())
+}
+
+/// Regression for issue #1266: the **VMM** half of the metadata-less overflow
+/// that #1264 deliberately left unfixed.
+///
+/// On the VMM path (`ONNX_GENAI_CUDA_VMM=1`) `DecodeCudaState::new` reserves the
+/// full logical mask island (`batch × capacity.max_len × i64`) and the full KV
+/// extent (`full_vmm_kv_allocation_bytes(..., capacity.max_len)`) up front. For
+/// a model with no `max_sequence_length` metadata `capacity.max_len` is
+/// `usize::MAX`, so — unlike the non-VMM path where the value is dead — these
+/// reservation multiplies are *live* and overflow, aborting construction with
+/// `full CUDA mask reservation size overflow` / `full VMM-backed CUDA KV
+/// reservation size overflow`.
+///
+/// The fix resolves the `usize::MAX` sentinel to a concrete device-memory bound
+/// (`device_free / bytes_per_token`) *only for the VMM reservation* — the
+/// reservation is virtual-only, so an over-large-but-finite bound is nearly
+/// free, and growth still fails at the same physical ceiling. The sentinel
+/// itself is left intact (asserted below), so the non-VMM grow-until-OOM
+/// contract is unchanged.
+///
+/// This test goes RED (with the overflow above) if the bound resolution is
+/// removed and `capacity.max_len` is fed to the reservations again. The
+/// `kv_commits_on_demand()` assertion guarantees the test really is on the VMM
+/// path — without it a silent fall back to the eager path would make the test
+/// prove nothing.
+#[cfg(feature = "cuda")]
+#[test]
+fn native_cuda_vmm_decoder_constructs_with_unbounded_metadata_less_capacity() -> anyhow::Result<()>
+{
+    if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+        eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+        return Ok(());
+    }
+    let _guard = env_lock()
+        .lock()
+        .expect("CUDA smoke env mutex should not be poisoned");
+
+    // VMM on (commit-on-demand path), and crucially NO ONNX_GENAI_CUDA_KV_MAX_LEN
+    // and no model metadata, so `resolve_cuda_kv_capacity` keeps the unbounded
+    // `usize::MAX` sentinel and the VMM reservation is the live overflow site.
+    // Deliberately do NOT touch ONNX_GENAI_CUDA_GRAPH: it is a frozen
+    // RuntimeConfig knob (#804), so mutating it after any earlier test froze the
+    // process-wide config trips the freeze-guard. This test only constructs the
+    // decoder (no decode, no graph capture), so the graph knob is irrelevant to
+    // the reservation-sizing overflow it targets; `vmm_enabled()` reads
+    // ONNX_GENAI_CUDA_VMM directly from the environment, so setting it here is
+    // safe regardless of freeze order.
+    let _vmm = EnvVarGuard::set("ONNX_GENAI_CUDA_VMM", "1");
+
+    let session = build_cuda_decoder_unbounded().context(
+        "native CUDA decoder must construct on the VMM path when the KV capacity is \
+         unbounded (a model with no max_sequence_length metadata): the reservation must \
+         resolve the usize::MAX sentinel to a concrete device-memory bound instead of \
+         overflowing",
+    )?;
+
+    let state = session.cuda.as_ref().expect("CUDA decode state");
+    assert!(
+        state.kv_commits_on_demand(),
+        "ONNX_GENAI_CUDA_VMM=1 must put the decoder on the VMM commit-on-demand path; \
+         otherwise this test does not exercise the VMM reservation at all"
+    );
+    // The unbounded sentinel is intended design and must survive untouched: the
+    // fix resolves a concrete bound only locally for the VMM reservation.
+    assert_eq!(
+        state.capacity.max_len,
+        usize::MAX,
+        "a metadata-less model must keep the unbounded-until-growth-fails sentinel; \
+         the fix must not rewrite capacity.max_len"
+    );
+    assert!(
+        !state.bindings.is_empty(),
+        "the attention-mask binding must be constructed on the VMM path"
+    );
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -2327,7 +2458,8 @@ fn native_cuda_binds_rank3_fixed_state_without_changing_growing_kv() -> anyhow::
         return Ok(());
     }
 
-    let mut session = build_cuda_decoder_with_fixed_state(false, 16, AuxOutput::StaticUnit, true)?;
+    let mut session =
+        build_cuda_decoder_with_fixed_state(false, Some(16), AuxOutput::StaticUnit, true)?;
     let state = session.cuda.as_mut().expect("CUDA state");
     assert_eq!(state.kv_binding_range.len(), 2);
     let fixed = state

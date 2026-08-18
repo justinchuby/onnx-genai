@@ -114,7 +114,7 @@ impl Executor {
         } else if is_sequence {
             self.exec_sequence_node(pi, resolved, external)
         } else {
-            self.exec_kernel_node(pi, resolved, external)
+            self.exec_kernel_node(pi, resolved, external, capture)
         }
     }
 
@@ -351,6 +351,7 @@ impl Executor {
         pi: usize,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         external: &ExternalBindings,
+        capture: OpCaptureTrace<'_>,
     ) -> Result<()> {
         // Whole-node dispatch span: its lifetime minus `exec_kernel.compute` is
         // the serial per-node dispatch glue (shape resolve, input/output view
@@ -433,6 +434,7 @@ impl Executor {
                 .inherited_workspace
                 .map(|(ptr, bytes)| WorkspaceView::new(DevicePtrMut(ptr as *mut _), bytes)),
             workspace_preparation_required: self.workspace_preparation_required,
+            eager_workspace_growth: matches!(capture, OpCaptureTrace::Eager),
         };
 
         // Build the (possibly strided) input views once; they feed both the
@@ -699,7 +701,13 @@ impl Executor {
                 .iter()
                 .enumerate()
                 .map(|(i, v)| {
-                    v.and_then(|vid| self.shape_input_i64(vid, &input_shapes[i], input_dtypes[i]))
+                    v.and_then(|vid| {
+                        if node.is_default_domain() && node.op_type == "Compress" && i == 1 {
+                            self.compress_condition_i64(vid, &input_shapes[i], input_dtypes[i])
+                        } else {
+                            self.shape_input_i64(vid, &input_shapes[i], input_dtypes[i])
+                        }
+                    })
                 })
                 .collect();
             // Only materialize a *float* input value for the specific inputs an
@@ -1050,6 +1058,32 @@ impl Executor {
         self.input_i64(vid, shape, dtype)
     }
 
+    fn compress_condition_i64(
+        &self,
+        vid: ValueId,
+        shape: &[usize],
+        dtype: DataType,
+    ) -> Option<Vec<i64>> {
+        if !bounded_compress_condition(dtype, shape) {
+            return None;
+        }
+        let max_bytes = shape[0].checked_mul(dtype.byte_size())?;
+        if let Some(view) = self.views.get(&vid) {
+            let source = self.buffers.get(&view.source)?;
+            if source.len() > max_bytes {
+                return None;
+            }
+        }
+        if self
+            .seq_elem_values
+            .get(&vid)
+            .is_some_and(|elem| elem.root_len() > max_bytes)
+        {
+            return None;
+        }
+        self.input_i64(vid, shape, dtype)
+    }
+
     pub(super) fn shape_input_f64(
         &self,
         vid: ValueId,
@@ -1176,6 +1210,15 @@ struct KernelDispatchContext<'a> {
     step_workspace: &'a mut Option<PreparedWorkspace>,
     inherited_workspace: Option<WorkspaceView>,
     workspace_preparation_required: bool,
+    /// True when this node is dispatched on a plain eager run (no device-graph
+    /// capture in progress), so growing a prepared workspace slot in place is
+    /// safe: nothing has baked its device pointer into a captured graph. This is
+    /// what lets a prepared session re-prepare (grow) its governed workspace when
+    /// execution rebuckets to a larger shape bucket than preparation reserved
+    /// for, instead of failing the prepared-workspace invariant (#1223). It is
+    /// false while recording a captured segment ([`OpCaptureTrace::Captured`]),
+    /// where the workspace pointer must stay fixed for replay.
+    eager_workspace_growth: bool,
 }
 
 impl KernelDispatchContext<'_> {
@@ -1476,7 +1519,21 @@ impl KernelDispatchContext<'_> {
                 let needs_replacement = prepared.as_ref().is_none_or(|workspace| {
                     required > workspace.bytes || requirement.alignment > workspace.alignment
                 });
-                if needs_replacement && !self.workspace_preparation_required {
+                // A prepared session normally refuses to allocate at execution
+                // time — its governed workspace must be reserved up front so a
+                // captured device graph can bake a stable pointer. That invariant
+                // only holds *within* one shape bucket, though: when execution
+                // rebuckets to a larger bucket than preparation reserved for, the
+                // reserved slot may be absent or undersized for the new geometry
+                // (#1223). Re-run preparation in place on the eager (non-capture)
+                // dispatch that a rebucket forces before any re-capture — growing
+                // the slot there is safe because no captured graph references it
+                // yet. This generalizes the in-bucket reservation fix from #1221
+                // to the cross-bucket case, for every governed-workspace operator
+                // rather than any one op-type.
+                if needs_replacement
+                    && (!self.workspace_preparation_required || self.eager_workspace_growth)
+                {
                     // Sequential dispatch is the scratch hand-off boundary. An
                     // EP may enqueue asynchronous device work, so synchronize
                     // before retiring the old disposable workspace. Release it

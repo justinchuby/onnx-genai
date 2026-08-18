@@ -16,6 +16,34 @@ use crate::weight::ExecutionProviderCapabilities;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct EpId(pub u32);
 
+/// Tie-break policy for [`ExecutionProvider::device_argmax`] when two or more
+/// logits share the maximum value.
+///
+/// The default ([`ArgmaxTieBreak::LowestIndex`]) matches the canonical ONNX
+/// `ArgMax` operator (`select_last_index=false`) and the host greedy references
+/// `sample_greedy` / `argmax_logits_tensor` ("ties keep the lowest token id"),
+/// which is the base-decode / ORT byte-identity contract.
+/// [`ArgmaxTieBreak::HighestIndex`] instead keeps the highest token id on ties,
+/// matching Rust's `Iterator::max_by` (returns the LAST maximal element) as used
+/// by the engine/reference greedy `max_by` probes, and ONNX `ArgMax` with
+/// `select_last_index=true`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum ArgmaxTieBreak {
+    /// Ties resolve to the lowest token id (first maximal element).
+    #[default]
+    LowestIndex,
+    /// Ties resolve to the highest token id (last maximal element).
+    HighestIndex,
+}
+
+impl ArgmaxTieBreak {
+    /// Whether ties select the LAST (highest-index) maximal element.
+    #[must_use]
+    pub fn select_last_index(self) -> bool {
+        matches!(self, ArgmaxTieBreak::HighestIndex)
+    }
+}
+
 /// Opaque, namespaced configuration passed to [`ExecutionProvider::initialize`].
 #[derive(Clone, Debug, Default)]
 pub struct EpConfig {
@@ -693,6 +721,10 @@ pub trait ExecutionProvider: Send + Sync {
     /// `s`, two native-endian u32 values at word offset `2*s`: the token id, then
     /// the latching device capture-error bitmask. At `batch == 1` this is the
     /// previous single-sequence contract byte-for-byte.
+    ///
+    /// `tie_break` selects which token id wins when several logits share the
+    /// maximum value; see [`ArgmaxTieBreak`]. [`ArgmaxTieBreak::LowestIndex`] is
+    /// the base-decode / ORT byte-identity default.
     fn device_argmax(
         &self,
         _logits: &DeviceBuffer,
@@ -700,6 +732,7 @@ pub trait ExecutionProvider: Send + Sync {
         _batch: usize,
         _dtype: DataType,
         _result: &mut DeviceBuffer,
+        _tie_break: ArgmaxTieBreak,
     ) -> Result<()> {
         Err(EpError::KernelFailed(format!(
             "{}: device argmax is not supported",
@@ -876,19 +909,16 @@ pub trait ExecutionProvider: Send + Sync {
     /// Whether the memory this provider hands out commits physically as it is
     /// used rather than when it is requested.
     ///
-    /// A forwarder, not a fact of its own: the property belongs to whichever
-    /// allocator the provider is currently using, discovered through
-    /// [`DeviceAllocator::as_virtual_backing`] — an allocator has this
-    /// property exactly when it has a [`VirtualBacking`] capability. This is
-    /// repeated here only because a caller holding a session reaches the
-    /// allocator through the provider, not because the provider tracks it
-    /// independently.
+    /// A forwarder, not a fact of its own: the property belongs to
+    /// [`DeviceAllocator::commits_on_demand`], and a provider should answer by
+    /// asking whichever allocator it is currently using. It is repeated here
+    /// only because a caller holding a session reaches the allocator through
+    /// the provider.
     ///
     /// `false` is the safe default -- a consumer that believes `true` will
     /// under-reserve.
     ///
-    /// [`DeviceAllocator::as_virtual_backing`]: onnx_runtime_memory_governor::DeviceAllocator::as_virtual_backing
-    /// [`VirtualBacking`]: onnx_runtime_memory_governor::VirtualBacking
+    /// [`DeviceAllocator::commits_on_demand`]: onnx_runtime_memory_governor::DeviceAllocator::commits_on_demand
     fn commits_on_demand(&self) -> bool {
         false
     }

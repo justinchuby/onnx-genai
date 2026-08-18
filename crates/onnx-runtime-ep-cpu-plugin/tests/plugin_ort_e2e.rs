@@ -5743,6 +5743,14 @@ fn unary_case(
             " attribute: [{ name: \"approximate\" type: STRING s: \"tanh\" }]"
         }
         "Gelu" => " attribute: [{ name: \"approximate\" type: STRING s: \"none\" }]",
+        // Celu's alpha divides the input *and* scales the output, so the
+        // default and a non-default value exercise different arithmetic. The
+        // name carries which one the case means.
+        "Celu" if name.contains("_a2") => " attribute: [{ name: \"alpha\" type: FLOAT f: 2.0 }]",
+        // Same for Elu: alpha scales only the negative half, so the default
+        // and a non-default value take different arithmetic through the same
+        // select.
+        "Elu" if name.contains("_a2") => " attribute: [{ name: \"alpha\" type: FLOAT f: 2.0 }]",
         _ => "",
     };
     let model = format!(
@@ -5870,6 +5878,140 @@ fn unary_bench_cases() -> Vec<MatmulFamilyCase> {
             false,
             0.0,
         ),
+        // The activation family that moved off the generic scalar path: Elu,
+        // LeakyRelu, HardSigmoid, ThresholdedRelu and Selu all have AVX2
+        // kernels and the zero-copy tensor path now. `Swish(alpha != 1)` is
+        // the only one left on the generic path.
+        unary_case("bench_elu_f32_4k", "Elu", "", ELEM_F32, K4, 17, false, 1e-4),
+        unary_case("bench_elu_f32_1m", "Elu", "", ELEM_F32, M1, 17, false, 1e-4),
+        unary_case(
+            "bench_leakyrelu_f32_1m",
+            "LeakyRelu",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_leakyrelu_f32_4k",
+            "LeakyRelu",
+            "",
+            ELEM_F32,
+            K4,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_hardsigmoid_f32_4k",
+            "HardSigmoid",
+            "",
+            ELEM_F32,
+            K4,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_hardsigmoid_f32_1m",
+            "HardSigmoid",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_thresholdedrelu_f32_4k",
+            "ThresholdedRelu",
+            "",
+            ELEM_F32,
+            K4,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_thresholdedrelu_f32_1m",
+            "ThresholdedRelu",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_selu_f32_4k",
+            "Selu",
+            "",
+            ELEM_F32,
+            K4,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_selu_f32_1m",
+            "Selu",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
+        ),
+        // `Celu` and `Mish` had no kernel here at all before, so ORT ran them
+        // and there is no "before" arm to compare against: ours-vs-ORT *is*
+        // the A/B. `Mish` is opset 18, `Celu` is 12.
+        unary_case(
+            "bench_celu_f32_4k",
+            "Celu",
+            "",
+            ELEM_F32,
+            K4,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_celu_f32_1m",
+            "Celu",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_mish_f32_4k",
+            "Mish",
+            "",
+            ELEM_F32,
+            K4,
+            18,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_mish_f32_1m",
+            "Mish",
+            "",
+            ELEM_F32,
+            M1,
+            18,
+            false,
+            1e-4,
+        ),
+        // `Log` was the last elementwise op still evaluated one `libm` call at
+        // a time, so it gets both sizes: 4k to see the per-call overhead with
+        // the data L1-resident, 1M to see the steady-state throughput.
+        unary_case("bench_log_f32_4k", "Log", "", ELEM_F32, K4, 17, true, 1e-4),
+        unary_case("bench_log_f32_1m", "Log", "", ELEM_F32, M1, 17, true, 1e-4),
         unary_case(
             "bench_sqrt_f32_4k",
             "Sqrt",
@@ -6861,5 +7003,229 @@ fn every_assigned_node_is_also_executed_by_this_ep() {
          covered by rope_and_gqa_execute_on_our_ep_and_match_ort_numerics: {skipped:?}",
         no_ort_kernel.len(),
         skipped.len()
+    );
+}
+
+// ─── Celu, Mish and Log: new native kernels, checked against ORT's ───────────
+
+/// The activation buffer a unary parity check has to survive.
+///
+/// A sweep of well-behaved values in `[-1, 1]` is the one input set on which
+/// every plausible implementation agrees, so it proves almost nothing. The
+/// interesting disagreements live at the edges each kernel has to special-case
+/// by hand: both signed zeros, both infinities, NaN, the ends of the normal
+/// range, the denormal band (which `log` handles by pre-scaling and fixing the
+/// exponent afterwards), and the saturation tails where `exp` overflows and the
+/// kernels are expected to clamp rather than produce Inf/NaN.
+///
+/// The negative half is kept even for `Log`, where it is undefined: "both
+/// return NaN" is a real contract, and a kernel that returned a huge negative
+/// number instead would pass a positives-only sweep.
+fn unary_special_values() -> Vec<f32> {
+    let mut v = vec![
+        f32::NEG_INFINITY,
+        -f32::MAX,
+        -1e30,
+        -100.0,
+        -88.72284,
+        -88.0,
+        -20.0,
+        -10.0,
+        -2.0,
+        -1.5,
+        -1.0,
+        -0.5,
+        -std::f32::consts::LN_2,
+        -f32::MIN_POSITIVE,
+        -1e-40,
+        -1e-45,
+        -0.0,
+        0.0,
+        1e-45,
+        1e-40,
+        5.877472e-39,
+        f32::MIN_POSITIVE,
+        0.5,
+        std::f32::consts::LN_2,
+        std::f32::consts::FRAC_1_SQRT_2,
+        0.99999994,
+        1.0,
+        1.0000001,
+        1.5,
+        2.0,
+        10.0,
+        20.0,
+        88.0,
+        88.72284,
+        100.0,
+        1e30,
+        f32::MAX,
+        f32::INFINITY,
+        f32::NAN,
+    ];
+    // A dense two-sided sweep on top of the corner cases, so the comparison is
+    // not made only of exceptional lanes, and so the length crosses several
+    // SIMD blocks with a ragged tail.
+    let n = 421;
+    for i in 0..n {
+        v.push(-30.0 + 60.0 * (i as f32) / ((n - 1) as f32));
+    }
+    v
+}
+
+/// Whether two results are compatible, given that neither side is the oracle.
+///
+/// Exact equality is required wherever the value is not a rounding of a real
+/// number -- NaN, the infinities, and the sign of zero -- because those are
+/// contract, not accuracy. Everything else is compared relative to the larger
+/// magnitude, which is the right scale for `log`: `ln(1e-38)` is `-87.3`, where
+/// one ulp is `7.6e-6`, so an absolute bound would either be vacuous there or
+/// unmeetable near `ln(1) = 0`.
+fn unary_result_matches(ours: f32, ort: f32, rel: f32) -> bool {
+    if ours.is_nan() || ort.is_nan() {
+        return ours.is_nan() && ort.is_nan();
+    }
+    if ours.is_infinite() || ort.is_infinite() {
+        return ours == ort;
+    }
+    if ours == 0.0 && ort == 0.0 {
+        return true;
+    }
+    (ours - ort).abs() <= rel * ours.abs().max(ort.abs()).max(1.0)
+}
+
+/// `Celu`, `Mish` and `Log` run on this EP and agree with ORT's own kernels.
+///
+/// These three are the ops this EP was quietly not doing properly. `Celu` and
+/// `Mish` had no kernel at all, so the plugin's fail-closed capability filter
+/// dropped them and ORT ran them -- which the architectural rule forbids, and
+/// which no existing test could see because a missing op cannot appear in a
+/// coverage list written from the ops that exist. `Log` was registered but fell
+/// into the scalar catch-all in `unary_math`, one `libm` call per element.
+///
+/// Every case runs with `session.disable_cpu_ep_fallback=1`, so a node this EP
+/// declines does not quietly move to ORT -- session creation fails instead.
+/// Assignment is then checked against ORT's own record, the case is run so the
+/// claim is backed by an execution, and the output is compared elementwise
+/// against a second session with no EP appended at all.
+#[test]
+fn the_native_activation_family_executes_locally_and_matches_ort_numerics() {
+    let _lock = lock_ort_ep();
+    let x = unary_special_values();
+    let len = x.len();
+    let bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    // `Celu` is opset 12, `Mish` is opset 18; ask for each op's own opset
+    // rather than one number that happens to satisfy both.
+    let specs: [(&'static str, &'static str, u64, f32); 10] = [
+        ("parity_celu_f32", "Celu", 12, 2e-6),
+        ("parity_celu_a2_f32", "Celu", 12, 2e-6),
+        ("parity_mish_f32", "Mish", 18, 2e-6),
+        ("parity_log_f32", "Log", 17, 2e-6),
+        ("parity_elu_f32", "Elu", 17, 2e-6),
+        ("parity_elu_a2_f32", "Elu", 17, 2e-6),
+        ("parity_leakyrelu_f32", "LeakyRelu", 17, 2e-6),
+        ("parity_hardsigmoid_f32", "HardSigmoid", 17, 2e-6),
+        ("parity_thresholdedrelu_f32", "ThresholdedRelu", 17, 2e-6),
+        ("parity_selu_f32", "Selu", 17, 2e-6),
+    ];
+
+    let mut checked = 0usize;
+    for (name, op, opset, rel) in specs {
+        let mut case = unary_case(name, op, "", ELEM_F32, len, opset, false, rel);
+        case.inputs[0].data = bytes.clone();
+        let path = write_generated_model(name, &case.model);
+        let reg = format!("cpu_ep_parity_{name}");
+        let Some((_lib, api, env, _opts, session)) =
+            (unsafe { conformance_setup(&reg, &path, true) })
+        else {
+            eprintln!("*** SKIPPED: {name} — ORT or EP cdylib not found ***");
+            return;
+        };
+
+        unsafe {
+            let info = query_ep_assignment(api, session);
+            let ours_ops = info.ops_on_our_ep();
+            let theirs = info.ops_not_on_our_ep();
+            assert!(
+                ours_ops.contains(&op),
+                "{name}: '{op}' must run on this EP, got {:?}",
+                info.assignments
+            );
+            assert!(
+                theirs.is_empty(),
+                "{name}: nodes {theirs:?} were left to ORT's CPU EP. This EP does not \
+                 defer -- a missing kernel is a kernel to write, not a node to give away",
+            );
+
+            let ours_out = run_generated_case(api, session, &case, &format!("Run({name})"));
+            let (ort_opts, ort_session) = match try_plain_ort_session(api, env, &path) {
+                Ok(pair) => pair,
+                Err(e) => panic!("{name}: ORT could not build its own kernel: {e}"),
+            };
+            let ort_out = run_generated_case(
+                api,
+                ort_session,
+                &case,
+                &format!("Run(ORT baseline {name})"),
+            );
+            assert_eq!(ours_out.len(), ort_out.len(), "{name}: output length");
+
+            // `unary_result_matches` calls +0 and -0 equal, which is right for
+            // a tolerance comparison and wrong for the question these kernels
+            // actually had to answer: several of them are implemented as a
+            // *select* precisely so a signed zero survives, and one (`Selu`)
+            // has its branch written on `x < 0` rather than ONNX's `x > 0` for
+            // no other reason. Comparing the sign bit against ORT is the only
+            // thing that makes those choices evidence rather than assertion.
+            for (i, &xi) in x.iter().enumerate() {
+                if xi == 0.0 && ours_out[i] == 0.0 && ort_out[i] == 0.0 {
+                    assert_eq!(
+                        ours_out[i].to_bits(),
+                        ort_out[i].to_bits(),
+                        "{name}: sign of zero disagrees with ORT at x={xi:e} \
+                         (ours {:e}, ORT {:e})",
+                        ours_out[i],
+                        ort_out[i]
+                    );
+                }
+            }
+
+            let mut worst = 0.0f32;
+            let mut worst_at = usize::MAX;
+            let mut bad: Vec<String> = Vec::new();
+            for (i, (&a, &b)) in ours_out.iter().zip(ort_out.iter()).enumerate() {
+                if !unary_result_matches(a, b, rel) {
+                    if bad.len() < 12 {
+                        bad.push(format!("  x={:e}: ours={a:e} ort={b:e}", x[i]));
+                    }
+                    let d = (a - b).abs() / a.abs().max(b.abs()).max(1.0);
+                    if d > worst {
+                        worst = d;
+                        worst_at = i;
+                    }
+                }
+            }
+            assert!(
+                bad.is_empty(),
+                "{name}: {} of {len} elements disagree with ORT (worst {worst:e} at \
+                 x={:e}, tolerance {rel:e}):\n{}",
+                bad.len(),
+                if worst_at == usize::MAX {
+                    f32::NAN
+                } else {
+                    x[worst_at]
+                },
+                bad.join("\n"),
+            );
+            eprintln!("  [{name}] {len} elements match ORT within {rel:e}");
+            ((*api).ReleaseSession.unwrap())(ort_session);
+            ((*api).ReleaseSessionOptions.unwrap())(ort_opts);
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 10, "every parity case must have been checked");
+    eprintln!(
+        "\n✅ the_native_activation_family_executes_locally_and_matches_ort_numerics: PASSED"
     );
 }

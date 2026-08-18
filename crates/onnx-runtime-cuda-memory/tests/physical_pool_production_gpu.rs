@@ -6,7 +6,7 @@ use onnx_runtime_cuda_memory::vmm_allocator::{
 };
 use onnx_runtime_memory_governor::{
     DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
-    Tier, VirtualBacking,
+    Tier,
 };
 use std::sync::{Arc, Barrier};
 

@@ -29,6 +29,7 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod backend;
+pub mod core_topology;
 pub mod decode_affinity;
 pub mod decode_numa;
 pub mod decode_spmd;
@@ -39,6 +40,7 @@ pub mod nchwc_layout;
 pub mod optimizer;
 pub mod provider;
 pub mod strided;
+pub mod task_runtime;
 mod trace;
 pub mod weight_offload;
 
