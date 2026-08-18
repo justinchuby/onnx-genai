@@ -1362,6 +1362,34 @@ pub struct QgemmPackedB {
 unsafe impl Send for QgemmPackedB {}
 unsafe impl Sync for QgemmPackedB {}
 
+/// Live heap bytes currently retained by all [`QgemmPackedB`] instances -- the
+/// MLAS packed allocation only (there is no owned scale/zp copy for the integer
+/// GEMM). Maintained by construction/`Drop` so a caller can compare the memory
+/// plan's *predicted* packed footprint against the bytes the kernels *actually*
+/// hold, in the same run. Mirrors [`SQNBIT_PACKED_LIVE_BYTES`].
+static QGEMM_PACKED_LIVE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Snapshot of [`QGEMM_PACKED_LIVE_BYTES`]: the heap bytes all live
+/// [`QgemmPackedB`] instances currently retain.
+pub fn qgemm_packed_live_bytes() -> usize {
+    QGEMM_PACKED_LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The exact MLAS packed-B buffer size for a constant quantized B, or `None`
+/// when MLAS reports no packed layout for this shape/signedness on the current
+/// host (the caller then uses the unpacked path). Lets the memory plan predict
+/// the pre-pack footprint before any weight is packed.
+pub fn qgemm_pack_b_size(n: usize, k: usize, a_signed: bool, b_signed: bool) -> Option<usize> {
+    if n == 0 || k == 0 {
+        return None;
+    }
+    // SAFETY: a pure size query with no pointer arguments.
+    let size =
+        unsafe { mlas_qgemm_pack_b_size(n, k, c_int::from(a_signed), c_int::from(b_signed)) };
+    (size != 0).then_some(size)
+}
+
 impl QgemmPackedB {
     /// Pack a row-major `k x n` quantized B (`ldb == n`).
     ///
@@ -1397,6 +1425,7 @@ impl QgemmPackedB {
                 ptr.cast::<c_void>(),
             );
         }
+        QGEMM_PACKED_LIVE_BYTES.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
         Some(Self {
             ptr,
             layout,
@@ -1405,6 +1434,11 @@ impl QgemmPackedB {
             a_signed,
             b_signed,
         })
+    }
+
+    /// Heap bytes this pack retains: the MLAS packed allocation.
+    pub fn owned_heap_bytes(&self) -> usize {
+        self.layout.size()
     }
 
     /// The logical `(k, n)` dimensions and `(a_signed, b_signed)` this pack was
@@ -1416,6 +1450,8 @@ impl QgemmPackedB {
 
 impl Drop for QgemmPackedB {
     fn drop(&mut self) {
+        QGEMM_PACKED_LIVE_BYTES
+            .fetch_sub(self.owned_heap_bytes(), std::sync::atomic::Ordering::Relaxed);
         // SAFETY: `ptr`/`layout` are the pair returned by `alloc_zeroed` in
         // `new` and this runs at most once.
         unsafe { std::alloc::dealloc(self.ptr, self.layout) };

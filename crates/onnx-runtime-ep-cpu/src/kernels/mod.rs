@@ -461,6 +461,7 @@ mod half_gemm;
 // The GEMV is an F16C/AVX2 kernel with no portable body: off x86 the decode
 // path is unchanged, so the module is not compiled at all rather than left as
 // dead code.
+pub mod governed_accumulator_budget;
 pub mod governed_weight_cache;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod half_gemv;
