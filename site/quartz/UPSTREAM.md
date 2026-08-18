@@ -14,6 +14,17 @@ commit `075afd3f712da0088a07f5284a7b3aba37dd61b6`. This small backport lets newe
 pinned plugins resolve runtime navigation beneath GitHub Pages project paths
 without otherwise moving the v5.0.0 engine.
 
+The pinned Graph plugin names floating-major jsDelivr builds of D3 and PixiJS.
+`scripts/integrate-graph-runtime.mjs` replaces those URLs in the verified plugin
+build with project-local URLs and uses the root, lockfile-pinned `d3@7.9.0`,
+`pixi.js@8.19.0`, and existing esbuild dependency to produce deterministic ESM
+bundles that install the globals required by Graph. The integration also marks
+Graph's generated dependency loaders as module scripts. Quartz copies the
+generated files from `quartz/static/vendor/` into the published
+`static/vendor/` directory. The ignored plugin checkout remains disposable:
+the integration is reapplied after every plugin install, including clean CI
+rebuilds.
+
 To update Quartz, replace the vendored engine from a reviewed upstream tag,
 retain the integration files, refresh both lockfiles, and run:
 
