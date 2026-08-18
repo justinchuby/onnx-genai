@@ -21,9 +21,11 @@ Fresh steady-state decode (medians of 5, 128 tok, on-GPU argmax ON), native CUDA
 | qwen2.5-7b | 305.6 | 271.3 | **1.13×** |
 | qwen2.5-14b-zp | 153.3 | 85.2 | **1.80×** |
 | DeepSeek-V2-Lite int4 (MoE) | 101.68 (capture) | 0.17† | **capability gap** |
+| GLM-4-9B int4 (dense GQA) | 211.74 (capture) / 128.82 (eager) | can't load‡ | **capability gap** |
 
 **Native is ahead of ORT CUDA on all three dense int4 models under real deployment conditions.**
 † DeepSeek-V2-Lite: ORT CUDA EP **structurally cannot run it on GPU** — the export has 26× `com.microsoft::QMoE` and ORT 1.27 has no CUDA kernel for it → every MoE layer forced to CPU EP (104 Memcpy bridge nodes, ORT itself warns "unable to run CUDA graph") → 0.17 tok/s CPU-fallback artifact. The 598× (capture) / 336× (eager) ratios are **GPU-vs-CPU-fallback, NOT per-kernel speed** — reported honestly as a hard capability gap (Wallace 2026-08-18, ORT pinned to CUDA 1.27 build, H200). Native is the ONLY engine serving int4 QMoE on GPU (same class as GLM-4-9B). Base decode, greedy, opt-in capture flag.
+‡ GLM-4-9B: ORT cannot load the dense int4 export at all (native-only). Native graph-capture engages cleanly with NO code change — the V2-Lite capture stack (#1171 classifier + #1181 `_d1` + #1189 long-context) already covers GLM's dense GQA topology (its attention-mask cone terminates at a genuine capacity-form `Attention[3]` with present-KV, so the #1171 classifier passes). Measured `captures=3 replays=185 fallbacks=0`, byte-identical 0/256 tokens (independent lock `glm4_9b_decode_lock.rs`), capture **211.74** vs eager **128.82** = **1.64×**, zero-overlap (min-ON 211.57 > max-OFF 129.05), pstdev ≤0.33 (Wallace 2026-08-18, H200 GPU6, `cohaagen-glm-4-9b-int4-cuda-post434`). Base decode, greedy, opt-in capture flag. The older 98.2 eager figure predates #1189+argmax on this box.
 
 ### ORT-fairness decomposition (Wallace, 2026-08-17 — the honest anatomy of the lead)
 
@@ -91,7 +93,7 @@ Batch-1 kernel vein mined out (5 NO-GOs). Three parallel fronts, all higher-valu
 
 | Model | Arch | E2E native? | Decode |
 |---|---|---|---|
-| GLM-4-9B int4 | dense GQA partial-RoPE | ✅ | 98.2 tok/s (native-only; ORT can't load it) |
+| GLM-4-9B int4 | dense GQA partial-RoPE | ✅ | native-only (ORT can't load it); **128.82 eager / 211.74 captured tok/s = 1.64×, byte-identical over 256 tok, opt-in** [Wallace 2026-08-18, H200]. **Graph capture ✅ engages with ZERO code change** — V2-Lite capture stack (#1171+#1181+#1189) already covers GLM's dense GQA topology; `captures=3 replays=185 fallbacks=0`, independent lock `glm4_9b_decode_lock.rs`. |
 | DeepSeek-R1-distill-1.5B | dense Qwen | ✅ | 690 tok/s |
 | DeepSeek-V2-Lite int4 (MoE) | QMoE + std Attention | ✅ supported + f64-correct (#1150) | **native 101.68 tok/s (capture ON+argmax) / 57.15 eager** [Wallace 2026-08-18, H200, medians of 5]; golden locked to native-CUDA validated vs f64; CPU divergence proven benign reassociation drift. **ORT CUDA EP CANNOT run it** — no QMoE CUDA kernel → all 26 MoE layers fall to CPU EP (0.17 tok/s CPU-fallback artifact, 104 Memcpy bridges). Native is the ONLY engine serving int4 QMoE on GPU (same class as GLM-4-9B). **Graph capture ✅ FULLY LANDED (#1171 classifier + #1181 `_d1` fix + #1189 Engine long-context) = 1.79x over eager, byte-identical, opt-in.** DeepSeek performance+support halves of the mandate BOTH closed vs ORT. |
 | GLM-5.2 MoE (CSA/IndexShare) | MoE + sparse attn | tiny fixtures only | — |

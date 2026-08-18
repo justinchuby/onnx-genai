@@ -60,3 +60,9 @@ Full pre-compaction history in `history-archive.md`.
 - Measured the real 27-layer DeepSeek-V2-Lite int4 QMoE artifact with pinned ORT CUDA 1.27 and confirmed native CUDA serves it on GPU at 57.15 tok/s eager / 101.68 tok/s captured.
 - ORT CUDA EP cannot place the 26 `com.microsoft::QMoE` nodes on GPU; with fallback it bridges 104 CPU/GPU Memcpy nodes and reaches 0.17 tok/s, while strict no-fallback refuses the graph.
 - Durable framing: this is a hard GPU capability gap (native GPU vs ORT CPU fallback), not a per-kernel speedup claim; ORT CUDA graph is categorically N/A on the split CPU/GPU graph.
+
+## 2026-08-18T04:30Z — GLM-4-9B graph-capture scope green
+
+- Scoped real GLM-4-9B int4 dense GQA decode and found the existing V2-Lite capture stack already covers it with no code change: captures=3, replays=185, fallbacks=0.
+- Capture and eager streams were byte-identical over 256 tokens; capture measured 211.74 tok/s vs eager 128.82 tok/s (1.64×), with zero overlap across rounds on H200 GPU6.
+- Durable framing: GLM extends the native-only capture moat today; report as opt-in graph-capture capability on native CUDA, not as a new implementation task.
