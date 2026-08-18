@@ -1044,45 +1044,58 @@ mod vectorized_tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri: no AVX2, and nondeterministic libm/NaN results")]
     fn out_of_place_softmax_is_bit_identical_on_pathological_rows() {
-        const D: usize = 8;
+        // 8 is a whole vector body with no tail; 11 is a vector body plus a
+        // 3-lane scalar tail; 6 is a pure tail with no vector body at all.
+        // The tail widths matter: a NaN in a vectorized lane is forced to a
+        // canonical NaN by the mask, while a NaN in a tail lane is whatever
+        // libm returns, so a future change that stopped both forms sharing one
+        // core would diverge on exactly these rows and nowhere else.
+        for d in [8usize, 11, 6] {
+            check_pathological_rows_bit_identical(d);
+        }
+    }
+
+    fn check_pathological_rows_bit_identical(d: usize) {
+        assert!(d >= 6, "the row patterns below index up to lane 5");
+        let big = d - 1;
         let rows: Vec<Vec<f32>> = vec![
             // Fully masked: sum of exponentials is 0, so normalization is 0/0.
-            vec![f32::NEG_INFINITY; D],
+            vec![f32::NEG_INFINITY; d],
             // Row max is +inf, so exp(inf - inf) is NaN.
             {
-                let mut r = vec![1.0f32; D];
+                let mut r = vec![1.0f32; d];
                 r[3] = f32::INFINITY;
                 r
             },
             // Both infinities in one row.
             {
-                let mut r = vec![0.5f32; D];
+                let mut r = vec![0.5f32; d];
                 r[0] = f32::INFINITY;
-                r[D - 1] = f32::NEG_INFINITY;
+                r[big] = f32::NEG_INFINITY;
                 r
             },
             // Quiet NaN.
             {
-                let mut r = vec![2.0f32; D];
+                let mut r = vec![2.0f32; d];
                 r[2] = f32::NAN;
                 r
             },
             // Signalling NaN: the pattern class that broke the bf16 widen.
             {
-                let mut r = vec![-1.0f32; D];
+                let mut r = vec![-1.0f32; d];
                 r[5] = f32::from_bits(0x7f80_0001);
                 r
             },
             // Negative-payload NaN.
             {
-                let mut r = vec![3.0f32; D];
+                let mut r = vec![3.0f32; d];
                 r[1] = f32::from_bits(0xffc0_0003);
                 r
             },
             // Denormals.
-            (0..D).map(|i| f32::from_bits(1 + i as u32)).collect(),
+            (0..d).map(|i| f32::from_bits(1 + i as u32)).collect(),
             // Ordinary finite logits, as a control.
-            (0..D).map(|i| i as f32 * 0.25 - 1.0).collect(),
+            (0..d).map(|i| i as f32 * 0.25 - 1.0).collect(),
         ];
         let n = rows.len();
         let src: Vec<f32> = rows.concat();
@@ -1090,18 +1103,18 @@ mod vectorized_tests {
         // The form this kernel replaced: copy the whole tensor, then reduce in
         // place over the copy.
         let mut expect = src.clone();
-        softmax_rows_in_place(&mut expect, n, D);
+        softmax_rows_in_place(&mut expect, n, d);
 
-        let mut got = vec![0.0f32; n * D];
-        softmax_rows(&src, &mut got, n, D);
+        let mut got = vec![0.0f32; n * d];
+        softmax_rows(&src, &mut got, n, d);
 
         for (i, (g, e)) in got.iter().zip(&expect).enumerate() {
             assert_eq!(
                 g.to_bits(),
                 e.to_bits(),
-                "row {} lane {}: out-of-place {:#010x} != copy+in-place {:#010x}",
-                i / D,
-                i % D,
+                "d={d} row {} lane {}: out-of-place {:#010x} != copy+in-place {:#010x}",
+                i / d,
+                i % d,
                 g.to_bits(),
                 e.to_bits()
             );
@@ -1112,12 +1125,12 @@ mod vectorized_tests {
         // Without this, a change that quietly made every row finite would leave
         // the bit comparison trivially true.
         assert!(
-            expect[..D].iter().all(|v| v.is_nan()),
-            "the fully masked row stopped producing NaN; this test no longer covers it"
+            expect[..d].iter().all(|v| v.is_nan()),
+            "d={d}: the fully masked row stopped producing NaN; this test no longer covers it"
         );
         assert!(
-            expect.iter().filter(|v| v.is_nan()).count() >= 5 * D,
-            "the pathological rows stopped producing NaN; the bit comparison is now vacuous"
+            expect.iter().filter(|v| v.is_nan()).count() >= 5 * d,
+            "d={d}: the pathological rows stopped producing NaN; the bit comparison is now vacuous"
         );
     }
 
