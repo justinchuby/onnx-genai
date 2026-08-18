@@ -327,6 +327,12 @@ impl CudaStepProfile {
         if !cuda_step_profile_enabled() {
             return None;
         }
+        // Phase accounting only. This deliberately does not switch on the
+        // activation-memory planner, which used to come along with it: the
+        // planner re-plans every activation on every run, so it taxed the very
+        // decode steps this profiler exists to time. A caller that wants its
+        // stats asks for them with `enable_activation_memory_plan_for_process`
+        // or `NXRT_ACTIVATION_MEMORY_PLAN=1`.
         onnx_runtime_session::enable_exec_phase_profile_for_process();
         onnx_runtime_session::reset_exec_phase_profile();
         Some(Self {

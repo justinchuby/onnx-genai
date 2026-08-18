@@ -33,6 +33,12 @@ struct Args {
     /// native runs. This is the only way to attribute the part of a run that
     /// the per-op profiler (`ONNX_GENAI_PROFILE_OPS=1`) leaves undifferentiated,
     /// because that one times node execution and nothing around it.
+    ///
+    /// Does not enable the activation-memory planner. That planner re-plans
+    /// every activation on every run - work the shipped runtime never does -
+    /// so while this flag switched it on, the profiler perturbed what it was
+    /// measuring and then reported its own cost back as a phase of the run.
+    /// Set `NXRT_ACTIVATION_MEMORY_PLAN=1` to opt into it deliberately.
     #[arg(long)]
     phase_profile: bool,
     /// Measure ORT only. Useful for recording a baseline when native loading or execution fails.
