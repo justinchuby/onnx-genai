@@ -570,24 +570,49 @@ where
         body(input, output);
         return;
     }
-    // Nesting a `par_chunks` inside an outer parallel region only adds
-    // scheduling overhead: the outer region is already keeping the pool busy.
-    if rayon::current_thread_index().is_some() {
+    // Nesting a split inside an outer parallel region only adds scheduling
+    // overhead: the outer region is already keeping the pool busy. Rayon is
+    // still checked because plenty of this crate fans out through it directly.
+    if rayon::current_thread_index().is_some() || crate::task_runtime::in_task() {
         body(input, output);
         return;
     }
-    let Some(chunk) = par_chunk_len(len, rayon::current_num_threads()) else {
+    let Some(chunk) = par_chunk_len(len, crate::task_runtime::width()) else {
         body(input, output);
         return;
     };
 
     note_parallel_dispatch();
+    run_on_task_runtime(input, output, chunk, &body);
+}
 
-    use rayon::prelude::*;
-    output
-        .par_chunks_mut(chunk)
-        .zip(input.par_chunks(chunk))
-        .for_each(|(o, i)| body(i, o));
+/// Splits `input`/`output` into `chunk`-sized pieces across the native task
+/// runtime and runs `body` on each.
+///
+/// Bit-identical to calling `body` on the whole slice, for the same reason
+/// [`run_on_host`] is: the kernels are elementwise, every chunk is a multiple of
+/// eight lanes, and none is shorter than [`PAR_MIN_CHUNK`], so no chunk takes a
+/// different code path from its neighbours.
+///
+/// The runtime's pool replaces rayon here because rayon parks its workers
+/// between regions and an elementwise op is *all* region boundary: an isolated
+/// region measured 67 us back-to-back and 226 us when the previous one ended
+/// 20 us earlier, which is the spacing between two activations in a decode step.
+///
+/// `#[inline(never)]` for the same reason as [`try_host`]: `run_chunked`'s
+/// callers are the hottest elementwise kernels in the crate, and growing it has
+/// repartitioned codegen units before -- 34% on `Relu` at 1 Mi with no path
+/// change at all.
+#[inline(never)]
+fn run_on_task_runtime<F>(input: &[f32], output: &mut [f32], chunk: usize, body: &F)
+where
+    F: Fn(&[f32], &mut [f32]) + Sync,
+{
+    debug_assert_eq!(input.len(), output.len());
+    crate::task_runtime::chunk_runs_mut(output, chunk, 1, |first, out| {
+        let start = first * chunk;
+        body(&input[start..start + out.len()], out);
+    });
 }
 
 #[cfg(test)]
@@ -675,20 +700,16 @@ where
         body(input, output);
         return;
     }
-    if rayon::current_thread_index().is_some() {
+    if rayon::current_thread_index().is_some() || crate::task_runtime::in_task() {
         body(input, output);
         return;
     }
-    let Some(chunk) = par_chunk_len_rows(len, width, rayon::current_num_threads()) else {
+    let Some(chunk) = par_chunk_len_rows(len, width, crate::task_runtime::width()) else {
         body(input, output);
         return;
     };
 
-    use rayon::prelude::*;
-    output
-        .par_chunks_mut(chunk)
-        .zip(input.par_chunks(chunk))
-        .for_each(|(o, i)| body(i, o));
+    run_on_task_runtime(input, output, chunk, &body);
 }
 
 // ---------------------------------------------------------------------------
