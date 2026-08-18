@@ -1,0 +1,598 @@
+//! SMT-aware core topology: which logical CPUs share a physical core.
+//!
+//! # Why this exists
+//!
+//! [`crate::decode_affinity`] discovers *NUMA nodes*. That is one of the two
+//! topology facts a spinning thread pool needs, and it is the less important
+//! one on a single-node host. The other is **which logical CPUs are siblings on
+//! one physical core**, because a busy-waiting worker does not share a core
+//! gracefully: two spinning SMT siblings interleave in the front end and each
+//! runs at roughly half rate, while one spinning sibling next to one *working*
+//! sibling steals issue slots from real arithmetic.
+//!
+//! This is not hypothetical on this project. `docs/benchmarks/`
+//! `2026-08-15-cpu-ep-vs-ort-attention-moe.md` §26.2(b) records a bistable
+//! result — the same command measuring 0.030 ms and 0.441 ms on consecutive
+//! runs — traced to 15 pinned spinning workers confined to CPUs 0-15, which on
+//! that host is **8 physical cores** (siblings are adjacent: `cpu0`/`cpu1` =
+//! core 0). A blocktime sweep over 500/200/50/20/5/0 us produced ratios from
+//! 0.233 to 72.3 with no monotone trend, which is the signature of a scheduling
+//! pathology rather than a tuning parameter. §27.1 lists "SMT-aware spin
+//! capping" as blocker #1 for the entire t=8/16 column, and this module is that
+//! discovery step.
+//!
+//! # What it does *not* do
+//!
+//! It does not spread work across physical cores. Pinning one thread per
+//! physical core across `0,2,…,30` on the same host measured **worse** (0.133 ms
+//! vs 0.079 ms) because the working set fits one CCX's L3, so the compact mask
+//! is correct and stays. The lever is capping how many *spinning* workers live
+//! inside that compact mask, not widening it.
+//!
+//! # Portability
+//!
+//! * **Linux** — `/sys/devices/system/cpu/cpuN/topology/core_cpus_list`, falling
+//!   back to the older `thread_siblings_list`. Both are cpu-list syntax
+//!   (`"0,16"`, `"0-1"`).
+//! * **Windows** — `GetLogicalProcessorInformationEx(RelationProcessorCore)`,
+//!   whose `PROCESSOR_RELATIONSHIP` names each core's logical processors as
+//!   group affinities. CPU indices use the same `group * 64 + bit` encoding as
+//!   [`crate::decode_affinity`].
+//! * **macOS** — `sysctlbyname("hw.physicalcpu"/"hw.logicalcpu")`. The scope
+//!   directive for Apple work is macOS arm64, which has no SMT, so the derived
+//!   grouping is one logical CPU per core and the cap is the identity.
+//! * **Anything else** — `None`, and every consumer degrades to "no cap".
+//!
+//! Detection is fallible everywhere and every caller treats `None` as "do not
+//! cap", never as "cap to 1".
+
+use std::collections::BTreeSet;
+use std::sync::OnceLock;
+
+/// Which logical CPUs share a physical core.
+///
+/// Invariants, established by [`CoreTopology::from_sibling_groups`] and relied
+/// on by every accessor: each group is sorted ascending and non-empty, no CPU
+/// appears in two groups, and the groups themselves are ordered by their lowest
+/// CPU index.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoreTopology {
+    cores: Vec<Vec<usize>>,
+}
+
+impl CoreTopology {
+    /// Build from raw sibling groups, normalising them into the documented
+    /// invariants: sort within a group, drop empties, drop a CPU already claimed
+    /// by an earlier group (the sysfs files list the *same* group once per
+    /// sibling, so raw reads are full of duplicates), then order by first CPU.
+    ///
+    /// This is the seam the unit tests drive: every policy function below is
+    /// pure over a `CoreTopology`, so SMT policy is testable on a host with no
+    /// SMT, and a host with SMT can be tested for the non-SMT case.
+    pub fn from_sibling_groups(groups: impl IntoIterator<Item = Vec<usize>>) -> Self {
+        let mut seen: BTreeSet<usize> = BTreeSet::new();
+        let mut cores: Vec<Vec<usize>> = Vec::new();
+        for group in groups {
+            let mut group: Vec<usize> = group.into_iter().filter(|c| !seen.contains(c)).collect();
+            group.sort_unstable();
+            group.dedup();
+            if group.is_empty() {
+                continue;
+            }
+            seen.extend(group.iter().copied());
+            cores.push(group);
+        }
+        cores.sort_unstable_by_key(|group| group[0]);
+        Self { cores }
+    }
+
+    /// Detect the running host's core topology, or `None` when this platform
+    /// exposes none (which every caller reads as "do not cap").
+    pub fn detect() -> Option<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            Self::detect_linux()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Self::detect_windows()
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            Self::detect_apple()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_vendor = "apple")))]
+        {
+            None
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn detect_linux() -> Option<Self> {
+        let entries = std::fs::read_dir("/sys/devices/system/cpu").ok()?;
+        let mut cpus: Vec<usize> = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let Some(index) = name.strip_prefix("cpu") else {
+                continue;
+            };
+            // `cpufreq`, `cpuidle`, `cpu_capacity` and friends also start with
+            // `cpu`; only a pure integer suffix names a logical CPU.
+            let Ok(index) = index.parse::<usize>() else {
+                continue;
+            };
+            cpus.push(index);
+        }
+        cpus.sort_unstable();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for cpu in cpus {
+            let dir = format!("/sys/devices/system/cpu/cpu{cpu}/topology");
+            // `core_cpus_list` is the modern name; `thread_siblings_list` is the
+            // pre-5.3 spelling and is still what container images with older
+            // kernels expose. A CPU that exposes neither is its own core.
+            let list = std::fs::read_to_string(format!("{dir}/core_cpus_list"))
+                .or_else(|_| std::fs::read_to_string(format!("{dir}/thread_siblings_list")))
+                .ok();
+            match list.as_deref().map(parse_cpu_list) {
+                Some(siblings) if !siblings.is_empty() => groups.push(siblings),
+                _ => groups.push(vec![cpu]),
+            }
+        }
+        let topology = Self::from_sibling_groups(groups);
+        (!topology.cores.is_empty()).then_some(topology)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn detect_windows() -> Option<Self> {
+        let groups = windows_cores::processor_cores()?;
+        let topology = Self::from_sibling_groups(groups);
+        (!topology.cores.is_empty()).then_some(topology)
+    }
+
+    /// macOS reports counts, not a sibling map. Apple Silicon (the only Apple
+    /// target in scope) has no SMT, so `logical == physical` and the derived
+    /// grouping is one CPU per core — exactly the identity cap. If a host ever
+    /// reports `logical > physical`, siblings are modelled as consecutive
+    /// indices, which is the conventional enumeration and is only ever used to
+    /// *count* cores here.
+    #[cfg(target_vendor = "apple")]
+    fn detect_apple() -> Option<Self> {
+        let physical = apple_sysctl_usize(c"hw.physicalcpu")?;
+        let logical = apple_sysctl_usize(c"hw.logicalcpu")?;
+        if physical == 0 || logical < physical {
+            return None;
+        }
+        let per_core = logical / physical;
+        let groups = (0..physical)
+            .map(|core| (0..per_core).map(|s| core * per_core + s).collect())
+            .collect::<Vec<Vec<usize>>>();
+        Some(Self::from_sibling_groups(groups))
+    }
+
+    /// The number of physical cores discovered.
+    pub fn core_count(&self) -> usize {
+        self.cores.len()
+    }
+
+    /// The number of logical CPUs discovered.
+    pub fn logical_count(&self) -> usize {
+        self.cores.iter().map(Vec::len).sum()
+    }
+
+    /// The sibling groups, ordered by lowest CPU index.
+    pub fn cores(&self) -> &[Vec<usize>] {
+        &self.cores
+    }
+
+    /// True when at least one physical core has more than one logical CPU.
+    pub fn has_smt(&self) -> bool {
+        self.cores.iter().any(|group| group.len() > 1)
+    }
+
+    /// The logical CPUs sharing `cpu`'s physical core, including `cpu` itself.
+    pub fn siblings_of(&self, cpu: usize) -> Option<&[usize]> {
+        self.cores
+            .iter()
+            .find(|group| group.contains(&cpu))
+            .map(Vec::as_slice)
+    }
+
+    /// How many distinct physical cores the CPUs in `allowed` cover.
+    ///
+    /// This — not `allowed.len()` — is the number of threads that can spin
+    /// without two of them sharing a core's front end. A CPU that is not in the
+    /// discovered topology counts as its own core, so an incomplete sysfs view
+    /// can only ever *over*-count, never silently collapse the cap to 1.
+    pub fn physical_cores_within(&self, allowed: &[usize]) -> usize {
+        let allowed: BTreeSet<usize> = allowed.iter().copied().collect();
+        let mut cores = 0;
+        let mut covered: BTreeSet<usize> = BTreeSet::new();
+        for group in &self.cores {
+            if group.iter().any(|cpu| allowed.contains(cpu)) {
+                cores += 1;
+                covered.extend(group.iter().copied());
+            }
+        }
+        cores + allowed.iter().filter(|cpu| !covered.contains(cpu)).count()
+    }
+
+    /// One CPU per physical core within `allowed`, in ascending order.
+    ///
+    /// The leader of a core is its lowest allowed sibling, so a compact mask
+    /// such as `0..16` on a host whose siblings are adjacent yields
+    /// `0,2,4,…,14` — still inside the original mask, so this never widens the
+    /// process's CPU set. Unknown CPUs are leaders of their own core.
+    pub fn leaders_within(&self, allowed: &[usize]) -> Vec<usize> {
+        let allowed_set: BTreeSet<usize> = allowed.iter().copied().collect();
+        let mut leaders: Vec<usize> = Vec::new();
+        let mut covered: BTreeSet<usize> = BTreeSet::new();
+        for group in &self.cores {
+            if let Some(&leader) = group.iter().find(|cpu| allowed_set.contains(cpu)) {
+                leaders.push(leader);
+                covered.extend(group.iter().copied());
+            }
+        }
+        leaders.extend(allowed_set.iter().copied().filter(|cpu| !covered.contains(cpu)));
+        leaders.sort_unstable();
+        leaders.dedup();
+        leaders
+    }
+}
+
+/// Parse a Linux cpu-list string such as `"0-3,8,10-11"` into CPU indices.
+///
+/// Deliberately a second copy of [`crate::decode_affinity`]'s parser rather than
+/// a shared one: that one is `#[cfg(any(target_os = "linux", test))]` and
+/// private, and duplicating twenty lines is cheaper than widening a module's
+/// public surface for it. Both are covered by their own tests.
+#[cfg(any(target_os = "linux", test))]
+fn parse_cpu_list(list: &str) -> Vec<usize> {
+    let mut cpus = Vec::new();
+    for part in list.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = part.split_once('-') {
+            if let (Ok(start), Ok(end)) =
+                (start.trim().parse::<usize>(), end.trim().parse::<usize>())
+                && start <= end
+            {
+                cpus.extend(start..=end);
+            }
+        } else if let Ok(cpu) = part.parse::<usize>() {
+            cpus.push(cpu);
+        }
+    }
+    cpus
+}
+
+#[cfg(target_vendor = "apple")]
+fn apple_sysctl_usize(name: &std::ffi::CStr) -> Option<usize> {
+    let mut value: i32 = 0;
+    let mut len = std::mem::size_of::<i32>();
+    // SAFETY: `name` is a NUL-terminated C string, `value` is a live `i32` and
+    // `len` truthfully reports its size; a null new-value pointer with length 0
+    // is the documented read-only form.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut value).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && value > 0).then_some(value as usize)
+}
+
+/// The host's core topology, detected once.
+///
+/// Cached because the consumers are pool-construction paths that may run per
+/// session, and a Linux detection walks one directory plus one small file per
+/// logical CPU.
+pub fn host() -> Option<&'static CoreTopology> {
+    static TOPOLOGY: OnceLock<Option<CoreTopology>> = OnceLock::new();
+    TOPOLOGY.get_or_init(CoreTopology::detect).as_ref()
+}
+
+/// The number of physical cores the current process may actually run on.
+///
+/// Intersects the detected core topology with the process's allowed CPU set
+/// (`sched_getaffinity` / `GetThreadGroupAffinity`), so a container, `taskset`,
+/// or this crate's own `bound_process_to_decode_budget` confinement is reflected
+/// rather than ignored. `None` means the answer is unknown — callers must treat
+/// that as "do not cap", because capping on a guess is how a 32-thread host
+/// silently becomes a 1-thread host.
+pub fn allowed_physical_cores() -> Option<usize> {
+    let topology = host()?;
+    match crate::decode_affinity::allowed_cpus() {
+        Some(allowed) => Some(topology.physical_cores_within(&allowed)),
+        // The allowed set is unknown, so every discovered core is assumed
+        // reachable. This is the same "do not guess a restriction" policy
+        // `NumaTopology::restrict_to_allowed` applies.
+        None => Some(topology.core_count()),
+    }
+    .filter(|&cores| cores > 0)
+}
+
+/// Cap `requested` spinning workers at one per physical core the process may
+/// run on.
+///
+/// Returns `requested` unchanged when the topology is undiscoverable, when the
+/// host has no SMT, or when the request already fits — so this is a no-op on
+/// every non-SMT machine and can only ever reduce, never inflate, a thread
+/// count. Never returns 0 for a non-zero request.
+pub fn cap_spinning_workers(requested: usize) -> usize {
+    match allowed_physical_cores() {
+        Some(cores) => requested.min(cores).max(usize::from(requested > 0)),
+        None => requested,
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod windows_cores {
+    use std::mem::size_of;
+
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+
+    /// Bits per processor group mask (`KAFFINITY` is 64-bit on x64/arm64).
+    const GROUP_BITS: usize = 64;
+
+    fn cpus_from_mask(group: u16, mask: usize) -> Vec<usize> {
+        let base = group as usize * GROUP_BITS;
+        (0..GROUP_BITS)
+            .filter(|bit| mask & (1usize << bit) != 0)
+            .map(|bit| base + bit)
+            .collect()
+    }
+
+    /// One `Vec<usize>` of sibling logical CPUs per physical core, via
+    /// `GetLogicalProcessorInformationEx(RelationProcessorCore)`.
+    ///
+    /// A `PROCESSOR_RELATIONSHIP` record carries `GroupCount` group affinities
+    /// in a trailing flexible array, so a core spanning processor groups (rare,
+    /// but legal) is read completely rather than truncated to its first group.
+    pub(super) fn processor_cores() -> Option<Vec<Vec<usize>>> {
+        let mut len: u32 = 0;
+        // SAFETY: the null-buffer/zero-length form is the documented size query;
+        // it only writes `len` and fails with ERROR_INSUFFICIENT_BUFFER.
+        unsafe {
+            GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut len);
+        }
+        if len == 0 {
+            return None;
+        }
+        let mut buffer = vec![0u8; len as usize];
+        // SAFETY: `buffer` is a live `len`-byte allocation and we pass its true
+        // length; on success the OS fills it with packed variable-length records.
+        let ok = unsafe {
+            GetLogicalProcessorInformationEx(
+                RelationProcessorCore,
+                buffer.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+                &mut len,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+
+        let mut cores: Vec<Vec<usize>> = Vec::new();
+        let mut offset = 0usize;
+        let end = len as usize;
+        while offset + size_of::<u32>() * 2 <= end {
+            // SAFETY: `offset` leaves at least the `Relationship`+`Size` header
+            // inside the filled region; the struct is `Copy` and the buffer has
+            // alignment 1, so an unaligned by-value read is the sound form.
+            let record = unsafe {
+                std::ptr::read_unaligned(
+                    buffer.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX
+                )
+            };
+            let size = record.Size as usize;
+            if size == 0 || offset + size > end {
+                break;
+            }
+            if record.Relationship == RelationProcessorCore {
+                // SAFETY: the relationship tag says the `Processor` union arm is
+                // the active one.
+                let processor = unsafe { record.Anonymous.Processor };
+                let group_count = processor.GroupCount as usize;
+                let mut siblings = Vec::new();
+                // `GroupMask` is declared as a 1-element array but is a trailing
+                // flexible array of `GroupCount` entries; walk it by offset from
+                // the record base so the bytes read stay inside `Size`.
+                let masks_offset =
+                    offset + (std::ptr::from_ref(&processor.GroupMask[0]) as usize
+                        - std::ptr::from_ref(&record) as usize);
+                for i in 0..group_count {
+                    let entry_offset = masks_offset
+                        + i * size_of::<windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY>();
+                    if entry_offset
+                        + size_of::<windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY>()
+                        > offset + size
+                    {
+                        break;
+                    }
+                    // SAFETY: bounds-checked against this record's `Size` above;
+                    // `GROUP_AFFINITY` is POD and read unaligned.
+                    let affinity = unsafe {
+                        std::ptr::read_unaligned(
+                            buffer.as_ptr().add(entry_offset)
+                                as *const windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY,
+                        )
+                    };
+                    siblings.extend(cpus_from_mask(affinity.Group, affinity.Mask as usize));
+                }
+                if !siblings.is_empty() {
+                    cores.push(siblings);
+                }
+            }
+            offset += size;
+        }
+        (!cores.is_empty()).then_some(cores)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 16-core / 32-thread host with adjacent siblings: `cpu0`/`cpu1` share
+    /// core 0. This is exactly the AMD EPYC 9V74 layout every CPU-EP benchmark
+    /// in `docs/benchmarks/` was taken on.
+    fn adjacent_smt(cores: usize) -> CoreTopology {
+        CoreTopology::from_sibling_groups((0..cores).map(|c| vec![c * 2, c * 2 + 1]))
+    }
+
+    /// A host whose siblings are `cpu` and `cpu + n`, the other common
+    /// enumeration (Intel, and AMD in some firmware modes).
+    fn split_smt(cores: usize) -> CoreTopology {
+        CoreTopology::from_sibling_groups((0..cores).map(|c| vec![c, c + cores]))
+    }
+
+    fn no_smt(cores: usize) -> CoreTopology {
+        CoreTopology::from_sibling_groups((0..cores).map(|c| vec![c]))
+    }
+
+    #[test]
+    fn sibling_groups_are_deduplicated_and_ordered() {
+        // sysfs lists the same group once per sibling, so a raw read repeats it.
+        let topology = CoreTopology::from_sibling_groups(vec![
+            vec![2, 3],
+            vec![2, 3],
+            vec![0, 1],
+            vec![0, 1],
+            vec![],
+        ]);
+        assert_eq!(topology.cores(), &[vec![0, 1], vec![2, 3]]);
+        assert_eq!(topology.core_count(), 2);
+        assert_eq!(topology.logical_count(), 4);
+        assert!(topology.has_smt());
+    }
+
+    #[test]
+    fn overlapping_groups_never_double_count_a_cpu() {
+        // A malformed/partial view must not produce a core count above the
+        // number of logical CPUs, which would inflate the spin cap.
+        let topology = CoreTopology::from_sibling_groups(vec![vec![0, 1], vec![1, 2], vec![2, 3]]);
+        assert_eq!(topology.logical_count(), 4);
+        assert_eq!(topology.core_count(), 3);
+        assert_eq!(topology.cores(), &[vec![0, 1], vec![2], vec![3]]);
+    }
+
+    #[test]
+    fn compact_mask_on_adjacent_smt_covers_half_the_cores() {
+        // The §26.2(b) failure: `DECODE_THREADS=16` confines to CPUs 0-15, which
+        // is 8 physical cores, and 15 spinning workers were placed on them.
+        let topology = adjacent_smt(16);
+        let compact: Vec<usize> = (0..16).collect();
+        assert_eq!(topology.physical_cores_within(&compact), 8);
+        assert_eq!(topology.leaders_within(&compact), vec![0, 2, 4, 6, 8, 10, 12, 14]);
+    }
+
+    #[test]
+    fn split_enumeration_compact_mask_covers_every_core() {
+        // Same mask, different sibling enumeration: CPUs 0-15 on a `cpu`/`cpu+16`
+        // host are 16 *distinct* cores, so the cap must not fire. Hardcoding
+        // "half the mask" would be wrong here, which is why siblings are read
+        // rather than assumed.
+        let topology = split_smt(16);
+        let compact: Vec<usize> = (0..16).collect();
+        assert_eq!(topology.physical_cores_within(&compact), 16);
+        assert_eq!(topology.leaders_within(&compact), compact);
+    }
+
+    #[test]
+    fn leaders_stay_inside_the_allowed_mask() {
+        // Pinning must never widen the process's CPU set: every leader chosen
+        // for an odd-CPU mask is odd.
+        let topology = adjacent_smt(8);
+        let odd: Vec<usize> = (0..16).filter(|c| c % 2 == 1).collect();
+        let leaders = topology.leaders_within(&odd);
+        assert_eq!(leaders, odd);
+        assert!(leaders.iter().all(|cpu| odd.contains(cpu)));
+    }
+
+    #[test]
+    fn unknown_cpus_count_as_their_own_core() {
+        // An incomplete topology must over-count, never collapse the cap.
+        let topology = CoreTopology::from_sibling_groups(vec![vec![0, 1]]);
+        assert_eq!(topology.physical_cores_within(&[0, 1, 7, 9]), 3);
+        assert_eq!(topology.leaders_within(&[0, 1, 7, 9]), vec![0, 7, 9]);
+    }
+
+    #[test]
+    fn no_smt_host_is_the_identity() {
+        let topology = no_smt(12);
+        let all: Vec<usize> = (0..12).collect();
+        assert!(!topology.has_smt());
+        assert_eq!(topology.physical_cores_within(&all), 12);
+        assert_eq!(topology.leaders_within(&all), all);
+    }
+
+    #[test]
+    fn empty_allowed_set_reports_no_cores() {
+        assert_eq!(adjacent_smt(4).physical_cores_within(&[]), 0);
+        assert!(adjacent_smt(4).leaders_within(&[]).is_empty());
+    }
+
+    #[test]
+    fn siblings_of_finds_the_group() {
+        let topology = adjacent_smt(4);
+        assert_eq!(topology.siblings_of(5), Some(&[4, 5][..]));
+        assert_eq!(topology.siblings_of(99), None);
+    }
+
+    #[test]
+    fn cpu_list_parser_handles_both_sysfs_spellings() {
+        assert_eq!(parse_cpu_list("0-1\n"), vec![0, 1]);
+        assert_eq!(parse_cpu_list("0,16\n"), vec![0, 16]);
+        assert_eq!(parse_cpu_list(" 2 - 3 , 8 "), vec![2, 3, 8]);
+        assert_eq!(parse_cpu_list(""), Vec::<usize>::new());
+        // A reversed range is malformed; it must yield nothing rather than
+        // panicking or looping.
+        assert_eq!(parse_cpu_list("5-2"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn cap_never_returns_zero_for_a_real_request() {
+        // Whatever this host reports, a request for one worker stays one.
+        assert_eq!(cap_spinning_workers(1), 1);
+        assert_eq!(cap_spinning_workers(0), 0);
+    }
+
+    #[test]
+    fn cap_never_inflates_a_request() {
+        assert!(cap_spinning_workers(2) <= 2);
+        assert!(cap_spinning_workers(64) <= 64);
+    }
+
+    #[test]
+    fn detected_host_topology_is_self_consistent() {
+        // Runs on whatever CI machine this lands on; asserts the invariants
+        // rather than a specific layout, so it is not host-fitted.
+        let Some(topology) = host() else {
+            return;
+        };
+        assert!(topology.core_count() > 0);
+        assert!(topology.logical_count() >= topology.core_count());
+        let mut seen = BTreeSet::new();
+        for group in topology.cores() {
+            assert!(!group.is_empty());
+            assert!(group.windows(2).all(|w| w[0] < w[1]), "group not sorted: {group:?}");
+            for &cpu in group {
+                assert!(seen.insert(cpu), "cpu {cpu} appears in two cores");
+            }
+        }
+        let cores: Vec<Vec<usize>> = topology.cores().to_vec();
+        assert!(
+            cores.windows(2).all(|w| w[0][0] < w[1][0]),
+            "cores not ordered by first cpu"
+        );
+    }
+}
