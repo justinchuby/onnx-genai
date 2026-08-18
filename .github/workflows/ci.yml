@@ -95,7 +95,7 @@ jobs:
           -p onnx-genai-preprocess
           -p onnx-std
           -p onnx-genai-router
-          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
+          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-api -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
           -p onnx-runtime-capi
@@ -129,7 +129,7 @@ jobs:
           -p onnx-genai-preprocess
           -p onnx-std
           -p onnx-genai-router
-          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
+          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-api -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
           -p onnx-runtime-capi
@@ -247,7 +247,7 @@ jobs:
           -p onnx-genai-preprocess
           -p onnx-std
           -p onnx-genai-router
-          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
+          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-api -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
           -p onnx-runtime-capi
@@ -520,7 +520,7 @@ jobs:
           -p onnx-genai-preprocess
           -p onnx-std
           -p onnx-genai-router
-          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
+          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-api -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
           -p onnx-runtime-capi

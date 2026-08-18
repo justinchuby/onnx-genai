@@ -173,6 +173,7 @@ jobs:
           publish_crate onnx-std
           publish_crate onnx-runtime-optimizer
           publish_crate onnx-runtime-cpuinfo
+          publish_crate onnx-runtime-memory-api
           publish_crate onnx-runtime-memory-governor
           publish_crate onnx-runtime-virtual-memory
           publish_crate onnx-runtime-memory

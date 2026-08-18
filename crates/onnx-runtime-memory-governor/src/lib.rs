@@ -37,7 +37,8 @@
 //! canonical `HostGovernor` lives — already depends on `onnx-genai-kv`. The KV
 //! store therefore cannot lease from `HostGovernor` without a dependency cycle,
 //! so the vocabulary has to sit below both. It is also what a third party would
-//! implement against, which is why it depends on nothing but `thiserror`.
+//! implement against, which is why it depends only on the primitive
+//! `onnx-runtime-memory-api` crate and `thiserror`.
 //!
 //! Two divergences from the canonical design, stated rather than hidden:
 //!
@@ -82,6 +83,7 @@ pub use large_alloc_cache::{
     DEFAULT_CACHE_BUDGET_BYTES, FALLBACK_FLOOR_BYTES, LargeAllocCache, LargeAllocCacheStats,
     MAX_CACHED_BYTES, calibrate_floor_bytes, calibrated_floor_bytes, default_budget_bytes,
 };
+pub use onnx_runtime_memory_api::Tier;
 pub use shareability::{
     KvFragmentation, ModelKvGeometry, PrefixShareability, evaluate_geometry_shareability,
     evaluate_prefix_shareability,
@@ -137,38 +139,16 @@ impl std::fmt::Display for MemoryAuthorityId {
     }
 }
 
-/// Where the bytes physically live.
-///
-/// Ordered from fastest to slowest, which is also the demotion order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Tier {
-    /// Accelerator memory (VRAM).
-    Device,
-    /// Host RAM.
-    Host,
-    /// Spill file on disk.
-    Disk,
+trait TierIndex {
+    fn index(self) -> usize;
 }
 
-impl Tier {
-    /// Every tier, fastest first.
-    pub const ALL: [Tier; 3] = [Tier::Device, Tier::Host, Tier::Disk];
-
-    /// Stable index for array-backed per-tier state.
-    const fn index(self) -> usize {
+impl TierIndex for Tier {
+    fn index(self) -> usize {
         match self {
             Tier::Device => 0,
             Tier::Host => 1,
             Tier::Disk => 2,
-        }
-    }
-
-    /// Human-facing name used in error messages.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Tier::Device => "device",
-            Tier::Host => "host",
-            Tier::Disk => "disk",
         }
     }
 }
