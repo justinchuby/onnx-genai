@@ -116,8 +116,27 @@ that selecting this EP keeps work off ORT's CPU EP. `GetCapability` runs
 them. Deleting the policy addressed one; the other two were each found by
 review, after this document had already claimed the job was done.
 
-**Filter 1 — the assignment policy.** Removed. This was the performance-based
-decline.
+**Filter 1 — the assignment policy.** Removed, and now *unrepresentable*. This
+was the performance-based decline. Deleting `assignment_policy.rs` left the
+mechanism it plugged into standing: `ClaimPreference::DeferToHost`, the
+`claim_preference` / `claim_preference_node` trait methods on
+`ExecutionProvider`, and the `host_fallback_available` plumbing that switched
+the gate off under `session.disable_cpu_ep_fallback=1`. All of it is gone from
+`onnx-runtime-ep-api` and `onnx-runtime-ep-plugin`, so an EP can no longer
+decline a node it supports by overriding a default — there is no default left
+to override, and `supports_op` is the only claim-time answer. The
+`session.disable_cpu_ep_fallback` special case went with it: the gate it
+disabled no longer exists.
+
+**Assignment is not execution.** ORT's node→EP attribution is a session-build
+fact, and comparing outputs against ORT cannot distinguish "our kernel ran" from
+"ORT's kernel ran", because agreeing with ORT is what a correct kernel does. The
+plugin therefore counts the node kernels it actually executes
+(`nxrt_ep_executed_node_count`, read through `dlopen` from the same mapping ORT
+loaded) and `every_assigned_node_is_also_executed_by_this_ep` asserts, with CPU
+fallback disabled, that one `Run` advances that counter by exactly the number of
+nodes ORT assigned to `cpu_ep`. A baseline session with the EP never appended
+must leave the counter at zero, which is what keeps the assertion non-vacuous.
 
 **Filter 2 — the shape table.** Drops any claim containing a node whose
 `ShapeInference::for_node` returns `Declined`

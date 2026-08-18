@@ -759,81 +759,12 @@ unsafe extern "C" fn factory_get_supported_devices(
     result.unwrap_or_else(|_| fail_status("GetSupportedDevices: internal panic"))
 }
 
-/// Whether the session forbids ORT from running unclaimed nodes on its own CPU
-/// EP (`session.disable_cpu_ep_fallback=1`).
-///
-/// The plugin's claim-time *routing preference* gate assumes there is a host
-/// kernel to defer to. Under this flag there is not: a node this EP declines
-/// becomes unassignable and ORT fails session creation. So the flag is read
-/// once at `CreateEp` and, when set, the preference gate is disabled — the EP
-/// goes back to claiming everything it can correctly run. A slower kernel is a
-/// regression; a session that will not load is a break.
-fn host_cpu_fallback_disabled(options: *const ort::OrtSessionOptions) -> bool {
-    if options.is_null() {
-        return false;
-    }
-    let api = host_api();
-    if api.is_null() {
-        return false;
-    }
-    let key = c"session.disable_cpu_ep_fallback";
-    let Some(has_entry) = (unsafe { (*api).HasSessionConfigEntry }) else {
-        return false;
-    };
-    let mut present: std::os::raw::c_int = 0;
-    let status = unsafe { has_entry(options, key.as_ptr(), &mut present) };
-    if !status.is_null() {
-        if let Some(release) = unsafe { (*api).ReleaseStatus } {
-            unsafe { release(status) };
-        }
-        return false;
-    }
-    if present == 0 {
-        return false;
-    }
-    let Some(get_entry) = (unsafe { (*api).GetSessionConfigEntry }) else {
-        return false;
-    };
-    let mut len: usize = 0;
-    let status = unsafe { get_entry(options, key.as_ptr(), ptr::null_mut(), &mut len) };
-    if !status.is_null() {
-        if let Some(release) = unsafe { (*api).ReleaseStatus } {
-            unsafe { release(status) };
-        }
-        return false;
-    }
-    if len == 0 || len > 64 {
-        return false;
-    }
-    let mut buf = vec![0u8; len];
-    let status = unsafe {
-        get_entry(
-            options,
-            key.as_ptr(),
-            buf.as_mut_ptr().cast::<c_char>(),
-            &mut len,
-        )
-    };
-    if !status.is_null() {
-        if let Some(release) = unsafe { (*api).ReleaseStatus } {
-            unsafe { release(status) };
-        }
-        return false;
-    }
-    let value = buf
-        .split(|&b| b == 0)
-        .next()
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .unwrap_or("");
-    matches!(value.trim(), "1" | "true" | "True" | "TRUE")
-}
-
 unsafe extern "C" fn factory_create_ep(
     factory: *mut ort::OrtEpFactory,
     _hardware: *const *const ort::OrtHardwareDevice,
     _metadata: *const *const ort::OrtKeyValuePairs,
     _num_devices: usize,
-    session_options: *const ort::OrtSessionOptions,
+    _session_options: *const ort::OrtSessionOptions,
     _logger: *const ort::OrtLogger,
     out_ep: *mut *mut ort::OrtEp,
 ) -> *mut ort::OrtStatus {
@@ -843,7 +774,6 @@ unsafe extern "C" fn factory_create_ep(
         }
 
         let exported = unsafe { &*(factory.cast::<ExportedFactory>()) };
-        let host_fallback_available = !host_cpu_fallback_disabled(session_options);
 
         let registry_outcome = crate::ep::build_ort_kernel_registry(
             &exported.kernel_registry_entries,
@@ -863,29 +793,23 @@ unsafe extern "C" fn factory_create_ep(
         // ORT uses for host<->device transfers. CPU EPs construct a fresh,
         // owned instance.
         let exported_ep = if let Some(ref shared) = exported.shared_ep {
-            Box::new(
-                ExportedEp::new_shared(
-                    std::sync::Arc::clone(shared),
-                    exported.name_cstr.to_str().unwrap_or("nxrt_ep"),
-                    registry_outcome.registry,
-                    exported.kernel_registry_entries.clone(),
-                )
-                .with_host_fallback(host_fallback_available),
-            )
+            Box::new(ExportedEp::new_shared(
+                std::sync::Arc::clone(shared),
+                exported.name_cstr.to_str().unwrap_or("nxrt_ep"),
+                registry_outcome.registry,
+                exported.kernel_registry_entries.clone(),
+            ))
         } else {
             let mut ep = (exported.constructor)();
             let config = onnx_runtime_ep_api::provider::EpConfig::default();
             if let Err(e) = ep.initialize(&config) {
                 return fail_status(&format!("CreateEp: EP initialization failed: {e}"));
             }
-            Box::new(
-                ExportedEp::new_with_registry_and_entries(
-                    ep,
-                    registry_outcome.registry,
-                    exported.kernel_registry_entries.clone(),
-                )
-                .with_host_fallback(host_fallback_available),
-            )
+            Box::new(ExportedEp::new_with_registry_and_entries(
+                ep,
+                registry_outcome.registry,
+                exported.kernel_registry_entries.clone(),
+            ))
         };
         let ep_ptr = Box::into_raw(exported_ep);
         unsafe { *out_ep = ep_ptr.cast::<ort::OrtEp>() };
