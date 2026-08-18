@@ -451,6 +451,117 @@ pub(super) fn kernel_input_uses_padded_capacity(node: &Node, input_index: usize)
         && matches!(node.op_type.as_str(), "Shape" | "ReduceSum")
 }
 
+/// The default-domain ops that make up the standard additive causal-attention
+/// mask builder (`attention_mask → CumSum/Unsqueeze/… → Where(0/-inf) → Cast →
+/// Attention[input 3]`). When the mask binding's entire transitive consumer cone
+/// is limited to these ops and every leaf is a capacity-form `Attention` mask
+/// input (see [`is_capacity_form_attention_mask_input`]), the mask can be frozen
+/// to physical width without changing the additive bias: valid columns `[0, L)`
+/// are width-invariant (the CumSum prefix and fixed key positions are unchanged
+/// by width) and padded columns `[L, max_len)` are forced to `-inf` by the
+/// padding branch's `And`/`Where`, which dominates the CumSum suffix.
+///
+/// Broadcasting combiners that mix the mask *elementwise* with a logical-width
+/// score — e.g. GLM-5.2's indexer `Add` — are deliberately **absent** from this
+/// set, so a mask feeding such a consumer never classifies as padded-safe and
+/// keeps exposing its logical valid length (freezing must never leak `max_len`
+/// into a logical-width computation). Only ops actually observed in the standard
+/// builder cone are listed; anything else disqualifies the binding conservatively.
+pub(super) fn is_additive_mask_builder_op(node: &Node) -> bool {
+    node.is_default_domain()
+        && matches!(
+            node.op_type.as_str(),
+            "CumSum" | "Unsqueeze" | "Cast" | "GreaterOrEqual" | "And" | "Where" | "Slice" | "Sub"
+        )
+}
+
+/// Whether `node`/`input_index` is the additive-mask input (input 3) of a
+/// capacity-form `Attention`: a default-domain `Attention` whose KV cache
+/// (inputs 4/5) is already bound at physical capacity — i.e. a present mask and
+/// no `is_causal` attribute, so it derives the valid length from the mask
+/// frontier (see [`kernel_input_uses_physical_capacity`]). Such a node is
+/// *designed* to consume a physical-width additive mask, so it is a valid leaf
+/// for the frozen-mask (padded-capacity) classification.
+pub(super) fn is_capacity_form_attention_mask_input(node: &Node, input_index: usize) -> bool {
+    input_index == 3
+        && node.is_default_domain()
+        && node.op_type == "Attention"
+        && kernel_input_uses_physical_capacity(node, 4)
+}
+
+/// Structural pattern-match: is `mask` an attention-mask binding whose entire
+/// transitive consumer cone is the standard additive causal-mask builder, with
+/// every leaf a capacity-form `Attention` mask input (input 3)?
+///
+/// Walks forward from the binding over graph edges. Each consumer must be one of:
+/// - a physical-extent shape read (`Shape`/`ReduceSum`, a safe leaf),
+/// - a capacity-form `Attention` mask input (a valid leaf — the `Attention` op
+///   itself is not traversed),
+/// - an additive-mask-builder op (traversed onward to its outputs),
+///
+/// otherwise the binding is disqualified (returns `false`). Requires at least one
+/// capacity-form `Attention` leaf, so a mask that only feeds shape reads — or
+/// escapes as a graph output — is never blessed by this path. Because the builder
+/// op set ([`is_additive_mask_builder_op`]) excludes broadcasting logical-width
+/// combiners (e.g. `Add`), GLM-5.2's indexer mask cone is rejected here and keeps
+/// exposing its logical valid length.
+///
+/// When this holds, freezing the mask to physical (padded) width is byte-identical
+/// to the logical-width mask: valid columns are width-invariant and padded columns
+/// are forced to `-inf` by the padding branch — exactly the physical-width additive
+/// mask a capacity-form `Attention` is designed to consume — which is what lets the
+/// decode step keep a fixed-capacity, capture-stable mask binding.
+pub(super) fn mask_binding_feeds_capacity_form_attention(graph: &Graph, mask: ValueId) -> bool {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    // value → consumers as (node id, input slot).
+    let mut consumers: HashMap<ValueId, Vec<(NodeId, usize)>> = HashMap::new();
+    for (node_id, node) in graph.nodes.iter() {
+        for (slot, value) in node.inputs.iter().enumerate() {
+            if let Some(vid) = value {
+                consumers.entry(*vid).or_default().push((node_id, slot));
+            }
+        }
+    }
+    let graph_outputs: HashSet<ValueId> = graph.outputs.iter().copied().collect();
+
+    let mut visited: HashSet<ValueId> = HashSet::new();
+    let mut frontier: VecDeque<ValueId> = VecDeque::new();
+    frontier.push_back(mask);
+    let mut reached_attention = false;
+    while let Some(value) = frontier.pop_front() {
+        if !visited.insert(value) {
+            continue;
+        }
+        // A mask-derived value must not escape as a graph output under a frozen
+        // (physical-width) mask.
+        if value != mask && graph_outputs.contains(&value) {
+            return false;
+        }
+        for &(node_id, slot) in consumers.get(&value).map_or(&[][..], Vec::as_slice) {
+            let node = graph.node(node_id);
+            if kernel_input_uses_padded_capacity(node, slot) {
+                // `Shape`/`ReduceSum`: reads the physical extent — safe leaf.
+                continue;
+            }
+            if is_capacity_form_attention_mask_input(node, slot) {
+                reached_attention = true;
+                continue;
+            }
+            if is_additive_mask_builder_op(node) {
+                for out in &node.outputs {
+                    frontier.push_back(*out);
+                }
+                continue;
+            }
+            // Any other consumer (e.g. GLM-5.2's indexer `Add`, or a MatMul /
+            // Gather / graph-output sink) observes the mask width: disqualify.
+            return false;
+        }
+    }
+    reached_attention
+}
+
 #[cfg(test)]
 mod gather_tests {
     use super::*;

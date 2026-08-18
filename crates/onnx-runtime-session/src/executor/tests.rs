@@ -1947,6 +1947,263 @@ fn only_capacity_aware_inputs_keep_physical_capacity() {
     assert!(!kernel_input_uses_padded_capacity(&indexer_cast, 0));
 }
 
+// A capacity-form default-domain `Attention`: mask at input 3, KV cache at
+// inputs 4/5, no `is_causal` attribute — so it derives the valid length from the
+// mask frontier and binds the KV cache at physical capacity.
+fn capacity_form_attention(id: u32, q: ValueId, mask: ValueId, out: ValueId) -> Node {
+    Node::new(
+        NodeId(id),
+        "Attention",
+        vec![Some(q), Some(q), Some(q), Some(mask), Some(q), Some(q)],
+        vec![out],
+    )
+}
+
+#[test]
+fn capacity_form_attention_mask_input_classifier() {
+    // The mask slot (input 3) of a capacity-form `Attention` is a valid frozen-mask
+    // leaf; input 3 of a causal-attribute `Attention` (which reads the cache extent
+    // as the valid length) is not, and neither is a non-mask slot.
+    let q = ValueId(0);
+    let capacity = capacity_form_attention(0, q, q, q);
+    assert!(is_capacity_form_attention_mask_input(&capacity, 3));
+    assert!(!is_capacity_form_attention_mask_input(&capacity, 0));
+    assert!(!is_capacity_form_attention_mask_input(&capacity, 4));
+
+    let mut causal = capacity_form_attention(1, q, q, q);
+    causal
+        .attributes
+        .insert("is_causal".into(), Attribute::Int(1));
+    assert!(
+        !is_capacity_form_attention_mask_input(&causal, 3),
+        "an is_causal Attention reads the cache extent as valid length, not the mask frontier"
+    );
+}
+
+// Build the standard additive causal-mask builder cone feeding a capacity-form
+// `Attention` (the DeepSeek-V2-Lite / MLA topology). Returns the graph and the
+// `attention_mask` binding value id.
+fn v2lite_mask_builder_graph() -> (Graph, ValueId) {
+    use onnx_runtime_ir::static_shape;
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let q = graph.create_named_value("q", DataType::Float32, sh());
+
+    // Causal branch: attention_mask → CumSum → Unsqueeze → GreaterOrEqual.
+    let cumsum = graph.create_named_value("cumsum", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "CumSum",
+        vec![Some(mask)],
+        vec![cumsum],
+    ));
+    let unsq0 = graph.create_named_value("unsq0", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Unsqueeze",
+        vec![Some(cumsum)],
+        vec![unsq0],
+    ));
+    let ge = graph.create_named_value("ge", DataType::Bool, sh());
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "GreaterOrEqual",
+        vec![Some(unsq0)],
+        vec![ge],
+    ));
+
+    // Padding branch: attention_mask → Unsqueeze → Cast(bool).
+    let unsq1 = graph.create_named_value("unsq1", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Unsqueeze",
+        vec![Some(mask)],
+        vec![unsq1],
+    ));
+    let padbool = graph.create_named_value("padbool", DataType::Bool, sh());
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "Cast",
+        vec![Some(unsq1)],
+        vec![padbool],
+    ));
+
+    // And → Where(0/-inf) → Cast(fp16) → Unsqueeze → additive mask bias.
+    let and = graph.create_named_value("and", DataType::Bool, sh());
+    graph.insert_node(Node::new(
+        NodeId(5),
+        "And",
+        vec![Some(ge), Some(padbool)],
+        vec![and],
+    ));
+    let where_o = graph.create_named_value("where", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(6),
+        "Where",
+        vec![Some(and)],
+        vec![where_o],
+    ));
+    let cast_o = graph.create_named_value("cast", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(7),
+        "Cast",
+        vec![Some(where_o)],
+        vec![cast_o],
+    ));
+    let mask_bias = graph.create_named_value("mask_bias", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(8),
+        "Unsqueeze",
+        vec![Some(cast_o)],
+        vec![mask_bias],
+    ));
+
+    // Benign physical-extent read.
+    let shp = graph.create_named_value("shp", DataType::Int64, sh());
+    graph.insert_node(Node::new(NodeId(9), "Shape", vec![Some(mask)], vec![shp]));
+
+    // Two capacity-form Attention layers both consuming the shared mask bias.
+    let attn0 = graph.create_named_value("attn0", DataType::Float32, sh());
+    graph.insert_node(capacity_form_attention(10, q, mask_bias, attn0));
+    let attn1 = graph.create_named_value("attn1", DataType::Float32, sh());
+    graph.insert_node(capacity_form_attention(11, q, mask_bias, attn1));
+    graph.add_output(attn0);
+    graph.add_output(attn1);
+
+    (graph, mask)
+}
+
+#[test]
+fn vestigial_window_mask_builder_routes_to_padded_capacity() {
+    // The full additive-mask builder (prefix-sensitive CumSum/Unsqueeze included)
+    // terminating at capacity-form `Attention` inputs is padded-capacity-safe: the
+    // frozen physical-width mask yields a byte-identical additive bias.
+    let (graph, mask) = v2lite_mask_builder_graph();
+    assert!(
+        mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "vestigial-window additive-mask builder → capacity-form Attention must route padded-safe"
+    );
+}
+
+#[test]
+fn minimal_cast_to_capacity_attention_routes_to_padded_capacity() {
+    use onnx_runtime_ir::static_shape;
+    // The tiny-fixture shape: attention_mask → Cast(bool) → capacity-form Attention.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let q = graph.create_named_value("q", DataType::Float32, sh());
+    let bool_mask = graph.create_named_value("attn_mask_bool", DataType::Bool, sh());
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Cast",
+        vec![Some(mask)],
+        vec![bool_mask],
+    ));
+    let attn = graph.create_named_value("attn", DataType::Float32, sh());
+    graph.insert_node(capacity_form_attention(1, q, bool_mask, attn));
+    graph.add_output(attn);
+    assert!(mask_binding_feeds_capacity_form_attention(&graph, mask));
+}
+
+#[test]
+fn glm_indexer_add_mask_keeps_logical_width() {
+    use onnx_runtime_ir::static_shape;
+    // GLM-5.2's indexer branch mixes the mask with a logical-width score through
+    // Cast→Add. `Add` is not an additive-mask-builder op, so the cone is rejected
+    // and the mask keeps exposing its logical valid length (regression guard).
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let score = graph.create_named_value("indexer_score", DataType::Float32, sh());
+    let cast = graph.create_named_value("cast", DataType::Float32, sh());
+    graph.insert_node(Node::new(NodeId(0), "Cast", vec![Some(mask)], vec![cast]));
+    let add = graph.create_named_value("add", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Add",
+        vec![Some(cast), Some(score)],
+        vec![add],
+    ));
+    graph.add_output(add);
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "GLM-5.2 indexer Add mask must NOT be classified padded-safe"
+    );
+}
+
+#[test]
+fn mask_builder_without_capacity_attention_is_rejected() {
+    use onnx_runtime_ir::static_shape;
+    // A mask cone that ends at an is_causal Attention (reads cache extent as valid
+    // length), or reaches no Attention at all, must not be classified padded-safe.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let q = graph.create_named_value("q", DataType::Float32, sh());
+    let cast = graph.create_named_value("cast", DataType::Float32, sh());
+    graph.insert_node(Node::new(NodeId(0), "Cast", vec![Some(mask)], vec![cast]));
+    let attn = graph.create_named_value("attn", DataType::Float32, sh());
+    let mut causal = capacity_form_attention(1, q, cast, attn);
+    causal
+        .attributes
+        .insert("is_causal".into(), Attribute::Int(1));
+    graph.insert_node(causal);
+    graph.add_output(attn);
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "an is_causal terminal Attention is not a capacity-form mask consumer"
+    );
+}
+
+#[test]
+fn mask_feeding_only_shape_is_not_padded_capacity_via_topology() {
+    use onnx_runtime_ir::static_shape;
+    // A mask that reaches no capacity-form Attention (only Shape) is not blessed by
+    // the topology path: `reached_attention` stays false.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let shp = graph.create_named_value("shp", DataType::Int64, sh());
+    graph.insert_node(Node::new(NodeId(0), "Shape", vec![Some(mask)], vec![shp]));
+    graph.add_output(shp);
+    assert!(!mask_binding_feeds_capacity_form_attention(&graph, mask));
+}
+
+#[test]
+fn mask_feeding_non_builder_consumer_is_rejected() {
+    use onnx_runtime_ir::static_shape;
+    // A mask consumed by an arbitrary op (here MatMul) that is neither a shape read,
+    // a builder op, nor a capacity-form Attention input disqualifies the binding.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+    let mask = graph.create_named_value("attention_mask", DataType::Float32, sh());
+    graph.add_input(mask);
+    let w = graph.create_named_value("w", DataType::Float32, sh());
+    let mm = graph.create_named_value("mm", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "MatMul",
+        vec![Some(mask), Some(w)],
+        vec![mm],
+    ));
+    graph.add_output(mm);
+    assert!(!mask_binding_feeds_capacity_form_attention(&graph, mask));
+}
+
 struct WeightDeliveryKernel {
     deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,
     workspace_bytes: u64,
