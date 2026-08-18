@@ -6372,3 +6372,99 @@ fn sequence_promotion_never_retains_a_borrowed_input_alias() {
     assert!(!executor.buffers[&vid].is_borrowed());
     assert!(executor.parked_input_buffers.is_empty());
 }
+
+/// Dropping an executor must return every buffer it owns to the allocator,
+/// including one parked while a zero-copy input alias stood in its slot.
+///
+/// `unbind_borrowed_inputs` restores parked buffers on the normal and error
+/// paths, but a panic unwinding out of a run drops the `Executor` with them
+/// still parked, and `Drop` only drained `self.buffers`. A counting allocator
+/// makes the leak observable: `live` must return to its pre-run value.
+///
+/// Falsifier: delete the `parked_input_buffers` drain in `Drop for Executor`
+/// and the final assertion fails with `live=1`.
+#[test]
+fn dropping_an_executor_with_a_parked_input_buffer_leaks_nothing() {
+    use onnx_runtime_memory_governor::{DeviceAllocator, DeviceKey, HostAllocator, MemoryError};
+    use std::ptr::NonNull;
+
+    #[derive(Debug, Default)]
+    struct CountingAllocator {
+        inner: HostAllocator,
+        live: AtomicUsize,
+        allocated: AtomicUsize,
+    }
+
+    impl DeviceAllocator for CountingAllocator {
+        fn device(&self) -> DeviceKey {
+            self.inner.device()
+        }
+
+        fn allocate(
+            &self,
+            bytes: usize,
+            align: usize,
+        ) -> std::result::Result<NonNull<u8>, MemoryError> {
+            let ptr = self.inner.allocate(bytes, align)?;
+            self.live.fetch_add(1, Ordering::SeqCst);
+            self.allocated.fetch_add(1, Ordering::SeqCst);
+            Ok(ptr)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            // SAFETY: forwarded under this method's contract — `ptr`/`bytes`/
+            // `align` are the triple `allocate` above returned from `inner`.
+            unsafe { self.inner.deallocate(ptr, bytes, align) };
+        }
+    }
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([64]));
+    graph.add_input(input);
+    let out = graph.create_named_value("out", DataType::Float32, static_shape([64]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(input)], vec![out]));
+    graph.add_output(out);
+
+    let counting = Arc::new(CountingAllocator::default());
+    let mut ep = CpuExecutionProvider::new().with_memory(counting.clone());
+    ep.initialize(&Default::default()).unwrap();
+
+    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let vid = executor.input_index["input"];
+
+    let tensor = Tensor::from_f32(&[64], &vec![1.0f32; 64]).unwrap();
+    executor.run(&[("input", &tensor)]).unwrap();
+    assert!(
+        counting.allocated.load(Ordering::SeqCst) > 0,
+        "the run allocated nothing through the counting allocator, so this \
+         test could not observe a leak"
+    );
+
+    // Park the input's owned buffer exactly as `prepare_run_buffers` does when
+    // it installs a zero-copy alias, then drop the executor mid-run. Nothing
+    // else may reach `unbind_borrowed_inputs`.
+    let bytes = tensor.as_bytes();
+    let device = executor.buffers[&vid].device();
+    // SAFETY: `tensor` outlives `executor`, and the handle is never written or
+    // deallocated — it is dropped by `Drop for Executor`, where a borrowed
+    // handle is a no-op free.
+    let borrowed = unsafe {
+        DeviceBuffer::from_borrowed_parts(
+            bytes.as_ptr() as *mut std::ffi::c_void,
+            device,
+            bytes.len(),
+            TensorLayout::contiguous().alignment,
+        )
+    };
+    let owned = std::mem::replace(executor.buffers.get_mut(&vid).unwrap(), borrowed);
+    executor.parked_input_buffers.push((vid, owned));
+
+    drop(executor);
+    assert_eq!(
+        counting.live.load(Ordering::SeqCst),
+        0,
+        "dropping the executor leaked the parked input buffer"
+    );
+}
