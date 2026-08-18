@@ -927,16 +927,19 @@ pub trait ExecutionProvider: Send + Sync {
     /// Whether the memory this provider hands out commits physically as it is
     /// used rather than when it is requested.
     ///
-    /// A forwarder, not a fact of its own: the property belongs to
-    /// [`DeviceAllocator::commits_on_demand`], and a provider should answer by
-    /// asking whichever allocator it is currently using. It is repeated here
-    /// only because a caller holding a session reaches the allocator through
-    /// the provider.
+    /// A forwarder, not a fact of its own: the property belongs to whichever
+    /// allocator the provider is currently using, discovered through
+    /// [`DeviceAllocator::as_virtual_backing`] — an allocator has this
+    /// property exactly when it has a [`VirtualBacking`] capability. This is
+    /// repeated here only because a caller holding a session reaches the
+    /// allocator through the provider, not because the provider tracks it
+    /// independently.
     ///
     /// `false` is the safe default -- a consumer that believes `true` will
     /// under-reserve.
     ///
-    /// [`DeviceAllocator::commits_on_demand`]: onnx_runtime_memory_governor::DeviceAllocator::commits_on_demand
+    /// [`DeviceAllocator::as_virtual_backing`]: onnx_runtime_memory_governor::DeviceAllocator::as_virtual_backing
+    /// [`VirtualBacking`]: onnx_runtime_memory_governor::VirtualBacking
     fn commits_on_demand(&self) -> bool {
         false
     }

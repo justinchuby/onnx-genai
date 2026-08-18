@@ -688,9 +688,12 @@ impl<A: DeviceAllocator> DeviceAllocator for LargeAllocCache<A> {
         self.inner.device()
     }
 
-    fn commits_on_demand(&self) -> bool {
-        self.inner.commits_on_demand()
-    }
+    // `as_virtual_backing`/`as_shared_mapping` intentionally default to
+    // `None` rather than forwarding to `self.inner`: this cache retains freed
+    // blocks for reuse instead of always deallocating them, so a caller
+    // holding one of its pointers is not necessarily looking at the inner
+    // allocator's most recent bookkeeping for that address. It is only ever
+    // instantiated over `HostAllocator`, which has neither capability anyway.
 }
 
 #[cfg(test)]

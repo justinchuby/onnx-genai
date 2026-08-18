@@ -29,7 +29,7 @@ use onnx_runtime_ep_api::{
     WeightHandleError,
 };
 use onnx_runtime_ir::DataType;
-use onnx_runtime_memory_governor::{DeviceAllocator, Tier};
+use onnx_runtime_memory_governor::{Tier, VirtualBacking};
 
 use crate::pinned_pool::PinnedStagingPool;
 use crate::runtime::{CopyCompleted, CudaRuntime, PinnedStaging, raw_ptr};
