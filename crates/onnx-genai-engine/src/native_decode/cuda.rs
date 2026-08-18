@@ -3222,6 +3222,25 @@ impl DecodeCudaState {
     /// bound to reserve, so this errors with actionable guidance rather than
     /// overflowing or silently guessing a bound.
     fn vmm_unbounded_reservation_len(capacity: &CudaKvCapacity) -> anyhow::Result<usize> {
+        // CEILING / KNOWN LIMITATION (tracked in issue #1288):
+        // For a metadata-less model on the VMM path we reserve up-front virtual
+        // address space for `free_bytes / bytes_per_token` tokens. Adding the
+        // per-token mask (8 B/token on top of bytes_per_token) makes the total
+        // carved span ~1.2x device_free. All EP device allocations — decoder
+        // WEIGHTS, KV, and decode SCRATCH — carve from the SAME single VMM arena
+        // of RESERVATION_BYTES = 64 << 30 (see onnx-runtime-ep-cuda provider
+        // `memory()`), and the reservation is virtual-only (only committed
+        // ranges claim physical granules). Measured: loading qwen05b-q4 with VMM
+        // already occupies ~440 MiB across 517 spans in that arena before any KV
+        // reservation. Consequence: on a GPU with ~53 GiB or more free VRAM this
+        // carve can exceed the free virtual span and fail LOUDLY at construction.
+        // That regime is untestable on the RTX 4060 (8 GB) this was developed on,
+        // so we deliberately do NOT clamp here. A correct clamp would need (a) a
+        // public free-VA accessor on the VMM allocator (none exists today; the
+        // free `Spans` are not exposed and `committed_and_reserved()` returns
+        // physical-committed + capacity, not free VA) and (b) a decode-scratch
+        // margin policy, because scratch shares the same arena and an over-tight
+        // clamp would fail later at scratch-carve time instead of loudly here.
         let device_memory = capacity.device_memory.as_ref().with_context(|| {
             format!(
                 "cannot size the VMM-backed CUDA KV reservation for a model with no \
