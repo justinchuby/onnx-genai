@@ -41,7 +41,7 @@
 //! us there any more, and the entry records the measurement that earned it.
 
 use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Environment variable that turns live [`Observation`] recording on.
@@ -586,8 +586,18 @@ fn thread_degree() -> usize {
     }
 }
 
-static RECORDING: AtomicBool = AtomicBool::new(false);
-static INIT: OnceLock<()> = OnceLock::new();
+/// Recording state: [`UNINIT`] until the environment has been consulted, then
+/// [`OFF`] or [`ON`].
+///
+/// Tri-state rather than a `bool` behind a `OnceLock` so that the steady-state
+/// read on a dispatch path is exactly one relaxed load and a branch. A `OnceLock`
+/// guard would add an acquire load and an opaque call to every route decision
+/// forever, to answer a question that is settled after the first one.
+static RECORDING: AtomicU8 = AtomicU8::new(UNINIT);
+
+const UNINIT: u8 = 0;
+const OFF: u8 = 1;
+const ON: u8 = 2;
 
 /// Hard upper bound on retained [`Observation`]s.
 ///
@@ -613,40 +623,58 @@ fn log() -> &'static Mutex<Vec<Observation>> {
 /// backend Y" from a truncated log.
 static DROPPED: AtomicUsize = AtomicUsize::new(0);
 
-/// Honour `NXRT_CPU_DISPATCH_LEDGER=1` exactly once per process.
-fn init_from_env() {
-    INIT.get_or_init(|| {
-        if std::env::var(LEDGER_ENV).as_deref() == Ok("1") {
-            RECORDING.store(true, Ordering::Relaxed);
-        }
-    });
+/// Honour `NXRT_CPU_DISPATCH_LEDGER=1` on the first read.
+///
+/// Off the hot path: reached once per process, or never if [`enable`] or
+/// [`disable`] settles the state first. Two threads racing here read the same
+/// environment and compute the same answer, and the compare-exchange keeps
+/// either of them from overwriting an explicit [`enable`] that landed in
+/// between.
+#[cold]
+#[inline(never)]
+fn init_from_env() -> bool {
+    let from_env = std::env::var(LEDGER_ENV).as_deref() == Ok("1");
+    let settled = if from_env { ON } else { OFF };
+    match RECORDING.compare_exchange(UNINIT, settled, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => from_env,
+        Err(already) => already == ON,
+    }
 }
 
 /// Whether live recording is on.
+///
+/// One relaxed load and a branch once the state has settled, which is what a
+/// dispatch site pays for having the ledger available but off.
 #[inline]
 pub fn is_recording() -> bool {
-    init_from_env();
-    RECORDING.load(Ordering::Relaxed)
+    match RECORDING.load(Ordering::Relaxed) {
+        ON => true,
+        OFF => false,
+        _ => init_from_env(),
+    }
 }
 
 /// Turn live recording on. Intended for tests and benchmarks.
+///
+/// Supersedes the environment, and settles the state if nothing has read it
+/// yet, so a later first read cannot revert this.
 pub fn enable() {
-    init_from_env();
-    RECORDING.store(true, Ordering::Relaxed);
+    RECORDING.store(ON, Ordering::Relaxed);
 }
 
 /// Turn live recording off.
 pub fn disable() {
-    init_from_env();
-    RECORDING.store(false, Ordering::Relaxed);
+    RECORDING.store(OFF, Ordering::Relaxed);
 }
 
 /// Drop every recorded observation.
 pub fn reset() {
     if let Ok(mut entries) = log().lock() {
         entries.clear();
+        // Under the same lock `record` takes, so a concurrent drop cannot be
+        // credited to the run that was just cleared.
+        DROPPED.store(0, Ordering::Relaxed);
     }
-    DROPPED.store(0, Ordering::Relaxed);
 }
 
 /// How many observations were discarded because the log hit

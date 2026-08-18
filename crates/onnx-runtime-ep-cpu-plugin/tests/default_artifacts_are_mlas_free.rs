@@ -78,7 +78,7 @@ fn no_default_feature_list_activates_mlas() {
     if plugin.contains("\ndefault = [") {
         let defaults = array_members(&plugin, "default");
         assert!(
-            !defaults.iter().any(|f| f == "mlas"),
+            !defaults.iter().any(|f| activates_mlas(f)),
             "the shipped plugin cdylib must not enable MLAS by default, found {defaults:?}"
         );
     }
@@ -90,7 +90,7 @@ fn no_default_feature_list_activates_mlas() {
          would pass vacuously"
     );
     assert!(
-        !ep_defaults.iter().any(|f| f == "mlas"),
+        !ep_defaults.iter().any(|f| activates_mlas(f)),
         "onnx-runtime-ep-cpu must not enable MLAS by default, found {ep_defaults:?}"
     );
 
@@ -101,9 +101,20 @@ fn no_default_feature_list_activates_mlas() {
          pass vacuously"
     );
     assert!(
-        !full.iter().any(|f| f == "mlas"),
+        !full.iter().any(|f| activates_mlas(f)),
         "the `full` umbrella is in `default`, so it must not imply MLAS either, found {full:?}"
     );
+}
+
+/// Whether a feature-list entry turns the MLAS reference on.
+///
+/// Exact `== "mlas"` is too narrow: a `default` list reaches MLAS just as well
+/// through `"onnx-runtime-ep-cpu/mlas"`, `"dep:mlas-sys"` or `"mlas-sys/..."`,
+/// and none of those is the bare word. Nothing else in this workspace is named
+/// after MLAS, so matching the substring costs no false positives and removes
+/// the need to predict which spelling a regression will use.
+fn activates_mlas(feature: &str) -> bool {
+    feature.to_ascii_lowercase().contains("mlas")
 }
 
 /// A default build resolves no `mlas-sys` at all.
@@ -136,14 +147,12 @@ fn a_default_build_resolves_no_mlas_sys() {
     let output = match output {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
-            eprintln!(
-                "⏭ a_default_build_resolves_no_mlas_sys: skipped — cargo metadata failed: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
+            let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+            gate_probe_failed(&format!("cargo metadata failed: {stderr}"));
             return;
         }
         Err(e) => {
-            eprintln!("⏭ a_default_build_resolves_no_mlas_sys: skipped — cargo not runnable: {e}");
+            gate_probe_failed(&format!("cargo is not runnable: {e}"));
             return;
         }
     };
@@ -276,7 +285,7 @@ fn the_default_cdylib_contains_no_mlas_symbols() {
         return;
     }
     let Some(path) = cdylib_resolve::find_cpu_plugin_cdylib_optional() else {
-        eprintln!("⏭ the_default_cdylib_contains_no_mlas_symbols: skipped — cdylib not found");
+        gate_probe_failed("the default cdylib was not found, so there was nothing to inspect");
         return;
     };
 
@@ -379,6 +388,23 @@ fn the_wheel_never_proactively_enables_mlas() {
         "setup.py still carries the opt-out escape hatch from the MLAS-by-default \
          design; with MLAS off by default there is nothing to opt out of"
     );
+
+    // Everything above constrains `_mlas_features`, which matters only while
+    // `_mlas_features` is what the build reads. `CARGO_FEATURES = [MLAS_FEATURE]`
+    // would ship an MLAS wheel past every assertion in this file — including
+    // `_verify_features`, which derives what it expects *from* `CARGO_FEATURES`
+    // and so agrees with whatever it is told.
+    assert!(
+        setup.contains("CARGO_FEATURES: list[str] = _mlas_features()"),
+        "setup.py must take its cargo features from the gated `_mlas_features()`; \
+         assigning CARGO_FEATURES directly bypasses the opt-in checked above"
+    );
+    let assignments = setup.match_indices("\nCARGO_FEATURES").count();
+    assert_eq!(
+        assignments, 1,
+        "expected exactly one top-level CARGO_FEATURES binding, found {assignments}; \
+         a later rebinding would silently win over the gated one"
+    );
 }
 
 /// MLAS object-code symbols in an `nm --format=posix` table.
@@ -460,16 +486,37 @@ fn nm(path: &Path, args: &[&str]) -> Option<String> {
         .output()
     {
         Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
-        Ok(o) => {
-            eprintln!(
-                "⏭ the_default_cdylib_contains_no_mlas_symbols: skipped — nm {args:?} failed: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-            None
-        }
-        Err(e) => {
-            eprintln!("⏭ the_default_cdylib_contains_no_mlas_symbols: skipped — nm not found: {e}");
-            None
-        }
+        Ok(o) => gate_probe_failed(&format!(
+            "nm {args:?} failed on {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&o.stderr)
+        )),
+        Err(e) => gate_probe_failed(&format!("nm is not runnable: {e}")),
     }
+}
+
+/// Whether this configuration is one the merge gate is *required* to run in.
+///
+/// The gate is defined on the shipped configuration: a default-feature build on
+/// Linux, which is where release artifacts are produced. Elsewhere — a
+/// `--features mlas` research build, or a platform whose object format this
+/// probe cannot read — skipping is honest.
+fn gate_must_run() -> bool {
+    !cfg!(feature = "mlas") && cfg!(target_os = "linux")
+}
+
+/// Report a probe that could not run.
+///
+/// A test that returns without asserting is a *pass*, so a probe that fails to
+/// execute quietly converts the merge gate into no gate at all — the same
+/// failure mode as measuring a configuration nobody ships. Where the gate is
+/// required, an unusable probe is therefore a failure and not a skip.
+fn gate_probe_failed(why: &str) -> Option<String> {
+    assert!(
+        !gate_must_run(),
+        "the MLAS-free gate could not run its probe on the configuration it \
+         exists to check ({why}); passing here would prove nothing"
+    );
+    eprintln!("⏭ skipped — {why}");
+    None
 }

@@ -143,7 +143,7 @@ work. No shipped build reaches any of these.
 | `MlasConvPrepare` / `Run` | `Convolution` | plus plan lifetime management |
 | `MlasNchwc*` (block size, reorder in/out/filter, conv) | `Convolution` | the 6 extra op registrations a *research* build gains; production uses `conv_ref.rs` |
 | `MlasPool`, `MlasNchwcPool` | `Pooling` | f32 Max/Average |
-| `MlasQNBitGemm` (+ available / packB / workspace) | `MatMulNBits` | prefill `M >= NXRT_SQNBIT_PREFILL_MIN` |
+| `MlasQNBitGemm` (+ available / packB / workspace) | `MatMulNBits` | prefill `M >= NXRT_SQNBIT_DECODE_MIN` |
 | `MlasSetThreading` | all | the MLAS pool runs under *our* thread budget (#1054) |
 
 ### Available but deliberately not used
