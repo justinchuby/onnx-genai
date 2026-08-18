@@ -118,7 +118,16 @@ mod feature_default_guard {
     /// turned out to be about 9x ORT rather than the ~1.0 the tables showed.
     /// If a default build ever links MLAS again, the same class of mistake
     /// becomes possible again, so fail loudly here.
+    /// Deliberately a *runtime* assert over `cfg!`, not a `const` block.
+    /// Cargo features are additive and indistinguishable at `cfg` time, so a
+    /// compile-time assert cannot tell "`mlas` became a default" from "`mlas`
+    /// was explicitly requested" - it fires on both, and CI's MLAS reference
+    /// lanes (`--features mlas` for `kernels::moe::` and
+    /// `kernels::qlinear_matmul::`) then fail to *compile* the test target.
+    /// As a runtime test it only runs in the default-feature build, which is
+    /// exactly the configuration whose feature set it is policing.
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn mlas_is_not_a_default_feature() {
         assert!(
             !cfg!(feature = "mlas"),
