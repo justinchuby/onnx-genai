@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, Weak};
 use std::thread;
 
 use onnx_runtime_memory_api::{
@@ -152,6 +152,60 @@ impl SharedMapping for DropOrderMechanism {
         _byte_offset: usize,
     ) -> Result<SharedPrefixCommitInfo, MemoryError> {
         Ok(SharedPrefixCommitInfo::default())
+    }
+}
+
+/// A provider-context or authority resource that records when it is released.
+#[derive(Debug)]
+struct PinnedResource {
+    label: &'static str,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl Drop for PinnedResource {
+    fn drop(&mut self) {
+        self.log
+            .lock()
+            .expect("drop order log")
+            .push(format!("{} released", self.label));
+    }
+}
+
+/// A third-party allocator that releases device state from `Drop`.
+///
+/// Real provider allocators (CUDA pools, provider-library handles) need their
+/// provider context alive to free anything, so this observer records whether the
+/// registry's context and authority pins were still alive when it ran. The weak
+/// references never keep the resources alive themselves.
+#[derive(Debug)]
+struct ContextDependentAllocator {
+    log: Arc<Mutex<Vec<String>>>,
+    context: Weak<PinnedResource>,
+    authority: Weak<PinnedResource>,
+}
+
+impl Drop for ContextDependentAllocator {
+    fn drop(&mut self) {
+        let context_alive = self.context.upgrade().is_some();
+        let authority_alive = self.authority.upgrade().is_some();
+        self.log.lock().expect("drop order log").push(format!(
+            "allocator released (context alive: {context_alive}, authority alive: {authority_alive})"
+        ));
+    }
+}
+
+impl DeviceAllocator for ContextDependentAllocator {
+    fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
+        HostAllocator.allocate(bytes, align)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+        // SAFETY: forwarded unchanged from this method's contract.
+        unsafe { HostAllocator.deallocate(ptr, bytes, align) };
+    }
+
+    fn device(&self) -> DeviceKey {
+        DeviceKey::HOST
     }
 }
 
@@ -1096,4 +1150,69 @@ fn erased_third_party_allocator_remains_supported() {
     binding.release(allocation).unwrap();
     assert_eq!(concrete.allocations.load(Ordering::SeqCst), 1);
     assert_eq!(concrete.frees.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn allocator_drop_runs_while_context_and_authority_pins_are_alive() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let context_resource = Arc::new(PinnedResource {
+        label: "context",
+        log: Arc::clone(&log),
+    });
+    let authority_resource = Arc::new(PinnedResource {
+        label: "authority",
+        log: Arc::clone(&log),
+    });
+    let registry = BindingRegistry::new().unwrap();
+    let context = registry
+        .register_provider_context(
+            DeviceKey::HOST,
+            Arc::clone(&context_resource) as Arc<dyn BindingResource>,
+        )
+        .unwrap();
+    let authority = registry
+        .register_authority(
+            DeviceKey::HOST,
+            Arc::clone(&authority_resource) as Arc<dyn BindingResource>,
+        )
+        .unwrap();
+    let mechanism = registry
+        .register_allocator(
+            context,
+            authority,
+            Arc::new(ContextDependentAllocator {
+                log: Arc::clone(&log),
+                context: Arc::downgrade(&context_resource),
+                authority: Arc::downgrade(&authority_resource),
+            }) as Arc<dyn DeviceAllocator>,
+        )
+        .unwrap();
+    let binding = registry.bind(DeviceKey::HOST).unwrap();
+
+    // Retire every registry-side and test-side owner, so the outstanding
+    // binding becomes the only remaining pin on the allocator and its
+    // resources and their drop order is decided entirely by the registry.
+    registry.retire(mechanism).unwrap();
+    registry.remove(mechanism).unwrap();
+    registry.remove_provider_context(context).unwrap();
+    registry.remove_authority(authority).unwrap();
+    drop(registry);
+    drop(context_resource);
+    drop(authority_resource);
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "an outstanding binding must keep the allocator and both pins alive"
+    );
+
+    drop(binding);
+    let events = log.lock().unwrap().clone();
+    assert_eq!(
+        events,
+        vec![
+            "allocator released (context alive: true, authority alive: true)".to_string(),
+            "authority released".to_string(),
+            "context released".to_string(),
+        ],
+        "the allocator destructor must run before its provider-context and authority pins"
+    );
 }

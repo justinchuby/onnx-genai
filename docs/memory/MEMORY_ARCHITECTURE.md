@@ -1695,7 +1695,12 @@ selected `Arc<dyn DeviceAllocator>`, provider-context `BindingResource`, and
 authority `BindingResource`. `BoundAllocation`, `BoundMemoryView`, and bound
 capability handles clone that same binding. Dropping a session/EP front-end or
 the registry therefore cannot destroy the context while any bound metadata or
-active operation still references it. `BoundAllocation` has no `Drop` release;
+active operation still references it. Within that entry the allocator and its
+two pins live in one resource owner whose field order is load-bearing: the
+allocator is destroyed first, so a third-party allocator that releases device
+state from `Drop` still observes a live provider context and authority, and the
+provider context — the deepest resource — is released last.
+`BoundAllocation` has no `Drop` release;
 whole-allocation release remains explicit through `MemoryBinding::release` and
 the original `DeviceAllocator`. Phase 3 calls canonical `deallocate` and does
 not expose the EP's mapped-attribution refund from `deallocate_with_unmapped`;
@@ -1710,6 +1715,33 @@ cross-binding, cross-mechanism, cross-authority, and cross-device metadata is
 rejected before a capability or validated device callback runs. When a virtual
 address is reused, its new `AllocationGeneration` differs and a stale view
 fails validation.
+
+Selection publishes a candidate and then re-checks it, because a mechanism can
+be retired or lost in between. Withdrawing a failed candidate never leaves a
+dead selection behind. A candidate is withdrawn only while it still owns the
+device's selection, so a losing candidate cannot overwrite a newer selection
+published concurrently. The previous selection is restored only while it is
+still registered **and** `Active`, so a concurrently retired, lost, or removed
+predecessor is never resurrected. Otherwise the selection is cleared, because an
+absent selection is the only state a later registration self-heals — a stale
+identity left in the slot would wedge the device permanently. A restored
+predecessor is re-checked exactly like the candidate was, and that retry carries
+no further fallback. Withdrawal changes identity state only: it makes no
+allocator callback and, like every other registry path, releases the registry
+lock before each mechanism lifecycle snapshot.
+
+Retirement and device loss cooperate with that re-check by making the lifecycle
+terminal **before** dropping the selection. Because the registry lock and a
+mechanism lock may never be held together, dropping the selection first would
+leave a window in which a `select` that already validated the mechanism
+publishes it after the clear and still observes `Active` at its own re-check —
+wedging the device on a retired or lost selection that no later registration can
+heal. Retiring first closes that window: any selection published afterwards must
+have validated earlier, so it fails its re-check and withdraws itself. Device
+loss drops only a selection naming a mechanism it actually invalidated, so a
+registration that lands after the call returns is never deselected by it; one
+that lands mid-call may be left unselected, which fails closed and heals on the
+next registration or explicit selection.
 
 Device loss removes the current selection and makes every affected binding
 return an explicit `DeviceLost` error, including on attempted release. That path
@@ -1738,8 +1770,11 @@ Phase 3 adds no deferred-free queue, fence/event scheduling, owning allocation
 RAII, physical-release completeness state, partial-unmap recovery, quarantine,
 or pointer-only retry API. `BoundSharedPrefix` teardown is still drop-driven,
 not lifecycle-gated by the registry; field order only guarantees that its
-provider-context/resource pin outlives physical-prefix destruction. True
-stream-ordered, partial-failure-safe teardown remains Phase 4 work.
+provider-context/resource pin outlives physical-prefix destruction. Allocator
+teardown carries the same limit: field order guarantees only that the
+provider-context and authority pins outlive the allocator's destructor, not that
+the destructor's device work is ordered against a stream. True stream-ordered,
+partial-failure-safe teardown remains Phase 4 work.
 
 ### 1.2 Two directions, both backends
 

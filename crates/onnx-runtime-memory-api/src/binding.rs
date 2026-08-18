@@ -318,19 +318,52 @@ struct MechanismState {
     allocations: HashMap<AllocationGeneration, AllocationRecord>,
 }
 
+/// One registered allocator together with the resources its destructor needs.
+///
+/// Declaration order here is load-bearing rather than incidental. Rust drops
+/// struct fields in declaration order, so the allocator is destroyed first and
+/// its `Drop` still observes live provider-context and authority resources. A
+/// third-party allocator may release device state from `Drop`, and that work
+/// needs its provider context (a CUDA context, a loaded provider library) alive.
+/// The provider context is the deepest resource, so it is released last.
+///
+/// Keeping the three pins in one owner type means the ordering cannot be broken
+/// by unrelated field edits to [`MechanismEntry`].
+#[derive(Debug)]
+struct MechanismResources {
+    /// Destroyed first, while both pins below are still alive.
+    allocator: Arc<dyn DeviceAllocator>,
+    /// Outlives the allocator, so `Drop` can still settle accounting identity.
+    authority: Arc<AuthorityEntry>,
+    /// Outlives the allocator and the authority; released last.
+    context: Arc<ProviderContextEntry>,
+}
+
 #[derive(Debug)]
 struct MechanismEntry {
     identity: MechanismIdentity,
     device: DeviceKey,
-    context: Arc<ProviderContextEntry>,
-    authority: Arc<AuthorityEntry>,
-    allocator: Arc<dyn DeviceAllocator>,
     coherence: MechanismCoherence,
     state: Mutex<MechanismState>,
     active_operations: AtomicUsize,
+    /// Declared last so the allocator and its pins are released only after the
+    /// entry's own identity/lifecycle state is gone.
+    resources: MechanismResources,
 }
 
 impl MechanismEntry {
+    fn allocator(&self) -> &dyn DeviceAllocator {
+        self.resources.allocator.as_ref()
+    }
+
+    fn context_identity(&self) -> ProviderContextIdentity {
+        self.resources.context.identity
+    }
+
+    fn authority_identity(&self) -> AuthorityIdentity {
+        self.resources.authority.identity
+    }
+
     fn lock_state(
         &self,
         operation: &'static str,
@@ -453,8 +486,8 @@ impl MechanismEntry {
         Ok(MechanismSnapshot {
             identity: self.identity,
             device: self.device,
-            provider_context: self.context.identity,
-            authority: self.authority.identity,
+            provider_context: self.context_identity(),
+            authority: self.authority_identity(),
             coherence: self.coherence,
             lifecycle: state.lifecycle,
             live_allocations: state.allocations.len(),
@@ -489,13 +522,45 @@ struct RegistryInner {
     identities: Arc<IdentitySource>,
     state: Mutex<RegistryState>,
     #[cfg(test)]
-    select_after_validation_hook: Mutex<Option<SelectAfterValidationHook>>,
+    hooks: Mutex<Vec<RegistryHook>>,
+}
+
+/// What a test hook is keyed on.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HookSubject {
+    Mechanism(MechanismIdentity),
+    Device(DeviceKey),
+}
+
+/// A point inside a registry transition a test may pause at.
+///
+/// Selection and lifecycle transitions each span the registry lock and a
+/// mechanism lock, which may never be held together. Pausing between those
+/// phases is what makes the resulting races reproducible by construction rather
+/// than by timing.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HookPhase {
+    /// In `select`, after the candidate validated `Active` and before its
+    /// selection is published.
+    SelectAfterValidation,
+    /// In `select`, after the selection is published and before the candidate is
+    /// re-checked and possibly withdrawn.
+    SelectAfterPublish,
+    /// In `retire`, between the mechanism-lock lifecycle phase and the
+    /// registry-lock selection phase.
+    RetireBetweenPhases,
+    /// In `invalidate_device`, between the mechanism-lock lifecycle phase and
+    /// the registry-lock selection phase.
+    InvalidateBetweenPhases,
 }
 
 #[cfg(test)]
 #[derive(Clone, Debug)]
-struct SelectAfterValidationHook {
-    mechanism: MechanismIdentity,
+struct RegistryHook {
+    subject: HookSubject,
+    phase: HookPhase,
     entered: Arc<std::sync::Barrier>,
     resume: Arc<std::sync::Barrier>,
 }
@@ -520,7 +585,7 @@ impl BindingRegistry {
                 identities: Arc::new(IdentitySource::new()?),
                 state: Mutex::new(RegistryState::default()),
                 #[cfg(test)]
-                select_after_validation_hook: Mutex::new(None),
+                hooks: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -649,9 +714,6 @@ impl BindingRegistry {
         let entry = Arc::new(MechanismEntry {
             identity,
             device: context_entry.device,
-            context: context_entry,
-            authority: authority_entry,
-            allocator,
             coherence,
             state: Mutex::new(MechanismState {
                 lifecycle: MechanismLifecycle::Active,
@@ -659,6 +721,11 @@ impl BindingRegistry {
                 allocations: HashMap::new(),
             }),
             active_operations: AtomicUsize::new(0),
+            resources: MechanismResources {
+                allocator,
+                authority: authority_entry,
+                context: context_entry,
+            },
         });
         state.mechanisms.insert(identity, entry);
         state.selected.entry(context.device).or_insert(identity);
@@ -669,6 +736,15 @@ impl BindingRegistry {
         })
     }
 
+    /// Make `mechanism` the mechanism that later `bind(device)` calls use.
+    ///
+    /// A mechanism can be retired or lost between validation and publication, so
+    /// the candidate is re-checked after it is published. When that re-check
+    /// fails the selection is withdrawn, and the withdrawal never leaves a dead
+    /// or unregistered mechanism selected: it will not overwrite a newer
+    /// selection, restores the previous selection only while that is still
+    /// registered and `Active`, and otherwise clears the selection so a later
+    /// registration for the device can heal it.
     pub fn select(&self, mechanism: RegisteredMechanism) -> Result<(), BindingError> {
         self.ensure_local(mechanism.identity.0, "mechanism")?;
         let entry = {
@@ -688,21 +764,22 @@ impl BindingRegistry {
             });
         }
         #[cfg(test)]
-        self.wait_after_select_validation(mechanism.identity);
+        self.wait_at_hook(
+            HookSubject::Mechanism(mechanism.identity),
+            HookPhase::SelectAfterValidation,
+        );
         let prior = self
             .lock_state("publishing mechanism selection")?
             .selected
             .insert(mechanism.device, mechanism.identity);
+        #[cfg(test)]
+        self.wait_at_hook(
+            HookSubject::Mechanism(mechanism.identity),
+            HookPhase::SelectAfterPublish,
+        );
         let published = entry.snapshot()?;
         if published.lifecycle != MechanismLifecycle::Active {
-            let mut state = self.lock_state("withdrawing inactive mechanism selection")?;
-            if state.selected.get(&mechanism.device) == Some(&mechanism.identity) {
-                if let Some(prior) = prior {
-                    state.selected.insert(mechanism.device, prior);
-                } else {
-                    state.selected.remove(&mechanism.device);
-                }
-            }
+            self.withdraw_failed_selection(mechanism.device, mechanism.identity, prior)?;
             return Err(BindingError::InactiveMechanism {
                 mechanism: mechanism.identity,
                 lifecycle: published.lifecycle,
@@ -712,15 +789,108 @@ impl BindingRegistry {
         Ok(())
     }
 
+    /// Withdraw a published selection whose candidate turned out to be inactive.
+    ///
+    /// Three rules keep `selected` pointing only at a live registration:
+    ///
+    /// 1. the candidate is only replaced while it still owns `device`'s
+    ///    selection, so a newer selection published by another thread is never
+    ///    overwritten by a losing candidate;
+    /// 2. `prior` is restored only while it is still registered *and* `Active`,
+    ///    so a concurrently retired, lost, or removed prior is not resurrected;
+    /// 3. otherwise the selection is cleared, because an absent selection is the
+    ///    only state a later [`BindingRegistry::register_allocator`] can heal.
+    ///
+    /// The restored mechanism is re-checked after publication for the same
+    /// reason the candidate was, and that retry carries no further fallback, so
+    /// the loop runs at most twice.
+    ///
+    /// # Lock order
+    ///
+    /// The registry lock is released before every mechanism lifecycle snapshot,
+    /// so the two lock classes are still never held together and no allocator or
+    /// capability callback runs here.
+    fn withdraw_failed_selection(
+        &self,
+        device: DeviceKey,
+        candidate: MechanismIdentity,
+        prior: Option<MechanismIdentity>,
+    ) -> Result<(), BindingError> {
+        const OPERATION: &str = "withdrawing inactive mechanism selection";
+        let mut owner = candidate;
+        let mut replacement = prior;
+        loop {
+            let restorable = match replacement {
+                Some(identity) => {
+                    let entry = {
+                        let state = self.lock_state(OPERATION)?;
+                        if state.selected.get(&device) != Some(&owner) {
+                            return Ok(());
+                        }
+                        state.mechanisms.get(&identity).cloned()
+                    };
+                    match entry {
+                        Some(entry)
+                            if entry.snapshot()?.lifecycle == MechanismLifecycle::Active =>
+                        {
+                            Some(entry)
+                        }
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+
+            let restored = {
+                let mut state = self.lock_state(OPERATION)?;
+                if state.selected.get(&device) != Some(&owner) {
+                    return Ok(());
+                }
+                // Registration is re-confirmed under the lock that publishes it,
+                // so a `remove` racing the lifecycle snapshot above cannot leave
+                // an unregistered identity selected.
+                match restorable {
+                    Some(entry) if state.mechanisms.contains_key(&entry.identity) => {
+                        state.selected.insert(device, entry.identity);
+                        entry
+                    }
+                    _ => {
+                        state.selected.remove(&device);
+                        return Ok(());
+                    }
+                }
+            };
+
+            if restored.snapshot()?.lifecycle == MechanismLifecycle::Active {
+                return Ok(());
+            }
+            owner = restored.identity;
+            replacement = None;
+        }
+    }
+
     #[cfg(test)]
-    fn wait_after_select_validation(&self, mechanism: MechanismIdentity) {
+    fn install_hook(&self, hook: RegistryHook) {
+        self.inner
+            .hooks
+            .lock()
+            .expect("registry test hook lock")
+            .push(hook);
+    }
+
+    #[cfg(test)]
+    fn wait_at_hook(&self, subject: HookSubject, phase: HookPhase) {
         let hook = self
             .inner
-            .select_after_validation_hook
+            .hooks
             .lock()
-            .expect("select test hook lock")
-            .clone();
-        if let Some(hook) = hook.filter(|hook| hook.mechanism == mechanism) {
+            .expect("registry test hook lock")
+            .iter()
+            .find(|hook| hook.subject == subject && hook.phase == phase)
+            .cloned();
+        // The hook lock is released before waiting so a paused caller never
+        // blocks the test thread that is about to release it.
+        if let Some(hook) = hook {
             hook.entered.wait();
             hook.resume.wait();
         }
@@ -764,8 +934,8 @@ impl BindingRegistry {
             generation: self.inner.identities.binding_generation()?,
             device: entry.device,
             mechanism: entry.identity,
-            provider_context: entry.context.identity,
-            authority: entry.authority.identity,
+            provider_context: entry.context_identity(),
+            authority: entry.authority_identity(),
         };
         drop(operation);
         Ok(MemoryBinding {
@@ -779,22 +949,50 @@ impl BindingRegistry {
     ///
     /// Existing allocations keep the original allocator/context/authority pinned
     /// and may still use [`MemoryBinding::release`] explicitly.
+    ///
+    /// The lifecycle is made terminal *before* the selection is dropped. The two
+    /// lock classes cannot be held together, so the reverse order leaves a window
+    /// in which a concurrent `select` that already validated this mechanism
+    /// publishes it after the clear and still observes `Active` at its own
+    /// re-check, wedging the device on a retired selection. Retiring first means
+    /// any such `select` must fail its re-check and withdraw itself.
     pub fn retire(&self, mechanism: RegisteredMechanism) -> Result<(), BindingError> {
         self.ensure_local(mechanism.identity.0, "mechanism")?;
         let entry = {
-            let mut state = self.lock_state("retiring a mechanism")?;
-            if state.selected.get(&mechanism.device) == Some(&mechanism.identity) {
-                state.selected.remove(&mechanism.device);
-            }
+            let state = self.lock_state("retiring a mechanism")?;
             state
                 .mechanisms
                 .get(&mechanism.identity)
                 .cloned()
                 .ok_or(BindingError::UnregisteredMechanism(mechanism.identity))?
         };
-        let mut mechanism_state = entry.lock_state("retiring a mechanism")?;
-        if mechanism_state.lifecycle == MechanismLifecycle::Active {
-            mechanism_state.lifecycle = MechanismLifecycle::Retired;
+        {
+            let mut mechanism_state = entry.lock_state("retiring a mechanism")?;
+            if mechanism_state.lifecycle == MechanismLifecycle::Active {
+                mechanism_state.lifecycle = MechanismLifecycle::Retired;
+            }
+        }
+        #[cfg(test)]
+        self.wait_at_hook(
+            HookSubject::Mechanism(mechanism.identity),
+            HookPhase::RetireBetweenPhases,
+        );
+        self.drop_selection_of(mechanism.device, mechanism.identity, "retiring a mechanism")
+    }
+
+    /// Drop `device`'s selection while it still names `mechanism`.
+    ///
+    /// Never touches a selection naming anything else, so a healthy selection
+    /// published concurrently is left alone.
+    fn drop_selection_of(
+        &self,
+        device: DeviceKey,
+        mechanism: MechanismIdentity,
+        operation: &'static str,
+    ) -> Result<(), BindingError> {
+        let mut state = self.lock_state(operation)?;
+        if state.selected.get(&device) == Some(&mechanism) {
+            state.selected.remove(&device);
         }
         Ok(())
     }
@@ -803,6 +1001,16 @@ impl BindingRegistry {
     ///
     /// This method changes identity/lifetime state only. It does not invoke a
     /// device callback, free physical memory, release a lease, or refund quota.
+    ///
+    /// Like [`BindingRegistry::retire`], every affected mechanism is made
+    /// terminal before the selection is dropped, so a `select` racing device loss
+    /// cannot leave a lost mechanism selected. Only a selection naming a
+    /// mechanism this call actually invalidated is dropped, so a mechanism
+    /// registered after this call returns is never deselected by it. A
+    /// registration that lands while this call is in flight may still end up
+    /// unselected, because the slot it tried to claim was held by an identity
+    /// this call then dropped; that fails closed, and the next registration or
+    /// explicit [`BindingRegistry::select`] restores a selection.
     pub fn invalidate_device(
         &self,
         device: DeviceKey,
@@ -810,8 +1018,7 @@ impl BindingRegistry {
     ) -> Result<(), BindingError> {
         let reason = reason.into();
         let entries = {
-            let mut state = self.lock_state("invalidating a device")?;
-            state.selected.remove(&device);
+            let state = self.lock_state("invalidating a device")?;
             state
                 .mechanisms
                 .values()
@@ -819,12 +1026,25 @@ impl BindingRegistry {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        for entry in entries {
+        for entry in &entries {
             let mut state = entry.lock_state("invalidating a device binding")?;
             if state.lifecycle != MechanismLifecycle::Terminated {
                 state.lifecycle = MechanismLifecycle::DeviceLost;
                 state.loss_reason = Some(Arc::clone(&reason));
             }
+        }
+        #[cfg(test)]
+        self.wait_at_hook(
+            HookSubject::Device(device),
+            HookPhase::InvalidateBetweenPhases,
+        );
+        let mut state = self.lock_state("invalidating a device")?;
+        let invalidated = state
+            .selected
+            .get(&device)
+            .is_some_and(|selected| entries.iter().any(|entry| entry.identity == *selected));
+        if invalidated {
+            state.selected.remove(&device);
         }
         Ok(())
     }
@@ -848,7 +1068,7 @@ impl BindingRegistry {
             state
                 .mechanisms
                 .values()
-                .filter(|entry| entry.context.identity == context.identity)
+                .filter(|entry| entry.context_identity() == context.identity)
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -891,7 +1111,7 @@ impl BindingRegistry {
         if state
             .mechanisms
             .values()
-            .any(|entry| entry.context.identity == context.identity)
+            .any(|entry| entry.context_identity() == context.identity)
         {
             return Err(BindingError::ProviderContextInUse(context.identity));
         }
@@ -911,7 +1131,7 @@ impl BindingRegistry {
         if state
             .mechanisms
             .values()
-            .any(|entry| entry.authority.identity == authority.identity)
+            .any(|entry| entry.authority_identity() == authority.identity)
         {
             return Err(BindingError::AuthorityInUse(authority.identity));
         }
@@ -1066,13 +1286,13 @@ impl MemoryBinding {
         align: usize,
     ) -> Result<BoundAllocation, BindingError> {
         let active = self.mechanism.begin_active(operation)?;
-        let ptr = allocate(self.mechanism.allocator.as_ref())?;
+        let ptr = allocate(self.mechanism.allocator())?;
         let generation = match self.identities.allocation_generation() {
             Ok(generation) => generation,
             Err(error) => {
                 // SAFETY: this is the exact allocation returned immediately
                 // above; identity issuance failed before it escaped.
-                unsafe { self.mechanism.allocator.deallocate(ptr, bytes, align) };
+                unsafe { self.mechanism.allocator().deallocate(ptr, bytes, align) };
                 return Err(error);
             }
         };
@@ -1089,7 +1309,7 @@ impl MemoryBinding {
         };
         if let Err(error) = self.mechanism.record_allocation(allocation.record()) {
             // SAFETY: identity recording failed before the allocation escaped.
-            unsafe { self.mechanism.allocator.deallocate(ptr, bytes, align) };
+            unsafe { self.mechanism.allocator().deallocate(ptr, bytes, align) };
             return Err(error);
         }
         drop(active);
@@ -1122,7 +1342,7 @@ impl MemoryBinding {
         let align = allocation.align;
         // SAFETY: begin_release matched and retired the exact live record before
         // this canonical whole-allocation release. No registry lock is held.
-        unsafe { self.mechanism.allocator.deallocate(ptr, bytes, align) };
+        unsafe { self.mechanism.allocator().deallocate(ptr, bytes, align) };
         drop(operation);
         Ok(())
     }
@@ -1131,7 +1351,7 @@ impl MemoryBinding {
         let operation = self
             .mechanism
             .begin_active("discovering virtual backing capability")?;
-        let present = self.mechanism.allocator.as_virtual_backing().is_some();
+        let present = self.mechanism.allocator().as_virtual_backing().is_some();
         drop(operation);
         Ok(present.then(|| BoundVirtualBacking {
             binding: self.clone(),
@@ -1142,7 +1362,7 @@ impl MemoryBinding {
         let operation = self
             .mechanism
             .begin_active("discovering shared mapping capability")?;
-        let present = self.mechanism.allocator.as_shared_mapping().is_some();
+        let present = self.mechanism.allocator().as_shared_mapping().is_some();
         drop(operation);
         Ok(present.then(|| BoundSharedMapping {
             binding: self.clone(),
@@ -1407,7 +1627,7 @@ impl BoundVirtualBacking {
         let capability = self
             .binding
             .mechanism
-            .allocator
+            .allocator()
             .as_virtual_backing()
             .expect("capability presence is stable for a registered allocator");
         capability.commit_allocation_range(
@@ -1446,7 +1666,7 @@ impl BoundVirtualBacking {
         }
         self.binding
             .mechanism
-            .allocator
+            .allocator()
             .as_virtual_backing()
             .expect("capability presence is stable for a registered allocator")
             .commit_allocation_ranges(&raw)?;
@@ -1466,7 +1686,7 @@ impl BoundVirtualBacking {
         let mapped = self
             .binding
             .mechanism
-            .allocator
+            .allocator()
             .as_virtual_backing()
             .expect("capability presence is stable for a registered allocator")
             .mapped_bytes_for_allocation(bytes, align)?;
@@ -1492,7 +1712,7 @@ impl BoundVirtualBacking {
         let unmapped = self
             .binding
             .mechanism
-            .allocator
+            .allocator()
             .as_virtual_backing()
             .expect("capability presence is stable for a registered allocator")
             .decommit_allocation_range(
@@ -1522,7 +1742,7 @@ impl BoundVirtualBacking {
         let committed = self
             .binding
             .mechanism
-            .allocator
+            .allocator()
             .as_virtual_backing()
             .expect("capability presence is stable for a registered allocator")
             .allocation_committed_bytes(allocation.ptr, allocation.bytes, allocation.align);
@@ -1550,7 +1770,7 @@ impl BoundSharedMapping {
         let prefix = self
             .binding
             .mechanism
-            .allocator
+            .allocator()
             .as_shared_mapping()
             .expect("capability presence is stable for a registered allocator")
             .create_shared_prefix(bytes)?;
@@ -1573,7 +1793,7 @@ impl BoundSharedMapping {
         let bytes = self
             .binding
             .mechanism
-            .allocator
+            .allocator()
             .as_shared_mapping()
             .expect("capability presence is stable for a registered allocator")
             .incremental_owned_bytes_for_shared_prefix(prefix.prefix.as_ref())?;
@@ -1600,7 +1820,7 @@ impl BoundSharedMapping {
         let info = self
             .binding
             .mechanism
-            .allocator
+            .allocator()
             .as_shared_mapping()
             .expect("capability presence is stable for a registered allocator")
             .commit_shared_prefix(
@@ -1670,54 +1890,425 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn failed_select_restores_the_prior_healthy_selection() {
-        let registry = BindingRegistry::new().unwrap();
-        let context = registry
-            .register_provider_context(DeviceKey::HOST, Arc::new(()) as Arc<dyn BindingResource>)
-            .unwrap();
-        let authority = registry
-            .register_authority(DeviceKey::HOST, Arc::new(()) as Arc<dyn BindingResource>)
-            .unwrap();
-        let prior = registry
-            .register_allocator(
+    /// A real [`BindingRegistry`] with one registered context/authority pair.
+    ///
+    /// Every selection test below drives the production registry; only the
+    /// pause points are test-owned, so the code under test is unchanged.
+    struct SelectionFixture {
+        registry: BindingRegistry,
+        context: RegisteredProviderContext,
+        authority: RegisteredAuthority,
+    }
+
+    impl SelectionFixture {
+        fn new() -> Self {
+            let registry = BindingRegistry::new().expect("registry");
+            let context = registry
+                .register_provider_context(
+                    DeviceKey::HOST,
+                    Arc::new(()) as Arc<dyn BindingResource>,
+                )
+                .expect("context registration");
+            let authority = registry
+                .register_authority(DeviceKey::HOST, Arc::new(()) as Arc<dyn BindingResource>)
+                .expect("authority registration");
+            Self {
+                registry,
                 context,
                 authority,
-                Arc::new(HostAllocator) as Arc<dyn DeviceAllocator>,
-            )
-            .unwrap();
-        let candidate = registry
-            .register_allocator(
-                context,
-                authority,
-                Arc::new(HostAllocator) as Arc<dyn DeviceAllocator>,
-            )
-            .unwrap();
-        let entered = Arc::new(Barrier::new(2));
-        let resume = Arc::new(Barrier::new(2));
-        *registry.inner.select_after_validation_hook.lock().unwrap() =
-            Some(SelectAfterValidationHook {
-                mechanism: candidate.identity,
+            }
+        }
+
+        /// Register one more mechanism. The first registration for a device also
+        /// becomes its initial selection.
+        fn mechanism(&self) -> RegisteredMechanism {
+            self.registry
+                .register_allocator(
+                    self.context,
+                    self.authority,
+                    Arc::new(HostAllocator) as Arc<dyn DeviceAllocator>,
+                )
+                .expect("mechanism registration")
+        }
+
+        fn gate(&self, mechanism: RegisteredMechanism, phase: HookPhase) -> Gate {
+            self.gate_subject(HookSubject::Mechanism(mechanism.identity), phase)
+        }
+
+        fn gate_device(&self, phase: HookPhase) -> Gate {
+            self.gate_subject(HookSubject::Device(DeviceKey::HOST), phase)
+        }
+
+        fn gate_subject(&self, subject: HookSubject, phase: HookPhase) -> Gate {
+            let entered = Arc::new(Barrier::new(2));
+            let resume = Arc::new(Barrier::new(2));
+            self.registry.install_hook(RegistryHook {
+                subject,
+                phase,
                 entered: Arc::clone(&entered),
                 resume: Arc::clone(&resume),
             });
+            Gate { entered, resume }
+        }
 
-        let selecting_registry = registry.clone();
-        let selecting = thread::spawn(move || selecting_registry.select(candidate));
-        entered.wait();
-        registry.retire(candidate).unwrap();
-        resume.wait();
+        fn select_on_thread(
+            &self,
+            mechanism: RegisteredMechanism,
+        ) -> thread::JoinHandle<Result<(), BindingError>> {
+            let registry = self.registry.clone();
+            thread::spawn(move || registry.select(mechanism))
+        }
 
-        let error = selecting.join().unwrap().unwrap_err();
-        assert!(matches!(
-            error,
-            BindingError::InactiveMechanism {
-                mechanism,
-                lifecycle: MechanismLifecycle::Retired,
-                operation: "selecting a mechanism",
-            } if mechanism == candidate.identity
-        ));
-        let selected = registry.bind(DeviceKey::HOST).unwrap();
-        assert_eq!(selected.identity().mechanism(), prior.identity);
+        fn selected_mechanism(&self) -> Result<MechanismIdentity, BindingError> {
+            self.registry
+                .bind(DeviceKey::HOST)
+                .map(|binding| binding.identity().mechanism())
+        }
+
+        fn assert_nothing_selected(&self) {
+            let error = self
+                .selected_mechanism()
+                .expect_err("withdrawal must leave no selection to heal from");
+            assert!(
+                matches!(error, BindingError::NoSelectedMechanism(device) if device == DeviceKey::HOST),
+                "selection was left pointing at a dead or unregistered mechanism: {error:?}"
+            );
+        }
+    }
+
+    /// One paused select, released only when the test says so.
+    struct Gate {
+        entered: Arc<Barrier>,
+        resume: Arc<Barrier>,
+    }
+
+    impl Gate {
+        fn wait_entered(&self) {
+            self.entered.wait();
+        }
+
+        fn resume(&self) {
+            self.resume.wait();
+        }
+    }
+
+    fn assert_select_failed(
+        result: Result<(), BindingError>,
+        expected: RegisteredMechanism,
+        expected_lifecycle: MechanismLifecycle,
+    ) {
+        let error = result.expect_err("select must fail once its candidate is inactive");
+        assert!(
+            matches!(
+                error,
+                BindingError::InactiveMechanism {
+                    mechanism,
+                    lifecycle,
+                    operation: "selecting a mechanism",
+                } if mechanism == expected.identity && lifecycle == expected_lifecycle
+            ),
+            "unexpected select error: {error:?}"
+        );
+    }
+
+    /// Park a candidate after validation, retire it, then let it publish. The
+    /// candidate is guaranteed to fail its post-publish re-check.
+    fn publish_a_doomed_candidate(
+        fixture: &SelectionFixture,
+        candidate: RegisteredMechanism,
+    ) -> (thread::JoinHandle<Result<(), BindingError>>, Gate) {
+        let validated = fixture.gate(candidate, HookPhase::SelectAfterValidation);
+        let published = fixture.gate(candidate, HookPhase::SelectAfterPublish);
+        let selecting = fixture.select_on_thread(candidate);
+
+        validated.wait_entered();
+        // The candidate is not selected yet, so retiring it does not clear the
+        // selection; it only makes the pending publication stale.
+        fixture
+            .registry
+            .retire(candidate)
+            .expect("retire candidate");
+        validated.resume();
+
+        // Returns with the candidate published and its prior recorded.
+        published.wait_entered();
+        (selecting, published)
+    }
+
+    #[test]
+    fn failed_select_restores_the_prior_healthy_selection() {
+        let fixture = SelectionFixture::new();
+        let prior = fixture.mechanism();
+        let candidate = fixture.mechanism();
+
+        let (selecting, published) = publish_a_doomed_candidate(&fixture, candidate);
+        published.resume();
+
+        assert_select_failed(
+            selecting.join().expect("select thread"),
+            candidate,
+            MechanismLifecycle::Retired,
+        );
+        assert_eq!(
+            fixture
+                .selected_mechanism()
+                .expect("healthy prior restored"),
+            prior.identity
+        );
+    }
+
+    #[test]
+    fn failed_select_clears_a_retired_prior_instead_of_restoring_it() {
+        let fixture = SelectionFixture::new();
+        let prior = fixture.mechanism();
+        let candidate = fixture.mechanism();
+
+        let (selecting, published) = publish_a_doomed_candidate(&fixture, candidate);
+        // The prior is no longer selected, so retiring it cannot clear the
+        // selection itself; only the withdrawal can notice it went inactive.
+        fixture.registry.retire(prior).expect("retire prior");
+        published.resume();
+
+        assert_select_failed(
+            selecting.join().expect("select thread"),
+            candidate,
+            MechanismLifecycle::Retired,
+        );
+        fixture.assert_nothing_selected();
+    }
+
+    #[test]
+    fn failed_select_clears_a_removed_prior_instead_of_restoring_it() {
+        let fixture = SelectionFixture::new();
+        let prior = fixture.mechanism();
+        let candidate = fixture.mechanism();
+
+        let (selecting, published) = publish_a_doomed_candidate(&fixture, candidate);
+        fixture.registry.retire(prior).expect("retire prior");
+        fixture.registry.remove(prior).expect("remove prior");
+        published.resume();
+
+        assert_select_failed(
+            selecting.join().expect("select thread"),
+            candidate,
+            MechanismLifecycle::Retired,
+        );
+        fixture.assert_nothing_selected();
+    }
+
+    #[test]
+    fn failed_select_does_not_overwrite_a_newer_selection() {
+        let fixture = SelectionFixture::new();
+        let _prior = fixture.mechanism();
+        let candidate = fixture.mechanism();
+        let newer = fixture.mechanism();
+
+        let (selecting, published) = publish_a_doomed_candidate(&fixture, candidate);
+        // A healthy selection lands while the losing candidate is parked.
+        fixture.registry.select(newer).expect("newer selection");
+        published.resume();
+
+        assert_select_failed(
+            selecting.join().expect("select thread"),
+            candidate,
+            MechanismLifecycle::Retired,
+        );
+        assert_eq!(
+            fixture
+                .selected_mechanism()
+                .expect("newer selection stands"),
+            newer.identity
+        );
+    }
+
+    #[test]
+    fn two_failed_selects_never_leave_a_dead_mechanism_selected() {
+        let fixture = SelectionFixture::new();
+        let prior = fixture.mechanism();
+        let first = fixture.mechanism();
+        let second = fixture.mechanism();
+
+        let first_published = fixture.gate(first, HookPhase::SelectAfterPublish);
+        let second_validated = fixture.gate(second, HookPhase::SelectAfterValidation);
+        let second_published = fixture.gate(second, HookPhase::SelectAfterPublish);
+
+        // The first candidate publishes over the healthy prior and parks.
+        let selecting_first = fixture.select_on_thread(first);
+        first_published.wait_entered();
+
+        // The second candidate validates while the first still owns selection,
+        // so retiring it now does not clear the selection.
+        let selecting_second = fixture.select_on_thread(second);
+        second_validated.wait_entered();
+        fixture.registry.retire(second).expect("retire second");
+        second_validated.resume();
+
+        // The second candidate is now selected and recorded the first as its
+        // prior. Retiring the first makes that recorded prior dead.
+        second_published.wait_entered();
+        fixture.registry.retire(first).expect("retire first");
+
+        // The first candidate withdraws while the second owns selection, so it
+        // must leave the newer selection alone.
+        first_published.resume();
+        assert_select_failed(
+            selecting_first.join().expect("first select thread"),
+            first,
+            MechanismLifecycle::Retired,
+        );
+
+        // The second candidate withdraws last and must not resurrect the first.
+        second_published.resume();
+        assert_select_failed(
+            selecting_second.join().expect("second select thread"),
+            second,
+            MechanismLifecycle::Retired,
+        );
+
+        fixture.assert_nothing_selected();
+        // The untouched healthy prior is still selectable.
+        fixture.registry.select(prior).expect("reselect prior");
+        assert_eq!(
+            fixture.selected_mechanism().expect("prior reselected"),
+            prior.identity
+        );
+    }
+
+    #[test]
+    fn a_later_registration_heals_a_cleared_selection() {
+        let fixture = SelectionFixture::new();
+        let prior = fixture.mechanism();
+        let candidate = fixture.mechanism();
+
+        let (selecting, published) = publish_a_doomed_candidate(&fixture, candidate);
+        fixture.registry.retire(prior).expect("retire prior");
+        fixture.registry.remove(prior).expect("remove prior");
+        published.resume();
+
+        assert_select_failed(
+            selecting.join().expect("select thread"),
+            candidate,
+            MechanismLifecycle::Retired,
+        );
+        fixture.assert_nothing_selected();
+
+        // A cleared selection is the only state a later registration can heal;
+        // a stale identity left in the slot would make this registration a
+        // no-op and wedge the device permanently.
+        let healed = fixture.mechanism();
+        assert_eq!(
+            fixture
+                .selected_mechanism()
+                .expect("registration self-heal"),
+            healed.identity
+        );
+    }
+
+    #[test]
+    fn retire_racing_a_select_cannot_leave_the_retired_mechanism_selected() {
+        let fixture = SelectionFixture::new();
+        let prior = fixture.mechanism();
+        let candidate = fixture.mechanism();
+
+        let validated = fixture.gate(candidate, HookPhase::SelectAfterValidation);
+        let retiring_gate = fixture.gate(candidate, HookPhase::RetireBetweenPhases);
+
+        // The candidate validates `Active` and parks before publishing.
+        let selecting = fixture.select_on_thread(candidate);
+        validated.wait_entered();
+
+        // Retirement finishes its lifecycle phase and parks before its selection
+        // phase. Clearing the selection first would leave exactly this window
+        // open, because the candidate would still observe `Active` afterwards.
+        let registry = fixture.registry.clone();
+        let retiring = thread::spawn(move || registry.retire(candidate));
+        retiring_gate.wait_entered();
+
+        // The candidate publishes straight into that window and must still fail.
+        validated.resume();
+        assert_select_failed(
+            selecting.join().expect("select thread"),
+            candidate,
+            MechanismLifecycle::Retired,
+        );
+
+        retiring_gate.resume();
+        retiring
+            .join()
+            .expect("retire thread")
+            .expect("retire must succeed");
+
+        assert_eq!(
+            fixture
+                .selected_mechanism()
+                .expect("healthy prior restored"),
+            prior.identity
+        );
+    }
+
+    #[test]
+    fn device_loss_racing_a_select_cannot_leave_a_lost_mechanism_selected() {
+        let fixture = SelectionFixture::new();
+        let _prior = fixture.mechanism();
+        let candidate = fixture.mechanism();
+
+        let validated = fixture.gate(candidate, HookPhase::SelectAfterValidation);
+        let losing = fixture.gate_device(HookPhase::InvalidateBetweenPhases);
+
+        let selecting = fixture.select_on_thread(candidate);
+        validated.wait_entered();
+
+        // Device loss marks every mechanism lost and parks before dropping the
+        // selection, mirroring the retirement race.
+        let registry = fixture.registry.clone();
+        let invalidating =
+            thread::spawn(move || registry.invalidate_device(DeviceKey::HOST, "select race"));
+        losing.wait_entered();
+
+        validated.resume();
+        assert_select_failed(
+            selecting.join().expect("select thread"),
+            candidate,
+            MechanismLifecycle::DeviceLost,
+        );
+
+        losing.resume();
+        invalidating
+            .join()
+            .expect("invalidate thread")
+            .expect("invalidate must succeed");
+
+        // Every mechanism on the device is lost, so there is no healthy prior to
+        // fall back to and the selection must be empty rather than stale.
+        fixture.assert_nothing_selected();
+    }
+
+    #[test]
+    fn retirement_and_device_loss_drop_the_current_selection() {
+        let fixture = SelectionFixture::new();
+        let retired = fixture.mechanism();
+        assert_eq!(
+            fixture
+                .selected_mechanism()
+                .expect("first registration selects"),
+            retired.identity
+        );
+
+        fixture.registry.retire(retired).expect("retire");
+        fixture.assert_nothing_selected();
+
+        let lost = fixture.mechanism();
+        assert_eq!(
+            fixture
+                .selected_mechanism()
+                .expect("registration self-heal"),
+            lost.identity
+        );
+
+        fixture
+            .registry
+            .invalidate_device(DeviceKey::HOST, "device lost")
+            .expect("invalidate");
+        fixture.assert_nothing_selected();
     }
 }
