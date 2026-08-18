@@ -130,6 +130,9 @@ fn a_default_build_resolves_no_mlas_sys() {
         .join("../..")
         .canonicalize()
         .expect("workspace root exists above this crate");
+    let Some(host) = host_triple() else {
+        return;
+    };
     let output =
         std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
             .args([
@@ -140,6 +143,8 @@ fn a_default_build_resolves_no_mlas_sys() {
                 "--no-default-features",
                 "--features",
                 "",
+                "--filter-platform",
+                &host,
             ])
             .current_dir(&workspace_root)
             .output();
@@ -476,6 +481,33 @@ _ZN19onnx_runtime_ep_cpu7backend10CpuBackend4Mlas17h0123456789abcdefE t 1a2bc0 2
         "this crate's own Rust items are named after the routes they call and \
          must not be mistaken for vendored MLAS object code"
     );
+}
+
+/// The triple this test process runs on.
+///
+/// `cargo metadata` without `--filter-platform` insists on resolving the
+/// dependency graph of every target Cargo has ever heard of — Android, wasm —
+/// which an `--offline` lane has no reason to have vendored. That made the gate
+/// fail for a reason with nothing to do with MLAS. Filtering to the host keeps
+/// the resolve honest (it is the platform whose artifact is being probed) and
+/// resolvable from a cache that only ever built for it.
+fn host_triple() -> Option<String> {
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let output = match std::process::Command::new(rustc).arg("-vV").output() {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            return gate_probe_failed(&format!(
+                "rustc -vV failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            ));
+        }
+        Err(e) => return gate_probe_failed(&format!("rustc is not runnable: {e}")),
+    };
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    match text.lines().find_map(|line| line.strip_prefix("host: ")) {
+        Some(triple) if !triple.trim().is_empty() => Some(triple.trim().to_string()),
+        _ => gate_probe_failed("rustc -vV printed no host triple"),
+    }
 }
 
 /// `nm` output, or `None` with a skip message when `nm` is unavailable.
