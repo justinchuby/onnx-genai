@@ -173,4 +173,3 @@ or error. After completion, state may be:
 - [`onnx-genai-kv`](../../crates/onnx-genai-kv/src/lib.rs)
 - [`docs/genai/SCHEDULING.md`](../../docs/genai/SCHEDULING.md)
 - [`docs/genai/PIPELINE.md`](../../docs/genai/PIPELINE.md)
-

@@ -116,4 +116,3 @@ For the full source-precedence-aware index, see [[start/Documentation Guide]].
 > since refined. For questions about current behavior, prefer code, reproducible
 > measurements, and documents that explicitly identify themselves as current
 > authorities.
-
