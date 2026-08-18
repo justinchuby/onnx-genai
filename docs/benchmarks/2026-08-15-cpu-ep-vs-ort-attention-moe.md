@@ -3036,3 +3036,28 @@ Two things about this are worth keeping:
 `#[inline(always)]` and `#[target_feature]` cannot coexist in Rust, which is why
 neither helper carries the latter; every caller is already inside an `avx2,fma`
 function, so the features arrive with the inline.
+
+### 31.7.2 Re-verified against §29's Softmax, not the one it replaced
+
+The Softmax numbers above were taken before #1219 landed, so their baseline was
+a `softmax_rows` that still copied `src` into `dst` before reducing. Merging
+main changed the thing this phase is measured against, and the merge itself had
+to resolve a conflict inside `softmax_rows` — #1219 removed the copy, this phase
+moved the fan-out onto the task runtime, and both edits are in the same four
+lines. The resolution keeps both: one `compute_softmax` per task's whole chunk
+run, reading `src` and writing `dst` directly, with no copy anywhere.
+
+Re-run against the merged baseline (22 transform cells, 6 widths, 9 trials,
+paired arms in one driver invocation), native ms, base = `origin/main` at
+`54e8e831f`:
+
+| cell | t=4 | t=8 | t=16 | t=32 |
+| ---- | --- | --- | ---- | ---- |
+| `sm_bert_b8_s128`    | 0.644→0.378 (1.7×) | 0.565→0.320 (1.8×) | 0.840→0.291 (2.9×) | 2.751→0.485 (**5.7×**) |
+| `sm_prefill_h32_s512`| 2.697→2.164 (1.2×) | 1.900→1.747 (1.1×) | 2.111→1.722 (1.2×) | 4.572→1.078 (**4.2×**) |
+
+The win survives the merge, and its shape is unchanged: it grows with width,
+because what it removes is a per-region park, not a per-element cost. The
+decode-shaped `sm_decode_h32_kv*` cells stay serial and stay flat (18–182 µs,
+within ±1 µs of base at every width), and `sm_whisper_cross` is neutral at every
+width — both are the intended outcome, not a miss.
