@@ -3334,6 +3334,13 @@ and the extra hardware threads are worth more. 512 Mi classifies every measured
 cell correctly, and the wide path is not taken at all when Rayon is not actually
 wider than the pool.
 
+The threshold was chosen from a separate campaign, tabulated in
+`WIDE_PREFILL_MACS`'s doc comment, in which the tiling ran on the task runtime
+*unconditionally* — there was no policy yet, so both of its columns are a real
+measurement of the two executors on the same cell. Those numbers deliberately do
+not match §33.4 below: §33.4 measures the shipped policy, so above the threshold
+both of its arms take the same wide path and any difference there is noise.
+
 `prefill_tile_grain` adds the matching grain floor: the tiling cannot merge
 output-column shards (each owns its own packed weight), so the only lever for a
 too-fine partition is handing several whole tiles to one task, which it does

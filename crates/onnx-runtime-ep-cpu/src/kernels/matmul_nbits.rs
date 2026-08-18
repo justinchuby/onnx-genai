@@ -351,10 +351,7 @@ enum PrefillFanOut {
 ///
 /// The task runtime is the better executor almost everywhere here: its dispatch
 /// reaches a resident worker in ~5 us against global Rayon's 67-226 us, and it
-/// does not fight a co-resident ORT intra-op pool for cores. On this host, with
-/// an ORT session live in the same process, moving the tiling onto it took
-/// `gemm_nbits_qwen3_0p6b_mlp_t8` at 32 threads from 3.396 ms to 0.517 ms
-/// (6.6x) and `..._qkv_t8` from 2.511 ms to 0.479 ms (5.2x).
+/// does not fight a co-resident ORT intra-op pool for cores.
 ///
 /// It has one disadvantage: the runtime's pool is capped to the *physical*
 /// cores the process may use (see `task_runtime::resolve_width`), because
@@ -367,20 +364,28 @@ enum PrefillFanOut {
 /// *same* task runtime forced to 32 lanes 54.8 ms. The gap is the cap, not the
 /// executor.
 ///
-/// So the split is on work size, and 512 Mi MACs classifies every measured cell
-/// correctly (all at 32 threads, native/ORT paired, medians):
+/// So the split is on work size. The threshold was chosen from a campaign that
+/// ran the tiling on the task runtime *unconditionally* -- there was no policy
+/// yet, so both columns are a real measurement of the two executors on the same
+/// cell. All at 32 threads, native/ORT paired in one process, medians of 3
+/// trials x 15 runs:
 ///
 /// | cell | MACs | Rayon | task runtime | winner |
 /// |---|---|---|---|---|
-/// | `qwen3_0p6b_qkv_t8`   |  25 Mi |  2.511 ms |  0.479 ms | runtime 5.2x |
-/// | `qwen3_0p6b_mlp_t8`   |  50 Mi |  3.396 ms |  0.517 ms | runtime 6.6x |
-/// | `llama3_8b_qkv_t8`    | 201 Mi |  6.294 ms |  1.901 ms | runtime 3.3x |
-/// | `qwen3_0p6b_qkv_t128` | 403 Mi |  7.070 ms |  2.682 ms | runtime 2.6x |
-/// | `llama3_8b_mlp_t8`    | 470 Mi |  9.545 ms |  8.386 ms | runtime 1.1x |
-/// | `qwen3_0p6b_mlp_t128` | 805 Mi |  8.063 ms |  8.851 ms | Rayon 1.1x |
-/// | `qwen3_0p6b_qkv_t512` | 1.6 Gi | 12.095 ms | 12.314 ms | tie |
-/// | `llama3_8b_mlp_t128`  | 7.5 Gi | 35.436 ms | 37.664 ms | Rayon 1.06x |
-/// | `llama3_8b_mlp_t512`  |  30 Gi | 89.176 ms | 100.88 ms | Rayon 1.13x |
+/// | `qwen3_0p6b_qkv_t8`   |  24 Mi |  2.511 ms |  0.479 ms | runtime 5.2x |
+/// | `qwen3_0p6b_mlp_t8`   |  48 Mi |  3.396 ms |  0.517 ms | runtime 6.6x |
+/// | `llama3_8b_qkv_t8`    | 192 Mi |  6.294 ms |  1.901 ms | runtime 3.3x |
+/// | `qwen3_0p6b_qkv_t128` | 384 Mi |  7.070 ms |  2.682 ms | runtime 2.6x |
+/// | `llama3_8b_mlp_t8`    | 448 Mi |  9.545 ms |  8.386 ms | runtime 1.1x |
+/// | `qwen3_0p6b_mlp_t128` | 768 Mi |  8.063 ms |  8.851 ms | Rayon 1.1x |
+/// | `qwen3_0p6b_qkv_t512` | 1.5 Gi | 12.095 ms | 12.314 ms | tie |
+/// | `llama3_8b_mlp_t128`  |   7 Gi | 35.436 ms | 37.664 ms | Rayon 1.06x |
+/// | `llama3_8b_mlp_t512`  |  28 Gi | 89.176 ms | 100.88 ms | Rayon 1.13x |
+///
+/// 512 Mi separates those two groups cleanly. The numbers here are *not* the
+/// ones in the benchmark document's phase-13 matrix and are not meant to match:
+/// that matrix measures the shipped policy, so above this threshold both of its
+/// arms run the same wide path and the difference there is noise.
 ///
 /// Park latency is what makes the wide path safe above the threshold: 226 us of
 /// worst-case wake-up is 0.25% of a 90 ms fan-out, and 45% of a 0.5 ms one.
@@ -17080,7 +17085,7 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn prefill_tile_grain_batches_only_undersized_tiles() {
-        // 32 tiles of 8 x 96 x 1024 = 786 Ki MACs each, over the 512 Ki floor.
+        // 32 tiles of 8 x 96 x 1024 = 768 Ki MACs each, over the 512 Ki floor.
         assert_eq!(prefill_tile_grain(8, 3072, 1024, 32), 1);
         // The same output split 32x finer: 24 Ki MACs a tile, so batch them.
         assert_eq!(prefill_tile_grain(8, 3072, 1024, 1024), 22);
