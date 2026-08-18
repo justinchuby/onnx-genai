@@ -58,7 +58,7 @@
     "hast-util-to-string": "^3.0.1",
     "is-absolute-url": "^5.0.0",
     "isomorphic-git": "^1.36.3",
-    "js-yaml": "^4.1.1",
+    "js-yaml": "^4.3.1",
     "lightningcss": "^1.31.1",
     "mdast-util-find-and-replace": "^3.0.2",
     "mdast-util-to-hast": "^13.2.1",
