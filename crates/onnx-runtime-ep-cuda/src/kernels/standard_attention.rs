@@ -2125,12 +2125,10 @@ impl StandardAttentionKernel {
                 .saturating_mul(q_heads as u64)
                 .saturating_mul(q_seq as u64);
             let split_bytes = match split_cfg {
-                Some((num_splits, _)) => attention_split_scratch_floats(
-                    num_splits,
-                    total_rows_u,
-                    v_head_size as u64,
-                )
-                .saturating_mul(std::mem::size_of::<f32>()),
+                Some((num_splits, _)) => {
+                    attention_split_scratch_floats(num_splits, total_rows_u, v_head_size as u64)
+                        .saturating_mul(std::mem::size_of::<f32>())
+                }
                 None => 0,
             };
             let mut ws = if capture_workspace_eligible {
