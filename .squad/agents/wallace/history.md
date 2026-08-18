@@ -15,3 +15,7 @@
 Approved PR #365 after four rounds, including recursive scanning and uniform structural identity.
 
 Full pre-compaction history in `history-archive.md`.
+## 2026-08-18T01:35Z — V2-Lite MoE measurement + graph-capture scope
+
+- Measured corrected DeepSeek-V2-Lite int4 MoE: native CUDA eager median ~55.6 tok/s; graph flag currently no-ops because capture declines on `attention_mask_consumers_are_capacity_aware`; ORT CUDA lacks QMoE kernels and falls back to CPU experts at ~0.20 tok/s.
+- Scoped V2-Lite graph-capture unlock as GO: topology-gated capacity policy for additive-mask-builder → capacity-form `Attention[3]`, with GLM-5.2 negative guard intact; post-implementation Wallace owns byte-identity/perf A/B.
