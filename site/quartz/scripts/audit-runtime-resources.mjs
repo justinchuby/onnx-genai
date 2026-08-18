@@ -24,12 +24,6 @@
  * element that is actually appended has type="module" and its .src derives from
  * the loader parameter (directly or through a narrow local alias chain); vendor
  * manifest URLs must be supplied to that same validated function/parameter.
- *
- * Loader and vendor edges are attributed by lexical binding identity: an
- * identifier call target is resolved to the AST node of the binding in scope at
- * the call site, and only that node's validated loader shape may credit an
- * edge. There is no name-keyed fallback, so minified same-name functions in
- * different scopes cannot receive each other's calls or edges.
  */
 
 import { readFile, readdir } from "node:fs/promises"
@@ -437,250 +431,6 @@ function collectNamedFunctions(ast) {
   return functions
 }
 
-/**
- * Lexical binding resolution for identifier call targets.
- *
- * Minified browser bundles reuse short function names (`d`, `I`, `W`, ...) in
- * many unrelated scopes, so resolving a call target by *name* lets a call to
- * one `d` be credited with the behavior validated on a completely different
- * `d`. Vendor/loader edges are therefore keyed to the resolved AST node of the
- * binding that is actually in lexical scope at the call site.
- *
- * The resolution is deliberately conservative: a binding maps to a function
- * node only when it is introduced by a function declaration, a variable
- * declarator with a function initializer, or a named function expression, and
- * only when nothing ever reassigns that binding. Parameters, destructuring
- * targets, imports, classes, and reassigned bindings resolve to `null`, so an
- * unresolved call can never inherit another scope's validated behavior.
- */
-class LexicalScope {
-  constructor(parent = null) {
-    this.parent = parent
-    this.bindings = new Map()
-  }
-
-  declare(name, node) {
-    const value = node ?? null
-    if (this.bindings.has(name) && this.bindings.get(name) !== value) {
-      this.bindings.set(name, null)
-      return
-    }
-    this.bindings.set(name, value)
-  }
-
-  declareIfAbsent(name, node) {
-    if (!this.bindings.has(name)) this.bindings.set(name, node ?? null)
-  }
-
-  owner(name) {
-    if (this.bindings.has(name)) return this
-    return this.parent?.owner(name) ?? null
-  }
-
-  resolve(name) {
-    const owner = this.owner(name)
-    return owner ? owner.bindings.get(name) : null
-  }
-}
-
-function* childNodes(node) {
-  for (const key of Object.keys(node)) {
-    if (key === "start" || key === "end" || key === "range" || key === "loc") continue
-    const value = node[key]
-    if (Array.isArray(value)) {
-      for (const item of value) if (item && typeof item.type === "string") yield item
-    } else if (value && typeof value.type === "string") {
-      yield value
-    }
-  }
-}
-
-function patternNames(node, out = []) {
-  if (!node) return out
-  switch (node.type) {
-    case "Identifier":
-      out.push(node.name)
-      break
-    case "ObjectPattern":
-      for (const property of node.properties) {
-        patternNames(property.type === "RestElement" ? property.argument : property.value, out)
-      }
-      break
-    case "ArrayPattern":
-      for (const element of node.elements) patternNames(element, out)
-      break
-    case "AssignmentPattern":
-      patternNames(node.left, out)
-      break
-    case "RestElement":
-      patternNames(node.argument, out)
-      break
-    default:
-      break
-  }
-  return out
-}
-
-function declareLexicalStatement(statement, scope) {
-  if (!statement) return
-  switch (statement.type) {
-    case "FunctionDeclaration":
-      if (statement.id?.name) scope.declare(statement.id.name, statement)
-      return
-    case "ClassDeclaration":
-      if (statement.id?.name) scope.declare(statement.id.name, null)
-      return
-    case "VariableDeclaration":
-      if (statement.kind === "var") return
-      for (const declarator of statement.declarations) {
-        if (declarator.id.type === "Identifier") {
-          scope.declare(
-            declarator.id.name,
-            isFunctionNode(declarator.init) ? declarator.init : null,
-          )
-        } else {
-          for (const name of patternNames(declarator.id)) scope.declare(name, null)
-        }
-      }
-      return
-    case "ImportDeclaration":
-      for (const specifier of statement.specifiers) scope.declare(specifier.local.name, null)
-      return
-    case "ExportNamedDeclaration":
-    case "ExportDefaultDeclaration":
-      declareLexicalStatement(statement.declaration, scope)
-      return
-    case "LabeledStatement":
-      declareLexicalStatement(statement.body, scope)
-      return
-    default:
-      return
-  }
-}
-
-function declareLexicalStatements(statements, scope) {
-  for (const statement of statements) declareLexicalStatement(statement, scope)
-}
-
-function declareHoistedVars(statements, scope) {
-  const stack = [...statements]
-  while (stack.length) {
-    const node = stack.pop()
-    if (!node) continue
-    if (isFunctionNode(node)) continue
-    if (node.type === "VariableDeclaration" && node.kind === "var") {
-      for (const declarator of node.declarations) {
-        if (declarator.id.type === "Identifier") {
-          scope.declare(
-            declarator.id.name,
-            isFunctionNode(declarator.init) ? declarator.init : null,
-          )
-        } else {
-          for (const name of patternNames(declarator.id)) scope.declare(name, null)
-        }
-      }
-    }
-    for (const child of childNodes(node)) stack.push(child)
-  }
-}
-
-function buildLexicalCallTargets(ast) {
-  const pending = []
-  const programScope = new LexicalScope(null)
-
-  function poison(name, scope) {
-    const owner = scope.owner(name) ?? programScope
-    owner.declare(name, null)
-  }
-
-  function walk(node, scope) {
-    if (!node) return
-    if (isFunctionNode(node)) {
-      const fnScope = new LexicalScope(scope)
-      if (node.type === "FunctionExpression" && node.id?.name) {
-        fnScope.declareIfAbsent(node.id.name, node)
-      }
-      for (const param of node.params ?? []) {
-        for (const name of patternNames(param)) fnScope.declare(name, null)
-      }
-      const statements = node.body?.type === "BlockStatement" ? node.body.body : []
-      declareHoistedVars(statements, fnScope)
-      declareLexicalStatements(statements, fnScope)
-      for (const param of node.params ?? []) walk(param, fnScope)
-      if (node.body?.type === "BlockStatement") {
-        for (const statement of node.body.body) walk(statement, fnScope)
-      } else {
-        walk(node.body, fnScope)
-      }
-      return
-    }
-    switch (node.type) {
-      case "BlockStatement": {
-        const blockScope = new LexicalScope(scope)
-        declareLexicalStatements(node.body, blockScope)
-        for (const statement of node.body) walk(statement, blockScope)
-        return
-      }
-      case "ForStatement":
-      case "ForInStatement":
-      case "ForOfStatement": {
-        const loopScope = new LexicalScope(scope)
-        const declaration = node.type === "ForStatement" ? node.init : node.left
-        if (declaration?.type === "VariableDeclaration") {
-          declareLexicalStatement(declaration, loopScope)
-        }
-        for (const child of childNodes(node)) walk(child, loopScope)
-        return
-      }
-      case "CatchClause": {
-        const catchScope = new LexicalScope(scope)
-        for (const name of patternNames(node.param)) catchScope.declare(name, null)
-        walk(node.body, catchScope)
-        return
-      }
-      case "SwitchStatement": {
-        walk(node.discriminant, scope)
-        const switchScope = new LexicalScope(scope)
-        for (const switchCase of node.cases) {
-          declareLexicalStatements(switchCase.consequent, switchScope)
-        }
-        for (const switchCase of node.cases) {
-          if (switchCase.test) walk(switchCase.test, switchScope)
-          for (const statement of switchCase.consequent) walk(statement, switchScope)
-        }
-        return
-      }
-      case "AssignmentExpression": {
-        for (const name of patternNames(node.left)) poison(name, scope)
-        walk(node.left, scope)
-        walk(node.right, scope)
-        return
-      }
-      case "UpdateExpression": {
-        if (node.argument?.type === "Identifier") poison(node.argument.name, scope)
-        walk(node.argument, scope)
-        return
-      }
-      case "CallExpression": {
-        if (node.callee.type === "Identifier") pending.push({ node, scope, name: node.callee.name })
-        for (const child of childNodes(node)) walk(child, scope)
-        return
-      }
-      default: {
-        for (const child of childNodes(node)) walk(child, scope)
-      }
-    }
-  }
-
-  declareHoistedVars(ast.body, programScope)
-  declareLexicalStatements(ast.body, programScope)
-  for (const statement of ast.body) walk(statement, programScope)
-
-  const targets = new Map()
-  for (const entry of pending) targets.set(entry.node, entry.scope.resolve(entry.name))
-  return targets
-}
-
 class LoaderEnv {
   constructor(parent = null) {
     this.parent = parent
@@ -962,18 +712,7 @@ function validateLoaderFunction(fnNode) {
 }
 
 class Analyzer {
-  constructor({
-    ast,
-    id,
-    file,
-    source,
-    facts,
-    graph,
-    from,
-    validatedLoaders,
-    lexicalCallTargets,
-    isInline,
-  }) {
+  constructor({ ast, id, file, source, facts, graph, from, validatedLoaders, isInline }) {
     this.ast = ast
     this.id = id
     this.file = file
@@ -982,7 +721,6 @@ class Analyzer {
     this.graph = graph
     this.from = from
     this.validatedLoaders = validatedLoaders
-    this.lexicalCallTargets = lexicalCallTargets
     this.isInline = isInline
     this.selectorEvidence = []
     this.fetchResult = isInline
@@ -990,20 +728,6 @@ class Analyzer {
       : null
     this.fetchTrackers = []
     this.callCounts = new Map()
-  }
-
-  /**
-   * Resolve a call to a validated loader by lexical binding identity.
-   *
-   * The call's identifier callee is resolved to the AST node of the binding
-   * that is actually in scope at that call site, and only that node's
-   * validated loader shape may credit an import/vendor edge. There is no
-   * name-keyed fallback, so a minified same-name function in a different
-   * scope cannot inherit another function's loader behavior.
-   */
-  loaderForCall(node) {
-    const target = this.lexicalCallTargets.get(node)
-    return target ? (this.validatedLoaders.byNode.get(target) ?? null) : null
   }
 
   fileKey() {
@@ -1066,7 +790,7 @@ class Analyzer {
       this.fetchResult.dead += 1
     }
     if (node.type === "CallExpression" && node.callee.type === "Identifier") {
-      const loader = this.loaderForCall(node)
+      const loader = this.validatedLoaders.byName.get(node.callee.name)
       if (loader) {
         for (const index of loader.paramIndexes) {
           const url = literalString(node.arguments[index])
@@ -1449,7 +1173,9 @@ class Analyzer {
     }
 
     if (node.callee.type === "Identifier") {
-      const loader = this.loaderForCall(node)
+      const loader =
+        (localFunction ? this.validatedLoaders.byNode.get(localFunction) : null) ??
+        this.validatedLoaders.byName.get(node.callee.name)
       if (loader) {
         for (const index of loader.paramIndexes) {
           const url = literalString(node.arguments[index])
@@ -1530,11 +1256,13 @@ async function auditSource({ source, id, file = null, facts, graph, from, isInli
   }
   if (file) facts.bundles.push(graph.rel(file))
   const namedFunctions = collectNamedFunctions(ast)
-  const validatedLoaders = { byNode: new Map() }
-  for (const [, fn] of namedFunctions) {
-    if (validatedLoaders.byNode.has(fn)) continue
+  const validatedLoaders = { byName: new Map(), byNode: new WeakMap() }
+  for (const [name, fn] of namedFunctions) {
     const loader = validateLoaderFunction(fn)
-    if (loader) validatedLoaders.byNode.set(fn, loader)
+    if (loader) {
+      if (!validatedLoaders.byName.has(name)) validatedLoaders.byName.set(name, loader)
+      validatedLoaders.byNode.set(fn, loader)
+    }
   }
   const analyzer = new Analyzer({
     ast,
@@ -1545,7 +1273,6 @@ async function auditSource({ source, id, file = null, facts, graph, from, isInli
     graph,
     from,
     validatedLoaders,
-    lexicalCallTargets: buildLexicalCallTargets(ast),
     isInline,
   })
   analyzer.run()

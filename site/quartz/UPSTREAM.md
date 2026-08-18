@@ -34,54 +34,13 @@ never drift from, or be hand-edited independently of, the bytes actually
 shipped.
 
 `scripts/audit-runtime-resources.mjs` performs the non-vacuous runtime/plugin
-presence audit `validate_site.py` relies on. It is rooted in the generated
-HTML rather than in "every emitted `*.js` file": the `<script src>` tags and
-inline `<script>` bodies of the generated pages are the only entry points.
-From those roots it parses reachable code with `acorn` into a real AST and
-follows reachable static imports, reachable dynamic `import()` calls, and
-reachable calls to validated local script loaders. JavaScript under `public/`
-that is never reached from HTML is reported as an ignored file and can never
-contribute Search, Graph, Explorer, loader, vendor, or `fetchData` evidence.
-Within the reachable graph the audit prunes provably unreachable/dead
-branches, and only treats a surface as present when something real and
-reachable depends on it -- a comment, a discarded `querySelector(...)` result,
-an unreferenced decoy bundle, or dead `if (false) {...}` placeholder code
-cannot satisfy any of these checks.
-
-Loader and vendor edges are keyed to **lexical binding identity**, not to
-function names. Minified bundles reuse short names such as `d` in many
-unrelated scopes, so the audit resolves an identifier call target to the AST
-node of the binding actually in scope at the call site and credits only that
-node's validated loader shape. There is no name-keyed fallback: a same-name
-function in another scope, or a parameter that shadows a real loader, cannot
-inherit validated loader behavior, in reachable or in dead code.
-
-## Third-party runtime resource policy
-
-`../scripts/validate_site.py` governs two distinct third-party surfaces:
-
-- **Executable CDN references.** jsDelivr serves the same mutable package
-  namespace from several hostnames (`cdn.jsdelivr.net`, `fastly.`, `gcore.`,
-  `testingcf.`, ...) and as ESM through `esm.run`, so hostnames are
-  canonicalized (lowercased, trailing DNS root dot stripped) before policy
-  matching and every jsDelivr executable host is in scope. Detection covers
-  absolute and scheme-relative forms, `/npm/`, `/gh/` and `/wp/` namespaces,
-  query/fragment variants, and raw, decoded or double-encoded dot segments
-  (rejected before URL normalization could erase a package escape).
-  Allowlisting is deliberately narrower than detection: only the exact
-  canonical host spelling `cdn.jsdelivr.net`, the `/npm/` namespace, an exact
-  immutable semver, and a reviewed asset path are approved. Today that is a
-  single entry, the `latex` plugin's `katex@0.16.11/dist/contrib/copy-tex.min.js`.
-  Alternate jsDelivr mirrors, `esm.run`, uppercase or trailing-dot host
-  variants never inherit it.
-- **Third-party stylesheets.** The `latex` plugin also emits an external
-  `<link rel="stylesheet">` to KaTeX's CSS. Stylesheet links are _not_ silently
-  outside this control: they are validated against their own exact-URL
-  allowlist (`STYLESHEET_ALLOWLIST`), so any other off-origin stylesheet --
-  including a different KaTeX version, a jsDelivr mirror, or an unrelated CDN --
-  fails the build. Same-origin stylesheets are covered by the existing
-  internal link/asset existence checks. Non-loading hints such as
-  `<link rel="preconnect">` are outside both policies by design.
+presence audit `validate_site.py` relies on: it parses every emitted `*.js`
+bundle (and every inline `<script>` body) with `acorn` into a real AST, prunes
+provably unreachable/dead branches, and only treats Search, Graph, Explorer,
+the local ESM script-loader, Graph's vendor import edges, and the shared
+inline `fetchData` surface as present when something real and reachable
+depends on them -- a comment, a discarded `querySelector(...)` result, or dead
+`if (false) {...}` placeholder code cannot satisfy any of these checks.
 
 To update Quartz, replace the vendored engine from a reviewed upstream tag,
 retain the integration files, refresh both lockfiles, and run:
