@@ -29,9 +29,11 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod backend;
+pub mod backend_ab;
 pub mod decode_affinity;
 pub mod decode_numa;
 pub mod decode_spmd;
+pub mod dispatch_ledger;
 pub mod dtype;
 pub mod kernels;
 #[cfg(all(feature = "mlas", feature = "ops-cnn"))]
@@ -43,6 +45,7 @@ mod trace;
 pub mod weight_offload;
 
 pub use backend::CpuBackend;
+pub use dispatch_ledger::{Backend as DispatchBackend, KernelFamily, effective_backend};
 pub use kernels::qmoe::WeightOffloadHostCache;
 pub use kernels::{CpuOpDescriptor, build_cpu_registry_with_descriptors, supported_dtypes_for_op};
 pub use optimizer::{

@@ -320,13 +320,13 @@ jobs:
           -p onnx-genai-engine --features native-backend
           -- -D warnings
 
-      # The shipped nxrt-ep-cpu wheel enables the vendored MLAS kernels on this
-      # platform (python/nxrt-ep-cpu/setup.py: MLAS_TARGETS). ORT's own CPU EP
-      # *is* MLAS, so without them the quantized matmul paths measure an order
-      # of magnitude slower -- but the feature also compiles C++/asm that no
-      # other lane links into this cdylib. If that stops building here, the
-      # wheel stops building at release time, when it is most expensive.
-      - name: Build the shipped CPU plugin cdylib with MLAS
+      # No shipped artifact links MLAS: the wheel builds it only when someone
+      # opts in with NXRT_EP_CPU_RESEARCH_MLAS=1 on one of the platforms in
+      # python/nxrt-ep-cpu/setup.py: MLAS_TARGETS, and release automation never
+      # sets it. This lane is the only place the vendored C++/asm is compiled,
+      # so it is what keeps the research reference usable -- a differential
+      # measurement you cannot build is a measurement you do not have.
+      - name: Build the CPU plugin cdylib with the MLAS research reference
         run: cargo build --locked -p onnx-runtime-ep-cpu-plugin --features mlas
 
   rust-coverage:
@@ -400,13 +400,13 @@ jobs:
       # derived from cargo metadata and the commented deny-list in
       # `.github/scripts/workspace_test_packages.py`, so new offline workspace
       # crates are tested by default.
-      # The shipped nxrt-ep-cpu wheel enables the vendored MLAS kernels on this
-      # platform (python/nxrt-ep-cpu/setup.py: MLAS_TARGETS). ORT's own CPU EP
-      # *is* MLAS, so without them the quantized matmul paths measure an order
-      # of magnitude slower -- but the feature also compiles C++/asm that no
-      # other lane links into this cdylib. If that stops building here, the
-      # wheel stops building at release time, when it is most expensive.
-      - name: Build the shipped CPU plugin cdylib with MLAS
+      # No shipped artifact links MLAS: the wheel builds it only when someone
+      # opts in with NXRT_EP_CPU_RESEARCH_MLAS=1 on one of the platforms in
+      # python/nxrt-ep-cpu/setup.py: MLAS_TARGETS, and release automation never
+      # sets it. This lane is the only place the vendored C++/asm is compiled,
+      # so it is what keeps the research reference usable -- a differential
+      # measurement you cannot build is a measurement you do not have.
+      - name: Build the CPU plugin cdylib with the MLAS research reference
         if: runner.os != 'Linux'
         run: cargo build --locked -p onnx-runtime-ep-cpu-plugin --features mlas
 
@@ -481,13 +481,13 @@ jobs:
       - name: Build mlas-sys on Windows ARM64
         run: cargo build --locked --target aarch64-pc-windows-msvc -p mlas-sys
 
-      # The shipped nxrt-ep-cpu wheel enables the vendored MLAS kernels on this
-      # platform (python/nxrt-ep-cpu/setup.py: MLAS_TARGETS). ORT's own CPU EP
-      # *is* MLAS, so without them the quantized matmul paths measure an order
-      # of magnitude slower -- but the feature also compiles C++/asm that no
-      # other lane links into this cdylib. If that stops building here, the
-      # wheel stops building at release time, when it is most expensive.
-      - name: Build the shipped CPU plugin cdylib with MLAS
+      # No shipped artifact links MLAS: the wheel builds it only when someone
+      # opts in with NXRT_EP_CPU_RESEARCH_MLAS=1 on one of the platforms in
+      # python/nxrt-ep-cpu/setup.py: MLAS_TARGETS, and release automation never
+      # sets it. This lane is the only place the vendored C++/asm is compiled,
+      # so it is what keeps the research reference usable -- a differential
+      # measurement you cannot build is a measurement you do not have.
+      - name: Build the CPU plugin cdylib with the MLAS research reference
         run: cargo build --locked --target aarch64-pc-windows-msvc -p onnx-runtime-ep-cpu-plugin --features mlas
       # Platform execution is the signal here; coverage for most of these
       # offline crates is already reported by x64/macOS lanes, and ARM64
@@ -722,14 +722,14 @@ jobs:
       - name: Test onnx-runtime-ep-cpu-plugin (ORT gate)
         if: ${{ !cancelled() && runner.os == 'Linux' }}
         run: cargo test --locked --no-fail-fast -p onnx-runtime-ep-cpu-plugin
-      # The same suite against the *shipped* build. The wheel enables `mlas` on
-      # this platform, so the default-feature run above proves little about the
-      # library users install: with no features the build-identity assertion is
-      # trivially satisfied, the vendored C++ is not linked so the symbol
-      # leakage check has nothing to leak, and a testkit that rebuilds a
-      # feature-specific cdylib *without* its features -- the defect fixed
-      # alongside this step -- is only observable when features are requested.
-      - name: Test onnx-runtime-ep-cpu-plugin with MLAS (ORT gate)
+      # The same suite with the research reference linked. The run above is the
+      # shipped configuration, but precisely because it links nothing the tests
+      # that care about linkage are vacuous there: the build-identity assertion
+      # is trivially satisfied, the symbol-leakage check has nothing to leak,
+      # and a testkit that rebuilds a feature-specific cdylib *without* its
+      # features -- the defect fixed alongside this step -- is only observable
+      # when features are requested. This lane is where they have teeth.
+      - name: Test onnx-runtime-ep-cpu-plugin with the MLAS reference (ORT gate)
         if: ${{ !cancelled() && runner.os == 'Linux' }}
         run: >-
           cargo test --locked --no-fail-fast

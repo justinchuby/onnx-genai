@@ -42,6 +42,7 @@ use super::half_gemm::{self, HalfFormat, MatrixLayout};
 use super::half_gemv;
 use super::weight_transpose::{self, WeightTransposeKey};
 use crate::backend::CpuBackend;
+use crate::dispatch_ledger;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::{next_index, numel};
 
@@ -1057,6 +1058,16 @@ pub(crate) fn gemm_with_backend(
     k: usize,
     n: usize,
 ) -> Result<()> {
+    dispatch_ledger::record_with(|| {
+        dispatch_ledger::Observation::gemm(
+            dispatch_ledger::KernelFamily::MatMulF32,
+            ledger_backend(backend),
+            "f32",
+            m,
+            n,
+            k,
+        )
+    });
     match backend {
         #[cfg(feature = "mlas")]
         CpuBackend::Mlas => {
@@ -1082,6 +1093,16 @@ pub(crate) fn gemm_with_backend(
             gemm_generic(a, b, c, m, k, n);
             Ok(())
         }
+    }
+}
+
+/// How a [`CpuBackend`] reads in the dispatch ledger: MLAS is the only variant
+/// whose arithmetic is not ours, and it only exists in a research build.
+pub(crate) fn ledger_backend(backend: CpuBackend) -> dispatch_ledger::Backend {
+    match backend {
+        #[cfg(feature = "mlas")]
+        CpuBackend::Mlas => dispatch_ledger::Backend::Mlas,
+        _ => dispatch_ledger::Backend::Native,
     }
 }
 
