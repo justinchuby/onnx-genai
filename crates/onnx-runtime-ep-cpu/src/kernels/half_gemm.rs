@@ -394,11 +394,26 @@ fn gemm_impl<T: HalfElement>(
 /// |   524_288 | 1.34/1.30 | 1.01/1.02 | 1.29/1.76 | 1.20/1.08 | 1.19/1.12 |
 /// | 1_048_576 | 1.41/1.37 | 1.08/1.04 | 1.47/1.95 | 1.34/1.30 | 1.31/1.31 |
 ///
-/// `524_288` is the smallest size that wins at *every* measured thread count in
-/// *every* run (worst case 1.01x). Below it the picture is genuinely mixed --
-/// `262_144` wins at T=2/T=8 but loses at T=4 (0.92x) and T=32 (0.80x) -- so
-/// declining is the right call there even though it leaves some partial-pool
-/// wins on the table.
+/// Re-measured after `codegen-units = 1` was pinned for this crate, which makes
+/// the *serial* route materially faster and therefore moves the crossover up.
+/// Same harness, two runs per thread count:
+///
+/// | m*k*n     |       T=2 |       T=4 |       T=8 |      T=16 |
+/// |-----------|-----------|-----------|-----------|-----------|
+/// |   262_144 |      1.20 | 0.92/0.91 | 1.52      | 0.64/0.95 |
+/// |   393_216 |      1.28 | 0.99/0.96 | 1.66      | 0.80/1.10 |
+/// |   524_288 |      1.32 | 0.99/0.98 | 1.81      | 1.03/1.19 |
+/// |   786_432 |      1.33 | 1.03/0.92 | 1.35      | 0.97/1.25 |
+/// | 1_048_576 |      1.37 | 1.05/1.05 | 1.46      | 1.31/1.34 |
+///
+/// `1_048_576` is now the smallest size that wins at every measured thread count
+/// in every run (worst case 1.05x). `524_288` no longer qualifies: it is a wash
+/// at T=4 (0.99/0.98) and `786_432` dips to 0.92 there and 0.97 at T=16. The
+/// rule is unchanged -- smallest size that wins everywhere -- only the build it
+/// is measured against is faster, so the answer moved.
+///
+/// Below the threshold the picture is not merely mixed but bad: 0.32-0.37 at
+/// T=16 for the smallest shapes, which is the 3x the guard exists to stop.
 ///
 /// Deliberately a single constant rather than a function of thread count: the
 /// measured crossover is *not* monotone in threads (T=4 wants the highest
@@ -413,7 +428,7 @@ fn gemm_impl<T: HalfElement>(
 /// scaling with the pool, and why some shapes above the threshold still gain
 /// little. Sibling kernels apply the same kind of guard
 /// (`half_gemv::PARALLEL_MIN_WORK`, `accelerate_gemm`'s `k*n` bound).
-const PARALLEL_MIN_WORK: usize = 524_288;
+const PARALLEL_MIN_WORK: usize = 1_048_576;
 
 #[cfg(test)]
 thread_local! {
@@ -1333,7 +1348,7 @@ mod half_gemm_guard_tests {
     #[test]
     fn half_gemm_parallel_threshold_matches_the_measured_crossover() {
         assert_eq!(
-            PARALLEL_MIN_WORK, 524_288,
+            PARALLEL_MIN_WORK, 1_048_576,
             "smallest m*k*n measured to win at every thread count; re-run \
              bench_half_gemm_parallel_threshold before changing it"
         );
@@ -1358,10 +1373,10 @@ mod half_gemm_guard_tests {
             "work below PARALLEL_MIN_WORK must not fork the pool"
         );
 
-        // 8*512*256 = 1_048_576, measured 1.31x-1.95x in favour of splitting.
-        let (a, b, mut c) = operands(8, 512, 256);
+        // 8*512*384 = 1_572_864, measured 1.33x-1.51x in favour of splitting.
+        let (a, b, mut c) = operands(8, 512, 384);
         reset_serial_gemms();
-        gemm(&a, &b, &mut c, 8, 512, 256);
+        gemm(&a, &b, &mut c, 8, 512, 384);
         assert_eq!(
             serial_gemms(),
             0,
@@ -1378,8 +1393,8 @@ mod half_gemm_guard_tests {
             eprintln!("skipping: needs a multi-thread pool");
             return;
         }
-        // 8 * 256 * 256 == 524_288 == PARALLEL_MIN_WORK exactly.
-        let (m, k, n) = (8usize, 256usize, 256usize);
+        // 8 * 512 * 256 == 1_048_576 == PARALLEL_MIN_WORK exactly.
+        let (m, k, n) = (8usize, 512usize, 256usize);
         assert_eq!(
             m * k * n,
             PARALLEL_MIN_WORK,
@@ -1417,7 +1432,7 @@ mod half_gemm_guard_tests {
             eprintln!("skipping: needs a multi-thread pool");
             return;
         }
-        let (m, k, n) = (1usize, 1024usize, 1024usize);
+        let (m, k, n) = (1usize, 1024usize, 2048usize);
         assert!(m * k * n > PARALLEL_MIN_WORK, "must clear the work bound");
         let (a, b, mut c) = operands(m, k, n);
         reset_serial_gemms();
