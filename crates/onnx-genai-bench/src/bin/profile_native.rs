@@ -1177,6 +1177,23 @@ fn run_native_decode_batch_sweep(
             }
         }
 
+        // Whole-subgraph vs segmented capture: batch=1 typically captures as a
+        // single graph (segments=1 -> zero-host-work replay), while M>=2 can
+        // fragment into segments whose replay interleaves eager seam-node
+        // execution every step. `segments>1` at batch>=2 with the seam summary
+        // naming the culprit op is the localized root cause of the M>=2 decode
+        // step-cost cliff (per-step executor work instead of a bare graph relaunch).
+        {
+            let segments = session.captured_graph_segment_count();
+            let seams = session
+                .captured_graph_seam_summary()
+                .unwrap_or_else(|| "none".to_string());
+            println!(
+                "native_decode_batch_cuda_graph_segments: batch={batch} segments={segments} \
+                 seam_nodes={seams}"
+            );
+        }
+
         // Weight-streaming amortization: emitted tokens = steps × rows, so
         // `htod_bytes_per_token` is per produced token and should fall ~1/N,
         // partly offset upward as N× KV occupancy shrinks the elastic weight
