@@ -246,7 +246,9 @@ fn n_sequences_share_one_pinned_prefix_charged_once_alive_until_last() {
         let ptr = allocate_sequence(&allocator, granule, SEQ_GRANULES);
         let owned_before = governor.used(Tier::Device);
         assert_eq!(
-            allocator.incremental_owned_bytes_for_shared_prefix(&prefix),
+            allocator
+                .incremental_owned_bytes_for_shared_prefix(&prefix)
+                .expect("same-device same-authority prefix"),
             0,
             "admitting sharer {n} must need zero incremental owned bytes for the prefix"
         );
@@ -370,7 +372,9 @@ fn admitting_a_sharer_costs_only_private_bytes() {
 
     // Mapping the shared prefix at offset 0 is free on the owned axis.
     assert_eq!(
-        allocator.incremental_owned_bytes_for_shared_prefix(&prefix),
+        allocator
+            .incremental_owned_bytes_for_shared_prefix(&prefix)
+            .expect("same-device same-authority prefix"),
         0
     );
     allocator
@@ -621,10 +625,11 @@ fn foreign_device_and_authority_prefixes_are_not_free_and_are_rejected() {
     .expect("logical device-one allocator");
     let wrong_device_mapping = DeviceAllocator::as_shared_mapping(&wrong_device)
         .expect("wrong-device allocator still has its own pool");
-    assert_eq!(
-        wrong_device_mapping.incremental_owned_bytes_for_shared_prefix(prefix.as_ref()),
-        prefix.committed_physical_bytes(),
-        "a wrong-device prefix must never be admitted as zero-cost"
+    assert!(
+        wrong_device_mapping
+            .incremental_owned_bytes_for_shared_prefix(prefix.as_ref())
+            .is_err(),
+        "a wrong-device prefix must be rejected before a cost is reported"
     );
     assert!(
         wrong_device_mapping
@@ -641,10 +646,11 @@ fn foreign_device_and_authority_prefixes_are_not_free_and_are_rejected() {
     );
     let wrong_authority_mapping = DeviceAllocator::as_shared_mapping(&wrong_authority)
         .expect("wrong-authority allocator has its own pool");
-    assert_eq!(
-        wrong_authority_mapping.incremental_owned_bytes_for_shared_prefix(prefix.as_ref()),
-        prefix.committed_physical_bytes(),
-        "a wrong-authority prefix must never be admitted as zero-cost"
+    assert!(
+        wrong_authority_mapping
+            .incremental_owned_bytes_for_shared_prefix(prefix.as_ref())
+            .is_err(),
+        "a wrong-authority prefix must be rejected before a cost is reported"
     );
     assert!(
         wrong_authority_mapping

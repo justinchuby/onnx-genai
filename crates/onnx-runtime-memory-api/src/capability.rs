@@ -94,10 +94,13 @@ pub trait SharedMapping: Send + Sync + Debug {
     /// Incremental owned physical cost of admitting another mapping.
     ///
     /// Zero is valid only for a prefix this capability can actually map. A
-    /// wrong-device, wrong-authority, or foreign prefix must return a
-    /// conservative non-zero cost and be rejected by
+    /// wrong-device, wrong-authority, or foreign prefix must be rejected before
+    /// any cost is reported, matching
     /// [`commit_shared_prefix`](Self::commit_shared_prefix).
-    fn incremental_owned_bytes_for_shared_prefix(&self, prefix: &dyn SharedDevicePrefix) -> u64;
+    fn incremental_owned_bytes_for_shared_prefix(
+        &self,
+        prefix: &dyn SharedDevicePrefix,
+    ) -> Result<u64, MemoryError>;
 
     fn commit_shared_prefix(
         &self,
@@ -112,6 +115,7 @@ pub trait SharedMapping: Send + Sync + Debug {
 mod tests {
     use super::*;
     use crate::{DeviceAllocator, DeviceKey, HostAllocator};
+    use std::any::Any;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[derive(Debug, Default)]
@@ -202,6 +206,31 @@ mod tests {
     #[derive(Debug)]
     struct SharedOnly;
 
+    #[derive(Debug)]
+    struct ForeignZeroPrefix;
+
+    impl SharedDevicePrefix for ForeignZeroPrefix {
+        fn device_ptr(&self) -> u64 {
+            0
+        }
+
+        fn committed_physical_bytes(&self) -> u64 {
+            0
+        }
+
+        fn mapped_bytes(&self) -> usize {
+            0
+        }
+
+        fn requested_bytes(&self) -> usize {
+            0
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
     impl DeviceAllocator for SharedOnly {
         fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
             HostAllocator.allocate(bytes, align)
@@ -236,8 +265,12 @@ mod tests {
         fn incremental_owned_bytes_for_shared_prefix(
             &self,
             prefix: &dyn SharedDevicePrefix,
-        ) -> u64 {
-            prefix.committed_physical_bytes()
+        ) -> Result<u64, MemoryError> {
+            Err(MemoryError::InvalidRequest {
+                tier: "host",
+                requested: prefix.requested_bytes() as u64,
+                reason: "test shared prefix is foreign to this capability",
+            })
         }
 
         fn commit_shared_prefix(
@@ -286,6 +319,14 @@ mod tests {
     fn shared_mapping_discovery_is_independent_of_virtual_backing() {
         let allocator: &dyn DeviceAllocator = &SharedOnly;
         assert!(allocator.as_virtual_backing().is_none());
-        assert!(allocator.as_shared_mapping().is_some());
+        let mapping = allocator
+            .as_shared_mapping()
+            .expect("independent shared mapping capability");
+        assert!(
+            mapping
+                .incremental_owned_bytes_for_shared_prefix(&ForeignZeroPrefix)
+                .is_err(),
+            "foreign input must be rejected before even a zero cost is reported"
+        );
     }
 }

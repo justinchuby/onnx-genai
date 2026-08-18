@@ -635,12 +635,16 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
 
         // The shared prefix costs zero incremental owned bytes to admit.
         assert_eq!(
-            shared_mapping.incremental_owned_bytes_for_shared_prefix(key_prefix.as_ref()),
+            shared_mapping
+                .incremental_owned_bytes_for_shared_prefix(key_prefix.as_ref())
+                .expect("key prefix belongs to this mapping capability"),
             0,
             "admitting sharer {seq} needs zero incremental owned bytes for the key prefix"
         );
         assert_eq!(
-            shared_mapping.incremental_owned_bytes_for_shared_prefix(value_prefix.as_ref()),
+            shared_mapping
+                .incremental_owned_bytes_for_shared_prefix(value_prefix.as_ref())
+                .expect("value prefix belongs to this mapping capability"),
             0
         );
 

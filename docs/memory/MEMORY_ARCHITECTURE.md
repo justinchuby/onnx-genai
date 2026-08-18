@@ -1659,6 +1659,14 @@ delegates ordinary allocation, optional capabilities, and release to one inner
 object; runtime identity heuristics are not used as a fake proof.
 Manager-issued binding identity remains later work.
 
+`VirtualBacking` capability presence alone does not assert governed accounting.
+The separate `DeviceAllocator::commits_on_demand()` signal is `true` only when a
+mechanism both maps physical memory lazily and charges a governor as it commits;
+eager and ungoverned-capability implementations retain the safe `false`
+default. Likewise, `SharedMapping` rejects foreign device/pool-authority
+prefixes before reporting incremental owned cost, so an unmappable prefix can
+never appear free to admission control.
+
 ### 1.2 Two directions, both backends
 
 "Bring your own memory manager" needs traffic in both directions, and a backend

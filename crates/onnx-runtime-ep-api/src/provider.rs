@@ -877,18 +877,21 @@ pub trait ExecutionProvider: Send + Sync {
     /// If the tier cannot afford what the provider already holds. That is worth
     /// failing on: it says the model does not fit *before* the pool is used,
     /// rather than at an allocation somewhere unrelated later.
+    ///
     /// Whether the memory this provider hands out commits physically as it is
     /// used rather than when it is requested.
     ///
-    /// A forwarder, not a fact of its own: a provider should answer by
-    /// discovering [`VirtualBacking`] from whichever allocator it currently
-    /// uses. It is repeated here only because a caller holding a session
+    /// A forwarder, not a fact of its own: a provider should preserve the
+    /// selected allocator's explicit [`DeviceAllocator::commits_on_demand`]
+    /// signal. That signal requires both lazy physical mapping and governor
+    /// charging; optional `VirtualBacking` capability presence alone is not
+    /// enough. It is repeated here only because a caller holding a session
     /// reaches the allocator through the provider.
     ///
     /// `false` is the safe default -- a consumer that believes `true` will
     /// under-reserve.
     ///
-    /// [`VirtualBacking`]: onnx_runtime_memory_governor::VirtualBacking
+    /// [`DeviceAllocator::commits_on_demand`]: onnx_runtime_memory_governor::DeviceAllocator::commits_on_demand
     fn commits_on_demand(&self) -> bool {
         false
     }

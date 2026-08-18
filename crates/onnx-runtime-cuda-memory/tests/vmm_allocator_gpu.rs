@@ -18,6 +18,7 @@
 //! (#636).
 
 use cudarc::driver::CudaContext;
+use cudarc::driver::sys as cu;
 use onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator;
 use onnx_runtime_memory_governor::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor,
@@ -25,6 +26,28 @@ use onnx_runtime_memory_governor::{
 };
 
 const HOLDER: HolderId = HolderId::new(21);
+
+fn driver_granularity(device_ordinal: i32) -> usize {
+    let mut prop: cu::CUmemAllocationProp = unsafe { std::mem::zeroed() };
+    prop.type_ = cu::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type_ = cu::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device_ordinal;
+    let mut granularity = 0usize;
+    let result = unsafe {
+        cu::cuMemGetAllocationGranularity(
+            &mut granularity,
+            &prop,
+            cu::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+        )
+    };
+    assert_eq!(
+        result,
+        cu::CUresult::CUDA_SUCCESS,
+        "cuMemGetAllocationGranularity: {result:?}"
+    );
+    assert_ne!(granularity, 0, "CUDA reported zero VMM granularity");
+    granularity
+}
 
 /// An allocator over `capacity` bytes of address space, and the ledger behind
 /// it, or `None` on a machine with no driver.
@@ -540,10 +563,7 @@ fn disjoint_tiny_ranges_report_and_commit_granule_rounded_bytes() {
         .as_virtual_backing()
         .expect("VMM capability is discovered from the selected allocator");
 
-    let probe = selected.allocate(4096, 256).expect("probe allocation");
-    let granularity = allocator.committed_and_reserved().0;
-    // SAFETY: exact live allocation returned above.
-    unsafe { selected.deallocate(probe, 4096, 256) };
+    let granularity = driver_granularity(0);
 
     let allocation_bytes = granularity * 2;
     let ptr = backing

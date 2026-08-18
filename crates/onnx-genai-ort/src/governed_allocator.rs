@@ -207,13 +207,14 @@ impl GovernedAllocator {
     /// # What it unblocks
     ///
     /// This is how the ONNX Runtime path reaches an allocator that commits
-    /// physically on demand. `GovernedAllocator` already forwards
-    /// [`DeviceAllocator::as_virtual_backing`], so a session that registers one
-    /// of these answers the same question the native path does -- which is what
-    /// lets a consumer size a KV cache without knowing which backend it got.
+    /// physically on demand and charges those commits. `GovernedAllocator`
+    /// forwards [`DeviceAllocator::commits_on_demand`], so a session that
+    /// registers one of these answers the same accounting question the native
+    /// path does -- which is what lets a consumer size a KV cache without
+    /// knowing which backend it got.
     ///
     /// [`new`]: Self::new
-    /// [`DeviceAllocator::as_virtual_backing`]: onnx_runtime_memory_governor::DeviceAllocator::as_virtual_backing
+    /// [`DeviceAllocator::commits_on_demand`]: onnx_runtime_memory_governor::DeviceAllocator::commits_on_demand
     pub fn on_device(
         memory_info: MemoryInfo,
         memory: Arc<dyn DeviceAllocator>,
@@ -364,7 +365,7 @@ impl GovernedAllocator {
     /// `OrtAllocator` seam is a wrapper, and the property belongs to the
     /// allocator underneath it rather than to the backend on top.
     pub fn commits_on_demand(&self) -> bool {
-        self.state.memory.as_virtual_backing().is_some()
+        self.state.memory.commits_on_demand()
     }
     pub fn as_ort_allocator(&mut self) -> *mut onnx_genai_ort_sys::OrtAllocator {
         std::ptr::from_mut(&mut self.base)
@@ -786,7 +787,7 @@ mod tests {
     #[test]
     fn a_device_allocator_and_its_memory_info_must_agree() {
         #[derive(Debug)]
-        struct FakeDevice;
+        struct FakeDevice(bool);
 
         // SAFETY: never allocates, so the non-overlap and validity guarantees
         // hold vacuously.
@@ -810,6 +811,10 @@ mod tests {
             fn device(&self) -> onnx_runtime_memory_governor::DeviceKey {
                 onnx_runtime_memory_governor::DeviceKey::device(0)
             }
+
+            fn commits_on_demand(&self) -> bool {
+                self.0
+            }
         }
 
         let governor: Arc<dyn MemoryGovernor + Send + Sync> =
@@ -822,7 +827,7 @@ mod tests {
         };
         let error = match GovernedAllocator::on_device(
             cpu_info,
-            Arc::new(FakeDevice),
+            Arc::new(FakeDevice(false)),
             Arc::clone(&governor),
             AllocationRoles::default(),
             HolderId::new(90),
@@ -833,6 +838,22 @@ mod tests {
         assert!(
             format!("{error}").contains("MemoryInfo::cuda"),
             "the error should name the constructor that fixes it: {error}"
+        );
+
+        let Ok(device_info) = MemoryInfo::dml(0) else {
+            return;
+        };
+        let device_allocator = GovernedAllocator::on_device(
+            device_info,
+            Arc::new(FakeDevice(true)),
+            Arc::clone(&governor),
+            AllocationRoles::default(),
+            HolderId::new(92),
+        )
+        .expect("matching CUDA memory info");
+        assert!(
+            device_allocator.commits_on_demand(),
+            "the ORT wrapper must preserve the allocator's explicit accounting signal"
         );
 
         // Host memory offered to the device constructor: refused too, and by

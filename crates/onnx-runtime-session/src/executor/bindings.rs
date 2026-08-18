@@ -1049,9 +1049,7 @@ impl Executor {
     /// Place any long-lived device memory the provider holds under `governor`.
     /// Whether the memory this executor's provider hands out commits
     /// physically as it is used. See
-    /// [`DeviceAllocator::commits_on_demand`][d].
-    ///
-    /// [d]: onnx_runtime_memory_governor::DeviceAllocator::commits_on_demand
+    /// [`DeviceAllocator::commits_on_demand`](onnx_runtime_memory_governor::DeviceAllocator::commits_on_demand).
     pub(crate) fn commits_on_demand(&self) -> bool {
         self.ep.commits_on_demand()
     }

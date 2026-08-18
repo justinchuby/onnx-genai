@@ -1276,23 +1276,54 @@ impl CudaVmmAllocator {
         })
     }
 
+    fn validate_shared_prefix_source(
+        &self,
+        prefix: &SharedPrefix,
+        requested: usize,
+    ) -> Result<(), MemoryError> {
+        if prefix.device != self.device {
+            return Err(invalid(
+                requested,
+                format!(
+                    "shared prefix belongs to device {:?} but this allocator serves {:?}",
+                    prefix.device, self.device
+                ),
+            ));
+        }
+        match (prefix.authority, self.physical_pool_authority()) {
+            (Some(prefix_authority), Some(self_authority))
+                if prefix_authority == self_authority =>
+            {
+                Ok(())
+            }
+            (None, _) | (_, None) => Err(invalid(
+                requested,
+                String::from(
+                    "shared prefix requires the production physical-handle pool on both the \
+                     prefix and the committing allocator",
+                ),
+            )),
+            _ => Err(invalid(
+                requested,
+                String::from(
+                    "shared prefix was created under a different pool authority than this \
+                     allocator",
+                ),
+            )),
+        }
+    }
+
     /// Estimate the incremental owned bytes to admit one more sharer.
     ///
-    /// Zero is valid only when this allocator can actually map the prefix:
-    /// device and physical-pool authority must both match. A foreign prefix is
-    /// conservatively charged at its full physical footprint and the mapping
-    /// operation rejects it.
-    pub fn incremental_owned_bytes_for_shared_prefix(&self, prefix: &SharedPrefix) -> u64 {
-        let same_device = prefix.device == self.device;
-        let same_authority = match (prefix.authority, self.physical_pool_authority()) {
-            (Some(prefix_authority), Some(self_authority)) => prefix_authority == self_authority,
-            _ => false,
-        };
-        if same_device && same_authority {
-            0
-        } else {
-            prefix.committed_physical_bytes()
-        }
+    /// A compatible prefix is already owned and costs zero. Foreign device or
+    /// pool-authority inputs are rejected before reporting a cost, exactly as
+    /// the mapping operation rejects them.
+    pub fn incremental_owned_bytes_for_shared_prefix(
+        &self,
+        prefix: &SharedPrefix,
+    ) -> Result<u64, MemoryError> {
+        self.validate_shared_prefix_source(prefix, prefix.requested_bytes)?;
+        Ok(0)
     }
 
     /// Map `prefix` into the live allocation `ptr` at `byte_offset`,
@@ -1330,37 +1361,7 @@ impl CudaVmmAllocator {
                 ),
             ));
         }
-        if prefix.device != self.device {
-            return Err(invalid(
-                allocation_bytes,
-                format!(
-                    "shared prefix belongs to device {:?} but this allocator serves {:?}",
-                    prefix.device, self.device
-                ),
-            ));
-        }
-        match (prefix.authority, self.physical_pool_authority()) {
-            (Some(prefix_authority), Some(self_authority))
-                if prefix_authority == self_authority => {}
-            (None, _) | (_, None) => {
-                return Err(invalid(
-                    allocation_bytes,
-                    String::from(
-                        "shared prefix requires the production physical-handle pool on both the \
-                         prefix and the committing allocator",
-                    ),
-                ));
-            }
-            _ => {
-                return Err(invalid(
-                    allocation_bytes,
-                    String::from(
-                        "shared prefix was created under a different pool authority than this \
-                         allocator",
-                    ),
-                ));
-            }
-        }
+        self.validate_shared_prefix_source(prefix, allocation_bytes)?;
 
         let mut arena = self.lock();
         let granularity = arena.spans.granularity;
@@ -1726,6 +1727,10 @@ impl DeviceAllocator for CudaVmmAllocator {
         self.device
     }
 
+    fn commits_on_demand(&self) -> bool {
+        true
+    }
+
     fn as_virtual_backing(&self) -> Option<&dyn MemoryVirtualBacking> {
         Some(self)
     }
@@ -2011,17 +2016,20 @@ impl SharedMapping for CudaVmmAllocator {
         Ok(Box::new(prefix))
     }
 
-    fn incremental_owned_bytes_for_shared_prefix(&self, prefix: &dyn SharedDevicePrefix) -> u64 {
-        // A prefix from another allocator kind cannot be mapped here, so its
-        // incremental owned cost is not this allocator's to estimate; treat the
-        // unmappable case as "not free" so a caller never admits against a
-        // prefix `commit_shared_prefix` will refuse.
-        match prefix.as_any().downcast_ref::<SharedPrefix>() {
-            Some(prefix) => {
-                CudaVmmAllocator::incremental_owned_bytes_for_shared_prefix(self, prefix)
-            }
-            None => prefix.committed_physical_bytes(),
-        }
+    fn incremental_owned_bytes_for_shared_prefix(
+        &self,
+        prefix: &dyn SharedDevicePrefix,
+    ) -> Result<u64, MemoryError> {
+        let prefix = prefix.as_any().downcast_ref::<SharedPrefix>().ok_or_else(|| {
+            invalid(
+                prefix.requested_bytes(),
+                String::from(
+                    "shared prefix was not created by a CUDA VMM allocator; no incremental cost \
+                     can be reported for an unmappable prefix",
+                ),
+            )
+        })?;
+        CudaVmmAllocator::incremental_owned_bytes_for_shared_prefix(self, prefix)
     }
 
     fn commit_shared_prefix(

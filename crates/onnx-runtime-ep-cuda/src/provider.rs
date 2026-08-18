@@ -177,6 +177,17 @@ impl CudaMemory {
     }
 }
 
+fn assert_commit_buffer_devices(expected: DeviceId, ranges: &[(&DeviceBuffer, usize, usize)]) {
+    for &(buffer, _, _) in ranges {
+        assert_eq!(
+            buffer.device(),
+            expected,
+            "cuda_ep: refusing to commit a buffer from device {:?}",
+            buffer.device()
+        );
+    }
+}
+
 /// CUDA execution provider (Phase 2a: cudarc + cuBLASLt GEMM).
 ///
 /// Unlike the always-available CPU EP, this provider needs a real device, so
@@ -426,6 +437,17 @@ impl CudaExecutionProvider {
     /// The single allocator selected for this provider.
     fn memory(&self) -> &dyn onnx_runtime_memory_governor::DeviceAllocator {
         self.memory.allocator()
+    }
+
+    /// The provider-managed mapped-growth path is intentionally narrower than
+    /// generic `VirtualBacking`: it consumes governor capacity through inherent
+    /// `CudaVmmAllocator` methods, so only the construction-selected in-tree VMM
+    /// is eligible. Capability discovery and the explicit accounting promise
+    /// are both checked from that selected allocator reference.
+    fn managed_vmm(&self) -> Option<&Arc<crate::vmm_allocator::CudaVmmAllocator>> {
+        let arena = self.memory.vmm()?;
+        let selected: &dyn onnx_runtime_memory_governor::DeviceAllocator = arena.as_ref();
+        (selected.commits_on_demand() && selected.as_virtual_backing().is_some()).then_some(arena)
     }
 
     fn synchronize_before_pooled_unmap(&self) -> Result<()> {
@@ -906,7 +928,7 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
         if dynamic_lending_enabled()
-            && let Some(virtual_backing) = self.memory().as_virtual_backing()
+            && let Some(arena) = self.managed_vmm()
             && let Some(governor) = self.governor.as_deref()
             && let Some(requester) = self
                 .mapped_requesters
@@ -917,6 +939,9 @@ impl ExecutionProvider for CudaExecutionProvider {
                 ))
                 .cloned()
         {
+            let virtual_backing =
+                onnx_runtime_memory_governor::DeviceAllocator::as_virtual_backing(arena.as_ref())
+                    .expect("managed_vmm requires VirtualBacking");
             let bytes = virtual_backing
                 .mapped_bytes_for_allocation(size, alignment)
                 .map_err(EpError::Memory)?;
@@ -939,7 +964,7 @@ impl ExecutionProvider for CudaExecutionProvider {
             return Err(EpError::AlignmentError);
         }
         let full = 0..size;
-        let Some(arena) = self.memory.vmm() else {
+        let Some(arena) = self.managed_vmm() else {
             return Err(EpError::KernelFailed(
                 "cuda_ep: mapped growth requires the construction-selected CUDA VMM allocator; \
                  no second allocator handle or capability downcast is used"
@@ -1044,6 +1069,7 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn commit_allocation_ranges(&self, ranges: &[(&DeviceBuffer, usize, usize)]) -> Result<()> {
+        assert_commit_buffer_devices(self.device, ranges);
         let Some(virtual_backing) = self.memory().as_virtual_backing() else {
             // Same explicit eager fallback as the single-range operation.
             return Ok(());
@@ -1051,12 +1077,6 @@ impl ExecutionProvider for CudaExecutionProvider {
         let raw = ranges
             .iter()
             .map(|&(buffer, offset, bytes)| {
-                assert_eq!(
-                    buffer.device(),
-                    self.device,
-                    "cuda_ep: refusing to commit a buffer from device {:?}",
-                    buffer.device()
-                );
                 let ptr = std::ptr::NonNull::new(buffer.as_ptr().cast::<u8>() as *mut u8)
                     .ok_or_else(|| EpError::KernelFailed("cuda_ep: null commit buffer".into()))?;
                 Ok(onnx_runtime_memory_governor::AllocationCommitRange {
@@ -1084,7 +1104,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         ranges: &[(&DeviceBuffer, usize, usize)],
         grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
     ) -> Result<u64> {
-        let Some(arena) = self.memory.vmm() else {
+        let Some(arena) = self.managed_vmm() else {
             return Err(EpError::KernelFailed(
                 "cuda_ep: mapped growth requires the construction-selected CUDA VMM allocator; \
                  injected allocators use their ordinary capability path"
@@ -1504,7 +1524,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         bytes: u64,
         role: onnx_runtime_memory_governor::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
-        if self.memory.vmm().is_some() {
+        if self.memory().commits_on_demand() {
             return Ok(None);
         }
         self.governor
@@ -1526,7 +1546,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         bytes: u64,
         role: onnx_runtime_memory_governor::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
-        if bytes == 0 || !dynamic_lending_enabled() || self.memory.vmm().is_none() {
+        if bytes == 0 || !dynamic_lending_enabled() || self.managed_vmm().is_none() {
             return Ok(None);
         }
         let Some(governor) = self.governor.as_deref() else {
@@ -1584,10 +1604,7 @@ impl ExecutionProvider for CudaExecutionProvider {
     /// False on the `cuMemAlloc` path, which takes physical memory at the
     /// moment it is asked for.
     fn commits_on_demand(&self) -> bool {
-        // Capability presence is mechanism-only and does not prove that an
-        // injected allocator participates in this provider's governor. Only
-        // the construction-selected in-tree VMM has that accounting contract.
-        self.memory.vmm().is_some()
+        self.memory().commits_on_demand()
     }
 
     fn set_weight_residency_budget(&self, budget_bytes: u64) -> Result<Option<u64>> {
@@ -1687,6 +1704,20 @@ impl ExecutionProvider for CudaExecutionProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "refusing to commit a buffer from device")]
+    fn eager_batched_commit_still_rejects_a_foreign_device_buffer() {
+        let foreign = unsafe {
+            DeviceBuffer::from_raw_parts(
+                std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+                DeviceId::cuda(1),
+                64,
+                16,
+            )
+        };
+        assert_commit_buffer_devices(DeviceId::cuda(0), &[(&foreign, 0, 16)]);
+    }
 
     #[test]
     fn dynamic_lending_is_on_by_default_with_behavior_safe_opt_outs() {

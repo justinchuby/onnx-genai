@@ -133,6 +133,18 @@ pub trait DeviceAllocator: Send + Sync + Debug {
 
     fn device(&self) -> DeviceKey;
 
+    /// Whether this allocator maps physical memory lazily **and** charges a
+    /// governor as each physical commitment is made.
+    ///
+    /// This is an accounting promise, not capability discovery. An allocator
+    /// may expose [`VirtualBacking`] while returning `false` here when its
+    /// commit operations are not integrated with a governor. Consumers that
+    /// skip an eager full-footprint reservation rely on both halves of this
+    /// contract, so `false` is the safe default.
+    fn commits_on_demand(&self) -> bool {
+        false
+    }
+
     /// Discover lazy reserve/commit/decommit support from this selected
     /// allocator reference.
     fn as_virtual_backing(&self) -> Option<&dyn VirtualBacking> {
@@ -212,6 +224,7 @@ mod tests {
     #[test]
     fn eager_allocator_requires_only_the_ordinary_contract() {
         let allocator: &dyn DeviceAllocator = &EagerOnly;
+        assert!(!allocator.commits_on_demand());
         assert!(allocator.as_virtual_backing().is_none());
         assert!(allocator.as_shared_mapping().is_none());
         let ptr = allocator.allocate(64, 16).expect("ordinary allocation");
