@@ -130,3 +130,10 @@ ONNX_GENAI_CUDA_GRAPH=0 profile_native --model $M --ep cuda --steady --warmups 1
 Fresh detached worktree off `origin/main b416a3e0`; no `git add -A`; no source edits (measure + scope only);
 pinned idle GPU6 after nvidia-smi; base decode only; opt-in flag, no default flip; no /tmp writes; no
 stray procs left; GPU returned to idle.
+
+## 2026-08-18 — ORT-fairness dense int4 reconfirmed
+
+Wallace reconfirmed the 2026-08-17 dense int4 Native-vs-ORT decomposition from the opposite direction by trying to enable ORT CUDA graph mode on the same three production exports. True graph-vs-graph is unattainable: Phi-4-mini hard-rejects ORT graph capture because control-flow nodes cannot be supported by CUDAExecutionProvider; qwen2.5-7b aborts at runtime with `ort_value must contain a constructed tensor`; qwen2.5-14b-zp accepts the flag but effectively no-ops because CPU-assigned shape nodes fragment capture (eager 96.9 vs graph 98.7 tok/s, byte-identical).
+
+Eager-vs-eager medians again show this is architectural, not a broad per-kernel native win: Phi native/ORT **0.85×**, qwen2.5-7b **0.77×**, qwen2.5-14b-zp **1.19×**. Keep the deployment headline that native captured decode leads ORT eager **1.33× / 1.14× / 1.83×**, but always label it as CUDA-graph capture plus on-GPU argmax that ORT structurally cannot apply on these dynamic-KV int4 exports.
+

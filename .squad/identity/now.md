@@ -33,6 +33,8 @@ Root-caused the earlier "ORT errors through harness": auto-discovery was silentl
 
 **Graph-vs-graph is UNATTAINABLE — and that's the finding, not a gap in our test.** Stock ORT CUDA EP **cannot capture a usable CUDA graph** on these onnxruntime-genai int4 models (shape-massaging nodes forced to CPU + dynamic KV): `enable_cuda_graph=1` no-ops on 14b (80.7 vs eager 83.4), is garbage on Phi (4.4 tok/s), fails on 7b. **Native *can* capture (it owns the KV cache + does static-shape replay) — that capability is itself the source of the lead, and ORT structurally can't match it on these models.**
 
+**Per-model ORT-graph-mode failure reasons (Wallace 2026-08-18 reconfirmation, H200 GPU2, ORT pinned to CUDA build):** graph-vs-graph attempted directly and documented — **Phi-4-mini:** hard reject, *"model has control flow nodes which can't be supported by CUDAExecutionProvider"* (236→19.8 tok/s if forced). **qwen2.5-7b:** runtime error, *"ort_value must contain a constructed tensor"* (CPU-assigned shape nodes). **qwen2.5-14b-zp:** accepted but **no-op** — eager 96.9 vs "graph" 98.7, tokens byte-identical (CPU shape-massaging fragments the graph). Eager-vs-eager reconfirmed: Phi **0.85×**, qwen7b **0.77×**, qwen14b-zp **1.19×** (native/ORT per-kernel) — matches the 2026-08-17 EQUAL column; ORT's int4 kernels are faster per-kernel on 2/3 models, native's deployment lead is architectural (capture + on-GPU argmax). Two-framing standing table durable.
+
 Fair kernel-isolation test = eager-vs-eager (both launch-bound), medians of 5:
 
 | Model | ORT eager | native CLAIMED (graph+argmax) | native EQUAL (eager+argmax) | native PURE (eager, host argmax) |
