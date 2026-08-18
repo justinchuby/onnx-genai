@@ -5,9 +5,11 @@
 //!
 //! This crate is the lowest layer of the runtime memory stack. It owns the
 //! minimum ordinary allocator contract, explicit optional virtual-backing and
-//! shared-mapping capabilities, and manager-issued binding identity/lifetime
-//! pins. It does not own allocation policy, accounting, synchronization, or
-//! process-level transaction management.
+//! shared-mapping capabilities, manager-issued binding identity/lifetime pins,
+//! and the owning/deferred-release contract that says who owns a physical
+//! release and what is true after one partially fails. It does not own
+//! allocation policy, accounting, synchronization, or process-level transaction
+//! management.
 //!
 //! Governor-specific capacity tokens and grants remain in
 //! `onnx-runtime-memory-governor`; they are not methods every allocator or
@@ -16,6 +18,7 @@
 pub mod allocator;
 pub mod binding;
 pub mod capability;
+pub mod deferred;
 
 pub use allocator::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator, MappedAllocation,
@@ -26,10 +29,16 @@ pub use binding::{
     BindingId, BindingIdentity, BindingRegistry, BindingResource, BoundAllocation, BoundMemoryView,
     BoundSharedMapping, BoundSharedPrefix, BoundVirtualBacking, ExplicitReleaseError,
     MechanismCoherence, MechanismIdentity, MechanismLifecycle, MechanismSnapshot, MemoryBinding,
-    ProviderContextIdentity, RegisteredAuthority, RegisteredMechanism, RegisteredProviderContext,
-    ValidatedMemoryView,
+    OwnedView, OwningAllocation, OwningReleaseError, ProviderContextIdentity, RegisteredAuthority,
+    RegisteredMechanism, RegisteredProviderContext, ValidatedMemoryView,
 };
 pub use capability::{SharedMapping, VirtualBacking};
+pub use deferred::{
+    AllocationReleaseOutcome, AllocationReleaseState, DeferredEnqueueError,
+    DeferredEnqueueRejection, DeferredReleaseDisposition, DeferredReleaseQueue,
+    PreparedAllocationRelease, QuarantineReason, QuarantinedAllocation, ReleaseAccounting,
+    ReleaseFailure, ResidualOwnership,
+};
 
 /// Where the bytes physically live.
 ///

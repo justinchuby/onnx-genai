@@ -57,6 +57,7 @@
 //! provider's, not to hide the source.
 
 pub mod device_allocator;
+pub mod release;
 pub mod virtual_memory;
 pub mod vmm_allocator;
 

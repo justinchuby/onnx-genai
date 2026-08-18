@@ -2,9 +2,18 @@
 //!
 //! This module is intentionally narrower than a process memory manager. It owns
 //! registration identity, current-mechanism selection, binding/allocation
-//! identity, and the `Arc`s required to keep one mechanism usable. It does not
-//! own allocation policy, reservations, leases, deferred release, or physical
-//! release recovery.
+//! identity, owning allocation handles, and the `Arc`s required to keep one
+//! mechanism usable. It does not own allocation policy, reservations, leases,
+//! queue scheduling, or reclamation of quarantined ownership.
+//!
+//! Release ownership is split deliberately:
+//!
+//! * [`BoundAllocation`] is non-RAII Phase-3 metadata whose only release path is
+//!   the explicit [`MemoryBinding::release`] migration adapter.
+//! * [`OwningAllocation`] is the Phase-4 owner: not `Clone`, not `Copy`, one
+//!   consuming release, and a `Drop` that quarantines rather than frees.
+//! * [`crate::deferred::PreparedAllocationRelease`] is final ownership that has
+//!   already been detached from the live record and may be queued.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -13,6 +22,11 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::deferred::{
+    AllocationReleaseOutcome, AllocationReleaseState, DeferredReleaseDisposition,
+    DeferredReleaseQueue, PreparedAllocationRelease, PreparedReleasePins, QuarantineReason,
+    QuarantinedAllocation,
+};
 use crate::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, MemoryError, SharedDevicePrefix,
     SharedPrefixCommitInfo,
@@ -188,6 +202,21 @@ pub struct MechanismSnapshot {
     pub lifecycle: MechanismLifecycle,
     pub live_allocations: usize,
     pub active_operations: usize,
+    /// Allocations whose live record was retired into a prepared release that
+    /// has not settled yet. These are [`AllocationReleaseState::Queued`].
+    pub queued_releases: usize,
+    /// Allocations whose ownership was retained instead of released.
+    pub quarantined_allocations: usize,
+    /// Bytes still owned by quarantined ownership.
+    pub quarantined_bytes: u64,
+}
+
+impl MechanismSnapshot {
+    /// Whether any ownership is still outstanding in any non-terminal or
+    /// retained state. Removal is unsafe while this is true.
+    pub const fn retains_ownership(&self) -> bool {
+        self.live_allocations != 0 || self.queued_releases != 0 || self.quarantined_allocations != 0
+    }
 }
 
 /// Binding/registration failure before any caller-provided device action runs.
@@ -230,6 +259,32 @@ pub enum BindingError {
     },
     #[error("allocation metadata {0:?} is stale or was already explicitly released")]
     StaleAllocation(AllocationIdentity),
+    #[error(
+        "allocation {identity:?} still has {views} outstanding view(s); physical release is not \
+         permitted while a borrowed view or alias may still be used"
+    )]
+    OutstandingViews {
+        identity: AllocationIdentity,
+        views: usize,
+    },
+    #[error(
+        "release of allocation {identity:?} left {retained_bytes} byte(s) in the {state} state: \
+         {reason}"
+    )]
+    ReleaseQuarantined {
+        identity: AllocationIdentity,
+        state: AllocationReleaseState,
+        reason: QuarantineReason,
+        retained_bytes: u64,
+    },
+    #[error(
+        "mechanism {mechanism:?} still owns {quarantined} quarantined allocation(s); removal \
+         would lose ownership that was deliberately retained"
+    )]
+    QuarantinedOwnership {
+        mechanism: MechanismIdentity,
+        quarantined: usize,
+    },
     #[error("view range {offset}..{end} exceeds allocation size {allocation_bytes}")]
     ViewOutOfBounds {
         offset: usize,
@@ -316,6 +371,11 @@ struct MechanismState {
     lifecycle: MechanismLifecycle,
     loss_reason: Option<Arc<str>>,
     allocations: HashMap<AllocationGeneration, AllocationRecord>,
+    /// Prepared releases that have left the live map but have not settled.
+    queued_releases: usize,
+    /// Ownership retained instead of released, keyed by the generation it was
+    /// prepared from so a settled request can never be recorded twice.
+    quarantined: HashMap<AllocationGeneration, QuarantinedAllocation>,
 }
 
 /// One registered allocator together with the resources its destructor needs.
@@ -340,7 +400,7 @@ struct MechanismResources {
 }
 
 #[derive(Debug)]
-struct MechanismEntry {
+pub(crate) struct MechanismEntry {
     identity: MechanismIdentity,
     device: DeviceKey,
     coherence: MechanismCoherence,
@@ -349,6 +409,21 @@ struct MechanismEntry {
     /// Declared last so the allocator and its pins are released only after the
     /// entry's own identity/lifecycle state is gone.
     resources: MechanismResources,
+}
+
+/// Whether a prepared release may still reach the allocator.
+///
+/// Read under the mechanism lock and acted on after that lock is dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReleaseGate {
+    /// `Active` or `Retired`: the pinned allocator may perform the release.
+    Allowed,
+    /// The device or context was lost. The allocator must never be called.
+    DeviceLost,
+    /// Termination was confirmed; the device state provably no longer exists.
+    Terminated,
+    /// The mechanism lock was poisoned; fail safe without calling anything.
+    Poisoned,
 }
 
 impl MechanismEntry {
@@ -405,6 +480,12 @@ impl MechanismEntry {
         })
     }
 
+    /// Detach final ownership of `allocation` from the live record.
+    ///
+    /// The binding identity and the allocation generation are both matched, and
+    /// the live record is removed **exactly once** under this mechanism's lock,
+    /// so two racing final releases cannot both proceed and a stale handle over
+    /// a reused virtual address cannot match. No allocator call is made here.
     fn begin_release(
         self: &Arc<Self>,
         expected_binding: BindingIdentity,
@@ -424,11 +505,54 @@ impl MechanismEntry {
             return Err(BindingError::StaleAllocation(allocation.identity));
         }
         state.allocations.remove(&allocation.identity.generation);
+        state.queued_releases += 1;
         self.active_operations.fetch_add(1, Ordering::AcqRel);
         drop(state);
         Ok(MechanismOperation {
             mechanism: Arc::clone(self),
         })
+    }
+
+    /// Whether a prepared release may still call the allocator.
+    pub(crate) fn release_gate(&self) -> ReleaseGate {
+        let Ok(state) = self.state.lock() else {
+            return ReleaseGate::Poisoned;
+        };
+        match state.lifecycle {
+            MechanismLifecycle::Active | MechanismLifecycle::Retired => ReleaseGate::Allowed,
+            MechanismLifecycle::DeviceLost => ReleaseGate::DeviceLost,
+            MechanismLifecycle::Terminated => ReleaseGate::Terminated,
+        }
+    }
+
+    /// Record that a queued release completed. Never calls the allocator.
+    pub(crate) fn settle_release(&self, identity: AllocationIdentity) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.queued_releases = state.queued_releases.saturating_sub(1);
+        debug_assert!(
+            !state.allocations.contains_key(&identity.generation),
+            "a settled release must not leave a live record behind"
+        );
+    }
+
+    /// Record retained ownership. Never calls the allocator and never waits.
+    pub(crate) fn settle_quarantine(&self, record: QuarantinedAllocation) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.queued_releases = state.queued_releases.saturating_sub(1);
+        state.quarantined.insert(record.identity.generation, record);
+    }
+
+    pub(crate) fn allocator_arc(&self) -> Arc<dyn DeviceAllocator> {
+        Arc::clone(&self.resources.allocator)
+    }
+
+    fn quarantined(&self) -> Result<Vec<QuarantinedAllocation>, BindingError> {
+        let state = self.lock_state("listing quarantined ownership")?;
+        Ok(state.quarantined.values().copied().collect())
     }
 
     fn record_allocation(&self, record: AllocationRecord) -> Result<(), BindingError> {
@@ -492,12 +616,19 @@ impl MechanismEntry {
             lifecycle: state.lifecycle,
             live_allocations: state.allocations.len(),
             active_operations: self.active_operations.load(Ordering::Acquire),
+            queued_releases: state.queued_releases,
+            quarantined_allocations: state.quarantined.len(),
+            quarantined_bytes: state
+                .quarantined
+                .values()
+                .map(|record| record.retained_bytes)
+                .sum(),
         })
     }
 }
 
 #[derive(Debug)]
-struct MechanismOperation {
+pub(crate) struct MechanismOperation {
     mechanism: Arc<MechanismEntry>,
 }
 
@@ -570,9 +701,10 @@ struct RegistryHook {
 /// # Lock order
 ///
 /// There are two lock classes: the registry lock protects registration and
-/// current selection; each mechanism lock protects only lifecycle and allocation
-/// identities. They are never held together. Allocator/capability callbacks,
-/// waits, and device operations run with neither lock held.
+/// current selection; each mechanism lock protects only lifecycle, allocation
+/// identities, queued releases, and quarantined ownership. They are never held
+/// together. Allocator/capability callbacks, deferred-queue callbacks, waits,
+/// and device operations run with neither lock held.
 #[derive(Clone, Debug)]
 pub struct BindingRegistry {
     inner: Arc<RegistryInner>,
@@ -719,6 +851,8 @@ impl BindingRegistry {
                 lifecycle: MechanismLifecycle::Active,
                 loss_reason: None,
                 allocations: HashMap::new(),
+                queued_releases: 0,
+                quarantined: HashMap::new(),
             }),
             active_operations: AtomicUsize::new(0),
             resources: MechanismResources {
@@ -1092,8 +1226,29 @@ impl BindingRegistry {
             let mut state = entry.lock_state("confirming provider context termination")?;
             state.lifecycle = MechanismLifecycle::Terminated;
             state.allocations.clear();
+            // Confirmed context/process termination is the one point where
+            // quarantined device ownership provably no longer exists, so this is
+            // where retained ownership is discharged. No allocator call is made.
+            state.quarantined.clear();
         }
         Ok(())
+    }
+
+    /// Ownership this mechanism deliberately retained instead of releasing.
+    ///
+    /// Taking this list never invokes a provider and never calls an allocator.
+    pub fn quarantined(
+        &self,
+        mechanism: RegisteredMechanism,
+    ) -> Result<Vec<QuarantinedAllocation>, BindingError> {
+        self.ensure_local(mechanism.identity.0, "mechanism")?;
+        let entry = self
+            .lock_state("looking up quarantined ownership")?
+            .mechanisms
+            .get(&mechanism.identity)
+            .cloned()
+            .ok_or(BindingError::UnregisteredMechanism(mechanism.identity))?;
+        entry.quarantined()
     }
 
     /// Remove the registry's provider-context pin after all mechanism
@@ -1139,9 +1294,15 @@ impl BindingRegistry {
         Ok(())
     }
 
-    /// Remove a terminal/retired registration once no allocation metadata or
-    /// active callback remains. Existing binding/capability handles still pin the
-    /// entry and resources, but remain inactive.
+    /// Remove a terminal/retired registration once no allocation metadata,
+    /// queued release, quarantined ownership, or active callback remains.
+    /// Existing binding/capability handles still pin the entry and resources,
+    /// but remain inactive.
+    ///
+    /// Queued and quarantined ownership both block removal: a queued request
+    /// still holds an active-operation pin, and quarantined ownership is
+    /// reported separately so the caller learns *why* removal is unsafe rather
+    /// than seeing a bare lifecycle complaint.
     pub fn remove(&self, mechanism: RegisteredMechanism) -> Result<(), BindingError> {
         self.ensure_local(mechanism.identity.0, "mechanism")?;
         let entry = {
@@ -1153,8 +1314,15 @@ impl BindingRegistry {
                 .ok_or(BindingError::UnregisteredMechanism(mechanism.identity))?
         };
         let snapshot = entry.snapshot()?;
+        if snapshot.quarantined_allocations != 0 {
+            return Err(BindingError::QuarantinedOwnership {
+                mechanism: mechanism.identity,
+                quarantined: snapshot.quarantined_allocations,
+            });
+        }
         if snapshot.lifecycle == MechanismLifecycle::Active
             || snapshot.live_allocations != 0
+            || snapshot.queued_releases != 0
             || snapshot.active_operations != 0
         {
             return Err(BindingError::InactiveMechanism {
@@ -1316,35 +1484,183 @@ impl MemoryBinding {
         Ok(allocation)
     }
 
-    /// Explicitly release through this binding's pinned original allocator.
+    /// Allocate and take **owning** responsibility for the result.
     ///
-    /// This is not `Drop`-based ownership and does not enqueue or synchronize.
-    /// On validation/device-loss failure the allocation is returned to the caller
-    /// inside [`ExplicitReleaseError`] so its metadata and lifetime pins are not
-    /// silently discarded.
+    /// The returned [`OwningAllocation`] has exactly one consuming release and a
+    /// `Drop` that quarantines rather than frees, so a forgotten allocation is
+    /// accounted for instead of silently double-freed or leaked without trace.
+    pub fn allocate_owning(
+        &self,
+        bytes: usize,
+        align: usize,
+    ) -> Result<OwningAllocation, BindingError> {
+        self.allocate(bytes, align).map(OwningAllocation::new)
+    }
+
+    /// Issue an allocation generation for memory this binding's **own**
+    /// mechanism produced through a specialized entry point this crate cannot
+    /// express, and take owning responsibility for it.
     ///
-    /// This Phase-3 path calls canonical [`DeviceAllocator::deallocate`]. It does
-    /// not expose mapped-attribution refunds from
-    /// [`DeviceAllocator::deallocate_with_unmapped`]; EP adoption must wait for
-    /// Phase-4 accounting reconciliation.
-    pub fn release(&self, allocation: BoundAllocation) -> Result<(), ExplicitReleaseError> {
+    /// This is the narrow adoption seam for a provider-specific allocation call
+    /// (the CUDA VMM arena's mapped-capacity allocation is the motivating case:
+    /// it needs a governor capacity token that is deliberately not part of the
+    /// portable [`VirtualBacking`](crate::VirtualBacking) capability). Adoption
+    /// registers the address under a fresh generation *before* it escapes, so
+    /// every later view, commit, and release is generation-validated exactly
+    /// like a binding-issued allocation. Nothing else about the lifecycle is
+    /// relaxed.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee all of:
+    ///
+    /// * `ptr` is one live allocation of exactly `bytes` at `align` produced by
+    ///   **this binding's selected mechanism** (the same coherent allocator that
+    ///   would serve [`allocate`](Self::allocate)), not by another allocator or
+    ///   another device.
+    /// * The allocation is not already recorded by this or any other binding,
+    ///   and no other owner exists for it. Adoption is the single point at which
+    ///   ownership enters the binding, and the returned owner is its sole owner.
+    /// * The allocation may be released by that mechanism's canonical
+    ///   [`DeviceAllocator::release`] with exactly this `ptr`/`bytes`/`align`.
+    pub unsafe fn adopt_allocation(
+        &self,
+        ptr: NonNull<u8>,
+        bytes: usize,
+        align: usize,
+    ) -> Result<OwningAllocation, BindingError> {
+        let active = self
+            .mechanism
+            .begin_active("adopting a device allocation")?;
+        let generation = self.identities.allocation_generation()?;
+        let identity = AllocationIdentity {
+            binding: self.identity,
+            generation,
+        };
+        let allocation = BoundAllocation {
+            binding: self.clone(),
+            identity,
+            ptr,
+            bytes,
+            align,
+        };
+        self.mechanism.record_allocation(allocation.record())?;
+        drop(active);
+        Ok(OwningAllocation::new(allocation))
+    }
+
+    /// Detach final ownership of `allocation` without calling the allocator.
+    ///
+    /// This is the single preparation point for every release path. It matches
+    /// the binding identity **and** the allocation generation and removes the
+    /// live record exactly once under the per-mechanism lock, then returns an
+    /// owned request that pins the allocator, authority, and provider context.
+    ///
+    /// # Lock order
+    ///
+    /// Only the mechanism lock is taken, and it is released before this method
+    /// returns. Queue and allocator calls therefore always happen with no
+    /// registry or mechanism lock held.
+    pub fn prepare_release(
+        &self,
+        allocation: BoundAllocation,
+    ) -> Result<PreparedAllocationRelease, ExplicitReleaseError> {
         let operation = match self.mechanism.begin_release(self.identity, &allocation) {
             Ok(operation) => operation,
-            Err(error) => {
-                return Err(ExplicitReleaseError {
-                    error,
-                    allocation: Box::new(allocation),
-                });
-            }
+            Err(error) => return Err(ExplicitReleaseError::unchanged(error, allocation)),
         };
-        let ptr = allocation.ptr;
-        let bytes = allocation.bytes;
-        let align = allocation.align;
-        // SAFETY: begin_release matched and retired the exact live record before
-        // this canonical whole-allocation release. No registry lock is held.
-        unsafe { self.mechanism.allocator().deallocate(ptr, bytes, align) };
-        drop(operation);
-        Ok(())
+        Ok(PreparedAllocationRelease::new(
+            allocation.binding.clone(),
+            allocation.identity,
+            allocation.ptr,
+            allocation.bytes,
+            allocation.align,
+            PreparedReleasePins {
+                allocator: self.mechanism.allocator_arc(),
+                authority: self.identity.authority,
+                context: self.identity.provider_context,
+                operation,
+            },
+        ))
+    }
+
+    /// Explicitly release through this binding's pinned original allocator.
+    ///
+    /// This is the documented **migration adapter** for Phase-3 non-RAII
+    /// [`BoundAllocation`] metadata. It is routed through the same structured
+    /// prepared-release path as owning handles, so the generation is validated
+    /// and the live record is retired before the allocator is invoked. It
+    /// completes synchronously and never enqueues.
+    ///
+    /// On pre-mutation failure (identity mismatch, stale generation, device
+    /// loss) the allocation is returned inside [`ExplicitReleaseError`] exactly
+    /// as before, so metadata and lifetime pins are not silently discarded.
+    ///
+    /// # Limitations
+    ///
+    /// The adapter cannot report the structured success outcome, because its
+    /// signature returns `()`. Callers that need the release accounting or that
+    /// need to defer release past a stream fence should migrate to
+    /// [`OwningAllocation`] or [`MemoryBinding::prepare_release`].
+    ///
+    /// When the allocator quarantines residual ownership the adapter reports
+    /// [`BindingError::ReleaseQuarantined`] and hands back the now-dead
+    /// metadata together with the structured outcome
+    /// ([`ExplicitReleaseError::outcome`]). That metadata can never be released
+    /// again: its record was already retired, so every later operation on it
+    /// fails with [`BindingError::StaleAllocation`].
+    pub fn release(&self, allocation: BoundAllocation) -> Result<(), ExplicitReleaseError> {
+        let prepared = self.prepare_release(allocation)?;
+        let stale = self.stale_metadata(&prepared);
+        match prepared.execute() {
+            AllocationReleaseOutcome::Complete { .. } => Ok(()),
+            outcome @ (AllocationReleaseOutcome::Quarantined { .. }
+            | AllocationReleaseOutcome::Failed { .. }) => {
+                let residual = outcome.residual();
+                Err(ExplicitReleaseError::quarantined(
+                    BindingError::ReleaseQuarantined {
+                        identity: stale.identity,
+                        state: outcome.state(),
+                        reason: residual.map_or(QuarantineReason::AllocatorRefused, |residual| {
+                            residual.reason
+                        }),
+                        retained_bytes: residual.map_or(0, |residual| residual.retained_bytes),
+                    },
+                    stale,
+                    outcome,
+                ))
+            }
+        }
+    }
+
+    /// Rebuild inert metadata for an allocation whose live record is already
+    /// retired.
+    ///
+    /// Only the legacy adapter uses this, and only to keep its historical
+    /// "the error hands the allocation back" shape. The rebuilt value can never
+    /// be released again because its generation is no longer recorded.
+    fn stale_metadata(&self, prepared: &PreparedAllocationRelease) -> BoundAllocation {
+        BoundAllocation {
+            binding: self.clone(),
+            identity: prepared.identity(),
+            ptr: prepared.as_ptr(),
+            bytes: prepared.len(),
+            align: prepared.alignment(),
+        }
+    }
+
+    /// Ownership this binding's mechanism retained instead of releasing.
+    pub fn quarantined(&self) -> Result<Vec<QuarantinedAllocation>, BindingError> {
+        self.mechanism.quarantined()
+    }
+
+    /// Lifecycle and ownership counts for this binding's mechanism.
+    pub fn mechanism_snapshot(&self) -> Result<MechanismSnapshot, BindingError> {
+        self.mechanism.snapshot()
+    }
+
+    pub(crate) fn mechanism(&self) -> &Arc<MechanismEntry> {
+        &self.mechanism
     }
 
     pub fn virtual_backing(&self) -> Result<Option<BoundVirtualBacking>, BindingError> {
@@ -1550,16 +1866,376 @@ impl ValidatedMemoryView {
     }
 }
 
+/// Owning responsibility for exactly one [`BoundAllocation`].
+///
+/// This is the Phase-4 owner. It is deliberately **not** `Clone` and **not**
+/// `Copy`: ownership of a physical allocation cannot be duplicated. Aliases are
+/// expressed as [`OwnedView`]s, which can never release anything.
+///
+/// # Release paths
+///
+/// * [`release_now`](Self::release_now) — synchronous, no queue. This is the
+///   CPU/eager path: one mechanism-lock preparation plus one allocator call.
+/// * [`release_deferred`](Self::release_deferred) — hand final ownership to a
+///   provider/context-owned [`DeferredReleaseQueue`], for GPU allocations whose
+///   release must wait for a stream fence.
+/// * [`prepare_release`](Self::prepare_release) — take the owned request and
+///   route it manually.
+///
+/// All three consume the owner, so there is exactly one final release.
+///
+/// # Drop
+///
+/// Dropping an owner without releasing it **quarantines** the allocation: the
+/// live record is retired under the mechanism lock and residual ownership is
+/// recorded. `Drop` never calls the allocator, never enqueues, and never waits.
+/// Freeing from `Drop` is what makes stale-pointer double frees possible, so
+/// this type refuses to do it.
+///
+/// # Outstanding views block physical release
+///
+/// While any [`OwnedView`] (or clone of one) is alive, release is refused with
+/// [`BindingError::OutstandingViews`] and the owner is handed back untouched.
+#[derive(Debug)]
+pub struct OwningAllocation {
+    /// `None` only between a consuming method taking the allocation and the
+    /// shell being dropped, which is what keeps `Drop` from quarantining an
+    /// allocation that was already handed on.
+    allocation: Option<BoundAllocation>,
+    views: Arc<AtomicUsize>,
+}
+
+impl OwningAllocation {
+    /// Take ownership of Phase-3 metadata.
+    ///
+    /// This is the migration entry point from [`BoundAllocation`] to owning
+    /// semantics; the generation is still validated at release time.
+    pub fn new(allocation: BoundAllocation) -> Self {
+        Self {
+            allocation: Some(allocation),
+            views: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn allocation(&self) -> &BoundAllocation {
+        self.allocation
+            .as_ref()
+            .expect("an owning allocation holds its allocation until it is consumed")
+    }
+
+    pub fn identity(&self) -> AllocationIdentity {
+        self.allocation().identity
+    }
+
+    pub fn binding(&self) -> &MemoryBinding {
+        &self.allocation().binding
+    }
+
+    /// Borrow the allocation metadata for a bound capability call.
+    ///
+    /// [`BoundAllocation`] is not `Clone`, so a shared borrow can be handed to
+    /// [`BoundVirtualBacking`] commit/decommit/query operations — every one of
+    /// which re-validates the binding identity and the allocation generation —
+    /// without giving up owning responsibility. There is no path from this
+    /// borrow to a release: releasing still needs the owner by value.
+    pub fn bound(&self) -> &BoundAllocation {
+        self.allocation()
+    }
+
+    /// The owned address. Never dereferenced by this crate.
+    pub fn as_ptr(&self) -> NonNull<u8> {
+        self.allocation().ptr
+    }
+
+    pub fn len(&self) -> usize {
+        self.allocation().bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.allocation().bytes == 0
+    }
+
+    pub fn alignment(&self) -> usize {
+        self.allocation().align
+    }
+
+    /// Always [`AllocationReleaseState::Live`]; any other state means the owner
+    /// was already consumed.
+    pub const fn state(&self) -> AllocationReleaseState {
+        AllocationReleaseState::Live
+    }
+
+    /// Borrow a sub-range. The returned view never releases anything and keeps
+    /// this allocation from being physically released while it is alive.
+    pub fn view(&self, offset: usize, bytes: usize) -> Result<OwnedView, BindingError> {
+        let view = self.allocation().view(offset, bytes)?;
+        self.views.fetch_add(1, Ordering::AcqRel);
+        Ok(OwnedView {
+            view,
+            outstanding: Arc::clone(&self.views),
+        })
+    }
+
+    /// How many borrowed views and aliases are still alive.
+    pub fn outstanding_views(&self) -> usize {
+        self.views.load(Ordering::Acquire)
+    }
+
+    /// Give up owning semantics and return to Phase-3 metadata.
+    ///
+    /// Documented migration adapter: the result must be released explicitly
+    /// through [`MemoryBinding::release`], and dropping it releases nothing.
+    pub fn into_bound(self) -> Result<BoundAllocation, OwningReleaseError> {
+        self.take("disowning an allocation with outstanding views")
+    }
+
+    /// Detach final ownership without calling the allocator.
+    pub fn prepare_release(self) -> Result<PreparedAllocationRelease, OwningReleaseError> {
+        let views = Arc::clone(&self.views);
+        let allocation = self.take("preparing release with outstanding views")?;
+        let binding = allocation.binding.clone();
+        binding.prepare_release(allocation).map_err(|error| {
+            let (error, allocation) = error.into_parts();
+            OwningReleaseError {
+                error,
+                allocation: Box::new(Self {
+                    allocation: Some(allocation),
+                    views,
+                }),
+            }
+        })
+    }
+
+    /// Release immediately and synchronously through the pinned allocator.
+    ///
+    /// No queue is involved and no wait happens, so this is the low-overhead
+    /// path for CPU/eager mechanisms.
+    pub fn release_now(self) -> Result<AllocationReleaseOutcome, OwningReleaseError> {
+        Ok(self.prepare_release()?.execute())
+    }
+
+    /// Hand final ownership to a provider/context-owned queue.
+    ///
+    /// The queue is called after every registry and mechanism lock is dropped.
+    /// If the queue refuses, the exact prepared request is quarantined rather
+    /// than freed or lost, and the rejection is reported.
+    pub fn release_deferred(
+        self,
+        queue: &dyn DeferredReleaseQueue,
+    ) -> Result<DeferredReleaseDisposition, OwningReleaseError> {
+        let prepared = self.prepare_release()?;
+        let identity = prepared.identity();
+        match queue.enqueue(prepared) {
+            Ok(()) => Ok(DeferredReleaseDisposition::Queued { identity }),
+            Err(error) => {
+                let rejection = error.rejection();
+                Ok(DeferredReleaseDisposition::Quarantined {
+                    identity,
+                    rejection,
+                    outcome: error.quarantine(),
+                })
+            }
+        }
+    }
+
+    fn take(mut self, operation: &'static str) -> Result<BoundAllocation, OwningReleaseError> {
+        let _ = operation;
+        let views = Arc::clone(&self.views);
+        let outstanding = views.load(Ordering::Acquire);
+        let allocation = self
+            .allocation
+            .take()
+            .expect("an owning allocation holds its allocation until it is consumed");
+        if outstanding != 0 {
+            return Err(OwningReleaseError {
+                error: BindingError::OutstandingViews {
+                    identity: allocation.identity,
+                    views: outstanding,
+                },
+                allocation: Box::new(Self {
+                    allocation: Some(allocation),
+                    views,
+                }),
+            });
+        }
+        Ok(allocation)
+    }
+}
+
+impl Drop for OwningAllocation {
+    /// Quarantine an owner that was dropped without an explicit release.
+    ///
+    /// This never frees. It retires the live record under the mechanism lock and
+    /// records residual ownership, so the bytes stay visible to accounting and
+    /// block unsafe mechanism removal. When the record can no longer be
+    /// prepared — device loss, termination, or an already stale generation — the
+    /// metadata is simply dropped: in the device-loss case the live record is
+    /// still recorded at the mechanism and is discharged by confirmed context
+    /// termination.
+    fn drop(&mut self) {
+        let Some(allocation) = self.allocation.take() else {
+            return;
+        };
+        let binding = allocation.binding.clone();
+        if let Ok(prepared) = binding.prepare_release(allocation) {
+            let _ = prepared.quarantine(QuarantineReason::OwnerDropped);
+        }
+    }
+}
+
+/// A borrowed, cloneable alias of one [`OwningAllocation`].
+///
+/// A view can never release anything: it has no release method and its `Drop`
+/// only decrements the outstanding-view count. Clones are aliases, and every
+/// alias independently keeps physical release blocked.
+#[derive(Debug)]
+pub struct OwnedView {
+    view: BoundMemoryView,
+    outstanding: Arc<AtomicUsize>,
+}
+
+impl Clone for OwnedView {
+    fn clone(&self) -> Self {
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
+        Self {
+            view: self.view.clone(),
+            outstanding: Arc::clone(&self.outstanding),
+        }
+    }
+}
+
+impl Drop for OwnedView {
+    fn drop(&mut self) {
+        self.outstanding.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl OwnedView {
+    pub const fn view(&self) -> &BoundMemoryView {
+        &self.view
+    }
+
+    pub const fn binding(&self) -> &MemoryBinding {
+        self.view.binding()
+    }
+
+    pub const fn allocation_identity(&self) -> AllocationIdentity {
+        self.view.allocation_identity()
+    }
+
+    pub const fn len(&self) -> usize {
+        self.view.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.view.is_empty()
+    }
+}
+
+/// Owning-release failure that hands the exact owner back.
+///
+/// Every failure carried by this type is *pre-mutation*: nothing was released,
+/// nothing was queued, and the returned [`OwningAllocation`] is still live and
+/// still owns its allocation.
+#[derive(Debug)]
+pub struct OwningReleaseError {
+    error: BindingError,
+    /// Boxed so the common `Ok` path does not pay for an owner-sized `Err`.
+    allocation: Box<OwningAllocation>,
+}
+
+impl OwningReleaseError {
+    pub const fn error(&self) -> &BindingError {
+        &self.error
+    }
+
+    pub const fn allocation(&self) -> &OwningAllocation {
+        &self.allocation
+    }
+
+    /// Nothing was mutated, so the owner is still [`AllocationReleaseState::Live`].
+    pub const fn state(&self) -> AllocationReleaseState {
+        AllocationReleaseState::Live
+    }
+
+    pub fn into_parts(self) -> (BindingError, OwningAllocation) {
+        (self.error, *self.allocation)
+    }
+}
+
+impl std::fmt::Display for OwningReleaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for OwningReleaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 /// Explicit release failure that preserves allocation metadata and pins.
+///
+/// Two dispositions share this type:
+///
+/// * **Unchanged** — the failure happened before any device mutation, and
+///   [`into_parts`](Self::into_parts) returns the exact live allocation.
+/// * **Quarantined** — the release was prepared and the allocator did not
+///   complete it. [`outcome`](Self::outcome) carries the structured accounting
+///   and residual facts, and the returned metadata is provably dead because its
+///   generation record was already retired.
 #[derive(Debug)]
 pub struct ExplicitReleaseError {
     error: BindingError,
     allocation: Box<BoundAllocation>,
+    /// Boxed so a successful release does not pay for an outcome-sized `Err`.
+    outcome: Option<Box<AllocationReleaseOutcome>>,
 }
 
 impl ExplicitReleaseError {
+    fn unchanged(error: BindingError, allocation: BoundAllocation) -> Self {
+        Self {
+            error,
+            allocation: Box::new(allocation),
+            outcome: None,
+        }
+    }
+
+    fn quarantined(
+        error: BindingError,
+        allocation: BoundAllocation,
+        outcome: AllocationReleaseOutcome,
+    ) -> Self {
+        Self {
+            error,
+            allocation: Box::new(allocation),
+            outcome: Some(Box::new(outcome)),
+        }
+    }
+
     pub const fn error(&self) -> &BindingError {
         &self.error
+    }
+
+    /// The structured outcome, when the allocator was actually invoked.
+    ///
+    /// `None` means nothing was mutated and the allocation is still live.
+    pub fn outcome(&self) -> Option<&AllocationReleaseOutcome> {
+        self.outcome.as_deref()
+    }
+
+    /// Whether the allocation's ownership was retained after preparation.
+    pub const fn is_quarantined(&self) -> bool {
+        self.outcome.is_some()
+    }
+
+    /// The lifecycle state the allocation was left in.
+    pub fn state(&self) -> AllocationReleaseState {
+        self.outcome.as_deref().map_or(
+            AllocationReleaseState::Live,
+            AllocationReleaseOutcome::state,
+        )
     }
 
     pub fn into_parts(self) -> (BindingError, BoundAllocation) {

@@ -55,14 +55,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use onnx_runtime_memory_governor::{
-    AllocationCommitRange, DeviceAllocator, DeviceKey, HolderId, MappedPhysicalCapacityToken,
-    MemoryAuthorityId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, SharedDevicePrefix,
-    SharedMapping, SharedPrefixCommitInfo, Tier, VirtualBacking as MemoryVirtualBacking,
+    AllocationCommitRange, AllocationReleaseOutcome, AllocationReleaseState, DeviceAllocator,
+    DeviceKey, HolderId, MappedPhysicalCapacityToken, MemoryAuthorityId, MemoryError,
+    MemoryGovernor, MemoryLease, MemoryRole, QuarantineReason, ResidualOwnership,
+    SharedDevicePrefix, SharedMapping, SharedPrefixCommitInfo, Tier,
+    VirtualBacking as MemoryVirtualBacking,
 };
 use onnx_runtime_virtual_memory::{PhysicalMemoryAccounting, VirtualBacking};
 
+use crate::release::{MappedBlock, SpanReleaseReport, block_bytes};
 use crate::virtual_memory::{
-    CudaVirtualBacking, PhysicalHandlePool, PhysicalHandlePoolStats, SharedPrefixReservation,
+    CudaVirtualBacking, PhysicalHandlePool, PhysicalHandlePoolStats, RangeDecommit,
+    SharedPrefixReservation,
 };
 use cudarc::driver::CudaContext;
 
@@ -355,6 +359,23 @@ struct Spans {
     /// granules this allocation claimed even when it reserved more address
     /// space than it committed.
     live: BTreeMap<usize, LiveSpan>,
+    /// Spans whose release did not reach a terminal state, as `offset -> span`.
+    ///
+    /// A quarantined span is in neither `free` nor `live`: it can never be
+    /// carved again, and every commit, decommit or release naming its address
+    /// fails closed rather than pretending it is usable. This is the record
+    /// that makes "we still own something we could not give back" a fact the
+    /// allocator holds rather than an error message that scrolled past.
+    quarantine: BTreeMap<usize, QuarantinedSpan>,
+    /// Granules that must never be committed again.
+    ///
+    /// A granule lands here when its `cuMemUnmap` failed: the mapping is still
+    /// there, so mapping something else over it would either fail or — far
+    /// worse — hand a second allocation an address whose old contents are
+    /// still live behind it. Poisoning is per granule rather than per span
+    /// because a granule at the boundary of a quarantined span can be shared
+    /// with a live neighbour.
+    poisoned: BTreeSet<usize>,
     /// Bytes currently committed, which is `lease.bytes()` when a lease exists.
     committed: usize,
 }
@@ -362,7 +383,66 @@ struct Spans {
 #[derive(Debug)]
 struct LiveSpan {
     len: usize,
+    /// Recorded so a structured release can report the residual VA exactly as
+    /// the caller allocated it, without the caller having to supply it again.
+    align: usize,
     committed: BTreeSet<usize>,
+}
+
+/// One allocation the allocator still owns after a release that could not
+/// finish.
+///
+/// Every field is a fact the runtime must keep to stay honest: the address
+/// range it refuses to reuse, the granules that are still mapped, the physical
+/// handles it holds after their mappings went away, the bytes it refunded on
+/// each accounting axis, and why. The CUDA context is retained implicitly —
+/// the arena's reservation owns it, and a quarantined span keeps the arena
+/// alive — so the residual can never outlive the context it belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuarantinedSpan {
+    /// Offset of the retained address range inside the arena reservation.
+    pub offset: usize,
+    /// Length of the retained address range.
+    pub len: usize,
+    /// The alignment the allocation was made at.
+    pub align: usize,
+    /// Device address of the retained range.
+    pub address: usize,
+    /// The device this span's memory belongs to.
+    pub device: DeviceKey,
+    /// Granules still mapped, with the handles behind them.
+    pub still_mapped: Vec<MappedBlock>,
+    /// Blocks whose mapping is gone but whose physical handle could not be
+    /// given back. Their bytes stay charged on the owned axis.
+    pub unmapped_handle_owned: Vec<MappedBlock>,
+    /// Bytes refunded on the mapped axis by this release, counted once.
+    pub refunded_mapped_bytes: u64,
+    /// Physical bytes still owned, across both residual kinds.
+    pub retained_owned_bytes: u64,
+    pub state: AllocationReleaseState,
+    pub reason: QuarantineReason,
+    /// Every driver fault, in order, so the cause is never only in a log line.
+    pub faults: Vec<String>,
+}
+
+impl QuarantinedSpan {
+    /// The residual ownership record a release outcome reports.
+    pub fn residual(&self) -> ResidualOwnership {
+        ResidualOwnership {
+            state: self.state,
+            reason: self.reason,
+            retained_bytes: self.retained_owned_bytes,
+            address: self.address,
+            align: self.align,
+        }
+    }
+
+    fn fault_summary(&self) -> String {
+        if self.faults.is_empty() {
+            return String::from("no driver fault was reported");
+        }
+        self.faults.join("; ")
+    }
 }
 
 impl Spans {
@@ -374,6 +454,8 @@ impl Spans {
             granule_refs: vec![0; capacity / granularity],
             free,
             live: BTreeMap::new(),
+            quarantine: BTreeMap::new(),
+            poisoned: BTreeSet::new(),
             committed: 0,
         }
     }
@@ -412,9 +494,68 @@ impl Spans {
         Some(offset)
     }
 
+    /// Retain `[offset, offset + len)` and everything still owned inside it.
+    ///
+    /// The span goes to neither the free list nor the live map, which is the
+    /// whole point: a partially released address that came back to `free`
+    /// would be handed to the next allocation with the old mapping still under
+    /// part of it.
+    fn quarantine_span(&mut self, span: QuarantinedSpan) {
+        for block in &span.still_mapped {
+            self.poisoned.insert(block.offset / self.granularity);
+        }
+        self.quarantine.insert(span.offset, span);
+    }
+
+    /// Apply one run's release report to the granule bookkeeping and report
+    /// the mapped-axis refund.
+    ///
+    /// Pure by construction — no CUDA state reaches this type — so the rule
+    /// that decides whether an address becomes reusable is provable on a
+    /// machine with no GPU, which is where it was previously untestable.
+    ///
+    /// * every granule in the run gives up its reference;
+    /// * a granule whose mapping survived takes one back and is poisoned, so
+    ///   nothing unmaps or commits it again;
+    /// * the refund counts only bytes whose mapping is genuinely gone, whether
+    ///   or not the handle behind them could be given back.
+    fn settle_release_run(
+        &mut self,
+        run: std::ops::Range<usize>,
+        report: &crate::release::SpanReleaseReport,
+    ) -> u64 {
+        for granule in run {
+            self.granule_refs[granule] = 0;
+        }
+        for block in &report.still_mapped {
+            let granule = block.offset / self.granularity;
+            self.granule_refs[granule] = 1;
+            self.poisoned.insert(granule);
+        }
+        let unmapped = report.unmapped_bytes();
+        self.committed = self.committed.saturating_sub(unmapped as usize);
+        unmapped
+    }
+
+    /// The first poisoned granule in `granules`, if any.
+    fn first_poisoned(&self, granules: impl IntoIterator<Item = usize>) -> Option<usize> {
+        granules
+            .into_iter()
+            .find(|granule| self.poisoned.contains(granule))
+    }
+
     /// Return `[offset, offset + len)` to the free list, merging with either
     /// neighbour so the list cannot fragment into adjacent free spans.
     fn give_back(&mut self, offset: usize, len: usize) {
+        debug_assert!(
+            !self
+                .quarantine
+                .values()
+                .any(|span| { span.offset < offset + len && offset < span.offset + span.len }),
+            "vmm arena: {offset}..{} overlaps a quarantined span and must never return to the \
+             free list",
+            offset + len
+        );
         let mut start = offset;
         let mut end = offset + len;
         if let Some((&before, &span)) = self.free.range(..offset).next_back()
@@ -467,6 +608,61 @@ pub struct SpanCommit {
     pub additional_owned_bytes: u64,
     /// Bytes newly mapped into this allocation.
     pub newly_mapped_bytes: u64,
+}
+
+/// Byte accounting for one transactional decommit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecommitAccounting {
+    /// Bytes the caller asked to decommit.
+    pub requested_bytes: u64,
+    /// Bytes whose mapping is actually gone. Refunded on the mapped axis.
+    ///
+    /// Zero is a valid complete result: every granule in the range may still
+    /// be shared with another live allocation, in which case this decommit
+    /// only dropped a reference.
+    pub unmapped_bytes: u64,
+    /// Physical bytes whose handles could not be given back and are now held
+    /// in quarantine. Still charged on the owned axis, never reusable.
+    ///
+    /// The mapping is gone, so the allocation's topology is exactly what the
+    /// caller asked for; what remains is a pool-level ownership residual and
+    /// not a hole in a live buffer.
+    pub quarantined_owned_bytes: u64,
+}
+
+/// What a transactional decommit did to a live allocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecommitOutcome {
+    /// The requested range is unmapped and the allocation is still live and
+    /// usable with exactly the topology the caller asked for.
+    Complete { accounting: DecommitAccounting },
+    /// The decommit was refused and the original mapping was restored. The
+    /// allocation is byte-for-byte what it was.
+    RolledBack { reason: String },
+    /// The decommit could not be completed *or* rolled back, so the allocation
+    /// is quarantined whole: its address range is retained, its residual
+    /// mappings and handles stay owned, and it can never be used again.
+    Quarantined {
+        accounting: DecommitAccounting,
+        residual: ResidualOwnership,
+        reason: String,
+    },
+}
+
+impl DecommitOutcome {
+    /// Bytes whose mapping is gone, for a caller that only needs the refund.
+    pub const fn unmapped_bytes(&self) -> u64 {
+        match self {
+            Self::Complete { accounting } => accounting.unmapped_bytes,
+            Self::RolledBack { .. } => 0,
+            Self::Quarantined { accounting, .. } => accounting.unmapped_bytes,
+        }
+    }
+
+    /// Whether the allocation is still live and usable afterwards.
+    pub const fn allocation_remains_usable(&self) -> bool {
+        matches!(self, Self::Complete { .. } | Self::RolledBack { .. })
+    }
 }
 
 /// A pinned, read-only shared prefix: physical granules created **once**
@@ -626,6 +822,7 @@ struct VmmConstruction {
     role: MemoryRole,
     pool_bytes: Option<usize>,
     teardown_synchronizer: Option<crate::virtual_memory::TeardownSynchronizer>,
+    reservation_queue: Option<Arc<dyn crate::virtual_memory::DeferredReservationQueue>>,
 }
 
 // `MemoryGovernor` is a replaceable contract and does not require `Debug`, so
@@ -687,6 +884,7 @@ impl CudaVmmAllocator {
                 role,
                 pool_bytes: None,
                 teardown_synchronizer: None,
+                reservation_queue: None,
             },
             &private,
         )
@@ -718,6 +916,7 @@ impl CudaVmmAllocator {
                 role,
                 pool_bytes: physical_handle_pool_bytes(),
                 teardown_synchronizer: None,
+                reservation_queue: None,
             },
             &private,
         )
@@ -747,6 +946,44 @@ impl CudaVmmAllocator {
                 role,
                 pool_bytes: physical_handle_pool_bytes().or(default_pool_bytes),
                 teardown_synchronizer: Some(teardown_synchronizer),
+                reservation_queue: None,
+            },
+            &private,
+        )
+    }
+
+    /// Construct a standalone arena whose reservation teardown is owned by a
+    /// deferred queue.
+    ///
+    /// This is the production standalone path: no reservation `Drop` anywhere
+    /// under this arena synchronizes a stream, because teardown is handed to
+    /// `reservation_queue` as a ticket and executed once the queue observes the
+    /// completion of the work that could still read the range.
+    #[allow(clippy::too_many_arguments)]
+    pub fn standalone_with_reservation_queue(
+        context: Arc<CudaContext>,
+        device: DeviceKey,
+        device_ordinal: i32,
+        capacity: usize,
+        holder: HolderId,
+        role: MemoryRole,
+        reservation_queue: Arc<dyn crate::virtual_memory::DeferredReservationQueue>,
+        default_pool_bytes: Option<usize>,
+    ) -> Result<Self, MemoryError> {
+        let private = onnx_runtime_memory_governor::LedgerGovernor::new(
+            onnx_runtime_memory_governor::LeaseLedger::new_for_device(device, u64::MAX, 0, 0),
+        );
+        Self::build(
+            VmmConstruction {
+                context,
+                device,
+                device_ordinal,
+                capacity,
+                holder,
+                role,
+                pool_bytes: physical_handle_pool_bytes().or(default_pool_bytes),
+                teardown_synchronizer: None,
+                reservation_queue: Some(reservation_queue),
             },
             &private,
         )
@@ -825,6 +1062,7 @@ impl CudaVmmAllocator {
                 role,
                 pool_bytes: physical_handle_pool_bytes(),
                 teardown_synchronizer: None,
+                reservation_queue: None,
             },
             governor,
         )
@@ -852,6 +1090,37 @@ impl CudaVmmAllocator {
                 role,
                 pool_bytes: physical_handle_pool_bytes().or(default_pool_bytes),
                 teardown_synchronizer: Some(teardown_synchronizer),
+                reservation_queue: None,
+            },
+            governor,
+        )
+    }
+
+    /// Construct a governed arena whose reservation teardown is owned by a
+    /// deferred queue. The production governed path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_reservation_queue(
+        context: Arc<CudaContext>,
+        device: DeviceKey,
+        device_ordinal: i32,
+        capacity: usize,
+        governor: &dyn MemoryGovernor,
+        holder: HolderId,
+        role: MemoryRole,
+        reservation_queue: Arc<dyn crate::virtual_memory::DeferredReservationQueue>,
+        default_pool_bytes: Option<usize>,
+    ) -> Result<Self, MemoryError> {
+        Self::build(
+            VmmConstruction {
+                context,
+                device,
+                device_ordinal,
+                capacity,
+                holder,
+                role,
+                pool_bytes: physical_handle_pool_bytes().or(default_pool_bytes),
+                teardown_synchronizer: None,
+                reservation_queue: Some(reservation_queue),
             },
             governor,
         )
@@ -870,6 +1139,7 @@ impl CudaVmmAllocator {
             role,
             pool_bytes,
             teardown_synchronizer,
+            reservation_queue,
         } = construction;
         let backing = if let Some(pool_bytes) = pool_bytes {
             let pool = PhysicalHandlePool::get_or_create(
@@ -886,6 +1156,10 @@ impl CudaVmmAllocator {
         };
         let backing = match teardown_synchronizer {
             Some(synchronizer) => backing.with_teardown_synchronizer(synchronizer),
+            None => backing,
+        };
+        let backing = match reservation_queue {
+            Some(queue) => backing.with_reservation_queue(queue),
             None => backing,
         };
         let granularity = backing.granularity();
@@ -975,6 +1249,19 @@ impl CudaVmmAllocator {
     ) -> Result<(BTreeSet<usize>, SpanCommit), MemoryError> {
         let granularity = arena.spans.granularity;
         let claimed = granules.into_iter().collect::<BTreeSet<_>>();
+        // Fail closed before touching the driver: a poisoned granule is one
+        // whose old mapping could not be removed, so committing over it would
+        // either be refused by CUDA or, worse, quietly alias live memory.
+        if let Some(granule) = arena.spans.first_poisoned(claimed.iter().copied()) {
+            return Err(invalid(
+                claimed.len().saturating_mul(granularity),
+                format!(
+                    "granule {granule} is quarantined after a release whose cuMemUnmap failed; \
+                     its mapping is still live, so it can never be committed again. Restart the \
+                     CUDA context to reclaim it"
+                ),
+            ));
+        }
         let mut shared_claimed = BTreeSet::new();
         let mut newly_mapped = Vec::new();
         for &granule in &claimed {
@@ -1001,10 +1288,23 @@ impl CudaVmmAllocator {
             capacity,
         ) {
             Ok(bytes) => bytes,
-            Err(error) => {
-                self.give_back_lease(arena, mapped_bytes);
+            Err(failure) => {
+                // Whatever the rollback could not unmap is still mapped and
+                // still owned. Poison it and keep its bytes on the books:
+                // reporting the commit as "never happened" while a granule
+                // stays mapped is how a later allocation inherits it.
+                let residual_bytes = block_bytes(&failure.residual_mapped) as usize;
+                for block in &failure.residual_mapped {
+                    let granule = block.offset / granularity;
+                    arena.spans.granule_refs[granule] = 1;
+                    arena.spans.poisoned.insert(granule);
+                    arena.spans.committed += granularity;
+                    note_commit(granularity);
+                }
+                self.give_back_lease(arena, mapped_bytes.saturating_sub(residual_bytes));
                 self.release_granules(arena, &shared_claimed);
-                return Err(match &error {
+                let error = &failure.error;
+                return Err(match error {
                     onnx_runtime_virtual_memory::VirtualMemoryError::Os {
                         operation: "growing physical handle pool lease",
                         ..
@@ -1013,9 +1313,9 @@ impl CudaVmmAllocator {
                         requested: mapped_bytes as u64,
                         available: 0,
                         role: self.role,
-                        detail: format!("cuMemMap: {error}"),
+                        detail: format!("cuMemMap: {failure}"),
                     },
-                    _ => invalid(mapped_bytes, format!("cuMemMap: {error}")),
+                    _ => invalid(mapped_bytes, format!("cuMemMap: {failure}")),
                 });
             }
         };
@@ -1064,20 +1364,35 @@ impl CudaVmmAllocator {
     }
 
     /// Drop this allocation's claims, unmapping whatever it was the last user
-    /// of.
+    /// of, and report exactly what would not go away.
     fn release_granules(&self, arena: &mut Arena, granules: &BTreeSet<usize>) {
-        let _ = self.release_granules_report(arena, granules);
+        let _ = self.drop_granule_references(arena, granules);
     }
 
-    fn release_granules_report(&self, arena: &mut Arena, granules: &BTreeSet<usize>) -> u64 {
+    /// Give up one reference per granule and release the ones that reach zero.
+    ///
+    /// The two accounting axes are settled separately and each exactly once:
+    ///
+    /// * a block that is unmapped refunds the **mapped** axis (arena committed
+    ///   bytes, the process gauge, the arena lease when the backing is not
+    ///   pool-accounted) whether or not its handle could then be given back;
+    /// * a block whose handle could not be given back keeps its **owned**
+    ///   bytes charged, in the pool or on the reservation, because the driver
+    ///   has not confirmed the physical memory is gone.
+    ///
+    /// A run whose unmap fails refunds neither: nothing was mutated, so its
+    /// granule keeps a retained reference and is poisoned rather than silently
+    /// re-entering circulation.
+    fn drop_granule_references(
+        &self,
+        arena: &mut Arena,
+        granules: &BTreeSet<usize>,
+    ) -> SpanReleaseReport {
         let granularity = arena.spans.granularity;
-        let mut unmapped = 0_u64;
         let mut releasable = Vec::new();
         for &granule in granules {
             match arena.spans.granule_refs[granule].checked_sub(1) {
-                Some(0) => {
-                    releasable.push(granule);
-                }
+                Some(0) => releasable.push(granule),
                 Some(remaining) => arena.spans.granule_refs[granule] = remaining,
                 None => {
                     // Already released. Continuing is the safe action --
@@ -1098,28 +1413,125 @@ impl CudaVmmAllocator {
                 }
             }
         }
+        let mut result = SpanReleaseReport::default();
         for (start, end) in contiguous_granule_runs(releasable) {
-            let bytes = (end - start) * granularity;
-            if self
-                .backing
-                .release(&mut arena.reservation, start * granularity, bytes)
-                .is_err()
-            {
-                continue;
+            let report = self.backing.release_range_reporting(
+                &mut arena.reservation,
+                start * granularity,
+                (end - start) * granularity,
+            );
+            let unmapped = arena.spans.settle_release_run(start..end, &report);
+            if unmapped > 0 {
+                note_release(unmapped as usize);
+                self.give_back_lease(arena, unmapped as usize);
             }
-            for granule in start..end {
-                arena.spans.granule_refs[granule] = 0;
-            }
-            arena.spans.committed -= bytes;
-            note_release(bytes);
-            self.give_back_lease(arena, bytes);
-            unmapped = unmapped.saturating_add(bytes as u64);
+            result.merge(report);
         }
-        unmapped
+        result
     }
 
-    fn release_committed_granules(&self, arena: &mut Arena, granules: &BTreeSet<usize>) {
-        self.release_granules(arena, granules);
+    /// Undo a half-built allocation, keeping whatever will not let go.
+    ///
+    /// Returning the address range to the free list here is only correct when
+    /// every granule this allocation had already claimed came all the way
+    /// back. If any did not, the range is quarantined instead: an allocation
+    /// that failed to be born still owns physical memory, and handing its
+    /// address to the next caller is the same defect as handing out a
+    /// partially released one.
+    fn unwind_partial_allocation(
+        &self,
+        arena: &mut Arena,
+        offset: usize,
+        bytes: usize,
+        align: usize,
+        committed: &BTreeSet<usize>,
+        reason: String,
+    ) -> MemoryError {
+        let release = self.drop_granule_references(arena, committed);
+        if release.is_complete() {
+            arena.spans.give_back(offset, bytes);
+            return invalid(bytes, reason);
+        }
+        let record = self.quarantine_record(
+            arena,
+            offset,
+            bytes,
+            align,
+            release,
+            QuarantineReason::PartialRelease,
+        );
+        let detail = format!(
+            "{reason}; rolling the allocation back left {} B of physical memory owned at \
+             {:#x}, so its {bytes} byte address range is quarantined rather than reused: {}",
+            record.retained_owned_bytes,
+            record.address,
+            record.fault_summary(),
+        );
+        arena.spans.quarantine_span(record);
+        invalid(bytes, detail)
+    }
+
+    /// Why `ptr`/`bytes`/`align` do not describe a live allocation, if they do
+    /// not. `None` means the release may proceed.
+    fn release_size_mismatch(
+        &self,
+        ptr: NonNull<u8>,
+        bytes: usize,
+        align: usize,
+    ) -> Option<String> {
+        let arena = self.lock();
+        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let offset = (ptr.as_ptr() as usize).checked_sub(base)?;
+        let live = arena.spans.live.get(&offset)?;
+        if live.len != bytes {
+            return Some(format!(
+                "release names {bytes} bytes at {:#x} but that live VMM allocation is {} bytes; \
+                 nothing was released",
+                ptr.as_ptr() as usize,
+                live.len
+            ));
+        }
+        // `allocate_committed` normalizes a zero alignment to one, so compare
+        // against the same normalization rather than rejecting a caller that
+        // passes back exactly what it passed in.
+        if live.align != align.max(1) {
+            return Some(format!(
+                "release names alignment {align} at {:#x} but that live VMM allocation was made \
+                 at alignment {}; nothing was released",
+                ptr.as_ptr() as usize,
+                live.align
+            ));
+        }
+        None
+    }
+
+    /// Build the quarantine record for a span whose release left residuals.
+    fn quarantine_record(
+        &self,
+        arena: &Arena,
+        offset: usize,
+        len: usize,
+        align: usize,
+        release: SpanReleaseReport,
+        reason: QuarantineReason,
+    ) -> QuarantinedSpan {
+        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        QuarantinedSpan {
+            offset,
+            len,
+            align,
+            address: base + offset,
+            device: self.device,
+            retained_owned_bytes: release.retained_owned_bytes(),
+            refunded_mapped_bytes: release.unmapped_bytes(),
+            state: release
+                .residual_state()
+                .unwrap_or(AllocationReleaseState::Released),
+            still_mapped: release.still_mapped,
+            unmapped_handle_owned: release.unmapped_handle_owned,
+            reason,
+            faults: release.faults.iter().map(ToString::to_string).collect(),
+        }
     }
 
     /// Estimate new authority-owned physical bytes needed to back a live span.
@@ -1213,19 +1625,336 @@ impl CudaVmmAllocator {
     }
 
     /// Release a live allocation and report physical bytes actually unmapped.
+    ///
+    /// Migration adapter over [`deallocate_span_outcome`]. Zero here means
+    /// "nothing was unmapped", which is a legitimate answer for an allocation
+    /// with no committed granules *and* for one whose release was quarantined;
+    /// callers that must tell those apart use the structured form.
+    ///
+    /// [`deallocate_span_outcome`]: Self::deallocate_span_outcome
     pub fn deallocate_span(&self, ptr: NonNull<u8>) -> u64 {
+        self.deallocate_span_outcome(ptr).unmapped_bytes()
+    }
+
+    /// Release a live allocation, reporting what is still owned afterwards.
+    ///
+    /// This is the honest whole-allocation release:
+    ///
+    /// * [`AllocationReleaseOutcome::Complete`] — the address range is back in
+    ///   the free list and nothing is owed. Zero unmapped bytes is a normal
+    ///   complete result: the allocation may have committed nothing, or every
+    ///   granule under it may still be shared with a live neighbour.
+    /// * [`AllocationReleaseOutcome::Quarantined`] — some CUDA mutation
+    ///   succeeded and a later one did not. The address range is **not**
+    ///   returned to the free list, the residual mappings and handles stay
+    ///   owned, and the outcome carries both.
+    /// * [`AllocationReleaseOutcome::Failed`] — nothing was mutated, because
+    ///   the pointer named no live allocation of this arena.
+    ///
+    /// The address range only returns to the free list once every mapping and
+    /// handle under it has reached a terminal state, which is what stops a
+    /// later allocation from inheriting a stale mapping.
+    pub fn deallocate_span_outcome(&self, ptr: NonNull<u8>) -> AllocationReleaseOutcome {
         let mut arena = self.lock();
         let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
         let address = ptr.as_ptr() as usize;
         let Some(offset) = address.checked_sub(base) else {
-            return 0;
+            return AllocationReleaseOutcome::failed(format!(
+                "address {address:#x} is below this VMM arena reservation ({base:#x}); nothing \
+                 was released"
+            ));
         };
+        if let Some(span) = arena.spans.quarantine.get(&offset) {
+            return AllocationReleaseOutcome::failed(format!(
+                "address {address:#x} names a span quarantined after a failed release ({}); it \
+                 retains {} B of physical ownership and can never be released, reused, or \
+                 committed again: {}",
+                span.reason,
+                span.retained_owned_bytes,
+                span.fault_summary(),
+            ));
+        }
         let Some(live) = arena.spans.live.remove(&offset) else {
-            return 0;
+            return AllocationReleaseOutcome::failed(format!(
+                "address {address:#x} is not a live allocation of this VMM arena; it was already \
+                 released or never came from here"
+            ));
         };
-        let unmapped = self.release_granules_report(&mut arena, &live.committed);
-        arena.spans.give_back(offset, live.len);
-        unmapped
+        let (len, align) = (live.len, live.align);
+        let release = self.drop_granule_references(&mut arena, &live.committed);
+        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let outcome = release.outcome(len as u64, base + offset, align);
+        if release.is_complete() {
+            arena.spans.give_back(offset, len);
+            return outcome;
+        }
+        let record = self.quarantine_record(
+            &arena,
+            offset,
+            len,
+            align,
+            release,
+            QuarantineReason::PartialRelease,
+        );
+        arena.spans.quarantine_span(record);
+        outcome
+    }
+
+    /// Decommit part of a live allocation, transactionally.
+    ///
+    /// Either the requested granules are unmapped and the allocation stays
+    /// live with exactly the topology the caller asked for, or the topology it
+    /// had is restored. There is no third answer in which part of a live
+    /// allocation is missing: a decommit that unmapped two of three granules
+    /// and stopped would leave a live buffer with a hole in it, and the caller
+    /// would keep using it.
+    ///
+    /// Rollback works because the unmap phase retains every physical handle
+    /// until it is known complete — a handle already given back cannot be
+    /// mapped in again. If the rollback itself fails, the whole allocation is
+    /// quarantined rather than reported as restored.
+    pub fn decommit_allocation_range_outcome(
+        &self,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        byte_offset: usize,
+        bytes: usize,
+    ) -> Result<DecommitOutcome, MemoryError> {
+        let end = byte_offset.checked_add(bytes).ok_or_else(|| {
+            invalid(
+                allocation_bytes,
+                format!("decommit range offset {byte_offset} plus {bytes} bytes overflows"),
+            )
+        })?;
+        if end > allocation_bytes {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "decommit range {byte_offset}..{end} exceeds allocation of \
+                     {allocation_bytes} bytes"
+                ),
+            ));
+        }
+        let mut arena = self.lock();
+        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let address = ptr.as_ptr() as usize;
+        let Some(offset) = address.checked_sub(base) else {
+            return Err(invalid(
+                allocation_bytes,
+                "decommit pointer is below the VMM arena reservation".to_string(),
+            ));
+        };
+        if let Some(span) = arena.spans.quarantine.get(&offset) {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "decommit pointer names a span quarantined after a failed release ({}); it \
+                     retains {} B of physical ownership and can never be committed or decommitted \
+                     again",
+                    span.reason, span.retained_owned_bytes,
+                ),
+            ));
+        }
+        let Some(live) = arena.spans.live.get(&offset) else {
+            return Err(invalid(
+                allocation_bytes,
+                "decommit pointer is not a live VMM allocation".to_string(),
+            ));
+        };
+        if live.len != allocation_bytes {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "decommit allocation size {allocation_bytes} does not match live VMM \
+                     allocation size {}",
+                    live.len
+                ),
+            ));
+        }
+        if bytes == 0 {
+            return Ok(DecommitOutcome::Complete {
+                accounting: DecommitAccounting::default(),
+            });
+        }
+        let granularity = arena.spans.granularity;
+        let align = live.align;
+        let len = live.len;
+        let absolute_start = offset + byte_offset;
+        let absolute_end = offset + end;
+        let requested = live
+            .committed
+            .iter()
+            .copied()
+            .filter(|granule| {
+                let start = granule * granularity;
+                start >= absolute_start && start < absolute_end
+            })
+            .collect::<BTreeSet<_>>();
+        if requested.is_empty() {
+            return Ok(DecommitOutcome::Complete {
+                accounting: DecommitAccounting::default(),
+            });
+        }
+        // References are not dropped until the driver work is known to have
+        // succeeded, so a rollback needs no compensating re-increment: the
+        // counts were never touched.
+        let releasable = requested
+            .iter()
+            .copied()
+            .filter(|&granule| arena.spans.granule_refs[granule] == 1)
+            .collect::<Vec<_>>();
+        let blocks = releasable
+            .iter()
+            .flat_map(|&granule| {
+                arena
+                    .reservation
+                    .mapped_blocks()
+                    .iter()
+                    .copied()
+                    .filter(move |block| block.offset / granularity == granule)
+            })
+            .collect::<Vec<_>>();
+        let decommit = self
+            .backing
+            .decommit_blocks_transactional(&mut arena.reservation, blocks);
+        match decommit {
+            RangeDecommit::Unmapped(report) => {
+                let unmapped = report.unmapped_bytes();
+                for &granule in &requested {
+                    match arena.spans.granule_refs[granule].checked_sub(1) {
+                        Some(remaining) => arena.spans.granule_refs[granule] = remaining,
+                        None => {
+                            GLOBAL_REF_UNDERFLOWS.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                if unmapped > 0 {
+                    arena.spans.committed = arena.spans.committed.saturating_sub(unmapped as usize);
+                    note_release(unmapped as usize);
+                    self.give_back_lease(&mut arena, unmapped as usize);
+                }
+                if let Some(live) = arena.spans.live.get_mut(&offset) {
+                    for granule in &requested {
+                        live.committed.remove(granule);
+                    }
+                }
+                Ok(DecommitOutcome::Complete {
+                    accounting: DecommitAccounting {
+                        requested_bytes: bytes as u64,
+                        unmapped_bytes: unmapped,
+                        quarantined_owned_bytes: block_bytes(&report.unmapped_handle_owned),
+                    },
+                })
+            }
+            RangeDecommit::RolledBack(fault) => Ok(DecommitOutcome::RolledBack {
+                reason: fault.to_string(),
+            }),
+            RangeDecommit::Poisoned {
+                still_mapped,
+                unmapped_handle_owned,
+                faults,
+            } => {
+                // The mapping topology is neither the old one nor the new one,
+                // so the allocation cannot honestly be called live. Retire it
+                // whole, keeping its address range and every residual.
+                let unmapped = block_bytes(&unmapped_handle_owned);
+                if unmapped > 0 {
+                    arena.spans.committed = arena.spans.committed.saturating_sub(unmapped as usize);
+                    note_release(unmapped as usize);
+                    self.give_back_lease(&mut arena, unmapped as usize);
+                }
+                let live = arena.spans.live.remove(&offset);
+                let mut retained = live.map(|live| live.committed).unwrap_or_default();
+                for block in &unmapped_handle_owned {
+                    let granule = block.offset / granularity;
+                    arena.spans.granule_refs[granule] = 0;
+                    retained.remove(&granule);
+                }
+                for block in &still_mapped {
+                    let granule = block.offset / granularity;
+                    arena.spans.granule_refs[granule] = 1;
+                    arena.spans.poisoned.insert(granule);
+                }
+                // Granules of this allocation that the failed decommit never
+                // touched are still mapped and still owned by the quarantined
+                // span; nothing may unmap them again.
+                let mut still_mapped = still_mapped;
+                let untouched = retained
+                    .iter()
+                    .filter(|&&granule| {
+                        still_mapped
+                            .iter()
+                            .all(|block| block.offset / granularity != granule)
+                    })
+                    .filter_map(|&granule| {
+                        arena
+                            .reservation
+                            .mapped_blocks()
+                            .iter()
+                            .copied()
+                            .find(|block| block.offset / granularity == granule)
+                    })
+                    .collect::<Vec<_>>();
+                for block in untouched {
+                    arena.spans.poisoned.insert(block.offset / granularity);
+                    still_mapped.push(block);
+                }
+                still_mapped.sort_unstable_by_key(|block| block.offset);
+                let record = self.quarantine_record(
+                    &arena,
+                    offset,
+                    len,
+                    align,
+                    SpanReleaseReport {
+                        settled: Vec::new(),
+                        still_mapped,
+                        unmapped_handle_owned,
+                        faults,
+                    },
+                    QuarantineReason::PartialRelease,
+                );
+                let residual = record.residual();
+                let reason = record.fault_summary();
+                arena.spans.quarantine_span(record);
+                Ok(DecommitOutcome::Quarantined {
+                    accounting: DecommitAccounting {
+                        requested_bytes: bytes as u64,
+                        unmapped_bytes: unmapped,
+                        quarantined_owned_bytes: unmapped,
+                    },
+                    residual,
+                    reason,
+                })
+            }
+        }
+    }
+
+    /// Spans this arena still owns after a release that could not finish.
+    ///
+    /// Empty in a correct run. A non-empty list is a standing fault: the
+    /// address ranges named here are permanently withdrawn from the arena and
+    /// their physical bytes stay charged.
+    pub fn quarantined_spans(&self) -> Vec<QuarantinedSpan> {
+        self.lock().spans.quarantine.values().cloned().collect()
+    }
+
+    /// Physical bytes this arena owns but could not release.
+    pub fn quarantined_owned_bytes(&self) -> u64 {
+        self.lock()
+            .spans
+            .quarantine
+            .values()
+            .map(|span| span.retained_owned_bytes)
+            .sum()
+    }
+
+    /// Attach a deterministic driver fault plan to this allocator's backing.
+    ///
+    /// Test-only, and scoped to this allocator: no other allocator, pool or
+    /// test in the same process can observe the injected faults.
+    #[cfg(any(test, feature = "gpu-tests"))]
+    pub fn install_driver_faults(&mut self, plan: Arc<crate::release::DriverFaultPlan>) {
+        self.backing = self.backing.clone().with_driver_faults(plan);
     }
 
     /// Declare a CUDA graph capture (or replay window) open on this allocator.
@@ -1469,19 +2198,62 @@ impl CudaVmmAllocator {
             ) {
                 Ok(()) => mapped.push(granule),
                 Err(error) => {
+                    // Unmap what this call mapped. The handle goes back to the
+                    // pool's shared refcount, not to `available`, so the other
+                    // sharers and the prefix owner keep the physical granule:
+                    // its lifetime is the union of every mapping, and a failed
+                    // sharer must not shorten it.
+                    let mut residual = Vec::new();
+                    // The granule that just failed may itself still be mapped:
+                    // `map_shared_prefix_readonly` records the block when its
+                    // own cleanup unmap fails. Leaving it out here would let
+                    // the arena believe an address with a live read-only
+                    // mapping under it is free.
+                    let failed_offset = granule * granularity;
+                    residual.extend(
+                        arena
+                            .reservation
+                            .mapped_blocks()
+                            .iter()
+                            .copied()
+                            .filter(|block| block.offset == failed_offset),
+                    );
                     for &done in &mapped {
-                        // Unmap what this call mapped; the handle returns to the
-                        // pool's shared refcount, not to `available`, so other
-                        // sharers are unaffected.
-                        let _ = self.backing.release(
+                        let report = self.backing.release_range_reporting(
                             &mut arena.reservation,
                             done * granularity,
                             granularity,
                         );
+                        residual.extend(report.still_mapped.iter().copied());
+                        residual.extend(report.unmapped_handle_owned.iter().copied());
+                    }
+                    for block in &residual {
+                        // Never entered `granule_refs` in the first place, so
+                        // taking a reference here is what keeps a granule whose
+                        // mapping survived from being handed out again, and
+                        // charging `committed` keeps the mapped-byte gauge
+                        // truthful about memory that really is mapped.
+                        let granule = block.offset / granularity;
+                        arena.spans.granule_refs[granule] = 1;
+                        arena.spans.poisoned.insert(granule);
+                        arena.spans.committed += granularity;
+                        note_commit(granularity);
+                    }
+                    if residual.is_empty() {
+                        return Err(invalid(
+                            allocation_bytes,
+                            format!("shared prefix mapping: {error}"),
+                        ));
                     }
                     return Err(invalid(
                         allocation_bytes,
-                        format!("shared prefix mapping: {error}"),
+                        format!(
+                            "shared prefix mapping: {error}; rolling back left {} granule(s) \
+                             ({} B) mapped and owned, which are quarantined and can never be \
+                             committed again",
+                            residual.len(),
+                            block_bytes(&residual),
+                        ),
                     ));
                 }
             }
@@ -1536,7 +2308,7 @@ impl CudaVmmAllocator {
         let Some(live) = arena.spans.live.get(&offset) else {
             return Err(invalid(
                 allocation_bytes,
-                "commit pointer is not a live VMM allocation".to_string(),
+                quarantine_or(arena, offset, "commit pointer is not a live VMM allocation"),
             ));
         };
         if live.len != allocation_bytes {
@@ -1558,6 +2330,21 @@ impl CudaVmmAllocator {
             .filter(|granule| !live.committed.contains(granule))
             .collect();
         Ok((offset, granules))
+    }
+}
+
+/// Name the quarantine when `offset` is one, so a caller sees why an address
+/// it holds stopped working instead of the generic "not live".
+fn quarantine_or(arena: &Arena, offset: usize, otherwise: &str) -> String {
+    match arena.spans.quarantine.get(&offset) {
+        Some(span) => format!(
+            "this address names a span quarantined after a failed release ({}); it retains {} B \
+             of physical ownership and can never be committed, used, or released again: {}",
+            span.reason,
+            span.retained_owned_bytes,
+            span.fault_summary(),
+        ),
+        None => otherwise.to_string(),
     }
 }
 
@@ -1710,17 +2497,38 @@ impl DeviceAllocator for CudaVmmAllocator {
         )
     }
 
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, _bytes: usize, _align: usize) {
-        let _ = self.deallocate_span(ptr);
+    /// Migration adapter. Delegates to [`release`](Self::release) so a
+    /// quarantined address can never come back through the shorter path.
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+        // SAFETY: forwarded under this method's identical contract.
+        let _ = unsafe { self.release(ptr, bytes, align) };
     }
 
-    unsafe fn deallocate_with_unmapped(
+    /// Migration adapter reporting only the mapped-axis refund. Zero is a
+    /// valid answer and never means the release failed; use
+    /// [`release`](Self::release) to tell complete from quarantined.
+    unsafe fn deallocate_with_unmapped(&self, ptr: NonNull<u8>, bytes: usize, align: usize) -> u64 {
+        // SAFETY: forwarded under this method's identical contract.
+        unsafe { self.release(ptr, bytes, align) }.unmapped_bytes()
+    }
+
+    /// Whole-allocation release with honest terminal state.
+    ///
+    /// `bytes` is checked against the live record rather than trusted: a
+    /// mismatch means the caller is not describing this allocation, and
+    /// releasing on that basis would unmap granules belonging to something
+    /// else. Such a call mutates nothing and reports
+    /// [`AllocationReleaseOutcome::Failed`].
+    unsafe fn release(
         &self,
         ptr: NonNull<u8>,
-        _bytes: usize,
-        _align: usize,
-    ) -> u64 {
-        self.deallocate_span(ptr)
+        bytes: usize,
+        align: usize,
+    ) -> AllocationReleaseOutcome {
+        if let Some(mismatch) = self.release_size_mismatch(ptr, bytes, align) {
+            return AllocationReleaseOutcome::failed(mismatch);
+        }
+        self.deallocate_span_outcome(ptr)
     }
 
     fn device(&self) -> DeviceKey {
@@ -1775,14 +2583,12 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
         let mut committed = BTreeSet::new();
         for range in committed_ranges {
             if range.start > range.end || range.end > bytes {
-                self.release_committed_granules(&mut arena, &committed);
-                arena.spans.give_back(offset, bytes);
-                return Err(invalid(
-                    bytes,
-                    format!(
-                        "committed subrange {}..{} lies outside allocation of {bytes} bytes",
-                        range.start, range.end
-                    ),
+                let reason = format!(
+                    "committed subrange {}..{} lies outside allocation of {bytes} bytes",
+                    range.start, range.end
+                );
+                return Err(self.unwind_partial_allocation(
+                    &mut arena, offset, bytes, align, &committed, reason,
                 ));
             }
             if range.is_empty() {
@@ -1797,9 +2603,17 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
             let claimed = match self.claim_granules(&mut arena, granules) {
                 Ok(claimed) => claimed,
                 Err(error) => {
-                    self.release_committed_granules(&mut arena, &committed);
-                    arena.spans.give_back(offset, bytes);
-                    return Err(error);
+                    let reason = error.to_string();
+                    let unwind = self.unwind_partial_allocation(
+                        &mut arena, offset, bytes, align, &committed, reason,
+                    );
+                    // The original refusal is the useful diagnosis unless the
+                    // unwind itself left something owned, which outranks it.
+                    return Err(if arena.spans.quarantine.contains_key(&offset) {
+                        unwind
+                    } else {
+                        error
+                    });
                 }
             };
             committed.extend(claimed);
@@ -1808,6 +2622,7 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
             offset,
             LiveSpan {
                 len: bytes,
+                align,
                 committed,
             },
         );
@@ -1855,7 +2670,11 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
         let Some(live) = arena.spans.live.get(&offset) else {
             return Err(invalid(
                 allocation_bytes,
-                "commit pointer is not a live VMM allocation".to_string(),
+                quarantine_or(
+                    &arena,
+                    offset,
+                    "commit pointer is not a live VMM allocation",
+                ),
             ));
         };
         let len = live.len;
@@ -1916,6 +2735,15 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
         Ok(round_up(granularity, bytes) as u64)
     }
 
+    /// Migration adapter over [`decommit_allocation_range_outcome`].
+    ///
+    /// `Ok(bytes)` means the range really is unmapped and the allocation is
+    /// still live. `Err` means the allocation is either exactly as it was (the
+    /// decommit rolled back) or quarantined whole (the rollback failed) — the
+    /// message says which, because the two demand different responses from the
+    /// caller.
+    ///
+    /// [`decommit_allocation_range_outcome`]: CudaVmmAllocator::decommit_allocation_range_outcome
     fn decommit_allocation_range(
         &self,
         ptr: NonNull<u8>,
@@ -1924,66 +2752,31 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
         byte_offset: usize,
         bytes: usize,
     ) -> Result<u64, MemoryError> {
-        let end = byte_offset.checked_add(bytes).ok_or_else(|| {
-            invalid(
-                allocation_bytes,
-                format!("decommit range offset {byte_offset} plus {bytes} bytes overflows"),
-            )
-        })?;
-        if end > allocation_bytes {
-            return Err(invalid(
+        let end = byte_offset.saturating_add(bytes);
+        match self.decommit_allocation_range_outcome(ptr, allocation_bytes, byte_offset, bytes)? {
+            DecommitOutcome::Complete { accounting } => Ok(accounting.unmapped_bytes),
+            DecommitOutcome::RolledBack { reason } => Err(invalid(
                 allocation_bytes,
                 format!(
-                    "decommit range {byte_offset}..{end} exceeds allocation of {allocation_bytes} bytes"
+                    "decommit of {byte_offset}..{end} was refused and the original mapping was \
+                     restored, so the allocation is unchanged and still usable: {reason}"
                 ),
-            ));
-        }
-        if bytes == 0 {
-            return Ok(0);
-        }
-        let mut arena = self.lock();
-        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
-        let address = ptr.as_ptr() as usize;
-        let Some(offset) = address.checked_sub(base) else {
-            return Err(invalid(
-                allocation_bytes,
-                "decommit pointer is below the VMM arena reservation".to_string(),
-            ));
-        };
-        let Some(live) = arena.spans.live.get(&offset) else {
-            return Err(invalid(
-                allocation_bytes,
-                "decommit pointer is not a live VMM allocation".to_string(),
-            ));
-        };
-        if live.len != allocation_bytes {
-            return Err(invalid(
+            )),
+            DecommitOutcome::Quarantined {
+                accounting,
+                residual,
+                reason,
+            } => Err(invalid(
                 allocation_bytes,
                 format!(
-                    "decommit allocation size {allocation_bytes} does not match live VMM allocation size {}",
-                    live.len
+                    "decommit of {byte_offset}..{end} could not be rolled back; the whole \
+                     allocation at {:#x} is quarantined with {} B of physical ownership retained \
+                     after {} B were actually unmapped, and can no longer be used or released: \
+                     {reason}",
+                    residual.address, residual.retained_bytes, accounting.unmapped_bytes,
                 ),
-            ));
+            )),
         }
-        let granularity = arena.spans.granularity;
-        let absolute_start = offset + byte_offset;
-        let absolute_end = offset + end;
-        let releasable = live
-            .committed
-            .iter()
-            .copied()
-            .filter(|granule| {
-                let start = granule * granularity;
-                start >= absolute_start && start < absolute_end
-            })
-            .collect::<BTreeSet<_>>();
-        let unmapped = self.release_granules_report(&mut arena, &releasable);
-        if let Some(live) = arena.spans.live.get_mut(&offset) {
-            for granule in releasable {
-                live.committed.remove(&granule);
-            }
-        }
-        Ok(unmapped)
     }
 
     fn allocation_committed_bytes(
@@ -2070,12 +2863,20 @@ impl Drop for CudaVmmAllocator {
         // is small -- is unfalsifiable from outside: `committed_and_reserved`
         // exists but nothing calls it, so "is this doing anything?" has no
         // answer short of a debugger.
-        let (committed, reserved, granularity) = {
+        let (committed, reserved, granularity, quarantined_mapped, quarantined_spans) = {
             let arena = self.lock();
+            let quarantined_mapped = arena
+                .spans
+                .quarantine
+                .values()
+                .map(|span| block_bytes(&span.still_mapped))
+                .sum::<u64>();
             (
                 arena.spans.committed,
                 arena.spans.capacity(),
                 arena.spans.granularity,
+                quarantined_mapped,
+                arena.spans.quarantine.len(),
             )
         };
         eprintln!(
@@ -2083,16 +2884,23 @@ impl Drop for CudaVmmAllocator {
              ({} granules of {granularity} B)",
             committed / granularity.max(1),
         );
+        if quarantined_spans > 0 {
+            eprintln!(
+                "cuda_ep: WARNING: VMM arena closing with {quarantined_spans} quarantined span(s) \
+                 holding {quarantined_mapped} B still mapped; those bytes stay charged because \
+                 the driver never confirmed they were released"
+            );
+        }
 
-        // The reservation's own `Drop` unmaps and frees every block, so the
-        // only thing left is to stop the ledger believing the granules are
-        // still held. Shrinking to zero does that; the lease's own `Drop`
-        // would too, but doing it here keeps the two in step if a field is
-        // ever reordered.
+        // The reservation's own `Drop` unmaps and frees every block it can, so
+        // the only thing left is to stop the ledger believing the granules are
+        // still held. Quarantined mappings are the exception: their unmap
+        // already failed once, so their bytes stay charged rather than being
+        // advertised as free memory the device does not actually have.
         let mut arena = self.lock();
-        let held = arena.spans.committed as u64;
+        let held = (arena.spans.committed as u64).saturating_sub(quarantined_mapped);
         arena.lease.shrink(held);
-        arena.spans.committed = 0;
+        arena.spans.committed = quarantined_mapped as usize;
 
         // Keep the process-global counters honest. Without this the arena's
         // bytes stay on the books after it is gone, and a second run in the
@@ -2100,6 +2908,17 @@ impl Drop for CudaVmmAllocator {
         // mapped.
         subtract_counted(&GLOBAL_COMMITTED_BYTES, held);
         subtract_counted(&GLOBAL_RESERVED_BYTES, reserved as u64);
+        if quarantined_mapped > 0 {
+            // The lease still owns the quarantined bytes; dropping it would
+            // hand them back to the governor as free memory the device may not
+            // actually have. Swap in a zero-byte sibling over the same
+            // accounting and leak the original, which is the same conservative
+            // choice the physical handle pool makes.
+            if let Ok(placeholder) = arena.lease.reserve_sibling(0) {
+                let retained = std::mem::replace(&mut arena.lease, placeholder);
+                std::mem::forget(retained);
+            }
+        }
     }
 }
 
@@ -2260,5 +3079,233 @@ mod tests {
         let mut spans = Spans::new(1 << 16, 2 << 16);
         assert_eq!(spans.carve(3 << 16, 1), None);
         assert_eq!(spans.capacity(), 2 << 16);
+    }
+
+    const GRANULE: usize = 1 << 16;
+
+    fn block(granule: usize) -> MappedBlock {
+        MappedBlock::new(granule * GRANULE, GRANULE, 500 + granule as u64)
+    }
+
+    /// A span with one granule claimed, as `allocate_committed` would leave it.
+    fn committed_spans(granules: usize) -> Spans {
+        let mut spans = Spans::new(GRANULE, granules * GRANULE);
+        let offset = spans.carve(granules * GRANULE, 1).expect("fits");
+        for granule in 0..granules {
+            spans.granule_refs[granule] = 1;
+            spans.committed += GRANULE;
+        }
+        spans.live.insert(
+            offset,
+            LiveSpan {
+                len: granules * GRANULE,
+                align: 1,
+                committed: (0..granules).collect(),
+            },
+        );
+        spans
+    }
+
+    fn quarantine_of(spans: &mut Spans, offset: usize, len: usize, report: &SpanReleaseReport) {
+        spans.quarantine_span(QuarantinedSpan {
+            offset,
+            len,
+            align: 1,
+            address: 0x1000 + offset,
+            device: DeviceKey::device(0),
+            still_mapped: report.still_mapped.clone(),
+            unmapped_handle_owned: report.unmapped_handle_owned.clone(),
+            refunded_mapped_bytes: report.unmapped_bytes(),
+            retained_owned_bytes: report.retained_owned_bytes(),
+            state: AllocationReleaseState::PartiallyUnmapped,
+            reason: QuarantineReason::PartialRelease,
+            faults: vec![String::from("cuMemUnmap failed: injected")],
+        });
+    }
+
+    /// A granule whose unmap failed keeps its reference and its committed
+    /// bytes, and is poisoned.
+    ///
+    /// This is the exact-accounting rule: the mapped axis is refunded only for
+    /// bytes whose mapping is really gone. Refunding a granule that is still
+    /// mapped would tell the governor there is memory available that the
+    /// device is still holding.
+    #[test]
+    fn a_failed_unmap_refunds_nothing_and_poisons_the_granule() {
+        let mut spans = committed_spans(3);
+        let report = SpanReleaseReport {
+            settled: vec![block(0), block(2)],
+            still_mapped: vec![block(1)],
+            ..SpanReleaseReport::default()
+        };
+
+        let refund = spans.settle_release_run(0..3, &report);
+
+        assert_eq!(refund, 2 * GRANULE as u64, "only the two unmapped granules");
+        assert_eq!(spans.committed, GRANULE, "the mapped granule stays charged");
+        assert_eq!(spans.granule_refs, vec![0, 1, 0], "granule 1 keeps a claim");
+        assert!(spans.poisoned.contains(&1));
+        assert!(!spans.poisoned.contains(&0) && !spans.poisoned.contains(&2));
+    }
+
+    /// A handle that could not be given back still refunds the mapped axis.
+    ///
+    /// The two axes are independent: the mapping really is gone (so the
+    /// arena's committed bytes must drop) while the physical memory is still
+    /// owned by the pool (so its owned-byte gauge must not).
+    #[test]
+    fn an_unmapped_block_with_an_owned_handle_refunds_only_the_mapped_axis() {
+        let mut spans = committed_spans(2);
+        let report = SpanReleaseReport {
+            settled: vec![block(0)],
+            unmapped_handle_owned: vec![block(1)],
+            ..SpanReleaseReport::default()
+        };
+
+        let refund = spans.settle_release_run(0..2, &report);
+
+        assert_eq!(refund, 2 * GRANULE as u64, "both mappings are gone");
+        assert_eq!(spans.committed, 0);
+        assert_eq!(
+            report.retained_owned_bytes(),
+            GRANULE as u64,
+            "the quarantined handle is still owned"
+        );
+        assert!(
+            spans.poisoned.is_empty(),
+            "an address whose mapping is genuinely gone is not poisoned"
+        );
+    }
+
+    /// A quarantined span never comes back, however the arena is exercised.
+    ///
+    /// This is the defect Phase 4 exists to close: a partially released
+    /// address that returned to the free list would be handed to a later
+    /// allocation with the old mapping still under part of it.
+    #[test]
+    fn a_quarantined_span_is_never_carved_again() {
+        let mut spans = committed_spans(3);
+        let report = SpanReleaseReport {
+            settled: vec![block(0), block(2)],
+            still_mapped: vec![block(1)],
+            ..SpanReleaseReport::default()
+        };
+        spans.settle_release_run(0..3, &report);
+        // The whole allocation is retired without its address returning to the
+        // free list.
+        spans.live.remove(&0);
+        quarantine_of(&mut spans, 0, 3 * GRANULE, &report);
+
+        assert!(spans.free.is_empty(), "the arena has no free span left");
+        assert_eq!(spans.carve(GRANULE, 1), None, "nothing may be handed out");
+        assert!(spans.live.is_empty(), "the span is not live either");
+        let quarantined = spans.quarantine.get(&0).expect("recorded");
+        assert_eq!(quarantined.retained_owned_bytes, GRANULE as u64);
+        assert_eq!(quarantined.still_mapped, vec![block(1)]);
+    }
+
+    /// A poisoned granule refuses every future commit, even from a neighbour
+    /// that legitimately shares it.
+    #[test]
+    fn a_poisoned_granule_fails_every_later_commit_closed() {
+        let mut spans = committed_spans(2);
+        let report = SpanReleaseReport {
+            still_mapped: vec![block(1)],
+            settled: vec![block(0)],
+            ..SpanReleaseReport::default()
+        };
+        spans.settle_release_run(0..2, &report);
+
+        assert_eq!(spans.first_poisoned([0, 1]), Some(1));
+        assert_eq!(spans.first_poisoned([0]), None, "only the failed granule");
+    }
+
+    /// A rollback that succeeded touches nothing: no refund, no poison, no
+    /// change to any reference count.
+    #[test]
+    fn a_successful_rollback_leaves_the_bookkeeping_untouched() {
+        let before = committed_spans(3);
+        let mut spans = committed_spans(3);
+
+        // A rolled-back decommit never reaches `settle_release_run`, which is
+        // the property: references are dropped only after the driver work is
+        // known to have succeeded, so there is nothing to compensate for.
+        assert_eq!(spans.granule_refs, before.granule_refs);
+        assert_eq!(spans.committed, before.committed);
+        assert!(spans.poisoned.is_empty());
+        assert_eq!(
+            spans.live.get(&0).map(|live| live.committed.len()),
+            Some(3),
+            "every granule is still committed to the live allocation"
+        );
+        assert!(spans.quarantine.is_empty());
+        assert_eq!(spans.carve(GRANULE, 1), None, "the span is still live");
+    }
+
+    /// Interleaved allocate/release with one poisoned granule in the middle
+    /// never produces a reusable address for that granule, whatever the order.
+    ///
+    /// Deterministic rather than randomized: the orders are enumerated, so a
+    /// failure names the exact sequence rather than a seed.
+    #[test]
+    fn repeated_allocate_and_release_never_reuses_a_poisoned_granule() {
+        for order in [[0usize, 1, 2], [2, 1, 0], [1, 0, 2], [1, 2, 0]] {
+            let mut spans = Spans::new(GRANULE, 4 * GRANULE);
+            let mut offsets = Vec::new();
+            for _ in 0..3 {
+                let offset = spans.carve(GRANULE, 1).expect("fits");
+                let granule = offset / GRANULE;
+                spans.granule_refs[granule] = 1;
+                spans.committed += GRANULE;
+                spans.live.insert(
+                    offset,
+                    LiveSpan {
+                        len: GRANULE,
+                        align: 1,
+                        committed: BTreeSet::from([granule]),
+                    },
+                );
+                offsets.push(offset);
+            }
+            for &index in &order {
+                let offset = offsets[index];
+                let granule = offset / GRANULE;
+                let report = if granule == 1 {
+                    SpanReleaseReport {
+                        still_mapped: vec![block(1)],
+                        ..SpanReleaseReport::default()
+                    }
+                } else {
+                    SpanReleaseReport {
+                        settled: vec![block(granule)],
+                        ..SpanReleaseReport::default()
+                    }
+                };
+                spans.settle_release_run(granule..granule + 1, &report);
+                spans.live.remove(&offset);
+                if report.is_complete() {
+                    spans.give_back(offset, GRANULE);
+                } else {
+                    quarantine_of(&mut spans, offset, GRANULE, &report);
+                }
+            }
+
+            assert!(
+                spans.poisoned.contains(&1),
+                "order {order:?} lost the poison on granule 1"
+            );
+            assert_eq!(spans.granule_refs[1], 1, "order {order:?}");
+            assert_eq!(spans.committed, GRANULE, "order {order:?}");
+            // Every free span must avoid the quarantined granule.
+            for (&start, &len) in &spans.free {
+                assert!(
+                    !(start < 2 * GRANULE && GRANULE < start + len),
+                    "order {order:?} returned quarantined granule 1 to the free list: {:?}",
+                    spans.free
+                );
+            }
+            // The arena can still serve the granules that released cleanly.
+            assert!(spans.carve(GRANULE, 1).is_some(), "order {order:?}");
+        }
     }
 }

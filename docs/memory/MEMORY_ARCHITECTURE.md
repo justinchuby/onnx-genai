@@ -1641,7 +1641,8 @@ test passed, because every test lived inside the crate where private fields are
 reachable. The proof now lives in `tests/`, where it sees exactly what a third
 party sees and stops compiling if the contract closes again.
 
-Phases 1-3 of #1186 establish the dependency, capability, and binding-lifetime
+Phases 1-4 of #1186 establish the dependency, capability, binding-lifetime, and
+ordered-release
 boundaries.
 `onnx-runtime-memory-api` owns `Tier`, `MemoryRole`, `MemoryError`, the primitive
 allocation/prefix types, the minimal `DeviceAllocator`, `HostAllocator`, and the
@@ -1766,7 +1767,7 @@ returns `ContextNotQuiescent` while callbacks remain, so callers wait or poll
 outside registry/governance locks. Resource removal is a separate non-callback
 step after mechanism registrations are quiescent and removed.
 
-Phase 3 adds no deferred-free queue, fence/event scheduling, owning allocation
+At the Phase-3 boundary there is no deferred-free queue, fence/event scheduling, owning allocation
 RAII, physical-release completeness state, partial-unmap recovery, quarantine,
 or pointer-only retry API. `BoundSharedPrefix` teardown is still drop-driven,
 not lifecycle-gated by the registry; field order only guarantees that its
@@ -1775,6 +1776,112 @@ teardown carries the same limit: field order guarantees only that the
 provider-context and authority pins outlive the allocator's destructor, not that
 the destructor's device work is ordered against a stream. True stream-ordered,
 partial-failure-safe teardown remains Phase 4 work.
+
+#### Phase 4 owning release, deferred ordering, and quarantine
+
+Phase 4 adds ownership and release ordering without moving policy into the
+allocation handle. `OwningAllocation` wraps one exact `BoundAllocation`; it is
+not `Clone` or `Copy`, and its final release consumes the binding identity plus
+`AllocationGeneration`. `OwnedView` is cloneable borrowed metadata only. A live
+view blocks release, and neither a view nor a raw pointer has a release method.
+The execution-facing `DeviceBuffer` can carry this owner directly. Its raw
+escape hatch refuses to discard the owner, and the ORT plugin allocator retains
+the exact EP-issued buffer until `Free` rather than reconstructing release
+authority from a pointer and size.
+
+The lifecycle is explicit:
+
+```text
+live/mapped
+  | prepare_release(binding + allocation generation)
+  v
+queued -- both compute/copy fences complete --> released-or-pooled
+  | enqueue refusal / abandoned request
+  +-----------------------------------------> quarantined
+  | device loss
+  +-----------------------------------------> device-lost quarantine
+
+partially unmapped
+  | residual mappings/handles/VA/context stay owned
+  +-----------------------------------------> quarantined (never reusable)
+```
+
+Preparation removes the live generation exactly once under the mechanism lock
+and returns a `PreparedAllocationRelease` that pins the allocator, authority,
+and provider context. Dropping either an unreleased owner or an unexecuted
+prepared request does not free and does not wait: it records quarantine.
+`MemoryBinding::release(BoundAllocation)` remains the migration adapter, but it
+uses the same generation-checked preparation and cannot retry a pointer after
+virtual-address reuse.
+
+CUDA owns one `CudaDeferredReleaseQueue` per provider context. Production does
+not reject already-existing ownership solely because earlier fences are still
+pending; custom/test queues may set a finite capacity to exercise fail-safe
+`Full` handling. Enqueue
+records one event at the current compute-stream tail and one at the current
+copy-stream tail, then returns without a stream or device synchronization. A
+worker uses non-blocking event queries and executes ready releases outside the
+queue lock. Provider `Drop` and shutdown initiate a non-blocking drain; already
+accepted work keeps the queue, streams, context, and exact ownership alive.
+Queue refusal returns the exact request. Device loss stops event queries and
+allocator calls and retains pending ownership without a refund. Explicit
+partial decommit is different: its caller asks for the range to be unavailable
+before proceeding, so it waits only on freshly recorded events for these two
+streams, never on the whole device.
+
+CUDA VMM release has two independent accounting axes:
+
+| observed transition | mapped attribution | physical ownership / lease |
+|---|---:|---:|
+| `cuMemUnmap` failed | unchanged | unchanged |
+| unmap succeeded, handle returned to retained pool | refund actual unmapped bytes | pool remains charged |
+| unmap and `cuMemRelease` succeeded | refund actual unmapped bytes | release owned bytes |
+| unmap succeeded, pool return / handle release failed | refund actual unmapped bytes | retain exact handle and charge in quarantine |
+| rollback remapped every block | unchanged | unchanged |
+| rollback/remap failed | refund only mappings that stayed removed | retain the whole poisoned span and every residual |
+
+Zero unmapped bytes is therefore a valid `Complete` result, not an error
+sentinel. `AllocationReleaseOutcome` distinguishes `Complete`, `Quarantined`,
+and pre-mutation `Failed`; after any CUDA mutation the only non-complete answer
+is `Quarantined` with actual accounting and residual ownership.
+
+The VMM arena never returns a span to its free list until release reaches a
+consistent terminal state. Failed unmaps leave exact mappings recorded.
+Successfully unmapped handles that could not be returned enter a pool
+quarantine that is never checked out. Transactional decommit retains handles
+through its unmap phase so it can restore the original mapping and access
+protection. A remap failure moves the whole allocation out of the live set,
+poisons its granules, retains its VA/mappings/handles/context/lease, and rejects
+all later commit, decommit, or release attempts. Shared-prefix handles keep
+their cross-reservation mapping reference count, so the physical backing
+survives until the last owner or mapping retires.
+
+Production CUDA EP allocation, committed allocation, mapped-capacity adoption,
+weight paging, stable weight slots, reservation teardown, provider shutdown,
+and the ORT plugin allocator use this lifecycle. Mapped refunds and provider
+free counters are applied by observers only after the structured release
+outcome is known. Stable slots remain pending until their deferred decommit
+settles and become permanently poisoned after incomplete or refused release.
+Authority-driven reclaim and admission that require immediate headroom wait
+with a finite deadline for the relevant deferred queue; a timeout fails closed
+without claiming capacity that is still charged.
+
+The lock order remains leaf-oriented:
+
+1. Registry lock: registration and selected mechanism only.
+2. Per-mechanism lock: lifecycle, live generations, queued count, quarantine.
+3. CUDA arena and physical-pool bookkeeping locks.
+4. Deferred queue state and execution gate.
+
+Registry and mechanism locks are never nested. Queue locks are never held
+across event recording/query, allocator or observer calls, governor/allowance
+calls, release execution, or waits. CUDA driver operations do not run under a
+physical-pool state lock. Any bounded admission/reclaim wait occurs outside
+registry and governance locks.
+
+Phase 4 does not centralize policy or sessions in `ProcessMemoryManager`, define
+the plugin ABI, remove explicit adapters, remove the eager CUDA compatibility
+mechanism, or change an allocator-selection default. Those remain later phases.
 
 ### 1.2 Two directions, both backends
 

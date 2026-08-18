@@ -80,6 +80,7 @@ compile_error!(
 pub mod blas;
 pub mod capture;
 pub mod cudnn;
+pub mod deferred_release;
 mod dynamic_library;
 pub mod error;
 mod graph;

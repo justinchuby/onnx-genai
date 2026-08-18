@@ -9,6 +9,7 @@ use std::fmt::Debug;
 use std::ptr::NonNull;
 
 use crate::capability::{SharedMapping, VirtualBacking};
+use crate::deferred::{AllocationReleaseOutcome, ReleaseAccounting};
 use crate::{MemoryError, Tier};
 
 #[derive(Clone, Copy, Debug)]
@@ -109,6 +110,11 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     /// Give back a whole allocation returned by this allocator or by the
     /// [`VirtualBacking`] capability discovered from this allocator.
     ///
+    /// This is the pre-Phase-4 **migration adapter**. It cannot report partial
+    /// failure, so new code should implement and call
+    /// [`release`](Self::release) instead; the default `release` forwards here
+    /// so existing implementations keep working unchanged.
+    ///
     /// # Safety
     ///
     /// `ptr` must identify one live allocation from this coherent mechanism
@@ -122,6 +128,10 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     /// remains part of canonical whole-allocation release; it is intentionally
     /// not a method on either optional capability.
     ///
+    /// Like [`deallocate`](Self::deallocate), this is a migration adapter that
+    /// cannot express partial failure. Zero is a valid answer here and never
+    /// means the release failed.
+    ///
     /// # Safety
     ///
     /// The same requirements as [`deallocate`](Self::deallocate).
@@ -129,6 +139,43 @@ pub trait DeviceAllocator: Send + Sync + Debug {
         // SAFETY: forwarded under this method's identical contract.
         unsafe { self.deallocate(ptr, bytes, align) };
         0
+    }
+
+    /// Give back a whole allocation and report a **structured** outcome.
+    ///
+    /// This is the Phase-4 canonical release entry point. It is additive: the
+    /// default implementation is an eager adapter over
+    /// [`deallocate_with_unmapped`](Self::deallocate_with_unmapped), so every
+    /// existing allocator keeps working unchanged and reports
+    /// [`AllocationReleaseOutcome::Complete`].
+    ///
+    /// # Honesty requirements
+    ///
+    /// * [`AllocationReleaseOutcome::Complete`] means the whole allocation is
+    ///   gone (freed or pooled). Zero unmapped bytes is a valid complete
+    ///   result and must never be used to signal failure.
+    /// * [`AllocationReleaseOutcome::Failed`] may be returned **only** when
+    ///   nothing was mutated. It is the one shape that implies "unchanged".
+    /// * Any partial mutation — some granules unmapped, some handles released,
+    ///   an error partway through a multi-step teardown — must be
+    ///   [`AllocationReleaseOutcome::Quarantined`] carrying the bytes actually
+    ///   unmapped and the residual ownership that remains.
+    ///
+    /// # Safety
+    ///
+    /// The same requirements as [`deallocate`](Self::deallocate).
+    unsafe fn release(
+        &self,
+        ptr: NonNull<u8>,
+        bytes: usize,
+        align: usize,
+    ) -> AllocationReleaseOutcome {
+        // SAFETY: forwarded under this method's identical contract.
+        let unmapped_bytes = unsafe { self.deallocate_with_unmapped(ptr, bytes, align) };
+        AllocationReleaseOutcome::complete(ReleaseAccounting {
+            allocation_bytes: bytes as u64,
+            unmapped_bytes,
+        })
     }
 
     fn device(&self) -> DeviceKey;

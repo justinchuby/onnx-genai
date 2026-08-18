@@ -5,11 +5,15 @@
 //! so Phase 2 does not require an unrelated workspace-wide import migration.
 
 pub use onnx_runtime_memory_api::{
-    AllocationCommitRange, AllocationGeneration, AllocationIdentity, AuthorityIdentity,
-    BindingError, BindingGeneration, BindingId, BindingIdentity, BindingRegistry, BindingResource,
-    BoundAllocation, BoundMemoryView, BoundSharedMapping, BoundSharedPrefix, BoundVirtualBacking,
-    DeviceAllocator, DeviceKey, ExplicitReleaseError, HostAllocator, MappedAllocation,
-    MechanismCoherence, MechanismIdentity, MechanismLifecycle, MechanismSnapshot, MemoryBinding,
-    ProviderContextIdentity, RegisteredAuthority, RegisteredMechanism, RegisteredProviderContext,
+    AllocationCommitRange, AllocationGeneration, AllocationIdentity, AllocationReleaseOutcome,
+    AllocationReleaseState, AuthorityIdentity, BindingError, BindingGeneration, BindingId,
+    BindingIdentity, BindingRegistry, BindingResource, BoundAllocation, BoundMemoryView,
+    BoundSharedMapping, BoundSharedPrefix, BoundVirtualBacking, DeferredEnqueueError,
+    DeferredEnqueueRejection, DeferredReleaseDisposition, DeferredReleaseQueue, DeviceAllocator,
+    DeviceKey, ExplicitReleaseError, HostAllocator, MappedAllocation, MechanismCoherence,
+    MechanismIdentity, MechanismLifecycle, MechanismSnapshot, MemoryBinding, OwnedView,
+    OwningAllocation, OwningReleaseError, PreparedAllocationRelease, ProviderContextIdentity,
+    QuarantineReason, QuarantinedAllocation, RegisteredAuthority, RegisteredMechanism,
+    RegisteredProviderContext, ReleaseAccounting, ReleaseFailure, ResidualOwnership,
     SharedDevicePrefix, SharedMapping, SharedPrefixCommitInfo, ValidatedMemoryView, VirtualBacking,
 };

@@ -6,6 +6,7 @@ use std::ptr::NonNull;
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, GraphView, Node, NodeId, NodeIndex, Shape, TensorLayout,
 };
+use onnx_runtime_memory_governor::OwningAllocation;
 
 use crate::epcontext::EpContext;
 use crate::error::{EpError, Result};
@@ -35,6 +36,21 @@ pub struct EpConfig {
 /// to a different EP. Ownership is unique — no two `DeviceBuffer`s ever alias
 /// the same allocation.
 ///
+/// # Two owning representations
+///
+/// * **Raw owning** ([`DeviceBuffer::from_raw_parts`]) — an address plus size
+///   and alignment. The EP is trusted to pair it with exactly one free. This is
+///   what the CPU EP and adapter/plugin paths use.
+/// * **Bound owning** ([`DeviceBuffer::from_owning_allocation`]) — the exact
+///   [`OwningAllocation`] that minted the address, carrying its binding identity
+///   and allocation generation. Final release goes back through that owner, so
+///   a stale handle over a reused address cannot free anything, and a release
+///   can never be attributed to the wrong mechanism.
+///
+/// A bound buffer is still non-`Clone` and still has no `Drop`: the generation
+/// is what makes the release safe, and the owner's own `Drop` quarantines
+/// rather than frees.
+///
 /// # No `Drop`
 ///
 /// `DeviceBuffer` deliberately does **not** implement [`Drop`]. Freeing device
@@ -42,7 +58,8 @@ pub struct EpConfig {
 /// queue, an allocator arena) that this bare handle does not carry, so a silent
 /// drop could not free correctly. Consequences:
 /// * Dropping a `DeviceBuffer` without passing it to `deallocate` **leaks** the
-///   allocation. It can never *double-free*, which is the memory-safety
+///   allocation (a bound buffer instead quarantines it, so the bytes stay
+///   accounted for). It can never *double-free*, which is the memory-safety
 ///   property we prioritize (plan §4.4).
 /// * The session layer owns the discipline of pairing every `allocate` with
 ///   exactly one `deallocate`. Higher layers may wrap this handle in an
@@ -72,20 +89,25 @@ pub struct DeviceBuffer {
     ///
     /// [`BufferOwner::Owned`] (the default for [`DeviceBuffer::from_raw_parts`])
     /// is the original contract: the owning EP must free it exactly once in
-    /// `deallocate`. Borrowed handles alias memory owned by *someone else*.
-    /// Read-only aliases come from [`DeviceBuffer::from_borrowed_parts`];
-    /// exclusive writable aliases come from
-    /// [`DeviceBuffer::from_borrowed_mut_parts`]. `deallocate` must **not** free
-    /// either kind.
+    /// `deallocate`. [`BufferOwner::Bound`] carries the generation-checked
+    /// owner instead of trusting the raw triple. Borrowed handles alias memory
+    /// owned by *someone else*. Read-only aliases come from
+    /// [`DeviceBuffer::from_borrowed_parts`]; exclusive writable aliases come
+    /// from [`DeviceBuffer::from_borrowed_mut_parts`]. `deallocate` must **not**
+    /// free either borrowed kind.
     owner: BufferOwner,
 }
 
 /// Whether a [`DeviceBuffer`] owns the allocation it names, or merely borrows
 /// (aliases) memory owned elsewhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum BufferOwner {
     /// This handle is the sole owner; the owning EP frees it in `deallocate`.
     Owned,
+    /// This handle is the sole owner *and* carries the binding-issued owner
+    /// that minted the address. Release consumes that owner, so it is validated
+    /// against the binding identity and the allocation generation.
+    Bound(Box<OwningAllocation>),
     /// This handle aliases foreign memory (e.g. an mmap). `deallocate` must be
     /// a no-op free; the real owner must outlive the buffer and every use of it.
     Borrowed,
@@ -205,6 +227,65 @@ impl DeviceBuffer {
         matches!(self.owner, BufferOwner::Borrowed | BufferOwner::BorrowedMut)
     }
 
+    /// Wrap a **binding-issued owning allocation** in a `DeviceBuffer`.
+    ///
+    /// The buffer's address, size, and alignment are taken from `owner`, so a
+    /// bound buffer can never describe a different region than the owner it
+    /// carries. Final release consumes that owner
+    /// ([`into_bound_owner`](Self::into_bound_owner)), which matches the binding
+    /// identity and the allocation generation before anything is freed: a stale
+    /// handle over a reused device address is refused instead of freeing a live
+    /// allocation.
+    ///
+    /// This is safe to call — the safety obligations were discharged when the
+    /// binding issued (or adopted) the allocation.
+    pub fn from_owning_allocation(owner: OwningAllocation, device: DeviceId) -> Self {
+        let ptr = owner.as_ptr();
+        let size = owner.len();
+        let align = owner.alignment().max(1);
+        Self {
+            device,
+            size,
+            align,
+            ptr: NonNull::new(ptr.as_ptr().cast::<c_void>())
+                .expect("an owning allocation holds a non-null address"),
+            owner: BufferOwner::Bound(Box::new(owner)),
+        }
+    }
+
+    /// Whether this handle carries a binding-issued owner whose release is
+    /// generation-validated.
+    pub fn is_bound(&self) -> bool {
+        matches!(self.owner, BufferOwner::Bound(_))
+    }
+
+    /// Borrow the binding-issued owner, for a bound capability call (commit,
+    /// decommit, mapped-byte queries) that must be validated against the
+    /// allocation generation.
+    ///
+    /// Returns `None` for raw-owning and borrowed buffers, which is how a
+    /// generation-checked path fails closed on foreign memory.
+    pub fn bound_owner(&self) -> Option<&OwningAllocation> {
+        match &self.owner {
+            BufferOwner::Bound(owner) => Some(owner),
+            _ => None,
+        }
+    }
+
+    /// Consume the handle and recover the binding-issued owner.
+    ///
+    /// This is the only way a bound buffer's ownership leaves the handle, and it
+    /// is what a provider's `deallocate` calls before preparing or deferring the
+    /// physical release. `Err` hands the buffer back untouched when it is not
+    /// bound, so a caller that requires generation-checked release can refuse
+    /// foreign memory without losing it.
+    pub fn into_bound_owner(self) -> std::result::Result<OwningAllocation, Self> {
+        match self.owner {
+            BufferOwner::Bound(owner) => Ok(*owner),
+            owner => Err(Self { owner, ..self }),
+        }
+    }
+
     /// The device this allocation lives on (and whose EP must free it).
     pub fn device(&self) -> DeviceId {
         self.device
@@ -245,8 +326,42 @@ impl DeviceBuffer {
     /// [`DeviceBuffer::from_borrowed_parts`]) the pointer must **not** be freed;
     /// check [`is_borrowed`](DeviceBuffer::is_borrowed) first if the caller
     /// intends to free.
+    ///
+    /// # Panics
+    ///
+    /// For a **bound** buffer ([`DeviceBuffer::from_owning_allocation`]) this
+    /// panics rather than silently downgrading generation-checked ownership to
+    /// a bare address. Handing out the raw pointer alone would let a caller free
+    /// it without matching the binding identity or the allocation generation —
+    /// exactly the stale-pointer free the binding exists to prevent — while the
+    /// owner it left behind would quarantine the same bytes. Use
+    /// [`into_raw_with_owner`](Self::into_raw_with_owner) when the raw address
+    /// *and* the owner are both wanted, or
+    /// [`into_bound_owner`](Self::into_bound_owner) to take ownership back.
     pub fn into_raw(self) -> *mut c_void {
+        assert!(
+            !self.is_bound(),
+            "DeviceBuffer::into_raw: this buffer carries a binding-issued owning allocation, so \
+             returning the raw pointer alone would bypass binding-identity and allocation-\
+             generation validation on release. Use into_raw_with_owner or into_bound_owner."
+        );
         self.ptr.as_ptr()
+    }
+
+    /// Consume the handle, returning the raw pointer **together with** the
+    /// binding-issued owner when there is one.
+    ///
+    /// This is the explicit escape hatch [`into_raw`](Self::into_raw) refuses to
+    /// be: the caller receives the address and the generation-checked ownership
+    /// in the same step, so the release obligation travels with the pointer
+    /// instead of being dropped on the floor. `None` means the buffer was raw
+    /// owning or borrowed and the historical raw contract applies.
+    pub fn into_raw_with_owner(self) -> (*mut c_void, Option<OwningAllocation>) {
+        let ptr = self.ptr.as_ptr();
+        match self.owner {
+            BufferOwner::Bound(owner) => (ptr, Some(*owner)),
+            _ => (ptr, None),
+        }
     }
 }
 
@@ -1162,6 +1277,117 @@ mod tests {
         assert!(backing.iter().all(|&b| b == 7));
         backing[0] = 9;
         assert_eq!(backing[0], 9);
+    }
+
+    /// A host-backed binding, so the bound-ownership contract can be exercised
+    /// without a device.
+    fn host_binding() -> onnx_runtime_memory_governor::MemoryBinding {
+        use onnx_runtime_memory_governor::{BindingRegistry, DeviceKey, HostAllocator};
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct Pin;
+
+        let registry = BindingRegistry::new().expect("registry");
+        let context = registry
+            .register_provider_context(DeviceKey::HOST, Arc::new(Pin))
+            .expect("provider context");
+        let authority = registry
+            .register_authority(DeviceKey::HOST, Arc::new(Pin))
+            .expect("authority");
+        let mechanism = registry
+            .register_allocator(context, authority, Arc::new(HostAllocator))
+            .expect("allocator");
+        registry.select(mechanism).expect("selection");
+        registry.bind(DeviceKey::HOST).expect("binding")
+    }
+
+    #[test]
+    fn a_bound_buffer_carries_the_owner_that_minted_it() {
+        let binding = host_binding();
+        let owner = binding.allocate_owning(256, 64).expect("owning allocation");
+        let identity = owner.identity();
+        let address = owner.as_ptr().as_ptr() as usize;
+        let buffer = DeviceBuffer::from_owning_allocation(owner, DeviceId::cpu());
+        assert!(buffer.is_bound());
+        assert!(!buffer.is_borrowed(), "a bound buffer owns its allocation");
+        assert_eq!(buffer.len(), 256);
+        assert_eq!(buffer.alignment(), 64);
+        assert_eq!(buffer.as_ptr() as usize, address);
+        assert_eq!(
+            buffer.bound_owner().expect("bound owner").identity(),
+            identity,
+            "the buffer never describes a different allocation than its owner"
+        );
+        // The only way ownership leaves the handle is the consuming extractor,
+        // and what comes back is the same generation-checked owner.
+        let recovered = buffer.into_bound_owner().expect("bound");
+        assert_eq!(recovered.identity(), identity);
+        let outcome = recovered.release_now().expect("release");
+        assert!(outcome.is_complete());
+    }
+
+    #[test]
+    fn a_raw_or_borrowed_buffer_has_no_bound_owner() {
+        let raw = host_alloc(64, 16);
+        assert!(!raw.is_bound());
+        assert!(raw.bound_owner().is_none());
+        // Failing to extract hands the buffer back untouched rather than losing
+        // it, which is what lets a generation-checked path fail closed.
+        let raw = raw.into_bound_owner().expect_err("not bound");
+        assert_eq!(raw.len(), 64);
+        host_free(raw);
+    }
+
+    #[test]
+    #[should_panic(expected = "would bypass binding-identity")]
+    fn into_raw_refuses_to_strip_bound_ownership() {
+        let binding = host_binding();
+        let owner = binding.allocate_owning(128, 16).expect("owning allocation");
+        let buffer = DeviceBuffer::from_owning_allocation(owner, DeviceId::cpu());
+        // Handing out the address alone would let a caller free it without
+        // matching the binding identity or the allocation generation.
+        let _ = buffer.into_raw();
+    }
+
+    #[test]
+    fn into_raw_with_owner_is_the_explicit_escape_hatch() {
+        let binding = host_binding();
+        let owner = binding.allocate_owning(128, 16).expect("owning allocation");
+        let expected = owner.as_ptr().as_ptr() as usize;
+        let buffer = DeviceBuffer::from_owning_allocation(owner, DeviceId::cpu());
+        let (ptr, owner) = buffer.into_raw_with_owner();
+        assert_eq!(ptr as usize, expected);
+        let owner = owner.expect("the release obligation travels with the pointer");
+        assert!(owner.release_now().expect("release").is_complete());
+
+        // A raw-owning buffer keeps the historical contract: no owner, and the
+        // caller still owes the free.
+        let raw = host_alloc(32, 8);
+        let (ptr, owner) = raw.into_raw_with_owner();
+        assert!(owner.is_none());
+        // SAFETY: reconstruct the exact `Box<[u8]>` leaked in `host_alloc`.
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                ptr as *mut u8,
+                32,
+            )));
+        }
+    }
+
+    #[test]
+    fn dropping_a_bound_buffer_quarantines_instead_of_freeing() {
+        let binding = host_binding();
+        let owner = binding.allocate_owning(64, 16).expect("owning allocation");
+        let buffer = DeviceBuffer::from_owning_allocation(owner, DeviceId::cpu());
+        drop(buffer);
+        let quarantined = binding.quarantined().expect("quarantine list");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "a dropped bound buffer stays accounted for instead of being freed"
+        );
+        assert_eq!(quarantined[0].retained_bytes, 64);
     }
 
     #[test]

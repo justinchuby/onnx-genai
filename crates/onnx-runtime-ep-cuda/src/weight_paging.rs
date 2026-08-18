@@ -29,8 +29,11 @@ use onnx_runtime_ep_api::{
     WeightHandleError,
 };
 use onnx_runtime_ir::DataType;
-use onnx_runtime_memory_governor::{Tier, VirtualBacking};
+use onnx_runtime_memory_governor::{AllocationReleaseState, Tier, VirtualBacking};
 
+use crate::deferred_release::{
+    CudaDeferredReleaseQueue, DeferredActionOutcome, DeferredReleaseAction, RetainedOwnership,
+};
 use crate::pinned_pool::PinnedStagingPool;
 use crate::runtime::{CopyCompleted, CudaRuntime, PinnedStaging, raw_ptr};
 
@@ -39,6 +42,10 @@ use crate::runtime::{CopyCompleted, CudaRuntime, PinnedStaging, raw_ptr};
 /// the reserved VA start; 256 B matches the value used for the pre-#716
 /// throwaway carves so slot addresses stay comparably aligned.
 const WEIGHT_SLOT_ALIGN: usize = 256;
+/// Admission sometimes needs the bytes from an eviction before it can proceed.
+/// Wait only for the queue's recorded compute/copy fences, and keep the wait
+/// bounded so a stalled device becomes an explicit error rather than a hang.
+const DEFERRED_RELEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Process-global weight-offload activity counters. These may be reset between
 /// benchmark measurement windows while caches remain alive.
@@ -69,8 +76,12 @@ static GLOBAL_MATERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
 // CUDA-event elapsed time for H2D DMA: start event before cuMemcpyHtoDAsync,
 // end event after it, then host-block on the end event to read elapsed time.
 static GLOBAL_HTOD_NS: AtomicU64 = AtomicU64::new(0);
-// Host-blocking compute-stream synchronize taken before evicting pages whose
-// VRAM might still be referenced by earlier kernels.
+// Time spent ordering evictions. This used to be a host-blocking synchronize of
+// the compute and copy streams, taken before evicting pages whose VRAM might
+// still be referenced by earlier kernels. Eviction now hands each page's release
+// to the deferred queue, which fences it behind completion events on both
+// streams instead — so this counts the enqueue, and a large value here no longer
+// means the host was blocked waiting for the device.
 static GLOBAL_ADMIT_SYNC_NS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_STAGING_FILL_BYTES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_STAGING_FILL_REGIONS: AtomicU64 = AtomicU64::new(0);
@@ -163,6 +174,9 @@ pub struct GlobalOffloadStats {
     pub bypassed_page_in_bytes: u64,
     pub materialize_ns: u64,
     pub htod_ns: u64,
+    /// Time spent ordering evictions before admitting a page. Since the deferred
+    /// release queue took ownership of page release, this is enqueue time rather
+    /// than a host-blocking stream drain.
     pub admit_sync_ns: u64,
     pub staging_fill_bytes: u64,
     pub staging_fill_regions: u64,
@@ -1288,6 +1302,10 @@ pub struct CudaResidencyStats {
 /// for a consuming kernel's `TensorView`.
 pub struct CudaWeightPage {
     runtime: Arc<CudaRuntime>,
+    /// The context-owned queue that performs this page's final release after
+    /// both stream tails. `None` only for pages built by a direct-upload caller
+    /// that owns its own ordering (the pre-Phase-4 compatibility path).
+    queue: Option<Arc<CudaDeferredReleaseQueue>>,
     allocation: WeightAllocation,
     ptr: CUdeviceptr,
     len: usize,
@@ -1316,7 +1334,77 @@ enum WeightAllocation {
         /// throwaway VA, freed outright on Drop — it is never baked into a
         /// captured graph, so no stable address is required.
         stable_slot: bool,
+        /// Release state of the stable slot this page occupies, when it has
+        /// one. The slot is marked pending while its deferred decommit is in
+        /// flight and is only reusable again once that decommit terminally
+        /// completes; a decommit that quarantines poisons the slot instead.
+        slot_state: Option<Arc<SlotReleaseState>>,
     },
+}
+
+/// Whether a stable weight slot may be mapped again.
+///
+/// A slot's virtual address is baked into captured graphs, so remapping it
+/// while its previous physical decommit is still in flight would let a page-in
+/// race a release over one address. The slot therefore carries explicit state:
+/// page-in fails closed unless the slot is idle.
+#[derive(Debug, Default)]
+pub(crate) struct SlotReleaseState {
+    state: std::sync::atomic::AtomicU8,
+}
+
+/// What a stable slot is currently doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotStatus {
+    /// No release is in flight; the slot may be mapped again.
+    Idle,
+    /// A deferred decommit of this slot has not terminally completed.
+    Pending,
+    /// A decommit of this slot did not complete; its physical ownership is
+    /// retained and the address must never be mapped again.
+    Poisoned,
+}
+
+impl SlotReleaseState {
+    const IDLE: u8 = 0;
+    const PENDING: u8 = 1;
+    const POISONED: u8 = 2;
+
+    pub(crate) fn status(&self) -> SlotStatus {
+        match self.state.load(Ordering::Acquire) {
+            Self::PENDING => SlotStatus::Pending,
+            Self::POISONED => SlotStatus::Poisoned,
+            _ => SlotStatus::Idle,
+        }
+    }
+
+    /// Claim the slot for a deferred release. Returns `false` when a release is
+    /// already in flight or the slot is poisoned.
+    fn begin_release(&self) -> bool {
+        self.state
+            .compare_exchange(
+                Self::IDLE,
+                Self::PENDING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// The deferred release completed; the address may be mapped again.
+    fn finish_release(&self) {
+        let _ = self.state.compare_exchange(
+            Self::PENDING,
+            Self::IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// The release did not complete. The slot is never reusable.
+    fn poison(&self) {
+        self.state.store(Self::POISONED, Ordering::Release);
+    }
 }
 
 /// A reserved-once virtual address slot backing a paged weight `key` (issue
@@ -1324,85 +1412,498 @@ enum WeightAllocation {
 /// on eviction, but the `va` itself persists for the residency's lifetime so a
 /// captured graph that baked this pointer keeps reading the current physical
 /// mapping across repeated page-ins.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct StableWeightSlot {
     va: CUdeviceptr,
     len: usize,
+    /// Shared with every page that occupies this slot, so a page-in can see
+    /// that the previous page's decommit has not finished.
+    state: Arc<SlotReleaseState>,
+}
+
+/// A weight page's device memory, released after both stream tails.
+///
+/// The action owns everything the release needs — runtime, allocator,
+/// allowance, and the slot state — so the queue can hold it across provider
+/// teardown. Nothing here waits: ordering is the queue's recorded events.
+#[derive(Debug)]
+enum WeightReleaseAction {
+    /// A raw `CudaRuntime::alloc_raw` page.
+    Runtime {
+        runtime: Arc<CudaRuntime>,
+        ptr: CUdeviceptr,
+        len: usize,
+    },
+    /// A transient VMM page on its own throwaway virtual address.
+    VmmSpan {
+        allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
+        allowance: onnx_runtime_memory_governor::MappedAllowance,
+        ptr: CUdeviceptr,
+        len: usize,
+    },
+    /// A persistent stable-VA slot: the physical granules are decommitted and
+    /// the address is kept for the captured graph that baked it.
+    VmmSlot {
+        allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
+        allowance: onnx_runtime_memory_governor::MappedAllowance,
+        ptr: CUdeviceptr,
+        len: usize,
+        slot_state: Option<Arc<SlotReleaseState>>,
+    },
+    /// A duplicate or already-poisoned stable-slot release. Nothing may touch
+    /// the address again, so retain the exact allocator/allowance/slot state.
+    RetainedVmmSlot {
+        allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
+        allowance: onnx_runtime_memory_governor::MappedAllowance,
+        ptr: CUdeviceptr,
+        len: usize,
+        slot_state: Option<Arc<SlotReleaseState>>,
+    },
+}
+
+impl WeightReleaseAction {
+    fn bytes(&self) -> u64 {
+        match self {
+            Self::Runtime { len, .. }
+            | Self::VmmSpan { len, .. }
+            | Self::VmmSlot { len, .. }
+            | Self::RetainedVmmSlot { len, .. } => *len as u64,
+        }
+    }
+
+    fn poison_slot(&self) {
+        match self {
+            Self::VmmSlot {
+                slot_state: Some(state),
+                ..
+            }
+            | Self::RetainedVmmSlot {
+                slot_state: Some(state),
+                ..
+            } => state.poison(),
+            _ => {}
+        }
+    }
+
+    /// Refund the weight allowance and the global mapped counter by the bytes a
+    /// release **actually** unmapped.
+    fn refund(allowance: &onnx_runtime_memory_governor::MappedAllowance, unmapped: u64) {
+        if unmapped == 0 {
+            return;
+        }
+        allowance.unmap(unmapped);
+        let _ = GLOBAL_WEIGHT_MAPPED_BYTES.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(unmapped)),
+        );
+    }
+
+    fn run(self) -> DeferredActionOutcome {
+        let free_start = std::time::Instant::now();
+        let outcome = self.run_inner();
+        add_duration(&GLOBAL_VRAM_FREE_NS, free_start.elapsed());
+        outcome
+    }
+
+    fn run_inner(self) -> DeferredActionOutcome {
+        match self {
+            Self::Runtime { runtime, ptr, len } => {
+                // SAFETY: `ptr` came from this runtime's `alloc_raw` for this
+                // page and is freed exactly once, here, after the fences the
+                // queue recorded have completed.
+                match unsafe { runtime.free_raw(ptr) } {
+                    Ok(()) => DeferredActionOutcome::released(0),
+                    Err(error) => {
+                        let detail =
+                            format!("cuMemFree of a {len} byte weight page failed: {error}");
+                        DeferredActionOutcome::quarantined(
+                            AllocationReleaseState::Quarantined,
+                            0,
+                            detail.clone(),
+                            Some(RetainedOwnership {
+                                bytes: len as u64,
+                                detail,
+                                keep_alive: Box::new((runtime, ptr, len)),
+                            }),
+                        )
+                    }
+                }
+            }
+            Self::VmmSpan {
+                allocator,
+                allowance,
+                ptr,
+                len,
+            } => {
+                let Some(ptr) = NonNull::new(ptr as *mut u8) else {
+                    return DeferredActionOutcome::released(0);
+                };
+                // SAFETY: the span was allocated by this arena for this page and
+                // is released exactly once.
+                let outcome = unsafe {
+                    onnx_runtime_memory_governor::DeviceAllocator::release(
+                        allocator.as_ref(),
+                        ptr,
+                        len,
+                        WEIGHT_SLOT_ALIGN,
+                    )
+                };
+                match outcome {
+                    onnx_runtime_memory_governor::AllocationReleaseOutcome::Complete {
+                        accounting,
+                    } => {
+                        Self::refund(&allowance, accounting.unmapped_bytes);
+                        DeferredActionOutcome::released(accounting.unmapped_bytes)
+                    }
+                    onnx_runtime_memory_governor::AllocationReleaseOutcome::Quarantined {
+                        accounting,
+                        residual,
+                    } => {
+                        // Refund only what really became unmapped; the residual
+                        // stays charged and its allocator stays pinned.
+                        Self::refund(&allowance, accounting.unmapped_bytes);
+                        DeferredActionOutcome::quarantined(
+                            residual.state,
+                            accounting.unmapped_bytes,
+                            format!(
+                                "{} ({} byte(s) retained at {:#x})",
+                                residual.reason, residual.retained_bytes, residual.address
+                            ),
+                            Some(RetainedOwnership {
+                                bytes: residual.retained_bytes,
+                                detail: String::from("transient VMM weight page"),
+                                keep_alive: Box::new((allocator, allowance)),
+                            }),
+                        )
+                    }
+                    onnx_runtime_memory_governor::AllocationReleaseOutcome::Failed { failure } => {
+                        DeferredActionOutcome::quarantined(
+                            AllocationReleaseState::Quarantined,
+                            0,
+                            failure.to_string(),
+                            Some(RetainedOwnership {
+                                bytes: len as u64,
+                                detail: String::from("transient VMM weight page"),
+                                keep_alive: Box::new((allocator, allowance)),
+                            }),
+                        )
+                    }
+                }
+            }
+            Self::VmmSlot {
+                allocator,
+                allowance,
+                ptr,
+                len,
+                slot_state,
+            } => {
+                let Some(ptr) = NonNull::new(ptr as *mut u8) else {
+                    if let Some(state) = slot_state.as_ref() {
+                        state.finish_release();
+                    }
+                    return DeferredActionOutcome::released(0);
+                };
+                let outcome = allocator.decommit_allocation_range_outcome(ptr, len, 0, len);
+                match outcome {
+                    Ok(crate::vmm_allocator::DecommitOutcome::Complete { accounting }) => {
+                        Self::refund(&allowance, accounting.unmapped_bytes);
+                        // Only a terminally complete decommit reopens the slot.
+                        if let Some(state) = slot_state.as_ref() {
+                            state.finish_release();
+                        }
+                        if accounting.quarantined_owned_bytes == 0 {
+                            DeferredActionOutcome::released(accounting.unmapped_bytes)
+                        } else {
+                            DeferredActionOutcome::quarantined(
+                                AllocationReleaseState::Quarantined,
+                                accounting.unmapped_bytes,
+                                format!(
+                                    "stable-slot decommit unmapped successfully but retained {} \
+                                     byte(s) of quarantined physical handles",
+                                    accounting.quarantined_owned_bytes
+                                ),
+                                Some(RetainedOwnership {
+                                    bytes: accounting.quarantined_owned_bytes,
+                                    detail: String::from(
+                                        "stable-VA weight-slot physical-handle quarantine",
+                                    ),
+                                    keep_alive: Box::new((allocator, allowance)),
+                                }),
+                            )
+                        }
+                    }
+                    Ok(crate::vmm_allocator::DecommitOutcome::RolledBack { reason }) => {
+                        // Nothing was unmapped and nothing is refunded: the
+                        // mapping is exactly as it was, so the slot keeps its
+                        // physical bytes and must not be paged in over.
+                        if let Some(state) = slot_state.as_ref() {
+                            state.poison();
+                        }
+                        DeferredActionOutcome::quarantined(
+                            AllocationReleaseState::Quarantined,
+                            0,
+                            format!("stable-slot decommit rolled back: {reason}"),
+                            Some(RetainedOwnership {
+                                bytes: len as u64,
+                                detail: String::from("stable-VA weight slot"),
+                                keep_alive: Box::new((allocator, allowance)),
+                            }),
+                        )
+                    }
+                    Ok(crate::vmm_allocator::DecommitOutcome::Quarantined {
+                        accounting,
+                        residual,
+                        reason,
+                    }) => {
+                        Self::refund(&allowance, accounting.unmapped_bytes);
+                        if let Some(state) = slot_state.as_ref() {
+                            state.poison();
+                        }
+                        DeferredActionOutcome::quarantined(
+                            residual.state,
+                            accounting.unmapped_bytes,
+                            format!(
+                                "stable-slot decommit quarantined: {reason} ({} byte(s) retained \
+                                 at {:#x})",
+                                residual.retained_bytes, residual.address
+                            ),
+                            Some(RetainedOwnership {
+                                bytes: residual.retained_bytes,
+                                detail: String::from("stable-VA weight slot"),
+                                keep_alive: Box::new((allocator, allowance)),
+                            }),
+                        )
+                    }
+                    Err(error) => {
+                        if let Some(state) = slot_state.as_ref() {
+                            state.poison();
+                        }
+                        DeferredActionOutcome::quarantined(
+                            AllocationReleaseState::Quarantined,
+                            0,
+                            format!("stable-slot decommit refused: {error}"),
+                            Some(RetainedOwnership {
+                                bytes: len as u64,
+                                detail: String::from("stable-VA weight slot"),
+                                keep_alive: Box::new((allocator, allowance)),
+                            }),
+                        )
+                    }
+                }
+            }
+            Self::RetainedVmmSlot {
+                allocator,
+                allowance,
+                ptr,
+                len,
+                slot_state,
+            } => DeferredActionOutcome::quarantined(
+                AllocationReleaseState::Quarantined,
+                0,
+                format!("stable weight slot at {ptr:#x} already had a pending or poisoned release"),
+                Some(RetainedOwnership {
+                    bytes: len as u64,
+                    detail: String::from("duplicate stable-VA weight-slot release"),
+                    keep_alive: Box::new((allocator, allowance, slot_state)),
+                }),
+            ),
+        }
+    }
+}
+
+/// The queue-side wrapper for one weight page release.
+#[derive(Debug)]
+struct WeightPageRelease {
+    /// `None` only after `execute` consumed it.
+    action: Option<WeightReleaseAction>,
+}
+
+impl DeferredReleaseAction for WeightPageRelease {
+    fn execute(mut self: Box<Self>) -> DeferredActionOutcome {
+        let Some(action) = self.action.take() else {
+            return DeferredActionOutcome::quarantined(
+                AllocationReleaseState::Quarantined,
+                0,
+                "a weight page release ran without its action",
+                None,
+            );
+        };
+        action.run()
+    }
+
+    fn label(&self) -> &'static str {
+        "weight page"
+    }
+
+    fn bytes(&self) -> u64 {
+        self.action.as_ref().map_or(0, WeightReleaseAction::bytes)
+    }
+}
+
+impl Drop for WeightPageRelease {
+    /// An abandoned release retains everything: the allocator, the allowance,
+    /// the address, and the slot state stay owned, and the slot stays pending
+    /// so nothing pages in over it.
+    fn drop(&mut self) {
+        if let Some(action) = self.action.take() {
+            eprintln!(
+                "cuda_ep: WARNING: a deferred weight page release of {} byte(s) was abandoned; \
+                 its device memory is retained rather than freed",
+                action.bytes()
+            );
+            action.poison_slot();
+            std::mem::forget(action);
+        }
+    }
 }
 
 impl CudaWeightPage {
-    fn release_allocation(&mut self, synchronize_streams: bool) {
+    /// Install the context-owned deferred release queue.
+    ///
+    /// Pages built by the residency and the pager always carry one, so their
+    /// `Drop` hands the release to the queue instead of draining both streams.
+    pub fn with_deferred_release_queue(mut self, queue: Arc<CudaDeferredReleaseQueue>) -> Self {
+        self.queue = Some(queue);
+        self
+    }
+
+    /// Turn this page's allocation into a deferred release action.
+    fn take_release_action(&mut self) -> Option<WeightReleaseAction> {
         let allocation = std::mem::replace(&mut self.allocation, WeightAllocation::Retired);
         match allocation {
-            WeightAllocation::Runtime => {
-                let _ = unsafe { self.runtime.free_raw(self.ptr) };
-            }
-            WeightAllocation::Retired => {}
+            WeightAllocation::Retired => None,
             WeightAllocation::HostMapped => {
                 // The device pointer aliases host-mapped memory owned and
                 // unregistered by the residency's `HostMapRegistry`. Nothing to
                 // free here; never assert (reachable from Drop).
+                None
             }
+            WeightAllocation::Runtime => Some(WeightReleaseAction::Runtime {
+                runtime: Arc::clone(&self.runtime),
+                ptr: self.ptr,
+                len: self.len,
+            }),
             WeightAllocation::Vmm {
                 allocator,
                 allowance,
                 stable_slot,
+                slot_state,
             } => {
-                // VMM unmap does not wait for users of the VA. Normal Drop
-                // drains both streams; the eviction batch may do that once
-                // up front and retire several pages without repeating it.
-                if synchronize_streams
-                    && (self.runtime.synchronize().is_err()
-                        || self.runtime.copy_stream().synchronize().is_err())
-                {
-                    self.allocation = WeightAllocation::Vmm {
+                if stable_slot {
+                    // Claim the slot before the release is queued, so a page-in
+                    // between here and terminal completion fails closed instead
+                    // of remapping an address whose decommit is in flight.
+                    if let Some(state) = slot_state.as_ref()
+                        && !state.begin_release()
+                    {
+                        eprintln!(
+                            "cuda_ep: WARNING: a stable weight slot at {:#x} already has an \
+                             unfinished release; retaining this page's physical granules rather \
+                             than decommitting them twice",
+                            self.ptr
+                        );
+                        return Some(WeightReleaseAction::RetainedVmmSlot {
+                            allocator,
+                            allowance,
+                            ptr: self.ptr,
+                            len: self.len,
+                            slot_state,
+                        });
+                    }
+                    Some(WeightReleaseAction::VmmSlot {
                         allocator,
                         allowance,
-                        stable_slot,
-                    };
-                    return;
-                }
-                if let Some(ptr) = NonNull::new(self.ptr as *mut u8) {
-                    // Stable slots retain VA for graph-baked pointers. Never
-                    // assert here: this remains reachable from Drop.
-                    let unmapped = if stable_slot {
-                        allocator
-                            .decommit_allocation_range(
-                                ptr,
-                                self.len,
-                                WEIGHT_SLOT_ALIGN,
-                                0,
-                                self.len,
-                            )
-                            .unwrap_or(0)
-                    } else {
-                        allocator.deallocate_span(ptr)
-                    };
-                    allowance.unmap(unmapped);
-                    let _ = GLOBAL_WEIGHT_MAPPED_BYTES.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |current| Some(current.saturating_sub(unmapped)),
-                    );
+                        ptr: self.ptr,
+                        len: self.len,
+                        slot_state,
+                    })
+                } else {
+                    Some(WeightReleaseAction::VmmSpan {
+                        allocator,
+                        allowance,
+                        ptr: self.ptr,
+                        len: self.len,
+                    })
                 }
             }
         }
     }
 
+    /// Hand this page's device memory to the deferred queue.
+    ///
+    /// Never synchronizes a stream and never waits: the queue orders the
+    /// release after completion events recorded on both the compute and copy
+    /// streams. If no queue is installed (the direct-upload compatibility path)
+    /// the release runs inline, exactly as it did before the queue existed.
+    fn release_allocation(&mut self) {
+        let Some(action) = self.take_release_action() else {
+            return;
+        };
+        let Some(queue) = self.queue.clone() else {
+            // A raw CUDA page has no immediate-safe release path. Without the
+            // provider/context queue there is no stream-ordering proof, so retain
+            // the exact action rather than freeing memory that may still be in use.
+            eprintln!(
+                "cuda_ep: WARNING: retaining a {} byte weight page because no deferred-release \
+                 queue is installed",
+                action.bytes()
+            );
+            action.poison_slot();
+            std::mem::forget(action);
+            return;
+        };
+        let bytes = action.bytes();
+        if let Err(refused) = queue.enqueue(WeightPageRelease {
+            action: Some(action),
+        }) {
+            eprintln!(
+                "cuda_ep: WARNING: the deferred release queue refused a {bytes} byte weight page \
+                 release ({}); its device memory is retained rather than freed before in-flight \
+                 work has finished",
+                refused.rejection.name()
+            );
+            // Dropping the refused action retains everything it owns.
+        }
+    }
+
     fn retire_after_stream_sync(&mut self) {
-        let free_start = std::time::Instant::now();
-        self.release_allocation(false);
-        add_duration(&GLOBAL_VRAM_FREE_NS, free_start.elapsed());
+        self.release_allocation();
     }
 
     /// Allocate a VRAM page and copy `bytes` host→device into it. The bytes are
     /// the canonical (compressed) backing of the tensor, so the page is
-    /// byte-identical to a resident upload. Frees the allocation on copy failure.
+    /// byte-identical to a resident upload.
+    ///
+    /// Provider paths use `upload_queued`, which installs release ordering before
+    /// the copy starts so a copy failure is still deferred safely. This legacy
+    /// entry point has no queue and therefore retains rather than prematurely
+    /// freeing on failure.
     pub fn upload(
         runtime: &Arc<CudaRuntime>,
         dtype: DataType,
         shape: Vec<usize>,
         bytes: &[u8],
+    ) -> Result<Self, WeightHandleError> {
+        Self::upload_inner(runtime, dtype, shape, bytes, None)
+    }
+
+    pub(crate) fn upload_queued(
+        runtime: &Arc<CudaRuntime>,
+        dtype: DataType,
+        shape: Vec<usize>,
+        bytes: &[u8],
+        queue: Arc<CudaDeferredReleaseQueue>,
+    ) -> Result<Self, WeightHandleError> {
+        Self::upload_inner(runtime, dtype, shape, bytes, Some(queue))
+    }
+
+    fn upload_inner(
+        runtime: &Arc<CudaRuntime>,
+        dtype: DataType,
+        shape: Vec<usize>,
+        bytes: &[u8],
+        queue: Option<Arc<CudaDeferredReleaseQueue>>,
     ) -> Result<Self, WeightHandleError> {
         if bytes.is_empty() {
             return Err(WeightHandleError::MissingRegions);
@@ -1414,14 +1915,15 @@ impl CudaWeightPage {
         add_duration(&GLOBAL_VRAM_ALLOC_NS, alloc_start.elapsed());
         let page = Self {
             runtime: Arc::clone(runtime),
+            queue,
             allocation: WeightAllocation::Runtime,
             ptr,
             len: bytes.len(),
             dtype,
             shape,
         };
-        // SAFETY: `ptr` owns `bytes.len()` bytes; `page`'s Drop frees it if the
-        // copy below fails.
+        // SAFETY: `ptr` owns `bytes.len()` bytes. The queued constructor installs
+        // its release queue before this copy can fail.
         let copy_start = std::time::Instant::now();
         unsafe { runtime.htod(bytes, ptr) }
             .map_err(|error| WeightHandleError::DeviceBinding(format!("H2D copy: {error}")))?;
@@ -1436,13 +1938,37 @@ impl CudaWeightPage {
     /// caller MUST order the consuming compute work after (via
     /// [`CudaRuntime::compute_wait_fence`]). Because the copy is asynchronous,
     /// the source bytes are first staged into a caller-owned page-locked buffer
-    /// that MUST outlive the returned fence. Frees the VRAM on any failure.
+    /// that MUST outlive the returned fence. Provider/test paths use the queued
+    /// variant so every failure retains the same stream-ordering contract.
     pub fn upload_async(
         runtime: &Arc<CudaRuntime>,
         dtype: DataType,
         shape: Vec<usize>,
         bytes: &[u8],
+        staging: PinnedStaging,
+    ) -> Result<(Self, u64, PinnedStaging), WeightHandleError> {
+        Self::upload_async_inner(runtime, dtype, shape, bytes, staging, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn upload_async_queued(
+        runtime: &Arc<CudaRuntime>,
+        dtype: DataType,
+        shape: Vec<usize>,
+        bytes: &[u8],
+        staging: PinnedStaging,
+        queue: Arc<CudaDeferredReleaseQueue>,
+    ) -> Result<(Self, u64, PinnedStaging), WeightHandleError> {
+        Self::upload_async_inner(runtime, dtype, shape, bytes, staging, Some(queue))
+    }
+
+    fn upload_async_inner(
+        runtime: &Arc<CudaRuntime>,
+        dtype: DataType,
+        shape: Vec<usize>,
+        bytes: &[u8],
         mut staging: PinnedStaging,
+        queue: Option<Arc<CudaDeferredReleaseQueue>>,
     ) -> Result<(Self, u64, PinnedStaging), WeightHandleError> {
         if bytes.is_empty() {
             return Err(WeightHandleError::MissingRegions);
@@ -1460,12 +1986,13 @@ impl CudaWeightPage {
             .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
         add_duration(&GLOBAL_VRAM_ALLOC_NS, alloc_start.elapsed());
         staging.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-        // Own the VRAM `ptr` before enqueuing the copy, so any error below drops
-        // `page` and frees it exactly once. The pinned staging remains owned by
-        // this function and is returned to the caller on success so it can keep
-        // the source alive until the fence completes.
+        // Own the VRAM `ptr` before enqueuing the copy. When a queue was supplied,
+        // any error below drops `page` into deferred release. The pinned staging
+        // remains owned by this function and is returned on success so it can
+        // keep the source alive until the fence completes.
         let page = Self {
             runtime: Arc::clone(runtime),
+            queue,
             allocation: WeightAllocation::Runtime,
             ptr,
             len: bytes.len(),
@@ -1499,6 +2026,28 @@ impl CudaWeightPage {
         len: usize,
         staging: PinnedStaging,
     ) -> Result<(Self, u64, PinnedStaging, CopyCompleted), WeightHandleError> {
+        Self::upload_staged_async_inner(runtime, dtype, shape, len, staging, None)
+    }
+
+    pub(crate) fn upload_staged_async_queued(
+        runtime: &Arc<CudaRuntime>,
+        dtype: DataType,
+        shape: Vec<usize>,
+        len: usize,
+        staging: PinnedStaging,
+        queue: Arc<CudaDeferredReleaseQueue>,
+    ) -> Result<(Self, u64, PinnedStaging, CopyCompleted), WeightHandleError> {
+        Self::upload_staged_async_inner(runtime, dtype, shape, len, staging, Some(queue))
+    }
+
+    fn upload_staged_async_inner(
+        runtime: &Arc<CudaRuntime>,
+        dtype: DataType,
+        shape: Vec<usize>,
+        len: usize,
+        staging: PinnedStaging,
+        queue: Option<Arc<CudaDeferredReleaseQueue>>,
+    ) -> Result<(Self, u64, PinnedStaging, CopyCompleted), WeightHandleError> {
         if len == 0 {
             return Err(WeightHandleError::MissingRegions);
         }
@@ -1516,6 +2065,7 @@ impl CudaWeightPage {
         add_duration(&GLOBAL_VRAM_ALLOC_NS, alloc_start.elapsed());
         let page = Self {
             runtime: Arc::clone(runtime),
+            queue,
             allocation: WeightAllocation::Runtime,
             ptr,
             len,
@@ -1608,12 +2158,15 @@ impl std::fmt::Debug for CudaWeightPage {
 }
 
 impl Drop for CudaWeightPage {
+    /// Hand the page's device memory to the deferred release queue.
+    ///
+    /// This used to drain the compute and copy streams here, in `Drop`, so that
+    /// a VMM unmap could not race a kernel still reading the page. It now
+    /// enqueues instead: the queue records a completion event on each stream and
+    /// performs the release once both have completed, so the eviction that
+    /// dropped this page returns immediately.
     fn drop(&mut self) {
-        // SAFETY: `ptr` came from this runtime's `alloc_raw` in `bind_block_quantized_moe`
-        // and is freed exactly once here; no alias to it escapes `CudaWeightPage`.
-        let free_start = std::time::Instant::now();
-        self.release_allocation(true);
-        add_duration(&GLOBAL_VRAM_FREE_NS, free_start.elapsed());
+        self.release_allocation();
     }
 }
 
@@ -1623,12 +2176,24 @@ impl Drop for CudaWeightPage {
 /// is byte-identical to the resident tensor a stock EP would upload.
 pub struct CudaWeightPager<'a, S: MmapRegionSource + ?Sized> {
     runtime: Arc<CudaRuntime>,
+    /// Deferred release queue handed to every page this pager builds.
+    queue: Option<Arc<CudaDeferredReleaseQueue>>,
     source: &'a S,
 }
 
 impl<'a, S: MmapRegionSource + ?Sized> CudaWeightPager<'a, S> {
     pub fn new(runtime: Arc<CudaRuntime>, source: &'a S) -> Self {
-        Self { runtime, source }
+        Self {
+            runtime,
+            queue: None,
+            source,
+        }
+    }
+
+    /// Give the pages this pager builds the provider's deferred release queue.
+    pub fn with_deferred_release_queue(mut self, queue: Arc<CudaDeferredReleaseQueue>) -> Self {
+        self.queue = Some(queue);
+        self
     }
 }
 
@@ -1653,6 +2218,7 @@ impl<S: MmapRegionSource + ?Sized> LazyDeviceWeightBinder for CudaWeightPager<'_
             .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
         let page = CudaWeightPage {
             runtime: Arc::clone(&self.runtime),
+            queue: self.queue.clone(),
             allocation: WeightAllocation::Runtime,
             ptr,
             len: total,
@@ -1862,6 +2428,10 @@ impl VmmAdmit {
 /// and reported non-blocking stream-wait enqueue time as copy waiting.
 pub struct CudaWeightResidency {
     runtime: Arc<CudaRuntime>,
+    /// The provider/context-owned queue every page's final release goes to.
+    /// `None` until a provider installs one, in which case pages fall back to
+    /// the inline compatibility release.
+    queue: Option<Arc<CudaDeferredReleaseQueue>>,
     scan_resistant_dense: bool,
     /// Byte-aware admission (#837 item 3): keep the largest tensors resident by
     /// evicting the smallest evictable resident to admit a strictly-larger
@@ -2194,6 +2764,7 @@ impl CudaWeightResidency {
         replace_global_budget(0, budget_bytes);
         Self {
             runtime: Arc::clone(&runtime),
+            queue: None,
             scan_resistant_dense: false,
             byte_aware: false,
             evict_order_probe: EvictOrderProbe::Lru,
@@ -2253,6 +2824,7 @@ impl CudaWeightResidency {
         replace_global_budget(0, lease.bytes());
         Ok(Self {
             runtime: Arc::clone(&runtime),
+            queue: None,
             scan_resistant_dense: false,
             byte_aware: false,
             evict_order_probe: EvictOrderProbe::Lru,
@@ -2374,6 +2946,22 @@ impl CudaWeightResidency {
     }
 
     /// Select the asynchronous (default `true`) vs synchronous page-in path.
+    /// Install the provider/context-owned deferred release queue.
+    ///
+    /// Every page this cache hands out then releases its device memory through
+    /// that queue, after completion events recorded on both the compute and the
+    /// copy stream — so an eviction never drains a stream and a page's backing
+    /// stays alive until the release terminally completes.
+    pub fn with_deferred_release_queue(mut self, queue: Arc<CudaDeferredReleaseQueue>) -> Self {
+        self.queue = Some(queue);
+        self
+    }
+
+    /// The deferred release queue this cache hands page releases to.
+    pub fn deferred_release_queue(&self) -> Option<&Arc<CudaDeferredReleaseQueue>> {
+        self.queue.as_ref()
+    }
+
     pub fn with_async_pagein(self, async_pagein: bool) -> Self {
         let _ = async_pagein;
         self
@@ -2504,7 +3092,10 @@ impl CudaWeightResidency {
         }
         // Copy region bytes host→device before re-locking so a failed bind never
         // mutates cache accounting.
-        let pager = CudaWeightPager::new(Arc::clone(&self.runtime), source);
+        let mut pager = CudaWeightPager::new(Arc::clone(&self.runtime), source);
+        if let Some(queue) = self.queue.as_ref() {
+            pager = pager.with_deferred_release_queue(Arc::clone(queue));
+        }
         let page = Arc::new(pager.bind_block_quantized_moe(weight)?);
         self.admit(key, page, self.eviction_for(weight.boundary))
     }
@@ -2592,13 +3183,23 @@ impl CudaWeightResidency {
         // host-blocking copy, and hands it back with a `CopyCompleted` witness.
         // Return it to the pool with that witness (copy complete), then admit.
         let raw_staging = staging.into_inner();
-        let (page, _, raw_staging, completed) = CudaWeightPage::upload_staged_async(
-            &self.runtime,
-            weight.dtype,
-            weight.shape.clone(),
-            len,
-            raw_staging,
-        )?;
+        let (page, _, raw_staging, completed) = match self.queue.as_ref() {
+            Some(queue) => CudaWeightPage::upload_staged_async_queued(
+                &self.runtime,
+                weight.dtype,
+                weight.shape.clone(),
+                len,
+                raw_staging,
+                Arc::clone(queue),
+            ),
+            None => CudaWeightPage::upload_staged_async(
+                &self.runtime,
+                weight.dtype,
+                weight.shape.clone(),
+                len,
+                raw_staging,
+            ),
+        }?;
         self.staging_pool.release(raw_staging, completed);
         self.admit(key, Arc::new(page), self.eviction_for(weight.boundary))
             .map(VmmAdmit::Page)
@@ -2727,6 +3328,7 @@ impl CudaWeightResidency {
         }
         let page = Arc::new(CudaWeightPage {
             runtime: Arc::clone(&self.runtime),
+            queue: self.queue.clone(),
             allocation: WeightAllocation::HostMapped,
             ptr: device_ptr,
             len,
@@ -2837,12 +3439,22 @@ impl CudaWeightResidency {
                 )
                 .map(VmmAdmit::expect_page);
         }
-        let page = Arc::new(CudaWeightPage::upload(
-            &self.runtime,
-            resident.dtype,
-            resident.shape.clone(),
-            resident.bytes(),
-        )?);
+        let page = match self.queue.as_ref() {
+            Some(queue) => CudaWeightPage::upload_queued(
+                &self.runtime,
+                resident.dtype,
+                resident.shape.clone(),
+                resident.bytes(),
+                Arc::clone(queue),
+            ),
+            None => CudaWeightPage::upload(
+                &self.runtime,
+                resident.dtype,
+                resident.shape.clone(),
+                resident.bytes(),
+            ),
+        }?;
+        let page = Arc::new(page);
         self.admit(key, page, self.eviction_for(weight.boundary))
     }
 
@@ -2928,8 +3540,8 @@ impl CudaWeightResidency {
         // `vmm_stable_va_weight_slot_gpu`). A first-seen key gets a fresh
         // throwaway reservation; whether that becomes a persistent slot is
         // decided once admission classifies the page as retained vs bypassed.
-        let reused_slot = inner.slots.get(&key).copied();
-        let ptr = match reused_slot {
+        let reused_slot = inner.slots.get(&key).cloned();
+        let ptr = match reused_slot.as_ref() {
             Some(slot) => {
                 // A key's byte size is fixed by the weight it names; a differing
                 // length means two weights collided on one key, which would
@@ -2940,6 +3552,57 @@ impl CudaWeightResidency {
                          {len}-byte page-in requested it",
                         slot.len
                     )));
+                }
+                // Stable-VA semantics: this address may only be mapped again
+                // once the previous page's deferred decommit has *terminally*
+                // completed. Racing a page-in against a release in flight would
+                // let the release unmap granules the fill just wrote, so page-in
+                // fails closed instead.
+                match slot.state.status() {
+                    SlotStatus::Idle => {}
+                    SlotStatus::Pending => {
+                        let Some(queue) = self.queue.as_ref().cloned() else {
+                            return Err(WeightHandleError::DeviceBinding(format!(
+                                "stable weight slot for key {key} has a deferred decommit in \
+                                 flight but this residency has no release queue to settle it"
+                            )));
+                        };
+                        drop(inner);
+                        if !queue.wait_until_idle(DEFERRED_RELEASE_WAIT_TIMEOUT) {
+                            return Err(WeightHandleError::DeviceBinding(format!(
+                                "stable weight slot for key {key} did not finish its deferred \
+                                 decommit within {DEFERRED_RELEASE_WAIT_TIMEOUT:?}; the address \
+                                 remains unavailable rather than being remapped underneath it"
+                            )));
+                        }
+                        inner = self.lock();
+                        if let Some(existing) = inner.pages.get(&key).cloned() {
+                            inner.record_hit(key);
+                            return Ok(VmmAdmit::Page(existing));
+                        }
+                        match slot.state.status() {
+                            SlotStatus::Idle => {}
+                            SlotStatus::Pending => {
+                                return Err(WeightHandleError::DeviceBinding(format!(
+                                    "stable weight slot for key {key} remains pending after its \
+                                     deferred-release queue drained"
+                                )));
+                            }
+                            SlotStatus::Poisoned => {
+                                return Err(WeightHandleError::DeviceBinding(format!(
+                                    "stable weight slot for key {key} is poisoned: its previous \
+                                     decommit retained ownership"
+                                )));
+                            }
+                        }
+                    }
+                    SlotStatus::Poisoned => {
+                        return Err(WeightHandleError::DeviceBinding(format!(
+                            "stable weight slot for key {key} is poisoned: a previous decommit \
+                             did not complete and its physical ownership is retained, so this \
+                             address can never be mapped again"
+                        )));
+                    }
                 }
                 NonNull::new(slot.va as *mut u8).ok_or_else(|| {
                     WeightHandleError::DeviceBinding("stable weight slot has a null VA".into())
@@ -3022,21 +3685,30 @@ impl CudaWeightResidency {
             }
         }
         let stable_slot = reused_slot.is_some() || !bypass;
-        if stable_slot && reused_slot.is_none() {
-            inner.slots.insert(
-                key,
-                StableWeightSlot {
-                    va: ptr.as_ptr() as CUdeviceptr,
-                    len,
-                },
-            );
-        }
+        let slot_state = match reused_slot.as_ref() {
+            Some(slot) => Some(Arc::clone(&slot.state)),
+            None if stable_slot => {
+                let state = Arc::new(SlotReleaseState::default());
+                inner.slots.insert(
+                    key,
+                    StableWeightSlot {
+                        va: ptr.as_ptr() as CUdeviceptr,
+                        len,
+                        state: Arc::clone(&state),
+                    },
+                );
+                Some(state)
+            }
+            None => None,
+        };
         let page = Arc::new(CudaWeightPage {
             runtime: Arc::clone(&self.runtime),
+            queue: self.queue.clone(),
             allocation: WeightAllocation::Vmm {
                 allocator: Arc::clone(&physical.allocator),
                 allowance: allowance.clone(),
                 stable_slot,
+                slot_state,
             },
             ptr: ptr.as_ptr() as CUdeviceptr,
             len,
@@ -3110,7 +3782,7 @@ impl CudaWeightResidency {
         let max_evictions = inner.pages.len();
         let mut evictions = 0usize;
         let mut bypass = false;
-        let mut streams_drained = false;
+
         // Static hot-set pin (#837 item 3): a large-enough tensor, within the
         // pin budget and not already pinned, is retained once and never evicted
         // or re-admitted. Decided once here (independent of whether it happens
@@ -3291,18 +3963,31 @@ impl CudaWeightResidency {
                      headroom, and no page is evictable"
                 )));
             };
-            if !streams_drained {
-                let sync_start = std::time::Instant::now();
-                self.runtime.synchronize().map_err(|error| {
-                    WeightHandleError::DeviceBinding(format!("compute stream sync: {error}"))
-                })?;
-                self.runtime.copy_stream().synchronize().map_err(|error| {
-                    WeightHandleError::DeviceBinding(format!("copy stream sync: {error}"))
-                })?;
-                add_duration(&GLOBAL_ADMIT_SYNC_NS, sync_start.elapsed());
-                streams_drained = true;
-            }
+            let Some(queue) = self.queue.as_ref().cloned() else {
+                return Err(WeightHandleError::DeviceBinding(
+                    "weight residency must evict a page, but no deferred-release queue is \
+                     installed; refusing rather than leaking the page or freeing it before \
+                     in-flight CUDA work completes"
+                        .into(),
+                ));
+            };
+            // Eviction used to drain both streams here, so that the evicted
+            // page's VMM unmap could not race a kernel or a transfer still
+            // reading it. The page's release is now handed to the deferred
+            // queue, which records a completion event on each stream and only
+            // then unmaps — the same ordering, without stalling the admission
+            // that triggered the eviction. When no queue is installed the
+            // release still runs inline, exactly as it did before.
+            let evict_start = std::time::Instant::now();
             inner.remove_page_after_stream_sync(evicted_key);
+            if !queue.wait_until_idle(DEFERRED_RELEASE_WAIT_TIMEOUT) {
+                return Err(WeightHandleError::DeviceBinding(format!(
+                    "weight eviction did not settle its deferred release within \
+                     {DEFERRED_RELEASE_WAIT_TIMEOUT:?}; admission cannot claim the mapped or \
+                     physical headroom yet"
+                )));
+            }
+            add_duration(&GLOBAL_ADMIT_SYNC_NS, evict_start.elapsed());
             evictions += 1;
             let after_owned = physical
                 .allocator
@@ -3376,15 +4061,6 @@ impl CudaWeightResidency {
         }
     }
 
-    /// Drain the transfer stream so a just-uploaded page we are about to drop
-    /// cannot have an in-flight async copy still reading its (freeing) VRAM or
-    /// pinned staging. A no-op for synchronously-uploaded pages (idle copy stream).
-    fn drain_copy_stream(&self) -> Result<(), WeightHandleError> {
-        self.runtime.sync_copy_stream().map_err(|error| {
-            WeightHandleError::DeviceBinding(format!("transfer stream sync: {error}"))
-        })
-    }
-
     /// #945 staleness probe: read the current device copy at `ptr..ptr+len` back
     /// to the host and return a per-granule FNV-1a hash vector. Both streams are
     /// drained first so the read-back observes every fill and kernel enqueued for
@@ -3430,12 +4106,14 @@ impl CudaWeightResidency {
         {
             let mut inner = self.lock();
             // A concurrent caller may have populated `key` while we paged in;
-            // prefer the already-resident page and drop ours (its Drop frees the
-            // VRAM + staging — drained first so it never races an in-flight copy).
+            // prefer the already-resident page and drop ours. Dropping it is
+            // safe without draining the transfer stream: the page's release is
+            // deferred behind completion events recorded on both the compute and
+            // the copy stream, so an in-flight upload into it still finishes
+            // before its memory is released.
             if let Some(existing) = inner.pages.get(&key).cloned() {
                 inner.record_hit(key);
                 drop(inner);
-                self.drain_copy_stream()?;
                 return Ok(existing);
             }
             // Fits without eviction: nothing is freed, so no consumer drain is
@@ -3445,21 +4123,16 @@ impl CudaWeightResidency {
                 return Ok(page);
             }
         }
-        // Eviction required: drain in-flight consumers before freeing any page.
-        // Weight offload and CUDA graph capture are mutually exclusive (the decode
-        // session declines capture whenever offload is enabled), so this
-        // synchronize is never capture-illegal.
-        let sync_start = std::time::Instant::now();
-        self.runtime
-            .synchronize()
-            .map_err(|error| WeightHandleError::DeviceBinding(format!("stream sync: {error}")))?;
-        add_duration(&GLOBAL_ADMIT_SYNC_NS, sync_start.elapsed());
+        // Eviction required. This used to drain the compute stream here so an
+        // evicted page could not be freed while a consumer was still reading it;
+        // the evicted page's release is now deferred behind completion events
+        // recorded on both streams, which is the same ordering guarantee without
+        // stalling the admission.
         let mut inner = self.lock();
-        // Re-check after releasing the lock for the sync.
+        // Re-check: another thread may have admitted this key meanwhile.
         if let Some(existing) = inner.pages.get(&key).cloned() {
             inner.record_hit(key);
             drop(inner);
-            self.drain_copy_stream()?;
             return Ok(existing);
         }
         if eviction == WeightEvictionPolicy::StableResident && !inner.policy.can_fit(bytes) {
@@ -3602,11 +4275,33 @@ impl onnx_runtime_memory_governor::ReclaimableMappedHolder for CudaWeightResiden
         while before.saturating_sub(allowance.mapped_bytes()) < target_bytes
             && attempts < max_attempts
         {
+            let Some(queue) = self.queue.as_ref().cloned() else {
+                return Err(onnx_runtime_memory_governor::MemoryError::InvalidRequest {
+                    tier: Tier::Device.name(),
+                    requested: target_bytes,
+                    reason: "mapped weight reclaim requires the provider deferred-release queue",
+                });
+            };
             let Some(key) = inner.next_evictable_key(WeightEvictionPolicy::Lru) else {
                 break;
             };
             inner.remove_page(key);
             attempts += 1;
+            if !queue.wait_until_idle(DEFERRED_RELEASE_WAIT_TIMEOUT) {
+                let reclaimed = before.saturating_sub(allowance.mapped_bytes());
+                return Err(
+                    onnx_runtime_memory_governor::MemoryError::CapacityUnavailable {
+                        tier: Tier::Device.name(),
+                        requested: target_bytes,
+                        available: reclaimed,
+                        role: allowance.role(),
+                        detail: format!(
+                            "deferred weight reclaim did not settle within \
+                             {DEFERRED_RELEASE_WAIT_TIMEOUT:?}; mapped capacity remains charged"
+                        ),
+                    },
+                );
+            }
         }
         let reclaimed = before.saturating_sub(allowance.mapped_bytes());
         Ok(onnx_runtime_memory_governor::MappedReclaimReport {

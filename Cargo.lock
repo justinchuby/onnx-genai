@@ -2502,6 +2502,7 @@ dependencies = [
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ir",
+ "onnx-runtime-memory-governor",
  "onnx-runtime-ort-testkit",
 ]
 

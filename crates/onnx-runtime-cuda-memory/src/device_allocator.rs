@@ -31,12 +31,33 @@
 //! `cuMemAlloc` below cannot.
 
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use onnx_runtime_memory_governor::{DeviceAllocator, DeviceKey, MemoryError, Tier};
+use onnx_runtime_memory_governor::{
+    AllocationReleaseOutcome, AllocationReleaseState, DeviceAllocator, DeviceKey, MemoryError,
+    QuarantineReason, ReleaseAccounting, ResidualOwnership, Tier,
+};
 
 use cudarc::driver::CudaContext;
+
+/// One `cuMemAlloc` allocation this allocator could not give back.
+///
+/// The exact address, size, and context are kept so the loss is reconcilable
+/// against provider-side records rather than showing up later as VRAM that
+/// simply went missing. Nothing is ever taken out of the quarantine: an
+/// allocation whose free failed has genuinely uncertain ownership and must
+/// never be handed out again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuarantinedCudaAllocation {
+    /// Device address. Never dereferenced on the host.
+    pub address: usize,
+    pub bytes: usize,
+    pub align: usize,
+    /// CUDA device ordinal of the context the allocation belongs to.
+    pub device_ordinal: u32,
+    pub reason: String,
+}
 
 /// Device memory from `cuMemAlloc`, on one CUDA device.
 #[derive(Debug)]
@@ -61,6 +82,8 @@ pub struct CudaDeviceAllocator {
     /// the same requests (`measurement-discipline`: measure the thing, do not
     /// infer it from a missing symptom).
     cumemalloc_calls: AtomicU64,
+    /// Allocations whose release failed, retained exactly.
+    quarantine: Mutex<Vec<QuarantinedCudaAllocation>>,
 }
 
 impl CudaDeviceAllocator {
@@ -86,7 +109,59 @@ impl CudaDeviceAllocator {
             leaked_frees: AtomicU64::new(0),
             leaked_bytes: AtomicU64::new(0),
             cumemalloc_calls: AtomicU64::new(0),
+            quarantine: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Allocations this allocator retained because their release failed.
+    ///
+    /// Non-empty means VRAM is held with uncertain ownership. It is observable
+    /// here, where it happened, with the exact pointer/bytes/context metadata
+    /// needed to reconcile it — rather than being inferred from an unrelated
+    /// out-of-memory error much later.
+    pub fn quarantined(&self) -> Vec<QuarantinedCudaAllocation> {
+        self.quarantine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Record retained ownership and report it as a structured quarantine.
+    fn quarantine(
+        &self,
+        ptr: NonNull<u8>,
+        bytes: usize,
+        align: usize,
+        reason: String,
+    ) -> AllocationReleaseOutcome {
+        self.leaked_frees.fetch_add(1, Ordering::Relaxed);
+        self.leaked_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        let address = ptr.as_ptr() as usize;
+        self.quarantine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(QuarantinedCudaAllocation {
+                address,
+                bytes,
+                align,
+                device_ordinal: self.device.index,
+                reason: reason.clone(),
+            });
+        eprintln!(
+            "cuda_ep: WARNING: could not free a {bytes} byte CUDA allocation at {address:#x} on \
+             device {}: {reason}; its ownership is retained and it will never be reused",
+            self.device.index
+        );
+        AllocationReleaseOutcome::quarantined(
+            ReleaseAccounting::eager(bytes as u64),
+            ResidualOwnership {
+                state: AllocationReleaseState::Quarantined,
+                reason: QuarantineReason::PartialRelease,
+                retained_bytes: bytes as u64,
+                address,
+                align,
+            },
+        )
     }
 
     /// Successful `cuMemAlloc` calls this allocator has made since construction.
@@ -180,23 +255,46 @@ impl DeviceAllocator for CudaDeviceAllocator {
             })
     }
 
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, _align: usize) {
-        if self.bind(bytes).is_err() {
-            // Leaking beats freeing on the wrong context, which would either
-            // fail or free someone else's allocation. Recorded rather than
-            // dropped: this is VRAM that will not come back.
-            self.leaked_frees.fetch_add(1, Ordering::Relaxed);
-            self.leaked_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
-            return;
+    /// Documented migration adapter.
+    ///
+    /// It cannot report partial failure, so it delegates to
+    /// [`release`](Self::release) and discards the structured outcome; the
+    /// retained ownership is still recorded in the allocator's own quarantine
+    /// and is readable through [`CudaDeviceAllocator::quarantined`].
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+        // SAFETY: forwarded under this method's identical contract.
+        let _ = unsafe { self.release(ptr, bytes, align) };
+    }
+
+    /// Whole-allocation release with an honest terminal state.
+    ///
+    /// A failure to bind the context or a refused `cuMemFree` is **not**
+    /// reported as "nothing happened": the bytes are still owned, so the
+    /// outcome is a quarantine that keeps the exact address, size, alignment,
+    /// and context. Leaking beats freeing on the wrong context, which would
+    /// either fail or free someone else's allocation.
+    unsafe fn release(
+        &self,
+        ptr: NonNull<u8>,
+        bytes: usize,
+        align: usize,
+    ) -> AllocationReleaseOutcome {
+        if let Err(error) = self.bind(bytes) {
+            return self.quarantine(
+                ptr,
+                bytes,
+                align,
+                format!("the CUDA context could not be bound for the free: {error}"),
+            );
         }
         // SAFETY: delegated to this method's contract -- the pointer came from
         // `allocate` on this allocator and is freed once.
         let freed = unsafe {
             cudarc::driver::result::free_sync(ptr.as_ptr() as cudarc::driver::sys::CUdeviceptr)
         };
-        if freed.is_err() {
-            self.leaked_frees.fetch_add(1, Ordering::Relaxed);
-            self.leaked_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        match freed {
+            Ok(()) => AllocationReleaseOutcome::complete(ReleaseAccounting::eager(bytes as u64)),
+            Err(error) => self.quarantine(ptr, bytes, align, format!("cuMemFree refused: {error}")),
         }
     }
 
