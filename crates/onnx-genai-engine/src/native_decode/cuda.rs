@@ -1574,6 +1574,7 @@ impl NativeDecodeSession {
 
         if token_ids.len() == 1 {
             state.write_decode_inputs(token_ids[0], past_len)?;
+            state.prepare_decode_workspace_after_capacity_growth(&mut self.session, grew)?;
             if route_inline {
                 // Inc-1b PR-3: route this single-token decode step to the
                 // decode-specialized inlined-body sibling exec and drive its
@@ -1728,6 +1729,7 @@ impl NativeDecodeSession {
         let mask_expose = state.decode_mask_expose_len(total_len);
         state.extend_mask(if grew { 0 } else { past_len }, total_len, mask_expose)?;
         state.write_captured_step_inputs(supplied, position)?;
+        state.prepare_decode_workspace_after_capacity_growth(&mut self.session, grew)?;
 
         let step_profile = CudaStepProfile::begin(past_len, total_len);
         let mut step_wall = CudaStepWallBreakdown::default();
@@ -1982,6 +1984,7 @@ impl NativeDecodeSession {
             state.decode_mask_expose_len(total_len),
         )?;
         state.write_decode_inputs(token_id, past_len)?;
+        state.prepare_decode_workspace_after_capacity_growth(&mut self.session, grew)?;
         if route_inline {
             // Inc-1b PR-3: run this single-token decode step through the
             // decode-specialized inlined-body sibling exec, driving its CUDA-graph
@@ -3930,6 +3933,19 @@ impl DecodeCudaState {
         } else {
             self.max_len
         }
+    }
+
+    fn prepare_decode_workspace_after_capacity_growth(
+        &mut self,
+        session: &mut InferenceSession,
+        grew: bool,
+    ) -> anyhow::Result<()> {
+        if grew {
+            session
+                .prepare_with_device_bindings(&[], &mut self.bindings)
+                .context("prepare native CUDA decode workspace after KV capacity growth")?;
+        }
+        Ok(())
     }
 
     fn extend_mask(&mut self, start: usize, end: usize, expose_len: usize) -> anyhow::Result<()> {

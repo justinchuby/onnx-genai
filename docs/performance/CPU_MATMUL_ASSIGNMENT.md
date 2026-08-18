@@ -21,10 +21,17 @@ open gap, and closing it is the only way it stops being one.
 
 None, at assignment time. Everything supported is claimed.
 
-The bar for calling a gap *closed* is unchanged and still deliberately strict: a **>= 5% repeatable
-win beyond noise at every measured thread count**. Anything inside the noise band is not a win, and
-a win at one thread count that inverts at another is not a win either — `Sqrt` is the standing
-example, at 1.9x single-threaded and 0.30x at sixteen threads.
+There is also no longer a mechanism to express anything else: `ClaimPreference`,
+`ExecutionProvider::claim_preference{,_node}` and the `host_fallback_available`
+plumbing were deleted from `onnx-runtime-ep-api` / `onnx-runtime-ep-plugin`, so
+a future "just this one shape" deferral would have to reintroduce the machinery
+first. `supports_op` — a *capability* answer — is all that remains.
+
+The bar for calling a gap *closed* is unchanged and still deliberately strict: a
+**>= 5% repeatable win beyond noise at every measured thread count**. Anything
+inside the noise band is not a win, and a win at one thread count that inverts at
+another is not a win either — `Sqrt` is the standing example, at 1.9x
+single-threaded and 0.30x at sixteen threads.
 
 ## Method
 

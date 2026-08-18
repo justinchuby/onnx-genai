@@ -524,6 +524,8 @@ fn l1_required_symbols_resolve() {
         &b"nxrt_ep_reset_workspace_placement_queries"[..],
         &b"nxrt_ep_constant_weight_inputs"[..],
         &b"nxrt_ep_reset_constant_weight_inputs"[..],
+        &b"nxrt_ep_executed_node_count"[..],
+        &b"nxrt_ep_reset_executed_node_count"[..],
     ] {
         let _counter: libloading::Symbol<'_, unsafe extern "C" fn() -> usize> =
             unsafe { lib.get(symbol) }.unwrap_or_else(|e| {
@@ -621,6 +623,8 @@ fn l1_no_symbol_leakage() {
                 && *name != "nxrt_ep_reset_workspace_placement_queries"
                 && *name != "nxrt_ep_constant_weight_inputs"
                 && *name != "nxrt_ep_reset_constant_weight_inputs"
+                && *name != "nxrt_ep_executed_node_count"
+                && *name != "nxrt_ep_reset_executed_node_count"
                 && *name != "nxrt_ep_build_features"
                 && *name != "nxrt_ep_persistent_decode_pool_built"
                 && !name.starts_with("_Z")
