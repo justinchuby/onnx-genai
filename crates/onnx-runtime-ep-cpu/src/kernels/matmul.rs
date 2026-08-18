@@ -1699,12 +1699,19 @@ fn count_half_yielded_to_widened() {
 
 /// Number of times the current thread took the widened-`f32` SGEMM instead of
 /// the blocked half GEMM.
-#[cfg(all(test, feature = "mlas"))]
+///
+/// Gated to the same `x86_64 + mlas` as its only two consumers
+/// (`f16_prefill_yields_to_widened_sgemm_only_above_the_measured_crossover`
+/// and `f16_widened_route_matches_an_f64_oracle_across_the_crossover`): the
+/// widening gate itself keys off `CpuBackend::Mlas`, which `auto_detect` only
+/// returns on x86-64, so on aarch64 + mlas these would be dead code and the
+/// cross-arch clippy pass rejects them.
+#[cfg(all(test, target_arch = "x86_64", feature = "mlas"))]
 pub(crate) fn half_yielded_to_widened_calls() -> u64 {
     HALF_YIELDED_TO_WIDENED.with(|c| c.get())
 }
 
-#[cfg(all(test, feature = "mlas"))]
+#[cfg(all(test, target_arch = "x86_64", feature = "mlas"))]
 pub(crate) fn reset_half_yielded_to_widened_calls() {
     HALF_YIELDED_TO_WIDENED.with(|c| c.set(0));
 }
