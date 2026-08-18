@@ -32,7 +32,9 @@ pub use onnx_runtime_memory_api::allocator::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator, MappedAllocation,
     SharedDevicePrefix, SharedPrefixCommitInfo,
 };
-pub use onnx_runtime_memory_api::capability::{SharedMapping, VirtualBacking};
+pub use onnx_runtime_memory_api::capability::{
+    SharedMapping, VirtualBacking, capability_shares_mechanism,
+};
 
 #[cfg(test)]
 mod tests {

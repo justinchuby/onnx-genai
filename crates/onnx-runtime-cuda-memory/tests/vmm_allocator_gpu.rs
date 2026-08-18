@@ -20,8 +20,8 @@
 use cudarc::driver::CudaContext;
 use onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator;
 use onnx_runtime_memory_governor::{
-    DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
-    Tier, VirtualBacking,
+    AllocationCommitRange, DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor,
+    MemoryGovernor, MemoryRole, Tier, VirtualBacking,
 };
 
 const HOLDER: HolderId = HolderId::new(21);
@@ -108,6 +108,51 @@ fn an_allocation_commits_a_granule_and_the_ledger_sees_it() {
         governor.used(Tier::Device),
         0,
         "released granules must come back to the tier"
+    );
+}
+
+/// `VirtualBacking::deallocate_committed`, called through the trait object
+/// (the same capability object `allocate_committed` was reached through, per
+/// #1186 Phase 2 review findings 1 and 5), must release exactly the granule
+/// it committed and report it as unmapped — not silently report zero the way
+/// the base `DeviceAllocator::deallocate_with_unmapped` default would.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn deallocate_committed_through_the_capability_reports_the_real_unmapped_bytes() {
+    let (allocator, governor) = allocator(64 << 20, 8 << 30);
+
+    let virtual_backing = DeviceAllocator::as_virtual_backing(&allocator)
+        .expect("a VMM arena always advertises VirtualBacking");
+    let full = 0..4096usize;
+    let ptr = virtual_backing
+        .allocate_committed(4096, 256, std::slice::from_ref(&full))
+        .expect("allocate through the capability");
+
+    let (committed, _) = allocator.committed_and_reserved();
+    assert!(committed > 0, "the fully-committed range must be backed");
+    assert_eq!(governor.used(Tier::Device) as usize, committed);
+
+    // SAFETY: `ptr` came from this same capability's `allocate_committed`
+    // above and is still live; this is its single release.
+    let unmapped = unsafe { virtual_backing.deallocate_committed(ptr, 4096, 256) };
+
+    assert_eq!(
+        unmapped as usize, committed,
+        "deallocate_committed must report exactly the bytes it actually released, matching \
+         what was committed — never an ambiguous zero"
+    );
+    assert_eq!(
+        allocator.committed_and_reserved().0,
+        0,
+        "the granule must actually be released"
+    );
+    assert_eq!(
+        governor.used(Tier::Device),
+        0,
+        "the ledger must see the full refund"
     );
 }
 
@@ -806,4 +851,85 @@ fn a_refused_allocation_commits_nothing() {
         unsafe { allocator.deallocate(pointer, 1 << 20, 256) };
     }
     assert_eq!(governor.used(Tier::Device), 0);
+}
+
+/// `mapped_bytes_for_allocation_ranges` must report real, granule-rounded
+/// physical bytes for disjoint tiny ranges that each land in a *different*
+/// granule — not the sum of the requested bytes, which would badly
+/// UNDER-estimate the actual mapped footprint for a granule-rounding
+/// mechanism like this one (#1186 Phase 2 review, finding 4: the trait no
+/// longer has a byte-summing default precisely because it is unsafe for an
+/// implementation like this).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn mapped_bytes_for_disjoint_tiny_ranges_is_granule_rounded_not_a_byte_sum() {
+    let (allocator, _governor) = allocator(8 << 20, 8 << 20);
+
+    // Discover the real granule size the same way other tests here do: a
+    // small committed probe's reported committed bytes is exactly one
+    // granule.
+    let probe = allocator.allocate(4096, 256).expect("probe allocation");
+    let granularity = allocator.committed_and_reserved().0;
+    unsafe { allocator.deallocate(probe, 4096, 256) };
+    assert!(granularity >= 4096, "probe reveals a real granule");
+
+    // Reserve a span spanning (at least) two granules, entirely uncommitted.
+    let allocation_bytes = granularity * 2;
+    let ptr = allocator
+        .allocate_committed(allocation_bytes, 256, &[])
+        .expect("reserve without committing");
+
+    // Two disjoint tiny ranges, each a handful of bytes, each landing inside
+    // a *different* granule: 64 bytes at the very start of granule 0, and 32
+    // bytes just inside granule 1.
+    let ranges = [
+        AllocationCommitRange {
+            ptr,
+            allocation_bytes,
+            align: 256,
+            offset: 0,
+            bytes: 64,
+        },
+        AllocationCommitRange {
+            ptr,
+            allocation_bytes,
+            align: 256,
+            offset: granularity + 16,
+            bytes: 32,
+        },
+    ];
+    let requested_bytes: u64 = ranges.iter().map(|range| range.bytes as u64).sum();
+    assert_eq!(requested_bytes, 96, "the two ranges request 96 bytes total");
+
+    let mapped = allocator
+        .mapped_bytes_for_allocation_ranges(&ranges)
+        .expect("estimate disjoint tiny ranges");
+
+    assert_eq!(
+        mapped,
+        2 * granularity as u64,
+        "two ranges in two distinct granules must report two full granules of mapped bytes"
+    );
+    assert!(
+        mapped > requested_bytes,
+        "a granule-rounded estimate ({mapped} B) must exceed the raw requested-byte sum \
+         ({requested_bytes} B); a byte-summing default would silently under-charge admission"
+    );
+
+    // Committing the same two ranges must charge exactly what the estimate
+    // promised, so the estimate is not just non-zero but actually right.
+    allocator
+        .commit_allocation_ranges(&ranges)
+        .expect("commit the two disjoint tiny ranges");
+    let (committed, _) = allocator.committed_and_reserved();
+    assert_eq!(
+        committed as u64, mapped,
+        "actual committed bytes must equal the estimate this allocator itself reported"
+    );
+
+    // SAFETY: from this allocator, live, freed once.
+    unsafe { allocator.deallocate(ptr, allocation_bytes, 256) };
 }

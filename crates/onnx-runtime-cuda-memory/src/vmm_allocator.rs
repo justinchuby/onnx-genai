@@ -1278,16 +1278,33 @@ impl CudaVmmAllocator {
     }
 
     /// Estimate the incremental **owned** physical bytes to admit one more
-    /// sharer of `prefix` — always zero, because the prefix's granules are
-    /// already owned.
+    /// sharer of `prefix` — zero only when `prefix` genuinely belongs to
+    /// this allocator's device and pool authority, because only then are its
+    /// granules already owned here. This is the admission-facing statement
+    /// (#745): the shared bytes are charged once, so the Nth request costs
+    /// only its private continuation. It is an observation;
+    /// [`commit_shared_prefix`](Self::commit_shared_prefix) is the operation
+    /// and applies the identical device/authority check before mapping.
     ///
-    /// This is the admission-facing statement (#745): the shared bytes are
-    /// charged once, so the Nth request costs only its private continuation.
-    /// It is an observation; [`commit_shared_prefix`](Self::commit_shared_prefix)
-    /// is the operation.
+    /// A `prefix` from a different device or pool authority is never free to
+    /// admit here — `commit_shared_prefix` would reject mapping it, so
+    /// treating it as zero-cost would let admission control undercount a
+    /// mapping that can never actually happen for free. Its own reported
+    /// [`committed_physical_bytes`](SharedPrefix::committed_physical_bytes) is
+    /// returned instead, a conservative (non-zero) estimate consistent with
+    /// the trait-level [`SharedMapping::incremental_owned_bytes_for_shared_prefix`]
+    /// fallback for a foreign prefix type (#1186 Phase 2 review, finding 3).
     pub fn incremental_owned_bytes_for_shared_prefix(&self, prefix: &SharedPrefix) -> u64 {
-        let _ = prefix;
-        0
+        let same_device = prefix.device == self.device;
+        let same_authority = match (prefix.authority, self.physical_pool_authority()) {
+            (Some(prefix_authority), Some(self_authority)) => prefix_authority == self_authority,
+            _ => false,
+        };
+        if same_device && same_authority {
+            0
+        } else {
+            prefix.committed_physical_bytes()
+        }
     }
 
     /// Map `prefix` into the live allocation `ptr` at `byte_offset`,
@@ -1744,12 +1761,21 @@ impl DeviceAllocator for CudaVmmAllocator {
         Some(self)
     }
 
-    /// `Some(self)`: a VMM arena can always create and map shared physical
-    /// prefixes. See [`impl SharedMapping`] below.
+    /// `Some(self)` only when this arena actually owns a production
+    /// physical-handle pool. Sharing is defined by pool identity across
+    /// reservations (see [`impl SharedMapping`] below and
+    /// [`physical_pool_authority`](Self::physical_pool_authority)): a
+    /// `detached`/pool-less arena has no authority to share against, so
+    /// `create_shared_prefix` can never succeed for it even though it is
+    /// otherwise a perfectly ordinary VMM allocator. Advertising `Some` here
+    /// regardless would let a caller discover a capability that always fails
+    /// on first use — the exact "successful-looking no-op" this split exists
+    /// to remove, just moved from the call to the discovery (#1186 Phase 2
+    /// review).
     ///
     /// [`impl SharedMapping`]: #impl-SharedMapping-for-CudaVmmAllocator
     fn as_shared_mapping(&self) -> Option<&dyn SharedMapping> {
-        Some(self)
+        self.backing.physical_pool().is_some().then_some(self)
     }
 }
 
@@ -1836,6 +1862,24 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
         // SAFETY: `base` is non-null (cuMemAddressReserve refuses otherwise) and
         // `offset` is within the reservation, so the sum cannot be null.
         Ok(unsafe { NonNull::new_unchecked((base + offset) as *mut u8) })
+    }
+
+    /// # Safety
+    ///
+    /// Delegates to [`deallocate_span`](Self::deallocate_span), which imposes
+    /// the same requirement: `ptr` must be a still-live pointer this
+    /// allocator's `allocate`/`allocate_committed` produced. Reached only
+    /// through this capability reference — never through the base
+    /// [`DeviceAllocator::deallocate_with_unmapped`] — so the mechanism that
+    /// produced a `VirtualBacking`-obtained pointer is always the mechanism
+    /// that releases it (#1186 Phase 2 review, finding 1).
+    unsafe fn deallocate_committed(
+        &self,
+        ptr: NonNull<u8>,
+        _allocation_bytes: usize,
+        _align: usize,
+    ) -> u64 {
+        self.deallocate_span(ptr)
     }
 
     fn commit_allocation_range(

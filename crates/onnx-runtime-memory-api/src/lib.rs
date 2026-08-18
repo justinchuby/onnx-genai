@@ -47,7 +47,7 @@ pub use allocator::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator, MappedAllocation,
     SharedDevicePrefix, SharedPrefixCommitInfo,
 };
-pub use capability::{SharedMapping, VirtualBacking};
+pub use capability::{SharedMapping, VirtualBacking, capability_shares_mechanism};
 
 /// Where the bytes physically live.
 ///

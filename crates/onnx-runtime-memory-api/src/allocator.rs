@@ -207,6 +207,18 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     /// allocator with no shared physical-handle pool: it cannot produce a
     /// prefix mappable at zero incremental owned cost, so it has nothing to
     /// offer here rather than a degenerate always-fails implementation.
+    ///
+    /// An override must answer per-*instance*, not per-*type*: a type that
+    /// implements [`SharedMapping`] for some of its instances (for example a
+    /// VMM arena built with a production physical-handle pool) but not others
+    /// (the same type built without one, or bound to a foreign pool
+    /// authority) must return `None` for the instances that lack the
+    /// resource the capability actually needs, even though the trait is
+    /// implemented on the type. Returning `Some` unconditionally whenever the
+    /// type implements the trait — regardless of whether *this* instance can
+    /// actually honor a call — reintroduces the same "successful no-op"
+    /// ambiguity this split exists to remove, just one level up: discovery
+    /// says "yes", and the first real call says "no" (#1186 Phase 2 review).
     fn as_shared_mapping(&self) -> Option<&dyn SharedMapping> {
         None
     }
