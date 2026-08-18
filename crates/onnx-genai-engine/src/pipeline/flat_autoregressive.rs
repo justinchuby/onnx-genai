@@ -55,14 +55,21 @@ impl PipelineEngine {
 
         let mut options = pipeline_request.request.options.clone();
         options.validate()?;
-        if options.stop_on_eos && options.eos_token_id.is_none() {
+        if options.stop_on_eos {
             let mut eos_token_ids = self.eos_token_ids.clone();
             for id in self.tokenizer()?.eos_token_ids() {
                 if !eos_token_ids.contains(&id) {
                     eos_token_ids.push(id);
                 }
             }
-            options.eos_token_id = eos_token_ids.first().copied();
+            if let Some(id) = options.eos_token_id
+                && !eos_token_ids.contains(&id)
+            {
+                eos_token_ids.push(id);
+            }
+            if options.eos_token_id.is_none() {
+                options.eos_token_id = eos_token_ids.first().copied();
+            }
             for id in eos_token_ids {
                 let stop = StopSequence::Tokens(vec![id]);
                 if !options.stop_sequences.contains(&stop) {
