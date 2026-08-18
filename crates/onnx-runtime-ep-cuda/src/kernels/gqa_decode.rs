@@ -27,13 +27,25 @@ use onnx_runtime_ep_api::{EpError, Result};
 use crate::error::driver_err;
 use crate::runtime::CudaRuntime;
 
-const MODULE_KEY: &str = "gqa_decode_attention_f32_v3";
-const ENTRY: &str = "gqa_decode_attention_f32";
-const MERGE_ENTRY: &str = "gqa_decode_attention_f32_merge";
+const MODULE_KEY: &str = "gqa_decode_attention_f32_v5";
+const ENTRY_PREFIX: &str = "gqa_decode_attention_f32_dpl";
+const MERGE_ENTRY_PREFIX: &str = "gqa_decode_attention_f32_merge_dpl";
 
 /// Largest `head_dim` this kernel supports. Each of the 32 warp lanes owns
-/// `ceil(head_dim / 32)` output dimensions in registers, capped at 4.
-pub(super) const MAX_HEAD_DIM: usize = 128;
+/// `ceil(head_dim / 32)` output dimensions in registers, capped at
+/// [`MAX_DIMS_PER_LANE`] (8 lanes-worth == 256).
+pub(super) const MAX_HEAD_DIM: usize = 256;
+
+/// Highest dims-per-lane tier the CUDA source instantiates (`GQA_DECODE_ENTRIES`
+/// 1..=8). `32 * MAX_DIMS_PER_LANE == MAX_HEAD_DIM`.
+const MAX_DIMS_PER_LANE: usize = 8;
+
+/// Dims-per-lane tier for a given head_dim: `ceil(head_dim / 32)`. The launcher
+/// picks the matching specialized entry so a small head keeps its original
+/// register footprint instead of paying for the widest tier.
+fn dims_per_lane(head_dim: usize) -> usize {
+    head_dim.div_ceil(WARP_SIZE as usize).clamp(1, MAX_DIMS_PER_LANE)
+}
 
 /// Warps grouped into one CTA. Small enough to spread the (few) decode rows
 /// across many SMs, large enough to amortize launch overhead.
@@ -100,8 +112,13 @@ pub(super) static TEST_SINGLE_SPLIT_LOCK: std::sync::Mutex<()> = std::sync::Mute
 
 const DECODE_SRC: &str = r#"
 #define GQA_WARP_SIZE 32
-#define GQA_MAX_DPL 4   // dims per lane; head_dim <= 32 * GQA_MAX_DPL == 128
-#define GQA_MAX_HEAD_SIZE 128
+// Dims-per-lane (DPL) is a compile-time template parameter: each of the 32 warp
+// lanes owns `DPL` output dims, so the kernel covers head_dim <= 32 * DPL. The
+// launcher instantiates the exact tier `DPL = ceil(head_dim / 32)` (1..=8) so a
+// small head (e.g. 64 -> DPL 2, 128 -> DPL 4) keeps its original register
+// footprint while head_dim=256 uses DPL 8 -- no register regression on small
+// heads, no head256 fallback to the serial reference kernel.
+#define GQA_MAX_HEAD_SIZE 256
 #define GQA_MAX_SPLITS 16
 #define GQA_MAX_SCRATCH_ROWS 256
 #define GQA_SCRATCH_STRIDE (GQA_MAX_HEAD_SIZE + 2)
@@ -117,7 +134,8 @@ __device__ __forceinline__ int gqa_active_splits(const int sequence_length) {
     return GQA_MAX_SPLITS;
 }
 
-extern "C" __global__ void gqa_decode_attention_f32(
+template<int DPL>
+__device__ __forceinline__ void gqa_decode_f32_impl(
     const float* __restrict__ query,
     const float* __restrict__ key,
     const float* __restrict__ value,
@@ -174,10 +192,10 @@ extern "C" __global__ void gqa_decode_attention_f32(
     const long kv_plane =
         (long)(batch_index * kv_heads + kv_head) * (long)cache_capacity * (long)head_size;
 
-    float q_reg[GQA_MAX_DPL];
-    float acc[GQA_MAX_DPL];
+    float q_reg[DPL];
+    float acc[DPL];
 #pragma unroll
-    for (int i = 0; i < GQA_MAX_DPL; ++i) {
+    for (int i = 0; i < DPL; ++i) {
         const int d = lane + i * GQA_WARP_SIZE;
         q_reg[i] = (d < head_size) ? query[q_base + d] : 0.0f;
         acc[i] = 0.0f;
@@ -192,7 +210,7 @@ extern "C" __global__ void gqa_decode_attention_f32(
         const long k_base = kv_plane + (long)key_pos * (long)head_size;
         float partial = 0.0f;
 #pragma unroll
-        for (int i = 0; i < GQA_MAX_DPL; ++i) {
+        for (int i = 0; i < DPL; ++i) {
             const int d = lane + i * GQA_WARP_SIZE;
             if (d < head_size) {
                 partial += q_reg[i] * key[k_base + d];
@@ -213,7 +231,7 @@ extern "C" __global__ void gqa_decode_attention_f32(
         const float probability = expf(score - new_max);
         running_sum = running_sum * correction + probability;
 #pragma unroll
-        for (int i = 0; i < GQA_MAX_DPL; ++i) {
+        for (int i = 0; i < DPL; ++i) {
             const int d = lane + i * GQA_WARP_SIZE;
             const float v = (d < head_size) ? value[k_base + d] : 0.0f;
             acc[i] = acc[i] * correction + probability * v;
@@ -226,7 +244,7 @@ extern "C" __global__ void gqa_decode_attention_f32(
         warp_sum[warp_in_block] = running_sum;
     }
 #pragma unroll
-    for (int i = 0; i < GQA_MAX_DPL; ++i) {
+    for (int i = 0; i < DPL; ++i) {
         const int d = lane + i * GQA_WARP_SIZE;
         if (d < head_size) {
             warp_acc[warp_in_block * head_size + d] = acc[i];
@@ -261,7 +279,7 @@ extern "C" __global__ void gqa_decode_attention_f32(
     const float inverse_sum =
         (direct_output && denom > 0.0f) ? (1.0f / denom) : 0.0f;
 #pragma unroll
-    for (int i = 0; i < GQA_MAX_DPL; ++i) {
+    for (int i = 0; i < DPL; ++i) {
         const int d = lane + i * GQA_WARP_SIZE;
         if (d < head_size) {
             float out = 0.0f;
@@ -278,7 +296,8 @@ extern "C" __global__ void gqa_decode_attention_f32(
     }
 }
 
-extern "C" __global__ void gqa_decode_attention_f32_merge(
+template<int DPL>
+__device__ __forceinline__ void gqa_merge_f32_impl(
     float* __restrict__ output,
     const int* __restrict__ total_lengths,
     const int batch,
@@ -321,7 +340,7 @@ extern "C" __global__ void gqa_decode_attention_f32_merge(
     const float inverse_sum = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
     const long q_base = (long)row * (long)head_size;
 #pragma unroll
-    for (int i = 0; i < GQA_MAX_DPL; ++i) {
+    for (int i = 0; i < DPL; ++i) {
         const int d = lane + i * GQA_WARP_SIZE;
         if (d < head_size) {
             float out = 0.0f;
@@ -334,6 +353,40 @@ extern "C" __global__ void gqa_decode_attention_f32_merge(
         }
     }
 }
+
+// Emit the `extern "C"` launch entry points for one DPL tier. The launcher
+// selects `gqa_decode_attention_f32_dpl{N}` / `..._merge_dpl{N}` for
+// `N = ceil(head_dim / 32)`.
+#define GQA_DECODE_ENTRIES(DPL)                                                \
+extern "C" __global__ void gqa_decode_attention_f32_dpl##DPL(                  \
+    const float* __restrict__ query, const float* __restrict__ key,           \
+    const float* __restrict__ value, float* __restrict__ output,              \
+    const int* __restrict__ total_lengths, const int batch,                   \
+    const int query_heads, const int kv_heads, const int query_seq,           \
+    const int head_size, const int cache_capacity, const int group_size,      \
+    const float scale, const int local_window, const float softcap,           \
+    const int single_split_direct) {                                          \
+    gqa_decode_f32_impl<DPL>(query, key, value, output, total_lengths, batch, \
+        query_heads, kv_heads, query_seq, head_size, cache_capacity,          \
+        group_size, scale, local_window, softcap, single_split_direct);       \
+}                                                                             \
+extern "C" __global__ void gqa_decode_attention_f32_merge_dpl##DPL(           \
+    float* __restrict__ output, const int* __restrict__ total_lengths,        \
+    const int batch, const int query_heads, const int query_seq,              \
+    const int head_size, const int local_window,                             \
+    const int single_split_direct) {                                          \
+    gqa_merge_f32_impl<DPL>(output, total_lengths, batch, query_heads,        \
+        query_seq, head_size, local_window, single_split_direct);             \
+}
+
+GQA_DECODE_ENTRIES(1)
+GQA_DECODE_ENTRIES(2)
+GQA_DECODE_ENTRIES(3)
+GQA_DECODE_ENTRIES(4)
+GQA_DECODE_ENTRIES(5)
+GQA_DECODE_ENTRIES(6)
+GQA_DECODE_ENTRIES(7)
+GQA_DECODE_ENTRIES(8)
 "#;
 
 /// Launch the capture-safe warp-parallel decode kernel.
@@ -401,7 +454,13 @@ pub(super) fn run(
             EpError::KernelFailed("cuda_ep GQA decode: shared-mem bytes exceed u32".into())
         })?;
 
-    let function = runtime.nvrtc_function(MODULE_KEY, DECODE_SRC, ENTRY)?;
+    // Select the compile-time dims-per-lane specialization for this head_dim so
+    // small heads keep their original (narrow) register footprint.
+    let dpl = dims_per_lane(head_dim);
+    let decode_entry = format!("{ENTRY_PREFIX}{dpl}");
+    let merge_entry = format!("{MERGE_ENTRY_PREFIX}{dpl}");
+
+    let function = runtime.nvrtc_function(MODULE_KEY, DECODE_SRC, &decode_entry)?;
     let single_split_direct = single_split_direct_flag();
     let mut builder = runtime.stream().launch_builder(&function);
     builder
@@ -421,7 +480,7 @@ pub(super) fn run(
         .arg(&local_window)
         .arg(&softcap)
         .arg(&single_split_direct);
-    // SAFETY: `ENTRY` matches this argument ABI; all buffers were sized by the
+    // SAFETY: the selected `dpl` entry matches this argument ABI; all buffers were sized by the
     // caller. Fixed module-global and dynamic shared scratch make the launch
     // legal to record into and replay from a CUDA graph.
     unsafe {
@@ -433,7 +492,7 @@ pub(super) fn run(
     }
     .map_err(|error| driver_err("launch GQA f32 split-K attention", error))?;
 
-    let merge_function = runtime.nvrtc_function(MODULE_KEY, DECODE_SRC, MERGE_ENTRY)?;
+    let merge_function = runtime.nvrtc_function(MODULE_KEY, DECODE_SRC, &merge_entry)?;
     let mut merge_builder = runtime.stream().launch_builder(&merge_function);
     merge_builder
         .arg(&output)
@@ -658,11 +717,183 @@ mod tests {
         );
     }
 
+    /// Runs the fused decode kernel for one shape across a set of cache lengths
+    /// (spanning the split-K boundaries) and returns the worst absolute/relative
+    /// error versus the f64 CPU reference. Shared by the per-head-dim parity
+    /// tests below.
+    fn parity_for_shape(
+        runtime: &CudaRuntime,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        totals: &[usize],
+    ) -> (f32, f32) {
+        let batch = 1usize;
+        let cache_capacity = 1024usize;
+        let group = num_heads / num_kv_heads;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        let mut state = 0x0BADC0DEu64 ^ ((head_dim as u64) << 17);
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let query: Vec<f32> = (0..num_heads * head_dim).map(|_| next()).collect();
+        let key: Vec<f32> = (0..num_kv_heads * cache_capacity * head_dim)
+            .map(|_| next())
+            .collect();
+        let value: Vec<f32> = (0..num_kv_heads * cache_capacity * head_dim)
+            .map(|_| next())
+            .collect();
+
+        let query_dev = runtime.alloc_raw(query.len() * 4).unwrap();
+        let key_dev = runtime.alloc_raw(key.len() * 4).unwrap();
+        let value_dev = runtime.alloc_raw(value.len() * 4).unwrap();
+        let output_dev = runtime.alloc_raw(num_heads * head_dim * 4).unwrap();
+        let totals_dev = runtime.alloc_raw(batch * 4).unwrap();
+
+        // SAFETY: device buffers were sized to hold each source slice.
+        unsafe {
+            runtime.htod(as_bytes(&query), query_dev).unwrap();
+            runtime.htod(as_bytes(&key), key_dev).unwrap();
+            runtime.htod(as_bytes(&value), value_dev).unwrap();
+        }
+
+        let mut worst_abs = 0.0f32;
+        let mut worst_rel = 0.0f32;
+        for &total in totals {
+            let totals_host = [total as i32];
+            // SAFETY: `totals_dev` holds `batch` i32 values.
+            unsafe {
+                runtime.htod(as_bytes(&totals_host), totals_dev).unwrap();
+            }
+
+            run(
+                runtime,
+                batch,
+                num_heads,
+                num_kv_heads,
+                1,
+                head_dim,
+                cache_capacity,
+                group,
+                scale,
+                query_dev,
+                key_dev,
+                value_dev,
+                output_dev,
+                totals_dev,
+                0,
+                0.0,
+            )
+            .unwrap();
+
+            let mut got = vec![0.0f32; num_heads * head_dim];
+            // SAFETY: `output_dev` holds `num_heads * head_dim` f32 values.
+            unsafe {
+                runtime.dtoh(as_bytes_mut(&mut got), output_dev).unwrap();
+            }
+
+            let expected = cpu_reference(
+                &query,
+                &key,
+                &value,
+                total,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                cache_capacity,
+                scale,
+            );
+
+            for (g, e) in got.iter().zip(expected.iter()) {
+                let abs = (g - e).abs();
+                let rel = abs / e.abs().max(1e-4);
+                worst_abs = worst_abs.max(abs);
+                worst_rel = worst_rel.max(rel);
+            }
+        }
+
+        // SAFETY: each pointer came from this runtime's `alloc_raw` and is freed once.
+        unsafe {
+            runtime.free_raw(query_dev).unwrap();
+            runtime.free_raw(key_dev).unwrap();
+            runtime.free_raw(value_dev).unwrap();
+            runtime.free_raw(output_dev).unwrap();
+            runtime.free_raw(totals_dev).unwrap();
+        }
+
+        (worst_abs, worst_rel)
+    }
+
+    /// Mirrors [`decode_kernel_matches_reference_softmax`] for the qwen3.5-2b
+    /// full-attention shape: GQA 8/2 with `head_dim=256` (double the previous
+    /// `MAX_HEAD_DIM`). Exercises the split-K boundaries at seq 64/128/256 and
+    /// asserts the fused kernel matches the f64 CPU reference within the same
+    /// tolerance the head_dim<=128 parity test accepts.
+    #[test]
+    fn decode_kernel_matches_reference_softmax_head256() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping CUDA GQA decode head256 parity test: CUDA runtime unavailable");
+            return;
+        };
+
+        // Split-K boundaries: <=64 -> 1 split, <=128 -> 2, <=256 -> 4, <=512 -> 8.
+        let totals = [1usize, 7, 64, 65, 128, 129, 255, 256, 257, 512, 1023];
+        let (worst_abs, worst_rel) = parity_for_shape(&runtime, 8, 2, 256, &totals);
+
+        eprintln!("GQA decode head256 parity: max_abs={worst_abs:.3e} max_rel={worst_rel:.3e}");
+        assert!(
+            worst_abs < 1e-3,
+            "head256 decode kernel diverged from reference softmax: max_abs={worst_abs:.3e}"
+        );
+        assert!(
+            worst_rel < 5e-3,
+            "head256 decode kernel diverged from reference softmax: max_rel={worst_rel:.3e}"
+        );
+    }
+
+    /// General head-size coverage: the fused fast path is parameterized over
+    /// dims-per-lane (`ceil(head_dim / 32)`), so it must be byte-identical-eligible
+    /// for every common head_dim, including the non-multiple-of-32 dims (80/96/112)
+    /// that mask partial lanes and the DPL 6 tier (192). Each is checked against
+    /// the f64 CPU reference at the same tolerance the head_dim<=128 test accepts.
+    #[test]
+    fn decode_kernel_matches_reference_softmax_general_head_dims() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping CUDA GQA decode general head-dim parity test: CUDA runtime unavailable");
+            return;
+        };
+
+        // Cover single-split, two-split and four-split lengths for each head_dim.
+        let totals = [1usize, 7, 64, 65, 128, 129, 255, 256, 300];
+        for head_dim in [64usize, 80, 96, 112, 128, 192, 256] {
+            let (worst_abs, worst_rel) = parity_for_shape(&runtime, 8, 2, head_dim, &totals);
+            eprintln!(
+                "GQA decode head{head_dim} parity (dpl={}): max_abs={worst_abs:.3e} max_rel={worst_rel:.3e}",
+                super::dims_per_lane(head_dim)
+            );
+            assert!(
+                worst_abs < 1e-3,
+                "head{head_dim} decode kernel diverged from reference softmax: max_abs={worst_abs:.3e}"
+            );
+            assert!(
+                worst_rel < 5e-3,
+                "head{head_dim} decode kernel diverged from reference softmax: max_rel={worst_rel:.3e}"
+            );
+        }
+    }
+
     #[test]
     fn support_gate_targets_single_token_decode() {
         assert!(supported(1, 64));
         assert!(supported(1, 128));
-        assert!(!supported(1, 129));
+        assert!(supported(1, 129));
+        assert!(supported(1, 256));
+        assert!(!supported(1, 257));
         assert!(!supported(2, 64));
         assert!(!supported(1, 0));
     }
@@ -697,7 +928,7 @@ mod tests {
             ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
         };
 
-        for head_dim in [64usize, 128usize] {
+        for head_dim in [64usize, 128usize, 256usize] {
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             let mut q = vec![0.0f32; num_heads * head_dim];
             for slot in q.iter_mut() {
@@ -757,7 +988,7 @@ mod tests {
                 got
             };
 
-            for total in [1usize, 8, 33, 64, 65, 129, 300] {
+            for total in [1usize, 8, 33, 64, 65, 129, 256, 257, 300] {
                 let direct = launch(1, total);
                 let two_step = launch(0, total);
                 assert_eq!(
