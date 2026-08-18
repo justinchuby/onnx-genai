@@ -3730,6 +3730,24 @@ fn dynamic_output_shapes_compress_counts_selected_values() {
     );
 }
 
+#[test]
+fn compress_condition_allows_image_sized_boolean_vectors() {
+    let image_condition = MAX_SHAPE_DATA_ELEMS + 1;
+    assert!(bounded_compress_condition(
+        DataType::Bool,
+        &[image_condition]
+    ));
+    assert!(!bounded_shape_input(DataType::Bool, &[image_condition]));
+    assert!(!bounded_compress_condition(
+        DataType::Int64,
+        &[image_condition]
+    ));
+    assert!(!bounded_compress_condition(
+        DataType::Bool,
+        &[(1 << 20) + 1]
+    ));
+}
+
 /// The data-dependent shape sizer must return exactly one shape per output
 /// so the run loop's `out_shapes[oi]` indexing can never misindex. Slice is
 /// single-output, so it returns a 1-element Vec; the run loop additionally
