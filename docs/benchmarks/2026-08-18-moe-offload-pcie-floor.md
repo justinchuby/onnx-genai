@@ -94,6 +94,12 @@ Two levers move it, and both have caveats:
 2. **Batching.** W=8 roughly halves GB/token (25 %: 1.63 → 0.81 GB/tok) because the
    batch's non-pinned experts are loaded once and serve 8 tokens.
 
+A **third** lever attacks the wall most directly of all — **quantisation**, since
+bytes/token scales linearly with expert size — and it is priced on the same axis as
+VRAM in [2026-08-18-moe-quant-lever.md](2026-08-18-moe-quant-lever.md) (a 4× expert-size
+cut ≈ raising VRAM from 25 % to 65 %). It is the only lever that trades accuracy.
+
+
 ---
 
 ## The knee is *later* than a Zipf assumption predicts (MEASURED)
