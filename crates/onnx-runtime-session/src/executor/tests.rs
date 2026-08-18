@@ -6207,3 +6207,85 @@ fn prepare_workspace_exact_resolution_is_unchanged() {
     assert_eq!(resolved, PlannedInputShape::Exact(vec![1, 12, 8]));
     assert_eq!(resolved.dims(), &[1, 12, 8]);
 }
+
+/// A borrowed input buffer must never escape into cross-run sequence storage.
+///
+/// `read_seq_element` promotes a value's buffer into a `SharedTensorBuffer` that
+/// `restore_shared_buffers` reinstates on the *next* run. A zero-copy input
+/// alias is only valid for the run that created it, so promoting the alias
+/// would leave `buffers[input]` pointing at a caller tensor that has already
+/// been dropped — and the next `copy_from_host` would write through it.
+///
+/// Falsifier: delete the `is_borrowed` branch in `read_seq_element` and this
+/// test fails on the `!is_borrowed()` assertion (and, with a differently
+/// aligned second input, aborts inside the allocator).
+#[test]
+fn sequence_promotion_never_retains_a_borrowed_input_alias() {
+    use onnx_runtime_ir::{TensorData, WeightRef, static_shape};
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([2]));
+    graph.add_input(input);
+    let zero = graph.create_named_value("zero", DataType::Int64, static_shape([]));
+    graph.set_initializer(
+        zero,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            vec![],
+            0i64.to_le_bytes().to_vec(),
+        )),
+    );
+    let seq = graph.create_value(DataType::Float32, static_shape([]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "SequenceConstruct",
+        vec![Some(input)],
+        vec![seq],
+    ));
+    let at = graph.create_value(DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "SequenceAt",
+        vec![Some(seq), Some(zero)],
+        vec![at],
+    ));
+    graph.add_output(at);
+
+    let mut executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    let vid = executor.input_index["input"];
+    let first = Tensor::from_f32(&[2], &[1.0, 2.0]).unwrap();
+    let first_ptr = first.as_bytes().as_ptr() as usize;
+    assert_eq!(
+        executor.run(&[("input", &first)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0]
+    );
+    drop(first);
+
+    let installed = &executor.buffers[&vid];
+    assert!(
+        !installed.is_borrowed(),
+        "input buffer is still a borrowed alias after the run that borrowed it"
+    );
+    assert_ne!(
+        installed.as_ptr() as usize,
+        first_ptr,
+        "input buffer still points at the (now dropped) caller tensor"
+    );
+
+    // A second run must read the new tensor, not stale storage, and must not
+    // write through any retained alias.
+    let second = Tensor::from_f32(&[2], &[3.0, 4.0]).unwrap();
+    assert_eq!(
+        executor.run(&[("input", &second)]).unwrap()[0].to_vec_f32(),
+        vec![3.0, 4.0]
+    );
+    assert!(!executor.buffers[&vid].is_borrowed());
+    assert!(executor.parked_input_buffers.is_empty());
+}
