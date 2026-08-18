@@ -21,6 +21,10 @@ name = "qwen3_0_6b_native_cuda_e2e"
 required-features = ["cuda", "native-backend"]
 
 [[test]]
+name = "tiny_llm_native_cuda_decode_workspace"
+required-features = ["cuda", "native-backend"]
+
+[[test]]
 name = "marlin_m_gt_1_e2e"
 required-features = ["cuda", "native-backend"]
 
