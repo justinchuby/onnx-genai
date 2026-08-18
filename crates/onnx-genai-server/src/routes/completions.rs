@@ -2906,6 +2906,40 @@ mod tool_name_alignment_tests {
         assert_eq!(aligned("shell.exec", &["glob", "read"]), "shell.exec");
         assert_eq!(aligned("wander", &["glob", "read"]), "wander");
     }
+
+    // Suffix resolution is safe only because it matches a call's final segment
+    // against an offered tool's *whole* name, so the resolved target is always a
+    // single offered name and never a choice between two. When two offered tools
+    // merely share a final segment (`fs.read`, `net.read`) and the model writes a
+    // third namespace (`svc.read`), the bare segment `read` is offered by
+    // neither, so the call is left alone for the caller to reject rather than
+    // being resolved arbitrarily to one of them.
+    #[test]
+    fn a_shared_final_segment_is_not_resolved_arbitrarily() {
+        assert_eq!(aligned("svc.read", &["fs.read", "net.read"]), "svc.read");
+        // An exact offer still wins and is never rewritten to the other.
+        assert_eq!(aligned("net.read", &["fs.read", "net.read"]), "net.read");
+    }
+
+    // The whole path a real turn travels: an ATEM tool call the model spelled
+    // with a namespace it was never offered is parsed and then resolved to the
+    // offered tool, so the client dispatches it instead of rejecting `glob.glob`.
+    #[test]
+    fn a_namespaced_atem_call_dispatches_through_the_full_parse_path() {
+        let output = "to=functions.glob<|message|>\
+             <atem:invoke name=\"glob.glob\">\
+             <atem:parameter name=\"pattern\">*.rs</atem:parameter>\
+             </atem:invoke>"
+            .to_string();
+        let parsed =
+            parse_assistant_output(output, "stop").aligned_to(&request_offering(&["glob", "read"]));
+        let calls = parsed.tool_calls.expect("an ATEM invoke is a tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].function.name, "glob",
+            "the namespaced call is dispatched to the offered flat tool"
+        );
+    }
 }
 
 #[cfg(test)]
