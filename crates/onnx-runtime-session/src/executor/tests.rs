@@ -3748,6 +3748,112 @@ fn compress_condition_allows_image_sized_boolean_vectors() {
     ));
 }
 
+/// #1195 behavioural falsification. A `Compress` whose boolean condition is
+/// longer than `MAX_SHAPE_DATA_ELEMS` (an image-sized mask) must still resolve
+/// its data-dependent output shape and run to completion. Before the fix the
+/// condition was rejected by the ordinary shape-data bound, so
+/// `resolve_node_outputs` handed `dynamic_output_shapes` a `None` condition and
+/// the run failed with `UnresolvedShape { op: "Compress" }`. Reverting the
+/// dispatch routing (`compress_condition_i64` for `Compress` input 1 back to
+/// `shape_input_i64`) makes this test go RED, while the shipped predicate-only
+/// test stays green. The empty/full cases also cover the all-false and all-true
+/// condition boundaries through the real resolve + kernel path.
+#[test]
+fn compress_runs_with_image_sized_condition_including_empty_and_full() {
+    use onnx_runtime_ir::{Attribute, TensorData};
+
+    let n = MAX_SHAPE_DATA_ELEMS + 500; // 1524: past the shape-data bound, under 1<<20.
+    assert!(n > MAX_SHAPE_DATA_ELEMS);
+
+    // (selected indices, expected output length)
+    let scenarios: Vec<(Vec<usize>, usize)> = vec![
+        (vec![0, 7, n - 1], 3), // sparse selection spanning the ends
+        (Vec::new(), 0),        // all-false -> empty output
+        ((0..n).collect(), n),  // all-true  -> full output
+    ];
+
+    for (selected, expected_len) in scenarios {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+
+        let x = graph.create_named_value("x", DataType::Float32, static_shape([n]));
+        graph.add_input(x);
+
+        let mut cond_bytes = vec![0u8; n];
+        for &i in &selected {
+            cond_bytes[i] = 1;
+        }
+        let cond = graph.create_named_value("cond", DataType::Bool, static_shape([n]));
+        graph.set_initializer(
+            cond,
+            WeightRef::Inline(TensorData::from_raw(DataType::Bool, vec![n], cond_bytes)),
+        );
+
+        // A symbolic output extent keeps the shape unresolved after static
+        // inference, so the data-dependent resolve path (and the #1195 routing)
+        // is the only thing that can size the output.
+        let extent = graph.create_symbol(None);
+        let y = graph.create_named_value("y", DataType::Float32, vec![Dim::Symbolic(extent)]);
+        let mut node = Node::new(NodeId(0), "Compress", vec![Some(x), Some(cond)], vec![y]);
+        node.attributes.insert("axis".into(), Attribute::Int(0));
+        graph.insert_node(node);
+        graph.add_output(y);
+
+        let mut executor = Executor::build(
+            graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+
+        let x_data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let x_val = Tensor::from_f32(&[n], &x_data).unwrap();
+        let outputs = executor
+            .run(&[("x", &x_val)])
+            .expect("an image-sized Compress condition must resolve its output shape");
+        let out = outputs[0].to_vec_f32();
+        assert_eq!(
+            out.len(),
+            expected_len,
+            "selected count must set the Compress output extent"
+        );
+        let expected: Vec<f32> = selected.iter().map(|&i| i as f32).collect();
+        assert_eq!(out, expected, "Compress must gather exactly the selected rows");
+    }
+}
+
+/// Boundary behaviour of the Compress output-extent count that the #1195 sizer
+/// feeds an image-sized condition into: the count clamps to the axis length when
+/// the condition is longer, counts only the provided entries when it is shorter,
+/// and spans the empty (all-false) and full (all-true) ends.
+#[test]
+fn dynamic_output_shapes_compress_boundary_counts() {
+    use onnx_runtime_ir::Attribute;
+
+    let mut node = Node::new(NodeId(0), "Compress", vec![], vec![]);
+    node.attributes.insert("axis".into(), Attribute::Int(0));
+
+    let count = |cond: Vec<i64>, axis_dim: usize| {
+        dynamic_output_shapes(
+            &node,
+            &[vec![axis_dim], vec![cond.len()]],
+            &[DataType::Float32, DataType::Bool],
+            &[None, Some(cond)],
+            &[],
+            17,
+        )
+    };
+
+    // Condition longer than the axis: entries past the axis length are ignored.
+    assert_eq!(count(vec![1, 1, 1, 1, 1], 3), Some(vec![vec![3]]));
+    // Condition shorter than the axis: only the provided entries are counted.
+    assert_eq!(count(vec![1, 0, 1], 6), Some(vec![vec![2]]));
+    // All-false selects nothing: an empty output extent.
+    assert_eq!(count(vec![0, 0, 0, 0], 4), Some(vec![vec![0]]));
+    // All-true selects the whole axis.
+    assert_eq!(count(vec![1, 1, 1, 1], 4), Some(vec![vec![4]]));
+}
+
 /// The data-dependent shape sizer must return exactly one shape per output
 /// so the run loop's `out_shapes[oi]` indexing can never misindex. Slice is
 /// single-output, so it returns a 1-element Vec; the run loop additionally
