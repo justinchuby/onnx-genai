@@ -1,5 +1,6 @@
 import { readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
+import { createHash } from "node:crypto"
 import { build } from "esbuild"
 
 const dependencies = {
@@ -28,8 +29,16 @@ async function installedVersion(packageName) {
   return manifest.version
 }
 
+const manifestPath = join(vendorDirectory, "manifest.json")
+
+async function sha256(path) {
+  const contents = await readFile(path)
+  return createHash("sha256").update(contents).digest("hex")
+}
+
 async function bundleDependencies() {
   await rm(vendorDirectory, { recursive: true, force: true })
+  const assets = []
   for (const [packageName, dependency] of Object.entries(dependencies)) {
     const actualVersion = await installedVersion(packageName)
     if (actualVersion !== dependency.version) {
@@ -38,6 +47,8 @@ async function bundleDependencies() {
       )
     }
 
+    const fileName = `${packageName.replace(".", "-")}-${dependency.version}.esm.js`
+    const outfile = join(vendorDirectory, fileName)
     await build({
       absWorkingDir: process.cwd(),
       bundle: true,
@@ -45,10 +56,7 @@ async function bundleDependencies() {
       format: "esm",
       legalComments: "none",
       minify: true,
-      outfile: join(
-        vendorDirectory,
-        `${packageName.replace(".", "-")}-${dependency.version}.esm.js`,
-      ),
+      outfile,
       platform: "browser",
       stdin: {
         contents: dependency.entry,
@@ -58,7 +66,28 @@ async function bundleDependencies() {
       target: ["chrome109", "edge115", "firefox102", "safari15.6"],
       write: true,
     })
+
+    const relativeFile = `static/vendor/${fileName}`
+    assets.push({
+      package: packageName,
+      version: dependency.version,
+      file: relativeFile,
+      url: `${siteBasePath}/${relativeFile}`,
+      sha256: await sha256(outfile),
+    })
   }
+
+  // Deterministic manifest: this is the single source of truth the runtime
+  // resource audit (site/quartz/scripts/audit-runtime-resources.mjs) and
+  // site/scripts/validate_site.py cross-check against emitted bytes on disk,
+  // so a hand-edited or commented-out signature cannot counterfeit it.
+  assets.sort((a, b) => a.package.localeCompare(b.package))
+  const manifest = {
+    generator: "site/quartz/scripts/integrate-graph-runtime.mjs",
+    basePath: siteBasePath,
+    assets,
+  }
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
 }
 
 async function rewriteGraphRuntime() {

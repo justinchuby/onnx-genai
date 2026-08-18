@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import re
+import subprocess
 import sys
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
@@ -85,35 +88,176 @@ RUNTIME_ROOT_PATTERNS = {
     "origin-root href assignment": re.compile(r"""\.href\s*=\s*["']/["']?\s*\+"""),
 }
 
+# jsDelivr npm URL parsing.
+#
+# A package/version boundary is any of: `/`, end-of-string, `?`, or `#` (a
+# trailing `/` is NOT required, unlike the previous pattern, which missed
+# bare executable URLs such as `.../npm/d3@7` or `.../npm/d3` with no
+# trailing path segment, and any `?query`/`#fragment` suffix). Scoped
+# packages (`@scope/name`) are parsed as a single package identifier so a
+# `@version` suffix is never mistaken for part of the scope/name.
 JSDELIVR_NPM_PATTERN = re.compile(
     r"""https?://cdn\.jsdelivr\.net/npm/"""
-    r"""(?P<package>@[^/"'\s]+/[^@/"'\s]+|[^@/"'\s]+)"""
-    r"""(?:@(?P<version>[^/"'\s]+))?/""",
+    r"""(?P<package>@[^/@?#"'\s]+/[^@/?#"'\s]+|[^@/?#"'\s]+)"""
+    r"""(?:@(?P<version>[^/?#"'\s]*))?""",
     re.IGNORECASE,
 )
 EXACT_SEMVER_PATTERN = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?")
-INLINE_FETCH_DATA_PATTERN = re.compile(
-    r"""\b(?:const|let|var)\s+fetchData\s*=\s*fetch\(\s*["']"""
-    r"""[^"']*static/contentIndex\.json["']"""
-)
-RUNTIME_SURFACES = {
-    "Search": re.compile(r"\.search-container"),
-    "Graph": re.compile(r"\.graph-container"),
-    "Explorer": re.compile(r"\.explorer-ul"),
+
+# Runtime executable jsDelivr references must be exact immutable semver
+# *and* the exact package must be individually reviewed and allowlisted --
+# an exact-semver shape alone is not sufficient, otherwise a prefix,
+# prerelease, or an unrelated package could ride along on a coincidentally
+# well-formed version string. Local bundling means Graph's d3/pixi.js have
+# zero legitimate jsDelivr references in production (see
+# integrate-graph-runtime.mjs); the only currently reviewed exception is the
+# pinned `latex` Quartz plugin's KaTeX copy-tex asset, embedded at the exact
+# commit recorded in quartz.lock.json.
+JSDELIVR_ALLOWLIST: dict[str, frozenset[str]] = {
+    "katex": frozenset({"0.16.11"}),
 }
-MODULE_LOADER_PATTERN = re.compile(r"""\.type\s*=\s*["']module["']""")
-VENDOR_ASSETS = (
-    "static/vendor/d3-7.9.0.esm.js",
-    "static/vendor/pixi-js-8.19.0.esm.js",
-)
 
 
 def mutable_cdn_references(source: str) -> int:
-    return sum(
-        match["version"] is None
-        or EXACT_SEMVER_PATTERN.fullmatch(match["version"]) is None
-        for match in JSDELIVR_NPM_PATTERN.finditer(source)
+    count = 0
+    for match in JSDELIVR_NPM_PATTERN.finditer(source):
+        package = match["package"]
+        version = match["version"]
+        if (
+            version is not None
+            and EXACT_SEMVER_PATTERN.fullmatch(version) is not None
+            and version in JSDELIVR_ALLOWLIST.get(package, frozenset())
+        ):
+            continue
+        count += 1
+    return count
+
+
+AUDIT_SCRIPT = Path(__file__).resolve().parent.parent / "quartz" / "scripts" / "audit-runtime-resources.mjs"
+VENDOR_MANIFEST_RELATIVE = PurePosixPath("static/vendor/manifest.json")
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def run_resource_audit(
+    public: Path,
+    expected_base_path: str,
+    documents: list[tuple[Path, LinkParser]],
+    errors: set[str],
+) -> dict[str, object]:
+    """Run the deterministic AST/resource-graph audit and fold its findings
+    into `errors`.
+
+    This is the non-vacuous replacement for substring-counting Search,
+    Graph, Explorer, the local ESM loader, and Graph's vendor import edges:
+    site/quartz/scripts/audit-runtime-resources.mjs parses every emitted
+    `*.js` bundle (and every inline `<script>` body) into a real AST, prunes
+    provably unreachable/dead branches, and only counts a signature as
+    "functional" when something downstream actually depends on it. A
+    comment, an unused string, or a dead `if (false) {...}` placeholder
+    cannot satisfy any of these checks. Graph's local vendor assets are
+    cross-checked here against the sha256 recorded in the build-emitted
+    `static/vendor/manifest.json`, so the manifest itself cannot be
+    hand-edited without also matching real deployed bytes.
+    """
+    manifest_path = public / VENDOR_MANIFEST_RELATIVE
+    inline_payload = json.dumps(
+        {
+            "inlineScripts": [
+                {"id": f"{html.relative_to(public).as_posix()}#{index}", "source": source}
+                for html, document in documents
+                for index, source in enumerate(document.inline_scripts)
+            ]
+        }
     )
+    try:
+        result = subprocess.run(
+            ["node", str(AUDIT_SCRIPT), str(public), expected_base_path, str(manifest_path)],
+            input=inline_payload,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        errors.add(f"runtime resource audit could not run node: {error}")
+        return {}
+    if result.returncode != 0:
+        errors.add(
+            f"runtime resource audit failed (exit {result.returncode}): "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+        return {}
+    try:
+        audit = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        errors.add(f"runtime resource audit produced invalid JSON: {error}")
+        return {}
+    if "manifestError" in audit:
+        errors.add(f"runtime resource audit: {audit['manifestError']}")
+        return {}
+
+    for entry in audit.get("parseErrors", []):
+        errors.add(f"{entry['file']}: runtime bundle failed to parse: {entry['message']}")
+
+    manifest = audit.get("manifest", {})
+    assets = manifest.get("assets", [])
+    if not assets:
+        errors.add(f"{manifest_path}: vendor manifest declares no assets")
+    for asset in assets:
+        asset_path = public / asset["file"]
+        if not asset_path.is_file():
+            errors.add(f"missing local Graph runtime asset: {asset_path}")
+            continue
+        actual_hash = sha256_file(asset_path)
+        if actual_hash != asset.get("sha256"):
+            errors.add(
+                f"{asset_path}: content hash does not match build manifest {manifest_path} "
+                f"(expected {asset.get('sha256')}, found {actual_hash})"
+            )
+        edge = audit.get("vendorEdges", {}).get(asset["url"], {"edges": 0, "dead": 0})
+        if edge.get("edges", 0) == 0:
+            hint = " (only found in dead/unreachable code)" if edge.get("dead", 0) else ""
+            errors.add(f"postscript.js: missing reachable Graph import edge to {asset['url']}{hint}")
+
+    for surface, counts in audit.get("surfaces", {}).items():
+        if counts.get("functional", 0) == 0:
+            hints = []
+            if counts.get("vacuous", 0):
+                hints.append(f"{counts['vacuous']} vacuous (result discarded)")
+            if counts.get("dead", 0):
+                hints.append(f"{counts['dead']} dead/unreachable")
+            suffix = f" (found only: {', '.join(hints)})" if hints else ""
+            errors.add(f"postscript.js: missing {surface} runtime surface{suffix}")
+
+    if not audit.get("loaderNames"):
+        errors.add(
+            "postscript.js: missing local ESM script-loader function "
+            "(createElement('script') + type='module' + DOM append)"
+        )
+
+    fetch_entries = audit.get("sharedFetchData", [])
+    for entry in fetch_entries:
+        if entry.get("parseError"):
+            errors.add(f"{entry['id']}: inline script failed to parse: {entry['parseError']}")
+    for html, document in documents:
+        if not document.has_body:
+            continue
+        prefix = f"{html.relative_to(public).as_posix()}#"
+        page_entries = [entry for entry in fetch_entries if entry["id"].startswith(prefix)]
+        if sum(entry.get("functional", 0) for entry in page_entries) == 0:
+            hints = []
+            vacuous = sum(entry.get("vacuous", 0) for entry in page_entries)
+            dead = sum(entry.get("dead", 0) for entry in page_entries)
+            if vacuous:
+                hints.append(f"{vacuous} vacuous")
+            if dead:
+                hints.append(f"{dead} dead/unreachable")
+            suffix = f" (found only: {', '.join(hints)})" if hints else ""
+            errors.add(f"{html}: missing inline shared fetchData runtime surface{suffix}")
+
+    return audit
 
 
 def validate_runtime(
@@ -123,12 +267,12 @@ def validate_runtime(
     errors: set[str],
 ) -> dict[str, int]:
     scripts = sorted(public.rglob("*.js"))
-    bundle_sources: dict[Path, str] = {}
     origin_root_count = 0
     mutable_cdn_count = 0
+    bundle_present: set[Path] = set()
     for script in scripts:
         source = script.read_text(encoding="utf-8")
-        bundle_sources[script] = source
+        bundle_present.add(script)
         for description, pattern in RUNTIME_ROOT_PATTERNS.items():
             matches = pattern.findall(source)
             origin_root_count += len(matches)
@@ -141,27 +285,13 @@ def validate_runtime(
 
     required_bundles = (public / "prescript.js", public / "postscript.js")
     for bundle in required_bundles:
-        if bundle not in bundle_sources:
+        if bundle not in bundle_present:
             errors.add(f"missing required runtime bundle: {bundle}")
 
-    postscript = bundle_sources.get(public / "postscript.js", "")
-    surface_counts: dict[str, int] = {}
-    for name, pattern in RUNTIME_SURFACES.items():
-        surface_counts[name] = len(pattern.findall(postscript))
-        if surface_counts[name] == 0:
-            errors.add(f"{public / 'postscript.js'}: missing {name} runtime surface")
-    module_loader_count = len(MODULE_LOADER_PATTERN.findall(postscript))
-    if module_loader_count == 0:
-        errors.add(f"{public / 'postscript.js'}: missing local ESM runtime loader")
-
     inline_script_count = 0
-    inline_fetch_count = 0
-    local_vendor_references = 0
     for html, document in documents:
         inline_script_count += len(document.inline_scripts)
-        page_fetch_count = 0
         for source in document.inline_scripts:
-            page_fetch_count += len(INLINE_FETCH_DATA_PATTERN.findall(source))
             for description, pattern in RUNTIME_ROOT_PATTERNS.items():
                 matches = pattern.findall(source)
                 origin_root_count += len(matches)
@@ -171,37 +301,30 @@ def validate_runtime(
             mutable_cdn_count += matches
             if matches:
                 errors.add(f"{html}: inline mutable jsDelivr npm runtime dependency")
-        inline_fetch_count += page_fetch_count
-        if document.has_body and page_fetch_count == 0:
-            errors.add(f"{html}: missing inline shared fetchData runtime surface")
         for source in document.script_sources:
             matches = mutable_cdn_references(source)
             if matches:
                 mutable_cdn_count += matches
                 errors.add(f"{html}: external script uses mutable jsDelivr npm dependency")
 
-    for relative in VENDOR_ASSETS:
-        asset = public / relative
-        if not asset.is_file():
-            errors.add(f"missing local Graph runtime asset: {asset}")
-        deployed_url = f"{expected_base_path.rstrip('/')}/{relative}"
-        references = postscript.count(deployed_url)
-        local_vendor_references += references
-        if references == 0:
-            errors.add(f"{public / 'postscript.js'}: missing local runtime import {deployed_url}")
+    audit = run_resource_audit(public, expected_base_path, documents, errors)
+    surfaces = audit.get("surfaces", {}) if audit else {}
+    vendor_edges = audit.get("vendorEdges", {}) if audit else {}
+    manifest_assets = audit.get("manifest", {}).get("assets", []) if audit else []
+    fetch_entries = audit.get("sharedFetchData", []) if audit else []
 
     return {
         "bundles": len(scripts),
         "inline_scripts": inline_script_count,
-        "inline_fetch": inline_fetch_count,
+        "inline_fetch": sum(entry.get("functional", 0) for entry in fetch_entries),
         "origin_root": origin_root_count,
         "mutable_cdn": mutable_cdn_count,
         "local_vendor_assets": sum(
-            (public / relative).is_file() for relative in VENDOR_ASSETS
+            1 for asset in manifest_assets if (public / asset["file"]).is_file()
         ),
-        "local_vendor_references": local_vendor_references,
-        "module_loaders": module_loader_count,
-        **surface_counts,
+        "local_vendor_references": sum(edge.get("edges", 0) for edge in vendor_edges.values()),
+        "module_loaders": len(audit.get("loaderNames", [])) if audit else 0,
+        **{name: counts.get("functional", 0) for name, counts in surfaces.items()},
     }
 
 
