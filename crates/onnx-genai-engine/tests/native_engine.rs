@@ -675,3 +675,72 @@ fn native_session_lru_eviction_keeps_remaining_session_correct() -> anyhow::Resu
     assert_eq!(retained_result.token_ids, cold_result.token_ids);
     Ok(())
 }
+
+/// End-to-end proof that a CPU KV cache which is *reallocated* mid-decode is
+/// still aliased present==past afterwards.
+///
+/// This is the property the whole in-place path rests on and the one the unit
+/// tests cannot reach: `GroupQueryAttention` decides to append in place by
+/// comparing the past-input and present-output pointers at execution time, so
+/// a replacement buffer that failed to re-alias would silently stop appending.
+///
+/// Token equality alone is not evidence here — this fixture's q/k/v are
+/// `Constant` zeros, so its output does not depend on KV contents at all and
+/// would stay `[1, 1, 1, 1]` even if growth dropped the entire history
+/// (verified by deliberately breaking the copy). The load-bearing assertion is
+/// therefore the in-place append *counter*: a cache forced to grow repeatedly
+/// must take the in-place path exactly as often as one that never grows. If
+/// aliasing were lost at the first realloc, the post-growth steps would fall
+/// through to the copy path and the counts would differ.
+#[test]
+fn a_regrown_cpu_kv_cache_is_still_appended_in_place() -> anyhow::Result<()> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-scalar-gqa");
+
+    let generate = |max_len: &str| -> anyhow::Result<(Vec<u32>, usize)> {
+        // SAFETY: both arms set the variable explicitly and it is removed at
+        // the end, so no unset-vs-set race exists between them.
+        unsafe { std::env::set_var("ONNX_GENAI_CPU_KV_MAX_LEN", max_len) };
+        let before = onnx_runtime_ep_cpu::present_inplace_count();
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(NativeDecodeDevice::Cpu),
+                ..EngineConfig::default()
+            },
+        )?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0]));
+        request.options.max_new_tokens = 4;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        let tokens = engine.generate(request)?.token_ids;
+        Ok((
+            tokens,
+            onnx_runtime_ep_cpu::present_inplace_count() - before,
+        ))
+    };
+
+    // Capacity 2 cannot hold the 1-token prompt plus 4 generated tokens, so the
+    // cache must grow mid-decode; 4096 never grows at all.
+    let (grown_tokens, grown_appends) = generate("2")?;
+    let (roomy_tokens, roomy_appends) = generate("4096")?;
+    unsafe { std::env::remove_var("ONNX_GENAI_CPU_KV_MAX_LEN") };
+
+    assert!(
+        roomy_appends > 0,
+        "the fixture must reach the in-place append path at all, else this \
+         test proves nothing about aliasing"
+    );
+    assert_eq!(
+        grown_appends, roomy_appends,
+        "a cache that grew mid-decode must keep appending in place; losing the \
+         present==past aliasing at realloc would drop these counts"
+    );
+    assert_eq!(
+        grown_tokens, roomy_tokens,
+        "growth must not change the decode"
+    );
+    assert_eq!(roomy_tokens, vec![1, 1, 1, 1]);
+    Ok(())
+}
