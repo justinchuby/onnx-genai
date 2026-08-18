@@ -382,6 +382,7 @@ async fn run_chat_completion(
         .then_some(request.top_logprobs.unwrap_or(0));
     let tokenizer = handle.tokenizer.clone();
     let placeholder = positional_image_placeholder(&request, &handle);
+    let output_budget = request.output_budget(state.config.max_output_tokens);
     let mut prepared = prepare_generate_request(
         &request,
         &handle.tokenizer,
@@ -389,10 +390,11 @@ async fn run_chat_completion(
         client_session_id.is_some(),
         placeholder.as_deref(),
         handle.generation_defaults.as_ref(),
+        output_budget,
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
     if !input_audio.is_empty() {
-        prepared = prepare_audio_generate_request(&request, &handle.tokenizer)?;
+        prepared = prepare_audio_generate_request(&request, &handle.tokenizer, output_budget)?;
     }
     let pipeline_input = if !image_urls.is_empty() {
         Some(
@@ -409,7 +411,7 @@ async fn run_chat_completion(
                     })?,
                 &mut prepared,
                 handle.model_max_context,
-                request.max_tokens,
+                output_budget,
             )
             .await?,
         )
@@ -420,7 +422,7 @@ async fn run_chat_completion(
     };
     enforce_context_cap(
         prepared.prompt_tokens,
-        request.max_tokens,
+        output_budget,
         handle.model_max_context,
     )?;
     let prompt_tokens = prepared.prompt_tokens;
@@ -546,6 +548,7 @@ async fn stream_chat_completion(
         .map(StopInput::into_texts)
         .unwrap_or_default();
     let placeholder = positional_image_placeholder(&request, &handle);
+    let output_budget = request.output_budget(state.config.max_output_tokens);
     let mut prepared = prepare_generate_request(
         &request,
         &handle.tokenizer,
@@ -553,10 +556,11 @@ async fn stream_chat_completion(
         client_session_id.is_some(),
         placeholder.as_deref(),
         handle.generation_defaults.as_ref(),
+        output_budget,
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
     if !input_audio.is_empty() {
-        prepared = prepare_audio_generate_request(&request, &handle.tokenizer)?;
+        prepared = prepare_audio_generate_request(&request, &handle.tokenizer, output_budget)?;
     }
     let pipeline_input = if !image_urls.is_empty() {
         Some(
@@ -573,7 +577,7 @@ async fn stream_chat_completion(
                     })?,
                 &mut prepared,
                 handle.model_max_context,
-                request.max_tokens,
+                output_budget,
             )
             .await?,
         )
@@ -584,7 +588,7 @@ async fn stream_chat_completion(
     };
     enforce_context_cap(
         prepared.prompt_tokens,
-        request.max_tokens,
+        output_budget,
         handle.model_max_context,
     )?;
     let wants_constrained_json = request.wants_constrained_json();
@@ -617,6 +621,7 @@ async fn stream_chat_completion(
         send_stream_chunk(&tx, role_chunk(&id, created, &model)).await?;
 
         let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.clone());
+        let mut channel_gate = AtemChannelGate::default();
         let mut buffered_text = String::new();
         let buffer_for_tool_detection =
             request.has_tool_context() && tools_parseable_from_output(&request);
@@ -627,7 +632,9 @@ async fn stream_chat_completion(
                         continue;
                     }
                     let finish_reason = token.finish_reason.clone();
-                    let content = stop_buffer.push(&token.text);
+                    let spelled = tokenizer.decode_with_special_tokens(&[token.token_id]).ok();
+                    let visible = channel_gate.push(spelled.as_deref(), &token.text);
+                    let content = stop_buffer.push(&visible);
                     if buffer_for_tool_detection {
                         buffered_text.push_str(&content);
                     } else if !wants_constrained_json && !content.is_empty() {
@@ -726,7 +733,8 @@ async fn stream_chat_completion(
                     .await?;
                 } else {
                     if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
-                        let content = stop_buffer.flush();
+                        let content = stop_buffer.push(&channel_gate.flush());
+                        let content = content + &stop_buffer.flush();
                         if !content.is_empty() {
                             send_stream_chunk(
                                 &tx,
@@ -949,13 +957,14 @@ async fn preprocess_chat_images(
 fn prepare_audio_generate_request(
     request: &ChatCompletionRequest,
     tokenizer: &Tokenizer,
+    output_budget: usize,
 ) -> Result<PreparedGenerateRequest, ApiError> {
     let token_ids = audio_decoder_prompt(tokenizer, None)?;
     let prompt_tokens = token_ids.len();
     Ok(PreparedGenerateRequest {
         request: GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
-            options: build_generate_options_with_tokenizer(request, tokenizer),
+            options: build_generate_options_with_tokenizer(request, tokenizer, output_budget),
         },
         prompt_tokens,
     })
@@ -968,16 +977,18 @@ fn validate_request(
     if request.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
     }
-    if request.max_tokens == 0 {
-        return Err(ApiError::bad_request(
-            "max_tokens must be greater than zero",
-        ));
-    }
-    if request.max_tokens > config.max_output_tokens {
-        return Err(ApiError::bad_request(format!(
-            "max_tokens must be less than or equal to the server cap of {}",
-            config.max_output_tokens
-        )));
+    if let Some((field, requested)) = request.requested_output_budget() {
+        if requested == 0 {
+            return Err(ApiError::bad_request(format!(
+                "{field} must be greater than zero"
+            )));
+        }
+        if requested > config.max_output_tokens {
+            return Err(ApiError::bad_request(format!(
+                "{field} must be less than or equal to the server cap of {}",
+                config.max_output_tokens
+            )));
+        }
     }
     if !request.temperature.is_finite() || request.temperature < 0.0 {
         return Err(ApiError::bad_request(
@@ -1222,10 +1233,12 @@ async fn get_or_create_session(
     Ok(engine_session_id)
 }
 
+/// Builds a generation request without a server in hand, so an unspecified
+/// output budget falls back to the default cap a server would have applied.
 pub fn build_generate_request(request: &ChatCompletionRequest) -> GenerateRequest {
     GenerateRequest {
         prompt: GeneratePrompt::Text(build_prompt(request)),
-        options: build_generate_options(request),
+        options: build_generate_options(request, request.output_budget(DEFAULT_MAX_OUTPUT_TOKENS)),
     }
 }
 
@@ -1404,6 +1417,7 @@ fn prepare_generate_request(
     session: bool,
     image_placeholder: Option<&str>,
     generation_defaults: Option<&GenerationDefaults>,
+    output_budget: usize,
 ) -> anyhow::Result<PreparedGenerateRequest> {
     let prompt = if session && !request.has_tool_context() {
         build_session_prompt(&request.messages, image_placeholder)
@@ -1414,7 +1428,7 @@ fn prepare_generate_request(
         .encode(&prompt)
         .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?;
     let prompt_tokens = token_ids.len();
-    let mut options = build_generate_options_with_tokenizer(request, tokenizer);
+    let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget);
     // Honor the model's declared sampling regime (e.g. a reasoning model that
     // ships do_sample=true); explicit request fields still win.
     options.resolve_sampling_defaults(generation_defaults, &chat_sampling_overrides(request));
@@ -1427,7 +1441,10 @@ fn prepare_generate_request(
     })
 }
 
-fn build_generate_options(request: &ChatCompletionRequest) -> GenerateOptions {
+fn build_generate_options(
+    request: &ChatCompletionRequest,
+    output_budget: usize,
+) -> GenerateOptions {
     // Chat historically used greedy decoding even with its default temperature
     // and top-p fields. Preserve that default while treating the newly exposed
     // stochastic controls as an explicit request to sample.
@@ -1439,7 +1456,7 @@ fn build_generate_options(request: &ChatCompletionRequest) -> GenerateOptions {
         || request.mirostat > 0
         || request.xtc_probability > 0.0;
     let mut options = GenerateOptions {
-        max_new_tokens: request.max_tokens,
+        max_new_tokens: output_budget,
         temperature: request.temperature,
         top_p: request.top_p,
         top_k: request.top_k,
@@ -1599,8 +1616,9 @@ fn tool_call_schema_for_tool(tool: &ChatTool) -> serde_json::Value {
 fn build_generate_options_with_tokenizer(
     request: &ChatCompletionRequest,
     tokenizer: &Tokenizer,
+    output_budget: usize,
 ) -> GenerateOptions {
-    let mut options = build_generate_options(request);
+    let mut options = build_generate_options(request, output_budget);
     add_tokenizer_stop_sequences(&mut options, tokenizer);
     options
 }
@@ -1788,7 +1806,6 @@ pub fn parse_tool_calls(output: &str) -> Vec<ChatMessageToolCall> {
     let parsed_calls = extract_atem_tool_calls(output)
         .into_iter()
         .chain(extract_qwen_tool_calls(output))
-        .into_iter()
         .chain(extract_llama_tool_calls(output))
         .chain(extract_mistral_tool_calls(output));
     let mut calls = Vec::new();
@@ -1974,6 +1991,97 @@ fn atem_visible_content(output: &str) -> Option<String> {
         return Some(answer[..end].to_string());
     }
     output.contains(ATEM_REASONING_CHANNEL).then(String::new)
+}
+
+/// Streams only the part of an ATEM turn a client may see.
+///
+/// A streamed token's text has special tokens stripped, so the channel markers
+/// that decide what is visible are invisible token by token and a streaming turn
+/// would otherwise send private reasoning as it is produced. The gate keeps the
+/// turn's special-token spelling and asks [`atem_visible_content`] what is
+/// visible so far, emitting only what has grown since the previous token, so
+/// channel semantics stay in one place and streaming agrees with the buffered
+/// path by construction.
+///
+/// A turn opens with its channel address, so the gate withholds output only
+/// while that address could still be forming: the first token of a turn that is
+/// not addressed at all decides the turn is not ATEM, and every later token
+/// streams unchanged. That covers every non-ATEM model at a cost of nothing.
+#[derive(Debug, Default)]
+struct AtemChannelGate {
+    /// The turn so far, spelled with the special tokens that mark channels.
+    transcript: String,
+    /// The turn so far as a client would see it, held back pending a decision.
+    withheld: String,
+    /// How much of the visible content has already been streamed.
+    streamed: String,
+    /// Set once the turn is known to carry no ATEM channel.
+    unaddressed: bool,
+}
+
+impl AtemChannelGate {
+    /// The visible text this token added, which is empty while the token
+    /// belongs to a private channel.
+    ///
+    /// `spelled` is the token with its special tokens intact and `plain` is the
+    /// same token as a client would see it. A token that cannot be spelled
+    /// leaves the gate unable to tell channels apart, so it streams on.
+    fn push(&mut self, spelled: Option<&str>, plain: &str) -> String {
+        if self.unaddressed {
+            return plain.to_string();
+        }
+        let Some(spelled) = spelled else {
+            return self.give_up(plain);
+        };
+        self.transcript.push_str(spelled);
+        self.withheld.push_str(plain);
+
+        match atem_visible_content(&self.transcript) {
+            Some(visible) => self.advance(visible),
+            None if self.addressing_could_still_complete() => String::new(),
+            None => self.give_up(""),
+        }
+    }
+
+    /// Whatever the gate is still holding once the turn ends, which is empty
+    /// unless the turn ended mid-address.
+    fn flush(&mut self) -> String {
+        if self.unaddressed || atem_visible_content(&self.transcript).is_some() {
+            return String::new();
+        }
+        self.give_up("")
+    }
+
+    /// The turn has begun an address that no channel completes yet, so the rest
+    /// of it may still arrive.
+    fn addressing_could_still_complete(&self) -> bool {
+        let opening = self.transcript.trim_start();
+        [ATEM_REASONING_CHANNEL, ATEM_USER_CHANNEL]
+            .into_iter()
+            .any(|channel| channel.starts_with(opening))
+    }
+
+    /// Emit the visible content this token revealed. A turn that opens a second
+    /// user channel replaces the answer rather than extending it, so anything
+    /// already streamed is no longer a prefix and the new answer is sent whole.
+    fn advance(&mut self, visible: String) -> String {
+        self.withheld.clear();
+        let grown = match visible.strip_prefix(&self.streamed) {
+            Some(grown) => grown.to_string(),
+            None => visible.clone(),
+        };
+        self.streamed = visible;
+        grown
+    }
+
+    /// Give up on channel gating and stream everything from here on, releasing
+    /// whatever was held back while the turn's addressing was undecided.
+    fn give_up(&mut self, also: &str) -> String {
+        self.unaddressed = true;
+        let mut released = std::mem::take(&mut self.withheld);
+        released.push_str(also);
+        released
+    }
 }
 
 fn assistant_output_text(result: &GenerateResult, tokenizer: &Tokenizer) -> String {
@@ -2380,7 +2488,7 @@ mod sampling_resolution_tests {
     #[test]
     fn silent_chat_request_honors_model_do_sample() {
         let request = chat_request(json!({}));
-        let mut options = build_generate_options(&request);
+        let mut options = build_generate_options(&request, DEFAULT_MAX_OUTPUT_TOKENS);
         assert!(options.greedy, "the base chat default is greedy");
         options.resolve_sampling_defaults(
             Some(&declared(Some(true), Some(0.6))),
@@ -2397,7 +2505,7 @@ mod sampling_resolution_tests {
     #[test]
     fn explicit_chat_controls_win_over_model() {
         let seeded = chat_request(json!({ "seed": 7 }));
-        let mut options = build_generate_options(&seeded);
+        let mut options = build_generate_options(&seeded, DEFAULT_MAX_OUTPUT_TOKENS);
         options.resolve_sampling_defaults(
             Some(&declared(Some(false), None)),
             &chat_sampling_overrides(&seeded),
@@ -2405,7 +2513,7 @@ mod sampling_resolution_tests {
         assert!(!options.greedy, "an explicit seed requests sampling");
 
         let cold = chat_request(json!({ "temperature": 0.0 }));
-        let mut options = build_generate_options(&cold);
+        let mut options = build_generate_options(&cold, DEFAULT_MAX_OUTPUT_TOKENS);
         options.resolve_sampling_defaults(
             Some(&declared(Some(true), Some(0.6))),
             &chat_sampling_overrides(&cold),
@@ -2418,7 +2526,7 @@ mod sampling_resolution_tests {
     #[test]
     fn silent_chat_request_keeps_model_top_k() {
         let request = chat_request(json!({}));
-        let mut options = build_generate_options(&request);
+        let mut options = build_generate_options(&request, DEFAULT_MAX_OUTPUT_TOKENS);
         options.resolve_sampling_defaults(
             Some(&declared_top_k(64)),
             &chat_sampling_overrides(&request),
@@ -2426,7 +2534,7 @@ mod sampling_resolution_tests {
         assert_eq!(options.top_k, 64, "a silent request keeps declared top_k");
 
         let explicit = chat_request(json!({ "top_k": 5 }));
-        let mut options = build_generate_options(&explicit);
+        let mut options = build_generate_options(&explicit, DEFAULT_MAX_OUTPUT_TOKENS);
         options.resolve_sampling_defaults(
             Some(&declared_top_k(64)),
             &chat_sampling_overrides(&explicit),
@@ -2450,5 +2558,155 @@ mod sampling_resolution_tests {
             &completion_sampling_overrides(&request),
         );
         assert!(!options.greedy, "model do_sample=true must disable greedy");
+    }
+}
+
+#[cfg(test)]
+mod output_budget_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn request(budget: serde_json::Value) -> ChatCompletionRequest {
+        let mut body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        for (field, value) in budget.as_object().expect("budget fields") {
+            body[field] = value.clone();
+        }
+        serde_json::from_value(body).expect("request")
+    }
+
+    // A reasoning model spends the same budget on thinking as on its answer, so
+    // a client that names no budget must get the server's cap rather than a
+    // small fixed default that truncates the turn mid-thought.
+    #[test]
+    fn an_unspecified_budget_is_the_server_cap() {
+        assert_eq!(request(json!({})).output_budget(4096), 4096);
+        assert_eq!(request(json!({})).requested_output_budget(), None);
+    }
+
+    // OpenAI deprecated max_tokens for chat and accepts only
+    // max_completion_tokens for reasoning models, so the newer field wins.
+    #[test]
+    fn max_completion_tokens_supersedes_max_tokens() {
+        let both = request(json!({"max_tokens": 16, "max_completion_tokens": 2048}));
+        assert_eq!(both.output_budget(4096), 2048);
+        assert_eq!(
+            both.requested_output_budget(),
+            Some(("max_completion_tokens", 2048))
+        );
+        assert_eq!(request(json!({"max_tokens": 16})).output_budget(4096), 16);
+    }
+
+    // The server cap bounds whatever the client asked for.
+    #[test]
+    fn the_server_cap_bounds_a_requested_budget() {
+        assert_eq!(
+            request(json!({"max_completion_tokens": 99_999})).output_budget(4096),
+            4096
+        );
+    }
+
+    // A rejection names the field the client actually sent, so the caller can
+    // find it in its own request.
+    #[test]
+    fn a_rejected_budget_names_the_field_the_client_sent() {
+        let config = ServerConfig {
+            max_output_tokens: 128,
+            ..ServerConfig::default()
+        };
+        let error = validate_request(&request(json!({"max_completion_tokens": 4096})), &config)
+            .expect_err("over cap");
+        assert!(
+            error.message.contains("max_completion_tokens"),
+            "{}",
+            error.message
+        );
+        let error =
+            validate_request(&request(json!({"max_tokens": 0})), &config).expect_err("zero");
+        assert!(error.message.contains("max_tokens"), "{}", error.message);
+        validate_request(&request(json!({})), &config).expect("an unspecified budget is valid");
+    }
+}
+
+#[cfg(test)]
+mod channel_gate_tests {
+    use super::*;
+
+    /// Feeds a turn to the gate one token at a time and returns what streamed.
+    ///
+    /// Each token is given as `(spelled, plain)` so the test can state exactly
+    /// where the special tokens fall, which is what the gate reads.
+    fn stream(tokens: &[(&str, &str)]) -> String {
+        let mut gate = AtemChannelGate::default();
+        let mut streamed: String = tokens
+            .iter()
+            .map(|(spelled, plain)| gate.push(Some(spelled), plain))
+            .collect();
+        streamed.push_str(&gate.flush());
+        streamed
+    }
+
+    // Private reasoning must never reach a streaming client, and a turn cut off
+    // before it addresses the user streams nothing rather than the thinking.
+    #[test]
+    fn reasoning_never_streams() {
+        assert_eq!(
+            stream(&[
+                (" to=self", " to=self"),
+                ("<|message|>", ""),
+                ("secret", "secret"),
+                (" plan", " plan"),
+            ]),
+            ""
+        );
+    }
+
+    // Once the turn addresses the user, the answer streams incrementally and
+    // the reasoning that preceded it stays withheld.
+    #[test]
+    fn only_the_user_channel_streams() {
+        assert_eq!(
+            stream(&[
+                (" to=self", " to=self"),
+                ("<|message|>", ""),
+                ("secret", "secret"),
+                ("<|end|> to=user<|message|>", "<|end|> to=user"),
+                ("Hello", "Hello"),
+                (" there", " there"),
+                ("<|eot|>", ""),
+            ]),
+            "Hello there"
+        );
+    }
+
+    // A model that addresses no channel is every non-ATEM model, and it must
+    // stream unchanged from its very first token.
+    #[test]
+    fn an_unaddressed_turn_streams_unchanged() {
+        assert_eq!(
+            stream(&[("Hello", "Hello"), (" world", " world")]),
+            "Hello world"
+        );
+    }
+
+    // A turn that ends while its address is still incomplete has been cut off
+    // mid-header; withholding it would silently swallow the whole turn.
+    #[test]
+    fn a_turn_cut_off_mid_address_is_released() {
+        assert_eq!(stream(&[(" to=", " to=")]), " to=");
+    }
+
+    // A token the tokenizer cannot spell leaves channels undecidable, so the
+    // gate stops gating rather than withholding the rest of the turn.
+    #[test]
+    fn an_unspellable_token_stops_gating() {
+        let mut gate = AtemChannelGate::default();
+        assert_eq!(gate.push(None, "raw"), "raw");
+        assert_eq!(
+            gate.push(Some(" to=self<|message|>"), " to=self"),
+            " to=self"
+        );
     }
 }
