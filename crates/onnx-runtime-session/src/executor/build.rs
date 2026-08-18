@@ -513,6 +513,7 @@ impl Executor {
             sequence_values,
             activation_memory_plan: None,
             shared_buffers: HashMap::new(),
+            parked_input_buffers: Vec::new(),
             sequences: HashMap::new(),
             seq_elem_values: HashMap::new(),
             execution_provider_fallback_report,

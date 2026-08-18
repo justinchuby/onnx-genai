@@ -180,7 +180,14 @@ fn compute_in_place_chain_is_byte_identical_and_fires() {
     let enabled_output = enabled.run(&[("input", &values)]).unwrap()[0]
         .as_bytes()
         .to_vec();
-    assert_eq!(enabled.compute_in_place_alias_count, 2);
+    // One alias, not two: the graph input is bound zero-copy (its buffer
+    // borrows the caller's `values` tensor), and a borrowed buffer must never
+    // be written, so `Tanh` cannot run in place on it. The intermediate value
+    // `first` is executor-owned and still aliases. Trading one in-place alias
+    // (which saves an allocation the run makes anyway on the next step) for
+    // eliminating a full host->EP copy of every graph input is the point of
+    // `prepare_run_buffers`.
+    assert_eq!(enabled.compute_in_place_alias_count, 1);
 
     let mut disabled = Executor::build(inplace_chain_graph(false, false), weights, ep).unwrap();
     disabled.compute_in_place_enabled = false;
@@ -6282,4 +6289,182 @@ fn prepare_workspace_resolves_reshape_flatten_chain_exactly() {
         .resolve_planned_workspace_input_shape(cast, &symbols, NodeId(3), &matmul, 0)
         .unwrap();
     assert_eq!(resolved, PlannedInputShape::Exact(vec![5, 2048]));
+}
+
+/// A borrowed input buffer must never escape into cross-run sequence storage.
+///
+/// `read_seq_element` promotes a value's buffer into a `SharedTensorBuffer` that
+/// `restore_shared_buffers` reinstates on the *next* run. A zero-copy input
+/// alias is only valid for the run that created it, so promoting the alias
+/// would leave `buffers[input]` pointing at a caller tensor that has already
+/// been dropped — and the next `copy_from_host` would write through it.
+///
+/// Falsifier: delete the `is_borrowed` branch in `read_seq_element` and this
+/// test fails on the `!is_borrowed()` assertion (and, with a differently
+/// aligned second input, aborts inside the allocator).
+#[test]
+fn sequence_promotion_never_retains_a_borrowed_input_alias() {
+    use onnx_runtime_ir::{TensorData, WeightRef, static_shape};
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([2]));
+    graph.add_input(input);
+    let zero = graph.create_named_value("zero", DataType::Int64, static_shape([]));
+    graph.set_initializer(
+        zero,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            vec![],
+            0i64.to_le_bytes().to_vec(),
+        )),
+    );
+    let seq = graph.create_value(DataType::Float32, static_shape([]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "SequenceConstruct",
+        vec![Some(input)],
+        vec![seq],
+    ));
+    let at = graph.create_value(DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "SequenceAt",
+        vec![Some(seq), Some(zero)],
+        vec![at],
+    ));
+    graph.add_output(at);
+
+    let mut executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    let vid = executor.input_index["input"];
+    let first = Tensor::from_f32(&[2], &[1.0, 2.0]).unwrap();
+    let first_ptr = first.as_bytes().as_ptr() as usize;
+    assert_eq!(
+        executor.run(&[("input", &first)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0]
+    );
+    drop(first);
+
+    let installed = &executor.buffers[&vid];
+    assert!(
+        !installed.is_borrowed(),
+        "input buffer is still a borrowed alias after the run that borrowed it"
+    );
+    assert_ne!(
+        installed.as_ptr() as usize,
+        first_ptr,
+        "input buffer still points at the (now dropped) caller tensor"
+    );
+
+    // A second run must read the new tensor, not stale storage, and must not
+    // write through any retained alias.
+    let second = Tensor::from_f32(&[2], &[3.0, 4.0]).unwrap();
+    assert_eq!(
+        executor.run(&[("input", &second)]).unwrap()[0].to_vec_f32(),
+        vec![3.0, 4.0]
+    );
+    assert!(!executor.buffers[&vid].is_borrowed());
+    assert!(executor.parked_input_buffers.is_empty());
+}
+
+/// Dropping an executor must return every buffer it owns to the allocator,
+/// including one parked while a zero-copy input alias stood in its slot.
+///
+/// `unbind_borrowed_inputs` restores parked buffers on the normal and error
+/// paths, but a panic unwinding out of a run drops the `Executor` with them
+/// still parked, and `Drop` only drained `self.buffers`. A counting allocator
+/// makes the leak observable: `live` must return to its pre-run value.
+///
+/// Falsifier: delete the `parked_input_buffers` drain in `Drop for Executor`
+/// and the final assertion fails with `live=1`.
+#[test]
+fn dropping_an_executor_with_a_parked_input_buffer_leaks_nothing() {
+    use onnx_runtime_memory_governor::{DeviceAllocator, DeviceKey, HostAllocator, MemoryError};
+    use std::ptr::NonNull;
+
+    #[derive(Debug, Default)]
+    struct CountingAllocator {
+        inner: HostAllocator,
+        live: AtomicUsize,
+        allocated: AtomicUsize,
+    }
+
+    impl DeviceAllocator for CountingAllocator {
+        fn device(&self) -> DeviceKey {
+            self.inner.device()
+        }
+
+        fn allocate(
+            &self,
+            bytes: usize,
+            align: usize,
+        ) -> std::result::Result<NonNull<u8>, MemoryError> {
+            let ptr = self.inner.allocate(bytes, align)?;
+            self.live.fetch_add(1, Ordering::SeqCst);
+            self.allocated.fetch_add(1, Ordering::SeqCst);
+            Ok(ptr)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            // SAFETY: forwarded under this method's contract — `ptr`/`bytes`/
+            // `align` are the triple `allocate` above returned from `inner`.
+            unsafe { self.inner.deallocate(ptr, bytes, align) };
+        }
+    }
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([64]));
+    graph.add_input(input);
+    let out = graph.create_named_value("out", DataType::Float32, static_shape([64]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(input)], vec![out]));
+    graph.add_output(out);
+
+    let counting = Arc::new(CountingAllocator::default());
+    let mut ep = CpuExecutionProvider::new().with_memory(counting.clone());
+    ep.initialize(&Default::default()).unwrap();
+
+    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let vid = executor.input_index["input"];
+
+    let tensor = Tensor::from_f32(&[64], &vec![1.0f32; 64]).unwrap();
+    executor.run(&[("input", &tensor)]).unwrap();
+    assert!(
+        counting.allocated.load(Ordering::SeqCst) > 0,
+        "the run allocated nothing through the counting allocator, so this \
+         test could not observe a leak"
+    );
+
+    // Park the input's owned buffer exactly as `prepare_run_buffers` does when
+    // it installs a zero-copy alias, then drop the executor mid-run. Nothing
+    // else may reach `unbind_borrowed_inputs`.
+    let bytes = tensor.as_bytes();
+    let device = executor.buffers[&vid].device();
+    // SAFETY: `tensor` outlives `executor`, and the handle is never written or
+    // deallocated — it is dropped by `Drop for Executor`, where a borrowed
+    // handle is a no-op free.
+    let borrowed = unsafe {
+        DeviceBuffer::from_borrowed_parts(
+            bytes.as_ptr() as *mut std::ffi::c_void,
+            device,
+            bytes.len(),
+            TensorLayout::contiguous().alignment,
+        )
+    };
+    let owned = std::mem::replace(executor.buffers.get_mut(&vid).unwrap(), borrowed);
+    executor.parked_input_buffers.push((vid, owned));
+
+    drop(executor);
+    assert_eq!(
+        counting.live.load(Ordering::SeqCst),
+        0,
+        "dropping the executor leaked the parked input buffer"
+    );
 }

@@ -85,7 +85,10 @@ impl Executor {
         self.prepare_run_buffers(inputs, external, &resolved, stage2.excluded.as_ref())?;
         drop(_phase_setup);
 
-        if let Some(result) = self.execute_run_plan(
+        // From here on a borrowed input handle may be installed in `buffers`;
+        // every exit path must go through `unbind_borrowed_inputs` before the
+        // caller's tensors can be dropped.
+        let outcome = self.execute_and_collect(
             mode,
             nested,
             outer_scope,
@@ -93,13 +96,43 @@ impl Executor {
             &mut resolved,
             decode_memo_eligible,
             stage2,
+            measure_activation_plan,
+        );
+        let unbound = self.unbind_borrowed_inputs();
+        match (outcome, unbound) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(e), _) => Err(e),
+            (Ok(_), Err(e)) => Err(e),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_and_collect(
+        &mut self,
+        mode: RunMode,
+        nested: bool,
+        outer_scope: &HashMap<String, Tensor>,
+        external: &ExternalBindings,
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        decode_memo_eligible: bool,
+        stage2: Stage2RunState,
+        measure_activation_plan: bool,
+    ) -> Result<ScopedRunResult> {
+        if let Some(result) = self.execute_run_plan(
+            mode,
+            nested,
+            outer_scope,
+            external,
+            resolved,
+            decode_memo_eligible,
+            stage2,
         )? {
-            self.finish_activation_memory_plan_measurement(measure_activation_plan, &resolved);
+            self.finish_activation_memory_plan_measurement(measure_activation_plan, resolved);
             return Ok(result);
         }
 
-        self.finish_activation_memory_plan_measurement(measure_activation_plan, &resolved);
-        self.collect_run_outputs(external, &mut resolved, nested, decode_memo_eligible)
+        self.finish_activation_memory_plan_measurement(measure_activation_plan, resolved);
+        self.collect_run_outputs(external, resolved, nested, decode_memo_eligible)
     }
 
     pub(crate) fn activation_memory_plan_stats(&self) -> Option<ActivationMemoryPlanStats> {
@@ -181,6 +214,10 @@ impl Executor {
     }
 
     fn reset_run_state(&mut self) -> Result<()> {
+        // A previous run must never leave a handle aliasing its caller's
+        // tensors installed (it cannot, but re-establishing the invariant here
+        // makes the guarantee independent of every early-return path above).
+        self.unbind_borrowed_inputs()?;
         // Zero-copy view metadata is run-scoped: a value that aliased another's
         // buffer last run must not leak into this one (buffers may be resized).
         self.views.clear();
@@ -388,23 +425,103 @@ impl Executor {
         }
 
         // --- Bind input bytes into their (now correctly sized) buffers ------
-        // Every graph input is copied host->EP here, once per run. For a large
-        // activation input that copy is the single biggest item in `setup_total`,
-        // so it gets its own phase and byte counter rather than being folded
-        // into the setup bucket where it cannot be told from shape work.
+        // Every graph input reaches its kernel one of two ways. When the EP's
+        // device is host-accessible and the value is provably read-only for the
+        // run, the buffer is replaced by a *borrowed* handle aliasing the
+        // caller's tensor — no copy at all, which is what ORT's CPU EP does when
+        // an `OrtValue` is constructed over user memory. Otherwise the bytes are
+        // copied host->EP, once per run; for a large activation that copy is the
+        // single biggest item in `setup_total`, so it keeps its own phase and
+        // byte counter rather than being folded into the setup bucket.
         let _s = phase_span!("run_scoped.bind_inputs");
+        // A memoized (Stage-2) view plan retains views whose source is a buffer
+        // pointer and asserts that pointer is stable across runs. A borrowed
+        // input's address changes whenever the caller hands us a different
+        // tensor, so leave those runs on the copy path.
+        let borrow_ok = stage2_excluded.is_none();
+        let borrow_align = TensorLayout::contiguous().alignment;
         let mut input_bytes = 0usize;
+        let mut borrowed_bytes = 0usize;
         for (name, tensor) in inputs {
             let vid = self.input_index[*name];
+            let bytes = tensor.as_bytes();
             let buf = self
                 .buffers
                 .get_mut(&vid)
                 .expect("input value has a buffer");
-            let bytes = tensor.as_bytes();
+            if borrow_ok
+                && !bytes.is_empty()
+                && bytes.len() == buf.len()
+                // Take the device from the *buffer*, not from `self.ep`: in a
+                // heterogeneous session the value's allocation can belong to
+                // another provider, and a handle must name the device whose
+                // `deallocate` will be asked to release it.
+                && buf.device().is_host_accessible()
+                && buf.device() == self.ep.device_id()
+                && (bytes.as_ptr() as usize).is_multiple_of(borrow_align)
+                // A graph output's buffer can be *moved* out to the caller
+                // (`try_move_host_output`), which would hand back — and later
+                // free — memory this executor does not own.
+                && !self.graph.outputs.contains(&vid)
+                // Activation-memory planning can alias another value's storage
+                // onto this one, and that other value is written.
+                && !self.shared_buffers.contains_key(&vid)
+            {
+                borrowed_bytes += bytes.len();
+                // SAFETY: `bytes` borrows the caller's `&Tensor`, which outlives
+                // this whole run (`inputs` is borrowed by `run_scoped_mode`).
+                // The range is `bytes.len()` long and `borrow_align`-aligned,
+                // and a graph input is producer-less, so no kernel writes it:
+                // every consumer sees it through a read-only `TensorView`.
+                let device = buf.device();
+                let borrowed = unsafe {
+                    DeviceBuffer::from_borrowed_parts(
+                        bytes.as_ptr() as *mut std::ffi::c_void,
+                        device,
+                        bytes.len(),
+                        borrow_align,
+                    )
+                };
+                let owned = std::mem::replace(buf, borrowed);
+                self.parked_input_buffers.push((vid, owned));
+                continue;
+            }
             input_bytes += bytes.len();
             self.ep.copy_from_host(bytes, buf)?;
         }
         phase_profile::record("bind_inputs.host_bytes", input_bytes as u128);
+        phase_profile::record("bind_inputs.borrowed_bytes", borrowed_bytes as u128);
+        Ok(())
+    }
+
+    /// Return every parked owned input buffer to [`Self::buffers`], dropping the
+    /// borrowed handle that stood in for it. Must run before `run_scoped_mode`
+    /// returns — on the error path too — so that no `DeviceBuffer` aliasing a
+    /// caller tensor survives the call that borrowed it.
+    ///
+    /// Borrowed handles are non-owning, so they are simply dropped rather than
+    /// deallocated; `DeviceBuffer` has no `Drop`, and `deallocate` is a no-op
+    /// free for borrowed handles anyway.
+    pub(super) fn unbind_borrowed_inputs(&mut self) -> Result<()> {
+        while let Some((vid, owned)) = self.parked_input_buffers.pop() {
+            match self.buffers.insert(vid, owned) {
+                // The expected case: the borrowed alias is dropped (it owns
+                // nothing, and `DeviceBuffer` has no `Drop`).
+                Some(installed) if installed.is_borrowed() => {}
+                // Something replaced the alias during the run (a sequence op
+                // re-roots a value's storage, for example). That replacement is
+                // now the live buffer for this value; keep it and free the
+                // allocation we parked instead, so neither handle leaks.
+                Some(installed) => {
+                    let parked = self
+                        .buffers
+                        .insert(vid, installed)
+                        .expect("value was just inserted");
+                    self.ep.deallocate(parked)?;
+                }
+                None => {}
+            }
+        }
         Ok(())
     }
 
