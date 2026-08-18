@@ -67,23 +67,36 @@ pub const HOST_HELPED: u32 = u32::MAX;
 
 /// Dispatches a session probes back to back before it starts backing off.
 ///
-/// A probe is deliberately made hard to fail — the implementation holds the
-/// calling thread's first index open so a worker that exists has time to claim
-/// another — but even so, a 16-thread ORT session answers only about half of
-/// them, because it hands its indices out dynamically and a caller that is not
-/// stalled drains them first. A burst of 32 turns that coin-flip into a
-/// certainty; getting it wrong the other way is the 3-10x mistake.
-pub const PROBE_BURST: u32 = 32;
+/// A probe is deliberately hard to fail: it carries no work, and the
+/// implementation holds the calling thread's first index open until another
+/// thread is seen taking one, up to a deadline. Instrumented over 15
+/// sixteen-thread sessions, every one latched, and the number of probes it
+/// took was 1 (nine sessions), 2 (five) or 3 (one). Eight is therefore ample
+/// margin. Only a pool with nobody to wake pays the deadline in full, and only
+/// eight times per fused node. An earlier design probed by diverting the
+/// caller's real work and needed a burst of 32, because an unstalled
+/// 16-thread dispatch answers only about half the time.
+pub const PROBE_BURST: u32 = 8;
 
 /// Gap between probes when the burst has produced nothing, before backoff.
-pub const PROBE_MIN: u32 = 16;
+///
+/// The burst is what answers the question; this is only the recovery path for
+/// a session whose pool was somehow busy through all eight, so it can start
+/// wide and still recover in a few hundred dispatches.
+pub const PROBE_MIN: u32 = 64;
 
 /// Longest gap between probes once the host has never been seen to help.
 ///
 /// Bounds the steady-state cost of asking on a session whose pool really is
-/// serial: one dispatch in a thousand runs on the host's single thread instead
-/// of ours.
+/// serial: one dispatch in a thousand pays for a probe.
 pub const PROBE_MAX: u32 = 1024;
+
+/// Indices in a probe dispatch.
+///
+/// A probe carries no work: it exists only to see whether anyone else picks up
+/// an index. More than one so there is something to pick up, and small so the
+/// host's queue never becomes the thing being measured.
+pub const PROBE_INDICES: usize = 8;
 
 /// Runs `body(i)` for every `i` in `0..total` on the host's threads.
 ///
@@ -154,25 +167,52 @@ impl HostParallel {
     /// pool ever actually run one of our bodies on another thread?* Only a
     /// pool with workers can, so a "yes" is permanent and cannot be faked.
     /// Until then this returns `false` — keeping the caller on its own pool,
-    /// which is what it did before this seam existed — except on the
-    /// occasional probe dispatch that gives the host a chance to answer.
+    /// which is what it did before this seam existed.
     ///
-    /// The first [`PROBE_BURST`] dispatches all ask, because at 16 threads a
+    /// The question is asked with a *probe*: an empty [`PROBE_INDICES`]-index
+    /// dispatch, run for its scheduling behaviour alone. Probing this way
+    /// rather than by sending the caller's real work to the host is what keeps
+    /// the unknown state cheap. A `intra_op = 1` session never latches, and
+    /// its real work would have been serialised on ORT's single thread every
+    /// time it was used as the question — 800 us at 1 Mi, against a 5x win
+    /// from our own pool. An empty probe costs the same on every dispatch it
+    /// touches, whatever the slice length.
+    ///
+    /// The first [`PROBE_BURST`] dispatches all probe, because at 16 threads a
     /// single dispatch answering "nobody helped" is uninformative — it happens
     /// 35% of the time — while a burst that long is answered almost surely.
     /// After that, probes back off geometrically from [`PROBE_MIN`] to
     /// [`PROBE_MAX`], so a session that really is serial settles at one probe
     /// per thousand dispatches and still recovers if the burst was unlucky.
     ///
-    /// Mutates the cell, so call it once per dispatch decision.
+    /// Mutates the cell and may dispatch, so call it once per dispatch
+    /// decision, and not from inside a host task.
     pub fn prefer_host(&self) -> bool {
-        let Some(cell) = self.probe_cell() else {
+        if self.helped() {
             return true;
+        }
+        if !self.probe_due() {
+            return false;
+        }
+        self.run(PROBE_INDICES, &|_| ());
+        // A probe that was answered leaves the caller's work on the host
+        // straight away, rather than spending this dispatch on the wrong pool
+        // to act on what was just learned.
+        self.helped()
+    }
+
+    /// Whether this dispatch is the one that should carry a probe.
+    ///
+    /// Split out from [`prefer_host`](Self::prefer_host) so the schedule can
+    /// be tested without a host to dispatch to.
+    fn probe_due(&self) -> bool {
+        let Some(cell) = self.probe_cell() else {
+            return false;
         };
         let mut seen = cell.load(Ordering::Relaxed);
         loop {
             if seen == HOST_HELPED {
-                return true;
+                return false;
             }
             let period = seen >> 16;
             let countdown = seen & 0xFFFF;
@@ -381,9 +421,47 @@ mod tests {
         let cell = AtomicU32::new(0);
         let host = with_probe(&cell);
         for step in 0..PROBE_BURST {
-            assert!(host.prefer_host(), "dispatch {step} of the burst");
+            assert!(host.probe_due(), "dispatch {step} of the burst");
         }
-        assert!(!host.prefer_host(), "the burst has to end somewhere");
+        assert!(!host.probe_due(), "the burst has to end somewhere");
+    }
+
+    /// A probe is its own dispatch, and an unhelpful one keeps the caller on
+    /// its own pool.
+    ///
+    /// The distinction is the whole point of probing separately: an
+    /// `intra_op = 1` session would otherwise answer the question by running
+    /// the caller's 1 Mi slice on one thread, at 800 us a time, when our own
+    /// pool does it 5x faster.
+    #[test]
+    fn a_probe_does_not_carry_the_callers_work() {
+        let cell = AtomicU32::new(0);
+        let indices = AtomicUsize::new(0);
+        // SAFETY: as `with_probe`; `COUNT` outlives the handle.
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+        unsafe fn counting_host(_host: *mut c_void, total: usize, body: &(dyn Fn(usize) + Sync)) {
+            COUNT.fetch_add(total, Ordering::Relaxed);
+            for index in 0..total {
+                body(index);
+            }
+        }
+        COUNT.store(0, Ordering::Relaxed);
+        // SAFETY: `counting_host` never dereferences `host`, and `cell`
+        // outlives the handle.
+        let host = unsafe {
+            HostParallel::new(
+                core::ptr::null_mut(),
+                counting_host,
+                core::ptr::from_ref(&cell),
+            )
+        };
+        assert!(!host.prefer_host(), "an inline host never proves itself");
+        assert_eq!(
+            COUNT.load(Ordering::Relaxed),
+            PROBE_INDICES,
+            "the probe dispatch is empty and fixed-size"
+        );
+        indices.store(0, Ordering::Relaxed);
     }
 
     /// Until the host has been seen helping, work stays on our pool -- which
@@ -395,7 +473,7 @@ mod tests {
         let mut gaps = Vec::new();
         let mut gap = 0u32;
         for _ in 0..8400 {
-            if host.prefer_host() {
+            if host.probe_due() {
                 gaps.push(gap);
                 gap = 0;
             } else {
@@ -434,6 +512,7 @@ mod tests {
         assert!(host.helped());
         for _ in 0..1000 {
             assert!(host.prefer_host());
+            assert!(!host.probe_due(), "a latched host is never probed again");
         }
         assert_eq!(cell.load(Ordering::Relaxed), HOST_HELPED);
     }
@@ -448,7 +527,7 @@ mod tests {
                 scope.spawn(|| {
                     let host = with_probe(&cell);
                     for _ in 0..5000 {
-                        host.prefer_host();
+                        host.probe_due();
                     }
                 });
             }
