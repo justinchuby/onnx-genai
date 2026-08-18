@@ -264,6 +264,8 @@ fn no_activation_or_norm_op_is_left_to_ort() {
         ("", "Softsign"),
         ("", "PRelu"),
         ("", "ThresholdedRelu"),
+        ("", "Celu"),
+        ("", "Mish"),
         ("", "Softmax"),
         ("", "LogSoftmax"),
         ("", "Swish"),

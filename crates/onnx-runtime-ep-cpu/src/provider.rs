@@ -1141,7 +1141,7 @@ mod tests {
                 node.attributes
                     .insert("direction".into(), Attribute::String(b"RIGHT".to_vec()));
             }
-            assert!(ep.get_kernel(&node, &[], 17).is_ok(), "no kernel for {op}");
+            assert!(ep.get_kernel(&node, &[], 18).is_ok(), "no kernel for {op}");
         }
         let bad = Node::new(onnx_runtime_ir::NodeId(99), "UnknownOp", vec![], vec![]);
         assert!(ep.get_kernel(&bad, &[], 17).is_err());
