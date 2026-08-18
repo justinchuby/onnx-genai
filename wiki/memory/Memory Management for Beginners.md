@@ -155,8 +155,10 @@ trait VirtualBacking: Send + Sync {
 
 ## “拆分 capabilities”是什么意思
 
-当前 `DeviceAllocator` 同时包含普通分配、lazy commit/decommit、
-committed-byte 查询、mapped-capacity 协作和 shared-prefix 等方法。
+Phase 2 已经把这些职责拆开：`DeviceAllocator` 只包含 device identity、
+普通 allocation 和整个 allocation 的最终 release。lazy commit/decommit 与
+committed-byte 查询属于可选 `VirtualBacking`；shared-prefix 属于独立可选
+`SharedMapping`。
 
 大多数普通 allocator 不支持高级功能，只能依赖默认实现。例如：
 
@@ -181,25 +183,27 @@ fn commit_allocation_range(...) -> Result<()> {
 - 真正支持物理页共享的实现才提供 `SharedMapping`；
 - 不支持某项能力时明确返回 absence 或 error，而不是成功 no-op。
 
-概念接口可以是：
+实际发现入口在已经选中的 allocator reference 上：
 
 ```rust
-trait DeviceMemoryMechanism {
-    fn allocator(&self) -> &dyn DeviceAllocator;
-    fn virtual_backing(&self) -> Option<&dyn VirtualBacking>;
-    fn shared_mapping(&self) -> Option<&dyn SharedMapping>;
+trait DeviceAllocator {
+    fn as_virtual_backing(&self) -> Option<&dyn VirtualBacking>;
+    fn as_shared_mapping(&self) -> Option<&dyn SharedMapping>;
 }
 ```
 
 调用方必须显式处理 fallback：
 
 ```rust
-let Some(backing) = mechanism.virtual_backing() else {
+let Some(backing) = allocator.as_virtual_backing() else {
     return use_eager_allocation_path();
 };
 ```
 
-这不是已经接受的最终 API，只用于说明能力应显式协商。
+能力 coherence 是 raw-pointer allocator 边界上的 trusted contract：
+返回的 capability 必须与该 allocator 使用同一 mechanism/device，整个
+allocation 的最终 release 仍走 `DeviceAllocator`/EP。Rust 不会结构性证明
+恶意 wrapper 的多个 inner 一致；runtime identity heuristic 不被当成安全证明。
 
 ## 为什么 SharedMapping 应再次独立
 
@@ -468,5 +472,5 @@ onnx-runtime-memory-api
 - [Memory Architecture](../../docs/memory/MEMORY_ARCHITECTURE.md)
 - [Memory Management Model Design](../../docs/memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md)
 - [Weight Offload](../../docs/memory/WEIGHT_OFFLOAD.md)
-- [`DeviceAllocator` implementation](../../crates/onnx-runtime-memory-governor/src/allocator.rs)
+- [`DeviceAllocator` implementation](../../crates/onnx-runtime-memory-api/src/allocator.rs)
 - [`ExecutionProvider` and `DeviceBuffer`](../../crates/onnx-runtime-ep-api/src/provider.rs)

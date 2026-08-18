@@ -594,8 +594,9 @@ pub trait ExecutionProvider: Send + Sync {
     }
 
     /// Release physical backing from a byte range in an existing allocation
-    /// while preserving its virtual address. Eager providers keep the default
-    /// no-op; lazy providers use this for transactional growth rollback.
+    /// while preserving its virtual address. Lazy providers use this for
+    /// transactional growth rollback. Eager providers return an actionable
+    /// unsupported error: unlike commit, decommit has no eager equivalent.
     /// Returns the bytes actually unmapped after shared references are applied.
     fn decommit_allocation_range(
         &self,
@@ -604,7 +605,10 @@ pub trait ExecutionProvider: Send + Sync {
         bytes: usize,
     ) -> Result<u64> {
         let _ = (buffer, offset, bytes);
-        Ok(0)
+        Err(EpError::KernelFailed(format!(
+            "{}: partial decommit requires a VirtualBacking capability",
+            self.name()
+        )))
     }
 
     /// Physical bytes currently claimed by `buffer`. Eager providers return
@@ -876,16 +880,15 @@ pub trait ExecutionProvider: Send + Sync {
     /// Whether the memory this provider hands out commits physically as it is
     /// used rather than when it is requested.
     ///
-    /// A forwarder, not a fact of its own: the property belongs to
-    /// [`DeviceAllocator::commits_on_demand`], and a provider should answer by
-    /// asking whichever allocator it is currently using. It is repeated here
-    /// only because a caller holding a session reaches the allocator through
-    /// the provider.
+    /// A forwarder, not a fact of its own: a provider should answer by
+    /// discovering [`VirtualBacking`] from whichever allocator it currently
+    /// uses. It is repeated here only because a caller holding a session
+    /// reaches the allocator through the provider.
     ///
     /// `false` is the safe default -- a consumer that believes `true` will
     /// under-reserve.
     ///
-    /// [`DeviceAllocator::commits_on_demand`]: onnx_runtime_memory_governor::DeviceAllocator::commits_on_demand
+    /// [`VirtualBacking`]: onnx_runtime_memory_governor::VirtualBacking
     fn commits_on_demand(&self) -> bool {
         false
     }

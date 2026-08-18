@@ -30,6 +30,7 @@ use onnx_runtime_ep_api::{
     structural_input_bytes,
 };
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
+use onnx_runtime_memory_governor::DeviceAllocator;
 
 use crate::kernels::build_cuda_registry_with_metrics;
 use crate::kernels::csa_checkpoint::CsaMetrics;
@@ -150,6 +151,32 @@ fn resolve_vmm_initialization<T, E: std::fmt::Display>(
     }
 }
 
+/// The one allocator mechanism selected for this provider.
+///
+/// Keeping the built-in VMM variant concrete preserves its governor-specific
+/// capacity-token path without caching a second allocator/capability handle.
+/// Every generic capability lookup still starts from [`CudaMemory::allocator`].
+enum CudaMemory {
+    Allocator(Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>),
+    Vmm(Arc<crate::vmm_allocator::CudaVmmAllocator>),
+}
+
+impl CudaMemory {
+    fn allocator(&self) -> &dyn onnx_runtime_memory_governor::DeviceAllocator {
+        match self {
+            Self::Allocator(allocator) => allocator.as_ref(),
+            Self::Vmm(arena) => arena.as_ref(),
+        }
+    }
+
+    fn vmm(&self) -> Option<&Arc<crate::vmm_allocator::CudaVmmAllocator>> {
+        match self {
+            Self::Allocator(_) => None,
+            Self::Vmm(arena) => Some(arena),
+        }
+    }
+}
+
 /// CUDA execution provider (Phase 2a: cudarc + cuBLASLt GEMM).
 ///
 /// Unlike the always-available CPU EP, this provider needs a real device, so
@@ -165,15 +192,8 @@ pub struct CudaExecutionProvider {
     /// allocator use, so an allocator a caller writes serves every backend.
     /// Defaults to CudaDeviceAllocator, which is the cuMemAlloc call this
     /// EP used to make directly.
-    memory: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>,
+    memory: CudaMemory,
     governor: Option<Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
-    /// Installed by `adopt_memory_governor` when VMM is enabled, and read in
-    /// place of `memory` from then on.
-    ///
-    /// A `OnceLock` rather than a lock because this is set once, before any
-    /// allocation, and read on every one: `get` is a relaxed atomic load, so
-    /// the hot path pays nothing for the option to swap.
-    vmm: std::sync::OnceLock<Arc<crate::vmm_allocator::CudaVmmAllocator>>,
     /// Allocations and frees this EP made through `memory`.
     ///
     /// Kept here rather than asked of the allocator, because the allocator is
@@ -274,9 +294,6 @@ impl CudaExecutionProvider {
         });
         let provider = Self {
             device: DeviceId::cuda(ordinal),
-            memory: Arc::new(crate::device_allocator::CudaDeviceAllocator::new(
-                runtime.cuda_context(),
-            )),
             governor: governor.clone(),
             // Built here rather than at governor adoption, because on the
             // native path the session allocates every tensor it will use while
@@ -288,8 +305,12 @@ impl CudaExecutionProvider {
             // fitted: 64 GiB comfortably exceeds any single accelerator we
             // target, and running out of *reservation* is a hard failure while
             // leaving it unmapped costs nothing.
-            vmm: {
-                let cell = std::sync::OnceLock::new();
+            memory: {
+                let eager = || {
+                    CudaMemory::Allocator(Arc::new(
+                        crate::device_allocator::CudaDeviceAllocator::new(runtime.cuda_context()),
+                    ))
+                };
                 if crate::vmm_allocator::vmm_enabled() || auto_dynamic_lending {
                     const RESERVATION_BYTES: usize = 64 << 30;
                     let synchronization_runtime = Arc::clone(&runtime);
@@ -361,16 +382,20 @@ impl CudaExecutionProvider {
                                     ""
                                 }
                             );
-                            let _ = cell.set(Arc::new(arena));
+                            CudaMemory::Vmm(Arc::new(arena))
                         }
-                        VmmInitialization::CompatibilityFallback(error) => eprintln!(
-                            "cuda_ep: WARNING: could not build the VMM arena, falling back to \
-                             cuMemAlloc; device allocations will not be charged to the ledger: \
-                             {error}"
-                        ),
+                        VmmInitialization::CompatibilityFallback(error) => {
+                            eprintln!(
+                                "cuda_ep: WARNING: could not build the VMM arena, falling back to \
+                                 cuMemAlloc; device allocations will not be charged to the ledger: \
+                                 {error}"
+                            );
+                            eager()
+                        }
                     }
+                } else {
+                    eager()
                 }
-                cell
             },
             ep_allocations: Arc::new(AtomicU64::new(0)),
             ep_frees: Arc::new(AtomicU64::new(0)),
@@ -384,7 +409,7 @@ impl CudaExecutionProvider {
             mapped_requesters: Mutex::new(HashMap::new()),
         };
         if let (Some(residency), Some(arena), Some(governor)) =
-            (provider.residency.as_ref(), provider.vmm.get(), governor)
+            (provider.residency.as_ref(), provider.memory.vmm(), governor)
             && arena.physical_pool_authority().is_some()
         {
             residency
@@ -398,22 +423,15 @@ impl CudaExecutionProvider {
         Ok(provider)
     }
 
-    /// The allocator in force: the VMM arena once installed, otherwise the one
-    /// this provider was built with.
-    ///
-    /// `OnceLock::get` is a relaxed atomic load, so the allocation path pays
-    /// nothing for the option to swap.
+    /// The single allocator selected for this provider.
     fn memory(&self) -> &dyn onnx_runtime_memory_governor::DeviceAllocator {
-        match self.vmm.get() {
-            Some(arena) => arena.as_ref(),
-            None => self.memory.as_ref(),
-        }
+        self.memory.allocator()
     }
 
     fn synchronize_before_pooled_unmap(&self) -> Result<()> {
         if self
-            .vmm
-            .get()
+            .memory
+            .vmm()
             .is_some_and(|arena| arena.physical_pool_stats().is_some())
         {
             self.runtime.synchronize().map_err(|error| {
@@ -461,7 +479,17 @@ impl CudaExecutionProvider {
                 expected.index, key.tier, key.index, expected.index
             )));
         }
-        self.memory = memory;
+        if let Some(arena) = self.memory.vmm() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: this execution provider selected its VMM allocator for CUDA device {} \
+                 at construction time; `with_memory` cannot silently replace or ignore that \
+                 selection. Construct without {} and without automatic dynamic lending before \
+                 injecting an allocator.",
+                onnx_runtime_memory_governor::DeviceAllocator::device(arena.as_ref()).index,
+                crate::vmm_allocator::CUDA_VMM_ENV
+            )));
+        }
+        self.memory = CudaMemory::Allocator(memory);
         Ok(self)
     }
 
@@ -878,7 +906,7 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
         if dynamic_lending_enabled()
-            && self.memory().commits_on_demand()
+            && let Some(virtual_backing) = self.memory().as_virtual_backing()
             && let Some(governor) = self.governor.as_deref()
             && let Some(requester) = self
                 .mapped_requesters
@@ -889,8 +917,7 @@ impl ExecutionProvider for CudaExecutionProvider {
                 ))
                 .cloned()
         {
-            let bytes = self
-                .memory()
+            let bytes = virtual_backing
                 .mapped_bytes_for_allocation(size, alignment)
                 .map_err(EpError::Memory)?;
             let grant = governor
@@ -912,8 +939,14 @@ impl ExecutionProvider for CudaExecutionProvider {
             return Err(EpError::AlignmentError);
         }
         let full = 0..size;
-        let allocation = self
-            .memory()
+        let Some(arena) = self.memory.vmm() else {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: mapped growth requires the construction-selected CUDA VMM allocator; \
+                 no second allocator handle or capability downcast is used"
+                    .into(),
+            ));
+        };
+        let allocation = arena
             .allocate_committed_with_capacity(
                 size,
                 alignment,
@@ -935,7 +968,7 @@ impl ExecutionProvider for CudaExecutionProvider {
             if let Some(ptr) = std::ptr::NonNull::new(ptr.cast::<u8>()) {
                 // Attribution never committed, so roll back the physical map
                 // without running the provider's canonical refund.
-                unsafe { self.memory().deallocate(ptr, size, alignment) };
+                unsafe { arena.deallocate(ptr, size, alignment) };
             }
             return Err(EpError::Memory(error));
         }
@@ -960,10 +993,15 @@ impl ExecutionProvider for CudaExecutionProvider {
         // same value; normalising a zero-byte request is the allocator's job,
         // because the contract lets an implementation rely on the two sizes
         // agreeing.
-        let ptr = self
-            .memory()
-            .allocate_committed(size, alignment, committed_ranges)
-            .map_err(EpError::Memory)?;
+        let ptr = match self.memory().as_virtual_backing() {
+            Some(virtual_backing) => virtual_backing
+                .allocate_committed(size, alignment, committed_ranges)
+                .map_err(EpError::Memory)?,
+            None => self
+                .memory()
+                .allocate(size, alignment)
+                .map_err(EpError::Memory)?,
+        };
         self.ep_allocations.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `ptr` is a fresh, unique, non-null device allocation of
         // >= `size` bytes owned by this EP and freed exactly once in
@@ -985,10 +1023,15 @@ impl ExecutionProvider for CudaExecutionProvider {
             "cuda_ep: refusing to commit a buffer from device {:?}",
             buffer.device()
         );
+        let Some(virtual_backing) = self.memory().as_virtual_backing() else {
+            // Eager fallback: the whole allocation was already physically
+            // backed, so there is no accounting-changing operation to perform.
+            return Ok(());
+        };
         let Some(ptr) = std::ptr::NonNull::new(buffer.as_ptr().cast::<u8>() as *mut u8) else {
             return Ok(());
         };
-        self.memory()
+        virtual_backing
             .commit_allocation_range(ptr, buffer.len(), buffer.alignment(), offset, bytes)
             .map_err(|error| {
                 EpError::KernelFailed(format!(
@@ -1001,6 +1044,10 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn commit_allocation_ranges(&self, ranges: &[(&DeviceBuffer, usize, usize)]) -> Result<()> {
+        let Some(virtual_backing) = self.memory().as_virtual_backing() else {
+            // Same explicit eager fallback as the single-range operation.
+            return Ok(());
+        };
         let raw = ranges
             .iter()
             .map(|&(buffer, offset, bytes)| {
@@ -1021,7 +1068,7 @@ impl ExecutionProvider for CudaExecutionProvider {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        self.memory()
+        virtual_backing
             .commit_allocation_ranges(&raw)
             .map_err(|error| {
                 EpError::KernelFailed(format!(
@@ -1037,6 +1084,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         ranges: &[(&DeviceBuffer, usize, usize)],
         grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
     ) -> Result<u64> {
+        let Some(arena) = self.memory.vmm() else {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: mapped growth requires the construction-selected CUDA VMM allocator; \
+                 injected allocators use their ordinary capability path"
+                    .into(),
+            ));
+        };
         let raw = ranges
             .iter()
             .map(|&(buffer, offset, bytes)| {
@@ -1053,7 +1107,7 @@ impl ExecutionProvider for CudaExecutionProvider {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        self.memory()
+        arena
             .commit_allocation_ranges_with_capacity(&raw, grant.physical_capacity())
             .map_err(|error| {
                 EpError::KernelFailed(format!(
@@ -1068,6 +1122,11 @@ impl ExecutionProvider for CudaExecutionProvider {
         &self,
         ranges: &[(&DeviceBuffer, usize, usize)],
     ) -> Result<u64> {
+        let Some(virtual_backing) = self.memory().as_virtual_backing() else {
+            return Ok(ranges.iter().fold(0_u64, |total, &(_, _, bytes)| {
+                total.saturating_add(bytes as u64)
+            }));
+        };
         let raw = ranges
             .iter()
             .map(|&(buffer, offset, bytes)| {
@@ -1084,15 +1143,18 @@ impl ExecutionProvider for CudaExecutionProvider {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        self.memory()
+        virtual_backing
             .mapped_bytes_for_allocation_ranges(&raw)
             .map_err(EpError::Memory)
     }
 
     fn mapped_bytes_for_allocation(&self, bytes: usize, alignment: usize) -> Result<u64> {
-        self.memory()
-            .mapped_bytes_for_allocation(bytes, alignment)
-            .map_err(EpError::Memory)
+        match self.memory().as_virtual_backing() {
+            Some(virtual_backing) => virtual_backing
+                .mapped_bytes_for_allocation(bytes, alignment)
+                .map_err(EpError::Memory),
+            None => Ok(bytes as u64),
+        }
     }
 
     fn decommit_allocation_range(
@@ -1107,12 +1169,18 @@ impl ExecutionProvider for CudaExecutionProvider {
             "cuda_ep: refusing to decommit a buffer from device {:?}",
             buffer.device()
         );
+        let Some(virtual_backing) = self.memory().as_virtual_backing() else {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: allocator for CUDA device {} has no VirtualBacking capability; \
+                 partial decommit is unsupported for eager allocations",
+                self.device.index
+            )));
+        };
         let Some(ptr) = std::ptr::NonNull::new(buffer.as_ptr().cast::<u8>() as *mut u8) else {
             return Ok(0);
         };
         self.synchronize_before_pooled_unmap()?;
-        let unmapped = self
-            .memory()
+        let unmapped = virtual_backing
             .decommit_allocation_range(ptr, buffer.len(), buffer.alignment(), offset, bytes)
             .map_err(|error| {
                 EpError::KernelFailed(format!(
@@ -1131,7 +1199,10 @@ impl ExecutionProvider for CudaExecutionProvider {
             return 0;
         };
         self.memory()
-            .allocation_committed_bytes(ptr, buffer.len(), buffer.alignment())
+            .as_virtual_backing()
+            .map_or(buffer.len(), |virtual_backing| {
+                virtual_backing.allocation_committed_bytes(ptr, buffer.len(), buffer.alignment())
+            })
     }
 
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()> {
@@ -1433,7 +1504,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         bytes: u64,
         role: onnx_runtime_memory_governor::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
-        if self.memory().commits_on_demand() {
+        if self.memory.vmm().is_some() {
             return Ok(None);
         }
         self.governor
@@ -1455,7 +1526,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         bytes: u64,
         role: onnx_runtime_memory_governor::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
-        if bytes == 0 || !dynamic_lending_enabled() || !self.memory().commits_on_demand() {
+        if bytes == 0 || !dynamic_lending_enabled() || self.memory.vmm().is_none() {
             return Ok(None);
         }
         let Some(governor) = self.governor.as_deref() else {
@@ -1513,7 +1584,10 @@ impl ExecutionProvider for CudaExecutionProvider {
     /// False on the `cuMemAlloc` path, which takes physical memory at the
     /// moment it is asked for.
     fn commits_on_demand(&self) -> bool {
-        self.memory().commits_on_demand()
+        // Capability presence is mechanism-only and does not prove that an
+        // injected allocator participates in this provider's governor. Only
+        // the construction-selected in-tree VMM has that accounting contract.
+        self.memory.vmm().is_some()
     }
 
     fn set_weight_residency_budget(&self, budget_bytes: u64) -> Result<Option<u64>> {
@@ -1537,7 +1611,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         tier: onnx_runtime_memory_governor::Tier,
         holder: onnx_runtime_memory_governor::HolderId,
     ) -> Result<u64> {
-        if let Some(arena) = self.vmm.get() {
+        if let Some(arena) = self.memory.vmm() {
             if let Some(authority) = arena.physical_pool_authority()
                 && authority != governor.authority_id()
             {
@@ -1702,6 +1776,38 @@ mod tests {
         ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
     )]
     #[test]
+    fn construction_selected_vmm_rejects_injection_instead_of_ignoring_it() {
+        // SAFETY: this integration-style unit test controls construction in its
+        // own test process and forces the mechanism-selection branch.
+        unsafe { std::env::set_var(crate::vmm_allocator::CUDA_VMM_ENV, "1") };
+        let provider = CudaExecutionProvider::new(0).expect("VMM-selected provider");
+        assert!(
+            provider.memory.vmm().is_some(),
+            "the construction-time VMM selection must be active"
+        );
+
+        let injected = Arc::new(crate::device_allocator::CudaDeviceAllocator::new(
+            provider.runtime().cuda_context(),
+        ));
+        let error = provider
+            .with_memory(injected.clone())
+            .expect_err("a selected VMM must not silently ignore injection");
+        assert!(
+            error.to_string().contains("selected its VMM allocator"),
+            "the rejection must explain the construction-time selection: {error}"
+        );
+        assert_eq!(
+            injected.cumemalloc_calls(),
+            0,
+            "a rejected allocator was never selected or used"
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
     fn public_constructor_installs_configured_physical_pool() {
         use cudarc::driver::{LaunchConfig, PushKernelArg};
 
@@ -1715,14 +1821,14 @@ mod tests {
         let provider = CudaExecutionProvider::new(0).expect("public CUDA provider");
         assert!(
             provider
-                .vmm
-                .get()
+                .memory
+                .vmm()
                 .is_some_and(|arena| arena.physical_pool_stats().is_some()),
             "public constructor must use the configured physical pool"
         );
         let stats = provider
-            .vmm
-            .get()
+            .memory
+            .vmm()
             .and_then(|arena| arena.physical_pool_stats())
             .expect("pool stats");
 
@@ -1979,8 +2085,8 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
             "the VMM arena, not the cuMemAlloc path, must serve allocations on the plugin path"
         );
         let stats = provider
-            .vmm
-            .get()
+            .memory
+            .vmm()
             .and_then(|arena| arena.physical_pool_stats())
             .expect(
                 "#956: the standalone plugin path installs a retained physical-handle pool by \
@@ -2159,8 +2265,8 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         .expect("first provider");
         let runtime = first.runtime().clone();
         let stats = first
-            .vmm
-            .get()
+            .memory
+            .vmm()
             .and_then(|arena| arena.physical_pool_stats())
             .expect("pool stats");
         let write_after_delay = runtime

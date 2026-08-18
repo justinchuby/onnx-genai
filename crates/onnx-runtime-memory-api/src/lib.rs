@@ -1,39 +1,25 @@
 //! # `onnx-runtime-memory-api`
 //!
-//! Dependency-free primitive types shared by memory mechanisms, governors, and
-//! execution providers.
+//! Low-dependency memory mechanism contracts shared by allocators, governors,
+//! and execution providers.
 //!
-//! This crate is the lowest layer of the runtime memory stack. It owns only
-//! types that describe placement, allocation ranges, mapped-byte outcomes, and
-//! opaque shared-prefix backing. It does not own allocation policy, accounting,
-//! synchronization, or runtime selection.
+//! This crate is the lowest layer of the runtime memory stack. It owns the
+//! minimum ordinary allocator contract, explicit optional virtual-backing and
+//! shared-mapping capabilities, and their primitive types. It does not own
+//! allocation policy, accounting, synchronization, or runtime selection.
 //!
-//! ## Types extracted in Phase 1
-//!
-//! * [`Tier`] and [`DeviceKey`] describe memory placement.
-//! * [`AllocationCommitRange`] and [`MappedAllocation`] describe existing
-//!   allocation and commit results.
-//! * [`SharedDevicePrefix`] and [`SharedPrefixCommitInfo`] describe the existing
-//!   opaque shared-prefix mechanism.
-//!
-//! ## Types that remain in `onnx-runtime-memory-governor`
-//!
-//! * `DeviceAllocator` and `HostAllocator`, because the current allocator trait
-//!   accepts governor-owned capacity tokens and errors.
-//! * `MemoryRole`, `MemoryError`, authority and holder identities, ledgers,
-//!   capacity tokens and grants, leases, pressure responders, and governor
-//!   traits, because they express accounting or governance.
-//! * The large-allocation cache and prefix-shareability analysis, because they
-//!   are built over the current governor-owned allocator and admission model.
-//!
-//! Existing `onnx-runtime-memory-governor` paths re-export the moved types for
-//! source compatibility.
+//! Governor-specific capacity tokens and grants remain in
+//! `onnx-runtime-memory-governor`; they are not methods every allocator or
+//! optional capability must implement.
 
 pub mod allocator;
+pub mod capability;
 
 pub use allocator::{
-    AllocationCommitRange, DeviceKey, MappedAllocation, SharedDevicePrefix, SharedPrefixCommitInfo,
+    AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator, MappedAllocation,
+    SharedDevicePrefix, SharedPrefixCommitInfo,
 };
+pub use capability::{SharedMapping, VirtualBacking};
 
 /// Where the bytes physically live.
 ///
@@ -52,6 +38,14 @@ impl Tier {
     /// Every tier, fastest first.
     pub const ALL: [Tier; 3] = [Tier::Device, Tier::Host, Tier::Disk];
 
+    pub const fn index(self) -> usize {
+        match self {
+            Tier::Device => 0,
+            Tier::Host => 1,
+            Tier::Disk => 2,
+        }
+    }
+
     /// Human-facing name used in error messages.
     pub const fn name(self) -> &'static str {
         match self {
@@ -60,6 +54,56 @@ impl Tier {
             Tier::Disk => "disk",
         }
     }
+}
+
+/// What a reservation is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemoryRole {
+    KvCache,
+    Workspace { step_scoped: bool },
+    Weights,
+    Activation,
+}
+
+/// Shared error vocabulary for mechanism and governance operations.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MemoryError {
+    #[error(
+        "cannot reserve {requested} bytes of {tier} memory for {role:?}: {used} of {limit} bytes \
+         are already leased, leaving {available}; free memory by closing sessions, lower the \
+         demand, or raise the {tier} limit"
+    )]
+    TierExhausted {
+        tier: &'static str,
+        requested: u64,
+        used: u64,
+        limit: u64,
+        available: u64,
+        role: MemoryRole,
+    },
+    #[error("cannot reserve {requested} bytes of {tier} memory: {reason}")]
+    InvalidRequest {
+        tier: &'static str,
+        requested: u64,
+        reason: &'static str,
+    },
+    #[error("cannot allocate {requested} bytes of {tier} memory: {reason}")]
+    AllocationFailed {
+        tier: &'static str,
+        requested: u64,
+        reason: String,
+    },
+    #[error(
+        "cannot make {requested} bytes of {tier} capacity available for {role:?}: only \
+         {available} bytes became available; {detail}"
+    )]
+    CapacityUnavailable {
+        tier: &'static str,
+        requested: u64,
+        available: u64,
+        role: MemoryRole,
+        detail: String,
+    },
 }
 
 #[cfg(test)]

@@ -57,7 +57,7 @@ use std::sync::{Arc, Mutex};
 use onnx_runtime_memory_governor::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HolderId, MappedPhysicalCapacityToken,
     MemoryAuthorityId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, SharedDevicePrefix,
-    SharedPrefixCommitInfo, Tier,
+    SharedMapping, SharedPrefixCommitInfo, Tier, VirtualBacking as MemoryVirtualBacking,
 };
 use onnx_runtime_virtual_memory::{PhysicalMemoryAccounting, VirtualBacking};
 
@@ -1276,17 +1276,23 @@ impl CudaVmmAllocator {
         })
     }
 
-    /// Estimate the incremental **owned** physical bytes to admit one more
-    /// sharer of `prefix` — always zero, because the prefix's granules are
-    /// already owned.
+    /// Estimate the incremental owned bytes to admit one more sharer.
     ///
-    /// This is the admission-facing statement (#745): the shared bytes are
-    /// charged once, so the Nth request costs only its private continuation.
-    /// It is an observation; [`commit_shared_prefix`](Self::commit_shared_prefix)
-    /// is the operation.
+    /// Zero is valid only when this allocator can actually map the prefix:
+    /// device and physical-pool authority must both match. A foreign prefix is
+    /// conservatively charged at its full physical footprint and the mapping
+    /// operation rejects it.
     pub fn incremental_owned_bytes_for_shared_prefix(&self, prefix: &SharedPrefix) -> u64 {
-        let _ = prefix;
-        0
+        let same_device = prefix.device == self.device;
+        let same_authority = match (prefix.authority, self.physical_pool_authority()) {
+            (Some(prefix_authority), Some(self_authority)) => prefix_authority == self_authority,
+            _ => false,
+        };
+        if same_device && same_authority {
+            0
+        } else {
+            prefix.committed_physical_bytes()
+        }
     }
 
     /// Map `prefix` into the live allocation `ptr` at `byte_offset`,
@@ -1628,6 +1634,63 @@ impl CudaVmmAllocator {
         }
         Ok(commit)
     }
+
+    /// Reserve one allocation and atomically consume governor-owned mapped
+    /// capacity for the granules that become newly mapped.
+    ///
+    /// This stays inherent because [`MappedPhysicalCapacityToken`] belongs to
+    /// the governor, not to the low-level [`MemoryVirtualBacking`] capability.
+    pub fn allocate_committed_with_capacity(
+        &self,
+        bytes: usize,
+        align: usize,
+        committed_ranges: &[std::ops::Range<usize>],
+        capacity: &mut MappedPhysicalCapacityToken,
+    ) -> Result<onnx_runtime_memory_governor::MappedAllocation<NonNull<u8>>, MemoryError> {
+        if capacity.role() != self.role {
+            return Err(invalid(
+                bytes,
+                format!(
+                    "mapped allocation role {:?} does not match arena zone {:?}",
+                    capacity.role(),
+                    self.role
+                ),
+            ));
+        }
+        let ptr = <Self as MemoryVirtualBacking>::allocate_committed(self, bytes, align, &[])?;
+        let ranges = committed_ranges
+            .iter()
+            .map(|range| AllocationCommitRange {
+                ptr,
+                allocation_bytes: bytes,
+                align,
+                offset: range.start,
+                bytes: range.len(),
+            })
+            .collect::<Vec<_>>();
+        let commit = match self.commit_allocation_ranges_inner(&ranges, Some(capacity)) {
+            Ok(commit) => commit,
+            Err(error) => {
+                // SAFETY: this exact live allocation has not escaped.
+                unsafe { self.deallocate(ptr, bytes, align) };
+                return Err(error);
+            }
+        };
+        Ok(onnx_runtime_memory_governor::MappedAllocation {
+            allocation: ptr,
+            newly_mapped_bytes: commit.newly_mapped_bytes,
+        })
+    }
+
+    /// Commit ranges while atomically consuming governor-owned mapped capacity.
+    pub fn commit_allocation_ranges_with_capacity(
+        &self,
+        ranges: &[AllocationCommitRange],
+        capacity: &mut MappedPhysicalCapacityToken,
+    ) -> Result<u64, MemoryError> {
+        self.commit_allocation_ranges_inner(ranges, Some(capacity))
+            .map(|commit| commit.newly_mapped_bytes)
+    }
 }
 
 // SAFETY: every pointer handed out lies inside this allocator's reservation,
@@ -1638,9 +1701,41 @@ impl CudaVmmAllocator {
 impl DeviceAllocator for CudaVmmAllocator {
     fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
         let full = 0..bytes;
-        self.allocate_committed(bytes, align, std::slice::from_ref(&full))
+        <Self as MemoryVirtualBacking>::allocate_committed(
+            self,
+            bytes,
+            align,
+            std::slice::from_ref(&full),
+        )
     }
 
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, _bytes: usize, _align: usize) {
+        let _ = self.deallocate_span(ptr);
+    }
+
+    unsafe fn deallocate_with_unmapped(
+        &self,
+        ptr: NonNull<u8>,
+        _bytes: usize,
+        _align: usize,
+    ) -> u64 {
+        self.deallocate_span(ptr)
+    }
+
+    fn device(&self) -> DeviceKey {
+        self.device
+    }
+
+    fn as_virtual_backing(&self) -> Option<&dyn MemoryVirtualBacking> {
+        Some(self)
+    }
+
+    fn as_shared_mapping(&self) -> Option<&dyn SharedMapping> {
+        self.backing.physical_pool().is_some().then_some(self)
+    }
+}
+
+impl MemoryVirtualBacking for CudaVmmAllocator {
     fn allocate_committed(
         &self,
         bytes: usize,
@@ -1718,49 +1813,6 @@ impl DeviceAllocator for CudaVmmAllocator {
         Ok(unsafe { NonNull::new_unchecked((base + offset) as *mut u8) })
     }
 
-    fn allocate_committed_with_capacity(
-        &self,
-        bytes: usize,
-        align: usize,
-        committed_ranges: &[std::ops::Range<usize>],
-        capacity: &mut MappedPhysicalCapacityToken,
-    ) -> Result<onnx_runtime_memory_governor::MappedAllocation<NonNull<u8>>, MemoryError> {
-        if capacity.role() != self.role {
-            return Err(invalid(
-                bytes,
-                format!(
-                    "mapped allocation role {:?} does not match arena zone {:?}",
-                    capacity.role(),
-                    self.role
-                ),
-            ));
-        }
-        let ptr = self.allocate_committed(bytes, align, &[])?;
-        let ranges = committed_ranges
-            .iter()
-            .map(|range| AllocationCommitRange {
-                ptr,
-                allocation_bytes: bytes,
-                align,
-                offset: range.start,
-                bytes: range.len(),
-            })
-            .collect::<Vec<_>>();
-        let commit = match self.commit_allocation_ranges_inner(&ranges, Some(capacity)) {
-            Ok(commit) => commit,
-            Err(error) => {
-                // SAFETY: this is the exact live allocation returned above and
-                // it has not escaped to the caller.
-                unsafe { self.deallocate(ptr, bytes, align) };
-                return Err(error);
-            }
-        };
-        Ok(onnx_runtime_memory_governor::MappedAllocation {
-            allocation: ptr,
-            newly_mapped_bytes: commit.newly_mapped_bytes,
-        })
-    }
-
     fn commit_allocation_range(
         &self,
         ptr: NonNull<u8>,
@@ -1829,15 +1881,6 @@ impl DeviceAllocator for CudaVmmAllocator {
     ) -> Result<(), MemoryError> {
         self.commit_allocation_ranges_inner(ranges, None)
             .map(|_| ())
-    }
-
-    fn commit_allocation_ranges_with_capacity(
-        &self,
-        ranges: &[AllocationCommitRange],
-        capacity: &mut MappedPhysicalCapacityToken,
-    ) -> Result<u64, MemoryError> {
-        self.commit_allocation_ranges_inner(ranges, Some(capacity))
-            .map(|commit| commit.newly_mapped_bytes)
     }
 
     fn mapped_bytes_for_allocation_ranges(
@@ -1957,30 +2000,9 @@ impl DeviceAllocator for CudaVmmAllocator {
             .map(|live| live.committed.len() * arena.spans.granularity)
             .unwrap_or(allocation_bytes)
     }
+}
 
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, _bytes: usize, _align: usize) {
-        let _ = self.deallocate_span(ptr);
-    }
-
-    unsafe fn deallocate_with_unmapped(
-        &self,
-        ptr: NonNull<u8>,
-        _bytes: usize,
-        _align: usize,
-    ) -> u64 {
-        self.deallocate_span(ptr)
-    }
-
-    /// True: spans are carved from granules mapped as they are needed, and
-    /// each granule is leased before it is mapped.
-    fn commits_on_demand(&self) -> bool {
-        true
-    }
-
-    fn device(&self) -> DeviceKey {
-        self.device
-    }
-
+impl SharedMapping for CudaVmmAllocator {
     fn create_shared_prefix(
         &self,
         bytes: usize,

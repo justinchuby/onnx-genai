@@ -517,16 +517,19 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
     )
     .expect("independent VMM allocator");
     let indep: &dyn DeviceAllocator = &indep_alloc;
+    let indep_backing = indep
+        .as_virtual_backing()
+        .expect("VMM exposes VirtualBacking through the selected allocator");
 
     let mut independent_out = Vec::new();
     let mut indep_ptrs = Vec::new();
     for seq in 0..2usize {
         // Full private caches: every granule committed (prefix + tail).
         let full = 0..alloc_bytes;
-        let key_ptr = indep
+        let key_ptr = indep_backing
             .allocate_committed(alloc_bytes, granule, std::slice::from_ref(&full))
             .expect("independent key cache");
-        let value_ptr = indep
+        let value_ptr = indep_backing
             .allocate_committed(alloc_bytes, granule, std::slice::from_ref(&full))
             .expect("independent value cache");
         // Seed prefix into granule 0; zero the tail granule.
@@ -587,13 +590,19 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
     )
     .expect("shared VMM allocator");
     let shared: &dyn DeviceAllocator = &shared_alloc;
+    let shared_backing = shared
+        .as_virtual_backing()
+        .expect("shared VMM exposes VirtualBacking");
+    let shared_mapping = shared
+        .as_shared_mapping()
+        .expect("pooled VMM exposes SharedMapping independently");
 
     // Create the two pinned prefixes (K, V) through the trait seam and fill
     // their content once through each owner window.
-    let key_prefix: Box<dyn SharedDevicePrefix> = shared
+    let key_prefix: Box<dyn SharedDevicePrefix> = shared_mapping
         .create_shared_prefix(granule)
         .expect("pin key prefix");
-    let value_prefix: Box<dyn SharedDevicePrefix> = shared
+    let value_prefix: Box<dyn SharedDevicePrefix> = shared_mapping
         .create_shared_prefix(granule)
         .expect("pin value prefix");
     assert_eq!(key_prefix.committed_physical_bytes(), granule as u64);
@@ -617,31 +626,31 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
         // Each sequence commits only its PRIVATE tail granule (granule 1); the
         // prefix region (granule 0) is left uncommitted for the shared map.
         let tail = granule..alloc_bytes;
-        let key_ptr = shared
+        let key_ptr = shared_backing
             .allocate_committed(alloc_bytes, granule, std::slice::from_ref(&tail))
             .expect("shared-seq key reservation");
-        let value_ptr = shared
+        let value_ptr = shared_backing
             .allocate_committed(alloc_bytes, granule, std::slice::from_ref(&tail))
             .expect("shared-seq value reservation");
 
         // The shared prefix costs zero incremental owned bytes to admit.
         assert_eq!(
-            shared.incremental_owned_bytes_for_shared_prefix(key_prefix.as_ref()),
+            shared_mapping.incremental_owned_bytes_for_shared_prefix(key_prefix.as_ref()),
             0,
             "admitting sharer {seq} needs zero incremental owned bytes for the key prefix"
         );
         assert_eq!(
-            shared.incremental_owned_bytes_for_shared_prefix(value_prefix.as_ref()),
+            shared_mapping.incremental_owned_bytes_for_shared_prefix(value_prefix.as_ref()),
             0
         );
 
         let owned_after_private = shared_governor.used(Tier::Device);
 
         // Map each shared prefix read-only into this sequence at offset 0.
-        let kc = shared
+        let kc = shared_mapping
             .commit_shared_prefix(key_prefix.as_ref(), key_ptr, alloc_bytes, 0)
             .expect("map key prefix into sequence");
-        let vc = shared
+        let vc = shared_mapping
             .commit_shared_prefix(value_prefix.as_ref(), value_ptr, alloc_bytes, 0)
             .expect("map value prefix into sequence");
         assert_eq!(

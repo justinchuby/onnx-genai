@@ -20,8 +20,8 @@
 use cudarc::driver::CudaContext;
 use onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator;
 use onnx_runtime_memory_governor::{
-    DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
-    Tier,
+    AllocationCommitRange, DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor,
+    MemoryGovernor, MemoryRole, Tier, VirtualBacking,
 };
 
 const HOLDER: HolderId = HolderId::new(21);
@@ -526,6 +526,57 @@ fn committed_ranges_do_not_map_the_whole_virtual_allocation() {
     unsafe { allocator.deallocate(pointer, reserved, 256) };
     assert_eq!(allocator.committed_and_reserved().0, 0);
     assert_eq!(governor.used(Tier::Device), 0);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn disjoint_tiny_ranges_report_and_commit_granule_rounded_bytes() {
+    let (allocator, _governor) = allocator(8 << 20, 8 << 20);
+    let selected: &dyn DeviceAllocator = &allocator;
+    let backing = selected
+        .as_virtual_backing()
+        .expect("VMM capability is discovered from the selected allocator");
+
+    let probe = selected.allocate(4096, 256).expect("probe allocation");
+    let granularity = allocator.committed_and_reserved().0;
+    // SAFETY: exact live allocation returned above.
+    unsafe { selected.deallocate(probe, 4096, 256) };
+
+    let allocation_bytes = granularity * 2;
+    let ptr = backing
+        .allocate_committed(allocation_bytes, 256, &[])
+        .expect("reserve without committing");
+    let ranges = [
+        AllocationCommitRange {
+            ptr,
+            allocation_bytes,
+            align: 256,
+            offset: 0,
+            bytes: 64,
+        },
+        AllocationCommitRange {
+            ptr,
+            allocation_bytes,
+            align: 256,
+            offset: granularity + 16,
+            bytes: 32,
+        },
+    ];
+    let mapped = backing
+        .mapped_bytes_for_allocation_ranges(&ranges)
+        .expect("granule-aware estimate");
+    assert_eq!(mapped, (2 * granularity) as u64);
+    assert!(mapped > 96, "raw requested-byte sums would undercharge");
+
+    backing
+        .commit_allocation_ranges(&ranges)
+        .expect("commit both granules");
+    assert_eq!(allocator.committed_and_reserved().0 as u64, mapped);
+    // SAFETY: whole-allocation release remains on the selected allocator.
+    unsafe { selected.deallocate(ptr, allocation_bytes, 256) };
 }
 
 /// Many small allocations share granules rather than each taking one.
