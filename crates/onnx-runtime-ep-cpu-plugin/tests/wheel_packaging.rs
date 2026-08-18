@@ -105,11 +105,10 @@ fn mlas_target_systems() -> std::collections::BTreeSet<&'static str> {
 /// `sys.platform`-style names of every operating system on which some `ci.yml`
 /// step compiles the plugin cdylib with MLAS.
 ///
-/// MLAS is a *default* feature of this crate, so the marker is the absence of
-/// `--no-default-features` rather than the presence of `--features mlas`.
-/// Matching on the opt-out flag is what keeps this honest: a lane that stops
-/// linking the vendored C++ can only do so by adding that flag, and adding it
-/// removes the lane from this set.
+/// MLAS is an *opt-in* feature of this crate, so the marker is the presence of
+/// `--features mlas` on a step that compiles the plugin. Matching on the opt-in
+/// flag is what keeps this honest: a lane only links the vendored C++ by naming
+/// that flag, and a lane that stops naming it drops out of this set.
 fn systems_building_mlas_in_ci() -> std::collections::BTreeSet<&'static str> {
     let ci: &'static str = Box::leak(
         std::fs::read_to_string(
@@ -135,7 +134,7 @@ fn systems_building_mlas_in_ci() -> std::collections::BTreeSet<&'static str> {
                 .get("run")
                 .and_then(serde_yaml::Value::as_str)
                 .unwrap_or_default();
-            if !compiles_plugin(run) || run.contains("--no-default-features") {
+            if !compiles_plugin(run) || !run.contains("--features mlas") {
                 continue;
             }
             let condition = step
@@ -161,40 +160,6 @@ fn compiles_plugin(run: &str) -> bool {
         && (run.contains("cargo build")
             || run.contains("cargo test")
             || run.contains("cargo clippy"))
-}
-
-/// Some `ci.yml` lane compiles the plugin *without* MLAS.
-///
-/// The wheel ships a pure-Rust cdylib whenever `NXRT_EP_CPU_NO_MLAS=1` is set
-/// or the target sits outside `MLAS_TARGETS`, and MLAS is now a default
-/// feature -- so the opt-out is the configuration that rots unobserved. It is
-/// also the only thing proving the plugin's `default-features = false` pin on
-/// its EP dependency still holds: without that pin Cargo's feature unification
-/// re-enables MLAS and `--no-default-features` becomes a no-op that ships an
-/// MLAS build under a pure-Rust label.
-#[test]
-fn the_pure_rust_plugin_build_is_covered_by_a_ci_lane() {
-    let ci = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml"),
-    )
-    .expect("read ci.yml");
-    let workflow: serde_yaml::Value = serde_yaml::from_str(&ci).expect("ci.yml parses as YAML");
-    let covered = workflow
-        .get("jobs")
-        .and_then(serde_yaml::Value::as_mapping)
-        .expect("ci.yml declares jobs")
-        .iter()
-        .filter_map(|(_, job)| job.get("steps").and_then(serde_yaml::Value::as_sequence))
-        .flatten()
-        .filter_map(|step| step.get("run").and_then(serde_yaml::Value::as_str))
-        .any(|run| compiles_plugin(run) && run.contains("--no-default-features"));
-
-    assert!(
-        covered,
-        "no ci.yml lane compiles onnx-runtime-ep-cpu-plugin with \
-         --no-default-features; the wheel's NXRT_EP_CPU_NO_MLAS escape hatch \
-         and every no-C++-toolchain build would break unobserved"
-    );
 }
 
 /// The operating systems a job's runners provide, expanding `matrix.os`.

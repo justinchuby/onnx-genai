@@ -117,12 +117,12 @@ jobs:
           # `--no-default-features --features full` is the pure-Rust build of the
           # crate. Miri interprets Rust; it cannot execute native code, so any
           # test that reaches an `extern "C"` MLAS entry point aborts with
-          # "unsupported operation: can't call foreign function". Since MLAS went
-          # on by default, `provider::tests` does exactly that via
-          # `mlas_nchwc_block_size`. Dropping the default feature keeps this lane
-          # checking what it is actually able to check — our own `unsafe` Rust —
-          # rather than silently losing all three surfaces. MLAS's C++ is covered
-          # by the sanitizer and differential lanes, not here.
+          # "unsupported operation: can't call foreign function". MLAS is opt-in
+          # and off by default, so the plain default build is already MLAS-free
+          # — the explicit flags pin that so this lane keeps checking what it is
+          # actually able to check (our own `unsafe` Rust) and never regresses
+          # to pulling in MLAS's C++ if the defaults ever change. MLAS's C++ is
+          # covered by the sanitizer and differential lanes, not here.
           run_miri "onnx-runtime-ep-cpu strided" \
             cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --no-default-features --features full --lib strided::tests
           run_miri "onnx-runtime-ep-cpu provider" \

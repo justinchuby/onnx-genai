@@ -9,15 +9,20 @@ keywords = ["onnx", "cpu", "execution-provider", "inference", "runtime"]
 categories = ["science", "hardware-support"]
 
 [features]
-# MLAS is part of the default CPU EP. It is an *internal* backend library of
-# this EP — we keep full node ownership and call MLAS ourselves; nothing here
-# delegates to ORT's built-in CPU execution provider. See
+# MLAS is an *opt-in* internal backend of this CPU EP, not a default. The
+# default build is our own native kernels; MLAS is linked in only under
+# `--features mlas`, where it serves as a reference implementation and a
+# graduation gate for the absorption work in
+# `docs/performance/ABSORBING_MLAS.md`. When it is linked it is a private
+# backend of this EP — we keep full node ownership and call MLAS ourselves;
+# nothing here delegates to ORT's built-in CPU execution provider. See
 # `docs/performance/CPU_MLAS_MIGRATION.md`.
 #
-# Opt out with `--no-default-features --features full` on a host with no
-# C++/asm toolchain, or on a target the vendored sources do not cover. That
-# combination keeps every operator group and drops only the MLAS backend.
-default = ["full", "mlas"]
+# Opt *in* with `--features mlas` (adds the vendored C++/asm backend); the
+# plain default keeps every operator group on the native path so a user who
+# builds or installs this EP gets our kernels, and every native gap stays
+# visible instead of being silently covered by MLAS.
+default = ["full"]
 # Default-on compatibility umbrella. Minimal builds disable defaults and select
 # only the capability groups emitted by the operator-selection manifest.
 full = [
@@ -38,8 +43,9 @@ ops-cnn = []
 ops-quantized = []
 ops-sequence = []
 # Vendored MLAS f32/quantized kernels, linked *into this EP* as an internal
-# backend library. On by default via `default`; `full` deliberately does not
-# imply it so `--no-default-features --features full` is a clean opt-out.
+# backend library. Opt-in only — `default` deliberately does not include it, so
+# the shipped default is our native path and MLAS is enabled explicitly with
+# `--features mlas` when it is wanted as a reference/graduation backend.
 mlas = ["dep:mlas-sys"]
 # Temporary: within-GroupQueryAttention phase timing (widen/present/attn/out),
 # gated further at runtime by ONNX_GENAI_PROFILE_GQA=1. Off by default; adds no

@@ -1,17 +1,24 @@
-//! MLAS is a default feature of the shipped cdylib, and it is *ours*.
+//! MLAS is an *opt-in* backend of the shipped cdylib — not a default — and
+//! when it is linked it is *ours*.
 //!
 //! Two claims are load-bearing for this repository's CPU story and neither is
 //! visible in a compiled artifact:
 //!
-//! 1. **On by default.** The library users install links MLAS unless they ask
-//!    otherwise. A `default` list that quietly loses `mlas` costs an order of
-//!    magnitude on quantized matmul and nothing fails — the pure-Rust build is
-//!    numerically correct, just slow, so every other test stays green.
-//! 2. **Internal, not delegated.** MLAS is linked into our plugin as a private
-//!    backend of our own execution provider. It is not ORT's CPU EP, it does
-//!    not share ORT's copy of MLAS, and it holds no state across the DSO
-//!    boundary. That is only true while every MLAS symbol stays local to this
-//!    cdylib.
+//! 1. **Off by default.** The library users install links *our native
+//!    kernels*, not MLAS, unless the builder explicitly opts in with
+//!    `--features mlas`. This is deliberate policy: a user who installs the
+//!    wheel must get our kernels so the native gap stays visible and the
+//!    absorption work in `docs/performance/ABSORBING_MLAS.md` keeps a forcing
+//!    function. MLAS is a reference implementation and a graduation gate, not
+//!    the shipped backend. A `default` list that silently *gained* `mlas`
+//!    would ship the vendored C++ against that policy and nothing would fail —
+//!    the MLAS build is numerically correct, just no longer ours — which is
+//!    why it needs an assertion rather than a comment.
+//! 2. **Internal, not delegated.** When MLAS *is* linked (under `--features
+//!    mlas`) it is linked into our plugin as a private backend of our own
+//!    execution provider. It is not ORT's CPU EP, it does not share ORT's copy
+//!    of MLAS, and it holds no state across the DSO boundary. That is only true
+//!    while every MLAS symbol stays local to this cdylib.
 //!
 //! `plugin_ort_e2e.rs` proves the complementary runtime claim (no node is left
 //! to `CPUExecutionProvider`, with `session.disable_cpu_ep_fallback=1`); this
@@ -47,48 +54,74 @@ fn array_members(manifest: &str, key: &str) -> Vec<String> {
         .collect()
 }
 
-/// The shipped cdylib links MLAS unless the builder opts out.
+/// The `default` feature list of a manifest, treating a *missing* `default`
+/// key as an empty list.
 ///
-/// This is the whole point of the 2026-08-17 direction: our CPU EP owns its
-/// nodes and calls MLAS *inside* that ownership, so the fast build has to be
-/// the one you get by default. Losing `mlas` from this list is invisible at
-/// runtime — correctness is unchanged, only speed — which is why it needs an
-/// assertion rather than a comment.
+/// Dropping `mlas` from the default is expressed by removing the `default`
+/// array entirely (a cdylib with no `default` key has no default features),
+/// which is exactly the policy this file pins: nothing is on unless a feature
+/// names it. A missing key is therefore a pass, not a parse error.
+fn default_features(manifest: &str) -> Vec<String> {
+    if manifest.contains("\ndefault = [") {
+        array_members(manifest, "default")
+    } else {
+        Vec::new()
+    }
+}
+
+/// The shipped cdylib does *not* link MLAS unless the builder opts in.
+///
+/// This is the policy the 2026-08-17 correction restored: MLAS is an internal
+/// reference backend and a graduation gate, not the thing we ship. The default
+/// wheel links our native kernels, so a user who installs it runs our code and
+/// every native gap stays load-bearing — the forcing function for absorption.
+/// Re-gaining `mlas` in this list is invisible at runtime (an MLAS build is
+/// numerically correct, just no longer ours), which is why it needs an
+/// assertion rather than a comment. Feature unification is the likely way it
+/// would drift back on in a merge; this test stops that silently.
 #[test]
-fn mlas_is_a_default_feature_of_the_shipped_plugin() {
-    let defaults = array_members(&manifest("."), "default");
+fn mlas_is_not_a_default_feature_of_the_shipped_plugin() {
+    let defaults = default_features(&manifest("."));
     assert!(
-        defaults.iter().any(|f| f == "mlas"),
-        "onnx-runtime-ep-cpu-plugin's default features are {defaults:?}; without `mlas` the \
-         wheel ships a cdylib that is an order of magnitude slower on quantized matmul and \
-         nothing else fails"
+        !defaults.iter().any(|f| f == "mlas"),
+        "onnx-runtime-ep-cpu-plugin's default features are {defaults:?}; `mlas` must not be \
+         among them — the shipped wheel is our native kernels, and MLAS is opt-in via \
+         `--features mlas`. Shipping it by default bundles the vendored C++ against policy and \
+         hides the native gap absorption exists to close"
     );
 }
 
-/// So does the EP crate itself, for anyone embedding it directly.
+/// Neither does the EP crate itself, for anyone embedding it directly.
 ///
 /// The plugin is one consumer. `onnx-runtime-ep-cpu` is published, and a
-/// dependent that writes `onnx-runtime-ep-cpu = "…"` must get the same
-/// backend the wheel ships, or "the CPU EP" means two different things.
+/// dependent that writes `onnx-runtime-ep-cpu = "…"` must get the same native
+/// backend the wheel ships, or "the CPU EP" means two different things — and
+/// the direct dependent would silently pull in the vendored MLAS C++ it never
+/// asked for.
 #[test]
-fn the_cpu_ep_ships_mlas_in_its_own_default_features() {
-    let defaults = array_members(&manifest("../onnx-runtime-ep-cpu"), "default");
+fn the_cpu_ep_does_not_ship_mlas_in_its_own_default_features() {
+    let defaults = default_features(&manifest("../onnx-runtime-ep-cpu"));
     assert!(
-        defaults.iter().any(|f| f == "mlas"),
-        "onnx-runtime-ep-cpu's default features are {defaults:?}; a direct dependent would get \
-         a different backend from the one the plugin ships"
+        !defaults.iter().any(|f| f == "mlas"),
+        "onnx-runtime-ep-cpu's default features are {defaults:?}; `mlas` must not be among \
+         them — a direct dependent would otherwise get a different (MLAS) backend from the \
+         native one the plugin ships, and would link the vendored C++ unbidden"
     );
 }
 
-/// The opt-out actually opts out.
+/// Every edge to the CPU EP pins `default-features = false`.
 ///
-/// `--no-default-features` on this crate only removes MLAS because every edge
-/// to `onnx-runtime-ep-cpu` pins `default-features = false`. Leave one edge
-/// unpinned and Cargo's feature unification turns the EP's own `default` list
-/// back on — including `mlas` — so the flag becomes a no-op that still
-/// compiles, still passes, and ships an MLAS cdylib under a pure-Rust label.
-/// Dev-dependencies count: they unify with normal dependencies under
-/// `cargo test`, which is where the numeric opt-out tests run.
+/// With MLAS off by default this is no longer what makes an opt-out work —
+/// there is nothing to opt out of. Its purpose now is the reverse: it stops
+/// feature unification from silently re-enabling MLAS. If one edge to
+/// `onnx-runtime-ep-cpu` left the EP's defaults on and the EP crate ever
+/// regained `mlas` in its `default` list (or gained it transitively), Cargo
+/// would unify that back into this cdylib and the shipped wheel would link the
+/// vendored C++ with no flag naming it. Pinning every edge keeps the feature
+/// set of this crate explicit, so MLAS can only ever arrive here by an
+/// on-purpose `--features mlas`. Dev-dependencies count: they unify with
+/// normal dependencies under `cargo test`, which is where the numeric tests
+/// run.
 #[test]
 fn every_edge_to_the_cpu_ep_pins_default_features_false() {
     let manifest = manifest(".");
@@ -111,16 +144,27 @@ fn every_edge_to_the_cpu_ep_pins_default_features_false() {
 /// CPU dispatch initialisation, and kernels chosen by whichever copy a given
 /// call site was linked against. Cargo permits it whenever two semver-major
 /// ranges coexist, and nothing else would report it.
+///
+/// This is a duplicate-runtime-state check, not a defaults check: it is only
+/// meaningful in the graph where `mlas-sys` is actually linked. With MLAS now
+/// opt-in, that graph is the one resolved with `--features mlas` — the default
+/// graph carries no `mlas-sys` node at all (which the two policy tests above
+/// pin). So this resolves the plugin *with* `mlas` enabled and asserts that
+/// even then there is exactly one copy.
 #[test]
 fn exactly_one_mlas_sys_in_the_dependency_graph() {
-    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("workspace root exists above this crate");
+    let plugin_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let output =
         std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
-            .args(["metadata", "--format-version", "1", "--offline"])
-            .current_dir(&workspace_root)
+            .args([
+                "metadata",
+                "--format-version",
+                "1",
+                "--offline",
+                "--features",
+                "mlas",
+            ])
+            .current_dir(&plugin_dir)
             .output();
 
     let output = match output {
@@ -235,6 +279,16 @@ fn exactly_one_mlas_sys_in_the_dependency_graph() {
 /// C++ symbol, which is exactly how MLAS is mangled.
 #[test]
 fn mlas_is_statically_private_to_this_cdylib() {
+    if !cfg!(feature = "mlas") {
+        eprintln!(
+            "⏭ mlas_is_statically_private_to_this_cdylib: skipped — this test binary was built \
+             without the `mlas` feature, so the cdylib it would probe links no MLAS at all. A \
+             probe that reported '0 exported' on a binary that never linked MLAS would pass \
+             vacuously; run `cargo test -p onnx-runtime-ep-cpu-plugin --features mlas` to \
+             exercise it."
+        );
+        return;
+    }
     if !cfg!(target_os = "linux") {
         eprintln!(
             "⏭ mlas_is_statically_private_to_this_cdylib: skipped (ELF-only check, this is {})",
@@ -265,14 +319,12 @@ fn mlas_is_statically_private_to_this_cdylib() {
     let linked = mlas_symbols(&all);
     let exposed = mlas_symbols(&dynamic);
 
-    if cfg!(feature = "mlas") {
-        assert!(
-            !linked.is_empty(),
-            "this cdylib was built with the `mlas` feature but its symbol table contains no \
-             MLAS symbols at {} — the vendored kernels are not actually linked in",
-            path.display()
-        );
-    }
+    assert!(
+        !linked.is_empty(),
+        "this cdylib was built with the `mlas` feature but its symbol table contains no \
+         MLAS symbols at {} — the vendored kernels are not actually linked in",
+        path.display()
+    );
     assert!(
         exposed.is_empty(),
         "{} of this cdylib's {} MLAS symbols are in the *dynamic* table: {:?}. MLAS is an \

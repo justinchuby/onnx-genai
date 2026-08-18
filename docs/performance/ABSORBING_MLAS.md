@@ -1,25 +1,27 @@
 # Absorbing MLAS: reference implementation, then replacement
 
-> **Partly superseded, 2026-08-17.** The *packaging* half of the direction below
-> was reversed by the repository owner: MLAS is now **on by default** inside our
-> CPU EP, as an internal backend library we call — never a delegation to ORT's
-> CPU EP. See [`CPU_MLAS_MIGRATION.md`](CPU_MLAS_MIGRATION.md) for the current
-> ownership boundary, dispatch ledger and graduation rule.
+> **Update, 2026-08-17.** A note briefly said MLAS had been made **on by
+> default**; the repository owner retracted that the same day. The packaging
+> direction below stands: we do **not** bundle MLAS by default. MLAS is an
+> opt-in internal backend library we call under `--features mlas` — a reference
+> implementation and a graduation gate, never a delegation to ORT's CPU EP, and
+> never the shipped default. See [`CPU_MLAS_MIGRATION.md`](CPU_MLAS_MIGRATION.md)
+> for the current ownership boundary, dispatch ledger and graduation rule.
 >
-> The *method* below is not superseded and is what the migration depends on:
+> The *method* below is unchanged and is what the migration depends on:
 > same-binary A/B, process CPU time, port the mechanism rather than the
-> dependency. Two things change in practice. Step 4 said to re-measure in a build
-> without the `mlas` feature "because that is what users run" — users now run the
-> MLAS build, so the comparison is native-vs-MLAS **in one binary**
-> (`cargo bench -p onnx-runtime-ep-cpu --bench native_vs_mlas`), which is
-> strictly better evidence than two builds. And absorption is no longer a
-> prerequisite for shipping speed; it is how we stop needing MLAS.
+> dependency. One refinement: Step 4's native-vs-MLAS comparison is best run as
+> both routes **in one binary** (`cargo bench -p onnx-runtime-ep-cpu --bench
+> native_vs_mlas`, built `--features mlas`), which is strictly better evidence
+> than two separate builds. Absorption remains the point: it is how we stop
+> needing MLAS at all, and because the shipped default is our native path, the
+> gap it closes is the gap users actually run.
 
-**Direction, set 2026-08-16:** we do not bundle MLAS by default. We progressively
-absorb its optimizations into our own native kernels. MLAS stays in the tree as a
-*measurement reference* — a second implementation in the same process that lets us
-measure exactly how far our kernel is from a good one — and nothing ships behind
-it.
+**Direction, set 2026-08-16 (in force):** we do not bundle MLAS by default. We
+progressively absorb its optimizations into our own native kernels. MLAS stays
+in the tree as a *measurement reference* — a second implementation in the same
+process that lets us measure exactly how far our kernel is from a good one — and
+nothing ships behind it.
 
 ## Why this became necessary
 
@@ -33,9 +35,11 @@ No individual PR did anything wrong — each was measured honestly with
 **the configuration we measured was not the configuration we shipped**, and nothing
 in the process noticed. Tracked as #1091.
 
-That defect is now closed from the other side: the default build *is* the
-measured build, and the pure-Rust configuration is the one carrying an explicit
-flag and its own CI lanes.
+The fix is to close that gap by measurement discipline, not by shipping MLAS:
+the shipped default stays our native kernels, and every MLAS win is required to
+be reproduced natively — measured native-vs-MLAS in one binary — before it
+counts. MLAS carries the explicit `--features mlas` flag and its own CI lanes;
+the native path is what users run.
 
 There is a second reason, visible only on large models. The MLAS int4 route holds a
 packed weight copy at roughly 2× the int4 bytes. On a 14B model that is predicted at

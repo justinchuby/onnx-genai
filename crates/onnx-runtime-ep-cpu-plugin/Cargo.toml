@@ -13,17 +13,17 @@ crate-type = ["cdylib", "lib"]
 
 [features]
 # The vendored ONNX Runtime MLAS kernels, linked into the cdylib as an
-# *internal* backend of our own CPU EP. ORT's built-in CPU EP is MLAS, so a
-# cdylib without this is not a like-for-like build: the quantized matmul paths
-# measure an order of magnitude slower. On by default (repository direction,
-# 2026-08-17); `--no-default-features` builds the pure-Rust cdylib for a host
-# with no C++ toolchain or a target the vendored sources do not cover.
+# *internal* backend of our own CPU EP. This is **opt-in**: the default cdylib
+# and the shipped wheel are our pure-Rust native kernels, and MLAS is enabled
+# only with `--features mlas`, where it is used as a reference implementation
+# and a graduation gate rather than as the shipped backend. A user who installs
+# the wheel gets *our* kernels, so the native gap stays visible and absorption
+# (see `docs/performance/ABSORBING_MLAS.md`) keeps a forcing function.
 #
 # The `onnx-runtime-ep-cpu` dependencies below pin `default-features = false`
-# precisely so this switch works: with the EP's own defaults on, Cargo feature
-# unification would re-enable MLAS and `--no-default-features` would silently
-# be a no-op.
-default = ["mlas"]
+# regardless: it drops the EP crate's own `full`/etc. defaults so this crate
+# controls the feature set explicitly, and it means Cargo feature unification
+# cannot silently re-enable MLAS through some other edge.
 mlas = ["onnx-runtime-ep-cpu/mlas"]
 
 [dependencies]

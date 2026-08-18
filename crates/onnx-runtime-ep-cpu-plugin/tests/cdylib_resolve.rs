@@ -13,17 +13,18 @@ const PACKAGE: &str = "onnx-runtime-ep-cpu-plugin";
 
 /// Cargo flags to rebuild the cdylib with, mirroring this test binary's own.
 ///
-/// MLAS is a *default* feature, so the flag that needs reproducing is the
-/// opt-out: `cargo test -p onnx-runtime-ep-cpu-plugin --no-default-features`
-/// compiles the test without MLAS, and a rebuild that omitted the flag would
-/// overwrite the cdylib with an MLAS build. The suite would then load a
-/// library the test binary is not a copy of -- and in the direction that
-/// hides a broken opt-out, since the MLAS build passes the numeric tests.
+/// MLAS is an *opt-in* feature, so the flag that needs reproducing is the
+/// opt-in: `cargo test -p onnx-runtime-ep-cpu-plugin --features mlas` compiles
+/// the test with MLAS, and a rebuild that omitted the flag would overwrite the
+/// cdylib with a default (pure-Rust) build. The suite would then load a library
+/// the test binary is not a copy of — and in the direction that hides a broken
+/// MLAS link, since the pure-Rust build passes the numeric tests. A default
+/// (pure-Rust) test binary reproduces itself with no flags.
 fn cargo_flags() -> &'static [&'static str] {
     if cfg!(feature = "mlas") {
-        &[]
+        &["--features", "mlas"]
     } else {
-        &["--no-default-features"]
+        &[]
     }
 }
 

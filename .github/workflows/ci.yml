@@ -267,42 +267,43 @@ jobs:
           --features mlas
           optimization_registry_excludes_nchwc_without_cnn_ops
 
-      # MLAS is part of the CPU EP's default features, so every lane above --
-      # including "Test Linux offline crates", the coverage matrix and the
-      # Windows ARM64 lane -- now runs the MoE `MlasGemmBatch` falsifiers and
-      # the QLinearMatMul fused-requantize tests against real MLAS.  The
-      # separate `--features mlas` steps they used to need are gone because the
-      # configuration we ship is now the configuration we test by default.
-      #
-      # What that inverts is the risk: the *pure-Rust* build is now the one
-      # nothing else compiles.  It is the documented opt-out for a host with no
-      # C++/asm toolchain, and it is the correctness baseline every MLAS route
-      # is differentially tested against, so it gets its own lane.
-      - name: CPU EP without MLAS (no-C++-toolchain opt-out)
+      # The MoE grouped driver hands several `*mut f32` out of one `&mut [f32]`
+      # to `MlasGemmBatch`, and its bit-exactness falsifiers are the only thing
+      # standing between a wrong batch offset and silently wrong logits.  MLAS
+      # is opt-in, so under the default (native) feature set those tests compile
+      # the pure-Rust fallback; this lane runs them against the real MLAS
+      # batched GEMM so the vendored path stays tested even though we do not
+      # ship it by default.
+      - name: CPU EP MoE tests against real MLAS
         run: >-
           cargo test --locked
           -p onnx-runtime-ep-cpu
           --no-default-features
-          --features full
+          --features mlas
+          kernels::moe::
 
-      - name: Clippy CPU EP without MLAS
+      # QLinearMatMul requantizes inside MLAS through the same output processor
+      # ORT uses, and the tests that pin that fused path bit-for-bit against the
+      # scalar loop only exist under `--features mlas`.  Nothing else in the
+      # pipeline runs them: the default lanes build this crate without MLAS and
+      # the ORT lane tests the plugin crate, not these unit tests.
+      - name: CPU EP QLinearMatMul tests against real MLAS
+        run: >-
+          cargo test --locked
+          -p onnx-runtime-ep-cpu
+          --no-default-features
+          --features mlas
+          kernels::qlinear_matmul::
+
+      # Clippy the MLAS build too. MLAS is opt-in, so the default clippy lanes
+      # only lint the native path; without this a warning behind
+      # `#[cfg(feature = "mlas")]` would land unseen until a release build.
+      - name: Clippy CPU EP with MLAS
         run: >-
           cargo clippy --locked --all-targets
           -p onnx-runtime-ep-cpu
-          --no-default-features
-          --features full
+          --features mlas
           -- -D warnings
-
-      # `--no-default-features` on the plugin must actually drop MLAS.  It only
-      # does because the crate pins `default-features = false` on its EP
-      # dependency; without that, Cargo feature unification would re-enable MLAS
-      # and the wheel's `NXRT_EP_CPU_NO_MLAS=1` escape hatch would silently ship
-      # an MLAS build.  This lane is what keeps that wiring honest.
-      - name: CPU plugin cdylib without MLAS (no-C++-toolchain opt-out)
-        run: >-
-          cargo build --locked
-          -p onnx-runtime-ep-cpu-plugin
-          --no-default-features
 
       # x86_64-apple-darwin changes target_arch but leaves target_os="macos",
       # so cfg(target_os) errors are invisible.  This step uses a genuine Linux
@@ -323,10 +324,12 @@ jobs:
       # sources and had no GNU/clang branch for the GAS .S sources, leaving
       # MlasSgemmKernelZero, MlasGemvFloatKernel, MlasConvSymKernelNeon and
       # ~30 more declared, called from dispatch tables, and never defined.
-      # `g++-aarch64-linux-gnu` is not optional now that MLAS is on by default:
-      # mlas-sys compiles ~150 C++ TUs for the target, and cc-rs probes
-      # `aarch64-linux-gnu-g++` before it compiles anything.  Without it the
-      # cross-arch pass fails at "Compiler family detection failed ...
+      # `g++-aarch64-linux-gnu` is kept installed so an MLAS cross build has its
+      # C++ toolchain: mlas-sys compiles ~150 C++ TUs for the target under
+      # `--features mlas`, and cc-rs probes `aarch64-linux-gnu-g++` before it
+      # compiles anything. MLAS is opt-in (the default cross build is pure
+      # Rust), but keeping g++ present means an MLAS-enabled cross build here or
+      # locally does not fail at "Compiler family detection failed ...
       # ToolNotFound".
       - name: Install the aarch64 cross toolchain for the cross-arch pass
         run: |
@@ -340,7 +343,7 @@ jobs:
       # time this suite executed on aarch64 it found three assertions that only
       # ever held on x86-64 (NCHWc blocking, MLAS-vs-Rust bit-identity in the
       # activation A/B, and which CompInt8 route wins MatMulNBits decode), all
-      # of which MLAS-by-default now makes reachable in production.  qemu-user
+      # of which running the CPU EP on real ARM64 surfaces.  qemu-user
       # is the cheap way to keep that signal without a scarce ARM runner.
       #
       # QEMU_LD_PREFIX is needed on top of the cargo runner: several parity
@@ -375,7 +378,7 @@ jobs:
       # other lane links into this cdylib. If that stops building here, the
       # wheel stops building at release time, when it is most expensive.
       - name: Build the shipped CPU plugin cdylib with MLAS
-        run: cargo build --locked -p onnx-runtime-ep-cpu-plugin
+        run: cargo build --locked -p onnx-runtime-ep-cpu-plugin --features mlas
 
   rust-coverage:
     name: Rust coverage (${{ matrix.name }})
@@ -456,7 +459,7 @@ jobs:
       # wheel stops building at release time, when it is most expensive.
       - name: Build the shipped CPU plugin cdylib with MLAS
         if: runner.os != 'Linux'
-        run: cargo build --locked -p onnx-runtime-ep-cpu-plugin
+        run: cargo build --locked -p onnx-runtime-ep-cpu-plugin --features mlas
 
       - name: Test cross-platform offline crates with coverage
         run: >-
@@ -536,7 +539,7 @@ jobs:
       # other lane links into this cdylib. If that stops building here, the
       # wheel stops building at release time, when it is most expensive.
       - name: Build the shipped CPU plugin cdylib with MLAS
-        run: cargo build --locked --target aarch64-pc-windows-msvc -p onnx-runtime-ep-cpu-plugin
+        run: cargo build --locked --target aarch64-pc-windows-msvc -p onnx-runtime-ep-cpu-plugin --features mlas
       # Platform execution is the signal here; coverage for most of these
       # offline crates is already reported by x64/macOS lanes, and ARM64
       # instrumentation owned the critical path.
@@ -768,25 +771,26 @@ jobs:
       # reason rather than being skipped. It cannot false-green, so the cost is
       # an extra red on an already-red job.
       #
-      # This is the shipped build: MLAS is a default feature, so the default
-      # run *is* the run that matters -- the vendored C++ is linked, so the
-      # symbol-leakage check has something to leak and the build-identity
-      # assertion is non-trivial.
+      # This is the shipped build: MLAS is opt-in and off by default, so the
+      # default run *is* the run that ships -- our native kernels against a real
+      # ORT session, with `disable_cpu_ep_fallback=1` proving no node escapes to
+      # ORT's own CPU EP. The MLAS build gets its own gate below.
       - name: Test onnx-runtime-ep-cpu-plugin (ORT gate)
         if: ${{ !cancelled() && runner.os == 'Linux' }}
         run: cargo test --locked --no-fail-fast -p onnx-runtime-ep-cpu-plugin
-      # The opt-out build against the same ORT gate. A pure-Rust plugin owns
-      # fewer nodes than an MLAS one (no Nchwc reorders, no MLAS convolution),
-      # so it exercises a genuinely different partitioning decision; the wheel
-      # ships this configuration wherever `NXRT_EP_CPU_NO_MLAS=1` is set or the
-      # target is outside the proven MLAS set, and nothing else runs it against
-      # a real session.
-      - name: Test onnx-runtime-ep-cpu-plugin without MLAS (ORT gate)
+      # The same suite against the MLAS build. MLAS is opt-in, so the default
+      # run above is our native path; this lane links the vendored C++ so the
+      # symbol-leakage / build-identity checks have something to leak and the
+      # MLAS partitioning (Nchwc reorders, MLAS convolution) is exercised
+      # against a real session. The testkit rebuilds the cdylib with the same
+      # `--features mlas` this test binary was compiled with, so the artifact
+      # under test matches.
+      - name: Test onnx-runtime-ep-cpu-plugin with MLAS (ORT gate)
         if: ${{ !cancelled() && runner.os == 'Linux' }}
         run: >-
           cargo test --locked --no-fail-fast
           -p onnx-runtime-ep-cpu-plugin
-          --no-default-features
+          --features mlas
       - name: Upload CLI ORT coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4

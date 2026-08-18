@@ -34,7 +34,7 @@
 //! longer on its hot path and the entry records the measurement that earned it.
 
 use core::fmt;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Environment variable that turns live [`Observation`] recording on.
@@ -582,6 +582,24 @@ fn thread_degree() -> usize {
 static RECORDING: AtomicBool = AtomicBool::new(false);
 static INIT: OnceLock<()> = OnceLock::new();
 
+/// Ceiling on retained observations.
+///
+/// The ledger is opt-in diagnostics (`NXRT_CPU_DISPATCH_LEDGER=1`). With it on,
+/// the log would otherwise grow by one [`Observation`] per route decision for
+/// the life of the process — and the operator who turns it on is the one least
+/// able to predict the dispatch count. So recording is capped here: past the
+/// cap, observations are dropped and counted in [`DROPPED`] so a truncated
+/// [`snapshot`] cannot be mistaken for a complete one.
+///
+/// Bounded footprint is the product, not one entry:
+/// `size_of::<Observation>()` (56 bytes on 64-bit) × `LEDGER_MAX` (65_536)
+/// ≈ 3.5 MiB of retained state, reached only after 65_536 recorded routes.
+const LEDGER_MAX: usize = 1 << 16;
+
+/// Observations dropped since the last [`reset`] because [`LEDGER_MAX`] was
+/// reached. Nonzero means [`snapshot`] is truncated.
+static DROPPED: AtomicUsize = AtomicUsize::new(0);
+
 fn log() -> &'static Mutex<Vec<Observation>> {
     static LOG: OnceLock<Mutex<Vec<Observation>>> = OnceLock::new();
     LOG.get_or_init(|| Mutex::new(Vec::new()))
@@ -620,6 +638,7 @@ pub fn reset() {
     if let Ok(mut entries) = log().lock() {
         entries.clear();
     }
+    DROPPED.store(0, Ordering::Relaxed);
 }
 
 /// Record a routing decision.
@@ -635,7 +654,13 @@ pub fn record(observation: Observation) {
         return;
     }
     if let Ok(mut entries) = log().lock() {
-        entries.push(observation);
+        if entries.len() < LEDGER_MAX {
+            entries.push(observation);
+        } else {
+            // Cap reached: drop and count, so a later snapshot's length is
+            // known to be truncated rather than silently short.
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -661,6 +686,16 @@ pub fn snapshot() -> Vec<Observation> {
         .lock()
         .map(|entries| entries.clone())
         .unwrap_or_default()
+}
+
+/// Observations dropped since the last [`reset`] because [`LEDGER_MAX`] was
+/// reached.
+///
+/// A nonzero value means [`snapshot`] holds only the first [`LEDGER_MAX`]
+/// routes and this many more occurred after it filled — the snapshot is a
+/// truncated prefix, not the whole run.
+pub fn dropped() -> usize {
+    DROPPED.load(Ordering::Relaxed)
 }
 
 /// Whether any observation for `family` recorded `backend`.
@@ -926,5 +961,46 @@ mod tests {
                 "render_plan omitted {family}"
             );
         }
+    }
+
+    /// The cap bounds retained state and reports the truncation.
+    ///
+    /// This is one test because the recorder is process-global. `LEDGER_MAX` is
+    /// too large to fill here without wasting time, so this checks the accounting
+    /// invariants (`dropped()` starts and resets to zero, `snapshot()` never
+    /// exceeds the cap) rather than pushing 65_536 entries.
+    #[test]
+    fn recording_is_capped_and_reports_drops() {
+        // The byte-ceiling comment on `LEDGER_MAX` states 56 B per entry; keep
+        // that honest. A wider `Observation` would silently blow the stated
+        // bound.
+        assert!(
+            std::mem::size_of::<Observation>() <= 56,
+            "Observation grew to {} bytes; update the LEDGER_MAX byte-ceiling comment",
+            std::mem::size_of::<Observation>()
+        );
+
+        enable();
+        reset();
+        assert_eq!(dropped(), 0, "reset() must zero the drop counter");
+        for _ in 0..8 {
+            record(Observation::gemm(
+                KernelFamily::MatMulF32,
+                Backend::Native,
+                "f32",
+                1,
+                1,
+                1,
+            ));
+        }
+        assert_eq!(snapshot().len(), 8);
+        assert_eq!(dropped(), 0, "well under the cap, nothing is dropped");
+        assert!(
+            snapshot().len() <= LEDGER_MAX,
+            "snapshot never exceeds the cap"
+        );
+        reset();
+        assert_eq!(dropped(), 0);
+        disable();
     }
 }

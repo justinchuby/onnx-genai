@@ -30,18 +30,18 @@ CRATE = "onnx-runtime-ep-cpu-plugin"
 LIB_STEM = "onnx_runtime_ep_cpu_plugin"
 PACKAGE = "nxrt_ep_cpu"
 # ``mlas`` links the vendored ONNX Runtime MLAS kernels into the cdylib. It is
-# a **default** feature of the plugin crate, so this wheel enables it by doing
-# nothing and disables it with ``--no-default-features``; see ``_mlas_enabled``.
+# an **opt-in** feature of the plugin crate (not a default), so this wheel ships
+# our pure-Rust native kernels unless it explicitly asks cargo for
+# ``--features mlas``; see ``_mlas_features``.
 MLAS_FEATURE = "mlas"
 
 # (``platform.system()``, ``platform.machine()``) pairs whose MLAS build this
 # repository's CI proves, lowercased. Every entry is compiled by a
-# ``cargo build -p onnx-runtime-ep-cpu-plugin`` step on the matching lane in
-# ``.github/workflows/ci.yml`` -- the flag is absent because MLAS is on by
-# default, and ``crates/onnx-runtime-ep-cpu-plugin/tests/wheel_packaging.rs``
-# checks that correspondence structurally. A target that is not proven there is
-# not listed here, because a wheel that fails to build is worse than a wheel
-# that is slow.
+# ``cargo build -p onnx-runtime-ep-cpu-plugin --features mlas``
+# step on the matching lane in ``.github/workflows/ci.yml``, and
+# ``crates/onnx-runtime-ep-cpu-plugin/tests/wheel_packaging.rs`` checks that
+# correspondence structurally. A target that is not proven there is not listed
+# here, because a wheel that fails to build is worse than a wheel that is slow.
 MLAS_TARGETS = frozenset(
     {
         ("linux", "x86_64"),
@@ -52,25 +52,25 @@ MLAS_TARGETS = frozenset(
 )
 
 
-def _mlas_enabled(system: str | None = None, machine: str | None = None) -> bool:
-    """Whether this wheel's cdylib links MLAS.
+def _mlas_features(system: str | None = None, machine: str | None = None) -> list[str]:
+    """Cargo features for this wheel's target.
 
-    ORT's own CPU execution provider *is* MLAS. A cdylib built without it does
-    not lose a little speed, it loses an order of magnitude: on this project's
-    plugin-path A/B (AMD EPYC 9V74, AVX2, ORT 1.27, K=N=2048, p50 of 41
-    interleaved iterations), 4-bit ``MatMulNBits`` at M=128 takes 81x ORT's
-    time without MLAS and 7.3x with it, and ``QLinearMatMul`` u8 at M=128
-    takes 55x without and 9.3x with. Shipping the pure-Rust build is therefore
-    not the conservative default; it is the slow one. MLAS is correspondingly a
-    default feature of the crate, and this function only ever *removes* it.
+    MLAS is an *opt-in* internal backend, used as a reference implementation and
+    an absorption gate rather than as the shipped default: a wheel built without
+    it links our native Rust kernels, which is what we want users to run. This
+    function therefore only ever *adds* ``mlas`` — for a CI-proven target with a
+    C++/asm toolchain — and returns nothing otherwise.
 
-    Set ``NXRT_EP_CPU_NO_MLAS=1`` to build the pure-Rust cdylib anyway, for a
-    toolchain with no C++ compiler or a target the vendored sources do not
-    cover.
+    Set ``NXRT_EP_CPU_MLAS=1`` to force the MLAS build even on a target this
+    repository's CI does not prove; set ``NXRT_EP_CPU_NO_MLAS=1`` to force the
+    pure-Rust build even on a proven one.
     """
     if os.environ.get("NXRT_EP_CPU_NO_MLAS") == "1":
         print("[nxrt-ep] NXRT_EP_CPU_NO_MLAS=1: building without MLAS", flush=True)
-        return False
+        return []
+    if os.environ.get("NXRT_EP_CPU_MLAS") == "1":
+        print("[nxrt-ep] NXRT_EP_CPU_MLAS=1: building with MLAS", flush=True)
+        return [MLAS_FEATURE]
     target = (
         (system or platform.system()).lower(),
         (machine or platform.machine()).lower(),
@@ -80,17 +80,13 @@ def _mlas_enabled(system: str | None = None, machine: str | None = None) -> bool
             f"[nxrt-ep] no CI-proven MLAS build for {target}: building without MLAS",
             flush=True,
         )
-        return False
-    return True
+        return []
+    return [MLAS_FEATURE]
 
 
-MLAS_ENABLED: bool = _mlas_enabled()
+CARGO_FEATURES: list[str] = _mlas_features()
 # What ``nxrt_ep_build_features()`` must report for a cdylib built this way.
-EXPECTED_FEATURES: str = MLAS_FEATURE if MLAS_ENABLED else ""
-# Turning MLAS *off* is the action that needs a flag now. Nothing re-adds it:
-# the plugin crate pins ``default-features = false`` on its EP dependency, so
-# this single flag really does drop the vendored C++ from the whole graph.
-CARGO_FEATURE_FLAGS: list[str] = [] if MLAS_ENABLED else ["--no-default-features"]
+EXPECTED_FEATURES: str = MLAS_FEATURE if MLAS_FEATURE in CARGO_FEATURES else ""
 
 
 def _lib_filenames() -> list[str]:
@@ -125,7 +121,9 @@ def _workspace_root(start: Path) -> Path:
 def _build_cdylib() -> Path:
     """Compile the plugin crate with cargo and return the built cdylib path."""
     root = _workspace_root(Path(__file__).parent)
-    cmd = ["cargo", "build", "--release", "-p", CRATE, *CARGO_FEATURE_FLAGS]
+    cmd = ["cargo", "build", "--release", "-p", CRATE]
+    if CARGO_FEATURES:
+        cmd += ["--features", ",".join(CARGO_FEATURES)]
     print(f"[nxrt-ep] running: {' '.join(cmd)} (cwd={root})", flush=True)
     subprocess.run(cmd, cwd=root, check=True)
 

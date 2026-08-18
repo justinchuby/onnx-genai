@@ -1,36 +1,44 @@
 # CPU EP → MLAS migration ledger
 
-**Direction, set 2026-08-17 (repository owner):** MLAS is **enabled by default
-inside our CPU execution provider**. It is an internal backend library that our
-EP calls; it is *not* ORT's built-in CPU execution provider and nothing here
+**Direction, corrected 2026-08-17 (repository owner):** MLAS is **not** enabled
+by default. It is an **opt-in internal backend** of our CPU execution provider —
+a reference implementation and a graduation gate — linked in only under
+`--features mlas`. The default build, the shipped cdylib and the wheel are our
+own native kernels. MLAS is an internal backend library that our EP calls when
+enabled; it is *not* ORT's built-in CPU execution provider and nothing here
 delegates a node to it. The long-term objective is unchanged and continues:
 progressively absorb and replace MLAS capabilities with our own faster kernels
-until this EP comprehensively outperforms MLAS.
+until this EP comprehensively outperforms MLAS, at which point the MLAS routes
+are deleted.
 
-This supersedes the *default-features* half of
-[`ABSORBING_MLAS.md`](ABSORBING_MLAS.md) (2026-08-16), which said we do not
-bundle MLAS. It does **not** supersede that document's method — the same-binary
-A/B, process CPU time, port-the-mechanism doctrine is what makes absorption
-verifiable, and everything below depends on it.
+This restores the *default-features* half of
+[`ABSORBING_MLAS.md`](ABSORBING_MLAS.md) (2026-08-16): we do **not** bundle
+MLAS by default. An earlier note here flipped that default on the strength of a
+directive that was retracted the same day; the correction returns the default
+to off. The document's method is unchanged — the same-binary A/B, process CPU
+time, port-the-mechanism doctrine is what makes absorption verifiable, and
+everything below depends on it.
 
-## Why the default flipped
+## Why the default stays off
 
-The 2026-08-16 direction was a correct response to a real defect (#1091: *the
-configuration we measured was not the configuration we shipped*), but it fixed
-it in the direction that made the shipped build the slow one. ORT's CPU EP **is**
-MLAS. A cdylib without MLAS is not a conservative build of our EP, it is a
-handicapped one: on this project's plugin-path A/B (AMD EPYC 9V74, AVX2, ORT
-1.27, K=N=2048, p50 of 41 interleaved iterations) 4-bit `MatMulNBits` at M=128
-took **81×** ORT's time without MLAS and 7.3× with it; `QLinearMatMul` u8 at
-M=128 took **55×** without and 9.3× with.
+#1091 was a real defect (*the configuration we measured was not the
+configuration we shipped*): PRs measured wins with `--features mlas` while
+nothing enabled it. There were two coherent fixes — ship what we measure
+(default MLAS on), or measure what we ship (require native numbers, default MLAS
+off). The owner chose the second: the shipped path must be *ours* so that every
+native gap is felt, not covered.
 
-Flipping the default fixes #1091 the other way round: measured and shipped are
-now the same configuration because the default *is* the measured one, and the
-opt-out is what carries the caveat.
+Shipping MLAS by default would make "an EP must be equally fast standing alone"
+untestable in the configuration users run: every native weakness would be
+hidden behind the vendored kernels, and "absorb MLAS" would become a project
+with no deadline and no pain. Keeping the default off makes the native path
+load-bearing, which is the forcing function absorption needs.
 
-The absorption programme is unaffected. MLAS being present is what makes the
-same-binary A/B possible on every developer machine and every CI lane — you
-cannot measure the gap you are closing against a library you did not link.
+The absorption programme still requires MLAS to be *linkable*: `--features mlas`
+is what makes the same-binary A/B possible on a developer machine and in CI —
+you cannot measure the gap you are closing against a library you did not link.
+It is enabled explicitly for those measurements and in the differential gate,
+not shipped.
 
 ## Ownership boundary
 
@@ -40,7 +48,7 @@ This is the part that is easy to state and easy to lose.
 |---|---|
 | Node claiming / partitioning | **Ours.** Our EP claims the nodes it supports and never declines one to make ORT's CPU EP take it. |
 | Kernel selection within a claimed node | **Ours.** `dispatch_ledger::PLAN` records which route runs and why. |
-| The inner arithmetic of some routes | MLAS, called as a library from inside our kernel. |
+| The inner arithmetic of some routes | MLAS, called as a library from inside our kernel *when `--features mlas` is enabled*. |
 | Threading | **Ours** for every family whose `threads` column says so; MLAS partitions only where it owns the whole GEMM. |
 | ORT's `CPUExecutionProvider` | **Never.** Not a fallback, not a baseline, not a dependency. |
 
@@ -53,7 +61,8 @@ Enforced by:
   creation instead of quietly running on ORT's CPU EP. CI runs this suite in
   **both** feature configurations.
 - `crates/onnx-runtime-ep-cpu-plugin/tests/mlas_default_wiring.rs` —
-  `mlas_is_statically_private_to_this_cdylib` asserts every MLAS symbol is local
+  `mlas_is_statically_private_to_this_cdylib` (run under `--features mlas`)
+  asserts every MLAS symbol is local
   to our shared object: **zero exported, zero undefined**. We link our own copy;
   the loader cannot bind our calls to `libonnxruntime`'s MLAS or vice versa, so
   the two never share a thread pool or a dispatch table.
@@ -99,8 +108,8 @@ for an inner primitive.
 
 ## Inventory of MLAS primitives
 
-Bound in `crates/mlas-sys`. "Used" means some route reaches it in a default
-build today.
+Bound in `crates/mlas-sys`. "Used" means some route reaches it in an
+`--features mlas` build today.
 
 ### Used
 
@@ -115,7 +124,7 @@ build today.
 | `MlasComputeErf` / `GeluErf` | `Activations` | `len >= SIMD_MIN_LEN` |
 | `MlasComputeLogistic` / `SiLU` | `Activations` | with native repair outside ±18 |
 | `MlasConvPrepare` / `Run` | `Convolution` | plus plan lifetime management |
-| `MlasNchwc*` (block size, reorder in/out/filter, conv) | `Convolution` | the 6 extra op registrations a default build gains |
+| `MlasNchwc*` (block size, reorder in/out/filter, conv) | `Convolution` | the 6 extra op registrations an MLAS build gains |
 | `MlasPool`, `MlasNchwcPool` | `Pooling` | f32 Max/Average |
 | `MlasQNBitGemm` (+ available / packB / workspace) | `MatMulNBits` | prefill `M >= NXRT_SQNBIT_PREFILL_MIN` |
 | `MlasSetThreading` | all | the MLAS pool runs under *our* thread budget (#1054) |
@@ -276,31 +285,34 @@ slice. Deliberately not done here: this PR is infrastructure, and flipping a
 kernel default is a kernel change that deserves its own before/after on a quiet
 pinned host, per the rule this document just wrote.
 
-## What the default costs
+## What the MLAS build costs
 
 Linux x86-64, gcc 13.3.0, cargo 1.97.1, release cdylib
 (`libonnx_runtime_ep_cpu_plugin.so`).
 
-| | pure Rust | default (MLAS) | delta |
+| | pure Rust (default) | `--features mlas` | delta |
 |---|---|---|---|
 | cdylib size (release) | 7,646,424 B | 9,250,096 B | **+1,603,672 B (+21.0%)** |
 | MLAS symbols linked | 0 | 860 | all local — 0 exported, 0 undefined |
 | one-time C++/asm compile | — | 70.2 s (`mlas-sys`, release, 32 cores) | **+70 s per target dir** |
 | incremental relink | 17.7 s | 16.7 s | within noise |
 
-The 70 s is paid once per target directory. The vendored C++ does not change, so
-`mlas-sys` is never recompiled by ordinary Rust edits and incremental rebuilds
-measure the same either way. The size cost buys the order-of-magnitude quantized-
-matmul numbers at the top of this document.
+The 70 s is paid once per target directory, only when `--features mlas` is
+requested. The vendored C++ does not change, so `mlas-sys` is never recompiled
+by ordinary Rust edits and incremental rebuilds measure the same either way. The
+size and compile cost is exactly why MLAS is opt-in: the default build carries
+neither, and a user who does not ask for MLAS pays for none of it.
 
-Requiring the toolchain is deliberate: a build that cannot compile MLAS should
-say so, not silently produce a cdylib that is 55–81× slower on the paths users
-notice. The opt-out below is the supported way to build without a C++ compiler.
+Keeping MLAS out of the default is deliberate: the shipped build is our native
+path, so the C++/asm toolchain is never required to build or install this EP,
+and every native gap stays visible instead of being papered over by the
+vendored kernels. Enabling MLAS is the explicit, measured action described in
+the opt-in below.
 
 ## Platform validation
 
-Flipping the default is what first required an ARM64 *binary*, and that exposed
-a latent break in `mlas-sys`.
+Building `--features mlas` for ARM64 is what first required an ARM64 *binary*,
+and that exposed a latent break in `mlas-sys`.
 
 `crates/mlas-sys/build.rs` assembled the MSVC ARM64 `.asm` sources and had no
 GNU/clang branch for the GAS `.S` sources in `lib/aarch64/`. Those files define
@@ -396,47 +408,52 @@ only ever held on x86-64:
   aarch64. The contract is that *a licensed CompInt8 route* runs, not which one,
   so it now matches its bits=4 sibling and accepts either.
 
-Three lanes had to follow the default rather than the other way round:
+The MLAS build (`--features mlas`) needed three CI lanes adjusted around it:
 
 - `Rust quality` installed `gcc-aarch64-linux-gnu` but not `g++`. `cc-rs` probes
   `aarch64-linux-gnu-g++` before compiling any of `mlas-sys`' C++, so the
-  cross-arch pass died at `ToolNotFound` the moment MLAS became default.
+  cross-arch pass dies at `ToolNotFound` as soon as an `--features mlas` lane
+  compiles it; the lane installs `g++` so the MLAS build links.
 - Miri interprets Rust and cannot call foreign functions, so
   `onnx-runtime-ep-cpu`'s `provider::tests` aborted on `mlas_nchwc_block_size`.
-  The three `ep-cpu` Miri passes now run `--no-default-features --features full`
-  — the pure-Rust build, which is what that lane is able to check at all.
+  The three `ep-cpu` Miri passes run `--no-default-features --features full`
+  — the pure-Rust build, which is what that lane is able to check at all (and
+  which is now also the default build).
 - `erf_neon_fp16.cpp` and `gelu_neon_fp16.cpp` must stay *out* of the Windows
   ARM64 build. `platform.cpp:755` installs those kernels under
   `MLAS_F16VEC_INTRINSICS_SUPPORTED && !defined(_WIN32)`, and MSVC has no
   `__fp16`, so compiling them there only fails. On Linux ARM64 omitting them
   breaks the link, so the split is per-OS, not per-arch.
 
-## Opting out
+## Opting in
 
-Two boundaries, both real, both tested in CI:
+MLAS is off by default; enable it explicitly. Each boundary is real and tested
+in CI:
 
 ```console
-# The EP crate, keeping every operator group:
-cargo build -p onnx-runtime-ep-cpu --no-default-features --features full
+# The EP crate, on top of every operator group:
+cargo build -p onnx-runtime-ep-cpu --features mlas
 
 # The shipped cdylib:
-cargo build -p onnx-runtime-ep-cpu-plugin --no-default-features
+cargo build -p onnx-runtime-ep-cpu-plugin --features mlas
 
-# The wheel:
-NXRT_EP_CPU_NO_MLAS=1 pip wheel python/nxrt-ep-cpu
+# The wheel (opt in even on an unproven target):
+NXRT_EP_CPU_MLAS=1 pip wheel python/nxrt-ep-cpu
 ```
 
-The wheel also drops MLAS automatically on any target outside
-`setup.py`'s `MLAS_TARGETS` (linux-x86_64, windows-amd64, windows-arm64,
-darwin-arm64), because a wheel that fails to build is worse than a wheel that is
-slow. `nxrt_ep_build_features()` reports `"mlas"` or `""` so a packaged cdylib
-can be identified after the fact, and `check_wheel.py` compares it against what
-the build asked for.
+The wheel enables MLAS only on a target inside `setup.py`'s `MLAS_TARGETS`
+(linux-x86_64, windows-amd64, windows-arm64, darwin-arm64), and drops it
+automatically elsewhere, because a wheel that fails to build is worse than a
+wheel that is slow; `NXRT_EP_CPU_MLAS=1` forces it on an unproven target and
+`NXRT_EP_CPU_NO_MLAS=1` forces it off on a proven one.
+`nxrt_ep_build_features()` reports `"mlas"` or `""` so a packaged cdylib can be
+identified after the fact, and `check_wheel.py` compares it against what the
+build asked for.
 
-Opting out changes behaviour, not just speed: without MLAS the EP registers 6
-fewer ops (the NCHWc reorders) and uses `conv_ref.rs` instead of `conv.rs`, so it
-claims fewer nodes. It remains correct — every MLAS route is differentially
-tested against the native one that a pure-Rust build takes.
+Enabling MLAS changes behaviour, not just speed: with MLAS the EP registers 6
+more ops (the NCHWc reorders) and uses `conv.rs` instead of `conv_ref.rs`, so it
+claims more nodes. The default (native) build remains correct — every MLAS route
+is differentially tested against the native one the default build takes.
 
 ## Rules that apply to every absorption
 
