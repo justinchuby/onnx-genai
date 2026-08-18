@@ -186,10 +186,9 @@ pub(crate) unsafe fn read_inputs(
         _ => None,
     };
     if get_type_and_shape_ref.is_none() && legacy_shape_hooks.is_none() {
-        return Err(
-            "OrtApi exposes neither GetTensorElementTypeAndShapeDataReference nor the              GetTensorTypeAndShape family; input shapes cannot be read"
-                .into(),
-        );
+        return Err("OrtApi exposes neither GetTensorElementTypeAndShapeDataReference nor the \
+                    GetTensorTypeAndShape family; input shapes cannot be read"
+            .into());
     }
     let get_tensor_data = api.GetTensorData.ok_or("OrtApi.GetTensorData is null")?;
 
@@ -408,6 +407,8 @@ mod tests {
     static MEM_INFO_CALLS: AtomicUsize = AtomicUsize::new(0);
     /// Storage the fake `GetTensorMutableData` hands back.
     static mut FAKE_OUTPUT: [f32; 4] = [0.0; 4];
+    /// The dims the recording fake `KernelContext_GetOutput` last saw.
+    static RECORDED_DIMS: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
 
     /// Stands in for ORT: yields an opaque non-null `OrtValue`.
     ///
@@ -421,6 +422,30 @@ mod tests {
         _dim_count: usize,
         out: *mut *mut ort::OrtValue,
     ) -> ort::OrtStatusPtr {
+        unsafe { *out = std::ptr::dangling_mut::<ort::OrtValue>() };
+        std::ptr::null_mut()
+    }
+
+    /// Stands in for ORT, recording the dims the caller passed so a test can
+    /// prove the inline-rank fast path sends the same shape as the heap path.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `dims` must point at `dim_count` i64 and
+    /// `out` must be a valid pointer.
+    unsafe extern "C" fn recording_get_output(
+        _ctx: *mut ort::OrtKernelContext,
+        _index: usize,
+        dims: *const i64,
+        dim_count: usize,
+        out: *mut *mut ort::OrtValue,
+    ) -> ort::OrtStatusPtr {
+        let seen = if dim_count == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(dims, dim_count) }.to_vec()
+        };
+        *RECORDED_DIMS.lock().expect("recorded dims lock") = seen;
         unsafe { *out = std::ptr::dangling_mut::<ort::OrtValue>() };
         std::ptr::null_mut()
     }
@@ -484,6 +509,293 @@ mod tests {
             1,
             "a staging caller still gets the output's memory info"
         );
+    }
+
+    /// How many times the fake ORT below was asked for a shape *reference*.
+    static SHAPE_REF_CALLS: AtomicUsize = AtomicUsize::new(0);
+    /// How many times the fake ORT below was asked to allocate shape info.
+    static LEGACY_SHAPE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    /// The shape the fake ORT reports for its single input.
+    static FAKE_INPUT_DIMS: [i64; 3] = [2, 3, 4];
+    /// Storage the fake `GetTensorData` hands back (2 * 3 * 4 f32).
+    static FAKE_INPUT_DATA: [f32; 24] = [0.0; 24];
+    /// `ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT`.
+    const ORT_ELEM_FLOAT: ort::ONNXTensorElementDataType = 1;
+
+    /// Stands in for ORT: exactly one input.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `out` must be a valid pointer.
+    unsafe extern "C" fn fake_get_input_count(
+        _ctx: *const ort::OrtKernelContext,
+        out: *mut usize,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = 1 };
+        std::ptr::null_mut()
+    }
+
+    /// Stands in for ORT: yields an opaque non-null `OrtValue`.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `out` must be a valid pointer.
+    unsafe extern "C" fn fake_get_input(
+        _ctx: *const ort::OrtKernelContext,
+        _index: usize,
+        out: *mut *const ort::OrtValue,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = std::ptr::dangling::<ort::OrtValue>() };
+        std::ptr::null_mut()
+    }
+
+    /// Stands in for ORT: points at `FAKE_INPUT_DATA`.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `out` must be a valid pointer.
+    unsafe extern "C" fn fake_get_tensor_data(
+        _value: *const ort::OrtValue,
+        out: *mut *const c_void,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = FAKE_INPUT_DATA.as_ptr().cast() };
+        std::ptr::null_mut()
+    }
+
+    /// Stands in for ORT's API-24 one-call type+shape reference, counting uses
+    /// and lending the value's *own* dims array exactly as ORT documents.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; all out pointers must be valid.
+    unsafe extern "C" fn counting_shape_reference(
+        _value: *const ort::OrtValue,
+        elem_type: *mut ort::ONNXTensorElementDataType,
+        shape_data: *mut *const i64,
+        shape_data_count: *mut usize,
+    ) -> ort::OrtStatusPtr {
+        SHAPE_REF_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            *elem_type = ORT_ELEM_FLOAT;
+            *shape_data = FAKE_INPUT_DIMS.as_ptr();
+            *shape_data_count = FAKE_INPUT_DIMS.len();
+        }
+        std::ptr::null_mut()
+    }
+
+    /// Same hook, reporting a scalar the way ORT documents it: a **null**
+    /// pointer with count 0, which must never reach `from_raw_parts`.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; all out pointers must be valid.
+    unsafe extern "C" fn scalar_shape_reference(
+        _value: *const ort::OrtValue,
+        elem_type: *mut ort::ONNXTensorElementDataType,
+        shape_data: *mut *const i64,
+        shape_data_count: *mut usize,
+    ) -> ort::OrtStatusPtr {
+        SHAPE_REF_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            *elem_type = ORT_ELEM_FLOAT;
+            *shape_data = std::ptr::null();
+            *shape_data_count = 0;
+        }
+        std::ptr::null_mut()
+    }
+
+    /// Stands in for the legacy allocating `GetTensorTypeAndShape`, counting
+    /// uses so a test can prove the five-call sequence was *not* taken.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `out` must be a valid pointer.
+    unsafe extern "C" fn counting_get_type_shape(
+        _value: *const ort::OrtValue,
+        out: *mut *mut ort::OrtTensorTypeAndShapeInfo,
+    ) -> ort::OrtStatusPtr {
+        LEGACY_SHAPE_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe { *out = std::ptr::dangling_mut::<ort::OrtTensorTypeAndShapeInfo>() };
+        std::ptr::null_mut()
+    }
+
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `out` must be a valid pointer.
+    unsafe extern "C" fn legacy_get_elem_type(
+        _info: *const ort::OrtTensorTypeAndShapeInfo,
+        out: *mut ort::ONNXTensorElementDataType,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = ORT_ELEM_FLOAT };
+        std::ptr::null_mut()
+    }
+
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `out` must be a valid pointer.
+    unsafe extern "C" fn legacy_get_dims_count(
+        _info: *const ort::OrtTensorTypeAndShapeInfo,
+        out: *mut usize,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = FAKE_INPUT_DIMS.len() };
+        std::ptr::null_mut()
+    }
+
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `out` must point at `count` writable i64.
+    unsafe extern "C" fn legacy_get_dims(
+        _info: *const ort::OrtTensorTypeAndShapeInfo,
+        out: *mut i64,
+        count: usize,
+    ) -> ort::OrtStatusPtr {
+        let n = count.min(FAKE_INPUT_DIMS.len());
+        unsafe { std::ptr::copy_nonoverlapping(FAKE_INPUT_DIMS.as_ptr(), out, n) };
+        std::ptr::null_mut()
+    }
+
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects.
+    unsafe extern "C" fn legacy_release_type_shape(_info: *mut ort::OrtTensorTypeAndShapeInfo) {}
+
+    /// An `OrtApi` with both shape routes wired and both counted.
+    fn api_with_both_shape_routes() -> ort::OrtApi {
+        let mut api: ort::OrtApi = unsafe { std::mem::zeroed() };
+        api.KernelContext_GetInputCount = Some(fake_get_input_count);
+        api.KernelContext_GetInput = Some(fake_get_input);
+        api.GetTensorData = Some(fake_get_tensor_data);
+        api.GetTensorElementTypeAndShapeDataReference = Some(counting_shape_reference);
+        api.GetTensorTypeAndShape = Some(counting_get_type_shape);
+        api.GetTensorElementType = Some(legacy_get_elem_type);
+        api.GetDimensionsCount = Some(legacy_get_dims_count);
+        api.GetDimensions = Some(legacy_get_dims);
+        api.ReleaseTensorTypeAndShapeInfo = Some(legacy_release_type_shape);
+        api
+    }
+
+    /// The whole point of the change: when ORT offers the API-24 hook, the
+    /// per-input, per-`Run` shape read is **one** call and the allocating
+    /// five-call sequence is never entered.
+    ///
+    /// Falsifier: point `read_inputs` back at the legacy family unconditionally
+    /// and this fails with `SHAPE_REF_CALLS 0` / `LEGACY_SHAPE_CALLS 1`
+    /// (verified).
+    #[test]
+    fn input_shapes_come_from_one_call_when_ort_offers_the_reference_hook() {
+        let api = api_with_both_shape_routes();
+        let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+
+        SHAPE_REF_CALLS.store(0, Ordering::Relaxed);
+        LEGACY_SHAPE_CALLS.store(0, Ordering::Relaxed);
+        let inputs = unsafe { read_inputs(&api, ctx) }.expect("the fake ORT reads successfully");
+
+        assert_eq!(
+            SHAPE_REF_CALLS.load(Ordering::Relaxed),
+            1,
+            "one input must cost exactly one shape call"
+        );
+        assert_eq!(
+            LEGACY_SHAPE_CALLS.load(Ordering::Relaxed),
+            0,
+            "the allocating five-call sequence must not run when the reference hook exists"
+        );
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].shape, vec![2, 3, 4]);
+        assert_eq!(inputs[0].strides, vec![12, 4, 1]);
+        assert_eq!(inputs[0].dtype, DataType::Float32);
+    }
+
+    /// The fallback is not decoration: with the reference hook absent, the
+    /// five-call sequence must still produce the identical `OwnedInput`.
+    #[test]
+    fn the_five_call_fallback_produces_the_same_input_as_the_reference_hook() {
+        let reference = {
+            let api = api_with_both_shape_routes();
+            let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+            unsafe { read_inputs(&api, ctx) }.expect("the fake ORT reads successfully")
+        };
+
+        let mut api = api_with_both_shape_routes();
+        api.GetTensorElementTypeAndShapeDataReference = None;
+        let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+
+        SHAPE_REF_CALLS.store(0, Ordering::Relaxed);
+        LEGACY_SHAPE_CALLS.store(0, Ordering::Relaxed);
+        let fallback = unsafe { read_inputs(&api, ctx) }.expect("the fake ORT reads successfully");
+
+        assert_eq!(
+            LEGACY_SHAPE_CALLS.load(Ordering::Relaxed),
+            1,
+            "a host without the reference hook must still get its shapes"
+        );
+        assert_eq!(fallback.len(), reference.len());
+        assert_eq!(fallback[0].shape, reference[0].shape);
+        assert_eq!(fallback[0].strides, reference[0].strides);
+        assert_eq!(fallback[0].dtype, reference[0].dtype);
+        assert_eq!(fallback[0].data_ptr, reference[0].data_ptr);
+    }
+
+    /// ORT reports a scalar as a **null** shape pointer with count 0.
+    /// `slice::from_raw_parts` is UB on null, so the borrowed path has to
+    /// special-case it — this is the test that would catch removing that guard
+    /// (under Miri; natively it asserts the resulting rank-0 shape).
+    #[test]
+    fn a_borrowed_scalar_shape_never_dereferences_null() {
+        let mut api = api_with_both_shape_routes();
+        api.GetTensorElementTypeAndShapeDataReference = Some(scalar_shape_reference);
+        let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+
+        SHAPE_REF_CALLS.store(0, Ordering::Relaxed);
+        let inputs = unsafe { read_inputs(&api, ctx) }.expect("a scalar input is legal");
+
+        assert_eq!(inputs[0].shape, Vec::<usize>::new());
+        assert_eq!(inputs[0].strides, Vec::<i64>::new());
+    }
+
+    /// A host offering neither route must fail closed with a message naming
+    /// both, not silently read garbage shapes.
+    #[test]
+    fn read_inputs_fails_closed_when_no_shape_route_exists() {
+        let mut api = api_with_both_shape_routes();
+        api.GetTensorElementTypeAndShapeDataReference = None;
+        api.GetDimensions = None;
+        let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+
+        let err = match unsafe { read_inputs(&api, ctx) } {
+            Ok(_) => panic!("no shape route must be fatal, not silently successful"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("GetTensorElementTypeAndShapeDataReference")
+                && err.contains("GetTensorTypeAndShape"),
+            "error must name both routes: {err}"
+        );
+    }
+
+    /// The output shape handed to ORT must be the same values whether it went
+    /// through the inline array or the `Vec`. The boundary is rank 8.
+    ///
+    /// Falsifier: drop the `heap_dims` arm and a rank-9 output silently sends
+    /// ORT a truncated shape; this fails on `dims_seen` (verified).
+    #[test]
+    fn output_dims_are_identical_on_the_inline_and_heap_ranks() {
+        let mut api: ort::OrtApi = unsafe { std::mem::zeroed() };
+        api.KernelContext_GetOutput = Some(recording_get_output);
+        api.GetTensorMutableData = Some(fake_get_mutable_data);
+        let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+
+        for rank in [0usize, 1, 8, 9, 12] {
+            let shape: Vec<usize> = (1..=rank).collect();
+            let _ = unsafe { allocate_output(&api, ctx, 0, &shape, DataType::Float32, false) }
+                .expect("the fake ORT allocates successfully");
+            let seen = RECORDED_DIMS.lock().expect("recorded dims lock");
+            let expected: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
+            assert_eq!(
+                *seen, expected,
+                "rank {rank} must reach ORT with every dimension intact"
+            );
+        }
     }
 
     #[test]
