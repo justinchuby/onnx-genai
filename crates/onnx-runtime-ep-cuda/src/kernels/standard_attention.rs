@@ -123,6 +123,21 @@ fn attention_row_threads(is_decode: bool) -> u32 {
 const ATTN_SPLIT_MAX_SPLITS: u64 = 64;
 /// Threads per block for the `attention_split` / `attention_combine` kernels.
 const ATTN_SPLIT_THREADS: u32 = 256;
+/// Adaptive split-KV target: total `attention_split` blocks
+/// (`total_rows * num_splits`) to aim for so the launch fills roughly one full
+/// occupancy wave of the machine (~4 resident CTAs on each of the 132 H200 SMs).
+/// The decode split kernel is memory-latency bound, so an ncu + E2E chunk sweep
+/// on V2-Lite showed the optimum is ~this many blocks (grid ~512 at deep
+/// context), NOT one block per SM: at deep context a grid of 132 blocks
+/// (`chunk`=512) leaves the SMs latency-starved and is ~5% slower than a grid of
+/// 512 (`chunk`=128). Targeting a whole wave keeps enough resident CTAs per SM
+/// to hide the KV-load latency.
+const ATTN_SPLIT_TARGET_BLOCKS: u64 = 512;
+/// Floor on keys per split for the adaptive sizing: never split so finely that a
+/// split covers fewer than this many keys. Also the byte-identity margin — any
+/// live context `<= ATTN_SPLIT_MIN_CHUNK` stays on the single-split bit-exact
+/// fast path (the V2-Lite golden 24-tok decode lock sits well under this).
+const ATTN_SPLIT_MIN_CHUNK: u64 = 128;
 
 /// FlashDecoding split-KV configuration for one decode launch, or `None` when
 /// the monolithic `attention_row` kernel should be used instead.
@@ -132,26 +147,37 @@ const ATTN_SPLIT_THREADS: u32 = 256;
 /// key reduction across `num_splits` blocks fills the machine at wide context,
 /// where `attention_row` is the #1 decode kernel (~40% of decode time).
 ///
-/// `num_splits` is derived purely from the fixed physical KV capacity `cap`
-/// (never the live sequence length), so the launch geometry — and the decision
-/// to split at all — is identical under eager and CUDA-graph capture. `chunk`
-/// (keys per split) is fixed too: when the live `total_seq <= chunk` only split
-/// 0 is active and reproduces `attention_row` bit-for-bit, so short-context
-/// decode stays byte-identical; only genuinely wide context reorders the fp32
-/// accumulation (validated to the f64 oracle tolerance).
+/// `num_splits` is derived purely from the fixed physical KV capacity `cap` and
+/// the fixed row count `total_rows` (never the live sequence length), so the
+/// launch geometry — and the decision to split at all — is identical under eager
+/// and CUDA-graph capture. The keys-per-split `chunk` follows from `num_splits`:
+/// when the live `total_seq <= chunk` only split 0 is active and reproduces
+/// `attention_row` bit-for-bit, so short-context decode stays byte-identical;
+/// only genuinely wide context reorders the fp32 accumulation (validated to the
+/// f64 oracle tolerance).
+///
+/// Adaptive sizing: aim for `ATTN_SPLIT_TARGET_BLOCKS` total blocks
+/// (`total_rows * num_splits`) so the launch fills ~one occupancy wave, but never
+/// split a row into pieces smaller than `ATTN_SPLIT_MIN_CHUNK` keys (which would
+/// starve each split of work and lower the byte-identity threshold). For
+/// V2-Lite's 16 decode rows this lands `num_splits` near 32 (grid ~512, the
+/// measured optimum) at deep context and scales down gracefully at shallow
+/// context, where `cap` alone caps the useful split count.
 ///
 /// `ONNX_GENAI_ATTN_SPLITKV=0` forces the monolithic path (A/B baseline);
-/// `ONNX_GENAI_ATTN_SPLIT_CHUNK` overrides the keys-per-split.
+/// `ONNX_GENAI_ATTN_SPLIT_CHUNK` pins a fixed keys-per-split, overriding the
+/// adaptive sizing (for A/B sweeps and backward compatibility).
 fn attention_split_config(
     is_decode: bool,
     dev_length_eligible: bool,
     want_qk: bool,
     cap: u64,
+    total_rows: u64,
     _v_head_size: u64,
 ) -> Option<(u64, u64)> {
     use std::sync::OnceLock;
-    static CFG: OnceLock<(bool, u64)> = OnceLock::new();
-    let (enabled, chunk) = *CFG.get_or_init(|| {
+    static CFG: OnceLock<(bool, Option<u64>)> = OnceLock::new();
+    let (enabled, chunk_override) = *CFG.get_or_init(|| {
         let enabled = std::env::var("ONNX_GENAI_ATTN_SPLITKV")
             .ok()
             .map(|s| {
@@ -159,12 +185,11 @@ fn attention_split_config(
                 !(s == "0" || s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("false"))
             })
             .unwrap_or(true);
-        let chunk = std::env::var("ONNX_GENAI_ATTN_SPLIT_CHUNK")
+        let chunk_override = std::env::var("ONNX_GENAI_ATTN_SPLIT_CHUNK")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&n| n >= 32)
-            .unwrap_or(256);
-        (enabled, chunk)
+            .filter(|&n| n >= 32);
+        (enabled, chunk_override)
     });
     // Split only on the capture-safe fixed-capacity decode route, and never when
     // the raw QK scores are an observable output (the score scratch is reused as
@@ -172,11 +197,42 @@ fn attention_split_config(
     if !enabled || !is_decode || !dev_length_eligible || want_qk || cap == 0 {
         return None;
     }
-    let num_splits = cap.div_ceil(chunk).clamp(1, ATTN_SPLIT_MAX_SPLITS);
+    attention_split_geometry(chunk_override, cap, total_rows)
+}
+
+/// Pure split-KV geometry: map (`chunk_override`, fixed `cap`, fixed
+/// `total_rows`) to `(num_splits, chunk)`, or `None` when a single split (the
+/// monolithic path plus combine overhead) is all that is warranted. Split out
+/// from [`attention_split_config`] so the capture-critical sizing arithmetic is
+/// unit-testable without touching process env.
+fn attention_split_geometry(
+    chunk_override: Option<u64>,
+    cap: u64,
+    total_rows: u64,
+) -> Option<(u64, u64)> {
+    if cap == 0 {
+        return None;
+    }
+    let rows = total_rows.max(1);
+    let num_splits = match chunk_override {
+        // Fixed-chunk mode: split count follows directly from the pinned chunk.
+        Some(chunk) => cap.div_ceil(chunk.max(1)).clamp(1, ATTN_SPLIT_MAX_SPLITS),
+        // Adaptive mode: target ~one occupancy wave of blocks, but never split a
+        // row finer than ATTN_SPLIT_MIN_CHUNK keys.
+        None => {
+            let target_splits = ATTN_SPLIT_TARGET_BLOCKS.div_ceil(rows);
+            let splits_by_cap = cap.div_ceil(ATTN_SPLIT_MIN_CHUNK);
+            target_splits
+                .min(splits_by_cap)
+                .clamp(1, ATTN_SPLIT_MAX_SPLITS)
+        }
+    };
     // A single split is just the monolithic kernel plus combine overhead.
     if num_splits < 2 {
         return None;
     }
+    // Keys per split; the single-split fast path triggers when total_seq <= chunk.
+    let chunk = cap.div_ceil(num_splits);
     Some((num_splits, chunk))
 }
 
@@ -2112,18 +2168,19 @@ impl StandardAttentionKernel {
             let staged_decode_eligible = (stage_key || stage_value) && batch == 1 && q_seq == 1;
             let capture_workspace_eligible = dev_length_eligible || staged_decode_eligible;
             // FlashDecoding split-KV: engage on the capture-safe fixed-capacity
-            // decode route. `num_splits`/`chunk` derive only from the fixed cap,
-            // so the choice is identical under eager and capture.
+            // decode route. `num_splits`/`chunk` derive only from the fixed cap
+            // and row count, so the choice is identical under eager and capture.
+            let total_rows_u = (batch as u64)
+                .saturating_mul(q_heads as u64)
+                .saturating_mul(q_seq as u64);
             let split_cfg = attention_split_config(
                 q_seq == 1,
                 dev_length_eligible,
                 want_qk,
                 key_cap as u64,
+                total_rows_u,
                 v_head_size as u64,
             );
-            let total_rows_u = (batch as u64)
-                .saturating_mul(q_heads as u64)
-                .saturating_mul(q_seq as u64);
             let split_bytes = match split_cfg {
                 Some((num_splits, _)) => attention_split_scratch_floats(
                     num_splits,
@@ -3485,6 +3542,42 @@ mod workspace_governance_tests {
         assert_eq!(
             std_attention_workspace_requirement(&bad_inputs, Some(4), Some(4), true, 3).unwrap(),
             WorkspaceRequirement::NONE
+        );
+    }
+
+    #[test]
+    fn adaptive_split_geometry_fills_a_wave_and_stays_capture_safe() {
+        // Adaptive mode (no chunk override): target ~ATTN_SPLIT_TARGET_BLOCKS
+        // blocks = total_rows * num_splits, floored so no split covers fewer than
+        // ATTN_SPLIT_MIN_CHUNK keys. For V2-Lite's 16 decode rows the deep-cap
+        // optimum measured on H200 is num_splits=32 (grid ~512, ~one wave).
+        let rows = 16;
+        // Deep cap: capped by the target-blocks wave, not by cap.
+        let (n, chunk) = attention_split_geometry(None, 4096, rows).unwrap();
+        assert_eq!(n, 32, "deep cap should target ~a full wave of blocks");
+        assert_eq!(chunk, 128, "keys per split at the deep optimum");
+        assert!(rows * n >= ATTN_SPLIT_TARGET_BLOCKS / 2);
+        // Extreme cap: split count is clamped by the wave target (never explodes),
+        // so chunk grows instead — keeps the combine loop + scratch bounded.
+        let (n_hi, chunk_hi) = attention_split_geometry(None, 16384, rows).unwrap();
+        assert_eq!(n_hi, 32);
+        assert_eq!(chunk_hi, 512);
+        // Shallow cap: MIN_CHUNK floor caps useful splits (cap/MIN_CHUNK), so we
+        // scale down gracefully rather than over-splitting tiny rows.
+        let (n_lo, chunk_lo) = attention_split_geometry(None, 512, rows).unwrap();
+        assert_eq!(n_lo, 4);
+        assert_eq!(chunk_lo, 128);
+        // Narrow cap: below 2*MIN_CHUNK there is no useful split — stay monolithic.
+        assert_eq!(attention_split_geometry(None, 128, rows), None);
+        assert_eq!(attention_split_geometry(None, 0, rows), None);
+        // Fixed-chunk override reproduces the pre-adaptive behaviour exactly.
+        assert_eq!(attention_split_geometry(Some(256), 4096, rows), Some((16, 256)));
+        assert_eq!(attention_split_geometry(Some(256), 512, rows), Some((2, 256)));
+        // Same fixed cap/rows always yields the same geometry — the property the
+        // CUDA-graph capture path relies on (no dependence on live seqlen).
+        assert_eq!(
+            attention_split_geometry(None, 4096, rows),
+            attention_split_geometry(None, 4096, rows)
         );
     }
 }
