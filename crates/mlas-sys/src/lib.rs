@@ -1450,8 +1450,10 @@ impl QgemmPackedB {
 
 impl Drop for QgemmPackedB {
     fn drop(&mut self) {
-        QGEMM_PACKED_LIVE_BYTES
-            .fetch_sub(self.owned_heap_bytes(), std::sync::atomic::Ordering::Relaxed);
+        QGEMM_PACKED_LIVE_BYTES.fetch_sub(
+            self.owned_heap_bytes(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // SAFETY: `ptr`/`layout` are the pair returned by `alloc_zeroed` in
         // `new` and this runs at most once.
         unsafe { std::alloc::dealloc(self.ptr, self.layout) };
