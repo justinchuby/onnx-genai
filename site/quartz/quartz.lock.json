@@ -112,8 +112,8 @@
     "explorer": {
       "source": "github:quartz-community/explorer",
       "resolved": "https://github.com/quartz-community/explorer.git",
-      "commit": "def459f31b02fdebdc22579cbeec2907829ff20f",
-      "installedAt": "2026-03-12T19:33:30.998Z"
+      "commit": "06ea3d8e206f0edaab08556191adc75b2403e832",
+      "installedAt": "2026-08-18T05:36:00.000Z"
     },
     "favicon": {
       "source": "github:quartz-community/favicon",
@@ -142,8 +142,8 @@
     "graph": {
       "source": "github:quartz-community/graph",
       "resolved": "https://github.com/quartz-community/graph.git",
-      "commit": "701bda442cf08f521e88ec326b12a7559320eef4",
-      "installedAt": "2026-03-12T19:33:34.250Z"
+      "commit": "411971434ab698c495dfc42870eb02d3bc539b3a",
+      "installedAt": "2026-08-18T05:36:00.000Z"
     },
     "hard-line-breaks": {
       "source": "github:quartz-community/hard-line-breaks",
@@ -214,8 +214,8 @@
     "search": {
       "source": "github:quartz-community/search",
       "resolved": "https://github.com/quartz-community/search.git",
-      "commit": "e9c10e521b95a14a512739b62a4159ab5afd5edf",
-      "installedAt": "2026-03-12T19:33:41.367Z"
+      "commit": "1d9ba593230b997ee4cf0cc3c1ed4a30b571cee2",
+      "installedAt": "2026-08-18T05:36:00.000Z"
     },
     "spacer": {
       "source": "github:quartz-community/spacer",

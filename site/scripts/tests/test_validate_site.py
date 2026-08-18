@@ -9,11 +9,16 @@ VALIDATOR = Path(__file__).parents[1] / "validate_site.py"
 
 
 class ValidateSiteTest(unittest.TestCase):
-    def run_validator(self, body: str) -> subprocess.CompletedProcess[str]:
+    def run_validator(
+        self, body: str, runtime: str = "fetchData; document.body.dataset.basepath;"
+    ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             public = Path(directory) / "public"
             public.mkdir()
+            if "<body" not in body:
+                body = f'<body data-basepath="/onnx-genai">{body}</body>'
             (public / "index.html").write_text(body, encoding="utf-8")
+            (public / "postscript.js").write_text(runtime, encoding="utf-8")
             return subprocess.run(
                 ["python3", str(VALIDATOR), str(public), "/onnx-genai/"],
                 check=False,
@@ -36,6 +41,42 @@ class ValidateSiteTest(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing internal target", result.stderr)
+
+    def test_rejects_origin_root_runtime_fetch(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            'fetch("/static/contentIndex.json").then((response) => response.json())',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("origin-root content index", result.stderr)
+
+    def test_rejects_origin_root_runtime_navigation(self) -> None:
+        result = self.run_validator("<p>Wiki</p>", 'result.href = "/" + item.slug')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("origin-root href assignment", result.stderr)
+
+    def test_rejects_origin_root_runtime_url_constructor(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            'const target = new URL("/" + slug, window.location.origin)',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("origin-root URL constructor", result.stderr)
+
+    def test_rejects_missing_runtime_base_path(self) -> None:
+        result = self.run_validator("<body><p>Wiki</p></body>")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("body data-basepath is None", result.stderr)
+
+    def test_accepts_project_safe_runtime(self) -> None:
+        result = self.run_validator(
+            "<p>Wiki</p>",
+            (
+                "const fetchData = fetch('./static/contentIndex.json');"
+                "const target = document.body.dataset.basepath + '/' + slug;"
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

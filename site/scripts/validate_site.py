@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
@@ -14,9 +15,14 @@ class LinkParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self.urls: list[str] = []
+        self.has_body = False
+        self.body_base_path: str | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
+        if tag == "body":
+            self.has_body = True
+            self.body_base_path = attributes.get("data-basepath")
         if tag in {"a", "link"} and attributes.get("href"):
             self.urls.append(attributes["href"] or "")
         if tag in {"img", "script", "source"} and attributes.get("src"):
@@ -53,6 +59,27 @@ def page_url(html: Path, public: Path, base_path: str) -> str:
     return f"{base_path}{relative.removesuffix('.html')}"
 
 
+RUNTIME_ROOT_PATTERNS = {
+    "origin-root content index": re.compile(
+        r"""(?:fetch\(|new URL\()\s*["']/static/contentIndex\.json"""
+    ),
+    "origin-root URL constructor": re.compile(r"""new URL\(\s*["']/["']?\s*\+"""),
+    "origin-root href assignment": re.compile(r"""\.href\s*=\s*["']/["']?\s*\+"""),
+}
+
+
+def validate_runtime(public: Path, expected_base_path: str, errors: set[str]) -> int:
+    scripts = sorted(public.rglob("*.js"))
+    checked = 0
+    for script in scripts:
+        source = script.read_text(encoding="utf-8")
+        checked += 1
+        for description, pattern in RUNTIME_ROOT_PATTERNS.items():
+            if pattern.search(source):
+                errors.add(f"{script}: {description} bypasses {expected_base_path}")
+    return checked
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("public", type=Path)
@@ -63,6 +90,7 @@ def main() -> int:
     html_files = sorted(public.rglob("*.html"))
     errors: set[str] = set()
     checked = 0
+    body_pages = 0
 
     if not (public / "index.html").is_file():
         errors.add("missing public/index.html landing page")
@@ -70,6 +98,13 @@ def main() -> int:
     for html in html_files:
         document = LinkParser()
         document.feed(html.read_text(encoding="utf-8"))
+        if document.has_body:
+            body_pages += 1
+            if document.body_base_path != base_path.rstrip("/"):
+                errors.add(
+                    f"{html}: body data-basepath is {document.body_base_path!r}, "
+                    f"expected {base_path.rstrip('/')!r}"
+                )
         current_url = f"https://justinchuby.github.io{page_url(html, public, base_path)}"
         for raw_url in document.urls:
             parsed = urlparse(raw_url)
@@ -88,13 +123,17 @@ def main() -> int:
             if not any(candidate.is_file() for candidate in candidates):
                 errors.add(f"{html}: missing internal target: {raw_url}")
 
+    if body_pages == 0:
+        errors.add("no generated page has a body for runtime navigation")
+    runtime_scripts = validate_runtime(public, base_path, errors)
     if errors:
         print("\n".join(sorted(errors)), file=sys.stderr)
         print(f"Found {len(errors)} generated site link error(s).", file=sys.stderr)
         return 1
     print(
         f"Validated {checked} generated internal link(s)/asset(s) across "
-        f"{len(html_files)} HTML page(s) at {base_path}."
+        f"{len(html_files)} HTML page(s) and {runtime_scripts} runtime bundle(s) "
+        f"at {base_path}."
     )
     return 0
 

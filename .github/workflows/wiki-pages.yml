@@ -3,18 +3,8 @@ name: Wiki Pages
 on:
   workflow_dispatch:
   push:
-    paths:
-      - ".github/workflows/wiki-pages.yml"
-      - "site/quartz/**"
-      - "site/scripts/**"
-      - "wiki/**"
   pull_request:
     types: [opened, synchronize, reopened]
-    paths:
-      - ".github/workflows/wiki-pages.yml"
-      - "site/quartz/**"
-      - "site/scripts/**"
-      - "wiki/**"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}

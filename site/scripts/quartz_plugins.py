@@ -13,6 +13,9 @@ import sys
 from pathlib import Path
 
 PLUGIN_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+# These plugins consume core globals/types; resolve their declarations from the
+# pinned root dependency tree instead of leaving duplicate nested type packages.
+ROOT_RESOLVED_PLUGINS = {"explorer", "graph", "search"}
 
 
 def enabled_plugin_names(config: Path) -> set[str]:
@@ -102,7 +105,14 @@ def verify(lock: dict[str, dict[str, str]], plugins_dir: Path) -> int:
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
+    pruned = 0
+    for name in sorted(ROOT_RESOLVED_PLUGINS):
+        dependencies = plugins_dir / name / "node_modules"
+        if dependencies.is_dir():
+            shutil.rmtree(dependencies)
+            pruned += 1
     print(f"Verified {len(lock)} Quartz plugin commit(s) and build output(s).")
+    print(f"Removed {pruned} runtime plugin dependency tree(s).")
     return 0
 
 
