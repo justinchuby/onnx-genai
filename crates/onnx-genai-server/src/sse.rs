@@ -47,6 +47,11 @@ pub(crate) struct Delta {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    /// The model's private thinking, carried beside the answer rather than
+    /// inside it so a client can show its progress without the two being
+    /// mistaken for one another.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ChunkToolCall>>,
 }
@@ -202,6 +207,7 @@ pub(crate) fn role_chunk(id: &str, created: u64, model: &str) -> ChatCompletionC
             delta: Delta {
                 role: Some("assistant"),
                 content: None,
+                reasoning_content: None,
                 tool_calls: None,
             },
             logprobs: None,
@@ -227,9 +233,36 @@ pub(crate) fn content_chunk(
             delta: Delta {
                 role: None,
                 content: Some(content),
+                reasoning_content: None,
                 tool_calls: None,
             },
             logprobs,
+            finish_reason: None,
+        }],
+    }
+}
+
+/// A chunk carrying the model's private thinking rather than its answer.
+pub(crate) fn reasoning_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    reasoning: String,
+) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.to_string(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: Delta {
+                role: None,
+                content: None,
+                reasoning_content: Some(reasoning),
+                tool_calls: None,
+            },
+            logprobs: None,
             finish_reason: None,
         }],
     }
@@ -295,6 +328,7 @@ fn tool_call_delta_chunk(
             delta: Delta {
                 role: None,
                 content: None,
+                reasoning_content: None,
                 tool_calls: Some(vec![tool_call]),
             },
             logprobs: None,

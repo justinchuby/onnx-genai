@@ -468,17 +468,16 @@ async fn run_chat_completion(
         None
     };
 
-    let (content, tool_calls, completion_tokens, finish_reason, logprobs) = match result {
+    let (content, tool_calls, completion_tokens, finish_reason, logprobs, reasoning) = match result
+    {
         Ok(result) => {
             let default_finish_reason = finish_reason_label(&result.finish_reason);
             let logprobs = chat_logprobs(&result, &tokenizer, requested_top_logprobs)
                 .map_err(|err| ApiError::internal(format!("logprobs conversion failed: {err}")))?;
+            let output = assistant_output_text(&result, &tokenizer);
+            let reasoning = atem_reasoning_content(&output).filter(|thought| !thought.is_empty());
             let parsed = if tools_parseable_from_output(&request) {
-                parse_assistant_output(
-                    assistant_output_text(&result, &tokenizer),
-                    default_finish_reason,
-                )
-                .aligned_to(&request)
+                parse_assistant_output(output, default_finish_reason).aligned_to(&request)
             } else {
                 ParsedAssistantOutput {
                     content: Some(result.text),
@@ -492,13 +491,14 @@ async fn run_chat_completion(
                 result.token_ids.len(),
                 parsed.finish_reason,
                 logprobs,
+                reasoning,
             )
         }
         Err(err)
             if wants_constrained_json
                 && json_constraint_stopped_incomplete_message(&err.message) =>
         {
-            (Some("{}".to_string()), None, 0, "stop", None)
+            (Some("{}".to_string()), None, 0, "stop", None, None)
         }
         Err(err) => return Err(err),
     };
@@ -513,6 +513,7 @@ async fn run_chat_completion(
             message: ChatMessage {
                 role: "assistant".to_string(),
                 content: content.map(ChatMessageContent::Text),
+                reasoning_content: reasoning,
                 tool_calls,
                 tool_call_id: None,
                 name: None,
@@ -638,8 +639,15 @@ async fn stream_chat_completion(
                     }
                     let finish_reason = token.finish_reason.clone();
                     let spelled = tokenizer.decode_with_special_tokens(&[token.token_id]).ok();
-                    let visible = channel_gate.push(spelled.as_deref(), &token.text);
-                    let content = stop_buffer.push(&visible);
+                    let revealed = channel_gate.push(spelled.as_deref(), &token.text);
+                    if !revealed.reasoning.is_empty() {
+                        send_stream_chunk(
+                            &tx,
+                            reasoning_chunk(&id, created, &model, revealed.reasoning),
+                        )
+                        .await?;
+                    }
+                    let content = stop_buffer.push(&revealed.content);
                     if buffer_for_tool_detection {
                         buffered_text.push_str(&content);
                     } else if !wants_constrained_json && !content.is_empty() {
@@ -741,7 +749,15 @@ async fn stream_chat_completion(
                     // The gate's withheld text is ordinary content rather than a
                     // partial stop sequence, so it is drained either way; only the
                     // stop buffer's own pending text is dropped on a stop match.
-                    let mut content = stop_buffer.push(&channel_gate.flush());
+                    let remaining = channel_gate.flush();
+                    if !remaining.reasoning.is_empty() {
+                        send_stream_chunk(
+                            &tx,
+                            reasoning_chunk(&id, created, &model, remaining.reasoning),
+                        )
+                        .await?;
+                    }
+                    let mut content = stop_buffer.push(&remaining.content);
                     if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
                         content.push_str(&stop_buffer.flush());
                     }
@@ -2084,6 +2100,32 @@ fn atem_visible_content(output: &str) -> Option<String> {
     atem_addresses_a_channel(output).then(String::new)
 }
 
+/// The ATEM channel the model addresses to itself, i.e. its private thinking.
+const ATEM_SELF_CHANNEL: &str = "to=self<|message|>";
+
+/// What an ATEM turn thought before answering, or `None` for output that
+/// carries no private channel.
+///
+/// A turn may think more than once — between tool calls, say — and the whole of
+/// it is one train of thought, so the segments are joined. This is not part of
+/// the answer and is never merged into it; it is offered separately so a client
+/// can show that the model is working rather than watching silence.
+fn atem_reasoning_content(output: &str) -> Option<String> {
+    let mut thought = String::new();
+    let mut addressed = false;
+    for (at, marker) in output.match_indices(ATEM_SELF_CHANNEL) {
+        addressed = true;
+        let rest = &output[at + marker.len()..];
+        let end = ["<|eot|>", "<|eom|>"]
+            .into_iter()
+            .filter_map(|marker| rest.find(marker))
+            .min()
+            .unwrap_or(rest.len());
+        thought.push_str(&rest[..end]);
+    }
+    addressed.then_some(thought)
+}
+
 /// Whether the output has opened a channel addressed to someone.
 ///
 /// The recipient is matched by shape rather than by name because a model may
@@ -2110,24 +2152,61 @@ fn atem_addresses_a_channel(output: &str) -> bool {
 /// The gate is armed from the package's own declaration that it has a private
 /// channel, not from guessing at the shape of a turn, so a model that declares
 /// none is never gated and streams exactly what it generated. An armed gate
-/// then fails closed: anything it cannot place in the channel addressed to the
-/// caller is withheld, because the cost of withholding an answer is a retry and
-/// the cost of releasing reasoning is a disclosure that cannot be taken back.
+/// then fails closed: nothing it cannot place in the channel addressed to the
+/// caller is served as an answer, because the cost of withholding an answer is
+/// a retry and the cost of releasing reasoning as one is a disclosure that
+/// cannot be taken back. Private thinking is not discarded, though — it is
+/// reported separately, so a client can show the model working instead of
+/// waiting on silence.
 #[derive(Debug)]
 struct PrivateChannelGate {
     /// The turn so far, spelled with the special tokens that mark channels.
     transcript: String,
-    /// How much of the visible content has already been streamed.
-    streamed: String,
+    /// How much of the answer has already been streamed.
+    content: ChannelStream,
+    /// How much of the thinking has already been streamed.
+    reasoning: ChannelStream,
     /// Whether the model declares a channel the caller must not be shown.
     armed: bool,
+}
+
+/// What one token added to each channel.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ChannelDelta {
+    /// Text belonging to the answer.
+    content: String,
+    /// Text belonging to the model's private thinking.
+    reasoning: String,
+}
+
+/// Tracks how much of one channel has been sent, so each emission carries only
+/// what has appeared since the last one.
+#[derive(Debug, Default)]
+struct ChannelStream {
+    sent: String,
+}
+
+impl ChannelStream {
+    /// What `revealed` adds to what was already sent.
+    ///
+    /// A channel that is reopened replaces its text rather than extending it,
+    /// so text that is no longer a continuation is sent whole.
+    fn growth(&mut self, revealed: String) -> String {
+        let grown = match revealed.strip_prefix(&self.sent) {
+            Some(grown) => grown.to_string(),
+            None => revealed.clone(),
+        };
+        self.sent = revealed;
+        grown
+    }
 }
 
 impl PrivateChannelGate {
     fn new(armed: bool) -> Self {
         Self {
             transcript: String::new(),
-            streamed: String::new(),
+            content: ChannelStream::default(),
+            reasoning: ChannelStream::default(),
             armed,
         }
     }
@@ -2139,43 +2218,44 @@ impl PrivateChannelGate {
     /// same token as a client would see it. A token that cannot be spelled
     /// leaves the gate unable to place it in a channel, so an armed gate
     /// withholds it.
-    fn push(&mut self, spelled: Option<&str>, plain: &str) -> String {
+    fn push(&mut self, spelled: Option<&str>, plain: &str) -> ChannelDelta {
         if !self.armed {
-            return plain.to_string();
+            return ChannelDelta {
+                content: plain.to_string(),
+                reasoning: String::new(),
+            };
         }
         let Some(spelled) = spelled else {
-            return String::new();
+            return ChannelDelta::default();
         };
         self.transcript.push_str(spelled);
-        self.visible_growth()
+        self.growth()
     }
 
     /// Whatever the gate is still holding once the turn ends.
     ///
     /// A turn that never reached the caller's channel produced no answer, so
-    /// there is nothing to release: the model spent the turn thinking, and
+    /// nothing is released as one: the model spent the turn thinking, and
     /// saying so is the honest empty completion a `length` finish reason
-    /// already reports.
-    fn flush(&mut self) -> String {
+    /// already reports. The thinking itself is still returned, in the channel
+    /// that is for thinking.
+    fn flush(&mut self) -> ChannelDelta {
         if !self.armed {
-            return String::new();
+            return ChannelDelta::default();
         }
-        self.visible_growth()
+        self.growth()
     }
 
-    /// The visible content this turn has revealed since the last emission.
-    ///
-    /// A turn that opens a second visible channel replaces the answer rather
-    /// than extending it, so anything already streamed is no longer a prefix
-    /// and the new answer is sent whole.
-    fn visible_growth(&mut self) -> String {
-        let visible = atem_visible_content(&self.transcript).unwrap_or_default();
-        let grown = match visible.strip_prefix(&self.streamed) {
-            Some(grown) => grown.to_string(),
-            None => visible.clone(),
-        };
-        self.streamed = visible;
-        grown
+    /// What each channel has revealed since the last emission.
+    fn growth(&mut self) -> ChannelDelta {
+        ChannelDelta {
+            content: self
+                .content
+                .growth(atem_visible_content(&self.transcript).unwrap_or_default()),
+            reasoning: self
+                .reasoning
+                .growth(atem_reasoning_content(&self.transcript).unwrap_or_default()),
+        }
     }
 }
 
@@ -2400,7 +2480,7 @@ async fn send_chat_logprob_chunks(
         .map(|&token_id| {
             let spelled = tokenizer.decode_with_special_tokens(&[token_id]).ok();
             let plain = tokenizer.decode(&[token_id])?;
-            Ok(gate.push(spelled.as_deref(), &plain))
+            Ok(gate.push(spelled.as_deref(), &plain).content)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let visible_text = truncate_tokens_at_stop(&stream_text, stop_sequences);
@@ -2952,13 +3032,28 @@ mod channel_gate_tests {
     /// Each token is given as `(spelled, plain)` so the test can state exactly
     /// where the special tokens fall, which is what the gate reads.
     fn stream(tokens: &[(&str, &str)]) -> String {
+        channels(tokens).0
+    }
+
+    /// The private thinking an armed gate reports for the same turn.
+    fn thinking(tokens: &[(&str, &str)]) -> String {
+        channels(tokens).1
+    }
+
+    /// What an armed gate routes to each channel, as `(answer, thinking)`.
+    fn channels(tokens: &[(&str, &str)]) -> (String, String) {
         let mut gate = PrivateChannelGate::new(true);
-        let mut streamed: String = tokens
-            .iter()
-            .map(|(spelled, plain)| gate.push(Some(spelled), plain))
-            .collect();
-        streamed.push_str(&gate.flush());
-        streamed
+        let mut answer = String::new();
+        let mut thought = String::new();
+        for (spelled, plain) in tokens {
+            let revealed = gate.push(Some(spelled), plain);
+            answer.push_str(&revealed.content);
+            thought.push_str(&revealed.reasoning);
+        }
+        let remaining = gate.flush();
+        answer.push_str(&remaining.content);
+        thought.push_str(&remaining.reasoning);
+        (answer, thought)
     }
 
     // Private reasoning must never reach a streaming client, and a turn cut off
@@ -3043,9 +3138,12 @@ mod channel_gate_tests {
     #[test]
     fn an_unspellable_token_is_withheld() {
         let mut gate = PrivateChannelGate::new(true);
-        assert_eq!(gate.push(None, "raw"), "");
-        assert_eq!(gate.push(Some(" to=self<|message|>"), " to=self"), "");
-        assert_eq!(gate.push(Some("secret"), "secret"), "");
+        assert_eq!(gate.push(None, "raw"), ChannelDelta::default());
+        assert_eq!(
+            gate.push(Some(" to=self<|message|>"), " to=self").content,
+            ""
+        );
+        assert_eq!(gate.push(Some("secret"), "secret").content, "");
     }
 
     // A model that declares no private channel is every ordinary model, and it
@@ -3054,10 +3152,67 @@ mod channel_gate_tests {
     fn an_unarmed_gate_streams_everything() {
         let mut gate = PrivateChannelGate::new(false);
         assert_eq!(
-            gate.push(Some(" to=self<|message|>"), " to=self"),
+            gate.push(Some(" to=self<|message|>"), " to=self").content,
             " to=self"
         );
-        assert_eq!(gate.push(None, "raw"), "raw");
-        assert_eq!(gate.flush(), "");
+        assert_eq!(gate.push(None, "raw").content, "raw");
+        assert_eq!(gate.flush(), ChannelDelta::default());
+    }
+
+    // Thinking is withheld from the answer but not thrown away: it is reported
+    // on its own channel as it is produced, so a client can show the model
+    // working instead of waiting on silence.
+    #[test]
+    fn thinking_is_reported_on_its_own_channel_as_it_is_produced() {
+        let tokens = [
+            (" to=self", " to=self"),
+            ("<|message|>", ""),
+            ("weigh", "weigh"),
+            (" it", " it"),
+            (
+                "<|eom|><|start|>assistant to=user<|message|>",
+                "assistant to=user",
+            ),
+            ("Hi", "Hi"),
+        ];
+        assert_eq!(stream(&tokens), "Hi");
+        assert_eq!(thinking(&tokens), "weigh it");
+    }
+
+    // A turn that never reaches the user still reports what it was thinking,
+    // which is the whole of what a truncated turn produced.
+    #[test]
+    fn a_turn_that_never_answers_still_reports_its_thinking() {
+        let tokens = [
+            (" to=self", " to=self"),
+            ("<|message|>", ""),
+            ("still", "still"),
+            (" going", " going"),
+        ];
+        assert_eq!(stream(&tokens), "");
+        assert_eq!(thinking(&tokens), "still going");
+    }
+
+    // Thinking resumed after a tool call is one train of thought, so the
+    // segments join rather than the later one replacing the earlier.
+    #[test]
+    fn thinking_resumed_after_a_tool_call_extends_it() {
+        let tokens = [
+            (" to=self<|message|>", " to=self"),
+            ("first", "first"),
+            (
+                "<|eom|><|start|>assistant to=self<|message|>",
+                "assistant to=self",
+            ),
+            ("second", "second"),
+        ];
+        assert_eq!(thinking(&tokens), "firstsecond");
+    }
+
+    // An unarmed gate has no private channel to report, so it never invents one.
+    #[test]
+    fn an_unarmed_gate_reports_no_thinking() {
+        let mut gate = PrivateChannelGate::new(false);
+        assert_eq!(gate.push(Some(" to=self<|message|>"), "x").reasoning, "");
     }
 }
