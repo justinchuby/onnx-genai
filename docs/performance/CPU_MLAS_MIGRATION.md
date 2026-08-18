@@ -283,8 +283,8 @@ Linux x86-64, gcc 13.3.0, cargo 1.97.1, release cdylib
 
 | | pure Rust | default (MLAS) | delta |
 |---|---|---|---|
-| cdylib size (release) | 7,574,552 B | 9,166,600 B | **+1,592,048 B (+21.0%)** |
-| MLAS symbols linked | 0 | 897 | all local — 0 exported, 0 undefined |
+| cdylib size (release) | 7,646,424 B | 9,250,096 B | **+1,603,672 B (+21.0%)** |
+| MLAS symbols linked | 0 | 860 | all local — 0 exported, 0 undefined |
 | one-time C++/asm compile | — | 70.2 s (`mlas-sys`, release, 32 cores) | **+70 s per target dir** |
 | incremental relink | 17.7 s | 16.7 s | within noise |
 
@@ -336,9 +336,33 @@ that the gate is real rather than decorative.
 | target | status | how |
 |---|---|---|
 | Linux x86-64 | tests, clippy, bench | native |
-| Linux aarch64 | **1300 lib tests pass**, clippy, link | `qemu-aarch64-static`, cross gcc 13 |
+| Linux aarch64 | **1314 lib tests pass**, clippy, link | `qemu-aarch64-static`, cross gcc 13 |
+| macOS arm64 | **cdylib links; 1327 EP tests run** | CI (`Rust coverage (macOS arm64)`) |
 | Windows x86-64 / ARM64 | build config only | no hardware here; CI lanes |
-| macOS arm64 | build config only | no hardware here; CI lanes |
+
+That macOS row is not a formality. `Rust coverage (macOS arm64)` had been red on
+`main` at `Build the shipped CPU plugin cdylib with MLAS` — the step #1115 added
+— since that PR merged, with ~40 undefined `_MlasSgemmKernel*` /
+`_MlasConvSym*` / `_MlasGemm*Kernel*` symbols for `architecture arm64`: exactly
+the missing GAS assembly described above, on a platform nobody had connected to
+it. Apple clang assembles all four groups without complaint, so the fix above
+turns that step green and, for the first time, lets the macOS test step run at
+all. Doing so immediately found four Apple-only dispatch facts, all fixed here:
+
+- `AddKernel` and `PoolKernel` checked MLAS *before* vDSP and BNNS, so linking
+  MLAS by default silently retired Accelerate on macOS. `auto_detect` returns
+  `CpuBackend::Accelerate` there, deliberately not `Mlas`, so the elementwise
+  routing now says the same thing: Apple first, MLAS second. Off Apple the
+  ordering is unchanged.
+- The int4 reachability test assumed MLAS rescues Apple when the KleidiAI SDOT
+  route is disabled there. It does not: `prefer_arm64_mlas_qnbit_decode` is
+  `not(macos/ios)` as well, so on Apple neither route is licensed for that
+  shape.
+- The dense-cache predictor test assumed a constant f16 `B` at M=1 always
+  widens through `dense(1)`. On Apple that instantiation takes the Accelerate
+  NEON GEMV and reads `B` through `transposed_b_f16`, so the governed
+  prediction over-budgets by one instantiation there — now asserted as a strict
+  upper bound on Apple and an exact ratio 1.00 everywhere else.
 
 Executing the ARM64 tests needs `QEMU_LD_PREFIX` as well as a cargo runner —
 several parity tests re-exec their own binary, and the child goes through
@@ -371,6 +395,21 @@ only ever held on x86-64:
   linked, `prefer_arm64_mlas_qnbit_decode` claims that shape first on non-Apple
   aarch64. The contract is that *a licensed CompInt8 route* runs, not which one,
   so it now matches its bits=4 sibling and accepts either.
+
+Three lanes had to follow the default rather than the other way round:
+
+- `Rust quality` installed `gcc-aarch64-linux-gnu` but not `g++`. `cc-rs` probes
+  `aarch64-linux-gnu-g++` before compiling any of `mlas-sys`' C++, so the
+  cross-arch pass died at `ToolNotFound` the moment MLAS became default.
+- Miri interprets Rust and cannot call foreign functions, so
+  `onnx-runtime-ep-cpu`'s `provider::tests` aborted on `mlas_nchwc_block_size`.
+  The three `ep-cpu` Miri passes now run `--no-default-features --features full`
+  — the pure-Rust build, which is what that lane is able to check at all.
+- `erf_neon_fp16.cpp` and `gelu_neon_fp16.cpp` must stay *out* of the Windows
+  ARM64 build. `platform.cpp:755` installs those kernels under
+  `MLAS_F16VEC_INTRINSICS_SUPPORTED && !defined(_WIN32)`, and MSVC has no
+  `__fp16`, so compiling them there only fails. On Linux ARM64 omitting them
+  breaks the link, so the split is per-OS, not per-arch.
 
 ## Opting out
 
