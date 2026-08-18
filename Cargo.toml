@@ -133,6 +133,27 @@ license = "MIT"
 authors = ["Justin Chu"]
 repository = "https://github.com/justinchuby/onnx-genai"
 
+# The CPU EP's elementwise kernels are AVX2 `#[target_feature]` functions whose
+# hot loops only vectorise when the compiler can see the dispatcher, the chunk
+# loop and the per-vector body together. The default sixteen codegen units split
+# that chain and the loops come out scalar, at a cost of up to 2.65x on the
+# elementwise family (`Sqrt` f32 at 4096 elements: 0.639 ns/elem against 0.241;
+# 77 of 105 measured cases move by more than 1.15x).
+# The failure is silent -- identical source, identical tests, no runtime-path
+# difference -- so it is pinned here rather than left to whichever partition the
+# compiler happens to pick. See `docs/performance/CPU_ACTIVATION_GAPS.md`.
+#
+# Scoped to this package alone: the rest of the workspace keeps parallel codegen
+# and only this crate pays the serial build (~19 s -> ~65 s).
+[profile.release.package.onnx-runtime-ep-cpu]
+codegen-units = 1
+
+# `bench` does not inherit a per-package override from `release`, so `cargo
+# bench` would rebuild the crate as sixteen units and measure the de-vectorized
+# code -- the one thing a benchmark must not do.
+[profile.bench.package.onnx-runtime-ep-cpu]
+codegen-units = 1
+
 # Central workspace lint policy (rico audit #11). Keep this SMALL, WARN-only,
 # and defensible: it is a shared, extensible anchor, not a cleanup crusade.
 # Member crates opt in via `[lints] workspace = true`. Do NOT add `deny`/`forbid`
