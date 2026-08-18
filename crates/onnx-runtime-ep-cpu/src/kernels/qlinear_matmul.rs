@@ -1716,7 +1716,9 @@ mod tests {
         // buffers so the reset below opens a clean window; the *upper*-bound
         // assertion holds regardless, being enforced inside `try_park`.
         static SERIALISE: Mutex<()> = Mutex::new(());
-        let _guard = SERIALISE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = SERIALISE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
 
         // `m * n` just under the 32 MiB per-thread cap so a full buffer is
         // admitted (a buffer *over* the cap is released -- tested separately),
@@ -1761,10 +1763,7 @@ mod tests {
         pool.broadcast(|_| {
             let mut output = Owned::zeros(DataType::Uint8, &[m, n]);
             kernel
-                .execute(
-                    &inputs.map(|input| input.view()),
-                    &mut [output.view_mut()],
-                )
+                .execute(&inputs.map(|input| input.view()), &mut [output.view_mut()])
                 .expect("kernel runs");
         });
 
