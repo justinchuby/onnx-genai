@@ -56,6 +56,96 @@ __device__ void topk_float(
   }
 }
 
+// One CUDA block cooperatively reduces a single slice, striding the width
+// across its threads and combining with the same `before` total order the
+// serial kernel uses. This is byte-identical to `topk_float` — top-k selection
+// is exact (integer-keyed comparison with a lower-index tie-break), so the
+// tree reduction picks the same winner regardless of visitation order — but it
+// turns the decode-time `slices == 1` case (which `topk_float` runs on a single
+// thread) into a full-block reduction. Dynamic shared memory holds the
+// already-picked indices (`k` longs) followed by the per-thread reduction
+// scratch (`blockDim.x` (key,index) pairs).
+__device__ __forceinline__ bool topk_wins(
+    float va, long long ia, float vb, long long ib, int largest) {
+  if (ib < 0) return true;   // the incumbent is empty; anything real wins
+  if (ia < 0) return false;  // the challenger is empty; it never wins
+  return before(va, vb, ia, ib, largest);
+}
+
+template <typename T>
+__device__ void topk_block_float(
+    const T* input, T* values, long long* indices,
+    unsigned long long slices, unsigned long long width,
+    unsigned long long inner, unsigned long long k, int largest) {
+  extern __shared__ unsigned char topk_smem[];
+  long long* picked = reinterpret_cast<long long*>(topk_smem);
+  float* red_key = reinterpret_cast<float*>(picked + k);
+  long long* red_idx = reinterpret_cast<long long*>(red_key + blockDim.x);
+  const unsigned int tid = threadIdx.x;
+  for (unsigned long long slice = blockIdx.x; slice < slices; slice += gridDim.x) {
+    const unsigned long long outer = slice / inner, i = slice % inner;
+    for (unsigned long long out = 0; out < k; ++out) {
+      long long best_index = -1;
+      float best = 0.0f;
+      for (unsigned long long candidate = tid; candidate < width;
+           candidate += blockDim.x) {
+        bool used = false;
+        for (unsigned long long prior = 0; prior < out; ++prior)
+          if (picked[prior] == (long long)candidate) used = true;
+        if (used) continue;
+        const float value =
+            static_cast<float>(input[(outer * width + candidate) * inner + i]);
+        if (topk_wins(value, (long long)candidate, best, best_index, largest)) {
+          best = value;
+          best_index = (long long)candidate;
+        }
+      }
+      red_key[tid] = best;
+      red_idx[tid] = best_index;
+      __syncthreads();
+      for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+          if (topk_wins(red_key[tid + stride], red_idx[tid + stride], red_key[tid],
+                        red_idx[tid], largest)) {
+            red_key[tid] = red_key[tid + stride];
+            red_idx[tid] = red_idx[tid + stride];
+          }
+        }
+        __syncthreads();
+      }
+      const long long winner = red_idx[0];
+      const unsigned long long offset = (outer * k + out) * inner + i;
+      if (tid == 0) {
+        picked[out] = winner;
+        values[offset] = input[(outer * width + winner) * inner + i];
+        indices[offset] = winner;
+      }
+      __syncthreads();
+    }
+  }
+}
+
+extern "C" __global__ void topk_block_f32(
+    const float* input, float* values, long long* indices,
+    unsigned long long slices, unsigned long long width,
+    unsigned long long inner, unsigned long long k, int largest) {
+  topk_block_float(input, values, indices, slices, width, inner, k, largest);
+}
+
+extern "C" __global__ void topk_block_f16(
+    const __half* input, __half* values, long long* indices,
+    unsigned long long slices, unsigned long long width,
+    unsigned long long inner, unsigned long long k, int largest) {
+  topk_block_float(input, values, indices, slices, width, inner, k, largest);
+}
+
+extern "C" __global__ void topk_block_bf16(
+    const __nv_bfloat16* input, __nv_bfloat16* values, long long* indices,
+    unsigned long long slices, unsigned long long width,
+    unsigned long long inner, unsigned long long k, int largest) {
+  topk_block_float(input, values, indices, slices, width, inner, k, largest);
+}
+
 extern "C" __global__ void topk_f32(
     const float* input, float* values, long long* indices,
     unsigned long long slices, unsigned long long width,
@@ -235,6 +325,12 @@ impl Kernel for TopKKernel {
             DataType::BFloat16 => "topk_bf16",
             _ => unreachable!("dtype validated above"),
         };
+        let block_function = match input.dtype {
+            DataType::Float32 => "topk_block_f32",
+            DataType::Float16 => "topk_block_f16",
+            DataType::BFloat16 => "topk_block_bf16",
+            _ => unreachable!("dtype validated above"),
+        };
         let func = self.runtime.nvrtc_function("topk", SOURCE, function)?;
         let input_ptr = cuptr(input.data_ptr::<u8>() as *const c_void);
         let values_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
@@ -244,28 +340,75 @@ impl Kernel for TopKKernel {
         let inner = inner as u64;
         let k_u64 = k as u64;
         let largest = i32::from(self.largest);
-        let mut builder = self.runtime.stream().launch_builder(&func);
-        builder
-            .arg(&input_ptr)
-            .arg(&values_ptr)
-            .arg(&indices_ptr)
-            .arg(&slices)
-            .arg(&width)
-            .arg(&inner)
-            .arg(&k_u64)
-            .arg(&largest);
-        unsafe {
-            builder.launch(LaunchConfig {
-                grid_dim: (
-                    (slices.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32),
-                    1,
-                    1,
-                ),
-                block_dim: (BLOCK, 1, 1),
-                shared_mem_bytes: 0,
-            })
+        // The default `topk_*` kernel maps one slice to one thread, which is
+        // ideal when there are enough slices to fill the device but collapses
+        // to a single active thread at decode (`slices == 1`, e.g. a 64-expert
+        // MoE router). When the slice count cannot saturate the device, launch
+        // the block-per-slice `topk_block_*` kernel instead: it reduces each
+        // slice across a whole block and is byte-identical (top-k selection is
+        // exact, and the tree reduction keeps the same `before` total order and
+        // lower-index tie-break). The one-thread-per-slice path is left intact
+        // for the wide/prefill case so it never regresses.
+        let sm_count = u64::from(self.runtime.capabilities().multiprocessor_count());
+        let use_block = slices > 0 && width > 1 && slices <= sm_count;
+        if use_block {
+            let block_func = self.runtime.nvrtc_function("topk", SOURCE, block_function)?;
+            // Dynamic shared: `k` picked indices + one (f32,i64) reduction slot
+            // per thread.
+            let shared_mem_bytes = (k as u64)
+                .checked_mul(std::mem::size_of::<i64>() as u64)
+                .and_then(|picked| {
+                    picked.checked_add(
+                        u64::from(BLOCK)
+                            * (std::mem::size_of::<f32>() + std::mem::size_of::<i64>()) as u64,
+                    )
+                })
+                .and_then(|bytes| u32::try_from(bytes).ok())
+                .ok_or_else(|| {
+                    EpError::KernelFailed("cuda_ep TopK: shared memory exceeds CUDA limits".into())
+                })?;
+            let mut builder = self.runtime.stream().launch_builder(&block_func);
+            builder
+                .arg(&input_ptr)
+                .arg(&values_ptr)
+                .arg(&indices_ptr)
+                .arg(&slices)
+                .arg(&width)
+                .arg(&inner)
+                .arg(&k_u64)
+                .arg(&largest);
+            unsafe {
+                builder.launch(LaunchConfig {
+                    grid_dim: (slices.clamp(1, 65_535) as u32, 1, 1),
+                    block_dim: (BLOCK, 1, 1),
+                    shared_mem_bytes,
+                })
+            }
+            .map_err(|e| driver_err("launch TopK", e))?;
+        } else {
+            let mut builder = self.runtime.stream().launch_builder(&func);
+            builder
+                .arg(&input_ptr)
+                .arg(&values_ptr)
+                .arg(&indices_ptr)
+                .arg(&slices)
+                .arg(&width)
+                .arg(&inner)
+                .arg(&k_u64)
+                .arg(&largest);
+            unsafe {
+                builder.launch(LaunchConfig {
+                    grid_dim: (
+                        (slices.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32),
+                        1,
+                        1,
+                    ),
+                    block_dim: (BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| driver_err("launch TopK", e))?;
         }
-        .map_err(|e| driver_err("launch TopK", e))?;
         if !capturing {
             *warmed = Some(TopKCaptureSignature {
                 input_shape: input.shape.to_vec(),
