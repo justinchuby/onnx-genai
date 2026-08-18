@@ -136,7 +136,6 @@ PR*.md
 /site/quartz/.quartz/
 /site/quartz/.quartz-cache/
 /site/quartz/**/.quartz-cache/
-/site/quartz/quartz/static/vendor/
 /site/quartz/tsconfig.tsbuildinfo
 
 # seq-major microbenchmark scratch crate
