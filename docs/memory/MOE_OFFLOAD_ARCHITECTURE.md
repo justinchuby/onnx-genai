@@ -23,8 +23,9 @@ Three workstreams, so a reader can trace any claim to its evidence:
 
 - **Mechanism** (this document's author): what the weights are backed by, whether
   the OS/storage can be handed paging, the three-regime page-cache sweep, the
-  host/PCIe crossover, CUDA UM on WDDM, DirectStorage/GDS, and the layout
-  constraint. All measured on *this box*.
+  device-tier VRAM-constrained oversubscription validation, the host/PCIe crossover,
+  CUDA UM on WDDM, DirectStorage/GDS, and the layout constraint. All measured on
+  *this box*.
 - **Policy** (MoE agent, merged as **#1321 / #1322 / #1326 / #1331**): the routing
   concentration curve, static hot-pin vs the Belady oracle, the composed PCIe
   floor, the absence of a knee, route-aware scheduling, and the prediction-window
@@ -103,6 +104,58 @@ This **refines** the earlier prediction that "MoE beats the OS." It does not,
 uniformly: the OS exploits skew for free whenever the hot set fits in cache. MoE
 beats the OS **specifically in the oversubscribed-hot-set regime** — which is
 exactly the hundreds-of-GB-MoE case the target names.
+
+### 2b. Device-tier validation — regime 3 is reachable by constraining VRAM, and it exposes that granite reads *dense*
+
+The host-tier sweep above reached regime 3 by shrinking the *cache* (ballast), not
+by finding a huge model — **a regime defined by a ratio is reachable by constraining
+the resource, not only by scaling the workload.** The same trick validates the
+*device* tier: constrain the VRAM weight-residency budget below the expert bank and
+the offload path must page experts, on this 8 GB card, with no datacentre GPU
+required. This corrects an earlier mistaken claim that regime 3 was "unvalidatable
+on this hardware."
+
+Recipe (measured, RTX 4060 8 GB / WDDM, native CUDA decode):
+`ONNX_GENAI_WEIGHT_OFFLOAD=1` + `ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES=<budget>`
+below the bank. Model **granite-3.0-1b-a400m** (`granite-1b-a400m-f16-mobius`, 2.64 GB
+`model.onnx.data`, 32 experts top-8, 24 layers, real trained router). The paging path
+was genuinely exercised — not a run that never pages: at a 512 MiB budget,
+`page_ins = 61,056`, `htod_bytes_per_token = 2.13 GB`.
+
+Budget sweep (`--tokens 24`), `htod_bytes_per_token` vs the residency budget:
+
+| budget (MiB) | htod (GB/token) | bank − budget (GB) |
+|---|---|---|
+| 256  | 2.401 | 2.38 |
+| 768  | 1.864 | 1.87 |
+| 1280 | 1.327 | 1.36 |
+| 1792 | 0.791 | 0.85 |
+| 2304 | 0.254 | 0.34 |
+
+**`htod ≈ bank − budget`, perfectly linear, slope ≈ 1.0, no knee.** Every resident
+byte saves exactly one byte/token of streaming, **independent of which bytes are
+resident.** That is the decisive signature of a **dense** read pattern: if a
+routing-hot subset existed in the *reads*, htod would collapse to ~0 once the budget
+covered it (a knee) and *which* bytes were pinned would matter. Neither happens.
+
+The cause is structural and confirmed from the graph: **granite's MoE is unfused** —
+zero fused `MoE`/`QMoE` nodes; it expands to 768 per-expert `MatMul` + `Equal`-mask
+(32 experts × 24 layers), so the runtime **computes all 32 experts every token and
+masks the output.** The measured routing skew (top-8/32 = 45.4%) lives in which
+experts *contribute*, not in which weights are *read*. So on granite as exported,
+**routing-aware pinning cannot beat a general-purpose policy — not because the pin
+mechanism fails, but because the workload has no read skew to exploit.** This is the
+dense `reads_per_step = 1.000` regime (§ MEMORY_MANAGEMENT_MODEL_DESIGN "Dense has
+nothing to optimize"), now reproduced at the device tier on a nominal *MoE* model.
+
+**Reconciling the two tiers:** the host-tier 3× pinning win (§I.2) was measured under
+a **synthetically skewed** access pattern — a proxy for what a *fused/gather* MoE
+would read (only the selected top-k experts). The device-tier reality shows granite
+does not produce that skew. **The routing-aware advantage is therefore gated on
+fused / sparse-gather MoE execution** (a `MoE`/`QMoE` op that gathers only the
+selected experts), which the mobius exporter does **not** emit for granite. The pin
+plumbing exists and works (#837/#864, e2e-tested); the sparsity it needs does not
+exist in this fixture's read stream.
 
 ### 3. The ~45 GB crossover on 64 GB DDR5 (inferred)
 
@@ -228,22 +281,30 @@ throughput work.
 
 Composing all three workstreams:
 
-1. **Build routing-aware expert pinning only for Regime 3.** It is near-worthless in
-   regimes 1–2, where the free OS page cache already captures **83–88%** and LRU
-   exploits skew for free. It earns its complexity only once the hot expert set
-   exceeds usable DRAM cache (~45 GB on this 64 GB box; proportionally more on a
-   larger machine). Build the *static hot-pin* form — the policy workstream shows it
-   is within ~17–27% of the Belady oracle, and the prediction-window gate (#1331)
-   shows **dynamic prefetch is foreclosed**, so there is no reason to build the
-   dynamic machinery.
+1. **Build routing-aware expert pinning only for Regime 3 — *and only once expert
+   reads are actually sparse.*** It is near-worthless in regimes 1–2, where the free
+   OS page cache already captures **83–88%** and LRU exploits skew for free. It earns
+   its complexity only once the hot expert set exceeds usable cache **and the runtime
+   reads only the selected experts.** Build the *static hot-pin* form — the policy
+   workstream shows it is within ~17–27% of the Belady oracle, and the
+   prediction-window gate (#1331) shows **dynamic prefetch is foreclosed**, so there
+   is no reason to build the dynamic machinery.
 
-2. **The target (hundreds-of-GB MoE) sits in Regime 3, so pinning is worth building
-   — but it cannot be validated on this hardware.** An 8 GB WDDM laptop with a 17 GB
-   test file cannot reach a >45 GB hot set. What *would* validate it: a Linux
-   datacentre GPU with a real hundreds-of-GB MoE, measuring hot-warm-hit and
-   achieved tok/s across VRAM-resident fractions against the composed PCIe floor
-   (~8 tok/s at 25%, batch 1, x8). Until then the pinning win is **projected from the
-   regime shape, not measured at target scale.**
+2. **Prerequisite, measured on-device: fuse the MoE first, or pinning has nothing to
+   exploit.** Regime 3 *is* reachable on this hardware by constraining the VRAM budget
+   (§I.2b) — that mistaken "unvalidatable here" claim is retracted. But the on-device
+   validation revealed that **granite as exported reads dense** (`htod = bank − budget`,
+   linear, no knee), because its MoE is unfused and computes all 32 experts per token.
+   A routing-aware cache can only beat a general policy when the runtime **gathers only
+   the top-k experts** — i.e. emits a fused `MoE`/`QMoE` op. So the ordering is: emit
+   sparse-gather MoE → *then* a hot-set pin has a read skew to exploit. What remains
+   genuinely untested: (a) the pin advantage on a real **fused/sparse** MoE (no such
+   fixture runs on the native offload path here — granite is unfused, the QMoE
+   fixtures are sub-MB untrained-router test stubs); (b) **absolute magnitudes** at
+   datacentre scale — this box is PCIe x8 / 8 GB VRAM, and granite's 32-expert top-8
+   router is milder than a 256-expert one (the policy workstream measured top 12.5% →
+   27.1%, flatter than 80/20, and *inferred* larger banks concentrate more). The
+   mechanism and direction are validatable here; the magnitudes are not.
 
 3. **Quantisation is likely the best return per unit of complexity.** It attacks the
    PCIe wall **linearly** (fewer bytes/token → higher tok/s at the same residency)
@@ -263,9 +324,14 @@ Composing all three workstreams:
 
 **Ordering implied by the evidence:** fix the M≥2 batch-decode overhead (unblocks the
 −61% bytes lever) and pursue quantisation (linear PCIe relief, no policy) *before*
-building any residency policy; build static hot-pin only when a Regime-3 model is the
-actual target and can be validated on Linux hardware. Challenge this if a measurement
-says otherwise.
+building any residency policy; **emit a fused/sparse-gather MoE op** (without it the
+read stream is dense and pinning is inert — §I.2b); and build static hot-pin only
+when a genuinely sparse Regime-3 model is the actual target and can be validated on
+Linux hardware. A general lesson worth keeping: **a regime defined by a ratio
+(cache/hot-set, or VRAM/bank) can be reached by constraining resources, not only by
+scaling the workload** — that is how both the host tier (ballast) and the device
+tier (VRAM budget) were validated on an 8 GB laptop, and it retires a whole class of
+"untestable here" claims. Challenge this if a measurement says otherwise.
 
 ---
 
