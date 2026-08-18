@@ -87,10 +87,14 @@ pub struct ChatCompletionRequest {
     /// output limit OpenAI accepts for a reasoning model.
     #[serde(default)]
     pub max_completion_tokens: Option<usize>,
-    #[serde(default = "default_temperature")]
-    pub temperature: f32,
-    #[serde(default = "default_top_p")]
-    pub top_p: f32,
+    /// Absent when the caller left sampling to the model. See
+    /// [`Self::sampling_overrides`].
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Absent when the caller left sampling to the model. See
+    /// [`Self::sampling_overrides`].
+    #[serde(default)]
+    pub top_p: Option<f32>,
     #[serde(default)]
     pub top_k: usize,
     #[serde(default)]
@@ -154,10 +158,12 @@ pub struct CompletionRequest {
     pub suffix: Option<String>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
-    #[serde(default = "default_temperature")]
-    pub temperature: f32,
-    #[serde(default = "default_top_p")]
-    pub top_p: f32,
+    /// Absent when the caller left sampling to the model.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Absent when the caller left sampling to the model.
+    #[serde(default)]
+    pub top_p: Option<f32>,
     #[serde(default)]
     pub min_p: f32,
     #[serde(default)]
@@ -760,12 +766,6 @@ pub struct CompletionLogprobs {
 
 fn default_max_tokens() -> usize {
     256
-}
-fn default_temperature() -> f32 {
-    1.0
-}
-fn default_top_p() -> f32 {
-    1.0
 }
 fn default_typical_p() -> f32 {
     1.0
