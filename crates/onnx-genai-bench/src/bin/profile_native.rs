@@ -680,12 +680,13 @@ fn print_weight_offload_observability(emitted_tokens: u64) {
     print_weight_offload_amortization(&stats, emitted_tokens);
     println!(
         "weight_offload_timing: materialize_ms={:.3} htod_ms={:.3} \
-         admit_sync_ms={:.3} vram_alloc_ms={:.3} vram_free_ms={:.3}",
+         admit_sync_ms={:.3} vram_alloc_ms={:.3} vram_free_ms={:.3} vram_free_sync_ms={:.3}",
         stats.materialize_ns as f64 / 1_000_000.0,
         stats.htod_ns as f64 / 1_000_000.0,
         stats.admit_sync_ns as f64 / 1_000_000.0,
         stats.vram_alloc_ns as f64 / 1_000_000.0,
-        stats.vram_free_ns as f64 / 1_000_000.0
+        stats.vram_free_ns as f64 / 1_000_000.0,
+        stats.vram_free_sync_ns as f64 / 1_000_000.0
     );
     println!(
         "weight_offload_physical: budget_bytes={} mapped_physical_bytes={} \
@@ -1048,12 +1049,15 @@ fn run_native_decode_batch_sweep(
         let before_measured = session.cuda_kv_debug_stats();
 
         let mut row0_stream = Vec::with_capacity(tokens);
+        let mut step_ms: Vec<f64> = Vec::with_capacity(tokens);
         for step in 0..tokens {
             let inputs = vec![step_token; batch];
             let past_len = context + step;
+            let step_start = std::time::Instant::now();
             let rows = session
                 .decode_greedy_batch(&inputs, past_len)
                 .with_context(|| format!("batch {batch} decode step {step}"))?;
+            step_ms.push(step_start.elapsed().as_secs_f64() * 1000.0);
             if rows.len() != batch {
                 bail!(
                     "batch {batch} decode step {step} returned {} rows, expected {batch}",
@@ -1077,6 +1081,33 @@ fn run_native_decode_batch_sweep(
         println!(
             "native_decode_batch_row_identity: batch={batch} all_rows_equal_row0=true steps={tokens}"
         );
+        // Throughput instrument (#750 large-model amortization line). Per-step
+        // wall time is noisy on this box under weight-streaming pressure (the OS
+        // pages our own VMM granules, #863), so report the MEDIAN ms/step with
+        // the full min-max range rather than a mean, and derive tok/s from the
+        // median. `per_row_tok_s` is one sequence's rate; `aggregate_tok_s`
+        // (per_row × batch) is the batch's produced-token rate — the quantity
+        // that should climb toward N× if the fused forward truly reads each
+        // weight once per step regardless of N. Read the contention-invariant
+        // `htod_bytes` counter beside this to confirm the mechanism (#884).
+        if !step_ms.is_empty() {
+            let mut sorted = step_ms.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median_ms = sorted[sorted.len() / 2];
+            let min_ms = sorted[0];
+            let max_ms = sorted[sorted.len() - 1];
+            let per_row_tok_s = if median_ms > 0.0 {
+                1000.0 / median_ms
+            } else {
+                0.0
+            };
+            let aggregate_tok_s = per_row_tok_s * batch as f64;
+            println!(
+                "native_decode_batch_throughput: batch={batch} steps={tokens} \
+                 median_ms_per_step={median_ms:.3} range_ms=[{min_ms:.3},{max_ms:.3}] \
+                 per_row_tok_s={per_row_tok_s:.2} aggregate_tok_s={aggregate_tok_s:.2}"
+            );
+        }
         println!("native_decode_batch_row0_stream: batch={batch} {row0_stream:?}");
         match &batch1_reference {
             None if batch == 1 => batch1_reference = Some(row0_stream.clone()),
@@ -1145,6 +1176,23 @@ fn run_native_decode_batch_sweep(
             if let Some(decision) = &stats.graph.growth_decision {
                 println!("native_decode_batch_cuda_graph_growth: batch={batch} {decision}");
             }
+        }
+
+        // Whole-subgraph vs segmented capture: batch=1 typically captures as a
+        // single graph (segments=1 -> zero-host-work replay), while M>=2 can
+        // fragment into segments whose replay interleaves eager seam-node
+        // execution every step. `segments>1` at batch>=2 with the seam summary
+        // naming the culprit op is the localized root cause of the M>=2 decode
+        // step-cost cliff (per-step executor work instead of a bare graph relaunch).
+        {
+            let segments = session.captured_graph_segment_count();
+            let seams = session
+                .captured_graph_seam_summary()
+                .unwrap_or_else(|| "none".to_string());
+            println!(
+                "native_decode_batch_cuda_graph_segments: batch={batch} segments={segments} \
+                 seam_nodes={seams}"
+            );
         }
 
         // Weight-streaming amortization: emitted tokens = steps × rows, so

@@ -155,12 +155,9 @@ pub(crate) fn scale_mask_softmax_rows(
     debug_assert_eq!(data.len(), outer * d);
     match parallel_rows_per_task(outer, d) {
         Some(rows_per_task) => {
-            use rayon::prelude::*;
-            data.par_chunks_mut(rows_per_task * d)
-                .enumerate()
-                .for_each(|(chunk, rows)| {
-                    scale_mask_softmax_serial(rows, chunk * rows_per_task, d, scale, mask);
-                });
+            crate::task_runtime::chunks_mut(data, rows_per_task * d, 1, |chunk, rows| {
+                scale_mask_softmax_serial(rows, chunk * rows_per_task, d, scale, mask);
+            });
         }
         None => scale_mask_softmax_serial(data, 0, d, scale, mask),
     }
@@ -254,30 +251,43 @@ pub(crate) fn softmax_rows(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
         return;
     }
     if let Some(rows_per_task) = parallel_rows_per_task(n, d) {
-        use rayon::prelude::*;
         let block = rows_per_task * d;
-        dst.par_chunks_mut(block)
-            .zip(src.par_chunks(block))
-            .for_each(|(out, inp)| {
-                softmax_rows_serial_out(inp, out, out.len() / d, d);
-            });
+        // One `compute_softmax` per task's whole run, not one per chunk: MLAS
+        // re-pays its prologue on every call, and the runtime deliberately
+        // hands out several chunks per task for balance.
+        crate::task_runtime::chunk_runs_mut(dst, block, 1, |first, out| {
+            let start = first * block;
+            softmax_rows_serial_out(&src[start..start + out.len()], out, out.len() / d, d);
+        });
     } else {
         softmax_rows_serial_out(src, dst, n, d);
     }
 }
 
-/// `Some(rows_per_task)` when a fan-out is worth it, `None` to stay serial.
+/// `Some(rows_per_chunk)` when a fan-out is worth it, `None` to stay serial.
+///
+/// The chunk is one [`ROW_TILE_BYTES`] row tile, *not* `n / workers`. Sizing the
+/// chunk from the pool width assigns each worker exactly one static share, so
+/// the whole fan-out waits for whichever share was unlucky -- a descheduled
+/// thread, an SMT sibling, a cold row. The task runtime claims chunks
+/// dynamically, so handing it many small chunks lets a fast thread absorb a slow
+/// one's remainder, and the runtime still caps the task count so the extra
+/// chunks cost nothing when the machine is idle.
+///
+/// One tile is the floor because the serial worker already tiles at that size
+/// to keep a run of rows in a core's private cache between the scale/mask write
+/// and the softmax's two reads; a chunk smaller than a tile could not fill that
+/// pipeline, and would call MLAS more often for less work each time.
 fn parallel_rows_per_task(n: usize, d: usize) -> Option<usize> {
     if n < MIN_PARALLEL_SOFTMAX_ROWS || n.saturating_mul(d) < MIN_PARALLEL_SOFTMAX_ELEMENTS {
         return None;
     }
-    let workers = rayon::current_num_threads().max(1);
-    if workers < 2 {
+    if crate::task_runtime::width() < 2 {
         return None;
     }
-    // Whole rows per task, so each chunk is a valid `n' × d` sub-matrix and
+    // Whole rows per chunk, so each chunk is a valid `n' × d` sub-matrix and
     // MLAS is invoked once per chunk rather than once per row.
-    Some(n.div_ceil(workers).max(1))
+    Some((ROW_TILE_BYTES / (d.max(1) * size_of::<f32>())).clamp(1, n))
 }
 
 #[cfg(feature = "mlas")]

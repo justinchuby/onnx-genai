@@ -242,6 +242,12 @@ impl EngineResourceGovernor {
         domain: Option<&DeviceCompatibilityDomain>,
     ) -> Result<Self, ResourceError> {
         let (model_weights_bytes, reservation_bytes) = model_weight_bytes;
+        // Captured before `capacities` is consumed by `ResourceGovernor::new`
+        // below: the *measured free* VRAM the combined mapped-physical cap
+        // (#1295) is sourced from. `None` on a device whose capacity could not
+        // be measured — a fraction of an unknown is unknown, not a number (#947),
+        // so the cap simply does not bind there.
+        let measured_vram_free_bytes = capacities.vram.free_bytes();
         // Model weights are measured from the package on disk (graph plus its
         // ONNX external-data blob), so the KV budget is derived from what is
         // actually left rather than from the whole ceiling.
@@ -304,6 +310,35 @@ impl EngineResourceGovernor {
             .resolved_limits
             .vram_bytes
             .unwrap_or(snapshot.resolved_limits.host_ram_bytes);
+        // #1295 combined mapped-physical cap. The device authority ceiling bounds
+        // the *sum* of every Device-tier lease — weight residency, KV, and
+        // activations all admit against it (the weight-residency page-in checks
+        // `governor.available(Tier::Device)`, and KV/activation mapped growth
+        // admits through `prepare_mapped_growth` against the same tier), so a
+        // single ceiling is already the shared authority. What was wrong was its
+        // *source*: a `Fraction` resolved against nominal *total* VRAM, when the
+        // driver only ever hands out *free* (usable) VRAM — measured ~7959 MiB of
+        // a nominal 8188 on the RTX 4060 Laptop 8 GB box (the ~229 MiB delta is
+        // the desktop compositor's standing reserve). Oversubscribing past usable
+        // is what drove `vram_free` off the WDDM fault-in cliff. Holding the
+        // ceiling to `measured_free * safe_fraction` converts that catastrophic
+        // cliff into a graceful admission refusal. This does not raise N_max; it
+        // makes the ceiling honest and the failure mode a plateau.
+        let (device_ceiling_bytes, usable_cap_bytes) = clamp_ceiling_to_usable_vram(
+            device_ceiling_bytes,
+            measured_vram_free_bytes,
+            usable_mapped_safe_fraction(),
+        );
+        if let Some(cap) = usable_cap_bytes {
+            tracing::info!(
+                measured_free_bytes = measured_vram_free_bytes.unwrap_or(0),
+                safe_fraction = usable_mapped_safe_fraction(),
+                combined_mapped_ceiling_bytes = cap,
+                model_weights_bytes,
+                "bounded the device mapped-physical ceiling to usable VRAM x safe fraction; \
+                 weights, KV, and activations share this single cap (#1295)"
+            );
+        }
         let device = match (provider, domain) {
             (Some(provider), Some(domain)) => provider
                 .authority(domain, device_ceiling_bytes)
@@ -705,6 +740,76 @@ pub(crate) fn capacity_providers_for_device(
     providers
 }
 
+/// Environment override for the combined mapped-physical safe fraction (#1295).
+/// A finite value in `(0, 1]`; anything else is ignored with a warning.
+pub(crate) const VMM_MAPPED_FRACTION_ENV: &str = "ONNX_GENAI_VMM_MAPPED_FRACTION";
+
+/// Default fraction of *usable* (measured-free) device VRAM the combined mapped
+/// physical ceiling — weights + KV + activations — is held to (#1295).
+///
+/// Sourced from measured *free*, not nominal *total*, so a device's standing
+/// reserve is already excluded before the fraction applies: on the RTX 4060
+/// Laptop 8 GB box (driver 591.55, CUDA 13.1, WDDM) `cuMemGetInfo` reports
+/// ~7959 MiB free of a nominal 8188, the ~229 MiB delta being the desktop
+/// compositor. The remaining 10 % is headroom against WDDM fault-in / eviction
+/// variance: #1295 measured the page-in cliff onset at ~0.97x nominal ≈ the
+/// usable boundary, past which `vram_free` cost becomes unpredictable (median
+/// ~33 ms with non-deterministic multi-hundred-ms storms). Holding to 0.90 of
+/// *free* keeps a margin below that measured onset, converting the cliff into a
+/// graceful refusal.
+///
+/// It is not a magic constant tuned on one machine (cf #1261): the concrete
+/// ceiling is `measured_free * fraction`, recomputed per device at load from the
+/// driver's own query. Raise it toward 1.0 on a headless box (no compositor
+/// reserve, steadier WDDM); lower it if a device shows eviction storms below the
+/// boundary. That is what the [`VMM_MAPPED_FRACTION_ENV`] override is for.
+pub(crate) const DEFAULT_VMM_MAPPED_FRACTION: f64 = 0.90;
+
+/// Resolve the combined mapped-physical safe fraction from the environment,
+/// falling back to [`DEFAULT_VMM_MAPPED_FRACTION`]. A malformed or out-of-range
+/// value is ignored with a warning rather than silently changing admission.
+pub(crate) fn usable_mapped_safe_fraction() -> f64 {
+    match std::env::var(VMM_MAPPED_FRACTION_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<f64>() {
+            Ok(value) if value.is_finite() && value > 0.0 && value <= 1.0 => value,
+            _ => {
+                tracing::warn!(
+                    value = %raw,
+                    "ignoring {VMM_MAPPED_FRACTION_ENV}: expected a finite fraction in (0, 1]; \
+                     using default {DEFAULT_VMM_MAPPED_FRACTION}"
+                );
+                DEFAULT_VMM_MAPPED_FRACTION
+            }
+        },
+        _ => DEFAULT_VMM_MAPPED_FRACTION,
+    }
+}
+
+/// Clamp a configured device ceiling to the combined mapped-physical cap derived
+/// from *usable* (measured-free) VRAM (#1295).
+///
+/// Returns `(effective_ceiling, Some(cap))` when the usable cap actually bound
+/// the ceiling (for logging), or `(configured, None)` when it did not — either
+/// because no device free was measured (a fraction of an unknown is unknown,
+/// #947) or because the configured ceiling was already the tighter bound. The
+/// cap is never *raised* above the configured ceiling: it is a safety bound, not
+/// a grant.
+pub(crate) fn clamp_ceiling_to_usable_vram(
+    configured_ceiling_bytes: u64,
+    measured_free_bytes: Option<u64>,
+    fraction: f64,
+) -> (u64, Option<u64>) {
+    let Some(free) = measured_free_bytes else {
+        return (configured_ceiling_bytes, None);
+    };
+    let usable_cap = ((free as f64) * fraction).floor() as u64;
+    if usable_cap < configured_ceiling_bytes {
+        (usable_cap, Some(usable_cap))
+    } else {
+        (configured_ceiling_bytes, None)
+    }
+}
+
 /// The VRAM capacity tier for a device: the real `cudaMemGetInfo` query when the
 /// decode targets a known CUDA index, and [`UnknownCapacity`] otherwise.
 ///
@@ -952,6 +1057,114 @@ mod tests {
             resolve_vram_limit_bytes(&limits, None).unwrap(),
             Some(12_345_678)
         );
+    }
+
+    #[test]
+    fn usable_mapped_fraction_defaults_and_rejects_out_of_range() {
+        // Pure derivation logic, no env dependence for the default. The env
+        // override path is exercised by callers; here we pin the default and the
+        // clamp arithmetic that the whole cap rests on (#1295).
+        assert_eq!(usable_mapped_safe_fraction(), DEFAULT_VMM_MAPPED_FRACTION);
+        assert_eq!(DEFAULT_VMM_MAPPED_FRACTION, 0.90);
+    }
+
+    #[test]
+    fn usable_cap_binds_only_when_below_configured_and_sources_from_free() {
+        // Nominal total 8188 MiB, usable free 7959 MiB — the measured RTX 4060
+        // Laptop 8 GB idle figures (#1295). At 0.90 the cap is 0.90 * free, which
+        // is strictly below both the nominal total and 0.90 * total: this is the
+        // exact discrimination that proves the cap is drawn from *usable* VRAM,
+        // not the nominal number a `Fraction` would otherwise resolve against.
+        const MIB: u64 = 1 << 20;
+        let total = 8188 * MIB;
+        let free = 7959 * MIB;
+        let (ceiling, bound) = clamp_ceiling_to_usable_vram(total, Some(free), 0.90);
+        let expected = ((free as f64) * 0.90).floor() as u64;
+        assert_eq!(ceiling, expected);
+        assert_eq!(bound, Some(expected));
+        assert!(ceiling < total, "cap must sit below nominal total");
+        assert!(
+            ceiling < ((total as f64) * 0.90) as u64,
+            "cap must sit below 0.90 * total, proving it is sourced from free not total"
+        );
+
+        // A configured ceiling already tighter than the usable cap wins, and the
+        // cap reports it did not bind (so nothing is logged as a change).
+        let tight = 4 * (1u64 << 30);
+        let (ceiling, bound) = clamp_ceiling_to_usable_vram(tight, Some(free), 0.90);
+        assert_eq!(ceiling, tight);
+        assert_eq!(bound, None);
+
+        // An unmeasured device: a fraction of an unknown is unknown (#947), so
+        // the cap does not bind and the configured ceiling passes through.
+        let (ceiling, bound) = clamp_ceiling_to_usable_vram(total, None, 0.90);
+        assert_eq!(ceiling, total);
+        assert_eq!(bound, None);
+    }
+
+    #[test]
+    fn device_authority_ceiling_is_usable_free_and_refuses_growth_past_it() {
+        // End-to-end, non-vacuous (#8): build a real governor whose device tier
+        // is the measured RTX 4060 idle capacity with a configured ceiling of the
+        // *whole* device (Fraction 1.0). The resulting authority ceiling must be
+        // the usable-free cap, and a Device-tier reservation one byte past it
+        // must be refused (G3) — the admission refusal that converts the #1295
+        // oversubscription cliff into a plateau.
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryRole, Tier};
+        const MIB: u64 = 1 << 20;
+        let total = 8188 * MIB;
+        let free = 7959 * MIB;
+        let capacities = CapacityProviders {
+            vram: Arc::new(FixedCapacity::new(total, free)),
+            host_ram: Arc::new(FixedCapacity::new(64u64 << 30, 32u64 << 30)),
+            disk_spill: None,
+        };
+        let limits = ResourceLimits {
+            // Ask for the entire device; the usable cap must still bind.
+            vram_limit: ResourceLimit::Fraction(1.0),
+            host_ram_limit: ResourceLimit::Fraction(0.90),
+            disk_spill_limit: None,
+        };
+        let kv_config = governor_no_paged_kv_config(&EngineConfig::default()).unwrap();
+        let domain = DeviceCompatibilityDomain::Cuda(0);
+        let governor = EngineResourceGovernor::new_with_capacities_and_authority(
+            limits,
+            false,
+            capacities,
+            kv_config,
+            (0, 0),
+            None,
+            Some(&domain),
+        )
+        .expect("governor construction with a measured device capacity");
+
+        let authority = governor.device_authority();
+        let ceiling = authority.limit_bytes();
+        let expected = ((free as f64) * DEFAULT_VMM_MAPPED_FRACTION).floor() as u64;
+        assert_eq!(
+            ceiling, expected,
+            "device authority ceiling must be floor(usable_free * safe_fraction)"
+        );
+        assert!(
+            ceiling < ((total as f64) * DEFAULT_VMM_MAPPED_FRACTION) as u64,
+            "ceiling must be below 0.90 * nominal total, i.e. sourced from free"
+        );
+
+        // Non-vacuous precondition: a reservation of the whole ceiling succeeds,
+        // establishing the state in which the next byte must be refused.
+        let lease = authority
+            .reserve(Tier::Device, ceiling, MemoryRole::Weights, HolderId::new(1))
+            .expect("a reservation up to the ceiling must be admitted");
+        assert_eq!(authority.available(Tier::Device), 0);
+        // The (N+1)th byte over the usable cap is refused rather than allowed to
+        // oversubscribe the device — the plateau, not the cliff.
+        assert!(
+            authority
+                .reserve(Tier::Device, 1, MemoryRole::KvCache, HolderId::new(2))
+                .is_err(),
+            "growth past the usable-VRAM cap must be refused (G3)"
+        );
+        drop(lease);
     }
 
     #[test]

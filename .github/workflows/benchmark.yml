@@ -16,6 +16,19 @@ name: Benchmarks
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    # Not a required check, so a plain paths-ignore is safe here (no risk of
+    # a permanently pending required check): docs/wiki/site-only PRs skip the
+    # whole workflow instead of spending a macOS runner on a benchmark
+    # comparison nobody will read.
+    paths-ignore:
+      - "docs/**"
+      - "wiki/**"
+      - "site/**"
+      - "**/*.md"
+      - "**/*.mdx"
+      - "**/*.markdown"
+      - "LICENSE"
+      - "NOTICE"
 
 permissions:
   contents: read

@@ -229,7 +229,9 @@ impl ShapeInference {
             | "HardSwish"
             | "LeakyRelu"
             | "Elu"
+            | "Celu"
             | "Selu"
+            | "Mish"
             | "Softplus"
             | "Softsign"
             // Trigonometric and hyperbolic ops. Unary and shape-preserving,
@@ -405,7 +407,9 @@ impl ShapeInference {
             | "HardSwish"
             | "LeakyRelu"
             | "Elu"
+            | "Celu"
             | "Selu"
+            | "Mish"
             | "Softplus"
             | "Softsign"
             // Trigonometric and hyperbolic unaries, plus the remaining

@@ -74,6 +74,7 @@ mod model;
 #[cfg(feature = "native-backend")]
 mod placement;
 mod runtime;
+pub(crate) mod session_state;
 mod speculative_load;
 
 pub(crate) use decode_backend::*;

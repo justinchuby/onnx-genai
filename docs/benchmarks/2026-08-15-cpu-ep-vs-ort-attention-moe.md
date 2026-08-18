@@ -2770,3 +2770,352 @@ Not started: paged/appendable KV behind an attention-owned handle (§13's bounda
 stands), and beam reorder, which still does not exist on any EP.
 
 Nothing here defers to ORT and nothing links MLAS.
+
+## 32. Phase 12: erf's Estrin reassociation, and a perf number that is hardware-dependent by nature (#1218)
+
+The change in #1218 is sound and it landed: `erf`'s two on-path polynomials (the
+big-branch `R` and the `exp` it feeds) now evaluate by Estrin's scheme instead of
+Horner's, trading two extra multiplies for half the dependency depth on a
+latency-bound chain. The interesting part for this ledger is what happened when a
+second reviewer re-measured the speedup on different hardware, and got a different
+magnitude — not because either number is wrong, but because a CPU perf result is a
+property of the machine it was taken on.
+
+### 32.1 Two measurements, two machines, no conflict
+
+The change was measured twice, on two different microarchitectures, against two
+different references. Both are reported here as peers:
+
+| source | hardware | method | result |
+| --- | --- | --- | --- |
+| original (#1218) | many-core **AMD server** part | vs an ORT reference on that box | **~1.36x vs ORT** (from 1.66x) |
+| reviewer | **Intel Core i7-13800H** (14C/20T, laptop-class), Windows 11 | ORT-independent same-binary A/B on `erf_avx2`; single thread; min-of-200 × 9 rounds; 1,048,576 mixed-range elements | **0.6346 ms → 0.6042 ms = ~5.0% (1.05x)** |
+
+These are **not in conflict and neither refutes the other.** They differ on every axis
+that matters for a CPU kernel timing: different microarchitecture (server AMD vs client
+Intel), different core count, and different reference (one is a ratio *relative to ORT*,
+the other an *internal* Horner-vs-Estrin A/B on the same binary because no ORT reference
+build was available on the review host). A latency-bound reassociation win is exactly
+the kind of result that scales with pipeline depth, memory system, and how much of the
+work is exposed to the out-of-order engine — all of which change between those two
+parts. The honest reading is: **Estrin is faster on both machines; the magnitude is
+hardware-dependent**, ~5% on this laptop and reported larger relative to ORT on the
+server part.
+
+### 32.2 The general lesson: CPU perf numbers here are hardware-dependent, and must carry their metadata
+
+This is the reusable point, and it is bigger than one PR. Server-class many-core AMD
+parts and consumer Intel laptops are **different measurement environments**; the same
+kernel change can be ~5% on one and a different ratio on the other, with neither being
+an error. It follows that **any CPU perf number recorded in these docs is only
+interpretable if it carries its hardware, its thread count, and its reference baseline.**
+A bare "1.36x" or "5%" with none of that attached cannot be compared to anything later,
+because the reader has no way to know whether a difference is a real change or just a
+different chip.
+
+Some entries in this benchmark corpus predate that discipline and record a ratio without
+naming the host, the thread count, or the ORT reference build. This section does not go
+fix them — it flags that the gap exists, so that new entries name their environment and
+old bare numbers are read with appropriate caution.
+
+### 32.3 The durable fact: this reassociation is NOT bit-identical
+
+Unlike the perf number, this part **is** hardware-independent — it is a property of the
+shipped kernel, true on every machine, so it is the most important thing to write down.
+Estrin reassociates floating-point FMAs, so it **does not** produce the same bits as
+Horner, by construction. A two-build dump-and-diff over 404,045 points — `[-6,6]`
+sampled densely, the `0.921875` split boundary, large `|x|`, denormals, and NaN/±inf —
+establishes the actual envelope:
+
+* **Estrin differs from Horner by at most exactly one ULP.** 4,401 of 404,043 finite
+  points (1.09%) differ, every one of them by a single ULP; max absolute difference
+  5.96e-8. Nothing anywhere in the domain moves by more than one ULP.
+* **Against f64 `erf` truth:** max error Horner 5.77e-8, Estrin 6.55e-8 (worst just
+  past the split, x≈0.933). Both are within ~1 ULP of the correctly-rounded f32
+  result; Estrin is at most ~0.8e-8 looser than Horner and never worse than one ULP
+  from it.
+* **Special values are correct and identical between the two:** large `|x|`
+  (7 … 1e30, `f32::MAX`) saturate to ±1.0; denormals produce bit-identical outputs;
+  NaN → NaN; +inf → +1.0; −inf → −1.0.
+
+The tripwire is the test **`erf_reassociation_costs_no_accuracy`** in
+`kernels/simd_activations.rs`: it pins the worst scaled error over `|x|<=1` at `2^-24`
+(half a ULP) against `erf_avx2` directly, so a future regrouping that widens the
+envelope fails the build instead of being absorbed by the looser `ERF_BOUND`. A reader
+who needs to know whether erf is bit-stable should start there.
+
+## 33. Phase 13: a CPU task runtime, because the scheduler was the loss
+
+§26 measured the thing that costs the most and is not arithmetic: Rayon parks
+its workers between parallel regions, so a fan-out costs **67 µs when it follows
+another fan-out immediately and 226 µs when it follows a 20 µs gap**. Decode is
+a stream of small regions separated by exactly that kind of gap. Every kernel
+that fans out pays the parked number, every layer, forever.
+
+That is a scheduler problem, and it does not get better by making the kernels
+faster. This phase replaces the fan-out mechanism.
+
+### 33.1 Two backends, chosen by where we are running
+
+`onnx_runtime_ep_cpu::task_runtime` is a thin façade over two implementations,
+and the choice is made per call:
+
+| condition | backend |
+|---|---|
+| `total == 0`, forced serial, or already inside a task | `Serial` |
+| a `KernelContext` with `ParallelFor` is installed | `Host` |
+| otherwise, and the work splits into ≥2 tasks | `Native` |
+| otherwise | `Serial` |
+
+**Inside the plugin EP we do not run our own threads at all.** ORT has already
+sized an intra-op pool from the session's `intra_op_num_threads`, and starting a
+second pool beside it oversubscribes every core. `Host` routes the fan-out into
+`KernelContext_ParallelFor` through the existing `host_parallel` shim, so our
+kernels schedule exactly like every other ORT kernel and inherit the session's
+thread count, its affinity settings and its spin policy. This is not a fallback
+in the §23 sense — no node is handed to ORT's CPU EP, no kernel is skipped, and
+the arithmetic is still entirely ours. Only the `for` loop is the host's.
+
+`Native` is for the standalone runtime, where there is no host pool to borrow
+and Rayon is the only alternative.
+
+Nesting is checked in both directions (`in_host_task()`, `in_task()`). A kernel
+that fans out from inside another fan-out runs serially rather than exploding
+the region count, which is what made the earlier hot-pool RoPE attempt bimodal.
+
+### 33.2 The native pool
+
+Eight job slots, not one. A single-slot pool serialises concurrent dispatchers,
+which is the wrong answer when two sessions decode at once; with eight, they get
+real parallelism, and a ninth concurrent dispatcher gets `false` back and runs
+its own work serially rather than blocking. Slot exhaustion is a counter
+(`slot_exhausted`), so the assumption is falsifiable rather than assumed —
+measured **0 in 9744 dispatches** across the concurrency harness.
+
+Workers watch a single `epoch` counter with `atomic_wait`, and the publish order
+is: write the job, store `remaining`, store `claim` (Release), set the active
+bit, bump `epoch`, wake. The soundness argument is the claim protocol: a worker
+that successfully claims a range has proved `remaining > 0`, which proves the
+dispatcher is still blocked, which proves the closure's stack frame is alive.
+
+**Adaptive spin, 20 µs → 500 µs**, doubling when a worker catches work in its
+spin window and halving when it parks. This is the part that answers §26: the
+window self-sizes to the actual gap between regions instead of being tuned to a
+guess.
+
+### 33.3 Width: SMT-capped, but only above 8 hardware threads
+
+Whether to use both SMT siblings is not obvious for memory-bound kernels — the
+second sibling adds no execution resources but does add a memory-level-
+parallelism generator. So it was measured, on one binary, with one arm forced to
+an explicit uncapped width:
+
+| logical CPUs | physical | capped wins | uncapped wins |
+|---|---|---|---|
+| 2 | 1 | 0/4 | 4/4, by 14–19% |
+| 4 | 2 | 0/4 | 4/4, by 3–25% |
+| 8 | 4 | 1/4 | 3/4, by 10–26% |
+| 16 | 8 | **3/4, by 12–45%** | 1/4 |
+| 32 | 16 | **3/4, by 12–36%** | 1/4 |
+
+The cap only pays above 8 hardware threads, so `SMT_CAP_FLOOR = 8`: an inferred
+width is never capped below 8. Below that the sibling is still worth having;
+above it, the extra spinning worker costs more than the memory parallelism it
+buys. The split is not uniform even above the floor — the largest
+bandwidth-bound softmax prefers SMT at *every* width, the smallest RoPE prefers
+the cap at every width — which is why this is a floor and not a rule.
+
+An **explicit** budget (`set_task_thread_budget`, `ONNX_GENAI_CPU_TASK_THREADS`)
+is never capped. If a caller says 32, they get 32; the cap is an inference, and
+inferences do not override instructions.
+
+### 33.4 What it costs to dispatch
+
+16 workers, 400 rounds per sample, release build, on the §0 host:
+
+| gap before dispatch | p50 | p90 | | concurrent sessions | p50 | p90 |
+|---|---|---|---|---|---|---|
+| 0 µs | 4.8 µs | 5.2 µs | | 1 | 5.3 µs | 5.7 µs |
+| 5 µs | 4.9 µs | 5.2 µs | | 2 | 5.4 µs | 5.9 µs |
+| 20 µs | 4.8 µs | 5.2 µs | | 4 | 5.4 µs | 6.1 µs |
+| 100 µs | 4.9 µs | 5.3 µs | | 8 | 6.3 µs | 7.6 µs |
+| 500 µs | 43.8 µs | 46.4 µs | | | | |
+| 2000 µs | 34.7 µs | 44.8 µs | | | | |
+
+Against Rayon's 67 µs / 226 µs that is **14× back-to-back and 47× after a
+decode-shaped gap**. The 14× matters less than the flatness: 0 µs and 100 µs
+cost the same, so a decode step no longer pays for having been idle. Past the
+500 µs spin ceiling the workers do park and the cost returns to Rayon's order —
+which is correct, because at that point the process really is idle and should
+not be burning a core.
+
+`tests/task_runtime_latency.rs` asserts the decode-shaped part of this
+(gaps ≤ 100 µs stay within 3× back-to-back + 10 µs). It is `#[ignore]`d, because
+a latency assertion on a shared CI runner is a flake generator.
+
+### 33.5 Idle cost, which is the price of spinning
+
+A spinning pool that never parks is a regression disguised as a speedup.
+`tests/task_runtime_idle.rs` bounds both ends: after the spin window elapses the
+workers must be parked (bounded CPU over a 750 ms idle window) and the pool's
+resident set must not grow with dispatch count.
+
+The test is deliberately **one** `#[test]` with two phases. Two test functions
+in one binary run concurrently by default, and both of these measure
+whole-process CPU and RSS — so as separate tests they measured each other, and
+the idle bound failed with 1.31 s of CPU over a 750 ms window.
+
+### 33.6 Test hooks, not environment variables
+
+`task_runtime::testing` exposes `force_serial()`, `isolated_pool(n)`,
+`counters()`, `pool_width()` and `planned_backend()`. Nothing in the production
+path reads an environment variable for test purposes, and the tests do not race
+on a global by construction: `isolated_pool` builds a private pool rather than
+reconfiguring the shared one.
+
+### 33.7 RoPE and Softmax, moved onto it
+
+Real ORT A/B, one driver invocation per pair, 7 trials × 7 runs. Ratio is
+native ÷ ORT, lower is better, `base>new`:
+
+| cell | t=1 | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|---|
+| rope_llama3_s128 | 0.78>0.77 | 1.74>1.34 | 2.36>1.35 | 4.61>1.61 | 7.18>1.39 | 39.40>1.15 |
+| rope_llama3_s512 | 0.94>0.92 | 1.52>1.32 | 1.68>1.39 | 3.49>1.92 | 4.47>1.90 | 26.72>2.34 |
+| rope_gptj_il_s128 | 0.87>0.87 | 1.72>1.28 | 2.14>1.53 | 3.78>1.54 | 6.68>1.50 | 51.31>3.40 |
+| rope_gptj_il_s512 | 0.98>0.98 | 1.63>1.36 | 1.83>1.35 | 3.38>2.00 | 4.83>1.76 | 24.37>2.68 |
+| sm_bert_b8_s128 | 1.26>1.29 | 2.04>1.63 | 2.12>1.67 | 3.62>1.93 | 5.56>2.58 | 3.72>2.44 |
+| sm_prefill_h32_s512 | 1.33>1.34 | 2.21>2.14 | 2.33>1.45 | 2.54>2.06 | 2.54>2.23 | 5.58>1.53 |
+| sm_whisper_cross | 1.36>1.38 | 2.25>2.28 | 2.50>2.58 | 3.00>2.57 | 2.54>2.79 | 1.75>1.85 |
+
+Our own native milliseconds for the same runs, which is the honest view of what
+*we* changed — the ratio also moves when ORT moves, and ORT's spread on this
+shared host reaches 50% on the small cells:
+
+| cell | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|
+| rope_llama3_s128 | 0.126>0.091 | 0.103>0.067 | 0.151>0.051 | 0.233>0.043 | 2.239>0.148 |
+| rope_llama3_s512 | 0.415>0.351 | 0.242>0.193 | 0.359>0.169 | 0.382>0.128 | 2.918>0.221 |
+| rope_gptj_il_s128 | 0.137>0.103 | 0.104>0.077 | 0.132>0.052 | 0.248>0.046 | 3.711>0.170 |
+| rope_gptj_il_s512 | 0.429>0.402 | 0.253>0.211 | 0.354>0.212 | 0.452>0.140 | 3.505>0.251 |
+| sm_bert_b8_s128 | 0.908>0.883 | 0.491>0.461 | 0.476>0.334 | 0.617>0.262 | 3.536>0.328 |
+
+Up to **15× at 32 threads** and **5.4× at 16**. The largest wins are in the
+widest columns, which is where §26 said the park cost was worst — the prediction
+and the measurement agree, which is the main reason to believe the mechanism.
+
+The decode-shaped cells are deliberately unmoved: `rope_*_s1` and
+`sm_decode_h32_kv*` are below the parallel threshold and run serially in both
+arms, flat to within noise at every width. A one-token RoPE should not be
+fanning out and still does not.
+
+### 33.7.1 The scar: an unrelated edit de-vectorised the activations
+
+Rewiring RoPE and Softmax made **`Tanh` and `Sigmoid` 2× slower at one thread**,
+in a file the change did not touch, on inputs that never reach a parallel path.
+
+`avx2::map_ps` takes the per-vector kernel as `impl Fn(__m256) -> __m256` and
+calls it once per eight lanes. Its body is a couple of hundred bytes of
+polynomial, which sits right at the inliner's threshold, so whether it inlined
+came out of a cost model with the whole crate in view — and an edit anywhere
+could flip it. `nm -S` is what caught it: `tanh_avx2` went from one 511-byte
+function to a 5-byte shim calling an outlined `map_ps` calling an outlined
+216-byte closure. Tanh `[32,4096]` 0.053 → 0.100 ms, Sigmoid 0.054 → 0.104 ms.
+
+Two things about this are worth keeping:
+
+1. **`codegen-units = 1` does not prevent it.** It is already pinned for this
+   package (#1174) for exactly this class of bug. One codegen unit still leaves
+   the inline decision to a cost model. The fix has to be `#[inline(always)]`.
+2. **The A/B grid nearly published it as a scheduler result.** The first
+   activation grid showed 74 regressed cells, including at t=1 where no
+   scheduling happens. The t=1 column is what made it obviously not a scheduler
+   effect. Any grid that only reports the widths it is trying to improve would
+   have attributed this to the runtime.
+
+`#[inline(always)]` and `#[target_feature]` cannot coexist in Rust, which is why
+neither helper carries the latter; every caller is already inside an `avx2,fma`
+function, so the features arrive with the inline.
+
+### 33.7.2 Re-verified against §29's Softmax, not the one it replaced
+
+The Softmax numbers above were taken before #1219 landed, so their baseline was
+a `softmax_rows` that still copied `src` into `dst` before reducing. Merging
+main changed the thing this phase is measured against, and the merge itself had
+to resolve a conflict inside `softmax_rows` — #1219 removed the copy, this phase
+moved the fan-out onto the task runtime, and both edits are in the same four
+lines. The resolution keeps both: one `compute_softmax` per task's whole chunk
+run, reading `src` and writing `dst` directly, with no copy anywhere.
+
+Re-run against the merged baseline (22 transform cells, 6 widths, 9 trials,
+paired arms in one driver invocation), native ms, base = `origin/main` at
+`54e8e831f`:
+
+| cell | t=4 | t=8 | t=16 | t=32 |
+| ---- | --- | --- | ---- | ---- |
+| `sm_bert_b8_s128`    | 0.644→0.378 (1.7×) | 0.565→0.320 (1.8×) | 0.840→0.291 (2.9×) | 2.751→0.485 (**5.7×**) |
+| `sm_prefill_h32_s512`| 2.697→2.164 (1.2×) | 1.900→1.747 (1.1×) | 2.111→1.722 (1.2×) | 4.572→1.078 (**4.2×**) |
+
+The win survives the merge, and its shape is unchanged: it grows with width,
+because what it removes is a per-region park, not a per-element cost. The
+decode-shaped `sm_decode_h32_kv*` cells stay serial and stay flat (18–182 µs,
+within ±1 µs of base at every width), and `sm_whisper_cross` is neutral at every
+width — both are the intended outcome, not a miss.
+
+### 33.8 Transpose and the activations, and what the controls say
+
+Activations, our own native ms, `base>new`, 5 trials × 7 runs:
+
+| cell | t=1 | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|---|
+| act_relu_hidden_t512 | 0.838>0.822 | 0.546>0.488 | 0.295>0.251 | 0.276>0.183 | 0.381>0.130 | 1.201>0.303 |
+| act_tanh_hidden_t512 | 0.804>0.803 | 0.806>0.794 | 0.457>0.417 | 0.419>0.317 | 0.485>0.204 | 1.441>0.386 |
+| act_sigmoid_hidden_t512 | 0.826>0.837 | 0.832>0.808 | 0.640>0.559 | 0.462>0.296 | 0.513>0.214 | 1.176>0.437 |
+| act_tanh_hidden_t4096 | 6.398>6.542 | 6.331>6.436 | 4.300>3.412 | 3.609>3.494 | 3.691>3.490 | 5.991>2.933 |
+| act_sigmoid_hidden_t4096 | 6.532>6.680 | 6.488>6.605 | 3.547>3.465 | 3.560>3.476 | 3.672>3.539 | 6.070>2.356 |
+| act_fastgelu_mlp_t512 | 5.466>5.448 | 5.169>5.294 | 2.815>2.765 | 2.156>1.864 | 1.949>1.553 | 4.461>1.463 |
+
+27 improved cells against 5 regressed at a 5% deadband, and the five are 1–6 µs
+absolute or bandwidth-bound cells whose distributions overlap outright. Up to
+3.6× at t=16 and 4× at t=32.
+
+Transpose needed 15 trials rather than 7 before it said anything stable — at 7
+it produced a `tr_bert_b8_s128` "regression" that was entirely dispersion:
+
+| cell | t=1 | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|---|
+| tr_bert_b8_s128 | 0.117>0.119 | 0.152>0.153 | 0.111>0.112 | 0.134>0.140 | 0.261>0.248 | 2.658>2.670 |
+| tr_llama3_s512 | 0.718>0.705 | 0.390>0.389 | 0.227>0.228 | 0.253>0.239 | 0.430>0.352 | 3.412>3.101 |
+| tr_whisper_s1500 | 0.566>0.593 | 0.448>0.442 | 0.353>0.358 | 0.307>0.296 | 0.397>0.380 | 3.292>3.017 |
+
+4 improved, 0 regressed. Transpose is a straight copy, so it is bandwidth-bound
+long before it is scheduler-bound; the gain is small and lives at the wide end.
+
+**The controls.** Two families this work does not touch were run at the same six
+widths purely to establish the noise floor: 24 GQA attention cells (32 improved
+/ 27 regressed) and 20 GEMM cells (19 / 12). Both are symmetric, which is what
+licenses reading the 3–15× numbers as real rather than as luck. Anyone repeating
+this on this host should budget for ±25% on a single 7-trial cell and treat any
+claim smaller than that as unmeasured.
+
+### 33.9 The biggest remaining loss is GEMM, and it is the same disease
+
+The GEMM control was meant to be a null result and instead found the largest
+single loss in the CPU EP. Decode-shaped `MatMulNBits`, native ms:
+
+| cell | t=8 | t=16 | t=32 | ratio vs ORT at t=32 |
+|---|---|---|---|---|
+| gemm_nbits_qwen3_0p6b_qkv_t8 | 0.67 | 0.64 | **2.98** | 25.99 |
+| gemm_nbits_qwen3_0p6b_mlp_t8 | 1.17 | 1.03 | **3.81** | 18.73 |
+| gemm_nbits_llama3_8b_qkv_t8 | 4.15 | 3.05 | **6.07** | 8.64 |
+
+Going from 16 to 32 threads makes these **4.6× slower**, on the operator that
+carries most of a decode step's arithmetic. That is the §26 signature exactly,
+and `matmul_nbits.rs` is still the largest raw-Rayon fan-out in the crate.
+
+Prefill-shaped GEMM (`t128`, `t512`) does not show it: those regions are long
+enough to amortise a park. It is specifically the small, frequent, decode-shaped
+region that the global pool cannot serve, which is the whole thesis of §26.
+
+Nothing in this phase touches it. It is the next target, and the runtime it
+needs already exists.

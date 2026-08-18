@@ -30,7 +30,6 @@ use onnx_runtime_ep_api::{
     structural_input_bytes,
 };
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
-use onnx_runtime_memory_governor::DeviceAllocator;
 
 use crate::kernels::build_cuda_registry_with_metrics;
 use crate::kernels::csa_checkpoint::CsaMetrics;
@@ -168,18 +167,8 @@ pub struct CudaExecutionProvider {
     /// EP used to make directly.
     memory: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>,
     governor: Option<Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
-    /// Installed inside the constructor (`new_with_policy_and_governor`) when
-    /// VMM is enabled, and read in place of `memory` from then on.
-    ///
-    /// `adopt_memory_governor` does **not** install this cell — by the time it
-    /// runs, a governor has become available, but the arena (if any) already
-    /// exists from construction; adoption only moves the arena's own ledger
-    /// onto the real governor (see [`CudaExecutionProvider::adopt_memory_governor`]).
-    /// So this is set at most once, and always before the constructed provider
-    /// is returned to a caller — never after allocations may have happened.
-    /// That is what makes `with_memory`'s rejection of "inject an allocator
-    /// once VMM is already selected" complete rather than racy: nothing after
-    /// construction can populate this cell out from under it.
+    /// Installed by `adopt_memory_governor` when VMM is enabled, and read in
+    /// place of `memory` from then on.
     ///
     /// A `OnceLock` rather than a lock because this is set once, before any
     /// allocation, and read on every one: `get` is a relaxed atomic load, so
@@ -453,46 +442,15 @@ impl CudaExecutionProvider {
     ///
     /// # Errors
     ///
-    /// - If `memory` does not serve this EP's device. Pointers from it are
-    ///   handed to kernels as this device's addresses, so a host allocator or
-    ///   another device's allocator would produce an address that is invalid
-    ///   where it is used. That fails inside a kernel launch, far from the
-    ///   substitution that caused it, so it is rejected here instead.
-    /// - If a VMM arena is already installed (constructed when
-    ///   `ONNX_GENAI_CUDA_VMM` or dynamic lending select it, before this
-    ///   method can run). `memory()` always prefers `self.vmm` once it is
-    ///   set, so accepting the substitution here would return `Ok(Self)`
-    ///   while `memory` sat unused forever — a silently ignored injection.
-    ///   Rejecting it instead keeps "which mechanism serves this provider"
-    ///   unambiguous: exactly one of VMM or the (possibly substituted) base
-    ///   allocator is ever in force, decided at construction, and this method
-    ///   cannot un-select VMM once chosen (its address-space reservation and
-    ///   any already-mapped granules are not something this method can undo).
-    ///   A caller who needs a specific base allocator must build without VMM
-    ///   (`ONNX_GENAI_CUDA_VMM` unset and dynamic lending disabled).
-    /// - If `memory` advertises a `VirtualBacking`/`SharedMapping` capability
-    ///   whose `device()` disagrees with `memory.device()`, or whose
-    ///   underlying object is not `memory` itself (see
-    ///   [`capability_shares_mechanism`](onnx_runtime_memory_governor::capability_shares_mechanism)).
-    ///   A composite allocator whose ordinary allocate/deallocate and whose
-    ///   advertised capability are two different objects cannot prove that a
-    ///   pointer produced through the capability is ever released through the
-    ///   mechanism that produced it (#1186 Phase 2 review).
+    /// If `memory` does not serve this EP's device. Pointers from it are handed
+    /// to kernels as this device's addresses, so a host allocator or another
+    /// device's allocator would produce an address that is invalid where it is
+    /// used. That fails inside a kernel launch, far from the substitution that
+    /// caused it, so it is rejected here instead.
     pub fn with_memory(
         mut self,
         memory: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>,
     ) -> Result<Self> {
-        if let Some(arena) = self.vmm.get() {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: this execution provider already selected a VMM arena over CUDA \
-                 device {} at construction time; it cannot also be substituted with the \
-                 injected allocator, and mixing the two would make the ordinary allocation \
-                 mechanism ambiguous. Construct without VMM (unset {} and disable dynamic \
-                 KV/weight lending) to use `with_memory` instead.",
-                DeviceAllocator::device(arena.as_ref()).index,
-                crate::vmm_allocator::CUDA_VMM_ENV
-            )));
-        }
         let key = memory.device();
         let expected = onnx_runtime_memory_governor::DeviceKey::device(self.device.index);
         if key != expected {
@@ -502,73 +460,6 @@ impl CudaExecutionProvider {
                  them. Supply an allocator for CUDA device {}.",
                 expected.index, key.tier, key.index, expected.index
             )));
-        }
-        // Any capability this allocator advertises must genuinely be *this*
-        // allocator, not a different inner object it merely composes.
-        // Release for a `VirtualBacking`-produced pointer is reached through
-        // this same `as_virtual_backing()` call at both allocate and
-        // deallocate time (see `deallocate_with_unmapped`), so a foreign
-        // capability object can never actually be freed through a different
-        // mechanism through this EP — but rejecting a malformed allocator
-        // here, rather than merely tolerating it, keeps "which mechanism
-        // owns this pointer" an identity a caller can trust rather than an
-        // accident of how `deallocate_with_unmapped` happens to be wired
-        // (#1186 Phase 2 review, finding 1).
-        if let Some(virtual_backing) = memory.as_virtual_backing() {
-            if virtual_backing.device() != key {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep: the injected allocator's VirtualBacking capability reports \
-                     device {:?} {}, but the allocator itself reports {:?} {}; a capability \
-                     that disagrees with its own allocator about device identity cannot be \
-                     trusted to belong to it",
-                    virtual_backing.device().tier,
-                    virtual_backing.device().index,
-                    key.tier,
-                    key.index
-                )));
-            }
-            if !onnx_runtime_memory_governor::capability_shares_mechanism(
-                memory.as_ref(),
-                virtual_backing.as_any(),
-            ) {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep: the injected allocator's VirtualBacking capability is not the \
-                     allocator itself. A composite allocator whose ordinary \
-                     allocate/deallocate and whose VirtualBacking capability are two \
-                     different objects sharing only a matching device cannot prove that \
-                     release always reaches the mechanism that allocated; implement \
-                     `as_virtual_backing` to return `Some(self)` on the same type instead."
-                        .into(),
-                ));
-            }
-        }
-        if let Some(shared_mapping) = memory.as_shared_mapping() {
-            if shared_mapping.device() != key {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep: the injected allocator's SharedMapping capability reports \
-                     device {:?} {}, but the allocator itself reports {:?} {}; a capability \
-                     that disagrees with its own allocator about device identity cannot be \
-                     trusted to belong to it",
-                    shared_mapping.device().tier,
-                    shared_mapping.device().index,
-                    key.tier,
-                    key.index
-                )));
-            }
-            if !onnx_runtime_memory_governor::capability_shares_mechanism(
-                memory.as_ref(),
-                shared_mapping.as_any(),
-            ) {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep: the injected allocator's SharedMapping capability is not the \
-                     allocator itself. A composite allocator whose ordinary \
-                     allocate/deallocate and whose SharedMapping capability are two \
-                     different objects sharing only a matching device cannot be trusted to \
-                     mix them safely; implement `as_shared_mapping` to return `Some(self)` \
-                     on the same type instead."
-                        .into(),
-                ));
-            }
         }
         self.memory = memory;
         Ok(self)
@@ -987,7 +878,7 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
         if dynamic_lending_enabled()
-            && let Some(virtual_backing) = self.memory().as_virtual_backing()
+            && self.memory().commits_on_demand()
             && let Some(governor) = self.governor.as_deref()
             && let Some(requester) = self
                 .mapped_requesters
@@ -998,7 +889,8 @@ impl ExecutionProvider for CudaExecutionProvider {
                 ))
                 .cloned()
         {
-            let bytes = virtual_backing
+            let bytes = self
+                .memory()
                 .mapped_bytes_for_allocation(size, alignment)
                 .map_err(EpError::Memory)?;
             let grant = governor
@@ -1019,23 +911,9 @@ impl ExecutionProvider for CudaExecutionProvider {
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(EpError::AlignmentError);
         }
-        // The atomic capacity-token commit these callers need is inherent to
-        // `CudaVmmAllocator` (governor-coupling reasons in
-        // `onnx-runtime-cuda-memory::vmm_allocator`), not part of the
-        // `VirtualBacking` capability trait. Dynamic mapped growth is only
-        // ever entered for the arena this EP itself installed, so the
-        // concrete field is used directly rather than the generic
-        // `self.memory()` seam.
-        let Some(arena) = self.vmm.get() else {
-            return Err(EpError::KernelFailed(
-                "cuda_ep: mapped growth requires the built-in CUDA VMM arena; the installed \
-                 allocator reports a virtual-backing capability but is not the CUDA VMM arena, \
-                 so there is no atomic capacity-token commit to use here"
-                    .into(),
-            ));
-        };
         let full = 0..size;
-        let allocation = arena
+        let allocation = self
+            .memory()
             .allocate_committed_with_capacity(
                 size,
                 alignment,
@@ -1057,7 +935,7 @@ impl ExecutionProvider for CudaExecutionProvider {
             if let Some(ptr) = std::ptr::NonNull::new(ptr.cast::<u8>()) {
                 // Attribution never committed, so roll back the physical map
                 // without running the provider's canonical refund.
-                unsafe { arena.deallocate(ptr, size, alignment) };
+                unsafe { self.memory().deallocate(ptr, size, alignment) };
             }
             return Err(EpError::Memory(error));
         }
@@ -1082,22 +960,10 @@ impl ExecutionProvider for CudaExecutionProvider {
         // same value; normalising a zero-byte request is the allocator's job,
         // because the contract lets an implementation rely on the two sizes
         // agreeing.
-        //
-        // An allocator with no `VirtualBacking` capability has no separate
-        // commit step: it maps everything at `allocate` time, so the
-        // documented fallback is the ordinary eager `allocate` call, ignoring
-        // `committed_ranges` exactly as the eager contract promises (the
-        // whole footprint is committed regardless of which ranges are named
-        // live).
-        let ptr = match self.memory().as_virtual_backing() {
-            Some(virtual_backing) => virtual_backing
-                .allocate_committed(size, alignment, committed_ranges)
-                .map_err(EpError::Memory)?,
-            None => self
-                .memory()
-                .allocate(size, alignment)
-                .map_err(EpError::Memory)?,
-        };
+        let ptr = self
+            .memory()
+            .allocate_committed(size, alignment, committed_ranges)
+            .map_err(EpError::Memory)?;
         self.ep_allocations.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `ptr` is a fresh, unique, non-null device allocation of
         // >= `size` bytes owned by this EP and freed exactly once in
@@ -1119,17 +985,10 @@ impl ExecutionProvider for CudaExecutionProvider {
             "cuda_ep: refusing to commit a buffer from device {:?}",
             buffer.device()
         );
-        // No separate commit step for an eager allocator: everything was
-        // already committed at `allocate` time, matching
-        // `ExecutionProvider::commit_allocation_range`'s documented no-op
-        // default.
-        let Some(virtual_backing) = self.memory().as_virtual_backing() else {
-            return Ok(());
-        };
         let Some(ptr) = std::ptr::NonNull::new(buffer.as_ptr().cast::<u8>() as *mut u8) else {
             return Ok(());
         };
-        virtual_backing
+        self.memory()
             .commit_allocation_range(ptr, buffer.len(), buffer.alignment(), offset, bytes)
             .map_err(|error| {
                 EpError::KernelFailed(format!(
@@ -1142,10 +1001,6 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn commit_allocation_ranges(&self, ranges: &[(&DeviceBuffer, usize, usize)]) -> Result<()> {
-        // Same documented eager no-op as `commit_allocation_range`.
-        let Some(virtual_backing) = self.memory().as_virtual_backing() else {
-            return Ok(());
-        };
         let raw = ranges
             .iter()
             .map(|&(buffer, offset, bytes)| {
@@ -1166,13 +1021,15 @@ impl ExecutionProvider for CudaExecutionProvider {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        virtual_backing.commit_allocation_ranges(&raw).map_err(|error| {
-            EpError::KernelFailed(format!(
-                "cuda_ep: could not commit {} binding range(s) atomically on CUDA device {}: {error}",
-                raw.len(),
-                self.device.index
-            ))
-        })
+        self.memory()
+            .commit_allocation_ranges(&raw)
+            .map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: could not commit {} binding range(s) atomically on CUDA device {}: {error}",
+                    raw.len(),
+                    self.device.index
+                ))
+            })
     }
 
     fn commit_allocation_ranges_with_mapped_growth(
@@ -1180,17 +1037,6 @@ impl ExecutionProvider for CudaExecutionProvider {
         ranges: &[(&DeviceBuffer, usize, usize)],
         grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
     ) -> Result<u64> {
-        // Same capacity-token coupling as `allocate_with_mapped_growth`: the
-        // atomic commit is inherent to `CudaVmmAllocator`, so this goes
-        // through the concrete field rather than the generic capability.
-        let Some(arena) = self.vmm.get() else {
-            return Err(EpError::KernelFailed(
-                "cuda_ep: mapped growth requires the built-in CUDA VMM arena; the installed \
-                 allocator reports a virtual-backing capability but is not the CUDA VMM arena, \
-                 so there is no atomic capacity-token commit to use here"
-                    .into(),
-            ));
-        };
         let raw = ranges
             .iter()
             .map(|&(buffer, offset, bytes)| {
@@ -1207,7 +1053,7 @@ impl ExecutionProvider for CudaExecutionProvider {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        arena
+        self.memory()
             .commit_allocation_ranges_with_capacity(&raw, grant.physical_capacity())
             .map_err(|error| {
                 EpError::KernelFailed(format!(
@@ -1222,14 +1068,6 @@ impl ExecutionProvider for CudaExecutionProvider {
         &self,
         ranges: &[(&DeviceBuffer, usize, usize)],
     ) -> Result<u64> {
-        // Eager default: every named byte is mapped-attribution bytes,
-        // matching `ExecutionProvider::mapped_bytes_for_allocation_ranges`'s
-        // documented default.
-        let Some(virtual_backing) = self.memory().as_virtual_backing() else {
-            return Ok(ranges.iter().fold(0_u64, |total, &(_, _, bytes)| {
-                total.saturating_add(bytes as u64)
-            }));
-        };
         let raw = ranges
             .iter()
             .map(|&(buffer, offset, bytes)| {
@@ -1246,21 +1084,15 @@ impl ExecutionProvider for CudaExecutionProvider {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        virtual_backing
+        self.memory()
             .mapped_bytes_for_allocation_ranges(&raw)
             .map_err(EpError::Memory)
     }
 
     fn mapped_bytes_for_allocation(&self, bytes: usize, alignment: usize) -> Result<u64> {
-        match self.memory().as_virtual_backing() {
-            Some(virtual_backing) => virtual_backing
-                .mapped_bytes_for_allocation(bytes, alignment)
-                .map_err(EpError::Memory),
-            // Eager default: the whole request is mapped bytes, matching
-            // `ExecutionProvider::mapped_bytes_for_allocation`'s documented
-            // default.
-            None => Ok(bytes as u64),
-        }
+        self.memory()
+            .mapped_bytes_for_allocation(bytes, alignment)
+            .map_err(EpError::Memory)
     }
 
     fn decommit_allocation_range(
@@ -1275,17 +1107,12 @@ impl ExecutionProvider for CudaExecutionProvider {
             "cuda_ep: refusing to decommit a buffer from device {:?}",
             buffer.device()
         );
-        // Eager default: nothing to release early, matching
-        // `ExecutionProvider::decommit_allocation_range`'s documented no-op
-        // default.
-        let Some(virtual_backing) = self.memory().as_virtual_backing() else {
-            return Ok(0);
-        };
         let Some(ptr) = std::ptr::NonNull::new(buffer.as_ptr().cast::<u8>() as *mut u8) else {
             return Ok(0);
         };
         self.synchronize_before_pooled_unmap()?;
-        let unmapped = virtual_backing
+        let unmapped = self
+            .memory()
             .decommit_allocation_range(ptr, buffer.len(), buffer.alignment(), offset, bytes)
             .map_err(|error| {
                 EpError::KernelFailed(format!(
@@ -1303,15 +1130,8 @@ impl ExecutionProvider for CudaExecutionProvider {
         let Some(ptr) = std::ptr::NonNull::new(buffer.as_ptr().cast::<u8>() as *mut u8) else {
             return 0;
         };
-        match self.memory().as_virtual_backing() {
-            Some(virtual_backing) => {
-                virtual_backing.allocation_committed_bytes(ptr, buffer.len(), buffer.alignment())
-            }
-            // Eager default: the whole allocation is committed, matching
-            // `ExecutionProvider::allocation_committed_bytes`'s documented
-            // default.
-            None => buffer.len(),
-        }
+        self.memory()
+            .allocation_committed_bytes(ptr, buffer.len(), buffer.alignment())
     }
 
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()> {
@@ -1338,29 +1158,10 @@ impl ExecutionProvider for CudaExecutionProvider {
         let Some(ptr) = std::ptr::NonNull::new(ptr.cast::<u8>()) else {
             return Ok(0);
         };
-        // Release through the *same* capability-discovery call
-        // (`self.memory().as_virtual_backing()`) used in `allocate_committed`,
-        // never through the base `DeviceAllocator::deallocate_with_unmapped`,
-        // whenever this mechanism advertises `VirtualBacking`. Discovery is a
-        // documented per-allocator invariant (stable `Some`/`None`, same
-        // object, for the allocator's whole lifetime), so calling it again
-        // here is guaranteed to reach the identical concrete mechanism that
-        // produced `ptr` — closing the capability-identity gap structurally
-        // rather than relying on `DeviceKey` (coarse: two unrelated arenas on
-        // the same device compare equal by it) or on every implementation
-        // happening to agree by convention (#1186 Phase 2 review, findings
-        // 1 and 5).
-        //
         // SAFETY: `ptr`, `size` and `align` are the triple this EP obtained
-        // from `self.memory` in `allocate`/`allocate_committed`; `into_raw`
-        // consumed the owning handle so no alias remains, and this is its
-        // single free.
-        let unmapped = match self.memory().as_virtual_backing() {
-            Some(virtual_backing) => unsafe {
-                virtual_backing.deallocate_committed(ptr, size, align)
-            },
-            None => unsafe { self.memory().deallocate_with_unmapped(ptr, size, align) },
-        };
+        // from `self.memory` in `allocate`; `into_raw` consumed the owning
+        // handle so no alias remains, and this is its single free.
+        let unmapped = unsafe { self.memory().deallocate_with_unmapped(ptr, size, align) };
         self.refund_canonical_mapped_zone(unmapped);
         self.ep_frees.fetch_add(1, Ordering::Relaxed);
         Ok(unmapped)
@@ -1471,8 +1272,17 @@ impl ExecutionProvider for CudaExecutionProvider {
         batch: usize,
         dtype: DataType,
         result: &mut DeviceBuffer,
+        tie_break: onnx_runtime_ep_api::ArgmaxTieBreak,
     ) -> Result<()> {
-        crate::kernels::device_argmax::launch(&self.runtime, logits, elements, batch, dtype, result)
+        crate::kernels::device_argmax::launch(
+            &self.runtime,
+            logits,
+            elements,
+            batch,
+            dtype,
+            result,
+            tie_break.select_last_index(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1632,7 +1442,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         bytes: u64,
         role: onnx_runtime_memory_governor::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
-        if self.memory().as_virtual_backing().is_some() {
+        if self.memory().commits_on_demand() {
             return Ok(None);
         }
         self.governor
@@ -1654,8 +1464,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         bytes: u64,
         role: onnx_runtime_memory_governor::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
-        if bytes == 0 || !dynamic_lending_enabled() || self.memory().as_virtual_backing().is_none()
-        {
+        if bytes == 0 || !dynamic_lending_enabled() || !self.memory().commits_on_demand() {
             return Ok(None);
         }
         let Some(governor) = self.governor.as_deref() else {
@@ -1713,7 +1522,7 @@ impl ExecutionProvider for CudaExecutionProvider {
     /// False on the `cuMemAlloc` path, which takes physical memory at the
     /// moment it is asked for.
     fn commits_on_demand(&self) -> bool {
-        self.memory().as_virtual_backing().is_some()
+        self.memory().commits_on_demand()
     }
 
     fn set_weight_residency_budget(&self, budget_bytes: u64) -> Result<Option<u64>> {
@@ -2109,288 +1918,6 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         assert_eq!(
             after64.releases, warm.releases,
             "retained handles are reused, not released per cycle"
-        );
-    }
-
-    /// `with_memory` must reject a VMM-already-selected provider explicitly
-    /// rather than accepting the injected allocator and silently continuing to
-    /// prefer the arena: `memory()` always prefers `self.vmm` once it is set,
-    /// so a builder that only overwrote `self.memory` would return `Ok(Self)`
-    /// while the injected allocator sat unused forever — a successful ignored
-    /// injection, exactly the ambiguity Phase 2 of #1186 removes. This proves
-    /// both halves: the call itself is an `Err`, and the injected allocator
-    /// never actually served a single allocation (its own counter, not an
-    /// inference from the error).
-    #[cfg_attr(
-        not(feature = "gpu-tests"),
-        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
-    )]
-    #[test]
-    fn with_memory_rejects_injection_once_vmm_is_already_selected() {
-        // SAFETY: single-process test; forces the VMM arena on for this
-        // constructor call so the rejection path being proven is reachable
-        // regardless of the ambient environment.
-        unsafe { std::env::set_var(crate::vmm_allocator::CUDA_VMM_ENV, "1") };
-
-        let Ok(provider) = CudaExecutionProvider::new(0) else {
-            eprintln!(
-                "SKIPPED (no CUDA runtime): the with_memory VMM-rejection proof did NOT run."
-            );
-            panic!("CUDA test path did not run; report as a failed GPU test, not a pass");
-        };
-        assert!(
-            provider.vmm.get().is_some(),
-            "the forced-on VMM arena must actually be installed for this proof to test what it \
-             claims"
-        );
-
-        let context = provider.runtime().cuda_context();
-        // A same-device counting allocator: `CudaDeviceAllocator` already
-        // tracks every `cuMemAlloc` it makes, so it doubles as a ready-made
-        // "was this ever actually asked for memory" witness without a new
-        // test-only wrapper type.
-        let counting_allocator =
-            Arc::new(crate::device_allocator::CudaDeviceAllocator::new(context));
-
-        let error = provider.with_memory(counting_allocator.clone()).expect_err(
-            "with_memory must return Err once a VMM arena is already selected, not Ok(Self) \
-                 with the injection silently ignored",
-        );
-        let message = error.to_string();
-        assert!(
-            message.contains("already selected a VMM arena"),
-            "the rejection must name what happened, not just fail: {message}"
-        );
-        assert_eq!(
-            counting_allocator.cumemalloc_calls(),
-            0,
-            "the rejected allocator must never have been asked for memory — Err means it was \
-             never adopted, not adopted-then-abandoned"
-        );
-    }
-
-    /// A hypothetical composite allocator whose ordinary allocate/deallocate
-    /// are backed by one object but whose `VirtualBacking` capability is a
-    /// totally different (real) VMM arena, sharing only a matching
-    /// `DeviceKey` — exactly the "same-device wrapper exposing foreign
-    /// backing" scenario the #1186 Phase 2 review flagged as unable to prove
-    /// release always reaches the mechanism that allocated. `with_memory`
-    /// must reject it outright rather than accept it and rely on downstream
-    /// code happening to be safe (finding 1).
-    #[cfg_attr(
-        not(feature = "gpu-tests"),
-        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
-    )]
-    #[test]
-    fn with_memory_rejects_an_allocator_whose_capability_is_a_different_mechanism() {
-        // SAFETY: single-process test; ensure VMM is not force-enabled by a
-        // previous test in this binary, so the identity-validation path below
-        // (not the "VMM already selected" path) is what actually runs.
-        unsafe { std::env::remove_var(crate::vmm_allocator::CUDA_VMM_ENV) };
-
-        let Ok(provider) = CudaExecutionProvider::new(0) else {
-            eprintln!(
-                "SKIPPED (no CUDA runtime): the with_memory capability-identity proof did NOT \
-                 run."
-            );
-            panic!("CUDA test path did not run; report as a failed GPU test, not a pass");
-        };
-        assert!(
-            provider.vmm.get().is_none(),
-            "this proof requires the plain (non-VMM) construction path"
-        );
-
-        let context = provider.runtime().cuda_context();
-        let base = Arc::new(crate::device_allocator::CudaDeviceAllocator::new(
-            context.clone(),
-        ));
-        let foreign = Arc::new(
-            crate::vmm_allocator::CudaVmmAllocator::standalone(
-                context,
-                onnx_runtime_memory_governor::DeviceKey::device(0),
-                0,
-                64 << 20,
-                onnx_runtime_memory_governor::HolderId::new(1186),
-                onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
-            )
-            .expect("a second, unrelated VMM arena over the same device"),
-        );
-
-        /// Deliberately composes two different objects behind one
-        /// `DeviceAllocator`: ordinary allocate/deallocate go through `base`,
-        /// but the advertised `VirtualBacking` is `foreign` — a different
-        /// mechanism than the one that would service `allocate`/`deallocate`.
-        #[derive(Debug)]
-        struct CompositeAllocator {
-            base: Arc<crate::device_allocator::CudaDeviceAllocator>,
-            foreign: Arc<crate::vmm_allocator::CudaVmmAllocator>,
-        }
-
-        impl onnx_runtime_memory_governor::DeviceAllocator for CompositeAllocator {
-            fn allocate(
-                &self,
-                bytes: usize,
-                align: usize,
-            ) -> std::result::Result<std::ptr::NonNull<u8>, onnx_runtime_memory_governor::MemoryError>
-            {
-                self.base.allocate(bytes, align)
-            }
-
-            unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, bytes: usize, align: usize) {
-                // SAFETY: forwarded verbatim; our own caller upholds the same
-                // contract `DeviceAllocator::deallocate` documents.
-                unsafe { self.base.deallocate(ptr, bytes, align) }
-            }
-
-            fn device(&self) -> onnx_runtime_memory_governor::DeviceKey {
-                onnx_runtime_memory_governor::DeviceAllocator::device(self.base.as_ref())
-            }
-
-            fn as_virtual_backing(
-                &self,
-            ) -> Option<&dyn onnx_runtime_memory_governor::VirtualBacking> {
-                // Deliberately a *different* object than `self`/`self.base` —
-                // the exact composite the review flagged.
-                Some(self.foreign.as_ref())
-            }
-
-            fn mechanism_id(&self) -> Option<onnx_runtime_memory_governor::MechanismId> {
-                // The wrapper's own identity, not `self.foreign`'s: this
-                // proves the rejection below comes from a genuine identity
-                // mismatch, not from `CompositeAllocator` having opted out of
-                // identity entirely (#1186 Phase 2 review, round 4 finding 2).
-                Some(onnx_runtime_memory_governor::MechanismId::of(self))
-            }
-        }
-
-        let composite: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator> =
-            Arc::new(CompositeAllocator { base, foreign });
-
-        let error = provider.with_memory(composite).expect_err(
-            "with_memory must reject an allocator whose VirtualBacking capability is not \
-             itself, not accept it and hope release stays consistent by convention",
-        );
-        let message = error.to_string();
-        assert!(
-            message.contains("VirtualBacking capability is not the allocator itself"),
-            "the rejection must name what happened, not just fail: {message}"
-        );
-    }
-
-    /// #1186 Phase 2 review, round 3 finding 1: pointer equality alone is not
-    /// unforgeable. `#[repr(C)]` guarantees a struct's first field starts at
-    /// the struct's own address, so a wrapper that embeds a foreign
-    /// `CudaVmmAllocator` **by value** as its first field and advertises it
-    /// as its `VirtualBacking` produces the exact same address as `&self` —
-    /// the identity check must still reject it. This is the non-vacuous,
-    /// real-type counterpart to the synthetic proof in
-    /// `onnx_runtime_memory_api::capability::tests`.
-    #[cfg_attr(
-        not(feature = "gpu-tests"),
-        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
-    )]
-    #[test]
-    fn with_memory_rejects_a_foreign_vmm_embedded_at_offset_zero() {
-        // SAFETY: single-process test; ensure VMM is not force-enabled by a
-        // previous test in this binary.
-        unsafe { std::env::remove_var(crate::vmm_allocator::CUDA_VMM_ENV) };
-
-        let Ok(provider) = CudaExecutionProvider::new(0) else {
-            eprintln!("SKIPPED (no CUDA runtime): the offset-zero identity proof did NOT run.");
-            panic!("CUDA test path did not run; report as a failed GPU test, not a pass");
-        };
-        assert!(
-            provider.vmm.get().is_none(),
-            "this proof requires the plain (non-VMM) construction path"
-        );
-
-        let context = provider.runtime().cuda_context();
-        let base = Arc::new(crate::device_allocator::CudaDeviceAllocator::new(
-            context.clone(),
-        ));
-        let foreign = crate::vmm_allocator::CudaVmmAllocator::standalone(
-            context,
-            onnx_runtime_memory_governor::DeviceKey::device(0),
-            0,
-            64 << 20,
-            onnx_runtime_memory_governor::HolderId::new(1186),
-            onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
-        )
-        .expect("a second, unrelated VMM arena over the same device");
-
-        /// `#[repr(C)]` with `foreign` as the first field: `&self` and
-        /// `&self.foreign` are numerically the same address. Ordinary
-        /// allocate/deallocate go through `base`; the advertised
-        /// `VirtualBacking` is the embedded `foreign`, not `self`.
-        #[repr(C)]
-        #[derive(Debug)]
-        struct OffsetZeroWrapper {
-            foreign: crate::vmm_allocator::CudaVmmAllocator,
-            base: Arc<crate::device_allocator::CudaDeviceAllocator>,
-        }
-
-        impl onnx_runtime_memory_governor::DeviceAllocator for OffsetZeroWrapper {
-            fn allocate(
-                &self,
-                bytes: usize,
-                align: usize,
-            ) -> std::result::Result<std::ptr::NonNull<u8>, onnx_runtime_memory_governor::MemoryError>
-            {
-                self.base.allocate(bytes, align)
-            }
-
-            unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, bytes: usize, align: usize) {
-                // SAFETY: forwarded verbatim; our own caller upholds the same
-                // contract `DeviceAllocator::deallocate` documents.
-                unsafe { self.base.deallocate(ptr, bytes, align) }
-            }
-
-            fn device(&self) -> onnx_runtime_memory_governor::DeviceKey {
-                onnx_runtime_memory_governor::DeviceAllocator::device(self.base.as_ref())
-            }
-
-            fn as_virtual_backing(
-                &self,
-            ) -> Option<&dyn onnx_runtime_memory_governor::VirtualBacking> {
-                // Deliberately the embedded first field, reached through
-                // `self`'s own address, not a separately allocated object.
-                Some(&self.foreign)
-            }
-
-            fn mechanism_id(&self) -> Option<onnx_runtime_memory_governor::MechanismId> {
-                // The wrapper's own identity, not `self.foreign`'s: this
-                // proves the rejection below comes from a genuine `TypeId`
-                // mismatch defeating the offset-zero address collision, not
-                // from `OffsetZeroWrapper` having opted out of identity
-                // entirely (#1186 Phase 2 review, round 4 finding 2).
-                Some(onnx_runtime_memory_governor::MechanismId::of(self))
-            }
-        }
-
-        let wrapper = OffsetZeroWrapper { foreign, base };
-
-        // Non-vacuous: prove the address collision this test exists to guard
-        // against is real before asserting on the rejection it causes.
-        let wrapper_addr = &wrapper as *const OffsetZeroWrapper as *const ();
-        let foreign_addr =
-            &wrapper.foreign as *const crate::vmm_allocator::CudaVmmAllocator as *const ();
-        assert!(
-            std::ptr::eq(wrapper_addr, foreign_addr),
-            "test setup did not reproduce the offset-zero address collision `#[repr(C)]` is \
-             supposed to guarantee"
-        );
-
-        let composite: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator> = Arc::new(wrapper);
-
-        let error = provider.with_memory(composite).expect_err(
-            "with_memory must reject a foreign VirtualBacking embedded at offset zero even \
-             though its address coincides with the wrapper's own address (#1186 Phase 2 \
-             review, round 3 finding 1)",
-        );
-        let message = error.to_string();
-        assert!(
-            message.contains("VirtualBacking capability is not the allocator itself"),
-            "the rejection must name what happened, not just fail: {message}"
         );
     }
 

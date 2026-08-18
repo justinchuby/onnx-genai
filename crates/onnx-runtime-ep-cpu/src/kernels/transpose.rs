@@ -76,6 +76,17 @@ const TILE: usize = 64;
 /// more cores start helping.
 const MIN_PARALLEL_BYTES: usize = 256 * 1024;
 
+/// Minimum output bytes in one task's chunk.
+///
+/// A quarter of [`MIN_PARALLEL_BYTES`]: the whole-operation bar exists because
+/// below it the copy finishes faster than a fan-out can be scheduled, and a
+/// single chunk faces the same arithmetic against the task runtime's much
+/// cheaper per-task cost (a `fetch_sub` and an indirect call, not a fork/join).
+/// 64 KiB is still comfortably past the point where a copy is bandwidth-bound,
+/// so a chunk this size scales, while being small enough that a 1 MiB transpose
+/// has 16 chunks to balance across rather than one per thread.
+const MIN_PARALLEL_TASK_BYTES: usize = 64 * 1024;
+
 /// Dtype-generic Transpose kernel carrying the resolved `perm`.
 pub struct TransposeKernel {
     /// Axis permutation; `None` means reverse all axes.
@@ -389,11 +400,10 @@ fn block_move(src: &[u8], dst: &mut [u8], shape: &[usize], perm: &[usize], block
     };
 
     match parallel_blocks_per_task(blocks, block) {
-        Some(per_task) => {
-            use rayon::prelude::*;
-            dst.par_chunks_mut(per_task * block)
-                .enumerate()
-                .for_each(|(task, chunk)| body(chunk, task * per_task));
+        Some(per_chunk) => {
+            crate::task_runtime::chunk_runs_mut(dst, per_chunk * block, 1, |first, run| {
+                body(run, first * per_chunk);
+            });
         }
         None => body(dst, 0),
     }
@@ -407,13 +417,10 @@ fn blocked_2d(src: &[u8], dst: &mut [u8], rows: usize, cols: usize, esize: usize
     // worker a `&mut [u8]` without any unsafe pointer splitting.
     let dst_row = rows * esize;
     match parallel_blocks_per_task(cols, dst_row) {
-        Some(per_task) => {
-            use rayon::prelude::*;
-            dst.par_chunks_mut(per_task * dst_row)
-                .enumerate()
-                .for_each(|(task, chunk)| {
-                    blocked_2d_band(src, chunk, rows, cols, esize, task * per_task);
-                });
+        Some(per_chunk) => {
+            crate::task_runtime::chunk_runs_mut(dst, per_chunk * dst_row, 1, |first, run| {
+                blocked_2d_band(src, run, rows, cols, esize, first * per_chunk);
+            });
         }
         None => blocked_2d_band(src, dst, rows, cols, esize, 0),
     }
@@ -469,16 +476,13 @@ fn batched_blocked_2d(
     plane: usize,
 ) {
     match parallel_blocks_per_task(batch, plane) {
-        Some(per_task) => {
-            use rayon::prelude::*;
-            dst.par_chunks_mut(per_task * plane)
-                .enumerate()
-                .for_each(|(task, chunk)| {
-                    for (n, dst_plane) in chunk.chunks_mut(plane).enumerate() {
-                        let base = (task * per_task + n) * plane;
-                        blocked_2d_band(&src[base..base + plane], dst_plane, rows, cols, esize, 0);
-                    }
-                });
+        Some(per_chunk) => {
+            crate::task_runtime::chunk_runs_mut(dst, per_chunk * plane, 1, |first, run| {
+                for (n, dst_plane) in run.chunks_mut(plane).enumerate() {
+                    let base = (first * per_chunk + n) * plane;
+                    blocked_2d_band(&src[base..base + plane], dst_plane, rows, cols, esize, 0);
+                }
+            });
         }
         None => {
             // Too few planes to split, so let each plane decide for itself
@@ -524,16 +528,31 @@ fn unflatten(mut flat: usize, shape: &[usize]) -> Vec<usize> {
     idx
 }
 
-/// `Some(units_per_task)` when splitting `units` of `unit_bytes` each pays off.
+/// `Some(units_per_chunk)` when splitting `units` of `unit_bytes` each pays off.
+///
+/// The chunk is a *balance* unit, not a per-thread share. Sizing it as
+/// `units / workers` gives every worker one static band and makes the whole
+/// transpose wait for whichever band was unlucky -- a descheduled thread, an SMT
+/// sibling, a page fault on first touch. The task runtime claims chunks
+/// dynamically and caps the task count itself, so handing it several chunks per
+/// thread costs nothing on an idle machine and absorbs a straggler on a busy
+/// one.
+///
+/// [`MIN_PARALLEL_TASK_BYTES`] keeps a chunk from falling below the size where
+/// a copy is bandwidth-bound rather than latency-bound; below that the
+/// per-chunk bookkeeping starts to show.
 fn parallel_blocks_per_task(units: usize, unit_bytes: usize) -> Option<usize> {
     if units.saturating_mul(unit_bytes) < MIN_PARALLEL_BYTES {
         return None;
     }
-    let workers = rayon::current_num_threads().max(1);
-    if workers < 2 || units < 2 {
+    if crate::task_runtime::width() < 2 || units < 2 {
         return None;
     }
-    Some(units.div_ceil(workers).max(1))
+    Some(
+        MIN_PARALLEL_TASK_BYTES
+            .div_ceil(unit_bytes.max(1))
+            .clamp(1, units),
+    )
 }
 
 #[cfg(test)]

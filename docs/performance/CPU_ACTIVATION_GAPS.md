@@ -149,18 +149,23 @@ Two effects explain most of the table, and neither is the transcendental math:
 | `Exp` f32 | 0.14 | 0.82–0.92 | ported `MlasComputeExpVector` to AVX2 (#1093) |
 | bf16 ⇄ f32 conversion | scalar | 1.6–2.8× | bulk AVX2 conversion (#1041) |
 | `com.microsoft` activations unreachable | never ran | reachable | shape-inference table entries (#1082) |
+| `Celu`, `Mish` — no kernel at all | ORT ran them | 0.29–0.64 | native AVX2 kernels (#1235) |
+| `Log` f32 | 1.76 (4k), 1.66 (1M) | 0.77, 0.55 | AVX2 `log_ps`, was scalar `libm` per element (#1235) |
 
 ## Activations with no kernel at all
 
-Distinct from the sections below: these are not declines, they are missing
-features. ORT runs them because this EP has nothing to run.
+None, as of #1235. `Celu` (opset 12) and `Mish` (opset 18) were the last two:
+distinct from a decline, they were missing features, and ORT ran them because
+this EP had nothing to run. Both now have native AVX2 kernels built on the
+existing `exp`/`tanh` primitives, and both are in
+`activation_and_norm_ops_clear_every_capability_filter`'s `OWNED` list, so a
+future regression through either the shape filter or the dtype filter fails
+the suite.
 
-- **`Celu`** — ONNX opset 12. `max(0,x) + min(0, alpha*(exp(x/alpha)-1))`.
-- **`Mish`** — ONNX opset 18. `x * tanh(softplus(x))`.
-
-Both are cheap to add on top of the existing `exp`/`tanh` AVX2 primitives, and
-`activation_and_norm_ops_clear_every_capability_filter` has a comment naming
-them so they are added to that test the moment a kernel lands.
+This category is worth keeping as a heading even while it is empty, because
+the failure mode it describes is invisible to the obvious test: a coverage
+list written from the ops that exist cannot report an op nobody implemented.
+Both of these cleared `supports_op` by never reaching it.
 
 ## Ops that still reach ORT despite being supported
 
