@@ -10,6 +10,8 @@ tags:
   - vmm
   - beginner
 status: proposed
+created: 2026-08-17
+updated: 2026-08-17
 ---
 
 # Memory Management for Beginners
