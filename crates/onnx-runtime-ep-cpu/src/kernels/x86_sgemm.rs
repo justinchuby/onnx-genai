@@ -69,13 +69,14 @@ impl CPtr {
 /// [`crate::backend::has_simd_x86`]); callers without it must use the generic
 /// fallback instead.
 ///
-/// M==1 selection of the native GEMV ([`sgemm_simd_m1`]) is read once from the
-/// `ONNX_GENAI_CPU_MM_SIMD_M1_GEMV` toggle here; the actual dispatch lives in
-/// [`sgemm_simd_variant`] so the A/B harness can drive both variants in one
-/// process without touching process-global env state.
+/// `m == 1` takes the native GEMV ([`sgemm_simd_m1`]); every other `m` takes
+/// the packed GEBP path. The dispatch itself lives in [`sgemm_simd_variant`],
+/// which still accepts the route as an argument so the A/B harness can drive
+/// both in one process — but production no longer has a choice to make, and
+/// there is no env probe on this call.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) fn sgemm_simd(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
-    sgemm_simd_variant(a, b, c, m, k, n, m1_gemv_enabled());
+    sgemm_simd_variant(a, b, c, m, k, n, true);
 }
 
 /// Backend body with the M==1 route decision passed in explicitly rather than
@@ -109,9 +110,7 @@ pub(crate) fn sgemm_simd_variant(
     // memory copy." The packed path always calls `pack_b`, so at M=1 it pays a
     // full read+write copy of B (K*N f32) that is reused zero times — the whole
     // 2.2–4.6x decode gap measured against MLAS on AVX2. This GEMV streams B in
-    // place: no pack, no resident buffer, strictly less memory traffic. Behind
-    // a same-binary A/B toggle (default off) like #1104's nblk kernel, because
-    // it reassociates the f32 sum versus the packed path.
+    // place: no pack, no resident buffer, strictly less memory traffic.
     //
     // Dispatch boundary (measured on this host, AVX2, process CPU time, control
     // -gated so the M=128 prefill rows confirm the run was quiet — see
@@ -126,6 +125,14 @@ pub(crate) fn sgemm_simd_variant(
     // sequential B streaming trails MLAS's blocked M=1 asm; the other three win
     // outright (0.68-0.93). That MLAS-only boundary is a known limit, not a
     // regression against the code this build actually ships.
+    //
+    // #1091 landed this behind a default-off env toggle "until the win is
+    // measured". It has now been measured end to end, through an ORT session
+    // rather than a kernel driver: at `1x2048x2048`, f32, one thread on each
+    // side, `ours/ORT` p50 goes 7.57 -> 1.18 with this route on, while the
+    // M=128 prefill row -- which cannot reach it -- stays at 1.03. So the route
+    // is the default and `use_m1_gemv` survives only as the A/B harness's
+    // handle on the path it replaced.
     if m == 1 && use_m1_gemv {
         // SAFETY: `SimdX86` is only selected when the host has AVX2+FMA (see
         // `crate::backend::has_simd_x86`), the same guarantee `micro_6x16`
@@ -209,24 +216,6 @@ fn sgemm_simd_packed(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n:
             pc += KC;
         }
     });
-}
-
-/// A/B toggle for the #1091 native M=1 GEMV that absorbs MLAS's `SgemmKernelM1`
-/// mechanism (stream B in place, no packed buffer) into the built-in `SimdX86`
-/// backend. `1`/`on` enables it; unset or `0`/`off` keeps the packed GEBP path
-/// for every M. Default off so the shipped `SimdX86` path is unchanged until
-/// the win is measured, exactly like the `ONNX_GENAI_CPU_MM_INT4_NBLK` (#1104)
-/// and `NXRT_CPU_GEMM_BACKEND` toggles that preceded it. This is a read-only
-/// env probe — production is the only writer of process state here.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn m1_gemv_enabled() -> bool {
-    std::env::var("ONNX_GENAI_CPU_MM_SIMD_M1_GEMV")
-        .ok()
-        .map(|value| {
-            let value = value.trim();
-            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("off")
-        })
-        .unwrap_or(false)
 }
 
 /// Native M=1 SGEMV: `c[1,n] = a[1,k] @ b[k,n]` (overwrite), reading B in place.
@@ -622,11 +611,11 @@ mod tests {
         check_m1(512, 5120); // model-scale decode width
     }
 
-    /// The M=1 GEMV taken through the public `sgemm_simd` entry (with the toggle
-    /// on) must agree with the packed path (toggle off) within f32 tolerance —
-    /// they differ only by summation reassociation, never in which products are
-    /// summed. Guarded so no other test observes the env change: the toggle is
-    /// set and cleared within this test only, and `sgemm_simd` reads it once.
+    /// The M=1 GEMV must agree with the packed path within f32 tolerance — they
+    /// differ only by summation reassociation, never in which products are
+    /// summed. The packed side is reached through `sgemm_simd_variant(.., false)`
+    /// rather than `sgemm_simd`, because `sgemm_simd` now *is* the GEMV at
+    /// `m == 1`; comparing it against itself would prove nothing.
     #[test]
     fn m1_route_matches_packed_within_tolerance() {
         if !has_simd_x86() {
@@ -636,7 +625,7 @@ mod tests {
         let a = fill(k, 5);
         let b = fill(k * n, 9);
         let mut packed = vec![0.0f32; n];
-        sgemm_simd(&a, &b, &mut packed, 1, k, n);
+        sgemm_simd_variant(&a, &b, &mut packed, 1, k, n, false);
         let mut gemv = vec![0.0f32; n];
         // SAFETY: AVX2+FMA confirmed; sizes match 1*k / k*n / n.
         unsafe {
@@ -650,6 +639,82 @@ mod tests {
         assert!(
             max_err <= 1e-3 * (1.0 + max_ref),
             "m1 GEMV vs packed max abs error {max_err} exceeds tolerance (max_ref {max_ref})"
+        );
+        // ...and the two really are different code, so the tolerance check
+        // above is not comparing one path with itself.
+        assert_ne!(
+            packed, gemv,
+            "packed and GEMV produced identical bits; one of the two routes was \
+             not taken and the tolerance assertion is vacuous"
+        );
+    }
+
+    /// What the public entry point actually does at `m == 1`.
+    ///
+    /// The route used to be an env toggle that defaulted to the packed path, so
+    /// the shipped binary never reached the GEMV. Nothing else in this file
+    /// fails if that regresses -- `m1_gemv_shapes` calls the kernel directly and
+    /// `m1_route_matches_packed_within_tolerance` names both routes explicitly
+    /// -- which is exactly why this test exists, and why it asserts bit
+    /// equality with the GEMV rather than a tolerance against the packed path.
+    #[test]
+    fn the_default_entry_point_routes_m1_to_the_gemv() {
+        if !has_simd_x86() {
+            return;
+        }
+        let (k, n) = (300usize, 517usize);
+        let a = fill(k, 5);
+        let b = fill(k * n, 9);
+        let mut shipped = vec![0.0f32; n];
+        sgemm_simd(&a, &b, &mut shipped, 1, k, n);
+        let mut gemv = vec![0.0f32; n];
+        // SAFETY: AVX2+FMA confirmed; sizes match 1*k / k*n / n.
+        unsafe {
+            sgemm_simd_m1(&a, &b, &mut gemv, k, n);
+        }
+        assert_eq!(
+            shipped, gemv,
+            "sgemm_simd must take the M=1 GEMV, bit for bit"
+        );
+
+        // The M>=2 rows are the control: the GEMV cannot reach them, so the
+        // shipped entry must still be the packed kernel there.
+        let a2 = fill(2 * k, 5);
+        let mut shipped2 = vec![0.0f32; 2 * n];
+        sgemm_simd(&a2, &b, &mut shipped2, 2, k, n);
+        let mut packed2 = vec![0.0f32; 2 * n];
+        sgemm_simd_variant(&a2, &b, &mut packed2, 2, k, n, false);
+        assert_eq!(
+            shipped2, packed2,
+            "M>=2 must still be the packed GEBP path, bit for bit"
+        );
+    }
+
+    /// The route is fixed at compile time, so two calls in the same process
+    /// cannot disagree -- and no environment variable can move it. A previous
+    /// version of this dispatch read `ONNX_GENAI_CPU_MM_SIMD_M1_GEMV` on every
+    /// call, which made the shipped path depend on process state (and cost a
+    /// locked env lookup per GEMM).
+    #[test]
+    fn no_environment_variable_can_change_the_m1_route() {
+        if !has_simd_x86() {
+            return;
+        }
+        let (k, n) = (128usize, 96usize);
+        let a = fill(k, 7);
+        let b = fill(k * n, 13);
+        let mut first = vec![0.0f32; n];
+        sgemm_simd(&a, &b, &mut first, 1, k, n);
+        // SAFETY: single-threaded test; nothing else reads the environment
+        // concurrently, and the variable is removed again before returning.
+        unsafe { std::env::set_var("ONNX_GENAI_CPU_MM_SIMD_M1_GEMV", "0") };
+        let mut second = vec![0.0f32; n];
+        sgemm_simd(&a, &b, &mut second, 1, k, n);
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("ONNX_GENAI_CPU_MM_SIMD_M1_GEMV") };
+        assert_eq!(
+            first, second,
+            "the M=1 route must not be readable from the environment"
         );
     }
 }
