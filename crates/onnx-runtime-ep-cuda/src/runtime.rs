@@ -93,6 +93,7 @@ pub struct CudaDeviceCapabilities {
     max_shared_memory_per_block: u32,
     max_shared_memory_per_block_optin: u32,
     multiprocessor_count: u32,
+    l2_cache_size: u32,
 }
 
 impl CudaDeviceCapabilities {
@@ -102,6 +103,7 @@ impl CudaDeviceCapabilities {
         max_shared_memory_per_block: Option<u32>,
         max_shared_memory_per_block_optin: Option<u32>,
         multiprocessor_count: Option<u32>,
+        l2_cache_size: Option<u32>,
     ) -> Self {
         let max_threads_per_block = max_threads_per_block
             .filter(|&value| value > 0)
@@ -114,12 +116,16 @@ impl CudaDeviceCapabilities {
             .unwrap_or(max_shared_memory_per_block)
             .max(max_shared_memory_per_block);
         let multiprocessor_count = multiprocessor_count.filter(|&value| value > 0).unwrap_or(1);
+        // L2 size is a hint only (Ada L2-residency tiling); 0 means "unknown",
+        // which every consumer must treat as "no L2-residency assumptions".
+        let l2_cache_size = l2_cache_size.filter(|&value| value > 0).unwrap_or(0);
         Self {
             compute_capability,
             max_threads_per_block,
             max_shared_memory_per_block,
             max_shared_memory_per_block_optin,
             multiprocessor_count,
+            l2_cache_size,
         }
     }
 
@@ -137,6 +143,46 @@ impl CudaDeviceCapabilities {
 
     pub fn multiprocessor_count(self) -> u32 {
         self.multiprocessor_count
+    }
+
+    /// Device L2 cache size in bytes, or `0` when the driver did not report it.
+    /// Used as a *hint* for the pending Ada L2-residency tiling lever; a `0`
+    /// here must be treated as "make no L2-residency assumptions".
+    pub fn l2_cache_size(self) -> u32 {
+        self.l2_cache_size
+    }
+
+    /// Arch tier this device maps to (see [`crate::arch::ArchTier`]). The
+    /// mapping is total: every compute capability resolves to a tier without
+    /// panicking, and `sm_90` resolves to [`crate::arch::ArchTier::Hopper`].
+    pub fn arch_tier(self) -> crate::arch::ArchTier {
+        crate::arch::ArchTier::from_compute_capability(self.compute_capability)
+    }
+
+    /// Default, tier-derived kernel configuration hints for this device. This is
+    /// pure scaffolding for the pending RTX/arch kernels: nothing in the live
+    /// kernel-selection path consumes it yet, so it cannot change today's
+    /// behavior on any device (see [`crate::arch::ArchConfig`]).
+    pub fn arch_config(self) -> crate::arch::ArchConfig {
+        crate::arch::ArchConfig::for_capabilities(self)
+    }
+
+    /// Test-only constructor: synthesize capabilities for an arbitrary arch tier
+    /// so the SM-dispatch scaffolding can be exercised without that hardware.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        compute_capability: (u32, u32),
+        multiprocessor_count: u32,
+        l2_cache_size: u32,
+    ) -> Self {
+        Self::from_reported_limits(
+            compute_capability,
+            None,
+            None,
+            None,
+            Some(multiprocessor_count),
+            Some(l2_cache_size),
+        )
     }
 }
 
@@ -336,6 +382,10 @@ impl CudaRuntime {
             positive_attribute(
                 &context,
                 CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            ),
+            positive_attribute(
+                &context,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE,
             ),
         );
         let ptx_arch = ptx_arch_for(major, minor);
@@ -1359,7 +1409,7 @@ mod tests {
     #[test]
     fn capability_limits_use_conservative_fallbacks() {
         let capabilities =
-            CudaDeviceCapabilities::from_reported_limits((7, 0), None, None, None, None);
+            CudaDeviceCapabilities::from_reported_limits((7, 0), None, None, None, None, None);
         assert_eq!(capabilities.compute_capability(), (7, 0));
         assert_eq!(capabilities.max_threads_per_block, 256);
         assert_eq!(
@@ -1371,6 +1421,7 @@ mod tests {
             SAFE_SHARED_MEMORY_PER_BLOCK_FALLBACK
         );
         assert_eq!(capabilities.multiprocessor_count(), 1);
+        assert_eq!(capabilities.l2_cache_size(), 0);
     }
 
     #[test]
@@ -1381,9 +1432,11 @@ mod tests {
             Some(64 * 1024),
             Some(48 * 1024),
             Some(200),
+            Some(96 * 1024 * 1024),
         );
         assert_eq!(capabilities.max_shared_memory_per_block_optin(), 64 * 1024);
         assert_eq!(capabilities.multiprocessor_count(), 200);
+        assert_eq!(capabilities.l2_cache_size(), 96 * 1024 * 1024);
     }
 
     #[test]
