@@ -488,6 +488,16 @@ struct RegistryState {
 struct RegistryInner {
     identities: Arc<IdentitySource>,
     state: Mutex<RegistryState>,
+    #[cfg(test)]
+    select_after_validation_hook: Mutex<Option<SelectAfterValidationHook>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct SelectAfterValidationHook {
+    mechanism: MechanismIdentity,
+    entered: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
 }
 
 /// A narrow registry for provider/context pins and binding identity.
@@ -509,6 +519,8 @@ impl BindingRegistry {
             inner: Arc::new(RegistryInner {
                 identities: Arc::new(IdentitySource::new()?),
                 state: Mutex::new(RegistryState::default()),
+                #[cfg(test)]
+                select_after_validation_hook: Mutex::new(None),
             }),
         })
     }
@@ -675,14 +687,21 @@ impl BindingRegistry {
                 operation: "selecting a mechanism",
             });
         }
-        self.lock_state("publishing mechanism selection")?
+        #[cfg(test)]
+        self.wait_after_select_validation(mechanism.identity);
+        let prior = self
+            .lock_state("publishing mechanism selection")?
             .selected
             .insert(mechanism.device, mechanism.identity);
         let published = entry.snapshot()?;
         if published.lifecycle != MechanismLifecycle::Active {
             let mut state = self.lock_state("withdrawing inactive mechanism selection")?;
             if state.selected.get(&mechanism.device) == Some(&mechanism.identity) {
-                state.selected.remove(&mechanism.device);
+                if let Some(prior) = prior {
+                    state.selected.insert(mechanism.device, prior);
+                } else {
+                    state.selected.remove(&mechanism.device);
+                }
             }
             return Err(BindingError::InactiveMechanism {
                 mechanism: mechanism.identity,
@@ -691,6 +710,20 @@ impl BindingRegistry {
             });
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn wait_after_select_validation(&self, mechanism: MechanismIdentity) {
+        let hook = self
+            .inner
+            .select_after_validation_hook
+            .lock()
+            .expect("select test hook lock")
+            .clone();
+        if let Some(hook) = hook.filter(|hook| hook.mechanism == mechanism) {
+            hook.entered.wait();
+            hook.resume.wait();
+        }
     }
 
     pub fn bind(&self, device: DeviceKey) -> Result<MemoryBinding, BindingError> {
@@ -1069,6 +1102,11 @@ impl MemoryBinding {
     /// On validation/device-loss failure the allocation is returned to the caller
     /// inside [`ExplicitReleaseError`] so its metadata and lifetime pins are not
     /// silently discarded.
+    ///
+    /// This Phase-3 path calls canonical [`DeviceAllocator::deallocate`]. It does
+    /// not expose mapped-attribution refunds from
+    /// [`DeviceAllocator::deallocate_with_unmapped`]; EP adoption must wait for
+    /// Phase-4 accounting reconciliation.
     pub fn release(&self, allocation: BoundAllocation) -> Result<(), ExplicitReleaseError> {
         let operation = match self.mechanism.begin_release(self.identity, &allocation) {
             Ok(operation) => operation,
@@ -1518,8 +1556,8 @@ impl BoundSharedMapping {
             .create_shared_prefix(bytes)?;
         drop(active);
         Ok(BoundSharedPrefix {
-            binding: self.binding.clone(),
             prefix,
+            binding: self.binding.clone(),
         })
     }
 
@@ -1577,10 +1615,15 @@ impl BoundSharedMapping {
 }
 
 /// Shared physical-prefix handle pinned to one binding.
+///
+/// Physical teardown remains driven by dropping this handle, not by
+/// [`BindingRegistry`] lifecycle transitions. The prefix is dropped before its
+/// binding pin so its provider context is still alive during teardown. Phase 4
+/// owns stream ordering and partial-failure-safe physical release.
 #[derive(Debug)]
 pub struct BoundSharedPrefix {
-    binding: MemoryBinding,
     prefix: Box<dyn SharedDevicePrefix>,
+    binding: MemoryBinding,
 }
 
 impl BoundSharedPrefix {
@@ -1616,4 +1659,65 @@ fn validate_binding_identity(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    use crate::{BindingResource, HostAllocator};
+
+    use super::*;
+
+    #[test]
+    fn failed_select_restores_the_prior_healthy_selection() {
+        let registry = BindingRegistry::new().unwrap();
+        let context = registry
+            .register_provider_context(DeviceKey::HOST, Arc::new(()) as Arc<dyn BindingResource>)
+            .unwrap();
+        let authority = registry
+            .register_authority(DeviceKey::HOST, Arc::new(()) as Arc<dyn BindingResource>)
+            .unwrap();
+        let prior = registry
+            .register_allocator(
+                context,
+                authority,
+                Arc::new(HostAllocator) as Arc<dyn DeviceAllocator>,
+            )
+            .unwrap();
+        let candidate = registry
+            .register_allocator(
+                context,
+                authority,
+                Arc::new(HostAllocator) as Arc<dyn DeviceAllocator>,
+            )
+            .unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        *registry.inner.select_after_validation_hook.lock().unwrap() =
+            Some(SelectAfterValidationHook {
+                mechanism: candidate.identity,
+                entered: Arc::clone(&entered),
+                resume: Arc::clone(&resume),
+            });
+
+        let selecting_registry = registry.clone();
+        let selecting = thread::spawn(move || selecting_registry.select(candidate));
+        entered.wait();
+        registry.retire(candidate).unwrap();
+        resume.wait();
+
+        let error = selecting.join().unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            BindingError::InactiveMechanism {
+                mechanism,
+                lifecycle: MechanismLifecycle::Retired,
+                operation: "selecting a mechanism",
+            } if mechanism == candidate.identity
+        ));
+        let selected = registry.bind(DeviceKey::HOST).unwrap();
+        assert_eq!(selected.identity().mechanism(), prior.identity);
+    }
 }

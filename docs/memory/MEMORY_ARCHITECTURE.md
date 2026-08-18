@@ -1697,7 +1697,9 @@ capability handles clone that same binding. Dropping a session/EP front-end or
 the registry therefore cannot destroy the context while any bound metadata or
 active operation still references it. `BoundAllocation` has no `Drop` release;
 whole-allocation release remains explicit through `MemoryBinding::release` and
-the original `DeviceAllocator`.
+the original `DeviceAllocator`. Phase 3 calls canonical `deallocate` and does
+not expose the EP's mapped-attribution refund from `deallocate_with_unmapped`;
+EP adoption must wait for Phase-4 accounting reconciliation.
 
 Changing the selected mechanism affects only later `bind(device)` calls. An old
 binding remains pinned to its original mechanism and explicitly releases there.
@@ -1734,7 +1736,10 @@ step after mechanism registrations are quiescent and removed.
 
 Phase 3 adds no deferred-free queue, fence/event scheduling, owning allocation
 RAII, physical-release completeness state, partial-unmap recovery, quarantine,
-or pointer-only retry API. Those remain Phase 4 work.
+or pointer-only retry API. `BoundSharedPrefix` teardown is still drop-driven,
+not lifecycle-gated by the registry; field order only guarantees that its
+provider-context/resource pin outlives physical-prefix destruction. True
+stream-ordered, partial-failure-safe teardown remains Phase 4 work.
 
 ### 1.2 Two directions, both backends
 

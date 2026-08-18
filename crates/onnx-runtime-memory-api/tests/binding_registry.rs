@@ -51,6 +51,111 @@ impl SharedDevicePrefix for TestPrefix {
 }
 
 #[derive(Debug)]
+struct ContextDropFlag {
+    released: Arc<AtomicBool>,
+}
+
+impl Drop for ContextDropFlag {
+    fn drop(&mut self) {
+        self.released.store(true, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug)]
+struct ObservedPrefix {
+    bytes: usize,
+    context_released: Arc<AtomicBool>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for ObservedPrefix {
+    fn drop(&mut self) {
+        assert!(
+            !self.context_released.load(Ordering::SeqCst),
+            "shared-prefix teardown ran after its provider context pin was released"
+        );
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+impl SharedDevicePrefix for ObservedPrefix {
+    fn device_ptr(&self) -> u64 {
+        0x2000
+    }
+
+    fn committed_physical_bytes(&self) -> u64 {
+        self.bytes as u64
+    }
+
+    fn mapped_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn requested_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[derive(Debug)]
+struct DropOrderMechanism {
+    context_released: Arc<AtomicBool>,
+    prefix_dropped: Arc<AtomicBool>,
+}
+
+impl DeviceAllocator for DropOrderMechanism {
+    fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
+        HostAllocator.allocate(bytes, align)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+        // SAFETY: forwarded unchanged from this method's contract.
+        unsafe { HostAllocator.deallocate(ptr, bytes, align) };
+    }
+
+    fn device(&self) -> DeviceKey {
+        DeviceKey::HOST
+    }
+
+    fn as_shared_mapping(&self) -> Option<&dyn SharedMapping> {
+        Some(self)
+    }
+}
+
+impl SharedMapping for DropOrderMechanism {
+    fn create_shared_prefix(
+        &self,
+        bytes: usize,
+    ) -> Result<Box<dyn SharedDevicePrefix>, MemoryError> {
+        Ok(Box::new(ObservedPrefix {
+            bytes,
+            context_released: Arc::clone(&self.context_released),
+            dropped: Arc::clone(&self.prefix_dropped),
+        }))
+    }
+
+    fn incremental_owned_bytes_for_shared_prefix(
+        &self,
+        prefix: &dyn SharedDevicePrefix,
+    ) -> Result<u64, MemoryError> {
+        Ok(prefix.committed_physical_bytes())
+    }
+
+    fn commit_shared_prefix(
+        &self,
+        _prefix: &dyn SharedDevicePrefix,
+        _ptr: NonNull<u8>,
+        _allocation_bytes: usize,
+        _byte_offset: usize,
+    ) -> Result<SharedPrefixCommitInfo, MemoryError> {
+        Ok(SharedPrefixCommitInfo::default())
+    }
+}
+
+#[derive(Debug)]
 struct TestMechanism {
     device: DeviceKey,
     allocations: AtomicUsize,
@@ -576,6 +681,54 @@ fn shared_prefix_and_allocation_must_have_the_same_binding() {
         operations_before
     );
     first.release(allocation).unwrap();
+}
+
+#[test]
+fn shared_prefix_drops_before_context_pin_after_terminal_registry_teardown() {
+    let context_released = Arc::new(AtomicBool::new(false));
+    let prefix_dropped = Arc::new(AtomicBool::new(false));
+    let registry = BindingRegistry::new().unwrap();
+    let context = registry
+        .register_provider_context(
+            DeviceKey::HOST,
+            Arc::new(ContextDropFlag {
+                released: Arc::clone(&context_released),
+            }) as Arc<dyn BindingResource>,
+        )
+        .unwrap();
+    let authority = registry
+        .register_authority(DeviceKey::HOST, Arc::new(()) as Arc<dyn BindingResource>)
+        .unwrap();
+    let mechanism = registry
+        .register_allocator(
+            context,
+            authority,
+            Arc::new(DropOrderMechanism {
+                context_released: Arc::clone(&context_released),
+                prefix_dropped: Arc::clone(&prefix_dropped),
+            }) as Arc<dyn DeviceAllocator>,
+        )
+        .unwrap();
+    let binding = registry.bind(DeviceKey::HOST).unwrap();
+    let mapping = binding.shared_mapping().unwrap().unwrap();
+    let prefix = mapping.create_shared_prefix(64).unwrap();
+    drop(mapping);
+    drop(binding);
+
+    registry
+        .invalidate_device(DeviceKey::HOST, "drop-order regression")
+        .unwrap();
+    registry.confirm_context_terminated(context).unwrap();
+    registry.remove(mechanism).unwrap();
+    registry.remove_provider_context(context).unwrap();
+    registry.remove_authority(authority).unwrap();
+    drop(registry);
+    assert!(!prefix_dropped.load(Ordering::SeqCst));
+    assert!(!context_released.load(Ordering::SeqCst));
+
+    drop(prefix);
+    assert!(prefix_dropped.load(Ordering::SeqCst));
+    assert!(context_released.load(Ordering::SeqCst));
 }
 
 #[test]
