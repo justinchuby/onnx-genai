@@ -680,12 +680,13 @@ fn print_weight_offload_observability(emitted_tokens: u64) {
     print_weight_offload_amortization(&stats, emitted_tokens);
     println!(
         "weight_offload_timing: materialize_ms={:.3} htod_ms={:.3} \
-         admit_sync_ms={:.3} vram_alloc_ms={:.3} vram_free_ms={:.3}",
+         admit_sync_ms={:.3} vram_alloc_ms={:.3} vram_free_ms={:.3} vram_free_sync_ms={:.3}",
         stats.materialize_ns as f64 / 1_000_000.0,
         stats.htod_ns as f64 / 1_000_000.0,
         stats.admit_sync_ns as f64 / 1_000_000.0,
         stats.vram_alloc_ns as f64 / 1_000_000.0,
-        stats.vram_free_ns as f64 / 1_000_000.0
+        stats.vram_free_ns as f64 / 1_000_000.0,
+        stats.vram_free_sync_ns as f64 / 1_000_000.0
     );
     println!(
         "weight_offload_physical: budget_bytes={} mapped_physical_bytes={} \
@@ -1095,7 +1096,11 @@ fn run_native_decode_batch_sweep(
             let median_ms = sorted[sorted.len() / 2];
             let min_ms = sorted[0];
             let max_ms = sorted[sorted.len() - 1];
-            let per_row_tok_s = if median_ms > 0.0 { 1000.0 / median_ms } else { 0.0 };
+            let per_row_tok_s = if median_ms > 0.0 {
+                1000.0 / median_ms
+            } else {
+                0.0
+            };
             let aggregate_tok_s = per_row_tok_s * batch as f64;
             println!(
                 "native_decode_batch_throughput: batch={batch} steps={tokens} \
