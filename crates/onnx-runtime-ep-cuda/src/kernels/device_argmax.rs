@@ -50,16 +50,24 @@ __device__ __forceinline__ void argmax_update(
     float candidate,
     unsigned int candidate_index,
     float& best,
-    unsigned int& best_index) {
-  // Ties resolve to the LOWEST index, matching the canonical ONNX ArgMax
-  // operator (select_last_index=false keeps the first extremal element) and the
-  // host greedy references `sample_greedy` / `argmax_logits_tensor`, which keep
-  // the lowest token id on ties. This is the base-decode / ORT byte-identity
-  // contract. The comparison is on the global index value, so this rule holds
-  // identically across the warp, block, and finalize reductions regardless of
-  // lane origin (strict-improve on value, else keep the lower global index).
-  if (candidate > best ||
-      (candidate == best && candidate_index < best_index)) {
+    unsigned int& best_index,
+    unsigned int select_last) {
+  // Tie-break policy is selected by `select_last`:
+  //   select_last == 0 -> ties resolve to the LOWEST index, matching the
+  //     canonical ONNX ArgMax operator (select_last_index=false keeps the first
+  //     extremal element) and the host greedy references `sample_greedy` /
+  //     `argmax_logits_tensor`, which keep the lowest token id on ties. This is
+  //     the base-decode / ORT byte-identity contract.
+  //   select_last != 0 -> ties resolve to the HIGHEST index, matching
+  //     `Iterator::max_by` (Rust returns the LAST maximal element on ties) as
+  //     used by the engine/reference greedy paths (`state.rs` argmax probes),
+  //     and ONNX ArgMax with select_last_index=true.
+  // The comparison is on the global index value, so the rule holds identically
+  // across the warp, block, and finalize reductions regardless of lane origin
+  // (strict-improve on value, else keep the lower/higher global index).
+  bool prefer_index =
+      select_last ? (candidate_index > best_index) : (candidate_index < best_index);
+  if (candidate > best || (candidate == best && prefer_index)) {
     best = candidate;
     best_index = candidate_index;
   }
@@ -67,12 +75,13 @@ __device__ __forceinline__ void argmax_update(
 
 __device__ __forceinline__ void warp_argmax(
     float& best,
-    unsigned int& best_index) {
+    unsigned int& best_index,
+    unsigned int select_last) {
   for (unsigned int offset = 16; offset > 0; offset >>= 1) {
     float candidate = __shfl_down_sync(0xffffffffu, best, offset);
     unsigned int candidate_index =
         __shfl_down_sync(0xffffffffu, best_index, offset);
-    argmax_update(candidate, candidate_index, best, best_index);
+    argmax_update(candidate, candidate_index, best, best_index, select_last);
   }
 }
 
@@ -81,7 +90,8 @@ __device__ __forceinline__ void greedy_argmax_partials_impl(
     const T* logits,
     unsigned long long elements,
     float* partial_values,
-    unsigned int* partial_indices) {
+    unsigned int* partial_indices,
+    unsigned int select_last) {
   // One sequence per grid row (blockIdx.y); `gridDim.x` blocks cooperatively
   // reduce that sequence's `elements` contiguous logits. Sequence `s` reads
   // `logits[s*elements + ..]` and writes its `gridDim.x` partials at
@@ -102,10 +112,10 @@ __device__ __forceinline__ void greedy_argmax_partials_impl(
     float value = argmax_load<T>(seq_logits[i]);
     if (isnan(value)) continue;
     unsigned int index = static_cast<unsigned int>(i);
-    argmax_update(value, index, best, best_index);
+    argmax_update(value, index, best, best_index, select_last);
   }
 
-  warp_argmax(best, best_index);
+  warp_argmax(best, best_index, select_last);
   __shared__ float warp_values[32];
   __shared__ unsigned int warp_indices[32];
   unsigned int lane = threadIdx.x & 31;
@@ -120,7 +130,7 @@ __device__ __forceinline__ void greedy_argmax_partials_impl(
     unsigned int warp_count = (blockDim.x + 31) >> 5;
     best = lane < warp_count ? warp_values[lane] : -1.0f / 0.0f;
     best_index = lane < warp_count ? warp_indices[lane] : 0;
-    warp_argmax(best, best_index);
+    warp_argmax(best, best_index, select_last);
     if (lane == 0) {
       seq_values[blockIdx.x] = best;
       seq_indices[blockIdx.x] = best_index;
@@ -132,18 +142,20 @@ extern "C" __global__ void greedy_argmax_partials_f32(
     const float* logits,
     unsigned long long elements,
     float* partial_values,
-    unsigned int* partial_indices) {
+    unsigned int* partial_indices,
+    unsigned int select_last) {
   greedy_argmax_partials_impl<float>(
-      logits, elements, partial_values, partial_indices);
+      logits, elements, partial_values, partial_indices, select_last);
 }
 
 extern "C" __global__ void greedy_argmax_partials_f16(
     const __half* logits,
     unsigned long long elements,
     float* partial_values,
-    unsigned int* partial_indices) {
+    unsigned int* partial_indices,
+    unsigned int select_last) {
   greedy_argmax_partials_impl<__half>(
-      logits, elements, partial_values, partial_indices);
+      logits, elements, partial_values, partial_indices, select_last);
 }
 
 extern "C" __global__ void greedy_argmax_finalize(
@@ -151,7 +163,8 @@ extern "C" __global__ void greedy_argmax_finalize(
     const unsigned int* partial_indices,
     unsigned int partial_count,
     const unsigned int* capture_error,
-    unsigned int* result) {
+    unsigned int* result,
+    unsigned int select_last) {
   // One block per sequence (blockIdx.x). Sequence `s` reduces its own
   // `partial_count` partials at `partial_{values,indices}[s*partial_count + ..]`
   // and writes its token id / capture-error pair at `result[2*s .. 2*s+2]`. At
@@ -164,9 +177,9 @@ extern "C" __global__ void greedy_argmax_finalize(
   float best = -1.0f / 0.0f;
   unsigned int best_index = 0;
   for (unsigned int i = threadIdx.x; i < partial_count; i += blockDim.x) {
-    argmax_update(seq_values[i], seq_indices[i], best, best_index);
+    argmax_update(seq_values[i], seq_indices[i], best, best_index, select_last);
   }
-  warp_argmax(best, best_index);
+  warp_argmax(best, best_index, select_last);
   __shared__ float warp_values[32];
   __shared__ unsigned int warp_indices[32];
   unsigned int lane = threadIdx.x & 31;
@@ -180,7 +193,7 @@ extern "C" __global__ void greedy_argmax_finalize(
     unsigned int warp_count = (blockDim.x + 31) >> 5;
     best = lane < warp_count ? warp_values[lane] : -1.0f / 0.0f;
     best_index = lane < warp_count ? warp_indices[lane] : 0;
-    warp_argmax(best, best_index);
+    warp_argmax(best, best_index, select_last);
     if (lane == 0) {
       result[2 * sequence] = best_index;
       result[2 * sequence + 1] = *capture_error;
@@ -196,6 +209,7 @@ pub(crate) fn launch(
     batch: usize,
     dtype: DataType,
     result: &mut DeviceBuffer,
+    select_last: bool,
 ) -> Result<()> {
     if elements == 0 {
         return Err(EpError::KernelFailed(
@@ -284,12 +298,14 @@ pub(crate) fn launch(
         cuptr(unsafe { scratch_ptr.add(batch * partial_count * std::mem::size_of::<f32>()) });
     let capture_error_ptr = runtime.capture_error_ptr();
     let result_ptr = cuptr(result.as_mut_ptr());
+    let select_last_flag: u32 = u32::from(select_last);
     let mut builder = runtime.stream().launch_builder(&partial_function);
     builder
         .arg(&logits_ptr)
         .arg(&elements)
         .arg(&partial_values_ptr)
-        .arg(&partial_indices_ptr);
+        .arg(&partial_indices_ptr)
+        .arg(&select_last_flag);
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim: (partial_count as u32, batch as u32, 1),
@@ -306,7 +322,8 @@ pub(crate) fn launch(
         .arg(&partial_indices_ptr)
         .arg(&partial_count)
         .arg(&capture_error_ptr)
-        .arg(&result_ptr);
+        .arg(&result_ptr)
+        .arg(&select_last_flag);
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim: (batch as u32, 1, 1),
@@ -321,7 +338,7 @@ pub(crate) fn launch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onnx_runtime_ep_api::{EpConfig, ExecutionProvider};
+    use onnx_runtime_ep_api::{ArgmaxTieBreak, EpConfig, ExecutionProvider};
 
     use crate::CudaExecutionProvider;
 
@@ -373,7 +390,7 @@ mod tests {
         ep.copy_to_host(input, &mut scratch).unwrap();
     }
 
-    fn run_case(ep: &CudaExecutionProvider, logits: &[f32]) -> [u32; 2] {
+    fn run_case(ep: &CudaExecutionProvider, logits: &[f32], tie_break: ArgmaxTieBreak) -> [u32; 2] {
         let bytes = logits
             .iter()
             .flat_map(|value| value.to_ne_bytes())
@@ -382,7 +399,7 @@ mod tests {
         let mut output = ep.allocate(result_bytes(logits.len(), 1), 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
         ensure_input_coherent(ep, &input, bytes.len());
-        ep.device_argmax(&input, logits.len(), 1, DataType::Float32, &mut output)
+        ep.device_argmax(&input, logits.len(), 1, DataType::Float32, &mut output, tie_break)
             .unwrap();
         let mut result = [0_u8; RESULT_BYTES];
         ep.copy_to_host(&output, &mut result).unwrap();
@@ -398,7 +415,7 @@ mod tests {
     /// Run the argmax over `batch` sequences of `vocab` f32 logits laid out
     /// row-major (`rows.concat()`), returning the `(token_id, capture_error)`
     /// pair per sequence read back from the `2 × batch`-word header.
-    fn run_batch_case(ep: &CudaExecutionProvider, rows: &[Vec<f32>]) -> Vec<[u32; 2]> {
+    fn run_batch_case(ep: &CudaExecutionProvider, rows: &[Vec<f32>], tie_break: ArgmaxTieBreak) -> Vec<[u32; 2]> {
         let batch = rows.len();
         let vocab = rows[0].len();
         assert!(rows.iter().all(|row| row.len() == vocab));
@@ -411,7 +428,7 @@ mod tests {
         let mut output = ep.allocate(result_bytes(vocab, batch), 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
         ensure_input_coherent(ep, &input, bytes.len());
-        ep.device_argmax(&input, vocab, batch, DataType::Float32, &mut output)
+        ep.device_argmax(&input, vocab, batch, DataType::Float32, &mut output, tie_break)
             .unwrap();
         let mut header = vec![0_u8; batch * RESULT_BYTES];
         ep.copy_to_host(&output, &mut header).unwrap();
@@ -429,7 +446,7 @@ mod tests {
         out
     }
 
-    fn run_case_f16(ep: &CudaExecutionProvider, logits: &[f32]) -> [u32; 2] {
+    fn run_case_f16(ep: &CudaExecutionProvider, logits: &[f32], tie_break: ArgmaxTieBreak) -> [u32; 2] {
         let bytes = logits
             .iter()
             .flat_map(|&value| half::f16::from_f32(value).to_bits().to_ne_bytes())
@@ -438,7 +455,7 @@ mod tests {
         let mut output = ep.allocate(result_bytes(logits.len(), 1), 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
         ensure_input_coherent(ep, &input, bytes.len());
-        ep.device_argmax(&input, logits.len(), 1, DataType::Float16, &mut output)
+        ep.device_argmax(&input, logits.len(), 1, DataType::Float16, &mut output, tie_break)
             .unwrap();
         let mut result = [0_u8; RESULT_BYTES];
         ep.copy_to_host(&output, &mut result).unwrap();
@@ -454,7 +471,7 @@ mod tests {
     /// Batched f16 sibling of [`run_batch_case`]: rounds every row to fp16, runs
     /// the whole `batch` in one launch, and reads back the per-row header. Used
     /// by the tie-break gate to exercise the f16 partials kernel over M rows.
-    fn run_batch_case_f16(ep: &CudaExecutionProvider, rows: &[Vec<f32>]) -> Vec<[u32; 2]> {
+    fn run_batch_case_f16(ep: &CudaExecutionProvider, rows: &[Vec<f32>], tie_break: ArgmaxTieBreak) -> Vec<[u32; 2]> {
         let batch = rows.len();
         let vocab = rows[0].len();
         assert!(rows.iter().all(|row| row.len() == vocab));
@@ -467,7 +484,7 @@ mod tests {
         let mut output = ep.allocate(result_bytes(vocab, batch), 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
         ensure_input_coherent(ep, &input, bytes.len());
-        ep.device_argmax(&input, vocab, batch, DataType::Float16, &mut output)
+        ep.device_argmax(&input, vocab, batch, DataType::Float16, &mut output, tie_break)
             .unwrap();
         let mut header = vec![0_u8; batch * RESULT_BYTES];
         ep.copy_to_host(&output, &mut header).unwrap();
@@ -498,11 +515,11 @@ mod tests {
         logits[17] = 9.0;
         logits[93_001] = 9.0;
         logits[77] = f32::NAN;
-        let result = run_case(&ep, &logits);
+        let result = run_case(&ep, &logits, ArgmaxTieBreak::LowestIndex);
         assert_eq!(result, [host_argmax(&logits), 0]);
 
         let all_non_finite = [f32::NAN, f32::NEG_INFINITY, f32::NAN];
-        let result = run_case(&ep, &all_non_finite);
+        let result = run_case(&ep, &all_non_finite, ArgmaxTieBreak::LowestIndex);
         assert_eq!(result, [host_argmax(&all_non_finite), 0]);
 
         let capture_error = 0x40_u32;
@@ -514,7 +531,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let result = run_case(&ep, &[1.0, 5.0, 3.0]);
+        let result = run_case(&ep, &[1.0, 5.0, 3.0], ArgmaxTieBreak::LowestIndex);
         assert_eq!(result, [1, capture_error]);
         ep.runtime().reset_capture_error().unwrap();
     }
@@ -533,11 +550,11 @@ mod tests {
             .iter()
             .map(|&value| half::f16::from_f32(value).to_f32())
             .collect::<Vec<_>>();
-        let result = run_case_f16(&ep, &logits);
+        let result = run_case_f16(&ep, &logits, ArgmaxTieBreak::LowestIndex);
         assert_eq!(result, [host_argmax(&rounded), 0]);
 
         let all_non_finite = [f32::NAN, f32::NEG_INFINITY, f32::NAN];
-        let result = run_case_f16(&ep, &all_non_finite);
+        let result = run_case_f16(&ep, &all_non_finite, ArgmaxTieBreak::LowestIndex);
         assert_eq!(result, [host_argmax(&all_non_finite), 0]);
     }
 
@@ -569,7 +586,7 @@ mod tests {
         rows[3][900] = 9.0; // tie {900, 2049} → lower index 900 must win
         let expected = [17_u32, 2500, 128, 900];
 
-        let batched = run_batch_case(&ep, &rows);
+        let batched = run_batch_case(&ep, &rows, ArgmaxTieBreak::LowestIndex);
         assert_eq!(batched.len(), rows.len());
         for (row, (result, &want)) in batched.iter().zip(expected.iter()).enumerate() {
             assert_eq!(
@@ -580,7 +597,7 @@ mod tests {
             assert_eq!(result[1], 0, "row {row} unexpected capture-error flag");
             // Each batched row must equal a standalone single-sequence argmax of
             // the same logits — the byte-identity contract, row by row.
-            let solo = run_case(&ep, &rows[row]);
+            let solo = run_case(&ep, &rows[row], ArgmaxTieBreak::LowestIndex);
             assert_eq!(
                 *result, solo,
                 "batched row {row} diverged from the single-sequence argmax"
@@ -625,8 +642,8 @@ mod tests {
                         .collect()
                 })
                 .collect();
-            let random_f32 = run_batch_case(&ep, &random_rows);
-            let random_f16 = run_batch_case_f16(&ep, &random_rows);
+            let random_f32 = run_batch_case(&ep, &random_rows, ArgmaxTieBreak::LowestIndex);
+            let random_f16 = run_batch_case_f16(&ep, &random_rows, ArgmaxTieBreak::LowestIndex);
             for (row, (f32_got, f16_got)) in random_f32.iter().zip(random_f16.iter()).enumerate() {
                 let want = host_argmax(&random_rows[row]);
                 assert_eq!(
@@ -665,8 +682,8 @@ mod tests {
                 })
                 .collect();
             let tie_expected: Vec<u32> = (0..m).map(|row| (3 + row * 7) as u32).collect();
-            let tie_f32 = run_batch_case(&ep, &tie_rows);
-            let tie_f16 = run_batch_case_f16(&ep, &tie_rows);
+            let tie_f32 = run_batch_case(&ep, &tie_rows, ArgmaxTieBreak::LowestIndex);
+            let tie_f16 = run_batch_case_f16(&ep, &tie_rows, ArgmaxTieBreak::LowestIndex);
             for (row, (f32_got, f16_got)) in tie_f32.iter().zip(tie_f16.iter()).enumerate() {
                 let want = tie_expected[row];
                 assert_eq!(
@@ -722,8 +739,8 @@ mod tests {
                     *cfg.iter().min().unwrap() as u32
                 })
                 .collect();
-            let boundary_f32 = run_batch_case(&ep, &boundary_rows);
-            let boundary_f16 = run_batch_case_f16(&ep, &boundary_rows);
+            let boundary_f32 = run_batch_case(&ep, &boundary_rows, ArgmaxTieBreak::LowestIndex);
+            let boundary_f16 = run_batch_case_f16(&ep, &boundary_rows, ArgmaxTieBreak::LowestIndex);
             for (row, (f32_got, f16_got)) in
                 boundary_f32.iter().zip(boundary_f16.iter()).enumerate()
             {
@@ -774,8 +791,8 @@ mod tests {
                 })
                 .collect();
             let want: Vec<u32> = (0..m).map(|row| (5 + row * 3) as u32).collect();
-            let f32_out = run_batch_case(&ep, &rows);
-            let f16_out = run_batch_case_f16(&ep, &rows);
+            let f32_out = run_batch_case(&ep, &rows, ArgmaxTieBreak::LowestIndex);
+            let f16_out = run_batch_case_f16(&ep, &rows, ArgmaxTieBreak::LowestIndex);
             for (row, (g32, g16)) in f32_out.iter().zip(f16_out.iter()).enumerate() {
                 // The device kernel, the host greedy reference, and the expected
                 // lowest index must all agree.
@@ -792,5 +809,138 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Host reference for the HIGHEST-index tie-break, mirroring `argmax_update`
+    /// with `select_last != 0` exactly: skip NaN, keep a running max from -inf,
+    /// and update on a strict increase OR on an exact tie at a HIGHER index. This
+    /// is the `Iterator::max_by` convention (Rust returns the LAST maximal
+    /// element) used by the engine/reference greedy `max_by` probes, and ONNX
+    /// ArgMax with `select_last_index=true`.
+    fn host_argmax_highest(logits: &[f32]) -> u32 {
+        let mut best = f32::NEG_INFINITY;
+        let mut best_index = 0u32;
+        for (index, &value) in logits.iter().enumerate() {
+            if value.is_nan() {
+                continue;
+            }
+            let idx = index as u32;
+            if value > best || (value == best && idx > best_index) {
+                best = value;
+                best_index = idx;
+            }
+        }
+        best_index
+    }
+
+    /// Deliverable-1 focused gate: with `ArgmaxTieBreak::HighestIndex` the device
+    /// argmax must select the HIGHEST tied index on DELIBERATE fp16 ULP ties, and
+    /// match the host highest-index reference (`Iterator::max_by` convention). The
+    /// same rows under `LowestIndex` must still select the lowest tied index, so
+    /// the two policies are provably distinct on the identical inputs (a kernel
+    /// that ignored the flag would fail one of the two assertions).
+    ///
+    /// The maxima are placed at fp16-exact values (`half::f16::from_f32` round
+    /// trip) at indices spanning multiple 1024-wide reduction partitions, so the
+    /// cross-partition finalize — not just the in-block reduction — must honour
+    /// the tie-break. Covers M∈{1,4,8} through both the f32 and f16 kernels.
+    #[test]
+    fn device_argmax_highest_index_tiebreak_matches_host_on_fp16_ulp_ties() {
+        let Some(ep) = gpu() else { return };
+        let vocab = 152_064;
+        for &m in &[1_usize, 4, 8] {
+            let mut rows: Vec<Vec<f32>> = Vec::with_capacity(m);
+            let mut tie_indices: Vec<[usize; 4]> = Vec::with_capacity(m);
+            for row in 0..m {
+                // Baseline is an fp16-exact non-maximal value; the tied maxima are
+                // a single fp16 value repeated at four indices, so every tie is a
+                // genuine bit-for-bit fp16 ULP tie (not an f32-only near-equal).
+                let base = half::f16::from_f32(0.5).to_f32();
+                let peak = half::f16::from_f32(2.0).to_f32();
+                let mut logits = vec![base; vocab];
+                // Four equal maxima per row across distinct reduction partitions;
+                // offsets per row falsify a shared/globally wrong reduction.
+                let lo = 3 + row * 5;
+                let a = 40_000 + row * 13;
+                let b = 90_000 + row * 17;
+                let hi = vocab - 2 - row * 11; // highest → must win under HighestIndex
+                for &p in &[lo, a, b, hi] {
+                    logits[p] = peak;
+                }
+                tie_indices.push([lo, a, b, hi]);
+                rows.push(logits);
+            }
+
+            let hi_f32 = run_batch_case(&ep, &rows, ArgmaxTieBreak::HighestIndex);
+            let hi_f16 = run_batch_case_f16(&ep, &rows, ArgmaxTieBreak::HighestIndex);
+            let lo_f32 = run_batch_case(&ep, &rows, ArgmaxTieBreak::LowestIndex);
+            for (row, ties) in tie_indices.iter().enumerate() {
+                let want_hi = *ties.iter().max().unwrap() as u32;
+                let want_lo = *ties.iter().min().unwrap() as u32;
+                // Host oracle agrees with the constructed expectation.
+                assert_eq!(
+                    host_argmax_highest(&rows[row]),
+                    want_hi,
+                    "M={m} row {row}: host highest-index reference disagrees"
+                );
+                assert_eq!(
+                    host_argmax(&rows[row]),
+                    want_lo,
+                    "M={m} row {row}: host lowest-index reference disagrees"
+                );
+                // Device HighestIndex selects the highest tied index (f32 + f16).
+                assert_eq!(
+                    hi_f32[row][0], want_hi,
+                    "M={m} row {row}: f32 HighestIndex device argmax {} != host highest {want_hi}",
+                    hi_f32[row][0]
+                );
+                assert_eq!(hi_f32[row][1], 0, "M={m} row {row}: unexpected capture-error");
+                assert_eq!(
+                    hi_f16[row][0], want_hi,
+                    "M={m} row {row}: f16 HighestIndex device argmax {} != host highest {want_hi}",
+                    hi_f16[row][0]
+                );
+                // The identical rows under LowestIndex still select the lowest
+                // tied index — proving the flag changes selection, not the input.
+                assert_eq!(
+                    lo_f32[row][0], want_lo,
+                    "M={m} row {row}: f32 LowestIndex device argmax {} != host lowest {want_lo}",
+                    lo_f32[row][0]
+                );
+                assert_ne!(
+                    want_hi, want_lo,
+                    "M={m} row {row}: test bug — highest and lowest tied indices must differ"
+                );
+            }
+        }
+    }
+
+    /// Regression lock for the tie-break invariant so a future kernel edit cannot
+    /// silently drop the `select_last` flag: for one fixed row with three equal
+    /// maxima, `LowestIndex` must return the lowest and `HighestIndex` the
+    /// highest, on both the f32 and f16 kernels and the single-sequence path.
+    #[test]
+    fn device_argmax_tiebreak_flag_selects_low_vs_high_regression() {
+        let Some(ep) = gpu() else { return };
+        let vocab = 4096;
+        let peak = half::f16::from_f32(1.5).to_f32();
+        let base = half::f16::from_f32(0.1).to_f32();
+        let mut logits = vec![base; vocab];
+        let (lo, mid, hi) = (7_usize, 2048_usize, 4090_usize);
+        for &p in &[lo, mid, hi] {
+            logits[p] = peak;
+        }
+
+        let low_f32 = run_case(&ep, &logits, ArgmaxTieBreak::LowestIndex);
+        let high_f32 = run_case(&ep, &logits, ArgmaxTieBreak::HighestIndex);
+        let low_f16 = run_case_f16(&ep, &logits, ArgmaxTieBreak::LowestIndex);
+        let high_f16 = run_case_f16(&ep, &logits, ArgmaxTieBreak::HighestIndex);
+
+        assert_eq!(low_f32[0], lo as u32, "f32 lowest tie-break");
+        assert_eq!(high_f32[0], hi as u32, "f32 highest tie-break");
+        assert_eq!(low_f16[0], lo as u32, "f16 lowest tie-break");
+        assert_eq!(high_f16[0], hi as u32, "f16 highest tie-break");
+        assert_eq!(host_argmax(&logits), lo as u32, "host lowest reference");
+        assert_eq!(host_argmax_highest(&logits), hi as u32, "host highest reference");
     }
 }
