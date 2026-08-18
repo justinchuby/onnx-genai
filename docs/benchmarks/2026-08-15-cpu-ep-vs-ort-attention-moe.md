@@ -2476,3 +2476,83 @@ Two things are worth recording about writing it:
   instead of leaving a bit comparison that is trivially true. This is the third vacuous
   or near-vacuous test caught in this effort (§28.2 has the other two); assume the
   default state of a new test is vacuous until a falsifier has been run against it.
+
+## 30. Phase 10: the profiler was charging the run for its own instrument (#1226)
+
+### 30.1 The defect
+
+`activation_memory_planning_enabled()` returned `phase_profile::enabled()`, so the
+executor's activation-memory planner ran on every run whenever phase profiling was on.
+The planner rebuilds the view map and re-plans every activation each run - work the
+shipped runtime never does. `--phase-profile` therefore perturbed the run it was
+measuring and reported its own cost back as a phase of that run,
+`run_scoped.activation_memory_plan`, which no unprofiled run ever pays.
+
+The planner now has its own gate. `--phase-profile` drives the profiler only;
+`NXRT_EXEC_PHASE_PROFILE=1` in the environment still enables both, so the CLI memory
+report keeps its stats; `NXRT_ACTIVATION_MEMORY_PLAN=1` opts in without profiling.
+
+The CUDA step profiler switched the planner on as a side effect of enabling phase
+accounting, taxing the very decode steps it exists to time. That coupling is gone.
+
+### 30.2 Magnitude, and two withdrawn claims
+
+The planner's own span reads **1.9-6.0 us per run**. Removing it lowers `native_min` on
+`sm_decode_h32_kv4096` from **0.065 ms to 0.063 ms** - median of 15 interleaved
+repetitions, 300 runs each, single thread, both arms in one loop, 13 of 15 favouring
+the fixed arm. About **3%**, in line with the span.
+
+The first version of this section, and of the PR, claimed a **35%** inflation
+(0.065 -> 0.088 ms, ratio 1.023 -> 1.080) and claimed the planner also polluted the
+adjacent `exec_kernel.compute` figure (84.5 vs 60.3 us/call). **Both are withdrawn.**
+Review could not reproduce either, and a properly interleaved re-measurement showed
+why: this host is bimodal under contention, the 0.065/0.088 ms split appears in
+**both** arms, and `exec_kernel.compute` swings 75-168 us/call regardless of the
+planner.
+
+### 30.3 The methodology lesson, which is the point of this section
+
+The withdrawn numbers were produced by running arm A three times, then arm B three
+times, inside one shell loop - and reading the *mean* `native=` field. Every arm-vs-arm
+number in this document is supposed to come from interleaved repetitions in one
+invocation, precisely because this host drifts. I wrote the loop that way, saw a clean
+35% separation, and believed it, because the separation was large and the story was
+satisfying. It was the machine changing state between the two halves of the loop.
+
+Three things that would have caught it, and are now the standing rule for this
+document:
+
+* **Interleave at the innermost level.** A B A B A B, not A A A B B B. The second form
+  cannot distinguish an arm effect from a time effect, and on this host time effects
+  are large.
+* **Prefer `native_min` to the mean for small graphs.** The minimum over 300 runs is
+  the least contaminated estimator available when the noise is one-sided, which
+  contention noise is. Switching to it turned an unstable 0.065-vs-0.088 into a stable
+  0.065-vs-0.063.
+* **Distrust a result proportional to how much you like it.** A 35% win from deleting
+  one planning call was far larger than the planner's own measured span, and that
+  internal inconsistency - the span said 2-6 us, the wall clock said 23 us - was
+  visible in my own output before review saw it. When the mechanism's measured cost
+  and the claimed effect disagree by an order of magnitude, the effect is wrong.
+
+The change still stands: charging a run for the instrument observing it is a defect
+whatever its size, and the phantom phase made every per-phase attribution taken with
+`--phase-profile` wrong by construction. Section 21's boundary instrument and every
+attribution derived from it were taken under the coupled gate and should be re-read.
+
+### 30.4 A third vacuous test, and why this one was interesting
+
+The first regression test passed, and then still passed when the planner was
+deliberately re-coupled to phase profiling. The gate read `#[cfg(test)] { true }`, so
+the production wiring was the one line no unit test could reach; the test pinned the
+module's parts and not the wiring between them.
+
+Removing the `cfg(test)` override so tests and production share one gate is what made
+it testable, and the two tests that genuinely need the planner now pin the production
+wiring as a side effect of asking for it explicitly. Re-coupling the wiring fails both.
+
+Counting §28.2 and §29.5, that is four vacuous or near-vacuous tests found in this
+effort. Every one of them passed when written. The only thing that separated the real
+tests from the decorative ones was running the falsifier - and in §29.5 even the
+falsifier misfired, which is its own lesson: a falsifier that does not fire is not
+evidence the test is sound until you know *why* it did not fire.
