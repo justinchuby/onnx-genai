@@ -6,15 +6,14 @@ struct Stage2RunState {
     excluded: Option<HashSet<ValueId>>,
 }
 
+/// Whether to run the activation-memory planner during this run.
+///
+/// One path for tests and production. It used to be `#[cfg(test)] true`, which
+/// meant the production wiring - the part that decides whether a run pays for
+/// planning at all - was the one line no unit test could reach, and a test that
+/// re-coupled it to phase profiling still passed.
 fn activation_memory_planning_enabled() -> bool {
-    #[cfg(test)]
-    {
-        true
-    }
-    #[cfg(not(test))]
-    {
-        phase_profile::enabled()
-    }
+    phase_profile::activation_plan_enabled()
 }
 
 impl Executor {

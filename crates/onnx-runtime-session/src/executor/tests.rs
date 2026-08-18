@@ -10,8 +10,9 @@ use super::*;
 
 #[test]
 fn phase_profile_gating_and_accumulation() {
-    // Single test (not two) so the process-global enable flag is never
-    // toggled concurrently by a sibling test under the parallel runner.
+    // The process-global gates have no per-test isolation, so every test that
+    // writes them takes this lock.
+    let _globals = phase_profile::globals_lock();
 
     // Disabled: a span records nothing and never captures a timestamp.
     phase_profile::force_enabled(false);
@@ -54,8 +55,40 @@ fn phase_profile_gating_and_accumulation() {
         "reset must clear this test's accumulated phase stats"
     );
 
+    // Turning on phase profiling must **not** turn on the activation-memory
+    // planner. The planner re-plans every activation on every run - work the
+    // shipped runtime never does - so while `--phase-profile` enabled it the
+    // profiler perturbed the run it was measuring, by about 3% on a softmax
+    // decode, and reported its own cost back as a phase of that run.
+    //
+    // The two gates are separate on purpose: `enable_for_process` (what
+    // `--phase-profile` calls) drives only the profiler, while the planner
+    // reads the environment. Asserted here rather than in a sibling test so
+    // the process-global enable flag stays owned by this one test, per the
+    // note at the top. Skipped when the environment already asks for planning,
+    // because then the separation is not observable.
+    let env_requests_planning = ["NXRT_ACTIVATION_MEMORY_PLAN", "NXRT_EXEC_PHASE_PROFILE"]
+        .iter()
+        .any(|key| std::env::var(key).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")));
+    if !env_requests_planning {
+        phase_profile::force_activation_plan_enabled(false);
+        phase_profile::enable_for_process();
+        assert!(phase_profile::enabled());
+        assert!(
+            !phase_profile::activation_plan_enabled(),
+            "phase profiling must not drag the activation-memory planner in \
+             with it: the planner costs about a third of a small run and would \
+             be charged to the run it is supposed to be measuring"
+        );
+        // The explicit opt-in still works, so the capability is decoupled from
+        // phase profiling rather than lost.
+        phase_profile::enable_activation_plan_for_process();
+        assert!(phase_profile::activation_plan_enabled());
+    }
+
     // Restore the default (disabled) state so other tests stay inert.
     phase_profile::force_enabled(false);
+    phase_profile::force_activation_plan_enabled(false);
 }
 
 // A produced top-level output is handed to the caller by moving its host
@@ -471,6 +504,13 @@ fn compute_in_place_multilayer_decode_residual_is_byte_identical_and_fires() {
 
 #[test]
 fn activation_memory_planner_reports_static_decode_graph_savings() {
+    // The planner is off by default, in tests as in production, so a test that
+    // needs its stats asks for them explicitly. The guard takes the globals
+    // lock (the gate is a process-global atomic) and clears the gate again on
+    // drop, including on panic - leaving it set would let a reader test that
+    // does not take the lock observe a planner this test switched on.
+    let _planner = phase_profile::ActivationPlanForTest::on();
+
     let values = Tensor::from_f32(&[4], &[-2.0, -0.5, 0.5, 2.0]).unwrap();
     let weights = Arc::new(WeightStore::new());
     let ep = auto_detect_cpu_ep().unwrap();
@@ -493,6 +533,13 @@ fn activation_memory_planner_reports_static_decode_graph_savings() {
 
 #[test]
 fn activation_memory_planner_uses_runtime_view_edges() {
+    // The planner is off by default, in tests as in production, so a test that
+    // needs its stats asks for them explicitly. The guard takes the globals
+    // lock (the gate is a process-global atomic) and clears the gate again on
+    // drop, including on panic - leaving it set would let a reader test that
+    // does not take the lock observe a planner this test switched on.
+    let _planner = phase_profile::ActivationPlanForTest::on();
+
     let values = Tensor::from_f32(&[4], &[-2.0, -0.5, 0.5, 2.0]).unwrap();
     let weights = Arc::new(WeightStore::new());
     let ep = auto_detect_cpu_ep().unwrap();

@@ -534,6 +534,27 @@ extern "C" void mlas_compute_softmax_in_place(
         /*ThreadPool=*/nullptr);
 }
 
+// Out-of-place variant: read `input`, write `output`. MLAS's non-log softmax
+// streams `Input -> Output` (max reduce over Input, then `exp(Input - max)`
+// into Output, then rescale Output alone), so the result is *bit-identical* to
+// copying `input` into `output` and calling the in-place form above - it simply
+// skips that full-buffer copy, which is the pass ORT never pays because it hands
+// `MlasComputeSoftmax` the graph input and output buffers directly. `input` and
+// `output` must not overlap.
+extern "C" void mlas_compute_softmax(
+    const float* input,
+    float* output,
+    size_t n,
+    size_t d)
+{
+    MlasComputeSoftmax<float>(
+        input, output, n, d,
+        /*LogSoftmax=*/false,
+        /*SmoothSoftmax=*/false,
+        /*Sink=*/0.0f,
+        /*ThreadPool=*/nullptr);
+}
+
 // ---- Vectorized SiLU -------------------------------------------------------
 // MLAS selects its fused AVX-512F implementation at runtime when available,
 // with a portable logistic-then-multiply fallback on other architectures.

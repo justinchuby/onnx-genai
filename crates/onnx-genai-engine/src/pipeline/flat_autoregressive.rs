@@ -118,8 +118,21 @@ impl PipelineEngine {
 
         let mut options = pipeline_request.request.options.clone();
         options.validate()?;
-        if options.eos_token_id.is_none() {
-            options.eos_token_id = self.tokenizer()?.eos_token_id();
+        if options.stop_on_eos {
+            let eos_token_ids = merge_eos_token_ids(
+                &self.eos_token_ids,
+                &self.tokenizer()?.eos_token_ids(),
+                options.eos_token_id,
+            );
+            if options.eos_token_id.is_none() {
+                options.eos_token_id = eos_token_ids.first().copied();
+            }
+            for id in eos_token_ids {
+                let stop = StopSequence::Tokens(vec![id]);
+                if !options.stop_sequences.contains(&stop) {
+                    options.stop_sequences.push(stop);
+                }
+            }
         }
         let prompt_tokens = tokenize_with(self.tokenizer()?, &pipeline_request.request.prompt)?;
         if prompt_tokens.is_empty() {
@@ -689,5 +702,79 @@ impl PipelineEngine {
         decoder_in_edges
             .iter()
             .any(|(_, port)| port == position_input)
+    }
+}
+
+/// Every end-of-turn token the request should stop on.
+///
+/// Three sources declare one and none of them is authoritative on its own: the
+/// package metadata (which knows the chat template's end-of-turn marker), the
+/// tokenizer (which knows the model's), and the caller (which may pin a
+/// specific one). Taking only the caller's when it is set is what let a
+/// package-declared marker be dropped -- the OpenAI server always supplies an
+/// id, so every request through it ran past the end of its answer and stopped
+/// only on the token budget. Union them; a superfluous stop token costs
+/// nothing, a missing one costs the whole reply.
+///
+/// Order is meaningful: the declared ids come first so that a caller who left
+/// `eos_token_id` unset inherits the package's own marker rather than the
+/// tokenizer's.
+fn merge_eos_token_ids(
+    declared: &[TokenId],
+    from_tokenizer: &[TokenId],
+    from_caller: Option<TokenId>,
+) -> Vec<TokenId> {
+    let mut merged: Vec<TokenId> = declared.to_vec();
+    for id in from_tokenizer.iter().copied().chain(from_caller) {
+        if !merged.contains(&id) {
+            merged.push(id);
+        }
+    }
+    merged
+}
+
+#[cfg(test)]
+mod eos_tests {
+    use super::merge_eos_token_ids;
+
+    #[test]
+    fn a_caller_supplied_eos_does_not_displace_the_declared_one() {
+        assert_eq!(
+            merge_eos_token_ids(&[200012], &[199999], Some(200002)),
+            vec![200012, 199999, 200002],
+            "the package's declared end-of-turn marker must survive a caller that \
+             pins its own id -- dropping it is what made server requests generate \
+             past the end of the answer until they hit the token budget"
+        );
+    }
+
+    #[test]
+    fn the_declared_marker_leads_so_an_unset_caller_inherits_it() {
+        let merged = merge_eos_token_ids(&[200012], &[199999], None);
+        assert_eq!(
+            merged.first().copied(),
+            Some(200012),
+            "callers that leave eos_token_id unset take the first id, so the \
+             package's own marker has to lead the tokenizer's"
+        );
+    }
+
+    #[test]
+    fn duplicates_collapse_across_all_three_sources() {
+        assert_eq!(
+            merge_eos_token_ids(&[7, 7], &[7, 9], Some(9)),
+            vec![7, 7, 9],
+            "de-duplication is against the accumulated set, not within the \
+             declared list, which is left exactly as the package wrote it"
+        );
+    }
+
+    #[test]
+    fn no_declared_marker_leaves_the_other_two_sources_intact() {
+        assert_eq!(
+            merge_eos_token_ids(&[], &[199999], Some(2)),
+            vec![199999, 2]
+        );
+        assert!(merge_eos_token_ids(&[], &[], None).is_empty());
     }
 }
