@@ -255,7 +255,6 @@ pub struct PipelineEngine {
     /// Native decoder retained across sequential requests. Its CUDA KV bindings
     /// stay device-resident in their original dtype (including BF16); `retained`
     /// identifies the exact token prefix those bindings contain.
-    #[cfg(feature = "native-backend")]
     native_retained_decoder: Option<Box<dyn PipelineDecoderComponent>>,
     /// Maximum suffix tokens sent through one native prefill graph invocation.
     /// Declared by `model.runtime_configurable.chunked_prefill`.
@@ -1268,7 +1267,6 @@ impl PipelineEngine {
             )),
             memoizable_components,
             retained: None,
-            #[cfg(feature = "native-backend")]
             native_retained_decoder: None,
             prefill_chunk_size,
             paged,
