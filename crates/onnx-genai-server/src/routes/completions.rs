@@ -1918,6 +1918,17 @@ fn extract_atem_tool_calls(output: &str) -> Vec<serde_json::Value> {
             let Some(parameter_end) = parameters.find(PARAMETER_CLOSE) else {
                 break;
             };
+            // A parameter that opens another parameter before it closes was
+            // opened twice: a value cannot contain a parameter, so the outer
+            // tag is a stray and the inner one is the real parameter. Taking
+            // the outer at its word would swallow the stray tag into the value
+            // and lose the argument the model meant to pass.
+            if let Some(nested) = parameters.find(PARAMETER)
+                && nested < parameter_end
+            {
+                parameters = &parameters[nested..];
+                continue;
+            }
             let raw_value = &parameters[..parameter_end];
             let value = serde_json::from_str(raw_value.trim())
                 .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()));
@@ -2925,6 +2936,64 @@ mod output_budget_tests {
         assert_eq!(
             reserved_output_tokens(&request(json!({"max_tokens": 512})), 4096),
             512
+        );
+    }
+}
+
+#[cfg(test)]
+mod atem_tool_call_parsing_tests {
+    use super::*;
+
+    fn arguments(output: &str) -> serde_json::Value {
+        let calls = parse_tool_calls(output);
+        assert_eq!(calls.len(), 1, "expected one call from {output:?}");
+        serde_json::from_str(&calls[0].function.arguments).expect("arguments")
+    }
+
+    // Observed from OpenCode: the model opened the same parameter twice, and
+    // taking the outer tag at its word swallowed the stray tag into the value,
+    // so the call reached the client with the argument it needed missing.
+    #[test]
+    fn a_parameter_opened_twice_keeps_the_inner_one() {
+        assert_eq!(
+            arguments(concat!(
+                "<atem:invoke name=\"bash\">\n",
+                "<atem:parameter name=\"command\">\n",
+                "<atem:parameter name=\"command\">ls -la</atem:parameter>\n",
+                "</atem:invoke>",
+            )),
+            serde_json::json!({"command": "ls -la"})
+        );
+    }
+
+    // The repair is confined to the parameter that was opened twice; the ones
+    // around it are read exactly as they were written.
+    #[test]
+    fn a_stray_open_tag_does_not_disturb_its_neighbours() {
+        assert_eq!(
+            arguments(concat!(
+                "<atem:invoke name=\"edit\">\n",
+                "<atem:parameter name=\"path\">a.py</atem:parameter>\n",
+                "<atem:parameter name=\"text\">",
+                "<atem:parameter name=\"text\">hi</atem:parameter>\n",
+                "<atem:parameter name=\"count\">2</atem:parameter>\n",
+                "</atem:invoke>",
+            )),
+            serde_json::json!({"path": "a.py", "text": "hi", "count": 2})
+        );
+    }
+
+    // A well-formed call is unaffected, including a value that legitimately
+    // carries angle brackets.
+    #[test]
+    fn a_well_formed_call_is_read_as_written() {
+        assert_eq!(
+            arguments(concat!(
+                "<atem:invoke name=\"bash\">\n",
+                "<atem:parameter name=\"command\">echo \"<b>hi</b>\"</atem:parameter>\n",
+                "</atem:invoke>",
+            )),
+            serde_json::json!({"command": "echo \"<b>hi</b>\""})
         );
     }
 }
