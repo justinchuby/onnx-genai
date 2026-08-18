@@ -70,6 +70,9 @@ KNOWN_UNIMPLEMENTED: dict[str, str] = {
     "dense-decode-megakernel-feasibility.md §9.2; the cp.async double-buffered "
     "weight-load path regressed (−13%, 4 B/lane granularity) and was reverted, "
     "not shipped",
+    "ONNX_GENAI_DECODE_GEMV_PROBE_ROWS": "throwaway ceiling-probe flag in "
+    "2026-08-18-multirow-gemv-ceiling-probe.md, which states the probe was "
+    "reverted after measuring and is not implemented in the shipped code",
     "NXRT_AUTO_INSTALL_CUDA": "referenced in prose about a proposed installer step",
     "NXRT_SQNBIT_PREFILL_MIN": "referenced in prose about a proposed tuning knob",
     "ONNX_GENAI_BASE_URL": "client-side variable read by external tooling, not by this workspace",

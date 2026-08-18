@@ -28,7 +28,8 @@ one predicts ~M× on the GEMV portion. If it is not bandwidth-bound, stop.
   observable rather than hidden behind HtoD.
 - **Instrument — a control-arm ceiling probe (Nsight unavailable on this box).**
   A temporary, byte-invariant probe (`ONNX_GENAI_DECODE_GEMV_PROBE_ROWS=1`,
-  reverted after measuring) caps the looped GEMV to **one** iteration per
+  reverted after measuring — **it is not implemented in the shipped code**, so
+  setting it today does nothing) caps the looped GEMV to **one** iteration per
   MatMulNBits node instead of M. Output for rows 1..M is discarded (timing
   only), so the step models a *perfect multi-row GEMV that reads weights once*.
   The multi-row change **provably cannot beat** this ceiling, so the delta
