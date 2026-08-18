@@ -2648,6 +2648,15 @@ impl DecodeCudaState {
         self.kv_commits_on_demand && self.kv_layout.is_seq_major()
     }
 
+    /// Whether this decoder is on the VMM (commit-on-demand) KV path. Exposed so
+    /// a regression test can assert it is *actually* exercising the VMM path
+    /// rather than silently falling back to the eager path (which would make a
+    /// "VMM reservation" assertion prove nothing).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn kv_commits_on_demand(&self) -> bool {
+        self.kv_commits_on_demand
+    }
+
     /// A conservative signature of every binding's captured-graph dependencies
     /// that KV growth could plausibly disturb: the device pointer (baked into
     /// recorded graph nodes) and the reported physical shape (baked into kernel
@@ -3189,6 +3198,53 @@ impl DecodeCudaState {
         Ok(0..bytes)
     }
 
+    /// Resolve the `usize::MAX` "unbounded" capacity sentinel to a concrete
+    /// upper bound for the **VMM** path's up-front virtual reservation.
+    ///
+    /// The non-VMM path grows KV buckets until the device OOMs, so it never
+    /// needs a concrete `max_len` and `resolve_cuda_kv_capacity` deliberately
+    /// leaves it at `usize::MAX` for a model with no `max_sequence_length`
+    /// metadata (the sentinel from #367). The VMM path, in contrast, reserves
+    /// the full context's *address range* up front, which structurally requires
+    /// a real bound — `usize::MAX` cannot be reserved and today overflows the
+    /// reservation arithmetic (issue #1266).
+    ///
+    /// The largest sequence length the device could *ever* hold is
+    /// `device_free / bytes_per_token`, so reserve exactly that. On the VMM
+    /// path the reservation is **virtual-only** — physical pages are committed
+    /// on demand out of a fixed 64 GiB address arena — so an over-large but
+    /// finite bound is nearly free, and a decode that outgrows it still fails
+    /// at the same physical ceiling the sentinel implied. This resolves the
+    /// bound *only here, only for the VMM reservation*; `capacity.max_len` and
+    /// the non-VMM path that relies on the sentinel are left untouched.
+    ///
+    /// Requires a device free-memory reading. Without one the VMM path has no
+    /// bound to reserve, so this errors with actionable guidance rather than
+    /// overflowing or silently guessing a bound.
+    fn vmm_unbounded_reservation_len(capacity: &CudaKvCapacity) -> anyhow::Result<usize> {
+        let device_memory = capacity.device_memory.as_ref().with_context(|| {
+            format!(
+                "cannot size the VMM-backed CUDA KV reservation for a model with no \
+                 max_sequence_length metadata ({}): the device free-memory query is \
+                 unavailable, so there is no bound to reserve up front. Set \
+                 ONNX_GENAI_CUDA_KV_MAX_LEN or load_with_cuda_kv_max_len to a concrete \
+                 length, or run without ONNX_GENAI_CUDA_VMM to use the grow-on-demand path.",
+                capacity.source
+            )
+        })?;
+        // `bytes_per_token` is validated > 0 in `resolve_cuda_kv_capacity`.
+        let bound = device_memory.free_bytes / capacity.bytes_per_token.max(1);
+        if bound == 0 {
+            bail!(
+                "device has too little free memory ({} bytes) to reserve a VMM-backed \
+                 CUDA KV cache at {} bytes/token",
+                device_memory.free_bytes,
+                capacity.bytes_per_token
+            );
+        }
+        Ok(bound)
+    }
+
     fn full_vmm_kv_allocation_bytes(
         physical_shape: &[usize],
         dtype: DataType,
@@ -3339,11 +3395,23 @@ impl DecodeCudaState {
         // The legacy realloc path (no VMM) also keeps the growing-bucket model.
         let seq_major_fixed = kv_commits_on_demand && kv_layout.is_seq_major();
         let initial_bucket_len = onnx_genai_kv::kv_capacity_bucket(0, capacity.max_len);
+        // The VMM path reserves the full context's virtual address range up
+        // front, so it needs a concrete `max_len`. A metadata-less model leaves
+        // `capacity.max_len` at the `usize::MAX` sentinel, which cannot be
+        // reserved (issue #1266); resolve it — only for the VMM reservation —
+        // to the largest token count the device could ever hold. On the non-VMM
+        // path (or a model that declares its max length) this is just
+        // `capacity.max_len`, so behaviour there is unchanged.
+        let vmm_reserved_max_len = if kv_commits_on_demand && capacity.max_len == usize::MAX {
+            Self::vmm_unbounded_reservation_len(&capacity)?
+        } else {
+            capacity.max_len
+        };
         // The capacity reported to the bindings (physical axis-2 / mask island).
         // Seq-major fixed stride pins this at the hard maximum from the start;
         // everything else starts at the initial bucket and grows it.
         let reported_len = if seq_major_fixed {
-            capacity.max_len
+            vmm_reserved_max_len
         } else {
             initial_bucket_len
         };
@@ -3358,17 +3426,17 @@ impl DecodeCudaState {
             .context("initial CUDA mask size overflow")?;
         let mask = if kv_commits_on_demand {
             // The VMM committed-range binding reserves the full logical mask
-            // island (`batch × capacity.max_len`) up front and commits only the
-            // initial bucket. `capacity.max_len` is `usize::MAX` for a model
-            // with no declared max sequence length (the deliberate "unbounded
-            // until growth fails" sentinel), so this reservation multiply is
-            // only meaningful — and only non-overflowing — when a concrete bound
-            // exists. The non-VMM binding below never reserves the full extent,
-            // so it must not compute this value at all (computing it
-            // unconditionally overflowed and aborted construction for any
-            // metadata-less model even though the non-VMM path never uses it).
+            // island (`batch × vmm_reserved_max_len`) up front and commits only
+            // the initial bucket. `vmm_reserved_max_len` is the sentinel
+            // resolved to a concrete device-memory bound for a metadata-less
+            // model (issue #1266), so this reservation multiply is always
+            // bounded on the VMM path. The non-VMM binding below never reserves
+            // the full extent, so it must not compute this value at all
+            // (computing it unconditionally overflowed and aborted construction
+            // for any metadata-less model even though the non-VMM path never
+            // uses it).
             let full_mask_bytes = batch
-                .checked_mul(capacity.max_len)
+                .checked_mul(vmm_reserved_max_len)
                 .and_then(|elements| elements.checked_mul(std::mem::size_of::<i64>()))
                 .context("full CUDA mask reservation size overflow")?;
             // Seq-major fixed stride commits the whole (tiny) mask at
@@ -3438,7 +3506,7 @@ impl DecodeCudaState {
                 let allocation_bytes = Self::full_vmm_kv_allocation_bytes(
                     &physical_shape,
                     meta.dtype,
-                    capacity.max_len,
+                    vmm_reserved_max_len,
                 )
                 .with_context(|| {
                     format!("sizing full VMM-backed CUDA KV reservation for '{past}'")
