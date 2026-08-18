@@ -16,6 +16,56 @@ residency, does sub-division still buy selectivity, and under what packing?** Th
 is that analysis, computed from the already-measured granite router-skew
 distribution — no new inference of the design was needed before the numbers.
 
+## Scope correction (owner, 2026-08-18) — and the resulting answer: **don't build sub-division**
+
+> [!important] The problem re-framed after this analysis was first written
+> The owner narrowed the question: *the experts are so small that keeping them
+> resident is fine; the problem to solve is what to do optimally when you **cannot
+> fit all the experts**.* Two consequences:
+>
+> 1. **Granite's ~0.75 MiB experts are no longer the case to design for.** That
+>    model fits, stays resident, and never pages — so the 2.7× granule waste is
+>    real but irrelevant, and **the "recover granule waste on small experts"
+>    motivation is dropped.** The E=2 optimum below answers a problem we do not
+>    have. It stays recorded as the sub-granule *arithmetic*, not as a recommendation.
+> 2. **The regime that matters is over-subscription with large (≥ granule)
+>    experts** — GLM/DeepSeek-class, ~16 MiB experts (= **8× the 2 MiB granule**),
+>    banks in the tens of GB. At that size the granule floor is not binding either,
+>    so the sub-granule packing question dissolves.
+
+**The surviving question — for large, ≥-granule experts in the over-subscribed
+regime, is there still a reason to commit large chunks and sub-divide, or should
+each expert simply be its own commit? — has a short, measured answer: each expert
+should be its own commit. Sub-division solves a problem we no longer have, and the
+mechanism that actually hurts is unaffected by it.** The two arguments that could
+have survived both fail:
+
+- **Call count / churn (fewer, larger map/unmap).** A 16 MiB expert already maps
+  **8 granules**; committing K experts as one chunk reduces the number of `cuMemMap`
+  / `cuMemUnmap` *calls* (1 vs K) but **not the number of granules mapped** (8K
+  either way). The binding cost of the cliff is **WDDM fault-in beyond usable VRAM**,
+  which is per-granule/per-page — I proved (#1295 characterisation, PR #1315) that
+  **span/commit count is not the cliff driver**, so packing does not touch it. The
+  per-step map/unmap *API* overhead that packing would shave is **3.39 ms/step at
+  16 MiB skewed** — already secondary to H2D re-streaming's **10.9 ms/step** (~24% of
+  the 14.34 ms/step wall, `2026-08-18-moe-per-expert-paging-churn.md`), and only the
+  call-overhead fraction of that 3.39 ms is reducible. So packing shaves **well under
+  a quarter of per-step paging cost at best, and zero of the binding cliff.**
+- **Coherent residency grouping.** Once experts are ≥ one granule there is no
+  granule-sharing to force, so grouping hot experts is a **policy** decision (which
+  experts to keep resident), fully served by **per-expert commits plus an eviction
+  policy**. Packing them into a shared commit does the opposite of help: a chunk is
+  resident if **any** member is hot, so packing **removes** the independent
+  per-expert eviction that gives selectivity — strictly worse, for no benefit.
+  Grouping belongs in the policy layer (the offline Belady/LRU/LFU/static-pin replay
+  another agent is running), which operates at per-expert granularity.
+
+**Conclusion: drop sub-division.** Each ≥-granule expert is its own commit unit.
+What remains valuable is the **admission cap** (refuse over-subscription; PR #1325,
+correct under our-VMM *and* OS-paging architectures) and a **per-expert residency
+policy** (separate offline replay). The sub-granule E=2 result below is retained only
+as the arithmetic for the case the owner has now set aside.
+
 ## Result in one line
 
 > [!summary] Measured
@@ -170,12 +220,19 @@ E=8: 22.28 vs 19.07) — hotness packing helps at every E≥2. Min resident phys
   say the cost worth hiding is exactly per-page fault-in, which is what a prefetch
   hint would target. Recorded for that slice.
 
-**Recommendation:** do not implement large-region commit-and-subdivide under any
-condition. If we stay on our own VMM paging, the minimal correct change is E=2
-(two experts per granule, hotness-packed, within-layer) — a modest −17% resident
-physical that feeds the admission cap. If OS hinting is honoured, prefer it and
-skip packing entirely. **Reporting before implementing, as asked** — no packing
-code was written.
+**Recommendation (updated after the owner's 2026-08-18 scope correction — see the
+top section):** **Do not build sub-division at all** — neither large-region
+commit-and-subdivide (dominated on every metric) *nor* the sub-granule E=2 packing
+(which optimises granule waste on small experts, a case the owner has set aside
+because those models fit and never page). In the regime that matters — **over-
+subscribed, large ≥-granule experts** — **each expert should be its own commit**:
+packing buys only a fraction of the secondary map/unmap *call* overhead (≤¼ of
+per-step paging cost, zero of the fault-in cliff), and it *destroys* the independent
+per-expert eviction that gives selectivity. Grouping hot experts is a **policy**
+concern (the offline residency replay), not a packing/commit-unit concern. If OS
+hinting is honoured (4 KiB pages, zero waste, full selectivity), the whole packing
+question is moot. **Reporting before implementing, as asked — no packing code was
+written, and the conclusion is to write none.**
 
 ## Reproduction
 
