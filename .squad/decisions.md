@@ -628,3 +628,89 @@ decode optimization levers are now exhausted with quantitative evidence.** The k
 are at the M=1 decode roofline (occupancy-max, latency-bound, traffic irreducible to
 int4 expert weights). Further QMoE gains require a lower-bit weight format — a
 model/format change, not kernel work. **Next lever: `attention_row` (12.4%, 24.7 µs).**
+
+---
+
+### 2026-08-18: attention_row decode block-width 128→256 — GO, byte-identical (PR #1337, merged 37bdefe8)
+
+**By:** Deckard
+
+**What:** Widened the decode launch of `attention_row`
+(`crates/onnx-runtime-ep-cuda/src/kernels/standard_attention.rs`) from 128 to 256
+threads/block. Prefill keeps 128 threads. Env override
+`ONNX_GENAI_ATTN_ROW_THREADS` available. BYTE-IDENTICAL: more threads, same
+ascending accumulation order (Q·Kᵀ / serial softmax / P·V all unchanged).
+
+**Profile evidence (ncu, H200 pinned, V2-Lite eager decode, ~65-key ctx):**
+Grid = 16 blocks, achieved occupancy 6.23% (3.99/64 warps/SM), waves/SM 0.01.
+DRAM 0.17%, SM 0.47% — near-zero utilization yet 25µs → pure memory-latency
+bound; 62.7% barrier-stall cycles. Not at roofline; real structural headroom.
+attention_row context scaling: 12.4% GPU decode share at short ctx, **25.3% at
+~500-tok prompt / 64-tok gen, 40.0% at ~500-tok / 256-tok gen** — overtakes
+QMoE kernels at realistic depth. This is the **#1 decode kernel at realistic and
+wide context** (up to 40% at deep ctx); both QMoE decode levers are exhausted.
+
+**Numerics gate:** BYTE-IDENTICAL. Token-id md5 unchanged on V2-Lite short/long
+ctx and dense qwen2.5-0.5b-int4. Golden lock PASS. Standard-attention fp16/bf16/
+capture tests PASS. 23/24 suite (1 pre-existing fail on clean origin/main,
+unrelated dtype-claim test — coordinator-confirmed).
+
+**H200 A/B (pinned, median of 5):**
+| workload | baseline | PR | Δ |
+|---|---|---|---|
+| V2-Lite ~500-tok, 128-tok gen — attention_row kernel | 172 µs | 148 µs | **−14%** |
+| V2-Lite ~500-tok, 128-tok gen — E2E | 81.94 tok/s | 86.47 tok/s | **+5.5%** |
+| V2-Lite short / dense qwen long ctx — E2E | neutral | neutral | — |
+
+**Merge:** PR #1337, commit 37bdefe8.
+
+**Strategic note:** attention_row is the highest-leverage non-dense-GEMV decode
+lever available (QMoE levers exhausted). This is the disciplined first step;
+split-KV was named as the follow-up to fill the 116 idle SMs.
+
+---
+
+### 2026-08-18: attention_row split-KV / FlashDecoding — GO, default-ON (PR #1340, merged 763d81f5)
+
+**By:** Deckard
+
+**What:** Added a two-kernel FlashDecoding split-KV path for `attention_row` decode,
+default ON via `ONNX_GENAI_ATTN_SPLITKV` (`=0` = monolithic baseline).
+- `attention_split` (grid `(total_rows, num_splits)`): per-slice online softmax,
+  writes unnormalized partial P·V + per-split max/sum.
+- **Single-split sentinel fast path** (`total_seq <= chunk`, default chunk=256):
+  reproduces `attention_row` exactly with sentinel meta (max=0, sum=1) →
+  contexts ≤ chunk are **byte-identical pass-through**.
+- `attention_combine`: uniform log-sum-exp merge across splits.
+- `num_splits = cap.div_ceil(chunk).clamp(1,64)` derived from fixed KV `cap` →
+  capture-safe (eager and capture make identical launch decisions).
+
+**Profile evidence (ncu, H200 GPU3, V2-Lite eager decode, wide ctx):**
+attention_row = #1 kernel, 36% of GPU decode. Grid=16, waves/SM=0.02 (~116 idle
+SMs), achieved occupancy 9.8%, DRAM 0.79% — machine starved. Split-KV is the
+textbook fix; at cap≈2048 → ~8 splits → grid~128 fills the machine.
+
+**Numerics gate:**
+- Short ctx (≤ chunk): **BYTE-IDENTICAL** via single-split sentinel. V2-Lite
+  24-tok golden lock PASS.
+- Wide ctx (multi-split): **f64-tol** (#1150 oracle path). V2-Lite 340-tok
+  long-context lock (`eager==capture` + golden prefix) PASS; greedy tokens
+  unchanged. Standard-attention capture/fp16/bf16 PASS; layout unit tests 14/14.
+- 23/24 suite (1 pre-existing fail — same as #1337, unrelated).
+- Dense qwen2.5-0.5b: token md5 byte-identical (no regression).
+
+**H200 A/B (GPU3, pinned, median of 5):**
+| workload | baseline | PR | Δ |
+|---|---|---|---|
+| Wide-ctx attention_row kernel | 147.6 µs | ~65 µs (split+combine) | **~2.3×** |
+| DRAM throughput (wide ctx) | 0.79% | 9.26% | fills machine |
+| E2E wide ctx | 51.64 tok/s | 56.90 tok/s | **+10.2%** |
+| E2E short eager / short capture / dense qwen | neutral | neutral | — |
+
+**Merge:** PR #1340, commit 763d81f5.
+
+**Strategic note:** attention_row is the #1 decode kernel at realistic/wide context
+(up to 40% at deep ctx) and the highest-leverage non-dense-GEMV lever with QMoE
+levers exhausted. Split-KV fills the 116 idle SMs left by the monolithic launch.
+Next: re-profile at ≥2000-ctx regime and consider adaptive `chunk` targeting grid ≈
+SM count; then move to the next untouched non-dense decode kernel.
