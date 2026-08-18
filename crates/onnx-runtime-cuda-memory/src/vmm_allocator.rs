@@ -49,6 +49,7 @@
 //!
 //! [`CudaDeviceAllocator`]: crate::device_allocator::CudaDeviceAllocator
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,7 +58,7 @@ use std::sync::{Arc, Mutex};
 use onnx_runtime_memory_governor::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HolderId, MappedPhysicalCapacityToken,
     MemoryAuthorityId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, SharedDevicePrefix,
-    SharedPrefixCommitInfo, Tier,
+    SharedMapping, SharedPrefixCommitInfo, Tier, VirtualBacking as MemoryVirtualBacking,
 };
 use onnx_runtime_virtual_memory::{PhysicalMemoryAccounting, VirtualBacking};
 
@@ -1628,8 +1629,85 @@ impl CudaVmmAllocator {
         }
         Ok(commit)
     }
+
+    /// Reserve one allocation while committing only the byte ranges the
+    /// caller names as immediately live, charging the newly-mapped bytes to
+    /// `capacity` atomically with claiming the underlying granules.
+    ///
+    /// # Why this is inherent rather than part of a trait
+    ///
+    /// [`MappedPhysicalCapacityToken`] is a `onnx-runtime-memory-governor`
+    /// type — the governor's atomic capacity-charging seam, not part of the
+    /// dyn-safe allocator contract every backend implements. Putting it on a
+    /// trait would force every [`crate::device_allocator::CudaDeviceAllocator`]-
+    /// like eager allocator and the CPU allocator to answer for a governor
+    /// concept they have no way to honor. `onnx-runtime-ep-cuda` already holds
+    /// this allocator at its concrete type (`vmm: OnceLock<Arc<CudaVmmAllocator>>`),
+    /// so it calls this directly rather than through `&dyn DeviceAllocator`/
+    /// `&dyn VirtualBacking`.
+    pub fn allocate_committed_with_capacity(
+        &self,
+        bytes: usize,
+        align: usize,
+        committed_ranges: &[std::ops::Range<usize>],
+        capacity: &mut MappedPhysicalCapacityToken,
+    ) -> Result<onnx_runtime_memory_governor::MappedAllocation<NonNull<u8>>, MemoryError> {
+        if capacity.role() != self.role {
+            return Err(invalid(
+                bytes,
+                format!(
+                    "mapped allocation role {:?} does not match arena zone {:?}",
+                    capacity.role(),
+                    self.role
+                ),
+            ));
+        }
+        let ptr = self.allocate_committed(bytes, align, &[])?;
+        let ranges = committed_ranges
+            .iter()
+            .map(|range| AllocationCommitRange {
+                ptr,
+                allocation_bytes: bytes,
+                align,
+                offset: range.start,
+                bytes: range.len(),
+            })
+            .collect::<Vec<_>>();
+        let commit = match self.commit_allocation_ranges_inner(&ranges, Some(capacity)) {
+            Ok(commit) => commit,
+            Err(error) => {
+                // SAFETY: this is the exact live allocation returned above and
+                // it has not escaped to the caller.
+                unsafe { self.deallocate(ptr, bytes, align) };
+                return Err(error);
+            }
+        };
+        Ok(onnx_runtime_memory_governor::MappedAllocation {
+            allocation: ptr,
+            newly_mapped_bytes: commit.newly_mapped_bytes,
+        })
+    }
+
+    /// Commit several allocation ranges as one allocator transaction, charging
+    /// the newly-mapped bytes to `capacity` atomically with claiming the
+    /// underlying granules. See
+    /// [`allocate_committed_with_capacity`](Self::allocate_committed_with_capacity)
+    /// for why this is inherent rather than part of a trait.
+    pub fn commit_allocation_ranges_with_capacity(
+        &self,
+        ranges: &[AllocationCommitRange],
+        capacity: &mut MappedPhysicalCapacityToken,
+    ) -> Result<u64, MemoryError> {
+        self.commit_allocation_ranges_inner(ranges, Some(capacity))
+            .map(|commit| commit.newly_mapped_bytes)
+    }
 }
 
+// SAFETY: every pointer handed out lies inside this allocator's reservation,
+// in a span removed from the free list and recorded in `live`, so no two live
+// allocations overlap. The granules under a span stay mapped while its
+// reference count is non-zero, so the memory remains valid until `deallocate`.
+// `device` names the CUDA device the reservation belongs to.
 // SAFETY: every pointer handed out lies inside this allocator's reservation,
 // in a span removed from the free list and recorded in `live`, so no two live
 // allocations overlap. The granules under a span stay mapped while its
@@ -1639,6 +1717,48 @@ impl DeviceAllocator for CudaVmmAllocator {
     fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
         let full = 0..bytes;
         self.allocate_committed(bytes, align, std::slice::from_ref(&full))
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, _bytes: usize, _align: usize) {
+        let _ = self.deallocate_span(ptr);
+    }
+
+    unsafe fn deallocate_with_unmapped(
+        &self,
+        ptr: NonNull<u8>,
+        _bytes: usize,
+        _align: usize,
+    ) -> u64 {
+        self.deallocate_span(ptr)
+    }
+
+    fn device(&self) -> DeviceKey {
+        self.device
+    }
+
+    /// `Some(self)`: a VMM arena always separates reservation from commit, so
+    /// it always has this capability. See [`impl MemoryVirtualBacking`] below.
+    ///
+    /// [`impl MemoryVirtualBacking`]: #impl-VirtualBacking-for-CudaVmmAllocator
+    fn as_virtual_backing(&self) -> Option<&dyn MemoryVirtualBacking> {
+        Some(self)
+    }
+
+    /// `Some(self)`: a VMM arena can always create and map shared physical
+    /// prefixes. See [`impl SharedMapping`] below.
+    ///
+    /// [`impl SharedMapping`]: #impl-SharedMapping-for-CudaVmmAllocator
+    fn as_shared_mapping(&self) -> Option<&dyn SharedMapping> {
+        Some(self)
+    }
+}
+
+// SAFETY: every pointer handed to these methods lies inside this allocator's
+// reservation, in a span recorded in `live` (checked by address arithmetic
+// against `arena.spans.live` before any granule is touched).
+impl MemoryVirtualBacking for CudaVmmAllocator {
+    fn device(&self) -> DeviceKey {
+        self.device
     }
 
     fn allocate_committed(
@@ -1718,49 +1838,6 @@ impl DeviceAllocator for CudaVmmAllocator {
         Ok(unsafe { NonNull::new_unchecked((base + offset) as *mut u8) })
     }
 
-    fn allocate_committed_with_capacity(
-        &self,
-        bytes: usize,
-        align: usize,
-        committed_ranges: &[std::ops::Range<usize>],
-        capacity: &mut MappedPhysicalCapacityToken,
-    ) -> Result<onnx_runtime_memory_governor::MappedAllocation<NonNull<u8>>, MemoryError> {
-        if capacity.role() != self.role {
-            return Err(invalid(
-                bytes,
-                format!(
-                    "mapped allocation role {:?} does not match arena zone {:?}",
-                    capacity.role(),
-                    self.role
-                ),
-            ));
-        }
-        let ptr = self.allocate_committed(bytes, align, &[])?;
-        let ranges = committed_ranges
-            .iter()
-            .map(|range| AllocationCommitRange {
-                ptr,
-                allocation_bytes: bytes,
-                align,
-                offset: range.start,
-                bytes: range.len(),
-            })
-            .collect::<Vec<_>>();
-        let commit = match self.commit_allocation_ranges_inner(&ranges, Some(capacity)) {
-            Ok(commit) => commit,
-            Err(error) => {
-                // SAFETY: this is the exact live allocation returned above and
-                // it has not escaped to the caller.
-                unsafe { self.deallocate(ptr, bytes, align) };
-                return Err(error);
-            }
-        };
-        Ok(onnx_runtime_memory_governor::MappedAllocation {
-            allocation: ptr,
-            newly_mapped_bytes: commit.newly_mapped_bytes,
-        })
-    }
-
     fn commit_allocation_range(
         &self,
         ptr: NonNull<u8>,
@@ -1829,15 +1906,6 @@ impl DeviceAllocator for CudaVmmAllocator {
     ) -> Result<(), MemoryError> {
         self.commit_allocation_ranges_inner(ranges, None)
             .map(|_| ())
-    }
-
-    fn commit_allocation_ranges_with_capacity(
-        &self,
-        ranges: &[AllocationCommitRange],
-        capacity: &mut MappedPhysicalCapacityToken,
-    ) -> Result<u64, MemoryError> {
-        self.commit_allocation_ranges_inner(ranges, Some(capacity))
-            .map(|commit| commit.newly_mapped_bytes)
     }
 
     fn mapped_bytes_for_allocation_ranges(
@@ -1958,25 +2026,12 @@ impl DeviceAllocator for CudaVmmAllocator {
             .unwrap_or(allocation_bytes)
     }
 
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, _bytes: usize, _align: usize) {
-        let _ = self.deallocate_span(ptr);
+    fn as_any(&self) -> &dyn Any {
+        self
     }
+}
 
-    unsafe fn deallocate_with_unmapped(
-        &self,
-        ptr: NonNull<u8>,
-        _bytes: usize,
-        _align: usize,
-    ) -> u64 {
-        self.deallocate_span(ptr)
-    }
-
-    /// True: spans are carved from granules mapped as they are needed, and
-    /// each granule is leased before it is mapped.
-    fn commits_on_demand(&self) -> bool {
-        true
-    }
-
+impl SharedMapping for CudaVmmAllocator {
     fn device(&self) -> DeviceKey {
         self.device
     }
@@ -2030,6 +2085,10 @@ impl DeviceAllocator for CudaVmmAllocator {
             newly_mapped_bytes: commit.newly_mapped_bytes,
             granules: commit.granules,
         })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

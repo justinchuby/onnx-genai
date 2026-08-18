@@ -18,24 +18,36 @@
 //! * [`AllocationCommitRange`], [`MappedAllocation`] — commit-path primitives.
 //! * [`SharedDevicePrefix`], [`SharedPrefixCommitInfo`] — shared-physical-prefix
 //!   contract.
+//! * [`allocator::DeviceAllocator`], [`allocator::HostAllocator`] — the
+//!   minimal ordinary-allocation contract: device identity plus
+//!   allocate/deallocate. It carries no lazy-commit or shared-prefix methods
+//!   of its own.
+//! * [`capability::VirtualBacking`], [`capability::SharedMapping`] — the two
+//!   independent optional capabilities an allocator may expose, discovered
+//!   through `DeviceAllocator::as_virtual_backing`/`as_shared_mapping` rather
+//!   than called unconditionally. See [`mod@capability`] for the rationale.
 //!
 //! ## What stays in `onnx-runtime-memory-governor`
 //!
-//! * `DeviceAllocator` trait —
-//!   its `allocate_committed_with_capacity` and
-//!   `commit_allocation_ranges_with_capacity` methods accept
-//!   `MappedPhysicalCapacityToken`, a governor-coupled type. Splitting those
-//!   into an extension trait is deferred to Phase 2 (#1186).
-//! * `HostAllocator` — trivially
-//!   depends on `DeviceAllocator`.
+//! * `MappedPhysicalCapacityToken`-consuming atomic capacity accounting for a
+//!   VMM allocator's mapped-growth path. That coupling is not part of
+//!   `DeviceAllocator`, `VirtualBacking`, or any other trait in this crate —
+//!   a governor-specific type has no business on a mechanism-only trait's
+//!   signature. It lives instead as inherent methods on the one concrete
+//!   allocator that needs it (`onnx-runtime-cuda-memory`'s
+//!   `CudaVmmAllocator`), reached by an execution provider that already
+//!   depends on and constructs that concrete type.
 //! * Lease ledgers, capacity tokens, growth grants, pressure responders, holder
 //!   identities, and the `MemoryGovernor` trait.
 
 pub mod allocator;
+pub mod capability;
 
 pub use allocator::{
-    AllocationCommitRange, DeviceKey, MappedAllocation, SharedDevicePrefix, SharedPrefixCommitInfo,
+    AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator, MappedAllocation,
+    SharedDevicePrefix, SharedPrefixCommitInfo,
 };
+pub use capability::{SharedMapping, VirtualBacking};
 
 /// Where the bytes physically live.
 ///
