@@ -3061,6 +3061,7 @@ because what it removes is a per-region park, not a per-element cost. The
 decode-shaped `sm_decode_h32_kv*` cells stay serial and stay flat (18–182 µs,
 within ±1 µs of base at every width), and `sm_whisper_cross` is neutral at every
 width — both are the intended outcome, not a miss.
+
 ### 31.8 Transpose and the activations, and what the controls say
 
 Activations, our own native ms, `base>new`, 5 trials × 7 runs:

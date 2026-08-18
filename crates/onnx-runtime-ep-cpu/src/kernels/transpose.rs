@@ -548,7 +548,11 @@ fn parallel_blocks_per_task(units: usize, unit_bytes: usize) -> Option<usize> {
     if crate::task_runtime::width() < 2 || units < 2 {
         return None;
     }
-    Some(MIN_PARALLEL_TASK_BYTES.div_ceil(unit_bytes.max(1)).clamp(1, units))
+    Some(
+        MIN_PARALLEL_TASK_BYTES
+            .div_ceil(unit_bytes.max(1))
+            .clamp(1, units),
+    )
 }
 
 #[cfg(test)]
