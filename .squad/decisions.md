@@ -108,3 +108,24 @@ Holden's `ONNX_GENAI_DEVICE_TOKEN_LOOP=k` keeps sampled tokens on-device across 
 ## 2026-08-18 — Older Deckard decode drops deduped to archived/current decode standing
 
 Processed Deckard's pending 2026-08-15 drops for GQA aux merge, flash-decoding split retune, GQA core-warps, lever-2, group-reuse NO-GO, cp.async NO-GO, GEMV v2, fp16 GEMV, lm_head cuBLASLt, and default-on lm_head cuBLASLt. These are already covered by the archived decode-program narrative and the live standing rule that batch-1 byte-identical single-kernel work is mined out; do not duplicate their per-PR tables in the live ledger.
+
+
+## 2026-08-18 — Dense f32 M=1 GEMV gap: measured, default-OFF future lever
+
+Copilot's #1091 note is merged into the ledger as a methodology/target decision, not a landed default. The reproducible CPU f32 gap is decode M=1 GEMV, where the current SimdX86 path unconditionally packs B and wastes a full B copy; M=128 prefill is at parity with MLAS on the measured host when process CPU time and identical-code controls are used. Any future native M=1 GEMV should be default-OFF unless/until its f32 reassociation is explicitly accepted against f64/Generic tolerances. Detailed tables and control methodology are archived in `.squad/decisions-archive/2026-08.md` under the 2026-08-18T03:15Z inbox batch.
+
+## 2026-08-18 — QMoE gate/up occupancy lever merged (#1167)
+
+PR #1167 landed on `main` as `651901a3`. Luv's `ONNX_GENAI_QMOE_OCC` lever stays default-OFF and changes only launch-bounds/occupancy for the QMoE gate/up activation path; Rachael approved with the caveat that the flag applies more broadly than the early "symmetric int4 only" wording. Evidence: spill-free `(256,6)` path, registers about 54→40, achieved occupancy about 43%→64%, isolated kernel about 42.3→37.8us (−10.6%), full QMoE 32/32 and opt-in/off V2-Lite golden streams byte-identical. This merge also fixed pre-existing fmt drift that was blocking PR flow.
+
+## 2026-08-18 — V2-Lite graph-capture mask classifier merged (#1171)
+
+PR #1171 landed on `main` as `bc1e97ff`. Deckard's original additive-mask capacity classifier targeted the right V2-Lite topology, but Rachael rejected it for two safety blockers: a non-capacity Attention leaf could be accepted, and a root graph-output mask escape was not rejected. Reviewer lockout was enforced: Deckard did not revise the rejected artifact; Wallace tightened the classifier with present-KV and root-output negative tests; Rachael re-reviewed and approved. Durable rule: only topology-gated additive-mask-builder cones ending at genuine capacity-form default-domain `Attention[3]` may be considered capture-safe; GLM-5.2 logical-width indexer patterns remain rejected.
+
+## 2026-08-18 — V2-Lite `_d1` workspace planner fix merged; MoE graph-capture win landed (#1181)
+
+PR #1181 landed on `main` as `c9c7f64c`. Leon fixed the additive-mask query-axis (`_d1`) workspace planner by deriving exact runtime shape through deterministic mask-cone producers instead of guessing; Rachael approved the planner path as exact and fail-closed. Wallace's final hardware A/B on the real 27-layer DeepSeek-V2-Lite int4 QMoE artifact showed capture ON vs eager OFF byte-identical over 320 tokens (0.000% divergence), with median steady throughput **101.80 vs 56.94 tok/s = 1.79×** and zero overlap. DeepSeek MoE performance half of the mandate is closed under equal base-decode conditions, behind opt-in `ONNX_GENAI_CUDA_GRAPH` with no default flip.
+
+## 2026-08-18 — Follow-up: long-context Engine Attention workspace under-plan
+
+Wallace found a separate long-context `Engine::generate` Attention workspace under-plan on V2-Lite: node 38 requires 33288 bytes aligned to 256 but prepare reserved 16904 bytes around ~320 tokens. It reproduces in eager and capture, so it is not introduced by the graph-capture classifier. Leon owns this Engine-path workspace-planner follow-up; the session/native path used for the 320-token byte-identity gate is unaffected.

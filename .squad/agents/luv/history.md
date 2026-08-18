@@ -84,3 +84,9 @@ Fresh adversarial review of `nxrt/mlas-avx2-layernorm` @ `72e02cd92c` after the 
 
 - Rebuilt QMoE gate/up occupancy on #1150 baseline as `ONNX_GENAI_QMOE_OCC` default-OFF, symmetric int4 only; `(256,6)` launch bounds are spill-free and cut live gate/up kernel ~10.6%.
 - Byte-identity is green and V2-Lite E2E converts modestly (~+1%, 56.6→57.2 tok/s); down/grouped paths are already saturated or different-lane, so no remaining QMoE occupancy vein.
+
+## 2026-08-18T03:15Z — QMoE gate/up occupancy lever merged (#1167)
+
+- PR #1167 landed on `main` as `651901a3`: `ONNX_GENAI_QMOE_OCC` remains default-OFF and uses launch-bounds/occupancy tuning for QMoE gate/up activation.
+- Evidence recorded: byte-identical QMoE suite and V2-Lite golden streams, registers about 54→40, achieved occupancy about 43%→64%, isolated gate/up kernel about −10.6%, and modest ~+1% E2E on V2-Lite.
+- Rachael approved with a scope wording note: the flag is not literally limited to symmetric int4, even though default-OFF and affine smoke tests made that non-blocking.
