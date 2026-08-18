@@ -118,8 +118,20 @@ impl PipelineEngine {
 
         let mut options = pipeline_request.request.options.clone();
         options.validate()?;
-        if options.eos_token_id.is_none() {
-            options.eos_token_id = self.tokenizer()?.eos_token_id();
+        if options.stop_on_eos && options.eos_token_id.is_none() {
+            let mut eos_token_ids = self.eos_token_ids.clone();
+            for id in self.tokenizer()?.eos_token_ids() {
+                if !eos_token_ids.contains(&id) {
+                    eos_token_ids.push(id);
+                }
+            }
+            options.eos_token_id = eos_token_ids.first().copied();
+            for id in eos_token_ids {
+                let stop = StopSequence::Tokens(vec![id]);
+                if !options.stop_sequences.contains(&stop) {
+                    options.stop_sequences.push(stop);
+                }
+            }
         }
         let prompt_tokens = tokenize_with(self.tokenizer()?, &pipeline_request.request.prompt)?;
         if prompt_tokens.is_empty() {
