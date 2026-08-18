@@ -697,6 +697,38 @@ impl PreparedAllocationRelease {
         }
     }
 
+    /// Settle this request as device-lost quarantine, without calling the
+    /// allocator and without refunding anything.
+    ///
+    /// This is the same settlement [`execute`](Self::execute) performs when it
+    /// observes a device-lost release gate, exposed for the case where the
+    /// *provider's* queue learns the context is unusable first: the mechanism
+    /// lifecycle may not have been invalidated yet, so `execute` would still be
+    /// allowed to call the allocator, which is exactly what must not happen.
+    ///
+    /// It is deliberately distinct from
+    /// [`quarantine(QuarantineReason::DeviceLost)`](Self::quarantine), which
+    /// records the generic [`AllocationReleaseState::Quarantined`]. Device loss
+    /// is its own terminal state because it is discharged by confirmed
+    /// context/process termination rather than by anything the runtime can do
+    /// to the device.
+    ///
+    /// Consuming the request is the point: the binding records the exact
+    /// allocation identity as device-lost, the queued-release count settles,
+    /// and the active-operation pin — with the mechanism, provider-context, and
+    /// binding references behind it — is released, so a queue that holds the
+    /// residual does not keep its own provider context alive.
+    pub fn quarantine_device_lost(mut self) -> AllocationReleaseOutcome {
+        self.armed = false;
+        let bytes = self.bytes as u64;
+        self.settle_quarantine(
+            ReleaseAccounting::new(bytes, 0),
+            AllocationReleaseState::DeviceLost,
+            QuarantineReason::DeviceLost,
+            bytes,
+        )
+    }
+
     /// Retain ownership deliberately without calling the allocator.
     ///
     /// This is the explicit form of what `Drop` does implicitly.

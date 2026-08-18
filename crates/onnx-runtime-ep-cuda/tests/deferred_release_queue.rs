@@ -8,6 +8,7 @@
 //! Owner/view/ABA semantics are covered by the memory-api tests and are not
 //! duplicated here.
 
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
@@ -16,7 +17,12 @@ use onnx_runtime_ep_cuda::deferred_release::{
     CudaDeferredReleaseQueue, DeferredActionOutcome, DeferredReleaseAction, ReleaseFence,
     ReleaseFenceSource, RetainedOwnership,
 };
-use onnx_runtime_memory_governor::{AllocationReleaseState, DeferredEnqueueRejection};
+use onnx_runtime_memory_governor::{
+    AllocationIdentity, AllocationReleaseState, BindingRegistry, BindingResource,
+    DeferredEnqueueRejection, DeviceAllocator, DeviceKey, HostAllocator, MemoryBinding,
+    MemoryError, QuarantineReason, QuarantinedAllocation, RegisteredMechanism,
+    RegisteredProviderContext,
+};
 
 /// A fence whose completion the test controls.
 #[derive(Debug)]
@@ -680,4 +686,352 @@ fn dropping_a_queue_with_pending_work_neither_frees_nor_blocks() {
         1,
         "the action is dropped without being executed, which is a retain"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Production-path device-loss settlement
+//
+// The tests above drive the scheduler through a toy action. The ones below use
+// the *production* entry point — `enqueue_prepared` with a real
+// `PreparedAllocationRelease` taken from a real `MemoryBinding` — because the
+// thing that has to be true after device loss is a property of the binding and
+// of the provider context, not of the queue's own counters.
+// ---------------------------------------------------------------------------
+
+/// A host-backed stand-in for a device allocator that counts physical releases.
+///
+/// Device loss must never reach it, so `release_calls` staying at zero is the
+/// load-bearing assertion; the bytes it handed out stay owned, exactly as
+/// quarantined device ownership does.
+#[derive(Debug, Default)]
+struct CountingReleaseAllocator {
+    release_calls: AtomicUsize,
+}
+
+impl CountingReleaseAllocator {
+    fn release_calls(&self) -> usize {
+        self.release_calls.load(Ordering::Acquire)
+    }
+}
+
+impl DeviceAllocator for CountingReleaseAllocator {
+    fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
+        HostAllocator.allocate(bytes, align)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+        self.release_calls.fetch_add(1, Ordering::AcqRel);
+        // SAFETY: forwarded unchanged from this method's contract.
+        unsafe { HostAllocator.deallocate(ptr, bytes, align) };
+    }
+
+    fn device(&self) -> DeviceKey {
+        DeviceKey::HOST
+    }
+}
+
+/// The provider-context resource, shaped exactly like the CUDA provider's.
+///
+/// It pins the deferred queue, which is what makes an unsettled retained
+/// request a *cycle* rather than a leak: request -> binding -> mechanism ->
+/// provider context -> this pin -> queue -> retained request.
+#[derive(Debug)]
+struct ContextPin {
+    #[allow(dead_code)]
+    queue: Arc<CudaDeferredReleaseQueue>,
+}
+
+/// A real binding registry over a host allocator, wired to `queue` the way the
+/// CUDA provider wires its own.
+struct BoundFixture {
+    registry: BindingRegistry,
+    context: RegisteredProviderContext,
+    mechanism: RegisteredMechanism,
+    binding: MemoryBinding,
+    allocator: Arc<CountingReleaseAllocator>,
+}
+
+impl BoundFixture {
+    fn new(queue: &Arc<CudaDeferredReleaseQueue>) -> Self {
+        let registry = BindingRegistry::new().expect("registry");
+        let context = registry
+            .register_provider_context(
+                DeviceKey::HOST,
+                Arc::new(ContextPin {
+                    queue: Arc::clone(queue),
+                }) as Arc<dyn BindingResource>,
+            )
+            .expect("provider context");
+        let authority = registry
+            .register_authority(DeviceKey::HOST, Arc::new(()) as Arc<dyn BindingResource>)
+            .expect("authority");
+        let allocator = Arc::new(CountingReleaseAllocator::default());
+        let mechanism = registry
+            .register_allocator(
+                context,
+                authority,
+                Arc::clone(&allocator) as Arc<dyn DeviceAllocator>,
+            )
+            .expect("mechanism");
+        let binding = registry.bind(DeviceKey::HOST).expect("binding");
+        Self {
+            registry,
+            context,
+            mechanism,
+            binding,
+            allocator,
+        }
+    }
+
+    fn snapshot(&self) -> onnx_runtime_memory_governor::MechanismSnapshot {
+        self.registry.snapshot(self.mechanism).expect("snapshot")
+    }
+
+    fn quarantined(&self) -> Vec<QuarantinedAllocation> {
+        self.registry
+            .quarantined(self.mechanism)
+            .expect("quarantined ownership")
+    }
+
+    /// Hand one real allocation's final ownership to `queue`.
+    fn enqueue_one(
+        &self,
+        queue: &Arc<CudaDeferredReleaseQueue>,
+        bytes: usize,
+    ) -> AllocationIdentity {
+        let allocation = self.binding.allocate(bytes, 256).expect("allocation");
+        let request = self
+            .binding
+            .prepare_release(allocation)
+            .expect("prepared release");
+        let identity = request.identity();
+        queue.enqueue_prepared(request, None).expect("accepted");
+        identity
+    }
+
+    /// The documented device-loss teardown: invalidate, confirm termination
+    /// (which discharges quarantine), then remove the registration and the
+    /// provider context.
+    fn tear_down_after_device_loss(self) {
+        self.registry
+            .invalidate_device(DeviceKey::HOST, "test device loss")
+            .expect("invalidate");
+        self.registry
+            .confirm_context_terminated(self.context)
+            .expect("a settled context can confirm termination");
+        self.registry
+            .remove(self.mechanism)
+            .expect("a discharged mechanism can be removed");
+        drop(self.binding);
+        drop(self.allocator);
+        self.registry
+            .remove_provider_context(self.context)
+            .expect("an unused provider context can be removed");
+        drop(self.registry);
+    }
+}
+
+/// Assert everything that must be true of one settled device-lost request.
+fn assert_settled_device_lost(
+    fixture: &BoundFixture,
+    identity: AllocationIdentity,
+    bytes: usize,
+    queue: &Arc<CudaDeferredReleaseQueue>,
+) {
+    assert_eq!(
+        fixture.allocator.release_calls(),
+        0,
+        "the allocator is never called after device loss"
+    );
+
+    let quarantined = fixture.quarantined();
+    assert_eq!(
+        quarantined.len(),
+        1,
+        "the binding records exactly one retained allocation"
+    );
+    let record = quarantined[0];
+    assert_eq!(record.identity, identity, "the exact allocation identity");
+    assert_eq!(record.state, AllocationReleaseState::DeviceLost);
+    assert_eq!(record.reason, QuarantineReason::DeviceLost);
+    assert_eq!(record.bytes, bytes);
+    assert_eq!(record.retained_bytes, bytes as u64);
+
+    let snapshot = fixture.snapshot();
+    assert_eq!(
+        snapshot.queued_releases, 0,
+        "the queued release settled instead of staying owed forever"
+    );
+    assert_eq!(
+        snapshot.active_operations, 0,
+        "the operation pin is released, so the context can reach quiescence"
+    );
+    assert_eq!(snapshot.live_allocations, 0);
+    assert_eq!(snapshot.quarantined_allocations, 1);
+
+    let stats = queue.stats();
+    assert_eq!(stats.pending, 0, "nothing is owed to the device any more");
+    assert_eq!(stats.completed, 0, "a retain is not a free");
+    assert_eq!(stats.quarantined, 1);
+    assert_eq!(stats.retained, 1);
+    assert_eq!(stats.mapped_refunded_bytes, 0, "no refund on assumption");
+
+    let retained = queue.retained();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].state, AllocationReleaseState::DeviceLost);
+    assert_eq!(retained[0].bytes, bytes as u64);
+    assert_eq!(retained[0].label, "provider allocation");
+}
+
+#[test]
+fn device_loss_settles_a_pending_prepared_release_and_frees_the_context() {
+    let h = harness(8);
+    let queue = Arc::clone(&h.queue);
+    let fixture = BoundFixture::new(&queue);
+    let before_enqueue = Arc::strong_count(&queue);
+
+    let identity = fixture.enqueue_one(&queue, 4096);
+    assert_eq!(queue.pending(), 1);
+    assert_eq!(fixture.snapshot().queued_releases, 1);
+    assert_eq!(fixture.snapshot().active_operations, 1);
+
+    // The reported path: the request is still pending when loss is published.
+    queue.mark_device_lost("Xid 13");
+
+    assert_eq!(
+        h.destroyed.load(Ordering::Acquire),
+        0,
+        "events are retained, not destroyed through a lost context"
+    );
+    assert_settled_device_lost(&fixture, identity, 4096, &queue);
+    assert_eq!(
+        Arc::strong_count(&queue),
+        before_enqueue,
+        "settlement must not leave the queue holding a new reference to itself"
+    );
+
+    fixture.tear_down_after_device_loss();
+    // The harness's own handle is the only other one; drop it so the count
+    // below is exactly "what the settled release left behind".
+    drop(h);
+    assert_eq!(
+        Arc::strong_count(&queue),
+        1,
+        "the retained residual must not keep the provider context — and therefore \
+         this queue — alive"
+    );
+    // The residual is still held, so the physical ownership is not reusable.
+    assert_eq!(queue.retained().len(), 1);
+}
+
+#[test]
+fn device_loss_settles_a_prepared_release_a_poller_was_holding() {
+    let entered = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let queue = CudaDeferredReleaseQueue::manual(
+        Box::new(BlockingStreams {
+            entered: Arc::clone(&entered),
+            resume: Arc::clone(&resume),
+        }),
+        8,
+    );
+    let fixture = BoundFixture::new(&queue);
+    let before_enqueue = Arc::strong_count(&queue);
+    let identity = fixture.enqueue_one(&queue, 8192);
+
+    let poll_queue = Arc::clone(&queue);
+    let poller = std::thread::spawn(move || poll_queue.poll());
+    entered.wait();
+    let loss_queue = Arc::clone(&queue);
+    let loss = std::thread::spawn(move || loss_queue.mark_device_lost("concurrent Xid"));
+    resume.wait();
+
+    assert_eq!(poller.join().expect("poller"), 0);
+    loss.join().expect("loss marker");
+
+    // The carry path settles the same way the pending path does.
+    assert_settled_device_lost(&fixture, identity, 8192, &queue);
+    assert_eq!(
+        Arc::strong_count(&queue),
+        before_enqueue,
+        "the carry path must not retain a reference to the queue either"
+    );
+
+    fixture.tear_down_after_device_loss();
+    assert_eq!(
+        Arc::strong_count(&queue),
+        1,
+        "a carried request must not keep the provider context alive"
+    );
+}
+
+#[test]
+fn concurrent_loss_settles_every_prepared_release_whichever_path_takes_it() {
+    // Pollers and device loss race, so the entries are settled by a mix of the
+    // already-lost, carry, and retain-all paths. Whichever site wins, every
+    // request must reach the same terminal state and the queue must end up
+    // holding nothing that points back at it.
+    let h = harness(64);
+    let queue = Arc::clone(&h.queue);
+    let fixture = BoundFixture::new(&queue);
+    let before_enqueue = Arc::strong_count(&queue);
+
+    let mut identities = Vec::new();
+    for _ in 0..32 {
+        identities.push(fixture.enqueue_one(&queue, 1024));
+    }
+
+    let start = Arc::new(Barrier::new(3));
+    let pollers: Vec<_> = (0..2)
+        .map(|_| {
+            let queue = Arc::clone(&queue);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                for _ in 0..64 {
+                    queue.poll();
+                }
+            })
+        })
+        .collect();
+    start.wait();
+    queue.mark_device_lost("racing Xid");
+    for poller in pollers {
+        poller.join().expect("poller");
+    }
+    // Anything a poller carried back after loss is settled by a final poll.
+    queue.poll();
+
+    assert_eq!(
+        fixture.allocator.release_calls(),
+        0,
+        "no release may reach the allocator once loss is published"
+    );
+    assert_eq!(queue.pending(), 0, "nothing stays owed");
+    let quarantined = fixture.quarantined();
+    assert_eq!(quarantined.len(), identities.len());
+    for record in &quarantined {
+        assert_eq!(record.state, AllocationReleaseState::DeviceLost);
+        assert_eq!(record.reason, QuarantineReason::DeviceLost);
+    }
+    let recorded: std::collections::HashSet<_> =
+        quarantined.iter().map(|record| record.identity).collect();
+    for identity in &identities {
+        assert!(
+            recorded.contains(identity),
+            "allocation {identity:?} was never settled"
+        );
+    }
+    let snapshot = fixture.snapshot();
+    assert_eq!(snapshot.queued_releases, 0);
+    assert_eq!(snapshot.active_operations, 0);
+    assert_eq!(
+        Arc::strong_count(&queue),
+        before_enqueue,
+        "no settled request may leave a queue reference behind"
+    );
+
+    fixture.tear_down_after_device_loss();
+    drop(h);
+    assert_eq!(Arc::strong_count(&queue), 1);
 }

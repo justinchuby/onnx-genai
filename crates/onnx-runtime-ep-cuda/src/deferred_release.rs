@@ -170,8 +170,39 @@ impl DeferredActionOutcome {
 ///
 /// `execute` consumes the action, so the ownership it carries is released (or
 /// retained) exactly once. It runs with **no** queue lock held.
-pub trait DeferredReleaseAction: Send + Debug {
+///
+/// Actions are `'static` because the queue may outlive every caller that
+/// handed it one, and because device-loss settlement stores what an action
+/// could not give back as `Box<dyn Any + Send>`.
+pub trait DeferredReleaseAction: Send + Debug + 'static {
     fn execute(self: Box<Self>) -> DeferredActionOutcome;
+
+    /// Settle this action after the device or provider context was lost.
+    ///
+    /// This is a *terminal* path, not a deferral: it consumes the action
+    /// exactly like `execute` does, but it must never call an allocator, never
+    /// touch the device, and never refund. It runs with no queue lock held.
+    ///
+    /// The return value is the ownership the **queue** must keep alive, and it
+    /// is deliberately narrower than the action itself. An action that carries
+    /// a settlement of its own — a prepared request that owes a mechanism a
+    /// terminal state — is expected to perform that settlement here and hand
+    /// back only the residual physical ownership. Handing back the whole
+    /// unexecuted action instead would leave that settlement permanently owed,
+    /// and would keep alive whatever provider context the action pins, which
+    /// for a context-owned queue is the queue itself.
+    ///
+    /// The default retains the whole action, which is correct for an action
+    /// whose ownership is purely physical (a page's allocator/allowance, a
+    /// reservation ticket) and owes no mechanism anything.
+    fn settle_device_lost(self: Box<Self>, detail: &str) -> Option<RetainedOwnership> {
+        let bytes = self.bytes();
+        Some(RetainedOwnership {
+            bytes,
+            detail: detail.to_owned(),
+            keep_alive: Box::new(self),
+        })
+    }
 
     /// Stable short label for stats and shutdown diagnostics.
     fn label(&self) -> &'static str;
@@ -454,9 +485,16 @@ impl CudaDeferredReleaseQueue {
     /// Record that the device or provider context was lost.
     ///
     /// From this point the queue never queries a fence, never calls an
-    /// allocator, and never refunds: every pending and future request is
-    /// retained with its ownership and accounting intact, and its events are
-    /// kept rather than destroyed through a context that is known bad.
+    /// allocator, and never refunds. Every pending request is *settled* rather
+    /// than abandoned: its action records its own terminal device-loss state —
+    /// for a binding-prepared release that is device-lost quarantine at the
+    /// exact allocation identity — and hands back only the ownership that must
+    /// stay alive, which the queue then holds. Its events are kept rather than
+    /// destroyed through a context that is known bad.
+    ///
+    /// Settling rather than freezing the whole action is what lets the
+    /// mechanism reach quiescence, so the provider context can confirm
+    /// termination and discharge the quarantine it was handed.
     pub fn mark_device_lost(&self, reason: impl Into<String>) {
         let reason = reason.into();
         let gate = self
@@ -508,26 +546,10 @@ impl CudaDeferredReleaseQueue {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if self.is_device_lost() {
                 drop(execution);
-                let PendingRelease { fences, action } = entry;
-                for fence in fences {
-                    fence.retain_after_device_loss();
-                }
-                let bytes = action.bytes();
-                retained.push(RetainedRelease {
-                    label: action.label(),
-                    state: AllocationReleaseState::DeviceLost,
-                    bytes,
-                    detail: String::from("device lost while a poller owned the deferred release"),
-                    ownership: Some(RetainedOwnership {
-                        bytes,
-                        detail: String::from(
-                            "device lost while a poller owned the deferred release",
-                        ),
-                        keep_alive: Box::new(action),
-                    }),
-                });
-                self.counters.quarantined.fetch_add(1, Ordering::Relaxed);
-                self.outstanding.fetch_sub(1, Ordering::AcqRel);
+                retained.push(self.settle_lost_entry(
+                    entry,
+                    "device lost while a poller owned the deferred release",
+                ));
                 continue;
             }
             if !entry.fences.iter().all(|fence| fence.is_complete()) {
@@ -552,26 +574,11 @@ impl CudaDeferredReleaseQueue {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.is_device_lost() {
-            while let Some(PendingRelease { fences, action }) = carry.pop_front() {
-                for fence in fences {
-                    fence.retain_after_device_loss();
-                }
-                let bytes = action.bytes();
-                let detail =
-                    String::from("device lost after a poller observed an incomplete release fence");
-                retained.push(RetainedRelease {
-                    label: action.label(),
-                    state: AllocationReleaseState::DeviceLost,
-                    bytes,
-                    detail: detail.clone(),
-                    ownership: Some(RetainedOwnership {
-                        bytes,
-                        detail,
-                        keep_alive: Box::new(action),
-                    }),
-                });
-                self.counters.quarantined.fetch_add(1, Ordering::Relaxed);
-                self.outstanding.fetch_sub(1, Ordering::AcqRel);
+            while let Some(entry) = carry.pop_front() {
+                retained.push(self.settle_lost_entry(
+                    entry,
+                    "device lost after a poller observed an incomplete release fence",
+                ));
             }
         }
         if !carry.is_empty() || !retained.is_empty() {
@@ -627,8 +634,39 @@ impl CudaDeferredReleaseQueue {
         });
     }
 
-    /// Move every pending request into retained ownership without touching the
-    /// device. Used on device loss.
+    /// Settle one pending entry that can never reach the device again.
+    ///
+    /// The fences are retained rather than destroyed, and the action settles
+    /// its own device-loss state and hands back only the ownership the queue
+    /// must keep. The queue deliberately does **not** keep the unexecuted
+    /// action: an action that owes a mechanism a terminal state would owe it
+    /// forever, its binding/provider-context pins would never be released, and
+    /// for a context-owned queue those pins reach back to this queue, so the
+    /// retained record would keep itself alive.
+    ///
+    /// Callers must hold neither the queue lock nor the execution gate.
+    fn settle_lost_entry(&self, entry: PendingRelease, detail: &str) -> RetainedRelease {
+        let PendingRelease { fences, action } = entry;
+        for fence in fences {
+            // The context is gone; destroying the event would be a driver call
+            // on state that no longer exists.
+            fence.retain_after_device_loss();
+        }
+        let label = action.label();
+        let bytes = action.bytes();
+        let ownership = action.settle_device_lost(detail);
+        self.counters.quarantined.fetch_add(1, Ordering::Relaxed);
+        self.outstanding.fetch_sub(1, Ordering::AcqRel);
+        RetainedRelease {
+            label,
+            state: AllocationReleaseState::DeviceLost,
+            bytes,
+            detail: detail.to_owned(),
+            ownership,
+        }
+    }
+
+    /// Settle every pending request as device-lost without touching the device.
     fn retain_all_pending(&self, detail: &str) {
         let drained: Vec<PendingRelease> = {
             let mut state = self.lock();
@@ -638,27 +676,8 @@ impl CudaDeferredReleaseQueue {
             return;
         }
         let mut records = Vec::with_capacity(drained.len());
-        for PendingRelease { fences, action } in drained {
-            for fence in fences {
-                // The context is gone; destroying the event would be a driver
-                // call on state that no longer exists.
-                fence.retain_after_device_loss();
-            }
-            self.counters.quarantined.fetch_add(1, Ordering::Relaxed);
-            records.push(RetainedRelease {
-                label: action.label(),
-                state: AllocationReleaseState::DeviceLost,
-                bytes: action.bytes(),
-                detail: detail.to_string(),
-                // The action is never executed, so every allocator, pointer,
-                // allowance and pin it holds stays alive and unusable.
-                ownership: Some(RetainedOwnership {
-                    bytes: action.bytes(),
-                    detail: detail.to_string(),
-                    keep_alive: Box::new(action),
-                }),
-            });
-            self.outstanding.fetch_sub(1, Ordering::AcqRel);
+        for entry in drained {
+            records.push(self.settle_lost_entry(entry, detail));
         }
         let mut state = self.lock();
         state.retained.append(&mut records);
@@ -971,6 +990,35 @@ impl DeferredReleaseAction for PreparedReleaseAction {
                 }),
             ),
         }
+    }
+
+    /// Settle the prepared request as device-lost quarantine.
+    ///
+    /// No allocator is called and nothing is refunded: the binding records the
+    /// exact allocation identity as device-lost, the mechanism's queued-release
+    /// count settles, and the active-operation pin is released, so the
+    /// mechanism can reach quiescence and the provider context can confirm
+    /// termination and discharge the quarantine.
+    ///
+    /// Only the pinned allocator is handed back — the same residual the normal
+    /// quarantine path retains. It is what keeps the physical ownership from
+    /// being handed out again, and unlike the request it does not pin the
+    /// provider context, so retaining it cannot keep this queue alive.
+    fn settle_device_lost(mut self: Box<Self>, detail: &str) -> Option<RetainedOwnership> {
+        let request = self.request.take()?;
+        let bytes = request.len() as u64;
+        let allocator = Arc::clone(request.allocator());
+        let outcome = request.quarantine_device_lost();
+        // The observer sees the real terminal outcome. It refunds only what the
+        // allocator reported unmapped, which is zero here, and counts no free.
+        if let Some(observer) = self.observer.as_ref() {
+            observer.released(&outcome);
+        }
+        Some(RetainedOwnership {
+            bytes,
+            detail: detail.to_owned(),
+            keep_alive: Box::new(allocator),
+        })
     }
 
     fn label(&self) -> &'static str {
