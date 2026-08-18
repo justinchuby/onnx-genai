@@ -1,34 +1,115 @@
 # Team Focus — now
 
-**Current focus:** glm-4-9b-int4 CUDA decode-vs-ORT program on H200. Native base decode is now **192.4 tok/s** after #986, with this arc moving **97.5→112→138→192 tok/s** and narrowing the ORT base gap from **2.57× to ~1.30×**. Honest standing: native base still **loses** to ORT base (~250 tok/s). Speculative decode is additive-on-top and is **not** the basis for an ORT-win claim.
+**Current focus:** Base-decode CUDA perf vs ORT + GLM/DeepSeek support, on H200. Two constraints stand: (1) beat ORT under equal conditions on BASE decode first; (2) speculative decode is additive/opt-in only and is never the basis for an ORT-win claim.
 
-## Merged this arc
+## Recently merged (this arc)
 
-- **#978 (`532ef6bc`) — int4 M=1 decode GEMV split-K:** LOP3 dequant + grid-fill split-K for the generic block-size path. glm **97.5→112.4 tok/s** (+15%); qwen block-32 unchanged. A/B: `ONNX_GENAI_GENERAL_SPLITK`.
-- **#981 (`b24e961e`) — decode SkipRMSNorm block kernel:** multi-warp block parallelization for M=1 / M≤8 verify. glm **112.3→137.8** (+22.7%); qwen **125.6→148.85** (+18%). A/B: `ONNX_GENAI_CUDA_DISABLE_SKIP_RMSNORM_BLOCK`.
-- **#986 (`e8f76c53`) — 128-bit wide-load int4 GEMV:** default-on `uint4` wide-load path for glm-class block-128 general-BS GEMV. glm **140.7→192.4 tok/s** (+36.7%); Gaff reproduced +35%; Chew f64 oracle **7/7** and glm/qwen byte-identical. A/B: `ONNX_GENAI_GEMV_WIDELOAD=0`.
+- **#1139 — gate/up SwiGLU decode occupancy 62%→82% via launch_bounds (byte-identical, +2.6% 14b):** `_vec_occ` siblings of the symmetric RMS-fused `_vec` kernels add `__launch_bounds__(256,8)` → caps regs 40→32 (no spill) → 8 blocks/SM = 100% theoretical occ, raising achieved occ 62%→82% on the dominant decode kernel (38.8% of decode time). More resident warps hide the Short-Scoreboard/RMS-staging latency. Byte-identical BY CONSTRUCTION (register-allocation hint, no math/reduction-order change). Flag `ONNX_GENAI_GATEUP_OCC` **default-ON** (`=0` forces non-occ A/B), symmetric-RMS-only (asym `_zp` excluded to avoid spill). Wallace: byte-identity 0.000% on 14b & 7b, **+2.6% 14b (5/5 rounds)**, 7b flat/no-regression. Rachael 🟢 + Wallace GREEN. origin/main @ 0636a759. Biggest single-kernel lever of the campaign.
+- **#1137 — gate/up SwiGLU dequant zero-point bias-fold (byte-identical, −7.4% issued instrs):** fold symmetric −8 int4 zero-point into the dequant magic-bias constants (bottom nibbles `x−1032`; top `fma x*(1/16)−72`) → 4 fewer f16x2 ops/word. Flag `ONNX_GENAI_GATEUP_VEC` **default-ON** (`=0` forces scalar A/B). Byte-identical (0-bit unit test + Wallace 0.000% divergence on 14b & 7b); perf 7b clean **+1.4%**, 14b break-even (decode memory-latency-bound → ALU cuts limited leverage on big model), zero regression. Rachael 🟢 + Wallace GREEN. origin/main @ 70cc06ad.
+- **#1134 — int4 GEMV prefetch pipeline (base decode +5.6% 14b / +2.2% 7b, byte-identical):** PF=2 register shift-register keeps 2 int4 weight-loads in flight per lane on the single-warp block-32 scales-fp16 decode GEMV, cutting Long/Short-Scoreboard stalls. Flag `ONNX_GENAI_GEMV_PIPELINE` **default-ON** (byte-identical: 0-bit unit test + 0.000% divergence over 300 tok). Rachael 🟢 + Wallace independent GPU re-validation. origin/main @ 972fc62d.
+- **#1112 — base-decode on-GPU argmax:** kills per-step logits D2H + host argmax. qwen2.5-14b-int4 **+8.7–9.1%**. Opt-in `ONNX_GENAI_ONGPU_ARGMAX`, default-OFF.
+- **#1119 — argmax tie-break reconciled to lowest-index (ONNX/ORT canonical):** device_argmax now breaks value ties toward the LOWEST global index, matching ONNX ArgMax `select_last_index=false`, `sample_greedy`, and `argmax_logits_tensor`. Byte-identical incl. tie positions; makes the opt-in flag parity-safe for a future default-ON. device_argmax suite 5/5.
+- **#1120 — rustfmt repair** of device_argmax.rs test blocks #1119 left unformatted (unblocks Fast CI).
 
-All landed default-on, portable, capture-clean, and byte-identical at greedy-token level.
+## Native-vs-ORT base-decode standing (measured 2026-08-17, Wallace)
 
-## In flight
+Fresh steady-state decode (medians of 5, 128 tok, on-GPU argmax ON), native CUDA vs ORT CUDA 1.27 on the SAME int4 model+prompt:
 
-- **Deckard — `squad/int4-gemv-wideload-v2`:** base GEMV-v2 to deepen memory-level parallelism and push native int4 GEMV streaming from **1.40→2.42 TB/s** (ORT level), aiming to beat ORT base decode (~250 tok/s; target around ~280 tok/s if full streaming is captured).
-- **Batty — `squad/spec-decode-w9-contract`:** fix the W=9 speculative-decode contract after #988. This is a secondary on-top layer: captured spec must match plain M=1 greedy before it can stack on base decode.
+| Model | Native | ORT | native/ORT |
+|---|---|---|---|
+| Phi-4-mini (3.8B) | 312.3 | 234.2 | **1.33×** |
+| qwen2.5-7b | 305.6 | 271.3 | **1.13×** |
+| qwen2.5-14b-zp | 153.3 | 85.2 | **1.80×** |
 
-## Killed / learned
+**Native is ahead of ORT CUDA on all three int4 models under real deployment conditions.**
 
-- **cp.async M=1 int4 GEMV is a NO-GO** (#980 closed, not merged): every config regressed −15% to −20%. M=1 has ~8 FMA per loaded word, so async-copy machinery has no compute to overlap.
-- The earlier “base-decode floor” verdict is **overturned**. ORT streams the same int4 GEMV at **2.42 TB/s** vs native now **1.40 TB/s** after #986; the remaining base gap is MLP/streaming-limited, not compute-limited or irreducible dequant math.
-- **#984 is closed/superseded.** Captured verify had qwen workspace/capture failures and is no longer the active artifact.
-- **#988 fixed capture crashes but is rejected.** Gaff 🟢 approved graph-slot/capture stability, but Chew 🔴 rejected qwen W=9 (`spec_tokens=8`) because captured spec diverges from plain greedy at token[2] (**9370 vs 2810**). Deckard is locked out; Batty owns the contract fix.
+### ORT-fairness decomposition (Wallace, 2026-08-17 — the honest anatomy of the lead)
 
-## Prior waves (compressed)
+Root-caused the earlier "ORT errors through harness": auto-discovery was silently loading the **conda CPU-only ORT**; fixed by pinning `ONNX_GENAI_ORT_LIB` to the CUDA build + `ONNX_GENAI_EP_FALLBACK=1`. With that fixed:
 
-Earlier August work delivered native CUDA capture, bf16/int4 decode improvements, Marlin M>1 speculative-verify capture, DeepSeek/QMoE fixtures, and Apple/fixture/testing directives. Detailed history lives in `.squad/decisions-archive/2026-08.md` and agent history archives. Old 27B QMoE / LinearAttention status is no longer the current focus.
+**Graph-vs-graph is UNATTAINABLE — and that's the finding, not a gap in our test.** Stock ORT CUDA EP **cannot capture a usable CUDA graph** on these onnxruntime-genai int4 models (shape-massaging nodes forced to CPU + dynamic KV): `enable_cuda_graph=1` no-ops on 14b (80.7 vs eager 83.4), is garbage on Phi (4.4 tok/s), fails on 7b. **Native *can* capture (it owns the KV cache + does static-shape replay) — that capability is itself the source of the lead, and ORT structurally can't match it on these models.**
+
+Fair kernel-isolation test = eager-vs-eager (both launch-bound), medians of 5:
+
+| Model | ORT eager | native CLAIMED (graph+argmax) | native EQUAL (eager+argmax) | native PURE (eager, host argmax) |
+|---|---|---|---|---|
+| qwen2.5-14b-zp | 83.4 | 167.1 (**2.00×**) | 106.5 (**1.28×**) | 67.5 (0.81×) |
+| qwen2.5-7b | 273.6 | 312.3 (**1.14×**) | 207.0 (0.76×) | 206.4 (0.75×) |
+| Phi-4-mini | 230.1 | 313.1 (**1.36×**) | 198.0 (0.86×) | 199.2 (0.87×) |
+
+**Verdict — the win is ARCHITECTURAL, not per-kernel:** captured-graph launch-overhead elimination = **+51–58% on every model** (dominant lever); on-GPU argmax = huge on 14b (152k-vocab D2H avoidance, +58%), ~0 on small vocab; **intrinsic per-kernel decode: native is 0.75–0.87× of ORT eager on all three** — ORT's kernels are actually slightly faster. This **independently corroborates the batch-1 kernel NO-GOs**: kernels are not where the win is or where headroom lives.
+
+**Strategic read:** our moat is graph-capture + device-sampler integration on dynamic-KV int4 models — a *capability* ORT can't provide, more durable than a tuning lead. The honest headline: *"1.14–2.00× faster than ORT under identical deployment conditions, because native captures a full-decode CUDA graph + on-GPU sampling that ORT's CUDA EP structurally cannot on these models; intrinsic per-kernel throughput is comparable-to-slightly-behind."* Do NOT chase more byte-identical GEMV micro-ops — mis-aimed. Leverage lives in (a) preserving/extending the graph + device-sampling envelope, (b) arithmetic intensity (M>1 QMoE / low-bit). ORT CPU fallback negligible (2 non-GEMM nodes).
+
+**Kernel-level lever (graph-independent):** int4 **MatMulNBits GEMV family = ~77% of decode GPU time**; dominant single kernel `matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm` = **38.8%**, running at **1.4 TB/s = ~29% of H200 4.8 TB/s peak**, top stall **Short Scoreboard (shared-mem staging)**, ~3× bandwidth headroom. Software-pipelining the dequant→compute path to raise DRAM util toward 70–80% is the highest-leverage next win.
+
+- **gate/up cp.async weight-stream pipeline (`ONNX_GENAI_GATEUP_CPASYNC`, branch `squad/gateup-cpasync` @ eff4e0e7) — NOT merged, NO-GO:** double-buffer int4 weight loads global→shared via `cp.async` to hide DRAM latency behind compute. **Byte-identical (0 mismatching bits, cp.async is a pure value-preserving copy)** BUT a hard regression: kernel **2.3× slower** (52.96→119.9us), DRAM util *halved* (33.4%→15.4%), Long Scoreboard *rose* (12.68→13.73), E2E 14b −36%. Deeper 3-stage didn't rescue → fundamental. **Mechanism: #1139's 82% occupancy already saturates TLP latency-hiding; for a once-used int4 stream with tiny per-tile compute, the global→shared→register round-trip + commit/wait/LDS issue overhead has nothing to overlap behind. Direct LDG + high occupancy wins.** Also corrected the ncu wording: the dominant kernel's top stall is **Long Scoreboard (global weight-load latency, ~52%)**, NOT Short Scoreboard/shared-mem (LDS only 0.18 cyc) — so the winning direction is register-resident, not smem-staged. Branch preserved.
+
+## Shelved (honest NO-GO)
+
+- **gate/up pre-permute (`ONNX_GENAI_GATEUP_PREPERM`, branch `squad/gateup-preperm` @ 6629f0aa) — NOT merged:** `_vec_occ_preperm` stages the normalized activation once in weight-nibble-interleaved order → main loop reads with one vector load, no per-iter `prmt.b32`. **Byte-identical (Rachael 🟢: hoisted permute proven to preserve exact FMA accumulate order + RMS reduction; Wallace: 0.000% divergence on BOTH 14b & 7b over 300 tok).** BUT the perf win did not reproduce: ncu-isolated −3.4% kernel win is real, yet E2E is within noise (14b median +0.27%, 2/5 rounds regressed, widened variance; 7b flat). Decode is memory-latency-bound → ALU-side savings don't convert. Shelved as a dead default-OFF flag would be pure maintenance debt. Branch preserved. **Lesson: post-occupancy, the dominant gate/up kernel is memory-bound (Short-Scoreboard 52% of stall, DRAM ~33%, 1.4 TB/s = ~29% of peak) — further ALU cuts have limited leverage. Next wins must be memory-side.**
+
+- **MLP down-proj occupancy (`ONNX_GENAI_DOWN_OCC`, branch `squad/down-occ` @ 393b162d) — NOT merged, NO-GO:** applied #1139 `__launch_bounds__(256,8)` to `_down_tpl`. **Byte-identical (0-bit test across c2/c4/c8 COLS widths, launch_bounds is register-cap-only).** Occ rose 66.5%→**87.3%** BUT duration FLAT (22.62→22.59us), E2E 14b base won 5/5 (−0.8%). Two kill-switches hit: (1) **spilled** at 32-reg cap (245,760 local-mem reqs — down's heavier body: 4× permute + COLS accumulates + `warp_sums[8][COLS]` shared reduction), pushing Long-Scoreboard *up* 9.62→11.49; `(256,6)` fallback useless (kernel already 39<48 regs = 75% theoretical). (2) **No conversion** — down is already ~38% DRAM, so occupancy isn't the residual bottleneck. Branch preserved. **Lesson: launch_bounds occupancy only converts on kernels that (a) fit the reg cap spill-free AND (b) are occupancy-starved, not already near-bandwidth. down fails both.**
+
+- **attn q/o `_pipe` occupancy (`ONNX_GENAI_QO_OCC`, branch `squad/qo-occ` @ 9ba8c131) — NOT merged, NO-GO:** applied #1139 `__launch_bounds__(256,8)` to the q/o `_pipe` kernel. **Byte-identical (extended `scales_f16_pipeline_is_bit_identical_to_scalar` to genuinely exercise the `_pipe_occ` arm — 0-bit across q/o, wide-MLP, small, ragged-N × fp16/fp32 scales).** Perf NO-GO — actively regresses: duration 10.27→**13.44us (+31%)**, achieved occ 58.1%→**55.4% (down!)**, **spill 0→281,600 reqs**, E2E 14b base won 3/3 (−6.4%, 166.3 vs 155.4 tok/s). **The register-granularity trap: Hopper allocates registers in steps of 8. `_pipe` uses 40 (75% theoretical); the only step below is 32 (100%), which spills — no 36-reg option. `(256,7)` also yields 32 regs + identical spill; `(256,6)` is a no-op (permits 42, kernel uses 40).** Branch preserved.
+
+## Batch-1 kernel vein MINED OUT (decisive campaign conclusion, evidenced 5×)
+
+**Kernel fusion scope (Luv, profiling-only, NO-GO) — the top candidate already exists & is shelved:** QKV fusion is already built in-repo (`CudaQkvProjectionFusion`, `optimizer.rs:2103`, flag `ONNX_GENAI_CUDA_ENABLE_QKV_FUSION` default-OFF); byte-exact, cuts −104 GEMV launches/token, previously measured flat-to-worse (47.33→47.26 tok/s 30B). Luv independently reproduced **−10.8% on qwen2.5-14b** (167.7→149.4 tok/s, base wins 3/3) — worse because the fused wide-N node drops the tuned `_pipe`/`_down_c2` dispatch + adds a `Split` copy, forfeiting the #1134/#1139 wins. Input-RMSNorm→QKV fold and down-fold cut only launches/tiny-activation-traffic (not weight bytes) → predicted flat + RMS-reduction-delicate + lose per-kernel tuning. gate/up & lm_head already fused.
+
+**Root cause (now evidenced 5× — preperm, cp.async, down_occ, qo_occ, QKV-fusion all fail for the SAME reason):**
+1. Decode is **weight-DRAM-bandwidth-bound** — every GEMV streams its full disjoint int4 weights once/token; no batch-1 lever (fusion, occupancy, pipelining) reduces those bytes.
+2. **CUDA graphs already amortize launch overhead** — the classic fusion win is pre-captured; only ~1.1us GPU bubbles + ~10KB activation round-trips remain (<0.3% of traffic).
+3. The 3× DRAM-bandwidth headroom only converts by raising **arithmetic intensity** — i.e. amortizing each weight read across **M>1 token-columns** (batched verify / spec-decode territory, which is additive-only and shelved for fast-base) OR **lower-bit/mixed-precision quant** (cuts weight bytes directly — oracle-gated, Rachael's domain, NOT byte-identical).
+
+**Campaign takeaway:** batch-1 byte-identical decode is at the bandwidth floor and native already leads ORT on all 3 int4 models. Further headline gains require either (a) proving the ORT lead holds under equal graph conditions (fairness follow-up), (b) net-new model support (GLM/DeepSeek — untouched mandate half), or (c) oracle-gated lower-bit quant.
+
+## GEMV-family decode survey (Luv, 2026-08-17 — where the leverage is)
+
+Ranked decode mix (nsys, 14b, GEMV family ≈ 86.8% of decode):
+1. **gate/up SwiGLU+RMS `_vec_occ` — 42.8%**, occ 82%, Long-SB ~52% stall. #1134+#1137+#1139 done → **near floor** (preperm + cp.async both NO-GO'd here).
+2. **MLP down-proj `..._scales_f16_down_c2` — 24.4%**, DRAM 39.9%, occ **66%** (regs 39 cap theoretical to 75%), Long-SB 9.4 + Barrier 2.7. Grid-fill only, **MISSING #1139 launch_bounds** → **next lever**.
+3. attn q/o `..._pipe` — 14.7%, occ **59%** (regs 40), Long-SB 11.2. #1134 pipe done, missing launch_bounds → **secondary lever**.
+4. lm_head `..._rmsnorm` — 4.9%, occ 91%, issue-bound → near floor, skip.
+
+Whole family is **Long-Scoreboard (global int4 weight-load latency) bound**, DRAM 30–40% of peak → ~2.5–3× BW headroom. The lever that converts is **occupancy-based latency hiding** (#1139: +2.6%), NOT bandwidth tricks (cp.async/PF=2 both NO-GO on issue-bound kernels). 128-bit gate/up loads NOT applicable (already 128B-coalesced; per-lane widening reorders accumulate → breaks byte-identity). down_c2 already uses uint4 loads → its headroom is occupancy, not load-width.
+
+## In flight / next levers
+
+Batch-1 kernel vein mined out (5 NO-GOs). Three parallel fronts, all higher-value than another batch-1 micro-opt:
+
+- **Wallace — ORT fairness follow-up (in flight):** THE open question on the headline claim. Native leads ORT (1.33/1.13/1.80×) but native runs a captured CUDA graph while ORT runs eager. Get ORT into CUDA-graph mode (static-shape IO binding) for graph-vs-graph, or isolate the kernel-only delta via eager-vs-eager. Either outcome is honest.
+- **🎯 V2-Lite CUDA-graph-capture UNLOCK (top lever, 2-STAGE — stage 1 done, stage 2 IN FLIGHT):** Wallace scoped GO → Deckard implemented the mask classifier → but a SECOND pre-existing blocker gates the real win.
+  - **Stage 1 ✅ MERGED — Wallace's corrected classifier (PR #1171, main @ `bc1e97ff`):** topology-gated capacity-classifier in `executor/{geometry,build}.rs`. Deckard's original was 🔴 REJECTED (2 safety blockers); Deckard LOCKED OUT, **Wallace revised** (same capacity-policy surface he scoped), Rachael 🟢 re-approved, admin-merged. Both blockers fixed, strictly TIGHTENING: (1) `is_capacity_form_attention_mask_input` requires present-KV `inputs[4]`+`inputs[5]` (grounded `standard_attention.rs:822-840`), test `mask_builder_to_attention_without_past_kv_is_rejected`; (2) dropped `value != mask` exception so a root mask that escapes as graph output is rejected, test `mask_binding_that_is_graph_output_is_rejected`. GLM-5.2 `Add` exclusion preserved.
+  - **Stage 2 ✅ MERGED — LEON'S `_d1` FIX = 1.79x WIN (PR #1181, main @ `c9c7f64c`):** additive-mask query axis `_d1` (`v_model.Unsqueeze_18` `['batch',1,'_d1','past+seq']`) was an unresolved internal symbol → prepare-only planner refused the Attention workspace. Leon's fix = EXACT recovery through the V2 mask cone (`Shape/Sub/Slice/Unsqueeze/Where/Cast`) → `_d1`=`sequence_len`, no max-seq guess. Fail-closed: unsupported chains fall back to bounded/error, never guess. Rachael 🟢 (planner recovery exact/deterministic/fail-closed, dense planning unchanged, new test asserts `[1,1,1,2048]`) + Wallace 🟢 GO (**0.000% divergence over 320 tokens; capture 101.80 vs eager 56.94 tok/s median = 1.79x, zero arm overlap** min-ON 100.57 > max-OFF 57.00). Qwen3 dense reservation unchanged (983040 B), eager untouched, opt-in `ONNX_GENAI_CUDA_GRAPH` no default flip. **THE graph-capture top lever is FULLY LANDED (classifier #1171 + `_d1` fix #1181). The DeepSeek MoE performance half of the mandate is CLOSED under equal conditions — byte-identical base decode, opt-in flag, NOT spec-decode. Durable +79% architectural moat: extends graph-capture to the MoE decode path, a capability ORT's CUDA EP structurally can't provide on dynamic-KV int4.** Follow-ups dispatched: Leon owns a newly-found long-context Attention workspace under-plan on the Engine/`--steady` path (node 38 needs 33288 vs 16904 at ~320 tok, present in eager+capture, NOT capture-specific); Wallace measuring Native-vs-ORT on V2-Lite directly (the missing table row).
+- **✅ MERGED — Luv QMoE gate/up occupancy lever (PR #1167, main @ `651901a3`):** flag `ONNX_GENAI_QMOE_OCC` default-OFF. Ported dense #1139 gate/up occupancy win to fused gate/up SwiGLU expert GEMV. ncu: 54 reg/50% theo/43.3% ach/42.3us → (256,6) 40 reg spill-free/75% theo/63.8% ach/37.8us (−10.6% kernel). Byte-identical (`qmoe_occ_is_bit_identical` 0 bits; qmoe_gpu 32/32; E2E tokens=golden). Rachael 🟡. Note: flag selects `_occ` for any QMoE QuantLayout when enabled. Discovered+fixed pre-existing fmt drift blocking all PRs' Fast check (#1172 landed same fix independently). `qmoe_linear`/grouped-GEMM at floor — **QMoE occupancy vein mined out.** Branch deleted, worktrees cleaned.
+- **✅ MERGED #1150 (main @ e075a715) — DeepSeek-V2-Lite MoE E2E native + f64-correct CUDA golden.** Combined Leon's planner fix + Luv's oracle correction into one reviewer-gated unit (Rachael 🟢 on both planner regression and oracle re-gate). Golden rebased CPU→native-CUDA (`…207,16,24,1012`), justified by f64 reference (CUDA closer to truth than CPU on every measured QMoE/dense case). New f64-bounded QMoE test + env-gated router probe `ONNX_GENAI_QMOE_ROUTE_DUMP`. Luv rebased onto current main pre-merge and confirmed the golden held through #1129's MoE-claiming change (graphs OFF/ON both pass). Branches `squad/qmoe-divergence-fix` + `squad/leon-deepseek-v2-planner` deleted. **Episode resolution: the "CUDA numerics bug" was a WRONG-ORACLE premise error, not a kernel bug** — CPU-vs-CUDA divergence is benign f32 accumulation-ORDER drift; the repo already treats f64 (not CPU) as truth and never required CPU=CUDA bit-equality (`matmul_nbits_gpu.rs:734` tol `2e-4.max(·*2e-5)`). Token-5 expert-set swap (CPU expert 61 / CUDA expert 1) is a below-fp32-resolution near-tie (logit Δ~5e-5 < reassoc drift ~4.7–6.4e-5); Rachael judged an epsilon tie-break arbitrary and accepted it. Leon's original lock-to-CUDA instinct was right; his SIN (correctly 🔴'd) was doing it SILENTLY — the merged artifact does it explicitly with f64 justification.
+
+## GLM/DeepSeek support scope (Luv, 2026-08-17 — more mature than archive implied)
+
+| Model | Arch | E2E native? | Decode |
+|---|---|---|---|
+| GLM-4-9B int4 | dense GQA partial-RoPE | ✅ | 98.2 tok/s (native-only; ORT can't load it) |
+| DeepSeek-R1-distill-1.5B | dense Qwen | ✅ | 690 tok/s |
+| DeepSeek-V2-Lite int4 (MoE) | QMoE + std Attention | ✅ supported + f64-correct (#1150) | **55.6 tok/s median (H200, eager)** [Wallace 2026-08-18, corrected baseline @ e075a715]; golden locked to native-CUDA validated vs f64; CPU divergence proven benign reassociation drift. **ORT CUDA EP CANNOT run it** — no QMoE CUDA kernel → all 26 MoE layers fall to CPU EP (0.20 tok/s, ~280× slower, CPU-fallback artifact). Native is the ONLY engine serving int4 QMoE on GPU (same class as GLM-4-9B). **Graph capture: unlock IN PROGRESS** — Wallace scoped GO (over-conservative bail, not a hard wall); Deckard implementing topology-gated capacity-policy fix on `squad/v2lite-graphcapture`; projected 54.3 → ~82–86 tok/s (+51–58%) once captured. |
+| GLM-5.2 MoE (CSA/IndexShare) | MoE + sparse attn | tiny fixtures only | — |
+
+**Key structural facts:** MLA is NOT a custom op — DeepSeek-V2 exports as standard `RotaryEmbedding`+`Attention` → **no MLA-kernel gap**. QMoE router+expert-GEMV, CompressedSparseAttention (V4-Flash/GLM-5.2), IndexShare/DSA CUDA kernels **all already exist** + CPU-oracle validated. Gaps: (1) V2-Lite MoE blocked E2E in workspace planner → Leon; (2) QMoE expert-GEMV under-optimized (pre-campaign schedule) → Luv; (3) native MLA kernel — no model needs it today, low priority; (4) GLM-5.2 MoE perf — kernels exist, blocked on a real int4 artifact.
+
+- **Deferred (oracle-gated, Rachael's domain if pursued):** lower-bit/mixed-precision quant — the only remaining lever that cuts weight-bytes-per-token, but not byte-identical.
+- Foundry-local ORT benchmarking remains the fairness reference for every native-vs-ORT claim.
+
+## Spec-decode status (shelved)
+
+Model-draft spec-decode on qwen2.5-14b-int4 is an honest **NO-GO** for this fast-base config (best E2E net 0.974× @ W=4, byte-identical; free-draft ceiling ~1.175× < 1.25× gate). Byte-identical machinery is built and shelved on `squad/spec-*` branches for future slower-base/different-draft configs. No spec-decode ORT-win claim allowed.
 
 ## Standing facts
 
-- Native-vs-ORT comparisons must use identical weights, optimized CUDA decode configs, steady-state methodology, and oracle/token fairness where applicable.
-- Base native decode must be compared against ORT base; speculative decode is additive and cannot be used as the ORT-win basis.
-- CUDA-graph decode profiling should use `nsys --cuda-graph-trace=node`; eager op profiling can mis-rank launch-heavy ops.
-- Keep shipped decode optimizations byte-identical or oracle-gated, portable/default-on only when Rule 11 is satisfied, and guarded by honest A/B env vars.
+- Canonical greedy/argmax tie-break is **LOWEST index** (ONNX ArgMax `select_last_index=false`, matching ORT); all decode/sampling/argmax paths must keep the lowest token id on ties for byte-identical ORT parity.
+- Native-vs-ORT comparisons must use identical weights, optimized CUDA decode configs, steady-state methodology, and oracle/token fairness. Base native decode is compared against ORT base; spec decode is additive and cannot be the ORT-win basis.
+- CUDA-graph decode profiling must use `nsys --cuda-graph-trace=node` / `ncu --graph-profiling node`; eager op profiling can mis-rank launch-heavy ops. The per-op timer is blind to captured CUDA-graph replay.
+- Keep shipped decode optimizations byte-identical or oracle-gated, portable/default-on only when validated, guarded by honest A/B env vars.
+
+## Prior waves (compressed)
+
+Earlier August work delivered native CUDA capture, bf16/int4 decode improvements, Marlin M>1 speculative-verify capture, DeepSeek/QMoE fixtures, split-K/SkipRMSNorm/128-bit-wideload GEMV wins, and testing directives. Detail lives in `.squad/decisions-archive/2026-08.md` and agent history archives.

@@ -80,3 +80,9 @@ All five red CI jobs trace to pre-existing `onnx-genai-server` failure on `main`
 - Established precedent: int4 GEMV/QMoE CPU bit-identity is not the oracle when CPU and CUDA use different f32 accumulation orders; use f64-bounded evidence plus deterministic backend output and explicit golden rationale.
 - Final merge: PR #1150 landed on `main` at squash `e075a715`; reviewer lockout was honored throughout.
 
+
+## 2026-08-18T03:15Z — QMoE/classifier/planner review gates closed
+
+- Approved Luv's default-OFF QMoE occupancy lever (#1167) with a non-blocking scope caveat.
+- Rejected Deckard's first V2-Lite mask classifier for two safety blockers and enforced reviewer lockout; re-approved Wallace's tightened revision after present-KV and root graph-output negative tests.
+- Approved Leon's `_d1` additive-mask query-axis workspace-planner fix (#1181) as exact and fail-closed; Wallace's hardware A/B then closed the DeepSeek MoE performance mandate at 1.79× capture/eager with 0.000% divergence.

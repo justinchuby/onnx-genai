@@ -43,3 +43,9 @@ tok/s**, capture fully engaged (1 segment / 0 seams).
 - Rachael's initial 🔴 on the silent golden move triggered reviewer lockout; Leon did not revise the rejected artifact. Lockout cleared on merge.
 - Final outcome: V2-Lite MoE E2E is unblocked; correctness is gated by a native-CUDA/f64-justified golden rather than CPU bit-identity.
 
+
+## 2026-08-18T03:15Z — V2-Lite `_d1` planner fix landed; Engine long-context follow-up
+
+- PR #1181 landed as `c9c7f64c`, fixing the V2-Lite additive-mask query-axis workspace-planner under-resolution by deriving exact `_d1` shape through deterministic mask-cone producers.
+- Rachael approved the planner path as exact, bounded, and fail-closed; Wallace's final real-model A/B showed the combined classifier+planner unlock is byte-identical over 320 tokens and 1.79× faster under capture.
+- Follow-up assigned: long-context `Engine::generate` Attention workspace under-plan on node 38 (requires 33288 bytes vs prepared 16904 around ~320 tokens), reproducing in eager and capture and therefore not capture-specific.
