@@ -120,6 +120,54 @@ resident 0.5B. On this 8 GB box the 14B can only stream, where a different limit
 (`CaptureRecordingFailed` streaming seams + HtoD bandwidth) dominates and the resident fix is
 neither helpful nor harmful in a measurable way.
 
+## Fixed per-step batch cost — the input expert-aware MoE batching needs
+
+Route-aware / expert-aware batching (dispatch requests that share MoE experts together, so a
+loaded expert serves many requests before eviction) is a **batching** technique: its value is
+that a shared-expert batch is cheaper than the same requests run separately. That only pays if
+the per-step cost of *being* a batch is small. So the question it must answer first is: **what
+does batch-N cost before any clever scheduling, and what would it need to cost to pay?**
+
+Decompose the measured step into a fixed intercept + per-row slope (differencing cancels the
+shared work; qwen05b-q4, resident, medians):
+
+| arm | fit `total_ms ≈ fixed + slope·M` | fixed per-step batch cost | marginal per row |
+|-----|----------------------------------|--------------------------:|-----------------:|
+| **before fix** | 25.1 (M=2), 24.7 (M=4), 27.5 (M=8) | **≈ 22–24 ms** | **≈ 0.4 ms/row** |
+| **after fix**  | 5.15 (M=2), 9.9 (M=4), 16.4 (M=8)  | **≈ 1.4 ms**   | **≈ 1.9 ms/row** |
+
+The mechanistic view agrees with the fit: before the fix the fixed cost is the segmented-replay
+`kernel_host_dispatch` term (~22 ms, flat M=2→M=4); the marginal per row is tiny only because
+the capture-unsafe tiled seam GEMM is itself M-independent for M≤16.
+
+**Interpretation for the scheduler.**
+
+- **Before the fix, batching carries a ~22–24 ms flat penalty that is essentially independent
+  of how many requests are in the batch.** A route-aware scheduler optimising the numerator
+  (bandwidth saved on expert loads) would be doing so while the denominator is broken: every
+  step pays ~22 ms of eager seam replay regardless of how well the batch is packed. On this
+  stack, in this state, batching-dependent techniques are gated — the fixed cost would likely
+  swamp any expert-load bandwidth saving unless the batch is enormous.
+- **The penalty is structural and fixable, not diffuse.** It has a single dominant cause —
+  CUDA-graph capture segmentation from the 24 fused-SwiGLU seam nodes — and a byte-identical
+  change removes essentially all of it. After the fix the step cost is `≈ 1.4 ms + 1.9 ms/row`:
+  a normal linear model where adding a request costs about what its work costs. That is the
+  regime in which expert-aware batching can pay.
+- **So the ~22 ms fixed batch cost is a precondition for a class of MoE serving techniques, not
+  just a throughput number.** Recommendation to whoever owns the routing-trace simulation:
+  model the per-step batch cost as **~22 ms fixed (today) vs ~1.4 ms fixed (with this fix
+  landed)**, and treat "does expert-aware batching pay?" as conditional on this fix landing.
+  Run the offline overlap-vs-FIFO sweep against *both* constants — the answer may invert.
+
+**Backend neutrality (DRY).** *Measured:* native CUDA decode. *Inferred:* the seam and its fix
+are in the **shared** CUDA kernel (`MatMulNBits` `capture_support` / `run_f16_gate_up_swiglu` in
+`onnx-runtime-ep-cuda`), not in a native-only decode-loop branch. CUDA-graph capture and
+`replay_device_graph` live in `onnx-runtime-session`, which both the native and ORT decode
+drivers use on the CUDA EP. So the fixed penalty and its removal apply to **both** backends
+identically — a route-aware technique built on it would not be left native-only. (The ORT batch
+decode path was not separately measured here; that neutrality claim is inferred from the shared
+kernel/capture location, not measured.)
+
 ## Disposition — coordination collision (why the fix is not merged here)
 
 The fix lives in `run_f16_gate_up_swiglu`, which is the swiglu team's in-flight area (Estrin
