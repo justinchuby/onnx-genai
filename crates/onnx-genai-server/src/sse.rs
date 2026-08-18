@@ -47,6 +47,11 @@ pub(crate) struct Delta {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    /// The model's private thinking, carried beside the answer rather than
+    /// inside it so a client can show its progress without the two being
+    /// mistaken for one another.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ChunkToolCall>>,
 }
@@ -202,6 +207,7 @@ pub(crate) fn role_chunk(id: &str, created: u64, model: &str) -> ChatCompletionC
             delta: Delta {
                 role: Some("assistant"),
                 content: None,
+                reasoning_content: None,
                 tool_calls: None,
             },
             logprobs: None,
@@ -227,9 +233,36 @@ pub(crate) fn content_chunk(
             delta: Delta {
                 role: None,
                 content: Some(content),
+                reasoning_content: None,
                 tool_calls: None,
             },
             logprobs,
+            finish_reason: None,
+        }],
+    }
+}
+
+/// A chunk carrying the model's private thinking rather than its answer.
+pub(crate) fn reasoning_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    reasoning: String,
+) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.to_string(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: Delta {
+                role: None,
+                content: None,
+                reasoning_content: Some(reasoning),
+                tool_calls: None,
+            },
+            logprobs: None,
             finish_reason: None,
         }],
     }
@@ -295,6 +328,7 @@ fn tool_call_delta_chunk(
             delta: Delta {
                 role: None,
                 content: None,
+                reasoning_content: None,
                 tool_calls: Some(vec![tool_call]),
             },
             logprobs: None,
@@ -320,5 +354,32 @@ pub(crate) fn done_chunk(
             logprobs: None,
             finish_reason: Some(finish_reason),
         }],
+    }
+}
+
+#[cfg(test)]
+mod reasoning_wire_tests {
+    use super::{content_chunk, reasoning_chunk};
+
+    // Reasoning rides on its own `reasoning_content` key and never touches
+    // `content`, so an OpenAI-compatible client that ignores the extra field
+    // sees the same answer stream as before while a reasoning-aware one can show
+    // the model working.
+    #[test]
+    fn a_reasoning_chunk_carries_reasoning_content_and_no_content() {
+        let chunk = reasoning_chunk("id", 0, "m", "weighing it".to_string());
+        let json = serde_json::to_string(&chunk).expect("serialize");
+        assert!(json.contains("\"reasoning_content\":\"weighing it\""), "{json}");
+        assert!(!json.contains("\"content\""), "{json}");
+    }
+
+    // An ordinary answer chunk omits `reasoning_content` entirely, so its wire
+    // shape is byte for byte what it was before the channel existed.
+    #[test]
+    fn a_content_chunk_omits_reasoning_content() {
+        let chunk = content_chunk("id", 0, "m", "Hi".to_string(), None);
+        let json = serde_json::to_string(&chunk).expect("serialize");
+        assert!(json.contains("\"content\":\"Hi\""), "{json}");
+        assert!(!json.contains("reasoning_content"), "{json}");
     }
 }

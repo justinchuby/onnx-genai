@@ -273,6 +273,11 @@ pub struct ChatMessage {
     pub role: String,
     #[serde(default)]
     pub content: Option<ChatMessageContent>,
+    /// The model's private thinking, carried beside the answer rather than
+    /// inside it so a client can show its progress without the two being
+    /// mistaken for one another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ChatMessageToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

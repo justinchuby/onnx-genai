@@ -39,7 +39,8 @@ use crate::{
     session::SessionRegistry,
     sse::{
         StopBoundaryBuffer, completion_chunk, completion_done_chunk, content_chunk, done_chunk,
-        role_chunk, send_completion_stream_chunk, send_stream_chunk, tool_call_delta_chunks,
+        reasoning_chunk, role_chunk, send_completion_stream_chunk, send_stream_chunk,
+        tool_call_delta_chunks,
     },
     state::{AppState, DEFAULT_MAX_OUTPUT_TOKENS, ServerConfig},
     types::{
