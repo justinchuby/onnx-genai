@@ -2770,3 +2770,79 @@ Not started: paged/appendable KV behind an attention-owned handle (§13's bounda
 stands), and beam reorder, which still does not exist on any EP.
 
 Nothing here defers to ORT and nothing links MLAS.
+
+## 32. Phase 12: erf's Estrin reassociation shipped with an unreproducible speedup headline (#1218)
+
+The change in #1218 is sound and it landed: `erf`'s two on-path polynomials (the
+big-branch `R` and the `exp` it feeds) now evaluate by Estrin's scheme instead of
+Horner's, trading two extra multiplies for half the dependency depth on a
+latency-bound chain. What did not survive review is the number in its title.
+
+### 32.1 The withdrawn headline
+
+The PR shipped as *"evaluate erf's on-path polynomials with Estrin's scheme
+(1.66x -> 1.36x vs ORT)"*. That phrasing claims the kernel closed an ORT gap from
+1.66x to 1.36x — roughly a 17.7% kernel-time reduction. **That figure is withdrawn.**
+It was neither reproduced nor refuted, for the plain reason that it is measured
+against a reference this reviewer does not have: there is no pinned ORT build on the
+review host, and the PR's original number came from different hardware. A ratio you
+cannot re-run is not a result you can publish, whichever direction it would have gone.
+
+The merge-commit subject on `main` still carries the old ratio — a squash subject
+cannot be rewritten after the fact — but it is the least-cited copy. The overstated
+number reached no benchmark table, no README, and no source comment; this section is
+the durable correction of record, in the same place and style as the #1226 and #1230
+withdrawals above (§30.2).
+
+### 32.2 What was measured instead
+
+Same-binary, ORT-independent A/B on the shipping kernel. Two builds of `erf_avx2`
+(base Horner vs this PR's Estrin), single thread, min-of-200 runs repeated over 9
+rounds, on a 1,048,576-element mixed-range buffer, on an **Intel Core i7-13800H
+(14C/20T), Windows 11**:
+
+| build | per-round min (ms) | best |
+| --- | --- | ---: |
+| Horner (base) | 0.6346-0.6348 (8/9 rounds) | 0.6346 |
+| **Estrin (#1218)** | **0.6042-0.6043 (8/9 rounds)** | **0.6042** |
+
+The ranges do not overlap, so the direction is real: **~5.0% faster (1.05x)** on the
+erf kernel on this host. That is a genuine win and consistent with the mechanism (a
+shorter dependency chain on a latency-bound evaluation), but it is a fraction of the
+~17.7% the title implied. The honest statement is: Estrin is measurably faster here by
+about 5%; the "1.36x vs ORT" claim is unverified against a reference we do not run.
+
+### 32.3 The durable fact: this reassociation is NOT bit-identical
+
+Estrin reassociates floating-point FMAs, so it **does not** produce the same bits as
+Horner, by construction. This is a property of the shipped kernel now, not a footnote
+about a PR, so it is stated here in as many words. A two-build dump-and-diff over
+404,045 points — `[-6,6]` sampled densely, the `0.921875` split boundary, large `|x|`,
+denormals, and NaN/±inf — establishes the actual envelope:
+
+* **Estrin differs from Horner by at most exactly one ULP.** 4,401 of 404,043 finite
+  points (1.09%) differ, every one of them by a single ULP; max absolute difference
+  5.96e-8. Nothing anywhere in the domain moves by more than one ULP.
+* **Against f64 `erf` truth:** max error Horner 5.77e-8, Estrin 6.55e-8 (worst just
+  past the split, x≈0.933). Both are within ~1 ULP of the correctly-rounded f32
+  result; Estrin is at most ~0.8e-8 looser than Horner and never worse than one ULP
+  from it.
+* **Special values are correct and identical between the two:** large `|x|`
+  (7 … 1e30, `f32::MAX`) saturate to ±1.0; denormals produce bit-identical outputs;
+  NaN → NaN; +inf → +1.0; −inf → −1.0.
+
+The tripwire is the test **`erf_reassociation_costs_no_accuracy`** in
+`kernels/simd_activations.rs`: it pins the worst scaled error over `|x|<=1` at `2^-24`
+(half a ULP) against `erf_avx2` directly, so a future regrouping that widens the
+envelope fails the build instead of being absorbed by the looser `ERF_BOUND`. A reader
+who needs to know whether erf is bit-stable should start there.
+
+### 32.4 Methodology note
+
+This is the same lesson as §30.2 and §31, arriving from the other direction: there the
+claim was too large and collapsed under interleaving; here the claim was against a
+baseline the reviewer could not instantiate at all. A speedup quoted "vs ORT" is only
+publishable by whoever can run that ORT arm on the same box in the same session. When
+they cannot, the correct report is the ORT-independent internal A/B (which stands at
+~5% here) plus an explicit note that the cross-runtime ratio was not evaluated —
+never the inherited number restated as if verified.
