@@ -26,7 +26,9 @@ pub(crate) struct DecodeCpuKvState {
     /// `(present, past)` port names, index-aligned with `bindings`, retained so
     /// a grown cache can be re-bound to the same ports.
     pairs: Vec<(String, String)>,
-    /// Element type of every KV binding (uniform: `new` declines mixed models).
+    /// Element type of every KV binding. `new` currently binds only `Float32`
+    /// caches, but the growth path sizes its copies from this rather than
+    /// assuming 4 bytes, so widening that gate does not silently corrupt it.
     dtype: DataType,
     pub(crate) max_len: usize,
     logical_len: usize,
@@ -63,6 +65,7 @@ impl DecodeCpuKvState {
         }
         let mut bindings = Vec::with_capacity(pairs.len());
         let mut bound_pairs = Vec::with_capacity(pairs.len());
+        let mut kv_dtype = None;
         for (present, past) in pairs {
             let meta = session
                 .inputs()
@@ -90,6 +93,7 @@ impl DecodeCpuKvState {
             }
             let mut logical_shape = physical_shape.clone();
             logical_shape[2] = 0;
+            kv_dtype = Some(meta.dtype);
             bindings.push(session.allocate_device_binding(
                 past.clone(),
                 Some(present.clone()),
@@ -102,10 +106,11 @@ impl DecodeCpuKvState {
         if bindings.is_empty() {
             return Ok(None);
         }
+        let dtype = kv_dtype.context("bound KV pairs without an element type")?;
         Ok(Some(Self {
             bindings,
             pairs: bound_pairs,
-            dtype: DataType::Float32,
+            dtype,
             max_len,
             logical_len: 0,
         }))
@@ -123,9 +128,19 @@ impl DecodeCpuKvState {
     ///
     /// Growth doubles (bounded below by `needed`), so re-binding is amortised
     /// O(1) per token and a decode that runs to length `n` copies O(n) rows in
-    /// total rather than O(n) per step. The old buffer is staged to host and
-    /// released before the replacement is allocated, so peak RSS is
+    /// total rather than O(n) per step. Each old buffer is staged to host and
+    /// released before its replacement is allocated, so peak RSS is
     /// `old + live_prefix` rather than `old + new`.
+    ///
+    /// `live` is the caller's history length, which is expected to equal
+    /// `self.logical_len`; it is passed explicitly rather than read from the
+    /// field so the rows actually preserved are the caller's decision, and
+    /// clamped so a stale value cannot read past the buffer it is leaving.
+    ///
+    /// On failure every binding is returned to `self` and `max_len` is left at
+    /// the old value, which stays true as the invariant "`max_len` is a lower
+    /// bound on every binding's capacity" — bindings already grown simply have
+    /// spare room. A retry re-reads each binding's own capacity and converges.
     pub(crate) fn grow_to(
         &mut self,
         session: &InferenceSession,
@@ -136,45 +151,67 @@ impl DecodeCpuKvState {
             return Ok(());
         }
         let new_max = needed.max(self.max_len.saturating_mul(2));
-        // Carry exactly the rows the caller treats as history. Clamped to the
-        // old capacity so a caller's stale `past_len` can never read past the
-        // buffer it is copying out of.
         let live = live.min(self.max_len);
-        let element = self.dtype.byte_size();
+        let (dtype, pairs) = (self.dtype, std::mem::take(&mut self.pairs));
         let mut bindings = std::mem::take(&mut self.bindings);
+        let mut failure = None;
         for (index, binding) in bindings.iter_mut().enumerate() {
-            let (present, past) = &self.pairs[index];
-            let physical = binding.physical_shape().to_vec();
-            let (blocks, old_capacity, head_dim) =
-                (physical[0] * physical[1], physical[2], physical[3]);
-            let row_bytes = head_dim * element;
-            // Stage the live rows out of the old buffer, one run per head.
-            let mut carried = Vec::with_capacity(blocks);
-            for block in 0..blocks {
-                carried.push(binding.read_bytes_range(
-                    block_offset(block, old_capacity, row_bytes),
-                    live * row_bytes,
-                )?);
+            match Self::regrow(session, binding, &pairs[index], dtype, new_max, live) {
+                Ok(replacement) => *binding = replacement,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
             }
-            let mut grown_physical = physical.clone();
-            grown_physical[2] = new_max;
-            let mut logical = grown_physical.clone();
-            logical[2] = live;
-            let mut grown = session.allocate_device_binding(
-                past.clone(),
-                Some(present.clone()),
-                self.dtype,
-                grown_physical,
-                logical,
-            )?;
-            for (block, rows) in carried.into_iter().enumerate() {
-                grown.write_bytes(block_offset(block, new_max, row_bytes), &rows)?;
-            }
-            *binding = grown;
         }
+        // Restored unconditionally: an early return that left `self.bindings`
+        // empty would make the next `grow_to` a silent no-op returning `Ok`
+        // with no KV bound at all.
         self.bindings = bindings;
+        self.pairs = pairs;
+        if let Some(error) = failure {
+            return Err(error);
+        }
         self.max_len = new_max;
         Ok(())
+    }
+
+    /// Re-bind one KV pair at `capacity`, carrying its first `live` rows over.
+    fn regrow(
+        session: &InferenceSession,
+        binding: &mut DeviceIoBinding,
+        (present, past): &(String, String),
+        dtype: DataType,
+        capacity: usize,
+        live: usize,
+    ) -> anyhow::Result<DeviceIoBinding> {
+        let physical = binding.physical_shape().to_vec();
+        let (blocks, old_capacity, head_dim) =
+            (physical[0] * physical[1], physical[2], physical[3]);
+        let row_bytes = head_dim * dtype.byte_size();
+        // Stage the live rows out of the old buffer, one run per head.
+        let mut carried = Vec::with_capacity(blocks);
+        for block in 0..blocks {
+            carried.push(binding.read_bytes_range(
+                block_offset(block, old_capacity, row_bytes),
+                live * row_bytes,
+            )?);
+        }
+        let mut grown_physical = physical;
+        grown_physical[2] = capacity;
+        let mut logical = grown_physical.clone();
+        logical[2] = live;
+        let mut grown = session.allocate_device_binding(
+            past.clone(),
+            Some(present.clone()),
+            dtype,
+            grown_physical,
+            logical,
+        )?;
+        for (block, rows) in carried.into_iter().enumerate() {
+            grown.write_bytes(block_offset(block, capacity, row_bytes), &rows)?;
+        }
+        Ok(grown)
     }
 
     /// Assemble a state directly from already-allocated bindings.
@@ -185,13 +222,14 @@ impl DecodeCpuKvState {
     pub(crate) fn from_parts_for_test(
         bindings: Vec<DeviceIoBinding>,
         pairs: Vec<(String, String)>,
+        dtype: DataType,
         max_len: usize,
         logical_len: usize,
     ) -> Self {
         Self {
             bindings,
             pairs,
-            dtype: DataType::Float32,
+            dtype,
             max_len,
             logical_len,
         }

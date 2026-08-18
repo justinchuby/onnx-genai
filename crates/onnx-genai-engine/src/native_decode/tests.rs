@@ -3484,7 +3484,13 @@ fn growing_the_cpu_kv_cache_relocates_every_head() {
     let seeded_bytes: Vec<u8> = seeded.iter().flat_map(|v| v.to_le_bytes()).collect();
     binding.write_bytes(0, &seeded_bytes).expect("seed cache");
 
-    let mut state = DecodeCpuKvState::from_parts_for_test(vec![binding], pairs, capacity, live);
+    let mut state = DecodeCpuKvState::from_parts_for_test(
+        vec![binding],
+        pairs,
+        DataType::Float32,
+        capacity,
+        live,
+    );
     state
         .grow_to(&session, capacity + 1, live)
         .expect("grow the cache");
@@ -3545,7 +3551,8 @@ fn growing_within_the_existing_capacity_is_a_no_op() {
             vec![1, 2, 3, 4],
         )
         .expect("allocate KV binding");
-    let mut state = DecodeCpuKvState::from_parts_for_test(vec![binding], pairs, 16, 3);
+    let mut state =
+        DecodeCpuKvState::from_parts_for_test(vec![binding], pairs, DataType::Float32, 16, 3);
     let before = state.binding_for_test(0).device_ptr();
     state.grow_to(&session, 16, 3).expect("no-op grow");
     assert_eq!(state.max_len, 16);
@@ -3554,4 +3561,194 @@ fn growing_within_the_existing_capacity_is_a_no_op() {
         before,
         "a grow within capacity must not reallocate"
     );
+}
+
+/// Allocate a `[1, heads, capacity, head_dim]` f32 KV binding whose first
+/// `live` rows carry a distinct value per `(head, row, lane)`.
+fn seeded_kv_binding(
+    session: &InferenceSession,
+    pair: &(String, String),
+    heads: usize,
+    capacity: usize,
+    head_dim: usize,
+    live: usize,
+    salt: usize,
+) -> DeviceIoBinding {
+    let mut binding = session
+        .allocate_device_binding(
+            pair.1.clone(),
+            Some(pair.0.clone()),
+            DataType::Float32,
+            vec![1, heads, capacity, head_dim],
+            vec![1, heads, live, head_dim],
+        )
+        .expect("allocate KV binding");
+    let mut seeded = vec![0f32; heads * capacity * head_dim];
+    for block in 0..heads {
+        for row in 0..live {
+            for lane in 0..head_dim {
+                seeded[block * capacity * head_dim + row * head_dim + lane] =
+                    kv_probe_value(block, row, lane) + salt as f32 * 0.5;
+            }
+        }
+    }
+    let bytes: Vec<u8> = seeded.iter().flat_map(|v| v.to_le_bytes()).collect();
+    binding.write_bytes(0, &bytes).expect("seed cache");
+    binding
+}
+
+/// Read a binding back as f32 and assert its first `live` rows per head match
+/// the seeded pattern at the binding's *current* capacity.
+fn assert_kv_prefix_intact(
+    binding: &mut DeviceIoBinding,
+    heads: usize,
+    head_dim: usize,
+    live: usize,
+    salt: usize,
+    context: &str,
+) {
+    let capacity = binding.physical_shape()[2];
+    let raw = binding.read_bytes().expect("read cache");
+    let values: Vec<f32> = raw
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    for block in 0..heads {
+        for row in 0..live {
+            for lane in 0..head_dim {
+                assert_eq!(
+                    values[block * capacity * head_dim + row * head_dim + lane],
+                    kv_probe_value(block, row, lane) + salt as f32 * 0.5,
+                    "{context}: head {block} row {row} lane {lane}"
+                );
+            }
+        }
+    }
+}
+
+/// The production trigger is a *full* cache: token 4097 arrives with
+/// `past_len == max_len`, so the copy spans every row of every block with no
+/// slack. The original test left slack (live 5 of 8) and would not have caught
+/// an off-by-one at the block boundary.
+#[test]
+fn growing_a_completely_full_cpu_kv_cache_preserves_every_row() {
+    let session = tiny_decoder(false);
+    let (heads, head_dim, capacity) = (3usize, 4usize, 8usize);
+    let pairs = vec![(
+        "present.0.key".to_string(),
+        "past_key_values.0.key".to_string(),
+    )];
+    let binding = seeded_kv_binding(&session, &pairs[0], heads, capacity, head_dim, capacity, 0);
+    let mut state = DecodeCpuKvState::from_parts_for_test(
+        vec![binding],
+        pairs,
+        DataType::Float32,
+        capacity,
+        capacity,
+    );
+    state
+        .grow_to(&session, capacity + 1, capacity)
+        .expect("grow a full cache");
+    assert_eq!(state.max_len, capacity * 2);
+    assert_kv_prefix_intact(
+        state.binding_for_test(0),
+        heads,
+        head_dim,
+        capacity,
+        0,
+        "full-cache grow",
+    );
+}
+
+/// Every KV pair must grow, and each must keep its own contents. A single
+/// binding cannot catch a `pairs[index]`/`bindings[index]` misalignment or a
+/// loop that stops after the first pair; a real decoder binds two per layer.
+#[test]
+fn growing_the_cpu_kv_cache_grows_every_pair_independently() {
+    let session = tiny_decoder(false);
+    let (heads, head_dim, capacity, live) = (2usize, 4usize, 8usize, 5usize);
+    let pairs = vec![
+        (
+            "present.0.key".to_string(),
+            "past_key_values.0.key".to_string(),
+        ),
+        (
+            "present.0.value".to_string(),
+            "past_key_values.0.value".to_string(),
+        ),
+    ];
+    let bindings: Vec<DeviceIoBinding> = pairs
+        .iter()
+        .enumerate()
+        .map(|(salt, pair)| {
+            seeded_kv_binding(&session, pair, heads, capacity, head_dim, live, salt + 1)
+        })
+        .collect();
+    let mut state =
+        DecodeCpuKvState::from_parts_for_test(bindings, pairs, DataType::Float32, capacity, live);
+    state.grow_to(&session, capacity + 1, live).expect("grow");
+    for index in 0..2 {
+        let binding = state.binding_for_test(index);
+        assert_eq!(
+            binding.physical_shape()[2],
+            capacity * 2,
+            "pair {index} must have grown"
+        );
+        assert_kv_prefix_intact(binding, heads, head_dim, live, index + 1, "multi-pair grow");
+    }
+}
+
+/// A second grow must read from the capacity the first one established, not
+/// from the original. Reusing a stale stride would corrupt every head but the
+/// first on the second grow only — invisible to a single-grow test.
+#[test]
+fn growing_the_cpu_kv_cache_twice_reads_the_current_stride() {
+    let session = tiny_decoder(false);
+    let (heads, head_dim, capacity, live) = (3usize, 4usize, 8usize, 5usize);
+    let pairs = vec![(
+        "present.0.key".to_string(),
+        "past_key_values.0.key".to_string(),
+    )];
+    let binding = seeded_kv_binding(&session, &pairs[0], heads, capacity, head_dim, live, 0);
+    let mut state = DecodeCpuKvState::from_parts_for_test(
+        vec![binding],
+        pairs,
+        DataType::Float32,
+        capacity,
+        live,
+    );
+    state.grow_to(&session, capacity + 1, live).expect("grow 1");
+    assert_eq!(state.max_len, 16);
+    state.grow_to(&session, 17, live).expect("grow 2");
+    assert_eq!(state.max_len, 32);
+    assert_kv_prefix_intact(
+        state.binding_for_test(0),
+        heads,
+        head_dim,
+        live,
+        0,
+        "second grow",
+    );
+}
+
+/// Growing an empty cache carries nothing. This is the post-reset path:
+/// `rewind(0)` zeroes the logical length, and an oversized prefill then grows
+/// with no history to preserve.
+#[test]
+fn growing_an_empty_cpu_kv_cache_carries_nothing() {
+    let session = tiny_decoder(false);
+    let (heads, head_dim, capacity) = (3usize, 4usize, 8usize);
+    let pairs = vec![(
+        "present.0.key".to_string(),
+        "past_key_values.0.key".to_string(),
+    )];
+    let binding = seeded_kv_binding(&session, &pairs[0], heads, capacity, head_dim, 0, 0);
+    let mut state =
+        DecodeCpuKvState::from_parts_for_test(vec![binding], pairs, DataType::Float32, capacity, 0);
+    state.grow_to(&session, 100, 0).expect("grow from empty");
+    // 100 exceeds a doubling, so the request wins over the growth factor.
+    assert_eq!(state.max_len, 100);
+    let binding = state.binding_for_test(0);
+    assert_eq!(binding.physical_shape(), [1, heads, 100, head_dim]);
+    assert_eq!(binding.logical_shape(), [1, heads, 0, head_dim]);
 }
