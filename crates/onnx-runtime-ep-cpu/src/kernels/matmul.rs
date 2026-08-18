@@ -2377,6 +2377,7 @@ mod tests {
         // SEPARATE `MatMulKernel`/`MatMulPrepack`, each widening `B` into its own
         // `dense`. We instantiate both and sum their live bytes.
         let mut instances = 0u64;
+        let mut widened = 0u64;
         let mut actual = 0u64;
         for m in [4usize, 1usize] {
             let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.017).sin()).collect();
@@ -2387,15 +2388,25 @@ mod tests {
             kernel
                 .execute(&[a.view(), b.view()], &mut [out.view_mut()])
                 .unwrap();
+            // Decode (m == 1) on Apple silicon takes the FP16 GEMV, which reads
+            // the f16 weights directly and returns before `dense` is touched: it
+            // retains the 2-byte-per-element transposed-B memo instead of a
+            // widened 4-byte copy. Prefill has no such path, so the widening is
+            // unconditional there. Either way the weight must be retained once —
+            // a run that retains neither is the regression this guards.
+            let dense_filled = kernel.prepack.dense[1].is_filled();
+            let gemv_memo = kernel.prepack.transposed_b_f16.get().is_some();
             assert!(
-                kernel.prepack.dense[1].is_filled(),
-                "the constant f16 B must be widened into the governed cache at m={m}"
+                dense_filled || (m == 1 && gemv_memo),
+                "the constant f16 B must be retained at m={m}: widened into the \
+                 governed dense cache, or (decode only) as the f16 transposed-B memo"
             );
             assert!(
                 !kernel.prepack.dense[0].is_filled(),
                 "the contiguous f32 A is borrowed, never cached (m={m})"
             );
             actual += kernel.prepack.dense_live_bytes();
+            widened += u64::from(dense_filled);
             instances += 1;
         }
 
@@ -2405,10 +2416,25 @@ mod tests {
             "prefill + decode = two shape-keyed instantiations"
         );
         assert_eq!(
-            actual, predicted,
-            "predicted dense-cache bytes must equal the summed bytes actually \
-             held across all instantiations (ratio 1.00)"
+            actual,
+            (k as u64) * (n as u64) * 4 * widened,
+            "every instantiation that widens retains exactly one f32 copy"
         );
+        // The predictor budgets the widened worst case for every instantiation,
+        // so it is exact where all of them widen and conservative where a
+        // platform routes one away. Under-counting is the #1051 defect.
+        assert!(
+            actual <= predicted,
+            "predicted dense-cache bytes must never under-count the bytes \
+             actually held ({actual} held > {predicted} predicted)"
+        );
+        if widened == instances {
+            assert_eq!(
+                actual, predicted,
+                "predicted dense-cache bytes must equal the summed bytes actually \
+                 held across all instantiations (ratio 1.00)"
+            );
+        }
     }
 
     /// #1056 decline contract: when the cache is declined, a constant operand
