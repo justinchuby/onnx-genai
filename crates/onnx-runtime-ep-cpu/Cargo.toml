@@ -95,5 +95,9 @@ harness = false
 name = "sdpa_simd"
 harness = false
 
+[[bench]]
+name = "matmul_nbits_prefill_ab"
+harness = false
+
 [lints]
 workspace = true
