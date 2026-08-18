@@ -2204,6 +2204,73 @@ fn mask_feeding_non_builder_consumer_is_rejected() {
     assert!(!mask_binding_feeds_capacity_form_attention(&graph, mask));
 }
 
+#[test]
+fn mask_builder_to_attention_without_past_kv_is_rejected() {
+    use onnx_runtime_ir::static_shape;
+    // A masked, non-causal default-domain `Attention` with only q/k/v/mask (no
+    // past_key/past_value KV binding at inputs 4/5) is NOT a capacity-form leaf:
+    // the CUDA `Attention` kernel's fixed-capacity append contract requires both
+    // past caches. The cone must reach no valid capacity-form Attention, so the
+    // mask keeps exposing its logical valid length.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let q = graph.create_named_value("q", DataType::Float32, sh());
+    let cast = graph.create_named_value("cast", DataType::Float32, sh());
+    graph.insert_node(Node::new(NodeId(0), "Cast", vec![Some(mask)], vec![cast]));
+    // Attention with q/k/v/mask only — no KV cache at inputs 4/5.
+    let attn = graph.create_named_value("attn", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Attention",
+        vec![Some(q), Some(q), Some(q), Some(cast)],
+        vec![attn],
+    ));
+    graph.add_output(attn);
+    // Sanity: the leaf classifier itself rejects the KV-less Attention.
+    let kvless = graph.node(NodeId(1));
+    assert!(
+        !is_capacity_form_attention_mask_input(kvless, 3),
+        "an Attention without past_key/past_value is not a capacity-form leaf"
+    );
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "a mask cone reaching only a KV-less Attention must not be padded-safe"
+    );
+}
+
+#[test]
+fn mask_binding_that_is_graph_output_is_rejected() {
+    use onnx_runtime_ir::static_shape;
+    // The mask binding itself is ALSO a graph output while feeding the builder to
+    // a capacity-form Attention. Freezing it to physical width would leak the
+    // padded `max_len` into the output escape, so the root must be rejected too.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let q = graph.create_named_value("q", DataType::Float32, sh());
+    let bool_mask = graph.create_named_value("attn_mask_bool", DataType::Bool, sh());
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Cast",
+        vec![Some(mask)],
+        vec![bool_mask],
+    ));
+    let attn = graph.create_named_value("attn", DataType::Float32, sh());
+    graph.insert_node(capacity_form_attention(1, q, bool_mask, attn));
+    graph.add_output(attn);
+    // The mask binding escapes as a graph output as well.
+    graph.add_output(mask);
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "a mask binding that is itself a graph output must not be padded-safe"
+    );
+}
+
 struct WeightDeliveryKernel {
     deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,
     workspace_bytes: u64,

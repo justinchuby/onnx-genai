@@ -482,10 +482,22 @@ pub(super) fn is_additive_mask_builder_op(node: &Node) -> bool {
 /// frontier (see [`kernel_input_uses_physical_capacity`]). Such a node is
 /// *designed* to consume a physical-width additive mask, so it is a valid leaf
 /// for the frozen-mask (padded-capacity) classification.
+///
+/// The KV cache inputs (`past_key` = input 4, `past_value` = input 5) must both
+/// actually exist: `kernel_input_uses_physical_capacity` gates only on the mask
+/// (input 3) presence and `is_causal == 0`, but the CUDA `Attention` kernel's
+/// fixed-capacity append contract requires both past caches bound at physical
+/// capacity (`standard_attention.rs`: `has_past_key`/`has_past_value` on inputs
+/// 4/5, and `fixed_capacity_append` compares their capacity to the mask key
+/// width). A masked, non-causal `Attention` with only q/k/v/mask and no KV
+/// binding is NOT a capacity-form leaf, so require both KV inputs here rather
+/// than blessing any masked non-causal `Attention` as a valid cone terminus.
 pub(super) fn is_capacity_form_attention_mask_input(node: &Node, input_index: usize) -> bool {
     input_index == 3
         && node.is_default_domain()
         && node.op_type == "Attention"
+        && node.inputs.get(4).is_some_and(Option::is_some)
+        && node.inputs.get(5).is_some_and(Option::is_some)
         && kernel_input_uses_physical_capacity(node, 4)
 }
 
@@ -534,8 +546,13 @@ pub(super) fn mask_binding_feeds_capacity_form_attention(graph: &Graph, mask: Va
             continue;
         }
         // A mask-derived value must not escape as a graph output under a frozen
-        // (physical-width) mask.
-        if value != mask && graph_outputs.contains(&value) {
+        // (physical-width) mask. This includes the root mask binding itself: if
+        // the binding is *also* a graph output, freezing it to physical width
+        // would leak the padded `max_len` into whatever consumes that output, so
+        // the binding must keep exposing its logical valid length. (Input
+        // bindings can in principle also be graph outputs, so the root is not
+        // exempt.)
+        if graph_outputs.contains(&value) {
             return false;
         }
         for &(node_id, slot) in consumers.get(&value).map_or(&[][..], Vec::as_slice) {
