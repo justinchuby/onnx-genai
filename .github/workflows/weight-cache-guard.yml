@@ -40,11 +40,36 @@ name: Weight cache guard
 # is the process's exposure. Under-reporting is worse than reporting zero: zero is
 # obviously blind and gets caught at review, whereas a plausible-looking 32 MiB
 # passes admission and then overruns.
+#
+# 2026-08-17, later the same day: the guard failed again, and this time the hole
+# was not the regex but the **path filter**. #1132 adds
+# `crates/onnx-runtime-ep-cpu/src/dispatch_ledger.rs` containing
+#
+#     static LOG: OnceLock<Mutex<Vec<Observation>>> = OnceLock::new();
+#
+# an unbounded process-lifetime Vec that grows by one entry per dispatch
+# decision. Both jobs reported success on that PR's 3511 added lines, because
+# both looked only at `src/kernels/**` and the file is one directory up. The
+# first job's regex would have matched the line on sight.
+#
+# So the scope is now the whole EP crate's `src`, not just its kernels. The
+# question the guard asks -- "what multiplies this buffer, and who accounted for
+# it?" -- was never specific to kernels; only the original grep was. Falsified
+# before landing, which is the only reason to believe it:
+#
+#   scope src/kernels (before): #1132 -> 0 matches (green, wrongly)
+#   scope src        (after):  #1132 -> 1 match, exactly the ledger line
+#   six merged commits (11043a02, 8d4401d8, c62798b8, faf489a4, fdeaf77f,
+#   1f675d2b) under the widened scope: 0 new matches beyond the one #1133
+#   already produced -- so the wider net costs no false positives here.
+#
+# `OnceLock<Instant>` and `OnceLock<()>`, also added by #1132, are correctly not
+# matched: the patterns require an owned growable payload.
 
 on:
   pull_request:
     paths:
-      - "crates/onnx-runtime-ep-cpu/src/kernels/**"
+      - "crates/onnx-runtime-ep-cpu/src/**"
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
@@ -67,12 +92,16 @@ jobs:
         run: |
           set -uo pipefail
 
-          # Added lines only, in the CPU kernels, that declare a struct field
-          # holding an owned buffer for longer than a call. `GovernedWeightCache`
-          # is the sanctioned form and is excluded, as is the module that defines
-          # it and anything inside a #[cfg(test)] fixture.
+          # Added lines only, anywhere in the CPU EP's `src`, that declare a
+          # field or static holding an owned buffer for longer than a call.
+          # `GovernedWeightCache` is the sanctioned form and is excluded, as is
+          # the module that defines it and anything inside a #[cfg(test)] fixture.
+          # Scope is the whole crate, not just `kernels/`: #1132 put an unbounded
+          # `OnceLock<Mutex<Vec<Observation>>>` in `src/dispatch_ledger.rs` and
+          # this job reported success because the file sat one directory outside
+          # the old filter.
           added=$(git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" \
-                    -- crates/onnx-runtime-ep-cpu/src/kernels \
+                    -- crates/onnx-runtime-ep-cpu/src \
                     ':(exclude)crates/onnx-runtime-ep-cpu/src/kernels/governed_weight_cache.rs' \
                   | grep -E '^\+' \
                   | grep -vE '^\+\+\+' \
@@ -131,8 +160,10 @@ jobs:
           # `per-thread bytes x pool width` -- and the pool width is exactly the
           # variable these kernels scale with. The pattern is rare in this tree
           # (3 occurrences at the time of writing), so flagging it is cheap.
+          # Scoped to the whole crate `src` for the same reason as the job above:
+          # a retained buffer is no less retained for living outside `kernels/`.
           added=$(git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" \
-                    -- crates/onnx-runtime-ep-cpu/src/kernels \
+                    -- crates/onnx-runtime-ep-cpu/src \
                     ':(exclude)crates/onnx-runtime-ep-cpu/src/kernels/governed_weight_cache.rs' \
                   | grep -E '^\+' \
                   | grep -vE '^\+\+\+' \
