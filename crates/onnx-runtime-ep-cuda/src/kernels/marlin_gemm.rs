@@ -107,10 +107,21 @@ pub fn device_supports_marlin(compute_capability: (u32, u32)) -> bool {
 /// 37.7s -> 16.7s (2.26x; prefill 86 -> 195 tok/s), and the in-tree
 /// `marlin_m_gt_1_wall_vs_tiled` bench shows the same ordering per shape.
 ///
+/// **Numerics.** The tensor-core kernel is *not* bit-identical to the tiled
+/// GEMM: it accumulates in a different order, so full-vocab logprobs shift
+/// slightly (the in-tree parity tests assert a `2e-2 * max_out` tolerance, not
+/// equality, and an earlier probe measured max Δ 0.017 / 0.168 on
+/// qwen2.5-14b/7b). Argmax is stable — greedy token streams match, modulo the
+/// pre-existing near-tie nondeterminism that `marlin_m_gt_1_e2e.rs` classifies.
+/// Defaulting this ON therefore trades bit-identical logprobs for a large
+/// prefill win, which matters to anything that consumes the *distribution*
+/// rather than the selected token (a logprobs API, beam search, spec-decode
+/// acceptance ratios). Those callers should set `ONNX_GENAI_MARLIN_M_GT_1=0`.
+///
 /// This gate only *offers* Marlin; every eligibility check still applies at the
 /// call site (SM80+, int4, no `g_idx`, no fused SwiGLU/RMSNorm epilogue) and any
-/// runtime ineligibility or launch error falls through to the byte-identical
-/// portable tiled GEMM (Rule 11 fallback contract). Opt out with
+/// runtime ineligibility or launch error falls through to the portable tiled
+/// GEMM (Rule 11 fallback contract). Opt out with
 /// `ONNX_GENAI_MARLIN_M_GT_1=0` (or `false`/`off`) to force the tiled path for
 /// A/B measurement or to bisect a suspected Marlin regression.
 #[must_use]
@@ -134,20 +145,18 @@ pub fn marlin_m_gt_1_enabled() -> bool {
 /// short-K), leaving those on the byte-identical direct kernel.
 ///
 /// Default **OFF**. Split-K was ON-by-default only for as long as its parent
-/// gate was opt-in, which kept the non-byte-identical reduction out of every
+/// gate was opt-in, which kept its non-byte-identical reduction out of every
 /// default deployment. Now that [`marlin_m_gt_1_enabled`] defaults ON, leaving
-/// this one ON would silently ship that reduction to everyone and break the
-/// byte-identity bar that blocked the earlier default flip — so the polarity
-/// moves here instead. Nothing is lost on the path that motivated the flip:
-/// split-K is inert for prefill shapes (`choose_split_k` returns 1 there), and
-/// an A100 prefill A/B on Muse-Glimmer-30B int4 measured it as pure noise
-/// (3247-token prompt: 16.2s with split-K off vs 16.7s on).
+/// this one ON would newly ship a *second*, independent source of numeric
+/// divergence to every default deployment — so the polarity moves here.
 ///
-/// Enable with `ONNX_GENAI_MARLIN_SPLITK=1` (or `true`/`on`) to recover the
-/// small-M lever: it is what collapses the speculative-verify (M=K) wall —
-/// capture B* 5.10x -> 2.69x at M=8 on glm-4-9b — at the cost of a fixed-order
-/// fp32 partial reduction that is deterministic and within f64-oracle tolerance
-/// but not bit-for-bit equal to the direct kernel.
+/// Note this is not what makes prefill numerics move: [`choose_split_k`]
+/// returns 1 for `m > SPLITK_MAX_M` (32), so prefill never elected a split in
+/// the first place and this gate is inert there. The shapes it actually governs
+/// are M<=32 — speculative verify, where it was the measured lever (capture B*
+/// 5.10x -> 2.69x at M=8 on glm-4-9b). Turning it off is acceptable only
+/// because that workload is separately shelved; enable with
+/// `ONNX_GENAI_MARLIN_SPLITK=1` (or `true`/`on`) to get it back.
 #[must_use]
 pub fn marlin_splitk_enabled() -> bool {
     matches!(
