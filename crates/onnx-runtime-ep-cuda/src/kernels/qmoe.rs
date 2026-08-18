@@ -9,7 +9,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::sys::CUdeviceptr;
@@ -1561,6 +1561,13 @@ impl Kernel for QMoEKernel {
             rows,
             experts,
         )?;
+        // Investigation probe (default-OFF): dump the top-k expert SELECTION and
+        // the router-logit margin per QMoE call so a CPU-vs-CUDA run can be
+        // diffed to distinguish a benign borderline-argmax reassociation from a
+        // real router top-k divergence. Safe only outside graph capture.
+        if !capturing && std::env::var_os("ONNX_GENAI_QMOE_ROUTE_DUMP").is_some() {
+            self.dump_route_selection(&inputs[1], route_indices, rows, experts, self.attributes.k)?;
+        }
         if let Some(grouping) = grouping {
             let fc1_output = fc1_output.expect("grouped QMoE keeps FC1 scratch");
             self.launch_grouping(route_indices, grouping, routes, experts)?;
@@ -1703,6 +1710,71 @@ impl Kernel for QMoEKernel {
 }
 
 impl QMoEKernel {
+    /// Investigation-only: copy the top-k expert indices and the router logits
+    /// back to the host and print, per decode row, the selected expert SET plus
+    /// the logit margin between the last-selected expert and the best rejected
+    /// expert. A tiny margin (~1e-5) means a borderline selection that upstream
+    /// f32 reassociation can flip; a large margin means routing is robust and
+    /// any token divergence is purely downstream (GEMV/argmax), not routing.
+    fn dump_route_selection(
+        &self,
+        router_probs: &TensorView,
+        route_indices: CUdeviceptr,
+        rows: usize,
+        experts: usize,
+        top_k: usize,
+    ) -> Result<()> {
+        static CALL: AtomicU64 = AtomicU64::new(0);
+        let routes = rows * top_k;
+        let mut indices = vec![0i32; routes];
+        {
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    indices.as_mut_ptr() as *mut u8,
+                    routes * std::mem::size_of::<i32>(),
+                )
+            };
+            unsafe { self.runtime.dtoh(bytes, route_indices)? };
+        }
+        let mut logits = vec![0f32; rows * experts];
+        {
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    logits.as_mut_ptr() as *mut u8,
+                    rows * experts * std::mem::size_of::<f32>(),
+                )
+            };
+            unsafe { self.runtime.dtoh(bytes, tensor_ptr(router_probs))? };
+        }
+        for row in 0..rows {
+            let call = CALL.fetch_add(1, Ordering::Relaxed);
+            let sel = &indices[row * top_k..row * top_k + top_k];
+            let row_logits = &logits[row * experts..row * experts + experts];
+            let mut selected: Vec<i32> = sel.to_vec();
+            let mut sorted = selected.clone();
+            sorted.sort_unstable();
+            // Margin: smallest selected logit vs largest rejected logit.
+            let selected_set: std::collections::HashSet<i32> = sel.iter().copied().collect();
+            let min_selected = sel
+                .iter()
+                .map(|&e| row_logits[e as usize])
+                .fold(f32::INFINITY, f32::min);
+            let max_rejected = (0..experts)
+                .filter(|e| !selected_set.contains(&(*e as i32)))
+                .map(|e| row_logits[e])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let margin = min_selected - max_rejected;
+            selected.clear();
+            selected.extend_from_slice(sel);
+            eprintln!(
+                "QMOE_ROUTE_CUDA call={call} row={row} order={selected:?} set={sorted:?} \
+                 min_sel_logit={min_selected:.8e} max_rej_logit={max_rejected:.8e} \
+                 margin={margin:.8e}"
+            );
+        }
+        Ok(())
+    }
+
     fn launch_route(
         &self,
         router_probs: &TensorView,
