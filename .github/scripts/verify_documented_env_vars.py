@@ -74,6 +74,9 @@ KNOWN_UNIMPLEMENTED: dict[str, str] = {
     "NXRT_SQNBIT_PREFILL_MIN": "referenced in prose about a proposed tuning knob",
     "ONNX_GENAI_BASE_URL": "client-side variable read by external tooling, not by this workspace",
     "ONNX_GENAI_SD_PACKAGE": "referenced in prose about a proposed packaging layout",
+    "ONNX_GENAI_DECODE_GEMV_PROBE_ROWS": "throwaway ceiling-probe flag in "
+    "2026-08-18-multirow-gemv-ceiling-probe.md, whose method section states the "
+    "probe was reverted after measuring and is not shipped",
 }
 
 # Uppercase only: the lowercase `onnx_genai_*` names in the docs are Prometheus
