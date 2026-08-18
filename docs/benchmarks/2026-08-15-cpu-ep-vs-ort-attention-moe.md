@@ -3061,3 +3061,60 @@ because what it removes is a per-region park, not a per-element cost. The
 decode-shaped `sm_decode_h32_kv*` cells stay serial and stay flat (18–182 µs,
 within ±1 µs of base at every width), and `sm_whisper_cross` is neutral at every
 width — both are the intended outcome, not a miss.
+### 31.8 Transpose and the activations, and what the controls say
+
+Activations, our own native ms, `base>new`, 5 trials × 7 runs:
+
+| cell | t=1 | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|---|
+| act_relu_hidden_t512 | 0.838>0.822 | 0.546>0.488 | 0.295>0.251 | 0.276>0.183 | 0.381>0.130 | 1.201>0.303 |
+| act_tanh_hidden_t512 | 0.804>0.803 | 0.806>0.794 | 0.457>0.417 | 0.419>0.317 | 0.485>0.204 | 1.441>0.386 |
+| act_sigmoid_hidden_t512 | 0.826>0.837 | 0.832>0.808 | 0.640>0.559 | 0.462>0.296 | 0.513>0.214 | 1.176>0.437 |
+| act_tanh_hidden_t4096 | 6.398>6.542 | 6.331>6.436 | 4.300>3.412 | 3.609>3.494 | 3.691>3.490 | 5.991>2.933 |
+| act_sigmoid_hidden_t4096 | 6.532>6.680 | 6.488>6.605 | 3.547>3.465 | 3.560>3.476 | 3.672>3.539 | 6.070>2.356 |
+| act_fastgelu_mlp_t512 | 5.466>5.448 | 5.169>5.294 | 2.815>2.765 | 2.156>1.864 | 1.949>1.553 | 4.461>1.463 |
+
+27 improved cells against 5 regressed at a 5% deadband, and the five are 1–6 µs
+absolute or bandwidth-bound cells whose distributions overlap outright. Up to
+3.6× at t=16 and 4× at t=32.
+
+Transpose needed 15 trials rather than 7 before it said anything stable — at 7
+it produced a `tr_bert_b8_s128` "regression" that was entirely dispersion:
+
+| cell | t=1 | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|---|
+| tr_bert_b8_s128 | 0.117>0.119 | 0.152>0.153 | 0.111>0.112 | 0.134>0.140 | 0.261>0.248 | 2.658>2.670 |
+| tr_llama3_s512 | 0.718>0.705 | 0.390>0.389 | 0.227>0.228 | 0.253>0.239 | 0.430>0.352 | 3.412>3.101 |
+| tr_whisper_s1500 | 0.566>0.593 | 0.448>0.442 | 0.353>0.358 | 0.307>0.296 | 0.397>0.380 | 3.292>3.017 |
+
+4 improved, 0 regressed. Transpose is a straight copy, so it is bandwidth-bound
+long before it is scheduler-bound; the gain is small and lives at the wide end.
+
+**The controls.** Two families this work does not touch were run at the same six
+widths purely to establish the noise floor: 24 GQA attention cells (32 improved
+/ 27 regressed) and 20 GEMM cells (19 / 12). Both are symmetric, which is what
+licenses reading the 3–15× numbers as real rather than as luck. Anyone repeating
+this on this host should budget for ±25% on a single 7-trial cell and treat any
+claim smaller than that as unmeasured.
+
+### 31.9 The biggest remaining loss is GEMM, and it is the same disease
+
+The GEMM control was meant to be a null result and instead found the largest
+single loss in the CPU EP. Decode-shaped `MatMulNBits`, native ms:
+
+| cell | t=8 | t=16 | t=32 | ratio vs ORT at t=32 |
+|---|---|---|---|---|
+| gemm_nbits_qwen3_0p6b_qkv_t8 | 0.67 | 0.64 | **2.98** | 25.99 |
+| gemm_nbits_qwen3_0p6b_mlp_t8 | 1.17 | 1.03 | **3.81** | 18.73 |
+| gemm_nbits_llama3_8b_qkv_t8 | 4.15 | 3.05 | **6.07** | 8.64 |
+
+Going from 16 to 32 threads makes these **4.6× slower**, on the operator that
+carries most of a decode step's arithmetic. That is the §26 signature exactly,
+and `matmul_nbits.rs` is still the largest raw-Rayon fan-out in the crate.
+
+Prefill-shaped GEMM (`t128`, `t512`) does not show it: those regions are long
+enough to amortise a park. It is specifically the small, frequent, decode-shaped
+region that the global pool cannot serve, which is the whole thesis of §26.
+
+Nothing in this phase touches it. It is the next target, and the runtime it
+needs already exists.
