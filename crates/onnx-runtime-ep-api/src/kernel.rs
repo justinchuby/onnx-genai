@@ -190,57 +190,6 @@ impl CaptureSupport {
     }
 }
 
-/// A plugin host's *routing preference* for a node this EP could already run.
-///
-/// [`KernelMatch`] answers "can this EP produce a correct result for this node?".
-/// `ClaimPreference` answers a strictly different question: "**should** this EP
-/// take the node away from the host runtime's own kernel?" The two must stay
-/// separate. Folding a performance decline into `supports_op` would make the
-/// native session's build step treat a statically-shaped node as a hard
-/// `unsupported_op` error, so a slow-but-correct kernel must remain reachable
-/// for native execution even when the plugin declines to advertise it to ORT.
-///
-/// The preference is consulted **only** on the plugin capability path, before
-/// convex partitioning, so a deferred node is simply left out of the supported
-/// set and the host partitions around it.
-///
-/// Declining is a claim about *measured* behaviour on the current host, so a
-/// `DeferToHost` reason must say what was measured and where the boundary is —
-/// a bare "too slow" is not actionable.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ClaimPreference {
-    /// Advertise the node to the host runtime as ours.
-    Claim,
-    /// Leave the node to the host runtime's own kernel.
-    DeferToHost {
-        /// What was measured, and the threshold that put this node on the
-        /// losing side of it.
-        reason: Cow<'static, str>,
-    },
-}
-
-impl ClaimPreference {
-    /// Construct a deferral with its measured justification.
-    pub fn defer(reason: impl Into<Cow<'static, str>>) -> Self {
-        Self::DeferToHost {
-            reason: reason.into(),
-        }
-    }
-
-    /// Whether the EP wants the node.
-    pub fn is_claim(&self) -> bool {
-        matches!(self, Self::Claim)
-    }
-
-    /// The deferral reason, or `None` when the EP wants the node.
-    pub fn reason(&self) -> Option<&str> {
-        match self {
-            Self::Claim => None,
-            Self::DeferToHost { reason } => Some(reason),
-        }
-    }
-}
-
 /// The concrete implementation selected by a kernel's internal dispatcher.
 ///
 /// Unlike [`KernelMatch`] (the EP's claim over a node) and [`CaptureSupport`]

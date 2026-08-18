@@ -5705,6 +5705,225 @@ fn percentile(samples: &mut [f64], p: f64) -> f64 {
     samples[idx]
 }
 
+/// A single-input elementwise case: one node, one tensor in, same shape out.
+///
+/// Reuses [`MatmulFamilyCase`], which is a single-node generated model plus its
+/// runtime inputs and nothing matmul-specific beyond its name.
+///
+/// `positive` maps the generated activations into `[0.5, 1.5]` for the ops that
+/// are undefined or uninteresting on negatives (`Sqrt`, `Log`); everything else
+/// gets the two-sided `[-1, 1]` range so saturating branches are exercised on
+/// both sides.
+///
+/// `tolerance` is inert for these: the only consumer of the unary cases is the
+/// timing A/B, which asserts assignment and then measures. Elementwise numerics
+/// are covered against closed forms in `onnx-runtime-ep-cpu`'s own kernel
+/// tests, not here.
+#[allow(clippy::too_many_arguments)]
+fn unary_case(
+    name: &'static str,
+    op: &'static str,
+    domain: &'static str,
+    elem: ort::ONNXTensorElementDataType,
+    len: usize,
+    opset: u64,
+    positive: bool,
+    tolerance: f32,
+) -> MatmulFamilyCase {
+    let dims = vec![1, len as i64];
+    let opset_imports = if domain.is_empty() {
+        format!("[{{ version: {opset} }}]")
+    } else {
+        format!("[{{ version: {opset} }}, {{ domain: \"{domain}\" version: 1 }}]")
+    };
+    let attrs = match op {
+        // `Gelu`'s default is already "none" (exact); spell whichever variant
+        // the case name promises so the model cannot silently drift.
+        "Gelu" if name.contains("_tanh") => {
+            " attribute: [{ name: \"approximate\" type: STRING s: \"tanh\" }]"
+        }
+        "Gelu" => " attribute: [{ name: \"approximate\" type: STRING s: \"none\" }]",
+        _ => "",
+    };
+    let model = format!(
+        r#"ir_version: 10
+graph {{
+  node: [{{ input: ["X"] output: ["Y"] op_type: "{op}" domain: "{domain}"{attrs} }}]
+  name: "{name}"
+  input: [{}]
+  output: [{}]
+}}
+opset_import: {opset_imports}
+"#,
+        textproto_value_info("X", elem, &dims),
+        textproto_value_info("Y", elem, &dims),
+    );
+    let mut x = activation_f32(1, len);
+    if positive {
+        for v in &mut x {
+            *v = v.abs() + 0.5;
+        }
+    }
+    let data = if elem == ELEM_F16 {
+        f16_slice_to_bytes(&x)
+    } else {
+        f32_slice_to_bytes(&x)
+    };
+    MatmulFamilyCase {
+        name,
+        op,
+        model,
+        inputs: vec![GeneratedInput {
+            name: "X",
+            elem,
+            dims,
+            data,
+        }],
+        output: "Y",
+        output_elem: elem,
+        ort_can_build: true,
+        tolerance,
+    }
+}
+
+/// The elementwise grid `CPU_ACTIVATION_GAPS.md` is written against, as
+/// session-level cases.
+///
+/// Two sizes: a decode-width row (4 Ki) where per-node dispatch overhead is
+/// still visible, and 1 Mi where the kernel is the whole cost. Both are the
+/// sizes the published ratio table uses, so a number from here is directly
+/// comparable to a number in that file.
+fn unary_bench_cases() -> Vec<MatmulFamilyCase> {
+    const K4: usize = 4096;
+    const M1: usize = 1 << 20;
+    vec![
+        unary_case(
+            "bench_tanh_f32_4k",
+            "Tanh",
+            "",
+            ELEM_F32,
+            K4,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_tanh_f32_1m",
+            "Tanh",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_sigmoid_f32_4k",
+            "Sigmoid",
+            "",
+            ELEM_F32,
+            K4,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_sigmoid_f32_1m",
+            "Sigmoid",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case("bench_erf_f32_4k", "Erf", "", ELEM_F32, K4, 17, false, 1e-4),
+        unary_case("bench_erf_f32_1m", "Erf", "", ELEM_F32, M1, 17, false, 1e-4),
+        unary_case(
+            "bench_gelu_tanh_f32_1m",
+            "Gelu",
+            "",
+            ELEM_F32,
+            M1,
+            20,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_gelu_exact_f32_1m",
+            "Gelu",
+            "",
+            ELEM_F32,
+            M1,
+            20,
+            false,
+            1e-4,
+        ),
+        unary_case("bench_exp_f32_1m", "Exp", "", ELEM_F32, M1, 17, false, 1e-4),
+        unary_case(
+            "bench_relu_f32_1m",
+            "Relu",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            0.0,
+        ),
+        unary_case(
+            "bench_sqrt_f32_4k",
+            "Sqrt",
+            "",
+            ELEM_F32,
+            K4,
+            17,
+            true,
+            1e-4,
+        ),
+        unary_case(
+            "bench_sqrt_f32_1m",
+            "Sqrt",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            true,
+            1e-4,
+        ),
+        unary_case(
+            "bench_quickgelu_f32_1m",
+            "QuickGelu",
+            "com.microsoft",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_fastgelu_f32_1m",
+            "FastGelu",
+            "com.microsoft",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_tanh_f16_1m",
+            "Tanh",
+            "",
+            ELEM_F16,
+            M1,
+            17,
+            false,
+            5e-3,
+        ),
+        unary_case("bench_exp_f16_1m", "Exp", "", ELEM_F16, M1, 17, false, 5e-3),
+    ]
+}
+
 /// Shapes worth measuring on the plugin path, at sizes a real decode/prefill
 /// step reaches rather than the smallest size that proves correctness.
 fn matmul_bench_cases() -> Vec<MatmulFamilyCase> {
@@ -5819,7 +6038,7 @@ fn plugin_path_ab_vs_plain_ort() {
     println!(
         "case,ours_p50_ms,ort_p50_ms,ratio_p50,ours_p90_ms,ort_p90_ms,ratio_p90,cold_ours_ms,cold_ort_ms"
     );
-    for case in matmul_bench_cases() {
+    for case in matmul_bench_cases().into_iter().chain(unary_bench_cases()) {
         if !filter.is_empty() && !case.name.contains(&filter) {
             continue;
         }
@@ -6260,4 +6479,387 @@ fn factory_only_capability_limits_are_declined_at_claim_time() {
             conformance_teardown(api, env, opts, session, &reg);
         }
     }
+}
+
+// ─── Falsifier: assignment is not execution ─────────────────────────────────
+
+/// Deterministic float payloads for every input a fixture declares, read from
+/// the session itself rather than from a per-fixture table.
+///
+/// Returns `None` — meaning "this fixture cannot be driven generically" — when
+/// any input is not float32/float16/bfloat16 or has a non-static dimension.
+/// Integer inputs are excluded on purpose: `seqlens_k`, `total_sequence_length`
+/// and `position_ids` carry *semantics*, and filling them with noise would
+/// produce a kernel error rather than a measurement. Those fixtures are covered
+/// by `rope_and_gqa_execute_on_our_ep_and_match_ort_numerics`, which supplies
+/// real values.
+///
+/// # Safety
+/// `api` and `session` must come from a successfully created session.
+#[allow(clippy::type_complexity)]
+unsafe fn generic_float_inputs(
+    api: *const ort::OrtApi,
+    session: *mut ort::OrtSession,
+) -> Option<(
+    Vec<std::ffi::CString>,
+    Vec<*mut ort::OrtValue>,
+    Vec<std::ffi::CString>,
+)> {
+    unsafe {
+        let mut allocator: *mut ort::OrtAllocator = ptr::null_mut();
+        let status = ((*api).GetAllocatorWithDefaultOptions.unwrap())(&mut allocator);
+        check_status(api, status, "GetAllocatorWithDefaultOptions");
+
+        let mut num_inputs = 0usize;
+        let status = ((*api).SessionGetInputCount.unwrap())(session, &mut num_inputs);
+        check_status(api, status, "SessionGetInputCount");
+
+        let mut names = Vec::with_capacity(num_inputs);
+        let mut values: Vec<*mut ort::OrtValue> = Vec::with_capacity(num_inputs);
+
+        for i in 0..num_inputs {
+            let mut name_ptr: *mut std::os::raw::c_char = ptr::null_mut();
+            let status =
+                ((*api).SessionGetInputName.unwrap())(session, i, allocator, &mut name_ptr);
+            check_status(api, status, "SessionGetInputName");
+            let name = CStr::from_ptr(name_ptr).to_owned();
+            ((*allocator).Free.unwrap())(allocator, name_ptr.cast());
+
+            let mut type_info: *mut ort::OrtTypeInfo = ptr::null_mut();
+            let status = ((*api).SessionGetInputTypeInfo.unwrap())(session, i, &mut type_info);
+            check_status(api, status, "SessionGetInputTypeInfo");
+            let mut tensor_info: *const ort::OrtTensorTypeAndShapeInfo = ptr::null();
+            let status = ((*api).CastTypeInfoToTensorInfo.unwrap())(type_info, &mut tensor_info);
+            check_status(api, status, "CastTypeInfoToTensorInfo");
+            if tensor_info.is_null() {
+                ((*api).ReleaseTypeInfo.unwrap())(type_info);
+                for v in values.drain(..) {
+                    ((*api).ReleaseValue.unwrap())(v);
+                }
+                return None;
+            }
+            let mut elem: ort::ONNXTensorElementDataType =
+                ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+            let status = ((*api).GetTensorElementType.unwrap())(tensor_info, &mut elem);
+            check_status(api, status, "GetTensorElementType");
+            let mut rank = 0usize;
+            let status = ((*api).GetDimensionsCount.unwrap())(tensor_info, &mut rank);
+            check_status(api, status, "GetDimensionsCount");
+            let mut dims = vec![0i64; rank];
+            let status = ((*api).GetDimensions.unwrap())(tensor_info, dims.as_mut_ptr(), rank);
+            check_status(api, status, "GetDimensions");
+            ((*api).ReleaseTypeInfo.unwrap())(type_info);
+
+            let is_float = elem == ELEM_F32
+                || elem == ELEM_F16
+                || elem == ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16;
+            if !is_float || dims.iter().any(|&d| d <= 0) {
+                for v in values.drain(..) {
+                    ((*api).ReleaseValue.unwrap())(v);
+                }
+                return None;
+            }
+
+            let count: usize = dims.iter().map(|&d| d as usize).product::<usize>().max(1);
+            // A spread in [-1, 1) rather than zeros: a saturating or masked
+            // kernel can produce the right answer from an all-zero input for
+            // the wrong reason, and this data also keeps `Log`/`Sqrt` inputs
+            // off the degenerate value.
+            let mut seed = (7u32).wrapping_add(count as u32) | 1;
+            let value = |s: &mut u32| -> f32 {
+                *s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((*s >> 8) as f32 / (1u32 << 23) as f32) - 1.0
+            };
+            let val = if elem == ELEM_F32 {
+                let data: Vec<f32> = (0..count).map(|_| value(&mut seed)).collect();
+                make_float_tensor(api, Box::leak(data.into_boxed_slice()), &dims)
+            } else {
+                let mut bytes = Vec::with_capacity(count * 2);
+                for _ in 0..count {
+                    let x = value(&mut seed);
+                    let bits = if elem == ELEM_F16 {
+                        f32_to_f16_bits(x)
+                    } else {
+                        // bfloat16 is the top half of the f32 pattern.
+                        (x.to_bits() >> 16) as u16
+                    };
+                    bytes.extend_from_slice(&bits.to_le_bytes());
+                }
+                make_raw_tensor(api, Box::leak(bytes.into_boxed_slice()), &dims, elem)
+            };
+            names.push(name);
+            values.push(val);
+        }
+
+        let mut num_outputs = 0usize;
+        let status = ((*api).SessionGetOutputCount.unwrap())(session, &mut num_outputs);
+        check_status(api, status, "SessionGetOutputCount");
+        let mut out_names = Vec::with_capacity(num_outputs);
+        for i in 0..num_outputs {
+            let mut name_ptr: *mut std::os::raw::c_char = ptr::null_mut();
+            let status =
+                ((*api).SessionGetOutputName.unwrap())(session, i, allocator, &mut name_ptr);
+            check_status(api, status, "SessionGetOutputName");
+            out_names.push(CStr::from_ptr(name_ptr).to_owned());
+            ((*allocator).Free.unwrap())(allocator, name_ptr.cast());
+        }
+
+        Some((names, values, out_names))
+    }
+}
+
+/// Run `session` over `inputs`, discard the outputs, and return ORT's error
+/// message instead of panicking when the run fails.
+///
+/// The baseline half of `every_assigned_node_is_also_executed_by_this_ep` needs
+/// the non-panicking form: ORT's own CPU kernels reject two of these fixtures
+/// (bfloat16 `Add` has no kernel; ORT's `QMoE` wants a different
+/// `fc2_experts_scales` layout from the one its contrib schema admits), and
+/// "ORT cannot run this at all" is a fact to report, not a test failure.
+///
+/// # Safety
+/// Every pointer must come from the same live session.
+unsafe fn try_run_discarding_outputs(
+    api: *const ort::OrtApi,
+    session: *mut ort::OrtSession,
+    input_names: &[std::ffi::CString],
+    inputs: &[*mut ort::OrtValue],
+    output_names: &[std::ffi::CString],
+) -> Result<(), String> {
+    unsafe {
+        let in_ptrs: Vec<*const std::os::raw::c_char> =
+            input_names.iter().map(|c| c.as_ptr()).collect();
+        let out_ptrs: Vec<*const std::os::raw::c_char> =
+            output_names.iter().map(|c| c.as_ptr()).collect();
+        let mut outputs: Vec<*mut ort::OrtValue> = vec![ptr::null_mut(); output_names.len()];
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            in_ptrs.as_ptr(),
+            inputs.as_ptr().cast(),
+            inputs.len(),
+            out_ptrs.as_ptr(),
+            output_names.len(),
+            outputs.as_mut_ptr(),
+        );
+        let failure = if status.is_null() {
+            None
+        } else {
+            let msg = CStr::from_ptr(((*api).GetErrorMessage.unwrap())(status))
+                .to_string_lossy()
+                .into_owned();
+            ((*api).ReleaseStatus.unwrap())(status);
+            Some(msg)
+        };
+        for out in outputs {
+            if !out.is_null() {
+                ((*api).ReleaseValue.unwrap())(out);
+            }
+        }
+        match failure {
+            None => Ok(()),
+            Some(msg) => Err(msg),
+        }
+    }
+}
+
+/// [`try_run_discarding_outputs`], panicking on failure. Used for *our* side,
+/// where a failed run is a real defect.
+///
+/// # Safety
+/// Every pointer must come from the same live session.
+unsafe fn run_discarding_outputs(
+    api: *const ort::OrtApi,
+    session: *mut ort::OrtSession,
+    input_names: &[std::ffi::CString],
+    inputs: &[*mut ort::OrtValue],
+    output_names: &[std::ffi::CString],
+    label: &str,
+) {
+    if let Err(msg) =
+        unsafe { try_run_discarding_outputs(api, session, input_names, inputs, output_names) }
+    {
+        panic!("Run({label}) failed: {msg}");
+    }
+}
+
+/// Being *assigned* a node and *executing* it are different claims, and only
+/// the second one is what "this EP does not defer" actually promises.
+///
+/// `no_supported_node_is_ever_left_to_the_ort_cpu_ep` and
+/// `every_fixture_loads_with_cpu_fallback_disabled` both read ORT's static
+/// node→EP attribution, which is a session-build fact. Neither runs the model,
+/// so neither can see whether our kernel is what produced the output. Output
+/// equality cannot close that gap either: agreeing with ORT is exactly what a
+/// correct kernel does, so a graph secretly executed by ORT looks identical.
+///
+/// This test closes it with the cdylib's own counter. For every fixture it can
+/// drive generically, with `session.disable_cpu_ep_fallback=1`:
+///
+/// 1. ORT reports *n* nodes assigned to `cpu_ep`;
+/// 2. one `Run` later, this EP's execution counter has advanced by exactly *n*.
+///
+/// The counter is read out of the same mapping ORT loaded (same absolute path,
+/// so the same statics), which is why it observes the real session rather than
+/// a second copy of the library.
+///
+/// **Non-vacuity** is checked in the same run: a baseline session over the same
+/// model file with our EP never appended must leave the counter at zero. If the
+/// counter incremented for any session, or if a fixture's nodes were silently
+/// running on ORT, exactly one of the two halves fails.
+#[test]
+fn every_assigned_node_is_also_executed_by_this_ep() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let ep_path = match find_ep_cdylib() {
+        Some(p) => p,
+        None => {
+            if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+                panic!("NXRT_REQUIRE_ORT_TESTS=1 but the EP cdylib is missing");
+            }
+            eprintln!("*** SKIPPED: EP cdylib not found ***");
+            return;
+        }
+    };
+    // The same absolute path ORT registers: one mapping, one set of statics.
+    let ep_lib = unsafe { libloading::Library::new(&ep_path) }.expect("dlopen EP cdylib");
+    let executed: libloading::Symbol<'_, unsafe extern "C" fn() -> usize> =
+        unsafe { ep_lib.get(b"nxrt_ep_executed_node_count") }
+            .expect("nxrt_ep_executed_node_count not exported");
+    let reset_executed: libloading::Symbol<'_, unsafe extern "C" fn()> =
+        unsafe { ep_lib.get(b"nxrt_ep_reset_executed_node_count") }
+            .expect("nxrt_ep_reset_executed_node_count not exported");
+
+    let mut driven = 0usize;
+    let mut baselines = 0usize;
+    let mut skipped: Vec<&str> = Vec::new();
+    let mut no_ort_kernel: Vec<&str> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+
+    for (fixture, op) in ASSIGNMENT_FIXTURES {
+        let model_path = PathBuf::from(manifest_dir)
+            .join(format!("tests/fixtures/{fixture}/model.onnx.textproto"));
+        let reg = format!("cpu_ep_exec_{fixture}");
+        let Some((_lib, api, env, opts, session)) =
+            (unsafe { conformance_setup(&reg, &model_path, true) })
+        else {
+            eprintln!("*** SKIPPED: {fixture} (execution) — ORT or EP cdylib not found ***");
+            continue;
+        };
+
+        unsafe {
+            let Some((names, inputs, out_names)) = generic_float_inputs(api, session) else {
+                skipped.push(fixture);
+                conformance_teardown(api, env, opts, session, &reg);
+                continue;
+            };
+
+            let info = query_ep_assignment(api, session);
+            let assigned = info.ops_on_our_ep().len();
+            assert!(
+                info.ops_on_our_ep().contains(op),
+                "{fixture}: '{op}' is not on this EP — got {:?}",
+                info.assignments
+            );
+
+            reset_executed();
+            run_discarding_outputs(api, session, &names, &inputs, &out_names, fixture);
+            let ran = executed();
+            if ran != assigned {
+                failures.push(format!(
+                    "  {fixture}: ORT assigned {assigned} node(s) to cpu_ep but this EP executed \
+                     {ran}"
+                ));
+            }
+
+            // Non-vacuity: the same model, our EP never appended. ORT runs it
+            // itself, so our counter must not move. Without this half, a
+            // counter that incremented on every node of every session — or one
+            // wired to the wrong event — would still satisfy the check above.
+            //
+            // Some fixtures have no ORT-only session at all: bfloat16 `Add`,
+            // for one, has no ORT CPU kernel, which is why this EP claiming it
+            // matters. Those are counted and reported rather than asserted, so
+            // the check stays honest instead of silently dropping to zero
+            // baselines.
+            reset_executed();
+            let mut base_opts: *mut ort::OrtSessionOptions = ptr::null_mut();
+            let status = ((*api).CreateSessionOptions.unwrap())(&mut base_opts);
+            check_status(api, status, "CreateSessionOptions(baseline)");
+            pin_intra_op_threads(api, base_opts);
+            let mut base_session: *mut ort::OrtSession = ptr::null_mut();
+            let status =
+                ort_session::create_session(api, env, base_opts, &model_path, &mut base_session);
+            if status.is_null() {
+                let (base_names, base_inputs, base_outs) =
+                    generic_float_inputs(api, base_session).expect("baseline inputs");
+                match try_run_discarding_outputs(
+                    api,
+                    base_session,
+                    &base_names,
+                    &base_inputs,
+                    &base_outs,
+                ) {
+                    Ok(()) => {
+                        let leaked = executed();
+                        if leaked != 0 {
+                            failures.push(format!(
+                                "  {fixture}: a session without this EP still advanced our \
+                                 execution counter by {leaked} — the counter does not observe \
+                                 what it claims to"
+                            ));
+                        }
+                        baselines += 1;
+                    }
+                    Err(msg) => {
+                        eprintln!("  [{fixture}] ORT alone cannot run this graph: {msg}");
+                        no_ort_kernel.push(fixture);
+                    }
+                }
+                for v in base_inputs {
+                    ((*api).ReleaseValue.unwrap())(v);
+                }
+                ((*api).ReleaseSession.unwrap())(base_session);
+            } else {
+                ((*api).ReleaseStatus.unwrap())(status);
+                no_ort_kernel.push(fixture);
+            }
+            ((*api).ReleaseSessionOptions.unwrap())(base_opts);
+
+            for v in inputs {
+                ((*api).ReleaseValue.unwrap())(v);
+            }
+            conformance_teardown(api, env, opts, session, &reg);
+        }
+        eprintln!("  [{fixture}] '{op}' assigned to cpu_ep and executed here");
+        driven += 1;
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} fixture(s) were assigned to this EP without being executed by it:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+
+    if driven == 0 {
+        eprintln!("*** SKIPPED: no fixture could be driven — ORT or EP cdylib not found ***");
+        return;
+    }
+    assert!(
+        baselines > 0,
+        "every driven fixture failed to build an ORT-only baseline, so the non-vacuity half \
+         never ran: {no_ort_kernel:?}"
+    );
+    // A fixture whose inputs carry semantics (int32 `seqlens_k`, int64
+    // `position_ids`) cannot be filled with noise; those are driven with real
+    // values by `rope_and_gqa_execute_on_our_ep_and_match_ort_numerics`.
+    eprintln!(
+        "\n✅ every_assigned_node_is_also_executed_by_this_ep: {driven} fixtures executed here \
+         ({baselines} of them also proved a no-EP baseline leaves the counter at zero; \
+         {} have no ORT CPU kernel at all: {no_ort_kernel:?}). {} needed semantic inputs and are \
+         covered by rope_and_gqa_execute_on_our_ep_and_match_ort_numerics: {skipped:?}",
+        no_ort_kernel.len(),
+        skipped.len()
+    );
 }

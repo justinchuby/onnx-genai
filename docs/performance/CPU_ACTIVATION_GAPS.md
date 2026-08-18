@@ -19,22 +19,71 @@ Host: AMD EPYC 9V74, 32 vCPU, `avx2 f16c fma`, AVX-512 masked off. Ratios are
 **ours ÷ ORT**, so **below 1.00 means we are slower** and the row is a gap to
 close.
 
+The elementwise grid is reproducible from the tree:
+
+```sh
+NXRT_MM_BENCH=1 NXRT_MM_BENCH_THREADS=1 ONNX_GENAI_MLAS_THREADPOOL_THREADS=1 \
+NXRT_MM_BENCH_CASE=f32_1m NXRT_MM_BENCH_ITERS=31 taskset -c 8-15 \
+cargo test --release -p onnx-runtime-ep-cpu-plugin --test plugin_ort_e2e \
+  plugin_path_ab -- --nocapture --ignored
+```
+
+`unary_bench_cases()` holds the cases; `f32_4k`, `f32_1m` and `f16_1m` select
+the size groups. The harness refuses a half-pinned comparison outright, so a
+ratio it prints was measured with both pools at the same width. Note that its
+`ratio_p50` column is ORT-relative the other way round — `ours_ms / ort_ms` —
+so the tables below are its reciprocal.
+
 ## Open gaps
 
 ### Elementwise float32, single thread
 
+Three columns, all `ours ÷ ORT` (below 1.00 = we are slower), but only two of
+them are comparable with each other.
+
+*16 CGUs* and *1 CGU* are the same session-level harness
+(`plugin_path_ab_vs_plain_ort`, `intra_op = 1` on both sides, 31 interleaved
+iterations, p50 of whole-`Run`) on the same commit, differing only in whether
+`codegen-units = 1` is pinned for `onnx-runtime-ep-cpu`. That pair is a
+controlled A/B and the improvement between them is the claim: the default
+sixteen codegen units de-vectorize these loops, and the pin recovers 1.4–1.9x of
+it.
+
+*Published* is the column this file has carried since #1093. It is kept for
+continuity but it is **not** on the same footing: it predates this harness, and
+on several rows it is still above the pinned column (`Tanh` 0.82 against 0.70),
+which a strictly-improved build on one harness cannot produce. Treat it as a
+different measurement of the same op, not as a target the pin was supposed to
+restore. Rows are being re-measured on the current harness as they are worked;
+until a row has been, its *published* cell is history rather than status.
+
+| op | published | 16 CGUs | 1 CGU | size |
+|---|---|---|---|---|
+| `Tanh` | 0.82 | 0.41 | 0.70 | 1 M |
+| `Tanh` | 0.71 | 0.49 | 0.66 | 4 K |
+| `Sigmoid` | 0.81 | 0.43 | 0.72 | 1 M |
+| `Sigmoid` | 0.70 | 0.48 | 0.66 | 4 K |
+| `Gelu` (tanh) | 0.79 | 0.49 | 0.72 | 1 M |
+| `Gelu` (none, exact) | 0.76 | 0.51 | 0.66 | 1 M |
+| `Erf` | 0.74 | 0.49 | 0.64 | 1 M |
+| `Erf` | 0.69 | 0.53 | 0.63 | 4 K |
+| `Exp` | 0.92 | 0.42 | 0.78 | 1 M |
+| `Relu` | 1.03 | 0.96 | 0.97 | 1 M |
+| `Sqrt` | 1.1–1.9 | 0.65 | **1.39** | 1 M |
+| `Sqrt` | — | 0.61 | 0.87 | 4 K |
+| `QuickGelu` | 0.75–1.02 | 0.69 | **1.05** | 1 M |
+| `FastGelu` | 0.57–0.75 | 0.50 | 0.71 | 1 M |
+
+Still to measure on the current build: `Log` (0.60–0.68 published, still scalar
+`libm`), `Softplus`, `BiasGelu`, and the 1 K column.
+
+`Relu` is the control: it is memory-bound at 1 M, so the codegen partition
+cannot move it, and it does not — 0.96 against 0.97.
+
 | op | 1 K | 4 K | 64 K | 1 M | note |
 |---|---|---|---|---|---|
-| `Tanh` | 0.60 | 0.71 | 0.80 | 0.82 | AVX2 poly landed in #1037 |
-| `Sigmoid` | 0.62 | 0.70 | 0.78 | 0.81 | AVX2 poly landed in #1037 |
-| `Gelu` (tanh) | 0.64 | 0.72 | 0.77 | 0.79 | |
-| `Gelu` (none, exact) | 0.67 | 0.70 | 0.74 | 0.76 | erf poly landed in #1074 |
-| `Erf` | 0.66 | 0.69 | 0.72 | 0.74 | was 0.022–0.25 before #1074 |
-| `Exp` | 0.74 | 0.75 | 0.88 | 0.92 | MLAS poly ported in #1093 |
 | `Log` | 0.68 | 0.60 | 0.60 | 0.64 | still scalar `libm` |
 | `Softplus` | 1.03 | 1.13 | 0.96 | 0.92 | wins small, loses large |
-| `Relu` | 0.76 | 0.76 | 0.87 | 1.03 | |
-| `Sqrt` | — | — | 1.1–1.9 | 1.1–1.9 | wins at 1 thread, **0.30 at 16** |
 
 ### Elementwise float16
 
@@ -50,6 +99,11 @@ in the math.
 
 The `Exp` f16 0.22 at 1 M is the worst single cell in the table and is
 conversion-bound, not math-bound.
+
+Re-measured 2026-08-18 through the session harness at 1 M and one thread, `16
+CGUs → 1 CGU`: `Tanh` 0.49 → 0.74, `Exp` 0.50 → 0.75. The codegen pin is worth
+1.5x here too, so the f16 rows above are also lower than they should be and are
+being re-measured op by op.
 
 ### `com.microsoft` activations, float32
 
@@ -116,8 +170,27 @@ that selecting this EP keeps work off ORT's CPU EP. `GetCapability` runs
 them. Deleting the policy addressed one; the other two were each found by
 review, after this document had already claimed the job was done.
 
-**Filter 1 — the assignment policy.** Removed. This was the performance-based
-decline.
+**Filter 1 — the assignment policy.** Removed, and now *unrepresentable*. This
+was the performance-based decline. Deleting `assignment_policy.rs` left the
+mechanism it plugged into standing: `ClaimPreference::DeferToHost`, the
+`claim_preference` / `claim_preference_node` trait methods on
+`ExecutionProvider`, and the `host_fallback_available` plumbing that switched
+the gate off under `session.disable_cpu_ep_fallback=1`. All of it is gone from
+`onnx-runtime-ep-api` and `onnx-runtime-ep-plugin`, so an EP can no longer
+decline a node it supports by overriding a default — there is no default left
+to override, and `supports_op` is the only claim-time answer. The
+`session.disable_cpu_ep_fallback` special case went with it: the gate it
+disabled no longer exists.
+
+**Assignment is not execution.** ORT's node→EP attribution is a session-build
+fact, and comparing outputs against ORT cannot distinguish "our kernel ran" from
+"ORT's kernel ran", because agreeing with ORT is what a correct kernel does. The
+plugin therefore counts the node kernels it actually executes
+(`nxrt_ep_executed_node_count`, read through `dlopen` from the same mapping ORT
+loaded) and `every_assigned_node_is_also_executed_by_this_ep` asserts, with CPU
+fallback disabled, that one `Run` advances that counter by exactly the number of
+nodes ORT assigned to `cpu_ep`. A baseline session with the EP never appended
+must leave the counter at zero, which is what keeps the assertion non-vacuous.
 
 **Filter 2 — the shape table.** Drops any claim containing a node whose
 `ShapeInference::for_node` returns `Declined`

@@ -2119,6 +2119,40 @@ physical core within the compact set, which needs SMT sibling discovery
 (`/sys/devices/system/cpu/cpuN/topology/thread_siblings_list`) that
 `decode_affinity` does not currently do.
 
+### 26.2.1 (a) is now fixed, and (b) alone still blocks
+
+#1184 made the pool genuinely multi-dispatcher: `dispatch` claims the single job
+slot with a compare-exchange and a losing caller runs the same shards inline on
+its own thread, which is the identical computation because the shards already
+partition their output by global worker index. That closed (a) as a correctness
+matter, and the review confirmed the failure was reproducible - deleting the
+claim gate makes the two-dispatcher test *hang* rather than fail, which is why
+the hazard had gone unnoticed.
+
+It did **not** make the routing landable. Re-wiring `RotaryEmbedding`'s fan-out
+through the pool on top of #1184 and running the paired grid again reproduces
+the bistability of §26.2(b) intact, and worse than before:
+
+| model | t | rayon (base) | hot pool |
+|---|---|---|---|
+| rope_llama3_s128 | 8 | 5.456 | 11.313 |
+| rope_llama3_s128 | 16 | 9.457 `[6.4-23.1]` | **72.704** `[20.7-86.6]` |
+| rope_gptj_il_s128 | 16 | 6.247 | **55.751** `[29.0-85.7]` |
+| rope_gptj_il_s512 | 16 | 5.445 | **1.232** `[1.08-35.6]` |
+| rope_llama3_b8_s1 | 16 | 0.807 | **0.622** |
+| rope_llama3_s512 | 16 | 30.771 | **18.385** |
+
+Both directions in one grid, with dispersion bands wider than the medians. That
+is not a tuning problem, and the bottom three rows are not a partial win - they
+are the same bistable system landing on its other mode. Nothing here is
+publishable as a ratio.
+
+So the ordering is settled: **(b) is the binding constraint, not (a)**. Capping
+*spinning* workers at one per physical core inside the compact mask - which
+needs the SMT sibling discovery `decode_affinity` does not do - has to land
+before the hot-pool routing can be evaluated at all, let alone merged. Until
+then the t=8/16 column stays where it is, and the RoPE fan-out stays on Rayon.
+
 ### 26.3 What this means for the remaining §23.7 rows
 
 Softmax, Transpose, Concat and the MoE cells should not be attacked as separate
@@ -2127,8 +2161,398 @@ of their arithmetic; their t=8/16 numbers are mostly measuring thread wake-up.
 Any per-kernel tuning done against the t=16 column now is tuning against the
 scheduler, and will have to be redone.
 
+Per §26.2.1 that now reads more sharply: the scheduler work itself is blocked
+behind SMT-aware spin capping, so *neither* the per-kernel tuning nor the
+hot-pool routing is the next move.
+
 The exception is §11.5's paged/appendable KV cache. `Concat` re-copying the full
 history every token is a real algorithmic cost that no scheduler change touches,
 and §8 already established that parallelising `ConcatKernel` is a dead end. That
 remains the largest genuinely structural gap and is independent of all of the
 above.
+
+## 27. Where the CPU EP actually stands
+
+Full transform + KV-concat grid on `main` at `f2e6ad97d`, paired interleaved
+against a real ORT 1.27 CPU session, one driver invocation, 5 trials × 60 runs ×
+15 warmups. Ratio is native/ORT p50, **lower is better**, and `< 1.000` is a win.
+
+| model | t=1 | t=8 | t=16 |
+|---|---|---|---|
+| kvcat_llama3_b8_p2047 | **0.883** | 2.203 | 2.250 |
+| kvcat_llama3_p1023 | 1.002 | 4.672 | 3.930 |
+| kvcat_llama3_p2047 | **0.968** | 3.545 | 3.878 |
+| kvcat_llama3_p4095 | 1.706 | 5.075 | 6.633 |
+| kvcat_llama3_p8191 | 1.004 | 2.824 | 2.955 |
+| rope_gptj_il_s1 | 1.300 | 1.290 | 1.287 |
+| rope_gptj_il_s128 | **0.878** | 3.864 | 5.800 |
+| rope_gptj_il_s512 | **0.962** | 3.018 | 5.773 |
+| rope_llama3_b8_s1 | 1.160 | 1.261 | **0.874** |
+| rope_llama3_s1 | 1.295 | 1.295 | 1.295 |
+| rope_llama3_s128 | 1.022 | 4.657 | 17.557 |
+| rope_llama3_s512 | 1.024 | 3.589 | 5.230 |
+| sm_bert_b8_s128 | 1.246 | 3.294 | 5.179 |
+| sm_decode_h32_kv1024 | 1.177 | 1.987 | 2.051 |
+| sm_decode_h32_kv2048 | 1.183 | 2.648 | 3.015 |
+| sm_decode_h32_kv4096 | 1.188 | 4.143 | 4.268 |
+| sm_decode_h32_kv8192 | 1.214 | 5.423 | 6.776 |
+| sm_prefill_h32_s512 | 1.328 | 2.539 | 2.655 |
+| sm_whisper_cross | 1.374 | 2.933 | 3.059 |
+| tr_bert_b8_s128 | **0.607** | 1.068 | 1.715 |
+| tr_llama3_s512 | **0.820** | 2.796 | 4.292 |
+| tr_whisper_s1500 | **0.984** | 2.311 | 3.413 |
+
+**8 of 66 cells win. 58 lose. Parity 330/330 PASS.**
+
+Read by column rather than by row, which is the whole point of §26:
+
+| threads | wins | median ratio |
+|---|---|---|
+| 1 | 8 / 22 | ~1.02 |
+| 8 | 0 / 22 | ~3.0 |
+| 16 | 1 / 22 | ~3.6 |
+
+At **t=1** the kernels are at parity - median 1.02, eight outright wins, and the
+worst cell is 1.706. That column is a fair measure of the arithmetic, and it
+says the arithmetic is broadly competitive. At **t=8 and t=16** the median is
+3-3.6× with almost no wins. The kernels did not get worse; the scheduling did.
+
+Two caveats on this table, stated rather than buried. The host is shared and
+contended, so absolute numbers drift between runs - `rope_llama3_s128` at t=16
+reads 17.557 here and 9.457 in the §26.2.1 grid taken later the same session.
+Only ratios from a single driver invocation are comparable, which is why the
+arms are interleaved. And cells whose native p50 is under ~100 µs
+(`rope_*_s1`, `rope_llama3_b8_s1`) are overhead-dominated, which is why they sit
+near a flat ~1.3 at every thread count instead of scaling.
+
+### 27.1 The honest blocker list
+
+1. **SMT-aware spin capping** (§26.2.1) - blocks the entire t=8/16 column, which
+   is 58 of the 66 losing cells. Nothing else in this list can be measured
+   cleanly until it lands.
+2. **Paged/appendable KV cache** (§11.5) - the `kvcat_*` rows re-copy the whole
+   history per token. Independent of (1); the only structural item that is
+   actionable right now.
+3. **Fused transpose-with-consumer** (§7, §19, §20) - `tr_*` wins at t=1 by
+   reading and writing less, and that advantage should compose into QK/PV/MoE
+   rather than being spent on a standalone node.
+4. **Grouped/batched MoE GEMM** (§18) - not in this grid; measured separately at
+   1.47-2.37× on qwen3-moe e16 top-8.
+5. **Fused-attention session A/B** (§15) - the `sm_*` rows here are isolated
+   single-node graphs. Softmax has to win inside a real fused SDPA region.
+6. **Output/intermediate arena** (§21.3) - #1146 removed the input half;
+   `collect_outputs` remains.
+
+## 28. Phase 8: the appendable KV path, and what it actually cost
+
+Phase 8 went at the KV cache structurally rather than through the scheduler
+(which Sebastian now owns). Mapping the CPU appendable-KV path turned up two
+defects that had nothing to do with thread counts, and both are now fixed.
+
+### 28.1 A bf16 KV cache widened its entire capacity, every forward (#1199)
+
+`PastCache::from_cache` classified a KV cache into one of three sources. It
+borrowed contiguous `f32` and contiguous `f16` and sent everything else to
+`to_dense_f32_widen`, which allocates a `Vec<f32>` over the cache's **whole
+physical capacity** and widens every element into it — for a result the append
+path then reads one token's rows out of and drops.
+
+`bf16` landed in that catch-all. Three things made it worse than it looks:
+
+* It is on the **general** path. `from_cache` runs on every
+  `GroupQueryAttention` forward, before any aliasing gate is evaluated.
+* It runs **twice per layer per token**.
+* It scales with **capacity**, not with the valid prefix, so it does not get
+  cheaper at short context and a generous `ONNX_GENAI_CPU_KV_MAX_LEN` makes it
+  worse.
+
+`f16` never paid any of it. The two half formats are handled identically
+everywhere else in the kernel; only the classifier had the gap.
+
+Classify + read one row at llama3-8B KV geometry (8 kv heads, head_dim 128,
+capacity 4096 — 4.19M elements, a 16 MiB widen), best of 7 x 20, release:
+
+| dtype | before | after |
+|---|---|---|
+| f16 | 83 ns | 83 ns |
+| **bf16** | **606 147 ns** | **81 ns** |
+
+bf16 now costs what f16 costs. On a 32-layer decoder that is ~39 ms per token
+of pure widen removed; the unchanged f16 column confirms nothing else moved.
+
+**The part worth remembering.** The first version of this fix used
+`widen_bf16_slice_into`, a raw `(bits << 16)` shift. The path it replaced
+reaches `half::bf16::to_f32`, which **quiets signalling NaN**. Those two
+disagree on exactly 126 of the 65536 bit patterns. `dtype.rs` already carried a
+warning about precisely this, on `widen_quieting`:
+
+> A bulk path that replaces the latter has to quiet, or it would silently
+> change what every bf16 kernel sees for sNaN inputs.
+
+`cast.rs`, `elementwise.rs` and `dense_elementwise.rs` had each taken that
+advice and each left a comment saying so. This kernel was the one that did not
+— and the reason it was easy to get wrong is that there was no *safe* slice
+wrapper for the quieting widen, only the unsafe AVX2 intrinsic. There is one
+now (`widen_bf16_slice_quieting_into`), documented against its raw sibling.
+
+The test that "verified" bit-identity listed one NaN pattern and happened to
+pick a **quiet** one, so it passed against a non-quieting widen. It is now an
+exhaustive sweep of all 65536 patterns across six `(start, len)` windows. Two
+further instances of the same defect in the same kernel — `HalfKv::widen_into`
+on the in-place append path, and `widen_rotary_prefix`, whose own fallback four
+lines below is `to_dense_f32_widen` — were fixed with it.
+
+### 28.2 The CPU KV cache could not grow at all (#1203)
+
+`decode_cpu_inplace` hard-errored the moment a context outgrew the cache:
+
+    bail!("CPU KV capacity exceeded: requested context length {total_len}, ...")
+
+`DEFAULT_CPU_KV_MAX_LEN` is 4096, so **token 4097 killed the generation**. The
+suggested remedy — raise the env var — means guessing a bigger number up front
+and paying for it in resident memory for the whole run. The CUDA path has had
+growth since it landed (`ensure_capacity`, bucketing, VMM remap); the CPU path
+had none of it.
+
+Capacity is axis 2 of `[B, H, capacity, Dh]`, not the outermost axis, so head
+`i` lives at `i * capacity * Dh` and **growing relocates every head but the
+first**. A flat memcpy would leave head 1 onward reading the previous head's
+tail — plausible numbers, silently wrong attention, no crash. The prefix is
+carried one contiguous run per `(batch, head)` block. Growth doubles, so
+re-binding is amortised O(1) per token.
+
+**The end-to-end test was worthless on the first attempt, and this is the
+lesson.** It asserted that a decode with a deliberately tiny KV capacity
+produced the same tokens as one with room to spare. It passed — and it *also*
+passed when growth was changed to drop the entire KV history, because the
+scalar-GQA fixture's q/k/v are `Constant` zeros and its output does not depend
+on cache contents at all. Token equality proved nothing.
+
+The property worth testing is the one the unit tests cannot reach:
+`GroupQueryAttention` decides to append in place by comparing the past-input
+and present-output pointers **at execution time**, so a reallocated buffer that
+failed to re-alias would silently stop appending. Nothing observable
+distinguished that from success — so the f32 in-place path now has a counter
+(`present_inplace_count()`, mirroring the half-precision one that already
+existed), and the test asserts a cache forced to grow repeatedly appends in
+place **exactly as often** as one that never grows. Breaking the aliasing fails
+it. As a side effect these counters, which had no consumer outside the kernel's
+own unit tests, now have one.
+
+### 28.3 Where the KV axis stands against ORT, context 1k–8k
+
+Concat-shaped KV, matched paired-interleaved A/B, one driver invocation,
+5 trials x 30 runs x 10 warmups. Ratio is native/ORT, lower is better.
+Parity **60/60 PASS**.
+
+| model | t=1 | t=8 | t=16 |
+|---|---|---|---|
+| kvcat_llama3_p1023 | **0.979** | 4.079 | 4.207 |
+| kvcat_llama3_p2047 | **0.978** | 4.298 | 5.585 |
+| kvcat_llama3_p4095 | 1.981 | 5.122 | 5.322 |
+| kvcat_llama3_p8191 | **1.009** | 2.418 | 2.698 |
+
+Two things to read here, and one not to.
+
+* **t=1 is at parity across the whole 1k–8k range** (0.98–1.01), with p4095 the
+  single exception.
+* **t=8/16 lose 2.4–5.6×.** This is §26's worker-park effect, not a KV defect:
+  the same shape of result appears on every kernel in §27 regardless of what it
+  computes. It is Sebastian's area and nothing in Phase 8 touches it.
+* **Do not read the p4095 row as a regression against p8191.** ORT's absolute
+  time doubles from p4095 to p8191 (1.92 → 3.73 ms) as expected, while native's
+  is flat (3.81 → 3.76 ms). Native is paying a roughly fixed ~3.8 ms at both
+  lengths, so the *ratio* improves with context purely because ORT's cost grows
+  into it. That flat cost is unexplained and is the next thing to chase on this
+  axis; the honest summary is "native does not scale with past length here the
+  way ORT does, in both directions".
+
+### 28.4 What is still structurally blocked
+
+`Concat`-shaped KV caches still pay the full O(S) history copy, and that is
+still the §13 boundary: `ExternalValue` has no strides field, so a device-bound
+value is always dense, and a capacity-backed dense view of `[B,H,S,D]` with the
+growth axis at position 2 is not expressible. The GQA present==past route
+(which Phase 8 improved) remains the only appendable path, and the engine still
+declines to take it for any non-f32 cache, so the bf16 fix above is reachable
+today only through the raw session API — though it applies to every bf16 GQA
+forward regardless.
+
+Beam reorder still does not exist for CPU or CUDA; `num_beams` is passthrough
+metadata and the decode loop is single-sequence. Nothing in Phase 8 changed
+that, and no claim about beam search should be made from this work.
+
+## 29. Phase 9: Softmax was paying for a copy ORT never makes (#1219)
+
+### 29.1 The defect
+
+`softmax_rows` - the shared entry point every `Softmax` node reaches, and the one
+`scale_mask_softmax_rows` and `softmax_slices` route through - began with
+
+    dst.copy_from_slice(src);
+    softmax_rows_in_place(dst, n, d);
+
+That is a full extra read+write pass over the tensor before any arithmetic happens. On
+`sm_prefill_h32_s512` the logit block is 33 MiB, so each inference moved **66 MiB** of
+traffic that produced no result. ORT never pays it: it hands `MlasComputeSoftmax` the
+graph input and output buffers directly.
+
+This is the whole explanation for §9's and §27's standing Softmax losses. The kernel's
+arithmetic was never the problem, and no amount of vectorising the reducer would have
+found it - the cost was in the line before the reducer was called.
+
+### 29.2 The fix
+
+Compute out-of-place. The reducer already traverses each row twice (once for the max,
+once for the exponent sum), so writing into `dst` on the final pass instead of
+pre-seeding `dst` with a copy is free. `softmax_rows_serial_out(src, dst, n, d)` takes
+the two buffers separately and has both a pure-Rust and an MLAS arm.
+
+Aliasing was already handled upstream and did not need new guards:
+`output_direct_write_eligible` refuses the direct-write slice when input and output
+overlap, so `softmax_rows` is only ever handed disjoint buffers. The pre-existing test
+`an_output_aliasing_its_input_matches_the_disjoint_result` covers that path.
+
+### 29.3 Result
+
+Paired interleaved A/B, one driver invocation, 3 repetitions x 40 runs x 15 warmups,
+`--native-threads 1 --ort-intra-threads 1`, base arm built from `origin/main` in a
+separate worktree. Median `native/ort`, lower is better:
+
+| model | before | after |
+|---|---|---|
+| sm_prefill_h32_s512 | 1.318 | **0.924** |
+| sm_bert_b8_s128 | 1.242 | 1.033 |
+| sm_decode_h32_kv1024 | 1.174 | 1.015 |
+| sm_decode_h32_kv2048 | 1.291 | 1.026 |
+| sm_decode_h32_kv4096 | 1.183 | 1.028 |
+| sm_decode_h32_kv8192 | 1.199 | 1.035 |
+
+Parity 36/36 PASS, `max_abs=0` in every cell.
+
+**What this does not claim.** One shape is won outright. The other five moved from a
+17-29% loss to a 1.5-3.5% loss. They are *not* won. The remaining few percent on those
+shapes is unattributed and is the next thing to chase on this axis.
+
+### 29.4 A measurement caveat that applies to this whole document
+
+`onnx-genai-bench` declares `required-features = ["mlas"]`, so `bench_generic` can only
+be built with MLAS linked in. Every ratio published in this document - including §27's
+66-cell grid - was therefore produced by the **MLAS-linked build**, and where a kernel
+has an MLAS arm (`softmax_rows_serial` does) that arm is what was measured.
+
+`mlas` is **not** a default feature of `onnx-runtime-ep-cpu`. The build that ships runs
+the pure-Rust arm. For this change that distinction does not affect the conclusion,
+because the removed copy sat at the shared, arm-agnostic `softmax_rows` call site and
+both arms lose it identically. But it does mean the *magnitude* of the win on the
+production build is unmeasured, and no ratio in this document should be read as a
+statement about a non-MLAS build until the harness can produce one. Fixing that -
+relaxing `required-features` so `bench_generic` can build both arms - is open work.
+
+### 29.5 Review finding: the bit-identity claim had no in-tree assertion
+
+The adversarial review of #1219 accepted the change but noted that its central claim -
+that the out-of-place form is bit-identical to the copy-then-in-place form - rested on
+prose. Every existing test compared with a `1e-6` tolerance over finite synthetic
+logits, and the non-finite tests exercised `softmax_rows_in_place`, not `softmax_rows`.
+
+That gap matters here specifically because the in-place reducer is vectorised and the
+out-of-place path is not, so the two `exp` implementations have to agree on the
+non-finite lanes exactly. `out_of_place_softmax_is_bit_identical_on_pathological_rows`
+now compares raw bits over fully masked rows, `+inf`-max rows, quiet, signalling and
+negative-payload NaNs, and denormals.
+
+Two things are worth recording about writing it:
+
+* The first falsifier chosen - guarding the normalisation with
+  `if sum == 0.0 { 0.0 }` - **did not trip the test**, and the reason was that the
+  test's own doc comment was wrong. A fully masked row does not normalise `0.0/0.0`:
+  the row max is `-inf`, so `exp(-inf - -inf)` is `exp(NaN)` and the sum is NaN, never
+  zero. The NaN arrives by propagation, not by division. A falsifier that fails to fire
+  is not evidence the test is vacuous - it can equally mean the falsifier is
+  inapplicable - and the only way to tell the two apart is to work out *why*.
+* The test carries an explicit non-vacuity guard asserting those rows still produce NaN
+  at all, so a future change that quietly made every row finite would fail loudly
+  instead of leaving a bit comparison that is trivially true. This is the third vacuous
+  or near-vacuous test caught in this effort (§28.2 has the other two); assume the
+  default state of a new test is vacuous until a falsifier has been run against it.
+
+## 30. Phase 10: the profiler was charging the run for its own instrument (#1226)
+
+### 30.1 The defect
+
+`activation_memory_planning_enabled()` returned `phase_profile::enabled()`, so the
+executor's activation-memory planner ran on every run whenever phase profiling was on.
+The planner rebuilds the view map and re-plans every activation each run - work the
+shipped runtime never does. `--phase-profile` therefore perturbed the run it was
+measuring and reported its own cost back as a phase of that run,
+`run_scoped.activation_memory_plan`, which no unprofiled run ever pays.
+
+The planner now has its own gate. `--phase-profile` drives the profiler only;
+`NXRT_EXEC_PHASE_PROFILE=1` in the environment still enables both, so the CLI memory
+report keeps its stats; `NXRT_ACTIVATION_MEMORY_PLAN=1` opts in without profiling.
+
+The CUDA step profiler switched the planner on as a side effect of enabling phase
+accounting, taxing the very decode steps it exists to time. That coupling is gone.
+
+### 30.2 Magnitude, and two withdrawn claims
+
+The planner's own span reads **1.9-6.0 us per run**. Removing it lowers `native_min` on
+`sm_decode_h32_kv4096` from **0.065 ms to 0.063 ms** - median of 15 interleaved
+repetitions, 300 runs each, single thread, both arms in one loop, 13 of 15 favouring
+the fixed arm. About **3%**, in line with the span.
+
+The first version of this section, and of the PR, claimed a **35%** inflation
+(0.065 -> 0.088 ms, ratio 1.023 -> 1.080) and claimed the planner also polluted the
+adjacent `exec_kernel.compute` figure (84.5 vs 60.3 us/call). **Both are withdrawn.**
+Review could not reproduce either, and a properly interleaved re-measurement showed
+why: this host is bimodal under contention, the 0.065/0.088 ms split appears in
+**both** arms, and `exec_kernel.compute` swings 75-168 us/call regardless of the
+planner.
+
+### 30.3 The methodology lesson, which is the point of this section
+
+The withdrawn numbers were produced by running arm A three times, then arm B three
+times, inside one shell loop - and reading the *mean* `native=` field. Every arm-vs-arm
+number in this document is supposed to come from interleaved repetitions in one
+invocation, precisely because this host drifts. I wrote the loop that way, saw a clean
+35% separation, and believed it, because the separation was large and the story was
+satisfying. It was the machine changing state between the two halves of the loop.
+
+Three things that would have caught it, and are now the standing rule for this
+document:
+
+* **Interleave at the innermost level.** A B A B A B, not A A A B B B. The second form
+  cannot distinguish an arm effect from a time effect, and on this host time effects
+  are large.
+* **Prefer `native_min` to the mean for small graphs.** The minimum over 300 runs is
+  the least contaminated estimator available when the noise is one-sided, which
+  contention noise is. Switching to it turned an unstable 0.065-vs-0.088 into a stable
+  0.065-vs-0.063.
+* **Distrust a result proportional to how much you like it.** A 35% win from deleting
+  one planning call was far larger than the planner's own measured span, and that
+  internal inconsistency - the span said 2-6 us, the wall clock said 23 us - was
+  visible in my own output before review saw it. When the mechanism's measured cost
+  and the claimed effect disagree by an order of magnitude, the effect is wrong.
+
+The change still stands: charging a run for the instrument observing it is a defect
+whatever its size, and the phantom phase made every per-phase attribution taken with
+`--phase-profile` wrong by construction. Section 21's boundary instrument and every
+attribution derived from it were taken under the coupled gate and should be re-read.
+
+### 30.4 A third vacuous test, and why this one was interesting
+
+The first regression test passed, and then still passed when the planner was
+deliberately re-coupled to phase profiling. The gate read `#[cfg(test)] { true }`, so
+the production wiring was the one line no unit test could reach; the test pinned the
+module's parts and not the wiring between them.
+
+Removing the `cfg(test)` override so tests and production share one gate is what made
+it testable, and the two tests that genuinely need the planner now pin the production
+wiring as a side effect of asking for it explicitly. Re-coupling the wiring fails both.
+
+Counting §28.2 and §29.5, that is four vacuous or near-vacuous tests found in this
+effort. Every one of them passed when written. The only thing that separated the real
+tests from the decorative ones was running the falsifier - and in §29.5 even the
+falsifier misfired, which is its own lesson: a falsifier that does not fire is not
+evidence the test is sound until you know *why* it did not fire.
