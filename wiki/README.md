@@ -16,6 +16,8 @@ This directory is an Obsidian-compatible knowledge base for explanatory notes,
 learning paths, and links between implementation concepts. It does not replace
 the specifications, measured evidence, or accepted designs in `docs/`.
 
+Published readers start at [[index|onnx-genai Knowledge Base]].
+
 > [!important] Source precedence
 > When a wiki note disagrees with formal documentation or code, use this order:
 > 1. Current code and reproducible measurements
