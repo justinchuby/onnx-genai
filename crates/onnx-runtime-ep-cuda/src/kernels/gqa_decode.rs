@@ -27,13 +27,13 @@ use onnx_runtime_ep_api::{EpError, Result};
 use crate::error::driver_err;
 use crate::runtime::CudaRuntime;
 
-const MODULE_KEY: &str = "gqa_decode_attention_f32_v3";
+const MODULE_KEY: &str = "gqa_decode_attention_f32_v4";
 const ENTRY: &str = "gqa_decode_attention_f32";
 const MERGE_ENTRY: &str = "gqa_decode_attention_f32_merge";
 
 /// Largest `head_dim` this kernel supports. Each of the 32 warp lanes owns
-/// `ceil(head_dim / 32)` output dimensions in registers, capped at 4.
-pub(super) const MAX_HEAD_DIM: usize = 128;
+/// `ceil(head_dim / 32)` output dimensions in registers, capped at 8.
+pub(super) const MAX_HEAD_DIM: usize = 256;
 
 /// Warps grouped into one CTA. Small enough to spread the (few) decode rows
 /// across many SMs, large enough to amortize launch overhead.
@@ -100,8 +100,8 @@ pub(super) static TEST_SINGLE_SPLIT_LOCK: std::sync::Mutex<()> = std::sync::Mute
 
 const DECODE_SRC: &str = r#"
 #define GQA_WARP_SIZE 32
-#define GQA_MAX_DPL 4   // dims per lane; head_dim <= 32 * GQA_MAX_DPL == 128
-#define GQA_MAX_HEAD_SIZE 128
+#define GQA_MAX_DPL 8   // dims per lane; head_dim <= 32 * GQA_MAX_DPL == 256
+#define GQA_MAX_HEAD_SIZE 256
 #define GQA_MAX_SPLITS 16
 #define GQA_MAX_SCRATCH_ROWS 256
 #define GQA_SCRATCH_STRIDE (GQA_MAX_HEAD_SIZE + 2)
@@ -658,11 +658,138 @@ mod tests {
         );
     }
 
+    /// Mirrors [`decode_kernel_matches_reference_softmax`] for the qwen3.5-2b
+    /// full-attention shape: GQA 8/2 with `head_dim=256` (double the previous
+    /// `MAX_HEAD_DIM`). Exercises the split-K boundaries at seq 64/128/256 and
+    /// asserts the fused kernel matches the f64 CPU reference within the same
+    /// tolerance the head_dim<=128 parity test accepts.
+    #[test]
+    fn decode_kernel_matches_reference_softmax_head256() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping CUDA GQA decode head256 parity test: CUDA runtime unavailable");
+            return;
+        };
+
+        let batch = 1usize;
+        let num_heads = 8usize;
+        let num_kv_heads = 2usize;
+        let head_dim = 256usize;
+        let cache_capacity = 1024usize;
+        let group = num_heads / num_kv_heads;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        let mut state = 0x0BADC0DEu64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let query: Vec<f32> = (0..num_heads * head_dim).map(|_| next()).collect();
+        let key: Vec<f32> = (0..num_kv_heads * cache_capacity * head_dim)
+            .map(|_| next())
+            .collect();
+        let value: Vec<f32> = (0..num_kv_heads * cache_capacity * head_dim)
+            .map(|_| next())
+            .collect();
+
+        let query_dev = runtime.alloc_raw(query.len() * 4).unwrap();
+        let key_dev = runtime.alloc_raw(key.len() * 4).unwrap();
+        let value_dev = runtime.alloc_raw(value.len() * 4).unwrap();
+        let output_dev = runtime.alloc_raw(num_heads * head_dim * 4).unwrap();
+        let totals_dev = runtime.alloc_raw(batch * 4).unwrap();
+
+        // SAFETY: device buffers were sized to hold each source slice.
+        unsafe {
+            runtime.htod(as_bytes(&query), query_dev).unwrap();
+            runtime.htod(as_bytes(&key), key_dev).unwrap();
+            runtime.htod(as_bytes(&value), value_dev).unwrap();
+        }
+
+        let mut worst_abs = 0.0f32;
+        let mut worst_rel = 0.0f32;
+        // Split-K boundaries: <=64 -> 1 split, <=128 -> 2, <=256 -> 4, <=512 -> 8.
+        for total in [1usize, 7, 64, 65, 128, 129, 255, 256, 257, 512, 1023] {
+            let totals = [total as i32];
+            // SAFETY: `totals_dev` holds `batch` i32 values.
+            unsafe {
+                runtime.htod(as_bytes(&totals), totals_dev).unwrap();
+            }
+
+            run(
+                &runtime,
+                batch,
+                num_heads,
+                num_kv_heads,
+                1,
+                head_dim,
+                cache_capacity,
+                group,
+                scale,
+                query_dev,
+                key_dev,
+                value_dev,
+                output_dev,
+                totals_dev,
+                0,
+                0.0,
+            )
+            .unwrap();
+
+            let mut got = vec![0.0f32; num_heads * head_dim];
+            // SAFETY: `output_dev` holds `num_heads * head_dim` f32 values.
+            unsafe {
+                runtime.dtoh(as_bytes_mut(&mut got), output_dev).unwrap();
+            }
+
+            let expected = cpu_reference(
+                &query,
+                &key,
+                &value,
+                total,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                cache_capacity,
+                scale,
+            );
+
+            for (g, e) in got.iter().zip(expected.iter()) {
+                let abs = (g - e).abs();
+                let rel = abs / e.abs().max(1e-4);
+                worst_abs = worst_abs.max(abs);
+                worst_rel = worst_rel.max(rel);
+            }
+        }
+
+        // SAFETY: each pointer came from this runtime's `alloc_raw` and is freed once.
+        unsafe {
+            runtime.free_raw(query_dev).unwrap();
+            runtime.free_raw(key_dev).unwrap();
+            runtime.free_raw(value_dev).unwrap();
+            runtime.free_raw(output_dev).unwrap();
+            runtime.free_raw(totals_dev).unwrap();
+        }
+
+        eprintln!("GQA decode head256 parity: max_abs={worst_abs:.3e} max_rel={worst_rel:.3e}");
+        assert!(
+            worst_abs < 1e-3,
+            "head256 decode kernel diverged from reference softmax: max_abs={worst_abs:.3e}"
+        );
+        assert!(
+            worst_rel < 5e-3,
+            "head256 decode kernel diverged from reference softmax: max_rel={worst_rel:.3e}"
+        );
+    }
+
     #[test]
     fn support_gate_targets_single_token_decode() {
         assert!(supported(1, 64));
         assert!(supported(1, 128));
-        assert!(!supported(1, 129));
+        assert!(supported(1, 129));
+        assert!(supported(1, 256));
+        assert!(!supported(1, 257));
         assert!(!supported(2, 64));
         assert!(!supported(1, 0));
     }
@@ -697,7 +824,7 @@ mod tests {
             ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
         };
 
-        for head_dim in [64usize, 128usize] {
+        for head_dim in [64usize, 128usize, 256usize] {
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             let mut q = vec![0.0f32; num_heads * head_dim];
             for slot in q.iter_mut() {
@@ -757,7 +884,7 @@ mod tests {
                 got
             };
 
-            for total in [1usize, 8, 33, 64, 65, 129, 300] {
+            for total in [1usize, 8, 33, 64, 65, 129, 256, 257, 300] {
                 let direct = launch(1, total);
                 let two_step = launch(0, total);
                 assert_eq!(
