@@ -1890,6 +1890,7 @@ impl Executor {
 
     pub(super) fn binding_consumers_use_padded_capacity(&self, input: ValueId) -> bool {
         let mut found = false;
+        let mut all_direct_padded = true;
         for plan in &self.plan {
             for (slot, value) in plan.inputs.iter().enumerate() {
                 if *value != Some(input) {
@@ -1897,11 +1898,24 @@ impl Executor {
                 }
                 found = true;
                 if !kernel_input_uses_padded_capacity(self.graph.node(plan.node_id), slot) {
-                    return false;
+                    all_direct_padded = false;
                 }
             }
         }
-        found
+        // Fast path: every direct consumer already reads the physical extent
+        // (`Shape`/`ReduceSum`), as in dense GQA masks (mask → ReduceSum→seqlens_k
+        // and Shape only).
+        if found && all_direct_padded {
+            return true;
+        }
+        // Topology-gated path: the mask binding feeds *only* the standard additive
+        // causal-mask builder, terminating at capacity-form `Attention` mask
+        // inputs (the DeepSeek-V2-Lite / MLA shape). There the frozen (physical
+        // width) mask yields a byte-identical additive bias, so the binding is
+        // padded-capacity-safe even though its cone contains prefix-sensitive
+        // `CumSum`/`Unsqueeze` (which stay non-padded-safe for any other topology,
+        // e.g. GLM-5.2's indexer `Add`).
+        mask_binding_feeds_capacity_form_attention(&self.graph, input)
     }
 
     /// The compiled graph, retained for the §55.4 EPContext dump path: the

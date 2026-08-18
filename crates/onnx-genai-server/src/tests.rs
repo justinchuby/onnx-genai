@@ -17,7 +17,7 @@ use axum::{
 use onnx_genai::engine::EngineDecodeBackend;
 use onnx_genai::{Engine, EngineConfig};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, io::Cursor, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, fs, io::Cursor, path::PathBuf, time::Duration};
 use tokio::{sync::mpsc, time::timeout};
 use tower::ServiceExt;
 
@@ -2393,6 +2393,52 @@ async fn multimodal_input_expands_the_prompt_and_binds_the_declared_endpoint() {
         "the declared endpoint must be bound: {:?}",
         request.inputs.keys().collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn pipeline_setup_inspects_native_only_graph_without_ort_session() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-native-sub4-engine");
+    let fixture = tempfile::tempdir().expect("create fixture directory");
+    fs::copy(
+        source.join("model.onnx.textproto"),
+        fixture.path().join("model.onnx.textproto"),
+    )
+    .expect("copy native-only model");
+    fs::copy(
+        source.join("tokenizer.json"),
+        fixture.path().join("tokenizer.json"),
+    )
+    .expect("copy tokenizer");
+    fs::write(
+        fixture.path().join("inference_metadata.yaml"),
+        r#"
+pipeline:
+  models:
+    decoder:
+      filename: model.onnx.textproto
+      type: decoder
+      tokenizer: tokenizer.json
+      io:
+        token_input: input_ids
+        attention_mask_input: attention_mask
+        position_ids_input: position_ids
+        logits_output: logits
+        kv_inputs: [past_key_values.0.key, past_key_values.0.value]
+        kv_outputs: [present.0.key, present.0.value]
+  strategy:
+    kind: autoregressive
+    decoder: decoder
+"#,
+    )
+    .expect("write pipeline metadata");
+
+    let setup = crate::multimodal::load(fixture.path())
+        .expect("graph-only setup inspection must not ask ORT to load native-only operators")
+        .expect("fixture declares a pipeline");
+    assert!(setup.multimodal.vision.is_none());
+    assert!(setup.multimodal.audio.is_none());
+    assert_eq!(setup.tokenizer_path, fixture.path().join("tokenizer.json"));
 }
 
 #[tokio::test]

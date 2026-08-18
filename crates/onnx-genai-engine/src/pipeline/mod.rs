@@ -235,6 +235,7 @@ pub struct PipelineEngine {
     memory_strategy_plan: MemoryStrategyPlan,
     plan: PipelinePlan,
     decode_backend: EngineDecodeBackend,
+    generation_defaults: Option<onnx_genai_metadata::GenerationDefaults>,
     /// Autoregressive decode state; `None` for non-autoregressive pipelines
     /// (single-pass, iterative/diffusion) which produce tensors, not tokens.
     decoder_state: Option<DecodeState>,
@@ -582,6 +583,16 @@ fn pipeline_metadata_prefill_chunk_size(
         .filter(|size| *size > 0)
 }
 
+fn pipeline_metadata_generation_defaults(
+    directory: &onnx_genai_ort::PipelineModelDirectory,
+) -> Option<onnx_genai_metadata::GenerationDefaults> {
+    directory
+        .metadata_path
+        .as_ref()
+        .and_then(|path| onnx_genai_metadata::load_metadata(path).ok())
+        .and_then(|metadata| metadata.generation)
+}
+
 /// Build the native device-KV [`PipelineDecoderComponent`] for `decoder`, loading
 /// its ONNX model as a [`NativeDecodeSession`](crate::native_decode::NativeDecodeSession)
 /// on the native backend so its KV cache stays session-resident across steps.
@@ -765,6 +776,11 @@ impl PipelineEngine {
         self.decode_backend
     }
 
+    /// Model-authored sampling defaults declared by the pipeline package.
+    pub fn generation_defaults(&self) -> Option<&onnx_genai_metadata::GenerationDefaults> {
+        self.generation_defaults.as_ref()
+    }
+
     /// Execution-provider placement reported by the loaded component sessions.
     pub fn execution_provider_status(&self) -> String {
         let mut summaries = self
@@ -856,6 +872,7 @@ impl PipelineEngine {
         let directory = PipelineModelDirectory::load(pipeline_dir)
             .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {e}"))?;
         let prefill_chunk_size = pipeline_metadata_prefill_chunk_size(&directory);
+        let generation_defaults = pipeline_metadata_generation_defaults(&directory);
         let model_weights_bytes =
             directory
                 .model_paths
@@ -1260,6 +1277,7 @@ impl PipelineEngine {
                 PipelineBackend::Ort => EngineDecodeBackend::Ort,
                 PipelineBackend::Native => EngineDecodeBackend::Native,
             },
+            generation_defaults,
             decoder_state,
             tokenizer_component,
             fixed_state_budget_bytes,
