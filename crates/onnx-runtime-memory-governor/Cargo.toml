@@ -9,7 +9,6 @@ keywords = ["onnx", "memory", "governor", "runtime", "inference"]
 categories = ["memory-management", "science"]
 
 [dependencies]
-onnx-runtime-memory-api = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
