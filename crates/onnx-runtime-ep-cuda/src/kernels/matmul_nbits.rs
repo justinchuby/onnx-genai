@@ -260,6 +260,44 @@ const GEMV_F16_DOWN_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_down";
 const GEMV_F16_DOWN_C4_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_down_c4";
 const GEMV_F16_DOWN_C2_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_down_c2";
 const GEMM_F16_TILE: usize = 16;
+
+/// Upper bound on batch `M` for which small-batch decode reuses the capture-safe
+/// single-row decode GEMV once per row instead of the tiled prefill GEMM.
+///
+/// Why a bound exists: the M>1 tiled GEMM tiles the M dimension in
+/// [`GEMM_F16_TILE`]-row (16) blocks with a grid of `ceil(M/16)` tile-rows, so
+/// for any `M in [1, 16]` it launches the *same* `(N/16) x 1` CTA grid and pays
+/// a full weight-grid dequant+MAC pass whose cost is independent of `M`. A
+/// single-row decode GEMV instead reads the weights once for one row; looping it
+/// `M` times reads the weights `M` times but skips the tiled GEMM's fixed
+/// full-grid overhead, so it is faster while `M x gemv_step < tiled_step`.
+///
+/// Measured crossover on **RTX 4060 Laptop 8 GB, i7-13800H (14C/20T), CUDA 13.1**,
+/// `qwen05b-q4` (native CUDA, fp16 activation, int4): the M==1 decode GEMV runs a
+/// full forward step in ~2.55 ms; the tiled GEMM step is ~28.6 ms and flat for
+/// M=2..16. So `M x 2.55 ms < 28.6 ms` holds up to `M ~ 11`. The default is set
+/// conservatively below that measured crossover; the ratio is a kernel-efficiency
+/// property (both paths are weight-bandwidth bound on the same weights) so it is
+/// approximately model-independent, but it IS hardware-dependent — retune per
+/// #1261 via `ONNX_GENAI_DECODE_GEMV_LOOP_MAX_M` rather than trusting this number
+/// on a different GPU.
+const DECODE_GEMV_LOOP_MAX_M_DEFAULT: usize = 8;
+
+/// Resolve the looped-decode-GEMV batch bound, honoring the
+/// `ONNX_GENAI_DECODE_GEMV_LOOP_MAX_M` override (read once per process). Setting
+/// it to `1` disables the loop (all `M>1` go to the tiled GEMM), which is the
+/// byte-identical A/B baseline for measuring the change.
+fn decode_gemv_loop_max_m() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("ONNX_GENAI_DECODE_GEMV_LOOP_MAX_M")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&value| value >= 1)
+            .unwrap_or(DECODE_GEMV_LOOP_MAX_M_DEFAULT)
+    })
+}
+
 const GEMV_F16_SMALL_THREADS: u32 = 64;
 const GEMV_F16_LARGE_THREADS: u32 = 256;
 const GEMV_F16_SMALL_N_MAX: usize = 1152;
@@ -6986,6 +7024,91 @@ impl MatMulNBitsKernel {
         }
 
         if m > 1 {
+            // Small-batch decode fast path: for M within the crossover bound,
+            // reuse the capture-safe single-row decode GEMV once per row instead
+            // of the tiled prefill GEMM. The tiled GEMM tiles M in 16-row blocks,
+            // so M=2..16 pay the same M-independent full-weight-grid pass; the
+            // looped GEMV instead reads the weights once per row and skips that
+            // fixed overhead, which is faster while M x gemv_step < tiled_step
+            // (measured crossover ~11 on qwen05b-q4; see DECODE_GEMV_LOOP_MAX_M_*).
+            // Excludes the fused SwiGLU/decomposed-SiLU epilogues, which have no
+            // single-row GEMV equivalent in `dispatch_f16_decode_gemv_row`.
+            //
+            // Numerics: each row is computed byte-identically to a single-sequence
+            // (M==1) decode of that row — the strongest batching-correctness
+            // guarantee (a batched row produces the same tokens as if run alone).
+            // Capture-safe: every per-row launch is static-grid, allocation- and
+            // sync-free, so the batch decode graph captures and replays it.
+            // Streaming: the resident weight is read M times from VRAM, not
+            // re-streamed, so the weight-offload HtoD 1/N amortization is intact.
+            if m <= decode_gemv_loop_max_m()
+                && !self.gate_up_swiglu
+                && !self.decomposed_silu
+            {
+                onnx_runtime_ep_api::record_kernel_variant!(
+                    "gemv_f16_batched_loop",
+                    "M={} small-batch decode: {} single-row decode GEMV launches (one per row), \
+                     each byte-identical to M==1 decode; skips the tiled prefill GEMM's \
+                     M-independent full-weight-grid pass",
+                    m,
+                    m
+                );
+                self.last_call_capture_safe.store(true, Ordering::Relaxed);
+                let per_token_bias = bias
+                    .filter(|b| b.numel() == m * self.n && m * self.n != self.n);
+                let a_base = inputs[0].data_ptr::<u8>();
+                let y_base = outputs[0].data_ptr_mut::<u8>();
+                let bias_base = per_token_bias.map(|b| b.data_ptr::<u8>());
+                let a_row_shape = [1usize, self.k];
+                let a_row_strides = [self.k as i64, 1];
+                let y_row_shape = [1usize, self.n];
+                let y_row_strides = [self.n as i64, 1];
+                let a_row_bytes = self.k * 2; // fp16 activation
+                let y_row_bytes = self.n * 2; // fp16 output / residual
+                for row in 0..m {
+                    let a_row = TensorView::new(
+                        DevicePtr(a_base.wrapping_add(row * a_row_bytes) as *const c_void),
+                        DataType::Float16,
+                        &a_row_shape,
+                        &a_row_strides,
+                        inputs[0].device,
+                    );
+                    let mut y_row = TensorMut::new(
+                        DevicePtrMut(y_base.wrapping_add(row * y_row_bytes) as *mut c_void),
+                        DataType::Float16,
+                        &y_row_shape,
+                        &y_row_strides,
+                        outputs[0].device,
+                    );
+                    let bias_row = bias_base.map(|base| {
+                        TensorView::new(
+                            DevicePtr(base.wrapping_add(row * y_row_bytes) as *const c_void),
+                            DataType::Float16,
+                            &y_row_shape,
+                            &y_row_strides,
+                            inputs[0].device,
+                        )
+                    });
+                    let bias_ref = match bias_row {
+                        Some(ref b) => Some(b),
+                        None => bias,
+                    };
+                    self.dispatch_f16_decode_gemv_row(
+                        &a_row,
+                        &inputs[1],
+                        &inputs[2],
+                        scales_fp16,
+                        zero_points,
+                        bias_ref,
+                        gamma,
+                        &mut y_row,
+                        k_blocks,
+                        blob_size,
+                        zp_row_bytes,
+                    )?;
+                }
+                return Ok(());
+            }
             // SAFETY: the tiled prefill kernel itself has fixed pointers and no
             // allocation or host synchronization. We nevertheless keep the
             // advertised capture contract conservative: variable-M prefill is
@@ -7150,6 +7273,42 @@ impl MatMulNBitsKernel {
         }
 
         self.last_call_capture_safe.store(true, Ordering::Relaxed);
+        self.dispatch_f16_decode_gemv_row(
+            &inputs[0],
+            &inputs[1],
+            &inputs[2],
+            scales_fp16,
+            zero_points,
+            bias,
+            gamma,
+            &mut outputs[0],
+            k_blocks,
+            blob_size,
+            zp_row_bytes,
+        )
+    }
+
+    /// Dispatch one single-row (M==1) fp16-activation decode GEMV for `a_row`
+    /// into `y_row`, selecting the specialized kernel by bits/block_size/rmsnorm
+    /// exactly as the M==1 path does. `packed`/`scales`/`zero_points`/`gamma` are
+    /// the shared weight metadata; `bias` is the row's bias/residual slice (or a
+    /// broadcast `[N]` bias). Reused by [`Self::run_f16`] for the true M==1 step
+    /// and by the small-batch looped decode path (one call per row).
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_f16_decode_gemv_row(
+        &self,
+        a_row: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        scales_fp16: bool,
+        zero_points: Option<&TensorView>,
+        bias: Option<&TensorView>,
+        gamma: Option<&TensorView>,
+        y_row: &mut TensorMut,
+        k_blocks: usize,
+        blob_size: usize,
+        zp_row_bytes: usize,
+    ) -> Result<()> {
         if self.bits == 8 && self.block_size == 32 {
             if self.rmsnorm_prologue {
                 let gamma = gamma.ok_or_else(|| {
@@ -7169,14 +7328,7 @@ impl MatMulNBitsKernel {
                     zero_points.is_some()
                 );
                 return self.launch_int8_f16_gemv_rmsnorm(
-                    &inputs[0],
-                    &inputs[1],
-                    &inputs[2],
-                    zero_points,
-                    gamma,
-                    bias,
-                    &mut outputs[0],
-                    k_blocks,
+                    a_row, packed, scales, zero_points, gamma, bias, y_row, k_blocks,
                 );
             }
             onnx_runtime_ep_api::record_kernel_variant!(
@@ -7186,14 +7338,7 @@ impl MatMulNBitsKernel {
                 zero_points.is_some()
             );
             return self.launch_int8_f16_gemv(
-                &inputs[0],
-                &inputs[1],
-                &inputs[2],
-                scales_fp16,
-                zero_points,
-                bias,
-                &mut outputs[0],
-                k_blocks,
+                a_row, packed, scales, scales_fp16, zero_points, bias, y_row, k_blocks,
             );
         }
         if self.rmsnorm_prologue {
@@ -7214,28 +7359,12 @@ impl MatMulNBitsKernel {
                 zero_points.is_some()
             );
             return self.launch_f16_gemv_rmsnorm(
-                &inputs[0],
-                &inputs[1],
-                &inputs[2],
-                zero_points,
-                gamma,
-                bias,
-                &mut outputs[0],
-                k_blocks,
-                blob_size,
+                a_row, packed, scales, zero_points, gamma, bias, y_row, k_blocks, blob_size,
                 zp_row_bytes,
             );
         }
         self.launch_f16_gemv(
-            &inputs[0],
-            &inputs[1],
-            &inputs[2],
-            scales_fp16,
-            zero_points,
-            bias,
-            &mut outputs[0],
-            k_blocks,
-            blob_size,
+            a_row, packed, scales, scales_fp16, zero_points, bias, y_row, k_blocks, blob_size,
             zp_row_bytes,
         )
     }
@@ -12768,6 +12897,224 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             worst_rel < 5e-2,
             "fp16 GEMV diverged from dequant reference: max_rel={worst_rel:.3e}"
         );
+    }
+
+    /// Multi-request batch decode byte-identity guard for the looped fp16 decode
+    /// GEMV (limiter B fix). For `1 < m <= decode_gemv_loop_max_m()`, `run_f16`
+    /// runs the specialized single-row decode GEMV once per row instead of the
+    /// portable tiled prefill GEMM. Because each row is dispatched through the
+    /// *identical* `dispatch_f16_decode_gemv_row` path the M==1 decode step uses,
+    /// row `r` of the batched output must be BIT-for-BIT equal to running that
+    /// row alone as an M==1 GEMV. This is the strong form of the bit-identity
+    /// claim: batched decode is byte-identical to single-stream decode, so a
+    /// batch cannot change any user's logits. A regression that reintroduced a
+    /// tiled-GEMM (fp32-accumulation, different reduction order) batch path — or
+    /// mis-strided the per-row sub-views — would diverge here.
+    #[test]
+    fn decode_gemv_loop_is_byte_identical_to_per_row_singlestream() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping looped decode GEMV byte-identity test: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("matmul_nbits_gemv_f16")
+            .is_err()
+        {
+            eprintln!("skipping looped decode GEMV byte-identity test: fp16 NVRTC headers unavailable");
+            return;
+        }
+
+        // Qwen2.5-0.5B-ish block-32 shapes: square attention proj and the wide
+        // MLP (K<N general GEMV, K>N tall-skinny GEMV). m=4 sits inside the
+        // default loop window (max_m=8).
+        for (k, n) in [(896usize, 896usize), (896usize, 4864usize), (4864usize, 896usize)] {
+            let m = 4usize;
+            let block_size = 32usize;
+            let k_blocks = k / block_size;
+            let blob_size = block_size / 2;
+
+            let mut state = 0x0123_4567_89ab_cdefu64 ^ ((k as u64) << 20) ^ (n as u64);
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+
+            // m distinct activation rows, contiguous [m, k].
+            let mut activation_f16 = vec![f16::ZERO; m * k];
+            for h in activation_f16.iter_mut() {
+                *h = f16::from_f32(next());
+            }
+
+            // Symmetric int4 weights (implicit zp=8), block-32, no bias.
+            let mut quant = vec![0u8; n * k];
+            for value in quant.iter_mut() {
+                *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+            }
+            let mut packed = vec![0u8; n * k_blocks * blob_size];
+            for col in 0..n {
+                for block in 0..k_blocks {
+                    for pair in 0..blob_size {
+                        let low = quant[col * k + block * block_size + pair * 2] & 15;
+                        let high = quant[col * k + block * block_size + pair * 2 + 1] & 15;
+                        packed[(col * k_blocks + block) * blob_size + pair] = low | (high << 4);
+                    }
+                }
+            }
+            let mut scale_f16 = vec![f16::ZERO; n * k_blocks];
+            for s in scale_f16.iter_mut() {
+                *s = f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5));
+            }
+
+            let activation_dev = runtime.alloc_raw(activation_f16.len() * 2).unwrap();
+            let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
+            let scales_dev = runtime.alloc_raw(scale_f16.len() * 2).unwrap();
+            let loop_out_dev = runtime.alloc_raw(m * n * 2).unwrap();
+            let ref_out_dev = runtime.alloc_raw(n * 2).unwrap();
+            // SAFETY: device buffers were sized to hold each source slice.
+            unsafe {
+                runtime.htod(as_bytes(&activation_f16), activation_dev).unwrap();
+                runtime.htod(&packed, packed_dev).unwrap();
+                runtime.htod(as_bytes(&scale_f16), scales_dev).unwrap();
+            }
+
+            let device = DeviceId::cuda(0);
+            let b_shape = [n, k_blocks, blob_size];
+            let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+            let scales_shape = [n, k_blocks];
+            let scales_strides = [k_blocks as i64, 1];
+            let packed_view = TensorView::new(
+                device_ptr(packed_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            );
+            let scales_view = TensorView::new(
+                device_ptr(scales_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            );
+
+            let kernel = MatMulNBitsKernel {
+                runtime: runtime.clone(),
+                k,
+                n,
+                bits: 4,
+                block_size,
+                accuracy_level: 4,
+                accuracy4_workspace: None,
+                fold_bias_post_round: false,
+                gate_up_swiglu: false,
+                decomposed_silu: false,
+                rmsnorm_prologue: false,
+                rmsnorm_epsilon: 1e-5,
+                last_call_capture_safe: AtomicBool::new(false),
+                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            };
+
+            // Batched path: m>1 routes through the looped single-row decode GEMV.
+            let a_shape_m = [m, k];
+            let a_strides_m = [k as i64, 1];
+            let y_shape_m = [m, n];
+            let y_strides_m = [n as i64, 1];
+            let inputs_m = vec![
+                TensorView::new(
+                    device_ptr(activation_dev),
+                    DataType::Float16,
+                    &a_shape_m,
+                    &a_strides_m,
+                    device,
+                ),
+                packed_view.clone(),
+                scales_view.clone(),
+            ];
+            {
+                let mut outputs_m = [TensorMut::new(
+                    device_ptr_mut(loop_out_dev),
+                    DataType::Float16,
+                    &y_shape_m,
+                    &y_strides_m,
+                    device,
+                )];
+                // Warm once so scratch pools are allocated, then the measured run
+                // must report capture-safe (mirrors the M==1 decode contract).
+                kernel.run(&inputs_m, &mut outputs_m, None).unwrap();
+                kernel.run(&inputs_m, &mut outputs_m, None).unwrap();
+                runtime.synchronize().unwrap();
+            }
+            assert!(
+                kernel.last_call_capture_safe.load(Ordering::Relaxed),
+                "warm looped decode GEMV must report capture-safe (K={k} N={n})"
+            );
+            let mut loop_out = vec![f16::ZERO; m * n];
+            // SAFETY: `loop_out_dev` holds `m * n` fp16 values.
+            unsafe {
+                runtime.dtoh(as_bytes_mut(&mut loop_out), loop_out_dev).unwrap();
+            }
+
+            // Reference: run each row alone as an independent M==1 GEMV over the
+            // same weights and the same (offset) activation row.
+            let mut ref_out = vec![f16::ZERO; m * n];
+            for r in 0..m {
+                let a_off = (r * k * 2) as CUdeviceptr;
+                let a_shape_1 = [1usize, k];
+                let a_strides_1 = [k as i64, 1];
+                let y_shape_1 = [1usize, n];
+                let y_strides_1 = [n as i64, 1];
+                let inputs_1 = vec![
+                    TensorView::new(
+                        device_ptr(activation_dev + a_off),
+                        DataType::Float16,
+                        &a_shape_1,
+                        &a_strides_1,
+                        device,
+                    ),
+                    packed_view.clone(),
+                    scales_view.clone(),
+                ];
+                let mut outputs_1 = [TensorMut::new(
+                    device_ptr_mut(ref_out_dev),
+                    DataType::Float16,
+                    &y_shape_1,
+                    &y_strides_1,
+                    device,
+                )];
+                kernel.run(&inputs_1, &mut outputs_1, None).unwrap();
+                runtime.synchronize().unwrap();
+                // SAFETY: `ref_out_dev` holds `n` fp16 values.
+                unsafe {
+                    runtime
+                        .dtoh(as_bytes_mut(&mut ref_out[r * n..(r + 1) * n]), ref_out_dev)
+                        .unwrap();
+                }
+            }
+
+            // SAFETY: each pointer came from this runtime's `alloc_raw`, freed once.
+            unsafe {
+                runtime.free_raw(activation_dev).unwrap();
+                runtime.free_raw(packed_dev).unwrap();
+                runtime.free_raw(scales_dev).unwrap();
+                runtime.free_raw(loop_out_dev).unwrap();
+                runtime.free_raw(ref_out_dev).unwrap();
+            }
+
+            let mismatches = loop_out
+                .iter()
+                .zip(ref_out.iter())
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                mismatches, 0,
+                "looped batch-{m} decode GEMV diverged from per-row single-stream decode at \
+                 K={k} N={n}: {mismatches}/{} fp16 outputs differ",
+                m * n
+            );
+        }
     }
 
     /// Regression guard for the native-vs-ORT divergence investigated on
