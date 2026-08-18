@@ -1093,7 +1093,10 @@ impl ExecutionProvider for CudaExecutionProvider {
             Some(virtual_backing) => virtual_backing
                 .allocate_committed(size, alignment, committed_ranges)
                 .map_err(EpError::Memory)?,
-            None => self.memory().allocate(size, alignment).map_err(EpError::Memory)?,
+            None => self
+                .memory()
+                .allocate(size, alignment)
+                .map_err(EpError::Memory)?,
         };
         self.ep_allocations.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `ptr` is a fresh, unique, non-null device allocation of
@@ -1651,9 +1654,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         bytes: u64,
         role: onnx_runtime_memory_governor::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
-        if bytes == 0
-            || !dynamic_lending_enabled()
-            || self.memory().as_virtual_backing().is_none()
+        if bytes == 0 || !dynamic_lending_enabled() || self.memory().as_virtual_backing().is_none()
         {
             return Ok(None);
         }
@@ -2151,12 +2152,10 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         let counting_allocator =
             Arc::new(crate::device_allocator::CudaDeviceAllocator::new(context));
 
-        let error = provider
-            .with_memory(counting_allocator.clone())
-            .expect_err(
-                "with_memory must return Err once a VMM arena is already selected, not Ok(Self) \
+        let error = provider.with_memory(counting_allocator.clone()).expect_err(
+            "with_memory must return Err once a VMM arena is already selected, not Ok(Self) \
                  with the injection silently ignored",
-            );
+        );
         let message = error.to_string();
         assert!(
             message.contains("already selected a VMM arena"),
@@ -2232,10 +2231,8 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
                 &self,
                 bytes: usize,
                 align: usize,
-            ) -> std::result::Result<
-                std::ptr::NonNull<u8>,
-                onnx_runtime_memory_governor::MemoryError,
-            > {
+            ) -> std::result::Result<std::ptr::NonNull<u8>, onnx_runtime_memory_governor::MemoryError>
+            {
                 self.base.allocate(bytes, align)
             }
 
@@ -2299,9 +2296,7 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         unsafe { std::env::remove_var(crate::vmm_allocator::CUDA_VMM_ENV) };
 
         let Ok(provider) = CudaExecutionProvider::new(0) else {
-            eprintln!(
-                "SKIPPED (no CUDA runtime): the offset-zero identity proof did NOT run."
-            );
+            eprintln!("SKIPPED (no CUDA runtime): the offset-zero identity proof did NOT run.");
             panic!("CUDA test path did not run; report as a failed GPU test, not a pass");
         };
         assert!(
@@ -2339,10 +2334,8 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
                 &self,
                 bytes: usize,
                 align: usize,
-            ) -> std::result::Result<
-                std::ptr::NonNull<u8>,
-                onnx_runtime_memory_governor::MemoryError,
-            > {
+            ) -> std::result::Result<std::ptr::NonNull<u8>, onnx_runtime_memory_governor::MemoryError>
+            {
                 self.base.allocate(bytes, align)
             }
 
@@ -2379,8 +2372,8 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         // Non-vacuous: prove the address collision this test exists to guard
         // against is real before asserting on the rejection it causes.
         let wrapper_addr = &wrapper as *const OffsetZeroWrapper as *const ();
-        let foreign_addr = &wrapper.foreign as *const crate::vmm_allocator::CudaVmmAllocator
-            as *const ();
+        let foreign_addr =
+            &wrapper.foreign as *const crate::vmm_allocator::CudaVmmAllocator as *const ();
         assert!(
             std::ptr::eq(wrapper_addr, foreign_addr),
             "test setup did not reproduce the offset-zero address collision `#[repr(C)]` is \
