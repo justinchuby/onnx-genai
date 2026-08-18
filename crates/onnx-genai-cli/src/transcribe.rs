@@ -173,6 +173,7 @@ impl Transcriber {
             .engine
             .generate_with_callback(request, Some(&mut callback));
         GENERATING.store(false, Ordering::SeqCst);
+        crate::flush_deferred_tracing()?;
         result?;
         Ok(text.trim().to_string())
     }

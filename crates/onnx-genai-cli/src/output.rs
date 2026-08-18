@@ -598,6 +598,7 @@ pub(super) fn run_generation_turn(
         }
     }
     GENERATING.store(false, Ordering::SeqCst);
+    crate::flush_deferred_tracing()?;
     timings.finish();
     let budget_cap = result.as_ref().ok().and_then(|result| result.budget_cap);
     if let Some(cap) = budget_cap {
