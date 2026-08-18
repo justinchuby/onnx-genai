@@ -91,8 +91,34 @@ fn push_unique(values: &mut Vec<String>, value: &str) {
     }
 }
 
+/// Bind the template's marker strings to token ids, withdrawing structured mode
+/// entirely when the tokenizer cannot represent the marker the parser depends on.
+///
+/// This is the only entry point: [`ResponseConfig::bind_token_ids`] is private to
+/// this module so a caller cannot bind without also applying the check.
+pub(super) fn bind_response_tokens(response: &mut Option<ResponseConfig>, backend: &Backend) {
+    let Some(config) = response.as_mut() else {
+        return;
+    };
+    config.bind_token_ids(backend);
+    if !config.is_parseable() {
+        *response = None;
+    }
+}
+
 impl ResponseConfig {
-    pub(super) fn bind_token_ids(&mut self, backend: &Backend) {
+    /// A template is only parseable once its message marker resolves to a token id.
+    ///
+    /// The parser starts in [`ResponseState::Header`] and leaves it solely on that
+    /// id, so an unbound marker traps every token in the header and excludes all of
+    /// them from the reply -- the caller receives an empty string with no error.
+    /// Falling back to raw output shows the markers as text, which is a poorer
+    /// presentation but an honest one; silence is neither.
+    fn is_parseable(&self) -> bool {
+        self.message_token_id.is_some()
+    }
+
+    fn bind_token_ids(&mut self, backend: &Backend) {
         self.start_token_id = backend.single_token_id(&self.start_token);
         self.message_token_id = backend.single_token_id(&self.message_token);
         self.close_token_ids = self
@@ -645,6 +671,77 @@ pub(super) fn display_paths(paths: &[PathBuf]) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn an_unbound_message_token_traps_every_token_in_the_header_and_empties_the_reply() {
+        let config = ResponseConfig {
+            message_token_id: None,
+            ..atem_config()
+        };
+        let tokens = [(10, " to=user"), (23, ""), (13, "answer"), (8, "")];
+        let mut stream = ResponseStream::new(&config);
+        let reply = tokens
+            .into_iter()
+            .map(|(token_id, text)| {
+                stream.push(&GenerateToken {
+                    token_id,
+                    text: text.to_string(),
+                    finish_reason: None,
+                })
+            })
+            .filter(|output| output.include_in_reply)
+            .map(|output| output.text)
+            .collect::<String>();
+
+        assert_eq!(
+            reply, "",
+            "this is the hazard bind_response_tokens exists to prevent: with no \
+             message-token id the parser never leaves its header state, so a \
+             perfectly good generation is reported to the caller as an empty reply"
+        );
+        assert!(!config.is_parseable());
+    }
+
+    #[test]
+    fn structured_mode_is_withdrawn_when_the_message_token_does_not_resolve() {
+        assert!(
+            atem_config().is_parseable(),
+            "a fully bound template must stay in structured mode"
+        );
+        assert!(
+            !ResponseConfig {
+                message_token_id: None,
+                ..atem_config()
+            }
+            .is_parseable(),
+            "an unbound message marker must withdraw structured mode so the caller \
+             falls back to raw output rather than receiving silence"
+        );
+        assert!(
+            ResponseConfig {
+                start_token_id: None,
+                close_token_ids: Vec::new(),
+                ..atem_config()
+            }
+            .is_parseable(),
+            "only the message marker is load-bearing; withdrawing on the optional \
+             markers would drop structured mode for templates that parse fine"
+        );
+    }
+
+    fn atem_config() -> ResponseConfig {
+        ResponseConfig {
+            initial_header: "assistant".to_string(),
+            content_header: "to=user".to_string(),
+            reasoning_header: "to=self".to_string(),
+            start_token: "<|start|>".to_string(),
+            message_token: "<|message|>".to_string(),
+            close_tokens: vec!["<|eom|>".to_string(), "<|eot|>".to_string()],
+            start_token_id: Some(22),
+            message_token_id: Some(23),
+            close_token_ids: vec![(7, "<|eom|>".to_string()), (8, "<|eot|>".to_string())],
+        }
+    }
 
     #[test]
     fn response_stream_formats_atem_channels_and_keeps_only_answer_for_history() {

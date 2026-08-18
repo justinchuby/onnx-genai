@@ -29,6 +29,7 @@ use super::commands::{
     render_repl_help, set_trace_recording,
 };
 use super::output::{
+    bind_response_tokens,
     build_turn_prompt, detect_reasoning, display_paths, emit_stats_line, load_chat_template,
     load_response_config, run_generation_turn,
 };
@@ -1051,9 +1052,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
     let mut reasoning = detect_reasoning(template.as_ref());
     backend.bind_reasoning_marker_tokens(&mut reasoning);
     let mut response = load_response_config(&model_dir, raw_mode);
-    if let Some(config) = response.as_mut() {
-        config.bind_token_ids(&backend);
-    }
+    bind_response_tokens(&mut response, &backend);
     let mut warned_missing_context_limit = false;
 
     eprintln!(
@@ -1190,9 +1189,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                                 reasoning = detect_reasoning(template.as_ref());
                                 backend.bind_reasoning_marker_tokens(&mut reasoning);
                                 response = load_response_config(&model_dir, raw_mode);
-                                if let Some(config) = response.as_mut() {
-                                    config.bind_token_ids(&backend);
-                                }
+                                bind_response_tokens(&mut response, &backend);
                                 warned_missing_context_limit = false;
                                 // A conversation is about the model that held
                                 // it; replaying it into a different model would
@@ -1348,9 +1345,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                 reasoning = detect_reasoning(template.as_ref());
                 backend.bind_reasoning_marker_tokens(&mut reasoning);
                 response = load_response_config(&model_dir, raw_mode);
-                if let Some(config) = response.as_mut() {
-                    config.bind_token_ids(&backend);
-                }
+                bind_response_tokens(&mut response, &backend);
                 println!("raw mode {}", if raw_mode { "enabled" } else { "disabled" });
                 None
             }
@@ -1595,3 +1590,5 @@ mod tests {
         assert!(!initial_repl_show_stats(ReplInputMode::Plain, false));
     }
 }
+
+

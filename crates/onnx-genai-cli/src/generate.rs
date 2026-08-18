@@ -14,6 +14,7 @@ use super::interactive::{
     install_ctrlc_handler, is_interrupt_error, repl_input_mode, warn_missing_context_limit,
 };
 use super::output::{
+    bind_response_tokens,
     build_turn_prompt, detect_reasoning, emit_stats_line, load_chat_template, load_response_config,
     run_generation_turn,
 };
@@ -131,9 +132,7 @@ fn generate_text(
     let mut reasoning = detect_reasoning(template.as_ref());
     backend.bind_reasoning_marker_tokens(&mut reasoning);
     let mut response = load_response_config(model_dir, args.sampling.raw);
-    if let Some(config) = response.as_mut() {
-        config.bind_token_ids(&backend);
-    }
+    bind_response_tokens(&mut response, &backend);
     match run_generation_turn(
         &mut backend,
         turn,
@@ -666,3 +665,5 @@ mod tests {
         );
     }
 }
+
+
