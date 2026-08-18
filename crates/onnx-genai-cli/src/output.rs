@@ -262,6 +262,10 @@ pub(super) fn run_generation_turn(
 ) -> anyhow::Result<String> {
     INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
     GENERATING.store(true, Ordering::SeqCst);
+    // Guarantees the streaming flag is cleared and any diagnostics buffered
+    // while generating are flushed however this turn exits: the normal return
+    // below, a `?` early-return from the finalization writes, or a panic unwind.
+    let _flush_guard = crate::FlushGuard;
     backend.reset_reuse_stats();
 
     let prompt_tokens = turn.prompt_tokens;
