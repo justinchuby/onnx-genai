@@ -5878,16 +5878,85 @@ fn unary_bench_cases() -> Vec<MatmulFamilyCase> {
             false,
             0.0,
         ),
-        // `Elu` exercises the AVX2 kernel and the zero-copy tensor path.
-        // `LeakyRelu` deliberately does not: it still has no SIMD kernel, so it
-        // measures what the generic scalar activation path costs -- two extra
-        // passes over the tensor and a per-element `match` -- and is the
-        // control this file needs to keep that cost visible.
+        // The activation family that moved off the generic scalar path: Elu,
+        // LeakyRelu, HardSigmoid, ThresholdedRelu and Selu all have AVX2
+        // kernels and the zero-copy tensor path now. `Swish(alpha != 1)` is
+        // the only one left on the generic path.
         unary_case("bench_elu_f32_4k", "Elu", "", ELEM_F32, K4, 17, false, 1e-4),
         unary_case("bench_elu_f32_1m", "Elu", "", ELEM_F32, M1, 17, false, 1e-4),
         unary_case(
             "bench_leakyrelu_f32_1m",
             "LeakyRelu",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_leakyrelu_f32_4k",
+            "LeakyRelu",
+            "",
+            ELEM_F32,
+            K4,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_hardsigmoid_f32_4k",
+            "HardSigmoid",
+            "",
+            ELEM_F32,
+            K4,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_hardsigmoid_f32_1m",
+            "HardSigmoid",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_thresholdedrelu_f32_4k",
+            "ThresholdedRelu",
+            "",
+            ELEM_F32,
+            K4,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_thresholdedrelu_f32_1m",
+            "ThresholdedRelu",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_selu_f32_4k",
+            "Selu",
+            "",
+            ELEM_F32,
+            K4,
+            17,
+            false,
+            1e-4,
+        ),
+        unary_case(
+            "bench_selu_f32_1m",
+            "Selu",
             "",
             ELEM_F32,
             M1,
@@ -7040,7 +7109,7 @@ fn unary_result_matches(ours: f32, ort: f32, rel: f32) -> bool {
 /// claim is backed by an execution, and the output is compared elementwise
 /// against a second session with no EP appended at all.
 #[test]
-fn celu_mish_elu_and_log_execute_locally_and_match_ort_numerics() {
+fn the_native_activation_family_executes_locally_and_matches_ort_numerics() {
     let _lock = lock_ort_ep();
     let x = unary_special_values();
     let len = x.len();
@@ -7048,13 +7117,17 @@ fn celu_mish_elu_and_log_execute_locally_and_match_ort_numerics() {
 
     // `Celu` is opset 12, `Mish` is opset 18; ask for each op's own opset
     // rather than one number that happens to satisfy both.
-    let specs: [(&'static str, &'static str, u64, f32); 6] = [
+    let specs: [(&'static str, &'static str, u64, f32); 10] = [
         ("parity_celu_f32", "Celu", 12, 2e-6),
         ("parity_celu_a2_f32", "Celu", 12, 2e-6),
         ("parity_mish_f32", "Mish", 18, 2e-6),
         ("parity_log_f32", "Log", 17, 2e-6),
         ("parity_elu_f32", "Elu", 17, 2e-6),
         ("parity_elu_a2_f32", "Elu", 17, 2e-6),
+        ("parity_leakyrelu_f32", "LeakyRelu", 17, 2e-6),
+        ("parity_hardsigmoid_f32", "HardSigmoid", 17, 2e-6),
+        ("parity_thresholdedrelu_f32", "ThresholdedRelu", 17, 2e-6),
+        ("parity_selu_f32", "Selu", 17, 2e-6),
     ];
 
     let mut checked = 0usize;
@@ -7098,6 +7171,26 @@ fn celu_mish_elu_and_log_execute_locally_and_match_ort_numerics() {
             );
             assert_eq!(ours_out.len(), ort_out.len(), "{name}: output length");
 
+            // `unary_result_matches` calls +0 and -0 equal, which is right for
+            // a tolerance comparison and wrong for the question these kernels
+            // actually had to answer: several of them are implemented as a
+            // *select* precisely so a signed zero survives, and one (`Selu`)
+            // has its branch written on `x < 0` rather than ONNX's `x > 0` for
+            // no other reason. Comparing the sign bit against ORT is the only
+            // thing that makes those choices evidence rather than assertion.
+            for (i, &xi) in x.iter().enumerate() {
+                if xi == 0.0 && ours_out[i] == 0.0 && ort_out[i] == 0.0 {
+                    assert_eq!(
+                        ours_out[i].to_bits(),
+                        ort_out[i].to_bits(),
+                        "{name}: sign of zero disagrees with ORT at x={xi:e} \
+                         (ours {:e}, ORT {:e})",
+                        ours_out[i],
+                        ort_out[i]
+                    );
+                }
+            }
+
             let mut worst = 0.0f32;
             let mut worst_at = usize::MAX;
             let mut bad: Vec<String> = Vec::new();
@@ -7131,6 +7224,8 @@ fn celu_mish_elu_and_log_execute_locally_and_match_ort_numerics() {
         }
         checked += 1;
     }
-    assert_eq!(checked, 6, "every parity case must have been checked");
-    eprintln!("\n✅ celu_mish_elu_and_log_execute_locally_and_match_ort_numerics: PASSED");
+    assert_eq!(checked, 10, "every parity case must have been checked");
+    eprintln!(
+        "\n✅ the_native_activation_family_executes_locally_and_matches_ort_numerics: PASSED"
+    );
 }
