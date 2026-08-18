@@ -182,6 +182,19 @@ static PRESENT_SCRATCH_CALLS: std::sync::atomic::AtomicUsize =
 static PRESENT_INPLACE_HALF_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Count of forwards that appended into an aliased **f32** present==past cache
+/// instead of re-materialising the whole history. The f32 counterpart of
+/// [`PRESENT_INPLACE_HALF_CALLS`], and the only externally observable signal
+/// that the aliasing gate actually fired — which is what makes it possible to
+/// test that a cache that was *reallocated* mid-decode is still aliased.
+static PRESENT_INPLACE_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of forwards that took the f32 in-place append path.
+pub fn present_inplace_count() -> usize {
+    PRESENT_INPLACE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Number of forwards that took the half-precision in-place append path.
 pub fn present_inplace_half_count() -> usize {
     PRESENT_INPLACE_HALF_CALLS.load(std::sync::atomic::Ordering::Relaxed)
@@ -1816,6 +1829,9 @@ impl Kernel for GroupQueryAttentionKernel {
             present_len,
             past_key.as_ref(),
         );
+        if in_place {
+            PRESENT_INPLACE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // Owned present storage backs only the fall-back copy path; the in-place
         // and direct-write paths fill the aliased/graph output buffers and never

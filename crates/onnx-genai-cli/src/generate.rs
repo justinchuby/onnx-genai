@@ -14,7 +14,8 @@ use super::interactive::{
     install_ctrlc_handler, is_interrupt_error, repl_input_mode, warn_missing_context_limit,
 };
 use super::output::{
-    build_turn_prompt, detect_reasoning, emit_stats_line, load_chat_template, run_generation_turn,
+    bind_response_tokens, build_turn_prompt, detect_reasoning, emit_stats_line, load_chat_template,
+    load_response_config, run_generation_turn,
 };
 use super::profile::{self, RunProfile};
 use super::{GenerateArgs, ProfileArgs, decode_backend_name, resolve_model_dir};
@@ -129,12 +130,15 @@ fn generate_text(
     let offload_before = cuda_offload_stats();
     let mut reasoning = detect_reasoning(template.as_ref());
     backend.bind_reasoning_marker_tokens(&mut reasoning);
+    let mut response = load_response_config(model_dir, args.sampling.raw);
+    bind_response_tokens(&mut response, &backend);
     match run_generation_turn(
         &mut backend,
         turn,
         args.stream,
         Some(&mut profile),
         reasoning.as_ref(),
+        response.as_ref(),
         None,
     ) {
         Ok(output) => {

@@ -11,7 +11,19 @@ use super::*;
 
 pub(crate) struct DecodeState {
     pub(crate) use_kv: bool,
-    pub(crate) past: HashMap<String, Value>,
+    /// The cached KV tensors. Private so it cannot be assigned without also
+    /// updating `kv_len`: the two must move together or the length silently
+    /// describes tokens the cache no longer holds. Every mutation routes
+    /// through [`DecodeState::set_past`] (external code) or the length-aware
+    /// methods on this type (`rewind_kv`, `apply_window_after_step`,
+    /// `rewind_windowed`, `rewind_runner`).
+    past: HashMap<String, Value>,
+    /// Absolute number of KV tokens `past` represents. For a runner-backed
+    /// state the runner owns the length instead (`runner_len`), so this stays
+    /// `0` and [`DecodeState::current_kv_len`] reads the runner. For a windowed
+    /// state this is the absolute position count, which is larger than the
+    /// physically retained rows (`retained_kv_len`).
+    kv_len: usize,
     pub(crate) present_to_past: HashMap<String, String>,
     pub(crate) kv_inputs: Vec<String>,
     pub(crate) io: ResolvedIo,
@@ -74,6 +86,7 @@ impl DecodeState {
         Ok(Self {
             use_kv,
             past: HashMap::new(),
+            kv_len: 0,
             present_to_past,
             kv_inputs,
             io: resolved,
@@ -123,6 +136,7 @@ impl DecodeState {
                 Ok(Self {
                     use_kv: true,
                     past: HashMap::new(),
+                    kv_len: 0,
                     present_to_past: HashMap::new(),
                     kv_inputs: Vec::new(),
                     io: resolved,
@@ -280,6 +294,41 @@ impl DecodeState {
         }
     }
 
+    /// The KV tensors this state currently holds. Read-only; writes go through
+    /// [`set_past`](Self::set_past) or the length-aware rewind/window methods so
+    /// the tracked length can never diverge from the tensors it describes.
+    pub(crate) fn past(&self) -> &HashMap<String, Value> {
+        &self.past
+    }
+
+    /// Replace the cached KV and its absolute length together. This is the only
+    /// way code outside this module can write `past`; the length is not
+    /// optional, so a caller cannot leave it stale.
+    pub(crate) fn set_past(&mut self, past: HashMap<String, Value>, kv_len: usize) {
+        self.past = past;
+        self.kv_len = kv_len;
+    }
+
+    /// Absolute KV length this state owns. A runner-backed state defers to the
+    /// runner (which owns its own cursor); every other state tracks the length
+    /// next to the `past` tensors it describes, so the pipeline no longer has
+    /// to thread it in from the retained context.
+    pub(crate) fn current_kv_len(&self) -> usize {
+        match self.runner {
+            Some(_) => self.runner_len(),
+            None => self.kv_len,
+        }
+    }
+
+    /// Drop the KV for everything past `target`, reusing the shared prefix a
+    /// diverging prompt still has in common. Same name and signature as
+    /// [`PipelineDecoderComponent::rewind_kv`](crate::pipeline::PipelineDecoderComponent::rewind_kv),
+    /// so both backends' `KvPrefixStore` adapters are the same shape: the state
+    /// owns its length, so it is not told `current_len` from outside.
+    pub(crate) fn rewind_kv(&mut self, target: usize) -> anyhow::Result<bool> {
+        self.truncate_past(self.current_kv_len(), target)
+    }
+
     /// Whether the active runner can select the greedy token internally via
     /// [`DecodeBackend::decode_argmax`] without materializing host logits. Only
     /// the shared-buffer past/present runner supports this today; the check is
@@ -313,6 +362,7 @@ impl DecodeState {
         Self {
             use_kv: true,
             past,
+            kv_len: 0,
             present_to_past: HashMap::new(),
             kv_inputs: Vec::new(),
             io: ResolvedIo::default(),
@@ -332,6 +382,7 @@ impl DecodeState {
         Self {
             use_kv: true,
             past: HashMap::new(),
+            kv_len: 0,
             present_to_past: HashMap::new(),
             kv_inputs: Vec::new(),
             io: ResolvedIo::default(),
@@ -351,6 +402,7 @@ impl DecodeState {
         Self {
             use_kv: true,
             past: HashMap::new(),
+            kv_len: 0,
             present_to_past: HashMap::new(),
             kv_inputs: Vec::new(),
             io: ResolvedIo::default(),
@@ -365,7 +417,12 @@ impl DecodeState {
         }
     }
 
-    pub(crate) fn truncate_past(
+    /// Length-aware primitive behind [`rewind_kv`](Self::rewind_kv). Private:
+    /// production callers go through `rewind_kv`, which passes
+    /// `self.current_kv_len()` so `current_len` can never disagree with the
+    /// tracked length. On every successful outcome `self.kv_len` is updated in
+    /// lockstep with `self.past`, so the two cannot drift apart.
+    pub(super) fn truncate_past(
         &mut self,
         current_len: usize,
         target_len: usize,
@@ -374,6 +431,7 @@ impl DecodeState {
             return Ok(false);
         }
         if target_len == current_len {
+            self.kv_len = target_len;
             return Ok(true);
         }
         // Fixed loop-carried state advances with the sequence but exposes no
@@ -390,6 +448,7 @@ impl DecodeState {
             truncated.insert(name.clone(), slice_value_axis(value, axis, 0, target_len)?);
         }
         self.past = truncated;
+        self.kv_len = target_len;
         // Positions are rebuilt from the absolute past length on the next step;
         // a carried value would describe tokens that no longer exist.
         self.next_positions = None;
@@ -409,6 +468,7 @@ impl DecodeState {
             Some(DecodeRunner::Native(session)) => session.rewind(target_len)?,
             None => {
                 self.past.clear();
+                self.kv_len = 0;
             }
         }
         if target_len == 0 {
@@ -532,6 +592,7 @@ impl DecodeState {
                 }
             }
             self.retained_kv_len = target_retained_len.min(window_size);
+            self.kv_len = target_len;
             return Ok(());
         }
 
@@ -560,6 +621,7 @@ impl DecodeState {
             }
         }
         self.retained_kv_len = new_retained;
+        self.kv_len = target_len;
         Ok(())
     }
 }
@@ -615,7 +677,7 @@ mod tests {
         assert_eq!(state.loop_state["state_a.in"].to_vec_f32()?, vec![1.0, 1.0]);
         assert_eq!(state.loop_state["state_b.in"].to_vec_f32()?, vec![2.0, 2.0]);
         assert_eq!(
-            state.past.keys().cloned().collect::<HashSet<_>>(),
+            state.past().keys().cloned().collect::<HashSet<_>>(),
             [
                 "past.3.key".to_string(),
                 "past.3.value".to_string(),
@@ -660,7 +722,7 @@ mod tests {
         assert_eq!(state.loop_state["state_b.in"].to_vec_f32()?, vec![6.0, 6.0]);
         assert!(
             state
-                .past
+                .past()
                 .values()
                 .all(|value| value.shape() == [1, 1, 5, 1])
         );
@@ -686,12 +748,50 @@ mod tests {
             DecodeState::for_test_with_past(past)
         }
 
+        /// The whole point of making `past` private and pairing it with `kv_len`:
+        /// the owned length can never describe a different number of tokens than
+        /// the tensors physically hold. `set_past` writes both, `rewind_kv` moves
+        /// both, and there is no way to touch one without the other.
+        ///
+        /// This is falsifiable: drop the `self.kv_len = target_len` write in
+        /// `truncate_past` (or make `set_past` ignore its `kv_len` argument) and
+        /// this goes red because `current_kv_len()` reports a length the sequence
+        /// axis no longer matches.
+        #[test]
+        fn the_owned_kv_length_cannot_diverge_from_the_past_tensors() {
+            let data: Vec<f32> = (0..12).map(|value| value as f32).collect();
+            let mut past = HashMap::new();
+            past.insert(
+                "past_key_values.0.key".to_string(),
+                Value::from_vec_f32(data, &[1, 2, 3, 2]).expect("build a past tensor"),
+            );
+            let mut state = DecodeState::for_test_with_past(HashMap::new());
+
+            // A write sets the length alongside the tensors.
+            state.set_past(past, 3);
+            assert_eq!(state.current_kv_len(), 3);
+            assert_eq!(
+                state.past()["past_key_values.0.key"].shape()[2],
+                3,
+                "the reported length must match the sequence axis extent"
+            );
+
+            // A rewind moves both in lockstep.
+            assert!(state.rewind_kv(2).expect("rewind succeeds"));
+            assert_eq!(state.current_kv_len(), 2);
+            assert_eq!(
+                state.past()["past_key_values.0.key"].shape()[2],
+                2,
+                "after a rewind the length must still match the sequence axis extent"
+            );
+        }
+
         #[test]
         fn truncating_keeps_the_leading_positions_of_the_sequence_axis() {
             let mut state = state_with_past(3);
             assert!(state.truncate_past(3, 2).expect("truncation succeeds"));
 
-            let kept = &state.past["past_key_values.0.key"];
+            let kept = &state.past()["past_key_values.0.key"];
             assert_eq!(
                 kept.shape(),
                 &[1, 2, 2, 2],
@@ -710,7 +810,7 @@ mod tests {
         fn truncating_to_the_current_length_is_a_no_op() {
             let mut state = state_with_past(3);
             assert!(state.truncate_past(3, 3).expect("no-op succeeds"));
-            assert_eq!(state.past["past_key_values.0.key"].shape(), &[1, 2, 3, 2]);
+            assert_eq!(state.past()["past_key_values.0.key"].shape(), &[1, 2, 3, 2]);
         }
 
         #[test]
@@ -733,7 +833,7 @@ mod tests {
                 "an ambiguous axis must decline"
             );
             assert_eq!(
-                state.past["past_key_values.0.key"].shape(),
+                state.past()["past_key_values.0.key"].shape(),
                 &[1, 3, 3, 2],
                 "a declined truncation must leave the KV untouched"
             );

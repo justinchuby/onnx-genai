@@ -36,34 +36,34 @@ impl KvPrefixStore for NativeKvStore<'_> {
     }
 }
 
-/// ORT's past tensors, held by the pipeline rather than the decoder, as a
-/// [`KvPrefixStore`]. `current` is tracked outside the state, so it is passed
-/// in rather than read back.
-struct OrtKvStore<'a> {
-    state: &'a mut Option<DecodeState>,
-    current: usize,
-}
+/// ORT's past tensors, held by the pipeline as an `Option<DecodeState>` rather
+/// than by the decoder, as a [`KvPrefixStore`]. The state now owns its KV
+/// length, so this adapter is the same shape as [`NativeKvStore`]: it reads and
+/// rewinds through `current_kv_len` / `rewind_kv` without the pipeline having to
+/// thread the length in. The one essential difference is `reset`: ORT rebuilds a
+/// fresh `DecodeState` per turn, so emptying the cache means dropping to `None`.
+struct OrtKvStore<'a>(&'a mut Option<DecodeState>);
 
 impl KvPrefixStore for OrtKvStore<'_> {
     fn current_kv_len(&self) -> usize {
-        self.current
+        self.0.as_ref().map_or(0, DecodeState::current_kv_len)
     }
 
     fn use_kv(&self) -> bool {
-        self.state.as_ref().is_some_and(|state| state.use_kv)
+        self.0.as_ref().is_some_and(|state| state.use_kv)
     }
 
     fn rewind_to(&mut self, target: usize) -> anyhow::Result<bool> {
-        let Some(state) = self.state.as_mut() else {
-            return Ok(false);
-        };
-        state.truncate_past(self.current, target)
+        match self.0.as_mut() {
+            Some(state) => state.rewind_kv(target),
+            None => Ok(false),
+        }
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
         // Dropping the state is how ORT empties its cache: a fresh one is built
         // below for every turn that reuses nothing.
-        *self.state = None;
+        *self.0 = None;
         Ok(())
     }
 }
@@ -118,8 +118,20 @@ impl PipelineEngine {
 
         let mut options = pipeline_request.request.options.clone();
         options.validate()?;
-        if options.eos_token_id.is_none() {
-            options.eos_token_id = self.tokenizer()?.eos_token_id();
+        if options.stop_on_eos && options.eos_token_id.is_none() {
+            let mut eos_token_ids = self.eos_token_ids.clone();
+            for id in self.tokenizer()?.eos_token_ids() {
+                if !eos_token_ids.contains(&id) {
+                    eos_token_ids.push(id);
+                }
+            }
+            options.eos_token_id = eos_token_ids.first().copied();
+            for id in eos_token_ids {
+                let stop = StopSequence::Tokens(vec![id]);
+                if !options.stop_sequences.contains(&stop) {
+                    options.stop_sequences.push(stop);
+                }
+            }
         }
         let prompt_tokens = tokenize_with(self.tokenizer()?, &pipeline_request.request.prompt)?;
         if prompt_tokens.is_empty() {
@@ -193,7 +205,6 @@ impl PipelineEngine {
             (Some(inputs), Some(retained)) => retained.reusable_prefix(inputs, &prompt_tokens),
             _ => 0,
         };
-        let retained_len = self.retained.as_ref().map_or(0, |r| r.tokens.len());
         let positions_are_linear = self.positions_are_linear();
         let reused = if paged_enabled {
             ReusedPrefix::NONE
@@ -207,11 +218,10 @@ impl PipelineEngine {
                 None => ReusedPrefix::NONE,
             }
         } else {
+            // The state owns its KV length, so the pipeline no longer threads
+            // `retained.tokens.len()` in as the ORT cache's current length.
             apply_prefix_reuse(
-                &mut OrtKvStore {
-                    state: &mut self.decoder_state,
-                    current: retained_len,
-                },
+                &mut OrtKvStore(&mut self.decoder_state),
                 shared,
                 positions_are_linear,
             )?
