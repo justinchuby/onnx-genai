@@ -352,7 +352,9 @@ impl Kernel for TopKKernel {
         let sm_count = u64::from(self.runtime.capabilities().multiprocessor_count());
         let use_block = slices > 0 && width > 1 && slices <= sm_count;
         if use_block {
-            let block_func = self.runtime.nvrtc_function("topk", SOURCE, block_function)?;
+            let block_func = self
+                .runtime
+                .nvrtc_function("topk", SOURCE, block_function)?;
             // Dynamic shared: `k` picked indices + one (f32,i64) reduction slot
             // per thread.
             let shared_mem_bytes = (k as u64)

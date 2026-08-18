@@ -681,7 +681,9 @@ fn topk_block_decode_path_is_byte_identical_to_cpu_oracle() {
     // kernel and the CPU oracle resolve them.
     let width = 320_usize;
     let k = 8_i64;
-    let f32_data = (0..width).map(|n| (n % 13) as f32 - 6.0).collect::<Vec<_>>();
+    let f32_data = (0..width)
+        .map(|n| (n % 13) as f32 - 6.0)
+        .collect::<Vec<_>>();
     let attrs = [("axis", Attribute::Int(-1))];
     let f32_inputs = [
         tensor(DataType::Float32, &[1, width], &f32_data),
@@ -703,7 +705,10 @@ fn topk_block_decode_path_is_byte_identical_to_cpu_oracle() {
 
     // Same shape in fp16 and bf16: the upcast-for-compare block path stays
     // byte-identical to the CPU oracle at the decode shape as well.
-    let f16_data = f32_data.iter().map(|&v| f16::from_f32(v)).collect::<Vec<_>>();
+    let f16_data = f32_data
+        .iter()
+        .map(|&v| f16::from_f32(v))
+        .collect::<Vec<_>>();
     let f16_inputs = [
         tensor(DataType::Float16, &[1, width], &f16_data),
         tensor(DataType::Int64, &[], &[k]),

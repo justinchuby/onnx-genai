@@ -1095,7 +1095,11 @@ fn run_native_decode_batch_sweep(
             let median_ms = sorted[sorted.len() / 2];
             let min_ms = sorted[0];
             let max_ms = sorted[sorted.len() - 1];
-            let per_row_tok_s = if median_ms > 0.0 { 1000.0 / median_ms } else { 0.0 };
+            let per_row_tok_s = if median_ms > 0.0 {
+                1000.0 / median_ms
+            } else {
+                0.0
+            };
             let aggregate_tok_s = per_row_tok_s * batch as f64;
             println!(
                 "native_decode_batch_throughput: batch={batch} steps={tokens} \
