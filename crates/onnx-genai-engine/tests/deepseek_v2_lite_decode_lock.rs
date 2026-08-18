@@ -53,3 +53,14 @@ const EXPECTED_TOKENS: &[u32] = &[
 fn deepseek_v2_lite_native_cuda_matches_golden_greedy_sequence() -> anyhow::Result<()> {
     decode_lock::assert_native_matches_golden("DEEPSEEK_V2_LITE_CUDA_DIR", PROMPT, EXPECTED_TOKENS)
 }
+
+#[test]
+#[ignore = "requires the real DeepSeek-V2-Lite int4 export, a CUDA device, and ~340 generated tokens"]
+fn deepseek_v2_lite_engine_long_context_workspace_survives_capacity_growth() -> anyhow::Result<()> {
+    decode_lock::assert_native_long_context_eager_and_capture_match_prefix(
+        "DEEPSEEK_V2_LITE_CUDA_DIR",
+        PROMPT,
+        340,
+        EXPECTED_TOKENS,
+    )
+}
