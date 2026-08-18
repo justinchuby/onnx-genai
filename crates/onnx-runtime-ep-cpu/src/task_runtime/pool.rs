@@ -824,14 +824,27 @@ mod tests {
     }
 
     #[test]
+    // Miri's clock is emulated, and the adaptive window is defined in wall time:
+    // a spinning worker advances the emulated clock only a sliver per iteration,
+    // so `MAX_SPIN` is effectively unreachable and the park never happens. The
+    // rest of this module runs under Miri, which is where the value is -- this
+    // one test asserts a timing behaviour rather than a memory-model one.
+    #[cfg_attr(miri, ignore = "adaptive spin window is wall-clock, not emulated")]
     fn workers_park_when_idle_and_wake_again() {
         // The idle-CPU bound: after the adaptive window decays, workers must
         // reach the futex, and a later dispatch must still be served.
         let pool = TaskPool::new(4);
         assert!(pool.dispatch(64, &|_| {}));
-        thread::sleep(Duration::from_millis(100));
+        // Poll rather than sleep a fixed span. The window is `MAX_SPIN` at
+        // worst, but a loaded runner can delay a worker's *observation* of it
+        // for far longer than the window itself, and a fixed sleep turns that
+        // into a flake.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pool.counters().parks == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
         let parked = pool.counters().parks;
-        assert!(parked > 0, "no worker parked after 100 ms idle");
+        assert!(parked > 0, "no worker parked while idle");
         let seen: Vec<AtomicU32> = (0..64).map(|_| AtomicU32::new(0)).collect();
         assert!(pool.dispatch(64, &|i: usize| {
             seen[i].fetch_add(1, Ordering::Relaxed);
