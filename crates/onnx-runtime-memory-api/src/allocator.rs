@@ -1,8 +1,7 @@
 //! Primitive data types shared by allocator mechanism interfaces.
 //!
-//! The [`DeviceAllocator`](onnx_runtime_memory_governor::DeviceAllocator) trait
-//! and [`HostAllocator`](onnx_runtime_memory_governor::HostAllocator)
-//! implementation remain in `onnx-runtime-memory-governor` because the trait
+//! The `DeviceAllocator` trait and `HostAllocator` implementation remain in
+//! `onnx-runtime-memory-governor` because the trait
 //! currently references governor-specific capacity tokens. These data types
 //! have no such coupling and are the foundational vocabulary every allocator
 //! and consumer shares.
@@ -64,7 +63,7 @@ impl DeviceKey {
 /// This is the allocator-agnostic handle a KV path holds when it declares "this
 /// token prefix is shared" and pins it once, then maps it into each subsequent
 /// sequence with
-/// [`DeviceAllocator::commit_shared_prefix`](onnx_runtime_memory_governor::DeviceAllocator::commit_shared_prefix).
+/// `DeviceAllocator::commit_shared_prefix`.
 /// It is deliberately opaque: the concrete backing (CUDA VMM physical handles
 /// today) lives in the allocator crate, downcast through
 /// [`SharedDevicePrefix::as_any`] by the allocator that produced it.

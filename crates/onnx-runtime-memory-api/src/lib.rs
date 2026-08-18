@@ -21,12 +21,12 @@
 //!
 //! ## What stays in `onnx-runtime-memory-governor`
 //!
-//! * [`DeviceAllocator`](onnx_runtime_memory_governor::DeviceAllocator) trait —
+//! * `DeviceAllocator` trait —
 //!   its `allocate_committed_with_capacity` and
 //!   `commit_allocation_ranges_with_capacity` methods accept
 //!   `MappedPhysicalCapacityToken`, a governor-coupled type. Splitting those
 //!   into an extension trait is deferred to Phase 2 (#1186).
-//! * [`HostAllocator`](onnx_runtime_memory_governor::HostAllocator) — trivially
+//! * `HostAllocator` — trivially
 //!   depends on `DeviceAllocator`.
 //! * Lease ledgers, capacity tokens, growth grants, pressure responders, holder
 //!   identities, and the `MemoryGovernor` trait.
