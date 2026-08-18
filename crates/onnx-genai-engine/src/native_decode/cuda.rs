@@ -863,6 +863,53 @@ impl NativeDecodeSession {
         past_len: usize,
         step_inputs: &[(String, Tensor)],
     ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+        // A generation runs *two* forward shapes against the same session with
+        // distinct governed-workspace lifetimes: the multi-token prefill/verify
+        // shape here, and the steady-state single-token decode step. The
+        // prepare-only planner reserves one workspace slot per *lifetime class*
+        // from the shapes it is handed, and default-domain `Attention` classifies
+        // its composite workspace by route — multi-row query (`q_seq > 1`) is the
+        // per-call StepScoped route, single-row query (`batch == 1, q_seq == 1`)
+        // is the capture-eligible SessionPersistent route. Preparing only the
+        // multi-row prefill shape therefore reserves the StepScoped slot and
+        // leaves the SessionPersistent slot empty, so the first single-token
+        // decode reaches the `Attention` node with an unprepared
+        // SessionPersistent workspace and fails (#1179). GQA/MoE sidestep this by
+        // charging SessionPersistent for both routes, but MHA does not.
+        //
+        // Reserve the decode route's SessionPersistent slot up front by driving
+        // one additional single-query-row pass. Workspace planning now binds the
+        // growing KV cache at its physical capacity (see
+        // `prepare_external_bindings_mode`), so this single-token pass reserves a
+        // SessionPersistent workspace sized for the full-capacity attended
+        // length — a valid upper bound for every single-token decode step until
+        // the KV cache rebuckets. `reserve_prepared_workspace` only ever grows a
+        // slot, so a model that already reserved a larger SessionPersistent slot
+        // for the prefill shape (GQA/MoE) sees this as a no-op; MHA needs the
+        // top-up. The subsequent prefill forward re-establishes the KV/mask
+        // device state before it executes, so the decode pass's residual
+        // single-token mask is not observed.
+        let prefill = self.run_cuda_workspace_prepare_pass(token_ids, past_len, step_inputs)?;
+        if token_ids.len() > 1 {
+            let last_token = &token_ids[token_ids.len() - 1..];
+            self.run_cuda_workspace_prepare_pass(last_token, 0, &[])
+                .context("prepare native CUDA single-token decode workspace")?;
+        }
+        Ok(prefill)
+    }
+
+    /// Resolve concrete metadata for one forward shape (`token_ids` at
+    /// `past_len`, plus any routed `step_inputs`) and reserve the governed
+    /// kernel workspace slots for it without executing any graph node. Shared by
+    /// the multi-token prefill/verify reservation and the single-token decode
+    /// top-up so both bind symbols and size workspaces through the identical
+    /// path.
+    fn run_cuda_workspace_prepare_pass(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        step_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
         if self.has_eager_step_inputs() {
             let workspace_nodes = self.session.workspace_node_locations();
             if workspace_nodes.is_empty() {
@@ -3152,20 +3199,26 @@ impl DecodeCudaState {
         new_capacity: usize,
         valid_len: usize,
     ) -> anyhow::Result<()> {
-        // The mask binding is `[batch, new_capacity]`; the committed byte extent
-        // and the zeroing span all `batch` rows (stage 2b-impl-2, #750). At
-        // `batch == 1` this is byte-identical to the previous single-row memset.
-        let bytes = new_capacity
-            .checked_mul(std::mem::size_of::<i64>())
-            .and_then(|row_bytes| row_bytes.checked_mul(self.batch))
-            .with_context(|| {
-                format!("VMM-backed CUDA mask growth overflows for capacity {new_capacity}")
-            })?;
-        native_cuda_memset_zero(self.bindings[0].device_ptr() as usize, bytes)?;
-        self.bindings[0].set_physical_and_logical_shapes(
-            vec![self.batch, new_capacity],
-            vec![self.batch, valid_len],
-        )?;
+        let old_shape = self.bindings[0].physical_shape().to_vec();
+        if old_shape != [self.batch, self.max_len] {
+            bail!(
+                "VMM-backed CUDA mask binding must be [{}, {}] before growth, got {:?}",
+                self.batch,
+                self.max_len,
+                old_shape
+            );
+        }
+        let new_shape = vec![self.batch, new_capacity];
+        let ptr = self.bindings[0].device_ptr() as usize;
+        let elem = std::mem::size_of::<i64>();
+        // The mask carries one row per sequence. Growing its capacity changes
+        // every batch>0 row stride just like head-major KV, so preserve the
+        // valid prefix before clearing only the newly exposed suffix. Clearing
+        // the whole allocation here used to erase all prior `1` entries; GQA
+        // then derived a zero past length at the first bucket boundary.
+        copy_kv_prefix_device_to_device_in_place(ptr, &old_shape, &new_shape, 1, valid_len, elem)?;
+        zero_kv_suffix_device(ptr, &new_shape, 1, valid_len, elem)?;
+        self.bindings[0].set_physical_and_logical_shapes(new_shape, vec![self.batch, valid_len])?;
         Ok(())
     }
 
