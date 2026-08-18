@@ -391,6 +391,7 @@ async fn run_chat_completion(
         placeholder.as_deref(),
         handle.generation_defaults.as_ref(),
         output_budget,
+        state.config.default_reasoning_effort,
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
     if !input_audio.is_empty() {
@@ -561,6 +562,7 @@ async fn stream_chat_completion(
         placeholder.as_deref(),
         handle.generation_defaults.as_ref(),
         output_budget,
+        state.config.default_reasoning_effort,
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
     if !input_audio.is_empty() {
@@ -1462,11 +1464,17 @@ fn prepare_generate_request(
     image_placeholder: Option<&str>,
     generation_defaults: Option<&GenerationDefaults>,
     output_budget: usize,
+    default_reasoning_effort: Option<ReasoningEffort>,
 ) -> anyhow::Result<PreparedGenerateRequest> {
     let prompt = if session && !request.has_tool_context() {
         build_session_prompt(&request.messages, image_placeholder)
     } else {
-        render_prompt(request, chat_template, image_placeholder)?
+        render_prompt(
+            request,
+            chat_template,
+            image_placeholder,
+            default_reasoning_effort,
+        )?
     };
     let token_ids = tokenizer
         .encode(&prompt)
@@ -1791,6 +1799,7 @@ fn render_prompt(
     request: &ChatCompletionRequest,
     chat_template: Option<&ChatTemplate>,
     image_placeholder: Option<&str>,
+    default_reasoning_effort: Option<ReasoningEffort>,
 ) -> anyhow::Result<String> {
     if let Some(chat_template) = chat_template {
         let messages = request
@@ -1806,7 +1815,10 @@ fn render_prompt(
                 &messages,
                 tools_json.as_deref(),
                 true,
-                request.reasoning_effort.map(ReasoningEffort::as_str),
+                request
+                    .reasoning_effort
+                    .or(default_reasoning_effort)
+                    .map(ReasoningEffort::as_str),
             )
             .map_err(|err| anyhow::anyhow!("chat template render failed: {err}"));
     }
@@ -2635,14 +2647,62 @@ mod prompt_rendering_tests {
             render_prompt(
                 &request(json!({ "reasoning_effort": "low" })),
                 Some(&template),
-                None
+                None,
+                None,
             )
             .unwrap(),
             "low"
         );
         assert_eq!(
-            render_prompt(&request(json!({})), Some(&template), None).unwrap(),
+            render_prompt(&request(json!({})), Some(&template), None, None).unwrap(),
             "default"
+        );
+    }
+
+    // An agent client that never sends `reasoning_effort` would otherwise leave
+    // the model on its own default and can burn a whole token budget thinking
+    // without emitting an answer, so the operator can supply a floor. A client
+    // that does ask still wins.
+    #[test]
+    fn server_default_reasoning_effort_fills_in_only_when_the_request_is_silent() {
+        let template = ChatTemplate::from_source(
+            "{{ reasoning_strength if reasoning_strength is defined and reasoning_strength else 'model-default' }}",
+        );
+        let request = |extra: serde_json::Value| -> ChatCompletionRequest {
+            let mut body = json!({ "model": "m", "messages": [{"role": "user", "content": "hi"}] });
+            let object = body.as_object_mut().unwrap();
+            for (key, value) in extra.as_object().unwrap() {
+                object.insert(key.clone(), value.clone());
+            }
+            serde_json::from_value(body).unwrap()
+        };
+
+        // Silent request takes the server default.
+        assert_eq!(
+            render_prompt(
+                &request(json!({})),
+                Some(&template),
+                None,
+                Some(ReasoningEffort::Low),
+            )
+            .unwrap(),
+            "low"
+        );
+        // An explicit request value outranks the server default.
+        assert_eq!(
+            render_prompt(
+                &request(json!({ "reasoning_effort": "high" })),
+                Some(&template),
+                None,
+                Some(ReasoningEffort::Low),
+            )
+            .unwrap(),
+            "high"
+        );
+        // No server default configured leaves the model on its own default.
+        assert_eq!(
+            render_prompt(&request(json!({})), Some(&template), None, None).unwrap(),
+            "model-default"
         );
     }
 }
@@ -3303,10 +3363,7 @@ mod buffered_reasoning_tests {
         let output =
             " to=self<|message|>weigh it<|eom|><|start|>assistant to=user<|message|>Hi<|eot|>"
                 .to_string();
-        assert_eq!(
-            atem_reasoning_content(&output).as_deref(),
-            Some("weigh it")
-        );
+        assert_eq!(atem_reasoning_content(&output).as_deref(), Some("weigh it"));
         assert_eq!(
             parse_assistant_output(output, "stop").content.as_deref(),
             Some("Hi")

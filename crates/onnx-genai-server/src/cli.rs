@@ -11,6 +11,7 @@ use onnx_genai_engine::{KvDType, ResourceLimit, parse_resource_limit};
 
 #[cfg(feature = "native-backend")]
 use crate::parse_native_device;
+use crate::types::ReasoningEffort;
 use crate::{
     AppState, ModelSpec, ModelsConfig, ServerConfig, default_node_id, from_models_dir,
     parse_kv_cache_dtype, serve,
@@ -62,6 +63,17 @@ pub struct ServeArgs {
     /// Maximum requested output tokens per chat completion. Falls back to ONNX_GENAI_MAX_OUTPUT_TOKENS.
     #[arg(long, env = "ONNX_GENAI_MAX_OUTPUT_TOKENS", default_value_t = 4096)]
     pub max_output_tokens: usize,
+
+    /// Reasoning effort applied when a request omits `reasoning_effort`.
+    ///
+    /// Reasoning models pick their own default when the template receives no
+    /// effort, and that default is often the maximum. Agent clients frequently
+    /// never send the field at all, so the model can spend an entire token
+    /// budget thinking and emit no answer. Setting this gives the operator a
+    /// floor without overriding clients that do ask. Unset leaves the model's
+    /// own default in place. Falls back to ONNX_GENAI_DEFAULT_REASONING_EFFORT.
+    #[arg(long, env = "ONNX_GENAI_DEFAULT_REASONING_EFFORT", value_enum)]
+    pub default_reasoning_effort: Option<ReasoningEffort>,
 
     /// Maximum concurrent server sessions before least-recently-used eviction. Falls back to ONNX_GENAI_MAX_SESSIONS.
     #[arg(long, env = "ONNX_GENAI_MAX_SESSIONS", default_value_t = 256)]
@@ -156,6 +168,7 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
     ServerConfig {
         node_id: args.node_id.clone().unwrap_or_else(default_node_id),
         max_output_tokens: args.max_output_tokens,
+        default_reasoning_effort: args.default_reasoning_effort,
         max_sessions: args.max_sessions,
         max_queue_depth: args.max_queue_depth,
         max_batch: args.max_batch,
