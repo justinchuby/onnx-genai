@@ -176,8 +176,7 @@ mod phase_profile {
     /// and holding it is the whole point.  `dead_code` cannot see that a
     /// `MutexGuard`'s value is its `Drop`, so it has to be told.
     #[cfg(test)]
-    #[allow(dead_code)]
-    pub(super) struct ActivationPlanForTest(std::sync::MutexGuard<'static, ()>);
+    pub(super) struct ActivationPlanForTest(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 
     #[cfg(test)]
     impl ActivationPlanForTest {
