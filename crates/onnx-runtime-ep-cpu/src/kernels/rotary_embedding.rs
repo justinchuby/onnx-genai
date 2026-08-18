@@ -109,9 +109,9 @@ fn rotate_split_half(
     let mut k = 0;
     #[cfg(target_arch = "x86_64")]
     if vector_rotation_available() {
-        // SAFETY: guarded by the runtime AVX2+FMA probe; every slice is
-        // asserted at least `half` long and the loop reads 8 lanes at a time
-        // only while `k + 8 <= half`.
+        // SAFETY: guarded by the runtime AVX2 probe (the arms use no FMA and
+        // no AVX-512); every slice is asserted at least `half` long and the
+        // loop reads 8 lanes at a time only while `k + 8 <= half`.
         k = unsafe { avx2::split_half(lo_in, hi_in, lo_out, hi_out, cos_row, sin_row, half) };
     }
     while k < half {
@@ -133,9 +133,10 @@ fn rotate_interleaved(src: &[f32], dst: &mut [f32], cos_row: &[f32], sin_row: &[
     let mut k = 0;
     #[cfg(target_arch = "x86_64")]
     if vector_rotation_available() {
-        // SAFETY: guarded by the runtime AVX2+FMA probe; the vector loop reads
-        // and writes `2 * 8` lanes only while `k + 8 <= half`, and `src`/`dst`
-        // are asserted at least `2 * half` long.
+        // SAFETY: guarded by the runtime AVX2 probe (the arms use no FMA and
+        // no AVX-512); the vector loop reads and writes `2 * 8` lanes only
+        // while `k + 8 <= half`, and `src`/`dst` are asserted at least
+        // `2 * half` long.
         k = unsafe { avx2::interleaved(src, dst, cos_row, sin_row, half) };
     }
     while k < half {
@@ -150,7 +151,7 @@ fn rotate_interleaved(src: &[f32], dst: &mut [f32], cos_row: &[f32], sin_row: &[
 /// Whether the AVX2 rotation arms are live on this machine.
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[inline]
-pub(crate) fn vector_rotation_available() -> bool {
+fn vector_rotation_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         std::arch::is_x86_feature_detected!("avx2")
@@ -1108,6 +1109,13 @@ mod parallel_tests {
             (1, 128, 32, 128, 128),                   // prefill, parallel
             (2, 40, 6, 16, 8),                        // partial rotary, parallel-ish
             (3, 7, 5, 12, 12),                        // nothing divides evenly
+            // Parallel *and* indivisible: 130 rows over a 4-row task tiling
+            // leaves a 2-row final slab, so the `task * per_task + i` index
+            // arithmetic is checked against a short chunk rather than only the
+            // exact multiples the common shapes happen to produce.
+            (1, 130, 32, 128, 128),
+            // Same for the 4D plane path: 34 planes do not divide evenly.
+            (2, 66, 17, 64, 64),
         ] {
             let half = rotary_dim / 2;
             let n = batch * seq * heads * head_size;
@@ -1279,9 +1287,12 @@ mod vector_arm_tests {
 
     #[test]
     fn avx2_split_half_is_bit_identical_to_the_scalar_loop() {
-        // Sweep `half` across, below, and either side of the 8-lane vector
-        // width so the tail loop is exercised at every residue.
-        for half in [1usize, 3, 7, 8, 9, 15, 16, 31, 32, 63, 64, 65, 127, 128] {
+        // Sweep `half` so the scalar tail runs at *every* residue mod 8, not
+        // just the convenient ones: 1..9 covers 1-7 and 0, and the larger
+        // values re-check the residues after several full vector iterations.
+        for half in [
+            1usize, 2, 3, 4, 5, 6, 7, 8, 9, 13, 14, 15, 16, 20, 31, 32, 63, 64, 65, 127, 128,
+        ] {
             let lo_in = ramp(half, 0.3);
             let hi_in = ramp(half, 1.7);
             let cos_row = ramp(half, 2.9);
@@ -1308,7 +1319,9 @@ mod vector_arm_tests {
         // The interleaved arm de-interleaves with a lane permutation that is
         // its own inverse; a wrong index vector still produces plausible
         // magnitudes, so this compares every element rather than a norm.
-        for half in [1usize, 3, 7, 8, 9, 15, 16, 31, 32, 63, 64, 65] {
+        for half in [
+            1usize, 2, 3, 4, 5, 6, 7, 8, 9, 13, 14, 15, 16, 20, 31, 32, 63, 64, 65,
+        ] {
             let src = ramp(2 * half, 0.11);
             let cos_row = ramp(half, 5.3);
             let sin_row = ramp(half, 6.7);
