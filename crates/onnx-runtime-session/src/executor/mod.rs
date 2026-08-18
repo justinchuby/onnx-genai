@@ -613,6 +613,13 @@ impl Drop for Executor {
         for (_, buf) in self.buffers.drain() {
             let _ = self.ep.deallocate(buf);
         }
+        // An input buffer parked while its slot held a zero-copy borrow of the
+        // caller's tensor is owned by this executor too. `unbind_borrowed_inputs`
+        // returns them on every normal and error path, but a panic unwinding out
+        // of a run drops the executor with them still parked.
+        for (_, buf) in self.parked_input_buffers.drain(..) {
+            let _ = self.ep.deallocate(buf);
+        }
         if let Some(workspace) = self.persistent_workspace.take() {
             let _ = self.ep.deallocate(workspace.buffer);
         }

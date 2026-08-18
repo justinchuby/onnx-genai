@@ -98,6 +98,15 @@ fn merge_workspace_peak(peak: &mut WorkspaceRequirement, requirement: WorkspaceR
 
 impl Executor {
     fn constant_i64_values(&self, value: ValueId) -> Option<Vec<i64>> {
+        if let Some(WeightRef::Inline(tensor)) = self.graph.initializers.get(&value) {
+            return match tensor.dtype {
+                DataType::Int64 => onnx_runtime_ir::read_vec_le::<i64>(&tensor.data).ok(),
+                DataType::Int32 => onnx_runtime_ir::read_vec_le::<i32>(&tensor.data)
+                    .ok()
+                    .map(|values| values.into_iter().map(i64::from).collect()),
+                _ => None,
+            };
+        }
         let producer = self.graph.value(value).producer?;
         let node = self.graph.node(producer);
         if !node.domain.is_empty() || node.op_type != "Constant" {
@@ -119,6 +128,111 @@ impl Executor {
         }
     }
 
+    fn normalize_i64_axis(axis: i64, rank: usize) -> Option<usize> {
+        let rank = i64::try_from(rank).ok()?;
+        let axis = if axis < 0 {
+            axis.checked_add(rank)?
+        } else {
+            axis
+        };
+        if (0..rank).contains(&axis) {
+            usize::try_from(axis).ok()
+        } else {
+            None
+        }
+    }
+
+    fn normalize_i64_bound(bound: i64, len: usize) -> Option<i64> {
+        let len = i64::try_from(len).ok()?;
+        let bound = if bound < 0 {
+            bound.checked_add(len)?
+        } else {
+            bound
+        };
+        Some(bound.clamp(0, len))
+    }
+
+    fn exact_runtime_i64_vector(
+        &self,
+        value: ValueId,
+        symbols: &HashMap<SymbolId, usize>,
+        depth: usize,
+    ) -> Option<Vec<i64>> {
+        if depth >= 16 {
+            return None;
+        }
+        if let Some(values) = self.constant_i64_values(value) {
+            return Some(values);
+        }
+        let producer = self.graph.value(value).producer?;
+        let node = self.graph.node(producer);
+        match (node.domain.as_str(), node.op_type.as_str()) {
+            ("", "Shape") => {
+                let input = node.inputs.first().copied().flatten()?;
+                let shape = self.exact_runtime_value_shape(input, symbols, depth + 1)?;
+                let rank = i64::try_from(shape.len()).ok()?;
+                let start = node.attr("start").and_then(Attribute::as_int).unwrap_or(0);
+                let end = node.attr("end").and_then(Attribute::as_int).unwrap_or(rank);
+                let start = Self::normalize_i64_bound(start, shape.len())?;
+                let end = Self::normalize_i64_bound(end, shape.len())?;
+                if end < start {
+                    return None;
+                }
+                shape
+                    .get(usize::try_from(start).ok()?..usize::try_from(end).ok()?)?
+                    .iter()
+                    .map(|&dim| i64::try_from(dim).ok())
+                    .collect()
+            }
+            ("", "Sub") => {
+                let lhs = node.inputs.first().copied().flatten()?;
+                let rhs = node.inputs.get(1).copied().flatten()?;
+                let lhs = self.exact_runtime_i64_vector(lhs, symbols, depth + 1)?;
+                let rhs = self.exact_runtime_i64_vector(rhs, symbols, depth + 1)?;
+                let len = lhs.len().max(rhs.len());
+                if !(lhs.len() == len || lhs.len() == 1) || !(rhs.len() == len || rhs.len() == 1) {
+                    return None;
+                }
+                (0..len)
+                    .map(|i| {
+                        let a = lhs[if lhs.len() == 1 { 0 } else { i }];
+                        let b = rhs[if rhs.len() == 1 { 0 } else { i }];
+                        a.checked_sub(b)
+                    })
+                    .collect()
+            }
+            _ => None,
+        }
+    }
+
+    fn broadcast_shapes(lhs: &[usize], rhs: &[usize]) -> Option<Vec<usize>> {
+        let rank = lhs.len().max(rhs.len());
+        let mut out = Vec::with_capacity(rank);
+        for i in 0..rank {
+            let a = lhs
+                .len()
+                .checked_sub(i + 1)
+                .and_then(|axis| lhs.get(axis))
+                .copied()
+                .unwrap_or(1);
+            let b = rhs
+                .len()
+                .checked_sub(i + 1)
+                .and_then(|axis| rhs.get(axis))
+                .copied()
+                .unwrap_or(1);
+            let dim = match (a, b) {
+                (a, b) if a == b => a,
+                (1, b) => b,
+                (a, 1) => a,
+                _ => return None,
+            };
+            out.push(dim);
+        }
+        out.reverse();
+        Some(out)
+    }
+
     fn exact_runtime_value_shape(
         &self,
         value: ValueId,
@@ -132,15 +246,98 @@ impl Executor {
         {
             return Some(shape);
         }
-        if depth >= 8 {
+        if depth >= 16 {
             return None;
         }
         let producer = self.graph.value(value).producer?;
         let node = self.graph.node(producer);
         match (node.domain.as_str(), node.op_type.as_str()) {
-            ("", "Cast" | "CastLike" | "Identity") => {
+            ("", "Cast" | "CastLike" | "Identity" | "CumSum") => {
                 let input = node.inputs.first().copied().flatten()?;
                 self.exact_runtime_value_shape(input, symbols, depth + 1)
+            }
+            ("", "Unsqueeze") => {
+                let input = node.inputs.first().copied().flatten()?;
+                let mut shape = self.exact_runtime_value_shape(input, symbols, depth + 1)?;
+                let axes = if let Some(axes) = node.attr("axes").and_then(Attribute::as_ints) {
+                    axes.to_vec()
+                } else {
+                    let axes = node.inputs.get(1).copied().flatten()?;
+                    self.constant_i64_values(axes)?
+                };
+                let output_rank = shape.len().checked_add(axes.len())?;
+                let mut axes = axes
+                    .into_iter()
+                    .map(|axis| Self::normalize_i64_axis(axis, output_rank))
+                    .collect::<Option<Vec<_>>>()?;
+                axes.sort_unstable();
+                axes.dedup();
+                if axes.len() != output_rank - shape.len() {
+                    return None;
+                }
+                for axis in axes {
+                    shape.insert(axis, 1);
+                }
+                Some(shape)
+            }
+            ("", "Slice") => {
+                let data = node.inputs.first().copied().flatten()?;
+                let starts = node.inputs.get(1).copied().flatten()?;
+                let ends = node.inputs.get(2).copied().flatten()?;
+                let shape = self.exact_runtime_value_shape(data, symbols, depth + 1)?;
+                let starts = self.exact_runtime_i64_vector(starts, symbols, depth + 1)?;
+                let ends = self.exact_runtime_i64_vector(ends, symbols, depth + 1)?;
+                let axes = match node.inputs.get(3).copied().flatten() {
+                    Some(axes) => self.constant_i64_values(axes)?,
+                    None => (0..i64::try_from(starts.len()).ok()?).collect(),
+                };
+                let steps = match node.inputs.get(4).copied().flatten() {
+                    Some(steps) => self.constant_i64_values(steps)?,
+                    None => vec![1; axes.len()],
+                };
+                if starts.len() != axes.len()
+                    || ends.len() != axes.len()
+                    || steps.len() != axes.len()
+                {
+                    return None;
+                }
+                let mut output = shape.clone();
+                for ((&start, &end), (&axis, &step)) in
+                    starts.iter().zip(&ends).zip(axes.iter().zip(&steps))
+                {
+                    if step <= 0 {
+                        return None;
+                    }
+                    let axis = Self::normalize_i64_axis(axis, shape.len())?;
+                    let start = Self::normalize_i64_bound(start, shape[axis])?;
+                    let end = Self::normalize_i64_bound(end, shape[axis])?;
+                    let len = if end <= start {
+                        0
+                    } else {
+                        let span = usize::try_from(end.checked_sub(start)?).ok()?;
+                        let step = usize::try_from(step).ok()?;
+                        span.div_ceil(step)
+                    };
+                    output[axis] = len;
+                }
+                Some(output)
+            }
+            ("", "And" | "GreaterOrEqual") => {
+                let lhs = node.inputs.first().copied().flatten()?;
+                let rhs = node.inputs.get(1).copied().flatten()?;
+                let lhs = self.exact_runtime_value_shape(lhs, symbols, depth + 1)?;
+                let rhs = self.exact_runtime_value_shape(rhs, symbols, depth + 1)?;
+                Self::broadcast_shapes(&lhs, &rhs)
+            }
+            ("", "Where") => {
+                let condition = node.inputs.first().copied().flatten()?;
+                let x = node.inputs.get(1).copied().flatten()?;
+                let y = node.inputs.get(2).copied().flatten()?;
+                let condition = self.exact_runtime_value_shape(condition, symbols, depth + 1)?;
+                let x = self.exact_runtime_value_shape(x, symbols, depth + 1)?;
+                let y = self.exact_runtime_value_shape(y, symbols, depth + 1)?;
+                let xy = Self::broadcast_shapes(&x, &y)?;
+                Self::broadcast_shapes(&condition, &xy)
             }
             ("", "Reshape") => {
                 let data = node.inputs.first().copied().flatten()?;

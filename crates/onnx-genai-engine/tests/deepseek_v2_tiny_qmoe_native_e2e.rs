@@ -161,20 +161,20 @@ fn deepseek_v2_tiny_native_cuda_matches_cpu_under_current_graph_policy() -> anyh
             assert_eq!(stats.graph.replays, 0);
         }
         Some("1") => {
+            // With the topology-gated capacity policy, the standard additive
+            // causal-mask builder no longer forces the mask binding to expose its
+            // logical width, so `attention_mask_consumers_are_capacity_aware` no
+            // longer declines capture for this capacity-form Attention graph.
+            if let Some(reason) = stats.graph.decline_reason.as_deref() {
+                assert!(
+                    !reason.contains("attention_mask_consumers_are_capacity_aware"),
+                    "attention-mask capacity policy should no longer decline capture: {reason}"
+                );
+            }
             if stats.graph.captures > 0 {
                 assert!(
                     stats.graph.replays > 0,
                     "expected captured decode steps to replay"
-                );
-            } else {
-                let reason = stats
-                    .graph
-                    .decline_reason
-                    .as_deref()
-                    .expect("capture-disabled run should report why capture declined");
-                assert!(
-                    reason.contains("attention_mask_consumers_are_capacity_aware"),
-                    "unexpected capture decline reason: {reason}"
                 );
             }
         }
