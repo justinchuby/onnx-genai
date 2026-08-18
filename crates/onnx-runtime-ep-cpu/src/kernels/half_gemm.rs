@@ -333,12 +333,7 @@ fn gemm_impl<T: HalfElement>(
     // after the region ends, which competes with whatever runs next. Below
     // `PARALLEL_MIN_WORK` that costs more than the split saves, so stay serial
     // -- the same guard `half_gemv` and `accelerate_gemm` already apply.
-    let parallel = forced_route().unwrap_or_else(|| {
-        threads > 1 && m.saturating_mul(k).saturating_mul(n) >= PARALLEL_MIN_WORK
-    });
-    let mc = if !parallel {
-        MAX_MC.min(m)
-    } else {
+    let split_mc = {
         let rows = m.div_ceil(threads.saturating_mul(2)).clamp(1, MAX_MC);
         if rows == 1 {
             1
@@ -346,6 +341,14 @@ fn gemm_impl<T: HalfElement>(
             rows.div_ceil(MR).saturating_mul(MR).min(MAX_MC)
         }
     };
+    let parallel = forced_route().unwrap_or_else(|| {
+        threads > 1
+            && m.saturating_mul(k).saturating_mul(n) >= PARALLEL_MIN_WORK
+            // A split into a single block cannot use more than one thread, so
+            // it is pure fork overhead. `m == 1` always lands here.
+            && m.div_ceil(split_mc) > 1
+    });
+    let mc = if parallel { split_mc } else { MAX_MC.min(m) };
 
     let block = |block_index: usize, c_block: &mut [f32]| {
         let first_row = block_index * mc;
@@ -377,27 +380,40 @@ fn gemm_impl<T: HalfElement>(
 /// this kernel only ever sees the *small* shapes that decline widening, so the
 /// unguarded fork was mis-sized for every shape it still serves.
 ///
-/// Measured `serial/parallel` (>1 = splitting wins), interleaved rep-by-rep,
-/// `p50` of 9, pinned to 16 physical cores, two independent runs per thread
-/// count (`bench_half_gemm_parallel_threshold`):
+/// Measured `serial/parallel` (>1 = splitting wins) at `m = 8`, interleaved
+/// rep-by-rep, `p50` of 9, pinned to 16 physical cores, two independent runs
+/// per thread count (`bench_half_gemm_parallel_threshold`):
 ///
-/// | m*k*n     | T=4 run1/run2 | T=16 run1/run2 |
-/// |-----------|---------------|----------------|
-/// |    32_768 |         0.70x |          0.32x |
-/// |   131_072 |         0.73x |          0.70x |
-/// |   262_144 |   0.91x/0.92x |    0.93x/0.74x |
-/// |   393_216 |   0.96x/0.98x |    1.06x/0.92x |
-/// |   524_288 |   1.00x/1.00x |    1.15x/0.96x |
-/// |   786_432 |   1.04x/1.04x |    1.28x/1.22x |
-/// | 1_048_576 |   1.06x/1.06x |    1.36x/1.37x |
+/// | m*k*n     |       T=2 |       T=4 |       T=8 |      T=16 |      T=32 |
+/// |-----------|-----------|-----------|-----------|-----------|-----------|
+/// |    32_768 | 0.88/0.86 | 0.51/0.55 | 0.63/0.75 | 0.36/0.31 | 0.21/0.19 |
+/// |    65_536 | 0.79/0.78 | 0.63/0.63 | 0.85/0.88 | 0.53/0.53 | 0.41/0.33 |
+/// |   131_072 | 1.02/1.02 | 0.79/0.80 | 1.14/1.18 | 0.76/0.60 | 0.63/0.54 |
+/// |   262_144 | 1.20/1.20 | 0.92/0.92 | 1.16/1.51 | 1.03/1.02 | 0.86/0.80 |
+/// |   393_216 | 1.27/1.28 | 0.91/0.97 | 1.27/1.64 | 1.04/1.14 | 0.99/1.04 |
+/// |   524_288 | 1.34/1.30 | 1.01/1.02 | 1.29/1.76 | 1.20/1.08 | 1.19/1.12 |
+/// | 1_048_576 | 1.41/1.37 | 1.08/1.04 | 1.47/1.95 | 1.34/1.30 | 1.31/1.31 |
 ///
-/// `786_432` is the smallest size that wins at *every* thread count in *every*
-/// run; `524_288` only breaks even and dips to 0.96x. Sibling kernels apply the
-/// same guard (`half_gemv::PARALLEL_MIN_WORK`, `accelerate_gemm`'s `k*n`
-/// bound); this one is measured separately because it forks per row-block
-/// rather than per stripe, so its fork count -- and therefore its overhead --
-/// is larger for the same operand.
-const PARALLEL_MIN_WORK: usize = 786_432;
+/// `524_288` is the smallest size that wins at *every* measured thread count in
+/// *every* run (worst case 1.01x). Below it the picture is genuinely mixed --
+/// `262_144` wins at T=2/T=8 but loses at T=4 (0.92x) and T=32 (0.80x) -- so
+/// declining is the right call there even though it leaves some partial-pool
+/// wins on the table.
+///
+/// Deliberately a single constant rather than a function of thread count: the
+/// measured crossover is *not* monotone in threads (T=4 wants the highest
+/// threshold, T=8 the lowest), because for small `m` the block count is pinned
+/// by `m` rather than by the pool, so a thread-scaled formula would be fitting
+/// noise.
+///
+/// `m*k*n` is a proxy, not a cost model. The split is over *rows of C*, so the
+/// achievable speedup is bounded by the block count, and the parallel route
+/// re-packs `B` per row-block -- for small `m` (`mc == 1`) that is `m`
+/// redundant packs. That is why the ratios plateau near 1.1x at T=4 rather than
+/// scaling with the pool, and why some shapes above the threshold still gain
+/// little. Sibling kernels apply the same kind of guard
+/// (`half_gemv::PARALLEL_MIN_WORK`, `accelerate_gemm`'s `k*n` bound).
+const PARALLEL_MIN_WORK: usize = 524_288;
 
 #[cfg(test)]
 thread_local! {
@@ -1226,13 +1242,18 @@ mod half_gemm_par_bench {
         println!("threads={}", rayon::current_num_threads());
         println!("m,k,n,work,serial_ms,par_ms,serial/par");
         for &(m, k, n) in &[
-            (8usize, 256usize, 128usize), // 262_144
-            (8, 256, 192),                // 393_216
-            (8, 256, 256),                // 524_288
-            (8, 384, 256),                // 786_432
-            (8, 512, 256),                // 1_048_576
-            (15, 256, 256),               // 983_040
-            (4, 512, 512),                // 1_048_576
+            (8usize, 64usize, 64usize), //    32_768
+            (8, 128, 64),               //    65_536
+            (8, 128, 128),              //   131_072
+            (8, 192, 128),              //   196_608
+            (8, 256, 128),              //   262_144
+            (8, 256, 192),              //   393_216
+            (8, 256, 256),              //   524_288
+            (8, 384, 256),              //   786_432
+            (8, 512, 256),              // 1_048_576
+            (8, 512, 384),              // 1_572_864
+            (8, 512, 512),              // 2_097_152
+            (8, 768, 512),              // 3_145_728
         ] {
             let (a, b, mut c) = operands(m, k, n);
             run(&a, &b, &mut c, m, k, n, false);
@@ -1276,6 +1297,20 @@ mod half_gemm_guard_tests {
         (a, b, vec![0.0f32; m * n])
     }
 
+    fn gemm_as<T: HalfElement>(a: &[u16], b: &[u16], c: &mut [f32], m: usize, k: usize, n: usize) {
+        gemm_impl::<T>(
+            a,
+            MatrixLayout::row_major(k),
+            b,
+            MatrixLayout::row_major(n),
+            c,
+            m,
+            k,
+            n,
+            ExecutionPath::Scalar,
+        );
+    }
+
     fn gemm(a: &[u16], b: &[u16], c: &mut [f32], m: usize, k: usize, n: usize) {
         gemm_impl::<F16>(
             a,
@@ -1291,12 +1326,14 @@ mod half_gemm_guard_tests {
     }
 
     /// The threshold is a measured crossover, not a guess -- an earlier guess
-    /// sat 12x too low, inside the range the sweep shows losing 0.74x-0.93x.
-    /// Pin the value so a silent edit has to come back through the sweep.
+    /// sat 8x too low, inside the range the sweep shows losing 0.3x-0.9x. Pin
+    /// the value so a silent edit has to come back through the sweep, which
+    /// spans five thread counts precisely because the crossover moves with the
+    /// pool.
     #[test]
     fn half_gemm_parallel_threshold_matches_the_measured_crossover() {
         assert_eq!(
-            PARALLEL_MIN_WORK, 786_432,
+            PARALLEL_MIN_WORK, 524_288,
             "smallest m*k*n measured to win at every thread count; re-run \
              bench_half_gemm_parallel_threshold before changing it"
         );
@@ -1321,7 +1358,7 @@ mod half_gemm_guard_tests {
             "work below PARALLEL_MIN_WORK must not fork the pool"
         );
 
-        // 8*512*256 = 1_048_576, measured 1.36x/1.37x in favour of splitting.
+        // 8*512*256 = 1_048_576, measured 1.31x-1.95x in favour of splitting.
         let (a, b, mut c) = operands(8, 512, 256);
         reset_serial_gemms();
         gemm(&a, &b, &mut c, 8, 512, 256);
@@ -1330,6 +1367,90 @@ mod half_gemm_guard_tests {
             0,
             "work above PARALLEL_MIN_WORK must still be split"
         );
+    }
+
+    /// Pins the comparison at *exactly* the threshold. Without this, swapping
+    /// `>=` for `>` in the guard changes behaviour at the boundary and every
+    /// other test still passes.
+    #[test]
+    fn the_crossover_itself_splits_and_one_mac_below_it_does_not() {
+        if rayon::current_num_threads() < 2 {
+            eprintln!("skipping: needs a multi-thread pool");
+            return;
+        }
+        // 8 * 256 * 256 == 524_288 == PARALLEL_MIN_WORK exactly.
+        let (m, k, n) = (8usize, 256usize, 256usize);
+        assert_eq!(
+            m * k * n,
+            PARALLEL_MIN_WORK,
+            "shape must sit on the boundary"
+        );
+        let (a, b, mut c) = operands(m, k, n);
+        reset_serial_gemms();
+        gemm(&a, &b, &mut c, m, k, n);
+        assert_eq!(
+            serial_gemms(),
+            0,
+            "work equal to PARALLEL_MIN_WORK must split (the bound is inclusive)"
+        );
+
+        // One MAC below the threshold: k*n is one column short.
+        let n1 = n - 1;
+        assert!(m * k * n1 < PARALLEL_MIN_WORK);
+        let (a, b, mut c) = operands(m, k, n1);
+        reset_serial_gemms();
+        gemm(&a, &b, &mut c, m, k, n1);
+        assert_eq!(
+            serial_gemms(),
+            1,
+            "work below PARALLEL_MIN_WORK must stay serial"
+        );
+    }
+
+    /// A split into one block cannot use more than one thread, so forking for
+    /// it is pure overhead however large the operand is. `m == 1` is the case
+    /// that matters: a 1x2048 by 2048x2048 GEMV is 4.2M MACs, far above the
+    /// threshold, yet yields exactly one block.
+    #[test]
+    fn a_single_block_is_never_split_however_large_the_operand() {
+        if rayon::current_num_threads() < 2 {
+            eprintln!("skipping: needs a multi-thread pool");
+            return;
+        }
+        let (m, k, n) = (1usize, 1024usize, 1024usize);
+        assert!(m * k * n > PARALLEL_MIN_WORK, "must clear the work bound");
+        let (a, b, mut c) = operands(m, k, n);
+        reset_serial_gemms();
+        gemm(&a, &b, &mut c, m, k, n);
+        assert_eq!(
+            serial_gemms(),
+            1,
+            "a one-block split is pure fork overhead and must be declined"
+        );
+    }
+
+    /// The routing is element-type agnostic, so bf16 must get the same
+    /// bit-for-bit guarantee as f16 rather than inheriting it by assumption.
+    #[test]
+    fn bf16_routes_agree_bit_for_bit() {
+        for &(m, k, n) in &[(8usize, 64usize, 64usize), (13, 129, 67), (130, 65, 67)] {
+            let a: Vec<u16> = (0..m * k)
+                .map(|i| half::bf16::from_f32(((i % 23) as f32 - 11.0) * 0.07).to_bits())
+                .collect();
+            let b: Vec<u16> = (0..k * n)
+                .map(|i| half::bf16::from_f32(((i % 17) as f32 - 8.0) * 0.05).to_bits())
+                .collect();
+            let mut c = vec![0.0f32; m * n];
+            with_forced_route(false, || gemm_as::<Bf16>(&a, &b, &mut c, m, k, n));
+            let serial = c.clone();
+            with_forced_route(true, || gemm_as::<Bf16>(&a, &b, &mut c, m, k, n));
+            let sb: Vec<u32> = serial.iter().map(|v| v.to_bits()).collect();
+            let pb: Vec<u32> = c.iter().map(|v| v.to_bits()).collect();
+            assert!(
+                sb == pb,
+                "{m}x{k}x{n}: split and serial bf16 half GEMM disagree bit-for-bit"
+            );
+        }
     }
 
     /// The guard changes *scheduling*, never arithmetic: both routes must agree
