@@ -361,3 +361,93 @@ greedy loop — byte-identical and a strict tok/s win on every model measured. K
 path with zero token drift, a pure BASE-decode win (no speculative).
 
 **Merged PR:** #1293
+
+---
+
+### 2026-08-18: Device-property tiling for the int4 decode GEMV (consume arch dispatch)
+
+**By:** Batty
+
+**What:** Wired the SM-version dispatch scaffolding from #1287 into the
+int4/accuracy_level=4 decode GEMV so tiling + split-K grid-fill are keyed off
+probed device properties through one arch seam. Three pieces, all in
+`onnx-runtime-ep-cuda`:
+
+1. `arch.rs` — `decode_resident_warps_per_sm(cc)` reproduces the existing
+   resident-warp ladder byte-for-byte (`(8,0)|(9..,_) => 64`, else `48`), and a
+   new `DecodeTilingProfile { tier, multiprocessor_count, resident_warps_per_sm,
+   sm_count_split_k }` + `one_wave_ctas(threads)` fold the arch tier, SM count
+   and resident-warp estimate into the split-K decision the pending RTX kernels
+   select through.
+2. `runtime.rs` — `CudaDeviceCapabilities::decode_resident_warps_per_sm()`
+   delegates to the arch layer.
+3. `matmul_nbits.rs` — `use_accuracy4_stage64` now reads its resident-warp
+   estimate from the arch helper instead of an inline `match`.
+
+**Which tier gets which tiling:**
+- **Hopper `sm_90` (H100/H200):** 64 resident warps/SM; **excluded** from the
+  new SM-count split-K lever (`sm_count_split_k = false`) — frozen to today's
+  exact selection.
+- **Ada `sm_89` (RTX 40 / L4/L40), Ampere `sm_86`/`sm_87` (RTX 30):** 48
+  resident warps/SM; opt **into** the SM-count-driven split-K lever
+  (`sm_count_split_k = true`). `one_wave_ctas()` scales the occupancy target
+  with the probed SM count, so lower-SM parts (e.g. an L4 with 58 SMs) reach one
+  wave sooner and split-K fills the grid without oversubscription.
+- **Turing/Volta/Legacy/Blackwell:** total, panic-free mapping; consumer tiers
+  opt into the lever, Blackwell datacenter stays on the 64-warp rung.
+
+**Why:** Standing directive "rtx显卡也要优化" — the decode GEMV's grid-fill must
+track consumer/edge RTX SM counts, not just H200's 132 SMs. Much of the
+SM-count-driven split-K already existed (the selectors read
+`multiprocessor_count`); this change gives the resident-warp/occupancy input a
+single arch-aware seam and a unit-testable `DecodeTilingProfile` for the pending
+`rtx-devprop-tiling` kernels, without perturbing H200.
+
+**H200 byte-identity evidence:** structural (arch helper returns same 64 on sm_90 as
+old inline match) + tests (`accuracy4_resident_warps_matches_prior_inline_ladder`,
+`sm_90_decode_profile_is_frozen_out_of_rtx_splitk`) + GPU parity (19/20
+matmul_nbits_gpu decode tests, 1 pre-existing failure on pristine origin/main).
+
+**Verdict:** Zero-H200-change, test-locked scaffolding-that-selects. No Ada/Ampere
+hardware attached; RTX path validated via synthetic `for_test` capabilities only.
+Benchmark when RTX hardware lands. **Merged PR #1298 (04cfb77e).**
+
+---
+
+### 2026-08-18: Rescue PR #976 — split-block device argmax landed on current main — GO
+
+**By:** Deckard
+
+**What:** Rescued and re-landed the valuable change from draft PR #976 ("Split the
+device sampler argmax across blocks instead of one per row") in `onnx-genai-ort`'s
+device sampler (`crates/onnx-genai-ort/src/device_sampler.rs`). New branch off
+origin/main (04cfb77e): `squad/rescue-976-split-argmax`, PR #1306. Worktree
+`/home/justinchu/wt-976`.
+
+**What was dropped:** PR #976 had 3 commits; the bottom one (`2965895f` PTX/loader
+prerequisite) already landed on main as #964 — dropped. Cherry-picked only
+`0048f5fb` (split-block argmax kernels + dispatch) and `91e64a75`
+(dtype/batch/width tests). Both applied cleanly onto current main and compose
+correctly with main's post-branch rework.
+
+**Reconciliation with multi-row-argmax rework:** split composes ON TOP —
+`argmax_into` derives `parts = argmax_parts(vocab)` and when `parts > 1` launches
+`argmax_part_{f16,bf16,f32}` with `grid=(parts, rows)` then `argmax_join` with
+`grid=(rows)`. Narrow rows (`vocab <= 2*BLOCK`) return `parts=0` and stay on the
+single-launch kernel unchanged.
+
+**Byte-identity result (H200, GPU3, PINNED, release):** UNCHANGED vs current main.
+All GPU tests pass (split_matches_single_launch, batched_rows, odd_widths, main's
+own parity tests). 19 non-ignored + 6 GPU-gated device_sampler tests pass; 0 fail.
+
+**Kernel A/B (H200, vocab=202048, medians of 5):**
+| path | median |
+|------|--------|
+| one-block-per-row (parts=1) | 38.17 µs |
+| split (parts=99, auto) | 23.49 µs |
+Speedup **1.62×** end-to-end. Pure-kernel win larger; original PR measured 19.52 µs
+→ 3.60 µs at this vocab.
+
+**Verdict: GO.** Byte-identical argmax confirmed across dtype/batch/width on H200.
+Split win is NOT superseded by multi-row rework — they are orthogonal (multi-row
+spreads rows on y-axis; this adds per-row block split). **Merged PR #1306 (9ac981ca).**
