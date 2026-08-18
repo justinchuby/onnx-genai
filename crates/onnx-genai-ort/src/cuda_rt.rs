@@ -64,13 +64,22 @@ unsafe impl Sync for CudaRt {}
 static CUDART: OnceLock<std::result::Result<CudaRt, String>> = OnceLock::new();
 
 /// Candidate `cudart` library names, most specific first. Windows ships
-/// versioned DLLs (`cudart64_12.dll` for CUDA 12.x, older `cudart64_120.dll`),
-/// while the bare name lets the platform loader resolve `libcudart.so` on Linux
-/// or a name already on the search path.
+/// versioned DLLs (`cudart64_13.dll` for CUDA 13.x, `cudart64_12.dll` for
+/// 12.x, older `cudart64_120.dll`), while the bare name lets the platform
+/// loader resolve `libcudart.so` on Linux or a name already on the search path.
+///
+/// This list must cover every CUDA major version the CUDA EP's own loader
+/// (`onnx-runtime-ep-cuda::dynamic_library::candidates`) accepts. When the two
+/// disagree the EP loads and this one does not, and the failure surfaces as a
+/// Linux `.so` name failing on Windows -- the last candidate tried -- which
+/// reads like "this machine has no CUDA" rather than "this list is stale".
+/// That is exactly how a CUDA 13 host came to look CUDA-less.
 const CUDART_CANDIDATES: &[&str] = &[
+    "cudart64_13.dll",
     "cudart64_12.dll",
     "cudart64_120.dll",
     "cudart",
+    "libcudart.so.13",
     "libcudart.so.12",
     "libcudart.so",
 ];
@@ -378,4 +387,34 @@ pub fn memcpy_device_to_device(dst: usize, src: usize, bytes: usize) -> Result<(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CUDART_CANDIDATES;
+
+    /// Every CUDA major version the EP's loader
+    /// (`onnx-runtime-ep-cuda::dynamic_library::candidates`) accepts must also
+    /// be resolvable here. When the two lists disagree the EP loads and this
+    /// one does not, and the resulting error names the *last* candidate --- a
+    /// Linux `.so` on Windows --- which reads as "no CUDA on this machine"
+    /// rather than "this list is stale". A CUDA 13 host looked CUDA-less for
+    /// exactly this reason.
+    ///
+    /// If you add a CUDA major version to the EP's table, add it here too.
+    #[test]
+    fn every_cuda_major_the_ep_loads_is_also_resolvable_here() {
+        for major in ["13", "12"] {
+            let windows = format!("cudart64_{major}.dll");
+            let linux = format!("libcudart.so.{major}");
+            assert!(
+                CUDART_CANDIDATES.contains(&windows.as_str()),
+                "missing {windows}; the CUDA EP loads this major but `cuda_rt` would not"
+            );
+            assert!(
+                CUDART_CANDIDATES.contains(&linux.as_str()),
+                "missing {linux}; the CUDA EP loads this major but `cuda_rt` would not"
+            );
+        }
+    }
 }
