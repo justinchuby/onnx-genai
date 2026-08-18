@@ -24,7 +24,8 @@ use crate::pipeline_cache::{
 };
 use crate::processors::build_processor_chain;
 use crate::{
-    EngineDecodeBackend, GeneratePrompt, GenerateRequest, GenerateResult, GenerateTokenCallback,
+    EngineDecodeBackend, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
+    GenerateTokenCallback,
 };
 use anyhow::Context;
 use onnx_genai_kv::{PagedKvCache, PrefixCache, SequenceId};
@@ -236,6 +237,7 @@ pub struct PipelineEngine {
     plan: PipelinePlan,
     decode_backend: EngineDecodeBackend,
     generation_defaults: Option<onnx_genai_metadata::GenerationDefaults>,
+    max_sequence_length: Option<usize>,
     /// Autoregressive decode state; `None` for non-autoregressive pipelines
     /// (single-pass, iterative/diffusion) which produce tensors, not tokens.
     decoder_state: Option<DecodeState>,
@@ -781,6 +783,12 @@ impl PipelineEngine {
         self.generation_defaults.as_ref()
     }
 
+    /// Effective context limit for a request, combining the package metadata
+    /// with an explicit per-request override.
+    pub fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
+        options.max_context.or(self.max_sequence_length)
+    }
+
     /// Execution-provider placement reported by the loaded component sessions.
     pub fn execution_provider_status(&self) -> String {
         let mut summaries = self
@@ -873,6 +881,7 @@ impl PipelineEngine {
             .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {e}"))?;
         let prefill_chunk_size = pipeline_metadata_prefill_chunk_size(&directory);
         let generation_defaults = pipeline_metadata_generation_defaults(&directory);
+        let max_sequence_length = pipeline_metadata_max_len(&directory);
         let model_weights_bytes =
             directory
                 .model_paths
@@ -1278,6 +1287,7 @@ impl PipelineEngine {
                 PipelineBackend::Native => EngineDecodeBackend::Native,
             },
             generation_defaults,
+            max_sequence_length,
             decoder_state,
             tokenizer_component,
             fixed_state_budget_bytes,

@@ -120,6 +120,7 @@ impl NativeComponentSession {
 
     /// Load an ONNX model on the requested native device as a neutral component.
     pub fn load(path: &Path, device: NativeDecodeDevice) -> anyhow::Result<Self> {
+        let requested_cuda = matches!(&device, NativeDecodeDevice::Cuda { .. });
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
@@ -135,6 +136,13 @@ impl NativeComponentSession {
                     path.display()
                 )
             })?;
+        if requested_cuda && let Some(report) = session.execution_provider_fallback_report() {
+            tracing::warn!(
+                model = %path.display(),
+                fallback = %report,
+                "native CUDA pipeline component fell back to CPU"
+            );
+        }
         Self::new(session).map_err(anyhow::Error::from)
     }
 }

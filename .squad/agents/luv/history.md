@@ -90,3 +90,7 @@ Fresh adversarial review of `nxrt/mlas-avx2-layernorm` @ `72e02cd92c` after the 
 - PR #1167 landed on `main` as `651901a3`: `ONNX_GENAI_QMOE_OCC` remains default-OFF and uses launch-bounds/occupancy tuning for QMoE gate/up activation.
 - Evidence recorded: byte-identical QMoE suite and V2-Lite golden streams, registers about 54→40, achieved occupancy about 43%→64%, isolated gate/up kernel about −10.6%, and modest ~+1% E2E on V2-Lite.
 - Rachael approved with a scope wording note: the flag is not literally limited to symmetric int4, even though default-OFF and affine smoke tests made that non-blocking.
+
+## 2026-08-18T05:25Z — Gate-3 B* post-Marlin re-probe NO-GO
+
+Luv's current-main (`923dc592`) re-probe found captured verify B* still far above the ≤~2 GO gate after Marlin: qwen2.5-14b-zp **17.5×/18.4×/20.0×** and qwen2.5-7b **14.9×/15.7×/17.4×** at K=2/4/8. Spec-decode family work remains shelved. The blocker shifted from the old #957 cheap-seam hypothesis to M>1 `MatMulNBits` launching `matmul_nbits_gemm_f16` eagerly; rerun only after the MatMulNBits/Marlin M>1 graph-safe path is actually selected.

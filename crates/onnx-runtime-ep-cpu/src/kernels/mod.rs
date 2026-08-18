@@ -189,7 +189,7 @@ static INDEX_DTYPES: &[DataType] = &[DataType::Int64, DataType::Int32];
 /// `GroupQueryAttention`'s `seqlens_k` / `total_sequence_length` are int32. The
 /// union test then rejects those slots and the node is silently handed to ORT's
 /// CPU EP, even though our kernel runs it. That contradicts this EP's contract
-/// (see `provider.rs::claim_preference_node`): a node we can execute is never
+/// (see `provider.rs::supports_op`): a node we can execute is never
 /// delegated. Listing the integer slots explicitly is what makes the two most
 /// important decode ops in the engine reachable at all;
 /// `plugin_ort_e2e.rs::no_supported_node_is_ever_left_to_the_ort_cpu_ep` is the
