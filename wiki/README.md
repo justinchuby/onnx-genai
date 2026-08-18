@@ -1,5 +1,6 @@
 ---
 title: Wiki
+permalink: index
 aliases:
   - Knowledge Base
 tags:

@@ -109,6 +109,28 @@ because GitHub renders them correctly and they represent formal sources:
 [Memory Architecture](../../docs/memory/MEMORY_ARCHITECTURE.md)
 ```
 
+## Preview and publish the static site
+
+The published site reads directly from `wiki/`; there is no second copy of the
+notes to maintain. From the repository root:
+
+```bash
+cd site/quartz
+npm ci
+npm run wiki:serve
+```
+
+Open <http://localhost:8080/onnx-genai/>. Before opening a pull request, run
+`npm run wiki:build` from the same directory. That command validates wikilinks,
+builds the production site, and checks that generated links and assets stay
+under the `/onnx-genai/` project path.
+
+Site settings live in `site/quartz/quartz.config.yaml`; dependency versions are
+recorded in the adjacent npm and Quartz lockfiles. The `Wiki Pages` workflow
+builds relevant pull requests and pushes, but only a push to `main` can deploy
+to GitHub Pages. Repository maintainers must select **GitHub Actions** as the
+Pages source.
+
 ## Human reading budget
 
 Each note should answer one primary question and usually take roughly 5–10
