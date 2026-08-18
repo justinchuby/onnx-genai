@@ -144,6 +144,13 @@ pub struct SharedPrefixCommitInfo {
 ///   [`DeviceKey`] as `device()`. A caller that discovers a capability
 ///   through one of these methods never has to re-check for staleness: there
 ///   is no separate handle that could have been swapped out from under it.
+/// * An allocator whose own [`deallocate_with_unmapped`](Self::deallocate_with_unmapped)
+///   override folds `SharedMapping` accounting into its return value some
+///   other way (for instance because commit and sharing are tracked in one
+///   structure, as `CudaVmmAllocator` does) must still implement
+///   [`SharedMapping::allocation_shared_mapped_bytes`] correctly: anything
+///   reachable through `as_shared_mapping` is expected to answer the same
+///   question consistently, regardless of which path a caller takes to it.
 ///
 /// # This trait does not make memory governed
 ///
@@ -158,7 +165,17 @@ pub struct SharedPrefixCommitInfo {
 /// a path an execution provider walks constantly. A component with a standing
 /// claim should hold a lease alongside its allocator rather than expect the
 /// allocator to account for it.
-pub trait DeviceAllocator: Send + Sync + Debug {
+///
+/// # Why this extends [`Any`]
+///
+/// [`capability_shares_mechanism`](crate::capability::capability_shares_mechanism)
+/// needs each trait-object reference's concrete [`TypeId`](std::any::TypeId)
+/// as well as its data pointer, to reject a composing wrapper whose first
+/// field happens to share its own address (#1186 Phase 2 review, round 3
+/// finding 1). `Any` is a blanket impl for every `'static` type, so this adds
+/// no obligation to any implementation — every existing and future
+/// `DeviceAllocator` already satisfies it.
+pub trait DeviceAllocator: Send + Sync + Debug + Any {
     /// Take `bytes` aligned to `align`.
     fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError>;
 
@@ -177,19 +194,36 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     /// Free an allocation and report bytes whose global mapping reference
     /// count transitioned from one to zero.
     ///
-    /// The default forwards to [`deallocate`](Self::deallocate) and reports
-    /// zero, which is the unambiguously correct answer for any allocator that
-    /// has no [`SharedMapping`] capability: nothing here is ever shared, so
-    /// nothing here can transition a shared mapping's reference count.
+    /// The default forwards to [`deallocate`](Self::deallocate) and then, if
+    /// [`as_shared_mapping`](Self::as_shared_mapping) reports a capability,
+    /// asks it how many of `ptr`'s bytes were backed by a shared-prefix
+    /// mapping — an allocator that can create mapped cost through
+    /// [`SharedMapping::commit_shared_prefix`] must never lose that refund by
+    /// silently inheriting a plain zero the way an eager allocator correctly
+    /// does (#1186 Phase 2 review, round 3 finding 2). It has no
+    /// [`VirtualBacking`] equivalent here on purpose: an allocator with that
+    /// capability instead releases through
+    /// [`VirtualBacking::deallocate_committed`], never through this default —
+    /// see that method's documentation.
+    ///
+    /// This is the unambiguously correct answer for any allocator with
+    /// neither capability: nothing here is ever committed lazily or shared,
+    /// so nothing here can transition a shared mapping's reference count.
     ///
     /// # Safety
     ///
     /// `ptr`, `bytes`, and `align` must identify one live allocation returned
     /// by this allocator, exactly as required by [`DeviceAllocator::deallocate`].
     unsafe fn deallocate_with_unmapped(&self, ptr: NonNull<u8>, bytes: usize, align: usize) -> u64 {
+        let unmapped = self
+            .as_shared_mapping()
+            .map(|shared_mapping| {
+                shared_mapping.allocation_shared_mapped_bytes(ptr, bytes, align)
+            })
+            .unwrap_or(0);
         // SAFETY: forwarded under this method's identical contract.
         unsafe { self.deallocate(ptr, bytes, align) };
-        0
+        unmapped
     }
 
     /// This allocator's lazy commit/decommit capability, if it has one.

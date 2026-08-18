@@ -2272,6 +2272,118 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         );
     }
 
+    /// #1186 Phase 2 review, round 3 finding 1: pointer equality alone is not
+    /// unforgeable. `#[repr(C)]` guarantees a struct's first field starts at
+    /// the struct's own address, so a wrapper that embeds a foreign
+    /// `CudaVmmAllocator` **by value** as its first field and advertises it
+    /// as its `VirtualBacking` produces the exact same address as `&self` —
+    /// the identity check must still reject it. This is the non-vacuous,
+    /// real-type counterpart to the synthetic proof in
+    /// `onnx_runtime_memory_api::capability::tests`.
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn with_memory_rejects_a_foreign_vmm_embedded_at_offset_zero() {
+        // SAFETY: single-process test; ensure VMM is not force-enabled by a
+        // previous test in this binary.
+        unsafe { std::env::remove_var(crate::vmm_allocator::CUDA_VMM_ENV) };
+
+        let Ok(provider) = CudaExecutionProvider::new(0) else {
+            eprintln!(
+                "SKIPPED (no CUDA runtime): the offset-zero identity proof did NOT run."
+            );
+            panic!("CUDA test path did not run; report as a failed GPU test, not a pass");
+        };
+        assert!(
+            provider.vmm.get().is_none(),
+            "this proof requires the plain (non-VMM) construction path"
+        );
+
+        let context = provider.runtime().cuda_context();
+        let base = Arc::new(crate::device_allocator::CudaDeviceAllocator::new(
+            context.clone(),
+        ));
+        let foreign = crate::vmm_allocator::CudaVmmAllocator::standalone(
+            context,
+            onnx_runtime_memory_governor::DeviceKey::device(0),
+            0,
+            64 << 20,
+            onnx_runtime_memory_governor::HolderId::new(1186),
+            onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+        )
+        .expect("a second, unrelated VMM arena over the same device");
+
+        /// `#[repr(C)]` with `foreign` as the first field: `&self` and
+        /// `&self.foreign` are numerically the same address. Ordinary
+        /// allocate/deallocate go through `base`; the advertised
+        /// `VirtualBacking` is the embedded `foreign`, not `self`.
+        #[repr(C)]
+        #[derive(Debug)]
+        struct OffsetZeroWrapper {
+            foreign: crate::vmm_allocator::CudaVmmAllocator,
+            base: Arc<crate::device_allocator::CudaDeviceAllocator>,
+        }
+
+        impl onnx_runtime_memory_governor::DeviceAllocator for OffsetZeroWrapper {
+            fn allocate(
+                &self,
+                bytes: usize,
+                align: usize,
+            ) -> std::result::Result<
+                std::ptr::NonNull<u8>,
+                onnx_runtime_memory_governor::MemoryError,
+            > {
+                self.base.allocate(bytes, align)
+            }
+
+            unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, bytes: usize, align: usize) {
+                // SAFETY: forwarded verbatim; our own caller upholds the same
+                // contract `DeviceAllocator::deallocate` documents.
+                unsafe { self.base.deallocate(ptr, bytes, align) }
+            }
+
+            fn device(&self) -> onnx_runtime_memory_governor::DeviceKey {
+                onnx_runtime_memory_governor::DeviceAllocator::device(self.base.as_ref())
+            }
+
+            fn as_virtual_backing(
+                &self,
+            ) -> Option<&dyn onnx_runtime_memory_governor::VirtualBacking> {
+                // Deliberately the embedded first field, reached through
+                // `self`'s own address, not a separately allocated object.
+                Some(&self.foreign)
+            }
+        }
+
+        let wrapper = OffsetZeroWrapper { foreign, base };
+
+        // Non-vacuous: prove the address collision this test exists to guard
+        // against is real before asserting on the rejection it causes.
+        let wrapper_addr = &wrapper as *const OffsetZeroWrapper as *const ();
+        let foreign_addr = &wrapper.foreign as *const crate::vmm_allocator::CudaVmmAllocator
+            as *const ();
+        assert!(
+            std::ptr::eq(wrapper_addr, foreign_addr),
+            "test setup did not reproduce the offset-zero address collision `#[repr(C)]` is \
+             supposed to guarantee"
+        );
+
+        let composite: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator> = Arc::new(wrapper);
+
+        let error = provider.with_memory(composite).expect_err(
+            "with_memory must reject a foreign VirtualBacking embedded at offset zero even \
+             though its address coincides with the wrapper's own address (#1186 Phase 2 \
+             review, round 3 finding 1)",
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("VirtualBacking capability is not the allocator itself"),
+            "the rejection must name what happened, not just fail: {message}"
+        );
+    }
+
     /// #956 contrast: the default `cuMemAlloc` path makes exactly one driver
     /// allocation per request, so it scales one-for-one with decode steps —
     /// which is the residual the VMM arena removes. Fully isolated (per-instance

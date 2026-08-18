@@ -2131,6 +2131,37 @@ impl SharedMapping for CudaVmmAllocator {
         })
     }
 
+    /// `deallocate_with_unmapped` (the `DeviceAllocator` method) never
+    /// actually reaches this: `as_virtual_backing` is always `Some` for this
+    /// allocator (a VMM arena always separates reservation from commit), so
+    /// release always goes through `VirtualBacking::deallocate_committed`
+    /// (`impl DeviceAllocator for CudaVmmAllocator::deallocate_with_unmapped`
+    /// overrides the base default entirely, above). This exists for a caller
+    /// that reaches release accounting through `as_shared_mapping` directly,
+    /// bypassing that override (#1186 Phase 2 review, round 3 finding 2), and
+    /// for that caller must still answer correctly.
+    ///
+    /// This allocator's granule tracking does not record whether a committed
+    /// granule became committed through an ordinary
+    /// [`commit_allocation_range`](MemoryVirtualBacking::commit_allocation_range)
+    /// or through [`commit_shared_prefix`](Self::commit_shared_prefix) — both
+    /// mark the same granule "committed" in the same span, since either way
+    /// the physical page is mapped and the address range is live. So the
+    /// conservative, always-correct answer for "how many of `ptr`'s bytes did
+    /// a shared mapping contribute" is this allocation's whole committed
+    /// footprint: exactly what `deallocate_committed` would itself report if
+    /// invoked instead, which is what every real caller in this codebase
+    /// does.
+    fn allocation_shared_mapped_bytes(
+        &self,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        align: usize,
+    ) -> u64 {
+        <Self as MemoryVirtualBacking>::allocation_committed_bytes(self, ptr, allocation_bytes, align)
+            as u64
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
