@@ -57,3 +57,17 @@ Diagnostic instrument only: batch-path per-step phase profiler
 
 - #1312 (looped decode GEMV, the pattern this fix mirrors), #1316 (multi-row ceiling probe).
 - Adjacent: the swiglu team's Estrin/capture-safe work in `run_f16_gate_up_swiglu`.
+
+## Input for expert-aware MoE batching (owner request)
+
+The fixed per-step batch cost — the constant a route-aware scheduler must overcome — is
+**~22-24 ms (resident qwen05b-q4)** before the SwiGLU-capture fix, essentially independent of
+batch size M (marginal ~0.4 ms/row). It is **structural (capture segmentation), not diffuse**,
+and the byte-identical fix removes it: after the fix the step is `~1.4 ms fixed + ~1.9 ms/row`.
+
+Disposition for the MoE routing-trace simulation: model per-step batch cost as **~22 ms fixed
+(today) vs ~1.4 ms fixed (fix landed)** and treat "does expert-aware batching pay?" as
+conditional on the fix. Backend-neutral (shared CUDA EP kernel; ORT path inferred, not
+measured). Fix ready on `squad/batch-swiglu-capture-fix`, blocked on the swiglu team's Estrin
+bit-exactness fix + a capture-safe invariant update. Raised priority: this now gates a class of
+MoE serving techniques, not just batch throughput.
