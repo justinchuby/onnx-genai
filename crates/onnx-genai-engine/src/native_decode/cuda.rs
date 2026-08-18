@@ -691,7 +691,7 @@ pub(crate) struct DecodeCudaState {
     kv_committed_len: usize,
     /// Named rationale for the most recent KV-growth capture decision.
     graph_growth_decision: Option<String>,
-    capacity: CudaKvCapacity,
+    pub(crate) capacity: CudaKvCapacity,
     /// The KV bindings reserve their full context address range while the CUDA
     /// VMM allocator maps only the token stripes reached so far.
     kv_commits_on_demand: bool,
@@ -3356,21 +3356,32 @@ impl DecodeCudaState {
             .checked_mul(max_len)
             .and_then(|elements| elements.checked_mul(std::mem::size_of::<i64>()))
             .context("initial CUDA mask size overflow")?;
-        let full_mask_bytes = batch
-            .checked_mul(capacity.max_len)
-            .and_then(|elements| elements.checked_mul(std::mem::size_of::<i64>()))
-            .context("full CUDA mask reservation size overflow")?;
-        // Seq-major fixed stride commits the whole (tiny) mask at construction so
-        // the mask island is shape-static at the hard max and never grows; every
-        // other path commits only the initial mask bucket and grows it in place.
-        let mask_committed_bytes = if seq_major_fixed {
-            full_mask_bytes
-        } else {
-            mask_bytes
-        };
         let mask = if kv_commits_on_demand {
+            // The VMM committed-range binding reserves the full logical mask
+            // island (`batch × capacity.max_len`) up front and commits only the
+            // initial bucket. `capacity.max_len` is `usize::MAX` for a model
+            // with no declared max sequence length (the deliberate "unbounded
+            // until growth fails" sentinel), so this reservation multiply is
+            // only meaningful — and only non-overflowing — when a concrete bound
+            // exists. The non-VMM binding below never reserves the full extent,
+            // so it must not compute this value at all (computing it
+            // unconditionally overflowed and aborted construction for any
+            // metadata-less model even though the non-VMM path never uses it).
+            let full_mask_bytes = batch
+                .checked_mul(capacity.max_len)
+                .and_then(|elements| elements.checked_mul(std::mem::size_of::<i64>()))
+                .context("full CUDA mask reservation size overflow")?;
+            // Seq-major fixed stride commits the whole (tiny) mask at
+            // construction so the mask island is shape-static at the hard max
+            // and never grows; every other path commits only the initial mask
+            // bucket and grows it in place.
+            let mask_committed_bytes = if seq_major_fixed {
+                full_mask_bytes
+            } else {
+                mask_bytes
+            };
             let committed = std::iter::once(0..mask_committed_bytes).collect::<Vec<_>>();
-            session.allocate_device_binding_committed(
+            let binding = session.allocate_device_binding_committed(
                 io.attention_mask,
                 None::<String>,
                 DataType::Int64,
@@ -3378,17 +3389,24 @@ impl DecodeCudaState {
                 vec![batch, max_len],
                 full_mask_bytes,
                 committed,
-            )?
+            )?;
+            native_cuda_memset_zero(binding.device_ptr() as usize, mask_committed_bytes)?;
+            binding
         } else {
-            session.allocate_device_binding(
+            // The non-VMM binding allocates exactly `[batch, max_len]` and never
+            // reserves the full logical extent, so it never touches
+            // `capacity.max_len` (which is `usize::MAX` for a metadata-less
+            // model). Its committed region is the whole `mask_bytes` allocation.
+            let binding = session.allocate_device_binding(
                 io.attention_mask,
                 None::<String>,
                 DataType::Int64,
                 vec![batch, max_len],
                 vec![batch, max_len],
-            )?
+            )?;
+            native_cuda_memset_zero(binding.device_ptr() as usize, mask_bytes)?;
+            binding
         };
-        native_cuda_memset_zero(mask.device_ptr() as usize, mask_committed_bytes)?;
 
         let mut pairs = present_to_past
             .iter()
