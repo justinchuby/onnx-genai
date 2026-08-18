@@ -33,7 +33,7 @@ use super::sdpa::{
     sdpa_decode_row,
 };
 use super::{check_arity, to_dense_i64};
-use crate::dtype::{to_dense_f32_widen, widen_bf16_slice_into, write_dense_f32_narrow};
+use crate::dtype::{to_dense_f32_widen, widen_bf16_slice_quieting_into, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
@@ -897,7 +897,11 @@ impl HalfKv {
     fn widen_into(self, src: &[u16], dst: &mut [f32]) {
         match self {
             HalfKv::F16 => crate::dtype::widen_f16_slice_into(src, dst),
-            HalfKv::Bf16 => crate::dtype::widen_bf16_slice_into(src, dst),
+            // Quieting, not the raw shift: the copy path widens the same cache
+            // through `to_dense_f32_widen` (i.e. `half::bf16::to_f32`), and the
+            // in-place path has to produce identical bits or the two disagree
+            // on signalling NaN.
+            HalfKv::Bf16 => crate::dtype::widen_bf16_slice_quieting_into(src, dst),
         }
     }
 
@@ -952,7 +956,9 @@ impl<'a> PastCache<'a> {
         match &self.src {
             PastSrc::F32(s) => dst.copy_from_slice(&s[start..start + len]),
             PastSrc::F16(s) => crate::dtype::widen_f16_slice_into(&s[start..start + len], dst),
-            PastSrc::Bf16(s) => crate::dtype::widen_bf16_slice_into(&s[start..start + len], dst),
+            PastSrc::Bf16(s) => {
+                crate::dtype::widen_bf16_slice_quieting_into(&s[start..start + len], dst)
+            }
             PastSrc::Dense(s) => dst.copy_from_slice(&s[start..start + len]),
         }
     }
@@ -1046,7 +1052,8 @@ fn widen_rotary_prefix(op: &str, view: &TensorView, rows: usize, half: usize) ->
         // 2-byte elements; BF16 widening is the exact high-half f32 bit shift.
         let src = unsafe { std::slice::from_raw_parts(view.data_ptr::<u16>(), count) };
         let mut dst = vec![0.0f32; count];
-        widen_bf16_slice_into(src, &mut dst);
+        // Quieting, to match the `to_dense_f32_widen` fallback below on sNaN.
+        widen_bf16_slice_quieting_into(src, &mut dst);
         return Ok(dst);
     }
     if view.dtype == onnx_runtime_ir::DataType::Float32 && view.is_contiguous() {
@@ -5050,36 +5057,46 @@ mod tests {
     }
 
     /// The borrowing arm must be bit-identical to the owned path it replaces.
-    /// `widen_run` now dispatches bf16 to `widen_bf16_slice_into`, while the
-    /// old path went through `to_dense_f32_widen`; if those two disagreed on
-    /// any bit pattern the change would silently alter every bf16 decode.
-    /// Sweeps NaN, both infinities, both zeros, subnormals and ordinary values.
+    /// The old path widened through `to_dense_f32_widen`, which reaches
+    /// `half::bf16::to_f32` and therefore *quiets* signalling NaN; the raw
+    /// shift in `widen_bf16_slice_into` does not. Those two spellings differ on
+    /// 126 of the 65536 patterns, so `widen_run` has to use the quieting
+    /// widen or this silently alters every bf16 decode.
+    ///
+    /// Swept exhaustively rather than over a hand-picked sample: an earlier
+    /// version of this test listed one NaN and happened to pick a *quiet* one,
+    /// so it passed against a non-quieting widen. Every pattern, no judgement.
     #[test]
     fn the_bf16_borrowing_arm_widens_bit_identically_to_the_owned_path() {
         use onnx_runtime_ir::DataType;
         let (heads, seq, dim) = (2usize, 4usize, 4usize);
-        let patterns: [u16; 8] = [
-            0x7FC0, // NaN
-            0x7F80, // +inf
-            0xFF80, // -inf
-            0x0000, // +0
-            0x8000, // -0
-            0x0001, // smallest subnormal
-            0x3F80, // 1.0
-            0xC049, // about -3.14
-        ];
-        let bits: Vec<u16> = (0..heads * seq * dim)
-            .map(|i| patterns[i % patterns.len()])
-            .collect();
-        let shape = [1, heads, seq, dim];
+        // 65536 patterns laid out as whole [heads, seq, dim] blocks.
+        let block = heads * seq * dim;
+        let bits: Vec<u16> = (0..=u16::MAX).collect();
+        assert_eq!(bits.len() % block, 0, "sweep must tile the cache geometry");
+        let blocks = bits.len() / block;
+        let shape = [blocks, heads, seq, dim];
         let strides = cache_strides(&shape);
         let view = half_cache_view(&bits, DataType::BFloat16, &shape, &strides);
         let cache = PastCache::from_cache(&view, heads, "past_key").expect("classify cache");
+        assert!(
+            matches!(cache.src, PastSrc::Bf16(_)),
+            "the sweep is only meaningful against the borrowing arm"
+        );
         let owned = to_dense_f32_widen("GroupQueryAttention", &view).expect("owned widen");
 
-        // Walk several offsets and lengths so the run arithmetic is covered too,
-        // not just a single whole-buffer widen.
-        for (start, len) in [(0usize, bits.len()), (0, 1), (3, 5), (dim, dim * 2)] {
+        // Walk several offsets and lengths so the run arithmetic is covered
+        // too, not just a single whole-buffer widen. The odd start/len pairs
+        // straddle the AVX2 8-lane body so the scalar tail is exercised.
+        let n = bits.len();
+        for (start, len) in [
+            (0usize, n),
+            (0, 1),
+            (3, 5),
+            (dim, dim * 2),
+            (7, n - 7),
+            (n - 3, 3),
+        ] {
             let mut got = vec![0f32; len];
             cache.widen_run(start, &mut got);
             for (offset, value) in got.iter().enumerate() {
@@ -5088,8 +5105,10 @@ mod tests {
                     value.to_bits(),
                     expected.to_bits(),
                     "start={start} len={len} offset={offset}: borrowing arm widened \
-                     0x{:04X} to {value} but the owned path gives {expected}",
-                    bits[start + offset]
+                     0x{:04X} to 0x{:08X} but the owned path gives 0x{:08X}",
+                    bits[start + offset],
+                    value.to_bits(),
+                    expected.to_bits()
                 );
             }
         }
