@@ -451,3 +451,105 @@ Speedup **1.62×** end-to-end. Pure-kernel win larger; original PR measured 19.5
 **Verdict: GO.** Byte-identical argmax confirmed across dtype/batch/width on H200.
 Split win is NOT superseded by multi-row rework — they are orthogonal (multi-row
 spreads rows on y-axis; this adds per-row block split). **Merged PR #1306 (9ac981ca).**
+
+---
+
+### 2026-08-18: QMoE decode profiling → block-parallel router TopK (byte-identical +24% on V2-Lite) — GO
+
+**By:** Deckard
+
+**What:** Profiled DeepSeek-V2-Lite int4 QMoE eager decode (H200, PINNED), then
+shipped the highest-leverage byte-identical decode win it surfaced. Branch off
+origin/main (e87af36d): `squad/qmoe-expert-gemv`, PR #1317. Worktree
+`/home/justinchu/wt-qmoe` (NOT /tmp — runtime forbids it). One source file
+changed: `crates/onnx-runtime-ep-cuda/src/kernels/topk.rs` (+ its
+`indexing_gpu.rs` test).
+
+**Profile table (nsys, cuda_gpu_kern_sum, eager, 48 tok, GPU3):**
+| kernel | % GPU | avg |
+|---|---|---|
+| topk_f32 (MoE router select) | **28.4%** | 81.7 µs/layer |
+| qmoe_gate_up_activate_f32 | 14.8% | 42.7 µs |
+| matmul_nbits_gemv (attn/dense) | 13.3% | 5.2 µs |
+| qmoe_linear_f32 | 10.0% | 28.7 µs |
+| attention_row | 8.9% | 24.7 µs |
+| qmoe_route / qmoe_combine | 2.3% / 0.7% | — |
+
+QMoE expert-GEMV (gate_up+linear+route+combine) ≈ 27.8% GPU → a real hotspot
+(NOT a NO-GO-not-a-hotspot). BUT the single biggest kernel is the router `TopK`.
+Root cause: at decode a MoE router `TopK` is `[1,1,64]` → `slices==1`, and the
+one-thread-per-slice `topk_*` kernel runs the whole top-6-of-64 selection on a
+SINGLE thread (serial dependent global loads). That is both the #1 cost and the
+cleanest byte-identical lever, so I optimized it.
+
+**What I did:** added a block-per-slice `topk_block_*` kernel; the launcher
+dispatches under-saturated shapes (`slices <= SM count`, i.e. decode) to it and
+leaves the wide/prefill one-thread-per-slice path untouched (no-regression by
+construction). Top-k selection is exact (integer-keyed compare, lower-index
+tie-break); the tree reduction preserves the same `before` total order → the
+output is byte-identical.
+
+**Numerics gate — byte-identical (PASS):**
+- Router `topk_deepseek_router_k6_of_64` (ties→lowest index) + 256-expert fp16
+  router-scale test now run on the block path and still match the CPU oracle.
+- New `topk_block_decode_path_is_byte_identical_to_cpu_oracle` (tie-dense
+  f32/fp16/bf16 decode shape) locks block == CPU oracle.
+- Full `indexing_gpu`: 16/16 pass (incl. capture-safety test).
+- **V2-Lite native-CUDA golden decode lock** passes unchanged
+  (`deepseek_v2_lite_native_cuda_matches_golden_greedy_sequence`, post434 export).
+- End-to-end 128-token stream identical before/after in BOTH eager and capture.
+
+**Perf A/B — H200, GPU3 PINNED, 128 tok, medians of 5 (PASS):**
+- Router TopK kernel: 81.7 µs → 9.73 µs/layer (**8.4×**); 28.4% → 4.5% of GPU.
+- Production capture decode: **101.17 → 125.68 tok/s (+24.2%, 1.24×)**,
+  9.884 → 7.957 ms/tok. Baseline matches historical 101.68 tok/s. Variance tight
+  (±0.1 tok/s within each arm). No prefill regression (dispatch only diverts
+  under-saturated slice counts).
+
+**Verdict: GO.** Byte-identical greedy decode confirmed (kernel oracle tests +
+V2-Lite golden lock + 128-tok E2E identity) AND a large positive delta on H200
+(+24% capture tok/s). After this, `qmoe_gate_up_activate` is the new #1 kernel
+(19.8%) — the QMoE int4 expert GEMV is the natural next lever. **Merged PR #1317.**
+
+---
+
+### 2026-08-18: QMoE gate_up_activate expert GEMV — occupancy default-on + selective read-only-cache int4 loads (+2.2% V2-Lite decode, byte-identical) — GO
+
+**By:** Deckard
+
+**What:**
+Optimized `qmoe_gate_up_activate_f32` (fused SwiGLU gate/up int4 expert GEMV), the
+#1 decode kernel on DeepSeek-V2-Lite int4 QMoE (19.8% of GPU decode after the
+#1317 TopK win). Two byte-identical levers in
+`crates/onnx-runtime-ep-cuda/src/kernels/qmoe.rs`:
+
+1. Flipped the occupancy-raised `_occ` entry (`__launch_bounds__(256, 6)`) from
+   DEFAULT-OFF to DEFAULT-ON. Opt out via `ONNX_GENAI_QMOE_OCC=0/false/off`.
+2. Added a `ReadOnly` template param routing packed weights/scales/zero-points
+   through the read-only data cache (`__ldg`), scoped ON only for the fused gate/up
+   path (fc2 keeps default cached loads — blanket `__ldg` on shared helper
+   regressed fc2 +14.6%; selective scope captures gate/up win flat on linear).
+
+Shipped as PR #1323 off origin/main @ 1660cff6.
+
+**Why:** gate_up is Long-Scoreboard bound on int4 weight-load latency (ncu: DRAM
+9.1%, 50% theo occupancy), so latency-hiding — not bandwidth — is the lever.
+`__launch_bounds__` raises resident warps; `__ldg` cuts per-load latency. Both load
+identical bytes in the same accumulate order → bit-identical fp32 partials.
+
+**Profile after (nsys, H200, eager, pinned):**
+- qmoe_gate_up_activate_f32: 42.68 µs → 34.24 µs (−19.8%)
+- qmoe_linear_f32: 28.79 µs → 28.77 µs (~0, no collateral regression)
+
+**Byte-identity result:**
+- V2-Lite native-CUDA golden decode lock: BYTE-IDENTICAL greedy sequence.
+- `qmoe_occ_is_bit_identical`: 0 differing bits (fp16/bf16/fp32 × rows ∈ {1,4,6,8}).
+- 32/32 `qmoe_gpu` tests pass.
+
+**H200 A/B (capture, 128 tok, medians of 5, PINNED):**
+- Baseline: median 124.98 tok/s
+- This PR: median 127.77 tok/s → **+2.23% V2-Lite decode.**
+
+**Verdict: GO.** Byte-identical + real positive delta. Selective `ReadOnly` scoping
+is a standing lesson: profile the helper's callers separately before applying
+cache hints uniformly. **Merged PR #1323.**
