@@ -10,8 +10,9 @@ use super::*;
 
 #[test]
 fn phase_profile_gating_and_accumulation() {
-    // Single test (not two) so the process-global enable flag is never
-    // toggled concurrently by a sibling test under the parallel runner.
+    // The process-global gates have no per-test isolation, so every test that
+    // writes them takes this lock.
+    let _globals = phase_profile::globals_lock();
 
     // Disabled: a span records nothing and never captures a timestamp.
     phase_profile::force_enabled(false);
@@ -54,8 +55,40 @@ fn phase_profile_gating_and_accumulation() {
         "reset must clear this test's accumulated phase stats"
     );
 
+    // Turning on phase profiling must **not** turn on the activation-memory
+    // planner. The planner re-plans every activation on every run - work the
+    // shipped runtime never does - so while `--phase-profile` enabled it the
+    // profiler perturbed the run it was measuring, by about 3% on a softmax
+    // decode, and reported its own cost back as a phase of that run.
+    //
+    // The two gates are separate on purpose: `enable_for_process` (what
+    // `--phase-profile` calls) drives only the profiler, while the planner
+    // reads the environment. Asserted here rather than in a sibling test so
+    // the process-global enable flag stays owned by this one test, per the
+    // note at the top. Skipped when the environment already asks for planning,
+    // because then the separation is not observable.
+    let env_requests_planning = ["NXRT_ACTIVATION_MEMORY_PLAN", "NXRT_EXEC_PHASE_PROFILE"]
+        .iter()
+        .any(|key| std::env::var(key).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")));
+    if !env_requests_planning {
+        phase_profile::force_activation_plan_enabled(false);
+        phase_profile::enable_for_process();
+        assert!(phase_profile::enabled());
+        assert!(
+            !phase_profile::activation_plan_enabled(),
+            "phase profiling must not drag the activation-memory planner in \
+             with it: the planner costs about a third of a small run and would \
+             be charged to the run it is supposed to be measuring"
+        );
+        // The explicit opt-in still works, so the capability is decoupled from
+        // phase profiling rather than lost.
+        phase_profile::enable_activation_plan_for_process();
+        assert!(phase_profile::activation_plan_enabled());
+    }
+
     // Restore the default (disabled) state so other tests stay inert.
     phase_profile::force_enabled(false);
+    phase_profile::force_activation_plan_enabled(false);
 }
 
 // A produced top-level output is handed to the caller by moving its host
@@ -471,6 +504,13 @@ fn compute_in_place_multilayer_decode_residual_is_byte_identical_and_fires() {
 
 #[test]
 fn activation_memory_planner_reports_static_decode_graph_savings() {
+    // The planner is off by default, in tests as in production, so a test that
+    // needs its stats asks for them explicitly. The guard takes the globals
+    // lock (the gate is a process-global atomic) and clears the gate again on
+    // drop, including on panic - leaving it set would let a reader test that
+    // does not take the lock observe a planner this test switched on.
+    let _planner = phase_profile::ActivationPlanForTest::on();
+
     let values = Tensor::from_f32(&[4], &[-2.0, -0.5, 0.5, 2.0]).unwrap();
     let weights = Arc::new(WeightStore::new());
     let ep = auto_detect_cpu_ep().unwrap();
@@ -493,6 +533,13 @@ fn activation_memory_planner_reports_static_decode_graph_savings() {
 
 #[test]
 fn activation_memory_planner_uses_runtime_view_edges() {
+    // The planner is off by default, in tests as in production, so a test that
+    // needs its stats asks for them explicitly. The guard takes the globals
+    // lock (the gate is a process-global atomic) and clears the gate again on
+    // drop, including on panic - leaving it set would let a reader test that
+    // does not take the lock observe a planner this test switched on.
+    let _planner = phase_profile::ActivationPlanForTest::on();
+
     let values = Tensor::from_f32(&[4], &[-2.0, -0.5, 0.5, 2.0]).unwrap();
     let weights = Arc::new(WeightStore::new());
     let ep = auto_detect_cpu_ep().unwrap();
@@ -2972,6 +3019,112 @@ fn inference_session_fallback_workspace_grows_retries_and_reuses() {
     assert_eq!(reused.buffer.as_ptr(), ptr);
 }
 
+/// #1223: a *prepared* session must re-prepare its governed workspace when
+/// execution rebuckets to a larger shape bucket than preparation reserved for.
+///
+/// Preparation reserves one governed-workspace slot per lifetime class from the
+/// shapes it is handed, and — so a captured device graph can bake a stable
+/// pointer — a prepared session otherwise refuses to (re)allocate at execution
+/// time. That invariant only holds *within* one shape bucket. When decode grows
+/// past a bucket edge (or a prompt lands in a different bucket than its decode
+/// steps), the slot reserved under the old bucket's geometry can be undersized
+/// for the new one. Before the fix, the larger bucket failed the prepared-
+/// workspace invariant with "workspace invariant mismatch"; #1221 fixed the same
+/// failure mode *in-bucket* for `Attention` but scoped the cross-bucket case out.
+///
+/// This drives the exact gap on the executor's shared workspace path (not any
+/// one op-type): reserve a `SessionPersistent` per-row slot for a 2-row bucket,
+/// then execute a 4-row bucket. The rebucket lands on an eager dispatch (as it
+/// does on the real growing-KV decode path, which declines capture, and on the
+/// eager re-warm a capture-eligible model runs after a KV-growth graph
+/// invalidation), so the slot is re-prepared in place. Reverting the fix makes
+/// the 4-row execute fail with "workspace invariant mismatch".
+#[test]
+fn prepared_session_reprepares_workspace_when_execution_rebuckets() {
+    let mut graph = Graph::new();
+    graph
+        .opset_imports
+        .insert(onnx_runtime_ir::RUNTIME_DOMAIN.into(), 1);
+    let rows = SymbolId(0);
+    let shape = vec![Dim::Symbolic(rows)];
+    let input = graph.create_named_value("input", DataType::Float32, shape.clone());
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, shape);
+    graph.add_output(output);
+    let mut node = Node::new(
+        NodeId(0),
+        "BlockQuantizedMoE",
+        vec![Some(input)],
+        vec![output],
+    );
+    node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+    graph.insert_node(node);
+
+    let inputs = crate::io_meta(&graph, &graph.inputs);
+    let outputs = crate::io_meta(&graph, &graph.outputs);
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ep = WeightDeliveryEp::new(false, deliveries);
+    ep.workspace_bytes_per_row = 1024;
+    let exec = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let mut session = crate::InferenceSession {
+        inputs,
+        outputs,
+        model_metadata: crate::ModelMetadata::default(),
+        exec,
+        decode_inline_exec: None,
+        ep_context_config: crate::EpContextDumpConfig::default(),
+    };
+
+    // Bucket A: preparation reserves the SessionPersistent slot for a 2-row
+    // shape and latches "workspace preparation required", so execution may no
+    // longer lazily grow the slot within this bucket.
+    let bucket_a = Tensor::from_f32(&[2], &[1.0, 2.0]).unwrap();
+    session
+        .exec
+        .prepare_with_device_bindings(&[("input", &bucket_a)], &mut [])
+        .unwrap();
+    let reserved = session.exec.persistent_workspace.as_ref().unwrap();
+    assert_eq!(reserved.bytes, 2048);
+    assert_eq!(reserved.alignment, 256);
+    assert!(
+        session.exec.workspace_preparation_required,
+        "prepare must latch the prepared-workspace invariant"
+    );
+
+    // In-bucket execution still fits under the reservation.
+    assert_eq!(
+        session.run(&[("input", &bucket_a)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0]
+    );
+
+    // Bucket B: a larger bucket needs 4096 bytes at a tighter alignment than the
+    // 2-row reservation. Without the #1223 fix this eager rebucket dispatch
+    // fails the prepared-workspace invariant; with it, preparation is re-run in
+    // place and the slot grows.
+    let bucket_b = Tensor::from_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    assert_eq!(
+        session.run(&[("input", &bucket_b)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    let grown = session.exec.persistent_workspace.as_ref().unwrap();
+    assert_eq!(grown.bytes, 4096);
+    assert_eq!(grown.alignment, 512);
+    assert!(
+        session.exec.workspace_preparation_required,
+        "re-preparing on rebucket must not drop the prepared-workspace invariant"
+    );
+
+    // Rebucketing back down reuses the grown slot (a slot only ever grows).
+    assert_eq!(
+        session.run(&[("input", &bucket_a)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0]
+    );
+    assert_eq!(
+        session.exec.persistent_workspace.as_ref().unwrap().bytes,
+        4096
+    );
+}
+
 fn two_node_weight_delivery_fixture() -> (Graph, Arc<WeightStore>, std::path::PathBuf) {
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
     let root = std::env::var_os("CARGO_TARGET_DIR")
@@ -3646,6 +3799,168 @@ fn checked_storage_bytes_detects_byte_overflow() {
         checked_storage_bytes(DataType::Float32, 4, || "v".into(), &[4]).unwrap(),
         16
     );
+}
+
+#[test]
+fn dynamic_output_shapes_compress_counts_selected_values() {
+    use onnx_runtime_ir::Attribute;
+
+    let mut axis_node = Node::new(NodeId(0), "Compress", vec![], vec![]);
+    axis_node
+        .attributes
+        .insert("axis".into(), Attribute::Int(-1));
+    assert_eq!(
+        dynamic_output_shapes(
+            &axis_node,
+            &[vec![2, 4], vec![5]],
+            &[DataType::Float32, DataType::Bool],
+            &[None, Some(vec![1, 0, 1, 1, 1])],
+            &[],
+            11,
+        ),
+        Some(vec![vec![2, 3]]),
+        "condition entries beyond the selected axis must be ignored"
+    );
+
+    let flat_node = Node::new(NodeId(1), "Compress", vec![], vec![]);
+    assert_eq!(
+        dynamic_output_shapes(
+            &flat_node,
+            &[vec![2, 3], vec![4]],
+            &[DataType::Float32, DataType::Bool],
+            &[None, Some(vec![0, 1, 1, 0])],
+            &[],
+            11,
+        ),
+        Some(vec![vec![2]])
+    );
+}
+
+#[test]
+fn compress_condition_allows_image_sized_boolean_vectors() {
+    let image_condition = MAX_SHAPE_DATA_ELEMS + 1;
+    assert!(bounded_compress_condition(
+        DataType::Bool,
+        &[image_condition]
+    ));
+    assert!(!bounded_shape_input(DataType::Bool, &[image_condition]));
+    assert!(!bounded_compress_condition(
+        DataType::Int64,
+        &[image_condition]
+    ));
+    assert!(!bounded_compress_condition(
+        DataType::Bool,
+        &[(1 << 20) + 1]
+    ));
+}
+
+/// #1195 behavioural falsification. A `Compress` whose boolean condition is
+/// longer than `MAX_SHAPE_DATA_ELEMS` (an image-sized mask) must still resolve
+/// its data-dependent output shape and run to completion. Before the fix the
+/// condition was rejected by the ordinary shape-data bound, so
+/// `resolve_node_outputs` handed `dynamic_output_shapes` a `None` condition and
+/// the run failed with `UnresolvedShape { op: "Compress" }`. Reverting the
+/// dispatch routing (`compress_condition_i64` for `Compress` input 1 back to
+/// `shape_input_i64`) makes this test go RED, while the shipped predicate-only
+/// test stays green. The empty/full cases also cover the all-false and all-true
+/// condition boundaries through the real resolve + kernel path.
+#[test]
+fn compress_runs_with_image_sized_condition_including_empty_and_full() {
+    use onnx_runtime_ir::{Attribute, TensorData};
+
+    let n = MAX_SHAPE_DATA_ELEMS + 500; // 1524: past the shape-data bound, under 1<<20.
+    assert!(n > MAX_SHAPE_DATA_ELEMS);
+
+    // (selected indices, expected output length)
+    let scenarios: Vec<(Vec<usize>, usize)> = vec![
+        (vec![0, 7, n - 1], 3), // sparse selection spanning the ends
+        (Vec::new(), 0),        // all-false -> empty output
+        ((0..n).collect(), n),  // all-true  -> full output
+    ];
+
+    for (selected, expected_len) in scenarios {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+
+        let x = graph.create_named_value("x", DataType::Float32, static_shape([n]));
+        graph.add_input(x);
+
+        let mut cond_bytes = vec![0u8; n];
+        for &i in &selected {
+            cond_bytes[i] = 1;
+        }
+        let cond = graph.create_named_value("cond", DataType::Bool, static_shape([n]));
+        graph.set_initializer(
+            cond,
+            WeightRef::Inline(TensorData::from_raw(DataType::Bool, vec![n], cond_bytes)),
+        );
+
+        // A symbolic output extent keeps the shape unresolved after static
+        // inference, so the data-dependent resolve path (and the #1195 routing)
+        // is the only thing that can size the output.
+        let extent = graph.create_symbol(None);
+        let y = graph.create_named_value("y", DataType::Float32, vec![Dim::Symbolic(extent)]);
+        let mut node = Node::new(NodeId(0), "Compress", vec![Some(x), Some(cond)], vec![y]);
+        node.attributes.insert("axis".into(), Attribute::Int(0));
+        graph.insert_node(node);
+        graph.add_output(y);
+
+        let mut executor = Executor::build(
+            graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+
+        let x_data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let x_val = Tensor::from_f32(&[n], &x_data).unwrap();
+        let outputs = executor
+            .run(&[("x", &x_val)])
+            .expect("an image-sized Compress condition must resolve its output shape");
+        let out = outputs[0].to_vec_f32();
+        assert_eq!(
+            out.len(),
+            expected_len,
+            "selected count must set the Compress output extent"
+        );
+        let expected: Vec<f32> = selected.iter().map(|&i| i as f32).collect();
+        assert_eq!(
+            out, expected,
+            "Compress must gather exactly the selected rows"
+        );
+    }
+}
+
+/// Boundary behaviour of the Compress output-extent count that the #1195 sizer
+/// feeds an image-sized condition into: the count clamps to the axis length when
+/// the condition is longer, counts only the provided entries when it is shorter,
+/// and spans the empty (all-false) and full (all-true) ends.
+#[test]
+fn dynamic_output_shapes_compress_boundary_counts() {
+    use onnx_runtime_ir::Attribute;
+
+    let mut node = Node::new(NodeId(0), "Compress", vec![], vec![]);
+    node.attributes.insert("axis".into(), Attribute::Int(0));
+
+    let count = |cond: Vec<i64>, axis_dim: usize| {
+        dynamic_output_shapes(
+            &node,
+            &[vec![axis_dim], vec![cond.len()]],
+            &[DataType::Float32, DataType::Bool],
+            &[None, Some(cond)],
+            &[],
+            17,
+        )
+    };
+
+    // Condition longer than the axis: entries past the axis length are ignored.
+    assert_eq!(count(vec![1, 1, 1, 1, 1], 3), Some(vec![vec![3]]));
+    // Condition shorter than the axis: only the provided entries are counted.
+    assert_eq!(count(vec![1, 0, 1], 6), Some(vec![vec![2]]));
+    // All-false selects nothing: an empty output extent.
+    assert_eq!(count(vec![0, 0, 0, 0], 4), Some(vec![vec![0]]));
+    // All-true selects the whole axis.
+    assert_eq!(count(vec![1, 1, 1, 1], 4), Some(vec![vec![4]]));
 }
 
 /// The data-dependent shape sizer must return exactly one shape per output

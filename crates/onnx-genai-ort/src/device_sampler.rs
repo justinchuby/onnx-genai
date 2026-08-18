@@ -101,7 +101,7 @@ pub(crate) trait DeviceSampler: Send {
 
 /// Threads per block. One block reduces the whole row via a grid-stride loop
 /// then a shared-memory tree reduction, so this is also the shared-array width.
-const BLOCK: u32 = 1024;
+pub(crate) const BLOCK: u32 = 1024;
 
 /// Whether to issue a device-wide `cuCtxSynchronize` before reading the logits.
 /// ORT's built-in CUDA EP synchronizes its compute stream at the end of each
@@ -127,7 +127,7 @@ fn ctx_sync_enabled() -> bool {
 /// breaking ties toward the lowest index, writing index 0 when nothing is valid.
 /// Handling `rows > 1` lets speculative decoding argmax every verified position
 /// (`logits [1, N, vocab]`) in a single launch, not just the final token.
-const ARGMAX_SRC: &str = r#"
+pub(crate) const ARGMAX_SRC: &str = r#"
 #define BLOCK 1024
 
 // binary16 -> f32 via pure integer bit math (no <cuda_fp16.h> dependency).
@@ -180,6 +180,128 @@ __device__ __forceinline__ void block_reduce_argmax(float best, int bidx, int* o
     }
     if (tid == 0) {
         out[row] = (sidx[0] == 0x7fffffff) ? 0 : sidx[0];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Split (two-stage) argmax.
+//
+// The single-launch kernels above give each row exactly one block, so one row's
+// reduction reads the whole row through one SM. For decode-sized vocabularies
+// (2e5 logits = 0.8 MB) that caps the scan at a single SM's read bandwidth. The
+// kernels below split each row across `parts` blocks, reduce each part to one
+// (value, index) pair, and join the pairs in a second launch. The combine rule
+// is bit-identical to `block_reduce_argmax` (NaN never enters, ties resolve to
+// the lowest index, an all-NaN/empty row yields index 0), so the split path is
+// an exact drop-in for the single-launch path.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ void warp_reduce_argmax(float& v, int& i) {
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_down_sync(0xffffffffu, v, off);
+        int   oi = __shfl_down_sync(0xffffffffu, i, off);
+        if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
+    }
+}
+
+// Reduce one block's (value, index) candidates and write the winner to
+// `*oval` / `*oidx`. Warp shuffles first, then a single warp joins the
+// per-warp winners: 6 reduction steps instead of the 10 shared-memory
+// rounds of `block_reduce_argmax`.
+__device__ __forceinline__ void block_reduce_pair(float v, int i, float* oval, int* oidx) {
+    __shared__ float sv[BLOCK / 32];
+    __shared__ int   si[BLOCK / 32];
+    const float NEG_INF = __int_as_float(0xff800000);
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    warp_reduce_argmax(v, i);
+    if (lane == 0) { sv[warp] = v; si[warp] = i; }
+    __syncthreads();
+    if (warp == 0) {
+        int warps = (int)(blockDim.x >> 5);
+        v = (lane < warps) ? sv[lane] : NEG_INF;
+        i = (lane < warps) ? si[lane] : 0x7fffffff;
+        warp_reduce_argmax(v, i);
+        if (lane == 0) { *oval = v; *oidx = i; }
+    }
+}
+
+// `blockIdx.x` selects the part, `blockIdx.y` the row. Each block strides its
+// row with `parts * BLOCK`, starting at `part * BLOCK + threadIdx.x`, so the
+// whole grid walks the row in fully coalesced order.
+#define SPLIT_BODY(CONV, T)                                                        \
+    int row  = blockIdx.y;                                                         \
+    int part = blockIdx.x;                                                         \
+    if (row >= rows) return;                                                       \
+    const T* r = x + (size_t)row * (size_t)vocab;                                  \
+    const float NEG_INF = __int_as_float(0xff800000);                              \
+    float best = NEG_INF;                                                          \
+    int   bidx = 0x7fffffff;                                                       \
+    int stride = parts * BLOCK;                                                    \
+    for (int i = part * BLOCK + threadIdx.x; i < vocab; i += stride) {             \
+        float v = CONV(r[i]);                                                      \
+        if (v == v && (v > best || (v == best && i < bidx))) { best = v; bidx = i; }\
+    }                                                                              \
+    block_reduce_pair(best, bidx, &pval[row * parts + part], &pidx[row * parts + part]);
+
+#define IDENT(v) (v)
+
+extern "C" __global__ void argmax_part_f16(const unsigned short* x, int rows, int vocab,
+                                           int parts, float* pval, int* pidx) {
+    SPLIT_BODY(h2f, unsigned short)
+}
+
+extern "C" __global__ void argmax_part_bf16(const unsigned short* x, int rows, int vocab,
+                                            int parts, float* pval, int* pidx) {
+    SPLIT_BODY(bf2f, unsigned short)
+}
+
+extern "C" __global__ void argmax_part_f32(const float* x, int rows, int vocab,
+                                           int parts, float* pval, int* pidx) {
+    SPLIT_BODY(IDENT, float)
+}
+
+// As `argmax_join`, but writing ONNX ArgMax's `int64` output type.
+extern "C" __global__ void argmax_join_i64(const float* pval, const int* pidx,
+                                           int rows, int parts, long long* out) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const float NEG_INF = __int_as_float(0xff800000);
+    float best = NEG_INF;
+    int   bidx = 0x7fffffff;
+    for (int p = threadIdx.x; p < parts; p += BLOCK) {
+        float v = pval[row * parts + p];
+        int   i = pidx[row * parts + p];
+        if (i != 0x7fffffff && (v > best || (v == best && i < bidx))) { best = v; bidx = i; }
+    }
+    __shared__ float ov;
+    __shared__ int   oi;
+    block_reduce_pair(best, bidx, &ov, &oi);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        out[row] = (oi == 0x7fffffff) ? 0LL : (long long)oi;
+    }
+}
+
+// One block per row joins that row's `parts` partial winners.
+extern "C" __global__ void argmax_join(const float* pval, const int* pidx,
+                                       int rows, int parts, int* out) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const float NEG_INF = __int_as_float(0xff800000);
+    float best = NEG_INF;
+    int   bidx = 0x7fffffff;
+    for (int p = threadIdx.x; p < parts; p += BLOCK) {
+        float v = pval[row * parts + p];
+        int   i = pidx[row * parts + p];
+        if (i != 0x7fffffff && (v > best || (v == best && i < bidx))) { best = v; bidx = i; }
+    }
+    __shared__ float ov;
+    __shared__ int   oi;
+    block_reduce_pair(best, bidx, &ov, &oi);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        out[row] = (oi == 0x7fffffff) ? 0 : oi;
     }
 }
 
@@ -550,6 +672,13 @@ pub(crate) struct CudaSampler {
     f_sample_f16: CudaFunction,
     f_sample_bf16: CudaFunction,
     f_sample_f32: CudaFunction,
+    /// Split (two-stage) argmax entry points: per-part reduction plus the join.
+    /// Used instead of `f_*` whenever a row is wide enough that a single block
+    /// would bottleneck on one SM's read bandwidth (see [`argmax_parts`]).
+    f_part_f16: CudaFunction,
+    f_part_bf16: CudaFunction,
+    f_part_f32: CudaFunction,
+    f_join: CudaFunction,
     /// Reused device scratch holding one `i32` winning index per row. Guarded by
     /// `lock`; grown on demand for wider speculative-verification launches.
     out: Mutex<OutScratch>,
@@ -557,6 +686,38 @@ pub(crate) struct CudaSampler {
     /// pipeline to hold the intermediate scaled logits / probabilities. Grown on
     /// demand; guarded by its own `Mutex` (always locked after `out`).
     work: Mutex<WorkScratch>,
+    /// Reused device scratch holding the split argmax's `rows * parts` partial
+    /// `(value, index)` pairs. Guarded by its own `Mutex` (locked after `out`).
+    parts: Mutex<PartScratch>,
+}
+
+/// Number of blocks the split argmax spreads one row over.
+///
+/// Zero means "row is too narrow to be worth splitting" and the caller uses the
+/// single-launch kernel. Otherwise each block handles `>= ELEMS_PER_THREAD`
+/// elements per thread, capped at [`MAX_PARTS`] so the join stays a single
+/// block, and clamped so no block would run empty.
+pub(crate) fn argmax_parts(vocab: usize) -> usize {
+    const ELEMS_PER_THREAD: usize = 2;
+    let per_block = BLOCK as usize * ELEMS_PER_THREAD;
+    if vocab <= per_block {
+        return 0;
+    }
+    vocab.div_ceil(per_block).min(MAX_PARTS)
+}
+
+/// Cap on split parts per row. The join kernel is a single block of [`BLOCK`]
+/// threads, so any cap `<= BLOCK` keeps the join to one shared reduction.
+const MAX_PARTS: usize = 256;
+
+/// Growable device scratch for the split argmax's partial `(value, index)` pairs.
+///
+/// One allocation holds `cap` f32 values followed by `cap` i32 indices, so a
+/// single `malloc`/`free` covers both halves and they stay mutually aligned.
+struct PartScratch {
+    ptr: CUdeviceptr,
+    /// Capacity in pairs.
+    cap: usize,
 }
 
 /// Growable device scratch for the per-row argmax indices.
@@ -587,17 +748,12 @@ impl CudaSampler {
             .map_err(|e| OrtError::Cuda(format!("CudaContext::new({ordinal}): {e:?}")))?;
         let stream = ctx.default_stream();
 
-        // Target the device's own compute capability so the PTX matches.
-        let arch = compute_arch(&ctx)?;
-        let opts = cudarc::nvrtc::CompileOptions {
-            options: vec![format!("--gpu-architecture={arch}")],
-            ..Default::default()
-        };
-        let ptx = cudarc::nvrtc::compile_ptx_with_opts(ARGMAX_SRC, opts)
-            .map_err(|e| OrtError::Cuda(format!("NVRTC compile argmax: {e:?}")))?;
-        let module = ctx
-            .load_module(ptx)
-            .map_err(|e| OrtError::Cuda(format!("load argmax module: {e:?}")))?;
+        // Build and load device code the *driver* can actually accept. See
+        // `load_kernels_for_device`: real-architecture SASS when this NVRTC can
+        // emit it and the driver's CUDA major will load it, otherwise PTX when
+        // this NVRTC's ISA is one the driver can JIT.
+        let capability = compute_capability(&ctx)?;
+        let module = load_kernels_for_device(&ctx, ARGMAX_SRC, "argmax", capability)?;
         let f_f16 = module
             .load_function("argmax_f16")
             .map_err(|e| OrtError::Cuda(format!("load argmax_f16: {e:?}")))?;
@@ -607,17 +763,21 @@ impl CudaSampler {
         let f_f32 = module
             .load_function("argmax_f32")
             .map_err(|e| OrtError::Cuda(format!("load argmax_f32: {e:?}")))?;
+        let f_part_f16 = module
+            .load_function("argmax_part_f16")
+            .map_err(|e| OrtError::Cuda(format!("load argmax_part_f16: {e:?}")))?;
+        let f_part_bf16 = module
+            .load_function("argmax_part_bf16")
+            .map_err(|e| OrtError::Cuda(format!("load argmax_part_bf16: {e:?}")))?;
+        let f_part_f32 = module
+            .load_function("argmax_part_f32")
+            .map_err(|e| OrtError::Cuda(format!("load argmax_part_f32: {e:?}")))?;
+        let f_join = module
+            .load_function("argmax_join")
+            .map_err(|e| OrtError::Cuda(format!("load argmax_join: {e:?}")))?;
 
         // Second module: the non-greedy sampling pipeline.
-        let sample_opts = cudarc::nvrtc::CompileOptions {
-            options: vec![format!("--gpu-architecture={arch}")],
-            ..Default::default()
-        };
-        let sample_ptx = cudarc::nvrtc::compile_ptx_with_opts(SAMPLE_SRC, sample_opts)
-            .map_err(|e| OrtError::Cuda(format!("NVRTC compile sample: {e:?}")))?;
-        let sample_module = ctx
-            .load_module(sample_ptx)
-            .map_err(|e| OrtError::Cuda(format!("load sample module: {e:?}")))?;
+        let sample_module = load_kernels_for_device(&ctx, SAMPLE_SRC, "sample", capability)?;
         let f_sample_f16 = sample_module
             .load_function("sample_f16")
             .map_err(|e| OrtError::Cuda(format!("load sample_f16: {e:?}")))?;
@@ -635,6 +795,9 @@ impl CudaSampler {
         // SAFETY: same context; freed in `Drop`. Grown on first non-greedy call.
         let work_ptr = unsafe { cudarc::driver::result::malloc_sync(4) }
             .map_err(|e| OrtError::Cuda(format!("alloc sample scratch: {e:?}")))?;
+        // SAFETY: same context; freed in `Drop`. Grown on the first split argmax.
+        let part_ptr = unsafe { cudarc::driver::result::malloc_sync(8) }
+            .map_err(|e| OrtError::Cuda(format!("alloc argmax part scratch: {e:?}")))?;
 
         Ok(Self {
             ctx,
@@ -645,9 +808,17 @@ impl CudaSampler {
             f_sample_f16,
             f_sample_bf16,
             f_sample_f32,
+            f_part_f16,
+            f_part_bf16,
+            f_part_f32,
+            f_join,
             out: Mutex::new(OutScratch { ptr, cap: 1 }),
             work: Mutex::new(WorkScratch {
                 ptr: work_ptr,
+                cap: 1,
+            }),
+            parts: Mutex::new(PartScratch {
+                ptr: part_ptr,
                 cap: 1,
             }),
         })
@@ -668,7 +839,7 @@ impl CudaSampler {
         vocab: usize,
     ) -> Result<Vec<u32>> {
         let mut idx = vec![0i32; rows];
-        self.argmax_into(dtype, ptr_addr, rows, vocab, &mut idx)?;
+        self.argmax_into(dtype, ptr_addr, rows, vocab, &mut idx, None)?;
         Ok(idx.into_iter().map(|v| v as u32).collect())
     }
 
@@ -683,6 +854,7 @@ impl CudaSampler {
         rows: usize,
         vocab: usize,
         out_idx: &mut [i32],
+        parts_override: Option<usize>,
     ) -> Result<()> {
         if rows == 0 {
             return Ok(());
@@ -718,18 +890,74 @@ impl CudaSampler {
             .map_err(|_| OrtError::Cuda(format!("row count {rows} exceeds i32")))?;
         let vocab_i = i32::try_from(vocab)
             .map_err(|_| OrtError::Cuda(format!("vocab {vocab} exceeds i32")))?;
-        let cfg = LaunchConfig {
-            grid_dim: (rows_i as u32, 1, 1),
-            block_dim: (BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut builder = self.stream.launch_builder(func);
-        builder.arg(&x_ptr).arg(&rows_i).arg(&vocab_i).arg(&out.ptr);
-        // SAFETY: `func` is the compiled argmax entry; the argument list matches
-        // its (const T*, int, int, int*) signature; `x_ptr` is a live device
-        // buffer of `rows * vocab` elements and `out.ptr` holds `rows` i32 slots.
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| OrtError::Cuda(format!("launch argmax: {e:?}")))?;
+        let parts = parts_override.unwrap_or_else(|| argmax_parts(vocab));
+        if parts > 1 {
+            // Split path: `parts` blocks scan each row in parallel, then one
+            // block per row joins the partial winners. Identical result to the
+            // single-launch path; see the kernel comments.
+            let split = match dtype {
+                DataType::Float16 => &self.f_part_f16,
+                DataType::BFloat16 => &self.f_part_bf16,
+                _ => &self.f_part_f32,
+            };
+            let mut scratch = self.parts.lock().expect("cuda argmax parts poisoned");
+            let pairs = rows
+                .checked_mul(parts)
+                .ok_or_else(|| OrtError::Cuda("argmax part count overflow".into()))?;
+            scratch.ensure(pairs)?;
+            let parts_i = parts as i32;
+            let pval = scratch.ptr;
+            let pidx = scratch.idx_ptr();
+            let part_cfg = LaunchConfig {
+                grid_dim: (parts_i as u32, rows_i as u32, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = self.stream.launch_builder(split);
+            builder
+                .arg(&x_ptr)
+                .arg(&rows_i)
+                .arg(&vocab_i)
+                .arg(&parts_i)
+                .arg(&pval)
+                .arg(&pidx);
+            // SAFETY: `split` is the compiled per-part entry; the argument list
+            // matches its (const T*, int, int, int, float*, int*) signature;
+            // `x_ptr` covers `rows * vocab` elements and the scratch holds
+            // `rows * parts` pairs.
+            unsafe { builder.launch(part_cfg) }
+                .map_err(|e| OrtError::Cuda(format!("launch argmax part: {e:?}")))?;
+            let join_cfg = LaunchConfig {
+                grid_dim: (rows_i as u32, 1, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = self.stream.launch_builder(&self.f_join);
+            builder
+                .arg(&pval)
+                .arg(&pidx)
+                .arg(&rows_i)
+                .arg(&parts_i)
+                .arg(&out.ptr);
+            // SAFETY: `f_join` matches (const float*, const int*, int, int, int*);
+            // both scratch halves hold `rows * parts` live slots and `out.ptr`
+            // holds `rows` i32 slots.
+            unsafe { builder.launch(join_cfg) }
+                .map_err(|e| OrtError::Cuda(format!("launch argmax join: {e:?}")))?;
+        } else {
+            let cfg = LaunchConfig {
+                grid_dim: (rows_i as u32, 1, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = self.stream.launch_builder(func);
+            builder.arg(&x_ptr).arg(&rows_i).arg(&vocab_i).arg(&out.ptr);
+            // SAFETY: `func` is the compiled argmax entry; the argument list matches
+            // its (const T*, int, int, int*) signature; `x_ptr` is a live device
+            // buffer of `rows * vocab` elements and `out.ptr` holds `rows` i32 slots.
+            unsafe { builder.launch(cfg) }
+                .map_err(|e| OrtError::Cuda(format!("launch argmax: {e:?}")))?;
+        }
 
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(out_idx.as_mut_ptr().cast::<u8>(), rows * 4) };
@@ -875,7 +1103,7 @@ impl CudaSampler {
     ) -> Result<u32> {
         let mut idx = [0i32; 1];
         if params.greedy {
-            self.argmax_into(dtype, ptr_addr, 1, vocab, &mut idx)?;
+            self.argmax_into(dtype, ptr_addr, 1, vocab, &mut idx, None)?;
         } else {
             self.sample_into(dtype, ptr_addr, 1, vocab, params, &mut idx)?;
         }
@@ -963,6 +1191,38 @@ impl DeviceSampler for CudaSampler {
     }
 }
 
+impl PartScratch {
+    /// Device pointer to the `i32` index half, which follows the `f32` value
+    /// half. Both halves are `cap` entries, so the index half starts at
+    /// `cap * 4` bytes and inherits the allocation's alignment.
+    fn idx_ptr(&self) -> CUdeviceptr {
+        self.ptr + (self.cap * 4) as CUdeviceptr
+    }
+
+    /// Ensure the scratch can hold `pairs` `(f32, i32)` partial results.
+    ///
+    /// Allocate-new-first, then free-old-and-swap only after the new allocation
+    /// succeeds, so a failed `malloc_sync` leaves the existing buffer live and
+    /// neither a retry nor `Drop` can double-free.
+    fn ensure(&mut self, pairs: usize) -> Result<()> {
+        if pairs <= self.cap {
+            return Ok(());
+        }
+        let bytes = pairs
+            .checked_mul(8)
+            .ok_or_else(|| OrtError::Cuda("argmax part scratch size overflow".into()))?;
+        // SAFETY: primary context is current (caller bound it); we own the result.
+        let new_ptr = unsafe { cudarc::driver::result::malloc_sync(bytes) }
+            .map_err(|e| OrtError::Cuda(format!("grow argmax part scratch: {e:?}")))?;
+        let old_ptr = self.ptr;
+        self.ptr = new_ptr;
+        self.cap = pairs;
+        // SAFETY: `old_ptr` came from `malloc_sync` and is no longer referenced.
+        let _ = unsafe { cudarc::driver::result::free_sync(old_ptr) };
+        Ok(())
+    }
+}
+
 impl OutScratch {
     /// Ensure the scratch can hold `rows` i32 indices, reallocating if needed.
     ///
@@ -1028,12 +1288,17 @@ impl Drop for CudaSampler {
                 // SAFETY: `work.ptr` came from `malloc_sync` and is freed once here.
                 let _ = unsafe { cudarc::driver::result::free_sync(work.ptr) };
             }
+            if let Ok(parts) = self.parts.lock() {
+                // SAFETY: `parts.ptr` came from `malloc_sync` and is freed once here.
+                let _ = unsafe { cudarc::driver::result::free_sync(parts.ptr) };
+            }
         }
     }
 }
 
 /// `compute_XY` string for the device's CUDA compute capability.
-fn compute_arch(ctx: &CudaContext) -> Result<String> {
+/// A device's compute capability as `(major, minor)`.
+pub(crate) fn compute_capability(ctx: &CudaContext) -> Result<(i32, i32)> {
     use cudarc::driver::sys::CUdevice_attribute;
     let major = ctx
         .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
@@ -1041,7 +1306,252 @@ fn compute_arch(ctx: &CudaContext) -> Result<String> {
     let minor = ctx
         .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
         .map_err(|e| OrtError::Cuda(format!("query CC minor: {e:?}")))?;
-    Ok(format!("compute_{major}{minor}"))
+    Ok((major, minor))
+}
+
+/// NVRTC's `--gpu-architecture` flag for a compute capability.
+///
+/// A *real* architecture (`sm_90`) lets NVRTC emit SASS the driver loads
+/// directly. A *virtual* one (`compute_90`) can only produce PTX, which the
+/// driver has to JIT — and a driver only understands PTX from a toolkit at most
+/// as new as itself.
+fn arch_flag(kind: DeviceCode, major: i32, minor: i32) -> String {
+    match kind {
+        DeviceCode::Cubin => format!("--gpu-architecture=sm_{major}{minor}"),
+        DeviceCode::Ptx => format!("--gpu-architecture=compute_{major}{minor}"),
+    }
+}
+
+/// Whether a driver can JIT PTX emitted by an NVRTC of the given version.
+///
+/// CUDA guarantees a driver accepts PTX from its own toolkit and older ones, so
+/// this is simply "NVRTC is not newer than the driver's toolkit".
+fn ptx_jit_supported(nvrtc: (i32, i32), driver_toolkit: (i32, i32)) -> bool {
+    nvrtc <= driver_toolkit
+}
+
+/// The newest CUDA toolkit this driver can consume, as `(major, minor)`.
+fn driver_toolkit_version() -> Result<(i32, i32)> {
+    let mut version = 0;
+    // SAFETY: `version` is a valid out-parameter for the documented driver ABI.
+    let status = unsafe { cudarc::driver::sys::cuDriverGetVersion(&mut version) };
+    if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        return Err(OrtError::Cuda(format!(
+            "cuDriverGetVersion failed: {status:?}"
+        )));
+    }
+    Ok(decode_driver_version(version))
+}
+
+/// Decode `cuDriverGetVersion`'s integer into the `(major, minor)` CUDA
+/// toolkit it supports. The driver reports `1000 * major + 10 * minor`.
+fn decode_driver_version(version: i32) -> (i32, i32) {
+    (version / 1000, (version % 1000) / 10)
+}
+
+/// The NVRTC actually loaded into this process, as `(major, minor)`.
+fn nvrtc_version() -> Result<(i32, i32)> {
+    let (mut major, mut minor) = (0, 0);
+    // SAFETY: both are valid out-parameters for the documented NVRTC ABI.
+    let status = unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor) };
+    if status != cudarc::nvrtc::sys::nvrtcResult::NVRTC_SUCCESS {
+        return Err(OrtError::Cuda(format!("nvrtcVersion failed: {status:?}")));
+    }
+    Ok((major, minor))
+}
+
+/// Which form of device code a module was built as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceCode {
+    /// Real-architecture SASS. The driver loads it as-is: no JIT, so the
+    /// toolkit that produced it does not have to be one the driver knows.
+    Cubin,
+    /// Virtual-architecture PTX. The driver must JIT it, which only works when
+    /// the producing toolkit is no newer than the driver.
+    Ptx,
+}
+
+/// Build the kernels in `source` for this device and load them.
+///
+/// Compilation and loading are one operation because only loading can tell us
+/// that an image this machine happily produced is one its driver refuses. The
+/// candidates are tried in order and every rejection is remembered, so a machine
+/// that can run neither gets a single error naming the device, the NVRTC and the
+/// driver rather than a bare `CUDA_ERROR_*` from whichever step failed:
+///
+/// 1. **SASS for the device's real architecture**, when this NVRTC can emit it
+///    and its CUDA major is one the driver loads. Nothing is JIT compiled, so a
+///    newer NVRTC *minor* than the driver is harmless.
+/// 2. **PTX for the matching virtual architecture**, when this NVRTC is not
+///    newer than the driver's toolkit. Emitting PTX the driver cannot parse
+///    produces `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` at load.
+///
+/// It never silently degrades to a host path: the caller asked for device
+/// sampling, and quietly not doing it would turn a configuration problem into a
+/// performance mystery.
+fn load_kernels_for_device(
+    ctx: &std::sync::Arc<CudaContext>,
+    source: &str,
+    name: &str,
+    (major, minor): (i32, i32),
+) -> Result<std::sync::Arc<cudarc::driver::CudaModule>> {
+    let nvrtc = nvrtc_version()?;
+    let driver = driver_toolkit_version()?;
+    let mut rejected: Vec<String> = Vec::new();
+
+    if cubin_supported(nvrtc, driver) {
+        match compile_cubin(source, arch_flag(DeviceCode::Cubin, major, minor)) {
+            Ok(cubin) => {
+                let bytes = cubin.len();
+                match ctx.load_module(cudarc::nvrtc::Ptx::from_binary(cubin)) {
+                    Ok(module) => {
+                        tracing::debug!(
+                            kernel = name,
+                            arch = format!("sm_{major}{minor}"),
+                            bytes,
+                            "compiled sampler kernels to real-architecture SASS"
+                        );
+                        return Ok(module);
+                    }
+                    // Reachable if a compatibility rule this code does not model
+                    // makes the driver reject an image NVRTC accepted. PTX may
+                    // still work, so this is a rejection to record, not an exit.
+                    Err(error) => rejected.push(format!(
+                        "the driver refused the sm_{major}{minor} SASS this NVRTC produced ({error:?})"
+                    )),
+                }
+            }
+            Err(error) => {
+                rejected.push(format!(
+                    "NVRTC could not emit sm_{major}{minor} SASS ({error})"
+                ));
+            }
+        }
+    } else if nvrtc < FIRST_NVRTC_WITH_CUBIN {
+        rejected.push(format!(
+            "NVRTC {}.{} predates nvrtcGetCUBIN (CUDA {}.{}) and cannot emit SASS",
+            nvrtc.0, nvrtc.1, FIRST_NVRTC_WITH_CUBIN.0, FIRST_NVRTC_WITH_CUBIN.1
+        ));
+    } else {
+        rejected.push(format!(
+            "NVRTC {}.{} is a newer CUDA major than the CUDA {}.{} this driver supports, so its SASS would be rejected at load",
+            nvrtc.0, nvrtc.1, driver.0, driver.1
+        ));
+    }
+
+    if ptx_jit_supported(nvrtc, driver) {
+        let opts = cudarc::nvrtc::CompileOptions {
+            options: vec![arch_flag(DeviceCode::Ptx, major, minor)],
+            ..Default::default()
+        };
+        match cudarc::nvrtc::compile_ptx_with_opts(source, opts) {
+            Ok(ptx) => match ctx.load_module(ptx) {
+                Ok(module) => {
+                    tracing::debug!(
+                        kernel = name,
+                        arch = format!("compute_{major}{minor}"),
+                        "compiled sampler kernels to PTX; the driver JIT compiled them"
+                    );
+                    return Ok(module);
+                }
+                Err(error) => {
+                    rejected.push(format!(
+                        "the driver refused to JIT compile the PTX ({error:?})"
+                    ));
+                }
+            },
+            Err(error) => rejected.push(format!("NVRTC could not emit PTX ({error:?})")),
+        }
+    } else {
+        rejected.push(format!(
+            "PTX cannot be used either, because NVRTC {}.{} is newer than the CUDA {}.{} this driver supports",
+            nvrtc.0, nvrtc.1, driver.0, driver.1
+        ));
+    }
+
+    Err(OrtError::Cuda(format!(
+        "device sampler kernels cannot be built for this machine (kernel {name}, device sm_{major}{minor}, NVRTC {}.{}, driver supports CUDA {}.{}): {}. Point the process at an NVRTC no newer than CUDA {}.{} (for example the nvidia-cuda-nvrtc package matching the driver), install a driver that supports CUDA {}.{} or newer, or use a CUDA toolkit whose NVRTC emits SASS for sm_{major}{minor}.",
+        nvrtc.0,
+        nvrtc.1,
+        driver.0,
+        driver.1,
+        rejected.join("; "),
+        driver.0,
+        driver.1,
+        nvrtc.0,
+        nvrtc.1,
+    )))
+}
+
+/// The first NVRTC that exposes `nvrtcGetCUBIN` / `nvrtcGetCUBINSize`.
+///
+/// Older NVRTCs cannot emit SASS at all. This matters more than a missing
+/// feature usually would: the CUDA bindings resolve NVRTC entry points lazily
+/// by name, and a *missing* symbol aborts the process rather than returning an
+/// error, so calling the cubin entry points against an older NVRTC would turn a
+/// machine that PTX serves perfectly well into a crash.
+const FIRST_NVRTC_WITH_CUBIN: (i32, i32) = (11, 3);
+
+/// Whether asking this NVRTC for SASS can produce something this driver loads.
+///
+/// Two independent constraints, and both must hold before the cubin path is
+/// worth attempting:
+///
+/// 1. `nvrtcGetCUBIN` only exists from CUDA 11.3.
+/// 2. A driver loads cubins from its own CUDA major family or older. CUDA
+///    guarantees *minor* version compatibility, so a 12.8 cubin loads on a 12.0
+///    driver, but a 13.x cubin is rejected by every 12.x driver. Compiling one
+///    anyway would push the failure into `cuModuleLoadData`, far from its cause.
+fn cubin_supported(nvrtc: (i32, i32), driver: (i32, i32)) -> bool {
+    nvrtc >= FIRST_NVRTC_WITH_CUBIN && nvrtc.0 <= driver.0
+}
+
+/// Compile to real-architecture SASS, returning the cubin image.
+///
+/// Returns a description of why SASS was unavailable rather than an
+/// `OrtError`, because the caller treats that as "try PTX", not as a failure.
+fn compile_cubin(source: &str, arch: String) -> std::result::Result<Vec<u8>, String> {
+    use cudarc::nvrtc::{result, sys};
+
+    let src =
+        std::ffi::CString::new(source).map_err(|_| "kernel source contains NUL".to_string())?;
+    let program = result::create_program(&src, None)
+        .map_err(|e| format!("nvrtcCreateProgram failed: {e:?}"))?;
+    // SAFETY: `program` was just created and is destroyed on every path below.
+    let compiled = unsafe { result::compile_program(program, std::slice::from_ref(&arch)) };
+    if let Err(error) = compiled {
+        // SAFETY: `program` is live; the log is copied out before it is freed.
+        let log = unsafe { result::get_program_log(program) }
+            .map(|log| {
+                String::from_utf8_lossy(&log.iter().map(|c| *c as u8).collect::<Vec<_>>())
+                    .trim_end_matches('\0')
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_default();
+        // SAFETY: `program` is live and freed exactly once here.
+        unsafe { result::destroy_program(program) }.ok();
+        return Err(format!("NVRTC rejected {arch}: {error:?} {log}"));
+    }
+    let mut size = 0usize;
+    // SAFETY: `program` compiled successfully; `size` is a valid out-parameter.
+    let status = unsafe { sys::nvrtcGetCUBINSize(program, &mut size) };
+    if status != sys::nvrtcResult::NVRTC_SUCCESS || size == 0 {
+        // SAFETY: `program` is live and freed exactly once here.
+        unsafe { result::destroy_program(program) }.ok();
+        return Err(format!(
+            "this NVRTC produced no SASS for {arch} (nvrtcGetCUBINSize: {status:?}, {size} bytes)"
+        ));
+    }
+    let mut cubin = vec![0u8; size];
+    // SAFETY: `cubin` has exactly `size` bytes, which is what NVRTC reported.
+    let status = unsafe { sys::nvrtcGetCUBIN(program, cubin.as_mut_ptr().cast()) };
+    // SAFETY: `program` is live and freed exactly once here.
+    unsafe { result::destroy_program(program) }.ok();
+    if status != sys::nvrtcResult::NVRTC_SUCCESS {
+        return Err(format!("nvrtcGetCUBIN failed for {arch}: {status:?}"));
+    }
+    Ok(cubin)
 }
 
 fn dtype_size(dtype: DataType) -> Result<usize> {
@@ -1054,6 +1564,220 @@ fn dtype_size(dtype: DataType) -> Result<usize> {
             )));
         }
     })
+}
+
+/// Real-device proof that the sampler builds and runs in the *default*
+/// environment, with no loader-path reordering to hide a toolkit/driver skew.
+///
+/// This is the regression guard for the defect where `compute_90` PTX from a
+/// CUDA 13.3 NVRTC was rejected by a CUDA 13.0 driver with
+/// `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`.
+#[cfg(all(test, feature = "cuda"))]
+mod device_smoke {
+    use super::*;
+
+    /// The canonical microcase: a deterministic 202048-wide row whose maximum
+    /// sits at 180559, matching the logits width of the benchmarked decoder.
+    fn canonical_logits() -> Vec<f32> {
+        let mut values = Vec::with_capacity(202_048);
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..202_048 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            values.push((state >> 40) as f32 / 16_777_216.0 - 0.5);
+        }
+        values[180_559] = 12.5;
+        values
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn device_argmax_runs_in_the_default_environment() {
+        let capability_probe = CudaContext::new(0).expect("CUDA device 0");
+        let capability = compute_capability(&capability_probe).expect("compute capability");
+        let nvrtc = nvrtc_version().expect("nvrtc version");
+        let driver = driver_toolkit_version().expect("driver version");
+        println!(
+            "device sm_{}{} | NVRTC {}.{} | driver supports CUDA {}.{}",
+            capability.0, capability.1, nvrtc.0, nvrtc.1, driver.0, driver.1
+        );
+        drop(capability_probe);
+        if !ptx_jit_supported(nvrtc, driver) {
+            // On this machine PTX could not possibly load, so a sampler that
+            // constructs at all proves the real-architecture SASS path is the
+            // one being taken.
+            println!("NVRTC is newer than the driver: only the SASS path can succeed here");
+        }
+
+        // The construction itself is the regression: it compiled and loaded.
+        let sampler = CudaSampler::new(0).expect(
+            "device sampler must build in the default environment; a toolkit/driver skew must              not require reordering the loader path",
+        );
+
+        let host = canonical_logits();
+        let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // SAFETY: the primary context is current after `CudaSampler::new`, and
+        // this allocation is owned by the test for its duration.
+        let ptr = unsafe { cudarc::driver::result::malloc_sync(bytes.len()) }.expect("malloc");
+        // SAFETY: `ptr` holds exactly `bytes.len()` bytes.
+        unsafe { cudarc::driver::result::memcpy_htod_sync(ptr, &bytes) }.expect("upload");
+
+        let tokens = sampler
+            .argmax_rows(DataType::Float32, ptr as usize, 1, 202_048)
+            .expect("device argmax");
+        // SAFETY: `ptr` came from `malloc_sync` above and is freed once.
+        unsafe { cudarc::driver::result::free_sync(ptr) }.ok();
+
+        assert_eq!(
+            tokens,
+            vec![180_559],
+            "device argmax must select the canonical token"
+        );
+    }
+}
+
+#[cfg(test)]
+mod device_code_selection {
+    use super::*;
+
+    #[test]
+    fn real_architecture_is_requested_for_sass_and_virtual_for_ptx() {
+        assert_eq!(
+            arch_flag(DeviceCode::Cubin, 9, 0),
+            "--gpu-architecture=sm_90"
+        );
+        assert_eq!(
+            arch_flag(DeviceCode::Ptx, 9, 0),
+            "--gpu-architecture=compute_90"
+        );
+        // Nothing here is device-specific: the capability is whatever the driver
+        // reported, so a two-digit minor or a future major works the same way.
+        assert_eq!(
+            arch_flag(DeviceCode::Cubin, 12, 1),
+            "--gpu-architecture=sm_121"
+        );
+        assert_eq!(
+            arch_flag(DeviceCode::Ptx, 7, 5),
+            "--gpu-architecture=compute_75"
+        );
+    }
+
+    #[test]
+    fn ptx_is_rejected_only_when_nvrtc_is_newer_than_the_driver() {
+        // The defect this guards: a CUDA 13.3 NVRTC against a driver that tops
+        // out at CUDA 13.0 emits PTX the driver refuses with
+        // CUDA_ERROR_UNSUPPORTED_PTX_VERSION.
+        assert!(!ptx_jit_supported((13, 3), (13, 0)));
+        assert!(!ptx_jit_supported((13, 0), (12, 9)));
+        // Equal, or an older NVRTC, is exactly the supported direction.
+        assert!(ptx_jit_supported((13, 0), (13, 0)));
+        assert!(ptx_jit_supported((12, 8), (13, 0)));
+        assert!(ptx_jit_supported((11, 8), (13, 3)));
+    }
+
+    #[test]
+    fn only_an_nvrtc_that_has_the_cubin_entry_points_is_asked_for_sass() {
+        // Asking an older NVRTC for SASS is not a graceful failure: the CUDA
+        // bindings resolve entry points by name and abort on a missing symbol,
+        // so the version gate is what keeps a PTX-capable machine working.
+        let same_major = |nvrtc: (i32, i32)| (nvrtc.0, 9);
+        assert!(!cubin_supported((10, 2), same_major((10, 2))));
+        assert!(!cubin_supported((11, 0), same_major((11, 0))));
+        assert!(!cubin_supported((11, 2), same_major((11, 2))));
+        assert!(cubin_supported(
+            FIRST_NVRTC_WITH_CUBIN,
+            same_major(FIRST_NVRTC_WITH_CUBIN)
+        ));
+        assert!(cubin_supported((11, 8), same_major((11, 8))));
+        assert!(cubin_supported((12, 0), same_major((12, 0))));
+        assert!(cubin_supported((13, 3), same_major((13, 3))));
+    }
+
+    #[test]
+    fn sass_is_not_produced_for_a_driver_of_an_older_cuda_major() {
+        // The reported case: a CUDA 13 NVRTC emits a cubin that no CUDA 12
+        // driver will load. Compiling it anyway moves the failure into
+        // cuModuleLoadData, far from its cause.
+        assert!(!cubin_supported((13, 3), (12, 8)));
+        assert!(!cubin_supported((13, 0), (12, 0)));
+        assert!(!cubin_supported((12, 0), (11, 8)));
+
+        // Minor version compatibility is the whole point of preferring SASS: a
+        // newer NVRTC minor within the driver's major is fine, in both
+        // directions.
+        assert!(cubin_supported((12, 8), (12, 0)));
+        assert!(cubin_supported((12, 0), (12, 8)));
+        assert!(cubin_supported((13, 3), (13, 0)));
+
+        // A driver from a newer major loads an older major's SASS.
+        assert!(cubin_supported((12, 8), (13, 0)));
+        assert!(cubin_supported((11, 3), (13, 3)));
+    }
+
+    #[test]
+    fn the_two_gates_together_always_leave_a_usable_path_or_a_diagnosis() {
+        // Across every neighbouring pair, at least one of SASS or PTX is
+        // offered unless the machine genuinely cannot run either, which is the
+        // case the error message exists for.
+        for nvrtc in [
+            (11, 0),
+            (11, 3),
+            (11, 8),
+            (12, 0),
+            (12, 8),
+            (13, 0),
+            (13, 3),
+        ] {
+            for driver in [
+                (11, 0),
+                (11, 3),
+                (11, 8),
+                (12, 0),
+                (12, 8),
+                (13, 0),
+                (13, 3),
+            ] {
+                let sass = cubin_supported(nvrtc, driver);
+                let ptx = ptx_jit_supported(nvrtc, driver);
+                if nvrtc <= driver {
+                    assert!(
+                        ptx,
+                        "PTX must be offered when NVRTC {nvrtc:?} <= driver {driver:?}"
+                    );
+                }
+                if nvrtc > driver && nvrtc.0 > driver.0 {
+                    assert!(
+                        !sass && !ptx,
+                        "a newer NVRTC major than the driver has no usable path: \
+                         NVRTC {nvrtc:?} driver {driver:?}"
+                    );
+                }
+                // A newer NVRTC minor within the driver's major is exactly the
+                // case SASS exists to serve, and PTX cannot.
+                if nvrtc.0 == driver.0 && nvrtc.1 > driver.1 {
+                    assert!(sass, "SASS must serve NVRTC {nvrtc:?} on driver {driver:?}");
+                    assert!(
+                        !ptx,
+                        "PTX must not be attempted for NVRTC {nvrtc:?} on {driver:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_driver_version_decodes_to_its_toolkit_pair() {
+        // Exercise the decoder the driver path actually uses, so a change to
+        // the formula cannot pass this test.
+        assert_eq!(decode_driver_version(13_000), (13, 0));
+        assert_eq!(decode_driver_version(13_030), (13, 3));
+        assert_eq!(decode_driver_version(12_080), (12, 8));
+        assert_eq!(decode_driver_version(11_020), (11, 2));
+        // The gate and the decoder have to agree about what a driver supports.
+        assert!(ptx_jit_supported(decode_driver_version(13_030), (13, 3)));
+        assert!(!ptx_jit_supported((13, 3), decode_driver_version(13_000)));
+    }
 }
 
 #[cfg(test)]
@@ -1783,5 +2507,510 @@ mod tests {
                 .expect("multi inf sample");
             assert_eq!(ids, vec![3], "multi +inf rng={rng}");
         }
+    }
+}
+
+/// Split-argmax equivalence and cost tests.
+///
+/// The split (two-stage) path must be an exact drop-in for the single-launch
+/// path: same winner for ties, NaN, +/-inf, widths that do not divide evenly by
+/// the part count, and heterogeneous batches. These tests force both paths over
+/// identical device data and require identical output.
+#[cfg(test)]
+mod split_argmax {
+    use super::*;
+
+    /// Part counts the split kernels must handle: the auto choice, a single
+    /// part, prime counts that leave ragged tails, and the cap.
+    const FORCED: &[usize] = &[0, 1, 3, 7, 64, MAX_PARTS];
+
+    #[test]
+    fn narrow_rows_do_not_split() {
+        // A row a single block can scan with two elements per thread is not
+        // worth a second launch.
+        assert_eq!(argmax_parts(0), 0);
+        assert_eq!(argmax_parts(1), 0);
+        assert_eq!(argmax_parts(BLOCK as usize * 2), 0);
+    }
+
+    #[test]
+    fn wide_rows_split_up_to_the_cap() {
+        assert_eq!(argmax_parts(BLOCK as usize * 2 + 1), 2);
+        assert_eq!(argmax_parts(202_048), 99);
+        // Beyond the cap the parts saturate so the join stays one block.
+        assert_eq!(argmax_parts(usize::from(u16::MAX) * 4096), MAX_PARTS);
+    }
+
+    /// Host model of the kernels' shared combine rule, used as the oracle.
+    fn reference(row: &[f32]) -> i32 {
+        let mut best = f32::NEG_INFINITY;
+        let mut bidx = i32::MAX;
+        for (i, &v) in row.iter().enumerate() {
+            let i = i as i32;
+            if !v.is_nan() && (v > best || (v == best && i < bidx)) {
+                best = v;
+                bidx = i;
+            }
+        }
+        if bidx == i32::MAX { 0 } else { bidx }
+    }
+
+    fn cases() -> Vec<(&'static str, Vec<Vec<f32>>)> {
+        let wide = 202_048usize;
+        let mut xorshift = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            xorshift ^= xorshift << 13;
+            xorshift ^= xorshift >> 7;
+            xorshift ^= xorshift << 17;
+            (xorshift >> 40) as f32 / 16_777_216.0 - 0.5
+        };
+        let mut random: Vec<f32> = (0..wide).map(|_| next()).collect();
+        random[180_559] = 12.5;
+        vec![
+            ("canonical", vec![random]),
+            // Every element equal: the lowest index must win regardless of how
+            // the row is partitioned.
+            ("all ties", vec![vec![1.5f32; 5_000]]),
+            // A tie between two parts, resolved toward the lower index.
+            ("split tie", {
+                let mut r = vec![0.0f32; 9_001];
+                r[10] = 7.0;
+                r[8_000] = 7.0;
+                vec![r]
+            }),
+            // NaN must never be selected, including when it precedes the max.
+            ("leading nan", {
+                let mut r = vec![f32::NAN; 4_096];
+                r[3_000] = 2.0;
+                vec![r]
+            }),
+            ("all nan", vec![vec![f32::NAN; 4_096]]),
+            // An all -inf row still has a well-defined lowest-index winner.
+            ("all neg inf", vec![vec![f32::NEG_INFINITY; 4_096]]),
+            ("pos inf", {
+                let mut r = vec![1.0f32; 4_096];
+                r[4_095] = f32::INFINITY;
+                vec![r]
+            }),
+            // Width that divides no part count evenly.
+            ("ragged width", {
+                let mut r = vec![0.5f32; 3_331];
+                r[3_330] = 9.0;
+                vec![r]
+            }),
+            // Heterogeneous batch: each row's winner is independent.
+            ("batch", {
+                (0..5)
+                    .map(|row| {
+                        let mut r = vec![0.0f32; 4_100];
+                        r[row * 800] = 3.0 + row as f32;
+                        r
+                    })
+                    .collect()
+            }),
+        ]
+    }
+
+    /// Encode an f32 row into the device byte layout for `dtype`, so the same
+    /// case exercises every entry point the sampler dispatches to.
+    fn encode(logits: &[f32], dtype: DataType) -> Vec<u8> {
+        match dtype {
+            DataType::Float32 => logits.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            DataType::Float16 => logits
+                .iter()
+                .flat_map(|&v| half_bits(v).to_le_bytes())
+                .collect(),
+            DataType::BFloat16 => logits
+                .iter()
+                .flat_map(|&v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect(),
+            other => panic!("unsupported test dtype {other:?}"),
+        }
+    }
+
+    /// Round an f32 to binary16, matching the kernel's decode.
+    fn half_bits(value: f32) -> u16 {
+        let bits = value.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        if value.is_nan() {
+            return sign | 0x7E00;
+        }
+        let exponent = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
+        if exponent >= 0x1F {
+            return sign | 0x7C00;
+        }
+        if exponent <= 0 {
+            return sign;
+        }
+        sign | ((exponent as u16) << 10) | (((bits >> 13) & 0x3FF) as u16)
+    }
+
+    /// The reference answer for `row` once it has been rounded to `dtype`.
+    ///
+    /// Narrowing can create ties that do not exist in f32, so the oracle must
+    /// see exactly the values the kernel sees.
+    fn reference_in(row: &[f32], dtype: DataType) -> i32 {
+        let seen: Vec<f32> = match dtype {
+            DataType::Float32 => row.to_vec(),
+            DataType::Float16 => row.iter().map(|&v| half_to_f32(half_bits(v))).collect(),
+            DataType::BFloat16 => row
+                .iter()
+                .map(|&v| f32::from_bits(v.to_bits() & 0xFFFF_0000))
+                .collect(),
+            other => panic!("unsupported test dtype {other:?}"),
+        };
+        reference(&seen)
+    }
+
+    fn half_to_f32(bits: u16) -> f32 {
+        let sign = ((bits & 0x8000) as u32) << 16;
+        let exponent = ((bits >> 10) & 0x1F) as u32;
+        let mantissa = (bits & 0x3FF) as u32;
+        if exponent == 0 {
+            if mantissa == 0 {
+                return f32::from_bits(sign);
+            }
+            let mut e = 1u32;
+            let mut m = mantissa;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            return f32::from_bits(sign | ((e + 112) << 23) | ((m & 0x3FF) << 13));
+        }
+        if exponent == 0x1F {
+            return f32::from_bits(sign | 0x7F80_0000 | (mantissa << 13));
+        }
+        f32::from_bits(sign | ((exponent + 112) << 23) | (mantissa << 13))
+    }
+
+    /// The split path must agree with the single-launch path for every dtype the
+    /// sampler supports, not just the f32 one the decode loop happens to use.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn split_matches_the_single_launch_path_for_every_dtype() {
+        let sampler = CudaSampler::new(0).expect("cuda sampler");
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            for (name, rows) in cases() {
+                let vocab = rows[0].len();
+                let flat: Vec<u8> = rows.iter().flat_map(|r| encode(r, dtype)).collect();
+                // SAFETY: the primary context is current after `CudaSampler::new`;
+                // this allocation is owned by the test and freed below.
+                let ptr =
+                    unsafe { cudarc::driver::result::malloc_sync(flat.len()) }.expect("malloc");
+                // SAFETY: `ptr` holds exactly `flat.len()` bytes.
+                unsafe { cudarc::driver::result::memcpy_htod_sync(ptr, &flat) }.expect("upload");
+                let expected: Vec<i32> = rows.iter().map(|r| reference_in(r, dtype)).collect();
+                for &parts in FORCED {
+                    let mut got = vec![-1i32; rows.len()];
+                    sampler
+                        .argmax_into(
+                            dtype,
+                            ptr as usize,
+                            rows.len(),
+                            vocab,
+                            &mut got,
+                            Some(parts),
+                        )
+                        .expect("argmax");
+                    assert_eq!(got, expected, "case {name:?} dtype {dtype:?} parts={parts}");
+                }
+                // SAFETY: `ptr` came from `malloc_sync` above and is freed once.
+                unsafe { cudarc::driver::result::free_sync(ptr) }.ok();
+            }
+        }
+    }
+
+    /// Batch sizes a serving loop actually uses, with a different winner per row
+    /// so a row-indexing mistake cannot pass by coincidence.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn batched_rows_are_reduced_independently() {
+        let sampler = CudaSampler::new(0).expect("cuda sampler");
+        let vocab = 51_200usize;
+        for batch in [1usize, 2, 4, 8] {
+            let rows: Vec<Vec<f32>> = (0..batch)
+                .map(|row| {
+                    let mut values = vec![-1.0f32; vocab];
+                    // Winners spread across the row so different part counts put
+                    // them in different blocks.
+                    values[(row * 6_113 + 17) % vocab] = 3.0 + row as f32;
+                    values
+                })
+                .collect();
+            let flat: Vec<u8> = rows
+                .iter()
+                .flat_map(|r| r.iter().flat_map(|v| v.to_le_bytes()))
+                .collect();
+            // SAFETY: primary context is current; owned by the test.
+            let ptr = unsafe { cudarc::driver::result::malloc_sync(flat.len()) }.expect("malloc");
+            // SAFETY: `ptr` holds exactly `flat.len()` bytes.
+            unsafe { cudarc::driver::result::memcpy_htod_sync(ptr, &flat) }.expect("upload");
+            let expected: Vec<i32> = rows.iter().map(|r| reference(r)).collect();
+            for &parts in FORCED {
+                let mut got = vec![-1i32; batch];
+                sampler
+                    .argmax_into(
+                        DataType::Float32,
+                        ptr as usize,
+                        batch,
+                        vocab,
+                        &mut got,
+                        Some(parts),
+                    )
+                    .expect("argmax");
+                assert_eq!(got, expected, "batch={batch} parts={parts}");
+            }
+            // SAFETY: `ptr` came from `malloc_sync` above and is freed once.
+            unsafe { cudarc::driver::result::free_sync(ptr) }.ok();
+        }
+    }
+
+    /// Widths that divide no part count evenly, around the split threshold.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn odd_widths_reduce_correctly() {
+        let sampler = CudaSampler::new(0).expect("cuda sampler");
+        let block = BLOCK as usize;
+        for vocab in [
+            block * 2 - 1,
+            block * 2,
+            block * 2 + 1,
+            block * 2 + 3,
+            4_099,
+            65_537,
+            131_071,
+            202_048 - 1,
+        ] {
+            let mut row = vec![0.25f32; vocab];
+            // The last element wins, which an off-by-one in the tail cannot hide.
+            row[vocab - 1] = 7.0;
+            let flat: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+            // SAFETY: primary context is current; owned by the test.
+            let ptr = unsafe { cudarc::driver::result::malloc_sync(flat.len()) }.expect("malloc");
+            // SAFETY: `ptr` holds exactly `flat.len()` bytes.
+            unsafe { cudarc::driver::result::memcpy_htod_sync(ptr, &flat) }.expect("upload");
+            let mut got = [0i32; 1];
+            sampler
+                .argmax_into(DataType::Float32, ptr as usize, 1, vocab, &mut got, None)
+                .expect("argmax");
+            assert_eq!(got[0], (vocab - 1) as i32, "vocab={vocab}");
+            // SAFETY: `ptr` came from `malloc_sync` above and is freed once.
+            unsafe { cudarc::driver::result::free_sync(ptr) }.ok();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn split_matches_the_single_launch_path() {
+        let sampler = CudaSampler::new(0).expect("cuda sampler");
+        for (name, rows) in cases() {
+            let vocab = rows[0].len();
+            assert!(rows.iter().all(|r| r.len() == vocab));
+            let flat: Vec<u8> = rows
+                .iter()
+                .flat_map(|r| r.iter().flat_map(|v| v.to_le_bytes()))
+                .collect();
+            // SAFETY: the primary context is current after `CudaSampler::new`;
+            // this allocation is owned by the test and freed below.
+            let ptr = unsafe { cudarc::driver::result::malloc_sync(flat.len()) }.expect("malloc");
+            // SAFETY: `ptr` holds exactly `flat.len()` bytes.
+            unsafe { cudarc::driver::result::memcpy_htod_sync(ptr, &flat) }.expect("upload");
+
+            let expected: Vec<i32> = rows.iter().map(|r| reference(r)).collect();
+            for &parts in FORCED {
+                let mut got = vec![-1i32; rows.len()];
+                sampler
+                    .argmax_into(
+                        DataType::Float32,
+                        ptr as usize,
+                        rows.len(),
+                        vocab,
+                        &mut got,
+                        Some(parts),
+                    )
+                    .expect("argmax");
+                assert_eq!(got, expected, "case {name:?} with parts={parts}");
+            }
+            // SAFETY: `ptr` came from `malloc_sync` above and is freed once.
+            unsafe { cudarc::driver::result::free_sync(ptr) }.ok();
+        }
+    }
+
+    /// Report the launch, scratch and occupancy shape of the split reduction.
+    ///
+    /// These are the properties that decide whether the kernel is usable inside
+    /// a captured graph and how much device memory a serving loop must reserve,
+    /// so they are measured rather than assumed.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn split_launch_and_occupancy_shape() {
+        let sampler = CudaSampler::new(0).expect("cuda sampler");
+        let device = &sampler.ctx;
+        let sm_count = device
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .expect("sm count");
+        let max_threads_per_sm = device
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,
+            )
+            .expect("threads per sm");
+        for (name, function) in [
+            ("argmax_part_f32", &sampler.f_part_f32),
+            ("argmax_join", &sampler.f_join),
+            ("argmax_f32 (one block per row)", &sampler.f_f32),
+        ] {
+            let blocks = function
+                .occupancy_max_active_blocks_per_multiprocessor(BLOCK, 0, None)
+                .expect("occupancy");
+            let registers = function.num_regs().unwrap_or(-1);
+            let shared = function.shared_size_bytes().unwrap_or(-1);
+            let occupancy =
+                f64::from(blocks) * f64::from(BLOCK) / f64::from(max_threads_per_sm) * 100.0;
+            println!(
+                "{name:34} regs/thread={registers:3} static shared={shared:4} B                  blocks/SM={blocks} occupancy={occupancy:.0}%"
+            );
+            assert!(blocks >= 1, "{name} must fit on an SM at {BLOCK} threads");
+        }
+
+        // Launch and scratch shape for the decode-sized case.
+        let vocab = 202_048usize;
+        let parts = argmax_parts(vocab);
+        println!(
+            "vocab={vocab} rows=1: parts={parts} launches=2 grid={parts}x1 block={BLOCK}              scratch={} B",
+            parts * 8
+        );
+        assert!(
+            parts > 1,
+            "a decode-width row must be split across blocks, got parts={parts}"
+        );
+        // Scratch is one (f32, i32) pair per part per row. State the ceiling as
+        // a concrete number of bytes rather than as `parts <= MAX_PARTS`, which
+        // `argmax_parts` guarantees by construction and so cannot fail.
+        for rows in [1usize, 8, 64] {
+            let bytes = rows * parts * 8;
+            assert!(
+                bytes <= 128 * 1024,
+                "a decode-width reduction must not need more than 128 KiB of scratch for \
+                 {rows} rows, needs {bytes} B"
+            );
+        }
+        println!("sm_count={sm_count} max_threads_per_sm={max_threads_per_sm}");
+
+        // Part-count sensitivity for the decode-sized row. The chosen value
+        // must not be beaten by a neighbour, or the tuning constant is stale.
+        let host: Vec<f32> = (0..vocab).map(|i| (i % 977) as f32 * 0.001).collect();
+        let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // SAFETY: primary context is current; owned by the test.
+        let ptr = unsafe { cudarc::driver::result::malloc_sync(bytes.len()) }.expect("malloc");
+        // SAFETY: `ptr` holds exactly `bytes.len()` bytes.
+        unsafe { cudarc::driver::result::memcpy_htod_sync(ptr, &bytes) }.expect("upload");
+        let mut timings = Vec::new();
+        for candidate in [33usize, 66, parts, 132, 165, 198, MAX_PARTS] {
+            let mut idx = [0i32; 1];
+            for _ in 0..40 {
+                sampler
+                    .argmax_into(
+                        DataType::Float32,
+                        ptr as usize,
+                        1,
+                        vocab,
+                        &mut idx,
+                        Some(candidate),
+                    )
+                    .expect("argmax");
+            }
+            let start = std::time::Instant::now();
+            const ITERS: u32 = 400;
+            for _ in 0..ITERS {
+                sampler
+                    .argmax_into(
+                        DataType::Float32,
+                        ptr as usize,
+                        1,
+                        vocab,
+                        &mut idx,
+                        Some(candidate),
+                    )
+                    .expect("argmax");
+            }
+            let each = start.elapsed().as_secs_f64() * 1e6 / f64::from(ITERS);
+            println!("  parts={candidate:4} {each:7.2} us end to end");
+            timings.push((candidate, each));
+        }
+        // SAFETY: `ptr` came from `malloc_sync` above and is freed once.
+        unsafe { cudarc::driver::result::free_sync(ptr) }.ok();
+        let best = timings
+            .iter()
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("timings");
+        let chosen = timings
+            .iter()
+            .find(|(candidate, _)| *candidate == parts)
+            .expect("the chosen part count is measured");
+        println!(
+            "fastest part count: {} ({:.2} us); chosen {} ({:.2} us)",
+            best.0, best.1, chosen.0, chosen.1
+        );
+        // End to end is dominated by the result copy and the synchronisation
+        // around it, so neighbouring part counts land within noise of each
+        // other; this only catches a constant that has gone badly stale.
+        assert!(
+            chosen.1 <= best.1 * 1.10,
+            "the chosen part count {} ({:.2} us) is more than 10% off the best {} ({:.2} us)",
+            chosen.0,
+            chosen.1,
+            best.0,
+            best.1
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn split_is_faster_than_one_block_per_row() {
+        let vocab = 202_048usize;
+        let sampler = CudaSampler::new(0).expect("cuda sampler");
+        let mut xorshift = 0x2545_F491_4F6C_DD1Du64;
+        let host: Vec<f32> = (0..vocab)
+            .map(|_| {
+                xorshift ^= xorshift << 13;
+                xorshift ^= xorshift >> 7;
+                xorshift ^= xorshift << 17;
+                (xorshift >> 40) as f32 / 16_777_216.0 - 0.5
+            })
+            .collect();
+        let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // SAFETY: the primary context is current; owned by the test.
+        let ptr = unsafe { cudarc::driver::result::malloc_sync(bytes.len()) }.expect("malloc");
+        // SAFETY: `ptr` holds exactly `bytes.len()` bytes.
+        unsafe { cudarc::driver::result::memcpy_htod_sync(ptr, &bytes) }.expect("upload");
+
+        let measure = |parts: Option<usize>| -> f64 {
+            let mut idx = [0i32; 1];
+            for _ in 0..50 {
+                sampler
+                    .argmax_into(DataType::Float32, ptr as usize, 1, vocab, &mut idx, parts)
+                    .expect("argmax");
+            }
+            let start = std::time::Instant::now();
+            const ITERS: u32 = 500;
+            for _ in 0..ITERS {
+                sampler
+                    .argmax_into(DataType::Float32, ptr as usize, 1, vocab, &mut idx, parts)
+                    .expect("argmax");
+            }
+            start.elapsed().as_secs_f64() * 1e6 / f64::from(ITERS)
+        };
+        let single = measure(Some(1));
+        let split = measure(None);
+        // SAFETY: `ptr` came from `malloc_sync` above and is freed once.
+        unsafe { cudarc::driver::result::free_sync(ptr) }.ok();
+        println!("one-block-per-row {single:.2} us | split {split:.2} us");
+        assert!(
+            split < single,
+            "split argmax must beat one block per row: {split:.2} us vs {single:.2} us"
+        );
     }
 }

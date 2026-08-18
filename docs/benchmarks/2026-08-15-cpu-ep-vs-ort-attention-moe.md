@@ -1081,6 +1081,12 @@ per-expert loop rather than merely close - the tests assert on raw `Vec<f32>` eq
 
 ### 18.3 Full matrix, 27 cells, real ORT CPU session
 
+> **Correction (§31).** These are **MLAS-arm** ratios. The claim below that every `t=1`
+> cell sits at 1.006-1.052 is not true of the build that ships: measured on the
+> production arm, the same `t=1` cells were **39-72x** ORT, because the shipping path
+> materialized a transposed copy of each expert's weights on every call. Fixed in #1241.
+> Current production-native numbers are in §31.5.
+
 `ratio = native p50 / ORT p50`, **lower is better**. Interleaved arms, same host,
 same session options, same thread count on both sides, 5 warmups, 5 trials x 15 runs.
 Synthetic weights from `scripts/ort_ab/gen_moe.py` (public architecture dimensions,
@@ -2119,6 +2125,40 @@ physical core within the compact set, which needs SMT sibling discovery
 (`/sys/devices/system/cpu/cpuN/topology/thread_siblings_list`) that
 `decode_affinity` does not currently do.
 
+### 26.2.1 (a) is now fixed, and (b) alone still blocks
+
+#1184 made the pool genuinely multi-dispatcher: `dispatch` claims the single job
+slot with a compare-exchange and a losing caller runs the same shards inline on
+its own thread, which is the identical computation because the shards already
+partition their output by global worker index. That closed (a) as a correctness
+matter, and the review confirmed the failure was reproducible - deleting the
+claim gate makes the two-dispatcher test *hang* rather than fail, which is why
+the hazard had gone unnoticed.
+
+It did **not** make the routing landable. Re-wiring `RotaryEmbedding`'s fan-out
+through the pool on top of #1184 and running the paired grid again reproduces
+the bistability of §26.2(b) intact, and worse than before:
+
+| model | t | rayon (base) | hot pool |
+|---|---|---|---|
+| rope_llama3_s128 | 8 | 5.456 | 11.313 |
+| rope_llama3_s128 | 16 | 9.457 `[6.4-23.1]` | **72.704** `[20.7-86.6]` |
+| rope_gptj_il_s128 | 16 | 6.247 | **55.751** `[29.0-85.7]` |
+| rope_gptj_il_s512 | 16 | 5.445 | **1.232** `[1.08-35.6]` |
+| rope_llama3_b8_s1 | 16 | 0.807 | **0.622** |
+| rope_llama3_s512 | 16 | 30.771 | **18.385** |
+
+Both directions in one grid, with dispersion bands wider than the medians. That
+is not a tuning problem, and the bottom three rows are not a partial win - they
+are the same bistable system landing on its other mode. Nothing here is
+publishable as a ratio.
+
+So the ordering is settled: **(b) is the binding constraint, not (a)**. Capping
+*spinning* workers at one per physical core inside the compact mask - which
+needs the SMT sibling discovery `decode_affinity` does not do - has to land
+before the hot-pool routing can be evaluated at all, let alone merged. Until
+then the t=8/16 column stays where it is, and the RoPE fan-out stays on Rayon.
+
 ### 26.3 What this means for the remaining §23.7 rows
 
 Softmax, Transpose, Concat and the MoE cells should not be attacked as separate
@@ -2127,8 +2167,955 @@ of their arithmetic; their t=8/16 numbers are mostly measuring thread wake-up.
 Any per-kernel tuning done against the t=16 column now is tuning against the
 scheduler, and will have to be redone.
 
+Per §26.2.1 that now reads more sharply: the scheduler work itself is blocked
+behind SMT-aware spin capping, so *neither* the per-kernel tuning nor the
+hot-pool routing is the next move.
+
 The exception is §11.5's paged/appendable KV cache. `Concat` re-copying the full
 history every token is a real algorithmic cost that no scheduler change touches,
 and §8 already established that parallelising `ConcatKernel` is a dead end. That
 remains the largest genuinely structural gap and is independent of all of the
 above.
+
+## 27. Where the CPU EP actually stands
+
+> **Correction (§31).** The 66-cell grid in this section was produced by the MLAS-linked
+> `bench_generic` and does not describe the shipping build. See §31.5 for the corrected
+> production-native matrix.
+
+Full transform + KV-concat grid on `main` at `f2e6ad97d`, paired interleaved
+against a real ORT 1.27 CPU session, one driver invocation, 5 trials × 60 runs ×
+15 warmups. Ratio is native/ORT p50, **lower is better**, and `< 1.000` is a win.
+
+| model | t=1 | t=8 | t=16 |
+|---|---|---|---|
+| kvcat_llama3_b8_p2047 | **0.883** | 2.203 | 2.250 |
+| kvcat_llama3_p1023 | 1.002 | 4.672 | 3.930 |
+| kvcat_llama3_p2047 | **0.968** | 3.545 | 3.878 |
+| kvcat_llama3_p4095 | 1.706 | 5.075 | 6.633 |
+| kvcat_llama3_p8191 | 1.004 | 2.824 | 2.955 |
+| rope_gptj_il_s1 | 1.300 | 1.290 | 1.287 |
+| rope_gptj_il_s128 | **0.878** | 3.864 | 5.800 |
+| rope_gptj_il_s512 | **0.962** | 3.018 | 5.773 |
+| rope_llama3_b8_s1 | 1.160 | 1.261 | **0.874** |
+| rope_llama3_s1 | 1.295 | 1.295 | 1.295 |
+| rope_llama3_s128 | 1.022 | 4.657 | 17.557 |
+| rope_llama3_s512 | 1.024 | 3.589 | 5.230 |
+| sm_bert_b8_s128 | 1.246 | 3.294 | 5.179 |
+| sm_decode_h32_kv1024 | 1.177 | 1.987 | 2.051 |
+| sm_decode_h32_kv2048 | 1.183 | 2.648 | 3.015 |
+| sm_decode_h32_kv4096 | 1.188 | 4.143 | 4.268 |
+| sm_decode_h32_kv8192 | 1.214 | 5.423 | 6.776 |
+| sm_prefill_h32_s512 | 1.328 | 2.539 | 2.655 |
+| sm_whisper_cross | 1.374 | 2.933 | 3.059 |
+| tr_bert_b8_s128 | **0.607** | 1.068 | 1.715 |
+| tr_llama3_s512 | **0.820** | 2.796 | 4.292 |
+| tr_whisper_s1500 | **0.984** | 2.311 | 3.413 |
+
+**8 of 66 cells win. 58 lose. Parity 330/330 PASS.**
+
+Read by column rather than by row, which is the whole point of §26:
+
+| threads | wins | median ratio |
+|---|---|---|
+| 1 | 8 / 22 | ~1.02 |
+| 8 | 0 / 22 | ~3.0 |
+| 16 | 1 / 22 | ~3.6 |
+
+At **t=1** the kernels are at parity - median 1.02, eight outright wins, and the
+worst cell is 1.706. That column is a fair measure of the arithmetic, and it
+says the arithmetic is broadly competitive. At **t=8 and t=16** the median is
+3-3.6× with almost no wins. The kernels did not get worse; the scheduling did.
+
+Two caveats on this table, stated rather than buried. The host is shared and
+contended, so absolute numbers drift between runs - `rope_llama3_s128` at t=16
+reads 17.557 here and 9.457 in the §26.2.1 grid taken later the same session.
+Only ratios from a single driver invocation are comparable, which is why the
+arms are interleaved. And cells whose native p50 is under ~100 µs
+(`rope_*_s1`, `rope_llama3_b8_s1`) are overhead-dominated, which is why they sit
+near a flat ~1.3 at every thread count instead of scaling.
+
+### 27.1 The honest blocker list
+
+1. **SMT-aware spin capping** (§26.2.1) - blocks the entire t=8/16 column, which
+   is 58 of the 66 losing cells. Nothing else in this list can be measured
+   cleanly until it lands.
+2. **Paged/appendable KV cache** (§11.5) - the `kvcat_*` rows re-copy the whole
+   history per token. Independent of (1); the only structural item that is
+   actionable right now.
+3. **Fused transpose-with-consumer** (§7, §19, §20) - `tr_*` wins at t=1 by
+   reading and writing less, and that advantage should compose into QK/PV/MoE
+   rather than being spent on a standalone node.
+4. **Grouped/batched MoE GEMM** (§18) - not in this grid; measured separately at
+   1.47-2.37× on qwen3-moe e16 top-8.
+5. **Fused-attention session A/B** (§15) - the `sm_*` rows here are isolated
+   single-node graphs. Softmax has to win inside a real fused SDPA region.
+6. **Output/intermediate arena** (§21.3) - #1146 removed the input half;
+   `collect_outputs` remains.
+
+## 28. Phase 8: the appendable KV path, and what it actually cost
+
+Phase 8 went at the KV cache structurally rather than through the scheduler
+(which Sebastian now owns). Mapping the CPU appendable-KV path turned up two
+defects that had nothing to do with thread counts, and both are now fixed.
+
+### 28.1 A bf16 KV cache widened its entire capacity, every forward (#1199)
+
+`PastCache::from_cache` classified a KV cache into one of three sources. It
+borrowed contiguous `f32` and contiguous `f16` and sent everything else to
+`to_dense_f32_widen`, which allocates a `Vec<f32>` over the cache's **whole
+physical capacity** and widens every element into it — for a result the append
+path then reads one token's rows out of and drops.
+
+`bf16` landed in that catch-all. Three things made it worse than it looks:
+
+* It is on the **general** path. `from_cache` runs on every
+  `GroupQueryAttention` forward, before any aliasing gate is evaluated.
+* It runs **twice per layer per token**.
+* It scales with **capacity**, not with the valid prefix, so it does not get
+  cheaper at short context and a generous `ONNX_GENAI_CPU_KV_MAX_LEN` makes it
+  worse.
+
+`f16` never paid any of it. The two half formats are handled identically
+everywhere else in the kernel; only the classifier had the gap.
+
+Classify + read one row at llama3-8B KV geometry (8 kv heads, head_dim 128,
+capacity 4096 — 4.19M elements, a 16 MiB widen), best of 7 x 20, release:
+
+| dtype | before | after |
+|---|---|---|
+| f16 | 83 ns | 83 ns |
+| **bf16** | **606 147 ns** | **81 ns** |
+
+bf16 now costs what f16 costs. On a 32-layer decoder that is ~39 ms per token
+of pure widen removed; the unchanged f16 column confirms nothing else moved.
+
+**The part worth remembering.** The first version of this fix used
+`widen_bf16_slice_into`, a raw `(bits << 16)` shift. The path it replaced
+reaches `half::bf16::to_f32`, which **quiets signalling NaN**. Those two
+disagree on exactly 126 of the 65536 bit patterns. `dtype.rs` already carried a
+warning about precisely this, on `widen_quieting`:
+
+> A bulk path that replaces the latter has to quiet, or it would silently
+> change what every bf16 kernel sees for sNaN inputs.
+
+`cast.rs`, `elementwise.rs` and `dense_elementwise.rs` had each taken that
+advice and each left a comment saying so. This kernel was the one that did not
+— and the reason it was easy to get wrong is that there was no *safe* slice
+wrapper for the quieting widen, only the unsafe AVX2 intrinsic. There is one
+now (`widen_bf16_slice_quieting_into`), documented against its raw sibling.
+
+The test that "verified" bit-identity listed one NaN pattern and happened to
+pick a **quiet** one, so it passed against a non-quieting widen. It is now an
+exhaustive sweep of all 65536 patterns across six `(start, len)` windows. Two
+further instances of the same defect in the same kernel — `HalfKv::widen_into`
+on the in-place append path, and `widen_rotary_prefix`, whose own fallback four
+lines below is `to_dense_f32_widen` — were fixed with it.
+
+### 28.2 The CPU KV cache could not grow at all (#1203)
+
+`decode_cpu_inplace` hard-errored the moment a context outgrew the cache:
+
+    bail!("CPU KV capacity exceeded: requested context length {total_len}, ...")
+
+`DEFAULT_CPU_KV_MAX_LEN` is 4096, so **token 4097 killed the generation**. The
+suggested remedy — raise the env var — means guessing a bigger number up front
+and paying for it in resident memory for the whole run. The CUDA path has had
+growth since it landed (`ensure_capacity`, bucketing, VMM remap); the CPU path
+had none of it.
+
+Capacity is axis 2 of `[B, H, capacity, Dh]`, not the outermost axis, so head
+`i` lives at `i * capacity * Dh` and **growing relocates every head but the
+first**. A flat memcpy would leave head 1 onward reading the previous head's
+tail — plausible numbers, silently wrong attention, no crash. The prefix is
+carried one contiguous run per `(batch, head)` block. Growth doubles, so
+re-binding is amortised O(1) per token.
+
+**The end-to-end test was worthless on the first attempt, and this is the
+lesson.** It asserted that a decode with a deliberately tiny KV capacity
+produced the same tokens as one with room to spare. It passed — and it *also*
+passed when growth was changed to drop the entire KV history, because the
+scalar-GQA fixture's q/k/v are `Constant` zeros and its output does not depend
+on cache contents at all. Token equality proved nothing.
+
+The property worth testing is the one the unit tests cannot reach:
+`GroupQueryAttention` decides to append in place by comparing the past-input
+and present-output pointers **at execution time**, so a reallocated buffer that
+failed to re-alias would silently stop appending. Nothing observable
+distinguished that from success — so the f32 in-place path now has a counter
+(`present_inplace_count()`, mirroring the half-precision one that already
+existed), and the test asserts a cache forced to grow repeatedly appends in
+place **exactly as often** as one that never grows. Breaking the aliasing fails
+it. As a side effect these counters, which had no consumer outside the kernel's
+own unit tests, now have one.
+
+### 28.3 Where the KV axis stands against ORT, context 1k–8k
+
+Concat-shaped KV, matched paired-interleaved A/B, one driver invocation,
+5 trials x 30 runs x 10 warmups. Ratio is native/ORT, lower is better.
+Parity **60/60 PASS**.
+
+| model | t=1 | t=8 | t=16 |
+|---|---|---|---|
+| kvcat_llama3_p1023 | **0.979** | 4.079 | 4.207 |
+| kvcat_llama3_p2047 | **0.978** | 4.298 | 5.585 |
+| kvcat_llama3_p4095 | 1.981 | 5.122 | 5.322 |
+| kvcat_llama3_p8191 | **1.009** | 2.418 | 2.698 |
+
+Two things to read here, and one not to.
+
+* **t=1 is at parity across the whole 1k–8k range** (0.98–1.01), with p4095 the
+  single exception.
+* **t=8/16 lose 2.4–5.6×.** This is §26's worker-park effect, not a KV defect:
+  the same shape of result appears on every kernel in §27 regardless of what it
+  computes. It is Sebastian's area and nothing in Phase 8 touches it.
+* **Do not read the p4095 row as a regression against p8191.** ORT's absolute
+  time doubles from p4095 to p8191 (1.92 → 3.73 ms) as expected, while native's
+  is flat (3.81 → 3.76 ms). Native is paying a roughly fixed ~3.8 ms at both
+  lengths, so the *ratio* improves with context purely because ORT's cost grows
+  into it. That flat cost is unexplained and is the next thing to chase on this
+  axis; the honest summary is "native does not scale with past length here the
+  way ORT does, in both directions".
+
+### 28.4 What is still structurally blocked
+
+`Concat`-shaped KV caches still pay the full O(S) history copy, and that is
+still the §13 boundary: `ExternalValue` has no strides field, so a device-bound
+value is always dense, and a capacity-backed dense view of `[B,H,S,D]` with the
+growth axis at position 2 is not expressible. The GQA present==past route
+(which Phase 8 improved) remains the only appendable path, and the engine still
+declines to take it for any non-f32 cache, so the bf16 fix above is reachable
+today only through the raw session API — though it applies to every bf16 GQA
+forward regardless.
+
+Beam reorder still does not exist for CPU or CUDA; `num_beams` is passthrough
+metadata and the decode loop is single-sequence. Nothing in Phase 8 changed
+that, and no claim about beam search should be made from this work.
+
+## 29. Phase 9: Softmax was paying for a copy ORT never makes (#1219)
+
+### 29.1 The defect
+
+`softmax_rows` - the shared entry point every `Softmax` node reaches, and the one
+`scale_mask_softmax_rows` and `softmax_slices` route through - began with
+
+    dst.copy_from_slice(src);
+    softmax_rows_in_place(dst, n, d);
+
+That is a full extra read+write pass over the tensor before any arithmetic happens. On
+`sm_prefill_h32_s512` the logit block is 33 MiB, so each inference moved **66 MiB** of
+traffic that produced no result. ORT never pays it: it hands `MlasComputeSoftmax` the
+graph input and output buffers directly.
+
+This is the whole explanation for §9's and §27's standing Softmax losses. The kernel's
+arithmetic was never the problem, and no amount of vectorising the reducer would have
+found it - the cost was in the line before the reducer was called.
+
+### 29.2 The fix
+
+Compute out-of-place. The reducer already traverses each row twice (once for the max,
+once for the exponent sum), so writing into `dst` on the final pass instead of
+pre-seeding `dst` with a copy is free. `softmax_rows_serial_out(src, dst, n, d)` takes
+the two buffers separately and has both a pure-Rust and an MLAS arm.
+
+Aliasing was already handled upstream and did not need new guards:
+`output_direct_write_eligible` refuses the direct-write slice when input and output
+overlap, so `softmax_rows` is only ever handed disjoint buffers. The pre-existing test
+`an_output_aliasing_its_input_matches_the_disjoint_result` covers that path.
+
+### 29.3 Result
+
+Paired interleaved A/B, one driver invocation, 3 repetitions x 40 runs x 15 warmups,
+`--native-threads 1 --ort-intra-threads 1`, base arm built from `origin/main` in a
+separate worktree. Median `native/ort`, lower is better:
+
+| model | before | after |
+|---|---|---|
+| sm_prefill_h32_s512 | 1.318 | **0.924** |
+| sm_bert_b8_s128 | 1.242 | 1.033 |
+| sm_decode_h32_kv1024 | 1.174 | 1.015 |
+| sm_decode_h32_kv2048 | 1.291 | 1.026 |
+| sm_decode_h32_kv4096 | 1.183 | 1.028 |
+| sm_decode_h32_kv8192 | 1.199 | 1.035 |
+
+Parity 36/36 PASS, `max_abs=0` in every cell.
+
+**What this does not claim.** One shape is won outright. The other five moved from a
+17-29% loss to a 1.5-3.5% loss. They are *not* won. The remaining few percent on those
+shapes is unattributed and is the next thing to chase on this axis.
+
+### 29.4 A measurement caveat that applies to this whole document
+
+> **Superseded by §31.** The caveat below was correct and its consequence was far larger
+> than it estimated. The harness has since been fixed (#1231) and the production arm
+> measured. The main table in §29.3, and every ratio in §18 and §27, is an **MLAS-arm**
+> number. See §31.6 for exactly which tables are affected.
+
+`onnx-genai-bench` declares `required-features = ["mlas"]`, so `bench_generic` can only
+be built with MLAS linked in. Every ratio published in this document - including §27's
+66-cell grid - was therefore produced by the **MLAS-linked build**, and where a kernel
+has an MLAS arm (`softmax_rows_serial` does) that arm is what was measured.
+
+`mlas` is **not** a default feature of `onnx-runtime-ep-cpu`. The build that ships runs
+the pure-Rust arm. For this change that distinction does not affect the conclusion,
+because the removed copy sat at the shared, arm-agnostic `softmax_rows` call site and
+both arms lose it identically. But it does mean the *magnitude* of the win on the
+production build is unmeasured, and no ratio in this document should be read as a
+statement about a non-MLAS build until the harness can produce one. Fixing that -
+relaxing `required-features` so `bench_generic` can build both arms - is open work.
+
+### 29.5 Review finding: the bit-identity claim had no in-tree assertion
+
+The adversarial review of #1219 accepted the change but noted that its central claim -
+that the out-of-place form is bit-identical to the copy-then-in-place form - rested on
+prose. Every existing test compared with a `1e-6` tolerance over finite synthetic
+logits, and the non-finite tests exercised `softmax_rows_in_place`, not `softmax_rows`.
+
+That gap matters here specifically because the in-place reducer is vectorised and the
+out-of-place path is not, so the two `exp` implementations have to agree on the
+non-finite lanes exactly. `out_of_place_softmax_is_bit_identical_on_pathological_rows`
+now compares raw bits over fully masked rows, `+inf`-max rows, quiet, signalling and
+negative-payload NaNs, and denormals.
+
+Two things are worth recording about writing it:
+
+* The first falsifier chosen - guarding the normalisation with
+  `if sum == 0.0 { 0.0 }` - **did not trip the test**, and the reason was that the
+  test's own doc comment was wrong. A fully masked row does not normalise `0.0/0.0`:
+  the row max is `-inf`, so `exp(-inf - -inf)` is `exp(NaN)` and the sum is NaN, never
+  zero. The NaN arrives by propagation, not by division. A falsifier that fails to fire
+  is not evidence the test is vacuous - it can equally mean the falsifier is
+  inapplicable - and the only way to tell the two apart is to work out *why*.
+* The test carries an explicit non-vacuity guard asserting those rows still produce NaN
+  at all, so a future change that quietly made every row finite would fail loudly
+  instead of leaving a bit comparison that is trivially true. This is the third vacuous
+  or near-vacuous test caught in this effort (§28.2 has the other two); assume the
+  default state of a new test is vacuous until a falsifier has been run against it.
+
+## 30. Phase 10: the profiler was charging the run for its own instrument (#1226)
+
+### 30.1 The defect
+
+`activation_memory_planning_enabled()` returned `phase_profile::enabled()`, so the
+executor's activation-memory planner ran on every run whenever phase profiling was on.
+The planner rebuilds the view map and re-plans every activation each run - work the
+shipped runtime never does. `--phase-profile` therefore perturbed the run it was
+measuring and reported its own cost back as a phase of that run,
+`run_scoped.activation_memory_plan`, which no unprofiled run ever pays.
+
+The planner now has its own gate. `--phase-profile` drives the profiler only;
+`NXRT_EXEC_PHASE_PROFILE=1` in the environment still enables both, so the CLI memory
+report keeps its stats; `NXRT_ACTIVATION_MEMORY_PLAN=1` opts in without profiling.
+
+The CUDA step profiler switched the planner on as a side effect of enabling phase
+accounting, taxing the very decode steps it exists to time. That coupling is gone.
+
+### 30.2 Magnitude, and two withdrawn claims
+
+The planner's own span reads **1.9-6.0 us per run**. Removing it lowers `native_min` on
+`sm_decode_h32_kv4096` from **0.065 ms to 0.063 ms** - median of 15 interleaved
+repetitions, 300 runs each, single thread, both arms in one loop, 13 of 15 favouring
+the fixed arm. About **3%**, in line with the span.
+
+The first version of this section, and of the PR, claimed a **35%** inflation
+(0.065 -> 0.088 ms, ratio 1.023 -> 1.080) and claimed the planner also polluted the
+adjacent `exec_kernel.compute` figure (84.5 vs 60.3 us/call). **Both are withdrawn.**
+Review could not reproduce either, and a properly interleaved re-measurement showed
+why: this host is bimodal under contention, the 0.065/0.088 ms split appears in
+**both** arms, and `exec_kernel.compute` swings 75-168 us/call regardless of the
+planner.
+
+### 30.3 The methodology lesson, which is the point of this section
+
+The withdrawn numbers were produced by running arm A three times, then arm B three
+times, inside one shell loop - and reading the *mean* `native=` field. Every arm-vs-arm
+number in this document is supposed to come from interleaved repetitions in one
+invocation, precisely because this host drifts. I wrote the loop that way, saw a clean
+35% separation, and believed it, because the separation was large and the story was
+satisfying. It was the machine changing state between the two halves of the loop.
+
+Three things that would have caught it, and are now the standing rule for this
+document:
+
+* **Interleave at the innermost level.** A B A B A B, not A A A B B B. The second form
+  cannot distinguish an arm effect from a time effect, and on this host time effects
+  are large.
+* **Prefer `native_min` to the mean for small graphs.** The minimum over 300 runs is
+  the least contaminated estimator available when the noise is one-sided, which
+  contention noise is. Switching to it turned an unstable 0.065-vs-0.088 into a stable
+  0.065-vs-0.063.
+* **Distrust a result proportional to how much you like it.** A 35% win from deleting
+  one planning call was far larger than the planner's own measured span, and that
+  internal inconsistency - the span said 2-6 us, the wall clock said 23 us - was
+  visible in my own output before review saw it. When the mechanism's measured cost
+  and the claimed effect disagree by an order of magnitude, the effect is wrong.
+
+The change still stands: charging a run for the instrument observing it is a defect
+whatever its size, and the phantom phase made every per-phase attribution taken with
+`--phase-profile` wrong by construction. Section 21's boundary instrument and every
+attribution derived from it were taken under the coupled gate and should be re-read.
+
+### 30.4 A third vacuous test, and why this one was interesting
+
+The first regression test passed, and then still passed when the planner was
+deliberately re-coupled to phase profiling. The gate read `#[cfg(test)] { true }`, so
+the production wiring was the one line no unit test could reach; the test pinned the
+module's parts and not the wiring between them.
+
+Removing the `cfg(test)` override so tests and production share one gate is what made
+it testable, and the two tests that genuinely need the planner now pin the production
+wiring as a side effect of asking for it explicitly. Re-coupling the wiring fails both.
+
+Counting §28.2 and §29.5, that is four vacuous or near-vacuous tests found in this
+effort. Every one of them passed when written. The only thing that separated the real
+tests from the decorative ones was running the falsifier - and in §29.5 even the
+falsifier misfired, which is its own lesson: a falsifier that does not fire is not
+evidence the test is sound until you know *why* it did not fire.
+
+
+## 31. Phase 11: the benchmark was measuring an arm that does not ship (#1231, #1234, #1241)
+
+### 31.1 The defect
+
+`crates/onnx-genai-bench/Cargo.toml` declared:
+
+```toml
+[[bin]]
+name = "bench_generic"
+required-features = ["mlas"]
+```
+
+`bench_generic` contains **no MLAS references at all**. The requirement was gratuitous.
+But `mlas` is not a default feature of `onnx-runtime-ep-cpu`, so the effect was that the
+only binary anyone benchmarked with was the one configuration production never builds.
+
+Every ratio in this document up to §30 was therefore an MLAS-arm measurement, read and
+acted on as though it described the shipping runtime. §29.4 spotted the harness problem
+and correctly flagged it as open work; it badly underestimated the consequence.
+
+#1231 changed the requirement to a `bench-native` feature, added an `arm=native` /
+`arm=mlas-reference` label to every result line, and added `mlas_is_not_a_default_feature`
+so the crate fails loudly if MLAS ever becomes default.
+
+A feature flag is not proof. The falsifier that is proof:
+
+```
+$ nm -C target/release/bench_generic | grep -ci mlas
+0        # --features bench-native   (the arm that ships)
+805      # --features mlas           (the research/reference arm)
+```
+
+Every performance claim from here on is taken with that `0` verified on the same binary.
+
+### 31.2 What it hid
+
+Two kernels turned out to have no vectorized production path at all. Both had looked
+fine for months because the MLAS arm was covering for them.
+
+**Softmax.** The `#[cfg(not(feature = "mlas"))]` arm called scalar `f32::exp()` once per
+element. `scale_mask_softmax_serial` routes through the same helper, so fused attention
+paid it too. The doc comment claiming an "8-lane polynomial" described only the MLAS arm.
+
+| model | production native | mlas reference |
+|---|--:|--:|
+| sm_prefill_h32_s512 | **10.012** | 0.908 |
+| sm_bert_b8_s128 | **9.621** | 1.032 |
+| sm_decode_h32_kv1024 | **9.302** | 1.011 |
+| sm_decode_h32_kv2048 | **9.944** | 1.013 |
+| sm_decode_h32_kv4096 | **10.535** | 1.028 |
+| sm_decode_h32_kv8192 | **10.861** | 1.000 |
+
+**MoE.** Worse. The shipping path allocated and filled a full transposed copy of an
+expert's weight matrix *on every call, for every routed expert group*, because expert
+weights are stored `[out_features][in_features]` while `gemm` wants `[K][N]`. For a
+Mixtral-shaped expert with `swiglu_fusion=1` that is a 29 MiB allocate-and-transpose for
+fc1 plus 14.7 MB for fc2 - to multiply a **single token row**.
+
+| model | production native, before |
+|---|--:|
+| moe_mixtral_h1024_i3584_e8_t1 | **71.4** |
+| moe_qwen3moe_h2048_i768_e16_t1 | **42.0** |
+| moe_phi35moe_h2048_i6400_e4_t1 | **48.4** |
+
+§18.3 had recorded every `t=1` MoE cell at 1.006-1.052 and concluded the remaining MoE
+problem was purely thread scheduling at `t=8/16`. On the arm that ships, `t=1` was the
+worst cell in the entire benchmark suite.
+
+### 31.3 The fixes
+
+**#1234, softmax.** Both non-MLAS forms now route through one
+`softmax_row_core(src, dst, d)` with an AVX2+FMA `exp`: Cody-Waite split of `ln2`, a
+degree-6 Cephes minimax polynomial in FMA form, `2^k` built as `(k + 127) << 23`, runtime
+`is_x86_feature_detected!` dispatch, scalar fallback for non-AVX2 and for sub-8 tails.
+Non-finite lanes are handled by explicit masks: NaN by unordered-compare plus `blendv`,
+`-inf` and deep underflow forced to exactly `0` by ordered-compare plus `andnot`. Review
+independently measured the result at **max 1 ULP** against an f64 reference across the
+whole domain.
+
+**#1241, MoE.** `gemm_bt(a, bt, c, m, k, n)` computes `C = A * Bt^T` directly on the
+`[out][in]` expert slice, so the transposed copy is never materialized. That layout is
+also the better one: for `C[i][j] = sum_k A[i][k] * Bt[j][k]` both operands are
+contiguous along `k`, making the inner loop a pure contiguous dot product instead of a
+strided gather. Interior tiles are swept column-panel-first so a ~256 KiB `bt` panel is
+reused across row bands - without that, an expert bank larger than the 32 MiB L3 (the
+Phi experts are 52 MiB) is re-streamed from DRAM once per row band, which regressed the
+largest prefill shape until it was fixed.
+
+### 31.4 A note on what this says about the transpose question
+
+§19 and §20 closed the Transpose investigation on the grounds that the Transpose *kernel*
+moves zero bytes in-graph, and that a layout-aware consumer was "a real cost these graphs
+simply do not exercise" - so a synthetic fixture would have to be built to demonstrate it.
+
+That conclusion was wrong, and it was wrong because it only looked at `Transpose` nodes.
+The most expensive transpose in the runtime was not a node at all: it was a materialized
+transpose *inside* the MoE kernel, feeding straight into a GEMM. The fixture did not need
+building. It was already the single largest term in the operator, on three of the models
+in this document, and it went unseen because the MLAS arm did not take that path.
+
+### 31.5 Corrected production-native matrix
+
+All cells: production build (`bench-native`, 0 MLAS symbols), thread-matched at
+`--native-threads 1 --ort-intra-threads 1`, `native_min`/`ort_min`, models interleaved
+and order-alternated across reps, min/median/max of per-rep ratios. Ratio is native/ORT,
+so **below 1.000 beats ORT**. Parity PASS in every cell shown.
+
+**Transforms, after #1234:**
+
+| group | model | min | med | max |
+|---|---|--:|--:|--:|
+| softmax | sm_prefill_h32_s512 | 1.455 | 1.460 | 1.470 |
+| softmax | sm_bert_b8_s128 | 1.472 | 1.477 | 1.485 |
+| softmax | sm_decode_h32_kv1024 | 1.529 | 1.529 | 1.625 |
+| softmax | sm_decode_h32_kv2048 | 1.613 | 1.633 | 1.805 |
+| softmax | sm_decode_h32_kv4096 | 1.574 | 1.574 | 1.574 |
+| softmax | sm_decode_h32_kv8192 | 1.603 | 1.622 | 1.650 |
+| softmax | sm_whisper_cross | 1.289 | 1.295 | 1.300 |
+| rope | rope_llama3_s1 | 1.250 | 1.250 | 1.250 |
+| rope | rope_llama3_s128 | **0.759** | **0.766** | 0.802 |
+| rope | rope_llama3_s512 | **0.833** | **0.861** | 0.956 |
+| rope | rope_llama3_b8_s1 | **0.900** | 1.000 | 1.000 |
+| rope | rope_gptj_il_s1 | 1.250 | 1.250 | 1.500 |
+| rope | rope_gptj_il_s128 | **0.821** | **0.855** | 0.861 |
+| rope | rope_gptj_il_s512 | **0.941** | 1.002 | 1.017 |
+| transpose | tr_bert_b8_s128 | **0.569** | **0.582** | 0.616 |
+| transpose | tr_llama3_s512 | 1.023 | 1.046 | 1.647 |
+| transpose | tr_whisper_s1500 | **0.679** | **0.846** | 0.994 |
+| kvcat | kvcat_llama3_p1023 | 1.115 | 1.179 | 1.218 |
+| kvcat | kvcat_llama3_p2047 | **0.981** | 1.015 | 1.273 |
+| kvcat | kvcat_llama3_p4095 | **0.986** | 1.070 | 1.161 |
+| kvcat | kvcat_llama3_p8191 | **0.999** | 1.052 | 1.066 |
+| kvcat | kvcat_llama3_b8_p2047 | **0.947** | **0.975** | 0.984 |
+
+**MoE, before and after #1241** (before column is the production arm, freshly measured,
+not the MLAS numbers from §18.3):
+
+| model | before (med) | after: min | med | max |
+|---|--:|--:|--:|--:|
+| moe_mixtral_h1024_i3584_e8_t1 | 71.366 | **0.897** | **0.926** | 0.952 |
+| moe_mixtral_h1024_i3584_e8_t32 | 17.852 | **0.752** | **0.805** | 0.806 |
+| moe_mixtral_h1024_i3584_e8_t512 | 3.670 | 1.217 | 1.232 | 1.240 |
+| moe_qwen3moe_h2048_i768_e16_t1 | 41.958 | **0.912** | **0.918** | 0.927 |
+| moe_qwen3moe_h2048_i768_e16_t32 | 8.241 | **0.975** | 1.007 | 1.057 |
+| moe_qwen3moe_h2048_i768_e16_t512 | 1.877 | 1.375 | 1.383 | 1.388 |
+| moe_phi35moe_h2048_i6400_e4_t1 | 48.365 | 1.094 | 1.102 | 1.136 |
+| moe_phi35moe_h2048_i6400_e4_t32 | 9.008 | 1.213 | 1.225 | 1.238 |
+| moe_phi35moe_h2048_i6400_e4_t512 | 1.921 | 1.553 | 1.557 | 1.571 |
+
+### 31.6 Which earlier tables are now known to be wrong
+
+Any ratio in this document produced before #1231 came from the MLAS-linked binary.
+Concretely:
+
+- **§18.3's 27-cell MoE matrix** - MLAS arm. Its central conclusion, that `t=1` MoE is at
+  parity and only `t=8/16` scheduling remains, was false for the shipping build. Banner added.
+- **§27's 66-cell grid** - MLAS arm. Banner added.
+- **§29.3's softmax table** - MLAS arm. The *direction* of that change (removing a copy at
+  the shared, arm-agnostic call site) still holds, and §31.5 shows the production arm
+  post-fix, but the magnitudes in §29.3 are not production magnitudes. Banner added at §29.4.
+- **§21's boundary instrument** - taken under the coupled profiler gate later fixed in
+  #1226, *and* on the MLAS arm. Both reasons to re-read it before relying on it.
+
+Sections that do not depend on a ratio - the structural analysis in §13, the aliasing and
+capacity work in §28, the methodology in §30 - are unaffected.
+
+### 31.7 What this adds to the methodology rules
+
+§30.3 established: interleave innermost, prefer `native_min` on small graphs, distrust an
+effect an order of magnitude larger than its mechanism. Phase 11 adds two more.
+
+1. **Benchmark the artifact that ships, and prove it with the linker, not the flag.**
+   `required-features` silently redefined what "the CPU EP" meant for every measurement in
+   this document. `nm -C | grep -ci mlas` is cheap, and it is the only statement about
+   linkage that a feature flag cannot make for you.
+
+2. **A fallback arm hides the absence of the primary one.** Neither the scalar `exp` nor
+   the materialized MoE transpose was subtle. Both survived because the configuration
+   under measurement never executed them. When a kernel has two arms, the untested arm is
+   not "probably similar" - it is unmeasured, and here it was 10x and 70x.
+
+### 31.8 Where the CPU EP now stands, honestly
+
+Won at `t=1`: RoPE at s128/s512, both Transpose shapes that matter, KV concat at every
+context length from 2047 up, MoE decode on mixtral and qwen3moe.
+
+Still losing at `t=1`: **softmax, 1.29-1.63x** across the whole family - a 6-7x
+improvement on #1234 but not parity, and the remaining cost is the three-pass
+memory-bound structure, not `exp`. **MoE prefill, 1.22-1.56x** - microkernel efficiency
+against MLAS's packed panels and wider register tiles. **phi35moe decode, 1.10x** -
+bandwidth-bound, the most weight bytes per token of the three. `rope_*_s1` and
+`kvcat_p1023` at 1.12-1.25x are per-call overhead on graphs too small to amortize it.
+
+Not started: paged/appendable KV behind an attention-owned handle (§13's boundary
+stands), and beam reorder, which still does not exist on any EP.
+
+Nothing here defers to ORT and nothing links MLAS.
+
+## 32. Phase 12: erf's Estrin reassociation, and a perf number that is hardware-dependent by nature (#1218)
+
+The change in #1218 is sound and it landed: `erf`'s two on-path polynomials (the
+big-branch `R` and the `exp` it feeds) now evaluate by Estrin's scheme instead of
+Horner's, trading two extra multiplies for half the dependency depth on a
+latency-bound chain. The interesting part for this ledger is what happened when a
+second reviewer re-measured the speedup on different hardware, and got a different
+magnitude — not because either number is wrong, but because a CPU perf result is a
+property of the machine it was taken on.
+
+### 32.1 Two measurements, two machines, no conflict
+
+The change was measured twice, on two different microarchitectures, against two
+different references. Both are reported here as peers:
+
+| source | hardware | method | result |
+| --- | --- | --- | --- |
+| original (#1218) | many-core **AMD server** part | vs an ORT reference on that box | **~1.36x vs ORT** (from 1.66x) |
+| reviewer | **Intel Core i7-13800H** (14C/20T, laptop-class), Windows 11 | ORT-independent same-binary A/B on `erf_avx2`; single thread; min-of-200 × 9 rounds; 1,048,576 mixed-range elements | **0.6346 ms → 0.6042 ms = ~5.0% (1.05x)** |
+
+These are **not in conflict and neither refutes the other.** They differ on every axis
+that matters for a CPU kernel timing: different microarchitecture (server AMD vs client
+Intel), different core count, and different reference (one is a ratio *relative to ORT*,
+the other an *internal* Horner-vs-Estrin A/B on the same binary because no ORT reference
+build was available on the review host). A latency-bound reassociation win is exactly
+the kind of result that scales with pipeline depth, memory system, and how much of the
+work is exposed to the out-of-order engine — all of which change between those two
+parts. The honest reading is: **Estrin is faster on both machines; the magnitude is
+hardware-dependent**, ~5% on this laptop and reported larger relative to ORT on the
+server part.
+
+### 32.2 The general lesson: CPU perf numbers here are hardware-dependent, and must carry their metadata
+
+This is the reusable point, and it is bigger than one PR. Server-class many-core AMD
+parts and consumer Intel laptops are **different measurement environments**; the same
+kernel change can be ~5% on one and a different ratio on the other, with neither being
+an error. It follows that **any CPU perf number recorded in these docs is only
+interpretable if it carries its hardware, its thread count, and its reference baseline.**
+A bare "1.36x" or "5%" with none of that attached cannot be compared to anything later,
+because the reader has no way to know whether a difference is a real change or just a
+different chip.
+
+Some entries in this benchmark corpus predate that discipline and record a ratio without
+naming the host, the thread count, or the ORT reference build. This section does not go
+fix them — it flags that the gap exists, so that new entries name their environment and
+old bare numbers are read with appropriate caution.
+
+### 32.3 The durable fact: this reassociation is NOT bit-identical
+
+Unlike the perf number, this part **is** hardware-independent — it is a property of the
+shipped kernel, true on every machine, so it is the most important thing to write down.
+Estrin reassociates floating-point FMAs, so it **does not** produce the same bits as
+Horner, by construction. A two-build dump-and-diff over 404,045 points — `[-6,6]`
+sampled densely, the `0.921875` split boundary, large `|x|`, denormals, and NaN/±inf —
+establishes the actual envelope:
+
+* **Estrin differs from Horner by at most exactly one ULP.** 4,401 of 404,043 finite
+  points (1.09%) differ, every one of them by a single ULP; max absolute difference
+  5.96e-8. Nothing anywhere in the domain moves by more than one ULP.
+* **Against f64 `erf` truth:** max error Horner 5.77e-8, Estrin 6.55e-8 (worst just
+  past the split, x≈0.933). Both are within ~1 ULP of the correctly-rounded f32
+  result; Estrin is at most ~0.8e-8 looser than Horner and never worse than one ULP
+  from it.
+* **Special values are correct and identical between the two:** large `|x|`
+  (7 … 1e30, `f32::MAX`) saturate to ±1.0; denormals produce bit-identical outputs;
+  NaN → NaN; +inf → +1.0; −inf → −1.0.
+
+The tripwire is the test **`erf_reassociation_costs_no_accuracy`** in
+`kernels/simd_activations.rs`: it pins the worst scaled error over `|x|<=1` at `2^-24`
+(half a ULP) against `erf_avx2` directly, so a future regrouping that widens the
+envelope fails the build instead of being absorbed by the looser `ERF_BOUND`. A reader
+who needs to know whether erf is bit-stable should start there.
+
+## 33. Phase 13: a CPU task runtime, because the scheduler was the loss
+
+§26 measured the thing that costs the most and is not arithmetic: Rayon parks
+its workers between parallel regions, so a fan-out costs **67 µs when it follows
+another fan-out immediately and 226 µs when it follows a 20 µs gap**. Decode is
+a stream of small regions separated by exactly that kind of gap. Every kernel
+that fans out pays the parked number, every layer, forever.
+
+That is a scheduler problem, and it does not get better by making the kernels
+faster. This phase replaces the fan-out mechanism.
+
+### 33.1 Two backends, chosen by where we are running
+
+`onnx_runtime_ep_cpu::task_runtime` is a thin façade over two implementations,
+and the choice is made per call:
+
+| condition | backend |
+|---|---|
+| `total == 0`, forced serial, or already inside a task | `Serial` |
+| a `KernelContext` with `ParallelFor` is installed | `Host` |
+| otherwise, and the work splits into ≥2 tasks | `Native` |
+| otherwise | `Serial` |
+
+**Inside the plugin EP we do not run our own threads at all.** ORT has already
+sized an intra-op pool from the session's `intra_op_num_threads`, and starting a
+second pool beside it oversubscribes every core. `Host` routes the fan-out into
+`KernelContext_ParallelFor` through the existing `host_parallel` shim, so our
+kernels schedule exactly like every other ORT kernel and inherit the session's
+thread count, its affinity settings and its spin policy. This is not a fallback
+in the §23 sense — no node is handed to ORT's CPU EP, no kernel is skipped, and
+the arithmetic is still entirely ours. Only the `for` loop is the host's.
+
+`Native` is for the standalone runtime, where there is no host pool to borrow
+and Rayon is the only alternative.
+
+Nesting is checked in both directions (`in_host_task()`, `in_task()`). A kernel
+that fans out from inside another fan-out runs serially rather than exploding
+the region count, which is what made the earlier hot-pool RoPE attempt bimodal.
+
+### 33.2 The native pool
+
+Eight job slots, not one. A single-slot pool serialises concurrent dispatchers,
+which is the wrong answer when two sessions decode at once; with eight, they get
+real parallelism, and a ninth concurrent dispatcher gets `false` back and runs
+its own work serially rather than blocking. Slot exhaustion is a counter
+(`slot_exhausted`), so the assumption is falsifiable rather than assumed —
+measured **0 in 9744 dispatches** across the concurrency harness.
+
+Workers watch a single `epoch` counter with `atomic_wait`, and the publish order
+is: write the job, store `remaining`, store `claim` (Release), set the active
+bit, bump `epoch`, wake. The soundness argument is the claim protocol: a worker
+that successfully claims a range has proved `remaining > 0`, which proves the
+dispatcher is still blocked, which proves the closure's stack frame is alive.
+
+**Adaptive spin, 20 µs → 500 µs**, doubling when a worker catches work in its
+spin window and halving when it parks. This is the part that answers §26: the
+window self-sizes to the actual gap between regions instead of being tuned to a
+guess.
+
+### 33.3 Width: SMT-capped, but only above 8 hardware threads
+
+Whether to use both SMT siblings is not obvious for memory-bound kernels — the
+second sibling adds no execution resources but does add a memory-level-
+parallelism generator. So it was measured, on one binary, with one arm forced to
+an explicit uncapped width:
+
+| logical CPUs | physical | capped wins | uncapped wins |
+|---|---|---|---|
+| 2 | 1 | 0/4 | 4/4, by 14–19% |
+| 4 | 2 | 0/4 | 4/4, by 3–25% |
+| 8 | 4 | 1/4 | 3/4, by 10–26% |
+| 16 | 8 | **3/4, by 12–45%** | 1/4 |
+| 32 | 16 | **3/4, by 12–36%** | 1/4 |
+
+The cap only pays above 8 hardware threads, so `SMT_CAP_FLOOR = 8`: an inferred
+width is never capped below 8. Below that the sibling is still worth having;
+above it, the extra spinning worker costs more than the memory parallelism it
+buys. The split is not uniform even above the floor — the largest
+bandwidth-bound softmax prefers SMT at *every* width, the smallest RoPE prefers
+the cap at every width — which is why this is a floor and not a rule.
+
+An **explicit** budget (`set_task_thread_budget`, `ONNX_GENAI_CPU_TASK_THREADS`)
+is never capped. If a caller says 32, they get 32; the cap is an inference, and
+inferences do not override instructions.
+
+### 33.4 What it costs to dispatch
+
+16 workers, 400 rounds per sample, release build, on the §0 host:
+
+| gap before dispatch | p50 | p90 | | concurrent sessions | p50 | p90 |
+|---|---|---|---|---|---|---|
+| 0 µs | 4.8 µs | 5.2 µs | | 1 | 5.3 µs | 5.7 µs |
+| 5 µs | 4.9 µs | 5.2 µs | | 2 | 5.4 µs | 5.9 µs |
+| 20 µs | 4.8 µs | 5.2 µs | | 4 | 5.4 µs | 6.1 µs |
+| 100 µs | 4.9 µs | 5.3 µs | | 8 | 6.3 µs | 7.6 µs |
+| 500 µs | 43.8 µs | 46.4 µs | | | | |
+| 2000 µs | 34.7 µs | 44.8 µs | | | | |
+
+Against Rayon's 67 µs / 226 µs that is **14× back-to-back and 47× after a
+decode-shaped gap**. The 14× matters less than the flatness: 0 µs and 100 µs
+cost the same, so a decode step no longer pays for having been idle. Past the
+500 µs spin ceiling the workers do park and the cost returns to Rayon's order —
+which is correct, because at that point the process really is idle and should
+not be burning a core.
+
+`tests/task_runtime_latency.rs` asserts the decode-shaped part of this
+(gaps ≤ 100 µs stay within 3× back-to-back + 10 µs). It is `#[ignore]`d, because
+a latency assertion on a shared CI runner is a flake generator.
+
+### 33.5 Idle cost, which is the price of spinning
+
+A spinning pool that never parks is a regression disguised as a speedup.
+`tests/task_runtime_idle.rs` bounds both ends: after the spin window elapses the
+workers must be parked (bounded CPU over a 750 ms idle window) and the pool's
+resident set must not grow with dispatch count.
+
+The test is deliberately **one** `#[test]` with two phases. Two test functions
+in one binary run concurrently by default, and both of these measure
+whole-process CPU and RSS — so as separate tests they measured each other, and
+the idle bound failed with 1.31 s of CPU over a 750 ms window.
+
+### 33.6 Test hooks, not environment variables
+
+`task_runtime::testing` exposes `force_serial()`, `isolated_pool(n)`,
+`counters()`, `pool_width()` and `planned_backend()`. Nothing in the production
+path reads an environment variable for test purposes, and the tests do not race
+on a global by construction: `isolated_pool` builds a private pool rather than
+reconfiguring the shared one.
+
+### 33.7 RoPE and Softmax, moved onto it
+
+Real ORT A/B, one driver invocation per pair, 7 trials × 7 runs. Ratio is
+native ÷ ORT, lower is better, `base>new`:
+
+| cell | t=1 | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|---|
+| rope_llama3_s128 | 0.78>0.77 | 1.74>1.34 | 2.36>1.35 | 4.61>1.61 | 7.18>1.39 | 39.40>1.15 |
+| rope_llama3_s512 | 0.94>0.92 | 1.52>1.32 | 1.68>1.39 | 3.49>1.92 | 4.47>1.90 | 26.72>2.34 |
+| rope_gptj_il_s128 | 0.87>0.87 | 1.72>1.28 | 2.14>1.53 | 3.78>1.54 | 6.68>1.50 | 51.31>3.40 |
+| rope_gptj_il_s512 | 0.98>0.98 | 1.63>1.36 | 1.83>1.35 | 3.38>2.00 | 4.83>1.76 | 24.37>2.68 |
+| sm_bert_b8_s128 | 1.26>1.29 | 2.04>1.63 | 2.12>1.67 | 3.62>1.93 | 5.56>2.58 | 3.72>2.44 |
+| sm_prefill_h32_s512 | 1.33>1.34 | 2.21>2.14 | 2.33>1.45 | 2.54>2.06 | 2.54>2.23 | 5.58>1.53 |
+| sm_whisper_cross | 1.36>1.38 | 2.25>2.28 | 2.50>2.58 | 3.00>2.57 | 2.54>2.79 | 1.75>1.85 |
+
+Our own native milliseconds for the same runs, which is the honest view of what
+*we* changed — the ratio also moves when ORT moves, and ORT's spread on this
+shared host reaches 50% on the small cells:
+
+| cell | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|
+| rope_llama3_s128 | 0.126>0.091 | 0.103>0.067 | 0.151>0.051 | 0.233>0.043 | 2.239>0.148 |
+| rope_llama3_s512 | 0.415>0.351 | 0.242>0.193 | 0.359>0.169 | 0.382>0.128 | 2.918>0.221 |
+| rope_gptj_il_s128 | 0.137>0.103 | 0.104>0.077 | 0.132>0.052 | 0.248>0.046 | 3.711>0.170 |
+| rope_gptj_il_s512 | 0.429>0.402 | 0.253>0.211 | 0.354>0.212 | 0.452>0.140 | 3.505>0.251 |
+| sm_bert_b8_s128 | 0.908>0.883 | 0.491>0.461 | 0.476>0.334 | 0.617>0.262 | 3.536>0.328 |
+
+Up to **15× at 32 threads** and **5.4× at 16**. The largest wins are in the
+widest columns, which is where §26 said the park cost was worst — the prediction
+and the measurement agree, which is the main reason to believe the mechanism.
+
+The decode-shaped cells are deliberately unmoved: `rope_*_s1` and
+`sm_decode_h32_kv*` are below the parallel threshold and run serially in both
+arms, flat to within noise at every width. A one-token RoPE should not be
+fanning out and still does not.
+
+### 33.7.1 The scar: an unrelated edit de-vectorised the activations
+
+Rewiring RoPE and Softmax made **`Tanh` and `Sigmoid` 2× slower at one thread**,
+in a file the change did not touch, on inputs that never reach a parallel path.
+
+`avx2::map_ps` takes the per-vector kernel as `impl Fn(__m256) -> __m256` and
+calls it once per eight lanes. Its body is a couple of hundred bytes of
+polynomial, which sits right at the inliner's threshold, so whether it inlined
+came out of a cost model with the whole crate in view — and an edit anywhere
+could flip it. `nm -S` is what caught it: `tanh_avx2` went from one 511-byte
+function to a 5-byte shim calling an outlined `map_ps` calling an outlined
+216-byte closure. Tanh `[32,4096]` 0.053 → 0.100 ms, Sigmoid 0.054 → 0.104 ms.
+
+Two things about this are worth keeping:
+
+1. **`codegen-units = 1` does not prevent it.** It is already pinned for this
+   package (#1174) for exactly this class of bug. One codegen unit still leaves
+   the inline decision to a cost model. The fix has to be `#[inline(always)]`.
+2. **The A/B grid nearly published it as a scheduler result.** The first
+   activation grid showed 74 regressed cells, including at t=1 where no
+   scheduling happens. The t=1 column is what made it obviously not a scheduler
+   effect. Any grid that only reports the widths it is trying to improve would
+   have attributed this to the runtime.
+
+`#[inline(always)]` and `#[target_feature]` cannot coexist in Rust, which is why
+neither helper carries the latter; every caller is already inside an `avx2,fma`
+function, so the features arrive with the inline.
+
+### 33.7.2 Re-verified against §29's Softmax, not the one it replaced
+
+The Softmax numbers above were taken before #1219 landed, so their baseline was
+a `softmax_rows` that still copied `src` into `dst` before reducing. Merging
+main changed the thing this phase is measured against, and the merge itself had
+to resolve a conflict inside `softmax_rows` — #1219 removed the copy, this phase
+moved the fan-out onto the task runtime, and both edits are in the same four
+lines. The resolution keeps both: one `compute_softmax` per task's whole chunk
+run, reading `src` and writing `dst` directly, with no copy anywhere.
+
+Re-run against the merged baseline (22 transform cells, 6 widths, 9 trials,
+paired arms in one driver invocation), native ms, base = `origin/main` at
+`54e8e831f`:
+
+| cell | t=4 | t=8 | t=16 | t=32 |
+| ---- | --- | --- | ---- | ---- |
+| `sm_bert_b8_s128`    | 0.644→0.378 (1.7×) | 0.565→0.320 (1.8×) | 0.840→0.291 (2.9×) | 2.751→0.485 (**5.7×**) |
+| `sm_prefill_h32_s512`| 2.697→2.164 (1.2×) | 1.900→1.747 (1.1×) | 2.111→1.722 (1.2×) | 4.572→1.078 (**4.2×**) |
+
+The win survives the merge, and its shape is unchanged: it grows with width,
+because what it removes is a per-region park, not a per-element cost. The
+decode-shaped `sm_decode_h32_kv*` cells stay serial and stay flat (18–182 µs,
+within ±1 µs of base at every width), and `sm_whisper_cross` is neutral at every
+width — both are the intended outcome, not a miss.
+
+### 33.8 Transpose and the activations, and what the controls say
+
+Activations, our own native ms, `base>new`, 5 trials × 7 runs:
+
+| cell | t=1 | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|---|
+| act_relu_hidden_t512 | 0.838>0.822 | 0.546>0.488 | 0.295>0.251 | 0.276>0.183 | 0.381>0.130 | 1.201>0.303 |
+| act_tanh_hidden_t512 | 0.804>0.803 | 0.806>0.794 | 0.457>0.417 | 0.419>0.317 | 0.485>0.204 | 1.441>0.386 |
+| act_sigmoid_hidden_t512 | 0.826>0.837 | 0.832>0.808 | 0.640>0.559 | 0.462>0.296 | 0.513>0.214 | 1.176>0.437 |
+| act_tanh_hidden_t4096 | 6.398>6.542 | 6.331>6.436 | 4.300>3.412 | 3.609>3.494 | 3.691>3.490 | 5.991>2.933 |
+| act_sigmoid_hidden_t4096 | 6.532>6.680 | 6.488>6.605 | 3.547>3.465 | 3.560>3.476 | 3.672>3.539 | 6.070>2.356 |
+| act_fastgelu_mlp_t512 | 5.466>5.448 | 5.169>5.294 | 2.815>2.765 | 2.156>1.864 | 1.949>1.553 | 4.461>1.463 |
+
+27 improved cells against 5 regressed at a 5% deadband, and the five are 1–6 µs
+absolute or bandwidth-bound cells whose distributions overlap outright. Up to
+3.6× at t=16 and 4× at t=32.
+
+Transpose needed 15 trials rather than 7 before it said anything stable — at 7
+it produced a `tr_bert_b8_s128` "regression" that was entirely dispersion:
+
+| cell | t=1 | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|---|
+| tr_bert_b8_s128 | 0.117>0.119 | 0.152>0.153 | 0.111>0.112 | 0.134>0.140 | 0.261>0.248 | 2.658>2.670 |
+| tr_llama3_s512 | 0.718>0.705 | 0.390>0.389 | 0.227>0.228 | 0.253>0.239 | 0.430>0.352 | 3.412>3.101 |
+| tr_whisper_s1500 | 0.566>0.593 | 0.448>0.442 | 0.353>0.358 | 0.307>0.296 | 0.397>0.380 | 3.292>3.017 |
+
+4 improved, 0 regressed. Transpose is a straight copy, so it is bandwidth-bound
+long before it is scheduler-bound; the gain is small and lives at the wide end.
+
+**The controls.** Two families this work does not touch were run at the same six
+widths purely to establish the noise floor: 24 GQA attention cells (32 improved
+/ 27 regressed) and 20 GEMM cells (19 / 12). Both are symmetric, which is what
+licenses reading the 3–15× numbers as real rather than as luck. Anyone repeating
+this on this host should budget for ±25% on a single 7-trial cell and treat any
+claim smaller than that as unmeasured.
+
+### 33.9 The biggest remaining loss is GEMM, and it is the same disease
+
+The GEMM control was meant to be a null result and instead found the largest
+single loss in the CPU EP. Decode-shaped `MatMulNBits`, native ms:
+
+| cell | t=8 | t=16 | t=32 | ratio vs ORT at t=32 |
+|---|---|---|---|---|
+| gemm_nbits_qwen3_0p6b_qkv_t8 | 0.67 | 0.64 | **2.98** | 25.99 |
+| gemm_nbits_qwen3_0p6b_mlp_t8 | 1.17 | 1.03 | **3.81** | 18.73 |
+| gemm_nbits_llama3_8b_qkv_t8 | 4.15 | 3.05 | **6.07** | 8.64 |
+
+Going from 16 to 32 threads makes these **4.6× slower**, on the operator that
+carries most of a decode step's arithmetic. That is the §26 signature exactly,
+and `matmul_nbits.rs` is still the largest raw-Rayon fan-out in the crate.
+
+Prefill-shaped GEMM (`t128`, `t512`) does not show it: those regions are long
+enough to amortise a park. It is specifically the small, frequent, decode-shaped
+region that the global pool cannot serve, which is the whole thesis of §26.
+
+Nothing in this phase touches it. It is the next target, and the runtime it
+needs already exists.

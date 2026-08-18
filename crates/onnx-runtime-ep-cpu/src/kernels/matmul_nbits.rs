@@ -3033,6 +3033,26 @@ fn decode_threads_override() -> Option<usize> {
         .map(std::num::NonZeroUsize::get)
 }
 
+/// The CPU decode thread budget, if one was configured explicitly.
+///
+/// Returns the programmatic override set by [`set_decode_thread_budget`] when
+/// present, otherwise a positive `ONNX_GENAI_CPU_DECODE_THREADS`, otherwise
+/// `None`. Unlike [`configured_persistent_decode_threads`] this applies no
+/// default: `None` means "nobody asked for a specific width", which is what a
+/// caller needs to know before substituting a default of its own.
+///
+/// `0` (the documented opt-out) reads as `None` for the same reason — it is a
+/// request to *not* size a pool from this knob.
+pub fn decode_thread_budget() -> Option<usize> {
+    decode_threads_override().or_else(|| {
+        std::env::var(DECODE_THREADS_ENV)
+            .ok()?
+            .parse::<usize>()
+            .ok()
+            .filter(|threads| *threads > 0)
+    })
+}
+
 /// Enable or disable the resident dequantized-f32 decode cache for the process.
 ///
 /// The memory-strategy plan calls this before the native decode session is
@@ -3770,7 +3790,10 @@ fn decode_affinity_cpus(threads: usize) -> std::result::Result<Option<Vec<usize>
 fn report_decode_affinity_policy(message: &str) {
     static REPORTED: OnceLock<()> = OnceLock::new();
     if REPORTED.set(()).is_ok() {
-        eprintln!("onnx-genai: decode affinity policy: {message}");
+        eprintln!(
+            "onnx-genai: native CPU worker affinity policy: {message}. \
+             This configures CPU kernels only and does not select the decode backend"
+        );
     }
 }
 

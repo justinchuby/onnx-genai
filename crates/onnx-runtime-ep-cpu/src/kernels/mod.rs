@@ -189,7 +189,7 @@ static INDEX_DTYPES: &[DataType] = &[DataType::Int64, DataType::Int32];
 /// `GroupQueryAttention`'s `seqlens_k` / `total_sequence_length` are int32. The
 /// union test then rejects those slots and the node is silently handed to ORT's
 /// CPU EP, even though our kernel runs it. That contradicts this EP's contract
-/// (see `provider.rs::claim_preference_node`): a node we can execute is never
+/// (see `provider.rs::supports_op`): a node we can execute is never
 /// delegated. Listing the integer slots explicitly is what makes the two most
 /// important decode ops in the engine reachable at all;
 /// `plugin_ort_e2e.rs::no_supported_node_is_ever_left_to_the_ort_cpu_ep` is the
@@ -345,7 +345,9 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("LeakyRelu", "")
         | ("HardSigmoid", "")
         | ("Selu", "")
-        | ("ThresholdedRelu", "") => FLOAT_DTYPES,
+        | ("ThresholdedRelu", "")
+        | ("Celu", "")
+        | ("Mish", "") => FLOAT_DTYPES,
 
         // Softmax, LogSoftmax, ReduceMean, LayerNorm, etc.: float-only.
         ("Softmax", "")
@@ -662,6 +664,8 @@ pub const PHASE1_OPS: &[&str] = &[
     "Elu",
     "LeakyRelu",
     "HardSigmoid",
+    "Celu",
+    "Mish",
     // Logical / selection.
     "And",
     "Or",
@@ -1341,6 +1345,16 @@ fn build_cpu_registry_recorded_inner(
     rec.register(OpKey::new("Sinh", "", 1), Box::new(unary_math::SinhFactory));
     rec.register(OpKey::new("Tan", "", 1), Box::new(unary_math::TanFactory));
     rec.register(OpKey::new("Elu", "", 1), Box::new(activations::EluFactory));
+    // Celu is opset 12, Mish opset 18 -- registering at their introducing
+    // opset keeps older models routing to whatever handled them before.
+    rec.register(
+        OpKey::new("Celu", "", 12),
+        Box::new(activations::CeluFactory),
+    );
+    rec.register(
+        OpKey::new("Mish", "", 18),
+        Box::new(activations::MishFactory),
+    );
     rec.register(
         OpKey::new("LeakyRelu", "", 1),
         Box::new(activations::LeakyReluFactory),

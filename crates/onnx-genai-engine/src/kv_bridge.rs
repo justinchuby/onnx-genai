@@ -467,7 +467,10 @@ pub(crate) fn load_materialized_past(
     decode_state: &mut DecodeState,
     materialized: &onnx_genai_kv::MaterializedKv,
 ) -> anyhow::Result<()> {
-    decode_state.past = materialized_past_values(session, kv_model, materialized)?;
+    decode_state.set_past(
+        materialized_past_values(session, kv_model, materialized)?,
+        materialized.sequence_len,
+    );
     Ok(())
 }
 
@@ -766,7 +769,7 @@ pub(crate) fn rewind_decode_state_to_len(
             .rewind_to(seq, len)
             .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {e}"))?;
         *kv_token_count = len;
-        decode_state.past.clear();
+        decode_state.set_past(HashMap::new(), 0);
         return Ok(());
     }
     let kv_model = kv_model.context("missing KV model after rewind check")?;
@@ -783,7 +786,7 @@ pub(crate) fn rewind_decode_state_to_len(
         .rewind_to(seq, len)
         .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {e}"))?;
     *kv_token_count = len;
-    decode_state.past = past;
+    decode_state.set_past(past, len);
     Ok(())
 }
 
@@ -1606,18 +1609,19 @@ mod tests {
         };
         let io = fixture_io("tiny-llm")?;
         let mut state = DecodeState::new_with_io(&session, Some(&io))?;
-        state
-            .past
-            .insert("stale".into(), Value::from_vec_f32(vec![0.0], &[1])?);
+        state.set_past(
+            HashMap::from([("stale".to_string(), Value::from_vec_f32(vec![0.0], &[1])?)]),
+            1,
+        );
 
         load_materialized_past(&session, &model, &mut state, &materialized)?;
 
-        assert!(!state.past.contains_key("stale"));
-        let key = &state.past["past_key_values.0.key"];
+        assert!(!state.past().contains_key("stale"));
+        let key = &state.past()["past_key_values.0.key"];
         assert_eq!(key.shape(), &[1, 2, 2, 8]);
         assert_eq!(key.to_vec_f32()?, materialized.layers[0].key);
         assert_eq!(
-            state.past["past_key_values.0.value"].to_vec_f32()?,
+            state.past()["past_key_values.0.value"].to_vec_f32()?,
             materialized.layers[0].value
         );
         Ok(())
@@ -1716,7 +1720,7 @@ mod tests {
         )?;
         assert_eq!(count, 2);
         assert_eq!(
-            decode_state.past["past_key_values.0.key"].shape(),
+            decode_state.past()["past_key_values.0.key"].shape(),
             &[1, 2, 2, 8]
         );
 
@@ -1730,7 +1734,7 @@ mod tests {
             RewindRequest::new(0, RewindRunnerPolicy::AllowRunnerRewind),
         )?;
         assert_eq!(count, 0);
-        assert!(decode_state.past.is_empty());
+        assert!(decode_state.past().is_empty());
 
         count = 1;
         let error = rewind_decode_state_to_len(
@@ -1830,11 +1834,11 @@ mod tests {
 
         run_decode_step(&session, &mut state, &[2, 4], 0)?;
         assert_eq!(state.retained_kv_len(2), 2);
-        assert!(state.past.values().all(|value| value.shape()[2] == 2));
+        assert!(state.past().values().all(|value| value.shape()[2] == 2));
 
         run_decode_step(&session, &mut state, &[3], 2)?;
         assert_eq!(state.retained_kv_len(3), 2);
-        assert!(state.past.values().all(|value| value.shape()[2] == 2));
+        assert!(state.past().values().all(|value| value.shape()[2] == 2));
         // A declared share-buffer KV dtype (shared_kv_max_len = Some) does not
         // override sliding-window attention: the model still takes the bounded
         // paged sliding-window path (shared_buffer: false), since the append-only
@@ -1947,17 +1951,17 @@ mod tests {
         // present_len=2, window covers the whole buffer (window_start=0 <= sink).
         run_decode_step(&session, &mut state, &[2, 4], 0)?;
         assert_eq!(state.retained_kv_len(2), 2);
-        assert!(state.past.values().all(|value| value.shape()[2] == 2));
+        assert!(state.past().values().all(|value| value.shape()[2] == 2));
 
         // present_len=3, window_start=1 == sink: still keep everything.
         run_decode_step(&session, &mut state, &[3], 2)?;
         assert_eq!(state.retained_kv_len(3), 3);
-        assert!(state.past.values().all(|value| value.shape()[2] == 3));
+        assert!(state.past().values().all(|value| value.shape()[2] == 3));
 
         // present_len=4, window_start=2 > sink=1: pin sink row + trailing window.
         run_decode_step(&session, &mut state, &[5], 3)?;
         assert_eq!(state.retained_kv_len(4), 3);
-        assert!(state.past.values().all(|value| value.shape()[2] == 3));
+        assert!(state.past().values().all(|value| value.shape()[2] == 3));
         Ok(())
     }
 

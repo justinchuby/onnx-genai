@@ -1272,8 +1272,17 @@ impl ExecutionProvider for CudaExecutionProvider {
         batch: usize,
         dtype: DataType,
         result: &mut DeviceBuffer,
+        tie_break: onnx_runtime_ep_api::ArgmaxTieBreak,
     ) -> Result<()> {
-        crate::kernels::device_argmax::launch(&self.runtime, logits, elements, batch, dtype, result)
+        crate::kernels::device_argmax::launch(
+            &self.runtime,
+            logits,
+            elements,
+            batch,
+            dtype,
+            result,
+            tie_break.select_last_index(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -9,7 +9,8 @@
 //! and narrows back to the requested output float type:
 //!
 //! * `Abs`, `Neg`, `Reciprocal` — trivial arithmetic.
-//! * `Exp`, `Log`, `Sin`, `Cos` — `std` intrinsics.
+//! * `Exp`, `Log` — vectorised on AVX2+FMA (see [`simd_activations`]).
+//! * `Sin`, `Cos` — `std` intrinsics.
 //! * `Floor`, `Ceil` — `std` intrinsics.
 //! * `Round` — ONNX "round half to even" (banker's rounding), not Rust's
 //!   round-half-away-from-zero `f32::round`; uses [`f32::round_ties_even`].
@@ -197,6 +198,7 @@ impl UnaryMathKernel {
             MathOp::Round => simd_activations::round_ties_even_f32_slice(x, y),
             MathOp::Sign => simd_activations::sign_f32_slice(x, y),
             MathOp::Softsign => simd_activations::softsign_f32_slice(x, y),
+            MathOp::Log => simd_activations::log_f32_slice(x, y),
             op => {
                 for (o, &v) in y.iter_mut().zip(x.iter()) {
                     *o = op.apply(v);

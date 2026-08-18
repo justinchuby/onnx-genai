@@ -123,6 +123,87 @@ mod phase_profile {
         STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
     }
 
+    static PLAN_STATE: AtomicU8 = AtomicU8::new(0); // 0 = unknown, 1 = off, 2 = on
+
+    /// Whether to run the activation-memory *planner* during a run.
+    ///
+    /// Deliberately **not** `enabled()`. The planner is a separate instrument:
+    /// it rebuilds the view map and re-plans every activation on every run,
+    /// work the shipped runtime never does. Its own span measures 1.9-6.0us
+    /// per run, so charging it to `--phase-profile` meant the profiler
+    /// perturbed the run it was measuring and reported its own cost back as a
+    /// phase of that run. Removing it lowers `native_min` on a softmax decode
+    /// from 0.065ms to 0.063ms, median of 15 interleaved repetitions - about
+    /// 3%, in line with the span.
+    ///
+    /// Reading the environment directly, rather than `enabled()`, is what
+    /// separates the two: `enable_for_process()` (what `--phase-profile` calls)
+    /// no longer switches the planner on, while anyone who set
+    /// `NXRT_EXEC_PHASE_PROFILE=1` in the environment - the CLI memory report's
+    /// path to these stats - keeps getting them.
+    pub fn activation_plan_enabled() -> bool {
+        match PLAN_STATE.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let on = ["NXRT_ACTIVATION_MEMORY_PLAN", "NXRT_EXEC_PHASE_PROFILE"]
+                    .iter()
+                    .any(|key| {
+                        std::env::var(key).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    });
+                PLAN_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+                on
+            }
+        }
+    }
+
+    /// Opt a process into activation-memory planning without turning on phase
+    /// profiling, for callers that want the stats and are willing to pay.
+    pub fn enable_activation_plan_for_process() {
+        PLAN_STATE.store(2, Ordering::Relaxed);
+    }
+
+    /// Test-only override of the env-derived planner state.
+    #[cfg(test)]
+    pub(super) fn force_activation_plan_enabled(on: bool) {
+        PLAN_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    }
+
+    /// Holds the planner on for one test and clears it on drop, so a leaked
+    /// gate cannot be observed by a later test that does not take the lock.
+    ///
+    /// The field is never read on purpose: it is the [`globals_lock`] guard,
+    /// and holding it is the whole point.  `dead_code` cannot see that a
+    /// `MutexGuard`'s value is its `Drop`, so it has to be told.
+    #[cfg(test)]
+    pub(super) struct ActivationPlanForTest(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    #[cfg(test)]
+    impl ActivationPlanForTest {
+        pub(super) fn on() -> Self {
+            let guard = globals_lock();
+            force_activation_plan_enabled(true);
+            Self(guard)
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for ActivationPlanForTest {
+        fn drop(&mut self) {
+            force_activation_plan_enabled(false);
+        }
+    }
+
+    /// Serialises the tests that write the two process-global gates above.
+    /// Both are plain atomics with no per-test isolation, so without this the
+    /// parallel runner lets one test's `enable`/`force` land inside another
+    /// test's assertion window.
+    #[cfg(test)]
+    pub(super) fn globals_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn enable_for_process() {
         STATE.store(2, Ordering::Relaxed);
     }
@@ -300,6 +381,13 @@ pub fn reset_exec_phase_profile() {
 /// the cheap env-gated default untouched.
 pub fn enable_exec_phase_profile_for_process() {
     phase_profile::enable_for_process();
+}
+
+/// Opt this process into the activation-memory planner, which runs on every
+/// `Run` and is *not* enabled by [`enable_exec_phase_profile_for_process`]
+/// because it costs enough to distort the run it would be reported against.
+pub fn enable_activation_memory_plan_for_process() {
+    phase_profile::enable_activation_plan_for_process();
 }
 
 /// Activation-memory planner metrics from the most recent measured top-level run.

@@ -2,8 +2,247 @@
 
 use super::*;
 
+use super::session_state::{CheckedPosition, SessionLen, SessionStore};
+
 fn generate_uses_scheduler(_backend: EngineDecodeBackend) -> bool {
     true
+}
+
+/// Logical token length of an ORT-backed session, the single source of the
+/// "session not found" answer for the ORT arm of the shared session policy.
+fn ort_logical_len(engine: &Engine, id: SessionId) -> Option<usize> {
+    engine.sessions.get(&id).map(|state| state.tokens.len())
+}
+
+/// Logical token length of a native-backed session.
+#[cfg(feature = "native-backend")]
+fn native_logical_len(engine: &Engine, id: SessionId) -> Option<usize> {
+    engine
+        .native_sessions
+        .get(&id)
+        .map(|state| state.tokens.len())
+}
+
+/// The ORT backend as a [`SessionStore`]: a session in `Engine::sessions`, its
+/// paged KV sequence, its scheduler entry, and any aligned draft state.
+struct OrtSessions<'a>(&'a mut Engine);
+
+/// Read-only view of the ORT backend for `&self` policy calls (checkpoint,
+/// token count), which need only the logical length.
+struct OrtSessionsRef<'a>(&'a Engine);
+
+impl SessionLen for OrtSessions<'_> {
+    fn logical_len(&self, id: SessionId) -> Option<usize> {
+        ort_logical_len(self.0, id)
+    }
+}
+
+impl SessionLen for OrtSessionsRef<'_> {
+    fn logical_len(&self, id: SessionId) -> Option<usize> {
+        ort_logical_len(self.0, id)
+    }
+}
+
+impl SessionStore for OrtSessions<'_> {
+    fn validate_rewind(&self, id: SessionId, target: CheckedPosition) -> anyhow::Result<()> {
+        let engine = &*self.0;
+        let position = target.get();
+        // Existence is guaranteed by the shared policy; a vanished session is a
+        // no-op here rather than a second not-found path.
+        let Some(state) = engine.sessions.get(&id) else {
+            return Ok(());
+        };
+        validate_target_state_rewind_to_len(
+            engine.kv_model.as_ref(),
+            &engine.kv_cache,
+            id,
+            state,
+            RewindRequest::new(position, RewindRunnerPolicy::RejectRunnerRewind),
+        )?;
+        if let (Some(draft_model), Some(draft)) = (&engine.draft, &state.draft) {
+            let draft_target = position.min(draft.tokens.len());
+            validate_draft_state_rewind_to_len(
+                draft_model,
+                draft,
+                RewindRequest::new(draft_target, RewindRunnerPolicy::RejectRunnerRewind),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn rewind(&mut self, id: SessionId, target: CheckedPosition) -> anyhow::Result<()> {
+        let engine = &mut *self.0;
+        let position = target.get();
+        engine.scheduler.complete(id);
+        let mut state = engine
+            .sessions
+            .remove(&id)
+            .with_context(|| format!("session {id} not found"))?;
+        let result = (|| {
+            let session = engine.session.as_deref().context(MISSING_ORT_SESSION)?;
+            rewind_target_state_to_len(
+                session,
+                engine.kv_model.as_ref(),
+                &mut engine.kv_cache,
+                id,
+                &mut state,
+                RewindRequest::new(position, RewindRunnerPolicy::RejectRunnerRewind),
+            )?;
+            if let (Some(draft_model), Some(draft)) = (&mut engine.draft, &mut state.draft) {
+                let draft_target = position.min(draft.tokens.len());
+                rewind_draft_state_to_len(
+                    draft_model,
+                    draft,
+                    RewindRequest::new(draft_target, RewindRunnerPolicy::RejectRunnerRewind),
+                )?;
+            }
+            Ok(())
+        })();
+        engine.sessions.insert(id, state);
+        result
+    }
+
+    fn reset(&mut self, id: SessionId) -> anyhow::Result<()> {
+        let engine = &mut *self.0;
+        engine.scheduler.complete(id);
+        engine
+            .kv_cache
+            .remove(id)
+            .map_err(|e| anyhow::anyhow!("Failed to reset KV sequence {id}: {e}"))?;
+        engine.kv_cache.page_table.create_sequence(id);
+        let decode_state = engine.new_target_decode_state()?;
+        let state = engine
+            .sessions
+            .get_mut(&id)
+            .context("session disappeared during reset")?;
+        state.tokens.clear();
+        state.kv_token_count = 0;
+        state.decode_state = decode_state;
+        if let (Some(draft_model), Some(draft)) = (&mut engine.draft, &mut state.draft) {
+            draft_model
+                .kv_cache
+                .remove(draft.seq)
+                .map_err(|e| anyhow::anyhow!("Failed to reset draft KV sequence: {e}"))?;
+            draft.seq = draft_model.kv_cache.create_sequence();
+            draft.tokens.clear();
+            draft.kv_token_count = 0;
+            draft.decode_state = DecodeState::new_for_path_with_io(
+                &draft_model.session,
+                &draft_model.decode_path,
+                draft_model.io.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn close(&mut self, id: SessionId) -> anyhow::Result<()> {
+        let engine = &mut *self.0;
+        engine.scheduler.complete(id);
+        let state = engine
+            .sessions
+            .remove(&id)
+            .with_context(|| format!("session {id} not found"))?;
+        engine
+            .kv_cache
+            .remove(id)
+            .map_err(|e| anyhow::anyhow!("Failed to remove KV sequence {id}: {e}"))?;
+        if let (Some(draft_model), Some(draft)) = (&mut engine.draft, state.draft) {
+            draft_model
+                .kv_cache
+                .remove(draft.seq)
+                .map_err(|e| anyhow::anyhow!("Failed to remove draft KV sequence: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// The native backend as a [`SessionStore`]: a token history in
+/// `Engine::native_sessions` and one in-process decoder that is rewound or reset
+/// only while it holds this session's KV (`native_active_session`).
+#[cfg(feature = "native-backend")]
+struct NativeSessions<'a>(&'a mut Engine);
+
+/// Read-only view of the native backend for `&self` policy calls.
+#[cfg(feature = "native-backend")]
+struct NativeSessionsRef<'a>(&'a Engine);
+
+#[cfg(feature = "native-backend")]
+impl SessionLen for NativeSessions<'_> {
+    fn logical_len(&self, id: SessionId) -> Option<usize> {
+        native_logical_len(self.0, id)
+    }
+}
+
+#[cfg(feature = "native-backend")]
+impl SessionLen for NativeSessionsRef<'_> {
+    fn logical_len(&self, id: SessionId) -> Option<usize> {
+        native_logical_len(self.0, id)
+    }
+}
+
+#[cfg(feature = "native-backend")]
+impl SessionStore for NativeSessions<'_> {
+    fn validate_rewind(&self, _id: SessionId, _target: CheckedPosition) -> anyhow::Result<()> {
+        // The native decoder always admits a rewind and clamps to its own
+        // materialized length in `rewind`; there is no runner/draft state to
+        // reject it the way ORT's does.
+        Ok(())
+    }
+
+    fn rewind(&mut self, id: SessionId, target: CheckedPosition) -> anyhow::Result<()> {
+        let engine = &mut *self.0;
+        let position = target.get();
+        if let Some(state) = engine.native_sessions.get_mut(&id) {
+            state.tokens.truncate(position);
+        }
+        if engine.native_active_session == Some(id) {
+            let native = engine
+                .native_session
+                .as_mut()
+                .context("native decoder session is unavailable")?;
+            native.rewind(position.min(native.current_len()))?;
+        }
+        let last_access = engine.touch_native_session();
+        if let Some(state) = engine.native_sessions.get_mut(&id) {
+            state.last_access = last_access;
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self, id: SessionId) -> anyhow::Result<()> {
+        let engine = &mut *self.0;
+        let last_access = engine.touch_native_session();
+        if let Some(state) = engine.native_sessions.get_mut(&id) {
+            state.tokens.clear();
+            state.last_access = last_access;
+        }
+        if engine.native_active_session == Some(id) {
+            let native = engine
+                .native_session
+                .as_mut()
+                .context("native decoder session is unavailable")?;
+            native.reset()?;
+            engine.native_active_session = None;
+        }
+        Ok(())
+    }
+
+    fn close(&mut self, id: SessionId) -> anyhow::Result<()> {
+        let engine = &mut *self.0;
+        engine.native_sessions.remove(&id);
+        if engine.native_active_session == Some(id) {
+            let native = engine
+                .native_session
+                .as_mut()
+                .context("native decoder session is unavailable")?;
+            native.reset()?;
+            engine.native_active_session = None;
+        }
+        if engine.native_default_session == Some(id) {
+            engine.native_default_session = None;
+        }
+        Ok(())
+    }
 }
 
 fn generation_budget_cap(cap: ScheduledBudgetCap) -> GenerationBudgetCap {
@@ -992,24 +1231,10 @@ impl Engine {
     pub fn checkpoint_session(&self, session_id: SessionId) -> anyhow::Result<SessionCheckpoint> {
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
-            let state = self
-                .native_sessions
-                .get(&session_id)
-                .with_context(|| format!("session {session_id} not found"))?;
-            return Ok(SessionCheckpoint {
-                session_id,
-                position: SessionPosition::new(state.tokens.len()),
-            });
+            return session_state::checkpoint(&NativeSessionsRef(self), session_id);
         }
         self.require_ort_backend("session checkpoints")?;
-        let state = self
-            .sessions
-            .get(&session_id)
-            .with_context(|| format!("session {session_id} not found"))?;
-        Ok(SessionCheckpoint {
-            session_id,
-            position: SessionPosition::new(state.tokens.len()),
-        })
+        session_state::checkpoint(&OrtSessionsRef(self), session_id)
     }
 
     /// Restore a persistent session to a previously checkpointed token boundary.
@@ -1030,36 +1255,10 @@ impl Engine {
     ) -> anyhow::Result<SessionPosition> {
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
-            let tokens = tokens.get();
-            let current = self
-                .native_sessions
-                .get(&session_id)
-                .with_context(|| format!("session {session_id} not found"))?
-                .tokens
-                .len();
-            let target = current.checked_sub(tokens).with_context(|| {
-                format!(
-                    "cannot rewind session {session_id} by {tokens} tokens from length {current}"
-                )
-            })?;
-            let target = SessionPosition::new(target);
-            self.rewind_session_to(session_id, target)?;
-            return Ok(target);
+            return session_state::rewind_by(&mut NativeSessions(self), session_id, tokens.get());
         }
         self.require_ort_backend("session rewind")?;
-        let tokens = tokens.get();
-        let current = self
-            .sessions
-            .get(&session_id)
-            .with_context(|| format!("session {session_id} not found"))?
-            .tokens
-            .len();
-        let target = current.checked_sub(tokens).with_context(|| {
-            format!("cannot rewind session {session_id} by {tokens} tokens from length {current}")
-        })?;
-        let target = SessionPosition::new(target);
-        self.rewind_session_to(session_id, target)?;
-        Ok(target)
+        session_state::rewind_by(&mut OrtSessions(self), session_id, tokens.get())
     }
 
     /// Rewind a persistent session to an absolute logical token position.
@@ -1074,91 +1273,10 @@ impl Engine {
     ) -> anyhow::Result<()> {
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
-            let position = position.get();
-            let current = self
-                .native_sessions
-                .get(&session_id)
-                .with_context(|| format!("session {session_id} not found"))?
-                .tokens
-                .len();
-            if position > current {
-                anyhow::bail!(
-                    "cannot rewind session {session_id} to token {position}; current length is {current}"
-                );
-            }
-            let state = self
-                .native_sessions
-                .get_mut(&session_id)
-                .with_context(|| format!("session {session_id} not found"))?;
-            state.tokens.truncate(position);
-            if self.native_active_session == Some(session_id) {
-                let native = self
-                    .native_session
-                    .as_mut()
-                    .context("native decoder session is unavailable")?;
-                native.rewind(position.min(native.current_len()))?;
-            }
-            let last_access = self.touch_native_session();
-            if let Some(state) = self.native_sessions.get_mut(&session_id) {
-                state.last_access = last_access;
-            }
-            return Ok(());
+            return session_state::rewind_to(&mut NativeSessions(self), session_id, position);
         }
         self.require_ort_backend("session rewind")?;
-        let position = position.get();
-        let state = self
-            .sessions
-            .get(&session_id)
-            .with_context(|| format!("session {session_id} not found"))?;
-        let current = state.tokens.len();
-        if position > current {
-            anyhow::bail!(
-                "cannot rewind session {session_id} to token {position}; current length is {current}"
-            );
-        }
-        validate_target_state_rewind_to_len(
-            self.kv_model.as_ref(),
-            &self.kv_cache,
-            session_id,
-            state,
-            RewindRequest::new(position, RewindRunnerPolicy::RejectRunnerRewind),
-        )?;
-        if let (Some(draft_model), Some(draft)) = (&self.draft, &state.draft) {
-            let draft_target = position.min(draft.tokens.len());
-            validate_draft_state_rewind_to_len(
-                draft_model,
-                draft,
-                RewindRequest::new(draft_target, RewindRunnerPolicy::RejectRunnerRewind),
-            )?;
-        }
-
-        self.scheduler.complete(session_id);
-        let mut state = self
-            .sessions
-            .remove(&session_id)
-            .with_context(|| format!("session {session_id} not found"))?;
-        let result = (|| {
-            let session = self.session.as_deref().context(MISSING_ORT_SESSION)?;
-            rewind_target_state_to_len(
-                session,
-                self.kv_model.as_ref(),
-                &mut self.kv_cache,
-                session_id,
-                &mut state,
-                RewindRequest::new(position, RewindRunnerPolicy::RejectRunnerRewind),
-            )?;
-            if let (Some(draft_model), Some(draft)) = (&mut self.draft, &mut state.draft) {
-                let draft_target = position.min(draft.tokens.len());
-                rewind_draft_state_to_len(
-                    draft_model,
-                    draft,
-                    RewindRequest::new(draft_target, RewindRunnerPolicy::RejectRunnerRewind),
-                )?;
-            }
-            Ok(())
-        })();
-        self.sessions.insert(session_id, state);
-        result
+        session_state::rewind_to(&mut OrtSessions(self), session_id, position)
     }
 
     /// Capability for session fork, if the selected backend supports safe CoW
@@ -1205,55 +1323,10 @@ impl Engine {
     pub fn reset_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
-            let last_access = self.touch_native_session();
-            let state = self
-                .native_sessions
-                .get_mut(&session_id)
-                .with_context(|| format!("session {session_id} not found"))?;
-            state.tokens.clear();
-            state.last_access = last_access;
-            if self.native_active_session == Some(session_id) {
-                let native = self
-                    .native_session
-                    .as_mut()
-                    .context("native decoder session is unavailable")?;
-                native.reset()?;
-                self.native_active_session = None;
-            }
-            return Ok(());
+            return session_state::reset(&mut NativeSessions(self), session_id);
         }
         self.require_ort_backend("persistent sessions")?;
-        if !self.sessions.contains_key(&session_id) {
-            anyhow::bail!("session {session_id} not found");
-        }
-        self.scheduler.complete(session_id);
-        self.kv_cache
-            .remove(session_id)
-            .map_err(|e| anyhow::anyhow!("Failed to reset KV sequence {session_id}: {e}"))?;
-        self.kv_cache.page_table.create_sequence(session_id);
-        let decode_state = self.new_target_decode_state()?;
-        let state = self
-            .sessions
-            .get_mut(&session_id)
-            .context("session disappeared during reset")?;
-        state.tokens.clear();
-        state.kv_token_count = 0;
-        state.decode_state = decode_state;
-        if let (Some(draft_model), Some(draft)) = (&mut self.draft, &mut state.draft) {
-            draft_model
-                .kv_cache
-                .remove(draft.seq)
-                .map_err(|e| anyhow::anyhow!("Failed to reset draft KV sequence: {e}"))?;
-            draft.seq = draft_model.kv_cache.create_sequence();
-            draft.tokens.clear();
-            draft.kv_token_count = 0;
-            draft.decode_state = DecodeState::new_for_path_with_io(
-                &draft_model.session,
-                &draft_model.decode_path,
-                draft_model.io.as_ref(),
-            )?;
-        }
-        Ok(())
+        session_state::reset(&mut OrtSessions(self), session_id)
     }
 
     fn new_target_decode_state(&self) -> anyhow::Result<DecodeState> {
@@ -1293,55 +1366,20 @@ impl Engine {
     pub fn close_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
-            self.native_sessions
-                .remove(&session_id)
-                .with_context(|| format!("session {session_id} not found"))?;
-            if self.native_active_session == Some(session_id) {
-                let native = self
-                    .native_session
-                    .as_mut()
-                    .context("native decoder session is unavailable")?;
-                native.reset()?;
-                self.native_active_session = None;
-            }
-            if self.native_default_session == Some(session_id) {
-                self.native_default_session = None;
-            }
-            return Ok(());
+            return session_state::close(&mut NativeSessions(self), session_id);
         }
         self.require_ort_backend("persistent sessions")?;
-        self.scheduler.complete(session_id);
-        let state = self
-            .sessions
-            .remove(&session_id)
-            .with_context(|| format!("session {session_id} not found"))?;
-        self.kv_cache
-            .remove(session_id)
-            .map_err(|e| anyhow::anyhow!("Failed to remove KV sequence {session_id}: {e}"))?;
-        if let (Some(draft_model), Some(draft)) = (&mut self.draft, state.draft) {
-            draft_model
-                .kv_cache
-                .remove(draft.seq)
-                .map_err(|e| anyhow::anyhow!("Failed to remove draft KV sequence: {e}"))?;
-        }
-        Ok(())
+        session_state::close(&mut OrtSessions(self), session_id)
     }
 
     /// Number of logical tokens retained in a persistent session.
     pub fn session_token_count(&self, session_id: SessionId) -> anyhow::Result<usize> {
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
-            return self
-                .native_sessions
-                .get(&session_id)
-                .map(|state| state.tokens.len())
-                .with_context(|| format!("session {session_id} not found"));
+            return session_state::token_count(&NativeSessionsRef(self), session_id);
         }
         self.require_ort_backend("persistent sessions")?;
-        self.sessions
-            .get(&session_id)
-            .map(|state| state.tokens.len())
-            .with_context(|| format!("session {session_id} not found"))
+        session_state::token_count(&OrtSessionsRef(self), session_id)
     }
 
     /// Get the loaded metadata.
@@ -1370,9 +1408,13 @@ impl Engine {
             |session| session.execution_provider_status().summary(),
         )
     }
-
     /// Latest native activation-memory planner measurement, if the current
     /// backend is native and has executed far enough to resolve concrete shapes.
+    ///
+    /// Returns `None` unless the planner is switched on, which it is not by
+    /// default: set `NXRT_ACTIVATION_MEMORY_PLAN=1` (or
+    /// `NXRT_EXEC_PHASE_PROFILE=1`) first. Being native and having executed is
+    /// necessary but not sufficient.
     pub fn activation_memory_plan_stats(&self) -> Option<crate::ActivationMemoryPlanSummary> {
         #[cfg(feature = "native-backend")]
         {

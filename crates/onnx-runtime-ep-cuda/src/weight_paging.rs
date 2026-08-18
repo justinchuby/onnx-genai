@@ -80,6 +80,13 @@ static GLOBAL_HTOD_BYTES: AtomicU64 = AtomicU64::new(0);
 // Host-blocking cuMemAlloc/cuMemFree spans for paged weight buffers.
 static GLOBAL_VRAM_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_VRAM_FREE_NS: AtomicU64 = AtomicU64::new(0);
+// Pre-free stream drain (`cuStreamSynchronize` on the compute+copy streams)
+// taken before a Drop-path unmap. This is NOT freeing — it waits for in-flight
+// consumers of the VA to finish — but under VMM over-subscription that in-flight
+// work is itself PCIe-fault-slowed, so folding it into `GLOBAL_VRAM_FREE_NS`
+// mis-attributes paging-stalled compute/copy as "free" time (#1295). Timed
+// separately so `vram_free_ns` measures only unmap/release.
+static GLOBAL_VRAM_FREE_SYNC_NS: AtomicU64 = AtomicU64::new(0);
 // Process-lifetime high-water gauge. Resetting activity counters must not write
 // it: a concurrent page-in could otherwise be overwritten with a stale value.
 static GLOBAL_PEAK_RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -171,6 +178,13 @@ pub struct GlobalOffloadStats {
     pub htod_bytes: u64,
     pub vram_alloc_ns: u64,
     pub vram_free_ns: u64,
+    /// Pre-free stream drain time (`cuStreamSynchronize`) taken on the Drop-path
+    /// eviction before unmapping. Split out of [`Self::vram_free_ns`] so the
+    /// latter measures only `cuMemUnmap`/`cuMemRelease` (#1295). Under VMM
+    /// over-subscription this drain waits on PCIe-fault-slowed in-flight work,
+    /// so a large value here that was previously folded into `vram_free_ns` is
+    /// the mis-attribution, not slow freeing.
+    pub vram_free_sync_ns: u64,
     pub budget_bytes: u64,
     pub peak_resident_bytes: u64,
     pub content_resident_bytes: u64,
@@ -268,6 +282,7 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
         htod_bytes: GLOBAL_HTOD_BYTES.load(Ordering::Relaxed),
         vram_alloc_ns: GLOBAL_VRAM_ALLOC_NS.load(Ordering::Relaxed),
         vram_free_ns: GLOBAL_VRAM_FREE_NS.load(Ordering::Relaxed),
+        vram_free_sync_ns: GLOBAL_VRAM_FREE_SYNC_NS.load(Ordering::Relaxed),
         budget_bytes: GLOBAL_BUDGET_BYTES.load(Ordering::Relaxed),
         peak_resident_bytes: GLOBAL_PEAK_RESIDENT_BYTES.load(Ordering::Relaxed),
         content_resident_bytes: GLOBAL_CONTENT_RESIDENT_BYTES.load(Ordering::Relaxed),
@@ -306,6 +321,7 @@ pub fn reset_global_offload_stats() {
     GLOBAL_HTOD_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_VRAM_ALLOC_NS.store(0, Ordering::Relaxed);
     GLOBAL_VRAM_FREE_NS.store(0, Ordering::Relaxed);
+    GLOBAL_VRAM_FREE_SYNC_NS.store(0, Ordering::Relaxed);
     // Per-window activity: cold zero-copy reads/bytes. `zero_copy_binds` and
     // `host_registered_bytes` are live gauges (the registrations survive a
     // window reset), so they are preserved exactly like the residency gauges.
@@ -1331,11 +1347,19 @@ struct StableWeightSlot {
 }
 
 impl CudaWeightPage {
+    /// Free this page's device backing. Times the actual `cuMemUnmap`/
+    /// `cuMemRelease`/`cuMemFree` into `GLOBAL_VRAM_FREE_NS`; when
+    /// `synchronize_streams` is set, the pre-free compute+copy stream drain is
+    /// timed **separately** into `GLOBAL_VRAM_FREE_SYNC_NS` so freeing time is
+    /// not conflated with waiting on in-flight (possibly paging-stalled) work
+    /// (#1295).
     fn release_allocation(&mut self, synchronize_streams: bool) {
         let allocation = std::mem::replace(&mut self.allocation, WeightAllocation::Retired);
         match allocation {
             WeightAllocation::Runtime => {
+                let free_start = std::time::Instant::now();
                 let _ = unsafe { self.runtime.free_raw(self.ptr) };
+                add_duration(&GLOBAL_VRAM_FREE_NS, free_start.elapsed());
             }
             WeightAllocation::Retired => {}
             WeightAllocation::HostMapped => {
@@ -1350,18 +1374,25 @@ impl CudaWeightPage {
             } => {
                 // VMM unmap does not wait for users of the VA. Normal Drop
                 // drains both streams; the eviction batch may do that once
-                // up front and retire several pages without repeating it.
-                if synchronize_streams
-                    && (self.runtime.synchronize().is_err()
-                        || self.runtime.copy_stream().synchronize().is_err())
-                {
-                    self.allocation = WeightAllocation::Vmm {
-                        allocator,
-                        allowance,
-                        stable_slot,
-                    };
-                    return;
+                // up front and retire several pages without repeating it. The
+                // drain is timed into GLOBAL_VRAM_FREE_SYNC_NS, not the free
+                // counter, because it waits on in-flight work rather than
+                // freeing anything (#1295).
+                if synchronize_streams {
+                    let sync_start = std::time::Instant::now();
+                    let sync_failed = self.runtime.synchronize().is_err()
+                        || self.runtime.copy_stream().synchronize().is_err();
+                    add_duration(&GLOBAL_VRAM_FREE_SYNC_NS, sync_start.elapsed());
+                    if sync_failed {
+                        self.allocation = WeightAllocation::Vmm {
+                            allocator,
+                            allowance,
+                            stable_slot,
+                        };
+                        return;
+                    }
                 }
+                let free_start = std::time::Instant::now();
                 if let Some(ptr) = NonNull::new(self.ptr as *mut u8) {
                     // Stable slots retain VA for graph-baked pointers. Never
                     // assert here: this remains reachable from Drop.
@@ -1385,14 +1416,13 @@ impl CudaWeightPage {
                         |current| Some(current.saturating_sub(unmapped)),
                     );
                 }
+                add_duration(&GLOBAL_VRAM_FREE_NS, free_start.elapsed());
             }
         }
     }
 
     fn retire_after_stream_sync(&mut self) {
-        let free_start = std::time::Instant::now();
         self.release_allocation(false);
-        add_duration(&GLOBAL_VRAM_FREE_NS, free_start.elapsed());
     }
 
     /// Allocate a VRAM page and copy `bytes` host→device into it. The bytes are
@@ -1611,9 +1641,9 @@ impl Drop for CudaWeightPage {
     fn drop(&mut self) {
         // SAFETY: `ptr` came from this runtime's `alloc_raw` in `bind_block_quantized_moe`
         // and is freed exactly once here; no alias to it escapes `CudaWeightPage`.
-        let free_start = std::time::Instant::now();
+        // `release_allocation` times the pre-free stream drain and the unmap/release
+        // separately (#1295), so no outer timing bracket is taken here.
         self.release_allocation(true);
-        add_duration(&GLOBAL_VRAM_FREE_NS, free_start.elapsed());
     }
 }
 

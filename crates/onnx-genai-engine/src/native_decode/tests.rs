@@ -1249,13 +1249,13 @@ fn build_cuda_decoder(
     max_len: usize,
     aux: AuxOutput,
 ) -> anyhow::Result<NativeDecodeSession> {
-    build_cuda_decoder_with_fixed_state(graph_capture, max_len, aux, false)
+    build_cuda_decoder_with_fixed_state(graph_capture, Some(max_len), aux, false)
 }
 
 #[cfg(feature = "cuda")]
 fn build_cuda_decoder_with_fixed_state(
     graph_capture: bool,
-    max_len: usize,
+    kv_max_len: Option<usize>,
     aux: AuxOutput,
     fixed_state: bool,
 ) -> anyhow::Result<NativeDecodeSession> {
@@ -1392,7 +1392,7 @@ fn build_cuda_decoder_with_fixed_state(
         }]);
         NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
             session,
-            Some(max_len),
+            kv_max_len,
             Some(&io),
         )
     } else {
@@ -1400,7 +1400,7 @@ fn build_cuda_decoder_with_fixed_state(
             session,
             NativeDecodeCudaOptions {
                 decode_batch: None,
-                kv_max_len: Some(max_len),
+                kv_max_len,
                 metadata_max_len: None,
                 graph_capture: Some(graph_capture),
                 weight_offload_enabled: None,
@@ -1408,6 +1408,137 @@ fn build_cuda_decoder_with_fixed_state(
             },
         )
     }
+}
+
+/// Build the synthetic single-layer CUDA decoder with **no** KV length bound:
+/// neither an explicit `kv_max_len` nor model `metadata_max_len`, so
+/// `resolve_cuda_kv_capacity` returns the deliberate `usize::MAX` "unbounded
+/// until growth fails" sentinel. This is the shape a model with no declared
+/// `max_sequence_length` produces on the non-VMM native-CUDA decode path. We go
+/// through the `fixed_state` builder purely because it declares the graph
+/// `model.io` ports explicitly via `tiny_decoder_io()`; the default (non-VMM)
+/// KV path is unaffected by the extra recurrent state pair, so
+/// `kv_commits_on_demand` stays false and this reproduces the metadata-less
+/// non-VMM construction exactly.
+#[cfg(feature = "cuda")]
+fn build_cuda_decoder_unbounded() -> anyhow::Result<NativeDecodeSession> {
+    build_cuda_decoder_with_fixed_state(false, None, AuxOutput::StaticUnit, true)
+}
+
+/// Regression for the first-bad-commit #682 (`9fd7ee56`): `DecodeCudaState::new`
+/// computed `full_mask_bytes = batch × capacity.max_len × size_of::<i64>()`
+/// unconditionally. For a model with no `max_sequence_length` metadata,
+/// `capacity.max_len` is `usize::MAX` (the intended "unbounded until growth
+/// fails" sentinel), so that product overflowed and aborted construction with
+/// `full CUDA mask reservation size overflow` — even on the non-VMM path, whose
+/// mask binding never uses the full-reservation extent at all. The fix computes
+/// `full_mask_bytes` only inside the `kv_commits_on_demand` (VMM) branch that
+/// consumes it. This test drives the real construction and goes RED (with that
+/// exact overflow error) if the computation is hoisted back out of the branch.
+#[cfg(feature = "cuda")]
+#[test]
+fn native_cuda_decoder_constructs_with_unbounded_metadata_less_capacity() -> anyhow::Result<()> {
+    if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+        eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+        return Ok(());
+    }
+
+    let session = build_cuda_decoder_unbounded().context(
+        "native CUDA decoder must construct on the non-VMM path when the KV capacity is \
+         unbounded (a model with no max_sequence_length metadata)",
+    )?;
+
+    let state = session.cuda.as_ref().expect("CUDA decode state");
+    // The unbounded sentinel must survive into the resolved capacity — this is
+    // the value whose reservation multiply overflowed before the fix.
+    assert_eq!(
+        state.capacity.max_len,
+        usize::MAX,
+        "a metadata-less model must keep the unbounded-until-growth-fails sentinel"
+    );
+    // The mask binding still exists and is the non-VMM full `[1, max_len]`
+    // allocation (bindings[0] is the attention mask island).
+    assert!(
+        !state.bindings.is_empty(),
+        "the attention-mask binding must be constructed"
+    );
+    Ok(())
+}
+
+/// Regression for issue #1266: the **VMM** half of the metadata-less overflow
+/// that #1264 deliberately left unfixed.
+///
+/// On the VMM path (`ONNX_GENAI_CUDA_VMM=1`) `DecodeCudaState::new` reserves the
+/// full logical mask island (`batch × capacity.max_len × i64`) and the full KV
+/// extent (`full_vmm_kv_allocation_bytes(..., capacity.max_len)`) up front. For
+/// a model with no `max_sequence_length` metadata `capacity.max_len` is
+/// `usize::MAX`, so — unlike the non-VMM path where the value is dead — these
+/// reservation multiplies are *live* and overflow, aborting construction with
+/// `full CUDA mask reservation size overflow` / `full VMM-backed CUDA KV
+/// reservation size overflow`.
+///
+/// The fix resolves the `usize::MAX` sentinel to a concrete device-memory bound
+/// (`device_free / bytes_per_token`) *only for the VMM reservation* — the
+/// reservation is virtual-only, so an over-large-but-finite bound is nearly
+/// free, and growth still fails at the same physical ceiling. The sentinel
+/// itself is left intact (asserted below), so the non-VMM grow-until-OOM
+/// contract is unchanged.
+///
+/// This test goes RED (with the overflow above) if the bound resolution is
+/// removed and `capacity.max_len` is fed to the reservations again. The
+/// `kv_commits_on_demand()` assertion guarantees the test really is on the VMM
+/// path — without it a silent fall back to the eager path would make the test
+/// prove nothing.
+#[cfg(feature = "cuda")]
+#[test]
+fn native_cuda_vmm_decoder_constructs_with_unbounded_metadata_less_capacity() -> anyhow::Result<()>
+{
+    if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+        eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+        return Ok(());
+    }
+    let _guard = env_lock()
+        .lock()
+        .expect("CUDA smoke env mutex should not be poisoned");
+
+    // VMM on (commit-on-demand path), and crucially NO ONNX_GENAI_CUDA_KV_MAX_LEN
+    // and no model metadata, so `resolve_cuda_kv_capacity` keeps the unbounded
+    // `usize::MAX` sentinel and the VMM reservation is the live overflow site.
+    // Deliberately do NOT touch ONNX_GENAI_CUDA_GRAPH: it is a frozen
+    // RuntimeConfig knob (#804), so mutating it after any earlier test froze the
+    // process-wide config trips the freeze-guard. This test only constructs the
+    // decoder (no decode, no graph capture), so the graph knob is irrelevant to
+    // the reservation-sizing overflow it targets; `vmm_enabled()` reads
+    // ONNX_GENAI_CUDA_VMM directly from the environment, so setting it here is
+    // safe regardless of freeze order.
+    let _vmm = EnvVarGuard::set("ONNX_GENAI_CUDA_VMM", "1");
+
+    let session = build_cuda_decoder_unbounded().context(
+        "native CUDA decoder must construct on the VMM path when the KV capacity is \
+         unbounded (a model with no max_sequence_length metadata): the reservation must \
+         resolve the usize::MAX sentinel to a concrete device-memory bound instead of \
+         overflowing",
+    )?;
+
+    let state = session.cuda.as_ref().expect("CUDA decode state");
+    assert!(
+        state.kv_commits_on_demand(),
+        "ONNX_GENAI_CUDA_VMM=1 must put the decoder on the VMM commit-on-demand path; \
+         otherwise this test does not exercise the VMM reservation at all"
+    );
+    // The unbounded sentinel is intended design and must survive untouched: the
+    // fix resolves a concrete bound only locally for the VMM reservation.
+    assert_eq!(
+        state.capacity.max_len,
+        usize::MAX,
+        "a metadata-less model must keep the unbounded-until-growth-fails sentinel; \
+         the fix must not rewrite capacity.max_len"
+    );
+    assert!(
+        !state.bindings.is_empty(),
+        "the attention-mask binding must be constructed on the VMM path"
+    );
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -2327,7 +2458,8 @@ fn native_cuda_binds_rank3_fixed_state_without_changing_growing_kv() -> anyhow::
         return Ok(());
     }
 
-    let mut session = build_cuda_decoder_with_fixed_state(false, 16, AuxOutput::StaticUnit, true)?;
+    let mut session =
+        build_cuda_decoder_with_fixed_state(false, Some(16), AuxOutput::StaticUnit, true)?;
     let state = session.cuda.as_mut().expect("CUDA state");
     assert_eq!(state.kv_binding_range.len(), 2);
     let fixed = state
@@ -3436,4 +3568,319 @@ fn an_undeclared_input_of_the_same_shape_is_not_charged() {
         48,
         "the recurrent_state input is present in the graph but was not declared"
     );
+}
+
+/// Fill each `(batch, head)` block of a `[1, H, capacity, Dh]` cache with a
+/// value that identifies the block and row it came from, so a relocation that
+/// uses the wrong stride produces recognisably wrong numbers rather than
+/// plausible ones.
+fn kv_probe_value(block: usize, row: usize, lane: usize) -> f32 {
+    (block * 1_000_000 + row * 1_000 + lane) as f32
+}
+
+/// Growing the CPU KV cache must relocate every head, not just memcpy.
+///
+/// Capacity is axis 2 of `[B, H, capacity, Dh]`, so head `i` starts at
+/// `i * capacity * Dh`. Enlarging the capacity moves every head but the first;
+/// a flat copy would leave heads 1.. reading the previous head's tail. This
+/// test writes a distinct value per (head, row, lane), grows, and checks every
+/// live element lands at its new address.
+#[test]
+fn growing_the_cpu_kv_cache_relocates_every_head() {
+    let session = tiny_decoder(false);
+    let (heads, head_dim) = (3usize, 4usize);
+    let (capacity, live) = (8usize, 5usize);
+    let pairs = vec![(
+        "present.0.key".to_string(),
+        "past_key_values.0.key".to_string(),
+    )];
+    let mut binding = session
+        .allocate_device_binding(
+            pairs[0].1.clone(),
+            Some(pairs[0].0.clone()),
+            DataType::Float32,
+            vec![1, heads, capacity, head_dim],
+            vec![1, heads, live, head_dim],
+        )
+        .expect("allocate KV binding");
+
+    let mut seeded = vec![0f32; heads * capacity * head_dim];
+    for block in 0..heads {
+        for row in 0..live {
+            for lane in 0..head_dim {
+                seeded[block * capacity * head_dim + row * head_dim + lane] =
+                    kv_probe_value(block, row, lane);
+            }
+        }
+    }
+    let seeded_bytes: Vec<u8> = seeded.iter().flat_map(|v| v.to_le_bytes()).collect();
+    binding.write_bytes(0, &seeded_bytes).expect("seed cache");
+
+    let mut state = DecodeCpuKvState::from_parts_for_test(
+        vec![binding],
+        pairs,
+        DataType::Float32,
+        capacity,
+        live,
+    );
+    state
+        .grow_to(&session, capacity + 1, live)
+        .expect("grow the cache");
+
+    // Doubling, so one grow covers well past the requested length.
+    assert_eq!(
+        state.max_len,
+        capacity * 2,
+        "growth must amortise, not creep"
+    );
+    let grown_capacity = state.max_len;
+    let grown = state.binding_for_test(0);
+    assert_eq!(
+        grown.physical_shape(),
+        [1, heads, grown_capacity, head_dim],
+        "physical shape must report the new capacity"
+    );
+    assert_eq!(
+        grown.logical_shape(),
+        [1, heads, live, head_dim],
+        "the live prefix length must survive the grow"
+    );
+
+    let raw = grown.read_bytes().expect("read grown cache");
+    let values: Vec<f32> = raw
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(values.len(), heads * grown_capacity * head_dim);
+    for block in 0..heads {
+        for row in 0..live {
+            for lane in 0..head_dim {
+                let got = values[block * grown_capacity * head_dim + row * head_dim + lane];
+                assert_eq!(
+                    got,
+                    kv_probe_value(block, row, lane),
+                    "head {block} row {row} lane {lane} did not survive the grow"
+                );
+            }
+        }
+    }
+}
+
+/// A grow that is already covered must not reallocate or disturb the cache.
+#[test]
+fn growing_within_the_existing_capacity_is_a_no_op() {
+    let session = tiny_decoder(false);
+    let pairs = vec![(
+        "present.0.key".to_string(),
+        "past_key_values.0.key".to_string(),
+    )];
+    let binding = session
+        .allocate_device_binding(
+            pairs[0].1.clone(),
+            Some(pairs[0].0.clone()),
+            DataType::Float32,
+            vec![1, 2, 16, 4],
+            vec![1, 2, 3, 4],
+        )
+        .expect("allocate KV binding");
+    let mut state =
+        DecodeCpuKvState::from_parts_for_test(vec![binding], pairs, DataType::Float32, 16, 3);
+    let before = state.binding_for_test(0).device_ptr();
+    state.grow_to(&session, 16, 3).expect("no-op grow");
+    assert_eq!(state.max_len, 16);
+    assert_eq!(
+        state.binding_for_test(0).device_ptr(),
+        before,
+        "a grow within capacity must not reallocate"
+    );
+}
+
+/// Allocate a `[1, heads, capacity, head_dim]` f32 KV binding whose first
+/// `live` rows carry a distinct value per `(head, row, lane)`.
+fn seeded_kv_binding(
+    session: &InferenceSession,
+    pair: &(String, String),
+    heads: usize,
+    capacity: usize,
+    head_dim: usize,
+    live: usize,
+    salt: usize,
+) -> DeviceIoBinding {
+    let mut binding = session
+        .allocate_device_binding(
+            pair.1.clone(),
+            Some(pair.0.clone()),
+            DataType::Float32,
+            vec![1, heads, capacity, head_dim],
+            vec![1, heads, live, head_dim],
+        )
+        .expect("allocate KV binding");
+    let mut seeded = vec![0f32; heads * capacity * head_dim];
+    for block in 0..heads {
+        for row in 0..live {
+            for lane in 0..head_dim {
+                seeded[block * capacity * head_dim + row * head_dim + lane] =
+                    kv_probe_value(block, row, lane) + salt as f32 * 0.5;
+            }
+        }
+    }
+    let bytes: Vec<u8> = seeded.iter().flat_map(|v| v.to_le_bytes()).collect();
+    binding.write_bytes(0, &bytes).expect("seed cache");
+    binding
+}
+
+/// Read a binding back as f32 and assert its first `live` rows per head match
+/// the seeded pattern at the binding's *current* capacity.
+fn assert_kv_prefix_intact(
+    binding: &mut DeviceIoBinding,
+    heads: usize,
+    head_dim: usize,
+    live: usize,
+    salt: usize,
+    context: &str,
+) {
+    let capacity = binding.physical_shape()[2];
+    let raw = binding.read_bytes().expect("read cache");
+    let values: Vec<f32> = raw
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    for block in 0..heads {
+        for row in 0..live {
+            for lane in 0..head_dim {
+                assert_eq!(
+                    values[block * capacity * head_dim + row * head_dim + lane],
+                    kv_probe_value(block, row, lane) + salt as f32 * 0.5,
+                    "{context}: head {block} row {row} lane {lane}"
+                );
+            }
+        }
+    }
+}
+
+/// The production trigger is a *full* cache: token 4097 arrives with
+/// `past_len == max_len`, so the copy spans every row of every block with no
+/// slack. The original test left slack (live 5 of 8) and would not have caught
+/// an off-by-one at the block boundary.
+#[test]
+fn growing_a_completely_full_cpu_kv_cache_preserves_every_row() {
+    let session = tiny_decoder(false);
+    let (heads, head_dim, capacity) = (3usize, 4usize, 8usize);
+    let pairs = vec![(
+        "present.0.key".to_string(),
+        "past_key_values.0.key".to_string(),
+    )];
+    let binding = seeded_kv_binding(&session, &pairs[0], heads, capacity, head_dim, capacity, 0);
+    let mut state = DecodeCpuKvState::from_parts_for_test(
+        vec![binding],
+        pairs,
+        DataType::Float32,
+        capacity,
+        capacity,
+    );
+    state
+        .grow_to(&session, capacity + 1, capacity)
+        .expect("grow a full cache");
+    assert_eq!(state.max_len, capacity * 2);
+    assert_kv_prefix_intact(
+        state.binding_for_test(0),
+        heads,
+        head_dim,
+        capacity,
+        0,
+        "full-cache grow",
+    );
+}
+
+/// Every KV pair must grow, and each must keep its own contents. A single
+/// binding cannot catch a `pairs[index]`/`bindings[index]` misalignment or a
+/// loop that stops after the first pair; a real decoder binds two per layer.
+#[test]
+fn growing_the_cpu_kv_cache_grows_every_pair_independently() {
+    let session = tiny_decoder(false);
+    let (heads, head_dim, capacity, live) = (2usize, 4usize, 8usize, 5usize);
+    let pairs = vec![
+        (
+            "present.0.key".to_string(),
+            "past_key_values.0.key".to_string(),
+        ),
+        (
+            "present.0.value".to_string(),
+            "past_key_values.0.value".to_string(),
+        ),
+    ];
+    let bindings: Vec<DeviceIoBinding> = pairs
+        .iter()
+        .enumerate()
+        .map(|(salt, pair)| {
+            seeded_kv_binding(&session, pair, heads, capacity, head_dim, live, salt + 1)
+        })
+        .collect();
+    let mut state =
+        DecodeCpuKvState::from_parts_for_test(bindings, pairs, DataType::Float32, capacity, live);
+    state.grow_to(&session, capacity + 1, live).expect("grow");
+    for index in 0..2 {
+        let binding = state.binding_for_test(index);
+        assert_eq!(
+            binding.physical_shape()[2],
+            capacity * 2,
+            "pair {index} must have grown"
+        );
+        assert_kv_prefix_intact(binding, heads, head_dim, live, index + 1, "multi-pair grow");
+    }
+}
+
+/// A second grow must read from the capacity the first one established, not
+/// from the original. Reusing a stale stride would corrupt every head but the
+/// first on the second grow only — invisible to a single-grow test.
+#[test]
+fn growing_the_cpu_kv_cache_twice_reads_the_current_stride() {
+    let session = tiny_decoder(false);
+    let (heads, head_dim, capacity, live) = (3usize, 4usize, 8usize, 5usize);
+    let pairs = vec![(
+        "present.0.key".to_string(),
+        "past_key_values.0.key".to_string(),
+    )];
+    let binding = seeded_kv_binding(&session, &pairs[0], heads, capacity, head_dim, live, 0);
+    let mut state = DecodeCpuKvState::from_parts_for_test(
+        vec![binding],
+        pairs,
+        DataType::Float32,
+        capacity,
+        live,
+    );
+    state.grow_to(&session, capacity + 1, live).expect("grow 1");
+    assert_eq!(state.max_len, 16);
+    state.grow_to(&session, 17, live).expect("grow 2");
+    assert_eq!(state.max_len, 32);
+    assert_kv_prefix_intact(
+        state.binding_for_test(0),
+        heads,
+        head_dim,
+        live,
+        0,
+        "second grow",
+    );
+}
+
+/// Growing an empty cache carries nothing. This is the post-reset path:
+/// `rewind(0)` zeroes the logical length, and an oversized prefill then grows
+/// with no history to preserve.
+#[test]
+fn growing_an_empty_cpu_kv_cache_carries_nothing() {
+    let session = tiny_decoder(false);
+    let (heads, head_dim, capacity) = (3usize, 4usize, 8usize);
+    let pairs = vec![(
+        "present.0.key".to_string(),
+        "past_key_values.0.key".to_string(),
+    )];
+    let binding = seeded_kv_binding(&session, &pairs[0], heads, capacity, head_dim, 0, 0);
+    let mut state =
+        DecodeCpuKvState::from_parts_for_test(vec![binding], pairs, DataType::Float32, capacity, 0);
+    state.grow_to(&session, 100, 0).expect("grow from empty");
+    // 100 exceeds a doubling, so the request wins over the growth factor.
+    assert_eq!(state.max_len, 100);
+    let binding = state.binding_for_test(0);
+    assert_eq!(binding.physical_shape(), [1, heads, 100, head_dim]);
+    assert_eq!(binding.logical_shape(), [1, heads, 0, head_dim]);
 }

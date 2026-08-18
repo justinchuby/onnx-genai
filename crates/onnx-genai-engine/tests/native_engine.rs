@@ -2,7 +2,8 @@
 
 use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GeneratePrompt, GenerateRequest,
-    NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS, NativeDecodeDevice, SpeculativeMode,
+    NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS, NativeDecodeDevice, RewindTokenCount,
+    SpeculativeMode,
 };
 use onnx_genai_ort::{SessionOptions, ep_selection};
 use std::path::Path;
@@ -513,6 +514,53 @@ fn native_session_switching_matches_cold_start() -> anyhow::Result<()> {
 }
 
 /// Native sessions use the unified session API and allow multiple logical sessions.
+/// A valid explicit rewind through the shared `session_state` policy truncates
+/// the native session's logical length. This drives the same shared bound check
+/// that the ORT `failed_rewind_of_*` tests reach, so inverting the check in
+/// `session_state::rewind_to` turns *both* backends red — the proof that the two
+/// arms genuinely share one policy rather than two look-alike copies.
+#[test]
+fn native_session_rewind_by_truncates_logical_length() -> anyhow::Result<()> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
+    let mut engine = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )?;
+
+    let session = engine.create_session()?;
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0u32, 0, 0]));
+    request.options.max_new_tokens = 2;
+    request.options.temperature = 0.0;
+    request.options.stop_on_eos = false;
+    engine.generate_in_session(session, request)?;
+
+    let before = engine.session_token_count(session)?;
+    assert!(
+        before >= 2,
+        "expected at least two logical tokens before rewind, got {before}"
+    );
+
+    let new_position = engine.rewind_session_by(session, RewindTokenCount::new(2))?;
+    assert_eq!(new_position.get(), before - 2);
+    assert_eq!(engine.session_token_count(session)?, before - 2);
+
+    // Rewinding past the start is rejected by the same shared bound check.
+    let error = engine
+        .rewind_session_by(session, RewindTokenCount::new(before))
+        .expect_err("rewinding past the start must fail");
+    assert!(
+        error.to_string().contains("cannot rewind session"),
+        "unexpected error: {error:#}"
+    );
+
+    engine.close_session(session)?;
+    Ok(())
+}
+
 #[test]
 fn native_session_creation_uses_unified_multi_session_api() -> anyhow::Result<()> {
     let fixture =
@@ -673,5 +721,74 @@ fn native_session_lru_eviction_keeps_remaining_session_correct() -> anyhow::Resu
     cold_request.options.cold_start = true;
     let cold_result = fresh.generate(cold_request)?;
     assert_eq!(retained_result.token_ids, cold_result.token_ids);
+    Ok(())
+}
+
+/// End-to-end proof that a CPU KV cache which is *reallocated* mid-decode is
+/// still aliased present==past afterwards.
+///
+/// This is the property the whole in-place path rests on and the one the unit
+/// tests cannot reach: `GroupQueryAttention` decides to append in place by
+/// comparing the past-input and present-output pointers at execution time, so
+/// a replacement buffer that failed to re-alias would silently stop appending.
+///
+/// Token equality alone is not evidence here — this fixture's q/k/v are
+/// `Constant` zeros, so its output does not depend on KV contents at all and
+/// would stay `[1, 1, 1, 1]` even if growth dropped the entire history
+/// (verified by deliberately breaking the copy). The load-bearing assertion is
+/// therefore the in-place append *counter*: a cache forced to grow repeatedly
+/// must take the in-place path exactly as often as one that never grows. If
+/// aliasing were lost at the first realloc, the post-growth steps would fall
+/// through to the copy path and the counts would differ.
+#[test]
+fn a_regrown_cpu_kv_cache_is_still_appended_in_place() -> anyhow::Result<()> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-scalar-gqa");
+
+    let generate = |max_len: &str| -> anyhow::Result<(Vec<u32>, usize)> {
+        // SAFETY: both arms set the variable explicitly and it is removed at
+        // the end, so no unset-vs-set race exists between them.
+        unsafe { std::env::set_var("ONNX_GENAI_CPU_KV_MAX_LEN", max_len) };
+        let before = onnx_runtime_ep_cpu::present_inplace_count();
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(NativeDecodeDevice::Cpu),
+                ..EngineConfig::default()
+            },
+        )?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0]));
+        request.options.max_new_tokens = 4;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        let tokens = engine.generate(request)?.token_ids;
+        Ok((
+            tokens,
+            onnx_runtime_ep_cpu::present_inplace_count() - before,
+        ))
+    };
+
+    // Capacity 2 cannot hold the 1-token prompt plus 4 generated tokens, so the
+    // cache must grow mid-decode; 4096 never grows at all.
+    let (grown_tokens, grown_appends) = generate("2")?;
+    let (roomy_tokens, roomy_appends) = generate("4096")?;
+    unsafe { std::env::remove_var("ONNX_GENAI_CPU_KV_MAX_LEN") };
+
+    assert!(
+        roomy_appends > 0,
+        "the fixture must reach the in-place append path at all, else this \
+         test proves nothing about aliasing"
+    );
+    assert_eq!(
+        grown_appends, roomy_appends,
+        "a cache that grew mid-decode must keep appending in place; losing the \
+         present==past aliasing at realloc would drop these counts"
+    );
+    assert_eq!(
+        grown_tokens, roomy_tokens,
+        "growth must not change the decode"
+    );
+    assert_eq!(roomy_tokens, vec![1, 1, 1, 1]);
     Ok(())
 }

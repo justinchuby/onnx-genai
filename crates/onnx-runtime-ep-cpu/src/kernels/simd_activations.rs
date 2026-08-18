@@ -570,24 +570,49 @@ where
         body(input, output);
         return;
     }
-    // Nesting a `par_chunks` inside an outer parallel region only adds
-    // scheduling overhead: the outer region is already keeping the pool busy.
-    if rayon::current_thread_index().is_some() {
+    // Nesting a split inside an outer parallel region only adds scheduling
+    // overhead: the outer region is already keeping the pool busy. Rayon is
+    // still checked because plenty of this crate fans out through it directly.
+    if rayon::current_thread_index().is_some() || crate::task_runtime::in_task() {
         body(input, output);
         return;
     }
-    let Some(chunk) = par_chunk_len(len, rayon::current_num_threads()) else {
+    let Some(chunk) = par_chunk_len(len, crate::task_runtime::width()) else {
         body(input, output);
         return;
     };
 
     note_parallel_dispatch();
+    run_on_task_runtime(input, output, chunk, &body);
+}
 
-    use rayon::prelude::*;
-    output
-        .par_chunks_mut(chunk)
-        .zip(input.par_chunks(chunk))
-        .for_each(|(o, i)| body(i, o));
+/// Splits `input`/`output` into `chunk`-sized pieces across the native task
+/// runtime and runs `body` on each.
+///
+/// Bit-identical to calling `body` on the whole slice, for the same reason
+/// [`run_on_host`] is: the kernels are elementwise, every chunk is a multiple of
+/// eight lanes, and none is shorter than [`PAR_MIN_CHUNK`], so no chunk takes a
+/// different code path from its neighbours.
+///
+/// The runtime's pool replaces rayon here because rayon parks its workers
+/// between regions and an elementwise op is *all* region boundary: an isolated
+/// region measured 67 us back-to-back and 226 us when the previous one ended
+/// 20 us earlier, which is the spacing between two activations in a decode step.
+///
+/// `#[inline(never)]` for the same reason as [`try_host`]: `run_chunked`'s
+/// callers are the hottest elementwise kernels in the crate, and growing it has
+/// repartitioned codegen units before -- 34% on `Relu` at 1 Mi with no path
+/// change at all.
+#[inline(never)]
+fn run_on_task_runtime<F>(input: &[f32], output: &mut [f32], chunk: usize, body: &F)
+where
+    F: Fn(&[f32], &mut [f32]) + Sync,
+{
+    debug_assert_eq!(input.len(), output.len());
+    crate::task_runtime::chunk_runs_mut(output, chunk, 1, |first, out| {
+        let start = first * chunk;
+        body(&input[start..start + out.len()], out);
+    });
 }
 
 #[cfg(test)]
@@ -675,20 +700,16 @@ where
         body(input, output);
         return;
     }
-    if rayon::current_thread_index().is_some() {
+    if rayon::current_thread_index().is_some() || crate::task_runtime::in_task() {
         body(input, output);
         return;
     }
-    let Some(chunk) = par_chunk_len_rows(len, width, rayon::current_num_threads()) else {
+    let Some(chunk) = par_chunk_len_rows(len, width, crate::task_runtime::width()) else {
         body(input, output);
         return;
     };
 
-    use rayon::prelude::*;
-    output
-        .par_chunks_mut(chunk)
-        .zip(input.par_chunks(chunk))
-        .for_each(|(o, i)| body(i, o));
+    run_on_task_runtime(input, output, chunk, &body);
 }
 
 // ---------------------------------------------------------------------------
@@ -790,6 +811,37 @@ mod erf_c {
     /// `1.5 · 2^23`: adding then subtracting it rounds a float to the nearest
     /// integer under the default rounding mode without a `roundps`.
     pub(super) const EXP_C: f32 = 1.25829120e7;
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Cephes `logf` constants.
+///
+/// These are the same coefficients Eigen's `plog` carries, which is what ORT's
+/// CPU `Log` ultimately evaluates, so matching them is what buys us parity
+/// rather than merely accuracy.
+#[cfg(target_arch = "x86_64")]
+mod log_c {
+    /// `sqrt(0.5)`. The mantissa is folded into `[sqrt(0.5), sqrt(2))` around
+    /// this point so the polynomial argument `f = m - 1` stays small and
+    /// symmetric about zero.
+    pub(super) const SQRT_HALF: f32 = core::f32::consts::FRAC_1_SQRT_2;
+    pub(super) const P0: f32 = 7.037_683_6E-2;
+    pub(super) const P1: f32 = -1.151_461_0E-1;
+    pub(super) const P2: f32 = 1.167_699_9E-1;
+    pub(super) const P3: f32 = -1.242_014_1E-1;
+    pub(super) const P4: f32 = 1.424_932_3E-1;
+    pub(super) const P5: f32 = -1.666_805_8E-1;
+    pub(super) const P6: f32 = 2.000_071_5E-1;
+    pub(super) const P7: f32 = -2.499_999_4E-1;
+    pub(super) const P8: f32 = 3.333_333_1E-1;
+    /// `ln 2` split so that `e * LN2_HI` is exact for every `e` a `f32`
+    /// exponent can hold; `LN2_LO` carries the remainder.
+    pub(super) const LN2_HI: f32 = 0.693_359_38;
+    pub(super) const LN2_LO: f32 = -2.121_944_4E-4;
+    /// Denormal inputs have no usable exponent field, so they are scaled by
+    /// `2^25` first and `25` is subtracted from the recovered exponent.
+    pub(super) const DENORM_SCALE: f32 = 33_554_432.0;
+    pub(super) const DENORM_EXP: f32 = 25.0;
 }
 
 /// `MlasExpConstants` (`onnxruntime/core/mlas/lib/compute.cpp`), the parameter
@@ -1168,6 +1220,129 @@ pub(crate) fn tanh_gelu_f32_slice(input: &[f32], output: &mut [f32]) {
     dispatch!(input, output, tanh_gelu_scalar, tanh_gelu_avx2);
 }
 
+/// `y = ln(x)`.
+///
+/// Vectorised rather than left to `f32::ln`: `Log` was the last unary op in
+/// this module still taking a `libm` call per element.
+pub(crate) fn log_f32_slice(input: &[f32], output: &mut [f32]) {
+    dispatch!(input, output, log_scalar, log_avx2);
+}
+
+/// `y = x·tanh(softplus(x))`, `Mish`.
+pub(crate) fn mish_f32_slice(input: &[f32], output: &mut [f32]) {
+    dispatch!(input, output, mish_scalar, mish_avx2);
+}
+
+/// `y = LeakyRelu(x, alpha)`.
+pub(crate) fn leaky_relu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32) {
+    debug_assert_eq!(input.len(), output.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if input.len() >= SIMD_MIN_LEN && vector_path_available() {
+            // SAFETY: guarded by the runtime AVX2+FMA detection above.
+            run_chunked(input, output, |i, o| unsafe {
+                leaky_relu_avx2(i, o, alpha)
+            });
+            return;
+        }
+    }
+    for (y, x) in output.iter_mut().zip(input) {
+        *y = leaky_relu_scalar(*x, alpha);
+    }
+}
+
+/// `y = HardSigmoid(x, alpha, beta)`.
+pub(crate) fn hard_sigmoid_f32_slice(input: &[f32], output: &mut [f32], alpha: f32, beta: f32) {
+    debug_assert_eq!(input.len(), output.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if input.len() >= SIMD_MIN_LEN && vector_path_available() {
+            // SAFETY: guarded by the runtime AVX2+FMA detection above.
+            run_chunked(input, output, |i, o| unsafe {
+                hard_sigmoid_avx2(i, o, alpha, beta)
+            });
+            return;
+        }
+    }
+    for (y, x) in output.iter_mut().zip(input) {
+        *y = hard_sigmoid_scalar(*x, alpha, beta);
+    }
+}
+
+/// `y = ThresholdedRelu(x, alpha)`.
+pub(crate) fn thresholded_relu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32) {
+    debug_assert_eq!(input.len(), output.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if input.len() >= SIMD_MIN_LEN && vector_path_available() {
+            // SAFETY: guarded by the runtime AVX2+FMA detection above.
+            run_chunked(input, output, |i, o| unsafe {
+                thresholded_relu_avx2(i, o, alpha)
+            });
+            return;
+        }
+    }
+    for (y, x) in output.iter_mut().zip(input) {
+        *y = thresholded_relu_scalar(*x, alpha);
+    }
+}
+
+/// `y = Selu(x, alpha, gamma)`.
+pub(crate) fn selu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32, gamma: f32) {
+    debug_assert_eq!(input.len(), output.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if input.len() >= SIMD_MIN_LEN && vector_path_available() {
+            // SAFETY: guarded by the runtime AVX2+FMA detection above.
+            run_chunked(input, output, |i, o| unsafe {
+                selu_avx2(i, o, alpha, gamma)
+            });
+            return;
+        }
+    }
+    for (y, x) in output.iter_mut().zip(input) {
+        *y = selu_scalar(*x, alpha, gamma);
+    }
+}
+
+/// `y = Elu(x, alpha)`.
+pub(crate) fn elu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32) {
+    debug_assert_eq!(input.len(), output.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if input.len() >= SIMD_MIN_LEN && vector_path_available() {
+            // SAFETY: guarded by the runtime AVX2+FMA detection above.
+            run_chunked(input, output, |i, o| unsafe { elu_avx2(i, o, alpha) });
+            return;
+        }
+    }
+    for (y, x) in output.iter_mut().zip(input) {
+        *y = elu_scalar(*x, alpha);
+    }
+}
+
+/// `y = max(0,x) + min(0, alpha·(exp(x/alpha) − 1))`, `Celu`.
+///
+/// `alpha` must be non-zero; ONNX requires it and the reciprocal below would
+/// otherwise be infinite.
+pub(crate) fn celu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32) {
+    debug_assert_eq!(input.len(), output.len());
+    debug_assert!(alpha != 0.0);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if input.len() >= SIMD_MIN_LEN && vector_path_available() {
+            // SAFETY: guarded by the runtime AVX2+FMA detection above.
+            run_chunked(input, output, |i, o| unsafe { celu_avx2(i, o, alpha) });
+            return;
+        }
+    }
+    run_chunked(input, output, |i, o| {
+        for (o, &i) in o.iter_mut().zip(i) {
+            *o = celu_scalar(i, alpha);
+        }
+    });
+}
+
 /// `y = x·sigmoid(alpha·x)`, the `QuickGelu` / Swish form.
 pub(crate) fn quick_gelu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32) {
     debug_assert_eq!(input.len(), output.len());
@@ -1381,6 +1556,98 @@ pub(crate) fn softsign_scalar(x: f32) -> f32 {
 // ---------------------------------------------------------------------------
 
 #[inline]
+/// `ln(x)`, the scalar reference for [`log_f32_slice`].
+fn log_scalar(x: f32) -> f32 {
+    x.ln()
+}
+
+/// `Celu(x) = max(0, x) + min(0, alpha * (exp(x / alpha) - 1))`.
+///
+/// This is ONNX's definition evaluated literally, which is also what ORT does.
+/// `alpha` is required to be non-zero by the spec.
+pub(crate) fn celu_scalar(x: f32, alpha: f32) -> f32 {
+    // Transcribing the formula literally is not enough. Rust's `f32::max` and
+    // `f32::min` are IEEE-754 `maxNum`/`minNum`: they return the *other*
+    // operand when one is NaN, so both terms collapse to zero and `Celu(NaN)`
+    // comes out `0.0`. ORT propagates NaN, and so does `celu_ps` (whose
+    // `maxps` keeps it) -- without this guard the answer would depend on
+    // whether the slice was long enough for the vector path and on whether the
+    // host has AVX2, which is exactly what `dispatch!` exists to prevent.
+    if x.is_nan() {
+        return x;
+    }
+    x.max(0.0) + (alpha * ((x / alpha).exp() - 1.0)).min(0.0)
+}
+
+/// `Elu(x) = x` for `x >= 0`, `alpha * (e^x - 1)` below it.
+///
+/// `exp(x) - 1` rather than `exp_m1(x)`, deliberately. `exp_m1` is the more
+/// accurate spelling near zero and is what `Activation::apply` used, but ORT
+/// evaluates `(x.exp() - 1)` and there is no AVX2 `expm1` to match it with, so
+/// a vector path would have to disagree with whichever one this returned. The
+/// two differ by at most a half-ulp of `1.0` (~6e-8) in absolute terms,
+/// comfortably inside this module's `4e-7` bound, and picking ORT's spelling
+/// makes the scalar path, the vector path and the oracle the same function.
+pub(crate) fn elu_scalar(x: f32, alpha: f32) -> f32 {
+    if x >= 0.0 { x } else { alpha * (x.exp() - 1.0) }
+}
+
+/// `LeakyRelu(x) = x` for `x >= 0`, `alpha * x` below it.
+///
+/// NaN answers false to `>= 0` and comes back out of `alpha * NaN` as NaN, so
+/// the sign of a quiet NaN payload is the only thing the two branches can
+/// disagree about -- and the vector path passes NaN through untouched, which
+/// is why the agreement test compares NaN by `is_nan()` and everything else
+/// bit for bit.
+pub(crate) fn leaky_relu_scalar(x: f32, alpha: f32) -> f32 {
+    if x < 0.0 { alpha * x } else { x }
+}
+
+/// `HardSigmoid(x) = max(0, min(1, alpha * x + beta))`.
+///
+/// `clamp` rather than `min`/`max`: Rust's `f32::min`/`max` are IEEE
+/// `minNum`/`maxNum` and return the *other* operand when one is NaN, so the
+/// literal ONNX spelling would answer `0` for a NaN input. `f32::clamp`
+/// returns NaN for a NaN input (it only panics when the *bounds* are NaN),
+/// which is what the AVX2 path does and what this EP does everywhere else.
+pub(crate) fn hard_sigmoid_scalar(x: f32, alpha: f32, beta: f32) -> f32 {
+    (alpha * x + beta).clamp(0.0, 1.0)
+}
+
+/// `ThresholdedRelu(x) = x` for `x > alpha`, `0` otherwise.
+pub(crate) fn thresholded_relu_scalar(x: f32, alpha: f32) -> f32 {
+    if x > alpha { x } else { 0.0 }
+}
+
+/// `Selu(x) = gamma * x` for `x > 0`, `gamma * alpha * (e^x - 1)` otherwise.
+///
+/// ONNX's predicate is `x > 0`, so `-0` goes down the *negative* branch. That
+/// used to be evaluated as `alpha * x.exp_m1()`, which preserves the sign and
+/// returns `-0`; written with `exp() - 1` -- the only spelling an AVX2 path
+/// can have, since there is no vector `expm1` -- the subtraction yields `+0`
+/// instead. Those are different answers, so the sign had to be settled by
+/// measurement rather than by preference: a signed-zero comparison against
+/// ORT's own Selu kernel says **ORT returns `+0`**, which means the old
+/// `exp_m1` scalar was the one that disagreed. This kernel matches ORT.
+pub(crate) fn selu_scalar(x: f32, alpha: f32, gamma: f32) -> f32 {
+    if x > 0.0 {
+        gamma * x
+    } else {
+        gamma * (alpha * (x.exp() - 1.0))
+    }
+}
+
+/// `Softplus(x) = ln(1 + e^x)`, in the stable form
+/// `max(x, 0) + ln(1 + e^-|x|)`.
+fn softplus_scalar(x: f32) -> f32 {
+    x.max(0.0) + (-x.abs()).exp().ln_1p()
+}
+
+/// `Mish(x) = x * tanh(softplus(x))`.
+fn mish_scalar(x: f32) -> f32 {
+    x * softplus_scalar(x).tanh()
+}
+
 fn tanh_scalar(x: f32) -> f32 {
     x.tanh()
 }
@@ -1439,7 +1706,7 @@ fn quick_gelu_scalar(x: f32, alpha: f32) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
-    use super::{GELU_B, GELU_C, erf_c, exp_c, logistic_c, tanh_c};
+    use super::{GELU_B, GELU_C, erf_c, exp_c, log_c, logistic_c, tanh_c};
     use core::arch::x86_64::*;
 
     /// `[-1; 7] ++ [0; 8]`. Loading 8 lanes at offset `7 - rem` yields a mask
@@ -1657,18 +1924,35 @@ mod avx2 {
             let small = _mm256_andnot_ps(split, small);
 
             // |x| > 0.921875: erf(x) = 1 - exp(-R(|x|)).
+            //
+            // `R` is a degree-6 polynomial, evaluated by Estrin's scheme rather
+            // than Horner's. Horner is six dependent FMAs deep; Estrin splits it
+            // as `a^3 * (c0 a^3 + c1 a^2 + c2 a + c3) + (c4 a^2 + c5 a + c6)`,
+            // whose halves evaluate independently, and is three deep for two
+            // extra multiplies. See the note on [`erf_ps`] for why depth is what
+            // costs here.
             let abs = _mm256_and_ps(split, abs);
-            let mut big = _mm256_fmadd_ps(
+            let sq_abs = _mm256_mul_ps(abs, abs);
+            let cube_abs = _mm256_mul_ps(sq_abs, abs);
+            let hi = _mm256_fmadd_ps(
                 _mm256_set1_ps(erf_c::BIG_P0),
                 abs,
                 _mm256_set1_ps(erf_c::BIG_P1),
             );
-            big = _mm256_fmadd_ps(big, abs, _mm256_set1_ps(erf_c::BIG_P2));
-            big = _mm256_fmadd_ps(big, abs, _mm256_set1_ps(erf_c::BIG_P3));
-            big = _mm256_fmadd_ps(big, abs, _mm256_set1_ps(erf_c::BIG_P4));
-            big = _mm256_fmadd_ps(big, abs, _mm256_set1_ps(erf_c::BIG_P5));
-            big = _mm256_fmadd_ps(big, abs, _mm256_set1_ps(erf_c::BIG_P6_MINUS_ONE));
-            big = _mm256_fmadd_ps(big, abs, abs);
+            let hi_lo = _mm256_fmadd_ps(
+                _mm256_set1_ps(erf_c::BIG_P2),
+                abs,
+                _mm256_set1_ps(erf_c::BIG_P3),
+            );
+            let hi = _mm256_fmadd_ps(hi, sq_abs, hi_lo);
+            let lo = _mm256_fmadd_ps(
+                _mm256_set1_ps(erf_c::BIG_P4),
+                abs,
+                _mm256_set1_ps(erf_c::BIG_P5),
+            );
+            let lo = _mm256_fmadd_ps(lo, abs, _mm256_set1_ps(erf_c::BIG_P6_MINUS_ONE));
+            let big = _mm256_fmadd_ps(hi, cube_abs, lo);
+            let big = _mm256_fmadd_ps(big, abs, abs);
 
             let neg_big = _mm256_max_ps(
                 _mm256_set1_ps(erf_c::EXP_LOWER_RANGE),
@@ -1699,16 +1983,30 @@ mod avx2 {
             let mut f = _mm256_fmadd_ps(k, _mm256_set1_ps(erf_c::EXP_LOG2_HI), x);
             f = _mm256_fmadd_ps(k, _mm256_set1_ps(erf_c::EXP_LOG2_LO), f);
 
-            let mut p = _mm256_fmadd_ps(
+            // Estrin again: three deep instead of six, for two extra
+            // multiplies. This chain sits on `erf`'s critical path, behind the
+            // big-branch polynomial, so its depth is what the whole kernel waits
+            // on.
+            let sq_f = _mm256_mul_ps(f, f);
+            let cube_f = _mm256_mul_ps(sq_f, f);
+            let hi = _mm256_fmadd_ps(
                 _mm256_set1_ps(erf_c::EXP_P0),
                 f,
                 _mm256_set1_ps(erf_c::EXP_P1),
             );
-            p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(erf_c::EXP_P2));
-            p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(erf_c::EXP_P3));
-            p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(erf_c::EXP_P4));
-            p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(erf_c::EXP_P5));
-            p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(erf_c::EXP_P6));
+            let hi_lo = _mm256_fmadd_ps(
+                _mm256_set1_ps(erf_c::EXP_P2),
+                f,
+                _mm256_set1_ps(erf_c::EXP_P3),
+            );
+            let hi = _mm256_fmadd_ps(hi, sq_f, hi_lo);
+            let lo = _mm256_fmadd_ps(
+                _mm256_set1_ps(erf_c::EXP_P4),
+                f,
+                _mm256_set1_ps(erf_c::EXP_P5),
+            );
+            let lo = _mm256_fmadd_ps(lo, f, _mm256_set1_ps(erf_c::EXP_P6));
+            let p = _mm256_fmadd_ps(hi, cube_f, lo);
 
             _mm256_mul_ps(p, power_of_2_ps(k))
         }
@@ -1784,6 +2082,230 @@ mod avx2 {
         p
     }
 
+    /// `ln(x)` for eight lanes, the Cephes decomposition.
+    ///
+    /// `x = m * 2^e` with `m` folded into `[sqrt(0.5), sqrt(2))`, then
+    /// `ln x = ln m + e ln 2`, with `ln m` from a degree-8 polynomial in
+    /// `f = m - 1`. `ln 2` is split `HI + LO` so `e * HI` is exact.
+    ///
+    /// Denormals are handled rather than flushed: they carry no usable exponent
+    /// field, so they are pre-scaled by `2^25` and `25` is taken back off the
+    /// recovered exponent. That keeps the whole subnormal range accurate
+    /// instead of returning `-Inf` for it.
+    ///
+    /// Every IEEE special is restored by a final blend, because the bit
+    /// surgery in the middle destroys them:
+    ///
+    /// | input | result |
+    /// |---|---|
+    /// | `+Inf` | `+Inf` |
+    /// | `±0` | `-Inf` |
+    /// | `x < 0` | `NaN` |
+    /// | `NaN` | that same `NaN`, payload intact |
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn log_ps(x: __m256) -> __m256 {
+        let zero = _mm256_setzero_ps();
+
+        // Denormals (and only denormals: the compare is ordered, so NaN
+        // and negatives answer false, and they are overwritten at the end
+        // anyway) get scaled into the normal range first.
+        let is_denorm = _mm256_and_ps(
+            _mm256_cmp_ps(x, _mm256_set1_ps(f32::MIN_POSITIVE), _CMP_LT_OQ),
+            _mm256_cmp_ps(x, zero, _CMP_GT_OQ),
+        );
+        let scale = _mm256_blendv_ps(
+            _mm256_set1_ps(1.0),
+            _mm256_set1_ps(log_c::DENORM_SCALE),
+            is_denorm,
+        );
+        let scaled = _mm256_mul_ps(x, scale);
+        let exp_fix = _mm256_and_ps(is_denorm, _mm256_set1_ps(log_c::DENORM_EXP));
+
+        let bits = _mm256_castps_si256(scaled);
+        // 126, not 127: the mantissa below is forced into [0.5, 1) rather than
+        // [1, 2), so `x == m * 2^(field - 126)`. Using the usual 127 bias here
+        // costs exactly one `ln 2` and is invisible near `x = 1`, which is why
+        // it has to be caught at the top of the range (`ln(f32::MAX)`).
+        let raw_exp = _mm256_sub_epi32(_mm256_srli_epi32::<23>(bits), _mm256_set1_epi32(126));
+        let mut e = _mm256_sub_ps(_mm256_cvtepi32_ps(raw_exp), exp_fix);
+
+        // Mantissa into [0.5, 1): keep the fraction field, force the
+        // exponent field to 126.
+        let m = _mm256_or_ps(
+            _mm256_and_ps(
+                scaled,
+                _mm256_castsi256_ps(_mm256_set1_epi32(0x807f_ffffu32 as i32)),
+            ),
+            _mm256_set1_ps(0.5),
+        );
+
+        // Fold to [sqrt(0.5), sqrt(2)): below the split point, double the
+        // mantissa and borrow one from the exponent.
+        let lt = _mm256_cmp_ps(m, _mm256_set1_ps(log_c::SQRT_HALF), _CMP_LT_OQ);
+        e = _mm256_sub_ps(e, _mm256_and_ps(lt, _mm256_set1_ps(1.0)));
+        let f = _mm256_sub_ps(_mm256_add_ps(m, _mm256_and_ps(lt, m)), _mm256_set1_ps(1.0));
+
+        let z = _mm256_mul_ps(f, f);
+        let mut poly = _mm256_set1_ps(log_c::P0);
+        poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(log_c::P1));
+        poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(log_c::P2));
+        poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(log_c::P3));
+        poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(log_c::P4));
+        poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(log_c::P5));
+        poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(log_c::P6));
+        poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(log_c::P7));
+        poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(log_c::P8));
+        poly = _mm256_mul_ps(poly, _mm256_mul_ps(f, z));
+
+        poly = _mm256_fmadd_ps(e, _mm256_set1_ps(log_c::LN2_LO), poly);
+        poly = _mm256_fnmadd_ps(z, _mm256_set1_ps(0.5), poly);
+        let mut r = _mm256_add_ps(f, poly);
+        r = _mm256_fmadd_ps(e, _mm256_set1_ps(log_c::LN2_HI), r);
+
+        // Specials, innermost first.
+        let nan = _mm256_set1_ps(f32::NAN);
+        r = _mm256_blendv_ps(
+            r,
+            _mm256_set1_ps(f32::INFINITY),
+            _mm256_cmp_ps(x, _mm256_set1_ps(f32::INFINITY), _CMP_EQ_OQ),
+        );
+        // `-0.0 < 0.0` is false in IEEE, so both zeros land here and both
+        // give `-Inf`, which is what `f32::ln` does.
+        r = _mm256_blendv_ps(
+            r,
+            _mm256_set1_ps(f32::NEG_INFINITY),
+            _mm256_cmp_ps(x, zero, _CMP_EQ_OQ),
+        );
+        r = _mm256_blendv_ps(r, nan, _mm256_cmp_ps(x, zero, _CMP_LT_OQ));
+        // Pass the original through so the payload survives.
+        _mm256_blendv_ps(r, x, _mm256_cmp_ps(x, x, _CMP_UNORD_Q))
+    }
+
+    /// `LeakyRelu(x) = x` for `x >= 0`, `alpha * x` below it.
+    ///
+    /// One ordered compare and one blend. NaN answers false to `x < 0` and is
+    /// passed through as itself; `-0.0` also answers false and keeps its sign,
+    /// matching the scalar's `x >= 0` identity branch.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn leaky_relu_ps(x: __m256, alpha: __m256) -> __m256 {
+        let below = _mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_LT_OQ);
+        _mm256_blendv_ps(x, _mm256_mul_ps(alpha, x), below)
+    }
+
+    /// `HardSigmoid(x) = max(0, min(1, alpha * x + beta))`.
+    ///
+    /// The operand order of both clamps is load-bearing: `minps a, b` and
+    /// `maxps a, b` return `b` whenever either operand is unordered, so the
+    /// value has to be the *second* operand for NaN to survive. Written the
+    /// other way round this returns `1` then `0` for a NaN input, silently.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn hard_sigmoid_ps(x: __m256, alpha: __m256, beta: __m256) -> __m256 {
+        let t = _mm256_fmadd_ps(alpha, x, beta);
+        let capped = _mm256_min_ps(_mm256_set1_ps(1.0), t);
+        _mm256_max_ps(_mm256_setzero_ps(), capped)
+    }
+
+    /// `ThresholdedRelu(x) = x` for `x > alpha`, `0` otherwise.
+    ///
+    /// NaN answers false to the ordered `>` and is therefore *not* passed
+    /// through: it becomes `0`, exactly as the scalar's `if x > alpha` does.
+    /// This is the one activation in this file where dropping NaN is the
+    /// correct answer rather than a bug, because the comparison, not the
+    /// arithmetic, decides the output.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn thresholded_relu_ps(x: __m256, alpha: __m256) -> __m256 {
+        let keep = _mm256_cmp_ps(x, alpha, _CMP_GT_OQ);
+        _mm256_and_ps(x, keep)
+    }
+
+    /// `Selu(x) = gamma * x` for `x > 0`, `gamma * alpha * (e^x - 1)` otherwise.
+    ///
+    /// The compare is `x <= 0` and ordered, which is ONNX's `x > 0` inverted:
+    /// both zeros take the exponential branch and come out `+0`, matching ORT
+    /// (see `selu_scalar`), while NaN answers false and is passed through the
+    /// identity branch as `gamma * NaN`.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn selu_ps(x: __m256, alpha: __m256, gamma: __m256) -> __m256 {
+        // SAFETY: `#[target_feature(enable = "avx2,fma")]` on this function is
+        // the same guarantee `exp_full_ps` asks for.
+        let ex = unsafe { exp_full_ps(x) };
+        let neg = _mm256_mul_ps(alpha, _mm256_sub_ps(ex, _mm256_set1_ps(1.0)));
+        let below = _mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_LE_OQ);
+        _mm256_mul_ps(gamma, _mm256_blendv_ps(x, neg, below))
+    }
+
+    /// `Elu(x) = x` for `x >= 0`, `alpha * (e^x - 1)` below it.
+    ///
+    /// `alpha` arrives pre-splatted; it is a node attribute, so it is
+    /// broadcast once per call rather than once per block.
+    ///
+    /// The compare is `x < 0` and ordered, which settles all three awkward
+    /// inputs at once: NaN answers false and is passed through as itself,
+    /// `-0.0` answers false and stays `-0.0` (matching the scalar's `x >= 0`),
+    /// and `-Inf` answers true and lands on `alpha * (0 - 1) = -alpha`.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn elu_ps(x: __m256, alpha: __m256) -> __m256 {
+        // SAFETY: `#[target_feature(enable = "avx2,fma")]` on this function is
+        // the same guarantee `exp_full_ps` asks for.
+        let ex = unsafe { exp_full_ps(x) };
+        let neg = _mm256_mul_ps(alpha, _mm256_sub_ps(ex, _mm256_set1_ps(1.0)));
+        let below = _mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_LT_OQ);
+        _mm256_blendv_ps(x, neg, below)
+    }
+
+    /// `Celu(x) = max(0, x) + min(0, alpha * (exp(x / alpha) - 1))`.
+    ///
+    /// Evaluated exactly as ONNX writes it. `alpha` is reciprocated once by the
+    /// caller so the per-element cost is a multiply rather than a divide.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn celu_ps(x: __m256, alpha: __m256, inv_alpha: __m256) -> __m256 {
+        unsafe {
+            let zero = _mm256_setzero_ps();
+            let e = exp_full_ps(_mm256_mul_ps(x, inv_alpha));
+            let neg = _mm256_mul_ps(alpha, _mm256_sub_ps(e, _mm256_set1_ps(1.0)));
+            // Operand order is load-bearing: `maxps a, b` returns `b` when
+            // either operand is NaN, so `max(x, zero)` would quietly turn NaN
+            // into 0. Passing `x` second propagates it, matching the scalar
+            // reference. Same argument for `minps` on the negative half.
+            _mm256_add_ps(_mm256_max_ps(zero, x), _mm256_min_ps(zero, neg))
+        }
+    }
+
+    /// `Softplus(x) = ln(1 + e^x)` in the stable form `max(x,0) + ln(1+e^-|x|)`.
+    ///
+    /// The `-|x|` argument means the exponential never overflows, so the only
+    /// rounding that matters is `1 + e^-|x|` losing the tail for large `|x|` —
+    /// where the result is dominated by `max(x,0)` anyway.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn softplus_ps(x: __m256) -> __m256 {
+        unsafe {
+            let zero = _mm256_setzero_ps();
+            let abs = _mm256_andnot_ps(_mm256_set1_ps(-0.0), x);
+            let e = exp_full_ps(_mm256_sub_ps(zero, abs));
+            // `max(zero, x)`, not `max(x, zero)`: see `celu_ps`. Here it is
+            // NaN propagation that depends on it.
+            _mm256_add_ps(
+                _mm256_max_ps(zero, x),
+                log_ps(_mm256_add_ps(_mm256_set1_ps(1.0), e)),
+            )
+        }
+    }
+
+    /// `Mish(x) = x * tanh(softplus(x))`.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn mish_ps(x: __m256) -> __m256 {
+        unsafe { _mm256_mul_ps(x, tanh_ps(softplus_ps(x))) }
+    }
+
     /// `2^k` for integer-valued `k`, built by biasing and shifting into the
     /// exponent field (`MlasPowerOf2Float32x4`).
     #[inline]
@@ -1814,13 +2336,10 @@ mod avx2 {
         }
     }
 
-    /// Apply an 8-lane kernel across a slice. The `< 8` remainder is processed
-    /// through the *same* kernel via a masked load/store, so every element of
-    /// the output — tail included — is computed identically.
-    #[inline]
-    #[target_feature(enable = "avx2,fma")]
     /// Like [`map_ps`], but adds a `width`-element bias row to each `width`-element
     /// slab of the input before applying `kernel`.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn map_bias_ps(
         input: &[f32],
         bias: &[f32],
@@ -1860,6 +2379,23 @@ mod avx2 {
         }
     }
 
+    /// Apply an 8-lane kernel across a slice. The `< 8` remainder is processed
+    /// through the *same* kernel via a masked load/store, so every element of
+    /// the output — tail included — is computed identically.
+    ///
+    /// The `target_feature` is load-bearing, not decoration. LLVM will not
+    /// inline a callee that requires a feature its caller lacks — a *strict*
+    /// superset; equal feature sets inline fine, which is the whole point of
+    /// putting `avx2,fma` back here. Without it the `kernel` closures — which
+    /// are all `avx2,fma` — cannot be inlined into this loop. Today that is masked:
+    /// every caller is itself `avx2,fma`, so `map_ps` gets inlined *upwards*
+    /// into the caller first and the closure folds in afterwards. That is a
+    /// property of the current inlining decision, not a guarantee. Grow this
+    /// function past the inline threshold and the closure becomes a real call
+    /// per 8 elements, which for a kernel like `erf_ps` would also force all
+    /// of its constants to be re-materialised on every call.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn map_ps(
         input: &[f32],
         output: &mut [f32],
@@ -2032,6 +2568,100 @@ unsafe fn quick_gelu_avx2(input: &[f32], output: &mut [f32], alpha: f32) {
     unsafe {
         let a = core::arch::x86_64::_mm256_set1_ps(alpha);
         avx2::map_ps(input, output, |v| avx2::quick_gelu_ps(v, a))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn log_avx2(input: &[f32], output: &mut [f32]) {
+    unsafe { avx2::map_ps(input, output, |v| avx2::log_ps(v)) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn mish_avx2(input: &[f32], output: &mut [f32]) {
+    unsafe { avx2::map_ps(input, output, |v| avx2::mish_ps(v)) }
+}
+
+/// `LeakyRelu` over a whole slice.
+///
+/// # Safety
+/// The host must support AVX2 and FMA.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn leaky_relu_avx2(input: &[f32], output: &mut [f32], alpha: f32) {
+    // SAFETY: the caller guarantees AVX2+FMA.
+    unsafe {
+        let a = core::arch::x86_64::_mm256_set1_ps(alpha);
+        avx2::map_ps(input, output, |v| avx2::leaky_relu_ps(v, a));
+    }
+}
+
+/// `HardSigmoid` over a whole slice.
+///
+/// # Safety
+/// The host must support AVX2 and FMA.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn hard_sigmoid_avx2(input: &[f32], output: &mut [f32], alpha: f32, beta: f32) {
+    // SAFETY: the caller guarantees AVX2+FMA.
+    unsafe {
+        let a = core::arch::x86_64::_mm256_set1_ps(alpha);
+        let b = core::arch::x86_64::_mm256_set1_ps(beta);
+        avx2::map_ps(input, output, |v| avx2::hard_sigmoid_ps(v, a, b));
+    }
+}
+
+/// `ThresholdedRelu` over a whole slice.
+///
+/// # Safety
+/// The host must support AVX2 and FMA.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn thresholded_relu_avx2(input: &[f32], output: &mut [f32], alpha: f32) {
+    // SAFETY: the caller guarantees AVX2+FMA.
+    unsafe {
+        let a = core::arch::x86_64::_mm256_set1_ps(alpha);
+        avx2::map_ps(input, output, |v| avx2::thresholded_relu_ps(v, a));
+    }
+}
+
+/// `Selu` over a whole slice.
+///
+/// # Safety
+/// The host must support AVX2 and FMA.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn selu_avx2(input: &[f32], output: &mut [f32], alpha: f32, gamma: f32) {
+    // SAFETY: the caller guarantees AVX2+FMA.
+    unsafe {
+        let a = core::arch::x86_64::_mm256_set1_ps(alpha);
+        let g = core::arch::x86_64::_mm256_set1_ps(gamma);
+        avx2::map_ps(input, output, |v| avx2::selu_ps(v, a, g));
+    }
+}
+
+/// `Elu` over a whole slice.
+///
+/// # Safety
+/// The host must support AVX2 and FMA.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn elu_avx2(input: &[f32], output: &mut [f32], alpha: f32) {
+    // SAFETY: the caller guarantees AVX2+FMA.
+    unsafe {
+        let a = core::arch::x86_64::_mm256_set1_ps(alpha);
+        avx2::map_ps(input, output, |v| avx2::elu_ps(v, a));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn celu_avx2(input: &[f32], output: &mut [f32], alpha: f32) {
+    unsafe {
+        let a = core::arch::x86_64::_mm256_set1_ps(alpha);
+        let inv = core::arch::x86_64::_mm256_set1_ps(1.0 / alpha);
+        avx2::map_ps(input, output, |v| avx2::celu_ps(v, a, inv))
     }
 }
 
@@ -2242,6 +2872,38 @@ mod tests {
 
     /// The interesting band is `|x| <= 1`, where `erf` is steep and the small
     /// polynomial runs; sample it far more densely than the wide sweep can.
+    /// `erf`'s two on-path polynomials are evaluated by Estrin's scheme, which
+    /// reassociates them, so the guard that the reassociation did not cost
+    /// accuracy has to be tighter than `ERF_BOUND` — that bound carries five
+    /// times the slack the kernel actually uses, so a reassociation four times
+    /// worse would still pass it.
+    ///
+    /// Both the Horner and the Estrin evaluation reach a worst scaled error of
+    /// exactly `2^-24` over this sweep, i.e. half an ulp, which is the best a
+    /// correctly-rounded `f32` result can do. Pinning the *worst* case here
+    /// means a regrouping that widens it fails, instead of being absorbed by
+    /// `ERF_BOUND`. (Individual points do move: Estrin differs from Horner by
+    /// one ulp at some two thousand of these inputs. It is the envelope that
+    /// must not grow.)
+    ///
+    /// Calls `erf_avx2` rather than `erf_f32_slice` on purpose. The slice entry
+    /// point dispatches to the scalar `libm` path when AVX2 is missing and to
+    /// MLAS under `--features mlas`; either way the test would still pass while
+    /// exercising something that has no Estrin in it at all. Naming the kernel
+    /// means the assertion is about the code the doc comment describes.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn erf_reassociation_costs_no_accuracy() {
+        if !vector_path_available() {
+            return;
+        }
+        let x = grid(-6.0, 6.0, 400_003, &[]);
+        let mut out = vec![0.0f32; x.len()];
+        // SAFETY: guarded by the runtime AVX2+FMA detection above.
+        unsafe { erf_avx2(&x, &mut out) };
+        check(&x, &out, erf_ref, 5.97e-8, "erf reassociation");
+    }
+
     #[test]
     fn erf_dense_sweep_near_origin() {
         let x = grid(-1.5, 1.5, 400_003, &[]);
@@ -2378,6 +3040,533 @@ mod tests {
                     "sqrt mismatch at len={len} index={i} input={v:e}"
                 );
             }
+        }
+    }
+
+    /// `log`'s error is relative to the *result*, not the input: `ln(1e-38)`
+    /// is `-87.3`, where one ulp is `7.6e-6` and the shared `scaled_err`
+    /// (which divides by `max(|x|,1)`) would call that a huge error. Divide by
+    /// the reference magnitude instead, flooring at 1 so the region around
+    /// `x = 1` — where `ln` legitimately passes through zero — stays an
+    /// absolute test.
+    fn log_err(got: f32, want: f32) -> f64 {
+        if (got.is_nan() && want.is_nan()) || got == want {
+            return 0.0;
+        }
+        (f64::from(got) - f64::from(want)).abs() / f64::from(want).abs().max(1.0)
+    }
+
+    const LOG_BOUND: f64 = 2e-7;
+
+    #[test]
+    fn log_special_values() {
+        let mut x = special_inputs();
+        x.extend_from_slice(&[1.0, std::f32::consts::E, 0.5]);
+        let mut o = vec![0.0f32; x.len()];
+        log_f32_slice(&x, &mut o);
+        assert!(o[PAD].is_nan(), "log(-Inf) is NaN");
+        assert_eq!(o[PAD + 1], f32::NEG_INFINITY, "log(-0) is -Inf");
+        assert_eq!(o[PAD + 2], f32::NEG_INFINITY, "log(+0) is -Inf");
+        assert_eq!(o[PAD + 3], f32::INFINITY, "log(+Inf) is +Inf");
+        assert!(o[PAD + 4].is_nan(), "log(NaN)");
+        assert!(o[PAD + 5].is_nan(), "log(-MAX) is NaN");
+        assert!(log_err(o[PAD + 6], f32::MAX.ln()) <= LOG_BOUND);
+        assert!(o[PAD + 7].is_nan(), "log(-1e30) is NaN");
+        assert!(log_err(o[PAD + 8], 1e30f32.ln()) <= LOG_BOUND);
+        assert_eq!(o[x.len() - 3], 0.0, "log(1) is exactly 0");
+        assert!(log_err(o[x.len() - 2], 1.0) <= LOG_BOUND, "log(e) is 1");
+        assert!(log_err(o[x.len() - 1], 0.5f32.ln()) <= LOG_BOUND);
+    }
+
+    /// The vector path must not flush subnormals: it scales them into the
+    /// normal range instead, so the whole subnormal decade stays accurate.
+    #[test]
+    fn log_handles_subnormals() {
+        let mut x = vec![0.0f32; PAD];
+        x.extend_from_slice(&[
+            f32::from_bits(1),
+            f32::from_bits(2),
+            f32::from_bits(0x0000_0f00),
+            f32::from_bits(0x007f_ffff),
+            f32::MIN_POSITIVE,
+        ]);
+        let mut o = vec![0.0f32; x.len()];
+        log_f32_slice(&x, &mut o);
+        for (&xi, &got) in x[PAD..].iter().zip(&o[PAD..]) {
+            let want = xi.ln();
+            assert!(
+                got.is_finite(),
+                "log({xi:e}) returned {got}, so a subnormal was flushed"
+            );
+            let e = log_err(got, want);
+            assert!(e <= LOG_BOUND, "log({xi:e}): {got} vs {want}, err {e:e}");
+        }
+    }
+
+    #[test]
+    fn log_dense_sweep_matches_scalar() {
+        // Spread over the whole positive exponent range, not just [0,1]: the
+        // exponent reconstruction is the part most likely to be wrong.
+        let mut x: Vec<f32> = (0..200_003)
+            .map(|i| {
+                let t = i as f32 / 200_002.0;
+                (t * 176.0 - 88.0).exp2()
+            })
+            .collect();
+        x.extend(grid(1e-6, 20.0, 100_003, &[]));
+        x.extend(grid(0.9, 1.1, 50_003, &[]));
+        let mut o = vec![0.0f32; x.len()];
+        log_f32_slice(&x, &mut o);
+        let mut worst = 0.0f64;
+        for (&xi, &got) in x.iter().zip(&o) {
+            let e = log_err(got, xi.ln());
+            if e > worst {
+                worst = e;
+            }
+            assert!(e <= LOG_BOUND, "log({xi:e}) = {got}, want {}", xi.ln());
+        }
+        assert!(worst > 0.0, "sweep did not exercise anything");
+    }
+
+    /// The four activations that moved off the generic scalar path together.
+    ///
+    /// Each one is checked at every special value *and* through the scalar
+    /// branch, because a slice shorter than `SIMD_MIN_LEN` (or any host
+    /// without AVX2) reaches a different function than the one the vector
+    /// tests exercise, and the two must not be distinguishable.
+    #[test]
+    fn leaky_relu_special_values() {
+        let mut x = special_inputs();
+        x.extend_from_slice(&[1.0, -1.0, 0.25]);
+        let mut o = vec![0.0f32; x.len()];
+        leaky_relu_f32_slice(&x, &mut o, 0.125);
+        assert_eq!(o[PAD], f32::NEG_INFINITY, "leaky(-Inf)");
+        assert_eq!(o[PAD + 1].to_bits(), 0x8000_0000, "leaky(-0) stays -0");
+        assert_eq!(o[PAD + 2].to_bits(), 0, "leaky(+0)");
+        assert_eq!(o[PAD + 3], f32::INFINITY, "leaky(+Inf)");
+        assert!(o[PAD + 4].is_nan(), "leaky(NaN)");
+        assert_eq!(o[PAD + 5], -f32::MAX * 0.125, "leaky(-MAX)");
+        assert_eq!(o[PAD + 6], f32::MAX, "leaky(MAX)");
+        assert_eq!(o[x.len() - 1], 0.25, "leaky(0.25)");
+        assert_eq!(o[x.len() - 2], -0.125, "leaky(-1)");
+    }
+
+    #[test]
+    fn hard_sigmoid_special_values() {
+        let mut x = special_inputs();
+        x.extend_from_slice(&[1.0, -1.0, 0.25]);
+        let mut o = vec![0.0f32; x.len()];
+        hard_sigmoid_f32_slice(&x, &mut o, 0.2, 0.5);
+        assert_eq!(o[PAD], 0.0, "hard_sigmoid(-Inf) clamps to 0");
+        assert_eq!(o[PAD + 1], 0.5, "hard_sigmoid(-0) = beta");
+        assert_eq!(o[PAD + 2], 0.5, "hard_sigmoid(+0) = beta");
+        assert_eq!(o[PAD + 3], 1.0, "hard_sigmoid(+Inf) clamps to 1");
+        // `minps`/`maxps` return their *second* operand when either is
+        // unordered, so a NaN here means the constants are on the correct side
+        // of both clamps. Written the other way round this is 0.
+        assert!(o[PAD + 4].is_nan(), "hard_sigmoid(NaN) stays NaN");
+        assert_eq!(o[PAD + 5], 0.0, "hard_sigmoid(-MAX)");
+        assert_eq!(o[PAD + 6], 1.0, "hard_sigmoid(MAX)");
+        for (&xi, &got) in x[x.len() - 3..].iter().zip(&o[x.len() - 3..]) {
+            let want = hard_sigmoid_scalar(xi, 0.2, 0.5);
+            assert!((got - want).abs() <= 1e-7, "hard_sigmoid({xi}) = {got}");
+        }
+    }
+
+    #[test]
+    fn thresholded_relu_special_values() {
+        let mut x = special_inputs();
+        x.extend_from_slice(&[1.0, -1.0, 0.25]);
+        let mut o = vec![0.0f32; x.len()];
+        thresholded_relu_f32_slice(&x, &mut o, 0.5);
+        assert_eq!(o[PAD], 0.0, "thresholded(-Inf)");
+        assert_eq!(o[PAD + 1], 0.0, "thresholded(-0)");
+        assert_eq!(o[PAD + 2], 0.0, "thresholded(+0)");
+        assert_eq!(o[PAD + 3], f32::INFINITY, "thresholded(+Inf)");
+        // The output is decided by an ordered compare, which NaN loses: 0 is
+        // the right answer here, not a lost NaN.
+        assert_eq!(o[PAD + 4], 0.0, "thresholded(NaN) is 0, by the compare");
+        assert_eq!(o[PAD + 5], 0.0, "thresholded(-MAX)");
+        assert_eq!(o[PAD + 6], f32::MAX, "thresholded(MAX)");
+        assert_eq!(o[x.len() - 3], 1.0, "thresholded(1) > alpha passes");
+        assert_eq!(o[x.len() - 1], 0.0, "thresholded(0.25) < alpha clears");
+    }
+
+    #[test]
+    fn selu_special_values() {
+        const A: f32 = 1.673_263_2;
+        const G: f32 = 1.050_701;
+        let mut x = special_inputs();
+        x.extend_from_slice(&[1.0, -1.0, 0.25]);
+        let mut o = vec![0.0f32; x.len()];
+        selu_f32_slice(&x, &mut o, A, G);
+        assert_eq!(o[PAD], -G * A, "selu(-Inf) saturates at -gamma*alpha");
+        // Both zeros take the exponential branch, where `exp(x) - 1` erases the
+        // sign -- and ORT's kernel does the same. Pinned in both directions so
+        // a future rewrite cannot quietly reintroduce `exp_m1`'s `-0`.
+        assert_eq!(o[PAD + 1].to_bits(), 0, "selu(-0) is +0, as in ORT");
+        assert_eq!(o[PAD + 2].to_bits(), 0, "selu(+0)");
+        assert_eq!(
+            selu_scalar(-0.0, A, G).to_bits(),
+            0,
+            "scalar selu(-0) is +0"
+        );
+        assert_eq!(o[PAD + 3], f32::INFINITY, "selu(+Inf)");
+        assert!(o[PAD + 4].is_nan(), "selu(NaN)");
+        assert_eq!(o[PAD + 5], -G * A, "selu(-MAX) saturates");
+        assert_eq!(o[PAD + 6], f32::MAX * G, "selu(MAX)");
+        // `+Inf` and `MAX` cannot tell the two branches apart -- `alpha > 1`, so
+        // the exponential branch overflows to `+Inf` there too. `1e30` can:
+        // the identity branch is finite, the exponential branch is not.
+        assert_eq!(o[PAD + 7], -G * A, "selu(-1e30) saturates");
+        assert_eq!(o[PAD + 8], 1e30 * G, "selu(1e30) takes the identity branch");
+        for (&xi, &got) in x[x.len() - 3..].iter().zip(&o[x.len() - 3..]) {
+            let want = selu_scalar(xi, A, G);
+            let e = (f64::from(got) - f64::from(want)).abs() / f64::from(want).abs().max(1.0);
+            assert!(e <= 4e-7, "selu({xi}) = {got}, want {want}");
+        }
+    }
+
+    /// Scalar branch versus vector branch, bit for bit, for all four.
+    #[test]
+    fn scalar_paths_agree_with_the_vector_paths() {
+        let specials = [
+            f32::NAN,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            -0.0,
+            0.0,
+            -1.0,
+            1.0,
+            -90.0,
+            0.25,
+        ];
+        assert!(
+            specials.len() < SIMD_MIN_LEN,
+            "the short slice must be short enough to take the scalar path"
+        );
+        let mut long_in = vec![0.0f32; PAD];
+        long_in.extend_from_slice(&specials);
+
+        let compare = |name: &str, run: &dyn Fn(&[f32], &mut [f32])| {
+            let mut short_out = vec![0.0f32; specials.len()];
+            run(&specials, &mut short_out);
+            let mut long_out = vec![0.0f32; long_in.len()];
+            run(&long_in, &mut long_out);
+            for (i, &x) in specials.iter().enumerate() {
+                let scalar = short_out[i];
+                let vector = long_out[PAD + i];
+                assert_eq!(
+                    scalar.is_nan(),
+                    vector.is_nan(),
+                    "{name}({x}): scalar {scalar}, vector {vector}"
+                );
+                if !scalar.is_nan() {
+                    assert_eq!(
+                        scalar.to_bits(),
+                        vector.to_bits(),
+                        "{name}({x}): scalar {scalar}, vector {vector}"
+                    );
+                }
+            }
+        };
+
+        for alpha in [0.01f32, 0.125, 1.0, 2.5] {
+            compare("leaky_relu", &|i, o| leaky_relu_f32_slice(i, o, alpha));
+            compare("thresholded_relu", &|i, o| {
+                thresholded_relu_f32_slice(i, o, alpha)
+            });
+            compare("selu", &|i, o| selu_f32_slice(i, o, alpha, 1.050_701));
+            for beta in [0.0f32, 0.5, 1.0] {
+                compare("hard_sigmoid", &|i, o| {
+                    hard_sigmoid_f32_slice(i, o, alpha, beta)
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn dense_sweeps_match_the_scalars() {
+        let x = grid(-90.0, 90.0, 20_003, &[]);
+        let mut o = vec![0.0f32; x.len()];
+
+        for alpha in [0.01f32, 0.125, 1.0, 2.5] {
+            leaky_relu_f32_slice(&x, &mut o, alpha);
+            for (&xi, &got) in x.iter().zip(&o) {
+                assert_eq!(
+                    got.to_bits(),
+                    leaky_relu_scalar(xi, alpha).to_bits(),
+                    "leaky_relu({xi}, {alpha}) is exact, so it must be bit-identical"
+                );
+            }
+
+            thresholded_relu_f32_slice(&x, &mut o, alpha);
+            for (&xi, &got) in x.iter().zip(&o) {
+                assert_eq!(
+                    got.to_bits(),
+                    thresholded_relu_scalar(xi, alpha).to_bits(),
+                    "thresholded_relu({xi}, {alpha}) is exact"
+                );
+            }
+
+            hard_sigmoid_f32_slice(&x, &mut o, alpha, 0.5);
+            for (&xi, &got) in x.iter().zip(&o) {
+                let want = hard_sigmoid_scalar(xi, alpha, 0.5);
+                // FMA in the vector path against a rounded multiply-then-add in
+                // the scalar one: equal to within one rounding of the product,
+                // not bit-identical.
+                assert!(
+                    (f64::from(got) - f64::from(want)).abs() <= 1e-7,
+                    "hard_sigmoid({xi}, {alpha}) = {got}, want {want}"
+                );
+            }
+
+            selu_f32_slice(&x, &mut o, alpha, 1.050_701);
+            for (&xi, &got) in x.iter().zip(&o) {
+                let want = selu_scalar(xi, alpha, 1.050_701);
+                let e = (f64::from(got) - f64::from(want)).abs() / f64::from(want).abs().max(1.0);
+                assert!(
+                    e <= 4e-7 * f64::from(alpha).max(1.0),
+                    "selu({xi}, {alpha}) = {got}, want {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn elu_special_values() {
+        let mut x = special_inputs();
+        x.extend_from_slice(&[1.0, -1.0, 0.25]);
+        let mut o = vec![0.0f32; x.len()];
+        elu_f32_slice(&x, &mut o, 1.0);
+        // exp(-Inf) - 1 = -1, so Elu saturates at -alpha rather than diverging.
+        assert_eq!(o[PAD], -1.0, "elu(-Inf)");
+        // `x < 0` is false at -0, so -0 is passed through with its sign intact.
+        // This is where Elu and Celu part company: Celu's formula ends in an
+        // addition that destroys the sign, Elu's is a select that keeps it.
+        assert_eq!(o[PAD + 1].to_bits(), 0x8000_0000, "elu(-0) stays -0");
+        assert_eq!(
+            elu_scalar(-0.0, 1.0).to_bits(),
+            0x8000_0000,
+            "scalar elu(-0)"
+        );
+        assert_eq!(o[PAD + 2].to_bits(), 0, "elu(+0)");
+        assert_eq!(o[PAD + 3], f32::INFINITY, "elu(+Inf)");
+        // NaN answers false to an ordered `<`, so it takes the identity lane.
+        assert!(o[PAD + 4].is_nan(), "elu(NaN)");
+        assert_eq!(o[PAD + 5], -1.0, "elu(-MAX) saturates to -alpha");
+        assert_eq!(o[PAD + 6], f32::MAX, "elu(MAX)");
+        assert_eq!(o[PAD + 7], -1.0, "elu(-1e30)");
+        assert_eq!(o[PAD + 8], 1e30, "elu(1e30)");
+        for (&xi, &got) in x[x.len() - 3..].iter().zip(&o[x.len() - 3..]) {
+            let want = elu_scalar(xi, 1.0);
+            assert!(
+                (f64::from(got) - f64::from(want)).abs() <= 4e-7,
+                "elu({xi}) = {got}, want {want}"
+            );
+        }
+    }
+
+    /// The scalar fallback must answer exactly what the vector path answers.
+    ///
+    /// Reachable from outside by any tensor shorter than `SIMD_MIN_LEN` and by
+    /// every non-AVX2 host, so a divergence here would make the result depend
+    /// on the tensor's length and on which machine ran it.
+    #[test]
+    fn elu_scalar_path_agrees_with_the_vector_path() {
+        let specials = [
+            f32::NAN,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            -0.0,
+            0.0,
+            -1.0,
+            1.0,
+            -90.0,
+            0.25,
+        ];
+        assert!(
+            specials.len() < SIMD_MIN_LEN,
+            "the short slice must be short enough to take the scalar path"
+        );
+        for alpha in [0.25f32, 1.0, 2.0, 7.5] {
+            let mut short_out = vec![0.0f32; specials.len()];
+            elu_f32_slice(&specials, &mut short_out, alpha);
+
+            let mut long = vec![0.0f32; PAD];
+            long.extend_from_slice(&specials);
+            let mut long_out = vec![0.0f32; long.len()];
+            elu_f32_slice(&long, &mut long_out, alpha);
+
+            for (i, &x) in specials.iter().enumerate() {
+                let scalar = short_out[i];
+                let vector = long_out[PAD + i];
+                assert_eq!(
+                    scalar.is_nan(),
+                    vector.is_nan(),
+                    "elu({x}, alpha={alpha}): scalar {scalar}, vector {vector}"
+                );
+                if !scalar.is_nan() {
+                    assert_eq!(
+                        scalar.to_bits(),
+                        vector.to_bits(),
+                        "elu({x}, alpha={alpha}): scalar {scalar}, vector {vector}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn elu_matches_scalar_across_alphas() {
+        let x = grid(-90.0, 90.0, 20_003, &[]);
+        let mut o = vec![0.0f32; x.len()];
+        for alpha in [0.25f32, 0.5, 1.0, 2.0, 7.5] {
+            elu_f32_slice(&x, &mut o, alpha);
+            for (&xi, &got) in x.iter().zip(&o) {
+                let want = elu_scalar(xi, alpha);
+                let e = (f64::from(got) - f64::from(want)).abs() / f64::from(want).abs().max(1.0);
+                // As in Celu, alpha multiplies exp's rounding error directly.
+                let bound = 4e-7 * f64::from(alpha).max(1.0);
+                assert!(e <= bound, "elu({xi}, alpha={alpha}) = {got}, want {want}");
+            }
+        }
+    }
+
+    #[test]
+    fn celu_special_values() {
+        let mut x = special_inputs();
+        x.extend_from_slice(&[1.0, -1.0, 0.25]);
+        let mut o = vec![0.0f32; x.len()];
+        celu_f32_slice(&x, &mut o, 1.0);
+        // Celu(-Inf) = 0 + min(0, 1*(exp(-Inf)-1)) = -1.
+        assert_eq!(o[PAD], -1.0, "celu(-Inf)");
+        // Celu(x) = max(0, x) + min(0, alpha * (exp(x / alpha) - 1)). At x = -0
+        // both terms are zero, and IEEE-754 round-to-nearest addition of two
+        // zeros yields -0 only when *both* are -0. Here the right-hand term is
+        // exp(-0) - 1 = +0, so the sign is destroyed by the formula itself --
+        // for the scalar reference and for ORT exactly as for us. Pin both.
+        assert_eq!(o[PAD + 1].to_bits(), 0, "celu(-0) is +0");
+        assert_eq!(celu_scalar(-0.0, 1.0).to_bits(), 0, "scalar celu(-0) is +0");
+        assert_eq!(o[PAD + 2], 0.0, "celu(+0)");
+        assert_eq!(o[PAD + 3], f32::INFINITY, "celu(+Inf)");
+        assert!(o[PAD + 4].is_nan(), "celu(NaN)");
+        assert_eq!(o[PAD + 5], -1.0, "celu(-MAX) saturates to -alpha");
+        assert_eq!(o[PAD + 6], f32::MAX, "celu(MAX)");
+        for (&xi, &got) in x[x.len() - 3..].iter().zip(&o[x.len() - 3..]) {
+            let want = celu_scalar(xi, 1.0);
+            assert!(
+                (f64::from(got) - f64::from(want)).abs() <= 4e-7,
+                "celu({xi}) = {got}, want {want}"
+            );
+        }
+    }
+
+    /// The scalar fallback must answer exactly what the vector path answers.
+    ///
+    /// `special_inputs()` pads to `SIMD_MIN_LEN`, so every other special-value
+    /// test in this file takes the vector path -- which is how `celu_scalar`
+    /// silently turning NaN into `0.0` survived being written. A slice shorter
+    /// than `SIMD_MIN_LEN` is the only way to reach the scalar branch from
+    /// outside, and it is reached in production by small tensors and by any
+    /// host without AVX2. Which one runs must not be observable.
+    #[test]
+    fn celu_scalar_path_agrees_with_the_vector_path() {
+        let specials = [
+            f32::NAN,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            -0.0,
+            0.0,
+            -1.0,
+            1.0,
+            -30.0,
+            0.25,
+        ];
+        assert!(
+            specials.len() < SIMD_MIN_LEN,
+            "the short slice must be short enough to take the scalar path"
+        );
+        for alpha in [0.25f32, 1.0, 2.0, 7.5] {
+            let mut short_out = vec![0.0f32; specials.len()];
+            celu_f32_slice(&specials, &mut short_out, alpha);
+
+            let mut long = vec![0.0f32; PAD];
+            long.extend_from_slice(&specials);
+            let mut long_out = vec![0.0f32; long.len()];
+            celu_f32_slice(&long, &mut long_out, alpha);
+
+            for (i, &x) in specials.iter().enumerate() {
+                let scalar = short_out[i];
+                let vector = long_out[PAD + i];
+                assert_eq!(
+                    scalar.is_nan(),
+                    vector.is_nan(),
+                    "celu({x}, alpha={alpha}): scalar {scalar}, vector {vector}"
+                );
+                if !scalar.is_nan() {
+                    assert_eq!(
+                        scalar.to_bits(),
+                        vector.to_bits(),
+                        "celu({x}, alpha={alpha}): scalar {scalar}, vector {vector}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn celu_matches_scalar_across_alphas() {
+        let x = grid(-30.0, 30.0, 20_003, &[]);
+        let mut o = vec![0.0f32; x.len()];
+        for alpha in [0.25f32, 0.5, 1.0, 2.0, 7.5] {
+            celu_f32_slice(&x, &mut o, alpha);
+            for (&xi, &got) in x.iter().zip(&o) {
+                let want = celu_scalar(xi, alpha);
+                let e = (f64::from(got) - f64::from(want)).abs() / f64::from(want).abs().max(1.0);
+                // The negative half is alpha * (exp(u) - 1), so alpha directly
+                // multiplies the rounding error of exp: at alpha = 7.5 a
+                // half-ulp slip in exp shows up as ~7.5 half-ulps here. The
+                // bound therefore has to scale with alpha rather than pretend
+                // the amplification is not real.
+                let bound = 4e-7 * f64::from(alpha).max(1.0);
+                assert!(
+                    e <= bound,
+                    "celu({xi}, alpha={alpha}) = {got}, want {want}, err {e:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mish_special_values() {
+        let mut x = special_inputs();
+        x.extend_from_slice(&[1.0, -1.0, 0.0]);
+        let mut o = vec![0.0f32; x.len()];
+        mish_f32_slice(&x, &mut o);
+        // softplus(-Inf) = 0, tanh(0) = 0, so x*0 with x = -Inf is NaN --
+        // which is what the scalar reference produces too.
+        assert_eq!(
+            o[PAD].is_nan(),
+            mish_scalar(f32::NEG_INFINITY).is_nan(),
+            "mish(-Inf) must agree with the scalar reference"
+        );
+        assert_eq!(o[PAD + 1].to_bits(), (-0.0f32).to_bits(), "mish(-0) is -0");
+        assert_eq!(o[PAD + 2], 0.0, "mish(+0)");
+        assert_eq!(o[PAD + 3], f32::INFINITY, "mish(+Inf)");
+        assert!(o[PAD + 4].is_nan(), "mish(NaN)");
+        assert_eq!(o[PAD + 6], f32::MAX, "mish(MAX) = MAX");
+    }
+
+    #[test]
+    fn mish_dense_sweep_matches_scalar() {
+        let x = grid(-30.0, 30.0, 200_003, &[]);
+        let mut o = vec![0.0f32; x.len()];
+        mish_f32_slice(&x, &mut o);
+        for (&xi, &got) in x.iter().zip(&o) {
+            let want = mish_scalar(xi);
+            let e = (f64::from(got) - f64::from(want)).abs() / f64::from(xi).abs().max(1.0);
+            assert!(e <= 6e-7, "mish({xi}) = {got}, want {want}, err {e:e}");
         }
     }
 
@@ -4265,6 +5454,79 @@ mod chunking_instantiation_is_local {
                  Relu 34% at 1 Mi (236 -> 315 us) with no path change"
             );
         }
+    }
+}
+
+/// The same hazard from the other side: keeping `run_chunked` private stops one
+/// *known* way of repartitioning the crate, but the compiler is free to split it
+/// sixteen ways regardless, and by default it does. Measured on the release
+/// profile, this crate built as one codegen unit against the default sixteen:
+///
+/// | case (1 thread, p50 of 5 interleaved runs) | 16 CGUs | 1 CGU | ratio |
+/// |---|---|---|---|
+/// | `Sqrt` f32, 4096 elems | 0.639 ns/elem | 0.241 | 2.65x |
+/// | `Tanh` f32, 4096 elems | 0.728 | 0.381 | 1.91x |
+/// | `Sigmoid` f32, 4096 elems | 0.729 | 0.392 | 1.86x |
+/// | `Sqrt` f16, 4096 elems | 0.907 | 0.511 | 1.78x |
+/// | `Tanh` f32, 2 Mi elems | 0.202 | 0.099 | 2.04x |
+/// | `QuickGelu` f32, 16 elems (control) | 8.56 | 8.66 | 0.99x |
+///
+/// 77 of 105 measured cases move by more than 1.15x; the ones that do not are
+/// the 16-element shapes, where dispatch rather than the loop is the cost. That
+/// is the signature of a de-vectorized inner loop, not of noise.
+///
+/// So the workspace pins `codegen-units = 1` for this package. That is a build
+/// setting a rebase can drop without any test noticing, which is exactly how the
+/// same class of regression reached `main` before, so this test reads it back.
+#[cfg(test)]
+mod codegen_units_are_pinned {
+    /// Both shipping profiles must still build this crate as a single codegen
+    /// unit.
+    ///
+    /// `bench` is checked too because a per-package override does not inherit
+    /// from `release`, so dropping it would leave `cargo bench` measuring the
+    /// de-vectorized build -- the one place a wrong number is most expensive.
+    #[test]
+    fn the_workspace_pins_one_codegen_unit_for_this_crate() {
+        for profile in ["release", "bench"] {
+            assert_pinned(profile);
+        }
+    }
+
+    fn assert_pinned(profile: &str) {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/<pkg> has a workspace root two levels up")
+            .join("Cargo.toml");
+        let text = std::fs::read_to_string(&manifest)
+            .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+        let header = format!("[profile.{profile}.package.onnx-runtime-ep-cpu]");
+        let Some(start) = text.find(&header) else {
+            panic!(
+                "{} no longer contains {header}; building this crate as the \
+                 default sixteen codegen units de-vectorizes the AVX2 \
+                 elementwise kernels and costs up to 2.65x",
+                manifest.display()
+            );
+        };
+        let section = &text[start + header.len()..];
+        let section = &section[..section.find("\n[").unwrap_or(section.len())];
+        let pinned = section.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("codegen-units")
+                && line.split_once('=').is_some_and(|(_, value)| {
+                    // Tolerate an inline comment: the most likely future edit to
+                    // this line is someone explaining it, and a guard that fails
+                    // on its own documentation teaches people to delete it.
+                    let value = value.split('#').next().unwrap_or(value);
+                    value.trim().trim_end_matches(',') == "1"
+                })
+        });
+        assert!(
+            pinned,
+            "{header} exists but does not set `codegen-units = 1`; found:{section}"
+        );
     }
 }
 

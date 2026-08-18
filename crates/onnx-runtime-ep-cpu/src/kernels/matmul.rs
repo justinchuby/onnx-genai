@@ -1253,6 +1253,412 @@ fn micro_kernel(
     }
 }
 
+/// Layout-aware 2-D GEMM: `c[m,n] = a[m,k] * bt[n,k]ᵀ` (overwrite), i.e.
+/// `c[i][j] = Σ_p a[i*k + p] * bt[j*k + p]`.
+///
+/// `a` is `m*k` row-major, **`bt` is `n*k` row-major** — B stored transposed as
+/// `[n][k]` — and `c` is `m*n` row-major. This is exactly the layout MoE expert
+/// weights already have (`[out_features][in_features]`), so the caller never has
+/// to materialize the `[k][n]` copy that plain [`gemm`] would need. It is also a
+/// *better* layout for the dot-product formulation: both operands are contiguous
+/// along `k`, so the inner loop is a pure contiguous dot product.
+///
+/// Parallelized identically to [`gemm_generic`]: row blocks of `c` across the
+/// process Rayon pool, or column strips when `m` is smaller than the pool. The
+/// per-block inner kernel dispatches to an AVX2+FMA path at runtime (with a
+/// portable scalar fallback), mirroring the softmax kernel's structure. Result
+/// is bit-plausible against a scalar reference within f32 tolerance.
+#[cfg(not(feature = "mlas"))]
+pub(crate) fn gemm_bt(
+    a: &[f32],
+    bt: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<()> {
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    let threads = rayon::current_num_threads();
+    if threads > 1 && m < threads && n > 1 {
+        gemm_bt_col_parallel(a, bt, c, m, k, n, threads);
+        return Ok(());
+    }
+    let mc = if threads <= 1 {
+        MAX_MC.min(m)
+    } else {
+        let target_tasks = threads.saturating_mul(2);
+        let rows = m.div_ceil(target_tasks).clamp(1, MAX_MC);
+        if rows == 1 {
+            1
+        } else {
+            rows.div_ceil(MR).saturating_mul(MR).min(MAX_MC)
+        }
+    };
+    // Parallelize over disjoint row blocks of `c`; each block reads shared,
+    // immutable `a`/`bt`. `for_each_init` opens one worker-lane span per worker
+    // rather than reopening it per block, matching [`gemm_generic`].
+    c.par_chunks_mut(mc * n).enumerate().for_each_init(
+        || crate::trace::worker_span("MatMul.gemm_bt.row_block"),
+        |_span, (blk, c_block)| {
+            let i0 = blk * mc;
+            let rows = c_block.len() / n; // last block may be short
+            let a_block = &a[i0 * k..i0 * k + rows * k];
+            gemm_bt_block(a_block, bt, c_block, rows, k, n);
+        },
+    );
+    Ok(())
+}
+
+/// Column-strip parallel counterpart of [`gemm_bt`], selected when `m` is below
+/// the pool size so row-block parallelism would under-fill it. Unlike
+/// [`gemm_generic_col_parallel`], no strided B copy is needed: a strip of output
+/// columns `[j0, j0+strip)` is exactly the contiguous `bt` rows
+/// `bt[j0*k .. (j0+strip)*k]`, so each task borrows its slice directly and only
+/// the small result scatter is serial.
+#[cfg(not(feature = "mlas"))]
+fn gemm_bt_col_parallel(
+    a: &[f32],
+    bt: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    threads: usize,
+) {
+    let cols_per_strip = n.div_ceil(threads).max(1);
+    let strips: Vec<(usize, usize)> = (0..n)
+        .step_by(cols_per_strip)
+        .map(|j0| (j0, cols_per_strip.min(n - j0)))
+        .collect();
+    let results: Vec<(usize, usize, Vec<f32>)> = strips
+        .into_par_iter()
+        .map(|(j0, strip_n)| {
+            let bt_strip = &bt[j0 * k..(j0 + strip_n) * k];
+            let mut c_strip = vec![0.0f32; m * strip_n];
+            gemm_bt_block(a, bt_strip, &mut c_strip, m, k, strip_n);
+            (j0, strip_n, c_strip)
+        })
+        .collect();
+    for (j0, strip_n, c_strip) in results {
+        for row in 0..m {
+            c[row * n + j0..row * n + j0 + strip_n]
+                .copy_from_slice(&c_strip[row * strip_n..row * strip_n + strip_n]);
+        }
+    }
+}
+
+/// Compute `c[rows,n] = a[rows,k] * bt[n,k]ᵀ` (overwrite) for one row block,
+/// dispatching to the AVX2+FMA kernel when the host supports it.
+#[cfg(not(feature = "mlas"))]
+fn gemm_bt_block(a: &[f32], bt: &[f32], c: &mut [f32], rows: usize, k: usize, n: usize) {
+    if rows == 0 || n == 0 {
+        return;
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if gemm_bt_avx2::available() {
+            // SAFETY: the branch proves the running CPU has AVX2+FMA. `a` is
+            // `rows*k`, `bt` is `n*k`, `c` is `rows*n`, all row-major, so every
+            // pointer the kernel forms from `(rows, k, n)` is in bounds.
+            unsafe {
+                gemm_bt_avx2::block(a.as_ptr(), bt.as_ptr(), c.as_mut_ptr(), rows, k, n);
+            }
+            return;
+        }
+    }
+    gemm_bt_block_scalar(a, bt, c, rows, k, n);
+}
+
+/// Portable scalar reference block: the fallback for non-x86 targets and for x86
+/// without AVX2+FMA. Contains no `unsafe`. Overwrites each `c[i][j]` with the
+/// contiguous dot product `Σ_p a[i][p] * bt[j][p]` (so `k == 0` writes 0).
+#[cfg(not(feature = "mlas"))]
+fn gemm_bt_block_scalar(a: &[f32], bt: &[f32], c: &mut [f32], rows: usize, k: usize, n: usize) {
+    for i in 0..rows {
+        let arow = &a[i * k..i * k + k];
+        let crow = &mut c[i * n..i * n + n];
+        for (j, cv) in crow.iter_mut().enumerate() {
+            let brow = &bt[j * k..j * k + k];
+            let mut sum = 0.0f32;
+            for p in 0..k {
+                sum += arow[p] * brow[p];
+            }
+            *cv = sum;
+        }
+    }
+}
+
+/// AVX2+FMA inner kernel for [`gemm_bt`]: `c[i][j] = Σ_p a[i][p] * bt[j][p]` on
+/// eight `k`-lanes at once. Runtime-detected exactly like the softmax kernel,
+/// with `loadu`/`storeu`-style unaligned access (no alignment assumed) and a
+/// scalar tail for `k % 8`.
+///
+/// Interior `4×2` tiles of `c` are held in eight `__m256` accumulators (four
+/// A rows × two B rows), reusing each loaded B vector across the four rows and
+/// each loaded A vector across the two columns; the eight independent
+/// accumulators hide FMA latency. Edge rows (`rows % 4`, which includes the
+/// `m == 1` decode case) and the odd trailing column (`n % 2`) fall to a
+/// four-accumulator contiguous dot product — itself a good GEMV.
+#[cfg(all(
+    not(feature = "mlas"),
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+mod gemm_bt_avx2 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    /// Runtime detection: AVX2 (256-bit float ops) and FMA (the accumulation).
+    #[inline]
+    pub fn available() -> bool {
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+    }
+
+    /// Horizontal sum of the eight lanes.
+    ///
+    /// # Safety
+    /// AVX must be available (implied by AVX2 on the calling path).
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn hsum(v: __m256) -> f32 {
+        let hi = _mm256_extractf128_ps::<1>(v);
+        let lo = _mm256_castps256_ps128(v);
+        let s = _mm_add_ps(lo, hi);
+        let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        let s = _mm_add_ss(s, _mm_shuffle_ps::<0x55>(s, s));
+        _mm_cvtss_f32(s)
+    }
+
+    /// Contiguous dot product `Σ_{p<k} a[p] * b[p]` with four independent
+    /// accumulators (32-wide unroll) to hide FMA latency, then a scalar tail.
+    ///
+    /// # Safety
+    /// AVX2+FMA available; `a` and `b` are each valid for `k` f32 reads.
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn dot(a: *const f32, b: *const f32, k: usize) -> f32 {
+        unsafe {
+            let mut acc0 = _mm256_setzero_ps();
+            let mut acc1 = _mm256_setzero_ps();
+            let mut acc2 = _mm256_setzero_ps();
+            let mut acc3 = _mm256_setzero_ps();
+            let mut p = 0usize;
+            while p + 32 <= k {
+                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(p)), _mm256_loadu_ps(b.add(p)), acc0);
+                acc1 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(a.add(p + 8)),
+                    _mm256_loadu_ps(b.add(p + 8)),
+                    acc1,
+                );
+                acc2 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(a.add(p + 16)),
+                    _mm256_loadu_ps(b.add(p + 16)),
+                    acc2,
+                );
+                acc3 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(a.add(p + 24)),
+                    _mm256_loadu_ps(b.add(p + 24)),
+                    acc3,
+                );
+                p += 32;
+            }
+            while p + 8 <= k {
+                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(p)), _mm256_loadu_ps(b.add(p)), acc0);
+                p += 8;
+            }
+            let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+            let mut sum = hsum(acc);
+            while p < k {
+                sum += *a.add(p) * *b.add(p);
+                p += 1;
+            }
+            sum
+        }
+    }
+
+    /// One interior `4×2` tile: `c[i+ii][j+jj] = Σ_p a[i+ii][p] * bt[j+jj][p]`
+    /// for `ii<4`, `jj<2`, held in eight `__m256` accumulators over the full
+    /// `k`-loop and finished with a scalar tail (`k % 8`). Each B vector is
+    /// reused across the four A rows and each A vector across the two B rows, so
+    /// the tile issues eight independent FMAs per eight-lane step — enough
+    /// in-flight accumulators to hide FMA latency — and pays exactly one
+    /// horizontal reduction per output cell. Because the reduction is along `k`
+    /// (the SIMD lanes hold `k`-partials, not `C`-partials), `k` is *not* cache
+    /// blocked here; the reuse of a large `bt` is instead recovered by column
+    /// blocking in [`block`], which keeps one reduction per tile.
+    ///
+    /// # Safety
+    /// AVX2+FMA available. Rows `i..i+4` of `a` (`a` is `_*k`), rows `j..j+2` of
+    /// `bt` (`bt` is `_*k`) and elements `(i+ii)*n + j+jj` of `c` are all valid.
+    #[target_feature(enable = "avx2,fma")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn tile_4x2(
+        a: *const f32,
+        bt: *const f32,
+        c: *mut f32,
+        k: usize,
+        n: usize,
+        i: usize,
+        j: usize,
+    ) {
+        unsafe {
+            let a0 = a.add(i * k);
+            let a1 = a.add((i + 1) * k);
+            let a2 = a.add((i + 2) * k);
+            let a3 = a.add((i + 3) * k);
+            let b0 = bt.add(j * k);
+            let b1 = bt.add((j + 1) * k);
+
+            let mut c00 = _mm256_setzero_ps();
+            let mut c01 = _mm256_setzero_ps();
+            let mut c10 = _mm256_setzero_ps();
+            let mut c11 = _mm256_setzero_ps();
+            let mut c20 = _mm256_setzero_ps();
+            let mut c21 = _mm256_setzero_ps();
+            let mut c30 = _mm256_setzero_ps();
+            let mut c31 = _mm256_setzero_ps();
+
+            let mut p = 0usize;
+            while p + 8 <= k {
+                let vb0 = _mm256_loadu_ps(b0.add(p));
+                let vb1 = _mm256_loadu_ps(b1.add(p));
+                let va = _mm256_loadu_ps(a0.add(p));
+                c00 = _mm256_fmadd_ps(va, vb0, c00);
+                c01 = _mm256_fmadd_ps(va, vb1, c01);
+                let va = _mm256_loadu_ps(a1.add(p));
+                c10 = _mm256_fmadd_ps(va, vb0, c10);
+                c11 = _mm256_fmadd_ps(va, vb1, c11);
+                let va = _mm256_loadu_ps(a2.add(p));
+                c20 = _mm256_fmadd_ps(va, vb0, c20);
+                c21 = _mm256_fmadd_ps(va, vb1, c21);
+                let va = _mm256_loadu_ps(a3.add(p));
+                c30 = _mm256_fmadd_ps(va, vb0, c30);
+                c31 = _mm256_fmadd_ps(va, vb1, c31);
+                p += 8;
+            }
+
+            let mut s00 = hsum(c00);
+            let mut s01 = hsum(c01);
+            let mut s10 = hsum(c10);
+            let mut s11 = hsum(c11);
+            let mut s20 = hsum(c20);
+            let mut s21 = hsum(c21);
+            let mut s30 = hsum(c30);
+            let mut s31 = hsum(c31);
+            while p < k {
+                let x0 = *b0.add(p);
+                let x1 = *b1.add(p);
+                let y0 = *a0.add(p);
+                s00 += y0 * x0;
+                s01 += y0 * x1;
+                let y1 = *a1.add(p);
+                s10 += y1 * x0;
+                s11 += y1 * x1;
+                let y2 = *a2.add(p);
+                s20 += y2 * x0;
+                s21 += y2 * x1;
+                let y3 = *a3.add(p);
+                s30 += y3 * x0;
+                s31 += y3 * x1;
+                p += 1;
+            }
+
+            *c.add(i * n + j) = s00;
+            *c.add(i * n + j + 1) = s01;
+            *c.add((i + 1) * n + j) = s10;
+            *c.add((i + 1) * n + j + 1) = s11;
+            *c.add((i + 2) * n + j) = s20;
+            *c.add((i + 2) * n + j + 1) = s21;
+            *c.add((i + 3) * n + j) = s30;
+            *c.add((i + 3) * n + j + 1) = s31;
+        }
+    }
+
+    /// Compute `c[rows,n] = a[rows,k] * bt[n,k]ᵀ` (overwrite).
+    ///
+    /// Interior `4×2` tiles are swept **column-block first**: a panel of `NC_KB`
+    /// KiB worth of `bt` columns (`nc` rows of the `[n][k]` matrix) is pinned in
+    /// cache while all row bands reuse it, then the panel advances. Without this,
+    /// each row band re-streams the whole `[n × k]` `bt` from DRAM, so for a
+    /// `bt` larger than L3 (e.g. the 52 MiB Phi-3.5-MoE experts) large-token
+    /// prefill becomes DRAM-bound and loses to a one-shot transpose+GEMM. The
+    /// tile still reduces along `k` in one pass (one horizontal sum per cell),
+    /// so — unlike K blocking — column blocking adds no reduction overhead. The
+    /// odd trailing column (`n % 2`) and edge rows (`rows % 4`, incl. the
+    /// `rows == 1` decode case) then run as full-`k` [`dot`]s.
+    ///
+    /// # Safety
+    /// AVX2+FMA available. `a` is valid for `rows*k` reads, `bt` for `n*k`
+    /// reads, and `c` for `rows*n` writes, all row-major.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn block(
+        a: *const f32,
+        bt: *const f32,
+        c: *mut f32,
+        rows: usize,
+        k: usize,
+        n: usize,
+    ) {
+        unsafe {
+            let r4 = rows - rows % 4;
+            let n2 = n - n % 2;
+
+            // Column-block width: keep one `bt` panel near L2-resident so the
+            // row-band sweep reuses it instead of re-reading all of `bt` per
+            // band. Round down to an even count (the tile is 2 columns wide) and
+            // keep at least one tile.
+            const NC_KB: usize = 256;
+            let bytes_per_col = k.saturating_mul(4).max(1);
+            let mut nc = (NC_KB * 1024) / bytes_per_col;
+            nc &= !1;
+            if nc < 2 {
+                nc = 2;
+            }
+
+            // Interior tiles: column panel outer, row band inner, so the pinned
+            // `bt` panel is reused across every row band before it is evicted.
+            let mut j0 = 0usize;
+            while j0 < n2 {
+                let jend = (j0 + nc).min(n2);
+                let mut i = 0usize;
+                while i < r4 {
+                    let mut j = j0;
+                    while j < jend {
+                        tile_4x2(a, bt, c, k, n, i, j);
+                        j += 2;
+                    }
+                    i += 4;
+                }
+                j0 = jend;
+            }
+
+            // Odd trailing column of the interior rows (single full-k dot each).
+            if n2 < n {
+                let mut i = 0usize;
+                while i < r4 {
+                    for ii in 0..4 {
+                        *c.add((i + ii) * n + n2) = dot(a.add((i + ii) * k), bt.add(n2 * k), k);
+                    }
+                    i += 4;
+                }
+            }
+
+            // Edge rows (`rows % 4`, incl. the `rows == 1` decode case): a
+            // full-k dot for every column.
+            let mut i = r4;
+            while i < rows {
+                for j in 0..n {
+                    *c.add(i * n + j) = dot(a.add(i * k), bt.add(j * k), k);
+                }
+                i += 1;
+            }
+        }
+    }
+}
+
 impl Kernel for MatMulKernel {
     fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
         self.prepack.set_constant_inputs(constant_inputs);
@@ -5468,5 +5874,225 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// Independent scalar oracle for [`gemm_bt`]: `c[i][j] = Σ_p a[i][p]*bt[j][p]`
+    /// with left-to-right accumulation, sharing no code with production.
+    #[cfg(not(feature = "mlas"))]
+    #[allow(clippy::needless_range_loop)]
+    fn naive_bt(a: &[f32], bt: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut c = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += a[i * k + p] * bt[j * k + p];
+                }
+                c[i * n + j] = sum;
+            }
+        }
+        c
+    }
+
+    /// Small deterministic LCG stream in `[-0.125, 0.125)`, matching the style of
+    /// [`matmul_generic_block_boundaries_match_naive_reference`].
+    #[cfg(not(feature = "mlas"))]
+    fn lcg_stream(seed: u32) -> impl FnMut() -> f32 {
+        let mut state = seed;
+        move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 0.25
+        }
+    }
+
+    /// `gemm_bt` must match the independent naive oracle across every shape that
+    /// exercises the `4×2` interior tile, the `dot` edge/GEMV path, `k % 8`
+    /// tails, odd `n`, leftover rows (`rows % 4`), the `m == 1` decode case and
+    /// `n == 1`.
+    #[cfg(not(feature = "mlas"))]
+    #[test]
+    fn gemm_bt_matches_naive_reference_across_shapes() {
+        // (m, k, n): full tiles, tails, odd n, decode rows, single row/col.
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (1, 1, 1),     // smallest
+            (1, 7, 1),     // m=1, n=1, k tail (7 % 8)
+            (1, 8, 5),     // m=1, exact k block, odd n
+            (1, 9, 5),     // m=1, k tail 1, odd n
+            (1, 1024, 64), // decode: single token, large k
+            (1, 300, 300), // decode: rectangular
+            (4, 16, 2),    // exactly one interior tile
+            (4, 17, 2),    // interior tile + k tail
+            (5, 16, 2),    // 1 full row band + 1 leftover row
+            (7, 33, 9),    // 3 leftover rows, k tail, odd n
+            (8, 8, 8),     // two full row bands
+            (13, 64, 5),   // leftover rows + odd n
+            (3, 100, 1),   // all leftover rows, single column
+            (6, 1, 4),     // k = 1 (tail only, no 8-block)
+            (4, 3, 2),     // k < 8 (all tail)
+            (2, 5, 3),
+            (129, 130, 131), // large: row-block / col-parallel + all edges
+        ];
+        for &(m, k, n) in SHAPES {
+            let mut ra = lcg_stream(0x1234_5678 ^ (m as u32).wrapping_mul(2_654_435_761));
+            let mut rb = lcg_stream(0x9E37_79B9 ^ (n as u32).wrapping_mul(40_503));
+            let a: Vec<f32> = (0..m * k).map(|_| ra()).collect();
+            let bt: Vec<f32> = (0..n * k).map(|_| rb()).collect();
+            let want = naive_bt(&a, &bt, m, k, n);
+            let mut got = vec![f32::NAN; m * n];
+            gemm_bt(&a, &bt, &mut got, m, k, n).unwrap();
+            for (idx, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-3,
+                    "shape {m}x{k}x{n} index {idx}: got {g}, want {w}"
+                );
+            }
+        }
+    }
+
+    /// The zero-extent guards must leave a correctly sized result and never
+    /// panic on the chunking math: `m == 0` and `n == 0` produce empty products
+    /// and `k == 0` produces all-zero dot products.
+    #[cfg(not(feature = "mlas"))]
+    #[test]
+    fn gemm_bt_handles_zero_extents() {
+        // m == 0: nothing to write.
+        let mut c: Vec<f32> = Vec::new();
+        gemm_bt(&[], &[0.1, 0.2, 0.3, 0.4], &mut c, 0, 4, 1).unwrap();
+        assert!(c.is_empty());
+
+        // n == 0: nothing to write.
+        let mut c: Vec<f32> = Vec::new();
+        gemm_bt(&[0.1, 0.2, 0.3, 0.4], &[], &mut c, 2, 2, 0).unwrap();
+        assert!(c.is_empty());
+
+        // k == 0: every dot product is the empty sum, i.e. exactly 0.
+        let mut c = vec![7.0f32; 3 * 5];
+        gemm_bt(&[], &[], &mut c, 3, 0, 5).unwrap();
+        assert!(c.iter().all(|&v| v == 0.0), "k == 0 must zero every output");
+    }
+
+    /// Pin the portable scalar fallback [`gemm_bt_block_scalar`] (the non-x86 /
+    /// no-AVX2 path) directly against the naive oracle, since the host normally
+    /// takes the AVX2 path and would never exercise it.
+    #[cfg(not(feature = "mlas"))]
+    #[test]
+    fn gemm_bt_block_scalar_matches_naive_reference() {
+        const SHAPES: &[(usize, usize, usize)] = &[(1, 7, 1), (4, 17, 3), (7, 33, 9), (13, 5, 4)];
+        for &(m, k, n) in SHAPES {
+            let mut ra = lcg_stream(0x0BAD_F00D ^ (k as u32));
+            let mut rb = lcg_stream(0xFEED_BEEF ^ (n as u32));
+            let a: Vec<f32> = (0..m * k).map(|_| ra()).collect();
+            let bt: Vec<f32> = (0..n * k).map(|_| rb()).collect();
+            let want = naive_bt(&a, &bt, m, k, n);
+            let mut got = vec![f32::NAN; m * n];
+            gemm_bt_block_scalar(&a, &bt, &mut got, m, k, n);
+            for (idx, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-3,
+                    "scalar shape {m}x{k}x{n} index {idx}: got {g}, want {w}"
+                );
+            }
+        }
+    }
+
+    /// The exact oracle the task asks for: `gemm_bt` on the native `[n][k]`
+    /// weight layout must equal the *removed* production path — materialize the
+    /// `[k][n]` transpose, then run the plain `gemm`. Values must match within a
+    /// tight f32 tolerance (only the summation order differs).
+    #[cfg(not(feature = "mlas"))]
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn gemm_bt_matches_transpose_then_gemm() {
+        // Small-m shapes exercise the `dot` GEMV path; the large-m shapes force
+        // the row-block driver so the `4×2` tile kernel (and its `k` tail) runs.
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (1, 96, 40),
+            (5, 7, 9),
+            (12, 64, 20),
+            (4, 16, 2),
+            (40, 130, 34),
+            (64, 96, 48),
+        ];
+        for &(m, k, n) in SHAPES {
+            let mut ra = lcg_stream(0xA5A5_1234 ^ (m as u32));
+            let mut rb = lcg_stream(0x5A5A_9876 ^ (n as u32));
+            let a: Vec<f32> = (0..m * k).map(|_| ra()).collect();
+            // `bt` is the expert layout `[n][k]` (i.e. `[out][in]`).
+            let bt: Vec<f32> = (0..n * k).map(|_| rb()).collect();
+
+            // Reference: the old path — transpose `bt` into `[k][n]`, plain gemm.
+            let mut b_kn = vec![0.0f32; k * n];
+            for out in 0..n {
+                for inp in 0..k {
+                    b_kn[inp * n + out] = bt[out * k + inp];
+                }
+            }
+            let mut reference = vec![0.0f32; m * n];
+            gemm(&a, &b_kn, &mut reference, m, k, n).unwrap();
+
+            let mut got = vec![f32::NAN; m * n];
+            gemm_bt(&a, &bt, &mut got, m, k, n).unwrap();
+            for (idx, (&g, &r)) in got.iter().zip(&reference).enumerate() {
+                assert!(
+                    (g - r).abs() <= 1e-3,
+                    "shape {m}x{k}x{n} index {idx}: gemm_bt {g}, transpose+gemm {r}"
+                );
+            }
+        }
+    }
+
+    /// Deterministically exercise the `4×2` tile kernel and its `k` tail. A
+    /// single-thread Rayon pool forces the row-block driver (the
+    /// `native-threads=1` production path), so every `m >= 4` shape runs through
+    /// `tile_4x2` regardless of the ambient pool width - the ambient pool would
+    /// otherwise split small `m`/`n` into one-row / one-column tasks that never
+    /// reach the tile. Checked against the independent naive oracle.
+    #[cfg(not(feature = "mlas"))]
+    #[test]
+    fn gemm_bt_tile_kernel_matches_naive_single_threaded() {
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (8, 17, 4),   // two tile bands, k tail, even n
+            (12, 130, 6), // k tail 2
+            (4, 96, 2),   // exactly one tile, no tail
+            (9, 33, 11),  // leftover row + odd trailing column
+            (16, 256, 8),
+            // Large `k`. There is no K blocking: `tile_4x2` reduces the whole
+            // of `k` in one pass, so these cover a long single-pass reduction
+            // and its `k % 8` scalar tail, not a panelled accumulation.
+            (16, 512, 8), // long reduction, no tail
+            (12, 520, 6), // long reduction, no tail
+            (8, 300, 4),  // long reduction with a k%8 tail
+            (8, 259, 4),  // reduction whose tail is 3 lanes, all scalar
+            (13, 577, 7), // leftover rows + odd trailing column + k tail
+            // The only blocking in `gemm_bt` is over columns, and it engages
+            // at `n * k > NC_KB` (65536). Every shape above stays under that,
+            // so without these the column-panel sweep - the change that turned
+            // the largest prefill shape from a regression into a win - would
+            // be covered by nothing but the 629 MiB integration fixtures.
+            (8, 2000, 64),  // several full column panels
+            (10, 2001, 70), // column panels with a short final panel, k tail
+            (1, 2000, 40),  // the decode row, multi-panel
+        ];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            for &(m, k, n) in SHAPES {
+                let mut ra = lcg_stream(0x00C0_FFEE ^ (m as u32));
+                let mut rb = lcg_stream(0xB16B_00B5 ^ (n as u32));
+                let a: Vec<f32> = (0..m * k).map(|_| ra()).collect();
+                let bt: Vec<f32> = (0..n * k).map(|_| rb()).collect();
+                let want = naive_bt(&a, &bt, m, k, n);
+                let mut got = vec![f32::NAN; m * n];
+                gemm_bt(&a, &bt, &mut got, m, k, n).unwrap();
+                for (idx, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 1e-3,
+                        "tile shape {m}x{k}x{n} index {idx}: got {g}, want {w}"
+                    );
+                }
+            }
+        });
     }
 }

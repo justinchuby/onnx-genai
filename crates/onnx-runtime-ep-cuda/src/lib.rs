@@ -77,6 +77,7 @@ compile_error!(
     "onnx-genai CUDA build: multiple CUDA versions selected; cudarc bindings cannot compile with more than one. Enable exactly one of cuda-12060 | cuda-12080 | cuda-12090 | cuda-13000 (and set default-features = false on inter-crate deps if you override the default)."
 );
 
+pub mod arch;
 pub mod blas;
 pub mod capture;
 pub mod cudnn;
