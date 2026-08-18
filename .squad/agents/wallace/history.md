@@ -55,3 +55,8 @@ Full pre-compaction history in `history-archive.md`.
 - Under reviewer lockout, revised Deckard's rejected V2-Lite additive-mask capacity classifier by requiring present KV inputs and rejecting root graph-output mask escapes; Rachael re-approved and #1171 merged as `bc1e97ff`.
 - After Leon's `_d1` planner fix, measured the real 27-layer DeepSeek-V2-Lite int4 QMoE artifact: capture ON vs eager OFF was byte-identical over 320 tokens and median 101.80 vs 56.94 tok/s (1.79×), with every capture run faster than every eager run.
 - Flagged a separate long-context Engine Attention workspace under-plan for Leon; it reproduces with graph capture disabled and is not a classifier/capture regression.
+## 2026-08-18T04:15Z — DeepSeek-V2-Lite Native-vs-ORT row closed
+
+- Measured the real 27-layer DeepSeek-V2-Lite int4 QMoE artifact with pinned ORT CUDA 1.27 and confirmed native CUDA serves it on GPU at 57.15 tok/s eager / 101.68 tok/s captured.
+- ORT CUDA EP cannot place the 26 `com.microsoft::QMoE` nodes on GPU; with fallback it bridges 104 CPU/GPU Memcpy nodes and reaches 0.17 tok/s, while strict no-fallback refuses the graph.
+- Durable framing: this is a hard GPU capability gap (native GPU vs ORT CPU fallback), not a per-kernel speedup claim; ORT CUDA graph is categorically N/A on the split CPU/GPU graph.

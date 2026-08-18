@@ -86,3 +86,8 @@ All five red CI jobs trace to pre-existing `onnx-genai-server` failure on `main`
 - Approved Luv's default-OFF QMoE occupancy lever (#1167) with a non-blocking scope caveat.
 - Rejected Deckard's first V2-Lite mask classifier for two safety blockers and enforced reviewer lockout; re-approved Wallace's tightened revision after present-KV and root graph-output negative tests.
 - Approved Leon's `_d1` additive-mask query-axis workspace-planner fix (#1181) as exact and fail-closed; Wallace's hardware A/B then closed the DeepSeek MoE performance mandate at 1.79× capture/eager with 0.000% divergence.
+## 2026-08-18T04:15Z — Review gate approved Engine long-context workspace fix (#1189)
+
+- Approved PR #1189 after checking the capacity-growth gate, persistent-binding reprepare, and all reachable single-token Engine decode placements.
+- Verdict: 🟢 APPROVE; steady-state decode is not disturbed because the new reprepare path is a no-op unless `ensure_capacity` reports growth.
+- The reviewed evidence supports Leon's real V2-Lite A/B: eager/capture streams token-identical through the long-context bucket transition.
