@@ -94,6 +94,29 @@ use crate::runtime::{CudaRuntime, cuptr};
 const BLOCK: u32 = 256;
 /// Threads per block for `attention_row` (one block services one score row).
 const ROW_THREADS: u32 = 128;
+
+/// Threads-per-block for `attention_row`, with an env override for tuning.
+///
+/// `attention_row` launches one block per (batch, q_head, query) row. In the
+/// decode regime (q_seq == 1) the grid is only `batch * q_heads` blocks (16 for
+/// a 16-head model), so the kernel is badly under-occupied and memory-latency
+/// bound on the per-key K/V load chains. Giving each block more warps lets it
+/// hide that latency without changing any reduction order, so the result stays
+/// byte-identical. `ONNX_GENAI_ATTN_ROW_THREADS` overrides the count for tuning.
+fn attention_row_threads(is_decode: bool) -> u32 {
+    use std::sync::OnceLock;
+    static OVERRIDE: OnceLock<Option<u32>> = OnceLock::new();
+    let over = *OVERRIDE.get_or_init(|| {
+        std::env::var("ONNX_GENAI_ATTN_ROW_THREADS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&n| (32..=1024).contains(&n) && n % 32 == 0)
+    });
+    if let Some(n) = over {
+        return n;
+    }
+    if is_decode { 256 } else { ROW_THREADS }
+}
 const ATTENTION_MODULE: &str = "standard_attention_f32_f16_bf16_v3";
 const ATTENTION_SOURCE: &str = r#"
 #include <cuda_fp16.h>
@@ -2121,7 +2144,7 @@ impl StandardAttentionKernel {
                 unsafe {
                     builder.launch(LaunchConfig {
                         grid_dim: (total_rows.min(u32::MAX as u64).max(1) as u32, 1, 1),
-                        block_dim: (ROW_THREADS, 1, 1),
+                        block_dim: (attention_row_threads(q_seq == 1), 1, 1),
                         shared_mem_bytes: 0,
                     })
                 }
@@ -2217,6 +2240,27 @@ impl Kernel for StandardAttentionKernel {
                 "Attention capture signature is unavailable because its state lock was poisoned",
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod row_threads_tests {
+    //! Locks the decode-vs-prefill launch width for `attention_row`. The decode
+    //! path (`is_decode == true`, i.e. `q_seq == 1`) intentionally launches wider
+    //! blocks (256 threads) so each of the few per-head blocks has enough warps to
+    //! hide the per-key K/V load latency; prefill keeps the base `ROW_THREADS`
+    //! width. The change is byte-identical (more threads, same reduction order).
+    use super::{ROW_THREADS, attention_row_threads};
+
+    #[test]
+    fn decode_uses_wider_blocks_prefill_keeps_base() {
+        // No `ONNX_GENAI_ATTN_ROW_THREADS` override in the test environment, so
+        // the built-in defaults apply.
+        assert_eq!(attention_row_threads(false), ROW_THREADS);
+        assert_eq!(attention_row_threads(true), 256);
+        // Both widths must be positive multiples of a warp.
+        assert_eq!(attention_row_threads(true) % 32, 0);
+        assert_eq!(attention_row_threads(false) % 32, 0);
     }
 }
 
