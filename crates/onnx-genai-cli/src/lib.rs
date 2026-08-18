@@ -28,6 +28,8 @@
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::{Mutex, OnceLock};
 
 use clap::{ArgAction, Args, Parser, Subcommand};
 
@@ -789,12 +791,85 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         // Diagnostics go to stderr: stdout carries the command's actual output
         // (generated text, transcripts), which is routinely piped and parsed.
-        .with_writer(io::stderr)
+        .with_writer(DeferredStderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .try_init();
+}
+
+static DEFERRED_TRACING: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+
+struct DeferredStderr;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DeferredStderr {
+    type Writer = DeferredStderrWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        DeferredStderrWriter
+    }
+}
+
+struct DeferredStderrWriter;
+
+impl Write for DeferredStderrWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if interactive::GENERATING.load(Ordering::SeqCst) {
+            DEFERRED_TRACING
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .map_err(|_| io::Error::other("deferred tracing buffer is poisoned"))?
+                .extend_from_slice(bytes);
+            return Ok(bytes.len());
+        }
+        flush_deferred_tracing()?;
+        io::stderr().write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !interactive::GENERATING.load(Ordering::SeqCst) {
+            flush_deferred_tracing()?;
+            io::stderr().flush()?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn flush_deferred_tracing() -> io::Result<()> {
+    let Some(buffer) = DEFERRED_TRACING.get() else {
+        return Ok(());
+    };
+    let bytes = {
+        let mut buffer = buffer
+            .lock()
+            .map_err(|_| io::Error::other("deferred tracing buffer is poisoned"))?;
+        std::mem::take(&mut *buffer)
+    };
+    if !bytes.is_empty() {
+        let mut stderr = io::stderr().lock();
+        stderr.write_all(&bytes)?;
+        stderr.flush()?;
+    }
+    Ok(())
+}
+
+/// Clears the streaming flag and flushes any diagnostics buffered during a turn
+/// when it drops, so the buffer is drained on *every* exit from
+/// [`run_generation_turn`](crate::output::run_generation_turn) — a normal
+/// return, a `?` early-return while finalizing the reply, or a panic unwind —
+/// not just the happy path.
+///
+/// The forced `process::exit` taken on a double Ctrl-C cannot run this: it
+/// terminates the process from the signal-handler thread without unwinding the
+/// generating thread's stack, so that path flushes explicitly before exiting.
+pub(crate) struct FlushGuard;
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        interactive::GENERATING.store(false, Ordering::SeqCst);
+        let _ = flush_deferred_tracing();
+    }
 }
 
 /// Parse `args` (an argv vector whose first element is the program name) and run
@@ -831,6 +906,47 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn flush_guard_drains_buffered_diagnostics_when_a_turn_exits_early() {
+        // Simulate a turn in progress: the streaming flag is set and diagnostics
+        // have been buffered by the deferred tracing writer instead of reaching
+        // stderr live.
+        interactive::GENERATING.store(true, Ordering::SeqCst);
+        DEFERRED_TRACING
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .extend_from_slice(b"buffered diagnostic\n");
+
+        // Reproduce a `?` early-return out of the finalization sequence while a
+        // `FlushGuard` is live on the stack, exactly as a broken-pipe write error
+        // from `emit_reasoning_segment` / `live.draw` / `live.finish` would.
+        fn finalize_then_fail() -> io::Result<()> {
+            let _flush_guard = FlushGuard;
+            Err(io::Error::other("stdout write failed during finalization"))?;
+            Ok(())
+        }
+        assert!(finalize_then_fail().is_err());
+
+        // The guard must have drained the buffer (flushed it to the sink) and
+        // cleared the streaming flag despite the early return, so diagnostics are
+        // never silently lost.
+        let buffered = DEFERRED_TRACING
+            .get()
+            .expect("buffer was initialized")
+            .lock()
+            .unwrap()
+            .len();
+        assert_eq!(
+            buffered, 0,
+            "FlushGuard left diagnostics buffered after an early return"
+        );
+        assert!(
+            !interactive::GENERATING.load(Ordering::SeqCst),
+            "FlushGuard left the streaming flag set after an early return"
+        );
+    }
 
     #[test]
     fn generate_accepts_positional_model_and_prompt_flag() {

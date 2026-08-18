@@ -325,7 +325,15 @@ pub(super) fn install_ctrlc_handler() {
                     EXIT_ARMED.store(true, Ordering::SeqCst);
                     eprintln!("\n^C  (press Ctrl-C again to exit)");
                 }
-                InterruptAction::Exit => std::process::exit(EXIT_INTERRUPTED),
+                InterruptAction::Exit => {
+                    // This runs on the signal-handler thread and terminates the
+                    // process without unwinding the generating thread, so the
+                    // `FlushGuard` on that stack never drops. Flush the buffered
+                    // diagnostics here so a double Ctrl-C during a turn does not
+                    // silently discard the whole turn's logs.
+                    let _ = crate::flush_deferred_tracing();
+                    std::process::exit(EXIT_INTERRUPTED)
+                }
             }
         });
         if let Err(error) = result {
