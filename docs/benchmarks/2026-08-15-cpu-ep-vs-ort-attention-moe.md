@@ -3267,3 +3267,127 @@ native/ORT ratio for `rope_gptj_il_s128` and `tr_llama3_s512` is still 3–7×, 
 changed the arithmetic or the grain policy; it changed which CPUs the arithmetic
 runs on. The remaining losses are the ones §31.9 named, and they are still
 `matmul_nbits.rs`'s 64 raw Rayon call sites.
+## 34. Phase 14: the prefill fan-out was on the wrong pool (#1238)
+
+`gemm_nbits_*_t8` at t=32 was the worst cell in this document at the end of
+§33 — 22–34× ORT. It is now 2.6–2.8×. Nothing about the arithmetic changed.
+
+### 34.1 A loss that gets worse with every thread you add
+
+The int4 GEMM cells with a small token count degraded monotonically with width,
+which no arithmetic explanation covers:
+
+| cell (native/ORT) | t=1 | t=2 | t=4 | t=8 | t=16 | t=32 |
+| ---- | --- | --- | --- | --- | --- | --- |
+| `gemm_nbits_qwen3_0p6b_qkv_t8` | 1.00 | 1.54 | 3.33 | 3.24 | 4.72 | 24.6 |
+| `gemm_nbits_qwen3_0p6b_mlp_t8` | 1.00 | 1.53 | 2.30 | 2.93 | 4.36 | 18.6 |
+| `gemm_nbits_llama3_8b_qkv_t8`  | 0.96 | 1.49 | 2.32 | 2.50 | 3.60 | 8.00 |
+
+Parity at one thread and 24× at thirty-two is the signature of a scheduler, not
+a kernel.
+
+### 34.2 It only happens when someone else is in the process
+
+Run the same cell with `--native-only`, so no ORT session is ever created, and
+the pathology disappears:
+
+| `gemm_nbits_qwen3_0p6b_qkv_t8`, t=32 | native p50 | native min | user CPU |
+| ---- | ---- | ---- | ---- |
+| native-only  | 0.448 ms | 0.174 ms |  4.87 s |
+| ORT co-resident | 4.104 ms | 0.998 ms | 15.65 s |
+
+The kernel is *fine*. What is not fine is what it does to get threads. The
+`m > 1` MLAS shard tiling in `run_mlas_shards` issued one `tiles.par_iter()`
+fan-out on **global Rayon**, sized by `rayon::current_num_threads()`. Global
+Rayon's workers park, and this document already measured what that costs: 67 µs
+to wake back-to-back, 226 µs after a 20 µs gap (§33.4). Put a live ORT intra-op
+pool — which spins — on the same cores and every one of those wake-ups lands
+behind a spinning thread. A 32-way fan-out over 0.5 ms of arithmetic pays it 32
+times.
+
+### 34.3 The fix, and the one place it is not the fix
+
+Route the tiling through the CPU task runtime built in §33: resident workers,
+adaptive spin/park, dispatch to a resident worker measured at p50 4.8 µs, and a
+width that comes from the topology rather than from whatever global Rayon was
+built with.
+
+That is right everywhere except one case, and the exception is instructive. The
+task runtime's pool is capped to the *physical* cores the process may use
+(§33.3), because spinning workers on SMT siblings measurably hurt the short
+latency-bound strip kernels the pool mostly serves. A prefill tile is the
+opposite workload: a multi-millisecond MLAS call whose dequantise step has
+enough load latency that SMT siblings pay for themselves. Measured on
+`gemm_nbits_llama3_8b_mlp_t512` at t=32, native-only:
+
+| executor | width | native p50 | user CPU |
+| ---- | ---- | ---- | ---- |
+| global Rayon | 32 | 54.1 ms | 28.0 s |
+| task runtime | 16 (SMT-capped) | 66.8 ms | 19.6 s |
+| task runtime | 32 (`ONNX_GENAI_CPU_TASK_THREADS=32`) | 54.8 ms | 27.4 s |
+
+The gap is the cap, not the executor — forced to the same width the runtime
+matches Rayon to within noise. So the split is on *work size*, in
+`prefill_fan_out`: below 512 Mi MACs the task runtime's cheap dispatch wins;
+above it, the fan-out is long enough that a 226 µs wake-up is 0.25% of the run
+and the extra hardware threads are worth more. 512 Mi classifies every measured
+cell correctly, and the wide path is not taken at all when Rayon is not actually
+wider than the pool.
+
+`prefill_tile_grain` adds the matching grain floor: the tiling cannot merge
+output-column shards (each owns its own packed weight), so the only lever for a
+too-fine partition is handing several whole tiles to one task, which it does
+below 512 Ki MACs a tile.
+
+### 34.4 The matrix
+
+All 20 `gemm_nbits_*` cells × 6 widths, 3 trials × 10 runs, native/ORT paired in
+a single process, arms interleaved. Speedup is Rayon ÷ task runtime, so >1 is
+this change winning.
+
+| | t=1 | t=2 | t=4 | t=8 | t=16 | t=32 |
+| ---- | --- | --- | --- | --- | --- | --- |
+| geomean, m>1 cells | 1.00× | 1.00× | 0.99× | 1.11× | 1.25× | **1.71×** |
+| cells improved >5% | 0/12 | 1/12 | 3/12 | 4/12 | 9/12 | 4/12 |
+
+The `m = 1` cells are the control: this change cannot reach them (the path is
+gated on `m > 1`), and they came back 0.68×–1.53× with a median of 0.99×. That
+spread *is* the noise floor of a 3-trial grid on this host, and it is why the
+narrow-width cells below are re-measured rather than reported.
+
+Largest movements at t=32:
+
+| cell | Rayon | task runtime | speedup | vs ORT, before → after |
+| ---- | ---- | ---- | ---- | ---- |
+| `gemm_nbits_qwen3_0p6b_qkv_t8`   | 4.041 ms | 0.299 ms | 13.5× | 34.1× → 2.85× |
+| `gemm_nbits_qwen3_0p6b_mlp_t8`   | 4.440 ms | 0.663 ms |  6.7× | 21.8× → 2.60× |
+| `gemm_nbits_llama3_8b_qkv_t8`    | 5.980 ms | 1.908 ms |  3.1× |  8.5× → 2.77× |
+| `gemm_nbits_qwen3_0p6b_qkv_t128` | 6.282 ms | 2.100 ms |  3.0× |  4.4× → 1.27× |
+
+### 34.5 The apparent narrow-width losses are dispersion
+
+Five cells came back below 0.95× in the 3-trial grid. Three of them
+(`qwen3_0p6b_qkv_t512` t=32, `qwen3_0p6b_mlp_t128` t=32, `llama3_8b_qkv_t128`
+t=32) are above the 512 Mi threshold at a width where Rayon is wider, so **both
+arms run byte-identical code** — they are noise by construction. The other two
+were re-measured at 7 trials × 25 runs with 8 warm-ups:
+
+| cell | t | 3×10 grid | 7×25 re-measurement |
+| ---- | - | ---- | ---- |
+| `gemm_nbits_qwen3_0p6b_qkv_t512` | 4 | 12.67 → 16.72 ms | 15.99 → 15.87 ms (tie) |
+| `gemm_nbits_qwen3_0p6b_qkv_t512` | 8 |  7.02 →  9.09 ms |  6.90 →  6.83 ms (tie) |
+| `gemm_nbits_qwen3_0p6b_qkv_t128` | 4 |  3.39 →  3.55 ms |  3.39 →  3.43 ms (tie) |
+| `gemm_nbits_qwen3_0p6b_qkv_t8`   | 4 |  0.54 →  0.59 ms |  0.52 →  0.46 ms (1.13×) |
+| `gemm_nbits_qwen3_0p6b_qkv_t8`   | 8 |  0.56 →  0.55 ms |  0.55 →  0.39 ms (1.41×) |
+
+No reproducible regression survives the larger sample.
+
+### 34.6 What is still true after this phase
+
+`gemm_nbits_*_t8` at t=32 is no longer the worst cell in the document; the small
+transform kernels are, at 3–7× ORT at t=16, and they are a grain and
+arithmetic problem rather than a scheduling one. `matmul_nbits.rs` still holds
+raw Rayon call sites, but the remaining ones are the one-time prepack/dequant
+passes and the decode paths that already route to the persistent SPMD pool when
+a decode scope is active — neither is on the per-token critical path this phase
+was chasing.
