@@ -247,7 +247,7 @@ template <typename Input>
 __device__ __forceinline__ float qmoe_load(
     const Input* input, unsigned long long index);
 
-template <typename Input, int BlockSize, bool HasZeroPoints>
+template <typename Input, int BlockSize, bool HasZeroPoints, bool ReadOnly = false>
 __device__ __forceinline__ float qmoe_int4_chunk(
     const Input* input,
     const unsigned char* packed,
@@ -262,17 +262,25 @@ __device__ __forceinline__ float qmoe_int4_chunk(
 {
     // Int4 rows are multiples of eight packed bytes because block sizes are
     // powers of two >= 16, and chunk depths advance by eight values.
-    const unsigned int packed_values =
-        *reinterpret_cast<const unsigned int*>(
-            packed + expert_row * packed_in + depth / 2);
+    // When `ReadOnly`, the packed weights, scales, and zero points are routed
+    // through the read-only data cache (`__ldg`): bit-for-bit identical to a
+    // plain load -- same bytes, same decode -- but it cuts the int4 weight-load
+    // latency the fused gate/up GEMV is Long-Scoreboard bound on. Only the
+    // fused gate/up path opts in; the fc2 `qmoe_linear` path measured a
+    // regression under `__ldg`, so it keeps the default cached load.
+    const unsigned int* packed_ptr =
+        reinterpret_cast<const unsigned int*>(packed + expert_row * packed_in + depth / 2);
+    const unsigned int packed_values = ReadOnly ? __ldg(packed_ptr) : *packed_ptr;
     const int block = depth / BlockSize;
     int zero_point = 8;
     if (HasZeroPoints) {
-        const unsigned char packed_zero =
-            zero_points[expert_row * zero_point_bytes + block / 2];
+        const unsigned char* zero_ptr =
+            &zero_points[expert_row * zero_point_bytes + block / 2];
+        const unsigned char packed_zero = ReadOnly ? __ldg(zero_ptr) : *zero_ptr;
         zero_point = (packed_zero >> ((block & 1) * 4)) & 15;
     }
-    const float scale = scales[expert_row * blocks + block];
+    const float* scale_ptr = &scales[expert_row * blocks + block];
+    const float scale = ReadOnly ? __ldg(scale_ptr) : *scale_ptr;
     float value = 0.0f;
 #pragma unroll
     for (int offset = 0; offset < 8; ++offset) {
@@ -596,11 +604,11 @@ __device__ void qmoe_gate_up_activate_impl(
         for (int chunk = (int)threadIdx.x;
              chunk < chunks;
              chunk += (int)blockDim.x) {
-            gate += qmoe_int4_chunk<Input, BlockSize, HasZeroPoints>(
+            gate += qmoe_int4_chunk<Input, BlockSize, HasZeroPoints, true>(
                 input, fc1_packed, fc1_scales, fc1_zero_points, input_base,
                 gate_expert_row, chunk * 8, fc1_packed_in, fc1_blocks,
                 fc1_zero_point_bytes);
-            linear += qmoe_int4_chunk<Input, BlockSize, HasZeroPoints>(
+            linear += qmoe_int4_chunk<Input, BlockSize, HasZeroPoints, true>(
                 input, fc3_present ? fc3_packed : fc1_packed,
                 fc3_present ? fc3_scales : fc1_scales,
                 fc3_present ? fc3_zero_points : fc1_zero_points, input_base,
@@ -934,12 +942,14 @@ struct QuantLayout {
 /// resident warps hide the int4 weight-load latency. Byte-identical to the
 /// default entry: `__launch_bounds__` only constrains register allocation, so
 /// the accumulate order, both `block_sum` reductions, and the SwiGLU are
-/// unchanged. Opt-in, DEFAULT-OFF; `ONNX_GENAI_QMOE_OCC=1` (or `true`/`on`)
-/// engages the `_occ` path.
+/// unchanged. Now DEFAULT-ON after the H200 E2E A/B confirmed a consistent
+/// V2-Lite decode gain (124.6 -> 126.6 tok/s) with the golden decode lock
+/// unchanged; set `ONNX_GENAI_QMOE_OCC=0` (or `false`/`off`) to force the
+/// unbounded entry for A/B or regression bisection.
 fn qmoe_gate_up_occ_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("ONNX_GENAI_QMOE_OCC").ok().as_deref(),
-        Some("1") | Some("true") | Some("on")
+        Some("0") | Some("false") | Some("off")
     )
 }
 
