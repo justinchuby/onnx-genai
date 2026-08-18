@@ -4763,3 +4763,158 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod claim_probes {
+    use std::ffi::c_void;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    use half::{bf16, f16};
+    use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
+    use onnx_runtime_ir::{DataType, DeviceId};
+
+    use super::SkipLayerNormKernel;
+    use crate::runtime::CudaRuntime;
+
+    fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rt = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
+            .ok()
+            .flatten();
+        std::panic::set_hook(previous);
+        rt
+    }
+
+    fn reference(input: &[f32], skip: &[f32], gamma: &[f32], eps: f32) -> Vec<f32> {
+        let n = input.len();
+        let s: Vec<f32> = (0..n).map(|i| input[i] + skip[i]).collect();
+        let mean = s.iter().sum::<f32>() / n as f32;
+        let var = s.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
+        let inv = 1.0 / (var + eps).sqrt();
+        (0..n).map(|i| (s[i] - mean) * inv * gamma[i]).collect()
+    }
+
+    #[test]
+    fn typed_skip_layernorm_f16_bf16_match_reference_on_gpu() {
+        let Some(runtime) = maybe_runtime() else {
+            eprintln!("skipping typed SkipLayerNorm GPU probe: CUDA runtime unavailable");
+            return;
+        };
+        if runtime.require_nvrtc_half_headers("SkipLayerNormalization").is_err() {
+            eprintln!("skipping typed SkipLayerNorm GPU probe: fp16 headers unavailable");
+            return;
+        }
+        let input = [1.0f32, 2.0, 3.0, 4.0];
+        let skip = [0.5f32, 0.5, 0.5, 0.5];
+        let gamma = [1.0f32, 0.5, 2.0, 1.5];
+        let eps = 1e-5f32;
+        let expect = reference(&input, &skip, &gamma, eps);
+
+        // f16 arm
+        run_half::<f16>(
+            &runtime,
+            DataType::Float16,
+            f16::from_f32,
+            f16::to_f32,
+            &input,
+            &skip,
+            &gamma,
+            eps,
+            &expect,
+            3.0e-2,
+        );
+        // bf16 arm
+        run_half::<bf16>(
+            &runtime,
+            DataType::BFloat16,
+            bf16::from_f32,
+            bf16::to_f32,
+            &input,
+            &skip,
+            &gamma,
+            eps,
+            &expect,
+            1.5e-1,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_half<T: Copy>(
+        runtime: &Arc<CudaRuntime>,
+        dtype: DataType,
+        to_h: impl Fn(f32) -> T,
+        from_h: impl Fn(T) -> f32,
+        input: &[f32],
+        skip: &[f32],
+        gamma: &[f32],
+        eps: f32,
+        expect: &[f32],
+        tol: f32,
+    ) {
+        let n = input.len();
+        let hin: Vec<T> = input.iter().map(|&v| to_h(v)).collect();
+        let hskip: Vec<T> = skip.iter().map(|&v| to_h(v)).collect();
+        let hgamma: Vec<T> = gamma.iter().map(|&v| to_h(v)).collect();
+        let elem = std::mem::size_of::<T>();
+        let bytes = elem * n;
+        let in_dev = runtime.alloc_raw(bytes).unwrap();
+        let skip_dev = runtime.alloc_raw(bytes).unwrap();
+        let gamma_dev = runtime.alloc_raw(bytes).unwrap();
+        let out_dev = runtime.alloc_raw(bytes).unwrap();
+        let as_bytes = |v: &[T]| unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+        unsafe {
+            runtime.htod(as_bytes(&hin), in_dev).unwrap();
+            runtime.htod(as_bytes(&hskip), skip_dev).unwrap();
+            runtime.htod(as_bytes(&hgamma), gamma_dev).unwrap();
+        }
+        let device = DeviceId::cuda(0);
+        let shape = [1usize, n];
+        let strides = [n as i64, 1];
+        let mk = |ptr: u64| {
+            TensorView::new(
+                DevicePtr(ptr as usize as *const c_void),
+                dtype,
+                &shape,
+                &strides,
+                device,
+            )
+        };
+        let inputs = [mk(in_dev), mk(skip_dev), mk(gamma_dev)];
+        let mut outputs = [TensorMut::new(
+            DevicePtrMut(out_dev as usize as *mut c_void),
+            dtype,
+            &shape,
+            &strides,
+            device,
+        )];
+        let kernel = SkipLayerNormKernel {
+            epsilon: eps,
+            runtime: runtime.clone(),
+            last_call_capture_safe: AtomicBool::new(false),
+        };
+        kernel.run(&inputs, &mut outputs).unwrap();
+        runtime.synchronize().unwrap();
+        let mut out = vec![to_h(0.0); n];
+        let out_bytes = unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes)
+        };
+        unsafe { runtime.dtoh(out_bytes, out_dev).unwrap() };
+        unsafe {
+            runtime.free_raw(in_dev).unwrap();
+            runtime.free_raw(skip_dev).unwrap();
+            runtime.free_raw(gamma_dev).unwrap();
+            runtime.free_raw(out_dev).unwrap();
+        }
+        for (i, (&o, &e)) in out.iter().zip(expect).enumerate() {
+            let got = from_h(o);
+            assert!(
+                (got - e).abs() <= tol,
+                "{dtype:?} SkipLayerNorm index {i}: expected {e}, got {got}"
+            );
+        }
+    }
+}

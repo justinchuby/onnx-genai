@@ -1431,3 +1431,139 @@ mod tests {
         assert_eq!(output.strides(), &[3, 3, 1, 1]);
     }
 }
+
+#[cfg(test)]
+mod claim_probes {
+    use std::ffi::c_void;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, Kernel, TensorMut, TensorView};
+    use onnx_runtime_ir::{DataType, DeviceId};
+
+    use super::{CudnnReduceCache, ReduceKernel, ReduceOp, ReductionMetadataCache};
+    use crate::runtime::CudaRuntime;
+
+    fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rt = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
+            .ok()
+            .flatten();
+        std::panic::set_hook(previous);
+        rt
+    }
+
+    fn kernel(runtime: &Arc<CudaRuntime>, op: ReduceOp) -> ReduceKernel {
+        ReduceKernel {
+            op,
+            axes_attr: Some(vec![1]),
+            keepdims: false,
+            noop_with_empty_axes: false,
+            runtime: runtime.clone(),
+            reduce_metadata: Mutex::new(ReductionMetadataCache::new(runtime.clone())),
+            cudnn_reduce: Mutex::new(CudnnReduceCache::new(runtime.stream().clone())),
+            warmed_axes: Mutex::new(None),
+            last_call_capture_safe: AtomicBool::new(false),
+        }
+    }
+
+    fn run_i32(runtime: &Arc<CudaRuntime>, op: ReduceOp, data: &[i32]) -> Vec<i32> {
+        let bytes = std::mem::size_of_val(data);
+        let in_dev = runtime.alloc_raw(bytes).unwrap();
+        let out_dev = runtime.alloc_raw(std::mem::size_of::<i32>() * 2).unwrap();
+        let as_bytes = |v: &[i32]| unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+        unsafe { runtime.htod(as_bytes(data), in_dev).unwrap() };
+        let device = DeviceId::cuda(0);
+        let in_shape = [2usize, 3];
+        let in_strides = [3i64, 1];
+        let inputs = [TensorView::new(
+            DevicePtr(in_dev as usize as *const c_void),
+            DataType::Int32,
+            &in_shape,
+            &in_strides,
+            device,
+        )];
+        let out_shape = [2usize];
+        let out_strides = [1i64];
+        let mut outputs = [TensorMut::new(
+            DevicePtrMut(out_dev as usize as *mut c_void),
+            DataType::Int32,
+            &out_shape,
+            &out_strides,
+            device,
+        )];
+        kernel(runtime, op).execute(&inputs, &mut outputs).unwrap();
+        runtime.synchronize().unwrap();
+        let mut out = vec![0i32; 2];
+        let out_bytes = unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), std::mem::size_of::<i32>() * 2)
+        };
+        unsafe { runtime.dtoh(out_bytes, out_dev).unwrap() };
+        unsafe {
+            runtime.free_raw(in_dev).unwrap();
+            runtime.free_raw(out_dev).unwrap();
+        }
+        out
+    }
+
+    fn run_i64(runtime: &Arc<CudaRuntime>, op: ReduceOp, data: &[i64]) -> Vec<i64> {
+        let bytes = std::mem::size_of_val(data);
+        let in_dev = runtime.alloc_raw(bytes).unwrap();
+        let out_dev = runtime.alloc_raw(std::mem::size_of::<i64>() * 2).unwrap();
+        let as_bytes = |v: &[i64]| unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+        unsafe { runtime.htod(as_bytes(data), in_dev).unwrap() };
+        let device = DeviceId::cuda(0);
+        let in_shape = [2usize, 3];
+        let in_strides = [3i64, 1];
+        let inputs = [TensorView::new(
+            DevicePtr(in_dev as usize as *const c_void),
+            DataType::Int64,
+            &in_shape,
+            &in_strides,
+            device,
+        )];
+        let out_shape = [2usize];
+        let out_strides = [1i64];
+        let mut outputs = [TensorMut::new(
+            DevicePtrMut(out_dev as usize as *mut c_void),
+            DataType::Int64,
+            &out_shape,
+            &out_strides,
+            device,
+        )];
+        kernel(runtime, op).execute(&inputs, &mut outputs).unwrap();
+        runtime.synchronize().unwrap();
+        let mut out = vec![0i64; 2];
+        let out_bytes = unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), std::mem::size_of::<i64>() * 2)
+        };
+        unsafe { runtime.dtoh(out_bytes, out_dev).unwrap() };
+        unsafe {
+            runtime.free_raw(in_dev).unwrap();
+            runtime.free_raw(out_dev).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn i32_i64_reduce_sum_max_min_over_last_axis_on_gpu() {
+        let Some(runtime) = maybe_runtime() else {
+            eprintln!("skipping i32/i64 reduce GPU probe: CUDA runtime unavailable");
+            return;
+        };
+        let data32 = [1i32, 5, 3, 9, 2, 4];
+        assert_eq!(run_i32(&runtime, ReduceOp::Sum, &data32), vec![9, 15], "i32 ReduceSum");
+        assert_eq!(run_i32(&runtime, ReduceOp::Max, &data32), vec![5, 9], "i32 ReduceMax");
+        assert_eq!(run_i32(&runtime, ReduceOp::Min, &data32), vec![1, 2], "i32 ReduceMin");
+
+        let data64 = [-1i64, 50, 3, 90, -2, 4];
+        assert_eq!(run_i64(&runtime, ReduceOp::Sum, &data64), vec![52, 92], "i64 ReduceSum");
+        assert_eq!(run_i64(&runtime, ReduceOp::Max, &data64), vec![50, 90], "i64 ReduceMax");
+        assert_eq!(run_i64(&runtime, ReduceOp::Min, &data64), vec![-1, -2], "i64 ReduceMin");
+    }
+}

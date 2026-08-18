@@ -1642,3 +1642,119 @@ mod tests {
         assert_eq!(standalone, fused);
     }
 }
+
+#[cfg(test)]
+mod claim_probes {
+    use std::ffi::c_void;
+    use std::sync::{Arc, Mutex};
+
+    use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, Kernel, TensorMut, TensorView};
+    use onnx_runtime_ir::{DataType, DeviceId};
+
+    use super::{BinaryKernel, BinaryOp, BroadcastMetadataCache};
+    use crate::CudaRuntime;
+
+    fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rt = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
+            .ok()
+            .flatten();
+        std::panic::set_hook(previous);
+        rt
+    }
+
+    fn run_i32_binary(runtime: &Arc<CudaRuntime>, op: BinaryOp, a: &[i32], b: &[i32]) -> Vec<i32> {
+        let bytes = std::mem::size_of_val(a);
+        let a_dev = runtime.alloc_raw(bytes).unwrap();
+        let b_dev = runtime.alloc_raw(bytes).unwrap();
+        let out_dev = runtime.alloc_raw(bytes).unwrap();
+        let as_bytes = |v: &[i32]| unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+        unsafe {
+            runtime.htod(as_bytes(a), a_dev).unwrap();
+            runtime.htod(as_bytes(b), b_dev).unwrap();
+        }
+        let shape = [1usize, a.len()];
+        let strides = [a.len() as i64, 1];
+        let device = DeviceId::cuda(0);
+        let inputs = [
+            TensorView::new(
+                DevicePtr(a_dev as usize as *const c_void),
+                DataType::Int32,
+                &shape,
+                &strides,
+                device,
+            ),
+            TensorView::new(
+                DevicePtr(b_dev as usize as *const c_void),
+                DataType::Int32,
+                &shape,
+                &strides,
+                device,
+            ),
+        ];
+        let mut outputs = [TensorMut::new(
+            DevicePtrMut(out_dev as usize as *mut c_void),
+            DataType::Int32,
+            &shape,
+            &strides,
+            device,
+        )];
+        let kernel = BinaryKernel {
+            op,
+            runtime: runtime.clone(),
+            metadata: Mutex::new(BroadcastMetadataCache::new(runtime.clone())),
+            last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
+        };
+        kernel.execute(&inputs, &mut outputs).unwrap();
+        runtime.synchronize().unwrap();
+        let mut out = vec![0i32; a.len()];
+        let out_bytes = unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes)
+        };
+        unsafe { runtime.dtoh(out_bytes, out_dev).unwrap() };
+        unsafe {
+            runtime.free_raw(a_dev).unwrap();
+            runtime.free_raw(b_dev).unwrap();
+            runtime.free_raw(out_dev).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn i32_binary_add_sub_mul_div_min_max_match_reference_on_gpu() {
+        let Some(runtime) = maybe_runtime() else {
+            eprintln!("skipping i32 binary GPU probe: CUDA runtime unavailable");
+            return;
+        };
+        let a = [7i32, -20, 9, 100, -5, 8];
+        let b = [2i32, 6, -3, 7, -2, 8];
+        for op in [
+            BinaryOp::Add,
+            BinaryOp::Sub,
+            BinaryOp::Mul,
+            BinaryOp::Div,
+            BinaryOp::Min,
+            BinaryOp::Max,
+        ] {
+            let expected: Vec<i32> = a
+                .iter()
+                .zip(&b)
+                .map(|(&x, &y)| match op {
+                    BinaryOp::Add => x + y,
+                    BinaryOp::Sub => x - y,
+                    BinaryOp::Mul => x * y,
+                    BinaryOp::Div => x / y,
+                    BinaryOp::Min => x.min(y),
+                    BinaryOp::Max => x.max(y),
+                    _ => unreachable!(),
+                })
+                .collect();
+            let actual = run_i32_binary(&runtime, op, &a, &b);
+            assert_eq!(actual, expected, "i32 {op:?} diverged on GPU");
+        }
+    }
+}
