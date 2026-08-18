@@ -148,6 +148,77 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _decode_thread_count(model_dir: Path) -> dict[str, Any]:
+    """The thread settings that govern this run's decode, as far as they can be
+    observed without constructing a session.
+
+    ORT GenAI reads its session options from `genai_config.json`; a value of `0`
+    or an absent key means ORT picks the default (physical cores), so the raw
+    config value plus `logical_cpus` in :func:`_host_metadata` is what a later
+    reader needs to interpret a throughput number.
+    """
+    intra_op: Any = None
+    inter_op: Any = None
+    try:
+        cfg = json.loads((model_dir / "genai_config.json").read_text())
+        session_options = cfg.get("model", {}).get("decoder", {}).get("session_options", {})
+        intra_op = session_options.get("intra_op_num_threads")
+        inter_op = session_options.get("inter_op_num_threads")
+    except (OSError, ValueError, AttributeError):
+        # A missing or malformed config must not sink the whole run; the fields
+        # simply record `null` so the omission is visible rather than assumed.
+        pass
+    return {
+        "intra_op_num_threads": intra_op,
+        "inter_op_num_threads": inter_op,
+        "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+    }
+
+
+def _gpu_names() -> Any:
+    """Best-effort GPU model names via `nvidia-smi`. `None` when it cannot be
+    determined, so the field is present but honestly empty rather than absent."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return names or None
+
+
+def _host_metadata(model_dir: Path) -> dict[str, Any]:
+    """Hardware and thread-count provenance for a recorded measurement.
+
+    House rule (`docs/benchmarks/...` §32.2): every recorded perf number must
+    carry hardware, thread count and a reference baseline, or it is not
+    interpretable later. The baseline lives in `release_gates`
+    (`min_throughput_ratio` / `exact_token_parity`); this supplies the other two
+    so a bare throughput number can never be quoted without the machine and
+    thread configuration it came from.
+    """
+    import platform
+
+    return {
+        "system": platform.system(),
+        "release": platform.release(),
+        "machine": platform.machine(),
+        "processor": platform.processor() or platform.machine(),
+        "python": platform.python_version(),
+        "logical_cpus": os.cpu_count(),
+        "gpu": _gpu_names(),
+        "threads": _decode_thread_count(model_dir),
+    }
+
+
 def _prompt(tokenizer: Any, text: str, *, include_image: bool) -> str:
     content: Any = [{"type": "image"}, {"type": "text", "text": text}]
     if not include_image:
@@ -452,7 +523,28 @@ def _self_test(*, require_numpy: bool = False) -> int:
         print("FAIL: main must not tokenize the canonical prompt outside encode_and_verify_prompt")
         failures += 1
 
-    checks = len(cases) + len(length_cases) + len(site_cases) + 9
+    # Every recorded measurement must carry hardware and thread provenance
+    # (docs/benchmarks house rule §32.2): a bare throughput number with no
+    # machine or thread configuration attached is not interpretable later. Pin
+    # that the record's host block is populated even when the model directory
+    # has no `genai_config.json` session options to read.
+    host = _host_metadata(Path("does-not-exist"))
+    for key in ("system", "release", "machine", "processor", "python", "logical_cpus", "gpu"):
+        if key not in host:
+            print(f"FAIL host metadata missing key: {key}")
+            failures += 1
+    for key in ("intra_op_num_threads", "inter_op_num_threads", "omp_num_threads"):
+        if key not in host.get("threads", {}):
+            print(f"FAIL host thread metadata missing key: {key}")
+            failures += 1
+    if not host.get("system"):
+        print("FAIL host metadata: system must be a non-empty string")
+        failures += 1
+    if "host" not in main_source:
+        print("FAIL: main must record host provenance in the result")
+        failures += 1
+
+    checks = len(cases) + len(length_cases) + len(site_cases) + 9 + 12
     if failures:
         print(f"{failures} self-test case(s) failed")
         return 1
@@ -619,6 +711,7 @@ def main() -> int:
             "onnxruntime_genai": getattr(og, "__version__", "unknown"),
             "providers": providers,
         },
+        "host": _host_metadata(args.model),
         "package": {
             # Optional: a generic GenAI package has no workflow metadata.
             "metadata_sha256": (
