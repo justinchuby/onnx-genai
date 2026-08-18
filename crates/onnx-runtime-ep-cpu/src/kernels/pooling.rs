@@ -308,13 +308,16 @@ impl Kernel for PoolKernel {
                 "MaxPool: Indices must be an Int64 tensor with the output shape".into(),
             ));
         }
-        #[cfg(feature = "mlas")]
-        if try_mlas_pool(self, inputs, outputs, &expected, &pads)? {
-            return Ok(());
-        }
+        // Apple first, for the reason spelled out in `AddKernel::execute`:
+        // `auto_detect` picks `Accelerate` over `Mlas` on macOS/iOS, so BNNS
+        // has to keep precedence there once MLAS is linked by default.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         if try_bnns_pool(self, inputs, outputs, &expected, &pads)? {
             POOL_BNNS_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+        #[cfg(feature = "mlas")]
+        if try_mlas_pool(self, inputs, outputs, &expected, &pads)? {
             return Ok(());
         }
         POOL_SCALAR_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

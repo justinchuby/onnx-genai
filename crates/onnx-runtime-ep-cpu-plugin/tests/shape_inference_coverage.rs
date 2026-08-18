@@ -119,6 +119,23 @@ const DECLINED: &[(&str, &str)] = &[
     ("com.microsoft", "QMoE"),
 ];
 
+/// The NCHWc blocked-layout family, registered only when the `mlas` feature is
+/// on (`kernels/mod.rs`'s `register_cnn_ops`, inner `#[cfg(feature = "mlas")]`)
+/// because the blocked kernels *are* MLAS. They belong to group 2 above: our
+/// own `NchwcLayoutPropagation` pass rewrites `Conv`/pooling into them after
+/// `GetCapability` has already run, so they are never candidates at capability
+/// time and declining them costs nothing. Kept in a separate list so the
+/// allowlist stays asserted *exactly* in both feature configurations.
+#[cfg(feature = "mlas")]
+const DECLINED_MLAS_ONLY: &[(&str, &str)] = &[
+    ("pkg.nxrt", "NchwcAveragePool"),
+    ("pkg.nxrt", "NchwcConv"),
+    ("pkg.nxrt", "NchwcGlobalAveragePool"),
+    ("pkg.nxrt", "NchwcMaxPool"),
+    ("pkg.nxrt", "NchwcReorderToBlocked"),
+    ("pkg.nxrt", "NchwcReorderToNchw"),
+];
+
 /// Ops registered only so a test can exercise the registry machinery. They are
 /// not real ONNX ops and must never be expected in the shape table.
 const TEST_ONLY: &[&str] = &["TotallyFakeOp"];
@@ -223,6 +240,12 @@ fn every_registered_op_has_a_shape_rule_or_is_a_known_gap() {
         .iter()
         .map(|(d, o)| ((*d).to_string(), (*o).to_string()))
         .collect();
+    #[cfg(feature = "mlas")]
+    expected.extend(
+        DECLINED_MLAS_ONLY
+            .iter()
+            .map(|(d, o)| ((*d).to_string(), (*o).to_string())),
+    );
     expected.sort();
 
     let newly_declined: Vec<_> = actual.iter().filter(|e| !expected.contains(e)).collect();

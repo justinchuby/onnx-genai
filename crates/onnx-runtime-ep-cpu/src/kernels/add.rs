@@ -104,13 +104,18 @@ impl Kernel for AddKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Add", inputs, outputs, 2, 2, 1)?;
         crate::trace::record_kernel_metrics(inputs, outputs, || outputs[0].numel() as u64);
-        #[cfg(feature = "mlas")]
-        if add_contiguous_f32(inputs, &mut outputs[0])? {
-            return Ok(());
-        }
+        // Apple keeps its own vector library ahead of MLAS: `auto_detect`
+        // returns `CpuBackend::Accelerate` there, deliberately not `Mlas`, and
+        // the elementwise routing has to say the same thing or linking MLAS
+        // would silently retire the vDSP path. On every other target the block
+        // below does not exist and MLAS is first, unchanged.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         if add_vdsp_f32(inputs, &mut outputs[0])? {
             ADD_VDSP_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+        #[cfg(feature = "mlas")]
+        if add_contiguous_f32(inputs, &mut outputs[0])? {
             return Ok(());
         }
         // Shared with Sub/Mul/Div so there is exactly one dense binary walk in

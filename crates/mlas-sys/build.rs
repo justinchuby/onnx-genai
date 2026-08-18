@@ -162,15 +162,24 @@ fn main() {
                 "halfgemm_kernel_neon_fp16.cpp",
                 "softmax_kernel_neon_fp16.cpp",
                 "eltwise_kernel_neon_fp16.cpp",
-                // `platform.cpp` installs these into MLAS_PLATFORM
-                // unconditionally under MLAS_F16VEC_INTRINSICS_SUPPORTED, so
-                // omitting them breaks the link, not just the fp16 kernels.
-                "erf_neon_fp16.cpp",
-                "gelu_neon_fp16.cpp",
             ]
             .iter()
             .map(|f| p.lib.join(f))
             .collect();
+            // `platform.cpp:755` installs MlasNeonErfFP16Kernel and
+            // MlasNeonGeluFP16Kernel into MLAS_PLATFORM under
+            // `MLAS_F16VEC_INTRINSICS_SUPPORTED && !defined(_WIN32)`, so on
+            // Linux ARM64 omitting these TUs breaks the *link*, not just the
+            // fp16 kernels. On Windows they must stay out: MSVC has no `__fp16`
+            // (nor `MlasBroadcastF16Float16x8`), and `platform.cpp` never
+            // references the kernels there, so compiling them only fails.
+            if target_os != "windows" {
+                arm64_fp16_sources.extend(
+                    ["erf_neon_fp16.cpp", "gelu_neon_fp16.cpp"]
+                        .iter()
+                        .map(|f| p.lib.join(f)),
+                );
+            }
         }
         generic.extend(arm64_sources.iter().map(|f| p.lib.join(f)));
     } else {

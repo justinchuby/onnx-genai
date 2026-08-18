@@ -10483,9 +10483,11 @@ mod tests {
         let (k, n, block_size) = (1024usize, 1024usize, 128usize);
         // "Reachable" is a per-OS policy statement, not a universal one:
         // production disables the KAI SDOT route on macOS/iOS
-        // (`arm64_kai_sdot_direct_enabled`), so on Apple silicon without MLAS
-        // there is no fast int4 route for this shape to reach. The KAI kernel's
-        // numerics stay covered there by
+        // (`arm64_kai_sdot_direct_enabled`), so on Apple silicon there is no
+        // fast int4 route for this shape to reach — MLAS does not rescue it,
+        // because `prefer_arm64_mlas_qnbit_decode` is `not(macos/ios)` too, so
+        // linking MLAS changes nothing on Apple. The KAI kernel's numerics stay
+        // covered there by
         // `matmulnbits_arm64_kai_qsi4_block128_qwen_shapes_match_reference`,
         // which calls it directly instead of through dispatch.
         assert_eq!(
@@ -10493,7 +10495,11 @@ mod tests {
             DotKernel::arm64_kai_sdot_direct_enabled(),
             "int4-direct dispatch support must follow the documented per-OS KAI policy"
         );
-        if !DotKernel::arm64_kai_sdot_direct_enabled() && !cfg!(feature = "mlas") {
+        #[cfg(all(feature = "mlas", not(any(target_os = "macos", target_os = "ios"))))]
+        let mlas_qnbit_enabled = arm64_mlas_qnbit_decode_opted_in();
+        #[cfg(not(all(feature = "mlas", not(any(target_os = "macos", target_os = "ios")))))]
+        let mlas_qnbit_enabled = false;
+        if !DotKernel::arm64_kai_sdot_direct_enabled() && !mlas_qnbit_enabled {
             return;
         }
         let blocks = k.div_ceil(block_size);

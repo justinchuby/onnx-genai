@@ -113,12 +113,22 @@ jobs:
           # onnx-runtime-ep-cpu has OS affinity and Rayon-heavy tests that are not
           # Miri-tractable. Cover the pure unsafe allocator, copy, dtype, and
           # strided-view surfaces directly instead of claiming full-crate coverage.
+          #
+          # `--no-default-features --features full` is the pure-Rust build of the
+          # crate. Miri interprets Rust; it cannot execute native code, so any
+          # test that reaches an `extern "C"` MLAS entry point aborts with
+          # "unsupported operation: can't call foreign function". Since MLAS went
+          # on by default, `provider::tests` does exactly that via
+          # `mlas_nchwc_block_size`. Dropping the default feature keeps this lane
+          # checking what it is actually able to check — our own `unsafe` Rust —
+          # rather than silently losing all three surfaces. MLAS's C++ is covered
+          # by the sanitizer and differential lanes, not here.
           run_miri "onnx-runtime-ep-cpu strided" \
-            cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib strided::tests
+            cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --no-default-features --features full --lib strided::tests
           run_miri "onnx-runtime-ep-cpu provider" \
-            cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib provider::tests
+            cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --no-default-features --features full --lib provider::tests
           run_miri "onnx-runtime-ep-cpu dtype" \
-            cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib dtype::tests
+            cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --no-default-features --features full --lib dtype::tests
 
           run_miri "onnx-runtime-session tensor" \
             env MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --locked -p onnx-runtime-session --lib tensor::tests

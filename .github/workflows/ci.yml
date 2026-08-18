@@ -323,10 +323,16 @@ jobs:
       # sources and had no GNU/clang branch for the GAS .S sources, leaving
       # MlasSgemmKernelZero, MlasGemvFloatKernel, MlasConvSymKernelNeon and
       # ~30 more declared, called from dispatch tables, and never defined.
+      # `g++-aarch64-linux-gnu` is not optional now that MLAS is on by default:
+      # mlas-sys compiles ~150 C++ TUs for the target, and cc-rs probes
+      # `aarch64-linux-gnu-g++` before it compiles anything.  Without it the
+      # cross-arch pass fails at "Compiler family detection failed ...
+      # ToolNotFound".
       - name: Install the aarch64 cross toolchain for the cross-arch pass
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
       - name: Cross-target compile check (catches os- and arch-gating errors)
         run: bash scripts/check_cross_compile.sh
 

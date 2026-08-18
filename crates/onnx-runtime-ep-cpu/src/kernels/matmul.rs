@@ -2247,10 +2247,25 @@ mod tests {
             kernel
                 .execute(&[a.view(), b.view()], &mut [out.view_mut()])
                 .unwrap();
-            assert!(
-                kernel.prepack.dense[1].is_filled(),
-                "the constant f16 B must be widened into the governed cache at m={m}"
-            );
+            // Apple decode is the one instantiation that never reaches the
+            // generic widening path: `execute_with_backend` routes a constant
+            // f16 `B` at M=1 through the Accelerate NEON GEMV, which reads `B`
+            // via `transposed_b_f16` and never touches `dense[1]`. That cache
+            // is not governed, so on Apple the predictor budgets for an
+            // instantiation that does not materialise — conservative, and
+            // asserted as a strict upper bound below rather than waved away.
+            let apple_gemv_decode = cfg!(any(target_os = "macos", target_os = "ios")) && m == 1;
+            if apple_gemv_decode {
+                assert!(
+                    !kernel.prepack.dense[1].is_filled(),
+                    "the Apple M=1 GEMV reads B through the transposed cache, not `dense`"
+                );
+            } else {
+                assert!(
+                    kernel.prepack.dense[1].is_filled(),
+                    "the constant f16 B must be widened into the governed cache at m={m}"
+                );
+            }
             assert!(
                 !kernel.prepack.dense[0].is_filled(),
                 "the contiguous f32 A is borrowed, never cached (m={m})"
@@ -2264,10 +2279,21 @@ mod tests {
             instances, MATMUL_DENSE_DECODE_INSTANTIATIONS,
             "prefill + decode = two shape-keyed instantiations"
         );
+        let caching_instances = if cfg!(any(target_os = "macos", target_os = "ios")) {
+            1
+        } else {
+            MATMUL_DENSE_DECODE_INSTANTIATIONS
+        };
         assert_eq!(
-            actual, predicted,
+            actual,
+            (k as u64) * (n as u64) * 4 * caching_instances,
             "predicted dense-cache bytes must equal the summed bytes actually \
-             held across all instantiations (ratio 1.00)"
+             held across all instantiations (ratio 1.00 off Apple; the Apple \
+             decode takes the Accelerate GEMV and caches nothing here)"
+        );
+        assert!(
+            actual <= predicted,
+            "the governed prediction must never under-budget the bytes actually held"
         );
     }
 
