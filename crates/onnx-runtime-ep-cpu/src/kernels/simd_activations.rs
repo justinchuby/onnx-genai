@@ -1767,13 +1767,10 @@ mod avx2 {
         }
     }
 
-    /// Apply an 8-lane kernel across a slice. The `< 8` remainder is processed
-    /// through the *same* kernel via a masked load/store, so every element of
-    /// the output — tail included — is computed identically.
-    #[inline]
-    #[target_feature(enable = "avx2,fma")]
     /// Like [`map_ps`], but adds a `width`-element bias row to each `width`-element
     /// slab of the input before applying `kernel`.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn map_bias_ps(
         input: &[f32],
         bias: &[f32],
@@ -1813,6 +1810,22 @@ mod avx2 {
         }
     }
 
+    /// Apply an 8-lane kernel across a slice. The `< 8` remainder is processed
+    /// through the *same* kernel via a masked load/store, so every element of
+    /// the output — tail included — is computed identically.
+    ///
+    /// The `target_feature` is load-bearing, not decoration. LLVM will not
+    /// inline a callee whose feature set is a superset of its caller's, so
+    /// without `avx2,fma` here the `kernel` closures — which are all
+    /// `avx2,fma` — cannot be inlined into this loop. Today that is masked:
+    /// every caller is itself `avx2,fma`, so `map_ps` gets inlined *upwards*
+    /// into the caller first and the closure folds in afterwards. That is a
+    /// property of the current inlining decision, not a guarantee. Grow this
+    /// function past the inline threshold and the closure becomes a real call
+    /// per 8 elements, which for a kernel like `erf_ps` would also force all
+    /// of its constants to be re-materialised on every call.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn map_ps(
         input: &[f32],
         output: &mut [f32],
