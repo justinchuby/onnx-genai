@@ -43,6 +43,10 @@ Start with [[start/Repository Map]], then follow:
 backing, shared mappings, governors, holders and the provider's stream/context
 responsibilities from first principles.
 
+[[memory/MoE Router Skew and Always-On Experts]] explains how expert-selection
+skew was measured for a trained-router MoE model, and why it decides whether a
+residency policy has anything to exploit.
+
 ### Change or measure the runtime
 
 - [[development/Testing and Verification]]

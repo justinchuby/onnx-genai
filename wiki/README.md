@@ -36,6 +36,7 @@ Published readers start at [[index|onnx-genai Knowledge Base]].
 - **CUDA EP:** [[execution/CUDA Execution Provider]]
 - **Plugin EPs:** [[execution/Plugin Execution Providers]]
 - **Memory:** [[memory/Memory Management for Beginners]]
+- **MoE router skew:** [[memory/MoE Router Skew and Always-On Experts]]
 - **Tracing:** [[observability/Tracing and Profiling]]
 - **Performance engineering:** [[performance/Performance Engineering Playbook]]
 - **API design:** [[api/API Design Principles]]
