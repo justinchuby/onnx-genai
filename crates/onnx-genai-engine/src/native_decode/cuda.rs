@@ -2294,12 +2294,22 @@ impl NativeDecodeSession {
         past_lens: &[usize],
         advances: &[bool],
     ) -> anyhow::Result<Vec<TokenId>> {
+        let profile_past = past_lens.iter().copied().max().unwrap_or(0);
+        let profile_total = profile_past.saturating_add(1);
+        let step_profile = CudaStepProfile::begin(profile_past, profile_total);
+        let mut step_wall = CudaStepWallBreakdown::default();
+
+        let run_start = std::time::Instant::now();
         let valid_lens = self.run_ragged_forward(tokens, past_lens, advances)?;
+        step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
+
         let state = self
             .cuda
             .as_mut()
             .context("CUDA decode state is not initialized")?;
+        let read_start = std::time::Instant::now();
         let rows = state.read_greedy_result_batch()?;
+        step_wall.logits_read_ms = read_start.elapsed().as_secs_f64() * 1_000.0;
         for (sequence, (_, capture_error)) in rows.iter().enumerate() {
             if *capture_error != 0 {
                 let _ = state.invalidate_graph(&mut self.session);
@@ -2312,6 +2322,9 @@ impl NativeDecodeSession {
             }
         }
         self.commit_ragged_advance(&valid_lens, advances)?;
+        if let Some(profile) = step_profile {
+            profile.finish("decode_batch", step_wall);
+        }
         Ok(rows.into_iter().map(|(token, _)| token).collect())
     }
 

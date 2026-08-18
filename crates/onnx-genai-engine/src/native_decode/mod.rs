@@ -693,6 +693,44 @@ impl NativeDecodeSession {
             .map(|state| state.debug_stats(&self.session))
     }
 
+    /// Number of captured device-graph segments installed by the most recent
+    /// capture on the main decode graph slot (1 = whole-subgraph capture that
+    /// reaches the zero-host-work replay fast path; >=2 = a segmented capture
+    /// whose replay must interleave eager seam-node execution every step). This
+    /// is the batch-decode `M>=2` cliff signal: batch=1 typically captures as a
+    /// single graph while `M>=2` fragments into segments.
+    pub fn captured_graph_segment_count(&self) -> usize {
+        self.session.captured_graph_segment_count()
+    }
+
+    /// One `op_type[seam_reason]xN` summary per eager seam node that split the
+    /// most recent segmented capture on the main decode graph slot — the root
+    /// cause of a `>1`-segment graph. Empty for a whole-subgraph capture.
+    pub fn captured_graph_seam_summary(&self) -> Option<String> {
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for decline in self.session.capture_segmentation() {
+            let seam = decline
+                .seam_reason
+                .map(|reason| format!("{reason:?}"))
+                .unwrap_or_else(|| "graph".to_string());
+            *counts
+                .entry(format!("{}[{}]", decline.op_type, seam))
+                .or_default() += 1;
+        }
+        if counts.is_empty() {
+            None
+        } else {
+            Some(
+                counts
+                    .into_iter()
+                    .map(|(key, count)| format!("{key}x{count}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        }
+    }
+
     pub fn cuda_graph_fallback_reason(&self) -> Option<&str> {
         self.cuda
             .as_ref()
