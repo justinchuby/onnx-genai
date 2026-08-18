@@ -79,8 +79,14 @@ pub struct EmbeddingUsage {
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: usize,
+    /// Deprecated by OpenAI in favour of `max_completion_tokens`, and absent
+    /// from requests aimed at reasoning models. See [`Self::output_budget`].
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+    /// The budget covering reasoning *and* answer tokens, which is the only
+    /// output limit OpenAI accepts for a reasoning model.
+    #[serde(default)]
+    pub max_completion_tokens: Option<usize>,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
     #[serde(default = "default_top_p")]
@@ -193,6 +199,30 @@ impl ReasoningEffort {
 }
 
 impl ChatCompletionRequest {
+    /// How many tokens this turn may decode, given the server's cap.
+    ///
+    /// `max_completion_tokens` supersedes `max_tokens`, which OpenAI deprecated
+    /// for chat completions and rejects outright for reasoning models. A client
+    /// that sends neither has asked for no limit of its own — OpenAI decodes
+    /// until the model stops or the context runs out — so the budget falls back
+    /// to the server's cap rather than to a small fixed default. That
+    /// distinction matters most for a reasoning model, whose private thinking
+    /// spends the same budget as its answer: too small a fallback truncates the
+    /// turn mid-thought and returns nothing at all.
+    pub(crate) fn output_budget(&self, cap: usize) -> usize {
+        self.requested_output_budget()
+            .map_or(cap, |(_, requested)| requested)
+            .min(cap)
+    }
+
+    /// The output budget the client asked for and the field it used, or `None`
+    /// when it named neither and left the limit to the server.
+    pub(crate) fn requested_output_budget(&self) -> Option<(&'static str, usize)> {
+        self.max_completion_tokens
+            .map(|budget| ("max_completion_tokens", budget))
+            .or_else(|| self.max_tokens.map(|budget| ("max_tokens", budget)))
+    }
+
     pub(crate) fn wants_constrained_json(&self) -> bool {
         matches!(
             self.response_format.as_ref(),
