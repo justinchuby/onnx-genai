@@ -57,8 +57,9 @@ use std::sync::{Arc, Mutex};
 
 use onnx_runtime_memory_governor::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HolderId, MappedPhysicalCapacityToken,
-    MemoryAuthorityId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, SharedDevicePrefix,
-    SharedMapping, SharedPrefixCommitInfo, Tier, VirtualBacking as MemoryVirtualBacking,
+    MechanismId, MemoryAuthorityId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole,
+    SharedDevicePrefix, SharedMapping, SharedPrefixCommitInfo, Tier,
+    VirtualBacking as MemoryVirtualBacking,
 };
 use onnx_runtime_virtual_memory::{PhysicalMemoryAccounting, VirtualBacking};
 
@@ -1777,6 +1778,16 @@ impl DeviceAllocator for CudaVmmAllocator {
     fn as_shared_mapping(&self) -> Option<&dyn SharedMapping> {
         self.backing.physical_pool().is_some().then_some(self)
     }
+
+    /// `Some(MechanismId::of(self))`: `CudaVmmAllocator` is a concrete,
+    /// `'static` type, and every capability it advertises through
+    /// `as_virtual_backing`/`as_shared_mapping` returns `self` — so its own
+    /// identity is exactly what a caller needs to prove a capability
+    /// genuinely came from this allocator (#1186 Phase 2 review, round 4
+    /// finding 2).
+    fn mechanism_id(&self) -> Option<MechanismId> {
+        Some(MechanismId::of(self))
+    }
 }
 
 // SAFETY: every pointer handed to these methods lies inside this allocator's
@@ -2139,27 +2150,46 @@ impl SharedMapping for CudaVmmAllocator {
     /// overrides the base default entirely, above). This exists for a caller
     /// that reaches release accounting through `as_shared_mapping` directly,
     /// bypassing that override (#1186 Phase 2 review, round 3 finding 2), and
-    /// for that caller must still answer correctly.
+    /// for that caller it must still perform a genuine, atomic, exact-once
+    /// release — not merely answer a query (#1186 Phase 2 review, round 4
+    /// finding 1).
     ///
     /// This allocator's granule tracking does not record whether a committed
     /// granule became committed through an ordinary
     /// [`commit_allocation_range`](MemoryVirtualBacking::commit_allocation_range)
     /// or through [`commit_shared_prefix`](Self::commit_shared_prefix) — both
     /// mark the same granule "committed" in the same span, since either way
-    /// the physical page is mapped and the address range is live. So the
-    /// conservative, always-correct answer for "how many of `ptr`'s bytes did
-    /// a shared mapping contribute" is this allocation's whole committed
-    /// footprint: exactly what `deallocate_committed` would itself report if
-    /// invoked instead, which is what every real caller in this codebase
-    /// does.
-    fn allocation_shared_mapped_bytes(
+    /// the physical page is mapped and the address range is live. So
+    /// delegating straight to [`deallocate_span`](Self::deallocate_span) —
+    /// the same machinery [`DeviceAllocator::deallocate`] and
+    /// [`MemoryVirtualBacking::deallocate_committed`] both use — is both the
+    /// conservative, always-correct accounting answer (this allocation's
+    /// whole committed footprint, exactly what `deallocate_committed` would
+    /// itself report if invoked instead) *and* a genuine atomic release: the
+    /// span's removal from the live-allocation table and its granule release
+    /// happen under one lock acquisition inside `deallocate_span`, and
+    /// removing an already-removed span is a safe no-op that reports `0` —
+    /// so this method is exact-once, refunds zero on a repeated or otherwise
+    /// unmatched call, and is safe to call whether or not a caller also
+    /// later calls [`DeviceAllocator::deallocate`]/`deallocate_with_unmapped`
+    /// on the same pointer (which would simply find nothing left to release).
+    ///
+    /// [`DeviceAllocator::deallocate`]: onnx_runtime_memory_governor::DeviceAllocator::deallocate
+    ///
+    /// # Safety
+    ///
+    /// `ptr`, `allocation_bytes`, and `align` must identify one live
+    /// allocation this allocator's [`DeviceAllocator::allocate`] (or
+    /// [`MemoryVirtualBacking::allocate_committed`]) produced.
+    ///
+    /// [`DeviceAllocator::allocate`]: onnx_runtime_memory_governor::DeviceAllocator::allocate
+    unsafe fn release_shared_mapping(
         &self,
         ptr: NonNull<u8>,
-        allocation_bytes: usize,
-        align: usize,
+        _allocation_bytes: usize,
+        _align: usize,
     ) -> u64 {
-        <Self as MemoryVirtualBacking>::allocation_committed_bytes(self, ptr, allocation_bytes, align)
-            as u64
+        self.deallocate_span(ptr)
     }
 
     fn as_any(&self) -> &dyn Any {

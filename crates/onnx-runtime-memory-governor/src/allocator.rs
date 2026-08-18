@@ -33,7 +33,7 @@ pub use onnx_runtime_memory_api::allocator::{
     SharedDevicePrefix, SharedPrefixCommitInfo,
 };
 pub use onnx_runtime_memory_api::capability::{
-    SharedMapping, VirtualBacking, capability_shares_mechanism,
+    MechanismId, SharedMapping, VirtualBacking, capability_shares_mechanism,
 };
 
 #[cfg(test)]

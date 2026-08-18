@@ -12,7 +12,7 @@ use std::any::Any;
 use std::fmt::Debug;
 use std::ptr::NonNull;
 
-use crate::capability::{SharedMapping, VirtualBacking};
+use crate::capability::{MechanismId, SharedMapping, VirtualBacking};
 use crate::{MemoryError, Tier};
 
 #[derive(Clone, Copy, Debug)]
@@ -148,7 +148,7 @@ pub struct SharedPrefixCommitInfo {
 ///   override folds `SharedMapping` accounting into its return value some
 ///   other way (for instance because commit and sharing are tracked in one
 ///   structure, as `CudaVmmAllocator` does) must still implement
-///   [`SharedMapping::allocation_shared_mapped_bytes`] correctly: anything
+///   [`SharedMapping::release_shared_mapping`] correctly: anything
 ///   reachable through `as_shared_mapping` is expected to answer the same
 ///   question consistently, regardless of which path a caller takes to it.
 ///
@@ -166,16 +166,23 @@ pub struct SharedPrefixCommitInfo {
 /// claim should hold a lease alongside its allocator rather than expect the
 /// allocator to account for it.
 ///
-/// # Why this extends [`Any`]
+/// # Why this does not require [`Any`]
 ///
-/// [`capability_shares_mechanism`](crate::capability::capability_shares_mechanism)
-/// needs each trait-object reference's concrete [`TypeId`](std::any::TypeId)
-/// as well as its data pointer, to reject a composing wrapper whose first
-/// field happens to share its own address (#1186 Phase 2 review, round 3
-/// finding 1). `Any` is a blanket impl for every `'static` type, so this adds
-/// no obligation to any implementation — every existing and future
-/// `DeviceAllocator` already satisfies it.
-pub trait DeviceAllocator: Send + Sync + Debug + Any {
+/// An earlier design (#1186 Phase 2 review, round 3) added `Any` as a
+/// supertrait here so [`capability_shares_mechanism`](crate::capability::capability_shares_mechanism)
+/// could upcast a `&dyn DeviceAllocator` to `&dyn Any` and compare data
+/// pointers and [`TypeId`](std::any::TypeId)s, rejecting a composing wrapper
+/// whose first field happens to share its own address. `Any: 'static`, so
+/// that supertrait transitively forced every implementation to be `'static`
+/// — a real regression against "minimal ordinary contract", since it
+/// rejected an otherwise valid allocator built over borrowed, non-`'static`
+/// data (#1186 Phase 2 review, round 4 finding 2).
+///
+/// [`mechanism_id`](Self::mechanism_id) replaces that: it is a plain,
+/// `'static`-free default method that only a concrete type opting into
+/// identity-checked capabilities needs to override, so no lifetime
+/// restriction reaches an implementation that never does.
+pub trait DeviceAllocator: Send + Sync + Debug {
     /// Take `bytes` aligned to `align`.
     fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError>;
 
@@ -196,11 +203,13 @@ pub trait DeviceAllocator: Send + Sync + Debug + Any {
     ///
     /// The default forwards to [`deallocate`](Self::deallocate) and then, if
     /// [`as_shared_mapping`](Self::as_shared_mapping) reports a capability,
-    /// asks it how many of `ptr`'s bytes were backed by a shared-prefix
-    /// mapping — an allocator that can create mapped cost through
-    /// [`SharedMapping::commit_shared_prefix`] must never lose that refund by
-    /// silently inheriting a plain zero the way an eager allocator correctly
-    /// does (#1186 Phase 2 review, round 3 finding 2). It has no
+    /// atomically releases and reports how many of `ptr`'s bytes were backed
+    /// by a shared-prefix mapping — an allocator that can create mapped cost
+    /// through [`SharedMapping::commit_shared_prefix`] must never lose that
+    /// refund by silently inheriting a plain zero the way an eager allocator
+    /// correctly does (#1186 Phase 2 review, round 3 finding 2), and must
+    /// never report it from a stale snapshot taken before the actual release
+    /// (#1186 Phase 2 review, round 4 finding 1). It has no
     /// [`VirtualBacking`] equivalent here on purpose: an allocator with that
     /// capability instead releases through
     /// [`VirtualBacking::deallocate_committed`], never through this default —
@@ -215,12 +224,11 @@ pub trait DeviceAllocator: Send + Sync + Debug + Any {
     /// `ptr`, `bytes`, and `align` must identify one live allocation returned
     /// by this allocator, exactly as required by [`DeviceAllocator::deallocate`].
     unsafe fn deallocate_with_unmapped(&self, ptr: NonNull<u8>, bytes: usize, align: usize) -> u64 {
-        let unmapped = self
-            .as_shared_mapping()
-            .map(|shared_mapping| {
-                shared_mapping.allocation_shared_mapped_bytes(ptr, bytes, align)
-            })
-            .unwrap_or(0);
+        let unmapped = match self.as_shared_mapping() {
+            // SAFETY: forwarded under this method's identical contract.
+            Some(shared_mapping) => unsafe { shared_mapping.release_shared_mapping(ptr, bytes, align) },
+            None => 0,
+        };
         // SAFETY: forwarded under this method's identical contract.
         unsafe { self.deallocate(ptr, bytes, align) };
         unmapped
@@ -254,6 +262,30 @@ pub trait DeviceAllocator: Send + Sync + Debug + Any {
     /// ambiguity this split exists to remove, just one level up: discovery
     /// says "yes", and the first real call says "no" (#1186 Phase 2 review).
     fn as_shared_mapping(&self) -> Option<&dyn SharedMapping> {
+        None
+    }
+
+    /// This mechanism's stable, unforgeable identity, if it has one.
+    ///
+    /// [`capability_shares_mechanism`](crate::capability::capability_shares_mechanism)
+    /// uses this to bind a `VirtualBacking`/`SharedMapping` capability to the
+    /// allocator that advertises it, rejecting a composing wrapper whose
+    /// capability is actually a different, foreign object (#1186 Phase 2
+    /// review, round 1 finding 1) — including one whose address merely
+    /// coincides with the wrapper's own (round 3 finding 1). See
+    /// [`MechanismId`]'s own documentation for the full identity design.
+    ///
+    /// The default `None` is correct and imposes nothing on an implementation
+    /// that never overrides it: it simply cannot participate in
+    /// identity-checked capability binding, exactly like a type with no
+    /// capabilities at all. A concrete, `'static` type that wants
+    /// `as_virtual_backing`/`as_shared_mapping` to be trusted overrides this
+    /// with `Some(MechanismId::of(self))` — computed from its own `&Self`
+    /// inside its own `impl` block, never through a trait-object upcast, so
+    /// this method (and this trait) never has to require `Any` or `'static`
+    /// of every implementation the way an earlier design did (#1186 Phase 2
+    /// review, round 4 finding 2).
+    fn mechanism_id(&self) -> Option<MechanismId> {
         None
     }
 }
@@ -300,6 +332,17 @@ impl DeviceAllocator for HostAllocator {
 
     fn device(&self) -> DeviceKey {
         DeviceKey::HOST
+    }
+
+    /// `HostAllocator` has no capability to bind an identity to, but it is a
+    /// concrete, owned, `'static` type like any other, so it overrides this
+    /// as a simple illustration of the opt-in pattern every capability-
+    /// bearing mechanism follows (see [`capability_shares_mechanism`]'s
+    /// doctest).
+    ///
+    /// [`capability_shares_mechanism`]: crate::capability::capability_shares_mechanism
+    fn mechanism_id(&self) -> Option<MechanismId> {
+        Some(MechanismId::of(self))
     }
 }
 

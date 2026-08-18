@@ -2256,6 +2256,14 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
                 // the exact composite the review flagged.
                 Some(self.foreign.as_ref())
             }
+
+            fn mechanism_id(&self) -> Option<onnx_runtime_memory_governor::MechanismId> {
+                // The wrapper's own identity, not `self.foreign`'s: this
+                // proves the rejection below comes from a genuine identity
+                // mismatch, not from `CompositeAllocator` having opted out of
+                // identity entirely (#1186 Phase 2 review, round 4 finding 2).
+                Some(onnx_runtime_memory_governor::MechanismId::of(self))
+            }
         }
 
         let composite: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator> =
@@ -2354,6 +2362,15 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
                 // Deliberately the embedded first field, reached through
                 // `self`'s own address, not a separately allocated object.
                 Some(&self.foreign)
+            }
+
+            fn mechanism_id(&self) -> Option<onnx_runtime_memory_governor::MechanismId> {
+                // The wrapper's own identity, not `self.foreign`'s: this
+                // proves the rejection below comes from a genuine `TypeId`
+                // mismatch defeating the offset-zero address collision, not
+                // from `OffsetZeroWrapper` having opted out of identity
+                // entirely (#1186 Phase 2 review, round 4 finding 2).
+                Some(onnx_runtime_memory_governor::MechanismId::of(self))
             }
         }
 
