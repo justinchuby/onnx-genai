@@ -5747,6 +5747,10 @@ fn unary_case(
         // default and a non-default value exercise different arithmetic. The
         // name carries which one the case means.
         "Celu" if name.contains("_a2") => " attribute: [{ name: \"alpha\" type: FLOAT f: 2.0 }]",
+        // Same for Elu: alpha scales only the negative half, so the default
+        // and a non-default value take different arithmetic through the same
+        // select.
+        "Elu" if name.contains("_a2") => " attribute: [{ name: \"alpha\" type: FLOAT f: 2.0 }]",
         _ => "",
     };
     let model = format!(
@@ -5873,6 +5877,23 @@ fn unary_bench_cases() -> Vec<MatmulFamilyCase> {
             17,
             false,
             0.0,
+        ),
+        // `Elu` exercises the AVX2 kernel and the zero-copy tensor path.
+        // `LeakyRelu` deliberately does not: it still has no SIMD kernel, so it
+        // measures what the generic scalar activation path costs -- two extra
+        // passes over the tensor and a per-element `match` -- and is the
+        // control this file needs to keep that cost visible.
+        unary_case("bench_elu_f32_4k", "Elu", "", ELEM_F32, K4, 17, false, 1e-4),
+        unary_case("bench_elu_f32_1m", "Elu", "", ELEM_F32, M1, 17, false, 1e-4),
+        unary_case(
+            "bench_leakyrelu_f32_1m",
+            "LeakyRelu",
+            "",
+            ELEM_F32,
+            M1,
+            17,
+            false,
+            1e-4,
         ),
         // `Celu` and `Mish` had no kernel here at all before, so ORT ran them
         // and there is no "before" arm to compare against: ours-vs-ORT *is*
@@ -7019,7 +7040,7 @@ fn unary_result_matches(ours: f32, ort: f32, rel: f32) -> bool {
 /// claim is backed by an execution, and the output is compared elementwise
 /// against a second session with no EP appended at all.
 #[test]
-fn celu_mish_and_log_execute_locally_and_match_ort_numerics() {
+fn celu_mish_elu_and_log_execute_locally_and_match_ort_numerics() {
     let _lock = lock_ort_ep();
     let x = unary_special_values();
     let len = x.len();
@@ -7027,11 +7048,13 @@ fn celu_mish_and_log_execute_locally_and_match_ort_numerics() {
 
     // `Celu` is opset 12, `Mish` is opset 18; ask for each op's own opset
     // rather than one number that happens to satisfy both.
-    let specs: [(&'static str, &'static str, u64, f32); 4] = [
+    let specs: [(&'static str, &'static str, u64, f32); 6] = [
         ("parity_celu_f32", "Celu", 12, 2e-6),
         ("parity_celu_a2_f32", "Celu", 12, 2e-6),
         ("parity_mish_f32", "Mish", 18, 2e-6),
         ("parity_log_f32", "Log", 17, 2e-6),
+        ("parity_elu_f32", "Elu", 17, 2e-6),
+        ("parity_elu_a2_f32", "Elu", 17, 2e-6),
     ];
 
     let mut checked = 0usize;
@@ -7108,6 +7131,6 @@ fn celu_mish_and_log_execute_locally_and_match_ort_numerics() {
         }
         checked += 1;
     }
-    assert_eq!(checked, 4, "every parity case must have been checked");
-    eprintln!("\n✅ celu_mish_and_log_execute_locally_and_match_ort_numerics: PASSED");
+    assert_eq!(checked, 6, "every parity case must have been checked");
+    eprintln!("\n✅ celu_mish_elu_and_log_execute_locally_and_match_ort_numerics: PASSED");
 }

@@ -39,13 +39,10 @@ impl Activation {
 
     fn apply(self, x: f32) -> f32 {
         match self {
-            Self::Elu { alpha } => {
-                if x >= 0.0 {
-                    x
-                } else {
-                    alpha * x.exp_m1()
-                }
-            }
+            // `exp(x) - 1`, not `exp_m1`: shared with the AVX2 slice path, which
+            // has no `expm1` to match `exp_m1` with, and with ORT, which spells
+            // it the same way. See `elu_scalar`.
+            Self::Elu { alpha } => crate::kernels::simd_activations::elu_scalar(x, alpha),
             Self::LeakyRelu { alpha } => {
                 if x >= 0.0 {
                     x
@@ -302,9 +299,27 @@ impl KernelFactory for SiluFactory {
 impl Kernel for ActivationKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(self.activation.name(), inputs, outputs, 1, 1, 1)?;
-        if matches!(self.activation, Activation::Silu)
-            && silu_contiguous_f32(&inputs[0], &mut outputs[0])
-        {
+        // Straight from the input tensor into the output tensor, for the
+        // activations that have a slice kernel. The generic path below borrows
+        // its input but still builds the result in a fresh `Vec` and copies
+        // that into the output, which for a dense f32 tensor is one allocation
+        // and 2n words of memory traffic that buy nothing.
+        let ran = match self.activation {
+            Activation::Silu => contiguous_f32(&inputs[0], &mut outputs[0], silu_f32_slice),
+            Activation::Celu { alpha } => contiguous_f32(&inputs[0], &mut outputs[0], |i, o| {
+                crate::kernels::simd_activations::celu_f32_slice(i, o, alpha);
+            }),
+            Activation::Mish => contiguous_f32(
+                &inputs[0],
+                &mut outputs[0],
+                crate::kernels::simd_activations::mish_f32_slice,
+            ),
+            Activation::Elu { alpha } => contiguous_f32(&inputs[0], &mut outputs[0], |i, o| {
+                crate::kernels::simd_activations::elu_f32_slice(i, o, alpha);
+            }),
+            _ => false,
+        };
+        if ran {
             return Ok(());
         }
         if inputs[0].dtype == DataType::Float64 {
@@ -341,7 +356,19 @@ impl Kernel for ActivationKernel {
     }
 }
 
-fn silu_contiguous_f32(input: &TensorView, output: &mut TensorMut) -> bool {
+/// Run an elementwise f32 slice kernel directly between the two tensors.
+///
+/// Returns `false` when that is not possible, leaving the caller to take the
+/// general path: either tensor not dense f32, shapes or strides disagreeing,
+/// or the two overlapping in memory. Overlap has to be refused even though the
+/// kernels are elementwise and would compute the right answer in place --
+/// forming `&[f32]` and `&mut [f32]` over the same bytes is undefined
+/// behaviour in Rust regardless of what the machine code would do.
+fn contiguous_f32(
+    input: &TensorView,
+    output: &mut TensorMut,
+    kernel: impl FnOnce(&[f32], &mut [f32]),
+) -> bool {
     if input.dtype != DataType::Float32
         || output.dtype != DataType::Float32
         || input.shape != output.shape
@@ -365,7 +392,7 @@ fn silu_contiguous_f32(input: &TensorView, output: &mut TensorMut) -> bool {
     // pointers span n elements; the range check proves output does not alias input.
     let input = unsafe { std::slice::from_raw_parts(input.data_ptr::<f32>(), n) };
     let output = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), n) };
-    silu_f32_slice(input, output);
+    kernel(input, output);
     true
 }
 
@@ -796,6 +823,116 @@ mod tests {
                 "silu({input}) = {got}, want {want}, abs_err {abs_err}, rel_err {rel_err}"
             );
         }
+    }
+
+    /// The zero-copy fast path forms `&[f32]` and `&mut [f32]` over raw tensor
+    /// pointers, which is only sound when both tensors are dense f32, agree on
+    /// shape and strides, and do not overlap in memory. This proves the guard
+    /// declines every layout that would make that unsound -- and that a genuine
+    /// dense, disjoint pair still takes it. Without the decline, aliasing would
+    /// be undefined behaviour rather than a slower answer.
+    #[test]
+    fn contiguous_f32_fast_path_declines_every_unsafe_layout() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
+        use onnx_runtime_ir::{DataType, DeviceId};
+
+        let must_not_run =
+            |_: &[f32], _: &mut [f32]| panic!("fast path ran on a layout it must decline");
+        let shape = [4usize];
+        let dense = [1i64];
+
+        // 1. dtype mismatch: an f64 input can never be reinterpreted as f32.
+        let in64 = [1.0f64, 2.0, 3.0, 4.0];
+        let mut out32 = [0.0f32; 4];
+        let iv = TensorView::new(
+            DevicePtr(in64.as_ptr() as *const _),
+            DataType::Float64,
+            &shape,
+            &dense,
+            DeviceId::cpu(),
+        );
+        let mut ov = TensorMut::new(
+            DevicePtrMut(out32.as_mut_ptr() as *mut _),
+            DataType::Float32,
+            &shape,
+            &dense,
+            DeviceId::cpu(),
+        );
+        assert!(
+            !contiguous_f32(&iv, &mut ov, must_not_run),
+            "dtype mismatch must decline the fast path"
+        );
+
+        // 2. non-dense strides (a broadcast stride of 0 is not a dense layout).
+        let bcast = [0i64];
+        let src = [1.0f32; 4];
+        let mut dst = [0.0f32; 4];
+        let iv = TensorView::new(
+            DevicePtr(src.as_ptr() as *const _),
+            DataType::Float32,
+            &shape,
+            &bcast,
+            DeviceId::cpu(),
+        );
+        let mut ov = TensorMut::new(
+            DevicePtrMut(dst.as_mut_ptr() as *mut _),
+            DataType::Float32,
+            &shape,
+            &bcast,
+            DeviceId::cpu(),
+        );
+        assert!(
+            !contiguous_f32(&iv, &mut ov, must_not_run),
+            "non-dense strides must decline the fast path"
+        );
+
+        // 3. aliasing: input and output over the very same buffer.
+        let mut buf = [1.0f32, 2.0, 3.0, 4.0];
+        let ptr = buf.as_mut_ptr();
+        let iv = TensorView::new(
+            DevicePtr(ptr as *const _),
+            DataType::Float32,
+            &shape,
+            &dense,
+            DeviceId::cpu(),
+        );
+        let mut ov = TensorMut::new(
+            DevicePtrMut(ptr as *mut _),
+            DataType::Float32,
+            &shape,
+            &dense,
+            DeviceId::cpu(),
+        );
+        assert!(
+            !contiguous_f32(&iv, &mut ov, must_not_run),
+            "aliasing input/output must decline the fast path"
+        );
+
+        // Control: distinct dense f32 buffers of equal shape -- the fast path
+        // must run, and must be the thing that produced the output.
+        let src = [1.0f32, 2.0, 3.0, 4.0];
+        let mut dst = [0.0f32; 4];
+        let iv = TensorView::new(
+            DevicePtr(src.as_ptr() as *const _),
+            DataType::Float32,
+            &shape,
+            &dense,
+            DeviceId::cpu(),
+        );
+        let mut ov = TensorMut::new(
+            DevicePtrMut(dst.as_mut_ptr() as *mut _),
+            DataType::Float32,
+            &shape,
+            &dense,
+            DeviceId::cpu(),
+        );
+        let mut ran = false;
+        let took = contiguous_f32(&iv, &mut ov, |i, o| {
+            ran = true;
+            o.copy_from_slice(i);
+        });
+        assert!(took && ran, "distinct dense f32 tensors must take the fast path");
+        assert_eq!(dst, src, "the fast-path kernel must have written the output");
     }
 
     #[test]
