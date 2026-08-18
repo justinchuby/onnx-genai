@@ -333,6 +333,7 @@ impl PipelineEngine {
             prompt_len: 0,
             generated_count: 0,
             kv_len: reused,
+            prefill_chunk_size: self.prefill_chunk_size,
         };
         // Prefill only what the retained KV does not already cover.
         backend.prompt_len = backend.context_tokens.len() - backend.retained_len;

@@ -123,6 +123,7 @@ pub(crate) struct PipelineDecodeLoopBackend<'a, 'admission> {
     /// is one token longer than the KV. Retaining the context length would claim
     /// KV that does not exist and corrupt the next turn's attention.
     pub(crate) kv_len: usize,
+    pub(crate) prefill_chunk_size: Option<usize>,
 }
 
 impl PipelineDecodeLoopBackend<'_, '_> {
@@ -201,6 +202,63 @@ impl PipelineDecodeLoopBackend<'_, '_> {
         }
         Ok(extras)
     }
+
+    fn run_decoder_step(
+        &mut self,
+        input_tokens: &[TokenId],
+        past_len: usize,
+    ) -> anyhow::Result<()> {
+        self.run_step_components(input_tokens)?;
+        let extras = self.decoder_extras()?;
+        self.decoder.prepare_step(input_tokens, past_len, &extras)?;
+        if let Some(admitted) = self.admission.take() {
+            admitted();
+        }
+        self.decoder.step(input_tokens, past_len, &extras)?;
+        self.kv_len = past_len + input_tokens.len();
+
+        if let Some(paged) = self.paged.as_mut().filter(|paged| !paged.exhausted) {
+            let retained_past_len = self.decoder.retained_kv_len(past_len);
+            match self.decoder.mirror_last_present_kv(
+                paged.kv_model,
+                paged.cache,
+                paged.seq,
+                retained_past_len,
+                input_tokens.len(),
+            ) {
+                Ok(()) => paged.mirrored_tokens = past_len + input_tokens.len(),
+                Err(error) if is_kv_out_of_memory(&error) => {
+                    paged.exhausted = true;
+                    tracing::debug!(
+                        "KV page pool exhausted after {} token(s); this generation stops \
+                         publishing KV for reuse but continues normally ({error})",
+                        paged.mirrored_tokens
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+            let pages_before = paged
+                .cache
+                .page_table
+                .get_sequence(paged.seq)
+                .map_or(0, <[_]>::len);
+            apply_paged_sliding_window(
+                paged.cache,
+                paged.seq,
+                self.decoder.sliding_window(),
+                self.decoder.sink_tokens(),
+            )?;
+            let pages_after = paged
+                .cache
+                .page_table
+                .get_sequence(paged.seq)
+                .map_or(0, <[_]>::len);
+            if pages_after < pages_before {
+                paged.windowed = true;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_, '_> {
@@ -233,79 +291,13 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_, '_> {
         } else {
             self.context_tokens[self.retained_len..].to_vec()
         };
-        // Refresh every `every_step` component over exactly the tokens the
-        // decoder is about to consume, then route their (and any cached) outputs
-        // into the decoder for this step.
-        self.run_step_components(&input_tokens)?;
-        let extras = self.decoder_extras()?;
-        self.decoder
-            .prepare_step(&input_tokens, past_len, &extras)?;
-        if let Some(admitted) = self.admission.take() {
-            admitted();
-        }
-        // Advance the decoder one step; it retains this step's outputs internally
-        // so the loop never handles a concrete tensor type (see
-        // `PipelineDecoderComponent`).
-        self.decoder.step(&input_tokens, past_len, &extras)?;
-        self.kv_len = past_len + input_tokens.len();
-        // Mirror this step's KV into pages before the outputs are consumed, so
-        // a later request opening with the same prefix can attach these pages
-        // instead of recomputing them.
-        if let Some(paged) = self.paged.as_mut().filter(|paged| !paged.exhausted) {
-            // A windowed decoder's present tensor is indexed in *retained*
-            // buffer space, not absolute position space: once the window has
-            // evicted anything, an absolute index reads the wrong rows or runs
-            // off the end. This is the same conversion the single-model decode
-            // step does before mirroring.
-            let retained_past_len = self.decoder.retained_kv_len(past_len);
-            match self.decoder.mirror_last_present_kv(
-                paged.kv_model,
-                paged.cache,
-                paged.seq,
-                retained_past_len,
-                input_tokens.len(),
-            ) {
-                Ok(()) => paged.mirrored_tokens = past_len + input_tokens.len(),
-                // Mirroring exists so a *later* request can reuse this KV. The
-                // pool running dry says nothing about whether this generation
-                // is valid, so failing it would punish the caller for a cache
-                // being full. Stop mirroring and keep decoding; only the
-                // tokens already mirrored get published.
-                Err(error) if is_kv_out_of_memory(&error) => {
-                    paged.exhausted = true;
-                    tracing::debug!(
-                        "KV page pool exhausted after {} token(s); this generation stops \
-                         publishing KV for reuse but continues normally ({error})",
-                        paged.mirrored_tokens
-                    );
-                }
-                Err(error) => return Err(error),
-            }
-            // Keep the paged sequence's window in step with the decoder's, so
-            // the pages published for reuse describe what the decoder can
-            // actually attend to.
-            let pages_before = paged
-                .cache
-                .page_table
-                .get_sequence(paged.seq)
-                .map_or(0, <[_]>::len);
-            apply_paged_sliding_window(
-                paged.cache,
-                paged.seq,
-                self.decoder.sliding_window(),
-                self.decoder.sink_tokens(),
-            )?;
-            let pages_after = paged
-                .cache
-                .page_table
-                .get_sequence(paged.seq)
-                .map_or(0, <[_]>::len);
-            // Compared rather than inferred from the window size: only an
-            // actual drop makes the sequence non-contiguous, so a windowed
-            // model whose conversation still fits its window keeps publishing.
-            if pages_after < pages_before {
-                paged.windowed = true;
-            }
+        let chunk_size = if self.generated_count == 0 {
+            self.prefill_chunk_size.unwrap_or(input_tokens.len().max(1))
+        } else {
+            input_tokens.len().max(1)
+        };
+        for (chunk_index, chunk) in input_tokens.chunks(chunk_size).enumerate() {
+            self.run_decoder_step(chunk, past_len + chunk_index * chunk_size)?;
         }
         self.decoder.next_token_logits()
     }
