@@ -7052,7 +7052,7 @@ fn celu_mish_and_log_execute_locally_and_match_ort_numerics() {
             let ours_ops = info.ops_on_our_ep();
             let theirs = info.ops_not_on_our_ep();
             assert!(
-                ours_ops.iter().any(|&o| o == op),
+                ours_ops.contains(&op),
                 "{name}: '{op}' must run on this EP, got {:?}",
                 info.assignments
             );
@@ -7084,7 +7084,7 @@ fn celu_mish_and_log_execute_locally_and_match_ort_numerics() {
                         bad.push(format!("  x={:e}: ours={a:e} ort={b:e}", x[i]));
                     }
                     let d = (a - b).abs() / a.abs().max(b.abs()).max(1.0);
-                    if !(d <= worst) {
+                    if d > worst {
                         worst = d;
                         worst_at = i;
                     }
