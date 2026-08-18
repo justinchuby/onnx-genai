@@ -3331,10 +3331,7 @@ mod buffered_reasoning_tests {
         let output =
             " to=self<|message|>weigh it<|eom|><|start|>assistant to=user<|message|>Hi<|eot|>"
                 .to_string();
-        assert_eq!(
-            atem_reasoning_content(&output).as_deref(),
-            Some("weigh it")
-        );
+        assert_eq!(atem_reasoning_content(&output).as_deref(), Some("weigh it"));
         assert_eq!(
             parse_assistant_output(output, "stop").content.as_deref(),
             Some("Hi")

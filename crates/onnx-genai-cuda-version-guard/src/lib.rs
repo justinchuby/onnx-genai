@@ -54,8 +54,12 @@ pub const CUDART_CANDIDATES_MACOS: &[&str] = &["libcudart.dylib"];
 /// first. Windows ships versioned DLLs (`cudart64_13.dll` for CUDA 13.x,
 /// `cudart64_12.dll` for 12.x, older `cudart64_120.dll`); the bare `cudart.dll`
 /// lets the platform loader resolve a name already on the search path.
-pub const CUDART_CANDIDATES_WINDOWS: &[&str] =
-    &["cudart64_13.dll", "cudart64_12.dll", "cudart64_120.dll", "cudart.dll"];
+pub const CUDART_CANDIDATES_WINDOWS: &[&str] = &[
+    "cudart64_13.dll",
+    "cudart64_12.dll",
+    "cudart64_120.dll",
+    "cudart.dll",
+];
 
 /// Canonical CUDA runtime (`cudart`) shared-library candidate names for `os`,
 /// most specific first.

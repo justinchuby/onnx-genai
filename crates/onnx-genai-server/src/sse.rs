@@ -369,7 +369,10 @@ mod reasoning_wire_tests {
     fn a_reasoning_chunk_carries_reasoning_content_and_no_content() {
         let chunk = reasoning_chunk("id", 0, "m", "weighing it".to_string());
         let json = serde_json::to_string(&chunk).expect("serialize");
-        assert!(json.contains("\"reasoning_content\":\"weighing it\""), "{json}");
+        assert!(
+            json.contains("\"reasoning_content\":\"weighing it\""),
+            "{json}"
+        );
         assert!(!json.contains("\"content\""), "{json}");
     }
 

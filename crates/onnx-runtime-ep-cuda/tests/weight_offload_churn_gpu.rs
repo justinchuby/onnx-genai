@@ -297,7 +297,11 @@ fn per_expert_paging_churn_measurement() {
             mib,
             granule_rounded as f64 / (1024.0 * 1024.0),
             granule_rounded / GRANULE,
-            if granule_rounded / GRANULE == 1 { "" } else { "s" },
+            if granule_rounded / GRANULE == 1 {
+                ""
+            } else {
+                "s"
+            },
             if sub_granule {
                 "  [SUB-GRANULE: cannot be mapped individually at VMM granularity]"
             } else {

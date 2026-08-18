@@ -399,8 +399,15 @@ mod tests {
         let mut output = ep.allocate(result_bytes(logits.len(), 1), 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
         ensure_input_coherent(ep, &input, bytes.len());
-        ep.device_argmax(&input, logits.len(), 1, DataType::Float32, &mut output, tie_break)
-            .unwrap();
+        ep.device_argmax(
+            &input,
+            logits.len(),
+            1,
+            DataType::Float32,
+            &mut output,
+            tie_break,
+        )
+        .unwrap();
         let mut result = [0_u8; RESULT_BYTES];
         ep.copy_to_host(&output, &mut result).unwrap();
         let values = [
@@ -415,7 +422,11 @@ mod tests {
     /// Run the argmax over `batch` sequences of `vocab` f32 logits laid out
     /// row-major (`rows.concat()`), returning the `(token_id, capture_error)`
     /// pair per sequence read back from the `2 × batch`-word header.
-    fn run_batch_case(ep: &CudaExecutionProvider, rows: &[Vec<f32>], tie_break: ArgmaxTieBreak) -> Vec<[u32; 2]> {
+    fn run_batch_case(
+        ep: &CudaExecutionProvider,
+        rows: &[Vec<f32>],
+        tie_break: ArgmaxTieBreak,
+    ) -> Vec<[u32; 2]> {
         let batch = rows.len();
         let vocab = rows[0].len();
         assert!(rows.iter().all(|row| row.len() == vocab));
@@ -428,8 +439,15 @@ mod tests {
         let mut output = ep.allocate(result_bytes(vocab, batch), 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
         ensure_input_coherent(ep, &input, bytes.len());
-        ep.device_argmax(&input, vocab, batch, DataType::Float32, &mut output, tie_break)
-            .unwrap();
+        ep.device_argmax(
+            &input,
+            vocab,
+            batch,
+            DataType::Float32,
+            &mut output,
+            tie_break,
+        )
+        .unwrap();
         let mut header = vec![0_u8; batch * RESULT_BYTES];
         ep.copy_to_host(&output, &mut header).unwrap();
         let out = (0..batch)
@@ -446,7 +464,11 @@ mod tests {
         out
     }
 
-    fn run_case_f16(ep: &CudaExecutionProvider, logits: &[f32], tie_break: ArgmaxTieBreak) -> [u32; 2] {
+    fn run_case_f16(
+        ep: &CudaExecutionProvider,
+        logits: &[f32],
+        tie_break: ArgmaxTieBreak,
+    ) -> [u32; 2] {
         let bytes = logits
             .iter()
             .flat_map(|&value| half::f16::from_f32(value).to_bits().to_ne_bytes())
@@ -455,8 +477,15 @@ mod tests {
         let mut output = ep.allocate(result_bytes(logits.len(), 1), 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
         ensure_input_coherent(ep, &input, bytes.len());
-        ep.device_argmax(&input, logits.len(), 1, DataType::Float16, &mut output, tie_break)
-            .unwrap();
+        ep.device_argmax(
+            &input,
+            logits.len(),
+            1,
+            DataType::Float16,
+            &mut output,
+            tie_break,
+        )
+        .unwrap();
         let mut result = [0_u8; RESULT_BYTES];
         ep.copy_to_host(&output, &mut result).unwrap();
         let values = [
@@ -471,7 +500,11 @@ mod tests {
     /// Batched f16 sibling of [`run_batch_case`]: rounds every row to fp16, runs
     /// the whole `batch` in one launch, and reads back the per-row header. Used
     /// by the tie-break gate to exercise the f16 partials kernel over M rows.
-    fn run_batch_case_f16(ep: &CudaExecutionProvider, rows: &[Vec<f32>], tie_break: ArgmaxTieBreak) -> Vec<[u32; 2]> {
+    fn run_batch_case_f16(
+        ep: &CudaExecutionProvider,
+        rows: &[Vec<f32>],
+        tie_break: ArgmaxTieBreak,
+    ) -> Vec<[u32; 2]> {
         let batch = rows.len();
         let vocab = rows[0].len();
         assert!(rows.iter().all(|row| row.len() == vocab));
@@ -484,8 +517,15 @@ mod tests {
         let mut output = ep.allocate(result_bytes(vocab, batch), 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
         ensure_input_coherent(ep, &input, bytes.len());
-        ep.device_argmax(&input, vocab, batch, DataType::Float16, &mut output, tie_break)
-            .unwrap();
+        ep.device_argmax(
+            &input,
+            vocab,
+            batch,
+            DataType::Float16,
+            &mut output,
+            tie_break,
+        )
+        .unwrap();
         let mut header = vec![0_u8; batch * RESULT_BYTES];
         ep.copy_to_host(&output, &mut header).unwrap();
         let out = (0..batch)
@@ -894,7 +934,10 @@ mod tests {
                     "M={m} row {row}: f32 HighestIndex device argmax {} != host highest {want_hi}",
                     hi_f32[row][0]
                 );
-                assert_eq!(hi_f32[row][1], 0, "M={m} row {row}: unexpected capture-error");
+                assert_eq!(
+                    hi_f32[row][1], 0,
+                    "M={m} row {row}: unexpected capture-error"
+                );
                 assert_eq!(
                     hi_f16[row][0], want_hi,
                     "M={m} row {row}: f16 HighestIndex device argmax {} != host highest {want_hi}",
@@ -941,6 +984,10 @@ mod tests {
         assert_eq!(low_f16[0], lo as u32, "f16 lowest tie-break");
         assert_eq!(high_f16[0], hi as u32, "f16 highest tie-break");
         assert_eq!(host_argmax(&logits), lo as u32, "host lowest reference");
-        assert_eq!(host_argmax_highest(&logits), hi as u32, "host highest reference");
+        assert_eq!(
+            host_argmax_highest(&logits),
+            hi as u32,
+            "host highest reference"
+        );
     }
 }

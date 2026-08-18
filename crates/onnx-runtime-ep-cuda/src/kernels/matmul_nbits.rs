@@ -7041,10 +7041,7 @@ impl MatMulNBitsKernel {
             // sync-free, so the batch decode graph captures and replays it.
             // Streaming: the resident weight is read M times from VRAM, not
             // re-streamed, so the weight-offload HtoD 1/N amortization is intact.
-            if m <= decode_gemv_loop_max_m()
-                && !self.gate_up_swiglu
-                && !self.decomposed_silu
-            {
+            if m <= decode_gemv_loop_max_m() && !self.gate_up_swiglu && !self.decomposed_silu {
                 onnx_runtime_ep_api::record_kernel_variant!(
                     "gemv_f16_batched_loop",
                     "M={} small-batch decode: {} single-row decode GEMV launches (one per row), \
@@ -7054,8 +7051,8 @@ impl MatMulNBitsKernel {
                     m
                 );
                 self.last_call_capture_safe.store(true, Ordering::Relaxed);
-                let per_token_bias = bias
-                    .filter(|b| b.numel() == m * self.n && m * self.n != self.n);
+                let per_token_bias =
+                    bias.filter(|b| b.numel() == m * self.n && m * self.n != self.n);
                 let a_base = inputs[0].data_ptr::<u8>();
                 let y_base = outputs[0].data_ptr_mut::<u8>();
                 let bias_base = per_token_bias.map(|b| b.data_ptr::<u8>());
@@ -7328,7 +7325,14 @@ impl MatMulNBitsKernel {
                     zero_points.is_some()
                 );
                 return self.launch_int8_f16_gemv_rmsnorm(
-                    a_row, packed, scales, zero_points, gamma, bias, y_row, k_blocks,
+                    a_row,
+                    packed,
+                    scales,
+                    zero_points,
+                    gamma,
+                    bias,
+                    y_row,
+                    k_blocks,
                 );
             }
             onnx_runtime_ep_api::record_kernel_variant!(
@@ -7338,7 +7342,14 @@ impl MatMulNBitsKernel {
                 zero_points.is_some()
             );
             return self.launch_int8_f16_gemv(
-                a_row, packed, scales, scales_fp16, zero_points, bias, y_row, k_blocks,
+                a_row,
+                packed,
+                scales,
+                scales_fp16,
+                zero_points,
+                bias,
+                y_row,
+                k_blocks,
             );
         }
         if self.rmsnorm_prologue {
@@ -7359,12 +7370,28 @@ impl MatMulNBitsKernel {
                 zero_points.is_some()
             );
             return self.launch_f16_gemv_rmsnorm(
-                a_row, packed, scales, zero_points, gamma, bias, y_row, k_blocks, blob_size,
+                a_row,
+                packed,
+                scales,
+                zero_points,
+                gamma,
+                bias,
+                y_row,
+                k_blocks,
+                blob_size,
                 zp_row_bytes,
             );
         }
         self.launch_f16_gemv(
-            a_row, packed, scales, scales_fp16, zero_points, bias, y_row, k_blocks, blob_size,
+            a_row,
+            packed,
+            scales,
+            scales_fp16,
+            zero_points,
+            bias,
+            y_row,
+            k_blocks,
+            blob_size,
             zp_row_bytes,
         )
     }
@@ -12920,14 +12947,20 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             .require_nvrtc_half_headers("matmul_nbits_gemv_f16")
             .is_err()
         {
-            eprintln!("skipping looped decode GEMV byte-identity test: fp16 NVRTC headers unavailable");
+            eprintln!(
+                "skipping looped decode GEMV byte-identity test: fp16 NVRTC headers unavailable"
+            );
             return;
         }
 
         // Qwen2.5-0.5B-ish block-32 shapes: square attention proj and the wide
         // MLP (K<N general GEMV, K>N tall-skinny GEMV). m=4 sits inside the
         // default loop window (max_m=8).
-        for (k, n) in [(896usize, 896usize), (896usize, 4864usize), (4864usize, 896usize)] {
+        for (k, n) in [
+            (896usize, 896usize),
+            (896usize, 4864usize),
+            (4864usize, 896usize),
+        ] {
             let m = 4usize;
             let block_size = 32usize;
             let k_blocks = k / block_size;
@@ -12974,7 +13007,9 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             let ref_out_dev = runtime.alloc_raw(n * 2).unwrap();
             // SAFETY: device buffers were sized to hold each source slice.
             unsafe {
-                runtime.htod(as_bytes(&activation_f16), activation_dev).unwrap();
+                runtime
+                    .htod(as_bytes(&activation_f16), activation_dev)
+                    .unwrap();
                 runtime.htod(&packed, packed_dev).unwrap();
                 runtime.htod(as_bytes(&scale_f16), scales_dev).unwrap();
             }
@@ -13054,7 +13089,9 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             let mut loop_out = vec![f16::ZERO; m * n];
             // SAFETY: `loop_out_dev` holds `m * n` fp16 values.
             unsafe {
-                runtime.dtoh(as_bytes_mut(&mut loop_out), loop_out_dev).unwrap();
+                runtime
+                    .dtoh(as_bytes_mut(&mut loop_out), loop_out_dev)
+                    .unwrap();
             }
 
             // Reference: run each row alone as an independent M==1 GEMV over the
@@ -13109,7 +13146,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
             assert_eq!(
-                mismatches, 0,
+                mismatches,
+                0,
                 "looped batch-{m} decode GEMV diverged from per-row single-stream decode at \
                  K={k} N={n}: {mismatches}/{} fp16 outputs differ",
                 m * n
