@@ -1815,9 +1815,10 @@ mod avx2 {
     /// the output — tail included — is computed identically.
     ///
     /// The `target_feature` is load-bearing, not decoration. LLVM will not
-    /// inline a callee whose feature set is a superset of its caller's, so
-    /// without `avx2,fma` here the `kernel` closures — which are all
-    /// `avx2,fma` — cannot be inlined into this loop. Today that is masked:
+    /// inline a callee that requires a feature its caller lacks — a *strict*
+    /// superset; equal feature sets inline fine, which is the whole point of
+    /// putting `avx2,fma` back here. Without it the `kernel` closures — which
+    /// are all `avx2,fma` — cannot be inlined into this loop. Today that is masked:
     /// every caller is itself `avx2,fma`, so `map_ps` gets inlined *upwards*
     /// into the caller first and the closure folds in afterwards. That is a
     /// property of the current inlining decision, not a guarantee. Grow this
