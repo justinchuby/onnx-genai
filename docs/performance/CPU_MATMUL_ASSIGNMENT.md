@@ -188,6 +188,17 @@ Ranges **outside** the measured region — `K * N < 2^20`, symbolic/dynamic weig
 dtypes other than f32/f16 — are simply unmeasured. They are claimed like everything else; the note
 is only that no row above characterises them.
 
+> **The `MatMul` f32 `M = 1` rows above predate the decode GEMV becoming the default and were taken
+> with a build that had it compiled in.** Measured through an ORT session on the *shipped* default
+> build, the same range was **5.63** at one thread, not 1.00, because the M=1 GEMV was behind a
+> default-off env toggle — see [section 4](#4-the-decode-f32-gemv-was-written-but-never-shipped-fixed),
+> which fixes it and re-measures the range end to end.
+>
+> The `QLinearMatMul` rows are likewise measured on a **`--features mlas` research build**. In the
+> default native build the integer path is the widened-`i32` scalar loop, which measures **11.8x
+> (M=1) / 12.0x (M=128)** against ORT at `1x2048x2048`, one thread. Section 3's "fixed" applies to
+> the MLAS route only; a native QGEMM is open work.
+
 ## Root causes
 
 ### 1. Parallel efficiency, not kernel quality — f32 dense and int4 `MatMulNBits`
@@ -407,6 +418,59 @@ Two things are deliberately left open:
    32 multiply-accumulates per pair of instructions with `vpmaddubsw`, which *saturates*, and this
    kernel reaches 32 per four with `vpmaddwd`, which does not. Closing it means giving up exact
    integer arithmetic, and this EP does not trade determinism for throughput.
+
+### 4. The decode f32 GEMV was written but never shipped (**fixed**)
+
+#1091 added a native `M = 1` SGEMV to the built-in `SimdX86` backend — the same mechanism MLAS uses
+(`SgemmKernelM1Avx`): stream B in place, no packed panel, because at one output row every byte of B
+is read exactly once and a packed copy is reused zero times. It landed behind
+`ONNX_GENAI_CPU_MM_SIMD_M1_GEMV`, **default off**, "until the win is measured". Nothing measured it,
+so every shipped decode `MatMul` kept paying the packed GEBP path: a full `K * N` read-and-write copy
+of B for no reuse, driven by a `6x16` microkernel with five of its six rows idle.
+
+It is measured now, and the route is the default. There is no env probe on the dispatch any more.
+
+**Kernel level**, `bench_f32_gemm_ab`, one rayon thread, `taskset -c 8-15`, min-of-5, Qwen2.5-14B f32
+shapes. The `M = 128` rows are the harness's built-in control: the `M = 1` route cannot reach them,
+so they measure this run's noise and must stay at ~1.00.
+
+| shape (M x K x N) | packed (shipped) | GEMV (new default) | packed / GEMV |
+|---|---:|---:|---:|
+| 1 x 5120 x 7168 (QKV) | 31.889 ms | 5.051 ms | **6.31x** |
+| 1 x 5120 x 5120 (o_proj) | 20.517 ms | 3.328 ms | **6.17x** |
+| 1 x 5120 x 13824 (gate/up) | 68.102 ms | 8.911 ms | **7.64x** |
+| 1 x 13824 x 5120 (down) | 65.828 ms | 10.169 ms | **6.47x** |
+| 1 x 5120 x 152064 (lm_head) | 734.203 ms | 95.901 ms | **7.66x** |
+| CTL 128 x 5120 x 5120 | 108.535 ms | 111.192 ms | 0.98x |
+| CTL 128 x 5120 x 13824 | 292.547 ms | 291.881 ms | 1.00x |
+| CTL 128 x 13824 x 5120 | 257.195 ms | 261.052 ms | 0.99x |
+
+The packed arm runs at 2.1-2.6 GF/s against the GEMV's 13.9-16.2 GF/s, which is the `6x16`
+microkernel doing one row of useful work in six plus the pack traffic.
+
+**Session level**, through an ORT session on both sides (`plugin_path_ab_vs_plain_ort`,
+`bench_matmul_f32_*`, `1x2048x2048`, 31 interleaved iterations, both pools pinned to the same
+count). Convention as everywhere else here: **ours/ORT, lower is better**. `M = 128` is again the
+control.
+
+| threads | M | p50 before | p50 after | p90 before | p90 after |
+|---|---|---:|---:|---:|---:|
+| 1 | 1 | 5.63 | **1.11** | 5.71 | **1.12** |
+| 1 | 128 (CTL) | 1.05 | 1.02 | 1.05 | 1.02 |
+| 4 | 1 | 5.33 | **2.25** | 4.90 | **2.35** |
+| 4 | 128 (CTL) | 1.58 | 1.55 | 1.57 | 1.58 |
+
+At 8 and 16 threads the control moved by 8.4x and 1.4x between the two arms on this shared host, so
+**no conclusion is drawn from those runs** — that is the control doing its job, not a result. What
+is left after this fix is the thread-scaling gap of
+[section 1](#1-parallel-efficiency-not-kernel-quality--f32-dense-and-int4-matmulnbits): one thread is
+now 1.11, four threads is 2.25.
+
+The two routes differ only in summation reassociation — the same products, summed in a different
+order — so this changes f32 results at `M = 1` within the tolerance
+`m1_route_matches_packed_within_tolerance` pins. Each route is itself deterministic: the GEMV's
+column strips are disjoint and its K-unroll order is fixed, so the same input gives the same bits on
+every run and at every thread count.
 
 ## Precision
 

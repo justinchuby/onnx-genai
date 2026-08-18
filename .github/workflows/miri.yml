@@ -113,6 +113,15 @@ jobs:
           # onnx-runtime-ep-cpu has OS affinity and Rayon-heavy tests that are not
           # Miri-tractable. Cover the pure unsafe allocator, copy, dtype, and
           # strided-view surfaces directly instead of claiming full-crate coverage.
+          #
+          # The task runtime is the exception worth paying for: it is a lock-free
+          # pool whose safety argument is a claim protocol over four atomics, and
+          # Miri is the only tool here that checks that argument rather than the
+          # code's behaviour on one machine. It needs isolation off because
+          # `core_topology` reads sysfs, and it is slow (~5 min) because it runs
+          # real threads under Stacked Borrows.
+          run_miri "onnx-runtime-ep-cpu task runtime" \
+            env MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib task_runtime::
           run_miri "onnx-runtime-ep-cpu strided" \
             cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib strided::tests
           run_miri "onnx-runtime-ep-cpu provider" \

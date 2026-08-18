@@ -82,8 +82,15 @@ const MIN_PARALLEL_SOFTMAX_ELEMENTS: usize = 16 * 1024;
 /// operator is worth vectorising at all: the scalar form costs one `f32::exp`
 /// libm call per element. With `mlas` this hands each row to `MlasComputeSoftmax`
 /// — the *same* primitive ONNX Runtime's own `Softmax` and attention kernels
-/// use, which finds the row max, evaluates `exp` through a polynomial on 8
-/// lanes at a time and normalizes, in one pass over the row.
+/// use, which finds the row max, evaluates `exp` and normalizes in one pass
+/// over the row.
+///
+/// The `exp` is only vectorised when the optional `mlas` feature is on, which
+/// it is **not** by default. The shipping build evaluates `f32::exp` one
+/// element at a time, and that is worth about 9x against ORT on a standalone
+/// `Softmax`. Fixing it is tracked separately; this comment previously claimed
+/// an 8-lane polynomial unconditionally, which was only ever true of the MLAS
+/// arm.
 ///
 /// Rows are independent, so the outer loop fans out across the shared Rayon
 /// pool once the tensor is large enough to pay for it. ORT parallelizes the
@@ -148,12 +155,9 @@ pub(crate) fn scale_mask_softmax_rows(
     debug_assert_eq!(data.len(), outer * d);
     match parallel_rows_per_task(outer, d) {
         Some(rows_per_task) => {
-            use rayon::prelude::*;
-            data.par_chunks_mut(rows_per_task * d)
-                .enumerate()
-                .for_each(|(chunk, rows)| {
-                    scale_mask_softmax_serial(rows, chunk * rows_per_task, d, scale, mask);
-                });
+            crate::task_runtime::chunks_mut(data, rows_per_task * d, 1, |chunk, rows| {
+                scale_mask_softmax_serial(rows, chunk * rows_per_task, d, scale, mask);
+            });
         }
         None => scale_mask_softmax_serial(data, 0, d, scale, mask),
     }
@@ -247,30 +251,43 @@ pub(crate) fn softmax_rows(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
         return;
     }
     if let Some(rows_per_task) = parallel_rows_per_task(n, d) {
-        use rayon::prelude::*;
         let block = rows_per_task * d;
-        dst.par_chunks_mut(block)
-            .zip(src.par_chunks(block))
-            .for_each(|(out, inp)| {
-                softmax_rows_serial_out(inp, out, out.len() / d, d);
-            });
+        // One `compute_softmax` per task's whole run, not one per chunk: MLAS
+        // re-pays its prologue on every call, and the runtime deliberately
+        // hands out several chunks per task for balance.
+        crate::task_runtime::chunk_runs_mut(dst, block, 1, |first, out| {
+            let start = first * block;
+            softmax_rows_serial_out(&src[start..start + out.len()], out, out.len() / d, d);
+        });
     } else {
         softmax_rows_serial_out(src, dst, n, d);
     }
 }
 
-/// `Some(rows_per_task)` when a fan-out is worth it, `None` to stay serial.
+/// `Some(rows_per_chunk)` when a fan-out is worth it, `None` to stay serial.
+///
+/// The chunk is one [`ROW_TILE_BYTES`] row tile, *not* `n / workers`. Sizing the
+/// chunk from the pool width assigns each worker exactly one static share, so
+/// the whole fan-out waits for whichever share was unlucky -- a descheduled
+/// thread, an SMT sibling, a cold row. The task runtime claims chunks
+/// dynamically, so handing it many small chunks lets a fast thread absorb a slow
+/// one's remainder, and the runtime still caps the task count so the extra
+/// chunks cost nothing when the machine is idle.
+///
+/// One tile is the floor because the serial worker already tiles at that size
+/// to keep a run of rows in a core's private cache between the scale/mask write
+/// and the softmax's two reads; a chunk smaller than a tile could not fill that
+/// pipeline, and would call MLAS more often for less work each time.
 fn parallel_rows_per_task(n: usize, d: usize) -> Option<usize> {
     if n < MIN_PARALLEL_SOFTMAX_ROWS || n.saturating_mul(d) < MIN_PARALLEL_SOFTMAX_ELEMENTS {
         return None;
     }
-    let workers = rayon::current_num_threads().max(1);
-    if workers < 2 {
+    if crate::task_runtime::width() < 2 {
         return None;
     }
-    // Whole rows per task, so each chunk is a valid `n' × d` sub-matrix and
+    // Whole rows per chunk, so each chunk is a valid `n' × d` sub-matrix and
     // MLAS is invoked once per chunk rather than once per row.
-    Some(n.div_ceil(workers).max(1))
+    Some((ROW_TILE_BYTES / (d.max(1) * size_of::<f32>())).clamp(1, n))
 }
 
 #[cfg(feature = "mlas")]
@@ -289,55 +306,302 @@ fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
 
 /// Portable fallback with the same semantics: subtract the row max, `exp`,
 /// normalize. Kept exact against the MLAS path by the parity tests below.
+///
+/// The scalar `f32::exp` this used to call was one libm invocation per element
+/// and was the entire gap against ORT's vectorised CPU softmax (9-11x on the
+/// attention shapes). Both the in-place and the out-of-place forms now route
+/// every row through the *one* [`softmax_row_core`] routine, which evaluates
+/// `exp` eight lanes at a time on AVX2+FMA (with a scalar fallback). Sharing a
+/// single core is also what keeps the two forms bit-identical - see
+/// `out_of_place_softmax_is_bit_identical_on_pathological_rows`.
 #[cfg(not(feature = "mlas"))]
 fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
     for row in data.chunks_mut(d) {
-        let mut max = f32::NEG_INFINITY;
-        for &v in row.iter() {
-            if v > max {
-                max = v;
-            }
-        }
-        let mut sum = 0.0f32;
-        for v in row.iter_mut() {
-            let e = (*v - max).exp();
-            *v = e;
-            sum += e;
-        }
-        let inv = 1.0 / sum;
-        for v in row.iter_mut() {
-            *v *= inv;
-        }
+        let ptr = row.as_mut_ptr();
+        // SAFETY: `row` is exactly `d` elements, so `ptr` is valid for `d` f32
+        // reads and writes. This is the in-place case (`src == dst`), which
+        // `softmax_row_core` supports because it loads each block from the
+        // source before storing the corresponding destination block, so no
+        // lane is ever read back after it is written.
+        unsafe { softmax_row_core(ptr as *const f32, ptr, d) };
     }
     let _ = n;
 }
 
 /// Portable out-of-place counterpart of [`softmax_rows_serial`]: read `src`,
 /// write `dst`, no copy. Bit-identical to `dst.copy_from_slice(src)` followed by
-/// the in-place form - it performs exactly the same max/`exp`/normalize
-/// operations in the same order, reading each `src` element in place of the
-/// copied `dst` element it would otherwise have read.
+/// the in-place form because it calls the *same* [`softmax_row_core`] per row,
+/// reading each `src` element in place of the copied `dst` element it would
+/// otherwise have read.
 #[cfg(not(feature = "mlas"))]
 fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
     for (srow, drow) in src.chunks(d).zip(dst.chunks_mut(d)) {
-        let mut max = f32::NEG_INFINITY;
-        for &v in srow.iter() {
-            if v > max {
-                max = v;
-            }
-        }
-        let mut sum = 0.0f32;
-        for (dv, &sv) in drow.iter_mut().zip(srow.iter()) {
-            let e = (sv - max).exp();
-            *dv = e;
-            sum += e;
-        }
-        let inv = 1.0 / sum;
-        for dv in drow.iter_mut() {
-            *dv *= inv;
-        }
+        debug_assert_eq!(srow.len(), d);
+        debug_assert_eq!(drow.len(), d);
+        // SAFETY: `srow` and `drow` are each exactly `d` elements. `softmax_rows`
+        // documents `src`/`dst` as disjoint, so these do not overlap; the core
+        // reads `d` floats from the first pointer and writes `d` to the second.
+        unsafe { softmax_row_core(srow.as_ptr(), drow.as_mut_ptr(), d) };
     }
     let _ = n;
+}
+
+/// The single row reducer shared by the in-place and out-of-place non-MLAS
+/// softmax paths: find the row max, write `exp(src - max)` into `dst`, and
+/// normalize by the row sum. Reading from `src` and writing to `dst` through
+/// one routine is what makes those two paths bit-identical (including on the
+/// non-finite rows the parity tests pin), because the max/`exp`/normalize
+/// arithmetic is literally the same instructions in both.
+///
+/// On x86 with AVX2+FMA it evaluates `exp` eight lanes at a time; elsewhere,
+/// and on the sub-8 tail of every row, it uses the scalar libm `exp`.
+///
+/// # Safety
+/// `src` must be valid for `d` f32 reads and `dst` for `d` f32 writes. The two
+/// regions must be either identical (`src == dst`, the in-place case) or fully
+/// disjoint - never partially overlapping - because the AVX2 kernel loads a
+/// whole 8-lane block from `src` before storing the matching block to `dst`.
+#[cfg(not(feature = "mlas"))]
+#[inline]
+unsafe fn softmax_row_core(src: *const f32, dst: *mut f32, d: usize) {
+    if d == 0 {
+        return;
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if softmax_avx2::available() {
+            // SAFETY: the branch proves the running CPU has AVX2+FMA, and the
+            // caller's contract on `src`/`dst`/`d` is forwarded unchanged.
+            unsafe { softmax_avx2::softmax_row(src, dst, d) };
+            return;
+        }
+    }
+    // SAFETY: same pointer/length contract; the scalar path performs the
+    // identical reads and writes without any SIMD.
+    unsafe { softmax_row_scalar(src, dst, d) };
+}
+
+/// Scalar reference reducer: one libm `exp` per element. This is the fallback
+/// for non-x86 targets, for x86 without AVX2+FMA, and (in the AVX2 kernel) for
+/// the tail of a row whose length is not a multiple of 8.
+///
+/// # Safety
+/// Same contract as [`softmax_row_core`].
+#[cfg(not(feature = "mlas"))]
+unsafe fn softmax_row_scalar(src: *const f32, dst: *mut f32, d: usize) {
+    let mut max = f32::NEG_INFINITY;
+    for i in 0..d {
+        // SAFETY: `i < d` and `src` is valid for `d` reads.
+        let v = unsafe { *src.add(i) };
+        if v > max {
+            max = v;
+        }
+    }
+    let mut sum = 0.0f32;
+    for i in 0..d {
+        // SAFETY: `i < d`; `src`/`dst` are valid for `d` reads/writes and the
+        // `src` lane is read before the `dst` lane is written, so an exact
+        // in-place alias is fine.
+        let e = (unsafe { *src.add(i) } - max).exp();
+        unsafe { *dst.add(i) = e };
+        sum += e;
+    }
+    let inv = 1.0 / sum;
+    for i in 0..d {
+        // SAFETY: `i < d` and `dst` is valid for `d` writes.
+        unsafe { *dst.add(i) *= inv };
+    }
+}
+
+/// AVX2+FMA row softmax: the same max / `exp(x - max)` / normalize the scalar
+/// path performs, but with `exp` evaluated on eight f32 lanes at once.
+///
+/// The polynomial is Cephes' single-precision `expf` (range-reduce
+/// `x = k·ln2 + r`, a degree-6 minimax on `r`, then scale by `2^k`), which is
+/// accurate to ~1 ULP - comfortably inside the `1e-6` softmax tolerance the
+/// tests assert against libm. Because softmax only ever evaluates `exp(v - max)`
+/// with `v - max <= 0`, the reduced argument never overflows; the non-finite
+/// lanes (`-inf` -> `0`, `NaN` -> `NaN`) are patched explicitly so a fully
+/// masked row still normalizes to `NaN` and a partially masked row's masked
+/// positions are exactly `0`, matching the scalar reference bit for bit through
+/// the shared normalization.
+#[cfg(all(
+    not(feature = "mlas"),
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+mod softmax_avx2 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    /// Runtime detection: both AVX2 (256-bit integer/float ops for the `2^k`
+    /// exponent build) and FMA (the polynomial's fused multiply-adds).
+    #[inline]
+    pub fn available() -> bool {
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+    }
+
+    /// `exp` on eight lanes for the softmax domain (`x <= 0`, plus `-inf`/`NaN`).
+    ///
+    /// # Safety
+    /// The caller must run on a CPU with AVX2+FMA (guaranteed by [`available`]).
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    #[allow(clippy::excessive_precision)]
+    unsafe fn exp8(x: __m256) -> __m256 {
+        let log2e = _mm256_set1_ps(core::f32::consts::LOG2_E);
+        // ln2 split into a high part that is exact in f32 and a low
+        // correction (Cody-Waite), so `x - k*ln2` keeps its low bits.
+        let ln2_hi = _mm256_set1_ps(0.693_359_375_f32);
+        let ln2_lo = _mm256_set1_ps(-2.121_944_40e-4_f32);
+        let one = _mm256_set1_ps(1.0);
+
+        // Cephes `expf` polynomial coefficients for `exp(r)` on
+        // `|r| <= ln2/2`.
+        let c0 = _mm256_set1_ps(1.987_569_15e-4_f32);
+        let c1 = _mm256_set1_ps(1.398_199_95e-3_f32);
+        let c2 = _mm256_set1_ps(8.333_451_9e-3_f32);
+        let c3 = _mm256_set1_ps(4.166_579_6e-2_f32);
+        let c4 = _mm256_set1_ps(1.666_666_5e-1_f32);
+        let c5 = _mm256_set1_ps(5.000_000_1e-1_f32);
+
+        // Below this, f32 `exp` has underflowed to (sub)normals we flush to
+        // 0; `-inf` lands here too and must become exactly 0.
+        let underflow = _mm256_set1_ps(-87.336_544_f32);
+
+        let is_nan = _mm256_cmp_ps::<_CMP_UNORD_Q>(x, x);
+        // Ordered `<=` so `NaN` reports false here (it is handled above).
+        let is_zero = _mm256_cmp_ps::<_CMP_LE_OQ>(x, underflow);
+
+        // Clamp so `-inf`/`NaN` cannot poison the exponent build; those
+        // lanes are overwritten below.
+        let xc = _mm256_max_ps(x, underflow);
+
+        // k = round(x * log2e); r = x - k*ln2 (two-part).
+        let k = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(
+            _mm256_mul_ps(xc, log2e),
+        );
+        let r = _mm256_fnmadd_ps(k, ln2_hi, xc);
+        let r = _mm256_fnmadd_ps(k, ln2_lo, r);
+
+        // Horner: exp(r) = ((((((c0*r+c1)*r+c2)*r+c3)*r+c4)*r+c5)*r^2 + r + 1.
+        let mut p = _mm256_fmadd_ps(c0, r, c1);
+        p = _mm256_fmadd_ps(p, r, c2);
+        p = _mm256_fmadd_ps(p, r, c3);
+        p = _mm256_fmadd_ps(p, r, c4);
+        p = _mm256_fmadd_ps(p, r, c5);
+        let r2 = _mm256_mul_ps(r, r);
+        p = _mm256_fmadd_ps(p, r2, r);
+        p = _mm256_add_ps(p, one);
+
+        // 2^k by constructing the IEEE-754 exponent: (k + 127) << 23.
+        let ki = _mm256_cvtps_epi32(k);
+        let biased = _mm256_add_epi32(ki, _mm256_set1_epi32(127));
+        let pow2 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(biased));
+        let mut y = _mm256_mul_ps(p, pow2);
+
+        // Underflow / -inf -> exactly 0 (andnot zeroes the masked lanes).
+        y = _mm256_andnot_ps(is_zero, y);
+        // NaN input -> NaN output, so a poisoned row sum stays NaN.
+        y = _mm256_blendv_ps(y, _mm256_set1_ps(f32::NAN), is_nan);
+        y
+    }
+
+    /// Horizontal maximum of the eight lanes.
+    ///
+    /// # Safety
+    /// AVX must be available (implied by AVX2 on the calling path).
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn hmax(v: __m256) -> f32 {
+        let hi = _mm256_extractf128_ps::<1>(v);
+        let lo = _mm256_castps256_ps128(v);
+        let m = _mm_max_ps(lo, hi);
+        let m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+        let m = _mm_max_ss(m, _mm_shuffle_ps::<0x55>(m, m));
+        _mm_cvtss_f32(m)
+    }
+
+    /// Horizontal sum of the eight lanes (NaN-propagating).
+    ///
+    /// # Safety
+    /// AVX must be available (implied by AVX2 on the calling path).
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn hsum(v: __m256) -> f32 {
+        let hi = _mm256_extractf128_ps::<1>(v);
+        let lo = _mm256_castps256_ps128(v);
+        let s = _mm_add_ps(lo, hi);
+        let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        let s = _mm_add_ss(s, _mm_shuffle_ps::<0x55>(s, s));
+        _mm_cvtss_f32(s)
+    }
+
+    /// One row: max, then `exp(src - max)` into `dst`, then normalize.
+    ///
+    /// # Safety
+    /// AVX2+FMA must be available. `src` is valid for `d` f32 reads and `dst`
+    /// for `d` f32 writes; the two regions are identical or disjoint. Every
+    /// 8-lane block is loaded from `src` before the matching block is stored to
+    /// `dst`, so an exact in-place alias is sound.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn softmax_row(src: *const f32, dst: *mut f32, d: usize) {
+        unsafe {
+            // Pass 1: row maximum. Feeding `v` as the first `max_ps` operand
+            // makes a `NaN` lane return the running accumulator, so `NaN`
+            // inputs are ignored exactly as `if v > max` ignores them.
+            let mut vmax = _mm256_set1_ps(f32::NEG_INFINITY);
+            let mut i = 0usize;
+            while i + 8 <= d {
+                let v = _mm256_loadu_ps(src.add(i));
+                vmax = _mm256_max_ps(v, vmax);
+                i += 8;
+            }
+            let mut max = hmax(vmax);
+            while i < d {
+                let v = *src.add(i);
+                if v > max {
+                    max = v;
+                }
+                i += 1;
+            }
+
+            // Pass 2: exp(v - max) into `dst`, accumulating the row sum. A NaN
+            // lane propagates into the sum, so a poisoned row normalizes to NaN.
+            let vmaxb = _mm256_set1_ps(max);
+            let mut vsum = _mm256_setzero_ps();
+            i = 0;
+            while i + 8 <= d {
+                let v = _mm256_loadu_ps(src.add(i));
+                let e = exp8(_mm256_sub_ps(v, vmaxb));
+                _mm256_storeu_ps(dst.add(i), e);
+                vsum = _mm256_add_ps(vsum, e);
+                i += 8;
+            }
+            let mut sum = hsum(vsum);
+            while i < d {
+                let e = (*src.add(i) - max).exp();
+                *dst.add(i) = e;
+                sum += e;
+                i += 1;
+            }
+
+            // Pass 3: normalize by the reciprocal row sum.
+            let inv = 1.0f32 / sum;
+            let vinv = _mm256_set1_ps(inv);
+            i = 0;
+            while i + 8 <= d {
+                let v = _mm256_loadu_ps(dst.add(i));
+                _mm256_storeu_ps(dst.add(i), _mm256_mul_ps(v, vinv));
+                i += 8;
+            }
+            while i < d {
+                *dst.add(i) *= inv;
+                i += 1;
+            }
+        }
+    }
 }
 
 /// Softmax `n` independent contiguous rows of `axis_dim` elements each over the
@@ -776,47 +1040,72 @@ mod vectorized_tests {
     /// quieting, diverging from the reference on 126 of 65536 patterns - and the
     /// tolerance-based tests above would not catch its analogue here, so this
     /// compares raw bits.
+    ///
+    /// Not Miri-tractable, for two independent reasons, both measured rather
+    /// than assumed. Miri reports `is_x86_feature_detected!("avx2") == false`,
+    /// so it only ever runs the scalar fallback and cannot validate the AVX2
+    /// kernel this test exists to police. And Miri deliberately returns a
+    /// nondeterministic approximation for libm calls - two evaluations of
+    /// `(-0.5f32).exp()` in one Miri process gave `0x3f1b4595` and
+    /// `0x3f1b4599` - plus a nondeterministic NaN sign/payload per operation,
+    /// so *any* bit-identity assertion over `exp` fails there by construction,
+    /// with a seed-dependent lane. Hardware `exp` and hardware NaN propagation
+    /// are both deterministic, which is why this holds off Miri.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: no AVX2, and nondeterministic libm/NaN results")]
     fn out_of_place_softmax_is_bit_identical_on_pathological_rows() {
-        const D: usize = 8;
+        // 8 is a whole vector body with no tail; 11 is a vector body plus a
+        // 3-lane scalar tail; 6 is a pure tail with no vector body at all.
+        // The tail widths matter: a NaN in a vectorized lane is forced to a
+        // canonical NaN by the mask, while a NaN in a tail lane is whatever
+        // libm returns, so a future change that stopped both forms sharing one
+        // core would diverge on exactly these rows and nowhere else.
+        for d in [8usize, 11, 6] {
+            check_pathological_rows_bit_identical(d);
+        }
+    }
+
+    fn check_pathological_rows_bit_identical(d: usize) {
+        assert!(d >= 6, "the row patterns below index up to lane 5");
+        let big = d - 1;
         let rows: Vec<Vec<f32>> = vec![
             // Fully masked: sum of exponentials is 0, so normalization is 0/0.
-            vec![f32::NEG_INFINITY; D],
+            vec![f32::NEG_INFINITY; d],
             // Row max is +inf, so exp(inf - inf) is NaN.
             {
-                let mut r = vec![1.0f32; D];
+                let mut r = vec![1.0f32; d];
                 r[3] = f32::INFINITY;
                 r
             },
             // Both infinities in one row.
             {
-                let mut r = vec![0.5f32; D];
+                let mut r = vec![0.5f32; d];
                 r[0] = f32::INFINITY;
-                r[D - 1] = f32::NEG_INFINITY;
+                r[big] = f32::NEG_INFINITY;
                 r
             },
             // Quiet NaN.
             {
-                let mut r = vec![2.0f32; D];
+                let mut r = vec![2.0f32; d];
                 r[2] = f32::NAN;
                 r
             },
             // Signalling NaN: the pattern class that broke the bf16 widen.
             {
-                let mut r = vec![-1.0f32; D];
+                let mut r = vec![-1.0f32; d];
                 r[5] = f32::from_bits(0x7f80_0001);
                 r
             },
             // Negative-payload NaN.
             {
-                let mut r = vec![3.0f32; D];
+                let mut r = vec![3.0f32; d];
                 r[1] = f32::from_bits(0xffc0_0003);
                 r
             },
             // Denormals.
-            (0..D).map(|i| f32::from_bits(1 + i as u32)).collect(),
+            (0..d).map(|i| f32::from_bits(1 + i as u32)).collect(),
             // Ordinary finite logits, as a control.
-            (0..D).map(|i| i as f32 * 0.25 - 1.0).collect(),
+            (0..d).map(|i| i as f32 * 0.25 - 1.0).collect(),
         ];
         let n = rows.len();
         let src: Vec<f32> = rows.concat();
@@ -824,18 +1113,18 @@ mod vectorized_tests {
         // The form this kernel replaced: copy the whole tensor, then reduce in
         // place over the copy.
         let mut expect = src.clone();
-        softmax_rows_in_place(&mut expect, n, D);
+        softmax_rows_in_place(&mut expect, n, d);
 
-        let mut got = vec![0.0f32; n * D];
-        softmax_rows(&src, &mut got, n, D);
+        let mut got = vec![0.0f32; n * d];
+        softmax_rows(&src, &mut got, n, d);
 
         for (i, (g, e)) in got.iter().zip(&expect).enumerate() {
             assert_eq!(
                 g.to_bits(),
                 e.to_bits(),
-                "row {} lane {}: out-of-place {:#010x} != copy+in-place {:#010x}",
-                i / D,
-                i % D,
+                "d={d} row {} lane {}: out-of-place {:#010x} != copy+in-place {:#010x}",
+                i / d,
+                i % d,
                 g.to_bits(),
                 e.to_bits()
             );
@@ -846,12 +1135,12 @@ mod vectorized_tests {
         // Without this, a change that quietly made every row finite would leave
         // the bit comparison trivially true.
         assert!(
-            expect[..D].iter().all(|v| v.is_nan()),
-            "the fully masked row stopped producing NaN; this test no longer covers it"
+            expect[..d].iter().all(|v| v.is_nan()),
+            "d={d}: the fully masked row stopped producing NaN; this test no longer covers it"
         );
         assert!(
-            expect.iter().filter(|v| v.is_nan()).count() >= 5 * D,
-            "the pathological rows stopped producing NaN; the bit comparison is now vacuous"
+            expect.iter().filter(|v| v.is_nan()).count() >= 5 * d,
+            "d={d}: the pathological rows stopped producing NaN; the bit comparison is now vacuous"
         );
     }
 

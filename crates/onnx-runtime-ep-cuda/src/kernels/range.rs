@@ -49,6 +49,15 @@ extern "C" __global__ void range_i64(
        index < elements; index += (unsigned long long)gridDim.x * blockDim.x)
     output[index] = (long long)(start_value + index * delta_value);
 }
+extern "C" __global__ void range_i32(
+    const int* start, const int* delta, int* output,
+    unsigned long long elements) {
+  const unsigned int start_value = (unsigned int)*start;
+  const unsigned int delta_value = (unsigned int)*delta;
+  for (unsigned long long index = blockIdx.x * blockDim.x + threadIdx.x;
+       index < elements; index += (unsigned long long)gridDim.x * blockDim.x)
+    output[index] = (int)(start_value + (unsigned int)index * delta_value);
+}
 "#;
 
 pub struct RangeFactory {
@@ -140,7 +149,11 @@ impl Kernel for RangeKernel {
         let dtype = inputs[0].dtype;
         if !matches!(
             dtype,
-            DataType::Float32 | DataType::Float16 | DataType::BFloat16 | DataType::Int64
+            DataType::Float32
+                | DataType::Float16
+                | DataType::BFloat16
+                | DataType::Int32
+                | DataType::Int64
         ) {
             return Err(not_implemented(format!("Range for dtype {dtype:?}")));
         }
@@ -175,6 +188,11 @@ impl Kernel for RangeKernel {
                 i64::from_ne_bytes(values[1][..8].try_into().unwrap()),
                 i64::from_ne_bytes(values[2][..8].try_into().unwrap()),
             )?,
+            DataType::Int32 => int_count(
+                i32::from_ne_bytes(values[0][..4].try_into().unwrap()).into(),
+                i32::from_ne_bytes(values[1][..4].try_into().unwrap()).into(),
+                i32::from_ne_bytes(values[2][..4].try_into().unwrap()).into(),
+            )?,
             _ => unreachable!(),
         };
         if outputs[0].numel() != expected {
@@ -191,9 +209,12 @@ impl Kernel for RangeKernel {
             DataType::Float16 => "range_f16",
             DataType::BFloat16 => "range_bf16",
             DataType::Int64 => "range_i64",
+            DataType::Int32 => "range_i32",
             _ => unreachable!(),
         };
-        let function = self.runtime.nvrtc_function("range", SOURCE, entry)?;
+        let function = self
+            .runtime
+            .nvrtc_function("range_typed_v2", SOURCE, entry)?;
         let start_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let delta_ptr = cuptr(inputs[2].data_ptr::<u8>() as *const c_void);
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
@@ -217,5 +238,96 @@ impl Kernel for RangeKernel {
         }
         .map_err(|error| driver_err("launch Range", error))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod claim_probes {
+    use std::ffi::c_void;
+    use std::sync::Arc;
+
+    use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, Kernel, TensorMut, TensorView};
+    use onnx_runtime_ir::{DataType, DeviceId};
+
+    use super::RangeKernel;
+    use crate::runtime::CudaRuntime;
+
+    fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rt = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
+            .ok()
+            .flatten();
+        std::panic::set_hook(previous);
+        rt
+    }
+
+    #[test]
+    fn i32_range_matches_reference_on_gpu() {
+        let Some(runtime) = maybe_runtime() else {
+            eprintln!("skipping i32 Range GPU probe: CUDA runtime unavailable");
+            return;
+        };
+        let start = [2i32];
+        let limit = [14i32];
+        let delta = [3i32];
+        let expected = [2i32, 5, 8, 11];
+
+        let scalar_bytes = std::mem::size_of::<i32>();
+        let start_dev = runtime.alloc_raw(scalar_bytes).unwrap();
+        let limit_dev = runtime.alloc_raw(scalar_bytes).unwrap();
+        let delta_dev = runtime.alloc_raw(scalar_bytes).unwrap();
+        let out_dev = runtime.alloc_raw(scalar_bytes * expected.len()).unwrap();
+        let as_bytes = |v: &[i32]| unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+        unsafe {
+            runtime.htod(as_bytes(&start), start_dev).unwrap();
+            runtime.htod(as_bytes(&limit), limit_dev).unwrap();
+            runtime.htod(as_bytes(&delta), delta_dev).unwrap();
+        }
+        let device = DeviceId::cuda(0);
+        let scalar_shape = [1usize];
+        let scalar_strides = [1i64];
+        let mk = |ptr: u64| {
+            TensorView::new(
+                DevicePtr(ptr as usize as *const c_void),
+                DataType::Int32,
+                &scalar_shape,
+                &scalar_strides,
+                device,
+            )
+        };
+        let inputs = [mk(start_dev), mk(limit_dev), mk(delta_dev)];
+        let out_shape = [expected.len()];
+        let out_strides = [1i64];
+        let mut outputs = [TensorMut::new(
+            DevicePtrMut(out_dev as usize as *mut c_void),
+            DataType::Int32,
+            &out_shape,
+            &out_strides,
+            device,
+        )];
+        RangeKernel {
+            runtime: runtime.clone(),
+        }
+        .execute(&inputs, &mut outputs)
+        .unwrap();
+        runtime.synchronize().unwrap();
+        let mut out = vec![0i32; expected.len()];
+        let out_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                out.as_mut_ptr().cast::<u8>(),
+                scalar_bytes * expected.len(),
+            )
+        };
+        unsafe { runtime.dtoh(out_bytes, out_dev).unwrap() };
+        unsafe {
+            runtime.free_raw(start_dev).unwrap();
+            runtime.free_raw(limit_dev).unwrap();
+            runtime.free_raw(delta_dev).unwrap();
+            runtime.free_raw(out_dev).unwrap();
+        }
+        assert_eq!(out, expected, "i32 Range diverged on GPU");
     }
 }

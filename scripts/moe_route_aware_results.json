@@ -1,0 +1,308 @@
+{
+ "model": "granite-3.0-1b-a400m-instruct (f16 dense Mobius)",
+ "num_requests": 192,
+ "expert_mib": 16.0,
+ "solo_bytes_per_token_mib": 3072.0,
+ "results": {
+  "W2_Q2_fifo": {
+   "W": 2,
+   "Q": 2,
+   "route_aware": false,
+   "union_per_token": 158.97916666666666,
+   "bytes_per_token_mib_16": 2543.6666666666665,
+   "delay_p50": 0,
+   "delay_p99": 0,
+   "delay_max": 0
+  },
+  "W2_Q2_route_aware": {
+   "W": 2,
+   "Q": 2,
+   "route_aware": true,
+   "union_per_token": 158.97916666666666,
+   "bytes_per_token_mib_16": 2543.6666666666665,
+   "delay_p50": 0,
+   "delay_p99": 0,
+   "delay_max": 0
+  },
+  "W2_Q4_fifo": {
+   "W": 2,
+   "Q": 4,
+   "route_aware": false,
+   "union_per_token": 158.97916666666666,
+   "bytes_per_token_mib_16": 2543.6666666666665,
+   "delay_p50": 0,
+   "delay_p99": 0,
+   "delay_max": 0
+  },
+  "W2_Q4_route_aware": {
+   "W": 2,
+   "Q": 4,
+   "route_aware": true,
+   "union_per_token": 141.59895833333334,
+   "bytes_per_token_mib_16": 2265.5833333333335,
+   "delay_p50": 0,
+   "delay_p99": 2,
+   "delay_max": 2
+  },
+  "W2_Q8_fifo": {
+   "W": 2,
+   "Q": 8,
+   "route_aware": false,
+   "union_per_token": 158.97916666666666,
+   "bytes_per_token_mib_16": 2543.6666666666665,
+   "delay_p50": 0,
+   "delay_p99": 0,
+   "delay_max": 0
+  },
+  "W2_Q8_route_aware": {
+   "W": 2,
+   "Q": 8,
+   "route_aware": true,
+   "union_per_token": 132.46354166666666,
+   "bytes_per_token_mib_16": 2119.4166666666665,
+   "delay_p50": 1,
+   "delay_p99": 5,
+   "delay_max": 6
+  },
+  "W2_Q16_fifo": {
+   "W": 2,
+   "Q": 16,
+   "route_aware": false,
+   "union_per_token": 158.97916666666666,
+   "bytes_per_token_mib_16": 2543.6666666666665,
+   "delay_p50": 0,
+   "delay_p99": 0,
+   "delay_max": 0
+  },
+  "W2_Q16_route_aware": {
+   "W": 2,
+   "Q": 16,
+   "route_aware": true,
+   "union_per_token": 127.984375,
+   "bytes_per_token_mib_16": 2047.75,
+   "delay_p50": 2,
+   "delay_p99": 8,
+   "delay_max": 8
+  },
+  "W2_Q192_fifo": {
+   "W": 2,
+   "Q": 192,
+   "route_aware": false,
+   "union_per_token": 158.97916666666666,
+   "bytes_per_token_mib_16": 2543.6666666666665,
+   "delay_p50": 0,
+   "delay_p99": 0,
+   "delay_max": 0
+  },
+  "W2_Q192_route_aware": {
+   "W": 2,
+   "Q": 192,
+   "route_aware": true,
+   "union_per_token": 116.75,
+   "bytes_per_token_mib_16": 1868.0,
+   "delay_p50": 14,
+   "delay_p99": 35,
+   "delay_max": 36
+  },
+  "W4_Q4_fifo": {
+   "W": 4,
+   "Q": 4,
+   "route_aware": false,
+   "union_per_token": 117.83333333333333,
+   "bytes_per_token_mib_16": 1885.3333333333333,
+   "delay_p50": 0,
+   "delay_p99": 0,
+   "delay_max": 0
+  },
+  "W4_Q4_route_aware": {
+   "W": 4,
+   "Q": 4,
+   "route_aware": true,
+   "union_per_token": 117.83333333333333,
+   "bytes_per_token_mib_16": 1885.3333333333333,
+   "delay_p50": 0,
+   "delay_p99": 2,
+   "delay_max": 2
+  },
+  "W4_Q8_fifo": {
+   "W": 4,
+   "Q": 8,
+   "route_aware": false,
+   "union_per_token": 117.83333333333333,
+   "bytes_per_token_mib_16": 1885.3333333333333,
+   "delay_p50": 0,
+   "delay_p99": 0,
+   "delay_max": 0
+  },
+  "W4_Q8_route_aware": {
+   "W": 4,
+   "Q": 8,
+   "route_aware": true,
+   "union_per_token": 96.86979166666667,
+   "bytes_per_token_mib_16": 1549.9166666666667,
+   "delay_p50": 0,
+   "delay_p99": 7,
+   "delay_max": 8
+  },
+  "W4_Q16_fifo": {
+   "W": 4,
+   "Q": 16,
+   "route_aware": false,
+   "union_per_token": 117.83333333333333,
+   "bytes_per_token_mib_16": 1885.3333333333333,
+   "delay_p50": 0,
+   "delay_p99": 0,
+   "delay_max": 0
+  },
+  "W4_Q16_route_aware": {
+   "W": 4,
+   "Q": 16,
+   "route_aware": true,
+   "union_per_token": 85.38020833333333,
+   "bytes_per_token_mib_16": 1366.0833333333333,
+   "delay_p50": 1,
+   "delay_p99": 14,
+   "delay_max": 15
+  },
+  "W4_Q32_fifo": {
+   "W": 4,
+   "Q": 32,
+   "route_aware": false,
+   "union_per_token": 117.83333333333333,
+   "bytes_per_token_mib_16": 1885.3333333333333,
+   "delay_p50": 0,
+   "delay_p99": 0,
+   "delay_max": 0
+  },
+  "W4_Q32_route_aware": {
+   "W": 4,
+   "Q": 32,
+   "route_aware": true,
+   "union_per_token": 80.265625,
+   "bytes_per_token_mib_16": 1284.25,
+   "delay_p50": 2,
+   "delay_p99": 25,
+   "delay_max": 31
+  },
+  "W4_Q192_fifo": {
+   "W": 4,
+   "Q": 192,
+   "route_aware": false,
+   "union_per_token": 117.83333333333333,
+   "bytes_per_token_mib_16": 1885.3333333333333,
+   "delay_p50": 0,
+   "delay_p99": 0,
+   "delay_max": 0
+  },
+  "W4_Q192_route_aware": {
+   "W": 4,
+   "Q": 192,
+   "route_aware": true,
+   "union_per_token": 72.51041666666667,
+   "bytes_per_token_mib_16": 1160.1666666666667,
+   "delay_p50": 13,
+   "delay_p99": 74,
+   "delay_max": 76
+  },
+  "W8_Q8_fifo": {
+   "W": 8,
+   "Q": 8,
+   "route_aware": false,
+   "union_per_token": 75.49479166666667,
+   "bytes_per_token_mib_16": 1207.9166666666667,
+   "delay_p50": 0,
+   "delay_p99": 0,
+   "delay_max": 0
+  },
+  "W8_Q8_route_aware": {
+   "W": 8,
+   "Q": 8,
+   "route_aware": true,
+   "union_per_token": 75.49479166666667,
+   "bytes_per_token_mib_16": 1207.9166666666667,
+   "delay_p50": 0,
+   "delay_p99": 6,
+   "delay_max": 6
+  },
+  "W8_Q16_fifo": {
+   "W": 8,
+   "Q": 16,
+   "route_aware": false,
+   "union_per_token": 75.49479166666667,
+   "bytes_per_token_mib_16": 1207.9166666666667,
+   "delay_p50": 0,
+   "delay_p99": 0,
+   "delay_max": 0
+  },
+  "W8_Q16_route_aware": {
+   "W": 8,
+   "Q": 16,
+   "route_aware": true,
+   "union_per_token": 58.609375,
+   "bytes_per_token_mib_16": 937.75,
+   "delay_p50": -2,
+   "delay_p99": 21,
+   "delay_max": 25
+  },
+  "W8_Q32_fifo": {
+   "W": 8,
+   "Q": 32,
+   "route_aware": false,
+   "union_per_token": 75.49479166666667,
+   "bytes_per_token_mib_16": 1207.9166666666667,
+   "delay_p50": 0,
+   "delay_p99": 0,
+   "delay_max": 0
+  },
+  "W8_Q32_route_aware": {
+   "W": 8,
+   "Q": 32,
+   "route_aware": true,
+   "union_per_token": 52.901041666666664,
+   "bytes_per_token_mib_16": 846.4166666666666,
+   "delay_p50": -1,
+   "delay_p99": 37,
+   "delay_max": 41
+  },
+  "W8_Q64_fifo": {
+   "W": 8,
+   "Q": 64,
+   "route_aware": false,
+   "union_per_token": 75.49479166666667,
+   "bytes_per_token_mib_16": 1207.9166666666667,
+   "delay_p50": 0,
+   "delay_p99": 0,
+   "delay_max": 0
+  },
+  "W8_Q64_route_aware": {
+   "W": 8,
+   "Q": 64,
+   "route_aware": true,
+   "union_per_token": 49.354166666666664,
+   "bytes_per_token_mib_16": 789.6666666666666,
+   "delay_p50": -1,
+   "delay_p99": 62,
+   "delay_max": 69
+  },
+  "W8_Q192_fifo": {
+   "W": 8,
+   "Q": 192,
+   "route_aware": false,
+   "union_per_token": 75.49479166666667,
+   "bytes_per_token_mib_16": 1207.9166666666667,
+   "delay_p50": 0,
+   "delay_p99": 0,
+   "delay_max": 0
+  },
+  "W8_Q192_route_aware": {
+   "W": 8,
+   "Q": 192,
+   "route_aware": true,
+   "union_per_token": 46.239583333333336,
+   "bytes_per_token_mib_16": 739.8333333333334,
+   "delay_p50": 10,
+   "delay_p99": 102,
+   "delay_max": 106
+  }
+ }
+}

@@ -2,7 +2,8 @@
 
 use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GeneratePrompt, GenerateRequest,
-    NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS, NativeDecodeDevice, SpeculativeMode,
+    NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS, NativeDecodeDevice, RewindTokenCount,
+    SpeculativeMode,
 };
 use onnx_genai_ort::{SessionOptions, ep_selection};
 use std::path::Path;
@@ -513,6 +514,53 @@ fn native_session_switching_matches_cold_start() -> anyhow::Result<()> {
 }
 
 /// Native sessions use the unified session API and allow multiple logical sessions.
+/// A valid explicit rewind through the shared `session_state` policy truncates
+/// the native session's logical length. This drives the same shared bound check
+/// that the ORT `failed_rewind_of_*` tests reach, so inverting the check in
+/// `session_state::rewind_to` turns *both* backends red — the proof that the two
+/// arms genuinely share one policy rather than two look-alike copies.
+#[test]
+fn native_session_rewind_by_truncates_logical_length() -> anyhow::Result<()> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
+    let mut engine = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )?;
+
+    let session = engine.create_session()?;
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0u32, 0, 0]));
+    request.options.max_new_tokens = 2;
+    request.options.temperature = 0.0;
+    request.options.stop_on_eos = false;
+    engine.generate_in_session(session, request)?;
+
+    let before = engine.session_token_count(session)?;
+    assert!(
+        before >= 2,
+        "expected at least two logical tokens before rewind, got {before}"
+    );
+
+    let new_position = engine.rewind_session_by(session, RewindTokenCount::new(2))?;
+    assert_eq!(new_position.get(), before - 2);
+    assert_eq!(engine.session_token_count(session)?, before - 2);
+
+    // Rewinding past the start is rejected by the same shared bound check.
+    let error = engine
+        .rewind_session_by(session, RewindTokenCount::new(before))
+        .expect_err("rewinding past the start must fail");
+    assert!(
+        error.to_string().contains("cannot rewind session"),
+        "unexpected error: {error:#}"
+    );
+
+    engine.close_session(session)?;
+    Ok(())
+}
+
 #[test]
 fn native_session_creation_uses_unified_multi_session_api() -> anyhow::Result<()> {
     let fixture =

@@ -605,6 +605,22 @@ impl Stats {
     }
 }
 
+/// Which CPU-kernel arm this binary was built with.
+///
+/// Printed on every result line because the distinction is not cosmetic: `mlas`
+/// is not a default feature of `onnx-runtime-ep-cpu`, so an MLAS-linked build
+/// does not measure what ships. This binary used to *require* the `mlas`
+/// feature, which meant every ratio ever published from it came from the
+/// research arm while being read as a production number. Labelling the arm in
+/// the output makes that impossible to do again by accident.
+fn build_arm() -> &'static str {
+    if cfg!(feature = "mlas") {
+        "mlas-reference"
+    } else {
+        "native"
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.runs == 0 {
@@ -783,12 +799,13 @@ fn main() -> Result<()> {
         println!(
             "result: native={:.3} ms ({:.2} infer/s) native_p90={:.3} ms native_min={:.3} ms \
              native_spread={:.2} native_threads={native_threads} ort=skipped native-only=true \
-             parity={}",
+             arm={} parity={}",
             native.p50,
             1_000.0 / native.p50,
             native.p90,
             native.min,
             native.spread(),
+            build_arm(),
             if parity_pass { "PASS" } else { "FAIL" }
         );
         if args.phase_profile {
@@ -801,7 +818,7 @@ fn main() -> Result<()> {
         "result: native={:.3} ms ({:.2} infer/s) ort={:.3} ms ({:.2} infer/s) \
          native/ort={:.3} native_p90={:.3} ort_p90={:.3} native_min={:.3} ort_min={:.3} \
          native_spread={:.2} ort_spread={:.2} native_threads={native_threads} \
-         ort_intra_threads={ort_intra_threads} parity={}",
+         ort_intra_threads={ort_intra_threads} arm={} parity={}",
         native.p50,
         1_000.0 / native.p50,
         ort.p50,
@@ -813,6 +830,7 @@ fn main() -> Result<()> {
         ort.min,
         native.spread(),
         ort.spread(),
+        build_arm(),
         if parity_pass { "PASS" } else { "FAIL" }
     );
     if args.phase_profile {

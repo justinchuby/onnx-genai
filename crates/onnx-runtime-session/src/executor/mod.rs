@@ -171,8 +171,12 @@ mod phase_profile {
 
     /// Holds the planner on for one test and clears it on drop, so a leaked
     /// gate cannot be observed by a later test that does not take the lock.
+    ///
+    /// The field is never read on purpose: it is the [`globals_lock`] guard,
+    /// and holding it is the whole point.  `dead_code` cannot see that a
+    /// `MutexGuard`'s value is its `Drop`, so it has to be told.
     #[cfg(test)]
-    pub(super) struct ActivationPlanForTest(std::sync::MutexGuard<'static, ()>);
+    pub(super) struct ActivationPlanForTest(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 
     #[cfg(test)]
     impl ActivationPlanForTest {
