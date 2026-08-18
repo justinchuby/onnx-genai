@@ -1499,7 +1499,10 @@ mod claim_probes {
         runtime.synchronize().unwrap();
         let mut out = vec![0i32; 2];
         let out_bytes = unsafe {
-            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), std::mem::size_of::<i32>() * 2)
+            std::slice::from_raw_parts_mut(
+                out.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of::<i32>() * 2,
+            )
         };
         unsafe { runtime.dtoh(out_bytes, out_dev).unwrap() };
         unsafe {
@@ -1540,7 +1543,10 @@ mod claim_probes {
         runtime.synchronize().unwrap();
         let mut out = vec![0i64; 2];
         let out_bytes = unsafe {
-            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), std::mem::size_of::<i64>() * 2)
+            std::slice::from_raw_parts_mut(
+                out.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of::<i64>() * 2,
+            )
         };
         unsafe { runtime.dtoh(out_bytes, out_dev).unwrap() };
         unsafe {
@@ -1557,13 +1563,37 @@ mod claim_probes {
             return;
         };
         let data32 = [1i32, 5, 3, 9, 2, 4];
-        assert_eq!(run_i32(&runtime, ReduceOp::Sum, &data32), vec![9, 15], "i32 ReduceSum");
-        assert_eq!(run_i32(&runtime, ReduceOp::Max, &data32), vec![5, 9], "i32 ReduceMax");
-        assert_eq!(run_i32(&runtime, ReduceOp::Min, &data32), vec![1, 2], "i32 ReduceMin");
+        assert_eq!(
+            run_i32(&runtime, ReduceOp::Sum, &data32),
+            vec![9, 15],
+            "i32 ReduceSum"
+        );
+        assert_eq!(
+            run_i32(&runtime, ReduceOp::Max, &data32),
+            vec![5, 9],
+            "i32 ReduceMax"
+        );
+        assert_eq!(
+            run_i32(&runtime, ReduceOp::Min, &data32),
+            vec![1, 2],
+            "i32 ReduceMin"
+        );
 
         let data64 = [-1i64, 50, 3, 90, -2, 4];
-        assert_eq!(run_i64(&runtime, ReduceOp::Sum, &data64), vec![52, 92], "i64 ReduceSum");
-        assert_eq!(run_i64(&runtime, ReduceOp::Max, &data64), vec![50, 90], "i64 ReduceMax");
-        assert_eq!(run_i64(&runtime, ReduceOp::Min, &data64), vec![-1, -2], "i64 ReduceMin");
+        assert_eq!(
+            run_i64(&runtime, ReduceOp::Sum, &data64),
+            vec![52, 92],
+            "i64 ReduceSum"
+        );
+        assert_eq!(
+            run_i64(&runtime, ReduceOp::Max, &data64),
+            vec![50, 90],
+            "i64 ReduceMax"
+        );
+        assert_eq!(
+            run_i64(&runtime, ReduceOp::Min, &data64),
+            vec![-1, -2],
+            "i64 ReduceMin"
+        );
     }
 }
