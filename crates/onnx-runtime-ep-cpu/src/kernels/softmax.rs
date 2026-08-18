@@ -232,10 +232,11 @@ fn scale_mask_softmax_serial(
 ///
 /// `dst` is written straight from `src` in a single traversal - the row max,
 /// `exp(row - max)` and the normalization all read `src` and write `dst`, so no
-/// element of `src` is ever copied into `dst` first. Removing that copy halves
-/// the single-thread memory traffic of a standalone `Softmax`: ORT never pays it
-/// because it hands `MlasComputeSoftmax` the graph input and output buffers
-/// directly, and this path now does the same. The result is bit-identical to a
+/// element of `src` is ever copied into `dst` first. That copy was a whole extra
+/// read+write pass over the tensor - 66 MiB of traffic per inference on a 33 MiB
+/// prefill logit block - and it bought nothing: ORT never pays it because it
+/// hands `MlasComputeSoftmax` the graph input and output buffers directly, and
+/// this path now does the same. The result is bit-identical to a
 /// `copy(src -> dst)` followed by the in-place reducer - the existing
 /// `the_parallel_fan_out_is_bit_identical_to_the_serial_path` test asserts that
 /// equality on both the MLAS and the pure-Rust builds.
@@ -762,6 +763,98 @@ mod vectorized_tests {
             }
         }
     }
+    /// The out-of-place form must be *bit*-identical to the copy-then-in-place
+    /// form it replaced, not merely close, and the interesting inputs are the
+    /// ones a tolerance-based check cannot see, because the in-place reducer is
+    /// vectorised and this path is not, so their `exp` implementations have to
+    /// agree on the non-finite lanes bit for bit: a fully masked row, where the
+    /// row max is `-inf` and `exp(-inf - -inf)` is `exp(NaN)`, so a NaN whose
+    /// payload and sign must match propagates through the whole row; a row whose
+    /// max is `+inf`, likewise NaN; and rows carrying quiet, signalling and
+    /// negative-payload NaNs, plus denormals. This repo has already shipped one
+    /// bug of exactly this shape - a bf16 widen that raw-shifted instead of
+    /// quieting, diverging from the reference on 126 of 65536 patterns - and the
+    /// tolerance-based tests above would not catch its analogue here, so this
+    /// compares raw bits.
+    #[test]
+    fn out_of_place_softmax_is_bit_identical_on_pathological_rows() {
+        const D: usize = 8;
+        let rows: Vec<Vec<f32>> = vec![
+            // Fully masked: sum of exponentials is 0, so normalization is 0/0.
+            vec![f32::NEG_INFINITY; D],
+            // Row max is +inf, so exp(inf - inf) is NaN.
+            {
+                let mut r = vec![1.0f32; D];
+                r[3] = f32::INFINITY;
+                r
+            },
+            // Both infinities in one row.
+            {
+                let mut r = vec![0.5f32; D];
+                r[0] = f32::INFINITY;
+                r[D - 1] = f32::NEG_INFINITY;
+                r
+            },
+            // Quiet NaN.
+            {
+                let mut r = vec![2.0f32; D];
+                r[2] = f32::NAN;
+                r
+            },
+            // Signalling NaN: the pattern class that broke the bf16 widen.
+            {
+                let mut r = vec![-1.0f32; D];
+                r[5] = f32::from_bits(0x7f80_0001);
+                r
+            },
+            // Negative-payload NaN.
+            {
+                let mut r = vec![3.0f32; D];
+                r[1] = f32::from_bits(0xffc0_0003);
+                r
+            },
+            // Denormals.
+            (0..D).map(|i| f32::from_bits(1 + i as u32)).collect(),
+            // Ordinary finite logits, as a control.
+            (0..D).map(|i| i as f32 * 0.25 - 1.0).collect(),
+        ];
+        let n = rows.len();
+        let src: Vec<f32> = rows.concat();
+
+        // The form this kernel replaced: copy the whole tensor, then reduce in
+        // place over the copy.
+        let mut expect = src.clone();
+        softmax_rows_in_place(&mut expect, n, D);
+
+        let mut got = vec![0.0f32; n * D];
+        softmax_rows(&src, &mut got, n, D);
+
+        for (i, (g, e)) in got.iter().zip(&expect).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                e.to_bits(),
+                "row {} lane {}: out-of-place {:#010x} != copy+in-place {:#010x}",
+                i / D,
+                i % D,
+                g.to_bits(),
+                e.to_bits()
+            );
+        }
+
+        // Guard against the whole comparison going vacuous: these rows must
+        // actually produce the non-finite results the test claims to pin down.
+        // Without this, a change that quietly made every row finite would leave
+        // the bit comparison trivially true.
+        assert!(
+            expect[..D].iter().all(|v| v.is_nan()),
+            "the fully masked row stopped producing NaN; this test no longer covers it"
+        );
+        assert!(
+            expect.iter().filter(|v| v.is_nan()).count() >= 5 * D,
+            "the pathological rows stopped producing NaN; the bit comparison is now vacuous"
+        );
+    }
+
     #[test]
     fn vectorized_rows_match_the_scalar_reference() {
         for (n, d) in [(1usize, 1usize), (3, 7), (64, 256), (200, 33)] {
