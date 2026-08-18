@@ -333,12 +333,13 @@ pub(crate) async fn chat_completions(
 ) -> Result<Response, ApiError> {
     let handle = resolve_model(&state.registry, &request.model).await?;
     validate_request(&request, &state.config)?;
-    let session_id = session_id_from_headers(&headers)?;
-    if handle.pipeline && session_id.is_some() {
-        return Err(ApiError::bad_request(
-            "X-Session-Id is not supported by pipeline models",
-        ));
-    }
+    let requested_session_id = session_id_from_headers(&headers)?;
+    // OpenAI-compatible clients such as OpenCode attach their own session key
+    // while still resending the complete message history. Pipeline engines
+    // already retain and rewind their one device-resident context internally,
+    // so ignore the transport hint instead of rejecting an otherwise valid
+    // stateless request.
+    let session_id = (!handle.pipeline).then_some(requested_session_id).flatten();
     let image_urls = request.image_urls();
     let input_audio = request.input_audio();
     // One admission policy, shared with the CLI, so both front ends accept and
@@ -381,6 +382,7 @@ async fn run_chat_completion(
         .then_some(request.top_logprobs.unwrap_or(0));
     let tokenizer = handle.tokenizer.clone();
     let placeholder = positional_image_placeholder(&request, &handle);
+    let output_budget = request.output_budget(state.config.max_output_tokens);
     let mut prepared = prepare_generate_request(
         &request,
         &handle.tokenizer,
@@ -388,10 +390,11 @@ async fn run_chat_completion(
         client_session_id.is_some(),
         placeholder.as_deref(),
         handle.generation_defaults.as_ref(),
+        output_budget,
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
     if !input_audio.is_empty() {
-        prepared = prepare_audio_generate_request(&request, &handle.tokenizer)?;
+        prepared = prepare_audio_generate_request(&request, &handle.tokenizer, output_budget)?;
     }
     let pipeline_input = if !image_urls.is_empty() {
         Some(
@@ -408,7 +411,7 @@ async fn run_chat_completion(
                     })?,
                 &mut prepared,
                 handle.model_max_context,
-                request.max_tokens,
+                reserved_output_tokens(&request, state.config.max_output_tokens),
             )
             .await?,
         )
@@ -417,13 +420,15 @@ async fn run_chat_completion(
     } else {
         None
     };
-    enforce_context_cap(
+    let output_budget = admit_output_budget(
+        &request,
         prepared.prompt_tokens,
-        request.max_tokens,
+        output_budget,
         handle.model_max_context,
     )?;
     let prompt_tokens = prepared.prompt_tokens;
     let mut generation_request = prepared.request;
+    generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
     let session_lookup = if let Some(id) = client_session_id.as_deref() {
         Some(get_or_create_session(&handle.engine, &state.sessions, id).await?)
@@ -469,7 +474,11 @@ async fn run_chat_completion(
             let logprobs = chat_logprobs(&result, &tokenizer, requested_top_logprobs)
                 .map_err(|err| ApiError::internal(format!("logprobs conversion failed: {err}")))?;
             let parsed = if tools_parseable_from_output(&request) {
-                parse_assistant_output(result.text, default_finish_reason)
+                parse_assistant_output(
+                    assistant_output_text(&result, &tokenizer),
+                    default_finish_reason,
+                )
+                .aligned_to(&request)
             } else {
                 ParsedAssistantOutput {
                     content: Some(result.text),
@@ -506,6 +515,7 @@ async fn run_chat_completion(
                 content: content.map(ChatMessageContent::Text),
                 tool_calls,
                 tool_call_id: None,
+                name: None,
             },
             finish_reason,
             logprobs,
@@ -541,6 +551,7 @@ async fn stream_chat_completion(
         .map(StopInput::into_texts)
         .unwrap_or_default();
     let placeholder = positional_image_placeholder(&request, &handle);
+    let output_budget = request.output_budget(state.config.max_output_tokens);
     let mut prepared = prepare_generate_request(
         &request,
         &handle.tokenizer,
@@ -548,10 +559,11 @@ async fn stream_chat_completion(
         client_session_id.is_some(),
         placeholder.as_deref(),
         handle.generation_defaults.as_ref(),
+        output_budget,
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
     if !input_audio.is_empty() {
-        prepared = prepare_audio_generate_request(&request, &handle.tokenizer)?;
+        prepared = prepare_audio_generate_request(&request, &handle.tokenizer, output_budget)?;
     }
     let pipeline_input = if !image_urls.is_empty() {
         Some(
@@ -568,7 +580,7 @@ async fn stream_chat_completion(
                     })?,
                 &mut prepared,
                 handle.model_max_context,
-                request.max_tokens,
+                reserved_output_tokens(&request, state.config.max_output_tokens),
             )
             .await?,
         )
@@ -577,13 +589,15 @@ async fn stream_chat_completion(
     } else {
         None
     };
-    enforce_context_cap(
+    let output_budget = admit_output_budget(
+        &request,
         prepared.prompt_tokens,
-        request.max_tokens,
+        output_budget,
         handle.model_max_context,
     )?;
     let wants_constrained_json = request.wants_constrained_json();
     let mut generation_request = prepared.request;
+    generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
     let (tx, rx) = mpsc::channel(16);
     let session_lookup = if let Some(id) = client_session_id.as_deref() {
@@ -612,6 +626,7 @@ async fn stream_chat_completion(
         send_stream_chunk(&tx, role_chunk(&id, created, &model)).await?;
 
         let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.clone());
+        let mut channel_gate = PrivateChannelGate::new(handle.private_channels);
         let mut buffered_text = String::new();
         let buffer_for_tool_detection =
             request.has_tool_context() && tools_parseable_from_output(&request);
@@ -622,7 +637,9 @@ async fn stream_chat_completion(
                         continue;
                     }
                     let finish_reason = token.finish_reason.clone();
-                    let content = stop_buffer.push(&token.text);
+                    let spelled = tokenizer.decode_with_special_tokens(&[token.token_id]).ok();
+                    let visible = channel_gate.push(spelled.as_deref(), &token.text);
+                    let content = stop_buffer.push(&visible);
                     if buffer_for_tool_detection {
                         buffered_text.push_str(&content);
                     } else if !wants_constrained_json && !content.is_empty() {
@@ -646,11 +663,12 @@ async fn stream_chat_completion(
         match result {
             Ok(result) => {
                 if let Some(requested_top_logprobs) = requested_top_logprobs {
-                    let tool_calls = if buffer_for_tool_detection {
-                        parse_tool_calls(&result.text)
+                    let mut tool_calls = if buffer_for_tool_detection {
+                        parse_tool_calls(&assistant_output_text(&result, &tokenizer))
                     } else {
                         Vec::new()
                     };
+                    align_tool_calls(&mut tool_calls, &request);
                     if tool_calls.is_empty() {
                         send_chat_logprob_chunks(
                             &tx,
@@ -659,6 +677,7 @@ async fn stream_chat_completion(
                             &tokenizer,
                             requested_top_logprobs,
                             &user_stop_sequences,
+                            handle.private_channels,
                         )
                         .await?;
                         send_stream_chunk(
@@ -675,38 +694,38 @@ async fn stream_chat_completion(
                         send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
                     }
                 } else if buffer_for_tool_detection {
-                    if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
-                        buffered_text.push_str(&stop_buffer.flush());
-                    }
-                    let tool_calls = parse_tool_calls(&buffered_text);
-                    if tool_calls.is_empty() {
-                        if !buffered_text.is_empty() {
+                    let parsed = parse_assistant_output(
+                        assistant_output_text(&result, &tokenizer),
+                        finish_reason_label(&result.finish_reason),
+                    )
+                    .aligned_to(&request);
+                    if let Some(tool_calls) = parsed.tool_calls {
+                        send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
+                    } else {
+                        let content = parsed.content.unwrap_or_else(|| {
+                            if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
+                                buffered_text.push_str(&stop_buffer.flush());
+                            }
+                            buffered_text
+                        });
+                        if !content.is_empty() {
                             send_stream_chunk(
                                 &tx,
-                                content_chunk(&id, created, &model, buffered_text, None),
+                                content_chunk(&id, created, &model, content, None),
                             )
                             .await?;
                         }
                         send_stream_chunk(
                             &tx,
-                            done_chunk(
-                                &id,
-                                created,
-                                &model,
-                                finish_reason_label(&result.finish_reason),
-                            ),
+                            done_chunk(&id, created, &model, parsed.finish_reason),
                         )
                         .await?;
-                    } else {
-                        send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
                     }
                 } else if wants_constrained_json {
-                    if !result.text.is_empty() {
-                        send_stream_chunk(
-                            &tx,
-                            content_chunk(&id, created, &model, result.text, None),
-                        )
-                        .await?;
+                    let content = visible_assistant_text(&result, &tokenizer);
+                    if !content.is_empty() {
+                        send_stream_chunk(&tx, content_chunk(&id, created, &model, content, None))
+                            .await?;
                     }
                     send_stream_chunk(
                         &tx,
@@ -719,15 +738,16 @@ async fn stream_chat_completion(
                     )
                     .await?;
                 } else {
+                    // The gate's withheld text is ordinary content rather than a
+                    // partial stop sequence, so it is drained either way; only the
+                    // stop buffer's own pending text is dropped on a stop match.
+                    let mut content = stop_buffer.push(&channel_gate.flush());
                     if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
-                        let content = stop_buffer.flush();
-                        if !content.is_empty() {
-                            send_stream_chunk(
-                                &tx,
-                                content_chunk(&id, created, &model, content, None),
-                            )
+                        content.push_str(&stop_buffer.flush());
+                    }
+                    if !content.is_empty() {
+                        send_stream_chunk(&tx, content_chunk(&id, created, &model, content, None))
                             .await?;
-                        }
                     }
                     send_stream_chunk(
                         &tx,
@@ -943,13 +963,14 @@ async fn preprocess_chat_images(
 fn prepare_audio_generate_request(
     request: &ChatCompletionRequest,
     tokenizer: &Tokenizer,
+    output_budget: usize,
 ) -> Result<PreparedGenerateRequest, ApiError> {
     let token_ids = audio_decoder_prompt(tokenizer, None)?;
     let prompt_tokens = token_ids.len();
     Ok(PreparedGenerateRequest {
         request: GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
-            options: build_generate_options_with_tokenizer(request, tokenizer),
+            options: build_generate_options_with_tokenizer(request, tokenizer, output_budget),
         },
         prompt_tokens,
     })
@@ -962,27 +983,21 @@ fn validate_request(
     if request.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
     }
-    if request.max_tokens == 0 {
-        return Err(ApiError::bad_request(
-            "max_tokens must be greater than zero",
-        ));
+    if let Some((field, requested)) = request.requested_output_budget() {
+        if requested == 0 {
+            return Err(ApiError::bad_request(format!(
+                "{field} must be greater than zero"
+            )));
+        }
+        if requested > config.max_output_tokens {
+            return Err(ApiError::bad_request(format!(
+                "{field} must be less than or equal to the server cap of {}",
+                config.max_output_tokens
+            )));
+        }
     }
-    if request.max_tokens > config.max_output_tokens {
-        return Err(ApiError::bad_request(format!(
-            "max_tokens must be less than or equal to the server cap of {}",
-            config.max_output_tokens
-        )));
-    }
-    if !request.temperature.is_finite() || request.temperature < 0.0 {
-        return Err(ApiError::bad_request(
-            "temperature must be finite and non-negative",
-        ));
-    }
-    if !request.top_p.is_finite() || request.top_p < 0.0 {
-        return Err(ApiError::bad_request(
-            "top_p must be finite and non-negative",
-        ));
-    }
+    validate_sampling_range(request.temperature, "temperature")?;
+    validate_sampling_range(request.top_p, "top_p")?;
     if !request.min_p.is_finite() || !(0.0..=1.0).contains(&request.min_p) {
         return Err(ApiError::bad_request(
             "min_p must be finite and between 0 and 1",
@@ -1079,16 +1094,8 @@ fn validate_completion_request(
             config.max_output_tokens
         )));
     }
-    if !request.temperature.is_finite() || request.temperature < 0.0 {
-        return Err(ApiError::bad_request(
-            "temperature must be finite and non-negative",
-        ));
-    }
-    if !request.top_p.is_finite() || request.top_p < 0.0 {
-        return Err(ApiError::bad_request(
-            "top_p must be finite and non-negative",
-        ));
-    }
+    validate_sampling_range(request.temperature, "temperature")?;
+    validate_sampling_range(request.top_p, "top_p")?;
     if !request.min_p.is_finite() || !(0.0..=1.0).contains(&request.min_p) {
         return Err(ApiError::bad_request(
             "min_p must be finite and between 0 and 1",
@@ -1109,6 +1116,49 @@ fn validate_completion_request(
         )));
     }
     Ok(())
+}
+
+/// The response budget this request may actually decode with, once the final
+/// prompt length is known.
+///
+/// A caller that named a budget is told when it does not fit, because quietly
+/// returning less than it asked for answers a question it did not ask. A caller
+/// that named none asked for whatever fits, so its budget shrinks to the
+/// context the prompt left behind rather than turning into a rejection — the
+/// server's cap is a ceiling on generosity, not a reservation the caller made.
+fn admit_output_budget(
+    request: &ChatCompletionRequest,
+    prompt_tokens: usize,
+    budget: usize,
+    model_max_context: Option<usize>,
+) -> Result<usize, ApiError> {
+    if request.requested_output_budget().is_some() {
+        enforce_context_cap(prompt_tokens, budget, model_max_context)?;
+        return Ok(budget);
+    }
+    let Some(model_max_context) = model_max_context else {
+        return Ok(budget);
+    };
+    let remaining = model_max_context
+        .checked_sub(prompt_tokens)
+        .filter(|remaining| *remaining > 0)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "What: request admission exceeded the model context limit. \
+                 Why: final prefill length ({prompt_tokens}) after placeholder expansion leaves no room to decode within {model_max_context}. \
+                 How: shorten the prompt or reduce the image count/expansion size."
+            ))
+        })?;
+    Ok(budget.min(remaining))
+}
+
+/// Tokens the caller explicitly reserved for its response, which is what image
+/// placeholder expansion must leave free. An unnamed budget reserves nothing,
+/// because it yields to whatever the prompt turns out to need.
+fn reserved_output_tokens(request: &ChatCompletionRequest, cap: usize) -> usize {
+    request
+        .requested_output_budget()
+        .map_or(0, |_| request.output_budget(cap))
 }
 
 fn enforce_context_cap(
@@ -1216,10 +1266,12 @@ async fn get_or_create_session(
     Ok(engine_session_id)
 }
 
+/// Builds a generation request without a server in hand, so an unspecified
+/// output budget falls back to the default cap a server would have applied.
 pub fn build_generate_request(request: &ChatCompletionRequest) -> GenerateRequest {
     GenerateRequest {
         prompt: GeneratePrompt::Text(build_prompt(request)),
-        options: build_generate_options(request),
+        options: build_generate_options(request, request.output_budget(DEFAULT_MAX_OUTPUT_TOKENS)),
     }
 }
 
@@ -1313,8 +1365,8 @@ fn tokenize_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<usize, ApiErro
 fn build_completion_options(request: &CompletionRequest, tokenizer: &Tokenizer) -> GenerateOptions {
     let mut options = GenerateOptions {
         max_new_tokens: request.max_tokens,
-        temperature: request.temperature,
-        top_p: request.top_p,
+        temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
+        top_p: request.top_p.unwrap_or(NEUTRAL_SAMPLING),
         min_p: request.min_p,
         frequency_penalty: request.frequency_penalty,
         presence_penalty: request.presence_penalty,
@@ -1336,13 +1388,8 @@ fn build_completion_options(request: &CompletionRequest, tokenizer: &Tokenizer) 
 /// knob the completions schema exposes) is an explicit request to sample.
 /// Otherwise the greedy decision is deferred (`None`) so a model that declares
 /// `do_sample: true` samples instead of looping under forced greedy.
-///
-/// `temperature` and `top_p` are passed as explicit values because the
-/// OpenAI-compatible schema always supplies them (with documented defaults) and
-/// has no "unspecified" state, so the API defaults win over any model-declared
-/// temperature/top_p; only the greedy decision defers to the model.
 fn completion_sampling_overrides(request: &CompletionRequest) -> SamplingOverrides {
-    let greedy = if request.temperature == 0.0 {
+    let greedy = if request.temperature == Some(0.0) {
         Some(true)
     } else if request.min_p > 0.0 {
         Some(false)
@@ -1351,8 +1398,8 @@ fn completion_sampling_overrides(request: &CompletionRequest) -> SamplingOverrid
     };
     SamplingOverrides {
         greedy,
-        temperature: Some(request.temperature),
-        top_p: Some(request.top_p),
+        temperature: request.temperature,
+        top_p: request.top_p,
         top_k: None,
     }
 }
@@ -1398,6 +1445,7 @@ fn prepare_generate_request(
     session: bool,
     image_placeholder: Option<&str>,
     generation_defaults: Option<&GenerationDefaults>,
+    output_budget: usize,
 ) -> anyhow::Result<PreparedGenerateRequest> {
     let prompt = if session && !request.has_tool_context() {
         build_session_prompt(&request.messages, image_placeholder)
@@ -1408,7 +1456,7 @@ fn prepare_generate_request(
         .encode(&prompt)
         .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?;
     let prompt_tokens = token_ids.len();
-    let mut options = build_generate_options_with_tokenizer(request, tokenizer);
+    let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget);
     // Honor the model's declared sampling regime (e.g. a reasoning model that
     // ships do_sample=true); explicit request fields still win.
     options.resolve_sampling_defaults(generation_defaults, &chat_sampling_overrides(request));
@@ -1421,7 +1469,10 @@ fn prepare_generate_request(
     })
 }
 
-fn build_generate_options(request: &ChatCompletionRequest) -> GenerateOptions {
+fn build_generate_options(
+    request: &ChatCompletionRequest,
+    output_budget: usize,
+) -> GenerateOptions {
     // Chat historically used greedy decoding even with its default temperature
     // and top-p fields. Preserve that default while treating the newly exposed
     // stochastic controls as an explicit request to sample.
@@ -1433,9 +1484,9 @@ fn build_generate_options(request: &ChatCompletionRequest) -> GenerateOptions {
         || request.mirostat > 0
         || request.xtc_probability > 0.0;
     let mut options = GenerateOptions {
-        max_new_tokens: request.max_tokens,
-        temperature: request.temperature,
-        top_p: request.top_p,
+        max_new_tokens: output_budget,
+        temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
+        top_p: request.top_p.unwrap_or(NEUTRAL_SAMPLING),
         top_k: request.top_k,
         min_p: request.min_p,
         top_a: request.top_a,
@@ -1443,7 +1494,7 @@ fn build_generate_options(request: &ChatCompletionRequest) -> GenerateOptions {
         repetition_penalty: request.repetition_penalty,
         frequency_penalty: request.frequency_penalty,
         presence_penalty: request.presence_penalty,
-        greedy: request.temperature == 0.0 || !stochastic_sampling_requested,
+        greedy: request.temperature == Some(0.0) || !stochastic_sampling_requested,
         seed: request.seed,
         dry: (request.dry_multiplier > 0.0).then(|| DryConfig {
             multiplier: request.dry_multiplier,
@@ -1507,7 +1558,7 @@ fn chat_sampling_overrides(request: &ChatCompletionRequest) -> SamplingOverrides
         || request.typical_p < 1.0
         || request.mirostat > 0
         || request.xtc_probability > 0.0;
-    let greedy = if request.temperature == 0.0 {
+    let greedy = if request.temperature == Some(0.0) {
         Some(true)
     } else if requests_sampling {
         Some(false)
@@ -1516,9 +1567,34 @@ fn chat_sampling_overrides(request: &ChatCompletionRequest) -> SamplingOverrides
     };
     SamplingOverrides {
         greedy,
-        temperature: Some(request.temperature),
-        top_p: Some(request.top_p),
-        top_k: Some(request.top_k),
+        // An absent field is a caller with no opinion, not a caller choosing
+        // the schema's documented default, so a package that declares its own
+        // temperature or top-p keeps it. An agent client typically sends
+        // neither; overriding both with 1.0 widened every such model to its
+        // full distribution, which is how a long agent turn degenerates.
+        temperature: request.temperature,
+        top_p: request.top_p,
+        // `top_k` is an extension the OpenAI schema never carries, and 0 is its
+        // "disabled" sentinel rather than a caller's choice. Treat an absent
+        // `top_k` as unspecified so a package that declares one keeps it,
+        // instead of every OpenAI client silently widening the model to the
+        // full vocabulary.
+        top_k: (request.top_k > 0).then_some(request.top_k),
+    }
+}
+
+/// Neutral value for a sampling control the caller left unset, used only where
+/// options are built without resolving them against the package's declaration.
+const NEUTRAL_SAMPLING: f32 = 1.0;
+
+/// Reject a sampling control the caller actually sent; an absent one is the
+/// package's business rather than a value to judge.
+fn validate_sampling_range(value: Option<f32>, field: &str) -> Result<(), ApiError> {
+    match value {
+        Some(value) if !value.is_finite() || value < 0.0 => Err(ApiError::bad_request(format!(
+            "{field} must be finite and non-negative"
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -1588,8 +1664,9 @@ fn tool_call_schema_for_tool(tool: &ChatTool) -> serde_json::Value {
 fn build_generate_options_with_tokenizer(
     request: &ChatCompletionRequest,
     tokenizer: &Tokenizer,
+    output_budget: usize,
 ) -> GenerateOptions {
-    let mut options = build_generate_options(request);
+    let mut options = build_generate_options(request, output_budget);
     add_tokenizer_stop_sequences(&mut options, tokenizer);
     options
 }
@@ -1642,6 +1719,58 @@ fn build_session_prompt(messages: &[ChatMessage], image_placeholder: Option<&str
         .unwrap_or_default()
 }
 
+/// Translate one OpenAI chat message into the value a chat template renders.
+///
+/// Tool identity travels with the message because a tool-calling template names
+/// each result from the `name`, or resolves it from the `tool_call_id` against
+/// the assistant call it answers; dropping either renders an unnamed result.
+fn template_message(
+    message: &ChatMessage,
+    image_placeholder: Option<&str>,
+) -> anyhow::Result<TemplateChatMessage> {
+    let mut template_message = TemplateChatMessage::new(
+        message.role.as_str(),
+        message
+            .content
+            .as_ref()
+            .map(|content| content.render(image_placeholder))
+            .unwrap_or_default(),
+    )
+    .with_tool_result(message.name.clone(), message.tool_call_id.clone());
+    if let Some(tool_calls) = &message.tool_calls {
+        template_message = template_message.with_tool_calls(template_tool_calls(tool_calls)?);
+    }
+    Ok(template_message)
+}
+
+/// Assistant tool calls in the shape Hugging Face chat templates expect.
+///
+/// OpenAI carries `function.arguments` as a JSON *string*, while chat templates
+/// index it as a mapping (`args.items()`), and the jinja sandbox cannot parse a
+/// string back into one. So decode the arguments here, where the wire format is
+/// known, and leave anything that is not a JSON object as the original string
+/// rather than guessing at a shape the caller did not send.
+fn template_tool_calls(tool_calls: &[ChatMessageToolCall]) -> anyhow::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(tool_calls)?;
+    for call in value.as_array_mut().into_iter().flatten() {
+        let Some(arguments) = call
+            .pointer("/function/arguments")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let Ok(decoded @ serde_json::Value::Object(_)) =
+            serde_json::from_str::<serde_json::Value>(arguments)
+        else {
+            continue;
+        };
+        if let Some(slot) = call.pointer_mut("/function/arguments") {
+            *slot = decoded;
+        }
+    }
+    Ok(value)
+}
+
 fn render_prompt(
     request: &ChatCompletionRequest,
     chat_template: Option<&ChatTemplate>,
@@ -1651,27 +1780,18 @@ fn render_prompt(
         let messages = request
             .messages
             .iter()
-            .map(|message| {
-                let mut template_message = TemplateChatMessage::new(
-                    message.role.as_str(),
-                    message
-                        .content
-                        .as_ref()
-                        .map(|content| content.render(image_placeholder))
-                        .unwrap_or_default(),
-                );
-                if let Some(tool_calls) = &message.tool_calls {
-                    template_message =
-                        template_message.with_tool_calls(serde_json::to_value(tool_calls)?);
-                }
-                Ok(template_message)
-            })
+            .map(|message| template_message(message, image_placeholder))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let tools_json = tools_offered_to_model(request)
             .map(serde_json::to_string)
             .transpose()?;
         return chat_template
-            .render(&messages, tools_json.as_deref(), true)
+            .render_with_reasoning_effort(
+                &messages,
+                tools_json.as_deref(),
+                true,
+                request.reasoning_effort.map(ReasoningEffort::as_str),
+            )
             .map_err(|err| anyhow::anyhow!("chat template render failed: {err}"));
     }
     Ok(build_prompt(request))
@@ -1729,10 +1849,11 @@ fn tool_choice_prompt(tool_choice: &ToolChoice) -> String {
 }
 
 pub fn parse_tool_calls(output: &str) -> Vec<ChatMessageToolCall> {
-    // Model families do not normally mix formats. When they do, use Qwen,
-    // Llama, then Mistral order so generated call IDs remain deterministic.
-    let parsed_calls = extract_qwen_tool_calls(output)
+    // Model families do not normally mix formats. When they do, use ATEM,
+    // Qwen, Llama, then Mistral order so generated call IDs remain deterministic.
+    let parsed_calls = extract_atem_tool_calls(output)
         .into_iter()
+        .chain(extract_qwen_tool_calls(output))
         .chain(extract_llama_tool_calls(output))
         .chain(extract_mistral_tool_calls(output));
     let mut calls = Vec::new();
@@ -1742,6 +1863,64 @@ pub fn parse_tool_calls(output: &str) -> Vec<ChatMessageToolCall> {
         }
     }
     calls
+}
+
+fn extract_atem_tool_calls(output: &str) -> Vec<serde_json::Value> {
+    const INVOKE: &str = "<atem:invoke";
+    const INVOKE_CLOSE: &str = "</atem:invoke>";
+    const PARAMETER: &str = "<atem:parameter";
+    const PARAMETER_CLOSE: &str = "</atem:parameter>";
+
+    let mut calls = Vec::new();
+    let mut rest = output;
+    while let Some(start) = rest.find(INVOKE) {
+        rest = &rest[start + INVOKE.len()..];
+        let Some(tag_end) = rest.find('>') else {
+            break;
+        };
+        let Some(name) = tag_attribute(&rest[..tag_end], "name") else {
+            rest = &rest[tag_end + 1..];
+            continue;
+        };
+        rest = &rest[tag_end + 1..];
+        let Some(invoke_end) = rest.find(INVOKE_CLOSE) else {
+            break;
+        };
+        let body = &rest[..invoke_end];
+        let mut arguments = serde_json::Map::new();
+        let mut parameters = body;
+        while let Some(parameter_start) = parameters.find(PARAMETER) {
+            parameters = &parameters[parameter_start + PARAMETER.len()..];
+            let Some(parameter_tag_end) = parameters.find('>') else {
+                break;
+            };
+            let Some(key) = tag_attribute(&parameters[..parameter_tag_end], "name") else {
+                parameters = &parameters[parameter_tag_end + 1..];
+                continue;
+            };
+            parameters = &parameters[parameter_tag_end + 1..];
+            let Some(parameter_end) = parameters.find(PARAMETER_CLOSE) else {
+                break;
+            };
+            let raw_value = &parameters[..parameter_end];
+            let value = serde_json::from_str(raw_value.trim())
+                .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()));
+            arguments.insert(key, value);
+            parameters = &parameters[parameter_end + PARAMETER_CLOSE.len()..];
+        }
+        calls.push(serde_json::json!({
+            "name": name,
+            "arguments": arguments,
+        }));
+        rest = &rest[invoke_end + INVOKE_CLOSE.len()..];
+    }
+    calls
+}
+
+fn tag_attribute(tag: &str, attribute: &str) -> Option<String> {
+    let marker = format!("{attribute}=\"");
+    let value = tag.split_once(&marker)?.1;
+    Some(value.split_once('"')?.0.to_string())
 }
 
 fn extract_qwen_tool_calls(output: &str) -> Vec<serde_json::Value> {
@@ -1815,6 +1994,46 @@ pub struct ParsedAssistantOutput {
     pub finish_reason: &'static str,
 }
 
+impl ParsedAssistantOutput {
+    /// Point every parsed call at a tool the caller actually offered.
+    fn aligned_to(mut self, request: &ChatCompletionRequest) -> Self {
+        if let Some(calls) = self.tool_calls.as_deref_mut() {
+            align_tool_calls(calls, request);
+        }
+        self
+    }
+}
+
+/// Resolve a namespaced call back to the tool the caller offered.
+///
+/// This package's own tool instructions carry a namespaced example
+/// (`example_tool_name.example_function_name`), so a model offered a bare name
+/// sometimes answers with a qualified one. The namespace is the model's
+/// spelling, not the caller's, and a client can only dispatch a name it
+/// offered — it rejects anything else as an unavailable tool. So when the
+/// qualified name is not on offer but its final segment is, the call names that
+/// tool and is resolved to it. Anything else is left untouched for the caller
+/// to reject, because inventing a target it never offered would be worse than
+/// the error it already knows how to report.
+fn align_tool_calls(calls: &mut [ChatMessageToolCall], request: &ChatCompletionRequest) {
+    let Some(offered) = tools_offered_to_model(request) else {
+        return;
+    };
+    let names_a_tool =
+        |name: &str| -> bool { offered.iter().any(|tool| tool.function.name == name) };
+    for call in calls {
+        if names_a_tool(&call.function.name) {
+            continue;
+        }
+        let Some((_, suffix)) = call.function.name.rsplit_once('.') else {
+            continue;
+        };
+        if names_a_tool(suffix) {
+            call.function.name = suffix.to_string();
+        }
+    }
+}
+
 pub fn parse_assistant_output(
     output: String,
     default_finish_reason: &'static str,
@@ -1825,7 +2044,7 @@ pub fn parse_assistant_output(
     let tool_calls = parse_tool_calls(&output);
     if tool_calls.is_empty() {
         ParsedAssistantOutput {
-            content: Some(output),
+            content: Some(atem_visible_content(&output).unwrap_or(output)),
             tool_calls: None,
             finish_reason: default_finish_reason,
         }
@@ -1835,6 +2054,150 @@ pub fn parse_assistant_output(
             tool_calls: Some(tool_calls),
             finish_reason: "tool_calls",
         }
+    }
+}
+
+/// Opens an ATEM channel, ending the address that names its recipient.
+const ATEM_MESSAGE: &str = "<|message|>";
+/// Begins the address that names an ATEM channel's recipient.
+const ATEM_ADDRESS: &str = "to=";
+/// The ATEM channel addressed to the caller, i.e. the visible answer.
+const ATEM_USER_CHANNEL: &str = "to=user<|message|>";
+
+/// The part of an ATEM turn a client may see, or `None` for output that carries
+/// no ATEM channel at all.
+///
+/// A turn is a sequence of channels, each addressed to a recipient: the model
+/// itself for private reasoning, a tool for a call, or the user. Only the one
+/// addressed to the user is an answer, so a turn that ends before reaching it —
+/// truncated by the token budget, say — produced no answer, and yields empty
+/// content rather than leaking the model's reasoning as if it were one.
+fn atem_visible_content(output: &str) -> Option<String> {
+    if let Some((_, answer)) = output.rsplit_once(ATEM_USER_CHANNEL) {
+        let end = ["<|eot|>", "<|eom|>"]
+            .into_iter()
+            .filter_map(|marker| answer.find(marker))
+            .min()
+            .unwrap_or(answer.len());
+        return Some(answer[..end].to_string());
+    }
+    atem_addresses_a_channel(output).then(String::new)
+}
+
+/// Whether the output has opened a channel addressed to someone.
+///
+/// The recipient is matched by shape rather than by name because a model may
+/// address any tool it was offered, not only itself and the user, and a channel
+/// addressed to a tool is no more visible than one addressed to the model.
+fn atem_addresses_a_channel(output: &str) -> bool {
+    output.match_indices(ATEM_ADDRESS).any(|(at, _)| {
+        output[at..]
+            .split_once(ATEM_MESSAGE)
+            .is_some_and(|(address, _)| !address.contains('<'))
+    })
+}
+
+/// Streams only the part of a channelled turn a client may see.
+///
+/// A streamed token's text has its special tokens stripped, so the channel
+/// markers that decide what is visible are invisible token by token and a
+/// streaming turn would otherwise send private reasoning as it is produced. The
+/// gate keeps the turn's special-token spelling and asks [`atem_visible_content`]
+/// what is visible so far, emitting only what has grown since the previous
+/// token, so channel semantics stay in one place and streaming agrees with the
+/// buffered path by construction.
+///
+/// The gate is armed from the package's own declaration that it has a private
+/// channel, not from guessing at the shape of a turn, so a model that declares
+/// none is never gated and streams exactly what it generated. An armed gate
+/// then fails closed: anything it cannot place in the channel addressed to the
+/// caller is withheld, because the cost of withholding an answer is a retry and
+/// the cost of releasing reasoning is a disclosure that cannot be taken back.
+#[derive(Debug)]
+struct PrivateChannelGate {
+    /// The turn so far, spelled with the special tokens that mark channels.
+    transcript: String,
+    /// How much of the visible content has already been streamed.
+    streamed: String,
+    /// Whether the model declares a channel the caller must not be shown.
+    armed: bool,
+}
+
+impl PrivateChannelGate {
+    fn new(armed: bool) -> Self {
+        Self {
+            transcript: String::new(),
+            streamed: String::new(),
+            armed,
+        }
+    }
+
+    /// The visible text this token added, which is empty while the token
+    /// belongs to a private channel.
+    ///
+    /// `spelled` is the token with its special tokens intact and `plain` is the
+    /// same token as a client would see it. A token that cannot be spelled
+    /// leaves the gate unable to place it in a channel, so an armed gate
+    /// withholds it.
+    fn push(&mut self, spelled: Option<&str>, plain: &str) -> String {
+        if !self.armed {
+            return plain.to_string();
+        }
+        let Some(spelled) = spelled else {
+            return String::new();
+        };
+        self.transcript.push_str(spelled);
+        self.visible_growth()
+    }
+
+    /// Whatever the gate is still holding once the turn ends.
+    ///
+    /// A turn that never reached the caller's channel produced no answer, so
+    /// there is nothing to release: the model spent the turn thinking, and
+    /// saying so is the honest empty completion a `length` finish reason
+    /// already reports.
+    fn flush(&mut self) -> String {
+        if !self.armed {
+            return String::new();
+        }
+        self.visible_growth()
+    }
+
+    /// The visible content this turn has revealed since the last emission.
+    ///
+    /// A turn that opens a second visible channel replaces the answer rather
+    /// than extending it, so anything already streamed is no longer a prefix
+    /// and the new answer is sent whole.
+    fn visible_growth(&mut self) -> String {
+        let visible = atem_visible_content(&self.transcript).unwrap_or_default();
+        let grown = match visible.strip_prefix(&self.streamed) {
+            Some(grown) => grown.to_string(),
+            None => visible.clone(),
+        };
+        self.streamed = visible;
+        grown
+    }
+}
+
+/// The part of a finished turn a caller may see.
+///
+/// The buffered paths all reduce to this, so no path can disagree with the
+/// streaming gate about which channel carried the answer.
+fn visible_assistant_text(result: &GenerateResult, tokenizer: &Tokenizer) -> String {
+    let output = assistant_output_text(result, tokenizer);
+    atem_visible_content(&output).unwrap_or(output)
+}
+
+fn assistant_output_text(result: &GenerateResult, tokenizer: &Tokenizer) -> String {
+    let Ok(with_special_tokens) = tokenizer.decode_with_special_tokens(&result.token_ids) else {
+        return result.text.clone();
+    };
+    if atem_addresses_a_channel(&with_special_tokens)
+        || with_special_tokens.contains("<atem:invoke")
+    {
+        with_special_tokens
+    } else {
+        result.text.clone()
     }
 }
 
@@ -2022,14 +2385,23 @@ async fn send_chat_logprob_chunks(
     tokenizer: &Tokenizer,
     requested_top_logprobs: usize,
     stop_sequences: &[String],
+    private_channels: bool,
 ) -> anyhow::Result<()> {
     let (id, created, model) = response;
     let logprobs = chat_logprobs(result, tokenizer, Some(requested_top_logprobs))?
         .context("requested chat logprobs were not built")?;
+    // Logprobs are per token, so the visible text is gated per token too: a
+    // token inside a private channel contributes an empty string and keeps its
+    // logprob entry aligned by index, rather than being dropped here.
+    let mut gate = PrivateChannelGate::new(private_channels);
     let stream_text = result
         .token_ids
         .iter()
-        .map(|&token_id| tokenizer.decode(&[token_id]).map_err(anyhow::Error::from))
+        .map(|&token_id| {
+            let spelled = tokenizer.decode_with_special_tokens(&[token_id]).ok();
+            let plain = tokenizer.decode(&[token_id])?;
+            Ok(gate.push(spelled.as_deref(), &plain))
+        })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let visible_text = truncate_tokens_at_stop(&stream_text, stop_sequences);
     for (index, content) in visible_text.into_iter().enumerate() {
@@ -2105,6 +2477,86 @@ fn text_completion_id() -> String {
 }
 
 #[cfg(test)]
+mod prompt_rendering_tests {
+    use super::*;
+    use serde_json::json;
+
+    // A tool result reaches the template with the identity the caller sent, so
+    // a tool-calling template can name the function it answers.
+    #[test]
+    fn tool_result_identity_reaches_the_template() {
+        let message: ChatMessage = serde_json::from_value(json!({
+            "role": "tool",
+            "content": "42",
+            "tool_call_id": "call_0",
+            "name": "get_weather"
+        }))
+        .unwrap();
+
+        let rendered = template_message(&message, None).unwrap();
+
+        assert_eq!(rendered.name.as_deref(), Some("get_weather"));
+        assert_eq!(rendered.tool_call_id.as_deref(), Some("call_0"));
+    }
+
+    // Chat templates index `function.arguments` as a mapping, so the JSON
+    // string OpenAI puts on the wire is decoded before rendering.
+    #[test]
+    fn assistant_tool_call_arguments_render_as_a_mapping() {
+        let message: ChatMessage = serde_json::from_value(json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_0",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}
+            }, {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "echo", "arguments": "not json"}
+            }]
+        }))
+        .unwrap();
+
+        let rendered = template_message(&message, None).unwrap();
+        let calls = rendered.tool_calls.expect("tool calls");
+
+        assert_eq!(calls[0]["function"]["arguments"]["command"], "ls");
+        assert_eq!(calls[1]["function"]["arguments"], "not json");
+    }
+
+    // A reasoning model's template reads the caller's effort; without it the
+    // template stays on its own default, which is often maximal.
+    #[test]
+    fn reasoning_effort_reaches_the_template() {
+        let template = ChatTemplate::from_source(
+            "{{ reasoning_strength if reasoning_strength is defined and reasoning_strength else 'default' }}",
+        );
+        let request = |extra: serde_json::Value| -> ChatCompletionRequest {
+            let mut body = json!({ "model": "m", "messages": [{"role": "user", "content": "hi"}] });
+            let object = body.as_object_mut().unwrap();
+            for (key, value) in extra.as_object().unwrap() {
+                object.insert(key.clone(), value.clone());
+            }
+            serde_json::from_value(body).unwrap()
+        };
+
+        assert_eq!(
+            render_prompt(
+                &request(json!({ "reasoning_effort": "low" })),
+                Some(&template),
+                None
+            )
+            .unwrap(),
+            "low"
+        );
+        assert_eq!(
+            render_prompt(&request(json!({})), Some(&template), None).unwrap(),
+            "default"
+        );
+    }
+}
+
+#[cfg(test)]
 mod sampling_resolution_tests {
     use super::*;
     use serde_json::json;
@@ -2127,6 +2579,13 @@ mod sampling_resolution_tests {
         }
     }
 
+    fn declared_top_k(top_k: usize) -> GenerationDefaults {
+        GenerationDefaults {
+            top_k: Some(top_k),
+            ..declared(Some(true), None)
+        }
+    }
+
     fn chat_request(extra: serde_json::Value) -> ChatCompletionRequest {
         let mut body = json!({ "model": "m", "messages": [{"role": "user", "content": "hi"}] });
         let object = body.as_object_mut().unwrap();
@@ -2141,16 +2600,17 @@ mod sampling_resolution_tests {
     #[test]
     fn silent_chat_request_honors_model_do_sample() {
         let request = chat_request(json!({}));
-        let mut options = build_generate_options(&request);
+        let mut options = build_generate_options(&request, DEFAULT_MAX_OUTPUT_TOKENS);
         assert!(options.greedy, "the base chat default is greedy");
         options.resolve_sampling_defaults(
             Some(&declared(Some(true), Some(0.6))),
             &chat_sampling_overrides(&request),
         );
         assert!(!options.greedy, "model do_sample=true must disable greedy");
-        // The OpenAI-compatible temperature default wins over the model's
-        // declared temperature (the schema always supplies a value).
-        assert_eq!(options.temperature, 1.0);
+        assert_eq!(
+            options.temperature, 0.6,
+            "a silent request keeps the declared temperature"
+        );
     }
 
     // An explicit sampling control keeps its meaning against a greedy model, and
@@ -2158,7 +2618,7 @@ mod sampling_resolution_tests {
     #[test]
     fn explicit_chat_controls_win_over_model() {
         let seeded = chat_request(json!({ "seed": 7 }));
-        let mut options = build_generate_options(&seeded);
+        let mut options = build_generate_options(&seeded, DEFAULT_MAX_OUTPUT_TOKENS);
         options.resolve_sampling_defaults(
             Some(&declared(Some(false), None)),
             &chat_sampling_overrides(&seeded),
@@ -2166,12 +2626,33 @@ mod sampling_resolution_tests {
         assert!(!options.greedy, "an explicit seed requests sampling");
 
         let cold = chat_request(json!({ "temperature": 0.0 }));
-        let mut options = build_generate_options(&cold);
+        let mut options = build_generate_options(&cold, DEFAULT_MAX_OUTPUT_TOKENS);
         options.resolve_sampling_defaults(
             Some(&declared(Some(true), Some(0.6))),
             &chat_sampling_overrides(&cold),
         );
         assert!(options.greedy, "temperature 0 forces greedy over the model");
+    }
+
+    // `top_k` is absent from the OpenAI schema, so a client that never mentions
+    // it must not disable a model's declared top_k with the 0 sentinel.
+    #[test]
+    fn silent_chat_request_keeps_model_top_k() {
+        let request = chat_request(json!({}));
+        let mut options = build_generate_options(&request, DEFAULT_MAX_OUTPUT_TOKENS);
+        options.resolve_sampling_defaults(
+            Some(&declared_top_k(64)),
+            &chat_sampling_overrides(&request),
+        );
+        assert_eq!(options.top_k, 64, "a silent request keeps declared top_k");
+
+        let explicit = chat_request(json!({ "top_k": 5 }));
+        let mut options = build_generate_options(&explicit, DEFAULT_MAX_OUTPUT_TOKENS);
+        options.resolve_sampling_defaults(
+            Some(&declared_top_k(64)),
+            &chat_sampling_overrides(&explicit),
+        );
+        assert_eq!(options.top_k, 5, "an explicit top_k still wins");
     }
 
     // A silent completion request likewise adopts the model's declared regime.
@@ -2180,8 +2661,8 @@ mod sampling_resolution_tests {
         let request: CompletionRequest =
             serde_json::from_value(json!({ "model": "m", "prompt": "hi" })).unwrap();
         let mut options = GenerateOptions {
-            temperature: request.temperature,
-            top_p: request.top_p,
+            temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
+            top_p: request.top_p.unwrap_or(NEUTRAL_SAMPLING),
             ..GenerateOptions::default()
         };
         assert!(options.greedy, "completions default to greedy");
@@ -2190,5 +2671,393 @@ mod sampling_resolution_tests {
             &completion_sampling_overrides(&request),
         );
         assert!(!options.greedy, "model do_sample=true must disable greedy");
+        assert_eq!(
+            options.temperature, 0.6,
+            "a silent request keeps the declared temperature"
+        );
+    }
+
+    // An agent client sends neither field, and the schema's documented 1.0
+    // defaults used to be forwarded as the caller's choice, silently widening
+    // every such model to its full distribution.
+    #[test]
+    fn a_silent_request_keeps_the_declared_temperature_and_top_p() {
+        let silent = chat_sampling_overrides(&chat_request(json!({})));
+        assert_eq!(silent.temperature, None);
+        assert_eq!(silent.top_p, None);
+
+        let explicit = chat_sampling_overrides(&chat_request(json!({
+            "temperature": 0.2,
+            "top_p": 0.5
+        })));
+        assert_eq!(explicit.temperature, Some(0.2));
+        assert_eq!(explicit.top_p, Some(0.5));
+    }
+
+    // Zero temperature is still how OpenAI clients ask for determinism, and it
+    // has to keep winning over a package that declares sampling.
+    #[test]
+    fn an_explicit_zero_temperature_still_forces_greedy() {
+        let request = chat_request(json!({ "temperature": 0.0 }));
+        let mut options = build_generate_options(&request, DEFAULT_MAX_OUTPUT_TOKENS);
+        options.resolve_sampling_defaults(
+            Some(&declared(Some(true), Some(0.6))),
+            &chat_sampling_overrides(&request),
+        );
+
+        assert!(options.greedy, "an explicit zero temperature is greedy");
+        assert_eq!(options.temperature, 0.0);
+    }
+
+    // The subtle case the Option distinction exists for: a caller that sends the
+    // schema's own default value (1.0) has still made an explicit choice, so it
+    // must override a package that declares a different temperature — absent is
+    // "no opinion", a sent 1.0 is an opinion that happens to equal the default.
+    #[test]
+    fn an_explicit_default_valued_temperature_still_overrides_the_package() {
+        let request = chat_request(json!({ "temperature": 1.0 }));
+        assert_eq!(
+            chat_sampling_overrides(&request).temperature,
+            Some(1.0),
+            "an explicitly sent 1.0 is a choice, not absence"
+        );
+        let mut options = build_generate_options(&request, DEFAULT_MAX_OUTPUT_TOKENS);
+        options.resolve_sampling_defaults(
+            Some(&declared(Some(true), Some(0.6))),
+            &chat_sampling_overrides(&request),
+        );
+        assert_eq!(
+            options.temperature, 1.0,
+            "a caller's explicit 1.0 wins over the package's declared 0.6"
+        );
+    }
+}
+
+#[cfg(test)]
+mod output_budget_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn request(budget: serde_json::Value) -> ChatCompletionRequest {
+        let mut body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        for (field, value) in budget.as_object().expect("budget fields") {
+            body[field] = value.clone();
+        }
+        serde_json::from_value(body).expect("request")
+    }
+
+    // A reasoning model spends the same budget on thinking as on its answer, so
+    // a client that names no budget must get the server's cap rather than a
+    // small fixed default that truncates the turn mid-thought.
+    #[test]
+    fn an_unspecified_budget_is_the_server_cap() {
+        assert_eq!(request(json!({})).output_budget(4096), 4096);
+        assert_eq!(request(json!({})).requested_output_budget(), None);
+    }
+
+    // OpenAI deprecated max_tokens for chat and accepts only
+    // max_completion_tokens for reasoning models, so the newer field wins.
+    #[test]
+    fn max_completion_tokens_supersedes_max_tokens() {
+        let both = request(json!({"max_tokens": 16, "max_completion_tokens": 2048}));
+        assert_eq!(both.output_budget(4096), 2048);
+        assert_eq!(
+            both.requested_output_budget(),
+            Some(("max_completion_tokens", 2048))
+        );
+        assert_eq!(request(json!({"max_tokens": 16})).output_budget(4096), 16);
+    }
+
+    // The server cap bounds whatever the client asked for.
+    #[test]
+    fn the_server_cap_bounds_a_requested_budget() {
+        assert_eq!(
+            request(json!({"max_completion_tokens": 99_999})).output_budget(4096),
+            4096
+        );
+    }
+
+    // A rejection names the field the client actually sent, so the caller can
+    // find it in its own request.
+    #[test]
+    fn a_rejected_budget_names_the_field_the_client_sent() {
+        let config = ServerConfig {
+            max_output_tokens: 128,
+            ..ServerConfig::default()
+        };
+        let error = validate_request(&request(json!({"max_completion_tokens": 4096})), &config)
+            .expect_err("over cap");
+        assert!(
+            error.message.contains("max_completion_tokens"),
+            "{}",
+            error.message
+        );
+        let error =
+            validate_request(&request(json!({"max_tokens": 0})), &config).expect_err("zero");
+        assert!(error.message.contains("max_tokens"), "{}", error.message);
+        validate_request(&request(json!({})), &config).expect("an unspecified budget is valid");
+    }
+
+    // The cap-sized fallback is a ceiling, not a reservation: a short-context
+    // model must still answer a request that named no budget, instead of
+    // rejecting every one of them because cap plus prompt exceeds its context.
+    #[test]
+    fn an_unspecified_budget_yields_to_the_prompt() {
+        let budget = admit_output_budget(&request(json!({})), 3000, 4096, Some(4096))
+            .expect("an unspecified budget never rejects a prompt that fits");
+
+        assert_eq!(budget, 1096);
+    }
+
+    // A caller that named a budget asked a question, and returning less than it
+    // asked for would answer a different one, so it is told instead.
+    #[test]
+    fn a_requested_budget_that_does_not_fit_is_rejected() {
+        let error = admit_output_budget(
+            &request(json!({"max_completion_tokens": 2048})),
+            3000,
+            2048,
+            Some(4096),
+        )
+        .expect_err("2048 requested tokens do not fit after a 3000 token prompt");
+
+        assert!(error.message.contains("2048"), "{}", error.message);
+    }
+
+    // A prompt that fills the context leaves nothing to decode, which is a real
+    // rejection rather than a budget of zero that would return an empty turn.
+    #[test]
+    fn a_prompt_that_fills_the_context_is_rejected() {
+        let error = admit_output_budget(&request(json!({})), 4096, 4096, Some(4096))
+            .expect_err("a full context leaves no room to decode");
+
+        assert!(error.message.contains("4096"), "{}", error.message);
+    }
+
+    // Image expansion has to leave room for the response the caller reserved,
+    // and an unnamed budget reserves nothing because it yields to the prompt.
+    #[test]
+    fn only_a_named_budget_reserves_room_for_expansion() {
+        assert_eq!(reserved_output_tokens(&request(json!({})), 4096), 0);
+        assert_eq!(
+            reserved_output_tokens(&request(json!({"max_tokens": 512})), 4096),
+            512
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_name_alignment_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn request_offering(names: &[&str]) -> ChatCompletionRequest {
+        let tools: Vec<_> = names
+            .iter()
+            .map(|name| json!({"type": "function", "function": {"name": name}}))
+            .collect();
+        serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools
+        }))
+        .expect("request")
+    }
+
+    fn call(name: &str) -> ChatMessageToolCall {
+        serde_json::from_value(json!({
+            "id": "call_0",
+            "type": "function",
+            "function": {"name": name, "arguments": "{}"}
+        }))
+        .expect("call")
+    }
+
+    fn aligned(name: &str, offered: &[&str]) -> String {
+        let mut calls = vec![call(name)];
+        align_tool_calls(&mut calls, &request_offering(offered));
+        calls.remove(0).function.name
+    }
+
+    // The package's tool instructions show a namespaced example, so the model
+    // sometimes qualifies a bare name. The client only knows the name it
+    // offered, and rejects anything else as an unavailable tool.
+    #[test]
+    fn a_namespaced_call_resolves_to_the_offered_tool() {
+        assert_eq!(aligned("glob.glob", &["glob", "read"]), "glob");
+        assert_eq!(aligned("functions.read", &["glob", "read"]), "read");
+    }
+
+    // A name the caller offered is never rewritten, even when it contains a dot.
+    #[test]
+    fn an_offered_name_is_left_alone() {
+        assert_eq!(aligned("glob", &["glob"]), "glob");
+        assert_eq!(aligned("fs.read", &["fs.read", "read"]), "fs.read");
+    }
+
+    // A suffix that names nothing on offer stays as the model spelled it, so
+    // the caller reports the unavailable tool it already knows how to report
+    // rather than dispatching one it never offered.
+    #[test]
+    fn an_unknown_call_is_left_for_the_caller_to_reject() {
+        assert_eq!(aligned("shell.exec", &["glob", "read"]), "shell.exec");
+        assert_eq!(aligned("wander", &["glob", "read"]), "wander");
+    }
+
+    // Suffix resolution is safe only because it matches a call's final segment
+    // against an offered tool's *whole* name, so the resolved target is always a
+    // single offered name and never a choice between two. When two offered tools
+    // merely share a final segment (`fs.read`, `net.read`) and the model writes a
+    // third namespace (`svc.read`), the bare segment `read` is offered by
+    // neither, so the call is left alone for the caller to reject rather than
+    // being resolved arbitrarily to one of them.
+    #[test]
+    fn a_shared_final_segment_is_not_resolved_arbitrarily() {
+        assert_eq!(aligned("svc.read", &["fs.read", "net.read"]), "svc.read");
+        // An exact offer still wins and is never rewritten to the other.
+        assert_eq!(aligned("net.read", &["fs.read", "net.read"]), "net.read");
+    }
+
+    // The whole path a real turn travels: an ATEM tool call the model spelled
+    // with a namespace it was never offered is parsed and then resolved to the
+    // offered tool, so the client dispatches it instead of rejecting `glob.glob`.
+    #[test]
+    fn a_namespaced_atem_call_dispatches_through_the_full_parse_path() {
+        let output = "to=functions.glob<|message|>\
+             <atem:invoke name=\"glob.glob\">\
+             <atem:parameter name=\"pattern\">*.rs</atem:parameter>\
+             </atem:invoke>"
+            .to_string();
+        let parsed =
+            parse_assistant_output(output, "stop").aligned_to(&request_offering(&["glob", "read"]));
+        let calls = parsed.tool_calls.expect("an ATEM invoke is a tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].function.name, "glob",
+            "the namespaced call is dispatched to the offered flat tool"
+        );
+    }
+}
+
+#[cfg(test)]
+mod channel_gate_tests {
+    use super::*;
+
+    /// Feeds a turn to an armed gate one token at a time and returns what
+    /// streamed.
+    ///
+    /// Each token is given as `(spelled, plain)` so the test can state exactly
+    /// where the special tokens fall, which is what the gate reads.
+    fn stream(tokens: &[(&str, &str)]) -> String {
+        let mut gate = PrivateChannelGate::new(true);
+        let mut streamed: String = tokens
+            .iter()
+            .map(|(spelled, plain)| gate.push(Some(spelled), plain))
+            .collect();
+        streamed.push_str(&gate.flush());
+        streamed
+    }
+
+    // Private reasoning must never reach a streaming client, and a turn cut off
+    // before it addresses the user streams nothing rather than the thinking.
+    #[test]
+    fn reasoning_never_streams() {
+        assert_eq!(
+            stream(&[
+                (" to=self", " to=self"),
+                ("<|message|>", ""),
+                ("secret", "secret"),
+                (" plan", " plan"),
+            ]),
+            ""
+        );
+    }
+
+    // Once the turn addresses the user, the answer streams incrementally and
+    // the reasoning that preceded it stays withheld.
+    #[test]
+    fn only_the_user_channel_streams() {
+        assert_eq!(
+            stream(&[
+                (" to=self", " to=self"),
+                ("<|message|>", ""),
+                ("secret", "secret"),
+                ("<|end|> to=user<|message|>", "<|end|> to=user"),
+                ("Hello", "Hello"),
+                (" there", " there"),
+                ("<|eot|>", ""),
+            ]),
+            "Hello there"
+        );
+    }
+
+    // A model may address any tool it was offered, and that channel carries a
+    // call rather than an answer, so it must not stream as content either.
+    #[test]
+    fn a_tool_channel_never_streams() {
+        assert_eq!(
+            stream(&[
+                (" to=functions.bash", " to=functions.bash"),
+                ("<|message|>", ""),
+                ("<atem:invoke name=\"bash\">", "<atem:invoke name=\"bash\">"),
+            ]),
+            ""
+        );
+    }
+
+    // An armed gate fails closed: a turn from a model that declares a private
+    // channel is withheld until it names the channel the caller may see, even
+    // when its opening tokens look like ordinary prose.
+    #[test]
+    fn an_armed_gate_withholds_an_unaddressed_turn() {
+        assert_eq!(stream(&[("Hello", "Hello"), (" world", " world")]), "");
+    }
+
+    // A session prompt is not wrapped in the chat template, so the model spells
+    // the turn header itself. The gate must not mistake that for prose and let
+    // the reasoning through.
+    #[test]
+    fn a_self_opened_turn_still_hides_reasoning() {
+        assert_eq!(
+            stream(&[
+                ("<|start|>", ""),
+                ("assistant", "assistant"),
+                (" to=self<|message|>", " to=self"),
+                ("secret", "secret"),
+                (
+                    "<|end|><|start|>assistant to=user<|message|>",
+                    "<|end|>assistant to=user"
+                ),
+                ("Hi", "Hi"),
+            ]),
+            "Hi"
+        );
+    }
+
+    // A token the tokenizer cannot spell leaves channels undecidable. An armed
+    // gate withholds it, because releasing a token that might be reasoning is
+    // the one mistake it cannot take back.
+    #[test]
+    fn an_unspellable_token_is_withheld() {
+        let mut gate = PrivateChannelGate::new(true);
+        assert_eq!(gate.push(None, "raw"), "");
+        assert_eq!(gate.push(Some(" to=self<|message|>"), " to=self"), "");
+        assert_eq!(gate.push(Some("secret"), "secret"), "");
+    }
+
+    // A model that declares no private channel is every ordinary model, and it
+    // must stream exactly what it generated.
+    #[test]
+    fn an_unarmed_gate_streams_everything() {
+        let mut gate = PrivateChannelGate::new(false);
+        assert_eq!(
+            gate.push(Some(" to=self<|message|>"), " to=self"),
+            " to=self"
+        );
+        assert_eq!(gate.push(None, "raw"), "raw");
+        assert_eq!(gate.flush(), "");
     }
 }

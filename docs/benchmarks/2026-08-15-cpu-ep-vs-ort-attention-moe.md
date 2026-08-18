@@ -1081,6 +1081,12 @@ per-expert loop rather than merely close - the tests assert on raw `Vec<f32>` eq
 
 ### 18.3 Full matrix, 27 cells, real ORT CPU session
 
+> **Correction (§31).** These are **MLAS-arm** ratios. The claim below that every `t=1`
+> cell sits at 1.006-1.052 is not true of the build that ships: measured on the
+> production arm, the same `t=1` cells were **39-72x** ORT, because the shipping path
+> materialized a transposed copy of each expert's weights on every call. Fixed in #1241.
+> Current production-native numbers are in §31.5.
+
 `ratio = native p50 / ORT p50`, **lower is better**. Interleaved arms, same host,
 same session options, same thread count on both sides, 5 warmups, 5 trials x 15 runs.
 Synthetic weights from `scripts/ort_ab/gen_moe.py` (public architecture dimensions,
@@ -2173,6 +2179,10 @@ above.
 
 ## 27. Where the CPU EP actually stands
 
+> **Correction (§31).** The 66-cell grid in this section was produced by the MLAS-linked
+> `bench_generic` and does not describe the shipping build. See §31.5 for the corrected
+> production-native matrix.
+
 Full transform + KV-concat grid on `main` at `f2e6ad97d`, paired interleaved
 against a real ORT 1.27 CPU session, one driver invocation, 5 trials × 60 runs ×
 15 warmups. Ratio is native/ORT p50, **lower is better**, and `< 1.000` is a win.
@@ -2436,6 +2446,11 @@ shapes is unattributed and is the next thing to chase on this axis.
 
 ### 29.4 A measurement caveat that applies to this whole document
 
+> **Superseded by §31.** The caveat below was correct and its consequence was far larger
+> than it estimated. The harness has since been fixed (#1231) and the production arm
+> measured. The main table in §29.3, and every ratio in §18 and §27, is an **MLAS-arm**
+> number. See §31.6 for exactly which tables are affected.
+
 `onnx-genai-bench` declares `required-features = ["mlas"]`, so `bench_generic` can only
 be built with MLAS linked in. Every ratio published in this document - including §27's
 66-cell grid - was therefore produced by the **MLAS-linked build**, and where a kernel
@@ -2557,7 +2572,279 @@ tests from the decorative ones was running the falsifier - and in §29.5 even th
 falsifier misfired, which is its own lesson: a falsifier that does not fire is not
 evidence the test is sound until you know *why* it did not fire.
 
-## 31. Phase 11: a CPU task runtime, because the scheduler was the loss
+
+## 31. Phase 11: the benchmark was measuring an arm that does not ship (#1231, #1234, #1241)
+
+### 31.1 The defect
+
+`crates/onnx-genai-bench/Cargo.toml` declared:
+
+```toml
+[[bin]]
+name = "bench_generic"
+required-features = ["mlas"]
+```
+
+`bench_generic` contains **no MLAS references at all**. The requirement was gratuitous.
+But `mlas` is not a default feature of `onnx-runtime-ep-cpu`, so the effect was that the
+only binary anyone benchmarked with was the one configuration production never builds.
+
+Every ratio in this document up to §30 was therefore an MLAS-arm measurement, read and
+acted on as though it described the shipping runtime. §29.4 spotted the harness problem
+and correctly flagged it as open work; it badly underestimated the consequence.
+
+#1231 changed the requirement to a `bench-native` feature, added an `arm=native` /
+`arm=mlas-reference` label to every result line, and added `mlas_is_not_a_default_feature`
+so the crate fails loudly if MLAS ever becomes default.
+
+A feature flag is not proof. The falsifier that is proof:
+
+```
+$ nm -C target/release/bench_generic | grep -ci mlas
+0        # --features bench-native   (the arm that ships)
+805      # --features mlas           (the research/reference arm)
+```
+
+Every performance claim from here on is taken with that `0` verified on the same binary.
+
+### 31.2 What it hid
+
+Two kernels turned out to have no vectorized production path at all. Both had looked
+fine for months because the MLAS arm was covering for them.
+
+**Softmax.** The `#[cfg(not(feature = "mlas"))]` arm called scalar `f32::exp()` once per
+element. `scale_mask_softmax_serial` routes through the same helper, so fused attention
+paid it too. The doc comment claiming an "8-lane polynomial" described only the MLAS arm.
+
+| model | production native | mlas reference |
+|---|--:|--:|
+| sm_prefill_h32_s512 | **10.012** | 0.908 |
+| sm_bert_b8_s128 | **9.621** | 1.032 |
+| sm_decode_h32_kv1024 | **9.302** | 1.011 |
+| sm_decode_h32_kv2048 | **9.944** | 1.013 |
+| sm_decode_h32_kv4096 | **10.535** | 1.028 |
+| sm_decode_h32_kv8192 | **10.861** | 1.000 |
+
+**MoE.** Worse. The shipping path allocated and filled a full transposed copy of an
+expert's weight matrix *on every call, for every routed expert group*, because expert
+weights are stored `[out_features][in_features]` while `gemm` wants `[K][N]`. For a
+Mixtral-shaped expert with `swiglu_fusion=1` that is a 29 MiB allocate-and-transpose for
+fc1 plus 14.7 MB for fc2 - to multiply a **single token row**.
+
+| model | production native, before |
+|---|--:|
+| moe_mixtral_h1024_i3584_e8_t1 | **71.4** |
+| moe_qwen3moe_h2048_i768_e16_t1 | **42.0** |
+| moe_phi35moe_h2048_i6400_e4_t1 | **48.4** |
+
+§18.3 had recorded every `t=1` MoE cell at 1.006-1.052 and concluded the remaining MoE
+problem was purely thread scheduling at `t=8/16`. On the arm that ships, `t=1` was the
+worst cell in the entire benchmark suite.
+
+### 31.3 The fixes
+
+**#1234, softmax.** Both non-MLAS forms now route through one
+`softmax_row_core(src, dst, d)` with an AVX2+FMA `exp`: Cody-Waite split of `ln2`, a
+degree-6 Cephes minimax polynomial in FMA form, `2^k` built as `(k + 127) << 23`, runtime
+`is_x86_feature_detected!` dispatch, scalar fallback for non-AVX2 and for sub-8 tails.
+Non-finite lanes are handled by explicit masks: NaN by unordered-compare plus `blendv`,
+`-inf` and deep underflow forced to exactly `0` by ordered-compare plus `andnot`. Review
+independently measured the result at **max 1 ULP** against an f64 reference across the
+whole domain.
+
+**#1241, MoE.** `gemm_bt(a, bt, c, m, k, n)` computes `C = A * Bt^T` directly on the
+`[out][in]` expert slice, so the transposed copy is never materialized. That layout is
+also the better one: for `C[i][j] = sum_k A[i][k] * Bt[j][k]` both operands are
+contiguous along `k`, making the inner loop a pure contiguous dot product instead of a
+strided gather. Interior tiles are swept column-panel-first so a ~256 KiB `bt` panel is
+reused across row bands - without that, an expert bank larger than the 32 MiB L3 (the
+Phi experts are 52 MiB) is re-streamed from DRAM once per row band, which regressed the
+largest prefill shape until it was fixed.
+
+### 31.4 A note on what this says about the transpose question
+
+§19 and §20 closed the Transpose investigation on the grounds that the Transpose *kernel*
+moves zero bytes in-graph, and that a layout-aware consumer was "a real cost these graphs
+simply do not exercise" - so a synthetic fixture would have to be built to demonstrate it.
+
+That conclusion was wrong, and it was wrong because it only looked at `Transpose` nodes.
+The most expensive transpose in the runtime was not a node at all: it was a materialized
+transpose *inside* the MoE kernel, feeding straight into a GEMM. The fixture did not need
+building. It was already the single largest term in the operator, on three of the models
+in this document, and it went unseen because the MLAS arm did not take that path.
+
+### 31.5 Corrected production-native matrix
+
+All cells: production build (`bench-native`, 0 MLAS symbols), thread-matched at
+`--native-threads 1 --ort-intra-threads 1`, `native_min`/`ort_min`, models interleaved
+and order-alternated across reps, min/median/max of per-rep ratios. Ratio is native/ORT,
+so **below 1.000 beats ORT**. Parity PASS in every cell shown.
+
+**Transforms, after #1234:**
+
+| group | model | min | med | max |
+|---|---|--:|--:|--:|
+| softmax | sm_prefill_h32_s512 | 1.455 | 1.460 | 1.470 |
+| softmax | sm_bert_b8_s128 | 1.472 | 1.477 | 1.485 |
+| softmax | sm_decode_h32_kv1024 | 1.529 | 1.529 | 1.625 |
+| softmax | sm_decode_h32_kv2048 | 1.613 | 1.633 | 1.805 |
+| softmax | sm_decode_h32_kv4096 | 1.574 | 1.574 | 1.574 |
+| softmax | sm_decode_h32_kv8192 | 1.603 | 1.622 | 1.650 |
+| softmax | sm_whisper_cross | 1.289 | 1.295 | 1.300 |
+| rope | rope_llama3_s1 | 1.250 | 1.250 | 1.250 |
+| rope | rope_llama3_s128 | **0.759** | **0.766** | 0.802 |
+| rope | rope_llama3_s512 | **0.833** | **0.861** | 0.956 |
+| rope | rope_llama3_b8_s1 | **0.900** | 1.000 | 1.000 |
+| rope | rope_gptj_il_s1 | 1.250 | 1.250 | 1.500 |
+| rope | rope_gptj_il_s128 | **0.821** | **0.855** | 0.861 |
+| rope | rope_gptj_il_s512 | **0.941** | 1.002 | 1.017 |
+| transpose | tr_bert_b8_s128 | **0.569** | **0.582** | 0.616 |
+| transpose | tr_llama3_s512 | 1.023 | 1.046 | 1.647 |
+| transpose | tr_whisper_s1500 | **0.679** | **0.846** | 0.994 |
+| kvcat | kvcat_llama3_p1023 | 1.115 | 1.179 | 1.218 |
+| kvcat | kvcat_llama3_p2047 | **0.981** | 1.015 | 1.273 |
+| kvcat | kvcat_llama3_p4095 | **0.986** | 1.070 | 1.161 |
+| kvcat | kvcat_llama3_p8191 | **0.999** | 1.052 | 1.066 |
+| kvcat | kvcat_llama3_b8_p2047 | **0.947** | **0.975** | 0.984 |
+
+**MoE, before and after #1241** (before column is the production arm, freshly measured,
+not the MLAS numbers from §18.3):
+
+| model | before (med) | after: min | med | max |
+|---|--:|--:|--:|--:|
+| moe_mixtral_h1024_i3584_e8_t1 | 71.366 | **0.897** | **0.926** | 0.952 |
+| moe_mixtral_h1024_i3584_e8_t32 | 17.852 | **0.752** | **0.805** | 0.806 |
+| moe_mixtral_h1024_i3584_e8_t512 | 3.670 | 1.217 | 1.232 | 1.240 |
+| moe_qwen3moe_h2048_i768_e16_t1 | 41.958 | **0.912** | **0.918** | 0.927 |
+| moe_qwen3moe_h2048_i768_e16_t32 | 8.241 | **0.975** | 1.007 | 1.057 |
+| moe_qwen3moe_h2048_i768_e16_t512 | 1.877 | 1.375 | 1.383 | 1.388 |
+| moe_phi35moe_h2048_i6400_e4_t1 | 48.365 | 1.094 | 1.102 | 1.136 |
+| moe_phi35moe_h2048_i6400_e4_t32 | 9.008 | 1.213 | 1.225 | 1.238 |
+| moe_phi35moe_h2048_i6400_e4_t512 | 1.921 | 1.553 | 1.557 | 1.571 |
+
+### 31.6 Which earlier tables are now known to be wrong
+
+Any ratio in this document produced before #1231 came from the MLAS-linked binary.
+Concretely:
+
+- **§18.3's 27-cell MoE matrix** - MLAS arm. Its central conclusion, that `t=1` MoE is at
+  parity and only `t=8/16` scheduling remains, was false for the shipping build. Banner added.
+- **§27's 66-cell grid** - MLAS arm. Banner added.
+- **§29.3's softmax table** - MLAS arm. The *direction* of that change (removing a copy at
+  the shared, arm-agnostic call site) still holds, and §31.5 shows the production arm
+  post-fix, but the magnitudes in §29.3 are not production magnitudes. Banner added at §29.4.
+- **§21's boundary instrument** - taken under the coupled profiler gate later fixed in
+  #1226, *and* on the MLAS arm. Both reasons to re-read it before relying on it.
+
+Sections that do not depend on a ratio - the structural analysis in §13, the aliasing and
+capacity work in §28, the methodology in §30 - are unaffected.
+
+### 31.7 What this adds to the methodology rules
+
+§30.3 established: interleave innermost, prefer `native_min` on small graphs, distrust an
+effect an order of magnitude larger than its mechanism. Phase 11 adds two more.
+
+1. **Benchmark the artifact that ships, and prove it with the linker, not the flag.**
+   `required-features` silently redefined what "the CPU EP" meant for every measurement in
+   this document. `nm -C | grep -ci mlas` is cheap, and it is the only statement about
+   linkage that a feature flag cannot make for you.
+
+2. **A fallback arm hides the absence of the primary one.** Neither the scalar `exp` nor
+   the materialized MoE transpose was subtle. Both survived because the configuration
+   under measurement never executed them. When a kernel has two arms, the untested arm is
+   not "probably similar" - it is unmeasured, and here it was 10x and 70x.
+
+### 31.8 Where the CPU EP now stands, honestly
+
+Won at `t=1`: RoPE at s128/s512, both Transpose shapes that matter, KV concat at every
+context length from 2047 up, MoE decode on mixtral and qwen3moe.
+
+Still losing at `t=1`: **softmax, 1.29-1.63x** across the whole family - a 6-7x
+improvement on #1234 but not parity, and the remaining cost is the three-pass
+memory-bound structure, not `exp`. **MoE prefill, 1.22-1.56x** - microkernel efficiency
+against MLAS's packed panels and wider register tiles. **phi35moe decode, 1.10x** -
+bandwidth-bound, the most weight bytes per token of the three. `rope_*_s1` and
+`kvcat_p1023` at 1.12-1.25x are per-call overhead on graphs too small to amortize it.
+
+Not started: paged/appendable KV behind an attention-owned handle (§13's boundary
+stands), and beam reorder, which still does not exist on any EP.
+
+Nothing here defers to ORT and nothing links MLAS.
+
+## 32. Phase 12: erf's Estrin reassociation, and a perf number that is hardware-dependent by nature (#1218)
+
+The change in #1218 is sound and it landed: `erf`'s two on-path polynomials (the
+big-branch `R` and the `exp` it feeds) now evaluate by Estrin's scheme instead of
+Horner's, trading two extra multiplies for half the dependency depth on a
+latency-bound chain. The interesting part for this ledger is what happened when a
+second reviewer re-measured the speedup on different hardware, and got a different
+magnitude — not because either number is wrong, but because a CPU perf result is a
+property of the machine it was taken on.
+
+### 32.1 Two measurements, two machines, no conflict
+
+The change was measured twice, on two different microarchitectures, against two
+different references. Both are reported here as peers:
+
+| source | hardware | method | result |
+| --- | --- | --- | --- |
+| original (#1218) | many-core **AMD server** part | vs an ORT reference on that box | **~1.36x vs ORT** (from 1.66x) |
+| reviewer | **Intel Core i7-13800H** (14C/20T, laptop-class), Windows 11 | ORT-independent same-binary A/B on `erf_avx2`; single thread; min-of-200 × 9 rounds; 1,048,576 mixed-range elements | **0.6346 ms → 0.6042 ms = ~5.0% (1.05x)** |
+
+These are **not in conflict and neither refutes the other.** They differ on every axis
+that matters for a CPU kernel timing: different microarchitecture (server AMD vs client
+Intel), different core count, and different reference (one is a ratio *relative to ORT*,
+the other an *internal* Horner-vs-Estrin A/B on the same binary because no ORT reference
+build was available on the review host). A latency-bound reassociation win is exactly
+the kind of result that scales with pipeline depth, memory system, and how much of the
+work is exposed to the out-of-order engine — all of which change between those two
+parts. The honest reading is: **Estrin is faster on both machines; the magnitude is
+hardware-dependent**, ~5% on this laptop and reported larger relative to ORT on the
+server part.
+
+### 32.2 The general lesson: CPU perf numbers here are hardware-dependent, and must carry their metadata
+
+This is the reusable point, and it is bigger than one PR. Server-class many-core AMD
+parts and consumer Intel laptops are **different measurement environments**; the same
+kernel change can be ~5% on one and a different ratio on the other, with neither being
+an error. It follows that **any CPU perf number recorded in these docs is only
+interpretable if it carries its hardware, its thread count, and its reference baseline.**
+A bare "1.36x" or "5%" with none of that attached cannot be compared to anything later,
+because the reader has no way to know whether a difference is a real change or just a
+different chip.
+
+Some entries in this benchmark corpus predate that discipline and record a ratio without
+naming the host, the thread count, or the ORT reference build. This section does not go
+fix them — it flags that the gap exists, so that new entries name their environment and
+old bare numbers are read with appropriate caution.
+
+### 32.3 The durable fact: this reassociation is NOT bit-identical
+
+Unlike the perf number, this part **is** hardware-independent — it is a property of the
+shipped kernel, true on every machine, so it is the most important thing to write down.
+Estrin reassociates floating-point FMAs, so it **does not** produce the same bits as
+Horner, by construction. A two-build dump-and-diff over 404,045 points — `[-6,6]`
+sampled densely, the `0.921875` split boundary, large `|x|`, denormals, and NaN/±inf —
+establishes the actual envelope:
+
+* **Estrin differs from Horner by at most exactly one ULP.** 4,401 of 404,043 finite
+  points (1.09%) differ, every one of them by a single ULP; max absolute difference
+  5.96e-8. Nothing anywhere in the domain moves by more than one ULP.
+* **Against f64 `erf` truth:** max error Horner 5.77e-8, Estrin 6.55e-8 (worst just
+  past the split, x≈0.933). Both are within ~1 ULP of the correctly-rounded f32
+  result; Estrin is at most ~0.8e-8 looser than Horner and never worse than one ULP
+  from it.
+* **Special values are correct and identical between the two:** large `|x|`
+  (7 … 1e30, `f32::MAX`) saturate to ±1.0; denormals produce bit-identical outputs;
+  NaN → NaN; +inf → +1.0; −inf → −1.0.
+
+The tripwire is the test **`erf_reassociation_costs_no_accuracy`** in
+`kernels/simd_activations.rs`: it pins the worst scaled error over `|x|<=1` at `2^-24`
+(half a ULP) against `erf_avx2` directly, so a future regrouping that widens the
+envelope fails the build instead of being absorbed by the looser `ERF_BOUND`. A reader
+who needs to know whether erf is bit-stable should start there.
+
+## 33. Phase 13: a CPU task runtime, because the scheduler was the loss
 
 §26 measured the thing that costs the most and is not arithmetic: Rayon parks
 its workers between parallel regions, so a fan-out costs **67 µs when it follows
@@ -2568,7 +2855,7 @@ that fans out pays the parked number, every layer, forever.
 That is a scheduler problem, and it does not get better by making the kernels
 faster. This phase replaces the fan-out mechanism.
 
-### 31.1 Two backends, chosen by where we are running
+### 33.1 Two backends, chosen by where we are running
 
 `onnx_runtime_ep_cpu::task_runtime` is a thin façade over two implementations,
 and the choice is made per call:
@@ -2596,7 +2883,7 @@ Nesting is checked in both directions (`in_host_task()`, `in_task()`). A kernel
 that fans out from inside another fan-out runs serially rather than exploding
 the region count, which is what made the earlier hot-pool RoPE attempt bimodal.
 
-### 31.2 The native pool
+### 33.2 The native pool
 
 Eight job slots, not one. A single-slot pool serialises concurrent dispatchers,
 which is the wrong answer when two sessions decode at once; with eight, they get
@@ -2616,7 +2903,7 @@ spin window and halving when it parks. This is the part that answers §26: the
 window self-sizes to the actual gap between regions instead of being tuned to a
 guess.
 
-### 31.3 Width: SMT-capped, but only above 8 hardware threads
+### 33.3 Width: SMT-capped, but only above 8 hardware threads
 
 Whether to use both SMT siblings is not obvious for memory-bound kernels — the
 second sibling adds no execution resources but does add a memory-level-
@@ -2642,7 +2929,7 @@ An **explicit** budget (`set_task_thread_budget`, `ONNX_GENAI_CPU_TASK_THREADS`)
 is never capped. If a caller says 32, they get 32; the cap is an inference, and
 inferences do not override instructions.
 
-### 31.4 What it costs to dispatch
+### 33.4 What it costs to dispatch
 
 16 workers, 400 rounds per sample, release build, on the §0 host:
 
@@ -2666,7 +2953,7 @@ not be burning a core.
 (gaps ≤ 100 µs stay within 3× back-to-back + 10 µs). It is `#[ignore]`d, because
 a latency assertion on a shared CI runner is a flake generator.
 
-### 31.5 Idle cost, which is the price of spinning
+### 33.5 Idle cost, which is the price of spinning
 
 A spinning pool that never parks is a regression disguised as a speedup.
 `tests/task_runtime_idle.rs` bounds both ends: after the spin window elapses the
@@ -2678,7 +2965,7 @@ in one binary run concurrently by default, and both of these measure
 whole-process CPU and RSS — so as separate tests they measured each other, and
 the idle bound failed with 1.31 s of CPU over a 750 ms window.
 
-### 31.6 Test hooks, not environment variables
+### 33.6 Test hooks, not environment variables
 
 `task_runtime::testing` exposes `force_serial()`, `isolated_pool(n)`,
 `counters()`, `pool_width()` and `planned_backend()`. Nothing in the production

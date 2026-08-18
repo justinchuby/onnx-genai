@@ -79,12 +79,22 @@ pub struct EmbeddingUsage {
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: usize,
-    #[serde(default = "default_temperature")]
-    pub temperature: f32,
-    #[serde(default = "default_top_p")]
-    pub top_p: f32,
+    /// Deprecated by OpenAI in favour of `max_completion_tokens`, and absent
+    /// from requests aimed at reasoning models. See [`Self::output_budget`].
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+    /// The budget covering reasoning *and* answer tokens, which is the only
+    /// output limit OpenAI accepts for a reasoning model.
+    #[serde(default)]
+    pub max_completion_tokens: Option<usize>,
+    /// Absent when the caller left sampling to the model. See
+    /// [`Self::sampling_overrides`].
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Absent when the caller left sampling to the model. See
+    /// [`Self::sampling_overrides`].
+    #[serde(default)]
+    pub top_p: Option<f32>,
     #[serde(default)]
     pub top_k: usize,
     #[serde(default)]
@@ -134,6 +144,10 @@ pub struct ChatCompletionRequest {
     pub logprobs: bool,
     #[serde(default)]
     pub top_logprobs: Option<usize>,
+    /// How much a reasoning model should think before answering; `None` leaves
+    /// the model's chat template on its own default.
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,10 +158,12 @@ pub struct CompletionRequest {
     pub suffix: Option<String>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
-    #[serde(default = "default_temperature")]
-    pub temperature: f32,
-    #[serde(default = "default_top_p")]
-    pub top_p: f32,
+    /// Absent when the caller left sampling to the model.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Absent when the caller left sampling to the model.
+    #[serde(default)]
+    pub top_p: Option<f32>,
     #[serde(default)]
     pub min_p: f32,
     #[serde(default)]
@@ -162,7 +178,57 @@ pub struct CompletionRequest {
     pub logprobs: Option<usize>,
 }
 
+/// How much a reasoning model should think before answering, in OpenAI's
+/// `reasoning_effort` vocabulary.
+///
+/// A closed set rather than a free string so an unsupported spelling is
+/// rejected with the accepted values instead of silently leaving the model on
+/// its own default, which for a reasoning model is often maximal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 impl ChatCompletionRequest {
+    /// How many tokens this turn may decode, given the server's cap.
+    ///
+    /// `max_completion_tokens` supersedes `max_tokens`, which OpenAI deprecated
+    /// for chat completions and rejects outright for reasoning models. A client
+    /// that sends neither has asked for no limit of its own — OpenAI decodes
+    /// until the model stops or the context runs out — so the budget falls back
+    /// to the server's cap rather than to a small fixed default. That
+    /// distinction matters most for a reasoning model, whose private thinking
+    /// spends the same budget as its answer: too small a fallback truncates the
+    /// turn mid-thought and returns nothing at all.
+    pub(crate) fn output_budget(&self, cap: usize) -> usize {
+        self.requested_output_budget()
+            .map_or(cap, |(_, requested)| requested)
+            .min(cap)
+    }
+
+    /// The output budget the client asked for and the field it used, or `None`
+    /// when it named neither and left the limit to the server.
+    pub(crate) fn requested_output_budget(&self) -> Option<(&'static str, usize)> {
+        self.max_completion_tokens
+            .map(|budget| ("max_completion_tokens", budget))
+            .or_else(|| self.max_tokens.map(|budget| ("max_tokens", budget)))
+    }
+
     pub(crate) fn wants_constrained_json(&self) -> bool {
         matches!(
             self.response_format.as_ref(),
@@ -211,6 +277,10 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ChatMessageToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// OpenAI's optional message `name`; on a `tool` message it names the
+    /// function that produced the result, which tool templates render.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -696,12 +766,6 @@ pub struct CompletionLogprobs {
 
 fn default_max_tokens() -> usize {
     256
-}
-fn default_temperature() -> f32 {
-    1.0
-}
-fn default_top_p() -> f32 {
-    1.0
 }
 fn default_typical_p() -> f32 {
     1.0

@@ -41,7 +41,7 @@ use crate::{
         StopBoundaryBuffer, completion_chunk, completion_done_chunk, content_chunk, done_chunk,
         role_chunk, send_completion_stream_chunk, send_stream_chunk, tool_call_delta_chunks,
     },
-    state::{AppState, ServerConfig},
+    state::{AppState, DEFAULT_MAX_OUTPUT_TOKENS, ServerConfig},
     types::{
         AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
         ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageToolCall,
@@ -49,8 +49,8 @@ use crate::{
         CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingInput,
         EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ImageData,
         ImageGenerationRequest, ImageGenerationResponse, ImageResponseFormat, InputAudio,
-        ResponseFormat, SpeechRequest, SpeechResponseFormat, StopInput, ToolChoice, ToolChoiceMode,
-        Usage,
+        ReasoningEffort, ResponseFormat, SpeechRequest, SpeechResponseFormat, StopInput,
+        ToolChoice, ToolChoiceMode, Usage,
     },
 };
 

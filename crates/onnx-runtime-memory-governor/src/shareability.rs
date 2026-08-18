@@ -37,12 +37,11 @@
 //! It is the shareability **decision**, not the mapping. It says whether — and
 //! at what cost — a prefix can be shared for a given layout, geometry, prefix
 //! length, and granule. The actual multi-map is
-//! [`SharedMapping::commit_shared_prefix`](crate::SharedMapping::commit_shared_prefix),
-//! reached through [`DeviceAllocator::as_shared_mapping`](crate::DeviceAllocator::as_shared_mapping);
+//! [`DeviceAllocator::commit_shared_prefix`](crate::DeviceAllocator::commit_shared_prefix);
 //! a caller uses [`PrefixShareability::shareable`] to decide whether to attempt
 //! it, and [`PrefixShareability::refusal_reason`] to refuse **with a reason**
 //! rather than silently falling back to N private copies — the same "error,
-//! never mis-map" discipline an absent `SharedMapping` capability keeps.
+//! never mis-map" discipline the refusing trait defaults keep.
 
 /// Geometry of a model's per-layer KV cache, in the terms the fragment sizes
 /// are computed from.

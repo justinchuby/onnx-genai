@@ -1610,18 +1610,35 @@ mod avx2 {
             let small = _mm256_andnot_ps(split, small);
 
             // |x| > 0.921875: erf(x) = 1 - exp(-R(|x|)).
+            //
+            // `R` is a degree-6 polynomial, evaluated by Estrin's scheme rather
+            // than Horner's. Horner is six dependent FMAs deep; Estrin splits it
+            // as `a^3 * (c0 a^3 + c1 a^2 + c2 a + c3) + (c4 a^2 + c5 a + c6)`,
+            // whose halves evaluate independently, and is three deep for two
+            // extra multiplies. See the note on [`erf_ps`] for why depth is what
+            // costs here.
             let abs = _mm256_and_ps(split, abs);
-            let mut big = _mm256_fmadd_ps(
+            let sq_abs = _mm256_mul_ps(abs, abs);
+            let cube_abs = _mm256_mul_ps(sq_abs, abs);
+            let hi = _mm256_fmadd_ps(
                 _mm256_set1_ps(erf_c::BIG_P0),
                 abs,
                 _mm256_set1_ps(erf_c::BIG_P1),
             );
-            big = _mm256_fmadd_ps(big, abs, _mm256_set1_ps(erf_c::BIG_P2));
-            big = _mm256_fmadd_ps(big, abs, _mm256_set1_ps(erf_c::BIG_P3));
-            big = _mm256_fmadd_ps(big, abs, _mm256_set1_ps(erf_c::BIG_P4));
-            big = _mm256_fmadd_ps(big, abs, _mm256_set1_ps(erf_c::BIG_P5));
-            big = _mm256_fmadd_ps(big, abs, _mm256_set1_ps(erf_c::BIG_P6_MINUS_ONE));
-            big = _mm256_fmadd_ps(big, abs, abs);
+            let hi_lo = _mm256_fmadd_ps(
+                _mm256_set1_ps(erf_c::BIG_P2),
+                abs,
+                _mm256_set1_ps(erf_c::BIG_P3),
+            );
+            let hi = _mm256_fmadd_ps(hi, sq_abs, hi_lo);
+            let lo = _mm256_fmadd_ps(
+                _mm256_set1_ps(erf_c::BIG_P4),
+                abs,
+                _mm256_set1_ps(erf_c::BIG_P5),
+            );
+            let lo = _mm256_fmadd_ps(lo, abs, _mm256_set1_ps(erf_c::BIG_P6_MINUS_ONE));
+            let big = _mm256_fmadd_ps(hi, cube_abs, lo);
+            let big = _mm256_fmadd_ps(big, abs, abs);
 
             let neg_big = _mm256_max_ps(
                 _mm256_set1_ps(erf_c::EXP_LOWER_RANGE),
@@ -1652,16 +1669,30 @@ mod avx2 {
             let mut f = _mm256_fmadd_ps(k, _mm256_set1_ps(erf_c::EXP_LOG2_HI), x);
             f = _mm256_fmadd_ps(k, _mm256_set1_ps(erf_c::EXP_LOG2_LO), f);
 
-            let mut p = _mm256_fmadd_ps(
+            // Estrin again: three deep instead of six, for two extra
+            // multiplies. This chain sits on `erf`'s critical path, behind the
+            // big-branch polynomial, so its depth is what the whole kernel waits
+            // on.
+            let sq_f = _mm256_mul_ps(f, f);
+            let cube_f = _mm256_mul_ps(sq_f, f);
+            let hi = _mm256_fmadd_ps(
                 _mm256_set1_ps(erf_c::EXP_P0),
                 f,
                 _mm256_set1_ps(erf_c::EXP_P1),
             );
-            p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(erf_c::EXP_P2));
-            p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(erf_c::EXP_P3));
-            p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(erf_c::EXP_P4));
-            p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(erf_c::EXP_P5));
-            p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(erf_c::EXP_P6));
+            let hi_lo = _mm256_fmadd_ps(
+                _mm256_set1_ps(erf_c::EXP_P2),
+                f,
+                _mm256_set1_ps(erf_c::EXP_P3),
+            );
+            let hi = _mm256_fmadd_ps(hi, sq_f, hi_lo);
+            let lo = _mm256_fmadd_ps(
+                _mm256_set1_ps(erf_c::EXP_P4),
+                f,
+                _mm256_set1_ps(erf_c::EXP_P5),
+            );
+            let lo = _mm256_fmadd_ps(lo, f, _mm256_set1_ps(erf_c::EXP_P6));
+            let p = _mm256_fmadd_ps(hi, cube_f, lo);
 
             _mm256_mul_ps(p, power_of_2_ps(k))
         }
@@ -1767,13 +1798,10 @@ mod avx2 {
         }
     }
 
-    /// Apply an 8-lane kernel across a slice. The `< 8` remainder is processed
-    /// through the *same* kernel via a masked load/store, so every element of
-    /// the output — tail included — is computed identically.
-    #[inline]
-    #[target_feature(enable = "avx2,fma")]
     /// Like [`map_ps`], but adds a `width`-element bias row to each `width`-element
     /// slab of the input before applying `kernel`.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn map_bias_ps(
         input: &[f32],
         bias: &[f32],
@@ -1813,6 +1841,23 @@ mod avx2 {
         }
     }
 
+    /// Apply an 8-lane kernel across a slice. The `< 8` remainder is processed
+    /// through the *same* kernel via a masked load/store, so every element of
+    /// the output — tail included — is computed identically.
+    ///
+    /// The `target_feature` is load-bearing, not decoration. LLVM will not
+    /// inline a callee that requires a feature its caller lacks — a *strict*
+    /// superset; equal feature sets inline fine, which is the whole point of
+    /// putting `avx2,fma` back here. Without it the `kernel` closures — which
+    /// are all `avx2,fma` — cannot be inlined into this loop. Today that is masked:
+    /// every caller is itself `avx2,fma`, so `map_ps` gets inlined *upwards*
+    /// into the caller first and the closure folds in afterwards. That is a
+    /// property of the current inlining decision, not a guarantee. Grow this
+    /// function past the inline threshold and the closure becomes a real call
+    /// per 8 elements, which for a kernel like `erf_ps` would also force all
+    /// of its constants to be re-materialised on every call.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn map_ps(
         input: &[f32],
         output: &mut [f32],
@@ -2195,6 +2240,38 @@ mod tests {
 
     /// The interesting band is `|x| <= 1`, where `erf` is steep and the small
     /// polynomial runs; sample it far more densely than the wide sweep can.
+    /// `erf`'s two on-path polynomials are evaluated by Estrin's scheme, which
+    /// reassociates them, so the guard that the reassociation did not cost
+    /// accuracy has to be tighter than `ERF_BOUND` — that bound carries five
+    /// times the slack the kernel actually uses, so a reassociation four times
+    /// worse would still pass it.
+    ///
+    /// Both the Horner and the Estrin evaluation reach a worst scaled error of
+    /// exactly `2^-24` over this sweep, i.e. half an ulp, which is the best a
+    /// correctly-rounded `f32` result can do. Pinning the *worst* case here
+    /// means a regrouping that widens it fails, instead of being absorbed by
+    /// `ERF_BOUND`. (Individual points do move: Estrin differs from Horner by
+    /// one ulp at some two thousand of these inputs. It is the envelope that
+    /// must not grow.)
+    ///
+    /// Calls `erf_avx2` rather than `erf_f32_slice` on purpose. The slice entry
+    /// point dispatches to the scalar `libm` path when AVX2 is missing and to
+    /// MLAS under `--features mlas`; either way the test would still pass while
+    /// exercising something that has no Estrin in it at all. Naming the kernel
+    /// means the assertion is about the code the doc comment describes.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn erf_reassociation_costs_no_accuracy() {
+        if !vector_path_available() {
+            return;
+        }
+        let x = grid(-6.0, 6.0, 400_003, &[]);
+        let mut out = vec![0.0f32; x.len()];
+        // SAFETY: guarded by the runtime AVX2+FMA detection above.
+        unsafe { erf_avx2(&x, &mut out) };
+        check(&x, &out, erf_ref, 5.97e-8, "erf reassociation");
+    }
+
     #[test]
     fn erf_dense_sweep_near_origin() {
         let x = grid(-1.5, 1.5, 400_003, &[]);
