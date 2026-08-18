@@ -37,6 +37,7 @@ use super::{check_arity, to_dense_i64};
 use crate::dtype::{
     output_direct_write_eligible, slice_byte_range, to_dense_f32_widen, write_dense_f32_narrow,
 };
+use crate::task_runtime;
 
 /// Elements below which the rotation stays on one thread. RoPE is two multiplies
 /// and an add per element - firmly memory bound - so the crossover is set by the
@@ -59,21 +60,20 @@ const MIN_PARALLEL_ROTARY_ELEMENTS: usize = 64 * 1024;
 /// until they clear this bar.
 const MIN_ROTARY_TASK_ELEMENTS: usize = 16 * 1024;
 
-/// How many layout units (`[B,H,S,D]` planes or `[B,S,H*D]` rows) one Rayon
-/// task should own, given `total_units` of `unit_elems` each.
+/// The fewest layout units (`[B,H,S,D]` planes or `[B,S,H*D]` rows) of
+/// `unit_elems` each that are worth handing to another thread.
 ///
-/// Aims for ~4 tasks per worker so a straggler costs a quarter of a worker's
-/// share, then raises the chunk until each task clears
-/// [`MIN_ROTARY_TASK_ELEMENTS`]. Returns `total_units` (a single task) when the
-/// pool has one worker, so the serial shape is reached without paying for a
-/// fan-out that cannot overlap with anything.
-fn rotary_units_per_task(total_units: usize, unit_elems: usize, workers: usize) -> usize {
-    if workers <= 1 || total_units <= 1 {
-        return total_units.max(1);
-    }
-    let by_balance = total_units.div_ceil(workers.saturating_mul(4)).max(1);
-    let by_size = MIN_ROTARY_TASK_ELEMENTS.div_ceil(unit_elems.max(1)).max(1);
-    by_balance.max(by_size).min(total_units)
+/// This is a *floor*, not a task size. The task runtime owns the balance
+/// question -- it knows the pool width, and its tasks are claimed dynamically
+/// rather than assigned up front, so a straggler strands one task instead of a
+/// whole static share. All this kernel has to say is how small a task may get
+/// before the fan-out costs more than the work, which is
+/// [`MIN_ROTARY_TASK_ELEMENTS`] worth of units.
+///
+/// Passing `total_units` back (the serial shape) is how the caller expresses
+/// "do not split this at all"; see [`MIN_PARALLEL_ROTARY_ELEMENTS`].
+fn rotary_min_units_per_task(unit_elems: usize) -> usize {
+    MIN_ROTARY_TASK_ELEMENTS.div_ceil(unit_elems.max(1)).max(1)
 }
 
 // ─── Rotation inner loops ───────────────────────────────────────────────────
@@ -512,8 +512,9 @@ impl Kernel for RotaryEmbeddingKernel {
         // per-element layout branch the old flat-index closure carried, and
         // lets the outer loop fan out across the shared Rayon pool. ORT
         // parallelizes the same transform.
-        let workers = rayon::current_num_threads().max(1);
-        let parallel = workers > 1 && y.len() >= MIN_PARALLEL_ROTARY_ELEMENTS;
+        // Below this the fan-out cannot pay for itself, and the runtime is told
+        // so by asking for one task's worth of units per task.
+        let splittable = y.len() >= MIN_PARALLEL_ROTARY_ELEMENTS;
         if is_4d {
             // [B, H, S, D]: plane (b, h) is `seq * head_size` contiguous.
             let plane = seq * head_size;
@@ -529,21 +530,13 @@ impl Kernel for RotaryEmbeddingKernel {
                     );
                 }
             };
-            let per_task = rotary_units_per_task(batch * heads, plane, workers);
-            if parallel && per_task < batch * heads {
-                use rayon::prelude::*;
-                y.par_chunks_mut(plane * per_task)
-                    .enumerate()
-                    .for_each(|(task, slab)| {
-                        for (i, out) in slab.chunks_mut(plane).enumerate() {
-                            fill(task * per_task + i, out);
-                        }
-                    });
+            let units = (batch * heads).max(1);
+            let min_units = if splittable {
+                rotary_min_units_per_task(plane)
             } else {
-                for (bh, out) in y.chunks_mut(plane).enumerate() {
-                    fill(bh, out);
-                }
-            }
+                units
+            };
+            task_runtime::chunks_mut(y, plane, min_units, fill);
         } else {
             // [B, S, H·D]: row (b, s) is `heads * head_size` contiguous.
             let row_len = heads * head_size;
@@ -559,21 +552,13 @@ impl Kernel for RotaryEmbeddingKernel {
                     );
                 }
             };
-            let per_task = rotary_units_per_task(batch * seq, row_len, workers);
-            if parallel && per_task < batch * seq {
-                use rayon::prelude::*;
-                y.par_chunks_mut(row_len * per_task)
-                    .enumerate()
-                    .for_each(|(task, slab)| {
-                        for (i, out) in slab.chunks_mut(row_len).enumerate() {
-                            fill(task * per_task + i, out);
-                        }
-                    });
+            let units = (batch * seq).max(1);
+            let min_units = if splittable {
+                rotary_min_units_per_task(row_len)
             } else {
-                for (bs, out) in y.chunks_mut(row_len).enumerate() {
-                    fill(bs, out);
-                }
-            }
+                units
+            };
+            task_runtime::chunks_mut(y, row_len, min_units, fill);
         }
 
         if direct {
@@ -1339,50 +1324,59 @@ mod vector_arm_tests {
 
     #[test]
     fn task_chunking_covers_every_unit_exactly_once() {
-        // `rotary_units_per_task` feeds `par_chunks_mut`, so an off-by-one
-        // silently drops or double-writes a row. Check the derived tiling is a
-        // partition for a wide range of shapes and pool sizes.
+        // The grain floor feeds `task_runtime::chunks_mut`, so an off-by-one
+        // silently drops or double-writes a row. Check that the runtime's tiling
+        // is a partition for a wide range of shapes and pool widths.
         for total in [1usize, 2, 3, 5, 8, 31, 32, 128, 512, 4096] {
             for unit in [64usize, 512, 4096, 32768] {
-                for workers in [1usize, 2, 8, 16, 32] {
-                    let per = rotary_units_per_task(total, unit, workers);
-                    assert!(per >= 1 && per <= total.max(1), "per={per} total={total}");
-                    let tasks = total.div_ceil(per);
-                    assert_eq!(
-                        (0..tasks)
-                            .map(|t| (total - t * per).min(per))
-                            .sum::<usize>(),
-                        total,
-                        "tiling total={total} unit={unit} workers={workers} per={per}"
-                    );
-                    if workers == 1 {
-                        assert_eq!(per, total.max(1), "one worker must stay serial");
+                let min_units = rotary_min_units_per_task(unit);
+                assert!(min_units >= 1, "min_units={min_units} unit={unit}");
+                let mut data = vec![0u32; total * unit];
+                task_runtime::chunks_mut(&mut data, unit, min_units, |index, slab| {
+                    for value in slab {
+                        *value = index as u32 + 1;
                     }
+                });
+                for index in 0..total {
+                    assert!(
+                        data[index * unit..(index + 1) * unit]
+                            .iter()
+                            .all(|&v| v == index as u32 + 1),
+                        "tiling total={total} unit={unit} lost unit {index}"
+                    );
                 }
             }
         }
     }
 
     #[test]
-    fn a_single_worker_pool_never_splits_the_rotation() {
+    fn a_serial_request_never_splits_the_rotation() {
         // Measured: fanning 128 tasks out over a one-worker pool cost 36us of
         // pure Rayon bookkeeping on `rope_llama3_s128` (162us vs 126us). The
-        // serial shape must be reachable.
-        assert_eq!(rotary_units_per_task(128, 4096, 1), 128);
-        assert_eq!(rotary_units_per_task(4096, 64, 1), 4096);
+        // serial shape must be reachable, and the kernel reaches it by asking
+        // for every unit in one task.
+        assert_eq!(
+            task_runtime::testing::planned_backend(128, 128),
+            task_runtime::Backend::Serial
+        );
+        assert_eq!(
+            task_runtime::testing::planned_backend(4096, 4096),
+            task_runtime::Backend::Serial
+        );
     }
 
     #[test]
-    fn tasks_clear_the_minimum_work_bar_when_the_pool_is_wide() {
-        // 128 rows of 4096 elements over 16 workers must not become 128 tasks.
-        let per = rotary_units_per_task(128, 4096, 16);
+    fn tasks_clear_the_minimum_work_bar() {
+        // 128 rows of 4096 elements must not become 128 tasks.
+        let per = rotary_min_units_per_task(4096);
         assert!(
             per * 4096 >= MIN_ROTARY_TASK_ELEMENTS,
             "task of {} elements is below the {MIN_ROTARY_TASK_ELEMENTS}-element bar",
             per * 4096
         );
-        assert!(128 / per >= 16, "only {} tasks for 16 workers", 128 / per);
         // Tiny units must be aggregated hard rather than shipped one per task.
-        assert!(rotary_units_per_task(65536, 8, 16) * 8 >= MIN_ROTARY_TASK_ELEMENTS);
+        assert!(rotary_min_units_per_task(8) * 8 >= MIN_ROTARY_TASK_ELEMENTS);
+        // A unit that already clears the bar is never aggregated further.
+        assert_eq!(rotary_min_units_per_task(MIN_ROTARY_TASK_ELEMENTS * 2), 1);
     }
 }
