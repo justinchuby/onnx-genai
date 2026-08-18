@@ -365,12 +365,13 @@ fn activation_and_norm_ops_clear_every_capability_filter() {
     /// Ops whose whole purpose is an activation or a normalisation. If one of
     /// these reaches ORT's CPU EP, the EP is not doing its job.
     ///
-    /// `Celu` and `Mish` are deliberately absent: this EP has no kernel for
-    /// either, so ORT running them is a missing feature rather than a decline.
-    /// They are tracked in `docs/performance/CPU_ACTIVATION_GAPS.md`; add them
-    /// here the moment a kernel lands, and this test will then hold them to the
-    /// same standard as the rest.
+    /// `Celu` and `Mish` used to be listed here as deliberate absences,
+    /// with a note to add them the moment a kernel landed. It has landed, so
+    /// they are held to the same standard as the rest: both the shape filter
+    /// and the dtype filter, which is the pair `PRelu` slipped between.
     const OWNED: &[(&str, &str)] = &[
+        ("", "Celu"),
+        ("", "Mish"),
         ("", "Tanh"),
         ("", "Sigmoid"),
         ("", "Erf"),

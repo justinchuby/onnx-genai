@@ -75,9 +75,10 @@ impl Activation {
                 x * s
             }
             Self::Silu => silu(x),
-            // ONNX writes Celu literally as
-            // `max(0,x) + min(0, alpha*(exp(x/alpha)-1))`, and so does ORT.
-            Self::Celu { alpha } => x.max(0.0) + (alpha * ((x / alpha).exp() - 1.0)).min(0.0),
+            // Shared with the slice path rather than transcribed again: the
+            // literal ONNX formula loses NaN through `f32::max`/`min`, and one
+            // copy of that guard is easier to keep true than two.
+            Self::Celu { alpha } => crate::kernels::simd_activations::celu_scalar(x, alpha),
             // Mish(x) = x * tanh(softplus(x)), with softplus in its stable
             // form so large `x` neither overflows nor loses the identity.
             Self::Mish => x * (x.max(0.0) + (-x.abs()).exp().ln_1p()).tanh(),
@@ -130,6 +131,13 @@ impl Activation {
             }
             Self::Silu => silu_f64(x),
             Self::Celu { alpha } => {
+                // See `simd_activations::celu_scalar`: `max`/`min` return the
+                // other operand for NaN, so without this the f64 path -- which
+                // every `Float64` tensor takes -- would answer `0.0` where ORT
+                // and the f32 paths answer NaN.
+                if x.is_nan() {
+                    return x;
+                }
                 let a = f64::from(alpha);
                 x.max(0.0) + (a * ((x / a).exp() - 1.0)).min(0.0)
             }
@@ -519,6 +527,27 @@ mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ir::{Attribute, NodeId};
+
+    /// `Float64` tensors never touch the SIMD kernels, so `apply_f64` is the
+    /// only implementation a `double` model sees. It has to agree with the
+    /// other two about NaN -- `f64::max`/`min` drop it exactly as the f32 ones
+    /// do, and ORT propagates it.
+    #[test]
+    fn celu_and_mish_propagate_nan_on_every_path() {
+        for alpha in [0.5f32, 1.0, 3.0] {
+            let act = Activation::Celu { alpha };
+            assert!(act.apply(f32::NAN).is_nan(), "f32 Celu(NaN), alpha={alpha}");
+            assert!(
+                act.apply_f64(f64::NAN).is_nan(),
+                "f64 Celu(NaN), alpha={alpha}"
+            );
+        }
+        assert!(Activation::Mish.apply(f32::NAN).is_nan(), "f32 Mish(NaN)");
+        assert!(
+            Activation::Mish.apply_f64(f64::NAN).is_nan(),
+            "f64 Mish(NaN)"
+        );
+    }
 
     #[test]
     fn activation_formulas_and_defaults() {

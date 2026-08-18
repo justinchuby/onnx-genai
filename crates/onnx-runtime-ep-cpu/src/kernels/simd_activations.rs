@@ -792,22 +792,13 @@ mod erf_c {
     pub(super) const EXP_C: f32 = 1.25829120e7;
 }
 
-/// `MlasExpConstants` (`onnxruntime/core/mlas/lib/compute.cpp`), the parameter
-/// set behind `MlasComputeExp`.
-///
-/// These are *not* the `erf_c::EXP_*` values above. `erf_c`'s copy is the older
-/// polynomial extracted from `MlasErfConstants`, valid only on
-/// `[-88.376, 0]` — enough for `erf`'s big branch, which never sees a positive
-/// argument. A standalone `Exp` operator has to cover the whole `f32` line, so
-/// MLAS uses a separately refined polynomial plus XNNPACK's two-piece exponent
-/// reconstruction, which extends the representable output range down to
-/// `-103.972` (subnormal results) and up to `88.776` (overflow to `+Inf`).
 #[cfg(target_arch = "x86_64")]
 /// Cephes `logf` constants.
 ///
 /// These are the same coefficients Eigen's `plog` carries, which is what ORT's
 /// CPU `Log` ultimately evaluates, so matching them is what buys us parity
 /// rather than merely accuracy.
+#[cfg(target_arch = "x86_64")]
 mod log_c {
     /// `sqrt(0.5)`. The mantissa is folded into `[sqrt(0.5), sqrt(2))` around
     /// this point so the polynomial argument `f = m - 1` stays small and
@@ -832,6 +823,17 @@ mod log_c {
     pub(super) const DENORM_EXP: f32 = 25.0;
 }
 
+/// `MlasExpConstants` (`onnxruntime/core/mlas/lib/compute.cpp`), the parameter
+/// set behind `MlasComputeExp`.
+///
+/// These are *not* the `erf_c::EXP_*` values above. `erf_c`'s copy is the older
+/// polynomial extracted from `MlasErfConstants`, valid only on
+/// `[-88.376, 0]` — enough for `erf`'s big branch, which never sees a positive
+/// argument. A standalone `Exp` operator has to cover the whole `f32` line, so
+/// MLAS uses a separately refined polynomial plus XNNPACK's two-piece exponent
+/// reconstruction, which extends the representable output range down to
+/// `-103.972` (subnormal results) and up to `88.776` (overflow to `+Inf`).
+#[cfg(target_arch = "x86_64")]
 mod exp_c {
     /// Below this every result is `0`; `-Inf` clamps here.
     pub(super) const LOWER_RANGE: f32 = -103.9720840454;
@@ -1407,7 +1409,17 @@ fn log_scalar(x: f32) -> f32 {
 ///
 /// This is ONNX's definition evaluated literally, which is also what ORT does.
 /// `alpha` is required to be non-zero by the spec.
-fn celu_scalar(x: f32, alpha: f32) -> f32 {
+pub(crate) fn celu_scalar(x: f32, alpha: f32) -> f32 {
+    // Transcribing the formula literally is not enough. Rust's `f32::max` and
+    // `f32::min` are IEEE-754 `maxNum`/`minNum`: they return the *other*
+    // operand when one is NaN, so both terms collapse to zero and `Celu(NaN)`
+    // comes out `0.0`. ORT propagates NaN, and so does `celu_ps` (whose
+    // `maxps` keeps it) -- without this guard the answer would depend on
+    // whether the slice was long enough for the vector path and on whether the
+    // host has AVX2, which is exactly what `dispatch!` exists to prevent.
+    if x.is_nan() {
+        return x;
+    }
     x.max(0.0) + (alpha * ((x / alpha).exp() - 1.0)).min(0.0)
 }
 
@@ -1787,6 +1799,44 @@ mod avx2 {
     /// [`exp_tests::nan_propagates_instead_of_becoming_finite`] pins this.
     ///
     /// An explicit `_CMP_UNORD_Q` compare plus `blendv` was measured as the
+    /// alternative and cost about 10% of throughput at 256 K elements for no
+    /// behavioural difference.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn exp_full_ps(x: __m256) -> __m256 {
+        let mut v = _mm256_min_ps(_mm256_set1_ps(exp_c::UPPER_RANGE), x);
+        v = _mm256_max_ps(_mm256_set1_ps(exp_c::LOWER_RANGE), v);
+
+        let bias = _mm256_set1_ps(exp_c::ROUNDING_BIAS);
+        let biased = _mm256_fmadd_ps(v, _mm256_set1_ps(exp_c::LOG2_RECIPROCAL), bias);
+        let m = _mm256_sub_ps(biased, bias);
+
+        v = _mm256_fmadd_ps(m, _mm256_set1_ps(exp_c::LOG2_HIGH), v);
+        v = _mm256_fmadd_ps(m, _mm256_set1_ps(exp_c::LOG2_LOW), v);
+
+        let max_exp = _mm256_set1_epi32(exp_c::MAXIMUM_EXPONENT);
+        let min_exp = _mm256_set1_epi32(exp_c::MINIMUM_EXPONENT);
+        let raw = _mm256_slli_epi32::<23>(_mm256_castps_si256(biased));
+        let normal = _mm256_max_epi32(_mm256_min_epi32(raw, max_exp), min_exp);
+        let overflow = _mm256_add_epi32(_mm256_sub_epi32(raw, normal), max_exp);
+        let normal = _mm256_add_epi32(normal, max_exp);
+        let overflow = _mm256_castsi256_ps(overflow);
+        let normal = _mm256_castsi256_ps(normal);
+
+        let mut p = _mm256_set1_ps(exp_c::P0);
+        p = _mm256_fmadd_ps(p, v, _mm256_set1_ps(exp_c::P1));
+        p = _mm256_fmadd_ps(p, v, _mm256_set1_ps(exp_c::P2));
+        p = _mm256_fmadd_ps(p, v, _mm256_set1_ps(exp_c::P3));
+        p = _mm256_fmadd_ps(p, v, _mm256_set1_ps(exp_c::P4));
+        p = _mm256_fmadd_ps(p, v, _mm256_set1_ps(exp_c::P56));
+
+        v = _mm256_mul_ps(v, overflow);
+        p = _mm256_fmadd_ps(p, v, overflow);
+        p = _mm256_mul_ps(p, normal);
+
+        p
+    }
+
     /// `ln(x)` for eight lanes, the Cephes decomposition.
     ///
     /// `x = m * 2^e` with `m` folded into `[sqrt(0.5), sqrt(2))`, then
@@ -1932,44 +1982,6 @@ mod avx2 {
     #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn mish_ps(x: __m256) -> __m256 {
         unsafe { _mm256_mul_ps(x, tanh_ps(softplus_ps(x))) }
-    }
-
-    /// alternative and cost about 10% of throughput at 256 K elements for no
-    /// behavioural difference.
-    #[inline]
-    #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn exp_full_ps(x: __m256) -> __m256 {
-        let mut v = _mm256_min_ps(_mm256_set1_ps(exp_c::UPPER_RANGE), x);
-        v = _mm256_max_ps(_mm256_set1_ps(exp_c::LOWER_RANGE), v);
-
-        let bias = _mm256_set1_ps(exp_c::ROUNDING_BIAS);
-        let biased = _mm256_fmadd_ps(v, _mm256_set1_ps(exp_c::LOG2_RECIPROCAL), bias);
-        let m = _mm256_sub_ps(biased, bias);
-
-        v = _mm256_fmadd_ps(m, _mm256_set1_ps(exp_c::LOG2_HIGH), v);
-        v = _mm256_fmadd_ps(m, _mm256_set1_ps(exp_c::LOG2_LOW), v);
-
-        let max_exp = _mm256_set1_epi32(exp_c::MAXIMUM_EXPONENT);
-        let min_exp = _mm256_set1_epi32(exp_c::MINIMUM_EXPONENT);
-        let raw = _mm256_slli_epi32::<23>(_mm256_castps_si256(biased));
-        let normal = _mm256_max_epi32(_mm256_min_epi32(raw, max_exp), min_exp);
-        let overflow = _mm256_add_epi32(_mm256_sub_epi32(raw, normal), max_exp);
-        let normal = _mm256_add_epi32(normal, max_exp);
-        let overflow = _mm256_castsi256_ps(overflow);
-        let normal = _mm256_castsi256_ps(normal);
-
-        let mut p = _mm256_set1_ps(exp_c::P0);
-        p = _mm256_fmadd_ps(p, v, _mm256_set1_ps(exp_c::P1));
-        p = _mm256_fmadd_ps(p, v, _mm256_set1_ps(exp_c::P2));
-        p = _mm256_fmadd_ps(p, v, _mm256_set1_ps(exp_c::P3));
-        p = _mm256_fmadd_ps(p, v, _mm256_set1_ps(exp_c::P4));
-        p = _mm256_fmadd_ps(p, v, _mm256_set1_ps(exp_c::P56));
-
-        v = _mm256_mul_ps(v, overflow);
-        p = _mm256_fmadd_ps(p, v, overflow);
-        p = _mm256_mul_ps(p, normal);
-
-        p
     }
 
     /// `2^k` for integer-valued `k`, built by biasing and shifting into the
@@ -2702,6 +2714,59 @@ mod tests {
                 (f64::from(got) - f64::from(want)).abs() <= 4e-7,
                 "celu({xi}) = {got}, want {want}"
             );
+        }
+    }
+
+    /// The scalar fallback must answer exactly what the vector path answers.
+    ///
+    /// `special_inputs()` pads to `SIMD_MIN_LEN`, so every other special-value
+    /// test in this file takes the vector path -- which is how `celu_scalar`
+    /// silently turning NaN into `0.0` survived being written. A slice shorter
+    /// than `SIMD_MIN_LEN` is the only way to reach the scalar branch from
+    /// outside, and it is reached in production by small tensors and by any
+    /// host without AVX2. Which one runs must not be observable.
+    #[test]
+    fn celu_scalar_path_agrees_with_the_vector_path() {
+        let specials = [
+            f32::NAN,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            -0.0,
+            0.0,
+            -1.0,
+            1.0,
+            -30.0,
+            0.25,
+        ];
+        assert!(
+            specials.len() < SIMD_MIN_LEN,
+            "the short slice must be short enough to take the scalar path"
+        );
+        for alpha in [0.25f32, 1.0, 2.0, 7.5] {
+            let mut short_out = vec![0.0f32; specials.len()];
+            celu_f32_slice(&specials, &mut short_out, alpha);
+
+            let mut long = vec![0.0f32; PAD];
+            long.extend_from_slice(&specials);
+            let mut long_out = vec![0.0f32; long.len()];
+            celu_f32_slice(&long, &mut long_out, alpha);
+
+            for (i, &x) in specials.iter().enumerate() {
+                let scalar = short_out[i];
+                let vector = long_out[PAD + i];
+                assert_eq!(
+                    scalar.is_nan(),
+                    vector.is_nan(),
+                    "celu({x}, alpha={alpha}): scalar {scalar}, vector {vector}"
+                );
+                if !scalar.is_nan() {
+                    assert_eq!(
+                        scalar.to_bits(),
+                        vector.to_bits(),
+                        "celu({x}, alpha={alpha}): scalar {scalar}, vector {vector}"
+                    );
+                }
+            }
         }
     }
 
