@@ -440,6 +440,16 @@ from #944 reports `reads_per_step` directly, so this is measurable rather than
 assumed — and it should be measured before any MoE-specific residency policy is
 designed.
 
+> **Update (2026-08-18):** it has now been measured. See
+> [`MOE_OFFLOAD_ARCHITECTURE.md`](MOE_OFFLOAD_ARCHITECTURE.md) (and #1321/#1322/#1326/#1331).
+> The result refines the dense conclusion rather than overturning it: the OS page
+> cache captures **83–88%** of the achievable win whenever the routing-hot expert
+> set fits in DRAM cache (LRU exploits skew for free, because frequent ≈ recent),
+> and a routing-aware pin earns its complexity **only** once the hot set exceeds
+> cache — the oversubscribed regime, ~45 GB hot-set on a 64 GB box (inferred). The
+> dense `reads_per_step = 1.000` case is that same page-cache regime with no reuse,
+> which is why nothing clever was possible and the OS won by ~30×.
+
 For dense models the only thing that changes the floor is **batching**, because
 it changes `W` per token rather than the bandwidth: `N` sequences sharing one
 fused forward read each weight once for `N` tokens, measured at `1/N` with a
