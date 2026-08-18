@@ -436,7 +436,6 @@ mod tests {
     #[test]
     fn a_probe_does_not_carry_the_callers_work() {
         let cell = AtomicU32::new(0);
-        let indices = AtomicUsize::new(0);
         // SAFETY: as `with_probe`; `COUNT` outlives the handle.
         static COUNT: AtomicUsize = AtomicUsize::new(0);
         unsafe fn counting_host(_host: *mut c_void, total: usize, body: &(dyn Fn(usize) + Sync)) {
@@ -461,7 +460,6 @@ mod tests {
             PROBE_INDICES,
             "the probe dispatch is empty and fixed-size"
         );
-        indices.store(0, Ordering::Relaxed);
     }
 
     /// Until the host has been seen helping, work stays on our pool -- which

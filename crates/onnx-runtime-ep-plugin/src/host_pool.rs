@@ -282,7 +282,7 @@ pub unsafe fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onnx_runtime_ep_api::host_parallel::{PROBE_MAX, PROBE_MIN};
+    use onnx_runtime_ep_api::host_parallel::{PROBE_BURST, PROBE_MAX, PROBE_MIN};
     use std::sync::atomic::AtomicUsize;
 
     /// Stands in for ORT: runs every index inline and reports success.
@@ -303,6 +303,26 @@ mod tests {
         }
         core::ptr::null_mut()
     }
+
+    /// [`inline_parallel_for`] that counts the dispatches it is handed.
+    ///
+    /// # Safety
+    ///
+    /// As [`inline_parallel_for`].
+    unsafe extern "C" fn counted_inline_parallel_for(
+        ctx: *const ort::OrtKernelContext,
+        body: Option<unsafe extern "C" fn(*mut c_void, usize)>,
+        total: usize,
+        num_batch: usize,
+        usr_data: *mut c_void,
+    ) -> *mut ort::OrtStatus {
+        INLINE_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+        unsafe { inline_parallel_for(ctx, body, total, num_batch, usr_data) }
+    }
+
+    /// Dispatches [`counted_inline_parallel_for`] has seen. Only
+    /// `the_probe_and_the_latch_agree` reads it, and it resets it first.
+    static INLINE_DISPATCHES: AtomicUsize = AtomicUsize::new(0);
 
     /// Stands in for an ORT that refuses the dispatch.
     ///
@@ -492,7 +512,8 @@ mod tests {
         // The same, over a pool that runs everything on the calling thread:
         // it can never prove itself, so the work stays on our own pool.
         let quiet = AtomicU32::new(0);
-        let mut inline = pool(inline_parallel_for, &quiet);
+        let mut inline = pool(counted_inline_parallel_for, &quiet);
+        INLINE_DISPATCHES.store(0, Ordering::Relaxed);
         // SAFETY: as above.
         let handle = unsafe {
             HostParallel::new(
@@ -514,9 +535,23 @@ mod tests {
         );
         // The cell still has to be asking often enough to recover if the
         // opening burst was unlucky, and not so often that it costs anything.
+        // Counting the dispatches the pool actually saw is the only way to say
+        // that: reading the settled period back out of the cell would only
+        // restate the constant.
+        let probes = INLINE_DISPATCHES.load(Ordering::Relaxed);
+        let dispatches = 4096;
+        assert!(
+            probes > usize::try_from(PROBE_BURST).unwrap(),
+            "probing stopped after the opening burst ({probes} probes): an \
+             unlucky burst could never be recovered from"
+        );
+        assert!(
+            probes <= dispatches / usize::try_from(PROBE_MIN).unwrap(),
+            "probed {probes} times in {dispatches} dispatches, more often than \
+             the shortest back-off period allows"
+        );
         let settled = quiet.load(Ordering::Relaxed) >> 16;
         assert_eq!(settled, PROBE_MAX, "probes should settle at the cap");
-        assert!(settled >= PROBE_MIN, "and never stop entirely");
     }
 
     #[test]
