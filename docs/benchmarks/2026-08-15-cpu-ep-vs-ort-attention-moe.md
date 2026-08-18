@@ -2242,3 +2242,142 @@ near a flat ~1.3 at every thread count instead of scaling.
    single-node graphs. Softmax has to win inside a real fused SDPA region.
 6. **Output/intermediate arena** (§21.3) - #1146 removed the input half;
    `collect_outputs` remains.
+
+## 28. Phase 8: the appendable KV path, and what it actually cost
+
+Phase 8 went at the KV cache structurally rather than through the scheduler
+(which Sebastian now owns). Mapping the CPU appendable-KV path turned up two
+defects that had nothing to do with thread counts, and both are now fixed.
+
+### 28.1 A bf16 KV cache widened its entire capacity, every forward (#1199)
+
+`PastCache::from_cache` classified a KV cache into one of three sources. It
+borrowed contiguous `f32` and contiguous `f16` and sent everything else to
+`to_dense_f32_widen`, which allocates a `Vec<f32>` over the cache's **whole
+physical capacity** and widens every element into it — for a result the append
+path then reads one token's rows out of and drops.
+
+`bf16` landed in that catch-all. Three things made it worse than it looks:
+
+* It is on the **general** path. `from_cache` runs on every
+  `GroupQueryAttention` forward, before any aliasing gate is evaluated.
+* It runs **twice per layer per token**.
+* It scales with **capacity**, not with the valid prefix, so it does not get
+  cheaper at short context and a generous `ONNX_GENAI_CPU_KV_MAX_LEN` makes it
+  worse.
+
+`f16` never paid any of it. The two half formats are handled identically
+everywhere else in the kernel; only the classifier had the gap.
+
+Classify + read one row at llama3-8B KV geometry (8 kv heads, head_dim 128,
+capacity 4096 — 4.19M elements, a 16 MiB widen), best of 7 x 20, release:
+
+| dtype | before | after |
+|---|---|---|
+| f16 | 83 ns | 83 ns |
+| **bf16** | **606 147 ns** | **81 ns** |
+
+bf16 now costs what f16 costs. On a 32-layer decoder that is ~39 ms per token
+of pure widen removed; the unchanged f16 column confirms nothing else moved.
+
+**The part worth remembering.** The first version of this fix used
+`widen_bf16_slice_into`, a raw `(bits << 16)` shift. The path it replaced
+reaches `half::bf16::to_f32`, which **quiets signalling NaN**. Those two
+disagree on exactly 126 of the 65536 bit patterns. `dtype.rs` already carried a
+warning about precisely this, on `widen_quieting`:
+
+> A bulk path that replaces the latter has to quiet, or it would silently
+> change what every bf16 kernel sees for sNaN inputs.
+
+`cast.rs`, `elementwise.rs` and `dense_elementwise.rs` had each taken that
+advice and each left a comment saying so. This kernel was the one that did not
+— and the reason it was easy to get wrong is that there was no *safe* slice
+wrapper for the quieting widen, only the unsafe AVX2 intrinsic. There is one
+now (`widen_bf16_slice_quieting_into`), documented against its raw sibling.
+
+The test that "verified" bit-identity listed one NaN pattern and happened to
+pick a **quiet** one, so it passed against a non-quieting widen. It is now an
+exhaustive sweep of all 65536 patterns across six `(start, len)` windows. Two
+further instances of the same defect in the same kernel — `HalfKv::widen_into`
+on the in-place append path, and `widen_rotary_prefix`, whose own fallback four
+lines below is `to_dense_f32_widen` — were fixed with it.
+
+### 28.2 The CPU KV cache could not grow at all (#1203)
+
+`decode_cpu_inplace` hard-errored the moment a context outgrew the cache:
+
+    bail!("CPU KV capacity exceeded: requested context length {total_len}, ...")
+
+`DEFAULT_CPU_KV_MAX_LEN` is 4096, so **token 4097 killed the generation**. The
+suggested remedy — raise the env var — means guessing a bigger number up front
+and paying for it in resident memory for the whole run. The CUDA path has had
+growth since it landed (`ensure_capacity`, bucketing, VMM remap); the CPU path
+had none of it.
+
+Capacity is axis 2 of `[B, H, capacity, Dh]`, not the outermost axis, so head
+`i` lives at `i * capacity * Dh` and **growing relocates every head but the
+first**. A flat memcpy would leave head 1 onward reading the previous head's
+tail — plausible numbers, silently wrong attention, no crash. The prefix is
+carried one contiguous run per `(batch, head)` block. Growth doubles, so
+re-binding is amortised O(1) per token.
+
+**The end-to-end test was worthless on the first attempt, and this is the
+lesson.** It asserted that a decode with a deliberately tiny KV capacity
+produced the same tokens as one with room to spare. It passed — and it *also*
+passed when growth was changed to drop the entire KV history, because the
+scalar-GQA fixture's q/k/v are `Constant` zeros and its output does not depend
+on cache contents at all. Token equality proved nothing.
+
+The property worth testing is the one the unit tests cannot reach:
+`GroupQueryAttention` decides to append in place by comparing the past-input
+and present-output pointers **at execution time**, so a reallocated buffer that
+failed to re-alias would silently stop appending. Nothing observable
+distinguished that from success — so the f32 in-place path now has a counter
+(`present_inplace_count()`, mirroring the half-precision one that already
+existed), and the test asserts a cache forced to grow repeatedly appends in
+place **exactly as often** as one that never grows. Breaking the aliasing fails
+it. As a side effect these counters, which had no consumer outside the kernel's
+own unit tests, now have one.
+
+### 28.3 Where the KV axis stands against ORT, context 1k–8k
+
+Concat-shaped KV, matched paired-interleaved A/B, one driver invocation,
+5 trials x 30 runs x 10 warmups. Ratio is native/ORT, lower is better.
+Parity **60/60 PASS**.
+
+| model | t=1 | t=8 | t=16 |
+|---|---|---|---|
+| kvcat_llama3_p1023 | **0.979** | 4.079 | 4.207 |
+| kvcat_llama3_p2047 | **0.978** | 4.298 | 5.585 |
+| kvcat_llama3_p4095 | 1.981 | 5.122 | 5.322 |
+| kvcat_llama3_p8191 | **1.009** | 2.418 | 2.698 |
+
+Two things to read here, and one not to.
+
+* **t=1 is at parity across the whole 1k–8k range** (0.98–1.01), with p4095 the
+  single exception.
+* **t=8/16 lose 2.4–5.6×.** This is §26's worker-park effect, not a KV defect:
+  the same shape of result appears on every kernel in §27 regardless of what it
+  computes. It is Sebastian's area and nothing in Phase 8 touches it.
+* **Do not read the p4095 row as a regression against p8191.** ORT's absolute
+  time doubles from p4095 to p8191 (1.92 → 3.73 ms) as expected, while native's
+  is flat (3.81 → 3.76 ms). Native is paying a roughly fixed ~3.8 ms at both
+  lengths, so the *ratio* improves with context purely because ORT's cost grows
+  into it. That flat cost is unexplained and is the next thing to chase on this
+  axis; the honest summary is "native does not scale with past length here the
+  way ORT does, in both directions".
+
+### 28.4 What is still structurally blocked
+
+`Concat`-shaped KV caches still pay the full O(S) history copy, and that is
+still the §13 boundary: `ExternalValue` has no strides field, so a device-bound
+value is always dense, and a capacity-backed dense view of `[B,H,S,D]` with the
+growth axis at position 2 is not expressible. The GQA present==past route
+(which Phase 8 improved) remains the only appendable path, and the engine still
+declines to take it for any non-f32 cache, so the bf16 fix above is reachable
+today only through the raw session API — though it applies to every bf16 GQA
+forward regardless.
+
+Beam reorder still does not exist for CPU or CUDA; `num_beams` is passthrough
+metadata and the decode loop is single-sequence. Nothing in Phase 8 changed
+that, and no claim about beam search should be made from this work.
