@@ -17,11 +17,59 @@ name: Weight cache guard
 # job is the crude defence: the pattern was found by grep in twenty minutes, so a
 # grep can guard it. It flags *new* long-lived buffer fields in the CPU kernels
 # and asks the author to answer one question rather than blocking them.
+#
+# 2026-08-17: this guard failed the test it exists to pass. #1133 parked a
+# QLinearMatMul i32 accumulator in a `thread_local!` `RefCell<Vec<i32>>`, bounded
+# by a *per-buffer* 32 MiB constant while the buffer is retained on every worker
+# thread for the life of the process -- 640 MiB on a 20-thread box, 1 GiB on a
+# 32-vCPU one, 4 GiB on a 128-vCPU one. Run against that PR's 459 added lines the
+# regex above matched **zero**, because it only knew `OnceLock`/`OnceCell`/
+# `LazyLock`.
+#
+# That is the same defect the guard was written to catch, one level up: a check
+# that exists and is green but is structurally incapable of failing on the case
+# that motivated it. It is also the fourth instance of the underlying arithmetic
+# error -- #1051 reported 247 MB against 592 MB measured, #1100's ratio test drove
+# a single instantiation so it could not observe the x2, and #1133 bounded one
+# copy of an N-per-thread buffer. Each comment was correct about one copy and
+# silent about N.
+#
+# So the second check below is not "also match thread_local". It asks the
+# question the first check does not: **what multiplies this buffer?** A retained
+# allocation has a per-instance size and an instance count, and only their product
+# is the process's exposure. Under-reporting is worse than reporting zero: zero is
+# obviously blind and gets caught at review, whereas a plausible-looking 32 MiB
+# passes admission and then overruns.
+#
+# 2026-08-17, later the same day: the guard failed again, and this time the hole
+# was not the regex but the **path filter**. #1132 adds
+# `crates/onnx-runtime-ep-cpu/src/dispatch_ledger.rs` containing
+#
+#     static LOG: OnceLock<Mutex<Vec<Observation>>> = OnceLock::new();
+#
+# an unbounded process-lifetime Vec that grows by one entry per dispatch
+# decision. Both jobs reported success on that PR's 3511 added lines, because
+# both looked only at `src/kernels/**` and the file is one directory up. The
+# first job's regex would have matched the line on sight.
+#
+# So the scope is now the whole EP crate's `src`, not just its kernels. The
+# question the guard asks -- "what multiplies this buffer, and who accounted for
+# it?" -- was never specific to kernels; only the original grep was. Falsified
+# before landing, which is the only reason to believe it:
+#
+#   scope src/kernels (before): #1132 -> 0 matches (green, wrongly)
+#   scope src        (after):  #1132 -> 1 match, exactly the ledger line
+#   six merged commits (11043a02, 8d4401d8, c62798b8, faf489a4, fdeaf77f,
+#   1f675d2b) under the widened scope: 0 new matches beyond the one #1133
+#   already produced -- so the wider net costs no false positives here.
+#
+# `OnceLock<Instant>` and `OnceLock<()>`, also added by #1132, are correctly not
+# matched: the patterns require an owned growable payload.
 
 on:
   pull_request:
     paths:
-      - "crates/onnx-runtime-ep-cpu/src/kernels/**"
+      - "crates/onnx-runtime-ep-cpu/src/**"
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
@@ -44,12 +92,16 @@ jobs:
         run: |
           set -uo pipefail
 
-          # Added lines only, in the CPU kernels, that declare a struct field
-          # holding an owned buffer for longer than a call. `GovernedWeightCache`
-          # is the sanctioned form and is excluded, as is the module that defines
-          # it and anything inside a #[cfg(test)] fixture.
+          # Added lines only, anywhere in the CPU EP's `src`, that declare a
+          # field or static holding an owned buffer for longer than a call.
+          # `GovernedWeightCache` is the sanctioned form and is excluded, as is
+          # the module that defines it and anything inside a #[cfg(test)] fixture.
+          # Scope is the whole crate, not just `kernels/`: #1132 put an unbounded
+          # `OnceLock<Mutex<Vec<Observation>>>` in `src/dispatch_ledger.rs` and
+          # this job reported success because the file sat one directory outside
+          # the old filter.
           added=$(git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" \
-                    -- crates/onnx-runtime-ep-cpu/src/kernels \
+                    -- crates/onnx-runtime-ep-cpu/src \
                     ':(exclude)crates/onnx-runtime-ep-cpu/src/kernels/governed_weight_cache.rs' \
                   | grep -E '^\+' \
                   | grep -vE '^\+\+\+' \
@@ -84,4 +136,68 @@ jobs:
           echo "::error::If it does NOT scale with weight size -- a fixed-size scratch, a"
           echo "::error::lookup table, a test fixture -- say so in the PR and add the"
           echo "::error::'weight-cache-reviewed' label to record that judgement."
+          exit 1
+
+  per-thread-retention:
+    name: A per-thread buffer needs a per-process bound
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Flag new per-thread retained buffers
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -uo pipefail
+
+          # An owned buffer behind interior mutability is how a value survives
+          # past a call without a struct field. In a `thread_local!` it is
+          # retained once per worker thread, so its process-wide ceiling is
+          # `per-thread bytes x pool width` -- and the pool width is exactly the
+          # variable these kernels scale with. The pattern is rare in this tree
+          # (3 occurrences at the time of writing), so flagging it is cheap.
+          # Scoped to the whole crate `src` for the same reason as the job above:
+          # a retained buffer is no less retained for living outside `kernels/`.
+          added=$(git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" \
+                    -- crates/onnx-runtime-ep-cpu/src \
+                    ':(exclude)crates/onnx-runtime-ep-cpu/src/kernels/governed_weight_cache.rs' \
+                  | grep -E '^\+' \
+                  | grep -vE '^\+\+\+' \
+                  | grep -E '(RefCell|Cell) *< *(Vec|Box|Arc)' \
+                  || true)
+
+          if [ -z "$added" ]; then
+            echo "No new per-thread retained buffers."
+            exit 0
+          fi
+
+          echo "Found new per-thread retained buffer declarations:"
+          echo "$added"
+          echo
+
+          case ",$LABELS," in
+            *,per-thread-bound-reviewed,*)
+              echo "Carries the 'per-thread-bound-reviewed' label; the author has"
+              echo "stated the per-process ceiling, not just the per-buffer one."
+              exit 0
+              ;;
+          esac
+
+          echo "::error::This PR retains an owned buffer behind interior mutability in a"
+          echo "::error::CPU kernel. If it lives in a thread_local!, it is retained once per"
+          echo "::error::worker thread for the life of the process, so a cap written as a"
+          echo "::error::single constant is NOT the process's exposure -- multiply it by the"
+          echo "::error::pool width before quoting it."
+          echo "::error::State the ceiling as 'per-thread x threads' with the arithmetic, and"
+          echo "::error::route the allocation through the memory plan (#1056): declare before"
+          echo "::error::allocating, account the bytes actually allocated, and be declinable."
+          echo "::error::A test for this MUST drive the buffer from more than one thread. A"
+          echo "::error::single-instantiation test cannot observe an xN multiplier, which is"
+          echo "::error::precisely how #1100 shipped with the factor unmeasured."
+          echo "::error::If the buffer is fixed-size, or is not retained across calls, say so"
+          echo "::error::in the PR and add the 'per-thread-bound-reviewed' label."
           exit 1

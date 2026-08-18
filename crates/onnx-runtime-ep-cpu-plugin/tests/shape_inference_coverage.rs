@@ -79,9 +79,6 @@ const DECLINED: &[(&str, &str)] = &[
     ("", "DequantizeLinear"),
     ("", "EyeLike"),
     ("", "QuantizeLinear"),
-    ("", "ScatterElements"),
-    ("", "ScatterND"),
-    ("", "Trilu"),
     //       Pooling and CNN geometry: inferrable from `kernel_shape`,
     //       `strides`, `pads`, `dilations` and `ceil_mode`, exactly as
     //       `build_conv` already does for `Conv`.
@@ -104,9 +101,6 @@ const DECLINED: &[(&str, &str)] = &[
     ("", "GatherElements"),        // output shape == indices shape
     ("", "Size"),                  // scalar
     //       Contrib ops that need a real rule written.
-    ("com.microsoft", "Attention"), // packed QKV; a different signature from
-    //                                 ai.onnx::Attention, so the opset-23 arm
-    //                                 deliberately does not cover it
     //       Qwen3.5 / Qwen3-Next hybrid linear-attention primitives, read
     //       from exported models rather than produced by our fusion passes.
     //       ORT has no kernel for these at all, so handing them over does not
@@ -114,9 +108,6 @@ const DECLINED: &[(&str, &str)] = &[
     ("", "LinearAttention"),
     ("com.microsoft", "CausalConvWithState"),
     ("com.microsoft", "LinearAttention"),
-    ("com.microsoft", "MoE"),
-    ("com.microsoft", "PackedMultiHeadAttention"),
-    ("com.microsoft", "QMoE"),
 ];
 
 /// The NCHWc blocked-layout family, registered only when the `mlas` feature is

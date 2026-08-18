@@ -1,0 +1,151 @@
+ir_version: 10
+graph {
+  node {
+    input: "input"
+    input: "router_probs"
+    input: "fc1_experts_weights"
+    input: "fc1_experts_bias"
+    input: "fc2_experts_weights"
+    input: "fc2_experts_bias"
+    output: "output"
+    op_type: "MoE"
+    attribute {
+      name: "activation_type"
+      s: "gelu"
+      type: STRING
+    }
+    attribute {
+      name: "k"
+      i: 2
+      type: INT
+    }
+    domain: "com.microsoft"
+  }
+  name: "moe_assignment_f32"
+  input {
+    name: "input"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "router_probs"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "fc1_experts_weights"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 8
+          }
+          dim {
+            dim_value: 64
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "fc1_experts_bias"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 8
+          }
+          dim {
+            dim_value: 64
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "fc2_experts_weights"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 8
+          }
+          dim {
+            dim_value: 32
+          }
+          dim {
+            dim_value: 64
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "fc2_experts_bias"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 8
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "output"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 17
+}
+opset_import {
+  domain: "com.microsoft"
+  version: 1
+}

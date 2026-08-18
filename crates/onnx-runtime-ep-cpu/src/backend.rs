@@ -41,8 +41,14 @@ pub enum CpuBackend {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     SimdX86,
     /// Vendored MLAS f32 SGEMM for x86-64, compiled in by the default `mlas`
-    /// feature and auto-selected on x86-64. Multi-threaded: MLAS partitions the
-    /// GEMM and runs the tiles on the `mlas-sys` work-stealing pool.
+    /// feature. Multi-threaded: MLAS partitions the GEMM and runs the tiles on
+    /// the `mlas-sys` work-stealing pool.
+    ///
+    /// This is the **default** on x86-64 whenever the feature is compiled in --
+    /// [`CpuBackend::auto_detect`] returns it without needing
+    /// `NXRT_CPU_GEMM_BACKEND=mlas`, which only forces it. Kernels that gate
+    /// behaviour on `== Mlas` (for example the `f16` prefill widening in
+    /// `matmul`) are therefore live by default, not dead code.
     /// `NXRT_CPU_GEMM_BACKEND=generic|simd` selects a native path instead,
     /// which is how the differential tests compare the two.
     #[cfg(feature = "mlas")]

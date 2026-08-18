@@ -3846,6 +3846,49 @@ const ASSIGNMENT_FIXTURES: &[(&str, &str)] = &[
     // dropped the claim and ORT ran it. Without a fixture whose op sits in that
     // gap, the sweep below can only prove the ops it already knew about.
     ("sin_assignment_f32", "Sin"),
+    // ── Attention, MoE and KV cache ──────────────────────────────────────
+    // The suite above is activations and normalisation. Those are not what
+    // this EP is for, so until these rows existed the architectural rule was
+    // unproven for exactly the operators the rule was written about.
+    //
+    // Five of these could not have passed before: `com.microsoft::Attention`,
+    // `MoE`, `PackedMultiHeadAttention`, `ScatterND` and `Trilu` had no entry
+    // in the plugin's `ShapeInference` table, so `GetCapability`'s fail-closed
+    // filter dropped the claim and ORT's CPU EP ran them -- silently, and
+    // regardless of what `supports_op` said.
+    ("softmax_assignment_f32", "Softmax"),
+    ("transpose_assignment_f32", "Transpose"),
+    ("kv_concat_assignment_f32", "Concat"),
+    ("kv_scatternd_assignment_f32", "ScatterND"),
+    // float32 `RotaryEmbedding` was deferred to ORT by #1078 on a 12/12
+    // losing grid. That deferral is withdrawn: this row is the falsifier that
+    // fails if it is ever reintroduced.
+    ("rotary_assignment_f32", "RotaryEmbedding"),
+    ("mha_assignment_f32", "MultiHeadAttention"),
+    ("gqa_assignment_f32", "GroupQueryAttention"),
+    // `position_ids` is GQA's optional input *9*. Leaving that slot off the
+    // per-slot dtype table sent a `do_rotary` node with explicit int64
+    // positions to ORT even after the `seqlens_k` / `total_sequence_length`
+    // slots were fixed, so it gets its own row rather than being assumed.
+    ("gqa_rotary_pos_assignment_f32", "GroupQueryAttention"),
+    ("msft_attention_assignment_f32", "Attention"),
+    ("moe_assignment_f32", "MoE"),
+    // f32 alone was not coverage: production mixtures are exported in half
+    // precision, and `MoE` advertised f32 only while its kernel widens f16 and
+    // bf16 to f32 and narrows on the way out. This row is the falsifier.
+    ("moe_assignment_f16", "MoE"),
+    // ORT has no CPU kernel for PackedMultiHeadAttention, so for that one the
+    // shape-table decline bought a *load failure* rather than a slower run; it
+    // does have CPU kernels for MoE and QMoE, so for those it was simply us not
+    // running an op we implement. Each was rescued here and each needs its own real
+    // session to prove it, because the pure-Rust inventory test builds
+    // synthetic nodes and never opens one -- it cannot see a dtype-filter or
+    // kernel-factory rejection, which are exactly the layers that were
+    // silently declining GQA and RoPE.
+    ("qmoe_assignment_f32", "QMoE"),
+    ("packed_mha_assignment_f32", "PackedMultiHeadAttention"),
+    ("trilu_assignment_f32", "Trilu"),
+    ("scatter_elements_assignment_f32", "ScatterElements"),
 ];
 
 /// The architectural rule, asserted directly: when this EP is loaded it takes
@@ -3866,6 +3909,7 @@ const ASSIGNMENT_FIXTURES: &[(&str, &str)] = &[
 fn no_supported_node_is_ever_left_to_the_ort_cpu_ep() {
     let _lock = lock_ort_ep();
     let mut checked = 0usize;
+    let mut failures: Vec<String> = Vec::new();
 
     for (fixture, op) in ASSIGNMENT_FIXTURES {
         let reg = format!("cpu_ep_noyield_{fixture}");
@@ -3878,18 +3922,25 @@ fn no_supported_node_is_ever_left_to_the_ort_cpu_ep() {
             continue;
         };
 
-        assert!(
-            ours.iter().any(|claimed| claimed == op),
-            "{fixture}: '{op}' must run on this EP, but it is not among {ours:?} \
-             (ORT was given {theirs:?})"
-        );
-        assert!(
-            !theirs.iter().any(|left| left == op),
-            "{fixture}: '{op}' was handed to ORT's CPU EP. This EP does not defer — \
-             a range where it is slower is a kernel to optimize, not a node to give away."
-        );
+        // Collected rather than asserted per fixture: a bare `assert!` stops at
+        // the first decline, so a run reports one op when several are being
+        // given away and the next iteration only uncovers the next one. The
+        // whole matrix is the useful output.
+        if !ours.iter().any(|claimed| claimed == op) || theirs.iter().any(|left| left == op) {
+            failures.push(format!(
+                "  {fixture}: '{op}' is not on this EP — ours={ours:?}, ORT was given {theirs:?}"
+            ));
+        }
         checked += 1;
     }
+
+    assert!(
+        failures.is_empty(),
+        "{} of {checked} fixtures were handed to ORT's CPU EP. This EP does not defer — \
+         a range where it is slower is a kernel to optimize, not a node to give away.\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 
     if checked != ASSIGNMENT_FIXTURES.len() {
         eprintln!(
@@ -5885,6 +5936,327 @@ fn plugin_path_ab_vs_plain_ort() {
             }
             ((*api).ReleaseSession.unwrap())(ort_session);
             ((*api).ReleaseSessionOptions.unwrap())(ort_opts);
+            conformance_teardown(api, env, opts, session, &reg);
+        }
+    }
+}
+
+/// float32 `com.microsoft::RotaryEmbedding` and `GroupQueryAttention` execute
+/// on *this* EP and agree with ORT's own CPU kernels.
+///
+/// Assignment alone is not the guarantee the policy asks for: a node can be
+/// claimed and then compute the wrong thing, which is strictly worse than the
+/// deferral it replaced. These two ops are the ones that were being handed to
+/// ORT until the per-slot dtype tables landed, so they are the two that most
+/// need their arithmetic checked against the implementation they displaced.
+///
+/// The baseline is a second session over the *same* model file with our EP
+/// simply not appended, so ORT resolves both nodes to its own contrib CPU
+/// kernels. Same bytes in, so any difference is ours.
+#[test]
+fn rope_and_gqa_execute_on_our_ep_and_match_ort_numerics() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+
+    for (fixture, op) in [
+        ("rotary_assignment_f32", "RotaryEmbedding"),
+        ("gqa_assignment_f32", "GroupQueryAttention"),
+    ] {
+        let model_path = PathBuf::from(manifest_dir)
+            .join(format!("tests/fixtures/{fixture}/model.onnx.textproto"));
+        let reg = format!("cpu_ep_num_{fixture}");
+
+        let Some((_lib, api, env, opts, session)) =
+            (unsafe { conformance_setup(&reg, &model_path, true) })
+        else {
+            eprintln!("*** SKIPPED: {fixture} numerics — ORT or EP cdylib not found ***");
+            return;
+        };
+
+        unsafe {
+            let info = query_ep_assignment(api, session);
+            assert!(
+                info.ops_on_our_ep().contains(&op),
+                "{fixture}: '{op}' must execute here, not on ORT's CPU EP; got {:?}",
+                info.assignments
+            );
+
+            let (names, mut inputs, output_names) = attention_fixture_inputs(api, fixture);
+            let ours = run_and_collect_f32(api, session, &names, &inputs, &output_names);
+
+            // Same model, same bytes, but ORT resolves the node itself.
+            let mut base_opts: *mut ort::OrtSessionOptions = ptr::null_mut();
+            let status = ((*api).CreateSessionOptions.unwrap())(&mut base_opts);
+            check_status(api, status, "CreateSessionOptions(baseline)");
+            let mut base_session: *mut ort::OrtSession = ptr::null_mut();
+            let status =
+                ort_session::create_session(api, env, base_opts, &model_path, &mut base_session);
+            check_status(api, status, "CreateSession(baseline)");
+            let theirs = run_and_collect_f32(api, base_session, &names, &inputs, &output_names);
+            ((*api).ReleaseSession.unwrap())(base_session);
+            ((*api).ReleaseSessionOptions.unwrap())(base_opts);
+
+            assert_eq!(ours.len(), theirs.len(), "{fixture}: output count differs");
+            for (idx, (a, b)) in ours.iter().zip(theirs.iter()).enumerate() {
+                assert_eq!(
+                    a.len(),
+                    b.len(),
+                    "{fixture}: output {idx} length {} vs ORT's {}",
+                    a.len(),
+                    b.len()
+                );
+                let mut worst = 0.0f32;
+                let mut worst_at = 0usize;
+                for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                    assert!(
+                        x.is_finite(),
+                        "{fixture}: output {idx}[{i}] is {x}, not finite"
+                    );
+                    let err = (x - y).abs() / y.abs().max(1.0);
+                    if err > worst {
+                        worst = err;
+                        worst_at = i;
+                    }
+                }
+                assert!(
+                    worst <= 2e-5,
+                    "{fixture}: output {idx} differs from ORT by {worst} at [{worst_at}] \
+                     (ours {}, ORT {})",
+                    a[worst_at],
+                    b[worst_at]
+                );
+                eprintln!(
+                    "  [{fixture}] output {idx}: {} values, max rel err {worst:.3e}",
+                    a.len()
+                );
+            }
+
+            for v in inputs.drain(..) {
+                ((*api).ReleaseValue.unwrap())(v);
+            }
+            conformance_teardown(api, env, opts, session, &reg);
+        }
+    }
+}
+
+/// Deterministic inputs for the attention fixtures, in each model's slot order.
+///
+/// The tensors are leaked rather than returned by value because ORT borrows the
+/// caller's buffers: `CreateTensorWithDataAsOrtValue` does not copy, so the
+/// backing storage has to outlive every `Run` that reads it.
+unsafe fn attention_fixture_inputs(
+    api: *const ort::OrtApi,
+    fixture: &str,
+) -> (
+    Vec<&'static str>,
+    Vec<*mut ort::OrtValue>,
+    Vec<&'static str>,
+) {
+    // A cheap deterministic spread in [-1, 1) that is not periodic in the head
+    // dimension, so a transposed or mis-strided read cannot look correct.
+    let fill = |n: usize, seed: u32| -> &'static mut [f32] {
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((s >> 8) as f32 / (1u32 << 23) as f32) - 1.0
+            })
+            .collect();
+        Box::leak(v.into_boxed_slice())
+    };
+    unsafe {
+        match fixture {
+            "rotary_assignment_f32" => {
+                let (b, s, h, d) = (1i64, 1i64, 32i64, 128i64);
+                let x = make_float_tensor(api, fill((b * s * h * d) as usize, 7), &[b, s, h * d]);
+                let pos = Box::leak(vec![17i64].into_boxed_slice());
+                let pos_bytes = std::slice::from_raw_parts_mut(
+                    pos.as_mut_ptr().cast::<u8>(),
+                    std::mem::size_of_val(pos),
+                );
+                let pos_v = make_raw_tensor(
+                    api,
+                    pos_bytes,
+                    &[b, s],
+                    ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+                );
+                let cos = make_float_tensor(api, fill((2048 * d / 2) as usize, 11), &[2048, d / 2]);
+                let sin = make_float_tensor(api, fill((2048 * d / 2) as usize, 13), &[2048, d / 2]);
+                (
+                    vec!["input", "position_ids", "cos_cache", "sin_cache"],
+                    vec![x, pos_v, cos, sin],
+                    vec!["output"],
+                )
+            }
+            "gqa_assignment_f32" => {
+                let (b, s, h, kv, d, p) = (1i64, 1i64, 32i64, 8i64, 128i64, 1023i64);
+                let q = make_float_tensor(api, fill((b * s * h * d) as usize, 3), &[b, s, h * d]);
+                let k = make_float_tensor(api, fill((b * s * kv * d) as usize, 5), &[b, s, kv * d]);
+                let v = make_float_tensor(api, fill((b * s * kv * d) as usize, 9), &[b, s, kv * d]);
+                let pk =
+                    make_float_tensor(api, fill((b * kv * p * d) as usize, 21), &[b, kv, p, d]);
+                let pv =
+                    make_float_tensor(api, fill((b * kv * p * d) as usize, 23), &[b, kv, p, d]);
+                // seqlens_k is the *past* length (ORT adds the new token), and
+                // total_sequence_length must equal max(seqlens_k) + 1.
+                // Leaked for the same reason as the float buffers: ORT keeps a
+                // pointer into them for the life of the value, so a temporary
+                // would dangle by the time `Run` reads it.
+                let seqlens =
+                    make_int32_tensor(api, Box::leak(vec![p as i32].into_boxed_slice()), &[b]);
+                let total = make_int32_tensor(
+                    api,
+                    Box::leak(vec![(p + 1) as i32].into_boxed_slice()),
+                    &[1],
+                );
+                (
+                    vec![
+                        "query",
+                        "key",
+                        "value",
+                        "past_key",
+                        "past_value",
+                        "seqlens_k",
+                        "total_sequence_length",
+                    ],
+                    vec![q, k, v, pk, pv, seqlens, total],
+                    vec!["output", "present_key", "present_value"],
+                )
+            }
+            other => panic!("attention_fixture_inputs: no inputs defined for {other}"),
+        }
+    }
+}
+
+/// Run `session` over the named inputs and copy every output out as float32.
+unsafe fn run_and_collect_f32(
+    api: *const ort::OrtApi,
+    session: *mut ort::OrtSession,
+    input_names: &[&str],
+    inputs: &[*mut ort::OrtValue],
+    output_names: &[&str],
+) -> Vec<Vec<f32>> {
+    unsafe {
+        let in_c: Vec<std::ffi::CString> = input_names
+            .iter()
+            .map(|n| std::ffi::CString::new(*n).unwrap())
+            .collect();
+        let out_c: Vec<std::ffi::CString> = output_names
+            .iter()
+            .map(|n| std::ffi::CString::new(*n).unwrap())
+            .collect();
+        let in_ptrs: Vec<*const i8> = in_c.iter().map(|c| c.as_ptr()).collect();
+        let out_ptrs: Vec<*const i8> = out_c.iter().map(|c| c.as_ptr()).collect();
+        let mut outputs: Vec<*mut ort::OrtValue> = vec![ptr::null_mut(); output_names.len()];
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            in_ptrs.as_ptr(),
+            inputs.as_ptr().cast(),
+            inputs.len(),
+            out_ptrs.as_ptr(),
+            output_names.len(),
+            outputs.as_mut_ptr(),
+        );
+        check_status(api, status, "Run(attention fixture)");
+
+        let mut collected = Vec::with_capacity(outputs.len());
+        for out in &outputs {
+            assert!(!out.is_null(), "Run returned a null output");
+            let mut info: *mut ort::OrtTensorTypeAndShapeInfo = ptr::null_mut();
+            let status = ((*api).GetTensorTypeAndShape.unwrap())(*out, &mut info);
+            check_status(api, status, "GetTensorTypeAndShape(attention fixture)");
+            let mut count = 0usize;
+            let status = ((*api).GetTensorShapeElementCount.unwrap())(info, &mut count);
+            check_status(api, status, "GetTensorShapeElementCount(attention fixture)");
+            ((*api).ReleaseTensorTypeAndShapeInfo.unwrap())(info);
+
+            let mut data: *mut std::ffi::c_void = ptr::null_mut();
+            let status = ((*api).GetTensorMutableData.unwrap())(*out, &mut data);
+            check_status(api, status, "GetTensorMutableData(attention fixture)");
+            collected.push(std::slice::from_raw_parts(data as *const f32, count).to_vec());
+        }
+        for out in outputs {
+            ((*api).ReleaseValue.unwrap())(out);
+        }
+        collected
+    }
+}
+
+/// Configurations these kernels cannot compute, each declined at *claim* time
+/// with the session still loading.
+///
+/// Every row is a **capability** answer rather than a performance one, and each
+/// mirrors a rejection its kernel factory raises. The mirroring is what matters:
+///
+///   * decline at claim time  → ORT runs it, model works, we owe a kernel;
+///   * claim and fail in the factory → `CreateSession` dies and **no fallback
+///     recovers**, because ORT has already compiled the node onto this EP.
+///
+/// Making these ops reachable at all is what created the second possibility, so
+/// this test pins the first. ORT's CPU EP runs all three configurations below,
+/// which is why claiming-then-failing would take a model that works today and
+/// make it unloadable.
+///
+/// | fixture | limit | where the factory raises it |
+/// |---|---|---|
+/// | `qmoe_columnwise_f32` | `block_size` absent → column-wise quantization | `qmoe.rs` |
+/// | `moe_sparse_mixer_f32` | `use_sparse_mixer=1` (Phi-3.5-MoE / GRIN-MoE) | `moe.rs` |
+/// | `gqa_smooth_softmax_f32` | `smooth_softmax=1` (attention sink) | `group_query_attention.rs` |
+///
+/// They are deliberately *not* in `ASSIGNMENT_FIXTURES`: they are the documented
+/// exceptions, and each should stop being one as soon as its kernel exists.
+#[test]
+fn factory_only_capability_limits_are_declined_at_claim_time() {
+    const CASES: &[(&str, &str, &str)] = &[
+        (
+            "qmoe_columnwise_f32",
+            "QMoE",
+            "`qmoe::unsupported_reason` (column-wise quantization)",
+        ),
+        (
+            "moe_sparse_mixer_f32",
+            "MoE",
+            "`moe::unsupported_reason` (use_sparse_mixer=1)",
+        ),
+        (
+            "gqa_smooth_softmax_f32",
+            "GroupQueryAttention",
+            "`group_query_attention::unsupported_reason` (smooth_softmax=1)",
+        ),
+    ];
+
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    for (fixture, op, guard) in CASES {
+        let model_path = PathBuf::from(manifest_dir)
+            .join(format!("tests/fixtures/{fixture}/model.onnx.textproto"));
+        let reg = format!("cpu_ep_claim_time_{fixture}");
+
+        // Fallback must stay *enabled*: the point is that ORT can still run it.
+        let Some((_lib, api, env, opts, session)) =
+            (unsafe { conformance_setup(&reg, &model_path, false) })
+        else {
+            eprintln!("*** SKIPPED: {fixture} — ORT or EP cdylib not found ***");
+            return;
+        };
+
+        unsafe {
+            let info = query_ep_assignment(api, session);
+            let ours = info.ops_on_our_ep();
+            assert!(
+                !ours.contains(op),
+                "{fixture}: {op} was claimed, but the kernel factory rejects this \
+                 configuration, which kills the session outright rather than falling back. \
+                 Decline it in {guard}, or implement the missing path. Got: {:?}",
+                info.assignments
+            );
+            eprintln!(
+                "  [{fixture}] declined at claim time, session loaded; ours={ours:?}, \
+                 others={:?}",
+                info.ops_not_on_our_ep()
+            );
             conformance_teardown(api, env, opts, session, &reg);
         }
     }
