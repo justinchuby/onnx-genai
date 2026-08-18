@@ -109,29 +109,75 @@ pub fn set_task_thread_budget(threads: Option<usize>) -> Result<(), &'static str
 /// Precedence: programmatic override, then [`TASK_THREADS_ENV`], then the CPU
 /// decode budget (`ONNX_GENAI_CPU_DECODE_THREADS` /
 /// [`crate::kernels::matmul_nbits::set_decode_thread_budget`]), then the
-/// machine. One budget knob for the whole engine is the property worth keeping:
-/// `scripts/ort_ab/ab.py --threads N` sets the decode budget, and a task runtime
-/// that ignored it would report thread-scaling numbers for a width nobody asked
-/// for.
+/// machine. Honouring the decode budget keeps one knob sizing the whole engine:
+/// `scripts/ort_ab/ab.py --threads N` sets it, and a task runtime that ignored
+/// it would report thread-scaling numbers for a width nobody asked for.
 ///
-/// Whatever comes out is then capped to the number of *physical* cores the
-/// process may run on ([`crate::core_topology::cap_spinning_workers`]). Spinning
-/// workers are the one workload where SMT siblings are strictly negative: two
-/// spinners on one core do not double throughput, they halve each other's issue
-/// rate while burning the same power.
+/// **The SMT cap applies to the inferred widths, not to the asked-for one.**
+/// [`TASK_THREADS_ENV`] and [`set_task_thread_budget`] name *this* pool, so a
+/// caller that sets them has said how many threads they want it to spin and
+/// gets exactly that. The decode budget and `available_parallelism` are
+/// inferences -- one is about a different pool, the other is about the machine
+/// -- and both are expressed in logical CPUs, so both are capped to the
+/// *physical* cores the process may run on
+/// ([`crate::core_topology::cap_spinning_workers`]).
+///
+/// The cap exists because spinning workers are the workload where SMT siblings
+/// hurt most: two spinners on one core do not double throughput, they halve each
+/// other's issue rate while burning the same power. But that is only true once
+/// the machine is wide enough to saturate its memory system. Below that, the
+/// sibling threads *are* the parallelism, and they hide memory latency rather
+/// than compete for issue slots.
+///
+/// So the cap only bites above [`SMT_CAP_FLOOR`] hardware threads. The crossover
+/// was measured, not assumed -- same binary, one arm with the explicit knob set
+/// to the uncapped width, on RoPE and Softmax cells:
+///
+/// | logical CPUs | physical | capped wins | uncapped wins |
+/// |---|---|---|---|
+/// | 2  | 1 | 0/4 | 4/4, by 14-19% |
+/// | 4  | 2 | 0/4 | 4/4, by 3-25%  |
+/// | 8  | 4 | 1/4 | 3/4, by 10-26% |
+/// | 16 | 8 | 3/4, by 12-45% | 1/4 |
+/// | 32 | 16 | 3/4, by 12-36% | 1/4 |
+///
+/// The one cell that prefers SMT at every width is the largest bandwidth-bound
+/// softmax; the one that prefers the cap at every width is the smallest RoPE.
+/// That is the same story from both ends: latency-bound work likes siblings,
+/// issue-bound work does not.
 fn resolve_width() -> usize {
-    let requested = NonZeroUsize::new(TASK_THREADS_OVERRIDE.load(Ordering::Acquire))
+    let asked = NonZeroUsize::new(TASK_THREADS_OVERRIDE.load(Ordering::Acquire))
         .map(NonZeroUsize::get)
         .or_else(|| {
             std::env::var(TASK_THREADS_ENV)
                 .ok()
                 .and_then(|raw| raw.parse::<usize>().ok())
                 .filter(|threads| *threads > 0)
-        })
-        .or_else(crate::kernels::matmul_nbits::decode_thread_budget)
+        });
+    if let Some(asked) = asked {
+        return asked;
+    }
+    let inferred = crate::kernels::matmul_nbits::decode_thread_budget()
         .or_else(|| std::thread::available_parallelism().ok().map(NonZeroUsize::get))
         .unwrap_or(1);
-    crate::core_topology::cap_spinning_workers(requested).max(1)
+    smt_cap(inferred, crate::core_topology::cap_spinning_workers(inferred))
+}
+
+/// The width below which the SMT cap is not applied at all.
+///
+/// Empirical, and from a single microarchitecture (AMD EPYC 9V74, 16 physical /
+/// 32 logical). It is the point where halving the width started winning more
+/// cells than it lost. Anyone porting this to a machine with a very different
+/// memory system should re-run the experiment in [`resolve_width`]'s table
+/// rather than trust the number.
+const SMT_CAP_FLOOR: usize = 8;
+
+/// Applies the physical-core cap, but never below [`SMT_CAP_FLOOR`] workers.
+///
+/// Split out from [`resolve_width`] so the policy is testable without a machine
+/// that has the topology in question.
+fn smt_cap(inferred: usize, capped: usize) -> usize {
+    capped.max(1).max(inferred.min(SMT_CAP_FLOOR))
 }
 
 /// The process-wide native pool, built on first use.
@@ -686,12 +732,41 @@ mod tests {
     }
 
     #[test]
-    fn the_resolved_width_never_exceeds_the_physical_cores_we_may_use() {
+    fn the_smt_cap_only_bites_on_wide_machines() {
+        // Narrow machines keep every hardware thread: the siblings are the only
+        // parallelism there is, and measured they win.
+        assert_eq!(smt_cap(2, 1), 2);
+        assert_eq!(smt_cap(4, 2), 4);
+        assert_eq!(smt_cap(8, 4), 8);
+        // Wide machines get capped to their physical cores.
+        assert_eq!(smt_cap(16, 8), 8);
+        assert_eq!(smt_cap(32, 16), 16);
+        // A machine with no SMT is unaffected either way.
+        assert_eq!(smt_cap(16, 16), 16);
+        // A genuinely single-threaded budget stays single-threaded.
+        assert_eq!(smt_cap(1, 1), 1);
+        // A cap that is somehow zero still leaves us a usable width.
+        assert_eq!(smt_cap(1, 0), 1);
+        // The cap never invents threads the caller did not ask for.
+        for inferred in 1..64usize {
+            for capped in 0..=inferred {
+                assert!(smt_cap(inferred, capped) <= inferred);
+            }
+        }
+    }
+
+    #[test]
+    fn an_inferred_width_never_exceeds_the_physical_cores_we_may_use() {
+        // The process-wide pool is built from an inferred width unless a test
+        // process sets the explicit knob, which none of them do.
+        if std::env::var_os(TASK_THREADS_ENV).is_some() {
+            return;
+        }
         let width = testing::pool_width();
         assert!(width >= 1);
         if let Some(cores) = crate::core_topology::allowed_physical_cores() {
             assert!(
-                width <= cores,
+                width <= cores.max(SMT_CAP_FLOOR),
                 "the pool spins {width} workers on {cores} physical cores"
             );
         }
