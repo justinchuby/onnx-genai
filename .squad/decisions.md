@@ -1,6 +1,6 @@
 # Decisions — live standing directives
 
-Last consolidated: 2026-08-15T05:27:00Z (Scribe decode-vs-ORT arc; local state; verified live decisions.md was 9,847 B, under the 20,480 B prompt gate and 50 KB charter gate, so no archive was needed. Merged 7 requested inbox drops and deleted them, keeping decisions/inbox/README.md.)
+Last consolidated: 2026-08-18T00:35Z (Scribe merged DeepSeek-V2-Lite MoE episode; processed 4 V2-Lite inbox drops; no archive gate because live ledger stayed below 20KB.)
 
 Standing governance rules and active directives. Full narrative is archived; keep this file to current decisions plus durable rules.
 
@@ -8,58 +8,23 @@ Standing governance rules and active directives. Full narrative is archived; kee
 
 Archive by SIZE, not age. Age-only archiving can silently no-op during high-volume campaigns because most entries are recent. When the live ledger crosses the spawn-budget gate, preserve full history in an archive and keep `decisions.md` to standing directives, active decisions, and pointers. Assemble from inbox drops, dedupe, then delete merged drops; leave `decisions/inbox/README.md`.
 
-## 2026-08-14/15 — glm-4-9b-int4 decode-vs-ORT program
+## Archived decode-vs-ORT program pointer
 
-### Same-weights ground truth vs stock ORT (Sebastian)
+The detailed 2026-08-14/15 glm-4-9b-int4 decode-vs-ORT narrative was archived by Scribe at 2026-08-17T19:05Z because the live ledger crossed the size gate while merging the gate/up cp.async NO-GO. See `.squad/decisions/archive/2026-08-17T19-05Z-decode-program-archive.md`. Current active directives remain below.
 
-On identical int4 weights and fair ORT CUDA fastcfg (`past_present_share_buffer=true`, CUDA graph enabled), native default M=1 decode initially lost to stock ORT:
+## Current decode campaign standing
 
-| model | native | ORT | gap |
-|---|---:|---:|---:|
-| glm-4-9b-int4 (block-128) | 97.5 tok/s | 250.3 tok/s | ORT 2.57× |
-| qwen2.5-14b-int4 (block-32) | 127.0 tok/s | 184.5 tok/s | ORT 1.45× |
+Landed byte-identical wins: #1134 GEMV PF=2 prefetch default-ON, #1137 gate/up SwiGLU symmetric zero-point bias-fold default-ON, and #1139 gate/up RMS-fused occupancy raise default-ON. Detailed review/perf narratives for these and the subsequent no-go probes are archived in `.squad/decisions/archive/2026-08-17T21-40Z-decode-program-archive.md`.
 
-Fairness: glm ORT artifact strips only the redundant GQA `rotary_embedding_dim` while hardlinking the same `model.onnx.data`; native and ORT greedy tokens match byte-identically for the certified glm prompt. qwen shares the same weight file; its early divergence is the known near-tie cascade, not a weight mismatch. Eager op profiling overweights launch-heavy GQA; CUDA-graph kernel tracing is the authority for decode mix.
+Active standing: native int4 decode is ahead of ORT-CUDA on the three measured models, but claims must continue to carry the CUDA-graph asymmetry until Wallace finishes the ORT CUDA-graph fairness follow-up.
 
-### PR #978 — int4 M=1 decode GEMV split-K (Deckard; Chew/Gaff approved)
+## 2026-08-17 — Kernel-fusion scope: batch-1 vein MINED OUT (NO-GO)
 
-**MERGED `532ef6bc`.** Deckard added default-on portable LOP3 dequant plus grid-fill split-K (`ONNX_GENAI_GENERAL_SPLITK=0|1` A/B). Result: glm **97.5→112.4 tok/s** (+15.3%); ORT gap **2.57×→2.24×**; qwen block-32 untouched by the `block_size != 32` gate. Greedy tokens byte-identical; f64 oracle passes. Chew and Gaff approved.
+Luv's profiling-only fusion survey closed the batch-1 byte-identical decode campaign. The decisive finding: **QKV fusion already exists in-repo** as `CudaQkvProjectionFusion` (`crates/onnx-runtime-ep-cuda/src/optimizer.rs:2103`), gated by default-OFF `ONNX_GENAI_CUDA_ENABLE_QKV_FUSION`. It is byte-exact and cuts captured GEMV launches/token by −104, but earlier Muse-Glimmer-30B int4 measurement was flat-to-worse (**47.33→47.26 tok/s**), and Luv independently reproduced a hard regression on qwen2.5-14b: median **167.73→149.43 tok/s (−10.8%)**, base winning **3/3** rounds.
 
-### PR #980 / cp.async GEMV spike — measured NO-GO (Deckard)
+Root cause is now evidenced five ways — preperm, cp.async, down occupancy, q/o occupancy, and QKV fusion: batch-1 decode is **weight-DRAM-bandwidth-bound**. Every GEMV streams disjoint int4 weights once/token, so fusion cannot cut the dominant bytes; CUDA graphs already amortize launch overhead, leaving only ~1.1us GPU bubbles and ~10KB activation round-trips (<0.3% of traffic). QKV fusion is worse on 14b because the fused wide-N node drops the tuned `_pipe` / `_down_c2` dispatch and adds a `Split` copy, forfeiting #1134/#1139 wins. Input-RMSNorm→QKV and down→next-RMS folds would likewise save launches/tiny activation traffic, not weight bytes, and are RMS-order delicate; gate/up and lm_head fusion are already done.
 
-**CLOSED, not merged.** SM80-gated cp.async variants behind `ONNX_GENAI_GEMV_CPASYNC=1` were correct but regressed every measured glm config on H200: direct **112.2 tok/s**, cp.async stages 3/5 **95.9/95.4**, batched **89.7**, single-warp **102.6→88.3**. M=1 GEMV has only ~8 FMAs per loaded word, so cp.async overhead has no compute to overlap. Standing verdict: **do not default-enable or retry cp.async for M=1 int4 GEMV**.
-
-### PR #981 — multi-warp block SkipSimplifiedLayerNorm for M=1 decode (Deckard; Chew approved)
-
-**MERGED `b24e961e`.** Deckard replaced the one-warp decode SkipRMSNorm path with a portable block-parallel half4 kernel for `num_groups <= 8`; prefill keeps the warp path. Env A/B: `ONNX_GENAI_CUDA_DISABLE_SKIP_RMSNORM_BLOCK=1`. Result: glm **112.3→137.8 tok/s** (+22.7%), qwen **125.6→148.85 tok/s** (+18% range), greedy tokens byte-identical. Chew approved with notes: reduction order changes by ULPs inside tolerance; the capture assertion was pre-existing.
-
-### PR #986 — 128-bit wide-load int4 M=1 decode GEMV (Deckard; Chew/Gaff approved)
-
-**MERGED `e8f76c53`.** Default-on portable `uint4` wide-load GEMV for the glm-class block-128 general-BS path; env A/B `ONNX_GENAI_GEMV_WIDELOAD=0`. Mechanism: each lane issues one 128-bit load for 32 nibbles plus a depth-2 synchronous software pipeline, reusing LOP3 dequant and preserving per-lane ascending-K accumulation within the wide lane.
-
-Key results: glm **140.7→192.4 tok/s** (+36.7%) in Deckard's idle run; Gaff reproduced **137.4→185.7 tok/s** (+35.1%) under shared-machine variance. Kernel gate_up improved **65.3µs→43.2µs**, DRAM **0.92→1.40 TB/s**. Cumulative glm base decode is now **97.5→112.4→137.8→192.4 tok/s**; ORT gap narrowed **2.57×→~1.30×** vs ORT ~250.3 tok/s, but native base still loses to ORT base.
-
-Chew verdict: 🟢 APPROVE — f64 oracle **7/7**, glm and qwen greedy streams byte-identical for default wide vs narrow; qwen block-32 remains on the existing narrow/tuned path. Gaff verdict: 🟢 APPROVE — +35% perf reproduced, qwen flat/no-regression, CUDA graph capture clean, Rule 11 portable, fmt/clippy clean. qwen block-32 fused wide variants were reverted/not shipped because they were flat/slightly negative and compute/SM-bound, not DRAM-bound.
-
-### Corrected ORT-gap mechanism and GEMV-v2 program
-
-The earlier base-decode floor verdict is **OVERTURNED**. ORT's dominant glm `MatMulFloatInt4Kernel<__half,128,0>` streams the same gate_up geometry at **2.42 TB/s** vs native now **1.40 TB/s** after #986 (previously 0.92 TB/s). The gap is memory-level parallelism / weight streaming, not algorithm, occupancy, or irreducible dequant math.
-
-**In flight:** Deckard owns GEMV-v2 on `squad/int4-gemv-wideload-v2`, targeting deeper MLP and ORT-like streaming (**1.40→2.42 TB/s**) to beat ORT base decode (~250 tok/s; target around ~280 tok/s if full streaming is captured). This is the base-vs-base path for any ORT-win claim.
-
-### PR #984 — captured fused verify speculative decode (Sebastian; closed/superseded)
-
-**CLOSED / SUPERSEDED.** Chew 🔴 and Gaff 🔴 rejected PR #984 at frozen head `82cde423`: opt-in captured verify was default-off and GLM token identity could pass on some prompts, but qwen repetition hit `GroupQueryAttention` prepared-workspace mismatch; Gaff also reproduced invalidated graph replay / illegal-address warmup failures and identified a shared graph-slot state hazard. The fix lineage moved to #988; #984 is not the active artifact.
-
-### PR #988 — graph-slot captured spec-decode fix (Deckard; rejected pending Batty contract fix)
-
-**DRAFT / NOT MERGEABLE.** PR #988 (`squad/spec-decode-graphslot`, frozen head `cfa96c5c`) fixed the capture crashes. Gaff 🟢 approved quality/perf/capture: GLM and qwen captured-spec runs completed, transition invalidation looked sound, CUDA regressions passed, and no stale replay/illegal address reproduced.
-
-Chew 🔴 rejected correctness: the binding contract **speculative output == plain M=1 greedy** still fails on qwen W=9 (`spec_tokens=8`) at token index 2 (**plain 9370 vs spec 2810**). Forcing `ONNX_GENAI_SPEC_ROW0_TIE_EPS=100000` did not repair the divergence, so the row-0 M=1 fallback does not cover accepted DRAFT tokens. Per reviewer lockout, Deckard is locked out of revising #988; Batty owns the contract fix on `squad/spec-decode-w9-contract`, with Chew re-review expected.
-
-### Standing directive for this arc
-
-Binding metric: compare **BASE non-speculative native decode vs ORT base** for ORT-win claims. Speculative decode is additive-on-top and may not be the basis of an ORT-win claim. Current honest standing after #986: native base **192.4 tok/s** vs ORT base **~250 tok/s**, still **~1.30× behind**. Prioritize: (1) Deckard GEMV-v2 base MLP/streaming; (2) Batty W=9 speculative contract fix as an additive layer; (3) only then revisit smaller base kernels such as GQA or lm_head. Keep cp.async M=1 GEMV as a recorded NO-GO.
+Decision: **NO-GO / do not spend another implementation cycle on batch-1 byte-identical fusion or single-kernel micro-opts.** Native already leads ORT on all three measured int4 models, but keep the graph-capture fairness caveat until Wallace verifies ORT under equal CUDA-graph conditions. Coordinator pivot: Wallace owns ORT CUDA-graph fairness follow-up; Luv pivots to GLM/DeepSeek CUDA-kernel support scope. The only remaining structural decode lever is raising arithmetic intensity with M>1 batched verify/spec decode (additive-only/shelved) or lower-bit quantization (oracle-gated, not byte-identical).
 
 ## Native-vs-ORT fairness rule
 
@@ -85,3 +50,32 @@ Default-on CUDA decode optimizations must be portable or explicitly arch-gated w
 ## Active historical pointers
 
 For detailed per-PR narrative, use archives rather than expanding this live file. Primary locations: `.squad/decisions-archive/2026-07.md`, `.squad/decisions-archive/2026-08.md`, and `.squad/decisions/archive/`. The complete live ledger immediately before the 2026-08-15T03:10 decode-arc compaction is `.squad/decisions/archive/2026-08-15T03-10-00Z-decisions-pre-decode-arc.md`.
+
+## 2026-08-17 — Native-vs-ORT fairness: the lead is architectural, not per-kernel
+
+Wallace's CUDA-graph fairness study resolved the standing native-vs-ORT caveat. Stock ORT CUDA EP cannot capture a replayable CUDA graph on the current onnxruntime-genai int4 decode models: dynamic KV growth and CPU-assigned shape-massaging nodes make `enable_cuda_graph=1` no-op, fail, or corrupt throughput. Native can capture because it owns the static-shaped KV decode step and device sampler; that capture capability is the moat.
+
+Equalizable eager-vs-eager medians show the mechanism clearly: qwen2.5-14b ORT eager 83.39 tok/s vs native eager+on-GPU-argmax 106.54 (1.28×), but native eager+host-argmax 67.54 (0.81×); qwen2.5-7b ORT 273.61 vs native eager 206.95 (0.76×); Phi-4-mini ORT 230.06 vs native eager 198.03 (0.86×). The production native headline remains real for users — graph+device-argmax delivers 167.08/312.27/313.10 tok/s, or 2.00×/1.14×/1.36× ORT eager — but the lead is **graph-capture + on-GPU argmax integration**, not intrinsically faster per-kernel math. This corroborates the batch-1 kernel NO-GO: do not spend more cycles chasing byte-identical per-kernel decode micro-opts to beat ORT; pursue structural capabilities or higher arithmetic intensity instead.
+
+## 2026-08-17 — GLM/DeepSeek support scope
+
+Luv's GLM/DeepSeek scope pass found support is already mature. Dense GLM-4-9B int4 runs native E2E at 98.2 tok/s, and DeepSeek-R1-distill-Qwen-1.5B int4 runs native E2E at 690 tok/s. There is no GLM/DeepSeek-specific dense-kernel gap: these ride the already-tuned MatMulNBits GEMV family.
+
+MLA is **not** a custom-op gap for the available DeepSeek-V2-Lite export; it lowers to standard RotaryEmbedding + Attention. QMoE router/expert-GEMV, CompressedSparseAttention, IndexShare/DSA, sparse KV gather, and related fixtures already exist and are CPU-oracle validated.
+
+Two active gaps remain. **Gap 1**: DeepSeek-V2-Lite MoE E2E is blocked in the workspace planner because Attention KV input `v_model.Unsqueeze_18` has runtime-dependent shape with no exact graph-metadata bound; owner Leon / Engine-KV-buffers. **Gap 2**: QMoE expert-GEMV is under-optimized relative to the dense-GEMV campaign (no prefetch/occupancy/vectorized-load treatment) and is Luv's CUDA-kernel target under default-off flag `ONNX_GENAI_QMOE_VEC`, with real-model profiling gated by Gap 1.
+
+## 2026-08-18 — DeepSeek-V2-Lite MoE support/correctness merged (#1150)
+
+PR #1150 landed on `main` as squash `e075a715`, combining Leon's DeepSeek-V2-Lite MoE workspace-planner shape-resolution fix with Luv's oracle correction. The branch `squad/qmoe-divergence-fix` supplied the final artifact; `squad/leon-deepseek-v2-planner` was folded in and both branches were deleted after merge. Outcome: DeepSeek-V2-Lite MoE is supported and the native-CUDA decode lock is now explicitly f64/oracle-justified.
+
+Rachael first rejected the planner artifact because it silently moved the golden from the native-CPU stream to the CUDA stream after the planner unblocked E2E execution. That lockout was honored: Leon did not revise the rejected artifact. Luv authored the separate oracle rebase and numerics artifact, then rebased it onto current `main` before merge; Rachael re-gated it green.
+
+Final decision: the apparent "CUDA numerics bug" was a wrong-oracle premise, not a kernel/workspace bug. CPU-vs-CUDA divergence is benign f32 accumulation-order drift. The repo already treats f64, not native CPU, as truth for int4 reductions (dense `matmul_nbits_gpu.rs` precedent uses tolerance and f64-reference tests). The token-5 expert-set swap is a below-fp32-resolution near-tie: CPU selected expert 61 and CUDA selected expert 1 for the sixth top-k slot after identical first five experts; router-logit delta was about `5e-5`, below measured reassociation drift (`4.7e-5`–`6.4e-5`). Rachael ruled that adding an epsilon tie-break would be arbitrary and could pin the model to the less accurate stream.
+
+Evidence: CUDA was closer to f64 truth in every relevant measurement — QMoE GEMV K=512 top_k=1 CUDA/f64 `4.62e-6` vs CPU/f64 `6.98e-6`, top_k=2 `2.93e-6` vs `5.30e-6`, and dense int8 block32 `1.26e-6` vs `3.60e-4` (~285x closer). The new `qmoe_int4_identity_expert_gemv_within_f64_roundoff` test bounds CPU and CUDA separately against f64 instead of asserting CPU==CUDA. The DeepSeek decode lock names the golden as native-CUDA/f64-justified, not CPU-golden. The env-gated router probe `ONNX_GENAI_QMOE_ROUTE_DUMP` remains default-OFF.
+
+Validation before merge: V2-Lite CUDA lock passed with CUDA graphs OFF and ON; all 30 `qmoe_gpu` tests passed; all five dense `matmul_nbits_gpu` f64-reference tests passed; the planner regression `prepare_workspace_resolves_reshape_flatten_chain_exactly` passed; Qwen3 dense native-CUDA lock passed. Luv confirmed the rebased golden held after #1129's MoE-claiming change.
+
+Policy precedent: for int4 GEMV/QMoE reductions, CPU bit-identity is not an oracle when accumulation order differs. Correctness is bounded agreement with an independent higher-precision reference plus deterministic backend output and explicit golden rationale.
+

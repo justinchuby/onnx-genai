@@ -32,3 +32,14 @@ kernel gap I flagged to Sebastian (#855). Team result: native decode **11.4 → 
 tok/s**, capture fully engaged (1 segment / 0 seams).
 
 - **2026-08-14 (#921, MERGED):** textproto fixture sweep — converted 29 committed inline-weight ONNX fixtures to `model.onnx.textproto` and established the convention (keep binary only for external-data sidecars or real-ORT/ORT-GenAI package loaders). Added the in-memory textproto→binary ORT shim `tests/common/ort_session.rs`; each conversion round-trip verified and suites re-run green.
+## 2026-08-17T22:20Z — Dispatched on DeepSeek-V2-Lite MoE workspace-planner blocker
+
+- Dispatched as `leon-3` to own Gap 1 from Luv's GLM/DeepSeek scope: DeepSeek-V2-Lite MoE cannot run E2E because prepare-only workspace planning cannot resolve runtime-dependent Attention KV shape `v_model.Unsqueeze_18`.
+- Target area: session executor / bindings workspace planning around `crates/onnx-runtime-session/src/executor/bindings.rs` near the unresolved Attention input.
+- Goal: unblock real-model MoE E2E so Luv can profile and validate QMoE expert-GEMV Gap 2.
+## 2026-08-18T00:35Z — DeepSeek-V2-Lite planner fix landed via PR #1150
+
+- Workspace-planner shape-resolution fix for DeepSeek-V2-Lite MoE landed on `main` as part of PR #1150 squash `e075a715`, combined with Luv's oracle/f64 numerics artifact.
+- Rachael's initial 🔴 on the silent golden move triggered reviewer lockout; Leon did not revise the rejected artifact. Lockout cleared on merge.
+- Final outcome: V2-Lite MoE E2E is unblocked; correctness is gated by a native-CUDA/f64-justified golden rather than CPU bit-identity.
+
