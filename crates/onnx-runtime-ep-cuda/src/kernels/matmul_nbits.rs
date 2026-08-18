@@ -5900,9 +5900,13 @@ fn select_accuracy4_gemv_warps(n: usize, multiprocessor_count: u32) -> u32 {
 
 /// Select the wider activation stage only when the fixed 8-warp block-32 launch
 /// does not provide one resident CTA wave. The estimate uses architectural warp
-/// limits: datacenter sm_80/sm_90 parts expose 64 warps/SM, while sm_86/sm_89
-/// consumer parts expose 48. Hudson's general blockwise path keeps its separate
-/// device-derived warp-width selection.
+/// limits via [`crate::arch::decode_resident_warps_per_sm`]: datacenter
+/// sm_80/sm_90 parts expose 64 warps/SM, while sm_86/sm_89 consumer parts expose
+/// 48. Routing the ladder through the arch layer keeps this decode selector's
+/// occupancy math byte-identical to the previous inline `match` (crucially
+/// sm_90 → 64) while giving the pending RTX split-K tuning a single seam.
+/// Hudson's general blockwise path keeps its separate device-derived warp-width
+/// selection.
 fn use_accuracy4_stage64(
     n: usize,
     multiprocessor_count: u32,
@@ -5912,10 +5916,7 @@ fn use_accuracy4_stage64(
     if max_shared_memory_per_block < GEMV_ACCURACY4_STAGE64_SHARED_BYTES {
         return false;
     }
-    let resident_warps = match compute_capability {
-        (8, 0) | (9.., _) => 64usize,
-        _ => 48usize,
-    };
+    let resident_warps = crate::arch::decode_resident_warps_per_sm(compute_capability) as usize;
     let resident_ctas = resident_warps / (GEMV_ACCURACY4_THREADS as usize / 32);
     let one_wave = (multiprocessor_count.max(1) as usize).saturating_mul(resident_ctas);
     n.div_ceil(GEMV_ACCURACY4_COLUMNS_PER_BLOCK) < one_wave
@@ -12781,6 +12782,51 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         assert!(!use_accuracy4_stage64(4608, 28, (8, 6), 48 * 1024));
         assert!(!use_accuracy4_stage64(4608, 132, (9, 0), 1024));
         assert!(!use_accuracy4_stage64(65_536, 132, (9, 0), 64 * 1024));
+    }
+
+    /// Byte-identity guard for routing `use_accuracy4_stage64`'s resident-warp
+    /// estimate through the arch layer: the arch helper must reproduce the exact
+    /// pre-refactor inline ladder for every compute capability, so the stage-64
+    /// decision (and therefore H200's selection) is provably unchanged.
+    #[test]
+    fn accuracy4_resident_warps_matches_prior_inline_ladder() {
+        fn prior_inline_ladder(compute_capability: (u32, u32)) -> u32 {
+            match compute_capability {
+                (8, 0) | (9.., _) => 64,
+                _ => 48,
+            }
+        }
+        for major in 0u32..=13 {
+            for minor in 0u32..=12 {
+                let cc = (major, minor);
+                assert_eq!(
+                    crate::arch::decode_resident_warps_per_sm(cc),
+                    prior_inline_ladder(cc),
+                    "arch resident-warp ladder diverged from the frozen inline ladder at {cc:?}"
+                );
+            }
+        }
+        // And the full stage-64 decision is unchanged across a shape/arch sweep.
+        for &(n, sms, cc, smem) in &[
+            (4608usize, 132u32, (9u32, 0u32), 64 * 1024u32),
+            (4608, 46, (8, 9), 48 * 1024),
+            (4608, 28, (8, 6), 48 * 1024),
+            (1024, 132, (9, 0), 64 * 1024),
+            (65_536, 132, (9, 0), 64 * 1024),
+            (2048, 84, (8, 9), 64 * 1024),
+            (4096, 68, (8, 6), 64 * 1024),
+        ] {
+            let resident = prior_inline_ladder(cc) as usize;
+            let resident_ctas = resident / (GEMV_ACCURACY4_THREADS as usize / 32);
+            let one_wave = (sms.max(1) as usize).saturating_mul(resident_ctas);
+            let expected = smem >= GEMV_ACCURACY4_STAGE64_SHARED_BYTES
+                && n.div_ceil(GEMV_ACCURACY4_COLUMNS_PER_BLOCK) < one_wave;
+            assert_eq!(
+                use_accuracy4_stage64(n, sms, cc, smem),
+                expected,
+                "stage64 decision changed for n={n} sms={sms} cc={cc:?} smem={smem}"
+            );
+        }
     }
 
     #[test]

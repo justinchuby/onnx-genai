@@ -94,6 +94,44 @@ class ValidateSiteTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("internal URL escapes", result.stderr)
 
+    def test_accepts_custom_domain_absolute_link(self) -> None:
+        self.write_valid_site(
+            index_extra=(
+                '<a href="https://www.justinchuby.com/onnx-genai/README">README</a>'
+            )
+        )
+        result = self.run_validator()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Validated 5 internal link(s)/asset(s)", result.stdout)
+
+    def test_rejects_missing_custom_domain_absolute_target(self) -> None:
+        self.write_valid_site(
+            index_extra=(
+                '<a href="https://www.justinchuby.com/onnx-genai/missing">missing</a>'
+            )
+        )
+        result = self.run_validator()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing internal target", result.stderr)
+
+    def test_rejects_custom_domain_absolute_path_escape(self) -> None:
+        self.write_valid_site(
+            index_extra='<a href="https://www.justinchuby.com/outside">outside</a>'
+        )
+        result = self.run_validator()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("internal URL escapes", result.stderr)
+
+    def test_ignores_old_github_pages_host(self) -> None:
+        self.write_valid_site(
+            index_extra=(
+                '<a href="https://justinchuby.github.io/onnx-genai/missing">'
+                "old deployment</a>"
+            )
+        )
+        result = self.run_validator()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rejects_wrong_base_path(self) -> None:
         self.write_valid_site()
         index = self.public / "index.html"

@@ -167,6 +167,15 @@ impl CudaDeviceCapabilities {
         crate::arch::ArchConfig::for_capabilities(self)
     }
 
+    /// Per-SM resident-warp estimate for the int4/accuracy_level=4 decode
+    /// GEMV's one-wave occupancy math, delegated to the arch layer (see
+    /// [`crate::arch::decode_resident_warps_per_sm`]). Byte-identical to the
+    /// ladder the decode selectors used inline before, so consuming it here does
+    /// not change selection on any device (`sm_90` → 64).
+    pub fn decode_resident_warps_per_sm(self) -> u32 {
+        crate::arch::decode_resident_warps_per_sm(self.compute_capability)
+    }
+
     /// Test-only constructor: synthesize capabilities for an arbitrary arch tier
     /// so the SM-dispatch scaffolding can be exercised without that hardware.
     #[cfg(test)]

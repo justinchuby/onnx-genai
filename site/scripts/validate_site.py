@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urljoin, urlparse, urlunsplit
 
 SITE_ORIGIN = "https://www.justinchuby.com"
+SITE_HOSTNAME = urlparse(SITE_ORIGIN).hostname
 LANDING_TITLE = "onnx-genai Knowledge Base"
 REQUIRED_PAGE = "README.html"
 
@@ -250,7 +251,7 @@ def main() -> int:
             parsed = urlparse(raw_url)
             if parsed.scheme in {"data", "mailto", "tel", "javascript"}:
                 continue
-            if parsed.netloc and parsed.hostname != "justinchuby.github.io":
+            if parsed.netloc and parsed.hostname != SITE_HOSTNAME:
                 continue
             checked_links += 1
             deployed = urlparse(urljoin(current_url, raw_url)).path

@@ -265,3 +265,99 @@ with `ONNX_GENAI_MARLIN_SPLITK=1`.
 Not addressed: Marlin is no longer the prefill bottleneck. With it on,
 `MatMulNBits` is ~20% of a prefill forward (GEMMs at ~74 TFLOPS); attention and
 elementwise ops are the other ~80%.
+
+---
+
+### 2026-08-18: SM-version kernel dispatch scaffolding (arch tier table)
+
+**By:** Batty
+
+**What:** Added arch-guarded kernel-dispatch scaffolding to `onnx-runtime-ep-cuda`
+so the pending RTX/consumer-GPU kernels have a clean insertion point, without
+touching any live kernel selection. Three pieces:
+
+1. **Device-property probe extension.** Built on the existing
+   `runtime::CudaDeviceCapabilities` seam (it already exposes compute capability,
+   multiprocessor count, and opt-in shared-mem ceiling). Added an L2 cache-size
+   probe (`CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`) with a `0 = unknown` fallback and
+   an `l2_cache_size()` getter. No duplicate probe struct created.
+2. **Arch dispatch table** (`src/arch.rs`): `ArchTier`
+   {Legacy, Volta, Turing, Ampere, Ada, Hopper, Blackwell} with a **total**,
+   panic-free `from_compute_capability` mapping, plus an `ArchConfig` of per-tier
+   default hints (QMoE tile, resident warps/SM, tensor-core eligibility, smem
+   budget, Ada L2-residency candidate). Hint values are seeded from today's
+   hardcoded selectors (`qmoe_gemm::tile_for`, `matmul_nbits` resident-warps,
+   `marlin_gemm::device_supports_marlin`).
+3. **Insertion points**: `// RTX/arch:` hooks tagged RTX-TILING, RTX-SPLITK,
+   RTX-CPASYNC, RTX-L2RES mark exactly where the pending device-property tiling,
+   split-K-by-SM-count, shared `cp.async` staging, and Ada L2-residency kernels
+   plug in.
+
+**Why:** No A100/Ada/Blackwell/RTX hardware is attached (H200 `sm_90` only), so
+this is scaffolding + correctness, not live RTX benchmarking. The layer lets us
+select kernel variants/tiling by compute capability the moment hardware lands,
+honoring the standing "rtx显卡也要优化" directive (optimizations must help
+consumer RTX 30/40/50, not just H200).
+
+**sm_90 no-change proof (HARD):** (a) The scaffolding is *not wired into any live
+selection path* — `arch_tier`/`arch_config`/`ArchTier`/`ArchConfig` are referenced
+only by their own definitions in `runtime.rs` and by `arch.rs`; no kernel selector
+(matmul_nbits, qmoe, marlin, gqa) calls them, so dispatch on every device is
+byte-for-byte unchanged. (b) The only `CudaDeviceCapabilities` change is an
+*additive* `l2_cache_size` field; existing getters return identical values and
+existing selectors are untouched. (c) Regression-locked by
+`sm_90_hopper_config_is_frozen` (tile 8, 64 resident warps, tensor-core eligible,
+no L2-residency) reached both directly and through a synthetic sm_90 device.
+
+**Tests:** `CUDA_VISIBLE_DEVICES=7 cargo test -p onnx-runtime-ep-cuda --lib -- arch:: capability_limits` → 7 passed. `cargo check` clean; `cargo clippy` clean on changed files (the single remaining warning is in the pre-existing dirty `matmul_nbits.rs`, not this change); `cargo fmt` applied.
+
+**Merged PR:** #1287
+
+---
+
+### 2026-08-18: on-GPU argmax base-decode win — GO (byte-identical), tie-break option added
+
+**By:** Deckard
+
+**What:** GO. Promoted/validated the on-GPU device argmax as a byte-identical greedy
+BASE-decode win and added a highest-index tie-break OPTION to the device argmax
+reduction kernel. Branch `squad/ongpu-argmax-base`, PR #1293 (off origin/main
+684c70d0, worktree ../ongpu-argmax-wt).
+
+**Tie-break finding (supersedes the task's stated blocker):** the device argmax
+kernel and the engine's host greedy reference BOTH already resolve ties to the
+LOWEST token id (`sample_greedy` / `argmax_logits_tensor`, canonical ONNX ArgMax
+`select_last_index=false`). They are therefore ALREADY byte-identical with the
+default lowest-index tie-break — the feared ~72.9% fp16-ULP-tie divergence does
+NOT occur on the shipping path. The `max_by`-based "highest index" references
+noted in the task are in test/bench code, not the shipping greedy sampler. I
+still delivered a `HighestIndex` kernel OPTION (default stays `LowestIndex`) so the
+same reduction can match a `max_by` / `select_last_index=true` reference where
+needed; threaded through `ExecutionProvider::device_argmax` → CUDA provider →
+session `DeviceIoBinding` → NVRTC partials/finalize kernels. Proven distinct on
+identical fp16 ULP-tie inputs (new unit test) + a low-vs-high regression lock.
+All 7 ep-cuda device_argmax GPU tests pass (GPU0); engine tensor_argmax tests pass.
+
+**Byte-identity result (0.000% token divergence, 128 tok greedy, PINNED):**
+- qwen2.5-0.5b int4 (24 layers, head64), GPU0: divergence 0.000% — PASS
+- qwen2.5-14b int4-zp (48 layers, head128), GPU1: divergence 0.000% — PASS
+
+**A/B perf (medians of 5 runs, 128 tok, decode-skip 1, warmups 2, PINNED idle GPU):**
+| model | host-argmax tok/s | on-GPU-argmax tok/s | net |
+|-------|-------------------|---------------------|-----|
+| qwen2.5-0.5b int4 (GPU0) | 500.07 | 638.53 | 1.277x (+27.7%) |
+| qwen2.5-14b int4-zp (GPU1) | 155.80 | 169.49 | 1.088x (+8.8%) |
+
+**Wiring status:** on-GPU device argmax is the default in the standalone native
+greedy loop (`NativeDecodeSession` → `next_token_greedy` → `decode_cuda_greedy` →
+`read_greedy_result` → `device_argmax`). The pipeline decoder (`NativePipelineDecoder::step`)
+is deliberately NOT wired here to keep this PR byte-identity-safe; recommend a follow-up.
+
+**Default recommendation:** keep on-GPU argmax ON by default for the native
+greedy loop — byte-identical and a strict tok/s win on every model measured. Keep
+`LowestIndex` tie-break default; expose `HighestIndex` only as an opt-in kernel option.
+
+**Why:** eliminates the per-step logits D2H + host reduction on the greedy base
+path with zero token drift, a pure BASE-decode win (no speculative).
+
+**Merged PR:** #1293
