@@ -99,16 +99,25 @@ pub fn device_supports_marlin(compute_capability: (u32, u32)) -> bool {
     compute_capability >= MARLIN_MIN_SM
 }
 
-/// Opt-in gate for routing the `MatMulNBits` M>1 path through Marlin. Default
-/// OFF so the tensor-core path never becomes the silent default that could
-/// regress a tier before it is proven faster than the portable tiled GEMM
-/// (Rule 11 / mission: Marlin is opt-in and tier-scoped). Enable with
-/// `ONNX_GENAI_MARLIN_M_GT_1=1` (or `true`/`on`).
+/// Gate for routing the `MatMulNBits` M>1 path through Marlin. Default **ON**:
+/// the tensor-core GEMM is now measured faster than the portable tiled GEMM on
+/// the prefill shapes it accepts, so leaving it opt-in only made every default
+/// deployment pay a prefill tax. End-to-end on an A100-SXM4-80GB (SM80) serving
+/// Muse-Glimmer-30B int4, time-to-first-token for a 3247-token prompt drops
+/// 37.7s -> 16.7s (2.26x; prefill 86 -> 195 tok/s), and the in-tree
+/// `marlin_m_gt_1_wall_vs_tiled` bench shows the same ordering per shape.
+///
+/// This gate only *offers* Marlin; every eligibility check still applies at the
+/// call site (SM80+, int4, no `g_idx`, no fused SwiGLU/RMSNorm epilogue) and any
+/// runtime ineligibility or launch error falls through to the byte-identical
+/// portable tiled GEMM (Rule 11 fallback contract). Opt out with
+/// `ONNX_GENAI_MARLIN_M_GT_1=0` (or `false`/`off`) to force the tiled path for
+/// A/B measurement or to bisect a suspected Marlin regression.
 #[must_use]
 pub fn marlin_m_gt_1_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("ONNX_GENAI_MARLIN_M_GT_1").ok().as_deref(),
-        Some("1") | Some("true") | Some("on")
+        Some("0") | Some("false") | Some("off")
     )
 }
 
@@ -119,21 +128,31 @@ pub fn marlin_m_gt_1_enabled() -> bool {
 /// tolerance and is deterministic — greedy/argmax tokens remain byte-identical,
 /// validated e2e on glm-4-9b and qwen2.5-14b).
 ///
-/// This gate lives *inside* the already-opt-in Marlin M>1 path
-/// ([`marlin_m_gt_1_enabled`], default OFF), so it never affects a default /
-/// consumer / edge tier; and [`choose_split_k`] only elects a split for
-/// small-M / low-wave shapes (returns 1 for large-M prefill and short-K),
-/// leaving those on the byte-identical direct kernel. Split-K is the measured
-/// lever that collapses the speculative-verify (M=K) wall — capture B* 5.10x ->
-/// 2.69x at M=8 on glm-4-9b (Sebastian's Increment-0 re-probe) — so it is ON by
-/// default whenever Marlin M>1 is enabled. Opt out with
-/// `ONNX_GENAI_MARLIN_SPLITK=0` (or `false`/`off`) to force the byte-identical
-/// direct kernel for every M.
+/// This gate lives *inside* the Marlin M>1 path ([`marlin_m_gt_1_enabled`]), so
+/// disabling that one disables this one too; and [`choose_split_k`] only elects
+/// a split for small-M / low-wave shapes (returns 1 for large-M prefill and
+/// short-K), leaving those on the byte-identical direct kernel.
+///
+/// Default **OFF**. Split-K was ON-by-default only for as long as its parent
+/// gate was opt-in, which kept the non-byte-identical reduction out of every
+/// default deployment. Now that [`marlin_m_gt_1_enabled`] defaults ON, leaving
+/// this one ON would silently ship that reduction to everyone and break the
+/// byte-identity bar that blocked the earlier default flip — so the polarity
+/// moves here instead. Nothing is lost on the path that motivated the flip:
+/// split-K is inert for prefill shapes (`choose_split_k` returns 1 there), and
+/// an A100 prefill A/B on Muse-Glimmer-30B int4 measured it as pure noise
+/// (3247-token prompt: 16.2s with split-K off vs 16.7s on).
+///
+/// Enable with `ONNX_GENAI_MARLIN_SPLITK=1` (or `true`/`on`) to recover the
+/// small-M lever: it is what collapses the speculative-verify (M=K) wall —
+/// capture B* 5.10x -> 2.69x at M=8 on glm-4-9b — at the cost of a fixed-order
+/// fp32 partial reduction that is deterministic and within f64-oracle tolerance
+/// but not bit-for-bit equal to the direct kernel.
 #[must_use]
 pub fn marlin_splitk_enabled() -> bool {
-    !matches!(
+    matches!(
         std::env::var("ONNX_GENAI_MARLIN_SPLITK").ok().as_deref(),
-        Some("0") | Some("false") | Some("off")
+        Some("1") | Some("true") | Some("on")
     )
 }
 

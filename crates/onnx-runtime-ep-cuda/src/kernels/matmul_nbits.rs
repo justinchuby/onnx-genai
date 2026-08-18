@@ -10003,8 +10003,9 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         eprintln!("  M     tiled_us   marlin_us   speedup");
         for &m in &[1usize, 2, 4, 8, 16, 32, 64, 128] {
             // SAFETY: serial ignored bench; flag toggling is race-free here.
+            // Marlin M>1 is default-ON, so the tiled arm opts out explicitly.
             unsafe {
-                std::env::remove_var("ONNX_GENAI_MARLIN_M_GT_1");
+                std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "0");
             }
             let tiled = time_path(&kernel, m);
             unsafe {
@@ -10189,7 +10190,9 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 if want_marlin {
                     std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "1");
                 } else {
-                    std::env::remove_var("ONNX_GENAI_MARLIN_M_GT_1");
+                    // Marlin M>1 is default-ON, so the tiled arm must opt out
+                    // explicitly; unsetting the variable would select Marlin.
+                    std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "0");
                 }
             }
             let mut outputs = [TensorMut::new(
@@ -10434,7 +10437,9 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 if want_marlin {
                     std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "1");
                 } else {
-                    std::env::remove_var("ONNX_GENAI_MARLIN_M_GT_1");
+                    // Marlin M>1 is default-ON, so the tiled arm must opt out
+                    // explicitly; unsetting the variable would select Marlin.
+                    std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "0");
                 }
             }
             let mut outputs = [TensorMut::new(
