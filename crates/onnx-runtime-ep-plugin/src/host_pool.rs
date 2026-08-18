@@ -80,7 +80,7 @@ unsafe extern "C" fn run_index(usr_data: *mut c_void, index: usize) {
             // worker which is going to help has time to claim another. Paid
             // only on probe dispatches, and only until one of them answers.
             if !task.stalled.swap(true, Ordering::Relaxed) {
-                stall(PROBE_STALL);
+                stall_until(PROBE_STALL, &task.saw_another_thread);
             }
         } else {
             task.saw_another_thread.store(true, Ordering::Relaxed);
@@ -91,20 +91,27 @@ unsafe extern "C" fn run_index(usr_data: *mut c_void, index: usize) {
     }
 }
 
-/// How long the calling thread holds its first index open on a probe.
+/// Longest the calling thread holds its first index open on a probe.
 ///
-/// Long enough to cover a sleeping worker's wake-up on this machine, short
-/// enough that a session whose pool really is serial barely notices: probes
-/// back off to one dispatch in a thousand, so this is ~0.1 us amortised.
-const PROBE_STALL: core::time::Duration = core::time::Duration::from_micros(100);
+/// A deadline, not a duration: the wait ends the moment a worker is seen, so a
+/// pool with threads pays its wake-up latency and no more. The full 400 us is
+/// only ever paid by a pool that has nobody to wake, and only for the
+/// [`PROBE_BURST`](onnx_runtime_ep_api::host_parallel::PROBE_BURST) probes of
+/// a fused node's opening burst plus one dispatch in a thousand after that.
+///
+/// It has to cover a *loaded* machine's wake-up, not an idle one. At 100 us,
+/// probing was decisive on a quiet box (15 of 15 sessions latched within three
+/// probes) but not on one running at load 5-10, where several sessions never
+/// latched at all and kept their work on the wrong pool.
+const PROBE_STALL: core::time::Duration = core::time::Duration::from_micros(400);
 
-/// Busy-waits for `how_long`.
+/// Busy-waits until `evidence` is set, or `how_long` has passed.
 ///
 /// Deliberately not a sleep: this runs on ORT's calling thread, and parking it
 /// would hand the core to the very workers whose presence is being tested.
-fn stall(how_long: core::time::Duration) {
+fn stall_until(how_long: core::time::Duration, evidence: &AtomicBool) {
     let until = std::time::Instant::now() + how_long;
-    while std::time::Instant::now() < until {
+    while !evidence.load(Ordering::Relaxed) && std::time::Instant::now() < until {
         std::hint::spin_loop();
     }
 }
@@ -117,11 +124,14 @@ fn stall(how_long: core::time::Duration) {
 /// this must be reached from inside the compute call that installed it.
 unsafe fn ort_parallel_for(host: *mut c_void, total: usize, body: &(dyn Fn(usize) + Sync)) {
     let pool = unsafe { &*(host.cast::<HostPool>()) };
-    // Only look at thread identities until the answer is in. A session runs
-    // this on every dispatch, and `thread::current()` is not free.
     // Watch which threads run the bodies until one of them is not ours. That
     // sighting is the whole answer -- see `HostParallel::prefer_host` -- and
     // once it is in, stop paying for `thread::current()` on every index.
+    //
+    // While the answer is missing, every dispatch that gets here is a probe:
+    // eight empty indices sent for their scheduling behaviour alone. Real work
+    // only reaches this function once the pool has proved it has workers, or
+    // when there is no cell to record the answer in.
     let observing = total > 1 && !unsafe { pool.helped() };
     let task = Task {
         body,
@@ -350,13 +360,6 @@ mod tests {
         }
     }
 
-    /// Only ever used to read a probe cell back through the public API.
-    ///
-    /// # Safety
-    ///
-    /// Trivially sound: it touches neither argument.
-    unsafe fn never_runs(_host: *mut c_void, _total: usize, _body: &(dyn Fn(usize) + Sync)) {}
-
     #[test]
     fn every_index_runs_once() {
         let width = AtomicU32::new(0);
@@ -466,47 +469,54 @@ mod tests {
     /// rarely.
     #[test]
     fn the_probe_and_the_latch_agree() {
+        // Wired to the real `ort_parallel_for`, so `prefer_host` runs its own
+        // probe through it exactly as a kernel would.
         let probe = AtomicU32::new(0);
         let mut threaded = pool(threaded_parallel_for, &probe);
-        // SAFETY: `never_runs` dereferences neither argument.
+        // SAFETY: `threaded` outlives the handle, and `ort_parallel_for` is
+        // the function that pointer was built for.
         let handle = unsafe {
             HostParallel::new(
-                core::ptr::null_mut(),
-                never_runs,
+                (&raw mut threaded).cast::<c_void>(),
+                ort_parallel_for,
                 core::ptr::from_ref(&probe),
             )
         };
-        assert!(handle.prefer_host(), "the first dispatch always asks");
-        unsafe { ort_parallel_for((&raw mut threaded).cast::<c_void>(), 4, &|_| {}) };
+        assert!(
+            handle.prefer_host(),
+            "a probe the pool answers should switch this dispatch over at once"
+        );
         assert!(handle.helped());
-        assert!(handle.prefer_host());
+        assert!(handle.prefer_host(), "and stay switched over");
 
+        // The same, over a pool that runs everything on the calling thread:
+        // it can never prove itself, so the work stays on our own pool.
         let quiet = AtomicU32::new(0);
         let mut inline = pool(inline_parallel_for, &quiet);
         // SAFETY: as above.
         let handle = unsafe {
             HostParallel::new(
-                core::ptr::null_mut(),
-                never_runs,
+                (&raw mut inline).cast::<c_void>(),
+                ort_parallel_for,
                 core::ptr::from_ref(&quiet),
             )
         };
-        let mut asks = 0;
+        let mut borrowed = 0;
         for _ in 0..4096 {
             if handle.prefer_host() {
-                asks += 1;
-                unsafe { ort_parallel_for((&raw mut inline).cast::<c_void>(), 4, &|_| {}) };
+                borrowed += 1;
             }
         }
         assert!(!handle.helped());
-        assert!(
-            (2..=4096 / usize::try_from(PROBE_MIN).unwrap()).contains(&asks),
-            "asked {asks} times in 4096 dispatches"
+        assert_eq!(
+            borrowed, 0,
+            "an inline pool never proves itself, so nothing may be handed to it"
         );
-        assert!(
-            asks * usize::try_from(PROBE_MAX).unwrap() >= 4096,
-            "a serial-looking session must still re-ask often enough to recover"
-        );
+        // The cell still has to be asking often enough to recover if the
+        // opening burst was unlucky, and not so often that it costs anything.
+        let settled = quiet.load(Ordering::Relaxed) >> 16;
+        assert_eq!(settled, PROBE_MAX, "probes should settle at the cap");
+        assert!(settled >= PROBE_MIN, "and never stop entirely");
     }
 
     #[test]
