@@ -72,7 +72,7 @@ pub const CPU_EP_SUPPORTED_DTYPES: &[DataType] = &[
 pub(crate) fn validate_dims(
     dims: &[i64],
     dtype: DataType,
-    context: &str,
+    context: std::fmt::Arguments<'_>,
 ) -> Result<(Vec<usize>, usize, usize), String> {
     let mut shape: Vec<usize> = Vec::with_capacity(dims.len());
     for (dim_idx, &d) in dims.iter().enumerate() {
@@ -166,19 +166,31 @@ pub(crate) unsafe fn read_inputs(
     let get_input = api
         .KernelContext_GetInput
         .ok_or("OrtApi.KernelContext_GetInput is null")?;
-    let get_type_shape = api
-        .GetTensorTypeAndShape
-        .ok_or("OrtApi.GetTensorTypeAndShape is null")?;
-    let get_elem_type = api
-        .GetTensorElementType
-        .ok_or("OrtApi.GetTensorElementType is null")?;
-    let get_dims_count = api
-        .GetDimensionsCount
-        .ok_or("OrtApi.GetDimensionsCount is null")?;
-    let get_dims = api.GetDimensions.ok_or("OrtApi.GetDimensions is null")?;
-    let release_type_shape = api
-        .ReleaseTensorTypeAndShapeInfo
-        .ok_or("OrtApi.ReleaseTensorTypeAndShapeInfo is null")?;
+    // One call that yields both the element type and a *reference* to the
+    // `OrtValue`'s own shape array. It replaces the five-call
+    // `GetTensorTypeAndShape` / `GetTensorElementType` / `GetDimensionsCount` /
+    // `GetDimensions` / `ReleaseTensorTypeAndShapeInfo` sequence below, and
+    // spares ORT the `OrtTensorTypeAndShapeInfo` it had to allocate and free
+    // for every input of every `Run`. Available since ORT API 24 and the
+    // plugin fails closed below API 27, so the fallback is unreachable in
+    // practice — it is kept so a host that leaves the hook null still works.
+    let get_type_and_shape_ref = api.GetTensorElementTypeAndShapeDataReference;
+    let legacy_shape_hooks = match (
+        api.GetTensorTypeAndShape,
+        api.GetTensorElementType,
+        api.GetDimensionsCount,
+        api.GetDimensions,
+        api.ReleaseTensorTypeAndShapeInfo,
+    ) {
+        (Some(a), Some(b), Some(c), Some(d), Some(e)) => Some((a, b, c, d, e)),
+        _ => None,
+    };
+    if get_type_and_shape_ref.is_none() && legacy_shape_hooks.is_none() {
+        return Err(
+            "OrtApi exposes neither GetTensorElementTypeAndShapeDataReference nor the              GetTensorTypeAndShape family; input shapes cannot be read"
+                .into(),
+        );
+    }
     let get_tensor_data = api.GetTensorData.ok_or("OrtApi.GetTensorData is null")?;
 
     let mut input_count: usize = 0;
@@ -205,40 +217,74 @@ pub(crate) unsafe fn read_inputs(
             continue;
         }
 
-        // Get type and shape info.
-        let mut type_shape: *mut ort::OrtTensorTypeAndShapeInfo = std::ptr::null_mut();
-        let status = unsafe { get_type_shape(value, &mut type_shape) };
-        if !status.is_null() || type_shape.is_null() {
-            return Err(format!("GetTensorTypeAndShape failed for input {i}"));
-        }
-
-        // Element type.
+        // Element type and dimensions.
         let mut elem_type: ort::ONNXTensorElementDataType = 0;
-        let status = unsafe { get_elem_type(type_shape, &mut elem_type) };
-        if !status.is_null() {
-            unsafe { release_type_shape(type_shape) };
-            return Err(format!("GetTensorElementType failed for input {i}"));
-        }
+        let mut borrowed_dims: *const i64 = std::ptr::null();
+        let mut borrowed_ndim: usize = 0;
+        let mut owned_dims: Vec<i64> = Vec::new();
+        let borrowed = match get_type_and_shape_ref {
+            Some(get_ref) => {
+                let status = unsafe {
+                    get_ref(
+                        value,
+                        &mut elem_type,
+                        &mut borrowed_dims,
+                        &mut borrowed_ndim,
+                    )
+                };
+                if !status.is_null() {
+                    return Err(format!(
+                        "GetTensorElementTypeAndShapeDataReference failed for input {i}"
+                    ));
+                }
+                true
+            }
+            None => {
+                let (get_type_shape, get_elem_type, get_dims_count, get_dims, release_type_shape) =
+                    legacy_shape_hooks.expect("checked above: one of the two paths exists");
+                let mut type_shape: *mut ort::OrtTensorTypeAndShapeInfo = std::ptr::null_mut();
+                let status = unsafe { get_type_shape(value, &mut type_shape) };
+                if !status.is_null() || type_shape.is_null() {
+                    return Err(format!("GetTensorTypeAndShape failed for input {i}"));
+                }
+                let status = unsafe { get_elem_type(type_shape, &mut elem_type) };
+                if !status.is_null() {
+                    unsafe { release_type_shape(type_shape) };
+                    return Err(format!("GetTensorElementType failed for input {i}"));
+                }
+                let mut ndim: usize = 0;
+                let status = unsafe { get_dims_count(type_shape, &mut ndim) };
+                if !status.is_null() {
+                    unsafe { release_type_shape(type_shape) };
+                    return Err(format!("GetDimensionsCount failed for input {i}"));
+                }
+                owned_dims = vec![0i64; ndim];
+                let status = unsafe { get_dims(type_shape, owned_dims.as_mut_ptr(), ndim) };
+                if !status.is_null() {
+                    unsafe { release_type_shape(type_shape) };
+                    return Err(format!("GetDimensions failed for input {i}"));
+                }
+                unsafe { release_type_shape(type_shape) };
+                false
+            }
+        };
         let dtype = DataType::from_onnx(elem_type as i32)
             .ok_or_else(|| format!("unsupported element type {elem_type} for input {i}"))?;
-
-        // Dimensions.
-        let mut ndim: usize = 0;
-        let status = unsafe { get_dims_count(type_shape, &mut ndim) };
-        if !status.is_null() {
-            unsafe { release_type_shape(type_shape) };
-            return Err(format!("GetDimensionsCount failed for input {i}"));
-        }
-        let mut dims = vec![0i64; ndim];
-        let status = unsafe { get_dims(type_shape, dims.as_mut_ptr(), ndim) };
-        if !status.is_null() {
-            unsafe { release_type_shape(type_shape) };
-            return Err(format!("GetDimensions failed for input {i}"));
-        }
-        unsafe { release_type_shape(type_shape) };
+        // SAFETY: on the borrowed path ORT reports `shape_data` as its own
+        // storage for this `OrtValue`, valid until the value is released or
+        // reshaped — neither happens while this `Compute` call holds it. A
+        // scalar is reported as a null pointer with count 0, which must not be
+        // handed to `from_raw_parts`.
+        let dims: &[i64] = if !borrowed {
+            &owned_dims
+        } else if borrowed_ndim == 0 || borrowed_dims.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(borrowed_dims, borrowed_ndim) }
+        };
 
         // Validate ORT-supplied dims: reject negatives and detect overflow.
-        let (shape, _, _) = validate_dims(&dims, dtype, &format!("input {i}"))?;
+        let (shape, _, _) = validate_dims(dims, dtype, format_args!("input {i}"))?;
         let strides = onnx_runtime_ir::compute_contiguous_strides(&shape);
 
         // Data pointer.
@@ -284,7 +330,22 @@ pub(crate) unsafe fn allocate_output(
         .GetTensorMutableData
         .ok_or("OrtApi.GetTensorMutableData is null")?;
 
-    let dims: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
+    // ORT wants the shape as `i64`. Ranks this small are the whole population
+    // of shapes this path sees, so the conversion goes to the stack and a
+    // per-`Run`, per-output heap allocation disappears; a taller tensor still
+    // works, through the `Vec`.
+    const INLINE_RANK: usize = 8;
+    let mut inline_dims = [0i64; INLINE_RANK];
+    let heap_dims: Vec<i64>;
+    let dims: &[i64] = if shape.len() <= INLINE_RANK {
+        for (slot, &d) in inline_dims.iter_mut().zip(shape) {
+            *slot = d as i64;
+        }
+        &inline_dims[..shape.len()]
+    } else {
+        heap_dims = shape.iter().map(|&d| d as i64).collect();
+        &heap_dims
+    };
     let mut value: *mut ort::OrtValue = std::ptr::null_mut();
     let status = unsafe { get_output(ctx, index, dims.as_ptr(), dims.len(), &mut value) };
     if !status.is_null() {
@@ -499,7 +560,7 @@ mod tests {
     #[test]
     fn validate_dims_rejects_negative() {
         let dims = [4, -1, 8];
-        let err = super::validate_dims(&dims, DataType::Float32, "test").unwrap_err();
+        let err = super::validate_dims(&dims, DataType::Float32, format_args!("test")).unwrap_err();
         assert!(err.contains("dim[1] is -1"), "error: {err}");
         assert!(err.contains("negative"), "error: {err}");
     }
@@ -508,7 +569,7 @@ mod tests {
     fn validate_dims_rejects_large_negative() {
         // ORT's dynamic-dim sentinel -1 as i64
         let dims = [2, -1i64];
-        let err = super::validate_dims(&dims, DataType::Float32, "x").unwrap_err();
+        let err = super::validate_dims(&dims, DataType::Float32, format_args!("x")).unwrap_err();
         assert!(err.contains("-1"), "error: {err}");
     }
 
@@ -516,7 +577,7 @@ mod tests {
     fn validate_dims_overflow_element_count() {
         // Two huge dims that overflow usize on multiply
         let dims = [i64::MAX / 2, 4];
-        let err = super::validate_dims(&dims, DataType::Float32, "big").unwrap_err();
+        let err = super::validate_dims(&dims, DataType::Float32, format_args!("big")).unwrap_err();
         assert!(err.contains("overflows"), "error: {err}");
     }
 
@@ -530,7 +591,7 @@ mod tests {
         // i64::MAX as usize = 2^63-1. For Float64 (8 bytes):
         // (2^63-1) * 8 overflows usize on 64-bit.
         let dims = [i64::MAX]; // huge but positive
-        let result = super::validate_dims(&dims, DataType::Float64, "bytes");
+        let result = super::validate_dims(&dims, DataType::Float64, format_args!("bytes"));
         // byte_size = 8, element_count = 2^63-1, product overflows
         assert!(result.is_err(), "should fail: {result:?}");
     }
@@ -540,7 +601,7 @@ mod tests {
         // Zero-dim tensors are legal in ONNX (e.g. empty batch)
         let dims = [0i64, 3, 224, 224];
         let (shape, elem_count, byte_len) =
-            super::validate_dims(&dims, DataType::Float32, "zero").unwrap();
+            super::validate_dims(&dims, DataType::Float32, format_args!("zero")).unwrap();
         assert_eq!(shape, vec![0, 3, 224, 224]);
         assert_eq!(elem_count, 0);
         assert_eq!(byte_len, 0);
@@ -551,7 +612,7 @@ mod tests {
         // Scalar: zero-rank tensor with 1 element
         let dims: [i64; 0] = [];
         let (shape, elem_count, byte_len) =
-            super::validate_dims(&dims, DataType::Float32, "scalar").unwrap();
+            super::validate_dims(&dims, DataType::Float32, format_args!("scalar")).unwrap();
         assert_eq!(shape, Vec::<usize>::new());
         assert_eq!(elem_count, 1); // product of empty = 1
         assert_eq!(byte_len, 4);
@@ -561,7 +622,7 @@ mod tests {
     fn validate_dims_normal_shape() {
         let dims = [2i64, 3, 4];
         let (shape, elem_count, byte_len) =
-            super::validate_dims(&dims, DataType::Float32, "ok").unwrap();
+            super::validate_dims(&dims, DataType::Float32, format_args!("ok")).unwrap();
         assert_eq!(shape, vec![2, 3, 4]);
         assert_eq!(elem_count, 24);
         assert_eq!(byte_len, 96);
@@ -592,7 +653,7 @@ mod tests {
         // A [4, 8] f16 tensor: 32 elements × 2 bytes = 64 bytes.
         let dims = [4i64, 8];
         let (shape, elem_count, byte_len) =
-            super::validate_dims(&dims, DataType::Float16, "f16").unwrap();
+            super::validate_dims(&dims, DataType::Float16, format_args!("f16")).unwrap();
         assert_eq!(shape, vec![4, 8]);
         assert_eq!(elem_count, 32);
         assert_eq!(byte_len, 64);
@@ -603,7 +664,7 @@ mod tests {
         // A [3, 5] bf16 tensor: 15 elements × 2 bytes = 30 bytes.
         let dims = [3i64, 5];
         let (shape, elem_count, byte_len) =
-            super::validate_dims(&dims, DataType::BFloat16, "bf16").unwrap();
+            super::validate_dims(&dims, DataType::BFloat16, format_args!("bf16")).unwrap();
         assert_eq!(shape, vec![3, 5]);
         assert_eq!(elem_count, 15);
         assert_eq!(byte_len, 30);
@@ -616,7 +677,8 @@ mod tests {
         // byte_len = 2^63 * 2 = 2^64 overflows usize — checked_mul must reject it.
         let half_max_plus_1 = i64::MAX / 2 + 1; // 4611686018427387904
         let dims = [half_max_plus_1, 2i64];
-        let err = super::validate_dims(&dims, DataType::Float16, "f16_overflow").unwrap_err();
+        let err = super::validate_dims(&dims, DataType::Float16, format_args!("f16_overflow"))
+            .unwrap_err();
         assert!(
             err.contains("overflows"),
             "expected overflow error, got: {err}"
