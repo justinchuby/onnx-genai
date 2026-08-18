@@ -2665,6 +2665,29 @@ mod sampling_resolution_tests {
         assert!(options.greedy, "an explicit zero temperature is greedy");
         assert_eq!(options.temperature, 0.0);
     }
+
+    // The subtle case the Option distinction exists for: a caller that sends the
+    // schema's own default value (1.0) has still made an explicit choice, so it
+    // must override a package that declares a different temperature — absent is
+    // "no opinion", a sent 1.0 is an opinion that happens to equal the default.
+    #[test]
+    fn an_explicit_default_valued_temperature_still_overrides_the_package() {
+        let request = chat_request(json!({ "temperature": 1.0 }));
+        assert_eq!(
+            chat_sampling_overrides(&request).temperature,
+            Some(1.0),
+            "an explicitly sent 1.0 is a choice, not absence"
+        );
+        let mut options = build_generate_options(&request, DEFAULT_MAX_OUTPUT_TOKENS);
+        options.resolve_sampling_defaults(
+            Some(&declared(Some(true), Some(0.6))),
+            &chat_sampling_overrides(&request),
+        );
+        assert_eq!(
+            options.temperature, 1.0,
+            "a caller's explicit 1.0 wins over the package's declared 0.6"
+        );
+    }
 }
 
 #[cfg(test)]
