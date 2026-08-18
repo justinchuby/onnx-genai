@@ -736,21 +736,47 @@ mod tests {
         let pool = Arc::new(TaskPool::new(4));
         let hold = Arc::new(AtomicBool::new(true));
         let declined = Arc::new(AtomicUsize::new(0));
+        // Count how many holder dispatches have actually entered their body, so
+        // the probe below runs only once every slot is provably occupied.
+        // Sleeping a fixed 50 ms instead assumes the OS scheduled all
+        // `SLOT_COUNT` holder threads inside that window -- which fails on a
+        // contended box (e.g. the rest of the test suite running in parallel),
+        // leaving slots free, the probe succeeding, and the assertion flaking.
+        // Constructing the precondition removes the race rather than papering
+        // it over.
+        let held = Arc::new(AtomicUsize::new(0));
         thread::scope(|scope| {
             for _ in 0..SLOT_COUNT {
                 let pool = Arc::clone(&pool);
                 let hold = Arc::clone(&hold);
+                let held = Arc::clone(&held);
                 scope.spawn(move || {
+                    // One increment per holder even though the fan-out has two
+                    // tasks and a pool worker may run the second.
+                    let counted = AtomicBool::new(false);
                     let _ = pool.dispatch(2, &|_| {
+                        if !counted.swap(true, Ordering::Relaxed) {
+                            held.fetch_add(1, Ordering::Release);
+                        }
                         while hold.load(Ordering::Relaxed) {
                             std::hint::spin_loop();
                         }
                     });
                 });
             }
-            // Give the holders time to take every slot, then prove the next
-            // dispatcher is declined rather than blocked.
-            thread::sleep(Duration::from_millis(50));
+            // Wait until every holder is provably inside its body -- i.e. every
+            // slot is claimed -- then prove the next dispatcher is declined
+            // rather than blocked. A generous deadline keeps a starved runner
+            // from hanging the suite forever.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while held.load(Ordering::Acquire) < SLOT_COUNT && Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+            assert_eq!(
+                held.load(Ordering::Acquire),
+                SLOT_COUNT,
+                "not every holder took a slot within the deadline"
+            );
             for _ in 0..4 {
                 if !pool.dispatch(2, &|_| {}) {
                     declined.fetch_add(1, Ordering::Relaxed);

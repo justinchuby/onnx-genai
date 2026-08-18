@@ -2973,7 +2973,7 @@ path reads an environment variable for test purposes, and the tests do not race
 on a global by construction: `isolated_pool` builds a private pool rather than
 reconfiguring the shared one.
 
-### 31.7 RoPE and Softmax, moved onto it
+### 33.7 RoPE and Softmax, moved onto it
 
 Real ORT A/B, one driver invocation per pair, 7 trials × 7 runs. Ratio is
 native ÷ ORT, lower is better, `base>new`:
@@ -3009,7 +3009,7 @@ The decode-shaped cells are deliberately unmoved: `rope_*_s1` and
 arms, flat to within noise at every width. A one-token RoPE should not be
 fanning out and still does not.
 
-### 31.7.1 The scar: an unrelated edit de-vectorised the activations
+### 33.7.1 The scar: an unrelated edit de-vectorised the activations
 
 Rewiring RoPE and Softmax made **`Tanh` and `Sigmoid` 2× slower at one thread**,
 in a file the change did not touch, on inputs that never reach a parallel path.
@@ -3037,7 +3037,7 @@ Two things about this are worth keeping:
 neither helper carries the latter; every caller is already inside an `avx2,fma`
 function, so the features arrive with the inline.
 
-### 31.7.2 Re-verified against §29's Softmax, not the one it replaced
+### 33.7.2 Re-verified against §29's Softmax, not the one it replaced
 
 The Softmax numbers above were taken before #1219 landed, so their baseline was
 a `softmax_rows` that still copied `src` into `dst` before reducing. Merging
@@ -3062,7 +3062,7 @@ decode-shaped `sm_decode_h32_kv*` cells stay serial and stay flat (18–182 µs,
 within ±1 µs of base at every width), and `sm_whisper_cross` is neutral at every
 width — both are the intended outcome, not a miss.
 
-### 31.8 Transpose and the activations, and what the controls say
+### 33.8 Transpose and the activations, and what the controls say
 
 Activations, our own native ms, `base>new`, 5 trials × 7 runs:
 
@@ -3098,7 +3098,7 @@ licenses reading the 3–15× numbers as real rather than as luck. Anyone repeat
 this on this host should budget for ±25% on a single 7-trial cell and treat any
 claim smaller than that as unmeasured.
 
-### 31.9 The biggest remaining loss is GEMM, and it is the same disease
+### 33.9 The biggest remaining loss is GEMM, and it is the same disease
 
 The GEMM control was meant to be a null result and instead found the largest
 single loss in the CPU EP. Decode-shaped `MatMulNBits`, native ms:
