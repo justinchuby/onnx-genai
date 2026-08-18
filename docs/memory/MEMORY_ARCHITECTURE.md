@@ -61,7 +61,7 @@ when in fact it is 1955 lines.
 | L3b HostGovernor | §5 | **implemented; adapter in `HostLeaseGovernor`** | `crates/onnx-genai-scheduler/src/pressure.rs`, 1955 lines, modelled in `specs/tla/PressureProtocol.tla` |
 | L4 ClusterCoordinator | §6 | **design only** | no type exists |
 | Lease contract | §1.1 | **implemented** | `crates/onnx-runtime-memory-governor` |
-| Allocator contract | §1.2, §1.3, §1.5 | **implemented on all three backends** | `onnx-runtime-memory-governor/src/allocator.rs`; CPU EP, ONNX Runtime and CUDA EP each implement it |
+| Allocator contract | §1.2, §1.3, §1.4, §1.5 | **implemented on all three backends; capability split landed (#1186 Phase 2)** | `onnx-runtime-memory-governor/src/allocator.rs`; CPU EP, ONNX Runtime and CUDA EP each implement the minimal `DeviceAllocator`. `VirtualBacking`/`SharedMapping` are now independent optional capabilities (`onnx-runtime-memory-api::capability`), discovered via `as_virtual_backing`/`as_shared_mapping` rather than always-present default methods |
 | Virtual contiguity | §1.6 | **implemented; managed no-spill VMM is the default for native CUDA (#755)** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. On native CUDA the authority-governed VMM/pool path is now selected **by default, without a flag** (#755): memory-strategy inference runs unconditionally (#752) and drives policy, so a plain `serve` gets managed **no-spill** mode and does not rely on WDDM shared-memory fallback. An explicit `serve --vram-limit <bytes>` now **overrides the inferred device budget** rather than being the trigger. When the resolved budget cannot hold the package weights the runtime **automatically enables weight streaming/offload** instead of failing, so being larger than the budget is a supported configuration; a model that fits stays `FullResident` and does **not** page. **Exception (#864): on Windows/WDDM the OS shared-memory fallback pages over-budget weights from host RAM over PCIe ~30× faster than managed streaming for the single-touch decode access pattern, so managed weight streaming is *not* auto-enabled there — the effective strategy becomes `Compatibility` (`weight_offload_enabled=false`, `managed_no_spill=false`).** This affects only the *inferred* default: an explicit `ONNX_GENAI_WEIGHT_OFFLOAD=1`, `--vram-limit`, or device-budget override still selects managed streaming, and `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1` forces it. On Linux there is no shared-memory fallback, so the managed path is unchanged (#783). Failure to construct the required VMM arena/pool is fatal before model allocation and names both the requested limit and provider failure; it never silently falls back to ungoverned `cuMemAlloc`. The legacy allocator remains reachable for one release via `ONNX_GENAI_LEGACY_ALLOCATOR=1` (back-compat: `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0`), which restores the compatibility fallback. The resolved budget, chosen strategy and offload state are printed at startup and exposed in `/v1/resources` (`memory_strategy`). |
 | Composability of the memory paths | — | **authority-governed native path implemented** | The historical independent VMM and weight-offload toggles did not compose (#704). On native CUDA — by default under #755, or under an explicit byte limit — native CUDA constructs one authority before the allocator, charges the physical-handle pool once, registers reloadable weight residency explicitly, and admits KV/workspace growth transactionally. The compatibility path remains available through the legacy-allocator opt-out; performance parity with WDDM remains separate work. |
 | Weight offload vs the OS | — | **fixed 2026-08-12: WDDM shared memory is now the default on Windows for inferred-over-budget models (#874)** | Measured directly on `qwen14b-zp` (8.33 GB weights vs a 7.73 GB budget), same binary, same prompt, byte-identical output, solo with `nvidia-smi` verified empty before every run: **WDDM 8.09/7.78 tok/s with `htod_bytes_per_token = 0`** (true zero-copy — the kernel reads weights in place from host RAM over PCIe) against **managed streaming 0.11 tok/s**. On `main` immediately prior the managed default measured 0.05–0.08 tok/s, so the end-to-end effect on this box is ~100×. **The cause is structural, not a tuning gap:** each weight is read *exactly once per decode step* (922 initializers, ~867 lookups/step, `SequentialDense`), so both paths move the same bytes over the same link, but ours adds a CPU memcpy into pinned staging, a VRAM allocation, a `cuMemMap`, an eviction and a synchronize — to buy VRAM residency that is discarded before it is ever re-read. **Copying to VRAM only pays off when the data is re-read from VRAM before eviction, and there is no intra-step reuse.** #874 therefore stops auto-enabling managed streaming on Windows when the OS fallback is available; explicit requests (`ONNX_GENAI_WEIGHT_OFFLOAD=1`, `--vram-limit`, a device-budget override) are still honoured, and `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1` forces the managed path back (parsed so an *unrecognized* value keeps the fast default — the inverse of the `ASYNC_PAGEIN` trap). Linux is unchanged and must stay so: with no shared-memory fallback an over-budget model simply fails there, so managed streaming competes with "does not run", not with something faster (#783's lesson about not inheriting a platform-specific conclusion). Trade stated plainly: the `Compatibility` arm has **no device budget** (`managed_limit_bytes=None`), so on a host short of RAM an over-budget model can thrash, and the governor cannot see system-wide pressure (#863). Keeping the no-spill arena while merely disabling offload is **not** an option — the physical-handle pool is a hard cap and `cuMemCreate` cannot spill, so with nothing paging the remainder the load fails outright. The durable fix remains the hybrid in #864: a resident hot set **plus zero-copy cold reads**, which is what would beat the OS rather than merely stop losing to it — **and which has since been built and measured to fail here; see the CLOSED NEGATIVE note at the end of this row.** **Feasibility is measured** (`scripts/zero_copy_host_map_probe.py`, #877; real-kernel follow-up #880): `cuMemHostRegister(READ_ONLY|DEVICEMAP)` on a read-only weight mapping succeeds and costs 3.1 ms per GiB, and **CUDA graph capture with a host-mapped weight pointer is supported, replaying bit-identically to eager** (#880) — so the cold path does not forfeit the `captures > 0` / `fallbacks == 0` gates. On bandwidth, **the sequential-proxy figure was optimistic by ~2× and is superseded**: #877 measured 11.41 GB/s with a `cuMemcpyDtoD` *from* mapped host memory, but #880 ran the **real strided int4 GEMV** — the exact kernel and launch config the engine selects — with only the weight pointer differing, and measured **~5.6 GB/s steady-state** from host-mapped memory against **~100–133 GB/s** resident, outputs bit-identical at every size. **Use 5.6 GB/s, not 11.4, when sizing the hybrid's cold path.** The correction is corroborated independently: WDDM reaches ~8 tok/s on qwen14b-zp by keeping ~7.7 GB resident and reading the ~0.6 GB remainder from host each step ≈ 4.8 GB/s of PCIe traffic — the same order, and impossible if zero-copy were ~1 GB/s. Sweeping the packed size mattered: the realistic ~12 MiB per-tensor read fits this GPU's L2, so a single-point measurement there compares a cached read against a PCIe read; the ≥64 MiB points are the honest ones, since the real 8.33 GB layer walk reads each weight once and vastly exceeds L2. Two consequences, the second of which **reverses the priority order originally assumed on #864**: zero-copy is **not** a bandwidth win (1.01× against an explicit copy) — it removes the copy's *second* pass and its machinery (staging fill, VRAM alloc, `cuMemMap`, eviction, synchronize), which subsumes #837 items 1–2 rather than competing with them; and **the resident hot set is worth ~9.7× at the realistic per-op shape, rising to ~15–24× at large N**, so maximising residency comes first and de-copying the remainder second. Registering all 8.33 GB of referenced weights also page-locks that much host RAM, which needs a policy on smaller hosts. **CLOSED NEGATIVE 2026-08-13 (#912): the hybrid was built end-to-end on this reasoning and it does not beat the OS here.** Both feasibility findings above held — real strided GEMV at ~5.6 GB/s, capture bit-identical with host-mapped pointers — so what defeated it was a limit neither probe looked for: **aggregate distinct host-mapped bytes read per decode step above ~0.44–0.65 GB silently return stale data** (48 cold weights collapsed generation 16 → 3 tokens; a single read stays bit-identical at 1/8/16/32, and a copy-instead A/B places the fault on the read), and capped at a provably safe 256 MiB the arm measured **0.73 tok/s against WDDM's 7.84** in the same session. The safe aperture (0.26 GB/step) is smaller than the traffic it must displace (~0.6 GB/step), so the lever is short by construction. It ships default-OFF behind `ONNX_GENAI_ZERO_COPY_HYBRID` with the conservative budget, as instrumentation for parts with larger host apertures — **re-measure there rather than inheriting this result in either direction.** **The closure is WDDM-scoped, and the Linux question is now answered (#925, default raised in #936).** On Linux there is no shared-memory fallback, so the 7.84 tok/s comparison arm does not exist: the hybrid's competitor is managed streaming or outright failure — and it wins by **~8×, 67 tok/s against ~8.5 median**. The aperture ceiling is a VidMm behaviour, as #863 suggested (it measured WDDM demoting our own VMM granules; a host registration being silently remapped is the same family), and it is **measured absent** on H200 (driver 580.105.08, CUDA 13, kernel 6.6): byte-identical to baseline with `fallbacks=0` up to **6.795 GB** of distinct host-mapped weights bound and re-read per decode step (704 `cuMemHostRegister` binds, n=3, all byte-identical) — ~15× the WDDM ~0.44 GB onset. The default budget is now platform-conditional: 256 MiB on Windows, 2 GiB elsewhere, deliberately bounded at >3× under the measured-safe figure because only one GPU class was tested. #783's lesson applied in both directions — the WDDM negative was not inherited onto Linux, and the Linux positive is not extrapolated past its hardware. With the hybrid closed on WDDM, the remaining levers on this row are **batching** (which creates the intra-step reuse that makes residency pay at all, #884/#891) and the **admission** side of the residency gap (~90% of it, #901). Historical figures this row previously carried (6.01 tok/s WDDM, 27× behind, `h2d_copy` 18.8% / `staging_fill` 9.0% / `vram_free` 9.0% / `vram_alloc` 2.3%, capture disabled under offload) are superseded: capture now runs under offload (#796) and the eviction-policy defect was fixed (#723). #705, #864, #874, #877, #880, #912, #925 |
@@ -1029,12 +1029,15 @@ an explicit pinned-prefix API (the smallest next increment) are in
 **First production consumer landed (#777).** The prefix-sharing primitive
 (`create_shared_prefix`/`commit_shared_prefix`, #803) previously had no live
 caller — only its definition and GPU tests. It is now reachable from production
-code through an allocator-agnostic seam on the `DeviceAllocator` trait
+code through the independent, allocator-agnostic `SharedMapping` capability
 (`create_shared_prefix` / `incremental_owned_bytes_for_shared_prefix` /
-`commit_shared_prefix`, returning an opaque `dyn SharedDevicePrefix`), so a
-caller holding only `dyn DeviceAllocator` can pin a token prefix once and have
-subsequent sequences map it. Non-VMM allocators keep the default impls, which
-refuse (`InvalidRequest`) rather than mis-map. The **seq-major** fused fp16 GQA
+`commit_shared_prefix`, returning an opaque `dyn SharedDevicePrefix`; see §1.4),
+so a caller holding only `dyn DeviceAllocator` calls `as_shared_mapping()` and,
+once matched to `Some`, can pin a token prefix once and have subsequent
+sequences map it. Allocators without the capability simply return `None` from
+`as_shared_mapping()` — an unambiguous "not supported here" rather than a
+method that exists everywhere and answers `InvalidRequest` from allocators that
+never had the mechanism to begin with. The **seq-major** fused fp16 GQA
 decode kernel is the first consumer: a GPU parity test
 (`crates/onnx-runtime-ep-cuda/tests/gqa_shared_prefix_parity_gpu.rs`) drives the
 real kernel over shared-prefix VMM KV and proves two sequences sharing one pinned
@@ -1712,6 +1715,120 @@ argues that *host* memory already has an arena, not that arenas are wrong.
 The benchmark is a warm single-threaded loop. It does not measure fragmentation
 over a long run, cold page faults, RSS, or contention across ORT's intra-op
 threads, and the default should not be considered settled on it alone.
+
+### 1.4 Allocator capability split: minimal contract, optional capabilities (#1186 Phase 2)
+
+Before #1186, `DeviceAllocator` carried the ordinary allocate/deallocate
+contract *and* the VMM/shared-prefix operations (`commit_allocation_range`,
+`decommit_allocation_range`, `create_shared_prefix`, ...) as optional methods
+with "successful no-op" defaults: commit answered `Ok(())`, decommit answered
+`Ok(0)`, `create_shared_prefix` answered `InvalidRequest`. Every eager
+allocator therefore answered "yes, committed" and "no bytes released" to
+questions it had no way to reason about, and discovering whether an allocator
+*actually* supported lazy commit or shared prefixes meant calling a method and
+hoping the default happened to be right for the situation — the ambiguity
+Phase 2 removes.
+
+**The split.** `DeviceAllocator` is now reduced to device identity plus
+ordinary allocate/deallocate. Two independent optional capabilities live
+beside it in `onnx-runtime-memory-api::capability`:
+
+- **`VirtualBacking`** — reserve/commit/decommit and committed-byte accounting
+  for an allocator that lazily commits physical memory onto a reserved virtual
+  range (`CudaVmmAllocator`).
+- **`SharedMapping`** — shared physical handles and prefix mappings
+  (`create_shared_prefix`/`incremental_owned_bytes_for_shared_prefix`/
+  `commit_shared_prefix`) for an allocator whose physical granules can be
+  multi-mapped across reservations.
+
+`DeviceAllocator::as_virtual_backing()`/`as_shared_mapping()` return
+`Option<&dyn Trait>`, defaulting to `None`. `None` is now the only "this
+capability does not exist here" answer — there is no longer a method whose
+success is ambiguous between "supported" and "eagerly stubbed". A caller that
+needs the capability matches on the `Option` instead of calling a method and
+trusting the default; `ExecutionProvider`'s own `commit_allocation_range` /
+`mapped_bytes_for_allocation` / `decommit_allocation_range` /
+`allocation_committed_bytes` defaults (§2) document the *same* eager fallback
+behaviour explicitly, so nothing about eager's observed behaviour changed —
+only how a caller distinguishes "eager, no capability" from "VMM, capability
+present" became precise instead of inferred.
+
+**One mechanism per provider, resolved once, never retargeted.**
+`CudaExecutionProvider` resolves exactly one CUDA allocation mechanism —
+built-in eager (`CudaDeviceAllocator`), an injected same-device allocator via
+`with_memory`, or the VMM arena (`vmm: OnceLock<Arc<CudaVmmAllocator>>`) — and
+that resolution happens entirely inside construction, before the provider is
+ever returned to a caller. `vmm` is populated at most once, inside `new`; there
+is no code path that installs it later. `with_memory(mut self, ...) ->
+Result<Self>` takes `self` by value, so it structurally cannot retarget a
+live/shared provider — and it now **rejects** (`Err`, actionable message
+referencing `CUDA_VMM_ENV`) rather than silently accepting an injected
+allocator once a VMM arena is already selected, because `memory()` always
+prefers `self.vmm` when it is set: without the rejection, `with_memory` would
+return `Ok(Self)` while the injected allocator sat unused forever — a
+successful ignored injection, exactly the ambiguity this phase removes. This
+is proven by a focused test,
+`with_memory_rejects_injection_once_vmm_is_already_selected`
+(`crates/onnx-runtime-ep-cuda/src/provider.rs`), which forces the VMM arena on,
+asserts the call returns `Err` naming what happened, and asserts a
+counting allocator passed to `with_memory` never actually served an
+allocation (`cumemalloc_calls() == 0`) — Err means the injection was never
+adopted, not adopted-then-abandoned. Capability discovery always follows
+whichever mechanism was actually selected (`self.memory().as_virtual_backing()`
+for the generic case; the concrete `self.vmm` field directly for the two
+capacity-token-coupled mapped-growth operations, which are inherent-only on
+`CudaVmmAllocator` and not part of `VirtualBacking` since only that concrete
+allocator can charge the token inside the same lock that claims physical
+granules).
+
+**Accounting exactness is unchanged, and is now independently provable per
+capability.** Eager allocation still charges the actual full requested
+footprint; VMM's lazy commit still charges only the newly committed,
+granule-rounded physical bytes; a shared physical prefix is still charged
+once, and a second sharer's admission is only its own incremental (private)
+bytes — this is what the `gqa_shared_prefix_parity_gpu` test measures
+(independent = 8 granules, shared = 6 granules, prefix charged 0 incremental
+bytes). What changed is that these numbers are now reached through
+`as_virtual_backing()`/`as_shared_mapping()` capability handles rather than
+methods that were always present on every allocator regardless of whether it
+implemented the underlying mechanism.
+
+**Not deleted in this phase.** The built-in eager CUDA allocator
+(`CudaDeviceAllocator`, `cuMemAlloc`/`cuMemFree`) is not removed by #1186
+Phase 2 — `DeviceAllocator` remains implemented by CPU, custom/injected, and
+ORT-integration allocators that have no reason to ever grow a `VirtualBacking`
+or `SharedMapping` capability. A later, final phase of the epic (tracked
+separately, labelled `timemachine`) removes the built-in eager path — only
+after the intervening capability/lifetime/manager/ABI phases have proven VMM
+fully subsumes it on every currently-supported target, and that phase's PR
+preserves migration/history evidence for future reference.
+
+**Blockers to eventual CUDA-VMM-only operation**, recorded here so a later
+phase does not have to rediscover them:
+
+- **Driver/device support variance.** `cuMemAddressReserve`/`cuMemCreate`/
+  `cuMemMap` require a CUDA driver and compute-capability floor that not every
+  currently-supported target meets; until a minimum driver/device floor is
+  chosen and enforced, an eager fallback is the only way to run on hardware
+  below that floor.
+- **Granularity/perf.** VMM commits round up to the device's allocation
+  granule (2 MiB on the devices measured in this document). Small or irregular
+  allocations pay rounding waste an eager `cuMemAlloc` does not; a VMM-only
+  world needs either a renegotiated granule floor or a sub-granule
+  sub-allocator layered over the VMM arena before it stops regressing
+  small-allocation-heavy workloads relative to eager.
+- **Plugin/standalone context ownership.** A CUDA execution provider
+  constructed outside this crate's own governed-authority path (a
+  plugin-hosted or third-party-context construction) currently gets the VMM
+  arena only when `ONNX_GENAI_CUDA_VMM` is set or the standalone default path
+  enables it. A plugin-hosted construction surface that guarantees the same
+  VMM-by-default behaviour without a flag has not been finalized.
+- **Teardown/drain complexity.** VMM's `TeardownSynchronizer`/drain logic,
+  which must run before the arena releases its physical pool and VA
+  reservation, is more involved than eager's `cuMemFree`. Every shutdown
+  ordering (including partial construction failure and concurrent teardown)
+  needs to be proven safe before the simpler eager teardown can be removed as
+  a fallback.
 
 ### 1.5 Using the allocator ABI fully
 

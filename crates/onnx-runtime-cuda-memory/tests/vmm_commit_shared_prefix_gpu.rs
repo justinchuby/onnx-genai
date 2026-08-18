@@ -36,7 +36,7 @@ use onnx_runtime_cuda_memory::vmm_allocator::{
 };
 use onnx_runtime_memory_governor::{
     DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
-    Tier,
+    Tier, VirtualBacking,
 };
 
 const HOLDER: HolderId = HolderId::new(777);
@@ -571,6 +571,20 @@ fn unsupported_shared_prefix_requests_error_rather_than_mismap() {
         detached.create_shared_prefix(granule).is_err(),
         "a shared prefix requires the production physical-handle pool"
     );
+    // The capability-discovery layer must agree with the inherent method: a
+    // detached/pool-less arena has no authority to share against, so
+    // `as_shared_mapping()` must say so up front rather than advertise a
+    // capability that always fails on first use (#1186 Phase 2 review,
+    // finding 2).
+    assert!(
+        DeviceAllocator::as_shared_mapping(&detached).is_none(),
+        "a detached/pool-less allocator must not advertise SharedMapping"
+    );
+    // The production, pooled allocator is the contrasting positive case.
+    assert!(
+        DeviceAllocator::as_shared_mapping(&allocator).is_some(),
+        "a pooled production allocator must advertise SharedMapping"
+    );
 
     // SAFETY: live pointers from this allocator, no CUDA work in flight.
     unsafe {
@@ -579,4 +593,122 @@ fn unsupported_shared_prefix_requests_error_rather_than_mismap() {
         allocator.deallocate(c, bytes, granule);
     }
     drop(prefix);
+}
+
+/// A shared prefix from a different logical device is never free to admit,
+/// even though it downcasts to this allocator's own prefix type: `commit_shared_prefix`
+/// would refuse to map it (device mismatch), so estimating it at zero owned
+/// bytes would let admission control undercount a mapping that can never
+/// actually happen for free (#1186 Phase 2 review, finding 3).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn a_prefix_from_a_different_device_is_never_free_to_admit() {
+    set_pool_env();
+    let context = require_cuda();
+    context.bind_to_thread().expect("bind CUDA context");
+    let granule = granularity(0);
+
+    // Two allocators bound to the same physical GPU (there is only one in
+    // this environment) but distinct *logical* `DeviceKey`s — the same
+    // distinction a multi-GPU host would express, without needing a second
+    // card to prove the accounting.
+    let governor_a = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let a = allocator(&governor_a, 64 << 20);
+    let governor_b = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let b = CudaVmmAllocator::new(
+        context.clone(),
+        DeviceKey::device(1),
+        0,
+        64 << 20,
+        &governor_b,
+        HOLDER,
+        MemoryRole::KvCache,
+    )
+    .expect("second logical-device allocator");
+
+    let prefix = a.create_shared_prefix(granule).expect("pinned prefix on a");
+
+    // The trait-level entry point (`dyn SharedMapping`), not just the
+    // inherent method, must see the same answer: this is what a caller doing
+    // capability discovery through `DeviceAllocator::as_shared_mapping`
+    // actually calls.
+    let b_mapping = DeviceAllocator::as_shared_mapping(&b).expect("b also has a pool");
+    let cost = b_mapping.incremental_owned_bytes_for_shared_prefix(&prefix);
+    assert_eq!(
+        cost,
+        prefix.committed_physical_bytes(),
+        "a prefix from a foreign device must cost its full committed bytes, not zero"
+    );
+    assert_ne!(cost, 0, "the prefix owns at least one granule");
+
+    // The inherent method (what `commit_shared_prefix`'s own device check
+    // mirrors) must agree.
+    assert_eq!(
+        b.incremental_owned_bytes_for_shared_prefix(&prefix),
+        prefix.committed_physical_bytes()
+    );
+    assert!(
+        b.commit_shared_prefix(&prefix, NonNull::dangling(), granule, 0)
+            .is_err(),
+        "commit_shared_prefix must refuse a foreign-device prefix, consistent with the \
+         non-zero cost above"
+    );
+}
+
+/// A shared prefix from a different pool authority — same logical device,
+/// unrelated physical-handle pool — is likewise never free to admit: it is
+/// exactly the case `commit_shared_prefix`'s authority check rejects.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn a_prefix_from_a_different_pool_authority_is_never_free_to_admit() {
+    set_pool_env();
+    let context = require_cuda();
+    context.bind_to_thread().expect("bind CUDA context");
+    let granule = granularity(0);
+
+    // Two independently constructed pooled allocators over the same device:
+    // each gets its own physical-handle pool authority, so they cannot share
+    // for free even though `device()` agrees.
+    let governor_a = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let a = allocator(&governor_a, 64 << 20);
+    let governor_c = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let c = allocator(&governor_c, 64 << 20);
+    assert_eq!(
+        DeviceAllocator::device(&a),
+        DeviceAllocator::device(&c),
+        "both allocators serve the same logical device"
+    );
+    assert_ne!(
+        a.physical_pool_authority(),
+        c.physical_pool_authority(),
+        "independently constructed pools must not share an authority"
+    );
+
+    let prefix = a.create_shared_prefix(granule).expect("pinned prefix on a");
+
+    let c_mapping = DeviceAllocator::as_shared_mapping(&c).expect("c also has a pool");
+    let cost = c_mapping.incremental_owned_bytes_for_shared_prefix(&prefix);
+    assert_eq!(
+        cost,
+        prefix.committed_physical_bytes(),
+        "a prefix from a foreign pool authority must cost its full committed bytes, not zero, \
+         even though the device matches"
+    );
+    assert_ne!(cost, 0, "the prefix owns at least one granule");
+    assert_eq!(
+        c.incremental_owned_bytes_for_shared_prefix(&prefix),
+        prefix.committed_physical_bytes()
+    );
+    assert!(
+        c.commit_shared_prefix(&prefix, NonNull::dangling(), granule, 0)
+            .is_err(),
+        "commit_shared_prefix must refuse a foreign-authority prefix, consistent with the \
+         non-zero cost above"
+    );
 }
