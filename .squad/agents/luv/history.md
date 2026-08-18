@@ -94,3 +94,8 @@ Fresh adversarial review of `nxrt/mlas-avx2-layernorm` @ `72e02cd92c` after the 
 ## 2026-08-18T05:25Z — Gate-3 B* post-Marlin re-probe NO-GO
 
 Luv's current-main (`923dc592`) re-probe found captured verify B* still far above the ≤~2 GO gate after Marlin: qwen2.5-14b-zp **17.5×/18.4×/20.0×** and qwen2.5-7b **14.9×/15.7×/17.4×** at K=2/4/8. Spec-decode family work remains shelved. The blocker shifted from the old #957 cheap-seam hypothesis to M>1 `MatMulNBits` launching `matmul_nbits_gemm_f16` eagerly; rerun only after the MatMulNBits/Marlin M>1 graph-safe path is actually selected.
+
+## 2026-08-18T06:10Z — Gate-3 B* Marlin M>1 opt-in still NO-GO
+
+- Re-ran the captured verify-cost probe with `ONNX_GENAI_MARLIN_M_GT_1=1`; the flag fixed M>1 capture fragmentation (qwen14 96→1 segments, qwen7 29→1) and selected `matmul_nbits_marlin_gemm_f16_splitk`; K=8 byte-identity PASS.
+- B* remains too high: qwen14 **5.19×/5.19×/5.79×**, qwen7 **4.64×/4.71×/5.23×** at K=2/4/8, so model-draft, n-gram/prompt-lookup, and EAGLE/MTP spec-decode remain mined out. Remaining bottleneck is Marlin M>1 GEMM/repack/reduce cost, not graph seams.
