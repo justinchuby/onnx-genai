@@ -208,13 +208,13 @@ impl GovernedAllocator {
     ///
     /// This is how the ONNX Runtime path reaches an allocator that commits
     /// physically on demand. `GovernedAllocator` already forwards
-    /// [`DeviceAllocator::as_virtual_backing`], so a session that registers
-    /// one of these answers the same question the native path does -- which
-    /// is what lets a consumer size a KV cache without knowing which backend
-    /// it got.
+    /// [`DeviceAllocator::commits_on_demand`], so a session that registers one
+    /// of these answers the same question the native path does -- which is
+    /// what lets a consumer size a KV cache without knowing which backend it
+    /// got.
     ///
     /// [`new`]: Self::new
-    /// [`DeviceAllocator::as_virtual_backing`]: onnx_runtime_memory_governor::DeviceAllocator::as_virtual_backing
+    /// [`DeviceAllocator::commits_on_demand`]: onnx_runtime_memory_governor::DeviceAllocator::commits_on_demand
     pub fn on_device(
         memory_info: MemoryInfo,
         memory: Arc<dyn DeviceAllocator>,
@@ -365,7 +365,7 @@ impl GovernedAllocator {
     /// `OrtAllocator` seam is a wrapper, and the property belongs to the
     /// allocator underneath it rather than to the backend on top.
     pub fn commits_on_demand(&self) -> bool {
-        self.state.memory.as_virtual_backing().is_some()
+        self.state.memory.commits_on_demand()
     }
     pub fn as_ort_allocator(&mut self) -> *mut onnx_genai_ort_sys::OrtAllocator {
         std::ptr::from_mut(&mut self.base)
@@ -810,6 +810,10 @@ mod tests {
 
             fn device(&self) -> onnx_runtime_memory_governor::DeviceKey {
                 onnx_runtime_memory_governor::DeviceKey::device(0)
+            }
+
+            fn commits_on_demand(&self) -> bool {
+                true
             }
         }
 

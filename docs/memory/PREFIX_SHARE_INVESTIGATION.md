@@ -391,14 +391,11 @@ divergence past the shared region. Those are the increments below.
 
 1. **KV-path integration (first production consumer — landed for seq-major,
    #777).** The landed primitive previously had no live caller. It is now
-   reachable from production through the independent, allocator-agnostic
-   `SharedMapping` capability (`create_shared_prefix` /
-   `incremental_owned_bytes_for_shared_prefix` / `commit_shared_prefix`,
-   yielding an opaque `dyn SharedDevicePrefix`; #1186 Phase 2 split this out of
-   `DeviceAllocator` into its own optional trait, discovered via
-   `as_shared_mapping()` — see `MEMORY_ARCHITECTURE.md` §1.4); allocators
-   without the capability return `None` rather than an always-present method
-   that refuses. The first consumer is the **seq-major** fused fp16
+   reachable from production through an allocator-agnostic seam on the
+   `DeviceAllocator` trait (`create_shared_prefix` /
+   `incremental_owned_bytes_for_shared_prefix` / `commit_shared_prefix`, yielding
+   an opaque `dyn SharedDevicePrefix`); non-VMM allocators keep default impls that
+   refuse rather than mis-map. The first consumer is the **seq-major** fused fp16
    GQA decode kernel: a caller pins a token prefix once and a second sequence maps
    it, then the real kernel reads it. Validated on the output-level parity oracle
    in `crates/onnx-runtime-ep-cuda/tests/gqa_shared_prefix_parity_gpu.rs`: two
