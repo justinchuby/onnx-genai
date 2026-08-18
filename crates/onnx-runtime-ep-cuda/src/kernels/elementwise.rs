@@ -147,6 +147,26 @@ extern "C" __global__ void NAME##_i64( \
     } \
 }
 
+#define DEFINE_BINARY_I32(NAME, EXPR) \
+extern "C" __global__ void NAME##_i32( \
+    const int* a, const int* b, int* y, \
+    const unsigned long long* metadata, const int rank, const unsigned long long n) { \
+    const unsigned long long* shape = metadata; \
+    const unsigned long long* a_strides = metadata + rank; \
+    const unsigned long long* b_strides = metadata + rank * 2; \
+    for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n; \
+         i += (unsigned long long)gridDim.x * blockDim.x) { \
+        unsigned long long linear = i, ai = 0, bi = 0; \
+        for (int d = rank - 1; d >= 0; --d) { \
+            unsigned long long coord = linear % shape[d]; \
+            linear /= shape[d]; \
+            ai += coord * a_strides[d]; \
+            bi += coord * b_strides[d]; \
+        } \
+        y[i] = (EXPR); \
+    } \
+}
+
 #define DEFINE_FOR_TYPE(TYPE, SUFFIX) \
 DEFINE_UNARY(relu, TYPE, SUFFIX) \
 DEFINE_UNARY(sqrt, TYPE, SUFFIX) \
@@ -169,8 +189,15 @@ DEFINE_SILU_MUL(float, f32)
 DEFINE_BINARY_I64(add, a[ai] + b[bi])
 DEFINE_BINARY_I64(sub, a[ai] - b[bi])
 DEFINE_BINARY_I64(mul, a[ai] * b[bi])
+DEFINE_BINARY_I64(div, a[ai] / b[bi])
 DEFINE_BINARY_I64(min, a[ai] < b[bi] ? a[ai] : b[bi])
 DEFINE_BINARY_I64(max, a[ai] > b[bi] ? a[ai] : b[bi])
+DEFINE_BINARY_I32(add, a[ai] + b[bi])
+DEFINE_BINARY_I32(sub, a[ai] - b[bi])
+DEFINE_BINARY_I32(mul, a[ai] * b[bi])
+DEFINE_BINARY_I32(div, a[ai] / b[bi])
+DEFINE_BINARY_I32(min, a[ai] < b[bi] ? a[ai] : b[bi])
+DEFINE_BINARY_I32(max, a[ai] > b[bi] ? a[ai] : b[bi])
 #ifdef NXRT_HAS_CUDA_HALF_HEADERS
 DEFINE_FOR_TYPE(__half, f16)
 DEFINE_FOR_TYPE(__nv_bfloat16, bf16)
@@ -271,7 +298,7 @@ extern "C" __global__ void decomposed_silu_bf16(
 /// NVRTC module names (one module holds all unary / all binary entries so a
 /// runtime compiles each source string at most once — see
 /// [`CudaRuntime::nvrtc_function`]).
-const POINTWISE_MODULE: &str = "elementwise_float_v3";
+const POINTWISE_MODULE: &str = "elementwise_float_v5";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FloatDtype {
@@ -793,10 +820,15 @@ impl BinaryKernel {
         }
         let a = &inputs[0];
         let b = &inputs[1];
-        let float_dtype = if a.dtype == DataType::Int64
+        let float_dtype = if matches!(a.dtype, DataType::Int32 | DataType::Int64)
             && matches!(
                 self.op,
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Min | BinaryOp::Max
+                BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Min
+                    | BinaryOp::Max
             ) {
             None
         } else {
@@ -834,7 +866,15 @@ impl BinaryKernel {
         })?;
         let entry = match float_dtype {
             Some(dtype) => self.op.entry(dtype),
-            None => format!("{}_i64", self.op.stem()),
+            None => format!(
+                "{}_{}",
+                self.op.stem(),
+                if a.dtype == DataType::Int32 {
+                    "i32"
+                } else {
+                    "i64"
+                }
+            ),
         };
         if self.op == BinaryOp::Mul {
             onnx_runtime_ep_api::record_kernel_variant!(
@@ -1600,5 +1640,121 @@ mod tests {
             runtime.free_raw(fused_device).unwrap();
         }
         assert_eq!(standalone, fused);
+    }
+}
+
+#[cfg(test)]
+mod claim_probes {
+    use std::ffi::c_void;
+    use std::sync::{Arc, Mutex};
+
+    use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, Kernel, TensorMut, TensorView};
+    use onnx_runtime_ir::{DataType, DeviceId};
+
+    use super::{BinaryKernel, BinaryOp, BroadcastMetadataCache};
+    use crate::CudaRuntime;
+
+    fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rt = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
+            .ok()
+            .flatten();
+        std::panic::set_hook(previous);
+        rt
+    }
+
+    fn run_i32_binary(runtime: &Arc<CudaRuntime>, op: BinaryOp, a: &[i32], b: &[i32]) -> Vec<i32> {
+        let bytes = std::mem::size_of_val(a);
+        let a_dev = runtime.alloc_raw(bytes).unwrap();
+        let b_dev = runtime.alloc_raw(bytes).unwrap();
+        let out_dev = runtime.alloc_raw(bytes).unwrap();
+        let as_bytes = |v: &[i32]| unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+        unsafe {
+            runtime.htod(as_bytes(a), a_dev).unwrap();
+            runtime.htod(as_bytes(b), b_dev).unwrap();
+        }
+        let shape = [1usize, a.len()];
+        let strides = [a.len() as i64, 1];
+        let device = DeviceId::cuda(0);
+        let inputs = [
+            TensorView::new(
+                DevicePtr(a_dev as usize as *const c_void),
+                DataType::Int32,
+                &shape,
+                &strides,
+                device,
+            ),
+            TensorView::new(
+                DevicePtr(b_dev as usize as *const c_void),
+                DataType::Int32,
+                &shape,
+                &strides,
+                device,
+            ),
+        ];
+        let mut outputs = [TensorMut::new(
+            DevicePtrMut(out_dev as usize as *mut c_void),
+            DataType::Int32,
+            &shape,
+            &strides,
+            device,
+        )];
+        let kernel = BinaryKernel {
+            op,
+            runtime: runtime.clone(),
+            metadata: Mutex::new(BroadcastMetadataCache::new(runtime.clone())),
+            last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
+        };
+        kernel.execute(&inputs, &mut outputs).unwrap();
+        runtime.synchronize().unwrap();
+        let mut out = vec![0i32; a.len()];
+        let out_bytes = unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes)
+        };
+        unsafe { runtime.dtoh(out_bytes, out_dev).unwrap() };
+        unsafe {
+            runtime.free_raw(a_dev).unwrap();
+            runtime.free_raw(b_dev).unwrap();
+            runtime.free_raw(out_dev).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn i32_binary_add_sub_mul_div_min_max_match_reference_on_gpu() {
+        let Some(runtime) = maybe_runtime() else {
+            eprintln!("skipping i32 binary GPU probe: CUDA runtime unavailable");
+            return;
+        };
+        let a = [7i32, -20, 9, 100, -5, 8];
+        let b = [2i32, 6, -3, 7, -2, 8];
+        for op in [
+            BinaryOp::Add,
+            BinaryOp::Sub,
+            BinaryOp::Mul,
+            BinaryOp::Div,
+            BinaryOp::Min,
+            BinaryOp::Max,
+        ] {
+            let expected: Vec<i32> = a
+                .iter()
+                .zip(&b)
+                .map(|(&x, &y)| match op {
+                    BinaryOp::Add => x + y,
+                    BinaryOp::Sub => x - y,
+                    BinaryOp::Mul => x * y,
+                    BinaryOp::Div => x / y,
+                    BinaryOp::Min => x.min(y),
+                    BinaryOp::Max => x.max(y),
+                    _ => unreachable!(),
+                })
+                .collect();
+            let actual = run_i32_binary(&runtime, op, &a, &b);
+            assert_eq!(actual, expected, "i32 {op:?} diverged on GPU");
+        }
     }
 }

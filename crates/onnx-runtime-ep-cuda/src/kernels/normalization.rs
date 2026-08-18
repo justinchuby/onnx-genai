@@ -1201,23 +1201,45 @@ extern "C" __global__ void skip_rmsnorm_f16(
 }
 "#;
 
-/// NVRTC source for the fused f32 `SkipLayerNormalization` (`com.microsoft`):
+/// NVRTC source for the fused f32/f16/bf16 `SkipLayerNormalization`
+/// (`com.microsoft`):
 /// `y = LayerNorm(input + skip + bias) · gamma + beta`. The residual sum is
 /// computed once into `y` (scratch) and optionally published to `sum_out`, then
 /// the standard two-pass LayerNorm runs over it.
 const SKIP_LAYERNORM_SRC: &str = r#"
-extern "C" __global__ void skip_layernorm_f32(
-    const float* input,
-    const float* skip,
-    const float* gamma,
-    const float* beta,        // null when absent
-    const float* bias,        // null when absent (per-channel, length norm_size)
-    float*       y,
-    float*       sum_out,      // null when not requested
-    float*       mean_out,     // null when not requested
-    float*       invstd_out,   // null when not requested
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
+__device__ __forceinline__ float skip_ln_load(
+    const void* data, size_t index, int dtype) {
+    if (dtype == 0) return ((const float*)data)[index];
+    if (dtype == 1) return __half2float(((const __half*)data)[index]);
+    return __bfloat162float(((const __nv_bfloat16*)data)[index]);
+}
+
+__device__ __forceinline__ void skip_ln_store(
+    void* data, size_t index, float value, int dtype) {
+    if (dtype == 0) ((float*)data)[index] = value;
+    else if (dtype == 1) ((__half*)data)[index] = __float2half_rn(value);
+    else ((__nv_bfloat16*)data)[index] = __float2bfloat16_rn(value);
+}
+
+extern "C" __global__ void skip_layernorm(
+    const void* input,
+    const void* skip,
+    const void* gamma,
+    const void* beta,         // null when absent
+    const void* bias,         // null when absent (per-channel, length norm_size)
+    void*       y,
+    void*       sum_out,      // null when not requested
+    void*       mean_out,     // null when not requested
+    void*       invstd_out,   // null when not requested
     const int    num_groups,
     const int    norm_size,
+    const int    dtype,
+    const int    gamma_dtype,
+    const int    beta_dtype,
+    const int    bias_dtype,
     const int    has_beta,
     const int    has_bias,
     const float  epsilon)
@@ -1232,16 +1254,18 @@ extern "C" __global__ void skip_layernorm_f32(
 
     // Residual sum s = input + skip (+ bias); stash in y and optionally sum_out.
     for (int j = tid; j < norm_size; j += nt) {
-        float sv = input[base + j] + skip[base + j];
-        if (has_bias) sv += bias[j];
-        y[base + j] = sv;
-        if (sum_out) sum_out[base + j] = sv;
+        float sv = skip_ln_load(input, base + j, dtype)
+                 + skip_ln_load(skip, base + j, dtype);
+        if (has_bias) sv += skip_ln_load(bias, j, bias_dtype);
+        skip_ln_store(y, base + j, sv, dtype);
+        if (sum_out) skip_ln_store(sum_out, base + j, sv, dtype);
     }
     __syncthreads();
 
     // Pass 1: mean of s.
     float s = 0.0f;
-    for (int j = tid; j < norm_size; j += nt) s += y[base + j];
+    for (int j = tid; j < norm_size; j += nt)
+        s += skip_ln_load(y, base + j, dtype);
     red[tid] = s;
     __syncthreads();
     for (int off = nt >> 1; off > 0; off >>= 1) {
@@ -1254,7 +1278,7 @@ extern "C" __global__ void skip_layernorm_f32(
     // Pass 2: population variance of s.
     float v = 0.0f;
     for (int j = tid; j < norm_size; j += nt) {
-        const float d = y[base + j] - mean;
+        const float d = skip_ln_load(y, base + j, dtype) - mean;
         v += d * d;
     }
     red[tid] = v;
@@ -1266,17 +1290,17 @@ extern "C" __global__ void skip_layernorm_f32(
     const float var = red[0] / (float)norm_size;
     const float inv_std = 1.0f / sqrtf(var + epsilon);
     if (tid == 0) {
-        if (mean_out)   mean_out[g]   = mean;
-        if (invstd_out) invstd_out[g] = inv_std;
+        if (mean_out)   skip_ln_store(mean_out, g, mean, dtype);
+        if (invstd_out) skip_ln_store(invstd_out, g, inv_std, dtype);
     }
     __syncthreads();
 
     // Pass 3: normalize + affine (gamma / optional beta).
     for (int j = tid; j < norm_size; j += nt) {
-        const float xhat = (y[base + j] - mean) * inv_std;
-        float o = xhat * gamma[j];
-        if (has_beta) o += beta[j];
-        y[base + j] = o;
+        const float xhat = (skip_ln_load(y, base + j, dtype) - mean) * inv_std;
+        float o = xhat * skip_ln_load(gamma, j, gamma_dtype);
+        if (has_beta) o += skip_ln_load(beta, j, beta_dtype);
+        skip_ln_store(y, base + j, o, dtype);
     }
 }
 "#;
@@ -1327,7 +1351,7 @@ fn skip_rmsnorm_warp_reduce_enabled() -> bool {
     std::env::var_os(SKIP_RMSNORM_WARP_REDUCE_ENV)
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
-const SKIP_LAYERNORM_MODULE: &str = "skip_layernorm_f32";
+const SKIP_LAYERNORM_MODULE: &str = "skip_layernorm_typed_v2";
 
 /// Threads per block for the norm reductions (power of two → exact tree reduce).
 const NORM_BLOCK: u32 = 256;
@@ -2756,7 +2780,7 @@ impl KernelFactory for SkipLayerNormFactory {
     }
 }
 
-/// Fused f32 SkipLayerNormalization kernel (`com.microsoft`).
+/// Fused f32/f16/bf16 SkipLayerNormalization kernel (`com.microsoft`).
 ///
 /// Inputs: `input`, `skip`, `gamma`, optional `beta`, optional `bias`.
 /// Outputs: `output`, optional `mean`, optional `inv_std_var`, optional
@@ -2785,10 +2809,14 @@ impl SkipLayerNormKernel {
         let gamma = &inputs[2];
         let beta = inputs.get(3);
         let bias = inputs.get(4);
-        require_f32(op, "input", input.dtype)?;
-        require_f32(op, "skip", skip.dtype)?;
-        require_f32(op, "gamma", gamma.dtype)?;
-        require_f32(op, "output", outputs[0].dtype)?;
+        require_float_storage(op, "input", input.dtype)?;
+        if skip.dtype != input.dtype || outputs[0].dtype != input.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: skip/output dtypes ({:?}/{:?}) must match input dtype {:?}",
+                skip.dtype, outputs[0].dtype, input.dtype
+            )));
+        }
+        require_param_for_activation(op, "gamma", input.dtype, gamma.dtype)?;
         require_contiguous(op, "input", input.is_contiguous())?;
         require_contiguous(op, "skip", skip.is_contiguous())?;
         require_contiguous(op, "gamma", gamma.is_contiguous())?;
@@ -2819,8 +2847,8 @@ impl SkipLayerNormKernel {
                 gamma.numel()
             )));
         }
-        let beta_ptr = optional_vec_ptr(op, "beta", beta, norm_size)?;
-        let bias_ptr = optional_vec_ptr(op, "bias", bias, norm_size)?;
+        let beta_ptr = optional_param_ptr(op, "beta", beta, norm_size, input.dtype)?;
+        let bias_ptr = optional_param_ptr(op, "bias", bias, norm_size, input.dtype)?;
         if outputs[0].shape != input.shape {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep {op}: output shape {:?} must equal input shape {:?}",
@@ -2852,11 +2880,17 @@ impl SkipLayerNormKernel {
 
         // Optional outputs: mean (slot 1), inv_std_var (slot 2) — length
         // num_groups; input_skip_bias_sum (slot 3) — length input.numel().
-        let (mean_ptr, invstd_ptr) = optional_stat_ptrs(op, outputs, num_groups)?;
+        let (mean_ptr, invstd_ptr) =
+            optional_stat_ptrs_typed(op, outputs, num_groups, input.dtype)?;
         let sum_ptr = match outputs.get_mut(3) {
             None => 0u64,
             Some(t) => {
-                require_f32(op, "input_skip_bias_sum", t.dtype)?;
+                if t.dtype != input.dtype {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep {op}: input_skip_bias_sum dtype {:?} must match input dtype {:?}",
+                        t.dtype, input.dtype
+                    )));
+                }
                 if t.numel() != input.numel() {
                     return Err(EpError::KernelFailed(format!(
                         "cuda_ep {op}: input_skip_bias_sum has {} elements, expected {}",
@@ -2875,11 +2909,15 @@ impl SkipLayerNormKernel {
         let has_beta: i32 = i32::from(beta_ptr != 0);
         let has_bias: i32 = i32::from(bias_ptr != 0);
         let eps = self.epsilon;
+        let dtype = storage_kind(input.dtype);
+        let gamma_dtype = storage_kind(gamma.dtype);
+        let beta_dtype = beta.map_or(dtype, |tensor| storage_kind(tensor.dtype));
+        let bias_dtype = bias.map_or(dtype, |tensor| storage_kind(tensor.dtype));
 
         let func = self.runtime.nvrtc_function(
             SKIP_LAYERNORM_MODULE,
             SKIP_LAYERNORM_SRC,
-            "skip_layernorm_f32",
+            "skip_layernorm",
         )?;
         let cfg = self.runtime.reduction_launch_config(
             &func,
@@ -2902,6 +2940,10 @@ impl SkipLayerNormKernel {
             .arg(&invstd_ptr)
             .arg(&groups_i)
             .arg(&norm_i)
+            .arg(&dtype)
+            .arg(&gamma_dtype)
+            .arg(&beta_dtype)
+            .arg(&bias_dtype)
             .arg(&has_beta)
             .arg(&has_bias)
             .arg(&eps);
@@ -2909,7 +2951,7 @@ impl SkipLayerNormKernel {
         // match; each non-null pointer is a live device allocation sized as
         // validated (input/skip/output/sum: num_groups·norm_size; gamma/beta/
         // bias: norm_size; mean/invstd: num_groups).
-        unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch skip_layernorm_f32", e))?;
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch skip_layernorm", e))?;
         // Kept single-group for capture on purpose: SkipLayerNorm normalizes the
         // hidden (last) axis per token, so the only captured phase (decode) is
         // always num_groups == 1 and a multi-group shape arises solely in the
@@ -2981,6 +3023,77 @@ fn optional_stat_ptrs(
     Ok((mean, invstd))
 }
 
+fn storage_kind(dtype: DataType) -> i32 {
+    match dtype {
+        DataType::Float32 => 0,
+        DataType::Float16 => 1,
+        DataType::BFloat16 => 2,
+        _ => unreachable!("normalization storage dtype must be validated before dispatch"),
+    }
+}
+
+fn optional_stat_ptrs_typed(
+    op: &str,
+    outputs: &mut [TensorMut],
+    num_groups: usize,
+    dtype: DataType,
+) -> Result<(CUdeviceptr, CUdeviceptr)> {
+    let mean = optional_out_ptr_typed(op, "Mean", outputs, 1, num_groups, dtype)?;
+    let invstd = optional_out_ptr_typed(op, "InvStdDev", outputs, 2, num_groups, dtype)?;
+    Ok((mean, invstd))
+}
+
+fn optional_out_ptr_typed(
+    op: &str,
+    name: &str,
+    outputs: &mut [TensorMut],
+    idx: usize,
+    expect: usize,
+    dtype: DataType,
+) -> Result<CUdeviceptr> {
+    match outputs.get_mut(idx) {
+        None => Ok(0),
+        Some(t) => {
+            if t.dtype != dtype {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: {name} dtype {:?} must match input dtype {dtype:?}",
+                    t.dtype
+                )));
+            }
+            if t.numel() != expect {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: {name} has {} elements, expected {expect}",
+                    t.numel()
+                )));
+            }
+            Ok(cuptr(t.data_ptr_mut::<u8>() as *const c_void))
+        }
+    }
+}
+
+fn optional_param_ptr(
+    op: &str,
+    name: &str,
+    tensor: Option<&TensorView>,
+    expect: usize,
+    activation_dtype: DataType,
+) -> Result<CUdeviceptr> {
+    match tensor {
+        None => Ok(0),
+        Some(tensor) => {
+            require_param_for_activation(op, name, activation_dtype, tensor.dtype)?;
+            require_contiguous(op, name, tensor.is_contiguous())?;
+            if tensor.numel() != expect {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: {name} has {} elements, expected {expect}",
+                    tensor.numel()
+                )));
+            }
+            Ok(cuptr(tensor.data_ptr::<u8>() as *const c_void))
+        }
+    }
+}
+
 fn optional_out_ptr(
     op: &str,
     name: &str,
@@ -2999,30 +3112,6 @@ fn optional_out_ptr(
                 )));
             }
             Ok(cuptr(t.data_ptr_mut::<u8>() as *const c_void))
-        }
-    }
-}
-
-/// Resolve an optional length-`expect` input vector (f32, contiguous) to a
-/// device pointer, or 0 when absent.
-fn optional_vec_ptr(
-    op: &str,
-    name: &str,
-    t: Option<&TensorView>,
-    expect: usize,
-) -> Result<CUdeviceptr> {
-    match t {
-        None => Ok(0),
-        Some(v) => {
-            require_f32(op, name, v.dtype)?;
-            require_contiguous(op, name, v.is_contiguous())?;
-            if v.numel() != expect {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep {op}: {name} has {} elements, expected {expect}",
-                    v.numel()
-                )));
-            }
-            Ok(cuptr(v.data_ptr::<u8>() as *const c_void))
         }
     }
 }
@@ -3128,7 +3217,9 @@ mod tests {
         assert!(RMSNORM_SRC.contains("rmsnorm_f32"));
         assert!(RMSNORM_SRC.contains("rmsnorm_f16"));
         assert!(RMSNORM_SRC.contains("rmsnorm_bf16"));
-        assert!(SKIP_LAYERNORM_SRC.contains("skip_layernorm_f32"));
+        assert!(SKIP_LAYERNORM_SRC.contains("skip_layernorm"));
+        assert!(SKIP_LAYERNORM_SRC.contains("__half"));
+        assert!(SKIP_LAYERNORM_SRC.contains("__nv_bfloat16"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_bf16"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32_dense"));
@@ -4669,6 +4760,161 @@ mod tests {
                      byte-identical to the shared-memory tree"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod claim_probes {
+    use std::ffi::c_void;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    use half::{bf16, f16};
+    use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
+    use onnx_runtime_ir::{DataType, DeviceId};
+
+    use super::SkipLayerNormKernel;
+    use crate::runtime::CudaRuntime;
+
+    fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rt = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
+            .ok()
+            .flatten();
+        std::panic::set_hook(previous);
+        rt
+    }
+
+    fn reference(input: &[f32], skip: &[f32], gamma: &[f32], eps: f32) -> Vec<f32> {
+        let n = input.len();
+        let s: Vec<f32> = (0..n).map(|i| input[i] + skip[i]).collect();
+        let mean = s.iter().sum::<f32>() / n as f32;
+        let var = s.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
+        let inv = 1.0 / (var + eps).sqrt();
+        (0..n).map(|i| (s[i] - mean) * inv * gamma[i]).collect()
+    }
+
+    #[test]
+    fn typed_skip_layernorm_f16_bf16_match_reference_on_gpu() {
+        let Some(runtime) = maybe_runtime() else {
+            eprintln!("skipping typed SkipLayerNorm GPU probe: CUDA runtime unavailable");
+            return;
+        };
+        if runtime.require_nvrtc_half_headers("SkipLayerNormalization").is_err() {
+            eprintln!("skipping typed SkipLayerNorm GPU probe: fp16 headers unavailable");
+            return;
+        }
+        let input = [1.0f32, 2.0, 3.0, 4.0];
+        let skip = [0.5f32, 0.5, 0.5, 0.5];
+        let gamma = [1.0f32, 0.5, 2.0, 1.5];
+        let eps = 1e-5f32;
+        let expect = reference(&input, &skip, &gamma, eps);
+
+        // f16 arm
+        run_half::<f16>(
+            &runtime,
+            DataType::Float16,
+            f16::from_f32,
+            f16::to_f32,
+            &input,
+            &skip,
+            &gamma,
+            eps,
+            &expect,
+            3.0e-2,
+        );
+        // bf16 arm
+        run_half::<bf16>(
+            &runtime,
+            DataType::BFloat16,
+            bf16::from_f32,
+            bf16::to_f32,
+            &input,
+            &skip,
+            &gamma,
+            eps,
+            &expect,
+            1.5e-1,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_half<T: Copy>(
+        runtime: &Arc<CudaRuntime>,
+        dtype: DataType,
+        to_h: impl Fn(f32) -> T,
+        from_h: impl Fn(T) -> f32,
+        input: &[f32],
+        skip: &[f32],
+        gamma: &[f32],
+        eps: f32,
+        expect: &[f32],
+        tol: f32,
+    ) {
+        let n = input.len();
+        let hin: Vec<T> = input.iter().map(|&v| to_h(v)).collect();
+        let hskip: Vec<T> = skip.iter().map(|&v| to_h(v)).collect();
+        let hgamma: Vec<T> = gamma.iter().map(|&v| to_h(v)).collect();
+        let elem = std::mem::size_of::<T>();
+        let bytes = elem * n;
+        let in_dev = runtime.alloc_raw(bytes).unwrap();
+        let skip_dev = runtime.alloc_raw(bytes).unwrap();
+        let gamma_dev = runtime.alloc_raw(bytes).unwrap();
+        let out_dev = runtime.alloc_raw(bytes).unwrap();
+        let as_bytes = |v: &[T]| unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+        unsafe {
+            runtime.htod(as_bytes(&hin), in_dev).unwrap();
+            runtime.htod(as_bytes(&hskip), skip_dev).unwrap();
+            runtime.htod(as_bytes(&hgamma), gamma_dev).unwrap();
+        }
+        let device = DeviceId::cuda(0);
+        let shape = [1usize, n];
+        let strides = [n as i64, 1];
+        let mk = |ptr: u64| {
+            TensorView::new(
+                DevicePtr(ptr as usize as *const c_void),
+                dtype,
+                &shape,
+                &strides,
+                device,
+            )
+        };
+        let inputs = [mk(in_dev), mk(skip_dev), mk(gamma_dev)];
+        let mut outputs = [TensorMut::new(
+            DevicePtrMut(out_dev as usize as *mut c_void),
+            dtype,
+            &shape,
+            &strides,
+            device,
+        )];
+        let kernel = SkipLayerNormKernel {
+            epsilon: eps,
+            runtime: runtime.clone(),
+            last_call_capture_safe: AtomicBool::new(false),
+        };
+        kernel.run(&inputs, &mut outputs).unwrap();
+        runtime.synchronize().unwrap();
+        let mut out = vec![to_h(0.0); n];
+        let out_bytes = unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes)
+        };
+        unsafe { runtime.dtoh(out_bytes, out_dev).unwrap() };
+        unsafe {
+            runtime.free_raw(in_dev).unwrap();
+            runtime.free_raw(skip_dev).unwrap();
+            runtime.free_raw(gamma_dev).unwrap();
+            runtime.free_raw(out_dev).unwrap();
+        }
+        for (i, (&o, &e)) in out.iter().zip(expect).enumerate() {
+            let got = from_h(o);
+            assert!(
+                (got - e).abs() <= tol,
+                "{dtype:?} SkipLayerNorm index {i}: expected {e}, got {got}"
+            );
         }
     }
 }

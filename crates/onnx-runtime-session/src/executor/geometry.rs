@@ -345,15 +345,16 @@ pub(super) fn substitute_into(
     true
 }
 
-/// Decode raw little-endian integer bytes as `i64` for `dtype`, or `None` if the
-/// dtype is not an integer the shape math understands. Shared by the owned-buffer
-/// and materialized-view integer-input readers.
+/// Decode raw little-endian integer or boolean bytes as `i64` for `dtype`, or
+/// `None` if the dtype is not scalar data the shape math understands. Shared by
+/// the owned-buffer and materialized-view shape-input readers.
 pub(super) fn bytes_as_i64(bytes: &[u8], dtype: DataType) -> Option<Vec<i64>> {
     match dtype {
         DataType::Int64 => onnx_runtime_ir::read_vec_le(bytes).ok(),
         DataType::Int32 => onnx_runtime_ir::read_vec_le::<i32>(bytes)
             .ok()
             .map(|values| values.into_iter().map(i64::from).collect()),
+        DataType::Bool => Some(bytes.iter().map(|&value| i64::from(value != 0)).collect()),
         _ => None,
     }
 }
@@ -372,7 +373,7 @@ pub(super) fn bytes_as_f64(bytes: &[u8], dtype: DataType) -> Option<Vec<f64>> {
 /// data. Keep this gate ahead of `contiguous_bytes`: unsupported tensors must
 /// degrade to absent shape-data without allocating or copying their contents.
 pub(super) fn bounded_shape_input(dtype: DataType, shape: &[usize]) -> bool {
-    if !matches!(dtype, DataType::Int32 | DataType::Int64) {
+    if !matches!(dtype, DataType::Bool | DataType::Int32 | DataType::Int64) {
         return false;
     }
     if shape.len() > 1 {
