@@ -410,6 +410,17 @@ impl CudaExecutionProvider {
         }
     }
 
+    /// The virtual-backing capability of the allocator in force, if it
+    /// advertises one.
+    ///
+    /// Discovery, not assumption: an eager allocator returns `None` here and
+    /// the EP falls back to fully-backed semantics (commit is a no-op, mapped
+    /// bytes equal the allocation length). Only an allocator that vends this
+    /// capability — the CUDA VMM arena — routes commit-on-demand traffic.
+    fn virtual_backing(&self) -> Option<&dyn onnx_runtime_memory_governor::VirtualBacking> {
+        self.memory().as_virtual_backing()
+    }
+
     fn synchronize_before_pooled_unmap(&self) -> Result<()> {
         if self
             .vmm
@@ -878,7 +889,7 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
         if dynamic_lending_enabled()
-            && self.memory().commits_on_demand()
+            && let Some(backing) = self.virtual_backing()
             && let Some(governor) = self.governor.as_deref()
             && let Some(requester) = self
                 .mapped_requesters
@@ -889,8 +900,7 @@ impl ExecutionProvider for CudaExecutionProvider {
                 ))
                 .cloned()
         {
-            let bytes = self
-                .memory()
+            let bytes = backing
                 .mapped_bytes_for_allocation(size, alignment)
                 .map_err(EpError::Memory)?;
             let grant = governor
@@ -913,7 +923,9 @@ impl ExecutionProvider for CudaExecutionProvider {
         }
         let full = 0..size;
         let allocation = self
-            .memory()
+            .vmm
+            .get()
+            .expect("mapped growth is only reached when the VMM capability is installed")
             .allocate_committed_with_capacity(
                 size,
                 alignment,
@@ -960,10 +972,17 @@ impl ExecutionProvider for CudaExecutionProvider {
         // same value; normalising a zero-byte request is the allocator's job,
         // because the contract lets an implementation rely on the two sizes
         // agreeing.
-        let ptr = self
-            .memory()
-            .allocate_committed(size, alignment, committed_ranges)
-            .map_err(EpError::Memory)?;
+        let ptr = match self.virtual_backing() {
+            Some(backing) => backing
+                .allocate_committed(size, alignment, committed_ranges)
+                .map_err(EpError::Memory)?,
+            // Eager allocator: it cannot separate reservation from commitment,
+            // so the whole allocation is backed at birth.
+            None => self
+                .memory()
+                .allocate(size, alignment)
+                .map_err(EpError::Memory)?,
+        };
         self.ep_allocations.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `ptr` is a fresh, unique, non-null device allocation of
         // >= `size` bytes owned by this EP and freed exactly once in
@@ -988,7 +1007,11 @@ impl ExecutionProvider for CudaExecutionProvider {
         let Some(ptr) = std::ptr::NonNull::new(buffer.as_ptr().cast::<u8>() as *mut u8) else {
             return Ok(());
         };
-        self.memory()
+        let Some(backing) = self.virtual_backing() else {
+            // Eager allocator: the range is already backed, so commit is a no-op.
+            return Ok(());
+        };
+        backing
             .commit_allocation_range(ptr, buffer.len(), buffer.alignment(), offset, bytes)
             .map_err(|error| {
                 EpError::KernelFailed(format!(
@@ -1021,7 +1044,11 @@ impl ExecutionProvider for CudaExecutionProvider {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        self.memory()
+        let Some(backing) = self.virtual_backing() else {
+            // Eager allocator: every range is already backed.
+            return Ok(());
+        };
+        backing
             .commit_allocation_ranges(&raw)
             .map_err(|error| {
                 EpError::KernelFailed(format!(
@@ -1053,7 +1080,9 @@ impl ExecutionProvider for CudaExecutionProvider {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        self.memory()
+        self.vmm
+            .get()
+            .expect("mapped growth is only reached when the VMM capability is installed")
             .commit_allocation_ranges_with_capacity(&raw, grant.physical_capacity())
             .map_err(|error| {
                 EpError::KernelFailed(format!(
@@ -1084,15 +1113,28 @@ impl ExecutionProvider for CudaExecutionProvider {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        self.memory()
-            .mapped_bytes_for_allocation_ranges(&raw)
-            .map_err(EpError::Memory)
+        match self.virtual_backing() {
+            Some(backing) => backing
+                .mapped_bytes_for_allocation_ranges(&raw)
+                .map_err(EpError::Memory),
+            // Eager allocator: each range is fully backed, so its mapped bytes
+            // equal its length.
+            None => Ok(raw
+                .iter()
+                .fold(0_u64, |total, range| {
+                    total.saturating_add(range.bytes as u64)
+                })),
+        }
     }
 
     fn mapped_bytes_for_allocation(&self, bytes: usize, alignment: usize) -> Result<u64> {
-        self.memory()
-            .mapped_bytes_for_allocation(bytes, alignment)
-            .map_err(EpError::Memory)
+        match self.virtual_backing() {
+            Some(backing) => backing
+                .mapped_bytes_for_allocation(bytes, alignment)
+                .map_err(EpError::Memory),
+            // Eager allocator: the whole allocation is backed at birth.
+            None => Ok(bytes as u64),
+        }
     }
 
     fn decommit_allocation_range(
@@ -1111,17 +1153,20 @@ impl ExecutionProvider for CudaExecutionProvider {
             return Ok(0);
         };
         self.synchronize_before_pooled_unmap()?;
-        let unmapped = self
-            .memory()
-            .decommit_allocation_range(ptr, buffer.len(), buffer.alignment(), offset, bytes)
-            .map_err(|error| {
-                EpError::KernelFailed(format!(
-                    "cuda_ep: could not decommit range {offset}..{} of {} byte allocation on CUDA device {}: {error}",
-                    offset.saturating_add(bytes),
-                    buffer.len(),
-                    self.device.index
-                ))
-            })?;
+        let unmapped = match self.vmm.get() {
+            Some(vmm) => vmm
+                .decommit_allocation_range(ptr, buffer.len(), buffer.alignment(), offset, bytes)
+                .map_err(|error| {
+                    EpError::KernelFailed(format!(
+                        "cuda_ep: could not decommit range {offset}..{} of {} byte allocation on CUDA device {}: {error}",
+                        offset.saturating_add(bytes),
+                        buffer.len(),
+                        self.device.index
+                    ))
+                })?,
+            // Eager allocator: it cannot partially unmap, so nothing is released.
+            None => 0,
+        };
         self.refund_canonical_mapped_zone(unmapped);
         Ok(unmapped)
     }
@@ -1130,8 +1175,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         let Some(ptr) = std::ptr::NonNull::new(buffer.as_ptr().cast::<u8>() as *mut u8) else {
             return 0;
         };
-        self.memory()
-            .allocation_committed_bytes(ptr, buffer.len(), buffer.alignment())
+        match self.virtual_backing() {
+            Some(backing) => {
+                backing.allocation_committed_bytes(ptr, buffer.len(), buffer.alignment())
+            }
+            // Eager allocator: every byte is backed from birth.
+            None => buffer.len(),
+        }
     }
 
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()> {
@@ -1161,7 +1211,15 @@ impl ExecutionProvider for CudaExecutionProvider {
         // SAFETY: `ptr`, `size` and `align` are the triple this EP obtained
         // from `self.memory` in `allocate`; `into_raw` consumed the owning
         // handle so no alias remains, and this is its single free.
-        let unmapped = unsafe { self.memory().deallocate_with_unmapped(ptr, size, align) };
+        let unmapped = match self.vmm.get() {
+            Some(vmm) => vmm.deallocate_span(ptr),
+            None => {
+                // SAFETY: forwarded under the same single-free contract; the
+                // eager allocator has no shared-granule attribution to report.
+                unsafe { self.memory().deallocate(ptr, size, align) };
+                0
+            }
+        };
         self.refund_canonical_mapped_zone(unmapped);
         self.ep_frees.fetch_add(1, Ordering::Relaxed);
         Ok(unmapped)
@@ -1433,7 +1491,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         bytes: u64,
         role: onnx_runtime_memory_governor::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
-        if self.memory().commits_on_demand() {
+        if self.virtual_backing().is_some() {
             return Ok(None);
         }
         self.governor
@@ -1455,7 +1513,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         bytes: u64,
         role: onnx_runtime_memory_governor::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
-        if bytes == 0 || !dynamic_lending_enabled() || !self.memory().commits_on_demand() {
+        if bytes == 0 || !dynamic_lending_enabled() || self.virtual_backing().is_none() {
             return Ok(None);
         }
         let Some(governor) = self.governor.as_deref() else {
@@ -1513,7 +1571,7 @@ impl ExecutionProvider for CudaExecutionProvider {
     /// False on the `cuMemAlloc` path, which takes physical memory at the
     /// moment it is asked for.
     fn commits_on_demand(&self) -> bool {
-        self.memory().commits_on_demand()
+        self.virtual_backing().is_some()
     }
 
     fn set_weight_residency_budget(&self, budget_bytes: u64) -> Result<Option<u64>> {

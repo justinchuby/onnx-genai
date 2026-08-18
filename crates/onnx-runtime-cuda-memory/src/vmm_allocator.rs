@@ -61,6 +61,10 @@ use onnx_runtime_memory_governor::{
 };
 use onnx_runtime_virtual_memory::{PhysicalMemoryAccounting, VirtualBacking};
 
+// Bring the governor's capability-trait methods into scope for the inherent
+// helpers below without colliding with `onnx_runtime_virtual_memory::VirtualBacking`.
+use onnx_runtime_memory_governor::VirtualBacking as _;
+
 use crate::virtual_memory::{
     CudaVirtualBacking, PhysicalHandlePool, PhysicalHandlePoolStats, SharedPrefixReservation,
 };
@@ -1641,6 +1645,36 @@ impl DeviceAllocator for CudaVmmAllocator {
         self.allocate_committed(bytes, align, std::slice::from_ref(&full))
     }
 
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, _bytes: usize, _align: usize) {
+        let _ = self.deallocate_span(ptr);
+    }
+
+    fn device(&self) -> DeviceKey {
+        self.device
+    }
+
+    fn as_virtual_backing(&self) -> Option<&dyn onnx_runtime_memory_governor::VirtualBacking> {
+        Some(self)
+    }
+
+    /// Per-instance: only an allocator built with the production
+    /// physical-handle pool can create and map a shared prefix, so an
+    /// instance without one honestly reports no shared-mapping capability
+    /// rather than a `SharedMapping` whose first real call would refuse.
+    fn as_shared_mapping(&self) -> Option<&dyn onnx_runtime_memory_governor::SharedMapping> {
+        if self.physical_pool_authority().is_some() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+
+impl onnx_runtime_memory_governor::VirtualBacking for CudaVmmAllocator {
+    fn device(&self) -> DeviceKey {
+        self.device
+    }
+
     fn allocate_committed(
         &self,
         bytes: usize,
@@ -1718,49 +1752,6 @@ impl DeviceAllocator for CudaVmmAllocator {
         Ok(unsafe { NonNull::new_unchecked((base + offset) as *mut u8) })
     }
 
-    fn allocate_committed_with_capacity(
-        &self,
-        bytes: usize,
-        align: usize,
-        committed_ranges: &[std::ops::Range<usize>],
-        capacity: &mut MappedPhysicalCapacityToken,
-    ) -> Result<onnx_runtime_memory_governor::MappedAllocation<NonNull<u8>>, MemoryError> {
-        if capacity.role() != self.role {
-            return Err(invalid(
-                bytes,
-                format!(
-                    "mapped allocation role {:?} does not match arena zone {:?}",
-                    capacity.role(),
-                    self.role
-                ),
-            ));
-        }
-        let ptr = self.allocate_committed(bytes, align, &[])?;
-        let ranges = committed_ranges
-            .iter()
-            .map(|range| AllocationCommitRange {
-                ptr,
-                allocation_bytes: bytes,
-                align,
-                offset: range.start,
-                bytes: range.len(),
-            })
-            .collect::<Vec<_>>();
-        let commit = match self.commit_allocation_ranges_inner(&ranges, Some(capacity)) {
-            Ok(commit) => commit,
-            Err(error) => {
-                // SAFETY: this is the exact live allocation returned above and
-                // it has not escaped to the caller.
-                unsafe { self.deallocate(ptr, bytes, align) };
-                return Err(error);
-            }
-        };
-        Ok(onnx_runtime_memory_governor::MappedAllocation {
-            allocation: ptr,
-            newly_mapped_bytes: commit.newly_mapped_bytes,
-        })
-    }
-
     fn commit_allocation_range(
         &self,
         ptr: NonNull<u8>,
@@ -1831,15 +1822,6 @@ impl DeviceAllocator for CudaVmmAllocator {
             .map(|_| ())
     }
 
-    fn commit_allocation_ranges_with_capacity(
-        &self,
-        ranges: &[AllocationCommitRange],
-        capacity: &mut MappedPhysicalCapacityToken,
-    ) -> Result<u64, MemoryError> {
-        self.commit_allocation_ranges_inner(ranges, Some(capacity))
-            .map(|commit| commit.newly_mapped_bytes)
-    }
-
     fn mapped_bytes_for_allocation_ranges(
         &self,
         ranges: &[AllocationCommitRange],
@@ -1868,7 +1850,150 @@ impl DeviceAllocator for CudaVmmAllocator {
         Ok(round_up(granularity, bytes) as u64)
     }
 
-    fn decommit_allocation_range(
+    fn allocation_committed_bytes(
+        &self,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        _align: usize,
+    ) -> usize {
+        let arena = self.lock();
+        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let address = ptr.as_ptr() as usize;
+        let Some(offset) = address.checked_sub(base) else {
+            return allocation_bytes;
+        };
+        arena
+            .spans
+            .live
+            .get(&offset)
+            .map(|live| live.committed.len() * arena.spans.granularity)
+            .unwrap_or(allocation_bytes)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl onnx_runtime_memory_governor::SharedMapping for CudaVmmAllocator {
+    fn device(&self) -> DeviceKey {
+        self.device
+    }
+
+    fn create_shared_prefix(
+        &self,
+        bytes: usize,
+    ) -> Result<Box<dyn SharedDevicePrefix>, MemoryError> {
+        let prefix = CudaVmmAllocator::create_shared_prefix(self, bytes)?;
+        Ok(Box::new(prefix))
+    }
+
+    fn incremental_owned_bytes_for_shared_prefix(&self, prefix: &dyn SharedDevicePrefix) -> u64 {
+        // A prefix from another allocator kind cannot be mapped here, so its
+        // incremental owned cost is not this allocator's to estimate; treat the
+        // unmappable case as "not free" so a caller never admits against a
+        // prefix `commit_shared_prefix` will refuse.
+        match prefix.as_any().downcast_ref::<SharedPrefix>() {
+            Some(prefix) => {
+                CudaVmmAllocator::incremental_owned_bytes_for_shared_prefix(self, prefix)
+            }
+            None => prefix.committed_physical_bytes(),
+        }
+    }
+
+    fn commit_shared_prefix(
+        &self,
+        prefix: &dyn SharedDevicePrefix,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        byte_offset: usize,
+    ) -> Result<SharedPrefixCommitInfo, MemoryError> {
+        let prefix = prefix.as_any().downcast_ref::<SharedPrefix>().ok_or_else(|| {
+            invalid(
+                allocation_bytes,
+                String::from(
+                    "shared prefix was not created by a CUDA VMM allocator; it cannot be mapped \
+                     here",
+                ),
+            )
+        })?;
+        let commit = CudaVmmAllocator::commit_shared_prefix(
+            self,
+            prefix,
+            ptr,
+            allocation_bytes,
+            byte_offset,
+        )?;
+        Ok(SharedPrefixCommitInfo {
+            additional_owned_bytes: commit.additional_owned_bytes,
+            newly_mapped_bytes: commit.newly_mapped_bytes,
+            granules: commit.granules,
+        })
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Governor-coupled and release operations that are deliberately **not** part
+/// of the [`VirtualBacking`]/[`SharedMapping`] discovery contract (see that
+/// module's documentation). They are reached by an execution provider that
+/// already constructs and owns this concrete allocator.
+impl CudaVmmAllocator {
+    pub fn allocate_committed_with_capacity(
+        &self,
+        bytes: usize,
+        align: usize,
+        committed_ranges: &[std::ops::Range<usize>],
+        capacity: &mut MappedPhysicalCapacityToken,
+    ) -> Result<onnx_runtime_memory_governor::MappedAllocation<NonNull<u8>>, MemoryError> {
+        if capacity.role() != self.role {
+            return Err(invalid(
+                bytes,
+                format!(
+                    "mapped allocation role {:?} does not match arena zone {:?}",
+                    capacity.role(),
+                    self.role
+                ),
+            ));
+        }
+        let ptr = self.allocate_committed(bytes, align, &[])?;
+        let ranges = committed_ranges
+            .iter()
+            .map(|range| AllocationCommitRange {
+                ptr,
+                allocation_bytes: bytes,
+                align,
+                offset: range.start,
+                bytes: range.len(),
+            })
+            .collect::<Vec<_>>();
+        let commit = match self.commit_allocation_ranges_inner(&ranges, Some(capacity)) {
+            Ok(commit) => commit,
+            Err(error) => {
+                // SAFETY: this is the exact live allocation returned above and
+                // it has not escaped to the caller.
+                unsafe { self.deallocate(ptr, bytes, align) };
+                return Err(error);
+            }
+        };
+        Ok(onnx_runtime_memory_governor::MappedAllocation {
+            allocation: ptr,
+            newly_mapped_bytes: commit.newly_mapped_bytes,
+        })
+    }
+
+    pub fn commit_allocation_ranges_with_capacity(
+        &self,
+        ranges: &[AllocationCommitRange],
+        capacity: &mut MappedPhysicalCapacityToken,
+    ) -> Result<u64, MemoryError> {
+        self.commit_allocation_ranges_inner(ranges, Some(capacity))
+            .map(|commit| commit.newly_mapped_bytes)
+    }
+
+    pub fn decommit_allocation_range(
         &self,
         ptr: NonNull<u8>,
         allocation_bytes: usize,
@@ -1936,100 +2061,6 @@ impl DeviceAllocator for CudaVmmAllocator {
             }
         }
         Ok(unmapped)
-    }
-
-    fn allocation_committed_bytes(
-        &self,
-        ptr: NonNull<u8>,
-        allocation_bytes: usize,
-        _align: usize,
-    ) -> usize {
-        let arena = self.lock();
-        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
-        let address = ptr.as_ptr() as usize;
-        let Some(offset) = address.checked_sub(base) else {
-            return allocation_bytes;
-        };
-        arena
-            .spans
-            .live
-            .get(&offset)
-            .map(|live| live.committed.len() * arena.spans.granularity)
-            .unwrap_or(allocation_bytes)
-    }
-
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, _bytes: usize, _align: usize) {
-        let _ = self.deallocate_span(ptr);
-    }
-
-    unsafe fn deallocate_with_unmapped(
-        &self,
-        ptr: NonNull<u8>,
-        _bytes: usize,
-        _align: usize,
-    ) -> u64 {
-        self.deallocate_span(ptr)
-    }
-
-    /// True: spans are carved from granules mapped as they are needed, and
-    /// each granule is leased before it is mapped.
-    fn commits_on_demand(&self) -> bool {
-        true
-    }
-
-    fn device(&self) -> DeviceKey {
-        self.device
-    }
-
-    fn create_shared_prefix(
-        &self,
-        bytes: usize,
-    ) -> Result<Box<dyn SharedDevicePrefix>, MemoryError> {
-        let prefix = CudaVmmAllocator::create_shared_prefix(self, bytes)?;
-        Ok(Box::new(prefix))
-    }
-
-    fn incremental_owned_bytes_for_shared_prefix(&self, prefix: &dyn SharedDevicePrefix) -> u64 {
-        // A prefix from another allocator kind cannot be mapped here, so its
-        // incremental owned cost is not this allocator's to estimate; treat the
-        // unmappable case as "not free" so a caller never admits against a
-        // prefix `commit_shared_prefix` will refuse.
-        match prefix.as_any().downcast_ref::<SharedPrefix>() {
-            Some(prefix) => {
-                CudaVmmAllocator::incremental_owned_bytes_for_shared_prefix(self, prefix)
-            }
-            None => prefix.committed_physical_bytes(),
-        }
-    }
-
-    fn commit_shared_prefix(
-        &self,
-        prefix: &dyn SharedDevicePrefix,
-        ptr: NonNull<u8>,
-        allocation_bytes: usize,
-        byte_offset: usize,
-    ) -> Result<SharedPrefixCommitInfo, MemoryError> {
-        let prefix = prefix.as_any().downcast_ref::<SharedPrefix>().ok_or_else(|| {
-            invalid(
-                allocation_bytes,
-                String::from(
-                    "shared prefix was not created by a CUDA VMM allocator; it cannot be mapped \
-                     here",
-                ),
-            )
-        })?;
-        let commit = CudaVmmAllocator::commit_shared_prefix(
-            self,
-            prefix,
-            ptr,
-            allocation_bytes,
-            byte_offset,
-        )?;
-        Ok(SharedPrefixCommitInfo {
-            additional_owned_bytes: commit.additional_owned_bytes,
-            newly_mapped_bytes: commit.newly_mapped_bytes,
-            granules: commit.granules,
-        })
     }
 }
 

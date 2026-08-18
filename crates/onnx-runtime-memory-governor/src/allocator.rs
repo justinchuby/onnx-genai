@@ -38,7 +38,8 @@ use std::any::Any;
 use std::fmt::Debug;
 use std::ptr::NonNull;
 
-use crate::{MappedPhysicalCapacityToken, MemoryError, Tier};
+use crate::capability::{SharedMapping, VirtualBacking};
+use crate::{MemoryError, Tier};
 
 #[derive(Clone, Copy, Debug)]
 pub struct AllocationCommitRange {
@@ -90,7 +91,7 @@ impl DeviceKey {
 ///
 /// This is the allocator-agnostic handle a KV path holds when it declares "this
 /// token prefix is shared" and pins it once, then maps it into each subsequent
-/// sequence with [`DeviceAllocator::commit_shared_prefix`]. It is deliberately
+/// sequence with [`SharedMapping::commit_shared_prefix`]. It is deliberately
 /// opaque: the concrete backing (CUDA VMM physical handles today) lives in the
 /// allocator crate, downcast through [`SharedDevicePrefix::as_any`] by the
 /// allocator that produced it. Detection (hashing) and copy-on-write at
@@ -142,6 +143,19 @@ pub struct SharedPrefixCommitInfo {
 /// which is a separate contract precisely so the two can be replaced
 /// independently.
 ///
+/// Lazy commit/decommit and shared physical prefixes are **not** methods on
+/// this trait. They are separate, optional capabilities — see
+/// [`VirtualBacking`] and [`SharedMapping`] — discovered through
+/// [`as_virtual_backing`](DeviceAllocator::as_virtual_backing) and
+/// [`as_shared_mapping`](DeviceAllocator::as_shared_mapping), which default to
+/// `None`. An allocator that does not have a capability is therefore never
+/// asked to answer for it: the older design gave every allocator
+/// "successful no-op" defaults (`commit → Ok(())`, `decommit → Ok(0)`), so an
+/// eager allocator with no virtual-memory mechanism answered "yes, committed"
+/// to a question it had no way to reason about. Returning `None` from the
+/// discovery methods is the honest alternative — "this capability does not
+/// exist here" rather than a successful-looking lie.
+///
 /// # Contract
 ///
 /// * `allocate` returns memory aligned to at least `align`, or an error. It must
@@ -152,7 +166,7 @@ pub struct SharedPrefixCommitInfo {
 ///   decide whether a pointer may be dereferenced on the host, so an allocator
 ///   that lies here turns a host read into a wild access rather than an error.
 /// * **Every method may be called concurrently from any number of threads.**
-///   All three take `&self`, and the `Send + Sync` bound is not decoration: one
+///   All take `&self`, and the `Send + Sync` bound is not decoration: one
 ///   allocator serves every session on its device, so concurrent sessions are
 ///   the normal case rather than an edge one. An implementation that needs
 ///   exclusive state must carry its own lock.
@@ -162,6 +176,25 @@ pub struct SharedPrefixCommitInfo {
 ///   though they happened in some sequential order — an implementation whose
 ///   locking lets two callers be handed the same region would let one session
 ///   overwrite another's tensors, silently and only under load.
+/// * [`as_virtual_backing`](Self::as_virtual_backing) and
+///   [`as_shared_mapping`](Self::as_shared_mapping) must return the same answer
+///   (`Some`/`None`) for the life of the allocator, and any capability returned
+///   must report the same [`DeviceKey`] as [`device`](Self::device). Discovery
+///   always goes through the same `&self` the caller already holds, so there is
+///   no second handle that could go stale or be swapped independently.
+///
+/// # Lifetime of a discovered capability (Phase 1 limitation)
+///
+/// A capability discovered here lets a caller **commit** backing and **query**
+/// mapping, but it exposes no `decommit`/refund/release method of its own. In
+/// this phase the physical backing a capability commits is released only when
+/// the allocation is freed through [`deallocate`](Self::deallocate) — its
+/// lifetime is owned by the allocator that vended it. Partial release,
+/// mapped-byte refunds, and governed decommit are the concrete allocator's own
+/// concern (reached through its inherent methods by a provider that constructs
+/// it) and are deliberately **not** part of this contract, rather than being
+/// asserted through a trait method the contract could not honour for an
+/// arbitrary implementation.
 ///
 /// # This trait does not make memory governed
 ///
@@ -182,176 +215,6 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     /// Take `bytes` aligned to `align`.
     fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError>;
 
-    /// Reserve one allocation while committing only the byte ranges the caller
-    /// says are live.
-    ///
-    /// Eager allocators cannot separate those two acts, so the default keeps
-    /// the old contract and commits the whole allocation. Lazy allocators may
-    /// override this and pair it with [`DeviceAllocator::commit_allocation_range`].
-    fn allocate_committed(
-        &self,
-        bytes: usize,
-        align: usize,
-        committed_ranges: &[std::ops::Range<usize>],
-    ) -> Result<NonNull<u8>, MemoryError> {
-        let _ = committed_ranges;
-        self.allocate(bytes, align)
-    }
-
-    fn allocate_committed_with_capacity(
-        &self,
-        bytes: usize,
-        align: usize,
-        committed_ranges: &[std::ops::Range<usize>],
-        capacity: &mut MappedPhysicalCapacityToken,
-    ) -> Result<MappedAllocation<NonNull<u8>>, MemoryError> {
-        let _ = capacity;
-        let allocation = self.allocate_committed(bytes, align, committed_ranges)?;
-        let newly_mapped_bytes = committed_ranges.iter().fold(0_u64, |total, range| {
-            total.saturating_add(range.len() as u64)
-        });
-        Ok(MappedAllocation {
-            allocation,
-            newly_mapped_bytes,
-        })
-    }
-
-    /// Ensure `offset..offset + bytes` in an existing allocation is physically
-    /// backed.
-    ///
-    /// The default is a no-op because [`DeviceAllocator::allocate`] and the
-    /// default [`DeviceAllocator::allocate_committed`] already committed the
-    /// whole allocation. Lazy allocators override this to grow the physical
-    /// commitment without moving the pointer.
-    fn commit_allocation_range(
-        &self,
-        ptr: NonNull<u8>,
-        allocation_bytes: usize,
-        align: usize,
-        offset: usize,
-        bytes: usize,
-    ) -> Result<(), MemoryError> {
-        let _ = (ptr, allocation_bytes, align, offset, bytes);
-        Ok(())
-    }
-
-    /// Commit several allocation ranges as one allocator transaction.
-    ///
-    /// Lazy allocators override this to union shared physical granules under a
-    /// single lock. The eager/default implementation preserves compatibility.
-    fn commit_allocation_ranges(
-        &self,
-        ranges: &[AllocationCommitRange],
-    ) -> Result<(), MemoryError> {
-        for range in ranges {
-            self.commit_allocation_range(
-                range.ptr,
-                range.allocation_bytes,
-                range.align,
-                range.offset,
-                range.bytes,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn commit_allocation_ranges_with_capacity(
-        &self,
-        ranges: &[AllocationCommitRange],
-        capacity: &mut MappedPhysicalCapacityToken,
-    ) -> Result<u64, MemoryError> {
-        let _ = capacity;
-        self.commit_allocation_ranges(ranges)?;
-        self.mapped_bytes_for_allocation_ranges(ranges)
-    }
-
-    /// Mapped attribution bytes represented by a batched set of ranges.
-    fn mapped_bytes_for_allocation_ranges(
-        &self,
-        ranges: &[AllocationCommitRange],
-    ) -> Result<u64, MemoryError> {
-        Ok(ranges.iter().fold(0_u64, |total, range| {
-            total.saturating_add(range.bytes as u64)
-        }))
-    }
-
-    /// Mapped bytes required to fully back a new allocation.
-    fn mapped_bytes_for_allocation(&self, bytes: usize, align: usize) -> Result<u64, MemoryError> {
-        let _ = align;
-        Ok(bytes as u64)
-    }
-
-    /// Release physical backing from a byte range in an existing allocation
-    /// while keeping its virtual address reserved.
-    ///
-    /// The default is a no-op because eager allocators cannot partially unmap
-    /// allocations. Lazy allocators may override this so callers can roll back
-    /// a failed multi-buffer growth without leaving committed bytes charged.
-    /// Returns the physical bytes whose global mapping reference reached zero.
-    fn decommit_allocation_range(
-        &self,
-        ptr: NonNull<u8>,
-        allocation_bytes: usize,
-        align: usize,
-        offset: usize,
-        bytes: usize,
-    ) -> Result<u64, MemoryError> {
-        let _ = (ptr, allocation_bytes, align, offset, bytes);
-        Ok(0)
-    }
-
-    /// Physical bytes currently claimed by this allocation.
-    ///
-    /// Eager allocators return the allocation length because every byte is
-    /// backed from birth. Lazy allocators override this so tests and profilers
-    /// can assert on bytes that are attributable to one binding rather than on
-    /// process-global activity from unrelated workspaces.
-    fn allocation_committed_bytes(
-        &self,
-        ptr: NonNull<u8>,
-        allocation_bytes: usize,
-        align: usize,
-    ) -> usize {
-        let _ = (ptr, align);
-        allocation_bytes
-    }
-
-    /// Whether this allocator commits physical memory as it is used rather
-    /// than when it is requested.
-    ///
-    /// # Why a consumer needs to know
-    ///
-    /// A component holding memory whose size it knows only as a worst case --
-    /// a KV cache sized at the model's full context, say -- has to choose
-    /// between two bad options when the allocator commits eagerly. Reserve the
-    /// worst case and refuse models that a short conversation would never grow
-    /// into; or reserve nothing and discover the shortfall at an allocation
-    /// mid-generation.
-    ///
-    /// When the allocator commits on demand the choice goes away: memory is
-    /// charged as it is genuinely taken, so the worst case becomes a *ceiling
-    /// to check* rather than a claim to hold. On a small machine that is the
-    /// difference between "this model does not fit" and "this model fits until
-    /// it actually needs the memory".
-    ///
-    /// # Why it lives here and not on an execution provider
-    ///
-    /// The allocator is the thing that commits, and it is the piece every
-    /// backend has. Asking a provider would answer only for the paths that go
-    /// through one; asking the allocator answers for ONNX Runtime too, whose
-    /// `OrtAllocator` seam wraps one of these.
-    ///
-    /// # Contract
-    ///
-    /// `false` is the safe answer and the default: a consumer that believes
-    /// this will under-reserve. Return `true` only when the allocator really
-    /// does map physical memory lazily **and** charges a governor as it does
-    /// so. Saying `true` without the second half turns an accounting question
-    /// into an out-of-memory crash.
-    fn commits_on_demand(&self) -> bool {
-        false
-    }
-
     /// Give back memory this allocator returned.
     ///
     /// # Safety
@@ -361,81 +224,34 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     /// deallocated twice.
     unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize);
 
-    /// Free an allocation and report bytes whose global mapping reference
-    /// count transitioned from one to zero.
-    ///
-    /// Eager allocators have no shared-granule attribution and return zero.
-    ///
-    /// # Safety
-    ///
-    /// `ptr`, `bytes`, and `align` must identify one live allocation returned
-    /// by this allocator, exactly as required by [`DeviceAllocator::deallocate`].
-    unsafe fn deallocate_with_unmapped(&self, ptr: NonNull<u8>, bytes: usize, align: usize) -> u64 {
-        // SAFETY: forwarded under this method's identical contract.
-        unsafe { self.deallocate(ptr, bytes, align) };
-        0
-    }
-
-    /// Create a pinned, read-only shared prefix of `bytes`, charged **once** on
-    /// the owned axis, for mapping into many allocations with
-    /// [`commit_shared_prefix`](DeviceAllocator::commit_shared_prefix).
-    ///
-    /// The default refuses: a shared prefix is defined by physical-handle
-    /// identity across reservations, which only an allocator that owns its
-    /// physical granules (a CUDA VMM arena) can provide. Eager allocators — and
-    /// any allocator without a physical-handle pool — return an error here
-    /// rather than mis-map, so an unsupported request faults loudly at the seam
-    /// instead of silently producing private copies.
-    fn create_shared_prefix(
-        &self,
-        bytes: usize,
-    ) -> Result<Box<dyn SharedDevicePrefix>, MemoryError> {
-        Err(MemoryError::InvalidRequest {
-            tier: self.device().tier.name(),
-            requested: bytes as u64,
-            reason: "this allocator does not support shared prefixes; a pinned shared prefix \
-                     requires a physical-handle pool (the CUDA VMM arena)",
-        })
-    }
-
-    /// Estimate the incremental **owned** physical bytes to admit one more
-    /// sharer of `prefix` — zero for an allocator that already owns the prefix's
-    /// granules.
-    ///
-    /// This is the admission-facing statement (#745): the shared bytes are
-    /// charged once, so the Nth request costs only its private continuation.
-    fn incremental_owned_bytes_for_shared_prefix(&self, prefix: &dyn SharedDevicePrefix) -> u64 {
-        let _ = prefix;
-        0
-    }
-
-    /// Map `prefix` into the live allocation `ptr` at `byte_offset`,
-    /// **read-only**, taking one reference per shared granule.
-    ///
-    /// The prefix's physical memory is already owned, so this maps existing
-    /// memory: it charges **zero** incremental owned bytes and keeps the shared
-    /// granules alive until the last sharer (or the prefix owner) leaves. The
-    /// default refuses for the same reason [`create_shared_prefix`] does.
-    ///
-    /// [`create_shared_prefix`]: DeviceAllocator::create_shared_prefix
-    fn commit_shared_prefix(
-        &self,
-        prefix: &dyn SharedDevicePrefix,
-        ptr: NonNull<u8>,
-        allocation_bytes: usize,
-        byte_offset: usize,
-    ) -> Result<SharedPrefixCommitInfo, MemoryError> {
-        let _ = (prefix, ptr, byte_offset);
-        Err(MemoryError::InvalidRequest {
-            tier: self.device().tier.name(),
-            requested: allocation_bytes as u64,
-            reason: "this allocator does not support shared prefixes; a pinned shared prefix \
-                     requires a physical-handle pool (the CUDA VMM arena)",
-        })
-    }
-
     /// Which device this allocator serves.
     fn device(&self) -> DeviceKey;
+
+    /// This allocator's lazy commit/decommit capability, if it has one.
+    ///
+    /// The default `None` is the correct, unambiguous answer for an eager
+    /// allocator: it maps everything at `allocate` time, so it has no separate
+    /// commit operation to offer, not a degenerate one. An override must answer
+    /// per-*instance*, not per-*type*: a type that implements [`VirtualBacking`]
+    /// for some of its instances but not others (the same type built without the
+    /// resource the capability needs) must return `None` for the instances that
+    /// cannot honor a call, so discovery never says "yes" to a capability the
+    /// first real call would refuse.
+    fn as_virtual_backing(&self) -> Option<&dyn VirtualBacking> {
+        None
+    }
+
+    /// This allocator's shared-physical-prefix capability, if it has one.
+    ///
+    /// The default `None` is the correct, unambiguous answer for an allocator
+    /// with no shared physical-handle pool: it cannot produce a prefix mappable
+    /// at zero incremental owned cost, so it has nothing to offer here rather
+    /// than a degenerate always-fails implementation. As with
+    /// [`as_virtual_backing`](Self::as_virtual_backing), an override must answer
+    /// per-*instance*.
+    fn as_shared_mapping(&self) -> Option<&dyn SharedMapping> {
+        None
+    }
 }
 
 /// Host memory from the global allocator.
@@ -495,45 +311,20 @@ impl DeviceAllocator for HostAllocator {
 mod tests {
     use super::*;
 
-    /// `commits_on_demand` is opaque: a caller asks the allocator, not the
-    /// backend.
+    /// An allocator that has no virtual-memory mechanism reports `None` from
+    /// both capability-discovery methods rather than a "successful no-op".
     ///
-    /// It lives on this trait rather than on an execution provider because the
-    /// allocator is the thing that commits, and it is the piece every backend
-    /// has. `GovernedAllocator` forwards it, so a session running on ONNX
-    /// Runtime answers the same question the native path does -- which is what
-    /// lets a consumer size a KV cache without knowing which backend it got.
+    /// This is the guarantee the capability split exists to make honest: an
+    /// eager allocator says "I do not have this capability", not "yes, I
+    /// committed". A consumer therefore gets an `Option` to match on instead of
+    /// a method to call and hope the default was meaningful.
     #[test]
-    fn an_allocator_reports_whether_it_commits_on_demand() {
-        #[derive(Debug)]
-        struct Stub(bool);
-
-        // SAFETY: never allocates, so the non-overlap and validity guarantees
-        // hold vacuously.
-        impl DeviceAllocator for Stub {
-            fn allocate(&self, _bytes: usize, _align: usize) -> Result<NonNull<u8>, MemoryError> {
-                Err(MemoryError::InvalidRequest {
-                    tier: "device",
-                    requested: 0,
-                    reason: "test double",
-                })
-            }
-
-            unsafe fn deallocate(&self, _ptr: NonNull<u8>, _bytes: usize, _align: usize) {}
-
-            fn device(&self) -> DeviceKey {
-                DeviceKey::device(0)
-            }
-
-            fn commits_on_demand(&self) -> bool {
-                self.0
-            }
-        }
-
+    fn an_allocator_with_no_capability_reports_none() {
         #[derive(Debug)]
         struct Silent;
 
-        // SAFETY: as above.
+        // SAFETY: never allocates, so the non-overlap and validity guarantees
+        // hold vacuously.
         impl DeviceAllocator for Silent {
             fn allocate(&self, _bytes: usize, _align: usize) -> Result<NonNull<u8>, MemoryError> {
                 Err(MemoryError::InvalidRequest {
@@ -550,17 +341,18 @@ mod tests {
             }
         }
 
-        assert!(
-            !Silent.commits_on_demand(),
-            "an allocator that says nothing must be treated as committing eagerly: a consumer \
-             that believes otherwise will under-reserve"
-        );
-
         // Through a trait object, which is how every real consumer holds one.
-        let lazy: &dyn DeviceAllocator = &Stub(true);
-        let eager: &dyn DeviceAllocator = &Stub(false);
-        assert!(lazy.commits_on_demand());
-        assert!(!eager.commits_on_demand());
+        let allocator: &dyn DeviceAllocator = &Silent;
+        assert!(
+            allocator.as_virtual_backing().is_none(),
+            "an allocator that says nothing must be treated as having no virtual-backing \
+             capability, not a degenerate eager one"
+        );
+        assert!(
+            allocator.as_shared_mapping().is_none(),
+            "an allocator that says nothing must be treated as having no shared-mapping \
+             capability, not a degenerate always-fails one"
+        );
     }
 
     /// The host allocator honours the alignment it is asked for, whatever the

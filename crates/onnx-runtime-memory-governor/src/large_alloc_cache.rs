@@ -687,10 +687,6 @@ impl<A: DeviceAllocator> DeviceAllocator for LargeAllocCache<A> {
     fn device(&self) -> DeviceKey {
         self.inner.device()
     }
-
-    fn commits_on_demand(&self) -> bool {
-        self.inner.commits_on_demand()
-    }
 }
 
 #[cfg(test)]

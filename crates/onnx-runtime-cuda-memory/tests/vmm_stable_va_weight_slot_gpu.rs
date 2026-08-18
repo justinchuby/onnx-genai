@@ -35,6 +35,7 @@ use std::panic::AssertUnwindSafe;
 
 use cudarc::driver::CudaContext;
 use cudarc::driver::sys as cu;
+use onnx_runtime_memory_governor::VirtualBacking as _;
 use onnx_runtime_cuda_memory::vmm_allocator::{
     CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV, CudaVmmAllocator,
 };

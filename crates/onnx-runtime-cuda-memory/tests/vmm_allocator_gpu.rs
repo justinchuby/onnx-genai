@@ -18,6 +18,7 @@
 //! (#636).
 
 use cudarc::driver::CudaContext;
+use onnx_runtime_memory_governor::VirtualBacking as _;
 use onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator;
 use onnx_runtime_memory_governor::{
     DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
