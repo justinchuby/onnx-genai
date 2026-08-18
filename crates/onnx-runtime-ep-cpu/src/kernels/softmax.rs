@@ -230,9 +230,15 @@ fn scale_mask_softmax_serial(
 
 /// Out-of-place row-major softmax: `src` and `dst` are `n × d` and disjoint.
 ///
-/// The copy is done *inside* the fan-out rather than as a separate pass, so a
-/// tall score matrix is touched once per worker instead of once serially and
-/// then again in parallel.
+/// `dst` is written straight from `src` in a single traversal - the row max,
+/// `exp(row - max)` and the normalization all read `src` and write `dst`, so no
+/// element of `src` is ever copied into `dst` first. Removing that copy halves
+/// the single-thread memory traffic of a standalone `Softmax`: ORT never pays it
+/// because it hands `MlasComputeSoftmax` the graph input and output buffers
+/// directly, and this path now does the same. The result is bit-identical to a
+/// `copy(src -> dst)` followed by the in-place reducer - the existing
+/// `the_parallel_fan_out_is_bit_identical_to_the_serial_path` test asserts that
+/// equality on both the MLAS and the pure-Rust builds.
 pub(crate) fn softmax_rows(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
     debug_assert_eq!(src.len(), n * d);
     debug_assert_eq!(dst.len(), n * d);
@@ -245,12 +251,10 @@ pub(crate) fn softmax_rows(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
         dst.par_chunks_mut(block)
             .zip(src.par_chunks(block))
             .for_each(|(out, inp)| {
-                out.copy_from_slice(inp);
-                softmax_rows_serial(out, out.len() / d, d);
+                softmax_rows_serial_out(inp, out, out.len() / d, d);
             });
     } else {
-        dst.copy_from_slice(src);
-        softmax_rows_serial(dst, n, d);
+        softmax_rows_serial_out(src, dst, n, d);
     }
 }
 
@@ -273,6 +277,15 @@ fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
     mlas_sys::compute_softmax_in_place(data, n, d);
 }
 
+/// Out-of-place counterpart of [`softmax_rows_serial`]: read `src`, write `dst`,
+/// no copy. MLAS's non-log softmax streams `Input -> Output` and then rescales
+/// `Output` alone, so this is bit-identical to `dst.copy_from_slice(src)`
+/// followed by the in-place form.
+#[cfg(feature = "mlas")]
+fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
+    mlas_sys::compute_softmax(src, dst, n, d);
+}
+
 /// Portable fallback with the same semantics: subtract the row max, `exp`,
 /// normalize. Kept exact against the MLAS path by the parity tests below.
 #[cfg(not(feature = "mlas"))]
@@ -293,6 +306,34 @@ fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
         let inv = 1.0 / sum;
         for v in row.iter_mut() {
             *v *= inv;
+        }
+    }
+    let _ = n;
+}
+
+/// Portable out-of-place counterpart of [`softmax_rows_serial`]: read `src`,
+/// write `dst`, no copy. Bit-identical to `dst.copy_from_slice(src)` followed by
+/// the in-place form - it performs exactly the same max/`exp`/normalize
+/// operations in the same order, reading each `src` element in place of the
+/// copied `dst` element it would otherwise have read.
+#[cfg(not(feature = "mlas"))]
+fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
+    for (srow, drow) in src.chunks(d).zip(dst.chunks_mut(d)) {
+        let mut max = f32::NEG_INFINITY;
+        for &v in srow.iter() {
+            if v > max {
+                max = v;
+            }
+        }
+        let mut sum = 0.0f32;
+        for (dv, &sv) in drow.iter_mut().zip(srow.iter()) {
+            let e = (sv - max).exp();
+            *dv = e;
+            sum += e;
+        }
+        let inv = 1.0 / sum;
+        for dv in drow.iter_mut() {
+            *dv *= inv;
         }
     }
     let _ = n;
@@ -675,7 +716,52 @@ mod vectorized_tests {
         }
     }
 
-    /// ...and the serial path itself must still be a softmax.
+    /// The out-of-place softmax derives every output element from `src` alone.
+    /// It writes `dst` without first copying `src` into it, so if it ever read
+    /// `dst` (the copy this kernel deliberately no longer makes) pre-existing
+    /// garbage there would leak into the result. Poisoning `dst` with values
+    /// that would wreck a softmax if mistaken for logits - `+inf` would win
+    /// every row max and `NaN` would poison every sum - and asserting the
+    /// result is bit-for-bit identical to running over a clean buffer pins the
+    /// destination-independence down exactly, on both the MLAS and pure-Rust
+    /// builds.
+    #[test]
+    fn out_of_place_softmax_never_reads_the_destination() {
+        for (n, d) in [(1usize, 1usize), (3, 7), (64, 256), (129, 500)] {
+            let src = synthetic(n, d, (7 * n + d) as u32);
+
+            let mut clean = vec![0.0f32; n * d];
+            softmax_rows(&src, &mut clean, n, d);
+
+            let poison = [f32::INFINITY, f32::NAN, f32::NEG_INFINITY, 1e30];
+            let mut garbage: Vec<f32> = (0..n * d).map(|i| poison[i % poison.len()]).collect();
+            softmax_rows(&src, &mut garbage, n, d);
+
+            assert_eq!(clean, garbage, "destination garbage leaked at n={n} d={d}");
+        }
+    }
+
+    /// ...and the no-copy path must still be a softmax, not merely
+    /// deterministic. Checks it against an independent scalar oracle with the
+    /// destination pre-poisoned with `NaN`, so a regression that reads the
+    /// poison or miscomputes the max/`exp`/normalize reduction surfaces here
+    /// rather than only under the A/B harness.
+    #[test]
+    fn out_of_place_softmax_matches_the_reference() {
+        for (n, d) in [(1usize, 1usize), (3, 7), (64, 256), (129, 500)] {
+            let src = synthetic(n, d, (5 * n + 3 * d) as u32);
+            let expect = reference_rows(&src, n, d);
+            let mut dst: Vec<f32> = vec![f32::NAN; n * d];
+            softmax_rows(&src, &mut dst, n, d);
+            for (i, (g, e)) in dst.iter().zip(&expect).enumerate() {
+                assert!(
+                    (g - e).abs() <= 1e-6,
+                    "n={n} d={d} idx={i}: {g} vs {e} (out-of-place softmax wrong)"
+                );
+                assert!(g.is_finite(), "n={n} d={d} idx={i}: non-finite {g}");
+            }
+        }
+    }
     #[test]
     fn vectorized_rows_match_the_scalar_reference() {
         for (n, d) in [(1usize, 1usize), (3, 7), (64, 256), (200, 33)] {
