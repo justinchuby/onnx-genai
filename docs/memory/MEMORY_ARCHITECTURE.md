@@ -1641,13 +1641,16 @@ test passed, because every test lived inside the crate where private fields are
 reachable. The proof now lives in `tests/`, where it sees exactly what a third
 party sees and stops compiling if the contract closes again.
 
-Phases 1-2 of #1186 establish the dependency and capability boundaries.
+Phases 1-3 of #1186 establish the dependency, capability, and binding-lifetime
+boundaries.
 `onnx-runtime-memory-api` owns `Tier`, `MemoryRole`, `MemoryError`, the primitive
 allocation/prefix types, the minimal `DeviceAllocator`, `HostAllocator`, and the
-optional `VirtualBacking`/`SharedMapping` traits. Governor-specific capacity
-tokens, authority/holder identities, ledgers, grants, leases, pressure
+optional `VirtualBacking`/`SharedMapping` traits. It also owns the narrow
+`BindingRegistry`: manager-issued registration/binding identity and the
+lifetime pins needed to keep one selected mechanism usable. Governor-specific
+capacity tokens, holder identities, ledgers, grants, leases, pressure
 responders, shareability analysis, and policy remain in
-`onnx-runtime-memory-governor`; its former paths re-export the moved public
+`onnx-runtime-memory-governor`; its former paths re-export the memory-API public
 surface for compatibility.
 
 Capability coherence is a trusted part of the raw-pointer allocator boundary.
@@ -1657,7 +1660,9 @@ through `DeviceAllocator`/the owning EP. In-tree mechanisms satisfy and test
 that contract. Rust does **not** structurally prove that an adversarial wrapper
 delegates ordinary allocation, optional capabilities, and release to one inner
 object; runtime identity heuristics are not used as a fake proof.
-Manager-issued binding identity remains later work.
+`BindingRegistry::register_trusted_composite` is therefore an explicit unsafe
+attestation for a transparent/split-inner bundle, not a claim that the type
+system proved it coherent.
 
 `VirtualBacking` capability presence alone does not assert governed accounting.
 The separate `DeviceAllocator::commits_on_demand()` signal is `true` only when a
@@ -1666,6 +1671,70 @@ eager and ungoverned-capability implementations retain the safe `false`
 default. Likewise, `SharedMapping` rejects foreign device/pool-authority
 prefixes before reporting incremental owned cost, so an unmappable prefix can
 never appear free to admission control.
+
+#### Phase 3 binding identity, lifetime, and teardown
+
+`BindingRegistry` is deliberately smaller than the future
+`ProcessMemoryManager`. It owns no budget, lease, holder, transaction, eviction,
+or victim policy. A process manager can embed it as the reusable mechanism
+registry.
+
+The registry, rather than `DeviceAllocator`, `VirtualBacking`, or
+`SharedMapping`, issues all identity used at the binding boundary:
+
+| Identity | Meaning |
+|---|---|
+| `ProviderContextIdentity` | one registered provider/context lifetime |
+| `AuthorityIdentity` | one registered accounting-authority lifetime |
+| `MechanismIdentity` | one ordinary allocator plus its registered coherent optional capabilities |
+| `BindingId` + `BindingGeneration` | one lookup of one mechanism/context/authority tuple |
+| `AllocationGeneration` | a never-pointer-derived cookie for one allocation at one binding |
+
+Each `MemoryBinding` holds one `Arc<MechanismEntry>`. That entry holds the
+selected `Arc<dyn DeviceAllocator>`, provider-context `BindingResource`, and
+authority `BindingResource`. `BoundAllocation`, `BoundMemoryView`, and bound
+capability handles clone that same binding. Dropping a session/EP front-end or
+the registry therefore cannot destroy the context while any bound metadata or
+active operation still references it. `BoundAllocation` has no `Drop` release;
+whole-allocation release remains explicit through `MemoryBinding::release` and
+the original `DeviceAllocator`.
+
+Changing the selected mechanism affects only later `bind(device)` calls. An old
+binding remains pinned to its original mechanism and explicitly releases there.
+Retiring a mechanism rejects new bindings/capability work while permitting
+existing allocations to release. Two separately issued bindings do not become
+interchangeable merely because they name the same device or allocator:
+cross-binding, cross-mechanism, cross-authority, and cross-device metadata is
+rejected before a capability or validated device callback runs. When a virtual
+address is reused, its new `AllocationGeneration` differs and a stale view
+fails validation.
+
+Device loss removes the current selection and makes every affected binding
+return an explicit `DeviceLost` error, including on attempted release. That path
+does **not** call the allocator, free physical memory, release a lease, or refund
+delegated quota. After the owner has observed provider-context/process
+termination and all active callbacks have quiesced,
+`confirm_context_terminated` makes allocation identities terminal; the
+accounting authority separately reconciles charge only at its required
+termination boundary. Normal retirement and device loss are intentionally
+different: a valid retired mechanism can still release, while a lost device
+cannot be assumed callable.
+
+The registry has two lock classes and never nests them:
+
+1. the registry lock protects registration and current selection;
+2. one per-mechanism lock protects lifecycle and live allocation identities.
+
+Lookup copies an `Arc` and releases the registry lock before inspecting a
+mechanism. Allocation, capability, validated-device, and deallocation callbacks
+run with neither lock held. Invalidation never waits; termination confirmation
+returns `ContextNotQuiescent` while callbacks remain, so callers wait or poll
+outside registry/governance locks. Resource removal is a separate non-callback
+step after mechanism registrations are quiescent and removed.
+
+Phase 3 adds no deferred-free queue, fence/event scheduling, owning allocation
+RAII, physical-release completeness state, partial-unmap recovery, quarantine,
+or pointer-only retry API. Those remain Phase 4 work.
 
 ### 1.2 Two directions, both backends
 

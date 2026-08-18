@@ -5,6 +5,11 @@
 //! so Phase 2 does not require an unrelated workspace-wide import migration.
 
 pub use onnx_runtime_memory_api::{
-    AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator, MappedAllocation,
-    SharedDevicePrefix, SharedMapping, SharedPrefixCommitInfo, VirtualBacking,
+    AllocationCommitRange, AllocationGeneration, AllocationIdentity, AuthorityIdentity,
+    BindingError, BindingGeneration, BindingId, BindingIdentity, BindingRegistry, BindingResource,
+    BoundAllocation, BoundMemoryView, BoundSharedMapping, BoundSharedPrefix, BoundVirtualBacking,
+    DeviceAllocator, DeviceKey, ExplicitReleaseError, HostAllocator, MappedAllocation,
+    MechanismCoherence, MechanismIdentity, MechanismLifecycle, MechanismSnapshot, MemoryBinding,
+    ProviderContextIdentity, RegisteredAuthority, RegisteredMechanism, RegisteredProviderContext,
+    SharedDevicePrefix, SharedMapping, SharedPrefixCommitInfo, ValidatedMemoryView, VirtualBacking,
 };

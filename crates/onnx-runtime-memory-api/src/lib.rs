@@ -5,19 +5,29 @@
 //!
 //! This crate is the lowest layer of the runtime memory stack. It owns the
 //! minimum ordinary allocator contract, explicit optional virtual-backing and
-//! shared-mapping capabilities, and their primitive types. It does not own
-//! allocation policy, accounting, synchronization, or runtime selection.
+//! shared-mapping capabilities, and manager-issued binding identity/lifetime
+//! pins. It does not own allocation policy, accounting, synchronization, or
+//! process-level transaction management.
 //!
 //! Governor-specific capacity tokens and grants remain in
 //! `onnx-runtime-memory-governor`; they are not methods every allocator or
 //! optional capability must implement.
 
 pub mod allocator;
+pub mod binding;
 pub mod capability;
 
 pub use allocator::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator, MappedAllocation,
     SharedDevicePrefix, SharedPrefixCommitInfo,
+};
+pub use binding::{
+    AllocationGeneration, AllocationIdentity, AuthorityIdentity, BindingError, BindingGeneration,
+    BindingId, BindingIdentity, BindingRegistry, BindingResource, BoundAllocation, BoundMemoryView,
+    BoundSharedMapping, BoundSharedPrefix, BoundVirtualBacking, ExplicitReleaseError,
+    MechanismCoherence, MechanismIdentity, MechanismLifecycle, MechanismSnapshot, MemoryBinding,
+    ProviderContextIdentity, RegisteredAuthority, RegisteredMechanism, RegisteredProviderContext,
+    ValidatedMemoryView,
 };
 pub use capability::{SharedMapping, VirtualBacking};
 

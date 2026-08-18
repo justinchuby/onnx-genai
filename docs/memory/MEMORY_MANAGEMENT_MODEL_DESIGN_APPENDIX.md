@@ -366,8 +366,13 @@ with native CUDA is not implemented.
 Today the design is only partially realized:
 
 - native CPU/CUDA EP instances own allocator handles;
+- `onnx-runtime-memory-api::BindingRegistry` now provides narrow manager-issued
+  device/mechanism/context/authority bindings, lifetime pins, switch
+  stability, allocation generations, and device-loss invalidation; existing
+  EP paths adopt it incrementally rather than changing policy;
 - the server shares device authorities, but host/disk ledgers remain per engine;
-- no process-wide allocator/provider registry exists;
+- no process-wide `ProcessMemoryManager` composes that registry with canonical
+  authorities, holders, policy, and transactions yet;
 - ORT governed allocator lifetime uses a bounded leak because the last session
   user is not observable;
 - `onnx-genai-kv` device storage is not wired into native CUDA decode;
