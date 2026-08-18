@@ -29,8 +29,8 @@ use super::commands::{
     render_repl_help, set_trace_recording,
 };
 use super::output::{
-    build_turn_prompt, detect_reasoning, display_paths, emit_stats_line, load_chat_template,
-    run_generation_turn,
+    bind_response_tokens, build_turn_prompt, detect_reasoning, display_paths, emit_stats_line,
+    load_chat_template, load_response_config, run_generation_turn,
 };
 use super::{EngineArgs, ProfileArgs, RunArgs, decode_backend_name, resolve_model_dir};
 use super::{live_turn, pages, profile};
@@ -1050,6 +1050,8 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
     let mut template = load_chat_template(&model_dir, raw_mode);
     let mut reasoning = detect_reasoning(template.as_ref());
     backend.bind_reasoning_marker_tokens(&mut reasoning);
+    let mut response = load_response_config(&model_dir, raw_mode);
+    bind_response_tokens(&mut response, &backend);
     let mut warned_missing_context_limit = false;
 
     eprintln!(
@@ -1185,6 +1187,8 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                                 template = load_chat_template(&model_dir, raw_mode);
                                 reasoning = detect_reasoning(template.as_ref());
                                 backend.bind_reasoning_marker_tokens(&mut reasoning);
+                                response = load_response_config(&model_dir, raw_mode);
+                                bind_response_tokens(&mut response, &backend);
                                 warned_missing_context_limit = false;
                                 // A conversation is about the model that held
                                 // it; replaying it into a different model would
@@ -1339,6 +1343,8 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                 template = load_chat_template(&model_dir, raw_mode);
                 reasoning = detect_reasoning(template.as_ref());
                 backend.bind_reasoning_marker_tokens(&mut reasoning);
+                response = load_response_config(&model_dir, raw_mode);
+                bind_response_tokens(&mut response, &backend);
                 println!("raw mode {}", if raw_mode { "enabled" } else { "disabled" });
                 None
             }
@@ -1460,6 +1466,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
             true,
             Some(&mut profile),
             reasoning.as_ref(),
+            response.as_ref(),
             // Live rendering follows `/stats`: it is what puts moving numbers
             // under the reply, and a session that did not ask for them keeps the
             // plain streaming path untouched.

@@ -87,3 +87,7 @@ After #978 split-K and #981 block SkipRMSNorm landed, the post-#981 base-floor r
 - Authored the first V2-Lite additive-mask capacity classifier for CUDA graph capture; the target topology and GLM-5.2 exclusion were directionally correct.
 - Rachael rejected the artifact for two safety blockers: non-capacity Attention could be blessed, and a root graph-output mask escape was not rejected. Strict reviewer lockout was honored, so Deckard did not revise the rejected artifact.
 - Wallace owned the revision, tightened both cases with negative tests, and Rachael approved; #1171 merged as `bc1e97ff`.
+
+## 2026-08-18T05:25Z — Gate-3 B* post-Marlin re-probe NO-GO
+
+Luv's current-main (`923dc592`) re-probe found captured verify B* still far above the ≤~2 GO gate after Marlin: qwen2.5-14b-zp **17.5×/18.4×/20.0×** and qwen2.5-7b **14.9×/15.7×/17.4×** at K=2/4/8. Spec-decode family work remains shelved. The blocker shifted from the old #957 cheap-seam hypothesis to M>1 `MatMulNBits` launching `matmul_nbits_gemm_f16` eagerly; rerun only after the MatMulNBits/Marlin M>1 graph-safe path is actually selected.

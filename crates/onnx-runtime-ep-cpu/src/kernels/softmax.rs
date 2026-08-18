@@ -230,9 +230,16 @@ fn scale_mask_softmax_serial(
 
 /// Out-of-place row-major softmax: `src` and `dst` are `n × d` and disjoint.
 ///
-/// The copy is done *inside* the fan-out rather than as a separate pass, so a
-/// tall score matrix is touched once per worker instead of once serially and
-/// then again in parallel.
+/// `dst` is written straight from `src` in a single traversal - the row max,
+/// `exp(row - max)` and the normalization all read `src` and write `dst`, so no
+/// element of `src` is ever copied into `dst` first. That copy was a whole extra
+/// read+write pass over the tensor - 66 MiB of traffic per inference on a 33 MiB
+/// prefill logit block - and it bought nothing: ORT never pays it because it
+/// hands `MlasComputeSoftmax` the graph input and output buffers directly, and
+/// this path now does the same. The result is bit-identical to a
+/// `copy(src -> dst)` followed by the in-place reducer - the existing
+/// `the_parallel_fan_out_is_bit_identical_to_the_serial_path` test asserts that
+/// equality on both the MLAS and the pure-Rust builds.
 pub(crate) fn softmax_rows(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
     debug_assert_eq!(src.len(), n * d);
     debug_assert_eq!(dst.len(), n * d);
@@ -245,12 +252,10 @@ pub(crate) fn softmax_rows(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
         dst.par_chunks_mut(block)
             .zip(src.par_chunks(block))
             .for_each(|(out, inp)| {
-                out.copy_from_slice(inp);
-                softmax_rows_serial(out, out.len() / d, d);
+                softmax_rows_serial_out(inp, out, out.len() / d, d);
             });
     } else {
-        dst.copy_from_slice(src);
-        softmax_rows_serial(dst, n, d);
+        softmax_rows_serial_out(src, dst, n, d);
     }
 }
 
@@ -273,6 +278,15 @@ fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
     mlas_sys::compute_softmax_in_place(data, n, d);
 }
 
+/// Out-of-place counterpart of [`softmax_rows_serial`]: read `src`, write `dst`,
+/// no copy. MLAS's non-log softmax streams `Input -> Output` and then rescales
+/// `Output` alone, so this is bit-identical to `dst.copy_from_slice(src)`
+/// followed by the in-place form.
+#[cfg(feature = "mlas")]
+fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
+    mlas_sys::compute_softmax(src, dst, n, d);
+}
+
 /// Portable fallback with the same semantics: subtract the row max, `exp`,
 /// normalize. Kept exact against the MLAS path by the parity tests below.
 #[cfg(not(feature = "mlas"))]
@@ -293,6 +307,34 @@ fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
         let inv = 1.0 / sum;
         for v in row.iter_mut() {
             *v *= inv;
+        }
+    }
+    let _ = n;
+}
+
+/// Portable out-of-place counterpart of [`softmax_rows_serial`]: read `src`,
+/// write `dst`, no copy. Bit-identical to `dst.copy_from_slice(src)` followed by
+/// the in-place form - it performs exactly the same max/`exp`/normalize
+/// operations in the same order, reading each `src` element in place of the
+/// copied `dst` element it would otherwise have read.
+#[cfg(not(feature = "mlas"))]
+fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
+    for (srow, drow) in src.chunks(d).zip(dst.chunks_mut(d)) {
+        let mut max = f32::NEG_INFINITY;
+        for &v in srow.iter() {
+            if v > max {
+                max = v;
+            }
+        }
+        let mut sum = 0.0f32;
+        for (dv, &sv) in drow.iter_mut().zip(srow.iter()) {
+            let e = (sv - max).exp();
+            *dv = e;
+            sum += e;
+        }
+        let inv = 1.0 / sum;
+        for dv in drow.iter_mut() {
+            *dv *= inv;
         }
     }
     let _ = n;
@@ -675,7 +717,144 @@ mod vectorized_tests {
         }
     }
 
-    /// ...and the serial path itself must still be a softmax.
+    /// The out-of-place softmax derives every output element from `src` alone.
+    /// It writes `dst` without first copying `src` into it, so if it ever read
+    /// `dst` (the copy this kernel deliberately no longer makes) pre-existing
+    /// garbage there would leak into the result. Poisoning `dst` with values
+    /// that would wreck a softmax if mistaken for logits - `+inf` would win
+    /// every row max and `NaN` would poison every sum - and asserting the
+    /// result is bit-for-bit identical to running over a clean buffer pins the
+    /// destination-independence down exactly, on both the MLAS and pure-Rust
+    /// builds.
+    #[test]
+    fn out_of_place_softmax_never_reads_the_destination() {
+        for (n, d) in [(1usize, 1usize), (3, 7), (64, 256), (129, 500)] {
+            let src = synthetic(n, d, (7 * n + d) as u32);
+
+            let mut clean = vec![0.0f32; n * d];
+            softmax_rows(&src, &mut clean, n, d);
+
+            let poison = [f32::INFINITY, f32::NAN, f32::NEG_INFINITY, 1e30];
+            let mut garbage: Vec<f32> = (0..n * d).map(|i| poison[i % poison.len()]).collect();
+            softmax_rows(&src, &mut garbage, n, d);
+
+            assert_eq!(clean, garbage, "destination garbage leaked at n={n} d={d}");
+        }
+    }
+
+    /// ...and the no-copy path must still be a softmax, not merely
+    /// deterministic. Checks it against an independent scalar oracle with the
+    /// destination pre-poisoned with `NaN`, so a regression that reads the
+    /// poison or miscomputes the max/`exp`/normalize reduction surfaces here
+    /// rather than only under the A/B harness.
+    #[test]
+    fn out_of_place_softmax_matches_the_reference() {
+        for (n, d) in [(1usize, 1usize), (3, 7), (64, 256), (129, 500)] {
+            let src = synthetic(n, d, (5 * n + 3 * d) as u32);
+            let expect = reference_rows(&src, n, d);
+            let mut dst: Vec<f32> = vec![f32::NAN; n * d];
+            softmax_rows(&src, &mut dst, n, d);
+            for (i, (g, e)) in dst.iter().zip(&expect).enumerate() {
+                assert!(
+                    (g - e).abs() <= 1e-6,
+                    "n={n} d={d} idx={i}: {g} vs {e} (out-of-place softmax wrong)"
+                );
+                assert!(g.is_finite(), "n={n} d={d} idx={i}: non-finite {g}");
+            }
+        }
+    }
+    /// The out-of-place form must be *bit*-identical to the copy-then-in-place
+    /// form it replaced, not merely close, and the interesting inputs are the
+    /// ones a tolerance-based check cannot see, because the in-place reducer is
+    /// vectorised and this path is not, so their `exp` implementations have to
+    /// agree on the non-finite lanes bit for bit: a fully masked row, where the
+    /// row max is `-inf` and `exp(-inf - -inf)` is `exp(NaN)`, so a NaN whose
+    /// payload and sign must match propagates through the whole row; a row whose
+    /// max is `+inf`, likewise NaN; and rows carrying quiet, signalling and
+    /// negative-payload NaNs, plus denormals. This repo has already shipped one
+    /// bug of exactly this shape - a bf16 widen that raw-shifted instead of
+    /// quieting, diverging from the reference on 126 of 65536 patterns - and the
+    /// tolerance-based tests above would not catch its analogue here, so this
+    /// compares raw bits.
+    #[test]
+    fn out_of_place_softmax_is_bit_identical_on_pathological_rows() {
+        const D: usize = 8;
+        let rows: Vec<Vec<f32>> = vec![
+            // Fully masked: sum of exponentials is 0, so normalization is 0/0.
+            vec![f32::NEG_INFINITY; D],
+            // Row max is +inf, so exp(inf - inf) is NaN.
+            {
+                let mut r = vec![1.0f32; D];
+                r[3] = f32::INFINITY;
+                r
+            },
+            // Both infinities in one row.
+            {
+                let mut r = vec![0.5f32; D];
+                r[0] = f32::INFINITY;
+                r[D - 1] = f32::NEG_INFINITY;
+                r
+            },
+            // Quiet NaN.
+            {
+                let mut r = vec![2.0f32; D];
+                r[2] = f32::NAN;
+                r
+            },
+            // Signalling NaN: the pattern class that broke the bf16 widen.
+            {
+                let mut r = vec![-1.0f32; D];
+                r[5] = f32::from_bits(0x7f80_0001);
+                r
+            },
+            // Negative-payload NaN.
+            {
+                let mut r = vec![3.0f32; D];
+                r[1] = f32::from_bits(0xffc0_0003);
+                r
+            },
+            // Denormals.
+            (0..D).map(|i| f32::from_bits(1 + i as u32)).collect(),
+            // Ordinary finite logits, as a control.
+            (0..D).map(|i| i as f32 * 0.25 - 1.0).collect(),
+        ];
+        let n = rows.len();
+        let src: Vec<f32> = rows.concat();
+
+        // The form this kernel replaced: copy the whole tensor, then reduce in
+        // place over the copy.
+        let mut expect = src.clone();
+        softmax_rows_in_place(&mut expect, n, D);
+
+        let mut got = vec![0.0f32; n * D];
+        softmax_rows(&src, &mut got, n, D);
+
+        for (i, (g, e)) in got.iter().zip(&expect).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                e.to_bits(),
+                "row {} lane {}: out-of-place {:#010x} != copy+in-place {:#010x}",
+                i / D,
+                i % D,
+                g.to_bits(),
+                e.to_bits()
+            );
+        }
+
+        // Guard against the whole comparison going vacuous: these rows must
+        // actually produce the non-finite results the test claims to pin down.
+        // Without this, a change that quietly made every row finite would leave
+        // the bit comparison trivially true.
+        assert!(
+            expect[..D].iter().all(|v| v.is_nan()),
+            "the fully masked row stopped producing NaN; this test no longer covers it"
+        );
+        assert!(
+            expect.iter().filter(|v| v.is_nan()).count() >= 5 * D,
+            "the pathological rows stopped producing NaN; the bit comparison is now vacuous"
+        );
+    }
+
     #[test]
     fn vectorized_rows_match_the_scalar_reference() {
         for (n, d) in [(1usize, 1usize), (3, 7), (64, 256), (200, 33)] {
