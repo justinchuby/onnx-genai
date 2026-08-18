@@ -781,7 +781,7 @@ impl Backend {
     pub(super) fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
         match self {
             Self::Text(engine) => engine.effective_max_context(options),
-            Self::Pipeline(_) => options.max_context,
+            Self::Pipeline(pipeline) => pipeline.engine.effective_max_context(options),
         }
     }
 
