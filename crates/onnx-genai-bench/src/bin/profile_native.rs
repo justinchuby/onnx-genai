@@ -680,12 +680,13 @@ fn print_weight_offload_observability(emitted_tokens: u64) {
     print_weight_offload_amortization(&stats, emitted_tokens);
     println!(
         "weight_offload_timing: materialize_ms={:.3} htod_ms={:.3} \
-         admit_sync_ms={:.3} vram_alloc_ms={:.3} vram_free_ms={:.3}",
+         admit_sync_ms={:.3} vram_alloc_ms={:.3} vram_free_ms={:.3} vram_free_sync_ms={:.3}",
         stats.materialize_ns as f64 / 1_000_000.0,
         stats.htod_ns as f64 / 1_000_000.0,
         stats.admit_sync_ns as f64 / 1_000_000.0,
         stats.vram_alloc_ns as f64 / 1_000_000.0,
-        stats.vram_free_ns as f64 / 1_000_000.0
+        stats.vram_free_ns as f64 / 1_000_000.0,
+        stats.vram_free_sync_ns as f64 / 1_000_000.0
     );
     println!(
         "weight_offload_physical: budget_bytes={} mapped_physical_bytes={} \
