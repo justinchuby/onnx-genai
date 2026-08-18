@@ -94,18 +94,21 @@ impl PipelineEngine {
         // the still-unwired case is reported as Inc-D.
         let mut native_decoder_component: Option<Box<dyn PipelineDecoderComponent + 'static>> =
             if use_native_decoder {
-                Some(build_native_pipeline_decoder(
-                    &self.models,
-                    &ar.decoder,
-                    self.native_device.as_ref(),
-                    &self.memory_strategy_plan,
-                    #[cfg(feature = "cuda")]
-                    std::sync::Arc::new(
-                        self.native_cuda_authority
-                            .clone()
-                            .unwrap_or_else(|| self.resource_governor.device_authority()),
-                    ),
-                )?)
+                match self.native_retained_decoder.take() {
+                    Some(decoder) => Some(decoder),
+                    None => Some(build_native_pipeline_decoder(
+                        &self.models,
+                        &ar.decoder,
+                        self.native_device.as_ref(),
+                        &self.memory_strategy_plan,
+                        #[cfg(feature = "cuda")]
+                        std::sync::Arc::new(
+                            self.native_cuda_authority
+                                .clone()
+                                .unwrap_or_else(|| self.resource_governor.device_authority()),
+                        ),
+                    )?),
+                }
             } else {
                 None
             };
@@ -119,7 +122,27 @@ impl PipelineEngine {
         let paged_enabled = self.paged.is_some()
             && inputs_digest.is_some()
             && (!use_native_decoder || native_supports_paging);
-        let reused = if paged_enabled || use_native_decoder {
+        let reused = if use_native_decoder && !paged_enabled {
+            let shared = match (inputs_digest, self.retained.as_ref()) {
+                (Some(inputs), Some(retained)) => retained.reusable_prefix(inputs, &prompt_tokens),
+                _ => 0,
+            };
+            let current = native_decoder_component
+                .as_ref()
+                .and_then(|decoder| decoder.current_kv_len())
+                .unwrap_or(0);
+            let reusable = shared.min(current);
+            let must_reset = reusable == 0 || (reusable < current && !self.positions_are_linear());
+            let target = if must_reset { 0 } else { reusable };
+            if let Some(decoder) = native_decoder_component.as_mut()
+                && target != current
+                && !decoder.rewind_kv(target)?
+            {
+                0
+            } else {
+                target
+            }
+        } else if paged_enabled || use_native_decoder {
             0
         } else {
             self.reusable_prefix_len(inputs_digest, &prompt_tokens)
@@ -273,8 +296,9 @@ impl PipelineEngine {
             }),
             _ => None,
         };
-        let decoder_component: Box<dyn PipelineDecoderComponent + '_> =
-            if let Some(native) = native_decoder_component {
+        let mut ort_decoder_component: Option<Box<dyn PipelineDecoderComponent + '_>> = None;
+        let decoder_component: &mut dyn PipelineDecoderComponent =
+            if let Some(native) = native_decoder_component.as_deref_mut() {
                 // Built (and, on a shared prefix, already KV-seeded) up front.
                 native
             } else {
@@ -286,12 +310,15 @@ impl PipelineEngine {
                     .models
                     .session(&ar.decoder)
                     .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
-                Box::new(OrtPipelineDecoder::new(
+                ort_decoder_component = Some(Box::new(OrtPipelineDecoder::new(
                     decoder,
                     self.decoder_state
                         .as_mut()
                         .expect("autoregressive pipeline has decode state"),
-                ))
+                )));
+                ort_decoder_component
+                    .as_deref_mut()
+                    .expect("ORT decoder component was just initialized")
             };
         let mut backend = PipelineDecodeLoopBackend {
             decoder: decoder_component,
@@ -306,6 +333,7 @@ impl PipelineEngine {
             prompt_len: 0,
             generated_count: 0,
             kv_len: reused,
+            prefill_chunk_size: self.prefill_chunk_size,
         };
         // Prefill only what the retained KV does not already cover.
         backend.prompt_len = backend.context_tokens.len() - backend.retained_len;
@@ -346,9 +374,11 @@ impl PipelineEngine {
         // needed downstream has been copied out above, so release it explicitly
         // before the paged-sequence retirement and the `tensors` move below.
         drop(backend);
+        drop(ort_decoder_component);
         let result = match result {
             Ok(result) => result,
             Err(error) => {
+                self.native_retained_decoder = None;
                 if let Some(paged) = self.paged.as_mut() {
                     paged.discard_active();
                 }
@@ -371,6 +401,21 @@ impl PipelineEngine {
                         inputs,
                         tokens: final_context,
                     });
+                    // Retain the decoder only here, under exactly the condition
+                    // that refreshed `retained`. The next request rewinds this
+                    // KV to a prefix length derived from `retained`, so a
+                    // decoder kept without a matching `retained` would have its
+                    // contents described by a stale context -- reusing another
+                    // request's KV as this one's prefix, silently and with
+                    // plausible output. Reachable whenever a request is not
+                    // digestible (`digest_request_identity` returns `None` for
+                    // an input `absorb_value` cannot canonicalize) or does not
+                    // use KV: those requests would leave `retained` untouched
+                    // while overwriting the KV it claims to describe. Dropping
+                    // the decoder only costs the reuse.
+                    if use_native_decoder {
+                        self.native_retained_decoder = native_decoder_component;
+                    }
                 }
             }
         }

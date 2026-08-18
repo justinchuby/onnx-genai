@@ -816,15 +816,25 @@ impl Backend {
                     .map_err(|error| match required {
                         // A multimodal package can require its non-text input;
                         // say so rather than leaving a bare "missing input".
-                        Some(modality) if attachments == 0 => error.context(format!(
-                            "the turn carried no attachment, but this model declares {modality} input. \
-                             How: attach one with `/{modality} <path>` in the REPL, or `--{modality} <path>` on the command line."
-                        )),
+                        Some(modality)
+                            if attachments == 0 && is_missing_required_input(&error) =>
+                        {
+                            error.context(format!(
+                                "the turn carried no attachment, but this model declares {modality} input. \
+                                 How: attach one with `/{modality} <path>` in the REPL, or `--{modality} <path>` on the command line."
+                            ))
+                        }
                         _ => error,
                     })
             }
         }
     }
+}
+
+fn is_missing_required_input(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with("input not found: "))
 }
 
 pub(super) fn apply_context_sized_max_new_tokens(
@@ -1544,6 +1554,17 @@ pub(super) fn stage_attachment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_input_not_found_errors_are_classified_as_missing_required_input() {
+        let missing =
+            anyhow::anyhow!("input not found: pixel_values").context("decoder forward failed");
+        assert!(is_missing_required_input(&missing));
+
+        let oom = anyhow::anyhow!("cuda_ep: cuMemAlloc: CUDA_ERROR_OUT_OF_MEMORY")
+            .context("decoder forward failed");
+        assert!(!is_missing_required_input(&oom));
+    }
 
     #[test]
     fn tty_mode_enables_live_stats_by_default() {

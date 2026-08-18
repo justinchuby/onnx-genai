@@ -463,6 +463,39 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        // Attribute-level capability limits for the attention and MoE family.
+        //
+        // Every one of these mirrors a rejection its kernel factory raises, and
+        // mirroring is mandatory rather than tidy: `GetCapability` consults only
+        // the dtype and shape filters, so a factory rejection arrives *after*
+        // ORT has compiled the node onto this EP and is a hard session failure
+        // that no fallback recovers from. Claiming an op we cannot configure is
+        // therefore strictly worse for the user than never claiming it — it
+        // turns a model that runs on ORT's CPU EP into one that does not load.
+        //
+        // Each `unsupported_reason` runs the factory's own attribute parse, so
+        // a new limit cannot be added to a factory without appearing here.
+        //
+        // These are *capability* declines, never performance ones: every entry
+        // is a kernel we owe. See the benchmark doc's §23.6.
+        let attribute_reason = match (op.op_type.as_str(), domain) {
+            ("MoE", "com.microsoft") => crate::kernels::moe::unsupported_reason(op),
+            ("QMoE", "com.microsoft") => crate::kernels::qmoe::unsupported_reason(op),
+            ("GroupQueryAttention", "com.microsoft") => {
+                crate::kernels::group_query_attention::unsupported_reason(op)
+            }
+            ("MultiHeadAttention", "com.microsoft") => {
+                crate::kernels::multi_head_attention::unsupported_reason(op)
+            }
+            ("Attention", "com.microsoft") => {
+                crate::kernels::msft_attention::unsupported_reason(op)
+            }
+            ("Attention", "ai.onnx") => crate::kernels::attention::unsupported_reason(op),
+            _ => None,
+        };
+        if let Some(reason) = attribute_reason {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "PackedMultiHeadAttention"
             && op.domain == "com.microsoft"
             && let Some(reason) = crate::kernels::packed_multi_head_attention::unsupported_reason(
@@ -1123,6 +1156,185 @@ mod tests {
         }
         let bad = Node::new(onnx_runtime_ir::NodeId(99), "UnknownOp", vec![], vec![]);
         assert!(ep.get_kernel(&bad, &[], 17).is_err());
+    }
+
+    /// Every attribute a kernel factory rejects must also be rejected by
+    /// `supports_op`, because a factory rejection lands after ORT has compiled
+    /// the node onto this EP and is a hard session failure no fallback recovers
+    /// from — strictly worse than never claiming. This is the pure-Rust half of
+    /// `plugin_ort_e2e::factory_only_capability_limits_are_declined_at_claim_time`,
+    /// so a regression is caught even where ORT is unavailable.
+    #[test]
+    fn every_factory_attribute_rejection_is_mirrored_at_claim_time() {
+        let ep = CpuExecutionProvider::new();
+        /// `(op, domain, opset, rejecting attribute, prerequisite attributes)`.
+        type FactoryRejection = (
+            &'static str,
+            &'static str,
+            u64,
+            (&'static str, Attribute),
+            &'static [(&'static str, Attribute)],
+        );
+        let cases: &[FactoryRejection] = &[
+            (
+                "MoE",
+                "com.microsoft",
+                1,
+                ("use_sparse_mixer", Attribute::Int(1)),
+                &[],
+            ),
+            (
+                "QMoE",
+                "com.microsoft",
+                1,
+                ("block_size", Attribute::Int(0)),
+                &[],
+            ),
+            (
+                "QMoE",
+                "com.microsoft",
+                1,
+                ("expert_weight_bits", Attribute::Int(3)),
+                &[("block_size", Attribute::Int(32))],
+            ),
+            (
+                "GroupQueryAttention",
+                "com.microsoft",
+                1,
+                ("smooth_softmax", Attribute::Int(1)),
+                &[
+                    ("num_heads", Attribute::Int(4)),
+                    ("kv_num_heads", Attribute::Int(2)),
+                ],
+            ),
+            (
+                "GroupQueryAttention",
+                "com.microsoft",
+                1,
+                ("qk_output", Attribute::Int(1)),
+                &[
+                    ("num_heads", Attribute::Int(4)),
+                    ("kv_num_heads", Attribute::Int(2)),
+                ],
+            ),
+            (
+                "GroupQueryAttention",
+                "com.microsoft",
+                1,
+                ("kv_cache_bit_width", Attribute::Int(8)),
+                &[
+                    ("num_heads", Attribute::Int(4)),
+                    ("kv_num_heads", Attribute::Int(2)),
+                ],
+            ),
+            (
+                "Attention",
+                "com.microsoft",
+                1,
+                ("do_rotary", Attribute::Int(1)),
+                &[("num_heads", Attribute::Int(4))],
+            ),
+            (
+                "Attention",
+                "com.microsoft",
+                1,
+                ("past_present_share_buffer", Attribute::Int(1)),
+                &[("num_heads", Attribute::Int(4))],
+            ),
+            (
+                "Attention",
+                "ai.onnx",
+                23,
+                ("qk_matmul_output_mode", Attribute::Int(7)),
+                &[],
+            ),
+            (
+                "MultiHeadAttention",
+                "com.microsoft",
+                1,
+                ("num_heads", Attribute::Int(0)),
+                &[],
+            ),
+        ];
+
+        for (op, domain, opset, (attr, value), extra) in cases {
+            let mut node = Node::new(NodeId(0), *op, vec![], vec![]);
+            node.domain = (*domain).into();
+            for (name, extra_value) in *extra {
+                node.attributes.insert((*name).into(), extra_value.clone());
+            }
+            node.attributes.insert((*attr).into(), value.clone());
+
+            let factory = ep.get_kernel(&node, &[], *opset);
+            assert!(
+                factory.is_err(),
+                "{domain}::{op} with {attr} is expected to be a factory rejection; if the \
+                 kernel now implements it, drop this row rather than the claim-time guard"
+            );
+
+            let claim = ep.supports_op(&node, *opset, &[], &[], &[]);
+            assert!(
+                !claim.is_supported(),
+                "{domain}::{op} with {attr} is claimed but its factory rejects it, so the \
+                 session dies at CreateSession with no fallback. Mirror the limit in \
+                 `supports_op`."
+            );
+        }
+
+        // `PackedMultiHeadAttention` needs a fully-formed node rather than a
+        // table row. Its claim-time check inspects inputs, shapes and dtypes
+        // before it reaches the attribute mirror, so an attribute-only node
+        // declines for the *wrong* reason and the assertion would pass even
+        // with the mirror deleted — which is exactly what review demonstrated.
+        // Hence the explicit reason match.
+        let mut graph = Graph::new();
+        let value = |graph: &mut Graph, name: &str, dtype| {
+            Some(graph.create_named_value(name.to_string(), dtype, static_shape([])))
+        };
+        let inputs = vec![
+            value(&mut graph, "query", DataType::Float32),
+            value(&mut graph, "key", DataType::Float32),
+            value(&mut graph, "value", DataType::Float32),
+            None,
+            value(&mut graph, "token_offset", DataType::Int32),
+            value(&mut graph, "cumulative_sequence_length", DataType::Int32),
+        ];
+        let output =
+            graph.create_named_value("output".to_string(), DataType::Float32, static_shape([]));
+        let mut node = Node::new(NodeId(0), "PackedMultiHeadAttention", inputs, vec![output]);
+        node.domain = "com.microsoft".into();
+        node.attributes
+            .insert("num_heads".into(), Attribute::Int(2));
+        node.attributes
+            .insert("scale".into(), Attribute::Float(f32::INFINITY));
+        let shapes = [
+            static_shape([4, 8]),
+            static_shape([4, 8]),
+            static_shape([4, 8]),
+            static_shape([]),
+            static_shape([1, 4]),
+            static_shape([2]),
+        ];
+        let dtypes = [
+            DataType::Float32,
+            DataType::Float32,
+            DataType::Float32,
+            DataType::Float32,
+            DataType::Int32,
+            DataType::Int32,
+        ];
+        assert!(
+            ep.get_kernel(&node, &[], 1).is_err(),
+            "PackedMultiHeadAttention with a non-finite scale is expected to be a factory \
+             rejection"
+        );
+        let claim = ep.supports_op(&node, 1, &shapes, &dtypes, &[]);
+        let reason = claim.reason().unwrap_or_default().to_string();
+        assert!(
+            reason.contains("scale must be finite"),
+            "PackedMultiHeadAttention's attribute mirror was not reached; the node declined \
+             for `{reason}` instead, so this case would not catch the mirror being removed"
+        );
     }
 
     #[test]

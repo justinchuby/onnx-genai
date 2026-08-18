@@ -97,6 +97,91 @@ fn merge_workspace_peak(peak: &mut WorkspaceRequirement, requirement: WorkspaceR
 }
 
 impl Executor {
+    fn constant_i64_values(&self, value: ValueId) -> Option<Vec<i64>> {
+        let producer = self.graph.value(value).producer?;
+        let node = self.graph.node(producer);
+        if !node.domain.is_empty() || node.op_type != "Constant" {
+            return None;
+        }
+        if let Some(values) = node.attr("value_ints").and_then(Attribute::as_ints) {
+            return Some(values.to_vec());
+        }
+        match node.attr("value") {
+            Some(Attribute::Tensor(tensor)) if tensor.dtype == DataType::Int64 => {
+                onnx_runtime_ir::read_vec_le::<i64>(&tensor.data).ok()
+            }
+            Some(Attribute::Tensor(tensor)) if tensor.dtype == DataType::Int32 => {
+                onnx_runtime_ir::read_vec_le::<i32>(&tensor.data)
+                    .ok()
+                    .map(|values| values.into_iter().map(i64::from).collect())
+            }
+            _ => None,
+        }
+    }
+
+    fn exact_runtime_value_shape(
+        &self,
+        value: ValueId,
+        symbols: &HashMap<SymbolId, usize>,
+        depth: usize,
+    ) -> Option<Vec<usize>> {
+        if let Some(shape) = self
+            .value_shapes
+            .get(&value)
+            .and_then(|shape| substitute(shape, symbols))
+        {
+            return Some(shape);
+        }
+        if depth >= 8 {
+            return None;
+        }
+        let producer = self.graph.value(value).producer?;
+        let node = self.graph.node(producer);
+        match (node.domain.as_str(), node.op_type.as_str()) {
+            ("", "Cast" | "CastLike" | "Identity") => {
+                let input = node.inputs.first().copied().flatten()?;
+                self.exact_runtime_value_shape(input, symbols, depth + 1)
+            }
+            ("", "Reshape") => {
+                let data = node.inputs.first().copied().flatten()?;
+                let target = node.inputs.get(1).copied().flatten()?;
+                let data_shape = self.exact_runtime_value_shape(data, symbols, depth + 1)?;
+                let target = self.constant_i64_values(target)?;
+                let data_elements = data_shape
+                    .iter()
+                    .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
+                let mut output = Vec::with_capacity(target.len());
+                let mut infer_axis = None;
+                let mut known_elements = 1usize;
+                for (axis, &dim) in target.iter().enumerate() {
+                    let resolved = match dim {
+                        -1 => {
+                            if infer_axis.replace(axis).is_some() {
+                                return None;
+                            }
+                            1
+                        }
+                        0 => *data_shape.get(axis)?,
+                        n if n > 0 => usize::try_from(n).ok()?,
+                        _ => return None,
+                    };
+                    known_elements = known_elements.checked_mul(resolved)?;
+                    output.push(resolved);
+                }
+                if let Some(axis) = infer_axis {
+                    if known_elements == 0 || !data_elements.is_multiple_of(known_elements) {
+                        return None;
+                    }
+                    output[axis] = data_elements / known_elements;
+                } else if known_elements != data_elements {
+                    return None;
+                }
+                Some(output)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn prepare_mapped_growth(
         &self,
         bytes: u64,
@@ -196,6 +281,9 @@ impl Executor {
         node: &Node,
         index: usize,
     ) -> Result<PlannedInputShape> {
+        if let Some(dims) = self.exact_runtime_value_shape(value, symbols, 0) {
+            return Ok(PlannedInputShape::Exact(dims));
+        }
         let shape = self.value_shapes.get(&value).ok_or_else(|| {
             SessionError::Internal(format!(
                 "prepare-only workspace planning has no loader shape for input {index} of \

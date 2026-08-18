@@ -1,0 +1,121 @@
+ir_version: 10
+graph {
+  node {
+    input: "query"
+    input: "key"
+    input: "value"
+    input: ""
+    input: "token_offset"
+    input: "cumulative_sequence_length"
+    output: "output"
+    op_type: "PackedMultiHeadAttention"
+    attribute {
+      name: "num_heads"
+      i: 4
+      type: INT
+    }
+    domain: "com.microsoft"
+  }
+  name: "packed_mha_assignment_f32"
+  input {
+    name: "query"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 8
+          }
+          dim {
+            dim_value: 64
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 8
+          }
+          dim {
+            dim_value: 64
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 8
+          }
+          dim {
+            dim_value: 64
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "token_offset"
+    type {
+      tensor_type {
+        elem_type: 6
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "cumulative_sequence_length"
+    type {
+      tensor_type {
+        elem_type: 6
+        shape {
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "output"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 8
+          }
+          dim {
+            dim_value: 64
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 17
+}
+opset_import {
+  domain: "com.microsoft"
+  version: 1
+}

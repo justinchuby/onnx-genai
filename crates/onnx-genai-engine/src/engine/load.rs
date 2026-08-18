@@ -494,6 +494,12 @@ impl Engine {
                     ))
                     .saturating_add(onnx_runtime_ep_cpu::matmul_dense_cache_predicted_bytes(
                         &graph,
+                    ))
+                    .saturating_add(
+                        onnx_runtime_ep_cpu::qlinear_accumulator_budget_predicted_bytes(&graph),
+                    )
+                    .saturating_add(onnx_runtime_ep_cpu::qlinear_packed_b_predicted_bytes(
+                        &graph,
                     )),
                 Err(_) => 0,
             }
@@ -576,6 +582,18 @@ impl Engine {
         // call and retain nothing (byte-identical output, only slower) instead of
         // holding the session-lifetime copies resident over budget.
         onnx_runtime_ep_cpu::set_matmul_dense_cache_enabled(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
+        // #1133: the QLinearMatMul process-wide accumulator scratch budget and
+        // the constant-`B` MLAS pre-pack are the fifth and sixth buffers folded
+        // into `resident_f32_cache_bytes`, governed by the same verdict. When
+        // declined, the kernel reallocates the `i32` accumulator per call and
+        // takes the unpacked GEMM (densifying `B` per call) -- byte-identical
+        // output, only slower -- instead of retaining either buffer over budget.
+        onnx_runtime_ep_cpu::set_qlinear_accumulator_budget_admitted(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
+        onnx_runtime_ep_cpu::set_qlinear_packed_b_enabled(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
         #[cfg(feature = "cuda")]

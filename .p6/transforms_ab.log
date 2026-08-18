@@ -1,0 +1,497 @@
+sm_bert_b8_s128              t=1   trial=0 base   native=   1.312 ort=   0.856 ratio= 1.534 parity=PASS
+sm_bert_b8_s128              t=1   trial=0 new    native=   1.043 ort=   0.846 ratio= 1.232 parity=PASS
+sm_bert_b8_s128              t=1   trial=1 new    native=   1.039 ort=   0.836 ratio= 1.243 parity=PASS
+sm_bert_b8_s128              t=1   trial=1 base   native=   1.291 ort=   0.822 ratio= 1.571 parity=PASS
+sm_bert_b8_s128              t=1   trial=2 base   native=   1.286 ort=   0.828 ratio= 1.553 parity=PASS
+sm_bert_b8_s128              t=1   trial=2 new    native=   1.080 ort=   0.844 ratio= 1.280 parity=PASS
+sm_bert_b8_s128              t=1   trial=3 new    native=   1.071 ort=   0.847 ratio= 1.265 parity=PASS
+sm_bert_b8_s128              t=1   trial=3 base   native=   1.327 ort=   0.836 ratio= 1.586 parity=PASS
+sm_bert_b8_s128              t=1   trial=4 base   native=   1.301 ort=   0.826 ratio= 1.574 parity=PASS
+sm_bert_b8_s128              t=1   trial=4 new    native=   1.015 ort=   0.823 ratio= 1.233 parity=PASS
+sm_bert_b8_s128              t=8   trial=0 base   native=   0.591 ort=   0.139 ratio= 4.244 parity=PASS
+sm_bert_b8_s128              t=8   trial=0 new    native=   0.520 ort=   0.133 ratio= 3.915 parity=PASS
+sm_bert_b8_s128              t=8   trial=1 new    native=   0.543 ort=   0.148 ratio= 3.668 parity=PASS
+sm_bert_b8_s128              t=8   trial=1 base   native=   0.638 ort=   0.180 ratio= 3.553 parity=PASS
+sm_bert_b8_s128              t=8   trial=2 base   native=   0.583 ort=   0.134 ratio= 4.369 parity=PASS
+sm_bert_b8_s128              t=8   trial=2 new    native=   0.627 ort=   0.128 ratio= 4.890 parity=PASS
+sm_bert_b8_s128              t=8   trial=3 new    native=   0.548 ort=   0.140 ratio= 3.923 parity=PASS
+sm_bert_b8_s128              t=8   trial=3 base   native=   0.552 ort=   0.133 ratio= 4.145 parity=PASS
+sm_bert_b8_s128              t=8   trial=4 base   native=   0.716 ort=   0.190 ratio= 3.764 parity=PASS
+sm_bert_b8_s128              t=8   trial=4 new    native=   0.451 ort=   0.129 ratio= 3.490 parity=PASS
+sm_bert_b8_s128              t=16  trial=0 base   native=   1.025 ort=   0.120 ratio= 8.543 parity=PASS
+sm_bert_b8_s128              t=16  trial=0 new    native=   0.449 ort=   0.111 ratio= 4.049 parity=PASS
+sm_bert_b8_s128              t=16  trial=1 new    native=   0.408 ort=   0.105 ratio= 3.875 parity=PASS
+sm_bert_b8_s128              t=16  trial=1 base   native=   0.688 ort=   0.114 ratio= 6.046 parity=PASS
+sm_bert_b8_s128              t=16  trial=2 base   native=   0.768 ort=   0.107 ratio= 7.163 parity=PASS
+sm_bert_b8_s128              t=16  trial=2 new    native=   0.500 ort=   0.115 ratio= 4.330 parity=PASS
+sm_bert_b8_s128              t=16  trial=3 new    native=   0.565 ort=   0.102 ratio= 5.531 parity=PASS
+sm_bert_b8_s128              t=16  trial=3 base   native=   0.910 ort=   0.112 ratio= 8.096 parity=PASS
+sm_bert_b8_s128              t=16  trial=4 base   native=   0.698 ort=   0.111 ratio= 6.315 parity=PASS
+sm_bert_b8_s128              t=16  trial=4 new    native=   0.603 ort=   0.106 ratio= 5.686 parity=PASS
+sm_decode_h32_kv1024         t=1   trial=0 base   native=   0.024 ort=   0.018 ratio= 1.317 parity=PASS
+sm_decode_h32_kv1024         t=1   trial=0 new    native=   0.020 ort=   0.018 ratio= 1.157 parity=PASS
+sm_decode_h32_kv1024         t=1   trial=1 new    native=   0.020 ort=   0.017 ratio= 1.176 parity=PASS
+sm_decode_h32_kv1024         t=1   trial=1 base   native=   0.025 ort=   0.018 ratio= 1.373 parity=PASS
+sm_decode_h32_kv1024         t=1   trial=2 base   native=   0.028 ort=   0.018 ratio= 1.556 parity=PASS
+sm_decode_h32_kv1024         t=1   trial=2 new    native=   0.033 ort=   0.024 ratio= 1.384 parity=PASS
+sm_decode_h32_kv1024         t=1   trial=3 new    native=   0.027 ort=   0.024 ratio= 1.125 parity=PASS
+sm_decode_h32_kv1024         t=1   trial=3 base   native=   0.024 ort=   0.018 ratio= 1.352 parity=PASS
+sm_decode_h32_kv1024         t=1   trial=4 base   native=   0.024 ort=   0.018 ratio= 1.386 parity=PASS
+sm_decode_h32_kv1024         t=1   trial=4 new    native=   0.022 ort=   0.017 ratio= 1.286 parity=PASS
+sm_decode_h32_kv1024         t=8   trial=0 base   native=   0.029 ort=   0.013 ratio= 2.281 parity=PASS
+sm_decode_h32_kv1024         t=8   trial=0 new    native=   0.023 ort=   0.012 ratio= 1.959 parity=PASS
+sm_decode_h32_kv1024         t=8   trial=1 new    native=   0.020 ort=   0.012 ratio= 1.742 parity=PASS
+sm_decode_h32_kv1024         t=8   trial=1 base   native=   0.032 ort=   0.014 ratio= 2.324 parity=PASS
+sm_decode_h32_kv1024         t=8   trial=2 base   native=   0.032 ort=   0.015 ratio= 2.217 parity=PASS
+sm_decode_h32_kv1024         t=8   trial=2 new    native=   0.029 ort=   0.015 ratio= 1.958 parity=PASS
+sm_decode_h32_kv1024         t=8   trial=3 new    native=   0.023 ort=   0.012 ratio= 1.862 parity=PASS
+sm_decode_h32_kv1024         t=8   trial=3 base   native=   0.038 ort=   0.014 ratio= 2.625 parity=PASS
+sm_decode_h32_kv1024         t=8   trial=4 base   native=   0.026 ort=   0.012 ratio= 2.230 parity=PASS
+sm_decode_h32_kv1024         t=8   trial=4 new    native=   0.021 ort=   0.009 ratio= 2.244 parity=PASS
+sm_decode_h32_kv1024         t=16  trial=0 base   native=   0.038 ort=   0.015 ratio= 2.515 parity=PASS
+sm_decode_h32_kv1024         t=16  trial=0 new    native=   0.031 ort=   0.015 ratio= 2.055 parity=PASS
+sm_decode_h32_kv1024         t=16  trial=1 new    native=   0.029 ort=   0.014 ratio= 2.092 parity=PASS
+sm_decode_h32_kv1024         t=16  trial=1 base   native=   0.038 ort=   0.015 ratio= 2.605 parity=PASS
+sm_decode_h32_kv1024         t=16  trial=2 base   native=   0.024 ort=   0.012 ratio= 2.082 parity=PASS
+sm_decode_h32_kv1024         t=16  trial=2 new    native=   0.028 ort=   0.014 ratio= 2.049 parity=PASS
+sm_decode_h32_kv1024         t=16  trial=3 new    native=   0.027 ort=   0.013 ratio= 2.047 parity=PASS
+sm_decode_h32_kv1024         t=16  trial=3 base   native=   0.026 ort=   0.012 ratio= 2.076 parity=PASS
+sm_decode_h32_kv1024         t=16  trial=4 base   native=   0.033 ort=   0.014 ratio= 2.447 parity=PASS
+sm_decode_h32_kv1024         t=16  trial=4 new    native=   0.027 ort=   0.012 ratio= 2.225 parity=PASS
+sm_decode_h32_kv2048         t=1   trial=0 base   native=   0.048 ort=   0.033 ratio= 1.430 parity=PASS
+sm_decode_h32_kv2048         t=1   trial=0 new    native=   0.052 ort=   0.045 ratio= 1.161 parity=PASS
+sm_decode_h32_kv2048         t=1   trial=1 new    native=   0.051 ort=   0.045 ratio= 1.129 parity=PASS
+sm_decode_h32_kv2048         t=1   trial=1 base   native=   0.064 ort=   0.046 ratio= 1.389 parity=PASS
+sm_decode_h32_kv2048         t=1   trial=2 base   native=   0.065 ort=   0.047 ratio= 1.369 parity=PASS
+sm_decode_h32_kv2048         t=1   trial=2 new    native=   0.052 ort=   0.045 ratio= 1.170 parity=PASS
+sm_decode_h32_kv2048         t=1   trial=3 new    native=   0.039 ort=   0.033 ratio= 1.197 parity=PASS
+sm_decode_h32_kv2048         t=1   trial=3 base   native=   0.047 ort=   0.033 ratio= 1.459 parity=PASS
+sm_decode_h32_kv2048         t=1   trial=4 base   native=   0.060 ort=   0.042 ratio= 1.427 parity=PASS
+sm_decode_h32_kv2048         t=1   trial=4 new    native=   0.052 ort=   0.044 ratio= 1.168 parity=PASS
+sm_decode_h32_kv2048         t=8   trial=0 base   native=   0.055 ort=   0.016 ratio= 3.420 parity=PASS
+sm_decode_h32_kv2048         t=8   trial=0 new    native=   0.044 ort=   0.015 ratio= 2.868 parity=PASS
+sm_decode_h32_kv2048         t=8   trial=1 new    native=   0.053 ort=   0.018 ratio= 2.916 parity=PASS
+sm_decode_h32_kv2048         t=8   trial=1 base   native=   0.048 ort=   0.017 ratio= 2.864 parity=PASS
+sm_decode_h32_kv2048         t=8   trial=2 base   native=   0.062 ort=   0.021 ratio= 2.909 parity=PASS
+sm_decode_h32_kv2048         t=8   trial=2 new    native=   0.045 ort=   0.015 ratio= 3.001 parity=PASS
+sm_decode_h32_kv2048         t=8   trial=3 new    native=   0.061 ort=   0.017 ratio= 3.497 parity=PASS
+sm_decode_h32_kv2048         t=8   trial=3 base   native=   0.076 ort=   0.018 ratio= 4.194 parity=PASS
+sm_decode_h32_kv2048         t=8   trial=4 base   native=   0.047 ort=   0.012 ratio= 3.925 parity=PASS
+sm_decode_h32_kv2048         t=8   trial=4 new    native=   0.061 ort=   0.023 ratio= 2.617 parity=PASS
+sm_decode_h32_kv2048         t=16  trial=0 base   native=   0.062 ort=   0.017 ratio= 3.731 parity=PASS
+sm_decode_h32_kv2048         t=16  trial=0 new    native=   0.052 ort=   0.021 ratio= 2.521 parity=PASS
+sm_decode_h32_kv2048         t=16  trial=1 new    native=   0.051 ort=   0.017 ratio= 3.008 parity=PASS
+sm_decode_h32_kv2048         t=16  trial=1 base   native=   0.073 ort=   0.018 ratio= 4.033 parity=PASS
+sm_decode_h32_kv2048         t=16  trial=2 base   native=   0.064 ort=   0.018 ratio= 3.546 parity=PASS
+sm_decode_h32_kv2048         t=16  trial=2 new    native=   0.051 ort=   0.016 ratio= 3.137 parity=PASS
+sm_decode_h32_kv2048         t=16  trial=3 new    native=   0.050 ort=   0.017 ratio= 2.927 parity=PASS
+sm_decode_h32_kv2048         t=16  trial=3 base   native=   0.073 ort=   0.019 ratio= 3.807 parity=PASS
+sm_decode_h32_kv2048         t=16  trial=4 base   native=   0.076 ort=   0.019 ratio= 3.993 parity=PASS
+sm_decode_h32_kv2048         t=16  trial=4 new    native=   0.051 ort=   0.017 ratio= 2.915 parity=PASS
+sm_decode_h32_kv4096         t=1   trial=0 base   native=   0.092 ort=   0.063 ratio= 1.459 parity=PASS
+sm_decode_h32_kv4096         t=1   trial=0 new    native=   0.075 ort=   0.063 ratio= 1.184 parity=PASS
+sm_decode_h32_kv4096         t=1   trial=1 new    native=   0.075 ort=   0.063 ratio= 1.201 parity=PASS
+sm_decode_h32_kv4096         t=1   trial=1 base   native=   0.094 ort=   0.063 ratio= 1.486 parity=PASS
+sm_decode_h32_kv4096         t=1   trial=2 base   native=   0.092 ort=   0.063 ratio= 1.467 parity=PASS
+sm_decode_h32_kv4096         t=1   trial=2 new    native=   0.075 ort=   0.063 ratio= 1.205 parity=PASS
+sm_decode_h32_kv4096         t=1   trial=3 new    native=   0.076 ort=   0.063 ratio= 1.193 parity=PASS
+sm_decode_h32_kv4096         t=1   trial=3 base   native=   0.092 ort=   0.063 ratio= 1.458 parity=PASS
+sm_decode_h32_kv4096         t=1   trial=4 base   native=   0.093 ort=   0.063 ratio= 1.460 parity=PASS
+sm_decode_h32_kv4096         t=1   trial=4 new    native=   0.080 ort=   0.064 ratio= 1.257 parity=PASS
+sm_decode_h32_kv4096         t=8   trial=0 base   native=   0.105 ort=   0.017 ratio= 6.192 parity=PASS
+sm_decode_h32_kv4096         t=8   trial=0 new    native=   0.112 ort=   0.023 ratio= 4.917 parity=PASS
+sm_decode_h32_kv4096         t=8   trial=1 new    native=   0.089 ort=   0.020 ratio= 4.534 parity=PASS
+sm_decode_h32_kv4096         t=8   trial=1 base   native=   0.095 ort=   0.018 ratio= 5.188 parity=PASS
+sm_decode_h32_kv4096         t=8   trial=2 base   native=   0.096 ort=   0.017 ratio= 5.626 parity=PASS
+sm_decode_h32_kv4096         t=8   trial=2 new    native=   0.083 ort=   0.018 ratio= 4.514 parity=PASS
+sm_decode_h32_kv4096         t=8   trial=3 new    native=   0.099 ort=   0.024 ratio= 4.050 parity=PASS
+sm_decode_h32_kv4096         t=8   trial=3 base   native=   0.094 ort=   0.018 ratio= 5.099 parity=PASS
+sm_decode_h32_kv4096         t=8   trial=4 base   native=   0.093 ort=   0.018 ratio= 5.083 parity=PASS
+sm_decode_h32_kv4096         t=8   trial=4 new    native=   0.112 ort=   0.023 ratio= 4.862 parity=PASS
+sm_decode_h32_kv4096         t=16  trial=0 base   native=   0.120 ort=   0.020 ratio= 5.961 parity=PASS
+sm_decode_h32_kv4096         t=16  trial=0 new    native=   0.102 ort=   0.021 ratio= 4.866 parity=PASS
+sm_decode_h32_kv4096         t=16  trial=1 new    native=   0.100 ort=   0.021 ratio= 4.703 parity=PASS
+sm_decode_h32_kv4096         t=16  trial=1 base   native=   0.136 ort=   0.020 ratio= 6.675 parity=PASS
+sm_decode_h32_kv4096         t=16  trial=2 base   native=   0.131 ort=   0.025 ratio= 5.314 parity=PASS
+sm_decode_h32_kv4096         t=16  trial=2 new    native=   0.119 ort=   0.022 ratio= 5.450 parity=PASS
+sm_decode_h32_kv4096         t=16  trial=3 new    native=   0.106 ort=   0.021 ratio= 4.927 parity=PASS
+sm_decode_h32_kv4096         t=16  trial=3 base   native=   0.131 ort=   0.023 ratio= 5.637 parity=PASS
+sm_decode_h32_kv4096         t=16  trial=4 base   native=   0.134 ort=   0.022 ratio= 6.003 parity=PASS
+sm_decode_h32_kv4096         t=16  trial=4 new    native=   0.115 ort=   0.025 ratio= 4.681 parity=PASS
+sm_decode_h32_kv8192         t=1   trial=0 base   native=   0.186 ort=   0.121 ratio= 1.535 parity=PASS
+sm_decode_h32_kv8192         t=1   trial=0 new    native=   0.149 ort=   0.122 ratio= 1.220 parity=PASS
+sm_decode_h32_kv8192         t=1   trial=1 new    native=   0.146 ort=   0.119 ratio= 1.222 parity=PASS
+sm_decode_h32_kv8192         t=1   trial=1 base   native=   0.182 ort=   0.120 ratio= 1.516 parity=PASS
+sm_decode_h32_kv8192         t=1   trial=2 base   native=   0.184 ort=   0.123 ratio= 1.500 parity=PASS
+sm_decode_h32_kv8192         t=1   trial=2 new    native=   0.146 ort=   0.121 ratio= 1.211 parity=PASS
+sm_decode_h32_kv8192         t=1   trial=3 new    native=   0.150 ort=   0.120 ratio= 1.243 parity=PASS
+sm_decode_h32_kv8192         t=1   trial=3 base   native=   0.178 ort=   0.125 ratio= 1.425 parity=PASS
+sm_decode_h32_kv8192         t=1   trial=4 base   native=   0.180 ort=   0.120 ratio= 1.499 parity=PASS
+sm_decode_h32_kv8192         t=1   trial=4 new    native=   0.147 ort=   0.120 ratio= 1.221 parity=PASS
+sm_decode_h32_kv8192         t=8   trial=0 base   native=   0.229 ort=   0.037 ratio= 6.277 parity=PASS
+sm_decode_h32_kv8192         t=8   trial=0 new    native=   0.146 ort=   0.028 ratio= 5.239 parity=PASS
+sm_decode_h32_kv8192         t=8   trial=1 new    native=   0.149 ort=   0.025 ratio= 6.027 parity=PASS
+sm_decode_h32_kv8192         t=8   trial=1 base   native=   0.231 ort=   0.038 ratio= 6.049 parity=PASS
+sm_decode_h32_kv8192         t=8   trial=2 base   native=   0.228 ort=   0.036 ratio= 6.293 parity=PASS
+sm_decode_h32_kv8192         t=8   trial=2 new    native=   0.149 ort=   0.025 ratio= 5.981 parity=PASS
+sm_decode_h32_kv8192         t=8   trial=3 new    native=   0.190 ort=   0.037 ratio= 5.195 parity=PASS
+sm_decode_h32_kv8192         t=8   trial=3 base   native=   0.185 ort=   0.025 ratio= 7.299 parity=PASS
+sm_decode_h32_kv8192         t=8   trial=4 base   native=   0.225 ort=   0.037 ratio= 6.036 parity=PASS
+sm_decode_h32_kv8192         t=8   trial=4 new    native=   0.192 ort=   0.038 ratio= 5.050 parity=PASS
+sm_decode_h32_kv8192         t=16  trial=0 base   native=   0.232 ort=   0.030 ratio= 7.765 parity=PASS
+sm_decode_h32_kv8192         t=16  trial=0 new    native=   0.192 ort=   0.027 ratio= 7.099 parity=PASS
+sm_decode_h32_kv8192         t=16  trial=1 new    native=   0.189 ort=   0.029 ratio= 6.532 parity=PASS
+sm_decode_h32_kv8192         t=16  trial=1 base   native=   0.232 ort=   0.026 ratio= 8.943 parity=PASS
+sm_decode_h32_kv8192         t=16  trial=2 base   native=   0.226 ort=   0.031 ratio= 7.322 parity=PASS
+sm_decode_h32_kv8192         t=16  trial=2 new    native=   0.192 ort=   0.028 ratio= 6.961 parity=PASS
+sm_decode_h32_kv8192         t=16  trial=3 new    native=   0.191 ort=   0.029 ratio= 6.571 parity=PASS
+sm_decode_h32_kv8192         t=16  trial=3 base   native=   0.228 ort=   0.029 ratio= 7.912 parity=PASS
+sm_decode_h32_kv8192         t=16  trial=4 base   native=   0.229 ort=   0.030 ratio= 7.667 parity=PASS
+sm_decode_h32_kv8192         t=16  trial=4 new    native=   0.151 ort=   0.027 ratio= 5.593 parity=PASS
+sm_prefill_h32_s512          t=1   trial=0 base   native=   7.536 ort=   4.278 ratio= 1.761 parity=PASS
+sm_prefill_h32_s512          t=1   trial=0 new    native=   5.648 ort=   4.244 ratio= 1.331 parity=PASS
+sm_prefill_h32_s512          t=1   trial=1 new    native=   5.612 ort=   4.186 ratio= 1.341 parity=PASS
+sm_prefill_h32_s512          t=1   trial=1 base   native=   7.486 ort=   4.233 ratio= 1.768 parity=PASS
+sm_prefill_h32_s512          t=1   trial=2 base   native=   7.527 ort=   4.260 ratio= 1.767 parity=PASS
+sm_prefill_h32_s512          t=1   trial=2 new    native=   5.610 ort=   4.219 ratio= 1.330 parity=PASS
+sm_prefill_h32_s512          t=1   trial=3 new    native=   5.702 ort=   4.284 ratio= 1.331 parity=PASS
+sm_prefill_h32_s512          t=1   trial=3 base   native=   7.502 ort=   4.221 ratio= 1.777 parity=PASS
+sm_prefill_h32_s512          t=1   trial=4 base   native=   7.579 ort=   4.299 ratio= 1.763 parity=PASS
+sm_prefill_h32_s512          t=1   trial=4 new    native=   5.641 ort=   4.244 ratio= 1.329 parity=PASS
+sm_prefill_h32_s512          t=8   trial=0 base   native=   4.458 ort=   1.057 ratio= 4.218 parity=PASS
+sm_prefill_h32_s512          t=8   trial=0 new    native=   2.656 ort=   0.941 ratio= 2.822 parity=PASS
+sm_prefill_h32_s512          t=8   trial=1 new    native=   3.027 ort=   1.638 ratio= 1.848 parity=PASS
+sm_prefill_h32_s512          t=8   trial=1 base   native=   4.630 ort=   1.133 ratio= 4.086 parity=PASS
+sm_prefill_h32_s512          t=8   trial=2 base   native=   4.271 ort=   1.086 ratio= 3.933 parity=PASS
+sm_prefill_h32_s512          t=8   trial=2 new    native=   2.815 ort=   1.094 ratio= 2.574 parity=PASS
+sm_prefill_h32_s512          t=8   trial=3 new    native=   2.894 ort=   1.101 ratio= 2.629 parity=PASS
+sm_prefill_h32_s512          t=8   trial=3 base   native=   4.619 ort=   1.107 ratio= 4.173 parity=PASS
+sm_prefill_h32_s512          t=8   trial=4 base   native=   4.580 ort=   1.273 ratio= 3.598 parity=PASS
+sm_prefill_h32_s512          t=8   trial=4 new    native=   2.721 ort=   1.070 ratio= 2.544 parity=PASS
+sm_prefill_h32_s512          t=16  trial=0 base   native=   4.896 ort=   1.184 ratio= 4.134 parity=PASS
+sm_prefill_h32_s512          t=16  trial=0 new    native=   2.764 ort=   1.090 ratio= 2.536 parity=PASS
+sm_prefill_h32_s512          t=16  trial=1 new    native=   2.782 ort=   1.255 ratio= 2.217 parity=PASS
+sm_prefill_h32_s512          t=16  trial=1 base   native=   4.368 ort=   1.164 ratio= 3.752 parity=PASS
+sm_prefill_h32_s512          t=16  trial=2 base   native=   4.380 ort=   1.087 ratio= 4.030 parity=PASS
+sm_prefill_h32_s512          t=16  trial=2 new    native=   2.756 ort=   1.032 ratio= 2.671 parity=PASS
+sm_prefill_h32_s512          t=16  trial=3 new    native=   2.510 ort=   1.048 ratio= 2.394 parity=PASS
+sm_prefill_h32_s512          t=16  trial=3 base   native=   4.475 ort=   1.136 ratio= 3.940 parity=PASS
+sm_prefill_h32_s512          t=16  trial=4 base   native=   4.446 ort=   1.073 ratio= 4.145 parity=PASS
+sm_prefill_h32_s512          t=16  trial=4 new    native=   2.456 ort=   0.943 ratio= 2.605 parity=PASS
+sm_whisper_cross             t=1   trial=0 base   native=  44.417 ort=  26.540 ratio= 1.674 parity=PASS
+sm_whisper_cross             t=1   trial=0 new    native=  36.678 ort=  26.697 ratio= 1.374 parity=PASS
+sm_whisper_cross             t=1   trial=1 new    native=  36.645 ort=  26.822 ratio= 1.366 parity=PASS
+sm_whisper_cross             t=1   trial=1 base   native=  44.969 ort=  26.841 ratio= 1.675 parity=PASS
+sm_whisper_cross             t=1   trial=2 base   native=  44.964 ort=  26.661 ratio= 1.687 parity=PASS
+sm_whisper_cross             t=1   trial=2 new    native=  36.412 ort=  26.766 ratio= 1.360 parity=PASS
+sm_whisper_cross             t=1   trial=3 new    native=  36.482 ort=  26.712 ratio= 1.366 parity=PASS
+sm_whisper_cross             t=1   trial=3 base   native=  44.791 ort=  26.597 ratio= 1.684 parity=PASS
+sm_whisper_cross             t=1   trial=4 base   native=  44.788 ort=  26.701 ratio= 1.677 parity=PASS
+sm_whisper_cross             t=1   trial=4 new    native=  36.491 ort=  26.860 ratio= 1.359 parity=PASS
+sm_whisper_cross             t=8   trial=0 base   native=  25.061 ort=   4.992 ratio= 5.021 parity=PASS
+sm_whisper_cross             t=8   trial=0 new    native=  18.158 ort=   6.011 ratio= 3.021 parity=PASS
+sm_whisper_cross             t=8   trial=1 new    native=  18.435 ort=   8.330 ratio= 2.213 parity=PASS
+sm_whisper_cross             t=8   trial=1 base   native=  25.235 ort=   5.869 ratio= 4.299 parity=PASS
+sm_whisper_cross             t=8   trial=2 base   native=  26.222 ort=   6.046 ratio= 4.337 parity=PASS
+sm_whisper_cross             t=8   trial=2 new    native=  18.427 ort=   4.868 ratio= 3.786 parity=PASS
+sm_whisper_cross             t=8   trial=3 new    native=  15.872 ort=   5.561 ratio= 2.854 parity=PASS
+sm_whisper_cross             t=8   trial=3 base   native=  26.744 ort=   4.932 ratio= 5.423 parity=PASS
+sm_whisper_cross             t=8   trial=4 base   native=  25.360 ort=   5.495 ratio= 4.615 parity=PASS
+sm_whisper_cross             t=8   trial=4 new    native=  18.391 ort=   5.628 ratio= 3.268 parity=PASS
+sm_whisper_cross             t=16  trial=0 base   native=  24.920 ort=   5.934 ratio= 4.199 parity=PASS
+sm_whisper_cross             t=16  trial=0 new    native=  15.051 ort=   5.647 ratio= 2.665 parity=PASS
+sm_whisper_cross             t=16  trial=1 new    native=  14.986 ort=   5.912 ratio= 2.535 parity=PASS
+sm_whisper_cross             t=16  trial=1 base   native=  24.575 ort=   6.171 ratio= 3.982 parity=PASS
+sm_whisper_cross             t=16  trial=2 base   native=  24.594 ort=   5.582 ratio= 4.406 parity=PASS
+sm_whisper_cross             t=16  trial=2 new    native=  15.258 ort=   5.907 ratio= 2.583 parity=PASS
+sm_whisper_cross             t=16  trial=3 new    native=  15.574 ort=   6.934 ratio= 2.246 parity=PASS
+sm_whisper_cross             t=16  trial=3 base   native=  24.612 ort=   5.598 ratio= 4.397 parity=PASS
+sm_whisper_cross             t=16  trial=4 base   native=  24.143 ort=   5.403 ratio= 4.468 parity=PASS
+sm_whisper_cross             t=16  trial=4 new    native=  15.084 ort=   5.948 ratio= 2.536 parity=PASS
+tr_bert_b8_s128              t=1   trial=0 base   native=   0.210 ort=   0.192 ratio= 1.093 parity=PASS
+tr_bert_b8_s128              t=1   trial=0 new    native=   0.114 ort=   0.189 ratio= 0.602 parity=PASS
+tr_bert_b8_s128              t=1   trial=1 new    native=   0.116 ort=   0.189 ratio= 0.614 parity=PASS
+tr_bert_b8_s128              t=1   trial=1 base   native=   0.217 ort=   0.193 ratio= 1.128 parity=PASS
+tr_bert_b8_s128              t=1   trial=2 base   native=   0.806 ort=   0.192 ratio= 4.206 parity=PASS
+tr_bert_b8_s128              t=1   trial=2 new    native=   0.123 ort=   0.189 ratio= 0.650 parity=PASS
+tr_bert_b8_s128              t=1   trial=3 new    native=   0.185 ort=   0.279 ratio= 0.662 parity=PASS
+tr_bert_b8_s128              t=1   trial=3 base   native=   0.215 ort=   0.190 ratio= 1.132 parity=PASS
+tr_bert_b8_s128              t=1   trial=4 base   native=   0.257 ort=   0.192 ratio= 1.337 parity=PASS
+tr_bert_b8_s128              t=1   trial=4 new    native=   0.171 ort=   0.192 ratio= 0.890 parity=PASS
+tr_bert_b8_s128              t=8   trial=0 base   native=   0.449 ort=   0.133 ratio= 3.366 parity=PASS
+tr_bert_b8_s128              t=8   trial=0 new    native=   0.217 ort=   0.157 ratio= 1.385 parity=PASS
+tr_bert_b8_s128              t=8   trial=1 new    native=   0.129 ort=   0.141 ratio= 0.917 parity=PASS
+tr_bert_b8_s128              t=8   trial=1 base   native=   0.345 ort=   0.147 ratio= 2.342 parity=PASS
+tr_bert_b8_s128              t=8   trial=2 base   native=   0.368 ort=   0.144 ratio= 2.561 parity=PASS
+tr_bert_b8_s128              t=8   trial=2 new    native=   0.252 ort=   0.139 ratio= 1.809 parity=PASS
+tr_bert_b8_s128              t=8   trial=3 new    native=   0.150 ort=   0.142 ratio= 1.055 parity=PASS
+tr_bert_b8_s128              t=8   trial=3 base   native=   0.421 ort=   0.143 ratio= 2.933 parity=PASS
+tr_bert_b8_s128              t=8   trial=4 base   native=   0.592 ort=   0.097 ratio= 6.075 parity=PASS
+tr_bert_b8_s128              t=8   trial=4 new    native=   0.549 ort=   0.140 ratio= 3.921 parity=PASS
+tr_bert_b8_s128              t=16  trial=0 base   native=   0.530 ort=   0.140 ratio= 3.791 parity=PASS
+tr_bert_b8_s128              t=16  trial=0 new    native=   0.229 ort=   0.143 ratio= 1.604 parity=PASS
+tr_bert_b8_s128              t=16  trial=1 new    native=   0.301 ort=   0.135 ratio= 2.234 parity=PASS
+tr_bert_b8_s128              t=16  trial=1 base   native=   0.659 ort=   0.101 ratio= 6.526 parity=PASS
+tr_bert_b8_s128              t=16  trial=2 base   native=   0.663 ort=   0.130 ratio= 5.108 parity=PASS
+tr_bert_b8_s128              t=16  trial=2 new    native=   0.356 ort=   0.112 ratio= 3.191 parity=PASS
+tr_bert_b8_s128              t=16  trial=3 new    native=   0.195 ort=   0.108 ratio= 1.803 parity=PASS
+tr_bert_b8_s128              t=16  trial=3 base   native=   0.662 ort=   0.128 ratio= 5.178 parity=PASS
+tr_bert_b8_s128              t=16  trial=4 base   native=   0.565 ort=   0.132 ratio= 4.279 parity=PASS
+tr_bert_b8_s128              t=16  trial=4 new    native=   0.543 ort=   0.134 ratio= 4.047 parity=PASS
+tr_llama3_s512               t=1   trial=0 base   native=   0.891 ort=   0.742 ratio= 1.201 parity=PASS
+tr_llama3_s512               t=1   trial=0 new    native=   0.559 ort=   0.611 ratio= 0.916 parity=PASS
+tr_llama3_s512               t=1   trial=1 new    native=   1.829 ort=   0.786 ratio= 2.327 parity=PASS
+tr_llama3_s512               t=1   trial=1 base   native=   0.971 ort=   0.810 ratio= 1.199 parity=PASS
+tr_llama3_s512               t=1   trial=2 base   native=   0.904 ort=   0.756 ratio= 1.195 parity=PASS
+tr_llama3_s512               t=1   trial=2 new    native=   0.571 ort=   0.625 ratio= 0.913 parity=PASS
+tr_llama3_s512               t=1   trial=3 new    native=   0.604 ort=   0.630 ratio= 0.959 parity=PASS
+tr_llama3_s512               t=1   trial=3 base   native=   0.865 ort=   0.814 ratio= 1.063 parity=PASS
+tr_llama3_s512               t=1   trial=4 base   native=   0.812 ort=   0.817 ratio= 0.994 parity=PASS
+tr_llama3_s512               t=1   trial=4 new    native=   0.659 ort=   0.695 ratio= 0.948 parity=PASS
+tr_llama3_s512               t=8   trial=0 base   native=   0.412 ort=   0.116 ratio= 3.539 parity=PASS
+tr_llama3_s512               t=8   trial=0 new    native=   0.252 ort=   0.093 ratio= 2.696 parity=PASS
+tr_llama3_s512               t=8   trial=1 new    native=   0.207 ort=   0.100 ratio= 2.080 parity=PASS
+tr_llama3_s512               t=8   trial=1 base   native=   0.584 ort=   0.138 ratio= 4.244 parity=PASS
+tr_llama3_s512               t=8   trial=2 base   native=   0.768 ort=   0.171 ratio= 4.491 parity=PASS
+tr_llama3_s512               t=8   trial=2 new    native=   0.310 ort=   0.104 ratio= 2.973 parity=PASS
+tr_llama3_s512               t=8   trial=3 new    native=   0.455 ort=   0.133 ratio= 3.432 parity=PASS
+tr_llama3_s512               t=8   trial=3 base   native=   0.450 ort=   0.128 ratio= 3.526 parity=PASS
+tr_llama3_s512               t=8   trial=4 base   native=   0.469 ort=   0.143 ratio= 3.277 parity=PASS
+tr_llama3_s512               t=8   trial=4 new    native=   0.489 ort=   0.117 ratio= 4.170 parity=PASS
+tr_llama3_s512               t=16  trial=0 base   native=   1.478 ort=   0.141 ratio=10.492 parity=PASS
+tr_llama3_s512               t=16  trial=0 new    native=   0.672 ort=   0.098 ratio= 6.886 parity=PASS
+tr_llama3_s512               t=16  trial=1 new    native=   0.338 ort=   0.098 ratio= 3.459 parity=PASS
+tr_llama3_s512               t=16  trial=1 base   native=   1.593 ort=   0.156 ratio=10.233 parity=PASS
+tr_llama3_s512               t=16  trial=2 base   native=   0.878 ort=   0.118 ratio= 7.462 parity=PASS
+tr_llama3_s512               t=16  trial=2 new    native=   0.313 ort=   0.083 ratio= 3.778 parity=PASS
+tr_llama3_s512               t=16  trial=3 new    native=   0.317 ort=   0.085 ratio= 3.740 parity=PASS
+tr_llama3_s512               t=16  trial=3 base   native=   0.812 ort=   0.126 ratio= 6.466 parity=PASS
+tr_llama3_s512               t=16  trial=4 base   native=   0.587 ort=   0.106 ratio= 5.556 parity=PASS
+tr_llama3_s512               t=16  trial=4 new    native=   0.295 ort=   0.076 ratio= 3.893 parity=PASS
+tr_whisper_s1500             t=1   trial=0 base   native=   0.874 ort=   0.588 ratio= 1.485 parity=PASS
+tr_whisper_s1500             t=1   trial=0 new    native=   0.521 ort=   0.529 ratio= 0.985 parity=PASS
+tr_whisper_s1500             t=1   trial=1 new    native=   0.464 ort=   0.520 ratio= 0.892 parity=PASS
+tr_whisper_s1500             t=1   trial=1 base   native=   0.802 ort=   0.580 ratio= 1.383 parity=PASS
+tr_whisper_s1500             t=1   trial=2 base   native=   0.856 ort=   0.571 ratio= 1.500 parity=PASS
+tr_whisper_s1500             t=1   trial=2 new    native=   0.553 ort=   0.545 ratio= 1.015 parity=PASS
+tr_whisper_s1500             t=1   trial=3 new    native=   0.475 ort=   0.511 ratio= 0.930 parity=PASS
+tr_whisper_s1500             t=1   trial=3 base   native=   0.824 ort=   0.691 ratio= 1.192 parity=PASS
+tr_whisper_s1500             t=1   trial=4 base   native=   0.755 ort=   0.634 ratio= 1.191 parity=PASS
+tr_whisper_s1500             t=1   trial=4 new    native=   0.676 ort=   0.552 ratio= 1.225 parity=PASS
+tr_whisper_s1500             t=8   trial=0 base   native=   0.480 ort=   0.140 ratio= 3.415 parity=PASS
+tr_whisper_s1500             t=8   trial=0 new    native=   0.172 ort=   0.108 ratio= 1.590 parity=PASS
+tr_whisper_s1500             t=8   trial=1 new    native=   0.259 ort=   0.113 ratio= 2.296 parity=PASS
+tr_whisper_s1500             t=8   trial=1 base   native=   0.418 ort=   0.135 ratio= 3.092 parity=PASS
+tr_whisper_s1500             t=8   trial=2 base   native=   0.391 ort=   0.103 ratio= 3.810 parity=PASS
+tr_whisper_s1500             t=8   trial=2 new    native=   0.161 ort=   0.098 ratio= 1.635 parity=PASS
+tr_whisper_s1500             t=8   trial=3 new    native=   0.223 ort=   0.100 ratio= 2.243 parity=PASS
+tr_whisper_s1500             t=8   trial=3 base   native=   0.446 ort=   0.113 ratio= 3.939 parity=PASS
+tr_whisper_s1500             t=8   trial=4 base   native=   0.501 ort=   0.139 ratio= 3.607 parity=PASS
+tr_whisper_s1500             t=8   trial=4 new    native=   0.247 ort=   0.104 ratio= 2.381 parity=PASS
+tr_whisper_s1500             t=16  trial=0 base   native=   0.740 ort=   0.111 ratio= 6.689 parity=PASS
+tr_whisper_s1500             t=16  trial=0 new    native=   0.511 ort=   0.114 ratio= 4.484 parity=PASS
+tr_whisper_s1500             t=16  trial=1 new    native=   0.465 ort=   0.090 ratio= 5.168 parity=PASS
+tr_whisper_s1500             t=16  trial=1 base   native=   0.634 ort=   0.100 ratio= 6.365 parity=PASS
+tr_whisper_s1500             t=16  trial=2 base   native=   0.565 ort=   0.115 ratio= 4.896 parity=PASS
+tr_whisper_s1500             t=16  trial=2 new    native=   0.589 ort=   0.092 ratio= 6.376 parity=PASS
+tr_whisper_s1500             t=16  trial=3 new    native=   0.270 ort=   0.092 ratio= 2.938 parity=PASS
+tr_whisper_s1500             t=16  trial=3 base   native=   0.684 ort=   0.117 ratio= 5.851 parity=PASS
+tr_whisper_s1500             t=16  trial=4 base   native=   0.706 ort=   0.122 ratio= 5.764 parity=PASS
+tr_whisper_s1500             t=16  trial=4 new    native=   0.591 ort=   0.094 ratio= 6.308 parity=PASS
+kvcat_llama3_b8_p2047        t=1   trial=0 base   native=  14.656 ort=   7.818 ratio= 1.875 parity=PASS
+kvcat_llama3_b8_p2047        t=1   trial=0 new    native=   7.431 ort=   7.935 ratio= 0.936 parity=PASS
+kvcat_llama3_b8_p2047        t=1   trial=1 new    native=   7.377 ort=   7.866 ratio= 0.938 parity=PASS
+kvcat_llama3_b8_p2047        t=1   trial=1 base   native=  14.823 ort=   7.834 ratio= 1.892 parity=PASS
+kvcat_llama3_b8_p2047        t=1   trial=2 base   native=  15.006 ort=   7.893 ratio= 1.901 parity=PASS
+kvcat_llama3_b8_p2047        t=1   trial=2 new    native=   7.529 ort=   8.097 ratio= 0.930 parity=PASS
+kvcat_llama3_b8_p2047        t=1   trial=3 new    native=   7.392 ort=   7.879 ratio= 0.938 parity=PASS
+kvcat_llama3_b8_p2047        t=1   trial=3 base   native=  14.602 ort=   7.827 ratio= 1.866 parity=PASS
+kvcat_llama3_b8_p2047        t=1   trial=4 base   native=  15.428 ort=   8.171 ratio= 1.888 parity=PASS
+kvcat_llama3_b8_p2047        t=1   trial=4 new    native=   7.546 ort=   8.027 ratio= 0.940 parity=PASS
+kvcat_llama3_b8_p2047        t=8   trial=0 base   native=  14.891 ort=   3.364 ratio= 4.426 parity=PASS
+kvcat_llama3_b8_p2047        t=8   trial=0 new    native=   7.915 ort=   3.301 ratio= 2.398 parity=PASS
+kvcat_llama3_b8_p2047        t=8   trial=1 new    native=   7.526 ort=   3.369 ratio= 2.234 parity=PASS
+kvcat_llama3_b8_p2047        t=8   trial=1 base   native=  14.912 ort=   3.419 ratio= 4.362 parity=PASS
+kvcat_llama3_b8_p2047        t=8   trial=2 base   native=  14.971 ort=   3.374 ratio= 4.438 parity=PASS
+kvcat_llama3_b8_p2047        t=8   trial=2 new    native=   7.552 ort=   3.258 ratio= 2.318 parity=PASS
+kvcat_llama3_b8_p2047        t=8   trial=3 new    native=   7.613 ort=   3.261 ratio= 2.334 parity=PASS
+kvcat_llama3_b8_p2047        t=8   trial=3 base   native=  14.746 ort=   3.310 ratio= 4.455 parity=PASS
+kvcat_llama3_b8_p2047        t=8   trial=4 base   native=  14.618 ort=   3.448 ratio= 4.240 parity=PASS
+kvcat_llama3_b8_p2047        t=8   trial=4 new    native=   7.491 ort=   3.386 ratio= 2.213 parity=PASS
+kvcat_llama3_b8_p2047        t=16  trial=0 base   native=  15.174 ort=   3.611 ratio= 4.202 parity=PASS
+kvcat_llama3_b8_p2047        t=16  trial=0 new    native=   7.817 ort=   3.546 ratio= 2.204 parity=PASS
+kvcat_llama3_b8_p2047        t=16  trial=1 new    native=   7.441 ort=   3.423 ratio= 2.174 parity=PASS
+kvcat_llama3_b8_p2047        t=16  trial=1 base   native=  15.003 ort=   3.484 ratio= 4.306 parity=PASS
+kvcat_llama3_b8_p2047        t=16  trial=2 base   native=  15.159 ort=   3.701 ratio= 4.096 parity=PASS
+kvcat_llama3_b8_p2047        t=16  trial=2 new    native=   7.342 ort=   3.583 ratio= 2.049 parity=PASS
+kvcat_llama3_b8_p2047        t=16  trial=3 new    native=   7.761 ort=   3.449 ratio= 2.250 parity=PASS
+kvcat_llama3_b8_p2047        t=16  trial=3 base   native=  14.554 ort=   3.609 ratio= 4.032 parity=PASS
+kvcat_llama3_b8_p2047        t=16  trial=4 base   native=  14.885 ort=   3.706 ratio= 4.017 parity=PASS
+kvcat_llama3_b8_p2047        t=16  trial=4 new    native=   7.795 ort=   3.431 ratio= 2.272 parity=PASS
+kvcat_llama3_p1023           t=1   trial=0 base   native=   0.720 ort=   0.390 ratio= 1.844 parity=PASS
+kvcat_llama3_p1023           t=1   trial=0 new    native=   0.383 ort=   0.334 ratio= 1.146 parity=PASS
+kvcat_llama3_p1023           t=1   trial=1 new    native=   0.332 ort=   0.324 ratio= 1.026 parity=PASS
+kvcat_llama3_p1023           t=1   trial=1 base   native=   0.703 ort=   0.372 ratio= 1.889 parity=PASS
+kvcat_llama3_p1023           t=1   trial=2 base   native=   0.743 ort=   0.407 ratio= 1.826 parity=PASS
+kvcat_llama3_p1023           t=1   trial=2 new    native=   0.363 ort=   0.338 ratio= 1.076 parity=PASS
+kvcat_llama3_p1023           t=1   trial=3 new    native=   0.356 ort=   0.330 ratio= 1.081 parity=PASS
+kvcat_llama3_p1023           t=1   trial=3 base   native=   0.744 ort=   0.395 ratio= 1.881 parity=PASS
+kvcat_llama3_p1023           t=1   trial=4 base   native=   0.700 ort=   0.410 ratio= 1.707 parity=PASS
+kvcat_llama3_p1023           t=1   trial=4 new    native=   0.392 ort=   0.338 ratio= 1.160 parity=PASS
+kvcat_llama3_p1023           t=8   trial=0 base   native=   0.601 ort=   0.105 ratio= 5.731 parity=PASS
+kvcat_llama3_p1023           t=8   trial=0 new    native=   0.316 ort=   0.121 ratio= 2.618 parity=PASS
+kvcat_llama3_p1023           t=8   trial=1 new    native=   0.360 ort=   0.136 ratio= 2.644 parity=PASS
+kvcat_llama3_p1023           t=8   trial=1 base   native=   0.680 ort=   0.119 ratio= 5.699 parity=PASS
+kvcat_llama3_p1023           t=8   trial=2 base   native=   0.707 ort=   0.136 ratio= 5.214 parity=PASS
+kvcat_llama3_p1023           t=8   trial=2 new    native=   0.306 ort=   0.075 ratio= 4.052 parity=PASS
+kvcat_llama3_p1023           t=8   trial=3 new    native=   0.289 ort=   0.105 ratio= 2.751 parity=PASS
+kvcat_llama3_p1023           t=8   trial=3 base   native=   0.696 ort=   0.117 ratio= 5.939 parity=PASS
+kvcat_llama3_p1023           t=8   trial=4 base   native=   0.609 ort=   0.124 ratio= 4.899 parity=PASS
+kvcat_llama3_p1023           t=8   trial=4 new    native=   0.323 ort=   0.093 ratio= 3.463 parity=PASS
+kvcat_llama3_p1023           t=16  trial=0 base   native=   0.747 ort=   0.158 ratio= 4.738 parity=PASS
+kvcat_llama3_p1023           t=16  trial=0 new    native=   0.319 ort=   0.105 ratio= 3.029 parity=PASS
+kvcat_llama3_p1023           t=16  trial=1 new    native=   0.328 ort=   0.111 ratio= 2.942 parity=PASS
+kvcat_llama3_p1023           t=16  trial=1 base   native=   0.753 ort=   0.145 ratio= 5.186 parity=PASS
+kvcat_llama3_p1023           t=16  trial=2 base   native=   0.679 ort=   0.104 ratio= 6.516 parity=PASS
+kvcat_llama3_p1023           t=16  trial=2 new    native=   0.321 ort=   0.105 ratio= 3.055 parity=PASS
+kvcat_llama3_p1023           t=16  trial=3 new    native=   0.334 ort=   0.091 ratio= 3.675 parity=PASS
+kvcat_llama3_p1023           t=16  trial=3 base   native=   0.720 ort=   0.145 ratio= 4.971 parity=PASS
+kvcat_llama3_p1023           t=16  trial=4 base   native=   0.672 ort=   0.119 ratio= 5.660 parity=PASS
+kvcat_llama3_p1023           t=16  trial=4 new    native=   0.292 ort=   0.079 ratio= 3.685 parity=PASS
+kvcat_llama3_p2047           t=1   trial=0 base   native=   1.676 ort=   0.948 ratio= 1.767 parity=PASS
+kvcat_llama3_p2047           t=1   trial=0 new    native=   0.775 ort=   0.802 ratio= 0.966 parity=PASS
+kvcat_llama3_p2047           t=1   trial=1 new    native=   0.720 ort=   0.776 ratio= 0.927 parity=PASS
+kvcat_llama3_p2047           t=1   trial=1 base   native=   1.811 ort=   0.947 ratio= 1.912 parity=PASS
+kvcat_llama3_p2047           t=1   trial=2 base   native=   1.595 ort=   0.859 ratio= 1.858 parity=PASS
+kvcat_llama3_p2047           t=1   trial=2 new    native=   0.721 ort=   0.797 ratio= 0.905 parity=PASS
+kvcat_llama3_p2047           t=1   trial=3 new    native=   0.848 ort=   0.818 ratio= 1.036 parity=PASS
+kvcat_llama3_p2047           t=1   trial=3 base   native=   1.726 ort=   0.937 ratio= 1.842 parity=PASS
+kvcat_llama3_p2047           t=1   trial=4 base   native=   1.603 ort=   0.881 ratio= 1.819 parity=PASS
+kvcat_llama3_p2047           t=1   trial=4 new    native=   0.746 ort=   0.763 ratio= 0.978 parity=PASS
+kvcat_llama3_p2047           t=8   trial=0 base   native=   1.678 ort=   0.303 ratio= 5.547 parity=PASS
+kvcat_llama3_p2047           t=8   trial=0 new    native=   0.728 ort=   0.199 ratio= 3.649 parity=PASS
+kvcat_llama3_p2047           t=8   trial=1 new    native=   0.814 ort=   0.247 ratio= 3.295 parity=PASS
+kvcat_llama3_p2047           t=8   trial=1 base   native=   1.679 ort=   0.356 ratio= 4.721 parity=PASS
+kvcat_llama3_p2047           t=8   trial=2 base   native=   1.705 ort=   0.314 ratio= 5.423 parity=PASS
+kvcat_llama3_p2047           t=8   trial=2 new    native=   0.808 ort=   0.202 ratio= 4.003 parity=PASS
+kvcat_llama3_p2047           t=8   trial=3 new    native=   0.741 ort=   0.257 ratio= 2.885 parity=PASS
+kvcat_llama3_p2047           t=8   trial=3 base   native=   1.986 ort=   0.512 ratio= 3.875 parity=PASS
+kvcat_llama3_p2047           t=8   trial=4 base   native=   1.785 ort=   0.316 ratio= 5.642 parity=PASS
+kvcat_llama3_p2047           t=8   trial=4 new    native=   0.874 ort=   0.304 ratio= 2.879 parity=PASS
+kvcat_llama3_p2047           t=16  trial=0 base   native=   1.947 ort=   0.289 ratio= 6.745 parity=PASS
+kvcat_llama3_p2047           t=16  trial=0 new    native=   0.801 ort=   0.172 ratio= 4.664 parity=PASS
+kvcat_llama3_p2047           t=16  trial=1 new    native=   0.823 ort=   0.207 ratio= 3.984 parity=PASS
+kvcat_llama3_p2047           t=16  trial=1 base   native=   1.873 ort=   0.247 ratio= 7.571 parity=PASS
+kvcat_llama3_p2047           t=16  trial=2 base   native=   1.872 ort=   0.251 ratio= 7.459 parity=PASS
+kvcat_llama3_p2047           t=16  trial=2 new    native=   0.801 ort=   0.156 ratio= 5.133 parity=PASS
+kvcat_llama3_p2047           t=16  trial=3 new    native=   0.831 ort=   0.198 ratio= 4.202 parity=PASS
+kvcat_llama3_p2047           t=16  trial=3 base   native=   1.943 ort=   0.287 ratio= 6.774 parity=PASS
+kvcat_llama3_p2047           t=16  trial=4 base   native=   2.614 ort=   0.266 ratio= 9.834 parity=PASS
+kvcat_llama3_p2047           t=16  trial=4 new    native=   0.731 ort=   0.181 ratio= 4.042 parity=PASS
+kvcat_llama3_p4095           t=1   trial=0 base   native=   5.366 ort=   1.902 ratio= 2.821 parity=PASS
+kvcat_llama3_p4095           t=1   trial=0 new    native=   3.509 ort=   1.828 ratio= 1.920 parity=PASS
+kvcat_llama3_p4095           t=1   trial=1 new    native=   3.296 ort=   1.852 ratio= 1.780 parity=PASS
+kvcat_llama3_p4095           t=1   trial=1 base   native=   5.353 ort=   1.951 ratio= 2.744 parity=PASS
+kvcat_llama3_p4095           t=1   trial=2 base   native=   5.285 ort=   1.893 ratio= 2.793 parity=PASS
+kvcat_llama3_p4095           t=1   trial=2 new    native=   3.277 ort=   1.794 ratio= 1.827 parity=PASS
+kvcat_llama3_p4095           t=1   trial=3 new    native=   4.042 ort=   1.864 ratio= 2.168 parity=PASS
+kvcat_llama3_p4095           t=1   trial=3 base   native=   5.860 ort=   2.009 ratio= 2.917 parity=PASS
+kvcat_llama3_p4095           t=1   trial=4 base   native=   5.428 ort=   1.894 ratio= 2.866 parity=PASS
+kvcat_llama3_p4095           t=1   trial=4 new    native=   3.434 ort=   1.821 ratio= 1.885 parity=PASS
+kvcat_llama3_p4095           t=8   trial=0 base   native=   3.503 ort=   0.749 ratio= 4.675 parity=PASS
+kvcat_llama3_p4095           t=8   trial=0 new    native=   3.268 ort=   0.692 ratio= 4.724 parity=PASS
+kvcat_llama3_p4095           t=8   trial=1 new    native=   3.317 ort=   0.783 ratio= 4.236 parity=PASS
+kvcat_llama3_p4095           t=8   trial=1 base   native=   5.856 ort=   0.753 ratio= 7.783 parity=PASS
+kvcat_llama3_p4095           t=8   trial=2 base   native=   5.404 ort=   0.789 ratio= 6.846 parity=PASS
+kvcat_llama3_p4095           t=8   trial=2 new    native=   3.452 ort=   0.815 ratio= 4.238 parity=PASS
+kvcat_llama3_p4095           t=8   trial=3 new    native=   1.847 ort=   0.743 ratio= 2.486 parity=PASS
+kvcat_llama3_p4095           t=8   trial=3 base   native=   5.767 ort=   0.784 ratio= 7.352 parity=PASS
+kvcat_llama3_p4095           t=8   trial=4 base   native=   5.563 ort=   0.786 ratio= 7.080 parity=PASS
+kvcat_llama3_p4095           t=8   trial=4 new    native=   1.670 ort=   0.671 ratio= 2.488 parity=PASS
+kvcat_llama3_p4095           t=16  trial=0 base   native=   3.875 ort=   0.740 ratio= 5.234 parity=PASS
+kvcat_llama3_p4095           t=16  trial=0 new    native=   1.939 ort=   0.699 ratio= 2.775 parity=PASS
+kvcat_llama3_p4095           t=16  trial=1 new    native=   3.783 ort=   0.730 ratio= 5.181 parity=PASS
+kvcat_llama3_p4095           t=16  trial=1 base   native=   3.724 ort=   0.706 ratio= 5.274 parity=PASS
+kvcat_llama3_p4095           t=16  trial=2 base   native=   5.881 ort=   0.760 ratio= 7.737 parity=PASS
+kvcat_llama3_p4095           t=16  trial=2 new    native=   3.921 ort=   0.831 ratio= 4.718 parity=PASS
+kvcat_llama3_p4095           t=16  trial=3 new    native=   3.980 ort=   0.738 ratio= 5.393 parity=PASS
+kvcat_llama3_p4095           t=16  trial=3 base   native=   5.972 ort=   0.867 ratio= 6.886 parity=PASS
+kvcat_llama3_p4095           t=16  trial=4 base   native=   3.690 ort=   0.723 ratio= 5.102 parity=PASS
+kvcat_llama3_p4095           t=16  trial=4 new    native=   3.379 ort=   0.665 ratio= 5.079 parity=PASS
+kvcat_llama3_p8191           t=1   trial=0 base   native=   7.487 ort=   3.776 ratio= 1.983 parity=PASS
+kvcat_llama3_p8191           t=1   trial=0 new    native=   3.747 ort=   3.779 ratio= 0.992 parity=PASS
+kvcat_llama3_p8191           t=1   trial=1 new    native=   3.711 ort=   3.789 ratio= 0.979 parity=PASS
+kvcat_llama3_p8191           t=1   trial=1 base   native=   7.373 ort=   3.751 ratio= 1.966 parity=PASS
+kvcat_llama3_p8191           t=1   trial=2 base   native=   7.476 ort=   3.792 ratio= 1.971 parity=PASS
+kvcat_llama3_p8191           t=1   trial=2 new    native=   3.846 ort=   3.780 ratio= 1.018 parity=PASS
+kvcat_llama3_p8191           t=1   trial=3 new    native=   3.774 ort=   3.774 ratio= 1.000 parity=PASS
+kvcat_llama3_p8191           t=1   trial=3 base   native=   7.477 ort=   3.778 ratio= 1.979 parity=PASS
+kvcat_llama3_p8191           t=1   trial=4 base   native=   7.425 ort=   3.769 ratio= 1.970 parity=PASS
+kvcat_llama3_p8191           t=1   trial=4 new    native=   3.755 ort=   3.727 ratio= 1.008 parity=PASS
+kvcat_llama3_p8191           t=8   trial=0 base   native=   7.327 ort=   1.654 ratio= 4.430 parity=PASS
+kvcat_llama3_p8191           t=8   trial=0 new    native=   3.779 ort=   1.563 ratio= 2.417 parity=PASS
+kvcat_llama3_p8191           t=8   trial=1 new    native=   3.775 ort=   1.584 ratio= 2.384 parity=PASS
+kvcat_llama3_p8191           t=8   trial=1 base   native=   7.256 ort=   1.620 ratio= 4.479 parity=PASS
+kvcat_llama3_p8191           t=8   trial=2 base   native=   7.259 ort=   1.746 ratio= 4.158 parity=PASS
+kvcat_llama3_p8191           t=8   trial=2 new    native=   3.578 ort=   1.412 ratio= 2.533 parity=PASS
+kvcat_llama3_p8191           t=8   trial=3 new    native=   3.578 ort=   1.871 ratio= 1.913 parity=PASS
+kvcat_llama3_p8191           t=8   trial=3 base   native=   7.194 ort=   1.725 ratio= 4.170 parity=PASS
+kvcat_llama3_p8191           t=8   trial=4 base   native=   7.256 ort=   1.615 ratio= 4.493 parity=PASS
+kvcat_llama3_p8191           t=8   trial=4 new    native=   3.795 ort=   1.582 ratio= 2.400 parity=PASS
+kvcat_llama3_p8191           t=16  trial=0 base   native=   7.495 ort=   1.578 ratio= 4.749 parity=PASS
+kvcat_llama3_p8191           t=16  trial=0 new    native=   3.803 ort=   1.601 ratio= 2.376 parity=PASS
+kvcat_llama3_p8191           t=16  trial=1 new    native=   3.758 ort=   1.375 ratio= 2.733 parity=PASS
+kvcat_llama3_p8191           t=16  trial=1 base   native=   7.385 ort=   1.575 ratio= 4.689 parity=PASS
+kvcat_llama3_p8191           t=16  trial=2 base   native=   7.470 ort=   1.610 ratio= 4.640 parity=PASS
+kvcat_llama3_p8191           t=16  trial=2 new    native=   3.866 ort=   1.348 ratio= 2.867 parity=PASS
+kvcat_llama3_p8191           t=16  trial=3 new    native=   3.909 ort=   1.444 ratio= 2.707 parity=PASS
+kvcat_llama3_p8191           t=16  trial=3 base   native=   7.984 ort=   1.473 ratio= 5.418 parity=PASS
+kvcat_llama3_p8191           t=16  trial=4 base   native=   7.755 ort=   1.555 ratio= 4.988 parity=PASS
+kvcat_llama3_p8191           t=16  trial=4 new    native=   3.887 ort=   1.532 ratio= 2.538 parity=PASS
+
+=== medians (native/ort ratio, lower is better) ===
+kvcat_llama3_b8_p2047        t=1    base: ratio_p50= 1.888 [1.866-1.901] native_p50=  14.823ms  new: ratio_p50= 0.938 [0.930-0.940] native_p50=   7.431ms
+kvcat_llama3_b8_p2047        t=8    base: ratio_p50= 4.426 [4.240-4.455] native_p50=  14.891ms  new: ratio_p50= 2.318 [2.213-2.398] native_p50=   7.552ms
+kvcat_llama3_b8_p2047        t=16   base: ratio_p50= 4.096 [4.017-4.306] native_p50=  15.003ms  new: ratio_p50= 2.204 [2.049-2.272] native_p50=   7.761ms
+kvcat_llama3_p1023           t=1    base: ratio_p50= 1.844 [1.707-1.889] native_p50=   0.720ms  new: ratio_p50= 1.081 [1.026-1.160] native_p50=   0.363ms
+kvcat_llama3_p1023           t=8    base: ratio_p50= 5.699 [4.899-5.939] native_p50=   0.680ms  new: ratio_p50= 2.751 [2.618-4.052] native_p50=   0.316ms
+kvcat_llama3_p1023           t=16   base: ratio_p50= 5.186 [4.738-6.516] native_p50=   0.720ms  new: ratio_p50= 3.055 [2.942-3.685] native_p50=   0.321ms
+kvcat_llama3_p2047           t=1    base: ratio_p50= 1.842 [1.767-1.912] native_p50=   1.676ms  new: ratio_p50= 0.966 [0.905-1.036] native_p50=   0.746ms
+kvcat_llama3_p2047           t=8    base: ratio_p50= 5.423 [3.875-5.642] native_p50=   1.705ms  new: ratio_p50= 3.295 [2.879-4.003] native_p50=   0.808ms
+kvcat_llama3_p2047           t=16   base: ratio_p50= 7.459 [6.745-9.834] native_p50=   1.943ms  new: ratio_p50= 4.202 [3.984-5.133] native_p50=   0.801ms
+kvcat_llama3_p4095           t=1    base: ratio_p50= 2.821 [2.744-2.917] native_p50=   5.366ms  new: ratio_p50= 1.885 [1.780-2.168] native_p50=   3.434ms
+kvcat_llama3_p4095           t=8    base: ratio_p50= 7.080 [4.675-7.783] native_p50=   5.563ms  new: ratio_p50= 4.236 [2.486-4.724] native_p50=   3.268ms
+kvcat_llama3_p4095           t=16   base: ratio_p50= 5.274 [5.102-7.737] native_p50=   3.875ms  new: ratio_p50= 5.079 [2.775-5.393] native_p50=   3.783ms
+kvcat_llama3_p8191           t=1    base: ratio_p50= 1.971 [1.966-1.983] native_p50=   7.476ms  new: ratio_p50= 1.000 [0.979-1.018] native_p50=   3.755ms
+kvcat_llama3_p8191           t=8    base: ratio_p50= 4.430 [4.158-4.493] native_p50=   7.256ms  new: ratio_p50= 2.400 [1.913-2.533] native_p50=   3.775ms
+kvcat_llama3_p8191           t=16   base: ratio_p50= 4.749 [4.640-5.418] native_p50=   7.495ms  new: ratio_p50= 2.707 [2.376-2.867] native_p50=   3.866ms
+sm_bert_b8_s128              t=1    base: ratio_p50= 1.571 [1.534-1.586] native_p50=   1.301ms  new: ratio_p50= 1.243 [1.232-1.280] native_p50=   1.043ms
+sm_bert_b8_s128              t=8    base: ratio_p50= 4.145 [3.553-4.369] native_p50=   0.591ms  new: ratio_p50= 3.915 [3.490-4.890] native_p50=   0.543ms
+sm_bert_b8_s128              t=16   base: ratio_p50= 7.163 [6.046-8.543] native_p50=   0.768ms  new: ratio_p50= 4.330 [3.875-5.686] native_p50=   0.500ms
+sm_decode_h32_kv1024         t=1    base: ratio_p50= 1.373 [1.317-1.556] native_p50=   0.024ms  new: ratio_p50= 1.176 [1.125-1.384] native_p50=   0.022ms
+sm_decode_h32_kv1024         t=8    base: ratio_p50= 2.281 [2.217-2.625] native_p50=   0.032ms  new: ratio_p50= 1.958 [1.742-2.244] native_p50=   0.023ms
+sm_decode_h32_kv1024         t=16   base: ratio_p50= 2.447 [2.076-2.605] native_p50=   0.033ms  new: ratio_p50= 2.055 [2.047-2.225] native_p50=   0.028ms
+sm_decode_h32_kv2048         t=1    base: ratio_p50= 1.427 [1.369-1.459] native_p50=   0.060ms  new: ratio_p50= 1.168 [1.129-1.197] native_p50=   0.052ms
+sm_decode_h32_kv2048         t=8    base: ratio_p50= 3.420 [2.864-4.194] native_p50=   0.055ms  new: ratio_p50= 2.916 [2.617-3.497] native_p50=   0.053ms
+sm_decode_h32_kv2048         t=16   base: ratio_p50= 3.807 [3.546-4.033] native_p50=   0.073ms  new: ratio_p50= 2.927 [2.521-3.137] native_p50=   0.051ms
+sm_decode_h32_kv4096         t=1    base: ratio_p50= 1.460 [1.458-1.486] native_p50=   0.092ms  new: ratio_p50= 1.201 [1.184-1.257] native_p50=   0.075ms
+sm_decode_h32_kv4096         t=8    base: ratio_p50= 5.188 [5.083-6.192] native_p50=   0.095ms  new: ratio_p50= 4.534 [4.050-4.917] native_p50=   0.099ms
+sm_decode_h32_kv4096         t=16   base: ratio_p50= 5.961 [5.314-6.675] native_p50=   0.131ms  new: ratio_p50= 4.866 [4.681-5.450] native_p50=   0.106ms
+sm_decode_h32_kv8192         t=1    base: ratio_p50= 1.500 [1.425-1.535] native_p50=   0.182ms  new: ratio_p50= 1.221 [1.211-1.243] native_p50=   0.147ms
+sm_decode_h32_kv8192         t=8    base: ratio_p50= 6.277 [6.036-7.299] native_p50=   0.228ms  new: ratio_p50= 5.239 [5.050-6.027] native_p50=   0.149ms
+sm_decode_h32_kv8192         t=16   base: ratio_p50= 7.765 [7.322-8.943] native_p50=   0.229ms  new: ratio_p50= 6.571 [5.593-7.099] native_p50=   0.191ms
+sm_prefill_h32_s512          t=1    base: ratio_p50= 1.767 [1.761-1.777] native_p50=   7.527ms  new: ratio_p50= 1.331 [1.329-1.341] native_p50=   5.641ms
+sm_prefill_h32_s512          t=8    base: ratio_p50= 4.086 [3.598-4.218] native_p50=   4.580ms  new: ratio_p50= 2.574 [1.848-2.822] native_p50=   2.815ms
+sm_prefill_h32_s512          t=16   base: ratio_p50= 4.030 [3.752-4.145] native_p50=   4.446ms  new: ratio_p50= 2.536 [2.217-2.671] native_p50=   2.756ms
+sm_whisper_cross             t=1    base: ratio_p50= 1.677 [1.674-1.687] native_p50=  44.791ms  new: ratio_p50= 1.366 [1.359-1.374] native_p50=  36.491ms
+sm_whisper_cross             t=8    base: ratio_p50= 4.615 [4.299-5.423] native_p50=  25.360ms  new: ratio_p50= 3.021 [2.213-3.786] native_p50=  18.391ms
+sm_whisper_cross             t=16   base: ratio_p50= 4.397 [3.982-4.468] native_p50=  24.594ms  new: ratio_p50= 2.536 [2.246-2.665] native_p50=  15.084ms
+tr_bert_b8_s128              t=1    base: ratio_p50= 1.132 [1.093-4.206] native_p50=   0.217ms  new: ratio_p50= 0.650 [0.602-0.890] native_p50=   0.123ms
+tr_bert_b8_s128              t=8    base: ratio_p50= 2.933 [2.342-6.075] native_p50=   0.421ms  new: ratio_p50= 1.385 [0.917-3.921] native_p50=   0.217ms
+tr_bert_b8_s128              t=16   base: ratio_p50= 5.108 [3.791-6.526] native_p50=   0.659ms  new: ratio_p50= 2.234 [1.604-4.047] native_p50=   0.301ms
+tr_llama3_s512               t=1    base: ratio_p50= 1.195 [0.994-1.201] native_p50=   0.891ms  new: ratio_p50= 0.948 [0.913-2.327] native_p50=   0.604ms
+tr_llama3_s512               t=8    base: ratio_p50= 3.539 [3.277-4.491] native_p50=   0.469ms  new: ratio_p50= 2.973 [2.080-4.170] native_p50=   0.310ms
+tr_llama3_s512               t=16   base: ratio_p50= 7.462 [5.556-10.492] native_p50=   0.878ms  new: ratio_p50= 3.778 [3.459-6.886] native_p50=   0.317ms
+tr_whisper_s1500             t=1    base: ratio_p50= 1.383 [1.191-1.500] native_p50=   0.824ms  new: ratio_p50= 0.985 [0.892-1.225] native_p50=   0.521ms
+tr_whisper_s1500             t=8    base: ratio_p50= 3.607 [3.092-3.939] native_p50=   0.446ms  new: ratio_p50= 2.243 [1.590-2.381] native_p50=   0.223ms
+tr_whisper_s1500             t=16   base: ratio_p50= 5.851 [4.896-6.689] native_p50=   0.684ms  new: ratio_p50= 5.168 [2.938-6.376] native_p50=   0.511ms

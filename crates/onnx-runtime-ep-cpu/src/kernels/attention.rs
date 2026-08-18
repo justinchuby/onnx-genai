@@ -75,41 +75,66 @@ pub struct AttentionFactory {
     pub since_version: u32,
 }
 
+/// Why this kernel cannot run a given `ai.onnx::Attention` node, if it cannot.
+///
+/// Answered at *claim* time: a rejection raised in the factory instead arrives
+/// after ORT has compiled the node onto this EP and is a hard session failure
+/// that no fallback recovers from. Implemented by running the factory's own
+/// attribute parse, so the two cannot disagree. `since_version` selects opset
+/// semantics inside `execute` and cannot change which nodes are rejected, so
+/// the claim-time call passes the newest.
+pub(crate) fn unsupported_reason(node: &Node) -> Option<String> {
+    attributes_from_node(node, 26).err().map(|e| e.to_string())
+}
+
+fn attributes_from_node(node: &Node, since_version: u32) -> Result<AttentionKernel> {
+    // Defensive, not load-bearing: ORT does not stamp this attribute (a
+    // real session was instrumented to confirm it arrives absent). But both
+    // ORT's kernels and ours read an explicit `scale = 0` as "use
+    // 1/sqrt(head_size)" rather than literally, so a zero taken at face
+    // value would zero every score silently. `> 0` is deliberately broader
+    // than ORT's `== 0`, since a negative scale is meaningless.
+    let scale = node
+        .attr("scale")
+        .and_then(|a| a.as_float())
+        .filter(|s| *s > 0.0);
+    let is_causal = node.attr("is_causal").and_then(|a| a.as_int()).unwrap_or(0) != 0;
+    let q_num_heads = node
+        .attr("q_num_heads")
+        .and_then(|a| a.as_int())
+        .map(|v| v as usize);
+    let kv_num_heads = node
+        .attr("kv_num_heads")
+        .and_then(|a| a.as_int())
+        .map(|v| v as usize);
+    let qk_matmul_output_mode = node
+        .attr("qk_matmul_output_mode")
+        .and_then(|a| a.as_int())
+        .unwrap_or(0);
+    let softcap = node
+        .attr("softcap")
+        .and_then(|a| a.as_float())
+        .unwrap_or(0.0);
+    if !(0..=3).contains(&qk_matmul_output_mode) {
+        return Err(EpError::KernelFailed(format!(
+            "Attention: qk_matmul_output_mode {qk_matmul_output_mode} is not supported \
+                 (only 0, 1, 2, 3 are implemented)"
+        )));
+    }
+    Ok(AttentionKernel {
+        scale,
+        is_causal,
+        q_num_heads,
+        kv_num_heads,
+        qk_matmul_output_mode,
+        softcap,
+        since_version,
+    })
+}
+
 impl KernelFactory for AttentionFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let scale = node.attr("scale").and_then(|a| a.as_float());
-        let is_causal = node.attr("is_causal").and_then(|a| a.as_int()).unwrap_or(0) != 0;
-        let q_num_heads = node
-            .attr("q_num_heads")
-            .and_then(|a| a.as_int())
-            .map(|v| v as usize);
-        let kv_num_heads = node
-            .attr("kv_num_heads")
-            .and_then(|a| a.as_int())
-            .map(|v| v as usize);
-        let qk_matmul_output_mode = node
-            .attr("qk_matmul_output_mode")
-            .and_then(|a| a.as_int())
-            .unwrap_or(0);
-        let softcap = node
-            .attr("softcap")
-            .and_then(|a| a.as_float())
-            .unwrap_or(0.0);
-        if !(0..=3).contains(&qk_matmul_output_mode) {
-            return Err(EpError::KernelFailed(format!(
-                "Attention: qk_matmul_output_mode {qk_matmul_output_mode} is not supported \
-                 (only 0, 1, 2, 3 are implemented)"
-            )));
-        }
-        Ok(Box::new(AttentionKernel {
-            scale,
-            is_causal,
-            q_num_heads,
-            kv_num_heads,
-            qk_matmul_output_mode,
-            softcap,
-            since_version: self.since_version,
-        }))
+        Ok(Box::new(attributes_from_node(node, self.since_version)?))
     }
 }
 

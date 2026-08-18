@@ -290,6 +290,220 @@ fn par_chunk_len(len: usize, threads: usize) -> Option<usize> {
     (chunk < len).then_some(chunk)
 }
 
+/// Chunks to cut `len` into when the *host* runtime owns the pool.
+///
+/// The rayon split asks the pool how wide it is and cuts exactly that many
+/// pieces, because a rayon `par_chunks` costs a wake-up per piece and handing
+/// it more pieces than threads is wasted scheduling. The host pool is the
+/// opposite: it is already spinning, we cannot ask ORT how many intra-op
+/// threads it was given, and `TrySimpleParallelFor` claims indices
+/// dynamically. So we cut by *size* rather than by thread count and let the
+/// host decide how many of its threads to point at the result.
+///
+/// Cutting by size rather than by pool width is also a **correctness**
+/// property, not only a scheduling one: the chunk boundaries — and therefore
+/// the exact bit pattern of the output — depend only on `len`, never on how
+/// many intra-op threads the session happens to have. The same tensor produces
+/// the same bits whether it is run at `intra_op = 1` or `16`, so a result can
+/// never move when the session is reconfigured. Had we cut by pool width (as
+/// the rayon path does), reducing `intra_op` would re-chunk the slice and
+/// perturb the last-lane rounding of the split boundaries.
+///
+/// [`HOST_MIN_CHUNK`] is the floor, so a chunk is never too short to be worth
+/// dispatching or to stay on the vector path; this cap is the other end, and
+/// keeps a very long slice from turning into thousands of tiny tasks. Raising
+/// it to 256 or 1024 measured within noise of 64 at every size swept, so 64 —
+/// four tasks per thread on a sixteen-thread session, enough for the host to
+/// balance with — is the one that dispatches least.
+const MAX_HOST_CHUNKS: usize = 64;
+
+/// Length below which the host split is not worth dispatching.
+///
+/// Sixteen times lower than [`PAR_MIN_LEN`], and for a concrete reason: that
+/// constant pays for waking rayon's workers, and ORT's intra-op workers are
+/// already awake — they spin. Measured at `intra_op = 16` against ORT's own
+/// CPU EP, splitting a 256 Ki slice on the host pool instead of leaving it
+/// whole moved `Gelu` from 0.15x to 0.94x, `FastGelu` 0.11x to 0.64x, `Erf`
+/// 0.24x to 1.33x and `Sqrt` 0.19x to 0.91x. At 64 Ki the split still helps
+/// (`Tanh` 0.40x to 1.36x, `Relu` 0.61x to 1.12x); at 16 Ki it stopped
+/// mattering, every gate measuring within noise of every other, so this is the
+/// last length where the evidence is one-sided.
+const HOST_MIN_LEN: usize = 65_536;
+
+/// Shortest chunk worth handing to one of the host's threads.
+///
+/// [`PAR_MIN_CHUNK`] is 256 Ki because a rayon wake-up costs ~50 us. A host
+/// task costs a fraction of that, and the sweep is monotone in this direction:
+/// at `intra_op = 16` over 64 Ki - 1 Mi, dropping the floor from 256 Ki to
+/// 64 Ki to 16 Ki to 4 Ki improved almost every op at almost every size
+/// (`Erf` at 256 Ki: 0.18x, 0.33x, 0.79x, 1.02x against ORT; `Gelu`: 0.16x,
+/// 0.31x, 0.90x, 0.98x). 4 Ki is where it flattened.
+const HOST_MIN_CHUNK: usize = 4_096;
+
+/// Chunk length and count for the host-pool split, or `None` to stay whole.
+#[inline]
+fn host_chunk_len(len: usize) -> Option<(usize, usize)> {
+    if len < HOST_MIN_LEN {
+        return None;
+    }
+    let chunk = len
+        .div_ceil(MAX_HOST_CHUNKS)
+        .max(HOST_MIN_CHUNK)
+        .next_multiple_of(8);
+    (chunk < len).then(|| (chunk, len.div_ceil(chunk)))
+}
+
+/// [`host_chunk_len`] for the bias-fused kernels: whole multiples of `width`.
+#[inline]
+fn host_chunk_len_rows(len: usize, width: usize) -> Option<(usize, usize)> {
+    if width == 0 || len < HOST_MIN_LEN {
+        return None;
+    }
+    let rows = len
+        .div_ceil(width)
+        .div_ceil(MAX_HOST_CHUNKS)
+        .max(HOST_MIN_CHUNK.div_ceil(width));
+    let chunk = rows.checked_mul(width)?;
+    (chunk < len).then(|| (chunk, len.div_ceil(chunk)))
+}
+
+/// `input`/`output` as raw pointers, so the host's threads can share them.
+///
+/// Rayon proves disjointness with `par_chunks_mut`; the host pool has no such
+/// API, so the split is done by index arithmetic and the disjointness argument
+/// moves into [`run_on_host`].
+struct HostChunks {
+    input: *const f32,
+    output: *mut f32,
+    len: usize,
+    chunk: usize,
+}
+
+// SAFETY: the only thing shared across threads is a pair of pointers plus the
+// two lengths needed to derive a chunk from an index. `run_on_host` gives each
+// index a disjoint half-open range of both slices, and `HostParallel::run`
+// promises each index runs exactly once, so no two threads ever hold
+// overlapping references to the output.
+unsafe impl Sync for HostChunks {}
+
+impl HostChunks {
+    /// Runs `body` on the `index`-th chunk of the input and output slices.
+    ///
+    /// Takes the body rather than returning the two slices so that the
+    /// caller's closure captures the whole `&HostChunks` — which is `Sync` —
+    /// instead of the raw pointer fields individually, which are not.
+    ///
+    /// # Safety
+    ///
+    /// `index` must be below the chunk count this was built for, and no two
+    /// live calls may share one: the `&mut` handed to `body` is only unique
+    /// because distinct indices give disjoint ranges.
+    unsafe fn run_chunk<F>(&self, index: usize, body: &F)
+    where
+        F: Fn(&[f32], &mut [f32]),
+    {
+        let start = index * self.chunk;
+        // The last chunk is short whenever `chunk` does not divide `len`.
+        let this = self.chunk.min(self.len - start);
+        // SAFETY: `start + this <= len` by construction, and the caller
+        // guarantees no other thread holds this range.
+        let (input, output) = unsafe {
+            (
+                core::slice::from_raw_parts(self.input.add(start), this),
+                core::slice::from_raw_parts_mut(self.output.add(start), this),
+            )
+        };
+        body(input, output);
+    }
+}
+
+/// Runs `body` on the host runtime's pool if this session has one worth using.
+///
+/// Returns whether `body` was run at all; a `false` return leaves `output`
+/// untouched and the caller free to pick another split.
+///
+/// `#[inline(never)]` on purpose. Everything here is cold -- the decision is a
+/// relaxed load, and the split it guards only happens inside an ORT session
+/// whose pool has been proven parallel -- while `run_chunked`'s callers are the
+/// hottest elementwise kernels in the crate. Inlining it grew `run_chunked`
+/// enough to repartition codegen units: at `intra_op = 1` it cost `Relu` 34% at
+/// 1 Mi (236 -> 315 us) with no path change at all, the same failure mode as
+/// the instantiation note on `clip_chunked`.
+#[inline(never)]
+fn try_host<F>(input: &[f32], output: &mut [f32], body: &F) -> bool
+where
+    F: Fn(&[f32], &mut [f32]) + Sync + Send,
+{
+    let Some(host) = onnx_runtime_ep_api::host_parallel::current() else {
+        return false;
+    };
+    if !host.prefer_host() {
+        return false;
+    }
+    match host_chunk_len(input.len()) {
+        Some((chunk, count)) => {
+            note_parallel_dispatch();
+            run_on_host(host, input, output, chunk, count, body);
+        }
+        // Too short to split across the host's threads. Our own pool is not
+        // the answer either: it would be a second pool on the same cores.
+        None => body(input, output),
+    }
+    true
+}
+
+/// [`try_host`] for the row-shaped split. Outlined for the same reason.
+#[inline(never)]
+fn try_host_rows<F>(input: &[f32], output: &mut [f32], width: usize, body: &F) -> bool
+where
+    F: Fn(&[f32], &mut [f32]) + Sync + Send,
+{
+    let Some(host) = onnx_runtime_ep_api::host_parallel::current() else {
+        return false;
+    };
+    if !host.prefer_host() {
+        return false;
+    }
+    match host_chunk_len_rows(input.len(), width) {
+        Some((chunk, count)) => run_on_host(host, input, output, chunk, count, body),
+        None => body(input, output),
+    }
+    true
+}
+
+/// Splits `input`/`output` into `count` chunks of `chunk` and runs `body` on
+/// each one on the host runtime's pool.
+///
+/// Bit-identical to calling `body` on the whole slice, for the same reason the
+/// rayon path is: the kernels are elementwise, every chunk is a multiple of
+/// eight lanes, and none is shorter than [`SIMD_MIN_LEN`], so no chunk takes a
+/// different code path from its neighbours.
+fn run_on_host<F>(
+    host: onnx_runtime_ep_api::HostParallel,
+    input: &[f32],
+    output: &mut [f32],
+    chunk: usize,
+    count: usize,
+    body: &F,
+) where
+    F: Fn(&[f32], &mut [f32]) + Sync,
+{
+    debug_assert_eq!(input.len(), output.len());
+    debug_assert!(chunk > 0 && count > 0);
+    let shared = HostChunks {
+        input: input.as_ptr(),
+        output: output.as_mut_ptr(),
+        len: input.len(),
+        chunk,
+    };
+    let shared = &shared;
+    host.run(count, &|index| {
+        // SAFETY: `HostParallel::run` invokes every index in `0..count`
+        // exactly once, so this call owns its range for its whole duration.
+        unsafe { shared.run_chunk(index, body) };
+    });
+}
+
 /// Chunk length for [`run_chunked_rows`], always a whole multiple of `width`.
 #[inline]
 fn par_chunk_len_rows(len: usize, width: usize, threads: usize) -> Option<usize> {
@@ -330,7 +544,29 @@ where
     // a 4096-element decode call cost ~1.4 us, which is more than the whole
     // call. Measured as a uniform 0.6-0.8x regression on every short case
     // until this check moved above it.
-    if len < PAR_MIN_LEN || force_serial() {
+    if len < HOST_MIN_LEN || force_serial() {
+        body(input, output);
+        return;
+    }
+    // Inside a host task we are already occupying one of the host's threads;
+    // splitting again would nest a pool inside the pool we were handed.
+    if onnx_runtime_ep_api::host_parallel::in_host_task() {
+        body(input, output);
+        return;
+    }
+    // Prefer the host's pool over ours whenever the host has one. Ours would
+    // be a *second* pool on the same cores: measured 1.5-3.1x slower than
+    // staying serial at 1 Mi under an `intra_op = 16` session.
+    //
+    // A host pool of *one* thread is the opposite case. It is not using the
+    // machine, so there is nothing to contend with and our own pool is the
+    // right tool: at `intra_op = 1`, rayon beat borrowing ORT's single thread
+    // by 2-9x over 1-4 Mi. `prefer_host` decides which of the two a session is
+    // by watching whether the host's pool ever actually runs our chunks.
+    if try_host(input, &mut *output, &body) {
+        return;
+    }
+    if len < PAR_MIN_LEN {
         body(input, output);
         return;
     }
@@ -391,7 +627,13 @@ pub(crate) fn run_chunked_fn(input: &[f32], output: &mut [f32], body: fn(&[f32],
 pub(crate) fn clip_chunked(input: &[f32], output: &mut [f32], minimum: f32, maximum: f32) {
     // Take the serial decision here, so the common short case is a direct call
     // instead of one through a closure the optimiser can no longer see into.
-    if input.len() < PAR_MIN_LEN || force_serial() || rayon::current_thread_index().is_some() {
+    if input.len() < HOST_MIN_LEN
+        || force_serial()
+        || onnx_runtime_ep_api::host_parallel::in_host_task()
+        || rayon::current_thread_index().is_some()
+    {
+        // Short, or already on a worker: one direct call, with no closure for
+        // the optimiser to lose sight of.
         mlas_sys::compute_clip(input, output, minimum, maximum);
         return;
     }
@@ -418,7 +660,18 @@ where
     F: Fn(&[f32], &mut [f32]) + Sync + Send,
 {
     let len = input.len();
-    if len < PAR_MIN_LEN || width == 0 || force_serial() {
+    if len < HOST_MIN_LEN || width == 0 || force_serial() {
+        body(input, output);
+        return;
+    }
+    if onnx_runtime_ep_api::host_parallel::in_host_task() {
+        body(input, output);
+        return;
+    }
+    if try_host_rows(input, &mut *output, width, &body) {
+        return;
+    }
+    if len < PAR_MIN_LEN {
         body(input, output);
         return;
     }
@@ -3936,5 +4189,729 @@ mod chunking_instantiation_is_local {
              run_chunked_fn or add a wrapper next to clip_chunked instead. \
              Offending call sites: {offenders:?}"
         );
+    }
+
+    /// The host branch is cold, and inlining it into `run_chunked` costs 34%.
+    ///
+    /// `try_host`/`try_host_rows` decide with one relaxed load, and the split
+    /// they guard only runs inside an ORT session whose intra-op pool has been
+    /// proven parallel. `run_chunked`'s callers, meanwhile, are the hottest
+    /// elementwise kernels in the crate. When the branch was written inline,
+    /// `Relu` at 1 Mi and one thread went 236 -> 315 us with no runtime path
+    /// change at all -- the same codegen-unit repartitioning as above. Adding
+    /// an `eprintln!` for diagnosis moved it back to 237 us, which is how the
+    /// cause was identified. `#[inline(never)]` pins it.
+    #[test]
+    fn the_host_branch_stays_outlined() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/kernels/simd_activations.rs");
+        let text = std::fs::read_to_string(&path).expect("read source");
+        for name in ["fn try_host<F>", "fn try_host_rows<F>"] {
+            let at = text.find(name).unwrap_or_else(|| panic!("{name} exists"));
+            assert!(
+                text[..at]
+                    .lines()
+                    .next_back()
+                    .is_some_and(|l| l.trim() == "#[inline(never)]"),
+                "{name} must be preceded by #[inline(never)]: inlining the host \
+                 branch into run_chunked repartitioned codegen units and cost \
+                 Relu 34% at 1 Mi (236 -> 315 us) with no path change"
+            );
+        }
+    }
+}
+
+/// The host-pool split: what happens when ORT lends us its intra-op threads.
+///
+/// The production host is ORT's `KernelContext_ParallelFor`, which needs a
+/// live session to exercise. These tests stand a real thread pool in its
+/// place, so everything on our side of the seam — the chunk policy, the
+/// disjointness of the ranges, the suppression of the rayon path and of
+/// nesting — is covered without one.
+#[cfg(test)]
+mod host_pool_split {
+    use super::*;
+    use onnx_runtime_ep_api::HostParallel;
+    use onnx_runtime_ep_api::host_parallel;
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    thread_local! {
+        /// Indices dispatched through the fake host from *this* thread since
+        /// the last reset.
+        ///
+        /// Thread-local rather than a global atomic for the same reason
+        /// `PARALLEL_DISPATCHES` is: the test binary runs these tests
+        /// concurrently, and a global counter would let them bump each
+        /// other's. The increment happens on whichever thread called
+        /// `threaded_host`, which is also the thread that reads it back --
+        /// including inside a task, which is what makes the nesting test
+        /// work.
+        static HOST_INDICES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn dispatched() -> usize {
+        HOST_INDICES.with(std::cell::Cell::get)
+    }
+
+    fn reset_dispatched() {
+        HOST_INDICES.with(|c| c.set(0));
+    }
+
+    /// Stands in for ORT: runs the indices on four real threads.
+    ///
+    /// Genuinely concurrent on purpose. A serial stand-in would still prove
+    /// the arithmetic but not that the ranges are disjoint, which is the part
+    /// that would corrupt an output tensor if it were wrong.
+    ///
+    /// # Safety
+    ///
+    /// Ignores `host`, so any pointer is valid for it.
+    unsafe fn threaded_host(_host: *mut c_void, total: usize, body: &(dyn Fn(usize) + Sync)) {
+        HOST_INDICES.with(|c| c.set(c.get() + total));
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= total {
+                            break;
+                        }
+                        body(index);
+                    }
+                });
+            }
+        });
+    }
+
+    /// A host pool that has been seen running our chunks on its own threads.
+    static HELPED: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(host_parallel::HOST_HELPED);
+
+    /// A host pool that never has, past its opening burst of probes: the
+    /// kernels should keep the work on their own pool.
+    static NEVER_HELPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(
+        (host_parallel::PROBE_MIN << 16) | host_parallel::PROBE_MIN,
+    );
+
+    fn fake_host() -> HostParallel {
+        // SAFETY: `threaded_host` never dereferences its `host` argument, and
+        // the probe cell is a `static`.
+        unsafe {
+            HostParallel::new(
+                core::ptr::null_mut(),
+                threaded_host,
+                core::ptr::from_ref(&HELPED),
+            )
+        }
+    }
+
+    /// The same host, but one that has never been seen to help.
+    fn unhelpful_host() -> HostParallel {
+        // SAFETY: as `fake_host`.
+        unsafe {
+            HostParallel::new(
+                core::ptr::null_mut(),
+                threaded_host,
+                core::ptr::from_ref(&NEVER_HELPED),
+            )
+        }
+    }
+
+    /// Long enough to be split, and deliberately not a multiple of the chunk
+    /// size, so the final chunk is short.
+    const N: usize = 5 * HOST_MIN_LEN + 37;
+
+    fn probe(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| (i as f32 / 991.0).sin() * 24.0 + (i % 7) as f32 * 1e-7 - 3.0)
+            .collect()
+    }
+
+    /// Asserts the host split computes exactly what one call would.
+    fn assert_same(name: &str, run: impl Fn(&[f32], &mut [f32]) + Sync) {
+        let x = probe(N);
+        let mut want = vec![0.0f32; N];
+        serial_scope(|| run(&x, &mut want));
+
+        reset_dispatched();
+        let mut got = vec![0.0f32; N];
+        host_parallel::scope(fake_host(), || run(&x, &mut got));
+        assert!(
+            dispatched() > 1,
+            "{name}: the host pool was never asked to split anything"
+        );
+
+        for (i, (&w, &g)) in want.iter().zip(&got).enumerate() {
+            assert_eq!(
+                w.to_bits(),
+                g.to_bits(),
+                "{name}: element {i} differs (whole {w:e}, host-split {g:e})"
+            );
+        }
+    }
+
+    #[test]
+    fn unary_kernels_match_the_unsplit_result() {
+        assert_same("tanh", tanh_f32_slice);
+        assert_same("sqrt", sqrt_f32_slice);
+        assert_same("sigmoid", sigmoid_f32_slice);
+        assert_same("exp", exp_f32_slice);
+        assert_same("erf", erf_f32_slice);
+        assert_same("erf_gelu", erf_gelu_f32_slice);
+        assert_same("tanh_gelu", tanh_gelu_f32_slice);
+        assert_same("quick_gelu", |x, y| quick_gelu_f32_slice(x, y, 1.702));
+    }
+
+    #[test]
+    fn bias_kernels_match_the_unsplit_result() {
+        for width in [1usize, 3, 11, 4096, 4099] {
+            let bias: Vec<f32> = (0..width).map(|i| (i as f32) * 0.013 - 0.4).collect();
+            assert_same("tanh_gelu_bias", |x, y| {
+                tanh_gelu_bias_f32_slice(x, &bias, width, y)
+            });
+            assert_same("erf_gelu_bias", |x, y| {
+                erf_gelu_bias_f32_slice(x, &bias, width, y)
+            });
+        }
+    }
+
+    /// The point of the whole change: with a host pool installed we must not
+    /// also start our own.
+    #[test]
+    fn the_rayon_pool_is_not_used_when_a_host_is_installed() {
+        if rayon::current_num_threads() < 2 {
+            eprintln!("skipped: single-threaded rayon pool cannot show the difference");
+            return;
+        }
+        let x = probe(N);
+        let mut y = vec![0.0f32; N];
+
+        reset_dispatched();
+        host_parallel::scope(fake_host(), || tanh_f32_slice(&x, &mut y));
+        let host_indices = dispatched();
+
+        assert!(host_indices > 1, "the host pool was not used");
+        assert_eq!(
+            host_indices,
+            host_chunk_len(N).expect("N is long enough to split").1,
+            "every chunk should have been dispatched exactly once"
+        );
+    }
+
+    /// A kernel reached from inside a host task is already on a host thread.
+    /// Splitting again would nest a pool inside the pool we were handed.
+    #[test]
+    fn a_nested_split_stays_serial() {
+        let x = probe(N);
+        let mut y = vec![0.0f32; N];
+        host_parallel::scope(fake_host(), || {
+            fake_host().run(2, &|_| {
+                assert!(host_parallel::in_host_task());
+                let before = dispatched();
+                let mut inner = vec![0.0f32; N];
+                tanh_f32_slice(&x, &mut inner);
+                assert_eq!(
+                    dispatched(),
+                    before,
+                    "a kernel inside a host task dispatched again"
+                );
+            });
+            tanh_f32_slice(&x, &mut y);
+        });
+    }
+
+    /// Below the gate the slice stays whole even with a host installed: the
+    /// dispatch would cost more than the work it hands out.
+    #[test]
+    fn a_short_slice_is_not_dispatched() {
+        let n = HOST_MIN_LEN - 8;
+        let x = probe(n);
+        let mut y = vec![0.0f32; n];
+        reset_dispatched();
+        host_parallel::scope(fake_host(), || tanh_f32_slice(&x, &mut y));
+        assert_eq!(dispatched(), 0, "{n} elements should have stayed whole");
+
+        let mut want = vec![0.0f32; n];
+        serial_scope(|| tanh_f32_slice(&x, &mut want));
+        assert!(want.iter().zip(&y).all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+
+    /// A host pool that has never been seen doing our work is not using the
+    /// machine, so ours may. Borrowing a single ORT thread instead measured
+    /// 2-9x slower over 1-4 Mi at `intra_op = 1`, so this is worth asserting.
+    #[test]
+    fn an_unhelpful_host_is_not_borrowed() {
+        if rayon::current_num_threads() < 2 {
+            eprintln!("skipped: single-threaded rayon pool cannot show the difference");
+            return;
+        }
+        let n = 2 * PAR_MIN_LEN;
+        let x = probe(n);
+        let mut y = vec![0.0f32; n];
+        reset_dispatched();
+        let before = parallel_dispatches();
+        // Past the opening burst with nothing to show for it, which is the
+        // steady state for a session whose host pool has no workers.
+        NEVER_HELPED.store(
+            (host_parallel::PROBE_MIN << 16) | host_parallel::PROBE_MIN,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        host_parallel::scope(unhelpful_host(), || tanh_f32_slice(&x, &mut y));
+        assert_eq!(
+            dispatched(),
+            0,
+            "an unhelpful host pool was borrowed anyway"
+        );
+        assert_eq!(
+            parallel_dispatches() - before,
+            1,
+            "the work should have gone to our own pool instead"
+        );
+
+        let mut want = vec![0.0f32; n];
+        serial_scope(|| tanh_f32_slice(&x, &mut want));
+        assert!(want.iter().zip(&y).all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+
+    /// `serial_scope` has to keep suppressing the split on the host path too,
+    /// or the f16/bf16 sandwich picks its measured regression back up.
+    #[test]
+    fn serial_scope_still_suppresses_the_split() {
+        let x = probe(N);
+        let mut y = vec![0.0f32; N];
+        reset_dispatched();
+        host_parallel::scope(fake_host(), || {
+            serial_scope(|| tanh_f32_slice(&x, &mut y));
+        });
+        assert_eq!(dispatched(), 0);
+    }
+
+    /// The host chunk policy is pure, so sweep it over lengths and widths this
+    /// machine's memory could not hold, and assert the invariants the kernels
+    /// depend on: whole vectors, never below the vector threshold, and — for
+    /// the bias kernels — never a cut through the middle of a row.
+    #[test]
+    fn host_chunk_policy_holds_across_lengths() {
+        for len in [
+            0,
+            1,
+            8,
+            HOST_MIN_CHUNK - 1,
+            HOST_MIN_CHUNK,
+            HOST_MIN_CHUNK + 1,
+            HOST_MIN_LEN - 1,
+            HOST_MIN_LEN,
+            HOST_MIN_LEN + 1,
+            PAR_MIN_CHUNK,
+            PAR_MIN_LEN,
+            N,
+            1 << 26,
+            (1 << 26) + 13,
+            usize::MAX / 2,
+        ] {
+            if let Some((chunk, count)) = host_chunk_len(len) {
+                assert!(chunk < len, "chunk {chunk} !< len {len}");
+                assert_eq!(chunk % 8, 0, "chunk {chunk} is not a whole vector");
+                assert!(len >= HOST_MIN_LEN, "split below the gate");
+                assert!(chunk >= HOST_MIN_CHUNK, "chunk {chunk} is too short");
+                assert!(chunk >= SIMD_MIN_LEN, "chunk {chunk} would go scalar");
+                assert_eq!(count, len.div_ceil(chunk));
+                assert!(
+                    (count - 1) * chunk < len,
+                    "chunk {chunk} x {count} would dispatch an empty range"
+                );
+                assert!(count <= MAX_HOST_CHUNKS, "{count} chunks is past the cap");
+            }
+            for width in [1usize, 3, 8, 64, 4099, PAR_MIN_LEN] {
+                if let Some((chunk, count)) = host_chunk_len_rows(len, width) {
+                    assert!(chunk < len, "rows: chunk {chunk} !< len {len}");
+                    assert_eq!(chunk % width, 0, "rows: chunk {chunk} cuts width {width}");
+                    assert!(len >= HOST_MIN_LEN, "rows: split below the gate");
+                    assert!(
+                        chunk >= HOST_MIN_CHUNK.min(len),
+                        "rows: chunk {chunk} short"
+                    );
+                    assert_eq!(count, len.div_ceil(chunk));
+                    assert!((count - 1) * chunk < len, "rows: empty final range");
+                }
+            }
+            assert_eq!(host_chunk_len_rows(len, 0), None, "width 0 must not split");
+            if len < HOST_MIN_LEN {
+                assert_eq!(host_chunk_len(len), None, "{len} is below the gate");
+            }
+        }
+    }
+}
+
+/// Interleaved three-arm micro-measurement for the host-pool split.
+///
+/// This is the arm that decides PR #1143: everything measured before compared
+/// *our rayon split against staying serial*, and serial won every row. Nothing
+/// showed that dispatching the split onto the **host's** pool — the change this
+/// PR actually makes — beats serial. This harness runs all three arms in one
+/// process, interleaved per rep, so between-arm drift on a shared box cannot
+/// flip the conclusion.
+///
+/// # Why a stand-in pool, and why it is trustworthy
+///
+/// A real ORT session cannot switch arms within one process — its rayon width
+/// is a process global and its host install is a code path — so the three arms
+/// are driven directly against the real `simd_activations` code paths. The one
+/// thing that has to be reproduced faithfully is *why* our rayon split loses
+/// under an ORT session: ORT's intra-op pool **spins**, so a second (rayon)
+/// pool alongside it oversubscribes the cores. The stand-in models exactly
+/// that — a persistent pool of workers that spin while idle (as ORT's do) and
+/// claim indices dynamically when dispatched (`num_batch = 0` semantics) — and
+/// it latches [`host_parallel::HOST_HELPED`] the honest way, by having a worker
+/// (not the dispatcher) run one of the chunks, so `prefer_host` reaches its
+/// steady state through the real mechanism rather than by fiat.
+///
+/// The `rayon split` arm is therefore a **built-in control**: its result is
+/// already known from the PR's nine-row table (serial wins at `intra_op = 16`).
+/// If this harness reproduces `rayon < serial`, the model is validated and its
+/// `host-pool` number can be trusted. If it does not, the run is unusable and
+/// we know it before drawing a conclusion.
+///
+/// Ignored by the normal gate; run with:
+/// `EP_BENCH=1 cargo test --release -p onnx-runtime-ep-cpu --lib three_arm_bench -- --nocapture --ignored --test-threads=1`
+#[cfg(test)]
+mod three_arm_bench {
+    use super::*;
+    use onnx_runtime_ep_api::HostParallel;
+    use onnx_runtime_ep_api::host_parallel;
+    use std::ffi::c_void;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// State shared between the dispatcher and the stand-in pool's workers.
+    ///
+    /// A dispatch publishes the body (as its two raw fat-pointer words) and the
+    /// index count, then bumps `generation`; workers pick the new generation up
+    /// and claim indices off `cursor` until it is drained, recording progress
+    /// in `done`. Everything is lock-free so idle workers can *spin*, which is
+    /// the property that makes a coexisting rayon pool oversubscribe.
+    struct Shared {
+        generation: AtomicUsize,
+        total: AtomicUsize,
+        cursor: AtomicUsize,
+        done: AtomicUsize,
+        body_data: AtomicUsize,
+        body_vtable: AtomicUsize,
+        stop: AtomicBool,
+        /// The probe cell `prefer_host` reads: starts at zero (opening burst)
+        /// and reaches `HOST_HELPED` the first time a worker runs a chunk.
+        probe: AtomicU32,
+        /// Set by a worker (never the dispatcher) when it runs a chunk, so the
+        /// dispatcher can latch the probe cell only on real positive evidence.
+        worker_helped: AtomicBool,
+    }
+
+    impl Shared {
+        fn new() -> Self {
+            Self {
+                generation: AtomicUsize::new(0),
+                total: AtomicUsize::new(0),
+                cursor: AtomicUsize::new(0),
+                done: AtomicUsize::new(0),
+                body_data: AtomicUsize::new(0),
+                body_vtable: AtomicUsize::new(0),
+                stop: AtomicBool::new(false),
+                probe: AtomicU32::new(0),
+                worker_helped: AtomicBool::new(false),
+            }
+        }
+
+        /// Claims and runs indices off `cursor` for the current generation.
+        ///
+        /// Shared by the workers and the calling thread — ORT's own
+        /// `ParallelFor` runs tasks on the caller too, so the calling thread is
+        /// one of the `intra_op` threads, not a spectator. A worker flags
+        /// `worker_helped` so the dispatcher can latch the probe cell.
+        ///
+        /// # Safety
+        ///
+        /// The published body pointer must still be valid, which the blocking
+        /// dispatch guarantees for its whole duration.
+        unsafe fn drain(&self, total: usize, is_worker: bool) {
+            let data = self.body_data.load(Ordering::Relaxed);
+            let vtable = self.body_vtable.load(Ordering::Relaxed);
+            // SAFETY: `data`/`vtable` are the two words of a `&(dyn Fn(usize) +
+            // Sync)` published under the `generation` release/acquire, and the
+            // referent outlives the dispatch.
+            let body: *const (dyn Fn(usize) + Sync) =
+                unsafe { core::mem::transmute([data, vtable]) };
+            let body = unsafe { &*body };
+            let mut ran = false;
+            loop {
+                let index = self.cursor.fetch_add(1, Ordering::Relaxed);
+                if index >= total {
+                    break;
+                }
+                body(index);
+                ran = true;
+                self.done.fetch_add(1, Ordering::Relaxed);
+            }
+            if is_worker && ran {
+                self.worker_helped.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// A persistent pool of spinning workers standing in for ORT's intra-op
+    /// pool. Sized so that `workers + 1` (the calling thread) equals the
+    /// modelled `intra_op_num_threads`.
+    struct SpinPool {
+        shared: Arc<Shared>,
+        handles: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl SpinPool {
+        fn new(workers: usize) -> Self {
+            let shared = Arc::new(Shared::new());
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                let shared = Arc::clone(&shared);
+                handles.push(std::thread::spawn(move || {
+                    let mut seen = 0usize;
+                    loop {
+                        if shared.stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let g = shared.generation.load(Ordering::Acquire);
+                        if g != seen {
+                            seen = g;
+                            let total = shared.total.load(Ordering::Relaxed);
+                            // SAFETY: the dispatch that bumped `generation` is
+                            // blocked until `done == total`, so the body it
+                            // published is alive for this whole drain.
+                            unsafe { shared.drain(total, true) };
+                        } else {
+                            // Idle: burn the core, exactly as ORT's workers do
+                            // between parallel regions. This is what makes the
+                            // rayon arm oversubscribe.
+                            std::hint::spin_loop();
+                        }
+                    }
+                }));
+            }
+            Self { shared, handles }
+        }
+
+        /// The `HostParallel` handle our kernels see.
+        fn handle(&self) -> HostParallel {
+            // SAFETY: `spin_dispatch` reads the host pointer back as
+            // `*const Shared`, and the probe pointer is the cell inside the same
+            // `Arc`. The `Arc` in `self` keeps both alive for as long as the
+            // handle is installed (the handle never escapes this struct).
+            unsafe {
+                HostParallel::new(
+                    Arc::as_ptr(&self.shared).cast::<c_void>().cast_mut(),
+                    spin_dispatch,
+                    core::ptr::from_ref(&self.shared.probe),
+                )
+            }
+        }
+    }
+
+    impl Drop for SpinPool {
+        fn drop(&mut self) {
+            self.shared.stop.store(true, Ordering::Relaxed);
+            for h in self.handles.drain(..) {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Publishes one dispatch and drives it to completion on the pool + caller.
+    ///
+    /// # Safety
+    ///
+    /// `host` must be the `*const Shared` produced by [`SpinPool::handle`].
+    unsafe fn spin_dispatch(host: *mut c_void, total: usize, body: &(dyn Fn(usize) + Sync)) {
+        let shared = unsafe { &*host.cast::<Shared>() };
+        let raw = body as *const (dyn Fn(usize) + Sync);
+        let [data, vtable]: [usize; 2] = unsafe { core::mem::transmute(raw) };
+        shared.worker_helped.store(false, Ordering::Relaxed);
+        shared.total.store(total, Ordering::Relaxed);
+        shared.cursor.store(0, Ordering::Relaxed);
+        shared.done.store(0, Ordering::Relaxed);
+        shared.body_data.store(data, Ordering::Relaxed);
+        shared.body_vtable.store(vtable, Ordering::Relaxed);
+        // Release the body/total stores to the workers, then help drain.
+        shared.generation.fetch_add(1, Ordering::Release);
+        // SAFETY: we published the body above and block below until every index
+        // is done, so it stays valid for the whole call.
+        unsafe { shared.drain(total, false) };
+        while shared.done.load(Ordering::Acquire) < total {
+            std::hint::spin_loop();
+        }
+        // Latch the probe the honest way: only if a worker (not this calling
+        // thread) actually ran a chunk. A pool with no workers can never set
+        // this, which is exactly the fact `prefer_host` is trying to learn.
+        if shared.worker_helped.load(Ordering::Relaxed) {
+            shared
+                .probe
+                .store(host_parallel::HOST_HELPED, Ordering::Relaxed);
+        }
+    }
+
+    /// A reproducible non-degenerate input in a range that exercises every
+    /// branch of the activation polynomials.
+    fn probe(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| (i as f32 / 977.0).sin() * 9.0 + (i % 13) as f32 * 1e-6 - 2.0)
+            .collect()
+    }
+
+    fn pct(sorted: &[Duration], num: usize, den: usize) -> Duration {
+        sorted[(sorted.len() * num / den).min(sorted.len() - 1)]
+    }
+
+    fn us(d: Duration) -> f64 {
+        d.as_secs_f64() * 1e6
+    }
+
+    type Kernel = fn(&[f32], &mut [f32]);
+
+    fn kernels() -> [(&'static str, Kernel); 2] {
+        [
+            ("Sqrt", sqrt_f32_slice as Kernel),
+            ("Gelu", erf_gelu_f32_slice as Kernel),
+        ]
+    }
+
+    /// The three arms at `intra_op = 16`, interleaved per rep.
+    #[test]
+    #[ignore = "measurement harness; run explicitly with EP_BENCH=1"]
+    fn three_arm_intra_op_16() {
+        if std::env::var("EP_BENCH").is_err() {
+            return;
+        }
+        const N: usize = 1 << 20; // 1 Mi f32
+        const REPS: usize = 201;
+        const WARMUP: usize = 25;
+        // The modelled intra-op width. Defaults to this box's physical core
+        // count (14) rather than the spec's 16, because the stand-in's spinning
+        // workers are *real* threads: on a 14-core box, 15 spinners + the caller
+        // already oversubscribe, which starves the serial baseline before the
+        // rayon arm even runs. Matching the core count gives every arm a clean
+        // core and keeps the rayon arm the only one that oversubscribes.
+        let intra_op: usize = std::env::var("EP_INTRA_OP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(14);
+
+        // (intra_op - 1) spinning workers + the calling thread == intra_op threads.
+        let pool = SpinPool::new(intra_op - 1);
+        let host = pool.handle();
+        let rayon_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(intra_op)
+            .build()
+            .expect("rayon pool");
+
+        let x = probe(N);
+        let mut out = vec![0.0f32; N];
+
+        println!("\n=== three-arm, intra_op = {intra_op}, N = 1 Mi f32, p50 us (p10..p90) ===");
+        println!(
+            "host stand-in: {} spinning workers + caller; rayon: {intra_op} threads",
+            intra_op - 1
+        );
+        for (name, kernel) in kernels() {
+            // Interleave the arms within one process: each rep samples all
+            // three back to back, so a busy neighbour hits every arm equally.
+            let arms = ["serial", "rayon split", "host-pool split"];
+            let mut samples: [Vec<Duration>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            for _ in 0..WARMUP + REPS {
+                let mut run_arm = |arm: usize| {
+                    let t = Instant::now();
+                    match arm {
+                        0 => serial_scope(|| kernel(&x, &mut out)),
+                        1 => rayon_pool.install(|| kernel(&x, &mut out)),
+                        _ => host_parallel::scope(host, || kernel(&x, &mut out)),
+                    }
+                    t.elapsed()
+                };
+                for (arm, bucket) in samples.iter_mut().enumerate() {
+                    let d = run_arm(arm);
+                    bucket.push(d);
+                }
+            }
+            // The host arm must have latched, or its numbers are the rayon
+            // fall-through, not the host path.
+            assert!(
+                host.helped(),
+                "{name}: the stand-in host was never seen to help; numbers invalid"
+            );
+            print!("{name:>5}: ");
+            let mut p50s = [0.0f64; 3];
+            for (i, arm) in arms.iter().enumerate() {
+                let s = &mut samples[i];
+                s.drain(..WARMUP);
+                s.sort_unstable();
+                p50s[i] = us(pct(s, 1, 2));
+                print!(
+                    "{arm} {:.0} ({:.0}..{:.0})  ",
+                    us(pct(s, 1, 2)),
+                    us(pct(s, 1, 10)),
+                    us(pct(s, 9, 10))
+                );
+            }
+            println!();
+            println!(
+                "       -> rayon/serial {:.2}x  host/serial {:.2}x  (control: rayon must be > 1x)",
+                p50s[1] / p50s[0],
+                p50s[2] / p50s[0]
+            );
+        }
+    }
+
+    /// The no-host fall-through on a free machine: rayon split must keep its
+    /// large win over serial at `intra_op = 1`. No stand-in pool, so nothing
+    /// spins and the machine is the native executor's to use.
+    #[test]
+    #[ignore = "measurement harness; run explicitly with EP_BENCH=1"]
+    fn no_host_fall_through_intra_op_1() {
+        if std::env::var("EP_BENCH").is_err() {
+            return;
+        }
+        const REPS: usize = 151;
+        const WARMUP: usize = 20;
+        println!("\n=== no-host fall-through, free machine, p50 us (p10..p90) ===");
+        for n_label in ["1 Mi", "4 Mi"] {
+            let n = if n_label == "1 Mi" { 1 << 20 } else { 1 << 22 };
+            let x = probe(n);
+            let mut out = vec![0.0f32; n];
+            for (name, kernel) in kernels() {
+                let mut ser = Vec::with_capacity(REPS);
+                let mut par = Vec::with_capacity(REPS);
+                for r in 0..WARMUP + REPS {
+                    let t = Instant::now();
+                    serial_scope(|| kernel(&x, &mut out));
+                    let ds = t.elapsed();
+                    let t = Instant::now();
+                    // No host installed and not inside rayon: run_chunked takes
+                    // the rayon fall-through on the global pool.
+                    kernel(&x, &mut out);
+                    let dp = t.elapsed();
+                    if r >= WARMUP {
+                        ser.push(ds);
+                        par.push(dp);
+                    }
+                }
+                ser.sort_unstable();
+                par.sort_unstable();
+                let (s, prl) = (pct(&ser, 1, 2), pct(&par, 1, 2));
+                println!(
+                    "{n_label} {name:>5}: serial {:.0}  rayon {:.0}  -> {:.2}x faster",
+                    us(s),
+                    us(prl),
+                    us(s) / us(prl)
+                );
+            }
+        }
     }
 }

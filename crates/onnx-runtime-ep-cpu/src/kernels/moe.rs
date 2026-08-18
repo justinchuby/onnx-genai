@@ -46,15 +46,39 @@ pub(super) struct MoeAttributes {
     swiglu_limit: f32,
 }
 
+/// Every attribute check `MoEFactory::create` performs, in one place so that
+/// [`unsupported_reason`] and the factory cannot disagree.
+fn float_moe_attributes(node: &Node) -> Result<MoeAttributes> {
+    let attributes = MoeAttributes::from_node(node)?;
+    if int_attr(node, "block_size", 0)? != 0 {
+        return Err(error(
+            "block_size is a QMoE quantization attribute and is unsupported by float MoE",
+        ));
+    }
+    Ok(attributes)
+}
+
+/// Why this kernel cannot run a given `MoE` node, if it cannot.
+///
+/// Must be answered at *claim* time. `GetCapability` consults only the dtype
+/// and shape filters, so a rejection raised later, in the kernel factory,
+/// arrives after ORT has compiled the node onto this EP and is a **hard session
+/// failure that no fallback recovers from**. ORT's own CPU `MoE` kernel runs
+/// configurations this one does not yet implement — `use_sparse_mixer=1` most
+/// notably, which real sparse-mixer mixtures set — so claiming and then failing
+/// would take a model that works today and kill it at `CreateSession`.
+///
+/// Implemented by running the factory's own attribute parse, so a limit cannot
+/// be added to `create` without appearing here too.
+pub(crate) fn unsupported_reason(node: &Node) -> Option<String> {
+    float_moe_attributes(node).err().map(|e| e.to_string())
+}
+
 impl KernelFactory for MoEFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let attributes = MoeAttributes::from_node(node)?;
-        if int_attr(node, "block_size", 0)? != 0 {
-            return Err(error(
-                "block_size is a QMoE quantization attribute and is unsupported by float MoE",
-            ));
-        }
-        Ok(Box::new(MoEKernel { attributes }))
+        Ok(Box::new(MoEKernel {
+            attributes: float_moe_attributes(node)?,
+        }))
     }
 }
 

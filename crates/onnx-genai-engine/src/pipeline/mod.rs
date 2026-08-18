@@ -252,6 +252,13 @@ pub struct PipelineEngine {
     /// Only used when the decoder's KV cannot be paged; the paged cache below
     /// supersedes it, because it holds many prefixes instead of one.
     retained: Option<RetainedContext>,
+    /// Native decoder retained across sequential requests. Its CUDA KV bindings
+    /// stay device-resident in their original dtype (including BF16); `retained`
+    /// identifies the exact token prefix those bindings contain.
+    native_retained_decoder: Option<Box<dyn PipelineDecoderComponent>>,
+    /// Maximum suffix tokens sent through one native prefill graph invocation.
+    /// Declared by `model.runtime_configurable.chunked_prefill`.
+    prefill_chunk_size: Option<usize>,
     /// Paged KV for the decoder, when its `present.*` outputs describe a layout
     /// the page table can address.
     paged: Option<PipelinePagedKv>,
@@ -560,6 +567,20 @@ fn pipeline_metadata_max_len(directory: &onnx_genai_ort::PipelineModelDirectory)
         .and_then(|config| config.max_sequence_length())
 }
 
+fn pipeline_metadata_prefill_chunk_size(
+    directory: &onnx_genai_ort::PipelineModelDirectory,
+) -> Option<usize> {
+    directory
+        .metadata_path
+        .as_ref()
+        .and_then(|path| onnx_genai_metadata::load_metadata(path).ok())
+        .and_then(|metadata| metadata.model)
+        .and_then(|model| model.runtime_configurable)
+        .and_then(|runtime| runtime.chunked_prefill)
+        .and_then(|chunked| chunked.chunk_size)
+        .filter(|size| *size > 0)
+}
+
 /// Build the native device-KV [`PipelineDecoderComponent`] for `decoder`, loading
 /// its ONNX model as a [`NativeDecodeSession`](crate::native_decode::NativeDecodeSession)
 /// on the native backend so its KV cache stays session-resident across steps.
@@ -833,6 +854,7 @@ impl PipelineEngine {
         )?;
         let directory = PipelineModelDirectory::load(pipeline_dir)
             .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {e}"))?;
+        let prefill_chunk_size = pipeline_metadata_prefill_chunk_size(&directory);
         let model_weights_bytes =
             directory
                 .model_paths
@@ -1245,6 +1267,8 @@ impl PipelineEngine {
             )),
             memoizable_components,
             retained: None,
+            native_retained_decoder: None,
+            prefill_chunk_size,
             paged,
             native_device: config.native_device.clone(),
             native_prompt_sessions: RefCell::new(BTreeMap::new()),
