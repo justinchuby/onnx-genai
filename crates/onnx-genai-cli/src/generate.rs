@@ -14,9 +14,8 @@ use super::interactive::{
     install_ctrlc_handler, is_interrupt_error, repl_input_mode, warn_missing_context_limit,
 };
 use super::output::{
-    bind_response_tokens,
-    build_turn_prompt, detect_reasoning, emit_stats_line, load_chat_template, load_response_config,
-    run_generation_turn,
+    bind_response_tokens, build_turn_prompt, detect_reasoning, emit_stats_line, load_chat_template,
+    load_response_config, run_generation_turn,
 };
 use super::profile::{self, RunProfile};
 use super::{GenerateArgs, ProfileArgs, decode_backend_name, resolve_model_dir};
@@ -665,5 +664,3 @@ mod tests {
         );
     }
 }
-
-

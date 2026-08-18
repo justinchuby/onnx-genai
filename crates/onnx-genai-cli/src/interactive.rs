@@ -29,9 +29,8 @@ use super::commands::{
     render_repl_help, set_trace_recording,
 };
 use super::output::{
-    bind_response_tokens,
-    build_turn_prompt, detect_reasoning, display_paths, emit_stats_line, load_chat_template,
-    load_response_config, run_generation_turn,
+    bind_response_tokens, build_turn_prompt, detect_reasoning, display_paths, emit_stats_line,
+    load_chat_template, load_response_config, run_generation_turn,
 };
 use super::{EngineArgs, ProfileArgs, RunArgs, decode_backend_name, resolve_model_dir};
 use super::{live_turn, pages, profile};
@@ -1590,5 +1589,3 @@ mod tests {
         assert!(!initial_repl_show_stats(ReplInputMode::Plain, false));
     }
 }
-
-
