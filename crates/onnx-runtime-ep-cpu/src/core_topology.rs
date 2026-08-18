@@ -233,7 +233,12 @@ impl CoreTopology {
                 covered.extend(group.iter().copied());
             }
         }
-        leaders.extend(allowed_set.iter().copied().filter(|cpu| !covered.contains(cpu)));
+        leaders.extend(
+            allowed_set
+                .iter()
+                .copied()
+                .filter(|cpu| !covered.contains(cpu)),
+        );
         leaders.sort_unstable();
         leaders.dedup();
         leaders
@@ -419,12 +424,14 @@ mod windows_cores {
                 // `GroupMask` is declared as a 1-element array but is a trailing
                 // flexible array of `GroupCount` entries; walk it by offset from
                 // the record base so the bytes read stay inside `Size`.
-                let masks_offset =
-                    offset + (std::ptr::from_ref(&processor.GroupMask[0]) as usize
+                let masks_offset = offset
+                    + (std::ptr::from_ref(&processor.GroupMask[0]) as usize
                         - std::ptr::from_ref(&record) as usize);
                 for i in 0..group_count {
                     let entry_offset = masks_offset
-                        + i * size_of::<windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY>();
+                        + i * size_of::<
+                            windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY,
+                        >();
                     if entry_offset
                         + size_of::<windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY>()
                         > offset + size
@@ -434,10 +441,8 @@ mod windows_cores {
                     // SAFETY: bounds-checked against this record's `Size` above;
                     // `GROUP_AFFINITY` is POD and read unaligned.
                     let affinity = unsafe {
-                        std::ptr::read_unaligned(
-                            buffer.as_ptr().add(entry_offset)
-                                as *const windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY,
-                        )
+                        std::ptr::read_unaligned(buffer.as_ptr().add(entry_offset)
+                            as *const windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY)
                     };
                     siblings.extend(cpus_from_mask(affinity.Group, affinity.Mask as usize));
                 }
@@ -505,7 +510,10 @@ mod tests {
         let topology = adjacent_smt(16);
         let compact: Vec<usize> = (0..16).collect();
         assert_eq!(topology.physical_cores_within(&compact), 8);
-        assert_eq!(topology.leaders_within(&compact), vec![0, 2, 4, 6, 8, 10, 12, 14]);
+        assert_eq!(
+            topology.leaders_within(&compact),
+            vec![0, 2, 4, 6, 8, 10, 12, 14]
+        );
     }
 
     #[test]
@@ -577,7 +585,10 @@ mod tests {
         assert_eq!(parse_cpu_list("0,1-4294967295,7"), vec![0, 7]);
         // The bound is on the span, not on the endpoints: a narrow range high
         // up is still parsed.
-        assert_eq!(parse_cpu_list("1000000-1000001"), vec![1_000_000, 1_000_001]);
+        assert_eq!(
+            parse_cpu_list("1000000-1000001"),
+            vec![1_000_000, 1_000_001]
+        );
     }
 
     #[test]
@@ -605,7 +616,10 @@ mod tests {
         let mut seen = BTreeSet::new();
         for group in topology.cores() {
             assert!(!group.is_empty());
-            assert!(group.windows(2).all(|w| w[0] < w[1]), "group not sorted: {group:?}");
+            assert!(
+                group.windows(2).all(|w| w[0] < w[1]),
+                "group not sorted: {group:?}"
+            );
             for &cpu in group {
                 assert!(seen.insert(cpu), "cpu {cpu} appears in two cores");
             }

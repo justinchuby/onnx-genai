@@ -105,7 +105,11 @@ fn report_dispatch_latency_against_idle_gap() {
     let mut results = Vec::new();
     for gap_us in GAPS_US {
         let (p50, p90) = sample_at_gap(gap_us, width);
-        println!("{gap_us:>8}us  {:>10.1}us  {:>10.1}us", as_us(p50), as_us(p90));
+        println!(
+            "{gap_us:>8}us  {:>10.1}us  {:>10.1}us",
+            as_us(p50),
+            as_us(p90)
+        );
         results.push((gap_us, p50));
     }
 
@@ -168,8 +172,14 @@ fn report_latency_under_concurrent_sessions() {
                         samples.push(timed_fanout(&mut scratch));
                     }
                     samples.sort_unstable();
-                    total_p50.fetch_add(percentile(&samples, 0.5).as_nanos() as u64, Ordering::Relaxed);
-                    total_p90.fetch_add(percentile(&samples, 0.9).as_nanos() as u64, Ordering::Relaxed);
+                    total_p50.fetch_add(
+                        percentile(&samples, 0.5).as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                    total_p90.fetch_add(
+                        percentile(&samples, 0.9).as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
                 });
             }
         });

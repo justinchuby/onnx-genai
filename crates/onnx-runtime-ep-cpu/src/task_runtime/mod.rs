@@ -158,9 +158,16 @@ fn resolve_width() -> usize {
         return asked;
     }
     let inferred = crate::kernels::matmul_nbits::decode_thread_budget()
-        .or_else(|| std::thread::available_parallelism().ok().map(NonZeroUsize::get))
+        .or_else(|| {
+            std::thread::available_parallelism()
+                .ok()
+                .map(NonZeroUsize::get)
+        })
         .unwrap_or(1);
-    smt_cap(inferred, crate::core_topology::cap_spinning_workers(inferred))
+    smt_cap(
+        inferred,
+        crate::core_topology::cap_spinning_workers(inferred),
+    )
 }
 
 /// The width below which the SMT cap is not applied at all.
@@ -271,9 +278,7 @@ where
         }
     };
 
-    if use_host
-        && let Some(host) = host
-    {
+    if use_host && let Some(host) = host {
         return run_on_host(&host, tasks, &run_task);
     }
 
@@ -378,7 +383,12 @@ where
 /// # Panics
 ///
 /// Panics if `chunk` is zero, and propagates a panic from `body`.
-pub fn chunks_mut<T, F>(data: &mut [T], chunk: usize, min_chunks_per_task: usize, body: F) -> Backend
+pub fn chunks_mut<T, F>(
+    data: &mut [T],
+    chunk: usize,
+    min_chunks_per_task: usize,
+    body: F,
+) -> Backend
 where
     T: Send,
     F: Fn(usize, &mut [T]) + Sync,
