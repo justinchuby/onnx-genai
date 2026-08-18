@@ -80,4 +80,7 @@ Fresh adversarial review of `nxrt/mlas-avx2-layernorm` @ `72e02cd92c` after the 
 - Authored the oracle correction for DeepSeek-V2-Lite CPU-vs-CUDA divergence: wrong CPU-oracle premise, benign f32 accumulation-order drift, and token-5 top-k near-tie below fp32 resolution.
 - Added the f64-bounded QMoE expert-GEMV test and explicit native-CUDA/f64 decode-golden rationale; rebased onto current `main` and confirmed the golden held through #1129's MoE-claiming change.
 - PR #1150 merged as squash `e075a715`; resume QMoE optimization (`ONNX_GENAI_QMOE_OCC`/`QMOE_VEC`) on this corrected baseline.
+## 2026-08-18T01:35Z — QMoE occupancy lever delivered on corrected baseline
 
+- Rebuilt QMoE gate/up occupancy on #1150 baseline as `ONNX_GENAI_QMOE_OCC` default-OFF, symmetric int4 only; `(256,6)` launch bounds are spill-free and cut live gate/up kernel ~10.6%.
+- Byte-identity is green and V2-Lite E2E converts modestly (~+1%, 56.6→57.2 tok/s); down/grouped paths are already saturated or different-lane, so no remaining QMoE occupancy vein.

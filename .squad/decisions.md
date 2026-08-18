@@ -1,6 +1,6 @@
 # Decisions — live standing directives
 
-Last consolidated: 2026-08-18T00:35Z (Scribe merged DeepSeek-V2-Lite MoE episode; processed 4 V2-Lite inbox drops; no archive gate because live ledger stayed below 20KB.)
+Last consolidated: 2026-08-18T01:35Z (Scribe merged V2-Lite graph-capture/QMoE-occupancy arc; processed 15 inbox drops; no archive gate because live ledger stayed below 20KB.)
 
 Standing governance rules and active directives. Full narrative is archived; keep this file to current decisions plus durable rules.
 
@@ -79,3 +79,32 @@ Validation before merge: V2-Lite CUDA lock passed with CUDA graphs OFF and ON; a
 
 Policy precedent: for int4 GEMV/QMoE reductions, CPU bit-identity is not an oracle when accumulation order differs. Correctness is bounded agreement with an independent higher-precision reference plus deterministic backend output and explicit golden rationale.
 
+## 2026-08-18 — DeepSeek-V2-Lite MoE performance baseline and ORT capability gap
+
+Wallace measured the corrected post-#1150 DeepSeek-V2-Lite int4 MoE artifact on H200: native CUDA decode is **~55.6 tok/s median** in eager mode. CUDA graph ON and OFF are equivalent today because native declines capture on the MLA/MoE attention-mask path (`attention_mask_consumers_are_capacity_aware`); on-GPU argmax is not material for this smaller vocab.
+
+Stock ORT CUDA EP cannot serve this int4 QMoE model on GPU: all 26 `QMoE` nodes lack CUDA kernels, require EP fallback to load, insert 104 CPU/GPU boundary copies, and run at **~0.20 tok/s** with CPU experts. Report this as a capability gap — native is the only measured GPU engine for int4 QMoE here — not as a meaningful native-vs-ORT throughput multiplier.
+
+## 2026-08-18 — QMoE gate/up occupancy lever: GO, default-OFF
+
+Luv rebuilt the QMoE occupancy lever on the corrected #1150 baseline as `ONNX_GENAI_QMOE_OCC` (default-OFF, symmetric int4 gate/up only). The live lever is fused gate/up SwiGLU, not down-proj: `__launch_bounds__(256,6)` cuts registers **54→40**, stays spill-free, raises achieved occupancy **43.3%→63.8%**, and reduces the isolated kernel **42.3→37.8us (−10.6%)**; the `(256,8)` variant spills and is rejected.
+
+Byte-identity is green (`qmoe_occ_is_bit_identical`, full QMoE suite, E2E tokens equal to golden). End-to-end V2-Lite decode converts modestly but consistently, about **56.6→57.2 tok/s (~+1%)**, because gate/up is a small slice of MoE decode. Decision: review/ship as default-OFF modest win; no remaining QMoE occupancy lever after down/grouped paths proved saturated or different-lane.
+
+## 2026-08-18 — V2-Lite MoE CUDA graph-capture unlock: GO scope
+
+Wallace scoped the V2-Lite graph-capture blocker and found the current attention-mask decline is an **over-conservative capacity-policy bail**, not a hard correctness wall. V2-Lite's mask cone (`CumSum`/`Unsqueeze`/`GreaterOrEqual`/`And`/`Where`/`Cast`) terminates in capacity-form `Attention` input 3; padded columns are forced to fp16 −65504, unlike GLM-5.2's logical-width indexer `Add` case.
+
+Decision: implement a topology-gated padded-capacity classification for the additive-mask-builder-to-`Attention[3]` pattern, while keeping the general `CumSum`/`Unsqueeze` denylist and GLM-5.2 regression guard. No kernel edits are expected; tests must pin the V2-Lite positive case and GLM negative case. Gate the feature on empirical byte-identity after implementation (Wallace: frozen-mask capture vs eager, ≥300 tokens, 0.000% divergence). Projected upside is conservative **54.3→~82–86 tok/s** (+50% class), larger than remaining per-kernel micro-opts; Rachael review is mandatory.
+
+## 2026-08-18 — Greedy argmax tie-break canonical remains lowest-index
+
+Wallace confirmed the canonical greedy tie-break is **lowest token id**: host sampler, native tensor argmax, ONNX/ORT ArgMax default, and historical design all use first/lowest. The post-#1112 highest-index device_argmax was a default native-CUDA parity drift, not an opt-in benchmark-only choice. Decision: reconcile device_argmax back to lowest-index and protect with deliberate tie tests; this was later resolved by #1119.
+
+## 2026-08-18 — Device-resident token-feedback loop remains opt-in small win
+
+Holden's `ONNX_GENAI_DEVICE_TOKEN_LOOP=k` keeps sampled tokens on-device across captured replays and is byte-identical on GLM and qwen, with fallbacks=0. It genuinely shrinks the nsys cross-replay gap, but unprofiled wall-clock gain is only **~1%** because the earlier 17.4% host-feedback gap was profiler-inflated. Decision: keep default-OFF/opt-in; require hardware parity tests before any default promotion.
+
+## 2026-08-18 — Older Deckard decode drops deduped to archived/current decode standing
+
+Processed Deckard's pending 2026-08-15 drops for GQA aux merge, flash-decoding split retune, GQA core-warps, lever-2, group-reuse NO-GO, cp.async NO-GO, GEMV v2, fp16 GEMV, lm_head cuBLASLt, and default-on lm_head cuBLASLt. These are already covered by the archived decode-program narrative and the live standing rule that batch-1 byte-identical single-kernel work is mined out; do not duplicate their per-PR tables in the live ledger.
