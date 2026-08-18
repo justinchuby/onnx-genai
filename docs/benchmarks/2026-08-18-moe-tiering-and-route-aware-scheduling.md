@@ -198,3 +198,9 @@ policy is worth having before we spend hardware on them.
 4. **DirectStorage / GDS** — a cold-miss backstop for the compulsory first-touch and
    true capacity overflow, i.e. the last 10–20 %, consistent with the analysis's own
    ranking.
+
+**Composed follow-up:** the "tier to delete the SSD, then pin to shrink the PCIe bill"
+number is worked out in
+[2026-08-18-moe-offload-pcie-floor.md](2026-08-18-moe-offload-pcie-floor.md) —
+PCIe bytes/token vs VRAM budget, the transfer-only tok/s ceiling, and the VRAM a
+given MoE needs to hit a target rate.
