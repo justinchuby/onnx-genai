@@ -424,9 +424,17 @@ mod windows_cores {
                 // `GroupMask` is declared as a 1-element array but is a trailing
                 // flexible array of `GroupCount` entries; walk it by offset from
                 // the record base so the bytes read stay inside `Size`.
+                //
+                // The offset is the field's position *within the record type* --
+                // computing it as a delta between `&processor` (a by-value copy
+                // read out of the union) and `&record` would subtract two
+                // unrelated stack addresses and produce a garbage offset, which
+                // fails the bounds check below and silently drops every core.
                 let masks_offset = offset
-                    + (std::ptr::from_ref(&processor.GroupMask[0]) as usize
-                        - std::ptr::from_ref(&record) as usize);
+                    + std::mem::offset_of!(
+                        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+                        Anonymous.Processor.GroupMask
+                    );
                 for i in 0..group_count {
                     let entry_offset = masks_offset
                         + i * size_of::<
@@ -628,6 +636,40 @@ mod tests {
         assert!(
             cores.windows(2).all(|w| w[0][0] < w[1][0]),
             "cores not ordered by first cpu"
+        );
+    }
+
+    /// Non-vacuous on Windows: `GetLogicalProcessorInformationEx` is always
+    /// available, so detection must *succeed* here — a `None` means the
+    /// flexible-array walk in `windows_cores::processor_cores` dropped every
+    /// core (the way a wrong `GroupMask` offset does), which silently disables
+    /// the SMT/physical-core cap and lets the task pool oversubscribe every
+    /// logical CPU. The self-consistent test above returns early on `None`, so
+    /// it cannot catch that; this one asserts the precondition held.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_detection_succeeds_and_covers_every_logical_cpu() {
+        let topology = host().expect("Windows core-topology detection returned None");
+        assert!(topology.core_count() > 0, "no physical cores discovered");
+        // `available_parallelism` counts the logical CPUs the process may use;
+        // the discovered topology must cover at least that many, or the cap is
+        // being computed against a truncated view of the machine.
+        let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert!(
+            topology.logical_count() >= logical,
+            "topology covers {} logical CPUs but the process sees {logical}",
+            topology.logical_count()
+        );
+        // On an SMT or hybrid part the cap must actually reduce below the
+        // logical count; on a non-SMT part it is the identity. Either way it is
+        // never zero for a non-zero request and never exceeds the physical
+        // cores the process may run on.
+        let capped = cap_spinning_workers(logical);
+        assert!(capped >= 1 && capped <= logical);
+        assert!(
+            capped <= topology.core_count(),
+            "cap {capped} exceeds {} physical cores",
+            topology.core_count()
         );
     }
 }
