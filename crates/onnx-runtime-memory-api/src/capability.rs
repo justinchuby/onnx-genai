@@ -23,145 +23,61 @@
 //! successful-looking no-op. A caller that needs the capability gets an
 //! `Option` to match on, not a method to call and hope was meaningful.
 //!
-//! # Capability identity
+//! # Capability identity — what Phase 2 does and does not prove
 //!
 //! [`VirtualBacking::device`] and [`SharedMapping::device`] must equal the
-//! owning allocator's [`DeviceAllocator::device`].
+//! owning allocator's [`DeviceAllocator::device`], and a caller must check
+//! that before trusting the two belong together — two unrelated arenas on the
+//! same device compare equal by [`DeviceKey`] alone.
+//!
 //! Discovery always goes through the same allocator reference a caller
-//! already holds (`allocator.as_virtual_backing()`), so there is no second
-//! handle that could go stale or be swapped independently — but a caller that
-//! stores the returned `&dyn VirtualBacking`/`&dyn SharedMapping` alongside a
-//! *different* allocator's identity (for instance, mixing up two devices, or
-//! mixing a capability obtained from one allocator with a pointer allocated by
-//! another) can still check `device()` itself before trusting the two belong
-//! together.
+//! already holds (`allocator.as_virtual_backing()`), so there is no *second*
+//! handle that could independently go stale or be swapped out from under a
+//! caller holding the first one.
+//!
+//! That is the full extent of what this crate structurally proves. It does
+//! **not** prove that a type's `VirtualBacking`/`SharedMapping` method bodies
+//! actually operate on the same backing state as its own
+//! [`DeviceAllocator::allocate`]/[`DeviceAllocator::deallocate`]. An earlier
+//! design (#1186 Phase 2 review, rounds 1/3/4) tried to prove exactly that
+//! with a self-reported identity token (compare a data pointer, then a data
+//! pointer plus [`TypeId`](std::any::TypeId)), rejecting a composite type
+//! whose advertised capability was a visibly different object. Coordinator
+//! review (round 6) found that design fundamentally unsound in the general
+//! case: nothing stops a single, honestly-self-identifying type from
+//! internally forwarding its `DeviceAllocator` methods to one backing object
+//! and its `VirtualBacking`/`SharedMapping` methods to an unrelated one —
+//! the check only ever compares *which object* implements a trait, never
+//! *what its methods do*, and no such self-attested token can close that gap
+//! (a hostile or merely buggy implementor can report whatever identity it
+//! likes; a legitimate delegating wrapper can just as easily be rejected by
+//! the same check). The token apparatus was removed rather than kept as a
+//! false assurance.
+//!
+//! Phase 2 therefore treats "a mechanism's `VirtualBacking`/`SharedMapping`
+//! genuinely shares state with its own ordinary allocation/release" as a
+//! **trusted-implementor invariant**, scoped to the mechanisms this
+//! workspace ships and reviews (`HostAllocator`, `CudaVmmAllocator`) — not
+//! something proven against an arbitrary or adversarial implementor. Closing
+//! that gap for real requires a registry that *issues* capability access
+//! rather than trusting a mechanism to self-report it, which is #1186
+//! Phase 3's "provider/context pinning and binding identity" work, not
+//! Phase 2's.
 
-use std::any::{Any, TypeId};
+use std::any::Any;
 use std::ptr::NonNull;
 
 use crate::MemoryError;
+// `DeviceAllocator` itself is never named in this module's actual code — only
+// in intra-doc links (`[`DeviceAllocator::allocate`]` and friends) above and
+// on individual items below, which need it in scope to resolve. Keep the
+// import and silence the resulting unused-import lint rather than dropping
+// it, since dropping it turns those doc links into rustdoc errors.
+#[allow(unused_imports)]
+use crate::allocator::DeviceAllocator;
 use crate::allocator::{
-    AllocationCommitRange, DeviceAllocator, DeviceKey, SharedDevicePrefix, SharedPrefixCommitInfo,
+    AllocationCommitRange, DeviceKey, SharedDevicePrefix, SharedPrefixCommitInfo,
 };
-
-/// A concrete mechanism's stable, unforgeable identity.
-///
-/// Two different [`DeviceAllocator`] instances must never compare equal
-/// here, and one concrete instance must always compare equal to itself —
-/// including across the different trait-object references a caller might
-/// hold to it (its own `&dyn DeviceAllocator`, and any `&dyn
-/// VirtualBacking`/`&dyn SharedMapping` it returns from
-/// `as_virtual_backing`/`as_shared_mapping`). This is exactly what
-/// [`capability_shares_mechanism`] compares, through
-/// [`DeviceAllocator::mechanism_id`].
-///
-/// # Why not upcast `&dyn DeviceAllocator` to `&dyn Any` directly
-///
-/// An earlier design (#1186 Phase 2 review, round 3) added `Any` as a
-/// supertrait of [`DeviceAllocator`] so a `&dyn DeviceAllocator` could be
-/// upcast to `&dyn Any` and compared by data pointer and [`TypeId`].
-/// `Any: 'static`, so that supertrait transitively forced *every*
-/// `DeviceAllocator` implementation to be `'static` — a real regression
-/// against "minimal ordinary contract", since it rejected an otherwise
-/// valid allocator that borrows non-`'static` data, such as one built over
-/// a caller-owned arena reference (#1186 Phase 2 review, round 4 finding 2).
-///
-/// `MechanismId` itself carries no lifetime parameter: it stores an untyped
-/// data pointer and a [`TypeId`], both plain, lifetime-free values.
-/// Constructing one does still require the value it is computed from to be
-/// `'static` (`TypeId::of` requires it), but that requirement now falls only
-/// on the specific, concrete [`DeviceAllocator::mechanism_id`] override that
-/// opts in — never on the trait itself, and never on an implementation that
-/// has no capability to identify and simply keeps the default `None`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MechanismId {
-    ptr: *const (),
-    type_id: TypeId,
-}
-
-impl MechanismId {
-    /// Compute the identity of a concrete, `'static` mechanism from its own
-    /// reference to itself.
-    ///
-    /// Call this as `MechanismId::of(self)` from inside a concrete type's
-    /// own [`DeviceAllocator::mechanism_id`] override (or an equivalent
-    /// override on [`VirtualBacking`]/[`SharedMapping`] for a capability
-    /// object that is a distinct value from the allocator) — never from
-    /// outside through a trait object, which is the one thing this design
-    /// exists to avoid requiring.
-    pub fn of<T: Any>(value: &T) -> Self {
-        Self {
-            ptr: (value as *const T).cast(),
-            type_id: TypeId::of::<T>(),
-        }
-    }
-
-    /// Compute the identity of a capability object already reached through
-    /// [`VirtualBacking::as_any`]/[`SharedMapping::as_any`].
-    pub fn of_dyn(value: &dyn Any) -> Self {
-        Self {
-            ptr: (value as *const dyn Any).cast(),
-            type_id: value.type_id(),
-        }
-    }
-}
-
-/// Whether `capability`, discovered from `allocator`, is genuinely the same
-/// concrete mechanism as `allocator` itself — not a different internal object
-/// that merely reports a matching [`DeviceKey`].
-///
-/// [`DeviceKey`] alone is not strong enough identity to bind a capability to
-/// the allocator it came from: two unrelated arenas on the same device
-/// compare equal by `DeviceKey`. This instead compares each side's
-/// [`MechanismId`] — a data pointer paired with a concrete [`TypeId`], which
-/// together cannot be produced by accident (see `MechanismId`'s own
-/// documentation for why the pointer alone is forgeable and the `TypeId`
-/// closes that gap).
-///
-/// `allocator.mechanism_id()` must be `Some` and equal `capability`'s own
-/// `MechanismId` (via [`MechanismId::of_dyn`]) for this to return `true`. An
-/// allocator that never overrides [`DeviceAllocator::mechanism_id`] (the
-/// default `None`) can never share a mechanism with anything through this
-/// check — which is the correct, conservative answer for a type that has
-/// opted out of identity-checked capabilities entirely, not a false
-/// rejection.
-///
-/// Every capability implementation this crate ships (`CudaVmmAllocator`'s
-/// `as_virtual_backing`/`as_shared_mapping`, paired with its own
-/// `mechanism_id` override) reports the same identity for the allocator and
-/// for the capability object it hands out, so this always holds for them;
-/// this exists to let a caller reject, rather than trust, an allocator
-/// composed so that its ordinary [`DeviceAllocator::allocate`]/
-/// [`DeviceAllocator::deallocate`] and its advertised capability are backed
-/// by two different objects — which would let a pointer produced through
-/// the capability be freed through a mechanism that never produced it
-/// (#1186 Phase 2 review, round 1 finding 1; round 3 finding 1 closed the
-/// pointer-only version of this check; round 4 finding 2 moved the identity
-/// off a blanket `Any` supertrait and onto this opt-in method).
-///
-/// [`TypeId`]: std::any::TypeId
-///
-/// # Example
-///
-/// ```
-/// use std::any::Any;
-/// use onnx_runtime_memory_api::allocator::{DeviceAllocator, DeviceKey, HostAllocator};
-/// use onnx_runtime_memory_api::capability::capability_shares_mechanism;
-///
-/// let allocator = HostAllocator;
-/// let allocator_ref: &dyn DeviceAllocator = &allocator;
-/// let other: &dyn Any = &allocator; // a different reference to the *same* value
-/// assert!(capability_shares_mechanism(allocator_ref, other));
-///
-/// let unrelated = HostAllocator;
-/// let unrelated_ref: &dyn Any = &unrelated;
-/// assert!(!capability_shares_mechanism(allocator_ref, unrelated_ref));
-/// ```
-pub fn capability_shares_mechanism(allocator: &dyn DeviceAllocator, capability: &dyn Any) -> bool {
-    allocator
-        .mechanism_id()
-        .is_some_and(|id| id == MechanismId::of_dyn(capability))
-}
 
 /// Lazy commit/decommit over an allocator's own reservations.
 ///
@@ -185,10 +101,9 @@ pub fn capability_shares_mechanism(allocator: &dyn DeviceAllocator, capability: 
 ///   [`DeviceAllocator::deallocate`]/[`DeviceAllocator::deallocate_with_unmapped`]:
 ///   routing release through the same capability reference that produced the
 ///   pointer (rather than re-deriving a release path from the owning
-///   allocator) is what makes "the mechanism that allocated this is the
-///   mechanism that frees it" true by construction instead of by convention —
-///   see [`capability_shares_mechanism`] for why `DeviceKey` alone cannot
-///   prove that on its own. Reports the number of bytes whose physical
+///   allocator) is the discipline a caller must follow — this crate does not
+///   structurally verify it (see this module's "Capability identity" notes).
+///   Reports the number of bytes whose physical
 ///   mapping actually transitioned from committed to uncommitted, the same
 ///   accounting [`decommit_allocation_range`](Self::decommit_allocation_range)
 ///   reports, so a mapped-zone refund is never silently lost the way an
@@ -360,12 +275,15 @@ pub trait VirtualBacking: Send + Sync {
 /// * `commit_shared_prefix` maps `prefix` read-only into a live allocation
 ///   and never mis-maps: it errors rather than mapping over an already
 ///   committed region, mixing devices, or mixing pool authorities.
-/// * `release_shared_mapping` atomically clears the shared-mapping bookkeeping
-///   for one allocation and reports exactly the bytes that transitioned from
-///   mapped to unmapped in that single call, so that mapped cost this
-///   capability created is never lost the way an always-zero default would
-///   lose it, and is never reported from a stale snapshot the way a
-///   query-then-clear pair would risk under concurrency — symmetric with
+/// * `release_shared_mapping` clears the shared-mapping bookkeeping for one
+///   allocation as a single, non-interleavable operation from the mechanism's
+///   own perspective (a lock, a compare-and-swap loop, or equivalent — see
+///   its own documentation for exactly what this does and does not
+///   guarantee), and reports exactly the bytes that transitioned from mapped
+///   to unmapped in that call, so that mapped cost this capability created is
+///   never lost the way an always-zero default would lose it, and is never
+///   reported from a stale snapshot the way a query-then-clear pair would
+///   risk under concurrency — symmetric with
 ///   [`VirtualBacking::deallocate_committed`]'s release report, and required
 ///   for the same reason: `SharedMapping` and `VirtualBacking` are
 ///   independent capabilities, so a mechanism that implements only this one
@@ -400,9 +318,9 @@ pub trait SharedMapping: Send + Sync {
         byte_offset: usize,
     ) -> Result<SharedPrefixCommitInfo, MemoryError>;
 
-    /// Atomically release the shared-mapping bookkeeping for the allocation
-    /// at `ptr` and report exactly the bytes that transitioned from mapped
-    /// to unmapped as a result of **this** call.
+    /// Release the shared-mapping bookkeeping for the allocation at `ptr`
+    /// and report exactly the bytes that transitioned from mapped to
+    /// unmapped as a result of **this** call.
     ///
     /// [`DeviceAllocator::deallocate_with_unmapped`]'s default calls this
     /// whenever [`DeviceAllocator::as_shared_mapping`] returns `Some`, so a
@@ -421,22 +339,35 @@ pub trait SharedMapping: Send + Sync {
     ///
     /// # Contract
     ///
-    /// This is a release operation, not a query: it must atomically observe
-    /// and clear whatever bookkeeping tracks this allocation's shared-mapped
-    /// bytes, under one mechanism synchronization boundary (a lock, a
-    /// compare-and-swap loop, or equivalent) so no concurrent caller can
-    /// observe the accounting between the read and the clear. A prior
-    /// version of this contract split those two steps into a pure query
-    /// method and a separate `deallocate` call; that gap let a concurrent
-    /// mapping change, a cached free, or a failed release be reported as if
-    /// it had actually happened (#1186 Phase 2 review, round 4 finding 1).
+    /// This is a release operation, not a query: from the perspective of this
+    /// mechanism's own in-memory bookkeeping, it must observe and clear
+    /// whatever tracks this allocation's shared-mapped bytes as one
+    /// non-interleavable step (a lock, a compare-and-swap loop, or
+    /// equivalent) so no concurrent caller can observe the accounting between
+    /// the read and the clear. A prior version of this contract split those
+    /// two steps into a pure query method and a separate `deallocate` call;
+    /// that gap let a concurrent mapping change, a cached free, or a failed
+    /// release be reported as if it had actually happened (#1186 Phase 2
+    /// review, round 4 finding 1). The guarantees below are about that
+    /// in-memory bookkeeping; they are **not** a claim that an underlying
+    /// multi-step OS/driver release (for instance, unmap-then-release-handle)
+    /// is itself indivisible. If such an operation can succeed partway and
+    /// then fail, that partial, possibly irreversible mutation is a property
+    /// of the backend, not something this contract can retroactively undo —
+    /// implementations must document any such gap explicitly rather than
+    /// imply it does not exist. A caller that needs a release to be provably
+    /// safe against that class of partial hardware/driver failure needs an
+    /// owning allocation token and a deferred, reconciled release state
+    /// machine, which is #1186 Phase 4's scope, not this trait's.
     ///
-    /// * **Exact once**: a `ptr` whose shared mapping this call has already
-    ///   released must report `0` on every subsequent call — it must not be
-    ///   possible to refund the same bytes twice.
-    /// * **Failure refunds zero and preserves state**: if the underlying
-    ///   release cannot complete, this returns `0` and leaves the mapping
-    ///   bookkeeping exactly as it was, so a caller may safely retry.
+    /// * **Exact once** (bookkeeping): a `ptr` whose shared mapping this call
+    ///   has already released must report `0` on every subsequent call — it
+    ///   must not be possible to refund the same bookkept bytes twice.
+    /// * **Failure refunds zero and preserves state** (bookkeeping): if the
+    ///   underlying release cannot complete, this returns `0` and leaves the
+    ///   mapping bookkeeping exactly as it was, so a caller may safely retry
+    ///   — except insofar as the backend itself already made an irreversible
+    ///   partial change outside this bookkeeping, per the paragraph above.
     /// * **Concurrency**: multiple threads calling this for the same `ptr`
     ///   must divide the true mapped total exactly once among them (any
     ///   ordering is fine; double-counting or losing bytes is not).
@@ -463,91 +394,25 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use crate::allocator::HostAllocator;
+    use crate::allocator::{DeviceAllocator, HostAllocator};
 
-    /// A trivial `VirtualBacking` that is never actually called: it exists
-    /// only so its address can be compared, never so its methods run.
+    /// A `DeviceAllocator` whose `VirtualBacking` capability is *itself*
+    /// (`as_virtual_backing` returns `Some(self)`, the idiomatic, honestly
+    /// self-identifying pattern) but whose `VirtualBacking` method bodies
+    /// silently forward to a second, unrelated backing (`foreign`) rather
+    /// than the same state its own `allocate`/`deallocate` use. This is the
+    /// case coordinator round-6 review found no self-reported identity token
+    /// can distinguish from a genuinely consistent implementation: both
+    /// present the exact same object as "the" `VirtualBacking`, so nothing
+    /// short of inspecting method bodies (impossible from outside the type)
+    /// tells them apart. The test below documents this honestly as an
+    /// accepted trust boundary rather than pretending it is checked.
     #[derive(Debug, Default)]
-    struct Marker;
-
-    impl VirtualBacking for Marker {
-        fn device(&self) -> DeviceKey {
-            DeviceKey::device(0)
-        }
-
-        fn allocate_committed(
-            &self,
-            _bytes: usize,
-            _align: usize,
-            _committed_ranges: &[std::ops::Range<usize>],
-        ) -> Result<NonNull<u8>, MemoryError> {
-            unimplemented!("test double: never called")
-        }
-
-        unsafe fn deallocate_committed(
-            &self,
-            _ptr: NonNull<u8>,
-            _allocation_bytes: usize,
-            _align: usize,
-        ) -> u64 {
-            unimplemented!("test double: never called")
-        }
-
-        fn commit_allocation_range(
-            &self,
-            _ptr: NonNull<u8>,
-            _allocation_bytes: usize,
-            _align: usize,
-            _offset: usize,
-            _bytes: usize,
-        ) -> Result<(), MemoryError> {
-            unimplemented!("test double: never called")
-        }
-
-        fn mapped_bytes_for_allocation_ranges(
-            &self,
-            _ranges: &[AllocationCommitRange],
-        ) -> Result<u64, MemoryError> {
-            unimplemented!("test double: never called")
-        }
-
-        fn mapped_bytes_for_allocation(&self, _bytes: usize, _align: usize) -> Result<u64, MemoryError> {
-            unimplemented!("test double: never called")
-        }
-
-        fn decommit_allocation_range(
-            &self,
-            _ptr: NonNull<u8>,
-            _allocation_bytes: usize,
-            _align: usize,
-            _offset: usize,
-            _bytes: usize,
-        ) -> Result<u64, MemoryError> {
-            unimplemented!("test double: never called")
-        }
-
-        fn allocation_committed_bytes(
-            &self,
-            _ptr: NonNull<u8>,
-            _allocation_bytes: usize,
-            _align: usize,
-        ) -> usize {
-            unimplemented!("test double: never called")
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
+    struct SplitInnerWrapper {
+        foreign_committed: std::sync::atomic::AtomicU64,
     }
 
-    /// Genuinely returns itself as its own `VirtualBacking`, the way a real
-    /// combined allocator/capability type does — as opposed to
-    /// `OffsetZeroComposite` below, which returns an *embedded* object that
-    /// merely shares its address.
-    #[derive(Debug, Default)]
-    struct HonestSelfReporter;
-
-    impl DeviceAllocator for HonestSelfReporter {
+    impl DeviceAllocator for SplitInnerWrapper {
         fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
             HostAllocator.allocate(bytes, align)
         }
@@ -562,35 +427,40 @@ mod tests {
         }
 
         fn as_virtual_backing(&self) -> Option<&dyn VirtualBacking> {
+            // Idiomatic and honest at the object-identity level: returns
+            // `self`, not a visibly different object.
             Some(self)
         }
-
-        fn mechanism_id(&self) -> Option<MechanismId> {
-            Some(MechanismId::of(self))
-        }
     }
 
-    impl VirtualBacking for HonestSelfReporter {
+    impl VirtualBacking for SplitInnerWrapper {
         fn device(&self) -> DeviceKey {
             DeviceKey::device(0)
         }
 
         fn allocate_committed(
             &self,
-            _bytes: usize,
+            bytes: usize,
             _align: usize,
             _committed_ranges: &[std::ops::Range<usize>],
         ) -> Result<NonNull<u8>, MemoryError> {
-            unimplemented!("test double: never called")
+            // Deliberately tracks state that `DeviceAllocator::allocate`
+            // above never touches, standing in for "a totally different
+            // backing object" without needing a second real allocator.
+            self.foreign_committed
+                .fetch_add(bytes as u64, std::sync::atomic::Ordering::AcqRel);
+            HostAllocator.allocate(bytes, 8)
         }
 
         unsafe fn deallocate_committed(
             &self,
             _ptr: NonNull<u8>,
-            _allocation_bytes: usize,
+            allocation_bytes: usize,
             _align: usize,
         ) -> u64 {
-            unimplemented!("test double: never called")
+            self.foreign_committed
+                .fetch_sub(allocation_bytes as u64, std::sync::atomic::Ordering::AcqRel);
+            allocation_bytes as u64
         }
 
         fn commit_allocation_range(
@@ -640,86 +510,49 @@ mod tests {
         }
     }
 
-    /// The exact composite the round-3 review flagged: `#[repr(C)]` puts
-    /// `foreign` at byte offset zero, so `&composite as *const _ as *const
-    /// ()` and `&composite.foreign as *const _ as *const ()` are the same
-    /// address, even though `foreign` is a distinct, embedded object with its
-    /// own type — not `composite` itself. Overrides `mechanism_id` with its
-    /// own (wrapper) identity so the rejection test below is non-vacuous: it
-    /// proves the `TypeId` mismatch defeats the address collision, not merely
-    /// that the wrapper lacks identity support at all.
-    #[repr(C)]
-    #[derive(Debug)]
-    struct OffsetZeroComposite {
-        foreign: Marker,
-        _extra: u64,
-    }
-
-    impl DeviceAllocator for OffsetZeroComposite {
-        fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
-            HostAllocator.allocate(bytes, align)
-        }
-
-        unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
-            // SAFETY: forwarded under this method's identical contract.
-            unsafe { HostAllocator.deallocate(ptr, bytes, align) };
-        }
-
-        fn device(&self) -> DeviceKey {
-            DeviceKey::device(0)
-        }
-
-        fn as_virtual_backing(&self) -> Option<&dyn VirtualBacking> {
-            // Deliberately the embedded first field, not `self`.
-            Some(&self.foreign)
-        }
-
-        fn mechanism_id(&self) -> Option<MechanismId> {
-            // Deliberately the composite's own identity, not `self.foreign`'s
-            // — proving the rejection below comes from a genuine `TypeId`
-            // mismatch, not from `OffsetZeroComposite` having opted out of
-            // identity entirely.
-            Some(MechanismId::of(self))
-        }
-    }
-
     #[test]
-    fn genuine_self_reference_still_shares_mechanism() {
-        let allocator = HonestSelfReporter;
-        let allocator_ref: &dyn DeviceAllocator = &allocator;
-        let virtual_backing = allocator_ref.as_virtual_backing().expect("advertised");
-        assert!(
-            capability_shares_mechanism(allocator_ref, virtual_backing.as_any()),
-            "an allocator that honestly returns `Some(self)` (through its own field, reached by \
-             address) must still be recognized as sharing its own mechanism"
-        );
-    }
+    fn documented_limitation_a_same_self_capability_can_still_track_unrelated_state() {
+        // This is not a desirable property; it is a regression guard on the
+        // documented trust boundary in this module's top-level docs. If this
+        // test starts failing, either `VirtualBacking`/`DeviceAllocator` grew
+        // a way to detect this (update the docs to say so) or `allocate`
+        // stopped forwarding to `HostAllocator` (unrelated breakage).
+        let wrapper = SplitInnerWrapper::default();
+        let allocator_ref: &dyn DeviceAllocator = &wrapper;
+        let virtual_backing = allocator_ref
+            .as_virtual_backing()
+            .expect("SplitInnerWrapper advertises VirtualBacking");
 
-    #[test]
-    fn offset_zero_embedded_capability_is_not_treated_as_the_same_mechanism() {
-        let composite = OffsetZeroComposite {
-            foreign: Marker,
-            _extra: 0,
-        };
-
-        // Non-vacuous: prove the address collision this test exists to guard
-        // against is real, not a hypothetical.
-        let composite_addr = &composite as *const OffsetZeroComposite as *const ();
-        let foreign_addr = &composite.foreign as *const Marker as *const ();
-        assert!(
-            std::ptr::eq(composite_addr, foreign_addr),
-            "test setup did not reproduce the offset-zero address collision `#[repr(C)]` is \
-             supposed to guarantee"
+        // `committed_ranges` is `&[std::ops::Range<usize>]`, an actual list
+        // of ranges this capability tracks, not a `Vec<usize>` in disguise —
+        // a single-element array literal here is a deliberate, correct call,
+        // not the ambiguous pattern the lint exists to catch.
+        #[allow(clippy::single_range_in_vec_init)]
+        let committed_ranges = [0..64];
+        let ptr = virtual_backing
+            .allocate_committed(64, 8, &committed_ranges)
+            .expect("allocate_committed granted");
+        assert_eq!(
+            wrapper
+                .foreign_committed
+                .load(std::sync::atomic::Ordering::Acquire),
+            64,
+            "allocate_committed must have run — proving it really is disjoint bookkeeping from              DeviceAllocator::allocate, not merely a hypothetical"
         );
 
-        let allocator_ref: &dyn DeviceAllocator = &composite;
-        let virtual_backing = allocator_ref.as_virtual_backing().expect("advertised");
-        assert!(
-            !capability_shares_mechanism(allocator_ref, virtual_backing.as_any()),
-            "a foreign `VirtualBacking` embedded at a wrapper's offset zero must never be \
-             treated as the wrapper's own mechanism just because their addresses coincide \
-             (#1186 Phase 2 review, round 3 finding 1)"
+        // SAFETY: `ptr` came from this capability's own `allocate_committed`
+        // above with matching bytes/align, released exactly once here.
+        unsafe { virtual_backing.deallocate_committed(ptr, 64, 8) };
+        assert_eq!(
+            wrapper
+                .foreign_committed
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "deallocate_committed must have run against the same disjoint bookkeeping"
         );
+        // SAFETY: `ptr` also came from `HostAllocator::allocate` (what our
+        // `DeviceAllocator::allocate` forwards to) with matching bytes/align.
+        unsafe { allocator_ref.deallocate(ptr, 64, 8) };
     }
 
     /// A `SharedMapping`-only allocator: no `VirtualBacking` at all, so its
@@ -1042,10 +875,10 @@ mod tests {
             DeviceKey::device(0)
         }
 
-        // Deliberately does not override `mechanism_id`, `as_virtual_backing`,
-        // or `as_shared_mapping`: a borrowed, non-`'static` allocator is
-        // exactly the kind of type that should be able to implement only the
-        // minimal ordinary contract and nothing more.
+        // Deliberately does not override `as_virtual_backing` or
+        // `as_shared_mapping`: a borrowed, non-`'static` allocator is exactly
+        // the kind of type that should be able to implement only the minimal
+        // ordinary contract and nothing more.
     }
 
     #[test]
@@ -1053,8 +886,9 @@ mod tests {
         let arena = BorrowedArena::default();
         let allocator = BorrowedAllocator { arena: &arena };
 
-        // This line is the actual proof: `DeviceAllocator` no longer requires
-        // `Any`, so a trait object over a non-`'static` reference compiles.
+        // This line is the actual proof: `DeviceAllocator` does not require
+        // `Any`/`'static`, so a trait object over a non-`'static` reference
+        // compiles.
         let as_dyn: &dyn DeviceAllocator = &allocator;
 
         let ptr = as_dyn.allocate(64, 8).expect("borrowed allocation");
@@ -1063,11 +897,6 @@ mod tests {
             unsafe { *arena.allocated.get() },
             64,
             "allocate must still run through the borrowed arena"
-        );
-        assert!(
-            as_dyn.mechanism_id().is_none(),
-            "an allocator that never overrides `mechanism_id` must report `None`, not be forced \
-             to fabricate an identity (#1186 Phase 2 review, round 4 finding 2)"
         );
 
         // SAFETY: `ptr` came from this allocator's own `allocate` above with

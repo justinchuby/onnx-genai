@@ -57,9 +57,8 @@ use std::sync::{Arc, Mutex};
 
 use onnx_runtime_memory_governor::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HolderId, MappedPhysicalCapacityToken,
-    MechanismId, MemoryAuthorityId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole,
-    SharedDevicePrefix, SharedMapping, SharedPrefixCommitInfo, Tier,
-    VirtualBacking as MemoryVirtualBacking,
+    MemoryAuthorityId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, SharedDevicePrefix,
+    SharedMapping, SharedPrefixCommitInfo, Tier, VirtualBacking as MemoryVirtualBacking,
 };
 use onnx_runtime_virtual_memory::{PhysicalMemoryAccounting, VirtualBacking};
 
@@ -1778,16 +1777,6 @@ impl DeviceAllocator for CudaVmmAllocator {
     fn as_shared_mapping(&self) -> Option<&dyn SharedMapping> {
         self.backing.physical_pool().is_some().then_some(self)
     }
-
-    /// `Some(MechanismId::of(self))`: `CudaVmmAllocator` is a concrete,
-    /// `'static` type, and every capability it advertises through
-    /// `as_virtual_backing`/`as_shared_mapping` returns `self` — so its own
-    /// identity is exactly what a caller needs to prove a capability
-    /// genuinely came from this allocator (#1186 Phase 2 review, round 4
-    /// finding 2).
-    fn mechanism_id(&self) -> Option<MechanismId> {
-        Some(MechanismId::of(self))
-    }
 }
 
 // SAFETY: every pointer handed to these methods lies inside this allocator's
@@ -2149,10 +2138,7 @@ impl SharedMapping for CudaVmmAllocator {
     /// (`impl DeviceAllocator for CudaVmmAllocator::deallocate_with_unmapped`
     /// overrides the base default entirely, above). This exists for a caller
     /// that reaches release accounting through `as_shared_mapping` directly,
-    /// bypassing that override (#1186 Phase 2 review, round 3 finding 2), and
-    /// for that caller it must still perform a genuine, atomic, exact-once
-    /// release — not merely answer a query (#1186 Phase 2 review, round 4
-    /// finding 1).
+    /// bypassing that override (#1186 Phase 2 review, round 3 finding 2).
     ///
     /// This allocator's granule tracking does not record whether a committed
     /// granule became committed through an ordinary
@@ -2162,17 +2148,38 @@ impl SharedMapping for CudaVmmAllocator {
     /// the physical page is mapped and the address range is live. So
     /// delegating straight to [`deallocate_span`](Self::deallocate_span) —
     /// the same machinery [`DeviceAllocator::deallocate`] and
-    /// [`MemoryVirtualBacking::deallocate_committed`] both use — is both the
+    /// [`MemoryVirtualBacking::deallocate_committed`] both use — is the
     /// conservative, always-correct accounting answer (this allocation's
     /// whole committed footprint, exactly what `deallocate_committed` would
-    /// itself report if invoked instead) *and* a genuine atomic release: the
-    /// span's removal from the live-allocation table and its granule release
-    /// happen under one lock acquisition inside `deallocate_span`, and
-    /// removing an already-removed span is a safe no-op that reports `0` —
-    /// so this method is exact-once, refunds zero on a repeated or otherwise
-    /// unmatched call, and is safe to call whether or not a caller also
-    /// later calls [`DeviceAllocator::deallocate`]/`deallocate_with_unmapped`
-    /// on the same pointer (which would simply find nothing left to release).
+    /// itself report if invoked instead), and is exact-once against repeated
+    /// calls from this crate's own bookkeeping: the span's removal from the
+    /// live-allocation table happens under one lock acquisition inside
+    /// `deallocate_span`, and removing an already-removed span is a safe
+    /// no-op that reports `0`, so a repeated or unmatched call on the same
+    /// `ptr` refunds zero rather than double-counting.
+    ///
+    /// That bookkeeping-level guarantee is **not** the same as a genuine
+    /// atomic release against the underlying CUDA driver calls.
+    /// [`deallocate_span`](Self::deallocate_span) removes the span (and hands
+    /// its address range back to the free list) unconditionally, even when
+    /// the CUDA unmap/handle release this triggers only partially succeeds:
+    /// if releasing one contiguous granule run fails, this allocator's
+    /// internal granule-release bookkeeping leaves that run's reference
+    /// counts exactly as they were (so the
+    /// bytes it could not release are simply never counted in this method's
+    /// return value, rather than being double-refunded), but the *address
+    /// range* is still given back to the free list either way. A subsequent
+    /// allocation can then be granted a virtual-address range that overlaps
+    /// granules this allocator's own bookkeeping still believes are
+    /// committed. This is a pre-existing property of this allocator's
+    /// internal `deallocate_span`/granule-release bookkeeping that predates
+    /// the
+    /// Phase 2 capability split — no Phase 2 change introduced or altered
+    /// it — and closing it needs an owning allocation token or generation
+    /// counter that can keep a VA range out of the free list until its
+    /// release genuinely reaches a consistent terminal state, which is
+    /// #1186 Phase 4's scope (deferred, reconciled release), not something
+    /// this method can honestly claim to already provide.
     ///
     /// [`DeviceAllocator::deallocate`]: onnx_runtime_memory_governor::DeviceAllocator::deallocate
     ///

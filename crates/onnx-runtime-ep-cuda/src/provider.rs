@@ -471,13 +471,20 @@ impl CudaExecutionProvider {
     ///   A caller who needs a specific base allocator must build without VMM
     ///   (`ONNX_GENAI_CUDA_VMM` unset and dynamic lending disabled).
     /// - If `memory` advertises a `VirtualBacking`/`SharedMapping` capability
-    ///   whose `device()` disagrees with `memory.device()`, or whose
-    ///   underlying object is not `memory` itself (see
-    ///   [`capability_shares_mechanism`](onnx_runtime_memory_governor::capability_shares_mechanism)).
-    ///   A composite allocator whose ordinary allocate/deallocate and whose
-    ///   advertised capability are two different objects cannot prove that a
-    ///   pointer produced through the capability is ever released through the
-    ///   mechanism that produced it (#1186 Phase 2 review).
+    ///   whose `device()` disagrees with `memory.device()`. A capability that
+    ///   disagrees with its own allocator about which device it serves
+    ///   cannot be trusted to belong to it. This device check is a sanity
+    ///   check on `memory`'s own self-reported answers, not a proof that the
+    ///   capability object is genuinely `memory` itself as opposed to some
+    ///   other object `memory` merely composes: no self-reported identity
+    ///   token can distinguish those two cases from outside the type (see
+    ///   the `capability` module's docs in `onnx_runtime_memory_api` for why
+    ///   #1186 Phase 2 review's round 6 removed the earlier attempt at that
+    ///   proof). A composite allocator whose ordinary allocate/deallocate and
+    ///   whose advertised capability are two different objects is expected
+    ///   to implement `as_virtual_backing`/`as_shared_mapping` honestly
+    ///   enough that this does not arise; proving it structurally is #1186
+    ///   Phase 3's scope.
     pub fn with_memory(
         mut self,
         memory: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>,
@@ -503,72 +510,40 @@ impl CudaExecutionProvider {
                 expected.index, key.tier, key.index, expected.index
             )));
         }
-        // Any capability this allocator advertises must genuinely be *this*
-        // allocator, not a different inner object it merely composes.
-        // Release for a `VirtualBacking`-produced pointer is reached through
-        // this same `as_virtual_backing()` call at both allocate and
-        // deallocate time (see `deallocate_with_unmapped`), so a foreign
-        // capability object can never actually be freed through a different
-        // mechanism through this EP — but rejecting a malformed allocator
-        // here, rather than merely tolerating it, keeps "which mechanism
-        // owns this pointer" an identity a caller can trust rather than an
-        // accident of how `deallocate_with_unmapped` happens to be wired
-        // (#1186 Phase 2 review, finding 1).
-        if let Some(virtual_backing) = memory.as_virtual_backing() {
-            if virtual_backing.device() != key {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep: the injected allocator's VirtualBacking capability reports \
-                     device {:?} {}, but the allocator itself reports {:?} {}; a capability \
-                     that disagrees with its own allocator about device identity cannot be \
-                     trusted to belong to it",
-                    virtual_backing.device().tier,
-                    virtual_backing.device().index,
-                    key.tier,
-                    key.index
-                )));
-            }
-            if !onnx_runtime_memory_governor::capability_shares_mechanism(
-                memory.as_ref(),
-                virtual_backing.as_any(),
-            ) {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep: the injected allocator's VirtualBacking capability is not the \
-                     allocator itself. A composite allocator whose ordinary \
-                     allocate/deallocate and whose VirtualBacking capability are two \
-                     different objects sharing only a matching device cannot prove that \
-                     release always reaches the mechanism that allocated; implement \
-                     `as_virtual_backing` to return `Some(self)` on the same type instead."
-                        .into(),
-                ));
-            }
+        // A capability's own `device()` must at least agree with the
+        // allocator's `device()`. This is a sanity check on self-reported
+        // values, not proof the capability object is genuinely `memory`
+        // itself rather than a distinct object `memory` composes — see the
+        // doc comment above and `onnx_runtime_memory_api::capability`'s
+        // module docs for why that stronger proof was removed rather than
+        // patched further (#1186 Phase 2 review, round 6).
+        if let Some(virtual_backing) = memory.as_virtual_backing()
+            && virtual_backing.device() != key
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: the injected allocator's VirtualBacking capability reports \
+                 device {:?} {}, but the allocator itself reports {:?} {}; a capability \
+                 that disagrees with its own allocator about device identity cannot be \
+                 trusted to belong to it",
+                virtual_backing.device().tier,
+                virtual_backing.device().index,
+                key.tier,
+                key.index
+            )));
         }
-        if let Some(shared_mapping) = memory.as_shared_mapping() {
-            if shared_mapping.device() != key {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep: the injected allocator's SharedMapping capability reports \
-                     device {:?} {}, but the allocator itself reports {:?} {}; a capability \
-                     that disagrees with its own allocator about device identity cannot be \
-                     trusted to belong to it",
-                    shared_mapping.device().tier,
-                    shared_mapping.device().index,
-                    key.tier,
-                    key.index
-                )));
-            }
-            if !onnx_runtime_memory_governor::capability_shares_mechanism(
-                memory.as_ref(),
-                shared_mapping.as_any(),
-            ) {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep: the injected allocator's SharedMapping capability is not the \
-                     allocator itself. A composite allocator whose ordinary \
-                     allocate/deallocate and whose SharedMapping capability are two \
-                     different objects sharing only a matching device cannot be trusted to \
-                     mix them safely; implement `as_shared_mapping` to return `Some(self)` \
-                     on the same type instead."
-                        .into(),
-                ));
-            }
+        if let Some(shared_mapping) = memory.as_shared_mapping()
+            && shared_mapping.device() != key
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: the injected allocator's SharedMapping capability reports \
+                 device {:?} {}, but the allocator itself reports {:?} {}; a capability \
+                 that disagrees with its own allocator about device identity cannot be \
+                 trusted to belong to it",
+                shared_mapping.device().tier,
+                shared_mapping.device().index,
+                key.tier,
+                key.index
+            )));
         }
         self.memory = memory;
         Ok(self)
@@ -2170,29 +2145,36 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         );
     }
 
-    /// A hypothetical composite allocator whose ordinary allocate/deallocate
-    /// are backed by one object but whose `VirtualBacking` capability is a
-    /// totally different (real) VMM arena, sharing only a matching
-    /// `DeviceKey` — exactly the "same-device wrapper exposing foreign
-    /// backing" scenario the #1186 Phase 2 review flagged as unable to prove
-    /// release always reaches the mechanism that allocated. `with_memory`
-    /// must reject it outright rather than accept it and rely on downstream
-    /// code happening to be safe (finding 1).
+    /// `with_memory`'s capability checks only validate that a
+    /// `VirtualBacking`/`SharedMapping` capability's own `device()` agrees
+    /// with the allocator's `device()` — a sanity check on self-reported
+    /// values, not a structural proof that the capability object is
+    /// genuinely the allocator itself rather than some other object the
+    /// allocator composes. An earlier design (#1186 Phase 2 review, rounds
+    /// 3-4) attempted that stronger proof through a self-reported
+    /// `MechanismId`/`TypeId`+pointer identity token; coordinator review
+    /// (round 6) found a type can honestly return `Some(self)` from both its
+    /// capability accessor and its identity accessor while its capability's
+    /// method *bodies* still operate on unrelated state, which no
+    /// self-reported token can detect from outside the type. That apparatus
+    /// was removed rather than patched further; see
+    /// `onnx_runtime_memory_api::capability`'s module docs for the full
+    /// rationale, and #1186 Phase 3 for where a real proof belongs. This
+    /// test proves the surviving, real (if narrower) device-mismatch check.
     #[cfg_attr(
         not(feature = "gpu-tests"),
         ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
     )]
     #[test]
-    fn with_memory_rejects_an_allocator_whose_capability_is_a_different_mechanism() {
+    fn with_memory_rejects_a_capability_whose_device_disagrees_with_its_allocator() {
         // SAFETY: single-process test; ensure VMM is not force-enabled by a
-        // previous test in this binary, so the identity-validation path below
-        // (not the "VMM already selected" path) is what actually runs.
+        // previous test in this binary, so the capability-validation path
+        // below (not the "VMM already selected" path) is what actually runs.
         unsafe { std::env::remove_var(crate::vmm_allocator::CUDA_VMM_ENV) };
 
         let Ok(provider) = CudaExecutionProvider::new(0) else {
             eprintln!(
-                "SKIPPED (no CUDA runtime): the with_memory capability-identity proof did NOT \
-                 run."
+                "SKIPPED (no CUDA runtime): the with_memory device-mismatch proof did NOT run."
             );
             panic!("CUDA test path did not run; report as a failed GPU test, not a pass");
         };
@@ -2205,29 +2187,18 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         let base = Arc::new(crate::device_allocator::CudaDeviceAllocator::new(
             context.clone(),
         ));
-        let foreign = Arc::new(
-            crate::vmm_allocator::CudaVmmAllocator::standalone(
-                context,
-                onnx_runtime_memory_governor::DeviceKey::device(0),
-                0,
-                64 << 20,
-                onnx_runtime_memory_governor::HolderId::new(1186),
-                onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
-            )
-            .expect("a second, unrelated VMM arena over the same device"),
-        );
 
-        /// Deliberately composes two different objects behind one
-        /// `DeviceAllocator`: ordinary allocate/deallocate go through `base`,
-        /// but the advertised `VirtualBacking` is `foreign` — a different
-        /// mechanism than the one that would service `allocate`/`deallocate`.
+        /// A `DeviceAllocator` that honestly returns `Some(self)` as its own
+        /// `VirtualBacking` capability, but whose `VirtualBacking::device()`
+        /// disagrees with its own `DeviceAllocator::device()` — the one
+        /// mismatch `with_memory` can still detect without a structural
+        /// identity proof, since it only compares self-reported values.
         #[derive(Debug)]
-        struct CompositeAllocator {
+        struct DeviceMismatchedAllocator {
             base: Arc<crate::device_allocator::CudaDeviceAllocator>,
-            foreign: Arc<crate::vmm_allocator::CudaVmmAllocator>,
         }
 
-        impl onnx_runtime_memory_governor::DeviceAllocator for CompositeAllocator {
+        impl onnx_runtime_memory_governor::DeviceAllocator for DeviceMismatchedAllocator {
             fn allocate(
                 &self,
                 bytes: usize,
@@ -2252,154 +2223,106 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
             fn as_virtual_backing(
                 &self,
             ) -> Option<&dyn onnx_runtime_memory_governor::VirtualBacking> {
-                // Deliberately a *different* object than `self`/`self.base` —
-                // the exact composite the review flagged.
-                Some(self.foreign.as_ref())
-            }
-
-            fn mechanism_id(&self) -> Option<onnx_runtime_memory_governor::MechanismId> {
-                // The wrapper's own identity, not `self.foreign`'s: this
-                // proves the rejection below comes from a genuine identity
-                // mismatch, not from `CompositeAllocator` having opted out of
-                // identity entirely (#1186 Phase 2 review, round 4 finding 2).
-                Some(onnx_runtime_memory_governor::MechanismId::of(self))
+                Some(self)
             }
         }
 
-        let composite: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator> =
-            Arc::new(CompositeAllocator { base, foreign });
+        impl onnx_runtime_memory_governor::VirtualBacking for DeviceMismatchedAllocator {
+            fn device(&self) -> onnx_runtime_memory_governor::DeviceKey {
+                // Deliberately a different device than `DeviceAllocator::device`
+                // above reports.
+                onnx_runtime_memory_governor::DeviceKey::device(
+                    onnx_runtime_memory_governor::DeviceAllocator::device(self.base.as_ref())
+                        .index
+                        + 1,
+                )
+            }
 
-        let error = provider.with_memory(composite).expect_err(
-            "with_memory must reject an allocator whose VirtualBacking capability is not \
-             itself, not accept it and hope release stays consistent by convention",
-        );
-        let message = error.to_string();
-        assert!(
-            message.contains("VirtualBacking capability is not the allocator itself"),
-            "the rejection must name what happened, not just fail: {message}"
-        );
-    }
-
-    /// #1186 Phase 2 review, round 3 finding 1: pointer equality alone is not
-    /// unforgeable. `#[repr(C)]` guarantees a struct's first field starts at
-    /// the struct's own address, so a wrapper that embeds a foreign
-    /// `CudaVmmAllocator` **by value** as its first field and advertises it
-    /// as its `VirtualBacking` produces the exact same address as `&self` —
-    /// the identity check must still reject it. This is the non-vacuous,
-    /// real-type counterpart to the synthetic proof in
-    /// `onnx_runtime_memory_api::capability::tests`.
-    #[cfg_attr(
-        not(feature = "gpu-tests"),
-        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
-    )]
-    #[test]
-    fn with_memory_rejects_a_foreign_vmm_embedded_at_offset_zero() {
-        // SAFETY: single-process test; ensure VMM is not force-enabled by a
-        // previous test in this binary.
-        unsafe { std::env::remove_var(crate::vmm_allocator::CUDA_VMM_ENV) };
-
-        let Ok(provider) = CudaExecutionProvider::new(0) else {
-            eprintln!(
-                "SKIPPED (no CUDA runtime): the offset-zero identity proof did NOT run."
-            );
-            panic!("CUDA test path did not run; report as a failed GPU test, not a pass");
-        };
-        assert!(
-            provider.vmm.get().is_none(),
-            "this proof requires the plain (non-VMM) construction path"
-        );
-
-        let context = provider.runtime().cuda_context();
-        let base = Arc::new(crate::device_allocator::CudaDeviceAllocator::new(
-            context.clone(),
-        ));
-        let foreign = crate::vmm_allocator::CudaVmmAllocator::standalone(
-            context,
-            onnx_runtime_memory_governor::DeviceKey::device(0),
-            0,
-            64 << 20,
-            onnx_runtime_memory_governor::HolderId::new(1186),
-            onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
-        )
-        .expect("a second, unrelated VMM arena over the same device");
-
-        /// `#[repr(C)]` with `foreign` as the first field: `&self` and
-        /// `&self.foreign` are numerically the same address. Ordinary
-        /// allocate/deallocate go through `base`; the advertised
-        /// `VirtualBacking` is the embedded `foreign`, not `self`.
-        #[repr(C)]
-        #[derive(Debug)]
-        struct OffsetZeroWrapper {
-            foreign: crate::vmm_allocator::CudaVmmAllocator,
-            base: Arc<crate::device_allocator::CudaDeviceAllocator>,
-        }
-
-        impl onnx_runtime_memory_governor::DeviceAllocator for OffsetZeroWrapper {
-            fn allocate(
+            fn allocate_committed(
                 &self,
-                bytes: usize,
-                align: usize,
+                _bytes: usize,
+                _align: usize,
+                _committed_ranges: &[std::ops::Range<usize>],
             ) -> std::result::Result<
                 std::ptr::NonNull<u8>,
                 onnx_runtime_memory_governor::MemoryError,
             > {
-                self.base.allocate(bytes, align)
+                unimplemented!("test double: never called; with_memory must reject before use")
             }
 
-            unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, bytes: usize, align: usize) {
-                // SAFETY: forwarded verbatim; our own caller upholds the same
-                // contract `DeviceAllocator::deallocate` documents.
-                unsafe { self.base.deallocate(ptr, bytes, align) }
-            }
-
-            fn device(&self) -> onnx_runtime_memory_governor::DeviceKey {
-                onnx_runtime_memory_governor::DeviceAllocator::device(self.base.as_ref())
-            }
-
-            fn as_virtual_backing(
+            unsafe fn deallocate_committed(
                 &self,
-            ) -> Option<&dyn onnx_runtime_memory_governor::VirtualBacking> {
-                // Deliberately the embedded first field, reached through
-                // `self`'s own address, not a separately allocated object.
-                Some(&self.foreign)
+                _ptr: std::ptr::NonNull<u8>,
+                _allocation_bytes: usize,
+                _align: usize,
+            ) -> u64 {
+                unimplemented!("test double: never called")
             }
 
-            fn mechanism_id(&self) -> Option<onnx_runtime_memory_governor::MechanismId> {
-                // The wrapper's own identity, not `self.foreign`'s: this
-                // proves the rejection below comes from a genuine `TypeId`
-                // mismatch defeating the offset-zero address collision, not
-                // from `OffsetZeroWrapper` having opted out of identity
-                // entirely (#1186 Phase 2 review, round 4 finding 2).
-                Some(onnx_runtime_memory_governor::MechanismId::of(self))
+            fn commit_allocation_range(
+                &self,
+                _ptr: std::ptr::NonNull<u8>,
+                _allocation_bytes: usize,
+                _align: usize,
+                _offset: usize,
+                _bytes: usize,
+            ) -> std::result::Result<(), onnx_runtime_memory_governor::MemoryError> {
+                unimplemented!("test double: never called")
+            }
+
+            fn mapped_bytes_for_allocation_ranges(
+                &self,
+                _ranges: &[onnx_runtime_memory_governor::AllocationCommitRange],
+            ) -> std::result::Result<u64, onnx_runtime_memory_governor::MemoryError> {
+                unimplemented!("test double: never called")
+            }
+
+            fn mapped_bytes_for_allocation(
+                &self,
+                _bytes: usize,
+                _align: usize,
+            ) -> std::result::Result<u64, onnx_runtime_memory_governor::MemoryError> {
+                unimplemented!("test double: never called")
+            }
+
+            fn decommit_allocation_range(
+                &self,
+                _ptr: std::ptr::NonNull<u8>,
+                _allocation_bytes: usize,
+                _align: usize,
+                _offset: usize,
+                _bytes: usize,
+            ) -> std::result::Result<u64, onnx_runtime_memory_governor::MemoryError> {
+                unimplemented!("test double: never called")
+            }
+
+            fn allocation_committed_bytes(
+                &self,
+                _ptr: std::ptr::NonNull<u8>,
+                _allocation_bytes: usize,
+                _align: usize,
+            ) -> usize {
+                unimplemented!("test double: never called")
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
             }
         }
 
-        let wrapper = OffsetZeroWrapper { foreign, base };
+        let mismatched: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator> =
+            Arc::new(DeviceMismatchedAllocator { base });
 
-        // Non-vacuous: prove the address collision this test exists to guard
-        // against is real before asserting on the rejection it causes.
-        let wrapper_addr = &wrapper as *const OffsetZeroWrapper as *const ();
-        let foreign_addr = &wrapper.foreign as *const crate::vmm_allocator::CudaVmmAllocator
-            as *const ();
-        assert!(
-            std::ptr::eq(wrapper_addr, foreign_addr),
-            "test setup did not reproduce the offset-zero address collision `#[repr(C)]` is \
-             supposed to guarantee"
-        );
-
-        let composite: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator> = Arc::new(wrapper);
-
-        let error = provider.with_memory(composite).expect_err(
-            "with_memory must reject a foreign VirtualBacking embedded at offset zero even \
-             though its address coincides with the wrapper's own address (#1186 Phase 2 \
-             review, round 3 finding 1)",
+        let error = provider.with_memory(mismatched).expect_err(
+            "with_memory must reject a VirtualBacking capability whose device() disagrees              with its own allocator's device()",
         );
         let message = error.to_string();
         assert!(
-            message.contains("VirtualBacking capability is not the allocator itself"),
+            message.contains("VirtualBacking capability reports"),
             "the rejection must name what happened, not just fail: {message}"
         );
     }
+
 
     /// #956 contrast: the default `cuMemAlloc` path makes exactly one driver
     /// allocation per request, so it scales one-for-one with decode steps —
