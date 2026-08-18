@@ -3199,20 +3199,26 @@ impl DecodeCudaState {
         new_capacity: usize,
         valid_len: usize,
     ) -> anyhow::Result<()> {
-        // The mask binding is `[batch, new_capacity]`; the committed byte extent
-        // and the zeroing span all `batch` rows (stage 2b-impl-2, #750). At
-        // `batch == 1` this is byte-identical to the previous single-row memset.
-        let bytes = new_capacity
-            .checked_mul(std::mem::size_of::<i64>())
-            .and_then(|row_bytes| row_bytes.checked_mul(self.batch))
-            .with_context(|| {
-                format!("VMM-backed CUDA mask growth overflows for capacity {new_capacity}")
-            })?;
-        native_cuda_memset_zero(self.bindings[0].device_ptr() as usize, bytes)?;
-        self.bindings[0].set_physical_and_logical_shapes(
-            vec![self.batch, new_capacity],
-            vec![self.batch, valid_len],
-        )?;
+        let old_shape = self.bindings[0].physical_shape().to_vec();
+        if old_shape != [self.batch, self.max_len] {
+            bail!(
+                "VMM-backed CUDA mask binding must be [{}, {}] before growth, got {:?}",
+                self.batch,
+                self.max_len,
+                old_shape
+            );
+        }
+        let new_shape = vec![self.batch, new_capacity];
+        let ptr = self.bindings[0].device_ptr() as usize;
+        let elem = std::mem::size_of::<i64>();
+        // The mask carries one row per sequence. Growing its capacity changes
+        // every batch>0 row stride just like head-major KV, so preserve the
+        // valid prefix before clearing only the newly exposed suffix. Clearing
+        // the whole allocation here used to erase all prior `1` entries; GQA
+        // then derived a zero past length at the first bucket boundary.
+        copy_kv_prefix_device_to_device_in_place(ptr, &old_shape, &new_shape, 1, valid_len, elem)?;
+        zero_kv_suffix_device(ptr, &new_shape, 1, valid_len, elem)?;
+        self.bindings[0].set_physical_and_logical_shapes(new_shape, vec![self.batch, valid_len])?;
         Ok(())
     }
 
