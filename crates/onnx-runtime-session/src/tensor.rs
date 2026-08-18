@@ -736,6 +736,21 @@ impl DeviceIoBinding {
         batch: usize,
         result: &mut DeviceIoBinding,
     ) -> Result<()> {
+        self.device_argmax_with_tie_break(
+            elements,
+            batch,
+            result,
+            onnx_runtime_ep_api::ArgmaxTieBreak::LowestIndex,
+        )
+    }
+
+    pub fn device_argmax_with_tie_break(
+        &self,
+        elements: usize,
+        batch: usize,
+        result: &mut DeviceIoBinding,
+        tie_break: onnx_runtime_ep_api::ArgmaxTieBreak,
+    ) -> Result<()> {
         if !matches!(self.dtype, DataType::Float32 | DataType::Float16)
             || result.dtype != DataType::Uint32
         {
@@ -755,6 +770,7 @@ impl DeviceIoBinding {
             batch,
             self.dtype,
             result.buffer_mut(),
+            tie_break,
         )?)
     }
 
