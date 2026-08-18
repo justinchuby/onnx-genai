@@ -109,11 +109,25 @@ because GitHub renders them correctly and they represent formal sources:
 [Memory Architecture](../../docs/memory/MEMORY_ARCHITECTURE.md)
 ```
 
+## Human reading budget
+
+Each note should answer one primary question and usually take roughly 5–10
+minutes to read. This is a navigation aid, not a hard size limit. Keep a longer
+tutorial when a beginner needs its definitions and reasoning in one continuous
+reading path.
+
+Prefer a small map of linked notes over one chapter that tries to preserve every
+implementation detail, but do not make readers chase links just to understand
+the article. A wiki note should stand on its own for its intended audience.
+Formal specifications and source code support verification and deeper
+implementation work; they are not prerequisites for understanding the note.
+
 ## Avoid duplicated truth
 
-Do not copy large status tables, benchmark numbers or normative contracts into
-the wiki. Explain the concept, identify the authoritative source, and link it.
-This keeps one place responsible for updating facts.
+Do not copy large changing status tables or exhaustive normative contracts into
+the wiki. Do include enough definitions, examples and constraints for a human to
+understand the topic without opening another file. Link authoritative sources
+so claims remain verifiable and maintainers can find implementation details.
 
 ## Note template
 
