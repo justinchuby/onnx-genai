@@ -2843,3 +2843,132 @@ The tripwire is the test **`erf_reassociation_costs_no_accuracy`** in
 (half a ULP) against `erf_avx2` directly, so a future regrouping that widens the
 envelope fails the build instead of being absorbed by the looser `ERF_BOUND`. A reader
 who needs to know whether erf is bit-stable should start there.
+
+## 33. Phase 13: a CPU task runtime, because the scheduler was the loss
+
+§26 measured the thing that costs the most and is not arithmetic: Rayon parks
+its workers between parallel regions, so a fan-out costs **67 µs when it follows
+another fan-out immediately and 226 µs when it follows a 20 µs gap**. Decode is
+a stream of small regions separated by exactly that kind of gap. Every kernel
+that fans out pays the parked number, every layer, forever.
+
+That is a scheduler problem, and it does not get better by making the kernels
+faster. This phase replaces the fan-out mechanism.
+
+### 33.1 Two backends, chosen by where we are running
+
+`onnx_runtime_ep_cpu::task_runtime` is a thin façade over two implementations,
+and the choice is made per call:
+
+| condition | backend |
+|---|---|
+| `total == 0`, forced serial, or already inside a task | `Serial` |
+| a `KernelContext` with `ParallelFor` is installed | `Host` |
+| otherwise, and the work splits into ≥2 tasks | `Native` |
+| otherwise | `Serial` |
+
+**Inside the plugin EP we do not run our own threads at all.** ORT has already
+sized an intra-op pool from the session's `intra_op_num_threads`, and starting a
+second pool beside it oversubscribes every core. `Host` routes the fan-out into
+`KernelContext_ParallelFor` through the existing `host_parallel` shim, so our
+kernels schedule exactly like every other ORT kernel and inherit the session's
+thread count, its affinity settings and its spin policy. This is not a fallback
+in the §23 sense — no node is handed to ORT's CPU EP, no kernel is skipped, and
+the arithmetic is still entirely ours. Only the `for` loop is the host's.
+
+`Native` is for the standalone runtime, where there is no host pool to borrow
+and Rayon is the only alternative.
+
+Nesting is checked in both directions (`in_host_task()`, `in_task()`). A kernel
+that fans out from inside another fan-out runs serially rather than exploding
+the region count, which is what made the earlier hot-pool RoPE attempt bimodal.
+
+### 33.2 The native pool
+
+Eight job slots, not one. A single-slot pool serialises concurrent dispatchers,
+which is the wrong answer when two sessions decode at once; with eight, they get
+real parallelism, and a ninth concurrent dispatcher gets `false` back and runs
+its own work serially rather than blocking. Slot exhaustion is a counter
+(`slot_exhausted`), so the assumption is falsifiable rather than assumed —
+measured **0 in 9744 dispatches** across the concurrency harness.
+
+Workers watch a single `epoch` counter with `atomic_wait`, and the publish order
+is: write the job, store `remaining`, store `claim` (Release), set the active
+bit, bump `epoch`, wake. The soundness argument is the claim protocol: a worker
+that successfully claims a range has proved `remaining > 0`, which proves the
+dispatcher is still blocked, which proves the closure's stack frame is alive.
+
+**Adaptive spin, 20 µs → 500 µs**, doubling when a worker catches work in its
+spin window and halving when it parks. This is the part that answers §26: the
+window self-sizes to the actual gap between regions instead of being tuned to a
+guess.
+
+### 33.3 Width: SMT-capped, but only above 8 hardware threads
+
+Whether to use both SMT siblings is not obvious for memory-bound kernels — the
+second sibling adds no execution resources but does add a memory-level-
+parallelism generator. So it was measured, on one binary, with one arm forced to
+an explicit uncapped width:
+
+| logical CPUs | physical | capped wins | uncapped wins |
+|---|---|---|---|
+| 2 | 1 | 0/4 | 4/4, by 14–19% |
+| 4 | 2 | 0/4 | 4/4, by 3–25% |
+| 8 | 4 | 1/4 | 3/4, by 10–26% |
+| 16 | 8 | **3/4, by 12–45%** | 1/4 |
+| 32 | 16 | **3/4, by 12–36%** | 1/4 |
+
+The cap only pays above 8 hardware threads, so `SMT_CAP_FLOOR = 8`: an inferred
+width is never capped below 8. Below that the sibling is still worth having;
+above it, the extra spinning worker costs more than the memory parallelism it
+buys. The split is not uniform even above the floor — the largest
+bandwidth-bound softmax prefers SMT at *every* width, the smallest RoPE prefers
+the cap at every width — which is why this is a floor and not a rule.
+
+An **explicit** budget (`set_task_thread_budget`, `ONNX_GENAI_CPU_TASK_THREADS`)
+is never capped. If a caller says 32, they get 32; the cap is an inference, and
+inferences do not override instructions.
+
+### 33.4 What it costs to dispatch
+
+16 workers, 400 rounds per sample, release build, on the §0 host:
+
+| gap before dispatch | p50 | p90 | | concurrent sessions | p50 | p90 |
+|---|---|---|---|---|---|---|
+| 0 µs | 4.8 µs | 5.2 µs | | 1 | 5.3 µs | 5.7 µs |
+| 5 µs | 4.9 µs | 5.2 µs | | 2 | 5.4 µs | 5.9 µs |
+| 20 µs | 4.8 µs | 5.2 µs | | 4 | 5.4 µs | 6.1 µs |
+| 100 µs | 4.9 µs | 5.3 µs | | 8 | 6.3 µs | 7.6 µs |
+| 500 µs | 43.8 µs | 46.4 µs | | | | |
+| 2000 µs | 34.7 µs | 44.8 µs | | | | |
+
+Against Rayon's 67 µs / 226 µs that is **14× back-to-back and 47× after a
+decode-shaped gap**. The 14× matters less than the flatness: 0 µs and 100 µs
+cost the same, so a decode step no longer pays for having been idle. Past the
+500 µs spin ceiling the workers do park and the cost returns to Rayon's order —
+which is correct, because at that point the process really is idle and should
+not be burning a core.
+
+`tests/task_runtime_latency.rs` asserts the decode-shaped part of this
+(gaps ≤ 100 µs stay within 3× back-to-back + 10 µs). It is `#[ignore]`d, because
+a latency assertion on a shared CI runner is a flake generator.
+
+### 33.5 Idle cost, which is the price of spinning
+
+A spinning pool that never parks is a regression disguised as a speedup.
+`tests/task_runtime_idle.rs` bounds both ends: after the spin window elapses the
+workers must be parked (bounded CPU over a 750 ms idle window) and the pool's
+resident set must not grow with dispatch count.
+
+The test is deliberately **one** `#[test]` with two phases. Two test functions
+in one binary run concurrently by default, and both of these measure
+whole-process CPU and RSS — so as separate tests they measured each other, and
+the idle bound failed with 1.31 s of CPU over a 750 ms window.
+
+### 33.6 Test hooks, not environment variables
+
+`task_runtime::testing` exposes `force_serial()`, `isolated_pool(n)`,
+`counters()`, `pool_width()` and `planned_backend()`. Nothing in the production
+path reads an environment variable for test purposes, and the tests do not race
+on a global by construction: `isolated_pool` builds a private pool rather than
+reconfiguring the shared one.
