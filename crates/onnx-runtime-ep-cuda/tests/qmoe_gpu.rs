@@ -1403,3 +1403,107 @@ fn qmoe_prefill_handles_empty_experts_and_all_routes_to_one_expert() {
     let actual = run_gpu(&ep, case, &inputs, DataType::Float32).unwrap();
     assert_conforms(&actual, &expected, case, DataType::Float32);
 }
+
+// ---------------------------------------------------------------------------
+// QMoE expert-GEMV microbench + byte-identity A/B (Luv, squad/qmoe-vec).
+//
+// Realistic DeepSeek-V2-Lite-shaped decode case for profiling `qmoe_linear`
+// (hidden=2048, moe_intermediate=1408, 64 experts, top-6). The bench is opt-in
+// (set QMOE_BENCH=1) so ordinary `cargo test` runs skip the heavy loop; ncu
+// filters the launches with `-k qmoe_linear`.
+// ---------------------------------------------------------------------------
+
+fn deepseek_v2_lite_decode_case() -> Case {
+    Case {
+        experts: 64,
+        rows: 1,
+        hidden: 2048,
+        inter: 1408,
+        bits: 4,
+        top_k: 6,
+        activation: "swiglu",
+        swiglu_fusion: 0,
+        affine: false,
+        fc3: true,
+        biases: false,
+        normalize: true,
+        router_weights: true,
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_deepseek_decode_bench() {
+    let ep = require_cuda();
+    let case = deepseek_v2_lite_decode_case();
+    let dtype = DataType::Float16;
+    let inputs = case_inputs(case, dtype);
+    // Warm the NVRTC cache + capture workspace.
+    let _ = run_gpu(&ep, case, &inputs, dtype).unwrap();
+    if std::env::var("QMOE_BENCH").is_err() {
+        // Under ncu we only need the launches; skip the wall-clock loop.
+        let _ = run_gpu(&ep, case, &inputs, dtype).unwrap();
+        return;
+    }
+    let iters = 60usize;
+    let mut samples = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let start = std::time::Instant::now();
+        let _ = run_gpu(&ep, case, &inputs, dtype).unwrap();
+        samples.push(start.elapsed().as_secs_f64() * 1e3);
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = samples[samples.len() / 2];
+    let flag = std::env::var("ONNX_GENAI_QMOE_OCC").unwrap_or_else(|_| "unset".into());
+    eprintln!(
+        "QMOE_BENCH deepseek-v2-lite decode: median_e2e={median:.4} ms (iters={iters}, \
+         ONNX_GENAI_QMOE_OCC={flag}, dtype={dtype:?})"
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_occ_is_bit_identical() {
+    // Byte-identity gate for the `ONNX_GENAI_QMOE_OCC` expert-GEMV variant:
+    // the `_occ` (`__launch_bounds__`) path must reproduce the default path
+    // bit-for-bit (0 differing bits) across dtypes and shapes.
+    //
+    // Coverage note: `_occ` only rebinds the fused gate/up SwiGLU expert GEMV,
+    // which is a decode-only (rows==1, routes<=16) launch. The rows>1 arm here
+    // routes through the grouped prefill path where the flag is a no-op, so it
+    // is an unchanged-output guard rather than genuine `_occ` coverage; rows==1
+    // is what actually exercises the `_occ` kernel.
+    let ep = require_cuda();
+    for &rows in &[1usize, 4, 6, 8] {
+        let mut case = deepseek_v2_lite_decode_case();
+        case.rows = rows;
+        for &dtype in &[DataType::Float16, DataType::BFloat16, DataType::Float32] {
+            let inputs = case_inputs(case, dtype);
+            // SAFETY: single-threaded test; the flag only selects a kernel entry.
+            unsafe { std::env::set_var("ONNX_GENAI_QMOE_OCC", "0") };
+            let base = run_gpu(&ep, case, &inputs, dtype).unwrap();
+            unsafe { std::env::set_var("ONNX_GENAI_QMOE_OCC", "1") };
+            let vec_path = run_gpu(&ep, case, &inputs, dtype).unwrap();
+            unsafe { std::env::remove_var("ONNX_GENAI_QMOE_OCC") };
+            assert_eq!(base.len(), vec_path.len());
+            let mismatches = base
+                .iter()
+                .zip(&vec_path)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                mismatches,
+                0,
+                "ONNX_GENAI_QMOE_OCC diverged from default: {mismatches} of {} elements \
+                 differ (rows={rows}, dtype={dtype:?})",
+                base.len()
+            );
+        }
+    }
+}
