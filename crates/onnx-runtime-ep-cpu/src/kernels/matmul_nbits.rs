@@ -337,7 +337,12 @@ fn mlas_prefill_serial() -> bool {
 }
 
 /// Which executor the `m > 1` MLAS shard tiling fans out on.
-#[cfg(feature = "mlas")]
+///
+/// Not gated on `mlas` even though only the MLAS path consults it: the policy
+/// is pure integer arithmetic, and the only CI lane that runs this crate's
+/// whole test suite is the default-feature one. Gating it would mean the
+/// tests never run.
+#[cfg_attr(not(feature = "mlas"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrefillFanOut {
     /// The CPU task runtime: bounded, topology-aware, adaptive spin/park.
@@ -389,7 +394,7 @@ enum PrefillFanOut {
 ///
 /// Park latency is what makes the wide path safe above the threshold: 226 us of
 /// worst-case wake-up is 0.25% of a 90 ms fan-out, and 45% of a 0.5 ms one.
-#[cfg(feature = "mlas")]
+#[cfg_attr(not(feature = "mlas"), allow(dead_code))]
 const WIDE_PREFILL_MACS: usize = 1 << 29;
 
 /// Picks the prefill fan-out executor for `macs` of work, given the task
@@ -397,7 +402,7 @@ const WIDE_PREFILL_MACS: usize = 1 << 29;
 ///
 /// Split out as a pure function so the policy is testable without a machine
 /// that has SMT, and so the threshold has one place to be wrong.
-#[cfg(feature = "mlas")]
+#[cfg_attr(not(feature = "mlas"), allow(dead_code))]
 fn prefill_fan_out(macs: usize, lanes: usize, wide: usize) -> PrefillFanOut {
     // Nothing to win from the wide path when it is not actually wider; prefer
     // the runtime's cheaper dispatch.
@@ -419,7 +424,7 @@ fn prefill_fan_out(macs: usize, lanes: usize, wide: usize) -> PrefillFanOut {
 /// a resident worker, see `task_runtime::pool`) against roughly 2 GMAC/s per
 /// core for MLAS SQNBit int4: 512 Ki MACs is ~250 us of arithmetic, about 50x
 /// the dispatch cost, so the fan-out is still overwhelmingly useful work.
-#[cfg(feature = "mlas")]
+#[cfg_attr(not(feature = "mlas"), allow(dead_code))]
 const MIN_PREFILL_TASK_MACS: usize = 1 << 19;
 
 /// Tiles per task for a prefill fan-out of `tiles` tiles over an `m x n` output
@@ -428,7 +433,7 @@ const MIN_PREFILL_TASK_MACS: usize = 1 << 19;
 ///
 /// Returns a *floor* the task runtime applies to its own partition; the runtime
 /// still uses a larger grain when there are more tiles than workers.
-#[cfg(feature = "mlas")]
+#[cfg_attr(not(feature = "mlas"), allow(dead_code))]
 fn prefill_tile_grain(m: usize, n: usize, k: usize, tiles: usize) -> usize {
     if tiles == 0 {
         return 1;
@@ -17026,7 +17031,6 @@ mod tests {
 
     /// A prefill small enough that the task runtime's ~5 us dispatch dominates
     /// stays on the task runtime, whatever the widths look like.
-    #[cfg(feature = "mlas")]
     #[test]
     fn small_prefill_work_stays_on_the_task_runtime() {
         assert_eq!(
@@ -17039,7 +17043,6 @@ mod tests {
     /// Past the threshold the SMT-capped pool is leaving half the machine idle
     /// on work long enough for a 226 us wake-up to be noise, so take the wide
     /// path.
-    #[cfg(feature = "mlas")]
     #[test]
     fn large_prefill_work_takes_the_wide_fan_out() {
         assert_eq!(
@@ -17055,7 +17058,6 @@ mod tests {
     /// The wide path exists only to reach threads the runtime's pool does not
     /// have. When it has them -- no SMT, an explicit task-thread budget, a
     /// narrow cpuset -- the cheaper dispatch wins unconditionally.
-    #[cfg(feature = "mlas")]
     #[test]
     fn the_wide_fan_out_is_not_taken_when_it_is_not_wider() {
         for wide in 1..=16 {
@@ -17070,7 +17072,6 @@ mod tests {
     /// The grain is a floor in *tiles*, so it must never exceed the tile count
     /// (which would ask the runtime to run a partition it cannot make) nor drop
     /// below one.
-    #[cfg(feature = "mlas")]
     #[test]
     fn prefill_tile_grain_stays_within_the_tile_count() {
         for tiles in [0usize, 1, 2, 7, 32, 1024] {
@@ -17082,7 +17083,6 @@ mod tests {
 
     /// Tiles that already carry enough arithmetic are handed out one per task;
     /// tiles that do not get batched until they do.
-    #[cfg(feature = "mlas")]
     #[test]
     fn prefill_tile_grain_batches_only_undersized_tiles() {
         // 32 tiles of 8 x 96 x 1024 = 768 Ki MACs each, over the 512 Ki floor.
@@ -17092,7 +17092,6 @@ mod tests {
     }
 
     /// A degenerate shape must not divide by zero or ask for a zero grain.
-    #[cfg(feature = "mlas")]
     #[test]
     fn prefill_tile_grain_survives_a_zero_sized_problem() {
         assert_eq!(prefill_tile_grain(0, 3072, 1024, 8), 8);
