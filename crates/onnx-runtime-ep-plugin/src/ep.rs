@@ -144,14 +144,6 @@ pub struct ExportedEp {
     /// that `GetCapability` can dtype-filter claims against the same source of
     /// truth. Empty when no registry entries were provided.
     pub registry_entries: Vec<KernelRegistryEntry>,
-    /// Whether ORT is allowed to run nodes this EP declines on its own CPU EP.
-    ///
-    /// `false` when the session sets `session.disable_cpu_ep_fallback=1`, in
-    /// which case the claim-time routing-preference gate is switched off: with
-    /// no host fallback, declining a node this EP *can* run turns a working
-    /// session into a session-creation failure, which is strictly worse than
-    /// running the node a little slower than ORT would have.
-    pub host_fallback_available: bool,
 }
 
 /// Owns an `OrtKernelRegistry*` allocated via ORT's EP API.
@@ -272,18 +264,7 @@ impl ExportedEp {
             name_cstr,
             kernel_registry: registry,
             registry_entries: entries,
-            host_fallback_available: true,
         }
-    }
-
-    /// Record whether the host runtime may run nodes this EP declines.
-    ///
-    /// Called from `CreateEp` with the session's
-    /// `session.disable_cpu_ep_fallback` setting. See
-    /// [`ExportedEp::host_fallback_available`].
-    pub fn with_host_fallback(mut self, available: bool) -> Self {
-        self.host_fallback_available = available;
-        self
     }
 }
 
@@ -371,32 +352,24 @@ fn ep_get_capability_inner(
     // initializer weights) must keep claiming such nodes — applying the gate to
     // it would wrongly decline them and break session creation with CPU fallback
     // disabled.
-    // Claim-time *routing preference* gate: a node this EP can run correctly is
-    // still left to the host runtime when the host's own kernel is measurably
-    // faster for that op/dtype/shape. This lives here, on the plugin path, and
-    // deliberately not in `supports_op`: the native session build turns a
-    // statically-shaped `KernelMatch::Unsupported` into a hard
-    // `unsupported_op` error, so a kernel we decline to *advertise* must stay
-    // reachable for native execution. Applying it inside the
-    // `query_capabilities_filtered` predicate means the node is excluded before
-    // convex partitioning, so ORT partitions around it instead of us handing
-    // back a partition we would then run slower than ORT would.
+    // Claim-time *routing preference* gate: removed, permanently.
     //
-    // The gate is sound only while the host has a kernel to fall back to. Under
-    // `session.disable_cpu_ep_fallback=1` it does not, and a declined node is an
-    // unassignable node, so the gate is disabled for such sessions and the EP
-    // claims everything it can run.
-    let apply_claim_preference = exported.host_fallback_available;
+    // An earlier design asked the EP, per node, whether it *wanted* a node it
+    // could already run, and left the losing shape/dtype ranges to the host
+    // runtime's own kernel. That is withdrawn as an architectural rule:
+    // selecting this EP is a request for this EP, so a range where it is
+    // slower than the host is a kernel to optimize, not a node to give away.
+    // The `ClaimPreference` type, the `claim_preference`/`claim_preference_node`
+    // trait methods and the `host_fallback_available` plumbing that switched
+    // the gate off under `session.disable_cpu_ep_fallback=1` are all deleted,
+    // so the deferral cannot be reintroduced by overriding a default — there is
+    // nothing left to override.
     let claims = exported.ep.with(|ep| {
         ort_view.query_capabilities_filtered(ep, |node| {
             if is_gpu_ep && !node_inputs_all_routable(&view, node) {
                 return false;
             }
-            if !apply_claim_preference {
-                return true;
-            }
-            let opset = view.graph().effective_opset(view.node(node)).unwrap_or(0);
-            ep.claim_preference_node(&view, node, opset).is_claim()
+            true
         })
     });
 
