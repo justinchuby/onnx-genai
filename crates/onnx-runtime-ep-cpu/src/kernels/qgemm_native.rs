@@ -283,11 +283,33 @@ unsafe fn accumulate_products_avx2(
             .next_multiple_of(64)
             .max(64),
     };
-    let blocks = n.div_ceil(block_width);
+    let column_blocks = n.div_ceil(block_width);
+    // A column block owns a packed panel, so splitting the columns further to
+    // reach every worker would shrink the panel and re-walk `B`. Splitting the
+    // *rows* instead duplicates only the pack, which is around a percent of the
+    // GEMM it feeds -- so the row split is what grows to fill the pool, and it
+    // grows only as far as the pool needs. Left at one block, an `n` of 2048
+    // offers eight tasks and a sixteen-worker pool leaves half of itself idle
+    // and spinning, which measured *slower* than running the whole GEMM on one
+    // thread.
+    let row_blocks = if fused || !parallel {
+        1
+    } else {
+        rayon::current_num_threads()
+            .div_ceil(column_blocks)
+            .clamp(1, m.div_ceil(MR))
+    };
+    let block_height = m.div_ceil(row_blocks).next_multiple_of(MR);
+    let blocks = column_blocks * row_blocks;
     let base = ProductsPtr(products.as_mut_ptr());
     let run_block = |block: usize| {
-        let n0 = block * block_width;
+        let n0 = (block % column_blocks) * block_width;
         let nc = block_width.min(n - n0);
+        let m0 = (block / column_blocks) * block_height;
+        if m0 >= m {
+            return;
+        }
+        let mc = block_height.min(m - m0);
         if fused {
             // SAFETY: AVX2 is guaranteed by the caller. The kernel reads
             // `b[row * n + n0 .. + nc]` for `row < k` and `a_pairs[r * pairs +
@@ -321,9 +343,9 @@ unsafe fn accumulate_products_avx2(
             // reads `b[(k0 + row) * n + n0 + column]` only for `row < kc` and
             // `column < nc`, both in bounds.
             unsafe { pack_panel(b, &mut panel, n, n0, nc, k0, kc, tiles) };
-            let mut r0 = 0;
-            while r0 < m {
-                let rows = MR.min(m - r0);
+            let mut r0 = m0;
+            while r0 < m0 + mc {
+                let rows = MR.min(m0 + mc - r0);
                 for tile in 0..tiles {
                     let c0 = n0 + tile * NR;
                     let width = NR.min(n - c0);
