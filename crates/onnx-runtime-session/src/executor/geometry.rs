@@ -385,6 +385,14 @@ pub(super) fn bounded_shape_input(dtype: DataType, shape: &[usize]) -> bool {
         .is_some_and(|count| count <= MAX_SHAPE_DATA_ELEMS)
 }
 
+const MAX_COMPRESS_CONDITION_ELEMS: usize = 1 << 20;
+
+/// `Compress` is data-dependent on its full boolean condition, which can be
+/// larger than ordinary scalar/vector shape metadata for image models.
+pub(super) fn bounded_compress_condition(dtype: DataType, shape: &[usize]) -> bool {
+    dtype == DataType::Bool && shape.len() == 1 && shape[0] <= MAX_COMPRESS_CONDITION_ELEMS
+}
+
 /// Whether a node needs a float runtime input to resolve a data-dependent
 /// output extent. The list is deliberately explicit, so shape propagation never
 /// copies unrelated tensor data to host.

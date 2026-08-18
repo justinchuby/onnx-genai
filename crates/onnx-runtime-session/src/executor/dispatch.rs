@@ -694,7 +694,13 @@ impl Executor {
                 .iter()
                 .enumerate()
                 .map(|(i, v)| {
-                    v.and_then(|vid| self.shape_input_i64(vid, &input_shapes[i], input_dtypes[i]))
+                    v.and_then(|vid| {
+                        if node.is_default_domain() && node.op_type == "Compress" && i == 1 {
+                            self.compress_condition_i64(vid, &input_shapes[i], input_dtypes[i])
+                        } else {
+                            self.shape_input_i64(vid, &input_shapes[i], input_dtypes[i])
+                        }
+                    })
                 })
                 .collect();
             // Only materialize a *float* input value for the specific inputs an
@@ -1029,6 +1035,32 @@ impl Executor {
             return None;
         }
         let max_bytes = MAX_SHAPE_DATA_ELEMS.checked_mul(dtype.byte_size())?;
+        if let Some(view) = self.views.get(&vid) {
+            let source = self.buffers.get(&view.source)?;
+            if source.len() > max_bytes {
+                return None;
+            }
+        }
+        if self
+            .seq_elem_values
+            .get(&vid)
+            .is_some_and(|elem| elem.root_len() > max_bytes)
+        {
+            return None;
+        }
+        self.input_i64(vid, shape, dtype)
+    }
+
+    fn compress_condition_i64(
+        &self,
+        vid: ValueId,
+        shape: &[usize],
+        dtype: DataType,
+    ) -> Option<Vec<i64>> {
+        if !bounded_compress_condition(dtype, shape) {
+            return None;
+        }
+        let max_bytes = shape[0].checked_mul(dtype.byte_size())?;
         if let Some(view) = self.views.get(&vid) {
             let source = self.buffers.get(&view.source)?;
             if source.len() > max_bytes {
