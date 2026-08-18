@@ -137,3 +137,9 @@ Wallace reconfirmed the 2026-08-17 dense int4 Native-vs-ORT decomposition from t
 
 Eager-vs-eager medians again show this is architectural, not a broad per-kernel native win: Phi native/ORT **0.85×**, qwen2.5-7b **0.77×**, qwen2.5-14b-zp **1.19×**. Keep the deployment headline that native captured decode leads ORT eager **1.33× / 1.14× / 1.83×**, but always label it as CUDA-graph capture plus on-GPU argmax that ORT structurally cannot apply on these dynamic-KV int4 exports.
 
+
+## 2026-08-18 — Gate-3 speculative verify remains shelved after Marlin
+
+Luv re-probed Deckard's Gate-3 B\* framework on current `main` `923dc592` after Marlin landed. Captured verify break-even `B*=C_verify(M=K)/C_decode(M=1)` is still **NO-GO**: qwen2.5-14b-zp reports **17.5× / 18.4× / 20.0×** for K=2/4/8, and qwen2.5-7b reports **14.9× / 15.7× / 17.4×**. This is worse than the 2026-08-14 baseline (~8.5×) and far above the ≤~2 GO gate, so n-gram/prompt-lookup, EAGLE/MTP, and model-draft speculative-decode work stays shelved.
+
+This updates the earlier spec-decode arc rather than reopening it: the old #957 cheap GQA/SkipSimplifiedLayerNorm residual seams no longer appear as M>1 `KernelCaptureUnsupported` blockers. The measured blocker is now solely `MatMulNBits` at M>1 launching `matmul_nbits_gemm_f16` eagerly; Marlin's capture-safe M>1 int4 GEMM is not selected for this MatMulNBits path. Reconsider only after a graph-safe M>1 MatMulNBits/Marlin path exists and this exact B\* probe is rerun.
