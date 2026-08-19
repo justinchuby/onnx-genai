@@ -2,10 +2,13 @@
 //! (`docs/execution/CUDA_COVERAGE.md`, "Normalization & softmax" / reduce rows).
 //!
 //! `ReduceSum` and `ReduceMean` use `cudnnReduceTensor` for f32 (native f32
-//! comp type) and f16 (with an f32 comp type). bf16 cannot be reduced by cuDNN
-//! (rejected even with an f32 comp type — `CUDNN_STATUS_NOT_SUPPORTED`), so it
-//! uses the typed NVRTC block reduction, which accumulates in f32. That same
-//! NVRTC fallback also runs for f32/f16 when cuDNN is absent.
+//! comp type). f16 and bf16 use the typed NVRTC block reduction, which does
+//! fp16/bf16 IO with f32 register accumulation in a single capture-safe kernel.
+//! For f16 this deliberately avoids cuDNN's fp16↔fp32 `op_tensor` cast +
+//! fp32-ReduceSum round-trip (cuDNN rejects a half `reduceTensorCompType` and
+//! forces `CUDNN_DATA_FLOAT`); bf16 cannot be reduced by cuDNN at all (rejected
+//! even with an f32 comp type — `CUDNN_STATUS_NOT_SUPPORTED`). That same NVRTC
+//! path also runs for f32 when cuDNN is absent.
 //! `ReduceMax`/`ReduceMin` always use NVRTC.
 //!
 //! `cub::DeviceReduce` / `DeviceSegmentedReduce` are the vendor primitives for
@@ -1033,13 +1036,26 @@ impl ReduceKernel {
             return Ok(());
         }
 
-        // cuDNN reduces f32 (native comp type) and f16 (with an f32 comp type,
-        // see `CudnnBackend::reduce`). It cannot reduce bf16 at all — cuDNN
-        // rejects a bf16 tensor even with an f32 comp type
-        // (`CUDNN_STATUS_NOT_SUPPORTED`, reproduced on cuDNN 9.10 and 9.20) — so
-        // bf16 falls through to the typed NVRTC block reduction below, which
-        // accumulates in f32 (identical ONNX semantics).
-        if matches!(x.dtype, DataType::Float32 | DataType::Float16)
+        // cuDNN reduces f32 with a native f32 comp type — byte-identical to the
+        // typed NVRTC block reduction but on cuDNN's tuned kernels — so f32 sum/
+        // mean stays here. f16 does **not**: `cudnnReduceTensor` rejects a half
+        // `reduceTensorCompType` and forces `CUDNN_DATA_FLOAT`, which cuDNN
+        // implements as an fp16→fp32 `op_tensor` cast, an fp32 ReduceSum, and an
+        // fp32→fp16 cast — a three-kernel round-trip through a full-size fp32
+        // temporary. A captured-graph node trace of the qwen3.5-0.8b-hybrid
+        // decode (Deckard, `.squad/decisions/inbox/deckard-fair-hybrid-gap.md`)
+        // measured that fragmentation at ~20.7% of decode GPU-kernel time on the
+        // SSM/linear-attention path (cudnn ReduceSum 8.1% + fp16↔fp32 op_tensor
+        // casts 2.7%, firing 18× per step). The typed NVRTC block reduction
+        // below already does fp16 IO with fp32 register accumulation — the exact
+        // ONNX accumulate-in-f32-then-cast rule — in a **single** capture-safe
+        // kernel, with no fp32 temporary and half the memory traffic, so f16
+        // sum/mean is routed there instead. This is general across all shapes/
+        // axes/dims (the same path already serves bf16 and every extended f16
+        // reduction), not a per-model special case. bf16 cannot be reduced by
+        // cuDNN at all (`CUDNN_STATUS_NOT_SUPPORTED`, cuDNN 9.10/9.20) and also
+        // falls through below.
+        if x.dtype == DataType::Float32
             && let Some(cudnn_op) = cudnn_op
             && self.runtime.cudnn().is_available()
         {
@@ -1086,9 +1102,11 @@ impl ReduceKernel {
             return Ok(());
         }
 
-        // NVRTC block-reduction path (Int64 DATA reduce; bf16, which cuDNN
-        // cannot reduce; every extended op — `ReduceSumSquare`/L1/L2/Prod/
-        // LogSum(Exp) — routed by `ext_tags`; and f16/f32 when cuDNN is absent).
+        // NVRTC block-reduction path (Int64 DATA reduce; f16 and bf16 sum/mean,
+        // which take the single-kernel fused fp16/bf16-IO f32-accumulation path
+        // here rather than cuDNN's fp32 round-trip; every extended op —
+        // `ReduceSumSquare`/L1/L2/Prod/LogSum(Exp) — routed by `ext_tags`; and
+        // f32 when cuDNN is absent).
         // All of these use the i64 base/delta offset tables, so they share one
         // capture-eligible metadata cache: a shape-stable decode reduce reuses
         // the cached device tables with no per-call `alloc`/`htod`/`free`, gates
