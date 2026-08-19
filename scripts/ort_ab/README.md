@@ -84,6 +84,7 @@ performance cliff that only trained weights would trigger.
 | `gen_mha.py` | `com.microsoft::MultiHeadAttention` (the operator the vectorised `sdpa_f32` path serves) |
 | `gen_moe.py` | `com.microsoft::MoE` / `QMoE`, top-k routing, grouped experts |
 | `gen_transforms.py` | the transforms that *surround* attention: `Softmax`, `RotaryEmbedding`, KV-cache `Concat`, BSNH↔BNSH `Transpose` |
+| `gen_f16_nt.py` | f16 `Gemm` prefill cells emitted **twice** — `transB = 1` and `transB = 0` over the same array pre-transposed — so the storage layout is the only variable |
 
 Each takes an output directory:
 
@@ -165,6 +166,13 @@ arms within one run, never across sessions.
 
 ## Caveats
 
+* **A paired run depresses the native arm on small cells.** ORT's intra-op pool
+  spin-waits, so on short kernels the two arms are not merely measured together
+  but *compete*; the effect has been measured at up to 6x on f16 GEMV cells.
+  Where the claim is a native-vs-native A/B, or where the cell is short, measure
+  the arms separately with `bench_generic --native-only` / `--ort-only` and use
+  the paired mode only to confirm `parity=PASS`. `--ort-only` synthesizes the
+  same dtypes as the paired path (f32, f16, i32, i64, u8, i8).
 * The driver **raises** if a cell produces no result line, rather than silently
   dropping it. Under heavy host contention a cell can fail this way; re-run it
   standalone before concluding anything.

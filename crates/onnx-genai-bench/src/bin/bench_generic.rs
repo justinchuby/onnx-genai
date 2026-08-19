@@ -360,9 +360,24 @@ fn run_ort_only(
                     &ort_shape,
                     OrtDataType::Int32,
                 )?,
+                // The same synthesizers the paired path uses, so an `--ort-only`
+                // arm is fed byte-identical inputs to the ORT half of a paired
+                // run and the two are comparable. Without these, `--ort-only`
+                // could not measure an `f16` graph at all, which made the
+                // separate-arm method unavailable for exactly the half-precision
+                // kernels that most need it.
+                OrtDataType::Float16 => {
+                    Value::from_slice_f16_bits(&synthetic_f16_bits(count), &ort_shape)?
+                }
+                OrtDataType::Uint8 => {
+                    Value::from_raw_bytes(synthetic_u8(count), &ort_shape, OrtDataType::Uint8)?
+                }
+                OrtDataType::Int8 => {
+                    Value::from_raw_bytes(synthetic_i8_bytes(count), &ort_shape, OrtDataType::Int8)?
+                }
                 dtype => bail!(
                     "input '{}' has unsupported dtype {dtype:?}; bench_generic currently \
-                     synthesizes Float32, Int32, and Int64 inputs",
+                     synthesizes Float32, Float16, Int32, Int64, Uint8, and Int8 inputs",
                     input.name
                 ),
             };
