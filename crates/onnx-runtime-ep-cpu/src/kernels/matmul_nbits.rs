@@ -96,6 +96,18 @@ mod mm_profile {
     pub fn time_gemv<T>(f: impl FnOnce() -> T) -> T {
         timed(&GEMV_NS, f)
     }
+
+    /// The default build shares the NT prefill call site with MLAS but has no
+    /// reporter for the `gemv` phase — [`tick`] is the MLAS f16 decode split —
+    /// so this is a pass-through rather than a counter nothing ever prints. It
+    /// exists so the shared call site stays `cfg`-free; the phase that carries
+    /// the default build's story (`dequant-nk` vs `dequant-kn`) is reported by
+    /// [`time_prepack`], which is not gated.
+    #[cfg(not(feature = "mlas"))]
+    #[inline]
+    pub fn time_gemv<T>(f: impl FnOnce() -> T) -> T {
+        f()
+    }
     #[cfg(feature = "mlas")]
     pub fn time_narrow<T>(f: impl FnOnce() -> T) -> T {
         timed(&NARROW_NS, f)
@@ -1936,14 +1948,16 @@ impl Kernel for MatMulNBitsKernel {
             // strided-scatter transpose (each K step writes at stride N), which
             // thrashes cache and dominated prefill wall time (~95% of the
             // MatMulNBits cost, measured ~45 ms/node on Qwen3-0.6B). Instead,
-            // on the MLAS backend dequantize once into the natural, contiguous
-            // `Nk` layout -- cached in the same `weight_nk` slot the m==1
-            // generic path uses, so constant weights pay the dequant once -- and
-            // let MLAS's cache-tiled `sgemm` consume it transposed (`trans_b`,
-            // `ldb = k`). MLAS then streams each weight row once and reuses it
-            // across all m activation rows, the amortization a per-row GEMV
-            // lacks. Non-MLAS hosts keep the previous direct-`Kn` dense path.
-            let used_fast_nt = self.try_prefill_mlas_nt(
+            // dequantize once into the natural, contiguous `Nk` layout -- cached
+            // in the same `weight_nk` slot the m==1 generic path uses, so
+            // constant weights pay the dequant once -- and let a transposed-B
+            // ("NT") dense GEMM consume it directly (`B_nk[n, k]^T`). The GEMM
+            // then streams each weight row once and reuses it across all m
+            // activation rows, the amortization a per-row GEMV lacks. Available
+            // on every backend with an NT GEMM: MLAS (`trans_b`) and, on the
+            // default build, the native `SimdX86` NT packer (#959, #1091).
+            // Backends without one keep the previous direct-`Kn` dense path.
+            let used_fast_nt = self.try_prefill_nk_nt(
                 &inputs[1],
                 &inputs[2],
                 zero_points,
@@ -2313,16 +2327,24 @@ impl MatMulNBitsKernel {
 
     /// Prefill / batched (`m > 1`) fast path for the dense-dequantize fallback:
     /// dequantize the constant weight once into the natural, contiguous `Nk`
-    /// (`[n, k]`) layout, cache it, and run MLAS's cache-tiled `sgemm` with
-    /// `trans_b` so each weight row is streamed once and reused across all `m`
-    /// activation rows. Returns `Ok(true)` when it handled the GEMM, `Ok(false)`
-    /// when the host GEMM backend is not MLAS (the caller then uses the previous
-    /// direct-`Kn` dense path). Bit-identical to a no-transpose dense GEMM: MLAS
-    /// with `trans_b` computes `C = A * B_nk^T` where `B_nk[n, k]` is the same
-    /// weight the `Kn` path stores transposed.
-    #[cfg(feature = "mlas")]
+    /// (`[n, k]`) layout, cache it in the same `weight_nk` slot the `m == 1`
+    /// decode path uses, and run a **transposed-B ("NT") dense GEMM** so each
+    /// weight row is streamed once and reused across all `m` activation rows.
+    /// Returns `Ok(true)` when it handled the GEMM, `Ok(false)` when the host
+    /// GEMM backend has no NT variant (the caller then uses the previous
+    /// direct-`Kn` dense path).
+    ///
+    /// This replaces the strided-scatter `Kn` dequant (each K step writing at
+    /// stride N) that dominated large-model time-to-first-token (#959, #1091).
+    /// It is available on every backend with an NT GEMM — MLAS's cache-tiled
+    /// `sgemm` with `trans_b`, and, now, the native `SimdX86` packer that reads
+    /// `B_nk` row-wise into an L1-resident pack tile (the same idea, ported off
+    /// MLAS). [`super::matmul::nt_gemm_supported`] is the single legality
+    /// predicate; [`super::matmul::gemm_nt_with_backend`] is proven
+    /// bit-identical to the `Kn` dense route for the same inputs, because
+    /// `B_nk[n, k]` is exactly the weight the `Kn` path stores transposed.
     #[allow(clippy::too_many_arguments)]
-    fn try_prefill_mlas_nt(
+    fn try_prefill_nk_nt(
         &self,
         packed: &TensorView,
         scales: &TensorView,
@@ -2335,7 +2357,8 @@ impl MatMulNBitsKernel {
     ) -> Result<bool> {
         use crate::backend::CpuBackend;
 
-        if CpuBackend::auto_detect() != CpuBackend::Mlas {
+        let backend = CpuBackend::auto_detect();
+        if !super::matmul::nt_gemm_supported(backend) {
             return Ok(false);
         }
 
@@ -2344,13 +2367,16 @@ impl MatMulNBitsKernel {
             if let Some(weight) = self.weight_nk.get() {
                 weight
             } else {
-                let weight = self.dequantize_weight(
-                    packed,
-                    scales,
-                    zero_points,
-                    group_indices,
-                    WeightLayout::Nk,
-                )?;
+                let weight =
+                    mm_profile::time_prepack("dequant-nk", self.nbits_weight_bytes(), || {
+                        self.dequantize_weight(
+                            packed,
+                            scales,
+                            zero_points,
+                            group_indices,
+                            WeightLayout::Nk,
+                        )
+                    })?;
                 let weight = numa_place_nk(weight, self.n);
                 let _ = self.weight_nk.set(weight);
                 self.weight_nk
@@ -2358,55 +2384,30 @@ impl MatMulNBitsKernel {
                     .expect("constant MatMulNBits Nk prepack was just initialized")
             }
         } else {
-            let built = self.dequantize_weight(
-                packed,
-                scales,
-                zero_points,
-                group_indices,
-                WeightLayout::Nk,
-            )?;
+            let built = mm_profile::time_prepack("dequant-nk", self.nbits_weight_bytes(), || {
+                self.dequantize_weight(packed, scales, zero_points, group_indices, WeightLayout::Nk)
+            })?;
             owned_weight = numa_place_nk(built, self.n);
             &owned_weight
         };
 
-        // C[m, n] = A[m, k] * B_nk[n, k]^T. `trans_b` with `ldb = k` reads the
-        // Nk weight as the transposed operand without materializing a Kn copy.
+        // C[m, n] = A[m, k] * B_nk[n, k]^T -- reads the Nk weight as the
+        // transposed operand without materializing a Kn copy. Bit-identical to
+        // the direct-`Kn` dense GEMM the caller would otherwise run. Timed on
+        // the same `gemv` phase the `Kn` route reports, so a profile taken
+        // across the two routes compares like with like.
         mm_profile::time_gemv(|| {
-            mlas_sys::sgemm(
-                false,
-                true,
-                m,
-                self.n,
-                self.k,
-                1.0,
+            super::matmul::gemm_nt_with_backend(
+                backend,
                 activations,
-                self.k,
                 weight_nk,
-                self.k,
-                0.0,
                 result,
+                m,
+                self.k,
                 self.n,
-            );
-        });
+            )
+        })?;
         Ok(true)
-    }
-
-    /// Non-MLAS builds have no cache-tiled dense GEMM here, so the batched
-    /// fallback always uses the direct-`Kn` dense path.
-    #[cfg(not(feature = "mlas"))]
-    #[allow(clippy::too_many_arguments)]
-    fn try_prefill_mlas_nt(
-        &self,
-        _packed: &TensorView,
-        _scales: &TensorView,
-        _zero_points: Option<&TensorView>,
-        _group_indices: Option<&TensorView>,
-        _can_prepack: bool,
-        _activations: &[f32],
-        _m: usize,
-        _result: &mut [f32],
-    ) -> Result<bool> {
-        Ok(false)
     }
 
     /// Run a pre-partitioned MLAS SQNBit GEMV (`self.n` split into contiguous

@@ -100,6 +100,9 @@ harness = false
 name = "sdpa_simd"
 harness = false
 
+[[bench]]
+name = "matmul_nbits_prefill_ab"
+
 # The absorption gate. Native and the MLAS reference in one binary, interleaved,
 # so a claimed native win is measured against the route it claims to replace.
 # Requires `--features mlas`; with MLAS absent it reports native-only and says
