@@ -2594,10 +2594,6 @@ unsafe extern "C" fn compute_execute(
                     }
                 }
 
-                // Build mutable output views: ORT outputs first, then buffer outputs.
-                let mut ort_out_views: Vec<_> =
-                    ort_outputs.iter_mut().map(|o| o.view_mut()).collect();
-
                 // For buffer-sink outputs, allocate the IntermediateBuf and get a
                 // mutable pointer into it. Device EPs take ORT scratch memory so
                 // intermediates live where the kernels execute; host EPs take a
@@ -2654,7 +2650,12 @@ unsafe extern "C" fn compute_execute(
                     absent_shapes,
                 );
                 let mut all_output_views: Vec<_> = {
-                    let mut ort_iter = ort_out_views.drain(..);
+                    // Taken lazily. Collecting these into their own `Vec` and
+                    // immediately draining it built a second vector of views per
+                    // node, for every node of every `Run`, to hand each view
+                    // straight to the map below. The single-node path stopped
+                    // doing this; the routed path is where it is paid per node.
+                    let mut ort_iter = ort_outputs.iter_mut().map(|o| o.view_mut());
                     let mut buf_iter = new_bufs.iter_mut();
                     slot_kinds
                         .iter()
