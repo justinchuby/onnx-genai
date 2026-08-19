@@ -26,4 +26,4 @@ mod transform;
 
 mod program;
 pub use program::ImagePreprocessor;
-use program::{CoordinateOrder, PatchChannelOrder, PatchifySpec};
+use program::{CoordinateOrder, PatchChannelOrder, PatchTemporalOrder, PatchifySpec};
