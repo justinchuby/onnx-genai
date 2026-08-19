@@ -3974,3 +3974,96 @@ Finally, the native-alone t=16→t=32 drift on the small shapes (roughly 1.7×)
 survives everything above and has no explanation yet. It is the real remaining
 scheduler residual, and it is about a fifth of what the paired numbers made it
 look like.
+
+## 39. Phase 19: the harness now measures itself (#1364 follow-up)
+
+§36.3 and §37.4 both ended at the same place: a delta was reported, and nothing
+in the run said whether the instrument could resolve it. Both had to reconstruct
+a noise estimate afterwards, from cells the change could not reach. That is an
+argument, and it arrives too late to change what was measured.
+
+`ab.py` now takes `--null-control`. It adds a third arm which is **the first
+arm's own binary, with the first arm's environment, under a second name**,
+interleaved and order-alternated exactly like the real arms. It cannot measure
+the change. Whatever delta it reports is the host's noise floor **for that cell,
+in that invocation**, and the deltas table marks any real arm inside it as
+`WITHIN NOISE` rather than printing a number that looks publishable.
+
+### 39.1 The floor, measured
+
+Same-binary control arm, MoE `t=512` fixtures (5 trials) and softmax transforms
+(8 trials), `|Δ|` of the median native/ort ratio against the identical binary:
+
+| cell | 1 thread | 2 threads | 8 threads |
+| --- | --- | --- | --- |
+| `moe_mixtral_h1024_i3584_e8_t512` | 0.63% | 0.22% | **19.54%** |
+| `moe_qwen3moe_h2048_i768_e16_t512` | 4.75% | 3.97% | **12.68%** |
+| `moe_phi35moe_h2048_i6400_e4_t512` | 0.19% | 4.28% | 3.03% |
+| `sm_bert_b8_s128` | 0.21% | — | — |
+| `sm_decode_h32_kv8192` | 1.32% | — | — |
+| `sm_prefill_h32_s512` | 0.22% | — | — |
+
+Two things fall out. Single-thread cells are **tight** — under 5%, mostly under
+1.5% — so the single-thread ratios this document publishes are resolvable at the
+effect sizes it claims. Eight-thread cells are **not**: a 12–20% floor means the
+5–15% movements tabulated in several earlier phases at `t=8` carried no
+information, exactly as §36.3 warned.
+
+§38 arrived at the wide-thread half of this independently and from the other
+side: it isolated the co-resident ORT session as a large part of the wide-thread
+residual. The two results compose rather than compete. The control arm here is
+paired with ORT exactly like the real arms, so it measures the floor **given**
+the pairing — which is the right floor for a published ratio, since every ratio
+in this document is paired. §38's `--native-only` split is what explains *why*
+that floor grows with thread count. Neither replaces the other: run the control
+to decide whether a ratio is a result, run the split to decide what an absolute
+native time means.
+
+### 39.2 Both phase-17 merges, re-measured against their own control
+
+The floor and the effect now come from the same invocation, so these are the
+first self-controlled cells in this document.
+
+| change | cell (1 thread) | Δ median ratio | floor | verdict |
+| --- | --- | --- | --- | --- |
+| #1364 packed panel | `moe_phi35moe…t512` | **−25.48%** | 0.19% | 134× the floor |
+| #1364 packed panel | `moe_qwen3moe…t512` | **−21.56%** | 4.75% | 4.5× the floor |
+| #1364 packed panel | `moe_mixtral…t512` | −2.38% | 0.63% | 3.8× the floor |
+| #1245 Horner `exp8` | `sm_bert_b8_s128` | **−10.28%** | 0.21% | 49× the floor |
+| #1245 Horner `exp8` | `sm_decode_h32_kv8192` | **−11.73%** | 1.32% | 8.9× the floor |
+| #1245 Horner `exp8` | `sm_prefill_h32_s512` | **−10.33%** | 0.22% | 47× the floor |
+
+Mixtral's small movement survives its control too, which is worth stating: at
+3.8× the floor it is a real 2.4% and not a rounding artefact, and it is small for
+the structural reason given in §37.3 rather than because the measurement failed.
+
+### 39.3 What this does to §37.4's 40%
+
+§37.4 reported ~40% between two *distinct binaries* traced to be executing the
+identical code path at two threads. The same-binary control above puts the
+2-thread floor at 0.22–4.28%, an order of magnitude tighter, and the absolute
+ratios differ wildly between the two sessions (mixtral `t=2` read 1.35 here and
+2.23 there, on the same fixture and the same thread count).
+
+So the 40% was not a stable property of two-thread measurement. It was a session
+— a load episode long enough to outlast the arm alternation. That distinction
+matters for how the number should be used: **it is not a floor to subtract, it
+is a demonstration that a whole invocation can be poisoned**, which no amount of
+within-invocation interleaving detects and which only a control arm inside the
+same invocation exposes.
+
+The rule that follows is narrower and stronger than "distrust multi-thread
+numbers": run the control arm in every invocation whose result will be
+published, and discard the invocation — not the cell — when the control moves
+more than the effect.
+
+### 39.4 The decision this changed
+
+#1364 shipped its packed kernel behind a gate above `MAX_MC`, which keeps the
+multi-threaded driver on the unpacked path by construction, because the
+multi-threaded evidence available at the time could not distinguish a regression
+from a load episode. §39.1 says that call was right at eight threads, where the
+floor is 12–20%, and that at **two** threads the floor is small enough (0.22–4.28%)
+for a properly controlled multi-threaded experiment to be worth running. That
+experiment — sharing one packed panel across row blocks rather than re-packing
+per block — is the open follow-up, and it now has a method that can answer it.
