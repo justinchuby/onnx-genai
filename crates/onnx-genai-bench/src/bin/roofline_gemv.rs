@@ -37,10 +37,22 @@
 //! Decode fans the N output rows across the CPU-EP decode pool, whose worker
 //! count is a process-global `OnceLock` built on first use. To sweep thread
 //! counts faithfully — as `roofline_bandwidth` does, because the DRAM ceiling
-//! itself spans 10.07 GB/s (1 thread) to 49.28 GB/s (20 threads) on this box —
-//! run this probe once per `--threads N`; each fresh process sizes its pool to
-//! `N` via `set_decode_thread_budget`. A single-threaded GEMV number would
-//! answer a different question than the one #994 asks.
+//! is itself a strong function of thread count (10.07 GB/s at 1 thread to
+//! 49.28 GB/s at 20 on the box #994 was written against; 33.7 to 75.8 GB/s on a
+//! 32-core box) — run this probe once per `--threads N`; each fresh process
+//! sizes its pool to `N` via `set_decode_thread_budget`. A single-threaded GEMV
+//! number would answer a different question than the one #994 asks.
+//!
+//! # Reading the output
+//!
+//! Every number this prints is a property of *one host and one build*, so a
+//! result quoted from an issue thread is evidence about that run, not a
+//! constant. Pair it with `roofline_bandwidth` **on the same box, in the same
+//! session** before turning a ratio into a placement decision — the point of
+//! having the probe is that re-measuring is cheap. It has already paid for
+//! itself once: between this PR being opened and being merged the kernel it
+//! drives got ~4x faster on the same host, which no amount of re-reading the
+//! original number would have revealed.
 
 use std::hint::black_box;
 use std::time::Instant;
