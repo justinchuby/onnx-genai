@@ -368,10 +368,10 @@ Muse Glimmer 这套 XML 式的 ATEM 语法有个有意思的工程细节:模板�
 ```
 
 > [!warning] 对 Llama 的一处常见误解
-> `<\|python_tag\|>` **不是**普通工具调用的语法。读模板可以看到,它只在
+> `<|python_tag|>` **不是**普通工具调用的语法。读模板可以看到,它只在
 > `builtin_tools is defined` 且被调函数属于内置工具(`brave_search`、`wolfram_alpha`
-> 这类)时才出现;`<\|eom_id\|>` 同样只在 `builtin_tools is defined` 时才用。只传普通的
-> `tools=[...]`,实际渲染出来是裸 JSON 加 `<\|eot_id\|>`,而且键名是 `parameters`
+> 这类)时才出现;`<|eom_id|>` 同样只在 `builtin_tools is defined` 时才用。只传普通的
+> `tools=[...]`,实际渲染出来是裸 JSON 加 `<|eot_id|>`,而且键名是 `parameters`
 > 不是 `arguments`。实测见 [[prompting/Chat Template Survey]]。
 
 原因说得很清楚:HF 的 Jinja 沙箱里没有 JSON 解析器,所以**必须**由调用方传 dict。

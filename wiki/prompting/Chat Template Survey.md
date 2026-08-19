@@ -255,13 +255,13 @@ Muse Glimmer 则写成大段自然语言 + XML 用法示例 + schema 清单。He
 - **Llama 4 和 Olmo 3 让模型写函数调用代码**,不写 JSON。解析这两种要写表达式解析,
   不能用 `json.loads`。
 
-> [!warning] `<\|python_tag\|>` 是个常见误解
+> [!warning] `<|python_tag|>` 是个常见误解
 > 网上(以及本 wiki 之前的版本)常说 Llama 3.1 用
-> `<\|python_tag\|>{...}<\|eom_id\|>` 发起工具调用。**默认路径不是这样。**
-> 读模板可以看到,`<\|python_tag\|>` 只在 `builtin_tools is defined`
+> `<|python_tag|>{...}<|eom_id|>` 发起工具调用。**默认路径不是这样。**
+> 读模板可以看到,`<|python_tag|>` 只在 `builtin_tools is defined`
 > **且**被调函数在 `builtin_tools` 里(`brave_search`、`wolfram_alpha` 这类内置工具)
-> 时才出现;`<\|eom_id\|>` 同样只在 `builtin_tools is defined` 时才用。
-> 只传普通的 `tools=[...]`,渲染出来是**裸 JSON + `<\|eot_id\|>`**,上表就是实测结果。
+> 时才出现;`<|eom_id|>` 同样只在 `builtin_tools is defined` 时才用。
+> 只传普通的 `tools=[...]`,渲染出来是**裸 JSON + `<|eot_id|>`**,上表就是实测结果。
 
 ### 第 3 段:工具结果怎么回填
 
