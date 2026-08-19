@@ -599,9 +599,13 @@ mod tests {
         }
     }
 
-    /// A transposed B keeps the blocked half GEMM. Both fast paths read B in
-    /// its stored [K, N] order, so materialising a transpose first would give
-    /// back exactly what they save.
+    /// A transposed B at **`M > 1`** keeps the blocked half GEMM: the decode
+    /// GEMV declines anything but a single row, and everything past it reads B
+    /// as `[K, N]`, so a transpose would have to be materialised first.
+    ///
+    /// At `M == 1` this is no longer true -- see
+    /// `half_decode_gemm_takes_the_nk_gemv_when_b_is_transposed`, which is why
+    /// this test pins `m = 4`.
     #[test]
     fn gemm_f16_transposed_b_keeps_the_blocked_path() {
         let (m, k, n) = (4usize, 6usize, 3usize);

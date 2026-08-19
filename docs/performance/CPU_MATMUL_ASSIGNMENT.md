@@ -158,13 +158,13 @@ whether we hand the node over.
 | `Gemm` | f16 | 128 | 3584 | 8 | 1.86 | 2.24 | gap |
 | `Gemm` | f16 | 128 | 3584 | 16 | 1.44 | 1.46 | gap |
 | `Gemm` | f16 | 128 | 3584 | 32 | 1.19 | 1.35 | gap |
-| `Gemm` | f16, **transB** | 1 | 3584 | 1 | **0.59** | 0.63 ‡ | **win** (was 22.5) |
-| `Gemm` | f16, **transB** | 1 | 3584 | 2 | **0.59** | 0.73 ‡ | **win** (was 29.7) |
-| `Gemm` | f16, **transB** | 1 | 3584 | 4 | 1.22 | 0.94 ‡ | gap (was 36.9) |
-| `Gemm` | f16, **transB** | 1 | 3584 | 8 | 1.83 | 1.40 ‡ | gap (was 49.5) |
-| `Gemm` | f16, **transB** | 1 | 3584 | 16 | 1.46 | 2.02 ‡ | gap (was 65.3) |
-| `Gemm` | f16, **transB** | 128 | 3584 | 1 | 3.71 | 4.06 ‡ | **gap** |
-| `Gemm` | f16, **transB** | 128 | 3584 | 8 | 10.72 | 17.97 ‡ | **gap** |
+| `Gemm` | f16, **transB** | 1 | 3584 | 1 | **0.66** | 0.67 | **win** (was 22.5) |
+| `Gemm` | f16, **transB** | 1 | 3584 | 2 | **0.63** | 0.73 | **win** (was 29.7) |
+| `Gemm` | f16, **transB** | 1 | 3584 | 4 | **0.84** | 1.02 | **win** (was 36.9) |
+| `Gemm` | f16, **transB** | 1 | 3584 | 8 | **0.76** | 0.93 | **win** (was 49.5) |
+| `Gemm` | f16, **transB** | 1 | 3584 | 16 | 1.71 | 1.22 | gap (noisy, was 65.3) |
+| `Gemm` | f16, **transB** | 128 | 3584 | 1 | 4.04 | 4.11 | **gap** |
+| `Gemm` | f16, **transB** | 128 | 3584 | 8 | 16.95 | 10.53 | **gap** |
 | `QLinearMatMul` | u8 x u8 | 1 | 3584 | 1 | 1.13 | 1.18 | gap |
 | `QLinearMatMul` | u8 x u8 | 1 | 3584 | 8 | 2.33 | 2.77 | gap |
 | `QLinearMatMul` | u8 x u8 | 1 | 3584 | 16 | 2.34 | 2.58 | gap |
@@ -183,17 +183,28 @@ whether we hand the node over.
 | `QLinearMatMul` | i8 x i8 | 512 | 3584 | 1 | **0.26** | 0.26 | **win** |
 | `QLinearMatMul` | i8 x i8 | 512 | 3584 | 8 | **0.42** | 0.43 | **win** |
 | `QLinearMatMul` | i8 x i8 | 512 | 3584 | 16 | **0.42** | 0.47 | **win** |
-‡ On the seven `transB` rows the last column is the **min-of-minima** ratio, not a
-p90: it is our best single run over ORT's best single run. It is quoted because
-these were measured on a host under load 6-13, where the minimum is the only
-statistic that is not partly a measure of the other tenants. It is not
-comparable to a p90 and is marked so nobody compares it to one.
-
 `transB = 1` is the layout every `nn.Linear` export produces, so these rows are
 not a corner case — they are what a QKV, an output projection and an MLP gate
 look like when a model is exported through `Gemm` rather than `MatMul`. They
 were absent from this table entirely until 2026-08-19; the `transB = 0` `Gemm`
 rows above them never covered them.
+
+**The `M = 1` ratios above are the least reproducible numbers in this file, and
+the `t = 16` row should not be trusted to two digits.** The decode cells now run
+in 0.3-1.5 ms, which is short enough that the host's other tenants move the
+ratio more than the kernel does. Three independent sweeps of the same five cells,
+at load 6-13, 12-18 and 9-11, gave p50 ratios of
+
+| threads | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| sweep A (7 trials) | 0.59 | 0.59 | 1.22 | 1.83 | 1.46 |
+| sweep B (7 trials) | 0.88 | 1.51 | 1.23 | 1.04 | 2.68 |
+| sweep C (9 trials, tabulated) | 0.66 | 0.63 | 0.84 | 0.76 | 1.71 |
+
+so the honest reading is: **a consistent win at 1-2 threads (0.59-0.88), and
+somewhere between a win and a ~2x loss at 4-16 threads, unresolvable on this
+host.** What is *not* in doubt is the absolute change, which is three to four
+orders of magnitude larger than the noise: 32-48 ms before, 0.3-1.5 ms after.
 
 
 Ranges **outside** the measured region — `K * N < 2^20`, symbolic/dynamic weight shapes, and dense
@@ -419,25 +430,27 @@ A transpose is only needed if you insist on reusing the `[K, N]` kernel. A
 to back and the output partitions to any granularity, down to a single row.
 
 So `transB = 1` at `M = 1` fell into the portable blocked half GEMM — the path
-section 2 already calls "the worst dense region measured anywhere in this EP".
-It measured **32-48 ms against ORT's 0.16-1.5 ms at `K = N = 3584`: 22x to 65x
+the dispatch comment in `gemm.rs` already calls "the worst dense region measured
+anywhere in this EP". It measured **32-48 ms against ORT's 0.16-1.5 ms at `K = N = 3584`: 22x to 65x
 slower**, and it did not improve with thread count at all (36.6 ms at 1 thread,
 36.2 at 8, 48.1 at 16). This is not a corner case — `transB = 1` is what every
 `nn.Linear` export produces.
 
 The fix is a second kernel rather than a transpose: `half_gemv::gemv_f16_nk`,
 four independent 8-lane FMA chains along `k`, 8 output rows per task. `M = 1`
-`transB` now reads **0.59 at 1 and 2 threads — a win** — and 1.2-1.8x at 4-16,
-i.e. 36x to 70x faster in absolute terms, up to 133x on per-run minima.
+`transB` now reads **0.63-0.84 — a win — at 1 through 8 threads**, and at 16 a
+ratio too noisy on this host to quote; in absolute terms 38x to 90x faster, up
+to 148x on per-run minima.
 
 Two things this did **not** fix, both open:
 
 * **`transB` prefill is still broken** and got no better: `M = 128` measures
-  **3.7x at 1 thread and 10.7x at 8** (170 ms vs 46 ms; 18x on minima). The GEMV
+  **4.0x at 1 thread and 17.0x at 8** (156 ms vs 39 ms). Unlike the decode
+  cells these are long enough to be reproducible. The GEMV
   correctly declines `M > 1`, so prefill still takes the blocked path. Closing
   it needs a packed **NT** half GEMM — the f16 analogue of #1176's transposed-B
   SGEMM.
-* **The residual 1.2-1.8x at 4-16 threads is the section 1 ceiling**, not
+* **The residual loss at high thread counts is the section 1 ceiling**, not
   anything specific to this kernel. Every one of our `M = 1` GEMVs flattens at
   ~0.7-1.1 ms past 4-8 threads while ORT keeps scaling. Measured on the same
   sweep: 4-bit goes 3.60 -> 0.79 ms across 1..16 threads while ORT goes

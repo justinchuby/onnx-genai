@@ -4,8 +4,10 @@
 `bench_generic` already alternates our EP and ORT inside one process, so each
 line is a paired measurement. What this adds is the *thread-count sweep* and an
 aggregation that survives a contended host: it reports the median of the
-per-run p50 **and** the min of the per-run min, because on a shared machine the
-min is the only statistic that is not a measure of the other tenants.
+per-run p50, the median of the per-run p90 (the statistic
+`docs/performance/CPU_MATMUL_ASSIGNMENT.md` tabulates) **and** the min of the
+per-run min, because on a shared machine the min is the only statistic that is
+not partly a measure of the other tenants.
 
 Absolute milliseconds are printed, not just the ratio -- the whole question
 these rows raise is whether we get slower with more threads or whether ORT
@@ -23,7 +25,8 @@ from pathlib import Path
 
 LINE = re.compile(
     r"native=(?P<native>[\d.]+) ms .*?ort=(?P<ort>[\d.]+) ms .*?"
-    r"native/ort=(?P<ratio>[\d.]+) .*?"
+    r"native/ort=(?P<ratio>[\d.]+) "
+    r"native_p90=(?P<native_p90>[\d.]+) ort_p90=(?P<ort_p90>[\d.]+) "
     r"native_min=(?P<native_min>[\d.]+) ort_min=(?P<ort_min>[\d.]+)"
 )
 
@@ -62,7 +65,8 @@ def main() -> int:
 
     print(
         f"{'model':26s} {'t':>3s} {'native_p50':>10s} {'ort_p50':>8s} "
-        f"{'ratio_p50':>9s} {'native_min':>10s} {'ort_min':>8s} {'ratio_min':>9s}"
+        f"{'ratio_p50':>9s} {'ratio_p90':>9s} {'native_min':>10s} {'ort_min':>8s} "
+        f"{'ratio_min':>9s}"
     )
     for model in args.models:
         for threads in args.threads:
@@ -73,11 +77,14 @@ def main() -> int:
                 )
             native_p50 = statistics.median(t["native"] for t in trials)
             ort_p50 = statistics.median(t["ort"] for t in trials)
+            native_p90 = statistics.median(t["native_p90"] for t in trials)
+            ort_p90 = statistics.median(t["ort_p90"] for t in trials)
             native_min = min(t["native_min"] for t in trials)
             ort_min = min(t["ort_min"] for t in trials)
             print(
                 f"{model.stem:26s} {threads:3d} {native_p50:10.3f} {ort_p50:8.3f} "
-                f"{native_p50 / ort_p50:9.3f} {native_min:10.3f} {ort_min:8.3f} "
+                f"{native_p50 / ort_p50:9.3f} {native_p90 / ort_p90:9.3f} "
+                f"{native_min:10.3f} {ort_min:8.3f} "
                 f"{native_min / ort_min:9.3f}",
                 flush=True,
             )

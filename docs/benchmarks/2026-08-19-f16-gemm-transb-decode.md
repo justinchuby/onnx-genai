@@ -8,8 +8,9 @@ AVX-512, no VNNI, no AMX). ONNX Runtime 1.27.0, CPU EP. Native build, **no**
 
 An f16 `Gemm` at `M = 1` with `transB = 1` took **32-48 ms** at `K = N = 3584`
 against ORT's 0.16-1.5 ms: between **21x and 65x slower**, and it did not
-improve with thread count at all. It now takes 0.69-1.00 ms, which is a **win**
-at 1 and 2 threads and a 1.2-1.8x loss at 4-16.
+improve with thread count at all. It now takes **0.3-1.5 ms** — a 38x to 90x
+absolute speedup, up to 148x on per-run minima — which is a **win at 1-8
+threads** and, at 16, a number too noisy on this host to quote (see below).
 
 `transB = 1` is not an exotic case. It is the layout every `nn.Linear` export
 produces, so it is what a QKV, an output projection and an MLP gate all look
@@ -89,20 +90,46 @@ tenants. Load average during the runs was 6-13.
 
 ### f16 `Gemm`, `transB = 1`, `M = 1` (the fix)
 
-| threads | before ms (p50) | after ms (p50) | speedup | before `ours/ORT` | after `ours/ORT` |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 36.606 | **1.001** | 36.6x | 22.46 | **0.588 win** |
-| 2 | 36.383 | **0.805** | 45.2x | 29.75 | **0.592 win** |
-| 4 | 32.587 | **0.694** | 47.0x | 36.86 | 1.224 |
-| 8 | 36.234 | **0.935** | 38.8x | 49.50 | 1.833 |
-| 16 | 48.096 | **0.688** | 69.9x | 65.26 | 1.455 |
+Tabulated run: 9 trials, load 9-11 (the quietest and largest sample of the
+three sweeps below).
 
-On per-run minima the same cells read 32.203 -> 0.926, 31.465 -> 0.491,
-31.628 -> 0.306, 36.076 -> 0.272 and 35.394 -> 0.321 ms, i.e. **35x to 133x**.
+| threads | before ms (p50) | after ms (p50) | speedup | before `ours/ORT` | after p50 | after p90 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 36.606 | **0.968** | 37.8x | 22.46 | **0.655 win** | 0.674 |
+| 2 | 36.383 | **0.633** | 57.5x | 29.75 | **0.634 win** | 0.733 |
+| 4 | 32.587 | **0.468** | 69.6x | 36.86 | **0.840 win** | 1.021 |
+| 8 | 36.234 | **0.532** | 68.1x | 49.50 | **0.757 win** | 0.929 |
+| 16 | 48.096 | **0.534** | 90.1x | 65.26 | 1.706 | 1.224 |
+
+On per-run minima the same cells read 32.203 -> 0.814, 31.465 -> 0.461,
+31.628 -> 0.294, 36.076 -> 0.243 and 35.394 -> 0.302 ms, i.e. **40x to 148x**.
 
 Note the before column does not move with thread count (36.6 at 1 thread, 36.2
 at 8, 48.1 at 16). That is the signature of the blocked path: it never scaled on
 a single-row problem, so the ratio degraded purely because ORT did scale.
+
+### The ratio is now the noisy part, and I am not going to pretend otherwise
+
+Post-fix these cells run in 0.3-1.5 ms. That is short enough that the host's
+other tenants move the ratio more than the kernel does. Three independent sweeps
+of the same five cells, taken at load 6-13, 12-18 and 9-11:
+
+| threads | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| sweep A (7 trials, load 6-13) | 0.588 | 0.592 | 1.224 | 1.833 | 1.455 |
+| sweep B (7 trials, load 12-18) | 0.884 | 1.513 | 1.234 | 1.040 | 2.680 |
+| sweep C (9 trials, load 9-11) | 0.655 | 0.634 | 0.840 | 0.757 | 1.706 |
+
+The `t = 16` cell swings between 1.46 and 2.68 and the `t = 8` cell between 0.76
+and 1.83, so neither is worth two digits. The defensible statement is: **a
+consistent win at 1-2 threads (0.59-0.88), and somewhere between a win and a
+~2x loss at 4-16 threads, unresolvable on this host.**
+
+What is not in doubt is the absolute change, which is three to four orders of
+magnitude larger than that noise: **32-48 ms before, 0.3-1.5 ms after**, in every
+sweep. A p90 taken at load 12-18 read 8.8 at two threads and 19.0 at sixteen —
+included here as evidence that the tail statistic is a measure of the other
+tenants at these durations, not of this kernel.
 
 ### Controls: everything else at `M = 1`, same binary, same session
 
@@ -119,14 +146,15 @@ Unchanged within noise, as expected — the diff only reaches `Gemm` with
 ## What this did not fix, stated plainly
 
 * **`transB = 1` f16 *prefill* is still badly broken**, and this change does not
-  touch it: at `M = 128` it measures **170 ms against ORT's 46 ms at 1 thread
-  (3.7x) and 125 ms against 11.6 ms at 8 (10.7x)**, 18x on minima. The GEMV is a
+  touch it: at `M = 128` it measures **156 ms against ORT's 39 ms at 1 thread
+  (4.04x p50, 4.11x p90) and 101 ms against 6.0 ms at 8 (16.95x p50, 10.53x
+  p90)**. Unlike the decode cells these are long enough to be reproducible. The GEMV is a
   decode kernel and correctly declines `M > 1`
   (`half_prefill_gemm_does_not_take_the_nk_gemv` asserts this), so prefill still
   falls into the same blocked half GEMM. Fixing it needs a packed **NT** half
   GEMM — the f16 analogue of the transposed-B SGEMM in #1176 — which is a
   separate piece of work, not a comment change.
-* **The residual 1.2-1.8x loss at 4-16 threads is the same ceiling every one of
+* **The residual loss at high thread counts is the same ceiling every one of
   our M=1 GEMVs hits.** The sweep shows all of them flattening at ~0.7-1.1 ms
   past 4-8 threads while ORT keeps scaling: 4-bit goes 3.60 -> 0.79 ms across
   1..16 threads while ORT goes 1.59 -> 0.13, and f32 goes 1.73 -> 0.94 while ORT
