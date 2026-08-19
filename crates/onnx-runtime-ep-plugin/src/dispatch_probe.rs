@@ -199,7 +199,30 @@ pub struct Counters {
     pub phase_ns: [u64; Phase::COUNT],
     /// Event tallies.
     pub events: [u64; Event::COUNT],
+    /// Heap allocations made while each phase was the innermost open one.
+    ///
+    /// Length is [`ALLOC_BUCKETS`], not `Phase::COUNT`: the last slot is
+    /// [`UNATTRIBUTED`], charged when an allocation happens with no phase open.
+    /// Without that slot the table silently omits allocations rather than
+    /// showing them, which is the opposite of what an attribution pass needs --
+    /// the first live reading had four allocations per node inside phases and
+    /// gave no hint whether that was all of them.
+    ///
+    /// Only populated when a [`CountingAllocator`] is installed as the global
+    /// allocator; otherwise zero. Unlike the hand-placed
+    /// [`Event::DispatchAlloc`] tally this is exhaustive -- it sees every
+    /// allocation, including ones inside `Vec` growth, `format!`, and code we
+    /// did not write -- so it is a total rather than a lower bound.
+    pub phase_allocs: [u64; ALLOC_BUCKETS],
+    /// Bytes requested by those allocations, same bucketing.
+    pub phase_alloc_bytes: [u64; ALLOC_BUCKETS],
 }
+
+/// Index of the bucket for allocations made with no phase open.
+pub const UNATTRIBUTED: usize = Phase::COUNT;
+
+/// Number of allocation buckets: one per phase, plus [`UNATTRIBUTED`].
+pub const ALLOC_BUCKETS: usize = Phase::COUNT + 1;
 
 impl Counters {
     /// This reading minus an earlier one — what happened in between.
@@ -213,6 +236,11 @@ impl Counters {
         for i in 0..Phase::COUNT {
             d.phase_calls[i] = self.phase_calls[i].saturating_sub(earlier.phase_calls[i]);
             d.phase_ns[i] = self.phase_ns[i].saturating_sub(earlier.phase_ns[i]);
+        }
+        for i in 0..ALLOC_BUCKETS {
+            d.phase_allocs[i] = self.phase_allocs[i].saturating_sub(earlier.phase_allocs[i]);
+            d.phase_alloc_bytes[i] =
+                self.phase_alloc_bytes[i].saturating_sub(earlier.phase_alloc_bytes[i]);
         }
         for i in 0..Event::COUNT {
             d.events[i] = self.events[i].saturating_sub(earlier.events[i]);
@@ -249,7 +277,7 @@ impl Counters {
                 self.event(e) as f64 / runs as f64
             ));
         }
-        for p in Phase::ALL {
+        for p in Phase::ALL.into_iter() {
             s.push_str(&format!(
                 "  {:<16} {:>10} calls  {:>12} ns  ({:.0} ns/run)\n",
                 p.name(),
@@ -264,7 +292,7 @@ impl Counters {
 
 #[cfg(feature = "dispatch_probe")]
 mod imp {
-    use super::{Counters, Event, Phase};
+    use super::{ALLOC_BUCKETS, Counters, Event, Phase, UNATTRIBUTED};
     use std::cell::Cell;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
@@ -291,11 +319,50 @@ mod imp {
             const { [const { Cell::new(0) }; Phase::COUNT] };
         static TL_EVENTS: [Cell<u64>; Event::COUNT] =
             const { [const { Cell::new(0) }; Event::COUNT] };
+        static TL_PHASE_ALLOCS: [Cell<u64>; ALLOC_BUCKETS] =
+            const { [const { Cell::new(0) }; ALLOC_BUCKETS] };
+        static TL_PHASE_ALLOC_BYTES: [Cell<u64>; ALLOC_BUCKETS] =
+            const { [const { Cell::new(0) }; ALLOC_BUCKETS] };
     }
+
+    // Which phase is currently open on this thread, or `NO_PHASE`.
+    //
+    // Read by `CountingAllocator` on every allocation, so it must not allocate
+    // itself: a `Cell<u8>` with a `const` initialiser and no `Drop` compiles to
+    // a plain TLS slot with no lazy initialisation.
+    thread_local! {
+        static TL_CURRENT_PHASE: Cell<u8> = const { Cell::new(NO_PHASE) };
+    }
+
+    /// Sentinel for "no phase is open", so allocations outside dispatch are
+    /// attributed to nothing rather than to phase 0.
+    pub const NO_PHASE: u8 = u8::MAX;
 
     static G_PHASE_CALLS: [AtomicU64; Phase::COUNT] = [const { AtomicU64::new(0) }; Phase::COUNT];
     static G_PHASE_NS: [AtomicU64; Phase::COUNT] = [const { AtomicU64::new(0) }; Phase::COUNT];
     static G_EVENTS: [AtomicU64; Event::COUNT] = [const { AtomicU64::new(0) }; Event::COUNT];
+    static G_PHASE_ALLOCS: [AtomicU64; ALLOC_BUCKETS] =
+        [const { AtomicU64::new(0) }; ALLOC_BUCKETS];
+    static G_PHASE_ALLOC_BYTES: [AtomicU64; ALLOC_BUCKETS] =
+        [const { AtomicU64::new(0) }; ALLOC_BUCKETS];
+
+    /// Attribute one allocation of `bytes` to whichever phase is open.
+    ///
+    /// Called from the global allocator, so it takes the thread-local slot with
+    /// `try_with`: during thread teardown the TLS may already be gone, and a
+    /// panic out of `alloc` would be considerably worse than a lost count.
+    pub fn record_alloc(bytes: u64) {
+        let phase = TL_CURRENT_PHASE.try_with(Cell::get).unwrap_or(NO_PHASE);
+        let i = if phase == NO_PHASE {
+            UNATTRIBUTED
+        } else {
+            phase as usize
+        };
+        let _ = TL_PHASE_ALLOCS.try_with(|a| a[i].set(a[i].get().wrapping_add(1)));
+        let _ = TL_PHASE_ALLOC_BYTES.try_with(|a| a[i].set(a[i].get().wrapping_add(bytes)));
+        G_PHASE_ALLOCS[i].fetch_add(1, Ordering::Relaxed);
+        G_PHASE_ALLOC_BYTES[i].fetch_add(bytes, Ordering::Relaxed);
+    }
 
     /// Whether to also accumulate wall time per phase.
     ///
@@ -312,6 +379,14 @@ mod imp {
     /// Guard returned by [`Phase::enter`]; closes the phase when dropped.
     pub struct PhaseGuard {
         phase: Phase,
+        /// The phase that was open when this one started, restored on close.
+        ///
+        /// Phases nest -- a guard closes at scope exit, not at an early
+        /// `return`, so `StatusCrossing` opens inside whatever was live. Saving
+        /// and restoring means an allocation inside the inner phase is
+        /// attributed to it and the outer phase resumes afterwards, rather than
+        /// everything after the first nested phase being lost.
+        outer: u8,
         start: Option<Instant>,
     }
 
@@ -323,6 +398,7 @@ mod imp {
 
     impl Drop for PhaseGuard {
         fn drop(&mut self) {
+            let _ = TL_CURRENT_PHASE.try_with(|c| c.set(self.outer));
             if let Some(t) = self.start {
                 let ns = t.elapsed().as_nanos() as u64;
                 let i = self.phase as usize;
@@ -338,8 +414,10 @@ mod imp {
             let i = self as usize;
             TL_PHASE_CALLS.with(|a| a[i].set(a[i].get().wrapping_add(1)));
             G_PHASE_CALLS[i].fetch_add(1, Ordering::Relaxed);
+            let outer = TL_CURRENT_PHASE.with(|c| c.replace(i as u8));
             PhaseGuard {
                 phase: self,
+                outer,
                 start: timing_enabled().then(Instant::now),
             }
         }
@@ -376,6 +454,16 @@ mod imp {
                 *dst = src.get();
             }
         });
+        TL_PHASE_ALLOCS.with(|a| {
+            for (dst, src) in c.phase_allocs.iter_mut().zip(a) {
+                *dst = src.get();
+            }
+        });
+        TL_PHASE_ALLOC_BYTES.with(|a| {
+            for (dst, src) in c.phase_alloc_bytes.iter_mut().zip(a) {
+                *dst = src.get();
+            }
+        });
         c
     }
 
@@ -396,6 +484,12 @@ mod imp {
         for (dst, src) in c.events.iter_mut().zip(&G_EVENTS) {
             *dst = src.load(Ordering::Relaxed);
         }
+        for (dst, src) in c.phase_allocs.iter_mut().zip(&G_PHASE_ALLOCS) {
+            *dst = src.load(Ordering::Relaxed);
+        }
+        for (dst, src) in c.phase_alloc_bytes.iter_mut().zip(&G_PHASE_ALLOC_BYTES) {
+            *dst = src.load(Ordering::Relaxed);
+        }
         c
     }
 
@@ -409,6 +503,8 @@ mod imp {
         TL_PHASE_CALLS.with(|a| a.iter().for_each(|c| c.set(0)));
         TL_PHASE_NS.with(|a| a.iter().for_each(|c| c.set(0)));
         TL_EVENTS.with(|a| a.iter().for_each(|c| c.set(0)));
+        TL_PHASE_ALLOCS.with(|a| a.iter().for_each(|c| c.set(0)));
+        TL_PHASE_ALLOC_BYTES.with(|a| a.iter().for_each(|c| c.set(0)));
         for c in &G_PHASE_CALLS {
             c.store(0, Ordering::Relaxed);
         }
@@ -416,6 +512,12 @@ mod imp {
             c.store(0, Ordering::Relaxed);
         }
         for c in &G_EVENTS {
+            c.store(0, Ordering::Relaxed);
+        }
+        for c in &G_PHASE_ALLOCS {
+            c.store(0, Ordering::Relaxed);
+        }
+        for c in &G_PHASE_ALLOC_BYTES {
             c.store(0, Ordering::Relaxed);
         }
     }
@@ -477,6 +579,11 @@ mod imp {
     #[inline(always)]
     pub fn reset() {}
 
+    /// No-op in a production build: nothing tracks the open phase, so there is
+    /// nothing to attribute an allocation to.
+    #[inline(always)]
+    pub fn record_alloc(_bytes: u64) {}
+
     /// No-op in a production build.
     #[inline(always)]
     pub fn timing_enabled() -> bool {
@@ -537,6 +644,7 @@ impl<A> CountingAllocator<A> {
 unsafe impl<A: std::alloc::GlobalAlloc> std::alloc::GlobalAlloc for CountingAllocator<A> {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         count(Event::DispatchAlloc);
+        imp::record_alloc(layout.size() as u64);
         unsafe { self.inner.alloc(layout) }
     }
 
@@ -546,11 +654,13 @@ unsafe impl<A: std::alloc::GlobalAlloc> std::alloc::GlobalAlloc for CountingAllo
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         count(Event::DispatchAlloc);
+        imp::record_alloc(layout.size() as u64);
         unsafe { self.inner.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
         count(Event::DispatchAlloc);
+        imp::record_alloc(new_size as u64);
         unsafe { self.inner.realloc(ptr, layout, new_size) }
     }
 }
@@ -576,24 +686,67 @@ pub fn ort_calls(n: u64) {
 /// process-wide totals rather than the calling thread's. In-process users
 /// should prefer [`snapshot`], which is isolated per thread.
 ///
-/// Writes `phase_calls`, then `phase_ns`, then `events`, and returns the number
-/// of `u64`s written, or 0 if `out` is null or `len` is too small. The required
-/// length is `Phase::COUNT * 2 + Event::COUNT`.
-///
-/// Only exported when the `dispatch_probe` feature is on. A shipped plugin must
-/// export the ORT plugin ABI and nothing else, and a `no_mangle` symbol is not
-/// free just because the code behind it is: it survives `--gc-sections`, is
-/// interposable, and appears in every dynamic symbol table. Absence *is* the
-/// "probe not compiled in" answer, which is what a `dlsym` caller already has to
-/// handle.
+/// Writes `phase_calls`, `phase_ns`, `phase_allocs`, `phase_alloc_bytes`, then
+/// `events`, and returns the number of `u64`s written, or 0 if `out` is null or
+/// `len` is too small. The required length is [`SNAPSHOT_LEN`].
 ///
 /// # Safety
 ///
 /// `out` must be null or point to `len` writable `u64`s.
+/// Name of allocation bucket `index`, or null if out of range.
+///
+/// Exists because the harness must not keep its own copy of the phase order.
+/// It did, briefly, and the copy was wrong: the table labelled `TensorBind`'s
+/// allocations "OutputMeta" and `Allocate`'s "TensorBind", which is the kind of
+/// error that survives review because every number in it looks plausible.
+///
+/// Index `Phase::COUNT` is the unattributed bucket.
+///
+/// # Safety
+///
+/// The returned pointer is to a `'static` NUL-terminated string and must not be
+/// freed. It stays valid for the lifetime of the library.
+/// Only compiled under the `dispatch_probe` feature. The shipped cdylib must
+/// export the ORT plugin ABI and nothing else, and a `no_mangle` symbol is not
+/// free just because its body is: it survives `--gc-sections`, it is
+/// interposable, and it lands in every dynamic symbol table. Absence *is* the
+/// "not compiled in" answer, which `libloading`'s `Option`-returning `get`
+/// already models.
+#[cfg(feature = "dispatch_probe")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_dispatch_probe_phase_name(index: usize) -> *const std::os::raw::c_char {
+    const NAMES: [&core::ffi::CStr; ALLOC_BUCKETS] = [
+        c"callback_entry",
+        c"metadata_query",
+        c"tensor_bind",
+        c"allocate",
+        c"dispatch_lookup",
+        c"kernel_invoke",
+        c"status_crossing",
+        c"unattributed",
+    ];
+    match NAMES.get(index) {
+        Some(n) => n.as_ptr(),
+        None => core::ptr::null(),
+    }
+}
+
+/// Number of `u64`s [`nxrt_dispatch_probe_snapshot`] writes.
+///
+/// Exported so the cdylib harness sizes its buffer from the same expression the
+/// writer uses, rather than from a number copied into a test.
+pub const SNAPSHOT_LEN: usize = Phase::COUNT * 2 + ALLOC_BUCKETS * 2 + Event::COUNT;
+
+/// Only compiled under the `dispatch_probe` feature. The shipped cdylib must
+/// export the ORT plugin ABI and nothing else, and a `no_mangle` symbol is not
+/// free just because its body is: it survives `--gc-sections`, it is
+/// interposable, and it lands in every dynamic symbol table. Absence *is* the
+/// "not compiled in" answer, which `libloading`'s `Option`-returning `get`
+/// already models.
 #[cfg(feature = "dispatch_probe")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nxrt_dispatch_probe_snapshot(out: *mut u64, len: usize) -> usize {
-    let need = Phase::COUNT * 2 + Event::COUNT;
+    let need = SNAPSHOT_LEN;
     if out.is_null() || len < need {
         return 0;
     }
@@ -610,6 +763,14 @@ pub unsafe extern "C" fn nxrt_dispatch_probe_snapshot(out: *mut u64, len: usize)
             p.write(v);
             p = p.add(1);
         }
+        for v in c.phase_allocs {
+            p.write(v);
+            p = p.add(1);
+        }
+        for v in c.phase_alloc_bytes {
+            p.write(v);
+            p = p.add(1);
+        }
         for v in c.events {
             p.write(v);
             p = p.add(1);
@@ -619,9 +780,12 @@ pub unsafe extern "C" fn nxrt_dispatch_probe_snapshot(out: *mut u64, len: usize)
 }
 
 /// Zero this thread's dispatch counters, for cdylib callers.
-///
-/// Feature-gated for the same reason as
-/// [`nxrt_dispatch_probe_snapshot`]: production exports the ORT plugin ABI only.
+/// Only compiled under the `dispatch_probe` feature. The shipped cdylib must
+/// export the ORT plugin ABI and nothing else, and a `no_mangle` symbol is not
+/// free just because its body is: it survives `--gc-sections`, it is
+/// interposable, and it lands in every dynamic symbol table. Absence *is* the
+/// "not compiled in" answer, which `libloading`'s `Option`-returning `get`
+/// already models.
 #[cfg(feature = "dispatch_probe")]
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_dispatch_probe_reset() {
@@ -632,12 +796,12 @@ pub extern "C" fn nxrt_dispatch_probe_reset() {
 ///
 /// Lets a harness tell "the probe reported zero" apart from "the probe is not
 /// there", which are very different answers to `did we make any FFI calls`.
-///
-/// This symbol only exists in a probe build, so resolving it *at all* already
-/// answers the question and it always returns 1. It is kept so a caller that
-/// resolved it can read a value rather than having to special-case a symbol it
-/// looked up successfully, and it still reads `compiled_in()` rather than
-/// hard-coding the answer so the two cannot drift apart.
+/// Only compiled under the `dispatch_probe` feature. The shipped cdylib must
+/// export the ORT plugin ABI and nothing else, and a `no_mangle` symbol is not
+/// free just because its body is: it survives `--gc-sections`, it is
+/// interposable, and it lands in every dynamic symbol table. Absence *is* the
+/// "not compiled in" answer, which `libloading`'s `Option`-returning `get`
+/// already models.
 #[cfg(feature = "dispatch_probe")]
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_dispatch_probe_available() -> i32 {
@@ -766,14 +930,36 @@ mod tests {
         }
     }
 
+    /// The exported names must match `Phase::name`, in order.
+    ///
+    /// Two sources of truth for the same list is exactly how the harness came
+    /// to mislabel two phases; this makes the duplicate a checked one.
+    #[cfg(feature = "dispatch_probe")]
+    #[test]
+    fn exported_phase_names_match_the_enum() {
+        for p in Phase::ALL.into_iter() {
+            let ptr = nxrt_dispatch_probe_phase_name(p as usize);
+            assert!(!ptr.is_null(), "{} has no exported name", p.name());
+            // SAFETY: the export returns a 'static NUL-terminated string.
+            let got = unsafe { core::ffi::CStr::from_ptr(ptr) };
+            assert_eq!(got.to_str().unwrap(), p.name(), "name mismatch");
+        }
+        let last = nxrt_dispatch_probe_phase_name(UNATTRIBUTED);
+        assert!(!last.is_null());
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { core::ffi::CStr::from_ptr(last) }.to_str().unwrap(),
+            "unattributed"
+        );
+        assert!(nxrt_dispatch_probe_phase_name(ALLOC_BUCKETS).is_null());
+    }
+
     /// The C entry point is what the cdylib harness uses; it must refuse a
     /// buffer it would overrun rather than writing past the end.
-    ///
-    /// Only exists in a probe build, because the entry point only exists there.
-    #[test]
     #[cfg(feature = "dispatch_probe")]
+    #[test]
     fn c_snapshot_refuses_a_short_buffer() {
-        let need = Phase::COUNT * 2 + Event::COUNT;
+        let need = SNAPSHOT_LEN;
         let mut buf = vec![0u64; need];
         // SAFETY: `buf` has exactly `need` writable u64s.
         assert_eq!(

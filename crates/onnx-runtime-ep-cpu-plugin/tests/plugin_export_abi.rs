@@ -627,7 +627,7 @@ fn l1_no_symbol_leakage() {
                 && *name != "nxrt_ep_reset_executed_node_count"
                 && *name != "nxrt_ep_build_features"
                 && *name != "nxrt_ep_persistent_decode_pool_built"
-                // The dispatch probe is a research build. Its three exports
+                // The dispatch probe is a research build. Its four exports
                 // exist only under the `dispatch_probe` feature, which no
                 // shipped build sets, so in a production cdylib these are
                 // absent and this arm never fires. Gated on the same `cfg` as
@@ -639,6 +639,7 @@ fn l1_no_symbol_leakage() {
                         "nxrt_dispatch_probe_snapshot"
                             | "nxrt_dispatch_probe_reset"
                             | "nxrt_dispatch_probe_available"
+                            | "nxrt_dispatch_probe_phase_name"
                     ))
                 && !name.starts_with("_Z")
                 && !name.starts_with("__rust")

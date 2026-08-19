@@ -20,10 +20,12 @@ crate-type = ["cdylib", "lib"]
 # resolved graph and the built cdylib's symbol table.
 mlas = ["onnx-runtime-ep-cpu/mlas"]
 
-# Compile the dispatch probe into the cdylib, so a harness can resolve its
-# entry points across the ORT boundary. Never enabled for a shipped build: the
-# probe's `no_mangle` exports exist only under this feature precisely so the
-# shipped cdylib keeps exporting the ORT plugin ABI and nothing else
+# Compile the dispatch probe into the cdylib and install the counting allocator
+# as its global allocator, so a harness can attribute allocations to dispatch
+# phases across the ORT boundary. Never enabled for a shipped build: it adds a
+# thread-local read and two counter updates to every allocation in the library,
+# and the probe's `no_mangle` exports exist only under this feature precisely so
+# the shipped cdylib keeps exporting the ORT plugin ABI and nothing else
 # (`plugin_export_abi::l1_no_symbol_leakage` pins that).
 dispatch_probe = ["onnx-runtime-ep-plugin/dispatch_probe"]
 
