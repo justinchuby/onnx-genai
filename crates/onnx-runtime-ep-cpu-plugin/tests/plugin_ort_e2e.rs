@@ -5868,6 +5868,20 @@ fn unary_bench_cases() -> Vec<MatmulFamilyCase> {
             1e-4,
         ),
         unary_case("bench_exp_f32_1m", "Exp", "", ELEM_F32, M1, 17, false, 1e-4),
+        // Relu had only the 1 Mi size, which is bandwidth-bound and therefore
+        // says almost nothing about the kernel. The 4 Ki case is the one that
+        // fits in L1 and actually measures the arithmetic, and it is also the
+        // size a decode step sees.
+        unary_case(
+            "bench_relu_f32_4k",
+            "Relu",
+            "",
+            ELEM_F32,
+            K4,
+            17,
+            false,
+            0.0,
+        ),
         unary_case(
             "bench_relu_f32_1m",
             "Relu",
