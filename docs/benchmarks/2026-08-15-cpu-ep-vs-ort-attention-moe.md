@@ -3785,3 +3785,165 @@ owns all `m` rows. It needs a quiet machine, not a better idea. The second is
 that **this document now has two independent measurements of its own instrument
 disagreeing with itself by 20–40%**, and every cross-arm claim in it that rests
 on a single pass without a null control should be read as provisional.
+
+## 38. Phase 18: the residual t=32 loss is mostly the other arm (no code change)
+
+§36.8 left `gemm_nbits_qwen3_0p6b_qkv_t8` slower at t=32 than at t=16 and called
+the remaining shape "a scheduler signature". It is — but it is not *our*
+scheduler. This phase spent its whole budget on measurement and produced no code
+change, because what it found is that a large part of the residual is the
+harness: the ORT session we measure against is still holding the machine while
+the native arm runs. §37.6 ended by saying every single-pass cross-arm claim in
+this document should be read as provisional. This section is the reason that
+warning needs to be stronger for the wide-thread rows specifically.
+
+### 38.1 Ruling out lane width first
+
+The obvious suspect was the task runtime's own width. On this host
+`resolve_width()` caps at 16 lanes for a 32-thread budget (`smt_cap`), so at
+t=32 sixteen lanes serve a fan-out that Rayon would have given 32 workers. If
+the residual were the cap, forcing the width up would recover it.
+
+`ONNX_GENAI_CPU_TASK_THREADS` was swept against the merged binary at t=32,
+7 trials, median native ms, paired harness:
+
+| cell | lanes=8 | lanes=16 (default) | lanes=32 |
+| --- | --- | --- | --- |
+| `gemm_nbits_llama3_8b_qkv_t8` | 39.41 | 30.19 | **25.09** |
+| `gemm_nbits_qwen3_0p6b_mlp_t8` | 11.54 | **10.32** | 10.63 |
+| `gemm_nbits_qwen3_0p6b_qkv_t8` | 5.88 | **4.43** | 7.02 |
+| `gemm_nbits_qwen3_0p6b_qkv_t1` | 0.80 | **0.73** | 0.99 |
+
+The default is at or near the optimum for three of the four cells, and the one
+that wants more lanes wants them by 1.2×, not by the 3× the residual is worth.
+More decisively: t=16 and t=32 both run **16 lanes**, and they differ by ~3×.
+Whatever the residual is, it is not a property of how wide the fan-out is cut.
+
+### 38.2 The measurement that explains it
+
+`bench_generic` takes `--native-only` and `--ort-only`, which build only the arm
+being timed. Running the same binary, same shapes, same thread counts, with and
+without the ORT session co-resident isolates contention from arithmetic. Median
+of 5, native ms:
+
+| cell | t | native alone | native paired with ORT | ratio |
+| --- | --- | --- | --- | --- |
+| `qwen3_0p6b_qkv_t8` | 8 | 1.94 | 1.97 | 1.02× |
+| `qwen3_0p6b_qkv_t8` | 16 | 2.09 | 2.06 | 0.98× |
+| `qwen3_0p6b_qkv_t8` | 32 | 3.61 | 5.66 | **1.57×** |
+| `qwen3_0p6b_mlp_t8` | 8 | 3.77 | 3.80 | 1.01× |
+| `qwen3_0p6b_mlp_t8` | 16 | 3.17 | 3.00 | 0.95× |
+| `qwen3_0p6b_mlp_t8` | 32 | 5.73 | 11.53 | **2.01×** |
+| `llama3_8b_qkv_t8` | 8 | 7.15 | 13.18 | **1.84×** |
+| `llama3_8b_qkv_t8` | 16 | 6.22 | 10.29 | **1.65×** |
+| `llama3_8b_qkv_t8` | 32 | 6.87 | 28.70 | **4.18×** |
+
+The `llama3_8b_qkv_t8` row is not noise. It reproduced across two independent
+sessions about an hour apart, to three significant figures: 28.698 then 28.713
+paired, 6.868 then 6.900 alone. §36.3's null arm puts this box's per-cell noise
+floor at 0.72×–1.20× at t=32; a 4.18× reading with that reproducibility is four
+times outside it.
+
+Note also what the table does to the "more threads, more time" story. Measured
+**alone**, `llama3_8b_qkv_t8` is 7.15 / 6.22 / 6.87 ms at t=8/16/32 — flat, with
+no inversion at all. The inversion only exists in the paired numbers.
+
+### 38.3 It is asymmetric, and that is the mechanism
+
+Timing all four arms at t=32, 7 trials, medians:
+
+| cell | native alone | native paired | ORT alone | ORT paired |
+| --- | --- | --- | --- | --- |
+| `qwen3_0p6b_qkv_t8` | 4.92 | 5.47 (1.11×) | 0.099 | 0.128 (1.29×) |
+| `llama3_8b_qkv_t8` | 6.90 | 28.71 (**4.16×**) | 0.691 | 0.840 (1.22×) |
+
+ORT pays 1.2–1.3× for our co-residency. We pay up to 4.2× for its. The asymmetry
+is the mechanism: ORT's intra-op pool spin-waits for a long window after its last
+op, so it is still burning all 32 CPUs when the native arm starts. Our pools do
+the opposite — the task runtime spins briefly and parks (§33), and the decode
+Rayon pool parks too — so by the time ORT's arm runs, our threads are asleep and
+cost it almost nothing.
+
+This is worth stating plainly, because it is the one place in this campaign where
+the design decision that looked like a concession is the one that pays: **a pool
+that parks quickly is invisible to its neighbours, and a pool that spins is not.**
+
+### 38.4 It is not an int4 problem, and not even a kernel problem
+
+If the tax were cache pressure specific to streaming int4 weights, the dense f32
+control would be exempt. It is the worst cell in the set. Median of 5 at t=32:
+
+| cell | native alone | native paired | ratio |
+| --- | --- | --- | --- |
+| `gemm_dense_tall_128x4096` (f32 dense) | 5.62 | 26.92 | **4.79×** |
+| `gemm_nbits_llama3_8b_mlp_t8` (int4, 56 Mi) | 15.99 | 42.56 | **2.66×** |
+| `gemm_nbits_llama3_8b_qkv_t8` (int4, 24 Mi) | 6.90 | 28.71 | **4.16×** |
+| `gemm_nbits_llama3_8b_qkv_t1` (int4, m=1) | 2.56 | 1.94 | 0.76× |
+
+The tax tracks how long the native arm runs, not what it computes. Cells that
+finish in ~2 ms escape it; cells that run 6 ms or more sit inside the spin window
+for their whole duration and pay 2.7–4.8×. `llama3_8b_qkv_t1` at 0.76× is inside
+the noise band and carries no signal either way.
+
+### 38.5 The affinity probe that did not survive its own null
+
+The remaining hypothesis for the *native-alone* t=16→t=32 drift (2.09 → 3.61 ms
+on `qwen3_0p6b_qkv_t8`) is SMT placement: at a 32-thread budget the process is
+allowed all 32 logical CPUs, so 16 unpinned task workers may double up on SMT
+siblings while whole cores idle. The task runtime sizes itself to the physical
+core count but does not pin.
+
+Confining the process externally to the 16 physical leaders (`taskset -c
+0,2,...,30`) while still asking for a 32-thread budget, 7 trials, medians:
+`qwen3_0p6b_qkv_t8` 4.44 pinned vs 5.85 free; `qwen3_0p6b_mlp_t8` 6.38 pinned vs
+5.99 free. The sign disagrees between two cells of the same family and both
+deltas are inside the 0.72×–1.20× band, on a run where a single configuration
+spanned 1.33–7.29 ms. **This is not evidence.** It is recorded so the next
+attempt knows the probe has already been run once on a loaded box and produced
+nothing.
+
+`decode_affinity.rs`'s `order_pin_targets` also already carries a measured
+warning against the obvious fix: spreading *spinning* workers one per core
+measured worse (0.133 ms vs 0.079 ms) than leaving them compact. The task
+runtime's workers spin before they park, so one-per-core pinning is not a free
+win there and needs its own null-armed measurement on a quiet host.
+
+### 38.6 What this changes about the rest of this document
+
+Every native-vs-ORT ratio in this campaign was produced by the paired harness.
+For short cells that is harmless — §38.2 shows 0.95×–1.02× at t=8 and t=16 for
+the small shapes. For **long cells at wide thread counts it is not**: the native
+arm is being timed while 32 ORT threads spin, and the tabulated ratio overstates
+the gap by up to 4.8×.
+
+Concretely, the honest t=32 numbers for `llama3_8b_qkv_t8` are 6.90 ms native
+against 0.691 ms ORT — a 10× gap, not the 41× the paired columns imply. The gap
+is still real and still large, and closing it is still a kernel problem rather
+than a scheduler one. But 41× was never the number.
+
+The rule this phase adds to the method, alongside §36.3's null arm: **any claim
+about a cell that runs longer than a few milliseconds, at a thread count above
+16, must be measured with `--native-only` and `--ort-only`.** The paired harness
+stays useful for parity checking and for short cells, and its arm-order reversal
+still defends against drift — it just cannot defend against a neighbour that is
+still spinning.
+
+### 38.7 What is still open
+
+Nesting is still unmeasured, exactly as §36.8 left it: `packed_nbits_output_row`
+and `int8_row` dispatch into the task pool from inside a `par_chunks_mut`, the
+eight job slots bound the surplus by falling back inline, and that remains an
+argument rather than a number.
+
+§36.8's `with_decode_pool` hypothesis needs a correction before anyone spends
+time on it. `with_decode_pool` early-returns inline when `IN_DECODE_POOL` is
+already set, which `with_decode_pool_scope` does around a whole forward pass — so
+the `pool.install` cost is per-pass, not per-`MatMulNBits`-node, wherever the
+scope is entered. Whether the GEMM bench enters it was not verified here, so the
+hypothesis is neither confirmed nor dismissed; it is just smaller than §36.8
+assumed.
+
+Finally, the native-alone t=16→t=32 drift on the small shapes (roughly 1.7×)
+survives everything above and has no explanation yet. It is the real remaining
+scheduler residual, and it is about a fifth of what the paired numbers made it
+look like.
