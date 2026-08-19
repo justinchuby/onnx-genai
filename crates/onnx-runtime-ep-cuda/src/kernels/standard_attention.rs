@@ -3569,8 +3569,14 @@ mod workspace_governance_tests {
         assert_eq!(attention_split_geometry(None, 128, rows), None);
         assert_eq!(attention_split_geometry(None, 0, rows), None);
         // Fixed-chunk override reproduces the pre-adaptive behaviour exactly.
-        assert_eq!(attention_split_geometry(Some(256), 4096, rows), Some((16, 256)));
-        assert_eq!(attention_split_geometry(Some(256), 512, rows), Some((2, 256)));
+        assert_eq!(
+            attention_split_geometry(Some(256), 4096, rows),
+            Some((16, 256))
+        );
+        assert_eq!(
+            attention_split_geometry(Some(256), 512, rows),
+            Some((2, 256))
+        );
         // Same fixed cap/rows always yields the same geometry — the property the
         // CUDA-graph capture path relies on (no dependence on live seqlen).
         assert_eq!(
