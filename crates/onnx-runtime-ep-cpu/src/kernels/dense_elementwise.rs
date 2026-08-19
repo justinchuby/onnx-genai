@@ -430,10 +430,79 @@ fn relu_f32_simd(src: &[f32], dst: &mut [f32]) {
     {
         relu_f32_neon(src, dst);
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2_available() {
+            // SAFETY: `avx2_available()` confirmed AVX2; the slices are equal
+            // length (`dispatch_dense_f32` derives both from the same `numel`).
+            unsafe { relu_f32_avx2(src, dst) };
+            return;
+        }
+    }
     #[cfg(not(target_arch = "aarch64"))]
     {
         for (d, &s) in dst.iter_mut().zip(src.iter()) {
             *d = if s < 0.0 { 0.0 } else { s };
+        }
+    }
+}
+
+/// Relu over eight lanes at a time.
+///
+/// `vmaxps` is not a *general* `max`: Intel defines it as
+/// `IF SRC1 > SRC2 THEN SRC1 ELSE SRC2`, and it returns `SRC2` whenever either
+/// operand is NaN. So the operand order here is load-bearing, not stylistic —
+/// with the zero vector as `SRC1` and the data as `SRC2` the instruction
+/// reproduces `if x < 0.0 { 0.0 } else { x }` exactly, including the two cases
+/// that make Relu awkward:
+///
+/// * `x = NaN` — the comparison is unordered, `SRC2` wins, the NaN propagates
+///   with its payload intact. The scalar form agrees because `NaN < 0.0` is
+///   false.
+/// * `x = -0.0` — `0.0 > -0.0` is false, so `SRC2` wins and the sign of zero
+///   survives. The scalar form agrees for the same reason.
+///
+/// Writing `_mm256_max_ps(x, zero)` instead would return `+0.0` for both, which
+/// is a different function. `relu_f32_avx2_is_bit_identical_to_the_scalar_form`
+/// pins all of this against the scalar reference over the whole special-value
+/// set, bit pattern for bit pattern.
+///
+/// # Safety
+///
+/// The running CPU must support `avx2`; `src.len() == dst.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn relu_f32_avx2(src: &[f32], dst: &mut [f32]) {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(src.len(), dst.len());
+    let n = src.len();
+    unsafe {
+        let zero = _mm256_setzero_ps();
+        let mut i = 0usize;
+        // Four vectors per iteration: the loop is pure load/max/store with no
+        // cross-lane dependency, so unrolling is what keeps the two load ports
+        // and the store port busy while the loop counter retires.
+        let bulk_end = n & !31;
+        while i < bulk_end {
+            let a0 = _mm256_loadu_ps(src.as_ptr().add(i));
+            let a1 = _mm256_loadu_ps(src.as_ptr().add(i + 8));
+            let a2 = _mm256_loadu_ps(src.as_ptr().add(i + 16));
+            let a3 = _mm256_loadu_ps(src.as_ptr().add(i + 24));
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_max_ps(zero, a0));
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i + 8), _mm256_max_ps(zero, a1));
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i + 16), _mm256_max_ps(zero, a2));
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i + 24), _mm256_max_ps(zero, a3));
+            i += 32;
+        }
+        while i + 8 <= n {
+            let a = _mm256_loadu_ps(src.as_ptr().add(i));
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_max_ps(zero, a));
+            i += 8;
+        }
+        while i < n {
+            let x = *src.get_unchecked(i);
+            *dst.get_unchecked_mut(i) = if x < 0.0 { 0.0 } else { x };
+            i += 1;
         }
     }
 }
@@ -481,11 +550,97 @@ fn clip_f32_simd(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32) {
     {
         clip_f32_neon(src, dst, minimum, maximum);
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2_available() {
+            // SAFETY: `avx2_available()` confirmed AVX2; the slices are equal
+            // length (`dispatch_dense_f32` derives both from the same `numel`).
+            unsafe { clip_f32_avx2(src, dst, minimum, maximum) };
+            return;
+        }
+    }
     #[cfg(not(target_arch = "aarch64"))]
     {
         for (d, &s) in dst.iter_mut().zip(src.iter()) {
             *d = clamp_nan_propagating(s, minimum, maximum);
         }
+    }
+}
+
+/// Clip over eight lanes at a time.
+///
+/// The same operand-order argument as [`relu_f32_avx2`], twice.
+/// [`clamp_nan_propagating`] is `max` then `min`, each written so a NaN input
+/// falls through untouched, and `vmaxps`/`vminps` both return `SRC2` on an
+/// unordered compare — so the bound goes in `SRC1` and the data in `SRC2`:
+///
+/// * `_mm256_max_ps(lo, x)` is `if x < lo { lo } else { x }`.
+/// * `_mm256_min_ps(hi, x)` is `if x > hi { hi } else { x }`
+///   (`MINPS: IF SRC1 < SRC2 THEN SRC1 ELSE SRC2`).
+///
+/// Reversing either operand pair turns a NaN into the bound and `-0.0` into
+/// `+0.0`. `clip_f32_avx2_is_bit_identical_to_the_scalar_form` holds this to
+/// the scalar reference bit for bit.
+///
+/// # Safety
+///
+/// The running CPU must support `avx2`; `src.len() == dst.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn clip_f32_avx2(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32) {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(src.len(), dst.len());
+    let n = src.len();
+    unsafe {
+        let lo = _mm256_set1_ps(minimum);
+        let hi = _mm256_set1_ps(maximum);
+        let mut i = 0usize;
+        let bulk_end = n & !31;
+        while i < bulk_end {
+            let a0 = _mm256_loadu_ps(src.as_ptr().add(i));
+            let a1 = _mm256_loadu_ps(src.as_ptr().add(i + 8));
+            let a2 = _mm256_loadu_ps(src.as_ptr().add(i + 16));
+            let a3 = _mm256_loadu_ps(src.as_ptr().add(i + 24));
+            let r0 = _mm256_min_ps(hi, _mm256_max_ps(lo, a0));
+            let r1 = _mm256_min_ps(hi, _mm256_max_ps(lo, a1));
+            let r2 = _mm256_min_ps(hi, _mm256_max_ps(lo, a2));
+            let r3 = _mm256_min_ps(hi, _mm256_max_ps(lo, a3));
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i), r0);
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i + 8), r1);
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i + 16), r2);
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i + 24), r3);
+            i += 32;
+        }
+        while i + 8 <= n {
+            let a = _mm256_loadu_ps(src.as_ptr().add(i));
+            _mm256_storeu_ps(
+                dst.as_mut_ptr().add(i),
+                _mm256_min_ps(hi, _mm256_max_ps(lo, a)),
+            );
+            i += 8;
+        }
+        while i < n {
+            *dst.get_unchecked_mut(i) =
+                clamp_nan_propagating(*src.get_unchecked(i), minimum, maximum);
+            i += 1;
+        }
+    }
+}
+
+/// Whether the AVX2 arms above are live on this CPU.
+///
+/// Answers on every architecture so tests can branch on it portably; only the
+/// `x86_64` dispatch arms call it.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[inline]
+fn avx2_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
     }
 }
 
@@ -729,6 +884,143 @@ mod tests {
         assert_eq!(results[1], 0.0);
         assert_eq!(results[2], 0.0);
         assert_eq!(results[3], 1.0);
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod x86_vector_parity_tests {
+    use super::*;
+
+    /// Every f32 shape that has ever made a `max`/`min` kernel disagree with
+    /// the scalar form it claims to reproduce: both zeros, both infinities, a
+    /// quiet and a signalling NaN with distinct payloads, the subnormal
+    /// boundary, and the extremes.
+    fn special_values() -> Vec<f32> {
+        let mut v = vec![
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MIN,
+            f32::MAX,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::from_bits(0x0000_0001), // smallest subnormal
+            f32::from_bits(0x8000_0001), // smallest negative subnormal
+            f32::from_bits(0x7FC0_0000), // quiet NaN
+            f32::from_bits(0x7FC0_DEAD), // quiet NaN, distinct payload
+            f32::from_bits(0xFFC0_0000), // negative quiet NaN
+            f32::from_bits(0x7F80_0001), // signalling NaN
+            1e-30,
+            -1e-30,
+            1e30,
+            -1e30,
+            0.5,
+            -0.5,
+            3.0,
+            -3.0,
+        ];
+        // Pad past the 32-wide unrolled body so the bulk loop, the 8-wide
+        // remainder and the scalar tail are all exercised at several lengths.
+        for i in 0..90 {
+            v.push((i as f32) * 0.37 - 16.0);
+        }
+        v
+    }
+
+    /// Compare by **bits**, not by value: `-0.0 == 0.0` and `NaN != NaN` under
+    /// `f32` equality, which are exactly the two cases where a wrong operand
+    /// order hides.
+    fn assert_bit_identical(got: &[f32], want: &[f32], what: &str) {
+        assert_eq!(got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "{what}: lane {i} is {g:?} ({:#010x}), scalar says {w:?} ({:#010x})",
+                g.to_bits(),
+                w.to_bits()
+            );
+        }
+    }
+
+    /// The AVX2 Relu must be the scalar `if x < 0.0 { 0.0 } else { x }`, not
+    /// merely "a relu". Swapping the `_mm256_max_ps` operands — the natural
+    /// way to write it — turns every NaN into `+0.0` and `-0.0` into `+0.0`,
+    /// and this fails on both (verified).
+    #[test]
+    fn relu_f32_avx2_is_bit_identical_to_the_scalar_form() {
+        if !avx2_available() {
+            eprintln!("skipping: host lacks avx2");
+            return;
+        }
+        let src = special_values();
+        // Sweep every length so the bulk / 8-wide / tail boundaries all land
+        // on special values rather than only on the padding.
+        for len in 0..src.len() {
+            let input = &src[..len];
+            let want: Vec<f32> = input.iter().map(|&x| ReluOp.apply_f32_scalar(x)).collect();
+            let mut got = vec![f32::from_bits(0xDEAD_BEEF); len];
+            unsafe { relu_f32_avx2(input, &mut got) };
+            assert_bit_identical(&got, &want, &format!("relu len {len}"));
+        }
+    }
+
+    /// Same contract for Clip, over bound pairs that put the special values on
+    /// both sides of both bounds — including a NaN bound, which ORT permits and
+    /// which `vminps`/`vmaxps` resolve by their `SRC2` rule.
+    #[test]
+    fn clip_f32_avx2_is_bit_identical_to_the_scalar_form() {
+        if !avx2_available() {
+            eprintln!("skipping: host lacks avx2");
+            return;
+        }
+        let src = special_values();
+        let bounds = [
+            (0.0f32, 6.0f32),
+            (-1.0, 1.0),
+            (-0.0, 0.0),
+            (f32::NEG_INFINITY, f32::INFINITY),
+            (-3.0, -1.0),
+            (1.0, -1.0), // inverted: min > max, ONNX leaves this to the impl
+            (f32::NAN, 1.0),
+            (-1.0, f32::NAN),
+        ];
+        for (lo, hi) in bounds {
+            for len in [0usize, 1, 7, 8, 9, 31, 32, 33, 64, 100, src.len()] {
+                let input = &src[..len.min(src.len())];
+                let want: Vec<f32> = input
+                    .iter()
+                    .map(|&x| clamp_nan_propagating(x, lo, hi))
+                    .collect();
+                let mut got = vec![f32::from_bits(0xDEAD_BEEF); input.len()];
+                unsafe { clip_f32_avx2(input, &mut got, lo, hi) };
+                assert_bit_identical(&got, &want, &format!("clip [{lo:?},{hi:?}] len {len}"));
+            }
+        }
+    }
+
+    /// The dispatcher, not just the kernel: `relu_f32_simd` is what `ReluOp`
+    /// actually calls, and it must agree with the scalar form too. This is the
+    /// test that would catch a wrong `#[cfg]` arm or a missing `return`.
+    #[test]
+    fn the_dispatched_relu_and_clip_agree_with_their_scalar_forms() {
+        let src = special_values();
+        let want_relu: Vec<f32> = src.iter().map(|&x| ReluOp.apply_f32_scalar(x)).collect();
+        let mut got_relu = vec![0.0f32; src.len()];
+        relu_f32_simd(&src, &mut got_relu);
+        assert_bit_identical(&got_relu, &want_relu, "dispatched relu");
+
+        let op = ClipOp {
+            minimum: -2.0,
+            maximum: 4.0,
+        };
+        let want_clip: Vec<f32> = src.iter().map(|&x| op.apply_f32_scalar(x)).collect();
+        let mut got_clip = vec![0.0f32; src.len()];
+        clip_f32_simd(&src, &mut got_clip, op.minimum, op.maximum);
+        assert_bit_identical(&got_clip, &want_clip, "dispatched clip");
     }
 }
 
