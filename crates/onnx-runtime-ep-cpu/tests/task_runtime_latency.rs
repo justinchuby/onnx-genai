@@ -200,10 +200,24 @@ fn report_latency_under_concurrent_sessions() {
 }
 
 /// How many outer Rayon workers to probe nesting with.
-const NEST_DISPATCHERS: [usize; 5] = [1, 2, 4, 8, 16];
+#[cfg(not(miri))]
+const NEST_DISPATCHERS: &[usize] = &[1, 2, 4, 8, 16];
+
+/// Under Miri this test is run for soundness, not for measurement, and the
+/// interpreter is thousands of times slower than native. Keep the *shape* --
+/// more than one dispatcher, so tasks from different rows are live against each
+/// other and a too-wide retag is a real conflict -- and drop the scale.
+#[cfg(miri)]
+const NEST_DISPATCHERS: &[usize] = &[1, 4];
 
 /// Inner fan-out size for the nesting probe, in `u64` elements.
+#[cfg(not(miri))]
 const NEST_INNER: usize = 4096;
+
+/// Still several times the 64-element grain, so a row is split across multiple
+/// concurrent tasks and the aliasing shape survives the shrink.
+#[cfg(miri)]
+const NEST_INNER: usize = 256;
 
 /// Nesting: several Rayon workers dispatching into the task pool at once.
 ///
@@ -228,7 +242,7 @@ fn nested_dispatch_slot_pressure() {
         "dispatchers", "wall", "dispatches", "declined", "inline"
     );
 
-    for &outer in &NEST_DISPATCHERS {
+    for &outer in NEST_DISPATCHERS {
         let mut rows = vec![0u64; outer * NEST_INNER];
         let before = task_runtime::testing::counters();
         let started = Instant::now();
