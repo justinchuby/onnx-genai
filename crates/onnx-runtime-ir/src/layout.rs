@@ -19,7 +19,27 @@ pub fn compute_contiguous_strides(shape: &[usize]) -> Vec<i64> {
 
 /// Whether `strides` describe a row-major contiguous layout for `shape`.
 pub fn is_contiguous(shape: &[usize], strides: &[i64]) -> bool {
-    strides == compute_contiguous_strides(shape).as_slice()
+    if shape.len() != strides.len() {
+        return false;
+    }
+    // Accumulate the row-major stride walking backwards rather than
+    // materialising the whole vector to compare against it. Same reason as
+    // `is_dense`: this runs on the kernel fast-path checks, once per operand,
+    // and allocating to answer a question about a handful of integers is the
+    // dominant cost of asking it.
+    //
+    // Short-circuiting on the first mismatch also means this cannot overflow
+    // where the allocating version could, since that one built every stride
+    // before comparing any of them. Strictly more defensive, and unreachable
+    // either way for shapes whose element count fits in memory.
+    let mut expected: i64 = 1;
+    for i in (0..shape.len()).rev() {
+        if strides[i] != expected {
+            return false;
+        }
+        expected *= shape[i] as i64;
+    }
+    true
 }
 
 /// Whether a tensor with `shape` and `strides` is **dense**: it occupies a
@@ -231,6 +251,71 @@ impl TensorLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-optimisation `is_contiguous`, verbatim, as a differential
+    /// oracle -- it materialised the full stride vector and compared slices.
+    fn is_contiguous_reference(shape: &[usize], strides: &[i64]) -> bool {
+        strides == compute_contiguous_strides(shape).as_slice()
+    }
+
+    /// The allocation-free walk must agree with the materialise-and-compare
+    /// version on every input. Falsifier — accumulate the product in the wrong
+    /// direction, drop the length check, or use `shape[i + 1]` instead of
+    /// `shape[i]` when advancing, and this disagrees.
+    #[test]
+    fn contiguous_walk_agrees_with_the_materialising_implementation() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |bound: u64| -> u64 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % bound
+        };
+
+        let mut agreed_true = 0usize;
+        for rank in 0..=6usize {
+            for _ in 0..500 {
+                let shape: Vec<usize> = (0..rank).map(|_| next(4) as usize).collect();
+                let strides: Vec<i64> = match next(3) {
+                    // Exactly contiguous, so the accepting arm is exercised.
+                    0 => compute_contiguous_strides(&shape),
+                    // Contiguous with one axis disturbed, the near-miss case.
+                    1 => {
+                        let mut s = compute_contiguous_strides(&shape);
+                        if !s.is_empty() {
+                            let i = next(s.len() as u64) as usize;
+                            s[i] += next(3) as i64 - 1;
+                        }
+                        s
+                    }
+                    _ => (0..rank).map(|_| next(9) as i64 - 4).collect(),
+                };
+                let got = is_contiguous(&shape, &strides);
+                if got && !shape.is_empty() {
+                    agreed_true += 1;
+                }
+                assert_eq!(
+                    got,
+                    is_contiguous_reference(&shape, &strides),
+                    "disagreement for shape {shape:?} strides {strides:?}"
+                );
+
+                // Ragged lengths must be rejected identically.
+                let mut long = strides.clone();
+                long.push(1);
+                assert_eq!(
+                    is_contiguous(&shape, &long),
+                    is_contiguous_reference(&shape, &long),
+                    "disagreement for shape {shape:?} strides {long:?}"
+                );
+            }
+        }
+        assert!(
+            agreed_true > 100,
+            "the corpus never reached the accepting arm on a non-empty shape \
+             (only {agreed_true} cases), so it proved nothing"
+        );
+    }
 
     /// The pre-optimisation `is_dense`, verbatim, as a differential oracle.
     ///
