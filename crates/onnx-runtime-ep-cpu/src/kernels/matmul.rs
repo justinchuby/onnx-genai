@@ -50,7 +50,7 @@ use crate::strided::{next_index, numel};
 // file but included here so `kernels/mod.rs` needs no edit; it is an internal
 // perf detail of the MatMul hot path, not a new op.
 #[path = "x86_sgemm.rs"]
-mod x86_sgemm;
+pub(crate) mod x86_sgemm;
 
 // Native BF16×BF16→FP32 GEMM (`_mm512_dpbf16_ps`) for avx512_bf16 hosts. It is
 // runtime-detected and otherwise falls back to the portable blocked half GEMM.

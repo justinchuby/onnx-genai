@@ -677,6 +677,342 @@ unsafe fn micro_6x16(
     }
 }
 
+/// A block-quantized weight in its on-disk `MatMulNBits` layout, borrowed
+/// rather than materialized, that can dequantize a run of one column's depths
+/// straight into a packed panel.
+///
+/// The bit width is the only thing that differs between the implementations:
+/// the strip policy, the panel layout and the microkernel are shared, so the
+/// GEBP driver below is written once against this trait. `dequant_column` is
+/// the innermost loop of the whole route, so it is a generic method rather than
+/// an object-safe one -- every call monomorphizes down to a shift, a subtract
+/// and a multiply with no indirect call.
+#[cfg(target_arch = "x86_64")]
+pub(crate) trait BlockQuantWeight: Sync {
+    /// Dequantize depths `[pc, pc + kc)` of column `col` into
+    /// `dst[p * NR + slot]` for `p` in `0..kc`.
+    ///
+    /// `scale_at(col * block_count + block)` supplies the scale; it is called
+    /// once per block, not once per element.
+    fn dequant_column<S: Fn(usize) -> f32>(
+        &self,
+        scale_at: &S,
+        col: usize,
+        pc: usize,
+        kc: usize,
+        slot: usize,
+        dst: &mut [f32],
+    );
+}
+
+/// Block-quantized int4 weight described in its on-disk `MatMulNBits` layout,
+/// borrowed rather than materialized.
+///
+/// Row `col` of the weight occupies `block_count * (block_size / 2)` packed
+/// bytes; two 4-bit values per byte, low nibble first. `zero_points`, when
+/// present, is one nibble per block in the same two-per-byte packing; absent
+/// means symmetric quantization with the implicit midpoint 8.
+#[cfg(target_arch = "x86_64")]
+pub(crate) struct Int4Weight<'a> {
+    pub packed: &'a [u8],
+    pub zero_points: Option<&'a [u8]>,
+    pub block_size: usize,
+    pub block_count: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Int4Weight<'_> {
+    #[inline]
+    fn packed_row_len(&self) -> usize {
+        self.block_count * (self.block_size / 2)
+    }
+
+    #[inline]
+    fn zero_point_row_len(&self) -> usize {
+        self.block_count.div_ceil(2)
+    }
+
+    /// Zero point for `(col, block)`, or the symmetric midpoint.
+    #[inline]
+    fn zero_point(&self, col: usize, block: usize) -> f32 {
+        match self.zero_points {
+            None => 8.0,
+            Some(zp) => {
+                let byte = zp[col * self.zero_point_row_len() + block / 2];
+                f32::from((byte >> (4 * (block % 2))) & 0x0f)
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl BlockQuantWeight for Int4Weight<'_> {
+    fn dequant_column<S: Fn(usize) -> f32>(
+        &self,
+        scale_at: &S,
+        col: usize,
+        pc: usize,
+        kc: usize,
+        slot: usize,
+        dst: &mut [f32],
+    ) {
+        let block_size = self.block_size;
+        let blob = block_size / 2;
+        let packed_row =
+            &self.packed[col * self.packed_row_len()..(col + 1) * self.packed_row_len()];
+        let mut p = 0usize;
+        while p < kc {
+            let depth = pc + p;
+            let block = depth / block_size;
+            let offset_in_block = depth % block_size;
+            let scale = scale_at(col * self.block_count + block);
+            let zero_point = self.zero_point(col, block);
+            // Depths left in this block, clipped to the panel.
+            let run = (block_size - offset_in_block).min(kc - p);
+            let block_bytes = &packed_row[block * blob..block * blob + blob];
+            for step in 0..run {
+                let index = offset_in_block + step;
+                let byte = block_bytes[index / 2];
+                let nibble = (byte >> (4 * (index % 2))) & 0x0f;
+                dst[(p + step) * NR + slot] = (f32::from(nibble) - zero_point) * scale;
+            }
+            p += run;
+        }
+    }
+}
+
+/// Block-quantized **8-bit** weight in the same borrowed `MatMulNBits` layout.
+///
+/// One byte per element, so row `col` occupies `block_count * block_size`
+/// packed bytes and `zero_points`, when present, is one whole byte per block.
+/// Absent means the implicit midpoint 128 -- `1 << (bits - 1)`, the same rule
+/// the 4-bit case applies at 8.
+///
+/// The 8-bit case is the one where fusing matters most in absolute terms: the
+/// route it replaces materializes a full `k * n` f32 weight *per call*, which
+/// is four bytes out for every one byte in.
+#[cfg(target_arch = "x86_64")]
+pub(crate) struct Int8Weight<'a> {
+    pub packed: &'a [u8],
+    pub zero_points: Option<&'a [u8]>,
+    pub block_size: usize,
+    pub block_count: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Int8Weight<'_> {
+    #[inline]
+    fn packed_row_len(&self) -> usize {
+        self.block_count * self.block_size
+    }
+
+    /// Zero point for `(col, block)`, or the symmetric midpoint.
+    #[inline]
+    fn zero_point(&self, col: usize, block: usize) -> f32 {
+        match self.zero_points {
+            None => 128.0,
+            Some(zp) => f32::from(zp[col * self.block_count + block]),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl BlockQuantWeight for Int8Weight<'_> {
+    fn dequant_column<S: Fn(usize) -> f32>(
+        &self,
+        scale_at: &S,
+        col: usize,
+        pc: usize,
+        kc: usize,
+        slot: usize,
+        dst: &mut [f32],
+    ) {
+        let block_size = self.block_size;
+        let packed_row_len = self.packed_row_len();
+        let packed_row = &self.packed[col * packed_row_len..(col + 1) * packed_row_len];
+        let mut p = 0usize;
+        while p < kc {
+            let depth = pc + p;
+            let block = depth / block_size;
+            let offset_in_block = depth % block_size;
+            let scale = scale_at(col * self.block_count + block);
+            let zero_point = self.zero_point(col, block);
+            let run = (block_size - offset_in_block).min(kc - p);
+            let block_bytes = &packed_row[block * block_size + offset_in_block..][..run];
+            for (step, &byte) in block_bytes.iter().enumerate() {
+                dst[(p + step) * NR + slot] = (f32::from(byte) - zero_point) * scale;
+            }
+            p += run;
+        }
+    }
+}
+
+/// Prefill GEMM for borrowed block-quantized weights: `c[m,n] = a[m,k] @
+/// dequant(B)[k,n]`, computed with the packed GEBP machinery above but with the
+/// dequantization **fused into B's pack step**.
+///
+/// The point is arithmetic intensity. The row-serial borrowed kernel (#1117)
+/// re-streams every packed weight byte once per activation row, so an `m`-token
+/// prefill does the memory traffic of `m` decodes and gains nothing from
+/// batching. Dequantizing the whole weight into a resident f32 `[n, k]` cache
+/// fixes the traffic but costs 8x the weight in RAM, which is exactly what #979
+/// removed. Fusing dequant into `pack_b` gets both: each packed byte is read
+/// once per call, expanded into an L1-resident `KC x NR` f32 panel, and then
+/// reused by every one of the `m` rows through the same `6x16` microkernel the
+/// f32 SGEMM uses. The only extra memory is the per-strip panel scratch —
+/// tens of KB, not gigabytes.
+///
+/// `scale_at(col * block_count + block)` supplies the scale, keeping the
+/// caller's scale dtype (f32/f16/bf16) out of this module; it is called once
+/// per block per column, not per element.
+///
+/// Generic over [`BlockQuantWeight`], so 4-bit and 8-bit share everything but
+/// the unpacking of a byte.
+///
+/// # Safety
+/// The caller must have verified AVX2 + FMA (i.e. [`crate::backend::has_simd_x86`]).
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quant_prefill_gebp<W, S>(
+    a: &[f32],
+    weight: &W,
+    scale_at: S,
+    bias: Option<&[f32]>,
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) where
+    W: BlockQuantWeight,
+    S: Fn(usize) -> f32 + Sync,
+{
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        for (i, v) in c.iter_mut().enumerate() {
+            *v = bias.map_or(0.0, |b| b[i % n]);
+        }
+        return;
+    }
+
+    let m_panels = m.div_ceil(MR);
+    let mut apack = vec![0.0f32; m_panels * k * MR];
+    pack_a(a, &mut apack, m, k);
+
+    // Same strip policy as `sgemm_simd_packed`: NR-aligned, enough strips to
+    // balance the pool, narrow enough that a strip's packed panels stay warm.
+    let n_panels = n.div_ceil(NR);
+    let threads = rayon::current_num_threads().max(1);
+    let target_tasks = threads.saturating_mul(8).max(1);
+    let panels_per_strip = n_panels.div_ceil(target_tasks).clamp(1, 16);
+    let strip_cols = panels_per_strip * NR;
+    let strip_count = n.div_ceil(strip_cols);
+
+    let cptr = CPtr(c.as_mut_ptr());
+    let apack = &apack;
+    let scale_at = &scale_at;
+
+    (0..strip_count).into_par_iter().for_each(|s| {
+        let j0 = s * strip_cols;
+        let nc = strip_cols.min(n - j0);
+        let strip_panels = nc.div_ceil(NR);
+        let mut bpack = vec![0.0f32; KC * strip_panels * NR];
+        // SAFETY: `cptr` addresses the caller's `c`; this task writes only
+        // columns [j0, j0+nc), disjoint from every other strip.
+        let c_base = cptr.get();
+
+        let mut pc = 0usize;
+        while pc < k {
+            let kc = KC.min(k - pc);
+            pack_b_quant(weight, scale_at, &mut bpack, pc, kc, j0, nc);
+            let first = pc == 0;
+
+            for ip in 0..m_panels {
+                let i0 = ip * MR;
+                let mr = MR.min(m - i0);
+                let apanel = &apack[ip * k * MR + pc * MR..ip * k * MR + pc * MR + kc * MR];
+                let mut jr = 0usize;
+                let mut jp = 0usize;
+                while jr < nc {
+                    let nr = NR.min(nc - jr);
+                    let bpanel = &bpack[jp * KC * NR..jp * KC * NR + kc * NR];
+                    // SAFETY: AVX2/FMA verified by the caller; `c_base` points
+                    // at valid `m*n` storage and (i0, j0+jr) with (mr, nr)
+                    // stays in bounds; this strip owns these columns.
+                    unsafe {
+                        micro_6x16(
+                            apanel.as_ptr(),
+                            bpanel.as_ptr(),
+                            c_base.add(i0 * n + j0 + jr),
+                            n,
+                            kc,
+                            mr,
+                            nr,
+                            first,
+                        );
+                    }
+                    jr += NR;
+                    jp += 1;
+                }
+            }
+            pc += KC;
+        }
+
+        if let Some(bias) = bias {
+            let bias_strip = &bias[j0..j0 + nc];
+            for i in 0..m {
+                // SAFETY: same disjoint-column ownership as the GEMM above.
+                let row = unsafe { std::slice::from_raw_parts_mut(c_base.add(i * n + j0), nc) };
+                for (v, b) in row.iter_mut().zip(bias_strip) {
+                    *v += b;
+                }
+            }
+        }
+    });
+}
+
+/// Dequantize the `kc x nc` block of a block-quantized weight (depths
+/// `[pc, pc+kc)`, columns `[j0, j0+nc)`) straight into `NR`-column f32 panels,
+/// producing the exact bytes [`pack_b`] would produce from a materialized
+/// `[k, n]` f32 weight.
+///
+/// The weight is stored column-major (`[n, block_count, blob]`), so one output
+/// column's depths are contiguous — the same property that makes the transposed
+/// pack cheap. Scale and zero point are hoisted per block by the
+/// [`BlockQuantWeight`] implementation, so the inner loop is an unpack, a
+/// subtract and a multiply.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+fn pack_b_quant<W, S>(
+    weight: &W,
+    scale_at: &S,
+    bpack: &mut [f32],
+    pc: usize,
+    kc: usize,
+    j0: usize,
+    nc: usize,
+) where
+    W: BlockQuantWeight,
+    S: Fn(usize) -> f32,
+{
+    let n_panels = nc.div_ceil(NR);
+    for jp in 0..n_panels {
+        let jcol = j0 + jp * NR;
+        let nr = NR.min(nc - jp * NR);
+        let dst = &mut bpack[jp * KC * NR..jp * KC * NR + kc * NR];
+        for col_in_panel in 0..nr {
+            weight.dequant_column(scale_at, jcol + col_in_panel, pc, kc, col_in_panel, dst);
+        }
+        // Zero-pad columns [nr, NR) so the microkernel needs no masking.
+        if nr < NR {
+            for p in 0..kc {
+                dst[p * NR + nr..p * NR + NR].fill(0.0);
+            }
+        }
+    }
+}
+
 #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
 mod tests {
     use super::*;
@@ -1065,4 +1401,135 @@ mod tests {
     // parallel next to dozens of live `env::var` readers. The bit-exact
     // comparison in `the_default_entry_point_routes_m1_to_the_gemv` pins the
     // route without touching process state.
+
+    #[cfg(target_arch = "x86_64")]
+    /// Build a deterministic int4 weight in `MatMulNBits` layout plus the f32
+    /// matrix it dequantizes to, so the fused kernel can be checked against the
+    /// ordinary SGEMM on the *same* numbers.
+    fn int4_weight(
+        k: usize,
+        n: usize,
+        block_size: usize,
+        asymmetric: bool,
+    ) -> (Vec<u8>, Vec<f32>, Option<Vec<u8>>, Vec<f32>) {
+        let block_count = k.div_ceil(block_size);
+        let blob = block_size / 2;
+        let mut packed = vec![0u8; n * block_count * blob];
+        for (i, byte) in packed.iter_mut().enumerate() {
+            *byte = ((i * 37 + 11) % 256) as u8;
+        }
+        let scales: Vec<f32> = (0..n * block_count)
+            .map(|i| 0.01 + ((i % 13) as f32) * 0.003)
+            .collect();
+        let zero_points = asymmetric.then(|| {
+            (0..n * block_count.div_ceil(2))
+                .map(|i| ((i * 53 + 7) % 256) as u8)
+                .collect::<Vec<u8>>()
+        });
+
+        // Dequantize to a `[k, n]` row-major f32 matrix: the reference operand.
+        let mut dense = vec![0.0f32; k * n];
+        for col in 0..n {
+            for depth in 0..k {
+                let block = depth / block_size;
+                let offset = depth % block_size;
+                let byte = packed[col * block_count * blob + block * blob + offset / 2];
+                let nibble = (byte >> (4 * (offset % 2))) & 0x0f;
+                let zero_point = match &zero_points {
+                    None => 8.0,
+                    Some(zp) => {
+                        let byte = zp[col * block_count.div_ceil(2) + block / 2];
+                        f32::from((byte >> (4 * (block % 2))) & 0x0f)
+                    }
+                };
+                dense[depth * n + col] =
+                    (f32::from(nibble) - zero_point) * scales[col * block_count + block];
+            }
+        }
+        (packed, scales, zero_points, dense)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn check_int4_gebp(m: usize, k: usize, n: usize, block_size: usize, asymmetric: bool) {
+        if !has_simd_x86() {
+            return;
+        }
+        let (packed, scales, zero_points, dense) = int4_weight(k, n, block_size, asymmetric);
+        let a = fill(m * k, 3);
+        let bias: Vec<f32> = (0..n).map(|j| ((j % 7) as f32) * 0.25 - 0.5).collect();
+
+        let mut expect = vec![0.0f32; m * n];
+        sgemm_simd(&a, &dense, &mut expect, m, k, n);
+        for (i, v) in expect.iter_mut().enumerate() {
+            *v += bias[i % n];
+        }
+
+        let weight = Int4Weight {
+            packed: &packed,
+            zero_points: zero_points.as_deref(),
+            block_size,
+            block_count: k.div_ceil(block_size),
+        };
+        let mut got = vec![0.0f32; m * n];
+        quant_prefill_gebp(
+            &a,
+            &weight,
+            |index| scales[index],
+            Some(&bias),
+            &mut got,
+            m,
+            k,
+            n,
+        );
+        assert_eq!(
+            got, expect,
+            "fused dequant must reproduce the packed SGEMM on the dequantized \
+             weight bit for bit (m={m}, k={k}, n={n}, block={block_size}, asym={asymmetric})"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int4_gebp_matches_the_sgemm_on_the_dequantized_weight() {
+        // Panel-aligned, then every awkward edge: m/n past the 6x16 tile, k
+        // past one KC panel, and a K that is not a whole number of blocks.
+        check_int4_gebp(8, 64, 16, 32, false);
+        check_int4_gebp(8, 64, 16, 32, true);
+        check_int4_gebp(13, 96, 37, 32, false);
+        check_int4_gebp(13, 96, 37, 32, true);
+        check_int4_gebp(9, 300, 33, 32, true);
+        check_int4_gebp(8, 128, 48, 16, false);
+        check_int4_gebp(8, 128, 48, 128, true);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int4_gebp_handles_a_k_that_is_not_a_whole_block() {
+        // k = 70 with block_size 32 leaves a 6-deep tail block; the packed row
+        // still carries a full blob, so only the valid depths may be read.
+        check_int4_gebp(8, 70, 32, 32, false);
+        check_int4_gebp(8, 70, 32, 32, true);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int4_gebp_degenerate_shapes_are_bias_only_or_empty() {
+        if !has_simd_x86() {
+            return;
+        }
+        let weight = Int4Weight {
+            packed: &[],
+            zero_points: None,
+            block_size: 32,
+            block_count: 0,
+        };
+        let bias = vec![1.5f32, -2.0];
+        let mut c = vec![7.0f32; 2 * 2];
+        quant_prefill_gebp(&[], &weight, |_| 0.0, Some(&bias), &mut c, 2, 0, 2);
+        assert_eq!(c, vec![1.5, -2.0, 1.5, -2.0], "k=0 leaves only the bias");
+
+        let mut empty: Vec<f32> = Vec::new();
+        quant_prefill_gebp(&[], &weight, |_| 0.0, None, &mut empty, 0, 0, 0);
+        assert!(empty.is_empty());
+    }
 }
