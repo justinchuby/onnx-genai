@@ -32,6 +32,20 @@ better; `1.0` is parity.
 * **Interleaved arms.** `ab.py` alternates the arms trial by trial, so drift
   hits both arms roughly equally instead of being attributed to whichever arm
   ran during a noisy minute.
+* **Run the null control.** Pass `--null-control` and `ab.py` adds a third arm
+  that is *the first arm's own binary under a second name*, interleaved with the
+  others. It cannot measure the change, which is the point: whatever delta it
+  reports is this host's noise floor for that cell, measured in the same
+  invocation as the real comparison, and the summary marks any real delta no
+  larger than it as `WITHIN NOISE`.
+
+  This is not a formality. Twice now, a delta that looked like a result was the
+  instrument: §36.3 of the ledger measured ±20–30% at 32 threads on cells the
+  change could not reach, and §37.4 measured **~40% apart on the median at two
+  threads between two binaries traced to be executing the identical code
+  path**. Interleaving and alternating arms does not remove that; it only stops
+  it from being systematic. A cross-arm claim without a null arm in the same
+  invocation should be read as provisional.
 * **Medians and dispersion.** Report `p50` with the observed `[min–max]` of the
   per-trial ratios. A win narrower than the dispersion is not a win.
 * **Warmups.** Both runtimes get warmup iterations before the measured runs;
@@ -102,6 +116,7 @@ python3 scripts/ort_ab/ab.py \
   --models /path/to/models/transforms/*.onnx \
   --threads 1 8 16 \
   --trials 5 --runs 7 --warmups 3 \
+  --null-control \
   --csv results/transforms.csv
 ```
 
@@ -110,6 +125,18 @@ python3 scripts/ort_ab/ab.py \
   *only* by the commits under test.
 * `--arm-env name=KEY=VALUE` — per-arm environment, for A/B-ing an opt-in
   threshold or feature flag using one binary in both arms.
+* `--null-control` — add an arm named `null` that runs the **first** arm's
+  binary, with the first arm's `--arm-env`, under a second name. It costs one
+  extra arm's wall time and buys the only thing that says whether a delta is a
+  result: the same-invocation noise floor. The deltas table then reads
+
+  ```
+  moe_phi35moe_h2048_i6400_e4_t512 t=1    after:  -25.48%  > noise (0.19%)  null:   -0.19%
+  moe_mixtral_h1024_i3584_e8_t512  t=1    after:   -2.38%  > noise (0.63%)  null:   -0.63%
+  ```
+
+  and any arm whose delta is inside the null delta is printed as
+  `WITHIN NOISE` instead of a number to paste into a table.
 * `--threads` — passed through as **both** `--native-threads N` and
   `--ort-intra-threads N`, so the two runtimes get matched pool widths.
   `--native-threads` sets `ONNX_GENAI_CPU_DECODE_THREADS` (a decode-pool width
@@ -121,8 +148,9 @@ python3 scripts/ort_ab/ab.py \
   which is what makes the comparison fair; it does **not** mean either runtime
   had N cores to itself.
 
-The driver prints a per-trial line for every cell and a medians table at the
-end, and writes the full per-trial CSV at exit.
+The driver prints a per-trial line for every cell, a medians table, and — when
+more than one arm is present — a deltas table against the first arm, then writes
+the full per-trial CSV at exit.
 
 ## Reading a result
 
