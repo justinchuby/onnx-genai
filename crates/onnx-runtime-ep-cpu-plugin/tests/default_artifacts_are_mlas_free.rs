@@ -17,10 +17,12 @@
 //!
 //! | level | what would break it | test |
 //! |---|---|---|
-//! | Cargo features | `mlas` reachable from any `default` list | `no_default_feature_list_activates_mlas` |
+//! | Cargo features | `mlas` reachable from the EP's or plugin's `default` | `no_default_feature_list_activates_mlas` |
+//! | feature graph | *any* workspace crate defaulting `mlas` | `no_workspace_crate_makes_mlas_a_default` |
 //! | resolved graph | `mlas-sys` compiled into a default build | `a_default_build_resolves_no_mlas_sys` |
 //! | linked binary | MLAS object code in the shipped cdylib | `the_default_cdylib_contains_no_mlas_symbols` |
 //! | package | the wheel asking cargo for `mlas` | `the_wheel_never_proactively_enables_mlas` |
+//! | documentation | the manifest telling readers MLAS is a default | `the_workspace_manifest_does_not_document_mlas_as_a_default` |
 //!
 //! Each probe is checked to be load-bearing before its claim is asserted — a
 //! zero count from a probe that read nothing is the failure mode these tests
@@ -104,6 +106,198 @@ fn no_default_feature_list_activates_mlas() {
         !full.iter().any(|f| activates_mlas(f)),
         "the `full` umbrella is in `default`, so it must not imply MLAS either, found {full:?}"
     );
+}
+
+/// *Every* workspace crate keeps MLAS out of its `default` closure — not just
+/// the two this file used to name.
+///
+/// [`no_default_feature_list_activates_mlas`] hardcodes the EP and its plugin.
+/// Seven crates in this workspace declare an `mlas` feature, and the five it
+/// does not name (`onnx-genai-bench`, `-cli`, `-engine`, `-server`,
+/// `onnx-runtime-session`) chain into the EP's. Any one of them could put
+/// `"mlas"` in its own `default` and light up the vendored C++ for everything
+/// downstream of it, with both existing manifest checks staying green because
+/// neither reads that file.
+///
+/// So this enumerates `crates/*/Cargo.toml` instead of listing them, walks each
+/// crate's `default` to a fixed point, and fails on the first one that can
+/// reach MLAS. A crate added tomorrow is covered without anyone remembering to
+/// come back here.
+#[test]
+fn no_workspace_crate_makes_mlas_a_default() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut declare_mlas = Vec::new();
+    let mut have_defaults = Vec::new();
+
+    let mut crates: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
+        .expect("workspace has a crates/ directory")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.join("Cargo.toml").is_file())
+        .collect();
+    crates.sort();
+    assert!(
+        crates.len() > 10,
+        "probe found only {} crates, so the sweep below would be near-vacuous",
+        crates.len()
+    );
+
+    for dir in &crates {
+        let name = dir.file_name().unwrap().to_string_lossy().to_string();
+        let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).expect("readable manifest");
+        let features = feature_table(&manifest);
+
+        if features.keys().any(|f| activates_mlas(f)) {
+            declare_mlas.push(name.clone());
+        }
+        let Some(defaults) = features.get("default") else {
+            continue;
+        };
+        if defaults.is_empty() {
+            continue;
+        }
+        have_defaults.push(name.clone());
+
+        // Walk `default` to a fixed point. A crate reaches MLAS if any name in
+        // the closure mentions it, whether as its own `mlas`, a `dep:mlas-sys`,
+        // or a `some-crate/mlas` passed through to a dependency.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut queue: Vec<String> = defaults.clone();
+        while let Some(feature) = queue.pop() {
+            assert!(
+                !activates_mlas(&feature),
+                "crate `{name}` reaches MLAS from its `default` feature via \
+                 `{feature}`. The production CPU EP is native; MLAS is an \
+                 explicit research reference, so nothing may be able to enable \
+                 it without asking. Closure walked so far: {seen:?}"
+            );
+            if !seen.insert(feature.clone()) {
+                continue;
+            }
+            if let Some(members) = features.get(&feature) {
+                queue.extend(members.iter().cloned());
+            }
+        }
+    }
+
+    // Both lists are the probe's own vacuity check: an empty sweep, a rename of
+    // the feature, or a `crates/` layout change would otherwise pass silently.
+    assert!(
+        declare_mlas.len() >= 5,
+        "probe found only {declare_mlas:?} declaring an MLAS feature; the sweep \
+         is reading less of the workspace than it used to and would pass vacuously"
+    );
+    assert!(
+        have_defaults.len() >= 5,
+        "probe walked defaults for only {have_defaults:?}; the feature-table \
+         parser has stopped reading manifests it used to read"
+    );
+}
+
+/// Every `name = [...]` under `[features]`, as a map.
+///
+/// Stops at the next `[section]` so a `[dependencies]` entry that happens to
+/// look like a feature list cannot be mistaken for one.
+fn feature_table(manifest: &str) -> HashMap<String, Vec<String>> {
+    let mut table = HashMap::new();
+    let Some(start) = manifest.find("\n[features]") else {
+        return table;
+    };
+    let body = &manifest[start + "\n[features]".len()..];
+    let end = body.find("\n[").unwrap_or(body.len());
+
+    let mut rest = &body[..end];
+    while let Some(open) = rest.find('[') {
+        let name = rest[..open].trim_end().trim_end_matches('=').trim();
+        let name = name.rsplit('\n').next().unwrap_or(name).trim();
+        let Some(close) = rest[open..].find(']') else {
+            break;
+        };
+        let members: Vec<String> = rest[open + 1..open + close]
+            .split(',')
+            // Drop trailing comments so `"a", # mlas is not here` cannot be
+            // read as a member named after MLAS.
+            .map(|item| {
+                item.split('#')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('"')
+                    .to_string()
+            })
+            .filter(|item| !item.is_empty())
+            .collect();
+        if !name.is_empty() && !name.contains(' ') {
+            table.insert(name.to_string(), members);
+        }
+        rest = &rest[open + close + 1..];
+    }
+    table
+}
+
+/// The workspace manifest's prose does not claim MLAS is a default.
+///
+/// This is a regression test for a real drift, not a style rule. Until this
+/// change the workspace `Cargo.toml` told readers that "the CPU EP's default
+/// features include vendored MLAS; opt out with `--no-default-features`" and
+/// that crates "enable the CPU EP's default `mlas` feature". Both were false —
+/// `mlas` has never been in any `default` list — and both survived because
+/// every test in this file reads feature *tables* and none reads the comments
+/// around them.
+///
+/// False prose here is expensive out of proportion to its size: it is the first
+/// thing a contributor reads when deciding whether a build needs a C++
+/// toolchain, and it is the justification someone would cite for "MLAS is
+/// already on by default, so linking it here changes nothing" — which is how
+/// #1091 happened.
+///
+/// Deliberately a deny-list of literal claims rather than a negation-aware
+/// reading of English: the corrected prose necessarily also puts "default" and
+/// "MLAS" in one sentence ("No member's default features compile the vendored
+/// MLAS C++/asm"), so proximity alone cannot separate a claim from its denial.
+/// The claims below are affirmative in any context.
+#[test]
+fn the_workspace_manifest_does_not_document_mlas_as_a_default() {
+    let manifest = repo_file("Cargo.toml");
+
+    // Comments only, whitespace-collapsed so a claim that wraps across two
+    // `#` lines reads the same as one that does not — which is how the
+    // "default\n# features include vendored MLAS" claim escaped notice.
+    let prose: String = manifest
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| l.starts_with('#'))
+        .map(|l| l.trim_start_matches('#').trim())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let prose = prose.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        prose.contains("mlas"),
+        "probe read no MLAS prose from the workspace manifest, so every claim \
+         below would pass vacuously"
+    );
+
+    const FALSE_CLAIMS: &[&str] = &[
+        "default `mlas` feature",
+        "default mlas feature",
+        "default features include vendored mlas",
+        "default features include mlas",
+        "mlas is enabled by default",
+        "mlas is on by default",
+        "enables mlas by default",
+        "links mlas by default",
+    ];
+    for claim in FALSE_CLAIMS {
+        assert!(
+            !prose.contains(claim),
+            "the workspace manifest claims \"{claim}\", which is false: `mlas` is \
+             not reachable from any `default` list (see \
+             `no_workspace_crate_makes_mlas_a_default`). Prose that says a \
+             shipped build already links MLAS is how a change that actually \
+             links it gets waved through."
+        );
+    }
 }
 
 /// Whether a feature-list entry turns the MLAS reference on.
