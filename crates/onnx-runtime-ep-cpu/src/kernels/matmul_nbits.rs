@@ -19273,4 +19273,35 @@ mod tests {
             );
         }
     }
+
+    /// The int4 prefill GEBP crossover is size-aware: a weight that stays
+    /// L2-resident across rows keeps the column-blocked kernel ahead twice as
+    /// long, so it must not be handed the same row threshold as a weight that
+    /// streams from DRAM every row block.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int4_prefill_gebp_crossover_is_size_aware() {
+        // qwen3-0.6B QKV: k=1024, n=2048+256+256 -> 1.0 MB packed.
+        let small = 1024 * 2560 / 2;
+        // llama3-8B QKV: k=4096, n=4096+1024+1024 -> 12.6 MB packed.
+        let large = 4096 * 6144 / 2;
+        assert!(small <= INT4_PREFILL_GEBP_L2_RESIDENT_BYTES);
+        assert!(large > INT4_PREFILL_GEBP_L2_RESIDENT_BYTES);
+
+        assert_eq!(
+            int4_prefill_gebp_min_rows(small),
+            INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT,
+            "an L2-resident weight measured its crossover at m=24"
+        );
+        assert_eq!(
+            int4_prefill_gebp_min_rows(large),
+            INT4_PREFILL_GEBP_MIN_ROWS,
+            "a DRAM-streaming weight measured its crossover at m=12"
+        );
+        assert!(
+            INT4_PREFILL_GEBP_MIN_ROWS < INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT,
+            "the resident threshold is the later one; swapping them would \
+             regress the small shape by 1.45x at m=12"
+        );
+    }
 }

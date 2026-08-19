@@ -209,6 +209,72 @@ End-to-end parity against ORT on the target cell: `max_rel = 1.68e-1` PASS —
 unchanged from before the change, and dominated by int4 quantization error, not
 by summation order.
 
+## Crossover with the fused-dequant GEBP prefill
+
+This branch was cut before #1356 landed, and #1356 changed what this kernel is
+competing against. `INT4_PREFILL_GEBP_MIN_ROWS` was tuned at `4` against the
+*row-serial* borrowed kernel: that kernel re-decoded every packed byte once per
+row, so GEBP's f32 panel paid for itself almost immediately. The column-blocked
+kernel in this PR amortises the same decode over four rows, which moves the
+crossover out by a factor of three to six.
+
+Left alone, the two changes compose into a regression: every prefill with
+`4 <= m < 12` would take a GEBP path that this kernel now beats.
+
+Same binary, `ONNX_GENAI_CPU_MM_INT4_GEBP` as the only variable, native-alone,
+min of 5 interleaved reps, ratio = column-blocked / GEBP (`> 1.00x` means GEBP
+wins):
+
+| `m` | qwen3-0.6B QKV (1.0 MB) | llama3-8B QKV (12.6 MB) | llama3-8B MLP (29.4 MB) |
+|---:|---:|---:|---:|
+| 2 | 0.50x | 0.33x | 0.29x |
+| 4 | 0.32x | 0.36x | 0.44x |
+| 8 | 0.50x | 0.73x | 0.81x |
+| 12 | 0.69x | **1.01x** | **1.01x** |
+| 16 | 0.80x | 1.35x | 1.26x |
+| 24 | **1.14x** | 1.80x | 1.98x |
+| 32 | 1.68x | 2.24x | 2.35x |
+
+The crossover is not one row count. It tracks whether the packed weight stays
+cache-resident across the row loop: the 1.0 MB weight fits and crosses at
+`m = 24`, while both multi-megabyte weights cross at `m = 12`. So the threshold
+is size-aware — `12` above 4 MB of packed weight, `24` at or below it. A flat
+`12` would hand the small shape a 1.45x regression at `m = 12..23`; a flat `24`
+would give up 1.35x-1.80x on the large shapes at `m = 16..23`. The 4 MB split
+sits between the two measured regimes and is fitted to exactly two weight
+sizes — it is a threshold, not a model.
+
+Verification with the gate in place, same binary, min of 9 interleaved reps
+(`off` rows execute identical code in both arms and are the noise floor):
+
+| shape | `m` | gate | blocked | dispatch | speedup |
+|---|---:|:---:|---:|---:|---:|
+| `qwen3_0p6b_qkv` | 8 | off | 0.359 | 0.345 | 1.04x |
+| `qwen3_0p6b_qkv` | 12 | off | 0.354 | 0.359 | 0.99x |
+| `qwen3_0p6b_qkv` | 16 | off | 0.652 | 0.672 | 0.97x |
+| `qwen3_0p6b_qkv` | 24 | **ON** | 0.679 | 0.578 | **1.17x** |
+| `qwen3_0p6b_qkv` | 32 | **ON** | 1.352 | 0.828 | **1.63x** |
+| `llama3_8b_qkv` | 4 | off | 1.309 | 1.272 | 1.03x |
+| `llama3_8b_qkv` | 8 | off | 2.529 | 2.519 | 1.00x |
+| `llama3_8b_qkv` | 12 | **ON** | 3.752 | 3.416 | **1.10x** |
+| `llama3_8b_qkv` | 16 | **ON** | 4.991 | 3.601 | **1.39x** |
+| `llama3_8b_qkv` | 24 | **ON** | 7.448 | 3.989 | **1.87x** |
+| `llama3_8b_qkv` | 32 | **ON** | 9.914 | 4.440 | **2.23x** |
+| `llama3_8b_mlp` | 4 | off | 2.955 | 2.398 | 1.23x |
+| `llama3_8b_mlp` | 8 | off | 4.462 | 4.978 | 0.90x |
+| `llama3_8b_mlp` | 12 | **ON** | 6.725 | 7.123 | 0.94x |
+| `llama3_8b_mlp` | 16 | **ON** | 11.433 | 7.754 | **1.47x** |
+| `llama3_8b_mlp` | 24 | **ON** | 15.232 | 8.376 | **1.82x** |
+| `llama3_8b_mlp` | 32 | **ON** | 22.924 | 9.481 | **2.42x** |
+
+Honest reading: the gate-off rows span 0.90x-1.23x while executing the same
+instructions, which is this host's noise floor and the reason every claim here
+is a minimum rather than a mean. `llama3_8b_mlp` at `m = 12` measured 1.01x in
+the sweep and 0.94x in the verification — it is neutral at the boundary, and
+the real gain starts at `m = 16`. The threshold is placed at the neutral point
+rather than the first winning point so the large shapes do not sit on the wrong
+kernel through `m = 12..15`.
+
 ## What this does not fix
 
 * **We are still 2.5x-7.3x behind ORT.** The remaining gap is the decode itself:
