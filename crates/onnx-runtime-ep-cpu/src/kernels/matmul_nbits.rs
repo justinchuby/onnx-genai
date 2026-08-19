@@ -2016,17 +2016,46 @@ impl Kernel for MatMulNBitsKernel {
             // on every backend with an NT GEMM: MLAS (`trans_b`) and, on the
             // default build, the native `SimdX86` NT packer (#959, #1091).
             // Backends without one keep the previous direct-`Kn` dense path.
-            let used_fast_nt = self.try_prefill_nk_nt(
-                &inputs[1],
-                &inputs[2],
-                zero_points,
-                group_indices,
-                can_prepack,
-                &activations,
-                m,
-                result,
-            )?;
-            if !used_fast_nt {
+            // Ordering against the NT route (#1176) turns on whether NT
+            // actually keeps its dequantized `Nk` weight resident. When it
+            // does, NT wins outright: one dequant for the whole session, then
+            // a cache-tiled NT GEMM that streams each weight row once.
+            //
+            // When the memory governor declined that cache (#971 -- the
+            // expanded f32 footprint did not fit the budget), NT has no cache
+            // to amortize into and rebuilds the entire `k * n` f32 panel on
+            // *every* call. That is precisely the cost this fused GEBP exists
+            // to remove, and it is worst in exactly the configuration that
+            // caused the decline: memory is scarce, yet the NT route would
+            // materialize ~51 MB per prefill for a 3584x3584 8-bit node. The
+            // fused pack allocates only per-strip scratch, so consult it first
+            // whenever NT would not keep the weight resident.
+            let nt_keeps_weight_resident = can_prepack && resident_dequant_f32_cache_enabled();
+            #[cfg(target_arch = "x86_64")]
+            let used_gebp_first = !nt_keeps_weight_resident
+                && self.try_int8_prefill_gebp(
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                    group_indices,
+                    &activations,
+                    m,
+                    result,
+                );
+            #[cfg(not(target_arch = "x86_64"))]
+            let used_gebp_first = false;
+            let used_fast_nt = !used_gebp_first
+                && self.try_prefill_nk_nt(
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                    group_indices,
+                    can_prepack,
+                    &activations,
+                    m,
+                    result,
+                )?;
+            if !used_gebp_first && !used_fast_nt {
                 // 8-bit prefill: fuse the dequant into the GEBP's B pack
                 // instead of materializing a `k * n` f32 weight per call.
                 //
@@ -2113,11 +2142,18 @@ impl MatMulNBitsKernel {
     /// Fused-dequant GEBP for an 8-bit `MatMulNBits` prefill, or `false` if this
     /// call is not one it can serve.
     ///
-    /// Deliberately consulted only *after* [`Self::try_prefill_mlas_nt`]
-    /// declines, so on an MLAS build the existing cached-`Nk` + `trans_b` route
-    /// keeps priority and nothing measured there changes. What this claims is
-    /// the native fallback, where the alternative is materializing the whole
-    /// `k * n` weight as f32 on every call.
+    /// Ordered against the NT route ([`Self::try_prefill_nk_nt`]) on whether
+    /// that route keeps its dequantized `Nk` weight **resident**. When it does
+    /// -- a constant weight and the #971 governor admitting the f32 cache -- NT
+    /// keeps priority and nothing measured there changes: it pays one dequant
+    /// for the session and then streams each weight row once.
+    ///
+    /// What this claims is the case where NT has no cache to amortize into and
+    /// so rebuilds the whole `k * n` f32 weight on *every* call: a non-constant
+    /// weight, or the governor declining the resident cache because the
+    /// expanded footprint did not fit the budget. Materializing ~51 MB per
+    /// prefill is worst precisely there, so this fused route is consulted first
+    /// in that configuration.
     ///
     /// Declines, in order: a non-x86-64 host or one without AVX2 + FMA (the
     /// `6x16` microkernel's contract); `bits != 8`; per-row `g_idx`, which the
