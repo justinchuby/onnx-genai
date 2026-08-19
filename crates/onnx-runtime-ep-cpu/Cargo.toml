@@ -29,8 +29,13 @@ ops-transformer = []
 ops-cnn = []
 ops-quantized = []
 ops-sequence = []
-# Opt-in vendored MLAS f32/quantized kernels. Kept off by default so the
-# default elementwise dispatch/tests keep exercising the pure-Rust SIMD path.
+# Opt-in vendored MLAS f32/quantized kernels. Kept off by default, and it stays
+# off: the production CPU EP is native. MLAS is a *research reference* we
+# measure our own kernels against and absorb capability from — it is never
+# linked into, activated in, or routed to by a default build. See
+# `docs/performance/CPU_MLAS_MIGRATION.md`, and
+# `crates/onnx-runtime-ep-cpu-plugin/tests/default_artifacts_are_mlas_free.rs`,
+# which falsifies the claim rather than restating it.
 mlas = ["dep:mlas-sys"]
 # Temporary: within-GroupQueryAttention phase timing (widen/present/attn/out),
 # gated further at runtime by ONNX_GENAI_PROFILE_GQA=1. Off by default; adds no
@@ -84,6 +89,14 @@ name = "half_prefill_route_ab"
 harness = false
 
 [[bench]]
+name = "int4_prefill_route_ab"
+harness = false
+
+[[bench]]
+name = "int8_prefill_route_ab"
+harness = false
+
+[[bench]]
 name = "kernels"
 harness = false
 
@@ -97,6 +110,17 @@ harness = false
 
 [[bench]]
 name = "sdpa_simd"
+harness = false
+
+[[bench]]
+name = "matmul_nbits_prefill_ab"
+
+# The absorption gate. Native and the MLAS reference in one binary, interleaved,
+# so a claimed native win is measured against the route it claims to replace.
+# Requires `--features mlas`; with MLAS absent it reports native-only and says
+# so rather than inventing a comparison.
+[[bench]]
+name = "native_vs_mlas"
 harness = false
 
 [lints]

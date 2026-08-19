@@ -15,7 +15,13 @@ harness's own synthetic pattern, fed identically to both runtimes.
 `MatMulNBits` slot order (com.microsoft):
   0 A  1 B  2 scales  3 zero_points  4 g_idx  5 bias
 `B` is `[n, n_blocks_per_col, blob_size]` uint8 with `blob_size = block_size/2`
-for 4-bit, and `scales` is `[n * n_blocks_per_col]`.
+for 4-bit and `blob_size = block_size` for 8-bit, and `scales` is
+`[n * n_blocks_per_col]`.
+
+8-bit cells exist because `docs/performance/CPU_MATMUL_ASSIGNMENT.md` carries
+8-bit `MatMulNBits` rows that no generator here could reproduce: the matrix said
+"gap (static M)" for wide 8-bit prefill with nothing in the tree able to
+re-measure it.
 """
 
 from __future__ import annotations
@@ -35,10 +41,16 @@ NBITS_SHAPES = {
     "qwen3_0p6b_mlp": (1024, 6144),
     "llama3_8b_qkv": (4096, 6144),
     "llama3_8b_mlp": (4096, 14336),
+    # The square geometry `docs/performance/CPU_MATMUL_ASSIGNMENT.md` quotes
+    # every `MatMulNBits` row at (Qwen3-8B hidden size). Kept here so a row of
+    # that matrix can be re-measured at the geometry it claims, rather than at a
+    # nearby projection shape.
+    "qwen3_8b_square": (3584, 3584),
 }
 
 # Token counts: 1 = decode, the rest walk prefill up through the caches.
-NBITS_TOKENS = (1, 8, 128, 512)
+# 256 is the assignment matrix's first pure-prefill row.
+NBITS_TOKENS = (1, 8, 128, 256, 512)
 
 # Dense f32 MatMul cells, [m, k] x [k, n].
 DENSE_SHAPES = {
@@ -51,9 +63,10 @@ DENSE_SHAPES = {
 BLOCK_SIZE = 32
 
 
-def build_matmul_nbits(path: Path, *, tokens: int, k: int, n: int) -> None:
+def build_matmul_nbits(path: Path, *, tokens: int, k: int, n: int, bits: int = 4) -> None:
     blocks = (k + BLOCK_SIZE - 1) // BLOCK_SIZE
-    blob = BLOCK_SIZE // 2
+    # One byte holds two 4-bit weights, or one 8-bit weight.
+    blob = BLOCK_SIZE // (8 // bits)
 
     rng = np.random.default_rng(0x5EBA5)
     b = rng.integers(0, 256, size=(n, blocks, blob), dtype=np.uint8)
@@ -69,7 +82,7 @@ def build_matmul_nbits(path: Path, *, tokens: int, k: int, n: int) -> None:
         name="matmul_nbits",
         K=k,
         N=n,
-        bits=4,
+        bits=bits,
         block_size=BLOCK_SIZE,
         accuracy_level=0,
     )
@@ -113,11 +126,13 @@ def build_matmul(path: Path, *, m: int, k: int, n: int) -> None:
 def main(out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     made = []
-    for name, (k, n) in NBITS_SHAPES.items():
-        for tokens in NBITS_TOKENS:
-            path = out / f"gemm_nbits_{name}_t{tokens}.onnx"
-            build_matmul_nbits(path, tokens=tokens, k=k, n=n)
-            made.append(path)
+    for bits in (4, 8):
+        stem = "nbits" if bits == 4 else "nbits8"
+        for name, (k, n) in NBITS_SHAPES.items():
+            for tokens in NBITS_TOKENS:
+                path = out / f"gemm_{stem}_{name}_t{tokens}.onnx"
+                build_matmul_nbits(path, tokens=tokens, k=k, n=n, bits=bits)
+                made.append(path)
     for name, (m, k, n) in DENSE_SHAPES.items():
         path = out / f"gemm_dense_{name}.onnx"
         build_matmul(path, m=m, k=k, n=n)

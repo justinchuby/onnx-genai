@@ -1,17 +1,26 @@
 # Absorbing MLAS: reference implementation, not dependency
 
-**Direction, set 2026-08-16:** we do not bundle MLAS by default. We progressively
-absorb its optimizations into our own native kernels. MLAS stays in the tree as a
-*measurement reference* — a second implementation in the same process that lets us
-measure exactly how far our kernel is from a good one — and nothing ships behind
-it.
+**Direction (repository owner, final):** we do not bundle MLAS by default, on any
+target, in any shipped artifact. We progressively absorb its optimizations into
+our own native kernels. MLAS stays in the tree as a *measurement reference* — a
+second implementation in the same process that lets us measure exactly how far
+our kernel is from a good one — and nothing ships behind it. Rejecting MLAS as a
+default is not a re-opening of ORT's built-in CPU EP either; that remains
+forbidden.
+
+This document is the **method**. Its companion,
+[`CPU_MLAS_MIGRATION.md`](CPU_MLAS_MIGRATION.md), is the **roadmap**: the
+per-family inventory of what MLAS still does better, the replacement priority,
+the graduation rule, and the falsifiers that keep the shipped artifacts free of
+MLAS. The machine-readable form of that roadmap is
+`crates/onnx-runtime-ep-cpu/src/dispatch_ledger.rs`.
 
 ## Why this became necessary
 
 A run of PRs won large CPU speedups by routing kernels to MLAS. None of them
 reached a default build: `mlas` is optional in `onnx-runtime-ep-cpu` and is absent
-from the default features of both the CLI and the server, and the CPU kernels
-carry the routes behind `#[cfg(feature = "mlas")]`.
+from the default features of the CLI, the server and the published wheel, and the
+CPU kernels carry the routes behind `#[cfg(feature = "mlas")]`.
 
 No individual PR did anything wrong — each was measured honestly with
 `--features mlas`, and several said so. The problem was cumulative and structural:

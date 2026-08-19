@@ -548,6 +548,7 @@ impl Kernel for RotaryEmbeddingKernel {
         let capturing = self.runtime.is_capturing()?;
         if let Some(pos_i) = pos_i
             && !capturing
+            && !self.runtime.eager_sync_deferred()
         {
             let mut host_positions = vec![0u8; batch * seq * std::mem::size_of::<i64>()];
             // SAFETY: position_ids is contiguous and the host buffer has its exact byte size.

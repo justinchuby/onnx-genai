@@ -1486,6 +1486,17 @@ impl InferenceSession {
         Ok(self.exec.adopt_memory_governor(governor, tier, holder)?)
     }
 
+    /// Release each intermediate value's buffer once its last consumer has run.
+    ///
+    /// Off by default: a session that records a device graph needs stable buffer
+    /// addresses across the recording run and its replays, and freeing lets the
+    /// allocator hand out a different address next time. Enable it on graphs that
+    /// never capture -- a prompt-phase vision encoder is the motivating case,
+    /// where holding all 2545 intermediates at once cost ~20x the live set.
+    pub fn set_release_dead_values(&mut self, enabled: bool) {
+        self.exec.set_release_dead_values(enabled);
+    }
+
     pub fn set_weight_residency_budget(&self, budget_bytes: u64) -> Result<Option<u64>> {
         Ok(self.exec.set_weight_residency_budget(budget_bytes)?)
     }

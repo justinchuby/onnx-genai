@@ -535,6 +535,7 @@ impl Executor {
             decode_view_plan_sig_mismatch_streak: 0,
             decode_view_plan_disabled: false,
             compute_in_place_enabled: compute_in_place_env_enabled(),
+            release_dead_values_enabled: false,
             compute_in_place_alias_count: 0,
             scan_inline_single_trip_enabled: scan_inline_single_trip_env_enabled(),
             scan_inline_single_trip_count: 0,
@@ -1058,6 +1059,7 @@ impl Executor {
                 input_dtypes,
                 output_dtypes,
                 inplace_dead_inputs: Vec::new(),
+                dead_after: Vec::new(),
                 lazy_weight_inputs,
             });
         }
@@ -1091,6 +1093,27 @@ impl Executor {
                     })
                 })
                 .collect();
+            // Values this node consumes for the last time. Weights are excluded
+            // here rather than at runtime because an initializer's buffer is
+            // built once and reused by every later run -- releasing it after its
+            // final *use in this run* would leave the next run with no weights.
+            // Graph inputs are excluded for the same reason at a different
+            // lifetime: their storage belongs to the caller's binding.
+            let mut seen = std::collections::HashSet::new();
+            let dead_after: Vec<ValueId> = node
+                .inputs
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|vid| {
+                    last_use.get(vid) == Some(&pi)
+                        && !graph_outputs.contains(vid)
+                        && !graph.initializers.contains_key(vid)
+                        && !graph.inputs.contains(vid)
+                        && seen.insert(*vid)
+                })
+                .collect();
+            node.dead_after = dead_after;
         }
         if let Some(span) = plan_span.as_mut() {
             span.set_args(
@@ -1940,6 +1963,16 @@ impl Executor {
             child.set_trace_context(trace.clone());
         }
         self.trace = trace;
+    }
+
+    /// Enable/disable dead-value buffer release, propagating to control-flow
+    /// child executors so a Scan/Loop body frees its intermediates too -- the
+    /// vision encoder's per-image Scan bodies are a large part of its live set.
+    pub(crate) fn set_release_dead_values(&mut self, enabled: bool) {
+        for child in self.subgraph_execs.values_mut() {
+            child.set_release_dead_values(enabled);
+        }
+        self.release_dead_values_enabled = enabled;
     }
 
     /// Live weight bytes backing the graph, needed alongside [`Self::graph`] so

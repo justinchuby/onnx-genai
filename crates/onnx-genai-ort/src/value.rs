@@ -1802,7 +1802,7 @@ mod argmax_tests {
 /// `#[ignore]`d by default. Run from the repo root (PowerShell):
 ///
 /// ```text
-/// $ort = "ort-gpu\onnxruntime-win-x64-gpu_cuda12-1.27.0"
+/// $ort = "ort-gpu\onnxruntime-win-x64-gpu_cuda12-1.28.0"
 /// $env:ORT_ROOT = (Resolve-Path $ort)
 /// $env:PATH = "$((Resolve-Path "$ort\lib"));$env:PATH"
 /// cargo test -p onnx-genai-ort --features cuda --lib -- --ignored --nocapture cuda_device_write
