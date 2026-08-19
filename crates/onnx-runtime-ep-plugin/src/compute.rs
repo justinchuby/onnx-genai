@@ -1050,11 +1050,20 @@ impl WorkspacePlanCache {
         let idx = plans
             .iter()
             .position(|(signature, _)| signature_matches(signature, metadata))?;
+        let requirement = plans[idx].1;
         // Move-to-front so the hot signature stays ahead of a one-off prefill
         // shape once the cache is full.
-        let entry = plans.remove(idx);
-        let requirement = entry.1;
-        plans.insert(0, entry);
+        //
+        // Skipped when the hit is already at the front, which is the steady
+        // state: one shape, every node, every `Run`. Promoting the front entry
+        // to the front is identity, but `remove` + `insert` still run the
+        // shift, bounds checks and length bookkeeping to achieve nothing.
+        // Callgrind, 100-node chain: `lookup` costs 141 instructions per node
+        // without this guard and 101 with it.
+        if idx != 0 {
+            let entry = plans.remove(idx);
+            plans.insert(0, entry);
+        }
         Some(requirement)
     }
 
@@ -5837,9 +5846,61 @@ mod workspace_plan_cache_tests {
         TensorMetadata::new(dtype, shape, present)
     }
 
+    /// The signature every dispatch is actually using must survive eviction.
+    ///
+    /// The cache evicts from the back, so without move-to-front the first
+    /// signature inserted drifts to the back and is evicted even though it is
+    /// the hot one -- silently restoring the expensive planning call the cache
+    /// exists to avoid. Asserted on observed planning calls, not on cache
+    /// state.
+    #[test]
+    fn a_repeatedly_used_signature_survives_eviction() {
+        let cache = WorkspacePlanCache::new();
+        let planner = CountingPlanner::new();
+
+        let hot_shape = vec![1usize];
+        let hot = [meta(DataType::Float32, &hot_shape, true)];
+        cache.get_or_plan(&hot, || planner.plan(&hot)).unwrap();
+
+        // Fill the rest of the cache. `hot` is now at the back, next to evict.
+        let cold: Vec<Vec<usize>> = (2..=WORKSPACE_PLAN_CACHE_CAPACITY)
+            .map(|n| vec![n])
+            .collect();
+        for sh in &cold {
+            let m = [meta(DataType::Float32, sh, true)];
+            cache.get_or_plan(&m, || planner.plan(&m)).unwrap();
+        }
+
+        // Using `hot` again is the access that must promote it.
+        let before = planner.calls();
+        cache.get_or_plan(&hot, || planner.plan(&hot)).unwrap();
+        assert_eq!(
+            planner.calls(),
+            before,
+            "hot signature was already lost before any eviction"
+        );
+
+        // One more distinct signature evicts whatever is at the back.
+        let evictor_shape = vec![WORKSPACE_PLAN_CACHE_CAPACITY + 1];
+        let evictor = [meta(DataType::Float32, &evictor_shape, true)];
+        cache
+            .get_or_plan(&evictor, || planner.plan(&evictor))
+            .unwrap();
+
+        let before = planner.calls();
+        let got = cache.get_or_plan(&hot, || planner.plan(&hot)).unwrap();
+        assert_eq!(
+            planner.calls(),
+            before,
+            "the signature every dispatch uses was evicted -- move-to-front is not promoting it"
+        );
+        assert_eq!(got.bytes, 4, "wrong plan served for the hot signature");
+    }
+
     /// The point of the cache: the second dispatch of an unchanged shape must
     /// not re-run the planner. Falsifier — delete the lookup and the call count
     /// becomes 2.
+
     #[test]
     fn a_repeated_signature_plans_exactly_once() {
         let cache = WorkspacePlanCache::new();
@@ -6029,9 +6090,11 @@ mod workspace_plan_cache_tests {
     }
 
     /// The hot signature must survive a one-off shape (a single prefill step
-    /// among many decode steps). Falsifier — remove the move-to-front on hit
-    /// and the interleaved decode signature is evicted, so the planner runs
-    /// once per iteration instead of once in total.
+    /// among many decode steps). The flood must run *past* capacity: filling
+    /// the cache to exactly capacity never evicts anything, so a shorter loop
+    /// passes with or without the promotion and proves nothing. Falsifier —
+    /// remove the move-to-front on hit and the hot signature drifts to the
+    /// back, gets evicted, and the planner runs again mid-flood.
     #[test]
     fn the_hot_signature_survives_a_flood_of_one_off_shapes() {
         let cache = WorkspacePlanCache::new();
@@ -6044,7 +6107,8 @@ mod workspace_plan_cache_tests {
             .expect("plan");
         let after_hot = planner.calls();
 
-        for n in 1..=(WORKSPACE_PLAN_CACHE_CAPACITY - 1) {
+        let flood = WORKSPACE_PLAN_CACHE_CAPACITY * 2;
+        for n in 1..=flood {
             let cold = [n];
             let cold_meta = [meta(DataType::Float32, &cold, true)];
             cache
@@ -6057,7 +6121,7 @@ mod workspace_plan_cache_tests {
         }
         assert_eq!(
             planner.calls(),
-            after_hot + (WORKSPACE_PLAN_CACHE_CAPACITY - 1),
+            after_hot + flood,
             "only the cold signatures may have been planned; the hot one must have stayed cached"
         );
     }
