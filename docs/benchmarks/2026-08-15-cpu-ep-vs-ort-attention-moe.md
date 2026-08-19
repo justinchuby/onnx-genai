@@ -4197,3 +4197,381 @@ For assertions specifically: a test that encodes a *contract* rather than a
 *result* should say so, so that the next reader can tell a stale expectation from
 a real regression. The distinction matters — updating a stale assertion is
 correct, and weakening a live one to get green is how a real bug ships.
+
+## 42. Phase 21: a decode-shaped harness, and the three pools it found
+
+Phase 20 closed the t=16→t=32 "drift" by showing it was pool construction
+rather than inference, and ended on an admission: neither of the harness
+shapes this campaign had was honest about decode. Seven runs sits inside the
+warm-up transient. Four hundred runs in a tight loop leaves the transient but
+enters the one regime real decode never occupies — no gap between parallel
+regions, so the pool's workers never park and every dispatch lands on a
+spinning core.
+
+This phase builds the missing harness and reports what it found. There is no
+kernel change here. The deliverable is a measuring instrument plus the first
+set of numbers that instrument makes it possible to state.
+
+### 41.1 What the harness is
+
+`bench_decode_gap` (`crates/onnx-genai-bench/src/bin/`) runs any ONNX model in
+a loop with a **configurable gap** between iterations, and reports the
+steady-state distribution together with the counters that say which scheduling
+regime produced it. The reusable pieces live in
+`crates/onnx-genai-bench/src/decode_gap.rs` behind unit tests.
+
+Four things it does that the previous harnesses did not:
+
+* **The gap is a distribution, not a constant.** `--gap-us` sets a mean,
+  `--gap-jitter` a uniform spread, `--gap-kind` chooses busy-spin (host-side
+  compute), sleep (blocking on a tokenizer), or an alternation of the two. A
+  *fixed* gap can sit permanently just inside or just outside the pool's spin
+  window and report a clean number for a bimodal reality; jitter reports the
+  mixture.
+* **Warm-up is detected, not guessed.** Every iteration is recorded from the
+  first, and the reported window begins where the series stops trending
+  (`steady_state_start`). A run whose series never settles says so instead of
+  quietly reporting its own transient. This matters because warm-up length is
+  a function of pool width — one `--warmups` constant cannot be right for both
+  a 4-wide and a 32-wide pool, and choosing it per-arm by hand is how an A/B
+  ends up comparing a warm arm against a cold one.
+* **Park/wake is counted, not inferred.** Voluntary context switches and the
+  task pool's own `parks`/`spin_hits` counters are reported per iteration.
+* **The ORT session is dropped before timing.** §38 established that a
+  co-resident ORT pool spin-waits long after its last op and depresses a
+  native arm measured beside it by up to 4.8x. Here parity is judged once,
+  against ORT, and then the ORT session goes out of scope — so the timed
+  window is solo *by construction* rather than by remembering a flag.
+
+### 41.2 Two measurement bugs, found by the harness in itself
+
+Recorded because both would have produced confident, wrong, publishable
+numbers, and neither is obvious.
+
+**CPU time is not in `/proc/self/status`.** The first working version reported
+`0.000 cpu-s` for every run. `status` carries RSS, thread count and context
+switches but no CPU accounting at all; CPU has to come from `/proc/self/stat`.
+A harness that reads one file and assumes it has everything reports a
+confident zero.
+
+**Context-switch counters in `/proc/self/status` describe only the leader
+thread.** This one is worse, because the number it produces is plausible. With
+the process file, park/wake came out at ~1.2 per iteration at *every* gap from
+0 to 20 ms — which would mean the pool's behaviour is independent of how long
+it sits idle, i.e. that the adaptive spin window does nothing. Summing
+`/proc/self/task/*/status` instead gives the real picture below. A pool of
+sixteen workers parking on every dispatch moves the *leader's* counter by
+approximately nothing.
+
+Both are covered by regression tests, the second by parking a spawned thread
+deliberately and asserting the sampler sees it (sampled while the thread is
+still alive — an exited thread takes its counters with it).
+
+The steady-state detector also went through three formulations before it was
+right, and the first two are worth naming because both are natural and both
+are wrong. Comparing each window against *the final window* lets a
+monotonically rising series be declared steady at the very end, because the
+final window always matches itself. Requiring *every overlapping* window to
+match makes the verdict hostage to a single blip anywhere in the run, since
+one outlier appears in `window` consecutive windows — on this host that
+reported "never settled" for series that plainly settled. The shipped version
+compares non-overlapping blocks against the median of the whole tail.
+
+### 41.3 Where the pool stops spinning
+
+`gemm_nbits_qwen3_0p6b_qkv_t8`, budget 16, 400 iterations, steady window
+detected, sleep gaps so the main thread contributes no CPU of its own:
+
+| gap | p50 (ms) | cpu-s per wall-s | parks/iter | spin-hits/iter |
+| --- | --- | --- | --- | --- |
+| 0 us | 0.916 | 13.68 | 1.7 | 111.6 |
+| 100 us | 0.863 | 13.41 | 3.8 | 129.7 |
+| 500 us | 1.011 | 10.71 | 16.9 | 97.9 |
+| 2000 us | 0.811 | 5.94 | 16.1 | 92.5 |
+| 20000 us | 1.086 | 0.90 | 16.9 | 82.9 |
+
+The transition is between **200 us and 500 us**, and `parks/iter` saturates at
+~17 — one per worker plus the dispatcher. That is exactly `MAX_SPIN`, the
+task runtime's adaptive spin ceiling (`pool.rs`: `MIN_SPIN` 20 us doubling to
+`MAX_SPIN` 500 us on a hit, halving on a park). The policy behaves as
+documented, which had never been confirmed at the model level.
+
+**Cross-validation against the micro-benchmark.** The CPU EP's
+`task_runtime_latency` integration test sweeps the same gaps against a bare
+fan-out. Independently, at 16 workers, it reports dispatch p50 of 5.5 us at a
+0 us gap, 5.4 us at 20 us, 5.6 us at 100 us, then **10.2 us at 500 us** and
+38.5 us at 2000 us. Two harnesses, two levels, same threshold.
+
+### 41.4 The cost of spinning, and the cost of not
+
+Converting the table above to CPU per iteration (`cpu-per-wall` x iteration
+wall, sleep gaps, so all of it is the pool):
+
+| gap | CPU-ms per iteration | over the 0-gap baseline |
+| --- | --- | --- |
+| 0 us | 12.53 | — |
+| 100 us | 12.92 | +0.4 |
+| 500 us | 16.18 | +3.7 |
+| 2000 us | 16.70 | +4.2 |
+| 20000 us | 18.98 | +6.5 |
+
+Idle spin costs roughly **`workers` x `spin window`** of CPU per idle period,
+saturating near 6.5 CPU-ms — 16 workers holding cores for up to 500 us before
+parking. At a *decode-shaped* gap of 100 us it costs +0.4 CPU-ms, which is
+0.4% of the ~10 ms this cell already spends. The spin window is cheap where
+decode actually lives and expensive only where decode does not.
+
+That is the argument against reflexively shortening it, and it is worth
+stating plainly because the opposite conclusion looks obvious from the
+saturated number alone.
+
+### 41.5 The thread census: three pools, and the unnamed ones are ours
+
+The long-standing open item was a thread count that ran to roughly twice the
+configured budget, with the excess unnamed and unattributed. Bracketing each
+construction step with a census delta settles it:
+
+| configuration | threads | composition |
+| --- | --- | --- |
+| default (no budget set) | 22 | 1 main + 6 decode + 15 task-runtime |
+| `--native-threads 16` | 48 | 1 + **16 global Rayon** + 16 decode + 15 task-runtime |
+| `--native-threads 32` | 80 | 1 + **32 global Rayon** + 32 decode + 15 task-runtime |
+
+The unnamed threads are **ours**: the global Rayon pool, built eagerly by
+`bound_process_to_decode_budget` so that prefill and MLAS inherit the budget.
+They are anonymous only because `rayon::ThreadPoolBuilder::build_global` is
+not given a `thread_name`, and a thread nobody names inherits the *process*
+name — which is why a flat census makes them look like the benchmark binary's
+own threads rather than a pool.
+
+Three consequences worth recording:
+
+1. **Setting an explicit budget more than doubles the thread count**, because
+   it creates a global Rayon pool of `budget` workers *in addition to* raising
+   the decode pool to `budget`. In a decode-only workload that Rayon pool does
+   essentially no work. This is a component of the fixed construction cost
+   phase 20 measured, and it is the specific reason an explicit budget is so
+   much more expensive than the default.
+2. **No duplicate ORT pool is created by our EP.** The census delta across
+   building the ORT session with `intra_op_num_threads=1` is exactly zero
+   threads. Whatever else is going on, we are not double-provisioning against
+   ORT.
+3. **The default decode pool is 6 workers on this 32-logical host**, not 16.
+   The default is far more frugal than any explicitly budgeted configuration.
+
+### 41.6 The budget matrix
+
+Same cell, 100 us busy gap, 400 iterations, steady window detected, native
+alone, production build (`build=native` — no MLAS, no ORT CPU fallback):
+
+| budget | p50 (ms) | p90 (ms) | cpu-s per wall-s | threads |
+| --- | --- | --- | --- | --- |
+| default | 1.435 | 1.672 | 5.19 | 22 |
+| 1 | 7.011 | 7.113 | 1.00 | 3 |
+| 2 | 3.585 | 3.652 | 1.95 | 6 |
+| 4 | 1.858 | 1.972 | 3.78 | 12 |
+| 8 | 1.738 | 1.929 | 6.38 | 24 |
+| 16 | 0.910 | 0.981 | 13.85 | 48 |
+| 32 | 0.934 | 0.953 | 14.83 | 80 |
+
+Scaling is near-ideal from 1 to 4 (1.96x, then 1.93x), appears to **stall from
+4 to 8** (1.07x for twice the threads and 1.7x the CPU), recovers 1.91x from 8
+to 16, and is flat to negative from 16 to 32 — the last of which is phase 20's
+finding reproduced by an independent harness.
+
+**The 4-to-8 stall is an artifact, and §41.7 explains it.** It is retained in
+the table above exactly as first measured, because the way it dissolves is
+more useful than the table would have been if it had been quietly corrected.
+
+The matched ORT arm on the same cell is **0.1196 ms** at `intra_op=16`, so
+native is **7.6x behind** at its best budget. That is consistent with the
+7.7x measured for this cell by the entirely separate `bench_generic` solo-arm
+path, and it is a kernel gap, not a scheduling one.
+
+### 41.7 An explicit budget cannot migrate away from a noisy neighbour
+
+The 4→8 stall did not reproduce. Chasing it produced a better finding than
+the one it retracted.
+
+Re-measuring budget 4 with the identical binary and flags, in two sessions a
+few hours apart:
+
+| session | p50 samples (ms) |
+| --- | --- |
+| A | 1.858, 1.847, 1.861, 1.871 |
+| B | 2.766, 2.761, 2.756, 3.992 |
+
+Within each session the reading is tight — four samples inside 1%, which is
+*better* than the null control's band. Across sessions it moves **1.48x**.
+This is not noise in the ordinary sense; it is a stable measurement of two
+different things.
+
+The mechanism is the budget's own affinity confinement. An explicit budget of
+N calls `select_budget_cpus(N)`, which is **deterministic**: budget 4 always
+confines the process to CPUs `[0, 2, 4, 6]`, budget 16 always to
+`[0, 2, ..., 30]`. Sampling `/proc/stat` during session B, CPUs 0/2/4/6 were
+22-34% busy with co-tenant work at a host load average of 8-21.
+
+So a budgeted process **cannot migrate away from a busy core**. That is the
+feature working as designed — the docstring's promise is that prefill, MLAS
+and decode "stay off the rest of the machine" — but it has three
+consequences that were not previously written down:
+
+1. **A small budget concentrates the exposure.** Budget 4 gives up 28 of 32
+   logical CPUs and keeps 4 it must share; the scheduler's usual remedy,
+   migration, has been removed. Budget 16 spans more cores and averages over
+   them, so it moved far less between the same two sessions (0.910 → 0.889).
+   The *narrower* the budget, the *more* volatile the result on a shared host
+   — the opposite of the intuition that fewer threads means less interference.
+2. **Budgeted processes collide deterministically.** Because the selection is
+   always the same low-numbered physical cores, N budgeted processes on one
+   host all land on the same cores instead of spreading across the machine.
+   Single-tenant this is correct and intended; multi-tenant it is close to
+   worst-case, and this campaign's own benchmark host is multi-tenant.
+3. **Low-budget cells in any matrix on a shared host carry co-tenant load as
+   signal.** The original 4→8 comparison put a session-A reading of budget 4
+   against a session-B reading of budget 8 and read the difference as
+   parallel-decomposition behaviour. Measured within one session, 4→8 is
+   1.57x — sublinear, unremarkable, and not a stall.
+
+An attempt to isolate this by pinning to apparently-idle CPUs
+(`taskset -c 11,17,20,31` with the auto-mask stood down) produced 1.866 then
+3.296 — worse and more variable, because 11, 17 and 31 are **SMT siblings** of
+busy physical cores 10, 16 and 30. Picking logical CPUs without regard to SMT
+pairing hands you cores you do not actually own, which is the same lesson
+#1232 encoded in `select_budget_cpus` and which I promptly re-learned by
+hand.
+
+**Protocol consequence, and it is stronger than the one in §41.9:** a budget
+sweep is only interpretable if **every cell is measured in the same session**,
+interleaved, on an otherwise-quiet host. Comparing cells across sessions
+compares co-tenant weather. The steady-state detector does not save you here,
+because each individual reading is genuinely steady — it is steady at the
+wrong value.
+
+
+### 41.8 Concurrency: the median is fine, the tail is not
+
+1, 2 and 4 concurrent sessions sharing one process-wide pool, budget 16,
+100 us gap, 300 iterations each:
+
+| sessions | p50 (ms) | p90 (ms) | spread | throughput | parks/iter |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0.931 | 1.009 | 1.08x | 1.00x | 2.15 |
+| 2 | 1.146 | 1.814 | 1.58x | 1.62x | 0.55 |
+| 4 | 1.756 | 4.611 | 2.63x | 2.12x | 0.17 |
+
+Median latency degrades 1.9x for 4x the offered load and aggregate throughput
+improves 2.1x, which is respectable for a pool that one session already
+saturates. **p90 degrades 4.6x**, which is not. `slot_exhausted` is zero
+throughout, so this is not the dispatch path declining work — it is
+contention for workers, and it lands on the tail.
+
+The methodological point is sharper than the result. The micro-benchmark's
+own concurrency probe reports dispatch p50 moving only 5.2 us → 6.7 us from 1
+to 8 sessions, i.e. **"concurrency is fine"**. At the model level it is not.
+Dispatch latency was never the constraint; time-to-worker under contention
+is. A harness that only measures the dispatch path cannot see this, which is
+precisely why the model-level one had to exist.
+
+### 41.9 The noise band, and an order effect
+
+Three A/A null controls (the same binary twice in one process, budget 16,
+100 us gap, 400 iterations) returned **0.941x, 0.923x, 0.809x**.
+
+Two readings. The band is **tighter than the 7-run harness's 0.72x–1.20x**,
+so steady-state detection genuinely improves precision. But all three land
+*below* 1.0, which is a systematic within-process order effect of roughly
+-8% favouring the second arm — warm allocator and warm caches, not noise.
+
+The consequence is a protocol rule: **A/B arms must be separate processes.**
+The `null` arm's value is as a bias detector, not as a way to run two arms
+cheaply. Any within-process A/B on this codebase carries an ~8% tailwind for
+whichever arm runs second, which is larger than most effects worth chasing.
+
+### 41.10 What this leaves open
+
+* **Retracted:** the 4→8 budget scaling stall. It was co-tenant load on the
+  four cores an explicit budget of 4 confines itself to (§41.7). Measured
+  within a single session, 4→8 is 1.57x. Nothing to explain.
+* **Whether `select_budget_cpus` should stagger its selection.** Its
+  determinism is correct for the single-tenant case it was designed for and
+  close to worst-case for a shared host, where every budgeted process picks
+  the same low-numbered cores. Not a defect; an unexamined trade.
+* **p90 under concurrency.** The tail is the real oversubscription cost and
+  nothing here addresses it; `slot_exhausted` being zero rules out the
+  obvious explanation.
+* **The eagerly-built global Rayon pool.** It is `budget` threads that a
+  decode-only process never uses. Making it lazy means guaranteeing every
+  global-Rayon entry point in the default build routes through a guard first,
+  and getting that wrong silently un-bounds prefill parallelism — so it is
+  named here as a measured cost with a known shape, not attempted as a
+  drive-by.
+* **Retracted:** a claimed regression of "111 of 915 dispatches declined" in
+  `nested_dispatch_slot_pressure`. That was a misreading — the test issues
+  ~25-30 dispatches in total, so 915 was never a number it could produce.
+  Re-measured across four runs it declines 0, 1, 2 and 6 of ~25-30, every
+  decline occurring in the 16-dispatcher row and none below it. #1377's zero
+  sits inside that range. The count tracks host load, for the same reason
+  §41.7 gives: when co-tenants hold cores, workers free their slots later and
+  more nested dispatches fall back to inline execution. The fallback is the
+  designed behaviour, so this is the mechanism working, not a regression.
+
+### 41.11 The adaptive spin window is structurally pinned — and it does not matter
+
+Reading `worker_loop` against §41.4's numbers turns up a real defect. The
+window has **two** doubling sites and **one** halving site:
+
+* `ran > 0` after a drain doubles it (line ~367);
+* a spin hit doubles it (~397);
+* a park halves it (~408).
+
+The sequence after any park is: halve (500 → 250 us), then the futex wake
+returns *because work arrived*, the worker drains it, `ran > 0`, double
+(250 → 500 us). Net zero, every time. **The halving can never win**, so in any
+workload that does work at all the window sits permanently at `MAX_SPIN`.
+The comment at the halving site — "shrink it so a mostly-idle process
+converges on parking rather than on burning a core" — describes an intent
+the very next statement undoes. That also explains why §41.4's idle CPU
+saturates at ~6.5 CPU-ms ≈ 16 workers x `MAX_SPIN`.
+
+Running work is not evidence that a *spin window* was well-sized; only a spin
+hit is. So the `ran > 0` doubling is the wrong one, and removing it should let
+a large-gap workload converge to `MIN_SPIN` within five iterations.
+
+**It does not.** A/B with the two binaries interleaved in one session
+(§41.7's rule), sleep gaps, budget 16, 250 iterations:
+
+| gap | arm | p50 (ms) | cpu-s per wall-s | parks/iter |
+| --- | --- | --- | --- | --- |
+| 100 us | base | 0.844 / 0.846 | 12.61 / 12.84 | 4.16 / 2.04 |
+| 100 us | fix | 0.877 / 0.899 | 12.91 / 12.68 | 3.41 / 7.19 |
+| 2000 us | base | 0.974 / 1.050 | 5.78 / 5.45 | 16.92 / 19.04 |
+| 2000 us | fix | 0.942 / 0.911 | 5.60 / 5.06 | 17.16 / 19.11 |
+
+5% slower at 100 us, 7% faster at 2000 us — both inside the 0.81x-1.24x null
+band, and **CPU moves ~3% where the model predicted ~44%**. The prediction
+failed for a checkable reason: `parks/iter` is ~17 in *both* arms at a 2 ms
+gap. The workers park either way. The window governs how long they spin
+before parking, and empirically that is worth ~0.4 CPU-ms per iteration, not
+the ~8 ms that `16 x MAX_SPIN` implies — the spin loop exits early on the
+epoch check far more often than it runs to the window's end.
+
+So the defect is real, the reasoning from it was wrong, and the change is
+**not shipped**. Recorded because "the adaptive window is not actually
+adaptive" is worth knowing before someone tunes `MIN_SPIN`/`MAX_SPIN` and
+expects the adaptation to respond, and because the measurement bounds what
+fixing it could ever be worth.
+
+One thing the attempt did establish, from the per-thread census at a 2 ms
+gap: idle CPU is **not** spread evenly across our pools.
+
+| pool | threads | total CPU over the run |
+| --- | --- | --- |
+| task runtime (`nxrt-task-*`) | 15 | ~3.45 s |
+| decode SPMD (`onnx-genai-deco`) | 16 | 0.28 s |
+| prefill Rayon (`nxgn-prefill-*`) + main | 17 | 0.05 s |
+
+The task runtime is **12x** the decode pool. Any future work on idle CPU
+belongs there, and the prefill pool — the one that looked alarming in §41.5
+because it was anonymous and 16 threads wide — is 1.5% of the total.
