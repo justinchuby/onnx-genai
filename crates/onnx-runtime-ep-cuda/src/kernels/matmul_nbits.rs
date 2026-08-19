@@ -10305,9 +10305,66 @@ mod tests {
 
     use super::*;
 
-    /// Serializes the env-mutating dispatch selection in the interleaved-dequant
-    /// byte-identity test so parallel test threads never observe a half-set flag.
-    static INTERLEAVE_TEST_ENV_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    /// Guards the `ONNX_GENAI_INTERLEAVE_DEQUANT` / `ONNX_GENAI_GEMV_PIPELINE`
+    /// levers, which the interleaved-dequant byte-identity test flips by writing
+    /// the PROCESS environment.
+    ///
+    /// A plain mutex is not enough here, and used to be the bug: it only excludes
+    /// other lock *holders*, while an env var is visible to every thread in the
+    /// binary. Any parity test running concurrently would silently pick up the
+    /// lever, route through `ensure_interleaved`, allocate the interleaved
+    /// weights on first sight and therefore report that call capture-UNSAFE —
+    /// failing an assertion about a kernel it never meant to exercise, at a
+    /// timing that depended on the harness's thread interleaving.
+    ///
+    /// So the writer takes the exclusive side and every helper that depends on
+    /// the levers being at their default (OFF) takes the shared side.
+    static INTERLEAVE_TEST_ENV_LOCK: std::sync::OnceLock<std::sync::RwLock<()>> =
+        std::sync::OnceLock::new();
+
+    /// Exclusive guard that clears the dispatch levers when it drops.
+    ///
+    /// Restoring the environment on the normal path only is not enough: these
+    /// helpers `unwrap()` their kernel runs, so a failing assertion unwinds past
+    /// the cleanup and leaves the lever set. The `RwLock` is then poisoned, and
+    /// readers — which recover with `into_inner` rather than cascade the
+    /// failure — would run with a lever nobody asked for, turning one real
+    /// failure into a run of unrelated ones. Clearing from `Drop` makes the
+    /// restore unwind-safe.
+    struct LeverEnvGuard(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+
+    impl LeverEnvGuard {
+        fn acquire() -> Self {
+            Self(
+                INTERLEAVE_TEST_ENV_LOCK
+                    .get_or_init(Default::default)
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        }
+    }
+
+    impl Drop for LeverEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still inside the exclusive section, so no other thread is
+            // reading the environment concurrently.
+            unsafe {
+                std::env::remove_var("ONNX_GENAI_INTERLEAVE_DEQUANT");
+                std::env::remove_var("ONNX_GENAI_GENERAL_SPLITK");
+                std::env::remove_var("ONNX_GENAI_GEMV_PIPELINE");
+                std::env::remove_var("ONNX_GENAI_GATEUP_VEC");
+                std::env::remove_var("ONNX_GENAI_GATEUP_OCC");
+            }
+        }
+    }
+
+    /// Shared guard for a test that requires the dispatch levers to be OFF.
+    fn default_levers_guard() -> std::sync::RwLockReadGuard<'static, ()> {
+        INTERLEAVE_TEST_ENV_LOCK
+            .get_or_init(Default::default)
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     // Qwen2.5-0.5B down-projection shape (K=intermediate, N=hidden). Used as a
     // test fixture for the tall-skinny down variant and, transposed, as the
@@ -10403,13 +10460,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
 "#;
 
     fn runtime() -> Option<Arc<CudaRuntime>> {
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous_hook);
-        runtime
+        crate::test_support::maybe_runtime()
     }
 
     fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
@@ -11425,6 +11476,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
+        // The default decode GEMV launch is a static grid that allocates
+        // nothing, so it is capture-safe on the very first call. That only holds
+        // with the dispatch levers OFF: `ONNX_GENAI_INTERLEAVE_DEQUANT` routes
+        // through `ensure_interleaved`, which allocates and interleaves the
+        // packed weights on first sight and correctly reports that call
+        // capture-unsafe. Hold the shared guard so the env-mutating interleave
+        // test cannot flip the lever underneath this kernel run.
+        let _levers = default_levers_guard();
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
 
@@ -11432,6 +11491,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             kernel.last_call_capture_safe.load(Ordering::Relaxed),
             "fp16 decode GEMV must report capture-safe"
         );
+        drop(_levers);
 
         let mut got_f16 = vec![f16::ZERO; n];
         // SAFETY: `output_dev` holds `n` fp16 values.
@@ -11614,14 +11674,11 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
 
-        // Serialize the env-mutating dispatch selection across the two phases so
-        // parallel test threads never observe a half-set flag. SAFETY: the env
-        // writes are confined to this critical section and restored before the
-        // lock is released.
-        let _guard = INTERLEAVE_TEST_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
+        // Take the EXCLUSIVE side: the env writes below are visible to every
+        // thread in the binary, so they must not overlap any test that expects
+        // the levers at their default. SAFETY: the writes are confined to this
+        // critical section and restored before the lock is released.
+        let _guard = LeverEnvGuard::acquire();
         unsafe {
             match general_splitk {
                 Some(true) => std::env::set_var("ONNX_GENAI_GENERAL_SPLITK", "on"),
@@ -11641,11 +11698,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         }
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
-        unsafe {
-            std::env::remove_var("ONNX_GENAI_INTERLEAVE_DEQUANT");
-            std::env::remove_var("ONNX_GENAI_GENERAL_SPLITK");
-            std::env::remove_var("ONNX_GENAI_GEMV_PIPELINE");
-        }
+        // `_guard` clears the levers as it drops, on the unwind path too.
         drop(_guard);
 
         let mut got_f16 = vec![f16::ZERO; n];
@@ -17080,10 +17133,11 @@ extern "C" __global__ void ref_silu_mul_f16(
 
                         let run_once = |vec_on: bool, occ_on: bool| -> Vec<u16> {
                             let out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
-                            let lock = INTERLEAVE_TEST_ENV_LOCK.get_or_init(|| Mutex::new(()));
-                            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-                            // SAFETY: the env write is confined to this critical
-                            // section and removed before the lock is released.
+                            // Exclusive: this env write is process-wide, and the
+                            // guard clears it on drop so an unwinding `unwrap`
+                            // below cannot leak the lever to other tests.
+                            let _guard = LeverEnvGuard::acquire();
+                            // SAFETY: confined to the exclusive section.
                             unsafe {
                                 std::env::set_var(
                                     "ONNX_GENAI_GATEUP_VEC",
