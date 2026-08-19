@@ -2007,7 +2007,7 @@ unsafe fn prepare_workspace(
     kernel: &dyn Kernel,
     plans: &WorkspacePlanCache,
     inputs: &[TensorView<'_>],
-    node_label: &str,
+    node_label: impl std::fmt::Display + Copy,
 ) -> Result<Option<WorkspaceView>, String> {
     let metadata: Vec<TensorMetadata<'_>> = inputs
         .iter()
@@ -2121,7 +2121,7 @@ fn workspace_trace_enabled() -> bool {
 /// returned, capped at 4096 — the useful question is "did ORT already meet the
 /// kernel's alignment", not the exact 2-adic valuation of the address.
 fn workspace_trace_line(
-    node_label: &str,
+    node_label: impl std::fmt::Display,
     base: usize,
     aligned: usize,
     bytes: usize,
@@ -2316,6 +2316,7 @@ unsafe extern "C" fn compute_execute(
                 last_reader_per_buffer(&routing.input_sources, routing.num_intermediate_buffers);
 
             for (node_idx, entry) in exported.entries.iter().enumerate() {
+                let node_probe = crate::dispatch_probe::Phase::TensorBind.enter();
                 let sources = &routing.input_sources[node_idx];
                 let sinks = &routing.output_sinks[node_idx];
 
@@ -2360,12 +2361,15 @@ unsafe extern "C" fn compute_execute(
                 }
 
                 // Infer output shapes.
+                node_probe.end();
+                let shape_probe = crate::dispatch_probe::Phase::DispatchLookup.enter();
                 let output_shapes = match infer_shapes(&entry.shape_inference, &kernel_inputs) {
                     Ok(s) => s,
                     Err(e) => {
                         return fail_status(&format!("Compute: shape inference failed: {e}"));
                     }
                 };
+                shape_probe.end();
 
                 // Execute — dispatch based on sinks.
                 // For outputs going to ORT we allocate via ORT API;
@@ -2522,7 +2526,7 @@ unsafe extern "C" fn compute_execute(
 
                 // Collect all output views using the per-slot view map so
                 // positions stay aligned even when absent slots are present.
-                let absent_shapes: Vec<Vec<usize>> = output_shapes.clone();
+                let absent_shapes: &[Vec<usize>] = &output_shapes;
                 let absent_strides_storage: Vec<Vec<i64>> = absent_shapes
                     .iter()
                     .map(|s| contiguous_strides(s))
@@ -2556,13 +2560,12 @@ unsafe extern "C" fn compute_execute(
                         .collect()
                 };
 
-                let node_label = format!("Compute: node {node_idx}");
                 let plans = match exported.workspace_plan_cache(node_idx) {
                     Some(plans) => plans,
                     None => {
                         return fail_status(&format!(
-                            "{node_label}: no workspace plan cache for this node (entries and \
-                             workspace_plans have drifted)"
+                            "Compute: node {node_idx}: no workspace plan cache for this node \
+                             (entries and workspace_plans have drifted)"
                         ));
                     }
                 };
@@ -2587,13 +2590,14 @@ unsafe extern "C" fn compute_execute(
                         &*entry.kernel,
                         plans,
                         &kernel_inputs,
-                        &node_label,
+                        format_args!("Compute: node {node_idx}"),
                     )
                 } {
                     Ok(w) => w,
                     Err(e) => return fail_status(&e),
                 };
 
+                let kernel_probe = crate::dispatch_probe::Phase::KernelInvoke.enter();
                 if let Err(e) = entry.kernel.execute_with_workspace(
                     &kernel_inputs,
                     &mut all_output_views,
@@ -2601,6 +2605,8 @@ unsafe extern "C" fn compute_execute(
                 ) {
                     return fail_status(&format!("Compute: kernel execution failed: {e}"));
                 }
+                kernel_probe.end();
+                crate::dispatch_probe::count(crate::dispatch_probe::Event::NodeExecuted);
                 EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
 
                 // Store new intermediate buffers.
@@ -2753,7 +2759,7 @@ unsafe extern "C" fn compute_execute(
             }
             // Build output views in node-output order so the kernel sees the
             // full arity including absent scratch slots.
-            let absent_shapes: Vec<Vec<usize>> = output_shapes.clone();
+            let absent_shapes: &[Vec<usize>] = &output_shapes;
             let absent_strides_storage: Vec<Vec<i64>> = absent_shapes
                 .iter()
                 .map(|s| contiguous_strides(s))
