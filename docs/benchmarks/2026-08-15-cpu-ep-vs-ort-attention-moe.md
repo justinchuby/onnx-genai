@@ -4386,3 +4386,62 @@ whichever arm runs second, which is larger than most effects worth chasing.
   §41.7 gives: when co-tenants hold cores, workers free their slots later and
   more nested dispatches fall back to inline execution. The fallback is the
   designed behaviour, so this is the mechanism working, not a regression.
+
+### 41.11 The adaptive spin window is structurally pinned — and it does not matter
+
+Reading `worker_loop` against §41.4's numbers turns up a real defect. The
+window has **two** doubling sites and **one** halving site:
+
+* `ran > 0` after a drain doubles it (line ~367);
+* a spin hit doubles it (~397);
+* a park halves it (~408).
+
+The sequence after any park is: halve (500 → 250 us), then the futex wake
+returns *because work arrived*, the worker drains it, `ran > 0`, double
+(250 → 500 us). Net zero, every time. **The halving can never win**, so in any
+workload that does work at all the window sits permanently at `MAX_SPIN`.
+The comment at the halving site — "shrink it so a mostly-idle process
+converges on parking rather than on burning a core" — describes an intent
+the very next statement undoes. That also explains why §41.4's idle CPU
+saturates at ~6.5 CPU-ms ≈ 16 workers x `MAX_SPIN`.
+
+Running work is not evidence that a *spin window* was well-sized; only a spin
+hit is. So the `ran > 0` doubling is the wrong one, and removing it should let
+a large-gap workload converge to `MIN_SPIN` within five iterations.
+
+**It does not.** A/B with the two binaries interleaved in one session
+(§41.7's rule), sleep gaps, budget 16, 250 iterations:
+
+| gap | arm | p50 (ms) | cpu-s per wall-s | parks/iter |
+| --- | --- | --- | --- | --- |
+| 100 us | base | 0.844 / 0.846 | 12.61 / 12.84 | 4.16 / 2.04 |
+| 100 us | fix | 0.877 / 0.899 | 12.91 / 12.68 | 3.41 / 7.19 |
+| 2000 us | base | 0.974 / 1.050 | 5.78 / 5.45 | 16.92 / 19.04 |
+| 2000 us | fix | 0.942 / 0.911 | 5.60 / 5.06 | 17.16 / 19.11 |
+
+5% slower at 100 us, 7% faster at 2000 us — both inside the 0.81x-1.24x null
+band, and **CPU moves ~3% where the model predicted ~44%**. The prediction
+failed for a checkable reason: `parks/iter` is ~17 in *both* arms at a 2 ms
+gap. The workers park either way. The window governs how long they spin
+before parking, and empirically that is worth ~0.4 CPU-ms per iteration, not
+the ~8 ms that `16 x MAX_SPIN` implies — the spin loop exits early on the
+epoch check far more often than it runs to the window's end.
+
+So the defect is real, the reasoning from it was wrong, and the change is
+**not shipped**. Recorded because "the adaptive window is not actually
+adaptive" is worth knowing before someone tunes `MIN_SPIN`/`MAX_SPIN` and
+expects the adaptation to respond, and because the measurement bounds what
+fixing it could ever be worth.
+
+One thing the attempt did establish, from the per-thread census at a 2 ms
+gap: idle CPU is **not** spread evenly across our pools.
+
+| pool | threads | total CPU over the run |
+| --- | --- | --- |
+| task runtime (`nxrt-task-*`) | 15 | ~3.45 s |
+| decode SPMD (`onnx-genai-deco`) | 16 | 0.28 s |
+| prefill Rayon (`nxgn-prefill-*`) + main | 17 | 0.05 s |
+
+The task runtime is **12x** the decode pool. Any future work on idle CPU
+belongs there, and the prefill pool — the one that looked alarming in §41.5
+because it was anonymous and 16 threads wide — is 1.5% of the total.
