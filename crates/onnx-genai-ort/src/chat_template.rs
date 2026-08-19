@@ -433,14 +433,22 @@ impl serde_json::ser::Formatter for PythonCompactFormatter {
     where
         W: ?Sized + std::io::Write,
     {
-        if first { Ok(()) } else { writer.write_all(b", ") }
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
     }
 
     fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
     where
         W: ?Sized + std::io::Write,
     {
-        if first { Ok(()) } else { writer.write_all(b", ") }
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
     }
 
     fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
