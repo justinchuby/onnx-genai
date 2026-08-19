@@ -140,8 +140,20 @@ jobs:
           # to the whole row reports "Data race detected between (1) retag write
           # ... and (2) retag write of type `[u64]`"; without it, the same bad
           # shape passes.
+          #
+          # `-Zmiri-ignore-leaks` is required *because* `-Zmiri-num-cpus=4`
+          # works. The pool is a process-lifetime global whose workers park
+          # rather than join, so once this test actually spawns them Miri's
+          # exit check fails the step with "the main thread terminated without
+          # waiting for all remaining threads" even though the test itself
+          # passes. At the default one CPU the test returns early on its
+          # `pool_width() < 2` guard, spawns nothing, and never trips it, which
+          # is why the broad `task_runtime::` step above does not need the flag.
+          # The flag suppresses only that exit-time thread-leak check: with it
+          # set, widening the retag still reports the data race above, so the
+          # falsifier is intact.
           run_miri "onnx-runtime-ep-cpu task runtime concurrent retag" \
-            env MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-num-cpus=4" cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib task_runtime::tests::concurrent_tasks_retag_only_their_own_range
+            env MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-num-cpus=4 -Zmiri-ignore-leaks" cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib task_runtime::tests::concurrent_tasks_retag_only_their_own_range
           # The lib step above covers the pool's own unsafe. It does not cover
           # `tests/`, and that is the gap #1377 actually escaped through: every
           # other step in this lane is `--lib`, so an integration test could
