@@ -543,55 +543,116 @@ pub fn explicit_decode_affinity_requested() -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
+/// Order `pool` so that one CPU per physical core comes first, then the SMT
+/// siblings, and keep the first `count`.
+///
+/// This is the whole point of [`choose_budget_cpus`] on an SMT host: a budget of
+/// `count` CPUs taken as the `count` lowest indices lands on `count / 2`
+/// physical cores whenever the kernel numbers siblings adjacently (`0-1`,
+/// `2-3`, … on AMD EPYC and on every Intel host since Skylake-SP). Two threads
+/// sharing one core's front end do not add a core's worth of throughput, so the
+/// naive mask halves the machine and then burns twice the CPU proving it.
+///
+/// Leaders come from [`CoreTopology::leaders_within`], which only ever returns
+/// CPUs already in `pool`, so this reorders — it never widens the mask. When the
+/// topology is unknown every CPU is its own leader and the result is exactly the
+/// ascending prefix the old code produced.
+fn scatter_across_cores(
+    pool: &[usize],
+    count: usize,
+    cores: Option<&crate::core_topology::CoreTopology>,
+) -> Vec<usize> {
+    let leaders: Vec<usize> = match cores {
+        Some(cores) => cores.leaders_within(pool),
+        None => pool.to_vec(),
+    };
+    let leader_set: std::collections::BTreeSet<usize> = leaders.iter().copied().collect();
+    let mut ranked = leaders;
+    ranked.extend(pool.iter().copied().filter(|cpu| !leader_set.contains(cpu)));
+    ranked.truncate(count);
+    ranked.sort_unstable();
+    ranked
+}
+
+/// How many logical CPUs a NUMA node must hold to supply `count` distinct
+/// physical cores: `count × threads-per-core`, or `count` itself when the SMT
+/// map is unknown.
+///
+/// The node search in [`NumaTopology::cpus_for`] is sized in *logical* CPUs, so
+/// asking it for `count` would accept a node that has only `count / 2` cores and
+/// force the cross-node top-up for budgets that could have been served by one
+/// core-rich node.
+fn smt_scaled_request(count: usize, cores: Option<&crate::core_topology::CoreTopology>) -> usize {
+    let factor = cores
+        .filter(|c| c.core_count() > 0)
+        .map(|c| c.logical_count().div_ceil(c.core_count()))
+        .unwrap_or(1)
+        .max(1);
+    count.saturating_mul(factor)
+}
+
 /// Pick `count` CPUs to confine the whole process to, preferring CPUs packed on
-/// a single NUMA node for memory-bandwidth and barrier locality.
+/// a single NUMA node for memory-bandwidth and barrier locality and spread one
+/// per physical core for throughput.
 ///
 /// Pure and platform-independent so it is unit-testable without touching the
 /// kernel. `topology` is expected to already be restricted to the process's
 /// allowed CPU set; `allowed` is the raw allowed list used both to keep the
 /// result within the process cpuset and to top up the selection when no single
-/// node covers `count`. The result never exceeds `count`, never contains a CPU
-/// outside `allowed` (when `allowed` is known), and is returned in ascending
-/// order. Returns `None` when `count` is zero or no usable CPU can be chosen.
+/// node covers `count`; `cores` is the SMT sibling map used to rank the survivors
+/// (see [`scatter_across_cores`]). The result never exceeds `count`, never
+/// contains a CPU outside `allowed` (when `allowed` is known), and is returned in
+/// ascending order. Returns `None` when `count` is zero or no usable CPU can be
+/// chosen.
 fn choose_budget_cpus(
     topology: Option<&NumaTopology>,
     allowed: Option<&[usize]>,
     count: usize,
+    cores: Option<&crate::core_topology::CoreTopology>,
 ) -> Option<Vec<usize>> {
     if count == 0 {
         return None;
     }
     let allowed_set: Option<std::collections::BTreeSet<usize>> =
         allowed.map(|a| a.iter().copied().collect());
-    let mut selected: Vec<usize> = Vec::new();
-    if let Some(topology) = topology
-        && let Ok(Some(node_cpus)) = topology.cpus_for(&DecodeAffinity::Compact, count)
-    {
-        selected = node_cpus;
+    let mut pool: Vec<usize> = Vec::new();
+    if let Some(topology) = topology {
+        // Prefer a node that can supply `count` distinct *cores*; only if no node
+        // is that large does the search fall back to sizing in logical CPUs, so a
+        // budget that fits on one node still stays on one node.
+        let wide = smt_scaled_request(count, cores);
+        if wide > count
+            && let Ok(Some(node_cpus)) = topology.cpus_for(&DecodeAffinity::Compact, wide)
+            && node_cpus.len() >= wide
+        {
+            pool = node_cpus;
+        }
+        if pool.is_empty()
+            && let Ok(Some(node_cpus)) = topology.cpus_for(&DecodeAffinity::Compact, count)
+        {
+            pool = node_cpus;
+        }
     }
     if let Some(set) = &allowed_set {
-        selected.retain(|cpu| set.contains(cpu));
+        pool.retain(|cpu| set.contains(cpu));
     }
-    selected.sort_unstable();
-    selected.dedup();
-    selected.truncate(count);
-    if selected.len() < count
+    pool.sort_unstable();
+    pool.dedup();
+    // Top up *before* ranking: a second node's CPUs are new physical cores, and
+    // they must compete for leader slots against the first node's SMT siblings
+    // rather than be appended after a mask that is already full.
+    if pool.len() < count
         && let Some(allowed) = allowed
     {
         let mut extra: Vec<usize> = allowed
             .iter()
             .copied()
-            .filter(|cpu| !selected.contains(cpu))
+            .filter(|cpu| !pool.contains(cpu))
             .collect();
         extra.sort_unstable();
-        for cpu in extra {
-            if selected.len() >= count {
-                break;
-            }
-            selected.push(cpu);
-        }
+        pool.extend(extra);
     }
-    selected.sort_unstable();
+    let selected = scatter_across_cores(&pool, count, cores);
     (!selected.is_empty()).then_some(selected)
 }
 
@@ -603,7 +664,12 @@ fn choose_budget_cpus(
 pub fn select_budget_cpus(count: usize) -> Option<Vec<usize>> {
     let allowed = allowed_cpus();
     let restricted = NumaTopology::detect().map(|t| t.restrict_to_allowed(allowed.as_deref()));
-    choose_budget_cpus(restricted.as_ref(), allowed.as_deref(), count)
+    choose_budget_cpus(
+        restricted.as_ref(),
+        allowed.as_deref(),
+        count,
+        crate::core_topology::host(),
+    )
 }
 
 /// The CPUs the current process is actually permitted to run on, or `None` when
@@ -781,10 +847,43 @@ pub fn plan_decode_affinity(worker_count: usize) -> std::result::Result<DecodePl
     let cpus = match usable {
         Some(topology) => topology
             .cpus_for(&affinity, worker_count)?
+            .map(|cpus| order_pin_targets(&cpus, crate::core_topology::host()))
             .filter(|cpus| !cpus.is_empty()),
         None => None,
     };
     Ok(DecodePlan { cpus, log })
+}
+
+/// Order the *flat* decode pool's CPU list so that worker `i` lands on a
+/// distinct physical core for as long as cores last, and only then starts
+/// doubling up on SMT siblings.
+///
+/// [`crate::kernels::matmul_nbits`]'s `build_decode_pool` pins worker `i` to
+/// `cpus[i % cpus.len()]`, so the *order* of this list — not just its contents —
+/// decides whether an 8-worker pool on a 16-core/32-thread node occupies 8 cores
+/// or 4. Same set, same cpuset guarantees; only the ranking changes. With no
+/// discoverable SMT map this is the identity.
+///
+/// Deliberately **not** applied to the persistent SPMD pool
+/// ([`crate::decode_spmd`]) or the `numa-split` sub-pools
+/// ([`crate::decode_numa`]): those build their pin lists from `NodeShard::cpus`
+/// and their workers *spin*. Spreading spinning workers one per core is the
+/// experiment recorded in [`crate::core_topology`]'s module docs, where it
+/// measured worse (0.133 ms vs 0.079 ms) than leaving them compact. This
+/// function is for the fork-join pool, where a worker that is handed a share of
+/// the arithmetic genuinely wants its own core's front end.
+fn order_pin_targets(
+    cpus: &[usize],
+    cores: Option<&crate::core_topology::CoreTopology>,
+) -> Vec<usize> {
+    let Some(cores) = cores else {
+        return cpus.to_vec();
+    };
+    let leaders = cores.leaders_within(cpus);
+    let leader_set: std::collections::BTreeSet<usize> = leaders.iter().copied().collect();
+    let mut ordered = leaders;
+    ordered.extend(cpus.iter().copied().filter(|cpu| !leader_set.contains(cpu)));
+    ordered
 }
 
 /// Windows NUMA topology discovery and per-thread pinning.
@@ -1318,7 +1417,7 @@ mod tests {
         let allowed: Vec<usize> = (0..16).collect();
         // Four CPUs fit inside node 0, so all four come from the smallest-index
         // node that covers the count -- packed on one node for locality.
-        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 4).unwrap();
+        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 4, None).unwrap();
         assert_eq!(chosen, vec![0, 1, 2, 3]);
     }
 
@@ -1328,7 +1427,7 @@ mod tests {
         let allowed: Vec<usize> = (0..16).collect();
         // Twelve exceeds either 8-CPU node, so the largest node fills first and
         // the rest are topped up from the allowed set, never exceeding count.
-        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 12).unwrap();
+        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 12, None).unwrap();
         assert_eq!(chosen.len(), 12);
         assert!(chosen.iter().all(|cpu| allowed.contains(cpu)));
     }
@@ -1339,20 +1438,157 @@ mod tests {
         // The process is only allowed on four CPUs; a larger request is clamped
         // to exactly those CPUs and never pins outside the cpuset.
         let allowed = vec![8, 9, 10, 11];
-        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 8).unwrap();
+        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 8, None).unwrap();
         assert_eq!(chosen, vec![8, 9, 10, 11]);
     }
 
     #[test]
     fn choose_budget_cpus_without_topology_uses_allowed_prefix() {
         let allowed = vec![2, 3, 5, 7, 11];
-        let chosen = choose_budget_cpus(None, Some(&allowed), 3).unwrap();
+        let chosen = choose_budget_cpus(None, Some(&allowed), 3, None).unwrap();
         assert_eq!(chosen, vec![2, 3, 5]);
     }
 
     #[test]
     fn choose_budget_cpus_returns_none_without_any_usable_cpu() {
-        assert!(choose_budget_cpus(None, None, 4).is_none());
-        assert!(choose_budget_cpus(Some(&two_node_topology()), Some(&[0]), 0).is_none());
+        assert!(choose_budget_cpus(None, None, 4, None).is_none());
+        assert!(choose_budget_cpus(Some(&two_node_topology()), Some(&[0]), 0, None).is_none());
+    }
+
+    /// 16 logical CPUs, siblings adjacent (`0-1`, `2-3`, …) — the layout of
+    /// every AMD EPYC and post-Skylake Intel host we run on.
+    fn adjacent_smt_topology() -> crate::core_topology::CoreTopology {
+        crate::core_topology::CoreTopology::from_sibling_groups(
+            (0..8).map(|core| vec![core * 2, core * 2 + 1]),
+        )
+    }
+
+    #[test]
+    fn budget_cpus_take_one_thread_per_core_before_doubling_up() {
+        let topology = two_node_topology();
+        let allowed: Vec<usize> = (0..16).collect();
+        let smt = adjacent_smt_topology();
+        // Without the SMT map a budget of 4 is `0,1,2,3` = two physical cores.
+        // With it, the same four-CPU budget covers four distinct cores. Measured
+        // on a 16-core EPYC 9V74: 4 threads on 4 cores ran an 8B QKV prefill in
+        // 33.5 ms against 54.3 ms for 4 threads on 2 cores, using less CPU time.
+        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 4, Some(&smt)).unwrap();
+        assert_eq!(chosen, vec![0, 2, 4, 6]);
+        assert_eq!(smt.physical_cores_within(&chosen), 4);
+    }
+
+    #[test]
+    fn budget_cpus_fall_back_to_siblings_once_every_core_is_taken() {
+        let topology = two_node_topology();
+        let allowed: Vec<usize> = (0..16).collect();
+        let smt = adjacent_smt_topology();
+        // Node 0 holds 8 CPUs = 4 cores. A 6-CPU budget therefore takes node 0's
+        // 4 leaders plus the 2 lowest siblings, and stays inside one node.
+        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 6, Some(&smt)).unwrap();
+        assert_eq!(chosen.len(), 6);
+        assert!(chosen.iter().all(|cpu| (0..8).contains(cpu)));
+        assert!([0, 2, 4, 6].iter().all(|cpu| chosen.contains(cpu)));
+    }
+
+    #[test]
+    fn budget_cpus_stay_inside_the_cpuset_when_ranked_by_core() {
+        let topology = two_node_topology();
+        let smt = adjacent_smt_topology();
+        // A taskset of one full core plus one lone sibling: ranking must never
+        // invent CPU 4 just because it is a leader the process cannot use.
+        let allowed = vec![2, 3, 5];
+        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 3, Some(&smt)).unwrap();
+        assert_eq!(chosen, vec![2, 3, 5]);
+        let two = choose_budget_cpus(Some(&topology), Some(&allowed), 2, Some(&smt)).unwrap();
+        assert_eq!(
+            two,
+            vec![2, 5],
+            "the two leaders reachable inside the cpuset"
+        );
+    }
+
+    #[test]
+    fn budget_of_the_whole_machine_is_unchanged_by_core_ranking() {
+        let topology = two_node_topology();
+        let allowed: Vec<usize> = (0..16).collect();
+        let smt = adjacent_smt_topology();
+        // Ranking only reorders; asking for every CPU must still return every
+        // CPU, so the full-width case cannot regress.
+        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 16, Some(&smt)).unwrap();
+        assert_eq!(chosen, allowed);
+    }
+
+    #[test]
+    fn smt_scaled_request_sizes_the_node_search_in_cores() {
+        let smt = adjacent_smt_topology();
+        assert_eq!(smt_scaled_request(4, Some(&smt)), 8);
+        assert_eq!(smt_scaled_request(4, None), 4);
+        let no_smt =
+            crate::core_topology::CoreTopology::from_sibling_groups((0..8).map(|cpu| vec![cpu]));
+        assert_eq!(smt_scaled_request(4, Some(&no_smt)), 4);
+    }
+
+    #[test]
+    fn a_core_rich_node_wins_over_a_smaller_node_that_only_covers_the_thread_count() {
+        // node 0: 4 CPUs = 2 cores. node 1: 8 CPUs = 4 cores.
+        let mut nodes = BTreeMap::new();
+        nodes.insert(0, (0..4).collect::<Vec<_>>());
+        nodes.insert(1, (4..12).collect::<Vec<_>>());
+        let topology = NumaTopology { nodes };
+        let allowed: Vec<usize> = (0..12).collect();
+        let smt = crate::core_topology::CoreTopology::from_sibling_groups(
+            (0..6).map(|core| vec![core * 2, core * 2 + 1]),
+        );
+        // Sized in threads, node 0 "covers" a budget of 4 -- but it is two cores.
+        // Sized in cores the search needs 8 CPUs, which only node 1 has, so the
+        // budget lands on four distinct cores of one node instead of two.
+        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 4, Some(&smt)).unwrap();
+        assert_eq!(chosen, vec![4, 6, 8, 10]);
+        assert_eq!(smt.physical_cores_within(&chosen), 4);
+        // Without the SMT map the old behaviour stands: the smallest-index node
+        // that covers the thread count.
+        let flat = choose_budget_cpus(Some(&topology), Some(&allowed), 4, None).unwrap();
+        assert_eq!(flat, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn topped_up_cpus_compete_for_core_slots_instead_of_being_appended() {
+        // Two 6-CPU nodes on a 16-CPU host: no node covers a budget of 8, so the
+        // selection is topped up from the allowed set.
+        let mut nodes = BTreeMap::new();
+        nodes.insert(0, (0..6).collect::<Vec<_>>());
+        nodes.insert(1, (6..12).collect::<Vec<_>>());
+        let topology = NumaTopology { nodes };
+        let allowed: Vec<usize> = (0..16).collect();
+        let smt = adjacent_smt_topology();
+        // Ranking *after* the top-up spends all eight slots on eight distinct
+        // cores. Appending the top-up to an already-full mask (the old order)
+        // returned `[0, 1, 6, 7, 8, 9, 10, 11]` -- four cores for eight threads.
+        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 8, Some(&smt)).unwrap();
+        assert_eq!(chosen, vec![0, 2, 4, 6, 8, 10, 12, 14]);
+        assert_eq!(smt.physical_cores_within(&chosen), 8);
+    }
+
+    #[test]
+    fn a_budget_that_fits_one_node_does_not_spill_across_nodes_for_cores() {
+        let topology = two_node_topology();
+        let allowed: Vec<usize> = (0..16).collect();
+        let smt = adjacent_smt_topology();
+        // Node 0 holds 8 CPUs = 4 cores. A budget of 8 could reach 8 cores by
+        // spanning both nodes, but NUMA locality wins: the whole budget stays on
+        // node 0 and simply uses both threads of each of its four cores.
+        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 8, Some(&smt)).unwrap();
+        assert_eq!(chosen, (0..8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn pin_targets_are_ordered_one_per_core_then_siblings() {
+        let smt = adjacent_smt_topology();
+        let node: Vec<usize> = (0..8).collect();
+        // The pool builder pins worker `i` to `cpus[i % len]`, so the first four
+        // workers of an 8-CPU node must land on four different cores.
+        let ordered = order_pin_targets(&node, Some(&smt));
+        assert_eq!(ordered, vec![0, 2, 4, 6, 1, 3, 5, 7]);
+        assert_eq!(order_pin_targets(&node, None), node);
     }
 }

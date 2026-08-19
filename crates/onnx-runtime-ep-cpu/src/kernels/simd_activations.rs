@@ -441,10 +441,7 @@ where
         return false;
     }
     match host_chunk_len(input.len()) {
-        Some((chunk, count)) => {
-            note_parallel_dispatch();
-            run_on_host(host, input, output, chunk, count, body);
-        }
+        Some((chunk, count)) => run_on_host(host, input, output, chunk, count, body),
         // Too short to split across the host's threads. Our own pool is not
         // the answer either: it would be a second pool on the same cores.
         None => body(input, output),
@@ -474,10 +471,15 @@ where
 /// Splits `input`/`output` into `count` chunks of `chunk` and runs `body` on
 /// each one on the host runtime's pool.
 ///
-/// Bit-identical to calling `body` on the whole slice, for the same reason the
-/// rayon path is: the kernels are elementwise, every chunk is a multiple of
-/// eight lanes, and none is shorter than [`SIMD_MIN_LEN`], so no chunk takes a
-/// different code path from its neighbours.
+/// Bit-identical to calling `body` on the whole slice, but *not* because every
+/// chunk is vector-shaped — the last one usually is not: `host_chunk_len`
+/// rounds the chunk up, so a length of 65537 ends with a chunk of one. It
+/// holds because every chunk *starts* on an 8-lane boundary and every chunk
+/// runs the same kernel, which handles its own remainder with a masked tail.
+/// The scalar-versus-vector decision is taken once, on the whole slice, before
+/// any of this: no chunk can take a path its neighbours did not. A kernel that
+/// fell back to scalar arithmetic per chunk, or that reduced across elements,
+/// would break this and must not be handed to it.
 fn run_on_host<F>(
     host: onnx_runtime_ep_api::HostParallel,
     input: &[f32],
@@ -5762,18 +5764,28 @@ mod host_pool_split {
     /// Splitting again would nest a pool inside the pool we were handed.
     #[test]
     fn a_nested_split_stays_serial() {
-        let x = probe(N);
-        let mut y = vec![0.0f32; N];
+        // Long enough for the *rayon* path to fire, which is the one the
+        // `in_host_task` guard exists to stop: a shorter slice would stay
+        // serial with the guard deleted and the test could not fail.
+        const NESTED: usize = PAR_MIN_LEN + 4099;
+        let x = probe(NESTED);
+        let mut y = vec![0.0f32; NESTED];
         host_parallel::scope(fake_host(), || {
             fake_host().run(2, &|_| {
                 assert!(host_parallel::in_host_task());
                 let before = dispatched();
-                let mut inner = vec![0.0f32; N];
+                let rayon_before = parallel_dispatches();
+                let mut inner = vec![0.0f32; NESTED];
                 tanh_f32_slice(&x, &mut inner);
                 assert_eq!(
                     dispatched(),
                     before,
-                    "a kernel inside a host task dispatched again"
+                    "a kernel inside a host task dispatched to the host again"
+                );
+                assert_eq!(
+                    parallel_dispatches(),
+                    rayon_before,
+                    "a kernel inside a host task dispatched to rayon"
                 );
             });
             tanh_f32_slice(&x, &mut y);
