@@ -153,7 +153,8 @@ __device__ __forceinline__ void gqa_decode_f32_impl(
     const float scale,
     const int local_window,
     const float softcap,
-    const int single_split_direct)
+    const int single_split_direct,
+    const float* __restrict__ head_sink)
 {
     extern __shared__ float smem[];
     const int warps_per_block = blockDim.x / GQA_WARP_SIZE;
@@ -259,10 +260,6 @@ __device__ __forceinline__ void gqa_decode_f32_impl(
     for (int w = 0; w < warps_per_block; ++w) {
         global_max = fmaxf(global_max, warp_max[w]);
     }
-    float denom = 0.0f;
-    for (int w = 0; w < warps_per_block; ++w) {
-        denom += warp_sum[w] * expf(warp_max[w] - global_max);
-    }
     // When `single_split_direct` is enabled and the on-device length selects a
     // single split, the sole active CTA already owns the complete flash state,
     // so it normalizes and writes the final output directly, skipping the
@@ -270,6 +267,24 @@ __device__ __forceinline__ void gqa_decode_f32_impl(
     // (the merge with one split multiplies by exp(0)==1 and the same 1/denom).
     const bool direct_output =
         (row >= GQA_MAX_SCRATCH_ROWS) || (single_split_direct != 0 && active_splits == 1);
+    // Learned attention sink (gpt-oss family): a per-head logit that joins the
+    // softmax denominator once per row but contributes no value vector. It is
+    // folded in only on the FINAL normalization (direct-output here, or the
+    // merge kernel for multi-split rows), never per-split, so split states stay
+    // sink-free. When absent, `sink_val == -inf` makes the fold a no-op
+    // (byte-identical to the pre-sink path).
+    const float sink_val =
+        (head_sink != nullptr) ? head_sink[query_head] : negative_infinity;
+    if (direct_output) {
+        global_max = fmaxf(global_max, sink_val);
+    }
+    float denom = 0.0f;
+    for (int w = 0; w < warps_per_block; ++w) {
+        denom += warp_sum[w] * expf(warp_max[w] - global_max);
+    }
+    if (direct_output) {
+        denom += expf(sink_val - global_max);
+    }
     float* split_state = direct_output
         ? nullptr
         : gqa_split_scratch
@@ -307,7 +322,8 @@ __device__ __forceinline__ void gqa_merge_f32_impl(
     const int query_seq,
     const int head_size,
     const int local_window,
-    const int single_split_direct)
+    const int single_split_direct,
+    const float* __restrict__ head_sink)
 {
     const int row = blockIdx.x;
     const int rows = batch * query_heads * query_seq;
@@ -327,18 +343,26 @@ __device__ __forceinline__ void gqa_merge_f32_impl(
     // Single-split rows were finalized in-place by the decode kernel.
     if (single_split_direct != 0 && active_splits <= 1) return;
 
+    const int query_head = (row / query_seq) % query_heads;
     float global_max = __int_as_float(0xff800000);
     for (int split = 0; split < active_splits; ++split) {
         const float* state = gqa_split_scratch
             + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
         global_max = fmaxf(global_max, state[0]);
     }
+    // Learned attention sink (see the decode kernel): folded into the softmax
+    // denominator once, on this final merge, for multi-split rows. `-inf` when
+    // absent => byte-identical no-op.
+    const float sink_val =
+        (head_sink != nullptr) ? head_sink[query_head] : __int_as_float(0xff800000);
+    global_max = fmaxf(global_max, sink_val);
     float denom = 0.0f;
     for (int split = 0; split < active_splits; ++split) {
         const float* state = gqa_split_scratch
             + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
         denom += state[1] * expf(state[0] - global_max);
     }
+    denom += expf(sink_val - global_max);
     const float inverse_sum = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
     const long q_base = (long)row * (long)head_size;
 #pragma unroll
@@ -367,18 +391,22 @@ extern "C" __global__ void gqa_decode_attention_f32_dpl##DPL(                  \
     const int query_heads, const int kv_heads, const int query_seq,           \
     const int head_size, const int cache_capacity, const int group_size,      \
     const float scale, const int local_window, const float softcap,           \
-    const int single_split_direct) {                                          \
+    const int single_split_direct,                                            \
+    const float* __restrict__ head_sink) {                                    \
     gqa_decode_f32_impl<DPL>(query, key, value, output, total_lengths, batch, \
         query_heads, kv_heads, query_seq, head_size, cache_capacity,          \
-        group_size, scale, local_window, softcap, single_split_direct);       \
+        group_size, scale, local_window, softcap, single_split_direct,        \
+        head_sink);                                                           \
 }                                                                             \
 extern "C" __global__ void gqa_decode_attention_f32_merge_dpl##DPL(           \
     float* __restrict__ output, const int* __restrict__ total_lengths,        \
     const int batch, const int query_heads, const int query_seq,              \
     const int head_size, const int local_window,                             \
-    const int single_split_direct) {                                          \
+    const int single_split_direct,                                            \
+    const float* __restrict__ head_sink) {                                    \
     gqa_merge_f32_impl<DPL>(output, total_lengths, batch, query_heads,        \
-        query_seq, head_size, local_window, single_split_direct);             \
+        query_seq, head_size, local_window, single_split_direct,             \
+        head_sink);                                                           \
 }
 
 GQA_DECODE_ENTRIES(1)
@@ -415,6 +443,7 @@ pub(super) fn run(
     total_lengths: CUdeviceptr,
     local_window: i32,
     softcap: f32,
+    head_sink: CUdeviceptr,
 ) -> Result<()> {
     let as_i32 = |name: &str, value: usize| {
         i32::try_from(value).map_err(|_| {
@@ -481,7 +510,8 @@ pub(super) fn run(
         .arg(&scale)
         .arg(&local_window)
         .arg(&softcap)
-        .arg(&single_split_direct);
+        .arg(&single_split_direct)
+        .arg(&head_sink);
     // SAFETY: the selected `dpl` entry matches this argument ABI; all buffers were sized by the
     // caller. Fixed module-global and dynamic shared scratch make the launch
     // legal to record into and replay from a CUDA graph.
@@ -504,7 +534,8 @@ pub(super) fn run(
         .arg(&query_seq_i)
         .arg(&dim_i)
         .arg(&local_window)
-        .arg(&single_split_direct);
+        .arg(&single_split_direct)
+        .arg(&head_sink);
     // SAFETY: the same-stream partial launch writes every active split state
     // consumed here; both launches are graph-recordable.
     unsafe {
@@ -670,6 +701,7 @@ mod tests {
                 totals_dev,
                 0,
                 0.0,
+                0, // head_sink: null (no attention sink)
             )
             .unwrap();
 
@@ -790,6 +822,7 @@ mod tests {
                 totals_dev,
                 0,
                 0.0,
+                0, // head_sink: null (no attention sink)
             )
             .unwrap();
 
@@ -982,6 +1015,7 @@ mod tests {
                     totals_dev,
                     0,
                     0.0,
+                    0, // head_sink: null (no attention sink)
                 )
                 .unwrap();
                 let mut got = vec![0.0f32; num_heads * head_dim];
