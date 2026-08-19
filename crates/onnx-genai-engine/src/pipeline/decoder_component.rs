@@ -294,6 +294,12 @@ impl NativePipelineDecoder {
             last_logits: None,
         })
     }
+
+    /// Bound the tokens per prefill forward, from
+    /// `model.runtime_configurable.chunked_prefill.chunk_size`.
+    pub(crate) fn set_prefill_chunk_size(&mut self, chunk_size: Option<usize>) {
+        self.session.set_prefill_chunk_size(chunk_size);
+    }
 }
 
 #[cfg(feature = "native-backend")]

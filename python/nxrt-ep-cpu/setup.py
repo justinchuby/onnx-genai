@@ -29,16 +29,19 @@ from setuptools.dist import Distribution
 CRATE = "onnx-runtime-ep-cpu-plugin"
 LIB_STEM = "onnx_runtime_ep_cpu_plugin"
 PACKAGE = "nxrt_ep_cpu"
-# Extra cargo features to enable. ``mlas`` links the vendored ONNX Runtime MLAS
-# kernels into the cdylib; see ``_mlas_features``.
+# Extra cargo features this wheel may enable. ``mlas`` links the vendored ONNX
+# Runtime MLAS kernels into the cdylib; see ``_mlas_features``.
 MLAS_FEATURE = "mlas"
 
+# Opt-in environment variable for a *research* wheel that links the MLAS
+# reference. Never set in a release build.
+MLAS_OPT_IN_ENV = "NXRT_EP_CPU_RESEARCH_MLAS"
+
 # (``platform.system()``, ``platform.machine()``) pairs whose MLAS build this
-# repository's CI proves, lowercased. Every entry is compiled by a
-# ``cargo build -p onnx-runtime-ep-cpu-plugin --features mlas``
-# step on the matching lane in ``.github/workflows/ci.yml``; a target that is
-# not proven there is not listed here, because a wheel that fails to build is
-# worse than a wheel that is slow.
+# repository's CI proves, lowercased. These are not targets the shipped wheel
+# enables MLAS on -- nothing enables it -- they are the only targets on which
+# the research opt-in below is allowed to try, because a research build that
+# fails to link is not useful either.
 MLAS_TARGETS = frozenset(
     {
         ("linux", "x86_64"),
@@ -50,22 +53,21 @@ MLAS_TARGETS = frozenset(
 
 
 def _mlas_features(system: str | None = None, machine: str | None = None) -> list[str]:
-    """Cargo features for this wheel's target.
+    """Cargo features for this wheel's target. Empty for every shipped wheel.
 
-    ORT's own CPU execution provider *is* MLAS. A cdylib built without it does
-    not lose a little speed, it loses an order of magnitude: on this project's
-    plugin-path A/B (AMD EPYC 9V74, AVX2, ORT 1.27, K=N=2048, p50 of 41
-    interleaved iterations), 4-bit ``MatMulNBits`` at M=128 takes 81x ORT's
-    time without MLAS and 7.3x with it, and ``QLinearMatMul`` u8 at M=128
-    takes 55x without and 9.3x with. Shipping the pure-Rust build is therefore
-    not the conservative default; it is the slow one.
+    The production CPU EP is native. The wheel does not proactively link,
+    activate, or route to MLAS on any target: MLAS is a research reference we
+    measure our own kernels against and absorb capability from, and shipping it
+    would remove the forcing function for that absorption -- every native gap
+    stays covered, so nobody ever feels it, and "an EP that is equally fast
+    standing alone" becomes untestable in the configuration users actually run.
 
-    Set ``NXRT_EP_CPU_NO_MLAS=1`` to build the pure-Rust cdylib anyway, for a
-    toolchain with no C++ compiler or a target the vendored sources do not
-    cover.
+    Set ``NXRT_EP_CPU_RESEARCH_MLAS=1`` to build a **non-shippable** research
+    wheel that links the reference, for differential testing and benchmarking
+    on one of ``MLAS_TARGETS``. Release automation never sets it; see
+    ``docs/performance/CPU_MLAS_MIGRATION.md``.
     """
-    if os.environ.get("NXRT_EP_CPU_NO_MLAS") == "1":
-        print("[nxrt-ep] NXRT_EP_CPU_NO_MLAS=1: building without MLAS", flush=True)
+    if os.environ.get(MLAS_OPT_IN_ENV) != "1":
         return []
     target = (
         (system or platform.system()).lower(),
@@ -73,10 +75,16 @@ def _mlas_features(system: str | None = None, machine: str | None = None) -> lis
     )
     if target not in MLAS_TARGETS:
         print(
-            f"[nxrt-ep] no CI-proven MLAS build for {target}: building without MLAS",
+            f"[nxrt-ep] {MLAS_OPT_IN_ENV}=1 but no CI-proven MLAS build for "
+            f"{target}: building without MLAS",
             flush=True,
         )
         return []
+    print(
+        f"[nxrt-ep] {MLAS_OPT_IN_ENV}=1: research build, linking the MLAS "
+        "reference. This wheel must not be published.",
+        flush=True,
+    )
     return [MLAS_FEATURE]
 
 

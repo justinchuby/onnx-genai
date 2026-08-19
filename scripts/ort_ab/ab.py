@@ -5,6 +5,14 @@ Runs two binaries (or one) alternately over a model/thread grid so host drift
 affects both arms equally, and records every trial's native p50, ORT p50 and the
 within-run native/ort ratio. The ratio is the publishable metric on this
 contended host; absolutes drift by >4x.
+
+`--null-control` adds a third arm that is the *first arm's own binary under a
+second name*. It measures nothing about the change, which is the point: whatever
+delta it reports is this host's noise floor for that cell, measured in the same
+invocation as the real comparison. Any real delta smaller than the null delta is
+not a result. See section 37.4 of the CPU-EP benchmark ledger for the run that
+made this non-optional: two binaries traced to be on the identical code path
+still measured ~40% apart on the median at two threads.
 """
 
 from __future__ import annotations
@@ -68,17 +76,34 @@ def main() -> None:
     ap.add_argument("--runs", type=int, default=15)
     ap.add_argument("--warmups", type=int, default=5)
     ap.add_argument("--csv", type=Path, required=True)
+    ap.add_argument(
+        "--null-control",
+        action="store_true",
+        help="add a duplicate of the first arm, under the name 'null', so the "
+        "run measures its own noise floor alongside the real comparison",
+    )
     args = ap.parse_args()
 
     arms = {}
     for spec in args.arms:
         name, _, path = spec.partition("=")
         arms[name] = Path(path)
+    baseline = next(iter(arms))
+    if args.null_control:
+        if "null" in arms:
+            ap.error("--null-control needs the arm name 'null' to be free")
+        # Same file, same environment overrides, second name. The delta this
+        # arm reports against `baseline` is pure host noise by construction.
+        arms["null"] = arms[baseline]
     arm_env: dict[str, dict[str, str]] = {name: {} for name in arms}
     for spec in args.arm_env:
         name, _, kv = spec.partition("=")
         key, _, value = kv.partition("=")
         arm_env.setdefault(name, {})[key] = value
+    if args.null_control:
+        # The control has to be the baseline in every respect the driver can
+        # vary, environment included, or it stops measuring only noise.
+        arm_env["null"] = dict(arm_env.get(baseline, {}))
 
     rows = []
     for model in args.models:
@@ -137,6 +162,54 @@ def main() -> None:
                     f"[{min(sel):.3f}-{max(sel):.3f}] native_p50={median(nat):8.3f}ms{flag}"
                 )
         print("  ".join(line))
+
+    if len(arms) > 1:
+        print(
+            "\n=== deltas vs "
+            f"'{baseline}' (median ratio; negative = arm is faster) ==="
+        )
+        if args.null_control:
+            print(
+                "The 'null' column is the same binary as "
+                f"'{baseline}'. Its delta is this host's noise floor for the "
+                "cell, so a real delta no larger than it is not a result."
+            )
+        for model, threads in keys:
+            def cell_p50(arm_name: str) -> float | None:
+                sel = [
+                    r["ratio"]
+                    for r in rows
+                    if r["model"] == model
+                    and r["threads"] == threads
+                    and r["arm"] == arm_name
+                ]
+                return median(sel) if sel else None
+
+            base_p50 = cell_p50(baseline)
+            if base_p50 is None or base_p50 == 0.0:
+                continue
+            null_delta = None
+            if args.null_control:
+                null_p50 = cell_p50("null")
+                if null_p50 is not None:
+                    null_delta = abs(null_p50 / base_p50 - 1.0) * 100.0
+            parts = [f"{model:28s} t={threads:<3d}"]
+            for name in arms:
+                if name == baseline:
+                    continue
+                p50 = cell_p50(name)
+                if p50 is None:
+                    continue
+                delta = (p50 / base_p50 - 1.0) * 100.0
+                verdict = ""
+                if name != "null" and null_delta is not None:
+                    verdict = (
+                        "  WITHIN NOISE"
+                        if abs(delta) <= null_delta
+                        else f"  > noise ({null_delta:.2f}%)"
+                    )
+                parts.append(f"{name}: {delta:+7.2f}%{verdict}")
+            print("  ".join(parts))
 
     failed = sum(1 for r in rows if r["parity"] != "PASS")
     if failed:

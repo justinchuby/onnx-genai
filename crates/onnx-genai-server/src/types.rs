@@ -184,7 +184,7 @@ pub struct CompletionRequest {
 /// A closed set rather than a free string so an unsupported spelling is
 /// rejected with the accepted values instead of silently leaving the model on
 /// its own default, which for a reasoning model is often maximal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     Minimal,

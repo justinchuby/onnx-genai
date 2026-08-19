@@ -96,6 +96,18 @@ mod mm_profile {
     pub fn time_gemv<T>(f: impl FnOnce() -> T) -> T {
         timed(&GEMV_NS, f)
     }
+
+    /// The default build shares the NT prefill call site with MLAS but has no
+    /// reporter for the `gemv` phase — [`tick`] is the MLAS f16 decode split —
+    /// so this is a pass-through rather than a counter nothing ever prints. It
+    /// exists so the shared call site stays `cfg`-free; the phase that carries
+    /// the default build's story (`dequant-nk` vs `dequant-kn`) is reported by
+    /// [`time_prepack`], which is not gated.
+    #[cfg(not(feature = "mlas"))]
+    #[inline]
+    pub fn time_gemv<T>(f: impl FnOnce() -> T) -> T {
+        f()
+    }
     #[cfg(feature = "mlas")]
     pub fn time_narrow<T>(f: impl FnOnce() -> T) -> T {
         timed(&NARROW_NS, f)
@@ -336,13 +348,11 @@ fn mlas_prefill_serial() -> bool {
     })
 }
 
-/// Which executor the `m > 1` MLAS shard tiling fans out on.
+/// Which executor a `m > 1` prefill fan-out runs on.
 ///
-/// Not gated on `mlas` even though only the MLAS path consults it: the policy
-/// is pure integer arithmetic, and the only CI lane that runs this crate's
-/// whole test suite is the default-feature one. Gating it would mean the
-/// tests never run.
-#[cfg_attr(not(feature = "mlas"), allow(dead_code))]
+/// Shared by the native borrowed-int4 column fan-out and the MLAS shard tiling:
+/// the two kernels differ in what a task *does*, not in which pool should own
+/// the threads while it does it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrefillFanOut {
     /// The CPU task runtime: bounded, topology-aware, adaptive spin/park.
@@ -394,7 +404,13 @@ enum PrefillFanOut {
 ///
 /// Park latency is what makes the wide path safe above the threshold: 226 us of
 /// worst-case wake-up is 0.25% of a 90 ms fan-out, and 45% of a 0.5 ms one.
-#[cfg_attr(not(feature = "mlas"), allow(dead_code))]
+/// Both callers are conditional -- `run_mlas_shards` on `feature = "mlas"`,
+/// `borrowed_affine_int4_matmul_prefill` on `target_arch = "x86_64"` -- so
+/// the union of those two cfgs is what keeps this alive. Silence dead code
+/// where neither applies rather than `#[cfg]`-ing the item away: the unit
+/// tests below reference it unconditionally, and gating the item forces
+/// gating the tests too, which drops the policy from aarch64 coverage.
+#[cfg_attr(not(any(feature = "mlas", target_arch = "x86_64")), allow(dead_code))]
 const WIDE_PREFILL_MACS: usize = 1 << 29;
 
 /// Picks the prefill fan-out executor for `macs` of work, given the task
@@ -402,7 +418,12 @@ const WIDE_PREFILL_MACS: usize = 1 << 29;
 ///
 /// Split out as a pure function so the policy is testable without a machine
 /// that has SMT, and so the threshold has one place to be wrong.
-#[cfg_attr(not(feature = "mlas"), allow(dead_code))]
+/// Its two callers are gated on different things -- `run_mlas_shards` on
+/// `feature = "mlas"` and `borrowed_affine_int4_matmul_prefill` on
+/// `target_arch = "x86_64"` -- so the union of those two cfgs is what keeps
+/// this alive. On aarch64 without MLAS both callers vanish and only the unit
+/// tests are left.
+#[cfg_attr(not(any(feature = "mlas", target_arch = "x86_64")), allow(dead_code))]
 fn prefill_fan_out(macs: usize, lanes: usize, wide: usize) -> PrefillFanOut {
     // Nothing to win from the wide path when it is not actually wider; prefer
     // the runtime's cheaper dispatch.
@@ -412,20 +433,152 @@ fn prefill_fan_out(macs: usize, lanes: usize, wide: usize) -> PrefillFanOut {
     PrefillFanOut::Wide
 }
 
-/// Smallest amount of multiply-accumulate work worth handing to another thread
-/// on the prefill tiling fan-out, in MACs.
+/// Per-fan-out multiply-accumulate work above which the *executor's width*
+/// matters more than its dispatch latency.
 ///
-/// The tiling below cannot merge output-column shards — each shard owns its own
-/// packed weight — so the only lever it has for a too-fine partition is to hand
-/// several whole tiles to one task. This constant converts "how much arithmetic
-/// is a wake-up worth" into that tile count.
+/// One flat fan-out of this size runs for hundreds of microseconds, so the
+/// ~5 us the task runtime saves on the dispatch is rounding error and all that
+/// is left is the runtime's physical-core cap against global Rayon's SMT width.
+/// Below it the dispatch is a double-digit percentage of the fan-out and the
+/// runtime wins outright.
+const HOT_FAN_OUT_MACS: usize = 1 << 25;
+
+/// Number of back-to-back fan-outs above which global Rayon's workers stop
+/// parking between them.
+///
+/// A parked Rayon worker takes 67-226 us to reach its first task; a hot one
+/// takes single-digit microseconds. Which of those a kernel pays is decided by
+/// how quickly the *next* fan-out arrives, and a kernel that issues one per
+/// activation row of an `m`-token prefill issues them with no gap at all. Past
+/// a few tens of rows the pool never gets to sleep and the park penalty --
+/// the entire reason the task runtime exists -- stops being charged.
+const HOT_FAN_OUT_CALLS: usize = 32;
+
+/// Rayon width below which a flat fan-out is left where it is.
+///
+/// The park cost this whole campaign is about is charged per worker that has to
+/// be woken, so it scales with how many there are. At four threads there are
+/// three wake-ups to pay for and moving the fan-out to another pool costs more
+/// than it saves; at thirty-two it is the dominant term in the kernel. Measured
+/// on this document's 16-cell `gemm_nbits_*` grid, native-only, geometric mean
+/// of Rayon / task runtime with the runtime routed unconditionally:
+///
+/// | width | geomean | cells below 0.95x |
+/// | --- | --- | --- |
+/// | t=1  | 1.01x | 1/8 |
+/// | t=2  | 1.01x | 1/8 |
+/// | t=4  | **0.81x** | 6/8 |
+/// | t=8  | **0.94x** | 4/16 |
+/// | t=16 | 1.07x | 4/16 |
+/// | t=32 | **2.22x** | 2/16 |
+///
+/// t=1 and t=2 are flat because the partition policy declines to split at all
+/// and both arms run the same serial code. t=4 and t=8 are a real, reproduced
+/// loss -- `gemm_nbits_llama3_8b_mlp_t1` at t=4 went 6.22 ms to 8.41 ms across
+/// three independent driver invocations. The crossover is between 8 and 16.
+///
+/// Like [`SMT_CAP_FLOOR`] this is empirical and from a single microarchitecture
+/// (AMD EPYC 9V74, 16 physical / 32 logical), and it happens to coincide with
+/// that host's physical core count. Anyone porting this to a machine with a
+/// very different memory system should re-run the grid rather than trust the
+/// number.
+const MIN_ROUTED_FAN_OUT_WIDTH: usize = 16;
+
+/// Which executor a *flat* output-row fan-out runs on.
+///
+/// Distinct from [`prefill_fan_out`], which partitions one big call. Here the
+/// kernel issues `calls` fan-outs of `fan_out_macs` each, and the choice needs
+/// both numbers because neither alone separates the measurements. Native-only,
+/// 32 threads (so 32 Rayon workers against the runtime's 16 physical lanes),
+/// medians of 5 trials x 7 runs, `par_chunks_mut` against the task runtime:
+///
+/// | cell | n*k | calls | Rayon | task runtime | winner |
+/// |---|---|---|---|---|---|
+/// | `qwen3_0p6b_qkv_t1`   |  3 Mi |   1 |   1.69 ms |  0.63 ms | runtime 2.7x |
+/// | `qwen3_0p6b_mlp_t1`   |  6 Mi |   1 |  11.78 ms |  0.66 ms | runtime 17.8x |
+/// | `llama3_8b_qkv_t1`    | 24 Mi |   1 |  15.41 ms |  1.94 ms | runtime 7.9x |
+/// | `llama3_8b_mlp_t1`    | 56 Mi |   1 |  16.90 ms |  6.76 ms | runtime 2.5x |
+/// | `qwen3_0p6b_qkv_t8`   |  3 Mi |   8 |  40.09 ms |  4.99 ms | runtime 8.0x |
+/// | `llama3_8b_mlp_t8`    | 56 Mi |   8 |  68.56 ms | 44.61 ms | runtime 1.5x |
+/// | `qwen3_0p6b_mlp_t128` |  6 Mi | 128 |  85.31 ms | 74.34 ms | runtime 1.15x |
+/// | `llama3_8b_qkv_t128`  | 24 Mi | 128 | 166.62 ms | 155.29 ms | runtime 1.07x |
+/// | `llama3_8b_qkv_t512`  | 24 Mi | 512 | 487.90 ms | 448.18 ms | runtime 1.09x |
+/// | `llama3_8b_mlp_t128`  | 56 Mi | 128 | 270.11 ms | 291.75 ms | **Rayon 1.08x** |
+/// | `llama3_8b_mlp_t512`  | 56 Mi | 512 | 905.81 ms | 1057.8 ms | **Rayon 1.17x** |
+///
+/// The last two rows are the only losses at this width and they are exactly
+/// the cells where both conditions hold: fan-outs big enough that dispatch
+/// latency has stopped mattering, arriving fast enough that Rayon never parks.
+/// Note that no threshold on the *product* can express this -- `llama3_8b_qkv`
+/// at 512 calls is 12.3 Gi of work and wants the runtime, while
+/// `llama3_8b_mlp` at 128 calls is 7.2 Gi and wants Rayon -- which is why this
+/// takes two constants rather than reusing [`WIDE_PREFILL_MACS`]. Both
+/// separations are wide: 24 Mi against 56 Mi, and 8 calls against 128.
+///
+/// `lanes` is a closure and not a `usize` on purpose. The only way to learn the
+/// runtime's width is [`task_runtime::width`], which *builds the pool* -- it
+/// spawns resident workers that spin before they park. Asking for it and then
+/// declining to use it is not free: it costs whatever those workers take from
+/// the threads doing the actual arithmetic, which on a narrow configuration is
+/// a measurable share of the machine. So the width test that needs no pool runs
+/// first, and `lanes` is never called on the paths that end on Rayon.
+fn flat_fan_out<L>(fan_out_macs: usize, calls: usize, lanes: L, wide: usize) -> PrefillFanOut
+where
+    L: FnOnce() -> usize,
+{
+    // Too few workers for their wake-ups to add up to anything worth moving the
+    // fan-out for -- and, more to the point, too few to be worth building a
+    // second pool for. This is the whole `t <= 8` half of the grid.
+    if wide < MIN_ROUTED_FAN_OUT_WIDTH {
+        return PrefillFanOut::Wide;
+    }
+    // Rayon is not actually wider than the pool, so the runtime's SMT cap costs
+    // nothing and its cheaper dispatch is free money.
+    if wide <= lanes() {
+        return PrefillFanOut::TaskRuntime;
+    }
+    if fan_out_macs >= HOT_FAN_OUT_MACS && calls >= HOT_FAN_OUT_CALLS {
+        return PrefillFanOut::Wide;
+    }
+    PrefillFanOut::TaskRuntime
+}
+
+/// Smallest amount of multiply-accumulate work worth handing to another thread
+/// on a prefill fan-out, in MACs.
+///
+/// Shared by both prefill fan-outs. Neither can subdivide below one unit of its
+/// own partition — the MLAS tiling cannot merge output-column shards (each
+/// shard owns its own packed weight) and the native path cannot split a single
+/// output column — so this constant is what converts "how much arithmetic is a
+/// wake-up worth" into a tile or column count.
 ///
 /// Sized from the task runtime's measured dispatch latency (p50 4.8 us to reach
 /// a resident worker, see `task_runtime::pool`) against roughly 2 GMAC/s per
-/// core for MLAS SQNBit int4: 512 Ki MACs is ~250 us of arithmetic, about 50x
-/// the dispatch cost, so the fan-out is still overwhelmingly useful work.
-#[cfg_attr(not(feature = "mlas"), allow(dead_code))]
+/// core for int4 SQNBit: 512 Ki MACs is ~250 us of arithmetic, about 50x the
+/// dispatch cost, so the fan-out is still overwhelmingly useful work.
 const MIN_PREFILL_TASK_MACS: usize = 1 << 19;
+
+/// Output columns per task for a native `m x n` prefill over depth `k`, so that
+/// no task is handed less than [`MIN_PREFILL_TASK_MACS`] of arithmetic.
+///
+/// Returns a *floor* the task runtime applies to its own partition; the runtime
+/// still uses a larger grain when there are more columns than workers.
+/// Its only non-test caller is `borrowed_affine_int4_matmul_prefill`, which is
+/// `#[cfg(target_arch = "x86_64")]` -- `run_mlas_shards` takes
+/// `prefill_tile_grain` instead -- so off x86 this is unit-test-only whether or
+/// not MLAS is on. Narrower than the predicate on the two symbols above for
+/// exactly that reason: widening it to their union would leave the lint live on
+/// `aarch64 + mlas`, where this function has no caller.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn prefill_column_grain(m: usize, k: usize, n: usize) -> usize {
+    let macs_per_column = m.saturating_mul(k);
+    if macs_per_column == 0 {
+        return n.max(1);
+    }
+    MIN_PREFILL_TASK_MACS
+        .div_ceil(macs_per_column)
+        .clamp(1, n.max(1))
+}
 
 /// Tiles per task for a prefill fan-out of `tiles` tiles over an `m x n` output
 /// with depth `k`, so that no task is handed less than
@@ -781,9 +934,13 @@ thread_local! {
 #[cfg(feature = "mlas")]
 #[inline]
 fn with_mlas_packed_caches<R>(f: impl FnOnce(&MlasPackedCaches) -> R) -> R {
+    // Exactly one of these blocks survives cfg-stripping, so whichever it is
+    // becomes the tail expression. An early `return` in the first reads more
+    // obviously but trips `needless_return`, which reaches the `-D warnings`
+    // lane whenever the research `mlas` feature is on.
     #[cfg(test)]
     {
-        return MLAS_PACKED_TEST_LOCAL.with(|caches| f(caches));
+        MLAS_PACKED_TEST_LOCAL.with(|caches| f(caches))
     }
     #[cfg(not(test))]
     {
@@ -910,6 +1067,10 @@ static BORROWED_INT4_ASYMMETRIC_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// [`x86_sgemm::Int8Weight`].
 #[cfg(all(test, target_arch = "x86_64"))]
 static INT8_PREFILL_GEBP_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Counts entries into [`with_decode_pool_lazy`], so a test can assert *which*
+/// shapes defer building the decode pool and which still install it eagerly.
+#[cfg(test)]
+static DEFERRED_DECODE_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// Standard ONNX row-major packed NBits weight with affine block metadata.
 ///
 /// This preserves the wire layout instead of expanding it to f32. Direct
@@ -1347,7 +1508,14 @@ impl Kernel for MatMulNBitsKernel {
                     write_compute_f32(&mut outputs[0], result)
                 };
             }
-            with_decode_pool(|| {
+            // `m == 1` is what makes the deferral provable rather than hopeful.
+            // Every kernel reachable from this closure at `m == 1`
+            // (`borrowed_affine_int4_matmul_nblock`, `borrowed_affine_int4_matmul`)
+            // parallelises solely through `parallel_output_rows_repeated`, which
+            // installs the pool on demand. The one branch that drives Rayon
+            // directly, `borrowed_affine_int4_matmul_prefill`, is gated on
+            // `m >= 2` and so is unreachable here by construction.
+            let run_borrowed_int4 = || {
                 #[cfg(target_arch = "x86_64")]
                 if borrowed_int4_prefill_block_enabled()
                     && m >= 2
@@ -1401,7 +1569,12 @@ impl Kernel for MatMulNBitsKernel {
                     self.block_size,
                     dot_kernel,
                 );
-            })?;
+            };
+            if m == 1 {
+                with_decode_pool_lazy(run_borrowed_int4)
+            } else {
+                with_decode_pool(run_borrowed_int4)
+            }?;
             return if direct_result {
                 Ok(())
             } else {
@@ -1449,7 +1622,7 @@ impl Kernel for MatMulNBitsKernel {
                 &owned_weight
             };
             if m == 1 {
-                with_decode_pool(|| {
+                with_decode_pool_lazy(|| {
                     packed_nbits_gemv(
                         &activations,
                         packed_weight,
@@ -1823,7 +1996,7 @@ impl Kernel for MatMulNBitsKernel {
                 owned_weight = numa_place_nk(built, self.n);
                 &owned_weight
             };
-            with_decode_pool(|| {
+            with_decode_pool_lazy(|| {
                 gemv_nk(&activations, weight_nk, result, self.k, self.n);
             })?;
         } else {
@@ -1834,14 +2007,16 @@ impl Kernel for MatMulNBitsKernel {
             // strided-scatter transpose (each K step writes at stride N), which
             // thrashes cache and dominated prefill wall time (~95% of the
             // MatMulNBits cost, measured ~45 ms/node on Qwen3-0.6B). Instead,
-            // on the MLAS backend dequantize once into the natural, contiguous
-            // `Nk` layout -- cached in the same `weight_nk` slot the m==1
-            // generic path uses, so constant weights pay the dequant once -- and
-            // let MLAS's cache-tiled `sgemm` consume it transposed (`trans_b`,
-            // `ldb = k`). MLAS then streams each weight row once and reuses it
-            // across all m activation rows, the amortization a per-row GEMV
-            // lacks. Non-MLAS hosts keep the previous direct-`Kn` dense path.
-            let used_fast_nt = self.try_prefill_mlas_nt(
+            // dequantize once into the natural, contiguous `Nk` layout -- cached
+            // in the same `weight_nk` slot the m==1 generic path uses, so
+            // constant weights pay the dequant once -- and let a transposed-B
+            // ("NT") dense GEMM consume it directly (`B_nk[n, k]^T`). The GEMM
+            // then streams each weight row once and reuses it across all m
+            // activation rows, the amortization a per-row GEMV lacks. Available
+            // on every backend with an NT GEMM: MLAS (`trans_b`) and, on the
+            // default build, the native `SimdX86` NT packer (#959, #1091).
+            // Backends without one keep the previous direct-`Kn` dense path.
+            let used_fast_nt = self.try_prefill_nk_nt(
                 &inputs[1],
                 &inputs[2],
                 zero_points,
@@ -2325,16 +2500,24 @@ impl MatMulNBitsKernel {
 
     /// Prefill / batched (`m > 1`) fast path for the dense-dequantize fallback:
     /// dequantize the constant weight once into the natural, contiguous `Nk`
-    /// (`[n, k]`) layout, cache it, and run MLAS's cache-tiled `sgemm` with
-    /// `trans_b` so each weight row is streamed once and reused across all `m`
-    /// activation rows. Returns `Ok(true)` when it handled the GEMM, `Ok(false)`
-    /// when the host GEMM backend is not MLAS (the caller then uses the previous
-    /// direct-`Kn` dense path). Bit-identical to a no-transpose dense GEMM: MLAS
-    /// with `trans_b` computes `C = A * B_nk^T` where `B_nk[n, k]` is the same
-    /// weight the `Kn` path stores transposed.
-    #[cfg(feature = "mlas")]
+    /// (`[n, k]`) layout, cache it in the same `weight_nk` slot the `m == 1`
+    /// decode path uses, and run a **transposed-B ("NT") dense GEMM** so each
+    /// weight row is streamed once and reused across all `m` activation rows.
+    /// Returns `Ok(true)` when it handled the GEMM, `Ok(false)` when the host
+    /// GEMM backend has no NT variant (the caller then uses the previous
+    /// direct-`Kn` dense path).
+    ///
+    /// This replaces the strided-scatter `Kn` dequant (each K step writing at
+    /// stride N) that dominated large-model time-to-first-token (#959, #1091).
+    /// It is available on every backend with an NT GEMM — MLAS's cache-tiled
+    /// `sgemm` with `trans_b`, and, now, the native `SimdX86` packer that reads
+    /// `B_nk` row-wise into an L1-resident pack tile (the same idea, ported off
+    /// MLAS). [`super::matmul::nt_gemm_supported`] is the single legality
+    /// predicate; [`super::matmul::gemm_nt_with_backend`] is proven
+    /// bit-identical to the `Kn` dense route for the same inputs, because
+    /// `B_nk[n, k]` is exactly the weight the `Kn` path stores transposed.
     #[allow(clippy::too_many_arguments)]
-    fn try_prefill_mlas_nt(
+    fn try_prefill_nk_nt(
         &self,
         packed: &TensorView,
         scales: &TensorView,
@@ -2347,7 +2530,8 @@ impl MatMulNBitsKernel {
     ) -> Result<bool> {
         use crate::backend::CpuBackend;
 
-        if CpuBackend::auto_detect() != CpuBackend::Mlas {
+        let backend = CpuBackend::auto_detect();
+        if !super::matmul::nt_gemm_supported(backend) {
             return Ok(false);
         }
 
@@ -2356,13 +2540,16 @@ impl MatMulNBitsKernel {
             if let Some(weight) = self.weight_nk.get() {
                 weight
             } else {
-                let weight = self.dequantize_weight(
-                    packed,
-                    scales,
-                    zero_points,
-                    group_indices,
-                    WeightLayout::Nk,
-                )?;
+                let weight =
+                    mm_profile::time_prepack("dequant-nk", self.nbits_weight_bytes(), || {
+                        self.dequantize_weight(
+                            packed,
+                            scales,
+                            zero_points,
+                            group_indices,
+                            WeightLayout::Nk,
+                        )
+                    })?;
                 let weight = numa_place_nk(weight, self.n);
                 let _ = self.weight_nk.set(weight);
                 self.weight_nk
@@ -2370,55 +2557,30 @@ impl MatMulNBitsKernel {
                     .expect("constant MatMulNBits Nk prepack was just initialized")
             }
         } else {
-            let built = self.dequantize_weight(
-                packed,
-                scales,
-                zero_points,
-                group_indices,
-                WeightLayout::Nk,
-            )?;
+            let built = mm_profile::time_prepack("dequant-nk", self.nbits_weight_bytes(), || {
+                self.dequantize_weight(packed, scales, zero_points, group_indices, WeightLayout::Nk)
+            })?;
             owned_weight = numa_place_nk(built, self.n);
             &owned_weight
         };
 
-        // C[m, n] = A[m, k] * B_nk[n, k]^T. `trans_b` with `ldb = k` reads the
-        // Nk weight as the transposed operand without materializing a Kn copy.
+        // C[m, n] = A[m, k] * B_nk[n, k]^T -- reads the Nk weight as the
+        // transposed operand without materializing a Kn copy. Bit-identical to
+        // the direct-`Kn` dense GEMM the caller would otherwise run. Timed on
+        // the same `gemv` phase the `Kn` route reports, so a profile taken
+        // across the two routes compares like with like.
         mm_profile::time_gemv(|| {
-            mlas_sys::sgemm(
-                false,
-                true,
-                m,
-                self.n,
-                self.k,
-                1.0,
+            super::matmul::gemm_nt_with_backend(
+                backend,
                 activations,
-                self.k,
                 weight_nk,
-                self.k,
-                0.0,
                 result,
+                m,
+                self.k,
                 self.n,
-            );
-        });
+            )
+        })?;
         Ok(true)
-    }
-
-    /// Non-MLAS builds have no cache-tiled dense GEMM here, so the batched
-    /// fallback always uses the direct-`Kn` dense path.
-    #[cfg(not(feature = "mlas"))]
-    #[allow(clippy::too_many_arguments)]
-    fn try_prefill_mlas_nt(
-        &self,
-        _packed: &TensorView,
-        _scales: &TensorView,
-        _zero_points: Option<&TensorView>,
-        _group_indices: Option<&TensorView>,
-        _can_prepack: bool,
-        _activations: &[f32],
-        _m: usize,
-        _result: &mut [f32],
-    ) -> Result<bool> {
-        Ok(false)
     }
 
     /// Run a pre-partitioned MLAS SQNBit GEMV (`self.n` split into contiguous
@@ -4107,6 +4269,97 @@ fn report_decode_affinity_failure(message: &str) {
     }
 }
 
+/// Run an M=1 decode kernel *without* installing the decode pool up front.
+///
+/// [`with_decode_pool`] pays a Rayon `install` per call: the pool's workers are
+/// woken, one runs the kernel, and the rest find nothing to do and go back to
+/// sleep. When the flat fan-out inside then routes to the task runtime -- which
+/// is the whole point of [`flat_fan_out`] -- not one of those workers performs
+/// any model work. Measured on `gemm_nbits_llama3_8b_mlp_t1` at a 16-core
+/// budget, that crossing costs a fixed ~1.8 ms of CPU per forward (~9.5% of
+/// process CPU) and it is *per dispatch*, not idle spin: holding the iteration
+/// count fixed and stretching the inter-token gap from 100 us to 4000 us grew
+/// wall 2.9x while the pool's CPU stayed flat (360 ms -> 350 ms).
+///
+/// So the install is deferred to the one place that genuinely needs a Rayon
+/// pool -- the `PrefillFanOut::Wide` arm of [`parallel_output_rows_repeated`] --
+/// and a model whose fan-outs all route to the task runtime never builds the
+/// decode pool at all.
+///
+/// # Invariant
+///
+/// Only call this around a kernel whose *sole* parallelism is
+/// [`parallel_output_rows`]. A kernel that reaches Rayon by any other route
+/// (`packed_nbits_gemm`, `borrowed_affine_int4_matmul_prefill`, `int8_matmul`
+/// and `kai_sdot_matmul_m1` all call `par_chunks_mut` directly) would silently
+/// run that work on the global pool instead of the bounded, pinned decode pool.
+/// `packed_nbits_gemv`, `gemv_nk` and the `m == 1` half of the borrowed int4
+/// path were audited against this; every other call site keeps
+/// [`with_decode_pool`].
+///
+/// Routing is unchanged: while deferred, [`deferred_decode_width`] reports the
+/// width the pool *would* have had, which is exactly what
+/// `rayon::current_num_threads()` returned inside the installation.
+fn with_decode_pool_lazy<T: Send>(operation: impl FnOnce() -> T + Send) -> Result<T> {
+    #[cfg(test)]
+    DEFERRED_DECODE_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+    // Already resident inside a real installation: identical to `with_decode_pool`.
+    if IN_DECODE_POOL.with(Cell::get) {
+        return Ok(operation());
+    }
+    // A construction failure already observed must keep failing the forward
+    // rather than silently degrading to the global pool.
+    if let Some(Err(message)) = DECODE_POOL.get() {
+        return Err(error(message.clone()));
+    }
+    let Some(width) = configured_decode_threads() else {
+        // No bounded decode pool configured; `with_decode_pool` would run the
+        // operation inline on the global pool, so do exactly that.
+        return Ok(operation());
+    };
+    let _guard = DeferredDecodeGuard::enter(width.max(1));
+    Ok(operation())
+}
+
+/// Width the decode pool *would* have had on a thread that deferred installing
+/// it, or `None` when no deferral is in effect.
+fn deferred_decode_width() -> Option<usize> {
+    let width = DEFERRED_DECODE_WIDTH.with(Cell::get);
+    (width > 0).then_some(width)
+}
+
+/// The pool width a fan-out should partition for.
+///
+/// Normally the installed pool's width. While a decode-pool install is deferred
+/// this is the width that pool *would* have had, so both the executor choice
+/// ([`flat_fan_out`]) and the grain ([`output_chunk_len`]) match the installed
+/// case exactly rather than reflecting whichever ambient pool happens to be
+/// current.
+fn effective_fan_out_width() -> usize {
+    deferred_decode_width()
+        .unwrap_or_else(rayon::current_num_threads)
+        .max(1)
+}
+
+/// Build and install the deferred decode pool around the one fan-out that needs
+/// it.
+///
+/// Falls back to the current pool when the decode pool is opted out or fails to
+/// build: `parallel_output_rows_repeated` returns `()` and cannot surface an
+/// error, and running the fan-out on the global pool is the same degradation
+/// [`with_decode_pool_scope`] already documents for its `Err(_)` arm.
+fn install_deferred_decode_pool(fan_out: impl FnOnce() + Send) {
+    match DECODE_POOL.get_or_init(|| build_decode_pool(configured_decode_threads())) {
+        Ok(Some(pool)) => pool.install(|| {
+            // Genuinely resident now, so a nested fan-out must read the
+            // installed width rather than the deferred hint.
+            let _guard = DeferredDecodeGuard::enter(0);
+            fan_out();
+        }),
+        _ => fan_out(),
+    }
+}
+
 fn with_decode_pool<T: Send>(operation: impl FnOnce() -> T + Send) -> Result<T> {
     // If we are already resident inside a `with_decode_pool_scope` installation
     // on this worker thread, run inline: the enclosing `pool.install(...)` already
@@ -4145,6 +4398,12 @@ thread_local! {
     /// output rows out across the persistent worker set instead of a per-op
     /// Rayon region.
     static IN_SPMD_SCOPE: Cell<bool> = const { Cell::new(false) };
+
+    /// Width the decode pool *would* have had on a thread that deliberately
+    /// skipped installing it (see [`with_decode_pool_lazy`]). Zero means no
+    /// deferral is in effect. Read by [`parallel_output_rows_repeated`] so the
+    /// fan-out routing decision is identical to the installed case.
+    static DEFERRED_DECODE_WIDTH: Cell<usize> = const { Cell::new(0) };
 }
 
 /// The lazily built `numa-split` decode layout, or `None` when the mode is not
@@ -4202,7 +4461,23 @@ static SPMD_TEST_DISPATCHES: std::sync::atomic::AtomicUsize =
 /// `output_start .. output_start + outputs.len()`, so the math is identical
 /// regardless of how the rows are partitioned (row-sharding a GEMV is exactly
 /// associative -- no cross-row reduction -- so results are bit-identical).
+///
+/// Treats this call as the operator's only fan-out. A kernel that issues one
+/// per activation row must call [`parallel_output_rows_repeated`] instead, so
+/// the executor choice can see how many of them are coming.
 fn parallel_output_rows<F>(result: &mut [f32], k: usize, compute: F)
+where
+    F: Fn(usize, &mut [f32]) + Sync,
+{
+    parallel_output_rows_repeated(result, k, 1, compute);
+}
+
+/// [`parallel_output_rows`] for a kernel that issues `calls` of them
+/// back-to-back, one per activation row.
+///
+/// `calls` is not bookkeeping -- it is half of the executor choice. See
+/// [`flat_fan_out`].
+fn parallel_output_rows_repeated<F>(result: &mut [f32], k: usize, calls: usize, compute: F)
 where
     F: Fn(usize, &mut [f32]) + Sync,
 {
@@ -4217,14 +4492,52 @@ where
         return;
     }
     let chunk = output_chunk_len(result.len(), k);
-    if chunk < result.len() {
-        result
-            .par_chunks_mut(chunk)
-            .enumerate()
-            .for_each(|(chunk_index, outputs)| compute(chunk_index * chunk, outputs));
-    } else {
+    if chunk >= result.len() {
         compute(0, result);
+        return;
     }
+    // The flat fan-out. Historically a bare `par_chunks_mut` on whichever Rayon
+    // pool happened to be installed, which is the §26 disease: a decode-shaped
+    // projection is a few tens of microseconds of work, and a parked Rayon
+    // worker takes 67-226 us to reach it. The task runtime dispatches to a
+    // resident worker in ~5 us, hands the fan-out to ORT's pool when we are
+    // inside a plugin compute call instead of fighting it for cores, and caps
+    // its width at the physical cores rather than every SMT sibling.
+    // While a decode-pool install is deferred (see `with_decode_pool_lazy`) the
+    // width the pool *would* have had is what the installed case reported here,
+    // so routing is bit-identical either way.
+    let wide = effective_fan_out_width();
+    let fan_out_macs = result.len().saturating_mul(k);
+    let lanes = || crate::task_runtime::width().max(1);
+    if flat_fan_out(fan_out_macs, calls, lanes, wide) == PrefillFanOut::Wide {
+        let mut fan_out = || {
+            result
+                .par_chunks_mut(chunk)
+                .enumerate()
+                .for_each(|(chunk_index, outputs)| compute(chunk_index * chunk, outputs));
+        };
+        // This is the only work in a deferred kernel that actually needs a
+        // Rayon pool, so this is where the decode pool gets built.
+        if deferred_decode_width().is_some() {
+            install_deferred_decode_pool(fan_out);
+        } else {
+            fan_out();
+        }
+        return;
+    }
+    // `chunk` is passed through unchanged as the *minimum* grain, so the
+    // partition can only get coarser, never finer, than the one Rayon used.
+    let total = result.len();
+    let base = result.as_mut_ptr() as usize;
+    crate::task_runtime::for_each_range(total, chunk, |start, end| {
+        // SAFETY: `for_each_range` covers `0..total` with disjoint half-open
+        // ranges and blocks until every one has been run exactly once, so this
+        // task is the only holder of `result[start..end]`. A raw pointer is
+        // needed because the runtime partitions an index space, not a slice.
+        let outputs =
+            unsafe { std::slice::from_raw_parts_mut((base as *mut f32).add(start), end - start) };
+        compute(start, outputs);
+    });
 }
 
 /// Fan `num_rows` fixed-width output rows (each `row_len` elements of `result`)
@@ -4501,6 +4814,27 @@ impl Drop for SpmdScopeGuard {
 /// RAII guard that marks the current thread as resident inside the decode pool
 /// and restores the previous state on drop -- including during panic unwinding,
 /// so a panicking forward pass cannot leak a stale `true` onto a pooled worker.
+/// RAII guard that records the width of a *deferred* decode-pool installation
+/// on the current thread and restores the previous value on drop, including
+/// during panic unwinding so a panicking kernel cannot leak a stale width.
+struct DeferredDecodeGuard {
+    previous: usize,
+}
+
+impl DeferredDecodeGuard {
+    fn enter(width: usize) -> Self {
+        let previous = DEFERRED_DECODE_WIDTH.with(|width_cell| width_cell.replace(width));
+        Self { previous }
+    }
+}
+
+impl Drop for DeferredDecodeGuard {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        DEFERRED_DECODE_WIDTH.with(|width_cell| width_cell.set(previous));
+    }
+}
+
 struct DecodeResidencyGuard {
     previous: bool,
 }
@@ -6597,7 +6931,7 @@ fn borrowed_affine_int4_matmul_nblock(
                 group_start += group;
             }
         };
-        parallel_output_rows(output_row, k, compute);
+        parallel_output_rows_repeated(output_row, k, m, compute);
     }
 }
 
@@ -6946,23 +7280,17 @@ fn borrowed_affine_int4_matmul_prefill(
         }
     }
 
-    // Parallelise over disjoint column strips (mirrors the column-strip GEMM in
+    // Parallelise over disjoint column ranges (mirrors the column-strip GEMM in
     // `accelerate_gemm`) with a single fork-join for the whole prefill, instead
     // of the row-serial path's `m` per-row fork-joins.
-    let threads = rayon::current_num_threads().max(1);
-    let strip = n.div_ceil(threads).max(1);
-    let num_strips = n.div_ceil(strip);
-    // SAFETY (raw pointer send): strip `t` writes only `result[i * n + j]` for
-    // `j` in `[j0, j0 + jn)` and `i` in `0..m`; disjoint column ranges never
-    // overlap. `par_chunks_mut` cannot partition a row-major matrix by columns,
-    // hence the raw pointer, exactly as in `accelerate_gemm`'s column strips.
+    //
+    // SAFETY (raw pointer send): a task writes only `result[i * n + j]` for `j`
+    // in its own half-open column range and `i` in `0..m`; disjoint column
+    // ranges never overlap. `par_chunks_mut` cannot partition a row-major
+    // matrix by columns, hence the raw pointer, exactly as in
+    // `accelerate_gemm`'s column strips.
     let result_ptr = result.as_mut_ptr() as usize;
-    let run_strip = |t: usize| {
-        let j0 = t * strip;
-        if j0 >= n {
-            return;
-        }
-        let jn = strip.min(n - j0);
+    let run_columns = |j0: usize, j1: usize| {
         let result_base = result_ptr as *mut f32;
         // Rows outer-most: this keeps the per-element k-reduction order and the
         // weight-traffic profile identical to the row-serial path; only the
@@ -6970,7 +7298,7 @@ fn borrowed_affine_int4_matmul_prefill(
         for i in 0..m {
             let activation = &activations[i * k..(i + 1) * k];
             let sums = &activation_sums[i * block_count..(i + 1) * block_count];
-            for j in j0..j0 + jn {
+            for j in j0..j1 {
                 let packed_row = &packed[j * packed_row_size..(j + 1) * packed_row_size];
                 let zp_row = zero_points
                     .map(|zp| &zp[j * zero_point_row_size..(j + 1) * zero_point_row_size]);
@@ -6990,19 +7318,32 @@ fn borrowed_affine_int4_matmul_prefill(
                     dot_kernel,
                 );
                 // SAFETY: `i < m` and `j < n`, so `i * n + j < m * n ==
-                // result.len()`; this strip owns column `j` exclusively.
+                // result.len()`; this task owns column `j` exclusively.
                 unsafe {
                     *result_base.add(i * n + j) = value;
                 }
             }
         }
     };
-    if num_strips <= 1 || threads <= 1 {
-        for t in 0..num_strips {
-            run_strip(t);
-        }
+
+    let wide = rayon::current_num_threads().max(1);
+    let lanes = crate::task_runtime::width().max(1);
+    let macs = m.saturating_mul(n).saturating_mul(k);
+    if prefill_fan_out(macs, lanes, wide) == PrefillFanOut::TaskRuntime {
+        crate::task_runtime::for_each_range(n, prefill_column_grain(m, k, n), run_columns);
+        return;
+    }
+    let strip = n.div_ceil(wide).max(1);
+    let num_strips = n.div_ceil(strip);
+    if num_strips <= 1 || wide <= 1 {
+        run_columns(0, n);
     } else {
-        (0..num_strips).into_par_iter().for_each(run_strip);
+        (0..num_strips).into_par_iter().for_each(|t| {
+            let j0 = t * strip;
+            if j0 < n {
+                run_columns(j0, (j0 + strip).min(n));
+            }
+        });
     }
 }
 
@@ -7073,7 +7414,7 @@ fn borrowed_affine_int4_matmul(
                 );
             }
         };
-        parallel_output_rows(output_row, k, compute);
+        parallel_output_rows_repeated(output_row, k, m, compute);
     }
 }
 
@@ -8890,7 +9231,7 @@ const MIN_OUTPUTS_PER_TASK: usize = 16;
 const MANY_THREAD_CUTOFF: usize = 48;
 
 pub(crate) fn output_chunk_len(n: usize, k: usize) -> usize {
-    let threads = rayon::current_num_threads();
+    let threads = effective_fan_out_width();
     let total_work = n.saturating_mul(k);
     // Small projections amortize Rayon well on one socket, but dispatching each
     // one across a larger pool costs more than its GEMV on the dual-socket host.
@@ -9891,6 +10232,102 @@ mod tests {
                         b.to_bits(),
                         "m={m} k={k} n={n} block={block_size} asym={asymmetric} \
                          index {index}: per-column {a} vs prefill {b} not bit-identical"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The column fan-out must be *byte-identical* to the same kernel run
+    /// serially. This is the property a scheduling change has to hold: every
+    /// output element is one `borrowed_int4_output_element` reduction over a
+    /// column that exactly one task owns, so which task runs it, and on which
+    /// pool, cannot change a bit.
+    ///
+    /// Uses a shape wide enough that the task runtime actually splits it —
+    /// `prefill_matches_per_column_borrowed_path_bit_identical` above covers
+    /// correctness, but its `n <= 16` cells fall under the grain floor and run
+    /// serially, so they never exercise the partition.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn prefill_column_fan_out_matches_its_serial_self() {
+        if matches!(selected_dot_kernel(), DotKernel::Scalar) {
+            return;
+        }
+        let mut rng: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng >> 40) as f32 / (1u32 << 24) as f32) - 0.5
+        };
+        // 8 x 1024 x 3072 is `gemm_nbits_qwen3_0p6b_qkv_t8`, the cell this
+        // fan-out exists for. 3 x 512 x 1031 is a deliberately ragged partition:
+        // 1031 columns over a 342-column grain is three uneven tasks, so the
+        // remainder distribution is exercised too. Both split -- a shape that
+        // falls under the grain floor would make the counter assertion below
+        // vacuous.
+        for &(m, k, n, block_size) in &[(8usize, 1024usize, 3072usize, 32usize), (3, 512, 1031, 32)]
+        {
+            for &asymmetric in &[false, true] {
+                let weights_nk: Vec<f32> = (0..n * k).map(|_| next()).collect();
+                let activations: Vec<f32> = (0..m * k).map(|_| next()).collect();
+                let (packed, scales, zps, _dequant) =
+                    quantize(&weights_nk, n, k, block_size, asymmetric);
+                let zp_slice = zps.as_deref();
+                let bias: Vec<f32> = (0..n).map(|_| next()).collect();
+
+                let mut serial = vec![0.0f32; m * n];
+                {
+                    let _guard = crate::task_runtime::testing::force_serial();
+                    borrowed_affine_int4_matmul_prefill(
+                        &activations,
+                        &packed,
+                        BorrowedScales::F32(&scales),
+                        zp_slice,
+                        Some(&bias),
+                        &mut serial,
+                        m,
+                        k,
+                        n,
+                        block_size,
+                        selected_dot_kernel(),
+                    );
+                }
+
+                let mut parallel = vec![0.0f32; m * n];
+                let before = crate::task_runtime::testing::counters();
+                borrowed_affine_int4_matmul_prefill(
+                    &activations,
+                    &packed,
+                    BorrowedScales::F32(&scales),
+                    zp_slice,
+                    Some(&bias),
+                    &mut parallel,
+                    m,
+                    k,
+                    n,
+                    block_size,
+                    selected_dot_kernel(),
+                );
+                let after = crate::task_runtime::testing::counters();
+                // Without this the test would still pass on a machine where the
+                // fan-out silently ran serially, which is exactly the failure it
+                // is supposed to catch.
+                if crate::task_runtime::width() > 1 {
+                    assert!(
+                        after.tasks > before.tasks,
+                        "m={m} k={k} n={n}: the fan-out ran no tasks, so this \
+                         test compared serial against serial"
+                    );
+                }
+
+                for (index, (a, b)) in serial.iter().zip(parallel.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "m={m} k={k} n={n} asym={asymmetric} index {index}: \
+                         serial {a} vs fanned-out {b} not bit-identical"
                     );
                 }
             }
@@ -14777,6 +15214,65 @@ mod tests {
         );
     }
 
+    /// The decode-pool deferral is gated on `m == 1`, and that gate is what
+    /// makes it provable rather than hopeful.
+    ///
+    /// At `m == 1` every kernel reachable from the borrowed int4 closure
+    /// (`borrowed_affine_int4_matmul_nblock`, `borrowed_affine_int4_matmul`)
+    /// parallelises solely through `parallel_output_rows_repeated`, which
+    /// installs the pool on demand. At `m >= 2` the closure can reach
+    /// `borrowed_affine_int4_matmul_prefill`, which drives `par_chunks_mut`
+    /// directly and would silently land on the *global* pool instead of the
+    /// bounded, pinned decode pool. So prefill must keep installing eagerly.
+    #[test]
+    fn only_the_decode_shaped_borrowed_int4_path_defers_the_pool() {
+        // Reads a process-global counter delta, so it must not be handed
+        // another test's dispatch.
+        let _probe = lock_dispatch_probe();
+        let (n, k, block_size) = (64usize, 128usize, 32usize);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+        let blocks = k / block_size;
+
+        for m in [1usize, 4usize] {
+            let a_values: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
+                .collect();
+            let mut kernel = test_kernel(k, n, block_size);
+            kernel.set_constant_inputs(&[false, false, true]);
+            let a = Owned::f32(&[m, k], &a_values);
+            let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+            let scale_view = Owned::f32(&[n, blocks], &scales);
+            let mut y = Owned::zeros_f32(&[m, n]);
+
+            let deferred_before = DEFERRED_DECODE_TEST_CALLS.load(Ordering::Relaxed);
+            kernel
+                .execute(
+                    &[a.view(), b.view(), scale_view.view()],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+            let deferred = DEFERRED_DECODE_TEST_CALLS.load(Ordering::Relaxed) - deferred_before;
+
+            assert_close(&y.to_f32(), &reference(&a_values, &dequantized, m, k, n));
+            if m == 1 {
+                assert_eq!(
+                    deferred, 1,
+                    "decode-shaped borrowed int4 must defer building the decode pool"
+                );
+            } else {
+                assert_eq!(
+                    deferred, 0,
+                    "prefill can reach a kernel that drives Rayon directly, so it must \
+                     keep installing the decode pool eagerly"
+                );
+            }
+        }
+    }
+
     /// `accuracy_level = 0` means fp32 compute, on every architecture.
     ///
     /// Regression guard for the aarch64 dispatch bug: with `dotprod` present,
@@ -17777,5 +18273,450 @@ mod tests {
     fn prefill_tile_grain_survives_a_zero_sized_problem() {
         assert_eq!(prefill_tile_grain(0, 3072, 1024, 8), 8);
         assert_eq!(prefill_tile_grain(8, 0, 1024, 8), 8);
+    }
+
+    /// The native fan-out's grain is a floor in *output columns*, so it must
+    /// never exceed the column count nor drop below one.
+    #[test]
+    fn prefill_column_grain_stays_within_the_column_count() {
+        for &(m, k, n) in &[
+            (1usize, 1usize, 1usize),
+            (8, 1024, 3072),
+            (1, 16, 7),
+            (512, 4096, 14336),
+        ] {
+            let grain = prefill_column_grain(m, k, n);
+            assert!(grain >= 1, "grain {grain} for m={m} k={k} n={n}");
+            assert!(grain <= n, "grain {grain} exceeds n={n}");
+        }
+    }
+
+    /// A column that already carries enough arithmetic is handed out one per
+    /// task; thinner columns get batched until they clear the floor.
+    #[test]
+    fn prefill_column_grain_batches_only_undersized_columns() {
+        // 8 x 1024 = 8 Ki MACs a column, so batch 64 of them to clear 512 Ki.
+        assert_eq!(prefill_column_grain(8, 1024, 3072), 64);
+        // 512 x 4096 = 2 Mi MACs a column, already four times the floor.
+        assert_eq!(prefill_column_grain(512, 4096, 14336), 1);
+        // Never wider than the problem.
+        assert_eq!(prefill_column_grain(1, 1, 8), 8);
+    }
+
+    /// A degenerate shape must not divide by zero or ask for a zero grain.
+    #[test]
+    fn prefill_column_grain_survives_a_zero_sized_problem() {
+        assert_eq!(prefill_column_grain(0, 1024, 8), 8);
+        assert_eq!(prefill_column_grain(8, 0, 8), 8);
+        assert_eq!(prefill_column_grain(0, 0, 0), 1);
+    }
+
+    /// The flat fan-out hands each task a raw sub-slice and an `output_start`
+    /// that must name the first element of *that* slice: every projection kernel
+    /// indexes the weight by `output_start + offset`, so a partition that
+    /// overlaps, leaves a gap, or misreports its origin computes the wrong
+    /// column and no parity test above would say which.
+    #[test]
+    fn parallel_output_rows_covers_every_output_exactly_once() {
+        use std::sync::atomic::AtomicU32;
+        for &(n, k) in &[
+            (1usize, 1usize),
+            (3072, 1024),
+            (1031, 512),
+            (17, 1 << 16),
+            (6144, 4096),
+        ] {
+            let writes: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+            let mut result = vec![f32::NAN; n];
+            parallel_output_rows(&mut result, k, |start, outputs| {
+                for (offset, output) in outputs.iter_mut().enumerate() {
+                    writes[start + offset].fetch_add(1, Ordering::Relaxed);
+                    *output = (start + offset) as f32;
+                }
+            });
+            for index in 0..n {
+                assert_eq!(
+                    writes[index].load(Ordering::Relaxed),
+                    1,
+                    "n={n} k={k}: output {index} was written \
+                     {} times, not once",
+                    writes[index].load(Ordering::Relaxed)
+                );
+                assert_eq!(
+                    result[index], index as f32,
+                    "n={n} k={k}: output {index} carries the wrong output_start"
+                );
+            }
+        }
+    }
+
+    /// The deferred-width hint must nest and unwind exactly like the residency
+    /// flag it parallels: a leaked width would misroute every later fan-out on
+    /// this thread.
+    #[test]
+    fn deferred_decode_width_nests_and_restores_on_panic() {
+        assert_eq!(deferred_decode_width(), None, "width leaked into the test");
+        {
+            let _outer = DeferredDecodeGuard::enter(16);
+            assert_eq!(deferred_decode_width(), Some(16));
+            {
+                // `install_deferred_decode_pool` clears the hint once it is
+                // genuinely resident, which must not clobber the outer value.
+                let _inner = DeferredDecodeGuard::enter(0);
+                assert_eq!(deferred_decode_width(), None);
+            }
+            assert_eq!(deferred_decode_width(), Some(16));
+
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _panicking = DeferredDecodeGuard::enter(4);
+                assert_eq!(deferred_decode_width(), Some(4));
+                panic!("kernel blew up mid-fan-out");
+            }));
+            assert!(unwound.is_err(), "the test panic did not propagate");
+            assert_eq!(
+                deferred_decode_width(),
+                Some(16),
+                "a panicking kernel leaked a stale deferred width"
+            );
+        }
+        assert_eq!(deferred_decode_width(), None);
+    }
+
+    /// Deferring the install must not move the routing decision. A deferred
+    /// width of `MIN_ROUTED_FAN_OUT_WIDTH` with `calls == 1` is the decode case,
+    /// and it has to reach the task runtime on any host -- the hint is read
+    /// instead of `rayon::current_num_threads()`, so this holds at every Rayon
+    /// width rather than only on a wide machine.
+    #[test]
+    fn a_deferred_decode_kernel_still_dispatches_to_the_task_runtime() {
+        if crate::task_runtime::width() <= 1 {
+            return;
+        }
+        let (n, k) = (6144usize, 4096usize);
+        assert!(
+            output_chunk_len(n, k) < n,
+            "the partition policy declined to split {n}x{k}"
+        );
+        let mut result = vec![0.0f32; n];
+        let before = crate::task_runtime::testing::counters();
+        {
+            let _deferred = DeferredDecodeGuard::enter(MIN_ROUTED_FAN_OUT_WIDTH);
+            parallel_output_rows(&mut result, k, |start, outputs| {
+                for (offset, output) in outputs.iter_mut().enumerate() {
+                    *output = (start + offset) as f32;
+                }
+            });
+        }
+        let after = crate::task_runtime::testing::counters();
+        assert!(
+            after.dispatches > before.dispatches,
+            "a deferred fan-out did not reach the task runtime"
+        );
+        for (index, value) in result.iter().enumerate() {
+            assert_eq!(
+                *value, index as f32,
+                "row {index} was not written exactly once"
+            );
+        }
+    }
+
+    /// Deferring must reproduce the *grain* the installed pool would have used,
+    /// not just the executor choice.
+    ///
+    /// `output_chunk_len` reads the current pool width directly, so if it were
+    /// left on `rayon::current_num_threads()` a deferred fan-out would
+    /// partition for whichever ambient pool happened to be current -- a
+    /// different chunk size, and at the boundary a serial-vs-parallel flip,
+    /// whenever the global pool is wider than the decode pool (no explicit
+    /// budget). Results would still be correct, because row sharding is
+    /// associative, but "routing is unchanged" would not be true.
+    #[test]
+    fn a_deferred_fan_out_partitions_for_the_pool_it_would_have_installed() {
+        let (n, k) = (4096usize, 1024usize);
+
+        let one_wide = {
+            let _guard = DeferredDecodeGuard::enter(1);
+            output_chunk_len(n, k)
+        };
+        assert_eq!(
+            one_wide, n,
+            "a deferred one-wide pool must not split the output at all"
+        );
+
+        // The hint must not outlive the guard.
+        assert_eq!(
+            output_chunk_len(n, k),
+            {
+                let _guard = DeferredDecodeGuard::enter(rayon::current_num_threads().max(1));
+                output_chunk_len(n, k)
+            },
+            "with the hint equal to the ambient width the grain must be unchanged"
+        );
+        assert_eq!(deferred_decode_width(), None);
+    }
+
+    /// The fallback half: work that genuinely routes to Rayon must still run,
+    /// and correctly, with the decode pool built on demand underneath it. A
+    /// deferred width below `MIN_ROUTED_FAN_OUT_WIDTH` is the `Wide` arm.
+    #[test]
+    fn a_deferred_wide_fan_out_runs_on_the_decode_pool() {
+        let (n, k) = (6144usize, 4096usize);
+        assert!(output_chunk_len(n, k) < n);
+        let mut result = vec![0.0f32; n];
+        {
+            let _deferred = DeferredDecodeGuard::enter(MIN_ROUTED_FAN_OUT_WIDTH - 1);
+            parallel_output_rows(&mut result, k, |start, outputs| {
+                for (offset, output) in outputs.iter_mut().enumerate() {
+                    *output = (start + offset) as f32;
+                }
+            });
+        }
+        for (index, value) in result.iter().enumerate() {
+            assert_eq!(
+                *value, index as f32,
+                "row {index} was not written exactly once"
+            );
+        }
+    }
+
+    /// Deferral must be invisible to results: the same fan-out, run installed
+    /// and deferred, has to produce identical output.
+    #[test]
+    fn deferring_the_decode_pool_does_not_change_results() {
+        let (n, k) = (4096usize, 2048usize);
+        let compute = |start: usize, outputs: &mut [f32]| {
+            for (offset, output) in outputs.iter_mut().enumerate() {
+                *output = ((start + offset) % 97) as f32;
+            }
+        };
+        let mut installed = vec![0.0f32; n];
+        parallel_output_rows(&mut installed, k, compute);
+
+        let mut deferred = vec![0.0f32; n];
+        {
+            let _deferred = DeferredDecodeGuard::enter(MIN_ROUTED_FAN_OUT_WIDTH);
+            parallel_output_rows(&mut deferred, k, compute);
+        }
+        assert_eq!(installed, deferred);
+    }
+
+    /// The flat fan-out must actually reach the task runtime, not fall back to
+    /// running inline: the whole point of routing it there is the ~5 us dispatch
+    /// to a resident worker instead of a 67-226 us Rayon park wake-up.
+    ///
+    /// Routing reads `rayon::current_num_threads()`, and below
+    /// [`MIN_ROUTED_FAN_OUT_WIDTH`] the fan-out is *supposed* to stay on Rayon.
+    /// So on any host narrower than that -- every stock CI runner -- asserting a
+    /// dispatch asserts something policy never promised. Installing a pool of
+    /// exactly the routing width makes the decision under test the same one on
+    /// a 4-vCPU runner as on a 32-thread workstation, instead of silently
+    /// testing the host.
+    #[test]
+    fn parallel_output_rows_dispatches_to_the_task_runtime() {
+        if crate::task_runtime::width() <= 1 {
+            return;
+        }
+        let (n, k) = (6144usize, 4096usize);
+        let mut result = vec![0.0f32; n];
+        let routing_width = rayon::ThreadPoolBuilder::new()
+            .num_threads(MIN_ROUTED_FAN_OUT_WIDTH)
+            .build()
+            .expect("could not build a routing-width Rayon pool");
+        let (before, after) = routing_width.install(|| {
+            // Inside the pool: `output_chunk_len` reads the same Rayon width the
+            // routing decision does, so the precondition and the behaviour under
+            // test have to be evaluated against the same one.
+            assert!(
+                output_chunk_len(n, k) < n,
+                "the partition policy declined to split {n}x{k}, so this test \
+                 cannot observe a dispatch"
+            );
+            let before = crate::task_runtime::testing::counters();
+            parallel_output_rows(&mut result, k, |start, outputs| {
+                for (offset, output) in outputs.iter_mut().enumerate() {
+                    *output = (start + offset) as f32;
+                }
+            });
+            (before, crate::task_runtime::testing::counters())
+        });
+        assert!(
+            after.dispatches > before.dispatches,
+            "the flat fan-out published no task-runtime dispatch"
+        );
+        for (index, value) in result.iter().enumerate() {
+            assert_eq!(*value, index as f32, "output row {index} was not written");
+        }
+    }
+
+    /// The regression the `calls` argument exists to prevent: a projection that
+    /// is issued once per token of a long prefill must stay on global Rayon,
+    /// because by then its workers never park and the runtime's physical-core
+    /// cap is a pure loss.
+    #[test]
+    fn flat_fan_out_sends_hot_repeated_fan_outs_to_the_wide_pool() {
+        // The reference host: 16 physical cores, 32 logical, `--threads 32`.
+        let (lanes, wide) = (16usize, 32usize);
+        // llama3-8b MLP, `n * k`.
+        let mlp = 14336 * 4096;
+        // llama3-8b QKV, the largest fan-out that still prefers the runtime.
+        let qkv = 6144 * 4096;
+
+        for &calls in &[128usize, 512] {
+            assert_eq!(
+                flat_fan_out(mlp, calls, || lanes, wide),
+                PrefillFanOut::Wide,
+                "llama3_8b_mlp at {calls} calls measured 8-17% slower on the \
+                 task runtime and must take the wide path"
+            );
+        }
+        for &calls in &[1usize, 8] {
+            assert_eq!(
+                flat_fan_out(mlp, calls, || lanes, wide),
+                PrefillFanOut::TaskRuntime,
+                "llama3_8b_mlp at {calls} calls measured 1.5-2.5x faster on the \
+                 task runtime"
+            );
+        }
+        for &calls in &[1usize, 8, 128, 512] {
+            assert_eq!(
+                flat_fan_out(qkv, calls, || lanes, wide),
+                PrefillFanOut::TaskRuntime,
+                "llama3_8b_qkv at {calls} calls measured faster on the task \
+                 runtime at every token count"
+            );
+        }
+    }
+
+    /// Whatever the work, a fan-out never leaves the runtime when the wide pool
+    /// is not actually wider than the runtime's lane count.
+    #[test]
+    fn flat_fan_out_ignores_a_wide_pool_that_is_not_wider() {
+        for &(lanes, wide) in &[(16usize, 16usize), (32, 16), (24, 20)] {
+            assert_eq!(
+                flat_fan_out(usize::MAX, usize::MAX, || lanes, wide),
+                PrefillFanOut::TaskRuntime,
+                "{wide} Rayon threads is not wider than {lanes} lanes"
+            );
+        }
+    }
+
+    /// The narrow-width regression: below `MIN_ROUTED_FAN_OUT_WIDTH` there are
+    /// too few workers for their wake-ups to be worth moving the fan-out for,
+    /// and routing it anyway measured 0.81x at t=4 and 0.94x at t=8.
+    #[test]
+    fn flat_fan_out_leaves_narrow_fan_outs_where_they_are() {
+        for &wide in &[1usize, 2, 4, 8, MIN_ROUTED_FAN_OUT_WIDTH - 1] {
+            for &calls in &[1usize, 8, 512] {
+                for &macs in &[3 << 20, 56 << 20] {
+                    assert_eq!(
+                        flat_fan_out(macs, calls, || wide, wide),
+                        PrefillFanOut::Wide,
+                        "{wide} threads is too narrow to be worth re-homing a \
+                         fan-out of {macs} MACs x {calls} calls"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            flat_fan_out(
+                3 << 20,
+                1,
+                || MIN_ROUTED_FAN_OUT_WIDTH,
+                MIN_ROUTED_FAN_OUT_WIDTH
+            ),
+            PrefillFanOut::TaskRuntime,
+            "the crossover measured between 8 and 16 threads, so 16 must route"
+        );
+    }
+
+    /// Asking the task runtime for its width builds the pool, so a fan-out that
+    /// is going to stay on Rayon anyway must never ask. This is not a
+    /// micro-optimisation: routing was gated on width *after* the width was
+    /// read, and the resident workers that got spawned to answer the question
+    /// cost 6% of the geometric mean at t=4 and t=8 all by themselves, with
+    /// both arms otherwise running identical code.
+    #[test]
+    fn flat_fan_out_does_not_ask_for_a_width_it_will_not_use() {
+        use std::cell::Cell;
+
+        let asked = Cell::new(false);
+        let lanes = || {
+            asked.set(true);
+            16
+        };
+        assert_eq!(
+            flat_fan_out(56 << 20, 512, lanes, MIN_ROUTED_FAN_OUT_WIDTH - 1),
+            PrefillFanOut::Wide
+        );
+        assert!(
+            !asked.get(),
+            "a fan-out below the routing width built the task pool to decide \
+             not to use it"
+        );
+
+        let asked = Cell::new(false);
+        let lanes = || {
+            asked.set(true);
+            16
+        };
+        flat_fan_out(56 << 20, 512, lanes, 32);
+        assert!(
+            asked.get(),
+            "a fan-out at a routable width must consult the runtime's width"
+        );
+    }
+
+    /// A single fan-out is a decode step, and a decode step is exactly the case
+    /// the task runtime was built for. No amount of per-call work moves it.
+    #[test]
+    fn flat_fan_out_keeps_one_shot_fan_outs_on_the_runtime() {
+        assert_eq!(
+            flat_fan_out(usize::MAX, 1, || 16, 32),
+            PrefillFanOut::TaskRuntime
+        );
+    }
+
+    /// `parallel_output_rows` is the one-shot spelling: it must never pick the
+    /// wide path on width grounds, however large the projection it is handed.
+    #[test]
+    fn parallel_output_rows_is_the_one_shot_spelling() {
+        assert_eq!(
+            flat_fan_out(14336 * 4096, 1, || 16, 32),
+            PrefillFanOut::TaskRuntime,
+            "the `calls = 1` delegation must not reach the wide path"
+        );
+    }
+
+    /// The wide path partitions the same output, so it owes the same coverage
+    /// guarantee as the task-runtime path.
+    #[test]
+    fn parallel_output_rows_repeated_covers_every_output_on_the_wide_path() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let (n, k) = (4096usize, 1024usize);
+        let mut result = vec![0.0f32; n];
+        let writes: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+        // `calls` at `HOT_FAN_OUT_CALLS`, so which executor this lands on
+        // depends on the host's width and topology. Both must cover the output
+        // exactly once, so the assertion holds either way.
+        parallel_output_rows_repeated(&mut result, k, HOT_FAN_OUT_CALLS, |start, outputs| {
+            for (offset, output) in outputs.iter_mut().enumerate() {
+                writes[start + offset].fetch_add(1, Ordering::Relaxed);
+                *output = (start + offset) as f32;
+            }
+        });
+
+        for (index, (value, seen)) in result.iter().zip(writes.iter()).enumerate() {
+            assert_eq!(
+                seen.load(Ordering::Relaxed),
+                1,
+                "output {index} was written {} times, not once",
+                seen.load(Ordering::Relaxed)
+            );
+            assert_eq!(
+                *value, index as f32,
+                "output {index} got the wrong `output_start`"
+            );
+        }
     }
 }

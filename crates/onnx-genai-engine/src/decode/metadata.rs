@@ -91,11 +91,16 @@ pub(crate) fn detect_model_decode_path(
     // when the exported decoder graph actually enforces a local-attention window
     // on its attention ops (an ORT `GroupQueryAttention` with a positive
     // `local_window_size`). If the window is declared in metadata but the graph
-    // computes GLOBAL attention (e.g. Muse-Glimmer-30B: 52 GQA ops, none with
-    // `local_window_size`; `genai_config.json` declares no window and
-    // `past_present_share_buffer: true`), the window is vestigial and must NOT
-    // route the model onto the capture-unstable growing/paged KV path. Treat it
-    // as global attention so it can reach the capture-stable shared-buffer path.
+    // computes GLOBAL attention, the runtime cannot conjure the mask back, so the
+    // model is routed as global attention rather than onto the capture-unstable
+    // growing/paged KV path.
+    //
+    // This is a fallback, not an endorsement: a graph that drops a window its
+    // architecture actually trains with is an export defect, and it silently
+    // corrupts generation once a prompt outgrows the window. Muse-Glimmer-30B is
+    // the known example (52 GQA ops, none carrying `local_window_size`, while the
+    // architecture uses a 2048-token window on 39 of its 52 layers), so the
+    // mismatch is logged loudly enough to be diagnosed.
     //
     // When no graph is supplied (best-effort inspection unavailable) the declared
     // window is kept, preserving the prior behavior for real SWA models
@@ -194,8 +199,9 @@ pub(crate) fn detect_model_decode_path(
 /// decoder graph computes. This returns the declared window only when the graph
 /// truly enforces a local-attention window (see [`graph_enforces_sliding_window`]).
 /// When the window is declared in metadata but the graph computes global
-/// attention, it is vestigial and dropped (`None`), so the model is not forced
-/// onto the capture-unstable growing/paged KV path. When no graph is available
+/// attention, the window is dropped (`None`) so the model is not forced onto the
+/// capture-unstable growing/paged KV path, and the mismatch is warned about: the
+/// runtime cannot re-apply a mask the export left out. When no graph is available
 /// to inspect, the declared window is kept unchanged to avoid regressing real
 /// sliding-window models whose graph we could not read.
 pub(crate) fn effective_sliding_window(
@@ -205,9 +211,9 @@ pub(crate) fn effective_sliding_window(
     let window = declared?;
     match graph {
         Some(graph) if !graph_enforces_sliding_window(graph) => {
-            tracing::debug!(
+            tracing::warn!(
                 sliding_window = window,
-                "inference metadata declares a sliding_window but the decoder graph carries no local-attention window (no GQA local_window_size); treating attention as global and routing to the shared-buffer/fixed-capacity KV path"
+                "inference metadata declares a sliding_window but the decoder graph carries no local-attention window (no GQA local_window_size), so attention runs globally and is routed to the shared-buffer/fixed-capacity KV path; if the architecture really is windowed this is an export defect and generation will diverge once a prompt exceeds the window"
             );
             None
         }

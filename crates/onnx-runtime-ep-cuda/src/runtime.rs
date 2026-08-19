@@ -293,6 +293,14 @@ pub struct CudaRuntime {
     /// existing per-step logits sync so a poisoned replay becomes a hard error
     /// before the produced token is consumed.
     capture_error: CUdeviceptr,
+    /// When set, the public [`CudaRuntime::synchronize`] becomes a no-op so the
+    /// redundant trailing per-op eager device syncs (issued by kernels on the
+    /// `!capturing` branch) are elided and launches pipeline on the in-order EP
+    /// stream. Host-visible reads (`dtoh`/`dtod`) call the private
+    /// [`CudaRuntime::force_synchronize`] and are therefore unaffected. On by
+    /// default (eager decode is made consistent with the captured path, which
+    /// already elides these); disable via `ONNX_GENAI_DEFER_EAGER_SYNC=0`.
+    defer_eager_sync: AtomicBool,
 }
 
 impl std::fmt::Debug for CudaRuntime {
@@ -439,6 +447,18 @@ impl CudaRuntime {
             fences: Mutex::new(HashMap::new()),
             next_fence_id: AtomicU64::new(1),
             capture_error: 0,
+            defer_eager_sync: AtomicBool::new(
+                // On by default; only an explicit falsey value restores the old
+                // always-sync eager path (escape hatch for debugging).
+                std::env::var("ONNX_GENAI_DEFER_EAGER_SYNC")
+                    .ok()
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase)
+                    .map_or(true, |v| {
+                        !matches!(v.as_str(), "0" | "false" | "off" | "no")
+                    }),
+            ),
         }
         .with_capture_error_word()
     }
@@ -938,10 +958,70 @@ impl CudaRuntime {
     }
 
     /// Block until all submitted work on the EP's dedicated stream completes.
+    ///
+    /// Deferred by default (eager decode is made consistent with the captured
+    /// path); this becomes a no-op unless `ONNX_GENAI_DEFER_EAGER_SYNC=0`
+    /// restores the old always-sync behavior. The trailing per-op eager syncs
+    /// are redundant because (a) kernel→kernel ordering is guaranteed by the
+    /// single in-order EP stream and (b) every host-visible read (`dtoh`/`dtod`)
+    /// issues its own [`force_synchronize`] before the synchronous copy. Eliding
+    /// these lets eager decode pipeline launches the way a captured graph does.
     pub fn synchronize(&self) -> Result<()> {
+        if self.defer_eager_sync.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.force_synchronize()
+    }
+
+    /// Unconditional stream drain. Used by host-visible reads (`dtoh`/`dtod`)
+    /// that must observe fully-produced bytes regardless of the eager-sync
+    /// deferral flag.
+    fn force_synchronize(&self) -> Result<()> {
         self.stream
             .synchronize()
             .map_err(|e| driver_err("stream synchronize", e))
+    }
+
+    /// Unconditional compute-stream drain used as a **correctness barrier**
+    /// before releasing or remapping device memory a kernel may still be
+    /// reading — e.g. immediately before `cuMemUnmap` of an evicted weight
+    /// granule in `weight_paging.rs`.
+    ///
+    /// Unlike [`synchronize`], this ignores the `defer_eager_sync` deferral
+    /// (#1383). Eliding a *trailing per-op* eager sync is safe — the single
+    /// in-order EP stream preserves kernel→kernel ordering — but eliding a
+    /// *pre-unmap* drain is a use-after-unmap: the granule is unmapped while an
+    /// in-flight decode kernel still references its VA. This was observed as
+    /// `CUDA_ERROR_ILLEGAL_ADDRESS` on the weight-offload repro (11/11 runs).
+    ///
+    /// A silent variant — a late read returning a *successor weight's* bytes
+    /// under stable-slot reuse (#716) — was hypothesised and then **falsified**:
+    /// stable slots are keyed by weight `key`, a slot's VA is reused only for
+    /// the same key, and on collision admission refuses rather than remaps, so a
+    /// stale read hits either decommitted physical memory (faults) or the same
+    /// weight's byte-identical bytes — never a different weight. The 11/11 runs
+    /// all crashed; 0 diverged. The hazard here is therefore a loud fault, not
+    /// silent corruption. See #1439 for the full chain.
+    ///
+    /// Any caller that must know all prior compute has retired before
+    /// freeing/remapping memory MUST use this, never `synchronize()`.
+    pub fn drain_for_unmap(&self) -> Result<()> {
+        self.force_synchronize()
+    }
+
+    /// Toggle the eager-sync deferral at runtime (see [`synchronize`]).
+    pub fn set_defer_eager_sync(&self, enabled: bool) {
+        self.defer_eager_sync.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether the eager-fast path is active. When true, kernels skip their
+    /// eager-only host-side validation readbacks (index/position bounds checks)
+    /// — these are numerically inert (a correct model never trips them) and the
+    /// captured path already relies on the device error latch instead of a
+    /// per-op D2H. Eliding them removes the blocking scalar D2H that otherwise
+    /// serializes each eager op against the GPU.
+    pub fn eager_sync_deferred(&self) -> bool {
+        self.defer_eager_sync.load(Ordering::Relaxed)
     }
 
     /// Whether the EP's compute stream is currently capturing into a CUDA graph.
@@ -999,7 +1079,7 @@ impl CudaRuntime {
         // Kernels enqueue work on the EP's dedicated non-default stream. Wait
         // before issuing the synchronous driver copy so the host never observes
         // bytes that were still being produced on that stream.
-        self.synchronize()?;
+        self.force_synchronize()?;
         // SAFETY: bound context; `src` covers `dst.len()` bytes per the contract.
         unsafe { cudarc::driver::result::memcpy_dtoh_sync(dst, src) }
             .map_err(|e| driver_err("cuMemcpyDtoH", e))?;
@@ -1020,7 +1100,7 @@ impl CudaRuntime {
         // consumer that already queued a read of `dst`). Drain the EP stream
         // first so the synchronous copy always sees fully-produced bytes. This
         // mirrors `dtoh`, which synchronizes for the same reason.
-        self.synchronize()?;
+        self.force_synchronize()?;
         // SAFETY: bound context; both endpoints cover `bytes` per the contract.
         unsafe { cudarc::driver::result::memcpy_dtod_sync(dst, src, bytes) }
             .map_err(|e| driver_err("cuMemcpyDtoD", e))

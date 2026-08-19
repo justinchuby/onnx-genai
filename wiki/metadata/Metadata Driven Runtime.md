@@ -8,40 +8,39 @@ tags:
   - models
   - contracts
 status: maintained
+lang: zh-CN
 created: 2026-08-17
-updated: 2026-08-17
+updated: 2026-08-19
 ---
 
 # Metadata Driven Runtime
 
-> [!summary] Question answered
-> How does the runtime support different model architectures without hardcoding model names and dimensions?
+> [!summary] 本文回答的问题
+> 运行时如何在不硬编码模型名称和维度的情况下支持不同的模型架构?
 
-The runtime treats model behavior as data. Inference metadata, graph structure,
-ONNX semantics, capabilities and explicit user configuration replace
-model-family dispatch.
+运行时把模型行为当作数据来对待。推理元数据、图结构、ONNX 语义、能力
+(capability)以及显式的用户配置,取代了按模型族(model-family)分派的做法。
 
-## What metadata describes
+## 元数据描述了什么
 
-Depending on the package/model, metadata can declare:
+取决于具体的包/模型,元数据可以声明:
 
-- model components and pipeline topology;
-- token/embedding input and logits/hidden outputs;
-- KV and recurrent state ownership;
-- attention/KV geometry and axes;
-- tokenizer/chat-template behavior;
-- image/audio preprocessing programs;
-- generation defaults and constraints;
-- speculative proposer contracts;
-- runtime-required capabilities;
-- execution/placement hints;
-- quantization and hardware requirements.
+- 模型组件与流水线拓扑;
+- token/embedding 输入与 logits/hidden 输出;
+- KV 与递归状态(recurrent state)的所有权;
+- attention/KV 的几何结构与轴;
+- tokenizer/chat-template 行为;
+- 图像/音频预处理程序;
+- 生成默认值与约束;
+- 投机式(speculative)proposer 契约;
+- 运行时所需的能力;
+- 执行/放置提示;
+- 量化与硬件要求。
 
-## Capability negotiation
+## 能力协商
 
-Models list stable capability identifiers. The runtime advertises its supported
-set and fails load with the missing capabilities instead of guessing from model
-identity.
+模型列出稳定的能力标识符。运行时公布其支持的集合,并在缺失能力时明确地
+加载失败,而不是从模型身份去猜测。
 
 ```text
 model requires: [loop_carried_state, multi_axis_positions]
@@ -49,69 +48,67 @@ runtime offers: [loop_carried_state]
 result: fail clearly; missing multi_axis_positions
 ```
 
-Capability strings are data and should not become hidden branches by model name.
+能力字符串是数据,不应按模型名称变成隐藏的分支。
 
-## Resolution priority
+## 解析优先级
 
-For execution hints, stronger/more local user intent overrides embedded defaults:
+对于执行提示,更强/更局部的用户意图会覆盖内嵌的默认值:
 
-1. programmatic builder API;
-2. user `execution_hints.json`;
-3. inference metadata execution hints;
-4. ONNX `onnx_runtime.*` metadata properties.
+1. 编程式的 builder API;
+2. 用户的 `execution_hints.json`;
+3. 推理元数据中的执行提示;
+4. ONNX 的 `onnx_runtime.*` 元数据属性。
 
-Conflicting forced constraints should fail rather than choose silently.
+相互冲突的强制约束应当失败,而不是悄悄地做出选择。
 
-## Names versus roles
+## 名称与角色
 
-Tensor port names are data, not semantics. Resolution should prefer:
+Tensor 端口名称是数据,而非语义。解析应优先:
 
-1. exact declared role/port;
-2. a unique structural/shape signal;
-3. failure naming the required metadata when ambiguous.
+1. 精确声明的角色/端口;
+2. 唯一的结构/形状信号;
+3. 在有歧义时,以指明所需元数据的方式失败。
 
-Conventional-name fallback may exist for a narrow compatibility case, but a
-declared contract always wins and the fallback must not guess among ambiguous
-ports.
+针对狭窄的兼容性场景,可能存在按惯用名称的回退,但已声明的契约始终优先,
+且该回退不得在有歧义的端口之间猜测。
 
-## State ownership
+## 状态所有权
 
-Metadata distinguishes:
+元数据区分:
 
-- token IDs versus input embeddings as sequence source;
-- owned versus shared KV;
-- positional KV inputs/outputs;
-- hidden/recurrent outputs;
-- proposer-to-target shared-state mappings.
+- 作为序列来源的 token ID 与 输入 embedding;
+- 自有(owned)与共享(shared)的 KV;
+- 位置相关的 KV 输入/输出;
+- hidden/recurrent 输出;
+- proposer 到 target 的共享状态映射。
 
-These declarations let ORT and native backends implement the same generation
-semantics without copying model-family assumptions into engine code.
+这些声明让 ORT 和原生后端能够实现相同的生成语义,而无需把模型族的假设复制
+进引擎代码中。
 
-## Schema and forward evolution
+## Schema 与前向演进
 
-`onnx-genai-metadata` provides typed Rust structures, validation and deterministic
-JSON Schema generation. Readers should:
+`onnx-genai-metadata` 提供带类型的 Rust 结构、校验以及确定性的 JSON Schema
+生成。读取方应当:
 
-- validate required capabilities;
-- retain actionable paths to invalid fields;
-- define schema-version behavior;
-- tolerate explicitly allowed additive evolution;
-- reject ambiguity that would change semantics.
+- 校验所需的能力;
+- 对无效字段保留可操作的路径;
+- 定义 schema 版本行为;
+- 容忍显式允许的加性(additive)演进;
+- 拒绝会改变语义的歧义。
 
-## Metadata is not a performance wish list
+## 元数据不是性能许愿单
 
-Hints do not override correctness, physical capability or user policy. A request
-for CUDA graph capture, a kernel or a device still passes capability and
-compatibility checks.
+提示不会覆盖正确性、物理能力或用户策略。对 CUDA graph capture、某个 kernel
+或某个 device 的请求,仍然要通过能力与兼容性检查。
 
-## Formal sources
+## 形式化来源
 
 - [`onnx-genai-metadata`](../../crates/onnx-genai-metadata/src/lib.rs)
 - [`MODEL_METADATA.md`](../../docs/genai/MODEL_METADATA.md)
 - [`MODEL_PACKAGE.md`](../../docs/genai/MODEL_PACKAGE.md)
 - [`RULES.md`](../../RULES.md)
 
-## Related notes
+## 相关笔记
 
 - [[metadata/Model Packages and Variants]]
 - [[contracts/Runtime Contracts]]

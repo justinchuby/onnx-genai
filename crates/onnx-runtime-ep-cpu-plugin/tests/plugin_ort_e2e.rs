@@ -5794,6 +5794,186 @@ opset_import: {opset_imports}
     }
 }
 
+/// A chain of `depth` identical single-input nodes, `X -> t1 -> … -> Y`.
+///
+/// Depth is the axis that separates the two costs #1077 conflates. Whatever
+/// ORT charges per `Run` — session bookkeeping, fetch/feed marshalling — is
+/// paid once regardless of depth, while our per-node dispatch is paid `depth`
+/// times. Comparing depth 1, 10 and 100 against ORT therefore reads the
+/// per-node slope directly, instead of a single number in which the fixed and
+/// variable parts are indistinguishable.
+///
+/// `dynamic` leaves the row count symbolic, so ORT cannot fold shapes at
+/// session build and our shape inference runs for real on every `Run`. A
+/// dispatch path that is only fast on static shapes is not fast.
+fn chain_case(
+    name: &'static str,
+    op: &'static str,
+    depth: usize,
+    len: usize,
+    dynamic: bool,
+) -> MatmulFamilyCase {
+    assert!(depth >= 1, "a chain needs at least one node");
+    let dims = vec![1, len as i64];
+    let decl = |n: &str| -> String {
+        if dynamic {
+            format!(
+                "{{ name: \"{n}\" type {{ tensor_type {{ elem_type: {ELEM_F32} \
+                 shape {{ dim: [{{ dim_param: \"batch\" }}, {{ dim_value: {len} }}] }} }} }} }}"
+            )
+        } else {
+            textproto_value_info(n, ELEM_F32, &dims)
+        }
+    };
+    let nodes: Vec<String> = (0..depth)
+        .map(|i| {
+            let input = if i == 0 {
+                "X".to_owned()
+            } else {
+                format!("t{i}")
+            };
+            let output = if i + 1 == depth {
+                "Y".to_owned()
+            } else {
+                format!("t{}", i + 1)
+            };
+            format!("{{ input: [\"{input}\"] output: [\"{output}\"] op_type: \"{op}\" }}")
+        })
+        .collect();
+    let model = format!(
+        r#"ir_version: 10
+graph {{
+  node: [{}]
+  name: "{name}"
+  input: [{}]
+  output: [{}]
+}}
+opset_import: [{{ version: 17 }}]
+"#,
+        nodes.join(", "),
+        decl("X"),
+        decl("Y"),
+    );
+    let x = activation_f32(1, len);
+    MatmulFamilyCase {
+        name,
+        op,
+        model,
+        inputs: vec![GeneratedInput {
+            name: "X",
+            elem: ELEM_F32,
+            dims,
+            data: f32_slice_to_bytes(&x),
+        }],
+        output: "Y",
+        output_elem: ELEM_F32,
+        ort_can_build: true,
+        // A Relu chain is exact in both implementations; Identity is a copy.
+        // Anything above zero here would be hiding a real disagreement.
+        tolerance: 0.0,
+    }
+}
+
+/// A single small `MatMul`, `[1, k] x [k, n]`, with both operands supplied at
+/// run time.
+///
+/// The elementwise cases all have trivial kernels, which is what makes them
+/// good dispatch probes — but it also means a win there could be an artefact of
+/// how little work the kernel does. `MatMul` at these sizes still has a real
+/// kernel while staying small enough for dispatch to matter, so it is the case
+/// that says whether the fast path generalises beyond one-liners.
+///
+/// Both operands are runtime inputs rather than initializers, which keeps the
+/// weight out of the TextFormat source (an octal-escaped 1024x1024 f32 blob is
+/// megabytes of test fixture) and denies both sides any prepacking, so the
+/// comparison stays about dispatch.
+fn small_matmul_case(name: &'static str, k: usize, n: usize) -> MatmulFamilyCase {
+    let model = format!(
+        r#"ir_version: 10
+graph {{
+  node: [{{ input: ["X", "W"] output: ["Y"] op_type: "MatMul" }}]
+  name: "{name}"
+  input: [{}, {}]
+  output: [{}]
+}}
+opset_import: [{{ version: 17 }}]
+"#,
+        textproto_value_info("X", ELEM_F32, &[1, k as i64]),
+        textproto_value_info("W", ELEM_F32, &[k as i64, n as i64]),
+        textproto_value_info("Y", ELEM_F32, &[1, n as i64]),
+    );
+    MatmulFamilyCase {
+        name,
+        op: "MatMul",
+        model,
+        inputs: vec![
+            GeneratedInput {
+                name: "X",
+                elem: ELEM_F32,
+                dims: vec![1, k as i64],
+                data: f32_slice_to_bytes(&activation_f32(1, k)),
+            },
+            GeneratedInput {
+                name: "W",
+                elem: ELEM_F32,
+                dims: vec![k as i64, n as i64],
+                data: f32_slice_to_bytes(&activation_f32(k, n)),
+            },
+        ],
+        output: "Y",
+        output_elem: ELEM_F32,
+        ort_can_build: true,
+        tolerance: 1e-3,
+    }
+}
+
+/// The grid issue #1077 is closed against.
+///
+/// Every row isolates one variable. Read together they say where the remaining
+/// dispatch cost is; read individually none of them would.
+///
+/// * **`identity_1`** is the floor. An `Identity` node does a memcpy, so
+///   essentially everything the timer sees is the cost of getting there and
+///   back. If we are at parity anywhere, it has to be here first.
+/// * **`relu_1` / `relu_10` / `relu_100`** vary only depth, giving the
+///   per-node slope with the per-`Run` constant divided out.
+/// * **`*_dyn`** repeat the static rows with a symbolic batch dimension, so a
+///   fast path that only works when shapes are known at build time cannot pass
+///   unnoticed.
+/// * **`matmul_*`** check the result is not an artefact of trivial kernels.
+/// * The `4k` width keeps every kernel small enough that dispatch is a visible
+///   fraction; at 1 Mi it would be rounding error, which is the whole reason
+///   the earlier activation sweep could not answer this question.
+fn dispatch_grid_cases() -> Vec<MatmulFamilyCase> {
+    const W: usize = 4096;
+    const TINY: usize = 8;
+    vec![
+        chain_case("grid_identity_1_static", "Identity", 1, W, false),
+        chain_case("grid_identity_10_static", "Identity", 10, W, false),
+        chain_case("grid_relu_1_static", "Relu", 1, W, false),
+        chain_case("grid_relu_10_static", "Relu", 10, W, false),
+        chain_case("grid_relu_100_static", "Relu", 100, W, false),
+        chain_case("grid_identity_1_dyn", "Identity", 1, W, true),
+        chain_case("grid_relu_1_dyn", "Relu", 1, W, true),
+        chain_case("grid_relu_10_dyn", "Relu", 10, W, true),
+        chain_case("grid_relu_100_dyn", "Relu", 100, W, true),
+        // Dispatch-isolating widths. At W = 4096 a Relu node moves 32 KiB, and
+        // that traffic — not the dispatch around it — sets the per-node cost,
+        // so the ratio there reports elementwise throughput wearing a
+        // dispatch-shaped hat. At 8 elements the kernel is a single masked
+        // vector op and essentially everything left is overhead, which is what
+        // #1077 is actually about. The pair brackets it: TINY is the overhead
+        // floor, W the throughput regime.
+        chain_case("grid_relu_1_tiny", "Relu", 1, TINY, false),
+        chain_case("grid_relu_10_tiny", "Relu", 10, TINY, false),
+        chain_case("grid_relu_100_tiny", "Relu", 100, TINY, false),
+        chain_case("grid_relu_1_tiny_dyn", "Relu", 1, TINY, true),
+        chain_case("grid_relu_10_tiny_dyn", "Relu", 10, TINY, true),
+        small_matmul_case("grid_matmul_128x128", 128, 128),
+        small_matmul_case("grid_matmul_512x512", 512, 512),
+    ]
+}
+
 /// The elementwise grid `CPU_ACTIVATION_GAPS.md` is written against, as
 /// session-level cases.
 ///
@@ -6180,7 +6360,25 @@ fn plugin_path_ab_vs_plain_ort() {
     println!(
         "case,ours_p50_ms,ort_p50_ms,ratio_p50,ours_p90_ms,ort_p90_ms,ratio_p90,cold_ours_ms,cold_ort_ms"
     );
-    for case in matmul_bench_cases().into_iter().chain(unary_bench_cases()) {
+    // The #1077 grid is off by default: it is 11 more sessions, and the
+    // matmul/unary rows answer a different question (kernel throughput) than
+    // these do (dispatch overhead). `NXRT_MM_BENCH_GRID=1` adds them;
+    // `NXRT_MM_BENCH_GRID=only` runs them alone, which is what a dispatch
+    // measurement wants — nothing else resident, nothing else warming caches.
+    let grid = std::env::var("NXRT_MM_BENCH_GRID").unwrap_or_default();
+    let cases: Vec<MatmulFamilyCase> = match grid.as_str() {
+        "only" => dispatch_grid_cases(),
+        "1" => matmul_bench_cases()
+            .into_iter()
+            .chain(unary_bench_cases())
+            .chain(dispatch_grid_cases())
+            .collect(),
+        _ => matmul_bench_cases()
+            .into_iter()
+            .chain(unary_bench_cases())
+            .collect(),
+    };
+    for case in cases {
         if !filter.is_empty() && !case.name.contains(&filter) {
             continue;
         }
