@@ -3412,11 +3412,18 @@ mod tests {
         // f32 prefill (Sq>1) has no split-K decode kernel: reference path runs
         // and materializes scores.
         assert!(gqa_reference_scores_path(DataType::Float32, 8, 64));
-        // f32 single-token decode with head_dim<=128 is covered by gqa_decode,
-        // which streams softmax and needs no score scratch.
+        // f32 single-token decode with head_dim within the gqa_decode ceiling
+        // (MAX_HEAD_DIM = 512) is covered by gqa_decode, which streams softmax
+        // and needs no score scratch. The ceiling was widened 128->256->512 as a
+        // feature (#1438, gemma4-e2b / Gemma-3n head_dim=512); this assertion is
+        // pinned to that ceiling so it flags deliberately if it moves again.
         assert!(!gqa_reference_scores_path(DataType::Float32, 1, 64));
-        // f32 single-token with head_dim>128 exceeds gqa_decode: reference path.
-        assert!(gqa_reference_scores_path(DataType::Float32, 1, 192));
+        assert!(!gqa_reference_scores_path(DataType::Float32, 1, 192));
+        assert!(!gqa_reference_scores_path(DataType::Float32, 1, 512));
+        // f32 single-token with head_dim > MAX_HEAD_DIM exceeds gqa_decode: the
+        // reference path runs and materializes scores.
+        assert!(gqa_reference_scores_path(DataType::Float32, 1, 513));
+        assert!(gqa_reference_scores_path(DataType::Float32, 1, 576));
         // fp16/bf16 never take the f32 reference path, so no score buffer is
         // charged on the common decode/prefill dtypes.
         assert!(!gqa_reference_scores_path(DataType::Float16, 8, 64));
