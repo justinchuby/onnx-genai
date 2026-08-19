@@ -540,7 +540,7 @@ mod softmax_avx2 {
         // So both cases fall out of the arithmetic, and the clamp, the
         // unordered compare and the `NaN` blend they fed are all gone -- three
         // of the sixteen port-0/1 ops this loop is bound by (measured: pass 2
-        // 442 -> 370 ps/element at d=1024, 1.20x). Every finite input is
+        // 446 -> 370 ps/element at d=1024, 1.20x). Every finite input is
         // bit-identical to the clamped form, since the clamp was the identity
         // there. Only a `NaN` *payload* changes: it is now the quieted input
         // rather than a canonical `f32::NAN`, which the row contract -- a
@@ -618,9 +618,15 @@ mod softmax_avx2 {
             // ignores them -- and since no accumulator can therefore ever hold
             // a `NaN`, folding the four together at the end obeys the same
             // convention. `max` is associative and commutative over the values
-            // that survive, so the result is bit-identical to one chain.
+            // that survive, with one caveat that does not reach the output: a
+            // row holding both `+0.0` and `-0.0` as its maximum can pick either
+            // sign depending on the grouping, and `v - (+0.0)`, `v - (-0.0)`
+            // and `exp8(±0.0) = 1.0` all erase it. Every row is therefore
+            // bit-identical to one chain (verified differentially over ~588k
+            // rows, `d` in 1..=140 plus seven larger widths, a quarter of them
+            // seeded with infinities, NaNs and signed zeros).
             //
-            // One chain is latency-bound, not throughput-bound: `vmaxpd`'s
+            // One chain is latency-bound, not throughput-bound: `vmaxps`'s
             // ~4-cycle latency lets it retire 8 floats per 4 cycles when the
             // load ports could feed 16. Four chains hide that (measured: 67 ->
             // 37 ps/element at d=1024, 1.8x).
@@ -1280,10 +1286,11 @@ mod vectorized_tests {
     fn out_of_place_softmax_is_bit_identical_on_pathological_rows() {
         // 8 is a whole vector body with no tail; 11 is a vector body plus a
         // 3-lane scalar tail; 6 is a pure tail with no vector body at all.
-        // The tail widths matter: a NaN in a vectorized lane is forced to a
-        // canonical NaN by the mask, while a NaN in a tail lane is whatever
-        // libm returns, so a future change that stopped both forms sharing one
-        // core would diverge on exactly these rows and nowhere else.
+        // The tail widths matter: a NaN in a vectorized lane carries whatever
+        // payload the polynomial produced from the input, while a NaN in a
+        // tail lane is whatever libm returns, so a future change that stopped
+        // both forms sharing one core would diverge on exactly these rows and
+        // nowhere else.
         for d in [8usize, 11, 6] {
             check_pathological_rows_bit_identical(d);
         }
