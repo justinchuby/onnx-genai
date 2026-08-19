@@ -1,6 +1,6 @@
 # Decisions — live standing directives
 
-Last consolidated: 2026-08-18T17:11Z (Scribe processed Deckard GQA head-size inbox drop; detailed 2026-08 narrative remains archived in `.squad/decisions-archive/2026-08.md` to keep the live ledger below 20KB.)
+Last consolidated: 2026-08-19T00:00Z (Scribe wave-3 merge: 5 inbox notes processed — adaptive split-KV #1350, attention_split launch_bounds NO-GO, derive_len #1357, cumsum_i64 #1366, Wallace GLM fair A/B + splitk_wide profile; 3 claim-integrity retractions added; older 2026-08-18 batch entries (lines 50–719 pre-merge) archived to `.squad/decisions-archive/2026-08.md` at "Archived 2026-08-19 by Scribe" section to keep the live ledger below 50KB.)
 
 Standing governance rules and active directives. Full narrative is archived; keep this file to current decisions plus durable rules.
 
@@ -47,670 +47,86 @@ For int4 GEMV/QMoE reductions, CPU bit-identity is not an oracle when accumulati
 
 The primary Windows development box has a working RTX 4060 CUDA path even though `nvcc`, `CUDA_PATH`, and default PATH probes may fail. A complete CUDA 13 runtime is available under anaconda site-packages; agents must distinguish absent from misconfigured before claiming CUDA is unavailable. On that box, add the `cu13` and `cudnn` bin directories to PATH and build with `--features native-cuda`.
 
-### 2026-08-18: general head-size fused f32 GQA decode kernel (was head_size=256)
+### 2026-08-18: adaptive split-KV sizing for attention_row decode — GO, default-ON (PR #1350, merged)
 
 **By:** Deckard
 
-**What:** GO. Generalized the f32 fused split-K GQA decode fast path over head size
-instead of special-casing 256. The kernel is now templated on dims-per-lane
-`DPL = ceil(head_dim / 32)`; the launcher selects the exact tier (1..=8) so each
-head keeps its minimal register footprint. `supported()` covers head_dim 1..=256.
+**What:** Sizes `num_splits` adaptively from fixed KV `cap` + fixed row count to target ~one occupancy wave (grid ≈ 512), floored at MIN_CHUNK=128. Replaces fixed `chunk=256` from #1340. `ONNX_GENAI_ATTN_SPLIT_CHUNK` still pins for A/B. Capture-safe (geometry from cap+rows only). Merged origin/main @ 32ee82cb5.
 
-- Correctness (byte-identical / f64 CPU-reference oracle), same tolerance as the
-  original head<=128 test (max_abs<1e-3, max_rel<5e-3). All GQA 8/2, cache lengths
-  spanning the split-K boundaries:
-    head64  (dpl2): max_abs=1.19e-7  max_rel=2.49e-7
-    head80  (dpl3): max_abs=1.19e-7  max_rel=2.55e-7
-    head96  (dpl3): max_abs=1.19e-7  max_rel=2.43e-7
-    head112 (dpl4): max_abs=1.79e-7  max_rel=3.58e-7
-    head128 (dpl4): max_abs=1.49e-7  max_rel=3.04e-7
-    head192 (dpl6): max_abs=1.19e-7  max_rel=2.51e-7
-    head256 (dpl8): max_abs=1.79e-7  max_rel=4.15e-7
-  (non-multiple-of-32 dims 80/96/112 correctly mask partial lanes.)
+**Why:** Deep-ctx re-profile (~2600 tok) revealed split-KV win is +63% over monolithic (not the +10% at shallow ctx). Fixed-256 under-fills at depth (grid 256, waves/SM 0.48, warps 11%). Sweep proved optimum at grid ≈ 512 (one full wave, ~4 CTAs/SM), not grid ≈ SM count. Adaptive targets one wave automatically across head counts.
 
-- Perf headline (qwen3.5-2b-text, head_dim=256, idle H200, native, tokens=128
-  warmups=2 runs=5 --steady --decode-skip 1, medians of 5):
-    BEFORE (gqa_attention_reference_f32): 102.31 tok/s (9.774 ms/token)
-    AFTER  (fused, dpl8):                 170.97 tok/s (5.849 ms/token)  -> 1.67x
-  nsys: gqa_attention_reference_f32 share 31.2% -> 1.1% (only warmup calls remain).
-
-- Regression guard (qwen3-0.6b, head_dim=128): DPL4 baseline 316.06 tok/s vs
-  templated dpl4 312-316 tok/s across repeats -> statistically identical (the
-  templated dpl4 path compiles to the same code as the pre-change DPL=4 kernel;
-  no register regression). A naive single-tier DPL=8 kernel measured 314.69 —
-  also within noise on this model, but the per-DPL specialization guarantees no
-  regression on attention-bound shapes/longer contexts.
-
-**Why:** head_dim=256 previously fell to the serial reference kernel (nsys #1
-decode hotspot, 31.2%). Parameterizing over DPL removes the fallback for the
-whole common head-size set (64/80/96/112/128/192/256) with one kernel, keeps
-small heads at their original register footprint, and is byte-identical-eligible.
-
-**Scoped follow-up (NOT in this PR): asymmetric v_head_dim != qk_head_dim
-(Gemma dual-head / DeepSeek MLA).** Audited: the f32 decode kernel and the entire
-`group_query_attention.rs` op thread a single `head_size` for Q/K/V. Standard ONNX
-`com.microsoft.GroupQueryAttention` is symmetric, so no runtime model needs this
-today. Adding it would require: (1) split `head_size` into `qk_head_size` (query,
-key, butterfly dot-product loop) and `v_head_size` (value accumulate `acc[]`,
-`warp_acc`, scratch stride, output write) in `gqa_decode.rs`; (2) a second template
-param so `q_reg` is sized by `ceil(qk/32)` and `acc`/output by `ceil(v/32)`
-(entry matrix grows to DPL_QK x DPL_V); (3) thread a separate `v_head_dim` through
-`gqa_decode::run()` and the GQA op call site + KV-cache/RoPE prep. Deferred to keep
-this PR scoped; the win here (symmetric heads) covers every model we currently run.
-
-### 2026-08-18: #1180 — single CUDA lib-name table
-**By:** Tycho
-**What:** Moved the CUDA runtime (`cudart`) shared-library candidate names into one canonical, per-platform table in `onnx-genai-cuda-version-guard` (`CUDART_CANDIDATES_LINUX/MACOS/WINDOWS`, `HostOs`, `cudart_candidates_for`, `cudart_candidates`). Both loaders now read it: `onnx-genai-ort::cuda_rt` (deleted its private `CUDART_CANDIDATES` const) and `onnx-runtime-ep-cuda::dynamic_library` (its `Runtime` match arm delegates to the guard). Deleted the #1178 agreement test `every_cuda_major_the_ep_loads_is_also_resolvable_here` and repointed the EP's `generates_linux/windows_cuda_names` tests at the canonical constants. Added `onnx-genai-cuda-version-guard` as a normal (not just build) dependency of both crates.
-**Why:** The two lists had drifted (EP had CUDA 13, `cuda_rt` did not), which made CUDA 13 hosts look CUDA-less (#1178). A test asserting two tables agree is weaker than one table — this makes the duplicate copy unrepresentable (same shape as #1170's prefix-reuse fix). The canonical table preserves the exact union of both prior lists (incl. CUDA 13 and legacy `cudart64_120.dll`), so no host regresses.
-
-### 2026-08-18: Reasoning content is sent to the client; the privacy gate is withdrawn
-**By:** Squad (Coordinator), on the owner's instruction (@justinchuby)
-**What:** The server must stream and return reasoning content to callers. The
-"keep it private" gate proposed in #1224 is cancelled. Any test asserting that
-reasoning is *absent* from a response (e.g. `reasoning_never_streams`) is
-asserting the wrong behaviour and must be inverted, covering the streamed
-deltas and the final non-streamed message as separate paths.
-**Why:** Owner decision. Agent clients are expected to see the reasoning turn.
-Note the budget half of #1224 ("give a reasoning turn room to finish") is
-unaffected and still wanted.
-
-### 2026-08-18: Session-state policy is unified behind one `SessionStore` seam (PR #1255)
-
-**By:** Coding agent (spawned by Squad coordinator), on the owner's standing
-"no 区别对待" directive.
-
-**What:** `crates/onnx-genai-engine/src/engine/session_state.rs` now owns the
-backend-independent session policy (lookup + "session {id} not found" text, the
-rewind bound-checks and their exact strings, checkpoint arithmetic). Native and
-ORT both route the six public session methods through it via `SessionStore`
-adapters in `runtime.rs`, exactly mirroring the `KvPrefixStore` precedent from
-#1170. Error strings are authored once; rendered text is byte-identical.
-
-**Guard (do not remove):** two-part DRY guard, like `ReusedPrefix` +
-`KV_REWIND_CALLERS`. (1) compile-time `CheckedPosition` newtype — the only way to
-obtain a rewind target is through the one shared bound check; (2) test-time
-tripwire `the_rewind_bound_check_lives_only_in_the_shared_policy` fails if
-`"cannot rewind session"` is open-coded outside `session_state.rs`. A future
-third backend must implement `SessionStore`, not copy the policy. Do NOT widen
-the tripwire allowlist to get a green test.
-
-**Asymmetries deliberately kept:** `create_session` (object construction, not
-policy); ORT `validate_rewind` validates draft/target/paged-KV while native's is
-`Ok(())` (persistent in-process decoder, always admits); ORT token `truncate`
-stays inside `rewind_target_state_to_len` because it is shared with the
-speculative-decode hot path — the shared policy owns the bound check, not the
-truncation.
-
-**Why it is trustworthy:** falsified — inverting the single shared bound check
-turns BOTH backends red (3 ORT `failed_rewind_of_*` + native
-`native_session_rewind_by_truncates_logical_length`, a new test added to close a
-real coverage gap); reverting restores green. Verified: 414 lib tests pass,
-clippy clean (default + native), native-backend suite green except a pre-existing
-host-RAM KV-budget test, and CUDA (RTX 4060) native_engine ran on-GPU 16 passed /
-1 pre-existing unrelated failure.
-
-**Status:** PR #1255 open, not merged, awaiting owner review.
-
-# CPU EP task runtime replaces raw Rayon fan-out in native kernels
-
-**By:** Sebastian (Performance Engineer) — 2026-08-18
-**What:** Native CPU kernels no longer fan out through the global Rayon pool.
-They call `onnx_runtime_ep_cpu::task_runtime`, which dispatches to ORT's
-`KernelContext_ParallelFor` when running inside the plugin EP and to a purpose
--built native pool otherwise. RoPE, Softmax, Transpose and the elementwise
-activation fallback are converted; the remaining raw-Rayon sites are unchanged
-and still work.
-
-**Why:**
-
-- Rayon parks its workers between parallel regions. Measured on this host, a
-  fan-out costs 67 µs back-to-back but 226 µs when it follows a 20 µs gap —
-  which is exactly the shape of decode. Documented in
-  `docs/benchmarks/2026-08-15-cpu-ep-vs-ort-attention-moe.md` §26/§27.
-- The new pool holds its workers in an adaptive spin (20 µs → 500 µs, doubling
-  on a catch and halving on a park) so back-to-back and decode-gap dispatch cost
-  the same. Measured p50 4.8 µs at a 0 µs gap and 4.9 µs at a 100 µs gap —
-  14× and 47× better than Rayon's two numbers, and, more importantly, flat.
-- Inside the plugin EP we do not run our own threads at all. Using ORT's own
-  intra-op pool is the only way to avoid oversubscribing a host that has already
-  sized its pool, and it makes our kernels honour the session's
-  `intra_op_num_threads` the way every other ORT kernel does.
-
-**Consequences / rules this sets:**
-
-1. **New parallel kernels use `task_runtime`, not `rayon`.** `for_each_range`,
-   `chunk_runs_mut` and `chunks_mut` cover the existing shapes.
-2. **Width is inferred, and SMT-capped only above 8 hardware threads.** An
-   explicit budget (`set_task_thread_budget`, `ONNX_GENAI_CPU_TASK_THREADS`) is
-   honoured exactly. The floor is empirical: below 16 logical CPUs the second
-   SMT sibling still pays for these memory-bound kernels, above it does not.
-3. **No env-var test hooks in production paths.** Determinism comes from
-   `task_runtime::testing` (`force_serial`, `isolated_pool`, `counters`,
-   `planned_backend`).
-4. **Per-vector SIMD helpers that take a closure must be `#[inline(always)]`.**
-   Not a hint: `avx2::map_ps` losing its inline made `Tanh` and `Sigmoid` 2×
-   slower on inputs that never reach the parallel path, and the trigger was an
-   edit in two unrelated files. `codegen-units = 1` does not prevent this.
-
-### 2026-08-18: #1223 — workspace re-prepare on rebucket
-
-**By:** Bishop
-
-**What:** Gap is REAL and now fixed. Rebucketing did NOT re-prepare governed
-workspace: `prepare_with_device_bindings` runs once per generation and latches
-`workspace_preparation_required`, after which `execute_kernel` refused to
-(re)allocate a prepared slot. Within one shape bucket #1221 made that safe; a KV
-growth to a new bucket (or a prompt in a different bucket than its decode steps)
-left the reserved `SessionPersistent`/`StepScoped` slot absent or undersized,
-reproducing #1221's two failure modes cross-bucket ("workspace invariant
-mismatch" / "reached execution without prepared workspace"). Fix: allow a
-prepared session to re-prepare (grow) its governed workspace slot **on eager
-(non-capture) dispatch** — exactly the dispatch a rebucket forces (the growing-KV
-decode path declines capture; a capture-eligible model re-warms eagerly after the
-KV-growth graph invalidation before it re-captures). Growth stays forbidden while
-recording a captured segment, so a replayed graph's baked workspace pointer is
-never invalidated under it. The change lives on the shared executor workspace
-path (`dispatch.rs::execute_kernel`), so it is general to every
-governed-workspace operator, not special-cased to `Attention`.
-
-**Why:** `Attention`'s route-dependent lifetime classification (decode →
-`SessionPersistent`, prefill → `StepScoped`) is what makes it hit this first, not
-what makes it unique; the correct fix generalizes #1221 rather than adding another
-Attention-specific prepare pass. Gating growth on the eager disposition keeps the
-prepared-workspace invariant intact for capture/replay while letting the one safe
-point (the rebucket re-warm) re-prepare.
-
-**Evidence:** New executor unit test
-`prepared_session_reprepares_workspace_when_execution_rebuckets` reserves a 2-row
-`SessionPersistent` slot via prepare, then executes a 4-row bucket. Reverting the
-one-line guard fails it with `workspace invariant mismatch: execute requires 4096
-bytes aligned to 512, prepared 2048 bytes aligned to 256`; with the fix it grows
-in place and passes. `cargo test -p onnx-runtime-session --lib` = 186 passed;
-clippy + rustfmt clean.
-
-## 2026-08-18 — Marlin M>1 now default ON; byte-identity bar relaxed to argmax stability
-
-Supersedes “Marlin M>1 default flip mined out” (2026-08-18). `ONNX_GENAI_MARLIN_M_GT_1`
-now defaults **ON**, and `ONNX_GENAI_MARLIN_SPLITK` moves to opt-in (default OFF).
-
-The earlier NO-GO rested on two findings. The first — that the win is marginal —
-was measured only on qwen2.5-14b/7b (0.976–1.013x). It does not generalize: on an
-A100-SXM4-80GB (SM80) serving Muse-Glimmer-30B int4, measured end-to-end through
-the server with both arms on one binary, a 3247-token prompt goes **37.5s → 16.1s
-(2.33x)**, prefill 87 → 202 tok/s; 1647 tok 23.7s → 10.4s; 647 tok 9.4s → 4.7s.
-Neutral on some models and 2.33x on others argues for a default plus an opt-out,
-not for hiding the win behind a variable nobody sets.
-
-The second finding — full-vocab token-0 logprobs are not byte-identical (max Δ
-0.017 qwen14, 0.168 qwen7 at M=128/512/2048) — **stands, and is not attributable
-to split-K**. `choose_split_k` returns 1 for `m > SPLITK_MAX_M` (32), so prefill
-never elected a split; that divergence is the direct tensor-core kernel's
-accumulation order versus the tiled GEMM. An earlier draft of this change claimed
-otherwise and was wrong.
-
-So this entry records a deliberate **relaxation of the bar**, not a claim that the
-bar is met: the shipping default is now *argmax-stable* rather than
-*bit-identical*. Greedy token streams match (validated by `marlin_m_gt_1_e2e.rs`
-parity plus an 826-token spot check across the flip: identical answer, one
-sentence reworded at a near-tie). Consumers of the *distribution* rather than the
-selected token — a logprobs API, beam search, spec-decode acceptance ratios —
-should set `ONNX_GENAI_MARLIN_M_GT_1=0`.
-
-Split-K goes opt-in because flipping the parent ON would otherwise newly ship a
-second, independent divergence source (its fixed-order fp32 partial reduction) to
-every default deployment. It is inert for prefill by construction; the shapes it
-governs are M<=32 speculative verify, which is separately shelved. Recover it
-with `ONNX_GENAI_MARLIN_SPLITK=1`.
-
-Not addressed: Marlin is no longer the prefill bottleneck. With it on,
-`MatMulNBits` is ~20% of a prefill forward (GEMMs at ~74 TFLOPS); attention and
-elementwise ops are the other ~80%.
+**Key result (H200, eager, medians-of-5):** deep fixed-256 46.37 → adaptive **48.32 tok/s (+4.2%; +70% vs monolithic)**; shallow **60.82 (+4.7%; +17.7% vs mono)**; short capture neutral. Occupancy A/B: monolithic grid16/waves0.02/warps9.8%/DRAM0.8% → fixed-256 grid256/0.48/11%/34% → **adaptive grid512/0.97/24%/48%**. Byte-identical short; f64-tol wide.
 
 ---
 
-### 2026-08-18: SM-version kernel dispatch scaffolding (arch tier table)
-
-**By:** Batty
-
-**What:** Added arch-guarded kernel-dispatch scaffolding to `onnx-runtime-ep-cuda`
-so the pending RTX/consumer-GPU kernels have a clean insertion point, without
-touching any live kernel selection. Three pieces:
-
-1. **Device-property probe extension.** Built on the existing
-   `runtime::CudaDeviceCapabilities` seam (it already exposes compute capability,
-   multiprocessor count, and opt-in shared-mem ceiling). Added an L2 cache-size
-   probe (`CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`) with a `0 = unknown` fallback and
-   an `l2_cache_size()` getter. No duplicate probe struct created.
-2. **Arch dispatch table** (`src/arch.rs`): `ArchTier`
-   {Legacy, Volta, Turing, Ampere, Ada, Hopper, Blackwell} with a **total**,
-   panic-free `from_compute_capability` mapping, plus an `ArchConfig` of per-tier
-   default hints (QMoE tile, resident warps/SM, tensor-core eligibility, smem
-   budget, Ada L2-residency candidate). Hint values are seeded from today's
-   hardcoded selectors (`qmoe_gemm::tile_for`, `matmul_nbits` resident-warps,
-   `marlin_gemm::device_supports_marlin`).
-3. **Insertion points**: `// RTX/arch:` hooks tagged RTX-TILING, RTX-SPLITK,
-   RTX-CPASYNC, RTX-L2RES mark exactly where the pending device-property tiling,
-   split-K-by-SM-count, shared `cp.async` staging, and Ada L2-residency kernels
-   plug in.
-
-**Why:** No A100/Ada/Blackwell/RTX hardware is attached (H200 `sm_90` only), so
-this is scaffolding + correctness, not live RTX benchmarking. The layer lets us
-select kernel variants/tiling by compute capability the moment hardware lands,
-honoring the standing "rtx显卡也要优化" directive (optimizations must help
-consumer RTX 30/40/50, not just H200).
-
-**sm_90 no-change proof (HARD):** (a) The scaffolding is *not wired into any live
-selection path* — `arch_tier`/`arch_config`/`ArchTier`/`ArchConfig` are referenced
-only by their own definitions in `runtime.rs` and by `arch.rs`; no kernel selector
-(matmul_nbits, qmoe, marlin, gqa) calls them, so dispatch on every device is
-byte-for-byte unchanged. (b) The only `CudaDeviceCapabilities` change is an
-*additive* `l2_cache_size` field; existing getters return identical values and
-existing selectors are untouched. (c) Regression-locked by
-`sm_90_hopper_config_is_frozen` (tile 8, 64 resident warps, tensor-core eligible,
-no L2-residency) reached both directly and through a synthetic sm_90 device.
-
-**Tests:** `CUDA_VISIBLE_DEVICES=7 cargo test -p onnx-runtime-ep-cuda --lib -- arch:: capability_limits` → 7 passed. `cargo check` clean; `cargo clippy` clean on changed files (the single remaining warning is in the pre-existing dirty `matmul_nbits.rs`, not this change); `cargo fmt` applied.
-
-**Merged PR:** #1287
-
----
-
-### 2026-08-18: on-GPU argmax base-decode win — GO (byte-identical), tie-break option added
+### 2026-08-19: attention_split launch_bounds / register pass — NO-GO (latency-bound, not occupancy-bound)
 
 **By:** Deckard
 
-**What:** GO. Promoted/validated the on-GPU device argmax as a byte-identical greedy
-BASE-decode win and added a highest-index tie-break OPTION to the device argmax
-reduction kernel. Branch `squad/ongpu-argmax-base`, PR #1293 (off origin/main
-684c70d0, worktree ../ongpu-argmax-wt).
+**What:** Tested `__launch_bounds__(256, minblocks)` pass on `attention_split` to raise resident CTAs/SM. NO change shipped; branch `squad/attention-split-launchbounds` carries no code change.
 
-**Tie-break finding (supersedes the task's stated blocker):** the device argmax
-kernel and the engine's host greedy reference BOTH already resolve ties to the
-LOWEST token id (`sample_greedy` / `argmax_logits_tensor`, canonical ONNX ArgMax
-`select_last_index=false`). They are therefore ALREADY byte-identical with the
-default lowest-index tie-break — the feared ~72.9% fp16-ULP-tie divergence does
-NOT occur on the shipping path. The `max_by`-based "highest index" references
-noted in the task are in test/bench code, not the shipping greedy sampler. I
-still delivered a `HighestIndex` kernel OPTION (default stays `LowestIndex`) so the
-same reduction can match a `max_by` / `select_last_index=true` reference where
-needed; threaded through `ExecutionProvider::device_argmax` → CUDA provider →
-session `DeviceIoBinding` → NVRTC partials/finalize kernels. Proven distinct on
-identical fp16 ULP-tie inputs (new unit test) + a low-vs-high regression lock.
-All 7 ep-cuda device_argmax GPU tests pass (GPU0); engine tensor_argmax tests pass.
-
-**Byte-identity result (0.000% token divergence, 128 tok greedy, PINNED):**
-- qwen2.5-0.5b int4 (24 layers, head64), GPU0: divergence 0.000% — PASS
-- qwen2.5-14b int4-zp (48 layers, head128), GPU1: divergence 0.000% — PASS
-
-**A/B perf (medians of 5 runs, 128 tok, decode-skip 1, warmups 2, PINNED idle GPU):**
-| model | host-argmax tok/s | on-GPU-argmax tok/s | net |
-|-------|-------------------|---------------------|-----|
-| qwen2.5-0.5b int4 (GPU0) | 500.07 | 638.53 | 1.277x (+27.7%) |
-| qwen2.5-14b int4-zp (GPU1) | 155.80 | 169.49 | 1.088x (+8.8%) |
-
-**Wiring status:** on-GPU device argmax is the default in the standalone native
-greedy loop (`NativeDecodeSession` → `next_token_greedy` → `decode_cuda_greedy` →
-`read_greedy_result` → `device_argmax`). The pipeline decoder (`NativePipelineDecoder::step`)
-is deliberately NOT wired here to keep this PR byte-identity-safe; recommend a follow-up.
-
-**Default recommendation:** keep on-GPU argmax ON by default for the native
-greedy loop — byte-identical and a strict tok/s win on every model measured. Keep
-`LowestIndex` tie-break default; expose `HighestIndex` only as an opt-in kernel option.
-
-**Why:** eliminates the per-step logits D2H + host reduction on the greedy base
-path with zero token drift, a pure BASE-decode win (no speculative).
-
-**Merged PR:** #1293
+**Why NO-GO:** lb worked at register level (56→40 reg/thread, occupancy limit 4→6 blk/SM, no spill). But produced no E2E win: at grid 512 all blocks already fit in one wave at 4 blk/SM, so freed occupancy headroom places no new blocks. Denser grid (chunk 96 → grid 688) did raise warps-active 24.2%→33.0%, but deep E2E stayed flat (DRAM actually dropped 47.8%→42.0%). Roofline verdict: `attention_split` at M=1 is bound by per-warp **dependent-load latency chain** (serial Q·K + P·V accumulation), not occupancy. Grid-512 from #1350 already sits at the effective knee. Consistent with QMoE GEMV roofline NO-GOs — moat decode kernels are at the M=1 latency roofline.
 
 ---
 
-### 2026-08-18: Device-property tiling for the int4 decode GEMV (consume arch dispatch)
-
-**By:** Batty
-
-**What:** Wired the SM-version dispatch scaffolding from #1287 into the
-int4/accuracy_level=4 decode GEMV so tiling + split-K grid-fill are keyed off
-probed device properties through one arch seam. Three pieces, all in
-`onnx-runtime-ep-cuda`:
-
-1. `arch.rs` — `decode_resident_warps_per_sm(cc)` reproduces the existing
-   resident-warp ladder byte-for-byte (`(8,0)|(9..,_) => 64`, else `48`), and a
-   new `DecodeTilingProfile { tier, multiprocessor_count, resident_warps_per_sm,
-   sm_count_split_k }` + `one_wave_ctas(threads)` fold the arch tier, SM count
-   and resident-warp estimate into the split-K decision the pending RTX kernels
-   select through.
-2. `runtime.rs` — `CudaDeviceCapabilities::decode_resident_warps_per_sm()`
-   delegates to the arch layer.
-3. `matmul_nbits.rs` — `use_accuracy4_stage64` now reads its resident-warp
-   estimate from the arch helper instead of an inline `match`.
-
-**Which tier gets which tiling:**
-- **Hopper `sm_90` (H100/H200):** 64 resident warps/SM; **excluded** from the
-  new SM-count split-K lever (`sm_count_split_k = false`) — frozen to today's
-  exact selection.
-- **Ada `sm_89` (RTX 40 / L4/L40), Ampere `sm_86`/`sm_87` (RTX 30):** 48
-  resident warps/SM; opt **into** the SM-count-driven split-K lever
-  (`sm_count_split_k = true`). `one_wave_ctas()` scales the occupancy target
-  with the probed SM count, so lower-SM parts (e.g. an L4 with 58 SMs) reach one
-  wave sooner and split-K fills the grid without oversubscription.
-- **Turing/Volta/Legacy/Blackwell:** total, panic-free mapping; consumer tiers
-  opt into the lever, Blackwell datacenter stays on the 64-warp rung.
-
-**Why:** Standing directive "rtx显卡也要优化" — the decode GEMV's grid-fill must
-track consumer/edge RTX SM counts, not just H200's 132 SMs. Much of the
-SM-count-driven split-K already existed (the selectors read
-`multiprocessor_count`); this change gives the resident-warp/occupancy input a
-single arch-aware seam and a unit-testable `DecodeTilingProfile` for the pending
-`rtx-devprop-tiling` kernels, without perturbing H200.
-
-**H200 byte-identity evidence:** structural (arch helper returns same 64 on sm_90 as
-old inline match) + tests (`accuracy4_resident_warps_matches_prior_inline_ladder`,
-`sm_90_decode_profile_is_frozen_out_of_rtx_splitk`) + GPU parity (19/20
-matmul_nbits_gpu decode tests, 1 pre-existing failure on pristine origin/main).
-
-**Verdict:** Zero-H200-change, test-locked scaffolding-that-selects. No Ada/Ampere
-hardware attached; RTX path validated via synthetic `for_test` capabilities only.
-Benchmark when RTX hardware lands. **Merged PR #1298 (04cfb77e).**
-
----
-
-### 2026-08-18: Rescue PR #976 — split-block device argmax landed on current main — GO
+### 2026-08-19: Parallelize `derive_len` mask-frontier scan — GO (PR #1357, merged 354be8fc7)
 
 **By:** Deckard
 
-**What:** Rescued and re-landed the valuable change from draft PR #976 ("Split the
-device sampler argmax across blocks instead of one per row") in `onnx-genai-ort`'s
-device sampler (`crates/onnx-genai-ort/src/device_sampler.rs`). New branch off
-origin/main (04cfb77e): `squad/rescue-976-split-argmax`, PR #1306. Worktree
-`/home/justinchu/wt-976`.
+**What:** Replaced single-thread O(key_len) serial mask scan with block-parallel 256-thread min-index reduction. Launch stays grid(1,1,1)/block(256,1,1) → capture-safe. One file: `standard_attention.rs`.
 
-**What was dropped:** PR #976 had 3 commits; the bottom one (`2965895f` PTX/loader
-prerequisite) already landed on main as #964 — dropped. Cherry-picked only
-`0048f5fb` (split-block argmax kernels + dispatch) and `91e64a75`
-(dtype/batch/width tests). Both applied cleanly onto current main and compose
-correctly with main's post-branch rework.
+**Why:** Deep-ctx re-rank surfaced `derive_len` as 2nd-largest decode kernel at ~2600 tok (143.6µs/call, 5.7% GPU time, fired per-layer per-step, O(context) cost). Root cause: grid(1,1,1)/block(1,1,1) single-thread serial scan. Block-min reduction is byte-identical by construction (integer index, no fp accumulation).
 
-**Reconciliation with multi-row-argmax rework:** split composes ON TOP —
-`argmax_into` derives `parts = argmax_parts(vocab)` and when `parts > 1` launches
-`argmax_part_{f16,bf16,f32}` with `grid=(parts, rows)` then `argmax_join` with
-`grid=(rows)`. Narrow rows (`vocab <= 2*BLOCK`) return `parts=0` and stay on the
-single-launch kernel unchanged.
-
-**Byte-identity result (H200, GPU3, PINNED, release):** UNCHANGED vs current main.
-All GPU tests pass (split_matches_single_launch, batched_rows, odd_widths, main's
-own parity tests). 19 non-ignored + 6 GPU-gated device_sampler tests pass; 0 fail.
-
-**Kernel A/B (H200, vocab=202048, medians of 5):**
-| path | median |
-|------|--------|
-| one-block-per-row (parts=1) | 38.17 µs |
-| split (parts=99, auto) | 23.49 µs |
-Speedup **1.62×** end-to-end. Pure-kernel win larger; original PR measured 19.52 µs
-→ 3.60 µs at this vocab.
-
-**Verdict: GO.** Byte-identical argmax confirmed across dtype/batch/width on H200.
-Split win is NOT superseded by multi-row rework — they are orthogonal (multi-row
-spreads rows on y-axis; this adds per-row block split). **Merged PR #1306 (9ac981ca).**
+**Key result (H200, medians-of-5, DeepSeek-V2-Lite int4):** derive_len kernel 143.6µs → **4.86µs (29.5×)**; E2E deep ctx 46.55 → **56.43 tok/s (+21.2%)**; short ctx +2.7%. Deep win reproduced across two 5-run sets. Win matches roofline prediction (removing ~3.9ms/tok serial scan from 21.5ms/tok decode). Perp-step hoist (b) evaluated and deferred: after (a) the residual 27×4.86µs is ~0.7% of deep-ctx decode — cross-cutting refactor risk not justified.
 
 ---
 
-### 2026-08-18: QMoE decode profiling → block-parallel router TopK (byte-identical +24% on V2-Lite) — GO
+### 2026-08-19: Block-parallel int64 cumsum for low-lane decode — GO (PR #1366, merged e19697fb0)
 
 **By:** Deckard
 
-**What:** Profiled DeepSeek-V2-Lite int4 QMoE eager decode (H200, PINNED), then
-shipped the highest-leverage byte-identical decode win it surfaced. Branch off
-origin/main (e87af36d): `squad/qmoe-expert-gemv`, PR #1317. Worktree
-`/home/justinchu/wt-qmoe` (NOT /tmp — runtime forbids it). One source file
-changed: `crates/onnx-runtime-ep-cuda/src/kernels/topk.rs` (+ its
-`indexing_gpu.rs` test).
+**What:** Added `cumsum_block_i64` — block-per-lane cooperative prefix scan (intra-tile Hillis-Steele, tile=blockDim=256, running per-block base) for int64 low-lane calls (`lanes ≤ sm_count`). Launcher routes these to it; fp32 and high-lane (prefill) calls keep the existing serial-per-lane kernel. Two files: `cumsum.rs`, `indexing_gpu.rs`. Byte-identical (int64 only — integer addition is associative; fp32 explicitly excluded to preserve byte-identity). Grid=lanes, block=256 fixed → capture-safe.
 
-**Profile table (nsys, cuda_gpu_kern_sum, eager, 48 tok, GPU3):**
-| kernel | % GPU | avg |
-|---|---|---|
-| topk_f32 (MoE router select) | **28.4%** | 81.7 µs/layer |
-| qmoe_gate_up_activate_f32 | 14.8% | 42.7 µs |
-| matmul_nbits_gemv (attn/dense) | 13.3% | 5.2 µs |
-| qmoe_linear_f32 | 10.0% | 28.7 µs |
-| attention_row | 8.9% | 24.7 µs |
-| qmoe_route / qmoe_combine | 2.3% / 0.7% | — |
+**Why:** Post-#1357 deep-ctx re-rank surfaced `cumsum_i64` as the standout: 341µs/call at ~2600 tok (confirmed O(context): 45.8µs at ~640 → 341µs at ~2600). One call per decode step. Derives-len anti-pattern again: batch-1 sequence cumsum (`position_ids = cumsum(attention_mask)`) has lanes==1, collapsing to one thread scanning seqlen serially.
 
-QMoE expert-GEMV (gate_up+linear+route+combine) ≈ 27.8% GPU → a real hotspot
-(NOT a NO-GO-not-a-hotspot). BUT the single biggest kernel is the router `TopK`.
-Root cause: at decode a MoE router `TopK` is `[1,1,64]` → `slices==1`, and the
-one-thread-per-slice `topk_*` kernel runs the whole top-6-of-64 selection on a
-SINGLE thread (serial dependent global loads). That is both the #1 cost and the
-cleanest byte-identical lever, so I optimized it.
-
-**What I did:** added a block-per-slice `topk_block_*` kernel; the launcher
-dispatches under-saturated shapes (`slices <= SM count`, i.e. decode) to it and
-leaves the wide/prefill one-thread-per-slice path untouched (no-regression by
-construction). Top-k selection is exact (integer-keyed compare, lower-index
-tie-break); the tree reduction preserves the same `before` total order → the
-output is byte-identical.
-
-**Numerics gate — byte-identical (PASS):**
-- Router `topk_deepseek_router_k6_of_64` (ties→lowest index) + 256-expert fp16
-  router-scale test now run on the block path and still match the CPU oracle.
-- New `topk_block_decode_path_is_byte_identical_to_cpu_oracle` (tie-dense
-  f32/fp16/bf16 decode shape) locks block == CPU oracle.
-- Full `indexing_gpu`: 16/16 pass (incl. capture-safety test).
-- **V2-Lite native-CUDA golden decode lock** passes unchanged
-  (`deepseek_v2_lite_native_cuda_matches_golden_greedy_sequence`, post434 export).
-- End-to-end 128-token stream identical before/after in BOTH eager and capture.
-
-**Perf A/B — H200, GPU3 PINNED, 128 tok, medians of 5 (PASS):**
-- Router TopK kernel: 81.7 µs → 9.73 µs/layer (**8.4×**); 28.4% → 4.5% of GPU.
-- Production capture decode: **101.17 → 125.68 tok/s (+24.2%, 1.24×)**,
-  9.884 → 7.957 ms/tok. Baseline matches historical 101.68 tok/s. Variance tight
-  (±0.1 tok/s within each arm). No prefill regression (dispatch only diverts
-  under-saturated slice counts).
-
-**Verdict: GO.** Byte-identical greedy decode confirmed (kernel oracle tests +
-V2-Lite golden lock + 128-tok E2E identity) AND a large positive delta on H200
-(+24% capture tok/s). After this, `qmoe_gate_up_activate` is the new #1 kernel
-(19.8%) — the QMoE int4 expert GEMV is the natural next lever. **Merged PR #1317.**
+**Key result (H200, medians-of-5, DeepSeek-V2-Lite int4, CUDA graphs ON):** cumsum kernel 341.5µs → **18.08µs (18.9×)**; E2E deep ctx CUDA graphs ON: 109.5 → **113.6 tok/s (+3.8%)**, short +1.1% (flat); eager deep +1.7% (launch-bound path, cumsum hid under gaps). CUDA-graph path is the production metric — the ~330µs/token saving lands directly on the critical path.
 
 ---
 
-### 2026-08-18: QMoE gate_up_activate expert GEMV — occupancy default-on + selective read-only-cache int4 loads (+2.2% V2-Lite decode, byte-identical) — GO
+### 2026-08-19: GLM-4-9B fair same-export A/B, block-32 prize-bounding, splitk_wide deep-profile
 
-**By:** Deckard
+**By:** Wallace (benchmarking / perf-fairness) — read-only measurement; no PR, no kernel edits.
 
-**What:**
-Optimized `qmoe_gate_up_activate_f32` (fused SwiGLU gate/up int4 expert GEMV), the
-#1 decode kernel on DeepSeek-V2-Lite int4 QMoE (19.8% of GPU decode after the
-#1317 TopK win). Two byte-identical levers in
-`crates/onnx-runtime-ep-cuda/src/kernels/qmoe.rs`:
+**What (three findings):**
 
-1. Flipped the occupancy-raised `_occ` entry (`__launch_bounds__(256, 6)`) from
-   DEFAULT-OFF to DEFAULT-ON. Opt out via `ONNX_GENAI_QMOE_OCC=0/false/off`.
-2. Added a `ReadOnly` template param routing packed weights/scales/zero-points
-   through the read-only data cache (`__ldg`), scoped ON only for the fused gate/up
-   path (fc2 keeps default cached loads — blanket `__ldg` on shared helper
-   regressed fc2 +14.6%; selective scope captures gate/up win flat on linear).
+1. **Fair same-export A/B (identical `model.onnx.data` inode):** H200, CUDA-graph both engines, greedy, medians-of-5: native 213.39 tok/s vs ORT-genai **251.37 tok/s = ORT 1.18× faster**. The prior 97.62 tok/s native number (Sapper) does NOT reproduce across 2 binaries × 2 exports × 2 configs — retracted as an unrepresentable contention artifact. GLM is a **~18% native optimization target**, not a moat.
 
-Shipped as PR #1323 off origin/main @ 1660cff6.
+2. **Block-32 re-export prize-bounding = ≤0.** Re-quanting to block-32 DOES engage the fused fast-path (`select_f16_gemv_variant` returns DownProjection only when block_size==32), confirmed by nsys. But native is **SLOWER** at block-32: −3.4% short (211.64→204.44), −4.2% deep (194.96→186.84). Gain from fusing RMSNorm more than cancelled by 4× scale-metadata DRAM traffic. ORT hurts less (−1.8%/−1.9%). Gap WIDENS at block-32 (1.18→1.20× short, 1.25→1.28× deep). **Do NOT spawn a block-128→32 kernel agent on the fusion rationale.**
 
-**Why:** gate_up is Long-Scoreboard bound on int4 weight-load latency (ncu: DRAM
-9.1%, 50% theo occupancy), so latency-hiding — not bandwidth — is the lever.
-`__launch_bounds__` raises resident warps; `__ldg` cuts per-load latency. Both load
-identical bytes in the same accumulate order → bit-identical fp32 partials.
+3. **splitk_wide is latency-bound at M=1 (DRAM 16.6%, No-Eligible 30.8%).** Root cause: single-column-per-warp accumulation exposes load latency; DRAM idle 83% despite healthy occupancy (59.8%). Native's own `wide_multicol` reaches 37.4% DRAM (1.79 TB/s) on the same GPU at LOWER occupancy — by register-blocking 4 columns/warp. Fix: multicol × split-K hybrid for down_proj/qkv shapes (register-block 2–4 cols AND keep K_SPLIT for grid fill). Predicted native 243–274 tok/s (closing or passing ORT's 249.83). Sebastian implementing.
 
-**Profile after (nsys, H200, eager, pinned):**
-- qmoe_gate_up_activate_f32: 42.68 µs → 34.24 µs (−19.8%)
-- qmoe_linear_f32: 28.79 µs → 28.77 µs (~0, no collateral regression)
-
-**Byte-identity result:**
-- V2-Lite native-CUDA golden decode lock: BYTE-IDENTICAL greedy sequence.
-- `qmoe_occ_is_bit_identical`: 0 differing bits (fp16/bf16/fp32 × rows ∈ {1,4,6,8}).
-- 32/32 `qmoe_gpu` tests pass.
-
-**H200 A/B (capture, 128 tok, medians of 5, PINNED):**
-- Baseline: median 124.98 tok/s
-- This PR: median 127.77 tok/s → **+2.23% V2-Lite decode.**
-
-**Verdict: GO.** Byte-identical + real positive delta. Selective `ReadOnly` scoping
-is a standing lesson: profile the helper's callers separately before applying
-cache hints uniformly. **Merged PR #1323.**
+**Depth-scaling finding:** block-128 native loses −7.9% short→deep-2600 vs ORT −2.7%; gap widens 1.18×→1.25×. GQA decode-attention path scales worse than ORT's. Second lever required for deep-ctx parity (post GEMV fix).
 
 ---
 
-### 2026-08-18: Port ORT int4 decode-GEMV ideas into QMoE expert GEMVs — NO-GO (occupancy spill; kernels already at M=1 decode roofline)
+### 2026-08-19: CLAIM RETRACTION — GLM-4-9B is NOT a moat; it is an ~18% native deficit
 
-**By:** Deckard
+**By:** Wallace / Scribe (claim-integrity)
 
-**What:** Studied ORT's int4 decode-GEMV machinery (`moe_gemv_device.cuh`,
-`fpA_intB_gemv`, `matmul_nbits`) and evaluated porting each idea into the hand-rolled
-NVRTC QMoE expert-GEMV kernels (`qmoe_gate_up_activate_f32`, `qmoe_linear_f32`)
-on DeepSeek-V2-Lite int4 (H200, PINNED). Four ideas examined: (1) issue all weight
-loads before consuming any ("batching"); (2) interleaved weight layout for coalesced
-loads; (3) raise occupancy via `__launch_bounds__` on `qmoe_linear`; (4) vectorized
-128-bit loads + K-paired hfma2.
-
-**Evidence:**
-- Idea 1 (load batching) was ported byte-identically (128-tok md5 match) but
-  **REGRESSED** gate_up 34.18 µs → 40.96 µs (+19.8%). ncu root cause: 40 reg/thread
-  at 6 blk/SM (register-limited by `__launch_bounds__(256,6)` from #1323); holding a
-  second live weight struct spills past the 40-reg cap → occupancy loss > added MLP.
-- Idea 2 (layout interleave): already inapplicable — our loads are fully coalesced
-  (thread t reads packed[row×packed_in + t×4], 128B transactions/warp).
-- Idea 3 (launch_bounds on linear): ncu shows `qmoe_linear_f32` at **8 blk/SM = the
-  64-warp hardware ceiling**, 85.4% achieved occupancy. Zero headroom.
-- Idea 4 (vec2/hfma2): not byte-identical (K-pairing reorders accumulation); would
-  increase register pressure — same failure mode as idea 1; not pursued.
-
-**Roofline read:** both QMoE expert GEMVs are memory-LATENCY bound (DRAM ~10–11%),
-already at max occupancy. ORT's residual edge is a different kernel structure
-(register-tiled CUTLASS GEMV) suited to its dispatch model, not ours.
-
-**Verdict:** NO-GO. No PR opened. Both QMoE GEMV micro-opt levers (per-load ORT ideas
-and prior `__ldg`/occupancy work in #1323) are now exhausted. Both kernels are at the
-M=1 decode roofline: occupancy-max, latency-bound, irreducible weight traffic.
-Further QMoE gains require reducing WEIGHT BYTES (lower-bit format — numeric risk,
-model/format change), not kernel restructuring. **Next lever: `attention_row` (12.4%,
-24.7 µs), the largest untouched non-dense decode kernel.**
+**What:** The "2.56×" native-over-ORT claim for GLM-4-9B is **RETRACTED**. Sapper's 97.62 tok/s native baseline was an un-reproducible contention artifact (VRAM-limit/weight-streaming in that run). Fair same-export CUDA-graph A/B (identical `model.onnx.data` inode 239679076): **native 213.39 vs ORT-genai 251.37 tok/s = ORT 1.18× faster**. GLM is not a "only-we-can-run" moat — ORT loads and runs it faster on the identical export. Do NOT cite 97.62 or 2.56× anywhere. The native GLM decode gap is real, isolated, and tractable: root cause is `matmul_nbits_gemv_f16_general_bs_splitk_wide` (41% decode, 16.6% DRAM peak, latency-bound at M=1 from single-column accumulation); block-32 re-export was prize-bounded at ≤0. Real lever: register-block the split-K GEMV to match `wide_multicol`'s 37.4% DRAM (Sebastian implementing).
 
 ---
 
-### 2026-08-18: Fuse QMoE expert pipeline (gate_up→fc2) to eliminate intermediate DRAM round-trip — NO-GO (premise refuted; fusion destroys occupancy)
+### 2026-08-19: CLAIM RETRACTION — DeepSeek int4 QMoE is NOT an "ORT-can't-run-it" moat; ORT is FASTER on a fair CUDA export
 
-**By:** Deckard
+**By:** Sapper / Scribe (claim-integrity)
 
-**What:** Investigated fusing `qmoe_gate_up_activate` → `qmoe_linear` (the M=1 decode
-expert pipeline) to eliminate the intermediate-activation DRAM round-trip and amortize
-routing/scale metadata reads. This was the "next lever" recommended in the ORT-ideas
-NO-GO above. Profiled and quantified traffic before touching code.
-
-**Evidence (ncu, per launch, H200 GPU3 pinned):**
-| Kernel | DRAM read (int4 weights) | DRAM write (intermediate) | dur |
-|---|---|---|---|
-| qmoe_gate_up_activate_f32_occ | 18.54 MB | 20.99 KB | 35.65 µs |
-| qmoe_linear_f32 | 9.31 MB | 256 B | 30.69 µs |
-
-- Combined traffic = **27.85 MB**, dominated by irreducible int4 expert-weight reads.
-  Fusion does NOT reduce weight traffic — every expert's fc1/fc3/fc2 weights must
-  still be read once.
-- The intermediate round-trip fusion targets = 20.99 KB write = **0.075% of DRAM
-  traffic**. The fc2-side read is served from L2 (not DRAM). Metadata (6 ints = 24 B)
-  saves < 0.01% — unmeasurable.
-- True fusion collapses the grid to ~6 blocks/route (vs 8448 + 12288 separate blocks),
-  destroying the occupancy that hides weight-load latency — the exact mechanism tuned
-  by #1323. SM occupancy ~4.5% vs current occupancy-max.
-
-**Roofline:** 18.54 MB in 35.65 µs = 520 GB/s ≈ 11% of H200 HBM3 → latency-bound,
-consistent with prior ncu. Fusion is doubly counterproductive: saves ≤0.075% traffic,
-wrecks latency hiding.
-
-**Verdict:** NO-GO. No PR opened. This closes the second and final QMoE decode lever
-(traffic reduction / fusion). Combined with the ORT-ideas NO-GO above, **both QMoE
-decode optimization levers are now exhausted with quantitative evidence.** The kernels
-are at the M=1 decode roofline (occupancy-max, latency-bound, traffic irreducible to
-int4 expert weights). Further QMoE gains require a lower-bit weight format — a
-model/format change, not kernel work. **Next lever: `attention_row` (12.4%, 24.7 µs).**
+**What:** The "598×/0.17 tok/s ORT" claim for DeepSeek-V2-Lite int4 QMoE is **RETRACTED**. Root cause: ORT's CUDA QMoE kernel requires fp16/bf16 activations; our default export emits fp32 → ORT partitioner drops all 26 QMoE nodes to CPU EP silently. The 0.17 tok/s was a CPU-fallback artifact, never an ORT-CUDA-QMoE measurement. ORT 1.27 DOES ship a CUDA QMoE kernel (int4/block128/swiglu/k=6). Fair CUDA-vs-CUDA A/B on an fp16-activation export: **ORT places all 26 QMoE on GPU (0 Memcpy) at 86.78 tok/s vs native fp32-activation 55.15 tok/s = ORT 1.57× faster** at M=1 short decode. Do NOT cite 598× or "ORT can't run QMoE." The export-compat gap (native EP requires fp32 QMoE activations, ORT CUDA QMoE requires fp16/bf16) means no single export currently runs QMoE-on-CUDA in both engines — this is a mutual constraint, not an ORT deficiency. Deep-ctx (~2600) native currently aborts (Attention workspace not resized for large KV — under investigation). Native's #1 lever: fp16-activation QMoE kernel.
 
 ---
 
-### 2026-08-18: attention_row decode block-width 128→256 — GO, byte-identical (PR #1337, merged 37bdefe8)
+### 2026-08-19: Decode per-kernel fp32 shaving is near the floor
 
-**By:** Deckard
+**By:** Deckard / Scribe (claim-integrity)
 
-**What:** Widened the decode launch of `attention_row`
-(`crates/onnx-runtime-ep-cuda/src/kernels/standard_attention.rs`) from 128 to 256
-threads/block. Prefill keeps 128 threads. Env override
-`ONNX_GENAI_ATTN_ROW_THREADS` available. BYTE-IDENTICAL: more threads, same
-ascending accumulation order (Q·Kᵀ / serial softmax / P·V all unchanged).
-
-**Profile evidence (ncu, H200 pinned, V2-Lite eager decode, ~65-key ctx):**
-Grid = 16 blocks, achieved occupancy 6.23% (3.99/64 warps/SM), waves/SM 0.01.
-DRAM 0.17%, SM 0.47% — near-zero utilization yet 25µs → pure memory-latency
-bound; 62.7% barrier-stall cycles. Not at roofline; real structural headroom.
-attention_row context scaling: 12.4% GPU decode share at short ctx, **25.3% at
-~500-tok prompt / 64-tok gen, 40.0% at ~500-tok / 256-tok gen** — overtakes
-QMoE kernels at realistic depth. This is the **#1 decode kernel at realistic and
-wide context** (up to 40% at deep ctx); both QMoE decode levers are exhausted.
-
-**Numerics gate:** BYTE-IDENTICAL. Token-id md5 unchanged on V2-Lite short/long
-ctx and dense qwen2.5-0.5b-int4. Golden lock PASS. Standard-attention fp16/bf16/
-capture tests PASS. 23/24 suite (1 pre-existing fail on clean origin/main,
-unrelated dtype-claim test — coordinator-confirmed).
-
-**H200 A/B (pinned, median of 5):**
-| workload | baseline | PR | Δ |
-|---|---|---|---|
-| V2-Lite ~500-tok, 128-tok gen — attention_row kernel | 172 µs | 148 µs | **−14%** |
-| V2-Lite ~500-tok, 128-tok gen — E2E | 81.94 tok/s | 86.47 tok/s | **+5.5%** |
-| V2-Lite short / dense qwen long ctx — E2E | neutral | neutral | — |
-
-**Merge:** PR #1337, commit 37bdefe8.
-
-**Strategic note:** attention_row is the highest-leverage non-dense-GEMV decode
-lever available (QMoE levers exhausted). This is the disciplined first step;
-split-KV was named as the follow-up to fill the 116 idle SMs.
-
----
-
-### 2026-08-18: attention_row split-KV / FlashDecoding — GO, default-ON (PR #1340, merged 763d81f5)
-
-**By:** Deckard
-
-**What:** Added a two-kernel FlashDecoding split-KV path for `attention_row` decode,
-default ON via `ONNX_GENAI_ATTN_SPLITKV` (`=0` = monolithic baseline).
-- `attention_split` (grid `(total_rows, num_splits)`): per-slice online softmax,
-  writes unnormalized partial P·V + per-split max/sum.
-- **Single-split sentinel fast path** (`total_seq <= chunk`, default chunk=256):
-  reproduces `attention_row` exactly with sentinel meta (max=0, sum=1) →
-  contexts ≤ chunk are **byte-identical pass-through**.
-- `attention_combine`: uniform log-sum-exp merge across splits.
-- `num_splits = cap.div_ceil(chunk).clamp(1,64)` derived from fixed KV `cap` →
-  capture-safe (eager and capture make identical launch decisions).
-
-**Profile evidence (ncu, H200 GPU3, V2-Lite eager decode, wide ctx):**
-attention_row = #1 kernel, 36% of GPU decode. Grid=16, waves/SM=0.02 (~116 idle
-SMs), achieved occupancy 9.8%, DRAM 0.79% — machine starved. Split-KV is the
-textbook fix; at cap≈2048 → ~8 splits → grid~128 fills the machine.
-
-**Numerics gate:**
-- Short ctx (≤ chunk): **BYTE-IDENTICAL** via single-split sentinel. V2-Lite
-  24-tok golden lock PASS.
-- Wide ctx (multi-split): **f64-tol** (#1150 oracle path). V2-Lite 340-tok
-  long-context lock (`eager==capture` + golden prefix) PASS; greedy tokens
-  unchanged. Standard-attention capture/fp16/bf16 PASS; layout unit tests 14/14.
-- 23/24 suite (1 pre-existing fail — same as #1337, unrelated).
-- Dense qwen2.5-0.5b: token md5 byte-identical (no regression).
-
-**H200 A/B (GPU3, pinned, median of 5):**
-| workload | baseline | PR | Δ |
-|---|---|---|---|
-| Wide-ctx attention_row kernel | 147.6 µs | ~65 µs (split+combine) | **~2.3×** |
-| DRAM throughput (wide ctx) | 0.79% | 9.26% | fills machine |
-| E2E wide ctx | 51.64 tok/s | 56.90 tok/s | **+10.2%** |
-| E2E short eager / short capture / dense qwen | neutral | neutral | — |
-
-**Merge:** PR #1340, commit 763d81f5.
-
-**Strategic note:** attention_row is the #1 decode kernel at realistic/wide context
-(up to 40% at deep ctx) and the highest-leverage non-dense-GEMV lever with QMoE
-levers exhausted. Split-KV fills the 116 idle SMs left by the monolithic launch.
-Next: re-profile at ≥2000-ctx regime and consider adaptive `chunk` targeting grid ≈
-SM count; then move to the next untouched non-dense decode kernel.
+**What:** The two O(context) single-thread anti-patterns in the decode path are now eliminated: `derive_len` (#1357, 29.5×) and `cumsum_i64` (#1366, 18.9×). The `attention_split` kernel is roofline-NO-GO'd for further per-kernel work (latency-bound at M=1, not occupancy-bound; launch_bounds pass was neutral). QMoE GEMVs are latency-roofline'd and were NO-GO'd twice. **Future decode gains come from structural improvements: fp16-activation QMoE kernel (M=1 tensor-core path), register-blocking the GLM split-K GEMV (multicol×split-K hybrid), and wider CUDA-graph coverage to close the eager CPU-launch gap (eager decode ~17ms/tok wall vs ~9ms/tok graphs).** Per-kernel fp32 shaving of the remaining small kernels (scatter_f32_i64 ~4.4µs, skip_rmsnorm ~2.7µs, build_kv ~1.8µs) is not a productive next lever.
