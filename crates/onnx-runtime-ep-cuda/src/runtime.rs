@@ -455,7 +455,9 @@ impl CudaRuntime {
                     .as_deref()
                     .map(str::trim)
                     .map(str::to_ascii_lowercase)
-                    .map_or(true, |v| !matches!(v.as_str(), "0" | "false" | "off" | "no")),
+                    .map_or(true, |v| {
+                        !matches!(v.as_str(), "0" | "false" | "off" | "no")
+                    }),
             ),
         }
         .with_capture_error_word()
