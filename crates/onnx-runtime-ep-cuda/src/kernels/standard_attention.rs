@@ -250,6 +250,7 @@ const ATTENTION_SOURCE: &str = r#"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #define NEG_INF __int_as_float(0xff800000)
+#define DERIVE_LEN_THREADS 256
 
 // dtype is 0 for f32, 1 for f16, and 2 for bf16. Keep all computation in fp32;
 // only the externally visible activations and cache use the requested storage
@@ -291,11 +292,21 @@ __device__ __forceinline__ void store_float(void* data, unsigned long long index
 extern "C" __global__ void derive_len(
     const void* mask, int mask_kind, unsigned long long key_len,
     unsigned long long row_base, int* out_len) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
-    return;
-  }
-  int total = (int)key_len;
-  for (unsigned long long j = 0; j < key_len; ++j) {
+  // Block-parallel min-index reduction over the mask row: each thread strides
+  // the row and records the first padded position (v < -1000) it encounters;
+  // the block-min of those indices is the overall frontier. Under the single
+  // contiguous right-aligned valid run this ABI assumes, every index < the
+  // frontier is valid and every index >= it is padded, so the block-min equals
+  // the valid length (or `key_len` if no padding is present). This is
+  // byte-identical to the prior single-thread serial scan but replaces its
+  // O(key_len) latency-bound walk (which dominates decode at wide context) with
+  // a coalesced parallel pass. Launched as grid(1,1,1) with DERIVE_LEN_THREADS
+  // threads so the geometry stays fixed and capture-safe.
+  const int nthreads = blockDim.x;
+  const int tid = threadIdx.x;
+  int local = (int)key_len;
+  for (unsigned long long j = (unsigned long long)tid; j < key_len;
+       j += (unsigned long long)nthreads) {
     const unsigned long long idx = row_base + j;
     float v;
     if (mask_kind == 1) {
@@ -308,11 +319,24 @@ extern "C" __global__ void derive_len(
       v = ((const unsigned char*)mask)[idx] != 0 ? 0.0f : NEG_INF;
     }
     if (v < -1000.0f) {
-      total = (int)j;
+      // Indices are scanned in ascending order within this thread's stride, so
+      // the first hit is this thread's smallest padded index.
+      local = (int)j;
       break;
     }
   }
-  out_len[0] = total;
+  __shared__ int red[DERIVE_LEN_THREADS];
+  red[tid] = local;
+  __syncthreads();
+  for (int s = nthreads >> 1; s > 0; s >>= 1) {
+    if (tid < s && red[tid + s] < red[tid]) {
+      red[tid] = red[tid + s];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    out_len[0] = red[0];
+  }
 }
 
 // buffer, applying the 3D->4D head reshape and the past ++ current concat.
@@ -1753,7 +1777,7 @@ impl StandardAttentionKernel {
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (1, 1, 1),
-                block_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             })
         }
@@ -3290,6 +3314,22 @@ mod alias_tests {
             1,
             "row-0 scan reports 1 for a causal prefill mask (decode-only bug guard)"
         );
+
+        // Wide-context decode spanning many thread strides (key_len > the 256
+        // reduction threads) with an unaligned frontier: locks the block-parallel
+        // min-index reduction against the prior serial scan. The valid run is
+        // [0, wide_total) followed by padding; the derived length must be exactly
+        // wide_total regardless of which thread stride owns the frontier.
+        let wide_cap = 2600u64;
+        for wide_total in [1i32, 255, 256, 257, 617, 2599, 2600] {
+            let mut wide = vec![0.0f32; wide_total as usize];
+            wide.extend(std::iter::repeat_n(NEG, wide_cap as usize - wide_total as usize));
+            assert_eq!(
+                derive(&wide, wide_cap, 0),
+                wide_total,
+                "wide decode: parallel frontier must equal valid length {wide_total}"
+            );
+        }
     }
 
     /// Capture eligibility of the default-domain Attention path is gated on a
