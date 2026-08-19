@@ -3004,7 +3004,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp(
 
 
 // Prefetch-pipelined sibling of `matmul_nbits_gemv_f16_scales_f16_tpl`.
-//
 // The single-warp scales-fp16 GEMV is Long-Scoreboard bound: ncu on qwen2.5-14b
 // q/o (N=5120) shows ~8.9 active warps/scheduler but only ~0.97 eligible, with
 // ~75% of warp cycles stalled waiting for the one in-flight 32-bit weight load.
@@ -3036,7 +3035,6 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_pipe_tpl(
 {
     (void)block_size;
     (void)scales_fp16;
-    constexpr int PF = 2;  // prefetch depth (weight words in flight per lane)
     const __half* __restrict__ scales =
         reinterpret_cast<const __half*>(scales_raw);
     const int tid = (int)threadIdx.x;
@@ -3068,17 +3066,26 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_pipe_tpl(
         };
         // Prime the shift register with the first PF steps' words (independent
         // loads -> they pipeline). Out-of-range slots are zero (never consumed).
-        unsigned int w0 = (0 < nfull) ? load_step(0) : 0u;
-        unsigned int w1 = (1 < nfull) ? load_step(1) : 0u;
+        // The array is `#pragma unroll`-rotated with a compile-time `PF`, so it
+        // stays fully in registers (no dynamic indexing -> no local spill).
+        constexpr int PF = 2;  // prefetch depth (weight words in flight per lane)
+        unsigned int wbuf[PF];
+#pragma unroll
+        for (int s = 0; s < PF; ++s) {
+            wbuf[s] = (s < nfull) ? load_step(s) : 0u;
+        }
 
         int depth_base = 0;
         for (int i = 0; i < nfull; ++i, depth_base += 256) {
-            const unsigned int packed_word = w0;
+            const unsigned int packed_word = wbuf[0];
             // Rotate the shift register and issue the load PF steps ahead BEFORE
             // consuming the current word, so PF loads stay in flight.
             const int pf = i + PF;
-            w0 = w1;
-            w1 = (pf < nfull) ? load_step(pf) : 0u;
+#pragma unroll
+            for (int s = 0; s < PF - 1; ++s) {
+                wbuf[s] = wbuf[s + 1];
+            }
+            wbuf[PF - 1] = (pf < nfull) ? load_step(pf) : 0u;
 
             const int block = (depth_base >> 5) + (lane >> 2);
             const unsigned int sub2 =
@@ -5797,6 +5804,19 @@ fn select_down_columns(n: usize, multiprocessor_count: u32) -> (usize, &'static 
 const ACCURACY4_GEMV_FILL_CTAS_PER_SM: usize = 12;
 const F16_SYMMETRIC_SPLITK_TARGET_WARPS_PER_SM: usize = 16;
 
+/// Per-SM CTA count at or above which a single-warp block-32 scales-fp16 int4
+/// GEMV is considered WELL-OCCUPIED and routed to the lower-register plain entry
+/// instead of the prefetch-pipelined one (see [`scales_f16_pipe_well_occupied`]).
+/// The pipe kernel's deeper register footprint hides the Long-Scoreboard
+/// weight-load latency on grid-starved (warp-capped) projections but only shaves
+/// occupancy once the launch already has many resident waves — measured on the
+/// qwen3.5-0.8b LM head (N=248320, grid=31040 ≈ 235 CTAs/SM on an H200): the
+/// plain entry runs ~85.0 µs vs the pipe entry's ~98.8 µs (-14%), while the
+/// grid-starved projections (N=4096, grid=512 ≈ 3.9 CTAs/SM) keep the pipe entry
+/// (4.66 vs 4.79 µs). One resident wave of 8-warp CTAs is 8/SM on sm_90; the
+/// crossover is far above that, so the threshold is set well clear of it.
+const GEMV_F16_PIPE_WELL_OCCUPIED_CTAS_PER_SM: usize = 32;
+
 /// Per-SM CTA target for the block!=32 general_bs split-K decode GEMV. The
 /// single-warp `general_bs` launch emits one 256-thread (8-warp) CTA per 8
 /// output columns, so a projection is grid-starved (leaves SMs idle, starving
@@ -6206,6 +6226,40 @@ fn scales_f16_pipeline_enabled() -> bool {
         std::env::var("ONNX_GENAI_GEMV_PIPELINE").ok().as_deref(),
         Some("0") | Some("false") | Some("off")
     )
+}
+
+/// Whether a single-warp block-32 scales-fp16 int4 GEMV launch is WELL-OCCUPIED
+/// enough that it should take the lower-register plain entry
+/// ([`GEMV_F16_SCALES_F16_ENTRY`]) instead of the prefetch-pipelined entry
+/// ([`GEMV_F16_SCALES_F16_PIPE_ENTRY`]). Both entries are BYTE-IDENTICAL (same
+/// lane→nibble mapping, same fp16 accumulation order), so this is a pure
+/// occupancy/register trade, not a numeric change. The pipe entry's extra
+/// registers pay off only on grid-starved (warp-capped) projections where the
+/// scheduler has too few resident warps to hide the Long-Scoreboard weight-load
+/// latency; once the launch already fills the SMs many times over (e.g. the
+/// wide LM-head projection), the pipe entry's lower occupancy makes it a net
+/// loss and the plain entry wins. Keys only on `N`, the launch width and the
+/// live SM count (no per-model magic); returns a launch-time constant stable
+/// across CUDA-graph replays. `ONNX_GENAI_GEMV_PIPELINE=0` still forces the
+/// plain entry everywhere for A/B; `ONNX_GENAI_GEMV_PIPE_WELLOCC=0` forces the
+/// pipe entry even on well-occupied launches (restores the pre-gate behavior).
+fn scales_f16_pipe_well_occupied(
+    n: usize,
+    columns_per_block: usize,
+    multiprocessor_count: u32,
+) -> bool {
+    match std::env::var("ONNX_GENAI_GEMV_PIPE_WELLOCC")
+        .ok()
+        .as_deref()
+    {
+        Some("0") | Some("false") | Some("off") => return false,
+        Some("1") | Some("true") | Some("on") => return true,
+        _ => {}
+    }
+    let ctas = n.div_ceil(columns_per_block.max(1));
+    let threshold = (multiprocessor_count.max(1) as usize)
+        .saturating_mul(GEMV_F16_PIPE_WELL_OCCUPIED_CTAS_PER_SM);
+    ctas >= threshold
 }
 
 /// Whether the SYMMETRIC paired gate/up SwiGLU decode GEMV takes the
@@ -9107,14 +9161,37 @@ impl MatMulNBitsKernel {
         let use_scales_f16_splitk = use_scales_f16_zp_splitk || use_scales_f16_symmetric_splitk;
         // Prefetch-pipeline routing for the SINGLE-WARP block-32 scales-fp16 int4
         // GEMV (the entry taken when split-K is not selected). Byte-identical to
-        // the original entry (same mapping/math/order) but keeps 4 weight loads
+        // the original entry (same mapping/math/order) but keeps 2 weight loads
         // in flight per lane to hide the Long-Scoreboard latency that dominates
-        // it. Default-on; `ONNX_GENAI_GEMV_PIPELINE=0` forces the original entry.
+        // the grid-starved projections. Default-on; `ONNX_GENAI_GEMV_PIPELINE=0`
+        // forces the original entry.
+        //
+        // Occupancy gate: the pipe entry's extra registers are a net LOSS once
+        // the launch already fills the SMs many waves over (the pipe kernel's
+        // lower occupancy then outweighs its latency hiding). The wide LM-head
+        // projection is the only such well-occupied block-32 GEMV here (measured
+        // plain 85.0 µs vs pipe 98.8 µs, -14%), so it falls back to the plain
+        // entry while the grid-starved q/gate/kv projections keep the pipe entry.
+        // `pipe_columns_per_block` mirrors the launch's `columns_per_block`: the
+        // pipe path always takes the 256-thread (8-warp) large launch unless BOTH
+        // n and k are small.
         let use_scales_f16_pipeline = self.block_size == 32
             && scales_fp16
             && matches!(selection.variant, F16GemvVariant::General)
             && !use_scales_f16_splitk
             && scales_f16_pipeline_enabled();
+        let pipe_columns_per_block =
+            if self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX {
+                (GEMV_F16_SMALL_THREADS / 32) as usize
+            } else {
+                (GEMV_F16_LARGE_THREADS / 32) as usize
+            };
+        let use_scales_f16_pipe = use_scales_f16_pipeline
+            && !scales_f16_pipe_well_occupied(
+                self.n,
+                pipe_columns_per_block,
+                self.runtime.capabilities().multiprocessor_count(),
+            );
         // Fold-scale routing for the split-K decode GEMV: opt-in (default off)
         // via `ONNX_GENAI_GEMV_FOLDSCALE`. Folds the per-block scale into the
         // dequant, dropping the MAC's __hmul2. Only matters when the split-K
@@ -9204,7 +9281,7 @@ impl MatMulNBitsKernel {
                             } else {
                                 GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY
                             }
-                        } else if use_scales_f16_pipeline {
+                        } else if use_scales_f16_pipe {
                             GEMV_F16_SCALES_F16_ZP_PIPE_ENTRY
                         } else {
                             GEMV_F16_SCALES_F16_ZP_ENTRY
@@ -9216,7 +9293,7 @@ impl MatMulNBitsKernel {
                             } else {
                                 GEMV_F16_SCALES_F16_SPLITK_ENTRY
                             }
-                        } else if use_scales_f16_pipeline {
+                        } else if use_scales_f16_pipe {
                             GEMV_F16_SCALES_F16_PIPE_ENTRY
                         } else {
                             GEMV_F16_SCALES_F16_ENTRY
@@ -13130,6 +13207,40 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             asymmetric.reason,
             "variant=general;zero_points=explicit;down_projection requires symmetric zp=8"
         );
+    }
+
+    #[test]
+    fn scales_f16_pipe_well_occupied_routes_lm_head_to_plain() {
+        // The pipe-vs-plain occupancy gate keys only on N, the launch's
+        // columns-per-CTA and the live SM count — no model-specific magic.
+        // qwen3.5-0.8b measured shapes on an H200 (132 SMs, 8-warp large launch
+        // => 8 columns per CTA):
+        //   LM head  N=248320 -> grid 31040 (~235 CTAs/SM): WELL-OCCUPIED -> plain
+        //   proj     N=4096   -> grid 512   (~3.9 CTAs/SM): grid-starved  -> pipe
+        assert!(
+            scales_f16_pipe_well_occupied(248_320, 8, 132),
+            "the wide LM-head projection must be treated as well-occupied (plain)"
+        );
+        assert!(
+            !scales_f16_pipe_well_occupied(4096, 8, 132),
+            "a grid-starved N=4096 projection must keep the pipe entry"
+        );
+
+        // Device-derived, not a fixed N: the same width flips with the SM count.
+        // grid = ceil(N/cols); well-occupied when grid >= mp_count*32.
+        // N=8192, cols=8 -> grid 1024; threshold(mp)=mp*32.
+        assert!(
+            scales_f16_pipe_well_occupied(8192, 8, 32),
+            "grid 1024 >= 32*32=1024 on a 32-SM device is well-occupied"
+        );
+        assert!(
+            !scales_f16_pipe_well_occupied(8192, 8, 33),
+            "grid 1024 < 33*32=1056 on a 33-SM device stays grid-starved"
+        );
+
+        // Degenerate inputs must not divide by zero.
+        assert!(scales_f16_pipe_well_occupied(1_000_000, 0, 1));
+        assert!(!scales_f16_pipe_well_occupied(1, 8, 0));
     }
 
     #[test]
