@@ -1,6 +1,6 @@
 # Decisions — live standing directives
 
-Last consolidated: 2026-08-19T00:00Z (Scribe wave-3 merge: 5 inbox notes processed — adaptive split-KV #1350, attention_split launch_bounds NO-GO, derive_len #1357, cumsum_i64 #1366, Wallace GLM fair A/B + splitk_wide profile; 3 claim-integrity retractions added; older 2026-08-18 batch entries (lines 50–719 pre-merge) archived to `.squad/decisions-archive/2026-08.md` at "Archived 2026-08-19 by Scribe" section to keep the live ledger below 50KB.)
+Last consolidated: 2026-08-19T11:56Z (Scribe qwen3.5 family-trio consolidation: 19 inbox notes processed; archive skipped because pre-check live ledger was 14,881 bytes < 20,480-byte requested gate.)
 
 Standing governance rules and active directives. Full narrative is archived; keep this file to current decisions plus durable rules.
 
@@ -130,3 +130,38 @@ The primary Windows development box has a working RTX 4060 CUDA path even though
 **By:** Deckard / Scribe (claim-integrity)
 
 **What:** The two O(context) single-thread anti-patterns in the decode path are now eliminated: `derive_len` (#1357, 29.5×) and `cumsum_i64` (#1366, 18.9×). The `attention_split` kernel is roofline-NO-GO'd for further per-kernel work (latency-bound at M=1, not occupancy-bound; launch_bounds pass was neutral). QMoE GEMVs are latency-roofline'd and were NO-GO'd twice. **Future decode gains come from structural improvements: fp16-activation QMoE kernel (M=1 tensor-core path), register-blocking the GLM split-K GEMV (multicol×split-K hybrid), and wider CUDA-graph coverage to close the eager CPU-launch gap (eager decode ~17ms/tok wall vs ~9ms/tok graphs).** Per-kernel fp32 shaving of the remaining small kernels (scatter_f32_i64 ~4.4µs, skip_rmsnorm ~2.7µs, build_kv ~1.8µs) is not a productive next lever.
+
+## 2026-08-19T11:56Z — Qwen3.5 family-trio arc and adjacent batching/kernel inbox consolidation
+
+**By:** Scribe
+
+**Pre-check:** live `decisions.md` was 14,881 bytes, below the 20,480-byte hard gate requested for this pass, so no archive was created. Inbox contained 20 markdown files including `README.md`; 19 drops were processed.
+
+### Qwen3.5 hybrid family decisions
+
+- **Deckard — qwen3.5-0.8b text export (PR #1456, merged @169febb1f): GO.** Graph surgery composed the text-only 0.8B export; native loads/captures the hybrid block and decodes byte-identical to ORT. This proves the hybrid graph-block moat also holds at the small end and locks the {0.8B, 2B, 9B} family coverage.
+- **Deckard — qwen3.5-9b text export (PR #1449): GO.** Graph surgery produced a clean 9B text export; native captures the full hybrid path with byte-identical decode. The moat scales up as a family property, though 9B is memory-ceiling limited.
+- **Sebastian — qwen3.5-2b hybrid kernel ladder: moat confirmed; `lm_head` int8 GEMV NO-GO; op-soup declined.** Profiling showed the dominant win is context-flat graph/capability coverage for hybrid recurrent ops, not a single dense kernel. The realistic lever became cast identity cleanup rather than a bespoke `lm_head` kernel.
+- **Sebastian — qwen3.5 identity-Cast elimination (PR #1459, merged @792958ecf): GO, general rule.** `CudaDropIdentityCast` removes redundant CUDA-bridge `Cast` nodes when source/target element types match; qwen3.5 casts dropped 270→0 with byte-identical outputs and +3.0% short-context throughput. Apply as RULES §2-style graph cleanup, not a model-specific hack.
+- **Wallace — qwen3.5 2B golden lock (PR #1418): GO.** The 2B hybrid moat has a regression-proof golden lock; byte identity and the native-only graph/capture path are now guarded.
+- **Wallace — qwen3.5 family moat: GO.** The hybrid graph-block moat is architectural across the family, originally quantified for {0.8B, 2B} and then completed with 9B. The 2B curve is strongest at depth (1.00×@16 → 4.03×@1729 → 9.08×@5000, no asymptote before native memory ceiling).
+- **Wallace — qwen3.5-9B deep curve: GO with caveat.** 9B confirms the family property but does not strengthen with size; it has a higher floor, gentler slope, and ~1500-context memory ceiling, capping around 2.7×.
+- **Wallace — qwen3.5-0.8B fixed-depth fair A/B: profile-only complete.** Native vs ORT reaches 3.45×@16 and 7.50×@1729, with ORT runnable only via raw onnxruntime CPU-fallback; the numeric family trio is complete.
+- **Wallace — Foundry-Local moat sweep: GO for qwen3.5 hybrid as a new context-scaling graph-block moat.** The recurrent/linear-attention operators form a capability moat distinct from ordinary dense decode kernels.
+
+### Adjacent model/kernel decisions
+
+- **Deckard — gemma4-e2b dual head_dim 256+512 e2e: partial GO.** Text export was composed and head_dim=512 eager golden lock landed (PR #1438/#1442 context); remaining blocker is CUDA-graph capture for the real dual-head-size path.
+- **Deckard — Nemotron streaming ASR triage: NO-GO for LM-decode moat.** The 0.6B Nemotron streaming models are RNN-T ASR/transducer systems, not autoregressive LM decode targets; loader decline is correct, not a bug.
+- **Sebastian — GLM deep-context re-rank: next general lever is block-128 RMSNorm-fold gap, not attention.** Post-#1435 profiling shifted attention away from attention kernels; deep gap decomposition kept the RMSNorm-fold gate capability-driven and near floor after PR #1445 work.
+- **Sebastian — CPU budget semantics: physical cores, not logical CPUs.** `ONNX_GENAI_CPU_DECODE_THREADS=N` should constrain the process to `N` physical cores for stable CPU decode interpretation.
+- **Sebastian — paired A/B harness caution.** The paired native/ORT harness depresses the native arm via co-residency/measurement interference; use it for relative controlled checks, not absolute native ceilings.
+
+### Batch and placement decisions from copilot drops
+
+- **M≥2 batch-decode resident cliff: fused-SwiGLU capture segmentation, not sampling or launch count.** A byte-identical fix exists but was not merged because it needs coordination with related CUDA capture segmentation work; model-size dependence must be reported explicitly.
+- **Batch device-logits router (#1155): killed for the 8GB large-model speedup claim.** Measurement showed it is not the large-model speedup on the 8GB box; keep any benefit narrowly framed and data-backed.
+- **Batch-N large-model scaling: 1/N HtoD amortization is real, but wall-clock is capped by VMM churn plus an M≥2 decode-GEMM cliff.** Structural CUDA dispatch changes remain held for owner sign-off.
+- **Multi-row decode GEMV ceiling probe: NO-GO.** The resident-model prize is ≤1 ms/step, too small to justify building a multi-row decode GEMV path now.
+- **Placement/native capture compatibility: viable with strict placement constraints.** Native CUDA capture compatibility must preserve fail-closed placement behavior and respect heterogeneous fallback boundaries.
+

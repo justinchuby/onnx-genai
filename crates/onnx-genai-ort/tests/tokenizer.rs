@@ -17,7 +17,10 @@ fn chat_template_bos_is_not_duplicated_by_the_post_processor() {
     let tokenizer = Tokenizer::from_file("tests/fixtures/tiny-tokenizer-bos.json").unwrap();
 
     // A chat template that already emits `bos_token` must not be given a second one.
-    assert_eq!(tokenizer.encode("[BOS] hello world").unwrap(), vec![4, 2, 3]);
+    assert_eq!(
+        tokenizer.encode("[BOS] hello world").unwrap(),
+        vec![4, 2, 3]
+    );
     // Prompts without a leading BOS still get the post-processor's copy.
     assert_eq!(tokenizer.encode("hello world").unwrap(), vec![4, 2, 3]);
 }
