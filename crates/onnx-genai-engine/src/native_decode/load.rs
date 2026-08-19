@@ -920,6 +920,7 @@ impl NativeDecodeSession {
             has_plugin_fused,
             position_rank,
             decode_inline: DecodeInlineState::Untried,
+            prefill_chunk_size: None,
         })
     }
 }

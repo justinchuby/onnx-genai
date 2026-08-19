@@ -1025,7 +1025,7 @@ pub(super) fn read_attachment(path: &Path, kind: &str) -> anyhow::Result<Vec<u8>
 
 pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
-    args.cpu.apply()?;
+    args.cpu.apply().map_err(anyhow::Error::msg)?;
     let input_mode = repl_input_mode(io::stdin().is_terminal(), io::stdout().is_terminal());
     let mut settings = SessionSettings::new(resolve_model_dir(&args.model), &args.engine);
     let load_started = std::time::Instant::now();

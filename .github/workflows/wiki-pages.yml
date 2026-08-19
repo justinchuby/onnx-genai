@@ -3,12 +3,25 @@ name: Wiki Pages
 on:
   workflow_dispatch:
   push:
+    branches: [main]
+    paths:
+      - wiki/**
+      - site/**
+      - .github/workflows/wiki-pages.yml
   pull_request:
     types: [opened, synchronize, reopened]
+    paths:
+      - wiki/**
+      - site/**
+      - .github/workflows/wiki-pages.yml
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Stale PR validation runs should be superseded by newer pushes to the same
+  # PR, but an in-progress main push/deploy must never be cancelled by a
+  # newer push: main runs queue and serialize so the latest push always
+  # eventually deploys.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

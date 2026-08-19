@@ -995,6 +995,14 @@
             "null"
           ]
         },
+        "temporal_order": {
+          "description": "Relative nesting of the temporal and channel axes inside a flattened\n`channels_first` patch (`channel_major` or `temporal_major`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "temporal_patch_size": {
           "description": "Number of identical temporal frames packed into each spatial patch.",
           "format": "uint",

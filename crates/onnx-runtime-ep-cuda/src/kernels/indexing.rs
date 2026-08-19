@@ -344,6 +344,12 @@ fn validate_indices(
             "cuda_ep {op}: indices must be Int32 or Int64"
         )));
     }
+    // Eager-fast path: skip the blocking index-bounds D2H (numerically inert —
+    // a correct model never trips it; the captured path relies on the device
+    // error latch instead of a per-op host readback).
+    if runtime.eager_sync_deferred() {
+        return Ok(());
+    }
     let mut bytes = vec![0_u8; indices.dtype.storage_bytes(indices.numel())];
     if !bytes.is_empty() {
         unsafe { runtime.dtoh(&mut bytes, cuptr(indices.data_ptr::<u8>() as *const c_void))? };
