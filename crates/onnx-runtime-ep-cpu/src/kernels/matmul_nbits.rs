@@ -336,6 +336,117 @@ fn mlas_prefill_serial() -> bool {
     })
 }
 
+/// Which executor the `m > 1` MLAS shard tiling fans out on.
+///
+/// Not gated on `mlas` even though only the MLAS path consults it: the policy
+/// is pure integer arithmetic, and the only CI lane that runs this crate's
+/// whole test suite is the default-feature one. Gating it would mean the
+/// tests never run.
+#[cfg_attr(not(feature = "mlas"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefillFanOut {
+    /// The CPU task runtime: bounded, topology-aware, adaptive spin/park.
+    TaskRuntime,
+    /// Global Rayon at its full logical-CPU width.
+    Wide,
+}
+
+/// Total multiply-accumulate work above which the prefill tiling takes the
+/// wide (global Rayon) fan-out instead of the CPU task runtime.
+///
+/// The task runtime is the better executor almost everywhere here: its dispatch
+/// reaches a resident worker in ~5 us against global Rayon's 67-226 us, and it
+/// does not fight a co-resident ORT intra-op pool for cores.
+///
+/// It has one disadvantage: the runtime's pool is capped to the *physical*
+/// cores the process may use (see `task_runtime::resolve_width`), because
+/// spinning workers on SMT siblings measurably hurt the short, latency-bound
+/// strip kernels the pool mostly serves. A prefill tile is neither short nor
+/// latency-bound -- it is a multi-millisecond MLAS call whose dequantise step
+/// has enough load latency to hide that SMT siblings pay off. Measured on
+/// `gemm_nbits_llama3_8b_mlp_t512` at 32 threads, native-only: Rayon at 32
+/// threads 54.1 ms, the task runtime at its capped 16 lanes 66.8 ms, and the
+/// *same* task runtime forced to 32 lanes 54.8 ms. The gap is the cap, not the
+/// executor.
+///
+/// So the split is on work size. The threshold was chosen from a campaign that
+/// ran the tiling on the task runtime *unconditionally* -- there was no policy
+/// yet, so both columns are a real measurement of the two executors on the same
+/// cell. All at 32 threads, native/ORT paired in one process, medians of 3
+/// trials x 15 runs:
+///
+/// | cell | MACs | Rayon | task runtime | winner |
+/// |---|---|---|---|---|
+/// | `qwen3_0p6b_qkv_t8`   |  24 Mi |  2.511 ms |  0.479 ms | runtime 5.2x |
+/// | `qwen3_0p6b_mlp_t8`   |  48 Mi |  3.396 ms |  0.517 ms | runtime 6.6x |
+/// | `llama3_8b_qkv_t8`    | 192 Mi |  6.294 ms |  1.901 ms | runtime 3.3x |
+/// | `qwen3_0p6b_qkv_t128` | 384 Mi |  7.070 ms |  2.682 ms | runtime 2.6x |
+/// | `llama3_8b_mlp_t8`    | 448 Mi |  9.545 ms |  8.386 ms | runtime 1.1x |
+/// | `qwen3_0p6b_mlp_t128` | 768 Mi |  8.063 ms |  8.851 ms | Rayon 1.1x |
+/// | `qwen3_0p6b_qkv_t512` | 1.5 Gi | 12.095 ms | 12.314 ms | tie |
+/// | `llama3_8b_mlp_t128`  |   7 Gi | 35.436 ms | 37.664 ms | Rayon 1.06x |
+/// | `llama3_8b_mlp_t512`  |  28 Gi | 89.176 ms | 100.88 ms | Rayon 1.13x |
+///
+/// 512 Mi separates those two groups cleanly. The numbers here are *not* the
+/// ones in the benchmark document's phase-13 matrix and are not meant to match:
+/// that matrix measures the shipped policy, so above this threshold both of its
+/// arms run the same wide path and the difference there is noise.
+///
+/// Park latency is what makes the wide path safe above the threshold: 226 us of
+/// worst-case wake-up is 0.25% of a 90 ms fan-out, and 45% of a 0.5 ms one.
+#[cfg_attr(not(feature = "mlas"), allow(dead_code))]
+const WIDE_PREFILL_MACS: usize = 1 << 29;
+
+/// Picks the prefill fan-out executor for `macs` of work, given the task
+/// runtime's `lanes` and global Rayon's `wide` width.
+///
+/// Split out as a pure function so the policy is testable without a machine
+/// that has SMT, and so the threshold has one place to be wrong.
+#[cfg_attr(not(feature = "mlas"), allow(dead_code))]
+fn prefill_fan_out(macs: usize, lanes: usize, wide: usize) -> PrefillFanOut {
+    // Nothing to win from the wide path when it is not actually wider; prefer
+    // the runtime's cheaper dispatch.
+    if wide <= lanes || macs < WIDE_PREFILL_MACS {
+        return PrefillFanOut::TaskRuntime;
+    }
+    PrefillFanOut::Wide
+}
+
+/// Smallest amount of multiply-accumulate work worth handing to another thread
+/// on the prefill tiling fan-out, in MACs.
+///
+/// The tiling below cannot merge output-column shards — each shard owns its own
+/// packed weight — so the only lever it has for a too-fine partition is to hand
+/// several whole tiles to one task. This constant converts "how much arithmetic
+/// is a wake-up worth" into that tile count.
+///
+/// Sized from the task runtime's measured dispatch latency (p50 4.8 us to reach
+/// a resident worker, see `task_runtime::pool`) against roughly 2 GMAC/s per
+/// core for MLAS SQNBit int4: 512 Ki MACs is ~250 us of arithmetic, about 50x
+/// the dispatch cost, so the fan-out is still overwhelmingly useful work.
+#[cfg_attr(not(feature = "mlas"), allow(dead_code))]
+const MIN_PREFILL_TASK_MACS: usize = 1 << 19;
+
+/// Tiles per task for a prefill fan-out of `tiles` tiles over an `m x n` output
+/// with depth `k`, so that no task is handed less than
+/// [`MIN_PREFILL_TASK_MACS`] of arithmetic.
+///
+/// Returns a *floor* the task runtime applies to its own partition; the runtime
+/// still uses a larger grain when there are more tiles than workers.
+#[cfg_attr(not(feature = "mlas"), allow(dead_code))]
+fn prefill_tile_grain(m: usize, n: usize, k: usize, tiles: usize) -> usize {
+    if tiles == 0 {
+        return 1;
+    }
+    let macs_per_tile = m.saturating_mul(n).saturating_mul(k) / tiles;
+    if macs_per_tile == 0 {
+        return tiles;
+    }
+    MIN_PREFILL_TASK_MACS
+        .div_ceil(macs_per_tile)
+        .clamp(1, tiles)
+}
+
 /// A/B escape hatch controlling the **unscoped** decode (`m == 1`, no persistent
 /// SPMD scope active) MLAS SQNBit dispatch.
 ///
@@ -2215,7 +2326,15 @@ impl MatMulNBitsKernel {
         if m > 1 && active > 1 && !mlas_prefill_serial() {
             let n = self.n;
             let k = self.k;
-            let threads = rayon::current_num_threads().max(1);
+            // Which executor this fan-out runs on, and therefore how many tiles
+            // are worth making. See [`prefill_fan_out`].
+            let lanes = crate::task_runtime::width().max(1);
+            let wide = rayon::current_num_threads().max(1);
+            let fan_out = prefill_fan_out(m.saturating_mul(n).saturating_mul(k), lanes, wide);
+            let threads = match fan_out {
+                PrefillFanOut::TaskRuntime => lanes,
+                PrefillFanOut::Wide => wide,
+            };
             // Aim for roughly one tile per hardware thread: split each shard's M
             // rows into enough blocks to reach `threads` tiles total.
             let row_blocks = (threads / active).clamp(1, m);
@@ -2230,6 +2349,7 @@ impl MatMulNBitsKernel {
                     row += rows;
                 }
             }
+            let grain = prefill_tile_grain(m, n, k, tiles.len());
             struct OutputBase(*mut f32);
             // SAFETY: every tile writes a disjoint `[row_start, row_start+rows)`
             // x `[shard.start, shard.start+shard.len)` window of the single
@@ -2238,30 +2358,39 @@ impl MatMulNBitsKernel {
             let out = OutputBase(base);
             let out = &out;
             let live = &live;
-            tiles
-                .par_iter()
-                .for_each(|&(shard_index, row_start, rows)| {
-                    let shard = live[shard_index];
-                    let bias = bias.map(|bias| &bias[shard.start..shard.start + shard.len]);
-                    let activations = &activations[row_start * k..(row_start + rows) * k];
-                    // SAFETY: `out.0.add(row_start * n + shard.start)` is the first
-                    // element of this tile's window; the kernel writes `rows` rows at
-                    // leading dimension `n`, each covering `shard.len` columns, all
-                    // within `[m, n]` (`row_start + rows <= m`,
-                    // `shard.start + shard.len <= n`).
-                    let dst = unsafe { out.0.add(row_start * n + shard.start) };
-                    unsafe {
-                        mlas_sys::sqnbit_gemm_into(
-                            &shard.prepared.packed,
-                            rows,
-                            activations,
-                            bias,
-                            dst,
-                            n,
-                            false,
-                        );
-                    }
-                });
+            let run_tile = |&(shard_index, row_start, rows): &(usize, usize, usize)| {
+                let shard = live[shard_index];
+                let bias = bias.map(|bias| &bias[shard.start..shard.start + shard.len]);
+                let activations = &activations[row_start * k..(row_start + rows) * k];
+                // SAFETY: `out.0.add(row_start * n + shard.start)` is the first
+                // element of this tile's window; the kernel writes `rows` rows at
+                // leading dimension `n`, each covering `shard.len` columns, all
+                // within `[m, n]` (`row_start + rows <= m`,
+                // `shard.start + shard.len <= n`).
+                let dst = unsafe { out.0.add(row_start * n + shard.start) };
+                unsafe {
+                    mlas_sys::sqnbit_gemm_into(
+                        &shard.prepared.packed,
+                        rows,
+                        activations,
+                        bias,
+                        dst,
+                        n,
+                        false,
+                    );
+                }
+            };
+            let tiles = &tiles;
+            match fan_out {
+                PrefillFanOut::TaskRuntime => {
+                    crate::task_runtime::for_each_range(tiles.len(), grain, |first, last| {
+                        for tile in &tiles[first..last] {
+                            run_tile(tile);
+                        }
+                    });
+                }
+                PrefillFanOut::Wide => tiles.par_iter().for_each(run_tile),
+            }
             return;
         }
 
@@ -16898,5 +17027,74 @@ mod tests {
         step("hand", &run_hand);
         step("mlas-int8", &run_mlas_int8);
         step("mlas-fp32", &run_mlas_fp32);
+    }
+
+    /// A prefill small enough that the task runtime's ~5 us dispatch dominates
+    /// stays on the task runtime, whatever the widths look like.
+    #[test]
+    fn small_prefill_work_stays_on_the_task_runtime() {
+        assert_eq!(
+            prefill_fan_out(WIDE_PREFILL_MACS - 1, 16, 32),
+            PrefillFanOut::TaskRuntime
+        );
+        assert_eq!(prefill_fan_out(0, 16, 32), PrefillFanOut::TaskRuntime);
+    }
+
+    /// Past the threshold the SMT-capped pool is leaving half the machine idle
+    /// on work long enough for a 226 us wake-up to be noise, so take the wide
+    /// path.
+    #[test]
+    fn large_prefill_work_takes_the_wide_fan_out() {
+        assert_eq!(
+            prefill_fan_out(WIDE_PREFILL_MACS, 16, 32),
+            PrefillFanOut::Wide
+        );
+        assert_eq!(
+            prefill_fan_out(WIDE_PREFILL_MACS * 64, 16, 32),
+            PrefillFanOut::Wide
+        );
+    }
+
+    /// The wide path exists only to reach threads the runtime's pool does not
+    /// have. When it has them -- no SMT, an explicit task-thread budget, a
+    /// narrow cpuset -- the cheaper dispatch wins unconditionally.
+    #[test]
+    fn the_wide_fan_out_is_not_taken_when_it_is_not_wider() {
+        for wide in 1..=16 {
+            assert_eq!(
+                prefill_fan_out(WIDE_PREFILL_MACS * 64, 16, wide),
+                PrefillFanOut::TaskRuntime,
+                "rayon width {wide} is not wider than 16 lanes"
+            );
+        }
+    }
+
+    /// The grain is a floor in *tiles*, so it must never exceed the tile count
+    /// (which would ask the runtime to run a partition it cannot make) nor drop
+    /// below one.
+    #[test]
+    fn prefill_tile_grain_stays_within_the_tile_count() {
+        for tiles in [0usize, 1, 2, 7, 32, 1024] {
+            let grain = prefill_tile_grain(8, 3072, 1024, tiles);
+            assert!(grain >= 1, "grain {grain} for {tiles} tiles");
+            assert!(grain <= tiles.max(1), "grain {grain} exceeds {tiles} tiles");
+        }
+    }
+
+    /// Tiles that already carry enough arithmetic are handed out one per task;
+    /// tiles that do not get batched until they do.
+    #[test]
+    fn prefill_tile_grain_batches_only_undersized_tiles() {
+        // 32 tiles of 8 x 96 x 1024 = 768 Ki MACs each, over the 512 Ki floor.
+        assert_eq!(prefill_tile_grain(8, 3072, 1024, 32), 1);
+        // The same output split 32x finer: 24 Ki MACs a tile, so batch them.
+        assert_eq!(prefill_tile_grain(8, 3072, 1024, 1024), 22);
+    }
+
+    /// A degenerate shape must not divide by zero or ask for a zero grain.
+    #[test]
+    fn prefill_tile_grain_survives_a_zero_sized_problem() {
+        assert_eq!(prefill_tile_grain(0, 3072, 1024, 8), 8);
+        assert_eq!(prefill_tile_grain(8, 0, 1024, 8), 8);
     }
 }
