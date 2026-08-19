@@ -4377,7 +4377,12 @@ whichever arm runs second, which is larger than most effects worth chasing.
   and getting that wrong silently un-bounds prefill parallelism — so it is
   named here as a measured cost with a known shape, not attempted as a
   drive-by.
-* Nested dispatch now shows **111 of 915 dispatches declined** at 16 outer
-  dispatchers, where #1377 measured zero at the same width. Either the
-  earlier run was lucky or something changed; it needs a re-measurement
-  rather than an assumption.
+* **Retracted:** a claimed regression of "111 of 915 dispatches declined" in
+  `nested_dispatch_slot_pressure`. That was a misreading — the test issues
+  ~25-30 dispatches in total, so 915 was never a number it could produce.
+  Re-measured across four runs it declines 0, 1, 2 and 6 of ~25-30, every
+  decline occurring in the 16-dispatcher row and none below it. #1377's zero
+  sits inside that range. The count tracks host load, for the same reason
+  §41.7 gives: when co-tenants hold cores, workers free their slots later and
+  more nested dispatches fall back to inline execution. The fallback is the
+  designed behaviour, so this is the mechanism working, not a regression.
