@@ -666,7 +666,13 @@ pub(crate) fn build_handle_with_authorities(
     if let Some(directory) = PipelineModelDirectory::load_if_declared(model_dir)
         .map_err(|e| anyhow::anyhow!("Failed to discover pipeline directory: {e}"))?
     {
-        let model_max_context = load_model_max_context(directory.metadata_path.as_deref())?;
+        // The directory already parsed this package's metadata; re-reading it
+        // here could disagree with the pipeline built from it.
+        let model_max_context = directory
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.model.as_ref())
+            .and_then(|model| model.max_sequence_length);
         return build_pipeline_handle(
             model_dir,
             model_id,
