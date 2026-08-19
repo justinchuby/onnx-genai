@@ -158,6 +158,13 @@ whether we hand the node over.
 | `Gemm` | f16 | 128 | 3584 | 8 | 1.86 | 2.24 | gap |
 | `Gemm` | f16 | 128 | 3584 | 16 | 1.44 | 1.46 | gap |
 | `Gemm` | f16 | 128 | 3584 | 32 | 1.19 | 1.35 | gap |
+| `Gemm` | f16, **transB** | 1 | 3584 | 1 | **0.59** | 0.63 ‡ | **win** (was 22.5) |
+| `Gemm` | f16, **transB** | 1 | 3584 | 2 | **0.59** | 0.73 ‡ | **win** (was 29.7) |
+| `Gemm` | f16, **transB** | 1 | 3584 | 4 | 1.22 | 0.94 ‡ | gap (was 36.9) |
+| `Gemm` | f16, **transB** | 1 | 3584 | 8 | 1.83 | 1.40 ‡ | gap (was 49.5) |
+| `Gemm` | f16, **transB** | 1 | 3584 | 16 | 1.46 | 2.02 ‡ | gap (was 65.3) |
+| `Gemm` | f16, **transB** | 128 | 3584 | 1 | 3.71 | 4.06 ‡ | **gap** |
+| `Gemm` | f16, **transB** | 128 | 3584 | 8 | 10.72 | 17.97 ‡ | **gap** |
 | `QLinearMatMul` | u8 x u8 | 1 | 3584 | 1 | 1.13 | 1.18 | gap |
 | `QLinearMatMul` | u8 x u8 | 1 | 3584 | 8 | 2.33 | 2.77 | gap |
 | `QLinearMatMul` | u8 x u8 | 1 | 3584 | 16 | 2.34 | 2.58 | gap |
@@ -176,6 +183,18 @@ whether we hand the node over.
 | `QLinearMatMul` | i8 x i8 | 512 | 3584 | 1 | **0.26** | 0.26 | **win** |
 | `QLinearMatMul` | i8 x i8 | 512 | 3584 | 8 | **0.42** | 0.43 | **win** |
 | `QLinearMatMul` | i8 x i8 | 512 | 3584 | 16 | **0.42** | 0.47 | **win** |
+‡ On the seven `transB` rows the last column is the **min-of-minima** ratio, not a
+p90: it is our best single run over ORT's best single run. It is quoted because
+these were measured on a host under load 6-13, where the minimum is the only
+statistic that is not partly a measure of the other tenants. It is not
+comparable to a p90 and is marked so nobody compares it to one.
+
+`transB = 1` is the layout every `nn.Linear` export produces, so these rows are
+not a corner case — they are what a QKV, an output projection and an MLP gate
+look like when a model is exported through `Gemm` rather than `MatMul`. They
+were absent from this table entirely until 2026-08-19; the `transB = 0` `Gemm`
+rows above them never covered them.
+
 
 Ranges **outside** the measured region — `K * N < 2^20`, symbolic/dynamic weight shapes, and dense
 dtypes other than f32/f16 — are simply unmeasured. They are claimed like everything else; the note
@@ -387,6 +406,48 @@ order — so this changes f32 results at `M = 1` within the tolerance
 `m1_route_matches_packed_within_tolerance` pins. Each route is itself deterministic: the GEMV's
 column strips are disjoint and its K-unroll order is fixed, so the same input gives the same bits on
 every run and at every thread count.
+
+### 5. `Gemm` declined the f16 fast path whenever B was transposed (**fixed**)
+
+`GemmKernel::execute` disqualified both f16 fast paths if either transpose flag
+was set, on the reasoning — written in a comment directly above the check — that
+both "read B in its stored `[K, N]` order, and materialising a transpose first
+would give back what they save". The premise is correct; the conclusion is not.
+A transpose is only needed if you insist on reusing the `[K, N]` kernel. A
+`[N, K]` weight is in fact the *better* GEMV layout: every output element is one
+**contiguous** `k`-run rather than a strided gather, so the weight streams front
+to back and the output partitions to any granularity, down to a single row.
+
+So `transB = 1` at `M = 1` fell into the portable blocked half GEMM — the path
+section 2 already calls "the worst dense region measured anywhere in this EP".
+It measured **32-48 ms against ORT's 0.16-1.5 ms at `K = N = 3584`: 22x to 65x
+slower**, and it did not improve with thread count at all (36.6 ms at 1 thread,
+36.2 at 8, 48.1 at 16). This is not a corner case — `transB = 1` is what every
+`nn.Linear` export produces.
+
+The fix is a second kernel rather than a transpose: `half_gemv::gemv_f16_nk`,
+four independent 8-lane FMA chains along `k`, 8 output rows per task. `M = 1`
+`transB` now reads **0.59 at 1 and 2 threads — a win** — and 1.2-1.8x at 4-16,
+i.e. 36x to 70x faster in absolute terms, up to 133x on per-run minima.
+
+Two things this did **not** fix, both open:
+
+* **`transB` prefill is still broken** and got no better: `M = 128` measures
+  **3.7x at 1 thread and 10.7x at 8** (170 ms vs 46 ms; 18x on minima). The GEMV
+  correctly declines `M > 1`, so prefill still takes the blocked path. Closing
+  it needs a packed **NT** half GEMM — the f16 analogue of #1176's transposed-B
+  SGEMM.
+* **The residual 1.2-1.8x at 4-16 threads is the section 1 ceiling**, not
+  anything specific to this kernel. Every one of our `M = 1` GEMVs flattens at
+  ~0.7-1.1 ms past 4-8 threads while ORT keeps scaling. Measured on the same
+  sweep: 4-bit goes 3.60 -> 0.79 ms across 1..16 threads while ORT goes
+  1.59 -> 0.13; f32 goes 1.73 -> 0.94 while ORT goes 1.76 -> 0.17. Note what this
+  rules out: we do **not** get slower as threads are added, so it is not
+  fork/join overhead — we stop getting *faster*. `gemv_f16_kn`'s fixed
+  `STRIPE = 512` is one concrete instance, yielding only 7 tasks at `n = 3584`
+  however many workers are offered.
+
+Full record: [`docs/benchmarks/2026-08-19-f16-gemm-transb-decode.md`](../benchmarks/2026-08-19-f16-gemm-transb-decode.md).
 
 ## Precision
 

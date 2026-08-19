@@ -135,6 +135,193 @@ fn stripe_scalar(a: &[f32], b: &[u16], acc: &mut [f32], j0: usize, k: usize, n: 
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Counts [`gemv_f16_nk`] entries so a caller's test can assert *which*
+    /// route served a call. Values alone cannot: the blocked fallback computes
+    /// the same thing, only two orders of magnitude slower, which is the
+    /// entire point.
+    ///
+    /// Thread-*local* on purpose. The count is taken at entry, on whichever
+    /// thread called in, before any rayon dispatch — so a per-thread counter
+    /// is both exact and immune to the rest of a threaded test harness running
+    /// other GEMVs concurrently. A global would need every caller in the crate
+    /// to agree on a lock, which is precisely the kind of coupling that rots.
+    pub(crate) static NK_GEMV_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Output rows owned by one task in the `[N, K]` kernel.
+///
+/// Each row there is an *independent, contiguous* dot product, so unlike
+/// [`STRIPE`] this can be as fine as we like without splitting a cache line.
+/// 8 rows is 8 sequential streams -- enough to keep the prefetchers busy while
+/// still giving a 3584-row projection 448 tasks to spread over the pool.
+const ROW_STRIPE: usize = 8;
+
+/// `out[j] = sum_p a[p] * b[j * k + p]`, with `b` the `[N, K]` row-major f16
+/// weight exactly as stored — no transpose, no copy, no cache.
+///
+/// This is the layout `Gemm`'s `transB = 1` holds, which is what essentially
+/// every `nn.Linear` export produces. It is a *better* layout for a GEMV than
+/// the `[K, N]` one [`gemv_f16_kn`] serves: each output element is one
+/// contiguous `k`-element dot product, so the weight streams front to back,
+/// every row is an independent task, and the partition can be arbitrarily fine.
+/// The reason to have both is simply that the caller does not get to choose how
+/// the weight was stored.
+///
+/// # Numerics
+///
+/// Unlike [`gemv_f16_kn`], this is **not** the summation order of a naive
+/// sequential loop, because the contraction runs along the vector lanes rather
+/// than across them. The order is still fixed and fully specified, and in
+/// particular does not depend on the thread count or on [`ROW_STRIPE`]:
+///
+/// 1. Lane `l` of accumulator `c` sums `p = 32*i + 8*c + l` for `i = 0, 1, ...`
+///    in increasing `i`, over the largest multiple of 32 at or below `k`.
+/// 2. Any remaining whole groups of 8 accumulate into `acc0` the same way.
+/// 3. The four accumulators combine as `(acc0 + acc1) + (acc2 + acc3)`, lanewise.
+/// 4. Those 8 lanes are summed low to high.
+/// 5. The final `k % 8` elements are added on in increasing `p`.
+///
+/// Splitting one sum into 32 partial sums is, if anything, *more* accurate than
+/// accumulating sequentially — but it is a different result, so the tests below
+/// pin it against a reference that reproduces exactly these five steps rather
+/// than against [`naive`](tests::naive).
+///
+/// # Panics
+/// When `b` is shorter than `k * n`, for the same memory-safety reason
+/// [`gemv_f16_kn`] panics.
+pub(crate) fn gemv_f16_nk(a: &[f32], b: &[u16], out: &mut [f32], k: usize, n: usize) {
+    #[cfg(test)]
+    NK_GEMV_CALLS.with(|calls| calls.set(calls.get() + 1));
+    debug_assert_eq!(a.len(), k);
+    debug_assert_eq!(out.len(), n);
+    let weights = k.checked_mul(n).expect("f16 GEMV geometry overflows usize");
+    assert!(
+        b.len() >= weights && a.len() >= k,
+        "f16 GEMV operands are too small for k={k} n={n}: a={} b={}",
+        a.len(),
+        b.len()
+    );
+    if n == 0 {
+        return;
+    }
+    if k == 0 {
+        out.fill(0.0);
+        return;
+    }
+
+    let simd = simd_available();
+    let rows = |j0: usize, acc: &mut [f32]| {
+        for (offset, slot) in acc.iter_mut().enumerate() {
+            let row = &b[(j0 + offset) * k..(j0 + offset) * k + k];
+            *slot = if simd {
+                // SAFETY: `simd_available()` confirmed f16c + avx2 + fma, and
+                // `row` was just sliced to exactly `k` elements.
+                unsafe { dot_row_simd(a, row, k) }
+            } else {
+                dot_row_scalar(a, row, k)
+            };
+        }
+    };
+
+    if weights < PARALLEL_MIN_WORK || rayon::current_num_threads() <= 1 {
+        for (tile, acc) in out.chunks_mut(ROW_STRIPE).enumerate() {
+            rows(tile * ROW_STRIPE, acc);
+        }
+        return;
+    }
+
+    use rayon::prelude::*;
+    out.par_chunks_mut(ROW_STRIPE)
+        .enumerate()
+        .for_each(|(tile, acc)| {
+            rows(tile * ROW_STRIPE, acc);
+        });
+}
+
+/// Reference for one `[N, K]` row, in the exact order [`gemv_f16_nk`] documents.
+fn dot_row_scalar(a: &[f32], row: &[u16], k: usize) -> f32 {
+    let widen = |p: usize| half::f16::from_bits(row[p]).to_f32();
+    let mut acc = [[0.0f32; 8]; 4];
+    // Groups of 8 consumed by the four-chain loop; whatever is left over runs
+    // into chain 0, exactly as the 8-wide SIMD loop does.
+    let quads = (k / 32) * 4;
+    let groups = k / 8;
+    for g in 0..groups {
+        let chain = if g < quads { g % 4 } else { 0 };
+        for (lane, cell) in acc[chain].iter_mut().enumerate() {
+            let p = g * 8 + lane;
+            *cell = widen(p).mul_add(a[p], *cell);
+        }
+    }
+    // Mirrors the vector combine and the store-then-sum that follows it.
+    let mut lanes = [0.0f32; 8];
+    for (lane, slot) in lanes.iter_mut().enumerate() {
+        *slot = (acc[0][lane] + acc[1][lane]) + (acc[2][lane] + acc[3][lane]);
+    }
+    let mut total = 0.0f32;
+    for lane in lanes {
+        total += lane;
+    }
+    for (p, &av) in a.iter().enumerate().take(k).skip(groups * 8) {
+        total = widen(p).mul_add(av, total);
+    }
+    total
+}
+
+/// F16C + FMA dot product of one contiguous `[N, K]` row against `a`.
+///
+/// # Safety
+/// The running CPU must support `f16c`, `avx2` and `fma` (see
+/// [`simd_available`]); `a.len() >= k` and `row.len() >= k`.
+#[target_feature(enable = "f16c,avx2,fma")]
+unsafe fn dot_row_simd(a: &[f32], row: &[u16], k: usize) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let ap = a.as_ptr();
+    let bp = row.as_ptr();
+    unsafe {
+        let mut acc = [_mm256_setzero_ps(); 4];
+        let mut p = 0;
+        // Four independent chains so the 4-cycle FMA latency does not serialise
+        // a kernel whose real limit is weight bandwidth.
+        while p + 32 <= k {
+            for (c, slot) in acc.iter_mut().enumerate() {
+                let h = _mm_loadu_si128(bp.add(p + c * 8) as *const __m128i);
+                let bw = _mm256_cvtph_ps(h);
+                let av = _mm256_loadu_ps(ap.add(p + c * 8));
+                *slot = _mm256_fmadd_ps(bw, av, *slot);
+            }
+            p += 32;
+        }
+        while p + 8 <= k {
+            let h = _mm_loadu_si128(bp.add(p) as *const __m128i);
+            let bw = _mm256_cvtph_ps(h);
+            let av = _mm256_loadu_ps(ap.add(p));
+            acc[0] = _mm256_fmadd_ps(bw, av, acc[0]);
+            p += 8;
+        }
+
+        let combined = _mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3]));
+        let mut lanes = [0.0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), combined);
+        let mut total = 0.0f32;
+        for lane in lanes {
+            total += lane;
+        }
+        while p < k {
+            let bv = half::f16::from_bits(*bp.add(p)).to_f32();
+            total = bv.mul_add(*ap.add(p), total);
+            p += 1;
+        }
+        total
+    }
+}
+
 /// F16C + FMA stripe kernel.
 ///
 /// # Safety
@@ -349,5 +536,125 @@ mod tests {
         let mut out = vec![0.0f32; n];
         gemv_f16_kn(&a, &b, &mut out, k, n);
         assert_eq!(out, vec![531.0, 642.0]);
+    }
+
+    #[test]
+    fn the_nk_weight_is_read_in_row_major_n_by_k_order() {
+        // The mirror of the test above, and the reason this kernel exists: the
+        // same logical matrix stored transposed must give the same answer.
+        //
+        // B^T = [[1, 3, 5], [2, 4, 6]], a = [1, 10, 100]
+        // out = [1 + 30 + 500, 2 + 40 + 600] = [531, 642]
+        let k = 3;
+        let n = 2;
+        let b = f16v(&[1.0, 3.0, 5.0, 2.0, 4.0, 6.0]);
+        let a = [1.0f32, 10.0, 100.0];
+        let mut out = vec![0.0f32; n];
+        gemv_f16_nk(&a, &b, &mut out, k, n);
+        assert_eq!(out, vec![531.0, 642.0]);
+    }
+
+    #[test]
+    fn nk_and_kn_agree_on_the_same_logical_matrix() {
+        // Transposing the storage must not change the value. It legitimately
+        // may change the last bits -- the two kernels contract along different
+        // axes -- so this is the one place a tolerance is right, and it is
+        // scaled by the magnitude the k-length sum can reach.
+        for (k, n) in [
+            (1usize, 1usize),
+            (7, 3),
+            (32, 8),
+            (33, 9),
+            (64, 16),
+            (129, 37),
+        ] {
+            let a = sample(k, 21);
+            let kn = f16v(&sample(k * n, 23));
+            let mut nk = vec![0u16; k * n];
+            for p in 0..k {
+                for j in 0..n {
+                    nk[j * k + p] = kn[p * n + j];
+                }
+            }
+            let mut from_kn = vec![0.0f32; n];
+            gemv_f16_kn(&a, &kn, &mut from_kn, k, n);
+            let mut from_nk = vec![0.0f32; n];
+            gemv_f16_nk(&a, &nk, &mut from_nk, k, n);
+            for (lhs, rhs) in from_kn.iter().zip(&from_nk) {
+                assert!(
+                    (lhs - rhs).abs() <= 1e-5 * (1.0 + lhs.abs()),
+                    "k={k} n={n}: {lhs} vs {rhs}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nk_simd_and_scalar_rows_agree_bit_for_bit() {
+        // The documented reduction order is the contract; `dot_row_scalar` is
+        // its executable statement, so the vector path must match it exactly at
+        // every `k` around the 32- and 8-element loop boundaries.
+        if !simd_available() {
+            return;
+        }
+        for k in [
+            1usize, 7, 8, 9, 31, 32, 33, 39, 40, 64, 65, 96, 127, 128, 3584,
+        ] {
+            let a = sample(k, 31);
+            let row = f16v(&sample(k, 37));
+            let scalar = dot_row_scalar(&a, &row, k);
+            // SAFETY: guarded by `simd_available()`; `a` and `row` both hold
+            // exactly `k` elements.
+            let simd = unsafe { dot_row_simd(&a, &row, k) };
+            assert_eq!(simd.to_bits(), scalar.to_bits(), "k={k}");
+        }
+    }
+
+    #[test]
+    fn nk_is_independent_of_the_thread_count() {
+        // `ROW_STRIPE` partitions the output, never the contraction, so the
+        // answer must not move when the pool width does.
+        let k = 300;
+        let n = 133;
+        let a = sample(k, 41);
+        let b = f16v(&sample(k * n, 43));
+        let mut reference = vec![0.0f32; n];
+        gemv_f16_nk(&a, &b, &mut reference, k, n);
+        for threads in [1usize, 2, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("pool");
+            let mut out = vec![0.0f32; n];
+            pool.install(|| gemv_f16_nk(&a, &b, &mut out, k, n));
+            assert_eq!(bits(&out), bits(&reference), "threads={threads}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "operands are too small")]
+    fn a_short_nk_weight_panics_rather_than_reading_out_of_bounds() {
+        let mut out = vec![0.0f32; 4];
+        gemv_f16_nk(&[1.0, 2.0], &[0u16; 5], &mut out, 2, 4);
+    }
+
+    #[test]
+    fn nk_handles_an_empty_contraction_and_a_partial_final_stripe() {
+        // k = 0 writes zeros without reading any weight; n = 13 leaves the last
+        // ROW_STRIPE chunk partial.
+        let mut out = vec![f32::NAN; 13];
+        gemv_f16_nk(&[], &[], &mut out, 0, 13);
+        assert_eq!(out, vec![0.0f32; 13]);
+
+        let k = 5;
+        let n = 13;
+        let a = sample(k, 47);
+        let b = f16v(&sample(k * n, 53));
+        let mut out = vec![0.0f32; n];
+        gemv_f16_nk(&a, &b, &mut out, k, n);
+        for (j, got) in out.iter().enumerate() {
+            let want = dot_row_scalar(&a, &b[j * k..j * k + k], k);
+            assert_eq!(got.to_bits(), want.to_bits(), "row {j}");
+        }
     }
 }
