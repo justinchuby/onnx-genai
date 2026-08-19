@@ -388,6 +388,56 @@ order — so this changes f32 results at `M = 1` within the tolerance
 column strips are disjoint and its K-unroll order is fixed, so the same input gives the same bits on
 every run and at every thread count.
 
+### 5. The f16 decode GEMV accumulated through memory (**fixed**)
+
+`kernels::half_gemv::gemv_f16_kn` is the x86 `M = 1` f16 GEMV. Its own module documentation states
+the premise — at `M = 1` "each weight element is touched exactly once, so the kernel is purely
+memory-bound" — and it was not true. Measured against this host's sustained read bandwidth
+(`roofline_bandwidth`: **75.8 GB/s**, saturating by 4-8 threads), the kernel ran at **12-47 GB/s**,
+under half the machine on every large cell. It also *anti-scaled*: `l3_3584` went 0.568 ms at t=4 to
+0.830 ms at t=32.
+
+The tell was that a 0.5 MB working set that never leaves L2 moved the same GB/s as a 134 MB one that
+cannot fit anywhere. A memory-bound kernel would be far faster per byte on the small cell. The limit
+was per-core and the extra threads were only contending for it.
+
+The `p` (contraction) loop was outermost, so each output's accumulator was live across the whole
+contraction but lived in `acc`. That is **three memory operations per 8-lane FMA** — load the weight,
+load the accumulator, store it back — plus a store-to-load forwarding round trip from the previous
+`p`. `STRIPE = 512` keeps the accumulators in L1, which the old comment offered as reassurance; L1 is
+only cheap next to L3, not next to a register, and 16 `ymm` were idle.
+
+Tiling the output into `TILE = 64` columns and hoisting `p` inside leaves eight accumulators in
+registers for the entire contraction, stored once — one memory operation per FMA, which is the
+minimum the problem admits. Tiling adds no traffic: the same `k * STRIPE` elements, the same stride,
+and `TILE` is exactly two cache lines with `STRIPE` a whole number of tiles.
+
+Native-alone (`ab.py --native-only --null-control`, 7 x 30, medians):
+
+| cell | weight | t | before | after | speedup | after % of roofline |
+|---|---:|---:|---:|---:|---:|---:|
+| `l2_512` | 0.5 MB | 16 | 0.028 ms | 0.018 ms | 1.56x | 39% |
+| `l2_1024` | 2.1 MB | 4 | 0.088 ms | 0.051 ms | 1.73x | 58% |
+| `l3_2048` | 8.4 MB | 16 | 0.401 ms | 0.154 ms | **2.60x** | 72% |
+| `l3_3584` | 25.7 MB | 4 | 0.549 ms | 0.419 ms | 1.31x | **86%** |
+| `l3_3584` | 25.7 MB | 32 | 1.075 ms | 0.560 ms | 1.92x | 61% |
+| `dram_8192` | 134.2 MB | 16 | 3.838 ms | 2.163 ms | 1.77x | **82%** |
+
+14 of 15 cells win by 1.22x-2.60x above their null control. `l3_2048` at t=32 would not settle in
+three runs and is not claimed. Full matrix, the `TILE` sweep, and the two rejected explanations are
+in [`2026-08-19-f16-decode-gemv-register-tile.md`](../benchmarks/2026-08-19-f16-decode-gemv-register-tile.md).
+
+Unlike the int4 row-blocking change, this is **bit-identical**: tiling changes which register holds a
+partial sum, never the order it is built in, so every pre-existing oracle test passes unmodified.
+
+`TILE = 64` was chosen by sweeping 32/64/96/128 across all 15 cells. 128 needs 18 of 16 architectural
+`ymm` and spills — on the smallest cell it is slower than making no change at all.
+
+What is left is the same fan-out problem as [section 1](#1-parallel-efficiency-not-kernel-quality--f32-dense-and-int4-matmulnbits):
+`STRIPE = 512` gives `n = 3584` only 7 stripes, so past 7 threads the workers contend. There is less
+to win there now — 46-61 GB/s against a 75.8 GB/s ceiling — and an adaptive stripe width was already
+measured and refuted.
+
 ## Precision
 
 `MatMulNBits` bits=8 M=1 was the only range this EP won outright, and part of that margin was bought
@@ -429,3 +479,20 @@ LD_LIBRARY_PATH=$ORT_ROOT/lib ./target/release/bench_prec \
 ```
 
 `native/ort` in the result line is the ratio quoted here; `parity` must read `PASS`.
+
+For the `M = 1` f16 GEMV of [section 5](#5-the-f16-decode-gemv-accumulated-through-memory-fixed),
+which is a native-vs-native comparison rather than a ratio against ORT:
+
+```sh
+python3 scripts/ort_ab/gen_f16_gemv.py --out <models>
+cargo build --release -p onnx-genai-bench --features bench-native \
+  --bin bench_generic --bin roofline_bandwidth
+./target/release/roofline_bandwidth --threads 1,2,4,8,16,32 --mib 1024 --seconds 3
+python3 scripts/ort_ab/ab.py --native-only --null-control \
+  --arms base=<before> tile=<after> --models <models>/*.onnx \
+  --threads 4 16 32 --trials 7 --runs 30 --warmups 10 --csv <out>.csv
+```
+
+`--native-only` is not optional for a native-vs-native A/B: ORT's intra-op pool spin-waits, and on
+these cells a paired run depressed the native median by up to 6x and pushed the null control past the
+effect being measured.

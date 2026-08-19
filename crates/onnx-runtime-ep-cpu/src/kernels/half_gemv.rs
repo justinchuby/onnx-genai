@@ -41,6 +41,29 @@
 //! SIMD path, the scalar fallback and a naive reference therefore all agree bit
 //! for bit, which the tests assert directly rather than within a tolerance.
 
+/// Output columns whose accumulators are held in `ymm` registers across the
+/// whole `k` loop.
+///
+/// The point of the tile is what the inner loop *stops* doing. Accumulating
+/// straight into `acc` costs three memory operations per 8-lane FMA — load the
+/// weight, load the accumulator, store it back — so the loop is limited by the
+/// load/store ports rather than by the FMA units, and every FMA also carries a
+/// store-to-load forwarding round trip from the previous `p`. Keeping the
+/// accumulators in registers leaves exactly one memory operation per FMA (the
+/// weight), which is the minimum this problem can have: the weight is read
+/// once and nothing else is touched.
+///
+/// 64 columns is 8 `ymm` accumulators, plus the broadcast activation and the
+/// widened weight, so 10 of 16 architectural registers. It is also 128 bytes,
+/// exactly two cache lines, and `STRIPE` is a multiple of it, so a tile never
+/// straddles a line it does not fully consume.
+///
+/// Tiling does not re-read anything: a stripe's weight is swept once per tile
+/// over `STRIPE / TILE` disjoint column ranges, which is the same `k * STRIPE`
+/// elements in total and the same `n`-element stride between consecutive `p`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const TILE: usize = 64;
+
 /// Output columns owned by one worker at a time.
 ///
 /// Must be at least 32 (one 64-byte line holds 32 `f16`) so no fetched line is
@@ -137,6 +160,13 @@ fn stripe_scalar(a: &[f32], b: &[u16], acc: &mut [f32], j0: usize, k: usize, n: 
 
 /// F16C + FMA stripe kernel.
 ///
+/// Column-tiled: each [`TILE`] of output columns keeps its accumulators in
+/// `ymm` for the whole `k` loop and is stored exactly once, so the inner loop
+/// issues one load per FMA instead of a load/FMA/store triple. Within any one
+/// output element the `p` order is still strictly increasing, so this is
+/// bit-identical to the untiled form and to [`stripe_scalar`] — the tiling
+/// changes which registers hold a partial sum, never the order it is built in.
+///
 /// # Safety
 /// The running CPU must support `f16c`, `avx2` and `fma` (see
 /// [`simd_available`]); `a.len() >= k`; and `(k - 1) * n + j0 + acc.len() <=
@@ -150,30 +180,53 @@ unsafe fn stripe_simd(a: &[f32], b: &[u16], acc: &mut [f32], j0: usize, k: usize
     use std::arch::x86_64::*;
 
     let w = acc.len();
-    acc.fill(0.0);
     let ap = a.as_ptr();
     let bp = b.as_ptr();
     let cp = acc.as_mut_ptr();
     unsafe {
-        for p in 0..k {
-            let avs = *ap.add(p);
-            let av = _mm256_set1_ps(avs);
-            let row = bp.add(p * n + j0);
-            let mut j = 0;
-            while j + 8 <= w {
-                let h = _mm_loadu_si128(row.add(j) as *const __m128i);
-                let bw = _mm256_cvtph_ps(h);
-                let cur = _mm256_loadu_ps(cp.add(j));
-                _mm256_storeu_ps(cp.add(j), _mm256_fmadd_ps(bw, av, cur));
-                j += 8;
+        let mut j = 0;
+        // Register-resident tiles: `TILE / 8` accumulators live in `ymm`
+        // across the whole contraction and reach memory once, at the end.
+        while j + TILE <= w {
+            let mut sums = [_mm256_setzero_ps(); TILE / 8];
+            let base = bp.add(j0 + j);
+            for p in 0..k {
+                let av = _mm256_set1_ps(*ap.add(p));
+                let row = base.add(p * n);
+                for (lane, sum) in sums.iter_mut().enumerate() {
+                    let h = _mm_loadu_si128(row.add(lane * 8) as *const __m128i);
+                    *sum = _mm256_fmadd_ps(_mm256_cvtph_ps(h), av, *sum);
+                }
             }
-            // Scalar tail, using the same fused multiply-add so the last lanes
-            // round identically to the vectorised ones.
-            while j < w {
-                let bv = half::f16::from_bits(*row.add(j)).to_f32();
-                *cp.add(j) = bv.mul_add(avs, *cp.add(j));
-                j += 1;
+            for (lane, sum) in sums.iter().enumerate() {
+                _mm256_storeu_ps(cp.add(j + lane * 8), *sum);
             }
+            j += TILE;
+        }
+        // Sub-tile remainder: one register accumulator per 8 columns, same
+        // shape as above, so it is bit-identical to the tiled path too.
+        while j + 8 <= w {
+            let mut sum = _mm256_setzero_ps();
+            let base = bp.add(j0 + j);
+            for p in 0..k {
+                let av = _mm256_set1_ps(*ap.add(p));
+                let h = _mm_loadu_si128(base.add(p * n) as *const __m128i);
+                sum = _mm256_fmadd_ps(_mm256_cvtph_ps(h), av, sum);
+            }
+            _mm256_storeu_ps(cp.add(j), sum);
+            j += 8;
+        }
+        // Scalar tail, using the same fused multiply-add so the last lanes
+        // round identically to the vectorised ones.
+        while j < w {
+            let mut sum = 0.0f32;
+            let base = bp.add(j0 + j);
+            for p in 0..k {
+                let bv = half::f16::from_bits(*base.add(p * n)).to_f32();
+                sum = bv.mul_add(*ap.add(p), sum);
+            }
+            *cp.add(j) = sum;
+            j += 1;
         }
     }
 }
@@ -282,6 +335,54 @@ mod tests {
         let mut out: Vec<f32> = Vec::new();
         gemv_f16_kn(&[1.0, 2.0], &[], &mut out, 2, 0);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn stripe_widths_around_the_tile_boundary_are_exact() {
+        // The register-tiled path runs in `TILE`-column blocks, then 8-lane
+        // blocks, then scalars, so every width class and every boundary
+        // between them has to land on the same bits. Sweeping a contiguous
+        // range rather than picked widths is what makes an off-by-one in the
+        // tile loop's `j + TILE <= w` bound impossible to miss.
+        if !simd_available() {
+            return;
+        }
+        let k = 11;
+        let n = 300;
+        let a = sample(k, 41);
+        let b = f16v(&sample(k * n, 43));
+        for w in 1..=(2 * TILE + 9) {
+            for j0 in [0usize, 8, 64, 67] {
+                if j0 + w > n {
+                    continue;
+                }
+                let mut scalar = vec![f32::NAN; w];
+                stripe_scalar(&a, &b, &mut scalar, j0, k, n);
+                let mut simd = vec![f32::NAN; w];
+                // SAFETY: `simd_available()` checked above; `j0 + w <= n` is
+                // enforced by the guard, and `b` holds `k * n` elements.
+                unsafe { stripe_simd(&a, &b, &mut simd, j0, k, n) };
+                assert_eq!(bits(&simd), bits(&scalar), "stripe j0={j0} w={w}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_tile_never_straddles_a_stripe() {
+        // `TILE`'s doc comment rests on this: a tile is two whole cache lines
+        // and a stripe is a whole number of tiles, so no tile boundary can
+        // split a line the kernel has already paid to fetch.
+        assert_eq!(
+            STRIPE % TILE,
+            0,
+            "STRIPE={STRIPE} must be a whole number of TILE={TILE} blocks"
+        );
+        assert_eq!(TILE % 8, 0, "a tile must be a whole number of 8-lane steps");
+        assert_eq!(
+            (TILE * size_of::<u16>()) % 64,
+            0,
+            "a tile must be a whole number of 64-byte cache lines"
+        );
     }
 
     #[test]

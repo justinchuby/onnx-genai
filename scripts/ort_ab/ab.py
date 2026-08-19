@@ -13,6 +13,12 @@ invocation as the real comparison. Any real delta smaller than the null delta is
 not a result. See section 37.4 of the CPU-EP benchmark ledger for the run that
 made this non-optional: two binaries traced to be on the identical code path
 still measured ~40% apart on the median at two threads.
+
+`--native-only` drops the ORT arm from every child process and compares native
+times directly. Use it for any native-vs-native A/B. ORT's intra-op pool
+spin-waits, so a paired run steals cores from the native arm -- measured at up
+to 6x depression on long cells -- and the resulting noise routinely exceeds the
+effect under test. See `sebastian-paired-harness-coresidency`.
 """
 
 from __future__ import annotations
@@ -33,8 +39,25 @@ RESULT = re.compile(
     r"native_spread=(?P<nspread>[\d.]+) ort_spread=(?P<ospread>[\d.]+).*?parity=(?P<parity>\w+)"
 )
 
+# `--native-only` prints no ORT figures at all, so it needs its own pattern:
+# the ratio and every `ort_*` field are absent rather than empty, and the
+# surviving native fields carry a ` ms` unit that the paired line omits.
+RESULT_NATIVE_ONLY = re.compile(
+    r"native=(?P<native>[\d.]+) ms .*?native_p90=(?P<np90>[\d.]+)(?: ms)? "
+    r"native_min=(?P<nmin>[\d.]+)(?: ms)? "
+    r"native_spread=(?P<nspread>[\d.]+).*?parity=(?P<parity>\w+)"
+)
 
-def run_one(binary: Path, model: Path, threads: int, runs: int, warmups: int, env=None):
+
+def run_one(
+    binary: Path,
+    model: Path,
+    threads: int,
+    runs: int,
+    warmups: int,
+    env=None,
+    native_only: bool = False,
+):
     cmd = [
         str(binary.resolve()),
         "--model",
@@ -48,17 +71,26 @@ def run_one(binary: Path, model: Path, threads: int, runs: int, warmups: int, en
         "--ort-intra-threads",
         str(threads),
     ]
+    if native_only:
+        cmd.append("--native-only")
     child_env = None
     if env:
         child_env = dict(os.environ)
         child_env.update(env)
     out = subprocess.run(cmd, capture_output=True, text=True, env=child_env)
-    m = RESULT.search(out.stdout)
+    m = (RESULT_NATIVE_ONLY if native_only else RESULT).search(out.stdout)
     if not m:
         sys.stderr.write(out.stdout[-2000:] + out.stderr[-2000:])
         raise RuntimeError(f"no result line for {model} threads={threads} bin={binary.name}")
     d = m.groupdict()
-    return {k: (v if k == "parity" else float(v)) for k, v in d.items()}
+    r = {k: (v if k == "parity" else float(v)) for k, v in d.items()}
+    if native_only:
+        # There is no ORT arm to divide by, so the comparable metric is the
+        # native time itself. Keeping the key name lets every downstream
+        # summary stay one code path.
+        r["ort"] = float("nan")
+        r["ratio"] = r["native"]
+    return r
 
 
 def main() -> None:
@@ -81,6 +113,15 @@ def main() -> None:
         action="store_true",
         help="add a duplicate of the first arm, under the name 'null', so the "
         "run measures its own noise floor alongside the real comparison",
+    )
+    ap.add_argument(
+        "--native-only",
+        action="store_true",
+        help="run each arm with --native-only and compare native times "
+        "directly, with no ORT arm in the process. Required for "
+        "native-vs-native A/B: ORT's intra-op pool spin-waits, so a paired "
+        "run depresses the native arm (up to 6x on long cells here) and its "
+        "noise swamps the comparison",
     )
     args = ap.parse_args()
 
@@ -121,15 +162,21 @@ def main() -> None:
                         args.runs,
                         args.warmups,
                         env=arm_env.get(name),
+                        native_only=args.native_only,
                     )
                     r.update(
                         model=model_path.stem, threads=threads, trial=trial, arm=name
                     )
                     rows.append(r)
+                    tail = (
+                        f"parity={r['parity']}"
+                        if args.native_only
+                        else f"ort={r['ort']:8.3f} ratio={r['ratio']:6.3f} "
+                        f"parity={r['parity']}"
+                    )
                     print(
                         f"{model_path.stem:28s} t={threads:<3d} trial={trial} {name:6s} "
-                        f"native={r['native']:8.3f} ort={r['ort']:8.3f} "
-                        f"ratio={r['ratio']:6.3f} parity={r['parity']}",
+                        f"native={r['native']:8.3f} " + tail,
                         flush=True,
                     )
 
@@ -139,7 +186,8 @@ def main() -> None:
         w.writeheader()
         w.writerows(rows)
 
-    print("\n=== medians (native/ort ratio, lower is better) ===")
+    metric = "native ms" if args.native_only else "native/ort ratio"
+    print(f"\n=== medians ({metric}, lower is better) ===")
     keys = sorted({(r["model"], r["threads"]) for r in rows})
     for model, threads in keys:
         line = [f"{model:28s} t={threads:<3d}"]
@@ -157,8 +205,9 @@ def main() -> None:
                 # blend into a median that reads as a clean win.
                 bad = sum(1 for r in cell if r["parity"] != "PASS")
                 flag = f" PARITY_FAIL={bad}/{len(cell)}" if bad else ""
+                label = "native_p50" if args.native_only else "ratio_p50"
                 line.append(
-                    f"{name}: ratio_p50={median(sel):6.3f} "
+                    f"{name}: {label}={median(sel):6.3f} "
                     f"[{min(sel):.3f}-{max(sel):.3f}] native_p50={median(nat):8.3f}ms{flag}"
                 )
         print("  ".join(line))
@@ -166,7 +215,7 @@ def main() -> None:
     if len(arms) > 1:
         print(
             "\n=== deltas vs "
-            f"'{baseline}' (median ratio; negative = arm is faster) ==="
+            f"'{baseline}' (median {metric}; negative = arm is faster) ==="
         )
         if args.null_control:
             print(
