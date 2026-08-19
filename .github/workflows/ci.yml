@@ -909,6 +909,14 @@ jobs:
       - name: Audit CUDA kernel capture-sync contract
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test capture_sync_contract
 
+      # The int4 MatMulNBits parity oracle self-checks are pure-CPU (no device):
+      # they validate the f64 dequant->GEMM ground truth and the justified
+      # tolerance envelope the GPU numerics gate depends on. The honesty checker
+      # deliberately does not police this target (it is in ALWAYS_RUN), so run it
+      # explicitly here to keep the oracle math exercised on the CPU lane (#1177).
+      - name: Verify int4 MatMulNBits numerics oracle
+        run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test matmul_nbits_marlin_oracle
+
       - name: Clippy CUDA execution provider
         run: cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings
 

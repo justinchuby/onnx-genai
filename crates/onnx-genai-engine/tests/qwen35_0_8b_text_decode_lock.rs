@@ -70,5 +70,3 @@ const EXPECTED_TOKENS: &[u32] = &[
 fn qwen35_0_8b_text_native_cuda_matches_golden_greedy_sequence() -> anyhow::Result<()> {
     decode_lock::assert_native_matches_golden(MODEL_DIR_ENV, PROMPT, EXPECTED_TOKENS)
 }
-
-
