@@ -2007,7 +2007,7 @@ unsafe fn prepare_workspace(
     kernel: &dyn Kernel,
     plans: &WorkspacePlanCache,
     inputs: &[TensorView<'_>],
-    node_label: &str,
+    node_label: impl std::fmt::Display + Copy,
 ) -> Result<Option<WorkspaceView>, String> {
     let metadata: Vec<TensorMetadata<'_>> = inputs
         .iter()
@@ -2121,7 +2121,7 @@ fn workspace_trace_enabled() -> bool {
 /// returned, capped at 4096 — the useful question is "did ORT already meet the
 /// kernel's alignment", not the exact 2-adic valuation of the address.
 fn workspace_trace_line(
-    node_label: &str,
+    node_label: impl std::fmt::Display,
     base: usize,
     aligned: usize,
     bytes: usize,
@@ -2312,10 +2312,11 @@ unsafe extern "C" fn compute_execute(
             // last reader has run is dead and its storage can be handed
             // straight back to the next allocation, so a chain of N nodes
             // cycles a couple of buffers instead of touching N fresh ones.
-            let last_reader =
-                last_reader_per_buffer(&routing.input_sources, routing.num_intermediate_buffers);
+            let (retire_starts, retire_items) =
+                retirements_per_node(&routing.input_sources, routing.num_intermediate_buffers);
 
             for (node_idx, entry) in exported.entries.iter().enumerate() {
+                let node_probe = crate::dispatch_probe::Phase::TensorBind.enter();
                 let sources = &routing.input_sources[node_idx];
                 let sinks = &routing.output_sinks[node_idx];
 
@@ -2360,12 +2361,15 @@ unsafe extern "C" fn compute_execute(
                 }
 
                 // Infer output shapes.
+                node_probe.end();
+                let shape_probe = crate::dispatch_probe::Phase::DispatchLookup.enter();
                 let output_shapes = match infer_shapes(&entry.shape_inference, &kernel_inputs) {
                     Ok(s) => s,
                     Err(e) => {
                         return fail_status(&format!("Compute: shape inference failed: {e}"));
                     }
                 };
+                shape_probe.end();
 
                 // Execute — dispatch based on sinks.
                 // For outputs going to ORT we allocate via ORT API;
@@ -2522,11 +2526,18 @@ unsafe extern "C" fn compute_execute(
 
                 // Collect all output views using the per-slot view map so
                 // positions stay aligned even when absent slots are present.
-                let absent_shapes: Vec<Vec<usize>> = output_shapes.clone();
-                let absent_strides_storage: Vec<Vec<i64>> = absent_shapes
-                    .iter()
-                    .map(|s| contiguous_strides(s))
-                    .collect();
+                let absent_shapes: &[Vec<usize>] = &output_shapes;
+                // One entry per *absent* slot, not per output slot. Only
+                // absent slots read these, and a node with an absent output is
+                // the exception, so building them for every output cost an
+                // allocation per output on every node that has none. Each entry
+                // is keyed by the same index that keys `absent_scratch`, where
+                // the slot it belongs to is recorded -- so this stays aligned by
+                // construction rather than by an invariant about emptiness.
+                let absent_strides_storage = absent_slot_strides(
+                    absent_scratch.iter().map(|(slot, _, _)| *slot),
+                    absent_shapes,
+                );
                 let mut all_output_views: Vec<_> = {
                     let mut ort_iter = ort_out_views.drain(..);
                     let mut buf_iter = new_bufs.iter_mut();
@@ -2542,7 +2553,7 @@ unsafe extern "C" fn compute_execute(
                             RoutedSlotKind::Absent(idx) => {
                                 let (_, scratch_buf, dtype) = &mut absent_scratch[*idx];
                                 let shape = &absent_shapes[slot_idx];
-                                let strides = &absent_strides_storage[slot_idx];
+                                let strides = &absent_strides_storage[*idx];
                                 TensorMut::new(
                                     DevicePtrMut(scratch_buf.as_mut_ptr().cast()),
                                     *dtype,
@@ -2556,13 +2567,12 @@ unsafe extern "C" fn compute_execute(
                         .collect()
                 };
 
-                let node_label = format!("Compute: node {node_idx}");
                 let plans = match exported.workspace_plan_cache(node_idx) {
                     Some(plans) => plans,
                     None => {
                         return fail_status(&format!(
-                            "{node_label}: no workspace plan cache for this node (entries and \
-                             workspace_plans have drifted)"
+                            "Compute: node {node_idx}: no workspace plan cache for this node \
+                             (entries and workspace_plans have drifted)"
                         ));
                     }
                 };
@@ -2587,13 +2597,14 @@ unsafe extern "C" fn compute_execute(
                         &*entry.kernel,
                         plans,
                         &kernel_inputs,
-                        &node_label,
+                        format_args!("Compute: node {node_idx}"),
                     )
                 } {
                     Ok(w) => w,
                     Err(e) => return fail_status(&e),
                 };
 
+                let kernel_probe = crate::dispatch_probe::Phase::KernelInvoke.enter();
                 if let Err(e) = entry.kernel.execute_with_workspace(
                     &kernel_inputs,
                     &mut all_output_views,
@@ -2601,6 +2612,8 @@ unsafe extern "C" fn compute_execute(
                 ) {
                     return fail_status(&format!("Compute: kernel execution failed: {e}"));
                 }
+                kernel_probe.end();
+                crate::dispatch_probe::count(crate::dispatch_probe::Event::NodeExecuted);
                 EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
 
                 // Store new intermediate buffers.
@@ -2620,10 +2633,9 @@ unsafe extern "C" fn compute_execute(
                 // it here — rather than at the end of the subgraph — is what
                 // lets the next node's allocation land on storage that is
                 // still hot in cache.
-                for (buf_idx, last) in last_reader.iter().enumerate() {
-                    if *last == Some(node_idx)
-                        && let Some(dead) = intermediates[buf_idx].take()
-                    {
+                for &buf_idx in &retire_items[retire_starts[node_idx]..retire_starts[node_idx + 1]]
+                {
+                    if let Some(dead) = intermediates[buf_idx].take() {
                         recycle_host_intermediate(dead.data);
                     }
                 }
@@ -2753,11 +2765,16 @@ unsafe extern "C" fn compute_execute(
             }
             // Build output views in node-output order so the kernel sees the
             // full arity including absent scratch slots.
-            let absent_shapes: Vec<Vec<usize>> = output_shapes.clone();
-            let absent_strides_storage: Vec<Vec<i64>> = absent_shapes
-                .iter()
-                .map(|s| contiguous_strides(s))
-                .collect();
+            let absent_shapes: &[Vec<usize>] = &output_shapes;
+            // See the routed path. `slot_map` pushes `Absent(idx)` with
+            // increasing `idx`, so filtering it in slot order yields the strides
+            // in absent-index order.
+            let absent_strides_storage = absent_slot_strides(
+                slot_map.iter().enumerate().filter_map(|(slot_idx, kind)| {
+                    matches!(kind, SlotKind::Absent(_)).then_some(slot_idx)
+                }),
+                absent_shapes,
+            );
             // First, get mutable views of all ORT outputs in order.
             let mut ort_views: Vec<TensorMut<'_>> =
                 owned_outputs.iter_mut().map(|o| o.view_mut()).collect();
@@ -2772,7 +2789,7 @@ unsafe extern "C" fn compute_execute(
                     SlotKind::Absent(idx) => {
                         let buf = &mut absent_bufs[*idx];
                         let shape = &absent_shapes[slot_idx];
-                        let strides = &absent_strides_storage[slot_idx];
+                        let strides = &absent_strides_storage[*idx];
                         let scratch_dtype = absent_dtypes[*idx];
                         let view = TensorMut::new(
                             DevicePtrMut(buf.as_mut_ptr().cast()),
@@ -2959,6 +2976,68 @@ fn last_reader_per_buffer(
         }
     }
     last
+}
+
+/// Buffers retiring after each node, as a CSR index: node `i` retires the
+/// buffers in `items[starts[i]..starts[i + 1]]`.
+///
+/// The routed loop used to find these by scanning every buffer's last-reader
+/// entry at every node, which is O(nodes x buffers) -- and a chain has a buffer
+/// per node, so it is quadratic in subgraph depth. That cost is invisible at
+/// depth 1 and dominant at depth 100.
+///
+/// Inverting the map once per `Run` makes each node touch only its own
+/// retirements. Within a node they stay in ascending buffer order, as the scan
+/// produced them.
+fn retirements_per_node(
+    input_sources: &[Vec<NodeInputSource>],
+    num_buffers: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let last = last_reader_per_buffer(input_sources, num_buffers);
+    let nodes = input_sources.len();
+    let mut starts = vec![0usize; nodes + 1];
+    for &reader in last.iter().flatten() {
+        if reader < nodes {
+            starts[reader + 1] += 1;
+        }
+    }
+    for i in 0..nodes {
+        starts[i + 1] += starts[i];
+    }
+    let mut items = vec![0usize; starts[nodes]];
+    let mut cursor = starts.clone();
+    for (buffer, reader) in last.iter().enumerate() {
+        if let Some(reader) = reader
+            && *reader < nodes
+        {
+            items[cursor[*reader]] = buffer;
+            cursor[*reader] += 1;
+        }
+    }
+    (starts, items)
+}
+
+/// Contiguous strides for the *absent* output slots only, in absent-index
+/// order.
+///
+/// Absent slots are the exception, so the routed loop used to build a stride
+/// vector for every output of every node and read it only when a slot turned
+/// out to be absent -- an allocation per output, per node, discarded unused.
+///
+/// The result is keyed by absent index, the same key `Absent(idx)` carries, so
+/// callers index it with `idx` rather than the slot number. Both callers pass
+/// absent slots in ascending slot order, which is the order `idx` was assigned
+/// in, so the two agree by construction.
+fn absent_slot_strides(
+    absent_slots: impl Iterator<Item = usize>,
+    shapes: &[Vec<usize>],
+) -> Vec<Vec<i64>> {
+    absent_slots
+        .map(|slot| match shapes.get(slot) {
+            Some(shape) => contiguous_strides(shape),
+            None => Vec::new(),
+        })
+        .collect()
 }
 
 fn contiguous_strides(shape: &[usize]) -> Vec<i64> {
@@ -4878,6 +4957,146 @@ mod tests {
             super::last_reader_per_buffer(&sources, 2),
             vec![Some(1), None]
         );
+    }
+
+    /// The CSR index must retire exactly what the per-node scan retired.
+    ///
+    /// This is the property the rewrite trades on, so it is checked against the
+    /// scan itself rather than against hand-written expectations: for every
+    /// node, the buffers the index yields are the buffers whose last reader is
+    /// that node, in the same ascending order the scan visited them.
+    fn scan_retirements(sources: &[Vec<NodeInputSource>], buffers: usize) -> Vec<Vec<usize>> {
+        let last = super::last_reader_per_buffer(sources, buffers);
+        (0..sources.len())
+            .map(|node| {
+                last.iter()
+                    .enumerate()
+                    .filter(|(_, l)| **l == Some(node))
+                    .map(|(buffer, _)| buffer)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn index_retirements(sources: &[Vec<NodeInputSource>], buffers: usize) -> Vec<Vec<usize>> {
+        let (starts, items) = super::retirements_per_node(sources, buffers);
+        (0..sources.len())
+            .map(|node| items[starts[node]..starts[node + 1]].to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn the_retirement_index_agrees_with_the_scan_it_replaces() {
+        let chain: Vec<Vec<NodeInputSource>> = std::iter::once(vec![NodeInputSource::Ort(0)])
+            .chain((0..9).map(|i| vec![NodeInputSource::Buffer(i)]))
+            .collect();
+        let cases: Vec<(Vec<Vec<NodeInputSource>>, usize)> = vec![
+            // A plain chain: every buffer dies after the node that reads it.
+            (chain, 9),
+            // A buffer read twice must retire only after the later reader, and
+            // must appear exactly once in the index.
+            (
+                vec![
+                    vec![NodeInputSource::Ort(0)],
+                    vec![NodeInputSource::Buffer(0)],
+                    vec![NodeInputSource::Ort(1)],
+                    vec![NodeInputSource::Buffer(0), NodeInputSource::Buffer(1)],
+                ],
+                2,
+            ),
+            // Unread and out-of-range buffers retire nowhere.
+            (
+                vec![
+                    vec![NodeInputSource::Ort(0)],
+                    vec![NodeInputSource::Buffer(0), NodeInputSource::Buffer(7)],
+                    vec![NodeInputSource::Absent],
+                ],
+                2,
+            ),
+            // One node retiring several buffers at once: order must be
+            // ascending, as the scan produced it.
+            (
+                vec![
+                    vec![NodeInputSource::Ort(0)],
+                    vec![NodeInputSource::Ort(1)],
+                    vec![
+                        NodeInputSource::Buffer(2),
+                        NodeInputSource::Buffer(0),
+                        NodeInputSource::Buffer(1),
+                    ],
+                ],
+                3,
+            ),
+            // No buffers at all.
+            (vec![vec![NodeInputSource::Ort(0)]], 0),
+        ];
+        for (sources, buffers) in cases {
+            assert_eq!(
+                index_retirements(&sources, buffers),
+                scan_retirements(&sources, buffers),
+                "retirement index diverged from the scan for {sources:?}"
+            );
+        }
+    }
+
+    /// Every buffer retires exactly once, or storage leaks for the length of
+    /// the subgraph (or worse, is recycled twice).
+    #[test]
+    fn every_read_buffer_retires_exactly_once() {
+        let sources: Vec<Vec<NodeInputSource>> = std::iter::once(vec![NodeInputSource::Ort(0)])
+            .chain((0..20).map(|i| vec![NodeInputSource::Buffer(i)]))
+            .collect();
+        let (starts, items) = super::retirements_per_node(&sources, 20);
+        let mut seen = items.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), items.len(), "a buffer retired twice");
+        assert_eq!(items.len(), 20, "every buffer of a chain is read once");
+        assert_eq!(starts[sources.len()], items.len());
+    }
+
+    /// Absent strides are keyed by absent index, not slot index.
+    ///
+    /// Getting this wrong is invisible for a node with a single absent output
+    /// at slot 0 -- the two indices coincide -- and silently hands the wrong
+    /// strides to every other shape. It is pinned with absent slots that are
+    /// neither first nor contiguous, and with differing shapes per slot so a
+    /// mis-key produces a different answer rather than the same one twice.
+    #[test]
+    fn absent_strides_are_keyed_by_absent_index_not_slot_index() {
+        let shapes = vec![
+            vec![2usize, 3, 4],
+            vec![5usize, 6],
+            vec![7usize, 8, 9],
+            vec![10usize],
+        ];
+        // Slots 1 and 3 are absent, so absent index 0 is slot 1 and absent
+        // index 1 is slot 3.
+        let got = super::absent_slot_strides([1usize, 3].into_iter(), &shapes);
+        assert_eq!(got.len(), 2, "one entry per absent slot, not per output");
+        assert_eq!(got[0], super::contiguous_strides(&shapes[1]));
+        assert_eq!(got[1], super::contiguous_strides(&shapes[3]));
+        assert_ne!(
+            got[0],
+            super::contiguous_strides(&shapes[0]),
+            "keying by slot index would have produced this"
+        );
+    }
+
+    #[test]
+    fn a_node_with_no_absent_outputs_builds_no_absent_strides() {
+        let shapes = vec![vec![2usize, 3], vec![4usize, 5]];
+        assert!(super::absent_slot_strides(std::iter::empty(), &shapes).is_empty());
+    }
+
+    /// An out-of-range slot must not panic in the middle of a `Run`. It cannot
+    /// arise from a well-formed slot map, but this runs inside ORT's callback
+    /// where a panic crosses an FFI boundary.
+    #[test]
+    fn an_out_of_range_absent_slot_yields_empty_strides() {
+        let shapes = vec![vec![2usize, 3]];
+        let got = super::absent_slot_strides([9usize].into_iter(), &shapes);
+        assert_eq!(got, vec![Vec::<i64>::new()]);
     }
 
     #[test]

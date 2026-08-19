@@ -5946,6 +5946,7 @@ opset_import: [{{ version: 17 }}]
 ///   the earlier activation sweep could not answer this question.
 fn dispatch_grid_cases() -> Vec<MatmulFamilyCase> {
     const W: usize = 4096;
+    const TINY: usize = 8;
     vec![
         chain_case("grid_identity_1_static", "Identity", 1, W, false),
         chain_case("grid_identity_10_static", "Identity", 10, W, false),
@@ -5956,6 +5957,18 @@ fn dispatch_grid_cases() -> Vec<MatmulFamilyCase> {
         chain_case("grid_relu_1_dyn", "Relu", 1, W, true),
         chain_case("grid_relu_10_dyn", "Relu", 10, W, true),
         chain_case("grid_relu_100_dyn", "Relu", 100, W, true),
+        // Dispatch-isolating widths. At W = 4096 a Relu node moves 32 KiB, and
+        // that traffic — not the dispatch around it — sets the per-node cost,
+        // so the ratio there reports elementwise throughput wearing a
+        // dispatch-shaped hat. At 8 elements the kernel is a single masked
+        // vector op and essentially everything left is overhead, which is what
+        // #1077 is actually about. The pair brackets it: TINY is the overhead
+        // floor, W the throughput regime.
+        chain_case("grid_relu_1_tiny", "Relu", 1, TINY, false),
+        chain_case("grid_relu_10_tiny", "Relu", 10, TINY, false),
+        chain_case("grid_relu_100_tiny", "Relu", 100, TINY, false),
+        chain_case("grid_relu_1_tiny_dyn", "Relu", 1, TINY, true),
+        chain_case("grid_relu_10_tiny_dyn", "Relu", 10, TINY, true),
         small_matmul_case("grid_matmul_128x128", 128, 128),
         small_matmul_case("grid_matmul_512x512", 512, 512),
     ]
