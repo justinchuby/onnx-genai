@@ -146,7 +146,7 @@ impl Kernel for GatherKernel {
             ));
         }
         let capturing = self.runtime.is_capturing()?;
-        if !capturing {
+        if !capturing && !self.runtime.eager_sync_deferred() {
             // A device-side out-of-range index would be an out-of-bounds load.
             // Eager execution reports it synchronously; captured execution uses
             // the shared device error latch checked before token consumption.

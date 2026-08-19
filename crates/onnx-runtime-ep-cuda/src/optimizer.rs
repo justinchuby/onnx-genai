@@ -5,8 +5,21 @@ use onnx_runtime_optimizer::{
     OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult,
 };
 
+use crate::kernels::linear_attention::{FUSE_BETA_SIGMOID_ATTR, FUSE_DECAY_SOFTPLUS_ATTR};
+
 pub(crate) const SILU_MUL_FUSION_ATTR: &str = "_cuda_silu_mul";
 pub(crate) const DECOMPOSED_SILU_ATTR: &str = "_cuda_decomposed_silu";
+
+/// Private marker set by [`CudaRsqrtFusion`] on a `Reciprocal` node whose input
+/// was a single-consumer `Sqrt`. The fusion rewires the `Reciprocal` to read the
+/// pre-`Sqrt` value and deletes the `Sqrt`; the CUDA unary-math factory
+/// ([`crate::kernels::pointwise::UnaryMathFactory`]) sees this marker and
+/// dispatches the single-kernel `rsqrt_{dtype}` (byte-identical double-round)
+/// instead of the plain `reciprocal_{dtype}`. The node keeps op_type
+/// `Reciprocal` in the default domain so standard unary shape inference and
+/// registry dispatch are unchanged, and the session restores the pre-pass graph
+/// before any non-CUDA fallback so no other EP observes the rewired node.
+pub(crate) const CUDA_RSQRT_ATTR: &str = "_cuda_rsqrt";
 
 /// Private marker set on a `MatMulNBits` node whose trailing bias input came
 /// from folding a *separate* elementwise `Add(MatMulNBits(x), bias)`.
@@ -90,6 +103,17 @@ pub(crate) struct CudaSiluFusion;
 pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     vec![
         Box::new(CudaSiluFusion),
+        // Collapse the SSM/linear-attention `Reciprocal(Sqrt(x))` normalize-scale
+        // glue into a single byte-identical `rsqrt` kernel (drops the standalone
+        // reciprocal kernel + its fp16 intermediate round-trip, ~1.2% of decode
+        // GPU-kernel time on qwen3.5-0.8b-hybrid; see the profiling drop).
+        Box::new(CudaRsqrtFusion),
+        // Fold the gated-delta `LinearAttention` beta-`Sigmoid` and decay
+        // `Softplus` gate chains into the kernel while they are still in their
+        // pristine exported form (before the cast-dropping passes run). Drops a
+        // handful of tiny per-layer elementwise nodes from the captured decode
+        // graph; byte-identical (the kernel reproduces each op's rounding).
+        Box::new(CudaLinearAttentionGatingFusion),
         Box::new(CudaFoldConstantTranspose),
         Box::new(CudaFoldConstantCast),
         // Fuse the per-layer Q/K/V projections into one wider MatMulNBits while
@@ -113,6 +137,10 @@ pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
         // cache selector into an on-device `Where`, collapsing the per-token host
         // cond readback / graph split so decode captures as a single graph.
         Box::new(CudaOnDeviceConstantSelect),
+        // Runs last so it also sweeps up any identity `Cast` left behind by the
+        // fusions above (and the ~90 fp32→fp32 export casts per forward), rewiring
+        // consumers onto the pre-cast value. Byte-identical, shape/dtype-driven.
+        Box::new(CudaDropIdentityCast),
     ]
 }
 
@@ -188,6 +216,384 @@ impl OptimizationPass for CudaSiluFusion {
                 .opset_imports
                 .entry(MICROSOFT_DOMAIN.to_string())
                 .or_insert(1);
+            changed = true;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+/// Collapse an ONNX `Reciprocal(Sqrt(x))` pair into a single fused `rsqrt`
+/// kernel.
+///
+/// ## The pattern
+///
+/// SSM / linear-attention decoders (e.g. qwen3.5-*-hybrid) normalize the SSM
+/// query/key by a sum-of-squares scale, which exporters emit as the primitive
+/// chain `... Add(sumsq, eps) → Sqrt → Reciprocal → Mul(x, scale)`. The `Sqrt`
+/// and `Reciprocal` land as two standalone per-layer kernels
+/// (`sqrt_{dtype}` + `reciprocal_{dtype}`); a captured-graph node trace of
+/// qwen3.5-0.8b-hybrid decode measured the standalone `reciprocal_f16` at ~1.2%
+/// of decode GPU-kernel time (fires 2× per SSM layer), each reading and writing
+/// the full scale tensor.
+///
+/// ## The rewrite
+///
+/// For every `Sqrt` whose single output is consumed *only* by one `Reciprocal`
+/// (and is not a graph output), this pass rewires the `Reciprocal` to read the
+/// `Sqrt`'s input directly, tags it with [`CUDA_RSQRT_ATTR`], and deletes the
+/// `Sqrt`. The node keeps op_type `Reciprocal` in the default domain, so
+/// standard unary shape inference and kernel-registry dispatch are unchanged;
+/// the CUDA unary-math factory reads the marker and launches the fused
+/// `rsqrt_{dtype}` kernel, which reproduces the exact two-kernel rounding
+/// (`Sqrt` rounds `sqrtf(x)` to the storage dtype, then `Reciprocal` reads that
+/// back) so greedy tokens stay byte-identical while the intermediate tensor's
+/// global round-trip and one kernel launch are eliminated.
+///
+/// This is model-agnostic: it matches the structural `Sqrt → Reciprocal` glue
+/// on any shape/dtype the unary kernels support (f32/f16/bf16), not a single
+/// architecture. The single-consumer / no-escape guard guarantees the fusion
+/// never removes a `Sqrt` value another node still observes.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaRsqrtFusion;
+
+impl OptimizationPass for CudaRsqrtFusion {
+    fn name(&self) -> &str {
+        "CudaRsqrtFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        let sqrt_ids: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "Sqrt"
+                    && node.is_default_domain()
+                    && node.inputs.len() == 1
+                    && node.outputs.len() == 1)
+                    .then_some(id)
+            })
+            .collect();
+        let mut changed = false;
+
+        for sqrt_id in sqrt_ids {
+            let Some(sqrt) = graph.try_node(sqrt_id) else {
+                continue;
+            };
+            let Some(x) = sqrt.inputs[0] else {
+                continue;
+            };
+            // The fused `rsqrt` kernel exists for f32/f16/bf16 and reproduces the
+            // two-op rounding exactly, so restrict the fusion to those dtypes.
+            if !matches!(
+                graph.value(x).dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            ) {
+                continue;
+            }
+            let sqrt_output = sqrt.outputs[0];
+            if graph.outputs.contains(&sqrt_output) {
+                continue;
+            }
+            let consumers = graph.consumers(sqrt_output);
+            if consumers.len() != 1 {
+                continue;
+            }
+            let recip_id = consumers[0];
+            let recip = graph.node(recip_id);
+            if recip.op_type != "Reciprocal"
+                || !recip.is_default_domain()
+                || recip.inputs.len() != 1
+                || recip.outputs.len() != 1
+                || recip.inputs[0] != Some(sqrt_output)
+                || recip.attr(CUDA_RSQRT_ATTR).is_some()
+            {
+                continue;
+            }
+
+            let mut rsqrt = recip.clone();
+            rsqrt.inputs = vec![Some(x)];
+            rsqrt
+                .attributes
+                .insert(CUDA_RSQRT_ATTR.into(), Attribute::Int(1));
+            graph.replace_node(recip_id, rsqrt);
+            graph.remove_node(sqrt_id);
+            changed = true;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+/// Fold the standalone gate chains that feed a gated-delta `LinearAttention`
+/// (Gated DeltaNet, Qwen3.5 / Qwen3-Next hybrid family) into the CUDA
+/// `LinearAttention` kernel itself, so the per-layer decode graph loses a handful
+/// of tiny elementwise nodes per layer:
+///
+/// * **`beta = Sigmoid(x)`** — the delta-rule mixing gate. The kernel already
+///   consumes `beta`; the fold rewires it onto the pre-`Sigmoid` value and marks
+///   [`FUSE_BETA_SIGMOID_ATTR`], so the kernel applies the sigmoid inline.
+/// * **`g = exp(neg_exp_A · Softplus(a + dt_bias))`** — the per-head decay gate.
+///   The exported chain is `Add(a, dt_bias) → Softplus → Mul(neg_exp_A, ·) →
+///   [Cast]`, feeding the kernel's `exp`. The fold rewires the decay slot onto
+///   `a`, appends `dt_bias` and `neg_exp_A` as trailing inputs, and marks
+///   [`FUSE_DECAY_SOFTPLUS_ATTR`]; the kernel recomputes the whole chain.
+///
+/// ## Byte-identity
+///
+/// The kernel reproduces each folded op's device function bit-for-bit
+/// (`la_sigmoid`/`la_softplus` mirror `op_sigmoid`/`op_softplus`) **and** rounds
+/// every intermediate through the storage dtype (`round_store<T>`) exactly where
+/// the standalone `Add`/`Softplus`/`Mul`/`Sigmoid` kernels round. So on the fp32
+/// text export (chain runs in f32, rounding is a no-op) and the fp16-I/O hybrid
+/// (chain rounds to f16 at every op boundary) greedy tokens stay identical. The
+/// fold is refused unless every folded operand shares the kernel's I/O dtype, so
+/// a dtype-changing `Cast` is never silently skipped.
+///
+/// ## Generality and safety
+///
+/// The match is purely structural — driven by op type, single-consumer /
+/// no-escape topology, and which `Mul`/`Add` operand is a graph initializer — so
+/// it fires for any head count and layer count and never bakes in a Qwen3.5
+/// shape. Each rewritten gate requires its whole chain to be single-consumer and
+/// not a graph output, so no value another node still observes is removed. When
+/// any condition fails the gate is left exactly as exported.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaLinearAttentionGatingFusion;
+
+/// Environment opt-out for [`CudaLinearAttentionGatingFusion`], mirroring the
+/// other CUDA-fusion switches. Any value other than unset/empty/`0` restores the
+/// exact exported (unfused) gate chains — for A/B measurement or rollback.
+const LINEAR_ATTENTION_GATING_DISABLE_ENV: &str = "ONNX_GENAI_CUDA_DISABLE_LINATTN_GATING_FUSION";
+
+fn linear_attention_gating_disabled() -> bool {
+    std::env::var_os(LINEAR_ATTENTION_GATING_DISABLE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+/// A `Sigmoid` gate folded into the kernel: `sigmoid_id` is removed and the
+/// beta slot is rewired onto `raw` (its pre-`Sigmoid` source).
+struct BetaSigmoidFold {
+    sigmoid_id: NodeId,
+    raw: ValueId,
+}
+
+/// A decay `Softplus` chain folded into the kernel.
+struct DecaySoftplusFold {
+    /// Pre-chain activation `a` (the `Add`'s non-initializer operand).
+    a: ValueId,
+    dt_bias: ValueId,
+    neg_exp_a: ValueId,
+    /// Chain nodes to delete, consumer-first so each is orphaned before removal.
+    dead: Vec<NodeId>,
+}
+
+impl CudaLinearAttentionGatingFusion {
+    /// A `LinearAttention` node in the `com.microsoft` domain with at least the
+    /// `q, k, v, past, decay, beta` slots.
+    fn is_gated_delta_la(node: &Node) -> bool {
+        node.op_type == "LinearAttention"
+            && node.domain == MICROSOFT_DOMAIN
+            && node.inputs.len() >= 6
+            && node.outputs.len() == 2
+    }
+
+    /// The single producer of `value`, if `value` is single-consumer (by
+    /// `consumer_id`), not a graph output, and produced by exactly one node.
+    fn sole_producer(graph: &Graph, value: ValueId, consumer_id: NodeId) -> Option<NodeId> {
+        if graph.outputs.contains(&value) {
+            return None;
+        }
+        let consumers = graph.consumers(value);
+        if consumers.len() != 1 || consumers[0] != consumer_id {
+            return None;
+        }
+        graph.value(value).producer
+    }
+
+    /// Match `beta = Sigmoid(raw)` where `raw` shares `io_dtype`.
+    fn match_beta_sigmoid(
+        graph: &Graph,
+        beta: ValueId,
+        la_id: NodeId,
+        io_dtype: DataType,
+    ) -> Option<BetaSigmoidFold> {
+        let sigmoid_id = Self::sole_producer(graph, beta, la_id)?;
+        let sigmoid = graph.node(sigmoid_id);
+        if sigmoid.op_type != "Sigmoid"
+            || !sigmoid.is_default_domain()
+            || sigmoid.inputs.len() != 1
+            || sigmoid.outputs.len() != 1
+        {
+            return None;
+        }
+        let raw = sigmoid.inputs[0]?;
+        if graph.value(raw).dtype != io_dtype {
+            return None;
+        }
+        Some(BetaSigmoidFold { sigmoid_id, raw })
+    }
+
+    /// Match `decay = [Cast](Mul(neg_exp_A, Softplus(Add(a, dt_bias))))` with an
+    /// optional identity `Cast` tail, every intermediate single-consumer and of
+    /// `io_dtype`, and `dt_bias`/`neg_exp_A` graph initializers.
+    fn match_decay_softplus(
+        graph: &Graph,
+        decay: ValueId,
+        la_id: NodeId,
+        io_dtype: DataType,
+    ) -> Option<DecaySoftplusFold> {
+        let mut dead = Vec::new();
+        // Optional trailing identity `Cast` (never a dtype-changing one).
+        let (mul_out, mul_consumer) = {
+            let producer = Self::sole_producer(graph, decay, la_id)?;
+            let node = graph.node(producer);
+            if node.op_type == "Cast"
+                && node.is_default_domain()
+                && node.inputs.len() == 1
+                && node.outputs.len() == 1
+                && graph.value(node.inputs[0]?).dtype == io_dtype
+            {
+                dead.push(producer);
+                (node.inputs[0]?, producer)
+            } else {
+                (decay, la_id)
+            }
+        };
+        // `Mul(neg_exp_A, Softplus(...))` — order-independent.
+        let mul_id = Self::sole_producer(graph, mul_out, mul_consumer)?;
+        let mul = graph.node(mul_id);
+        if mul.op_type != "Mul"
+            || !mul.is_default_domain()
+            || mul.inputs.len() != 2
+            || mul.outputs.len() != 1
+        {
+            return None;
+        }
+        let (a0, a1) = (mul.inputs[0]?, mul.inputs[1]?);
+        let (neg_exp_a, softplus_out) = if graph.initializers.contains_key(&a0) {
+            (a0, a1)
+        } else if graph.initializers.contains_key(&a1) {
+            (a1, a0)
+        } else {
+            return None;
+        };
+        if graph.value(neg_exp_a).dtype != io_dtype {
+            return None;
+        }
+        dead.push(mul_id);
+        // `Softplus(Add(...))`.
+        let softplus_id = Self::sole_producer(graph, softplus_out, mul_id)?;
+        let softplus = graph.node(softplus_id);
+        if softplus.op_type != "Softplus"
+            || !softplus.is_default_domain()
+            || softplus.inputs.len() != 1
+            || softplus.outputs.len() != 1
+        {
+            return None;
+        }
+        let add_out = softplus.inputs[0]?;
+        dead.push(softplus_id);
+        // `Add(a, dt_bias)` — order-independent.
+        let add_id = Self::sole_producer(graph, add_out, softplus_id)?;
+        let add = graph.node(add_id);
+        if add.op_type != "Add"
+            || !add.is_default_domain()
+            || add.inputs.len() != 2
+            || add.outputs.len() != 1
+        {
+            return None;
+        }
+        let (b0, b1) = (add.inputs[0]?, add.inputs[1]?);
+        let (dt_bias, a) = if graph.initializers.contains_key(&b1) {
+            (b1, b0)
+        } else if graph.initializers.contains_key(&b0) {
+            (b0, b1)
+        } else {
+            return None;
+        };
+        if graph.value(dt_bias).dtype != io_dtype || graph.value(a).dtype != io_dtype {
+            return None;
+        }
+        dead.push(add_id);
+        Some(DecaySoftplusFold {
+            a,
+            dt_bias,
+            neg_exp_a,
+            dead,
+        })
+    }
+}
+
+impl OptimizationPass for CudaLinearAttentionGatingFusion {
+    fn name(&self) -> &str {
+        "CudaLinearAttentionGatingFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        if linear_attention_gating_disabled() {
+            return Ok(());
+        }
+        let la_ids: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| Self::is_gated_delta_la(node).then_some(id))
+            .collect();
+        let mut changed = false;
+
+        for la_id in la_ids {
+            let Some(la) = graph.try_node(la_id) else {
+                continue;
+            };
+            // The kernel widens every input to f32 and rounds folded gates back
+            // through this storage dtype, so all folded operands must match it.
+            let Some(io_dtype) = la.inputs[0].map(|v| graph.value(v).dtype) else {
+                continue;
+            };
+            let beta_slot = la.inputs.get(5).copied().flatten();
+            let decay_slot = la.inputs.get(4).copied().flatten();
+            // Only fold decay when no trailing operands are present yet, so the
+            // rewrite owns input slots 6/7.
+            let decay_foldable = la.inputs.len() == 6;
+
+            let beta_fold =
+                beta_slot.and_then(|beta| Self::match_beta_sigmoid(graph, beta, la_id, io_dtype));
+            let decay_fold = if decay_foldable {
+                decay_slot
+                    .and_then(|decay| Self::match_decay_softplus(graph, decay, la_id, io_dtype))
+            } else {
+                None
+            };
+            if beta_fold.is_none() && decay_fold.is_none() {
+                continue;
+            }
+
+            let mut new_la = la.clone();
+            let mut dead = Vec::new();
+            if let Some(fold) = beta_fold {
+                new_la.inputs[5] = Some(fold.raw);
+                new_la
+                    .attributes
+                    .insert(FUSE_BETA_SIGMOID_ATTR.into(), Attribute::Int(1));
+                dead.push(fold.sigmoid_id);
+            }
+            if let Some(fold) = decay_fold {
+                new_la.inputs[4] = Some(fold.a);
+                new_la.inputs.push(Some(fold.dt_bias));
+                new_la.inputs.push(Some(fold.neg_exp_a));
+                new_la
+                    .attributes
+                    .insert(FUSE_DECAY_SOFTPLUS_ATTR.into(), Attribute::Int(1));
+                dead.extend(fold.dead);
+            }
+            graph.replace_node(la_id, new_la);
+            graph.remove_nodes(&dead);
             changed = true;
         }
 
@@ -1110,6 +1516,97 @@ fn convert_float_bytes(src: &[u8], from: DataType, to: DataType) -> Option<Vec<u
     Some(out)
 }
 
+/// Removes **identity** `Cast`/`CastLike` nodes whose output element type equals
+/// their input element type (e.g. the ~90 `Float32 → Float32` casts per forward
+/// this qwen3.5-hybrid export emits — pure launch overhead in an all-fp32
+/// activation path).
+///
+/// Correctness: a same-dtype cast is a bitwise no-op (the runtime `cast_core`
+/// kernel loads the source element and stores it back unchanged), so rewiring
+/// every consumer of the cast output onto the pre-cast input and deleting the
+/// node is **byte-identical**. The rewrite is shape/dtype-driven (no operator
+/// pattern or model-specific constant): any `Cast` whose input and output share
+/// a known element type qualifies, so it generalizes to every export.
+///
+/// Conservative guards:
+/// * both the input and output element types must be *known* (never guess);
+/// * the input slot must be present (a `CastLike`'s 2nd "like" input is ignored,
+///   only slot 0 carries data);
+/// * a cast whose output is a **graph output** is left intact, so the runtime's
+///   output binding (by value id / name) is never disturbed.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaDropIdentityCast;
+
+/// Environment opt-out for [`CudaDropIdentityCast`], mirroring the other
+/// CUDA-pass switches. Any value other than unset/empty/`0` restores the
+/// exported identity `Cast` launches (for A/B measurement or rollback).
+const IDENTITY_CAST_FOLD_DISABLE_ENV: &str = "ONNX_GENAI_CUDA_DISABLE_IDENTITY_CAST_FOLD";
+
+fn identity_cast_fold_disabled() -> bool {
+    std::env::var_os(IDENTITY_CAST_FOLD_DISABLE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+impl OptimizationPass for CudaDropIdentityCast {
+    fn name(&self) -> &str {
+        "CudaDropIdentityCast"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        if identity_cast_fold_disabled() {
+            return Ok(());
+        }
+        let candidates: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                ((node.op_type == "Cast" || node.op_type == "CastLike")
+                    && matches!(node.domain.as_str(), "" | "ai.onnx")
+                    && !node.inputs.is_empty()
+                    && node.outputs.len() == 1)
+                    .then_some(id)
+            })
+            .collect();
+
+        let mut changed = false;
+        for node_id in candidates {
+            // Re-read against the live graph so chained identity casts (cast of a
+            // cast) collapse correctly as earlier rewrites land.
+            let Some(node) = graph.try_node(node_id) else {
+                continue;
+            };
+            let Some(input) = node.inputs[0] else {
+                continue;
+            };
+            let output = node.outputs[0];
+            if input == output {
+                continue;
+            }
+            // Both element types must be known and equal for a bitwise no-op.
+            if !graph.value_type_is_known(input) || !graph.value_type_is_known(output) {
+                continue;
+            }
+            if graph.value(input).dtype != graph.value(output).dtype {
+                continue;
+            }
+            // Preserve any cast that directly feeds a graph output slot.
+            if graph.outputs.contains(&output) {
+                continue;
+            }
+
+            graph.replace_all_uses(output, input);
+            graph.remove_node(node_id);
+            graph.gc_value_if_orphan(output);
+            changed = true;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
 ///
 /// Only the exact QKV-style decode pattern is fused: a `MatMulNBits` with no
 /// zero-points / group-index / existing bias, whose sole consumer is a plain
@@ -1268,10 +1765,27 @@ impl CudaMatMulNBitsBiasFusion {
 
 /// Block-quantization the fused RMS-norm GEMV kernels assume. The fused decode
 /// GEMVs (and their prefill GEMM) implement both the packed int4 layout and the
-/// one-byte-per-weight int8 layout, so either bit width fuses; the block size is
-/// fixed at 32 by the tuned four-lane/eight-block warp walk.
+/// one-byte-per-weight int8 layout, so either bit width fuses.
 const RMSNORM_FUSION_SUPPORTED_BITS: [i64; 2] = [4, 8];
-const RMSNORM_FUSION_SUPPORTED_BLOCK_SIZE: i64 = 32;
+/// Block-quantization block sizes for which a fused RMS-norm-prologue GEMV kernel
+/// actually exists. This is a **kernel capability set**, not a model constant:
+/// the fused-prologue dot (`matmul_nbits_gemv_f16_scales_f16_rmsnorm*`) and the
+/// fused gate/up SwiGLU-RMSNorm kernel bake in the tuned four-lane/eight-block
+/// warp walk that only covers `block_size == 32` (the block index is a hard
+/// `depth >> 5`; the gate/up kernel explicitly rejects any other width). A larger
+/// block size (e.g. GLM-4-9B's block-128, whose standalone GEMVs run the
+/// `general_bs` `>> 7` layout) folds automatically here the moment a matching
+/// fused-prologue kernel variant for that layout is added — extend this set in
+/// lockstep with a kernel that reproduces the standalone norm bit-exactly (or
+/// under an f64-parity opt-in when the reduction order differs). Gating on the
+/// implemented set — never a magic scalar — keeps the fold capability-driven and
+/// subsumes the "gate too narrowly hardcoded" concern (issue #1421) on this axis.
+const RMSNORM_FUSION_SUPPORTED_BLOCK_SIZES: [i64; 1] = [32];
+
+/// Whether a fused RMS-norm-prologue GEMV kernel exists for `block_size`.
+fn rmsnorm_fusion_supports_block_size(block_size: i64) -> bool {
+    RMSNORM_FUSION_SUPPORTED_BLOCK_SIZES.contains(&block_size)
+}
 /// The fused prologue/epilogue reproduce `skip_rmsnorm_f16_warp_half4`, which
 /// covers the hidden size in 128-wide (`32 lanes * 4 halves`) chunks, so the
 /// fusion only fires when the hidden size is a whole multiple of 128.
@@ -1296,9 +1810,25 @@ fn rmsnorm_fusion_disabled() -> bool {
 /// of seven chunks (896, which regresses) and twelve chunks (1536, which wins),
 /// so the floor is the granularity-aligned midpoint. It is a property of the
 /// kernel's 128-lane reduction, never of any model.
+///
+/// Caveat — this floor was calibrated on **M=1 single-stream** throughput on an
+/// **H200** (commit `05e1fd10`: 0.5B hidden-896 regressed -2.7% folded), and it
+/// predates the capture-safe batch-decode path (#1404). At **M>=2** the fold
+/// makes the gate/up node capture-safe and collapses the batch-decode CUDA-graph
+/// segmentation (25 -> 1 segments), saving ~20 ms/step — which dwarfs the M=1
+/// prologue cost. The fold is byte-identical, so keeping the standalone norm
+/// below 1280 leaves that batch win on the table for small resident models
+/// (0.5B at 896, granite-1B MoE at 1024). The M=1 cost is also hardware-
+/// dependent: on RTX 4060 the same hidden-896 fold measured neutral-to-faster,
+/// not a regression. Making this gate batch/device-aware is tracked in #1421;
+/// until then the override below enables it. See the operator-knob section of
+/// `docs/benchmarks/2026-08-19-batch-decode-mge2-capture-segmentation.md`.
 const RMSNORM_FUSION_MIN_HIDDEN: usize = 10 * RMSNORM_FUSION_WARP_HALF4_MULTIPLE;
-/// Optional environment override for [`RMSNORM_FUSION_MIN_HIDDEN`], used only to
-/// calibrate the floor against measured throughput.
+/// Optional environment override for [`RMSNORM_FUSION_MIN_HIDDEN`]. Beyond
+/// calibrating the floor against measured throughput, this is the documented
+/// interim knob (#1421) an operator lowers to force the byte-identical fold on a
+/// small resident model so **batched** decode gets #1404's capture-safe path;
+/// set it only when batching (see the constant's caveat on the M=1 cost).
 const RMSNORM_FUSION_MIN_HIDDEN_ENV: &str = "ONNX_GENAI_RMSNORM_MIN_HIDDEN";
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -1736,8 +2266,10 @@ impl CudaSkipRmsNormMatMulFusion {
         {
             return false;
         }
-        if node.attr("block_size").and_then(Attribute::as_int)
-            != Some(RMSNORM_FUSION_SUPPORTED_BLOCK_SIZE)
+        if !node
+            .attr("block_size")
+            .and_then(Attribute::as_int)
+            .is_some_and(rmsnorm_fusion_supports_block_size)
         {
             return false;
         }
@@ -2877,6 +3409,11 @@ mod tests {
     use super::*;
     use onnx_runtime_ir::{Dim, Node, NodeId, ValueId};
 
+    /// Serializes the [`CudaDropIdentityCast`] tests: one mutates the process-wide
+    /// `IDENTITY_CAST_FOLD_DISABLE_ENV`, which the others read through the pass, so
+    /// they must not run concurrently (mirrors `TEST_SINGLE_SPLIT_LOCK`).
+    static IDENTITY_CAST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn value(graph: &mut Graph, name: &str, dtype: DataType, width: usize) -> ValueId {
         graph.create_named_value(name, dtype, vec![Dim::Static(1), Dim::Static(width)])
     }
@@ -3180,6 +3717,107 @@ mod tests {
         assert!(
             graph.nodes.values().all(|node| node.op_type != "Silu"),
             "fp32 has no byte-exact decomposed SiLU kernel; must stay unfused"
+        );
+    }
+
+    // === Rsqrt fusion (Reciprocal(Sqrt(x)) -> tagged Reciprocal) ===
+
+    /// `Add(sumsq, eps) → Sqrt → Reciprocal → Mul(x, scale)`, the SSM
+    /// normalize-scale glue `CudaRsqrtFusion` targets. The `Add` and trailing
+    /// `Mul` bracket the pair so the single-consumer rewrite is observable.
+    /// Returns the graph plus the `denom` (pre-Sqrt) and `root` (Sqrt output)
+    /// value ids for assertions.
+    fn rsqrt_glue_graph(dtype: DataType) -> (Graph, ValueId, ValueId) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let sumsq = value(&mut graph, "sumsq", dtype, 5);
+        let eps = value(&mut graph, "eps", dtype, 5);
+        let x = value(&mut graph, "x", dtype, 5);
+        let denom = value(&mut graph, "denom", dtype, 5);
+        let root = value(&mut graph, "root", dtype, 5);
+        let scale = value(&mut graph, "scale", dtype, 5);
+        let output = value(&mut graph, "output", dtype, 5);
+        graph.add_input(sumsq);
+        graph.add_input(eps);
+        graph.add_input(x);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(sumsq), Some(eps)],
+            vec![denom],
+        ));
+        graph.insert_node(Node::new(NodeId(0), "Sqrt", vec![Some(denom)], vec![root]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Reciprocal",
+            vec![Some(root)],
+            vec![scale],
+        ));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(x), Some(scale)],
+            vec![output],
+        ));
+        graph.add_output(output);
+        (graph, denom, root)
+    }
+
+    #[test]
+    fn fuses_fp16_reciprocal_of_sqrt() {
+        let (mut graph, denom, _root) = rsqrt_glue_graph(DataType::Float16);
+        CudaRsqrtFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        // Sqrt removed; Reciprocal retagged and rewired to the pre-sqrt value.
+        assert_eq!(graph.num_nodes(), 3, "Sqrt must be removed");
+        assert!(
+            graph.nodes.values().all(|n| n.op_type != "Sqrt"),
+            "Sqrt node must be gone"
+        );
+        let recip = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "Reciprocal")
+            .expect("Reciprocal must remain");
+        assert!(
+            recip.is_default_domain(),
+            "node stays a standard Reciprocal"
+        );
+        assert_eq!(
+            recip.attr(CUDA_RSQRT_ATTR).and_then(Attribute::as_int),
+            Some(1),
+            "fused Reciprocal must carry the rsqrt marker"
+        );
+        // Reciprocal now reads the pre-Sqrt value ("denom"), not the Sqrt output.
+        assert_eq!(recip.inputs[0], Some(denom));
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn does_not_fuse_sqrt_with_extra_consumer() {
+        // Sqrt output feeds both the Reciprocal *and* a second consumer, so the
+        // Sqrt value escapes the pair and must not be removed.
+        let (mut graph, _denom, root) = rsqrt_glue_graph(DataType::Float16);
+        let sink = value(&mut graph, "sink", DataType::Float16, 5);
+        graph.insert_node(Node::new(NodeId(0), "Neg", vec![Some(root)], vec![sink]));
+        graph.add_output(sink);
+
+        CudaRsqrtFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(
+            graph.nodes.values().any(|n| n.op_type == "Sqrt"),
+            "Sqrt with a second consumer must be preserved"
+        );
+        assert!(
+            graph
+                .nodes
+                .values()
+                .filter(|n| n.op_type == "Reciprocal")
+                .all(|n| n.attr(CUDA_RSQRT_ATTR).is_none()),
+            "Reciprocal must not be retagged when Sqrt escapes"
         );
     }
 
@@ -5947,5 +6585,313 @@ mod tests {
             .filter(|n| n.op_type == "MatMulNBits")
             .count();
         assert_eq!(fused, 1, "opt-in flag enables the fusion");
+    }
+
+    /// `x -> Cast(f32->f32) -> y -> Relu -> out`: the identity cast is removed
+    /// and `Relu` is rewired directly onto `x`, leaving a byte-identical graph.
+    #[test]
+    fn drops_identity_cast_and_rewires_consumer() {
+        let _serial = IDENTITY_CAST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = value(&mut g, "x", DataType::Float32, 4);
+        g.add_input(x);
+        let y = cast_node(&mut g, "y", x, DataType::Float32, 4);
+        let out = value(&mut g, "out", DataType::Float32, 4);
+        g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(y)], vec![out]));
+        g.add_output(out);
+
+        assert_eq!(g.nodes.values().filter(|n| n.op_type == "Cast").count(), 1);
+        CudaDropIdentityCast
+            .run(&mut g, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            0,
+            "identity cast removed"
+        );
+        let relu = g.nodes.values().find(|n| n.op_type == "Relu").unwrap();
+        assert!(
+            relu.input_values().any(|v| v == x),
+            "consumer rewired onto the pre-cast value"
+        );
+        assert!(g.validate().is_ok());
+    }
+
+    /// A genuine dtype change (`f32 -> f16`) is a real conversion, not an
+    /// identity, so the pass must leave it untouched.
+    #[test]
+    fn keeps_narrowing_cast() {
+        let _serial = IDENTITY_CAST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = value(&mut g, "x", DataType::Float32, 4);
+        g.add_input(x);
+        let y = cast_node(&mut g, "y", x, DataType::Float16, 4);
+        g.add_output(y);
+
+        CudaDropIdentityCast
+            .run(&mut g, &PassContext::new())
+            .unwrap();
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            1,
+            "narrowing cast preserved"
+        );
+    }
+
+    /// An identity cast that feeds a graph output slot is preserved so the
+    /// runtime's output binding (by value id) is never disturbed.
+    #[test]
+    fn keeps_identity_cast_feeding_graph_output() {
+        let _serial = IDENTITY_CAST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = value(&mut g, "x", DataType::Float32, 4);
+        g.add_input(x);
+        let y = cast_node(&mut g, "y", x, DataType::Float32, 4);
+        g.add_output(y);
+
+        CudaDropIdentityCast
+            .run(&mut g, &PassContext::new())
+            .unwrap();
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            1,
+            "graph-output cast preserved"
+        );
+    }
+
+    /// The opt-out env restores the exported identity casts for A/B / rollback.
+    #[test]
+    fn opt_out_env_preserves_identity_cast() {
+        let _serial = IDENTITY_CAST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = value(&mut g, "x", DataType::Float32, 4);
+        g.add_input(x);
+        let y = cast_node(&mut g, "y", x, DataType::Float32, 4);
+        let out = value(&mut g, "out", DataType::Float32, 4);
+        g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(y)], vec![out]));
+        g.add_output(out);
+
+        unsafe { std::env::set_var(IDENTITY_CAST_FOLD_DISABLE_ENV, "1") };
+        let result = CudaDropIdentityCast.run(&mut g, &PassContext::new());
+        unsafe { std::env::remove_var(IDENTITY_CAST_FOLD_DISABLE_ENV) };
+        result.unwrap();
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            1,
+            "opt-out preserves the identity cast"
+        );
+    }
+
+    /// Build a single gated-delta `LinearAttention` (`com.microsoft`) fed by its
+    /// exported standalone gate chains:
+    /// * beta: `Sigmoid(raw) → LA.input[5]`
+    /// * decay: `Add(a, dt_bias) → Softplus → Mul(neg_exp_A, ·) → [Cast] → LA.input[4]`
+    ///
+    /// `trailing_cast` toggles the optional identity `Cast` between the decay
+    /// `Mul` and the kernel (present on the fp32 text export).
+    fn gated_delta_la_graph(heads: usize, trailing_cast: bool) -> Graph {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+
+        let q = value(&mut graph, "q", DataType::Float32, heads);
+        let k = value(&mut graph, "k", DataType::Float32, heads);
+        let v = value(&mut graph, "v", DataType::Float32, heads);
+        let past = value(&mut graph, "past", DataType::Float32, heads);
+        let a = value(&mut graph, "a", DataType::Float32, heads);
+        let raw = value(&mut graph, "raw", DataType::Float32, heads);
+        for input in [q, k, v, past, a, raw] {
+            graph.add_input(input);
+        }
+
+        // dt_bias / neg_exp_A are graph initializers (that is how the pass tells
+        // the constant operand from the activation).
+        let dt_bias = vec1d(&mut graph, "dt_bias", DataType::Float32, heads);
+        let neg_exp_a = vec1d(&mut graph, "neg_exp_A", DataType::Float32, heads);
+        for init in [dt_bias, neg_exp_a] {
+            graph.set_initializer(
+                init,
+                WeightRef::Inline(TensorData::from_raw(
+                    DataType::Float32,
+                    vec![heads],
+                    vec![0u8; heads * DataType::Float32.byte_size()],
+                )),
+            );
+        }
+
+        // decay chain.
+        let add_out = value(&mut graph, "add_out", DataType::Float32, heads);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(a), Some(dt_bias)],
+            vec![add_out],
+        ));
+        let sp_out = value(&mut graph, "sp_out", DataType::Float32, heads);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Softplus",
+            vec![Some(add_out)],
+            vec![sp_out],
+        ));
+        let mul_out = value(&mut graph, "mul_out", DataType::Float32, heads);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(neg_exp_a), Some(sp_out)],
+            vec![mul_out],
+        ));
+        let decay = if trailing_cast {
+            let cast_out = value(&mut graph, "decay", DataType::Float32, heads);
+            let mut cast = Node::new(NodeId(0), "Cast", vec![Some(mul_out)], vec![cast_out]);
+            cast.attributes.insert(
+                "to".into(),
+                Attribute::Int(DataType::Float32.to_onnx() as i64),
+            );
+            graph.insert_node(cast);
+            cast_out
+        } else {
+            mul_out
+        };
+
+        // beta chain.
+        let beta = value(&mut graph, "beta", DataType::Float32, heads);
+        graph.insert_node(Node::new(NodeId(0), "Sigmoid", vec![Some(raw)], vec![beta]));
+
+        let out = value(&mut graph, "out", DataType::Float32, heads);
+        let present = value(&mut graph, "present", DataType::Float32, heads);
+        let mut la = Node::new(
+            NodeId(0),
+            "LinearAttention",
+            vec![
+                Some(q),
+                Some(k),
+                Some(v),
+                Some(past),
+                Some(decay),
+                Some(beta),
+            ],
+            vec![out, present],
+        );
+        la.domain = MICROSOFT_DOMAIN.into();
+        graph.insert_node(la);
+        graph.add_output(out);
+        graph.add_output(present);
+        graph
+    }
+
+    #[test]
+    fn folds_beta_sigmoid_and_decay_softplus_into_linear_attention() {
+        for trailing_cast in [false, true] {
+            let mut graph = gated_delta_la_graph(4, trailing_cast);
+            let a = value_id_by_name(&graph, "a");
+            let raw = value_id_by_name(&graph, "raw");
+            let dt_bias = value_id_by_name(&graph, "dt_bias");
+            let neg_exp_a = value_id_by_name(&graph, "neg_exp_A");
+
+            CudaLinearAttentionGatingFusion
+                .run(&mut graph, &PassContext::new())
+                .unwrap();
+
+            // Every folded elementwise node is gone.
+            for op in ["Sigmoid", "Softplus", "Add", "Mul", "Cast"] {
+                assert!(
+                    graph.nodes.values().all(|n| n.op_type != op),
+                    "{op} must be folded away (trailing_cast={trailing_cast})"
+                );
+            }
+
+            let la = graph
+                .nodes
+                .values()
+                .find(|n| n.op_type == "LinearAttention")
+                .unwrap();
+            assert_eq!(
+                la.attr(FUSE_BETA_SIGMOID_ATTR).and_then(Attribute::as_int),
+                Some(1)
+            );
+            assert_eq!(
+                la.attr(FUSE_DECAY_SOFTPLUS_ATTR)
+                    .and_then(Attribute::as_int),
+                Some(1)
+            );
+            // beta slot rewired onto the pre-Sigmoid value; decay slot onto `a`;
+            // dt_bias / neg_exp_A appended as trailing operands.
+            assert_eq!(la.inputs[5], Some(raw));
+            assert_eq!(la.inputs[4], Some(a));
+            assert_eq!(la.inputs.len(), 8);
+            assert_eq!(la.inputs[6], Some(dt_bias));
+            assert_eq!(la.inputs[7], Some(neg_exp_a));
+        }
+    }
+
+    #[test]
+    fn leaves_beta_gate_when_it_escapes_to_a_second_consumer() {
+        let mut graph = gated_delta_la_graph(4, false);
+        // A second consumer of `beta` means the Sigmoid output escapes, so the
+        // beta gate must be left exactly as exported; decay still folds.
+        let beta = value_id_by_name(&graph, "beta");
+        let sink = value(&mut graph, "beta_sink", DataType::Float32, 4);
+        graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(beta)], vec![sink]));
+        graph.add_output(sink);
+
+        CudaLinearAttentionGatingFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert!(
+            graph.nodes.values().any(|n| n.op_type == "Sigmoid"),
+            "the escaping beta Sigmoid is preserved"
+        );
+        let la = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "LinearAttention")
+            .unwrap();
+        assert!(la.attr(FUSE_BETA_SIGMOID_ATTR).is_none());
+        // Decay still folds independently.
+        assert_eq!(
+            la.attr(FUSE_DECAY_SOFTPLUS_ATTR)
+                .and_then(Attribute::as_int),
+            Some(1)
+        );
+        assert_eq!(la.inputs.len(), 8);
+    }
+
+    #[test]
+    fn opt_out_env_preserves_exported_gate_chains() {
+        let mut graph = gated_delta_la_graph(4, true);
+        // SAFETY: single-threaded test; env is restored before returning.
+        unsafe { std::env::set_var(LINEAR_ATTENTION_GATING_DISABLE_ENV, "1") };
+        let result = CudaLinearAttentionGatingFusion.run(&mut graph, &PassContext::new());
+        unsafe { std::env::remove_var(LINEAR_ATTENTION_GATING_DISABLE_ENV) };
+        result.unwrap();
+        for op in ["Sigmoid", "Softplus", "Add", "Mul", "Cast"] {
+            assert!(
+                graph.nodes.values().any(|n| n.op_type == op),
+                "opt-out preserves the standalone {op}"
+            );
+        }
+        let la = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "LinearAttention")
+            .unwrap();
+        assert!(la.attr(FUSE_BETA_SIGMOID_ATTR).is_none());
+        assert!(la.attr(FUSE_DECAY_SOFTPLUS_ATTR).is_none());
+        assert_eq!(la.inputs.len(), 6);
     }
 }

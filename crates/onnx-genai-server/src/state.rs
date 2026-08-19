@@ -366,6 +366,12 @@ pub struct ServerConfig {
     /// (§34.8). Independent of any model; defaults to the hostname or a generated id.
     pub node_id: String,
     pub max_output_tokens: usize,
+    /// Reasoning effort applied when a request omits `reasoning_effort`
+    /// (`--default-reasoning-effort`). `None` leaves the model's own default in
+    /// place, which for a reasoning model is often maximal — enough for an
+    /// agent client that never sends the field to spend a whole token budget
+    /// thinking and return no answer. An explicit request value always wins.
+    pub default_reasoning_effort: Option<crate::types::ReasoningEffort>,
     pub max_sessions: usize,
     /// Maximum generation requests admitted to the driver, including active and queued work.
     pub max_queue_depth: usize,
@@ -400,6 +406,7 @@ impl Default for ServerConfig {
         Self {
             node_id: default_node_id(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            default_reasoning_effort: None,
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             max_batch: None,
@@ -659,7 +666,13 @@ pub(crate) fn build_handle_with_authorities(
     if let Some(directory) = PipelineModelDirectory::load_if_declared(model_dir)
         .map_err(|e| anyhow::anyhow!("Failed to discover pipeline directory: {e}"))?
     {
-        let model_max_context = load_model_max_context(directory.metadata_path.as_deref())?;
+        // The directory already parsed this package's metadata; re-reading it
+        // here could disagree with the pipeline built from it.
+        let model_max_context = directory
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.model.as_ref())
+            .and_then(|model| model.max_sequence_length);
         return build_pipeline_handle(
             model_dir,
             model_id,

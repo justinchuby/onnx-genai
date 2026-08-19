@@ -1,41 +1,50 @@
 name: Benchmarks
 
-# Informational micro-benchmark comparison posted as a PR comment.
+# Informational micro-benchmark comparison, posted as a PR comment.
 # Does NOT block CI — the real regression gates live in
 # crates/onnx-genai-bench/tests/profile_native.rs (throughput floors +
 # dispatch-reachability tests on real hardware).
 #
-# This workflow's job is VISIBILITY: surface the comparison on the PR
-# that caused a change, while the author is still looking at it.
+# MANUAL ONLY — the automatic `pull_request` trigger was removed.
 #
-# Design:
+# Why: a GitHub-hosted runner is not a quiet machine. It is shared, its
+# neighbours are invisible to us, and we cannot verify it was idle for the
+# window we timed. Under that noise this job posted "🔴 Benchmark Regression
+# Detected" on PRs that had changed nothing relevant, so the header stopped
+# carrying information: a red flag that fires on noise trains readers to
+# ignore it, which is worse than not publishing the number at all.
+#
+# Timing base-then-PR in one job and reporting % change does cancel some
+# runner-to-runner variation, but it cannot cancel *within-job* contention —
+# the two halves still run at different moments against different neighbours.
+# The thresholds were calibrated against ~27% worst-case measured noise, and
+# real regressions worth catching are often smaller than that, so the signal
+# sits below the noise floor rather than above it.
+#
+# Nothing is lost by making this manual: it never gated anything. Run it by
+# hand when you actually want the comparison, and treat any single result as
+# unadjudicable unless a control arm the change cannot touch stayed put.
+# See docs/benchmarks/README.md for the verify-a-quiet-box methodology.
+#
+# Design (unchanged, for manual runs):
 #   - Base benchmarked FIRST (eats cold-start), PR SECOND (warm runner).
 #   - Reports % change as the reliable signal; absolutes are informational.
 #   - Measured run-to-run variance included so readers can judge signal vs noise.
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-    # Not a required check, so a plain paths-ignore is safe here (no risk of
-    # a permanently pending required check): docs/wiki/site-only PRs skip the
-    # whole workflow instead of spending a macOS runner on a benchmark
-    # comparison nobody will read.
-    paths-ignore:
-      - "docs/**"
-      - "wiki/**"
-      - "site/**"
-      - "**/*.md"
-      - "**/*.mdx"
-      - "**/*.markdown"
-      - "LICENSE"
-      - "NOTICE"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to benchmark (head vs its merge-base)"
+        required: true
+        type: string
 
 permissions:
   contents: read
   pull-requests: write
 
 concurrency:
-  group: benchmark-${{ github.event.pull_request.number }}
+  group: benchmark-${{ inputs.pr_number }}
   cancel-in-progress: true
 
 jobs:
@@ -56,11 +65,27 @@ jobs:
         with:
           prefix-key: bench-v1
 
+      # ── Resolve the PR under test ─────────────────────────────────────
+      # workflow_dispatch checks out the default branch, not the PR, so the
+      # head sha and base ref have to be looked up and the head fetched.
+      - name: Resolve PR
+        id: pr
+        run: |
+          HEAD_SHA=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
+          BASE_REF=$(gh pr view "$PR" --json baseRefName --jq .baseRefName)
+          git fetch --no-tags origin "pull/$PR/head:pr-head" "$BASE_REF"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+          echo "PR #$PR head=$HEAD_SHA base=$BASE_REF"
+        env:
+          PR: ${{ inputs.pr_number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       # ── Benchmark the merge-base FIRST (eats cold-start) ──────────────
       - name: Determine merge-base
         id: merge-base
         run: |
-          BASE=$(git merge-base HEAD origin/${{ github.event.pull_request.base.ref }})
+          BASE=$(git merge-base ${{ steps.pr.outputs.head_sha }} origin/${{ steps.pr.outputs.base_ref }})
           echo "sha=$BASE" >> "$GITHUB_OUTPUT"
           echo "Merge-base: $BASE"
 
@@ -78,7 +103,7 @@ jobs:
 
       # ── Benchmark the PR head SECOND (warm runner) ────────────────────
       - name: Checkout PR head
-        run: git checkout ${{ github.event.pull_request.head.sha }}
+        run: git checkout ${{ steps.pr.outputs.head_sha }}
 
       - name: Benchmark PR head (ep-cpu kernels)
         run: cargo bench -p onnx-runtime-ep-cpu --bench kernels -- --noplot
@@ -118,7 +143,7 @@ jobs:
         id: find-comment
         run: |
           COMMENT_ID=$(gh api \
-            "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            "repos/${{ github.repository }}/issues/${{ inputs.pr_number }}/comments" \
             --paginate --jq '.[] | select(.body | startswith("## ")) | select(.body | contains("Benchmark")) | .id' \
             | head -1)
           echo "id=$COMMENT_ID" >> "$GITHUB_OUTPUT"
@@ -135,7 +160,7 @@ jobs:
               -f body="$BODY"
             echo "Updated existing comment ${{ steps.find-comment.outputs.id }}"
           else
-            gh pr comment "${{ github.event.pull_request.number }}" --body "$BODY"
+            gh pr comment "${{ inputs.pr_number }}" --body "$BODY"
             echo "Posted new comment"
           fi
         env:

@@ -19,6 +19,36 @@ impl DecodeBackend for NativeDecodeSession {
                 self.current_len
             );
         }
+        let Some(chunk) = self
+            .prefill_chunk_size
+            .map(NonZeroUsize::get)
+            .filter(|&chunk| token_ids.len() > chunk)
+        else {
+            return self.decode_argmax_forward(token_ids, past_len);
+        };
+        // Only the last chunk's token is the prompt's continuation; the earlier
+        // forwards exist to populate KV. They are still run through the same
+        // entry point, so nothing about a chunk differs from a short prompt.
+        let mut token = None;
+        for slice in token_ids.chunks(chunk) {
+            let past_len = self.current_len;
+            token = self.decode_argmax_forward(slice, past_len)?;
+        }
+        Ok(token)
+    }
+
+    fn supports_argmax(&self) -> bool {
+        true
+    }
+}
+
+impl NativeDecodeSession {
+    /// One prefill or decode forward over `token_ids`, with no chunking.
+    fn decode_argmax_forward(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+    ) -> anyhow::Result<Option<u32>> {
         self.maybe_enable_decode_inline(token_ids);
         if self.cuda.is_some() {
             if token_ids.len() == 1 {
@@ -43,8 +73,17 @@ impl DecodeBackend for NativeDecodeSession {
         }
     }
 
-    fn supports_argmax(&self) -> bool {
-        true
+    /// Bound the tokens per prefill forward.
+    ///
+    /// Set from `model.runtime_configurable.chunked_prefill.chunk_size` at load,
+    /// which is the same metadata the flat ORT pipeline reads. Zero and `None`
+    /// both mean "one forward for the whole prompt".
+    pub(crate) fn set_prefill_chunk_size(&mut self, chunk_size: Option<usize>) {
+        self.prefill_chunk_size = chunk_size.and_then(NonZeroUsize::new);
+        tracing::debug!(
+            prefill_chunk_size = ?self.prefill_chunk_size.map(NonZeroUsize::get),
+            "native decode prefill chunking configured from model metadata"
+        );
     }
 }
 
