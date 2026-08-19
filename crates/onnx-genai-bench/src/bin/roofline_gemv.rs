@@ -4,7 +4,11 @@
 //! read-sum ceiling) and `roofline_transfer` (host<->device link). It measures
 //! the one term #994's placement criterion still assumes rather than measures:
 //! the **effective memory bandwidth the real CPU `MatMulNBits` decode kernel
-//! achieves** at `lm_head` shape.
+//! achieves** at `lm_head` shape — specifically on the #979 borrowed zero-copy
+//! int4 path, which is the path that streams weights from DRAM on every token
+//! and so the only one whose bandwidth the criterion actually turns on. A build
+//! that instead keeps an f32 `weight_nk` cache resident, or that hands fp32
+//! compute to MLAS SQNBit, is answering a different question; see below.
 //!
 //! # Why this exists
 //!
@@ -68,7 +72,8 @@ use onnx_runtime_ir::{
 #[derive(Debug, Parser)]
 #[command(
     about = "Measure the effective memory bandwidth of the real CPU int4 MatMulNBits \
-             decode GEMV at lm_head shape, for #994's placement criterion"
+             decode GEMV (the #979 borrowed zero-copy path) at lm_head shape, for \
+             #994's placement criterion"
 )]
 struct Args {
     /// Decode-pool worker count for this run. Sweep by invoking once per value

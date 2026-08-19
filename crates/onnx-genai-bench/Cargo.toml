@@ -37,10 +37,11 @@ transfer-probe = ["dep:cudarc"]
 # int4 MatMulNBits decode kernel (the #979 borrowed zero-copy path) at lm_head
 # shape to measure its effective memory bandwidth against the STREAM ceiling for
 # #994's placement criterion. CPU-only and lean: it pulls in just the CPU EP,
-# the EP API tensor types, and the IR — no CUDA, no engine — so it builds fast
-# and measures the same kernel the runtime decodes with. `mlas` is deliberately
-# NOT enabled: symmetric int4 accuracy_level=0 returns on the borrowed path
-# before the MLAS SQNBit interception, so the measured path is identical.
+# the EP API tensor types, and the IR — no CUDA, and no engine *features* — so
+# it builds fast and measures the same kernel the runtime decodes with. `mlas`
+# is deliberately NOT enabled: symmetric int4 accuracy_level=0 returns on the
+# borrowed path before the MLAS SQNBit interception, so the measured path is
+# identical.
 gemv-probe = [
     "dep:onnx-runtime-ep-cpu",
     "dep:onnx-runtime-ep-api",
