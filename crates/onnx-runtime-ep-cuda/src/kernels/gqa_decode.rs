@@ -27,18 +27,18 @@ use onnx_runtime_ep_api::{EpError, Result};
 use crate::error::driver_err;
 use crate::runtime::CudaRuntime;
 
-const MODULE_KEY: &str = "gqa_decode_attention_f32_v5";
+const MODULE_KEY: &str = "gqa_decode_attention_f32_v6";
 const ENTRY_PREFIX: &str = "gqa_decode_attention_f32_dpl";
 const MERGE_ENTRY_PREFIX: &str = "gqa_decode_attention_f32_merge_dpl";
 
 /// Largest `head_dim` this kernel supports. Each of the 32 warp lanes owns
 /// `ceil(head_dim / 32)` output dimensions in registers, capped at
-/// [`MAX_DIMS_PER_LANE`] (8 lanes-worth == 256).
-pub(super) const MAX_HEAD_DIM: usize = 256;
+/// [`MAX_DIMS_PER_LANE`] (16 lanes-worth == 512).
+pub(super) const MAX_HEAD_DIM: usize = 512;
 
 /// Highest dims-per-lane tier the CUDA source instantiates (`GQA_DECODE_ENTRIES`
-/// 1..=8). `32 * MAX_DIMS_PER_LANE == MAX_HEAD_DIM`.
-const MAX_DIMS_PER_LANE: usize = 8;
+/// 1..=16). `32 * MAX_DIMS_PER_LANE == MAX_HEAD_DIM`.
+const MAX_DIMS_PER_LANE: usize = 16;
 
 /// Dims-per-lane tier for a given head_dim: `ceil(head_dim / 32)`. The launcher
 /// picks the matching specialized entry so a small head keeps its original
@@ -118,9 +118,10 @@ const DECODE_SRC: &str = r#"
 // lanes owns `DPL` output dims, so the kernel covers head_dim <= 32 * DPL. The
 // launcher instantiates the exact tier `DPL = ceil(head_dim / 32)` (1..=8) so a
 // small head (e.g. 64 -> DPL 2, 128 -> DPL 4) keeps its original register
-// footprint while head_dim=256 uses DPL 8 -- no register regression on small
-// heads, no head256 fallback to the serial reference kernel.
-#define GQA_MAX_HEAD_SIZE 256
+// footprint while head_dim=256 uses DPL 8 and head_dim=512 uses DPL 16 -- no
+// register regression on small heads, no head256/head512 fallback to the serial
+// reference kernel.
+#define GQA_MAX_HEAD_SIZE 512
 #define GQA_MAX_SPLITS 16
 #define GQA_MAX_SCRATCH_ROWS 256
 #define GQA_SCRATCH_STRIDE (GQA_MAX_HEAD_SIZE + 2)
@@ -417,6 +418,14 @@ GQA_DECODE_ENTRIES(5)
 GQA_DECODE_ENTRIES(6)
 GQA_DECODE_ENTRIES(7)
 GQA_DECODE_ENTRIES(8)
+GQA_DECODE_ENTRIES(9)
+GQA_DECODE_ENTRIES(10)
+GQA_DECODE_ENTRIES(11)
+GQA_DECODE_ENTRIES(12)
+GQA_DECODE_ENTRIES(13)
+GQA_DECODE_ENTRIES(14)
+GQA_DECODE_ENTRIES(15)
+GQA_DECODE_ENTRIES(16)
 "#;
 
 /// Launch the capture-safe warp-parallel decode kernel.
@@ -894,8 +903,12 @@ mod tests {
     /// General head-size coverage: the fused fast path is parameterized over
     /// dims-per-lane (`ceil(head_dim / 32)`), so it must be byte-identical-eligible
     /// for every common head_dim, including the non-multiple-of-32 dims (80/96/112)
-    /// that mask partial lanes and the DPL 6 tier (192). Each is checked against
-    /// the f64 CPU reference at the same tolerance the head_dim<=128 test accepts.
+    /// that mask partial lanes and the DPL 6 tier (192). The widened capability
+    /// band (`MAX_HEAD_DIM = 512`) is swept generally -- 320/384/448/512, i.e. the
+    /// new DPL 10/12/14/16 tiers -- not just the 512 endpoint, so the raised
+    /// ceiling is proven across the whole range rather than as a value-keyed
+    /// special case. Each is checked against the f64 CPU reference at the same
+    /// tolerance the head_dim<=128 test accepts.
     #[test]
     fn decode_kernel_matches_reference_softmax_general_head_dims() {
         let Some(runtime) = runtime() else {
@@ -907,7 +920,7 @@ mod tests {
 
         // Cover single-split, two-split and four-split lengths for each head_dim.
         let totals = [1usize, 7, 64, 65, 128, 129, 255, 256, 300];
-        for head_dim in [64usize, 80, 96, 112, 128, 192, 256] {
+        for head_dim in [64usize, 80, 96, 112, 128, 192, 256, 320, 384, 448, 512] {
             let (worst_abs, worst_rel) = parity_for_shape(&runtime, 8, 2, head_dim, &totals);
             eprintln!(
                 "GQA decode head{head_dim} parity (dpl={}): max_abs={worst_abs:.3e} max_rel={worst_rel:.3e}",
@@ -930,15 +943,17 @@ mod tests {
         assert!(supported(1, 128));
         assert!(supported(1, 129));
         assert!(supported(1, 256));
-        assert!(!supported(1, 257));
+        assert!(supported(1, 257));
+        assert!(supported(1, 512));
+        assert!(!supported(1, 513));
         assert!(!supported(2, 64));
         assert!(!supported(1, 0));
     }
 
     /// The single-split direct-output fast path (flag=1) must be bit-identical
-    /// to the original two-step decode+merge path (flag=0) across Phi's
-    /// head_dim (128) and Qwen's (64), for both single-split and multi-split
-    /// decode lengths.
+    /// to the original two-step decode+merge path (flag=0) across Qwen's
+    /// head_dim (64), Phi's (128), the head256 tier, and the widened head512
+    /// tier (DPL 16), for both single-split and multi-split decode lengths.
     #[test]
     fn single_split_direct_output_is_bit_exact_to_two_step_path_f32() {
         use std::sync::atomic::Ordering;
@@ -965,7 +980,7 @@ mod tests {
             ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
         };
 
-        for head_dim in [64usize, 128usize, 256usize] {
+        for head_dim in [64usize, 128usize, 256usize, 512usize] {
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             let mut q = vec![0.0f32; num_heads * head_dim];
             for slot in q.iter_mut() {
