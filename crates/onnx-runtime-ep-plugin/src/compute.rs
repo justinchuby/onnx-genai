@@ -1056,10 +1056,10 @@ impl WorkspacePlanCache {
         //
         // Skipped when the hit is already at the front, which is the steady
         // state: one shape, every node, every `Run`. Promoting the front entry
-        // to the front is identity, but `remove` + `insert` still memmoves the
-        // whole vector twice to achieve nothing. Callgrind, 100-node chain:
-        // `lookup` costs 141 instructions per node without this guard and 101
-        // with it.
+        // to the front is identity, but `remove` + `insert` still run the
+        // shift, bounds checks and length bookkeeping to achieve nothing.
+        // Callgrind, 100-node chain: `lookup` costs 141 instructions per node
+        // without this guard and 101 with it.
         if idx != 0 {
             let entry = plans.remove(idx);
             plans.insert(0, entry);
@@ -5998,9 +5998,11 @@ mod workspace_plan_cache_tests {
     }
 
     /// The hot signature must survive a one-off shape (a single prefill step
-    /// among many decode steps). Falsifier — remove the move-to-front on hit
-    /// and the interleaved decode signature is evicted, so the planner runs
-    /// once per iteration instead of once in total.
+    /// among many decode steps). The flood must run *past* capacity: filling
+    /// the cache to exactly capacity never evicts anything, so a shorter loop
+    /// passes with or without the promotion and proves nothing. Falsifier —
+    /// remove the move-to-front on hit and the hot signature drifts to the
+    /// back, gets evicted, and the planner runs again mid-flood.
     #[test]
     fn the_hot_signature_survives_a_flood_of_one_off_shapes() {
         let cache = WorkspacePlanCache::new();
@@ -6013,7 +6015,8 @@ mod workspace_plan_cache_tests {
             .expect("plan");
         let after_hot = planner.calls();
 
-        for n in 1..=(WORKSPACE_PLAN_CACHE_CAPACITY - 1) {
+        let flood = WORKSPACE_PLAN_CACHE_CAPACITY * 2;
+        for n in 1..=flood {
             let cold = [n];
             let cold_meta = [meta(DataType::Float32, &cold, true)];
             cache
@@ -6026,7 +6029,7 @@ mod workspace_plan_cache_tests {
         }
         assert_eq!(
             planner.calls(),
-            after_hot + (WORKSPACE_PLAN_CACHE_CAPACITY - 1),
+            after_hot + flood,
             "only the cold signatures may have been planned; the hot one must have stayed cached"
         );
     }
