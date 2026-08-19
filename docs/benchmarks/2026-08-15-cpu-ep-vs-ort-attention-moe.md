@@ -3930,10 +3930,37 @@ still spinning.
 
 ### 38.7 What is still open
 
-Nesting is still unmeasured, exactly as §36.8 left it: `packed_nbits_output_row`
-and `int8_row` dispatch into the task pool from inside a `par_chunks_mut`, the
-eight job slots bound the surplus by falling back inline, and that remains an
-argument rather than a number.
+Nesting is no longer open. §36.8 left it as an argument rather than a number:
+`packed_nbits_output_row` and `int8_row` dispatch into the task pool from inside
+a `par_chunks_mut` for `m > 1` with `parallel_columns` set, and the eight job
+slots were said to bound the surplus by declining it back to the caller. That is
+now measured by `nested_dispatch_slot_pressure` in
+`crates/onnx-runtime-ep-cpu/tests/task_runtime_latency.rs`, which reproduces the
+shape directly — an outer `par_chunks_mut` over rows, an inner
+`task_runtime::for_each_range` in each — and reads the pool counters across it.
+
+Four runs against a 16-lane pool, `declined` being `slot_exhausted`:
+
+| outer dispatchers | wall | dispatches | declined |
+| --- | --- | --- | --- |
+| 1 | ~1.9–2.4 ms | 1 | 0 |
+| 2 | 0.29–0.44 ms | 2 | 0 |
+| 4 | 0.45–0.74 ms | 4 | 0 |
+| 8 | 0.84–1.51 ms | 8 | 0 |
+| 16 | 1.35–1.84 ms | 13–16 | 0 (3 once) |
+
+Slot exhaustion essentially does not happen. Three of the four runs declined
+nothing at any width; the single run that declined 3 of 16 was the first
+dispatch of a cold process. The slots turn around faster than sixteen Rayon
+workers can collide on them, so the inline fallback is a real safety net that is
+almost never used. Per-row cost also improves monotonically with dispatcher
+count (175 → 99 µs/row from 2 to 16), so the nesting is not serialising.
+
+Two incidental notes from the same table. The one-dispatcher row is ~2 ms in
+every run because it pays for building the pool — the first dispatch in a
+process is not representative of anything else. And the test asserts what
+actually matters under nesting: every element covered exactly once, and no task
+body panicking.
 
 §36.8's `with_decode_pool` hypothesis needs a correction before anyone spends
 time on it. `with_decode_pool` early-returns inline when `IN_DECODE_POOL` is
