@@ -17,6 +17,9 @@
 //! | `callback-probe` | calls the host's `request_reclaim` during `allocate` and fails when the host refuses |
 //! | `legacy-1-0` | pins itself to the minor-0 prefix, so an older participant meets a newer host |
 //! | `sticky` | never retires its queued releases, so unload stays refused |
+//! | `ahead-of-host` | always publishes at its own minor level, leaving the clamp entirely to the host |
+//! | `undeclared-slot` | publishes the structured-release slot without ever claiming the capability |
+//! | `complete-on-release` | reports a queued release's completion from inside `release`, while the host is mid-teardown |
 //!
 //! Publishing several *named* mechanisms from one module — rather than
 //! switching behaviour on an environment variable or a global — keeps every
@@ -145,6 +148,18 @@ static DRAIN_CALLS: AtomicU64 = AtomicU64::new(0);
 /// so the hook can never dereference a freed state.
 static PARKED_STATE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 
+/// The allocator vtable most recently published to the host.
+///
+/// Null unless an allocator created from it is still alive; cleared when the
+/// state that owns the vtable is destroyed. This exists so a test can ask what
+/// the *sender* actually put on the wire, which is otherwise unobservable from
+/// the host: the host clamps the prefix it reads, so a slot the plugin
+/// published but the host declined to adopt looks exactly like a slot the
+/// plugin never published at all. Distinguishing those two is the difference
+/// between "the host stayed out of the slot" and "there was no slot".
+static LAST_PUBLISHED_VTABLE: AtomicPtr<NxmemAllocatorVtable> =
+    AtomicPtr::new(core::ptr::null_mut());
+
 // ─── mechanism behaviour ────────────────────────────────────────────────────
 
 /// Which behaviours a named mechanism exhibits.
@@ -211,6 +226,41 @@ struct Behaviour {
     /// anticipation of success, including putting the allocation back in the
     /// map it took it out of.
     refuse_enqueue: bool,
+    /// Declare [`Self::abi_minor`] on the published allocator vtable **and
+    /// populate every slot that level defines**, whatever level the host
+    /// negotiated.
+    ///
+    /// This is legal, and it is what a newer sender meeting an older host
+    /// actually does: the struct it publishes is a strict superset of the one
+    /// the host agreed to read, and clamping is the *host's* job. Every other
+    /// mechanism here takes the opposite (also legal) option of quietly
+    /// declining to publish a slot the host could not call — which means the
+    /// host's clamp is never exercised against a slot that is really there,
+    /// and a test asserting the clamp works cannot fail.
+    declares_its_own_level: bool,
+    /// Populate `release_allocation` while *not* declaring
+    /// `NXMEM_CAP_STRUCTURED_RELEASE`.
+    ///
+    /// Version and capability are two separate axes of the negotiation, and a
+    /// slot being present in a struct of the right size says nothing about
+    /// whether the sender claimed to implement it. This is a malformed sender:
+    /// the host must go on the declaration, not on the pointer. Without a
+    /// mechanism shaped like this, every plugin that publishes the slot also
+    /// claims the capability, so the host's capability check is never the thing
+    /// keeping it out of the slot and deleting that check changes nothing
+    /// observable.
+    publishes_slot_without_capability: bool,
+    /// Retire one queued release from inside `release`, reporting the
+    /// completion to the host at a moment when the host is *inside*
+    /// `AllocatorCore::drop` and has not yet decided the callback table's
+    /// fate.
+    ///
+    /// The contract permits this: `release` is an ordinary host call, and a
+    /// mechanism whose device work finished while the allocator was being torn
+    /// down has nowhere else to report it. It is the one shape that makes the
+    /// host's ordering — plugin `release` first, callback table's fate second —
+    /// observable without dereferencing freed memory.
+    complete_inside_release: bool,
 }
 
 impl Behaviour {
@@ -231,6 +281,9 @@ impl Behaviour {
             complete_inside_enqueue: false,
             drain_batch_cap: 0,
             refuse_enqueue: false,
+            declares_its_own_level: false,
+            publishes_slot_without_capability: false,
+            complete_inside_release: false,
         }
     }
 }
@@ -427,6 +480,59 @@ const MECHANISMS: &[Mechanism] = &[
             ..Behaviour::base()
         },
     },
+    Mechanism {
+        name: "ahead-of-host",
+        c_name: c"ahead-of-host",
+        behaviour: Behaviour {
+            // Always publishes at minor 1 — populated `release_allocation`
+            // included — however low the host negotiated. Nothing on the
+            // plugin side then stops a host from entering the structured slot,
+            // so whether the slot is entered is decided entirely by the host's
+            // own clamp and guard. Every other mechanism withholds the slot at
+            // minor 0, which silently makes "the host did not call it" true by
+            // construction rather than by the host's doing.
+            capability_flags: NXMEM_CAP_ALLOCATOR | NXMEM_CAP_STRUCTURED_RELEASE,
+            abi_minor: 1,
+            declares_its_own_level: true,
+            ..Behaviour::base()
+        },
+    },
+    Mechanism {
+        name: "undeclared-slot",
+        c_name: c"undeclared-slot",
+        behaviour: Behaviour {
+            // Publishes a populated minor-1 `release_allocation` at minor 1
+            // without ever claiming `NXMEM_CAP_STRUCTURED_RELEASE`. Level and
+            // capability are separate axes, and this mechanism separates them:
+            // the host's level clamp has nothing to object to, so the only
+            // thing that can keep the host out of the slot is its capability
+            // check.
+            capability_flags: NXMEM_CAP_ALLOCATOR,
+            abi_minor: 1,
+            declares_its_own_level: true,
+            publishes_slot_without_capability: true,
+            ..Behaviour::base()
+        },
+    },
+    Mechanism {
+        name: "complete-on-release",
+        c_name: c"complete-on-release",
+        behaviour: Behaviour {
+            // Never retires through the drain slot, so a queued release is
+            // still outstanding when the host tears the allocator down — and
+            // then reports the completion from inside `release`, while the
+            // host is in the middle of `AllocatorCore::drop`. The host must
+            // therefore decide the callback table's fate *after* `release`
+            // returns; deciding it earlier reads a count the plugin was about
+            // to change and leaks a table that did not need leaking.
+            capability_flags: NXMEM_CAP_ALLOCATOR
+                | NXMEM_CAP_DEFERRED_RELEASE
+                | NXMEM_CAP_STRUCTURED_RELEASE,
+            never_drain: true,
+            complete_inside_release: true,
+            ..Behaviour::base()
+        },
+    },
 ];
 
 /// Mechanism names this plugin publishes, in factory order.
@@ -450,6 +556,9 @@ pub const MECHANISM_NAMES: &[&str] = &[
     "reentrant-completion",
     "refusing-deferred",
     "drip",
+    "ahead-of-host",
+    "undeclared-slot",
+    "complete-on-release",
 ];
 
 // ─── allocator state ────────────────────────────────────────────────────────
@@ -1137,6 +1246,20 @@ unsafe extern "C" fn plugin_release(ctx: *mut c_void) {
     catch_void_panic(|| {
         // SAFETY: the host only passes back a `ctx` this module published.
         if let Some(state) = unsafe { state(ctx) } {
+            if state.behaviour.complete_inside_release
+                && let Some(queued) = take_one_queued(state)
+            {
+                // Retiring here reports a completion to the host from inside
+                // the host's own `release` call, through the callback table
+                // the host is about to decide the fate of.
+                //
+                // Touching `state` after `retire_queued` is sound here and
+                // only here, for the same reason it is in `enqueue_release`:
+                // the caller's own reference is still held — dropping it is
+                // what the `release_state` below does — so the reference
+                // `retire_queued` drops cannot have been the last one.
+                let _ = retire_queued(state, queued);
+            }
             release_state(state);
         }
     });
@@ -1171,6 +1294,15 @@ fn release_state(state: &AllocatorState) {
     // pointer is cleared here rather than by whoever used it last.
     let _ = PARKED_STATE.compare_exchange(
         (state as *const AllocatorState).cast_mut().cast(),
+        core::ptr::null_mut(),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    // Same reasoning for the published vtable: it is owned by this state, so
+    // it dies with it and must not stay reachable from the introspection
+    // accessor.
+    let _ = LAST_PUBLISHED_VTABLE.compare_exchange(
+        core::ptr::from_ref::<NxmemAllocatorVtable>(state.allocator_vtable.as_ref()).cast_mut(),
         core::ptr::null_mut(),
         Ordering::AcqRel,
         Ordering::Acquire,
@@ -1770,6 +1902,17 @@ unsafe extern "C" fn plugin_open_allocator(
         // module keeps working, and a newer mechanism never offers a slot an
         // older host would not know how to call.
         let abi_minor = behaviour.abi_minor.min(request.abi_minor);
+        // …unless the mechanism declares its own level instead and leaves the
+        // clamp to the host, which the contract equally permits: the struct is
+        // then a strict superset of what the host agreed to read. Withholding
+        // the slot and clamping it are indistinguishable from the host's side,
+        // so a suite in which every mechanism withholds cannot tell whether
+        // the host clamps at all.
+        let allocator_minor = if behaviour.declares_its_own_level {
+            behaviour.abi_minor
+        } else {
+            abi_minor
+        };
 
         let backing_vtable =
             (behaviour.capability_flags & NXMEM_CAP_VIRTUAL_BACKING != 0).then(|| {
@@ -1798,7 +1941,7 @@ unsafe extern "C" fn plugin_open_allocator(
             });
 
         let mut allocator_vtable = NxmemAllocatorVtable::zeroed();
-        allocator_vtable.abi_minor = abi_minor;
+        allocator_vtable.abi_minor = allocator_minor;
         allocator_vtable.mechanism_id = mechanism_id;
         allocator_vtable.device = request.device;
         allocator_vtable.capability_flags = behaviour.capability_flags;
@@ -1812,7 +1955,10 @@ unsafe extern "C" fn plugin_open_allocator(
             allocator_vtable.drain_releases = Some(plugin_drain_releases);
             allocator_vtable.pending_release_count = Some(plugin_pending_release_count);
         }
-        if abi_minor >= 1 && behaviour.capability_flags & NXMEM_CAP_STRUCTURED_RELEASE != 0 {
+        if allocator_minor >= 1
+            && (behaviour.capability_flags & NXMEM_CAP_STRUCTURED_RELEASE != 0
+                || behaviour.publishes_slot_without_capability)
+        {
             allocator_vtable.release_allocation = Some(plugin_release_allocation);
         }
         let state = Box::new(AllocatorState {
@@ -1834,6 +1980,14 @@ unsafe extern "C" fn plugin_open_allocator(
         let state = unsafe { &mut *state_ptr };
         let allocator_ctx = state_ptr as *mut c_void;
         state.allocator_vtable.ctx = allocator_ctx;
+        // Record the published struct itself, not a summary of the decision
+        // that produced it. A test can then read the slot out of the very
+        // bytes the host was handed, so "the sender published a callable
+        // structured slot" cannot drift away from the code that publishes it.
+        LAST_PUBLISHED_VTABLE.store(
+            core::ptr::from_mut::<NxmemAllocatorVtable>(state.allocator_vtable.as_mut()),
+            Ordering::Release,
+        );
         if let Some(backing) = state.backing_vtable.as_mut() {
             backing.ctx = allocator_ctx;
         }
@@ -2065,6 +2219,49 @@ pub const SYMBOL_DRAIN_CALLS: &[u8] = b"NxmemTestpluginDrainCalls\0";
 #[unsafe(no_mangle)]
 pub extern "C" fn NxmemTestpluginDrainCalls() -> u64 {
     DRAIN_CALLS.load(Ordering::Acquire)
+}
+
+/// The name of the published-slot introspection symbol.
+pub const SYMBOL_PUBLISHED_STRUCTURED_SLOT: &[u8] = b"NxmemTestpluginPublishedStructuredSlot\0";
+
+/// Test-only introspection: does the allocator vtable this plugin most
+/// recently published carry a populated `release_allocation`?
+///
+/// **Not part of the nxmem ABI.** Returns `1` when the slot is populated, `0`
+/// when it is null, and `u64::MAX` when no published vtable is currently live
+/// — so a caller can never read "gone" as "absent".
+///
+/// This reads the published struct, rather than reporting a flag set beside
+/// the code that publishes it. That matters: from the host's side a slot it
+/// clamped away is indistinguishable from a slot the sender never wrote, so
+/// without this a test asserting "the host stayed out of the slot" can be
+/// satisfied by a sender that quietly stopped offering one.
+#[unsafe(no_mangle)]
+pub extern "C" fn NxmemTestpluginPublishedStructuredSlot() -> u64 {
+    let vtable = LAST_PUBLISHED_VTABLE.load(Ordering::Acquire);
+    if vtable.is_null() {
+        return u64::MAX;
+    }
+    // SAFETY: the pointer is stored while the owning state is alive and
+    // cleared in `release_state` before the state is dropped, so a non-null
+    // value names a live, initialised vtable.
+    let published = unsafe { &*vtable };
+    u64::from(published.release_allocation.is_some())
+}
+
+/// The name of the parked-state introspection symbol.
+pub const SYMBOL_PARKED_STATE_IS_SET: &[u8] = b"NxmemTestpluginParkedStateIsSet\0";
+
+/// Test-only introspection: is a parked allocator state currently recorded?
+///
+/// **Not part of the nxmem ABI.** Reports the pointer's presence without
+/// dereferencing it, so it stays sound even if the invariant it exists to
+/// check has been broken. That is the point: the parked pointer must be
+/// cleared when its state is destroyed, and the only safe way to observe that
+/// is to look at the pointer rather than at what it used to name.
+#[unsafe(no_mangle)]
+pub extern "C" fn NxmemTestpluginParkedStateIsSet() -> u64 {
+    u64::from(!PARKED_STATE.load(Ordering::Acquire).is_null())
 }
 
 /// The name of the parked-completion hook symbol.

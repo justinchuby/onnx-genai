@@ -48,7 +48,10 @@ use onnx_runtime_memory_host::{
 
 #[path = "support/testplugin.rs"]
 mod testplugin;
-use testplugin::{drain_calls, structured_releases, terminal_releases, testplugin_path};
+use testplugin::{
+    drain_calls, parked_state_is_set, published_structured_slot, structured_releases,
+    terminal_releases, testplugin_path,
+};
 
 /// Serialises the whole suite.
 ///
@@ -218,6 +221,16 @@ fn a_plugin_outside_the_hosts_major_range_is_refused() {
 ///
 /// A host that only speaks the baseline minor still drives the current plugin:
 /// negotiation settles on the baseline and no minor-1 slot is used.
+///
+/// The mechanism is `ahead-of-host`, not `lazy`, and that is the whole point.
+/// `lazy` clamps *itself*: at negotiated minor 0 it declares minor 0 and leaves
+/// `release_allocation` null, so `structured_releases` cannot move however the
+/// host behaves, and an assertion that it did not move is vacuous — both of the
+/// host's defences against reaching past the negotiated level could be deleted
+/// together without it failing. `ahead-of-host` publishes a populated minor-1
+/// `release_allocation` and declares minor 1 whatever the host negotiated,
+/// which is legal for a newer sender and puts the decision entirely on the
+/// host's side of the boundary.
 #[test]
 fn an_older_host_range_still_drives_the_current_plugin() {
     let _serial = serial();
@@ -234,11 +247,24 @@ fn an_older_host_range_still_drives_the_current_plugin() {
 
     assert_eq!(plugin.negotiated().minor, 0, "the ceiling is the host's");
 
-    let allocator = open(&plugin, "lazy", NXMEM_CAP_ALLOCATOR);
+    let allocator = open(&plugin, "ahead-of-host", NXMEM_CAP_ALLOCATOR);
     assert_eq!(
         allocator.core().abi_minor(),
         0,
-        "a mechanism must not offer a slot the negotiated host cannot call"
+        "a sender ahead of the ceiling must be read down to it, not followed up to its own \
+         level"
+    );
+    // The premise the assertion below rests on, checked rather than assumed:
+    // the sender really did put a callable structured slot on the wire at this
+    // negotiated level. Read out of the published struct itself, because the
+    // host's own view has already been clamped and so cannot tell a slot it
+    // declined from a slot that was never offered. If the mechanism ever
+    // reverts to clamping itself, this is what notices.
+    assert_eq!(
+        published_structured_slot(&plugin),
+        1,
+        "the sender must have published a populated structured slot at a negotiated minor 0, or \
+         the host having stayed out of it is a fact about the sender and not about the host"
     );
 
     // The whole allocate/free cycle still works at the baseline level, using
@@ -252,13 +278,10 @@ fn an_older_host_range_still_drives_the_current_plugin() {
         matches!(outcome, AllocationReleaseOutcome::Complete { .. }),
         "the baseline release path must still report a complete release, got {outcome:?}"
     );
-    // And it really was the baseline slot. `lazy` publishes the minor-1
-    // structured slot and claims the capability, so the only thing stopping
-    // the host calling it is the level this host negotiated — which makes the
-    // choice of slot the whole point of the test, and it was previously only
-    // asserted in a comment. A host that reached for a slot the negotiation
-    // excluded would be calling through a function pointer the sender is
-    // entitled to have left null.
+    // And it really was the baseline slot. The sender published the minor-1
+    // structured slot, claimed the capability, and declared minor 1; nothing on
+    // its side declines to serve the call. The only thing that can keep the
+    // host out of that slot is the host itself.
     assert_eq!(
         structured_releases(&plugin),
         structured_before,
@@ -270,6 +293,119 @@ fn an_older_host_range_still_drives_the_current_plugin() {
         1,
         "it must still have freed the allocation, through the baseline slot"
     );
+    drop(allocator);
+    plugin
+        .try_unload()
+        .expect("the baseline host leaves nothing outstanding");
+
+    // The other half of the same fact, which is what stops the assertion above
+    // passing because the slot was never callable in the first place: the very
+    // same mechanism, publishing the very same vtable, *is* entered through the
+    // structured slot once the negotiated level permits it. The mechanism did
+    // not change between the two halves; only the host's ceiling did.
+    let current = load();
+    assert_eq!(current.negotiated().minor, NXMEM_ABI_VERSION_MINOR);
+    let allocator = open(&current, "ahead-of-host", NXMEM_CAP_ALLOCATOR);
+    assert_eq!(
+        allocator.core().abi_minor(),
+        NXMEM_ABI_VERSION_MINOR,
+        "at the current ceiling the sender's own level is what applies"
+    );
+    let ptr = allocator
+        .allocate(4096, 64)
+        .expect("current-level allocation");
+    let structured_before = structured_releases(&current);
+    // SAFETY: `ptr` is live, and was allocated with exactly these parameters.
+    let outcome = unsafe { allocator.release(ptr, 4096, 64) };
+    assert!(
+        matches!(outcome, AllocationReleaseOutcome::Complete { .. }),
+        "the structured release path must report a complete release, got {outcome:?}"
+    );
+    assert_eq!(
+        structured_releases(&current) - structured_before,
+        1,
+        "the slot the baseline host stayed out of must be a slot that really works, or \
+         staying out of it proves nothing"
+    );
+    drop(allocator);
+    current.try_unload().expect("nothing is outstanding");
+}
+
+/// **Capability is a separate axis from level, and the host must honour both.**
+///
+/// `undeclared-slot` publishes a populated, working minor-1
+/// `release_allocation` and declares minor 1, so the host's *level* clamp has
+/// nothing to object to — the negotiated ceiling is minor 1 here and the
+/// sender is at minor 1. What it never does is claim
+/// `NXMEM_CAP_STRUCTURED_RELEASE`. A slot present in a struct of the right
+/// size is not a promise to implement it; the declaration is. The host must
+/// therefore go on the capability flags and stay on the baseline `deallocate`
+/// slot.
+///
+/// Every other mechanism that publishes the structured slot also claims the
+/// capability, which makes the host's capability check unobservable: deleting
+/// it changes nothing, because level agreement and capability agreement always
+/// coincide. This mechanism is the one place they come apart.
+#[test]
+fn a_published_slot_the_sender_never_claimed_is_not_entered() {
+    let _serial = serial();
+    let plugin = load();
+    assert_eq!(plugin.negotiated().minor, NXMEM_ABI_VERSION_MINOR);
+
+    let allocator = open(&plugin, "undeclared-slot", NXMEM_CAP_ALLOCATOR);
+    assert_eq!(
+        allocator.core().abi_minor(),
+        NXMEM_ABI_VERSION_MINOR,
+        "the level is agreed; the level is not what is in question here"
+    );
+    assert_eq!(
+        allocator.core().capability_flags() & NXMEM_CAP_STRUCTURED_RELEASE,
+        0,
+        "the sender must not have claimed the capability, or this test proves nothing"
+    );
+    // And it must nonetheless have published the slot, or "the host stayed out
+    // of it" is again a fact about the sender rather than about the host.
+    assert_eq!(
+        published_structured_slot(&plugin),
+        1,
+        "the sender must have published a populated structured slot despite not claiming the \
+         capability, or there is nothing here for the host's capability check to refuse"
+    );
+
+    let ptr = allocator.allocate(4096, 64).expect("allocation");
+    let terminal_before = terminal_releases(&plugin);
+    let structured_before = structured_releases(&plugin);
+    // SAFETY: `ptr` is live, and was allocated with exactly these parameters.
+    let outcome = unsafe { allocator.release(ptr, 4096, 64) };
+    assert!(
+        matches!(outcome, AllocationReleaseOutcome::Complete { .. }),
+        "the baseline path must still complete the release, got {outcome:?}"
+    );
+    assert_eq!(
+        structured_releases(&plugin),
+        structured_before,
+        "a slot the sender never claimed must not be entered, however inviting the pointer in \
+         the struct looks"
+    );
+    assert_eq!(
+        terminal_releases(&plugin) - terminal_before,
+        1,
+        "and the release must still have happened, through the slot the sender did claim"
+    );
+
+    drop(allocator);
+    // The accessor above names a struct owned by the allocator state. Once
+    // that state is gone the pointer must be gone with it, or the next caller
+    // reads freed memory — and a stale pointer would also let the accessor
+    // keep answering `1` for a sender that no longer exists, which is the one
+    // answer that would make the assertions above pass for the wrong reason.
+    assert_eq!(
+        published_structured_slot(&plugin),
+        u64::MAX,
+        "no published vtable may remain reachable once the state that owns it has been \
+         destroyed"
+    );
+    plugin.try_unload().expect("nothing is outstanding");
 }
 
 /// **Older supported participant, plugin side.**
@@ -290,12 +426,27 @@ fn a_minor_0_mechanism_works_under_a_minor_1_host() {
         0,
         "structured release did not exist at minor 0"
     );
+    // The fallback is the sender's own doing here: it published no structured
+    // slot at all. Stated against the published struct, which is also the one
+    // place in the suite where a live vtable must be reported as *not*
+    // carrying the slot — without it, an accessor that always answered "yes"
+    // would satisfy every other use.
+    assert_eq!(
+        published_structured_slot(&plugin),
+        0,
+        "a mechanism at minor 0 must publish no structured slot"
+    );
 
     let modern = open(&plugin, "lazy", NXMEM_CAP_ALLOCATOR);
     assert_eq!(
         modern.core().abi_minor(),
         NXMEM_ABI_VERSION_MINOR,
         "a current mechanism in the same module must not be dragged down"
+    );
+    assert_eq!(
+        published_structured_slot(&plugin),
+        1,
+        "and its current sibling, published from the same module moments later, must carry one"
     );
 
     // Both must work, through the same public release entry point.
@@ -1465,6 +1616,59 @@ fn a_plugin_thread_reports_a_completion_after_its_allocator_is_gone() {
     );
 }
 
+/// **An abandoned park must not leave a pointer to a destroyed state behind.**
+///
+/// `callback-after-drop` parks its allocator state where a plugin-owned thread
+/// can find it later, taking no reference of its own: it relies on a queued
+/// release holding the state alive. Open one and drop it with nothing queued
+/// and that assumption does not hold — the state's refcount reaches zero and
+/// it is destroyed while the parked pointer still names it. Anything that
+/// subsequently ran the completion hook would dereference freed memory.
+///
+/// The pointer is therefore cleared as the state is destroyed. This is the
+/// only test that reaches that clearing: every other use of the mechanism
+/// keeps a release queued, which keeps the state alive, so the clearing never
+/// fires and could be deleted unnoticed. The park is process-global inside the
+/// loaded module, so a stale pointer would not merely be latent — it would be
+/// waiting for the next test in this binary that calls the hook.
+///
+/// The assertion reads the pointer rather than following it, so it stays sound
+/// precisely when the invariant it checks is broken.
+#[test]
+fn an_abandoned_park_is_cleared_when_its_state_dies() {
+    let _serial = serial();
+    let plugin = load();
+    assert_eq!(
+        parked_state_is_set(&plugin),
+        0,
+        "no park may be outstanding when this test starts"
+    );
+
+    let allocator = plugin
+        .factory("callback-after-drop")
+        .expect("the mechanism is published")
+        .open(NXMEM_CAP_ALLOCATOR | NXMEM_CAP_DEFERRED_RELEASE, None)
+        .expect("the mechanism opens");
+    assert_eq!(
+        parked_state_is_set(&plugin),
+        1,
+        "opening the mechanism must park its state, or there is nothing here to abandon"
+    );
+
+    // Dropped with nothing queued, so nothing else is holding the state.
+    drop(allocator);
+    assert_eq!(
+        parked_state_is_set(&plugin),
+        0,
+        "a park whose state has been destroyed must not still name it; the hook has no way to \
+         tell a stale pointer from a live one and would dereference freed memory"
+    );
+
+    plugin
+        .try_unload()
+        .expect("an abandoned park leaves nothing outstanding");
+}
+
 /// **A refused `enqueue_release` leaves the allocation exactly as it was.**
 ///
 /// To queue a release the host must first take the allocation out of its live
@@ -1534,8 +1738,84 @@ fn a_refused_enqueue_leaves_the_allocation_releasable() {
     plugin.try_unload().expect("nothing is outstanding");
 }
 
-// ─── callback failure ───────────────────────────────────────────────────────
+/// **The callback table's fate is decided after the plugin's `release`, not
+/// before it.**
+///
+/// `AllocatorCore::drop` calls the plugin's `release(ctx)` and only then reads
+/// `outstanding_releases` to decide whether to free the callback table or leak
+/// it. The in-code comment says that order is load-bearing, because `release`
+/// is an ordinary host call and the plugin may touch the table from inside it.
+/// Nothing observed it: every other mechanism's `release` calls nothing at all,
+/// so freeing the table first would have been a use-after-free that no test
+/// performed.
+///
+/// `complete-on-release` performs it. It refuses to drain, so a queued release
+/// is still outstanding when teardown starts, and then reports that release's
+/// completion from inside `release` — taking the outstanding count from one to
+/// zero at the one instant the host is between those two steps.
+///
+/// The assertion is deliberately **not** on the use-after-free. Reading freed
+/// memory is undefined, so a test built on it passes or fails by accident, and
+/// Miri cannot reach this suite at all (it cannot execute a `dlopen`ed cdylib).
+/// It is on the decision the ordering changes: reading the count too early
+/// reads a one that is about to become a zero, and leaks a table that did not
+/// need leaking. That is a real, permanent, deterministic defect, and it is
+/// memory-safe to observe in both directions.
+#[test]
+fn the_callback_table_outlives_the_plugins_own_release_call() {
+    let _serial = serial();
+    let plugin = load();
+    let allocator = open(
+        &plugin,
+        "complete-on-release",
+        NXMEM_CAP_ALLOCATOR | NXMEM_CAP_DEFERRED_RELEASE,
+    );
 
+    let ptr = allocator.allocate(4096, 64).expect("allocation");
+    // SAFETY: a live allocation from this allocator with matching parameters.
+    let _ticket = unsafe { allocator.enqueue_release(ptr, 4096, 64) }.expect("queued release");
+    assert_eq!(
+        allocator.core().outstanding_releases(),
+        1,
+        "the release must still be outstanding when teardown begins, or the ordering \
+         under test never arises"
+    );
+
+    let leaks_before = PluginAllocatorCore::leaked_callback_tables();
+    let drain_calls_before = drain_calls(&plugin);
+    drop(allocator);
+
+    // The mechanism refuses to drain, so the drop's drain loop cannot be what
+    // retired this release: it asked once, was told nothing retired, and gave
+    // up. Whatever cleared the outstanding count came from inside `release`.
+    assert_eq!(
+        drain_calls(&plugin) - drain_calls_before,
+        1,
+        "a pass that retires nothing must end the drain loop"
+    );
+    assert_eq!(
+        plugin.module().host_live_counts().queued_releases,
+        0,
+        "the completion reported from inside `release` must have been accepted"
+    );
+    assert_eq!(
+        PluginAllocatorCore::leaked_callback_tables(),
+        leaks_before,
+        "the table's fate must be read after the plugin has finished with it; a count read \
+         before `release` is a count the plugin was still about to change, and leaks a \
+         table that nothing could ever name again"
+    );
+    assert_eq!(
+        plugin.module().host_live_counts().total(),
+        0,
+        "and the accounting must balance, so the gate really did reopen"
+    );
+    plugin
+        .try_unload()
+        .expect("a release retired from inside `release` leaves nothing outstanding");
+}
+
+// ─── callback failure ───────────────────────────────────────────────────────
 /// **Callback failure.**
 ///
 /// The `callback-probe` mechanism calls the host's reclaim hook on every
@@ -1661,6 +1941,96 @@ fn an_idle_plugin_unloads() {
         PluginModule::modules_unmapped() - unmapped_before,
         1,
         "a clean unload must actually unmap the module"
+    );
+}
+
+/// **The unmap count follows `PluginModule::drop`, not `try_unload`.**
+///
+/// Every other assertion on `modules_unmapped` in this suite either watches it
+/// move across a `try_unload`, or watches it stay still across a drop that
+/// deliberately leaked. Both shapes are equally satisfied by a counter that
+/// lives in `try_unload`'s success arm instead of in `PluginModule::drop` — and
+/// a counter that lives there is no longer a proxy for `dlclose` at all, it is
+/// a restatement of the decision `try_unload` just made. `MemoryPlugin::drop`'s
+/// deliberate `mem::forget` could then be deleted outright without a single
+/// test noticing, because nothing would be watching the drop path unmap.
+///
+/// This is the missing quadrant: an unload that happens *through the drop
+/// path*, with no `try_unload` anywhere. The gate is open, so `MemoryPlugin`'s
+/// drop takes its early return, ordinary field drops run, the last
+/// `Arc<PluginModule>` goes, and the library unmaps.
+#[test]
+fn dropping_an_idle_plugin_unmaps_it_with_no_try_unload_at_all() {
+    let _serial = serial();
+    let plugin = load();
+    assert_eq!(
+        plugin.module().host_live_counts().total(),
+        0,
+        "nothing is live, so the gate this drop evaluates is open"
+    );
+
+    let unmapped_before = PluginModule::modules_unmapped();
+    let leaks_before = MemoryPlugin::forced_module_leaks();
+    drop(plugin);
+
+    assert_eq!(
+        PluginModule::modules_unmapped() - unmapped_before,
+        1,
+        "an idle plugin that is dropped rather than unloaded must still reach dlclose"
+    );
+    assert_eq!(
+        MemoryPlugin::forced_module_leaks(),
+        leaks_before,
+        "an open gate is not a forced leak, whichever path reached it"
+    );
+}
+
+/// **The unmap is counted where the mapping goes, not where a handle goes.**
+///
+/// The test above pins the counter to *a* drop path, but a counter duplicated
+/// into both `try_unload`'s success arm and `MemoryPlugin::drop`'s open-gate
+/// branch would satisfy it too — and that counter would still be lying, because
+/// neither site can know whether the module actually unmapped. `module()` hands
+/// out the `Arc`, so any embedder can hold a module reference that outlives the
+/// plugin handle; both those sites would then count an unmap that did not
+/// happen.
+///
+/// So this drives the module through a shutdown in which the unmap happens at a
+/// moment when there is **no `MemoryPlugin` in existence and no `try_unload` on
+/// the stack**. The only code that can observe it is `PluginModule`'s own
+/// `Drop`, which is the one place the `library` field is dropped — and dropping
+/// that field is the `dlclose`.
+#[test]
+fn the_unmap_lands_when_the_last_module_reference_goes_not_when_the_plugin_does() {
+    let _serial = serial();
+    let plugin = load();
+    // An ordinary embedder handle: the loader publishes the `Arc`, so keeping
+    // one is a supported thing to do, not a trick.
+    let pinned = Arc::clone(plugin.module());
+
+    let unmapped_before = PluginModule::modules_unmapped();
+    let leaks_before = MemoryPlugin::forced_module_leaks();
+    drop(plugin);
+    assert_eq!(
+        MemoryPlugin::forced_module_leaks(),
+        leaks_before,
+        "the gate was open, so this drop is not a forced leak"
+    );
+    assert_eq!(
+        PluginModule::modules_unmapped(),
+        unmapped_before,
+        "an open gate does not unmap a module somebody else still holds; only the last \
+         reference going can do that"
+    );
+
+    // Nothing above this line is a `MemoryPlugin` any more, and `try_unload`
+    // was never called. This is the moment the mapping actually goes.
+    drop(pinned);
+    assert_eq!(
+        PluginModule::modules_unmapped() - unmapped_before,
+        1,
+        "the unmap must be counted where the library is dropped, which is the only place \
+         that knows it happened"
     );
 }
 

@@ -136,3 +136,41 @@ pub fn structured_releases(plugin: &onnx_runtime_memory_host::MemoryPlugin) -> u
     // SAFETY: as above.
     unsafe { symbol() }
 }
+
+/// Whether the allocator vtable the plugin most recently published carries a
+/// populated `release_allocation`: `1` yes, `0` no, `u64::MAX` no live vtable.
+///
+/// The host cannot answer this for itself. It clamps the prefix it reads, so a
+/// slot it declined to adopt looks exactly like a slot that was never offered,
+/// and an assertion that the host stayed out of the slot proves nothing until
+/// the slot is known to have been there.
+pub fn published_structured_slot(plugin: &onnx_runtime_memory_host::MemoryPlugin) -> u64 {
+    // SAFETY: `NxmemTestpluginPublishedStructuredSlot` is an
+    // `extern "C" fn() -> u64` exported by the test plugin, and the module
+    // stays mapped for as long as the borrow of `plugin` lasts.
+    let symbol: libloading::Symbol<'_, unsafe extern "C" fn() -> u64> = unsafe {
+        plugin
+            .module()
+            .library()
+            .get(onnx_runtime_memory_testplugin::SYMBOL_PUBLISHED_STRUCTURED_SLOT)
+    }
+    .expect("the test plugin exports its published-slot accessor");
+    // SAFETY: as above.
+    unsafe { symbol() }
+}
+
+/// Whether the plugin currently holds a parked allocator state pointer.
+pub fn parked_state_is_set(plugin: &onnx_runtime_memory_host::MemoryPlugin) -> u64 {
+    // SAFETY: `NxmemTestpluginParkedStateIsSet` is an
+    // `extern "C" fn() -> u64` exported by the test plugin, and the module
+    // stays mapped for as long as the borrow of `plugin` lasts.
+    let symbol: libloading::Symbol<'_, unsafe extern "C" fn() -> u64> = unsafe {
+        plugin
+            .module()
+            .library()
+            .get(onnx_runtime_memory_testplugin::SYMBOL_PARKED_STATE_IS_SET)
+    }
+    .expect("the test plugin exports its parked-state accessor");
+    // SAFETY: as above.
+    unsafe { symbol() }
+}
