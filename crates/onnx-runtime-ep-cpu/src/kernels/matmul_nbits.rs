@@ -1030,6 +1030,10 @@ static MLAS_SQNBIT_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 static BORROWED_INT4_SYMMETRIC_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static BORROWED_INT4_ASYMMETRIC_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Counts entries into [`with_decode_pool_lazy`], so a test can assert *which*
+/// shapes defer building the decode pool and which still install it eagerly.
+#[cfg(test)]
+static DEFERRED_DECODE_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// Standard ONNX row-major packed NBits weight with affine block metadata.
 ///
 /// This preserves the wire layout instead of expanding it to f32. Direct
@@ -1416,7 +1420,14 @@ impl Kernel for MatMulNBitsKernel {
             } else {
                 BORROWED_INT4_ASYMMETRIC_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
             }
-            with_decode_pool(|| {
+            // `m == 1` is what makes the deferral provable rather than hopeful.
+            // Every kernel reachable from this closure at `m == 1`
+            // (`borrowed_affine_int4_matmul_nblock`, `borrowed_affine_int4_matmul`)
+            // parallelises solely through `parallel_output_rows_repeated`, which
+            // installs the pool on demand. The one branch that drives Rayon
+            // directly, `borrowed_affine_int4_matmul_prefill`, is gated on
+            // `m >= 2` and so is unreachable here by construction.
+            let run_borrowed_int4 = || {
                 #[cfg(target_arch = "x86_64")]
                 if borrowed_int4_prefill_block_enabled()
                     && m >= 2
@@ -1470,7 +1481,12 @@ impl Kernel for MatMulNBitsKernel {
                     self.block_size,
                     dot_kernel,
                 );
-            })?;
+            };
+            if m == 1 {
+                with_decode_pool_lazy(run_borrowed_int4)
+            } else {
+                with_decode_pool(run_borrowed_int4)
+            }?;
             return if direct_result {
                 Ok(())
             } else {
@@ -1518,7 +1534,7 @@ impl Kernel for MatMulNBitsKernel {
                 &owned_weight
             };
             if m == 1 {
-                with_decode_pool(|| {
+                with_decode_pool_lazy(|| {
                     packed_nbits_gemv(
                         &activations,
                         packed_weight,
@@ -1892,7 +1908,7 @@ impl Kernel for MatMulNBitsKernel {
                 owned_weight = numa_place_nk(built, self.n);
                 &owned_weight
             };
-            with_decode_pool(|| {
+            with_decode_pool_lazy(|| {
                 gemv_nk(&activations, weight_nk, result, self.k, self.n);
             })?;
         } else {
@@ -4062,6 +4078,97 @@ fn report_decode_affinity_failure(message: &str) {
     }
 }
 
+/// Run an M=1 decode kernel *without* installing the decode pool up front.
+///
+/// [`with_decode_pool`] pays a Rayon `install` per call: the pool's workers are
+/// woken, one runs the kernel, and the rest find nothing to do and go back to
+/// sleep. When the flat fan-out inside then routes to the task runtime -- which
+/// is the whole point of [`flat_fan_out`] -- not one of those workers performs
+/// any model work. Measured on `gemm_nbits_llama3_8b_mlp_t1` at a 16-core
+/// budget, that crossing costs a fixed ~1.8 ms of CPU per forward (~9.5% of
+/// process CPU) and it is *per dispatch*, not idle spin: holding the iteration
+/// count fixed and stretching the inter-token gap from 100 us to 4000 us grew
+/// wall 2.9x while the pool's CPU stayed flat (360 ms -> 350 ms).
+///
+/// So the install is deferred to the one place that genuinely needs a Rayon
+/// pool -- the `PrefillFanOut::Wide` arm of [`parallel_output_rows_repeated`] --
+/// and a model whose fan-outs all route to the task runtime never builds the
+/// decode pool at all.
+///
+/// # Invariant
+///
+/// Only call this around a kernel whose *sole* parallelism is
+/// [`parallel_output_rows`]. A kernel that reaches Rayon by any other route
+/// (`packed_nbits_gemm`, `borrowed_affine_int4_matmul_prefill`, `int8_matmul`
+/// and `kai_sdot_matmul_m1` all call `par_chunks_mut` directly) would silently
+/// run that work on the global pool instead of the bounded, pinned decode pool.
+/// `packed_nbits_gemv`, `gemv_nk` and the `m == 1` half of the borrowed int4
+/// path were audited against this; every other call site keeps
+/// [`with_decode_pool`].
+///
+/// Routing is unchanged: while deferred, [`deferred_decode_width`] reports the
+/// width the pool *would* have had, which is exactly what
+/// `rayon::current_num_threads()` returned inside the installation.
+fn with_decode_pool_lazy<T: Send>(operation: impl FnOnce() -> T + Send) -> Result<T> {
+    #[cfg(test)]
+    DEFERRED_DECODE_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+    // Already resident inside a real installation: identical to `with_decode_pool`.
+    if IN_DECODE_POOL.with(Cell::get) {
+        return Ok(operation());
+    }
+    // A construction failure already observed must keep failing the forward
+    // rather than silently degrading to the global pool.
+    if let Some(Err(message)) = DECODE_POOL.get() {
+        return Err(error(message.clone()));
+    }
+    let Some(width) = configured_decode_threads() else {
+        // No bounded decode pool configured; `with_decode_pool` would run the
+        // operation inline on the global pool, so do exactly that.
+        return Ok(operation());
+    };
+    let _guard = DeferredDecodeGuard::enter(width.max(1));
+    Ok(operation())
+}
+
+/// Width the decode pool *would* have had on a thread that deferred installing
+/// it, or `None` when no deferral is in effect.
+fn deferred_decode_width() -> Option<usize> {
+    let width = DEFERRED_DECODE_WIDTH.with(Cell::get);
+    (width > 0).then_some(width)
+}
+
+/// The pool width a fan-out should partition for.
+///
+/// Normally the installed pool's width. While a decode-pool install is deferred
+/// this is the width that pool *would* have had, so both the executor choice
+/// ([`flat_fan_out`]) and the grain ([`output_chunk_len`]) match the installed
+/// case exactly rather than reflecting whichever ambient pool happens to be
+/// current.
+fn effective_fan_out_width() -> usize {
+    deferred_decode_width()
+        .unwrap_or_else(rayon::current_num_threads)
+        .max(1)
+}
+
+/// Build and install the deferred decode pool around the one fan-out that needs
+/// it.
+///
+/// Falls back to the current pool when the decode pool is opted out or fails to
+/// build: `parallel_output_rows_repeated` returns `()` and cannot surface an
+/// error, and running the fan-out on the global pool is the same degradation
+/// [`with_decode_pool_scope`] already documents for its `Err(_)` arm.
+fn install_deferred_decode_pool(fan_out: impl FnOnce() + Send) {
+    match DECODE_POOL.get_or_init(|| build_decode_pool(configured_decode_threads())) {
+        Ok(Some(pool)) => pool.install(|| {
+            // Genuinely resident now, so a nested fan-out must read the
+            // installed width rather than the deferred hint.
+            let _guard = DeferredDecodeGuard::enter(0);
+            fan_out();
+        }),
+        _ => fan_out(),
+    }
+}
+
 fn with_decode_pool<T: Send>(operation: impl FnOnce() -> T + Send) -> Result<T> {
     // If we are already resident inside a `with_decode_pool_scope` installation
     // on this worker thread, run inline: the enclosing `pool.install(...)` already
@@ -4100,6 +4207,12 @@ thread_local! {
     /// output rows out across the persistent worker set instead of a per-op
     /// Rayon region.
     static IN_SPMD_SCOPE: Cell<bool> = const { Cell::new(false) };
+
+    /// Width the decode pool *would* have had on a thread that deliberately
+    /// skipped installing it (see [`with_decode_pool_lazy`]). Zero means no
+    /// deferral is in effect. Read by [`parallel_output_rows_repeated`] so the
+    /// fan-out routing decision is identical to the installed case.
+    static DEFERRED_DECODE_WIDTH: Cell<usize> = const { Cell::new(0) };
 }
 
 /// The lazily built `numa-split` decode layout, or `None` when the mode is not
@@ -4199,14 +4312,26 @@ where
     // resident worker in ~5 us, hands the fan-out to ORT's pool when we are
     // inside a plugin compute call instead of fighting it for cores, and caps
     // its width at the physical cores rather than every SMT sibling.
-    let wide = rayon::current_num_threads().max(1);
+    // While a decode-pool install is deferred (see `with_decode_pool_lazy`) the
+    // width the pool *would* have had is what the installed case reported here,
+    // so routing is bit-identical either way.
+    let wide = effective_fan_out_width();
     let fan_out_macs = result.len().saturating_mul(k);
     let lanes = || crate::task_runtime::width().max(1);
     if flat_fan_out(fan_out_macs, calls, lanes, wide) == PrefillFanOut::Wide {
-        result
-            .par_chunks_mut(chunk)
-            .enumerate()
-            .for_each(|(chunk_index, outputs)| compute(chunk_index * chunk, outputs));
+        let mut fan_out = || {
+            result
+                .par_chunks_mut(chunk)
+                .enumerate()
+                .for_each(|(chunk_index, outputs)| compute(chunk_index * chunk, outputs));
+        };
+        // This is the only work in a deferred kernel that actually needs a
+        // Rayon pool, so this is where the decode pool gets built.
+        if deferred_decode_width().is_some() {
+            install_deferred_decode_pool(fan_out);
+        } else {
+            fan_out();
+        }
         return;
     }
     // `chunk` is passed through unchanged as the *minimum* grain, so the
@@ -4498,6 +4623,27 @@ impl Drop for SpmdScopeGuard {
 /// RAII guard that marks the current thread as resident inside the decode pool
 /// and restores the previous state on drop -- including during panic unwinding,
 /// so a panicking forward pass cannot leak a stale `true` onto a pooled worker.
+/// RAII guard that records the width of a *deferred* decode-pool installation
+/// on the current thread and restores the previous value on drop, including
+/// during panic unwinding so a panicking kernel cannot leak a stale width.
+struct DeferredDecodeGuard {
+    previous: usize,
+}
+
+impl DeferredDecodeGuard {
+    fn enter(width: usize) -> Self {
+        let previous = DEFERRED_DECODE_WIDTH.with(|width_cell| width_cell.replace(width));
+        Self { previous }
+    }
+}
+
+impl Drop for DeferredDecodeGuard {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        DEFERRED_DECODE_WIDTH.with(|width_cell| width_cell.set(previous));
+    }
+}
+
 struct DecodeResidencyGuard {
     previous: bool,
 }
@@ -8817,7 +8963,7 @@ const MIN_OUTPUTS_PER_TASK: usize = 16;
 const MANY_THREAD_CUTOFF: usize = 48;
 
 pub(crate) fn output_chunk_len(n: usize, k: usize) -> usize {
-    let threads = rayon::current_num_threads();
+    let threads = effective_fan_out_width();
     let total_work = n.saturating_mul(k);
     // Small projections amortize Rayon well on one socket, but dispatching each
     // one across a larger pool costs more than its GEMV on the dual-socket host.
@@ -14369,6 +14515,65 @@ mod tests {
         );
     }
 
+    /// The decode-pool deferral is gated on `m == 1`, and that gate is what
+    /// makes it provable rather than hopeful.
+    ///
+    /// At `m == 1` every kernel reachable from the borrowed int4 closure
+    /// (`borrowed_affine_int4_matmul_nblock`, `borrowed_affine_int4_matmul`)
+    /// parallelises solely through `parallel_output_rows_repeated`, which
+    /// installs the pool on demand. At `m >= 2` the closure can reach
+    /// `borrowed_affine_int4_matmul_prefill`, which drives `par_chunks_mut`
+    /// directly and would silently land on the *global* pool instead of the
+    /// bounded, pinned decode pool. So prefill must keep installing eagerly.
+    #[test]
+    fn only_the_decode_shaped_borrowed_int4_path_defers_the_pool() {
+        // Reads a process-global counter delta, so it must not be handed
+        // another test's dispatch.
+        let _probe = lock_dispatch_probe();
+        let (n, k, block_size) = (64usize, 128usize, 32usize);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+        let blocks = k / block_size;
+
+        for m in [1usize, 4usize] {
+            let a_values: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
+                .collect();
+            let mut kernel = test_kernel(k, n, block_size);
+            kernel.set_constant_inputs(&[false, false, true]);
+            let a = Owned::f32(&[m, k], &a_values);
+            let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+            let scale_view = Owned::f32(&[n, blocks], &scales);
+            let mut y = Owned::zeros_f32(&[m, n]);
+
+            let deferred_before = DEFERRED_DECODE_TEST_CALLS.load(Ordering::Relaxed);
+            kernel
+                .execute(
+                    &[a.view(), b.view(), scale_view.view()],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+            let deferred = DEFERRED_DECODE_TEST_CALLS.load(Ordering::Relaxed) - deferred_before;
+
+            assert_close(&y.to_f32(), &reference(&a_values, &dequantized, m, k, n));
+            if m == 1 {
+                assert_eq!(
+                    deferred, 1,
+                    "decode-shaped borrowed int4 must defer building the decode pool"
+                );
+            } else {
+                assert_eq!(
+                    deferred, 0,
+                    "prefill can reach a kernel that drives Rayon directly, so it must \
+                     keep installing the decode pool eagerly"
+                );
+            }
+        }
+    }
+
     /// `accuracy_level = 0` means fp32 compute, on every architecture.
     ///
     /// Regression guard for the aarch64 dispatch bug: with `dotprod` present,
@@ -17450,6 +17655,156 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The deferred-width hint must nest and unwind exactly like the residency
+    /// flag it parallels: a leaked width would misroute every later fan-out on
+    /// this thread.
+    #[test]
+    fn deferred_decode_width_nests_and_restores_on_panic() {
+        assert_eq!(deferred_decode_width(), None, "width leaked into the test");
+        {
+            let _outer = DeferredDecodeGuard::enter(16);
+            assert_eq!(deferred_decode_width(), Some(16));
+            {
+                // `install_deferred_decode_pool` clears the hint once it is
+                // genuinely resident, which must not clobber the outer value.
+                let _inner = DeferredDecodeGuard::enter(0);
+                assert_eq!(deferred_decode_width(), None);
+            }
+            assert_eq!(deferred_decode_width(), Some(16));
+
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _panicking = DeferredDecodeGuard::enter(4);
+                assert_eq!(deferred_decode_width(), Some(4));
+                panic!("kernel blew up mid-fan-out");
+            }));
+            assert!(unwound.is_err(), "the test panic did not propagate");
+            assert_eq!(
+                deferred_decode_width(),
+                Some(16),
+                "a panicking kernel leaked a stale deferred width"
+            );
+        }
+        assert_eq!(deferred_decode_width(), None);
+    }
+
+    /// Deferring the install must not move the routing decision. A deferred
+    /// width of `MIN_ROUTED_FAN_OUT_WIDTH` with `calls == 1` is the decode case,
+    /// and it has to reach the task runtime on any host -- the hint is read
+    /// instead of `rayon::current_num_threads()`, so this holds at every Rayon
+    /// width rather than only on a wide machine.
+    #[test]
+    fn a_deferred_decode_kernel_still_dispatches_to_the_task_runtime() {
+        if crate::task_runtime::width() <= 1 {
+            return;
+        }
+        let (n, k) = (6144usize, 4096usize);
+        assert!(
+            output_chunk_len(n, k) < n,
+            "the partition policy declined to split {n}x{k}"
+        );
+        let mut result = vec![0.0f32; n];
+        let before = crate::task_runtime::testing::counters();
+        {
+            let _deferred = DeferredDecodeGuard::enter(MIN_ROUTED_FAN_OUT_WIDTH);
+            parallel_output_rows(&mut result, k, |start, outputs| {
+                for (offset, output) in outputs.iter_mut().enumerate() {
+                    *output = (start + offset) as f32;
+                }
+            });
+        }
+        let after = crate::task_runtime::testing::counters();
+        assert!(
+            after.dispatches > before.dispatches,
+            "a deferred fan-out did not reach the task runtime"
+        );
+        for (index, value) in result.iter().enumerate() {
+            assert_eq!(
+                *value, index as f32,
+                "row {index} was not written exactly once"
+            );
+        }
+    }
+
+    /// Deferring must reproduce the *grain* the installed pool would have used,
+    /// not just the executor choice.
+    ///
+    /// `output_chunk_len` reads the current pool width directly, so if it were
+    /// left on `rayon::current_num_threads()` a deferred fan-out would
+    /// partition for whichever ambient pool happened to be current -- a
+    /// different chunk size, and at the boundary a serial-vs-parallel flip,
+    /// whenever the global pool is wider than the decode pool (no explicit
+    /// budget). Results would still be correct, because row sharding is
+    /// associative, but "routing is unchanged" would not be true.
+    #[test]
+    fn a_deferred_fan_out_partitions_for_the_pool_it_would_have_installed() {
+        let (n, k) = (4096usize, 1024usize);
+
+        let one_wide = {
+            let _guard = DeferredDecodeGuard::enter(1);
+            output_chunk_len(n, k)
+        };
+        assert_eq!(
+            one_wide, n,
+            "a deferred one-wide pool must not split the output at all"
+        );
+
+        // The hint must not outlive the guard.
+        assert_eq!(
+            output_chunk_len(n, k),
+            {
+                let _guard = DeferredDecodeGuard::enter(rayon::current_num_threads().max(1));
+                output_chunk_len(n, k)
+            },
+            "with the hint equal to the ambient width the grain must be unchanged"
+        );
+        assert_eq!(deferred_decode_width(), None);
+    }
+
+    /// The fallback half: work that genuinely routes to Rayon must still run,
+    /// and correctly, with the decode pool built on demand underneath it. A
+    /// deferred width below `MIN_ROUTED_FAN_OUT_WIDTH` is the `Wide` arm.
+    #[test]
+    fn a_deferred_wide_fan_out_runs_on_the_decode_pool() {
+        let (n, k) = (6144usize, 4096usize);
+        assert!(output_chunk_len(n, k) < n);
+        let mut result = vec![0.0f32; n];
+        {
+            let _deferred = DeferredDecodeGuard::enter(MIN_ROUTED_FAN_OUT_WIDTH - 1);
+            parallel_output_rows(&mut result, k, |start, outputs| {
+                for (offset, output) in outputs.iter_mut().enumerate() {
+                    *output = (start + offset) as f32;
+                }
+            });
+        }
+        for (index, value) in result.iter().enumerate() {
+            assert_eq!(
+                *value, index as f32,
+                "row {index} was not written exactly once"
+            );
+        }
+    }
+
+    /// Deferral must be invisible to results: the same fan-out, run installed
+    /// and deferred, has to produce identical output.
+    #[test]
+    fn deferring_the_decode_pool_does_not_change_results() {
+        let (n, k) = (4096usize, 2048usize);
+        let compute = |start: usize, outputs: &mut [f32]| {
+            for (offset, output) in outputs.iter_mut().enumerate() {
+                *output = ((start + offset) % 97) as f32;
+            }
+        };
+        let mut installed = vec![0.0f32; n];
+        parallel_output_rows(&mut installed, k, compute);
+
+        let mut deferred = vec![0.0f32; n];
+        {
+            let _deferred = DeferredDecodeGuard::enter(MIN_ROUTED_FAN_OUT_WIDTH);
+            parallel_output_rows(&mut deferred, k, compute);
+        }
+        assert_eq!(installed, deferred);
     }
 
     /// The flat fan-out must actually reach the task runtime, not fall back to
