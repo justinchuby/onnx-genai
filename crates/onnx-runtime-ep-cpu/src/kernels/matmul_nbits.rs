@@ -2042,8 +2042,14 @@ impl Kernel for MatMulNBitsKernel {
                     m,
                     result,
                 );
+            // Non-x86-64 has no fused GEBP microkernel, so the NT route is
+            // consulted unconditionally there and the residency verdict has no
+            // consumer; bind it so it is not an unused variable.
             #[cfg(not(target_arch = "x86_64"))]
-            let used_gebp_first = false;
+            let used_gebp_first = {
+                let _ = nt_keeps_weight_resident;
+                false
+            };
             let used_fast_nt = !used_gebp_first
                 && self.try_prefill_nk_nt(
                     &inputs[1],
