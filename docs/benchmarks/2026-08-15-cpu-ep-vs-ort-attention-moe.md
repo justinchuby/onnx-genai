@@ -4197,3 +4197,258 @@ For assertions specifically: a test that encodes a *contract* rather than a
 *result* should say so, so that the next reader can tell a stale expectation from
 a real regression. The distinction matters — updating a stale assertion is
 correct, and weakening a live one to get green is how a real bug ships.
+## 42. Phase 20: the answer to §39.4 was the wrong loop (#1402), and softmax's cost was not where its code shape suggests (#1416)
+
+§39.4 left one experiment open and one method to run it with. This phase runs it,
+gets a negative answer, and then finds the win one level up. It then does the
+same thing to softmax: profile it by phase instead of as a whole, and the
+optimisation that follows is not the one the code shape implies.
+
+### 42.1 Sharing one packed panel across row blocks loses, and loses harder the wider the pool
+
+The experiment §39.4 proposed was literal: pack a column panel once, then let the
+pool sweep the row bands under it, so `t` threads share one immutable pack
+instead of packing `t` times. It was built, and it is worse than the unpacked
+driver it replaces at every panel width tried:
+
+| panel width | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|
+| 128 KB | 0.83 | 0.56 | 0.35 | 0.20 | 0.40 |
+| 256 KB | 0.94 | 0.70 | 0.52 | 0.33 | 0.55 |
+| 512 KB | 1.04 | 0.84 | 0.76 | 0.61 | 0.77 |
+| 1 MB | 1.02 | 0.80 | 0.71 | 0.55 | 0.75 |
+| 4 MB | 1.00 | 0.74 | 0.64 | 0.49 | 0.72 |
+
+Geomean against the unpacked driver over `{phi35, qwen3, mixtral} × {96, 148,
+256, 365} rows`, higher is better. The 512 KB and 4 MB rows are *after* a second
+fix described below; the first attempt was worse still.
+
+Two costs, and the shape of the table names both. There is a fork-join per
+column panel, which is why every column degrades as `t` grows rather than
+degrading uniformly. And the pack itself becomes a serial term: it is O(n·k)
+work that the first version split only over `nc/PNR` micro-panels, so for
+phi35's `k=6400` — where a 512 KB panel holds exactly one micro-panel — the
+pack ran on one thread while the other 31 waited on the barrier. Splitting the
+pack over `k` as well as over micro-panels recovered a large part of it (0.61 →
+0.79 at 16 threads) and never enough. Amdahl is not negotiable: a barrier per
+panel plus a partly serial pack cannot beat a driver with neither.
+
+### 42.2 Distributing whole panels wins, because it is the serial algorithm with its outer loop given away
+
+The version that works keeps the same packed microkernel and moves the
+parallelism out one level: each lane takes whole column panels, packs each one
+exactly once itself, and sweeps the entire row extent against it. No barrier
+inside a panel, no shared buffer, a fully parallel pack, and the panel stays in
+the owning core's private L2 for the whole sweep. Total pack work is exactly
+`n16·k` element moves no matter how many threads run — the same total as the
+single-threaded path, which is the property §39.4 was actually asking for. It
+just is not obtained by sharing.
+
+Kernel grid, gated (below), against the unpacked driver:
+
+| | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|
+| geomean | **1.178** | **1.208** | **1.268** | **1.237** | **1.014** |
+
+By model: phi35 **1.377**, qwen3 **1.077**, mixtral **1.101**; worst single cell
+0.80; best cells 2.49–2.54 (phi35 at `m=96`, `t=16`).
+
+End to end at `t=512`, median native/ort ratio, negative = faster, both arms
+proved pure-native and every invocation carrying a §39 control arm:
+
+| model | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|
+| phi35moe | −21.6% | −11.3% | −25.2% | −35.0% | −12.9% |
+| qwen3moe | −27.6% | −19.3% | −13.3% | −6.6% | +0.8% ¹ |
+
+¹ inside that cell's floor.
+
+**Mixtral could not be read on the ratio at all**, and this is the §39.3 rule
+doing its job rather than an inconvenience: its control arm moved up to **+66%**
+in one invocation, which is larger than any effect being claimed, so those
+invocations are discarded. Re-run at 5 trials and read on native time against
+the control, mixtral is −2.4 / +1.7 / −5.3 / −6.3 / −3.6% at 2/4/8/16/32 —
+parity to a small win, which is what §42.3 predicts for a model with only one of
+its two GEMM shapes above the gate.
+
+### 42.3 The gate, and why `k` is in it
+
+Two conditions, both measured on the grid above rather than derived:
+
+1. **A band for every thread** (`m/PMR >= threads`). The unpacked driver slices
+   `m` into `MR`-row blocks and fills a wide pool better than a `PMR`-row band
+   sweep can when `m` is short, so packing there trades a certain loss for a
+   speculative win.
+2. **`k >= 2048`.** Below it the per-panel costs stop amortising and the
+   unpacked kernel's strided `b` reads are already cache-resident. Measured:
+   mixtral's `k=1024` shapes 0.90–1.02, qwen3's `k=768` 0.59–1.09, every
+   `k >= 2048` shape a win.
+
+`k >= 1024` scored marginally better on raw grid geomean (1.194 vs 1.177) and
+was **rejected**, because it turned mixtral's first GEMM into a consistent small
+loss. A geomean that improves while a production shape regresses is the geomean
+answering a question nobody asked.
+
+The threshold is quoted in the source as `PANEL_BYTES / (PNR * 16)` — the `k` at
+which one micro-panel reaches a quarter of the panel budget. That is a
+mnemonic that happens to land on the measured cliff on this host, not a
+derivation, and it is written down that way so a future L2 change is not
+mistaken for a proof.
+
+### 42.4 Softmax: pass 2 is 73% of the row, and it is throughput-bound
+
+Softmax sat at 1.10–1.32 ours/ORT after #1245's pure-Horner `exp8`. Timing the
+row kernel as a whole says only that. Timing it **by phase** says where to look
+(per element, `d=1024`, this host):
+
+| phase | ps/element | share |
+|---|---|---|
+| pass 1, row max | 67 | 11% |
+| pass 2, exp + sum | 446 | 73% |
+| pass 3, normalize | 58 | 10% |
+| whole row | 608 | |
+
+The two passes that matter are limited by *different* things, and that is the
+whole result:
+
+- **Pass 1 is latency-bound.** One `vmaxps` chain retires 8 floats per ~4 cycles
+  while the load ports could feed 16. Four independent chains: 67 → 37
+  ps/element, **1.8x**.
+- **Pass 2 is throughput-bound**, on ports 0/1, at 16 such ops per 8 lanes ≈ the
+  8 cycles/iteration measured. So the same trick fails: four independent *sum*
+  chains measured 446 → **458** ps/element, slower. The fix has to remove ops,
+  not reorder them.
+
+Three of those 16 ops existed only to patch `exp8`'s non-finite lanes — a
+`max_ps` clamp, an unordered compare and a `blendv`. All three are unnecessary,
+because `-inf` is caught by the underflow mask that already exists (bitwise
+`andnot`, so poisoned arithmetic underneath does not matter) and `NaN`
+propagates through the polynomial and the exponent build on its own
+(`cvtps_epi32` maps it to the integer indefinite, whose low nine bits build
+`2^0 = 1.0`). Removing them: 446 → 370 ps/element, **1.20x**.
+
+Whole row 608 → 481 ps/element: **1.16x at d=64 rising to 1.26x at d>=256**.
+End to end over all seven softmax fixtures × 1/2/4/8 threads, 25 of 28 cells
+show the old kernel slower by more than that cell's floor (+2.0% to +51.8%),
+with no cell regressing; the three inside their floors were re-run at 41 trials
+and all three then favour the new kernel.
+
+**Not taken:** folding the `mul` and `round` into one FMA with a magic-number
+constant removes a fourth port-0/1 op, and is worth 3% (370 → 356 ps/element).
+It moves `k` for arguments on a rounding boundary, so it forfeits bit-identity
+and would require re-establishing the 1-ULP bound from scratch. 3% does not buy
+that.
+
+### 42.5 Two lessons about evidence
+
+**Exhaustive beats representative when the domain is 2^32.** The `exp8` change
+is not argued and not sampled: an offline harness evaluates the old and new
+forms over **every f32 bit pattern** and reports 0 non-NaN inputs differing in
+any bit and 0 NaN inputs where either side is not NaN. The 1-ULP bound, the
+exact zero below the underflow threshold and the NaN contract then transfer by
+construction rather than by re-measurement — and the check runs in 0.6 seconds.
+A control that deletes the underflow mask reports 1,020,022,810 mismatches,
+first at `-87.33654`, which is what makes the zero meaningful.
+
+**A test that cannot fail is worse than no test, and invariance hides them.**
+Softmax is invariant to the value subtracted: exponentials and sum shift by the
+same factor and cancel. So a row maximum that misses part of the row is
+*numerically silent* — deleting one of the four new accumulator chains passed
+every existing test in the file. It only surfaces as overflow. The test that now
+guards it puts a 3e38 logit at every position of seven different `d` values and
+requires the row to stay finite. The same shape of hole appeared in #1402: no
+test shape produced a short final column panel, because the panel width is
+derived from `n16` and the thread count and the natural shapes divide evenly.
+Both were found by mutation, not by reading.
+
+## 43. The fourth instance §40 predicted, and it was the unit rather than the value (#1484)
+
+§40 was written so that "the fourth instance is recognised rather than
+re-derived". This is that instance, found six days later, and it is recorded
+here because it arrived with a variant §40 did not cover.
+
+### 43.1 The finding
+
+`parallel_rows_per_task` in the softmax kernel refused to fan out below
+`MIN_PARALLEL_SOFTMAX_ROWS = 64` rows. Decode attention softmax is
+`n = heads` by `d = kv_len`, so a 32-head model sat below that floor at **every**
+key length and **every** pool width. Measured on a pure-native default build, our
+native p50 was flat from one thread to eight while ORT parallelised:
+
+| fixture | t=1 | t=2 | t=4 | t=8 |
+| --- | --- | --- | --- | --- |
+| `sm_decode_h32_kv1024` | 0.031 ms | 0.031 ms | 0.031 ms | 0.031 ms |
+| `sm_decode_h32_kv8192` | 0.208 ms | 0.209 ms | 0.210 ms | 0.211 ms |
+
+That flatness *was* the multi-thread `ours/ORT` gap on these fixtures. Removing
+the row floor and keeping the adjacent element floor moved native time down
+29.9%-43.6% wherever the fan-out engages, and the ratio with it: −53.9% at
+kv4096 t=8, −44.1% at kv2048 t=8, −39.9% at kv8192 t=8, −23.2% at kv1024 t=2.
+
+### 43.2 The variant: the constant was calibrated in the right regime, in the wrong unit
+
+§40.2 says the three earlier instances were all "correct when set, and became
+wrong because a different regime started using the same path". This one is not
+quite that. A row floor is never right, in any regime, because **a row is not a
+unit of work** — `n` prices work only if `d` is held fixed, and `d` is the key
+length, which is the one thing that varies most in attention. The floor was a
+proxy for "enough work to amortise the pool wake-up", and the predicate it sat in
+*already contained the honest form of that question* one line below, as
+`MIN_PARALLEL_SOFTMAX_ELEMENTS`. Two thresholds for one question, one of them
+dimensionally wrong, and the wrong one bound first.
+
+So §40.3's practice — record the regime next to the constant — would not have
+prevented this. The regime was fine. The check to add is narrower and cheaper:
+**a threshold should be expressed in the unit of the thing it is protecting.**
+Wake-up cost is amortised by work, so the gate is priced in elements. When two
+thresholds guard one decision, ask whether the weaker one is a proxy for the
+stronger, and if it is, delete it rather than tuning it.
+
+The widening is safe for a reason worth stating in the same unit: chunks are
+sized by `ROW_TILE_BYTES`, not by pool width, so the newly-admitted `32 x 8192`
+yields 32 chunks of 8192 elements — exactly what the already-admitted `64 x 256`
+yields. The smallest total work admitted is unchanged at 16384 elements and the
+smallest per-chunk work is unchanged at 4097. Nothing new is admitted *per
+worker*; only the row-shaped refusal is gone.
+
+### 43.3 A gate whose effect is numerically invisible needs its wiring tested
+
+The more transferable lesson is a testing one, and it repeats §42's "a test that
+cannot fail is worse than no test" in a new form.
+
+Softmax rows are independent, so **the output is bit-identical whether or not the
+fan-out happens**. Every correctness test in the file is therefore blind to the
+gate by construction. Review demonstrated the consequence: inverting the caller's
+use of the predicate — which pins every large softmax back to a single thread and
+undoes the entire change — left all 1448 tests passing. The new unit test did not
+catch it either, because it exercised the predicate in isolation rather than
+through its caller.
+
+A performance gate has no numerical signature, so it must be asserted directly:
+the test now pins `parallel_rows_per_task`'s `Some`/`None` decision, not just the
+predicate's boolean. Its refusals hold at any pool width and run everywhere; the
+fan-out half returns early below two lanes, matching the existing
+`parallel_output_rows_dispatches_to_the_task_runtime`.
+
+Two further mutations were needed to pin the floor honestly. Asserting the
+boundary at `MIN` and `MIN-2` let a floor relaxed to `MIN-1` survive; `3 x 5461`
+is one element short and now straddles it exactly. And `saturating_mul` is
+load-bearing rather than defensive: it clamps *upward*, so an unrepresentable
+element count reads as "plenty of work" and fans out, where a wrapping multiply
+reads as "none" and would silently pin the largest tensors in the system to one
+thread. The first draft of that assertion had the sign backwards, and the test
+caught its own author.
+
+### 43.4 Reporting note
+
+The benchmark host was heavily contended during this run — A/A null controls
+reached 61% on some cells, against ≤2.5% for most cells in the §42 run, and
+absolute times inflated ~35%. Per §39.3 the control is the arbiter, and the
+honest read here came from structure rather than from the grid: only four of the
+seven softmax fixtures change gate decision at all. `sm_bert_b8_s128` (n=12288),
+`sm_prefill_h32_s512` (n=16384) and `sm_whisper_cross` (n=30000) cleared the old
+row floor already, so the predicate returns the same value before and after and
+their code path cannot change. Their scatter — up to +31.1% at prefill t=8,
+against a 31.41% A/A floor — is a calibration of the host, not a result, and is
+reported as such. When a host is too noisy to measure, knowing which cells
+*cannot* have moved is worth more than more trials.
