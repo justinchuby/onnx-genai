@@ -2874,7 +2874,7 @@ impl GroupQueryAttentionKernel {
         } else if q.dtype == DataType::Float16 && gqa_decode_fp16::supported(q_seq, dim) {
             onnx_runtime_ep_api::record_kernel_variant!(
                 "attention_gqa_decode_fp16_splitk",
-                "capture-safe fp16 split-K flash-decode: q_seq={}, even head_dim={} (<=256); \
+                "capture-safe fp16 split-K flash-decode: q_seq={}, even head_dim={} (<=512); \
                  active split count (up to {}) chosen on-device from the valid length \
                  and a host occupancy target that fills the multiprocessors",
                 q_seq,
@@ -2910,7 +2910,7 @@ impl GroupQueryAttentionKernel {
         } else if q.dtype == DataType::BFloat16 && gqa_decode_bf16::supported(q_seq, dim) {
             onnx_runtime_ep_api::record_kernel_variant!(
                 "attention_gqa_decode_bf16_splitk",
-                "capture-safe bf16 split-K flash-decode: q_seq={}, even head_dim={} (<=256); \
+                "capture-safe bf16 split-K flash-decode: q_seq={}, even head_dim={} (<=512); \
                  active split count (up to {}) chosen on-device from the valid length \
                  and a host occupancy target that fills the multiprocessors",
                 q_seq,
