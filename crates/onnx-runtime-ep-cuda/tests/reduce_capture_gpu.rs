@@ -12,7 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! CUDA-graph capture coverage for the float (`f32`/`f16`) cuDNN reduce path.
+//! CUDA-graph capture coverage for the float (`f32`/`f16`) reduce paths.
 //!
 //! Before Lever A, every `f32`/`f16` `ReduceSum`/`ReduceMean` took the cuDNN
 //! branch, which allocated a fresh device workspace (`cuMemAlloc`) per call and
@@ -22,12 +22,16 @@
 //! of times per decode step (256 experts × 40 layers on Qwen3.6-35B-A3B), which
 //! is 98%+ of the eager seams that made native decode host/sync-bound.
 //!
-//! The fix caches the cuDNN descriptors + workspace across calls with a stable
-//! signature and gates the trailing sync on `!capturing`, so a warmed
-//! fixed-shape float reduce records cleanly into a captured segment. These
-//! tests prove:
+//! Lever A cached the cuDNN descriptors + workspace across calls with a stable
+//! signature and gated the trailing sync on `!capturing`. `ReduceKernel` now
+//! also routes **well-parallelised** f32 sum/mean (enough outputs to fill the
+//! SMs, or a small per-output group — the common decode shape) to the same
+//! capture-safe NVRTC block reduction f16/bf16 already use, and keeps cuDNN only
+//! for the low-parallelism "few outputs, huge group" regime. Both paths record
+//! cleanly into a captured segment. These tests prove:
 //!   * a warmed float reduce reports capture-supported and its captured replay
-//!     is **byte-identical** to the eager result (both f16 and f32);
+//!     is **byte-identical** to the eager result (both f16 and f32, and both the
+//!     NVRTC and the retained-cuDNN f32 regimes);
 //!   * the descriptor/workspace cache repopulates correctly when the input shape
 //!     changes across eager calls (no stale workspace → no wrong bytes);
 //!   * a signature change *during* capture is rejected (no silent stale reuse).
@@ -234,14 +238,30 @@ fn varied(count: usize, seed: f32) -> Vec<f32> {
 /// assert the replayed output is byte-identical to the eager output and matches
 /// the f32 oracle. Runs several decode steps with fresh inputs each step.
 fn capture_matches_eager_and_oracle(op: &str, dtype: DataType, is_mean: bool) {
+    // Router-style shape: [1,5,8] reduce trailing axis -> [1,5,1], keepdims.
+    // 5 outputs / 8-element groups is the well-parallelised regime, so f32
+    // takes the NVRTC block reduction (the f16/bf16 default); f16 always does.
+    capture_matches_eager_and_oracle_shape(op, dtype, is_mean, 5, 8);
+}
+
+/// Same capture/oracle contract for the **low-parallelism** f32 regime
+/// (`out_count` below the SM count *and* a large per-output group), where
+/// `ReduceKernel` keeps the cuDNN `cudnnReduceTensor` path. Guards that the
+/// retained cuDNN reduce still records cleanly into a single captured segment
+/// and stays byte-identical to eager — coverage that the well-parallelised
+/// shapes above now route to NVRTC instead.
+fn capture_matches_eager_and_oracle_shape(
+    op: &str,
+    dtype: DataType,
+    is_mean: bool,
+    rows: usize,
+    cols: usize,
+) {
     let ep = require_cuda();
     let runtime = ep.runtime();
 
-    // Router-style shape: [1,5,8] reduce trailing axis -> [1,5,1], keepdims.
-    let in_shape = [1usize, 5, 8];
-    let out_shape = [1usize, 5, 1];
-    let rows = 5usize;
-    let cols = 8usize;
+    let in_shape = [1usize, rows, cols];
+    let out_shape = [1usize, rows, 1];
     let n = rows * cols;
     let axes_values = [2i64];
 
@@ -394,6 +414,28 @@ fn f32_reduce_sum_captures_and_matches_eager() {
 #[test]
 fn f32_reduce_mean_captures_and_matches_eager() {
     capture_matches_eager_and_oracle("ReduceMean", DataType::Float32, true);
+}
+
+/// Low-parallelism f32 regime (1 output, 4096-element group) — below the SM
+/// count with a large group, so `ReduceKernel` keeps the cuDNN reduce. Proves
+/// the retained cuDNN f32 capture path still folds into one segment and matches
+/// eager/oracle after the well-parallelised shapes were rerouted to NVRTC.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn f32_low_parallelism_reduce_sum_uses_cudnn_and_captures() {
+    capture_matches_eager_and_oracle_shape("ReduceSum", DataType::Float32, false, 1, 4096);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn f32_low_parallelism_reduce_mean_uses_cudnn_and_captures() {
+    capture_matches_eager_and_oracle_shape("ReduceMean", DataType::Float32, true, 1, 4096);
 }
 
 /// A single kernel driven across two shapes to prove the cache key includes the

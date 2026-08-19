@@ -1,15 +1,19 @@
 //! GPU **reductions** over arbitrary axes with `keepdims`
 //! (`docs/execution/CUDA_COVERAGE.md`, "Normalization & softmax" / reduce rows).
 //!
-//! `ReduceSum` and `ReduceMean` use `cudnnReduceTensor` for f32 (native f32
-//! comp type). f16 and bf16 use the typed NVRTC block reduction, which does
-//! fp16/bf16 IO with f32 register accumulation in a single capture-safe kernel.
-//! For f16 this deliberately avoids cuDNN's fp16↔fp32 `op_tensor` cast +
-//! fp32-ReduceSum round-trip (cuDNN rejects a half `reduceTensorCompType` and
-//! forces `CUDNN_DATA_FLOAT`); bf16 cannot be reduced by cuDNN at all (rejected
-//! even with an f32 comp type — `CUDNN_STATUS_NOT_SUPPORTED`). That same NVRTC
-//! path also runs for f32 when cuDNN is absent.
-//! `ReduceMax`/`ReduceMin` always use NVRTC.
+//! `ReduceSum` and `ReduceMean` prefer the typed NVRTC block reduction, which
+//! does f32/fp16/bf16 IO with f32 register accumulation in a single
+//! capture-safe kernel (one block per output element). f16 and bf16 always take
+//! it: cuDNN rejects a half `reduceTensorCompType` and forces
+//! `CUDNN_DATA_FLOAT` (an fp16↔fp32 `op_tensor` cast + fp32-ReduceSum
+//! round-trip), and bf16 is rejected entirely (`CUDNN_STATUS_NOT_SUPPORTED`).
+//! f32 also takes it whenever the reduction is well-parallelised (enough output
+//! elements to fill the SMs, or a small per-output group) — the common decode
+//! case — where cuDNN's generic reduce carries dominant per-launch overhead;
+//! f32 falls back to `cudnnReduceTensor` only for the low-parallelism
+//! "few outputs, huge group" regime (e.g. a global reduce-all), where cuDNN's
+//! multi-block reduce beats a single serialising block. It also uses NVRTC for
+//! f32 when cuDNN is absent. `ReduceMax`/`ReduceMin` always use NVRTC.
 //!
 //! `cub::DeviceReduce` / `DeviceSegmentedReduce` are the vendor primitives for
 //! reductions, and a segmented block reduction is exactly the shape they use.
@@ -1036,26 +1040,58 @@ impl ReduceKernel {
             return Ok(());
         }
 
-        // cuDNN reduces f32 with a native f32 comp type — byte-identical to the
-        // typed NVRTC block reduction but on cuDNN's tuned kernels — so f32 sum/
-        // mean stays here. f16 does **not**: `cudnnReduceTensor` rejects a half
+        // f32 sum/mean routing: cuDNN vs the typed NVRTC block reduction.
+        //
+        // The NVRTC block reduction assigns **one block per output element** and
+        // does a cooperative f32 tree-reduce over that element's group. It beats
+        // cuDNN's generic `cudnnReduceTensor` whenever the work is
+        // well-parallelised — either there are enough output elements to fill
+        // the SMs, or the per-output reduction group is small enough that one
+        // block sweep finishes cheaply. cuDNN only wins the pathological
+        // "few outputs, huge group" regime (e.g. a global reduce-all over a
+        // large tensor), where a single block would serialise the whole
+        // reduction; there we keep cuDNN's multi-block reduce.
+        //
+        // On the qwen3.5-0.8b-hybrid decode the gated-delta q/k L2-norm SumSq is
+        // an f32 `ReduceSum` over `d_k` (16 outputs × 128 elements, 36×/step) and
+        // is the single **largest** decode op (~11-13% of forward op time,
+        // Deckard `.squad/decisions/inbox/deckard-fair-hybrid-gap.md`). cuDNN's
+        // generic reduce carries per-launch overhead that dominates at that tiny
+        // decode shape; the block reduction runs it as one capture-safe kernel.
+        // Routing f32 here is the exact fp32 analogue of the f16/bf16 routing
+        // that already falls through below (#1486), and the choice is a general
+        // parallelism property (SM count + group size), never a per-model shape.
+        //
+        // f16/bf16 never enter this branch: `cudnnReduceTensor` rejects a half
         // `reduceTensorCompType` and forces `CUDNN_DATA_FLOAT`, which cuDNN
         // implements as an fp16→fp32 `op_tensor` cast, an fp32 ReduceSum, and an
         // fp32→fp16 cast — a three-kernel round-trip through a full-size fp32
-        // temporary. A captured-graph node trace of the qwen3.5-0.8b-hybrid
-        // decode (Deckard, `.squad/decisions/inbox/deckard-fair-hybrid-gap.md`)
-        // measured that fragmentation at ~20.7% of decode GPU-kernel time on the
-        // SSM/linear-attention path (cudnn ReduceSum 8.1% + fp16↔fp32 op_tensor
-        // casts 2.7%, firing 18× per step). The typed NVRTC block reduction
-        // below already does fp16 IO with fp32 register accumulation — the exact
-        // ONNX accumulate-in-f32-then-cast rule — in a **single** capture-safe
-        // kernel, with no fp32 temporary and half the memory traffic, so f16
-        // sum/mean is routed there instead. This is general across all shapes/
-        // axes/dims (the same path already serves bf16 and every extended f16
-        // reduction), not a per-model special case. bf16 cannot be reduced by
-        // cuDNN at all (`CUDNN_STATUS_NOT_SUPPORTED`, cuDNN 9.10/9.20) and also
-        // falls through below.
+        // temporary — while bf16 cannot be reduced by cuDNN at all
+        // (`CUDNN_STATUS_NOT_SUPPORTED`, cuDNN 9.10/9.20). Both take the single
+        // fused fp16/bf16-IO f32-accumulation block reduction below instead.
+        //
+        // `out_count_hint`/`reduce_count_hint` mirror `build_plan`'s
+        // `base.len()`/`delta.len()` (product of kept / reduced dims); the
+        // identity (no-axis) case already returned above.
+        let reduce_count_hint: usize = x
+            .shape
+            .iter()
+            .zip(reduce.iter())
+            .filter(|&(_, &r)| r)
+            .map(|(&d, _)| d)
+            .product();
+        let out_count_hint: usize = x
+            .shape
+            .iter()
+            .zip(reduce.iter())
+            .filter(|&(_, &r)| !r)
+            .map(|(&d, _)| d)
+            .product();
+        let sm_count = self.runtime.capabilities().multiprocessor_count() as usize;
+        let block_reduction_parallel =
+            out_count_hint >= sm_count || reduce_count_hint <= REDUCE_BLOCK as usize;
         if x.dtype == DataType::Float32
+            && !block_reduction_parallel
             && let Some(cudnn_op) = cudnn_op
             && self.runtime.cudnn().is_available()
         {
