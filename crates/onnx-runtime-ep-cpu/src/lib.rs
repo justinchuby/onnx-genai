@@ -182,7 +182,17 @@ mod feature_default_guard {
     /// against one hand-written file whose shape is fixed by
     /// `feature_lists_are_read_not_guessed`.
     fn feature_list(manifest: &str, name: &str) -> Vec<String> {
-        let Some(start) = manifest.find(&format!("\n{name} = [")) else {
+        // Find `name = [` at the start of a line, tolerating any spacing around
+        // the `=`. Anchoring on one exact spelling would let a reformat turn a
+        // populated feature into a silently empty one, which is the direction
+        // this guard must never fail in.
+        let start = manifest.lines().enumerate().find_map(|(i, line)| {
+            let rest = line.strip_prefix(name)?.trim_start();
+            let rest = rest.strip_prefix('=')?.trim_start();
+            rest.starts_with('[')
+                .then(|| manifest.lines().take(i).map(|l| l.len() + 1).sum::<usize>())
+        });
+        let Some(start) = start else {
             return Vec::new();
         };
         let open = manifest[start..].find('[').expect("array opens") + start;
@@ -223,6 +233,29 @@ mod feature_default_guard {
         assert!(
             feature_list(synthetic, "full").iter().any(|f| f == "mlas"),
             "a `full` umbrella that gained MLAS must be visible to the reader"
+        );
+
+        // Spacing must not turn a populated feature into an empty one: an
+        // empty read is a *pass* for every caller, so the reader has to be
+        // insensitive to formatting the manifest is free to change.
+        for spelling in [
+            "full=[\"mlas\"]",
+            "full  =  [\"mlas\"]",
+            "full\t= [\"mlas\"]",
+        ] {
+            let manifest = format!("\n[features]\n{spelling}\n");
+            assert_eq!(
+                feature_list(&manifest, "full"),
+                vec!["mlas".to_string()],
+                "`{spelling}` must read the same as the canonical spelling"
+            );
+        }
+
+        // A feature name must not match as a suffix or a prefix of another.
+        let neighbours = "\nnot-full = [\"mlas\"]\nfull-extra = [\"mlas\"]\n";
+        assert!(
+            feature_list(neighbours, "full").is_empty(),
+            "`full` must not be found inside `not-full` or `full-extra`"
         );
     }
 }

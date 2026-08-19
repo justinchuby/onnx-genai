@@ -1085,7 +1085,11 @@ mod tests {
 
         enable();
         record_with(|| build(&built));
-        assert_eq!(built.get(), 1, "an enabled ledger must build it exactly once");
+        assert_eq!(
+            built.get(),
+            1,
+            "an enabled ledger must build it exactly once"
+        );
         assert!(
             snapshot()
                 .iter()
@@ -1214,5 +1218,62 @@ mod tests {
         ));
         #[cfg(target_arch = "aarch64")]
         assert_eq!(Isa::host(), Isa::Neon);
+    }
+
+    /// Every production dispatch site reaches the ledger through the *lazy*
+    /// [`record_with`], never the eager [`record`].
+    ///
+    /// [`record_with_does_not_build_an_observation_while_disabled`] proves the
+    /// primitive is lazy. It cannot prove the callers use it. Swapping any one
+    /// site to `record(Observation::gemm(..))` would put [`Isa::host`] and
+    /// [`thread_degree`] — an FFI call in an MLAS build — back on a hot path
+    /// that is supposed to cost one relaxed load, and every other test in this
+    /// crate would still pass. So the sites are asserted, by name, here.
+    ///
+    /// Reading the sources rather than the behaviour is deliberate: the
+    /// difference between eager and lazy is invisible from outside the process
+    /// once the observation is discarded, and there is no runtime hook that
+    /// distinguishes them at a call site.
+    #[test]
+    fn production_dispatch_sites_record_lazily() {
+        // (file, source, how many sites are expected to record)
+        let sites: &[(&str, &str, usize)] = &[
+            ("kernels/matmul.rs", include_str!("kernels/matmul.rs"), 1),
+            (
+                "kernels/simd_activations.rs",
+                include_str!("kernels/simd_activations.rs"),
+                2,
+            ),
+            ("kernels/softmax.rs", include_str!("kernels/softmax.rs"), 1),
+        ];
+
+        for (name, source, expected) in sites {
+            let lazy = source.matches("record_with(").count();
+            assert_eq!(
+                lazy, *expected,
+                "{name} must reach the ledger through `record_with` at exactly \
+                 {expected} site(s); found {lazy}. If a dispatch site was added \
+                 or removed on purpose, update the count here and say why."
+            );
+
+            // `record(` but not `record_with(` and not `..._record(`: the eager
+            // form. Scanning for the bare identifier avoids matching
+            // `record_with`, whose next byte is `_`.
+            let eager: Vec<usize> = source
+                .match_indices("record(")
+                .filter(|(i, _)| {
+                    let before = source[..*i].chars().next_back();
+                    !matches!(before, Some(c) if c.is_alphanumeric() || c == '_')
+                })
+                .map(|(i, _)| source[..i].lines().count() + 1)
+                .collect();
+            assert!(
+                eager.is_empty(),
+                "{name} calls the eager `record` at line(s) {eager:?}. Production \
+                 dispatch must use `record_with(|| ..)`, or building the \
+                 observation costs an ISA probe and a thread-degree call on \
+                 every dispatch even when the ledger is off."
+            );
+        }
     }
 }
