@@ -5278,11 +5278,25 @@ mod tests {
                 if !crate::backend::has_simd_x86() {
                     continue; // No AVX2/FMA: the blocked half GEMM still runs.
                 }
-                assert_eq!(
-                    half_prefill_gebp_calls(),
-                    1,
-                    "{dtype:?} m={m}: prefill did not take the fused widen-pack GEBP"
-                );
+                // Built with the non-default `mlas` feature, an x86 host
+                // auto-detects `CpuBackend::Mlas`, and `try_packed_half_prefill`
+                // claims contiguous f16 prefill before `try_matmul_half` is
+                // reached. bf16 has no such interception, and the shipped
+                // default artifact carries no MLAS at all -- so this is about
+                // which route an opt-in build takes, not about the numbers,
+                // which are still checked below either way.
+                #[cfg(feature = "mlas")]
+                let mlas_claims_this = dtype == DataType::Float16
+                    && CpuBackend::auto_detect() == crate::backend::CpuBackend::Mlas;
+                #[cfg(not(feature = "mlas"))]
+                let mlas_claims_this = false;
+                if !mlas_claims_this {
+                    assert_eq!(
+                        half_prefill_gebp_calls(),
+                        1,
+                        "{dtype:?} m={m}: prefill did not take the fused widen-pack GEBP"
+                    );
+                }
 
                 let expected = naive_matmul(&a_data, &b_data, m, k, n);
                 for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
