@@ -8,20 +8,21 @@ tags:
   - ep
   - contracts
 status: maintained
+lang: zh-CN
 created: 2026-08-17
-updated: 2026-08-17
+updated: 2026-08-19
 ---
 
 # Execution Provider Contract
 
-> [!summary] Question answered
-> What must an execution provider promise to the native runtime, and which responsibilities stay outside the EP?
+> [!summary] 回答的问题
+> 一个 execution provider 必须向原生运行时承诺什么?哪些职责应留在 EP 之外?
 
-An execution provider turns graph nodes into executable kernels for one device
-class. The shared contract lives in `onnx-runtime-ep-api`; CPU, CUDA and dynamic
-providers differ in implementation, not in the session's conceptual model.
+execution provider(执行提供者,EP)把图节点转化为针对某一类设备的可执行 kernel。
+共享契约位于 `onnx-runtime-ep-api`;CPU、CUDA 与动态 provider 的差别在于实现,而不
+在于 session 的概念模型。
 
-## Core lifecycle
+## 核心生命周期
 
 ```mermaid
 sequenceDiagram
@@ -40,93 +41,92 @@ sequenceDiagram
     S->>E: shutdown()
 ```
 
-The runtime relies on claim honesty: an EP must not claim a node and then discover
-ordinary unsupported shape/dtype conditions only after execution begins.
+运行时依赖“认领的诚实性”:EP 不得先认领一个节点,然后在执行开始后才发现普通的、
+不受支持的 shape/dtype 情况。
 
-## Contract surfaces
+## 契约面
 
-| Surface | Purpose |
+| 契约面 | 用途 |
 |---|---|
-| Identity | Stable name, `DeviceType`, and `DeviceId` |
-| Capability | Explain whether a node/opset/shape/dtype/layout is supported |
-| Compilation | Produce a session-lifetime kernel or compiled partition |
-| Tensor views | Borrow device memory without pretending host dereference is valid |
-| Allocation | Create/release buffers and optional mapped backing |
-| Transfer | Synchronous/asynchronous copy and fence ordering |
-| Capture | Declare, begin, end, abort and replay device graph capture |
-| Weights | Negotiate resident, lazy or paged weight delivery |
-| Optimization | Supply EP-specific graph passes |
-| Diagnostics | Record why a fast path or claim was rejected |
+| Identity | 稳定的名称、`DeviceType` 与 `DeviceId` |
+| Capability | 说明某个 node/opset/shape/dtype/layout 是否受支持 |
+| Compilation | 产出 session 生命周期的 kernel 或已编译的分区 |
+| Tensor views | 借用设备内存,而不假装 host 解引用有效 |
+| Allocation | 创建/释放 buffer 以及可选的映射 backing |
+| Transfer | 同步/异步拷贝与 fence 顺序 |
+| Capture | 声明、开始、结束、中止与重放设备 graph capture |
+| Weights | 协商 resident、lazy 或 paged 的权重交付方式 |
+| Optimization | 提供 EP 专属的图 pass |
+| Diagnostics | 记录某条快路径或某个认领被拒绝的原因 |
 
-## Claim discipline
+## 认领纪律
 
-An unsupported result should name:
+一个 unsupported 结果应指明:
 
 - node/op/domain/opset;
-- rejected dtype, shape, layout or attribute;
-- selected device/EP;
-- what the EP accepts;
-- a useful remediation where possible.
+- 被拒绝的 dtype、shape、layout 或 attribute;
+- 选中的设备/EP;
+- 该 EP 接受什么;
+- 尽可能给出有用的补救建议。
 
-Returning `Unsupported` is normal. Claiming and later failing is a contract bug
-unless the failure depends on truly runtime-only state.
+返回 `Unsupported` 是正常的。先认领、后失败则是契约缺陷,除非该失败确实依赖于
+真正只在运行时才可知的状态。
 
-> [!important] Capability is a proof
-> Hot execution paths should consume a resolved capability or compiled kernel,
-> not repeat broad discovery and rediscover late failure.
+> [!important] Capability 是一种证明
+> 热执行路径应当消费一个已解析的 capability 或已编译的 kernel,而不是重复宽泛的
+> 发现过程并再次遇到迟到的失败。
 
-## Ownership
+## 所有权
 
-Current `DeviceBuffer` ownership is explicit:
+当前 `DeviceBuffer` 的所有权是显式的:
 
-- an owned buffer is created by one EP/mechanism;
-- it must be released exactly once through the matching path;
-- cross-device or cross-EP free is invalid;
-- borrowed views do not own backing memory;
-- raw pointers never extend the lifetime of their owner.
+- 一个 owned buffer 由某个 EP/机制创建;
+- 它必须通过匹配的路径恰好释放一次;
+- 跨设备或跨 EP 的释放是无效的;
+- borrowed view 不拥有 backing 内存;
+- 裸指针绝不延长其所有者的生命周期。
 
-The current buffer has no automatic `Drop` because GPU release can require
-context and stream synchronization. The proposed evolution is explained in
-[[memory/Memory Management for Beginners]].
+当前的 buffer 没有自动 `Drop`,因为 GPU 释放可能需要 context 与 stream 同步。
+提议中的演进方向见 [[memory/Memory Management for Beginners]]。
 
-## Kernel boundary
+## Kernel 边界
 
-The kernel sees typed tensor views, output/workspace views and execution context.
-Important invariants include:
+kernel 看到的是带类型的 tensor view、输出/workspace view 与执行 context。
+重要的不变量包括:
 
-- shapes, dtypes and layouts match the compiled claim;
-- mutable outputs do not alias illegally;
-- device pointers are opaque on the host;
-- workspace lifetime matches its declaration;
-- asynchronous work is ordered through fences/streams;
-- kernel errors do not panic across FFI boundaries.
+- shape、dtype 与 layout 与已编译的认领相符;
+- 可变输出不发生非法 alias;
+- 设备指针在 host 上是不透明的;
+- workspace 生命周期与其声明一致;
+- 异步工作通过 fence/stream 排序;
+- kernel 错误不跨 FFI 边界 panic。
 
-## What the EP does not own
+## EP 不拥有什么
 
-The EP should not decide:
+EP 不应决定:
 
-- request priority or batch admission;
-- which user's KV should be preempted;
-- global model residency policy;
-- prompt, sampling or stop semantics;
-- model-family-specific behavior.
+- 请求优先级或 batch 准入;
+- 应抢占哪个用户的 KV;
+- 全局模型 residency 策略;
+- prompt、sampling 或 stop 语义;
+- 特定模型族的行为。
 
-Those belong to the scheduler, holders, generation engine or metadata contracts.
+这些属于 scheduler、holder、generation engine 或元数据契约。
 
-## Conformance
+## 一致性
 
-Conformance is layered:
+一致性是分层的:
 
-1. Focused kernel tests for shape/dtype/attribute behavior.
-2. End-to-end loader → optimizer → session → EP comparisons with ONNX reference.
-3. Per-EP expected support/decline profiles.
-4. Plugin trait/C-ABI parity tests.
-5. Real-model parity and backend comparisons.
+1. 针对 shape/dtype/attribute 行为的聚焦 kernel 测试。
+2. 端到端 loader → optimizer → session → EP 与 ONNX 参考实现的对比。
+3. 每个 EP 预期的支持/拒绝画像。
+4. 插件 trait/C-ABI 对等测试。
+5. 真实模型的对齐与后端对比。
 
-Coverage counts are not full ONNX conformance. A passing operator name at one
-dtype/opset/shape does not prove its entire schema.
+覆盖计数并不等于完整的 ONNX 一致性。某个算子名在某一 dtype/opset/shape 下通过,
+并不能证明其整个 schema。
 
-## Formal sources
+## 正式来源
 
 - [`onnx-runtime-ep-api`](../../crates/onnx-runtime-ep-api/src/lib.rs)
 - [`ExecutionProvider`](../../crates/onnx-runtime-ep-api/src/provider.rs)
@@ -134,7 +134,7 @@ dtype/opset/shape does not prove its entire schema.
 - [`EP_CONFORMANCE.md`](../../docs/execution/EP_CONFORMANCE.md)
 - [`NXRT_ABI.md`](../../docs/architecture/NXRT_ABI.md)
 
-## Related notes
+## 相关笔记
 
 - [[execution/CPU Execution Provider]]
 - [[execution/CUDA Execution Provider]]

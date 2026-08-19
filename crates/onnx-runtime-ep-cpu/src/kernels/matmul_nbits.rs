@@ -905,9 +905,13 @@ thread_local! {
 #[cfg(feature = "mlas")]
 #[inline]
 fn with_mlas_packed_caches<R>(f: impl FnOnce(&MlasPackedCaches) -> R) -> R {
+    // Exactly one of these blocks survives cfg-stripping, so whichever it is
+    // becomes the tail expression. An early `return` in the first reads more
+    // obviously but trips `needless_return`, which reaches the `-D warnings`
+    // lane whenever the research `mlas` feature is on.
     #[cfg(test)]
     {
-        return MLAS_PACKED_TEST_LOCAL.with(|caches| f(caches));
+        MLAS_PACKED_TEST_LOCAL.with(|caches| f(caches))
     }
     #[cfg(not(test))]
     {
@@ -17806,29 +17810,49 @@ mod tests {
     /// The flat fan-out must actually reach the task runtime, not fall back to
     /// running inline: the whole point of routing it there is the ~5 us dispatch
     /// to a resident worker instead of a 67-226 us Rayon park wake-up.
+    ///
+    /// Routing reads `rayon::current_num_threads()`, and below
+    /// [`MIN_ROUTED_FAN_OUT_WIDTH`] the fan-out is *supposed* to stay on Rayon.
+    /// So on any host narrower than that -- every stock CI runner -- asserting a
+    /// dispatch asserts something policy never promised. Installing a pool of
+    /// exactly the routing width makes the decision under test the same one on
+    /// a 4-vCPU runner as on a 32-thread workstation, instead of silently
+    /// testing the host.
     #[test]
     fn parallel_output_rows_dispatches_to_the_task_runtime() {
         if crate::task_runtime::width() <= 1 {
             return;
         }
         let (n, k) = (6144usize, 4096usize);
-        assert!(
-            output_chunk_len(n, k) < n,
-            "the partition policy declined to split {n}x{k}, so this test \
-             cannot observe a dispatch"
-        );
         let mut result = vec![0.0f32; n];
-        let before = crate::task_runtime::testing::counters();
-        parallel_output_rows(&mut result, k, |start, outputs| {
-            for (offset, output) in outputs.iter_mut().enumerate() {
-                *output = (start + offset) as f32;
-            }
+        let routing_width = rayon::ThreadPoolBuilder::new()
+            .num_threads(MIN_ROUTED_FAN_OUT_WIDTH)
+            .build()
+            .expect("could not build a routing-width Rayon pool");
+        let (before, after) = routing_width.install(|| {
+            // Inside the pool: `output_chunk_len` reads the same Rayon width the
+            // routing decision does, so the precondition and the behaviour under
+            // test have to be evaluated against the same one.
+            assert!(
+                output_chunk_len(n, k) < n,
+                "the partition policy declined to split {n}x{k}, so this test \
+                 cannot observe a dispatch"
+            );
+            let before = crate::task_runtime::testing::counters();
+            parallel_output_rows(&mut result, k, |start, outputs| {
+                for (offset, output) in outputs.iter_mut().enumerate() {
+                    *output = (start + offset) as f32;
+                }
+            });
+            (before, crate::task_runtime::testing::counters())
         });
-        let after = crate::task_runtime::testing::counters();
         assert!(
             after.dispatches > before.dispatches,
             "the flat fan-out published no task-runtime dispatch"
         );
+        for (index, value) in result.iter().enumerate() {
+            assert_eq!(*value, index as f32, "output row {index} was not written");
+        }
     }
 
     /// The regression the `calls` argument exists to prevent: a projection that
