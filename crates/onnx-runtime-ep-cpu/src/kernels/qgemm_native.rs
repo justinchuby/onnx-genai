@@ -1085,6 +1085,15 @@ mod tests {
     }
 
     /// `k == 0` contributes nothing, and `m == 0` / `n == 0` must not index.
+    ///
+    /// The zero-point slices are sized to `m` and `n` even in the cases that
+    /// return immediately. [`qgemm`] documents them as one entry per row of `A`
+    /// and per column of `B`, and asserts exactly that on entry; a caller whose
+    /// `m` is zero still has `n` columns and still knows their zero points.
+    /// Passing `&[]` for a non-zero `n` here tested the early return against a
+    /// call the function does not accept — it passed only because
+    /// `debug_assert` compiles out under `--release`, and failed the moment the
+    /// same test ran in a debug profile.
     #[test]
     fn degenerate_extents_do_nothing() {
         let empty: Vec<u8> = Vec::new();
@@ -1093,7 +1102,7 @@ mod tests {
             signed: false,
         };
         let mut out: Vec<i32> = Vec::new();
-        qgemm(a, a, &[], &[], 0, 4, 4, &mut out);
+        qgemm(a, a, &[], &[0, 0, 0, 0], 0, 4, 4, &mut out);
         qgemm(a, a, &[1, 2], &[], 2, 4, 0, &mut out);
         let mut kept = vec![7i32; 6];
         qgemm(a, a, &[1, 2], &[1, 2, 3], 2, 0, 3, &mut kept);
