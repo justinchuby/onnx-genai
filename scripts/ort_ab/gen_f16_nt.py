@@ -19,8 +19,10 @@ separate those two things; this pairing can.
 
 `M` is swept because the suspected cost is paid per row-block rather than per
 row, which predicts a gap that grows with `M` and with thread count. `M = 1` is
-included as a negative control: it routes to `half_gemv`, not to this GEMM, so
-it should show no NT/NN difference at all.
+included because it is the cell #1417 addresses: as of `e13460af6` it still
+falls into this same blocked GEMM and so shows the layout penalty too. #1417
+routes `M = 1` to `half_gemv` instead, which is the better fix for that row, so
+`M = 1` is reported separately rather than folded into the prefill matrix.
 
 SYNTHETIC DATA NOTICE: no trained weights. Only the hidden sizes come from
 public model configs (Qwen3-8B 3584, Llama-3-8B 4096, Qwen3-0.6B 1024); tensor

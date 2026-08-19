@@ -412,7 +412,9 @@ new intrinsics, no new architecture gates). Columns are handled `TRANSPOSED_PACK
 time so the transposing stores are contiguous too; the group width is swept in the constant's docs.
 
 **27 cells across three geometries, 27 wins, 1.29x-2.66x.** The headline cell, `M = 128 / t = 8`,
-goes **16.0x -> 7.0x** against ORT. Results are **bit-identical** — widening is exact and
+goes **14.0x -> 7.0x** against ORT within one invocation (the 15.99x above is the same cell from a
+separate reproduction run; before/after must come from one run). Results are **bit-identical** —
+widening is exact and
 elementwise, so fill order cannot change the packed panel, and
 `transposed_b_is_bit_identical_to_pre_transposed_row_major` asserts `to_bits()` equality on every
 execution path rather than a tolerance.

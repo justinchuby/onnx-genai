@@ -131,6 +131,15 @@ execution path including `Scalar`. End-to-end `parity=PASS` against ORT on the p
 `a_layout_strided_in_both_directions_still_packs_correctly` pins the general branch, so the fast
 path cannot quietly become the only column-strided route.
 
+One behaviour genuinely does change, and it is worth stating rather than leaving to be discovered:
+on x86, transposed `B` now converts through F16C `_mm256_cvtph_ps` instead of scalar
+`half::f16::to_f32`. `f16 -> f32` is exact for every finite value, subnormal and infinity — `f32`
+strictly contains `f16` — so the two can differ only in the *payload bits of a NaN*. That cannot
+affect a GEMM result beyond NaN-ness, and it makes the transposed path agree with the row-major
+path, which has always used F16C. The bit-identity test's `sin`/`cos` data never generates NaN, so
+the test does not cover this; the claim it makes is the fill-order one, which is the claim that
+matters for the change.
+
 ## Results
 
 27 NT cells, three geometries x `M` x threads. Native-only `p50`, ms. `null` is the base binary
@@ -171,8 +180,13 @@ trials, 21 runs / 7 warmups each.
 `qwen3_8b m32 t=1` (7.5%) and `qwen3_0p6b m32 t=16` (19.5%) — and both still win by far more than
 their own noise floor, but they are the two cells to distrust.
 
-The headline row, the one the previous document left open: **`M = 128`, `t = 8`, 16.0x -> 7.0x
-against ORT.**
+The headline row, the one the previous document left open: **`M = 128`, `t = 8`, 14.0x -> 7.0x.**
+
+That before/after pair is the `base` and `new` columns of the *same* invocation, which is the only
+comparison this harness licenses. The 15.99x quoted at the top of this document came from the
+separate reproduction run above; ORT's own measured time differs between the two sessions (5.99 vs
+5.70 ms), which is exactly why cells from different invocations must not be pasted into one row.
+The change is the same size either way; only the denominator moved.
 
 ### The negative control: row-major `B` is untouched
 

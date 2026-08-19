@@ -674,6 +674,11 @@ const TRANSPOSED_PACK_GROUP: usize = 4;
 /// NEON widening the row-major path gets. Columns are processed
 /// `TRANSPOSED_PACK_GROUP` at a time so the transposing stores are contiguous
 /// too.
+///
+/// On x86 this moves transposed `B` from scalar `half::f16::to_f32` onto F16C,
+/// the same converter the row-major path already used. `f16 -> f32` is exact
+/// for every finite value, subnormal and infinity, so the only inputs on which
+/// the two converters can disagree are NaNs, and only in the payload bits.
 #[allow(clippy::too_many_arguments)]
 fn pack_b_transposed<T: HalfElement>(
     source: &[u16],
@@ -688,6 +693,11 @@ fn pack_b_transposed<T: HalfElement>(
     debug_assert_eq!(packed.len(), panel_depth * panel_columns);
     debug_assert!(panel_depth <= KC);
 
+    // Sized by the `panel_depth <= KC` invariant above: the only caller passes
+    // `KC.min(k - depth_start)`. The zeroing is dead -- every lane written to
+    // `widened` is fully overwritten by `pack_contiguous` before it is read --
+    // but it is 2 KiB of stack per call and avoiding it would mean
+    // `MaybeUninit`, which is not worth the `unsafe` here.
     let mut widened = [0.0f32; TRANSPOSED_PACK_GROUP * KC];
     for group_start in (0..panel_columns).step_by(TRANSPOSED_PACK_GROUP) {
         let group = TRANSPOSED_PACK_GROUP.min(panel_columns - group_start);
