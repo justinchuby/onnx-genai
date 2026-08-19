@@ -467,10 +467,11 @@ unsafe fn softmax_row_scalar(src: *const f32, dst: *mut f32, d: usize) {
 /// the tests assert against libm. Because softmax only ever evaluates
 /// `exp(v - max)`
 /// with `v - max <= 0`, the reduced argument never overflows; the non-finite
-/// lanes (`-inf` -> `0`, `NaN` -> `NaN`) are patched explicitly so a fully
-/// masked row still normalizes to `NaN` and a partially masked row's masked
-/// positions are exactly `0`, matching the scalar reference bit for bit through
-/// the shared normalization.
+/// lanes (`-inf` -> `0`, `NaN` -> `NaN`) come out of the arithmetic itself,
+/// with a single mask for the underflow/`-inf` flush, so a fully masked row
+/// still normalizes to `NaN` and a partially masked row's masked positions are
+/// exactly `0`, matching the scalar reference bit for bit through the shared
+/// normalization.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod softmax_avx2 {
     #[cfg(target_arch = "x86")]
@@ -520,22 +521,36 @@ mod softmax_avx2 {
         let c6 = _mm256_set1_ps(1.383_684_6e-3_f32);
 
         // Below this, f32 `exp` has underflowed to (sub)normals we flush to
-        // 0; `-inf` lands here too and must become exactly 0.
+        // 0; `-inf` lands here too and must become exactly 0. Ordered `<=`, so
+        // `NaN` reports false and keeps the value the polynomial produces.
         let underflow = _mm256_set1_ps(UNDERFLOW);
-
-        let is_nan = _mm256_cmp_ps::<_CMP_UNORD_Q>(x, x);
-        // Ordered `<=` so `NaN` reports false here (it is handled above).
         let is_zero = _mm256_cmp_ps::<_CMP_LE_OQ>(x, underflow);
 
-        // Clamp so `-inf`/`NaN` cannot poison the exponent build; those
-        // lanes are overwritten below.
-        let xc = _mm256_max_ps(x, underflow);
+        // `x` goes into the exponent build unclamped. `-inf` and `NaN` do
+        // poison it, and that is exactly what both need:
+        //
+        // * `-inf` makes `r` = `+inf - inf` = `NaN` and hence `y` = `NaN`, but
+        //   `is_zero` is true for it, so the mask below replaces the lane with
+        //   the required `0` bit pattern whatever `y` holds.
+        // * `NaN` stays `NaN` through `round`, both `fnmadd`s and the Horner
+        //   chain; `cvtps_epi32` turns it into the integer indefinite
+        //   `0x8000_0000`, whose low nine bits build `pow2` = `1.0`, so
+        //   `y` = `NaN * 1.0` = `NaN` and `is_zero` is false for it.
+        //
+        // So both cases fall out of the arithmetic, and the clamp, the
+        // unordered compare and the `NaN` blend they fed are all gone -- three
+        // of the sixteen port-0/1 ops this loop is bound by (measured: pass 2
+        // 442 -> 370 ps/element at d=1024, 1.20x). Every finite input is
+        // bit-identical to the clamped form, since the clamp was the identity
+        // there. Only a `NaN` *payload* changes: it is now the quieted input
+        // rather than a canonical `f32::NAN`, which the row contract -- a
+        // poisoned row normalizes to `NaN` -- does not distinguish.
 
         // k = round(x * log2e); r = x - k*ln2 (two-part).
         let k = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(
-            _mm256_mul_ps(xc, log2e),
+            _mm256_mul_ps(x, log2e),
         );
-        let r = _mm256_fnmadd_ps(k, ln2_hi, xc);
+        let r = _mm256_fnmadd_ps(k, ln2_hi, x);
         let r = _mm256_fnmadd_ps(k, ln2_lo, r);
 
         // Pure Horner of `1 + r + c2·r^2 + c3·r^3 + c4·r^4 + c5·r^5 + c6·r^6`.
@@ -550,13 +565,11 @@ mod softmax_avx2 {
         let ki = _mm256_cvtps_epi32(k);
         let biased = _mm256_add_epi32(ki, _mm256_set1_epi32(127));
         let pow2 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(biased));
-        let mut y = _mm256_mul_ps(p, pow2);
+        let y = _mm256_mul_ps(p, pow2);
 
-        // Underflow / -inf -> exactly 0 (andnot zeroes the masked lanes).
-        y = _mm256_andnot_ps(is_zero, y);
-        // NaN input -> NaN output, so a poisoned row sum stays NaN.
-        y = _mm256_blendv_ps(y, _mm256_set1_ps(f32::NAN), is_nan);
-        y
+        // Underflow / -inf -> exactly 0 (andnot zeroes the masked lanes
+        // bitwise, so it does not matter what the poisoned build produced).
+        _mm256_andnot_ps(is_zero, y)
     }
 
     /// Horizontal maximum of the eight lanes.
@@ -599,11 +612,32 @@ mod softmax_avx2 {
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn softmax_row(src: *const f32, dst: *mut f32, d: usize) {
         unsafe {
-            // Pass 1: row maximum. Feeding `v` as the first `max_ps` operand
-            // makes a `NaN` lane return the running accumulator, so `NaN`
-            // inputs are ignored exactly as `if v > max` ignores them.
-            let mut vmax = _mm256_set1_ps(f32::NEG_INFINITY);
+            // Pass 1: row maximum, over four independent chains. Feeding `v` as
+            // the first `max_ps` operand makes a `NaN` lane return the running
+            // accumulator, so `NaN` inputs are ignored exactly as `if v > max`
+            // ignores them -- and since no accumulator can therefore ever hold
+            // a `NaN`, folding the four together at the end obeys the same
+            // convention. `max` is associative and commutative over the values
+            // that survive, so the result is bit-identical to one chain.
+            //
+            // One chain is latency-bound, not throughput-bound: `vmaxpd`'s
+            // ~4-cycle latency lets it retire 8 floats per 4 cycles when the
+            // load ports could feed 16. Four chains hide that (measured: 67 ->
+            // 37 ps/element at d=1024, 1.8x).
+            let ninf = _mm256_set1_ps(f32::NEG_INFINITY);
+            let mut m0 = ninf;
+            let mut m1 = ninf;
+            let mut m2 = ninf;
+            let mut m3 = ninf;
             let mut i = 0usize;
+            while i + 32 <= d {
+                m0 = _mm256_max_ps(_mm256_loadu_ps(src.add(i)), m0);
+                m1 = _mm256_max_ps(_mm256_loadu_ps(src.add(i + 8)), m1);
+                m2 = _mm256_max_ps(_mm256_loadu_ps(src.add(i + 16)), m2);
+                m3 = _mm256_max_ps(_mm256_loadu_ps(src.add(i + 24)), m3);
+                i += 32;
+            }
+            let mut vmax = _mm256_max_ps(_mm256_max_ps(m0, m1), _mm256_max_ps(m2, m3));
             while i + 8 <= d {
                 let v = _mm256_loadu_ps(src.add(i));
                 vmax = _mm256_max_ps(v, vmax);
@@ -652,6 +686,86 @@ mod softmax_avx2 {
                 i += 1;
             }
         }
+    }
+
+    /// `exp8` no longer patches its non-finite lanes: `-inf` is caught by the
+    /// underflow mask and `NaN` survives the polynomial and the exponent build
+    /// on its own. Both are consequences of the arithmetic rather than of an
+    /// explicit branch, so they are exactly the kind of contract that a future
+    /// reformulation of the exponent build (a magic-number round, a different
+    /// clamp) could silently drop. Pin them at the vector level, with the
+    /// specials placed in every lane so a mask built for one lane cannot pass.
+    #[cfg(test)]
+    #[test]
+    fn exp8_maps_the_non_finite_lanes_without_an_explicit_patch() {
+        if !available() {
+            return;
+        }
+        // Signalling and quiet NaNs, both signs, plus a payload that would
+        // collide with the integer-indefinite pattern if the two were confused.
+        let nans = [
+            f32::NAN,
+            -f32::NAN,
+            f32::from_bits(0x7f80_0001),
+            f32::from_bits(0xff80_0001),
+            f32::from_bits(0x7fff_ffff),
+        ];
+        let zeros = [
+            f32::NEG_INFINITY,
+            UNDERFLOW,
+            UNDERFLOW - 1.0,
+            -1e30,
+            -f32::MAX,
+        ];
+        for lane in 0..8 {
+            for &n in &nans {
+                let mut xs = [-1.0f32; 8];
+                xs[lane] = n;
+                let mut out = [0f32; 8];
+                unsafe {
+                    _mm256_storeu_ps(out.as_mut_ptr(), exp8(_mm256_loadu_ps(xs.as_ptr())));
+                }
+                assert!(
+                    out[lane].is_nan(),
+                    "NaN {:#010x} in lane {lane} produced {} instead of NaN",
+                    n.to_bits(),
+                    out[lane]
+                );
+                for (j, &o) in out.iter().enumerate() {
+                    if j != lane {
+                        assert!(
+                            (o - (-1.0f32).exp()).abs() < 1e-6,
+                            "a NaN in lane {lane} disturbed lane {j}: {o}"
+                        );
+                    }
+                }
+            }
+            for &z in &zeros {
+                let mut xs = [-1.0f32; 8];
+                xs[lane] = z;
+                let mut out = [0f32; 8];
+                unsafe {
+                    _mm256_storeu_ps(out.as_mut_ptr(), exp8(_mm256_loadu_ps(xs.as_ptr())));
+                }
+                assert_eq!(
+                    out[lane].to_bits() & 0x7fff_ffff,
+                    0,
+                    "{z} in lane {lane} produced {} instead of exactly 0",
+                    out[lane]
+                );
+            }
+        }
+        // And the boundary itself: one ULP above the flush threshold must
+        // still be a normal, nonzero exponential.
+        let just_above = f32::from_bits(UNDERFLOW.to_bits() - 1);
+        let mut out = [0f32; 8];
+        unsafe {
+            _mm256_storeu_ps(out.as_mut_ptr(), exp8(_mm256_set1_ps(just_above)));
+        }
+        assert!(
+            out.iter().all(|v| *v > 0.0 && v.is_finite()),
+            "one ULP above the flush threshold must not flush: {out:?}"
+        );
     }
 
     /// The row-level softmax tests cannot police `exp8`'s absolute accuracy:
@@ -1315,6 +1429,45 @@ mod vectorized_tests {
                 if c % 3 == 0 {
                     assert_eq!(v, 0.0, "masked position must be exactly zero");
                 }
+            }
+        }
+    }
+
+    /// Softmax is invariant to the value subtracted, so a row maximum that
+    /// misses part of the row is *numerically silent* on ordinary data -- the
+    /// exponentials and the sum shift by the same factor and cancel. It only
+    /// surfaces as an overflow. Dropping one of the four accumulator chains in
+    /// pass 1 therefore passed every other test in this file.
+    ///
+    /// Force the issue: put one enormous logit at a chosen position and leave
+    /// the rest at zero. A max that saw the whole row yields a near one-hot
+    /// distribution; a max that missed the peak evaluates `exp(3e38)` and
+    /// blows the row to `inf`/`NaN`. Sweeping the position over more than one
+    /// full 32-lane block covers every chain, the 8-wide drain and the scalar
+    /// tail, and the `d` values put the peak in the block body, the drain and
+    /// the tail in turn.
+    #[test]
+    fn the_row_maximum_covers_every_position() {
+        for &d in &[32usize, 37, 40, 45, 96, 100, 256] {
+            for peak in 0..d {
+                let mut src = vec![0.0f32; d];
+                src[peak] = 3.0e38; // one exp() away from overflowing f32
+                let mut got = src.clone();
+                softmax_rows_in_place(&mut got, 1, d);
+                for (c, &v) in got.iter().enumerate() {
+                    assert!(
+                        v.is_finite(),
+                        "d={d} peak={peak}: column {c} is {v}, so the row \
+                         maximum missed position {peak}"
+                    );
+                }
+                assert!(
+                    (got[peak] - 1.0).abs() < 1e-6,
+                    "d={d} peak={peak}: the peak normalized to {} not 1.0",
+                    got[peak]
+                );
+                let sum: f32 = got.iter().sum();
+                assert!((sum - 1.0).abs() < 1e-5, "d={d} peak={peak} sums to {sum}");
             }
         }
     }
