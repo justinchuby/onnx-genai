@@ -55,7 +55,7 @@ use interactive::{
 use model_inspection::{list, show, version};
 #[cfg(test)]
 use onnx_genai::engine::EngineDecodeBackend;
-#[cfg(test)]
+#[cfg(all(test, feature = "native-backend"))]
 use onnx_genai::engine::native_decode_device::NativeDecodeDevice;
 use onnx_genai::text_to_audio::TextToAudioRequest;
 use onnx_genai::text_to_image::{TextToImageRequest, VaeDecoder};
@@ -1917,9 +1917,6 @@ mod tests {
     }
 
     #[test]
-    fn a_toggle_reports_when_given_nothing_and_refuses_nonsense() {}
-
-    #[test]
     fn interactive_session_preserves_the_requested_native_device() {
         let args = EngineArgs {
             backend: EngineDecodeBackend::Native,
@@ -1930,6 +1927,9 @@ mod tests {
 
         let config = settings.to_config();
         assert_eq!(config.decode_backend, EngineDecodeBackend::Native);
+        // A device only reaches the engine when the native decoder is compiled
+        // in; without it there is nothing that could honor one.
+        #[cfg(feature = "native-backend")]
         assert_eq!(
             config.native_device,
             Some(NativeDecodeDevice::Cuda { index: Some(3) })
