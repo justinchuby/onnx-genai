@@ -5,6 +5,8 @@ use onnx_runtime_optimizer::{
     OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult,
 };
 
+use crate::kernels::linear_attention::{FUSE_BETA_SIGMOID_ATTR, FUSE_DECAY_SOFTPLUS_ATTR};
+
 pub(crate) const SILU_MUL_FUSION_ATTR: &str = "_cuda_silu_mul";
 pub(crate) const DECOMPOSED_SILU_ATTR: &str = "_cuda_decomposed_silu";
 
@@ -106,6 +108,12 @@ pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
         // reciprocal kernel + its fp16 intermediate round-trip, ~1.2% of decode
         // GPU-kernel time on qwen3.5-0.8b-hybrid; see the profiling drop).
         Box::new(CudaRsqrtFusion),
+        // Fold the gated-delta `LinearAttention` beta-`Sigmoid` and decay
+        // `Softplus` gate chains into the kernel while they are still in their
+        // pristine exported form (before the cast-dropping passes run). Drops a
+        // handful of tiny per-layer elementwise nodes from the captured decode
+        // graph; byte-identical (the kernel reproduces each op's rounding).
+        Box::new(CudaLinearAttentionGatingFusion),
         Box::new(CudaFoldConstantTranspose),
         Box::new(CudaFoldConstantCast),
         // Fuse the per-layer Q/K/V projections into one wider MatMulNBits while
@@ -313,6 +321,279 @@ impl OptimizationPass for CudaRsqrtFusion {
                 .insert(CUDA_RSQRT_ATTR.into(), Attribute::Int(1));
             graph.replace_node(recip_id, rsqrt);
             graph.remove_node(sqrt_id);
+            changed = true;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+/// Fold the standalone gate chains that feed a gated-delta `LinearAttention`
+/// (Gated DeltaNet, Qwen3.5 / Qwen3-Next hybrid family) into the CUDA
+/// `LinearAttention` kernel itself, so the per-layer decode graph loses a handful
+/// of tiny elementwise nodes per layer:
+///
+/// * **`beta = Sigmoid(x)`** — the delta-rule mixing gate. The kernel already
+///   consumes `beta`; the fold rewires it onto the pre-`Sigmoid` value and marks
+///   [`FUSE_BETA_SIGMOID_ATTR`], so the kernel applies the sigmoid inline.
+/// * **`g = exp(neg_exp_A · Softplus(a + dt_bias))`** — the per-head decay gate.
+///   The exported chain is `Add(a, dt_bias) → Softplus → Mul(neg_exp_A, ·) →
+///   [Cast]`, feeding the kernel's `exp`. The fold rewires the decay slot onto
+///   `a`, appends `dt_bias` and `neg_exp_A` as trailing inputs, and marks
+///   [`FUSE_DECAY_SOFTPLUS_ATTR`]; the kernel recomputes the whole chain.
+///
+/// ## Byte-identity
+///
+/// The kernel reproduces each folded op's device function bit-for-bit
+/// (`la_sigmoid`/`la_softplus` mirror `op_sigmoid`/`op_softplus`) **and** rounds
+/// every intermediate through the storage dtype (`round_store<T>`) exactly where
+/// the standalone `Add`/`Softplus`/`Mul`/`Sigmoid` kernels round. So on the fp32
+/// text export (chain runs in f32, rounding is a no-op) and the fp16-I/O hybrid
+/// (chain rounds to f16 at every op boundary) greedy tokens stay identical. The
+/// fold is refused unless every folded operand shares the kernel's I/O dtype, so
+/// a dtype-changing `Cast` is never silently skipped.
+///
+/// ## Generality and safety
+///
+/// The match is purely structural — driven by op type, single-consumer /
+/// no-escape topology, and which `Mul`/`Add` operand is a graph initializer — so
+/// it fires for any head count and layer count and never bakes in a Qwen3.5
+/// shape. Each rewritten gate requires its whole chain to be single-consumer and
+/// not a graph output, so no value another node still observes is removed. When
+/// any condition fails the gate is left exactly as exported.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaLinearAttentionGatingFusion;
+
+/// Environment opt-out for [`CudaLinearAttentionGatingFusion`], mirroring the
+/// other CUDA-fusion switches. Any value other than unset/empty/`0` restores the
+/// exact exported (unfused) gate chains — for A/B measurement or rollback.
+const LINEAR_ATTENTION_GATING_DISABLE_ENV: &str = "ONNX_GENAI_CUDA_DISABLE_LINATTN_GATING_FUSION";
+
+fn linear_attention_gating_disabled() -> bool {
+    std::env::var_os(LINEAR_ATTENTION_GATING_DISABLE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+/// A `Sigmoid` gate folded into the kernel: `sigmoid_id` is removed and the
+/// beta slot is rewired onto `raw` (its pre-`Sigmoid` source).
+struct BetaSigmoidFold {
+    sigmoid_id: NodeId,
+    raw: ValueId,
+}
+
+/// A decay `Softplus` chain folded into the kernel.
+struct DecaySoftplusFold {
+    /// Pre-chain activation `a` (the `Add`'s non-initializer operand).
+    a: ValueId,
+    dt_bias: ValueId,
+    neg_exp_a: ValueId,
+    /// Chain nodes to delete, consumer-first so each is orphaned before removal.
+    dead: Vec<NodeId>,
+}
+
+impl CudaLinearAttentionGatingFusion {
+    /// A `LinearAttention` node in the `com.microsoft` domain with at least the
+    /// `q, k, v, past, decay, beta` slots.
+    fn is_gated_delta_la(node: &Node) -> bool {
+        node.op_type == "LinearAttention"
+            && node.domain == MICROSOFT_DOMAIN
+            && node.inputs.len() >= 6
+            && node.outputs.len() == 2
+    }
+
+    /// The single producer of `value`, if `value` is single-consumer (by
+    /// `consumer_id`), not a graph output, and produced by exactly one node.
+    fn sole_producer(graph: &Graph, value: ValueId, consumer_id: NodeId) -> Option<NodeId> {
+        if graph.outputs.contains(&value) {
+            return None;
+        }
+        let consumers = graph.consumers(value);
+        if consumers.len() != 1 || consumers[0] != consumer_id {
+            return None;
+        }
+        graph.value(value).producer
+    }
+
+    /// Match `beta = Sigmoid(raw)` where `raw` shares `io_dtype`.
+    fn match_beta_sigmoid(
+        graph: &Graph,
+        beta: ValueId,
+        la_id: NodeId,
+        io_dtype: DataType,
+    ) -> Option<BetaSigmoidFold> {
+        let sigmoid_id = Self::sole_producer(graph, beta, la_id)?;
+        let sigmoid = graph.node(sigmoid_id);
+        if sigmoid.op_type != "Sigmoid"
+            || !sigmoid.is_default_domain()
+            || sigmoid.inputs.len() != 1
+            || sigmoid.outputs.len() != 1
+        {
+            return None;
+        }
+        let raw = sigmoid.inputs[0]?;
+        if graph.value(raw).dtype != io_dtype {
+            return None;
+        }
+        Some(BetaSigmoidFold { sigmoid_id, raw })
+    }
+
+    /// Match `decay = [Cast](Mul(neg_exp_A, Softplus(Add(a, dt_bias))))` with an
+    /// optional identity `Cast` tail, every intermediate single-consumer and of
+    /// `io_dtype`, and `dt_bias`/`neg_exp_A` graph initializers.
+    fn match_decay_softplus(
+        graph: &Graph,
+        decay: ValueId,
+        la_id: NodeId,
+        io_dtype: DataType,
+    ) -> Option<DecaySoftplusFold> {
+        let mut dead = Vec::new();
+        // Optional trailing identity `Cast` (never a dtype-changing one).
+        let (mul_out, mul_consumer) = {
+            let producer = Self::sole_producer(graph, decay, la_id)?;
+            let node = graph.node(producer);
+            if node.op_type == "Cast"
+                && node.is_default_domain()
+                && node.inputs.len() == 1
+                && node.outputs.len() == 1
+                && graph.value(node.inputs[0]?).dtype == io_dtype
+            {
+                dead.push(producer);
+                (node.inputs[0]?, producer)
+            } else {
+                (decay, la_id)
+            }
+        };
+        // `Mul(neg_exp_A, Softplus(...))` — order-independent.
+        let mul_id = Self::sole_producer(graph, mul_out, mul_consumer)?;
+        let mul = graph.node(mul_id);
+        if mul.op_type != "Mul"
+            || !mul.is_default_domain()
+            || mul.inputs.len() != 2
+            || mul.outputs.len() != 1
+        {
+            return None;
+        }
+        let (a0, a1) = (mul.inputs[0]?, mul.inputs[1]?);
+        let (neg_exp_a, softplus_out) = if graph.initializers.contains_key(&a0) {
+            (a0, a1)
+        } else if graph.initializers.contains_key(&a1) {
+            (a1, a0)
+        } else {
+            return None;
+        };
+        if graph.value(neg_exp_a).dtype != io_dtype {
+            return None;
+        }
+        dead.push(mul_id);
+        // `Softplus(Add(...))`.
+        let softplus_id = Self::sole_producer(graph, softplus_out, mul_id)?;
+        let softplus = graph.node(softplus_id);
+        if softplus.op_type != "Softplus"
+            || !softplus.is_default_domain()
+            || softplus.inputs.len() != 1
+            || softplus.outputs.len() != 1
+        {
+            return None;
+        }
+        let add_out = softplus.inputs[0]?;
+        dead.push(softplus_id);
+        // `Add(a, dt_bias)` — order-independent.
+        let add_id = Self::sole_producer(graph, add_out, softplus_id)?;
+        let add = graph.node(add_id);
+        if add.op_type != "Add"
+            || !add.is_default_domain()
+            || add.inputs.len() != 2
+            || add.outputs.len() != 1
+        {
+            return None;
+        }
+        let (b0, b1) = (add.inputs[0]?, add.inputs[1]?);
+        let (dt_bias, a) = if graph.initializers.contains_key(&b1) {
+            (b1, b0)
+        } else if graph.initializers.contains_key(&b0) {
+            (b0, b1)
+        } else {
+            return None;
+        };
+        if graph.value(dt_bias).dtype != io_dtype || graph.value(a).dtype != io_dtype {
+            return None;
+        }
+        dead.push(add_id);
+        Some(DecaySoftplusFold {
+            a,
+            dt_bias,
+            neg_exp_a,
+            dead,
+        })
+    }
+}
+
+impl OptimizationPass for CudaLinearAttentionGatingFusion {
+    fn name(&self) -> &str {
+        "CudaLinearAttentionGatingFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        if linear_attention_gating_disabled() {
+            return Ok(());
+        }
+        let la_ids: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| Self::is_gated_delta_la(node).then_some(id))
+            .collect();
+        let mut changed = false;
+
+        for la_id in la_ids {
+            let Some(la) = graph.try_node(la_id) else {
+                continue;
+            };
+            // The kernel widens every input to f32 and rounds folded gates back
+            // through this storage dtype, so all folded operands must match it.
+            let Some(io_dtype) = la.inputs[0].map(|v| graph.value(v).dtype) else {
+                continue;
+            };
+            let beta_slot = la.inputs.get(5).copied().flatten();
+            let decay_slot = la.inputs.get(4).copied().flatten();
+            // Only fold decay when no trailing operands are present yet, so the
+            // rewrite owns input slots 6/7.
+            let decay_foldable = la.inputs.len() == 6;
+
+            let beta_fold =
+                beta_slot.and_then(|beta| Self::match_beta_sigmoid(graph, beta, la_id, io_dtype));
+            let decay_fold = if decay_foldable {
+                decay_slot
+                    .and_then(|decay| Self::match_decay_softplus(graph, decay, la_id, io_dtype))
+            } else {
+                None
+            };
+            if beta_fold.is_none() && decay_fold.is_none() {
+                continue;
+            }
+
+            let mut new_la = la.clone();
+            let mut dead = Vec::new();
+            if let Some(fold) = beta_fold {
+                new_la.inputs[5] = Some(fold.raw);
+                new_la
+                    .attributes
+                    .insert(FUSE_BETA_SIGMOID_ATTR.into(), Attribute::Int(1));
+                dead.push(fold.sigmoid_id);
+            }
+            if let Some(fold) = decay_fold {
+                new_la.inputs[4] = Some(fold.a);
+                new_la.inputs.push(Some(fold.dt_bias));
+                new_la.inputs.push(Some(fold.neg_exp_a));
+                new_la
+                    .attributes
+                    .insert(FUSE_DECAY_SOFTPLUS_ATTR.into(), Attribute::Int(1));
+                dead.extend(fold.dead);
+            }
+            graph.replace_node(la_id, new_la);
+            graph.remove_nodes(&dead);
             changed = true;
         }
 
@@ -6412,5 +6693,205 @@ mod tests {
             1,
             "opt-out preserves the identity cast"
         );
+    }
+
+    /// Build a single gated-delta `LinearAttention` (`com.microsoft`) fed by its
+    /// exported standalone gate chains:
+    /// * beta: `Sigmoid(raw) → LA.input[5]`
+    /// * decay: `Add(a, dt_bias) → Softplus → Mul(neg_exp_A, ·) → [Cast] → LA.input[4]`
+    ///
+    /// `trailing_cast` toggles the optional identity `Cast` between the decay
+    /// `Mul` and the kernel (present on the fp32 text export).
+    fn gated_delta_la_graph(heads: usize, trailing_cast: bool) -> Graph {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+
+        let q = value(&mut graph, "q", DataType::Float32, heads);
+        let k = value(&mut graph, "k", DataType::Float32, heads);
+        let v = value(&mut graph, "v", DataType::Float32, heads);
+        let past = value(&mut graph, "past", DataType::Float32, heads);
+        let a = value(&mut graph, "a", DataType::Float32, heads);
+        let raw = value(&mut graph, "raw", DataType::Float32, heads);
+        for input in [q, k, v, past, a, raw] {
+            graph.add_input(input);
+        }
+
+        // dt_bias / neg_exp_A are graph initializers (that is how the pass tells
+        // the constant operand from the activation).
+        let dt_bias = vec1d(&mut graph, "dt_bias", DataType::Float32, heads);
+        let neg_exp_a = vec1d(&mut graph, "neg_exp_A", DataType::Float32, heads);
+        for init in [dt_bias, neg_exp_a] {
+            graph.set_initializer(
+                init,
+                WeightRef::Inline(TensorData::from_raw(
+                    DataType::Float32,
+                    vec![heads],
+                    vec![0u8; heads * DataType::Float32.byte_size()],
+                )),
+            );
+        }
+
+        // decay chain.
+        let add_out = value(&mut graph, "add_out", DataType::Float32, heads);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(a), Some(dt_bias)],
+            vec![add_out],
+        ));
+        let sp_out = value(&mut graph, "sp_out", DataType::Float32, heads);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Softplus",
+            vec![Some(add_out)],
+            vec![sp_out],
+        ));
+        let mul_out = value(&mut graph, "mul_out", DataType::Float32, heads);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(neg_exp_a), Some(sp_out)],
+            vec![mul_out],
+        ));
+        let decay = if trailing_cast {
+            let cast_out = value(&mut graph, "decay", DataType::Float32, heads);
+            let mut cast = Node::new(NodeId(0), "Cast", vec![Some(mul_out)], vec![cast_out]);
+            cast.attributes.insert(
+                "to".into(),
+                Attribute::Int(DataType::Float32.to_onnx() as i64),
+            );
+            graph.insert_node(cast);
+            cast_out
+        } else {
+            mul_out
+        };
+
+        // beta chain.
+        let beta = value(&mut graph, "beta", DataType::Float32, heads);
+        graph.insert_node(Node::new(NodeId(0), "Sigmoid", vec![Some(raw)], vec![beta]));
+
+        let out = value(&mut graph, "out", DataType::Float32, heads);
+        let present = value(&mut graph, "present", DataType::Float32, heads);
+        let mut la = Node::new(
+            NodeId(0),
+            "LinearAttention",
+            vec![
+                Some(q),
+                Some(k),
+                Some(v),
+                Some(past),
+                Some(decay),
+                Some(beta),
+            ],
+            vec![out, present],
+        );
+        la.domain = MICROSOFT_DOMAIN.into();
+        graph.insert_node(la);
+        graph.add_output(out);
+        graph.add_output(present);
+        graph
+    }
+
+    #[test]
+    fn folds_beta_sigmoid_and_decay_softplus_into_linear_attention() {
+        for trailing_cast in [false, true] {
+            let mut graph = gated_delta_la_graph(4, trailing_cast);
+            let a = value_id_by_name(&graph, "a");
+            let raw = value_id_by_name(&graph, "raw");
+            let dt_bias = value_id_by_name(&graph, "dt_bias");
+            let neg_exp_a = value_id_by_name(&graph, "neg_exp_A");
+
+            CudaLinearAttentionGatingFusion
+                .run(&mut graph, &PassContext::new())
+                .unwrap();
+
+            // Every folded elementwise node is gone.
+            for op in ["Sigmoid", "Softplus", "Add", "Mul", "Cast"] {
+                assert!(
+                    graph.nodes.values().all(|n| n.op_type != op),
+                    "{op} must be folded away (trailing_cast={trailing_cast})"
+                );
+            }
+
+            let la = graph
+                .nodes
+                .values()
+                .find(|n| n.op_type == "LinearAttention")
+                .unwrap();
+            assert_eq!(
+                la.attr(FUSE_BETA_SIGMOID_ATTR).and_then(Attribute::as_int),
+                Some(1)
+            );
+            assert_eq!(
+                la.attr(FUSE_DECAY_SOFTPLUS_ATTR)
+                    .and_then(Attribute::as_int),
+                Some(1)
+            );
+            // beta slot rewired onto the pre-Sigmoid value; decay slot onto `a`;
+            // dt_bias / neg_exp_A appended as trailing operands.
+            assert_eq!(la.inputs[5], Some(raw));
+            assert_eq!(la.inputs[4], Some(a));
+            assert_eq!(la.inputs.len(), 8);
+            assert_eq!(la.inputs[6], Some(dt_bias));
+            assert_eq!(la.inputs[7], Some(neg_exp_a));
+        }
+    }
+
+    #[test]
+    fn leaves_beta_gate_when_it_escapes_to_a_second_consumer() {
+        let mut graph = gated_delta_la_graph(4, false);
+        // A second consumer of `beta` means the Sigmoid output escapes, so the
+        // beta gate must be left exactly as exported; decay still folds.
+        let beta = value_id_by_name(&graph, "beta");
+        let sink = value(&mut graph, "beta_sink", DataType::Float32, 4);
+        graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(beta)], vec![sink]));
+        graph.add_output(sink);
+
+        CudaLinearAttentionGatingFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert!(
+            graph.nodes.values().any(|n| n.op_type == "Sigmoid"),
+            "the escaping beta Sigmoid is preserved"
+        );
+        let la = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "LinearAttention")
+            .unwrap();
+        assert!(la.attr(FUSE_BETA_SIGMOID_ATTR).is_none());
+        // Decay still folds independently.
+        assert_eq!(
+            la.attr(FUSE_DECAY_SOFTPLUS_ATTR)
+                .and_then(Attribute::as_int),
+            Some(1)
+        );
+        assert_eq!(la.inputs.len(), 8);
+    }
+
+    #[test]
+    fn opt_out_env_preserves_exported_gate_chains() {
+        let mut graph = gated_delta_la_graph(4, true);
+        // SAFETY: single-threaded test; env is restored before returning.
+        unsafe { std::env::set_var(LINEAR_ATTENTION_GATING_DISABLE_ENV, "1") };
+        let result = CudaLinearAttentionGatingFusion.run(&mut graph, &PassContext::new());
+        unsafe { std::env::remove_var(LINEAR_ATTENTION_GATING_DISABLE_ENV) };
+        result.unwrap();
+        for op in ["Sigmoid", "Softplus", "Add", "Mul", "Cast"] {
+            assert!(
+                graph.nodes.values().any(|n| n.op_type == op),
+                "opt-out preserves the standalone {op}"
+            );
+        }
+        let la = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "LinearAttention")
+            .unwrap();
+        assert!(la.attr(FUSE_BETA_SIGMOID_ATTR).is_none());
+        assert!(la.attr(FUSE_DECAY_SOFTPLUS_ATTR).is_none());
+        assert_eq!(la.inputs.len(), 6);
     }
 }
