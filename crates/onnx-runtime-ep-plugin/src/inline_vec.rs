@@ -25,9 +25,12 @@ use std::ops::Deref;
 /// Rank at or below which a shape or stride list stays off the heap.
 ///
 /// Eight, because it is past every rank this EP has been handed (0-5 in
-/// practice) while keeping [`InlineVec<usize, INLINE_RANK>`] at 72 bytes —
-/// small enough that the `Vec<OwnedInput>` holding them is still one
-/// allocation, which is the point.
+/// practice) while keeping [`InlineVec<usize, INLINE_RANK>`] at 80 bytes: the
+/// 64-byte buffer, `len`, and a discriminant that cannot borrow the `Vec`
+/// pointer's null niche because the array payload has no niche to share. That
+/// buys a wider `OwnedInput` copied by value against four `malloc`/`free`
+/// pairs removed per `Run`, which at ~3.5 us per small node is the better
+/// trade.
 pub(crate) const INLINE_RANK: usize = 8;
 
 /// A `Vec`-like sequence that stores up to `N` elements inline.
@@ -127,6 +130,12 @@ impl<T: Copy + Default, const N: usize> Deref for InlineVec<T, N> {
 impl<T: Copy + Default + PartialEq, const N: usize> PartialEq for InlineVec<T, N> {
     /// Compares contents, not representation: the same dimensions inline and
     /// on the heap are the same shape.
+    ///
+    /// Deliberately not derived, and `Eq`/`Hash` are deliberately absent. If
+    /// either is ever added it must hash and compare [`Self::as_slice`] for
+    /// the same reason this does — a derived one would split the two
+    /// representations of an equal value apart and break any map keyed on a
+    /// shape.
     fn eq(&self, other: &Self) -> bool {
         self.as_slice() == other.as_slice()
     }
