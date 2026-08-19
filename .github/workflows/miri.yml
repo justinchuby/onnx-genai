@@ -146,12 +146,22 @@ jobs:
           # rather than join, so once this test actually spawns them Miri's
           # exit check fails the step with "the main thread terminated without
           # waiting for all remaining threads" even though the test itself
-          # passes. At the default one CPU the test returns early on its
-          # `pool_width() < 2` guard, spawns nothing, and never trips it, which
-          # is why the broad `task_runtime::` step above does not need the flag.
-          # The flag suppresses only that exit-time thread-leak check: with it
-          # set, widening the retag still reports the data race above, so the
-          # falsifier is intact.
+          # passes. At the default one CPU this test returns early on its
+          # `pool_width() < 2` guard and spawns nothing, which is why it only
+          # started failing once the lane became load-bearing.
+          #
+          # The flag disables Miri's exit-time leak checks -- both the memory
+          # leak checker and the remaining-threads check. It does not touch
+          # data-race, aliasing, or validity detection, which run during
+          # execution: with the flag set, widening the retag still reports the
+          # data race above, so the falsifier is intact. Little is given up
+          # here because the global pool is rooted in a `OnceLock` static and
+          # so is never leak-reported anyway.
+          #
+          # This does not blind the lane to a broken `shutdown()`. The broad
+          # `task_runtime::` step above runs without the flag and does spawn
+          # real workers (`TaskPool::new(4)`/`new(8)` in `pool.rs`); it stays
+          # green only because those are *local* pools that join on drop.
           run_miri "onnx-runtime-ep-cpu task runtime concurrent retag" \
             env MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-num-cpus=4 -Zmiri-ignore-leaks" cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib task_runtime::tests::concurrent_tasks_retag_only_their_own_range
           # The lib step above covers the pool's own unsafe. It does not cover
