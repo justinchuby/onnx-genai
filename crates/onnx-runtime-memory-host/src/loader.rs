@@ -356,19 +356,9 @@ impl MemoryPlugin {
     /// outstanding work and try again — this is a deferral, not a leak.
     pub fn try_unload(self) -> Result<(), UnloadRejection> {
         let host = self.module.host_live_counts();
-        if host.total() != 0 {
-            return Err(UnloadRejection {
-                reason: format!(
-                    "the host still holds {} allocator(s), {} allocation(s) and {} queued \
-                     release(s); retire them before unloading",
-                    host.allocators, host.allocations, host.queued_releases
-                ),
-                report: NxmemUnloadReport::zeroed(),
-                host,
-                plugin: Some(self),
-            });
-        }
-
+        // Ask the plugin first, unconditionally, so every rejection carries
+        // both tallies. A refusal that reports only one side leaves the caller
+        // guessing about which objects to retire.
         let report = match self.module.unload_report() {
             Ok(report) => report,
             Err(error) => {
@@ -383,6 +373,20 @@ impl MemoryPlugin {
                 });
             }
         };
+
+        if host.total() != 0 {
+            return Err(UnloadRejection {
+                reason: format!(
+                    "the host still holds {} allocator(s), {} allocation(s) and {} queued \
+                     release(s); retire them before unloading",
+                    host.allocators, host.allocations, host.queued_releases
+                ),
+                report,
+                host,
+                plugin: Some(self),
+            });
+        }
+
         if report.total() != 0 {
             return Err(UnloadRejection {
                 reason: format!(
@@ -510,9 +514,6 @@ fn enumerate_factories(
         // `read_prefix` null-checks, alignment-checks, and size-checks it
         // before reading any field, and copies rather than borrowing.
         let vtable = unsafe { NxmemAllocatorFactoryVtable::read_prefix(*slot, minor) }
-            .map_err(|status| PluginError::call("factory vtable", status))?;
-        vtable
-            .validate_required()
             .map_err(|status| PluginError::call("factory vtable", status))?;
 
         let device = device_key(vtable.device).ok_or_else(|| PluginError::Contract {

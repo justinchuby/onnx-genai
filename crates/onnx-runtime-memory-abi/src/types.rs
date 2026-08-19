@@ -339,6 +339,25 @@ pub struct NxmemReleaseCompletion {
     pub outcome: NxmemReleaseOutcome,
 }
 
+impl NxmemReleaseCompletion {
+    /// A completion record with the correct `struct_size`.
+    pub fn new(
+        ticket: u64,
+        mechanism_id: u64,
+        allocation_id: u64,
+        outcome: NxmemReleaseOutcome,
+    ) -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            reserved: 0,
+            ticket,
+            mechanism_id,
+            allocation_id,
+            outcome,
+        }
+    }
+}
+
 // ─── Host callbacks ─────────────────────────────────────────────────────────
 
 /// A plugin's request that the host free cached memory.
@@ -355,6 +374,19 @@ pub struct NxmemReclaimRequest {
     pub device: NxmemDeviceId,
     /// Bytes the plugin needs.
     pub bytes: u64,
+}
+
+impl NxmemReclaimRequest {
+    /// A reclaim request with the correct `struct_size`.
+    pub fn new(mechanism_id: u64, device: NxmemDeviceId, bytes: u64) -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            reserved: 0,
+            mechanism_id,
+            device,
+            bytes,
+        }
+    }
 }
 
 /// Callbacks the host offers to a plugin allocator.
@@ -528,6 +560,23 @@ pub struct NxmemSharedPrefixCommitRequest {
     pub allocation: NxmemAllocation,
     /// Byte offset within the allocation to map at.
     pub byte_offset: u64,
+}
+
+impl NxmemSharedPrefixCommitRequest {
+    /// A commit request with the correct `struct_size`.
+    pub fn new(
+        prefix: NxmemSharedPrefixHandle,
+        allocation: NxmemAllocation,
+        byte_offset: u64,
+    ) -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            reserved: 0,
+            prefix,
+            allocation,
+            byte_offset,
+        }
+    }
 }
 
 /// The accounting result of mapping a shared prefix.

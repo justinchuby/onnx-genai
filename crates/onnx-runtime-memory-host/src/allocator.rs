@@ -272,6 +272,14 @@ impl AllocatorCore {
         self.bridge.reclaim_failures.load(Ordering::Acquire)
     }
 
+    /// The callback table handed to the plugin.
+    ///
+    /// Exposed so a caller can confirm the table the plugin holds is the one
+    /// this host installed, and that its `abi_minor` matches negotiation.
+    pub fn host_callbacks(&self) -> &NxmemHostCallbacks {
+        &self.callbacks
+    }
+
     /// Deferred releases the plugin has reported as retired, in report order.
     pub fn retired_releases(&self) -> Vec<RetiredRelease> {
         self.bridge
@@ -537,7 +545,7 @@ impl AllocatorCore {
                     outcome.failure.describe()
                 ))
             }
-            other => {
+            _unknown => {
                 // An unknown state is never guessed. Treat it as residual
                 // ownership so nothing is reused or double-refunded.
                 self.module.allocation_closed();
@@ -554,20 +562,10 @@ impl AllocatorCore {
                         align: record.align,
                     },
                 )
-                .tap_unknown(other)
             }
         }
     }
 }
-
-/// Small helper so the unknown-state branch above stays readable.
-trait TapUnknown: Sized {
-    fn tap_unknown(self, _state: u32) -> Self {
-        self
-    }
-}
-
-impl TapUnknown for AllocationReleaseOutcome {}
 
 impl Drop for AllocatorCore {
     fn drop(&mut self) {
@@ -1320,6 +1318,32 @@ impl Drop for PluginSharedPrefix {
 }
 
 /// Open an allocator from a factory, wiring up the host callback table.
+/// Give back an allocator the host has decided it cannot use.
+///
+/// `open_allocator` returning `Ok` means the plugin created state, so the host
+/// owes it a `release` even when it then refuses the vtable. The refusal path
+/// is the one place the host must reach into a struct it has already judged
+/// untrustworthy, so it does the least it can: re-read the prefix, and call
+/// `release` only if that succeeds and the slot is present. A plugin that
+/// publishes a vtable too malformed to locate `release` cannot be given
+/// anything back — such a plugin must not allocate state before returning.
+///
+/// # Safety
+///
+/// `ptr` must be null or the pointer the plugin just returned.
+unsafe fn abandon_allocator(ptr: *const NxmemAllocatorVtable, minor: u32) {
+    // SAFETY: delegated to this function's contract; `read_prefix` performs
+    // every null, alignment, and size check before reading a field.
+    let Ok(vtable) = (unsafe { NxmemAllocatorVtable::read_prefix(ptr, minor) }) else {
+        return;
+    };
+    let Some(release) = vtable.release else {
+        return;
+    };
+    // SAFETY: `ctx` came from this vtable and no host lock is held.
+    unsafe { release(vtable.ctx) };
+}
+
 pub(crate) fn open_allocator(
     factory: &PluginFactory,
     required_capability_flags: u64,
@@ -1383,10 +1407,19 @@ pub(crate) fn open_allocator(
     // `read_prefix` null-, alignment- and size-checks it before reading any
     // field, and copies rather than borrowing.
     let vtable = unsafe { NxmemAllocatorVtable::read_prefix(raw_allocator, minor) }
-        .map_err(|status| PluginError::call("allocator vtable", status))?;
-    vtable
-        .validate_required()
-        .map_err(|status| PluginError::call("allocator vtable", status))?;
+        .map_err(|status| {
+            // SAFETY: the vtable was refused, so nothing may be called through
+            // it; `abandon_allocator` re-reads the prefix defensively and only
+            // calls `release` when the struct is well-formed enough to locate
+            // that slot.
+            unsafe { abandon_allocator(raw_allocator, minor) };
+            PluginError::call("allocator vtable", status)
+        })?;
+    if let Err(status) = vtable.validate_required() {
+        // SAFETY: as above. Here the prefix did read, so `release` is known.
+        unsafe { abandon_allocator(raw_allocator, minor) };
+        return Err(PluginError::call("allocator vtable", status));
+    }
 
     let device = device_key(vtable.device).ok_or_else(|| PluginError::Contract {
         path: module.path().display().to_string(),
@@ -1429,34 +1462,41 @@ pub(crate) fn open_allocator(
         });
     }
 
-    // Capability vtables are read at the allocator's own level, and each must
-    // name the same mechanism instance.
+    // Capability vtables are read at the allocator's own level, and
+    // `read_prefix` itself refuses a vtable that names a different mechanism.
     let backing = read_capability(
         vtable.virtual_backing,
         vtable.capability_flags & NXMEM_CAP_VIRTUAL_BACKING != 0,
-        minor,
-        vtable.mechanism_id,
         "virtual backing",
         &module,
-        |ptr, minor| {
-            // SAFETY: delegated to `read_capability`, which only calls this
-            // with a pointer the plugin published for this capability.
-            unsafe { NxmemVirtualBackingVtable::read_prefix(ptr, minor) }
+        || {
+            // SAFETY: the pointer came from the allocator vtable the plugin
+            // just published; `read_prefix` null-, alignment- and size-checks
+            // it before reading any field.
+            unsafe {
+                NxmemVirtualBackingVtable::read_prefix(
+                    vtable.virtual_backing,
+                    minor,
+                    vtable.mechanism_id,
+                )
+            }
         },
-        |vtable| vtable.mechanism_id,
     )?;
     let shared = read_capability(
         vtable.shared_mapping,
         vtable.capability_flags & NXMEM_CAP_SHARED_MAPPING != 0,
-        minor,
-        vtable.mechanism_id,
         "shared mapping",
         &module,
-        |ptr, minor| {
+        || {
             // SAFETY: as above.
-            unsafe { NxmemSharedMappingVtable::read_prefix(ptr, minor) }
+            unsafe {
+                NxmemSharedMappingVtable::read_prefix(
+                    vtable.shared_mapping,
+                    minor,
+                    vtable.mechanism_id,
+                )
+            }
         },
-        |vtable| vtable.mechanism_id,
     )?;
 
     // SAFETY: the contract requires `name` to stay valid until the final
@@ -1502,27 +1542,24 @@ pub(crate) fn open_allocator(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn read_capability<T>(
     ptr: *const T,
     advertised: bool,
-    minor: u32,
-    mechanism_id: u64,
     label: &str,
     module: &Arc<PluginModule>,
-    read: impl Fn(*const T, u32) -> Result<T, NxmemStatus>,
-    id_of: impl Fn(&T) -> u64,
+    read: impl FnOnce() -> Result<T, NxmemStatus>,
 ) -> Result<Option<T>, PluginError> {
     if !advertised {
         // An unsupported capability is represented explicitly: the flag is
-        // clear and the pointer is expected to be null. A non-null pointer
-        // behind a clear flag is a contract violation, not a bonus feature.
+        // clear *and* the pointer is null. A non-null pointer behind a clear
+        // flag is a contract violation, not a bonus feature, because the host
+        // would have no negotiated basis for calling it.
         if !ptr.is_null() {
             return Err(PluginError::Contract {
                 path: module.path().display().to_string(),
                 reason: format!(
-                    "the allocator published a {label} vtable without advertising the capability; \
-                     an unsupported capability must be a null pointer and a clear flag"
+                    "the allocator published a {label} vtable without advertising the \
+                     capability; an unsupported capability must be a null pointer and a clear flag"
                 ),
             });
         }
@@ -1531,22 +1568,10 @@ fn read_capability<T>(
     if ptr.is_null() {
         return Err(PluginError::Contract {
             path: module.path().display().to_string(),
-            reason: format!(
-                "the allocator advertised {label} but published a null vtable for it"
-            ),
+            reason: format!("the allocator advertised {label} but published a null vtable for it"),
         });
     }
-    let vtable = read(ptr, minor).map_err(|status| PluginError::call("capability vtable", status))?;
-    if id_of(&vtable) != mechanism_id {
-        return Err(PluginError::Contract {
-            path: module.path().display().to_string(),
-            reason: format!(
-                "the {label} vtable names mechanism {} but the allocator is mechanism \
-                 {mechanism_id}; a capability must belong to one coherent mechanism",
-                id_of(&vtable)
-            ),
-        });
-    }
+    let vtable = read().map_err(|status| PluginError::call("capability vtable", status))?;
     Ok(Some(vtable))
 }
 

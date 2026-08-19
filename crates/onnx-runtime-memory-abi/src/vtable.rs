@@ -30,8 +30,13 @@
 //! Negotiation fixes the **ceiling**. Each vtable independently declares the
 //! level it actually implements in `abi_minor`, so one plugin may ship a
 //! current mechanism next to one still built at the baseline prefix. A vtable
-//! declaring a level *above* the negotiated ceiling is rejected: the host did
-//! not agree to interpret those slots.
+//! declaring a level *above* the negotiated ceiling is **clamped**, not
+//! rejected: its struct is a strict superset, so the host reads only the
+//! prefix it agreed to and refuses to call any slot introduced above the
+//! ceiling. `read_prefix` rewrites `abi_minor` to that effective level, so a
+//! caller need only consult the value it gets back. A vtable whose
+//! `struct_size` is smaller than the level it *claims* is still rejected: that
+//! is a sender that contradicts itself, not an old one.
 
 use core::ffi::c_void;
 
@@ -145,16 +150,6 @@ fn short_struct(what: &str, declared: usize, required: usize, minor: u32) -> Nxm
         &format!(
             "nxmem: {what} declares struct_size {declared} but nxmem minor {minor} requires at \
              least {required} bytes; rebuild the plugin against a matching nxmem ABI header"
-        ),
-    )
-}
-
-fn level_too_new(what: &str, declared: u32, ceiling: u32) -> NxmemStatus {
-    NxmemStatus::with_message(
-        NxmemStatusCode::VersionMismatch,
-        &format!(
-            "nxmem: {what} declares nxmem minor {declared} but the negotiated ceiling is \
-             {ceiling}; the host will not interpret slots it did not agree to"
         ),
     )
 }
@@ -314,13 +309,9 @@ impl NxmemAllocatorVtable {
         // SAFETY: the size check above proved `abi_minor` (offset 4) is inside
         // the readable prefix.
         let declared_minor = unsafe { core::ptr::read_unaligned(ptr.cast::<u32>().add(1)) };
-        if declared_minor > negotiated_minor {
-            return Err(level_too_new(
-                "allocator vtable",
-                declared_minor,
-                negotiated_minor,
-            ));
-        }
+        // The sender's own claim must be self-consistent: a vtable that says
+        // "minor 1" must be at least as big as minor 1 requires, whatever the
+        // host negotiated.
         let required = Self::required_struct_size(declared_minor);
         if declared_size < required {
             return Err(short_struct(
@@ -330,11 +321,17 @@ impl NxmemAllocatorVtable {
                 declared_minor,
             ));
         }
+        // A sender ahead of the negotiated ceiling is not an error: its struct
+        // is a strict superset, so the host reads the prefix it agreed to and
+        // clamps the level it will act on. This is what lets a baseline host
+        // drive a current plugin.
+        let effective_minor = declared_minor.min(negotiated_minor);
         // SAFETY: `declared_size` bytes are readable and we copy no more.
         let mut vtable = unsafe { copy_prefix(ptr, declared_size) };
-        // A slot the sender does not define must never be called, even if this
-        // build knows about it.
-        if declared_minor < 1 {
+        vtable.abi_minor = effective_minor;
+        // A slot neither side agreed to must never be called, even if both
+        // builds happen to know about it.
+        if effective_minor < 1 {
             vtable.release_allocation = None;
         }
         vtable.validate_required()?;
@@ -486,15 +483,13 @@ impl NxmemVirtualBackingVtable {
         }
         // SAFETY: the size check proved `abi_minor` is readable.
         let declared_minor = unsafe { core::ptr::read_unaligned(ptr.cast::<u32>().add(1)) };
-        if declared_minor > negotiated_minor {
-            return Err(level_too_new(
-                "virtual-backing vtable",
-                declared_minor,
-                negotiated_minor,
-            ));
-        }
+        // A sender ahead of the negotiated ceiling is not an error: its struct
+        // is a strict superset, so the host simply reads the prefix it agreed
+        // to and clamps the level it will act on.
+        let effective_minor = declared_minor.min(negotiated_minor);
         // SAFETY: `declared_size` bytes are readable and we copy no more.
-        let vtable = unsafe { copy_prefix(ptr, declared_size) };
+        let mut vtable = unsafe { copy_prefix(ptr, declared_size) };
+        vtable.abi_minor = effective_minor;
         if vtable.mechanism_id != owner_mechanism_id {
             return Err(NxmemStatus::with_message(
                 NxmemStatusCode::WrongMechanism,
@@ -618,15 +613,13 @@ impl NxmemSharedMappingVtable {
         }
         // SAFETY: the size check proved `abi_minor` is readable.
         let declared_minor = unsafe { core::ptr::read_unaligned(ptr.cast::<u32>().add(1)) };
-        if declared_minor > negotiated_minor {
-            return Err(level_too_new(
-                "shared-mapping vtable",
-                declared_minor,
-                negotiated_minor,
-            ));
-        }
+        // A sender ahead of the negotiated ceiling is not an error: its struct
+        // is a strict superset, so the host simply reads the prefix it agreed
+        // to and clamps the level it will act on.
+        let effective_minor = declared_minor.min(negotiated_minor);
         // SAFETY: `declared_size` bytes are readable and we copy no more.
-        let vtable = unsafe { copy_prefix(ptr, declared_size) };
+        let mut vtable = unsafe { copy_prefix(ptr, declared_size) };
+        vtable.abi_minor = effective_minor;
         if vtable.mechanism_id != owner_mechanism_id {
             return Err(NxmemStatus::with_message(
                 NxmemStatusCode::WrongMechanism,
@@ -718,15 +711,13 @@ impl NxmemAllocatorFactoryVtable {
         }
         // SAFETY: the size check proved `abi_minor` is readable.
         let declared_minor = unsafe { core::ptr::read_unaligned(ptr.cast::<u32>().add(1)) };
-        if declared_minor > negotiated_minor {
-            return Err(level_too_new(
-                "allocator-factory vtable",
-                declared_minor,
-                negotiated_minor,
-            ));
-        }
+        // A sender ahead of the negotiated ceiling is not an error: its struct
+        // is a strict superset, so the host simply reads the prefix it agreed
+        // to and clamps the level it will act on.
+        let effective_minor = declared_minor.min(negotiated_minor);
         // SAFETY: `declared_size` bytes are readable and we copy no more.
-        let vtable = unsafe { copy_prefix(ptr, declared_size) };
+        let mut vtable = unsafe { copy_prefix(ptr, declared_size) };
+        vtable.abi_minor = effective_minor;
         if vtable.open_allocator.is_none() || vtable.release.is_none() {
             return Err(NxmemStatus::with_message(
                 NxmemStatusCode::ShortStruct,
@@ -834,13 +825,44 @@ mod tests {
     }
 
     #[test]
-    fn a_vtable_above_the_negotiated_ceiling_is_refused() {
+    fn a_vtable_above_the_negotiated_ceiling_is_clamped_not_refused() {
         let vtable = conforming_allocator(1);
+        assert!(
+            vtable.release_allocation.is_some(),
+            "the sender really does implement the minor-1 slot"
+        );
         // SAFETY: `vtable` is a live, aligned local.
-        let status =
-            unsafe { NxmemAllocatorVtable::read_prefix(&vtable, 0) }.expect_err("too new");
-        assert_eq!(status.status_code(), Some(NxmemStatusCode::VersionMismatch));
-        assert!(status.describe().contains("negotiated ceiling"));
+        let read = unsafe { NxmemAllocatorVtable::read_prefix(&vtable, 0) }
+            .expect("a newer sender is a strict superset, so a baseline host can still read it");
+        assert_eq!(
+            read.abi_minor, 0,
+            "the effective level is clamped to what both sides agreed"
+        );
+        assert!(
+            read.release_allocation.is_none(),
+            "a slot neither side agreed to must never be callable"
+        );
+        assert!(
+            read.allocate.is_some() && read.deallocate.is_some(),
+            "the baseline prefix still reads back intact"
+        );
+    }
+
+    #[test]
+    fn a_vtable_smaller_than_the_level_it_claims_is_refused() {
+        let mut vtable = conforming_allocator(1);
+        // The sender contradicts itself: it says "minor 1" but sizes itself
+        // for the baseline. That is not an old peer, it is a broken one.
+        vtable.struct_size = NxmemAllocatorVtable::MIN_STRUCT_SIZE_MINOR_0 as u32;
+        // SAFETY: `vtable` is a live, aligned local.
+        let status = unsafe { NxmemAllocatorVtable::read_prefix(&vtable, 1) }
+            .expect_err("a self-contradicting struct_size must be refused");
+        assert_eq!(status.status_code(), Some(NxmemStatusCode::ShortStruct));
+        assert!(
+            status.describe().contains("minor 1"),
+            "the refusal must name the level the sender claimed: {}",
+            status.describe()
+        );
     }
 
     #[test]
