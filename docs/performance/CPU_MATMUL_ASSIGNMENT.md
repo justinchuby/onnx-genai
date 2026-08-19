@@ -456,9 +456,32 @@ Two things this did **not** fix, both open:
   sweep: 4-bit goes 3.60 -> 0.79 ms across 1..16 threads while ORT goes
   1.59 -> 0.13; f32 goes 1.73 -> 0.94 while ORT goes 1.76 -> 0.17. Note what this
   rules out: we do **not** get slower as threads are added, so it is not
-  fork/join overhead — we stop getting *faster*. `gemv_f16_kn`'s fixed
-  `STRIPE = 512` is one concrete instance, yielding only 7 tasks at `n = 3584`
-  however many workers are offered.
+  fork/join overhead — we stop getting *faster*.
+* **Task granularity is *not* the cause — measured and rejected.** The obvious
+  suspect was `gemv_f16_kn`'s fixed `STRIPE = 512`: at `n = 3584` it yields 7
+  tasks however many workers are offered. Making the width adaptive
+  (`n / (2 * threads)`, rounded up to a multiple of 32) raises that to 8/16/28
+  tasks at 4/8/16 threads — and moves nothing. Two interleaved A/B runs of the
+  same binary pair, each with a null control, disagreed in sign:
+
+  | run | host load | t=4 | t=8 | t=16 |
+  |---|---|---|---|---|
+  | 1 (5 trials) | 5.0 | — | +49.1% *(noise 51.9%)* | **+41.0%** *(noise 0.5%)* |
+  | 2 (9 trials) | 9.9 | -15.1% *(noise 8.9%)* | +1.1% *(noise -1.3%)* | +9.2% *(noise 33.5%)* |
+
+  The effect is smaller than this host's between-run variability, so the change
+  was **not shipped**. The absolute numbers are what actually settle it: native
+  `p50` stayed at 1.15-1.64 ms in *both* arms at *every* thread count. 4x the
+  tasks, same time.
+* **The mechanism the rejection points at.** `gemv_f16_kn` holds a `w`-wide
+  `f32` accumulator *in memory* and loops `p` outermost, so every FMA is a
+  load-modify-**store** against L1 — `w` is far too large for the 16 available
+  `ymm` registers, at 512 lanes or at 128. Narrowing the stripe keeps the
+  accumulator in L1 either way, which is precisely why it changed nothing.
+  Fixing this means inverting the loop nest to hold a register-resident
+  accumulator tile across the whole `k` contraction — what `gemv_f16_nk`
+  already does for `[N, K]` — not tuning a constant. That is a kernel rewrite
+  and is the next thing to try, but it is unproven and is claimed as nothing more.
 
 Full record: [`docs/benchmarks/2026-08-19-f16-gemm-transb-decode.md`](../benchmarks/2026-08-19-f16-gemm-transb-decode.md).
 
