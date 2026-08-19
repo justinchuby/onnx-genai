@@ -21,10 +21,32 @@
 //!   machine, so a test can assert them: *"a single-node static-shape `Run`
 //!   makes exactly N FFI calls"*. That turns a performance property into a
 //!   correctness test, which is the only kind that survives contact with CI.
+//!
+//!   [`Event::OrtFfiCall`] is a genuine total: the `ffi_coverage` tests scan
+//!   this crate's source and fail if any file names an ORT API member without
+//!   matching instrumentation, so a new call cannot be added silently.
+//!   [`Event::DispatchAlloc`], counted by hand, is a **lower bound** — see its
+//!   own documentation, and use [`CountingAllocator`] when the exact figure
+//!   matters.
 //! * **Timings** — nanoseconds per phase. Useful for finding the next thing to
 //!   fix, useless as an assertion. They are gated behind an environment
 //!   variable *on top of* the build feature so that enabling counters for a
 //!   test does not drag two `Instant::now()` calls into every phase.
+//!
+//! # Phases are not a partition
+//!
+//! Summing `phase_ns` does not give the time spent in `Compute`, in either
+//! direction. On the success path the phases are *non-exhaustive*: work between
+//! them — output allocation bookkeeping, view construction — is inside no
+//! phase, so the sum is less than wall time. On an error path they *nest*:
+//! `StatusCrossing` opens inside whichever phase was live when the failure was
+//! detected, because a guard closes at scope exit rather than at the early
+//! `return`, so the sum can exceed wall time. `DispatchLookup` is likewise
+//! entered twice per node, once for shape inference and once for workspace
+//! preparation, and reports their total.
+//!
+//! Read a phase as "time attributable to this segment", not as a slice of a
+//! pie chart.
 //!
 //! # Cost when disabled
 //!
@@ -32,9 +54,13 @@
 //! default feature. With it off, [`Phase::enter`] returns a zero-sized guard
 //! whose `Drop` is empty and [`count`] is an empty `#[inline(always)]` function
 //! — there is nothing left for the optimiser to remove.
-//! `probe_is_compiled_out_in_production` pins that the guard is a ZST, and
-//! `dispatch_probe_is_not_a_default_feature` pins that a plain build does not
-//! get it.
+//! `probe_is_compiled_out_in_production` pins that the guard is a ZST with no
+//! `Drop`, and `dispatch_probe_is_not_a_default_feature` pins that a plain
+//! build does not get it. Note the limit of what a test can show here: it can
+//! prove the guard carries no state and runs nothing on scope exit, but it
+//! cannot prove [`count`] has no side effect, because a disabled build has no
+//! storage for it to observe. That claim rests on the function body being
+//! empty, which is visible in the source directly below.
 
 /// A segment of the dispatch path.
 ///
@@ -105,10 +131,23 @@ pub enum Event {
     /// One call through a function pointer in ORT's `OrtApi` table. This is the
     /// headline number for this issue: each one is a cross-library indirect
     /// call that ORT's own CPU EP does not have to make.
+    ///
+    /// This is a **total**, not a sample. The `ffi_coverage` tests scan every
+    /// source file that reaches into `OrtApi` and fail if the set of members it
+    /// names changes without the instrumentation changing with it, so a call
+    /// added later cannot go uncounted without someone noticing.
     OrtFfiCall = 0,
     /// One heap allocation the dispatch path asked for, at a site we control.
-    /// Counted where we allocate deliberately (shape/stride/metadata vectors),
-    /// not by hooking the global allocator.
+    ///
+    /// Unlike [`Event::OrtFfiCall`] this is a **lower bound**, and is honest
+    /// about it. Hand-placed counts cannot be exhaustive: `Vec::new()` does not
+    /// allocate, `Vec::with_capacity(0)` does not allocate, and whether a
+    /// `collect` allocates once or twice depends on `size_hint` rather than on
+    /// anything visible at the call site. It is exhaustive for `read_inputs`,
+    /// where the sites are few and each is pinned by a test.
+    ///
+    /// When the exact whole-`Run` figure is what you need, install
+    /// [`CountingAllocator`] and let the allocator count.
     DispatchAlloc = 1,
     /// One `OrtStatus` constructed and handed back across the ABI. Should be
     /// zero on a successful `Run`.
@@ -454,6 +493,68 @@ pub use imp::{
     PhaseGuard, compiled_in, count, count_n, reset, snapshot, snapshot_global, timing_enabled,
 };
 
+/// A `GlobalAlloc` that tallies every real heap allocation into
+/// [`Event::DispatchAlloc`], for callers that need an exhaustive count rather
+/// than a count of the sites someone remembered to instrument.
+///
+/// Hand-placed `count(DispatchAlloc)` calls cannot be exhaustive in general,
+/// and pretending otherwise is the failure mode this type exists to avoid:
+/// `Vec::new()` does not allocate, `Vec::with_capacity(0)` does not allocate,
+/// and whether a given `collect` allocates once or twice is a property of
+/// `size_hint`, not of the source text. Where the exact number matters, install
+/// this and let the allocator answer.
+///
+/// It is deliberately *not* installed by this crate. A `#[global_allocator]`
+/// may be defined only once per binary, so a library that installs one takes
+/// that choice away from every dependent. Tests and benchmarks opt in:
+///
+/// ```ignore
+/// #[global_allocator]
+/// static A: dispatch_probe::CountingAllocator<std::alloc::System> =
+///     dispatch_probe::CountingAllocator::new(std::alloc::System);
+/// ```
+///
+/// Counts reallocations and the allocating half of a resize, and ignores frees,
+/// because the question being asked is "how much allocator traffic does one
+/// `Run` cause", not "how much memory is live".
+///
+/// Without the `dispatch_probe` feature this forwards to the inner allocator
+/// and records nothing.
+pub struct CountingAllocator<A> {
+    inner: A,
+}
+
+impl<A> CountingAllocator<A> {
+    /// Wrap `inner`, counting the allocations that pass through it.
+    pub const fn new(inner: A) -> Self {
+        Self { inner }
+    }
+}
+
+// SAFETY: every method forwards to `self.inner` with its arguments unchanged
+// and returns its result unchanged, so the allocator contract is exactly the
+// inner allocator's. The added work only touches counters.
+unsafe impl<A: std::alloc::GlobalAlloc> std::alloc::GlobalAlloc for CountingAllocator<A> {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count(Event::DispatchAlloc);
+        unsafe { self.inner.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { self.inner.dealloc(ptr, layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count(Event::DispatchAlloc);
+        unsafe { self.inner.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        count(Event::DispatchAlloc);
+        unsafe { self.inner.realloc(ptr, layout, new_size) }
+    }
+}
+
 /// Tally one ORT FFI call. Shorthand for the single most common count.
 #[inline(always)]
 pub fn ort_call() {
@@ -557,7 +658,7 @@ mod tests {
         assert_eq!(
             snapshot(),
             Counters::default(),
-            "a disabled probe must not record anything"
+            "a disabled probe must not report anything"
         );
         assert_eq!(snapshot_global(), Counters::default());
     }
@@ -666,6 +767,106 @@ mod tests {
         assert_eq!(
             unsafe { nxrt_dispatch_probe_snapshot(std::ptr::null_mut(), need) },
             0
+        );
+    }
+}
+
+/// Guards the claim that `Event::OrtFfiCall` counts *every* call this crate
+/// makes into ORT, rather than the ones somebody remembered to instrument.
+///
+/// An under-counting probe presented as exact is worse than no probe: it
+/// invites a reader to conclude the dispatch path is cheaper than it is. But
+/// completeness is not something a unit test can observe from the inside —
+/// there is no hook that fires when a function pointer is called. So this
+/// checks the next best thing, statically: every ORT entry point the crate
+/// names, and every place it counts a call.
+///
+/// The mechanism is a source scan. ORT's C API members are `CamelCase`, while
+/// Rust fields and methods here are `snake_case`, so `.CamelCase` picks out
+/// API member accesses and essentially nothing else. Pinning both that set and
+/// the instrumentation count means a newly added FFI call cannot land silently:
+/// it changes one of these numbers and the author has to come here, look at
+/// this comment, and decide.
+#[cfg(test)]
+mod ffi_coverage {
+    /// Every source file that reaches into `OrtApi`, with the ORT members it
+    /// names and the number of `ort_call()` sites it contains.
+    ///
+    /// A count may legitimately differ from the number of distinct members: a
+    /// member can be called from more than one place, and an extracted
+    /// function pointer can be invoked through a local binding. What must
+    /// never happen is a member appearing here with no instrumentation to
+    /// account for it.
+    const EXPECTED: &[(&str, &str, usize, usize)] = &[
+        ("compute.rs", include_str!("compute.rs"), 9, 9),
+        ("kernel_ctx.rs", include_str!("kernel_ctx.rs"), 11, 11),
+        ("status.rs", include_str!("status.rs"), 1, 1),
+        ("host_pool.rs", include_str!("host_pool.rs"), 2, 2),
+    ];
+
+    /// Source ahead of the file's `#[cfg(test)]` block — test scaffolding
+    /// names ORT members too (the fake `OrtApi` in `kernel_ctx`, the fake
+    /// thread pools here), and instrumenting a fake would prove nothing.
+    fn production_source(src: &str) -> &str {
+        match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        }
+    }
+
+    fn ort_members(src: &str) -> Vec<String> {
+        let b = src.as_bytes();
+        let mut out: Vec<String> = Vec::new();
+        for (i, w) in b.windows(2).enumerate() {
+            if w[0] == b'.' && w[1].is_ascii_uppercase() {
+                // Skip `::Variant` — a path, not a member access.
+                if i > 0 && b[i - 1] == b':' {
+                    continue;
+                }
+                let rest = &src[i + 1..];
+                let end = rest
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(rest.len());
+                out.push(rest[..end].to_string());
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn every_ort_entry_point_is_accounted_for() {
+        for (name, src, want_members, want_calls) in EXPECTED {
+            let prod = production_source(src);
+            let members = ort_members(prod);
+            let calls = prod.matches("dispatch_probe::ort_call()").count();
+            assert_eq!(
+                members.len(),
+                *want_members,
+                "{name} now names {} ORT API members ({members:?}), not {want_members}. \
+                 If you added an FFI call, add an `ort_call()` beside it and update \
+                 this table; if you removed one, just update the table.",
+                members.len()
+            );
+            assert_eq!(
+                calls, *want_calls,
+                "{name} has {calls} `ort_call()` sites, not {want_calls}. Every call \
+                 into ORT must be counted, or `Event::OrtFfiCall` stops being a total."
+            );
+        }
+    }
+
+    /// The scan has to actually find things — a heuristic that silently matched
+    /// nothing would let the assertions above pass vacuously forever.
+    #[test]
+    fn the_source_scan_is_not_vacuous() {
+        let m = ort_members(production_source(include_str!("kernel_ctx.rs")));
+        assert!(m.contains(&"KernelContext_GetInput".to_string()), "{m:?}");
+        assert!(m.contains(&"GetTensorData".to_string()), "{m:?}");
+        assert!(
+            !m.iter().any(|s| s.contains("::")),
+            "path segments must not be mistaken for member accesses: {m:?}"
         );
     }
 }

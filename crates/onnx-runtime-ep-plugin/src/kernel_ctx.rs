@@ -189,7 +189,11 @@ pub(crate) unsafe fn read_inputs(
         return Err("KernelContext_GetInputCount failed".into());
     }
 
-    crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
+    // `Vec::with_capacity(0)` does not allocate, so a node with no inputs must
+    // not be charged for this one.
+    if input_count > 0 {
+        crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
+    }
     let mut inputs = Vec::with_capacity(input_count);
     for i in 0..input_count {
         let mut value: *const ort::OrtValue = std::ptr::null();
@@ -777,6 +781,36 @@ mod dispatch_cost {
             d.event(Event::OrtFfiCall),
             2,
             "an absent optional input must cost the input count plus one probe, nothing more"
+        );
+    }
+
+    /// A node with no inputs must not be charged for the `Vec<OwnedInput>`:
+    /// `Vec::with_capacity(0)` does not call the allocator. Counting it anyway
+    /// would make every constant-producing node look one allocation worse than
+    /// it is.
+    #[test]
+    fn a_node_with_no_inputs_allocates_nothing() {
+        unsafe extern "C" fn none(
+            _c: *const ort::OrtKernelContext,
+            out: *mut usize,
+        ) -> ort::OrtStatusPtr {
+            unsafe { *out = 0 };
+            std::ptr::null_mut()
+        }
+        let mut api = fake_api();
+        api.KernelContext_GetInputCount = Some(none);
+
+        let before = dispatch_probe::snapshot();
+        let inputs =
+            unsafe { read_inputs(&api, std::ptr::null_mut()) }.expect("zero inputs is fine");
+        let d = dispatch_probe::snapshot().since(&before);
+
+        assert!(inputs.is_empty());
+        assert_eq!(d.event(Event::OrtFfiCall), 1);
+        assert_eq!(
+            d.event(Event::DispatchAlloc),
+            0,
+            "an empty Vec::with_capacity must not be counted as an allocation"
         );
     }
 

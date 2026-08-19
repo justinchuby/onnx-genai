@@ -1148,6 +1148,7 @@ impl Drop for ReconstructedMemInfo {
             return;
         }
         if let Some(release) = unsafe { (*api).ReleaseMemoryInfo } {
+            crate::dispatch_probe::ort_call();
             unsafe { release(self.ptr.cast_mut()) };
         }
     }
@@ -1254,6 +1255,7 @@ unsafe fn device_mem_info(
     // on the device — scan every input for a genuinely device-resident one.
     if let Some(get_count) = api.KernelContext_GetInputCount {
         let mut count: usize = 0;
+        crate::dispatch_probe::ort_call();
         let status = unsafe { get_count(ctx, &mut count) };
         if status.is_null() {
             for i in 0..count {
@@ -1295,11 +1297,13 @@ unsafe fn ort_input_mem_info(
     let get_input = api.KernelContext_GetInput?;
     let get_mem_info = api.GetTensorMemoryInfo?;
     let mut value: *const ort::OrtValue = std::ptr::null();
+    crate::dispatch_probe::ort_call();
     let status = unsafe { get_input(ctx, index, &mut value) };
     if !status.is_null() || value.is_null() {
         return None;
     }
     let mut mem_info: *const ort::OrtMemoryInfo = std::ptr::null();
+    crate::dispatch_probe::ort_call();
     let status = unsafe { get_mem_info(value, &mut mem_info) };
     if !status.is_null() || mem_info.is_null() {
         return None;
@@ -1478,6 +1482,7 @@ unsafe fn operand_mem_info(
             return OperandMemInfo::Unavailable;
         };
         let mut equal: std::os::raw::c_int = 0;
+        crate::dispatch_probe::ort_call();
         let status = unsafe { compare(first, other, &mut equal) };
         if !status.is_null() {
             // ORT allocated this status and handed us ownership; dropping the
@@ -1515,6 +1520,7 @@ unsafe fn alloc_scratch(
         .KernelContext_GetScratchBuffer
         .ok_or("OrtApi.KernelContext_GetScratchBuffer is null")?;
     let mut out: *mut c_void = std::ptr::null_mut();
+    crate::dispatch_probe::ort_call();
     let status = unsafe { get_scratch(ctx, mem_info, bytes.max(1), &mut out) };
     if !status.is_null() {
         return Err("KernelContext_GetScratchBuffer failed".into());
@@ -1581,6 +1587,7 @@ fn reconstruct_device_mem_info(
     let create = unsafe { (*api).CreateMemoryInfo_V2 }?;
     let name = std::ffi::CString::new(allocator_name).ok()?;
     let mut ptr: *mut ort::OrtMemoryInfo = std::ptr::null_mut();
+    crate::dispatch_probe::ort_call();
     let status = unsafe {
         create(
             name.as_ptr(),
@@ -1595,6 +1602,7 @@ fn reconstruct_device_mem_info(
     };
     if !status.is_null() {
         if let Some(release) = unsafe { (*api).ReleaseStatus } {
+            crate::dispatch_probe::ort_call();
             unsafe { release(status) };
         }
         return None;
@@ -1616,6 +1624,7 @@ unsafe fn mem_info_device_type(
 ) -> Option<ort::OrtMemoryInfoDeviceType> {
     let f = api.MemoryInfoGetDeviceType?;
     let mut out: ort::OrtMemoryInfoDeviceType = ort::OrtMemoryInfoDeviceType_CPU;
+    crate::dispatch_probe::ort_call();
     unsafe { f(mem_info, &mut out) };
     Some(out)
 }
