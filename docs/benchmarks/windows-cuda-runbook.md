@@ -10,10 +10,11 @@ output is illustrative only.
 
 > **Status when written (2026-08-19):** every command below was executed on the
 > primary Windows dev box (see §0) and the results are recorded as
-> **passed / failed / ignored**. Where the author's field notes did not match
-> what actually happened on this machine, the discrepancy is called out inline
-> under **Correction**. The validated smoke command (§2) produces coherent text
-> on the GPU.
+> **passed / failed / ignored**. Two smoke models were validated: a dense GQA
+> model (`qwen2.5-0.5b`, §2) and an MoE model that additionally exercises cuDNN
+> (`granite-1b-a400m-f16-mobius`, §2b). Both produce coherent GPU text. Where the
+> observed behaviour is model-dependent (Failures 2 and 3), each model's measured
+> outcome is given side by side in §3.
 
 ---
 
@@ -145,6 +146,30 @@ rejects it before any CUDA work with
 […]` (a model-packaging mismatch, unrelated to the CUDA setup). Use the fp16
 `qwen2.5-0.5b` package for the smoke test.
 
+### 2b. Stricter smoke: an MoE model that exercises cuDNN (validated)
+
+`qwen2.5-0.5b` is a dense GQA model whose native path never touches cuDNN (see
+§3). To exercise **both** the MoE path **and** cuDNN in one command, run a
+Mixture-of-Experts model. Validated against `granite-1b-a400m-f16-mobius`
+(~2.6 GB fp16 weights; fits the 8 GiB card alongside a concurrent job):
+
+```powershell
+& .\target\release\profile_native.exe `
+    --model C:\path\to\models\granite-1b-a400m-f16-mobius --ep cuda --steady `
+    --tokens 32 --warmups 1 --runs 1 --prompt "The capital of France is"
+```
+
+**Result: passed.** Illustrative (non-timing) output:
+
+```
+profile_native: model=…\granite-1b-a400m-f16-mobius ep=Cuda backend=native
+generated_text: " Paris. Paris is a beautiful city with a rich history and culture. ..."
+```
+
+This is the better environment self-check of the two: it is the command that
+actually forces the cuDNN dependency (§3, Failure 3). If it produces coherent
+text, all three of cuBLASLt, the NVRTC headers, and cuDNN are wired correctly.
+
 ---
 
 ## 3. The three failures you get without §1
@@ -152,7 +177,9 @@ rejects it before any CUDA work with
 Each of these **looks like a missing engine capability but is only a missing DLL
 or header.** They appear in this order as you add pieces of the env. All three
 are **loud, actionable errors from the native EP** — which is the good outcome
-(contrast §4).
+(contrast §4). **Which model you run decides whether Failure 2 and Failure 3
+fire at all**, and in what form — the notes below give the measured evidence for
+two different models.
 
 **Failure 1 — at EP init (nothing on `PATH`).** *Reproduced verbatim here:*
 
@@ -161,49 +188,73 @@ cuda_ep: CUDA CublasLt library not found; tried
 ["cublasLt64_13.dll", "cublasLt64_12.dll", "cublasLt.dll"];
 CPU execution remains available
 ```
-Fix: put `…\cu13\bin\x86_64` on `PATH`.
+Fix: put `…\cu13\bin\x86_64` on `PATH`. This one is model-independent — it fires
+at EP init before any graph runs.
 
-**Failure 2 — at the first f16/bf16 kernel (cuBLASLt on `PATH`, no `CUDA_PATH`).**
-The EP's per-op pre-check emits:
+**Failure 2 — at the first f16/bf16 NVRTC kernel (cuBLASLt on `PATH`, no
+`CUDA_PATH`).** This surfaces in **two forms** depending on which op compiles
+first; **both are measured**, and both have the same root cause (NVRTC cannot
+find `cuda_fp16.h`) and the same fix (set `CUDA_PATH`).
 
-```
-cuda_ep <Op>: f16/bf16 NVRTC kernels require cuda_fp16.h and cuda_bf16.h.
-Install the CUDA runtime headers (for pip CUDA 13: `pip install nvidia-cuda-runtime`;
-alternatively set CUDA_HOME/CUDA_PATH).
-```
-Fix: set `CUDA_PATH` / `CUDA_HOME` to the wheel root whose `include\` holds
-`cuda_fp16.h`.
+- *Form A — friendly per-op pre-check.* Measured on `granite-1b-a400m-f16-mobius`
+  (first half op is a `Mul`, node `model/Mul_node_1`), which routes through the
+  EP's `require_nvrtc_half_headers` pre-check:
+  ```
+  cuda_ep Mul: f16/bf16 NVRTC kernels require cuda_fp16.h and cuda_bf16.h.
+  Install the CUDA runtime headers (for pip CUDA 13: `pip install nvidia-cuda-runtime`;
+  alternatively set CUDA_HOME/CUDA_PATH).
+  ```
+- *Form B — raw NVRTC compiler error.* Measured on `qwen2.5-0.5b`, whose first
+  half op is an `RMSNormalization` (`rmsnorm_bf16_v4`) that skips the pre-check
+  and fails straight inside NVRTC:
+  ```
+  compiling NVRTC CUBIN module 'rmsnorm_bf16_v4' failed (NVRTC_ERROR_COMPILATION);
+  rmsnorm_bf16_v4(2): catastrophic error: could not open source file "cuda_fp16.h"
+  ```
 
-> **Correction (verified):** with the `qwen2.5-0.5b` model the *first* half kernel
-> is an `RMSNormalization`, not a `Mul`, and its code path does **not** run the
-> friendly pre-check above. What actually printed here was the **raw NVRTC
-> compiler error**:
-> ```
-> compiling NVRTC CUBIN module 'rmsnorm_bf16_v4' failed (NVRTC_ERROR_COMPILATION);
-> rmsnorm_bf16_v4(2): catastrophic error: could not open source file "cuda_fp16.h"
-> ```
-> Same root cause, same fix (`CUDA_PATH`). The friendly `cuda_ep <Op>:` wording
-> does exist in the code (`require_nvrtc_half_headers`) and fires for the ops
-> that call it — just not for the RMSNorm that this model hits first.
+Document both so nobody who sees Form B assumes it is a different problem from
+Form A. Fix (either form): set `CUDA_PATH` / `CUDA_HOME` to the wheel root whose
+`include\` holds `cuda_fp16.h`.
+
+> **Caveat (measured, worth knowing):** Failure 2 can be *masked* by the EP's
+> own header auto-discovery. The EP also probes the cu12 layout's
+> `nvidia\cuda_runtime\include` (via `wheel_cuda_include_paths`), and that
+> directory ships `cuda_fp16.h` from the `nvidia-cuda-runtime-cu12` wheel. On
+> this box, re-running `granite` with cuBLASLt+cuDNN on `PATH` **but no
+> `CUDA_PATH`** *succeeded* rather than reproducing Form A, because those cu12
+> headers were auto-found. Do **not** rely on that — it depends on which wheel
+> roots happen to be registered. Setting `CUDA_PATH` explicitly (as in §1) is the
+> reliable fix.
 
 **Failure 3 — at the first cuDNN-backed op (headers set, cuDNN not on `PATH`).**
-The EP would emit:
+**This is model-dependent, and both outcomes are measured:**
 
-```
-cuda_ep: cuDNN (libcudnn.so.9 / cudnn64_9.dll) was not found at runtime.
-Install it with 'pip install nvidia-cudnn-cu13' or 'conda install -c nvidia cudnn',
-or add the cuDNN library directory to the platform library search path.
-```
-Fix: put `nvidia\cudnn\bin` on `PATH`.
+- *Fires — MoE model.* Measured on `granite-1b-a400m-f16-mobius` with `CUDA_PATH`
+  set and cuBLASLt on `PATH` but **cuDNN deliberately left off `PATH`**. The MoE
+  router's gate `Softmax` is cuDNN-backed and fails at node
+  `model/layers.0/mlp/gate/Softmax_node_39`:
+  ```
+  steady_partial_error: native CUDA decoder forward pass failed: internal executor error:
+  node 31 ("model/layers.0/mlp/gate/Softmax_node_39", op '::Softmax',
+  inputs ["v_model.layers.0.mlp.gate.TopK_38_0"] [Float16] [[1, 1, 8]],
+  outputs ["v_model.layers.0.mlp.gate.Softmax_39"] [Float16] [[1, 1, 8]])
+  failed: kernel execution failed: cuda_ep: cuDNN (libcudnn.so.9 / cudnn64_9.dll)
+  was not found at runtime. Install it with 'pip install nvidia-cudnn-cu13' or
+  'conda install -c nvidia cudnn', or add the cuDNN library directory to the
+  platform library search path.
+  ```
+  Adding `nvidia\cudnn\bin` to `PATH` makes the exact same command pass.
+- *Does not fire — dense GQA model.* Measured on `qwen2.5-0.5b` with cuDNN
+  **off** `PATH`: the run still **succeeded** with coherent output. Its native
+  GQA decode compiles its own NVRTC softmax/attention kernels and never invokes
+  a cuDNN op.
 
-> **Correction (verified):** this failure did **not** occur for the
-> `qwen2.5-0.5b` native path. With `CUDA_PATH` set and cuBLASLt on `PATH` but
-> **cuDNN deliberately left off `PATH`**, the run still **succeeded** with
-> coherent output — the native GQA decode compiles its own NVRTC softmax/attention
-> kernels and never invokes a cuDNN op. The `cudnn64_9.dll` error is real code
-> and can fire for a model whose graph reaches a cuDNN-backed op, so keeping
-> `nvidia\cudnn\bin` on `PATH` (as in §1) is still recommended — but it was not
-> the blocker for this model.
+Fix (when it fires): put `nvidia\cudnn\bin` on `PATH`.
+
+> **Takeaway — configure all three, always.** Whether you can skip cuDNN depends
+> entirely on which ops your model graph reaches (dense GQA: no cuDNN; MoE gate
+> Softmax: cuDNN). Since you cannot know that up front, the §1 block wires
+> cuBLASLt, the NVRTC headers, **and** cuDNN so any model just works.
 
 ### Why "loud" matters
 
@@ -288,11 +339,15 @@ returned nothing after each). If a run hangs, stop it by its specific PID
 |---|---|
 | No CUDA toolkit; libs come from `site-packages\nvidia` wheels | **measured** (passed) |
 | Failure 1 (`CublasLt … not found`) verbatim without cuBLASLt on `PATH` | **measured** (reproduced) |
-| Failure 2 (missing `cuda_fp16.h`) — surfaced as a raw NVRTC error for RMSNorm | **measured** (reproduced; wording corrected) |
-| Failure 3 (cuDNN) for `qwen2.5-0.5b` native path | **measured: did NOT fire** (correction) |
+| Failure 2 Form A — friendly `cuda_ep Mul:` pre-check, granite (`model/Mul_node_1`) | **measured** (reproduced) |
+| Failure 2 Form B — raw NVRTC `cuda_fp16.h` error, qwen (`rmsnorm_bf16_v4`) | **measured** (reproduced) |
+| Failure 2 masked by cu12 `cuda_runtime\include` header auto-discovery (granite, no `CUDA_PATH`) | **measured** (observed the mask) |
+| Failure 3 (cuDNN) **fires** on MoE `granite` at gate `Softmax_node_39` | **measured** (reproduced; adding cuDNN to `PATH` fixes it) |
+| Failure 3 (cuDNN) **does not fire** on dense GQA `qwen2.5-0.5b` | **measured** (ran clean without cuDNN) |
 | cu13 cuBLAS/runtime/NVRTC + `nvidia\cudnn\bin` combination runs | **measured** (passed) |
 | cu12 layout works | **not tested** (inferred to also expose the same DLLs) |
-| Smoke run produces coherent GPU text on `qwen2.5-0.5b` | **measured** (passed) |
+| Smoke run produces coherent GPU text on `qwen2.5-0.5b` (dense GQA) | **measured** (passed) |
+| Smoke run produces coherent GPU text on `granite-1b-a400m-f16-mobius` (MoE + cuDNN) | **measured** (passed) |
 | `qwen2.5-0.5b-q4` usable | **measured: no** (unrelated `position_ids` IO mismatch) |
 | `--tokens` must exceed `--decode-skip` | **measured** (both fail and pass cases) |
 | Discovery snippet (`import nvidia …`) locates the DLLs/headers | **measured** (passed) |
