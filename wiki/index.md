@@ -8,7 +8,7 @@ tags:
   - home
 status: maintained
 created: 2026-08-18
-updated: 2026-08-18
+updated: 2026-08-19
 ---
 
 # onnx-genai Knowledge Base
@@ -60,10 +60,17 @@ starts at the position right after the rendered assistant prefix, multimodal
 placeholder variants, recipient-scoped channels (`to=self` / `to=user` /
 `to=<tool>`), and how tool calls are rendered and fed back.
 
+[[performance/Chunked Prefill]] (中文) explains why a prompt can be prefilled in
+pieces without recomputing the KV a chunk attends over, what capping the query
+width buys, and why the leftover final chunk had to be padded onto a fixed
+ladder before the kernel cache could stop recompiling the graph on every
+request.
+
 ### Change or measure the runtime
 
 - [[development/Testing and Verification]]
 - [[performance/Performance Engineering Playbook]]
+- [[performance/Chunked Prefill]]
 - [[observability/Tracing and Profiling]]
 - [[api/API Design Principles]]
 

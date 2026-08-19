@@ -7,7 +7,7 @@ tags:
   - index
 status: maintained
 created: 2026-08-17
-updated: 2026-08-17
+updated: 2026-08-19
 ---
 
 # onnx-genai Wiki
@@ -41,6 +41,7 @@ Published readers start at [[index|onnx-genai Knowledge Base]].
 - **Chat templates:** [[prompting/Chat Templates]]
 - **Tracing:** [[observability/Tracing and Profiling]]
 - **Performance engineering:** [[performance/Performance Engineering Playbook]]
+- **Chunked prefill:** [[performance/Chunked Prefill]]
 - **API design:** [[api/API Design Principles]]
 - **Contracts:** [[contracts/Runtime Contracts]]
 - **Formal verification:** [[contracts/Formal Verification with TLA+]]
