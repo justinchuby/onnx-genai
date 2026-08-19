@@ -316,10 +316,26 @@ impl PipelineEngine {
                 format!("native pipeline prompt component '{component}' has no model path")
             })?;
         let device = super::native_decoder_device(self.native_device.as_ref());
-        let session = crate::native_component::NativeComponentSession::load(path, device)
-            .with_context(|| {
-                format!("failed to load native pipeline prompt component '{component}'")
-            })?;
+        if matches!(device, crate::native_decode_device::NativeDecodeDevice::Cpu) {
+            // The silent case is the expensive one: a vision tower on CPU still
+            // produces correct embeddings, just two orders of magnitude slower,
+            // so nothing fails and nothing is logged. Say it once, at load.
+            tracing::warn!(
+                component,
+                model = %path.display(),
+                "native pipeline prompt component is running on CPU; if this package has a CUDA \
+                 execution provider available, prompt-phase encoders (a vision tower) will be far \
+                 slower than the decoder that follows them"
+            );
+        }
+        let session = crate::native_component::NativeComponentSession::load(
+            path,
+            device,
+            Some(self.resource_governor.memory()),
+        )
+        .with_context(|| {
+            format!("failed to load native pipeline prompt component '{component}'")
+        })?;
         self.native_prompt_sessions
             .borrow_mut()
             .insert(component.to_string(), Box::new(session));
