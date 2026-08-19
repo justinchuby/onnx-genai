@@ -10,11 +10,12 @@ tags:
   - prompt
   - tools
 status: maintained
+lang: zh-CN
 created: 2026-08-19
 updated: 2026-08-19
 ---
 
-# 对话模板(Chat Template)
+# Chat Templates
 
 > [!summary] 本文回答的问题
 > 一段结构化的对话,是怎样变成模型真正看到的那一串 token 的?模板之后发生了什么?

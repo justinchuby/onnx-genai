@@ -5,7 +5,7 @@ configuration:
   enableSPA: true
   enablePopovers: true
   analytics: null
-  locale: en-US
+  locale: zh-CN
   baseUrl: www.justinchuby.com/onnx-genai
   ignorePatterns:
     - private

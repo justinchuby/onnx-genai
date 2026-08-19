@@ -8,19 +8,20 @@ tags:
   - ep
   - performance
 status: maintained
+lang: zh-CN
 created: 2026-08-17
-updated: 2026-08-17
+updated: 2026-08-19
 ---
 
 # CUDA Execution Provider
 
-> [!summary] Question answered
-> What does the native CUDA EP own, and how do kernels, streams, graph capture, VMM and weight residency fit together?
+> [!summary] 本文回答的问题
+> 原生 CUDA EP 拥有哪些职责,以及 kernel、stream、graph capture、VMM 和权重驻留是如何组合在一起的?
 
-The CUDA EP implements the native EP contract on CUDA driver APIs, cuBLASLt,
-cuDNN where applicable, and runtime-compiled kernels.
+CUDA EP 在 CUDA 驱动 API、cuBLASLt、适用处的 cuDNN 以及运行时编译的 kernel
+之上,实现了原生 EP 契约。
 
-## Main components
+## 主要组件
 
 ```mermaid
 flowchart TD
@@ -42,82 +43,79 @@ flowchart TD
     EP --> TRACE
 ```
 
-## Kernel strategy
+## Kernel 策略
 
-The EP prefers proven libraries where they fit and writes custom kernels for
-measured gaps or fusion opportunities:
+EP 在合适之处优先使用经过验证的库,并针对实测出的差距或融合机会编写自定义
+kernel:
 
-- GEMM family through cuBLASLt, including supported epilogues;
-- selected cuDNN operations;
-- NVRTC elementwise and attention kernels;
-- custom quantized, indexing, reduction and fused decode paths.
+- GEMM 系列通过 cuBLASLt 实现,包括受支持的 epilogue;
+- 选定的 cuDNN 操作;
+- NVRTC 的 elementwise 与 attention kernel;
+- 自定义的量化、索引、reduction 以及融合的 decode 路径。
 
-There is no build-time `nvcc` requirement for the core EP path: CUDA libraries
-are dynamically loaded and NVRTC compiles relevant source at runtime.
+核心 EP 路径在构建期没有 `nvcc` 依赖:CUDA 库是动态加载的,NVRTC 在运行时
+编译相关源码。
 
-Kernels remain model-agnostic. Head counts, dimensions, causal behavior and
-scales come from graph structure/attributes/runtime data.
+Kernel 保持与模型无关。head 数量、维度、causal 行为和 scale 都来自图结构/
+属性/运行时数据。
 
-## Streams and fences
+## Stream 与 fence
 
-CUDA operations are asynchronous. The EP manages:
+CUDA 操作是异步的。EP 负责管理:
 
-- compute stream ordering;
-- copy-stream overlap;
-- host-to-device/device-to-host/device-to-device transfer;
-- compute/copy fences;
-- synchronization before unsafe reuse or unmapping.
+- compute stream 的排序;
+- copy-stream 的重叠;
+- host-to-device/device-to-host/device-to-device 传输;
+- compute/copy fence;
+- 在不安全的复用或 unmap 之前进行同步。
 
-This is why raw allocator access cannot replace the EP execution context. A
-pointer may be valid while the GPU still has pending users.
+这正是为什么裸的 allocator 访问不能替代 EP 执行上下文。当 GPU 上仍有挂起的
+使用者时,一个指针可能仍然"有效"。
 
 ## CUDA graph capture
 
-Capture reduces repeated launch overhead by recording a stable execution region
-and replaying it. Eligibility depends on:
+capture 通过记录一段稳定的执行区域并回放它,来降低重复的启动开销。是否适用
+取决于:
 
-- stable addresses and shapes;
-- capture-safe kernels and allocations;
-- no unsupported host decision in the captured region;
-- explicit rejection reasons for seams;
-- correct invalidation when state capacity or bindings change.
+- 稳定的地址与形状;
+- capture-safe 的 kernel 与分配;
+- 被捕获区域内没有不受支持的 host 决策;
+- 对接缝(seam)给出显式的拒绝原因;
+- 当状态容量或绑定改变时能正确失效。
 
-A performance result must report `captures` and `fallbacks`; a “speedup” that
-silently disables capture is not the same configuration.
+一个性能结果必须报告 `captures` 和 `fallbacks`;一个悄悄禁用了 capture 的
+"加速"并不是同一份配置。
 
-## Memory and VMM
+## 内存与 VMM
 
-The EP can use ordinary CUDA allocation or an installed VMM arena. VMM separates
-stable virtual address capacity from mapped physical bytes and enables
-incremental KV growth and shared backing.
+EP 可以使用普通的 CUDA 分配,或使用已安装的 VMM arena。VMM 将稳定的虚拟地址
+容量与已映射的物理字节分离开,并支持 KV 的增量增长与共享后备存储。
 
-The mechanism is separated into `onnx-runtime-cuda-memory` and re-exported for
-compatibility. Governance, mapping and EP stream ordering remain distinct
-responsibilities. See [[memory/Memory Management for Beginners]].
+该机制被拆分到 `onnx-runtime-cuda-memory` 中,并为兼容性而重新导出。治理、
+映射与 EP 的 stream 排序仍是各自独立的职责。参见
+[[memory/Memory Management for Beginners]]。
 
-## Weight residency
+## 权重驻留
 
-Large models may keep, stream or map weights according to a residency policy.
-The EP exposes:
+大模型可以根据驻留策略选择保留、streaming 或映射权重。EP 暴露:
 
-- lazy/resident weight capability negotiation;
-- paging and prefetch;
-- pinned staging reuse;
-- byte-aware residency metrics;
-- explicit policy and fallback reporting.
+- lazy/resident 权重的能力协商;
+- 分页与预取;
+- pinned staging 的复用;
+- 按字节感知的驻留指标;
+- 显式的策略与回退报告。
 
-The Governor approves capacity; the residency holder chooses victims. The
-allocator does not decide which tensor is hot.
+Governor 批准容量;驻留持有者选择淘汰对象。allocator 不决定哪个 tensor 是热的。
 
-## Error and portability discipline
+## 错误处理与可移植性纪律
 
-- Unsupported op/dtype/rank/device conditions return actionable errors.
-- NVRTC failures preserve compiler logs.
-- Exactly one supported CUDA binding version is selected at build time.
-- Runtime kernels target the actual device rather than one datacenter GPU.
-- Consumer WDDM behavior must not be inferred from Linux/TCC measurements.
+- 不受支持的 op/dtype/rank/device 情况返回可操作的错误。
+- NVRTC 失败会保留编译器日志。
+- 构建期恰好选定一个受支持的 CUDA 绑定版本。
+- 运行时 kernel 面向实际设备,而非某一款数据中心 GPU。
+- 不得从 Linux/TCC 的测量结果推断消费级 WDDM 行为。
 
-## Formal sources
+## 形式化来源
 
 - [`onnx-runtime-ep-cuda`](../../crates/onnx-runtime-ep-cuda/src/lib.rs)
 - [`CUDA_COVERAGE.md`](../../docs/execution/CUDA_COVERAGE.md)
@@ -126,7 +124,7 @@ allocator does not decide which tensor is hot.
 - [`CUDA_STRATEGY.md`](../../docs/execution/CUDA_STRATEGY.md)
 - [`NATIVE_CUDA_DECODE.md`](../../docs/execution/NATIVE_CUDA_DECODE.md)
 
-## Related notes
+## 相关笔记
 
 - [[execution/Execution Provider Contract]]
 - [[performance/Performance Engineering Playbook]]

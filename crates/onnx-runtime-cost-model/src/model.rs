@@ -311,7 +311,7 @@ mod tests {
         // Compute-heavy: 2e13 FLOP / 2e13 = 1 s dominates the tiny memory term.
         let s = KernelStructure {
             bytes_moved: 8,
-            flops: Some(2_000_000_000_000_0),
+            flops: Some(20_000_000_000_000),
             compute_dtype: Some(DataType::Float16),
             launch_count: 1,
         };
