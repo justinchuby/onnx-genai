@@ -126,7 +126,7 @@ impl NativeComponentSession {
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
             NativeDecodeDevice::Plugin { .. } => DevicePreference::Cpu,
         };
-        let session = InferenceSession::builder()
+        let mut session = InferenceSession::builder()
             .model(path)
             .device(preference)
             .build()
@@ -136,6 +136,12 @@ impl NativeComponentSession {
                     path.display()
                 )
             })?;
+        // A component graph is run once per request and never records a device
+        // graph, so its intermediates can be freed as they die. The vision
+        // encoder is why this matters: holding every one of its 2545 node
+        // outputs at once cost ~23 GB at 448px and put full-resolution images
+        // out of reach entirely.
+        session.set_release_dead_values(true);
         if requested_cuda && let Some(report) = session.execution_provider_fallback_report() {
             tracing::warn!(
                 model = %path.display(),

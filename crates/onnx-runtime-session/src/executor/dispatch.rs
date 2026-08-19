@@ -169,6 +169,7 @@ impl Executor {
                 entry.0 += elapsed;
                 entry.1 += 1;
                 result?;
+                self.release_dead_values(pi, external);
             }
             print_op_profile(run_start.elapsed(), timings);
         } else {
@@ -178,9 +179,74 @@ impl Executor {
                 }
                 self.prefetch_lazy_weights_after(pi)?;
                 self.exec_plan_node(pi, resolved, outer_scope, external, OpCaptureTrace::Eager)?;
+                self.release_dead_values(pi, external);
             }
         }
         Ok(())
+    }
+
+    /// Release the buffers of values whose last consumer was plan node `pi`.
+    ///
+    /// The guards mirror the in-place-overwrite path: anything the caller owns,
+    /// anything aliased by a view, and anything a sequence or shared buffer still
+    /// refers to is left alone. A value that fails a guard simply stays resident,
+    /// which is the pre-existing behaviour for every value.
+    /// Free the buffers of values whose last consumer was node `pi`.
+    ///
+    /// The guard list is deliberately the same one `inplace_input` applies,
+    /// because both are asking the same question: may this buffer be taken away
+    /// from the value that currently holds it? Any guard added there belongs
+    /// here too.
+    ///
+    /// A value that is aliased -- by a view, by a sequence's shared storage --
+    /// is never released, even after every alias has died. `pinned` records
+    /// that a value was ever an alias source and is only cleared between runs,
+    /// so it is a deliberately conservative over-approximation. Releasing on
+    /// the exact liveness test (`views` no longer names it as a source) would
+    /// be wrong for the decode memo, which restores a step's view table from
+    /// `retained_views` on the *next* run and expects the source buffer to
+    /// still be resident. Measured cost of the conservative choice on the
+    /// vision encoder is 36 MiB out of ~12 GB reclaimed, which does not buy an
+    /// aliasing analysis that has to be right across runs.
+    fn release_dead_values(&mut self, pi: usize, external: &ExternalBindings) {
+        if !self.release_dead_values_enabled {
+            return;
+        }
+        let dead = std::mem::take(&mut self.plan[pi].dead_after);
+        for &vid in &dead {
+            if external.inputs.contains_key(&vid)
+                || external.outputs.contains_key(&vid)
+                || self.pinned.contains(&vid)
+                || self.shared_buffers.contains_key(&vid)
+                || self.seq_elem_values.contains_key(&vid)
+                || self.views.contains_key(&vid)
+            {
+                continue;
+            }
+            // A memoized loop-invariant `If` skips its branch on later runs and
+            // serves the outputs straight from the buffers the first run left
+            // resident (see `exec_if`), and the memo outlives an eager run.
+            // Freeing one of those outputs turns the next skip into a missing
+            // buffer. `try_move_host_output` declines for the same reason.
+            if let Some(producer) = self.graph.try_value(vid).and_then(|value| value.producer)
+                && self.if_last_predicate.contains_key(&producer)
+            {
+                continue;
+            }
+            // A borrowed buffer aliases memory this session does not own.
+            if self.buffers.get(&vid).is_some_and(|b| b.is_borrowed()) {
+                continue;
+            }
+            // `DeviceBuffer` is a bare handle with no `Drop`: dropping it
+            // strands the allocation, so the owning EP has to free it.
+            if let Some(buffer) = self.buffers.remove(&vid) {
+                // The reuse fast path treats a surviving shape entry as proof
+                // the allocation is still there, so it has to go with it.
+                self.buffer_shapes.remove(&vid);
+                let _ = self.ep.deallocate(buffer);
+            }
+        }
+        self.plan[pi].dead_after = dead;
     }
 
     fn prefetch_lazy_weights_after(&self, pi: usize) -> Result<()> {
