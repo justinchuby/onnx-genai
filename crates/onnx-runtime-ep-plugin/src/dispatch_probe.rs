@@ -534,17 +534,32 @@ mod tests {
     #[test]
     #[cfg(not(feature = "dispatch_probe"))]
     fn probe_is_compiled_out_in_production() {
-        assert_eq!(std::mem::size_of::<PhaseGuard>(), 0);
         assert!(!compiled_in());
-        let before = snapshot();
+        assert_eq!(
+            std::mem::size_of::<PhaseGuard>(),
+            0,
+            "the disabled guard must carry no state"
+        );
+        assert!(
+            !std::mem::needs_drop::<PhaseGuard>(),
+            "the disabled guard must not run code when it leaves scope"
+        );
+
         let _g = Phase::KernelInvoke.enter();
         count(Event::OrtFfiCall);
         ort_calls(1000);
+
+        // Compared against `Counters::default()`, not against a snapshot taken
+        // beforehand. The relative form is vacuous: it compares two calls to a
+        // function the compiler is free to fold to a constant, so it passes
+        // even against a build whose "disabled" probe records on every call.
+        // This was verified by mutation — the relative version did not fail.
         assert_eq!(
             snapshot(),
-            before,
+            Counters::default(),
             "a disabled probe must not record anything"
         );
+        assert_eq!(snapshot_global(), Counters::default());
     }
 
     #[test]
