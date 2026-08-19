@@ -690,6 +690,19 @@ impl Engine {
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?
         };
         let mut native_session = native_session;
+        // #1362: a prefill forward's activations scale with the tokens in it, so
+        // an unchunked prompt makes peak device memory a function of prompt
+        // length. The flat ORT pipeline has read this metadata since chunked
+        // prefill was introduced; the native backend ignored it, so a model that
+        // declared a chunk size got it honored on one backend only.
+        native_session.set_prefill_chunk_size(
+            metadata
+                .model
+                .as_ref()
+                .and_then(|model| model.runtime_configurable.as_ref())
+                .and_then(|runtime| runtime.chunked_prefill.as_ref())
+                .and_then(|chunked| chunked.chunk_size),
+        );
         #[cfg(feature = "cuda")]
         let cuda_offload_policy = reconcile_cuda_offload_budget_after_native_load(
             &native_session,
