@@ -982,6 +982,24 @@ impl CudaRuntime {
             .map_err(|e| driver_err("stream synchronize", e))
     }
 
+    /// Unconditional compute-stream drain used as a **correctness barrier**
+    /// before releasing or remapping device memory a kernel may still be
+    /// reading — e.g. immediately before `cuMemUnmap` of an evicted weight
+    /// granule in `weight_paging.rs`.
+    ///
+    /// Unlike [`synchronize`], this ignores the `defer_eager_sync` deferral
+    /// (#1383). Eliding a *trailing per-op* eager sync is safe — the single
+    /// in-order EP stream preserves kernel→kernel ordering — but eliding a
+    /// *pre-unmap* drain is a use-after-free: the granule is unmapped while an
+    /// in-flight decode kernel still references its VA, and under stable-slot
+    /// remapping (#716) a late read silently returns the successor weight's
+    /// bytes rather than faulting (#1439). Any caller that must know all prior
+    /// compute has retired before freeing/remapping memory MUST use this,
+    /// never `synchronize()`.
+    pub fn drain_for_unmap(&self) -> Result<()> {
+        self.force_synchronize()
+    }
+
     /// Toggle the eager-sync deferral at runtime (see [`synchronize`]).
     pub fn set_defer_eager_sync(&self, enabled: bool) {
         self.defer_eager_sync.store(enabled, Ordering::Relaxed);

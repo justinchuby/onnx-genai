@@ -1380,7 +1380,7 @@ impl CudaWeightPage {
                 // freeing anything (#1295).
                 if synchronize_streams {
                     let sync_start = std::time::Instant::now();
-                    let sync_failed = self.runtime.synchronize().is_err()
+                    let sync_failed = self.runtime.drain_for_unmap().is_err()
                         || self.runtime.copy_stream().synchronize().is_err();
                     add_duration(&GLOBAL_VRAM_FREE_SYNC_NS, sync_start.elapsed());
                     if sync_failed {
@@ -2926,7 +2926,7 @@ impl CudaWeightResidency {
                     // re-copying the original host source. If corruption
                     // vanishes under this, the retained device copy had gone
                     // stale (host bytes are unchanged) — the decisive control.
-                    self.runtime.synchronize().map_err(|error| {
+                    self.runtime.drain_for_unmap().map_err(|error| {
                         WeightHandleError::DeviceBinding(format!(
                             "pin-refill compute drain: {error}"
                         ))
@@ -3208,7 +3208,7 @@ impl CudaWeightResidency {
                         // not a pure aliasing/logic bug. Default OFF /
                         // byte-identical.
                         if sync_before_fill_enabled() {
-                            self.runtime.synchronize().map_err(|error| {
+                            self.runtime.drain_for_unmap().map_err(|error| {
                                 WeightHandleError::DeviceBinding(format!(
                                     "sync-before-fill compute drain: {error}"
                                 ))
@@ -3323,7 +3323,7 @@ impl CudaWeightResidency {
             };
             if !streams_drained {
                 let sync_start = std::time::Instant::now();
-                self.runtime.synchronize().map_err(|error| {
+                self.runtime.drain_for_unmap().map_err(|error| {
                     WeightHandleError::DeviceBinding(format!("compute stream sync: {error}"))
                 })?;
                 self.runtime.copy_stream().synchronize().map_err(|error| {
@@ -3425,7 +3425,7 @@ impl CudaWeightResidency {
         ptr: CUdeviceptr,
         len: usize,
     ) -> Result<Vec<u64>, WeightHandleError> {
-        self.runtime.synchronize().map_err(|error| {
+        self.runtime.drain_for_unmap().map_err(|error| {
             WeightHandleError::DeviceBinding(format!("pin-checksum compute drain: {error}"))
         })?;
         self.runtime.copy_stream().synchronize().map_err(|error| {
@@ -3481,7 +3481,7 @@ impl CudaWeightResidency {
         // synchronize is never capture-illegal.
         let sync_start = std::time::Instant::now();
         self.runtime
-            .synchronize()
+            .drain_for_unmap()
             .map_err(|error| WeightHandleError::DeviceBinding(format!("stream sync: {error}")))?;
         add_duration(&GLOBAL_ADMIT_SYNC_NS, sync_start.elapsed());
         let mut inner = self.lock();
