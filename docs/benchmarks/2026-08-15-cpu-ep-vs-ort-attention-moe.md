@@ -4067,3 +4067,147 @@ floor is 12–20%, and that at **two** threads the floor is small enough (0.22�
 for a properly controlled multi-threaded experiment to be worth running. That
 experiment — sharing one packed panel across row blocks rather than re-packing
 per block — is the open follow-up, and it now has a method that can answer it.
+
+## 39. Phase 19: the residual was never steady state (a diagnostic, not a kernel)
+
+§38.7 closed with "the native-alone t=16→t=32 drift on the small shapes (roughly
+1.7×) survives everything above and has no explanation yet. It is the real
+remaining scheduler residual." It had an explanation. It is not a steady-state
+loss at all, and chasing it as one would have been wasted work.
+
+### 39.1 The drift reproduces, and then dissolves
+
+On latest `main`, native-only, arms interleaved, 9 reps, median ms — the drift is
+real at the harness's run count:
+
+| cell | t=16 | t=32 | drift |
+| --- | --- | --- | --- |
+| `qwen3_0p6b_qkv_t8` | 3.345 | 6.286 | 1.88× |
+| `qwen3_0p6b_qkv_t1` | 0.520 | 0.692 | 1.33× |
+| `qwen3_0p6b_mlp_t8` | 5.029 | 5.596 | 1.11× |
+
+Raising `--runs` from 7 to 40 removes it. Three reps at each width, same binary,
+same shapes:
+
+| t | native p50 (40 runs) | user CPU |
+| --- | --- | --- |
+| 16 | 1.325 / 1.735 / 1.051 ms | 2.33 / 2.23 / 2.13 s |
+| 32 | 1.223 / 1.724 / 1.039 ms | **4.39 / 4.43 / 4.38 s** |
+
+The wall times are the same to within noise. The CPU is not: t=32 burns almost
+exactly twice as much of it to produce the same answer in the same time.
+
+### 39.2 Splitting fixed from marginal
+
+Sweeping `--runs` and fitting CPU = fixed + marginal × runs separates the two
+terms cleanly. `gemm_nbits_qwen3_0p6b_qkv_t8`, native-only:
+
+| budget | fixed (CPU-s) | marginal (CPU-ms/inference) | steady-state wall |
+| --- | --- | --- | --- |
+| 2 | 0.13 | 8.19 | 4.531 ms |
+| 4 | 0.31 | 8.61 | 3.271 ms |
+| 8 | 0.63 | 8.05 | 1.588 ms |
+| 16 | 1.55 | 13.99 | 0.921 ms |
+| 32 | **3.67** | 15.17 | 0.934 ms |
+
+Two things fall out. The marginal cost per inference at t=16 and t=32 is
+essentially the same (13.99 vs 15.17), and so is the steady-state wall (0.921 vs
+0.934 — t=32 is very slightly *worse*). **There is no steady-state t=16→t=32
+drift.** What there is, is a fixed cost that grows faster than the budget does:
+roughly 2.4× per doubling against 2× the threads.
+
+That fixed cost is pool construction and warm-up, and it is entirely
+pre-existing. Measured against the phase-16 base binary it is identical — 0.64 /
+1.67 / 3.54 CPU-s at budgets 8 / 16 / 32, against 0.63 / 1.59 / 3.73 for current
+`main`. Phase 16 neither caused it nor fixed it.
+
+### 39.3 What the fixed cost is
+
+A single inference with no warmups, on a 512² dense model small enough that the
+arithmetic is irrelevant:
+
+| budget | user CPU | first-inference wall | threads created | futex calls | sched_yield |
+| --- | --- | --- | --- | --- | --- |
+| 8 | 0.23 s | 2.198 ms | 15 | 150 | 643 |
+| 32 | **2.24 s** | **27.895 ms** | 63 | 1611 | 3346 |
+
+Two CPU-seconds and 28 ms of first-inference latency, to compute a 512×512
+matrix product. It is model-independent, so it is not the kernel. Forcing
+`ONNX_GENAI_CPU_TASK_THREADS=1` does not reduce it (2.53 s vs 2.00 s on the int4
+cell — it gets slightly *worse*), so it is not the task runtime either. It is the
+Rayon pools coming up: futex and yield-spin churn while twice as many workers
+race to their loops.
+
+### 39.4 Past the physical core count, nothing is bought
+
+The obvious question is whether the extra workers earn their construction back on
+larger work. They do not. Steady-state wall, native-only, 25 runs after 10
+warmups, median of 3:
+
+| cell | budget 16 | budget 32 |
+| --- | --- | --- |
+| `llama3_8b_mlp_t512` | **969 ms** | 1537 ms |
+| `llama3_8b_qkv_t128` | **106.4 ms** | 109.5 ms |
+| `qwen3_0p6b_mlp_t512` | **109.2 ms** | 112.5 ms |
+| `qwen3_0p6b_qkv_t8` | **0.921 ms** | 0.934 ms |
+
+On this 16-physical-core / 32-logical host a 32-thread budget is never faster
+than a 16-thread one, in decode or in prefill, and on the largest prefill shape
+it is 1.6× slower. This is the same fact `cap_spinning_workers` already encodes
+for the task runtime's lanes, showing up one level out: past one worker per
+physical core, the surplus workers are SMT siblings of workers that already
+exist, and they contend instead of adding throughput.
+
+### 39.5 The default was already right
+
+The important control, and the one that decides what this phase should change:
+
+| configuration | CPU for 60 runs | native |
+| --- | --- | --- |
+| default (no thread env set) | **0.54 s** | 1.371 ms |
+| `--native-threads 32` | 4.72 s | 0.933 ms |
+
+The shipping default — a flat decode pool capped at eight workers and SMT-capped
+task lanes — costs 0.54 CPU-seconds. Asking explicitly for 32 costs 8.7× that to
+run 1.47× faster. **The runtime's default configuration is the efficient one.**
+Nothing in the production path is misconfigured; the benchmark harness is what
+asks for 32, and the runtime faithfully honours it.
+
+So the residual is not a runtime defect to fix. It is a request that cannot pay
+for itself, which the runtime accepted silently.
+
+### 39.6 What phase 19 changes
+
+Two things, both small.
+
+The first is a diagnostic. `bound_process_to_decode_budget` now warns once when
+an explicit budget exceeds the physical cores the process may use, naming the
+core count and pointing at `ONNX_GENAI_CPU_DECODE_THREADS`. It does not override
+the request — an explicit budget stays explicit — it just stops a configuration
+that doubles CPU for no wall gain from being invisible. `budget_beyond_physical_cores`
+is a pure function so the policy is testable without a host, and an unknown
+topology deliberately never warns.
+
+The second is this document. Every `--threads 32` figure in this ledger was taken
+on a configuration that §39.4 shows is strictly worse than `--threads 16` on this
+host, and §39.1 shows was additionally measured inside a warm-up transient that
+the 7-run harness never leaves. Combined with §38's finding that the paired
+harness depresses the native arm 2.7–4.8× on long cells, the wide-thread rows of
+this campaign have now had two independent instrument errors found in them.
+
+### 39.7 One caveat, and what is genuinely left
+
+The steady-state numbers above are a *tight loop*: back-to-back inferences with
+no serial work between them. That is the one regime in which Rayon's parking cost
+disappears, because its workers never get the chance to park. It flatters the
+pre-phase-16 base — which reaches 0.858 ms at budget 32 over 400 runs, against
+the 50 ms the 7-run harness reported for the same binary and cell. Real decode is
+the opposite shape: single-digit microseconds of serial work between parallel
+regions, which is exactly the gap `task_runtime_latency.rs` models with
+`busy_gap` and exactly why the task runtime exists. Neither 7 runs nor 400 is the
+honest number for decode; a gap-aware harness is, and this campaign does not have
+one at the model level.
+
+That is the real open item now, and it is a methodology item rather than a
+kernel one. The scheduler residual that §36.8 and §38.7 were chasing does not
+exist.
