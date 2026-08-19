@@ -1296,9 +1296,25 @@ fn rmsnorm_fusion_disabled() -> bool {
 /// of seven chunks (896, which regresses) and twelve chunks (1536, which wins),
 /// so the floor is the granularity-aligned midpoint. It is a property of the
 /// kernel's 128-lane reduction, never of any model.
+///
+/// Caveat — this floor was calibrated on **M=1 single-stream** throughput on an
+/// **H200** (commit `05e1fd10`: 0.5B hidden-896 regressed -2.7% folded), and it
+/// predates the capture-safe batch-decode path (#1404). At **M>=2** the fold
+/// makes the gate/up node capture-safe and collapses the batch-decode CUDA-graph
+/// segmentation (25 -> 1 segments), saving ~20 ms/step — which dwarfs the M=1
+/// prologue cost. The fold is byte-identical, so keeping the standalone norm
+/// below 1280 leaves that batch win on the table for small resident models
+/// (0.5B at 896, granite-1B MoE at 1024). The M=1 cost is also hardware-
+/// dependent: on RTX 4060 the same hidden-896 fold measured neutral-to-faster,
+/// not a regression. Making this gate batch/device-aware is tracked in #1421;
+/// until then the override below enables it. See the operator-knob section of
+/// `docs/benchmarks/2026-08-19-batch-decode-mge2-capture-segmentation.md`.
 const RMSNORM_FUSION_MIN_HIDDEN: usize = 10 * RMSNORM_FUSION_WARP_HALF4_MULTIPLE;
-/// Optional environment override for [`RMSNORM_FUSION_MIN_HIDDEN`], used only to
-/// calibrate the floor against measured throughput.
+/// Optional environment override for [`RMSNORM_FUSION_MIN_HIDDEN`]. Beyond
+/// calibrating the floor against measured throughput, this is the documented
+/// interim knob (#1421) an operator lowers to force the byte-identical fold on a
+/// small resident model so **batched** decode gets #1404's capture-safe path;
+/// set it only when batching (see the constant's caveat on the M=1 cost).
 const RMSNORM_FUSION_MIN_HIDDEN_ENV: &str = "ONNX_GENAI_RMSNORM_MIN_HIDDEN";
 
 fn env_usize(name: &str, default: usize) -> usize {
