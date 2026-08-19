@@ -209,6 +209,9 @@ fn main() -> Result<()> {
     if args.threads == 0 {
         bail!("--threads must be positive");
     }
+    if args.repeats == 0 {
+        bail!("--repeats must be positive (the summary reports a distribution)");
+    }
     if args.block_size == 0 || !args.block_size.is_multiple_of(2) {
         bail!("--block-size must be a positive even number (int4 packs two nibbles per byte)");
     }
