@@ -68,12 +68,16 @@ impl Operand<'_> {
 }
 
 /// Columns per register tile: two `__m256i` accumulators per row.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const NR: usize = 16;
 /// Rows per register tile. Four rows share every packed `B` load.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const MR: usize = 4;
 /// Columns per packed panel.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const NC: usize = 256;
 /// `k` rows per packed panel. Even, so `k` pairs never straddle two panels.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const KC: usize = 512;
 
 /// Smallest `m * k * n` worth splitting across the pool.
@@ -561,6 +565,7 @@ unsafe fn fused_strip<const R: usize, const T: usize>(
 /// pairs never straddle two blocks. At 256 a strip's footprint is 256 cache
 /// lines, which stays in L1 while the neighbouring strips of the same block are
 /// walked.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const FUSED_KC: usize = 256;
 
 /// Drives [`fused_strip`] across a column block: the widest strip the register

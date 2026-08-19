@@ -3310,6 +3310,12 @@ mod tests {
             // Above `PARALLEL_MIN_WORK`, so `requantize_rows` forks. The
             // parallel and serial row walks must agree bit for bit.
             (96, 40, 900),
+            // `m <= 4` *and* above `PARALLEL_MIN_WORK`, so the pack-free
+            // kernel's column split runs and its products then flow through
+            // the forked `requantize_rows`. Without this the fused-parallel
+            // path was only ever checked at the kernel level, never end to
+            // end through requantization.
+            (4, 1029, 1100),
         ] {
             for per_axis in [false, true] {
                 // --- Uint8 ---
