@@ -348,15 +348,15 @@ if !self.blocks.is_empty()
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Reserved: cuMemAddressReserve(拿地址,0 字节显存)
-    Reserved --> Committed: commit(governor 批准 → cuMemCreate + cuMemMap + cuMemSetAccess)
-    Committed --> Committed: KV 增长(同段 VA 后面追加映射,指针不变)
-    Committed --> Shared: 前缀共享(同一 handle 以 PROT_READ 多映射,只计费一次)
-    Shared --> Committed: 所有 sharer 退出(refcount 归零)
-    Committed --> Reserved: release()(unmap + 还句柄,VA 保留可复用)
-    Reserved --> [*]: Drop(teardown 同步 → cuMemAddressFree)
+    [*] --> Reserved: cuMemAddressReserve<br/>(拿地址,0 字节显存)
+    Reserved --> Committed: commit<br/>(governor 批准 → cuMemCreate<br/>+ cuMemMap + cuMemSetAccess)
+    Committed --> Committed: KV 增长<br/>(同段 VA 后面追加映射,指针不变)
+    Committed --> Shared: 前缀共享<br/>(同一 handle 以 PROT_READ 多映射,只计费一次)
+    Shared --> Committed: 所有 sharer 退出<br/>(refcount 归零)
+    Committed --> Reserved: release()<br/>(unmap + 还句柄,VA 保留可复用)
+    Reserved --> [*]: Drop<br/>(teardown 同步 → cuMemAddressFree)
     Committed --> Quarantined: 提交失败 / 同步失败
-    Quarantined --> [*]: 故意泄漏到 context 销毁(宁可泄漏,不可损坏)
+    Quarantined --> [*]: 故意泄漏到 context 销毁<br/>(宁可泄漏,不可损坏)
 ```
 
 ## 八、要点回顾
