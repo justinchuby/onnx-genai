@@ -298,11 +298,11 @@ prompt 里给模型声明了一份"你可以往哪些 channel 写"的类型签�
 ```mermaid
 flowchart TD
     S["system<br/>(工具定义 + Valid recipients)"] --> U["user"]
-    U --> A1["assistant <b>to=self</b><br/>规划/推理 · &lt;|eom|&gt;"]
-    A1 --> A2["assistant <b>to=web.search</b><br/>ATEM 调用 · &lt;|eom|&gt;"]
-    A2 --> T["tool web.search<br/>&lt;tool_output&gt; · &lt;|eot|&gt;"]
-    T --> A3["assistant <b>to=self</b><br/>解读结果 · &lt;|eom|&gt;"]
-    A3 --> A4["assistant <b>to=user</b><br/>最终回答 · &lt;|eot|&gt;"]
+    U --> A1["assistant <b>to=self</b><br/>规划/推理 · &lt;&#124;eom&#124;&gt;"]
+    A1 --> A2["assistant <b>to=web.search</b><br/>ATEM 调用 · &lt;&#124;eom&#124;&gt;"]
+    A2 --> T["tool web.search<br/>&lt;tool_output&gt; · &lt;&#124;eot&#124;&gt;"]
+    T --> A3["assistant <b>to=self</b><br/>解读结果 · &lt;&#124;eom&#124;&gt;"]
+    A3 --> A4["assistant <b>to=user</b><br/>最终回答 · &lt;&#124;eot&#124;&gt;"]
 ```
 
 ### 为什么这个设计值得学
