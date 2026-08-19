@@ -42,6 +42,7 @@ use super::half_gemm::{self, HalfFormat, MatrixLayout};
 use super::half_gemv;
 use super::weight_transpose::{self, WeightTransposeKey};
 use crate::backend::CpuBackend;
+use crate::dispatch_ledger;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::{next_index, numel};
 
@@ -1057,6 +1058,16 @@ pub(crate) fn gemm_with_backend(
     k: usize,
     n: usize,
 ) -> Result<()> {
+    dispatch_ledger::record_with(|| {
+        dispatch_ledger::Observation::gemm(
+            dispatch_ledger::KernelFamily::MatMulF32,
+            ledger_backend(backend),
+            "f32",
+            m,
+            n,
+            k,
+        )
+    });
     match backend {
         #[cfg(feature = "mlas")]
         CpuBackend::Mlas => {
@@ -1082,6 +1093,85 @@ pub(crate) fn gemm_with_backend(
             gemm_generic(a, b, c, m, k, n);
             Ok(())
         }
+    }
+}
+
+/// Whether a transposed-B ("NT") dense GEMM — `c[m,n] = a[m,k] @ b_nk[n,k]^T`,
+/// reading the weight in its natural `[n, k]` layout with no `[k, n]` copy — is
+/// available for `backend`. This is the single legality predicate shared by the
+/// MLAS and native `MatMulNBits` prefill routes (see [`gemm_nt_with_backend`]);
+/// keeping it in one place stops the two build configurations from drifting.
+pub(crate) fn nt_gemm_supported(backend: CpuBackend) -> bool {
+    match backend {
+        #[cfg(feature = "mlas")]
+        CpuBackend::Mlas => true,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        CpuBackend::SimdX86 => true,
+        _ => {
+            let _ = backend;
+            false
+        }
+    }
+}
+
+/// Transposed-B dense GEMM: `c[m,n] = a[m,k] @ b_nk[n,k]^T`, where `b_nk` is
+/// `[n, k]` row-major. **Bit-identical** to `gemm_with_backend(backend, a,
+/// b_kn, c, m, k, n)` on the `[k, n]` transpose `b_kn` of `b_nk`, for every
+/// backend [`nt_gemm_supported`] accepts — the property `MatMulNBits` prefill
+/// relies on to reuse its cached `[n, k]` dequant instead of building a
+/// transposed copy.
+///
+/// * `Mlas`: MLAS's cache-tiled SGEMM with `trans_b` (`ldb = k`) reads `b_nk`
+///   as the transposed operand directly.
+/// * `SimdX86`: the native NT SGEMM ([`x86_sgemm::sgemm_simd_nt`]), which packs
+///   the same B panels the NN path would and drives the same microkernel.
+///
+/// `backend` must satisfy [`nt_gemm_supported`]; callers gate on it, and an
+/// unsupported backend here is a caller bug rather than a runtime condition.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_nt_with_backend(
+    backend: CpuBackend,
+    a: &[f32],
+    b_nk: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<()> {
+    match backend {
+        #[cfg(feature = "mlas")]
+        CpuBackend::Mlas => {
+            // C[m, n] = A[m, k] * B_nk[n, k]^T. `trans_b` with `ldb = k` reads
+            // the Nk weight as the transposed operand without materializing a
+            // Kn copy.
+            mlas_sys::sgemm(false, true, m, n, k, 1.0, a, k, b_nk, k, 0.0, c, n);
+            Ok(())
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        CpuBackend::SimdX86 => {
+            x86_sgemm::sgemm_simd_nt(a, b_nk, c, m, k, n);
+            Ok(())
+        }
+        _ => {
+            // On a build with neither NT arm compiled in (e.g. aarch64 without
+            // `mlas`) none of the operands are read; bind them so the arch
+            // gating does not turn every parameter into an unused variable.
+            let _ = (a, b_nk, c, m, k, n);
+            Err(EpError::KernelFailed(format!(
+                "gemm_nt_with_backend called for backend {backend:?} without a transposed-B GEMM; \
+                 callers must gate on nt_gemm_supported"
+            )))
+        }
+    }
+}
+
+/// How a [`CpuBackend`] reads in the dispatch ledger: MLAS is the only variant
+/// whose arithmetic is not ours, and it only exists in a research build.
+pub(crate) fn ledger_backend(backend: CpuBackend) -> dispatch_ledger::Backend {
+    match backend {
+        #[cfg(feature = "mlas")]
+        CpuBackend::Mlas => dispatch_ledger::Backend::Mlas,
+        _ => dispatch_ledger::Backend::Native,
     }
 }
 
@@ -2989,6 +3079,7 @@ mod tests {
         // SEPARATE `MatMulKernel`/`MatMulPrepack`, each widening `B` into its own
         // `dense`. We instantiate both and sum their live bytes.
         let mut instances = 0u64;
+        let mut widened = 0u64;
         let mut actual = 0u64;
         for m in [4usize, 1usize] {
             let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.017).sin()).collect();
@@ -2999,15 +3090,25 @@ mod tests {
             kernel
                 .execute(&[a.view(), b.view()], &mut [out.view_mut()])
                 .unwrap();
+            // Decode (m == 1) on Apple silicon takes the FP16 GEMV, which reads
+            // the f16 weights directly and returns before `dense` is touched: it
+            // retains the 2-byte-per-element transposed-B memo instead of a
+            // widened 4-byte copy. Prefill has no such path, so the widening is
+            // unconditional there. Either way the weight must be retained once —
+            // a run that retains neither is the regression this guards.
+            let dense_filled = kernel.prepack.dense[1].is_filled();
+            let gemv_memo = kernel.prepack.transposed_b_f16.get().is_some();
             assert!(
-                kernel.prepack.dense[1].is_filled(),
-                "the constant f16 B must be widened into the governed cache at m={m}"
+                dense_filled || (m == 1 && gemv_memo),
+                "the constant f16 B must be retained at m={m}: widened into the \
+                 governed dense cache, or (decode only) as the f16 transposed-B memo"
             );
             assert!(
                 !kernel.prepack.dense[0].is_filled(),
                 "the contiguous f32 A is borrowed, never cached (m={m})"
             );
             actual += kernel.prepack.dense_live_bytes();
+            widened += u64::from(dense_filled);
             instances += 1;
         }
 
@@ -3017,10 +3118,25 @@ mod tests {
             "prefill + decode = two shape-keyed instantiations"
         );
         assert_eq!(
-            actual, predicted,
-            "predicted dense-cache bytes must equal the summed bytes actually \
-             held across all instantiations (ratio 1.00)"
+            actual,
+            (k as u64) * (n as u64) * 4 * widened,
+            "every instantiation that widens retains exactly one f32 copy"
         );
+        // The predictor budgets the widened worst case for every instantiation,
+        // so it is exact where all of them widen and conservative where a
+        // platform routes one away. Under-counting is the #1051 defect.
+        assert!(
+            actual <= predicted,
+            "predicted dense-cache bytes must never under-count the bytes \
+             actually held ({actual} held > {predicted} predicted)"
+        );
+        if widened == instances {
+            assert_eq!(
+                actual, predicted,
+                "predicted dense-cache bytes must equal the summed bytes actually \
+                 held across all instantiations (ratio 1.00)"
+            );
+        }
     }
 
     /// #1056 decline contract: when the cache is declined, a constant operand

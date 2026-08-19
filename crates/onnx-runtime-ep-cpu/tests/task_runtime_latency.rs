@@ -200,10 +200,24 @@ fn report_latency_under_concurrent_sessions() {
 }
 
 /// How many outer Rayon workers to probe nesting with.
-const NEST_DISPATCHERS: [usize; 5] = [1, 2, 4, 8, 16];
+#[cfg(not(miri))]
+const NEST_DISPATCHERS: &[usize] = &[1, 2, 4, 8, 16];
+
+/// Under Miri this test is run for soundness, not for measurement, and the
+/// interpreter is thousands of times slower than native. Keep the *shape* --
+/// more than one dispatcher, so tasks from different rows are live against each
+/// other and a too-wide retag is a real conflict -- and drop the scale.
+#[cfg(miri)]
+const NEST_DISPATCHERS: &[usize] = &[1, 4];
 
 /// Inner fan-out size for the nesting probe, in `u64` elements.
+#[cfg(not(miri))]
 const NEST_INNER: usize = 4096;
+
+/// Still several times the 64-element grain, so a row is split across multiple
+/// concurrent tasks and the aliasing shape survives the shrink.
+#[cfg(miri)]
+const NEST_INNER: usize = 256;
 
 /// Nesting: several Rayon workers dispatching into the task pool at once.
 ///
@@ -228,7 +242,7 @@ fn nested_dispatch_slot_pressure() {
         "dispatchers", "wall", "dispatches", "declined", "inline"
     );
 
-    for &outer in &NEST_DISPATCHERS {
+    for &outer in NEST_DISPATCHERS {
         let mut rows = vec![0u64; outer * NEST_INNER];
         let before = task_runtime::testing::counters();
         let started = Instant::now();
@@ -236,10 +250,18 @@ fn nested_dispatch_slot_pressure() {
         rows.par_chunks_mut(NEST_INNER).for_each(|row| {
             let base = row.as_mut_ptr() as usize;
             task_runtime::for_each_range(NEST_INNER, 64, |start, end| {
-                // Each task owns a disjoint `start..end` of this row, so the
-                // reconstructed slice never overlaps another task's.
-                let row = unsafe { std::slice::from_raw_parts_mut(base as *mut u64, NEST_INNER) };
-                for slot in &mut row[start..end] {
+                // SAFETY: `for_each_range` visits `start..end` in exactly one
+                // task, so narrowing *before* the retag makes this `&mut`
+                // unique for its lifetime. Reconstructing the whole row and
+                // then indexing would retag the full `NEST_INNER` range in
+                // every task, and under Stacked Borrows the conflict is the
+                // retag rather than the store — the writes being disjoint
+                // would not save it. `parallel_output_rows_repeated` uses this
+                // same narrow-first shape in production.
+                let slots = unsafe {
+                    std::slice::from_raw_parts_mut((base as *mut u64).add(start), end - start)
+                };
+                for slot in slots {
                     *slot += 1;
                 }
             });

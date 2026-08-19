@@ -20,7 +20,9 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
-use onnx_runtime_ir::{DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape};
+use onnx_runtime_ir::{
+    Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
+};
 use onnx_runtime_loader::Model;
 
 fn encode(values: &[f32], dtype: DataType) -> Vec<u8> {
@@ -139,6 +141,43 @@ fn run_unary(ep: &CudaExecutionProvider, op: &str, dtype: DataType, x: &[f32]) -
     let kernel = ep
         .get_kernel(&Node::new(NodeId(0), op, vec![], vec![]), &[], 17)
         .unwrap();
+    kernel.execute(&[input], &mut [output]).unwrap();
+    let mut out = vec![0u8; bytes.len()];
+    unsafe { rt.dtoh(&mut out, cuptr(y_buf.as_ptr())).unwrap() };
+    ep.deallocate(x_buf).unwrap();
+    ep.deallocate(y_buf).unwrap();
+    decode(&out, dtype)
+}
+
+/// Run the fused `rsqrt` path: a standard-domain `Reciprocal` node carrying the
+/// `_cuda_rsqrt` marker (as `CudaRsqrtFusion` produces), which the CUDA
+/// unary-math factory dispatches to the single-kernel `rsqrt_{dtype}`.
+fn run_rsqrt(ep: &CudaExecutionProvider, dtype: DataType, x: &[f32]) -> Vec<f32> {
+    let rt = ep.runtime();
+    let bytes = encode(x, dtype);
+    let x_buf = ep.allocate(bytes.len(), 256).unwrap();
+    let mut y_buf = ep.allocate(bytes.len(), 256).unwrap();
+    unsafe { rt.htod(&bytes, cuptr(x_buf.as_ptr())).unwrap() };
+    let shape = [x.len()];
+    let strides = compute_contiguous_strides(&shape);
+    let input = TensorView::new(
+        DevicePtr(x_buf.as_ptr()),
+        dtype,
+        &shape,
+        &strides,
+        ep.device_id(),
+    );
+    let output = TensorMut::new(
+        DevicePtrMut(y_buf.as_mut_ptr()),
+        dtype,
+        &shape,
+        &strides,
+        ep.device_id(),
+    );
+    let mut node = Node::new(NodeId(0), "Reciprocal", vec![], vec![]);
+    node.attributes
+        .insert("_cuda_rsqrt".into(), Attribute::Int(1));
+    let kernel = ep.get_kernel(&node, &[], 17).unwrap();
     kernel.execute(&[input], &mut [output]).unwrap();
     let mut out = vec![0u8; bytes.len()];
     unsafe { rt.dtoh(&mut out, cuptr(y_buf.as_ptr())).unwrap() };
@@ -427,6 +466,37 @@ fn half_unary_and_activation_families_match_cpu_reference() {
             let expected = quantize(&xq.iter().copied().map(f).collect::<Vec<_>>(), dtype);
             assert_close(&run_unary(&ep, op, dtype, &x), &expected, tolerance);
         }
+    }
+}
+
+/// The fused `rsqrt` kernel (from `CudaRsqrtFusion`) must be **byte-identical**
+/// to the unfused `Reciprocal(Sqrt(x))` two-kernel path — that is the parity
+/// contract that keeps native decode greedy tokens unchanged. It reproduces the
+/// intermediate narrow-dtype rounding (`Sqrt` rounds `sqrtf(x)` to the storage
+/// dtype, then `Reciprocal` reads that back), so an exact-equality check (not a
+/// tolerance) is required.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn fused_rsqrt_is_byte_identical_to_sqrt_then_reciprocal() {
+    let ep = require_cuda();
+    // Positive inputs across a wide magnitude range (rsqrt domain); avoids NaN
+    // so exact equality is well-defined.
+    let x = [
+        1.0e-4, 0.01, 0.25, 0.5, 1.0, 2.0, 3.0, 7.5, 42.0, 123.5, 1000.0, 65504.0,
+    ];
+    for dtype in [DataType::Float16, DataType::BFloat16] {
+        // Two-kernel reference: Sqrt then Reciprocal, each rounding to `dtype`.
+        let sqrted = run_unary(&ep, "Sqrt", dtype, &x);
+        let reference = run_unary(&ep, "Reciprocal", dtype, &sqrted);
+        let fused = run_rsqrt(&ep, dtype, &x);
+        assert_eq!(
+            fused.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            reference.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "fused rsqrt must be bit-identical to Reciprocal(Sqrt(x)) for {dtype:?}"
+        );
     }
 }
 
