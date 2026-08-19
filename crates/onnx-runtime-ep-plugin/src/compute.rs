@@ -1050,11 +1050,20 @@ impl WorkspacePlanCache {
         let idx = plans
             .iter()
             .position(|(signature, _)| signature_matches(signature, metadata))?;
+        let requirement = plans[idx].1;
         // Move-to-front so the hot signature stays ahead of a one-off prefill
         // shape once the cache is full.
-        let entry = plans.remove(idx);
-        let requirement = entry.1;
-        plans.insert(0, entry);
+        //
+        // Skipped when the hit is already at the front, which is the steady
+        // state: one shape, every node, every `Run`. Promoting the front entry
+        // to the front is identity, but `remove` + `insert` still run the
+        // shift, bounds checks and length bookkeeping to achieve nothing.
+        // Callgrind, 100-node chain: `lookup` costs 141 instructions per node
+        // without this guard and 101 with it.
+        if idx != 0 {
+            let entry = plans.remove(idx);
+            plans.insert(0, entry);
+        }
         Some(requirement)
     }
 
@@ -2390,6 +2399,32 @@ unsafe extern "C" fn compute_execute(
             let (retire_starts, retire_items) =
                 retirements_per_node(&routing.input_sources, routing.num_intermediate_buffers);
 
+            // Per-node scratch, hoisted so each node reuses the previous
+            // node's capacity instead of allocating its own. These were the
+            // largest single item in the dispatch allocation table: six of the
+            // ~12 allocations per node were these vectors being created and
+            // dropped once each.
+            //
+            // Each is cleared at the top of the iteration that uses it, so a
+            // node always starts from empty regardless of how the previous one
+            // exited. (Every early exit in this loop is a `return`, so a failed
+            // node cannot leak into a later one either way -- the clears are
+            // load-bearing for ordinary node-to-node reuse, not for errors.)
+            enum RoutedSlotKind {
+                Ort,
+                Buffer,
+                Absent(usize), // index into absent_scratch
+            }
+            let mut ort_outputs: Vec<crate::kernel_ctx::OwnedOutput> = Vec::new();
+            // Stores the *output slot*, not a copy of its shape: cloning the
+            // shape cost one more allocation per buffer-bound output, and the
+            // shape is already live in `output_shapes` for the whole iteration.
+            let mut buf_writes: Vec<(usize, usize, DataType)> = Vec::new();
+            let mut absent_scratch: Vec<(usize, Vec<u8>, DataType)> = Vec::new();
+            let mut slot_kinds: Vec<RoutedSlotKind> = Vec::new();
+            let mut new_bufs: Vec<(usize, IntermediateBuf)> = Vec::new();
+            let mut node_ort_operands: Vec<usize> = Vec::new();
+
             for (node_idx, entry) in exported.entries.iter().enumerate() {
                 let node_probe = crate::dispatch_probe::Phase::TensorBind.enter();
                 let sources = &routing.input_sources[node_idx];
@@ -2450,17 +2485,11 @@ unsafe extern "C" fn compute_execute(
                 // For outputs going to ORT we allocate via ORT API;
                 // for outputs going to intermediate buffers we allocate on heap;
                 // for absent slots we allocate a scratch buffer.
-                let mut ort_outputs: Vec<crate::kernel_ctx::OwnedOutput> = Vec::new();
-                let mut buf_writes: Vec<(usize, Vec<usize>, DataType)> = Vec::new();
-                let mut absent_scratch: Vec<(usize, Vec<u8>, DataType)> = Vec::new(); // (slot, buf, dtype)
-
-                // Per-slot view map to keep positions aligned end-to-end.
-                enum RoutedSlotKind {
-                    Ort,
-                    Buffer,
-                    Absent(usize), // index into absent_scratch
-                }
-                let mut slot_kinds: Vec<RoutedSlotKind> = Vec::with_capacity(sinks.len());
+                ort_outputs.clear();
+                buf_writes.clear();
+                absent_scratch.clear();
+                slot_kinds.clear();
+                slot_kinds.reserve(sinks.len());
 
                 // We need to know which output slot → which sink.
                 for (out_slot, shape) in output_shapes.iter().enumerate() {
@@ -2520,7 +2549,7 @@ unsafe extern "C" fn compute_execute(
                             slot_kinds.push(RoutedSlotKind::Ort);
                         }
                         NodeOutputSink::Buffer(buf_idx) => {
-                            buf_writes.push((*buf_idx, shape.clone(), out_dtype));
+                            buf_writes.push((*buf_idx, out_slot, out_dtype));
                             slot_kinds.push(RoutedSlotKind::Buffer);
                         }
                         NodeOutputSink::Absent => {
@@ -2565,17 +2594,17 @@ unsafe extern "C" fn compute_execute(
                     }
                 }
 
-                // Build mutable output views: ORT outputs first, then buffer outputs.
-                let mut ort_out_views: Vec<_> =
-                    ort_outputs.iter_mut().map(|o| o.view_mut()).collect();
-
                 // For buffer-sink outputs, allocate the IntermediateBuf and get a
                 // mutable pointer into it. Device EPs take ORT scratch memory so
                 // intermediates live where the kernels execute; host EPs take a
                 // plain host buffer, which is both correct and measurably faster
                 // than ORT's host scratch allocator (see `intermediate_scratch`).
-                let mut new_bufs: Vec<(usize, IntermediateBuf)> = Vec::new();
-                for (buf_idx, shape, dtype) in &buf_writes {
+                // Redundant while `drain(..)` below is the only consumer, and
+                // kept so the invariant survives an early `continue` being
+                // added to this loop.
+                new_bufs.clear();
+                for &(buf_idx, out_slot, dtype) in &buf_writes {
+                    let shape = &output_shapes[out_slot];
                     let numel: usize = shape.iter().product();
                     let byte_len = dtype.byte_size() * numel;
                     let strides = contiguous_strides(shape);
@@ -2595,13 +2624,13 @@ unsafe extern "C" fn compute_execute(
                         None => (take_host_intermediate(byte_len), std::ptr::null_mut()),
                     };
                     new_bufs.push((
-                        *buf_idx,
+                        buf_idx,
                         IntermediateBuf {
                             data,
                             scratch_ptr,
                             shape: shape.clone(),
                             strides,
-                            dtype: *dtype,
+                            dtype,
                         },
                     ));
                 }
@@ -2621,7 +2650,12 @@ unsafe extern "C" fn compute_execute(
                     absent_shapes,
                 );
                 let mut all_output_views: Vec<_> = {
-                    let mut ort_iter = ort_out_views.drain(..);
+                    // Taken lazily. Collecting these into their own `Vec` and
+                    // immediately draining it built a second vector of views per
+                    // node, for every node of every `Run`, to hand each view
+                    // straight to the map below. The single-node path stopped
+                    // doing this; the routed path is where it is paid per node.
+                    let mut ort_iter = ort_outputs.iter_mut().map(|o| o.view_mut());
                     let mut buf_iter = new_bufs.iter_mut();
                     slot_kinds
                         .iter()
@@ -2661,13 +2695,11 @@ unsafe extern "C" fn compute_execute(
                 // This node's own ORT-bound operands — not subgraph input 0.
                 // Resolved lazily inside `prepare_workspace`, so a node that
                 // needs no workspace never queries ORT for placement.
-                let node_ort_operands: Vec<usize> = sources
-                    .iter()
-                    .filter_map(|src| match src {
-                        NodeInputSource::Ort(i) => Some(*i),
-                        NodeInputSource::Buffer(_) | NodeInputSource::Absent => None,
-                    })
-                    .collect();
+                node_ort_operands.clear();
+                node_ort_operands.extend(sources.iter().filter_map(|src| match src {
+                    NodeInputSource::Ort(i) => Some(*i),
+                    NodeInputSource::Buffer(_) | NodeInputSource::Absent => None,
+                }));
                 let workspace = match unsafe {
                     prepare_workspace(
                         api_ref,
@@ -2699,7 +2731,7 @@ unsafe extern "C" fn compute_execute(
                 EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
 
                 // Store new intermediate buffers.
-                for (buf_idx, buf) in new_bufs {
+                for (buf_idx, buf) in new_bufs.drain(..) {
                     if buf_idx >= intermediates.len() {
                         return fail_status(&format!(
                             "Compute: buffer index {buf_idx} out of range"
@@ -5815,9 +5847,61 @@ mod workspace_plan_cache_tests {
         TensorMetadata::new(dtype, shape, present)
     }
 
+    /// The signature every dispatch is actually using must survive eviction.
+    ///
+    /// The cache evicts from the back, so without move-to-front the first
+    /// signature inserted drifts to the back and is evicted even though it is
+    /// the hot one -- silently restoring the expensive planning call the cache
+    /// exists to avoid. Asserted on observed planning calls, not on cache
+    /// state.
+    #[test]
+    fn a_repeatedly_used_signature_survives_eviction() {
+        let cache = WorkspacePlanCache::new();
+        let planner = CountingPlanner::new();
+
+        let hot_shape = vec![1usize];
+        let hot = [meta(DataType::Float32, &hot_shape, true)];
+        cache.get_or_plan(&hot, || planner.plan(&hot)).unwrap();
+
+        // Fill the rest of the cache. `hot` is now at the back, next to evict.
+        let cold: Vec<Vec<usize>> = (2..=WORKSPACE_PLAN_CACHE_CAPACITY)
+            .map(|n| vec![n])
+            .collect();
+        for sh in &cold {
+            let m = [meta(DataType::Float32, sh, true)];
+            cache.get_or_plan(&m, || planner.plan(&m)).unwrap();
+        }
+
+        // Using `hot` again is the access that must promote it.
+        let before = planner.calls();
+        cache.get_or_plan(&hot, || planner.plan(&hot)).unwrap();
+        assert_eq!(
+            planner.calls(),
+            before,
+            "hot signature was already lost before any eviction"
+        );
+
+        // One more distinct signature evicts whatever is at the back.
+        let evictor_shape = vec![WORKSPACE_PLAN_CACHE_CAPACITY + 1];
+        let evictor = [meta(DataType::Float32, &evictor_shape, true)];
+        cache
+            .get_or_plan(&evictor, || planner.plan(&evictor))
+            .unwrap();
+
+        let before = planner.calls();
+        let got = cache.get_or_plan(&hot, || planner.plan(&hot)).unwrap();
+        assert_eq!(
+            planner.calls(),
+            before,
+            "the signature every dispatch uses was evicted -- move-to-front is not promoting it"
+        );
+        assert_eq!(got.bytes, 4, "wrong plan served for the hot signature");
+    }
+
     /// The point of the cache: the second dispatch of an unchanged shape must
     /// not re-run the planner. Falsifier — delete the lookup and the call count
     /// becomes 2.
+
     #[test]
     fn a_repeated_signature_plans_exactly_once() {
         let cache = WorkspacePlanCache::new();
@@ -6007,9 +6091,11 @@ mod workspace_plan_cache_tests {
     }
 
     /// The hot signature must survive a one-off shape (a single prefill step
-    /// among many decode steps). Falsifier — remove the move-to-front on hit
-    /// and the interleaved decode signature is evicted, so the planner runs
-    /// once per iteration instead of once in total.
+    /// among many decode steps). The flood must run *past* capacity: filling
+    /// the cache to exactly capacity never evicts anything, so a shorter loop
+    /// passes with or without the promotion and proves nothing. Falsifier —
+    /// remove the move-to-front on hit and the hot signature drifts to the
+    /// back, gets evicted, and the planner runs again mid-flood.
     #[test]
     fn the_hot_signature_survives_a_flood_of_one_off_shapes() {
         let cache = WorkspacePlanCache::new();
@@ -6022,7 +6108,8 @@ mod workspace_plan_cache_tests {
             .expect("plan");
         let after_hot = planner.calls();
 
-        for n in 1..=(WORKSPACE_PLAN_CACHE_CAPACITY - 1) {
+        let flood = WORKSPACE_PLAN_CACHE_CAPACITY * 2;
+        for n in 1..=flood {
             let cold = [n];
             let cold_meta = [meta(DataType::Float32, &cold, true)];
             cache
@@ -6035,7 +6122,7 @@ mod workspace_plan_cache_tests {
         }
         assert_eq!(
             planner.calls(),
-            after_hot + (WORKSPACE_PLAN_CACHE_CAPACITY - 1),
+            after_hot + flood,
             "only the cold signatures may have been planned; the hot one must have stayed cached"
         );
     }

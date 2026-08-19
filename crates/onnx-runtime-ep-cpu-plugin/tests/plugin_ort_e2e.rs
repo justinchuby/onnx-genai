@@ -6452,6 +6452,31 @@ fn plugin_path_ab_vs_plain_ort() {
                 );
             }
 
+            // Allocation attribution runs before the timed loop so its
+            // counter updates never land inside a measured iteration.
+            if run_ours
+                && let Some((buf, names)) = probe_dispatch(
+                    api,
+                    session,
+                    &input_name_ptrs,
+                    &values,
+                    &output_name_ptrs,
+                    64,
+                )
+            {
+                // Node count comes from ORT's assignment list, not from the
+                // case definition: per-node figures must divide by the nodes
+                // this EP actually received, and fusion means that is not the
+                // same as the number of `Run` callbacks.
+                report_probe(
+                    case.name,
+                    info.ops_on_our_ep().len().max(1),
+                    64,
+                    &buf,
+                    &names,
+                );
+            }
+
             // Interleave one iteration each so a drifting host load lands on
             // both sides rather than on whichever ran second.
             let mut ours = Vec::with_capacity(iters);
@@ -7426,4 +7451,146 @@ fn the_native_activation_family_executes_locally_and_matches_ort_numerics() {
     eprintln!(
         "\n✅ the_native_activation_family_executes_locally_and_matches_ort_numerics: PASSED"
     );
+}
+
+/// Bucket names, read from the library rather than copied.
+///
+/// A hand-maintained copy of this list drifted from the enum and mislabelled
+/// two rows of the attribution table -- every number was right and attached to
+/// the wrong phase. Asking the cdylib removes the second source of truth.
+fn probe_phase_names(lib: &libloading::Library) -> Vec<String> {
+    // SAFETY: the export is `extern "C"` with this signature and returns either
+    // null or a 'static NUL-terminated string owned by the library.
+    unsafe {
+        let name_of: libloading::Symbol<
+            '_,
+            unsafe extern "C" fn(usize) -> *const std::os::raw::c_char,
+        > = match lib.get(b"nxrt_dispatch_probe_phase_name") {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for i in 0.. {
+            let p = name_of(i);
+            if p.is_null() {
+                break;
+            }
+            out.push(std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned());
+        }
+        out
+    }
+}
+
+const PROBE_EVENTS: &[&str] = &[
+    "OrtFfiCall",
+    "DispatchAlloc",
+    "NodeExecuted",
+    "ShapeInferred",
+    "OutputMaterialized",
+];
+
+/// Open the EP cdylib a second time to reach its probe exports.
+///
+/// ORT has already `dlopen`ed this exact path, so this returns a handle to the
+/// same image and therefore the same counters — the allocations recorded here
+/// are the ones made inside `Compute`, which an allocator installed in this
+/// test binary could never see.
+///
+/// `None` when the cdylib was built without the `dispatch_probe` feature, which
+/// is the normal case; the symbols simply are not there.
+fn probe_lib() -> Option<&'static libloading::Library> {
+    static LIB: std::sync::OnceLock<Option<libloading::Library>> = std::sync::OnceLock::new();
+    LIB.get_or_init(|| {
+        let path = cdylib_resolve::find_cpu_plugin_cdylib_optional()?;
+        // SAFETY: the path is the EP cdylib this harness already registered
+        // with ORT; re-opening it runs no new initialisers.
+        unsafe { libloading::Library::new(path) }.ok()
+    })
+    .as_ref()
+}
+
+/// Reset the probe, run `runs` iterations, and return the per-phase totals.
+///
+/// Returns `None` unless `NXRT_MM_BENCH_PROBE=1` and the cdylib exports the
+/// probe, so the default benchmark path is untouched.
+#[allow(clippy::too_many_arguments)]
+unsafe fn probe_dispatch(
+    api: *const ort::OrtApi,
+    session: *mut ort::OrtSession,
+    input_names: &[*const std::os::raw::c_char],
+    values: &[*const ort::OrtValue],
+    output_names: &[*const std::os::raw::c_char],
+    runs: usize,
+) -> Option<(Vec<u64>, Vec<String>)> {
+    if std::env::var("NXRT_MM_BENCH_PROBE").unwrap_or_default() != "1" {
+        return None;
+    }
+    let lib = probe_lib()?;
+    // SAFETY: both symbols are `extern "C"` exports of the loaded cdylib with
+    // exactly these signatures; a missing symbol returns `Err`.
+    unsafe {
+        let reset: libloading::Symbol<'_, unsafe extern "C" fn()> =
+            lib.get(b"nxrt_dispatch_probe_reset").ok()?;
+        let snapshot: libloading::Symbol<'_, unsafe extern "C" fn(*mut u64, usize) -> usize> =
+            lib.get(b"nxrt_dispatch_probe_snapshot").ok()?;
+        reset();
+        bench_runs(api, session, input_names, values, output_names, runs);
+        let buckets = probe_phase_names(lib).len();
+        assert!(buckets > 0, "cdylib exports no phase names");
+        let need = (buckets - 1) * 2 + buckets * 2 + PROBE_EVENTS.len();
+        let mut buf = vec![0u64; need];
+        let written = snapshot(buf.as_mut_ptr(), need);
+        assert_eq!(
+            written, need,
+            "probe wrote {written} u64s, this harness expected {need} \
+             — PROBE_EVENTS is out of sync with dispatch_probe"
+        );
+        Some((buf, probe_phase_names(lib)))
+    }
+}
+
+/// Print allocations and bytes per phase, normalised per `Run` and per node.
+fn report_probe(case: &str, nodes: usize, runs: usize, buf: &[u64], names: &[String]) {
+    let nb = names.len();
+    let np = nb - 1;
+    let (calls, ns) = (&buf[..np], &buf[np..2 * np]);
+    let (allocs, bytes) = (
+        &buf[2 * np..2 * np + nb],
+        &buf[2 * np + nb..2 * np + 2 * nb],
+    );
+    let events = &buf[2 * np + 2 * nb..];
+    let per_run = runs.max(1) as f64;
+    let per_node = (runs.max(1) * nodes.max(1)) as f64;
+    println!("# probe {case}: nodes={nodes} runs={runs}");
+    println!("# phase,calls_per_run,ns_per_run,allocs_per_run,allocs_per_node,bytes_per_run");
+    for (i, name) in names.iter().enumerate().take(np) {
+        println!(
+            "# {name},{:.2},{:.0},{:.3},{:.3},{:.0}",
+            calls[i] as f64 / per_run,
+            ns[i] as f64 / per_run,
+            allocs[i] as f64 / per_run,
+            allocs[i] as f64 / per_node,
+            bytes[i] as f64 / per_run,
+        );
+    }
+    // The unattributed bucket is the point of the table, not a footnote: it is
+    // what says whether the per-phase rows are the whole story.
+    println!(
+        "# {},,,{:.3},{:.3},{:.0}",
+        names[nb - 1],
+        allocs[nb - 1] as f64 / per_run,
+        allocs[nb - 1] as f64 / per_node,
+        bytes[nb - 1] as f64 / per_run,
+    );
+    let total: u64 = allocs.iter().sum();
+    let total_bytes: u64 = bytes.iter().sum();
+    println!(
+        "# TOTAL_attributed,,,{:.3},{:.3},{:.0}",
+        total as f64 / per_run,
+        total as f64 / per_node,
+        total_bytes as f64 / per_run
+    );
+    for (i, name) in PROBE_EVENTS.iter().enumerate() {
+        println!("# event {name},{:.3}/run", events[i] as f64 / per_run);
+    }
 }
