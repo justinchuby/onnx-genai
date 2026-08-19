@@ -1132,6 +1132,18 @@ struct DeviceStaging {
 /// Owns an `OrtMemoryInfo` rebuilt via `CreateMemoryInfo_V2`, released on drop.
 struct ReconstructedMemInfo {
     ptr: *const ort::OrtMemoryInfo,
+    /// Whether `ptr` denotes device memory, recorded from the `device_type` it
+    /// was built with rather than asked of ORT afterwards.
+    ///
+    /// `mem_info_is_device` is exactly `device_type != CPU`, and this memory
+    /// info was created by passing `device_type` straight to
+    /// `CreateMemoryInfo_V2`, so the two agree by construction. Every EP that
+    /// supplies a host-to-device copier today is non-CPU, which would make a
+    /// hardcoded `true` correct — but nothing in `HostToDeviceCopier` requires
+    /// that, and a CPU-typed EP that grew a copier would then be handed host
+    /// memory as a device scratch target. Deriving it costs nothing and cannot
+    /// drift.
+    is_device: bool,
 }
 
 // SAFETY: the pointer is read-only after construction and released only on drop.
@@ -1288,9 +1300,10 @@ unsafe fn device_mem_info(
         && let Some(recon) = staging.recon_mem_info.as_ref()
         && !recon.ptr.is_null()
     {
-        // Reconstructed from the EP's own device recipe, so device-resident by
-        // construction; the old code asked ORT to confirm it.
-        return Some((recon.ptr, true));
+        // Device-ness recorded when this was built from the EP's own device
+        // recipe, so it matches what the old `mem_info_is_device` call returned
+        // without spending an FFI call to re-derive it.
+        return Some((recon.ptr, recon.is_device));
     }
     // Host EP (no device staging context): preserve the historical behavior of
     // using input 0's memory info. For a host EP this is host memory, which is
@@ -1650,7 +1663,10 @@ fn reconstruct_device_mem_info(
     if ptr.is_null() {
         return None;
     }
-    Some(ReconstructedMemInfo { ptr })
+    Some(ReconstructedMemInfo {
+        ptr,
+        is_device: device_type != ort::OrtMemoryInfoDeviceType_CPU,
+    })
 }
 
 /// Device type ORT placed a memory info on, or `None` if unreadable.
@@ -5834,6 +5850,37 @@ mod mem_info_cost {
 
     const MI: *const ort::OrtMemoryInfo = std::ptr::without_provenance(3);
     const VALUE: *const ort::OrtValue = std::ptr::without_provenance(4);
+    const RECON: *const ort::OrtMemoryInfo = std::ptr::without_provenance(5);
+
+    /// A device EP's staging context with a reconstructed memory info of the
+    /// given device-ness.
+    ///
+    /// Built directly rather than through `set_device_staging`, which would
+    /// need a live ORT to call `CreateMemoryInfo_V2`. Dropping the result is
+    /// safe with no host API installed: `ReconstructedMemInfo::drop` returns
+    /// early when `host_api()` is null, so the sentinel pointer is never
+    /// passed to `ReleaseMemoryInfo`.
+    fn staging_with_recon(ptr: *const ort::OrtMemoryInfo, is_device: bool) -> DeviceStaging {
+        struct NoCopier;
+        impl HostToDeviceCopier for NoCopier {
+            unsafe fn copy_host_to_device(
+                &self,
+                _src: &[u8],
+                _dst: *mut std::ffi::c_void,
+            ) -> onnx_runtime_ep_api::Result<()> {
+                unreachable!("scratch placement must not copy")
+            }
+        }
+        assert!(
+            crate::status::host_api().is_null(),
+            "test builds a ReconstructedMemInfo over a sentinel pointer; a live \
+             host API would hand it to ReleaseMemoryInfo on drop"
+        );
+        DeviceStaging {
+            copier: Arc::new(NoCopier),
+            recon_mem_info: Some(ReconstructedMemInfo { ptr, is_device }),
+        }
+    }
 
     unsafe extern "C" fn count_1(
         _c: *const ort::OrtKernelContext,
@@ -5960,6 +6007,68 @@ mod mem_info_cost {
         assert_eq!(
             unsafe { device_mem_info(&api, std::ptr::null_mut(), None) },
             None
+        );
+    }
+
+    /// A device EP whose node has only host-resident inputs falls back to the
+    /// memory info reconstructed from its own device recipe, so intermediates
+    /// still land on the device.
+    ///
+    /// The old code returned that pointer and left the caller to ask ORT
+    /// whether it was a device; the device-ness is now carried alongside it.
+    /// This is the one branch whose reporting changed, so it is pinned
+    /// explicitly rather than left to the host-EP tests.
+    #[test]
+    fn all_host_inputs_on_a_device_ep_fall_back_to_the_reconstructed_device_info() {
+        let staging = staging_with_recon(RECON, true);
+        let api = api(true);
+        let before = dispatch_probe::snapshot();
+        let got = unsafe { device_mem_info(&api, std::ptr::null_mut(), Some(&staging)) };
+        let d = dispatch_probe::snapshot().since(&before);
+
+        assert_eq!(
+            got,
+            Some((RECON, true)),
+            "device scratch target, reported as a device"
+        );
+        assert_eq!(
+            d.event(Event::OrtFfiCall),
+            4,
+            "the fallback must not re-ask ORT about the info it just built"
+        );
+    }
+
+    /// The device-ness of the reconstructed info is recorded from the
+    /// `device_type` it was built with, not hardcoded.
+    ///
+    /// Nothing in `HostToDeviceCopier` obliges an EP that provides a copier to
+    /// be non-CPU. Every one that exists today is, which is what makes a
+    /// hardcoded `true` look safe -- but a CPU-typed EP that grew a copier
+    /// would be handed host memory as a device scratch target, and the staging
+    /// path would treat host pointers as device pointers. `mem_info_is_device`
+    /// is exactly `device_type != CPU`, so recording it at construction
+    /// reproduces the old query in this case too.
+    #[test]
+    fn a_cpu_typed_reconstruction_is_not_reported_as_a_device() {
+        let staging = staging_with_recon(RECON, false);
+        let api = api(true);
+        assert_eq!(
+            unsafe { device_mem_info(&api, std::ptr::null_mut(), Some(&staging)) },
+            Some((RECON, false)),
+            "host-typed reconstruction must not be reported as device memory"
+        );
+    }
+
+    /// A device-resident input still wins over the reconstruction: the scan
+    /// short-circuits before the fallback is consulted.
+    #[test]
+    fn a_device_input_wins_over_the_reconstruction() {
+        let staging = staging_with_recon(RECON, true);
+        let api = api(false);
+        assert_eq!(
+            unsafe { device_mem_info(&api, std::ptr::null_mut(), Some(&staging)) },
+            Some((MI, true)),
+            "the actual device input, not the fallback recipe"
         );
     }
 }
