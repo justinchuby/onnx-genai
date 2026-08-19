@@ -1553,6 +1553,72 @@ fn abandoning_a_prepared_release_quarantines_without_refund() {
 }
 
 #[test]
+fn settlement_token_drop_with_waiter_retains_quarantined_snapshot() {
+    let fixture = Fixture::new(DeviceKey::HOST, 4096, unlimited());
+    let allocation = fixture.allocate(160);
+    let wait = allocation.settlement_wait();
+    let prepared = allocation.prepare_release().unwrap();
+    // SAFETY: this test intentionally simulates a provider losing its final
+    // settlement owner while a diagnostics/admission waiter remains.
+    let (request, settlement) = unsafe { prepared.into_parts() };
+    drop(settlement);
+
+    assert_eq!(
+        wait.status(),
+        onnx_runtime_memory_governor::AllocationSettlementStatus::Retained(
+            onnx_runtime_memory_governor::ManagedAllocationState::Quarantined
+        )
+    );
+    let snapshot = fixture.manager.snapshot().unwrap();
+    assert_eq!(snapshot.allocations.len(), 1);
+    assert_eq!(
+        snapshot.allocations[0].state,
+        onnx_runtime_memory_governor::ManagedAllocationState::Quarantined
+    );
+    assert_eq!(snapshot.allocations[0].charged_bytes, 160);
+    assert_eq!(fixture.governor.used(Tier::Host), 160);
+
+    drop(request);
+    fixture.allocator.cleanup();
+}
+
+#[test]
+fn last_token_drop_cannot_reinsert_after_context_termination() {
+    let fixture = Fixture::new(DeviceKey::HOST, 4096, unlimited());
+    let allocation = fixture.allocate(160);
+    let wait = allocation.settlement_wait();
+    let prepared = allocation.prepare_release().unwrap();
+    // SAFETY: the test preserves both halves and drives the exact device-loss
+    // outcome before external context termination.
+    let (request, settlement) = unsafe { prepared.into_parts() };
+    fixture
+        .manager
+        .invalidate_device(DeviceKey::HOST, "loss before token drop")
+        .unwrap();
+    let outcome = request.quarantine_device_lost();
+    assert_eq!(
+        outcome.state(),
+        onnx_runtime_memory_governor::AllocationReleaseState::DeviceLost
+    );
+    fixture
+        .manager
+        .confirm_context_terminated(&fixture.context)
+        .unwrap();
+    assert_eq!(
+        wait.status(),
+        onnx_runtime_memory_governor::AllocationSettlementStatus::Released
+    );
+
+    drop(settlement);
+    assert!(
+        fixture.manager.snapshot().unwrap().allocations.is_empty(),
+        "last-token abandonment must not resurrect a terminal charge"
+    );
+    assert_eq!(fixture.governor.used(Tier::Host), 0);
+    fixture.allocator.cleanup();
+}
+
+#[test]
 fn deterministic_switch_and_teardown_stress() {
     for round in 0..64 {
         let fixture = Fixture::new(DeviceKey::HOST, 8192, unlimited());

@@ -1610,9 +1610,106 @@ mod tests {
             DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
         };
 
-        let governor =
+        #[derive(Debug)]
+        struct WorkspaceDeallocationEp {
+            fail: bool,
+        }
+
+        impl ExecutionProvider for WorkspaceDeallocationEp {
+            fn name(&self) -> &str {
+                "workspace-deallocation-test"
+            }
+
+            fn device_type(&self) -> DeviceType {
+                DeviceType::Cpu
+            }
+
+            fn device_id(&self) -> DeviceId {
+                DeviceId::cpu()
+            }
+
+            fn initialize(&mut self, _config: &EpConfig) -> Result<()> {
+                Ok(())
+            }
+
+            fn shutdown(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            fn supports_op(
+                &self,
+                _op: &Node,
+                _opset: u64,
+                _shapes: &[Shape],
+                _input_dtypes: &[DataType],
+                _layouts: &[TensorLayout],
+            ) -> KernelMatch {
+                KernelMatch::unsupported("unused test provider")
+            }
+
+            fn get_kernel(
+                &self,
+                _op: &Node,
+                _shapes: &[Vec<usize>],
+                _opset: u64,
+            ) -> Result<Box<dyn Kernel>> {
+                Err(EpError::KernelFailed("unused test kernel".into()))
+            }
+
+            fn allocate(&self, _size: usize, _alignment: usize) -> Result<DeviceBuffer> {
+                Err(EpError::KernelFailed("unused test allocation".into()))
+            }
+
+            fn deallocate(&self, _buffer: DeviceBuffer) -> Result<()> {
+                if self.fail {
+                    Err(EpError::KernelFailed(
+                        "injected workspace deallocation failure".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn copy(
+                &self,
+                _src: &DeviceBuffer,
+                _dst: &mut DeviceBuffer,
+                _size: usize,
+            ) -> Result<()> {
+                Err(EpError::KernelFailed("unused test copy".into()))
+            }
+
+            fn copy_async(
+                &self,
+                _src: &DeviceBuffer,
+                _dst: &mut DeviceBuffer,
+                _size: usize,
+            ) -> Result<Fence> {
+                Err(EpError::KernelFailed("unused test async copy".into()))
+            }
+
+            fn sync(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        fn borrowed_workspace(lease: MemoryLease, backing: &mut [u8]) -> WorkspaceAllocation {
+            // SAFETY: `backing` outlives the synchronous deallocation call, and
+            // the test EP never reads, writes, or frees the borrowed pointer.
+            let buffer = unsafe {
+                DeviceBuffer::from_borrowed_parts(
+                    backing.as_mut_ptr().cast(),
+                    DeviceId::cpu(),
+                    backing.len(),
+                    1,
+                )
+            };
+            WorkspaceAllocation::new(buffer, Some(lease))
+        }
+
+        let failed_governor =
             LedgerGovernor::new(LeaseLedger::new_for_device(DeviceKey::HOST, 0, 1024, 0));
-        let lease = governor
+        let failed_lease = failed_governor
             .reserve(
                 Tier::Host,
                 64,
@@ -1621,12 +1718,41 @@ mod tests {
             )
             .unwrap();
         let before = quarantined_workspace_lease_count();
-        quarantine_failed_workspace_lease(lease);
+        let mut failed_backing = vec![0_u8; 64];
+        let error = WorkspaceDeallocationEp { fail: true }
+            .deallocate_workspace(borrowed_workspace(failed_lease, &mut failed_backing))
+            .unwrap_err();
+        assert!(error.to_string().contains("injected"));
         assert_eq!(quarantined_workspace_lease_count(), before + 1);
         assert_eq!(
-            governor.used(Tier::Host),
+            failed_governor.used(Tier::Host),
             64,
             "failed deallocation must not advertise unsettled bytes as free"
+        );
+
+        let success_governor =
+            LedgerGovernor::new(LeaseLedger::new_for_device(DeviceKey::HOST, 0, 1024, 0));
+        let success_lease = success_governor
+            .reserve(
+                Tier::Host,
+                64,
+                MemoryRole::Workspace { step_scoped: true },
+                HolderId::new(10),
+            )
+            .unwrap();
+        let mut success_backing = vec![0_u8; 64];
+        WorkspaceDeallocationEp { fail: false }
+            .deallocate_workspace(borrowed_workspace(success_lease, &mut success_backing))
+            .unwrap();
+        assert_eq!(
+            success_governor.used(Tier::Host),
+            0,
+            "successful synchronous deallocation must refund its outer lease"
+        );
+        assert_eq!(
+            quarantined_workspace_lease_count(),
+            before + 1,
+            "success and failure paths must not be swapped"
         );
     }
 

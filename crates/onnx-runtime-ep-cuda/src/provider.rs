@@ -1677,12 +1677,14 @@ impl CudaExecutionProvider {
         Ok(())
     }
 
-    fn wait_for_workspace_release_barrier(&self) -> Result<()> {
-        const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-        match self.workspace_release_barrier.wait(WAIT) {
+    fn wait_for_workspace_release_barrier(
+        barrier: &WorkspaceReleaseBarrier,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        match barrier.wait(timeout) {
             None | Some(AllocationSettlementStatus::Released) => Ok(()),
             Some(AllocationSettlementStatus::Pending) => Err(EpError::KernelFailed(format!(
-                "cuda_ep: workspace replacement timed out after {WAIT:?} waiting for its prior \
+                "cuda_ep: workspace replacement timed out after {timeout:?} waiting for its prior \
                  allocation-specific settlement; this error is retryable and unrelated deferred \
                  releases do not participate in the barrier"
             ))),
@@ -2230,7 +2232,10 @@ impl ExecutionProvider for CudaExecutionProvider {
         alignment: usize,
         role: MemoryRole,
     ) -> Result<WorkspaceAllocation> {
-        self.wait_for_workspace_release_barrier()?;
+        Self::wait_for_workspace_release_barrier(
+            &self.workspace_release_barrier,
+            std::time::Duration::from_secs(30),
+        )?;
         let target_mapped = self.mapped_bytes_for_allocation(size, alignment)?;
         if let Some(grant) = self.prepare_mapped_growth(target_mapped, role)? {
             return self
@@ -2251,7 +2256,10 @@ impl ExecutionProvider for CudaExecutionProvider {
     ) -> Result<WorkspaceAllocation> {
         if let Some(old) = old {
             self.deallocate_workspace(old)?;
-            self.wait_for_workspace_release_barrier()?;
+            Self::wait_for_workspace_release_barrier(
+                &self.workspace_release_barrier,
+                std::time::Duration::from_secs(30),
+            )?;
         }
         self.allocate_workspace(size, alignment, role)
     }
@@ -3289,10 +3297,11 @@ mod tests {
         assert_eq!(queue.pending(), 2);
         assert_eq!(queue.poll(), 1, "only the workspace release is ready");
 
-        assert_eq!(
-            barrier.wait(std::time::Duration::from_millis(10)),
-            Some(AllocationSettlementStatus::Released)
-        );
+        CudaExecutionProvider::wait_for_workspace_release_barrier(
+            &barrier,
+            std::time::Duration::from_millis(10),
+        )
+        .unwrap();
         assert_eq!(
             queue.pending(),
             1,
@@ -3306,25 +3315,28 @@ mod tests {
         let workspace = managed_host_workspace(128);
         assert!(barrier.capture(&workspace));
 
-        assert_eq!(
-            barrier.wait(std::time::Duration::ZERO),
-            Some(AllocationSettlementStatus::Pending)
+        assert!(
+            CudaExecutionProvider::wait_for_workspace_release_barrier(
+                &barrier,
+                std::time::Duration::ZERO,
+            )
+            .is_err()
         );
         release_managed_workspace(workspace);
-        assert_eq!(
-            barrier.wait(std::time::Duration::from_millis(10)),
-            Some(AllocationSettlementStatus::Released),
-            "a later admission retries the same allocation-specific settlement"
-        );
+        CudaExecutionProvider::wait_for_workspace_release_barrier(
+            &barrier,
+            std::time::Duration::from_millis(10),
+        )
+        .expect("a later admission retries the same allocation-specific settlement");
 
         let later = managed_host_workspace(128);
         assert!(barrier.capture(&later));
         release_managed_workspace(later);
-        assert_eq!(
-            barrier.wait(std::time::Duration::from_millis(10)),
-            Some(AllocationSettlementStatus::Released),
-            "a transient timeout must not permanently disable later workspaces"
-        );
+        CudaExecutionProvider::wait_for_workspace_release_barrier(
+            &barrier,
+            std::time::Duration::from_millis(10),
+        )
+        .expect("a transient timeout must not permanently disable later workspaces");
     }
 
     #[test]
