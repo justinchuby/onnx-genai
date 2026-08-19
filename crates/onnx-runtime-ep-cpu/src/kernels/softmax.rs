@@ -75,7 +75,7 @@ impl KernelFactory for SoftmaxLegacyFactory {
 /// `n`, so it refused shapes that are wide instead of tall: decode attention is
 /// `n = heads` by `d = kv_len`, and `32 x 8192` is 256 Ki elements, sixteen
 /// times this floor, yet 32 rows could never clear a floor of 64. Those shapes
-/// then ran single-threaded at every pool width. See section 42 of the CPU-EP
+/// then ran single-threaded at every pool width. See section 43 of the CPU-EP
 /// benchmark ledger for the measurement that found it.
 ///
 /// Removing the row floor admits nothing that this floor did not already admit
