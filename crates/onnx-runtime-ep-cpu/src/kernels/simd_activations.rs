@@ -127,6 +127,7 @@ where
 /// # Safety
 /// The caller must have confirmed the corresponding ISA is available and pass
 /// two slices of equal length.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 type NarrowFn = unsafe fn(&[f32], &mut [u16]);
 
 /// End of the fused-narrow chunk starting at `start`, for a tensor of `n`.
@@ -143,6 +144,7 @@ type NarrowFn = unsafe fn(&[f32], &mut [u16]);
 /// * **Lane-aligned boundaries.** `NARROW_CHUNK` is a multiple of 8, so every
 ///   boundary lands where the 8-wide vector run would have been anyway and the
 ///   scalar remainder is the same `n % 8` elements either way.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn chunk_end(start: usize, n: usize) -> usize {
     let end = (start + NARROW_CHUNK).min(n);
     if n - end < SIMD_MIN_LEN { n } else { end }
@@ -155,6 +157,7 @@ fn chunk_end(start: usize, n: usize) -> usize {
 /// narrow reads it back. The unfused path allocated one buffer the size of the
 /// whole tensor and made three passes over it — widen, compute, narrow — which
 /// on a 1 Mi tensor is 4 MB streamed twice more than it needs to be.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const NARROW_CHUNK: usize = 8192;
 
 /// [`write_mapped`] for closures that read a slice *besides* `x`.
@@ -4168,6 +4171,7 @@ mod tests {
     /// asserts in, or the test proves nothing. Finding it at test time — rather
     /// than hard-coding a constant a coefficient change could quietly retire —
     /// is what makes the chunking test below non-vacuous by construction.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn scalar_vector_divergence(kernel: fn(&[f32], &mut [f32])) -> Option<f32> {
         let mut short_in = [0.0f32; 8];
         let mut short_out = [0.0f32; 8];
@@ -4206,6 +4210,7 @@ mod tests {
     /// an input value where the two paths are *known* to disagree so the test
     /// cannot pass by luck.
     #[test]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn a_short_tail_does_not_fall_off_the_vector_path() {
         let mut witnesses = 0;
         for (name, kernel) in [
@@ -4246,6 +4251,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn fused_narrow_is_bit_identical_across_chunk_boundaries() {
         // A tail shorter than `SIMD_MIN_LEN` is the dangerous case: handed to
         // the kernel on its own it would take the scalar path, while a single
@@ -4298,6 +4304,7 @@ mod tests {
     /// both short and not the whole tensor, and no boundary falls off an
     /// 8-wide lane.
     #[test]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn chunk_end_never_emits_a_short_trailing_chunk() {
         let sizes = (1..80usize)
             .chain([NARROW_CHUNK - 1, NARROW_CHUNK, NARROW_CHUNK + 1])
@@ -4336,6 +4343,7 @@ mod tests {
     /// reference when the output is f16 and the tensor spans several chunks
     /// with a row width that never divides one.
     #[test]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn a_row_broadcast_closure_stays_off_the_chunked_arm() {
         let width = 61;
         let n = width * 300;
