@@ -401,7 +401,15 @@ pub fn gather_block_quantized(ctx: &mut InferenceContext) -> Result<(), ShapeInf
     if gather_axis != 0 || bits <= 0 {
         return Ok(());
     }
-    let components = 8 / bits;
+    // Only uint8-packed data stores several sub-byte elements per byte and needs
+    // the last axis scaled by 8/bits. Native ONNX sub-byte tensors (Int4/Uint4)
+    // already carry the full logical element count in their shape, so their last
+    // dim must NOT be expanded (matches ORT's `components == 1` for int4 data).
+    let data_packed = ctx
+        .input_type(0)
+        .map(|t| !t.dtype.is_sub_byte())
+        .unwrap_or(true);
+    let components = if data_packed { 8 / bits } else { 1 };
     if let (Some(dtype), Some(data_shape), Some(indices_shape)) = (
         ctx.input_type(2).map(|t| t.dtype),
         ctx.input_shape(0).map(<[_]>::to_vec),

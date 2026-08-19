@@ -40,8 +40,8 @@ pub use component::{
 };
 pub use parser::{
     MtpProposerSpec, SharedKvProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor,
-    SpeculatorProposerKind, SpeculatorProposerStatus, detect_speculator, load_metadata,
-    load_pipeline_spec, resolve_speculator_config,
+    SpeculatorProposerKind, SpeculatorProposerStatus, detect_speculator, find_metadata_path,
+    load_metadata, load_metadata_from_dir, load_pipeline_spec, resolve_speculator_config,
 };
 pub use schema::*;
 pub use validation::{

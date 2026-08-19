@@ -8,7 +8,7 @@
 //! are `__half`; every softmax statistic and value accumulator stays in fp32.
 //!
 //! The structural gate accepts any single-token fp16 GQA/MQA/MHA decode with an
-//! even `head_dim <= 256`.
+//! even `head_dim <= 512`.
 //!
 //! ## Reduction strategy
 //!
@@ -42,8 +42,8 @@
 //!     the split count to fill the multiprocessors, selects between 1 and 16
 //!     active splits, so replay observes updated lengths without a host round
 //!     trip or graph update. Inactive split CTAs return before loading Q/K/V.
-//!   * The worst-case module-global scratch is 4,227,072 bytes
-//!     (`256 rows * 16 splits * 258 floats * 4 bytes`). It is shared by all GQA
+//!   * The worst-case module-global scratch is 8,421,376 bytes
+//!     (`256 rows * 16 splits * 514 floats * 4 bytes`). It is shared by all GQA
 //!     layers under the runtime's single-stream execution invariant; concurrent
 //!     streams would require per-stream scratch.
 
@@ -55,13 +55,20 @@ use crate::error::driver_err;
 use crate::kernels::kv_stride::{KvCachePath, KvCacheStrides};
 use crate::runtime::CudaRuntime;
 
-const ENTRY: &str = "gqa_decode_attention_f16";
+const ENTRY_PREFIX: &str = "gqa_decode_attention_f16_h2pl";
 const MERGE_ENTRY: &str = "gqa_decode_attention_f16_merge";
 
 /// Largest `head_dim` this kernel supports. Each of the 32 warp lanes owns
-/// `ceil(head_dim / 2 / 32)` `half2` slots (2 dims each) in registers, capped at
-/// `GQA_MAX_H2PL == 4`, i.e. `head_dim <= 2 * 4 * 32 == 256`.
-pub(super) const MAX_HEAD_DIM: usize = 256;
+/// `ceil(head_dim / 2 / 32)` `half2` slots (2 dims each) in registers. The
+/// decode kernel is specialized per half2-per-lane tier `H2PL = ceil(head_dim /
+/// 2 / 32)` (1..=`GQA_MAX_H2PL == 8`), so a small head keeps its original
+/// register footprint while `head_dim` up to `2 * 8 * 32 == 512` is covered on
+/// the fused fast path.
+pub(super) const MAX_HEAD_DIM: usize = 512;
+
+/// Highest half2-per-lane tier the CUDA source instantiates
+/// (`GQA_DECODE_F16_ENTRIES` 1..=8). `2 * 32 * MAX_H2PL == MAX_HEAD_DIM`.
+const MAX_H2PL: usize = 8;
 
 /// Warps grouped into one CTA. Each CTA owns one query head; its warps split-K
 /// the sequence.
@@ -75,6 +82,16 @@ const MERGE_DIM_SPLITS: usize = 4;
 /// vectorization requires an even head size).
 pub(super) fn supported(query_seq: usize, head_dim: usize) -> bool {
     query_seq == 1 && head_dim.is_multiple_of(2) && (1..=MAX_HEAD_DIM).contains(&head_dim)
+}
+
+/// Half2-per-lane tier for a given head_dim: `ceil(head_dim / 2 / 32)`. The
+/// launcher instantiates the matching specialized decode entry so a small head
+/// keeps its original (narrow) register footprint instead of paying for the
+/// widest tier.
+fn h2_per_lane(head_dim: usize) -> usize {
+    (head_dim / 2)
+        .div_ceil(WARP_SIZE as usize)
+        .clamp(1, MAX_H2PL)
 }
 
 fn warps_per_block() -> u32 {
@@ -93,8 +110,8 @@ const DECODE_SRC: &str = r#"
 #include <cuda_fp16.h>
 
 #define GQA_WARP_SIZE 32
-#define GQA_MAX_H2PL 4   // half2 slots per lane; head_dim <= 2 * 4 * 32 == 256
-#define GQA_MAX_HEAD_SIZE 256
+#define GQA_MAX_H2PL 8   // half2 slots per lane (widest tier); head_dim <= 2 * 8 * 32 == 512
+#define GQA_MAX_HEAD_SIZE 512
 #define GQA_MAX_SPLITS 16
 #define GQA_MERGE_DIM_SPLITS 4
 #define GQA_MAX_SCRATCH_ROWS 256
@@ -103,7 +120,7 @@ const DECODE_SRC: &str = r#"
 
 // Module globals are allocated when the NVRTC module is loaded, before graph
 // capture. All GQA layers share the same stream and therefore reuse this
-// scratch sequentially. The 4,227,072-byte allocation is sized for the full
+// scratch sequentially. The 8,421,376-byte allocation is sized for the full
 // 256-row, 16-split worst case. Concurrent streams would need separate scratch.
 // Shapes above the row cap retain the old one-CTA path.
 __device__ __align__(16) float gqa_split_scratch[
@@ -131,7 +148,8 @@ __device__ __forceinline__ int gqa_active_splits(
     return splits;
 }
 
-extern "C" __global__ void gqa_decode_attention_f16(
+template<int H2PL>
+__device__ __forceinline__ void gqa_decode_f16_impl(
     const __half* __restrict__ query,
     const __half* __restrict__ key,
     const __half* __restrict__ value,
@@ -204,10 +222,10 @@ extern "C" __global__ void gqa_decode_attention_f16(
     const int h2 = head_size >> 1;   // number of half2 elements per row
     const half2* q2 = reinterpret_cast<const half2*>(query + q_base);
 
-    float2 q_reg[GQA_MAX_H2PL];
-    float2 acc[GQA_MAX_H2PL];
+    float2 q_reg[H2PL];
+    float2 acc[H2PL];
 #pragma unroll
-    for (int i = 0; i < GQA_MAX_H2PL; ++i) {
+    for (int i = 0; i < H2PL; ++i) {
         const int j = lane + i * GQA_WARP_SIZE;
         q_reg[i] = (j < h2) ? __half22float2(q2[j]) : make_float2(0.0f, 0.0f);
         acc[i] = make_float2(0.0f, 0.0f);
@@ -225,7 +243,7 @@ extern "C" __global__ void gqa_decode_attention_f16(
         const half2* k2 = reinterpret_cast<const half2*>(key + kv_off);
         float partial = 0.0f;
 #pragma unroll
-        for (int i = 0; i < GQA_MAX_H2PL; ++i) {
+        for (int i = 0; i < H2PL; ++i) {
             const int j = lane + i * GQA_WARP_SIZE;
             if (j < h2) {
                 const float2 k = __half22float2(k2[j]);
@@ -248,7 +266,7 @@ extern "C" __global__ void gqa_decode_attention_f16(
         running_sum = running_sum * correction + probability;
         const half2* v2 = reinterpret_cast<const half2*>(value + kv_off);
 #pragma unroll
-        for (int i = 0; i < GQA_MAX_H2PL; ++i) {
+        for (int i = 0; i < H2PL; ++i) {
             const int j = lane + i * GQA_WARP_SIZE;
             const float2 v = (j < h2) ? __half22float2(v2[j]) : make_float2(0.0f, 0.0f);
             acc[i].x = acc[i].x * correction + probability * v.x;
@@ -263,7 +281,7 @@ extern "C" __global__ void gqa_decode_attention_f16(
         warp_sum[warp_in_block] = running_sum;
     }
 #pragma unroll
-    for (int i = 0; i < GQA_MAX_H2PL; ++i) {
+    for (int i = 0; i < H2PL; ++i) {
         const int j = lane + i * GQA_WARP_SIZE;
         if (j < h2) {
             warp_acc[warp_in_block * head_size + 2 * j] = acc[i].x;
@@ -306,7 +324,7 @@ extern "C" __global__ void gqa_decode_attention_f16(
     const float inverse_sum =
         (direct_output && denom > 0.0f) ? (1.0f / denom) : 0.0f;
 #pragma unroll
-    for (int i = 0; i < GQA_MAX_H2PL; ++i) {
+    for (int i = 0; i < H2PL; ++i) {
         const int j = lane + i * GQA_WARP_SIZE;
         if (j < h2) {
             float ox = 0.0f;
@@ -325,6 +343,36 @@ extern "C" __global__ void gqa_decode_attention_f16(
         }
     }
 }
+
+// Emit the `extern "C"` decode launch entry for one half2-per-lane tier. The
+// launcher selects `gqa_decode_attention_f16_h2pl{N}` for
+// `N = ceil(head_dim / 2 / 32)` so a small head keeps its narrow register
+// footprint (no occupancy regression) while wide heads (up to head_dim 512, DPL
+// H2PL 8) stay on the fused fast path. The merge kernel is head-size-generic
+// (dynamic loop) and needs no per-tier specialization.
+#define GQA_DECODE_F16_ENTRIES(H2PL)                                          \
+extern "C" __global__ void gqa_decode_attention_f16_h2pl##H2PL(               \
+    const __half* __restrict__ query, const __half* __restrict__ key,         \
+    const __half* __restrict__ value, __half* __restrict__ output,            \
+    const int* __restrict__ total_lengths, const int batch,                   \
+    const int query_heads, const int kv_heads, const int query_seq,           \
+    const int head_size, const int cache_capacity, const int group_size,      \
+    const float scale, const int local_window, const float softcap,           \
+    const int single_split_direct, const int split_fill) {                    \
+    gqa_decode_f16_impl<H2PL>(query, key, value, output, total_lengths,       \
+        batch, query_heads, kv_heads, query_seq, head_size, cache_capacity,   \
+        group_size, scale, local_window, softcap, single_split_direct,        \
+        split_fill);                                                          \
+}
+
+GQA_DECODE_F16_ENTRIES(1)
+GQA_DECODE_F16_ENTRIES(2)
+GQA_DECODE_F16_ENTRIES(3)
+GQA_DECODE_F16_ENTRIES(4)
+GQA_DECODE_F16_ENTRIES(5)
+GQA_DECODE_F16_ENTRIES(6)
+GQA_DECODE_F16_ENTRIES(7)
+GQA_DECODE_F16_ENTRIES(8)
 
 extern "C" __global__ void gqa_decode_attention_f16_merge(
     __half* __restrict__ output,
@@ -505,7 +553,11 @@ pub(super) fn run(
             EpError::KernelFailed("cuda_ep GQA fp16 decode: shared-mem bytes exceed u32".into())
         })?;
 
-    let function = runtime.nvrtc_function(module_key, &decode_src, ENTRY)?;
+    // Select the compile-time half2-per-lane specialization for this head_dim so
+    // small heads keep their original (narrow) register footprint and occupancy.
+    let h2pl = h2_per_lane(head_dim);
+    let decode_entry = format!("{ENTRY_PREFIX}{h2pl}");
+    let function = runtime.nvrtc_function(module_key, &decode_src, &decode_entry)?;
     let single_split_direct = super::gqa_decode::single_split_direct_flag();
     let mut builder = runtime.stream().launch_builder(&function);
     builder
@@ -526,7 +578,7 @@ pub(super) fn run(
         .arg(&softcap)
         .arg(&single_split_direct)
         .arg(&split_fill_i);
-    // SAFETY: `ENTRY` matches this argument ABI; all buffers were sized by the
+    // SAFETY: the selected `h2pl` entry matches this argument ABI; all buffers were sized by the
     // caller (present K/V span `cache_capacity` rows, query/output span
     // `query_seq` tokens). Scratch is fixed module-global plus dynamic shared
     // memory, and the kernel never device-syncs, so the launch is legal to record
@@ -934,7 +986,7 @@ mod tests {
             ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
         };
 
-        for head_dim in [64usize, 128usize] {
+        for head_dim in [64usize, 128usize, 256usize, 512usize] {
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             let mut q_f16 = vec![f16::ZERO; num_heads * head_dim];
             for slot in q_f16.iter_mut() {
@@ -1019,13 +1071,167 @@ mod tests {
         }
     }
 
+    /// General head-size coverage for the fp16 fused fast path. The decode
+    /// kernel is specialized per half2-per-lane tier (`ceil(head_dim / 2 / 32)`),
+    /// so the widened capability band (`MAX_HEAD_DIM = 512`) must stay
+    /// f64-reference-accurate across the whole range -- not just the 512
+    /// endpoint. Sweeps 64/128/256 (existing tiers, non-regression) plus
+    /// 320/384/448/512 (new H2PL 5/6/7/8 tiers) against the fp32/f64 oracle.
+    #[test]
+    fn fp16_decode_kernel_matches_reference_softmax_general_head_dims() {
+        let Some(runtime) = runtime() else {
+            eprintln!(
+                "skipping CUDA GQA fp16 general head-dim parity test: CUDA runtime unavailable"
+            );
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("gqa_decode_attention_f16")
+            .is_err()
+        {
+            eprintln!(
+                "skipping CUDA GQA fp16 general head-dim parity test: fp16 NVRTC headers unavailable"
+            );
+            return;
+        }
+
+        let batch = 1usize;
+        let num_heads = 8usize;
+        let num_kv_heads = 2usize;
+        let cache_capacity = 1024usize;
+        let group = num_heads / num_kv_heads;
+
+        for head_dim in [64usize, 128, 256, 320, 384, 448, 512] {
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let mut state = 0x0F16_5EEDu64 ^ ((head_dim as u64) << 19);
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+            let round = |v: f32| -> (f16, f32) {
+                let h = f16::from_f32(v);
+                (h, h.to_f32())
+            };
+
+            let mut q_f16 = vec![f16::ZERO; num_heads * head_dim];
+            let mut q_ref = vec![0.0f32; num_heads * head_dim];
+            for (dst_h, dst_f) in q_f16.iter_mut().zip(q_ref.iter_mut()) {
+                let (h, f) = round(next());
+                *dst_h = h;
+                *dst_f = f;
+            }
+            let kv_len = num_kv_heads * cache_capacity * head_dim;
+            let mut k_f16 = vec![f16::ZERO; kv_len];
+            let mut k_ref = vec![0.0f32; kv_len];
+            let mut v_f16 = vec![f16::ZERO; kv_len];
+            let mut v_ref = vec![0.0f32; kv_len];
+            for i in 0..kv_len {
+                let (kh, kf) = round(next());
+                k_f16[i] = kh;
+                k_ref[i] = kf;
+                let (vh, vf) = round(next());
+                v_f16[i] = vh;
+                v_ref[i] = vf;
+            }
+
+            let query_dev = runtime.alloc_raw(q_f16.len() * 2).unwrap();
+            let key_dev = runtime.alloc_raw(k_f16.len() * 2).unwrap();
+            let value_dev = runtime.alloc_raw(v_f16.len() * 2).unwrap();
+            let output_dev = runtime.alloc_raw(num_heads * head_dim * 2).unwrap();
+            let totals_dev = runtime.alloc_raw(batch * 4).unwrap();
+            // SAFETY: device buffers were sized to hold each source slice.
+            unsafe {
+                runtime.htod(as_bytes(&q_f16), query_dev).unwrap();
+                runtime.htod(as_bytes(&k_f16), key_dev).unwrap();
+                runtime.htod(as_bytes(&v_f16), value_dev).unwrap();
+            }
+
+            let mut worst_abs = 0.0f32;
+            let mut worst_rel = 0.0f32;
+            for total in [1usize, 64, 65, 128, 129, 256, 257, 512, 1023] {
+                let totals = [total as i32];
+                // SAFETY: `totals_dev` holds `batch` i32 values.
+                unsafe {
+                    runtime.htod(as_bytes(&totals), totals_dev).unwrap();
+                }
+                run(
+                    &runtime,
+                    batch,
+                    num_heads,
+                    num_kv_heads,
+                    1,
+                    head_dim,
+                    cache_capacity,
+                    group,
+                    scale,
+                    query_dev,
+                    key_dev,
+                    value_dev,
+                    output_dev,
+                    totals_dev,
+                    0,
+                    0.0,
+                    &KvCacheStrides::head_major_bnsh(),
+                )
+                .unwrap();
+                let mut got = vec![f16::ZERO; num_heads * head_dim];
+                // SAFETY: `output_dev` holds `num_heads * head_dim` fp16 values.
+                unsafe {
+                    runtime.dtoh(as_bytes_mut(&mut got), output_dev).unwrap();
+                }
+                let expected = cpu_reference(
+                    &q_ref,
+                    &k_ref,
+                    &v_ref,
+                    total,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    cache_capacity,
+                    scale,
+                );
+                for (g, e) in got.iter().zip(expected.iter()) {
+                    let abs = (g.to_f32() - e).abs();
+                    let rel = abs / e.abs().max(1e-2);
+                    worst_abs = worst_abs.max(abs);
+                    worst_rel = worst_rel.max(rel);
+                }
+            }
+            // SAFETY: each pointer came from this runtime's `alloc_raw`, freed once.
+            unsafe {
+                runtime.free_raw(query_dev).unwrap();
+                runtime.free_raw(key_dev).unwrap();
+                runtime.free_raw(value_dev).unwrap();
+                runtime.free_raw(output_dev).unwrap();
+                runtime.free_raw(totals_dev).unwrap();
+            }
+
+            eprintln!(
+                "GQA fp16 decode head{head_dim} parity (h2pl={}): max_abs={worst_abs:.3e} max_rel={worst_rel:.3e}",
+                super::h2_per_lane(head_dim)
+            );
+            assert!(
+                worst_abs < 2e-3,
+                "fp16 head{head_dim} decode diverged from reference softmax: max_abs={worst_abs:.3e}"
+            );
+            assert!(
+                worst_rel < 5e-2,
+                "fp16 head{head_dim} decode diverged from reference softmax: max_rel={worst_rel:.3e}"
+            );
+        }
+    }
+
     #[test]
     fn support_gate_targets_even_head_dim_single_token_decode() {
         assert!(supported(1, 64));
         assert!(supported(1, 128));
         assert!(supported(1, 256));
+        assert!(supported(1, 258)); // within widened MAX_HEAD_DIM
+        assert!(supported(1, 512));
         assert!(!supported(1, 63)); // odd head_dim: no half2 vectorization
-        assert!(!supported(1, 258)); // exceeds MAX_HEAD_DIM
+        assert!(!supported(1, 514)); // exceeds MAX_HEAD_DIM
         assert!(!supported(2, 64)); // prefill (Sq > 1)
         assert!(!supported(1, 0));
     }
