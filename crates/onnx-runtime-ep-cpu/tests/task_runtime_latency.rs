@@ -236,10 +236,17 @@ fn nested_dispatch_slot_pressure() {
         rows.par_chunks_mut(NEST_INNER).for_each(|row| {
             let base = row.as_mut_ptr() as usize;
             task_runtime::for_each_range(NEST_INNER, 64, |start, end| {
-                // Each task owns a disjoint `start..end` of this row, so the
-                // reconstructed slice never overlaps another task's.
-                let row = unsafe { std::slice::from_raw_parts_mut(base as *mut u64, NEST_INNER) };
-                for slot in &mut row[start..end] {
+                // SAFETY: `for_each_range` covers `0..NEST_INNER` with disjoint
+                // half-open ranges and blocks until each has run exactly once,
+                // so this task is the only holder of `start..end`. Reconstruct
+                // *only* that range — the same shape production uses in
+                // `parallel_output_rows_repeated`. Materialising the whole row
+                // in every task would alias a `&mut` across concurrent tasks
+                // even though the writes are disjoint, which is UB.
+                let row = unsafe {
+                    std::slice::from_raw_parts_mut((base as *mut u64).add(start), end - start)
+                };
+                for slot in row.iter_mut() {
                     *slot += 1;
                 }
             });
