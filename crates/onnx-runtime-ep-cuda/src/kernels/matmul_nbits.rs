@@ -5901,6 +5901,51 @@ fn use_gemv_splitk_multicol() -> bool {
     )
 }
 
+/// Grid-fill override for the split-K wide path on GRID-STARVED narrow-N
+/// projections (e.g. a GQA k/v projection: N = kv_heads * head_dim, ~256).
+///
+/// The multicol hybrid ([`GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_ENTRY`])
+/// register-blocks [`GEMV_F16_WIDE_MULTICOL_NC`] columns per warp group, so a
+/// 256-thread (8-warp) CTA covers `(8 / GENERAL_BS_SPLITK_MULTICOL) *
+/// GEMV_F16_WIDE_MULTICOL_NC` output columns and its launch grid is only
+/// `ceil(N / cols_per_cta)`. That register blocking is a WIN on the medium/large
+/// projections (down_proj / q / o at N~4096) where it lifts the memory-level
+/// parallelism at ~1 wave, but on a narrow projection it collapses the grid so
+/// far below the device SM count that most SMs sit idle (measured N=256 on GLM's
+/// 2-kv-head GQA: grid=32 / ~0.06 waves / 2% DRAM / 6.1 us), starving the
+/// latency-bound global loads of any in-flight parallelism to hide behind.
+///
+/// The single-column split-K wide entry
+/// ([`GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY`]) covers only `8 /
+/// GENERAL_BS_SPLITK` columns per CTA (4x fewer), so its grid is `4 *
+/// GEMV_F16_WIDE_MULTICOL_NC` = 4x larger and fills those idle SMs. It is
+/// BYTE-IDENTICAL to the multicol hybrid (same per-column depth0/stride, same
+/// K_SPLIT reduction order — the only difference is how many columns a warp
+/// register-blocks), so this is a pure occupancy swap, not a numeric change
+/// (measured N=256: grid=32->128, 6.1->4.1 us / -33%). The medium/large
+/// projections keep the multicol hybrid unchanged.
+///
+/// Returns true (prefer the single-column entry) when the multicol grid would
+/// leave the device under-filled — `ceil(N / multicol_cols_per_cta) <
+/// multiprocessor_count` — i.e. below ~1 CTA/SM from the column dimension. This
+/// is shape/device-derived (narrow-N + SM count), not model-specific, so it
+/// helps every GQA/MLA int4 model's narrow k/v projection. `unset` uses the
+/// heuristic; `ONNX_GENAI_GEMV_SPLITK_SMALLN_SINGLECOL=0|1` forces off/on.
+fn splitk_smalln_prefers_single_column(n: usize, multiprocessor_count: u32) -> bool {
+    match std::env::var("ONNX_GENAI_GEMV_SPLITK_SMALLN_SINGLECOL")
+        .ok()
+        .as_deref()
+    {
+        Some("1") | Some("true") | Some("on") => return true,
+        Some("0") | Some("false") | Some("off") => return false,
+        _ => {}
+    }
+    // Columns covered by one 256-thread (8-warp) CTA of the multicol hybrid.
+    let multicol_cols_per_cta = (8 / GENERAL_BS_SPLITK_MULTICOL) * GEMV_F16_WIDE_MULTICOL_NC;
+    let multicol_grid = n.div_ceil(multicol_cols_per_cta.max(1));
+    multicol_grid < multiprocessor_count.max(1) as usize
+}
+
 /// Whether the column register-blocked wide GEMV should take the fp16
 /// mixed-precision entry ([`GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY`])
 /// instead of the fp32 [`GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY`]. Only
@@ -9104,7 +9149,18 @@ impl MatMulNBitsKernel {
             // correct for both symmetric (zp==8) and asymmetric layouts.
             if use_general_splitk {
                 if use_gemv_wideload(self.bits, self.block_size, self.k) {
-                    if use_gemv_splitk_multicol() {
+                    // The multicol hybrid register-blocks WIDE_NC columns/warp,
+                    // which lifts memory-level parallelism on the medium/large
+                    // projections but collapses the launch grid on a narrow
+                    // (grid-starved) projection. For those, fall back to the
+                    // byte-identical single-column split-K wide entry, whose 4x
+                    // larger grid fills the otherwise-idle SMs.
+                    if use_gemv_splitk_multicol()
+                        && !splitk_smalln_prefers_single_column(
+                            self.n,
+                            self.runtime.capabilities().multiprocessor_count(),
+                        )
+                    {
                         GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_ENTRY
                     } else {
                         GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY
@@ -13077,6 +13133,57 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     }
 
     #[test]
+    fn splitk_smalln_single_column_is_shape_driven_and_general() {
+        // A narrow (grid-starved) projection — e.g. a GQA k/v projection with
+        // N = kv_heads * head_dim (2*128 = 256) — under-fills the device with the
+        // multicol hybrid (grid = ceil(256/8) = 32 CTAs << 132 SMs), so it must
+        // prefer the byte-identical single-column split-K wide entry whose 4x
+        // larger grid fills the idle SMs.
+        assert!(
+            splitk_smalln_prefers_single_column(256, 132),
+            "a narrow N=256 kv projection must fall back to the single-column entry"
+        );
+        // Larger GQA kv widths that still under-fill also flip (shape-driven, not
+        // a single magic constant): N=512 -> grid 64 < 132.
+        assert!(splitk_smalln_prefers_single_column(512, 132));
+
+        // The medium/large projections (down_proj / q / o at N~4096) keep the
+        // multicol hybrid: grid = ceil(4096/8) = 512 >= 132 SMs, so the register
+        // blocking wins and the grid already fills the device.
+        assert!(
+            !splitk_smalln_prefers_single_column(4096, 132),
+            "a wide N=4096 projection must keep the multicol hybrid"
+        );
+        assert!(!splitk_smalln_prefers_single_column(27_392, 132));
+
+        // Device-derived, not model-specific: the same N flips on a bigger device
+        // (more SMs to fill) and holds on a tiny one.
+        assert!(
+            splitk_smalln_prefers_single_column(1024, 132),
+            "N=1024 -> grid 128 < 132 SMs still under-fills a large device"
+        );
+        assert!(
+            !splitk_smalln_prefers_single_column(1024, 100),
+            "N=1024 -> grid 128 >= 100 SMs fills a smaller device"
+        );
+
+        // Env override forces the decision for A/B measurement.
+        // SAFETY: serial logic test (--test-threads=1); the flag is cleared below
+        // so it cannot leak into other tests.
+        unsafe {
+            std::env::set_var("ONNX_GENAI_GEMV_SPLITK_SMALLN_SINGLECOL", "1");
+        }
+        assert!(splitk_smalln_prefers_single_column(4096, 132));
+        unsafe {
+            std::env::set_var("ONNX_GENAI_GEMV_SPLITK_SMALLN_SINGLECOL", "0");
+        }
+        assert!(!splitk_smalln_prefers_single_column(256, 132));
+        unsafe {
+            std::env::remove_var("ONNX_GENAI_GEMV_SPLITK_SMALLN_SINGLECOL");
+        }
+    }
+
+    #[test]
     fn down_columns_fill_the_device_and_never_undersplit() {
         // Wide down projection: the 8-column grid already clears the ~2-wave
         // target, so keep the cheapest 8-column launch.
@@ -15547,10 +15654,19 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// `fp16_gate_up_swiglu_rmsnorm_two_op_ulp_bound_sweep` (0 ULP at M==1) and
     /// issue #1334.
     ///
-    /// Restricted to M==1 on purpose: with the plain path no longer looped, plain
-    /// M>1 dispatches Marlin split-K (default-on), which is documented
-    /// non-byte-identical and possibly non-deterministic — an M>1 plain sweep
-    /// would measure Marlin's noise, not this node's decode-vs-two-op bound.
+    /// Restricted to M==1 on purpose. With the plain path no longer looped, the
+    /// plain M>1 fused gate/up runs through the direct Marlin int4 tensor-core
+    /// GEMM (`marlin_m_gt_1_enabled()`, default **ON**; split-K
+    /// `ONNX_GENAI_MARLIN_SPLITK` is a separate, default-OFF, deterministic
+    /// path and does not engage here). That direct kernel accumulates in a
+    /// different order than the tiled two-op reference and is documented
+    /// *non-byte-identical* to it (its parity tests assert a `2e-2 * max_out`
+    /// tolerance, not equality — see `marlin_gemm::marlin_m_gt_1_enabled`). So an
+    /// M>1 plain sweep would measure Marlin's accumulation offset, not this
+    /// node's decode-vs-two-op bound. It is also why `main` does not actually
+    /// hold "M>1 is bit-exact to the two-op reference" under the default config:
+    /// `fp16_gate_up_swiglu_is_bit_exact_to_two_op_path` reds at M=5 with Marlin
+    /// default-on and only passes under `ONNX_GENAI_MARLIN_M_GT_1=0` (tiled).
     #[test]
     fn fp16_gate_up_swiglu_two_op_ulp_bound_sweep() {
         let Some(runtime) = runtime() else {
@@ -15575,8 +15691,10 @@ extern "C" __global__ void ref_silu_mul_f16(
             (128, 256), // small, grid-starved
             (96, 77),   // odd tail (matches the existing test's small case)
         ];
-        // M==1 only: see the doc comment. Plain M>1 would route through Marlin
-        // split-K (non-byte-identical), not this node's decode GEMV.
+        // M==1 only: see the doc comment. Plain M>1 routes through the direct
+        // Marlin int4 tensor-core GEMM (non-byte-identical to the two-op
+        // reference by a different accumulation order), not this node's decode
+        // GEMV.
         let ms = [1usize];
         let seeds: [u64; 8] = [
             0x0bad_c0de_dead_beef,

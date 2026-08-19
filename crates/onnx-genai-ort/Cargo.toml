@@ -40,7 +40,7 @@ libloading = { workspace = true, optional = true }
 # version is selected via this crate's `cuda-*` features (or `CUDARC_CUDA_VERSION`),
 # not pinned here, so downstreams can match their ORT CUDA runtime.
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading"], optional = true }
-minijinja = { version = "2", features = ["json"] }
+minijinja = { version = "2", features = ["json", "preserve_order"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 onnx-genai-genai-config = { workspace = true }
 onnx-genai-kv = { workspace = true }

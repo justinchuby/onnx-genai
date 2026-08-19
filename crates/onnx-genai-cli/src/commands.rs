@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use onnx_genai::engine::EngineDecodeBackend;
 use onnx_genai::ort::profile::TraceVerbosity;
 
 use super::interactive::{Backend, ReplInputMode, SessionSettings};
@@ -269,18 +268,7 @@ pub(super) fn available_execution_providers() -> Vec<&'static str> {
     providers
 }
 
-pub(super) fn parse_decode_backend(name: &str) -> Result<EngineDecodeBackend, String> {
-    match name {
-        "auto" => Ok(EngineDecodeBackend::Auto),
-        "ort" => Ok(EngineDecodeBackend::Ort),
-        "native" => Ok(EngineDecodeBackend::Native),
-        other => Err(format!(
-            "What: {other:?} is not a decode backend. \
-             Why: the choices are fixed by the engine, not by the model. \
-             How: use auto, ort, or native."
-        )),
-    }
-}
+pub(super) use onnx_genai_server::runtime_args::parse_decode_backend;
 
 /// What `/profile <rest>` asked for.
 #[derive(Debug, PartialEq, Eq)]

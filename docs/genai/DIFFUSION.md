@@ -160,7 +160,7 @@ the exact diffusers timesteps, and writes `inference_metadata.yaml` + `run.json`
 
 ```bash
 onnx-genai generate out/ \
-  --prompt "an astronaut riding a horse" \
+  "an astronaut riding a horse" \
   --negative-prompt "blurry, low quality" \
   --steps 25 --guidance-scale 7.5 --seed 0 \
   --width 512 --height 512 \
