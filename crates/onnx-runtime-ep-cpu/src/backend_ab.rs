@@ -193,4 +193,88 @@ mod tests {
         let ran = softmax_rows_mlas(&mut data, 4, 16);
         assert_eq!(ran, mlas_available());
     }
+
+    /// Every family this module claims to A/B must actually have both halves
+    /// wired up, and the MLAS half must report itself present exactly when the
+    /// reference is linked. Without this, `AB_COVERED` is a list a family could
+    /// be added to without ever being comparable — and the graduation rule in
+    /// `docs/performance/CPU_MLAS_MIGRATION.md` reads that list.
+    #[test]
+    fn every_ab_covered_family_has_both_halves() {
+        assert!(!AB_COVERED.is_empty());
+        for family in AB_COVERED {
+            assert!(
+                KernelFamily::ALL.contains(family),
+                "{family} is A/B-covered but absent from the ledger's families"
+            );
+            let ran_mlas = match family {
+                KernelFamily::MatMulF32 => {
+                    let (m, k, n) = (2usize, 3usize, 4usize);
+                    let a = vec![0.25f32; m * k];
+                    let b = vec![0.5f32; k * n];
+                    let mut c = vec![0.0f32; m * n];
+                    let native = gemm_backends()[0];
+                    gemm_f32(native, &a, &b, &mut c, m, k, n).expect("native gemm must run");
+                    assert!(
+                        c.iter().all(|v| (*v - 0.375).abs() < 1e-6),
+                        "the native A/B gemm must compute a@b, got {c:?}"
+                    );
+                    gemm_backends()
+                        .iter()
+                        .any(|b| gemm_ledger_backend(*b) == Backend::Mlas)
+                }
+                KernelFamily::Softmax => {
+                    let mut native = vec![1.0f32, 2.0, 3.0, 4.0];
+                    softmax_rows_native(&mut native, 1, 4);
+                    let sum: f32 = native.iter().sum();
+                    assert!(
+                        (sum - 1.0).abs() < 1e-5,
+                        "the native A/B softmax must normalize, got {sum}"
+                    );
+                    let mut probe = native.clone();
+                    softmax_rows_mlas(&mut probe, 1, 4)
+                }
+                KernelFamily::Activations => {
+                    let input = [-1.0f32, 0.0, 1.0, 2.0];
+                    let mut out = [0.0f32; 4];
+                    erf_native(&input, &mut out);
+                    assert!(
+                        out[1] == 0.0 && out[2] > 0.8 && out[0] == -out[2],
+                        "the native A/B erf must be odd and finite, got {out:?}"
+                    );
+                    let mut gelu = [0.0f32; 4];
+                    gelu_native(&input, &mut gelu);
+                    assert!(
+                        gelu[1] == 0.0 && gelu[3] > 1.9,
+                        "the native A/B gelu must match 0.5x(1+erf(x/sqrt2)), got {gelu:?}"
+                    );
+                    let mut probe = [0.0f32; 4];
+                    erf_mlas(&input, &mut probe) && gelu_mlas(&input, &mut probe)
+                }
+                other => panic!(
+                    "{other} was added to AB_COVERED without an A/B entry point in this test"
+                ),
+            };
+            assert_eq!(
+                ran_mlas,
+                mlas_available(),
+                "{family} must offer its MLAS half exactly when the reference is linked"
+            );
+        }
+    }
+
+    /// A duplicate backend would double-count in every benchmark row and make
+    /// the A/B table claim a comparison it never ran.
+    #[test]
+    fn gemm_backends_are_distinct() {
+        let backends = gemm_backends();
+        let mut unique = backends.clone();
+        unique.sort_by_key(|b| format!("{b:?}"));
+        unique.dedup_by_key(|b| format!("{b:?}"));
+        assert_eq!(
+            unique.len(),
+            backends.len(),
+            "duplicate A/B backend offered"
+        );
+    }
 }

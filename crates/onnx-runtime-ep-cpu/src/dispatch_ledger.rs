@@ -765,6 +765,18 @@ pub fn render_plan() -> String {
 mod tests {
     use super::*;
 
+    /// Serialises the tests that toggle the process-global recorder. Two of
+    /// them running concurrently would race each other rather than the code,
+    /// and the resulting flake would look like a ledger defect.
+    static RECORDER_TESTS: Mutex<()> = Mutex::new(());
+
+    /// Take [`RECORDER_TESTS`], ignoring a poisoned lock: a panic in one
+    /// recorder test must not convert every other one into a second failure
+    /// that hides it.
+    fn recorder_guard() -> std::sync::MutexGuard<'static, ()> {
+        RECORDER_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn plan_is_total_and_unique() {
         assert_eq!(
@@ -826,8 +838,6 @@ mod tests {
         }
     }
 
-    /// A graduated family has absorbed MLAS; it must not still plan an MLAS
-    /// route. This is the invariant that keeps the ledger honest as families
     /// The ledger's GEMM verdict must be the dispatcher's, on this target.
     ///
     /// `effective()` used to gate on the `mlas` feature alone, which made it
@@ -881,6 +891,8 @@ mod tests {
         assert_eq!(gated, vec!["matmul_f32", "gemm_f32"]);
     }
 
+    /// A graduated family has absorbed MLAS; it must not still plan an MLAS
+    /// route. This is the invariant that keeps the ledger honest as families
     /// migrate.
     #[test]
     fn graduated_families_do_not_plan_mlas() {
@@ -950,6 +962,7 @@ mod tests {
 
     #[test]
     fn recording_is_off_until_asked_for_and_bounded_once_it_is_on() {
+        let _serialised = recorder_guard();
         // One test, because the recorder is process-global: two tests toggling
         // it in parallel would race each other rather than the code.
         //
@@ -1035,5 +1048,171 @@ mod tests {
                 "render_plan omitted {family}"
             );
         }
+    }
+
+    /// The claim every dispatch site in this crate rests on: with the ledger
+    /// off, [`record_with`] does not run its closure, so a shipped decode loop
+    /// pays one relaxed load and nothing else.
+    ///
+    /// This is not a restatement of the code. Building an [`Observation`]
+    /// probes the host ISA and asks for the thread degree — an FFI call in an
+    /// MLAS build — so if the closure ran anyway, the "no measurable overhead
+    /// when disabled" claim in the PR and in `CPU_MLAS_MIGRATION.md` would be
+    /// false while every other test still passed. Counting closure entries is
+    /// the only way to see the difference from inside the process.
+    #[test]
+    fn record_with_does_not_build_an_observation_while_disabled() {
+        let _serialised = recorder_guard();
+        disable();
+        reset();
+
+        let built = std::cell::Cell::new(0usize);
+        // A fresh closure per call, so the count is the only thing carried
+        // across iterations and nothing is moved into the loop.
+        let build = |counter: &std::cell::Cell<usize>| {
+            counter.set(counter.get() + 1);
+            Observation::gemm(KernelFamily::GemmF32, Backend::Native, "f32", 2, 3, 5)
+        };
+        for _ in 0..10_000 {
+            record_with(|| build(&built));
+        }
+        assert_eq!(
+            built.get(),
+            0,
+            "a disabled ledger must not build the observation it is about to \
+             throw away"
+        );
+
+        enable();
+        record_with(|| build(&built));
+        assert_eq!(built.get(), 1, "an enabled ledger must build it exactly once");
+        assert!(
+            snapshot()
+                .iter()
+                .any(|o| o.family == KernelFamily::GemmF32 && o.shape == (2, 3, 5)),
+            "the observation built under `record_with` must reach the log"
+        );
+
+        disable();
+        reset();
+    }
+
+    /// `record_with` is only cheaper than `record` if the *route decision* it
+    /// guards is the same one. Both forms must land the same observation.
+    #[test]
+    fn record_and_record_with_agree_on_what_they_store() {
+        let _serialised = recorder_guard();
+        enable();
+        reset();
+
+        let direct = Observation::elementwise(KernelFamily::Softmax, Backend::Native, "f32", 4_096);
+        record(direct);
+        record_with(|| {
+            Observation::elementwise(KernelFamily::Softmax, Backend::Native, "f32", 4_096)
+        });
+        let matching = snapshot().into_iter().filter(|o| *o == direct).count();
+        assert!(
+            matching >= 2,
+            "record and record_with must store identical observations; saw \
+             {matching} of them"
+        );
+
+        disable();
+        reset();
+    }
+
+    /// [`plan_for`] and [`effective_backend`] are the ledger's public reading
+    /// surface; a lookup that returned the wrong family, or a wrapper that
+    /// disagreed with the entry it wraps, would misreport every route.
+    #[test]
+    fn public_lookups_agree_with_the_plan_entry() {
+        for family in KernelFamily::ALL {
+            let entry = plan_for(*family);
+            assert_eq!(entry.family, *family, "plan_for returned another family");
+            assert_eq!(
+                effective_backend(*family),
+                entry.effective(),
+                "{family}: effective_backend disagrees with its own plan entry"
+            );
+            if !mlas_linked() {
+                assert!(
+                    !effective_backend(*family).uses_mlas(),
+                    "{family}: a build with no MLAS linked cannot reach it"
+                );
+            }
+        }
+    }
+
+    /// The names the ledger prints are its API for tests, dumps and the
+    /// migration doc: they must be distinct, and `uses_mlas` must agree with
+    /// what each variant means.
+    #[test]
+    fn backend_and_graduation_names_are_distinct_and_consistent() {
+        let backends = [Backend::Native, Backend::Mlas, Backend::NativeOverMlas];
+        let mut names: Vec<&str> = backends.iter().map(|b| b.name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), backends.len(), "backend names must be unique");
+
+        assert!(!Backend::Native.uses_mlas());
+        assert!(Backend::Mlas.uses_mlas());
+        assert!(
+            Backend::NativeOverMlas.uses_mlas(),
+            "a native outer loop over an MLAS inner primitive still has MLAS on \
+             its hot path, which is the whole reason the variant exists"
+        );
+
+        assert_eq!(Graduation::Graduated("evidence").name(), "graduated");
+        assert_eq!(Graduation::MlasBaseline.name(), "mlas_baseline");
+        assert_eq!(Graduation::Partial("evidence").name(), "partial");
+        assert_eq!(Graduation::NoMlasPrimitive.name(), "no_mlas_primitive");
+    }
+
+    /// An observation's evidence must describe the host it was taken on, and
+    /// the two constructors must place their shapes where the field docs say.
+    #[test]
+    fn observations_carry_host_evidence_and_the_documented_shape() {
+        let gemm = Observation::gemm(KernelFamily::MatMulF32, Backend::Native, "f32", 7, 11, 13);
+        assert_eq!(gemm.shape, (7, 11, 13), "gemm shape is (M, N, K)");
+        let ew = Observation::elementwise(KernelFamily::Activations, Backend::Native, "f32", 512);
+        assert_eq!(
+            ew.shape,
+            (512, 1, 1),
+            "elementwise shape is (elements, 1, 1)"
+        );
+
+        for o in [gemm, ew] {
+            assert_eq!(o.isa, Isa::host());
+            assert!(
+                o.threads >= 1,
+                "an observation must record a real thread degree, got {}",
+                o.threads
+            );
+            assert!(!o.dtype.is_empty());
+        }
+
+        let mut isa_names: Vec<&str> = [
+            Isa::Avx512,
+            Isa::Avx2Fma,
+            Isa::SseBaseline,
+            Isa::Neon,
+            Isa::Scalar,
+        ]
+        .iter()
+        .map(|i| i.name())
+        .collect();
+        isa_names.sort_unstable();
+        isa_names.dedup();
+        assert_eq!(isa_names.len(), 5, "ISA names must be unique");
+
+        // The host probe must agree with the architecture this build targets,
+        // or the evidence names an ISA the code cannot have used.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        assert!(matches!(
+            Isa::host(),
+            Isa::Avx512 | Isa::Avx2Fma | Isa::SseBaseline
+        ));
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(Isa::host(), Isa::Neon);
     }
 }

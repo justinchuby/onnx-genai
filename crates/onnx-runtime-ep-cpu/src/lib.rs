@@ -123,22 +123,106 @@ mod feature_default_guard {
     /// turned out to be about 9x ORT rather than the ~1.0 the tables showed.
     /// If a default build ever links MLAS again, the same class of mistake
     /// becomes possible again, so fail loudly here.
-    /// Deliberately a *runtime* assert over `cfg!`, not a `const` block.
-    /// Cargo features are additive and indistinguishable at `cfg` time, so a
-    /// compile-time assert cannot tell "`mlas` became a default" from "`mlas`
-    /// was explicitly requested" - it fires on both, and CI's MLAS reference
-    /// lanes (`--features mlas` for `kernels::moe::` and
-    /// `kernels::qlinear_matmul::`) then fail to *compile* the test target.
-    /// As a runtime test it only runs in the default-feature build, which is
-    /// exactly the configuration whose feature set it is policing.
+    ///
+    /// Resolved from the **manifest**, not from `cfg!`. Cargo features are
+    /// additive and indistinguishable at `cfg` time, so `!cfg!(feature =
+    /// "mlas")` cannot tell "`mlas` became a default" from "`mlas` was
+    /// requested on the command line": it passed in the shipped configuration
+    /// (where nothing could have gone wrong yet) and *failed* in the research
+    /// one (where nothing is wrong at all), which is the opposite of what this
+    /// guard is for. The manifest answers the actual policy question in every
+    /// configuration, including `--features mlas`.
+    ///
+    /// `crates/onnx-runtime-ep-cpu-plugin/tests/default_artifacts_are_mlas_free.rs`
+    /// makes the same statement about the shipped cdylib, its resolved
+    /// dependency graph and the wheel. This one is here so that editing *this*
+    /// crate's `Cargo.toml` and running `cargo test -p onnx-runtime-ep-cpu`
+    /// is enough to catch it.
     #[test]
-    #[allow(clippy::assertions_on_constants)]
     fn mlas_is_not_a_default_feature() {
+        const MANIFEST: &str = include_str!("../Cargo.toml");
+
+        let default = feature_list(MANIFEST, "default");
         assert!(
-            !cfg!(feature = "mlas"),
-            "this test runs in a default-feature build, so `mlas` being on means \
-             it was added to the crate's default features: production would then \
-             ship MLAS and every benchmark arm label would be wrong"
+            !default.is_empty(),
+            "probe read no `default` features, so the assertions below would \
+             pass vacuously"
+        );
+        // Transitive: `default` contains the `full` umbrella, so a `full` that
+        // gained MLAS would activate it for every consumer without the word
+        // `default` appearing anywhere near the change.
+        let mut reachable = default.clone();
+        let mut frontier = default;
+        while let Some(feature) = frontier.pop() {
+            for implied in feature_list(MANIFEST, &feature) {
+                if !reachable.contains(&implied) {
+                    reachable.push(implied.clone());
+                    frontier.push(implied);
+                }
+            }
+        }
+        // Substring, not `== "mlas"`: `dep:mlas-sys` and
+        // `onnx-runtime-ep-cpu/mlas` reach the reference just as well, and
+        // nothing else in this workspace is named after MLAS.
+        let offenders: Vec<&String> = reachable
+            .iter()
+            .filter(|f| f.to_ascii_lowercase().contains("mlas"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "the default feature closure of onnx-runtime-ep-cpu reaches the \
+             MLAS reference through {offenders:?}: production would then ship \
+             MLAS and every benchmark arm label would be wrong"
+        );
+    }
+
+    /// Members of a `name = [...]` feature list, or empty when there is none.
+    ///
+    /// Deliberately a five-line scan rather than a TOML dependency: this runs
+    /// against one hand-written file whose shape is fixed by
+    /// `feature_lists_are_read_not_guessed`.
+    fn feature_list(manifest: &str, name: &str) -> Vec<String> {
+        let Some(start) = manifest.find(&format!("\n{name} = [")) else {
+            return Vec::new();
+        };
+        let open = manifest[start..].find('[').expect("array opens") + start;
+        let close = manifest[open..].find(']').expect("array closes") + open;
+        manifest[open + 1..close]
+            .split(',')
+            .map(|item| item.trim().trim_matches('"').trim().to_string())
+            .filter(|item| !item.is_empty() && !item.starts_with('#'))
+            .collect()
+    }
+
+    /// The guard above is a filter over text; a filter that reads nothing
+    /// passes every assertion built on it. This is its positive control.
+    #[test]
+    fn feature_lists_are_read_not_guessed() {
+        const MANIFEST: &str = include_str!("../Cargo.toml");
+        assert!(
+            feature_list(MANIFEST, "default").contains(&"full".to_string()),
+            "the manifest reader must see `default = [\"full\"]`"
+        );
+        assert!(
+            feature_list(MANIFEST, "full").contains(&"ops-core".to_string()),
+            "the manifest reader must see through the multi-line `full` umbrella"
+        );
+        assert!(
+            feature_list(MANIFEST, "mlas").contains(&"dep:mlas-sys".to_string()),
+            "the manifest still has to declare the opt-in research feature"
+        );
+        assert!(
+            feature_list(MANIFEST, "no-such-feature").is_empty(),
+            "an absent feature must read as empty, not panic"
+        );
+
+        // The transitive walk must actually catch MLAS reaching `default`
+        // through the umbrella, which is the regression this guard exists for.
+        let synthetic =
+            "\ndefault = [\"full\"]\nfull = [\"ops-core\", \"mlas\"]\nmlas = [\"dep:mlas-sys\"]\n";
+        assert!(
+            feature_list(synthetic, "full").iter().any(|f| f == "mlas"),
+            "a `full` umbrella that gained MLAS must be visible to the reader"
         );
     }
 }

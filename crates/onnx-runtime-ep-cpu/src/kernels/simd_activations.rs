@@ -4708,10 +4708,38 @@ mod mlas_ab {
     }
 
     /// MLAS must agree with the pure-Rust route on every special value, not
-    /// just on the dense interior sweep. A difference here would be a silent
-    /// behaviour change for anyone who builds without the feature.
+    /// just on the dense interior sweep.
+    ///
+    /// **Bit-identical on the special values themselves** — NaN, ±inf, ±0,
+    /// subnormals and the saturation tails are where the two routes have
+    /// genuinely different behaviour (MLAS clamps; we repair), so any
+    /// divergence there is a behavioural one and this suite is the only place
+    /// that would see it.
+    ///
+    /// **Within one ULP on the finite interior.** The native route is what
+    /// production runs and MLAS is a research reference (see
+    /// `docs/performance/CPU_MLAS_MIGRATION.md`); two different polynomial
+    /// evaluations of the same transcendental are not required to agree to the
+    /// last bit, and demanding it made this test fail on `main` for a
+    /// 1-ULP `Erf(1.0)` — `0.84270084` vs `0.8427008`, adjacent floats — which
+    /// is not a defect in either route. The bound is asserted rather than
+    /// assumed: 1 ULP, with the observed value in the message, so a real
+    /// numerical regression still fails here.
     #[test]
     fn mlas_matches_rust_simd_on_special_values() {
+        /// Values whose *bits* must match, because they are where the repair
+        /// passes act: a divergence here is behaviour, not rounding.
+        fn is_special(x: f32) -> bool {
+            !x.is_finite() || x == 0.0 || x.abs() < f32::MIN_POSITIVE || x.abs() >= 88.0
+        }
+        /// Distance in representable floats. Same-sign finite values only,
+        /// which is all the interior case needs.
+        fn ulps_apart(a: f32, b: f32) -> u32 {
+            (i64::from(a.to_bits()) - i64::from(b.to_bits())).unsigned_abs() as u32
+        }
+        /// The interior tolerance, in units of the last place.
+        const INTERIOR_ULP_BUDGET: u32 = 1;
+
         let specials = [
             f32::NAN,
             -f32::NAN,
@@ -4749,6 +4777,9 @@ mod mlas_ab {
             ("Erf", erf_avx2_shim, mlas_sys::compute_erf),
             ("GeluErf", erf_gelu_avx2_shim, erf_gelu_mlas),
         ];
+        // A tolerance nothing exercises is a tolerance that proves nothing, so
+        // record whether the strict half of this test ran at all.
+        let mut special_comparisons = 0usize;
         for (name, rust, mlas_fn) in cases {
             rust(&x, &mut ours);
             mlas_fn(&x, &mut mlas);
@@ -4756,15 +4787,33 @@ mod mlas_ab {
                 if a.is_nan() && b.is_nan() {
                     continue;
                 }
-                assert_eq!(
-                    a.to_bits(),
-                    b.to_bits(),
-                    "{name}: the MLAS route and the pure-Rust SIMD route \
-                     disagree at index {i} for input {input:e} \
-                     (rust={a:e} mlas={b:e})"
+                if is_special(*input) {
+                    special_comparisons += 1;
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "{name}: the MLAS reference and the native SIMD route \
+                         disagree on the special value at index {i} for input \
+                         {input:e} (native={a:e} mlas={b:e}); special values are \
+                         where the repair passes act, so this is behaviour"
+                    );
+                    continue;
+                }
+                let apart = ulps_apart(*a, *b);
+                assert!(
+                    apart <= INTERIOR_ULP_BUDGET,
+                    "{name}: the MLAS reference and the native SIMD route are \
+                     {apart} ULP apart at index {i} for input {input:e} \
+                     (native={a:e} mlas={b:e}), over the {INTERIOR_ULP_BUDGET} \
+                     ULP budget for finite interior values"
                 );
             }
         }
+        assert!(
+            special_comparisons >= 4 * specials.len(),
+            "the bit-identity half of this test compared only \
+             {special_comparisons} values, so it is not checking what it claims"
+        );
     }
 
     /// Dense ULP sweep of the MLAS route against the pure-Rust route over the
