@@ -127,8 +127,8 @@ true length beside it. Prefill can do the same on the query axis: run at a
 rounded-up width, and carry the true row count beside it.
 
 `prefill_query_width` (in `crates/onnx-genai-engine/src/native_decode/cuda.rs`)
-rounds a forward's row count up to one of eight evenly spaced steps below the
-chunk width — `{64, 128, 192, 256, 320, 384, 448, 512}` for a 512-wide chunk. The
+rounds a forward's row count up to one of three evenly spaced steps below the
+chunk width — `{171, 342, 512}` for a 512-wide chunk. The
 extra rows are filled by repeating the last real token, and any supplied
 per-token port (`inputs_embeds`, and anything else shaped `[1, rows, …]`) is
 widened the same way.
@@ -155,36 +155,38 @@ disabled for the session before the forward is redone as asked.
 
 Set `ONNX_GENAI_PREFILL_QUERY_PADDING=0` to turn it off.
 
-## Padding alone was not enough
+## Why the ladder is only three steps
 
 Bounding the width set only helps if the kernel cache's per-node bound is at
-least as large as the set. It was 4, chosen when the working set was believed to
-be "a chunk shape, its remainder, and the decode shape". With eight ladder steps
-plus the single-token decode shape, 4 still thrashed:
+least as large as the set, and the bound is 4. The tempting move is to raise it.
+That is a trap: a retained variant owns device scratch, and the bound is the only
+thing capping how much of it accumulates. Raising the bound to 10 to accommodate
+an eight-step ladder made a 30B decoder climb to 72.8 GB and fail the 5.5k-token
+prompt outright, against a 76.2 GB mapped ceiling — a prompt that the same
+decoder served comfortably at 4, oscillating between 39 and 53 GB.
 
-| configuration | distinct widths | pass-2 recompiles | evictions after 14 forwards |
+So the ladder is sized to the bound that exists rather than the other way round:
+three prefill widths, leaving exactly one slot for the single-token decode shape.
+
+| configuration | distinct prefill widths | pass-2 recompiles | 5.5k-token prompt |
 | --- | --- | --- | --- |
-| no padding | unbounded | ~888 per forward | 9759, still climbing |
-| padding, bound 4 | 6 | ~888 per forward | 8402, still climbing |
-| padding, bound 10 | 6 | **0** | **156, flat** |
+| no padding, bound 4 | unbounded | ~888 per forward | ok, 39–53 GB |
+| padding (8 steps), bound 4 | 5 | ~888 per forward | — |
+| padding (8 steps), bound 10 | 5 | 0 | **fails, 72.8 GB** |
+| padding (3 steps), bound 4 | 3 | 0 | ok, 39–53 GB |
 
-So the two changes are one change. Padding is what makes the width set finite and
-knowable; raising the bound to cover that set — the ladder, plus the decode
-shape, plus one for a forward too wide to pad — is what makes the finiteness pay.
-`DEFAULT_VARIANTS_PER_NODE` is now 10 for that reason.
-
-End-to-end latency was unchanged within noise across prompts of 40 to 900 tokens,
-and greedy output was byte-identical with padding on and off. The win is not
+End-to-end latency is unchanged within noise across prompts of 40 to 900 tokens,
+and greedy output is byte-identical with padding on and off. The win is not
 speed; it is that a long-running server stops compiling kernels and stops
 accumulating kernel scratch it never accounts for.
 
 ## Choosing the step count
 
-`PREFILL_QUERY_WIDTH_STEPS = 8` balances two costs that pull opposite ways.
-Fewer steps means fewer shapes to cache but more duplicated arithmetic — rounding
-to powers of two instead sends 311 rows to 512, and the 65% of wasted work that
-buys measurably hurt mid-length prompts (a 200-word prompt went from 4.9 s to
-7.0 s). More steps means less waste but a larger working set, which pushes the
-per-node bound — and the kernel scratch behind it — up. Eight steps caps the
-waste at one step (≤64 rows) while keeping the bound at a number small enough to
-be uninteresting.
+Three steps is the largest ladder that fits alongside the decode shape in a
+four-variant bound, and the waste it implies is the price of that fit: a forward
+runs at most 170 duplicated rows. Fewer steps would be cheaper to cache and more
+wasteful to run — rounding to powers of two instead sends 311 rows to 512, and
+the 65% of duplicated arithmetic that buys measurably hurt mid-length prompts (a
+200-word prompt went from 4.9 s to 7.0 s). The step is rounded *up*, so the top
+step lands exactly on the chunk width rather than just short of it and leaving a
+stray fourth width above.

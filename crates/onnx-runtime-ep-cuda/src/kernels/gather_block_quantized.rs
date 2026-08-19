@@ -132,10 +132,7 @@ pub struct GatherBlockQuantizedFactory {
 
 impl KernelFactory for GatherBlockQuantizedFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let bits = node
-            .attr("bits")
-            .and_then(|a| a.as_int())
-            .unwrap_or(4);
+        let bits = node.attr("bits").and_then(|a| a.as_int()).unwrap_or(4);
         if !matches!(bits, 2 | 4 | 8) {
             return Err(not_implemented(
                 "GatherBlockQuantized CUDA supports uint8 data with bits in {2, 4, 8}",
