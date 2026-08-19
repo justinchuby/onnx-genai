@@ -1337,6 +1337,53 @@ fn symbolic_batch_matmul_chain_runs_for_multiple_shapes() {
     assert_eq!(s2b.hits, 1, "the fused node served from the batch=2 cache");
 }
 
+/// A shape-keyed kernel cache that never evicts turns "every request has a new
+/// prompt length" into unbounded device memory, because each compiled kernel
+/// owns its own workspaces (issue #1362). Feeding one node many distinct shapes
+/// must therefore settle at the per-node bound instead of growing with the
+/// number of distinct shapes seen.
+#[test]
+fn kernel_cache_bounds_the_shape_variants_it_keeps_per_node() {
+    let w_data = [
+        1.0f32, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0, //
+        0.0, 0.0, 0.0, 1.0,
+    ];
+
+    let mut g = Graph::new();
+    let batch = g.intern_symbol("batch");
+    let sym_row = || vec![Dim::Symbolic(batch), Dim::Static(4)];
+    let x = input_shaped(&mut g, "X", DataType::Float32, sym_row());
+    let w = f32_init(&mut g, "W", &[4, 4], &w_data);
+    let m = op_shaped(&mut g, "MatMul", &[x, w], DataType::Float32, sym_row(), &[]);
+    g.add_output(m);
+
+    let mut session = InferenceSession::from_graph(g).expect("build symbolic session");
+
+    // Far more distinct shapes than any per-node bound would keep.
+    let shapes = 24;
+    for rows in 1..=shapes {
+        let data: Vec<f32> = (0..rows * 4).map(|i| i as f32).collect();
+        let x_tensor = Tensor::from_f32(&[rows, 4], &data).unwrap();
+        let out = session.run(&[("X", &x_tensor)]).expect("run");
+        assert_eq!(out[0].shape, vec![rows, 4]);
+        // Identity weights: the output must still be the input, so eviction is
+        // shown to cost recompilation and nothing else.
+        assert_close(&out[0].to_vec_f32(), &data);
+    }
+
+    let stats = session.cache_stats();
+    assert!(
+        stats.evictions > 0,
+        "the bound must have evicted surplus variants, saw {stats:?}"
+    );
+    assert!(
+        stats.entries < shapes,
+        "the cache must not keep one entry per distinct shape, saw {stats:?}"
+    );
+}
+
 /// Two inputs share a symbol (`batch`); supplying them with *conflicting*
 /// concrete sizes is a resolution error, not a silently-wrong run.
 #[test]

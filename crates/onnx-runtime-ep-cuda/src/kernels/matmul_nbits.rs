@@ -5901,6 +5901,51 @@ fn use_gemv_splitk_multicol() -> bool {
     )
 }
 
+/// Grid-fill override for the split-K wide path on GRID-STARVED narrow-N
+/// projections (e.g. a GQA k/v projection: N = kv_heads * head_dim, ~256).
+///
+/// The multicol hybrid ([`GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_ENTRY`])
+/// register-blocks [`GEMV_F16_WIDE_MULTICOL_NC`] columns per warp group, so a
+/// 256-thread (8-warp) CTA covers `(8 / GENERAL_BS_SPLITK_MULTICOL) *
+/// GEMV_F16_WIDE_MULTICOL_NC` output columns and its launch grid is only
+/// `ceil(N / cols_per_cta)`. That register blocking is a WIN on the medium/large
+/// projections (down_proj / q / o at N~4096) where it lifts the memory-level
+/// parallelism at ~1 wave, but on a narrow projection it collapses the grid so
+/// far below the device SM count that most SMs sit idle (measured N=256 on GLM's
+/// 2-kv-head GQA: grid=32 / ~0.06 waves / 2% DRAM / 6.1 us), starving the
+/// latency-bound global loads of any in-flight parallelism to hide behind.
+///
+/// The single-column split-K wide entry
+/// ([`GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY`]) covers only `8 /
+/// GENERAL_BS_SPLITK` columns per CTA (4x fewer), so its grid is `4 *
+/// GEMV_F16_WIDE_MULTICOL_NC` = 4x larger and fills those idle SMs. It is
+/// BYTE-IDENTICAL to the multicol hybrid (same per-column depth0/stride, same
+/// K_SPLIT reduction order — the only difference is how many columns a warp
+/// register-blocks), so this is a pure occupancy swap, not a numeric change
+/// (measured N=256: grid=32->128, 6.1->4.1 us / -33%). The medium/large
+/// projections keep the multicol hybrid unchanged.
+///
+/// Returns true (prefer the single-column entry) when the multicol grid would
+/// leave the device under-filled — `ceil(N / multicol_cols_per_cta) <
+/// multiprocessor_count` — i.e. below ~1 CTA/SM from the column dimension. This
+/// is shape/device-derived (narrow-N + SM count), not model-specific, so it
+/// helps every GQA/MLA int4 model's narrow k/v projection. `unset` uses the
+/// heuristic; `ONNX_GENAI_GEMV_SPLITK_SMALLN_SINGLECOL=0|1` forces off/on.
+fn splitk_smalln_prefers_single_column(n: usize, multiprocessor_count: u32) -> bool {
+    match std::env::var("ONNX_GENAI_GEMV_SPLITK_SMALLN_SINGLECOL")
+        .ok()
+        .as_deref()
+    {
+        Some("1") | Some("true") | Some("on") => return true,
+        Some("0") | Some("false") | Some("off") => return false,
+        _ => {}
+    }
+    // Columns covered by one 256-thread (8-warp) CTA of the multicol hybrid.
+    let multicol_cols_per_cta = (8 / GENERAL_BS_SPLITK_MULTICOL) * GEMV_F16_WIDE_MULTICOL_NC;
+    let multicol_grid = n.div_ceil(multicol_cols_per_cta.max(1));
+    multicol_grid < multiprocessor_count.max(1) as usize
+}
+
 /// Whether the column register-blocked wide GEMV should take the fp16
 /// mixed-precision entry ([`GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY`])
 /// instead of the fp32 [`GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY`]. Only
@@ -8399,6 +8444,91 @@ impl MatMulNBitsKernel {
             return Ok(());
         }
         if m > 1 {
+            // Small-batch decode fast path (mirrors the plain-GEMV loop in
+            // `run_f16`): for M within the crossover window, loop the capture-safe
+            // M==1 fused gate/up SwiGLU GEMV once per row instead of the tiled
+            // prefill GEMM. Each row is computed byte-identically to a
+            // single-sequence (M==1) fused SwiGLU decode of that row, and every
+            // per-row launch is static-grid, allocation- and sync-free, so the
+            // batch decode graph captures it as part of the whole-subgraph capture
+            // instead of fragmenting into an eager seam. This is the node that
+            // otherwise leaves batch-N (M>=2) decode capturing as many segments as
+            // there are MLP layers, whose per-step eager replay dominates the
+            // M>=2 step cost. Streaming is unaffected: the resident gate/up weight
+            // is read M times from VRAM, not re-streamed (HtoD 1/N amortization
+            // intact).
+            //
+            // GATED TO THE RMS-NORM-PROLOGUE (`gamma.is_some()`) PATH ONLY. The
+            // production skip-rmsnorm fusion (`CudaGateUpSwiGluFusion` +
+            // `MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR`) folds the pre-MLP RMS norm
+            // into this node for every RMSNorm architecture (Qwen/Llama/Phi), so
+            // the resident-model decode win lives entirely on this branch. A ULP
+            // sweep (`fp16_gate_up_swiglu_rmsnorm_two_op_ulp_bound_sweep`) shows
+            // the fused rmsnorm decode GEMV is BYTE-IDENTICAL (0 ULP, 0/60 cases)
+            // to the two-op decode reference at M==1, so routing M>1 through the
+            // per-row loop is byte-exact to running each row alone as M==1 decode
+            // (the batching contract) AND within the two-op decode identity.
+            //
+            // The PLAIN (`gamma.is_none()`) gate/up SwiGLU is intentionally NOT
+            // routed here: its M==1 fused decode GEMV is measured up to 2 ULP off
+            // the two-op decode reference (8/56 cases in
+            // `fp16_gate_up_swiglu_two_op_ulp_bound_sweep`), so a looped M>1
+            // decode-GEMV would change plain-path logits vs the two-op path by
+            // more than 1 ULP. It stays on the prefill/Marlin path (advertised
+            // capture-unsafe at M>1) pending a decision on that bound in #1334.
+            if m <= decode_gemv_loop_max_m() {
+                if let Some(gamma) = gamma {
+                    onnx_runtime_ep_api::record_kernel_variant!(
+                        "gate_up_swiglu_rmsnorm_batched_loop",
+                        "M={} small-batch rmsnorm decode: {} single-row fused gate/up SwiGLU \
+                         GEMV launches (one per row), each byte-identical to M==1 decode; keeps \
+                         the batch decode graph a single captured subgraph instead of a \
+                         per-MLP-layer eager seam",
+                        m,
+                        m
+                    );
+                    self.last_call_capture_safe.store(true, Ordering::Relaxed);
+                    let a_base = inputs[0].data_ptr::<u8>();
+                    let y_base = outputs[0].data_ptr_mut::<u8>();
+                    let a_row_shape = [1usize, self.k];
+                    let a_row_strides = [self.k as i64, 1];
+                    let y_row_shape = [1usize, self.n];
+                    let y_row_strides = [self.n as i64, 1];
+                    let a_row_bytes = self.k * 2; // fp16 activation
+                    let y_row_bytes = self.n * 2; // fp16 output
+                    for row in 0..m {
+                        let a_row = TensorView::new(
+                            DevicePtr(a_base.wrapping_add(row * a_row_bytes) as *const c_void),
+                            DataType::Float16,
+                            &a_row_shape,
+                            &a_row_strides,
+                            inputs[0].device,
+                        );
+                        let mut y_row = TensorMut::new(
+                            DevicePtrMut(y_base.wrapping_add(row * y_row_bytes) as *mut c_void),
+                            DataType::Float16,
+                            &y_row_shape,
+                            &y_row_strides,
+                            outputs[0].device,
+                        );
+                        self.launch_gate_up_swiglu_rmsnorm(
+                            &a_row,
+                            &inputs[1],
+                            &inputs[2],
+                            &inputs[3],
+                            &inputs[4],
+                            zp_gate,
+                            zp_up,
+                            gamma,
+                            &mut y_row,
+                            k_blocks,
+                            blob_size,
+                            zp_row_bytes,
+                        )?;
+                    }
+                    return Ok(());
+                }
+            }
             self.last_call_capture_safe.store(false, Ordering::Relaxed);
             // Opt-in Marlin int4 tensor-core path for the paired gate/up MLP:
             // both projections run on tensor cores, then the same fp16 SiluMul
@@ -9019,7 +9149,18 @@ impl MatMulNBitsKernel {
             // correct for both symmetric (zp==8) and asymmetric layouts.
             if use_general_splitk {
                 if use_gemv_wideload(self.bits, self.block_size, self.k) {
-                    if use_gemv_splitk_multicol() {
+                    // The multicol hybrid register-blocks WIDE_NC columns/warp,
+                    // which lifts memory-level parallelism on the medium/large
+                    // projections but collapses the launch grid on a narrow
+                    // (grid-starved) projection. For those, fall back to the
+                    // byte-identical single-column split-K wide entry, whose 4x
+                    // larger grid fills the otherwise-idle SMs.
+                    if use_gemv_splitk_multicol()
+                        && !splitk_smalln_prefers_single_column(
+                            self.n,
+                            self.runtime.capabilities().multiprocessor_count(),
+                        )
+                    {
                         GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_ENTRY
                     } else {
                         GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY
@@ -12992,6 +13133,57 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     }
 
     #[test]
+    fn splitk_smalln_single_column_is_shape_driven_and_general() {
+        // A narrow (grid-starved) projection — e.g. a GQA k/v projection with
+        // N = kv_heads * head_dim (2*128 = 256) — under-fills the device with the
+        // multicol hybrid (grid = ceil(256/8) = 32 CTAs << 132 SMs), so it must
+        // prefer the byte-identical single-column split-K wide entry whose 4x
+        // larger grid fills the idle SMs.
+        assert!(
+            splitk_smalln_prefers_single_column(256, 132),
+            "a narrow N=256 kv projection must fall back to the single-column entry"
+        );
+        // Larger GQA kv widths that still under-fill also flip (shape-driven, not
+        // a single magic constant): N=512 -> grid 64 < 132.
+        assert!(splitk_smalln_prefers_single_column(512, 132));
+
+        // The medium/large projections (down_proj / q / o at N~4096) keep the
+        // multicol hybrid: grid = ceil(4096/8) = 512 >= 132 SMs, so the register
+        // blocking wins and the grid already fills the device.
+        assert!(
+            !splitk_smalln_prefers_single_column(4096, 132),
+            "a wide N=4096 projection must keep the multicol hybrid"
+        );
+        assert!(!splitk_smalln_prefers_single_column(27_392, 132));
+
+        // Device-derived, not model-specific: the same N flips on a bigger device
+        // (more SMs to fill) and holds on a tiny one.
+        assert!(
+            splitk_smalln_prefers_single_column(1024, 132),
+            "N=1024 -> grid 128 < 132 SMs still under-fills a large device"
+        );
+        assert!(
+            !splitk_smalln_prefers_single_column(1024, 100),
+            "N=1024 -> grid 128 >= 100 SMs fills a smaller device"
+        );
+
+        // Env override forces the decision for A/B measurement.
+        // SAFETY: serial logic test (--test-threads=1); the flag is cleared below
+        // so it cannot leak into other tests.
+        unsafe {
+            std::env::set_var("ONNX_GENAI_GEMV_SPLITK_SMALLN_SINGLECOL", "1");
+        }
+        assert!(splitk_smalln_prefers_single_column(4096, 132));
+        unsafe {
+            std::env::set_var("ONNX_GENAI_GEMV_SPLITK_SMALLN_SINGLECOL", "0");
+        }
+        assert!(!splitk_smalln_prefers_single_column(256, 132));
+        unsafe {
+            std::env::remove_var("ONNX_GENAI_GEMV_SPLITK_SMALLN_SINGLECOL");
+        }
+    }
+
+    #[test]
     fn down_columns_fill_the_device_and_never_undersplit() {
         // Wide down projection: the 8-column grid already clears the ~2-wave
         // target, so keep the cheapest 8-column launch.
@@ -13375,8 +13567,292 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         }
     }
 
-    /// Regression guard for the native-vs-ORT divergence investigated on
-    /// Qwen2.5-1.5B-instruct (int4, block-32). Its MLP projections use dims that
+    /// Multi-request batch decode byte-identity guard for the **fused gate/up
+    /// SwiGLU with an RMS-norm prologue** — the node whose small-batch decode is
+    /// routed through the per-row capture-safe loop by this fix. For
+    /// `1 < m <= decode_gemv_loop_max_m()` and a present gamma, the production
+    /// path (`run_f16_gate_up_swiglu`) dispatches `launch_gate_up_swiglu_rmsnorm`
+    /// once per row over a 1×K sub-view, which is the *identical* kernel an M==1
+    /// rmsnorm decode step runs. Therefore row `r` of the batched output must be
+    /// BIT-for-BIT equal to running that row alone as an M==1 fused rmsnorm
+    /// decode. This is THE batching-contract invariant this change must protect:
+    /// a request batched with others produces the same tokens as if it had run
+    /// alone. (The two-op ULP sweeps bound accuracy vs a different reference;
+    /// this asserts exact single-stream equivalence.) A regression that routed
+    /// M>1 through the tiled prefill GEMM / Marlin (different reduction order), or
+    /// mis-strided the per-row sub-views, would diverge here.
+    #[test]
+    fn gate_up_swiglu_rmsnorm_loop_is_byte_identical_to_per_row_singlestream() {
+        let Some(runtime) = runtime() else {
+            eprintln!(
+                "skipping rmsnorm gate/up SwiGLU byte-identity test: CUDA runtime unavailable"
+            );
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("matmul_nbits_gemv_f16")
+            .is_err()
+        {
+            eprintln!(
+                "skipping rmsnorm gate/up SwiGLU byte-identity test: fp16 NVRTC headers unavailable"
+            );
+            return;
+        }
+
+        // Qwen2.5-0.5B-ish gate/up shapes (K<N wide MLP and a square case).
+        // m=4 sits inside the default per-row loop window (max_m=8).
+        for (k, n) in [(896usize, 4864usize), (896usize, 896usize)] {
+            let m = 4usize;
+            let block_size = 32usize;
+            let k_blocks = k / block_size;
+            let blob_size = block_size / 2;
+
+            let mut state = 0x51ed_2701_c0ff_ee11u64 ^ ((k as u64) << 20) ^ (n as u64);
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+
+            // m distinct activation rows, contiguous [m, k].
+            let mut activation_f16 = vec![f16::ZERO; m * k];
+            for h in activation_f16.iter_mut() {
+                *h = f16::from_f32(next());
+            }
+            // fp16 gamma, length k.
+            let mut gamma_f16 = vec![f16::ZERO; k];
+            for g in gamma_f16.iter_mut() {
+                *g = f16::from_f32(0.75 + 0.5 * (next() * 0.5 + 0.5));
+            }
+
+            // Symmetric int4 gate and up weights (implicit zp=8), block-32.
+            let pack = |next: &mut dyn FnMut() -> f32| {
+                let mut quant = vec![0u8; n * k];
+                for value in quant.iter_mut() {
+                    *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+                }
+                let mut packed = vec![0u8; n * k_blocks * blob_size];
+                for col in 0..n {
+                    for block in 0..k_blocks {
+                        for pair in 0..blob_size {
+                            let low = quant[col * k + block * block_size + pair * 2] & 15;
+                            let high = quant[col * k + block * block_size + pair * 2 + 1] & 15;
+                            packed[(col * k_blocks + block) * blob_size + pair] = low | (high << 4);
+                        }
+                    }
+                }
+                packed
+            };
+            let packed_gate = pack(&mut next);
+            let packed_up = pack(&mut next);
+            let mut scales_gate = vec![f16::ZERO; n * k_blocks];
+            for s in scales_gate.iter_mut() {
+                *s = f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5));
+            }
+            let mut scales_up = vec![f16::ZERO; n * k_blocks];
+            for s in scales_up.iter_mut() {
+                *s = f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5));
+            }
+
+            let activation_dev = runtime.alloc_raw(activation_f16.len() * 2).unwrap();
+            let gamma_dev = runtime.alloc_raw(gamma_f16.len() * 2).unwrap();
+            let packed_gate_dev = runtime.alloc_raw(packed_gate.len()).unwrap();
+            let packed_up_dev = runtime.alloc_raw(packed_up.len()).unwrap();
+            let scales_gate_dev = runtime.alloc_raw(scales_gate.len() * 2).unwrap();
+            let scales_up_dev = runtime.alloc_raw(scales_up.len() * 2).unwrap();
+            let loop_out_dev = runtime.alloc_raw(m * n * 2).unwrap();
+            let ref_out_dev = runtime.alloc_raw(n * 2).unwrap();
+            // SAFETY: device buffers were sized to hold each source slice.
+            unsafe {
+                runtime
+                    .htod(as_bytes(&activation_f16), activation_dev)
+                    .unwrap();
+                runtime.htod(as_bytes(&gamma_f16), gamma_dev).unwrap();
+                runtime.htod(&packed_gate, packed_gate_dev).unwrap();
+                runtime.htod(&packed_up, packed_up_dev).unwrap();
+                runtime
+                    .htod(as_bytes(&scales_gate), scales_gate_dev)
+                    .unwrap();
+                runtime.htod(as_bytes(&scales_up), scales_up_dev).unwrap();
+            }
+
+            let device = DeviceId::cuda(0);
+            let b_shape = [n, k_blocks, blob_size];
+            let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+            let scales_shape = [n, k_blocks];
+            let scales_strides = [k_blocks as i64, 1];
+            let packed_gate_view = TensorView::new(
+                device_ptr(packed_gate_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            );
+            let packed_up_view = TensorView::new(
+                device_ptr(packed_up_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            );
+            let scales_gate_view = TensorView::new(
+                device_ptr(scales_gate_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            );
+            let scales_up_view = TensorView::new(
+                device_ptr(scales_up_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            );
+            let gamma_shape = [k];
+            let gamma_strides = [1i64];
+            let gamma_view = TensorView::new(
+                device_ptr(gamma_dev),
+                DataType::Float16,
+                &gamma_shape,
+                &gamma_strides,
+                device,
+            );
+
+            let kernel = MatMulNBitsKernel {
+                runtime: runtime.clone(),
+                k,
+                n,
+                bits: 4,
+                block_size,
+                accuracy_level: 4,
+                accuracy4_workspace: None,
+                fold_bias_post_round: false,
+                gate_up_swiglu: true,
+                decomposed_silu: false,
+                rmsnorm_prologue: true,
+                rmsnorm_epsilon: 1e-5,
+                last_call_capture_safe: AtomicBool::new(false),
+                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            };
+
+            // Batched path: m>1 with gamma present routes through the looped
+            // single-row fused rmsnorm decode GEMV.
+            let a_shape_m = [m, k];
+            let a_strides_m = [k as i64, 1];
+            let y_shape_m = [m, n];
+            let y_strides_m = [n as i64, 1];
+            let inputs_m = [
+                TensorView::new(
+                    device_ptr(activation_dev),
+                    DataType::Float16,
+                    &a_shape_m,
+                    &a_strides_m,
+                    device,
+                ),
+                packed_gate_view,
+                scales_gate_view,
+                packed_up_view,
+                scales_up_view,
+                gamma_view,
+            ];
+            {
+                let mut outputs_m = [TensorMut::new(
+                    device_ptr_mut(loop_out_dev),
+                    DataType::Float16,
+                    &y_shape_m,
+                    &y_strides_m,
+                    device,
+                )];
+                kernel
+                    .run_f16_gate_up_swiglu(&inputs_m, &mut outputs_m)
+                    .unwrap();
+                runtime.synchronize().unwrap();
+            }
+            assert!(
+                kernel.last_call_capture_safe.load(Ordering::Relaxed),
+                "looped rmsnorm gate/up SwiGLU decode must report capture-safe (K={k} N={n})"
+            );
+            let mut loop_out = vec![f16::ZERO; m * n];
+            // SAFETY: `loop_out_dev` holds `m * n` fp16 values.
+            unsafe {
+                runtime
+                    .dtoh(as_bytes_mut(&mut loop_out), loop_out_dev)
+                    .unwrap();
+            }
+
+            // Reference: run each row alone as an independent M==1 fused rmsnorm
+            // gate/up SwiGLU decode over the same weights, gamma, and the same
+            // (offset) activation row.
+            let mut ref_out = vec![f16::ZERO; m * n];
+            for r in 0..m {
+                let a_off = (r * k * 2) as CUdeviceptr;
+                let a_shape_1 = [1usize, k];
+                let a_strides_1 = [k as i64, 1];
+                let y_shape_1 = [1usize, n];
+                let y_strides_1 = [n as i64, 1];
+                let inputs_1 = [
+                    TensorView::new(
+                        device_ptr(activation_dev + a_off),
+                        DataType::Float16,
+                        &a_shape_1,
+                        &a_strides_1,
+                        device,
+                    ),
+                    packed_gate_view,
+                    scales_gate_view,
+                    packed_up_view,
+                    scales_up_view,
+                    gamma_view,
+                ];
+                let mut outputs_1 = [TensorMut::new(
+                    device_ptr_mut(ref_out_dev),
+                    DataType::Float16,
+                    &y_shape_1,
+                    &y_strides_1,
+                    device,
+                )];
+                kernel
+                    .run_f16_gate_up_swiglu(&inputs_1, &mut outputs_1)
+                    .unwrap();
+                runtime.synchronize().unwrap();
+                // SAFETY: `ref_out_dev` holds `n` fp16 values.
+                unsafe {
+                    runtime
+                        .dtoh(as_bytes_mut(&mut ref_out[r * n..(r + 1) * n]), ref_out_dev)
+                        .unwrap();
+                }
+            }
+
+            // SAFETY: each pointer came from this runtime's `alloc_raw`, freed once.
+            unsafe {
+                runtime.free_raw(activation_dev).unwrap();
+                runtime.free_raw(gamma_dev).unwrap();
+                runtime.free_raw(packed_gate_dev).unwrap();
+                runtime.free_raw(packed_up_dev).unwrap();
+                runtime.free_raw(scales_gate_dev).unwrap();
+                runtime.free_raw(scales_up_dev).unwrap();
+                runtime.free_raw(loop_out_dev).unwrap();
+                runtime.free_raw(ref_out_dev).unwrap();
+            }
+
+            let mismatches = loop_out
+                .iter()
+                .zip(ref_out.iter())
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                mismatches,
+                0,
+                "looped batch-{m} rmsnorm gate/up SwiGLU decode diverged from per-row \
+                 single-stream decode at K={k} N={n}: {mismatches}/{} fp16 outputs differ",
+                m * n
+            );
+        }
+    }
+
     /// no other Qwen2.5 size hits: gate/up is K=1536,N=8960 (K<N → *general*
     /// GEMV) and the down-projection is K=8960,N=1536 (K>N → *tall-skinny*
     /// specialized GEMV). K=1536 is 48 block-32 groups and N=8960 is a whole
@@ -14775,6 +15251,18 @@ extern "C" __global__ void ref_silu_mul_f16(
             gemv_kernel
                 .run_f16_gate_up_swiglu(&inputs, &mut outputs)
                 .unwrap();
+            // Plain (gamma=None) gate/up SwiGLU keeps the original strict
+            // invariant: ONLY M==1 decode is advertised capture-safe. Unlike the
+            // rmsnorm-prologue path (see the companion assertion in
+            // `run_fused_gate_up_swiglu_rmsnorm_parity`, narrowed to the per-row
+            // decode-GEMV loop window), the plain path is deliberately NOT routed
+            // through the small-M per-row loop: a plain fused decode GEMV is
+            // measured up to 2 ULP off the two-op decode reference even at M==1
+            // (`fp16_gate_up_swiglu_two_op_ulp_bound_sweep`), so looping it at M>1
+            // would move plain-path logits by >1 ULP vs the reference two-op path.
+            // Plain M>1 therefore still falls to the prefill/Marlin GEMM
+            // (capture-unsafe unless Marlin's warm path advertises otherwise),
+            // and this invariant stays `m == 1`. Tracked in #1334.
             assert_eq!(
                 gemv_kernel.last_call_capture_safe.load(Ordering::Relaxed),
                 m == 1,
@@ -14816,6 +15304,957 @@ extern "C" __global__ void ref_silu_mul_f16(
                 );
             }
         }
+    }
+
+    /// fp16 ULP distance between two half-precision bit patterns, using a
+    /// sign-magnitude → monotone-integer key so that adjacent representable
+    /// values are exactly 1 apart. Not meaningful for NaN/Inf; the SwiGLU
+    /// sweep bounds its activations so those do not arise.
+    fn f16_ulp_diff(a: u16, b: u16) -> i64 {
+        let key = |bits: u16| -> i64 {
+            let mag = (bits & 0x7fff) as i64;
+            if bits & 0x8000 != 0 { -mag } else { mag }
+        };
+        (key(a) - key(b)).abs()
+    }
+
+    /// One (M, K, N, seed) case of the fused gate/up SwiGLU vs two-op reference
+    /// comparison. Reference construction is IDENTICAL to
+    /// [`fp16_gate_up_swiglu_is_bit_exact_to_two_op_path`]: M==1 uses two
+    /// standalone General decode GEMVs, M>1 uses the tiled prefill GEMM, both
+    /// followed by the reference silu_mul. Returns
+    /// `(max_ulp, elements_with_nonzero_ulp, total_elements)`.
+    fn gate_up_swiglu_two_op_ulp_case(
+        runtime: &Arc<CudaRuntime>,
+        m: usize,
+        k: usize,
+        n: usize,
+        seed: u64,
+    ) -> (i64, usize, usize) {
+        const REF_SILU_MUL_SRC: &str = r#"
+#include <cuda_fp16.h>
+__device__ float ref_op_silu(float x) {
+    if (x >= 0.0f) {
+        const float denominator = __fadd_rn(1.0f, (float)exp((double)-x));
+        return __fdiv_rn(x, denominator);
+    }
+    const float e = (float)exp((double)x);
+    const float numerator = __fmul_rn(x, e);
+    return __fdiv_rn(numerator, __fadd_rn(1.0f, e));
+}
+extern "C" __global__ void ref_silu_mul_f16(
+    const __half* g, const __half* u, __half* y, const int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        y[i] = __float2half_rn(
+            __fmul_rn(ref_op_silu(__half2float(g[i])), __half2float(u[i])));
+    }
+}
+"#;
+        let block_size = 32usize;
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+
+        let mut state = seed;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let pack = |next: &mut dyn FnMut() -> f32| -> Vec<u8> {
+            let mut quant = vec![0u8; n * k];
+            for value in quant.iter_mut() {
+                *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+            }
+            let mut packed = vec![0u8; n * k_blocks * blob_size];
+            for col in 0..n {
+                for block in 0..k_blocks {
+                    for pair in 0..blob_size {
+                        let low = quant[col * k + block * block_size + pair * 2] & 15;
+                        let high = quant[col * k + block * block_size + pair * 2 + 1] & 15;
+                        packed[(col * k_blocks + block) * blob_size + pair] = low | (high << 4);
+                    }
+                }
+            }
+            packed
+        };
+
+        let activation: Vec<f16> = (0..m * k).map(|_| f16::from_f32(next())).collect();
+        let packed_gate = pack(&mut next);
+        let scales_gate: Vec<f16> = (0..n * k_blocks)
+            .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+            .collect();
+        let packed_up = pack(&mut next);
+        let scales_up: Vec<f16> = (0..n * k_blocks)
+            .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+            .collect();
+
+        let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+        let packed_gate_dev = runtime.alloc_raw(packed_gate.len()).unwrap();
+        let scales_gate_dev = runtime.alloc_raw(scales_gate.len() * 2).unwrap();
+        let packed_up_dev = runtime.alloc_raw(packed_up.len()).unwrap();
+        let scales_up_dev = runtime.alloc_raw(scales_up.len() * 2).unwrap();
+        let output_elements = m * n;
+        let gate_out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
+        let up_out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
+        let ref_out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
+        let fused_out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
+        // SAFETY: device buffers exactly cover their source slices.
+        unsafe {
+            runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+            runtime.htod(&packed_gate, packed_gate_dev).unwrap();
+            runtime
+                .htod(as_bytes(&scales_gate), scales_gate_dev)
+                .unwrap();
+            runtime.htod(&packed_up, packed_up_dev).unwrap();
+            runtime.htod(as_bytes(&scales_up), scales_up_dev).unwrap();
+        }
+
+        let device = DeviceId::cuda(0);
+        let a_shape = [m, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let scales_shape = [n, k_blocks];
+        let scales_strides = [k_blocks as i64, 1];
+        let y_shape = [m, n];
+        let y_strides = [n as i64, 1];
+        let activation_view = TensorView::new(
+            device_ptr(activation_dev),
+            DataType::Float16,
+            &a_shape,
+            &a_strides,
+            device,
+        );
+        let packed_gate_view = TensorView::new(
+            device_ptr(packed_gate_dev),
+            DataType::Uint8,
+            &b_shape,
+            &b_strides,
+            device,
+        );
+        let scales_gate_view = TensorView::new(
+            device_ptr(scales_gate_dev),
+            DataType::Float16,
+            &scales_shape,
+            &scales_strides,
+            device,
+        );
+        let packed_up_view = TensorView::new(
+            device_ptr(packed_up_dev),
+            DataType::Uint8,
+            &b_shape,
+            &b_strides,
+            device,
+        );
+        let scales_up_view = TensorView::new(
+            device_ptr(scales_up_dev),
+            DataType::Float16,
+            &scales_shape,
+            &scales_strides,
+            device,
+        );
+        let mut gate_out = TensorMut::new(
+            device_ptr_mut(gate_out_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        );
+        let mut up_out = TensorMut::new(
+            device_ptr_mut(up_out_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        );
+        let fused_out = TensorMut::new(
+            device_ptr_mut(fused_out_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        );
+
+        let gemv_kernel = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            bits: 4,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
+            decomposed_silu: false,
+            rmsnorm_prologue: false,
+            rmsnorm_epsilon: 1e-5,
+            last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+        };
+        if m == 1 {
+            let selection = select_f16_gemv_variant(k, n, block_size, true, false);
+            gemv_kernel
+                .launch_f16_gemv_variant(
+                    &activation_view,
+                    &packed_gate_view,
+                    &scales_gate_view,
+                    true,
+                    None,
+                    None,
+                    &mut gate_out,
+                    k_blocks,
+                    blob_size,
+                    k_blocks.div_ceil(2),
+                    selection,
+                )
+                .unwrap();
+            gemv_kernel
+                .launch_f16_gemv_variant(
+                    &activation_view,
+                    &packed_up_view,
+                    &scales_up_view,
+                    true,
+                    None,
+                    None,
+                    &mut up_out,
+                    k_blocks,
+                    blob_size,
+                    k_blocks.div_ceil(2),
+                    selection,
+                )
+                .unwrap();
+        } else {
+            gemv_kernel
+                .launch_f16_gemm(
+                    &activation_view,
+                    &packed_gate_view,
+                    &scales_gate_view,
+                    true,
+                    None,
+                    None,
+                    &mut gate_out,
+                    m,
+                    k_blocks,
+                    gemv_kernel.block_size * gemv_kernel.bits / 8,
+                    0,
+                )
+                .unwrap();
+            gemv_kernel
+                .launch_f16_gemm(
+                    &activation_view,
+                    &packed_up_view,
+                    &scales_up_view,
+                    true,
+                    None,
+                    None,
+                    &mut up_out,
+                    m,
+                    k_blocks,
+                    gemv_kernel.block_size * gemv_kernel.bits / 8,
+                    0,
+                )
+                .unwrap();
+        }
+        let ref_function = runtime
+            .nvrtc_function(
+                "matmul_nbits_ref_silu_mul",
+                REF_SILU_MUL_SRC,
+                "ref_silu_mul_f16",
+            )
+            .unwrap();
+        let gate_out_ptr = cuptr(device_ptr(gate_out_dev).0);
+        let up_out_ptr = cuptr(device_ptr(up_out_dev).0);
+        let ref_out_ptr = cuptr(device_ptr(ref_out_dev).0);
+        let output_elements_i32 = output_elements as i32;
+        let mut ref_builder = runtime.stream().launch_builder(&ref_function);
+        ref_builder
+            .arg(&gate_out_ptr)
+            .arg(&up_out_ptr)
+            .arg(&ref_out_ptr)
+            .arg(&output_elements_i32);
+        // SAFETY: all three buffers hold `output_elements` fp16 values.
+        unsafe {
+            ref_builder.launch(LaunchConfig {
+                grid_dim: (output_elements.div_ceil(256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .unwrap();
+
+        let inputs = [
+            activation_view,
+            packed_gate_view,
+            scales_gate_view,
+            packed_up_view,
+            scales_up_view,
+        ];
+        let mut outputs = [fused_out];
+        gemv_kernel
+            .run_f16_gate_up_swiglu(&inputs, &mut outputs)
+            .unwrap();
+        runtime.synchronize().unwrap();
+
+        let mut reference = vec![f16::ZERO; output_elements];
+        let mut fused = vec![f16::ZERO; output_elements];
+        // SAFETY: both output allocations hold `output_elements` fp16 values.
+        unsafe {
+            runtime
+                .dtoh(as_bytes_mut(&mut reference), ref_out_dev)
+                .unwrap();
+            runtime
+                .dtoh(as_bytes_mut(&mut fused), fused_out_dev)
+                .unwrap();
+            runtime.free_raw(activation_dev).unwrap();
+            runtime.free_raw(packed_gate_dev).unwrap();
+            runtime.free_raw(scales_gate_dev).unwrap();
+            runtime.free_raw(packed_up_dev).unwrap();
+            runtime.free_raw(scales_up_dev).unwrap();
+            runtime.free_raw(gate_out_dev).unwrap();
+            runtime.free_raw(up_out_dev).unwrap();
+            runtime.free_raw(ref_out_dev).unwrap();
+            runtime.free_raw(fused_out_dev).unwrap();
+        }
+
+        let mut max_ulp = 0i64;
+        let mut nonzero = 0usize;
+        for index in 0..output_elements {
+            let d = f16_ulp_diff(fused[index].to_bits(), reference[index].to_bits());
+            if d > 0 {
+                nonzero += 1;
+            }
+            if d > max_ulp {
+                max_ulp = d;
+            }
+        }
+        (max_ulp, nonzero, output_elements)
+    }
+
+    /// Measured ULP bound of the *plain* (no rmsnorm prologue) fused gate/up
+    /// SwiGLU decode GEMV against the two-op reference (two standalone
+    /// MatMulNBits projections + reference silu_mul), swept across activations
+    /// (many seeds) and shapes at **M==1**.
+    ///
+    /// WHY THIS EXISTS — and why it is M==1-only:
+    /// `fp16_gate_up_swiglu_is_bit_exact_to_two_op_path` asserts *byte* equality
+    /// against the two-op reference. That identity holds only for the particular
+    /// activations its four tuples happen to sample. The fused decode GEMV
+    /// carries gate/up in fp32 and the two-op reference rounds each projection to
+    /// fp16 before silu_mul, so the two differ by up to **2 ULP** depending on
+    /// the activation — *even at M==1*, the apples-to-apples decode comparison.
+    /// This measurement is the decision-rule input that HARD-STOPPED the plain
+    /// half of the batch-decode capture-safe fix: because the plain fused decode
+    /// GEMV is not within 1 ULP of the two-op path even at M==1, the production
+    /// per-row decode-GEMV loop is gated to the rmsnorm-prologue path only
+    /// (`gamma.is_some()`), and plain M>1 stays on the prefill/Marlin GEMM.
+    /// See the byte-identical rmsnorm analog
+    /// `fp16_gate_up_swiglu_rmsnorm_two_op_ulp_bound_sweep` (0 ULP at M==1) and
+    /// issue #1334.
+    ///
+    /// Restricted to M==1 on purpose. With the plain path no longer looped, the
+    /// plain M>1 fused gate/up runs through the direct Marlin int4 tensor-core
+    /// GEMM (`marlin_m_gt_1_enabled()`, default **ON**; split-K
+    /// `ONNX_GENAI_MARLIN_SPLITK` is a separate, default-OFF, deterministic
+    /// path and does not engage here). That direct kernel accumulates in a
+    /// different order than the tiled two-op reference and is documented
+    /// *non-byte-identical* to it (its parity tests assert a `2e-2 * max_out`
+    /// tolerance, not equality — see `marlin_gemm::marlin_m_gt_1_enabled`). So an
+    /// M>1 plain sweep would measure Marlin's accumulation offset, not this
+    /// node's decode-vs-two-op bound. It is also why `main` does not actually
+    /// hold "M>1 is bit-exact to the two-op reference" under the default config:
+    /// `fp16_gate_up_swiglu_is_bit_exact_to_two_op_path` reds at M=5 with Marlin
+    /// default-on and only passes under `ONNX_GENAI_MARLIN_M_GT_1=0` (tiled).
+    #[test]
+    fn fp16_gate_up_swiglu_two_op_ulp_bound_sweep() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping gate/up SwiGLU ULP sweep: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("matmul_nbits_gemv_f16")
+            .is_err()
+        {
+            eprintln!("skipping gate/up SwiGLU ULP sweep: fp16 NVRTC headers unavailable");
+            return;
+        }
+
+        // (K=hidden, N=intermediate), K divisible by block_size (32).
+        let shapes = [
+            (QWEN_DOWN_N, QWEN_DOWN_K), // Qwen2.5-0.5B gate/up: 896 -> 4864
+            (2048usize, 5632usize),     // Llama-7B-ish MLP
+            (1024, 2816),
+            (896, 896), // square
+            (512, 1536),
+            (128, 256), // small, grid-starved
+            (96, 77),   // odd tail (matches the existing test's small case)
+        ];
+        // M==1 only: see the doc comment. Plain M>1 routes through the direct
+        // Marlin int4 tensor-core GEMM (non-byte-identical to the two-op
+        // reference by a different accumulation order), not this node's decode
+        // GEMV.
+        let ms = [1usize];
+        let seeds: [u64; 8] = [
+            0x0bad_c0de_dead_beef,
+            0x1234_5678_9abc_def0,
+            0xdead_beef_cafe_babe,
+            0x0f0f_0f0f_f0f0_f0f0,
+            0xa5a5_5a5a_1111_2222,
+            0x9e37_79b9_7f4a_7c15,
+            0xc2b2_ae3d_27d4_eb4f,
+            0xff51_afd7_ed55_8ccd,
+        ];
+
+        let mut global_max = 0i64;
+        let mut m1_max = 0i64;
+        let mut m1_nonzero_cases = 0usize;
+        let mut m1_cases = 0usize;
+        let mut worst = (0usize, 0usize, 0usize, 0u64); // (m,k,n,seed)
+        for (k, n) in shapes {
+            for m in ms {
+                for seed in seeds {
+                    let (max_ulp, nonzero, total) =
+                        gate_up_swiglu_two_op_ulp_case(&runtime, m, k, n, seed);
+                    assert!(total > 0);
+                    if m == 1 {
+                        m1_cases += 1;
+                        if nonzero > 0 {
+                            m1_nonzero_cases += 1;
+                        }
+                        if max_ulp > m1_max {
+                            m1_max = max_ulp;
+                        }
+                    }
+                    if max_ulp > global_max {
+                        global_max = max_ulp;
+                        worst = (m, k, n, seed);
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "gate/up SwiGLU two-op ULP sweep: max_ulp={global_max} \
+             (worst: M={} K={} N={} seed={:#018x}); \
+             M==1: max_ulp={m1_max}, {m1_nonzero_cases}/{m1_cases} cases had >=1 ULP divergence",
+            worst.0, worst.1, worst.2, worst.3
+        );
+
+        // Decision-rule input (HARD STOP): the plain fused decode GEMV is a
+        // deterministic approximation of the two-op reference, but NOT within
+        // 1 ULP even at M==1 — the measured bound is 2 ULP. This is exactly why
+        // the plain path is not routed through the M>1 per-row decode loop
+        // (that would move plain-path logits >1 ULP vs the two-op path). The
+        // bound is asserted at its measured value so a *regression past it*
+        // (e.g. a kernel change widening the gap) still fails loudly; loosening
+        // this number must be a deliberate, measured edit, not an accident.
+        // The rmsnorm half, by contrast, is byte-identical at M==1 (0 ULP) and
+        // IS landed — see `fp16_gate_up_swiglu_rmsnorm_two_op_ulp_bound_sweep`.
+        assert_eq!(
+            global_max, m1_max,
+            "sweep is M==1-only; global and M==1 maxima must coincide"
+        );
+        assert!(
+            global_max <= 2,
+            "plain fused gate/up SwiGLU exceeded the measured 2 ULP bound vs the \
+             two-op reference: max_ulp={global_max} at M={} K={} N={} seed={:#018x}",
+            worst.0,
+            worst.1,
+            worst.2,
+            worst.3
+        );
+    }
+
+    /// One (M, K, N, seed, gamma_dtype) case of the fused gate/up SwiGLU *with an
+    /// RMS-norm prologue* vs the two-op reference. Reference: normalize the
+    /// activation with the production prefill norm kernel, then two standalone
+    /// projections (M==1 → General GEMV, M>1 → tiled GEMM) + reference silu_mul
+    /// on the normalized activation. Subject: the fused rmsnorm-prologue kernel
+    /// over the raw activation with gamma at slot 5. Returns
+    /// `(max_ulp, elements_with_nonzero_ulp, total_elements)`.
+    ///
+    /// This is the RMS-norm analog of [`gate_up_swiglu_two_op_ulp_case`]: it
+    /// measures whether the rmsnorm decode-GEMV loop is byte-identical to the
+    /// two-op (prefill-equivalent) rmsnorm path, i.e. whether the "rmsnorm half"
+    /// is genuinely a byte-safe substitute for what `main` ships, or only
+    /// byte-identical to a loop-vs-loop reference.
+    fn gate_up_swiglu_rmsnorm_two_op_ulp_case(
+        runtime: &Arc<CudaRuntime>,
+        m: usize,
+        k: usize,
+        n: usize,
+        seed: u64,
+        gamma_dtype: DataType,
+    ) -> (i64, usize, usize) {
+        const REF_SILU_MUL_SRC: &str = r#"
+#include <cuda_fp16.h>
+__device__ float ref_op_silu(float x) {
+    if (x >= 0.0f) {
+        const float denominator = __fadd_rn(1.0f, (float)exp((double)-x));
+        return __fdiv_rn(x, denominator);
+    }
+    const float e = (float)exp((double)x);
+    const float numerator = __fmul_rn(x, e);
+    return __fdiv_rn(numerator, __fadd_rn(1.0f, e));
+}
+extern "C" __global__ void ref_silu_mul_f16(
+    const __half* g, const __half* u, __half* y, const int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        y[i] = __float2half_rn(
+            __fmul_rn(ref_op_silu(__half2float(g[i])), __half2float(u[i])));
+    }
+}
+"#;
+        let epsilon = 1e-5f32;
+        let block_size = 32usize;
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+
+        let mut state = seed;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let pack = |next: &mut dyn FnMut() -> f32| -> Vec<u8> {
+            let mut quant = vec![0u8; n * k];
+            for value in quant.iter_mut() {
+                *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+            }
+            let mut packed = vec![0u8; n * k_blocks * blob_size];
+            for col in 0..n {
+                for block in 0..k_blocks {
+                    for pair in 0..blob_size {
+                        let low = quant[col * k + block * block_size + pair * 2] & 15;
+                        let high = quant[col * k + block * block_size + pair * 2 + 1] & 15;
+                        packed[(col * k_blocks + block) * blob_size + pair] = low | (high << 4);
+                    }
+                }
+            }
+            packed
+        };
+
+        let activation: Vec<f16> = (0..m * k).map(|_| f16::from_f32(next())).collect();
+        let packed_gate = pack(&mut next);
+        let scales_gate: Vec<f16> = (0..n * k_blocks)
+            .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+            .collect();
+        let packed_up = pack(&mut next);
+        let scales_up: Vec<f16> = (0..n * k_blocks)
+            .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+            .collect();
+        let gamma_is_f32 = gamma_dtype == DataType::Float32;
+        let gamma_f32: Vec<f32> = (0..k).map(|_| 0.5 + 0.5 * (next() * 0.5 + 0.5)).collect();
+        let gamma_bytes: Vec<u8> = if gamma_is_f32 {
+            gamma_f32.iter().flat_map(|v| v.to_le_bytes()).collect()
+        } else {
+            gamma_f32
+                .iter()
+                .flat_map(|v| f16::from_f32(*v).to_le_bytes())
+                .collect()
+        };
+
+        let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+        let packed_gate_dev = runtime.alloc_raw(packed_gate.len()).unwrap();
+        let scales_gate_dev = runtime.alloc_raw(scales_gate.len() * 2).unwrap();
+        let packed_up_dev = runtime.alloc_raw(packed_up.len()).unwrap();
+        let scales_up_dev = runtime.alloc_raw(scales_up.len() * 2).unwrap();
+        let gamma_dev = runtime.alloc_raw(gamma_bytes.len()).unwrap();
+        let normalized_dev = runtime.alloc_raw(m * k * 2).unwrap();
+        let output_elements = m * n;
+        let gate_out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
+        let up_out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
+        let ref_out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
+        let fused_out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
+        // SAFETY: device buffers exactly cover their source slices.
+        unsafe {
+            runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+            runtime.htod(&packed_gate, packed_gate_dev).unwrap();
+            runtime
+                .htod(as_bytes(&scales_gate), scales_gate_dev)
+                .unwrap();
+            runtime.htod(&packed_up, packed_up_dev).unwrap();
+            runtime.htod(as_bytes(&scales_up), scales_up_dev).unwrap();
+            runtime.htod(&gamma_bytes, gamma_dev).unwrap();
+        }
+
+        let device = DeviceId::cuda(0);
+        let a_shape = [m, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let scales_shape = [n, k_blocks];
+        let scales_strides = [k_blocks as i64, 1];
+        let gamma_shape = [k];
+        let gamma_strides = [1i64];
+        let y_shape = [m, n];
+        let y_strides = [n as i64, 1];
+        let activation_view = TensorView::new(
+            device_ptr(activation_dev),
+            DataType::Float16,
+            &a_shape,
+            &a_strides,
+            device,
+        );
+        let normalized_view = TensorView::new(
+            device_ptr(normalized_dev),
+            DataType::Float16,
+            &a_shape,
+            &a_strides,
+            device,
+        );
+        let packed_gate_view = TensorView::new(
+            device_ptr(packed_gate_dev),
+            DataType::Uint8,
+            &b_shape,
+            &b_strides,
+            device,
+        );
+        let scales_gate_view = TensorView::new(
+            device_ptr(scales_gate_dev),
+            DataType::Float16,
+            &scales_shape,
+            &scales_strides,
+            device,
+        );
+        let packed_up_view = TensorView::new(
+            device_ptr(packed_up_dev),
+            DataType::Uint8,
+            &b_shape,
+            &b_strides,
+            device,
+        );
+        let scales_up_view = TensorView::new(
+            device_ptr(scales_up_dev),
+            DataType::Float16,
+            &scales_shape,
+            &scales_strides,
+            device,
+        );
+        let gamma_view = TensorView::new(
+            device_ptr(gamma_dev),
+            gamma_dtype,
+            &gamma_shape,
+            &gamma_strides,
+            device,
+        );
+        let mut gate_out = TensorMut::new(
+            device_ptr_mut(gate_out_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        );
+        let mut up_out = TensorMut::new(
+            device_ptr_mut(up_out_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        );
+        let fused_out = TensorMut::new(
+            device_ptr_mut(fused_out_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        );
+
+        let plain_kernel = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            bits: 4,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
+            decomposed_silu: false,
+            rmsnorm_prologue: false,
+            rmsnorm_epsilon: epsilon,
+            last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+        };
+        let fused_kernel = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            bits: 4,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: true,
+            decomposed_silu: false,
+            rmsnorm_prologue: true,
+            rmsnorm_epsilon: epsilon,
+            last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+        };
+
+        // Reference: normalize with the production prefill norm, then two-op on
+        // the normalized activation (main's prefill-equivalent rmsnorm path).
+        plain_kernel
+            .launch_rmsnorm_prefill(
+                &activation_view,
+                &gamma_view,
+                cuptr(device_ptr(normalized_dev).0),
+                m,
+            )
+            .unwrap();
+        if m == 1 {
+            let selection = select_f16_gemv_variant(k, n, block_size, true, false);
+            plain_kernel
+                .launch_f16_gemv_variant(
+                    &normalized_view,
+                    &packed_gate_view,
+                    &scales_gate_view,
+                    true,
+                    None,
+                    None,
+                    &mut gate_out,
+                    k_blocks,
+                    blob_size,
+                    k_blocks.div_ceil(2),
+                    selection,
+                )
+                .unwrap();
+            plain_kernel
+                .launch_f16_gemv_variant(
+                    &normalized_view,
+                    &packed_up_view,
+                    &scales_up_view,
+                    true,
+                    None,
+                    None,
+                    &mut up_out,
+                    k_blocks,
+                    blob_size,
+                    k_blocks.div_ceil(2),
+                    selection,
+                )
+                .unwrap();
+        } else {
+            plain_kernel
+                .launch_f16_gemm(
+                    &normalized_view,
+                    &packed_gate_view,
+                    &scales_gate_view,
+                    true,
+                    None,
+                    None,
+                    &mut gate_out,
+                    m,
+                    k_blocks,
+                    plain_kernel.block_size * plain_kernel.bits / 8,
+                    0,
+                )
+                .unwrap();
+            plain_kernel
+                .launch_f16_gemm(
+                    &normalized_view,
+                    &packed_up_view,
+                    &scales_up_view,
+                    true,
+                    None,
+                    None,
+                    &mut up_out,
+                    m,
+                    k_blocks,
+                    plain_kernel.block_size * plain_kernel.bits / 8,
+                    0,
+                )
+                .unwrap();
+        }
+        let ref_function = runtime
+            .nvrtc_function(
+                "matmul_nbits_ref_silu_mul",
+                REF_SILU_MUL_SRC,
+                "ref_silu_mul_f16",
+            )
+            .unwrap();
+        let gate_out_ptr = cuptr(device_ptr(gate_out_dev).0);
+        let up_out_ptr = cuptr(device_ptr(up_out_dev).0);
+        let ref_out_ptr = cuptr(device_ptr(ref_out_dev).0);
+        let output_elements_i32 = output_elements as i32;
+        let mut ref_builder = runtime.stream().launch_builder(&ref_function);
+        ref_builder
+            .arg(&gate_out_ptr)
+            .arg(&up_out_ptr)
+            .arg(&ref_out_ptr)
+            .arg(&output_elements_i32);
+        // SAFETY: all three buffers hold `output_elements` fp16 values.
+        unsafe {
+            ref_builder.launch(LaunchConfig {
+                grid_dim: (output_elements.div_ceil(256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .unwrap();
+
+        // Subject: the fused rmsnorm-prologue kernel over the RAW activation.
+        let inputs = [
+            activation_view,
+            packed_gate_view,
+            scales_gate_view,
+            packed_up_view,
+            scales_up_view,
+            gamma_view,
+        ];
+        let mut outputs = [fused_out];
+        fused_kernel
+            .run_f16_gate_up_swiglu(&inputs, &mut outputs)
+            .unwrap();
+        runtime.synchronize().unwrap();
+
+        let mut reference = vec![f16::ZERO; output_elements];
+        let mut fused = vec![f16::ZERO; output_elements];
+        // SAFETY: both output allocations hold `output_elements` fp16 values.
+        unsafe {
+            runtime
+                .dtoh(as_bytes_mut(&mut reference), ref_out_dev)
+                .unwrap();
+            runtime
+                .dtoh(as_bytes_mut(&mut fused), fused_out_dev)
+                .unwrap();
+            runtime.free_raw(activation_dev).unwrap();
+            runtime.free_raw(packed_gate_dev).unwrap();
+            runtime.free_raw(scales_gate_dev).unwrap();
+            runtime.free_raw(packed_up_dev).unwrap();
+            runtime.free_raw(scales_up_dev).unwrap();
+            runtime.free_raw(gamma_dev).unwrap();
+            runtime.free_raw(normalized_dev).unwrap();
+            runtime.free_raw(gate_out_dev).unwrap();
+            runtime.free_raw(up_out_dev).unwrap();
+            runtime.free_raw(ref_out_dev).unwrap();
+            runtime.free_raw(fused_out_dev).unwrap();
+        }
+
+        let mut max_ulp = 0i64;
+        let mut nonzero = 0usize;
+        for index in 0..output_elements {
+            let d = f16_ulp_diff(fused[index].to_bits(), reference[index].to_bits());
+            if d > 0 {
+                nonzero += 1;
+            }
+            if d > max_ulp {
+                max_ulp = d;
+            }
+        }
+        (max_ulp, nonzero, output_elements)
+    }
+
+    /// RMS-norm analog of [`fp16_gate_up_swiglu_two_op_ulp_bound_sweep`]. The
+    /// rmsnorm parity tests (`fused_gate_up_swiglu_rmsnorm_*`) are byte-exact,
+    /// but their reference reuses a *per-row plain decode-GEMV loop* as its
+    /// second step, so they only prove `rmsnorm-loop == normalize + plain-loop`,
+    /// NOT that the rmsnorm loop matches a genuine two-op path. This sweep
+    /// compares the fused rmsnorm loop against a real two-op reference (prefill
+    /// normalize + standalone projections + silu_mul), across gamma dtypes,
+    /// shapes, seeds, and M. ANSWER: byte-identical (0 ULP) at M==1, so the
+    /// rmsnorm half is a byte-safe substitute for the two-op decode path and is
+    /// the half that landed; a few ULP at M>1 is pure GEMV-vs-GEMM reduction
+    /// order, not a batching-contract violation.
+    #[test]
+    fn fp16_gate_up_swiglu_rmsnorm_two_op_ulp_bound_sweep() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping gate/up SwiGLU rmsnorm ULP sweep: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("matmul_nbits_gemv_f16")
+            .is_err()
+        {
+            eprintln!("skipping gate/up SwiGLU rmsnorm ULP sweep: fp16 NVRTC headers unavailable");
+            return;
+        }
+
+        // (K=hidden, N=intermediate); K % 128 == 0 for the warp_half4 norm.
+        let shapes = [
+            (QWEN_DOWN_N, QWEN_DOWN_K), // 896 -> 4864
+            (2048usize, 5632usize),
+            (1024, 2816),
+            (896, 896),
+            (512, 1536),
+        ];
+        let ms = [1usize, 2, 5, 8];
+        let seeds: [u64; 6] = [
+            0x0bad_c0de_dead_beef,
+            0x1234_5678_9abc_def0,
+            0xdead_beef_cafe_babe,
+            0xa5a5_5a5a_1111_2222,
+            0x9e37_79b9_7f4a_7c15,
+            0xff51_afd7_ed55_8ccd,
+        ];
+        let gammas = [DataType::Float16, DataType::Float32];
+
+        let mut global_max = 0i64;
+        let mut m1_max = 0i64;
+        let mut m1_nonzero_cases = 0usize;
+        let mut m1_cases = 0usize;
+        let mut worst = (0usize, 0usize, 0usize, 0u64, DataType::Float16);
+        for gamma in gammas {
+            for (k, n) in shapes {
+                for m in ms {
+                    for seed in seeds {
+                        let (max_ulp, nonzero, total) =
+                            gate_up_swiglu_rmsnorm_two_op_ulp_case(&runtime, m, k, n, seed, gamma);
+                        assert!(total > 0);
+                        if m == 1 {
+                            m1_cases += 1;
+                            if nonzero > 0 {
+                                m1_nonzero_cases += 1;
+                            }
+                            if max_ulp > m1_max {
+                                m1_max = max_ulp;
+                            }
+                        }
+                        if max_ulp > global_max {
+                            global_max = max_ulp;
+                            worst = (m, k, n, seed, gamma);
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "gate/up SwiGLU rmsnorm two-op ULP sweep: max_ulp={global_max} \
+             (worst: M={} K={} N={} seed={:#018x} gamma={:?}); \
+             M==1: max_ulp={m1_max}, {m1_nonzero_cases}/{m1_cases} cases had >=1 ULP divergence",
+            worst.0, worst.1, worst.2, worst.3, worst.4
+        );
+
+        // DECISION-RULE OUTPUT: at M==1 — the apples-to-apples decode
+        // comparison — the fused rmsnorm decode GEMV is BYTE-IDENTICAL to the
+        // two-op reference (0 ULP). This is the property that made the rmsnorm
+        // half landable where the plain half was hard-stopped: routing M>1
+        // rmsnorm decode through the per-row loop is byte-exact to running each
+        // row alone as an M==1 decode (the batching contract), and each such
+        // row is byte-exact to the two-op path. Asserted strictly at 0 so any
+        // future divergence at M==1 fails loudly.
+        assert_eq!(
+            m1_max, 0,
+            "rmsnorm fused gate/up SwiGLU decode GEMV must be byte-identical to \
+             the two-op reference at M==1, but observed {m1_max} ULP"
+        );
+        // M>1 compares the per-row decode GEMV loop against a tiled two-op GEMM
+        // reference; they differ by a few ULP purely from GEMV-vs-GEMM reduction
+        // order (NOT a batching-contract violation — that is guarded by the
+        // per-row == single-stream byte identity test). Bound recorded, not 0.
+        assert!(
+            global_max <= 4,
+            "rmsnorm fused gate/up SwiGLU ULP vs two-op unexpectedly large: \
+             max_ulp={global_max}"
+        );
     }
 
     /// Byte-for-byte parity of the fused gate/up SwiGLU kernel *with an RMS
@@ -14995,7 +16434,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 &a_strides,
                 device,
             );
-            let normalized_view = TensorView::new(
+            let _normalized_view = TensorView::new(
                 device_ptr(normalized_dev),
                 DataType::Float16,
                 &a_shape,
@@ -15053,13 +16492,6 @@ extern "C" __global__ void ref_silu_mul_f16(
                 &zp_strides,
                 device,
             );
-            let ref_out = TensorMut::new(
-                device_ptr_mut(ref_out_dev),
-                DataType::Float16,
-                &y_shape,
-                &y_strides,
-                device,
-            );
             let fused_out = TensorMut::new(
                 device_ptr_mut(fused_out_dev),
                 DataType::Float16,
@@ -15114,33 +16546,66 @@ extern "C" __global__ void ref_silu_mul_f16(
                 )
                 .unwrap();
             {
-                let mut ref_outputs = [ref_out];
-                let ref_inputs_base = [
-                    normalized_view,
-                    packed_gate_view,
-                    scales_gate_view,
-                    packed_up_view,
-                    scales_up_view,
-                ];
-                if explicit_zp {
-                    // Slot 5 gamma absent (already normalized), slots 6/7 zp.
-                    let ref_inputs = [
-                        ref_inputs_base[0],
-                        ref_inputs_base[1],
-                        ref_inputs_base[2],
-                        ref_inputs_base[3],
-                        ref_inputs_base[4],
-                        TensorView::absent(DataType::Float16),
-                        zp_gate_view,
-                        zp_up_view,
+                // The reference GEMV is looped per row (M==1 each) rather than
+                // run once over all M rows. RMS norm is a per-row reduction and
+                // a plain M==1 gate/up SwiGLU always dispatches the capture-safe
+                // fused decode GEMV, so row r of this reference is exactly a
+                // standalone M==1 normalize+SwiGLU of row r. That keeps the
+                // reference byte-identical to the fused rmsnorm per-row decode
+                // loop under test even though the plain (gamma=None) path no
+                // longer loops M>1 (it falls to the prefill/Marlin GEMM, which
+                // is ~3 ULP off a decode GEMV; see the two-op ULP sweep and
+                // #1334). Running the plain reference over all M rows here would
+                // route through that GEMM and spuriously red this parity test.
+                let norm_row_shape = [1usize, k];
+                let norm_row_strides = [k as i64, 1];
+                let out_row_shape = [1usize, n];
+                let out_row_strides = [n as i64, 1];
+                let norm_row_bytes = (k * 2) as CUdeviceptr; // fp16
+                let out_row_bytes = (n * 2) as CUdeviceptr; // fp16
+                for row in 0..m {
+                    let norm_row = TensorView::new(
+                        device_ptr(normalized_dev + row as CUdeviceptr * norm_row_bytes),
+                        DataType::Float16,
+                        &norm_row_shape,
+                        &norm_row_strides,
+                        device,
+                    );
+                    let out_row = TensorMut::new(
+                        device_ptr_mut(ref_out_dev + row as CUdeviceptr * out_row_bytes),
+                        DataType::Float16,
+                        &out_row_shape,
+                        &out_row_strides,
+                        device,
+                    );
+                    let mut ref_outputs = [out_row];
+                    let ref_inputs_base = [
+                        norm_row,
+                        packed_gate_view,
+                        scales_gate_view,
+                        packed_up_view,
+                        scales_up_view,
                     ];
-                    plain_swiglu
-                        .run_f16_gate_up_swiglu(&ref_inputs, &mut ref_outputs)
-                        .unwrap();
-                } else {
-                    plain_swiglu
-                        .run_f16_gate_up_swiglu(&ref_inputs_base, &mut ref_outputs)
-                        .unwrap();
+                    if explicit_zp {
+                        // Slot 5 gamma absent (already normalized), slots 6/7 zp.
+                        let ref_inputs = [
+                            ref_inputs_base[0],
+                            ref_inputs_base[1],
+                            ref_inputs_base[2],
+                            ref_inputs_base[3],
+                            ref_inputs_base[4],
+                            TensorView::absent(DataType::Float16),
+                            zp_gate_view,
+                            zp_up_view,
+                        ];
+                        plain_swiglu
+                            .run_f16_gate_up_swiglu(&ref_inputs, &mut ref_outputs)
+                            .unwrap();
+                    } else {
+                        plain_swiglu
+                            .run_f16_gate_up_swiglu(&ref_inputs_base, &mut ref_outputs)
+                            .unwrap();
+                    }
                 }
             }
 
@@ -15176,10 +16641,23 @@ extern "C" __global__ void ref_silu_mul_f16(
                         .unwrap();
                 }
             }
+            // Capture-safety tracks the decode-GEMV *routing*, not a fixed
+            // M==1 rule (see the companion note on the non-rmsnorm assertion
+            // above). `05e1fd10` could only capture M==1 because every M>1
+            // fused gate/up-SwiGLU with an RMS-norm prologue reached
+            // `launch_gate_up_swiglu_rmsnorm_prefill`, which normalizes into
+            // freshly `alloc_raw`'d scratch and so cannot be graph-recorded.
+            // The small-M loop now dispatches `1 < m <= decode_gemv_loop_max_m()`
+            // as per-row capture-safe M==1 fused kernels (each byte-identical
+            // to M==1), making those M genuinely capture-safe; only
+            // `m > decode_gemv_loop_max_m()` still reaches the scratch prefill
+            // path. Narrowed to exactly that range, not deleted.
             assert_eq!(
                 fused_swiglu.last_call_capture_safe.load(Ordering::Relaxed),
-                m == 1,
-                "only M=1 decode may be advertised capture-safe"
+                (1..=decode_gemv_loop_max_m()).contains(&m),
+                "capture-safe iff the decode-GEMV routing is per-row M==1 \
+                 launches: M==1 or small-batch M<=decode_gemv_loop_max_m(); \
+                 M>window still reaches the uncapturable prefill GEMM"
             );
             runtime.synchronize().unwrap();
 
