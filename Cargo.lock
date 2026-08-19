@@ -2551,6 +2551,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-runtime-memory-abi"
+version = "0.1.0-dev.5"
+
+[[package]]
 name = "onnx-runtime-memory-api"
 version = "0.1.0-dev.5"
 dependencies = [
@@ -2565,6 +2569,14 @@ dependencies = [
  "onnx-runtime-memory-api",
  "thiserror 2.0.19",
 ]
+
+[[package]]
+name = "onnx-runtime-memory-host"
+version = "0.1.0-dev.5"
+
+[[package]]
+name = "onnx-runtime-memory-testplugin"
+version = "0.1.0-dev.5"
 
 [[package]]
 name = "onnx-runtime-operator-selection"
