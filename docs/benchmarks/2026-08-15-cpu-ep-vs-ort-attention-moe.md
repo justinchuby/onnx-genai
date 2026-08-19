@@ -3267,12 +3267,13 @@ native/ORT ratio for `rope_gptj_il_s128` and `tr_llama3_s512` is still 3–7×, 
 changed the arithmetic or the grain policy; it changed which CPUs the arithmetic
 runs on. The remaining losses are the ones §31.9 named, and they are still
 `matmul_nbits.rs`'s 64 raw Rayon call sites.
-## 34. Phase 14: the prefill fan-out was on the wrong pool (#1238)
+
+## 35. Phase 15: the prefill fan-out was on the wrong pool (#1238)
 
 `gemm_nbits_*_t8` at t=32 was the worst cell in this document at the end of
 §33 — 22–34× ORT. It is now 2.6–2.8×. Nothing about the arithmetic changed.
 
-### 34.1 A loss that gets worse with every thread you add
+### 35.1 A loss that gets worse with every thread you add
 
 The int4 GEMM cells with a small token count degraded monotonically with width,
 which no arithmetic explanation covers:
@@ -3286,7 +3287,7 @@ which no arithmetic explanation covers:
 Parity at one thread and 24× at thirty-two is the signature of a scheduler, not
 a kernel.
 
-### 34.2 It only happens when someone else is in the process
+### 35.2 It only happens when someone else is in the process
 
 Run the same cell with `--native-only`, so no ORT session is ever created, and
 the pathology disappears:
@@ -3305,7 +3306,7 @@ pool — which spins — on the same cores and every one of those wake-ups lands
 behind a spinning thread. A 32-way fan-out over 0.5 ms of arithmetic pays it 32
 times.
 
-### 34.3 The fix, and the one place it is not the fix
+### 35.3 The fix, and the one place it is not the fix
 
 Route the tiling through the CPU task runtime built in §33: resident workers,
 adaptive spin/park, dispatch to a resident worker measured at p50 4.8 µs, and a
@@ -3346,7 +3347,7 @@ output-column shards (each owns its own packed weight), so the only lever for a
 too-fine partition is handing several whole tiles to one task, which it does
 below 512 Ki MACs a tile.
 
-### 34.4 The matrix
+### 35.4 The matrix
 
 All 20 `gemm_nbits_*` cells × 6 widths, 3 trials × 10 runs, native/ORT paired in
 a single process, arms interleaved. Speedup is Rayon ÷ task runtime, so >1 is
@@ -3371,7 +3372,7 @@ Largest movements at t=32:
 | `gemm_nbits_llama3_8b_qkv_t8`    | 5.980 ms | 1.908 ms |  3.1× |  8.5× → 2.77× |
 | `gemm_nbits_qwen3_0p6b_qkv_t128` | 6.282 ms | 2.100 ms |  3.0× |  4.4× → 1.27× |
 
-### 34.5 The apparent narrow-width losses are dispersion
+### 35.5 The apparent narrow-width losses are dispersion
 
 Five cells came back below 0.95× in the 3-trial grid. Three of them
 (`qwen3_0p6b_qkv_t512` t=32, `qwen3_0p6b_mlp_t128` t=32, `llama3_8b_qkv_t128`
@@ -3389,7 +3390,7 @@ were re-measured at 7 trials × 25 runs with 8 warm-ups:
 
 No reproducible regression survives the larger sample.
 
-### 34.6 What is still true after this phase
+### 35.6 What is still true after this phase
 
 `gemm_nbits_*_t8` at t=32 is no longer the worst cell in the document; the small
 transform kernels are, at 3–7× ORT at t=16, and they are a grain and
