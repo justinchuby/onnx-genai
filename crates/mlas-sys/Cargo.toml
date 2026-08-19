@@ -6,8 +6,9 @@ license = "MIT"
 repository = "https://github.com/justinchuby/onnx-genai"
 description = "FFI bindings to vendored ONNX Runtime MLAS kernels."
 
-# Builds the vendored MLAS C++/asm sources. Downstream crates can disable their
-# default `mlas` feature for a pure-Rust fallback when no toolchain is present.
+# Builds the vendored MLAS C++/asm sources. No downstream crate depends on this
+# by default -- it is reached only through the opt-in `mlas` feature, which
+# exists so native kernels can be measured against a reference, not shipped.
 [lints]
 workspace = true
 

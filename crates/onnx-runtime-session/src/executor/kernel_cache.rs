@@ -661,17 +661,18 @@ pub(crate) struct KernelCache {
 /// what actually varies: a graph keeps its hot decode and prefill variants, and
 /// only a node that has genuinely seen many shapes gives one up.
 ///
-/// The bound only pays off if the shapes a steady stream of requests cycles
-/// through fit inside it. A prompt's final prefill chunk is as wide as whatever
-/// is left over, so left alone that set is unbounded and no bound is ever
-/// enough — the native CUDA decoder therefore rounds its prefill widths up to a
-/// short ladder (`PREFILL_QUERY_WIDTH_STEPS`, eight steps up to the chunk
-/// width). The default here is that ladder, plus the single-token decode shape,
-/// plus one for a forward too wide to be padded. Measured against a 30B decoder
-/// serving assorted prompt lengths, this is the difference between recompiling
-/// ~890 kernels on every request forever and recompiling none after the first
-/// pass over the ladder.
-const DEFAULT_VARIANTS_PER_NODE: usize = 10;
+/// The bound is small on purpose. A retained variant owns device scratch, so
+/// raising it raises the floor under every long-context request: measured on a
+/// 30B decoder, a bound of 10 pushed a 5.5k-token prompt past the mapped-memory
+/// ceiling that a bound of 4 cleared with 20 GB to spare. The bound is the cap
+/// on that scratch, and widening it defeats its own purpose.
+///
+/// Four is only enough because the shapes a request cycles through are kept
+/// deliberately few: the native CUDA decoder rounds its prefill widths onto a
+/// three-step ladder (`PREFILL_QUERY_WIDTH_STEPS`) so that a prompt's leftover
+/// final chunk cannot invent a fresh width per request, which leaves exactly one
+/// slot for the single-token decode shape.
+const DEFAULT_VARIANTS_PER_NODE: usize = 4;
 
 fn variants_per_node() -> usize {
     static RESOLVED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
