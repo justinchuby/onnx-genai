@@ -522,7 +522,16 @@ unsafe fn micro_6x16(
 ///
 /// Because the panels produced here are element-for-element what [`pack_a`] and
 /// [`pack_b`] produce from the widened operands, results are **bit-identical**
-/// to `sgemm_simd(widen(a), widen(b))`.
+/// to `sgemm_simd(widen(a), widen(b))` for every finite operand.
+///
+/// The one documented exception is a `bf16` *signalling* NaN: widening by shift
+/// keeps its payload, while `half::bf16::to_f32` canonicalizes it to a quiet
+/// NaN, so 126 of the 65536 `bf16` patterns widen to a different NaN encoding
+/// here (`widening_matches_the_half_crate_over_the_whole_domain` pins exactly
+/// which). No finite value differs, NaN still propagates as NaN, and the same
+/// shift is what [`super::half_gemm`] already uses -- so this is inherited
+/// behaviour, not new. `f16` has no such case: the hardware conversion is
+/// bit-identical to `half::f16::to_f32` across the entire domain.
 ///
 /// The caller must ensure the host supports AVX2 + FMA
 /// ([`crate::backend::has_simd_x86`]).
@@ -668,8 +677,16 @@ enum HalfWiden {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn select_half_widen(format: HalfFormat) -> HalfWiden {
+    // Both arms check *every* feature their target function declares, rather
+    // than leaning on the AVX2 the microkernel already required: this is also
+    // reached from tests, which do not go through that gate.
     match format {
-        HalfFormat::F16 if std::arch::is_x86_feature_detected!("f16c") => HalfWiden::F16c,
+        HalfFormat::F16
+            if std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("f16c") =>
+        {
+            HalfWiden::F16c
+        }
         HalfFormat::Bf16 if std::arch::is_x86_feature_detected!("avx2") => HalfWiden::Bf16Avx2,
         other => HalfWiden::Scalar(other),
     }
@@ -1084,16 +1101,57 @@ mod tests {
         }
     }
 
-    /// The scalar fallback exists for hosts without the vector conversion, so
-    /// it must produce the same panels as the SIMD one -- otherwise the
-    /// bit-exactness claim only holds on the machine it was measured on.
+    /// Pack `B` one element at a time through the `half` crate: the reference
+    /// the vector conversion has to reproduce.
+    ///
+    /// Deliberately *not* `pack_b_half_scalar`, which routes through
+    /// `half_gemm::widen_contiguous` and therefore vectorizes on any host that
+    /// can -- comparing that against the SIMD path would compare SIMD with
+    /// SIMD and prove nothing about the fallback.
+    #[allow(clippy::too_many_arguments)]
+    fn pack_b_half_reference(
+        format: HalfFormat,
+        b: &[u16],
+        bpack: &mut [f32],
+        n: usize,
+        pc: usize,
+        kc: usize,
+        j0: usize,
+        nc: usize,
+    ) {
+        for jp in 0..nc.div_ceil(NR) {
+            let jcol = j0 + jp * NR;
+            let nr = NR.min(nc - jp * NR);
+            let dst = &mut bpack[jp * KC * NR..jp * KC * NR + kc * NR];
+            for p in 0..kc {
+                for c in 0..NR {
+                    dst[p * NR + c] = if c < nr {
+                        let bits = b[(pc + p) * n + jcol + c];
+                        match format {
+                            HalfFormat::F16 => half::f16::from_bits(bits).to_f32(),
+                            HalfFormat::Bf16 => half::bf16::from_bits(bits).to_f32(),
+                        }
+                    } else {
+                        0.0
+                    };
+                }
+            }
+        }
+    }
+
+    /// The vector conversion must produce the same panels as widening one
+    /// element at a time through `half` -- otherwise the bit-exactness claim
+    /// only holds on the machine it was measured on, and the scalar fallback
+    /// silently computes something else.
     #[test]
-    fn scalar_and_simd_packing_agree() {
+    fn packing_matches_the_element_at_a_time_reference() {
         let (n, kc, nc) = (48usize, 5usize, 48usize);
         for format in [HalfFormat::F16, HalfFormat::Bf16] {
             let (b_bits, _) = half_operand(format, 8 * n, 3);
-            let mut scalar = vec![0.0f32; KC * nc.div_ceil(NR) * NR];
-            let mut simd = scalar.clone();
+            let mut reference = vec![0.0f32; KC * nc.div_ceil(NR) * NR];
+            let mut scalar = reference.clone();
+            let mut simd = reference.clone();
+            pack_b_half_reference(format, &b_bits, &mut reference, n, 1, kc, 0, nc);
             pack_b_half_scalar(format, &b_bits, &mut scalar, n, 1, kc, 0, nc);
             pack_b_half(
                 select_half_widen(format),
@@ -1105,7 +1163,65 @@ mod tests {
                 0,
                 nc,
             );
-            assert_eq!(scalar, simd, "{format:?} packing must not depend on ISA");
+            assert_eq!(reference, scalar, "{format:?} fallback packing diverged");
+            assert_eq!(reference, simd, "{format:?} packing must not depend on ISA");
+        }
+    }
+
+    /// Sweep the *entire* 16-bit domain -- NaN, infinity and denormals
+    /// included -- through the packing the kernel actually uses, and compare
+    /// against `half`.
+    ///
+    /// `f16` must agree on all 65536 patterns. `bf16` must agree on every
+    /// pattern that is not a signalling NaN; on those 126 the shift keeps the
+    /// payload where `half` canonicalizes to a quiet NaN, which changes no
+    /// finite value and still propagates NaN. That divergence is inherited
+    /// from `half_gemm`'s own widening, and this test is where it is written
+    /// down rather than left to be discovered.
+    #[test]
+    fn widening_matches_the_half_crate_over_the_whole_domain() {
+        let (n, nc) = (NR, NR);
+        let all_bits: Vec<u16> = (0..=u16::MAX).collect();
+        let rows = all_bits.len() / n;
+        for format in [HalfFormat::F16, HalfFormat::Bf16] {
+            let mut divergent = 0usize;
+            for pc in (0..rows).step_by(KC) {
+                let kc = KC.min(rows - pc);
+                let mut reference = vec![0.0f32; KC * NR];
+                let mut simd = reference.clone();
+                pack_b_half_reference(format, &all_bits, &mut reference, n, pc, kc, 0, nc);
+                pack_b_half(
+                    select_half_widen(format),
+                    &all_bits,
+                    &mut simd,
+                    n,
+                    pc,
+                    kc,
+                    0,
+                    nc,
+                );
+                for (got, want) in simd.iter().zip(&reference) {
+                    if got.to_bits() == want.to_bits() {
+                        continue;
+                    }
+                    assert!(
+                        got.is_nan() && want.is_nan(),
+                        "{format:?}: {got} != {want} on a non-NaN input"
+                    );
+                    divergent += 1;
+                }
+            }
+            let expected = match format {
+                HalfFormat::F16 => 0,
+                // The bf16 signalling-NaN patterns: sign x (payload != 0) with
+                // the quiet bit clear, i.e. 2 * (2^6 - 1) = 126.
+                HalfFormat::Bf16 => 126,
+            };
+            assert_eq!(
+                divergent, expected,
+                "{format:?}: NaN-encoding divergences moved; the doc comment on \
+                 `half_prefill_gebp` states this count"
+            );
         }
     }
 }

@@ -2409,15 +2409,22 @@ const HALF_PREFILL_GEBP_MIN_WEIGHT: usize = 1_048_576;
 /// `ONNX_GENAI_CPU_MM_HALF_GEBP=0` (or `off`) restores the blocked half GEMM
 /// for the whole process, so a regression can be bisected in the field without
 /// a rebuild. Read-only env probe -- production never mutates it at runtime.
+///
+/// Read once and cached, like `x86_bf16::native_available`: the doc says "for
+/// the whole process", and a `OnceLock` is what makes that literally true
+/// rather than "for every call that happens to read the same value".
 #[cfg(target_arch = "x86_64")]
 fn half_prefill_gebp_enabled() -> bool {
-    std::env::var("ONNX_GENAI_CPU_MM_HALF_GEBP")
-        .ok()
-        .map(|value| {
-            let value = value.trim();
-            value.is_empty() || (value != "0" && !value.eq_ignore_ascii_case("off"))
-        })
-        .unwrap_or(true)
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ONNX_GENAI_CPU_MM_HALF_GEBP")
+            .ok()
+            .map(|value| {
+                let value = value.trim();
+                value.is_empty() || (value != "0" && !value.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]

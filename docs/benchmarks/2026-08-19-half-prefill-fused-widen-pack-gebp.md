@@ -36,8 +36,17 @@ No f32 copy of `B` is ever materialized or retained, so this adds **no weight-de
 unlike the MLAS route, which keeps a widened `4*K*N`-byte `B`.
 
 Because the panels are element-for-element what `pack_a`/`pack_b` produce from the widened
-operands, the result is **bit-identical** to `sgemm_simd(widen(a), widen(b))`. That is asserted with
-`assert_eq!`, not a tolerance (`half_gebp_matches_the_widened_f32_kernel`).
+operands, the result is **bit-identical** to `sgemm_simd(widen(a), widen(b))` for every finite
+operand. That is asserted with `assert_eq!`, not a tolerance
+(`half_gebp_matches_the_widened_f32_kernel`).
+
+The one exception is a `bf16` **signalling** NaN: widening by shift keeps the payload, while
+`half::bf16::to_f32` canonicalizes it to a quiet NaN, so 126 of the 65536 `bf16` patterns widen to a
+different NaN *encoding*. No finite value differs, NaN still propagates as NaN, and the same shift is
+what the blocked half GEMM already used — so this is inherited behaviour, not new.
+`widening_matches_the_half_crate_over_the_whole_domain` sweeps all 65536 patterns of both formats
+and pins the count at 0 for `f16` and exactly 126 for `bf16`, so the divergence is written down
+rather than left to be discovered.
 
 Gate: `k*n >= 1_048_576` elements, and `m >= 2` (`bf16` also at `m == 1`, see below).
 `ONNX_GENAI_CPU_MM_HALF_GEBP=0` restores the blocked route for the whole process.
