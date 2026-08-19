@@ -308,7 +308,8 @@ impl OptimizationPass for CudaRsqrtFusion {
 
             let mut rsqrt = recip.clone();
             rsqrt.inputs = vec![Some(x)];
-            rsqrt.attributes
+            rsqrt
+                .attributes
                 .insert(CUDA_RSQRT_ATTR.into(), Attribute::Int(1));
             graph.replace_node(recip_id, rsqrt);
             graph.remove_node(sqrt_id);
@@ -3484,7 +3485,9 @@ mod tests {
     #[test]
     fn fuses_fp16_reciprocal_of_sqrt() {
         let (mut graph, denom, _root) = rsqrt_glue_graph(DataType::Float16);
-        CudaRsqrtFusion.run(&mut graph, &PassContext::new()).unwrap();
+        CudaRsqrtFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
 
         // Sqrt removed; Reciprocal retagged and rewired to the pre-sqrt value.
         assert_eq!(graph.num_nodes(), 3, "Sqrt must be removed");
@@ -3497,7 +3500,10 @@ mod tests {
             .values()
             .find(|n| n.op_type == "Reciprocal")
             .expect("Reciprocal must remain");
-        assert!(recip.is_default_domain(), "node stays a standard Reciprocal");
+        assert!(
+            recip.is_default_domain(),
+            "node stays a standard Reciprocal"
+        );
         assert_eq!(
             recip.attr(CUDA_RSQRT_ATTR).and_then(Attribute::as_int),
             Some(1),
@@ -3517,7 +3523,9 @@ mod tests {
         graph.insert_node(Node::new(NodeId(0), "Neg", vec![Some(root)], vec![sink]));
         graph.add_output(sink);
 
-        CudaRsqrtFusion.run(&mut graph, &PassContext::new()).unwrap();
+        CudaRsqrtFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
         assert!(
             graph.nodes.values().any(|n| n.op_type == "Sqrt"),
             "Sqrt with a second consumer must be preserved"
