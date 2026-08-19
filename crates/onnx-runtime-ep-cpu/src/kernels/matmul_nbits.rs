@@ -9316,6 +9316,16 @@ mod tests {
         }
     }
 
+    /// [`test_kernel`] with `bits = 8`, for tests that need to call a
+    /// bit-width-gated method directly rather than through `dyn Kernel`.
+    #[cfg(target_arch = "x86_64")]
+    fn test_kernel_8bit(k: usize, n: usize, block_size: usize) -> MatMulNBitsKernel {
+        MatMulNBitsKernel {
+            bits: 8,
+            ..test_kernel(k, n, block_size)
+        }
+    }
+
     fn accuracy4_kernel(k: usize, n: usize, block_size: usize) -> MatMulNBitsKernel {
         MatMulNBitsKernel {
             accuracy_level: 4,
@@ -14195,60 +14205,213 @@ mod tests {
         assert_close(&y.to_f32(), &reference(&a.to_f32(), &dequantized, m, k, n));
     }
 
-    /// Decode is not diverted, and neither is a prefill too narrow to amortize
-    /// the pack.
+    /// Decode is not diverted to the GEBP.
     ///
-    /// [`INT8_PREFILL_GEBP_MIN_ROWS`] is the whole of the row gate, and the
-    /// route below it must stay exactly what it was.
+    /// This is routing, not a threshold: `m == 1` is claimed by the 8-bit
+    /// decode GEMV before the prefill fallback is reached at all, so the
+    /// assertion is that the *outer* branch keeps decode, independently of
+    /// [`INT8_PREFILL_GEBP_MIN_ROWS`]. The row gate itself is exercised
+    /// directly in
+    /// [`matmulnbits_int8_gebp_row_gate_is_the_kernels_own_lower_bound`],
+    /// because no reachable prefill can trip it.
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn matmulnbits_int8_gebp_declines_decode_and_narrow_prefill() {
+    fn matmulnbits_int8_gebp_leaves_decode_on_the_gemv() {
         let _probe = lock_dispatch_probe();
+        let (k, n, block_size, m) = (96usize, 20usize, 32usize, 1usize);
+        let blocks = k.div_ceil(block_size);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 37) as f32 - 9.0) / 10.0)
+            .collect();
+        let (packed, scales, _, _) = quantize_8bit(&weights, n, k, block_size, false);
+        let activations: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
+            .collect();
+        let (graph, node) = model_node(
+            &[m, k],
+            &[n, blocks, block_size],
+            &[n, blocks],
+            None,
+            &[m, n],
+            k,
+            n,
+            block_size,
+        );
+        let mut graph = graph;
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("bits".into(), Attribute::Int(8));
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .expect("bits=8 kernel must build");
+        let a = Owned::f32(&[m, k], &activations);
+        let b = Owned::u8(&[n, blocks, block_size], &packed);
+        let scales_tensor = Owned::f32(&[n, blocks], &scales);
+        let mut y = Owned::zeros_f32(&[m, n]);
+        let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
+        kernel
+            .execute(
+                &[a.view(), b.view(), scales_tensor.view()],
+                &mut [y.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(
+            INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed),
+            before,
+            "decode must stay on the GEMV, whose Nk weight is cached"
+        );
+    }
+
+    /// The row gate is the GEBP's own lower bound, and it is unreachable.
+    ///
+    /// `try_int8_prefill_gebp` is only consulted from the `m > 1` fallback, so
+    /// no prefill the dispatch can deliver is ever rejected by
+    /// [`INT8_PREFILL_GEBP_MIN_ROWS`]. Calling it directly is the only way to
+    /// show the guard is a guard and not a tuned threshold -- and to keep it
+    /// honest if the dispatch above it ever changes.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn matmulnbits_int8_gebp_row_gate_is_the_kernels_own_lower_bound() {
+        let _probe = lock_dispatch_probe();
+        if !crate::backend::has_simd_x86() {
+            return;
+        }
+        assert_eq!(
+            INT8_PREFILL_GEBP_MIN_ROWS, 2,
+            "m == 1 is the decode GEMV's, so 2 is the smallest row count this \
+             route can be offered"
+        );
         let (k, n, block_size) = (96usize, 20usize, 32usize);
         let blocks = k.div_ceil(block_size);
         let weights: Vec<f32> = (0..n * k)
             .map(|i| ((i * 19 % 37) as f32 - 9.0) / 10.0)
             .collect();
         let (packed, scales, _, _) = quantize_8bit(&weights, n, k, block_size, false);
-        for m in 1..INT8_PREFILL_GEBP_MIN_ROWS {
-            let activations: Vec<f32> = (0..m * k)
+        let kernel = test_kernel_8bit(k, n, block_size);
+        let b = Owned::u8(&[n, blocks, block_size], &packed);
+        let scales_tensor = Owned::f32(&[n, blocks], &scales);
+        for (m, expected) in [(1usize, false), (2, true)] {
+            let activations: Vec<f32> = (0..m.max(1) * k)
                 .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
                 .collect();
-            let (graph, node) = model_node(
-                &[m, k],
-                &[n, blocks, block_size],
-                &[n, blocks],
-                None,
-                &[m, n],
-                k,
-                n,
-                block_size,
-            );
-            let mut graph = graph;
-            graph
-                .node_mut(node)
-                .attributes
-                .insert("bits".into(), Attribute::Int(8));
-            let model = Model::new(&graph);
-            let kernel = CpuExecutionProvider::new()
-                .get_kernel(model.graph.node(node), &[], 1)
-                .expect("bits=8 kernel must build");
-            let a = Owned::f32(&[m, k], &activations);
-            let b = Owned::u8(&[n, blocks, block_size], &packed);
-            let scales_tensor = Owned::f32(&[n, blocks], &scales);
-            let mut y = Owned::zeros_f32(&[m, n]);
-            let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
-            kernel
-                .execute(
-                    &[a.view(), b.view(), scales_tensor.view()],
-                    &mut [y.view_mut()],
-                )
-                .unwrap();
+            let mut result = vec![0.0f32; m * n];
             assert_eq!(
-                INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed),
-                before,
-                "m={m} is below the row gate and must not reach the fused GEBP"
+                kernel.try_int8_prefill_gebp(
+                    &b.view(),
+                    &scales_tensor.view(),
+                    None,
+                    None,
+                    &activations,
+                    m,
+                    &mut result,
+                ),
+                expected,
+                "m={m}: the row gate must accept exactly m >= {INT8_PREFILL_GEBP_MIN_ROWS}"
             );
+        }
+    }
+
+    /// The fused route is **bit-identical** to the one it replaces, including
+    /// when `k` does not fill its last block.
+    ///
+    /// Both routes dequantize to the same f32 values and hand them to the same
+    /// packed microkernel in the same depth order, so "close" is the wrong
+    /// assertion -- anything short of equality would mean one of them reordered
+    /// the reduction. The partial trailing block is the case where the two
+    /// index the packed bytes most differently, so it is the one worth pinning.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn matmulnbits_int8_gebp_is_bit_identical_to_the_dequant_route() {
+        let _probe = lock_dispatch_probe();
+        if !crate::backend::has_simd_x86() {
+            return;
+        }
+        // k = 100 leaves a 4-wide trailing block; n = 7 leaves a partial NR=16
+        // panel.
+        for &(k, n, block_size) in &[(100usize, 7usize, 32usize), (96, 20, 32), (130, 33, 128)] {
+            let blocks = k.div_ceil(block_size);
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 19 % 37) as f32 - 9.0) / 10.0)
+                .collect();
+            for &asymmetric in &[false, true] {
+                let (packed, scales, zero_points, _) =
+                    quantize_8bit(&weights, n, k, block_size, asymmetric);
+                let zp_shape = [n, blocks];
+                for &m in &[2usize, 7, 19] {
+                    let activations: Vec<f32> = (0..m * k)
+                        .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
+                        .collect();
+                    let (graph, node) = model_node(
+                        &[m, k],
+                        &[n, blocks, block_size],
+                        &[n, blocks],
+                        zero_points.as_ref().map(|_| &zp_shape[..]),
+                        &[m, n],
+                        k,
+                        n,
+                        block_size,
+                    );
+                    let mut graph = graph;
+                    graph
+                        .node_mut(node)
+                        .attributes
+                        .insert("bits".into(), Attribute::Int(8));
+                    let model = Model::new(&graph);
+                    let kernel = CpuExecutionProvider::new()
+                        .get_kernel(model.graph.node(node), &[], 1)
+                        .expect("bits=8 kernel must build");
+                    let a = Owned::f32(&[m, k], &activations);
+                    let b = Owned::u8(&[n, blocks, block_size], &packed);
+                    let scales_tensor = Owned::f32(&[n, blocks], &scales);
+                    let zp_tensor = zero_points
+                        .as_ref()
+                        .map(|zp| Owned::u8(&[n, blocks], zp.as_slice()));
+                    let mut inputs = vec![a.view(), b.view(), scales_tensor.view()];
+                    if let Some(zp) = zp_tensor.as_ref() {
+                        inputs.push(zp.view());
+                    }
+
+                    let mut fused = Owned::zeros_f32(&[m, n]);
+                    let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
+                    kernel.execute(&inputs, &mut [fused.view_mut()]).unwrap();
+                    assert_eq!(
+                        INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed),
+                        before + 1,
+                        "k={k} n={n} m={m}: the first arm must be the fused GEBP, or \
+                         this comparison is vacuous"
+                    );
+
+                    let previous = std::env::var("ONNX_GENAI_CPU_MM_INT8_GEBP").ok();
+                    // SAFETY: `_probe` is the lock every test that can reach
+                    // this route takes, so no other test thread reads this var
+                    // while it is swapped.
+                    unsafe { std::env::set_var("ONNX_GENAI_CPU_MM_INT8_GEBP", "0") };
+                    let mut dequant = Owned::zeros_f32(&[m, n]);
+                    let executed = kernel.execute(&inputs, &mut [dequant.view_mut()]);
+                    // SAFETY: same lock, still held via `_probe`.
+                    unsafe {
+                        match previous {
+                            Some(value) => std::env::set_var("ONNX_GENAI_CPU_MM_INT8_GEBP", value),
+                            None => std::env::remove_var("ONNX_GENAI_CPU_MM_INT8_GEBP"),
+                        }
+                    }
+                    executed.unwrap();
+                    assert_eq!(
+                        INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed),
+                        before + 1,
+                        "k={k} n={n} m={m}: the second arm must be the dequant route"
+                    );
+
+                    assert_eq!(
+                        fused.to_f32(),
+                        dequant.to_f32(),
+                        "k={k} n={n} m={m} asymmetric={asymmetric}: the fused pack must \
+                         reproduce the dequantize-then-GEMM bytes exactly"
+                    );
+                }
+            }
         }
     }
 

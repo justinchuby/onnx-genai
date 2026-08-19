@@ -59,15 +59,20 @@ under test.
 | `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 8 | **0.25** | 0.30 | **win** |
 | `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 16 | **0.23** | 0.23 | **win** |
 | `MatMulNBits` | 8-bit, block 32 | 1 | 4096 | 8 | **0.23** | 0.24 | **win** |
-| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 2 | **0.66** | 0.66 | **win** (was 2.06) |
-| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 4 | **0.75** | 0.84 | **win** (was 2.01) |
-| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 8 | **0.68** | 0.88 | **win** (was 2.32) |
-| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 2 | **0.77** | 0.79 | **win** (was 1.70) |
-| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 4 | **0.83** | 0.99 | **win** (was 1.69) |
-| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 8 | **0.88** | 1.11 | **win** (was 1.89) |
-| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 2 | **0.86** | 0.87 | **win** (was 1.41) |
-| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 4 | **0.88** | 1.00 | **win** (was 1.42) |
-| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 8 | 1.01 | 1.13 | parity (was 1.54) |
+| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 2 | **0.66** | 0.66 † | **win** (was 2.06) |
+| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 4 | **0.75** | 0.84 † | **win** (was 2.01) |
+| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 8 | **0.68** | 0.88 † | **win** (was 2.32) |
+| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 2 | **0.77** | 0.79 † | **win** (was 1.70) |
+| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 4 | **0.83** | 0.99 † | **win** (was 1.69) |
+| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 8 | **0.88** | 1.11 † | **win** (was 1.89) |
+| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 2 | **0.86** | 0.87 † | **win** (was 1.41) |
+| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 4 | **0.88** | 1.00 † | **win** (was 1.42) |
+| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 8 | 1.01 | 1.13 † | parity (was 1.54) |
+
+† **not a p90.** On the nine rows above, that column is the per-trial *maximum* — the worst of 7-11
+interleaved trials — because `ab.py` reports `p50 [min-max]` rather than a p90. It is a strictly more
+pessimistic statistic than the p90 the rest of this table carries, and it is marked rather than
+converted so no cell here is ever compared to a p90 as though the two were the same number.
 
 ### The 8-bit prefill loss was a 51 MB f32 weight rebuilt on every call
 
@@ -84,11 +89,9 @@ Full record, including the ORT-comparison method and the controls:
 
 Four things about the table above are worth stating plainly.
 
-* **The `p90` column on the nine re-measured rows is the per-trial *maximum*, not a p90.** `ab.py`
-  reports `p50 [min-max]` over interleaved trials, so the worst trial is what is quoted -- a
-  strictly more pessimistic statistic than the p90 the rest of this table carries. Where the max
-  crosses 1.00 (`M = 256, t = 4/8` and `M = 512, t = 4/8`) that is one trial out of 7-11, not the
-  median behaviour.
+* **The `p90` column on the nine re-measured rows is the per-trial *maximum*** (marked `†` above).
+  Where it crosses 1.00 (`M = 256, t = 4/8` and `M = 512, t = 4/8`) that is one trial out of 7-11,
+  not the median behaviour.
 * **The `was` column is a paired re-measurement, not the historical number.** Both arms are one
   build of the current tree, differing only by `ONNX_GENAI_CPU_MM_INT8_GEBP`, interleaved trial by
   trial (7-11 trials x 9 runs). The `M = 512` prior rows reproduce the numbers this file has always

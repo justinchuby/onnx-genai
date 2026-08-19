@@ -44,12 +44,18 @@ the per-strip scratch is allocated.
 
 ### The numbers are bit-identical, not merely close
 
-Both routes compute the same `(q - zero_point) * scale` in f32 and accumulate
-along `k` in strictly increasing order into one accumulator per output element,
-so blocking cannot reorder the reduction. The A/B bench compares the **full**
-output of both arms in one process and reports `bitexact` for every cell of
-every shape and row count measured below. That is also why the tests need
-`INT8_PREFILL_GEBP_TEST_CALLS`: values alone cannot tell which route ran.
+The route being replaced dequantizes to f32 and calls `gemm`, which on native
+x86_64 + AVX2 resolves to `x86_sgemm::sgemm_simd` — the same packing and the
+same `6x16` microkernel `quant_prefill_gebp` drives. `pack_b_quant` emits
+exactly the bytes `pack_b` would have emitted from that dequantized weight, so
+the two routes are not merely "the same order of operations", they are the same
+operations. The A/B bench compares the **full** output of both arms in one
+process and reports `bitexact` for every cell of every shape and row count
+measured below, and
+`matmulnbits_int8_gebp_is_bit_identical_to_the_dequant_route` asserts it through
+the production entry point for partial trailing blocks and partial `NR = 16`
+panels too. That is also why the tests need `INT8_PREFILL_GEBP_TEST_CALLS`:
+values alone cannot tell which route ran.
 
 ## Result, kernel level
 
@@ -82,6 +88,24 @@ Two more shapes, same method, `m = 1` carried as the control:
 The `m = 1` rows are the noise gauge: decode is not on this route in either arm,
 and it reads 1.00x / 1.00x / 0.99x, so the prefill ratios above are not host
 drift.
+
+### The small-`m` ratios are the host-sensitive ones
+
+Reproduced at review time on the same host under moderate contention, the
+`m >= 64` rows and the ORT crossover came back essentially unchanged — 5.55x at
+`m = 64`, 2.54x at `m = 256`, 1.75x at `m = 512`, peak 790 GFLOP/s — while
+`m = 2` and `m = 4` read **13.9x** and **14.7x** against the 17.1x / 18.0x
+above. The whole difference sits in the fused arm's *absolute* time (1.12 ms
+against 0.905 ms at `m = 2`); the dequant arm reproduced to within 0.7%
+(15.58 ms vs 15.47).
+
+That is the expected shape: at two rows the run is ~1 ms, so the fixed pack and
+fork/join cost is a large fraction of it and any co-tenant on the machine moves
+the ratio. Read the small-`m` numbers as "more than an order of magnitude,
+measured between 14x and 18x depending on host load", and the `m >= 64` numbers
+as the stable ones. Nothing about the disposition changes either way: the
+dequant arm cannot go below ~15 ms at this shape, because that is what
+materializing 51 MB costs.
 
 Cold (a fresh kernel per repetition — what time-to-first-token pays) tracks
 steady state on both arms, because neither caches anything: at `k = n = 3584`
@@ -220,3 +244,13 @@ lowered.
   read is amortized either way and what is left is raw SGEMM efficiency.
 * The AVX-512 / AVX512-VNNI case is untested; this host has neither, so the
   `6x16` f32 microkernel is the only one exercised.
+* The bit-exactness claim is specific to the shipped configuration and is not a
+  general statement about any two GEMMs: on native x86_64 + AVX2 the `gemm`
+  call in the route being replaced resolves to `x86_sgemm::sgemm_simd` — the
+  *same* packing and microkernel `quant_prefill_gebp` uses — and `pack_b_quant`
+  emits exactly the bytes `pack_b` would emit from the dequantized weight. That
+  is also the only configuration in which the fused route runs, so the claim
+  holds wherever it is made, but it would not survive a different backend on
+  either side. `matmulnbits_int8_gebp_is_bit_identical_to_the_dequant_route`
+  pins it through the production entry point, including a `k` that leaves a
+  partial trailing block.
