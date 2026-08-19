@@ -4244,19 +4244,83 @@ alone, production build (`build=native` — no MLAS, no ORT CPU fallback):
 | 16 | 0.910 | 0.981 | 13.85 | 48 |
 | 32 | 0.934 | 0.953 | 14.83 | 80 |
 
-Scaling is near-ideal from 1 to 4 (1.96x, then 1.93x), **stalls hard from 4 to
-8** (1.07x for twice the threads and 1.7x the CPU), recovers 1.91x from 8 to
-16, and is flat to negative from 16 to 32 — the last of which is phase 20's
-finding reproduced by an independent harness. The 4→8 stall is new and
-unexplained; it is a parallel-decomposition question rather than a scheduling
-one, and it is left open here rather than guessed at.
+Scaling is near-ideal from 1 to 4 (1.96x, then 1.93x), appears to **stall from
+4 to 8** (1.07x for twice the threads and 1.7x the CPU), recovers 1.91x from 8
+to 16, and is flat to negative from 16 to 32 — the last of which is phase 20's
+finding reproduced by an independent harness.
+
+**The 4-to-8 stall is an artifact, and §41.7 explains it.** It is retained in
+the table above exactly as first measured, because the way it dissolves is
+more useful than the table would have been if it had been quietly corrected.
 
 The matched ORT arm on the same cell is **0.1196 ms** at `intra_op=16`, so
 native is **7.6x behind** at its best budget. That is consistent with the
 7.7x measured for this cell by the entirely separate `bench_generic` solo-arm
 path, and it is a kernel gap, not a scheduling one.
 
-### 41.7 Concurrency: the median is fine, the tail is not
+### 41.7 An explicit budget cannot migrate away from a noisy neighbour
+
+The 4→8 stall did not reproduce. Chasing it produced a better finding than
+the one it retracted.
+
+Re-measuring budget 4 with the identical binary and flags, in two sessions a
+few hours apart:
+
+| session | p50 samples (ms) |
+| --- | --- |
+| A | 1.858, 1.847, 1.861, 1.871 |
+| B | 2.766, 2.761, 2.756, 3.992 |
+
+Within each session the reading is tight — four samples inside 1%, which is
+*better* than the null control's band. Across sessions it moves **1.48x**.
+This is not noise in the ordinary sense; it is a stable measurement of two
+different things.
+
+The mechanism is the budget's own affinity confinement. An explicit budget of
+N calls `select_budget_cpus(N)`, which is **deterministic**: budget 4 always
+confines the process to CPUs `[0, 2, 4, 6]`, budget 16 always to
+`[0, 2, ..., 30]`. Sampling `/proc/stat` during session B, CPUs 0/2/4/6 were
+22-34% busy with co-tenant work at a host load average of 8-21.
+
+So a budgeted process **cannot migrate away from a busy core**. That is the
+feature working as designed — the docstring's promise is that prefill, MLAS
+and decode "stay off the rest of the machine" — but it has three
+consequences that were not previously written down:
+
+1. **A small budget concentrates the exposure.** Budget 4 gives up 28 of 32
+   logical CPUs and keeps 4 it must share; the scheduler's usual remedy,
+   migration, has been removed. Budget 16 spans more cores and averages over
+   them, so it moved far less between the same two sessions (0.910 → 0.889).
+   The *narrower* the budget, the *more* volatile the result on a shared host
+   — the opposite of the intuition that fewer threads means less interference.
+2. **Budgeted processes collide deterministically.** Because the selection is
+   always the same low-numbered physical cores, N budgeted processes on one
+   host all land on the same cores instead of spreading across the machine.
+   Single-tenant this is correct and intended; multi-tenant it is close to
+   worst-case, and this campaign's own benchmark host is multi-tenant.
+3. **Low-budget cells in any matrix on a shared host carry co-tenant load as
+   signal.** The original 4→8 comparison put a session-A reading of budget 4
+   against a session-B reading of budget 8 and read the difference as
+   parallel-decomposition behaviour. Measured within one session, 4→8 is
+   1.57x — sublinear, unremarkable, and not a stall.
+
+An attempt to isolate this by pinning to apparently-idle CPUs
+(`taskset -c 11,17,20,31` with the auto-mask stood down) produced 1.866 then
+3.296 — worse and more variable, because 11, 17 and 31 are **SMT siblings** of
+busy physical cores 10, 16 and 30. Picking logical CPUs without regard to SMT
+pairing hands you cores you do not actually own, which is the same lesson
+#1232 encoded in `select_budget_cpus` and which I promptly re-learned by
+hand.
+
+**Protocol consequence, and it is stronger than the one in §41.9:** a budget
+sweep is only interpretable if **every cell is measured in the same session**,
+interleaved, on an otherwise-quiet host. Comparing cells across sessions
+compares co-tenant weather. The steady-state detector does not save you here,
+because each individual reading is genuinely steady — it is steady at the
+wrong value.
+
+
+### 41.8 Concurrency: the median is fine, the tail is not
 
 1, 2 and 4 concurrent sessions sharing one process-wide pool, budget 16,
 100 us gap, 300 iterations each:
@@ -4280,7 +4344,7 @@ Dispatch latency was never the constraint; time-to-worker under contention
 is. A harness that only measures the dispatch path cannot see this, which is
 precisely why the model-level one had to exist.
 
-### 41.8 The noise band, and an order effect
+### 41.9 The noise band, and an order effect
 
 Three A/A null controls (the same binary twice in one process, budget 16,
 100 us gap, 400 iterations) returned **0.941x, 0.923x, 0.809x**.
@@ -4295,9 +4359,15 @@ The `null` arm's value is as a bias detector, not as a way to run two arms
 cheaply. Any within-process A/B on this codebase carries an ~8% tailwind for
 whichever arm runs second, which is larger than most effects worth chasing.
 
-### 41.9 What this leaves open
+### 41.10 What this leaves open
 
-* The **4→8 budget scaling stall** (1.07x for 2x the threads). Unexplained.
+* **Retracted:** the 4→8 budget scaling stall. It was co-tenant load on the
+  four cores an explicit budget of 4 confines itself to (§41.7). Measured
+  within a single session, 4→8 is 1.57x. Nothing to explain.
+* **Whether `select_budget_cpus` should stagger its selection.** Its
+  determinism is correct for the single-tenant case it was designed for and
+  close to worst-case for a shared host, where every budgeted process picks
+  the same low-numbered cores. Not a defect; an unexamined trade.
 * **p90 under concurrency.** The tail is the real oversubscription cost and
   nothing here addresses it; `slot_exhausted` being zero rules out the
   obvious explanation.
