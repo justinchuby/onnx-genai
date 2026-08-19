@@ -48,6 +48,7 @@ mod nested_autoregressive;
 mod paged_decode;
 mod prefix_reuse;
 mod routing;
+pub use routing::is_missing_required_input;
 mod schedulers;
 #[cfg(feature = "native-backend")]
 pub(crate) use decoder_component::NativePipelineDecoder;
@@ -561,9 +562,11 @@ fn build_step_component_session<'a>(
     )
 )]
 fn pipeline_metadata_max_len(directory: &onnx_genai_ort::PipelineModelDirectory) -> Option<usize> {
-    if let Some(path) = directory.metadata_path.as_ref()
-        && let Ok(metadata) = onnx_genai_metadata::load_metadata(path)
-        && let Some(len) = metadata.model.and_then(|model| model.max_sequence_length)
+    if let Some(len) = directory
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.model.as_ref())
+        .and_then(|model| model.max_sequence_length)
     {
         return Some(len);
     }
@@ -577,12 +580,11 @@ fn pipeline_metadata_prefill_chunk_size(
     directory: &onnx_genai_ort::PipelineModelDirectory,
 ) -> Option<usize> {
     directory
-        .metadata_path
+        .metadata
         .as_ref()
-        .and_then(|path| onnx_genai_metadata::load_metadata(path).ok())
-        .and_then(|metadata| metadata.model)
-        .and_then(|model| model.runtime_configurable)
-        .and_then(|runtime| runtime.chunked_prefill)
+        .and_then(|metadata| metadata.model.as_ref())
+        .and_then(|model| model.runtime_configurable.as_ref())
+        .and_then(|runtime| runtime.chunked_prefill.as_ref())
         .and_then(|chunked| chunked.chunk_size)
         .filter(|size| *size > 0)
 }
@@ -591,24 +593,22 @@ fn pipeline_metadata_generation_defaults(
     directory: &onnx_genai_ort::PipelineModelDirectory,
 ) -> Option<onnx_genai_metadata::GenerationDefaults> {
     directory
-        .metadata_path
+        .metadata
         .as_ref()
-        .and_then(|path| onnx_genai_metadata::load_metadata(path).ok())
-        .and_then(|metadata| metadata.generation)
+        .and_then(|metadata| metadata.generation.clone())
 }
 
 fn pipeline_metadata_eos_token_ids(
     directory: &onnx_genai_ort::PipelineModelDirectory,
 ) -> Vec<TokenId> {
     directory
-        .metadata_path
+        .metadata
         .as_ref()
-        .and_then(|path| onnx_genai_metadata::load_metadata(path).ok())
-        .and_then(|metadata| metadata.tokens)
-        .and_then(|tokens| tokens.eos_token_id)
+        .and_then(|metadata| metadata.tokens.as_ref())
+        .and_then(|tokens| tokens.eos_token_id.as_ref())
         .into_iter()
         .flatten()
-        .filter_map(|id| TokenId::try_from(id).ok())
+        .filter_map(|id| TokenId::try_from(*id).ok())
         .collect()
 }
 
@@ -662,6 +662,11 @@ fn build_native_pipeline_decoder(
             #[cfg(feature = "cuda")]
             governor,
         )?;
+        // #1362: the pipeline's ORT decoders have always honored the declared
+        // chunk size; the native decoder ignored it, so a prompt's prefill ran
+        // as one forward and peak device memory scaled with prompt length.
+        let mut native = native;
+        native.set_prefill_chunk_size(pipeline_metadata_prefill_chunk_size(&models.directory));
         Ok(Box::new(native))
     }
     #[cfg(not(feature = "native-backend"))]

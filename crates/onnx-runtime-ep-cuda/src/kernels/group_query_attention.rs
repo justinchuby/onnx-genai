@@ -278,7 +278,8 @@ extern "C" __global__ void gqa_attention_reference_f32(
     const int group_size,
     const float scale,
     const int local_window,
-    const float softcap)
+    const float softcap,
+    const float* head_sink)
 {
     const int row = blockIdx.x;
     const int rows = batch * query_heads * query_seq;
@@ -295,6 +296,12 @@ extern "C" __global__ void gqa_attention_reference_f32(
             : 0;
     float* row_scores = scores + (long)row * cache_capacity;
 
+    // Learned attention sink (gpt-oss family): a per-head logit that enters the
+    // softmax denominator but carries no value vector. Thread 0 folds it into
+    // `maximum`, then publishes its exp() contribution so every thread adds it
+    // to the shared denominator `sum`. `head_sink == nullptr` => 0 contribution
+    // (byte-identical to the pre-sink path).
+    __shared__ float sink_contrib;
     if (threadIdx.x == 0) {
         const float negative_infinity = __int_as_float(0xff800000);
         float maximum = negative_infinity;
@@ -321,16 +328,22 @@ extern "C" __global__ void gqa_attention_reference_f32(
             row_scores[key_pos] = score;
             maximum = fmaxf(maximum, score);
         }
+        if (head_sink != nullptr) {
+            maximum = fmaxf(maximum, head_sink[query_head]);
+        }
         for (int key_pos = 0; key_pos < total; ++key_pos) {
             float probability = isfinite(row_scores[key_pos])
                 ? (float)exp((double)(row_scores[key_pos] - maximum))
                 : 0.0f;
             row_scores[key_pos] = probability;
         }
+        sink_contrib = (head_sink != nullptr)
+            ? (float)exp((double)(head_sink[query_head] - maximum))
+            : 0.0f;
     }
     __syncthreads();
 
-    float sum = 0.0f;
+    float sum = sink_contrib;
     for (int key_pos = 0; key_pos < total; ++key_pos) {
         sum = __fadd_rn(sum, row_scores[key_pos]);
     }
@@ -1682,7 +1695,6 @@ impl GroupQueryAttentionKernel {
         }
         for (index, feature) in [
             (10, "attention_bias"),
-            (11, "head_sink"),
             (12, "quantized-cache k_scale"),
             (13, "quantized-cache v_scale"),
         ] {
@@ -1691,6 +1703,33 @@ impl GroupQueryAttentionKernel {
                     "cuda_ep GroupQueryAttention: {feature} is not supported"
                 )));
             }
+        }
+        // Optional learned attention sink (input 11): a per-query-head logit
+        // vector (`[num_heads]`, f32) that joins the softmax denominator with no
+        // value contribution (gpt-oss family). Supported only on the f32
+        // reference and f32 split-K decode paths, which is where every f32
+        // decoder with sinks lands once fused flash is disabled below. Any other
+        // dtype/path with a sink present is rejected rather than silently
+        // dropping the sink term.
+        let head_sink = match inputs.get(11) {
+            Some(v) if !v.is_absent() => {
+                if v.dtype != DataType::Float32 {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep GroupQueryAttention: head_sink dtype {:?} is not supported; expected Float32",
+                        v.dtype
+                    )));
+                }
+                require_dense(v, "head_sink", v.dtype)?;
+                Some(cuptr(v.data_ptr::<u8>() as *const c_void))
+            }
+            _ => None,
+        };
+        if head_sink.is_some() && inputs[0].dtype != DataType::Float32 {
+            return Err(EpError::KernelFailed(
+                "cuda_ep GroupQueryAttention: head_sink is only supported for Float32 query \
+                 (reference and split-K decode paths)"
+                    .into(),
+            ));
         }
         if self.local_window_size == 0 || self.local_window_size < -1 {
             return Err(EpError::KernelFailed(
@@ -2208,9 +2247,18 @@ impl GroupQueryAttentionKernel {
         let fuse_metadata = fuse_prep && batch == 1;
 
         let attention_sequence_length = valid_sequence_length.unwrap_or(present_capacity);
-        let selected_backend =
+        let mut selected_backend =
             self.selected_backend_for_shape(q.dtype, q_seq, attention_sequence_length, dim);
+        // A learned attention sink is implemented only on the f32 reference and
+        // f32 split-K decode paths (the fused-flash and phase-2a kernels have no
+        // sink term). Route around fused flash whenever a sink is present so the
+        // sink is never silently dropped; f32 decode/prefill then land on the
+        // sink-aware kernels below.
+        if head_sink.is_some() && selected_backend == GroupQueryAttentionBackend::Fused {
+            selected_backend = GroupQueryAttentionBackend::Phase2a;
+        }
         let use_fused = selected_backend == GroupQueryAttentionBackend::Fused;
+        let head_sink_ptr = head_sink.unwrap_or(0);
         let prep_path = if fuse_prep && q.dtype == DataType::Float16 {
             KvCachePath::FusedDecodePrep
         } else if q_seq > 1 && use_fused {
@@ -2821,11 +2869,12 @@ impl GroupQueryAttentionKernel {
                 totals_gpu,
                 local_window_i,
                 self.softcap,
+                head_sink_ptr,
             )?;
         } else if q.dtype == DataType::Float16 && gqa_decode_fp16::supported(q_seq, dim) {
             onnx_runtime_ep_api::record_kernel_variant!(
                 "attention_gqa_decode_fp16_splitk",
-                "capture-safe fp16 split-K flash-decode: q_seq={}, even head_dim={} (<=256); \
+                "capture-safe fp16 split-K flash-decode: q_seq={}, even head_dim={} (<=512); \
                  active split count (up to {}) chosen on-device from the valid length \
                  and a host occupancy target that fills the multiprocessors",
                 q_seq,
@@ -2861,7 +2910,7 @@ impl GroupQueryAttentionKernel {
         } else if q.dtype == DataType::BFloat16 && gqa_decode_bf16::supported(q_seq, dim) {
             onnx_runtime_ep_api::record_kernel_variant!(
                 "attention_gqa_decode_bf16_splitk",
-                "capture-safe bf16 split-K flash-decode: q_seq={}, even head_dim={} (<=256); \
+                "capture-safe bf16 split-K flash-decode: q_seq={}, even head_dim={} (<=512); \
                  active split count (up to {}) chosen on-device from the valid length \
                  and a host occupancy target that fills the multiprocessors",
                 q_seq,
@@ -2971,7 +3020,8 @@ impl GroupQueryAttentionKernel {
                 .arg(&group_i)
                 .arg(&scale)
                 .arg(&local_window_i)
-                .arg(&self.softcap);
+                .arg(&self.softcap)
+                .arg(&head_sink_ptr);
             // SAFETY: the scratch and BNSH buffers are sized above, and the scalar
             // ABI matches `gqa_attention_reference_f32`.
             unsafe {

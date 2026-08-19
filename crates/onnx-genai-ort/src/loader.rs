@@ -8,8 +8,8 @@ use onnx_genai_genai_config::{
     pipeline_inference_metadata_from_dir,
 };
 use onnx_genai_metadata::{
-    PipelineSpec, PreprocessingSpec, SpeculatorDescriptor, detect_speculator, load_metadata,
-    load_pipeline_spec,
+    InferenceMetadata, PipelineSpec, PreprocessingSpec, SpeculatorDescriptor, detect_speculator,
+    load_metadata, load_pipeline_spec,
 };
 use onnx_model_package::{ModelPackage, SelectionRequest, is_model_package_directory};
 
@@ -82,14 +82,7 @@ impl ModelDirectory {
         }
 
         let model_path = resolve_model_path(root)?;
-        let metadata_path = [
-            "inference_metadata.yaml",
-            "inference_metadata.yml",
-            "inference_metadata.json",
-        ]
-        .iter()
-        .map(|name| root.join(name))
-        .find(|path| path.is_file());
+        let metadata_path = find_metadata_path(root);
         let speculator = detect_speculator(root);
         let genai_config_path = onnx_genai_genai_config::find_in_dir(root);
 
@@ -273,6 +266,15 @@ pub struct PipelineModelDirectory {
     /// leave this unset rather than mislabeling `genai_config.json` as native metadata.
     pub metadata_path: Option<PathBuf>,
     pub spec: PipelineSpec,
+    /// The package's parsed inference metadata, when it ships one.
+    ///
+    /// Resolving the directory already reads and validates this file, so every
+    /// setting it declares -- context length, chunked prefill, EOS ids,
+    /// sampling defaults -- is served from here rather than re-read. A reader
+    /// that re-opened the file could disagree with the spec built beside it,
+    /// and a reader that swallowed the parse error would silently see a model
+    /// that declares nothing.
+    pub metadata: Option<InferenceMetadata>,
     /// Typed preprocessing synthesized from compatibility config or loaded natively.
     pub preprocessing: Option<PreprocessingSpec>,
     pub model_paths: BTreeMap<String, PathBuf>,
@@ -326,17 +328,18 @@ impl PipelineModelDirectory {
         }
 
         let native_metadata_path = find_metadata_path(root);
-        let (metadata_path, spec, preprocessing) = if let Some(metadata_path) = native_metadata_path
-        {
-            let spec = load_pipeline_spec(&metadata_path)
-                .map_err(|err| OrtError::InvalidArgument(err.to_string()))?;
-            let preprocessing = load_metadata(&metadata_path)
-                .map_err(|err| OrtError::InvalidArgument(err.to_string()))?
-                .preprocessing;
-            (Some(metadata_path), spec, preprocessing)
-        } else {
-            load_compatibility_pipeline(root)?
-        };
+        let (metadata_path, spec, metadata, preprocessing) =
+            if let Some(metadata_path) = native_metadata_path {
+                let spec = load_pipeline_spec(&metadata_path)
+                    .map_err(|err| OrtError::InvalidArgument(err.to_string()))?;
+                let metadata = load_metadata(&metadata_path)
+                    .map_err(|err| OrtError::InvalidArgument(err.to_string()))?;
+                let preprocessing = metadata.preprocessing.clone();
+                (Some(metadata_path), spec, Some(metadata), preprocessing)
+            } else {
+                let (metadata_path, spec, preprocessing) = load_compatibility_pipeline(root)?;
+                (metadata_path, spec, None, preprocessing)
+            };
 
         let mut model_paths = BTreeMap::new();
         let mut per_component_tokenizers = BTreeMap::new();
@@ -369,6 +372,7 @@ impl PipelineModelDirectory {
             root: root.to_path_buf(),
             metadata_path,
             spec,
+            metadata,
             preprocessing,
             model_paths,
             tokenizer_paths,
@@ -809,15 +813,10 @@ mod model_package_tests {
     }
 }
 
+/// The package's inference-metadata sidecar, resolved by the format's own rule
+/// so every loader in the workspace agrees on what counts as one.
 fn find_metadata_path(root: &Path) -> Option<PathBuf> {
-    [
-        "inference_metadata.yaml",
-        "inference_metadata.yml",
-        "inference_metadata.json",
-    ]
-    .iter()
-    .map(|name| root.join(name))
-    .find(|path| path.is_file())
+    onnx_genai_metadata::find_metadata_path(root)
 }
 
 fn load_compatibility_pipeline(

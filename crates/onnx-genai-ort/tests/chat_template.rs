@@ -48,7 +48,8 @@ fn renders_tools_for_qwen_template() {
         .unwrap();
 
     assert!(rendered.contains("<tools>\n"));
-    assert!(rendered.contains(r#""name":"clock""#));
+    // `tojson` mirrors Python's `json.dumps`, which separates keys with `": "`.
+    assert!(rendered.contains(r#""name": "clock""#));
     assert!(rendered.contains("<tool_call>"));
     assert!(rendered.ends_with("<|im_start|>assistant\n"));
 }

@@ -323,6 +323,41 @@ fn resolve_shared_kv(model_dir: &Path, config: &SpeculatorConfig) -> SpeculatorP
     }))
 }
 
+/// The inference-metadata sidecar in `model_dir`, if the package ships one.
+///
+/// Which filenames count as inference metadata, and which wins when a package
+/// ships more than one, is a property of the format rather than of any one
+/// loader. Every caller asks here so a package cannot be read as having
+/// metadata by one loader and as having none by another.
+pub fn find_metadata_path(model_dir: &Path) -> Option<PathBuf> {
+    METADATA_FILE_NAMES
+        .iter()
+        .map(|name| model_dir.join(name))
+        .find(|path| path.is_file())
+}
+
+/// Load the inference-metadata sidecar from `model_dir`, if there is one.
+///
+/// `Ok(None)` means the package ships no metadata. A metadata file that exists
+/// but cannot be read is an error rather than a `None`: silently treating a
+/// malformed sidecar as an absent one is how a model comes to run with every
+/// declared setting -- context length, chunked prefill, EOS ids, sampling
+/// defaults -- quietly ignored.
+pub fn load_metadata_from_dir(
+    model_dir: &Path,
+) -> Result<Option<InferenceMetadata>, crate::MetadataError> {
+    find_metadata_path(model_dir)
+        .map(|path| load_metadata(&path))
+        .transpose()
+}
+
+/// Recognized inference-metadata filenames, in the order they are preferred.
+const METADATA_FILE_NAMES: [&str; 3] = [
+    "inference_metadata.yaml",
+    "inference_metadata.yml",
+    "inference_metadata.json",
+];
+
 /// Load inference metadata from a file (YAML or JSON based on extension).
 pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataError> {
     let content = std::fs::read_to_string(path).map_err(crate::MetadataError::Io)?;
@@ -363,11 +398,7 @@ pub fn load_pipeline_spec(path: &Path) -> Result<PipelineSpec, crate::MetadataEr
 /// Detection is best-effort so malformed or unrelated external configuration
 /// does not change normal model-directory loading behavior.
 pub fn detect_speculator(model_dir: &Path) -> Option<SpeculatorDescriptor> {
-    for name in [
-        "inference_metadata.yaml",
-        "inference_metadata.yml",
-        "inference_metadata.json",
-    ] {
+    for name in METADATA_FILE_NAMES {
         let path = model_dir.join(name);
         if !path.is_file() {
             continue;
@@ -405,6 +436,62 @@ struct HuggingFaceModelConfig {
 mod tests {
     use super::*;
     use crate::schema::InferenceMetadata;
+
+    /// A directory of this test's own, so parallel tests cannot see each
+    /// other's sidecars.
+    fn metadata_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("metadata-discovery-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the test directory must be created");
+        dir
+    }
+
+    #[test]
+    fn a_directory_without_a_sidecar_has_no_metadata() {
+        let dir = metadata_dir("absent");
+        assert_eq!(find_metadata_path(&dir), None);
+        assert!(
+            load_metadata_from_dir(&dir)
+                .expect("an absent sidecar is not an error")
+                .is_none()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn yaml_wins_over_the_other_spellings_of_the_same_sidecar() {
+        let dir = metadata_dir("preference");
+        for name in METADATA_FILE_NAMES {
+            std::fs::write(dir.join(name), "version: v1\n").unwrap();
+        }
+        assert_eq!(
+            find_metadata_path(&dir),
+            Some(dir.join("inference_metadata.yaml")),
+            "a package that ships more than one spelling must resolve the same way everywhere"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // A malformed sidecar used to read as an absent one, which is how a model
+    // came to run with every declared setting -- context length, chunked
+    // prefill, EOS ids, sampling defaults -- quietly ignored.
+    #[test]
+    fn a_sidecar_that_cannot_be_parsed_is_an_error_not_an_absence() {
+        let dir = metadata_dir("malformed");
+        std::fs::write(
+            dir.join("inference_metadata.yaml"),
+            "model: [this is not a mapping",
+        )
+        .unwrap();
+
+        let error = load_metadata_from_dir(&dir).expect_err("a malformed sidecar must be reported");
+        assert!(
+            matches!(error, crate::MetadataError::Parse(_)),
+            "unexpected error: {error}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     const SHARED_KV_YAML: &str = "\
 speculative:

@@ -1406,3 +1406,105 @@ preprocessing:
 
     assert!(error.to_string().contains("exceeding the safety limit"));
 }
+
+#[test]
+fn patchify_temporal_order_selects_the_frame_or_channel_nesting() {
+    const PROGRAM: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: resize
+        mode: pixel_area
+        min_pixels: 4
+        max_pixels: 65536
+        size_multiple: 2
+        interpolation: bicubic
+      - op: patchify
+        patch_size: 2
+        temporal_patch_size: 2
+        merge_size: 1
+        channel_order: channels_first
+        temporal_order: {order}
+        flatten: true
+    outputs:
+      - name: pixel_values
+        content: pixels
+        dtype: fp32
+"#;
+    let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([10, 20, 30])));
+    let pixels = |order: &str| {
+        let preprocessor = typed_preprocessor(&[-1, 24], &PROGRAM.replace("{order}", order));
+        let bundle = preprocessor
+            .preprocess(std::slice::from_ref(&image))
+            .unwrap();
+        match &bundle.tensor("pixel_values").unwrap().data {
+            ImageTensorData::Fp32(values) => values.clone(),
+            other => panic!("expected fp32 pixels, got {other:?}"),
+        }
+    };
+
+    // Each frame repeats the whole RGB patch: [R R R R, G G G G, B B B B] twice.
+    assert_eq!(
+        pixels("temporal_major"),
+        vec![
+            10.0, 10.0, 10.0, 10.0, 20.0, 20.0, 20.0, 20.0, 30.0, 30.0, 30.0, 30.0, 10.0, 10.0,
+            10.0, 10.0, 20.0, 20.0, 20.0, 20.0, 30.0, 30.0, 30.0, 30.0,
+        ]
+    );
+    // Each channel repeats its own patch across frames instead.
+    assert_eq!(
+        pixels("channel_major"),
+        vec![
+            10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 20.0, 20.0, 20.0, 20.0, 20.0, 20.0,
+            20.0, 20.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0,
+        ]
+    );
+    // Omitting the field keeps the historical Qwen2-VL nesting.
+    assert_eq!(pixels("channel_major"), {
+        let preprocessor = typed_preprocessor(
+            &[-1, 24],
+            &PROGRAM.replace("        temporal_order: {order}\n", ""),
+        );
+        let bundle = preprocessor
+            .preprocess(std::slice::from_ref(&image))
+            .unwrap();
+        match &bundle.tensor("pixel_values").unwrap().data {
+            ImageTensorData::Fp32(values) => values.clone(),
+            other => panic!("expected fp32 pixels, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn patchify_rejects_an_unknown_temporal_order() {
+    const PROGRAM: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: resize
+        mode: pixel_area
+        min_pixels: 4
+        max_pixels: 65536
+        size_multiple: 2
+        interpolation: bicubic
+      - op: patchify
+        patch_size: 2
+        temporal_patch_size: 2
+        merge_size: 1
+        temporal_order: sideways
+        flatten: true
+    outputs:
+      - name: pixel_values
+        content: pixels
+        dtype: fp32
+"#;
+    let document = serde_yaml::from_str::<MetadataDocument>(PROGRAM).unwrap();
+    let error = ImagePreprocessor::from_metadata_document(&[-1, 24], Some(document))
+        .expect_err("unknown temporal_order must be rejected");
+    assert!(
+        format!("{error:#}").contains("temporal_order 'sideways'"),
+        "unexpected error: {error:#}"
+    );
+}
