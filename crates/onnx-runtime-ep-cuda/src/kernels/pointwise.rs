@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use super::elementwise::{
     BroadcastMetadataCache, BroadcastMetadataKey, capture_shape_eligible,
@@ -193,14 +193,33 @@ DEFINE_UNARY(atan, TYPE, SUFFIX) \
 DEFINE_UNARY(asinh, TYPE, SUFFIX) \
 DEFINE_UNARY(acosh, TYPE, SUFFIX) \
 DEFINE_UNARY(atanh, TYPE, SUFFIX)
+// Fused reciprocal-square-root: collapses an ONNX `Reciprocal(Sqrt(x))` glue
+// pair (see `CudaRsqrtFusion`) into one kernel. It deliberately reproduces the
+// exact two-kernel rounding — `Sqrt` first rounds `sqrtf(x)` to the storage
+// dtype, then `Reciprocal` reads that rounded intermediate back — so the fused
+// result is byte-identical to the unfused pair (critical for byte-identical
+// greedy decode), while eliminating the intermediate tensor's global round-trip
+// and one kernel launch. Correct for f32/f16/bf16 (for f32 the intermediate
+// round is a no-op, so it matches the two-op f32 path exactly).
+#define DEFINE_RSQRT(TYPE, SUFFIX) \
+extern "C" __global__ void rsqrt_##SUFFIX(const TYPE* x, TYPE* y, const unsigned long long n) { \
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; \
+         i += (unsigned long long)gridDim.x * blockDim.x) { \
+        const TYPE s = store_float<TYPE>(sqrtf(load_float<TYPE>(x[i]))); \
+        y[i] = store_float<TYPE>(1.0f / load_float<TYPE>(s)); \
+    } \
+}
 DEFINE_FOR_TYPE(float, f32)
+DEFINE_RSQRT(float, f32)
 #ifdef NXRT_HAS_CUDA_HALF_HEADERS
 DEFINE_FOR_TYPE(__half, f16)
 DEFINE_FOR_TYPE(__nv_bfloat16, bf16)
+DEFINE_RSQRT(__half, f16)
+DEFINE_RSQRT(__nv_bfloat16, bf16)
 #endif
 "#;
 
-const UNARY_MATH_MODULE: &str = "pointwise_unary_math_float_v3";
+const UNARY_MATH_MODULE: &str = "pointwise_unary_math_float_v4";
 
 /// A supported unary math op and its NVRTC entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,6 +245,10 @@ pub enum UnaryMathOp {
     Asinh,
     Acosh,
     Atanh,
+    /// Fused `Reciprocal(Sqrt(x))`. Not a standard ONNX op — only produced by
+    /// [`crate::optimizer::CudaRsqrtFusion`], which retags a `Reciprocal` node
+    /// whose input is a single-consumer `Sqrt`.
+    Rsqrt,
 }
 
 impl UnaryMathOp {
@@ -252,6 +275,7 @@ impl UnaryMathOp {
             UnaryMathOp::Asinh => "asinh",
             UnaryMathOp::Acosh => "acosh",
             UnaryMathOp::Atanh => "atanh",
+            UnaryMathOp::Rsqrt => "rsqrt",
         }
     }
 
@@ -282,6 +306,9 @@ impl UnaryMathOp {
             UnaryMathOp::Asinh => "Asinh",
             UnaryMathOp::Acosh => "Acosh",
             UnaryMathOp::Atanh => "Atanh",
+            // Reported in errors as the source op; the fused node keeps op_type
+            // `Reciprocal`.
+            UnaryMathOp::Rsqrt => "Reciprocal",
         }
     }
 }
@@ -293,9 +320,22 @@ pub struct UnaryMathFactory {
 }
 
 impl KernelFactory for UnaryMathFactory {
-    fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        // `CudaRsqrtFusion` retags a `Reciprocal` whose input is a
+        // single-consumer `Sqrt` with the `_cuda_rsqrt` marker and rewires it to
+        // the pre-`sqrt` value, so this node computes `1/sqrt(x)` in one kernel.
+        let op = if self.op == UnaryMathOp::Reciprocal
+            && node
+                .attr(crate::optimizer::CUDA_RSQRT_ATTR)
+                .and_then(Attribute::as_int)
+                == Some(1)
+        {
+            UnaryMathOp::Rsqrt
+        } else {
+            self.op
+        };
         Ok(Box::new(UnaryMathKernel {
-            op: self.op,
+            op,
             runtime: self.runtime.clone(),
         }))
     }

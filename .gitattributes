@@ -10,5 +10,13 @@
 # passes on Windows checkouts (autocrlf would otherwise convert it to CRLF).
 schema/inference_metadata.schema.json text eol=lf
 
+# Shell scripts and the extension-less git hooks are executed by bash. With
+# core.autocrlf=true (the Git-for-Windows default) they check out as CRLF, and
+# bash then chokes on the stray carriage returns ("$'\r': command not found",
+# "set: pipefail: invalid option name") — the script cannot run at all. Pin
+# them to LF so they stay executable on Windows working trees.
+*.sh text eol=lf
+scripts/hooks/* text eol=lf
+
 # Serialized ONNX protobufs must remain byte-identical across checkouts.
 *.onnx binary

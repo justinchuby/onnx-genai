@@ -46,7 +46,7 @@ flowchart TD
 
 | Layer | Typical evidence |
 |---|---|
-| 语法与风格 | `cargo fmt --all -- --check`、Python 语法、生成文件检查 |
+| 语法与风格 | `cargo fmt`(见下方 Windows 注意事项)、Python 语法、生成文件检查 |
 | 类型面 | 定向的 `cargo check --locked -p ...` |
 | 行为 | 定向的 `cargo test --locked -p ...` |
 | Lint | 定向的 `cargo clippy --locked -p ... --all-targets -- -D warnings` |
@@ -104,6 +104,50 @@ cargo test --locked \
 CPU EP 默认启用内置(vendored)的 MLAS。在缺少所需 C++/汇编工具链的机器上,
 `--no-default-features` 可以运行纯 Rust 的回退路径,但它不能替代随发行版一起
 构建的 MLAS。
+
+## 格式化(以及 Windows 上的注意事项)
+
+CI 在 Linux 上运行 `cargo fmt --all -- --check`,那里工作正常。**但这条命令在本
+workspace 的 Windows 上无法工作。** `cargo fmt --all` 会把整个 workspace 的所有
+文件一次性传给单个 `rustfmt` 调用;本仓库有 54 个成员、约 970 个被跟踪的 `.rs`
+文件,参数列表会超出 Windows 约 32 KB 的命令行长度上限,命令随即失败:
+
+```
+The filename or extension is too long. (os error 206)
+```
+
+Linux CI 不受影响,只是因为它的 `ARG_MAX`(约 2 MB)大得多。
+
+在 Windows 上,请改为**按包**检查格式。`cargo fmt -p <pkg>` 会以每个包各自声明
+的 edition 逐包调用一次 `rustfmt`——这一点很关键,因为本 workspace 是混合
+edition 的(多数成员是 edition 2024,少数是 2021)。**不要**改用裸的
+`rustfmt --edition <E>` 循环:edition 用错时 `rustfmt` 会误解析 2024 专有语法
+(例如 `let` 链)并失败(`error: let chains are only allowed in Rust 2024 or
+later`)。只有 cargo 知道每个包声明的 edition,因此按包驱动检查是唯一正确的
+做法。
+
+```bash
+# 只检查你改动过的包(Windows 安全):
+cargo fmt -p onnx-runtime-memory -- --check
+# 对同一批包应用修复:
+cargo fmt -p onnx-runtime-memory
+```
+
+本地的 pre-commit 闸门正是把这套流程自动化了。安装一次即可:
+
+```bash
+bash scripts/install-hooks.sh
+```
+
+`install-hooks.sh` 通过 `git rev-parse --git-common-dir` 解析 hooks 目录,因此
+无论从主检出还是任意关联 worktree 都能工作(hooks 在一个仓库的所有 worktree
+之间共享)。安装后的 `pre-commit` 会把暂存的 `.rs` 文件映射到其所属的包,并
+**仅**对这些包运行 `cargo fmt -p <pkg> -- --check`,因而在 Windows 上安全,且
+不会因为树中别处已有的既存格式漂移而阻塞提交。它精确镜像 CI 的范围:属于非
+workspace 成员 crate 的文件(例如根目录下的 `bench-*` crate,CI 的
+`cargo fmt --all` 同样不覆盖它们)会被跳过并给出警告,而不是被拦截;若
+`cargo metadata` 根本无法运行,hook 会给出警告并放行提交,而不是把你锁在仓库
+之外。
 
 ## feature 门控的代码
 
