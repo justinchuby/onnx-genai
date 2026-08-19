@@ -15547,10 +15547,19 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// `fp16_gate_up_swiglu_rmsnorm_two_op_ulp_bound_sweep` (0 ULP at M==1) and
     /// issue #1334.
     ///
-    /// Restricted to M==1 on purpose: with the plain path no longer looped, plain
-    /// M>1 dispatches Marlin split-K (default-on), which is documented
-    /// non-byte-identical and possibly non-deterministic — an M>1 plain sweep
-    /// would measure Marlin's noise, not this node's decode-vs-two-op bound.
+    /// Restricted to M==1 on purpose. With the plain path no longer looped, the
+    /// plain M>1 fused gate/up runs through the direct Marlin int4 tensor-core
+    /// GEMM (`marlin_m_gt_1_enabled()`, default **ON**; split-K
+    /// `ONNX_GENAI_MARLIN_SPLITK` is a separate, default-OFF, deterministic
+    /// path and does not engage here). That direct kernel accumulates in a
+    /// different order than the tiled two-op reference and is documented
+    /// *non-byte-identical* to it (its parity tests assert a `2e-2 * max_out`
+    /// tolerance, not equality — see `marlin_gemm::marlin_m_gt_1_enabled`). So an
+    /// M>1 plain sweep would measure Marlin's accumulation offset, not this
+    /// node's decode-vs-two-op bound. It is also why `main` does not actually
+    /// hold "M>1 is bit-exact to the two-op reference" under the default config:
+    /// `fp16_gate_up_swiglu_is_bit_exact_to_two_op_path` reds at M=5 with Marlin
+    /// default-on and only passes under `ONNX_GENAI_MARLIN_M_GT_1=0` (tiled).
     #[test]
     fn fp16_gate_up_swiglu_two_op_ulp_bound_sweep() {
         let Some(runtime) = runtime() else {
@@ -15575,8 +15584,10 @@ extern "C" __global__ void ref_silu_mul_f16(
             (128, 256), // small, grid-starved
             (96, 77),   // odd tail (matches the existing test's small case)
         ];
-        // M==1 only: see the doc comment. Plain M>1 would route through Marlin
-        // split-K (non-byte-identical), not this node's decode GEMV.
+        // M==1 only: see the doc comment. Plain M>1 routes through the direct
+        // Marlin int4 tensor-core GEMM (non-byte-identical to the two-op
+        // reference by a different accumulation order), not this node's decode
+        // GEMV.
         let ms = [1usize];
         let seeds: [u64; 8] = [
             0x0bad_c0de_dead_beef,
