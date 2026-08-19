@@ -4,7 +4,7 @@
 # coverage signal duplicates x64/macOS while owning the critical path.
 #
 # `changes` classifies whether a pull_request/push touched anything other than
-# docs/wiki/site content. When it did not, every Rust job below is skipped
+# docs/wiki content. When it did not, every Rust job below is skipped
 # rather than run. GitHub reports a skipped job with conclusion "skipped",
 # which counts as passing for required status checks (unlike a workflow that
 # never triggers at all, which would leave a required check pending forever)
@@ -67,7 +67,7 @@ jobs:
 
           is_docs_path() {
             case "$1" in
-              docs/*|wiki/*|site/*|*.md|*.mdx|*.markdown|LICENSE|NOTICE)
+              docs/*|wiki/*|*.md|*.mdx|*.markdown|LICENSE|NOTICE)
                 return 0 ;;
               *)
                 return 1 ;;

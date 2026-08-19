@@ -48,9 +48,8 @@ updated: 2026-08-17
 ---
 ```
 
-`lang` 是必需字段。Quartz 会直接把它的值用作发布页面的 `<html lang>` 属性(参见
-`site/quartz/quartz/components/renderPage.tsx` 中对 `frontmatter?.lang` 的使用),
-因此它影响的是真实的可访问性与搜索引擎行为。中文笔记写 `lang: zh-CN`。
+`lang` 是必需字段。Quartz 会直接把它的值用作发布页面的 `<html lang>` 属性,因此它
+影响的是真实的可访问性与搜索引擎行为。中文笔记写 `lang: zh-CN`。
 
 建议的 status 取值:
 
@@ -117,22 +116,29 @@ git log --follow -- "wiki/path/Note.md"
 
 ## 预览并发布静态站点
 
-发布后的站点直接读取 `wiki/`;没有第二份需要维护的笔记副本。在仓库根目录:
+站点生成器不在本仓库里。`wiki/` 是**唯一的内容来源**,发布由
+[justinchuby/onnx-genai-wiki](https://github.com/justinchuby/onnx-genai-wiki)
+负责:它定时把 `wiki/` 镜像成自己的 `content/zh/`,再由此派生一份英文版,发布成
+可切换语言的双语站点。
+
+这意味着两件事。第一,笔记仍然只在这里编辑,推到 `main` 之后会自动同步过去,不需
+要在两个地方各维护一份。第二,**不要**在 onnx-genai-wiki 里直接改 `content/zh/`,
+那份是镜像,下一次同步会整体覆盖掉。
+
+要在本地预览,请 clone 那个仓库:
 
 ```bash
-cd site/quartz
+git clone https://github.com/justinchuby/onnx-genai-wiki
+cd onnx-genai-wiki/site/quartz
 npm ci
 npm run wiki:serve
 ```
 
-打开 <http://localhost:8080/onnx-genai/>。在发起 pull request 之前,在同一目录运行
-`npm run wiki:build`。该命令会校验 wikilink、构建生产站点,并检查生成的链接与资源
-是否都保持在 `/onnx-genai/` 这个项目路径之下。
+发布地址是 <https://www.justinchuby.com/onnx-genai-wiki/>。
 
-站点设置位于 `site/quartz/quartz.config.yaml`;依赖版本记录在相邻的 npm 与 Quartz
-lockfile 中。`Wiki Pages` 工作流会为相关的 pull request 与 push 进行构建,但只有推
-送到 `main` 才能部署到 GitHub Pages。仓库维护者必须在 Pages 来源中选择
-**GitHub Actions**。
+在本仓库里,提交笔记前值得跑的检查只有 wikilink 是否解析得开——这一项不需要站点
+生成器,onnx-genai-wiki 的构建也会再查一遍,并额外要求中英两版产出完全相同的页面
+集合。
 
 ## 人类阅读预算
 
