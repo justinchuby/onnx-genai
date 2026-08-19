@@ -23,7 +23,7 @@ fn gqa_shape_capacity_bound_enabled() -> bool {
             .as_deref()
             .map(str::trim)
             .map(str::to_ascii_lowercase)
-            .map_or(true, |v| !matches!(v.as_str(), "0" | "false" | "off" | "no"))
+            .is_none_or(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no"))
     })
 }
 
@@ -725,8 +725,7 @@ impl Executor {
             // unnecessary and, in eager decode, the dominant blocking-D2H launch
             // cost. Skip materializing them; `dynamic_output_shapes` sizes present
             // from the past-KV capacity when the total value is absent.
-            let is_gqa = node.domain == "com.microsoft"
-                && node.op_type == "GroupQueryAttention";
+            let is_gqa = node.domain == "com.microsoft" && node.op_type == "GroupQueryAttention";
             // Only skip the shape-input read-backs when the present-KV outputs are
             // externally (persistently) bound: their bound buffer shape is the
             // authoritative fixed physical capacity, aliased in-place to past-KV,

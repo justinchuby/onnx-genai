@@ -48,11 +48,30 @@ TEST_DIRS = tuple(crate / "tests" for crate in CUDA_CRATES)
 # "ignored, not passed" GPU rule -- it is a CPU probe, not a GPU test. Its name
 # deliberately omits the `_gpu` suffix its device-bound siblings carry.
 #
+# `matmul_nbits_marlin_oracle` is the pure-CPU half of the int4 `MatMulNBits`
+# parity gate: it self-checks the `f64` dequant->GEMM oracle against an
+# independent `f32` reference and validates the justified tolerance envelope
+# (`Envelope`/`ParityReport`) the GPU gate depends on. It shares the device-free
+# machinery in `tests/marlin_numerics/mod.rs` with the GPU target
+# (`matmul_nbits_marlin_numerics`) but issues no CUDA calls and touches no
+# device, so it legitimately *passes* on the CPU-only lane and cannot honor the
+# "ignored, not passed" GPU rule -- it is a CPU probe validating the checker's
+# own numeric ground truth, not a GPU test. It was split out of the GPU numerics
+# target precisely so that target stays purely-CUDA (all tests ignored without
+# `gpu-tests`); its name deliberately omits the `_gpu`/`_numerics` GPU suffixes.
+# It still runs on the CPU lane via a dedicated
+# `cargo test ... --test matmul_nbits_marlin_oracle` CI step (#1177).
+#
 # Anything added here needs the same argument: not "this one is awkward" but
 # "this one is checking the checker" (or otherwise a genuine CPU-only probe that
 # issues no CUDA calls).
 ALWAYS_RUN = frozenset(
-    {"suite_canary_gpu", "capture_sync_contract", "dummy_fill_and_crossover"}
+    {
+        "suite_canary_gpu",
+        "capture_sync_contract",
+        "dummy_fill_and_crossover",
+        "matmul_nbits_marlin_oracle",
+    }
 )
 SUMMARY = re.compile(
     r"test result: (?:ok|FAILED)\. (?P<passed>\d+) passed; (?P<failed>\d+) failed; "

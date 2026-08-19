@@ -7,7 +7,7 @@ tags:
   - index
 status: maintained
 created: 2026-08-17
-updated: 2026-08-17
+updated: 2026-08-19
 ---
 
 # onnx-genai Wiki
@@ -36,9 +36,12 @@ Published readers start at [[index|onnx-genai Knowledge Base]].
 - **CUDA EP:** [[execution/CUDA Execution Provider]]
 - **Plugin EPs:** [[execution/Plugin Execution Providers]]
 - **Memory:** [[memory/Memory Management for Beginners]]
+- **KV cache virtual memory:** [[memory/Virtual Memory for KV Cache]]
 - **MoE router skew:** [[memory/MoE Router Skew and Always-On Experts]]
+- **Chat templates:** [[prompting/Chat Templates]]
 - **Tracing:** [[observability/Tracing and Profiling]]
 - **Performance engineering:** [[performance/Performance Engineering Playbook]]
+- **Chunked prefill:** [[performance/Chunked Prefill]]
 - **API design:** [[api/API Design Principles]]
 - **Contracts:** [[contracts/Runtime Contracts]]
 - **Formal verification:** [[contracts/Formal Verification with TLA+]]

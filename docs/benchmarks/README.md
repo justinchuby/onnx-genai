@@ -63,6 +63,29 @@ there: a kernel can get 8× faster and still be 3× slower than ORT.
 - Run on a quiet machine with stable power and record the GPU, execution
   provider, model format, quantization, hashes, context limit, and runtime
   versions.
+- **Verify "quiet" rather than assuming it, and do not trust a single probe.**
+  A leaked benchmark process spun a full core here for eight hours
+  (2026-08-19, `profile_native` pid 9276, 01:00:52 to 09:05, ~5.6 CPU-hours)
+  while casual checks said the box was free. Both obvious probes fail, in
+  opposite directions:
+  - `nvidia-smi` and WMI retain **post-mortem** rows, so a dead process can
+    still appear to hold the GPU — a false *positive*, which merely wastes time.
+  - `Get-Process -Id <pid>` returned **absent for that live pid**, and
+    `Stop-Process -Id` failed against it — a false *negative*, which is the
+    dangerous direction: it invites starting a timing run on a contended box.
+
+  What worked: a repeated `Get-Process -Name <name>` snapshot, confirmed by a
+  **CPU-time delta over a wall-clock interval** (that process gained 5.55 s of
+  CPU in 6 s). A process whose CPU time advances is alive whatever any single
+  probe says. Terminating it needed `Get-CimInstance Win32_Process -Filter
+  "ProcessId = <pid>"` piped to `Invoke-CimMethod -MethodName Terminate`.
+- **`0 %` GPU utilisation is not evidence of an idle box.** A live process
+  holding a CUDA context sits at 0 % between kernels, and a spinning host-side
+  loop consumes a core while showing no GPU activity at all.
+- Where the question allows it, prefer a **contention-invariant** counter over
+  wall-clock: CUDA-graph segment counts, `htod_bytes`, page-in and eviction
+  counts, crash/no-crash ratios, and token byte-identity are unaffected by a
+  loaded box, and several conclusions in this corpus rest on them for that reason.
 
 ## Primary GPU-to-GPU comparison
 
