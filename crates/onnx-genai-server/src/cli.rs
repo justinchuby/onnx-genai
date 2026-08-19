@@ -7,13 +7,15 @@
 use std::{net::SocketAddr, path::PathBuf};
 
 use clap::{ArgGroup, Args};
-use onnx_genai_engine::{KvDType, ResourceLimit, parse_resource_limit};
+use onnx_genai_engine::KvDType;
 
 #[cfg(feature = "native-backend")]
 use crate::parse_native_device;
 use crate::{
     AppState, ModelSpec, ModelsConfig, ServerConfig, default_node_id, from_models_dir,
-    parse_kv_cache_dtype, serve,
+    parse_kv_cache_dtype,
+    runtime_args::{CpuArgs, EngineArgs},
+    serve,
 };
 
 /// Flags for the OpenAI-compatible HTTP server.
@@ -21,19 +23,31 @@ use crate::{
 #[command(group(
     ArgGroup::new("model_source")
         .required(true)
-        .args(["model", "models_dir", "models_config"])
+        .args(["model", "model_positional", "models_dir", "models_config"])
 ))]
 pub struct ServeArgs {
     /// Single-model mode: path to a model directory containing the ONNX model and tokenizer.
+    /// May also be given positionally (`serve MODEL`), which is how every other
+    /// subcommand takes it.
     /// Mutually exclusive with --models-dir and --models-config.
     /// Falls back to ONNX_GENAI_MODEL.
     #[arg(long, env = "ONNX_GENAI_MODEL", group = "model_source")]
     pub model: Option<PathBuf>,
 
+    /// Model directory given positionally.
+    ///
+    /// `generate`, `run` and `show` all take the model as the first positional
+    /// argument, so a command line learned from any of them was rejected by
+    /// `serve`, which accepted only `--model`. Both spellings now work, and
+    /// giving both is an error rather than a silent precedence rule — someone
+    /// who typed two different paths has no preference for us to guess at.
+    #[arg(value_name = "MODEL", group = "model_source")]
+    pub model_positional: Option<PathBuf>,
+
     /// Model id reported by /v1/models (single-model mode only).
     /// Defaults to the model directory name.
-    /// Ignored when --models-dir or --models-config is used.
-    #[arg(long, requires = "model")]
+    /// Rejected when --models-dir or --models-config is used.
+    #[arg(long)]
     pub model_id: Option<String>,
 
     /// Multi-model mode: parent directory whose immediate subdirectories are each
@@ -108,38 +122,36 @@ pub struct ServeArgs {
     )]
     pub kv_cache_dtype: KvDType,
 
-    /// VRAM ceiling for the engine resource governor. Resolved before model load so
-    /// native CUDA can choose governed weight offload instead of relying on WDDM paging.
-    /// Accepted values: bytes, fractions such as 0.9, byte strings such as 8GiB, or auto.
-    #[arg(long, env = "ONNX_GENAI_VRAM_LIMIT", value_parser = parse_limit)]
-    pub vram_limit: Option<ResourceLimit>,
+    #[command(flatten)]
+    pub engine: EngineArgs,
 
-    /// Device for native decoder execution: cpu, cuda, or cuda:<index>.
-    /// Falls back to ONNX_GENAI_EP when omitted.
+    #[command(flatten)]
+    pub cpu: CpuArgs,
+
+    /// Deprecated spelling of `--device`.
+    ///
+    /// Kept working so existing command lines and service units do not break,
+    /// but hidden from help: `--device` is what every other subcommand calls
+    /// this, and having two names for one setting is what made the flag hard to
+    /// find in the first place.
     #[cfg(feature = "native-backend")]
-    #[arg(long, env = "ONNX_GENAI_NATIVE_DEVICE", value_parser = parse_native_device)]
+    #[arg(long, hide = true, value_parser = parse_native_device)]
     pub native_device: Option<onnx_genai_engine::NativeDecodeDevice>,
 }
 
-fn parse_limit(input: &str) -> Result<ResourceLimit, String> {
-    parse_resource_limit(input).map_err(|error| error.to_string())
-}
-
 fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
-    let mut engine_config = onnx_genai_engine::EngineConfig {
-        kv_cache_dtype: args.kv_cache_dtype,
-        #[cfg(feature = "native-backend")]
-        native_device: args.native_device.clone(),
-        #[cfg(feature = "native-backend")]
-        decode_backend: if args.native_device.is_some() {
-            onnx_genai_engine::EngineDecodeBackend::Native
-        } else {
-            onnx_genai_engine::EngineDecodeBackend::default()
-        },
-        ..Default::default()
-    };
-    if let Some(vram_limit) = args.vram_limit {
-        engine_config.limits.vram_limit = vram_limit;
+    let mut engine_config = args.engine.to_config();
+    engine_config.kv_cache_dtype = args.kv_cache_dtype;
+    // The deprecated `--native-device` spelling still selects both the device
+    // and, implicitly, the native backend -- exactly what it did before
+    // `--device` existed. `--device` wins when both are given, because it is the
+    // spelling the help advertises.
+    #[cfg(feature = "native-backend")]
+    if engine_config.native_device.is_none()
+        && let Some(device) = args.native_device.clone()
+    {
+        engine_config.native_device = Some(device);
+        engine_config.decode_backend = onnx_genai_engine::EngineDecodeBackend::Native;
     }
     // #1064: `--max-batch N` is what *requests* the native persistent decode
     // batch extent. Previously the extent could only be turned on by
@@ -167,13 +179,34 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
     }
 }
 
+impl ServeArgs {
+    /// The single-model path, from either the flag or the positional argument.
+    ///
+    /// Giving both is refused rather than resolved by precedence: two different
+    /// paths mean the caller had two different intents, and guessing at one of
+    /// them serves a model nobody asked for.
+    fn resolve_model_path(&mut self) -> anyhow::Result<Option<PathBuf>> {
+        match (self.model.take(), self.model_positional.take()) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "What: the model was given twice, once with --model and once positionally. \
+                 Why: only one model can be served in single-model mode. \
+                 How: drop either the flag or the positional argument."
+            ),
+            (Some(path), None) | (None, Some(path)) => Ok(Some(path)),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
 /// Build the server state from [`ServeArgs`] and serve until shutdown.
-pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
+pub async fn run_serve(mut args: ServeArgs) -> anyhow::Result<()> {
+    args.cpu.apply().map_err(anyhow::Error::msg)?;
     let server_config = server_config_from_args(&args);
+    let model_path = args.resolve_model_path()?;
 
     // Build the model spec list from whichever source flag was provided.
-    // Exactly one of --model / --models-dir / --models-config is required (ArgGroup).
-    let specs: Vec<ModelSpec> = if let Some(model_path) = args.model {
+    // Exactly one model source is required (ArgGroup).
+    let specs: Vec<ModelSpec> = if let Some(model_path) = model_path {
         let model_id = args.model_id.unwrap_or_else(|| {
             model_path
                 .file_name()
@@ -187,12 +220,22 @@ pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
             eager: true,
             warmup: false,
         }]
-    } else if let Some(models_dir) = args.models_dir {
-        from_models_dir(&models_dir)?
-    } else if let Some(config_path) = args.models_config {
-        ModelsConfig::from_file(&config_path)?.models
     } else {
-        unreachable!("ArgGroup enforces that exactly one model_source arg is provided")
+        if args.model_id.is_some() {
+            anyhow::bail!(
+                "What: --model-id was given alongside a multi-model source. \
+                 Why: --models-dir and --models-config name every model themselves, \
+                 so there is no single id to override. \
+                 How: drop --model-id, or serve one model with --model."
+            );
+        }
+        if let Some(models_dir) = args.models_dir {
+            from_models_dir(&models_dir)?
+        } else if let Some(config_path) = args.models_config {
+            ModelsConfig::from_file(&config_path)?.models
+        } else {
+            unreachable!("ArgGroup enforces that exactly one model_source arg is provided")
+        }
     };
 
     let state = AppState::load_from_specs(specs, server_config)?;
@@ -204,6 +247,7 @@ pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use onnx_genai_engine::ResourceLimit;
 
     #[derive(Debug, Parser)]
     struct TestCli {
@@ -211,8 +255,87 @@ mod tests {
         serve: ServeArgs,
     }
 
-    /// #1064: `--max-batch N` must *shape the decode session*, not merely be
-    /// checked against a capability derived from a session built for one
+    /// Every other subcommand takes the model as the first positional argument,
+    /// so a command line learned from `run` has to work here too.
+    #[test]
+    fn the_model_can_be_given_positionally_or_as_a_flag() {
+        let mut positional = TestCli::parse_from(["test", "model-dir"]);
+        let mut flag = TestCli::parse_from(["test", "--model", "model-dir"]);
+
+        assert_eq!(
+            positional
+                .serve
+                .resolve_model_path()
+                .expect("one spelling is not ambiguous"),
+            Some(PathBuf::from("model-dir"))
+        );
+        assert_eq!(
+            flag.serve
+                .resolve_model_path()
+                .expect("one spelling is not ambiguous"),
+            Some(PathBuf::from("model-dir"))
+        );
+    }
+
+    /// Two paths mean two intents, and guessing at one of them serves a model
+    /// nobody asked for. Both spellings share the model-source group, so this is
+    /// refused while parsing rather than after the process has started.
+    #[test]
+    fn giving_the_model_twice_is_refused_rather_than_resolved_by_precedence() {
+        let error = TestCli::try_parse_from(["test", "--model", "one", "two"])
+            .expect_err("two different models were named");
+
+        assert!(error.to_string().contains("cannot be used with"), "{error}");
+    }
+
+    /// `--model-id` names *the* model, so a multi-model source has nothing for
+    /// it to name. Silently ignoring it hid a typo'd invocation.
+    #[tokio::test]
+    async fn a_model_id_is_refused_alongside_a_multi_model_source() {
+        let args =
+            TestCli::parse_from(["test", "--models-dir", "does-not-exist", "--model-id", "x"])
+                .serve;
+
+        let error = run_serve(args).await.expect_err("no single model to name");
+        assert!(error.to_string().contains("--model-id"), "{error}");
+    }
+
+    /// `--device` is the spelling every other subcommand uses, and naming a
+    /// device has always implied the native decoder on this command.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn the_shared_device_flag_selects_the_native_backend() {
+        let cli = TestCli::parse_from(["test", "--model", "model-dir", "--device", "cpu"]);
+
+        let config = server_config_from_args(&cli.serve).engine_config;
+        assert_eq!(
+            config.decode_backend,
+            onnx_genai_engine::EngineDecodeBackend::Native
+        );
+        assert_eq!(
+            config.native_device,
+            Some(onnx_genai_engine::NativeDecodeDevice::Cpu)
+        );
+    }
+
+    /// The old spelling stays wired up so existing service units keep working.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn the_deprecated_native_device_spelling_still_works() {
+        let cli = TestCli::parse_from(["test", "--model", "model-dir", "--native-device", "cpu"]);
+
+        let config = server_config_from_args(&cli.serve).engine_config;
+        assert_eq!(
+            config.decode_backend,
+            onnx_genai_engine::EngineDecodeBackend::Native
+        );
+        assert_eq!(
+            config.native_device,
+            Some(onnx_genai_engine::NativeDecodeDevice::Cpu)
+        );
+    }
+
+    /// #1064: `--max-batch N` must *shape the decode session*, not merely be    /// checked against a capability derived from a session built for one
     /// sequence. Before this, batch-N could only be enabled by
     /// `ONNX_GENAI_NATIVE_DECODE_BATCH`, so `--max-batch 4` was refused at
     /// startup with "this backend decodes at most 1 sequence(s) concurrently".

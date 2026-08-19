@@ -180,7 +180,7 @@ impl Transcriber {
 }
 
 pub(super) fn transcribe(args: TranscribeArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
-    args.cpu.apply()?;
+    args.cpu.apply().map_err(anyhow::Error::msg)?;
     install_ctrlc_handler();
     let model_dir = resolve_model_dir(&args.model);
     let mut profile = RunProfile::new(model_dir.display().to_string());
