@@ -236,10 +236,18 @@ fn nested_dispatch_slot_pressure() {
         rows.par_chunks_mut(NEST_INNER).for_each(|row| {
             let base = row.as_mut_ptr() as usize;
             task_runtime::for_each_range(NEST_INNER, 64, |start, end| {
-                // Each task owns a disjoint `start..end` of this row, so the
-                // reconstructed slice never overlaps another task's.
-                let row = unsafe { std::slice::from_raw_parts_mut(base as *mut u64, NEST_INNER) };
-                for slot in &mut row[start..end] {
+                // SAFETY: `for_each_range` visits `start..end` in exactly one
+                // task, so narrowing *before* the retag makes this `&mut`
+                // unique for its lifetime. Reconstructing the whole row and
+                // then indexing would retag the full `NEST_INNER` range in
+                // every task, and under Stacked Borrows the conflict is the
+                // retag rather than the store — the writes being disjoint
+                // would not save it. `parallel_output_rows_repeated` uses this
+                // same narrow-first shape in production.
+                let slots = unsafe {
+                    std::slice::from_raw_parts_mut((base as *mut u64).add(start), end - start)
+                };
+                for slot in slots {
                     *slot += 1;
                 }
             });

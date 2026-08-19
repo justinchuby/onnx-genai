@@ -122,6 +122,26 @@ jobs:
           # real threads under Stacked Borrows.
           run_miri "onnx-runtime-ep-cpu task runtime" \
             env MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib task_runtime::
+
+          # `-Zmiri-num-cpus` is load-bearing for aliasing coverage, not a
+          # tuning knob. Miri reports `available_parallelism() == 1` by default,
+          # so `resolve_width` gives a one-lane pool and every fan-out above
+          # degrades to `Backend::Serial`: the step type-checks the unsafe
+          # blocks but never runs two tasks against each other. That is how
+          # #1377's whole-row retag passed a lane that claimed to cover this
+          # module.
+          #
+          # Scoped to the single test that needs real concurrency rather than
+          # applied to all of `task_runtime::`, because multi-CPU Miri
+          # multiplies the runtime of the whole module and this module is
+          # already the slowest step in the lane.
+          #
+          # Verified both ways: with the flag, widening the retag in that test
+          # to the whole row reports "Data race detected between (1) retag write
+          # ... and (2) retag write of type `[u64]`"; without it, the same bad
+          # shape passes.
+          run_miri "onnx-runtime-ep-cpu task runtime concurrent retag" \
+            env MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-num-cpus=4" cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib task_runtime::tests::concurrent_tasks_retag_only_their_own_range
           run_miri "onnx-runtime-ep-cpu strided" \
             cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib strided::tests
           run_miri "onnx-runtime-ep-cpu provider" \
