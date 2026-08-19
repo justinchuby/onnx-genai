@@ -256,3 +256,18 @@ The fold is **byte-identical** (`row0_matches_batch1=true`; parity test `fused_g
 | **H200**, 0.5B, hidden 896 | **−2.7% regression** at M=1 (814.9 vs 816.1 tok/s), which is *why* the floor exists | commit `05e1fd10` |
 
 So on a large GPU folding a small decoder can regress single-stream M=1; on this small GPU it does not. At M≥2 the ~20 ms/step segmentation saving dwarfs the M=1 cost on either GPU. Do not set this for pure single-stream serving on a large GPU without measuring; do set it (or wait for #1421) for batched decode on small models.
+
+## Positive control — the fix engages by default on a folding model (2026-08-19)
+
+All prior batch-fix evidence was on `qwen05b-q4`, which is **gated off** (fold forced on via env). Missing was a model that folds **naturally** (hidden ≥ 1280) confirming the capture-safe loop engages by default and that the hidden floor is the *only* gate. Ran the control on `qwen14b-zp` (dense, hidden **5120**, folds by default; **RTX 4060 / CUDA 13.1**). GPU was **contended** (a second `profile_native` from another workstream present) — segment counts are contention-invariant, so this is valid without a quiet box; ms/step is *not* reported as a cost curve because 14B **streams** in 8 GB (weight-transfer bound, 356–3069 ms/step observed).
+
+| batch M | segments | seam nodes |
+|---|---|---|
+| 1 | **1** | none |
+| 2 | **1** | none |
+| 4 | **1** | none |
+| 8 | **1** | none |
+
+**1 segment at every M** — the fold engages by default and there is **no second gate** at hidden ≥ 1280. This closes #1404's evidence chain: proven correct (0 ULP, byte-identical), proven to **engage where it should** (this control), and proven **gated off where the floor bites** (qwen05b at 896 → 25 segments), with the interim knob documented.
+
+`qwen15-moe-dense-f32` (dense-fallback fp32 MoE, hidden 2048) was attempted as a MoE-architecture control but **abandoned**: the densely-materialized fp32 experts are tens of GB, so under streaming + contention it did not clear load/warmup cheaply and was competing with the other workstream's GPU use. Not measured. (The `qmoe-f32` build has two `.onnx` files and could not be resolved by the harness; `qmoe` fp16 is a known-broken ORT path.) No `CUDA_ERROR_ILLEGAL_ADDRESS` was encountered in any run.
