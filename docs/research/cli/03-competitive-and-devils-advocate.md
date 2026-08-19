@@ -18,15 +18,17 @@ Source inspected: `crates\onnx-genai-cli\src\lib.rs`, `crates\onnx-genai-cli\src
 
 | Subcommand | Current purpose | Flags / args found |
 |---|---|---|
-| `serve` | OpenAI-compatible HTTP server | One required source among `--model`, `--models-dir`, `--models-config`; plus `--model-id`, `--node-id`, `--addr`, `--max-output-tokens`, `--max-sessions`, `--max-queue-depth`, `--enable-debug-endpoints`, `--enable-admin-endpoints`, `--max-loaded-models`, `--kv-cache-dtype`; with native backend, `--native-device`. |
-| `generate` | One-shot text generation; also text-to-image/audio output | Positional `model`; `--prompt`/`-p`; sampling `--max-new-tokens`, `--temperature`, `--top-p`, `--top-k`, repeated `--stop`, `--raw`; attachments `--image`, `--audio`; engine `--vram-limit`, `--host-ram-limit`; CPU `--cpu-cores`; text/image/audio output controls `--stream`, `--output-image`, `--negative-prompt`, `--steps`, `--guidance-scale`, `--seed`, `--height`, `--width`, `--batch-size`, `--tokenizer`, `--text-encoder`, `--vae-decoder`, `--vae-scaling-factor`, `--output-audio`, `--sample-rate`. |
-| `run` | Interactive generation REPL | Positional `model`; shared sampling flags; `--image`, `--audio`; `--vram-limit`, `--host-ram-limit`, `--cpu-cores`. REPL slash commands: `/help`, `/reset`, `/raw`, `/stats`, `/pages`, `/profile [on|off|trace <path>|trace off|verbosity <level>]`, `/model [path]`, `/session`, `/ep [provider]`, `/backend [auto|ort|native]`, `/system [text]`, `/image [path] [prompt]`, `/audio [path] [prompt]`. |
+| `serve` | OpenAI-compatible HTTP server | One required source among positional `MODEL`, `--model`, `--models-dir`, `--models-config`; plus `--model-id`, `--node-id`, `--addr`, `--max-output-tokens`, `--max-sessions`, `--max-queue-depth`, `--enable-debug-endpoints`, `--enable-admin-endpoints`, `--max-loaded-models`, `--kv-cache-dtype`; shared engine/CPU flags. |
+| `generate` | One-shot text generation; also text-to-image/audio output | Positional `model`; `--prompt`/`-p`; sampling `--max-new-tokens`, `--temperature`, `--top-p`, `--top-k`, repeated `--stop`, `--raw`; attachments `--image`, `--audio`; shared engine/CPU flags; text/image/audio output controls `--stream`, `--output-image`, `--negative-prompt`, `--steps`, `--guidance-scale`, `--seed`, `--height`, `--width`, `--batch-size`, `--tokenizer`, `--text-encoder`, `--vae-decoder`, `--vae-scaling-factor`, `--output-audio`, `--sample-rate`. |
+| `run` | Interactive generation REPL | Positional `model`; shared sampling flags; `--image`, `--audio`; shared engine/CPU flags. REPL slash commands: `/help`, `/reset`, `/raw`, `/stats`, `/pages`, `/profile [on|off|trace <path>|trace off|verbosity <level>]`, `/model [path]`, `/session`, `/ep [provider]`, `/backend [auto|ort|native]`, `/system [text]`, `/image [path] [prompt]`, `/audio [path] [prompt]`. |
 | `show` | Inspect a model's resolved files/metadata | Positional `model`. |
 | `list` / alias `ls` | List model directories | `--models-dir` / `ONNX_GENAI_MODELS_DIR`. |
 | `transcribe` | Speech-to-text from files or live stdin | Positional `AUDIO...`; `--language`, `--format text|json|srt`, `--segment-seconds`, `--silence-seconds`, `--silence-threshold`, `--min-segment-seconds`, `--sample-rate`, `--channels`, `--max-new-tokens`; shared engine/CPU flags. |
 | `version` | Version and execution providers | No command-local flags. |
 
 ✅ Verified global profiling flags: `--profile`, `--profile-json PATH`, `--profile-trace PATH`.
+
+✅ Verified shared engine/CPU flags, identical on `serve`, `generate`, `run` and `transcribe`: `--backend auto|ort|native`, `--device auto|cpu|cuda[:N]`, `--vram-limit`, `--host-ram-limit`, `--cpu-cores`.
 
 ## 2. Comparable CLI surfaces checked
 

@@ -386,10 +386,13 @@ async fn run_chat_completion(
     let mut prepared = prepare_generate_request(
         &request,
         &handle.tokenizer,
-        handle.chat_template.as_deref(),
         client_session_id.is_some(),
-        placeholder.as_deref(),
-        handle.generation_defaults.as_ref(),
+        &PromptContext {
+            chat_template: handle.chat_template.as_deref(),
+            image_placeholder: placeholder.as_deref(),
+            generation_defaults: handle.generation_defaults.as_ref(),
+            default_reasoning_effort: state.config.default_reasoning_effort,
+        },
         output_budget,
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
@@ -556,10 +559,13 @@ async fn stream_chat_completion(
     let mut prepared = prepare_generate_request(
         &request,
         &handle.tokenizer,
-        handle.chat_template.as_deref(),
         client_session_id.is_some(),
-        placeholder.as_deref(),
-        handle.generation_defaults.as_ref(),
+        &PromptContext {
+            chat_template: handle.chat_template.as_deref(),
+            image_placeholder: placeholder.as_deref(),
+            generation_defaults: handle.generation_defaults.as_ref(),
+            default_reasoning_effort: state.config.default_reasoning_effort,
+        },
         output_budget,
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
@@ -1460,19 +1466,31 @@ fn positional_image_placeholder(
     (!already_positioned).then_some(placeholder)
 }
 
+/// What the loaded model and the server's configuration contribute to a prompt,
+/// as opposed to what the request itself carries.
+///
+/// These travel together to every prompt that is built, and a request that
+/// dropped one of them would render against the wrong defaults rather than
+/// fail, so they are passed as one value instead of four positional arguments.
+struct PromptContext<'a> {
+    chat_template: Option<&'a ChatTemplate>,
+    image_placeholder: Option<&'a str>,
+    generation_defaults: Option<&'a GenerationDefaults>,
+    /// Applied when the request omits `reasoning_effort`.
+    default_reasoning_effort: Option<ReasoningEffort>,
+}
+
 fn prepare_generate_request(
     request: &ChatCompletionRequest,
     tokenizer: &Tokenizer,
-    chat_template: Option<&ChatTemplate>,
     session: bool,
-    image_placeholder: Option<&str>,
-    generation_defaults: Option<&GenerationDefaults>,
+    context: &PromptContext<'_>,
     output_budget: usize,
 ) -> anyhow::Result<PreparedGenerateRequest> {
     let prompt = if session && !request.has_tool_context() {
-        build_session_prompt(&request.messages, image_placeholder)
+        build_session_prompt(&request.messages, context.image_placeholder)
     } else {
-        render_prompt(request, chat_template, image_placeholder)?
+        render_prompt(request, context)?
     };
     let token_ids = tokenizer
         .encode(&prompt)
@@ -1481,7 +1499,10 @@ fn prepare_generate_request(
     let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget);
     // Honor the model's declared sampling regime (e.g. a reasoning model that
     // ships do_sample=true); explicit request fields still win.
-    options.resolve_sampling_defaults(generation_defaults, &chat_sampling_overrides(request));
+    options.resolve_sampling_defaults(
+        context.generation_defaults,
+        &chat_sampling_overrides(request),
+    );
     Ok(PreparedGenerateRequest {
         request: GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
@@ -1795,14 +1816,13 @@ fn template_tool_calls(tool_calls: &[ChatMessageToolCall]) -> anyhow::Result<ser
 
 fn render_prompt(
     request: &ChatCompletionRequest,
-    chat_template: Option<&ChatTemplate>,
-    image_placeholder: Option<&str>,
+    context: &PromptContext<'_>,
 ) -> anyhow::Result<String> {
-    if let Some(chat_template) = chat_template {
+    if let Some(chat_template) = context.chat_template {
         let messages = request
             .messages
             .iter()
-            .map(|message| template_message(message, image_placeholder))
+            .map(|message| template_message(message, context.image_placeholder))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let tools_json = tools_offered_to_model(request)
             .map(serde_json::to_string)
@@ -1812,7 +1832,10 @@ fn render_prompt(
                 &messages,
                 tools_json.as_deref(),
                 true,
-                request.reasoning_effort.map(ReasoningEffort::as_str),
+                request
+                    .reasoning_effort
+                    .or(context.default_reasoning_effort)
+                    .map(ReasoningEffort::as_str),
             )
             .map_err(|err| anyhow::anyhow!("chat template render failed: {err}"));
     }
@@ -2629,6 +2652,20 @@ mod prompt_rendering_tests {
 
     // A reasoning model's template reads the caller's effort; without it the
     // template stays on its own default, which is often maximal.
+    /// A prompt context carrying only a template and an optional server-side
+    /// effort default, which is all these cases vary.
+    fn context<'a>(
+        template: &'a ChatTemplate,
+        default_reasoning_effort: Option<ReasoningEffort>,
+    ) -> PromptContext<'a> {
+        PromptContext {
+            chat_template: Some(template),
+            image_placeholder: None,
+            generation_defaults: None,
+            default_reasoning_effort,
+        }
+    }
+
     #[test]
     fn reasoning_effort_reaches_the_template() {
         let template = ChatTemplate::from_source(
@@ -2646,15 +2683,57 @@ mod prompt_rendering_tests {
         assert_eq!(
             render_prompt(
                 &request(json!({ "reasoning_effort": "low" })),
-                Some(&template),
-                None
+                &context(&template, None),
             )
             .unwrap(),
             "low"
         );
         assert_eq!(
-            render_prompt(&request(json!({})), Some(&template), None).unwrap(),
+            render_prompt(&request(json!({})), &context(&template, None)).unwrap(),
             "default"
+        );
+    }
+
+    // An agent client that never sends `reasoning_effort` would otherwise leave
+    // the model on its own default and can burn a whole token budget thinking
+    // without emitting an answer, so the operator can supply a floor. A client
+    // that does ask still wins.
+    #[test]
+    fn server_default_reasoning_effort_fills_in_only_when_the_request_is_silent() {
+        let template = ChatTemplate::from_source(
+            "{{ reasoning_strength if reasoning_strength is defined and reasoning_strength else 'model-default' }}",
+        );
+        let request = |extra: serde_json::Value| -> ChatCompletionRequest {
+            let mut body = json!({ "model": "m", "messages": [{"role": "user", "content": "hi"}] });
+            let object = body.as_object_mut().unwrap();
+            for (key, value) in extra.as_object().unwrap() {
+                object.insert(key.clone(), value.clone());
+            }
+            serde_json::from_value(body).unwrap()
+        };
+
+        // Silent request takes the server default.
+        assert_eq!(
+            render_prompt(
+                &request(json!({})),
+                &context(&template, Some(ReasoningEffort::Low)),
+            )
+            .unwrap(),
+            "low"
+        );
+        // An explicit request value outranks the server default.
+        assert_eq!(
+            render_prompt(
+                &request(json!({ "reasoning_effort": "high" })),
+                &context(&template, Some(ReasoningEffort::Low)),
+            )
+            .unwrap(),
+            "high"
+        );
+        // No server default configured leaves the model on its own default.
+        assert_eq!(
+            render_prompt(&request(json!({})), &context(&template, None)).unwrap(),
+            "model-default"
         );
     }
 }

@@ -25,10 +25,27 @@ impl Tokenizer {
     }
 
     /// Encode a prompt to token ids, including model-defined special tokens.
+    ///
+    /// Chat templates usually emit `bos_token` themselves, while the tokenizer's
+    /// post-processor prepends the same token again. Feeding a duplicated BOS to
+    /// the model corrupts the very first attention step and derails generation,
+    /// so drop the extra copy when the post-processor produced one.
     pub fn encode(&self, prompt: &str) -> Result<Vec<u32>> {
+        let ids = self.encode_inner(prompt, true)?;
+        if ids.len() < 2 || ids[0] != ids[1] {
+            return Ok(ids);
+        }
+        let plain = self.encode_inner(prompt, false)?;
+        if plain.first() == ids.first() && ids.len() == plain.len() + 1 {
+            return Ok(plain);
+        }
+        Ok(ids)
+    }
+
+    fn encode_inner(&self, prompt: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         let encoding = self
             .inner
-            .encode(prompt, true)
+            .encode(prompt, add_special_tokens)
             .map_err(|err| OrtError::Tokenizer(err.to_string()))?;
         Ok(encoding.get_ids().to_vec())
     }

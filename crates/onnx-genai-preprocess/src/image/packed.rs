@@ -6,7 +6,7 @@ use anyhow::Context;
 
 use super::{
     CoordinateOrder, ImageLayout, MAX_IMAGE_COUNT, MAX_TENSOR_ELEMENTS, PatchChannelOrder,
-    PatchifySpec, ThumbnailPosition, TileGrid,
+    PatchTemporalOrder, PatchifySpec, ThumbnailPosition, TileGrid,
 };
 
 /// Declared tensor element type for an image processor output.
@@ -595,15 +595,27 @@ fn pack_image(image: &PreparedImage, patchify: &PatchifySpec) -> anyhow::Result<
                         let patch_x = group_x * patchify.merge_size + local_x;
                         match patchify.channel_order {
                             PatchChannelOrder::ChannelsFirst => {
-                                for channel in 0..3 {
+                                let mut emit_channel = |channel: usize| {
                                     let channel_offset = channel * width * height;
-                                    for _ in 0..patchify.temporal_patch_size {
-                                        for y in 0..patch_size {
-                                            let row = (patch_y * patch_size + y) * width;
-                                            let start = channel_offset + row + patch_x * patch_size;
-                                            patches.extend_from_slice(
-                                                &tile[start..start + patch_size],
-                                            );
+                                    for y in 0..patch_size {
+                                        let row = (patch_y * patch_size + y) * width;
+                                        let start = channel_offset + row + patch_x * patch_size;
+                                        patches.extend_from_slice(&tile[start..start + patch_size]);
+                                    }
+                                };
+                                match patchify.temporal_order {
+                                    PatchTemporalOrder::ChannelMajor => {
+                                        for channel in 0..3 {
+                                            for _ in 0..patchify.temporal_patch_size {
+                                                emit_channel(channel);
+                                            }
+                                        }
+                                    }
+                                    PatchTemporalOrder::TemporalMajor => {
+                                        for _ in 0..patchify.temporal_patch_size {
+                                            for channel in 0..3 {
+                                                emit_channel(channel);
+                                            }
                                         }
                                     }
                                 }
@@ -1287,6 +1299,7 @@ mod tests {
             temporal_patch_size: 2,
             merge_size: 1,
             channel_order,
+            temporal_order: PatchTemporalOrder::ChannelMajor,
             coordinate_order: CoordinateOrder::Yx,
         };
 
