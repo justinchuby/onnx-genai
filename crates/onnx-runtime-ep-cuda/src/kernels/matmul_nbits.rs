@@ -156,6 +156,29 @@ const GEMV_F16_GENERAL_BS_WIDE_MULTICOL_INTERLEAVED_ENTRY: &str =
 /// on symmetric weights. Enabled only when [`interleave_dequant_enabled`] is set.
 const GEMV_F16_GENERAL_BS_SPLITK_WIDE_INTERLEAVED_ENTRY: &str =
     "matmul_nbits_gemv_f16_general_bs_splitk_wide_interleaved";
+/// Multicol x split-K hybrid of [`GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY`]
+/// (`matmul_nbits_gemv_f16_general_bs_splitk_wide_multicol`): keeps the split-K
+/// grid-fill (K_SPLIT warps/column group, shared-memory fp32 partial reduction)
+/// but register-blocks [`GEMV_F16_WIDE_MULTICOL_NC`] output columns per warp, so
+/// each warp issues WIDE_NC independent 128-bit weight loads per chunk. This
+/// ports the gate_up `wide_multicol` kernel's memory-level parallelism (which
+/// runs at ~37% DRAM peak) to the grid-starved medium-N split-K projections
+/// (down_proj / qkv / attn-out) that the single-column split-K wide kernel left
+/// latency-bound at ~16% DRAM peak. A 256-thread CTA covers
+/// `(8 / K_SPLIT) * GEMV_F16_WIDE_MULTICOL_NC` output columns. Byte-identical to
+/// [`GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY`] (same per-lane depth0/stride, same
+/// per-column accumulation order, same K_SPLIT reduction order).
+const GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_ENTRY: &str =
+    "matmul_nbits_gemv_f16_general_bs_splitk_wide_multicol";
+/// Interleaved + biased (symmetric-only, OPT-IN) sibling of
+/// [`GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_ENTRY`]
+/// (`matmul_nbits_gemv_f16_general_bs_splitk_wide_multicol_interleaved`). Same
+/// multicol x split-K geometry, consumes offline nibble-interleaved weights and
+/// folds the symmetric -8 bias into the LOP3 converter. Byte-identical to the
+/// non-interleaved multicol split-K kernel on symmetric weights; enabled only
+/// when [`interleave_dequant_enabled`] is set.
+const GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_INTERLEAVED_ENTRY: &str =
+    "matmul_nbits_gemv_f16_general_bs_splitk_wide_multicol_interleaved";
 /// Offline int4 nibble-interleave pass entry
 /// (`matmul_nbits_interleave_int4`); runs once per weight into the cache buffer.
 const INTERLEAVE_INT4_ENTRY: &str = "matmul_nbits_interleave_int4";
@@ -172,6 +195,17 @@ const GEMV_F16_WIDE_MULTICOL_NC: usize = 4;
 /// latency-hiding target), which measured fastest (+9.7% decode vs single-warp);
 /// K_SPLIT=8 saturated.
 const GENERAL_BS_SPLITK: usize = 4;
+/// Warps cooperating per output column GROUP in the multicol x split-K hybrid
+/// GEMV (`matmul_nbits_gemv_f16_general_bs_splitk_wide_multicol`). Kept at 4
+/// (independent of [`GENERAL_BS_SPLITK`] so it can be tuned separately) because
+/// the hybrid register-blocks [`GEMV_F16_WIDE_MULTICOL_NC`] columns per warp
+/// (WIDE_NC independent weight-load streams supply the memory-level parallelism),
+/// so K_SPLIT only has to refill the grid. With WIDE_NC=4 a 256-thread CTA covers
+/// `(8 / K_SPLIT) * WIDE_NC` columns; K_SPLIT=4 lands N=4096 at ~1 wave and
+/// measured fastest — K_SPLIT=8 (~2 waves) regressed decode (the 8-way partial
+/// reduction + halved per-warp work outweighed the extra grid-fill). Must match
+/// `constexpr int K_SPLIT` in the `*_splitk_wide_multicol*` CUDA kernels.
+const GENERAL_BS_SPLITK_MULTICOL: usize = 4;
 /// Model-agnostic fp16 int4/int8 prefill GEMM for any power-of-two `block_size`.
 /// Mirrors [`GEMM_F16_ENTRY`] but walks `K` in fixed 32-wide tiles and computes
 /// `block = depth / block_size`, decoupling the tile width from the block width.
@@ -5232,6 +5266,155 @@ extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_splitk_wide_interlea
     }
 }
 
+// Multicol x split-K hybrid of `matmul_nbits_gemv_f16_general_bs_splitk_wide`.
+// Combines the split-K grid-fill (K_SPLIT warps cooperate on one column group,
+// summing their fp32 partials through shared memory) with the register-blocked
+// wide-load multicol dot (each warp accumulates WIDE_NC output columns, issuing
+// WIDE_NC independent 128-bit weight loads per chunk). The split-K path was
+// picked for the grid-starved medium-N projections (down_proj N~4096, qkv/attn-
+// out) *because* single-warp multicol under-fills the SMs there (~<1 wave); this
+// hybrid restores the multicol memory-level parallelism (the lever that lifts the
+// gate_up `wide_multicol` kernel to ~37% DRAM peak) WHILE keeping K_SPLIT so the
+// grid still fills the device. Each lane's fp32 partial for (column, ks) uses the
+// SAME depth0 (`ks*32*32 + lane*32`) and stride (`K_SPLIT*32*32`) as the
+// single-column split-K wide kernel, the per-column accumulation order inside
+// `gemv_int4_wide_lane_dot_multicol` is unchanged, and the K_SPLIT shared-memory
+// reduction order is unchanged, so the output is BYTE-IDENTICAL to
+// `matmul_nbits_gemv_f16_general_bs_splitk_wide`.
+extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_splitk_wide_multicol(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int bits)
+{
+    constexpr int K_SPLIT = 4;  // must match Rust GENERAL_BS_SPLITK_MULTICOL
+    // 256-thread CTA (8 warps) => MAX_COL_GROUPS column groups per block.
+    constexpr int MAX_COL_GROUPS = 8 / K_SPLIT;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int col_groups_per_block = warps_per_block / K_SPLIT;
+    const int group_local = warp / K_SPLIT;
+    const int ks = warp % K_SPLIT;
+    const long col_base =
+        ((long)blockIdx.x * col_groups_per_block + group_local) * (long)WIDE_NC;
+
+    __shared__ float partials[MAX_COL_GROUPS][WIDE_NC][K_SPLIT];
+
+    float values[WIDE_NC];
+    gemv_int4_wide_lane_dot_multicol(
+        activation, packed, scales, zero_points, k, block_size, k_blocks,
+        blob_size, zp_row_bytes, scales_fp16, col_base, n,
+        ks * 32 * 32 + lane * 32, K_SPLIT * 32 * 32, values);
+#pragma unroll
+    for (int c = 0; c < WIDE_NC; ++c) {
+        const float reduced = warp_sum(values[c]);
+        if (lane == 0) {
+            partials[group_local][c][ks] = reduced;
+        }
+    }
+    __syncthreads();
+    if (ks == 0 && lane == 0) {
+#pragma unroll
+        for (int c = 0; c < WIDE_NC; ++c) {
+            const long column = col_base + c;
+            if (column < n) {
+                float acc = 0.0f;
+#pragma unroll
+                for (int s = 0; s < K_SPLIT; ++s) {
+                    acc += partials[group_local][c][s];
+                }
+                output[column] = fold_bias_f16(acc, bias, column, bias_post_round);
+            }
+        }
+    }
+}
+
+// Interleaved + biased (symmetric-only, OPT-IN) sibling of
+// `matmul_nbits_gemv_f16_general_bs_splitk_wide_multicol`. Same multicol x
+// split-K geometry, but consumes offline nibble-interleaved weights and folds
+// the symmetric -8 bias inside the LOP3 converter (dropping the per-block
+// zero-point subtract and the `prmt.b32` activation reorder). Because each lane's
+// fp32 partial is bit-identical to the non-interleaved multicol dot on symmetric
+// weights and the K_SPLIT reduction order is unchanged, the output is
+// byte-identical to `matmul_nbits_gemv_f16_general_bs_splitk_wide_multicol`.
+// `zero_points`/`zp_row_bytes`/`bits` are accepted for launch-signature parity
+// but unused (the dispatch only routes symmetric int4 nodes here).
+extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_splitk_wide_multicol_interleaved(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int bits)
+{
+    (void)zero_points;
+    (void)zp_row_bytes;
+    (void)bits;
+    constexpr int K_SPLIT = 4;  // must match Rust GENERAL_BS_SPLITK_MULTICOL
+    constexpr int MAX_COL_GROUPS = 8 / K_SPLIT;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int col_groups_per_block = warps_per_block / K_SPLIT;
+    const int group_local = warp / K_SPLIT;
+    const int ks = warp % K_SPLIT;
+    const long col_base =
+        ((long)blockIdx.x * col_groups_per_block + group_local) * (long)WIDE_NC;
+
+    __shared__ float partials[MAX_COL_GROUPS][WIDE_NC][K_SPLIT];
+
+    float values[WIDE_NC];
+    gemv_int4_wide_lane_dot_multicol_interleaved(
+        activation, packed, scales, k, block_size, k_blocks,
+        blob_size, scales_fp16, col_base, n,
+        ks * 32 * 32 + lane * 32, K_SPLIT * 32 * 32, values);
+#pragma unroll
+    for (int c = 0; c < WIDE_NC; ++c) {
+        const float reduced = warp_sum(values[c]);
+        if (lane == 0) {
+            partials[group_local][c][ks] = reduced;
+        }
+    }
+    __syncthreads();
+    if (ks == 0 && lane == 0) {
+#pragma unroll
+        for (int c = 0; c < WIDE_NC; ++c) {
+            const long column = col_base + c;
+            if (column < n) {
+                float acc = 0.0f;
+#pragma unroll
+                for (int s = 0; s < K_SPLIT; ++s) {
+                    acc += partials[group_local][c][s];
+                }
+                output[column] = fold_bias_f16(acc, bias, column, bias_post_round);
+            }
+        }
+    }
+}
+
 // Column register-blocked wide-load GEMV (see `gemv_int4_wide_lane_dot_multicol`).
 // Same launch geometry as `matmul_nbits_gemv_f16_general_bs_wide` (256-thread
 // CTA, one warp per group), but every warp emits WIDE_NC output columns, so the
@@ -5693,6 +5876,25 @@ fn use_gemv_wideload(bits: usize, block_size: usize, k: usize) -> bool {
 fn use_gemv_wide_multicol() -> bool {
     !matches!(
         std::env::var("ONNX_GENAI_GEMV_WIDE_MULTICOL")
+            .ok()
+            .as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
+/// Whether the block!=32 general_bs split-K wide GEMV should take the multicol x
+/// split-K hybrid entry ([`GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_ENTRY`])
+/// instead of the single-column split-K wide entry
+/// ([`GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY`]). Only consulted once the split-K
+/// wide path is already selected (`use_general_splitk && use_gemv_wideload`). The
+/// hybrid register-blocks [`GEMV_F16_WIDE_MULTICOL_NC`] columns/warp to restore
+/// the memory-level parallelism the single-column split-K kernel lacks, while
+/// keeping K_SPLIT grid-fill; it is byte-identical to the single-column split-K
+/// wide entry. Default-on; `ONNX_GENAI_GEMV_SPLITK_MULTICOL=0` forces the
+/// single-column split-K wide entry for A/B measurement.
+fn use_gemv_splitk_multicol() -> bool {
+    !matches!(
+        std::env::var("ONNX_GENAI_GEMV_SPLITK_MULTICOL")
             .ok()
             .as_deref(),
         Some("0") | Some("false") | Some("off")
@@ -8817,7 +9019,11 @@ impl MatMulNBitsKernel {
             // correct for both symmetric (zp==8) and asymmetric layouts.
             if use_general_splitk {
                 if use_gemv_wideload(self.bits, self.block_size, self.k) {
-                    GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY
+                    if use_gemv_splitk_multicol() {
+                        GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_ENTRY
+                    } else {
+                        GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY
+                    }
                 } else {
                     GEMV_F16_GENERAL_BS_SPLITK_ENTRY
                 }
@@ -8897,6 +9103,8 @@ impl MatMulNBitsKernel {
         // multicol, asymmetric) is likewise left untouched.
         let interleaved_entry = if entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY {
             Some(GEMV_F16_GENERAL_BS_WIDE_MULTICOL_INTERLEAVED_ENTRY)
+        } else if entry == GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_ENTRY {
+            Some(GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_INTERLEAVED_ENTRY)
         } else if entry == GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY {
             Some(GEMV_F16_GENERAL_BS_SPLITK_WIDE_INTERLEAVED_ENTRY)
         } else {
@@ -8965,7 +9173,17 @@ impl MatMulNBitsKernel {
                 // block!=32 general_bs split-K uses GENERAL_BS_SPLITK. Both force
                 // the 256-thread path so `threads/32 >= K_SPLIT`.
                 let columns_per_block = if use_general_splitk {
-                    (threads / 32) as usize / GENERAL_BS_SPLITK
+                    // Split-K covers `warps / K_SPLIT` column groups; the multicol
+                    // hybrid register-blocks WIDE_NC output columns per group, so
+                    // it covers that many more columns per block.
+                    if entry == GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_ENTRY
+                        || entry == GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_INTERLEAVED_ENTRY
+                    {
+                        (threads / 32) as usize / GENERAL_BS_SPLITK_MULTICOL
+                            * GEMV_F16_WIDE_MULTICOL_NC
+                    } else {
+                        (threads / 32) as usize / GENERAL_BS_SPLITK
+                    }
                 } else if use_scales_f16_splitk {
                     (threads / 32) as usize / GEMV_F16_SCALES_F16_ZP_SPLITK
                 } else if entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
@@ -9010,6 +9228,8 @@ impl MatMulNBitsKernel {
             || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY
             || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_INTERLEAVED_ENTRY
             || entry == GEMV_F16_GENERAL_BS_SPLITK_WIDE_INTERLEAVED_ENTRY
+            || entry == GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_ENTRY
+            || entry == GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_INTERLEAVED_ENTRY
         {
             builder.arg(&bits);
         }
