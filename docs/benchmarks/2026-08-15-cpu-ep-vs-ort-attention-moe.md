@@ -3627,3 +3627,161 @@ the campaign, and it says that a large fraction of the per-cell readings in
 earlier phases — anything inside 0.72×–1.20× at t=32, or 0.69×–1.27× at t=4 —
 carried no information about the change being measured. The 5–15% movements
 tabulated in several earlier sections should be read with that in mind.
+
+## 37. Phase 17: two microkernels, and a control that failed (#1245, #1364)
+
+Phase 17 is two register-allocation changes in two kernels, and one methodology
+result that matters more than either of them. §36.3 established that a null arm
+is the only way to know what a reading means on this box. This phase ran null
+arms deliberately, and one of them came back **40% wide** — which is how a
+multi-threaded claim that looked real got withdrawn before it shipped.
+
+### 37.1 Softmax was paying for a polynomial split it did not need (#1245)
+
+`exp8` evaluated its minimax polynomial in the Cephes form: a degree-6
+polynomial split so that one `_mm256_mul_ps` and one `_mm256_add_ps` sit outside
+the FMA chain. Six FMAs plus a MUL plus an ADD is eight vector ops per lane.
+Refitting the same degree as a **pure Horner chain** makes it six FMAs and
+nothing else — a quarter of the vector work in the exp, on the kernel that
+§29 had already stripped a copy out of.
+
+Production-native, `--native-threads 1 --ort-intra-threads 1`, `native_min/ort_min`
+(lower is better), pass 1 = 24 reps:
+
+| model | before min/med | after min/med | Δ min | Δ med |
+| --- | --- | --- | --- | --- |
+| `sm_bert_b8_s128` | 1.445/1.486 | 1.287/1.340 | −10.97% | −9.89% |
+| `sm_decode_h32_kv1024` | 1.471/1.471 | 1.294/1.348 | −12.00% | −8.35% |
+| `sm_decode_h32_kv2048` | 1.484/1.533 | 1.318/1.383 | −11.17% | −9.78% |
+| `sm_decode_h32_kv4096` | 1.429/1.475 | 1.311/1.328 | −8.20% | −10.00% |
+| `sm_decode_h32_kv8192` | 1.472/1.534 | 1.266/1.329 | −13.99% | −13.33% |
+| `sm_prefill_h32_s512` | 1.377/1.396 | 1.185/1.247 | −13.96% | −10.63% |
+| `sm_whisper_cross` | 1.227/1.240 | 1.102/1.115 | −10.20% | −10.03% |
+
+A second independent pass (16 reps, rebuilt binaries) reproduced every sign:
+−3.50% to −12.75% on the min, −9.38% to −15.09% on the median. **7/7 models
+improved on both statistics in both passes**, `parity=PASS` in every cell.
+Softmax remains 1.10–1.38× ORT — the gap narrowed, it did not close.
+
+### 37.2 The accuracy contract, and the sweep that lied about it
+
+The claim attached to #1245 is that the new coefficients hold **1 ULP** against
+an `f64` reference across the entire domain softmax can present, which is
+`exp(v - max)` with `v - max ≤ 0`. That was checked by exhaustive sweep, not by
+sampling: 1,118,743,631 `f32` values, both polynomial forms compiled with the
+real intrinsics in a standalone harness. Old form max 1 ULP, new form max 1 ULP.
+
+The first run of that harness reported `max_ulp = 8388646`, and the harness was
+wrong, not the kernel. `exp8` clamps at `UNDERFLOW = -87.336544` and returns a
+hard `+0.0` at or below it; the `f64` reference returns `1.17e-38` there. A
+sweep that includes the flush threshold is comparing an approximation against a
+deliberate contract. The endpoint is now `UNDERFLOW.to_bits() - 1` and the
+threshold is a single module constant shared by the kernel clamp and the test,
+so the two cannot drift apart again.
+
+Mutation testing on the shipped test found real slack: perturbing `c2` gives
+`max_ulp = 6` and fails, but perturbing `c4` by a comparable amount stays at
+1 ULP *exhaustively* — it is a genuinely equivalent fit, not a hole in the test.
+The test bar is 2 ULP against a measured 1 ULP, so it is a strong falsifier only
+for corruption reaching 3 ULP.
+
+### 37.3 MoE prefill was losing on register allocation, not on blocking (#1364)
+
+§31.5 attributed the remaining MoE prefill loss to "microkernel efficiency
+against MLAS's packed panels and wider register tiles". That was right.
+
+`gemm_bt`'s `tile_4x2` keeps **k-partials in the SIMD lanes**, so every output
+cell ends in a horizontal reduction and the `b` side of the inner loop is
+strided by `k` — six loads per eight FMAs. The new `micro_6x16` holds twelve
+accumulators of **`c` columns**: no horizontal reduction anywhere, and each `k`
+step is two contiguous vector loads plus six broadcasts feeding twelve FMAs
+(1.5 FMA/load against 1.33). Feeding it needs one `bt` column panel transposed
+into micro-panel-major order — the only transpose in the path, bounded by the
+panel rather than the expert bank, reused by every row band in the sweep.
+
+Production-native, single thread, `t=512`, shipped binary (6 reps):
+
+| model | before min/med | after min/med | Δ min | Δ med |
+| --- | --- | --- | --- | --- |
+| `moe_phi35moe_h2048_i6400_e4_t512` | 1.356/1.399 | **1.009**/1.168 | −25.61% | −16.50% |
+| `moe_qwen3moe_h2048_i768_e16_t512` | 1.297/1.359 | **1.101**/1.143 | −15.12% | −15.92% |
+| `moe_mixtral_h1024_i3584_e8_t512` | 1.226/1.274 | **1.173**/1.238 | −4.27% | −2.85% |
+
+Four independent passes, Δ on the min ratio:
+
+| model | pass 1 | pass 2 | pass 3 | pass 4 (shipped) |
+| --- | --- | --- | --- | --- |
+| qwen3moe t512 | −16.7% | −23.4% | −19.6% | −15.1% |
+| phi35moe t512 | −16.9% | −24.9% | −27.6% | −25.6% |
+| mixtral t512 | −1.3% | −6.6% | −3.0% | −4.3% |
+
+Phi-3.5-MoE prefill reaches parity with ORT in the shipped pass; Qwen3-MoE lands
+at 1.10 from 1.30–1.54. **Mixtral barely moves, and that is expected rather than
+disappointing**: its expert bank is ~352 MB of fp32, so that shape is nearer
+DRAM-bound than microkernel-bound and a better inner loop has less to win.
+
+### 37.4 Two gates that were wrong, and the control that caught the second
+
+The packed path is gated on row-block height, because packing a panel costs
+`nc*k` strided moves that are repaid only across the `rows/PMR` bands that
+sweep it. Choosing that gate produced two negative results worth keeping.
+
+**Four bands (`rows ≥ 24`) looked fine single-threaded and lost ~29% on the
+8-thread Phi-3.5-MoE median.** At eight threads the driver slices `m=365` into
+24-row blocks, and `k=6400` narrows the panel to a single micro-panel, so each
+block re-packed 400 KB to feed four bands. Raising the gate to eight bands
+removed it.
+
+**Twelve bands (`rows ≥ 72`, above `MAX_MC`) was then adopted for a reason that
+is structural rather than measured** — and the measurement is why. At eight
+bands the 2-thread A/B showed Qwen3-MoE +10.9% and Phi-3.5-MoE +6.0% on the min,
+which reads as a real multi-threaded regression. It is not usable data. The
+null arm proves it: after raising the gate above `MAX_MC`, the two binaries are
+**traced to be on the identical code path at two threads** (every row block
+`rows=56..64`, `packed=false`, verified with an instrumented build) — and they
+still came out **~40% apart on the median**, in the *favourable* direction for
+the arm that had just been slower.
+
+So the shipped gate does not claim a multi-threaded win or deny a multi-threaded
+loss. It sits above `MAX_MC` so that the multi-threaded driver — which caps row
+blocks at `MAX_MC` and would have every block re-pack the same panel — cannot
+reach the packed kernel at all, and a `const` assertion pins that relationship
+against a future `MAX_MC` bump. Multi-threaded behaviour is byte-identical to
+before the change, for every shape.
+
+This is the second null-arm result in the campaign and it is worse than §36.3's.
+§36.3 measured ±20–30% at 32 threads on cells the change could not reach; this
+one measured ~40% at **two** threads on a code path proved identical by tracing.
+Low thread counts are not the quiet regime on a shared box — they are the regime
+where one noisy neighbour is a larger fraction of what is running.
+
+The `t=1` and `t=32` MoE rows are the same kind of control, and they behave the
+same way: traced row extents are 14–19, far below any gate, so those cells are
+the unpacked path in both arms. Their spread — ±10% on the min, ±3% on the
+median, sign flipping between passes — is a direct read of the noise floor for
+single-thread MoE cells.
+
+### 37.5 The two-pass online softmax stays unmerged
+
+`squad/leon-p21-softmax-2pass` replaced the 3-pass softmax row with the online
+(Welford-style) 2-pass formulation, which trades a second read of the row for a
+running rescale. It measured **2.4× worse** and is not merged. The reason it
+loses here is that §29 already removed the copy that made the extra pass
+expensive: the 3-pass row now re-reads a slice that is hot in L1, while the
+online form pays a multiply and a compare per element on the first pass. The
+branch is kept for the record; it should not be revived without a new reason.
+
+### 37.6 What this leaves
+
+Softmax is 1.10–1.38× ORT and MoE prefill is 1.01–1.17× at one thread. The
+remaining named gaps are unchanged from §31.8: `rope_*_s1` and `kvcat_p1023` at
+1.12–1.25× are per-call overhead rather than arithmetic, and phi35moe decode sits
+at 1.10×.
+
+Two follow-ups fall directly out of this phase. The first is sharing one packed
+panel across threads — either by packing once above the row-block loop, or by
+making `gemm_bt_col_parallel` the packed path, since each of its tasks already
+owns all `m` rows. It needs a quiet machine, not a better idea. The second is
+that **this document now has two independent measurements of its own instrument
+disagreeing with itself by 20–40%**, and every cross-arm claim in it that rests
+on a single pass without a null control should be read as provisional.
