@@ -49,10 +49,10 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
 use onnx_runtime_memory_governor::{
     AllocationChargeMode, AllocationPublication, AllocationReleaseOutcome, AllocationRequest,
-    AllocationSettlementToken, AllocationStepError, AllocationTransactionError, BindingError,
-    DeviceAllocator, MemoryRole, OwningAllocation, ProcessMemoryManager, RegisteredMemoryAuthority,
-    RegisteredMemoryContext, RegisteredMemoryHolder, RegisteredMemoryMechanism,
-    ScopedMemoryBinding, ScopedVirtualBacking,
+    AllocationSettlementStatus, AllocationSettlementToken, AllocationSettlementWait,
+    AllocationStepError, AllocationTransactionError, BindingError, DeviceAllocator, MemoryRole,
+    OwningAllocation, ProcessMemoryManager, RegisteredMemoryAuthority, RegisteredMemoryContext,
+    RegisteredMemoryHolder, RegisteredMemoryMechanism, ScopedMemoryBinding, ScopedVirtualBacking,
 };
 
 use crate::deferred_release::{
@@ -378,6 +378,71 @@ struct TeardownTrackedAllocator {
     _completion: AllocatorTeardownCompletion,
 }
 
+#[derive(Debug, Default)]
+struct WorkspaceReleaseBarrier {
+    pending:
+        Mutex<HashMap<onnx_runtime_memory_governor::AllocationIdentity, AllocationSettlementWait>>,
+}
+
+impl WorkspaceReleaseBarrier {
+    fn capture(&self, workspace: &WorkspaceAllocation) -> bool {
+        let Some(wait) = workspace.buffer().managed_settlement_wait() else {
+            return false;
+        };
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(wait.identity(), wait);
+        true
+    }
+
+    fn wait(&self, timeout: std::time::Duration) -> Option<AllocationSettlementStatus> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let waits = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            if waits.is_empty() {
+                return None;
+            }
+            let mut released = Vec::new();
+            let mut retained = None;
+            let mut pending_status = false;
+            for wait in waits {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match wait.wait(remaining) {
+                    AllocationSettlementStatus::Released => released.push(wait.identity()),
+                    AllocationSettlementStatus::Retained(state) => {
+                        retained.get_or_insert(state);
+                    }
+                    AllocationSettlementStatus::Pending => pending_status = true,
+                }
+            }
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for identity in released {
+                pending.remove(&identity);
+            }
+            if let Some(state) = retained {
+                return Some(AllocationSettlementStatus::Retained(state));
+            }
+            if pending_status || std::time::Instant::now() >= deadline {
+                return Some(AllocationSettlementStatus::Pending);
+            }
+            if pending.is_empty() {
+                return Some(AllocationSettlementStatus::Released);
+            }
+            drop(pending);
+        }
+    }
+}
+
 impl std::fmt::Debug for TeardownTrackedAllocator {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -509,7 +574,7 @@ pub struct CudaExecutionProvider {
     /// already-accepted releases keep running on the queue.
     closed: AtomicBool,
     memory_cleanup_armed: AtomicBool,
-    workspace_release_pending: AtomicBool,
+    workspace_release_barrier: WorkspaceReleaseBarrier,
     registry: OpRegistry,
     csa_metrics: Arc<CsaMetrics>,
     /// Device weight-offload policy resolved from the environment. When enabled,
@@ -749,7 +814,7 @@ impl CudaExecutionProvider {
             initialized: false,
             closed: AtomicBool::new(false),
             memory_cleanup_armed: AtomicBool::new(false),
-            workspace_release_pending: AtomicBool::new(false),
+            workspace_release_barrier: WorkspaceReleaseBarrier::default(),
             registry,
             csa_metrics,
             offload_policy,
@@ -1613,20 +1678,21 @@ impl CudaExecutionProvider {
     }
 
     fn wait_for_workspace_release_barrier(&self) -> Result<()> {
-        if !self.workspace_release_pending.load(Ordering::Acquire) {
-            return Ok(());
-        }
         const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-        if !self.release_queue.wait_until_idle(WAIT) {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: workspace replacement waited {WAIT:?} for the old stream-ordered \
-                 release, but ownership remains pending; replacement admission is refused and \
-                 later workspace allocations remain gated"
-            )));
+        match self.workspace_release_barrier.wait(WAIT) {
+            None | Some(AllocationSettlementStatus::Released) => Ok(()),
+            Some(AllocationSettlementStatus::Pending) => Err(EpError::KernelFailed(format!(
+                "cuda_ep: workspace replacement timed out after {WAIT:?} waiting for its prior \
+                 allocation-specific settlement; this error is retryable and unrelated deferred \
+                 releases do not participate in the barrier"
+            ))),
+            Some(AllocationSettlementStatus::Retained(state)) => {
+                Err(EpError::KernelFailed(format!(
+                    "cuda_ep: prior workspace release settled as {state:?} with ownership retained; \
+                     replacement admission remains closed for those still-charged bytes"
+                )))
+            }
         }
-        self.workspace_release_pending
-            .store(false, Ordering::Release);
-        Ok(())
     }
 
     /// Drop the device residency cache so every page it holds enqueues its
@@ -2191,25 +2257,18 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn deallocate_workspace(&self, workspace: WorkspaceAllocation) -> Result<()> {
+        let captured = self.workspace_release_barrier.capture(&workspace);
         let (buffer, lease) = workspace.into_parts();
-        match self.deallocate(buffer) {
-            Ok(()) => {
-                // Every later workspace admission, including a new step with an
-                // empty slot, must cross the stream-ordered release barrier.
-                self.workspace_release_pending
-                    .store(true, Ordering::Release);
-                if let Some(lease) = lease {
-                    std::mem::forget(lease);
-                }
-                Ok(())
-            }
-            Err(error) => {
-                if let Some(lease) = lease {
-                    std::mem::forget(lease);
-                }
-                Err(error)
-            }
-        }
+        assert!(
+            lease.is_none(),
+            "CUDA manager-backed workspace must keep accounting in ManagedAllocation, not an outer \
+             compatibility lease"
+        );
+        assert!(
+            captured,
+            "CUDA workspace must carry allocation-specific manager settlement"
+        );
+        self.deallocate(buffer)
     }
 
     fn allocate_committed(
@@ -2494,10 +2553,6 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()> {
         self.deallocate_with_unmapped(buffer).map(|_| ())
-    }
-
-    fn deallocation_settles_before_return(&self) -> bool {
-        false
     }
 
     /// Hand final ownership to the deferred queue, ordered after both streams.
@@ -3081,6 +3136,217 @@ impl Drop for CudaExecutionProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct WorkspaceTestPin;
+
+    fn managed_host_workspace(bytes: usize) -> WorkspaceAllocation {
+        use onnx_runtime_memory_governor::{
+            AllocationPublication, AllocationRequest, DeviceKey, HostAllocator, LeaseLedger,
+            LedgerGovernor, MemoryGovernor, MemoryRole, ProcessMemoryManager, Tier,
+        };
+
+        let manager = ProcessMemoryManager::new().unwrap();
+        let context = manager
+            .register_provider_context(DeviceKey::HOST, "test context", Arc::new(WorkspaceTestPin))
+            .unwrap();
+        let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+            DeviceKey::HOST,
+            0,
+            4096,
+            0,
+        )));
+        let authority = manager
+            .register_authority(
+                DeviceKey::HOST,
+                "test authority",
+                Arc::new(WorkspaceTestPin),
+                governor as Arc<dyn MemoryGovernor + Send + Sync>,
+            )
+            .unwrap();
+        let holder = manager
+            .register_holder(&authority, "test workspace", None)
+            .unwrap();
+        let mechanism = manager
+            .register_allocator(
+                &context,
+                &authority,
+                "host allocator",
+                Arc::new(HostAllocator),
+            )
+            .unwrap();
+        let owner = manager
+            .bind_registered(&mechanism)
+            .unwrap()
+            .allocate(
+                AllocationRequest::managed(
+                    bytes,
+                    16,
+                    Tier::Host,
+                    MemoryRole::Workspace { step_scoped: true },
+                    holder,
+                    bytes as u64,
+                ),
+                AllocationPublication::exclusive(bytes as u64, bytes as u64, bytes as u64),
+            )
+            .unwrap();
+        WorkspaceAllocation::new(
+            DeviceBuffer::from_managed_allocation(owner, DeviceId::cpu()),
+            None,
+        )
+    }
+
+    fn release_managed_workspace(workspace: WorkspaceAllocation) {
+        let (buffer, lease) = workspace.into_parts();
+        assert!(lease.is_none());
+        let BoundBufferOwnership::Managed(owner) = buffer.into_bound_owner().unwrap() else {
+            panic!("test workspace lost manager ownership");
+        };
+        assert!(owner.release_now().unwrap().is_complete());
+    }
+
+    #[derive(Debug)]
+    struct TestReleaseFence(bool);
+
+    impl crate::deferred_release::ReleaseFence for TestReleaseFence {
+        fn is_complete(&self) -> bool {
+            self.0
+        }
+    }
+
+    #[derive(Debug)]
+    struct SequencedFenceSource {
+        recorded: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::deferred_release::ReleaseFenceSource for SequencedFenceSource {
+        fn record(
+            &self,
+        ) -> std::result::Result<Vec<Box<dyn crate::deferred_release::ReleaseFence>>, String>
+        {
+            let index = self
+                .recorded
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(vec![Box::new(TestReleaseFence(index != 0))])
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnrelatedRelease;
+
+    impl crate::deferred_release::DeferredReleaseAction for UnrelatedRelease {
+        fn execute(self: Box<Self>) -> crate::deferred_release::DeferredActionOutcome {
+            crate::deferred_release::DeferredActionOutcome::released(0)
+        }
+
+        fn label(&self) -> &'static str {
+            "unrelated"
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestSettlementObserver(AllocationSettlementToken);
+
+    impl ReleaseObserver for TestSettlementObserver {
+        fn released(&self, outcome: &AllocationReleaseOutcome) {
+            // SAFETY: this observer is enqueued with the exact prepared release
+            // paired with this token below.
+            unsafe { self.0.settle(outcome) };
+        }
+    }
+
+    fn enqueue_managed_workspace_release(
+        queue: &CudaDeferredReleaseQueue,
+        workspace: WorkspaceAllocation,
+    ) {
+        let (buffer, lease) = workspace.into_parts();
+        assert!(lease.is_none());
+        let BoundBufferOwnership::Managed(owner) = buffer.into_bound_owner().unwrap() else {
+            panic!("test workspace lost manager ownership");
+        };
+        let prepared = owner.prepare_release().unwrap();
+        // SAFETY: the request and token remain paired in the observer.
+        let (request, settlement) = unsafe { prepared.into_parts() };
+        queue
+            .enqueue_prepared(request, Some(Arc::new(TestSettlementObserver(settlement))))
+            .unwrap();
+    }
+
+    #[test]
+    fn workspace_barrier_ignores_unrelated_pending_queue_entries() {
+        let queue = CudaDeferredReleaseQueue::manual(
+            Box::new(SequencedFenceSource {
+                recorded: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            4,
+        );
+        queue.enqueue(UnrelatedRelease).unwrap();
+
+        let barrier = WorkspaceReleaseBarrier::default();
+        let workspace = managed_host_workspace(128);
+        assert!(barrier.capture(&workspace));
+        enqueue_managed_workspace_release(&queue, workspace);
+        assert_eq!(queue.pending(), 2);
+        assert_eq!(queue.poll(), 1, "only the workspace release is ready");
+
+        assert_eq!(
+            barrier.wait(std::time::Duration::from_millis(10)),
+            Some(AllocationSettlementStatus::Released)
+        );
+        assert_eq!(
+            queue.pending(),
+            1,
+            "the same queue still holds the unrelated deferred release"
+        );
+    }
+
+    #[test]
+    fn workspace_barrier_timeout_is_retryable_after_specific_settlement() {
+        let barrier = WorkspaceReleaseBarrier::default();
+        let workspace = managed_host_workspace(128);
+        assert!(barrier.capture(&workspace));
+
+        assert_eq!(
+            barrier.wait(std::time::Duration::ZERO),
+            Some(AllocationSettlementStatus::Pending)
+        );
+        release_managed_workspace(workspace);
+        assert_eq!(
+            barrier.wait(std::time::Duration::from_millis(10)),
+            Some(AllocationSettlementStatus::Released),
+            "a later admission retries the same allocation-specific settlement"
+        );
+
+        let later = managed_host_workspace(128);
+        assert!(barrier.capture(&later));
+        release_managed_workspace(later);
+        assert_eq!(
+            barrier.wait(std::time::Duration::from_millis(10)),
+            Some(AllocationSettlementStatus::Released),
+            "a transient timeout must not permanently disable later workspaces"
+        );
+    }
+
+    #[test]
+    fn workspace_barrier_keeps_every_concurrent_release_identity() {
+        let barrier = WorkspaceReleaseBarrier::default();
+        let first = managed_host_workspace(128);
+        let second = managed_host_workspace(128);
+        assert!(barrier.capture(&first));
+        assert!(barrier.capture(&second));
+
+        release_managed_workspace(second);
+        assert_eq!(
+            barrier.wait(std::time::Duration::ZERO),
+            Some(AllocationSettlementStatus::Pending),
+            "one released workspace must not erase another pending identity"
+        );
+        release_managed_workspace(first);
+        assert_eq!(
+            barrier.wait(std::time::Duration::from_millis(10)),
+            Some(AllocationSettlementStatus::Released)
+        );
+    }
 
     #[test]
     #[should_panic(expected = "refusing to commit a buffer from device")]

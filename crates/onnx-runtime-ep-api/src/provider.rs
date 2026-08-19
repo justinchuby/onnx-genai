@@ -302,6 +302,13 @@ impl DeviceBuffer {
         }
     }
 
+    /// Allocation-specific release settlement when this buffer is manager-owned.
+    pub fn managed_settlement_wait(
+        &self,
+    ) -> Option<onnx_runtime_memory_governor::AllocationSettlementWait> {
+        self.managed_owner().map(ManagedAllocation::settlement_wait)
+    }
+
     /// Consume the handle and recover its complete binding-issued ownership.
     ///
     /// This is the only way a bound buffer's ownership leaves the handle, and it
@@ -438,6 +445,32 @@ impl BoundBufferOwnership {
 pub struct WorkspaceAllocation {
     buffer: DeviceBuffer,
     lease: Option<MemoryLease>,
+}
+
+static QUARANTINED_WORKSPACE_LEASES: std::sync::OnceLock<std::sync::Mutex<Vec<MemoryLease>>> =
+    std::sync::OnceLock::new();
+
+fn quarantine_failed_workspace_lease(lease: MemoryLease) {
+    eprintln!(
+        "execution provider workspace deallocation failed before physical release was proven; \
+         retaining its {} byte {:?} lease in compatibility quarantine",
+        lease.bytes(),
+        lease.tier()
+    );
+    QUARANTINED_WORKSPACE_LEASES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(lease);
+}
+
+#[cfg(test)]
+fn quarantined_workspace_lease_count() -> usize {
+    QUARANTINED_WORKSPACE_LEASES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
 }
 
 impl WorkspaceAllocation {
@@ -887,35 +920,21 @@ pub trait ExecutionProvider: Send + Sync {
     /// Free device memory.
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()>;
 
-    /// Whether `deallocate` proves physical release before returning `Ok`.
-    ///
-    /// Providers that only enqueue release return `false`. A compatibility
-    /// workspace lease then fails closed instead of refunding bytes whose
-    /// terminal outcome is not observable through this legacy API.
-    fn deallocation_settles_before_return(&self) -> bool {
-        true
-    }
-
     /// Release an executor workspace and then its compatibility lease.
     ///
-    /// Manager-aware buffers carry no outer lease: their settlement token keeps
-    /// the charge until the provider's actual structured release outcome.
+    /// The default is only for providers whose `deallocate` settles synchronously.
+    /// An asynchronous provider must override this method and keep accounting
+    /// attached to its own structured settlement.
     fn deallocate_workspace(&self, workspace: WorkspaceAllocation) -> Result<()> {
         let (buffer, lease) = workspace.into_parts();
         match self.deallocate(buffer) {
-            Ok(()) if self.deallocation_settles_before_return() => {
-                drop(lease);
-                Ok(())
-            }
             Ok(()) => {
-                if let Some(lease) = lease {
-                    Box::leak(Box::new(lease));
-                }
+                drop(lease);
                 Ok(())
             }
             Err(error) => {
                 if let Some(lease) = lease {
-                    Box::leak(Box::new(lease));
+                    quarantine_failed_workspace_lease(lease);
                 }
                 Err(error)
             }
@@ -1583,6 +1602,32 @@ mod tests {
         };
         owner.release_now().unwrap();
         assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn failed_workspace_deallocation_quarantine_keeps_compatibility_charge() {
+        use onnx_runtime_memory_governor::{
+            DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
+        };
+
+        let governor =
+            LedgerGovernor::new(LeaseLedger::new_for_device(DeviceKey::HOST, 0, 1024, 0));
+        let lease = governor
+            .reserve(
+                Tier::Host,
+                64,
+                MemoryRole::Workspace { step_scoped: true },
+                HolderId::new(9),
+            )
+            .unwrap();
+        let before = quarantined_workspace_lease_count();
+        quarantine_failed_workspace_lease(lease);
+        assert_eq!(quarantined_workspace_lease_count(), before + 1);
+        assert_eq!(
+            governor.used(Tier::Host),
+            64,
+            "failed deallocation must not advertise unsettled bytes as free"
+        );
     }
 
     #[test]

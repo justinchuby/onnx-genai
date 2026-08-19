@@ -94,11 +94,12 @@ pub use large_alloc_cache::{
     MAX_CACHED_BYTES, calibrate_floor_bytes, calibrated_floor_bytes, default_budget_bytes,
 };
 pub use manager::{
-    AllocationChargeMode, AllocationPublication, AllocationRequest, AllocationSettlementToken,
-    AllocationStepError, AllocationTransactionError, AuthorityMemorySnapshot, DeviceLossListener,
-    ManagedAllocation, ManagedAllocationSnapshot, ManagedAllocationState, ManagedPreparedRelease,
-    ManagedReleaseError, MemoryContextOperation, MemoryContextScope, ProcessAuthorityId,
-    ProcessMemoryLimits, ProcessMemoryManager, ProcessMemorySnapshot, RegisteredMemoryAuthority,
+    AllocationChargeMode, AllocationPublication, AllocationRequest, AllocationSettlementStatus,
+    AllocationSettlementToken, AllocationSettlementWait, AllocationStepError,
+    AllocationTransactionError, AuthorityMemorySnapshot, DeviceLossListener, ManagedAllocation,
+    ManagedAllocationSnapshot, ManagedAllocationState, ManagedPreparedRelease, ManagedReleaseError,
+    MemoryContextOperation, MemoryContextScope, ProcessAuthorityId, ProcessMemoryLimits,
+    ProcessMemoryManager, ProcessMemorySnapshot, RegisteredMemoryAuthority,
     RegisteredMemoryContext, RegisteredMemoryHolder, RegisteredMemoryMechanism,
     ScopedAllocationContext, ScopedMemoryBinding, ScopedVirtualBacking, SharedPhysicalIdentity,
     WeakProcessMemoryManager,

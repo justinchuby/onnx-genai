@@ -2680,6 +2680,45 @@ impl ChargeCell {
             shared_physical: state.shared_physical,
         }
     }
+
+    fn settlement_status(state: ManagedAllocationState) -> AllocationSettlementStatus {
+        match state {
+            ManagedAllocationState::Released | ManagedAllocationState::ContextTerminated => {
+                AllocationSettlementStatus::Released
+            }
+            ManagedAllocationState::Quarantined | ManagedAllocationState::DeviceLost => {
+                AllocationSettlementStatus::Retained(state)
+            }
+            ManagedAllocationState::Provisional
+            | ManagedAllocationState::Live
+            | ManagedAllocationState::Queued
+            | ManagedAllocationState::Settling => AllocationSettlementStatus::Pending,
+        }
+    }
+
+    fn wait_for_settlement(&self, timeout: std::time::Duration) -> AllocationSettlementStatus {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self.lock();
+        loop {
+            let status = Self::settlement_status(state.state);
+            if status != AllocationSettlementStatus::Pending {
+                return status;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return AllocationSettlementStatus::Pending;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next, wait) = self
+                .wake
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            if wait.timed_out() {
+                return Self::settlement_status(state.state);
+            }
+        }
+    }
 }
 
 impl Drop for ChargeCell {
@@ -2875,6 +2914,34 @@ pub struct ManagedAllocation {
     settlement: AllocationSettlementToken,
 }
 
+/// Result of waiting for one allocation's structured release settlement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocationSettlementStatus {
+    Pending,
+    Released,
+    Retained(ManagedAllocationState),
+}
+
+/// Cloneable, allocation-specific settlement waiter.
+#[derive(Clone, Debug)]
+pub struct AllocationSettlementWait {
+    charge: Arc<ChargeCell>,
+}
+
+impl AllocationSettlementWait {
+    pub fn identity(&self) -> AllocationIdentity {
+        self.charge.snapshot().identity
+    }
+
+    pub fn status(&self) -> AllocationSettlementStatus {
+        ChargeCell::settlement_status(self.charge.snapshot().state)
+    }
+
+    pub fn wait(&self, timeout: std::time::Duration) -> AllocationSettlementStatus {
+        self.charge.wait_for_settlement(timeout)
+    }
+}
+
 impl ManagedAllocation {
     fn owner(&self) -> &OwningAllocation {
         self.owner
@@ -2904,6 +2971,13 @@ impl ManagedAllocation {
 
     pub fn owner_ref(&self) -> &OwningAllocation {
         self.owner()
+    }
+
+    /// Allocation-specific settlement observation for replacement admission.
+    pub fn settlement_wait(&self) -> AllocationSettlementWait {
+        AllocationSettlementWait {
+            charge: Arc::clone(&self.settlement.charge),
+        }
     }
 
     pub fn view(
