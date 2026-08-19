@@ -420,9 +420,10 @@ unsafe fn softmax_row_scalar(src: *const f32, dst: *mut f32, d: usize) {
 /// a degree-6 minimax polynomial on `r` in pure Horner form, then scale by
 /// `2^k`. The polynomial's two leading terms are pinned to the exact `1 + r`
 /// (`c0 = c1 = 1.0`), so the whole `exp8` is accurate to 1 ULP against an f64
-/// reference over the softmax domain `[-87.336, 0]` (measured exhaustively) -
-/// comfortably inside the `1e-6` softmax tolerance the tests assert against
-/// libm. Because softmax only ever evaluates `exp(v - max)`
+/// reference over the softmax domain `(-87.336544, 0]` (measured exhaustively,
+/// all 1.118e9 f32 values) - comfortably inside the `1e-6` softmax tolerance
+/// the tests assert against libm. Because softmax only ever evaluates
+/// `exp(v - max)`
 /// with `v - max <= 0`, the reduced argument never overflows; the non-finite
 /// lanes (`-inf` -> `0`, `NaN` -> `NaN`) are patched explicitly so a fully
 /// masked row still normalizes to `NaN` and a partially masked row's masked
@@ -444,6 +445,13 @@ mod softmax_avx2 {
     pub fn available() -> bool {
         std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
     }
+
+    /// At and below this argument, f32 `exp` has underflowed to the (sub)normals
+    /// we flush to `0`; `-inf` lands here too and must become exactly `0`. One
+    /// source of truth for [`exp8`]'s clamp and for the accuracy test's domain
+    /// endpoint, so the two cannot drift apart.
+    #[allow(clippy::excessive_precision)]
+    const UNDERFLOW: f32 = -87.336_544_f32;
 
     /// `exp` on eight lanes for the softmax domain (`x <= 0`, plus `-inf`/`NaN`).
     ///
@@ -474,7 +482,7 @@ mod softmax_avx2 {
 
         // Below this, f32 `exp` has underflowed to (sub)normals we flush to
         // 0; `-inf` lands here too and must become exactly 0.
-        let underflow = _mm256_set1_ps(-87.336_544_f32);
+        let underflow = _mm256_set1_ps(UNDERFLOW);
 
         let is_nan = _mm256_cmp_ps::<_CMP_UNORD_Q>(x, x);
         // Ordered `<=` so `NaN` reports false here (it is handled above).
@@ -615,10 +623,14 @@ mod softmax_avx2 {
     /// reference and pins the 1-ULP accuracy the polynomial was fitted for.
     ///
     /// The sweep is strided rather than exhaustive so it stays a fast unit test;
-    /// an offline exhaustive sweep over all 1.1e9 f32 values in `[-87.336, 0]`
-    /// confirms the same 1-ULP bound. The stride is coprime with 8 so every lane
-    /// position sees the whole domain, and the near-zero and near-underflow ends
-    /// (where the two candidate error regimes live) are both densely covered.
+    /// an offline exhaustive sweep over all 1.118e9 f32 values in the nonzero
+    /// domain `(-87.336544, 0]` confirms the same 1-ULP bound. Each lane marches
+    /// by `8 * stride`, so every lane position traverses the whole domain, and
+    /// the near-zero and near-underflow ends (where the two candidate error
+    /// regimes live) are both densely covered. The endpoint stops one ULP short
+    /// of the flush-to-zero threshold: at and below it `exp8` deliberately
+    /// returns exactly `0`, which is a contract the row-level tests police, not
+    /// an approximation error this bar applies to.
     #[cfg(test)]
     #[test]
     fn exp8_stays_within_two_ulp_of_the_f64_reference() {
@@ -626,8 +638,10 @@ mod softmax_avx2 {
             return;
         }
         let lo = 0x8000_0000u32; // -0.0
-        let hi = (-87.336_f32).to_bits(); // review domain endpoint
-        let stride = 1097u32; // coprime with 8; ~1M samples across the domain
+        // One ULP inside the flush-to-zero threshold, i.e. the most negative
+        // argument `exp8` still approximates rather than forces to `0`.
+        let hi = UNDERFLOW.to_bits() - 1;
+        let stride = 1097u32; // ~1M samples across the domain
         let mut max_ulp = 0u32;
         let mut worst = 0.0f32;
         let mut b = lo;
