@@ -4360,3 +4360,95 @@ requires the row to stay finite. The same shape of hole appeared in #1402: no
 test shape produced a short final column panel, because the panel width is
 derived from `n16` and the thread count and the natural shapes divide evenly.
 Both were found by mutation, not by reading.
+
+## 43. The fourth instance §40 predicted, and it was the unit rather than the value (#1484)
+
+§40 was written so that "the fourth instance is recognised rather than
+re-derived". This is that instance, found six days later, and it is recorded
+here because it arrived with a variant §40 did not cover.
+
+### 43.1 The finding
+
+`parallel_rows_per_task` in the softmax kernel refused to fan out below
+`MIN_PARALLEL_SOFTMAX_ROWS = 64` rows. Decode attention softmax is
+`n = heads` by `d = kv_len`, so a 32-head model sat below that floor at **every**
+key length and **every** pool width. Measured on a pure-native default build, our
+native p50 was flat from one thread to eight while ORT parallelised:
+
+| fixture | t=1 | t=2 | t=4 | t=8 |
+| --- | --- | --- | --- | --- |
+| `sm_decode_h32_kv1024` | 0.031 ms | 0.031 ms | 0.031 ms | 0.031 ms |
+| `sm_decode_h32_kv8192` | 0.208 ms | 0.209 ms | 0.210 ms | 0.211 ms |
+
+That flatness *was* the multi-thread `ours/ORT` gap on these fixtures. Removing
+the row floor and keeping the adjacent element floor moved native time down
+29.9%-43.6% wherever the fan-out engages, and the ratio with it: −53.9% at
+kv4096 t=8, −44.1% at kv2048 t=8, −39.9% at kv8192 t=8, −23.2% at kv1024 t=2.
+
+### 43.2 The variant: the constant was calibrated in the right regime, in the wrong unit
+
+§40.2 says the three earlier instances were all "correct when set, and became
+wrong because a different regime started using the same path". This one is not
+quite that. A row floor is never right, in any regime, because **a row is not a
+unit of work** — `n` prices work only if `d` is held fixed, and `d` is the key
+length, which is the one thing that varies most in attention. The floor was a
+proxy for "enough work to amortise the pool wake-up", and the predicate it sat in
+*already contained the honest form of that question* one line below, as
+`MIN_PARALLEL_SOFTMAX_ELEMENTS`. Two thresholds for one question, one of them
+dimensionally wrong, and the wrong one bound first.
+
+So §40.3's practice — record the regime next to the constant — would not have
+prevented this. The regime was fine. The check to add is narrower and cheaper:
+**a threshold should be expressed in the unit of the thing it is protecting.**
+Wake-up cost is amortised by work, so the gate is priced in elements. When two
+thresholds guard one decision, ask whether the weaker one is a proxy for the
+stronger, and if it is, delete it rather than tuning it.
+
+The widening is safe for a reason worth stating in the same unit: chunks are
+sized by `ROW_TILE_BYTES`, not by pool width, so the newly-admitted `32 x 8192`
+yields 32 chunks of 8192 elements — exactly what the already-admitted `64 x 256`
+yields. The smallest total work admitted is unchanged at 16384 elements and the
+smallest per-chunk work is unchanged at 4097. Nothing new is admitted *per
+worker*; only the row-shaped refusal is gone.
+
+### 43.3 A gate whose effect is numerically invisible needs its wiring tested
+
+The more transferable lesson is a testing one, and it repeats §42's "a test that
+cannot fail is worse than no test" in a new form.
+
+Softmax rows are independent, so **the output is bit-identical whether or not the
+fan-out happens**. Every correctness test in the file is therefore blind to the
+gate by construction. Review demonstrated the consequence: inverting the caller's
+use of the predicate — which pins every large softmax back to a single thread and
+undoes the entire change — left all 1448 tests passing. The new unit test did not
+catch it either, because it exercised the predicate in isolation rather than
+through its caller.
+
+A performance gate has no numerical signature, so it must be asserted directly:
+the test now pins `parallel_rows_per_task`'s `Some`/`None` decision, not just the
+predicate's boolean. Its refusals hold at any pool width and run everywhere; the
+fan-out half returns early below two lanes, matching the existing
+`parallel_output_rows_dispatches_to_the_task_runtime`.
+
+Two further mutations were needed to pin the floor honestly. Asserting the
+boundary at `MIN` and `MIN-2` let a floor relaxed to `MIN-1` survive; `3 x 5461`
+is one element short and now straddles it exactly. And `saturating_mul` is
+load-bearing rather than defensive: it clamps *upward*, so an unrepresentable
+element count reads as "plenty of work" and fans out, where a wrapping multiply
+reads as "none" and would silently pin the largest tensors in the system to one
+thread. The first draft of that assertion had the sign backwards, and the test
+caught its own author.
+
+### 43.4 Reporting note
+
+The benchmark host was heavily contended during this run — A/A null controls
+reached 61% on some cells, against ≤2.5% for most cells in the §42 run, and
+absolute times inflated ~35%. Per §39.3 the control is the arbiter, and the
+honest read here came from structure rather than from the grid: only four of the
+seven softmax fixtures change gate decision at all. `sm_bert_b8_s128` (n=12288),
+`sm_prefill_h32_s512` (n=16384) and `sm_whisper_cross` (n=30000) cleared the old
+row floor already, so the predicate returns the same value before and after and
+their code path cannot change. Their scatter — up to +31.1% at prefill t=8,
+against a 31.41% A/A floor — is a calibration of the host, not a result, and is
+reported as such. When a host is too noisy to measure, knowing which cells
+*cannot* have moved is worth more than more trials.
