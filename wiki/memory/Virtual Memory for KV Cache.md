@@ -10,11 +10,12 @@ tags:
   - cuda
   - virtual-memory
 status: maintained
+lang: zh-CN
 created: 2026-08-19
 updated: 2026-08-19
 ---
 
-# 虚拟内存在 KV Cache 管理中的应用
+# Virtual Memory for KV Cache
 
 > [!summary] 本文回答的问题
 > 显存的虚拟内存管理器,在 KV cache 增长、前缀共享、一份物理内存被多处映射、

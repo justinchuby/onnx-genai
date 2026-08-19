@@ -11,11 +11,12 @@ tags:
   - kv-cache
   - kernel-cache
 status: maintained
+lang: zh-CN
 created: 2026-08-19
 updated: 2026-08-19
 ---
 
-# 分块 Prefill,以及为什么查询轴必须补齐
+# Chunked Prefill
 
 > [!summary] 本文回答的问题
 > Prefill 为什么可以按块喂进模型,而不需要"所有 KV 都参与"?分块换来了什么?
