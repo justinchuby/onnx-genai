@@ -429,7 +429,7 @@ mod tests {
     /// that arithmetic makes a row attend to the wrong keys and shows up here.
     #[test]
     fn sdpa_masked_broadcast_matches_reference_across_parallel_chunks() {
-        // rows = b*h*sq = 512 (> MIN_PARALLEL_SOFTMAX_ROWS) and
+        // rows = b*h*sq = 512 and
         // rows*sk = 524288 (> MIN_PARALLEL_SOFTMAX_ELEMENTS), so the work is
         // split across workers. A 1024-key row is 4 KiB, so a `ROW_TILE_BYTES`
         // tile holds only 8 rows and every worker also loops over tiles —

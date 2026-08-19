@@ -158,8 +158,13 @@ impl Kernel for ReduceKernel {
         if matches!(self.op, ReduceOp::Max | ReduceOp::Min) && inputs[0].dtype == DataType::Bool {
             return self.execute_bool(inputs, &mut outputs[0]);
         }
-        if matches!(self.op, ReduceOp::Sum) && inputs[0].dtype == onnx_runtime_ir::DataType::Int64 {
-            return self.execute_i64_sum(inputs, &mut outputs[0]);
+        if matches!(inputs[0].dtype, DataType::Int64 | DataType::Int32)
+            && matches!(
+                self.op,
+                ReduceOp::Sum | ReduceOp::Max | ReduceOp::Min | ReduceOp::Prod
+            )
+        {
+            return self.execute_integer(inputs, &mut outputs[0]);
         }
         let x = to_dense_f32_widen(self.op.name(), &inputs[0])?;
         let in_shape = inputs[0].shape;
@@ -277,7 +282,17 @@ impl ReduceKernel {
         Ok(reduce)
     }
 
-    fn execute_i64_sum(&self, inputs: &[TensorView], output: &mut TensorMut) -> Result<()> {
+    /// Reduce an integer tensor without leaving the integer domain.
+    ///
+    /// The general path widens to `f32`, which silently rounds any magnitude
+    /// past 2^24 and rejects integer dtypes outright. ONNX defines
+    /// `ReduceSum`/`ReduceMax`/`ReduceMin`/`ReduceProd` over the integer types,
+    /// and callers use them on things like token counts and patch grid extents
+    /// where an off-by-rounding answer is worse than no answer.
+    ///
+    /// Accumulation happens in `i64` regardless of the input width; the result
+    /// is narrowed to whatever the output view declares.
+    fn execute_integer(&self, inputs: &[TensorView], output: &mut TensorMut) -> Result<()> {
         let x = to_dense_i64(&inputs[0])?;
         let in_shape = inputs[0].shape;
         let rank = in_shape.len();
@@ -288,7 +303,14 @@ impl ReduceKernel {
             .collect::<Vec<_>>();
         let in_strides = compute_contiguous_strides(in_shape);
         let kept_strides = compute_contiguous_strides(&kept_shape);
-        let mut sums = vec![0_i64; numel(&kept_shape).max(1)];
+        let seed = match self.op {
+            ReduceOp::Sum => 0,
+            ReduceOp::Prod => 1,
+            ReduceOp::Max => i64::MIN,
+            ReduceOp::Min => i64::MAX,
+            _ => unreachable!("integer reduction is only valid for Sum/Max/Min/Prod"),
+        };
+        let mut acc = vec![seed; numel(&kept_shape).max(1)];
         if numel(in_shape) > 0 {
             let mut index = vec![0; rank];
             loop {
@@ -302,18 +324,40 @@ impl ReduceKernel {
                         kept_axis += 1;
                     }
                 }
-                sums[output_offset] = sums[output_offset].wrapping_add(x[input_offset]);
+                let value = x[input_offset];
+                let slot = &mut acc[output_offset];
+                *slot = match self.op {
+                    ReduceOp::Sum => slot.wrapping_add(value),
+                    ReduceOp::Prod => slot.wrapping_mul(value),
+                    ReduceOp::Max => (*slot).max(value),
+                    ReduceOp::Min => (*slot).min(value),
+                    _ => unreachable!("integer reduction is only valid for Sum/Max/Min/Prod"),
+                };
                 if !next_index(in_shape, &mut index) {
                     break;
                 }
             }
         }
         let _ = self.keepdims;
-        let bytes = sums
-            .iter()
-            .take(numel(&kept_shape))
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
+        let kept = numel(&kept_shape);
+        let bytes = match output.dtype {
+            DataType::Int64 => acc
+                .iter()
+                .take(kept)
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>(),
+            DataType::Int32 => acc
+                .iter()
+                .take(kept)
+                .flat_map(|value| (*value as i32).to_le_bytes())
+                .collect::<Vec<_>>(),
+            other => {
+                return Err(EpError::KernelFailed(format!(
+                    "{}: integer reduction output must be Int64 or Int32, got {other:?}",
+                    self.op.name()
+                )));
+            }
+        };
         write_dense_bytes(output, &bytes)
     }
 
@@ -418,6 +462,78 @@ mod tests {
         let mut out = Owned::zeros(DataType::Int64, &[2, 1]);
         run_attr(ReduceOp::Sum, Some(vec![1]), &x, &mut out);
         assert_eq!(out.to_i64(), vec![6, 15]);
+    }
+
+    #[test]
+    fn max_min_prod_int64_axis1() {
+        let x = Owned::i64(&[2, 3], &[1, 9, 3, 4, 5, 0]);
+        for (op, expected) in [
+            (ReduceOp::Max, vec![9, 5]),
+            (ReduceOp::Min, vec![1, 0]),
+            (ReduceOp::Prod, vec![27, 0]),
+        ] {
+            let mut out = Owned::zeros(DataType::Int64, &[2, 1]);
+            run_attr(op, Some(vec![1]), &x, &mut out);
+            assert_eq!(out.to_i64(), expected);
+        }
+    }
+
+    #[test]
+    fn max_int64_reduce_all_to_scalar() {
+        // The shape the Muse Glimmer vision tower produces: reduce a 1-D int64
+        // patch-extent vector down to a scalar with no axes input.
+        let x = Owned::i64(&[3], &[7, 42, 13]);
+        let mut out = Owned::zeros(DataType::Int64, &[1]);
+        run_omitted_axes(ReduceOp::Max, &x, &mut out);
+        assert_eq!(out.to_i64(), vec![42]);
+    }
+
+    #[test]
+    fn max_int64_preserves_values_beyond_f32_precision() {
+        // Widening through f32 rounds anything past 2^24, so these two distinct
+        // values would collapse onto the same float and pick the wrong maximum.
+        let low = (1_i64 << 40) + 1;
+        let high = (1_i64 << 40) + 2;
+        let x = Owned::i64(&[2], &[high, low]);
+        let mut out = Owned::zeros(DataType::Int64, &[1]);
+        run_omitted_axes(ReduceOp::Max, &x, &mut out);
+        assert_eq!(out.to_i64(), vec![high]);
+
+        let mut out = Owned::zeros(DataType::Int64, &[1]);
+        run_omitted_axes(ReduceOp::Min, &x, &mut out);
+        assert_eq!(out.to_i64(), vec![low]);
+    }
+
+    #[test]
+    fn min_int64_negative_values() {
+        let x = Owned::i64(&[2, 2], &[-5, 3, -9, -1]);
+        let mut out = Owned::zeros(DataType::Int64, &[2, 1]);
+        run_attr(ReduceOp::Min, Some(vec![1]), &x, &mut out);
+        assert_eq!(out.to_i64(), vec![-5, -9]);
+    }
+
+    #[test]
+    fn max_int32_reduces_to_int32_output() {
+        // The shape the Muse Glimmer vision tower attention produces: an int32
+        // window-extent vector reduced to a single int32.
+        let x = Owned::i32(&[6], &[3, 11, 7, 11, 2, 9]);
+        let mut out = Owned::zeros(DataType::Int32, &[1]);
+        run_omitted_axes(ReduceOp::Max, &x, &mut out);
+        assert_eq!(out.to_i32(), vec![11]);
+    }
+
+    #[test]
+    fn int32_sum_min_prod_reduce_to_int32_output() {
+        let x = Owned::i32(&[2, 3], &[1, 9, 3, 4, 5, 0]);
+        for (op, expected) in [
+            (ReduceOp::Sum, vec![13, 9]),
+            (ReduceOp::Min, vec![1, 0]),
+            (ReduceOp::Prod, vec![27, 0]),
+        ] {
+            let mut out = Owned::zeros(DataType::Int32, &[2, 1]);
+            run_attr(op, Some(vec![1]), &x, &mut out);
+            assert_eq!(out.to_i32(), expected);
+        }
     }
 
     #[test]
