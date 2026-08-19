@@ -85,7 +85,21 @@ static GLOBAL_VRAM_FREE_NS: AtomicU64 = AtomicU64::new(0);
 // consumers of the VA to finish — but under VMM over-subscription that in-flight
 // work is itself PCIe-fault-slowed, so folding it into `GLOBAL_VRAM_FREE_NS`
 // mis-attributes paging-stalled compute/copy as "free" time (#1295). Timed
-// separately so `vram_free_ns` measures only unmap/release.
+// separately so the stream drain is excluded from `vram_free_ns`.
+//
+// CAUTION (2026-08-19 reconciliation, docs/benchmarks/
+// 2026-08-19-vram-free-attribution-reconciliation.md): even with the drain
+// split out, `GLOBAL_VRAM_FREE_NS` is NOT "driver freeing time". It wraps the
+// whole free code path -- the `cuMemUnmap`/`cuMemRelease` driver calls AND the
+// per-granule Rust bookkeeping in `decommit_allocation_range`/`deallocate_span`
+// -- and the bookkeeping dominates: on an RTX 4060 weight-lending run the driver
+// `cuMemUnmap` was a stable ~16.9 ms/call (~101 ms total over 6 releases) while
+// `vram_free_ms` swung 82 ms <-> 2450 ms (~30x) on byte-identical deterministic
+// work. A metric that varies 30x while the work is constant is measuring
+// variable non-driver time (bookkeeping and/or lock/blocking), not freeing.
+// To isolate the driver cost, time the `cuMemUnmap` sites directly (see the
+// reconciliation doc's split instrumentation); do not read `vram_free_ms` as a
+// driver-freeing figure.
 static GLOBAL_VRAM_FREE_SYNC_NS: AtomicU64 = AtomicU64::new(0);
 // Process-lifetime high-water gauge. Resetting activity counters must not write
 // it: a concurrent page-in could otherwise be overwritten with a stale value.
@@ -177,6 +191,13 @@ pub struct GlobalOffloadStats {
     pub materialize_fallback_calls: u64,
     pub htod_bytes: u64,
     pub vram_alloc_ns: u64,
+    /// Weight-page free code path: the `cuMemUnmap`/`cuMemRelease` driver calls
+    /// plus the per-granule Rust bookkeeping in `decommit_allocation_range`/
+    /// `deallocate_span`. NOT a driver-freeing figure -- the bookkeeping
+    /// dominates and this counter swings ~30x on byte-identical work while the
+    /// driver `cuMemUnmap` stays ~17 ms/call (see `GLOBAL_VRAM_FREE_NS` and the
+    /// 2026-08-19 reconciliation doc). Excludes the pre-free stream drain, which
+    /// is timed into [`Self::vram_free_sync_ns`].
     pub vram_free_ns: u64,
     /// Pre-free stream drain time (`cuStreamSynchronize`) taken on the Drop-path
     /// eviction before unmapping. Split out of [`Self::vram_free_ns`] so the
