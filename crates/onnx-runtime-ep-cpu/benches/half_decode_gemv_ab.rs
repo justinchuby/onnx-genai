@@ -10,9 +10,16 @@
 //!
 //! | arm | how | route |
 //! |---|---|---|
-//! | GEMV | default | read `B` in place in `[K, N]` order, no packing, no copy |
+//! | GEMV | `ONNX_GENAI_CPU_MM_HALF_GEBP=0` | read `B` in place in `[K, N]` order, no packing, no copy |
 //! | fused GEBP | `ONNX_GENAI_CPU_MM_HALF_GEMV=0` | widen `B` into packed L1 panels (the prefill kernel) |
 //! | blocked | `ONNX_GENAI_CPU_MM_HALF_GEMV=0 ONNX_GENAI_CPU_MM_HALF_GEBP=0` | the row-blocked half GEMM |
+//!
+//! Note that **neither** single-knob arm is the default: with no environment
+//! set, the shipped routing picks per shape -- GEMV below
+//! `HALF_DECODE_GEBP_MIN_WEIGHT`, fused GEBP at or above it -- so an unset run
+//! is a fourth, *shipped* arm that agrees with the GEMV column on small
+//! weights and with the GEBP column on large ones. The output digest is what
+//! says which one it took.
 //!
 //! Decode is bandwidth-bound, not flop-bound: at `M == 1` every weight element
 //! is touched exactly once, so the figure of merit is **GB/s of weight read**,
@@ -30,10 +37,11 @@
 //!
 //! Run with:
 //! ```text
-//! cargo bench -p onnx-runtime-ep-cpu --bench half_decode_gemv_ab
+//! ONNX_GENAI_CPU_MM_HALF_GEBP=0 cargo bench -p onnx-runtime-ep-cpu --bench half_decode_gemv_ab
 //! ONNX_GENAI_CPU_MM_HALF_GEMV=0 cargo bench -p onnx-runtime-ep-cpu --bench half_decode_gemv_ab
 //! ONNX_GENAI_CPU_MM_HALF_GEMV=0 ONNX_GENAI_CPU_MM_HALF_GEBP=0 \
 //!     cargo bench -p onnx-runtime-ep-cpu --bench half_decode_gemv_ab
+//! cargo bench -p onnx-runtime-ep-cpu --bench half_decode_gemv_ab  # shipped routing
 //! ```
 //! `PROBE_SHAPE=mlp|lm_head|square` picks one shape.
 

@@ -37,8 +37,8 @@ so it is the check that a difference between the half arms is the route and not 
 ## The result, and the direction it went
 
 The hypothesis was that a GEMV — one pass over the weight, nothing packed — must be the floor at
-`M = 1`, so the work started as "give `bf16` the GEMV `f16` already has". That is true at small and
-medium weights and **false at large ones**. Steady p50, 7-9 interleaved repetitions per arm,
+`M = 1`, so the work started as "give `bf16` the GEMV `f16` already has". That holds at small and
+medium weights and is **false at large ones**. Steady p50, 7-9 interleaved repetitions per arm,
 minimum of the same samples in parentheses where the two statistics disagree:
 
 | dtype | `K x N` | elements | GEMV | fused GEBP |
@@ -52,6 +52,14 @@ minimum of the same samples in parentheses where the two statistics disagree:
 | bf16 | 4096x11008 | 45.1M | 3.32 ms | **2.45 ms** |
 | f16 | 896x151936 | 136M | 6.94 ms | **5.84 ms** |
 | bf16 | 896x151936 | 136M | 6.61 ms | **5.56 ms** |
+
+Read that table precisely: below 33.6M the GEMV is **at worst a wash**, not a uniform win. It wins
+outright only at 4.2M. At 8.4M and 16.8M the median favours the GEBP by around 6% while the minimum
+of the same samples favours the GEMV — when the two statistics disagree by less than the control
+rows move (see the noise floor below), the difference is not resolvable on this host, and those
+shapes are tie-broken onto the GEMV because it is the route that allocates nothing. Above 33.6M the
+GEBP wins by both statistics in both formats, which is why the handover is claimed there and only
+there.
 
 The mechanism is parallelism, not traffic. The GEMV hands each worker a `STRIPE = 512` column slice
 and has that worker walk all `k` rows: at `n = 11008` that is 21 stripes on a 32-thread pool, so a
@@ -75,7 +83,7 @@ projection — on the slower arm.
 | case | before | after | change |
 |---|---|---|---|
 | `f16` `M = 1`, weight < 33.6M | GEMV | GEMV | none |
-| `f16` `M = 1`, weight >= 33.6M | GEMV | GEBP | wash to **1.28x** (lm_head) |
+| `f16` `M = 1`, weight >= 33.6M | GEMV | GEBP | wash to **1.33x** (lm_head; 1.25x by minimum) |
 | `bf16` `M = 1`, weight < 1M | blocked | GEMV | **3.0x** |
 | `bf16` `M = 1`, 1M <= weight < 33.6M | GEBP | GEMV | wash; tie broken toward the route that allocates nothing |
 | `bf16` `M = 1`, weight >= 33.6M | GEBP | GEBP | none |
@@ -103,6 +111,28 @@ ratio in the "vs blocked" column is far outside it; the 1.28x-1.32x `lm_head` ga
 by median and by minimum across 7-9 repetitions but are not order-of-magnitude claims, and the
 "wash" rows are called washes precisely because they are not.
 
+## Re-measured at review time, on a quiet host
+
+Because that noise floor is wide enough to swallow the `lm_head` claims, the two shapes those
+claims rest on were re-run at review time with load average at 4.6 instead of 14-30. Same one
+build, same interleaving, **median of the per-run steady p50** on both sides (the minimum of the
+same samples in parentheses), 9 repetitions per arm for the small shapes and 7 for `lm_head`:
+
+| dtype | shape | `K x N` | arm A | arm B | ratio | control |
+|---|---|---|---:|---:|---:|---:|
+| bf16 | attn_out | 1024x768 | blocked 0.252 (0.243) | shipped 0.083 (0.077) | **3.04x** (3.16x) | 1.02x |
+| bf16 | small | 512x512 | blocked 0.078 (0.077) | shipped 0.014 (0.014) | **5.57x** (5.50x) | 0.97x |
+| f16 | lm_head | 896x151936 | GEMV 6.131 (5.599) | shipped 4.598 (4.474) | **1.33x** (1.25x) | 0.99x |
+| bf16 | lm_head | 896x151936 | GEMV 6.218 (5.932) | shipped 4.563 (4.404) | **1.36x** (1.35x) | 0.99x |
+
+The `control` column is the same-run `f32` ratio between the two arms — identical code, so its
+distance from 1.00 is this run's noise. At 1-3% it is an order of magnitude tighter than the sweep
+above, and every ratio in the table survives: the small-shape gains are unchanged, and the
+`lm_head` gains come out slightly **larger** than the 1.28x/1.32x originally claimed. The one
+number that moves against the claim is `f16` `lm_head` by minimum (1.25x rather than 1.28x), so
+1.25x is the honest floor for that row. Absolute milliseconds differ between the two sweeps because
+the host does; the ratios do not.
+
 ## Assignment == execution
 
 Timing alone cannot say which route ran — the arms agree to half-precision rounding. Two
@@ -119,6 +149,17 @@ independent checks do:
 gates live in different functions with different thresholds, and every shape the GEMV declines must
 be one the fused GEBP accepts. If they drift apart, decode silently lands on the 16x-21x slower
 blocked kernel with identical numbers.
+
+`switching_off_the_gebp_leaves_decode_on_the_gemv` pins the other half of that invariant, the one
+the first test cannot reach: `ONNX_GENAI_CPU_MM_HALF_GEBP=0` is a bisect knob for *prefill*
+packing, so the decode handover must consult it too, or turning the knob off would push every large
+decode onto the blocked kernel instead of back onto the GEMV. `half_prefill_gebp_enabled` is a
+process-wide `OnceLock` that no test can flip, so the decision is asked of
+`half_decode_prefers_gebp_when`, which takes that answer as an argument.
+
+On 32-bit `x86` the handover does not exist at all — the fused GEBP is `x86_64`-only — so
+`half_decode_prefers_gebp` declines unconditionally there and every decode stays on the GEMV,
+exactly as before this change. Verified by compiling the crate for `i686-unknown-linux-gnu`.
 
 ## Numerics
 

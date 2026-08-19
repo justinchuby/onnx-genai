@@ -2177,12 +2177,18 @@ fn widened_sgemm_beats_half_gemm(
 /// | f16 896x151936 | 136M | 6.94 ms | **5.84 ms** |
 /// | bf16 896x151936 | 136M | 6.61 ms | **5.56 ms** |
 ///
-/// `1 << 25` is the *wash*, not the win: at exactly 33.6M the two are within
-/// run-to-run noise in both formats, and above it the GEBP pulls 6%-26%
-/// ahead. Placing the threshold at the wash rather than at the first clear win
-/// means no shape is left on the slower route, and no shape is moved onto the
-/// allocating one for a gain that could not be measured.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// `1 << 25` is the *wash*, not the win. Below it the GEMV is at worst a wash:
+/// it wins outright only at 4.2M, and at 8.4M-16.8M the median actually
+/// favours the GEBP by ~6% while the minimum of the same samples favours the
+/// GEMV -- a disagreement between the two statistics is exactly what an
+/// unresolvable difference looks like on a shared host, so those shapes are
+/// tie-broken onto the GEMV because it is the route that allocates nothing.
+/// At 33.6M the two are within run-to-run noise in both formats by both
+/// statistics, and above it the GEBP pulls 6%-26% ahead by both. Placing the
+/// threshold at the wash rather than at the first clear win means no shape is
+/// left on the slower route, and no shape is moved onto the allocating one for
+/// a gain that could not be measured.
+#[cfg(target_arch = "x86_64")]
 const HALF_DECODE_GEBP_MIN_WEIGHT: usize = 1 << 25;
 
 /// Whether an `M == 1` decode should skip the GEMV and let the fused
@@ -2191,14 +2197,46 @@ const HALF_DECODE_GEBP_MIN_WEIGHT: usize = 1 << 25;
 /// Mirrors [`half_gemm_tile`]'s precedence: if the AVX-512 BF16 kernel would
 /// claim the call, or the GEBP is switched off, this must not divert a decode
 /// away from the GEMV into the row-blocked GEMM.
+///
+/// On 32-bit `x86` there is no GEBP to defer to at all --
+/// [`half_prefill_gebp_selected`] and the GEBP arm of [`half_gemm_tile`] are
+/// `x86_64`-only -- so this always declines there and every decode stays on
+/// the GEMV. The GEMV itself is 32-bit clean; only the route it hands off to
+/// is not.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn half_decode_prefers_gebp(format: HalfFormat, k: usize, n: usize) -> bool {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (format, k, n);
+        false
+    }
     #[cfg(target_arch = "x86_64")]
+    {
+        half_decode_prefers_gebp_when(format, k, n, half_prefill_gebp_enabled())
+    }
+}
+
+/// The decision [`half_decode_prefers_gebp`] makes, with the GEBP's
+/// enablement passed in rather than read from the environment.
+///
+/// Split out only so a test can ask what the routing does with the GEBP
+/// switched off. [`half_prefill_gebp_enabled`] is a process-wide `OnceLock`,
+/// so no single run can observe both answers -- and the coupling is
+/// load-bearing: if this ever stops declining when the GEBP is off,
+/// `ONNX_GENAI_CPU_MM_HALF_GEBP=0` would push large decode onto the
+/// row-blocked GEMM instead of leaving it on the GEMV, turning a bisect knob
+/// into a 16x-21x regression.
+#[cfg(target_arch = "x86_64")]
+fn half_decode_prefers_gebp_when(
+    format: HalfFormat,
+    k: usize,
+    n: usize,
+    gebp_enabled: bool,
+) -> bool {
     if format == HalfFormat::Bf16 && x86_bf16::native_available() {
         return false;
     }
-    let _ = format;
-    k.saturating_mul(n) >= HALF_DECODE_GEBP_MIN_WEIGHT && half_prefill_gebp_enabled()
+    gebp_enabled && k.saturating_mul(n) >= HALF_DECODE_GEBP_MIN_WEIGHT
 }
 
 /// Whether the `M == 1` decode GEMV is used. On by default;
@@ -4880,6 +4918,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Switching the GEBP off must leave decode on the GEMV, not the blocked
+    /// GEMM.
+    ///
+    /// `ONNX_GENAI_CPU_MM_HALF_GEBP=0` is a bisect knob for the *prefill*
+    /// packing. Decode only reaches the GEBP because the GEMV declines, so if
+    /// that decline ever stopped consulting the knob, turning the knob off
+    /// would send every large decode to the row-blocked GEMM -- 16x-21x
+    /// slower, and silently, since the numbers agree. Asked of
+    /// [`half_decode_prefers_gebp_when`] because
+    /// [`half_prefill_gebp_enabled`] is a process-wide `OnceLock` that no test
+    /// can flip.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn switching_off_the_gebp_leaves_decode_on_the_gemv() {
+        for format in [HalfFormat::F16, HalfFormat::Bf16] {
+            for (k, n) in [(4096usize, 8192usize), (4096, 11008), (896, 151936)] {
+                assert!(
+                    k * n >= HALF_DECODE_GEBP_MIN_WEIGHT,
+                    "the shape must clear the decode threshold to be a test"
+                );
+                assert!(
+                    !half_decode_prefers_gebp_when(format, k, n, false),
+                    "{format:?} {k}x{n}: with the GEBP off the GEMV must keep the decode"
+                );
+            }
+        }
+        // ...and with it on, the same shapes are exactly the ones handed over,
+        // so the assertion above is about the knob and not about the shapes.
+        if !x86_bf16::native_available() {
+            assert!(half_decode_prefers_gebp_when(
+                HalfFormat::Bf16,
+                4096,
+                8192,
+                true
+            ));
+        }
+        assert!(half_decode_prefers_gebp_when(
+            HalfFormat::F16,
+            4096,
+            8192,
+            true
+        ));
     }
 
     /// The decode threshold is where the measurement put it.

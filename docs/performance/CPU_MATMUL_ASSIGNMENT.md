@@ -334,15 +334,24 @@ at 33.6M weight elements — measured at the wash, not at the first win:
 
 | dtype | `K x N` | before | after | gain |
 |---|---|---:|---:|---:|
-| bf16 | 1024x768 | 0.386 ms | 0.128 ms | **3.0x** |
-| bf16 | 512x512 | 0.079 ms | 0.014 ms | **5.6x** |
-| f16 | 896x151936 | 9.59 ms | 7.47 ms | **1.28x** |
-| bf16 | 896x151936 | 8.49 ms* | 6.45 ms | **1.32x*** |
+| bf16 | 1024x768 | 0.252 ms | 0.083 ms | **3.0x** |
+| bf16 | 512x512 | 0.078 ms | 0.014 ms | **5.6x** |
+| f16 | 896x151936 | 6.13 ms | 4.60 ms | **1.33x** |
+| bf16 | 896x151936 | 6.22 ms* | 4.56 ms | **1.36x*** |
+
+Every row is the **median of the per-run steady p50**, same statistic on both sides, over 9
+interleaved repetitions per arm for the two small shapes and 7 for `lm_head`; the `f32` control
+rows of those same runs agree between arms to within 3% (small) and 1% (`lm_head`), which is what
+makes differences this size readable at all. By the *minimum* of the same samples the two small
+rows are 3.2x and 5.5x, `bf16` `lm_head` is 1.35x, and `f16` `lm_head` is 1.25x — so the `f16`
+`lm_head` row is the one claim here that depends on which statistic is used, and 1.25x is its
+floor.
 
 \* the `bf16` `lm_head` row compares against the GEMV, which is what that shape would have used had
 the format had one; against the route it actually took before (the fused GEBP, #1365) it is
-unchanged. Full record, including the `f32` control rows that establish this shared host's ~1.6x
-noise floor: `docs/benchmarks/2026-08-19-bf16-decode-gemv.md`.
+unchanged. Full record, including a noisier earlier sweep whose `f32` controls moved by up to 1.6x
+and which is kept as the disclosure of this shared host's worst case:
+`docs/benchmarks/2026-08-19-bf16-decode-gemv.md`.
 
 ### 3. Per-call packing — `QLinearMatMul` (**fixed**)
 
