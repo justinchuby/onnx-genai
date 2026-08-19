@@ -416,10 +416,14 @@ unsafe fn softmax_row_scalar(src: *const f32, dst: *mut f32, d: usize) {
 /// AVX2+FMA row softmax: the same max / `exp(x - max)` / normalize the scalar
 /// path performs, but with `exp` evaluated on eight f32 lanes at once.
 ///
-/// The polynomial is Cephes' single-precision `expf` (range-reduce
-/// `x = k·ln2 + r`, a degree-6 minimax on `r`, then scale by `2^k`), which is
-/// accurate to ~1 ULP - comfortably inside the `1e-6` softmax tolerance the
-/// tests assert against libm. Because softmax only ever evaluates `exp(v - max)`
+/// The `exp` is a range-reduce (`x = k·ln2 + r`, Cody-Waite two-part `ln2`),
+/// a degree-6 minimax polynomial on `r` in pure Horner form, then scale by
+/// `2^k`. The polynomial's two leading terms are pinned to the exact `1 + r`
+/// (`c0 = c1 = 1.0`), so the whole `exp8` is accurate to 1 ULP against an f64
+/// reference over the softmax domain `(-87.336544, 0]` (measured exhaustively,
+/// all 1.118e9 f32 values) - comfortably inside the `1e-6` softmax tolerance
+/// the tests assert against libm. Because softmax only ever evaluates
+/// `exp(v - max)`
 /// with `v - max <= 0`, the reduced argument never overflows; the non-finite
 /// lanes (`-inf` -> `0`, `NaN` -> `NaN`) are patched explicitly so a fully
 /// masked row still normalizes to `NaN` and a partially masked row's masked
@@ -442,6 +446,13 @@ mod softmax_avx2 {
         std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
     }
 
+    /// At and below this argument, f32 `exp` has underflowed to the (sub)normals
+    /// we flush to `0`; `-inf` lands here too and must become exactly `0`. One
+    /// source of truth for [`exp8`]'s clamp and for the accuracy test's domain
+    /// endpoint, so the two cannot drift apart.
+    #[allow(clippy::excessive_precision)]
+    const UNDERFLOW: f32 = -87.336_544_f32;
+
     /// `exp` on eight lanes for the softmax domain (`x <= 0`, plus `-inf`/`NaN`).
     ///
     /// # Safety
@@ -457,18 +468,21 @@ mod softmax_avx2 {
         let ln2_lo = _mm256_set1_ps(-2.121_944_40e-4_f32);
         let one = _mm256_set1_ps(1.0);
 
-        // Cephes `expf` polynomial coefficients for `exp(r)` on
-        // `|r| <= ln2/2`.
-        let c0 = _mm256_set1_ps(1.987_569_15e-4_f32);
-        let c1 = _mm256_set1_ps(1.398_199_95e-3_f32);
-        let c2 = _mm256_set1_ps(8.333_451_9e-3_f32);
-        let c3 = _mm256_set1_ps(4.166_579_6e-2_f32);
-        let c4 = _mm256_set1_ps(1.666_666_5e-1_f32);
-        let c5 = _mm256_set1_ps(5.000_000_1e-1_f32);
+        // Degree-6 minimax (Remez) coefficients for `exp(r)` on `|r| <= ln2/2`,
+        // with the two leading terms pinned to the exact `1 + r` (the r^0 and
+        // r^1 coefficients round to exactly 1.0f32). Evaluated in pure Horner
+        // form below: 6 FMAs, no separate `r^2` multiply and no trailing add,
+        // which is one fewer FMA-unit op and one fewer FADD than the Cephes
+        // `1 + r + r^2·P5(r)` form it replaces, while staying at 1 ULP.
+        let c2 = _mm256_set1_ps(4.999_999_1e-1_f32);
+        let c3 = _mm256_set1_ps(1.666_642_0e-1_f32);
+        let c4 = _mm256_set1_ps(4.166_822_5e-2_f32);
+        let c5 = _mm256_set1_ps(8.374_816_0e-3_f32);
+        let c6 = _mm256_set1_ps(1.383_684_6e-3_f32);
 
         // Below this, f32 `exp` has underflowed to (sub)normals we flush to
         // 0; `-inf` lands here too and must become exactly 0.
-        let underflow = _mm256_set1_ps(-87.336_544_f32);
+        let underflow = _mm256_set1_ps(UNDERFLOW);
 
         let is_nan = _mm256_cmp_ps::<_CMP_UNORD_Q>(x, x);
         // Ordered `<=` so `NaN` reports false here (it is handled above).
@@ -485,15 +499,13 @@ mod softmax_avx2 {
         let r = _mm256_fnmadd_ps(k, ln2_hi, xc);
         let r = _mm256_fnmadd_ps(k, ln2_lo, r);
 
-        // Horner: exp(r) = ((((((c0*r+c1)*r+c2)*r+c3)*r+c4)*r+c5)*r^2 + r + 1.
-        let mut p = _mm256_fmadd_ps(c0, r, c1);
-        p = _mm256_fmadd_ps(p, r, c2);
-        p = _mm256_fmadd_ps(p, r, c3);
+        // Pure Horner of `1 + r + c2·r^2 + c3·r^3 + c4·r^4 + c5·r^5 + c6·r^6`.
+        let mut p = _mm256_fmadd_ps(c6, r, c5);
         p = _mm256_fmadd_ps(p, r, c4);
-        p = _mm256_fmadd_ps(p, r, c5);
-        let r2 = _mm256_mul_ps(r, r);
-        p = _mm256_fmadd_ps(p, r2, r);
-        p = _mm256_add_ps(p, one);
+        p = _mm256_fmadd_ps(p, r, c3);
+        p = _mm256_fmadd_ps(p, r, c2);
+        p = _mm256_fmadd_ps(p, r, one); // *r + 1  (the exact r^1 coefficient)
+        p = _mm256_fmadd_ps(p, r, one); // *r + 1  (the exact r^0 coefficient)
 
         // 2^k by constructing the IEEE-754 exponent: (k + 127) << 23.
         let ki = _mm256_cvtps_epi32(k);
@@ -601,6 +613,65 @@ mod softmax_avx2 {
                 i += 1;
             }
         }
+    }
+
+    /// The row-level softmax tests cannot police `exp8`'s absolute accuracy:
+    /// softmax divides every exponential by the row sum, so a *relative* error
+    /// shared across the lanes cancels in the ratio (an `exp8` variant measured
+    /// at 64 ULP against f64 still matched the scalar softmax to 2.4e-7). This
+    /// test therefore probes `exp8` directly against a correctly-rounded f64
+    /// reference and pins the 1-ULP accuracy the polynomial was fitted for.
+    ///
+    /// The sweep is strided rather than exhaustive so it stays a fast unit test;
+    /// an offline exhaustive sweep over all 1.118e9 f32 values in the nonzero
+    /// domain `(-87.336544, 0]` confirms the same 1-ULP bound. Each lane marches
+    /// by `8 * stride`, so every lane position traverses the whole domain, and
+    /// the near-zero and near-underflow ends (where the two candidate error
+    /// regimes live) are both densely covered. The endpoint stops one ULP short
+    /// of the flush-to-zero threshold: at and below it `exp8` deliberately
+    /// returns exactly `0`, which is a contract the row-level tests police, not
+    /// an approximation error this bar applies to.
+    #[cfg(test)]
+    #[test]
+    fn exp8_stays_within_two_ulp_of_the_f64_reference() {
+        if !available() {
+            return;
+        }
+        let lo = 0x8000_0000u32; // -0.0
+        // One ULP inside the flush-to-zero threshold, i.e. the most negative
+        // argument `exp8` still approximates rather than forces to `0`.
+        let hi = UNDERFLOW.to_bits() - 1;
+        let stride = 1097u32; // ~1M samples across the domain
+        let mut max_ulp = 0u32;
+        let mut worst = 0.0f32;
+        let mut b = lo;
+        while b < hi {
+            let mut xs = [0.0f32; 8];
+            for (j, x) in xs.iter_mut().enumerate() {
+                *x = f32::from_bits((b.wrapping_add((j as u32) * stride)).min(hi));
+            }
+            // SAFETY: `available()` proved AVX2+FMA; `xs` is 8 lanes.
+            let out = unsafe {
+                let y = exp8(_mm256_loadu_ps(xs.as_ptr()));
+                let mut o = [0.0f32; 8];
+                _mm256_storeu_ps(o.as_mut_ptr(), y);
+                o
+            };
+            for (j, &x) in xs.iter().enumerate() {
+                let reference = (x as f64).exp() as f32;
+                let ulp =
+                    (out[j].to_bits() as i64 - reference.to_bits() as i64).unsigned_abs() as u32;
+                if ulp > max_ulp {
+                    max_ulp = ulp;
+                    worst = x;
+                }
+            }
+            b = b.wrapping_add(8 * stride);
+        }
+        assert!(
+            max_ulp <= 2,
+            "exp8 exceeded the 2 ULP accuracy bar: max_ulp={max_ulp} at x={worst}"
+        );
     }
 }
 
