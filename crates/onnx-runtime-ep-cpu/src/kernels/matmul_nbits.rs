@@ -1288,6 +1288,45 @@ impl Kernel for MatMulNBitsKernel {
             } else {
                 BORROWED_INT4_ASYMMETRIC_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
             }
+            // Prefill wide enough to amortize the pack runs on the *global*
+            // pool, not the decode pool, and so is dispatched before the
+            // `with_decode_pool` installation below. The decode pool is
+            // deliberately narrow (the flat default caps at eight workers,
+            // sized for per-token latency where a wider fork/join loses); a
+            // prefill GEMM is the opposite regime -- one bulk parallel region
+            // per call that wants the whole machine, exactly like the f32
+            // dense fallback's `sgemm_simd_packed`. Running it inside the
+            // decode pool measured 2.4x slower purely from the narrower pool.
+            #[cfg(target_arch = "x86_64")]
+            if int4_prefill_gebp_enabled()
+                && m >= INT4_PREFILL_GEBP_MIN_ROWS
+                && self.block_size.is_multiple_of(2)
+                && crate::backend::has_simd_x86()
+            {
+                let weight = crate::kernels::matmul::x86_sgemm::Int4Weight {
+                    packed,
+                    zero_points: borrowed_zero_points,
+                    block_size: self.block_size,
+                    block_count: self.k.div_ceil(self.block_size),
+                };
+                // SAFETY (feature contract): `has_simd_x86()` above is the
+                // AVX2 + FMA check the packed microkernel requires.
+                crate::kernels::matmul::x86_sgemm::int4_prefill_gebp(
+                    &activations,
+                    &weight,
+                    |index| scales.get(index),
+                    bias.as_deref(),
+                    result,
+                    m,
+                    self.k,
+                    self.n,
+                );
+                return if direct_result {
+                    Ok(())
+                } else {
+                    write_compute_f32(&mut outputs[0], result)
+                };
+            }
             with_decode_pool(|| {
                 #[cfg(target_arch = "x86_64")]
                 if borrowed_int4_prefill_block_enabled()
@@ -6618,6 +6657,43 @@ fn borrowed_int4_output_element(
         sum += (dot - activation_sums[block] * zero_point) * scale;
     }
     sum
+}
+
+/// Row count from which the fused-dequant GEBP prefill (#1117) takes over from
+/// the row-serial borrowed kernel.
+///
+/// Below this the pack is not amortized. The row-serial kernel reads each
+/// packed byte once per row, so at very small `m` its total work is genuinely
+/// lower than expanding the weight into f32 panels — the panels only pay off
+/// once enough rows reuse them. Measured on a 32-core AVX2 host, medians of
+/// three interleaved runs:
+///
+/// | m | k=2048,n=2048 | k=4096,n=11008 |
+/// |---|---|---|
+/// | 2 | 0.83 -> 1.11 ms (**regresses**) | 8.21 -> 7.80 ms |
+/// | 4 | 1.64 -> 1.32 ms | 16.4 -> 7.51 ms (2.2x) |
+/// | 8 | 3.36 -> 1.14 ms (2.9x) | 33.5 -> 8.42 ms (4.0x) |
+///
+/// So 4 is the lowest row count that never loses: at 2 the small shape gives
+/// back more to packing than the reuse returns.
+#[cfg(target_arch = "x86_64")]
+const INT4_PREFILL_GEBP_MIN_ROWS: usize = 4;
+
+/// Kill switch for the fused-dequant GEBP prefill (issue #1117). Default **on**
+/// -- unlike the earlier `ONNX_GENAI_CPU_MM_INT4_PREFILL` probe this is a
+/// measured 15-24x win on the shapes it covers, so the burden of proof runs the
+/// other way. Set `ONNX_GENAI_CPU_MM_INT4_GEBP=0` (or `off`) to fall back to the
+/// row-serial path if a host ever disagrees. Read-only env probe -- production
+/// never mutates it at runtime.
+#[cfg(target_arch = "x86_64")]
+fn int4_prefill_gebp_enabled() -> bool {
+    std::env::var("ONNX_GENAI_CPU_MM_INT4_GEBP")
+        .ok()
+        .map(|value| {
+            let value = value.trim();
+            value.is_empty() || (value != "0" && !value.eq_ignore_ascii_case("off"))
+        })
+        .unwrap_or(true)
 }
 
 /// A/B toggle for the structural borrowed int4 prefill matmul (issue #1117).
@@ -13789,6 +13865,63 @@ mod tests {
             kernel.weight_nk.get().is_none(),
             "batched asymmetric INT4 must not expand the weight to f32"
         );
+    }
+
+    /// Prefill wide enough to reach the fused-dequant GEBP route (#1117) must
+    /// still equal the dequantized-f32 reference, for both symmetric and
+    /// asymmetric int4 -- and must still leave the weight borrowed, because the
+    /// whole point of fusing the dequant into the pack step is to buy GEMM
+    /// arithmetic intensity *without* the resident f32 cache #979 removed.
+    #[test]
+    fn matmulnbits_int4_prefill_gebp_matches_reference_and_stays_borrowed() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size) = (96usize, 20usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 37) as f32 - 9.0) / 10.0)
+            .collect();
+        for &asymmetric in &[false, true] {
+            let (packed, scales, zero_points, dequantized) =
+                quantize(&weights, n, k, block_size, asymmetric);
+            // 4 is the dispatch threshold and 5 sits inside one 6-row A panel,
+            // so both exercise the zero-padded partial panel.
+            for &m in &[4usize, 5, 8, 16, 37] {
+                let activations: Vec<f32> = (0..m * k)
+                    .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
+                    .collect();
+                let kernel = test_kernel(k, n, block_size);
+                let a = Owned::f32(&[m, k], &activations);
+                let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+                let scales_tensor = Owned::f32(&[n * blocks], &scales);
+                let zp_owned = zero_points
+                    .as_ref()
+                    .map(|zp| Owned::u8(&[n, blocks.div_ceil(2)], zp));
+                let mut inputs = vec![a.view(), b.view(), scales_tensor.view()];
+                if let Some(zp) = zp_owned.as_ref() {
+                    inputs.push(zp.view());
+                }
+                let mut y = Owned::zeros_f32(&[m, n]);
+                kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                // Scaled tolerance, not `assert_close`'s fixed 1e-5: the GEBP
+                // route reduces in the packed microkernel's order, so it
+                // differs from the row-serial order in the last f32 ulps, and
+                // at these magnitudes one ulp already exceeds 1e-5.
+                let got = y.to_f32();
+                let expect = reference(&activations, &dequantized, m, k, n);
+                for (index, (&got, &expect)) in got.iter().zip(&expect).enumerate() {
+                    let tol = 1e-5 * (1.0 + expect.abs());
+                    assert!(
+                        (got - expect).abs() <= tol,
+                        "asymmetric={asymmetric} m={m} index {index}: got={got}, expect={expect}"
+                    );
+                }
+                assert!(
+                    kernel.weight_nk.get().is_none(),
+                    "asymmetric={asymmetric} m={m}: the GEBP prefill must keep the \
+                     weight borrowed, not materialize the f32 cache"
+                );
+            }
+        }
     }
 
     #[test]
