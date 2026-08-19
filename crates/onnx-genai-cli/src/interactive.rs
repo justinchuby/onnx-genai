@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context as _;
 use nu_ansi_term::{Color as AnsiColor, Style as AnsiStyle};
-use onnx_genai::engine::{EngineDecodeBackend, PipelineEngine, PipelineGenerateRequest};
+use onnx_genai::engine::{
+    EngineDecodeBackend, PipelineEngine, PipelineGenerateRequest, is_missing_required_input,
+};
 use onnx_genai::metadata::GenerationDefaults;
 use onnx_genai::ort::profile::TraceVerbosity;
 use onnx_genai::ort::{ChatMessage, ChatRole, SessionOptions, Tokenizer, ep_selection};
@@ -839,12 +841,6 @@ impl Backend {
     }
 }
 
-fn is_missing_required_input(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().starts_with("input not found: "))
-}
-
 pub(super) fn apply_context_sized_max_new_tokens(
     options: &mut GenerateOptions,
     max_new_tokens_was_explicit: bool,
@@ -1025,7 +1021,7 @@ pub(super) fn read_attachment(path: &Path, kind: &str) -> anyhow::Result<Vec<u8>
 
 pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
-    args.cpu.apply()?;
+    args.cpu.apply().map_err(anyhow::Error::msg)?;
     let input_mode = repl_input_mode(io::stdin().is_terminal(), io::stdout().is_terminal());
     let mut settings = SessionSettings::new(resolve_model_dir(&args.model), &args.engine);
     let load_started = std::time::Instant::now();
@@ -1569,17 +1565,6 @@ pub(super) fn stage_attachment(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_input_not_found_errors_are_classified_as_missing_required_input() {
-        let missing =
-            anyhow::anyhow!("input not found: pixel_values").context("decoder forward failed");
-        assert!(is_missing_required_input(&missing));
-
-        let oom = anyhow::anyhow!("cuda_ep: cuMemAlloc: CUDA_ERROR_OUT_OF_MEMORY")
-            .context("decoder forward failed");
-        assert!(!is_missing_required_input(&oom));
-    }
 
     #[test]
     fn tty_mode_enables_live_stats_by_default() {

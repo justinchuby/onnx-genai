@@ -18,16 +18,10 @@ pub(crate) struct NativeDecodeLoadOptions<'a> {
 
 fn native_metadata_max_len_from_model_path(path: &Path) -> Option<usize> {
     let root = if path.is_dir() { path } else { path.parent()? };
-    [
-        "inference_metadata.yaml",
-        "inference_metadata.yml",
-        "inference_metadata.json",
-    ]
-    .iter()
-    .map(|name| root.join(name))
-    .find(|path| path.is_file())
-    .and_then(|path| onnx_genai_metadata::load_metadata(&path).ok())
-    .and_then(|metadata| metadata.model.and_then(|model| model.max_sequence_length))
+    onnx_genai_metadata::load_metadata_from_dir(root)
+        .ok()
+        .flatten()
+        .and_then(|metadata| metadata.model.and_then(|model| model.max_sequence_length))
 }
 
 /// Resolve a model directory's [`InferenceMetadata`] using the same precedence
@@ -39,15 +33,9 @@ fn resolve_io_metadata_from_model_path(
     path: &Path,
 ) -> Option<onnx_genai_metadata::InferenceMetadata> {
     let root = if path.is_dir() { path } else { path.parent()? };
-    if let Some(metadata) = [
-        "inference_metadata.yaml",
-        "inference_metadata.yml",
-        "inference_metadata.json",
-    ]
-    .iter()
-    .map(|name| root.join(name))
-    .find(|path| path.is_file())
-    .and_then(|path| onnx_genai_metadata::load_metadata(&path).ok())
+    if let Some(metadata) = onnx_genai_metadata::load_metadata_from_dir(root)
+        .ok()
+        .flatten()
     {
         return Some(metadata);
     }
@@ -489,7 +477,7 @@ impl NativeDecodeSession {
         )
     }
 
-    fn from_session_with_cuda_options_and_io(
+    pub(crate) fn from_session_with_cuda_options_and_io(
         mut session: InferenceSession,
         cuda_options: NativeDecodeCudaOptions,
         io: Option<&ModelIoSpec>,
@@ -920,6 +908,7 @@ impl NativeDecodeSession {
             has_plugin_fused,
             position_rank,
             decode_inline: DecodeInlineState::Untried,
+            prefill_chunk_size: None,
         })
     }
 }

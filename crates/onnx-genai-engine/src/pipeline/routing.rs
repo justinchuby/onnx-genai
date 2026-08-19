@@ -199,7 +199,7 @@ impl PipelineEngine {
                  (presence key '{}')",
                 optional.presence
             ),
-            None => anyhow::anyhow!("missing required pipeline input '{endpoint}'"),
+            None => anyhow::anyhow!("{MISSING_REQUIRED_INPUT}'{endpoint}'"),
         }
     }
 
@@ -887,5 +887,50 @@ impl PipelineEngine {
             });
         }
         Ok(bindings)
+    }
+}
+
+/// Prefix of the error a pipeline raises when a required input was never
+/// produced.
+///
+/// A front end turns this into advice about the attachment the caller most
+/// likely forgot, so the wording is shared rather than matched by hand: the
+/// message and its recognizer cannot drift apart if they name the same
+/// constant.
+pub const MISSING_REQUIRED_INPUT: &str = "missing required pipeline input ";
+
+/// True when `error`, or anything it wraps, is a required input that no
+/// component produced.
+pub fn is_missing_required_input(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with(MISSING_REQUIRED_INPUT))
+}
+
+#[cfg(test)]
+mod missing_input_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_required_input_is_recognized_through_the_context_wrapped_around_it() {
+        let raw = anyhow::anyhow!("{MISSING_REQUIRED_INPUT}'encoder.pixel_values'");
+        assert!(is_missing_required_input(&raw));
+        assert!(is_missing_required_input(
+            &raw.context("decoder forward failed")
+        ));
+    }
+
+    #[test]
+    fn an_unrelated_failure_is_not_mistaken_for_a_missing_input() {
+        let oom = anyhow::anyhow!("cuda_ep: cuMemAlloc: CUDA_ERROR_OUT_OF_MEMORY")
+            .context("decoder forward failed");
+        assert!(!is_missing_required_input(&oom));
+
+        // An optional input that was declared present is a package-authoring
+        // fault, not a forgotten attachment, so it must not be advised as one.
+        let optional = anyhow::anyhow!(
+            "missing optional-but-present pipeline input 'encoder.pixel_values' for presence key 'has_image'"
+        );
+        assert!(!is_missing_required_input(&optional));
     }
 }

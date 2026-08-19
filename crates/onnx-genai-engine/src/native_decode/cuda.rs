@@ -1868,6 +1868,14 @@ impl NativeDecodeSession {
         // CUDA-graph captured; expose the growing logical mask width (matching the
         // eager token forward) rather than freezing to physical capacity.
         state.extend_mask(if grew { 0 } else { past_len }, total_len, total_len)?;
+        // Re-prepare the governed workspace when the KV bucket grew so the
+        // persistent `::Attention` fp32 score scratch is sized for the new,
+        // larger bucket (Bug 1). #1189 added this to the captured/greedy decode
+        // paths but not to this routed-step eager path, which can rebucket just
+        // the same; without it the first execute past a power-of-two boundary
+        // needs exactly 2× the reserved workspace and trips the prepared-
+        // workspace invariant. Cheap: only fires on the rare `grew` transition.
+        state.prepare_decode_workspace_after_capacity_growth(&mut self.session, grew)?;
 
         self.run_cuda_eager_rows_owned(owned, total_len, "decoder")
     }
@@ -2011,6 +2019,13 @@ impl NativeDecodeSession {
         }
         let grew = state.ensure_capacity(&mut self.session, total_len)?;
         state.extend_mask(if grew { 0 } else { past_len }, total_len, total_len)?;
+        // Re-prepare the governed workspace when the KV bucket grew so the
+        // persistent `::Attention` fp32 score scratch is sized for the new,
+        // larger bucket (Bug 1). #1189 added this guard to the captured/greedy
+        // decode paths but not to this spec-decode verify path, which rebuckets
+        // when `past + K` crosses a power-of-two boundary; without it the verify
+        // forward trips the prepared-workspace invariant. Only fires on `grew`.
+        state.prepare_decode_workspace_after_capacity_growth(&mut self.session, grew)?;
         self.run_cuda_eager_rows(
             token_ids,
             past_len,
