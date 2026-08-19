@@ -392,7 +392,13 @@ enum PrefillFanOut {
 ///
 /// Park latency is what makes the wide path safe above the threshold: 226 us of
 /// worst-case wake-up is 0.25% of a 90 ms fan-out, and 45% of a 0.5 ms one.
-#[cfg(target_arch = "x86_64")]
+/// Both callers are conditional -- `run_mlas_shards` on `feature = "mlas"`,
+/// `borrowed_affine_int4_matmul_prefill` on `target_arch = "x86_64"` -- so
+/// the union of those two cfgs is what keeps this alive. Silence dead code
+/// where neither applies rather than `#[cfg]`-ing the item away: the unit
+/// tests below reference it unconditionally, and gating the item forces
+/// gating the tests too, which drops the policy from aarch64 coverage.
+#[cfg_attr(not(any(feature = "mlas", target_arch = "x86_64")), allow(dead_code))]
 const WIDE_PREFILL_MACS: usize = 1 << 29;
 
 /// Picks the prefill fan-out executor for `macs` of work, given the task
@@ -400,7 +406,12 @@ const WIDE_PREFILL_MACS: usize = 1 << 29;
 ///
 /// Split out as a pure function so the policy is testable without a machine
 /// that has SMT, and so the threshold has one place to be wrong.
-#[cfg(target_arch = "x86_64")]
+/// Its two callers are gated on different things -- `run_mlas_shards` on
+/// `feature = "mlas"` and `borrowed_affine_int4_matmul_prefill` on
+/// `target_arch = "x86_64"` -- so the union of those two cfgs is what keeps
+/// this alive. On aarch64 without MLAS both callers vanish and only the unit
+/// tests are left.
+#[cfg_attr(not(any(feature = "mlas", target_arch = "x86_64")), allow(dead_code))]
 fn prefill_fan_out(macs: usize, lanes: usize, wide: usize) -> PrefillFanOut {
     // Nothing to win from the wide path when it is not actually wider; prefer
     // the runtime's cheaper dispatch.
@@ -540,7 +551,13 @@ const MIN_PREFILL_TASK_MACS: usize = 1 << 19;
 ///
 /// Returns a *floor* the task runtime applies to its own partition; the runtime
 /// still uses a larger grain when there are more columns than workers.
-#[cfg(target_arch = "x86_64")]
+/// Its only non-test caller is `borrowed_affine_int4_matmul_prefill`, which is
+/// `#[cfg(target_arch = "x86_64")]` -- `run_mlas_shards` takes
+/// `prefill_tile_grain` instead -- so off x86 this is unit-test-only whether or
+/// not MLAS is on. Narrower than the predicate on the two symbols above for
+/// exactly that reason: widening it to their union would leave the lint live on
+/// `aarch64 + mlas`, where this function has no caller.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn prefill_column_grain(m: usize, k: usize, n: usize) -> usize {
     let macs_per_column = m.saturating_mul(k);
     if macs_per_column == 0 {
@@ -17510,7 +17527,6 @@ mod tests {
     /// A prefill small enough that the task runtime's ~5 us dispatch dominates
     /// stays on the task runtime, whatever the widths look like.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn small_prefill_work_stays_on_the_task_runtime() {
         assert_eq!(
             prefill_fan_out(WIDE_PREFILL_MACS - 1, 16, 32),
@@ -17523,7 +17539,6 @@ mod tests {
     /// on work long enough for a 226 us wake-up to be noise, so take the wide
     /// path.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn large_prefill_work_takes_the_wide_fan_out() {
         assert_eq!(
             prefill_fan_out(WIDE_PREFILL_MACS, 16, 32),
@@ -17539,7 +17554,6 @@ mod tests {
     /// have. When it has them -- no SMT, an explicit task-thread budget, a
     /// narrow cpuset -- the cheaper dispatch wins unconditionally.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn the_wide_fan_out_is_not_taken_when_it_is_not_wider() {
         for wide in 1..=16 {
             assert_eq!(
@@ -17582,7 +17596,6 @@ mod tests {
     /// The native fan-out's grain is a floor in *output columns*, so it must
     /// never exceed the column count nor drop below one.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn prefill_column_grain_stays_within_the_column_count() {
         for &(m, k, n) in &[
             (1usize, 1usize, 1usize),
@@ -17599,7 +17612,6 @@ mod tests {
     /// A column that already carries enough arithmetic is handed out one per
     /// task; thinner columns get batched until they clear the floor.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn prefill_column_grain_batches_only_undersized_columns() {
         // 8 x 1024 = 8 Ki MACs a column, so batch 64 of them to clear 512 Ki.
         assert_eq!(prefill_column_grain(8, 1024, 3072), 64);
@@ -17611,7 +17623,6 @@ mod tests {
 
     /// A degenerate shape must not divide by zero or ask for a zero grain.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn prefill_column_grain_survives_a_zero_sized_problem() {
         assert_eq!(prefill_column_grain(0, 1024, 8), 8);
         assert_eq!(prefill_column_grain(8, 0, 8), 8);
