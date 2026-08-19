@@ -2319,8 +2319,13 @@ unsafe extern "C" fn compute_execute(
             // node's capacity instead of allocating its own. These were the
             // largest single item in the dispatch allocation table: six of the
             // ~12 allocations per node were these vectors being created and
-            // dropped once each. They are cleared at the top of every
-            // iteration, so no node can observe another node's contents.
+            // dropped once each.
+            //
+            // Each is cleared at the top of the iteration that uses it, so a
+            // node always starts from empty regardless of how the previous one
+            // exited. (Every early exit in this loop is a `return`, so a failed
+            // node cannot leak into a later one either way -- the clears are
+            // load-bearing for ordinary node-to-node reuse, not for errors.)
             enum RoutedSlotKind {
                 Ort,
                 Buffer,
@@ -2507,6 +2512,9 @@ unsafe extern "C" fn compute_execute(
                 // intermediates live where the kernels execute; host EPs take a
                 // plain host buffer, which is both correct and measurably faster
                 // than ORT's host scratch allocator (see `intermediate_scratch`).
+                // Redundant while `drain(..)` below is the only consumer, and
+                // kept so the invariant survives an early `continue` being
+                // added to this loop.
                 new_bufs.clear();
                 for &(buf_idx, out_slot, dtype) in &buf_writes {
                     let shape = &output_shapes[out_slot];
