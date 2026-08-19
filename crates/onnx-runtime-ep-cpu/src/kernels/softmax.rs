@@ -1139,6 +1139,11 @@ mod vectorized_tests {
             MIN_PARALLEL_SOFTMAX_ELEMENTS / 2 - 1
         ));
         assert!(fan_out_is_worthwhile(2, MIN_PARALLEL_SOFTMAX_ELEMENTS / 2));
+        // Pin the floor to the element exactly, not to within one: 3*5461 is
+        // one element short of the floor, so a threshold relaxed by a single
+        // element flips this shape and fails here.
+        assert!(!fan_out_is_worthwhile(3, 5461));
+        assert!(fan_out_is_worthwhile(4, 4096));
 
         // Newly-admitted shapes chunk to the same work per chunk as shapes the
         // old gate already admitted, which is why this widening is safe: both
@@ -1152,6 +1157,32 @@ mod vectorized_tests {
         // work" and fans out; a wrapping `*` would read as "none" and would
         // silently pin the largest tensors to one thread.
         assert!(fan_out_is_worthwhile(usize::MAX, usize::MAX));
+    }
+
+    /// The gate above decides nothing on its own — `parallel_rows_per_task` has
+    /// to consult it the right way round. That wiring is invisible to every
+    /// other test in this file, because rows are independent and so the output
+    /// is bit-identical whether or not the fan-out happens. Inverting the
+    /// condition would pin every large softmax back to a single thread and
+    /// silently undo this optimisation while the suite stayed green.
+    #[test]
+    fn the_fan_out_gate_is_wired_the_right_way_round() {
+        // Refusals hold at any pool width, so they need no guard.
+        assert_eq!(parallel_rows_per_task(1, 1 << 20), None);
+        assert_eq!(parallel_rows_per_task(64, 8), None);
+
+        if crate::task_runtime::width() < 2 {
+            return;
+        }
+        // A decode-shaped softmax is exactly what the old row floor refused.
+        let rows = parallel_rows_per_task(32, 8192)
+            .expect("a 32x8192 softmax is 256 Ki elements and must fan out");
+        assert!(
+            rows < 32,
+            "fanning out means more than one chunk, got {rows} rows per task \
+             for all 32 rows"
+        );
+        assert!(parallel_rows_per_task(4096, 128).is_some());
     }
 
     /// The out-of-place softmax derives every output element from `src` alone.
