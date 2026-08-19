@@ -7,7 +7,8 @@
 //! much VRAM, how much host RAM. They used to answer them in two different
 //! places with two different spellings — the generation commands took
 //! `--backend`/`--device`, while `serve` took neither and instead inferred the
-//! backend from a `--native-device` flag that existed nowhere else. The result
+//! backend from a `--native-device` flag that existed nowhere else (now
+//! `--device`, shared by every subcommand). The result
 //! was that a command line learned from `run` was rejected by `serve`, and the
 //! flag that did work was undiscoverable from the other subcommands' help.
 //!
@@ -65,7 +66,7 @@ pub struct EngineArgs {
     #[arg(
         long,
         value_name = "auto|cpu|cuda[:N]",
-        env = "ONNX_GENAI_NATIVE_DEVICE",
+        env = "ONNX_GENAI_DEVICE",
         value_parser = parse_device
     )]
     pub device: Option<DeviceChoice>,
@@ -164,9 +165,9 @@ impl EngineArgs {
     ///
     /// `--device cuda:0` is only meaningful to the native decoder, so asking for
     /// one and leaving `--backend` at `auto` used to run on ORT and ignore the
-    /// device silently. `serve` already worked this way — its `--native-device`
-    /// flag selected the backend as a side effect — and that behaviour is the
-    /// one users expect, so it now applies everywhere.
+    /// device silently. `serve` already worked this way — naming a device
+    /// selected the backend as a side effect — and that behaviour is the one
+    /// users expect, so it now applies everywhere.
     pub fn resolved_backend(&self) -> EngineDecodeBackend {
         match (self.backend, self.device) {
             (EngineDecodeBackend::Auto, Some(DeviceChoice::Cpu | DeviceChoice::Cuda(_))) => {

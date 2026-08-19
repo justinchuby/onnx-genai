@@ -481,54 +481,26 @@ struct GenerateArgs {
     #[arg(long)]
     no_stats: bool,
 
-    /// Prompt text. May also be given positionally after the model
-    /// (`generate MODEL "your prompt"`).
-    #[arg(long = "prompt", short = 'p', value_name = "PROMPT")]
-    prompt_flag: Option<String>,
-
-    /// Prompt text, given positionally.
+    /// Prompt text, given after the model: `generate MODEL "your prompt"`.
+    ///
+    /// Optional at the parser so an omitted prompt is answered with guidance
+    /// rather than clap's bare "required argument"; [`GenerateArgs::prompt`]
+    /// is what the rest of the command reads.
     #[arg(value_name = "PROMPT")]
-    prompt_positional: Option<String>,
-
-    /// The prompt resolved from either spelling. Not parsed from the command
-    /// line; filled by [`GenerateArgs::resolve_prompt`] before use.
-    #[arg(skip)]
-    prompt: String,
+    prompt: Option<String>,
 }
 
 impl GenerateArgs {
-    /// Accept the prompt positionally or as a flag, and fill [`Self::prompt`].
+    /// The prompt to generate from.
     ///
-    /// `model` is positional while `prompt` was flag-only, so the two required
-    /// arguments of the same subcommand disagreed about how to be passed. That
-    /// asymmetry has no reason behind it and is not memorable: the coordinator
-    /// wrote `--model X --prompt Y` in a measurement runbook handed to the
-    /// repository owner, and clap rejected it.
-    ///
-    /// Supplying both spellings is an error rather than a silent precedence
-    /// rule, because someone who typed two different prompts has no preference
-    /// for us to guess at.
-    fn resolve_prompt(&mut self) -> Result<(), String> {
-        self.prompt = match (self.prompt_flag.take(), self.prompt_positional.take()) {
-            (Some(_), Some(_)) => {
-                return Err(
-                    "What: the prompt was given twice, once with --prompt/-p and once \
-                     positionally. Why: only one prompt can be generated from. How: drop \
-                     either the flag or the positional argument."
-                        .to_string(),
-                );
-            }
-            (Some(prompt), None) | (None, Some(prompt)) => prompt,
-            (None, None) => {
-                return Err(
-                    "What: no prompt was given. Why: `generate` needs text to continue. \
-                     How: pass it positionally (`generate MODEL \"your prompt\"`) or as \
-                     `--prompt \"your prompt\"`."
-                        .to_string(),
-                );
-            }
-        };
-        Ok(())
+    /// The model is positional, so the prompt is too: one way to pass each of
+    /// this subcommand's two required arguments, in the order they read.
+    fn take_prompt(&mut self) -> Result<String, String> {
+        self.prompt.take().ok_or_else(|| {
+            "What: no prompt was given. Why: `generate` needs text to continue. \
+             How: pass it after the model (`generate MODEL \"your prompt\"`)."
+                .to_string()
+        })
     }
 }
 
@@ -632,7 +604,7 @@ struct ShowArgs {
 struct ListArgs {
     /// Parent directory whose immediate subdirectories are each treated as one
     /// model. Falls back to ONNX_GENAI_MODELS_DIR.
-    #[arg(long, env = "ONNX_GENAI_MODELS_DIR")]
+    #[arg(value_name = "MODELS_DIR", env = "ONNX_GENAI_MODELS_DIR")]
     models_dir: PathBuf,
 }
 
@@ -750,10 +722,10 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
             runtime.block_on(run_serve(*serve_args))
         }
         Commands::Generate(mut generate_args) => {
-            generate_args
-                .resolve_prompt()
+            let prompt = generate_args
+                .take_prompt()
                 .map_err(|message| anyhow::anyhow!(message))?;
-            generate(*generate_args, &profiling)
+            generate(*generate_args, prompt, &profiling)
         }
         Commands::Run(run_args) => run_repl(run_args, &profiling),
         Commands::Transcribe(transcribe_args) => transcribe(*transcribe_args, &profiling),
@@ -812,69 +784,32 @@ mod tests {
         );
     }
 
+    /// The model is positional, so the prompt is too: one way to pass each of
+    /// this subcommand's two required arguments, in the order they read.
     #[test]
-    fn generate_accepts_positional_model_and_prompt_flag() {
-        let parsed_command_line =
-            Cli::try_parse_from(["onnx-genai", "generate", "./m", "--prompt", "hi"]).unwrap();
-
-        match parsed_command_line.command {
-            Commands::Generate(mut args) => {
-                args.resolve_prompt().expect("flag prompt resolves");
-                assert_eq!(args.model, PathBuf::from("./m"));
-                assert_eq!(args.prompt, "hi");
-            }
-            _ => panic!("expected generate command"),
-        }
-    }
-
-    #[test]
-    fn generate_accepts_a_positional_prompt() {
-        // `model` was positional while `prompt` was flag-only, so the two
-        // required arguments of one subcommand disagreed about how to be
-        // passed. That cost a real user a failed command, so both spellings
-        // work now.
+    fn generate_takes_the_model_then_the_prompt_positionally() {
         let parsed_command_line =
             Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi"]).unwrap();
 
         match parsed_command_line.command {
             Commands::Generate(mut args) => {
-                args.resolve_prompt().expect("positional prompt resolves");
                 assert_eq!(args.model, PathBuf::from("./m"));
-                assert_eq!(args.prompt, "hi");
+                assert_eq!(args.take_prompt().expect("a prompt was given"), "hi");
             }
             _ => panic!("expected generate command"),
         }
     }
 
+    /// Clap's own "required argument" text names a placeholder; someone who
+    /// typed only the model needs to be told what the second word is.
     #[test]
-    fn generate_rejects_a_prompt_given_twice() {
-        // Two different prompts is a mistake with no correct precedence rule,
-        // so it is an error rather than a silent choice.
-        let parsed_command_line =
-            Cli::try_parse_from(["onnx-genai", "generate", "./m", "positional", "-p", "flag"])
-                .unwrap();
+    fn generate_without_a_prompt_says_what_to_type() {
+        let parsed_command_line = Cli::try_parse_from(["onnx-genai", "generate", "./m"]).unwrap();
 
         match parsed_command_line.command {
             Commands::Generate(mut args) => {
-                let error = args
-                    .resolve_prompt()
-                    .expect_err("two prompts must be rejected");
-                assert!(error.contains("twice"), "{error}");
-            }
-            _ => panic!("expected generate command"),
-        }
-    }
-
-    #[test]
-    fn generate_accepts_prompt_short_flag() {
-        let parsed_command_line =
-            Cli::try_parse_from(["onnx-genai", "generate", "./m", "-p", "hi"]).unwrap();
-
-        match parsed_command_line.command {
-            Commands::Generate(mut args) => {
-                args.resolve_prompt().expect("short-flag prompt resolves");
-                assert_eq!(args.model, PathBuf::from("./m"));
-                assert_eq!(args.prompt, "hi");
+                let error = args.take_prompt().expect_err("no prompt was given");
+                assert!(error.contains("generate MODEL"), "{error}");
             }
             _ => panic!("expected generate command"),
         }
@@ -882,16 +817,9 @@ mod tests {
 
     #[test]
     fn cpu_cores_is_shared_by_generate_and_run() {
-        let generate = Cli::try_parse_from([
-            "onnx-genai",
-            "generate",
-            "./m",
-            "--prompt",
-            "hi",
-            "--cpu-cores",
-            "8",
-        ])
-        .unwrap();
+        let generate =
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi", "--cpu-cores", "8"])
+                .unwrap();
         let run = Cli::try_parse_from(["onnx-genai", "run", "./m", "--cpu-cores", "4"]).unwrap();
 
         match generate.command {
@@ -911,23 +839,14 @@ mod tests {
     #[test]
     fn cpu_cores_rejects_zero() {
         assert!(
-            Cli::try_parse_from([
-                "onnx-genai",
-                "generate",
-                "./m",
-                "--prompt",
-                "hi",
-                "--cpu-cores",
-                "0",
-            ])
-            .is_err()
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi", "--cpu-cores", "0",])
+                .is_err()
         );
     }
 
     #[test]
     fn cli_uses_finite_fallback_until_a_model_context_is_known() {
-        let parsed =
-            Cli::try_parse_from(["onnx-genai", "generate", "./m", "--prompt", "hi"]).unwrap();
+        let parsed = Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi"]).unwrap();
 
         match parsed.command {
             Commands::Generate(args) => {
@@ -1049,7 +968,6 @@ mod tests {
             "onnx-genai",
             "generate",
             "./m",
-            "--prompt",
             "hi",
             "--max-context",
             "1024",
@@ -1075,31 +993,16 @@ mod tests {
     #[test]
     fn max_context_rejects_zero() {
         assert!(
-            Cli::try_parse_from([
-                "onnx-genai",
-                "generate",
-                "./m",
-                "--prompt",
-                "hi",
-                "--max-context",
-                "0",
-            ])
-            .is_err()
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi", "--max-context", "0",])
+                .is_err()
         );
     }
 
     #[test]
     fn backend_is_shared_by_generate_run_and_transcribe() {
-        let generate = Cli::try_parse_from([
-            "onnx-genai",
-            "generate",
-            "./m",
-            "--prompt",
-            "hi",
-            "--backend",
-            "native",
-        ])
-        .unwrap();
+        let generate =
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi", "--backend", "native"])
+                .unwrap();
         let run = Cli::try_parse_from(["onnx-genai", "run", "./m", "--backend", "ort"]).unwrap();
         let transcribe =
             Cli::try_parse_from(["onnx-genai", "transcribe", "./m", "--backend", "native"])
@@ -1148,8 +1051,7 @@ mod tests {
 
     #[test]
     fn backend_defaults_to_auto() {
-        let parsed =
-            Cli::try_parse_from(["onnx-genai", "generate", "./m", "--prompt", "hi"]).unwrap();
+        let parsed = Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi"]).unwrap();
 
         match parsed.command {
             Commands::Generate(args) => {
@@ -1165,17 +1067,10 @@ mod tests {
 
     #[test]
     fn backend_reuses_repl_parser_error() {
-        let error = Cli::try_parse_from([
-            "onnx-genai",
-            "generate",
-            "./m",
-            "--prompt",
-            "hi",
-            "--backend",
-            "cuda",
-        ])
-        .expect_err("cuda is an execution provider, not a decode backend")
-        .to_string();
+        let error =
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi", "--backend", "cuda"])
+                .expect_err("cuda is an execution provider, not a decode backend")
+                .to_string();
 
         assert!(
             error.contains("What: \"cuda\" is not a decode backend"),
@@ -1190,38 +1085,21 @@ mod tests {
             "onnx-genai",
             "generate",
             "./m",
-            "--prompt",
             "hi",
             "--temperature",
             "0.7",
         ])
         .unwrap();
         let top_p = Cli::try_parse_from(["onnx-genai", "run", "./m", "--top-p", "0.9"]).unwrap();
-        let top_k = Cli::try_parse_from([
-            "onnx-genai",
-            "generate",
-            "./m",
-            "--prompt",
-            "hi",
-            "--top-k",
-            "40",
-        ])
-        .unwrap();
-        let temperature_zero = Cli::try_parse_from([
-            "onnx-genai",
-            "generate",
-            "./m",
-            "--prompt",
-            "hi",
-            "--temperature",
-            "0",
-        ])
-        .unwrap();
+        let top_k =
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi", "--top-k", "40"]).unwrap();
+        let temperature_zero =
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi", "--temperature", "0"])
+                .unwrap();
         let forced_greedy = Cli::try_parse_from([
             "onnx-genai",
             "generate",
             "./m",
-            "--prompt",
             "hi",
             "--temperature",
             "0.7",
@@ -1252,29 +1130,9 @@ mod tests {
     }
 
     #[test]
-    fn generate_requires_a_prompt_in_either_spelling() {
-        // Parsing now succeeds with neither spelling present -- the prompt is
-        // resolved afterwards -- so the rejection moved from clap to
-        // `resolve_prompt`, and the message has to carry its own weight.
-        let parsed = Cli::try_parse_from(["onnx-genai", "generate", "./m"]).unwrap();
-        match parsed.command {
-            Commands::Generate(mut args) => {
-                let error = args
-                    .resolve_prompt()
-                    .expect_err("a missing prompt must be rejected");
-                assert!(error.contains("no prompt was given"), "{error}");
-                assert!(error.contains("positionally"), "{error}");
-            }
-            _ => panic!("expected generate command"),
-        }
-    }
-
-    #[test]
-    fn generate_rejects_model_flag() {
-        assert!(
-            Cli::try_parse_from(["onnx-genai", "generate", "--model", "./m", "--prompt", "hi"])
-                .is_err()
-        );
+    fn generate_rejects_model_and_prompt_flags() {
+        assert!(Cli::try_parse_from(["onnx-genai", "generate", "--model", "./m", "hi"]).is_err());
+        assert!(Cli::try_parse_from(["onnx-genai", "generate", "./m", "--prompt", "hi"]).is_err());
     }
 
     #[test]
@@ -1305,15 +1163,8 @@ mod tests {
 
     #[test]
     fn generate_accepts_no_stats_opt_out() {
-        let parsed_command_line = Cli::try_parse_from([
-            "onnx-genai",
-            "generate",
-            "./m",
-            "--prompt",
-            "hi",
-            "--no-stats",
-        ])
-        .unwrap();
+        let parsed_command_line =
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi", "--no-stats"]).unwrap();
 
         match parsed_command_line.command {
             Commands::Generate(args) => assert!(args.no_stats),
@@ -1374,7 +1225,6 @@ mod tests {
             "onnx-genai",
             "generate",
             "./m",
-            "--prompt",
             "describe",
             "--image",
             "a.png",
@@ -1404,7 +1254,6 @@ mod tests {
             "onnx-genai",
             "generate",
             "./m",
-            "--prompt",
             "an astronaut riding a horse",
             "--output-image",
             "out.png",
@@ -1425,8 +1274,8 @@ mod tests {
 
         match parsed.command {
             Commands::Generate(mut args) => {
-                args.resolve_prompt().expect("prompt resolves");
-                let request = args.image_output.to_request(args.prompt.clone());
+                let prompt = args.take_prompt().expect("a prompt was given");
+                let request = args.image_output.to_request(prompt);
                 assert_eq!(
                     args.image_output.output_image,
                     Some(PathBuf::from("out.png"))
@@ -1448,7 +1297,6 @@ mod tests {
             "onnx-genai",
             "generate",
             "./m",
-            "--prompt",
             "a cat",
             "--output-image",
             "out.png",
@@ -1461,10 +1309,10 @@ mod tests {
 
         match parsed.command {
             Commands::Generate(mut args) => {
-                args.resolve_prompt().expect("prompt resolves");
+                let prompt = args.take_prompt().expect("a prompt was given");
                 let decoder = args
                     .image_output
-                    .to_request(args.prompt.clone())
+                    .to_request(prompt)
                     .vae_decoder
                     .expect("--vae-decoder must be carried through");
                 assert_eq!(decoder.model_path, PathBuf::from("vae_decoder/model.onnx"));
