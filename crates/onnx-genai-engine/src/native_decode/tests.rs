@@ -1396,7 +1396,7 @@ fn build_cuda_decoder_with_fixed_state(
             Some(&io),
         )
     } else {
-        NativeDecodeSession::from_session_with_cuda_options(
+        NativeDecodeSession::from_session_with_cuda_options_and_io(
             session,
             NativeDecodeCudaOptions {
                 decode_batch: None,
@@ -1406,6 +1406,7 @@ fn build_cuda_decoder_with_fixed_state(
                 weight_offload_enabled: None,
                 weight_offload_stable_va: None,
             },
+            Some(&tiny_decoder_io()),
         )
     }
 }
