@@ -177,6 +177,18 @@ Structural graph-fusion pass `CudaLinearAttentionGatingFusion` folds both standa
 
 ---
 
+### 2026-08-19: LinearAttention warp-cooperative kernel rewrite — spill eliminated (PR #1503)
+
+**By:** Gaff (gaff-16)
+
+Rewrote the gated-delta `LinearAttention` decode kernel (`linear_attention.rs`) to the warp-cooperative layout: one warp owns each state column with d_k rows distributed across lane registers, replacing the `sc[MAX_D_K=256]` local-memory array (which spilled to local-mem at 56 regs/thread). Two d_k dot-products (`r = Sᵀk`, `o = qᵀS`) became `__shfl_xor` warp reductions, replacing 128-iteration serial loops. ncu: local-load sectors 163,840 → 0, local-store 98,304 → 0, kernel 21,664 → 12,510 ns (−42%), SM util 1.31% → 13.3%, occupancy 12.0% → 21.2%. Admin-merged (squash, 2026-08-19). Opt-out: `ONNX_GENAI_CUDA_DISABLE_LINATTN_WARP_COOP=1`.
+
+**Result (H200, qwen3.5-0.8b fp16io, end-to-end):** +7.4–10.6 tok/s (~240 → ~249 tok/s, +3.2% at median). Native ~249 vs ORT ~290 (~1.16× ORT-ahead, narrowed from ~1.19×).
+
+**CRITICAL FINDING — lock tests assert greedy token-IDs, NOT bit-exact bytes:** The qwen35_*_text_decode_lock tests assert `Vec<u32>` argmax (greedy token-ID sequences), not byte-identical output. Warp-shuffle reduction reorder is ULP-divergent but argmax-stable — qwen3.5-0.8b and qwen3.5-2b lock PASS, GPU oracle-parity suite PASS across GQA/inverse-GQA/key-sharing/per-key-decay/shared-beta/all update rules + new d_k=128/96/130 configs. **De-risk implication:** future ULP-divergent CUDA kernel rewrites (warp reductions, reduction-order changes, etc.) are not barred by the lock gate provided argmax stability is preserved. Validate ≥2 models; do not assume bit-identity.
+
+---
+
 ### 2026-08-19: int4 MatMulNBits GEMV occupancy-gated pipe-vs-plain entry (PR #1501)
 
 **By:** Gaff (gaff-16)
