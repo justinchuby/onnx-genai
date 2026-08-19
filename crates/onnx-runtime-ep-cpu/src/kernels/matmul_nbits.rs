@@ -1479,7 +1479,7 @@ impl Kernel for MatMulNBitsKernel {
             // dense fallback's `sgemm_simd_packed`. Running it inside the
             // decode pool measured 2.4x slower purely from the narrower pool.
             #[cfg(target_arch = "x86_64")]
-            if m >= int4_prefill_gebp_min_rows(self.k * self.n / 2)
+            if m >= int4_prefill_gebp_min_rows(self.k * self.n / 2, self.block_size)
                 && self.block_size.is_multiple_of(2)
                 && crate::backend::has_simd_x86()
                 && int4_prefill_gebp_enabled()
@@ -7202,6 +7202,19 @@ const INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT: usize = 24;
 #[cfg(target_arch = "x86_64")]
 const INT4_PREFILL_GEBP_L2_RESIDENT_BYTES: usize = 4 << 20;
 
+/// Crossover for a weight whose block size the column-blocked kernels cannot
+/// take.
+///
+/// [`borrowed_affine_int4_matmul_prefill`] and
+/// [`borrowed_affine_int4_matmul_nblock`] both require 32-element blocks. For
+/// the ONNX-minimum block size of 16 the GEBP prefill is the only vectorised
+/// route there is, and everything below it is a scalar per-block dot running on
+/// the narrow decode pool. Raising the crossover for those weights would not
+/// hand them a better kernel, it would hand them no kernel, so they keep the
+/// threshold measured before #1356 arrived.
+#[cfg(target_arch = "x86_64")]
+const INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED: usize = 4;
+
 /// The `m` at which the fused-dequant GEBP overtakes the column-blocked
 /// borrowed kernel for this node's weight.
 ///
@@ -7219,9 +7232,15 @@ const INT4_PREFILL_GEBP_L2_RESIDENT_BYTES: usize = 4 << 20;
 ///
 /// A flat `12` would hand the small shape a 1.45x regression at `m = 12`; a
 /// flat `24` would give up 1.35x-1.80x on the large shapes at `m = 16..23`.
+///
+/// Both regimes were measured on `block_size = 32` weights, which is also the
+/// smallest block the kernels that win below the crossover can take; see
+/// [`INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED`] for the ones that cannot.
 #[cfg(target_arch = "x86_64")]
-fn int4_prefill_gebp_min_rows(packed_weight_bytes: usize) -> usize {
-    if packed_weight_bytes > INT4_PREFILL_GEBP_L2_RESIDENT_BYTES {
+fn int4_prefill_gebp_min_rows(packed_weight_bytes: usize, block_size: usize) -> usize {
+    if !block_size.is_multiple_of(32) {
+        INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED
+    } else if packed_weight_bytes > INT4_PREFILL_GEBP_L2_RESIDENT_BYTES {
         INT4_PREFILL_GEBP_MIN_ROWS
     } else {
         INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT
@@ -19289,19 +19308,41 @@ mod tests {
         assert!(large > INT4_PREFILL_GEBP_L2_RESIDENT_BYTES);
 
         assert_eq!(
-            int4_prefill_gebp_min_rows(small),
+            int4_prefill_gebp_min_rows(small, 32),
             INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT,
             "an L2-resident weight measured its crossover at m=24"
         );
         assert_eq!(
-            int4_prefill_gebp_min_rows(large),
+            int4_prefill_gebp_min_rows(large, 32),
             INT4_PREFILL_GEBP_MIN_ROWS,
             "a DRAM-streaming weight measured its crossover at m=12"
         );
-        assert!(
-            INT4_PREFILL_GEBP_MIN_ROWS < INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT,
-            "the resident threshold is the later one; swapping them would \
-             regress the small shape by 1.45x at m=12"
-        );
+        // The resident threshold is the later one; swapping them would regress
+        // the small shape by 1.45x at m=12.
+        const {
+            assert!(INT4_PREFILL_GEBP_MIN_ROWS < INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT);
+        }
+    }
+
+    /// A 16-element block cannot enter either column-blocked kernel, so raising
+    /// its crossover would drop it from the GEBP prefill straight to a scalar
+    /// per-block dot on the narrow decode pool rather than to a better kernel.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int4_prefill_gebp_crossover_holds_for_blocks_the_row_kernels_reject() {
+        let large = 4096 * 6144 / 2;
+        let small = 1024 * 2560 / 2;
+        for bytes in [small, large] {
+            assert_eq!(
+                int4_prefill_gebp_min_rows(bytes, 16),
+                INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED,
+                "block_size=16 has no column-blocked kernel to hand off to"
+            );
+        }
+        // Every block size the retune applies to is one those kernels accept.
+        for block_size in [32usize, 64, 128, 256] {
+            assert!(block_size.is_multiple_of(32));
+            assert!(int4_prefill_gebp_min_rows(large, block_size) >= INT4_PREFILL_GEBP_MIN_ROWS);
+        }
     }
 }
