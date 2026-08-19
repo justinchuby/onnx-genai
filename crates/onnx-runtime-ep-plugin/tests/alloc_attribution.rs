@@ -35,7 +35,7 @@ fn an_allocation_is_charged_to_the_phase_that_is_open() {
     if !dispatch_probe::compiled_in() {
         assert_eq!(
             d.phase_allocs,
-            [0; Phase::COUNT],
+            [0; dispatch_probe::ALLOC_BUCKETS],
             "a production build must attribute nothing"
         );
         return;
@@ -58,19 +58,43 @@ fn an_allocation_is_charged_to_the_phase_that_is_open() {
     }
 }
 
+/// An allocation with no phase open must be *visible* rather than dropped.
+///
+/// Charging it to no phase at all was the original behaviour, and it made the
+/// table unreadable: the first live routed dispatch showed four allocations per
+/// node inside phases with no way to tell whether that was all of them or a
+/// quarter of them. It has to land in `UNATTRIBUTED` so the columns add up to
+/// the process total, while still never being blamed on a phase.
 #[test]
-fn an_allocation_outside_every_phase_is_charged_to_none() {
+fn an_allocation_outside_every_phase_is_charged_to_the_unattributed_bucket() {
     let before = dispatch_probe::snapshot();
     let held = allocate(8192);
     let d = dispatch_probe::snapshot().since(&before);
     drop(held);
 
-    assert_eq!(
-        d.phase_allocs,
-        [0; Phase::COUNT],
-        "work outside dispatch must not be attributed to a dispatch phase"
+    for (i, n) in d.phase_allocs.iter().enumerate() {
+        if i != dispatch_probe::UNATTRIBUTED {
+            assert_eq!(
+                *n, 0,
+                "work outside dispatch was attributed to phase {i}: {:?}",
+                d.phase_allocs
+            );
+        }
+    }
+
+    if !dispatch_probe::compiled_in() {
+        return;
+    }
+    assert!(
+        d.phase_allocs[dispatch_probe::UNATTRIBUTED] >= 1,
+        "an allocation outside every phase went uncounted: {:?}",
+        d.phase_allocs
     );
-    assert_eq!(d.phase_alloc_bytes, [0; Phase::COUNT]);
+    assert!(
+        d.phase_alloc_bytes[dispatch_probe::UNATTRIBUTED] >= 8192,
+        "unattributed bytes were not recorded: {:?}",
+        d.phase_alloc_bytes
+    );
 }
 
 /// Phases nest — a guard closes at scope exit, not at an early `return`, so

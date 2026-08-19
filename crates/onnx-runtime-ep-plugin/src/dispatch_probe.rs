@@ -201,15 +201,28 @@ pub struct Counters {
     pub events: [u64; Event::COUNT],
     /// Heap allocations made while each phase was the innermost open one.
     ///
+    /// Length is [`ALLOC_BUCKETS`], not `Phase::COUNT`: the last slot is
+    /// [`UNATTRIBUTED`], charged when an allocation happens with no phase open.
+    /// Without that slot the table silently omits allocations rather than
+    /// showing them, which is the opposite of what an attribution pass needs --
+    /// the first live reading had four allocations per node inside phases and
+    /// gave no hint whether that was all of them.
+    ///
     /// Only populated when a [`CountingAllocator`] is installed as the global
     /// allocator; otherwise zero. Unlike the hand-placed
     /// [`Event::DispatchAlloc`] tally this is exhaustive -- it sees every
     /// allocation, including ones inside `Vec` growth, `format!`, and code we
     /// did not write -- so it is a total rather than a lower bound.
-    pub phase_allocs: [u64; Phase::COUNT],
-    /// Bytes requested by those allocations.
-    pub phase_alloc_bytes: [u64; Phase::COUNT],
+    pub phase_allocs: [u64; ALLOC_BUCKETS],
+    /// Bytes requested by those allocations, same bucketing.
+    pub phase_alloc_bytes: [u64; ALLOC_BUCKETS],
 }
+
+/// Index of the bucket for allocations made with no phase open.
+pub const UNATTRIBUTED: usize = Phase::COUNT;
+
+/// Number of allocation buckets: one per phase, plus [`UNATTRIBUTED`].
+pub const ALLOC_BUCKETS: usize = Phase::COUNT + 1;
 
 impl Counters {
     /// This reading minus an earlier one — what happened in between.
@@ -223,6 +236,8 @@ impl Counters {
         for i in 0..Phase::COUNT {
             d.phase_calls[i] = self.phase_calls[i].saturating_sub(earlier.phase_calls[i]);
             d.phase_ns[i] = self.phase_ns[i].saturating_sub(earlier.phase_ns[i]);
+        }
+        for i in 0..ALLOC_BUCKETS {
             d.phase_allocs[i] = self.phase_allocs[i].saturating_sub(earlier.phase_allocs[i]);
             d.phase_alloc_bytes[i] =
                 self.phase_alloc_bytes[i].saturating_sub(earlier.phase_alloc_bytes[i]);
@@ -262,7 +277,7 @@ impl Counters {
                 self.event(e) as f64 / runs as f64
             ));
         }
-        for p in Phase::ALL {
+        for p in Phase::ALL.into_iter() {
             s.push_str(&format!(
                 "  {:<16} {:>10} calls  {:>12} ns  ({:.0} ns/run)\n",
                 p.name(),
@@ -277,7 +292,7 @@ impl Counters {
 
 #[cfg(feature = "dispatch_probe")]
 mod imp {
-    use super::{Counters, Event, Phase};
+    use super::{ALLOC_BUCKETS, Counters, Event, Phase, UNATTRIBUTED};
     use std::cell::Cell;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
@@ -304,10 +319,10 @@ mod imp {
             const { [const { Cell::new(0) }; Phase::COUNT] };
         static TL_EVENTS: [Cell<u64>; Event::COUNT] =
             const { [const { Cell::new(0) }; Event::COUNT] };
-        static TL_PHASE_ALLOCS: [Cell<u64>; Phase::COUNT] =
-            const { [const { Cell::new(0) }; Phase::COUNT] };
-        static TL_PHASE_ALLOC_BYTES: [Cell<u64>; Phase::COUNT] =
-            const { [const { Cell::new(0) }; Phase::COUNT] };
+        static TL_PHASE_ALLOCS: [Cell<u64>; ALLOC_BUCKETS] =
+            const { [const { Cell::new(0) }; ALLOC_BUCKETS] };
+        static TL_PHASE_ALLOC_BYTES: [Cell<u64>; ALLOC_BUCKETS] =
+            const { [const { Cell::new(0) }; ALLOC_BUCKETS] };
     }
 
     // Which phase is currently open on this thread, or `NO_PHASE`.
@@ -326,9 +341,10 @@ mod imp {
     static G_PHASE_CALLS: [AtomicU64; Phase::COUNT] = [const { AtomicU64::new(0) }; Phase::COUNT];
     static G_PHASE_NS: [AtomicU64; Phase::COUNT] = [const { AtomicU64::new(0) }; Phase::COUNT];
     static G_EVENTS: [AtomicU64; Event::COUNT] = [const { AtomicU64::new(0) }; Event::COUNT];
-    static G_PHASE_ALLOCS: [AtomicU64; Phase::COUNT] = [const { AtomicU64::new(0) }; Phase::COUNT];
-    static G_PHASE_ALLOC_BYTES: [AtomicU64; Phase::COUNT] =
-        [const { AtomicU64::new(0) }; Phase::COUNT];
+    static G_PHASE_ALLOCS: [AtomicU64; ALLOC_BUCKETS] =
+        [const { AtomicU64::new(0) }; ALLOC_BUCKETS];
+    static G_PHASE_ALLOC_BYTES: [AtomicU64; ALLOC_BUCKETS] =
+        [const { AtomicU64::new(0) }; ALLOC_BUCKETS];
 
     /// Attribute one allocation of `bytes` to whichever phase is open.
     ///
@@ -337,10 +353,11 @@ mod imp {
     /// panic out of `alloc` would be considerably worse than a lost count.
     pub fn record_alloc(bytes: u64) {
         let phase = TL_CURRENT_PHASE.try_with(Cell::get).unwrap_or(NO_PHASE);
-        if phase == NO_PHASE {
-            return;
-        }
-        let i = phase as usize;
+        let i = if phase == NO_PHASE {
+            UNATTRIBUTED
+        } else {
+            phase as usize
+        };
         let _ = TL_PHASE_ALLOCS.try_with(|a| a[i].set(a[i].get().wrapping_add(1)));
         let _ = TL_PHASE_ALLOC_BYTES.try_with(|a| a[i].set(a[i].get().wrapping_add(bytes)));
         G_PHASE_ALLOCS[i].fetch_add(1, Ordering::Relaxed);
@@ -676,11 +693,42 @@ pub fn ort_calls(n: u64) {
 /// # Safety
 ///
 /// `out` must be null or point to `len` writable `u64`s.
+/// Name of allocation bucket `index`, or null if out of range.
+///
+/// Exists because the harness must not keep its own copy of the phase order.
+/// It did, briefly, and the copy was wrong: the table labelled `TensorBind`'s
+/// allocations "OutputMeta" and `Allocate`'s "TensorBind", which is the kind of
+/// error that survives review because every number in it looks plausible.
+///
+/// Index `Phase::COUNT` is the unattributed bucket.
+///
+/// # Safety
+///
+/// The returned pointer is to a `'static` NUL-terminated string and must not be
+/// freed. It stays valid for the lifetime of the library.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_dispatch_probe_phase_name(index: usize) -> *const std::os::raw::c_char {
+    const NAMES: [&core::ffi::CStr; ALLOC_BUCKETS] = [
+        c"callback_entry",
+        c"metadata_query",
+        c"tensor_bind",
+        c"allocate",
+        c"dispatch_lookup",
+        c"kernel_invoke",
+        c"status_crossing",
+        c"unattributed",
+    ];
+    match NAMES.get(index) {
+        Some(n) => n.as_ptr(),
+        None => core::ptr::null(),
+    }
+}
+
 /// Number of `u64`s [`nxrt_dispatch_probe_snapshot`] writes.
 ///
 /// Exported so the cdylib harness sizes its buffer from the same expression the
 /// writer uses, rather than from a number copied into a test.
-pub const SNAPSHOT_LEN: usize = Phase::COUNT * 4 + Event::COUNT;
+pub const SNAPSHOT_LEN: usize = Phase::COUNT * 2 + ALLOC_BUCKETS * 2 + Event::COUNT;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nxrt_dispatch_probe_snapshot(out: *mut u64, len: usize) -> usize {
@@ -852,6 +900,29 @@ mod tests {
         for (i, e) in Event::ALL.iter().enumerate() {
             assert_eq!(*e as usize, i, "{} is out of position", e.name());
         }
+    }
+
+    /// The exported names must match `Phase::name`, in order.
+    ///
+    /// Two sources of truth for the same list is exactly how the harness came
+    /// to mislabel two phases; this makes the duplicate a checked one.
+    #[test]
+    fn exported_phase_names_match_the_enum() {
+        for p in Phase::ALL.into_iter() {
+            let ptr = nxrt_dispatch_probe_phase_name(p as usize);
+            assert!(!ptr.is_null(), "{} has no exported name", p.name());
+            // SAFETY: the export returns a 'static NUL-terminated string.
+            let got = unsafe { core::ffi::CStr::from_ptr(ptr) };
+            assert_eq!(got.to_str().unwrap(), p.name(), "name mismatch");
+        }
+        let last = nxrt_dispatch_probe_phase_name(UNATTRIBUTED);
+        assert!(!last.is_null());
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { core::ffi::CStr::from_ptr(last) }.to_str().unwrap(),
+            "unattributed"
+        );
+        assert!(nxrt_dispatch_probe_phase_name(ALLOC_BUCKETS).is_null());
     }
 
     /// The C entry point is what the cdylib harness uses; it must refuse a

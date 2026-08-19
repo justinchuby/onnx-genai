@@ -6455,14 +6455,26 @@ fn plugin_path_ab_vs_plain_ort() {
             // Allocation attribution runs before the timed loop so its
             // counter updates never land inside a measured iteration.
             if run_ours
-                && let Some(buf) =
-                    probe_dispatch(api, session, &input_name_ptrs, &values, &output_name_ptrs, 64)
+                && let Some((buf, names)) = probe_dispatch(
+                    api,
+                    session,
+                    &input_name_ptrs,
+                    &values,
+                    &output_name_ptrs,
+                    64,
+                )
             {
-                    // Node count comes from ORT's assignment list, not from
-                    // the case definition: per-node figures must divide by the
-                    // nodes this EP actually received, and fusion means that
-                    // is not the same as the number of `Run` callbacks.
-                report_probe(case.name, info.ops_on_our_ep().len().max(1), 64, &buf);
+                // Node count comes from ORT's assignment list, not from the
+                // case definition: per-node figures must divide by the nodes
+                // this EP actually received, and fusion means that is not the
+                // same as the number of `Run` callbacks.
+                report_probe(
+                    case.name,
+                    info.ops_on_our_ep().len().max(1),
+                    64,
+                    &buf,
+                    &names,
+                );
             }
 
             // Interleave one iteration each so a drifting host load lands on
@@ -7441,21 +7453,34 @@ fn the_native_activation_family_executes_locally_and_matches_ort_numerics() {
     );
 }
 
-/// Phase names, in the order `nxrt_dispatch_probe_snapshot` writes them.
+/// Bucket names, read from the library rather than copied.
 ///
-/// Duplicated from `dispatch_probe::Phase` because this harness talks to the
-/// cdylib over the C ABI, not through the Rust type. `probe_phase_names` is
-/// checked against the returned length, so a phase added on the library side
-/// shows up as a loud mismatch here rather than as a silently shifted table.
-const PROBE_PHASES: &[&str] = &[
-    "OrtCallback",
-    "InputMeta",
-    "OutputMeta",
-    "TensorBind",
-    "DispatchLookup",
-    "KernelInvoke",
-    "StatusCrossing",
-];
+/// A hand-maintained copy of this list drifted from the enum and mislabelled
+/// two rows of the attribution table -- every number was right and attached to
+/// the wrong phase. Asking the cdylib removes the second source of truth.
+fn probe_phase_names(lib: &libloading::Library) -> Vec<String> {
+    // SAFETY: the export is `extern "C"` with this signature and returns either
+    // null or a 'static NUL-terminated string owned by the library.
+    unsafe {
+        let name_of: libloading::Symbol<
+            '_,
+            unsafe extern "C" fn(usize) -> *const std::os::raw::c_char,
+        > = match lib.get(b"nxrt_dispatch_probe_phase_name") {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for i in 0.. {
+            let p = name_of(i);
+            if p.is_null() {
+                break;
+            }
+            out.push(std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned());
+        }
+        out
+    }
+}
+
 const PROBE_EVENTS: &[&str] = &[
     "OrtFfiCall",
     "DispatchAlloc",
@@ -7496,7 +7521,7 @@ unsafe fn probe_dispatch(
     values: &[*const ort::OrtValue],
     output_names: &[*const std::os::raw::c_char],
     runs: usize,
-) -> Option<Vec<u64>> {
+) -> Option<(Vec<u64>, Vec<String>)> {
     if std::env::var("NXRT_MM_BENCH_PROBE").unwrap_or_default() != "1" {
         return None;
     }
@@ -7510,29 +7535,35 @@ unsafe fn probe_dispatch(
             lib.get(b"nxrt_dispatch_probe_snapshot").ok()?;
         reset();
         bench_runs(api, session, input_names, values, output_names, runs);
-        let need = PROBE_PHASES.len() * 4 + PROBE_EVENTS.len();
+        let buckets = probe_phase_names(lib).len();
+        assert!(buckets > 0, "cdylib exports no phase names");
+        let need = (buckets - 1) * 2 + buckets * 2 + PROBE_EVENTS.len();
         let mut buf = vec![0u64; need];
         let written = snapshot(buf.as_mut_ptr(), need);
         assert_eq!(
             written, need,
             "probe wrote {written} u64s, this harness expected {need} \
-             — PROBE_PHASES/PROBE_EVENTS are out of sync with dispatch_probe"
+             — PROBE_EVENTS is out of sync with dispatch_probe"
         );
-        Some(buf)
+        Some((buf, probe_phase_names(lib)))
     }
 }
 
 /// Print allocations and bytes per phase, normalised per `Run` and per node.
-fn report_probe(case: &str, nodes: usize, runs: usize, buf: &[u64]) {
-    let np = PROBE_PHASES.len();
+fn report_probe(case: &str, nodes: usize, runs: usize, buf: &[u64], names: &[String]) {
+    let nb = names.len();
+    let np = nb - 1;
     let (calls, ns) = (&buf[..np], &buf[np..2 * np]);
-    let (allocs, bytes) = (&buf[2 * np..3 * np], &buf[3 * np..4 * np]);
-    let events = &buf[4 * np..];
+    let (allocs, bytes) = (
+        &buf[2 * np..2 * np + nb],
+        &buf[2 * np + nb..2 * np + 2 * nb],
+    );
+    let events = &buf[2 * np + 2 * nb..];
     let per_run = runs.max(1) as f64;
     let per_node = (runs.max(1) * nodes.max(1)) as f64;
     println!("# probe {case}: nodes={nodes} runs={runs}");
     println!("# phase,calls_per_run,ns_per_run,allocs_per_run,allocs_per_node,bytes_per_run");
-    for (i, name) in PROBE_PHASES.iter().enumerate() {
+    for (i, name) in names.iter().enumerate().take(np) {
         println!(
             "# {name},{:.2},{:.0},{:.3},{:.3},{:.0}",
             calls[i] as f64 / per_run,
@@ -7542,6 +7573,15 @@ fn report_probe(case: &str, nodes: usize, runs: usize, buf: &[u64]) {
             bytes[i] as f64 / per_run,
         );
     }
+    // The unattributed bucket is the point of the table, not a footnote: it is
+    // what says whether the per-phase rows are the whole story.
+    println!(
+        "# {},,,{:.3},{:.3},{:.0}",
+        names[nb - 1],
+        allocs[nb - 1] as f64 / per_run,
+        allocs[nb - 1] as f64 / per_node,
+        bytes[nb - 1] as f64 / per_run,
+    );
     let total: u64 = allocs.iter().sum();
     let total_bytes: u64 = bytes.iter().sum();
     println!(
