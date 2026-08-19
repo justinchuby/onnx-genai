@@ -4067,3 +4067,63 @@ floor is 12–20%, and that at **two** threads the floor is small enough (0.22�
 for a properly controlled multi-threaded experiment to be worth running. That
 experiment — sharing one packed panel across row blocks rather than re-packing
 per block — is the open follow-up, and it now has a method that can answer it.
+
+## 40. The recurring shape: a threshold calibrated in one regime makes the wrong call in another
+
+This section records a pattern rather than a measurement. It surfaced three
+separate times in a single day, in unrelated parts of the codebase, each time
+costing real investigation to rediscover. It is written down so the fourth
+instance is recognised rather than re-derived.
+
+### 40.1 The three instances
+
+**#1261 — `PARALLEL_MIN_WORK` in the half GEMM.** The constant `1_048_576` was
+tuned on a 16-core Linux box. Measured on an Intel i7-13800H (14C/20T), the true
+serial/parallel crossover is ~2-3M MACs, so the shipped constant is conservative
+here. It cannot *regress* against the base behaviour (the base forks
+unconditionally), so it was safe to land as-is, but it is leaving work on the
+table on this hardware and would likely land somewhere else again on a many-core
+AMD server part. Three machines, three crossovers.
+
+**The `m == 1` decode-GEMV dispatch in `matmul_nbits`.** `m == 1` was routed to a
+specialised decode GEMV and `m > 1` to the tiled prefill GEMM. That split is
+correct for its original regime — prefill, where M is large — but at batch decode
+with M = 2..8 it meant re-reading the whole weight grid every step, costing 5.4x
+per step for 2x the work. The dispatch was not wrong; it was calibrated for a
+regime that batch decode does not occupy.
+
+**#1421 — the RMSNorm fold's hidden-size floor.** `CudaSkipRmsNormMatMulFusion`
+folds gamma into gate/up only for `hidden >= 1280` (`crates/onnx-runtime-ep-cuda/src/optimizer.rs:1295`). That
+floor was calibrated on **M=1** throughput, where the prologue costs ~0.7 ms on
+tiny decoders. At M>=2 the segmentation penalty it causes is ~20 ms — more than
+an order of magnitude larger than the cost it was protecting against. The floor
+is defensible in the regime it was measured in and wrong in the one next to it.
+
+### 40.2 What the three have in common
+
+In every case the constant was **correct when it was set**, measured honestly, and
+then became wrong because a *different regime* started using the same code path.
+None of them is a mistake by their author. The failure is that a threshold records
+a conclusion without recording the regime the conclusion was drawn in, so the next
+reader cannot tell whether it applies to them.
+
+Note also that two of the three were found only because something *else* was being
+investigated. A regime-mismatched threshold does not announce itself: it presents
+as "this path is slower than expected", and the constant is the last place anyone
+looks.
+
+### 40.3 The practice this suggests
+
+Consistent with §32.2's rule that a perf number must carry its hardware, thread
+count and reference baseline: **a tuning constant should carry the regime it was
+calibrated in**, next to the constant, in the same commit that introduces it. At
+minimum: what was varied, what was held fixed, and which workload shape the
+measurement came from (prefill vs decode, M=1 vs batch, resident vs streaming,
+core count).
+
+Where a constant is cheap to derive at runtime, deriving it beats recording it —
+see #1261's proposal for a hardware-aware crossover rather than any single tuned
+value. Where it must stay fixed, an env override (as
+`ONNX_GENAI_DECODE_GEMV_LOOP_MAX_M` and `ONNX_GENAI_RMSNORM_MIN_HIDDEN` provide)
+at least makes the alternative regime measurable without a rebuild, which is how
+all three of these were diagnosed.

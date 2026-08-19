@@ -206,6 +206,41 @@ fn native_metadata_precedes_invalid_genai_config_fallback() {
     assert_eq!(directory.spec.models.len(), 2);
 }
 
+// Resolving a pipeline already reads and validates the sidecar, so the settings
+// it declares are carried on the directory. A consumer that re-opened the file
+// could disagree with the spec built beside it, and one that swallowed the
+// parse error would see a package that declares nothing.
+#[test]
+fn a_resolved_pipeline_carries_the_settings_its_metadata_declares() {
+    let fixture = FixtureDir::new();
+    let sidecar = fixture.0.join("inference_metadata.yaml");
+    let mut source = std::fs::read_to_string(&sidecar).unwrap();
+    source.push_str("model:\n  max_sequence_length: 4096\ntokens:\n  eos_token_id: [7, 11]\n");
+    std::fs::write(&sidecar, source).unwrap();
+
+    let directory =
+        PipelineModelDirectory::load(&fixture.0).expect("the pipeline package must resolve");
+
+    let metadata = directory
+        .metadata
+        .as_ref()
+        .expect("a package with a native sidecar carries its parsed metadata");
+    assert_eq!(
+        metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.max_sequence_length),
+        Some(4096)
+    );
+    assert_eq!(
+        metadata
+            .tokens
+            .as_ref()
+            .and_then(|tokens| tokens.eos_token_id.clone()),
+        Some(vec![7, 11])
+    );
+}
+
 /// A pipeline component authored for a native-only operator (one ORT's session
 /// builder cannot load) must still load through the pipeline: its ORT `Session`
 /// is skipped and its I/O contract is surfaced from the ONNX graph instead. This
