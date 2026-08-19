@@ -45,10 +45,14 @@ fn unload_is_refused_while_a_queued_release_has_not_retired() {
     let rejection = plugin
         .try_unload()
         .expect_err("a queued release must block unload");
-    assert!(
-        rejection.host.queued_releases >= 1 || rejection.report.queued_releases >= 1,
-        "either side may notice first, but somebody must: host={:?} plugin={:?}",
-        rejection.host,
+    assert_eq!(
+        rejection.host.queued_releases, 1,
+        "the host's own tally must show the queued release: {:?}",
+        rejection.host
+    );
+    assert_eq!(
+        rejection.report.queued_releases, 1,
+        "and so must the plugin's: {:?}",
         rejection.report
     );
     let plugin = rejection
@@ -57,10 +61,27 @@ fn unload_is_refused_while_a_queued_release_has_not_retired() {
 
     // Dropping the allocator lets the plugin reclaim its own storage, but the
     // host's queued tally is what keeps the gate shut, and it never clears.
+    let leaks_before = MemoryPlugin::forced_module_leaks();
     drop(allocator);
-    let outcome = plugin.try_unload();
-    assert!(
-        outcome.is_err(),
-        "the host must not unmap a module that still owes a free"
+    let rejection = plugin
+        .try_unload()
+        .expect_err("the host must not unmap a module that still owes a free");
+    assert_eq!(
+        rejection.report.queued_releases, 1,
+        "the plugin is what still owes the free: {:?}",
+        rejection.report
+    );
+
+    // The refusal hands the plugin back, and nothing here can retire the
+    // release, so the only remaining exit is a drop — which must keep the
+    // module mapped rather than unmap code the free will run.
+    let plugin = rejection
+        .into_plugin()
+        .expect("the refusal returns the plugin");
+    drop(plugin);
+    assert_eq!(
+        MemoryPlugin::forced_module_leaks() - leaks_before,
+        1,
+        "dropping a plugin that still owes a free must keep its module mapped"
     );
 }

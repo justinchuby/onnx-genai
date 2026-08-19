@@ -88,6 +88,55 @@ struct HostBridge {
     reclaim_failures: AtomicU64,
     retired: Mutex<Vec<RetiredRelease>>,
     module: Arc<PluginModule>,
+    /// Deferred releases queued against **this allocator** that have not yet
+    /// reported completion.
+    ///
+    /// The module-wide tally in [`PluginModule`] answers "may the module
+    /// unload"; this one answers the narrower question "may this callback
+    /// table be freed", which is what the plugin's stored
+    /// `*const NxmemHostCallbacks` depends on. They are deliberately separate:
+    /// an allocator can be dropped long before the module is, and it is the
+    /// allocator's drop that would otherwise free the table.
+    outstanding_releases: AtomicU64,
+}
+
+/// The callback table and the state behind it, as one heap-resident unit.
+///
+/// The plugin captures `&callbacks` at open and dereferences it later, from
+/// its own threads. `callbacks.host_ctx` points at `bridge`, in the same
+/// allocation. The ABI contract ([`onnx_runtime_memory_abi`], `NxmemHostCallbacks`)
+/// says the host keeps this alive past the allocator's final `release` **and
+/// past every queued release**, so its lifetime cannot simply be the
+/// allocator's: a queued release outlives the allocator by construction.
+///
+/// Boxing the whole thing gives both members one stable address for the life
+/// of the context, and lets [`AllocatorCore::drop`] decide its fate rather
+/// than having the compiler free it unconditionally.
+#[derive(Debug)]
+struct HostCallbackContext {
+    bridge: HostBridge,
+    callbacks: NxmemHostCallbacks,
+}
+
+impl HostCallbackContext {
+    /// Build a context whose callback table already points at its own bridge.
+    fn new(minor: u32, bridge: HostBridge) -> Box<Self> {
+        let mut context = Box::new(Self {
+            bridge,
+            callbacks: NxmemHostCallbacks {
+                struct_size: core::mem::size_of::<NxmemHostCallbacks>() as u32,
+                abi_minor: minor,
+                // Patched below, once the box has its final address.
+                host_ctx: core::ptr::null_mut(),
+                request_reclaim: Some(host_request_reclaim),
+                release_completed: Some(host_release_completed),
+            },
+        });
+        // Boxing first and patching second is what makes the pointer stable:
+        // moving the `Box` moves the pointer, never the allocation it names.
+        context.callbacks.host_ctx = (&raw const context.bridge) as *mut core::ffi::c_void;
+        context
+    }
 }
 
 /// `request_reclaim` trampoline.
@@ -195,6 +244,10 @@ unsafe extern "C" fn host_release_completed(
         }
         bridge.module.release_retired();
         bridge.module.allocation_closed();
+        // Last, because it is what permits the table this callback is running
+        // against to be freed. Decrementing it earlier would open a window in
+        // which `AllocatorCore::drop` could free the bridge under our feet.
+        bridge.outstanding_releases.fetch_sub(1, Ordering::AcqRel);
         NxmemStatus::ok()
     })
 }
@@ -206,6 +259,17 @@ struct LiveAllocation {
     bytes: usize,
     align: usize,
 }
+
+/// How many times [`AllocatorCore::drop`] asks a plugin to drain before giving
+/// up and leaking the callback table instead.
+///
+/// Draining is a courtesy, not an obligation: the plugin owns the queue and is
+/// entitled to hold it. The bound exists so a plugin that reports progress it
+/// is not making cannot hang a `drop`.
+const MAX_DRAIN_PASSES_ON_DROP: usize = 16;
+
+/// How many host callback tables this process has deliberately leaked.
+static LEAKED_CALLBACK_TABLES: AtomicU64 = AtomicU64::new(0);
 
 /// The shared core of a plugin-backed mechanism.
 ///
@@ -225,12 +289,14 @@ pub struct AllocatorCore {
     capability_flags: u64,
     next_allocation_id: AtomicU64,
     live: Mutex<HashMap<usize, LiveAllocation>>,
-    /// Boxed so the plugin's stored pointer stays valid across moves of the
-    /// core. Declared before `module` and dropped after `Drop::drop` has
-    /// already made the final `release` call, so the plugin can still touch
-    /// the table from inside that call.
-    bridge: Box<HostBridge>,
-    callbacks: Box<NxmemHostCallbacks>,
+    /// The callback table the plugin holds a raw pointer to.
+    ///
+    /// `Option` so [`Drop`] can *take* it: the table must survive not only
+    /// this allocator's final `release` but every queued release that can
+    /// still name it, and a queued release can outlive the allocator. Taking
+    /// it lets `drop` decide between freeing and deliberately leaking, which a
+    /// plain field cannot express.
+    context: Option<Box<HostCallbackContext>>,
     module: Arc<PluginModule>,
 }
 
@@ -262,14 +328,39 @@ impl AllocatorCore {
         self.vtable.abi_minor.min(self.negotiated_minor)
     }
 
+    /// The callback context, which exists for the whole life of the core.
+    ///
+    /// It is only ever `None` inside [`Drop::drop`], after the context has
+    /// been taken to decide its fate.
+    fn context(&self) -> &HostCallbackContext {
+        self.context
+            .as_ref()
+            .expect("the callback context is taken only while the allocator core is being dropped")
+    }
+
+    fn bridge(&self) -> &HostBridge {
+        &self.context().bridge
+    }
+
     /// How many times the plugin has called back into the host for reclaim.
     pub fn reclaim_calls(&self) -> u64 {
-        self.bridge.reclaim_calls.load(Ordering::Acquire)
+        self.bridge().reclaim_calls.load(Ordering::Acquire)
     }
 
     /// How many of those reclaim calls the host refused.
     pub fn reclaim_failures(&self) -> u64 {
-        self.bridge.reclaim_failures.load(Ordering::Acquire)
+        self.bridge().reclaim_failures.load(Ordering::Acquire)
+    }
+
+    /// Deferred releases queued against this allocator that have not yet
+    /// reported completion.
+    ///
+    /// While this is non-zero the plugin may still dereference the host
+    /// callback table from one of its own threads, so the table must not be
+    /// freed. It is exposed because "may this be torn down" is a question a
+    /// caller is entitled to ask before dropping the allocator.
+    pub fn outstanding_releases(&self) -> u64 {
+        self.bridge().outstanding_releases.load(Ordering::Acquire)
     }
 
     /// The callback table handed to the plugin.
@@ -277,12 +368,35 @@ impl AllocatorCore {
     /// Exposed so a caller can confirm the table the plugin holds is the one
     /// this host installed, and that its `abi_minor` matches negotiation.
     pub fn host_callbacks(&self) -> &NxmemHostCallbacks {
-        &self.callbacks
+        &self.context().callbacks
+    }
+
+    /// Whether the plugin published a structured-release slot that survived
+    /// prefix negotiation.
+    ///
+    /// This reports the *slot*, not the capability: a mechanism that declares
+    /// minor 0 must read back with the slot nulled even if the bytes at that
+    /// offset in the sender's memory were something else entirely.
+    pub fn publishes_structured_release_slot(&self) -> bool {
+        self.vtable.release_allocation.is_some()
+    }
+
+    /// How many host callback tables this process has deliberately leaked.
+    ///
+    /// One per allocator that was dropped while a queued release could still
+    /// name its callback table. Process-wide, because the tables are freed —
+    /// or not — independently of any one allocator.
+    ///
+    /// A non-zero value is not corruption; it is the cost of refusing to hand
+    /// a plugin thread a dangling pointer. Treat it as a leak to be fixed by
+    /// draining releases before dropping the allocator.
+    pub fn leaked_callback_tables() -> u64 {
+        LEAKED_CALLBACK_TABLES.load(Ordering::Acquire)
     }
 
     /// Deferred releases the plugin has reported as retired, in report order.
     pub fn retired_releases(&self) -> Vec<RetiredRelease> {
-        self.bridge
+        self.bridge()
             .retired
             .lock()
             .map(|retired| retired.clone())
@@ -292,6 +406,37 @@ impl AllocatorCore {
     /// How many allocations the host still tracks for this mechanism.
     pub fn live_allocation_count(&self) -> usize {
         self.live.lock().map(|live| live.len()).unwrap_or(0)
+    }
+
+    /// Ask the plugin to retire everything it has queued, before teardown.
+    ///
+    /// Bounded rather than looping to completion: a mechanism is entitled to
+    /// refuse to drain (the `sticky` mechanism in the test plugin does exactly
+    /// that, and a real stream-ordered mechanism may simply not be ready), and
+    /// spinning on it inside `drop` would hang the caller. When the plugin
+    /// declines, the outstanding count stays non-zero and the caller's
+    /// callback table is leaked rather than freed, which is the honest
+    /// outcome.
+    fn retire_queued_releases_on_drop(&self) {
+        let Some(drain) = self.vtable.drain_releases else {
+            return;
+        };
+        // Each pass must make progress or the loop stops. The bound is a
+        // belt-and-braces guard against a plugin that reports a non-zero
+        // retirement without ever emptying its queue.
+        for _ in 0..MAX_DRAIN_PASSES_ON_DROP {
+            if self.bridge().outstanding_releases.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            let mut retired = 0u64;
+            // SAFETY: `ctx` came from this vtable and `retired` is a valid
+            // local. No host lock is held, which is required because the
+            // plugin calls back into the host from inside this call.
+            let status = unsafe { drain(self.vtable.ctx, u64::MAX, &raw mut retired) };
+            if !status.is_ok() || retired == 0 {
+                return;
+            }
+        }
     }
 
     fn next_allocation_id(&self) -> u64 {
@@ -574,6 +719,12 @@ impl AllocatorCore {
 
 impl Drop for AllocatorCore {
     fn drop(&mut self) {
+        // Give the plugin the chance to retire what it has queued. Without
+        // this, an ordinary drop leaves the module's queued tally non-zero
+        // forever and the unload gate can never reopen — a deferral that
+        // never resolves is indistinguishable from a leak.
+        self.retire_queued_releases_on_drop();
+
         // Any allocation still in the map is a host-side leak, not something to
         // silently free: the plugin may already have been told about it. Report
         // through the plugin's terminal slot so the bytes are not stranded.
@@ -593,11 +744,32 @@ impl Drop for AllocatorCore {
         if let Some(release) = self.vtable.release {
             // SAFETY: `ctx` came from this vtable and `release` is called
             // exactly once, here. The callback table and bridge are still
-            // alive: they are fields of `self`, which is only destructured
-            // after this `drop` body returns.
+            // alive: the context is taken below, after this call returns, so
+            // the plugin may touch the table from inside `release` itself.
             unsafe { release(self.vtable.ctx) };
         }
         self.module.allocator_closed();
+
+        // Now decide the callback table's fate. The synchronous `release`
+        // above is *not* the last thing that can reach it: the ABI explicitly
+        // permits a plugin to report a queued release from its own worker
+        // thread, which is the whole point of deferred release. So the table
+        // may only be freed once no queued release can still name it.
+        let Some(context) = self.context.take() else {
+            return;
+        };
+        if context.bridge.outstanding_releases.load(Ordering::Acquire) == 0 {
+            drop(context);
+            return;
+        }
+        // A release the plugin never retired still holds a raw pointer into
+        // this table. Freeing it would be a use-after-free the moment the
+        // plugin reports; leaking it is bounded by exactly the condition that
+        // already keeps the module mapped forever, and a leak is the safe
+        // direction — the same reasoning the plugin side applies to a block it
+        // cannot account for.
+        LEAKED_CALLBACK_TABLES.fetch_add(1, Ordering::AcqRel);
+        core::mem::forget(context);
     }
 }
 
@@ -685,11 +857,17 @@ impl PluginAllocator {
         // arrives synchronously from inside `enqueue_release` cannot decrement
         // a counter that was never incremented.
         core.module.release_queued();
+        core.bridge()
+            .outstanding_releases
+            .fetch_add(1, Ordering::AcqRel);
         // SAFETY: `ctx` came from this vtable; both pointers address valid
         // locals. No host lock is held.
         let status = unsafe { enqueue(core.vtable.ctx, &raw const allocation, &raw mut ticket) };
         if !status.is_ok() {
             core.module.release_retired();
+            core.bridge()
+                .outstanding_releases
+                .fetch_sub(1, Ordering::AcqRel);
             core.insert_allocation(ptr, record);
             return Err(status_to_memory_error(
                 "enqueue_release",
@@ -1314,7 +1492,6 @@ impl Drop for PluginSharedPrefix {
     }
 }
 
-/// Open an allocator from a factory, wiring up the host callback table.
 /// Give back an allocator the host has decided it cannot use.
 ///
 /// `open_allocator` returning `Ok` means the plugin created state, so the host
@@ -1325,13 +1502,22 @@ impl Drop for PluginSharedPrefix {
 /// publishes a vtable too malformed to locate `release` cannot be given
 /// anything back — such a plugin must not allocate state before returning.
 ///
+/// The re-read deliberately goes through
+/// [`NxmemAllocatorVtable::read_prefix_unvalidated`] rather than
+/// `read_prefix`. Every memory-safety check still runs; what is skipped is
+/// `validate_required`, which is the very check most refusals failed. Reading
+/// through the validating entry point here would fail a second time, for the
+/// same reason, and the plugin's state would be stranded — a null `allocate`
+/// slot or a zero `mechanism_id` would leak rather than be handed back.
+///
 /// # Safety
 ///
 /// `ptr` must be null or the pointer the plugin just returned.
 unsafe fn abandon_allocator(ptr: *const NxmemAllocatorVtable, minor: u32) {
-    // SAFETY: delegated to this function's contract; `read_prefix` performs
-    // every null, alignment, and size check before reading a field.
-    let Ok(vtable) = (unsafe { NxmemAllocatorVtable::read_prefix(ptr, minor) }) else {
+    // SAFETY: delegated to this function's contract; the unvalidated read
+    // still performs every null, alignment, and size check before reading a
+    // field, and copies rather than borrowing.
+    let Ok(vtable) = (unsafe { NxmemAllocatorVtable::read_prefix_unvalidated(ptr, minor) }) else {
         return;
     };
     let Some(release) = vtable.release else {
@@ -1341,6 +1527,74 @@ unsafe fn abandon_allocator(ptr: *const NxmemAllocatorVtable, minor: u32) {
     unsafe { release(vtable.ctx) };
 }
 
+/// Holds the host's debt to the plugin until the allocator is accepted.
+///
+/// From the moment `open_allocator` returns `Ok`, the plugin has created state
+/// and the host owes it exactly one `release`. Between that point and the
+/// construction of the [`AllocatorCore`] the host applies a series of
+/// independent checks, any of which may refuse the vtable — and every one of
+/// those refusals still owes the release.
+///
+/// Discharging that debt with an explicit call on each early return is what
+/// the previous shape did, and it is why five of the six refusal paths leaked:
+/// each new check is a new opportunity to forget. A guard inverts the default,
+/// so a path that forgets to think about the debt pays it anyway, and a
+/// seventh check added later is covered before it is written.
+struct AbandonOnDrop {
+    vtable: *const NxmemAllocatorVtable,
+    minor: u32,
+    armed: bool,
+}
+
+impl AbandonOnDrop {
+    /// Take on the debt for a vtable the plugin has just handed over.
+    ///
+    /// # Safety
+    ///
+    /// `vtable` must be null or the pointer the plugin returned from a
+    /// successful `open_allocator`, and must stay valid until the guard is
+    /// dropped or disarmed.
+    unsafe fn new(vtable: *const NxmemAllocatorVtable, minor: u32) -> Self {
+        Self {
+            vtable,
+            minor,
+            armed: true,
+        }
+    }
+
+    /// The host accepted the allocator: the debt now belongs to
+    /// [`AllocatorCore::drop`], which makes the matching `release` call.
+    fn accepted(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AbandonOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: the pointer is the one the plugin returned, as promised by
+        // `AbandonOnDrop::new`; `abandon_allocator` re-reads it defensively
+        // and calls nothing but `release`. No host lock is held: this runs on
+        // an early return from `open_allocator`, which takes none.
+        unsafe { abandon_allocator(self.vtable, self.minor) };
+    }
+}
+
+/// Open an allocator from a factory, wiring up the host callback table.
+///
+/// # The post-`Ok` obligation
+///
+/// Once the plugin returns `Ok` it has created state, and the host owes it a
+/// `release` — even if the host then refuses the vtable on its own terms. The
+/// `Ok` is what creates the debt; the host's later opinion of the vtable does
+/// not cancel it. A refusal that just returns `Err` strands plugin state and,
+/// because the module's live-allocator tally gates unload, permanently
+/// disables the gate for the life of the process.
+///
+/// That obligation is discharged by [`AbandonOnDrop`] rather than by a call on
+/// each rejection path, so a path added later is covered before it is written.
 pub(crate) fn open_allocator(
     factory: &PluginFactory,
     required_capability_flags: u64,
@@ -1361,29 +1615,26 @@ pub(crate) fn open_allocator(
 
     // The bridge and the callback table must live at stable heap addresses
     // *before* the plugin sees them, and must outlive the allocator's final
-    // release. Boxing them here and moving the boxes into the core satisfies
-    // both: moving a `Box` never moves the heap allocation.
-    let bridge = Box::new(HostBridge {
-        device: factory.device(),
-        reclaim,
-        reclaim_calls: AtomicU64::new(0),
-        reclaim_failures: AtomicU64::new(0),
-        retired: Mutex::new(Vec::new()),
-        module: Arc::clone(&module),
-    });
-    let callbacks = Box::new(NxmemHostCallbacks {
-        struct_size: core::mem::size_of::<NxmemHostCallbacks>() as u32,
-        abi_minor: minor,
-        host_ctx: (&raw const *bridge) as *mut core::ffi::c_void,
-        request_reclaim: Some(host_request_reclaim),
-        release_completed: Some(host_release_completed),
-    });
+    // release **and every queued release**. `HostCallbackContext` owns both in
+    // one boxed unit whose teardown `AllocatorCore::drop` controls.
+    let context = HostCallbackContext::new(
+        minor,
+        HostBridge {
+            device: factory.device(),
+            reclaim,
+            reclaim_calls: AtomicU64::new(0),
+            reclaim_failures: AtomicU64::new(0),
+            retired: Mutex::new(Vec::new()),
+            module: Arc::clone(&module),
+            outstanding_releases: AtomicU64::new(0),
+        },
+    );
 
     let request = NxmemOpenRequest::new(
         minor,
         factory_vtable.device,
         required_capability_flags,
-        &raw const *callbacks,
+        &raw const context.callbacks,
     );
     let mut raw_allocator = core::ptr::null::<NxmemAllocatorVtable>();
     // SAFETY: `ctx` came from the factory vtable; `request` and
@@ -1400,24 +1651,19 @@ pub(crate) fn open_allocator(
         return Err(PluginError::call("open_allocator", status));
     }
 
+    // From here on the plugin has created state and the host owes it exactly
+    // one `release`, whatever it decides about the vtable. The guard carries
+    // that debt so no rejection path below has to remember it.
+    // SAFETY: `raw_allocator` is whatever the plugin wrote in response to the
+    // successful call above, which is precisely what the guard promises to
+    // hand back.
+    let abandon = unsafe { AbandonOnDrop::new(raw_allocator, minor) };
+
     // SAFETY: the plugin wrote this pointer in response to the call above.
     // `read_prefix` null-, alignment- and size-checks it before reading any
     // field, and copies rather than borrowing.
-    let vtable =
-        unsafe { NxmemAllocatorVtable::read_prefix(raw_allocator, minor) }.map_err(|status| {
-            // SAFETY: the vtable was refused, so nothing may be called through
-            // it; `abandon_allocator` re-reads the prefix defensively and only
-            // calls `release` when the struct is well-formed enough to locate
-            // that slot.
-            unsafe { abandon_allocator(raw_allocator, minor) };
-            PluginError::call("allocator vtable", status)
-        })?;
-    if let Err(status) = vtable.validate_required() {
-        // SAFETY: as above. Here the prefix did read, so `release` is known.
-        unsafe { abandon_allocator(raw_allocator, minor) };
-        return Err(PluginError::call("allocator vtable", status));
-    }
-
+    let vtable = unsafe { NxmemAllocatorVtable::read_prefix(raw_allocator, minor) }
+        .map_err(|status| PluginError::call("allocator vtable", status))?;
     let device = device_key(vtable.device).ok_or_else(|| PluginError::Contract {
         path: module.path().display().to_string(),
         reason: format!(
@@ -1501,6 +1747,11 @@ pub(crate) fn open_allocator(
     let name = unsafe { read_optional_c_string(vtable.name) }
         .unwrap_or_else(|| factory.name().to_string());
 
+    // Every check has passed, so the host is taking the allocator. The debt
+    // for the plugin's `release` transfers from the guard to `AllocatorCore`,
+    // whose `Drop` makes the matching call.
+    abandon.accepted();
+
     module.allocator_opened();
     let core = Arc::new(AllocatorCore {
         vtable,
@@ -1513,8 +1764,7 @@ pub(crate) fn open_allocator(
         capability_flags: vtable.capability_flags,
         next_allocation_id: AtomicU64::new(0),
         live: Mutex::new(HashMap::new()),
-        bridge,
-        callbacks,
+        context: Some(context),
         module,
     });
 

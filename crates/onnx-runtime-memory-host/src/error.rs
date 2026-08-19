@@ -65,6 +65,20 @@ impl PluginError {
             status: Box::new(status),
         }
     }
+
+    /// The concrete status code the plugin reported, when there was one.
+    ///
+    /// Exposed so a caller — a test above all — can assert on the code rather
+    /// than on the wording of a human-readable message. A message is written
+    /// for a person reading a log; matching on its text turns a rewording into
+    /// a false pass or a false failure, and makes a test that never checked
+    /// the real condition look like it did.
+    pub fn status_code(&self) -> Option<NxmemStatusCode> {
+        match self {
+            Self::Call { status, .. } => status.status_code(),
+            _ => None,
+        }
+    }
 }
 
 /// Turn a failing plugin status into a [`MemoryError`].

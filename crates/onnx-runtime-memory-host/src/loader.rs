@@ -222,6 +222,20 @@ impl Drop for PluginFactory {
 }
 
 /// A loaded plugin and the mechanisms it publishes.
+///
+/// # Shutting one down
+///
+/// [`MemoryPlugin::try_unload`] is the only clean shutdown. **Dropping a
+/// `MemoryPlugin` is not**: a drop cannot report a refusal, so when live
+/// objects remain it has no honest option but to keep the module mapped
+/// forever. That is the safe direction — unmapping a module whose code a
+/// queued release is about to run is a use-after-free that no amount of
+/// host-side care can recover from — but it is a leak, and it is silent apart
+/// from the [`MemoryPlugin::forced_module_leaks`] counter.
+///
+/// So: call `try_unload`, and retire what it names. Reach a drop only on paths
+/// where the gate is already clear, or where leaking the module is genuinely
+/// the intended outcome (process teardown, for instance).
 #[derive(Debug)]
 pub struct MemoryPlugin {
     /// Declared before `module` so factories release before the module (and
@@ -229,6 +243,9 @@ pub struct MemoryPlugin {
     factories: Vec<PluginFactory>,
     module: Arc<PluginModule>,
 }
+
+/// How many times a `MemoryPlugin` was dropped while its unload gate was shut.
+static FORCED_MODULE_LEAKS: AtomicU64 = AtomicU64::new(0);
 
 impl MemoryPlugin {
     /// Load a plugin using this host's current supported version range.
@@ -353,7 +370,12 @@ impl MemoryPlugin {
     /// Unload is refused while **either** side still reports live objects. On
     /// refusal the plugin is handed back, so a caller can retire the
     /// outstanding work and try again — this is a deferral, not a leak.
-    pub fn try_unload(self) -> Result<(), UnloadRejection> {
+    ///
+    /// This is the only clean shutdown. Dropping the plugin instead skips
+    /// nothing — the same gate is evaluated in [`Drop`] — but a drop has no
+    /// way to report a refusal, so it can only keep the module mapped. See
+    /// the type-level documentation.
+    pub fn try_unload(mut self) -> Result<(), UnloadRejection> {
         let host = self.module.host_live_counts();
         // Ask the plugin first, unconditionally, so every rejection carries
         // both tallies. A refusal that reports only one side leaves the caller
@@ -405,10 +427,14 @@ impl MemoryPlugin {
 
         // Both sides agree nothing is live. Release the factories, then check
         // that nothing else still pins the module before letting it unmap.
-        let Self {
-            factories, module, ..
-        } = self;
-        drop(factories);
+        self.factories.clear();
+
+        // Hold the module across `self`'s own drop. `Drop` re-checks the gate
+        // — it passes, since nothing is live — and releases this handle's
+        // reference; the clone below is what keeps the library mapped until
+        // the deliberate unmap attempt.
+        let module = Arc::clone(&self.module);
+        drop(self);
 
         match Arc::try_unwrap(module) {
             Ok(module) => {
@@ -431,6 +457,52 @@ impl MemoryPlugin {
                 })
             }
         }
+    }
+
+    /// How many times a plugin has been dropped while its unload gate was shut.
+    ///
+    /// Each one is a module this process deliberately kept mapped rather than
+    /// risk unmapping code a queued release still needs. Process-wide, because
+    /// unloading a module is a process-wide act.
+    ///
+    /// A non-zero value is not a crash and not corruption; it means some
+    /// caller took the drop path instead of [`Self::try_unload`] and the
+    /// module can never be reclaimed. Treat it as a leak to be fixed at the
+    /// call site.
+    pub fn forced_module_leaks() -> u64 {
+        FORCED_MODULE_LEAKS.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for MemoryPlugin {
+    fn drop(&mut self) {
+        let host = self.module.host_live_counts();
+        // A module that cannot answer is treated exactly as `try_unload`
+        // treats it: unmapping it would be a guess, so it is not unmapped.
+        let plugin_total = match self.module.unload_report() {
+            Ok(report) => report.total(),
+            Err(_) => u64::MAX,
+        };
+        if host.total() == 0 && plugin_total == 0 {
+            // The gate is open. Ordinary field drops run: the factories
+            // release, this handle's `Arc` goes, and if it was the last one
+            // the library unmaps. That is the intended outcome.
+            return;
+        }
+
+        // The gate is shut, and a drop has no channel to refuse through. The
+        // only two options are to unmap a module whose code a live object may
+        // still enter, or to keep it mapped forever; nothing here can retire
+        // the outstanding work on the caller's behalf.
+        //
+        // Whether `dlclose` *actually* unmaps is a platform accident — glibc
+        // unmaps a refcount-zero DSO without `DF_1_NODELETE`, macOS commonly
+        // declines to — so relying on it not happening is not a safety
+        // argument. Leaking one strong reference makes the outcome the same
+        // everywhere: `library` is never dropped, so `dlclose` is never
+        // called.
+        FORCED_MODULE_LEAKS.fetch_add(1, Ordering::AcqRel);
+        core::mem::forget(Arc::clone(&self.module));
     }
 }
 

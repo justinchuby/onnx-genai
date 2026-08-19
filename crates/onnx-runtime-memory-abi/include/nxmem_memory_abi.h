@@ -412,6 +412,17 @@ typedef struct NxmemSharedPrefixCommitInfo {
  * A plugin must not hold any of its own locks across either callback.
  *
  * NXMEM_LAYOUT: NxmemHostCallbacks size=32
+ *
+ * Every field offset below is part of the contract too, not just the total
+ * size. A prefix is only meaningful if the fields inside it stay where they
+ * are: MIN_STRUCT_SIZE_MINOR_0 is derived from a field offset, so inserting a
+ * field mid-struct would silently move it and every older peer would be
+ * misread. Pinning the offsets makes that a build failure.
+ * NXMEM_LAYOUT_FIELD: NxmemHostCallbacks.struct_size offset=0
+ * NXMEM_LAYOUT_FIELD: NxmemHostCallbacks.abi_minor offset=4
+ * NXMEM_LAYOUT_FIELD: NxmemHostCallbacks.host_ctx offset=8
+ * NXMEM_LAYOUT_FIELD: NxmemHostCallbacks.request_reclaim offset=16
+ * NXMEM_LAYOUT_FIELD: NxmemHostCallbacks.release_completed offset=24
  */
 typedef struct NxmemHostCallbacks {
   uint32_t struct_size;
@@ -452,6 +463,22 @@ typedef struct NxmemOpenRequest {
  * allocator that published it and released with it — never separately.
  *
  * NXMEM_LAYOUT: NxmemVirtualBackingVtable size=72
+ *
+ * Every field offset below is part of the contract too, not just the total
+ * size. A prefix is only meaningful if the fields inside it stay where they
+ * are: MIN_STRUCT_SIZE_MINOR_0 is derived from a field offset, so inserting a
+ * field mid-struct would silently move it and every older peer would be
+ * misread. Pinning the offsets makes that a build failure.
+ * NXMEM_LAYOUT_FIELD: NxmemVirtualBackingVtable.struct_size offset=0
+ * NXMEM_LAYOUT_FIELD: NxmemVirtualBackingVtable.abi_minor offset=4
+ * NXMEM_LAYOUT_FIELD: NxmemVirtualBackingVtable.mechanism_id offset=8
+ * NXMEM_LAYOUT_FIELD: NxmemVirtualBackingVtable.ctx offset=16
+ * NXMEM_LAYOUT_FIELD: NxmemVirtualBackingVtable.allocate_committed offset=24
+ * NXMEM_LAYOUT_FIELD: NxmemVirtualBackingVtable.commit_range offset=32
+ * NXMEM_LAYOUT_FIELD: NxmemVirtualBackingVtable.decommit_range offset=40
+ * NXMEM_LAYOUT_FIELD: NxmemVirtualBackingVtable.mapped_bytes_for_ranges offset=48
+ * NXMEM_LAYOUT_FIELD: NxmemVirtualBackingVtable.mapped_bytes_for_allocation offset=56
+ * NXMEM_LAYOUT_FIELD: NxmemVirtualBackingVtable.committed_bytes offset=64
  */
 typedef struct NxmemVirtualBackingVtable {
   uint32_t struct_size;
@@ -479,6 +506,21 @@ typedef struct NxmemVirtualBackingVtable {
  * Owned by the allocator that published it, exactly as virtual backing is.
  *
  * NXMEM_LAYOUT: NxmemSharedMappingVtable size=64
+ *
+ * Every field offset below is part of the contract too, not just the total
+ * size. A prefix is only meaningful if the fields inside it stay where they
+ * are: MIN_STRUCT_SIZE_MINOR_0 is derived from a field offset, so inserting a
+ * field mid-struct would silently move it and every older peer would be
+ * misread. Pinning the offsets makes that a build failure.
+ * NXMEM_LAYOUT_FIELD: NxmemSharedMappingVtable.struct_size offset=0
+ * NXMEM_LAYOUT_FIELD: NxmemSharedMappingVtable.abi_minor offset=4
+ * NXMEM_LAYOUT_FIELD: NxmemSharedMappingVtable.mechanism_id offset=8
+ * NXMEM_LAYOUT_FIELD: NxmemSharedMappingVtable.ctx offset=16
+ * NXMEM_LAYOUT_FIELD: NxmemSharedMappingVtable.create_shared_prefix offset=24
+ * NXMEM_LAYOUT_FIELD: NxmemSharedMappingVtable.retain_shared_prefix offset=32
+ * NXMEM_LAYOUT_FIELD: NxmemSharedMappingVtable.release_shared_prefix offset=40
+ * NXMEM_LAYOUT_FIELD: NxmemSharedMappingVtable.incremental_owned_bytes offset=48
+ * NXMEM_LAYOUT_FIELD: NxmemSharedMappingVtable.commit_shared_prefix offset=56
  */
 typedef struct NxmemSharedMappingVtable {
   uint32_t struct_size;
@@ -512,6 +554,29 @@ typedef struct NxmemSharedMappingVtable {
  * back unchanged to every slot.
  *
  * NXMEM_LAYOUT: NxmemAllocatorVtable size=128
+ *
+ * Every field offset below is part of the contract too, not just the total
+ * size. A prefix is only meaningful if the fields inside it stay where they
+ * are: MIN_STRUCT_SIZE_MINOR_0 is derived from a field offset, so inserting a
+ * field mid-struct would silently move it and every older peer would be
+ * misread. Pinning the offsets makes that a build failure.
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.struct_size offset=0
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.abi_minor offset=4
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.mechanism_id offset=8
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.device offset=16
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.capability_flags offset=24
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.name offset=32
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.ctx offset=40
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.allocate offset=48
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.deallocate offset=56
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.retain offset=64
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.release offset=72
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.virtual_backing offset=80
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.shared_mapping offset=88
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.enqueue_release offset=96
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.drain_releases offset=104
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.pending_release_count offset=112
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorVtable.release_allocation offset=120
  */
 typedef struct NxmemAllocatorVtable {
   uint32_t struct_size;
@@ -552,6 +617,20 @@ typedef struct NxmemAllocatorVtable {
  * been released. `name` must outlive the factory.
  *
  * NXMEM_LAYOUT: NxmemAllocatorFactoryVtable size=56
+ *
+ * Every field offset below is part of the contract too, not just the total
+ * size. A prefix is only meaningful if the fields inside it stay where they
+ * are: MIN_STRUCT_SIZE_MINOR_0 is derived from a field offset, so inserting a
+ * field mid-struct would silently move it and every older peer would be
+ * misread. Pinning the offsets makes that a build failure.
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorFactoryVtable.struct_size offset=0
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorFactoryVtable.abi_minor offset=4
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorFactoryVtable.name offset=8
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorFactoryVtable.device offset=16
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorFactoryVtable.capability_flags offset=24
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorFactoryVtable.ctx offset=32
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorFactoryVtable.open_allocator offset=40
+ * NXMEM_LAYOUT_FIELD: NxmemAllocatorFactoryVtable.release offset=48
  */
 typedef struct NxmemAllocatorFactoryVtable {
   uint32_t struct_size;

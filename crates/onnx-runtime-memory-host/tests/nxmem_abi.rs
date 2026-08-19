@@ -34,12 +34,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use onnx_runtime_memory_abi::{
     NXMEM_ABI_VERSION_MAJOR, NXMEM_ABI_VERSION_MINOR, NXMEM_CAP_ALLOCATOR,
     NXMEM_CAP_DEFERRED_RELEASE, NXMEM_CAP_SHARED_MAPPING, NXMEM_CAP_STRUCTURED_RELEASE,
-    NXMEM_CAP_VIRTUAL_BACKING, NxmemVersionRange,
+    NXMEM_CAP_VIRTUAL_BACKING, NxmemAllocatorVtable, NxmemStatusCode, NxmemVersionRange,
 };
 use onnx_runtime_memory_api::{
     AllocationCommitRange, AllocationReleaseOutcome, DeviceAllocator, DeviceKey, MemoryError,
 };
-use onnx_runtime_memory_host::{HostReclaim, MemoryPlugin, PluginAllocator, PluginError};
+use onnx_runtime_memory_host::{
+    AllocatorCore as PluginAllocatorCore, HostReclaim, MemoryPlugin, PluginAllocator, PluginError,
+};
 
 // ─── locating the plugin ────────────────────────────────────────────────────
 
@@ -249,8 +251,16 @@ fn a_minor_0_mechanism_works_under_a_minor_1_host() {
 /// **Short struct.**
 ///
 /// The `short-struct` mechanism publishes an allocator vtable whose
-/// `struct_size` is smaller than the baseline prefix. The host must refuse it
-/// *before* reading any function pointer out of it.
+/// `struct_size` is smaller than the baseline prefix, in an allocation that is
+/// genuinely that short. The host must refuse it on the size check, *before*
+/// reading any function pointer out of it.
+///
+/// The assertion is on the status code and on the two sizes, not on the
+/// wording. Matching the word "short" in the message cannot distinguish this
+/// from a refusal that happened for a completely different reason: the status
+/// code's own name contains it, so a host that skipped the size check entirely
+/// and tripped over a null `allocate` slot would produce a message containing
+/// "short" too, and the test would stay green while testing nothing.
 #[test]
 fn a_short_allocator_vtable_is_refused_before_any_slot_is_read() {
     let _serial = serial();
@@ -261,12 +271,217 @@ fn a_short_allocator_vtable_is_refused_before_any_slot_is_read() {
         .open(NXMEM_CAP_ALLOCATOR, None)
         .expect_err("an undersized vtable must be refused");
 
+    assert_eq!(
+        error.status_code(),
+        Some(NxmemStatusCode::ShortStruct),
+        "the refusal must be the size check, not something downstream of it: {error}"
+    );
+
+    // The message still has to name the real numbers, because a human reading
+    // a log needs to know *which* struct disagreed and by how much. The
+    // declared size is the fixture's own declaration; the required size is the
+    // baseline prefix this host was built against.
+    let declared = NxmemAllocatorVtable::MIN_STRUCT_SIZE_MINOR_0 / 2;
+    let required = NxmemAllocatorVtable::MIN_STRUCT_SIZE_MINOR_0;
     let text = error.to_string();
     assert!(
-        text.contains("struct_size")
-            || text.to_lowercase().contains("short")
-            || text.contains("small"),
-        "the refusal must explain that the struct is too short, got: {text}"
+        text.contains(&declared.to_string()) && text.contains(&required.to_string()),
+        "the refusal must report the declared size {declared} and the required size {required}, \
+         got: {text}"
+    );
+}
+
+/// **The declared prefix bounds the read.**
+///
+/// `poisoned-tail` publishes a minor-0 allocator vtable out of a full-size
+/// heap allocation whose bytes past the declaration are `0xAB` — including a
+/// populated `release_allocation` slot the declaration excludes.
+///
+/// A host that honours `struct_size` reads the baseline prefix and zeroes the
+/// rest, so the structured-release slot comes back absent. A host that reads
+/// the whole struct *and* skips the level clamp comes back holding
+/// `0xABAB_ABAB_ABAB_ABAB` in a function-pointer slot — and would call it.
+///
+/// The assertion is on the raw post-negotiation slot rather than on release
+/// behaviour, because the structured-release path short-circuits on
+/// `abi_minor < 1` before it ever looks at the slot: asserting through
+/// behaviour would pass no matter what the slot contained.
+#[test]
+fn a_poisoned_tail_never_reaches_the_hosts_view_of_the_vtable() {
+    let _serial = serial();
+    let plugin = load();
+    let allocator = plugin
+        .factory("poisoned-tail")
+        .expect("the mechanism is published")
+        .open(NXMEM_CAP_ALLOCATOR, None)
+        .expect("a minor-0 vtable that declares its own size honestly is acceptable");
+
+    assert!(
+        !allocator.core().publishes_structured_release_slot(),
+        "a slot past the sender's declared size must never survive into the host's copy"
+    );
+
+    // And the allocator is otherwise entirely ordinary, so the refusal above
+    // is about the tail and nothing else.
+    let ptr = allocator
+        .allocate(4096, 256)
+        .expect("the mechanism allocates");
+    // SAFETY: `ptr` came from this allocator with exactly these parameters.
+    unsafe { allocator.deallocate(ptr, 4096, 256) };
+}
+
+/// **A refused vtable still owes the plugin a release.**
+///
+/// `bad-tier` creates real allocator state, returns `Ok`, and publishes a
+/// device tier code no host knows. The plugin has therefore done everything
+/// right up to the point where the host applies its *own* policy and refuses.
+///
+/// The `Ok` is what creates the debt: from the plugin's side an allocator
+/// exists and will exist until somebody calls `release`. A host that just
+/// returns `Err` strands it — and because the module's live-allocator tally is
+/// what gates unload, a single refusal like this permanently disables the gate
+/// for the life of the process.
+///
+/// Asserting through `try_unload` rather than through a counter is deliberate:
+/// the gate is the thing that actually breaks, so that is what the test
+/// exercises.
+#[test]
+fn a_vtable_the_host_refuses_after_ok_is_still_released() {
+    let _serial = serial();
+    let plugin = load();
+
+    let error = plugin
+        .factory("bad-tier")
+        .expect("the mechanism is published")
+        .open(NXMEM_CAP_ALLOCATOR, None)
+        .expect_err("a tier code this host does not know must be refused");
+    assert!(
+        matches!(error, PluginError::Contract { .. }),
+        "the refusal is the host's own policy, not a plugin failure: {error}"
+    );
+
+    // The refusal must have left the module exactly as it found it. If the
+    // plugin's state were stranded the report would still show one live
+    // allocator and this would come back as a rejection.
+    plugin
+        .try_unload()
+        .expect("a refused open must leave no plugin state behind");
+}
+
+/// **A vtable the host cannot even parse is still released.**
+///
+/// The sibling of the test above, and the harder half. There the host refused
+/// a vtable it had read successfully, so it could find `release` the ordinary
+/// way. Here `read_prefix` itself refuses — a required slot is null — so the
+/// host has no validated view to look in, and the only way to honour the
+/// post-`Ok` debt is to read the vtable *again* without validating it and call
+/// `release` out of that.
+///
+/// This is the path that decides whether the abandon route works at all. A
+/// re-read that validates is deterministic over the same bytes: it fails
+/// identically, returns before reaching `release`, and the plugin's state is
+/// stranded for the life of the process with no error anywhere.
+#[test]
+fn a_vtable_the_host_cannot_parse_is_still_released() {
+    let _serial = serial();
+    let plugin = load();
+
+    let error = plugin
+        .factory("missing-slot")
+        .expect("the mechanism is published")
+        .open(NXMEM_CAP_ALLOCATOR, None)
+        .expect_err("a vtable missing a required slot must be refused");
+    assert_eq!(
+        error.status_code(),
+        Some(NxmemStatusCode::ShortStruct),
+        "a null required slot is reported as a short struct, the same code the header \
+         contract uses for a vtable that cannot supply what the level requires: {error}"
+    );
+
+    // The plugin created real state and took its own reference before
+    // returning `Ok`. If the host did not reach `release`, that reference is
+    // still held and this comes back as a rejection naming a live allocator.
+    plugin
+        .try_unload()
+        .expect("a vtable the host could not parse must still have been released");
+}
+
+/// **A retirable queued release does not leak anything.**
+///
+/// The counterpart to the test above: leaking is the fallback, not the policy.
+/// `lazy` retires what it is asked to, so dropping its allocator drains the
+/// queue first and the table is freed normally — the module's queued tally
+/// comes back to zero and the gate reopens.
+#[test]
+fn dropping_an_allocator_drains_what_the_plugin_will_retire() {
+    let _serial = serial();
+    let plugin = load();
+    let allocator = plugin
+        .factory("lazy")
+        .expect("the mechanism is published")
+        .open(NXMEM_CAP_ALLOCATOR | NXMEM_CAP_DEFERRED_RELEASE, None)
+        .expect("the mechanism opens");
+
+    let ptr = allocator.allocate(4096, 64).expect("allocation");
+    // SAFETY: a live allocation from this allocator with matching parameters.
+    let _ticket = unsafe { allocator.enqueue_release(ptr, 4096, 64) }.expect("queued release");
+    assert_eq!(allocator.core().outstanding_releases(), 1);
+
+    let before = PluginAllocatorCore::leaked_callback_tables();
+    drop(allocator);
+    assert_eq!(
+        PluginAllocatorCore::leaked_callback_tables(),
+        before,
+        "a release the plugin is willing to retire must not cost a leaked table"
+    );
+
+    // And the gate really did reopen, which is the point of draining.
+    plugin
+        .try_unload()
+        .expect("a drained allocator leaves nothing outstanding");
+}
+
+/// **Dropping a plugin with live objects must not unmap it.**
+///
+/// `try_unload` consumes the plugin, so every early return, `?` and unwind
+/// reaches `drop` instead — and `drop` has no channel to refuse through. Its
+/// only safe option is to keep the module mapped.
+///
+/// Whether `dlclose` would *actually* unmap is a platform accident: glibc
+/// unmaps a refcount-zero DSO without `DF_1_NODELETE`, macOS commonly
+/// declines. Relying on the platform declining is not a safety property, so
+/// the assertion is on the host's own decision to leak rather than on whether
+/// the mapping survived.
+#[test]
+fn dropping_a_plugin_with_live_objects_keeps_the_module_mapped() {
+    let _serial = serial();
+    let before = MemoryPlugin::forced_module_leaks();
+
+    {
+        let plugin = load();
+        let allocator = plugin
+            .factory("eager")
+            .expect("the mechanism is published")
+            .open(NXMEM_CAP_ALLOCATOR, None)
+            .expect("the mechanism opens");
+        // The allocator is still live when the plugin goes out of scope, and
+        // nothing here calls `try_unload`.
+        drop(plugin);
+        assert_eq!(
+            MemoryPlugin::forced_module_leaks() - before,
+            1,
+            "dropping a plugin whose allocator is still live must keep the module mapped"
+        );
+        drop(allocator);
+    }
+
+    // An idle plugin, by contrast, unloads cleanly and costs nothing.
+    let after_live_drop = MemoryPlugin::forced_module_leaks();
+    load().try_unload().expect("an idle plugin unloads");
+    assert_eq!(
+        MemoryPlugin::forced_module_leaks(),
+        after_live_drop,
+        "a clean unload must not be counted as a forced leak"
     );
 }
 
@@ -985,7 +1200,7 @@ fn every_factory_is_released_exactly_once() {
     let before = releases(&observer);
     let plugin = load();
     let count = plugin.factories().len() as u64;
-    assert_eq!(count, 8, "the test plugin publishes eight mechanisms");
+    assert_eq!(count, 12, "the test plugin publishes twelve mechanisms");
     plugin.try_unload().expect("an idle plugin unloads");
 
     assert_eq!(

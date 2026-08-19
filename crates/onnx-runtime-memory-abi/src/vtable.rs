@@ -292,6 +292,36 @@ impl NxmemAllocatorVtable {
         ptr: *const Self,
         negotiated_minor: u32,
     ) -> Result<Self, NxmemStatus> {
+        // SAFETY: delegated verbatim to this function's contract.
+        let vtable = unsafe { Self::read_prefix_unvalidated(ptr, negotiated_minor) }?;
+        vtable.validate_required()?;
+        Ok(vtable)
+    }
+
+    /// Read the prefix while skipping [`Self::validate_required`].
+    ///
+    /// This performs **every memory-safety check** [`Self::read_prefix`] does —
+    /// null, alignment, self-consistent `struct_size`, bounded copy, and the
+    /// clamp — and differs only in that it does not insist the required slots
+    /// are populated or that `mechanism_id` is non-zero.
+    ///
+    /// It exists for exactly one caller: the host's abandon path, which must
+    /// still find `release` in a vtable it has *already decided to refuse*.
+    /// Refusing a vtable does not cancel the plugin's `Ok` from
+    /// `open_allocator`, so the host still owes it a `release`; re-reading
+    /// through the validating entry point would fail for the very reason the
+    /// vtable was refused and the plugin's state would be stranded.
+    ///
+    /// Do not use this to decide whether a vtable may be *called*. The only
+    /// slot it is safe to invoke on the result is `release`.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::read_prefix`].
+    pub unsafe fn read_prefix_unvalidated(
+        ptr: *const Self,
+        negotiated_minor: u32,
+    ) -> Result<Self, NxmemStatus> {
         check_vtable_ptr(ptr, "allocator")?;
         // SAFETY: `ptr` was proved non-null and aligned; `struct_size` is the
         // first field of every version of this struct.
@@ -333,7 +363,6 @@ impl NxmemAllocatorVtable {
         if effective_minor < 1 {
             vtable.release_allocation = None;
         }
-        vtable.validate_required()?;
         Ok(vtable)
     }
 
@@ -969,5 +998,346 @@ mod tests {
         .expect("a larger struct at the same major is compatible");
         assert_eq!(read.mechanism_id, 42);
         assert!(read.release_allocation.is_some());
+    }
+
+    /// A `T`-sized, `T`-aligned buffer whose every byte the test controls.
+    ///
+    /// Used to build senders that a plain `#[repr(C)]` literal cannot express:
+    /// a struct whose bytes *beyond the size it declares* hold a known poison
+    /// pattern rather than plausible values.
+    fn poisoned_buffer<T: Copy>(prefix: &T, declared_size: usize, poison: u8) -> Vec<u64> {
+        let size = core::mem::size_of::<T>();
+        assert!(declared_size <= size);
+        assert!(core::mem::align_of::<T>() <= core::mem::align_of::<u64>());
+        // A `Vec<u64>` gives 8-byte alignment, which is at least `align_of::<T>()`
+        // for every nxmem vtable, without depending on the global allocator
+        // over-aligning a byte buffer.
+        let mut storage = vec![0u64; size.div_ceil(core::mem::size_of::<u64>())];
+        let base = storage.as_mut_ptr().cast::<u8>();
+        // SAFETY: `storage` owns at least `size` bytes at `base`, and `prefix`
+        // is a live `T`, so both regions are valid for `size` bytes. They
+        // cannot overlap: `storage` was allocated in this function.
+        unsafe {
+            core::ptr::write_bytes(base, poison, size);
+            core::ptr::copy_nonoverlapping((prefix as *const T).cast::<u8>(), base, declared_size);
+        }
+        storage
+    }
+
+    /// Every byte of `value`, including padding, which is always initialised
+    /// here because the value came from a whole-struct byte copy.
+    fn as_bytes<T>(value: &T) -> &[u8] {
+        // SAFETY: `T` is `#[repr(C)]` plain data and every byte of `value` was
+        // initialised by `copy_prefix`, which starts from a zeroed buffer.
+        unsafe {
+            core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
+        }
+    }
+
+    /// **The bounded read itself**, tested without going through any of the
+    /// checks layered on top of it.
+    ///
+    /// `copy_prefix` is the memory-safety core of prefix negotiation: it is
+    /// the single line that stops the host reading past the end of a sender's
+    /// allocation. Asserting on it directly is the only way to pin the bound
+    /// independently of the *nulling* that happens afterwards — a test that
+    /// only checks `release_allocation.is_none()` stays green when the bound
+    /// is destroyed, because the clamp nulls that slot either way.
+    #[test]
+    fn copy_prefix_reads_exactly_the_declared_prefix_and_zeroes_the_rest() {
+        const POISON: u8 = 0xAB;
+        let declared = NxmemAllocatorVtable::MIN_STRUCT_SIZE_MINOR_0;
+        let source = conforming_allocator(1);
+        let storage = poisoned_buffer(&source, declared, POISON);
+        let ptr = storage.as_ptr().cast::<NxmemAllocatorVtable>();
+
+        // SAFETY: `storage` holds `size_of::<NxmemAllocatorVtable>()` readable,
+        // correctly aligned, fully initialised bytes, which is more than
+        // `declared`.
+        let read = unsafe { copy_prefix(ptr, declared) };
+        let read_bytes = as_bytes(&read);
+        let source_bytes = as_bytes(&source);
+
+        assert_eq!(
+            &read_bytes[..declared],
+            &source_bytes[..declared],
+            "the declared prefix must be copied verbatim"
+        );
+        assert!(
+            read_bytes[declared..].iter().all(|byte| *byte == 0),
+            "every byte past the declared size must read back as zero, but the copy brought back \
+             {:x?}; the bound was not honoured",
+            &read_bytes[declared..]
+        );
+    }
+
+    /// The destination is bounded too: a sender from a *newer* build declares
+    /// more bytes than this build defines, and the copy must stop at this
+    /// build's struct rather than overrun the local.
+    #[test]
+    fn copy_prefix_never_writes_more_than_this_builds_struct() {
+        let source = conforming_allocator(1);
+        let size = core::mem::size_of::<NxmemAllocatorVtable>();
+        let storage = poisoned_buffer(&source, size, 0);
+        let ptr = storage.as_ptr().cast::<NxmemAllocatorVtable>();
+
+        // A newer peer declares a struct twice this size. Copying that many
+        // bytes into a local `NxmemAllocatorVtable` would smash the stack.
+        // SAFETY: `copy_prefix` clamps to `size_of::<T>()`, so it reads only
+        // the `size` initialised bytes `storage` really has.
+        let read = unsafe { copy_prefix(ptr, size * 2) };
+        assert_eq!(read.mechanism_id, source.mechanism_id);
+        assert_eq!(as_bytes(&read), as_bytes(&source));
+    }
+
+    /// The same property, observed through the public entry point.
+    ///
+    /// A minor-0 sender is followed in memory by poison. Every byte the host
+    /// hands back past the declared prefix must be zero — that is what makes
+    /// "a slot the sender does not define reads back as `None`" true rather
+    /// than merely usually true.
+    #[test]
+    fn read_prefix_zeroes_every_byte_past_the_senders_declared_size() {
+        const POISON: u8 = 0xAB;
+        let declared = NxmemAllocatorVtable::MIN_STRUCT_SIZE_MINOR_0;
+        let source = NxmemAllocatorVtable {
+            struct_size: declared as u32,
+            abi_minor: 0,
+            ..conforming_allocator(0)
+        };
+        let storage = poisoned_buffer(&source, declared, POISON);
+        let ptr = storage.as_ptr().cast::<NxmemAllocatorVtable>();
+
+        // SAFETY: `storage` holds a fully initialised, correctly aligned
+        // `NxmemAllocatorVtable`-sized region whose first `declared` bytes are
+        // a well-formed minor-0 vtable.
+        let read = unsafe { NxmemAllocatorVtable::read_prefix(ptr, 1) }
+            .expect("a well-formed minor-0 sender is acceptable to a minor-1 host");
+
+        assert_eq!(read.abi_minor, 0);
+        assert!(
+            read.release_allocation.is_none(),
+            "a slot the sender never defined must not be callable"
+        );
+        assert!(
+            as_bytes(&read)[declared..].iter().all(|byte| *byte == 0),
+            "the host read {:x?} from past the sender's struct; the poison beyond {declared} \
+             bytes must never reach the host's copy",
+            &as_bytes(&read)[declared..]
+        );
+    }
+
+    /// A vtable that is exactly as big as it declares, and no bigger.
+    ///
+    /// The point is not the return value — it is that reading even one byte
+    /// past `declared` is a genuine out-of-bounds access of a heap allocation,
+    /// so a sanitiser or Miri can see it. A fixture backed by a full-size
+    /// struct that merely *lies* about its size cannot exhibit that.
+    #[test]
+    fn a_vtable_sized_exactly_to_its_declaration_is_read_within_bounds() {
+        let declared = NxmemAllocatorVtable::MIN_STRUCT_SIZE_MINOR_0;
+        let source = NxmemAllocatorVtable {
+            struct_size: declared as u32,
+            abi_minor: 0,
+            ..conforming_allocator(0)
+        };
+        // Exactly `declared` bytes, not a byte more. Backed by `u64` rather
+        // than `u8` so the allocation is aligned for the vtable by
+        // construction: a `Vec<u8>` is only byte-aligned, and while the system
+        // allocator happens to hand back an 8-aligned block, Miri does not, so
+        // a byte-backed fixture fails under Miri for the wrong reason.
+        assert!(
+            declared.is_multiple_of(core::mem::size_of::<u64>()),
+            "the minor-0 prefix must be a whole number of words for an exact fixture"
+        );
+        assert!(core::mem::align_of::<NxmemAllocatorVtable>() <= core::mem::align_of::<u64>());
+        let mut exact = vec![0u64; declared / core::mem::size_of::<u64>()];
+        // SAFETY: both regions are valid for `declared` bytes and do not
+        // overlap; `exact` was allocated in this function and holds exactly
+        // `declared` bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (&source as *const NxmemAllocatorVtable).cast::<u8>(),
+                exact.as_mut_ptr().cast::<u8>(),
+                declared,
+            );
+        }
+
+        // SAFETY: the buffer holds exactly `declared` readable bytes and
+        // declares exactly that size, so a conforming reader stays in bounds.
+        let read =
+            unsafe { NxmemAllocatorVtable::read_prefix(exact.as_ptr().cast(), 1) }.expect("valid");
+        assert_eq!(read.abi_minor, 0);
+        assert!(read.release_allocation.is_none());
+    }
+
+    /// A refused vtable can still be handed back.
+    ///
+    /// `read_prefix` rejects a vtable whose required slots are null, so the
+    /// host cannot use it to find `release` on the abandon path — the read
+    /// would fail for exactly the reason the vtable was refused, and the
+    /// plugin's state would be stranded.
+    #[test]
+    fn read_prefix_unvalidated_still_finds_release_in_a_refused_vtable() {
+        let refused = NxmemAllocatorVtable {
+            // A plugin that forgot `allocate`: refused, but it has already
+            // created state and `release` is right there.
+            allocate: None,
+            ..conforming_allocator(1)
+        };
+        // SAFETY: `refused` is a live, aligned local of exactly this type.
+        let status =
+            unsafe { NxmemAllocatorVtable::read_prefix(&refused, 1) }.expect_err("missing slot");
+        assert_eq!(status.status_code(), Some(NxmemStatusCode::ShortStruct));
+
+        // SAFETY: as above.
+        let unvalidated = unsafe { NxmemAllocatorVtable::read_prefix_unvalidated(&refused, 1) }
+            .expect("the abandon path must still be able to reach `release`");
+        assert!(
+            unvalidated.release.is_some(),
+            "a refusal must not strand the state the plugin already created"
+        );
+
+        // The same is true of a zero `mechanism_id`, the other validation.
+        let zero_id = NxmemAllocatorVtable {
+            mechanism_id: 0,
+            ..conforming_allocator(1)
+        };
+        // SAFETY: `zero_id` is a live, aligned local.
+        assert_eq!(
+            unsafe { NxmemAllocatorVtable::read_prefix(&zero_id, 1) }
+                .expect_err("zero mechanism id")
+                .status_code(),
+            Some(NxmemStatusCode::InvalidArgument)
+        );
+        // SAFETY: as above.
+        assert!(
+            unsafe { NxmemAllocatorVtable::read_prefix_unvalidated(&zero_id, 1) }
+                .expect("the memory-safety checks still pass")
+                .release
+                .is_some()
+        );
+    }
+
+    /// The unvalidated read is only a *validation* shortcut: every
+    /// memory-safety check still applies.
+    #[test]
+    fn read_prefix_unvalidated_still_refuses_unsafe_pointers_and_short_structs() {
+        // SAFETY: a null pointer is exactly what is under test.
+        assert_eq!(
+            unsafe { NxmemAllocatorVtable::read_prefix_unvalidated(core::ptr::null(), 1) }
+                .expect_err("null")
+                .status_code(),
+            Some(NxmemStatusCode::InvalidArgument)
+        );
+
+        let vtable = conforming_allocator(1);
+        let misaligned =
+            (&vtable as *const NxmemAllocatorVtable as usize + 1) as *const NxmemAllocatorVtable;
+        // SAFETY: rejected on alignment before any dereference.
+        assert_eq!(
+            unsafe { NxmemAllocatorVtable::read_prefix_unvalidated(misaligned, 1) }
+                .expect_err("misaligned")
+                .status_code(),
+            Some(NxmemStatusCode::InvalidArgument)
+        );
+
+        let short = NxmemAllocatorVtable {
+            struct_size: (NxmemAllocatorVtable::MIN_STRUCT_SIZE_MINOR_0 - 1) as u32,
+            ..conforming_allocator(0)
+        };
+        // SAFETY: `short` is a live, aligned local; only `struct_size` and
+        // `abi_minor` are read before the refusal.
+        assert_eq!(
+            unsafe { NxmemAllocatorVtable::read_prefix_unvalidated(&short, 1) }
+                .expect_err("short struct")
+                .status_code(),
+            Some(NxmemStatusCode::ShortStruct)
+        );
+    }
+
+    /// Field **offsets**, not just sizes.
+    ///
+    /// `MIN_STRUCT_SIZE_MINOR_0` is derived from `offset_of!`, so inserting a
+    /// field in the middle of a vtable silently moves the constant and every
+    /// size-based assertion keeps passing while the wire format has changed
+    /// underneath every already-built plugin. Pinning the offsets makes that
+    /// edit fail here, where it is cheap, instead of in a third party's
+    /// process. The same numbers are pinned against the C header, and against
+    /// a real C compiler, in `tests/header_contract.rs`.
+    #[test]
+    fn the_allocator_vtable_field_offsets_are_pinned() {
+        use core::mem::offset_of;
+
+        for (field, actual, expected) in [
+            (
+                "struct_size",
+                offset_of!(NxmemAllocatorVtable, struct_size),
+                0,
+            ),
+            ("abi_minor", offset_of!(NxmemAllocatorVtable, abi_minor), 4),
+            (
+                "mechanism_id",
+                offset_of!(NxmemAllocatorVtable, mechanism_id),
+                8,
+            ),
+            ("device", offset_of!(NxmemAllocatorVtable, device), 16),
+            (
+                "capability_flags",
+                offset_of!(NxmemAllocatorVtable, capability_flags),
+                24,
+            ),
+            ("name", offset_of!(NxmemAllocatorVtable, name), 32),
+            ("ctx", offset_of!(NxmemAllocatorVtable, ctx), 40),
+            ("allocate", offset_of!(NxmemAllocatorVtable, allocate), 48),
+            (
+                "deallocate",
+                offset_of!(NxmemAllocatorVtable, deallocate),
+                56,
+            ),
+            ("retain", offset_of!(NxmemAllocatorVtable, retain), 64),
+            ("release", offset_of!(NxmemAllocatorVtable, release), 72),
+            (
+                "virtual_backing",
+                offset_of!(NxmemAllocatorVtable, virtual_backing),
+                80,
+            ),
+            (
+                "shared_mapping",
+                offset_of!(NxmemAllocatorVtable, shared_mapping),
+                88,
+            ),
+            (
+                "enqueue_release",
+                offset_of!(NxmemAllocatorVtable, enqueue_release),
+                96,
+            ),
+            (
+                "drain_releases",
+                offset_of!(NxmemAllocatorVtable, drain_releases),
+                104,
+            ),
+            (
+                "pending_release_count",
+                offset_of!(NxmemAllocatorVtable, pending_release_count),
+                112,
+            ),
+            (
+                "release_allocation",
+                offset_of!(NxmemAllocatorVtable, release_allocation),
+                120,
+            ),
+        ] {
+            assert_eq!(
+                actual, expected,
+                "NxmemAllocatorVtable.{field} moved from {expected} to {actual}; every plugin \
+                 already built against this ABI reads the old offset, so this is a breaking \
+                 change and needs a major bump, not an edit here"
+            );
+        }
+
+        // And the derived prefix constants follow from those offsets.
+        assert_eq!(NxmemAllocatorVtable::MIN_STRUCT_SIZE_MINOR_0, 120);
+        assert_eq!(NxmemAllocatorVtable::MIN_STRUCT_SIZE_MINOR_1, 128);
     }
 }

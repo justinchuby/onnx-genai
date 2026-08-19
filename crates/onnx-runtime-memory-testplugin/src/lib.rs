@@ -56,6 +56,12 @@ use onnx_runtime_memory_abi::{
 struct ModuleCounters {
     live_allocators: AtomicU64,
     live_allocations: AtomicU64,
+    /// Shared prefixes committed into a live allocation.
+    ///
+    /// This is the module's referent for `NxmemUnloadReport::live_views`: a
+    /// window onto shared physical bytes, owned by the plugin, whose life is
+    /// bounded by the allocation it looks into. Incremented by
+    /// `commit_shared_prefix`, retired by [`retire_block_views`].
     live_views: AtomicU64,
     live_capabilities: AtomicU64,
     queued_releases: AtomicU64,
@@ -92,6 +98,27 @@ struct Behaviour {
     abi_minor: u32,
     /// Publish an allocator vtable that is deliberately too short.
     short_allocator_struct: bool,
+    /// Publish a minor-0 allocator vtable whose declared prefix is followed by
+    /// poisoned bytes inside the same allocation.
+    poisoned_tail_struct: bool,
+    /// Publish a vtable with a required slot missing, *after* creating real
+    /// state.
+    ///
+    /// This is the one post-`Ok` rejection the host cannot diagnose by reading
+    /// the vtable normally: `read_prefix` refuses it, so the host has no
+    /// validated view to find `release` in. It must still find `release`, or
+    /// the state is stranded for the life of the process.
+    missing_required_slot: bool,
+    /// Publish a device tier code no host knows, *after* creating real state.
+    ///
+    /// This is the shape of bug that tests the host's post-`Ok` obligation: the
+    /// plugin succeeded, so it created state and expects a `release`, and the
+    /// host then refuses the vtable on its own terms.
+    unknown_device_tier: bool,
+    /// Take an extra reference to the allocator state at open and never drop
+    /// it, modelling a plugin that keeps its allocator alive for its own
+    /// worker thread after the host has let go.
+    self_retaining: bool,
     /// Call the host's `request_reclaim` on every allocation, and fail the
     /// allocation when the host refuses.
     probe_host_callback: bool,
@@ -111,6 +138,10 @@ impl Behaviour {
             capability_flags: NXMEM_CAP_ALLOCATOR | NXMEM_CAP_STRUCTURED_RELEASE,
             abi_minor: 1,
             short_allocator_struct: false,
+            poisoned_tail_struct: false,
+            missing_required_slot: false,
+            unknown_device_tier: false,
+            self_retaining: false,
             probe_host_callback: false,
             never_drain: false,
             quarantine_on_release: false,
@@ -154,6 +185,49 @@ const MECHANISMS: &[Mechanism] = &[
         c_name: c"short-struct",
         behaviour: Behaviour {
             short_allocator_struct: true,
+            ..Behaviour::base()
+        },
+    },
+    Mechanism {
+        name: "poisoned-tail",
+        c_name: c"poisoned-tail",
+        behaviour: Behaviour {
+            // Declares the baseline prefix while its allocation holds a
+            // populated, wrong-for-this-level `release_allocation` past that
+            // declaration. A host that reads past the declaration and skips
+            // the level clamp ends up holding it.
+            capability_flags: NXMEM_CAP_ALLOCATOR,
+            abi_minor: 0,
+            poisoned_tail_struct: true,
+            ..Behaviour::base()
+        },
+    },
+    Mechanism {
+        name: "missing-slot",
+        c_name: c"missing-slot",
+        behaviour: Behaviour {
+            // Real state, then a vtable the host cannot validate. The host has
+            // to reach `release` through an unvalidated read or lose the state.
+            capability_flags: NXMEM_CAP_ALLOCATOR,
+            missing_required_slot: true,
+            ..Behaviour::base()
+        },
+    },
+    Mechanism {
+        name: "bad-tier",
+        c_name: c"bad-tier",
+        behaviour: Behaviour {
+            capability_flags: NXMEM_CAP_ALLOCATOR,
+            unknown_device_tier: true,
+            ..Behaviour::base()
+        },
+    },
+    Mechanism {
+        name: "self-retaining",
+        c_name: c"self-retaining",
+        behaviour: Behaviour {
+            capability_flags: NXMEM_CAP_ALLOCATOR,
+            self_retaining: true,
             ..Behaviour::base()
         },
     },
@@ -218,6 +292,10 @@ pub const MECHANISM_NAMES: &[&str] = &[
     "eager",
     "lazy",
     "short-struct",
+    "poisoned-tail",
+    "missing-slot",
+    "bad-tier",
+    "self-retaining",
     "callback-probe",
     "legacy-1-0",
     "quarantining",
@@ -233,6 +311,12 @@ struct Block {
     bytes: usize,
     align: usize,
     committed: usize,
+    /// Shared prefixes currently committed into this block.
+    ///
+    /// Each one is a plugin-side *view*: a window onto shared physical bytes
+    /// that lives inside this allocation and dies with it. This is what
+    /// `NxmemUnloadReport::live_views` counts.
+    views: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -366,6 +450,22 @@ fn free_block(block: Block) {
     unsafe { dealloc(block.address as *mut u8, layout) };
 }
 
+/// Retire the views a block carried, at the moment it stops being live.
+///
+/// A view's life is bounded by the allocation it looks into: once the host has
+/// handed the allocation back, the window into it is gone whether or not the
+/// physical bytes have been freed yet. Retiring here rather than in
+/// [`free_block`] keeps the count honest for a *deferred* release, where the
+/// allocation leaves the live set long before the bytes do.
+fn retire_block_views(block: &Block) {
+    if block.views == 0 {
+        return;
+    }
+    counters()
+        .live_views
+        .fetch_sub(block.views, Ordering::AcqRel);
+}
+
 /// # Safety
 ///
 /// `ctx` must be a live `AllocatorState` pointer produced by `open_allocator`.
@@ -492,6 +592,7 @@ unsafe fn allocate_inner(
             bytes,
             align,
             committed: committed.min(bytes),
+            views: 0,
         };
         match state.inner.lock() {
             Ok(mut inner) => {
@@ -552,6 +653,7 @@ unsafe extern "C" fn plugin_deallocate(
                 "testplugin: that allocation id is not live on this mechanism",
             );
         };
+        retire_block_views(&block);
         let unmapped = block.committed as u64;
         free_block(block);
         counters().live_allocations.fetch_sub(1, Ordering::AcqRel);
@@ -603,6 +705,7 @@ unsafe extern "C" fn plugin_release_allocation(
             return NxmemStatus::ok();
         };
 
+        retire_block_views(&block);
         let unmapped = block.committed as u64;
         let bytes = block.bytes as u64;
 
@@ -674,6 +777,7 @@ unsafe extern "C" fn plugin_enqueue_release(
                         "testplugin: that allocation id is not live on this mechanism",
                     );
                 };
+                retire_block_views(&block);
                 inner.queue.push(QueuedRelease {
                     ticket,
                     allocation_id: allocation.allocation_id,
@@ -742,6 +846,7 @@ unsafe extern "C" fn plugin_drain_releases(
                 bytes: queued.bytes,
                 align: queued.align,
                 committed: queued.bytes,
+                views: 0,
             });
             counters().live_allocations.fetch_sub(1, Ordering::AcqRel);
             counters().queued_releases.fetch_sub(1, Ordering::AcqRel);
@@ -851,6 +956,7 @@ fn release_state(state: &AllocatorState) {
     // Reclaim anything still outstanding rather than leaking it.
     if let Ok(mut inner) = state.inner.lock() {
         for (_, block) in inner.blocks.drain() {
+            retire_block_views(&block);
             free_block(block);
             counters().live_allocations.fetch_sub(1, Ordering::AcqRel);
         }
@@ -861,6 +967,7 @@ fn release_state(state: &AllocatorState) {
                 bytes: entry.bytes,
                 align: entry.align,
                 committed: entry.bytes,
+                views: 0,
             });
             counters().live_allocations.fetch_sub(1, Ordering::AcqRel);
             counters().queued_releases.fetch_sub(1, Ordering::AcqRel);
@@ -879,6 +986,7 @@ fn release_state(state: &AllocatorState) {
                 bytes: prefix.bytes,
                 align: PREFIX_ALIGN,
                 committed: prefix.bytes,
+                views: 0,
             });
         }
     }
@@ -1256,6 +1364,7 @@ unsafe extern "C" fn plugin_release_shared_prefix(
                         bytes: prefix.bytes,
                         align: PREFIX_ALIGN,
                         committed: prefix.bytes,
+                        views: 0,
                     });
                 }
                 NxmemStatus::ok()
@@ -1361,6 +1470,11 @@ unsafe extern "C" fn plugin_commit_shared_prefix(
                     );
                 }
                 block.committed = block.committed.max(end);
+                // A committed prefix is a live plugin-side view into this
+                // allocation. It is exactly the object `live_views` names, and
+                // it retires when the allocation does.
+                block.views += 1;
+                counters().live_views.fetch_add(1, Ordering::AcqRel);
                 prefix.bytes as u64
             }
             Err(_) => {
@@ -1513,35 +1627,170 @@ unsafe extern "C" fn plugin_open_allocator(
             .as_ref()
             .map_or(core::ptr::null(), |shared| &raw const **shared);
 
+        if behaviour.missing_required_slot {
+            // The state above is real, the refcount is held, and the plugin is
+            // about to return `Ok`. `release` stays populated precisely
+            // because it is the one slot the host is still entitled to call on
+            // a vtable it has refused.
+            state.allocator_vtable.allocate = None;
+        }
+        if behaviour.unknown_device_tier {
+            // The state above is real and the plugin is about to return `Ok`,
+            // so the host owes it a `release` — even though the host is about
+            // to refuse this vtable on a tier code it has never heard of.
+            state.allocator_vtable.device.tier = UNKNOWN_DEVICE_TIER;
+        }
+        if behaviour.self_retaining {
+            // A reference the host never learns about and can never drop.
+            state.refcount.fetch_add(1, Ordering::AcqRel);
+        }
+
         counters().live_allocators.fetch_add(1, Ordering::AcqRel);
+        let published: *const NxmemAllocatorVtable = if behaviour.poisoned_tail_struct {
+            // Publish out of a separate allocation whose tail is poisoned.
+            // The state itself is entirely ordinary, so the allocator behaves
+            // normally once the host has read the prefix correctly — the only
+            // thing under test is what the host does with the bytes past the
+            // declaration.
+            poisoned_tail_allocator_vtable(mechanism_id, request.device, allocator_ctx)
+                .cast::<NxmemAllocatorVtable>()
+        } else {
+            &raw const *state.allocator_vtable
+        };
         // SAFETY: checked non-null above.
-        unsafe { *allocator_out = &raw const *state.allocator_vtable };
+        unsafe { *allocator_out = published };
         NxmemStatus::ok()
     })
 }
 
-/// A deliberately undersized allocator vtable.
+/// A vtable published in an allocation sized to its own declaration.
 ///
-/// `struct_size` claims fewer bytes than even the baseline prefix needs, so
-/// the host must refuse it before reading a single function pointer. It is
-/// stateless and `'static`, so refusing it leaks nothing.
-struct ShortVtable(NxmemAllocatorVtable);
-
-// SAFETY: immutable after construction and holding only null pointers.
-unsafe impl Send for ShortVtable {}
-// SAFETY: as above.
-unsafe impl Sync for ShortVtable {}
-
-fn short_allocator_vtable() -> *const NxmemAllocatorVtable {
-    static VTABLE: OnceLock<ShortVtable> = OnceLock::new();
-    &VTABLE
-        .get_or_init(|| {
-            let mut vtable = NxmemAllocatorVtable::zeroed();
-            vtable.struct_size = (NxmemAllocatorVtable::MIN_STRUCT_SIZE_MINOR_0 as u32) / 2;
-            ShortVtable(vtable)
-        })
-        .0
+/// The point is that the memory really *ends* where `struct_size` says it
+/// does. A full-size static that merely lies about its size cannot exhibit an
+/// out-of-bounds read at all: the bytes past the declaration are valid, so a
+/// host that ignores the bound reads garbage rather than tripping a
+/// sanitiser, and a test named for the over-read proves nothing.
+///
+/// Leaked deliberately. The host is expected to refuse or clamp these, and a
+/// refusal path must not depend on the fixture staying alive; one leaked
+/// allocation per process is a fair price for a fixture that can actually
+/// fail.
+struct TruncatedVtable {
+    ptr: *const NxmemAllocatorVtable,
 }
+
+// SAFETY: the pointed-to bytes are written once, before the pointer escapes,
+// and never mutated afterwards.
+unsafe impl Send for TruncatedVtable {}
+// SAFETY: as above.
+unsafe impl Sync for TruncatedVtable {}
+
+/// Leak `bytes` of memory aligned for an allocator vtable, filled with `fill`.
+///
+/// `bytes` is the *exact* allocation size, so reading past it is a genuine
+/// heap over-read that ASan, Miri or `MallocScribble` can see.
+fn leak_vtable_bytes(bytes: usize, fill: u8) -> *mut u8 {
+    let layout = Layout::from_size_align(bytes, align_of::<NxmemAllocatorVtable>())
+        .expect("the fixture layout is a compile-time constant and is valid");
+    // SAFETY: `bytes` is non-zero for every caller below.
+    let raw = unsafe { alloc(layout) };
+    assert!(
+        !raw.is_null(),
+        "testplugin: could not allocate the {bytes}-byte vtable fixture"
+    );
+    // SAFETY: `raw` owns exactly `bytes` writable bytes.
+    unsafe { core::ptr::write_bytes(raw, fill, bytes) };
+    raw
+}
+
+/// A vtable whose allocation is genuinely too short for even the baseline
+/// prefix.
+///
+/// `struct_size` declares half the baseline, and the allocation is exactly
+/// that size. The host must refuse it on the size check, before it reads a
+/// single function pointer — and if it ever stops doing so, the read runs off
+/// the end of a real heap allocation.
+fn short_allocator_vtable() -> *const NxmemAllocatorVtable {
+    static VTABLE: OnceLock<TruncatedVtable> = OnceLock::new();
+    VTABLE
+        .get_or_init(|| {
+            let declared = NxmemAllocatorVtable::MIN_STRUCT_SIZE_MINOR_0 / 2;
+            let raw = leak_vtable_bytes(declared, 0);
+            // Only `struct_size` and `abi_minor` fit; that is the point.
+            // SAFETY: `raw` owns at least eight writable bytes and both fields
+            // are `u32` at offsets 0 and 4 of every version of this struct.
+            unsafe {
+                core::ptr::write_unaligned(raw.cast::<u32>(), declared as u32);
+                core::ptr::write_unaligned(raw.cast::<u32>().add(1), 0);
+            }
+            TruncatedVtable {
+                ptr: raw.cast::<NxmemAllocatorVtable>(),
+            }
+        })
+        .ptr
+}
+
+/// A minor-0 vtable followed by poisoned bytes *inside the same allocation*.
+///
+/// The allocation is a full `size_of::<NxmemAllocatorVtable>()`, but only the
+/// baseline prefix is written; everything past it is `0xAB`. A host that
+/// honours the declared size reads the prefix and zeroes the rest, so
+/// `release_allocation` comes back null. A host that reads the whole struct
+/// *and* skips the level clamp comes back holding `0xABAB_ABAB_ABAB_ABAB` in
+/// a function-pointer slot — deterministically, on every platform, with no
+/// dependence on what happened to be adjacent in the heap.
+///
+/// This is the value-observable half of the bound. The pure-bound half is not
+/// observable through any value here: `release_allocation` is the only field
+/// past the baseline prefix, and the clamp nulls it independently, so
+/// destroying only the bound changes no value the host can see. It is a
+/// silent over-read, which is why the direct `copy_prefix` unit test in the
+/// ABI crate exists alongside this.
+fn poisoned_tail_allocator_vtable(
+    mechanism_id: u64,
+    device: NxmemDeviceId,
+    ctx: *mut c_void,
+) -> *mut u8 {
+    let full = size_of::<NxmemAllocatorVtable>();
+    let declared = NxmemAllocatorVtable::MIN_STRUCT_SIZE_MINOR_0;
+    debug_assert!(
+        declared < full,
+        "the baseline prefix must be a strict prefix"
+    );
+    let raw = leak_vtable_bytes(full, 0xAB);
+
+    let mut prefix = NxmemAllocatorVtable::zeroed();
+    prefix.struct_size = declared as u32;
+    prefix.abi_minor = 0;
+    prefix.mechanism_id = mechanism_id;
+    prefix.device = device;
+    prefix.capability_flags = NXMEM_CAP_ALLOCATOR;
+    prefix.ctx = ctx;
+    prefix.name = POISONED_TAIL_NAME.as_ptr().cast();
+    prefix.allocate = Some(plugin_allocate);
+    prefix.deallocate = Some(plugin_deallocate);
+    prefix.retain = Some(plugin_retain);
+    prefix.release = Some(plugin_release);
+    // Deliberately populated even though the declaration excludes it: the
+    // bytes the host must not read have to be *wrong*, not merely absent.
+    prefix.release_allocation = Some(plugin_release_allocation);
+
+    // SAFETY: `raw` owns `full` writable bytes and `declared <= full`, so
+    // copying the first `declared` bytes of a `full`-sized value is in bounds
+    // at both ends. The tail keeps its poison.
+    unsafe {
+        core::ptr::copy_nonoverlapping((&raw const prefix).cast::<u8>(), raw, declared);
+    }
+    raw
+}
+
+const POISONED_TAIL_NAME: &std::ffi::CStr = c"poisoned-tail";
+
+/// A device tier code no released host knows.
+///
+/// Chosen far above anything the tier enum will plausibly reach, so a host
+/// that grows new tiers still rejects it.
+const UNKNOWN_DEVICE_TIER: u32 = 4242;
 
 unsafe extern "C" fn plugin_factory_release(_ctx: *mut c_void) {
     // Factories are `&'static Mechanism`, so there is nothing to free. The

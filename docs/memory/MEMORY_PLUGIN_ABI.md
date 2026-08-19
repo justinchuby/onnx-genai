@@ -142,8 +142,38 @@ ticket. Until that ticket retires:
 - the host's callback table stays alive, because `release_completed` will still
   be called through it.
 
-This is what "deferred release keeps the plugin module and provider/context
-pinned until callbacks and frees retire" means concretely.
+The pinning is at two different granularities and both matter. An
+`Arc<PluginModule>` keeps the plugin's *code* mapped; it says nothing about the
+host's *callback context*, which is a separate heap object the plugin captured
+a raw pointer to at open. A queued release holds both, so an allocator dropped
+with releases still outstanding drains what the plugin is willing to retire
+and, for anything left, deliberately leaks its callback table rather than free
+memory a plugin thread may still write to. `AllocatorCore::leaked_callback_tables`
+counts those; a non-zero value is a leak to be fixed at the call site, not a
+crash.
+
+**Not yet implemented:** the *provider/context* half. No execution provider is
+wired to this ABI in this phase, so "deferred release keeps the provider and
+its context pinned" has nothing to pin. Only the intra-boundary half — module
+and callback table — is implemented and tested here.
+
+## Unloading a plugin
+
+`MemoryPlugin::try_unload` is the only clean shutdown. It consumes the plugin,
+asks both sides what is still live, and hands the plugin back on refusal so the
+caller can retire the outstanding work and try again.
+
+**Dropping a `MemoryPlugin` is not a clean shutdown.** Because `try_unload`
+consumes `self`, every early return, `?` and unwind reaches `Drop` instead. A
+drop has no channel to refuse through, so when the gate is shut its only two
+options are to unmap a module whose code a live object may still enter, or to
+keep it mapped forever. It keeps it mapped, and counts the event in
+`MemoryPlugin::forced_module_leaks`.
+
+Do not rely on the platform to save you here. Whether `dlclose` actually
+unmaps is an accident of the loader: glibc unmaps a refcount-zero DSO that is
+not marked `DF_1_NODELETE`, and Rust `cdylib`s are not; macOS commonly declines
+to unmap. "It did not crash on my machine" is not a safety property.
 
 ## Release outcomes
 
@@ -175,7 +205,9 @@ ABA race cannot make one allocation impersonate another.
 ## Unload gating
 
 `NxmemQueryUnloadReadiness` reports live allocators, allocations, views,
-capabilities, and queued releases. The host refuses or defers unload while any
+capabilities, and queued releases. A *view* is a shared prefix committed into a
+live allocation — a plugin-owned window whose life is bounded by the allocation
+it looks into, and which the host has no way to count for itself. The host refuses or defers unload while any
 count is non-zero, and it checks its own counters too, so a rejection carries
 both sides' tallies and a misreporting plugin is visible rather than fatal.
 
@@ -187,7 +219,7 @@ invites the host to unmap code that is about to run.
 `onnx-runtime-memory-testplugin` is a `cdylib` loaded at runtime by the ABI
 tests — out-of-tree in the way that matters (`dlopen`, no workspace linking),
 in-tree in the way that does not (it lives in the repo so it is built and
-linted with everything else). It publishes eight named mechanisms rather than
+linted with everything else). It publishes twelve named mechanisms rather than
 switching on environment variables or globals, so the tests select behaviour by
 name:
 
@@ -195,7 +227,11 @@ name:
 | --- | --- |
 | `eager` | the minimal conforming mechanism: required slots only |
 | `lazy` | virtual backing, shared mapping, deferred release, structured release |
-| `short-struct` | a vtable claiming fewer bytes than the baseline prefix |
+| `short-struct` | a vtable claiming fewer bytes than the baseline prefix, in an allocation that really is that short |
+| `poisoned-tail` | a minor-0 vtable whose declared prefix is followed by populated garbage inside the same allocation |
+| `missing-slot` | returns `Ok` with real state, then a vtable with a required slot null: tests the release path for a vtable the host cannot even parse |
+| `bad-tier` | returns `Ok` with real state, then publishes a device tier no host knows: tests the host's post-`Ok` release obligation |
+| `self-retaining` | keeps a reference to its own allocator state after the host lets go, so only the plugin's report can refuse unload |
 | `callback-probe` | calls `request_reclaim` and fails cleanly when the host refuses |
 | `legacy-1-0` | built to minor 0: an older participant under a newer host |
 | `quarantining` | keeps residual ownership on release |
