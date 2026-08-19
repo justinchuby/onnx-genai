@@ -1240,6 +1240,7 @@ extern "C" __global__ void skip_layernorm(
     const int    gamma_dtype,
     const int    beta_dtype,
     const int    bias_dtype,
+    const int    stat_dtype,
     const int    has_beta,
     const int    has_bias,
     const float  epsilon)
@@ -1290,8 +1291,8 @@ extern "C" __global__ void skip_layernorm(
     const float var = red[0] / (float)norm_size;
     const float inv_std = 1.0f / sqrtf(var + epsilon);
     if (tid == 0) {
-        if (mean_out)   skip_ln_store(mean_out, g, mean, dtype);
-        if (invstd_out) skip_ln_store(invstd_out, g, inv_std, dtype);
+        if (mean_out)   skip_ln_store(mean_out, g, mean, stat_dtype);
+        if (invstd_out) skip_ln_store(invstd_out, g, inv_std, stat_dtype);
     }
     __syncthreads();
 
@@ -2880,7 +2881,7 @@ impl SkipLayerNormKernel {
 
         // Optional outputs: mean (slot 1), inv_std_var (slot 2) — length
         // num_groups; input_skip_bias_sum (slot 3) — length input.numel().
-        let (mean_ptr, invstd_ptr) =
+        let (mean_ptr, invstd_ptr, stat_dtype) =
             optional_stat_ptrs_typed(op, outputs, num_groups, input.dtype)?;
         let sum_ptr = match outputs.get_mut(3) {
             None => 0u64,
@@ -2913,6 +2914,7 @@ impl SkipLayerNormKernel {
         let gamma_dtype = storage_kind(gamma.dtype);
         let beta_dtype = beta.map_or(dtype, |tensor| storage_kind(tensor.dtype));
         let bias_dtype = bias.map_or(dtype, |tensor| storage_kind(tensor.dtype));
+        let stat_dtype_kind = storage_kind(stat_dtype);
 
         let func = self.runtime.nvrtc_function(
             SKIP_LAYERNORM_MODULE,
@@ -2944,6 +2946,7 @@ impl SkipLayerNormKernel {
             .arg(&gamma_dtype)
             .arg(&beta_dtype)
             .arg(&bias_dtype)
+            .arg(&stat_dtype_kind)
             .arg(&has_beta)
             .arg(&has_bias)
             .arg(&eps);
@@ -3037,10 +3040,33 @@ fn optional_stat_ptrs_typed(
     outputs: &mut [TensorMut],
     num_groups: usize,
     dtype: DataType,
-) -> Result<(CUdeviceptr, CUdeviceptr)> {
-    let mean = optional_out_ptr_typed(op, "Mean", outputs, 1, num_groups, dtype)?;
-    let invstd = optional_out_ptr_typed(op, "InvStdDev", outputs, 2, num_groups, dtype)?;
-    Ok((mean, invstd))
+) -> Result<(CUdeviceptr, CUdeviceptr, DataType)> {
+    // ORT's schema types `mean`/`inv_std_var` as float, but exporters commonly
+    // emit these dangling training-only stats in the activation dtype. Accept
+    // either and tell the kernel which storage to write.
+    let mut stat_dtype = DataType::Float32;
+    for idx in [1, 2] {
+        if let Some(t) = outputs.get(idx) {
+            if t.dtype != DataType::Float32 && t.dtype != dtype {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: stat output {idx} dtype {:?} must be Float32 or the input dtype {dtype:?}",
+                    t.dtype
+                )));
+            }
+            stat_dtype = t.dtype;
+        }
+    }
+    if let (Some(mean), Some(invstd)) = (outputs.get(1), outputs.get(2))
+        && mean.dtype != invstd.dtype
+    {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep {op}: Mean dtype {:?} and InvStdDev dtype {:?} must match",
+            mean.dtype, invstd.dtype
+        )));
+    }
+    let mean = optional_out_ptr_typed(op, "Mean", outputs, 1, num_groups, stat_dtype)?;
+    let invstd = optional_out_ptr_typed(op, "InvStdDev", outputs, 2, num_groups, stat_dtype)?;
+    Ok((mean, invstd, stat_dtype))
 }
 
 fn optional_out_ptr_typed(

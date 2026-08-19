@@ -210,7 +210,11 @@ impl DriverFailure {
             )
         });
         Self {
-            message: error.to_string(),
+            // Anyhow's Display shows only the outermost context, which for a
+            // decode failure is the generic "forward pass failed" wrapper. The
+            // alternate form keeps the whole chain, and this message is the
+            // only thing the client ever sees.
+            message: format!("{error:#}"),
             kind: if memory_overload {
                 DriverFailureKind::MemoryOverload
             } else {
@@ -1123,7 +1127,7 @@ fn run_static_batch_until_idle(
         route_continuous_admissions(manager.poll_admissions(), &mut routes);
         if let Err(err) = manager.step() {
             let mut failure = DriverFailure::from_engine_error(&err);
-            failure.message = format!("continuous batch generation failed: {err}");
+            failure.message = format!("continuous batch generation failed: {err:#}");
             for (_, mut route) in routes.drain() {
                 if let Some(sender) = route.admission.take() {
                     let _ = sender.send(Err(failure.clone()));
