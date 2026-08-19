@@ -269,7 +269,7 @@ impl ChatTemplate {
         // natively. `minijinja-contrib`'s pycompat callback resolves those method
         // calls; without it real-world templates (e.g. qwen3) fail to render.
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_filter("tojson", minijinja::filters::tojson);
+        env.add_filter("tojson", tojson);
         env.add_function("raise_exception", raise_exception);
         let template_source = normalize_hf_jinja(&self.template);
         env.add_template("chat", &template_source)
@@ -367,6 +367,96 @@ fn raise_exception(message: String) -> std::result::Result<(), minijinja::Error>
         minijinja::ErrorKind::InvalidOperation,
         message,
     ))
+}
+
+/// `tojson` that emits plain JSON, the way Hugging Face chat templates expect.
+///
+/// MiniJinja's built-in filter escapes `<`, `>` and `&` as `\u003c`, `\u003e`
+/// and `\u0026` so the output is safe to embed in HTML, and writes compact
+/// `{"a":1}` separators. A chat prompt is not HTML: Transformers registers a
+/// `tojson` backed by `json.dumps`, and llama.cpp mirrors it, so a tool schema
+/// containing those characters -- which any shell or glob tool description has
+/// -- reaches the model verbatim and spaced there but mangled here. Models
+/// trained on the unescaped form can then fail to recognize their own tool
+/// definitions and never stop reasoning.
+///
+/// This matches `json.dumps`: unescaped text, `", "` / `": "` separators when
+/// compact, and the document's own key order (serde_json is built with
+/// `preserve_order`).
+fn tojson(
+    value: minijinja::Value,
+    kwargs: minijinja::value::Kwargs,
+) -> std::result::Result<minijinja::Value, minijinja::Error> {
+    let indent: Option<usize> = kwargs.get("indent")?;
+    kwargs.assert_all_used()?;
+    let to_error = |err: serde_json::Error| {
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            "cannot serialize to JSON",
+        )
+        .with_source(err)
+    };
+    let mut buffer = Vec::new();
+    match indent {
+        Some(indent) => {
+            let indent = " ".repeat(indent);
+            let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
+            let mut serializer = serde_json::Serializer::with_formatter(&mut buffer, formatter);
+            serde::Serialize::serialize(&value, &mut serializer).map_err(to_error)?;
+        }
+        None => {
+            let mut serializer =
+                serde_json::Serializer::with_formatter(&mut buffer, PythonCompactFormatter);
+            serde::Serialize::serialize(&value, &mut serializer).map_err(to_error)?;
+        }
+    }
+    let rendered = String::from_utf8(buffer).map_err(|err| {
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            "JSON serialization produced invalid UTF-8",
+        )
+        .with_source(err)
+    })?;
+    Ok(minijinja::Value::from_safe_string(rendered))
+}
+
+/// serde_json formatter matching Python's default `json.dumps` separators.
+///
+/// `json.dumps` writes `", "` between items and `": "` after a key unless an
+/// indent is requested; serde_json's default omits both spaces. Chat templates
+/// splice tool schemas straight into the prompt, so that whitespace is part of
+/// what the model was trained to see.
+struct PythonCompactFormatter;
+
+impl serde_json::ser::Formatter for PythonCompactFormatter {
+    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        writer.write_all(b": ")
+    }
 }
 
 #[cfg(test)]
@@ -533,6 +623,36 @@ mod tests {
             ),
             "compatibility normalization must not mutate the model template"
         );
+    }
+
+    #[test]
+    fn tojson_does_not_html_escape_tool_schemas() {
+        // A tool description carrying shell syntax must reach the model as the
+        // author wrote it; escaping `<`, `>` or `&` corrupts the definitions the
+        // model was trained to recognize.
+        let template = ChatTemplate {
+            template: "{{ tools | tojson }}".to_string(),
+            bos_token: None,
+            eos_token: None,
+        };
+        let tools = r#"[{"description":"run `cd <dir> && ls`"}]"#;
+
+        let rendered = template.render(&[], Some(tools), false).unwrap();
+
+        assert_eq!(rendered, r#"[{"description": "run `cd <dir> && ls`"}]"#);
+    }
+
+    #[test]
+    fn tojson_honors_the_indent_argument() {
+        let template = ChatTemplate {
+            template: "{{ tools | tojson(indent=2) }}".to_string(),
+            bos_token: None,
+            eos_token: None,
+        };
+
+        let rendered = template.render(&[], Some(r#"["a&b"]"#), false).unwrap();
+
+        assert_eq!(rendered, "[\n  \"a&b\"\n]");
     }
 
     #[test]

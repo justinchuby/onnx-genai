@@ -3504,8 +3504,17 @@ fn gqa_gpu_fused_decode_prep_matches_unfused_bit_exactly() {
 #[test]
 fn gqa_gpu_rejected_features_return_clear_errors() {
     let ep = require_cuda();
+    // A well-formed GQA node (the required head-count attributes are present)
+    // must be claimable; `unsupported_reason` rejects a node that is missing
+    // `num_heads`/`kv_num_heads`, so a bare node is legitimately unsupported.
     let mut registered = Node::new(NodeId(0), "GroupQueryAttention", vec![], vec![]);
     registered.domain = "com.microsoft".into();
+    registered
+        .attributes
+        .insert("num_heads".into(), Attribute::Int(4));
+    registered
+        .attributes
+        .insert("kv_num_heads".into(), Attribute::Int(2));
     assert!(matches!(
         ep.supports_op(&registered, 1, &[], &[], &[]),
         KernelMatch::Supported { .. }
@@ -3526,7 +3535,6 @@ fn gqa_gpu_rejected_features_return_clear_errors() {
     }
     for (index, feature) in [
         (10, "attention_bias"),
-        (11, "head_sink"),
         (12, "quantized-cache k_scale"),
         (13, "quantized-cache v_scale"),
     ] {
@@ -3539,6 +3547,18 @@ fn gqa_gpu_rejected_features_return_clear_errors() {
             .expect_err("feature input must be rejected");
         assert!(format!("{error}").contains(feature));
     }
+
+    // head_sink (input 11) is a SUPPORTED feature on the f32 paths (gpt-oss
+    // family): a per-query-head logit `[num_heads]` that joins the softmax
+    // denominator with no value contribution. It must be ACCEPTED, not
+    // rejected. `attrs()` declares num_heads=4, so the sink is shape [4].
+    let mut sink_inputs = base.clone();
+    while sink_inputs.len() <= 11 {
+        sink_inputs.push(None);
+    }
+    sink_inputs[11] = Some(f32_tensor(&[4], &[0.0, 0.0, 0.0, 0.0]));
+    run(&ep, &attrs(&[]), &sink_inputs, &[vec![1, 1, 8]])
+        .expect("f32 head_sink is a supported feature and must be accepted");
 
     let mut incomplete_inputs = base;
     incomplete_inputs[1] = None;

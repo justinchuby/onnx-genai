@@ -8,6 +8,17 @@ use onnx_runtime_optimizer::{
 pub(crate) const SILU_MUL_FUSION_ATTR: &str = "_cuda_silu_mul";
 pub(crate) const DECOMPOSED_SILU_ATTR: &str = "_cuda_decomposed_silu";
 
+/// Private marker set by [`CudaRsqrtFusion`] on a `Reciprocal` node whose input
+/// was a single-consumer `Sqrt`. The fusion rewires the `Reciprocal` to read the
+/// pre-`Sqrt` value and deletes the `Sqrt`; the CUDA unary-math factory
+/// ([`crate::kernels::pointwise::UnaryMathFactory`]) sees this marker and
+/// dispatches the single-kernel `rsqrt_{dtype}` (byte-identical double-round)
+/// instead of the plain `reciprocal_{dtype}`. The node keeps op_type
+/// `Reciprocal` in the default domain so standard unary shape inference and
+/// registry dispatch are unchanged, and the session restores the pre-pass graph
+/// before any non-CUDA fallback so no other EP observes the rewired node.
+pub(crate) const CUDA_RSQRT_ATTR: &str = "_cuda_rsqrt";
+
 /// Private marker set on a `MatMulNBits` node whose trailing bias input came
 /// from folding a *separate* elementwise `Add(MatMulNBits(x), bias)`.
 ///
@@ -90,6 +101,11 @@ pub(crate) struct CudaSiluFusion;
 pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     vec![
         Box::new(CudaSiluFusion),
+        // Collapse the SSM/linear-attention `Reciprocal(Sqrt(x))` normalize-scale
+        // glue into a single byte-identical `rsqrt` kernel (drops the standalone
+        // reciprocal kernel + its fp16 intermediate round-trip, ~1.2% of decode
+        // GPU-kernel time on qwen3.5-0.8b-hybrid; see the profiling drop).
+        Box::new(CudaRsqrtFusion),
         Box::new(CudaFoldConstantTranspose),
         Box::new(CudaFoldConstantCast),
         // Fuse the per-layer Q/K/V projections into one wider MatMulNBits while
@@ -113,6 +129,10 @@ pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
         // cache selector into an on-device `Where`, collapsing the per-token host
         // cond readback / graph split so decode captures as a single graph.
         Box::new(CudaOnDeviceConstantSelect),
+        // Runs last so it also sweeps up any identity `Cast` left behind by the
+        // fusions above (and the ~90 fp32→fp32 export casts per forward), rewiring
+        // consumers onto the pre-cast value. Byte-identical, shape/dtype-driven.
+        Box::new(CudaDropIdentityCast),
     ]
 }
 
@@ -188,6 +208,111 @@ impl OptimizationPass for CudaSiluFusion {
                 .opset_imports
                 .entry(MICROSOFT_DOMAIN.to_string())
                 .or_insert(1);
+            changed = true;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+/// Collapse an ONNX `Reciprocal(Sqrt(x))` pair into a single fused `rsqrt`
+/// kernel.
+///
+/// ## The pattern
+///
+/// SSM / linear-attention decoders (e.g. qwen3.5-*-hybrid) normalize the SSM
+/// query/key by a sum-of-squares scale, which exporters emit as the primitive
+/// chain `... Add(sumsq, eps) → Sqrt → Reciprocal → Mul(x, scale)`. The `Sqrt`
+/// and `Reciprocal` land as two standalone per-layer kernels
+/// (`sqrt_{dtype}` + `reciprocal_{dtype}`); a captured-graph node trace of
+/// qwen3.5-0.8b-hybrid decode measured the standalone `reciprocal_f16` at ~1.2%
+/// of decode GPU-kernel time (fires 2× per SSM layer), each reading and writing
+/// the full scale tensor.
+///
+/// ## The rewrite
+///
+/// For every `Sqrt` whose single output is consumed *only* by one `Reciprocal`
+/// (and is not a graph output), this pass rewires the `Reciprocal` to read the
+/// `Sqrt`'s input directly, tags it with [`CUDA_RSQRT_ATTR`], and deletes the
+/// `Sqrt`. The node keeps op_type `Reciprocal` in the default domain, so
+/// standard unary shape inference and kernel-registry dispatch are unchanged;
+/// the CUDA unary-math factory reads the marker and launches the fused
+/// `rsqrt_{dtype}` kernel, which reproduces the exact two-kernel rounding
+/// (`Sqrt` rounds `sqrtf(x)` to the storage dtype, then `Reciprocal` reads that
+/// back) so greedy tokens stay byte-identical while the intermediate tensor's
+/// global round-trip and one kernel launch are eliminated.
+///
+/// This is model-agnostic: it matches the structural `Sqrt → Reciprocal` glue
+/// on any shape/dtype the unary kernels support (f32/f16/bf16), not a single
+/// architecture. The single-consumer / no-escape guard guarantees the fusion
+/// never removes a `Sqrt` value another node still observes.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaRsqrtFusion;
+
+impl OptimizationPass for CudaRsqrtFusion {
+    fn name(&self) -> &str {
+        "CudaRsqrtFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        let sqrt_ids: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "Sqrt"
+                    && node.is_default_domain()
+                    && node.inputs.len() == 1
+                    && node.outputs.len() == 1)
+                    .then_some(id)
+            })
+            .collect();
+        let mut changed = false;
+
+        for sqrt_id in sqrt_ids {
+            let Some(sqrt) = graph.try_node(sqrt_id) else {
+                continue;
+            };
+            let Some(x) = sqrt.inputs[0] else {
+                continue;
+            };
+            // The fused `rsqrt` kernel exists for f32/f16/bf16 and reproduces the
+            // two-op rounding exactly, so restrict the fusion to those dtypes.
+            if !matches!(
+                graph.value(x).dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            ) {
+                continue;
+            }
+            let sqrt_output = sqrt.outputs[0];
+            if graph.outputs.contains(&sqrt_output) {
+                continue;
+            }
+            let consumers = graph.consumers(sqrt_output);
+            if consumers.len() != 1 {
+                continue;
+            }
+            let recip_id = consumers[0];
+            let recip = graph.node(recip_id);
+            if recip.op_type != "Reciprocal"
+                || !recip.is_default_domain()
+                || recip.inputs.len() != 1
+                || recip.outputs.len() != 1
+                || recip.inputs[0] != Some(sqrt_output)
+                || recip.attr(CUDA_RSQRT_ATTR).is_some()
+            {
+                continue;
+            }
+
+            let mut rsqrt = recip.clone();
+            rsqrt.inputs = vec![Some(x)];
+            rsqrt
+                .attributes
+                .insert(CUDA_RSQRT_ATTR.into(), Attribute::Int(1));
+            graph.replace_node(recip_id, rsqrt);
+            graph.remove_node(sqrt_id);
             changed = true;
         }
 
@@ -1110,6 +1235,97 @@ fn convert_float_bytes(src: &[u8], from: DataType, to: DataType) -> Option<Vec<u
     Some(out)
 }
 
+/// Removes **identity** `Cast`/`CastLike` nodes whose output element type equals
+/// their input element type (e.g. the ~90 `Float32 → Float32` casts per forward
+/// this qwen3.5-hybrid export emits — pure launch overhead in an all-fp32
+/// activation path).
+///
+/// Correctness: a same-dtype cast is a bitwise no-op (the runtime `cast_core`
+/// kernel loads the source element and stores it back unchanged), so rewiring
+/// every consumer of the cast output onto the pre-cast input and deleting the
+/// node is **byte-identical**. The rewrite is shape/dtype-driven (no operator
+/// pattern or model-specific constant): any `Cast` whose input and output share
+/// a known element type qualifies, so it generalizes to every export.
+///
+/// Conservative guards:
+/// * both the input and output element types must be *known* (never guess);
+/// * the input slot must be present (a `CastLike`'s 2nd "like" input is ignored,
+///   only slot 0 carries data);
+/// * a cast whose output is a **graph output** is left intact, so the runtime's
+///   output binding (by value id / name) is never disturbed.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaDropIdentityCast;
+
+/// Environment opt-out for [`CudaDropIdentityCast`], mirroring the other
+/// CUDA-pass switches. Any value other than unset/empty/`0` restores the
+/// exported identity `Cast` launches (for A/B measurement or rollback).
+const IDENTITY_CAST_FOLD_DISABLE_ENV: &str = "ONNX_GENAI_CUDA_DISABLE_IDENTITY_CAST_FOLD";
+
+fn identity_cast_fold_disabled() -> bool {
+    std::env::var_os(IDENTITY_CAST_FOLD_DISABLE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+impl OptimizationPass for CudaDropIdentityCast {
+    fn name(&self) -> &str {
+        "CudaDropIdentityCast"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        if identity_cast_fold_disabled() {
+            return Ok(());
+        }
+        let candidates: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                ((node.op_type == "Cast" || node.op_type == "CastLike")
+                    && matches!(node.domain.as_str(), "" | "ai.onnx")
+                    && !node.inputs.is_empty()
+                    && node.outputs.len() == 1)
+                    .then_some(id)
+            })
+            .collect();
+
+        let mut changed = false;
+        for node_id in candidates {
+            // Re-read against the live graph so chained identity casts (cast of a
+            // cast) collapse correctly as earlier rewrites land.
+            let Some(node) = graph.try_node(node_id) else {
+                continue;
+            };
+            let Some(input) = node.inputs[0] else {
+                continue;
+            };
+            let output = node.outputs[0];
+            if input == output {
+                continue;
+            }
+            // Both element types must be known and equal for a bitwise no-op.
+            if !graph.value_type_is_known(input) || !graph.value_type_is_known(output) {
+                continue;
+            }
+            if graph.value(input).dtype != graph.value(output).dtype {
+                continue;
+            }
+            // Preserve any cast that directly feeds a graph output slot.
+            if graph.outputs.contains(&output) {
+                continue;
+            }
+
+            graph.replace_all_uses(output, input);
+            graph.remove_node(node_id);
+            graph.gc_value_if_orphan(output);
+            changed = true;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
 ///
 /// Only the exact QKV-style decode pattern is fused: a `MatMulNBits` with no
 /// zero-points / group-index / existing bias, whose sole consumer is a plain
@@ -1268,10 +1484,27 @@ impl CudaMatMulNBitsBiasFusion {
 
 /// Block-quantization the fused RMS-norm GEMV kernels assume. The fused decode
 /// GEMVs (and their prefill GEMM) implement both the packed int4 layout and the
-/// one-byte-per-weight int8 layout, so either bit width fuses; the block size is
-/// fixed at 32 by the tuned four-lane/eight-block warp walk.
+/// one-byte-per-weight int8 layout, so either bit width fuses.
 const RMSNORM_FUSION_SUPPORTED_BITS: [i64; 2] = [4, 8];
-const RMSNORM_FUSION_SUPPORTED_BLOCK_SIZE: i64 = 32;
+/// Block-quantization block sizes for which a fused RMS-norm-prologue GEMV kernel
+/// actually exists. This is a **kernel capability set**, not a model constant:
+/// the fused-prologue dot (`matmul_nbits_gemv_f16_scales_f16_rmsnorm*`) and the
+/// fused gate/up SwiGLU-RMSNorm kernel bake in the tuned four-lane/eight-block
+/// warp walk that only covers `block_size == 32` (the block index is a hard
+/// `depth >> 5`; the gate/up kernel explicitly rejects any other width). A larger
+/// block size (e.g. GLM-4-9B's block-128, whose standalone GEMVs run the
+/// `general_bs` `>> 7` layout) folds automatically here the moment a matching
+/// fused-prologue kernel variant for that layout is added — extend this set in
+/// lockstep with a kernel that reproduces the standalone norm bit-exactly (or
+/// under an f64-parity opt-in when the reduction order differs). Gating on the
+/// implemented set — never a magic scalar — keeps the fold capability-driven and
+/// subsumes the "gate too narrowly hardcoded" concern (issue #1421) on this axis.
+const RMSNORM_FUSION_SUPPORTED_BLOCK_SIZES: [i64; 1] = [32];
+
+/// Whether a fused RMS-norm-prologue GEMV kernel exists for `block_size`.
+fn rmsnorm_fusion_supports_block_size(block_size: i64) -> bool {
+    RMSNORM_FUSION_SUPPORTED_BLOCK_SIZES.contains(&block_size)
+}
 /// The fused prologue/epilogue reproduce `skip_rmsnorm_f16_warp_half4`, which
 /// covers the hidden size in 128-wide (`32 lanes * 4 halves`) chunks, so the
 /// fusion only fires when the hidden size is a whole multiple of 128.
@@ -1296,9 +1529,25 @@ fn rmsnorm_fusion_disabled() -> bool {
 /// of seven chunks (896, which regresses) and twelve chunks (1536, which wins),
 /// so the floor is the granularity-aligned midpoint. It is a property of the
 /// kernel's 128-lane reduction, never of any model.
+///
+/// Caveat — this floor was calibrated on **M=1 single-stream** throughput on an
+/// **H200** (commit `05e1fd10`: 0.5B hidden-896 regressed -2.7% folded), and it
+/// predates the capture-safe batch-decode path (#1404). At **M>=2** the fold
+/// makes the gate/up node capture-safe and collapses the batch-decode CUDA-graph
+/// segmentation (25 -> 1 segments), saving ~20 ms/step — which dwarfs the M=1
+/// prologue cost. The fold is byte-identical, so keeping the standalone norm
+/// below 1280 leaves that batch win on the table for small resident models
+/// (0.5B at 896, granite-1B MoE at 1024). The M=1 cost is also hardware-
+/// dependent: on RTX 4060 the same hidden-896 fold measured neutral-to-faster,
+/// not a regression. Making this gate batch/device-aware is tracked in #1421;
+/// until then the override below enables it. See the operator-knob section of
+/// `docs/benchmarks/2026-08-19-batch-decode-mge2-capture-segmentation.md`.
 const RMSNORM_FUSION_MIN_HIDDEN: usize = 10 * RMSNORM_FUSION_WARP_HALF4_MULTIPLE;
-/// Optional environment override for [`RMSNORM_FUSION_MIN_HIDDEN`], used only to
-/// calibrate the floor against measured throughput.
+/// Optional environment override for [`RMSNORM_FUSION_MIN_HIDDEN`]. Beyond
+/// calibrating the floor against measured throughput, this is the documented
+/// interim knob (#1421) an operator lowers to force the byte-identical fold on a
+/// small resident model so **batched** decode gets #1404's capture-safe path;
+/// set it only when batching (see the constant's caveat on the M=1 cost).
 const RMSNORM_FUSION_MIN_HIDDEN_ENV: &str = "ONNX_GENAI_RMSNORM_MIN_HIDDEN";
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -1736,8 +1985,10 @@ impl CudaSkipRmsNormMatMulFusion {
         {
             return false;
         }
-        if node.attr("block_size").and_then(Attribute::as_int)
-            != Some(RMSNORM_FUSION_SUPPORTED_BLOCK_SIZE)
+        if !node
+            .attr("block_size")
+            .and_then(Attribute::as_int)
+            .is_some_and(rmsnorm_fusion_supports_block_size)
         {
             return false;
         }
@@ -2877,6 +3128,11 @@ mod tests {
     use super::*;
     use onnx_runtime_ir::{Dim, Node, NodeId, ValueId};
 
+    /// Serializes the [`CudaDropIdentityCast`] tests: one mutates the process-wide
+    /// `IDENTITY_CAST_FOLD_DISABLE_ENV`, which the others read through the pass, so
+    /// they must not run concurrently (mirrors `TEST_SINGLE_SPLIT_LOCK`).
+    static IDENTITY_CAST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn value(graph: &mut Graph, name: &str, dtype: DataType, width: usize) -> ValueId {
         graph.create_named_value(name, dtype, vec![Dim::Static(1), Dim::Static(width)])
     }
@@ -3180,6 +3436,107 @@ mod tests {
         assert!(
             graph.nodes.values().all(|node| node.op_type != "Silu"),
             "fp32 has no byte-exact decomposed SiLU kernel; must stay unfused"
+        );
+    }
+
+    // === Rsqrt fusion (Reciprocal(Sqrt(x)) -> tagged Reciprocal) ===
+
+    /// `Add(sumsq, eps) → Sqrt → Reciprocal → Mul(x, scale)`, the SSM
+    /// normalize-scale glue `CudaRsqrtFusion` targets. The `Add` and trailing
+    /// `Mul` bracket the pair so the single-consumer rewrite is observable.
+    /// Returns the graph plus the `denom` (pre-Sqrt) and `root` (Sqrt output)
+    /// value ids for assertions.
+    fn rsqrt_glue_graph(dtype: DataType) -> (Graph, ValueId, ValueId) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let sumsq = value(&mut graph, "sumsq", dtype, 5);
+        let eps = value(&mut graph, "eps", dtype, 5);
+        let x = value(&mut graph, "x", dtype, 5);
+        let denom = value(&mut graph, "denom", dtype, 5);
+        let root = value(&mut graph, "root", dtype, 5);
+        let scale = value(&mut graph, "scale", dtype, 5);
+        let output = value(&mut graph, "output", dtype, 5);
+        graph.add_input(sumsq);
+        graph.add_input(eps);
+        graph.add_input(x);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(sumsq), Some(eps)],
+            vec![denom],
+        ));
+        graph.insert_node(Node::new(NodeId(0), "Sqrt", vec![Some(denom)], vec![root]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Reciprocal",
+            vec![Some(root)],
+            vec![scale],
+        ));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(x), Some(scale)],
+            vec![output],
+        ));
+        graph.add_output(output);
+        (graph, denom, root)
+    }
+
+    #[test]
+    fn fuses_fp16_reciprocal_of_sqrt() {
+        let (mut graph, denom, _root) = rsqrt_glue_graph(DataType::Float16);
+        CudaRsqrtFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        // Sqrt removed; Reciprocal retagged and rewired to the pre-sqrt value.
+        assert_eq!(graph.num_nodes(), 3, "Sqrt must be removed");
+        assert!(
+            graph.nodes.values().all(|n| n.op_type != "Sqrt"),
+            "Sqrt node must be gone"
+        );
+        let recip = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "Reciprocal")
+            .expect("Reciprocal must remain");
+        assert!(
+            recip.is_default_domain(),
+            "node stays a standard Reciprocal"
+        );
+        assert_eq!(
+            recip.attr(CUDA_RSQRT_ATTR).and_then(Attribute::as_int),
+            Some(1),
+            "fused Reciprocal must carry the rsqrt marker"
+        );
+        // Reciprocal now reads the pre-Sqrt value ("denom"), not the Sqrt output.
+        assert_eq!(recip.inputs[0], Some(denom));
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn does_not_fuse_sqrt_with_extra_consumer() {
+        // Sqrt output feeds both the Reciprocal *and* a second consumer, so the
+        // Sqrt value escapes the pair and must not be removed.
+        let (mut graph, _denom, root) = rsqrt_glue_graph(DataType::Float16);
+        let sink = value(&mut graph, "sink", DataType::Float16, 5);
+        graph.insert_node(Node::new(NodeId(0), "Neg", vec![Some(root)], vec![sink]));
+        graph.add_output(sink);
+
+        CudaRsqrtFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(
+            graph.nodes.values().any(|n| n.op_type == "Sqrt"),
+            "Sqrt with a second consumer must be preserved"
+        );
+        assert!(
+            graph
+                .nodes
+                .values()
+                .filter(|n| n.op_type == "Reciprocal")
+                .all(|n| n.attr(CUDA_RSQRT_ATTR).is_none()),
+            "Reciprocal must not be retagged when Sqrt escapes"
         );
     }
 
@@ -5947,5 +6304,113 @@ mod tests {
             .filter(|n| n.op_type == "MatMulNBits")
             .count();
         assert_eq!(fused, 1, "opt-in flag enables the fusion");
+    }
+
+    /// `x -> Cast(f32->f32) -> y -> Relu -> out`: the identity cast is removed
+    /// and `Relu` is rewired directly onto `x`, leaving a byte-identical graph.
+    #[test]
+    fn drops_identity_cast_and_rewires_consumer() {
+        let _serial = IDENTITY_CAST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = value(&mut g, "x", DataType::Float32, 4);
+        g.add_input(x);
+        let y = cast_node(&mut g, "y", x, DataType::Float32, 4);
+        let out = value(&mut g, "out", DataType::Float32, 4);
+        g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(y)], vec![out]));
+        g.add_output(out);
+
+        assert_eq!(g.nodes.values().filter(|n| n.op_type == "Cast").count(), 1);
+        CudaDropIdentityCast
+            .run(&mut g, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            0,
+            "identity cast removed"
+        );
+        let relu = g.nodes.values().find(|n| n.op_type == "Relu").unwrap();
+        assert!(
+            relu.input_values().any(|v| v == x),
+            "consumer rewired onto the pre-cast value"
+        );
+        assert!(g.validate().is_ok());
+    }
+
+    /// A genuine dtype change (`f32 -> f16`) is a real conversion, not an
+    /// identity, so the pass must leave it untouched.
+    #[test]
+    fn keeps_narrowing_cast() {
+        let _serial = IDENTITY_CAST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = value(&mut g, "x", DataType::Float32, 4);
+        g.add_input(x);
+        let y = cast_node(&mut g, "y", x, DataType::Float16, 4);
+        g.add_output(y);
+
+        CudaDropIdentityCast
+            .run(&mut g, &PassContext::new())
+            .unwrap();
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            1,
+            "narrowing cast preserved"
+        );
+    }
+
+    /// An identity cast that feeds a graph output slot is preserved so the
+    /// runtime's output binding (by value id) is never disturbed.
+    #[test]
+    fn keeps_identity_cast_feeding_graph_output() {
+        let _serial = IDENTITY_CAST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = value(&mut g, "x", DataType::Float32, 4);
+        g.add_input(x);
+        let y = cast_node(&mut g, "y", x, DataType::Float32, 4);
+        g.add_output(y);
+
+        CudaDropIdentityCast
+            .run(&mut g, &PassContext::new())
+            .unwrap();
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            1,
+            "graph-output cast preserved"
+        );
+    }
+
+    /// The opt-out env restores the exported identity casts for A/B / rollback.
+    #[test]
+    fn opt_out_env_preserves_identity_cast() {
+        let _serial = IDENTITY_CAST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = value(&mut g, "x", DataType::Float32, 4);
+        g.add_input(x);
+        let y = cast_node(&mut g, "y", x, DataType::Float32, 4);
+        let out = value(&mut g, "out", DataType::Float32, 4);
+        g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(y)], vec![out]));
+        g.add_output(out);
+
+        unsafe { std::env::set_var(IDENTITY_CAST_FOLD_DISABLE_ENV, "1") };
+        let result = CudaDropIdentityCast.run(&mut g, &PassContext::new());
+        unsafe { std::env::remove_var(IDENTITY_CAST_FOLD_DISABLE_ENV) };
+        result.unwrap();
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            1,
+            "opt-out preserves the identity cast"
+        );
     }
 }
