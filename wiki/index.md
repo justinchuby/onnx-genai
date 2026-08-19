@@ -47,6 +47,19 @@ responsibilities from first principles.
 skew was measured for a trained-router MoE model, and why it decides whether a
 residency policy has anything to exploit.
 
+[[memory/Virtual Memory for KV Cache]] (中文) walks through what the virtual
+memory manager actually does when a KV cache grows, when a prefix is shared,
+when one physical handle is mapped at several virtual addresses, and when a
+release or a teardown synchronization fails.
+
+### Understand model prompt formats
+
+[[prompting/Chat Templates]] (中文) explains how a message array becomes the token
+sequence a model sees: template structure and conventions, why generation
+starts at the position right after the rendered assistant prefix, multimodal
+placeholder variants, recipient-scoped channels (`to=self` / `to=user` /
+`to=<tool>`), and how tool calls are rendered and fed back.
+
 ### Change or measure the runtime
 
 - [[development/Testing and Verification]]
