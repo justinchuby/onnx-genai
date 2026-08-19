@@ -3442,6 +3442,16 @@ has no `m > 1` fan-out at all — it loops over activation rows and calls
 `parallel_output_rows` **once per row**. An 8-token prefill is eight
 fork-joins; a 512-token prefill is five hundred and twelve.
 
+> **Resolved 2026-08-19 (#1435).** This section was right that the path was
+> dead, and the default is now on. It was wrong about the cost, though, and so
+> was I when I acted on it: replacing the `m` fork-joins with one is worth
+> 6.897 -> 6.874 ms on `llama3_8b_qkv_t8`, i.e. nothing. The eight barriers were
+> never the problem. What was: the kernel spends >80% of its instruction stream
+> decoding nibbles and re-did all of it for every activation row, which is why
+> that cell's time was exactly linear in `m`. Decoding once per row *tile*
+> instead is worth 3.03x there and 2.53-5.22x across every int4 prefill cell.
+> See [`2026-08-19-int4-prefill-row-blocking.md`](2026-08-19-int4-prefill-row-blocking.md).
+
 `parallel_output_rows` is the single flat fan-out shared by eight call sites
 (`int4_matmul_m1`, `packed_nbits_output_row`, `borrowed_affine_int4_matmul`,
 `borrowed_affine_int4_matmul_nblock`, `int8_row`, `gemv_nk`, `gemv_nk_u8`,

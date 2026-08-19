@@ -1479,7 +1479,7 @@ impl Kernel for MatMulNBitsKernel {
             // dense fallback's `sgemm_simd_packed`. Running it inside the
             // decode pool measured 2.4x slower purely from the narrower pool.
             #[cfg(target_arch = "x86_64")]
-            if m >= INT4_PREFILL_GEBP_MIN_ROWS
+            if m >= int4_prefill_gebp_min_rows(self.k * self.n / 2, self.block_size)
                 && self.block_size.is_multiple_of(2)
                 && crate::backend::has_simd_x86()
                 && int4_prefill_gebp_enabled()
@@ -7174,24 +7174,78 @@ fn borrowed_int4_output_element(
 }
 
 /// Row count from which the fused-dequant GEBP prefill (#1117) takes over from
-/// the row-serial borrowed kernel.
+/// the borrowed column-blocked kernel for a weight too large to stay in L2.
 ///
-/// Below this the pack is not amortized. The row-serial kernel reads each
-/// packed byte once per row, so at very small `m` its total work is genuinely
-/// lower than expanding the weight into f32 panels — the panels only pay off
-/// once enough rows reuse them. Measured on a 32-core AVX2 host, medians of
-/// three interleaved runs:
+/// Below this the pack is not amortized: the borrowed kernel re-decodes each
+/// packed byte per row block but never materializes an f32 panel, so at small
+/// `m` its total work is genuinely lower — the panels only pay off once enough
+/// rows reuse them.
 ///
-/// | m | k=2048,n=2048 | k=4096,n=11008 |
-/// |---|---|---|
-/// | 2 | 0.83 -> 1.11 ms (**regresses**) | 8.21 -> 7.80 ms |
-/// | 4 | 1.64 -> 1.32 ms | 16.4 -> 7.51 ms (2.2x) |
-/// | 8 | 3.36 -> 1.14 ms (2.9x) | 33.5 -> 8.42 ms (4.0x) |
-///
-/// So 4 is the lowest row count that never loses: at 2 the small shape gives
-/// back more to packing than the reuse returns.
+/// This threshold was originally tuned at `4` against the *row-serial* borrowed
+/// kernel. #1356 replaced that with the column-blocked one, which amortizes its
+/// re-decode over a block of rows and therefore stays ahead considerably
+/// longer; the retune to `12` (and `24` when the weight is L2-resident, see
+/// [`int4_prefill_gebp_min_rows`]) measures against that current kernel.
 #[cfg(target_arch = "x86_64")]
-const INT4_PREFILL_GEBP_MIN_ROWS: usize = 4;
+const INT4_PREFILL_GEBP_MIN_ROWS: usize = 12;
+
+/// Row threshold for weights small enough to stay resident in L2, where the
+/// column-blocked kernel's re-decode is nearly free and the GEBP pack takes
+/// longer to pay off.
+#[cfg(target_arch = "x86_64")]
+const INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT: usize = 24;
+
+/// Packed-weight size above which the column-blocked kernel can no longer keep
+/// the weight in cache between rows. Sits between the two measured regimes:
+/// qwen3-0.6B QKV packs to 1.0 MB and crosses over at `m = 24`; llama3-8B QKV
+/// (12.6 MB) and MLP (29.4 MB) both cross at `m = 12`.
+#[cfg(target_arch = "x86_64")]
+const INT4_PREFILL_GEBP_L2_RESIDENT_BYTES: usize = 4 << 20;
+
+/// Crossover for a weight whose block size the column-blocked kernels cannot
+/// take.
+///
+/// [`borrowed_affine_int4_matmul_prefill`] and
+/// [`borrowed_affine_int4_matmul_nblock`] both require 32-element blocks. For
+/// the ONNX-minimum block size of 16 the GEBP prefill is the only vectorised
+/// route there is, and everything below it is a scalar per-block dot running on
+/// the narrow decode pool. Raising the crossover for those weights would not
+/// hand them a better kernel, it would hand them no kernel, so they keep the
+/// threshold measured before #1356 arrived.
+#[cfg(target_arch = "x86_64")]
+const INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED: usize = 4;
+
+/// The `m` at which the fused-dequant GEBP overtakes the column-blocked
+/// borrowed kernel for this node's weight.
+///
+/// The crossover is not a single row count: it depends on whether the packed
+/// weight stays cache-resident across rows. Measured on a 32-core AVX2 host,
+/// native-alone, min of 5, GEBP / column-blocked:
+///
+/// | m | qwen3-0.6B QKV (1.0 MB) | llama3-8B QKV (12.6 MB) | llama3-8B MLP (29.4 MB) |
+/// |---|---|---|---|
+/// | 8 | 0.50x | 0.73x | 0.81x |
+/// | 12 | 0.69x | **1.01x** | **1.01x** |
+/// | 16 | 0.80x | 1.35x | 1.26x |
+/// | 24 | **1.14x** | 1.80x | 1.98x |
+/// | 32 | 1.68x | 2.24x | 2.35x |
+///
+/// A flat `12` would hand the small shape a 1.45x regression at `m = 12`; a
+/// flat `24` would give up 1.35x-1.80x on the large shapes at `m = 16..23`.
+///
+/// Both regimes were measured on `block_size = 32` weights, which is also the
+/// smallest block the kernels that win below the crossover can take; see
+/// [`INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED`] for the ones that cannot.
+#[cfg(target_arch = "x86_64")]
+fn int4_prefill_gebp_min_rows(packed_weight_bytes: usize, block_size: usize) -> usize {
+    if !block_size.is_multiple_of(32) {
+        INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED
+    } else if packed_weight_bytes > INT4_PREFILL_GEBP_L2_RESIDENT_BYTES {
+        INT4_PREFILL_GEBP_MIN_ROWS
+    } else {
+        INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT
+    }
+}
 
 /// Kill switch for the fused-dequant GEBP prefill (issue #1117). Default **on**
 /// -- unlike the earlier `ONNX_GENAI_CPU_MM_INT4_PREFILL` probe this is a
@@ -7246,21 +7300,191 @@ fn int8_prefill_gebp_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// A/B toggle for the structural borrowed int4 prefill matmul (issue #1117).
-/// `1`/`on` enables it for multi-row (prefill) activations; unset or `0`/`off`
-/// keeps the row-serial path. Default off so the shipped path is unchanged
-/// until the win is measured, exactly like the `#1104` N-block
-/// (`ONNX_GENAI_CPU_MM_INT4_NBLK`) and `#994` SIMD toggles. Read-only env probe
-/// -- production never mutates it at runtime.
+/// Kill switch for the structural, column-blocked borrowed int4 prefill matmul
+/// (issues #1117 and #1435). `0`/`off` reverts multi-row activations to the
+/// row-serial path; unset or anything else keeps the blocked path.
+///
+/// **Default on.** It shipped off — "until the win is measured" — and then
+/// nothing measured it, so for its whole life the toggle meant the code was
+/// dead in every build anyone ran. The win is now measured: on the llama3-8b
+/// QKV cell (`k = 4096`, `n = 6144`, `m = 8`) at 32 threads, native-alone,
+/// 6.90 ms -> 1.11 ms, and the path is bit-identical to the one it replaces, so
+/// there is nothing left for the default to protect. The switch stays only so a
+/// bisect has something to flip. Read-only env probe -- production never
+/// mutates it at runtime.
 #[cfg(target_arch = "x86_64")]
 fn borrowed_int4_prefill_block_enabled() -> bool {
     std::env::var("ONNX_GENAI_CPU_MM_INT4_PREFILL")
         .ok()
         .map(|value| {
             let value = value.trim();
-            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("off")
+            value.is_empty() || (value != "0" && !value.eq_ignore_ascii_case("off"))
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
+}
+
+/// Activation rows a single [`borrowed_int4_rowblock_avx2`] call accumulates at
+/// once.
+///
+/// The int4 inner loop is dominated by *nibble decode*, not by arithmetic. Per
+/// 32-lane chunk of one column it costs one 16-byte load, two `and`s, a shift,
+/// two `unpack`s and eight widen/convert instructions — about 18 — to feed just
+/// four FMAs. So better than 80% of the instruction stream is unpacking, and
+/// the row-serial and `NCols4` kernels both pay all of it again for every
+/// activation row.
+///
+/// The decoded block is identical for every row, so hoisting the row loop
+/// *inside* the unpack amortises those 18 instructions over `4 x ROWS` FMAs
+/// instead of 4. The instruction budget per 32 MACs goes from ~22 to ~8.5.
+///
+/// Four is what the register file allows, and what the sweep picks. The chunk
+/// loop holds the decoded block (`w0..w3`, 4 `ymm`), a per-row in-block
+/// accumulator (`ROWS`) and the activation vectors it loads for the row it is
+/// on (4) — 12 of the 16 architectural `ymm` at `ROWS = 4`, leaving the per-row
+/// cross-block accumulators to live across the much colder block boundary.
+/// `ROWS = 8` needs 20 and spills.
+///
+/// Measured at 32 threads, native-alone, ms (`ROWS = 2` is uniformly worst and
+/// is dropped from the table; on the target cell it reads 3.514):
+///
+/// | cell | `ROWS = 4` | `ROWS = 8` |
+/// |---|---|---|
+/// | `llama3_8b_qkv_t8`   |   2.277 |   2.279 |
+/// | `llama3_8b_qkv_t128` |  26.697 |  23.201 |
+/// | `llama3_8b_qkv_t512` |  90.942 |  92.268 |
+/// | `llama3_8b_mlp_t8`   |   5.524 |   5.107 |
+/// | `llama3_8b_mlp_t128` |  52.886 |  54.392 |
+/// | `llama3_8b_mlp_t512` | 216.386 | 225.152 |
+/// | `qwen3_0p6b_qkv_t8`   |  0.325 |   0.275 |
+/// | `qwen3_0p6b_qkv_t128` |  4.480 |   4.829 |
+/// | `qwen3_0p6b_qkv_t512` | 10.526 |  13.786 |
+/// | `qwen3_0p6b_mlp_t8`   |  0.578 |   0.577 |
+/// | `qwen3_0p6b_mlp_t128` |  5.047 |   6.510 |
+/// | `qwen3_0p6b_mlp_t512` | 20.372 |  24.868 |
+///
+/// 4 takes eight of the twelve cells. 8 takes three `t8` cells (by up to 1.18x
+/// on `qwen3_0p6b_qkv_t8`) and one wide one, `llama3_8b_qkv_t128`, by 1.15x —
+/// which the register-pressure argument does not predict and I cannot explain.
+/// 4's wins are the larger ones (up to 1.31x on `qwen3_0p6b_qkv_t512`) and
+/// cover every other wide prefill. Since a `t8` tile at `ROWS = 8` is a single
+/// tile with no remainder, that is 8's most favourable possible shape and it
+/// still does not carry the table. 4 it is.
+#[cfg(target_arch = "x86_64")]
+const PREFILL_ROW_BLOCK: usize = 4;
+
+/// AVX2 + FMA int4 kernel for one output column and up to
+/// [`PREFILL_ROW_BLOCK`] activation rows.
+///
+/// Decodes each K block's nibbles **once** and drives every row in the tile
+/// through the decoded vectors, which is the whole point (see
+/// [`PREFILL_ROW_BLOCK`]). Within a row this is instruction-for-instruction the
+/// single-column case of [`borrowed_int4_nblock4_avx2`]: the same unpack, the
+/// same per-block `blk`, the same `acc = fma(blk, scale, acc)` fold, the same
+/// scalar affine `correction`, and one horizontal reduction per row at the end.
+/// A `rows == 1` call is therefore bit-identical to
+/// `borrowed_int4_nblock4_avx2` with `group == 1`, which
+/// `rowblock_matches_nblock_for_a_single_row` asserts, and results differ from
+/// the per-element path only by the f32 reassociation that kernel already
+/// documents — never in nibble decode.
+///
+/// `activations` and `activation_sums` are the tile's rows only; `out` is one
+/// value per row of the tile.
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn borrowed_int4_rowblock_avx2(
+    activations: &[f32],
+    activation_sums: &[f32],
+    rows: usize,
+    packed_row: &[u8],
+    scales: &BorrowedScales<'_>,
+    scale_base: usize,
+    zp_row: Option<&[u8]>,
+    bias_value: f32,
+    layout: NBitsLayout,
+    block_count: usize,
+    block_size: usize,
+    k: usize,
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let mask = _mm_set1_epi8(0x0f);
+    let packed_block_size = layout.packed_block_size();
+    let mut acc = [_mm256_setzero_ps(); PREFILL_ROW_BLOCK];
+    let mut correction = [0.0f32; PREFILL_ROW_BLOCK];
+    let mut extra = [0.0f32; PREFILL_ROW_BLOCK];
+
+    for block in 0..block_count {
+        let depth_start = block * block_size;
+        let valid = k.saturating_sub(depth_start).min(block_size);
+        let scale = scales.get(scale_base + block);
+        let zero_point = layout.zero_point(zp_row, block) as f32;
+        let block_values = &packed_row[block * packed_block_size..(block + 1) * packed_block_size];
+
+        if valid != block_size || !block_size.is_multiple_of(32) {
+            // Ragged or non-32-multiple tail block: scalar, matching the
+            // per-column and `NCols4` paths' scalar fallback exactly.
+            for r in 0..rows {
+                let activation = &activations[r * k..(r + 1) * k];
+                let mut dot = 0.0f32;
+                for (byte_index, &byte) in block_values.iter().enumerate() {
+                    let within = byte_index * 2;
+                    if within < valid {
+                        dot += activation[depth_start + within] * (byte & 0x0f) as f32;
+                    }
+                    if within + 1 < valid {
+                        dot += activation[depth_start + within + 1] * (byte >> 4) as f32;
+                    }
+                }
+                extra[r] += dot * scale;
+                correction[r] += scale * zero_point * activation_sums[r * block_count + block];
+            }
+            continue;
+        }
+
+        let mut blk = [_mm256_setzero_ps(); PREFILL_ROW_BLOCK];
+        for chunk in 0..block_size / 32 {
+            // SAFETY: 16 packed bytes per 32-lane chunk are in bounds for this
+            // column's block slice; loadu permits unaligned pointers.
+            let bytes = unsafe { _mm_loadu_si128(block_values.as_ptr().add(chunk * 16).cast()) };
+            let low = _mm_and_si128(bytes, mask);
+            let high = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+            let inter_lo = _mm_unpacklo_epi8(low, high);
+            let inter_hi = _mm_unpackhi_epi8(low, high);
+            let w0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(inter_lo));
+            let w1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(inter_lo, 8)));
+            let w2 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(inter_hi));
+            let w3 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(inter_hi, 8)));
+
+            let base = depth_start + chunk * 32;
+            for (r, blk_r) in blk.iter_mut().enumerate().take(rows) {
+                // SAFETY: `base + 32 <= k` because this is a full block, and
+                // row `r` of the tile spans `r * k .. (r + 1) * k`.
+                let a = unsafe { activations.as_ptr().add(r * k + base) };
+                *blk_r = _mm256_fmadd_ps(unsafe { _mm256_loadu_ps(a) }, w0, *blk_r);
+                *blk_r = _mm256_fmadd_ps(unsafe { _mm256_loadu_ps(a.add(8)) }, w1, *blk_r);
+                *blk_r = _mm256_fmadd_ps(unsafe { _mm256_loadu_ps(a.add(16)) }, w2, *blk_r);
+                *blk_r = _mm256_fmadd_ps(unsafe { _mm256_loadu_ps(a.add(24)) }, w3, *blk_r);
+            }
+        }
+
+        let scale_vector = _mm256_set1_ps(scale);
+        for r in 0..rows {
+            acc[r] = _mm256_fmadd_ps(blk[r], scale_vector, acc[r]);
+            correction[r] += scale * zero_point * activation_sums[r * block_count + block];
+        }
+    }
+
+    for (r, out_r) in out.iter_mut().enumerate().take(rows) {
+        let vector = acc[r];
+        let lo = _mm256_castps256_ps128(vector);
+        let hi = _mm256_extractf128_ps(vector, 1);
+        let sum4 = _mm_add_ps(lo, hi);
+        let sum2 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+        let sum1 = _mm_add_ss(sum2, _mm_shuffle_ps(sum2, sum2, 0x55));
+        *out_r = bias_value + _mm_cvtss_f32(sum1) + extra[r] - correction[r];
+    }
 }
 
 /// Structural borrowed int4 matmul for prefill (issue #1117). Reads the *same*
@@ -7275,18 +7499,24 @@ fn borrowed_int4_prefill_block_enabled() -> bool {
 ///    inside its per-row loop. Here it is hoisted to one allocation of
 ///    `m * block_count` floats, independent of the weight size.
 ///
-/// This is deliberately *not* GEMM blocking: rows are visited outer-most, so a
-/// column's packed bytes are still re-read once per row (same weight traffic as
-/// the row-serial path). Reusing a column's bytes across a tile of rows is a
-/// separate, so-far-unproven change tracked as a follow-up to #1117 -- on the
-/// 0.5B model the reuse effect sat within run-to-run noise, so it is kept out
-/// of this change until it clears the baseline spread on a large model.
+/// It is also **row-blocked** (see [`PREFILL_ROW_BLOCK`] and
+/// [`borrowed_int4_rowblock_avx2`]), which is what makes it more than a
+/// fork-join fix. This was originally left out as
+/// "a separate, so-far-unproven change tracked as a follow-up to #1117 -- on
+/// the 0.5B model the reuse effect sat within run-to-run noise, so it is kept
+/// out of this change until it clears the baseline spread on a large model."
+/// That caveat was exactly right: the 0.5B QKV weight is 3 MiB and lives in L3
+/// across the whole prefill, so there is nothing for reuse to save. The
+/// llama3-8b QKV weight is 12.58 MiB, and there the effect is not subtle --
+/// re-reading it per row was the entire reason that cell sat ~10x behind ORT
+/// with time scaling *linearly* in `m` (0.890 / 0.859 / 0.851 ms per row at
+/// `m` = 1 / 8 / 128, the signature of zero row reuse).
 ///
 /// Each output element is computed with the identical float sequence as the
-/// row-serial path (via [`borrowed_int4_output_element`]); only the fork-join
-/// structure and the allocation change, so results are byte-identical.
-/// Parallelism is over disjoint column strips, mirroring the column-strip GEMM
-/// in `accelerate_gemm`.
+/// row-serial path (via [`borrowed_int4_output_element`]); the loop nest only
+/// changes *when* an element is computed, never *how*, so results stay
+/// byte-identical. Parallelism is over disjoint column strips, mirroring the
+/// column-strip GEMM in `accelerate_gemm`.
 #[allow(clippy::too_many_arguments)]
 #[cfg(target_arch = "x86_64")]
 fn borrowed_affine_int4_matmul_prefill(
@@ -7304,6 +7534,17 @@ fn borrowed_affine_int4_matmul_prefill(
 ) {
     debug_assert_eq!(activations.len(), m * k);
     debug_assert_eq!(result.len(), m * n);
+    // The route only reaches here on an AVX2-capable host, which is the
+    // precondition [`borrowed_int4_rowblock_avx2`] relies on. `dot_kernel` is
+    // no longer read for dispatch (the row-blocked kernel replaces the
+    // per-element one outright), so assert the contract that made that legal
+    // rather than silently ignoring the argument.
+    debug_assert!(
+        !matches!(dot_kernel, DotKernel::Scalar),
+        "the blocked int4 prefill requires an AVX2 host; the caller must not \
+         route a Scalar dot kernel here"
+    );
+    let _ = dot_kernel;
     let bits = 4usize;
     let layout = NBitsLayout { bits, block_size };
     let block_count = k.div_ceil(block_size);
@@ -7334,36 +7575,50 @@ fn borrowed_affine_int4_matmul_prefill(
     let result_ptr = result.as_mut_ptr() as usize;
     let run_columns = |j0: usize, j1: usize| {
         let result_base = result_ptr as *mut f32;
-        // Rows outer-most: this keeps the per-element k-reduction order and the
-        // weight-traffic profile identical to the row-serial path; only the
-        // fork-join count and the allocation change.
-        for i in 0..m {
-            let activation = &activations[i * k..(i + 1) * k];
-            let sums = &activation_sums[i * block_count..(i + 1) * block_count];
-            for j in j0..j1 {
-                let packed_row = &packed[j * packed_row_size..(j + 1) * packed_row_size];
-                let zp_row = zero_points
-                    .map(|zp| &zp[j * zero_point_row_size..(j + 1) * zero_point_row_size]);
-                let bias_value = bias.map_or(0.0, |values| values[j]);
-                let value = borrowed_int4_output_element(
-                    activation,
-                    sums,
-                    packed_row,
-                    zp_row,
-                    &scales,
-                    j * block_count,
-                    bias_value,
-                    layout,
-                    block_count,
-                    block_size,
-                    k,
-                    dot_kernel,
-                );
-                // SAFETY: `i < m` and `j < n`, so `i * n + j < m * n ==
-                // result.len()`; this task owns column `j` exclusively.
+        // Columns outer, a tile of rows inner. The tile is what buys the
+        // win: `borrowed_int4_rowblock_avx2` decodes a K block's nibbles once
+        // and drives all `PREFILL_ROW_BLOCK` rows through the decoded vectors,
+        // where the row-serial path re-decoded the whole weight for every row.
+        // Decode is >80% of this kernel's instruction stream, so amortising it
+        // is worth far more than anything the fork-join structure can buy.
+        for j in j0..j1 {
+            let packed_row = &packed[j * packed_row_size..(j + 1) * packed_row_size];
+            let zp_row =
+                zero_points.map(|zp| &zp[j * zero_point_row_size..(j + 1) * zero_point_row_size]);
+            let bias_value = bias.map_or(0.0, |values| values[j]);
+            let mut row = 0usize;
+            while row < m {
+                let rows = (m - row).min(PREFILL_ROW_BLOCK);
+                let mut out_buf = [0.0f32; PREFILL_ROW_BLOCK];
+                // SAFETY: the caller's route guarantees an AVX2+FMA host (the
+                // same guard `borrowed_int4_nblock4_avx2` relies on); every
+                // slice below is bounds-checked by construction and the tile
+                // never runs past `m`.
                 unsafe {
-                    *result_base.add(i * n + j) = value;
+                    borrowed_int4_rowblock_avx2(
+                        &activations[row * k..(row + rows) * k],
+                        &activation_sums[row * block_count..(row + rows) * block_count],
+                        rows,
+                        packed_row,
+                        &scales,
+                        j * block_count,
+                        zp_row,
+                        bias_value,
+                        layout,
+                        block_count,
+                        block_size,
+                        k,
+                        &mut out_buf[..rows],
+                    );
                 }
+                for (r, value) in out_buf[..rows].iter().enumerate() {
+                    // SAFETY: `row + r < m` and `j < n`, so the index is inside
+                    // `m * n`; this task owns column `j` exclusively.
+                    unsafe {
+                        *result_base.add((row + r) * n + j) = *value;
+                    }
+                }
+                row += rows;
             }
         }
     };
@@ -9451,10 +9706,20 @@ mod tests {
     /// can move a probe counter -- directly, or through a helper that does --
     /// to take the lock. It is pure text analysis, so it holds on every target
     /// including the aarch64 lanes this host cannot execute.
+    ///
+    /// `borrowed_int4_prefill_block_enabled` is in the list for the same
+    /// reason even though it moves no counter: it reads process-global env,
+    /// and a test that pins the int4 prefill route while another test flips
+    /// `ONNX_GENAI_CPU_MM_INT4_PREFILL` reads whichever won the race.
     #[test]
     fn every_probe_perturbing_test_takes_the_dispatch_lock() {
         const SOURCE: &str = include_str!("matmul_nbits.rs");
-        const PERTURBS: [&str; 3] = [".execute(", "kai_sdot_matmul_m1(", "try_mlas_sqnbit("];
+        const PERTURBS: [&str; 4] = [
+            ".execute(",
+            "kai_sdot_matmul_m1(",
+            "try_mlas_sqnbit(",
+            "borrowed_int4_prefill_block_enabled(",
+        ];
 
         // (name, is_test, body) for every fn declared in the tests module.
         let tests_module = SOURCE
@@ -10201,15 +10466,32 @@ mod tests {
         }
     }
 
-    /// The structural prefill kernel must be *byte-identical* to the row-serial
-    /// per-column path, not merely close: it only changes the fork-join
-    /// structure and hoists the activation-sum allocation, computing each
-    /// element with the same `borrowed_int4_output_element` reduction (issue
-    /// #1117). Covers single-row (`m == 1`), multi-row, and an odd `m` for
-    /// symmetric and asymmetric int4 and an `N` that is not a multiple of 4.
+    /// The structural prefill kernel agrees with the row-serial per-column path
+    /// to within f32 reassociation, and is at least as accurate.
+    ///
+    /// This assertion used to be byte-identity, and was, for as long as the
+    /// prefill path differed from the row-serial one only in its fork-join
+    /// structure. Row blocking (#1435) ends that: the per-element path
+    /// horizontally reduces every 32-lane block and accumulates the scalar,
+    /// while [`borrowed_int4_rowblock_avx2`] keeps a lanewise `ymm`
+    /// accumulator across all blocks and reduces once at the end — the same
+    /// trade [`borrowed_int4_nblock4_avx2`] already documents. The nibble
+    /// decode is untouched, so the paths differ by a couple of ULP of f32
+    /// summation order and nothing else.
+    ///
+    /// Byte-identity still holds where it is load-bearing, and is asserted
+    /// elsewhere: across fan-out partitions
+    /// (`prefill_column_fan_out_matches_its_serial_self`), across row-tile
+    /// boundaries (`prefill_is_independent_of_the_row_tiling`), and against the
+    /// `NCols4` kernel for a single row
+    /// (`rowblock_matches_nblock_for_a_single_row`).
+    ///
+    /// Covers single-row (`m == 1`), multi-row, odd `m`, a `k` that leaves a
+    /// ragged tail block, symmetric and asymmetric int4, and an `N` that is not
+    /// a multiple of 4.
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn prefill_matches_per_column_borrowed_path_bit_identical() {
+    fn prefill_matches_per_column_borrowed_path_within_reassociation() {
         if matches!(selected_dot_kernel(), DotKernel::Scalar) {
             // No AVX2 on this host; the structural prefill path is never selected.
             return;
@@ -10222,18 +10504,21 @@ mod tests {
             ((rng >> 40) as f32 / (1u32 << 24) as f32) - 0.5
         };
         // `m` values below exercise a single row, several full-strip rows, and
-        // odd row counts so no dimension assumption sneaks in.
+        // odd row counts so no dimension assumption sneaks in. `m` of 5 and 6
+        // also straddle `PREFILL_ROW_BLOCK`, so the ragged final tile runs.
+        // `(7, 100, 9, 32)` leaves `k % block_size == 4`, the ragged tail block.
         for &(m, k, n, block_size) in &[
             (1usize, 96usize, 13usize, 32usize),
             (5, 128, 8, 32),
             (6, 64, 7, 32),
             (8, 256, 16, 128),
             (3, 96, 5, 32),
+            (7, 100, 9, 32),
         ] {
             for &asymmetric in &[false, true] {
                 let weights_nk: Vec<f32> = (0..n * k).map(|_| next()).collect();
                 let activations: Vec<f32> = (0..m * k).map(|_| next()).collect();
-                let (packed, scales, zps, _dequant) =
+                let (packed, scales, zps, dequant) =
                     quantize(&weights_nk, n, k, block_size, asymmetric);
                 let zp_slice = zps.as_deref();
                 let bias: Vec<f32> = (0..n).map(|_| next()).collect();
@@ -10268,15 +10553,261 @@ mod tests {
                     selected_dot_kernel(),
                 );
 
-                for (index, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+                // f64 oracle over the *dequantized* weights: the exact value
+                // both f32 paths are approximating, so "which one reassociates
+                // better" is a question with an answer rather than a matter of
+                // taste.
+                //
+                // Errors are normalised by `sum |a| * |w|`, not by the result.
+                // These dot products cancel heavily — a `k = 256` cell here
+                // sums terms of order 0.25 down to a result of order 0.005 —
+                // so dividing by the result measures the conditioning of the
+                // test data rather than the quality of the kernel. Dividing by
+                // the magnitude of the summands is the standard backward-error
+                // normalisation and is the quantity f32 summation order can
+                // actually be held to.
+                let mut serial_error = 0.0f64;
+                let mut blocked_error = 0.0f64;
+                let mut agreement = 0.0f64;
+                for row in 0..m {
+                    for column in 0..n {
+                        let mut reference = bias[column] as f64;
+                        let mut magnitude = (bias[column] as f64).abs();
+                        for depth in 0..k {
+                            let a = activations[row * k + depth] as f64;
+                            let w = dequant[column * k + depth] as f64;
+                            reference += a * w;
+                            magnitude += (a * w).abs();
+                        }
+                        let index = row * n + column;
+                        let magnitude = magnitude.max(1e-12);
+                        serial_error = serial_error
+                            .max((expected[index] as f64 - reference).abs() / magnitude);
+                        blocked_error =
+                            blocked_error.max((got[index] as f64 - reference).abs() / magnitude);
+                        agreement = agreement
+                            .max((expected[index] as f64 - got[index] as f64).abs() / magnitude);
+                    }
+                }
+                assert!(
+                    agreement < 1e-5,
+                    "m={m} k={k} n={n} block={block_size} asym={asymmetric}: the per-column \
+                     and blocked prefill paths disagree by {agreement} of the summand \
+                     magnitude, which is far more than f32 reassociation"
+                );
+                assert!(
+                    blocked_error <= serial_error * 4.0 + 1e-9,
+                    "m={m} k={k} n={n} block={block_size} asym={asymmetric}: the blocked \
+                     prefill's error against the f64 oracle ({blocked_error}) is materially \
+                     worse than the row-serial path's ({serial_error}); row blocking is \
+                     supposed to reassociate, not to lose accuracy"
+                );
+            }
+        }
+    }
+
+    /// A row's value must not depend on which tile it landed in.
+    ///
+    /// This is the invariant row blocking has to hold and the one a future
+    /// change to [`PREFILL_ROW_BLOCK`] would most plausibly break. Each row
+    /// carries its own `blk`/`acc` pair and walks the blocks in the same order
+    /// whatever the tile width, so the guarantee is *byte*-identity, not
+    /// tolerance: computing rows one at a time must reproduce the batched
+    /// result exactly.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn prefill_is_independent_of_the_row_tiling() {
+        if matches!(selected_dot_kernel(), DotKernel::Scalar) {
+            return;
+        }
+        let mut rng: u64 = 0x13198A2E03707344;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng >> 40) as f32 / (1u32 << 24) as f32) - 0.5
+        };
+        // 9 rows is more than two full tiles plus a remainder at
+        // `PREFILL_ROW_BLOCK == 4`, so rows land at every offset within a tile.
+        let (m, k, n, block_size) = (9usize, 128usize, 11usize, 32usize);
+        for &asymmetric in &[false, true] {
+            let weights_nk: Vec<f32> = (0..n * k).map(|_| next()).collect();
+            let activations: Vec<f32> = (0..m * k).map(|_| next()).collect();
+            let (packed, scales, zps, _dequant) =
+                quantize(&weights_nk, n, k, block_size, asymmetric);
+            let zp_slice = zps.as_deref();
+            let bias: Vec<f32> = (0..n).map(|_| next()).collect();
+
+            let mut batched = vec![0.0f32; m * n];
+            borrowed_affine_int4_matmul_prefill(
+                &activations,
+                &packed,
+                BorrowedScales::F32(&scales),
+                zp_slice,
+                Some(&bias),
+                &mut batched,
+                m,
+                k,
+                n,
+                block_size,
+                selected_dot_kernel(),
+            );
+
+            for row in 0..m {
+                // `m == 1` here, so this row is a tile of width one.
+                let mut alone = vec![0.0f32; n];
+                borrowed_affine_int4_matmul_prefill(
+                    &activations[row * k..(row + 1) * k],
+                    &packed,
+                    BorrowedScales::F32(&scales),
+                    zp_slice,
+                    Some(&bias),
+                    &mut alone,
+                    1,
+                    k,
+                    n,
+                    block_size,
+                    selected_dot_kernel(),
+                );
+                for column in 0..n {
                     assert_eq!(
-                        a.to_bits(),
-                        b.to_bits(),
-                        "m={m} k={k} n={n} block={block_size} asym={asymmetric} \
-                         index {index}: per-column {a} vs prefill {b} not bit-identical"
+                        batched[row * n + column].to_bits(),
+                        alone[column].to_bits(),
+                        "asym={asymmetric} row {row} column {column}: batched {} vs \
+                         single-row {} — a row's value depends on its tile",
+                        batched[row * n + column],
+                        alone[column]
                     );
                 }
             }
+        }
+    }
+
+    /// A one-row tile must reproduce the `NCols4` kernel exactly.
+    ///
+    /// [`borrowed_int4_rowblock_avx2`]'s documentation claims it is
+    /// instruction-for-instruction the single-column case of
+    /// [`borrowed_int4_nblock4_avx2`] within a row. That claim is what licenses
+    /// reusing the latter's numerics rationale, so it is asserted rather than
+    /// asserted-by-comment: same unpack, same `blk`, same scale fold, same
+    /// affine correction, same final reduction, therefore the same bits.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn rowblock_matches_nblock_for_a_single_row() {
+        if matches!(selected_dot_kernel(), DotKernel::Scalar) {
+            return;
+        }
+        let mut rng: u64 = 0xA4093822299F31D0;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng >> 40) as f32 / (1u32 << 24) as f32) - 0.5
+        };
+        for &(k, block_size) in &[(128usize, 32usize), (256, 128), (100, 32)] {
+            for &asymmetric in &[false, true] {
+                let n = 1usize;
+                let weights_nk: Vec<f32> = (0..n * k).map(|_| next()).collect();
+                let activation: Vec<f32> = (0..k).map(|_| next()).collect();
+                let (packed, scales, zps, _dequant) =
+                    quantize(&weights_nk, n, k, block_size, asymmetric);
+                let block_count = k.div_ceil(block_size);
+                let layout = NBitsLayout {
+                    bits: 4,
+                    block_size,
+                };
+                let sums: Vec<f32> = activation
+                    .chunks(block_size)
+                    .map(|block| block.iter().sum::<f32>())
+                    .collect();
+                let bias = next();
+                let zp_row = zps.as_deref();
+                let borrowed = BorrowedScales::F32(&scales);
+
+                let mut nblock_out = [0.0f32; 1];
+                // SAFETY: guarded by the `selected_dot_kernel` check above, and
+                // every slice is sized from `k`/`block_size`.
+                unsafe {
+                    borrowed_int4_nblock4_avx2(
+                        &activation,
+                        &sums,
+                        &[&packed[..]],
+                        &borrowed,
+                        &[0usize],
+                        &[zp_row],
+                        &[bias],
+                        layout,
+                        block_count,
+                        block_size,
+                        k,
+                        &mut nblock_out[..1],
+                    );
+                }
+
+                let mut rowblock_out = [0.0f32; 1];
+                // SAFETY: as above; `rows == 1` so the tile is one row.
+                unsafe {
+                    borrowed_int4_rowblock_avx2(
+                        &activation,
+                        &sums,
+                        1,
+                        &packed,
+                        &borrowed,
+                        0,
+                        zp_row,
+                        bias,
+                        layout,
+                        block_count,
+                        block_size,
+                        k,
+                        &mut rowblock_out[..1],
+                    );
+                }
+
+                assert_eq!(
+                    nblock_out[0].to_bits(),
+                    rowblock_out[0].to_bits(),
+                    "k={k} block={block_size} asym={asymmetric}: NCols4 {} vs row-blocked {} \
+                     are not bit-identical for a single row",
+                    nblock_out[0],
+                    rowblock_out[0]
+                );
+            }
+        }
+    }
+
+    /// The blocked prefill ships on. It spent its whole life behind a
+    /// default-off toggle "until the win is measured", which meant the code was
+    /// dead in every build anyone actually ran — the exact failure mode that
+    /// hid #1080's f16 fix behind a `mlas` feature gate. Now that it is
+    /// measured, the default is the thing worth pinning.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_blocked_int4_prefill_is_on_by_default() {
+        let _guard = lock_dispatch_probe();
+        // SAFETY: the dispatch-probe lock serialises the tests that perturb
+        // process environment, which is the requirement `set_var`/`remove_var`
+        // carry; no other thread reads this variable concurrently.
+        unsafe {
+            std::env::remove_var("ONNX_GENAI_CPU_MM_INT4_PREFILL");
+        }
+        assert!(
+            borrowed_int4_prefill_block_enabled(),
+            "the blocked int4 prefill must be enabled when the variable is unset"
+        );
+        for value in ["0", "off", "OFF"] {
+            // SAFETY: as above.
+            unsafe {
+                std::env::set_var("ONNX_GENAI_CPU_MM_INT4_PREFILL", value);
+            }
+            assert!(
+                !borrowed_int4_prefill_block_enabled(),
+                "{value:?} must disable the blocked int4 prefill"
+            );
+        }
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("ONNX_GENAI_CPU_MM_INT4_PREFILL");
         }
     }
 
@@ -10287,9 +10818,9 @@ mod tests {
     /// pool, cannot change a bit.
     ///
     /// Uses a shape wide enough that the task runtime actually splits it —
-    /// `prefill_matches_per_column_borrowed_path_bit_identical` above covers
-    /// correctness, but its `n <= 16` cells fall under the grain floor and run
-    /// serially, so they never exercise the partition.
+    /// `prefill_matches_per_column_borrowed_path_within_reassociation` above
+    /// covers correctness, but its `n <= 16` cells fall under the grain floor
+    /// and run serially, so they never exercise the partition.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn prefill_column_fan_out_matches_its_serial_self() {
@@ -18759,6 +19290,59 @@ mod tests {
                 *value, index as f32,
                 "output {index} got the wrong `output_start`"
             );
+        }
+    }
+
+    /// The int4 prefill GEBP crossover is size-aware: a weight that stays
+    /// L2-resident across rows keeps the column-blocked kernel ahead twice as
+    /// long, so it must not be handed the same row threshold as a weight that
+    /// streams from DRAM every row block.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int4_prefill_gebp_crossover_is_size_aware() {
+        // qwen3-0.6B QKV: k=1024, n=2048+256+256 -> 1.0 MB packed.
+        let small = 1024 * 2560 / 2;
+        // llama3-8B QKV: k=4096, n=4096+1024+1024 -> 12.6 MB packed.
+        let large = 4096 * 6144 / 2;
+        assert!(small <= INT4_PREFILL_GEBP_L2_RESIDENT_BYTES);
+        assert!(large > INT4_PREFILL_GEBP_L2_RESIDENT_BYTES);
+
+        assert_eq!(
+            int4_prefill_gebp_min_rows(small, 32),
+            INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT,
+            "an L2-resident weight measured its crossover at m=24"
+        );
+        assert_eq!(
+            int4_prefill_gebp_min_rows(large, 32),
+            INT4_PREFILL_GEBP_MIN_ROWS,
+            "a DRAM-streaming weight measured its crossover at m=12"
+        );
+        // The resident threshold is the later one; swapping them would regress
+        // the small shape by 1.45x at m=12.
+        const {
+            assert!(INT4_PREFILL_GEBP_MIN_ROWS < INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT);
+        }
+    }
+
+    /// A 16-element block cannot enter either column-blocked kernel, so raising
+    /// its crossover would drop it from the GEBP prefill straight to a scalar
+    /// per-block dot on the narrow decode pool rather than to a better kernel.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int4_prefill_gebp_crossover_holds_for_blocks_the_row_kernels_reject() {
+        let large = 4096 * 6144 / 2;
+        let small = 1024 * 2560 / 2;
+        for bytes in [small, large] {
+            assert_eq!(
+                int4_prefill_gebp_min_rows(bytes, 16),
+                INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED,
+                "block_size=16 has no column-blocked kernel to hand off to"
+            );
+        }
+        // Every block size the retune applies to is one those kernels accept.
+        for block_size in [32usize, 64, 128, 256] {
+            assert!(block_size.is_multiple_of(32));
+            assert!(int4_prefill_gebp_min_rows(large, block_size) >= INT4_PREFILL_GEBP_MIN_ROWS);
         }
     }
 }

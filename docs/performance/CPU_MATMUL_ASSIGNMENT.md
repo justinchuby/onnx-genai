@@ -416,6 +416,81 @@ order — so this changes f32 results at `M = 1` within the tolerance
 column strips are disjoint and its K-unroll order is fixed, so the same input gives the same bits on
 every run and at every thread count.
 
+### 5. The int4 prefill re-decoded the weight once per row, and was switched off (**fixed**)
+
+The scheduler isolated `gemm_nbits_llama3_8b_qkv_t8` at ~10x behind ORT measured native-alone, flat
+across 8/16/32 threads. Reproduced on `f8f3878ba` at 6.837 ms against the note's 6.90 ms — three
+significant figures apart — so the cell is stable.
+
+Two defects, and the second is the expensive one.
+
+**It was switched off.** `borrowed_int4_prefill_block_enabled()` defaulted to `false`, so every build
+anyone ran took the row-serial `borrowed_affine_int4_matmul`. This is
+[section 4](#4-the-decode-f32-gemv-was-written-but-never-shipped-fixed) again, and #1080's f16 fix
+behind a `mlas` feature gate a third time: a toggle added "until the win is measured", and then
+nothing measured it. §36.2 of the phase-18 benchmark document had already written down "it is dead in
+the default build"; it had not been acted on.
+
+**It re-decoded the weight for every activation row.** Per 32-lane chunk of one column the int4 inner
+loop spends ~18 instructions unpacking nibbles (load, two masks, a shift, two `unpack`s, eight
+widen/converts) to feed **four** FMAs. Better than 80% of the instruction stream is decode, and the
+row loop sat outside all of it.
+
+Two independent measurements say so. Time was **exactly linear in `m`** — 0.890 / 0.859 / 0.851 ms
+*per row* at `m` = 1 / 8 / 128, which is what zero row reuse looks like. And the roofline: 402 MFLOP
+in 6.87 ms is 58.6 GFLOP/s, **0.61 FLOP/cycle/thread** against ORT's 6.07. A kernel 10x off compute
+peak whose entire 15.7 MiB working set fits in one 32 MiB L3 slice is not waiting for memory.
+
+Worth recording what it was *not*, since two plausible causes were built and rejected:
+
+* **Not bandwidth.** 100.7 MiB in 6.87 ms is 14.6 GB/s, an order of magnitude under this part. A
+  64-column tile with rows inner — so a tile's weight and activations both sit in L2 — moved nothing
+  at 16 or 32 threads. Removed.
+* **Not fork/join.** The path whose whole purpose is to replace `m` fork-joins with one reads
+  6.874 ms against the default's 6.897 ms.
+
+The fix is `borrowed_int4_rowblock_avx2`: decode each K block's nibbles **once**, then drive
+`PREFILL_ROW_BLOCK = 4` rows through the decoded vectors, taking the instruction budget per 32 MACs
+from ~22 to ~8.5. Within a row it is instruction-for-instruction the single-column case of the
+existing `NCols4` kernel. The default is flipped to on; the variable stays as a kill switch.
+
+All cells, 32 threads, **native-alone** (`--native-only` / `--ort-only` as separate arms, per
+`sebastian-paired-harness-coresidency` — paired runs depress the native arm by up to 4.8x here).
+"before" is `ONNX_GENAI_CPU_MM_INT4_PREFILL=0`, exactly the path that shipped.
+
+| cell | before | after | speedup | ours/ORT was | now |
+|---|---:|---:|---:|---:|---:|
+| `llama3_8b_qkv_t8` | 7.087 ms | **2.339 ms** | 3.03x | 9.35 | **3.09** |
+| `llama3_8b_qkv_t128` | 103.250 ms | 28.862 ms | 3.58x | 12.49 | 3.49 |
+| `llama3_8b_qkv_t512` | 509.199 ms | 97.591 ms | **5.22x** | 23.97 | 4.59 |
+| `llama3_8b_mlp_t8` | 15.350 ms | 5.327 ms | 2.88x | 10.47 | 3.63 |
+| `llama3_8b_mlp_t128` | 195.611 ms | 56.196 ms | 3.48x | 13.10 | 3.76 |
+| `llama3_8b_mlp_t512` | 810.630 ms | 227.322 ms | 3.57x | 15.49 | 4.34 |
+| `qwen3_0p6b_qkv_t8` | 0.895 ms | 0.261 ms | 3.43x | 9.32 | 2.72 |
+| `qwen3_0p6b_qkv_t128` | 13.645 ms | 4.981 ms | 2.74x | 19.98 | 7.29 |
+| `qwen3_0p6b_qkv_t512` | 51.084 ms | 15.337 ms | 3.33x | 8.50 | 2.55 |
+| `qwen3_0p6b_mlp_t8` | 1.718 ms | 0.678 ms | 2.53x | 10.10 | 3.99 |
+| `qwen3_0p6b_mlp_t128` | 26.891 ms | 6.981 ms | 3.85x | 18.83 | 4.89 |
+| `qwen3_0p6b_mlp_t512` | 104.909 ms | 30.250 ms | 3.47x | 17.16 | 4.95 |
+
+Twelve cells, twelve wins, 2.53x-5.22x, no regressions. Row reuse now shows up where its absence
+used to: per-row cost falls with `m` (0.292 / 0.226 / 0.191 ms at `m` = 8 / 128 / 512) instead of
+sitting flat at ~0.9.
+
+Like section 4, the two routes differ only in summation reassociation (~2 ULP): the per-element path
+reduces every 32-lane block to a scalar, the blocked kernel keeps a lanewise accumulator and reduces
+once. Nibble decode is untouched. The test that asserted byte-identity is rewritten to check both
+paths against an **f64 oracle** and require the blocked one to be no worse, and byte-identity is
+still asserted across fan-out partitions, across row-tile boundaries, and against `NCols4` for a
+single row.
+
+What is left is the decode itself: MLAS SQNBit's CompInt8 path quantizes activations to int8 and uses
+integer dot products, avoiding f32 dequantization entirely, where this kernel still widens every
+nibble to f32. That is a structural step, not a tuning one, and VNNI — which this host lacks — is
+what would make it pay.
+
+Full record: [`docs/benchmarks/2026-08-19-int4-prefill-row-blocking.md`](../benchmarks/2026-08-19-int4-prefill-row-blocking.md).
+
 ## Precision
 
 `MatMulNBits` bits=8 M=1 was the only range this EP won outright, and part of that margin was bought
