@@ -1482,36 +1482,15 @@ impl KernelDispatchContext<'_> {
                     // before retiring the old disposable workspace. Release it
                     // before acquiring the replacement to avoid charging both.
                     self.ep.sync()?;
-                    if let Some(old) = prepared.take() {
-                        self.ep.deallocate(old.buffer)?;
-                    }
-                    let target_mapped = self
-                        .ep
-                        .mapped_bytes_for_allocation(required, requirement.alignment)?;
-                    let mut grant = self
-                        .ep
-                        .prepare_mapped_growth(target_mapped, requirement.role)?;
-                    let lease = match self
-                        .ep
-                        .reserve_workspace(requirement.bytes, requirement.role)
-                    {
-                        Ok(lease) => lease,
-                        Err(error) => {
-                            drop(grant);
-                            return Err(error.into());
-                        }
-                    };
-                    let buffer = match grant.take() {
-                        Some(grant) => self.ep.allocate_with_mapped_growth(
-                            required,
-                            requirement.alignment,
-                            grant,
-                        )?,
-                        None => self.ep.allocate(required, requirement.alignment)?,
-                    };
+                    let old = prepared.take().map(|workspace| workspace.buffer);
+                    let buffer = self.ep.replace_workspace(
+                        old,
+                        required,
+                        requirement.alignment,
+                        requirement.role,
+                    )?;
                     *prepared = Some(PreparedWorkspace {
                         buffer,
-                        _lease: lease,
                         bytes: required,
                         alignment: requirement.alignment,
                     });

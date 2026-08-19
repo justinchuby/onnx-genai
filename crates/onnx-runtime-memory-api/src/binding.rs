@@ -772,10 +772,30 @@ impl BindingRegistry {
         authority: RegisteredAuthority,
         allocator: Arc<dyn DeviceAllocator>,
     ) -> Result<RegisteredMechanism, BindingError> {
+        let allocator_device = allocator.device();
+        self.register_allocator_with_device(context, authority, allocator, allocator_device)
+    }
+
+    /// Register an allocator whose stable device identity was sampled before
+    /// entering an outer registration critical section.
+    ///
+    /// This is the process-manager adapter. Sampling a third-party allocator's
+    /// callback while the manager registration gate is held would permit
+    /// reentrant deadlock. The allocator contract requires `device()` to remain
+    /// stable for its lifetime; the caller supplies that already-sampled value.
+    #[doc(hidden)]
+    pub fn register_allocator_with_device(
+        &self,
+        context: RegisteredProviderContext,
+        authority: RegisteredAuthority,
+        allocator: Arc<dyn DeviceAllocator>,
+        allocator_device: DeviceKey,
+    ) -> Result<RegisteredMechanism, BindingError> {
         self.register_mechanism(
             context,
             authority,
             allocator,
+            allocator_device,
             MechanismCoherence::SelfContained,
         )
     }
@@ -794,10 +814,12 @@ impl BindingRegistry {
         authority: RegisteredAuthority,
         allocator: Arc<dyn DeviceAllocator>,
     ) -> Result<RegisteredMechanism, BindingError> {
+        let allocator_device = allocator.device();
         self.register_mechanism(
             context,
             authority,
             allocator,
+            allocator_device,
             MechanismCoherence::TrustedComposite,
         )
     }
@@ -807,11 +829,11 @@ impl BindingRegistry {
         context: RegisteredProviderContext,
         authority: RegisteredAuthority,
         allocator: Arc<dyn DeviceAllocator>,
+        allocator_device: DeviceKey,
         coherence: MechanismCoherence,
     ) -> Result<RegisteredMechanism, BindingError> {
         self.ensure_local(context.identity.0, "provider context")?;
         self.ensure_local(authority.identity.0, "authority")?;
-        let allocator_device = allocator.device();
         let (context_entry, authority_entry) = {
             let state = self.lock_state("looking up mechanism resources")?;
             let context_entry = state
@@ -1351,6 +1373,21 @@ impl BindingRegistry {
             .cloned()
             .ok_or(BindingError::UnregisteredMechanism(mechanism.identity))?;
         entry.snapshot()
+    }
+
+    /// Snapshot every registered mechanism without exposing the registration
+    /// map to a process manager.
+    ///
+    /// The registry lock is released before any per-mechanism lock is taken, so
+    /// the two lock classes remain never-nested.
+    pub fn snapshots(&self) -> Result<Vec<MechanismSnapshot>, BindingError> {
+        let entries = self
+            .lock_state("listing mechanism snapshots")?
+            .mechanisms
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        entries.into_iter().map(|entry| entry.snapshot()).collect()
     }
 
     fn ensure_local(

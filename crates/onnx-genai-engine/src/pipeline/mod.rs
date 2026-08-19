@@ -500,6 +500,11 @@ fn build_step_component_session<'a>(
     native_components: &BTreeSet<String>,
     #[cfg_attr(not(feature = "native-backend"), allow(unused_variables))]
     native_device: &crate::native_decode_device::NativeDecodeDevice,
+    #[cfg(feature = "cuda")] policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+    #[cfg(feature = "cuda")] governor: std::sync::Arc<
+        dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync,
+    >,
+    #[cfg(feature = "cuda")] manager: onnx_runtime_memory_governor::ProcessMemoryManager,
 ) -> anyhow::Result<Box<dyn onnx_genai_metadata::ComponentSession + 'a>> {
     if native_components.contains(component) {
         #[cfg(feature = "native-backend")]
@@ -518,6 +523,16 @@ fn build_step_component_session<'a>(
             // CPU pipeline keeps it on CPU. Inputs/outputs still cross the host
             // `ComponentTensor` seam, so only one small `inputs_embeds` row
             // round-trips host<->device per step; the decoder's KV never does.
+            #[cfg(feature = "cuda")]
+            let native = crate::native_component::NativeComponentSession::load_with_cuda_memory(
+                path,
+                native_device.clone(),
+                policy,
+                governor,
+                manager,
+            )
+            .with_context(|| format!("failed to load native every_step component '{component}'"))?;
+            #[cfg(not(feature = "cuda"))]
             let native =
                 crate::native_component::NativeComponentSession::load(path, native_device.clone())
                     .with_context(|| {
@@ -629,6 +644,7 @@ fn build_native_pipeline_decoder(
     #[cfg(feature = "cuda")] governor: std::sync::Arc<
         dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync,
     >,
+    #[cfg(feature = "cuda")] manager: onnx_runtime_memory_governor::ProcessMemoryManager,
 ) -> anyhow::Result<Box<dyn PipelineDecoderComponent + 'static>> {
     #[cfg(feature = "native-backend")]
     {
@@ -661,6 +677,8 @@ fn build_native_pipeline_decoder(
             crate::engine::cuda_policy_from_memory_strategy_plan(memory_strategy_plan),
             #[cfg(feature = "cuda")]
             governor,
+            #[cfg(feature = "cuda")]
+            manager,
         )?;
         Ok(Box::new(native))
     }
@@ -1098,10 +1116,19 @@ impl PipelineEngine {
         // Reserve every component's package bytes before constructing the
         // first session. Native CUDA components and their VMM pool share this
         // same authority, including in standalone pipelines.
+        let component_weight_reservation_bytes = if native_cuda_plan && pipeline_managed_vmm {
+            // Managed VMM charges physical handles to this authority as
+            // components commit them. Reserving package bytes here would
+            // charge the same weights twice.
+            0
+        } else {
+            model_weights_bytes
+        };
         let resource_governor = component_governor(
             &config,
             None,
             model_weights_bytes,
+            component_weight_reservation_bytes,
             pipeline_cuda_index,
             authority_provider.as_ref(),
             &authority_domain,

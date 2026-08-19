@@ -183,6 +183,8 @@ impl PipelineEngine {
                                 .clone()
                                 .unwrap_or_else(|| self.resource_governor.device_authority()),
                         ),
+                        #[cfg(feature = "cuda")]
+                        self.resource_governor.process_memory_manager(),
                     )?),
                 }
             } else {
@@ -355,6 +357,18 @@ impl PipelineEngine {
                         &binding.component,
                         native_step_components,
                         &native_step_device,
+                        #[cfg(feature = "cuda")]
+                        crate::engine::cuda_policy_from_memory_strategy_plan(
+                            &self.memory_strategy_plan,
+                        ),
+                        #[cfg(feature = "cuda")]
+                        std::sync::Arc::new(
+                            self.native_cuda_authority
+                                .clone()
+                                .unwrap_or_else(|| self.resource_governor.device_authority()),
+                        ),
+                        #[cfg(feature = "cuda")]
+                        self.resource_governor.process_memory_manager(),
                     )?;
                 Ok((binding, component))
             })

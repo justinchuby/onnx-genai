@@ -2466,6 +2466,7 @@ impl CudaVmmAllocator {
         };
         Ok(onnx_runtime_memory_governor::MappedAllocation {
             allocation: ptr,
+            additional_owned_bytes: commit.additional_owned_bytes,
             newly_mapped_bytes: commit.newly_mapped_bytes,
         })
     }

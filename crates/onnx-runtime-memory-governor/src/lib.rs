@@ -73,6 +73,7 @@
 
 pub mod allocator;
 pub mod large_alloc_cache;
+pub mod manager;
 pub mod shareability;
 
 pub use allocator::{
@@ -91,6 +92,16 @@ pub use allocator::{
 pub use large_alloc_cache::{
     DEFAULT_CACHE_BUDGET_BYTES, FALLBACK_FLOOR_BYTES, LargeAllocCache, LargeAllocCacheStats,
     MAX_CACHED_BYTES, calibrate_floor_bytes, calibrated_floor_bytes, default_budget_bytes,
+};
+pub use manager::{
+    AllocationChargeMode, AllocationPublication, AllocationRequest, AllocationSettlementToken,
+    AllocationStepError, AllocationTransactionError, AuthorityMemorySnapshot, DeviceLossListener,
+    ManagedAllocation, ManagedAllocationSnapshot, ManagedAllocationState, ManagedPreparedRelease,
+    ManagedReleaseError, MemoryContextOperation, MemoryContextScope, ProcessAuthorityId,
+    ProcessMemoryLimits, ProcessMemoryManager, ProcessMemorySnapshot, RegisteredMemoryAuthority,
+    RegisteredMemoryContext, RegisteredMemoryHolder, RegisteredMemoryMechanism,
+    ScopedAllocationContext, ScopedMemoryBinding, ScopedVirtualBacking, SharedPhysicalIdentity,
+    WeakProcessMemoryManager,
 };
 pub use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
 pub use shareability::{
@@ -709,6 +720,29 @@ impl MappedAllowance {
         returned
     }
 
+    /// Discharge this attribution after external proof that its provider
+    /// context no longer exists.
+    ///
+    /// Every clone shares this state, so later page/action drops observe a zero
+    /// limit and cannot release the same allowance twice.
+    pub fn confirm_context_terminated(&self) {
+        let released = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let released = state.limit;
+            state.limit = 0;
+            state.mapped = 0;
+            state.growth_reserved = 0;
+            released
+        };
+        if released != 0 {
+            self.inner.accounting.release(self.inner.tier, released);
+        }
+    }
+
     pub fn holder(&self) -> HolderId {
         self.inner.holder
     }
@@ -812,6 +846,42 @@ impl MappedAllowance {
                 reason: "mapped growth commit overflows mapped attribution",
             })?;
         Ok(())
+    }
+
+    /// Record retained mappings after a partial allocator failure.
+    ///
+    /// Unlike ordinary commit, counter overflow fails *conservatively*: mapped
+    /// attribution is pinned at `u64::MAX` after consuming the reservation so a
+    /// later admission cannot treat retained physical ownership as free.
+    fn map_reserved_retained(&self, bytes: u64) -> Result<(), MemoryError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if bytes > state.growth_reserved {
+            return Err(MemoryError::InvalidRequest {
+                tier: self.inner.tier.name(),
+                requested: bytes,
+                reason: "retained mapped growth exceeds its live reservation",
+            });
+        }
+        state.growth_reserved -= bytes;
+        match state.mapped.checked_add(bytes) {
+            Some(next) => {
+                state.mapped = next;
+                Ok(())
+            }
+            None => {
+                state.mapped = u64::MAX;
+                Err(MemoryError::InvalidRequest {
+                    tier: self.inner.tier.name(),
+                    requested: bytes,
+                    reason: "retained mapped growth overflows mapped attribution; admission is \
+                             pinned closed",
+                })
+            }
+        }
     }
 }
 
@@ -1361,6 +1431,30 @@ impl MappedGrowthGrant {
             .fetch_add(self.transferred_bytes, Ordering::Relaxed);
         self.finish();
         Ok(())
+    }
+
+    /// Settle a partially failed allocator transaction that retained mappings.
+    ///
+    /// The residual is committed to mapped attribution, unused capacity is
+    /// returned, and the operation guard is always released. This is the
+    /// fail-closed counterpart to [`commit_bytes`](Self::commit_bytes): retained
+    /// physical ownership must never be rolled back as if nothing happened.
+    pub fn settle_retained_bytes(mut self, retained_mapped_bytes: u64) -> Result<(), MemoryError> {
+        self.reduce_to_actual(retained_mapped_bytes)?;
+        let result = self.requester.map_reserved_retained(retained_mapped_bytes);
+        self.physical_capacity.release_remaining();
+        self.authority
+            .counters
+            .bytes_transferred
+            .fetch_add(self.transferred_bytes, Ordering::Relaxed);
+        if result.is_err() {
+            self.authority
+                .counters
+                .failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.finish();
+        result
     }
 
     fn reduce_to_actual(&mut self, actual: u64) -> Result<(), MemoryError> {
@@ -2236,6 +2330,49 @@ mod tests {
         ));
         assert_eq!(requester.limit(), 20);
         assert_eq!(requester.mapped_bytes(), 20);
+    }
+
+    #[test]
+    fn retained_mapped_growth_releases_operation_guard_and_keeps_residual_attributed() {
+        let governor = LedgerGovernor::new(LeaseLedger::new(64, 0, 0));
+        let requester = mapped_allowance(
+            &governor,
+            0,
+            MemoryRole::Workspace { step_scoped: false },
+            2,
+        );
+        governor
+            .prepare_mapped_growth(&requester, 20)
+            .unwrap()
+            .settle_retained_bytes(12)
+            .unwrap();
+        assert_eq!(requester.mapped_bytes(), 12);
+        assert_eq!(requester.limit(), 12);
+
+        // A forgotten operation guard would block this second transaction
+        // forever. Completing it proves retained settlement released the gate.
+        governor
+            .prepare_mapped_growth(&requester, 8)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(requester.mapped_bytes(), 20);
+    }
+
+    #[test]
+    fn confirmed_context_discharges_all_mapped_allowance_clones_exactly_once() {
+        let governor = LedgerGovernor::new(LeaseLedger::new(100, 0, 0));
+        let first = mapped_allowance(&governor, 100, MemoryRole::Weights, 1);
+        let clone = first.clone();
+        clone.confirm_context_terminated();
+        let second = mapped_allowance(&governor, 100, MemoryRole::Weights, 2);
+        drop(first);
+        drop(clone);
+        let error = governor
+            .reserve_mapped_allowance(Tier::Device, 1, MemoryRole::Weights, HolderId::new(3))
+            .unwrap_err();
+        assert!(matches!(error, MemoryError::TierExhausted { .. }));
+        drop(second);
     }
 
     #[test]

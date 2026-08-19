@@ -62,6 +62,7 @@ when in fact it is 1955 lines.
 | L4 ClusterCoordinator | §6 | **design only** | no type exists |
 | Lease contract | §1.1 | **implemented** | `crates/onnx-runtime-memory-governor` |
 | Memory mechanism contracts | #1186 Phases 1-2 | **implemented** | low-dependency `crates/onnx-runtime-memory-api`; existing governor paths re-export the moved types and traits |
+| Process memory manager | #1186 Phase 5 | **implemented for registration plus session workspace transactions** | `ProcessMemoryManager` in `onnx-runtime-memory-governor`; native CUDA and `onnx-runtime-session` workspace preparation use manager-issued scoped bindings, while remaining generic allocation adapters are reported as compatibility/unattributed |
 | Allocator capabilities | §1.2, §1.3, §1.5 | **implemented on all three backends** | minimal `DeviceAllocator` plus optional `VirtualBacking` and independent `SharedMapping`; CPU/eager implements only the minimum, while CUDA VMM discovers capabilities from its selected allocator |
 | Virtual contiguity | §1.6 | **implemented; managed no-spill VMM is the default for native CUDA (#755)** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. On native CUDA the authority-governed VMM/pool path is now selected **by default, without a flag** (#755): memory-strategy inference runs unconditionally (#752) and drives policy, so a plain `serve` gets managed **no-spill** mode and does not rely on WDDM shared-memory fallback. An explicit `serve --vram-limit <bytes>` now **overrides the inferred device budget** rather than being the trigger. When the resolved budget cannot hold the package weights the runtime **automatically enables weight streaming/offload** instead of failing, so being larger than the budget is a supported configuration; a model that fits stays `FullResident` and does **not** page. **Exception (#864): on Windows/WDDM the OS shared-memory fallback pages over-budget weights from host RAM over PCIe ~30× faster than managed streaming for the single-touch decode access pattern, so managed weight streaming is *not* auto-enabled there — the effective strategy becomes `Compatibility` (`weight_offload_enabled=false`, `managed_no_spill=false`).** This affects only the *inferred* default: an explicit `ONNX_GENAI_WEIGHT_OFFLOAD=1`, `--vram-limit`, or device-budget override still selects managed streaming, and `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1` forces it. On Linux there is no shared-memory fallback, so the managed path is unchanged (#783). Failure to construct the required VMM arena/pool is fatal before model allocation and names both the requested limit and provider failure; it never silently falls back to ungoverned `cuMemAlloc`. The legacy allocator remains reachable for one release via `ONNX_GENAI_LEGACY_ALLOCATOR=1` (back-compat: `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0`), which restores the compatibility fallback. The resolved budget, chosen strategy and offload state are printed at startup and exposed in `/v1/resources` (`memory_strategy`). |
 | Composability of the memory paths | — | **authority-governed native path implemented** | The historical independent VMM and weight-offload toggles did not compose (#704). On native CUDA — by default under #755, or under an explicit byte limit — native CUDA constructs one authority before the allocator, charges the physical-handle pool once, registers reloadable weight residency explicitly, and admits KV/workspace growth transactionally. The compatibility path remains available through the legacy-allocator opt-out; performance parity with WDDM remains separate work. |
@@ -1641,9 +1642,8 @@ test passed, because every test lived inside the crate where private fields are
 reachable. The proof now lives in `tests/`, where it sees exactly what a third
 party sees and stops compiling if the contract closes again.
 
-Phases 1-4 of #1186 establish the dependency, capability, binding-lifetime, and
-ordered-release
-boundaries.
+Phases 1-5 of #1186 establish the dependency, capability, binding-lifetime,
+ordered-release, and process-transaction boundaries.
 `onnx-runtime-memory-api` owns `Tier`, `MemoryRole`, `MemoryError`, the primitive
 allocation/prefix types, the minimal `DeviceAllocator`, `HostAllocator`, and the
 optional `VirtualBacking`/`SharedMapping` traits. It also owns the narrow
@@ -1675,10 +1675,10 @@ never appear free to admission control.
 
 #### Phase 3 binding identity, lifetime, and teardown
 
-`BindingRegistry` is deliberately smaller than the future
-`ProcessMemoryManager`. It owns no budget, lease, holder, transaction, eviction,
-or victim policy. A process manager can embed it as the reusable mechanism
-registry.
+`BindingRegistry` is deliberately smaller than `ProcessMemoryManager`. It owns
+no budget, lease, holder, transaction, eviction, or victim policy. The process
+manager embeds it as the only mechanism registry; it does not copy the
+registration or selection ledger.
 
 The registry, rather than `DeviceAllocator`, `VirtualBacking`, or
 `SharedMapping`, issues all identity used at the binding boundary:
@@ -1879,9 +1879,117 @@ calls, release execution, or waits. CUDA driver operations do not run under a
 physical-pool state lock. Any bounded admission/reclaim wait occurs outside
 registry and governance locks.
 
-Phase 4 does not centralize policy or sessions in `ProcessMemoryManager`, define
-the plugin ABI, remove explicit adapters, remove the eager CUDA compatibility
-mechanism, or change an allocator-selection default. Those remain later phases.
+At the Phase-4 boundary there is not yet a `ProcessMemoryManager`, plugin ABI,
+adapter removal, eager-CUDA removal, or allocator-selection default change.
+Phase 5 adds the manager described below; the other items remain later phases.
+
+#### Phase 5 process manager and scoped allocation transactions
+
+`ProcessMemoryManager` centralizes process-local registration, current mechanism
+selection, binding issuance, authority/holder identity, parent-quota
+delegation, and allocation transaction coordination. It does **not** become a
+second state owner:
+
+| concern | source of truth |
+|---|---|
+| context/authority/mechanism registration, selection, lifecycle, allocation generation | embedded `BindingRegistry` |
+| local capacity, policy, leases, mapped-growth grants | `MemoryGovernor` / physical authority |
+| what may be reclaimed and how | registered holder / `PressureResponder` |
+| stream, copy, commit/decommit, fence, deferred-release ordering | execution provider context |
+| process parent quota and transaction settlement | `ProcessMemoryManager` |
+
+A `ScopedMemoryBinding` pins one device, mechanism, provider context, and
+canonical authority. It exposes transaction-only allocation and
+non-allocating bound capability operations; it does not hand callers the raw
+registry or a raw allocation path. Registering the same
+`MemoryAuthorityId` again recovers the canonical authority registration, so two
+sessions or UMA/shared aliases cannot create independently grantable capacity
+for one physical pool. A mechanism switch affects only later bindings; existing
+allocations and queued releases retain the original allocator/context/authority
+path.
+
+Each provider context also owns a manager transaction gate (policy metadata,
+not a second registration ledger). Allocation commit/publication, weight
+page-in, and other provider-owned device work hold a context operation token.
+The context lifecycle is monotonic (`active -> retiring/lost -> terminated`):
+normal teardown and device loss reject new tokens, then wait for existing
+tokens with no manager/registry/governor lock held. A process-wide weak listener
+set broadcasts device loss to every same-device provider queue before registry
+invalidation, so sibling contexts cannot continue fence queries or allocator
+calls after only one queue learned of loss.
+
+The allocation state machine is:
+
+```text
+preflight pressure/delegation (no reservation held)
+  -> reserve process parent quota (unless already delegated)
+  -> reserve local authority lease (unless allocator-managed/compatibility)
+  -> allocate through the scoped binding
+  -> provider commit/map
+  -> publish allocation identity + independent accounting axes
+```
+
+Every failure before allocation drops provisional reservations exactly once.
+Every failure after allocation rolls back through `OwningAllocation` and the
+Phase-4 structured release. A complete rollback returns the reservation; a
+partial/failed rollback retains the exact residual charge and never makes the
+span reusable. If physical ownership exists but an allocation identity could
+not be issued, provisional tokens are deliberately retained rather than
+manufacturing a refund.
+
+`ManagedAllocation` keeps the authority lease and process reservation attached
+to physical ownership. Preparing a deferred release moves the same settlement
+token into the provider queue. The queue observer settles from the actual
+`AllocationReleaseOutcome`: complete release returns the charge, quarantine
+returns only the released portion and retains the residual, and device loss
+returns nothing. Enqueue refusal and abandoned prepared actions also report a
+quarantine outcome. Invalidation alone never refunds; only externally confirmed
+context/process termination discharges device-loss ownership.
+
+Snapshots keep these axes independent:
+
+| axis | meaning |
+|---|---|
+| charged bytes | bytes attributed to an authority/holder/role |
+| process-reserved bytes | live parent quota, excluding fixed authority delegation |
+| physical bytes | known owned backing, deduplicated by `SharedPhysicalIdentity` |
+| mapped bytes | per-mapping attribution; aliases may legitimately sum above physical |
+| unattributed bytes | compatibility allocations whose physical presence is known but whose authority charge is not |
+
+No snapshot infers residency from charge. Shared aliases reuse one
+authority-scoped physical identity and therefore count physical bytes once.
+Allocator-managed VMM transactions report delegated charge but do not take a
+transaction-scoped process lease: retained physical-handle pools can outlive one
+allocation, so refunding parent quota at allocation release would be false.
+Callers that need a finite process cap delegate a fixed parent-quota slice to
+the local authority once; the local governor then arbitrates within that slice
+without a second grant. Finite limits require the whole local authority extent
+to fit the slice; raising the local extent past it blocks further transactions,
+and lowering the parent below live slices is rejected.
+
+The manager lock order is:
+
+1. the registration gate may enter the registry for non-callback registration;
+2. manager state is copied and released before any registry/governor/holder call;
+3. registry and mechanism locks follow their existing never-nested rule;
+4. process quota and governor claims are completed independently;
+5. holder pressure, allocator/device work, queue callbacks, observers, and waits
+   run with manager/registry/governance locks dropped.
+
+Settlement tokens hold the allocation charge book, not the manager/registry, so
+the queue cannot form a manager → context → queue → manager `Arc` cycle.
+Manager teardown may precede a live/queued allocation; the token and binding
+pins keep settlement resources alive. If all coordination objects disappear
+without a terminal physical outcome, the implementation fails closed by
+retaining accounting rather than refunding possibly resident bytes.
+
+Confirmed CUDA context termination has explicit no-driver-call reconciliation:
+manager-published charges, mapped allowances (including every clone),
+weight-residency leases, and the matching physical-handle pool lease are
+discharged only after context operations quiesce. The pool is keyed by the
+stable CUDA context identity, not an `Arc` wrapper address. Later destructors
+observe the terminated marker and cannot call CUDA or release the same
+accounting twice.
 
 ### 1.2 Two directions, both backends
 

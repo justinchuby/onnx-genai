@@ -10,6 +10,7 @@ categories = ["memory-management", "science"]
 
 [dependencies]
 onnx-runtime-memory-api = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"

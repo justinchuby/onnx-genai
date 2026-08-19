@@ -6,7 +6,7 @@ use std::ptr::NonNull;
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, GraphView, Node, NodeId, NodeIndex, Shape, TensorLayout,
 };
-use onnx_runtime_memory_governor::OwningAllocation;
+use onnx_runtime_memory_governor::{ManagedAllocation, MemoryLease, MemoryRole, OwningAllocation};
 
 use crate::epcontext::EpContext;
 use crate::error::{EpError, Result};
@@ -108,6 +108,9 @@ enum BufferOwner {
     /// that minted the address. Release consumes that owner, so it is validated
     /// against the binding identity and the allocation generation.
     Bound(Box<OwningAllocation>),
+    /// Binding-issued ownership whose authority/process charges remain pinned
+    /// until the Phase-4 structured release outcome settles.
+    Managed(Box<ManagedAllocation>),
     /// This handle aliases foreign memory (e.g. an mmap). `deallocate` must be
     /// a no-op free; the real owner must outlive the buffer and every use of it.
     Borrowed,
@@ -253,10 +256,28 @@ impl DeviceBuffer {
         }
     }
 
+    /// Wrap a process-manager transaction result in a device buffer.
+    ///
+    /// The manager settlement token stays inseparable from physical ownership;
+    /// consuming release must use [`into_bound_ownership`](Self::into_bound_ownership).
+    pub fn from_managed_allocation(owner: ManagedAllocation, device: DeviceId) -> Self {
+        let ptr = owner.as_ptr();
+        let size = owner.len();
+        let align = owner.alignment().max(1);
+        Self {
+            device,
+            size,
+            align,
+            ptr: NonNull::new(ptr.as_ptr().cast::<c_void>())
+                .expect("a managed allocation holds a non-null address"),
+            owner: BufferOwner::Managed(Box::new(owner)),
+        }
+    }
+
     /// Whether this handle carries a binding-issued owner whose release is
     /// generation-validated.
     pub fn is_bound(&self) -> bool {
-        matches!(self.owner, BufferOwner::Bound(_))
+        matches!(self.owner, BufferOwner::Bound(_) | BufferOwner::Managed(_))
     }
 
     /// Borrow the binding-issued owner, for a bound capability call (commit,
@@ -268,22 +289,38 @@ impl DeviceBuffer {
     pub fn bound_owner(&self) -> Option<&OwningAllocation> {
         match &self.owner {
             BufferOwner::Bound(owner) => Some(owner),
+            BufferOwner::Managed(owner) => Some(owner.owner_ref()),
             _ => None,
         }
     }
 
-    /// Consume the handle and recover the binding-issued owner.
+    /// Borrow process-manager ownership when this buffer carries it.
+    pub fn managed_owner(&self) -> Option<&ManagedAllocation> {
+        match &self.owner {
+            BufferOwner::Managed(owner) => Some(owner),
+            _ => None,
+        }
+    }
+
+    /// Consume the handle and recover its complete binding-issued ownership.
     ///
     /// This is the only way a bound buffer's ownership leaves the handle, and it
     /// is what a provider's `deallocate` calls before preparing or deferring the
     /// physical release. `Err` hands the buffer back untouched when it is not
     /// bound, so a caller that requires generation-checked release can refuse
     /// foreign memory without losing it.
-    pub fn into_bound_owner(self) -> std::result::Result<OwningAllocation, Self> {
+    pub fn into_bound_owner(self) -> std::result::Result<BoundBufferOwnership, Self> {
         match self.owner {
-            BufferOwner::Bound(owner) => Ok(*owner),
+            BufferOwner::Bound(owner) => Ok(BoundBufferOwnership::Binding(*owner)),
+            BufferOwner::Managed(owner) => Ok(BoundBufferOwnership::Managed(*owner)),
             owner => Err(Self { owner, ..self }),
         }
+    }
+
+    /// Consume either binding-issued owning representation without discarding a
+    /// process-manager settlement token.
+    pub fn into_bound_ownership(self) -> std::result::Result<BoundBufferOwnership, Self> {
+        self.into_bound_owner()
     }
 
     /// The device this allocation lives on (and whose EP must free it).
@@ -356,12 +393,82 @@ impl DeviceBuffer {
     /// in the same step, so the release obligation travels with the pointer
     /// instead of being dropped on the floor. `None` means the buffer was raw
     /// owning or borrowed and the historical raw contract applies.
-    pub fn into_raw_with_owner(self) -> (*mut c_void, Option<OwningAllocation>) {
+    pub fn into_raw_with_owner(self) -> (*mut c_void, Option<BoundBufferOwnership>) {
         let ptr = self.ptr.as_ptr();
         match self.owner {
-            BufferOwner::Bound(owner) => (ptr, Some(*owner)),
+            BufferOwner::Bound(owner) => (ptr, Some(BoundBufferOwnership::Binding(*owner))),
+            BufferOwner::Managed(owner) => (ptr, Some(BoundBufferOwnership::Managed(*owner))),
             _ => (ptr, None),
         }
+    }
+
+    /// Consume the buffer into its raw address and complete binding ownership.
+    pub fn into_raw_with_bound_ownership(self) -> (*mut c_void, Option<BoundBufferOwnership>) {
+        let ptr = self.ptr.as_ptr();
+        match self.owner {
+            BufferOwner::Bound(owner) => (ptr, Some(BoundBufferOwnership::Binding(*owner))),
+            BufferOwner::Managed(owner) => (ptr, Some(BoundBufferOwnership::Managed(*owner))),
+            _ => (ptr, None),
+        }
+    }
+}
+
+/// Complete binding-issued ownership carried by a [`DeviceBuffer`].
+#[derive(Debug)]
+pub enum BoundBufferOwnership {
+    Binding(OwningAllocation),
+    Managed(ManagedAllocation),
+}
+
+impl BoundBufferOwnership {
+    pub fn owner(&self) -> &OwningAllocation {
+        match self {
+            Self::Binding(owner) => owner,
+            Self::Managed(owner) => owner.owner_ref(),
+        }
+    }
+}
+
+/// Executor workspace allocation with any compatibility lease it still needs.
+///
+/// Manager-aware providers retain charges inside the buffer's managed owner and
+/// leave `lease` empty. The default adapter preserves the older
+/// reserve-then-allocate contract for providers not yet migrated.
+#[derive(Debug)]
+pub struct WorkspaceAllocation {
+    buffer: DeviceBuffer,
+    lease: Option<MemoryLease>,
+}
+
+impl WorkspaceAllocation {
+    pub fn new(buffer: DeviceBuffer, lease: Option<MemoryLease>) -> Self {
+        Self { buffer, lease }
+    }
+
+    pub fn buffer(&self) -> &DeviceBuffer {
+        &self.buffer
+    }
+
+    pub fn buffer_mut(&mut self) -> &mut DeviceBuffer {
+        &mut self.buffer
+    }
+
+    pub fn into_parts(self) -> (DeviceBuffer, Option<MemoryLease>) {
+        (self.buffer, self.lease)
+    }
+}
+
+impl std::ops::Deref for WorkspaceAllocation {
+    type Target = DeviceBuffer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
+
+impl std::ops::DerefMut for WorkspaceAllocation {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffer
     }
 }
 
@@ -652,6 +759,51 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(allocation)
     }
 
+    /// Allocate executor workspace as one reserve/allocate/commit transaction.
+    ///
+    /// Providers with a process manager override this so the charge travels with
+    /// physical ownership through deferred release. The default is the existing
+    /// compatibility sequence for synchronous providers.
+    fn allocate_workspace(
+        &self,
+        size: usize,
+        alignment: usize,
+        role: MemoryRole,
+    ) -> Result<WorkspaceAllocation> {
+        let target_mapped = self.mapped_bytes_for_allocation(size, alignment)?;
+        let mut grant = self.prepare_mapped_growth(target_mapped, role)?;
+        let lease = match self.reserve_workspace(size as u64, role) {
+            Ok(lease) => lease,
+            Err(error) => {
+                drop(grant);
+                return Err(error);
+            }
+        };
+        let buffer = match grant.take() {
+            Some(grant) => self.allocate_with_mapped_growth(size, alignment, grant)?,
+            None => self.allocate(size, alignment)?,
+        };
+        Ok(WorkspaceAllocation::new(buffer, lease))
+    }
+
+    /// Replace executor workspace without granting the replacement until the
+    /// old allocation's provider-specific release boundary is satisfied.
+    ///
+    /// Synchronous providers use this default. Deferred providers override it
+    /// to await a structured release outcome with a finite deadline.
+    fn replace_workspace(
+        &self,
+        old: Option<WorkspaceAllocation>,
+        size: usize,
+        alignment: usize,
+        role: MemoryRole,
+    ) -> Result<WorkspaceAllocation> {
+        if let Some(old) = old {
+            self.deallocate_workspace(old)?;
+        }
+        self.allocate_workspace(size, alignment, role)
+    }
+
     /// Allocate device address space while committing only selected byte ranges.
     ///
     /// Providers whose allocator cannot reserve without committing should use
@@ -734,6 +886,41 @@ pub trait ExecutionProvider: Send + Sync {
 
     /// Free device memory.
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()>;
+
+    /// Whether `deallocate` proves physical release before returning `Ok`.
+    ///
+    /// Providers that only enqueue release return `false`. A compatibility
+    /// workspace lease then fails closed instead of refunding bytes whose
+    /// terminal outcome is not observable through this legacy API.
+    fn deallocation_settles_before_return(&self) -> bool {
+        true
+    }
+
+    /// Release an executor workspace and then its compatibility lease.
+    ///
+    /// Manager-aware buffers carry no outer lease: their settlement token keeps
+    /// the charge until the provider's actual structured release outcome.
+    fn deallocate_workspace(&self, workspace: WorkspaceAllocation) -> Result<()> {
+        let (buffer, lease) = workspace.into_parts();
+        match self.deallocate(buffer) {
+            Ok(()) if self.deallocation_settles_before_return() => {
+                drop(lease);
+                Ok(())
+            }
+            Ok(()) => {
+                if let Some(lease) = lease {
+                    Box::leak(Box::new(lease));
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(lease) = lease {
+                    Box::leak(Box::new(lease));
+                }
+                Err(error)
+            }
+        }
+    }
 
     /// Free device memory and report mapped-zone bytes actually unmapped.
     ///
@@ -1321,10 +1508,81 @@ mod tests {
         );
         // The only way ownership leaves the handle is the consuming extractor,
         // and what comes back is the same generation-checked owner.
-        let recovered = buffer.into_bound_owner().expect("bound");
+        let BoundBufferOwnership::Binding(recovered) = buffer.into_bound_owner().expect("bound")
+        else {
+            panic!("plain binding owner changed representation");
+        };
         assert_eq!(recovered.identity(), identity);
         let outcome = recovered.release_now().expect("release");
         assert!(outcome.is_complete());
+    }
+
+    #[test]
+    fn a_managed_buffer_keeps_charge_attached_to_bound_ownership() {
+        use onnx_runtime_memory_governor::{
+            AllocationPublication, AllocationRequest, DeviceKey, HostAllocator, LeaseLedger,
+            LedgerGovernor, MemoryGovernor, MemoryRole, ProcessMemoryManager, Tier,
+        };
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct Pin;
+
+        let manager = ProcessMemoryManager::new().unwrap();
+        let context = manager
+            .register_provider_context(DeviceKey::HOST, "host context", Arc::new(Pin))
+            .unwrap();
+        let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+            DeviceKey::HOST,
+            0,
+            1024,
+            0,
+        )));
+        let authority = manager
+            .register_authority(
+                DeviceKey::HOST,
+                "host authority",
+                Arc::new(Pin),
+                governor.clone() as Arc<dyn MemoryGovernor + Send + Sync>,
+            )
+            .unwrap();
+        let holder = manager
+            .register_holder(&authority, "workspace", None)
+            .unwrap();
+        let mechanism = manager
+            .register_allocator(
+                &context,
+                &authority,
+                "host allocator",
+                Arc::new(HostAllocator),
+            )
+            .unwrap();
+        let owner = manager
+            .bind_registered(&mechanism)
+            .unwrap()
+            .allocate(
+                AllocationRequest::managed(
+                    128,
+                    16,
+                    Tier::Host,
+                    MemoryRole::Workspace { step_scoped: false },
+                    holder,
+                    128,
+                ),
+                AllocationPublication::exclusive(128, 128, 128),
+            )
+            .unwrap();
+        assert_eq!(governor.used(Tier::Host), 128);
+        let buffer = DeviceBuffer::from_managed_allocation(owner, DeviceId::cpu());
+        assert!(buffer.is_bound());
+        assert!(buffer.managed_owner().is_some());
+        let BoundBufferOwnership::Managed(owner) =
+            buffer.into_bound_owner().expect("managed ownership")
+        else {
+            panic!("manager ownership changed representation");
+        };
+        owner.release_now().unwrap();
+        assert_eq!(governor.used(Tier::Host), 0);
     }
 
     #[test]
@@ -1358,7 +1616,11 @@ mod tests {
         let buffer = DeviceBuffer::from_owning_allocation(owner, DeviceId::cpu());
         let (ptr, owner) = buffer.into_raw_with_owner();
         assert_eq!(ptr as usize, expected);
-        let owner = owner.expect("the release obligation travels with the pointer");
+        let BoundBufferOwnership::Binding(owner) =
+            owner.expect("the release obligation travels with the pointer")
+        else {
+            panic!("plain binding owner changed representation");
+        };
         assert!(owner.release_now().expect("release").is_complete());
 
         // A raw-owning buffer keeps the historical contract: no owner, and the

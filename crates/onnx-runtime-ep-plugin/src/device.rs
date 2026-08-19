@@ -816,9 +816,14 @@ mod tests {
             let owner = buffer.into_bound_owner().map_err(|_| {
                 EpError::KernelFailed("mock GPU buffer lost its bound owner".into())
             })?;
-            let outcome = owner
-                .release_now()
-                .map_err(|error| EpError::KernelFailed(error.to_string()))?;
+            let outcome = match owner {
+                onnx_runtime_ep_api::BoundBufferOwnership::Binding(owner) => owner
+                    .release_now()
+                    .map_err(|error| EpError::KernelFailed(error.to_string()))?,
+                onnx_runtime_ep_api::BoundBufferOwnership::Managed(owner) => owner
+                    .release_now()
+                    .map_err(|error| EpError::KernelFailed(error.to_string()))?,
+            };
             if outcome.is_complete() {
                 Ok(())
             } else {

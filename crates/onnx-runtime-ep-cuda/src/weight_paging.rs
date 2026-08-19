@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -2178,6 +2178,7 @@ pub struct CudaWeightPager<'a, S: MmapRegionSource + ?Sized> {
     runtime: Arc<CudaRuntime>,
     /// Deferred release queue handed to every page this pager builds.
     queue: Option<Arc<CudaDeferredReleaseQueue>>,
+    context_scope: Option<onnx_runtime_memory_governor::MemoryContextScope>,
     source: &'a S,
 }
 
@@ -2186,6 +2187,7 @@ impl<'a, S: MmapRegionSource + ?Sized> CudaWeightPager<'a, S> {
         Self {
             runtime,
             queue: None,
+            context_scope: None,
             source,
         }
     }
@@ -2193,6 +2195,14 @@ impl<'a, S: MmapRegionSource + ?Sized> CudaWeightPager<'a, S> {
     /// Give the pages this pager builds the provider's deferred release queue.
     pub fn with_deferred_release_queue(mut self, queue: Arc<CudaDeferredReleaseQueue>) -> Self {
         self.queue = Some(queue);
+        self
+    }
+
+    pub fn with_context_scope(
+        mut self,
+        scope: onnx_runtime_memory_governor::MemoryContextScope,
+    ) -> Self {
+        self.context_scope = Some(scope);
         self
     }
 }
@@ -2204,6 +2214,12 @@ impl<S: MmapRegionSource + ?Sized> LazyDeviceWeightBinder for CudaWeightPager<'_
         &self,
         weight: &LazyWeight,
     ) -> Result<Self::Binding, WeightHandleError> {
+        let _context_operation = self
+            .context_scope
+            .as_ref()
+            .map(onnx_runtime_memory_governor::MemoryContextScope::enter)
+            .transpose()
+            .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         let total = weight.region_bytes_len();
         if total == 0 {
             return Err(WeightHandleError::MissingRegions);
@@ -2453,6 +2469,8 @@ pub struct CudaWeightResidency {
     /// contends the residency mutex for its (idempotent) registration bookkeeping.
     host_registry: Mutex<HostMapRegistry>,
     physical: OnceLock<PhysicalAdmission>,
+    context_scope: OnceLock<onnx_runtime_memory_governor::MemoryContextScope>,
+    context_terminated: AtomicBool,
     /// Reused pinned host staging buffers for weight page-ins. Shared so every
     /// page-in draws from the same bounded free-list instead of page-locking a
     /// fresh buffer per miss (issue #837). See [`crate::pinned_pool`] for the
@@ -2771,6 +2789,8 @@ impl CudaWeightResidency {
             zero_copy_hybrid: false,
             host_registry: Mutex::new(HostMapRegistry::new()),
             physical: OnceLock::new(),
+            context_scope: OnceLock::new(),
+            context_terminated: AtomicBool::new(false),
             staging_pool: PinnedStagingPool::new(Arc::clone(&runtime)),
             inner: Mutex::new(ResidencyInner {
                 policy: WeightResidencyPolicy::new(budget_bytes),
@@ -2831,6 +2851,8 @@ impl CudaWeightResidency {
             zero_copy_hybrid: false,
             host_registry: Mutex::new(HostMapRegistry::new()),
             physical: OnceLock::new(),
+            context_scope: OnceLock::new(),
+            context_terminated: AtomicBool::new(false),
             staging_pool: PinnedStagingPool::new(Arc::clone(&runtime)),
             inner: Mutex::new(ResidencyInner {
                 policy: WeightResidencyPolicy::new(lease.bytes()),
@@ -2957,6 +2979,50 @@ impl CudaWeightResidency {
         self
     }
 
+    pub fn install_context_scope(
+        &self,
+        scope: onnx_runtime_memory_governor::MemoryContextScope,
+    ) -> Result<(), &'static str> {
+        self.context_scope
+            .set(scope)
+            .map_err(|_| "weight residency context scope was already installed")
+    }
+
+    fn enter_context_operation(
+        &self,
+    ) -> Result<Option<onnx_runtime_memory_governor::MemoryContextOperation>, WeightHandleError>
+    {
+        if self.context_terminated.load(Ordering::Acquire) {
+            return Err(WeightHandleError::DeviceBinding(
+                "weight residency belongs to a terminated provider context".into(),
+            ));
+        }
+        self.context_scope
+            .get()
+            .map(onnx_runtime_memory_governor::MemoryContextScope::enter)
+            .transpose()
+            .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+    }
+
+    /// Discharge residency-owned authority capacity after externally confirmed
+    /// context termination. No CUDA operation is performed.
+    pub fn confirm_context_terminated(&self) {
+        if self.context_terminated.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (allowance, lease) = {
+            let mut inner = self.lock();
+            let allowance = inner.mapped_allowance.take();
+            let lease = inner.lease.take();
+            inner.policy.budget = 0;
+            (allowance, lease)
+        };
+        if let Some(allowance) = allowance {
+            allowance.confirm_context_terminated();
+        }
+        drop(lease);
+    }
+
     /// The deferred release queue this cache hands page releases to.
     pub fn deferred_release_queue(&self) -> Option<&Arc<CudaDeferredReleaseQueue>> {
         self.queue.as_ref()
@@ -3067,6 +3133,7 @@ impl CudaWeightResidency {
         weight: &LazyWeight,
         source: &S,
     ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
+        let _context_operation = self.enter_context_operation()?;
         if let Some(hit) = self.get_hit(key) {
             return Ok(hit);
         }
@@ -3116,6 +3183,7 @@ impl CudaWeightResidency {
         weight: &LazyWeight,
         source: &dyn MmapRegionSource,
     ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
+        let _context_operation = self.enter_context_operation()?;
         if self.zero_copy_hybrid && self.physical.get().is_some() {
             return self.resident_mapped_hybrid(key, weight, source);
         }
@@ -3414,6 +3482,7 @@ impl CudaWeightResidency {
         key: u64,
         weight: &LazyWeight,
     ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
+        let _context_operation = self.enter_context_operation()?;
         if let Some(hit) = self.get_hit(key) {
             return Ok(hit);
         }

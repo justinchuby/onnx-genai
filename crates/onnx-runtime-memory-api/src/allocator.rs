@@ -24,6 +24,9 @@ pub struct AllocationCommitRange {
 #[derive(Debug)]
 pub struct MappedAllocation<T> {
     pub allocation: T,
+    /// Newly created physical ownership. This is independent of mapping:
+    /// retained-pool/shared handles may map bytes while adding zero ownership.
+    pub additional_owned_bytes: u64,
     pub newly_mapped_bytes: u64,
 }
 

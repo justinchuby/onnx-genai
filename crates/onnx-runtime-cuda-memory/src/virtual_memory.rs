@@ -72,7 +72,7 @@
 //!   process to solve one allocation's problem.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use cudarc::driver::sys as cu;
@@ -1342,6 +1342,7 @@ pub fn physical_pool_authority_gate(authority: MemoryAuthorityId) -> Arc<RwLock<
 #[derive(Debug)]
 pub struct PhysicalHandlePool {
     context: Arc<CudaContext>,
+    context_identity: usize,
     device_ordinal: i32,
     granularity: usize,
     authority: MemoryAuthorityId,
@@ -1350,6 +1351,7 @@ pub struct PhysicalHandlePool {
     state: Mutex<PoolState>,
     lease_checkout: Mutex<()>,
     counters: Arc<PoolCounters>,
+    context_terminated: AtomicBool,
 }
 
 impl PhysicalHandlePool {
@@ -1375,12 +1377,13 @@ impl PhysicalHandlePool {
         }
         let granularity = allocation_granularity(device_ordinal);
         let allocation = allocation_compatibility(device_ordinal);
-        let context_id =
-            current_context_id(&context).map_err(|reason| MemoryError::AllocationFailed {
+        let context_id = physical_pool_context_identity(&context).map_err(|reason| {
+            MemoryError::AllocationFailed {
                 tier: Tier::Device.name(),
                 requested: 0,
                 reason,
-            })?;
+            }
+        })?;
         let key = PoolKey {
             context: context_id,
             device_ordinal,
@@ -1410,6 +1413,7 @@ impl PhysicalHandlePool {
         }
         let retained_granules = max_retained_bytes / granularity;
         let pool = Arc::new(Self {
+            context_identity: context_id,
             context,
             device_ordinal,
             granularity,
@@ -1425,9 +1429,39 @@ impl PhysicalHandlePool {
             }),
             lease_checkout: Mutex::new(()),
             counters: Arc::new(PoolCounters::default()),
+            context_terminated: AtomicBool::new(false),
         });
         registry.insert(key, Arc::downgrade(&pool));
         Ok(pool)
+    }
+
+    /// Discharge pool accounting after external proof that the CUDA context no
+    /// longer exists.
+    ///
+    /// No driver API is called. Handles and mappings ceased to exist with the
+    /// context, so their integer identities are discarded and the authority
+    /// lease is released exactly once.
+    fn confirm_context_terminated(&self) {
+        if self.context_terminated.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let lease = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.available.clear();
+            state.quarantined.clear();
+            state.shared.clear();
+            state.pending_lease_shrink = 0;
+            state.lease.take()
+        };
+        self.counters
+            .pooled_unmapped_bytes
+            .store(0, Ordering::Release);
+        self.counters.quarantined_bytes.store(0, Ordering::Release);
+        self.counters.total_owned_bytes.store(0, Ordering::Release);
+        drop(lease);
     }
 
     /// Allocation granularity shared by every handle in this pool.
@@ -1459,6 +1493,13 @@ impl PhysicalHandlePool {
     }
 
     fn bind(&self, what: &'static str) -> Result<(), VirtualMemoryError> {
+        if self.context_terminated.load(Ordering::Acquire) {
+            return Err(VirtualMemoryError::Os {
+                operation: what,
+                reason: "the CUDA context was externally confirmed terminated".into(),
+                code: 0,
+            });
+        }
         self.context
             .bind_to_thread()
             .map_err(|error| VirtualMemoryError::Os {
@@ -1810,6 +1851,29 @@ impl PhysicalHandlePool {
     }
 }
 
+/// Reconcile every physical pool belonging to one terminated CUDA context and
+/// authority without invoking the driver.
+pub fn confirm_physical_handle_pool_context_terminated(
+    context_identity: usize,
+    authority: MemoryAuthorityId,
+) {
+    let registry = PHYSICAL_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let pools = {
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_, pool| pool.strong_count() > 0);
+        registry
+            .values()
+            .filter_map(Weak::upgrade)
+            .filter(|pool| pool.authority == authority && pool.context_identity == context_identity)
+            .collect::<Vec<_>>()
+    };
+    for pool in pools {
+        pool.confirm_context_terminated();
+    }
+}
+
 /// Release retained, unmapped handles owned by `authority`.
 ///
 /// Pool locks serialize checkout/return with trimming. The caller must pause
@@ -1908,6 +1972,17 @@ pub fn total_physical_pool_owned_bytes() -> u64 {
 
 impl Drop for PhysicalHandlePool {
     fn drop(&mut self) {
+        if self.context_terminated.load(Ordering::Acquire) {
+            let state = self
+                .state
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.available.clear();
+            state.quarantined.clear();
+            state.shared.clear();
+            drop(state.lease.take());
+            return;
+        }
         let _operation = self
             .authority_gate
             .read()
@@ -1989,7 +2064,7 @@ fn allocation_compatibility(device_ordinal: i32) -> AllocationCompatibility {
     }
 }
 
-fn current_context_id(context: &CudaContext) -> Result<usize, String> {
+pub fn physical_pool_context_identity(context: &CudaContext) -> Result<usize, String> {
     context
         .bind_to_thread()
         .map_err(|error| format!("could not bind CUDA context: {error}"))?;

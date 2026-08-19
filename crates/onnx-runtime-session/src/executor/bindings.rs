@@ -677,25 +677,10 @@ impl Executor {
         {
             return Ok(());
         };
-        if let Some(old) = slot.take() {
-            ep.deallocate(old.buffer)?;
-        }
-        let target_mapped = ep.mapped_bytes_for_allocation(bytes, peak.alignment)?;
-        let mut grant = ep.prepare_mapped_growth(target_mapped, peak.role)?;
-        let lease = match ep.reserve_workspace(peak.bytes, peak.role) {
-            Ok(lease) => lease,
-            Err(error) => {
-                drop(grant);
-                return Err(error.into());
-            }
-        };
-        let fresh = match grant.take() {
-            Some(grant) => ep.allocate_with_mapped_growth(bytes, peak.alignment, grant)?,
-            None => ep.allocate(bytes, peak.alignment)?,
-        };
+        let old = slot.take().map(|workspace| workspace.buffer);
+        let fresh = ep.replace_workspace(old, bytes, peak.alignment, peak.role)?;
         *slot = Some(PreparedWorkspace {
             buffer: fresh,
-            _lease: lease,
             bytes,
             alignment: peak.alignment,
         });
@@ -792,7 +777,7 @@ impl Executor {
 
     pub(super) fn release_step_workspace(&mut self) -> Result<()> {
         if let Some(workspace) = self.step_workspace.take() {
-            self.ep.deallocate(workspace.buffer)?;
+            self.ep.deallocate_workspace(workspace.buffer)?;
         }
         Ok(())
     }

@@ -293,6 +293,61 @@ struct QueueState {
 }
 
 #[derive(Debug, Default)]
+struct ExecutionGateState {
+    owner: Option<std::thread::ThreadId>,
+    depth: usize,
+}
+
+#[derive(Debug, Default)]
+struct ExecutionGate {
+    state: Mutex<ExecutionGateState>,
+    wake: Condvar,
+}
+
+impl ExecutionGate {
+    fn lock(&self) -> ExecutionGateGuard<'_> {
+        let current = std::thread::current().id();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.owner.as_ref().is_some_and(|owner| *owner != current) {
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.owner = Some(current);
+        state.depth = state
+            .depth
+            .checked_add(1)
+            .expect("execution-gate recursion depth overflow");
+        ExecutionGateGuard { gate: self }
+    }
+}
+
+struct ExecutionGateGuard<'a> {
+    gate: &'a ExecutionGate,
+}
+
+impl Drop for ExecutionGateGuard<'_> {
+    fn drop(&mut self) {
+        let current = std::thread::current().id();
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert_eq!(state.owner.as_ref(), Some(&current));
+        state.depth = state.depth.saturating_sub(1);
+        if state.depth == 0 {
+            state.owner = None;
+            self.gate.wake.notify_all();
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 struct Counters {
     accepted: AtomicU64,
     completed: AtomicU64,
@@ -318,7 +373,7 @@ pub struct CudaDeferredReleaseQueue {
     /// Serializes the boundary between "device is usable" and starting a
     /// release/query. Device-loss marking takes this gate before publishing the
     /// lost state, so no new driver call can begin after loss is observed.
-    execution_gate: Mutex<()>,
+    execution_gate: ExecutionGate,
     state: Mutex<QueueState>,
     /// Signalled on enqueue, close, and device loss so the worker wakes without
     /// busy-waiting. The worker always waits with a timeout, so a missed
@@ -331,6 +386,9 @@ pub struct CudaDeferredReleaseQueue {
     device_lost: AtomicBool,
     closed: AtomicBool,
     draining: AtomicBool,
+    /// Provider teardown callback. It uses weak manager ownership and is invoked
+    /// with every queue/execution lock dropped once normal draining is idle.
+    drain_callback: Mutex<Option<Box<dyn FnMut() -> bool + Send>>>,
     counters: Counters,
 }
 
@@ -383,13 +441,14 @@ impl CudaDeferredReleaseQueue {
             capacity: capacity.max(1),
             poll_interval,
             autonomous,
-            execution_gate: Mutex::new(()),
+            execution_gate: ExecutionGate::default(),
             state: Mutex::new(QueueState::default()),
             wake: Condvar::new(),
             outstanding: AtomicUsize::new(0),
             device_lost: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             draining: AtomicBool::new(false),
+            drain_callback: Mutex::new(None),
             counters: Counters::default(),
         })
     }
@@ -479,7 +538,47 @@ impl CudaDeferredReleaseQueue {
     pub fn close_after_drain(&self) {
         self.draining.store(true, Ordering::Release);
         self.lock().draining = true;
+        self.run_drain_callback_if_ready();
         self.wake.notify_all();
+    }
+
+    /// Install one callback that removes provider registrations after all
+    /// normally ordered releases settle.
+    ///
+    /// Returning `false` asks the worker to retry on a later idle poll (for
+    /// example while a live allocation still pins the mechanism). Device-loss
+    /// teardown is excluded; it requires explicit context-termination
+    /// confirmation instead of normal removal.
+    pub fn set_drain_callback(&self, callback: impl FnMut() -> bool + Send + 'static) {
+        *self
+            .drain_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
+        self.run_drain_callback_if_ready();
+        self.wake.notify_all();
+    }
+
+    fn run_drain_callback_if_ready(&self) {
+        if !self.is_draining() || self.is_device_lost() || self.pending() != 0 {
+            return;
+        }
+        let callback = self
+            .drain_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(mut callback) = callback else {
+            return;
+        };
+        if !callback() {
+            let mut slot = self
+                .drain_callback
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot.is_none() {
+                *slot = Some(callback);
+            }
+        }
     }
 
     /// Record that the device or provider context was lost.
@@ -497,10 +596,7 @@ impl CudaDeferredReleaseQueue {
     /// termination and discharge the quarantine it was handed.
     pub fn mark_device_lost(&self, reason: impl Into<String>) {
         let reason = reason.into();
-        let gate = self
-            .execution_gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let gate = self.execution_gate.lock();
         if self.device_lost.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -534,16 +630,14 @@ impl CudaDeferredReleaseQueue {
             state.pending.drain(..).collect()
         };
         if drained.is_empty() {
+            self.run_drain_callback_if_ready();
             return 0;
         }
         let mut carry = VecDeque::with_capacity(drained.len());
         let mut executed = 0usize;
         let mut retained = Vec::new();
         for entry in drained {
-            let execution = self
-                .execution_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let execution = self.execution_gate.lock();
             if self.is_device_lost() {
                 drop(execution);
                 retained.push(self.settle_lost_entry(
@@ -569,10 +663,7 @@ impl CudaDeferredReleaseQueue {
             self.record_outcome(label, outcome, &mut retained);
             self.outstanding.fetch_sub(1, Ordering::AcqRel);
         }
-        let carry_gate = self
-            .execution_gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let carry_gate = self.execution_gate.lock();
         if self.is_device_lost() {
             while let Some(entry) = carry.pop_front() {
                 retained.push(self.settle_lost_entry(
@@ -594,6 +685,7 @@ impl CudaDeferredReleaseQueue {
         if executed > 0 {
             self.wake.notify_all();
         }
+        self.run_drain_callback_if_ready();
         executed
     }
 
@@ -707,9 +799,19 @@ impl CudaDeferredReleaseQueue {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(RefusedRelease::new(rejection, action));
         }
+        let execution = self.execution_gate.lock();
+        if let Some(rejection) = self.refusal_reason() {
+            drop(execution);
+            self.outstanding.fetch_sub(1, Ordering::AcqRel);
+            self.counters
+                .enqueue_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(RefusedRelease::new(rejection, action));
+        }
         let fences = match self.fences.record() {
             Ok(fences) => fences,
             Err(error) => {
+                drop(execution);
                 self.outstanding.fetch_sub(1, Ordering::AcqRel);
                 self.counters
                     .enqueue_failures
@@ -753,6 +855,7 @@ impl CudaDeferredReleaseQueue {
                 action: Box::new(action),
             });
         }
+        drop(execution);
         self.counters.accepted.fetch_add(1, Ordering::Relaxed);
         self.wake.notify_all();
         self.ensure_worker();
@@ -844,11 +947,18 @@ impl CudaDeferredReleaseQueue {
             if !self.is_device_lost() {
                 self.poll();
             }
-            let state = self.lock();
-            let idle = state.pending.is_empty() && self.outstanding.load(Ordering::Acquire) == 0;
+            let mut state = self.lock();
+            let mut idle =
+                state.pending.is_empty() && self.outstanding.load(Ordering::Acquire) == 0;
             if idle && state.closed {
                 // Closed and empty: nothing can arrive and nothing is owed.
                 return;
+            }
+            if idle && state.draining && !state.device_lost {
+                drop(state);
+                self.run_drain_callback_if_ready();
+                state = self.lock();
+                idle = state.pending.is_empty() && self.outstanding.load(Ordering::Acquire) == 0;
             }
             // Draining: the queue is empty *and* this worker holds the only
             // reference to it, so no provider, allocator, arena, or reservation
@@ -905,6 +1015,12 @@ impl DeferredReleaseQueue for CudaDeferredReleaseQueue {
 
     fn pending(&self) -> usize {
         self.outstanding.load(Ordering::Acquire)
+    }
+}
+
+impl onnx_runtime_memory_governor::DeviceLossListener for CudaDeferredReleaseQueue {
+    fn mark_device_lost(&self, reason: &str) {
+        CudaDeferredReleaseQueue::mark_device_lost(self, reason);
     }
 }
 
@@ -1037,7 +1153,10 @@ impl Drop for PreparedReleaseAction {
     /// the mechanism. It never frees and never waits.
     fn drop(&mut self) {
         if let Some(request) = self.request.take() {
-            let _ = request.quarantine(QuarantineReason::AbandonedRequest);
+            let outcome = request.quarantine(QuarantineReason::AbandonedRequest);
+            if let Some(observer) = self.observer.as_ref() {
+                observer.released(&outcome);
+            }
         }
     }
 }
@@ -1270,6 +1389,26 @@ mod tests {
             capacity,
         );
         (queue, compute, copy)
+    }
+
+    #[test]
+    fn drain_callback_runs_outside_queue_locks_and_retries_until_cleanup_succeeds() {
+        let (queue, _, _) = manual_queue(1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let reentrant = Arc::clone(&queue);
+        queue.set_drain_callback(move || {
+            let call = callback_calls.fetch_add(1, Ordering::AcqRel);
+            // Reentrant observability would deadlock if a queue lock were held.
+            let _ = reentrant.stats();
+            call != 0
+        });
+        queue.close_after_drain();
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        queue.poll();
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        queue.poll();
+        assert_eq!(calls.load(Ordering::Acquire), 2, "callback settles once");
     }
 
     #[test]

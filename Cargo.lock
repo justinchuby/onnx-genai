@@ -2563,6 +2563,7 @@ version = "0.1.0-dev.5"
 dependencies = [
  "criterion",
  "onnx-runtime-memory-api",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

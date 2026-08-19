@@ -316,6 +316,22 @@ impl PipelineEngine {
                 format!("native pipeline prompt component '{component}' has no model path")
             })?;
         let device = super::native_decoder_device(self.native_device.as_ref());
+        #[cfg(feature = "cuda")]
+        let session = crate::native_component::NativeComponentSession::load_with_cuda_memory(
+            path,
+            device,
+            crate::engine::cuda_policy_from_memory_strategy_plan(&self.memory_strategy_plan),
+            std::sync::Arc::new(
+                self.native_cuda_authority
+                    .clone()
+                    .unwrap_or_else(|| self.resource_governor.device_authority()),
+            ),
+            self.resource_governor.process_memory_manager(),
+        )
+        .with_context(|| {
+            format!("failed to load native pipeline prompt component '{component}'")
+        })?;
+        #[cfg(not(feature = "cuda"))]
         let session = crate::native_component::NativeComponentSession::load(path, device)
             .with_context(|| {
                 format!("failed to load native pipeline prompt component '{component}'")

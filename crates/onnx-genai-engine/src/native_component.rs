@@ -19,12 +19,16 @@
 //! / vision KV remain unwired; see [`crate::pipeline`].
 
 use crate::native_decode::NativeDecodeDevice;
+#[cfg(feature = "cuda")]
+use anyhow::Context;
 use onnx_genai_metadata::{
     ComponentDataType, ComponentError, ComponentIo, ComponentSession, ComponentTensor,
 };
 use onnx_runtime_ir::{DataType as IrDataType, Dim};
 use onnx_runtime_session::{DevicePreference, InferenceSession, IoMeta, Tensor};
 use std::path::Path;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 const BACKEND: &str = "native";
 
@@ -143,6 +147,41 @@ impl NativeComponentSession {
                 "native CUDA pipeline component fell back to CPU"
             );
         }
+        Self::new(session).map_err(anyhow::Error::from)
+    }
+
+    /// Load a component through the engine's shared CUDA authority and process
+    /// manager instead of automatic provider construction.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn load_with_cuda_memory(
+        path: &Path,
+        device: NativeDecodeDevice,
+        policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+        manager: onnx_runtime_memory_governor::ProcessMemoryManager,
+    ) -> anyhow::Result<Self> {
+        let NativeDecodeDevice::Cuda { index } = device else {
+            return Self::load(path, device);
+        };
+        let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::
+            initialized_with_offload_policy_governor_and_manager(
+                index.unwrap_or(0),
+                policy,
+                governor,
+                manager,
+            )
+            .context("initialize governed native CUDA component provider")?;
+        let session = InferenceSession::builder()
+            .model(path)
+            .execution_provider(Arc::new(ep))
+            .build()
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to load pipeline component '{}' on the governed native CUDA backend: \
+                     {err}",
+                    path.display()
+                )
+            })?;
         Self::new(session).map_err(anyhow::Error::from)
     }
 }
