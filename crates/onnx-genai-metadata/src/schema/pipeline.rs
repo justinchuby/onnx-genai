@@ -384,6 +384,18 @@ pub struct ImageTransform {
     #[schemars(length(min = 1))]
     pub channel_order: Option<String>,
 
+    /// Relative nesting of the temporal and channel axes inside a flattened
+    /// `channels_first` patch (`channel_major` or `temporal_major`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub temporal_order: Option<String>,
+    /// Order patches are emitted in (`merge_groups`, the default, or `raster`).
+    /// Independent of `merge_size`, which only sets how many patches collapse
+    /// into one image token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub patch_order: Option<String>,
+
     /// Patch-coordinate component order (`yx` or `xy`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]

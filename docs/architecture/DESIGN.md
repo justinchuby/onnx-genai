@@ -705,7 +705,7 @@ let alt_response = branch.generate("Actually, divide by 2 instead").await?;
 - [ ] Simple KV cache (non-paged, single sequence)
 - [ ] Greedy generation loop
 - [ ] Basic logit processors (temperature, top-p, stop sequences)
-- [ ] CLI: `onnx-genai generate ./path --prompt "prompt"`
+- [ ] CLI: `onnx-genai generate ./path "prompt"`
 
 **Exit criteria:** Can load a Phi-4 ONNX model (from Mobius) and generate text greedily, end-to-end.
 

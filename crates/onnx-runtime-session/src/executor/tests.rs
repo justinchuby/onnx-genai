@@ -1248,10 +1248,19 @@ fn growing_symbol_alias_keeps_downstream_consumer_eager() {
         growing.contains(&seq_kv),
         "the growing KV symbol must be collected, got {growing:?}"
     );
+    // The broadcast of the growing `seq_kv` against `batch` cannot claim the two
+    // are equal, so inference names the result with a fresh extent derived from
+    // both. What must hold either way is that whatever symbol lands on the
+    // aliasing op's OUTPUT is itself disqualifying — otherwise the downstream
+    // consumer, which only ever sees that symbol, would look capture-eligible.
+    let alias_rep = match graph.value(aliased_out).shape[0] {
+        Dim::Symbolic(s) => s,
+        ref other => panic!("expected a symbolic aliased extent, got {other:?}"),
+    };
     assert!(
-        growing.contains(&batch),
-        "the representative `batch` unified with a growing symbol must be in the CLOSED growing \
-         set, got {growing:?}"
+        growing.contains(&alias_rep),
+        "the extent a growing symbol broadcast into must be in the CLOSED growing set, \
+         got {growing:?} for {alias_rep:?}"
     );
     assert!(
         !node_capture_seq_independent(&graph, &aliased_op, &growing),
@@ -1346,11 +1355,15 @@ fn matmul_batch_alias_keeps_downstream_consumer_eager() {
         growing.contains(&seq_kv),
         "the growing KV symbol must be collected, got {growing:?}"
     );
+    let matmul_rep = match graph.value(matmul_out).shape[0] {
+        Dim::Symbolic(s) => s,
+        ref other => panic!("expected a symbolic MatMul batch extent, got {other:?}"),
+    };
     assert!(
-        growing.contains(&batch),
-        "the representative `batch` a MatMul batch-dim broadcast unified with the growing \
-         `seq_kv` must be in the CLOSED growing set — this FAILS on an elementwise-only closure, \
-         got {growing:?}"
+        growing.contains(&matmul_rep),
+        "the extent a MatMul batch-dim broadcast folded the growing `seq_kv` into must be in the \
+         CLOSED growing set — this FAILS on an elementwise-only closure, got {growing:?} for \
+         {matmul_rep:?}"
     );
     assert!(
         !node_capture_seq_independent(&graph, &consumer, &growing),

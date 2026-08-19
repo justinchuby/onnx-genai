@@ -770,7 +770,7 @@ unsafe extern "C" fn transfer_full_copy_tensors(
             let (_, _, byte_len) = match crate::kernel_ctx::validate_dims(
                 &dims,
                 dtype,
-                &format!("CopyTensors[{i}]"),
+                format_args!("CopyTensors[{i}]"),
             ) {
                 Ok(v) => v,
                 Err(e) => return fail_status(&e),

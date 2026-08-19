@@ -2229,17 +2229,87 @@ fn unifies(graph: &Graph, x: onnx_runtime_ir::SymbolId, y: onnx_runtime_ir::Symb
         .any(|&(a, b)| (a == x && b == y) || (a == y && b == x))
 }
 
-// Path-B completeness: the authoritative `Graph::symbol_unifications` record is
-// populated at the single `broadcast_dim` chokepoint, so it captures symbol
-// substitutions from EVERY broadcasting handler — not just elementwise. This
-// exercises the two non-elementwise handlers the prior executor closure missed
-// (`MatMul` batch dims via `linalg.rs`, `Concat` non-concat axes via
-// `movement/concat_slice.rs`); `Einsum`/`Expand` funnel through the same
-// chokepoint and are covered by construction. Recording is additive: the
-// inferred output shape is byte-identical (uses the lower-id representative),
-// which these assertions also pin.
+fn derives(
+    graph: &Graph,
+    derived: onnx_runtime_ir::SymbolId,
+    source: onnx_runtime_ir::SymbolId,
+) -> bool {
+    graph
+        .symbol_derivations
+        .iter()
+        .any(|&(d, s)| d == derived && s == source)
+}
+
+/// Fresh symbols minted during inference live at or above this id; named graph
+/// dim-params stay below it. Mirrors `ANON_SYMBOL_FLOOR` in the crate.
+const ANON_FLOOR: u32 = 0x8000_0000;
+
+fn sole_symbol(dim: &Dim) -> onnx_runtime_ir::SymbolId {
+    match dim {
+        Dim::Symbolic(s) => *s,
+        other => panic!("expected a symbolic dim, got {other:?}"),
+    }
+}
+
+// Path-B completeness: the authoritative symbol-lineage records are populated at
+// the single `broadcast_dim` chokepoint, so they capture symbol substitutions
+// from EVERY broadcasting handler — not just elementwise. These exercise the two
+// non-elementwise handlers the prior executor closure missed (`MatMul` batch
+// dims via `linalg.rs`, `Concat` non-concat axes via `movement/concat_slice.rs`);
+// `Einsum`/`Expand` funnel through the same chokepoint and are covered by
+// construction.
+//
+// Which record gets written depends on whether collapsing the two dims onto one
+// representative is *sound*, which these two pairs of tests pin:
+//
+//   * anonymous vs named  -> `symbol_unifications`, output keeps the named symbol
+//   * named vs named      -> `symbol_derivations`, output is a fresh unknown
 #[test]
-fn broadcast_records_symbol_unification_for_matmul_batch_dims() {
+fn broadcast_unifies_anonymous_symbol_into_named_for_matmul_batch_dims() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let a = graph.intern_symbol("a");
+    // An anonymous extent, as minted for a value inference could not track.
+    let anon = onnx_runtime_ir::SymbolId(ANON_FLOOR + 7);
+    let lhs = graph.create_named_value(
+        "lhs",
+        DataType::Float32,
+        vec![Dim::Symbolic(a), Dim::Static(8), Dim::Static(16)],
+    );
+    let rhs = graph.create_named_value(
+        "rhs",
+        DataType::Float32,
+        vec![Dim::Symbolic(anon), Dim::Static(16), Dim::Static(32)],
+    );
+    graph.add_input(lhs);
+    graph.add_input(rhs);
+    let out = graph.create_named_value("out", DataType::Float32, Shape::new());
+    graph.mark_value_shape_unknown(out);
+    graph.insert_node(node(0, "MatMul", vec![Some(lhs), Some(rhs)], vec![out]));
+    graph.add_output(out);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer MatMul with an anonymous batch dim");
+
+    // The anonymous side carries no independent meaning, so it adopts the named
+    // symbol — this is what lets a data-dependent extent re-bind to a real dim.
+    assert_eq!(
+        graph.value(out).shape,
+        vec![Dim::Symbolic(a), Dim::Static(8), Dim::Static(32)],
+        "an anonymous batch dim must re-bind to the named graph symbol"
+    );
+    assert!(
+        unifies(&graph, a, anon),
+        "the MatMul batch-dim broadcast must be recorded as an authoritative unification, got {:?}",
+        graph.symbol_unifications
+    );
+}
+
+#[test]
+fn broadcast_of_two_named_dims_stays_unknown_for_matmul_batch_dims() {
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 17);
     let a = graph.intern_symbol("a");
@@ -2267,17 +2337,25 @@ fn broadcast_records_symbol_unification_for_matmul_batch_dims() {
         .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
         .expect("infer MatMul with distinct symbolic batch dims");
 
-    // Inference behavior unchanged: the output batch dim is the lower-id rep.
-    let rep = if a.0 <= b.0 { a } else { b };
-    assert_eq!(
-        graph.value(out).shape,
-        vec![Dim::Symbolic(rep), Dim::Static(8), Dim::Static(32)],
-        "MatMul output must still use the lower-id representative (byte-identical inference)"
+    // `a` and `b` are separately declared dims: either may be the 1 that
+    // broadcasts up, so naming the result after either one would be a guess.
+    let shape = &graph.value(out).shape;
+    assert_eq!(shape[1..], [Dim::Static(8), Dim::Static(32)]);
+    let fresh = sole_symbol(&shape[0]);
+    assert!(
+        fresh != a && fresh != b && fresh.0 >= ANON_FLOOR,
+        "broadcasting two distinct named dims must yield a fresh unknown, got {fresh:?}"
     );
     assert!(
-        unifies(&graph, a, b),
-        "the MatMul batch-dim broadcast must be recorded as an authoritative unification, got {:?}",
+        !unifies(&graph, a, b),
+        "two separately declared graph dims must not be asserted equal, got {:?}",
         graph.symbol_unifications
+    );
+    assert!(
+        derives(&graph, fresh, a) && derives(&graph, fresh, b),
+        "the unknown extent must record provenance on BOTH operands so a growing \
+         dim still disqualifies it from capture, got {:?}",
+        graph.symbol_derivations
     );
 }
 
@@ -2286,8 +2364,8 @@ fn broadcast_records_symbol_unification_for_concat_non_concat_axes() {
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 17);
     let a = graph.intern_symbol("a");
-    let b = graph.intern_symbol("b");
-    // Concatenate along axis 1; the non-concat axis 0 broadcasts a and b.
+    let anon = onnx_runtime_ir::SymbolId(ANON_FLOOR + 7);
+    // Concatenate along axis 1; the non-concat axis 0 broadcasts a and anon.
     let in0 = graph.create_named_value(
         "in0",
         DataType::Float32,
@@ -2296,7 +2374,7 @@ fn broadcast_records_symbol_unification_for_concat_non_concat_axes() {
     let in1 = graph.create_named_value(
         "in1",
         DataType::Float32,
-        vec![Dim::Symbolic(b), Dim::Static(5)],
+        vec![Dim::Symbolic(anon), Dim::Static(5)],
     );
     graph.add_input(in0);
     graph.add_input(in1);
@@ -2313,16 +2391,77 @@ fn broadcast_records_symbol_unification_for_concat_non_concat_axes() {
         .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
         .expect("infer Concat with distinct symbolic non-concat dims");
 
-    let rep = if a.0 <= b.0 { a } else { b };
     assert_eq!(
         graph.value(out).shape,
-        vec![Dim::Symbolic(rep), Dim::Static(8)],
-        "Concat output non-concat axis must still use the lower-id representative"
+        vec![Dim::Symbolic(a), Dim::Static(8)],
+        "Concat output non-concat axis must re-bind the anonymous dim to the named one"
     );
     assert!(
-        unifies(&graph, a, b),
+        unifies(&graph, a, anon),
         "the Concat non-concat-axis broadcast must be recorded as an authoritative unification, \
          got {:?}",
+        graph.symbol_unifications
+    );
+}
+
+// Regression: an export whose rank-3 `MatMul` rhs right-aligns under a rank-4
+// lhs makes the rhs *batch* dim broadcast against the lhs *sequence* dim. That
+// is only valid because batch is 1 at runtime — so collapsing the two onto the
+// lower-id `batch` silently rewrites every downstream sequence extent into a
+// batch extent. With batch == 1 and a one-token step the lie is invisible; it
+// only surfaces once a step is wider than one token (speculative verify), where
+// a kernel then rejects `4 vs 1` sequence dims.
+#[test]
+fn rank_mismatched_matmul_does_not_collapse_sequence_onto_batch() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let batch = graph.intern_symbol("batch_size");
+    let seq = graph.intern_symbol("sequence_length");
+    let total = graph.intern_symbol("total_sequence_length");
+    // [batch, seq, 2, 8] @ [batch, 8, total]
+    let lhs = graph.create_named_value(
+        "lhs",
+        DataType::Float32,
+        vec![
+            Dim::Symbolic(batch),
+            Dim::Symbolic(seq),
+            Dim::Static(2),
+            Dim::Static(8),
+        ],
+    );
+    let rhs = graph.create_named_value(
+        "rhs",
+        DataType::Float32,
+        vec![Dim::Symbolic(batch), Dim::Static(8), Dim::Symbolic(total)],
+    );
+    graph.add_input(lhs);
+    graph.add_input(rhs);
+    let out = graph.create_named_value("out", DataType::Float32, Shape::new());
+    graph.mark_value_shape_unknown(out);
+    graph.insert_node(node(0, "MatMul", vec![Some(lhs), Some(rhs)], vec![out]));
+    graph.add_output(out);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer rank-mismatched MatMul");
+
+    let shape = &graph.value(out).shape;
+    assert_eq!(
+        shape[0],
+        Dim::Symbolic(batch),
+        "the leading batch dim is unambiguous and must be preserved"
+    );
+    assert_eq!(shape[2..], [Dim::Static(2), Dim::Symbolic(total)]);
+    assert_ne!(
+        shape[1],
+        Dim::Symbolic(batch),
+        "the sequence axis must not be rewritten into the batch symbol"
+    );
+    assert!(
+        !unifies(&graph, batch, seq),
+        "batch and sequence_length must never be asserted equal, got {:?}",
         graph.symbol_unifications
     );
 }
