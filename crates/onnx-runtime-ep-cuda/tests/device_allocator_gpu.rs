@@ -337,6 +337,21 @@ fn an_allocator_for_the_wrong_device_is_refused() {
 /// The replacement is authoritative, so the arena it displaces stops existing.
 /// A pointer already handed out has to be released through the mechanism that
 /// produced it, so swapping underneath one would strand it.
+///
+/// # Why the buffer is released before the refused injection
+///
+/// `with_memory` takes `mut self`, so a *refused* injection still consumes the
+/// provider and drops it — the arena is torn down on the error path just as it
+/// is on the success path. Holding a live `DeviceBuffer` across that call
+/// therefore does not demonstrate "the provider is unchanged by the refusal";
+/// it tears the arena down underneath an outstanding pointer, and the later
+/// drop of that pointer is a teardown assertion or a use-after-free on a real
+/// device. With `mut self` there is no way to hold a provider across a failed
+/// `with_memory`, so this asserts what is actually true and actually safe: the
+/// mechanism that served the pointer is the one that releases it, and the
+/// refusal still fires afterwards because the guard's `served` counter is
+/// monotonic — `ep_allocations` is never decremented, so "has served memory"
+/// stays true after the buffer is returned.
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
@@ -348,12 +363,17 @@ fn injection_is_refused_once_the_live_mechanism_has_served_memory() {
     let provider = require_provider("the late-injection refusal check");
     let buffer = provider.allocate(4096, 256).expect("device memory");
 
+    // The original mechanism owns the pointer and is the one that releases it.
+    provider
+        .deallocate(buffer)
+        .expect("the mechanism that served the pointer can release it");
+
     let injected = Arc::new(ExternalEagerAllocator::new(require_context(
         "the late-injection refusal check",
     )));
     let error = provider
         .with_memory(Arc::clone(&injected) as Arc<dyn DeviceAllocator>)
-        .expect_err("a mechanism with memory outstanding cannot be replaced");
+        .expect_err("a mechanism that has served memory cannot be replaced");
     assert!(
         error.to_string().contains("cannot do so underneath"),
         "the refusal must explain what is outstanding: {error}"
@@ -363,12 +383,6 @@ fn injection_is_refused_once_the_live_mechanism_has_served_memory() {
         0,
         "a refused allocator must never have been used"
     );
-
-    // The provider is unchanged by the refusal: the original mechanism still
-    // owns the pointer and can still release it.
-    let provider = require_provider("the late-injection refusal check");
-    let _ = provider;
-    drop(buffer);
 }
 
 /// A zero-byte allocation reaches `deallocate` with the size it was allocated

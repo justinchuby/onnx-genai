@@ -330,8 +330,8 @@ allocator。这里有两条规则：
 | 项目 | 值 | 说明 |
 | --- | --- | --- |
 | 虚拟地址预留 | 64 GiB（standalone 路径） | 只占地址空间，不占显存 |
-| 物理 granularity | 2 MiB | driver 报告的最小映射单位；所有 commit 向上取整到它 |
-| 保留物理 handle 池 | 默认关闭；`ONNX_GENAI_CUDA_PHYSICAL_HANDLE_POOL_BYTES` 设为正整数字节数开启 | 池归 authority 所有；0 或无法解析视为未配置 |
+| 物理 granularity | 2 MiB | driver 报告的最小映射单位；所有 commit 向上取整到它。这不是能力探测：driver 拒绝查询或报告 0 时一律回退到 2 MiB，因此不支持 VMM 的设备由 `cuMemAddressReserve` 在构造时检出，而不是由它检出 |
+| 保留物理 handle 池 | standalone/plugin 路径与启用动态借还的 governor 路径默认开启，大小 256 MiB；未启用动态借还的 governor 路径仅在 `ONNX_GENAI_CUDA_PHYSICAL_HANDLE_POOL_BYTES` 为正整数字节数时开启 | 该环境变量是覆盖默认值而非开启池，所以在上述两条默认开启的路径上，不设置它也会保留显存。池归 authority 所有；0 或无法解析视为回退到该路径的默认值，而不是"大小为 0 的池" |
 | 拆除同步 | 释放 handle 前等待在途 stream 工作完成 | 见 `deferred_release` |
 | 设备丢失 | driver 报错向上传播，不重试、不静默丢弃 | |
 

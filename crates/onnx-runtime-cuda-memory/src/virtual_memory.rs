@@ -2076,6 +2076,17 @@ pub fn physical_pool_context_identity(context: &CudaContext) -> Result<usize, St
     Ok(current as usize)
 }
 
+/// The driver's recommended mapping granularity, or 2 MiB if it will not say.
+///
+/// # This is not a capability probe
+///
+/// A driver refusal and a reported zero are both replaced with 2 MiB rather
+/// than surfaced. That makes this function unsuitable as a "does this device
+/// support VMM?" check, and it is deliberately not used as one: the init-time
+/// detector is `cuMemAddressReserve` in `CudaVirtualBacking::reserve`, which
+/// propagates its failure through `check` with no fallback. Because both
+/// callers of this function come through here, a zero can never reach the
+/// arena builder's `granularity == 0` guard from the CUDA provider.
 fn allocation_granularity(device_ordinal: i32) -> usize {
     let prop = allocation_prop(device_ordinal);
     let mut granularity = 0usize;

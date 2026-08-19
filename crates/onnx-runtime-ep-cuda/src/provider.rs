@@ -405,8 +405,11 @@ fn vmm_unavailable(
          arena, which is this execution provider's only built-in device memory mechanism: \
          {error}.\nSupport boundary: the arena needs a CUDA driver whose virtual memory \
          management entry points (cuMemAddressReserve, cuMemCreate, cuMemMap, cuMemSetAccess) \
-         work on this device with a non-zero allocation granularity; devices and driver builds \
-         without them are not supported by the built-in mechanism.\nOptions: run on a device \
+         work on this device; devices and driver builds without them are not supported by the \
+         built-in mechanism. The unsupported case is detected at construction by \
+         cuMemAddressReserve, whose failure is propagated rather than absorbed; the \
+         allocation-granularity query is not a capability check, because a driver refusal or a \
+         reported zero is replaced with a 2 MiB default.\nOptions: run on a device \
          and driver that support CUDA VMM, or supply your own allocator — including an eager \
          cuMemAlloc one — through `CudaExecutionProvider::with_memory`, which is unchanged and \
          still honoured.{}",

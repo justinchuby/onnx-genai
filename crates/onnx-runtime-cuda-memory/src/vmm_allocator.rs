@@ -1158,6 +1158,11 @@ impl CudaVmmAllocator {
             None => backing,
         };
         let granularity = backing.granularity();
+        // Unreachable from the CUDA provider: `CudaVirtualBacking::granularity`
+        // resolves through `allocation_granularity`, which substitutes 2 MiB
+        // for a driver refusal or a reported zero. It is kept for `VirtualBacking`
+        // implementations that do report zero. The init-time capability
+        // detector for CUDA is the `reserve` call below.
         if granularity == 0 {
             return Err(invalid(
                 capacity,
@@ -2967,6 +2972,44 @@ mod tests {
             "a negative value must not wrap into an enormous bound"
         );
         assert_eq!(parse_physical_handle_pool_bytes(Some("")), None);
+    }
+
+    /// The public predicate is exactly "a retained-byte bound is configured",
+    /// with no surviving dependence on the deleted arena on/off flag.
+    ///
+    /// # Why this needs its own test
+    ///
+    /// `production_physical_pool_enabled` had no coverage at all: changing its
+    /// body to `true` survived every suite in the workspace, including the
+    /// engine's. Its meaning also *changed* in Phase 7 — it used to require the
+    /// now-deleted `ONNX_GENAI_CUDA_VMM` flag as well, so
+    /// `ONNX_GENAI_CUDA_PHYSICAL_HANDLE_POOL_BYTES` set on its own was ignored
+    /// and is now honoured. That change is deliberate and load-bearing: its
+    /// only consumer is `engine/load.rs`'s `uses_governed_physical_pool`, which
+    /// feeds `cuda_weight_startup_reservation`, and the arena now always
+    /// applies `physical_handle_pool_bytes().or(default)`. Leaving the
+    /// predicate gated on a flag that no longer exists would make the engine
+    /// mispredict whether an authority-owned pool is present.
+    ///
+    /// The expectation is computed from the parse helper pinned above rather
+    /// than restated, so this asserts the *composition* — that the predicate
+    /// asks the environment exactly one question and applies no second
+    /// condition to the answer.
+    ///
+    /// Scope, stated rather than assumed: nothing in this workspace calls
+    /// `set_var` for this variable, so it is absent when the suite runs and the
+    /// expectation is `false`, which is what kills a `true` body. A developer
+    /// who has exported the variable will still see this pass, because it
+    /// checks agreement rather than a fixed answer.
+    #[test]
+    fn the_production_pool_predicate_is_exactly_whether_a_bound_is_configured() {
+        let configured = std::env::var(CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV).ok();
+        assert_eq!(
+            production_physical_pool_enabled(),
+            parse_physical_handle_pool_bytes(configured.as_deref()).is_some(),
+            "the predicate must be the configured-bound question and nothing else; \
+             {CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV} is currently {configured:?}"
+        );
     }
 
     #[test]

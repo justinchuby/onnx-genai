@@ -704,13 +704,18 @@ As shipped:
   (`CudaDeviceAllocator`) and its selection flag (`ONNX_GENAI_CUDA_VMM`) are
   deleted, not deprecated.
 - **Unsupported means fail, not degrade.** The capability is exercised at
-  provider construction — `cuMemAddressReserve` for the reservation and the
-  driver's reported allocation granularity, both of which a device without
-  VMM support refuses. Failure returns an error naming the device ordinal, the
-  driver's own message, the specific driver entry points that constitute the
-  support boundary, any requested managed limit, and `with_memory` as the
-  supported way to supply a different mechanism. There is no second built-in
-  mechanism for it to fall back to.
+  provider construction by `cuMemAddressReserve`, which reserves the arena's
+  address range and whose failure `CudaVirtualBacking::reserve` propagates with
+  no fallback. That single call is the init-time detector: a device or driver
+  build without VMM support refuses it, and construction fails fatally. The
+  driver's reported allocation granularity is *not* a second detector —
+  `allocation_granularity` substitutes a 2 MiB default when the driver refuses
+  the query or reports zero, so the `granularity == 0` guard in the arena
+  builder is unreachable from the CUDA provider. Failure returns an error
+  naming the device ordinal, the driver's own message, the specific driver
+  entry points that constitute the support boundary, any requested managed
+  limit, and `with_memory` as the supported way to supply a different
+  mechanism. There is no second built-in mechanism for it to fall back to.
 - **Removing the built-in implementation did not remove the capability.**
   `DeviceAllocator` is unchanged, and CPU, injected and integration-boundary
   mechanisms continue to use it. A caller who needs eager `cuMemAlloc` — or any
@@ -731,8 +736,8 @@ are the first things worth knowing when diagnosing it.
 | Constraint | As shipped | Consequence |
 |---|---|---|
 | Virtual reservation | 64 GiB on the standalone/plugin path | Address space only; it does not reserve device memory. An arena cannot grow past it. |
-| Physical granularity | 2 MiB, as reported by the driver | Every commit rounds up to it, so the committed/useful ratio is worst for many small spans. A reported granularity of zero is treated as "VMM unsupported". |
-| Retained physical-handle pool | Off unless `ONNX_GENAI_CUDA_PHYSICAL_HANDLE_POOL_BYTES` is a positive byte count | The pool is owned by the governor's authority; adopting a governor whose authority does not match the pool's is an error. Zero or unparseable means "no pool", never "a pool of zero". |
+| Physical granularity | 2 MiB, as reported by the driver | Every commit rounds up to it, so the committed/useful ratio is worst for many small spans. This is not a capability probe: if the driver refuses the query or reports zero, 2 MiB is substituted, so an unsupported device is detected by `cuMemAddressReserve` and not here. |
+| Retained physical-handle pool | On at 256 MiB by default on the standalone/plugin path and on the governed path with dynamic lending; on the governed non-lending path, only when `ONNX_GENAI_CUDA_PHYSICAL_HANDLE_POOL_BYTES` is a positive byte count | The variable *overrides* the default rather than enabling a pool, so on the two default-on paths device memory is retained whether or not it is set. The pool is owned by the governor's authority; adopting a governor whose authority does not match the pool's is an error. Zero or unparseable means "fall back to the path default", never "a pool of zero". |
 | Teardown synchronization | In-flight stream work is awaited before physical handles are released | Provider drop can block. Releasing under in-flight work is what this ordering exists to prevent. |
 | Device loss | Driver errors propagate | No retry and no silent discard; a lost device surfaces as a failure rather than as memory that appears to have been freed. |
 

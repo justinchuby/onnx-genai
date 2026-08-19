@@ -20,6 +20,16 @@
 //!
 //! Naming them here means they are disclosed rather than hidden, and it means
 //! removing one is as visible as adding one.
+//!
+//! One scope note so the allowlist does not read broader than it is: it counts
+//! `malloc_sync`/`free_sync` call sites only. `cudnn/mod.rs:621` also reaches
+//! the device eagerly through `.alloc_zeros::<u8>(...)`, which is a third
+//! eager device allocation this scan does not count. It is pre-existing,
+//! untouched by Phase 7, and outside the `DeviceAllocator` seam, so criterion 2
+//! — which is about EP-managed allocation falling back to a built-in eager
+//! allocator — is unaffected by it. What the allowlist pins is the set of
+//! `malloc_sync`/`free_sync` sites, not "every eager device allocation in the
+//! EP".
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -102,12 +112,24 @@ fn count_code(root: &Path, needle: &str) -> BTreeMap<String, usize> {
     counts
 }
 
-/// The scan can see what it claims to see.
+/// Both scans can see what they claim to see.
 ///
 /// Every assertion below is of the form "this count is zero" or "this count is
 /// exactly N". Both are satisfied by a scanner that reads nothing at all, so
-/// the scanner is checked against a site that is known to exist before any of
+/// each scanner is checked against a site that is known to exist before any of
 /// them are believed.
+///
+/// `count` and `count_code` are pinned *separately* and on purpose. They are
+/// two helpers, so anchoring one says nothing about the other: replacing
+/// `count_code`'s comment filter with `.filter(|_line| false)` leaves a
+/// scanner that reads no lines at all, and every `count_code` assertion in
+/// this file is an `is_empty()` — all of which a blind scanner satisfies
+/// trivially. The `count` anchor below does not touch `count_code`, and
+/// `the_removal_stays_explained_in_prose_and_the_code_scan_can_tell_the_difference`
+/// does not anchor it either: it asserts `count` sees `ONNX_GENAI_CUDA_VMM`
+/// and `count_code` does not, and *both* of those stay true when `count_code`
+/// is blinded. So `count_code` gets its own positive assertion, against a
+/// needle that lives on a real code line right now.
 #[test]
 fn the_scan_can_observe_an_eager_call_site_that_is_known_to_exist() {
     let ep = crate_src("onnx-runtime-ep-cuda");
@@ -117,15 +139,27 @@ fn the_scan_can_observe_an_eager_call_site_that_is_known_to_exist() {
         "the scanner did not find the known eager site in runtime.rs, so nothing it reports \
          about the absence of other sites means anything: {allocs:?}"
     );
+    let memory = crate_src("onnx-runtime-cuda-memory");
     assert!(
-        count(
-            &crate_src("onnx-runtime-cuda-memory"),
-            "impl DeviceAllocator for"
-        )
-        .values()
-        .sum::<usize>()
+        count(&memory, "impl DeviceAllocator for")
+            .values()
+            .sum::<usize>()
             > 0,
         "the scanner found no allocator implementation in the memory crate at all"
+    );
+
+    // `CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV` is declared on a code line in
+    // `vmm_allocator.rs` and is not going away: it is the surviving pool-bound
+    // environment variable, and the shipped-constraints table documents it. A
+    // `count_code` that cannot find it is a `count_code` that cannot find
+    // anything, which would make every emptiness assertion in this file a
+    // statement about the helper rather than about the code.
+    let observable = count_code(&memory, "CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV");
+    assert!(
+        !observable.is_empty(),
+        "the code scan found no occurrence of a constant that is declared on a code line right \
+         now, so it is reading nothing and every `count_code(..).is_empty()` assertion below is \
+         vacuous: {observable:?}"
     );
 }
 
