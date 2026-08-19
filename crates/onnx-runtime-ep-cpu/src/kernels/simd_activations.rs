@@ -129,6 +129,25 @@ where
 /// two slices of equal length.
 type NarrowFn = unsafe fn(&[f32], &mut [u16]);
 
+/// End of the fused-narrow chunk starting at `start`, for a tensor of `n`.
+///
+/// Two properties matter, and both are about staying bit-identical to a single
+/// whole-tensor pass rather than about speed:
+///
+/// * **No short chunk.** `dispatch!` picks the scalar path for any slice below
+///   [`SIMD_MIN_LEN`], and scalar and vector are not bit-identical for the
+///   approximated kernels. A tensor of `NARROW_CHUNK + 16` elements split
+///   naively would run its last 16 elements scalar where one pass would have
+///   run them vectorised. So a trailing remainder below `SIMD_MIN_LEN` is
+///   absorbed into the chunk before it instead of becoming its own.
+/// * **Lane-aligned boundaries.** `NARROW_CHUNK` is a multiple of 8, so every
+///   boundary lands where the 8-wide vector run would have been anyway and the
+///   scalar remainder is the same `n % 8` elements either way.
+fn chunk_end(start: usize, n: usize) -> usize {
+    let end = (start + NARROW_CHUNK).min(n);
+    if n - end < SIMD_MIN_LEN { n } else { end }
+}
+
 /// Elements of `f32` scratch held between the kernel and the narrow when the
 /// two are fused.
 ///
@@ -184,8 +203,16 @@ where
     // Fuse the kernel and the narrow for a contiguous 16-bit output, the shape
     // every f16/bf16 activation lands in. Chunking keeps each intermediate in
     // L1 instead of writing a tensor-sized `f32` buffer out to memory and
-    // reading all of it back. The values are bit-identical to the unfused arm
-    // because the kernel is elementwise and the narrow sees the same f32 bits.
+    // reading all of it back.
+    //
+    // The result stays bit-identical to the unfused arm, but that takes more
+    // than the kernel being elementwise: `dispatch!` picks scalar or vector
+    // from the length of the slice it is handed, and the two are *not*
+    // bit-identical for the approximated kernels. So a chunk must never be
+    // shorter than `SIMD_MIN_LEN` unless it is the whole tensor, and every
+    // boundary must be a multiple of the 8-wide lane so the vector run lines
+    // up with where it would have fallen in one pass. `chunk_end` maintains
+    // both.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if also_read.is_empty() && n != 0 && out.is_contiguous() && out.numel() == n {
         use crate::dtype::{bf16x, f16c};
@@ -197,22 +224,37 @@ where
         };
         if let Some(narrow) = narrow {
             out.validate()?;
-            // SAFETY: a validated contiguous 16-bit float output addresses
-            // exactly `n` 2-byte elements, and `half::f16`/`half::bf16` are
-            // `repr(transparent)` over `u16`, so writing `u16` bit patterns is
-            // sound. Each chunk of `x` is consumed into `scratch` before the
-            // matching half of `dst` is written, so even an output that aliases
-            // `x` reads its input before it is overwritten.
-            let dst = unsafe { std::slice::from_raw_parts_mut(out.data_ptr_mut::<u16>(), n) };
-            let mut scratch = vec![0.0f32; NARROW_CHUNK.min(n)];
+            let out_ptr = out.data_ptr_mut::<u16>();
+            let out_bytes = (out_ptr as usize)..(out_ptr as usize + n * 2);
+            let x_bytes = slice_byte_range(x);
+            debug_assert!(
+                x_bytes.start >= out_bytes.end || out_bytes.start >= x_bytes.end,
+                "the fused narrow writes `out` while still reading `x`; widening \
+                 to f32 always allocates, so they must never overlap"
+            );
+            // SAFETY: a validated contiguous `Float16`/`BFloat16` output
+            // addresses exactly `n` 2-byte elements -- the dtype match is what
+            // makes the element width 16 bits -- and `half::f16`/`half::bf16`
+            // are `repr(transparent)` over `u16`, so writing `u16` bit patterns
+            // is sound. `dst` is disjoint from `x`: reaching a 16-bit output
+            // means `x` came from `to_dense_f32_widen`, which always allocates
+            // a fresh `Cow::Owned` buffer when it has to widen, so no live
+            // borrow of `out`'s storage can be in `x`. The `debug_assert` above
+            // is the tripwire for a future caller that breaks that.
+            let dst = unsafe { std::slice::from_raw_parts_mut(out_ptr, n) };
+            // The final chunk can absorb a short tail, so size for that.
+            let mut scratch = vec![0.0f32; (NARROW_CHUNK + SIMD_MIN_LEN).min(n)];
             // Serial for the same reason the unfused arm is: see `serial_scope`.
             serial_scope(|| {
-                for (src, dst) in x.chunks(NARROW_CHUNK).zip(dst.chunks_mut(NARROW_CHUNK)) {
-                    let mid = &mut scratch[..src.len()];
-                    f(src, mid);
+                let mut start = 0;
+                while start < n {
+                    let end = chunk_end(start, n);
+                    let mid = &mut scratch[..end - start];
+                    f(&x[start..end], mid);
                     // SAFETY: `available()` confirmed the ISA above, and the
                     // two slices are the same length by construction.
-                    unsafe { narrow(mid, dst) };
+                    unsafe { narrow(mid, &mut dst[start..end]) };
+                    start = end;
                 }
             });
             return Ok(());
@@ -4069,45 +4111,173 @@ mod tests {
     /// spans several chunks and ends mid-chunk — the case where an off-by-one
     /// in the chunk/`dst` pairing, a stale `scratch` tail, or a kernel that
     /// looked across lanes would all show up.
-    #[test]
-    fn fused_narrow_is_bit_identical_across_chunk_boundaries() {
-        let n = NARROW_CHUNK * 2 + 137;
-        assert!(
-            !n.is_multiple_of(NARROW_CHUNK),
-            "the test must end on a partial chunk"
-        );
-        // Straddle the interesting parts of each kernel's domain: the tanh
-        // saturation knees and erf's split boundary.
-        let src: Vec<f32> = (0..n).map(|i| (i as f32 - 8000.0) * 0.0037).collect();
+    /// An `x` at which the scalar and vector paths of `kernel` disagree *after*
+    /// narrowing to f16.
+    ///
+    /// A slice shorter than [`SIMD_MIN_LEN`] takes the scalar path and a longer
+    /// one takes the vector path; for the approximated kernels the two are not
+    /// bit-identical. Most of those f32 disagreements are washed out by f16
+    /// rounding, so the witness has to be checked in the same domain the test
+    /// asserts in, or the test proves nothing. Finding it at test time — rather
+    /// than hard-coding a constant a coefficient change could quietly retire —
+    /// is what makes the chunking test below non-vacuous by construction.
+    fn scalar_vector_divergence(kernel: fn(&[f32], &mut [f32])) -> Option<f32> {
+        let mut short_in = [0.0f32; 8];
+        let mut short_out = [0.0f32; 8];
+        let mut long_in = vec![0.0f32; SIMD_MIN_LEN * 4];
+        let mut long_out = vec![0.0f32; SIMD_MIN_LEN * 4];
+        let mut probe = |v: f32| {
+            short_in.fill(v);
+            long_in.fill(v);
+            kernel(&short_in, &mut short_out);
+            kernel(&long_in, &mut long_out);
+            half::f16::from_f32(short_out[0]).to_bits()
+                != half::f16::from_f32(long_out[0]).to_bits()
+        };
+        // Sweep every f32 outward from zero across the range the activation
+        // approximations actually bend in; f16 has resolution here, so a
+        // disagreement can survive the narrow.
+        for sign in [1.0f32, -1.0] {
+            let base = (0.001f32).to_bits();
+            for step in 0..200_000u32 {
+                let v = sign * f32::from_bits(base + step);
+                if v.abs() > 12.0 {
+                    break;
+                }
+                if probe(v) {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
 
+    /// A trailing chunk shorter than [`SIMD_MIN_LEN`] would take the scalar
+    /// path where a single whole-tensor pass runs the same elements vectorised,
+    /// and the two are not bit-identical. `chunk_end` absorbs such a tail into
+    /// the previous chunk; this pins that the output really is unchanged, using
+    /// an input value where the two paths are *known* to disagree so the test
+    /// cannot pass by luck.
+    #[test]
+    fn a_short_tail_does_not_fall_off_the_vector_path() {
+        let mut witnesses = 0;
         for (name, kernel) in [
             ("Tanh", tanh_f32_slice as fn(&[f32], &mut [f32])),
             ("Erf", erf_f32_slice as fn(&[f32], &mut [f32])),
             ("Sigmoid", sigmoid_f32_slice as fn(&[f32], &mut [f32])),
         ] {
-            let mut expected = vec![0.0f32; n];
-            kernel(&src, &mut expected);
+            let Some(v) = scalar_vector_divergence(kernel) else {
+                continue;
+            };
+            witnesses += 1;
+            for tail in [1usize, 8, 16, 31] {
+                let n = NARROW_CHUNK + tail;
+                // Only the tail carries the divergent value; the body is
+                // ordinary so a failure localises to the seam.
+                let mut src = vec![0.25f32; n];
+                src[n - tail..].fill(v);
 
-            let mut f16_out = Owned::f16(&[n], &vec![0.0f32; n]);
-            write_mapped(name, &mut f16_out.view_mut(), &src, kernel).unwrap();
-            for (i, (g, e)) in f16_out.to_u16_bits().iter().zip(&expected).enumerate() {
-                assert_eq!(
-                    *g,
-                    half::f16::from_f32(*e).to_bits(),
-                    "{name} f16 differs at {i} (x={})",
-                    src[i]
-                );
+                let mut expected = vec![0.0f32; n];
+                kernel(&src, &mut expected);
+
+                let mut got = Owned::f16(&[n], &vec![0.0f32; n]);
+                write_mapped(name, &mut got.view_mut(), &src, kernel).unwrap();
+                for (i, (g, e)) in got.to_u16_bits().iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        *g,
+                        half::f16::from_f32(*e).to_bits(),
+                        "{name} tail {tail}: fused != unfused at {i} of {n} (x={})",
+                        src[i]
+                    );
+                }
             }
+        }
+        assert!(
+            witnesses > 0,
+            "found no scalar/vector divergence at all, so this test proves nothing"
+        );
+    }
 
-            let mut bf16_out = Owned::bf16(&[n], &vec![0.0f32; n]);
-            write_mapped(name, &mut bf16_out.view_mut(), &src, kernel).unwrap();
-            for (i, (g, e)) in bf16_out.to_u16_bits().iter().zip(&expected).enumerate() {
-                assert_eq!(
-                    *g,
-                    half::bf16::from_f32(*e).to_bits(),
-                    "{name} bf16 differs at {i} (x={})",
-                    src[i]
+    #[test]
+    fn fused_narrow_is_bit_identical_across_chunk_boundaries() {
+        // A tail shorter than `SIMD_MIN_LEN` is the dangerous case: handed to
+        // the kernel on its own it would take the scalar path, while a single
+        // whole-tensor pass runs those same elements vectorised, and the two
+        // are not bit-identical. 137 is a long tail, 16 and 8 are short ones,
+        // and 8191 leaves a one-element remainder inside a full chunk.
+        for tail in [137usize, 31, 16, 8, 7, 1, 8191] {
+            let n = NARROW_CHUNK * 2 + tail;
+            // Straddle the interesting parts of each kernel's domain: the tanh
+            // saturation knees, erf's split boundary, and sigmoid's tail, where
+            // the scalar and vector approximations part company.
+            let src: Vec<f32> = (0..n).map(|i| (i as f32 - 8000.0) * 0.0037).collect();
+
+            for (name, kernel) in [
+                ("Tanh", tanh_f32_slice as fn(&[f32], &mut [f32])),
+                ("Erf", erf_f32_slice as fn(&[f32], &mut [f32])),
+                ("Sigmoid", sigmoid_f32_slice as fn(&[f32], &mut [f32])),
+            ] {
+                let mut expected = vec![0.0f32; n];
+                kernel(&src, &mut expected);
+
+                let mut f16_out = Owned::f16(&[n], &vec![0.0f32; n]);
+                write_mapped(name, &mut f16_out.view_mut(), &src, kernel).unwrap();
+                for (i, (g, e)) in f16_out.to_u16_bits().iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        *g,
+                        half::f16::from_f32(*e).to_bits(),
+                        "{name} f16 differs at {i} of {n} (tail {tail}, x={})",
+                        src[i]
+                    );
+                }
+
+                let mut bf16_out = Owned::bf16(&[n], &vec![0.0f32; n]);
+                write_mapped(name, &mut bf16_out.view_mut(), &src, kernel).unwrap();
+                for (i, (g, e)) in bf16_out.to_u16_bits().iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        *g,
+                        half::bf16::from_f32(*e).to_bits(),
+                        "{name} bf16 differs at {i} of {n} (tail {tail}, x={})",
+                        src[i]
+                    );
+                }
+            }
+        }
+    }
+
+    /// `chunk_end` is what keeps the kernel off the scalar path for a short
+    /// trailing remainder. Pin the two properties the bit-identity argument
+    /// rests on for every tensor size around a chunk boundary: no chunk is
+    /// both short and not the whole tensor, and no boundary falls off an
+    /// 8-wide lane.
+    #[test]
+    fn chunk_end_never_emits_a_short_trailing_chunk() {
+        let sizes = (1..80usize)
+            .chain([NARROW_CHUNK - 1, NARROW_CHUNK, NARROW_CHUNK + 1])
+            .chain((0..80).map(|i| NARROW_CHUNK + i))
+            .chain((0..80).map(|i| NARROW_CHUNK * 3 + i));
+        for n in sizes {
+            let mut start = 0;
+            let mut chunks = 0;
+            while start < n {
+                let end = chunk_end(start, n);
+                assert!(end > start, "n={n} made no progress at {start}");
+                let len = end - start;
+                assert!(
+                    len >= SIMD_MIN_LEN || (start == 0 && end == n),
+                    "n={n} chunk [{start},{end}) is short but not the whole tensor"
                 );
+                assert!(
+                    end == n || end.is_multiple_of(8),
+                    "n={n} boundary {end} is not lane-aligned"
+                );
+                assert!(
+                    len <= NARROW_CHUNK + SIMD_MIN_LEN,
+                    "n={n} chunk [{start},{end}) overruns the scratch"
+                );
+                start = end;
+                chunks += 1;
+                assert!(chunks < 16, "n={n} did not terminate");
             }
         }
     }
