@@ -23,9 +23,7 @@ fn gqa_shape_capacity_bound_enabled() -> bool {
             .as_deref()
             .map(str::trim)
             .map(str::to_ascii_lowercase)
-            .map_or(true, |v| {
-                !matches!(v.as_str(), "0" | "false" | "off" | "no")
-            })
+            .is_none_or(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no"))
     })
 }
 
