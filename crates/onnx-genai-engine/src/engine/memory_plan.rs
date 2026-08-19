@@ -80,6 +80,17 @@ pub(crate) enum Holder {
     /// Seeding that tier with the KV sub-budget instead was what stopped every
     /// other holder from joining it.
     FixedDeviceReservation,
+    /// The standing device pool held by a pipeline component session (a vision
+    /// encoder, say) that is loaded lazily alongside the decoder.
+    ///
+    /// These sessions build their own execution provider, so without a lease
+    /// their device memory is spent behind the ledger's back: the decoder's
+    /// governor keeps sizing its ceiling from a `measured_free` that silently
+    /// includes bytes another session on the same device already holds. Two
+    /// co-resident tenants each admitting against the whole card is how a
+    /// 3264-patch vision prefill drove a 30B decoder into `CUDA_ERROR_OUT_OF_MEMORY`
+    /// with the card genuinely full.
+    PipelineComponentPool,
 }
 
 impl Holder {
@@ -97,7 +108,8 @@ impl Holder {
     /// the variants are unconditional even when only one build configuration
     /// constructs them.
     #[allow(dead_code)]
-    pub(crate) const ALL: [Holder; 10] = [
+    pub(crate) const ALL: [Holder; 11] = [
+        Holder::PipelineComponentPool,
         Holder::KvPool,
         Holder::PipelineKvPool,
         Holder::DraftKvPool,
@@ -126,6 +138,7 @@ impl Holder {
             Holder::NativeKvCache => 8,
             Holder::Activations => 6,
             Holder::FixedDeviceReservation => 7,
+            Holder::PipelineComponentPool => 11,
         })
     }
 
@@ -143,6 +156,9 @@ impl Holder {
             Holder::NativeKvCache => MemoryRole::KvCache,
             Holder::Activations => MemoryRole::Activation,
             Holder::FixedDeviceReservation => MemoryRole::Weights,
+            // A standing pool the component keeps for as long as the session
+            // lives, not a per-step scratch buffer.
+            Holder::PipelineComponentPool => MemoryRole::Workspace { step_scoped: false },
         }
     }
 
@@ -159,6 +175,7 @@ impl Holder {
             Holder::NativeKvCache => "native decode KV tensors",
             Holder::Activations => "activations",
             Holder::FixedDeviceReservation => "fixed device reservation",
+            Holder::PipelineComponentPool => "pipeline component device pool",
         }
     }
 
@@ -184,7 +201,8 @@ impl Holder {
             // for a device session.
             | Holder::NativeKvCache
             | Holder::Activations
-            | Holder::FixedDeviceReservation => Tier::Device,
+            | Holder::FixedDeviceReservation
+            | Holder::PipelineComponentPool => Tier::Device,
         }
     }
 }

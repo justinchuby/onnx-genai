@@ -5794,6 +5794,191 @@ opset_import: {opset_imports}
     }
 }
 
+/// A chain of `depth` identical single-input nodes, `X -> t1 -> … -> Y`.
+///
+/// Depth is the axis that separates the two costs #1077 conflates. Whatever
+/// ORT charges per `Run` — session bookkeeping, fetch/feed marshalling — is
+/// paid once regardless of depth, while our per-node dispatch is paid `depth`
+/// times. Comparing depth 1, 10 and 100 against ORT therefore reads the
+/// per-node slope directly, instead of a single number in which the fixed and
+/// variable parts are indistinguishable.
+///
+/// `dynamic` leaves the row count symbolic, so ORT cannot fold shapes at
+/// session build and our shape inference runs for real on every `Run`. A
+/// dispatch path that is only fast on static shapes is not fast.
+fn chain_case(
+    name: &'static str,
+    op: &'static str,
+    depth: usize,
+    len: usize,
+    dynamic: bool,
+) -> MatmulFamilyCase {
+    assert!(depth >= 1, "a chain needs at least one node");
+    let dims = vec![1, len as i64];
+    let decl = |n: &str| -> String {
+        if dynamic {
+            format!(
+                "{{ name: \"{n}\" type {{ tensor_type {{ elem_type: {ELEM_F32} \
+                 shape {{ dim: [{{ dim_param: \"batch\" }}, {{ dim_value: {len} }}] }} }} }} }}"
+            )
+        } else {
+            textproto_value_info(n, ELEM_F32, &dims)
+        }
+    };
+    let nodes: Vec<String> = (0..depth)
+        .map(|i| {
+            let input = if i == 0 {
+                "X".to_owned()
+            } else {
+                format!("t{i}")
+            };
+            let output = if i + 1 == depth {
+                "Y".to_owned()
+            } else {
+                format!("t{}", i + 1)
+            };
+            format!("{{ input: [\"{input}\"] output: [\"{output}\"] op_type: \"{op}\" }}")
+        })
+        .collect();
+    let model = format!(
+        r#"ir_version: 10
+graph {{
+  node: [{}]
+  name: "{name}"
+  input: [{}]
+  output: [{}]
+}}
+opset_import: [{{ version: 17 }}]
+"#,
+        nodes.join(", "),
+        decl("X"),
+        decl("Y"),
+    );
+    let x = activation_f32(1, len);
+    MatmulFamilyCase {
+        name,
+        op,
+        model,
+        inputs: vec![GeneratedInput {
+            name: "X",
+            elem: ELEM_F32,
+            dims,
+            data: f32_slice_to_bytes(&x),
+        }],
+        output: "Y",
+        output_elem: ELEM_F32,
+        ort_can_build: true,
+        // A Relu chain is exact in both implementations; Identity is a copy.
+        // Anything above zero here would be hiding a real disagreement.
+        tolerance: 0.0,
+    }
+}
+
+/// A single small `MatMul`, `[1, k] x [k, n]`, with both operands supplied at
+/// run time.
+///
+/// The elementwise cases all have trivial kernels, which is what makes them
+/// good dispatch probes — but it also means a win there could be an artefact of
+/// how little work the kernel does. `MatMul` at these sizes still has a real
+/// kernel while staying small enough for dispatch to matter, so it is the case
+/// that says whether the fast path generalises beyond one-liners.
+///
+/// Both operands are runtime inputs rather than initializers, which keeps the
+/// weight out of the TextFormat source (an octal-escaped 1024x1024 f32 blob is
+/// megabytes of test fixture) and denies both sides any prepacking, so the
+/// comparison stays about dispatch.
+fn small_matmul_case(name: &'static str, k: usize, n: usize) -> MatmulFamilyCase {
+    let model = format!(
+        r#"ir_version: 10
+graph {{
+  node: [{{ input: ["X", "W"] output: ["Y"] op_type: "MatMul" }}]
+  name: "{name}"
+  input: [{}, {}]
+  output: [{}]
+}}
+opset_import: [{{ version: 17 }}]
+"#,
+        textproto_value_info("X", ELEM_F32, &[1, k as i64]),
+        textproto_value_info("W", ELEM_F32, &[k as i64, n as i64]),
+        textproto_value_info("Y", ELEM_F32, &[1, n as i64]),
+    );
+    MatmulFamilyCase {
+        name,
+        op: "MatMul",
+        model,
+        inputs: vec![
+            GeneratedInput {
+                name: "X",
+                elem: ELEM_F32,
+                dims: vec![1, k as i64],
+                data: f32_slice_to_bytes(&activation_f32(1, k)),
+            },
+            GeneratedInput {
+                name: "W",
+                elem: ELEM_F32,
+                dims: vec![k as i64, n as i64],
+                data: f32_slice_to_bytes(&activation_f32(k, n)),
+            },
+        ],
+        output: "Y",
+        output_elem: ELEM_F32,
+        ort_can_build: true,
+        tolerance: 1e-3,
+    }
+}
+
+/// The grid issue #1077 is closed against.
+///
+/// Every row isolates one variable. Read together they say where the remaining
+/// dispatch cost is; read individually none of them would.
+///
+/// * **`identity_1`** is the floor. An `Identity` node does a memcpy, so
+///   essentially everything the timer sees is the cost of getting there and
+///   back. If we are at parity anywhere, it has to be here first.
+/// * **`relu_1` / `relu_10` / `relu_100`** vary only depth, giving the
+///   per-node slope with the per-`Run` constant divided out.
+/// * **`*_dyn`** repeat the static rows with a symbolic batch dimension, so a
+///   fast path that only works when shapes are known at build time cannot pass
+///   unnoticed.
+/// * **`matmul_*`** check the result is not an artefact of trivial kernels.
+/// * The `4k` width keeps every kernel small enough that dispatch is a visible
+///   fraction; at 1 Mi it would be rounding error, which is the whole reason
+///   the earlier activation sweep could not answer this question.
+fn dispatch_grid_cases() -> Vec<MatmulFamilyCase> {
+    const W: usize = 4096;
+    const TINY: usize = 8;
+    vec![
+        chain_case("grid_identity_1_static", "Identity", 1, W, false),
+        chain_case("grid_identity_10_static", "Identity", 10, W, false),
+        chain_case("grid_relu_1_static", "Relu", 1, W, false),
+        chain_case("grid_relu_10_static", "Relu", 10, W, false),
+        chain_case("grid_relu_100_static", "Relu", 100, W, false),
+        chain_case("grid_identity_1_dyn", "Identity", 1, W, true),
+        chain_case("grid_relu_1_dyn", "Relu", 1, W, true),
+        chain_case("grid_relu_10_dyn", "Relu", 10, W, true),
+        chain_case("grid_relu_100_dyn", "Relu", 100, W, true),
+        // Dispatch-isolating widths. At W = 4096 a Relu node moves 32 KiB, and
+        // that traffic — not the dispatch around it — sets the per-node cost,
+        // so the ratio there reports elementwise throughput wearing a
+        // dispatch-shaped hat. At 8 elements the kernel is a single masked
+        // vector op and essentially everything left is overhead, which is what
+        // #1077 is actually about. The pair brackets it: TINY is the overhead
+        // floor, W the throughput regime.
+        chain_case("grid_relu_1_tiny", "Relu", 1, TINY, false),
+        chain_case("grid_relu_10_tiny", "Relu", 10, TINY, false),
+        chain_case("grid_relu_100_tiny", "Relu", 100, TINY, false),
+        // Depth 1000 pins the per-node slope: at depth 100 the fixed per-`Run`
+        // cost is still ~9% of the total, so a slope read from 1/10/100 alone
+        // carries the fixed term's noise into it. Ten times the nodes divides
+        // that contamination by ten.
+        chain_case("grid_relu_1000_tiny", "Relu", 1000, TINY, false),
+        chain_case("grid_relu_1_tiny_dyn", "Relu", 1, TINY, true),
+        chain_case("grid_relu_10_tiny_dyn", "Relu", 10, TINY, true),
+        small_matmul_case("grid_matmul_128x128", 128, 128),
+        small_matmul_case("grid_matmul_512x512", 512, 512),
+    ]
+}
+
 /// The elementwise grid `CPU_ACTIVATION_GAPS.md` is written against, as
 /// session-level cases.
 ///
@@ -6194,7 +6379,25 @@ fn plugin_path_ab_vs_plain_ort() {
     println!(
         "case,ours_p50_ms,ort_p50_ms,ratio_p50,ours_p90_ms,ort_p90_ms,ratio_p90,cold_ours_ms,cold_ort_ms"
     );
-    for case in matmul_bench_cases().into_iter().chain(unary_bench_cases()) {
+    // The #1077 grid is off by default: it is 11 more sessions, and the
+    // matmul/unary rows answer a different question (kernel throughput) than
+    // these do (dispatch overhead). `NXRT_MM_BENCH_GRID=1` adds them;
+    // `NXRT_MM_BENCH_GRID=only` runs them alone, which is what a dispatch
+    // measurement wants — nothing else resident, nothing else warming caches.
+    let grid = std::env::var("NXRT_MM_BENCH_GRID").unwrap_or_default();
+    let cases: Vec<MatmulFamilyCase> = match grid.as_str() {
+        "only" => dispatch_grid_cases(),
+        "1" => matmul_bench_cases()
+            .into_iter()
+            .chain(unary_bench_cases())
+            .chain(dispatch_grid_cases())
+            .collect(),
+        _ => matmul_bench_cases()
+            .into_iter()
+            .chain(unary_bench_cases())
+            .collect(),
+    };
+    for case in cases {
         if !filter.is_empty() && !case.name.contains(&filter) {
             continue;
         }
@@ -6265,6 +6468,31 @@ fn plugin_path_ab_vs_plain_ort() {
                     &values,
                     &output_name_ptrs,
                     warmup,
+                );
+            }
+
+            // Allocation attribution runs before the timed loop so its
+            // counter updates never land inside a measured iteration.
+            if run_ours
+                && let Some((buf, names)) = probe_dispatch(
+                    api,
+                    session,
+                    &input_name_ptrs,
+                    &values,
+                    &output_name_ptrs,
+                    64,
+                )
+            {
+                // Node count comes from ORT's assignment list, not from the
+                // case definition: per-node figures must divide by the nodes
+                // this EP actually received, and fusion means that is not the
+                // same as the number of `Run` callbacks.
+                report_probe(
+                    case.name,
+                    info.ops_on_our_ep().len().max(1),
+                    64,
+                    &buf,
+                    &names,
                 );
             }
 
@@ -7242,4 +7470,146 @@ fn the_native_activation_family_executes_locally_and_matches_ort_numerics() {
     eprintln!(
         "\n✅ the_native_activation_family_executes_locally_and_matches_ort_numerics: PASSED"
     );
+}
+
+/// Bucket names, read from the library rather than copied.
+///
+/// A hand-maintained copy of this list drifted from the enum and mislabelled
+/// two rows of the attribution table -- every number was right and attached to
+/// the wrong phase. Asking the cdylib removes the second source of truth.
+fn probe_phase_names(lib: &libloading::Library) -> Vec<String> {
+    // SAFETY: the export is `extern "C"` with this signature and returns either
+    // null or a 'static NUL-terminated string owned by the library.
+    unsafe {
+        let name_of: libloading::Symbol<
+            '_,
+            unsafe extern "C" fn(usize) -> *const std::os::raw::c_char,
+        > = match lib.get(b"nxrt_dispatch_probe_phase_name") {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for i in 0.. {
+            let p = name_of(i);
+            if p.is_null() {
+                break;
+            }
+            out.push(std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned());
+        }
+        out
+    }
+}
+
+const PROBE_EVENTS: &[&str] = &[
+    "OrtFfiCall",
+    "DispatchAlloc",
+    "NodeExecuted",
+    "ShapeInferred",
+    "OutputMaterialized",
+];
+
+/// Open the EP cdylib a second time to reach its probe exports.
+///
+/// ORT has already `dlopen`ed this exact path, so this returns a handle to the
+/// same image and therefore the same counters — the allocations recorded here
+/// are the ones made inside `Compute`, which an allocator installed in this
+/// test binary could never see.
+///
+/// `None` when the cdylib was built without the `dispatch_probe` feature, which
+/// is the normal case; the symbols simply are not there.
+fn probe_lib() -> Option<&'static libloading::Library> {
+    static LIB: std::sync::OnceLock<Option<libloading::Library>> = std::sync::OnceLock::new();
+    LIB.get_or_init(|| {
+        let path = cdylib_resolve::find_cpu_plugin_cdylib_optional()?;
+        // SAFETY: the path is the EP cdylib this harness already registered
+        // with ORT; re-opening it runs no new initialisers.
+        unsafe { libloading::Library::new(path) }.ok()
+    })
+    .as_ref()
+}
+
+/// Reset the probe, run `runs` iterations, and return the per-phase totals.
+///
+/// Returns `None` unless `NXRT_MM_BENCH_PROBE=1` and the cdylib exports the
+/// probe, so the default benchmark path is untouched.
+#[allow(clippy::too_many_arguments)]
+unsafe fn probe_dispatch(
+    api: *const ort::OrtApi,
+    session: *mut ort::OrtSession,
+    input_names: &[*const std::os::raw::c_char],
+    values: &[*const ort::OrtValue],
+    output_names: &[*const std::os::raw::c_char],
+    runs: usize,
+) -> Option<(Vec<u64>, Vec<String>)> {
+    if std::env::var("NXRT_MM_BENCH_PROBE").unwrap_or_default() != "1" {
+        return None;
+    }
+    let lib = probe_lib()?;
+    // SAFETY: both symbols are `extern "C"` exports of the loaded cdylib with
+    // exactly these signatures; a missing symbol returns `Err`.
+    unsafe {
+        let reset: libloading::Symbol<'_, unsafe extern "C" fn()> =
+            lib.get(b"nxrt_dispatch_probe_reset").ok()?;
+        let snapshot: libloading::Symbol<'_, unsafe extern "C" fn(*mut u64, usize) -> usize> =
+            lib.get(b"nxrt_dispatch_probe_snapshot").ok()?;
+        reset();
+        bench_runs(api, session, input_names, values, output_names, runs);
+        let buckets = probe_phase_names(lib).len();
+        assert!(buckets > 0, "cdylib exports no phase names");
+        let need = (buckets - 1) * 2 + buckets * 2 + PROBE_EVENTS.len();
+        let mut buf = vec![0u64; need];
+        let written = snapshot(buf.as_mut_ptr(), need);
+        assert_eq!(
+            written, need,
+            "probe wrote {written} u64s, this harness expected {need} \
+             — PROBE_EVENTS is out of sync with dispatch_probe"
+        );
+        Some((buf, probe_phase_names(lib)))
+    }
+}
+
+/// Print allocations and bytes per phase, normalised per `Run` and per node.
+fn report_probe(case: &str, nodes: usize, runs: usize, buf: &[u64], names: &[String]) {
+    let nb = names.len();
+    let np = nb - 1;
+    let (calls, ns) = (&buf[..np], &buf[np..2 * np]);
+    let (allocs, bytes) = (
+        &buf[2 * np..2 * np + nb],
+        &buf[2 * np + nb..2 * np + 2 * nb],
+    );
+    let events = &buf[2 * np + 2 * nb..];
+    let per_run = runs.max(1) as f64;
+    let per_node = (runs.max(1) * nodes.max(1)) as f64;
+    println!("# probe {case}: nodes={nodes} runs={runs}");
+    println!("# phase,calls_per_run,ns_per_run,allocs_per_run,allocs_per_node,bytes_per_run");
+    for (i, name) in names.iter().enumerate().take(np) {
+        println!(
+            "# {name},{:.2},{:.0},{:.3},{:.3},{:.0}",
+            calls[i] as f64 / per_run,
+            ns[i] as f64 / per_run,
+            allocs[i] as f64 / per_run,
+            allocs[i] as f64 / per_node,
+            bytes[i] as f64 / per_run,
+        );
+    }
+    // The unattributed bucket is the point of the table, not a footnote: it is
+    // what says whether the per-phase rows are the whole story.
+    println!(
+        "# {},,,{:.3},{:.3},{:.0}",
+        names[nb - 1],
+        allocs[nb - 1] as f64 / per_run,
+        allocs[nb - 1] as f64 / per_node,
+        bytes[nb - 1] as f64 / per_run,
+    );
+    let total: u64 = allocs.iter().sum();
+    let total_bytes: u64 = bytes.iter().sum();
+    println!(
+        "# TOTAL_attributed,,,{:.3},{:.3},{:.0}",
+        total as f64 / per_run,
+        total as f64 / per_node,
+        total_bytes as f64 / per_run
+    );
+    for (i, name) in PROBE_EVENTS.iter().enumerate() {
+        println!("# event {name},{:.3}/run", events[i] as f64 / per_run);
+    }
 }

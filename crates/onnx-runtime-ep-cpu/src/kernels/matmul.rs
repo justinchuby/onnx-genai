@@ -42,6 +42,7 @@ use super::half_gemm::{self, HalfFormat, MatrixLayout};
 use super::half_gemv;
 use super::weight_transpose::{self, WeightTransposeKey};
 use crate::backend::CpuBackend;
+use crate::dispatch_ledger;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::{next_index, numel};
 
@@ -49,7 +50,7 @@ use crate::strided::{next_index, numel};
 // file but included here so `kernels/mod.rs` needs no edit; it is an internal
 // perf detail of the MatMul hot path, not a new op.
 #[path = "x86_sgemm.rs"]
-mod x86_sgemm;
+pub(crate) mod x86_sgemm;
 
 // Native BF16×BF16→FP32 GEMM (`_mm512_dpbf16_ps`) for avx512_bf16 hosts. It is
 // runtime-detected and otherwise falls back to the portable blocked half GEMM.
@@ -1057,6 +1058,16 @@ pub(crate) fn gemm_with_backend(
     k: usize,
     n: usize,
 ) -> Result<()> {
+    dispatch_ledger::record_with(|| {
+        dispatch_ledger::Observation::gemm(
+            dispatch_ledger::KernelFamily::MatMulF32,
+            ledger_backend(backend),
+            "f32",
+            m,
+            n,
+            k,
+        )
+    });
     match backend {
         #[cfg(feature = "mlas")]
         CpuBackend::Mlas => {
@@ -1082,6 +1093,85 @@ pub(crate) fn gemm_with_backend(
             gemm_generic(a, b, c, m, k, n);
             Ok(())
         }
+    }
+}
+
+/// Whether a transposed-B ("NT") dense GEMM — `c[m,n] = a[m,k] @ b_nk[n,k]^T`,
+/// reading the weight in its natural `[n, k]` layout with no `[k, n]` copy — is
+/// available for `backend`. This is the single legality predicate shared by the
+/// MLAS and native `MatMulNBits` prefill routes (see [`gemm_nt_with_backend`]);
+/// keeping it in one place stops the two build configurations from drifting.
+pub(crate) fn nt_gemm_supported(backend: CpuBackend) -> bool {
+    match backend {
+        #[cfg(feature = "mlas")]
+        CpuBackend::Mlas => true,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        CpuBackend::SimdX86 => true,
+        _ => {
+            let _ = backend;
+            false
+        }
+    }
+}
+
+/// Transposed-B dense GEMM: `c[m,n] = a[m,k] @ b_nk[n,k]^T`, where `b_nk` is
+/// `[n, k]` row-major. **Bit-identical** to `gemm_with_backend(backend, a,
+/// b_kn, c, m, k, n)` on the `[k, n]` transpose `b_kn` of `b_nk`, for every
+/// backend [`nt_gemm_supported`] accepts — the property `MatMulNBits` prefill
+/// relies on to reuse its cached `[n, k]` dequant instead of building a
+/// transposed copy.
+///
+/// * `Mlas`: MLAS's cache-tiled SGEMM with `trans_b` (`ldb = k`) reads `b_nk`
+///   as the transposed operand directly.
+/// * `SimdX86`: the native NT SGEMM ([`x86_sgemm::sgemm_simd_nt`]), which packs
+///   the same B panels the NN path would and drives the same microkernel.
+///
+/// `backend` must satisfy [`nt_gemm_supported`]; callers gate on it, and an
+/// unsupported backend here is a caller bug rather than a runtime condition.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_nt_with_backend(
+    backend: CpuBackend,
+    a: &[f32],
+    b_nk: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<()> {
+    match backend {
+        #[cfg(feature = "mlas")]
+        CpuBackend::Mlas => {
+            // C[m, n] = A[m, k] * B_nk[n, k]^T. `trans_b` with `ldb = k` reads
+            // the Nk weight as the transposed operand without materializing a
+            // Kn copy.
+            mlas_sys::sgemm(false, true, m, n, k, 1.0, a, k, b_nk, k, 0.0, c, n);
+            Ok(())
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        CpuBackend::SimdX86 => {
+            x86_sgemm::sgemm_simd_nt(a, b_nk, c, m, k, n);
+            Ok(())
+        }
+        _ => {
+            // On a build with neither NT arm compiled in (e.g. aarch64 without
+            // `mlas`) none of the operands are read; bind them so the arch
+            // gating does not turn every parameter into an unused variable.
+            let _ = (a, b_nk, c, m, k, n);
+            Err(EpError::KernelFailed(format!(
+                "gemm_nt_with_backend called for backend {backend:?} without a transposed-B GEMM; \
+                 callers must gate on nt_gemm_supported"
+            )))
+        }
+    }
+}
+
+/// How a [`CpuBackend`] reads in the dispatch ledger: MLAS is the only variant
+/// whose arithmetic is not ours, and it only exists in a research build.
+pub(crate) fn ledger_backend(backend: CpuBackend) -> dispatch_ledger::Backend {
+    match backend {
+        #[cfg(feature = "mlas")]
+        CpuBackend::Mlas => dispatch_ledger::Backend::Mlas,
+        _ => dispatch_ledger::Backend::Native,
     }
 }
 
@@ -1264,8 +1354,21 @@ pub(crate) fn gemm_bt(
         gemm_bt_col_parallel(a, bt, c, m, k, n, threads);
         return Ok(());
     }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if threads > 1 && gemm_bt_prefers_packed(m, k, n) && gemm_bt_packed_mt_fits(m, k, threads) {
+        gemm_bt_panel_parallel(a, bt, c, m, k, n, threads);
+        return Ok(());
+    }
     let mc = if threads <= 1 {
-        MAX_MC.min(m)
+        // The packed kernel pays a per-panel pack that is repaid across the row
+        // bands sweeping it, so hand the single-threaded driver the whole row
+        // extent instead of capping at `MAX_MC` — one pack for `m` rows rather
+        // than `m.div_ceil(MAX_MC)` packs of 64 rows each.
+        if gemm_bt_prefers_packed(m, k, n) {
+            m
+        } else {
+            MAX_MC.min(m)
+        }
     } else {
         let target_tasks = threads.saturating_mul(2);
         let rows = m.div_ceil(target_tasks).clamp(1, MAX_MC);
@@ -1328,6 +1431,203 @@ fn gemm_bt_col_parallel(
     }
 }
 
+/// Raw pointer to `c` wrapped so Rayon can hand disjoint column panels to
+/// worker threads. Each panel writes a disjoint set of columns of every row, so
+/// no two tasks touch the same element — the `Send`/`Sync` impls are sound
+/// given that invariant, which [`gemm_bt_panel_parallel`] upholds. Same pattern
+/// and same argument as `x86_sgemm::CPtr`.
+#[cfg(not(feature = "mlas"))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+struct PanelCPtr(*mut f32);
+#[cfg(not(feature = "mlas"))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe impl Send for PanelCPtr {}
+#[cfg(not(feature = "mlas"))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe impl Sync for PanelCPtr {}
+#[cfg(not(feature = "mlas"))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+impl PanelCPtr {
+    /// Take `self` by value so a closure captures the whole wrapper rather than
+    /// its raw field, which is what the `Send`/`Sync` impls are written for.
+    #[inline]
+    fn as_ptr(self) -> *mut f32 {
+        self.0
+    }
+}
+
+/// Multi-threaded packed `gemm_bt`: the column panel is the unit of work, so
+/// each panel is packed exactly once by whichever thread owns it.
+///
+/// This is the single-threaded packed algorithm with its outer loop handed to
+/// the pool, and it is the multi-threaded packed path that measured well. The
+/// obvious alternative — pack a panel serially and parallelise the row bands
+/// under it — shares one pack across threads but pays a fork-join per panel and
+/// makes the pack a partly serial term; measured across
+/// `{phi35, qwen3, mixtral} x {96,148,256,365} rows x {2..32} threads` it lost
+/// to the unpacked driver at every panel width tried (geomean 0.61-1.04, worse
+/// the wider the pool). Distributing whole panels instead keeps the pack fully
+/// parallel and the sweep barrier-free.
+///
+/// Ownership of the panel buffer is per-worker and explicit:
+///
+/// * **Identity** — the buffer is created by `for_each_init`, so it belongs to
+///   one worker lane of one invocation. Nothing is shared between calls, cached,
+///   or held in a static, so concurrent sessions cannot collide.
+/// * **Capacity** — it is allocated once per lane at exactly `nc*k` and reused
+///   across the panels that lane draws, never regrown. A final short panel uses
+///   a prefix; the sweep is told how many micro-panels are live, so it never
+///   reads past it.
+/// * **No duplicate pack** — a lane packs only panels it owns, and panel
+///   indices are disjoint across lanes, so the total pack work is exactly
+///   `n16*k` element moves however many threads run. Reusing one buffer per
+///   lane is what keeps that true without allocating per panel.
+///
+/// Both remainders (`n % PNR` columns, `m % PMR` rows) are swept after the
+/// panels, in one parallel pass over output rows.
+#[cfg(not(feature = "mlas"))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn gemm_bt_panel_parallel(
+    a: &[f32],
+    bt: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    threads: usize,
+) {
+    use gemm_bt_avx2 as kern;
+    use rayon::prelude::*;
+    let pmr = kern::band_rows();
+    let pnr = kern::panel_stride();
+    let n16 = n - n % pnr;
+    let r6 = m - m % pmr;
+    let nc = gemm_bt_panel_width(k, n16, threads);
+    let panels = n16.div_ceil(nc);
+
+    let cp = PanelCPtr(c.as_mut_ptr());
+    (0..panels).into_par_iter().for_each_init(
+        || {
+            (
+                vec![0.0f32; nc * k],
+                crate::trace::worker_span("MatMul.gemm_bt.panel"),
+            )
+        },
+        |(packed, _span), pi| {
+            let c_ptr = cp.as_ptr();
+            let j0 = pi * nc;
+            let jend = (j0 + nc).min(n16);
+            // SAFETY: `available()` is checked by the caller. `bt` holds `n*k`
+            // floats and `jend <= n16 <= n`; `packed` is `nc*k` long and
+            // `jend - j0 <= nc`.
+            unsafe { kern::pack_panel(bt.as_ptr(), packed.as_mut_ptr(), k, j0, jend) };
+            // SAFETY: `a` holds `m*k` floats and `r6 <= m`. This task writes
+            // only columns `j0..jend` of `c`, which no other panel index
+            // covers, and the row and column remainders are swept afterwards,
+            // so the aliasing `PanelCPtr` allows is never realised.
+            unsafe {
+                kern::sweep_band(
+                    a.as_ptr(),
+                    packed.as_ptr(),
+                    c_ptr,
+                    r6,
+                    k,
+                    n,
+                    j0,
+                    (jend - j0) / pnr,
+                )
+            };
+        },
+    );
+
+    if n16 < n || r6 < m {
+        c.par_chunks_mut(n).enumerate().for_each(|(i, c_row)| {
+            // Rows the panels covered need only their column tail; rows past
+            // the band extent were never touched and need the whole row.
+            let start = if i < r6 { n16 } else { 0 };
+            if start < n {
+                // SAFETY: `available()` is checked by the caller. `a` holds
+                // `m*k` floats and `i < m`; `bt` holds `n*k`; `c_row` is this
+                // closure's exclusive row of `n` floats.
+                unsafe {
+                    kern::dot_row_tail(
+                        a.as_ptr().add(i * k),
+                        bt.as_ptr(),
+                        c_row.as_mut_ptr(),
+                        k,
+                        n,
+                        start,
+                    )
+                }
+            }
+        });
+    }
+}
+
+/// Panel width for [`gemm_bt_panel_parallel`]: wide enough to keep the pack
+/// amortised, narrow enough that there is a panel for every thread.
+///
+/// The single-threaded width is a pure cache choice — as much of `b` as fits
+/// beside the sweeping `a` band in a private L2. On a pool it is also the unit
+/// of parallelism, so a `b` that would be two L2-sized panels cannot occupy
+/// eight threads. Splitting `n16` evenly across the pool and taking whichever
+/// is narrower keeps both properties.
+#[cfg(not(feature = "mlas"))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn gemm_bt_panel_width(k: usize, n16: usize, threads: usize) -> usize {
+    let pnr = gemm_bt_avx2::panel_stride();
+    let cache = gemm_bt_avx2::panel_cols(k, n16, gemm_bt_avx2::PANEL_BYTES);
+    let even = (n16 / threads.max(1) / pnr) * pnr;
+    cache.min(even.max(pnr))
+}
+
+/// Whether this shape will reach the packed micro-kernel inside
+/// [`gemm_bt_block`]. Used by [`gemm_bt`] to widen the single-threaded row block
+/// so the pack is amortized once over the whole row extent; always `false` where
+/// the packed kernel does not exist (non-x86, or x86 without AVX2+FMA).
+#[cfg(not(feature = "mlas"))]
+fn gemm_bt_prefers_packed(rows: usize, k: usize, n: usize) -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        gemm_bt_avx2::available() && gemm_bt_avx2::packed_is_profitable(rows, k, n)
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        let _ = (rows, k, n);
+        false
+    }
+}
+
+/// Whether the multi-threaded packed driver is the right choice for this shape.
+///
+/// Two independent conditions, both measured on the
+/// `{phi35, qwen3, mixtral} x {96,148,256,365} rows x {2,4,8,16,32} threads`
+/// grid:
+///
+/// * **A band for every thread.** The unpacked driver slices `m` into `MR`-row
+///   blocks and can keep more threads busy on a short `m` than a `PMR`-row band
+///   sweep can, so packing there would trade a real loss (idle cores) for a
+///   speculative win.
+/// * **Enough `k` to amortise a panel.** Below `k = 2048` the packed path lost
+///   on that grid (`mixtral` `k=1024` at 0.90-1.02, `qwen3` `k=768` at
+///   0.59-1.09) while every `k >= 2048` shape won. The threshold is where one
+///   micro-panel reaches a quarter of the panel budget
+///   (`PANEL_BYTES / (PNR * 4 * 4)`): a short `k` makes each micro-panel cheap
+///   enough that the per-panel costs — the pack loop, the rayon task, the
+///   `nc*k` buffer — stop being amortised, and the unpacked kernel's strided
+///   `b` reads are already cache-resident at that size, so there is little left
+///   for the pack to buy. Admitting `k >= 1024` scored marginally better on the
+///   grid geomean (1.194 vs 1.177) but turned `mixtral`'s first GEMM into a
+///   consistent small loss, which is the wrong trade for a shape that is always
+///   on the critical path.
+#[cfg(not(feature = "mlas"))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn gemm_bt_packed_mt_fits(m: usize, k: usize, threads: usize) -> bool {
+    k >= gemm_bt_avx2::PANEL_BYTES / (gemm_bt_avx2::panel_stride() * 16)
+        && m / gemm_bt_avx2::band_rows() >= threads
+}
+
 /// Compute `c[rows,n] = a[rows,k] * bt[n,k]ᵀ` (overwrite) for one row block,
 /// dispatching to the AVX2+FMA kernel when the host supports it.
 #[cfg(not(feature = "mlas"))]
@@ -1340,9 +1640,13 @@ fn gemm_bt_block(a: &[f32], bt: &[f32], c: &mut [f32], rows: usize, k: usize, n:
         if gemm_bt_avx2::available() {
             // SAFETY: the branch proves the running CPU has AVX2+FMA. `a` is
             // `rows*k`, `bt` is `n*k`, `c` is `rows*n`, all row-major, so every
-            // pointer the kernel forms from `(rows, k, n)` is in bounds.
+            // pointer either kernel forms from `(rows, k, n)` is in bounds.
             unsafe {
-                gemm_bt_avx2::block(a.as_ptr(), bt.as_ptr(), c.as_mut_ptr(), rows, k, n);
+                if gemm_bt_avx2::packed_is_profitable(rows, k, n) {
+                    gemm_bt_avx2::block_packed(a.as_ptr(), bt.as_ptr(), c.as_mut_ptr(), rows, k, n);
+                } else {
+                    gemm_bt_avx2::block(a.as_ptr(), bt.as_ptr(), c.as_mut_ptr(), rows, k, n);
+                }
             }
             return;
         }
@@ -1553,6 +1857,271 @@ mod gemm_bt_avx2 {
             *c.add((i + 2) * n + j + 1) = s21;
             *c.add((i + 3) * n + j) = s30;
             *c.add((i + 3) * n + j + 1) = s31;
+        }
+    }
+
+    /// Rows per micro-tile in the packed kernel: six `a` rows are broadcast
+    /// against two `b` vectors, so twelve of the sixteen `ymm` registers hold
+    /// accumulators and the remaining four cover the two `b` loads plus the
+    /// rotating broadcast.
+    const PMR: usize = 6;
+    /// Columns per micro-tile in the packed kernel: two eight-lane vectors.
+    const PNR: usize = 16;
+    /// Target bytes for one packed `b` panel: sized to sit in a core's private
+    /// L2 alongside the `PMR`-row `a` band that sweeps against it. It is a
+    /// target, not a bound — one micro-panel is `PNR*k*4` bytes and the `nc`
+    /// floor below never goes narrower than that, so `k > 8192` overshoots the
+    /// budget. Real MoE `k` (≤ 6400 across the benchmarked experts) stays
+    /// inside it.
+    pub const PANEL_BYTES: usize = 512 * 1024;
+    /// Row bands a packed panel must be swept by before the pack pays for
+    /// itself. Packing a column panel costs `nc*k` strided element moves that
+    /// are repaid only across the `rows/PMR` bands that reuse it, so a row
+    /// block with too few bands pays the transpose and never earns it back.
+    ///
+    /// The value is chosen so that [`PACK_MIN_ROWS`] lands above `MAX_MC`,
+    /// which keeps the *row-block* driver — whose blocks would each re-pack the
+    /// same panel — on the unpacked path by construction, single- or
+    /// multi-threaded. Threads reach the packed kernel through
+    /// [`super::gemm_bt_panel_parallel`] instead, which hands whole column
+    /// panels to the pool so each is still packed exactly once.
+    const PACK_MIN_BANDS: usize = 12;
+    /// Fewest rows the packed kernel will accept, i.e. [`PACK_MIN_BANDS`] full
+    /// micro-tile bands.
+    ///
+    /// The gate is on the **row block**, not on `m`, and it deliberately sits
+    /// above [`super::MAX_MC`]. The row-block driver slices `m` into blocks
+    /// capped at `MAX_MC` and each block packs independently, so a block that
+    /// could pack would re-pack a panel its neighbours already built; keeping
+    /// the bar above that cap makes "the panel is packed once per sweep" a
+    /// structural property rather than a lucky one. The row-block driver
+    /// therefore reaches the packed kernel only single-threaded, where it is
+    /// handed the whole row extent and there are no neighbours. The
+    /// multi-threaded packed path is [`super::gemm_bt_panel_parallel`], which
+    /// is selected before the row-block driver and distributes whole column
+    /// panels, so no panel is packed twice there either.
+    const PACK_MIN_ROWS: usize = PMR * PACK_MIN_BANDS;
+    const _: () = assert!(
+        PACK_MIN_ROWS > super::MAX_MC,
+        "the packed kernel must stay out of the row-block driver's blocks, \
+         which are capped at MAX_MC and would each re-pack the same panel"
+    );
+
+    /// Whether the packed kernel is worth its pack cost for this shape.
+    #[inline]
+    pub fn packed_is_profitable(rows: usize, k: usize, n: usize) -> bool {
+        rows >= PACK_MIN_ROWS && n >= PNR && k >= 8
+    }
+
+    /// Columns per packed panel for this `k`, given a byte budget: a multiple of
+    /// [`PNR`], never wider than the tiled column extent `n16`, never narrower
+    /// than one micro-panel.
+    #[inline]
+    pub fn panel_cols(k: usize, n16: usize, panel_bytes: usize) -> usize {
+        let bytes_per_col = k.saturating_mul(4).max(1);
+        let mut nc = (panel_bytes / bytes_per_col / PNR) * PNR;
+        if nc < PNR {
+            nc = PNR;
+        }
+        if nc > n16 {
+            nc = n16;
+        }
+        nc
+    }
+
+    /// Rows per micro-tile band, exposed so drivers can cut row blocks on a
+    /// band boundary.
+    #[inline]
+    pub fn band_rows() -> usize {
+        PMR
+    }
+
+    /// Columns per packed micro-panel, exposed for the same reason.
+    #[inline]
+    pub fn panel_stride() -> usize {
+        PNR
+    }
+
+    /// Sweep one row block against an already-packed panel.
+    ///
+    /// `a` and `c` point at the block's own first row, so the caller may hand
+    /// over a sub-slice; `n` is still the full output row stride and `j0` the
+    /// panel's absolute first column. `rows` must be a multiple of [`PMR`] —
+    /// the caller owns the row remainder, because with a shared panel the
+    /// remainder is not per-block work.
+    ///
+    /// # Safety
+    /// AVX2+FMA available. `a` is valid for `rows*k` reads, `panel` for
+    /// `sub_panels*k*PNR` reads, and rows `0..rows`, columns
+    /// `j0..j0+sub_panels*PNR` of `c` (row stride `n`) are writable.
+    #[target_feature(enable = "avx2,fma")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn sweep_band(
+        a: *const f32,
+        panel: *const f32,
+        c: *mut f32,
+        rows: usize,
+        k: usize,
+        n: usize,
+        j0: usize,
+        sub_panels: usize,
+    ) {
+        unsafe {
+            let mut i = 0usize;
+            while i + PMR <= rows {
+                for s in 0..sub_panels {
+                    micro_6x16(a, panel.add(s * k * PNR), c, k, n, i, j0 + s * PNR);
+                }
+                i += PMR;
+            }
+        }
+    }
+
+    /// Fill columns `j0..n` of one output row with plain dot products.
+    ///
+    /// The shared-pack driver owns both remainders (the `n % PNR` column tail
+    /// and the `m % PMR` row tail) because with one panel shared by the pool
+    /// neither is per-block work; this is the unit it parallelises them over.
+    ///
+    /// # Safety
+    /// AVX2+FMA available. `a_row` is valid for `k` reads, `bt` for `n*k`
+    /// reads, and `c_row` for `n` writes.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn dot_row_tail(
+        a_row: *const f32,
+        bt: *const f32,
+        c_row: *mut f32,
+        k: usize,
+        n: usize,
+        j0: usize,
+    ) {
+        unsafe {
+            for j in j0..n {
+                *c_row.add(j) = dot(a_row, bt.add(j * k), k);
+            }
+        }
+    }
+
+    /// Copy `bt` rows `j0..jend` into micro-panel-major order:
+    /// `packed[s*k*PNR + p*PNR + t] = bt[(j0 + s*PNR + t)*k + p]`.
+    ///
+    /// The kernel then reads each micro-panel as one contiguous `k*PNR` run, so
+    /// the `b` side of the inner loop is two sequential cache lines per `k` step
+    /// instead of the `k`-strided gather the unpacked layout would force. This
+    /// is the only transpose in the path, it is bounded by the panel (not the
+    /// whole expert bank), and it is reused by every row band in the sweep.
+    ///
+    /// # Safety
+    /// `bt` is valid for `(jend)*k` reads; `packed` is valid for
+    /// `(jend - j0) * k` writes; `jend - j0` is a multiple of [`PNR`].
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn pack_panel(bt: *const f32, packed: *mut f32, k: usize, j0: usize, jend: usize) {
+        unsafe {
+            let sub_panels = (jend - j0) / PNR;
+            for s in 0..sub_panels {
+                let dst = packed.add(s * k * PNR);
+                for t in 0..PNR {
+                    let src = bt.add((j0 + s * PNR + t) * k);
+                    for p in 0..k {
+                        *dst.add(p * PNR + t) = *src.add(p);
+                    }
+                }
+            }
+        }
+    }
+
+    /// One `PMR x PNR` micro-tile against a packed `b` micro-panel.
+    ///
+    /// Unlike [`tile_4x2`], the SIMD lanes hold `c` columns rather than `k`
+    /// partials, so there is **no horizontal reduction at all** — the twelve
+    /// accumulators are stored straight out. Per `k` step the tile issues two
+    /// contiguous vector loads plus six broadcasts against twelve FMAs (1.5
+    /// FMAs per load, against `tile_4x2`'s 1.33), which is what closes the gap
+    /// to a packed-panel reference GEMM on prefill-shaped `m`.
+    ///
+    /// # Safety
+    /// AVX2+FMA available. Rows `i..i+PMR` of `a` (`a` is `_*k`) are readable,
+    /// `panel` is valid for `k*PNR` reads, and columns `j..j+PNR` of rows
+    /// `i..i+PMR` of `c` (`c` is `_*n`) are writable.
+    #[target_feature(enable = "avx2,fma")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn micro_6x16(
+        a: *const f32,
+        panel: *const f32,
+        c: *mut f32,
+        k: usize,
+        n: usize,
+        i: usize,
+        j: usize,
+    ) {
+        unsafe {
+            let mut acc = [_mm256_setzero_ps(); 12];
+            let a0 = a.add(i * k);
+            for p in 0..k {
+                let b0 = _mm256_loadu_ps(panel.add(p * PNR));
+                let b1 = _mm256_loadu_ps(panel.add(p * PNR + 8));
+                for r in 0..PMR {
+                    let av = _mm256_set1_ps(*a0.add(r * k + p));
+                    acc[2 * r] = _mm256_fmadd_ps(av, b0, acc[2 * r]);
+                    acc[2 * r + 1] = _mm256_fmadd_ps(av, b1, acc[2 * r + 1]);
+                }
+            }
+            for r in 0..PMR {
+                let row = c.add((i + r) * n + j);
+                _mm256_storeu_ps(row, acc[2 * r]);
+                _mm256_storeu_ps(row.add(8), acc[2 * r + 1]);
+            }
+        }
+    }
+
+    /// Packed-panel counterpart of [`block`], selected by
+    /// [`packed_is_profitable`].
+    ///
+    /// Loop order is column panel -> row band -> micro-panel, so one packed `b`
+    /// panel is built once and swept by every row band before it is evicted.
+    /// The row remainder (`rows % PMR`) and the column remainder (`n % PNR`) run
+    /// as full-`k` [`dot`]s, which is the same code the unpacked path uses for
+    /// its edges and needs no packing to be efficient.
+    ///
+    /// # Safety
+    /// AVX2+FMA available. `a` is valid for `rows*k` reads, `bt` for `n*k`
+    /// reads, and `c` for `rows*n` writes, all row-major.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn block_packed(
+        a: *const f32,
+        bt: *const f32,
+        c: *mut f32,
+        rows: usize,
+        k: usize,
+        n: usize,
+    ) {
+        unsafe {
+            let n16 = n - n % PNR;
+            let r6 = rows - rows % PMR;
+
+            let nc = panel_cols(k, n16, PANEL_BYTES);
+
+            let mut packed = vec![0.0f32; nc * k];
+            let mut j0 = 0usize;
+            while j0 < n16 {
+                let jend = (j0 + nc).min(n16);
+                pack_panel(bt, packed.as_mut_ptr(), k, j0, jend);
+                sweep_band(a, packed.as_ptr(), c, r6, k, n, j0, (jend - j0) / PNR);
+                j0 = jend;
+            }
+
+            // Column remainder for the rows the micro-tile covered.
+            for i in 0..r6 {
+                for j in n16..n {
+                    *c.add(i * n + j) = dot(a.add(i * k), bt.add(j * k), k);
+                }
+            }
+            // Row remainder, all columns.
+            for i in r6..rows {
+                for j in 0..n {
+                    *c.add(i * n + j) = dot(a.add(i * k), bt.add(j * k), k);
+                }
+            }
         }
     }
 
@@ -2762,6 +3331,7 @@ mod tests {
         // SEPARATE `MatMulKernel`/`MatMulPrepack`, each widening `B` into its own
         // `dense`. We instantiate both and sum their live bytes.
         let mut instances = 0u64;
+        let mut widened = 0u64;
         let mut actual = 0u64;
         for m in [4usize, 1usize] {
             let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.017).sin()).collect();
@@ -2772,15 +3342,25 @@ mod tests {
             kernel
                 .execute(&[a.view(), b.view()], &mut [out.view_mut()])
                 .unwrap();
+            // Decode (m == 1) on Apple silicon takes the FP16 GEMV, which reads
+            // the f16 weights directly and returns before `dense` is touched: it
+            // retains the 2-byte-per-element transposed-B memo instead of a
+            // widened 4-byte copy. Prefill has no such path, so the widening is
+            // unconditional there. Either way the weight must be retained once —
+            // a run that retains neither is the regression this guards.
+            let dense_filled = kernel.prepack.dense[1].is_filled();
+            let gemv_memo = kernel.prepack.transposed_b_f16.get().is_some();
             assert!(
-                kernel.prepack.dense[1].is_filled(),
-                "the constant f16 B must be widened into the governed cache at m={m}"
+                dense_filled || (m == 1 && gemv_memo),
+                "the constant f16 B must be retained at m={m}: widened into the \
+                 governed dense cache, or (decode only) as the f16 transposed-B memo"
             );
             assert!(
                 !kernel.prepack.dense[0].is_filled(),
                 "the contiguous f32 A is borrowed, never cached (m={m})"
             );
             actual += kernel.prepack.dense_live_bytes();
+            widened += u64::from(dense_filled);
             instances += 1;
         }
 
@@ -2790,10 +3370,25 @@ mod tests {
             "prefill + decode = two shape-keyed instantiations"
         );
         assert_eq!(
-            actual, predicted,
-            "predicted dense-cache bytes must equal the summed bytes actually \
-             held across all instantiations (ratio 1.00)"
+            actual,
+            (k as u64) * (n as u64) * 4 * widened,
+            "every instantiation that widens retains exactly one f32 copy"
         );
+        // The predictor budgets the widened worst case for every instantiation,
+        // so it is exact where all of them widen and conservative where a
+        // platform routes one away. Under-counting is the #1051 defect.
+        assert!(
+            actual <= predicted,
+            "predicted dense-cache bytes must never under-count the bytes \
+             actually held ({actual} held > {predicted} predicted)"
+        );
+        if widened == instances {
+            assert_eq!(
+                actual, predicted,
+                "predicted dense-cache bytes must equal the summed bytes actually \
+                 held across all instantiations (ratio 1.00)"
+            );
+        }
     }
 
     /// #1056 decline contract: when the cache is declined, a constant operand
@@ -6047,5 +6642,153 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// Deterministically exercise the packed `6×16` micro-kernel, its pack step,
+    /// its column-panel sweep and both of its remainders. Every shape here has
+    /// `rows >= PACK_MIN_ROWS`, which is what selects the packed path over the
+    /// `4×2` tile; the single-thread pool then widens the row block to the whole
+    /// `m` (the `native-threads=1` production path), so the pack really is built
+    /// once and swept by every band.
+    ///
+    /// The non-vacuity assertion matters more than usual here: the packed kernel
+    /// is chosen by a *shape predicate*, so if that predicate is ever retuned
+    /// these shapes could silently stop reaching the code under test and the
+    /// oracle comparison would keep passing against the unpacked kernel.
+    #[cfg(not(feature = "mlas"))]
+    #[test]
+    fn gemm_bt_packed_kernel_matches_naive_single_threaded() {
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (72, 64, 16),  // 12 row bands x 1 micro-panel, no remainder at all
+            (72, 64, 32),  // two micro-panels
+            (73, 64, 17),  // 1 leftover row, 1 leftover column
+            (77, 71, 33),  // 5 leftover rows, 1 leftover column, k tail 7
+            (72, 8, 16),   // shortest k the predicate admits
+            (72, 9, 16),   // k tail of 1
+            (78, 128, 96), // 13 bands x 6 micro-panels
+            // Large `k` shrinks the panel width, so these cross several column
+            // panels - the loop that makes the pack pay for itself.
+            (80, 2000, 160), // multiple full column panels
+            (85, 2001, 163), // multi-panel, short final panel, both remainders
+            (100, 512, 80),  // wider row extent than the MAX_MC row block
+        ];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            for &(m, k, n) in SHAPES {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                assert!(
+                    !gemm_bt_avx2::available() || gemm_bt_prefers_packed(m, k, n),
+                    "shape {m}x{k}x{n} no longer reaches the packed kernel: \
+                     this test would be measuring the unpacked path"
+                );
+                let mut ra = lcg_stream(0x0BAD_F00D ^ (m as u32));
+                let mut rb = lcg_stream(0xDEAD_BEEF ^ (n as u32));
+                let a: Vec<f32> = (0..m * k).map(|_| ra()).collect();
+                let bt: Vec<f32> = (0..n * k).map(|_| rb()).collect();
+                let want = naive_bt(&a, &bt, m, k, n);
+                let mut got = vec![f32::NAN; m * n];
+                gemm_bt(&a, &bt, &mut got, m, k, n).unwrap();
+                for (idx, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 1e-3,
+                        "packed shape {m}x{k}x{n} index {idx}: got {g}, want {w}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// The multi-threaded packed driver: whole column panels distributed over a
+    /// real pool, each packed exactly once by the lane that owns it.
+    ///
+    /// Every shape here is asserted to reach that driver rather than the
+    /// row-block one, at every thread count, so a gate change that quietly
+    /// routes them elsewhere fails the test instead of hollowing it out. The
+    /// shapes cover both remainders the driver owns (`n % 16` columns and
+    /// `m % 6` rows), one-panel and many-panel column extents, panel counts
+    /// both above and below the thread count, and `k` values with a tail.
+    ///
+    /// Every `k` is at or above the gate's threshold, which is what the
+    /// production MoE experts look like; the row-block driver's own test covers
+    /// the short-`k` shapes that this gate deliberately sends there.
+    #[test]
+    #[cfg(not(feature = "mlas"))]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    fn gemm_bt_packed_mt_matches_naive_across_thread_counts() {
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (72, 2048, 16),  // 12 bands x 1 micro-panel, one panel, no remainder
+            (73, 2048, 17),  // 1 leftover row, 1 leftover column
+            (95, 2049, 33),  // 5 leftover rows, 1 leftover column, k tail 1
+            (192, 2048, 48), // 32 bands x 3 micro-panels
+            (144, 4096, 64), // narrower panels, so several of them
+            (205, 2053, 51), // both remainders, k tail 5
+            (121, 2048, 85), // short final panel, both remainders
+            (96, 2048, 147), // short final panel at two of the widths below
+            (96, 2048, 163), // short final panel at two more
+            (74, 2048, 48),  // row remainder with no column remainder
+        ];
+        const THREADS: &[usize] = &[2, 3, 4, 8];
+        // The panel width is derived from the column extent and the thread
+        // count, so a shape list that happens to divide evenly at every width
+        // would leave the short-final-panel path untested. Pin that it does
+        // not.
+        assert!(
+            SHAPES
+                .iter()
+                .any(|&(m, _, n)| n % 16 == 0 && m % 6 != 0 && m / 6 >= *THREADS.last().unwrap()),
+            "no shape has a row remainder without a column remainder: the \
+             remainder pass would be reached for the wrong reason"
+        );
+        assert!(
+            !gemm_bt_avx2::available()
+                || THREADS.iter().any(|&t| {
+                    SHAPES.iter().any(|&(m, k, n)| {
+                        let n16 = n - n % 16;
+                        m / 6 >= t && n16 % gemm_bt_panel_width(k, n16, t) != 0
+                    })
+                }),
+            "no shape leaves a short final column panel at any tested thread \
+             count: the driver's last-panel path would go unexercised"
+        );
+        for &threads in THREADS {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for &(m, k, n) in SHAPES {
+                    if m / 6 < threads {
+                        continue; // too few bands to fill this pool by design
+                    }
+                    assert!(
+                        !gemm_bt_avx2::available()
+                            || (gemm_bt_prefers_packed(m, k, n)
+                                && gemm_bt_packed_mt_fits(m, k, threads)),
+                        "shape {m}x{k}x{n} at {threads} threads no longer reaches \
+                         the multi-threaded packed driver: this test would be \
+                         measuring the row-block path"
+                    );
+                    let mut ra = lcg_stream(0x51DE_51DE ^ (m as u32));
+                    let mut rb = lcg_stream(0xC0FF_EE00 ^ (n as u32));
+                    let a: Vec<f32> = (0..m * k).map(|_| ra()).collect();
+                    let bt: Vec<f32> = (0..n * k).map(|_| rb()).collect();
+                    let want = naive_bt(&a, &bt, m, k, n);
+                    let mut got = vec![f32::NAN; m * n];
+                    gemm_bt(&a, &bt, &mut got, m, k, n).unwrap();
+                    for (idx, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                        assert!(
+                            (g - w).abs() <= 1e-3,
+                            "packed MT {m}x{k}x{n} at {threads} threads, \
+                             index {idx} (row {}, col {}): got {g}, want {w}",
+                            idx / n,
+                            idx % n
+                        );
+                    }
+                }
+            });
+        }
     }
 }

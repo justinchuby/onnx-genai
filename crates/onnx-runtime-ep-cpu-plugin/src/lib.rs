@@ -10,6 +10,19 @@
 use onnx_runtime_ep_cpu::{CpuExecutionProvider, build_cpu_registry_with_descriptors};
 use onnx_runtime_ep_plugin::ep::KernelRegistryEntry;
 
+// Attribute this library's allocations to whichever dispatch phase is open.
+//
+// It has to live here rather than in the harness: ORT `dlopen`s this cdylib, so
+// it has its own global allocator, and an allocator installed in the test
+// binary never sees an allocation made inside a `Compute` callback. The harness
+// reads the totals back through `nxrt_dispatch_probe_snapshot`.
+//
+// Off unless the `dispatch_probe` feature is on, which no shipped build sets.
+#[cfg(feature = "dispatch_probe")]
+#[global_allocator]
+static PROBE_ALLOC: onnx_runtime_ep_plugin::dispatch_probe::CountingAllocator<std::alloc::System> =
+    onnx_runtime_ep_plugin::dispatch_probe::CountingAllocator::new(std::alloc::System);
+
 /// Build `KernelRegistryEntry` slices from the CPU EP's real registry.
 ///
 /// Each entry's `supported_dtypes` is derived from the kernel's actual dispatch

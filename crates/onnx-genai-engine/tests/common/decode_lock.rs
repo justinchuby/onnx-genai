@@ -116,6 +116,42 @@ pub fn assert_native_matches_golden(
     Ok(())
 }
 
+/// Like [`assert_native_matches_golden`], but pins CUDA-graph capture OFF
+/// (`ONNX_GENAI_CUDA_GRAPH=0`) so the golden is captured/checked on the eager
+/// native CUDA decode path. Used by exports whose graph shape cannot yet be
+/// capture-planned (e.g. the composed Gemma-3n text export, whose merged
+/// present-KV sequence axis is an opaque symbol the prefill workspace planner
+/// cannot upper-bound), while the fused decode kernels themselves are exercised
+/// identically in eager mode. The greedy stream is capture-independent (same
+/// kernels, same reduction order), so this is a faithful lock of the decode
+/// math including any wide (head_dim > 256) attention layers.
+#[allow(dead_code)]
+pub fn assert_native_matches_golden_eager(
+    model_dir_env: &str,
+    prompt: &str,
+    expected_tokens: &[u32],
+) -> anyhow::Result<()> {
+    let Some(model_dir) = cuda_model_dir(model_dir_env) else {
+        return Ok(());
+    };
+    unsafe {
+        std::env::set_var("ONNX_GENAI_CUDA_GRAPH", "0");
+    }
+    let native = generate(
+        &model_dir,
+        EngineDecodeBackend::Native,
+        Some(NativeDecodeDevice::Cuda { index: Some(0) }),
+        DecodePrecision::Model,
+        prompt,
+        expected_tokens.len(),
+    )?;
+    assert_eq!(
+        native, expected_tokens,
+        "{model_dir_env} native CUDA (eager) greedy sequence drifted from its golden lock"
+    );
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub fn assert_native_long_context_eager_and_capture_match_prefix(
     model_dir_env: &str,
@@ -167,6 +203,48 @@ pub fn assert_native_long_context_eager_and_capture_match_prefix(
     assert_eq!(
         captured, eager,
         "{model_dir_env} native CUDA long-context capture diverged from eager"
+    );
+    Ok(())
+}
+
+/// Regression guard for the decode KV-bucket-growth workspace abort (Bug 1):
+/// generate `token_count` tokens from a short (single-token-bucket) prompt with
+/// the DEFAULT KV configuration and assert generation completes without the
+/// governed-workspace invariant abort (`workspace invariant mismatch` /
+/// `required > prepared`).
+///
+/// The KV capacity grows in powers of two (256, 512, 1024, …). Before the
+/// rebucket re-prepare fix, the single-token decode step grew the KV bucket via
+/// `ensure_capacity` but never re-sized the persistent `::Attention` fp32 score
+/// scratch (`batch·q_heads·q_seq·total_seq·4`), so the first execute past a
+/// power-of-two boundary needed exactly 2× the reserved workspace and hit the
+/// strict prepared-workspace invariant. Generating past the first boundary
+/// (256) from a short prompt is the minimal reproduction; a token_count of 320
+/// crosses 256→512 with margin.
+#[allow(dead_code)]
+pub fn assert_generation_completes(
+    model_dir_env: &str,
+    prompt: &str,
+    token_count: usize,
+) -> anyhow::Result<()> {
+    let Some(model_dir) = cuda_model_dir(model_dir_env) else {
+        return Ok(());
+    };
+    let tokens = generate(
+        &model_dir,
+        EngineDecodeBackend::Native,
+        Some(NativeDecodeDevice::Cuda { index: Some(0) }),
+        DecodePrecision::Model,
+        prompt,
+        token_count,
+    )?;
+    assert_eq!(
+        tokens.len(),
+        token_count,
+        "{model_dir_env} native CUDA generation returned {} of {token_count} tokens \
+         (a short return means generation aborted mid-stream, e.g. the decode \
+         KV-bucket-growth workspace invariant abort)",
+        tokens.len(),
     );
     Ok(())
 }

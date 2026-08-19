@@ -586,6 +586,87 @@ mod tests {
         }
     }
 
+    /// Concurrent tasks reconstructing `&mut` slices from one shared base must
+    /// retag **only their own range**.
+    ///
+    /// This lives in the lib, not beside the fan-out benchmark that actually
+    /// uses the shape, because CI's Miri lane runs
+    /// `-p onnx-runtime-ep-cpu --lib task_runtime::` — integration tests under
+    /// `tests/` are never checked. #1377 shipped a whole-row retag in
+    /// `tests/task_runtime_latency.rs` and it survived precisely because
+    /// nothing under Miri exercised the pattern. Fixing that instance without
+    /// putting the shape under Miri would leave the same gap open for the next
+    /// one.
+    ///
+    /// **Falsifier.** Widen the `from_raw_parts_mut` below to the whole row and
+    /// index `[start..end]` afterwards:
+    ///
+    /// ```ignore
+    /// let all = unsafe { std::slice::from_raw_parts_mut(base.as_ptr(), WIDTH) };
+    /// for slot in &mut all[start..end] { *slot += 1; }
+    /// ```
+    ///
+    /// and this test fails under Stacked Borrows. The *stores* stay disjoint —
+    /// what conflicts is the retag, which claims all of `WIDTH` in every task,
+    /// so each task pops the previous task's tag. The rendezvous below is what
+    /// makes that deterministic rather than a matter of interleaving luck: it
+    /// holds every task's reference live at the same time before any of them
+    /// writes.
+    #[test]
+    fn concurrent_tasks_retag_only_their_own_range() {
+        if testing::pool_width() < 2 {
+            // Nothing to alias against on a single-lane pool.
+            return;
+        }
+        const WIDTH: usize = 16;
+        // Small and spin-bounded: this runs under Miri, which is ~2 orders of
+        // magnitude slower and would otherwise dominate the lane's runtime.
+        const SPIN_LIMIT: u32 = 10_000;
+
+        let mut row = vec![0u64; WIDTH];
+        let base = SendMutPtr(row.as_mut_ptr());
+        let live = AtomicUsize::new(0);
+
+        let backend = for_each_range(WIDTH, 1, |start, end| {
+            // SAFETY: `for_each_range` visits `start..end` in exactly one task,
+            // so narrowing before the retag makes this `&mut` unique for its
+            // lifetime. This is the same shape `parallel_output_rows_repeated`
+            // uses in production.
+            let slots =
+                unsafe { std::slice::from_raw_parts_mut(base.as_ptr().add(start), end - start) };
+
+            // Publish that this task holds its reference, then wait for company
+            // so several retags are live simultaneously. Bounded, so a pool that
+            // ran the body serially still finishes instead of hanging.
+            live.fetch_add(1, Ordering::AcqRel);
+            for _ in 0..SPIN_LIMIT {
+                if live.load(Ordering::Acquire) >= 2 {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+
+            for slot in slots {
+                *slot += 1;
+            }
+        });
+
+        // Self-check: a canary that silently degrades to one serial task would
+        // pass whether or not the retag is correct. Under Miri that is the
+        // default outcome unless `-Zmiri-num-cpus` is set, which is exactly how
+        // #1377's whole-row retag survived a lane that claimed to cover this
+        // module. Assert the fan-out actually happened.
+        assert!(
+            matches!(backend, Backend::Native),
+            "expected a real fan-out, got {backend:?}; with pool_width \u{003e}= 2 this test \
+             must not degenerate to a single task or it stops checking anything"
+        );
+        assert!(
+            row.iter().all(|&visits| visits == 1),
+            "every slot must be written exactly once: {row:?}"
+        );
+    }
+
     #[test]
     fn a_large_fanout_uses_the_native_pool_and_more_than_one_thread() {
         if testing::pool_width() < 2 {

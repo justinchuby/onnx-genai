@@ -1202,3 +1202,53 @@ fn cumsum_exclusive_reverse_matrix_with_negative_axis() {
         assert_eq!(f32s(&out[0]), expected);
     }
 }
+
+// Locks the int64 block-per-lane cumsum path (used at decode when `lanes` is too
+// few to saturate the device, e.g. a batch-1 `position_ids` cumsum) against a
+// serial reference. Width 1000 > BLOCK(256) forces the multi-tile cooperative
+// scan with a running per-block base; lanes == 1 forces the block path. All
+// four (exclusive, reverse) combinations must be byte-identical to the serial
+// walk — integer addition is associative, so the parallel scan cannot diverge.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn cumsum_i64_block_path_matches_serial_reference() {
+    let width = 1000_usize;
+    let input: Vec<i64> = (0..width as i64).map(|n| (n % 7) - 3).collect();
+    for exclusive in [0_i64, 1] {
+        for reverse in [0_i64, 1] {
+            let mut expected = vec![0_i64; width];
+            let mut total = 0_i64;
+            for n in 0..width {
+                let d = if reverse == 1 { width - 1 - n } else { n };
+                if exclusive == 1 {
+                    expected[d] = total;
+                    total = total.wrapping_add(input[d]);
+                } else {
+                    total = total.wrapping_add(input[d]);
+                    expected[d] = total;
+                }
+            }
+            let out = run(
+                "CumSum",
+                11,
+                &[
+                    tensor(DataType::Int64, &[1, width], &input),
+                    tensor(DataType::Int64, &[], &[1_i64]),
+                ],
+                &[(DataType::Int64, vec![1, width])],
+                &[
+                    ("exclusive", Attribute::Int(exclusive)),
+                    ("reverse", Attribute::Int(reverse)),
+                ],
+            );
+            assert_eq!(
+                i64s(&out[0]),
+                expected,
+                "block cumsum mismatch (exclusive={exclusive}, reverse={reverse})"
+            );
+        }
+    }
+}
