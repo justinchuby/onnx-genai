@@ -25,6 +25,7 @@
 
 use std::ffi::c_void;
 
+use crate::inline_vec::{INLINE_RANK, InlineVec, contiguous_strides};
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::tensor::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, DeviceId};
@@ -73,8 +74,8 @@ pub(crate) fn validate_dims(
     dims: &[i64],
     dtype: DataType,
     context: std::fmt::Arguments<'_>,
-) -> Result<(Vec<usize>, usize, usize), String> {
-    let mut shape: Vec<usize> = Vec::with_capacity(dims.len());
+) -> Result<(InlineVec<usize, INLINE_RANK>, usize, usize), String> {
+    let mut shape = InlineVec::<usize, INLINE_RANK>::with_capacity(dims.len());
     for (dim_idx, &d) in dims.iter().enumerate() {
         if d < 0 {
             return Err(format!(
@@ -89,7 +90,10 @@ pub(crate) fn validate_dims(
     let element_count: usize = shape
         .iter()
         .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-        .ok_or_else(|| format!("{context} shape {shape:?} overflows usize in element count"))?;
+        .ok_or_else(|| {
+            let shape = shape.as_slice();
+            format!("{context} shape {shape:?} overflows usize in element count")
+        })?;
 
     let byte_size = dtype.byte_size();
     let expected_bytes = element_count.checked_mul(byte_size).ok_or_else(|| {
@@ -108,8 +112,8 @@ pub(crate) fn validate_dims(
 pub(crate) struct OwnedInput {
     pub data_ptr: *const c_void,
     pub dtype: DataType,
-    pub shape: Vec<usize>,
-    pub strides: Vec<i64>,
+    pub shape: InlineVec<usize, INLINE_RANK>,
+    pub strides: InlineVec<i64, INLINE_RANK>,
 }
 
 impl OwnedInput {
@@ -129,8 +133,8 @@ impl OwnedInput {
 pub(crate) struct OwnedOutput {
     pub data_ptr: *mut c_void,
     pub dtype: DataType,
-    pub shape: Vec<usize>,
-    pub strides: Vec<i64>,
+    pub shape: InlineVec<usize, INLINE_RANK>,
+    pub strides: InlineVec<i64, INLINE_RANK>,
     /// Memory info ORT placed this output on. For a boundary GPU node ORT
     /// places the output on the device, so this is a *valid device*
     /// `OrtMemoryInfo` the executor can reuse to allocate staging scratch for
@@ -212,8 +216,8 @@ pub(crate) unsafe fn read_inputs(
             inputs.push(OwnedInput {
                 data_ptr: std::ptr::null(),
                 dtype: DataType::Float32,
-                shape: vec![],
-                strides: vec![],
+                shape: InlineVec::new(),
+                strides: InlineVec::new(),
             });
             continue;
         }
@@ -286,7 +290,7 @@ pub(crate) unsafe fn read_inputs(
 
         // Validate ORT-supplied dims: reject negatives and detect overflow.
         let (shape, _, _) = validate_dims(dims, dtype, format_args!("input {i}"))?;
-        let strides = onnx_runtime_ir::compute_contiguous_strides(&shape);
+        let strides = contiguous_strides(&shape);
 
         // Data pointer.
         let mut data: *const c_void = std::ptr::null();
@@ -335,7 +339,6 @@ pub(crate) unsafe fn allocate_output(
     // of shapes this path sees, so the conversion goes to the stack and a
     // per-`Run`, per-output heap allocation disappears; a taller tensor still
     // works, through the `Vec`.
-    const INLINE_RANK: usize = 8;
     let mut inline_dims = [0i64; INLINE_RANK];
     let heap_dims: Vec<i64>;
     let dims: &[i64] = if shape.len() <= INLINE_RANK {
@@ -388,11 +391,11 @@ pub(crate) unsafe fn allocate_output(
         None => std::ptr::null(),
     };
 
-    let strides = onnx_runtime_ir::compute_contiguous_strides(shape);
+    let strides = contiguous_strides(shape);
     Ok(OwnedOutput {
         data_ptr: data,
         dtype,
-        shape: shape.to_vec(),
+        shape: InlineVec::from_slice(shape),
         strides,
         mem_info,
     })
@@ -503,6 +506,10 @@ mod tests {
         assert!(out.mem_info.is_null());
         assert_eq!(out.shape, vec![2, 2]);
         assert_eq!(out.strides, vec![2, 1]);
+        assert!(
+            out.shape.is_inline() && out.strides.is_inline(),
+            "an ordinary rank-2 output must not allocate for its shape or strides"
+        );
 
         let _ = unsafe { allocate_output(&api, ctx, 0, &[2, 2], DataType::Float32, true) }
             .expect("the fake ORT allocates successfully");
@@ -722,6 +729,17 @@ mod tests {
         assert_eq!(inputs[0].shape, vec![2, 3, 4]);
         assert_eq!(inputs[0].strides, vec![12, 4, 1]);
         assert_eq!(inputs[0].dtype, DataType::Float32);
+        // A rank-3 tensor — which is to say, an ordinary one — must carry its
+        // shape and strides in the value. If either of these ever fails, the
+        // per-`Run` allocations this path exists to avoid are back.
+        assert!(
+            inputs[0].shape.is_inline(),
+            "an ordinary rank-3 shape must not reach the heap"
+        );
+        assert!(
+            inputs[0].strides.is_inline(),
+            "an ordinary rank-3 stride list must not reach the heap"
+        );
     }
 
     /// The fallback is not decoration: with the reference hook absent, the
@@ -812,13 +830,26 @@ mod tests {
 
         for rank in [0usize, 1, 8, 9, 12] {
             let shape: Vec<usize> = (1..=rank).collect();
-            let _ = unsafe { allocate_output(&api, ctx, 0, &shape, DataType::Float32, false) }
+            let out = unsafe { allocate_output(&api, ctx, 0, &shape, DataType::Float32, false) }
                 .expect("the fake ORT allocates successfully");
             let seen = RECORDED_DIMS.lock().expect("recorded dims lock");
             let expected: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
             assert_eq!(
                 *seen, expected,
                 "rank {rank} must reach ORT with every dimension intact"
+            );
+            // The `OwnedOutput` it hands back must be intact on both sides of
+            // the inline boundary too, and stored where it claims to be.
+            assert_eq!(out.shape, shape, "rank {rank} output shape");
+            assert_eq!(
+                &*out.strides,
+                &onnx_runtime_ir::compute_contiguous_strides(&shape)[..],
+                "rank {rank} output strides"
+            );
+            assert_eq!(
+                out.shape.is_inline(),
+                rank <= INLINE_RANK,
+                "rank {rank} output shape representation"
             );
         }
     }
@@ -829,8 +860,8 @@ mod tests {
         let input = OwnedInput {
             data_ptr: data.as_ptr().cast(),
             dtype: DataType::Float32,
-            shape: vec![2, 2],
-            strides: vec![2, 1],
+            shape: InlineVec::from_slice(&[2, 2]),
+            strides: InlineVec::from_slice(&[2, 1]),
         };
         let view = input.view();
         assert_eq!(view.shape, &[2, 2]);
@@ -843,8 +874,8 @@ mod tests {
         let mut output = OwnedOutput {
             data_ptr: data.as_mut_ptr().cast(),
             dtype: DataType::Float32,
-            shape: vec![2, 3],
-            strides: vec![3, 1],
+            shape: InlineVec::from_slice(&[2, 3]),
+            strides: InlineVec::from_slice(&[3, 1]),
             mem_info: std::ptr::null(),
         };
         let view = output.view_mut();
@@ -857,8 +888,8 @@ mod tests {
         let input = OwnedInput {
             data_ptr: std::ptr::null(),
             dtype: DataType::Float32,
-            shape: vec![],
-            strides: vec![],
+            shape: InlineVec::new(),
+            strides: InlineVec::new(),
         };
         let view = input.view();
         assert_eq!(view.shape, &[] as &[usize]);

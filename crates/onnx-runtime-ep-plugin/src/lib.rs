@@ -33,6 +33,7 @@ pub mod ep;
 pub mod factory;
 pub mod graph_reader;
 pub mod host_pool;
+pub(crate) mod inline_vec;
 pub mod kernel_ctx;
 pub mod status;
 pub mod transfer;
