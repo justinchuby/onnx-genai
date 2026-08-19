@@ -1031,6 +1031,12 @@ mod ffi_coverage {
                 if i > 0 && b[i - 1] == b':' {
                     continue;
                 }
+                // Skip `..Struct::new()` and `..Type` — struct-update and
+                // range syntax. A field access is never preceded by a dot, so
+                // this can only be one of those, never an `OrtApi` member.
+                if i > 0 && b[i - 1] == b'.' {
+                    continue;
+                }
                 let rest = &src[i + 1..];
                 let end = rest
                     .find(|c: char| !c.is_alphanumeric() && c != '_')

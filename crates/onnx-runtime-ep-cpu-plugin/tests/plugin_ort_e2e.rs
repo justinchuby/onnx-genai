@@ -5967,6 +5967,11 @@ fn dispatch_grid_cases() -> Vec<MatmulFamilyCase> {
         chain_case("grid_relu_1_tiny", "Relu", 1, TINY, false),
         chain_case("grid_relu_10_tiny", "Relu", 10, TINY, false),
         chain_case("grid_relu_100_tiny", "Relu", 100, TINY, false),
+        // Depth 1000 pins the per-node slope: at depth 100 the fixed per-`Run`
+        // cost is still ~9% of the total, so a slope read from 1/10/100 alone
+        // carries the fixed term's noise into it. Ten times the nodes divides
+        // that contamination by ten.
+        chain_case("grid_relu_1000_tiny", "Relu", 1000, TINY, false),
         chain_case("grid_relu_1_tiny_dyn", "Relu", 1, TINY, true),
         chain_case("grid_relu_10_tiny_dyn", "Relu", 10, TINY, true),
         small_matmul_case("grid_matmul_128x128", 128, 128),
