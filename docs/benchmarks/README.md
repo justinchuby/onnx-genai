@@ -26,7 +26,9 @@ reaches 481 tok/s decode with 68 ms TTFT on Qwen2.5-0.5B (1024 greedy tokens):
 it beats Foundry Local on every axis and ties Ollama Q4_K_M on end-to-end total
 latency (2199 vs 2185 ms), winning TTFT (−59%) while trailing steady-state
 decode by ~5%. Reproduce via the
-[H200 CUDA runbook](H200-CUDA-runbook.md).
+[H200 CUDA runbook](H200-CUDA-runbook.md) (Linux/H200). On a **Windows** dev box
+with no CUDA toolkit (CUDA libs from pip wheels), follow the
+[Windows CUDA runbook](windows-cuda-runbook.md) to bring up the native CUDA EP.
 
 The current Mac GPU checkpoint is
 [`2026-07-12-JustindeMacBook-Pro-q4-gqa-webgpu.md`](2026-07-12-JustindeMacBook-Pro-q4-gqa-webgpu.md).
