@@ -12,13 +12,20 @@ categories = ["science", "hardware-support"]
 crate-type = ["cdylib", "lib"]
 
 [features]
-# Link the vendored ONNX Runtime MLAS kernels into the cdylib. ORT's own CPU
-# execution provider *is* MLAS, so a cdylib without this feature is not a
-# like-for-like build: the quantized matmul paths measure an order of magnitude
-# slower. The shipped wheel enables it on every target CI proves it builds on
-# (see python/nxrt-ep-cpu/setup.py); it stays off by default so a host with no
-# C++ toolchain can still build the cdylib.
+# Link the vendored ONNX Runtime MLAS kernels into the cdylib as a *research
+# reference*, for differential tests and A/B benchmarks only. Off by default and
+# it stays off: the shipped CPU EP is native, the wheel never enables this (see
+# python/nxrt-ep-cpu/setup.py), and
+# `tests/default_artifacts_are_mlas_free.rs` falsifies both claims against the
+# resolved graph and the built cdylib's symbol table.
 mlas = ["onnx-runtime-ep-cpu/mlas"]
+
+# Compile the dispatch probe into the cdylib, so a harness can resolve its
+# entry points across the ORT boundary. Never enabled for a shipped build: the
+# probe's `no_mangle` exports exist only under this feature precisely so the
+# shipped cdylib keeps exporting the ORT plugin ABI and nothing else
+# (`plugin_export_abi::l1_no_symbol_leakage` pins that).
+dispatch_probe = ["onnx-runtime-ep-plugin/dispatch_probe"]
 
 [dependencies]
 onnx-runtime-ep-cpu = { workspace = true }
@@ -34,6 +41,9 @@ onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-std = { workspace = true }
 serde_yaml = { workspace = true }
+# `default_artifacts_are_mlas_free.rs` reads the resolved dependency graph from
+# `cargo metadata`, which is JSON.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

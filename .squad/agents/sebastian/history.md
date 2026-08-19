@@ -35,3 +35,7 @@ Built `marlin_bench` (`crates/onnx-genai-bench/src/bin/marlin_bench.rs`, `--feat
 
 ## 2026-08-15 — spec-decode e2e in flight after base +41% arc
 Established same-weights glm/qwen native-vs-ORT ground truth, then gated the #978/#981 base-decode wins that moved glm 97.5→137.8 tok/s and narrowed the ORT gap to 1.82×. Captured-vs-eager M=8 parity is byte-identical on glm and qwen; glm B*≈2.16 is practical GO while qwen's ~4.45-4.7 is drafting-depth/denominator. Current program: `squad/spec-decode-e2e` on GPU7, wiring captured M=8 verify plus selective KV commit as the multiplicative lever to pass ORT.
+## 2026-08-19T11:56Z — Qwen3.5 cast-elim GO closes hybrid lever ladder
+
+Scribe recorded Sebastian's qwen3.5 hybrid ladder closure: `lm_head` kernel NO-GO, op-soup DECLINED, and `CudaDropIdentityCast` GO via PR #1459 (`792958ecf`), byte-identical with +3.0% short-context throughput. The cleanup generalizes beyond qwen3.5 as identity-cast elimination for CUDA bridge graphs. Deckard/Wallace completed the 0.8B export + fair A/B rows, so the family trio is complete.
+

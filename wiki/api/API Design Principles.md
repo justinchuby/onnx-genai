@@ -9,103 +9,102 @@ tags:
   - ffi
   - compatibility
 status: maintained
+lang: zh-CN
 created: 2026-08-17
-updated: 2026-08-17
+updated: 2026-08-19
 ---
 
 # API Design Principles
 
-> [!summary] Question answered
-> How should one behavior remain coherent across Rust, CLI, HTTP, Python and C without forcing every surface to expose identical mechanics?
+> [!summary] 本篇回答的问题
+> 一种行为如何在 Rust、CLI、HTTP、Python 与 C 之间保持一致,而不强迫每个表面都
+> 暴露完全相同的机制?
 
-## Layered surfaces
+## 分层表面
 
-| Surface | Primary audience | Design emphasis |
+| 表面 | 主要受众 | 设计侧重 |
 |---|---|---|
-| Rust facade | Rust applications | Typed ownership and composability |
-| Engine API | Advanced integrations | Full generation policy/control |
-| CLI/REPL | Humans and scripts | Discoverability, stable stdout, actionable errors |
-| HTTP server | OpenAI-compatible clients | Wire compatibility, streaming, sessions |
-| Python | Python/NumPy users | Familiar session API, DLPack where explicit |
-| C ABI | Cross-language hosts | Opaque handles, value/vtable ABI, explicit ownership |
+| Rust facade | Rust 应用 | 带类型的所有权与可组合性 |
+| Engine API | 高级集成方 | 完整的生成策略/控制 |
+| CLI/REPL | 人类与脚本 | 可发现性、稳定的 stdout、可操作的错误 |
+| HTTP server | 兼容 OpenAI 的客户端 | wire 兼容、streaming、会话 |
+| Python | Python/NumPy 用户 | 熟悉的 session API,显式处的 DLPack |
+| C ABI | 跨语言 host | 不透明 handle、value/vtable ABI、显式所有权 |
 
-The surfaces share semantics, not necessarily identical signatures.
+这些表面共享的是语义,而不一定是完全相同的签名。
 
-## One semantic core
+## 单一语义内核
 
-Prompt processing, generation options, finish reasons, stop behavior and sampling
-should converge on engine types. Bindings marshal into that core instead of
-reimplementing generation policy.
+prompt 处理、生成选项、finish reason、stop 行为与采样都应收敛到引擎的类型上。
+binding 把数据 marshal 进这个内核,而不是重新实现生成策略。
 
-For example, a foreign sampler replaces terminal token selection while the engine
-still applies the configured processor/constraint chain.
+例如,一个外部 sampler 替换的是终端 token 选择,而引擎仍然施加所配置的
+processor/constraint 链。
 
-## Actionable failure
+## 可操作的失败
 
-Every surface should preserve:
+每个表面都应保留:
 
-- what operation failed;
-- which argument/node/shape/dtype/path/device was involved;
-- why it was rejected;
-- how the caller can fix it;
-- the underlying cause where safe.
+- 是哪个操作失败了;
+- 涉及了哪个 argument/node/shape/dtype/path/device;
+- 为什么被拒绝;
+- 调用方如何修复;
+- 在安全的前提下给出底层原因。
 
-Rust uses typed crate errors; orchestration may add `anyhow::Context`; C uses
-machine-readable status plus a rich message; Python/HTTP map without erasing
-diagnostic detail.
+Rust 使用带类型的 crate 错误;编排层可以加上 `anyhow::Context`;C 使用机器可读的
+状态码加上一条丰富的消息;Python/HTTP 在映射时不擦除诊断细节。
 
-## Ownership by language
+## 按语言划分的所有权
 
 ### Rust
 
-Use ownership, borrowing and newtypes to make invalid states difficult to express.
-Fallible device/runtime work returns `Result`.
+利用所有权、borrowing 与 newtype 让非法状态难以表达。可失败的设备/运行时工作
+返回 `Result`。
 
 ### C
 
-- opaque handles have matching create/release functions;
-- null is checked before dereference;
-- every panic is caught at the ABI boundary;
-- status/message ownership is explicit;
-- caller and library never free each other's unspecified heap allocations.
+- 不透明 handle 有配对的 create/release 函数;
+- 在解引用之前检查 null;
+- 每个 panic 都在 ABI 边界处被捕获;
+- 状态/消息的所有权是显式的;
+- 调用方与库绝不释放对方未指明的 heap 分配。
 
 ### Python
 
-- copied NumPy output is the safe default;
-- DLPack/zero-copy paths are explicit;
-- thread/reentrancy behavior is stated;
-- iterator/callback completion semantics must distinguish token events from final
-  result state.
+- 拷贝出的 NumPy 输出是安全的默认;
+- DLPack/zero-copy 路径是显式的;
+- thread/可重入行为被明确说明;
+- iterator/callback 的完成语义必须区分 token event 与最终结果状态。
 
 ### HTTP
 
-- request/response shapes follow the intended OpenAI-compatible contract;
-- SSE streaming preserves completion/error semantics;
-- debug/admin endpoints are opt-in;
-- payloads and secrets are not logged by default.
+- request/response 的形状遵循目标中兼容 OpenAI 的契约;
+- SSE streaming 保持 completion/error 语义;
+- debug/admin 端点是 opt-in 的;
+- 默认不记录 payload 与 secret。
 
-## Compatibility policy
+## 兼容性策略
 
-The repository is pre-release for its own Rust/product APIs: reshape them cleanly
-and update all callers instead of accumulating aliases and deprecations.
+对仓库自有的 Rust/产品 API 而言,它处于 pre-release 阶段:干净地重塑它们并更新
+所有调用方,而不是不断堆积别名与弃用。
 
-That freedom does not apply to:
+这种自由不适用于:
 
-- ONNX semantics/opsets;
-- documented model metadata;
-- stable C/plugin ABI versions;
-- OpenAI-compatible wire behavior promised to users;
-- supported Python wheel ABI.
+- ONNX 语义/opset;
+- 已文档化的模型 metadata;
+- 稳定的 C/plugin ABI 版本;
+- 向用户承诺的兼容 OpenAI 的 wire 行为;
+- 受支持的 Python wheel ABI。
 
-## Explicit behavior beats hidden convenience
+## 显式行为胜过隐藏的便利
 
-- no silent CPU fallback unless explicitly enabled;
-- no implicit cross-device transfer in eager APIs;
-- capability negotiation before using optional behavior;
-- no model-name dispatch where metadata/graph structure is required;
-- report a constrained fallback instead of pretending the requested mode ran.
+- 除非显式启用,否则不做静默的 CPU 回退;
+- eager API 中不做隐式的跨设备传输;
+- 在使用可选行为之前先做 capability 协商;
+- 在需要 metadata/图结构之处,不按模型名做 dispatch;
+- 报告一个受约束的回退,而不是假装请求的模式已经运行。
 
-## Formal sources
+## 正式来源
 
 - [`RULES.md`](../../RULES.md)
 - [`onnx-genai` facade](../../crates/onnx-genai/src/lib.rs)
@@ -115,7 +114,7 @@ That freedom does not apply to:
 - [`onnx-genai-capi`](../../crates/onnx-genai-capi/src/lib.rs)
 - [`ERROR_AND_LOGGING_CONVENTIONS.md`](../../docs/architecture/ERROR_AND_LOGGING_CONVENTIONS.md)
 
-## Related notes
+## 相关笔记
 
 - [[contracts/Runtime Contracts]]
 - [[metadata/Metadata Driven Runtime]]
