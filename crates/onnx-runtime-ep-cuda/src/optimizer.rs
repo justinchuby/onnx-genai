@@ -1268,10 +1268,27 @@ impl CudaMatMulNBitsBiasFusion {
 
 /// Block-quantization the fused RMS-norm GEMV kernels assume. The fused decode
 /// GEMVs (and their prefill GEMM) implement both the packed int4 layout and the
-/// one-byte-per-weight int8 layout, so either bit width fuses; the block size is
-/// fixed at 32 by the tuned four-lane/eight-block warp walk.
+/// one-byte-per-weight int8 layout, so either bit width fuses.
 const RMSNORM_FUSION_SUPPORTED_BITS: [i64; 2] = [4, 8];
-const RMSNORM_FUSION_SUPPORTED_BLOCK_SIZE: i64 = 32;
+/// Block-quantization block sizes for which a fused RMS-norm-prologue GEMV kernel
+/// actually exists. This is a **kernel capability set**, not a model constant:
+/// the fused-prologue dot (`matmul_nbits_gemv_f16_scales_f16_rmsnorm*`) and the
+/// fused gate/up SwiGLU-RMSNorm kernel bake in the tuned four-lane/eight-block
+/// warp walk that only covers `block_size == 32` (the block index is a hard
+/// `depth >> 5`; the gate/up kernel explicitly rejects any other width). A larger
+/// block size (e.g. GLM-4-9B's block-128, whose standalone GEMVs run the
+/// `general_bs` `>> 7` layout) folds automatically here the moment a matching
+/// fused-prologue kernel variant for that layout is added — extend this set in
+/// lockstep with a kernel that reproduces the standalone norm bit-exactly (or
+/// under an f64-parity opt-in when the reduction order differs). Gating on the
+/// implemented set — never a magic scalar — keeps the fold capability-driven and
+/// subsumes the "gate too narrowly hardcoded" concern (issue #1421) on this axis.
+const RMSNORM_FUSION_SUPPORTED_BLOCK_SIZES: [i64; 1] = [32];
+
+/// Whether a fused RMS-norm-prologue GEMV kernel exists for `block_size`.
+fn rmsnorm_fusion_supports_block_size(block_size: i64) -> bool {
+    RMSNORM_FUSION_SUPPORTED_BLOCK_SIZES.contains(&block_size)
+}
 /// The fused prologue/epilogue reproduce `skip_rmsnorm_f16_warp_half4`, which
 /// covers the hidden size in 128-wide (`32 lanes * 4 halves`) chunks, so the
 /// fusion only fires when the hidden size is a whole multiple of 128.
@@ -1752,8 +1769,10 @@ impl CudaSkipRmsNormMatMulFusion {
         {
             return false;
         }
-        if node.attr("block_size").and_then(Attribute::as_int)
-            != Some(RMSNORM_FUSION_SUPPORTED_BLOCK_SIZE)
+        if !node
+            .attr("block_size")
+            .and_then(Attribute::as_int)
+            .is_some_and(rmsnorm_fusion_supports_block_size)
         {
             return false;
         }
