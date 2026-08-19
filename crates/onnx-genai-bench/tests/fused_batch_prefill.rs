@@ -1,3 +1,4 @@
+#![cfg(feature = "bench-native")]
 //! Stage 2a (#750) guard tests for the batch-N fused forward
 //! ([`NativeDecodeSession::run_fused_batch_prefill`]).
 //!

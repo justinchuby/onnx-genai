@@ -659,11 +659,19 @@ pub(crate) struct KernelCache {
 ///
 /// A per-node bound rather than a global one keeps the eviction proportional to
 /// what actually varies: a graph keeps its hot decode and prefill variants, and
-/// only a node that has genuinely seen many shapes gives one up. The default is
-/// deliberately generous enough to hold the shapes one request cycles through
-/// (a chunked prefill shape, its remainder, and the single-token decode shape)
-/// so steady state never recompiles.
-const DEFAULT_VARIANTS_PER_NODE: usize = 4;
+/// only a node that has genuinely seen many shapes gives one up.
+///
+/// The bound only pays off if the shapes a steady stream of requests cycles
+/// through fit inside it. A prompt's final prefill chunk is as wide as whatever
+/// is left over, so left alone that set is unbounded and no bound is ever
+/// enough — the native CUDA decoder therefore rounds its prefill widths up to a
+/// short ladder (`PREFILL_QUERY_WIDTH_STEPS`, eight steps up to the chunk
+/// width). The default here is that ladder, plus the single-token decode shape,
+/// plus one for a forward too wide to be padded. Measured against a 30B decoder
+/// serving assorted prompt lengths, this is the difference between recompiling
+/// ~890 kernels on every request forever and recompiling none after the first
+/// pass over the ladder.
+const DEFAULT_VARIANTS_PER_NODE: usize = 10;
 
 fn variants_per_node() -> usize {
     static RESOLVED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();

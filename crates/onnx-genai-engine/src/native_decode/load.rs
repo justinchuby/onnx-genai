@@ -477,7 +477,7 @@ impl NativeDecodeSession {
         )
     }
 
-    fn from_session_with_cuda_options_and_io(
+    pub(crate) fn from_session_with_cuda_options_and_io(
         mut session: InferenceSession,
         cuda_options: NativeDecodeCudaOptions,
         io: Option<&ModelIoSpec>,
@@ -909,6 +909,7 @@ impl NativeDecodeSession {
             position_rank,
             decode_inline: DecodeInlineState::Untried,
             prefill_chunk_size: None,
+            prefill_query_padding: true,
         })
     }
 }

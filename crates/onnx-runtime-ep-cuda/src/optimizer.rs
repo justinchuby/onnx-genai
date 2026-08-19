@@ -113,6 +113,10 @@ pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
         // cache selector into an on-device `Where`, collapsing the per-token host
         // cond readback / graph split so decode captures as a single graph.
         Box::new(CudaOnDeviceConstantSelect),
+        // Runs last so it also sweeps up any identity `Cast` left behind by the
+        // fusions above (and the ~90 fp32→fp32 export casts per forward), rewiring
+        // consumers onto the pre-cast value. Byte-identical, shape/dtype-driven.
+        Box::new(CudaDropIdentityCast),
     ]
 }
 
@@ -1110,6 +1114,97 @@ fn convert_float_bytes(src: &[u8], from: DataType, to: DataType) -> Option<Vec<u
     Some(out)
 }
 
+/// Removes **identity** `Cast`/`CastLike` nodes whose output element type equals
+/// their input element type (e.g. the ~90 `Float32 → Float32` casts per forward
+/// this qwen3.5-hybrid export emits — pure launch overhead in an all-fp32
+/// activation path).
+///
+/// Correctness: a same-dtype cast is a bitwise no-op (the runtime `cast_core`
+/// kernel loads the source element and stores it back unchanged), so rewiring
+/// every consumer of the cast output onto the pre-cast input and deleting the
+/// node is **byte-identical**. The rewrite is shape/dtype-driven (no operator
+/// pattern or model-specific constant): any `Cast` whose input and output share
+/// a known element type qualifies, so it generalizes to every export.
+///
+/// Conservative guards:
+/// * both the input and output element types must be *known* (never guess);
+/// * the input slot must be present (a `CastLike`'s 2nd "like" input is ignored,
+///   only slot 0 carries data);
+/// * a cast whose output is a **graph output** is left intact, so the runtime's
+///   output binding (by value id / name) is never disturbed.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaDropIdentityCast;
+
+/// Environment opt-out for [`CudaDropIdentityCast`], mirroring the other
+/// CUDA-pass switches. Any value other than unset/empty/`0` restores the
+/// exported identity `Cast` launches (for A/B measurement or rollback).
+const IDENTITY_CAST_FOLD_DISABLE_ENV: &str = "ONNX_GENAI_CUDA_DISABLE_IDENTITY_CAST_FOLD";
+
+fn identity_cast_fold_disabled() -> bool {
+    std::env::var_os(IDENTITY_CAST_FOLD_DISABLE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+impl OptimizationPass for CudaDropIdentityCast {
+    fn name(&self) -> &str {
+        "CudaDropIdentityCast"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        if identity_cast_fold_disabled() {
+            return Ok(());
+        }
+        let candidates: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                ((node.op_type == "Cast" || node.op_type == "CastLike")
+                    && matches!(node.domain.as_str(), "" | "ai.onnx")
+                    && !node.inputs.is_empty()
+                    && node.outputs.len() == 1)
+                    .then_some(id)
+            })
+            .collect();
+
+        let mut changed = false;
+        for node_id in candidates {
+            // Re-read against the live graph so chained identity casts (cast of a
+            // cast) collapse correctly as earlier rewrites land.
+            let Some(node) = graph.try_node(node_id) else {
+                continue;
+            };
+            let Some(input) = node.inputs[0] else {
+                continue;
+            };
+            let output = node.outputs[0];
+            if input == output {
+                continue;
+            }
+            // Both element types must be known and equal for a bitwise no-op.
+            if !graph.value_type_is_known(input) || !graph.value_type_is_known(output) {
+                continue;
+            }
+            if graph.value(input).dtype != graph.value(output).dtype {
+                continue;
+            }
+            // Preserve any cast that directly feeds a graph output slot.
+            if graph.outputs.contains(&output) {
+                continue;
+            }
+
+            graph.replace_all_uses(output, input);
+            graph.remove_node(node_id);
+            graph.gc_value_if_orphan(output);
+            changed = true;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
 ///
 /// Only the exact QKV-style decode pattern is fused: a `MatMulNBits` with no
 /// zero-points / group-index / existing bias, whose sole consumer is a plain
@@ -1268,10 +1363,27 @@ impl CudaMatMulNBitsBiasFusion {
 
 /// Block-quantization the fused RMS-norm GEMV kernels assume. The fused decode
 /// GEMVs (and their prefill GEMM) implement both the packed int4 layout and the
-/// one-byte-per-weight int8 layout, so either bit width fuses; the block size is
-/// fixed at 32 by the tuned four-lane/eight-block warp walk.
+/// one-byte-per-weight int8 layout, so either bit width fuses.
 const RMSNORM_FUSION_SUPPORTED_BITS: [i64; 2] = [4, 8];
-const RMSNORM_FUSION_SUPPORTED_BLOCK_SIZE: i64 = 32;
+/// Block-quantization block sizes for which a fused RMS-norm-prologue GEMV kernel
+/// actually exists. This is a **kernel capability set**, not a model constant:
+/// the fused-prologue dot (`matmul_nbits_gemv_f16_scales_f16_rmsnorm*`) and the
+/// fused gate/up SwiGLU-RMSNorm kernel bake in the tuned four-lane/eight-block
+/// warp walk that only covers `block_size == 32` (the block index is a hard
+/// `depth >> 5`; the gate/up kernel explicitly rejects any other width). A larger
+/// block size (e.g. GLM-4-9B's block-128, whose standalone GEMVs run the
+/// `general_bs` `>> 7` layout) folds automatically here the moment a matching
+/// fused-prologue kernel variant for that layout is added — extend this set in
+/// lockstep with a kernel that reproduces the standalone norm bit-exactly (or
+/// under an f64-parity opt-in when the reduction order differs). Gating on the
+/// implemented set — never a magic scalar — keeps the fold capability-driven and
+/// subsumes the "gate too narrowly hardcoded" concern (issue #1421) on this axis.
+const RMSNORM_FUSION_SUPPORTED_BLOCK_SIZES: [i64; 1] = [32];
+
+/// Whether a fused RMS-norm-prologue GEMV kernel exists for `block_size`.
+fn rmsnorm_fusion_supports_block_size(block_size: i64) -> bool {
+    RMSNORM_FUSION_SUPPORTED_BLOCK_SIZES.contains(&block_size)
+}
 /// The fused prologue/epilogue reproduce `skip_rmsnorm_f16_warp_half4`, which
 /// covers the hidden size in 128-wide (`32 lanes * 4 halves`) chunks, so the
 /// fusion only fires when the hidden size is a whole multiple of 128.
@@ -1752,8 +1864,10 @@ impl CudaSkipRmsNormMatMulFusion {
         {
             return false;
         }
-        if node.attr("block_size").and_then(Attribute::as_int)
-            != Some(RMSNORM_FUSION_SUPPORTED_BLOCK_SIZE)
+        if !node
+            .attr("block_size")
+            .and_then(Attribute::as_int)
+            .is_some_and(rmsnorm_fusion_supports_block_size)
         {
             return false;
         }
@@ -2892,6 +3006,11 @@ fn dims_bytes(dims: &[usize], elem: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use onnx_runtime_ir::{Dim, Node, NodeId, ValueId};
+
+    /// Serializes the [`CudaDropIdentityCast`] tests: one mutates the process-wide
+    /// `IDENTITY_CAST_FOLD_DISABLE_ENV`, which the others read through the pass, so
+    /// they must not run concurrently (mirrors `TEST_SINGLE_SPLIT_LOCK`).
+    static IDENTITY_CAST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn value(graph: &mut Graph, name: &str, dtype: DataType, width: usize) -> ValueId {
         graph.create_named_value(name, dtype, vec![Dim::Static(1), Dim::Static(width)])
@@ -5963,5 +6082,113 @@ mod tests {
             .filter(|n| n.op_type == "MatMulNBits")
             .count();
         assert_eq!(fused, 1, "opt-in flag enables the fusion");
+    }
+
+    /// `x -> Cast(f32->f32) -> y -> Relu -> out`: the identity cast is removed
+    /// and `Relu` is rewired directly onto `x`, leaving a byte-identical graph.
+    #[test]
+    fn drops_identity_cast_and_rewires_consumer() {
+        let _serial = IDENTITY_CAST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = value(&mut g, "x", DataType::Float32, 4);
+        g.add_input(x);
+        let y = cast_node(&mut g, "y", x, DataType::Float32, 4);
+        let out = value(&mut g, "out", DataType::Float32, 4);
+        g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(y)], vec![out]));
+        g.add_output(out);
+
+        assert_eq!(g.nodes.values().filter(|n| n.op_type == "Cast").count(), 1);
+        CudaDropIdentityCast
+            .run(&mut g, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            0,
+            "identity cast removed"
+        );
+        let relu = g.nodes.values().find(|n| n.op_type == "Relu").unwrap();
+        assert!(
+            relu.input_values().any(|v| v == x),
+            "consumer rewired onto the pre-cast value"
+        );
+        assert!(g.validate().is_ok());
+    }
+
+    /// A genuine dtype change (`f32 -> f16`) is a real conversion, not an
+    /// identity, so the pass must leave it untouched.
+    #[test]
+    fn keeps_narrowing_cast() {
+        let _serial = IDENTITY_CAST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = value(&mut g, "x", DataType::Float32, 4);
+        g.add_input(x);
+        let y = cast_node(&mut g, "y", x, DataType::Float16, 4);
+        g.add_output(y);
+
+        CudaDropIdentityCast
+            .run(&mut g, &PassContext::new())
+            .unwrap();
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            1,
+            "narrowing cast preserved"
+        );
+    }
+
+    /// An identity cast that feeds a graph output slot is preserved so the
+    /// runtime's output binding (by value id) is never disturbed.
+    #[test]
+    fn keeps_identity_cast_feeding_graph_output() {
+        let _serial = IDENTITY_CAST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = value(&mut g, "x", DataType::Float32, 4);
+        g.add_input(x);
+        let y = cast_node(&mut g, "y", x, DataType::Float32, 4);
+        g.add_output(y);
+
+        CudaDropIdentityCast
+            .run(&mut g, &PassContext::new())
+            .unwrap();
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            1,
+            "graph-output cast preserved"
+        );
+    }
+
+    /// The opt-out env restores the exported identity casts for A/B / rollback.
+    #[test]
+    fn opt_out_env_preserves_identity_cast() {
+        let _serial = IDENTITY_CAST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = value(&mut g, "x", DataType::Float32, 4);
+        g.add_input(x);
+        let y = cast_node(&mut g, "y", x, DataType::Float32, 4);
+        let out = value(&mut g, "out", DataType::Float32, 4);
+        g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(y)], vec![out]));
+        g.add_output(out);
+
+        unsafe { std::env::set_var(IDENTITY_CAST_FOLD_DISABLE_ENV, "1") };
+        let result = CudaDropIdentityCast.run(&mut g, &PassContext::new());
+        unsafe { std::env::remove_var(IDENTITY_CAST_FOLD_DISABLE_ENV) };
+        result.unwrap();
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            1,
+            "opt-out preserves the identity cast"
+        );
     }
 }
