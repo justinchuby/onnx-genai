@@ -31,6 +31,10 @@ use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
 
+/// Warp width the warp-cooperative kernel reduces across (must match `LA_WARP`
+/// in the CUDA source and divide [`BLOCK`]).
+const LA_WARP: u32 = 32;
+
 /// Largest `d_k` the per-thread f32 state column can hold. Real Qwen3.5 hybrid
 /// heads use `d_k = 128`; the claim gate rejects anything larger so we never
 /// claim an op this kernel cannot run.
@@ -43,11 +47,34 @@ const MAX_D_K: usize = 256;
 pub(crate) const FUSE_BETA_SIGMOID_ATTR: &str = "com.microsoft.cuda_fuse_beta_sigmoid";
 pub(crate) const FUSE_DECAY_SOFTPLUS_ATTR: &str = "com.microsoft.cuda_fuse_decay_softplus";
 
+/// Whether the warp-cooperative `linear_attention_*_coop` kernel is disabled in
+/// favour of the original one-thread-per-column serial kernel. The warp-coop
+/// kernel distributes each state column across a warp's registers (no
+/// `sc[MAX_D_K]` local-memory spill) and reduces the d_k dot products with
+/// `__shfl_xor` instead of a serial loop; it is DEFAULT-ON. Its warp reductions
+/// sum the retrieval/readout dot products in tree order rather than the serial
+/// kernel's left-to-right order, so fp32 results shift at the ULP level (still
+/// f32 accumulation) — greedy argmax is unaffected. Set
+/// `ONNX_GENAI_CUDA_DISABLE_LINATTN_WARP_COOP=1` (or `true`/`on`) to fall back to
+/// the serial kernel for A/B measurement or to de-risk a future model.
+fn linattn_warp_coop_disabled() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_CUDA_DISABLE_LINATTN_WARP_COOP")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
 const SOURCE: &str = r#"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
 #define MAX_D_K 256
+#define LA_WARP 32
+// Registers per lane for the warp-cooperative state column: each lane owns the
+// d_k rows i = lane, lane+32, ... so it needs ceil(MAX_D_K / warp) slots.
+#define LA_MAX_SLOTS ((MAX_D_K + LA_WARP - 1) / LA_WARP)
 
 __device__ __forceinline__ float to_f(float x) { return x; }
 __device__ __forceinline__ float to_f(__half x) { return __half2float(x); }
@@ -81,6 +108,19 @@ __device__ __forceinline__ float la_sigmoid(float x) {
 // (`kernels/pointwise.rs::op_softplus`).
 __device__ __forceinline__ float la_softplus(float x) {
   return fmaxf(x, 0.0f) + log1pf(expf(-fabsf(x)));
+}
+
+// Full-warp butterfly sum: every lane returns Σ over all 32 lanes. Used by the
+// warp-cooperative kernel to reduce the d_k dot products (retrieval r = Sᵀk and
+// readout o = qᵀS) that the serial kernel walks with a 128-iteration loop. The
+// tree order differs from the serial left-to-right sum, so fp32 results shift at
+// the ULP level (accumulation stays in f32); greedy argmax is unaffected.
+__device__ __forceinline__ float la_warp_reduce_sum(float v) {
+#pragma unroll
+  for (int off = LA_WARP / 2; off > 0; off >>= 1) {
+    v += __shfl_xor_sync(0xffffffffu, v, off);
+  }
+  return v;
 }
 
 template <typename T>
@@ -255,6 +295,239 @@ extern "C" __global__ void linear_attention_bf16(
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
       fuse_decay_softplus);
 }
+
+// ── Warp-cooperative variant ────────────────────────────────────────────────
+//
+// Same math as `linear_attention_core`, but one WARP (not one thread) owns each
+// state column (b, h_kv, j): lane `l` holds the d_k rows i = l, l+warp, ... in
+// registers (`sc[LA_MAX_SLOTS]`, ≤8 f32) instead of a per-thread `sc[MAX_D_K]`
+// array that spills to local memory. The two d_k dot products (retrieval and
+// readout) become `__shfl_xor` warp reductions instead of a 128-iteration serial
+// loop. This raises the launch from `batch·H_kv·d_v` threads to that many WARPS
+// (32× more resident work → fills the SMs) and removes the local-memory spill
+// that dominated the serial kernel's Long-Scoreboard stalls. Generic over the
+// per-op dtype, head geometry (GQA / inverse GQA / dual head sizes) and any
+// `d_k ≤ MAX_D_K` (the `i < d_k` guards handle d_k not a multiple of the warp).
+template <typename T>
+__device__ void linear_attention_core_coop(
+    const T* q, const T* k, const T* v,
+    const T* past_state, const T* decay, const T* beta,
+    const T* dt_bias, const T* neg_exp_A,
+    T* output, T* present_state,
+    unsigned long long batch, unsigned long long seq,
+    unsigned long long d_k, unsigned long long d_v,
+    unsigned long long q_num_heads, unsigned long long kv_num_heads,
+    unsigned long long n_k_heads, unsigned long long heads_per_group,
+    unsigned long long kv_per_k_head, unsigned long long output_hidden,
+    float scale, int needs_decay, int decay_per_key_dim,
+    int needs_delta, int beta_per_head,
+    int fuse_beta_sigmoid, int fuse_decay_softplus) {
+  const unsigned lane = threadIdx.x & (LA_WARP - 1);
+  const unsigned warps_per_block = blockDim.x / LA_WARP;
+  const unsigned long long total_warps = batch * kv_num_heads * d_v;
+  const unsigned long long warp_stride =
+      (unsigned long long)gridDim.x * warps_per_block;
+  // The loop bound `w` is warp-uniform (every lane shares it), so an out-of-range
+  // warp exits collectively — no partial-warp `__shfl_xor_sync` divergence.
+  for (unsigned long long w =
+           (unsigned long long)blockIdx.x * warps_per_block +
+           (threadIdx.x / LA_WARP);
+       w < total_warps; w += warp_stride) {
+    const unsigned long long j = w % d_v;
+    const unsigned long long hk_flat = w / d_v;  // b * kv_num_heads + h_kv
+    const unsigned long long b = hk_flat / kv_num_heads;
+    const unsigned long long h_kv = hk_flat % kv_num_heads;
+    const unsigned long long h_k = h_kv / kv_per_k_head;
+    const unsigned long long sbase = hk_flat * d_k * d_v;  // + i*d_v + j
+
+    float sc[LA_MAX_SLOTS];
+#pragma unroll
+    for (int s = 0; s < LA_MAX_SLOTS; ++s) {
+      const unsigned long long i = lane + (unsigned long long)s * LA_WARP;
+      sc[s] = (i < d_k && past_state) ? to_f(past_state[sbase + i * d_v + j]) : 0.0f;
+    }
+
+    for (unsigned long long t = 0; t < seq; ++t) {
+      const unsigned long long row = b * seq + t;
+
+      // Step 1: decay  S *= exp(g_t)
+      if (needs_decay) {
+        if (decay_per_key_dim) {
+          const T* g = decay + row * (kv_num_heads * d_k) + h_kv * d_k;
+          if (fuse_decay_softplus) {
+            const T* dtb = dt_bias + h_kv * d_k;
+            const T* na = neg_exp_A + h_kv * d_k;
+#pragma unroll
+            for (int s = 0; s < LA_MAX_SLOTS; ++s) {
+              const unsigned long long i = lane + (unsigned long long)s * LA_WARP;
+              if (i < d_k) {
+                float a = round_store<T>(to_f(g[i]) + to_f(dtb[i]));
+                a = round_store<T>(la_softplus(a));
+                a = round_store<T>(to_f(na[i]) * a);
+                sc[s] *= expf(a);
+              }
+            }
+          } else {
+#pragma unroll
+            for (int s = 0; s < LA_MAX_SLOTS; ++s) {
+              const unsigned long long i = lane + (unsigned long long)s * LA_WARP;
+              if (i < d_k) sc[s] *= expf(to_f(g[i]));
+            }
+          }
+        } else {
+          float g_val;
+          if (fuse_decay_softplus) {
+            float a = round_store<T>(
+                to_f(decay[row * kv_num_heads + h_kv]) + to_f(dt_bias[h_kv]));
+            a = round_store<T>(la_softplus(a));
+            g_val = round_store<T>(to_f(neg_exp_A[h_kv]) * a);
+          } else {
+            g_val = to_f(decay[row * kv_num_heads + h_kv]);
+          }
+          const float eg = expf(g_val);
+#pragma unroll
+          for (int s = 0; s < LA_MAX_SLOTS; ++s) {
+            const unsigned long long i = lane + (unsigned long long)s * LA_WARP;
+            if (i < d_k) sc[s] *= eg;
+          }
+        }
+      }
+
+      const float vt = to_f(v[row * (kv_num_heads * d_v) + h_kv * d_v + j]);
+      const T* kt = k + row * (n_k_heads * d_k) + h_k * d_k;
+
+      if (needs_delta) {
+        // Step 2: retrieval r = Sᵀ k_t  (warp reduction over d_k)
+        float rpart = 0.0f;
+#pragma unroll
+        for (int s = 0; s < LA_MAX_SLOTS; ++s) {
+          const unsigned long long i = lane + (unsigned long long)s * LA_WARP;
+          if (i < d_k) rpart += sc[s] * to_f(kt[i]);
+        }
+        const float r = la_warp_reduce_sum(rpart);
+        // Step 3: delta update  S += k_t ⊗ (beta·(v_t − r))
+        float bt = beta_per_head ? to_f(beta[row * kv_num_heads + h_kv]) : to_f(beta[row]);
+        if (fuse_beta_sigmoid) bt = round_store<T>(la_sigmoid(bt));
+        const float dd = bt * (vt - r);
+#pragma unroll
+        for (int s = 0; s < LA_MAX_SLOTS; ++s) {
+          const unsigned long long i = lane + (unsigned long long)s * LA_WARP;
+          if (i < d_k) sc[s] += to_f(kt[i]) * dd;
+        }
+      } else {
+        // linear / gated: S += k_t ⊗ v_t
+#pragma unroll
+        for (int s = 0; s < LA_MAX_SLOTS; ++s) {
+          const unsigned long long i = lane + (unsigned long long)s * LA_WARP;
+          if (i < d_k) sc[s] += to_f(kt[i]) * vt;
+        }
+      }
+
+      // Step 4: readout o_t = scale · q_tᵀ S  (warp reduction over d_k)
+      if (heads_per_group > 0) {
+        for (unsigned long long g = 0; g < heads_per_group; ++g) {
+          const unsigned long long h_q = h_kv * heads_per_group + g;
+          const T* qt = q + row * (q_num_heads * d_k) + h_q * d_k;
+          float opart = 0.0f;
+#pragma unroll
+          for (int s = 0; s < LA_MAX_SLOTS; ++s) {
+            const unsigned long long i = lane + (unsigned long long)s * LA_WARP;
+            if (i < d_k) opart += to_f(qt[i]) * sc[s];
+          }
+          const float o = la_warp_reduce_sum(opart);
+          if (lane == 0) {
+            output[row * output_hidden + h_q * d_v + j] = from_f_val(o * scale, output);
+          }
+        }
+      } else {
+        // Inverse GQA: output slot is h_kv, query head h_kv·H_q/H_kv.
+        const unsigned long long h_q = h_kv * q_num_heads / kv_num_heads;
+        const T* qt = q + row * (q_num_heads * d_k) + h_q * d_k;
+        float opart = 0.0f;
+#pragma unroll
+        for (int s = 0; s < LA_MAX_SLOTS; ++s) {
+          const unsigned long long i = lane + (unsigned long long)s * LA_WARP;
+          if (i < d_k) opart += to_f(qt[i]) * sc[s];
+        }
+        const float o = la_warp_reduce_sum(opart);
+        if (lane == 0) {
+          output[row * output_hidden + h_kv * d_v + j] = from_f_val(o * scale, output);
+        }
+      }
+    }
+
+#pragma unroll
+    for (int s = 0; s < LA_MAX_SLOTS; ++s) {
+      const unsigned long long i = lane + (unsigned long long)s * LA_WARP;
+      if (i < d_k) present_state[sbase + i * d_v + j] = from_f_val(sc[s], present_state);
+    }
+  }
+}
+
+extern "C" __global__ void linear_attention_f32_coop(
+    const float* q, const float* k, const float* v,
+    const float* past_state, const float* decay, const float* beta,
+    const float* dt_bias, const float* neg_exp_A,
+    float* output, float* present_state,
+    unsigned long long batch, unsigned long long seq,
+    unsigned long long d_k, unsigned long long d_v,
+    unsigned long long q_num_heads, unsigned long long kv_num_heads,
+    unsigned long long n_k_heads, unsigned long long heads_per_group,
+    unsigned long long kv_per_k_head, unsigned long long output_hidden,
+    float scale, int needs_decay, int decay_per_key_dim,
+    int needs_delta, int beta_per_head,
+    int fuse_beta_sigmoid, int fuse_decay_softplus) {
+  linear_attention_core_coop<float>(
+      q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
+      present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
+      heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
+      decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
+      fuse_decay_softplus);
+}
+
+extern "C" __global__ void linear_attention_f16_coop(
+    const __half* q, const __half* k, const __half* v,
+    const __half* past_state, const __half* decay, const __half* beta,
+    const __half* dt_bias, const __half* neg_exp_A,
+    __half* output, __half* present_state,
+    unsigned long long batch, unsigned long long seq,
+    unsigned long long d_k, unsigned long long d_v,
+    unsigned long long q_num_heads, unsigned long long kv_num_heads,
+    unsigned long long n_k_heads, unsigned long long heads_per_group,
+    unsigned long long kv_per_k_head, unsigned long long output_hidden,
+    float scale, int needs_decay, int decay_per_key_dim,
+    int needs_delta, int beta_per_head,
+    int fuse_beta_sigmoid, int fuse_decay_softplus) {
+  linear_attention_core_coop<__half>(
+      q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
+      present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
+      heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
+      decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
+      fuse_decay_softplus);
+}
+
+extern "C" __global__ void linear_attention_bf16_coop(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    const __nv_bfloat16* past_state, const __nv_bfloat16* decay,
+    const __nv_bfloat16* beta,
+    const __nv_bfloat16* dt_bias, const __nv_bfloat16* neg_exp_A,
+    __nv_bfloat16* output,
+    __nv_bfloat16* present_state,
+    unsigned long long batch, unsigned long long seq,
+    unsigned long long d_k, unsigned long long d_v,
+    unsigned long long q_num_heads, unsigned long long kv_num_heads,
+    unsigned long long n_k_heads, unsigned long long heads_per_group,
+    unsigned long long kv_per_k_head, unsigned long long output_hidden,
+    float scale, int needs_decay, int decay_per_key_dim,
+    int needs_delta, int beta_per_head,
+    int fuse_beta_sigmoid, int fuse_decay_softplus) {
+  linear_attention_core_coop<__nv_bfloat16>(
+      q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
+      present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
+      heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
+      decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
+      fuse_decay_softplus);
+}
 "#;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -377,6 +650,7 @@ impl KernelFactory for LinearAttentionFactory {
             scale,
             fuse_beta_sigmoid,
             fuse_decay_softplus,
+            warp_coop: !linattn_warp_coop_disabled(),
         }))
     }
 }
@@ -390,6 +664,7 @@ struct LinearAttentionKernel {
     scale: Option<f32>,
     fuse_beta_sigmoid: bool,
     fuse_decay_softplus: bool,
+    warp_coop: bool,
 }
 
 impl std::fmt::Debug for UpdateRule {
@@ -649,10 +924,13 @@ impl Kernel for LinearAttentionKernel {
             return Ok(());
         }
 
-        let stem = match dtype {
-            DataType::Float32 => "linear_attention_f32",
-            DataType::Float16 => "linear_attention_f16",
-            DataType::BFloat16 => "linear_attention_bf16",
+        let stem = match (dtype, self.warp_coop) {
+            (DataType::Float32, false) => "linear_attention_f32",
+            (DataType::Float16, false) => "linear_attention_f16",
+            (DataType::BFloat16, false) => "linear_attention_bf16",
+            (DataType::Float32, true) => "linear_attention_f32_coop",
+            (DataType::Float16, true) => "linear_attention_f16_coop",
+            (DataType::BFloat16, true) => "linear_attention_bf16_coop",
             _ => unreachable!(),
         };
         if dtype != DataType::Float32 {
@@ -660,7 +938,7 @@ impl Kernel for LinearAttentionKernel {
         }
         let function = self
             .runtime
-            .nvrtc_function("linear_attention_v2", SOURCE, stem)?;
+            .nvrtc_function("linear_attention_v3", SOURCE, stem)?;
 
         let q_ptr = cuptr(q.data_ptr::<u8>() as *const c_void);
         let k_ptr = cuptr(k.data_ptr::<u8>() as *const c_void);
@@ -708,7 +986,14 @@ impl Kernel for LinearAttentionKernel {
         let fuse_beta_sigmoid_i = i32::from(fuse_beta_sigmoid);
         let fuse_decay_softplus_i = i32::from(fuse_decay_softplus);
 
-        let grid = u32::try_from(total.div_ceil(BLOCK as u64))
+        // The serial kernel launches one thread per state column; the
+        // warp-cooperative kernel launches one WARP (32 threads) per column.
+        let threads_needed = if self.warp_coop {
+            total.saturating_mul(u64::from(LA_WARP))
+        } else {
+            total
+        };
+        let grid = u32::try_from(threads_needed.div_ceil(BLOCK as u64))
             .unwrap_or(u32::MAX)
             .clamp(1, 65_535);
         let stream = self.runtime.stream();
