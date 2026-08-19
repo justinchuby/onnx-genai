@@ -286,6 +286,55 @@ allocator 真正释放
 因此 RAII 是可行的，但 `Drop` 应负责排队，而不是在任意线程上直接
 同步整个 GPU 或立即 free。
 
+## CUDA 的内建机制只有 VMM 一种
+
+从 memory refactor 的最后一个阶段（issue #1186 Phase 7）开始，**CUDA EP 内建的
+device 内存机制只有 VMM arena**。原先那个 eager 的 `cuMemAlloc` allocator
+（`CudaDeviceAllocator`）以及用来在两者之间切换的开关 `ONNX_GENAI_CUDA_VMM`
+都已经删除。
+
+### 这意味着什么
+
+- **默认就是 VMM**，不需要设置任何环境变量。
+- **没有静默回退**。如果 driver 或设备不支持 VMM，provider 会在*构造时*
+  直接报错，并说明失败的 device、driver 的原话，以及支持边界。它不会退回到一个
+  不受 ledger 记账的 eager allocator 上继续跑 —— 那种“看起来能跑，但账本是错的”
+  才是最难排查的状态。
+- **注入外部 allocator 仍然完全支持**。删掉的是内建实现，不是
+  `DeviceAllocator` 这个能力。
+
+### 仍然可以注入自己的 allocator
+
+`DeviceAllocator` trait 没有任何变化。想要 eager `cuMemAlloc` 行为的调用方可以
+自己实现一个再注入：
+
+```rust
+let provider = CudaExecutionProvider::new(0)?
+    .with_memory(Arc::new(MyEagerAllocator::new(context)));
+```
+
+注入是**权威的**：成功之后内建 arena 会被退役，之后所有 device 内存都来自注入的
+allocator。这里有两条规则：
+
+1. allocator 必须服务同一个 device，否则调用直接被拒绝 —— 一个 host 指针在
+   kernel 里解引用之前不会有任何征兆。
+2. 如果当前机制已经发出过内存，注入会被拒绝。已经发出的指针必须由发出它的机制
+   回收，中途换掉会让它变成孤儿。
+
+被拒绝时会返回 `Err`，不会出现“调用成功但被忽略”的情况。
+
+## 内建 VMM arena 的既定约束
+
+这些不是可调参数，而是当前实现的边界，排查问题时值得先知道：
+
+| 项目 | 值 | 说明 |
+| --- | --- | --- |
+| 虚拟地址预留 | 64 GiB（standalone 路径） | 只占地址空间，不占显存 |
+| 物理 granularity | 2 MiB | driver 报告的最小映射单位；所有 commit 向上取整到它 |
+| 保留物理 handle 池 | 默认关闭；`ONNX_GENAI_CUDA_PHYSICAL_HANDLE_POOL_BYTES` 设为正整数字节数开启 | 池归 authority 所有；0 或无法解析视为未配置 |
+| 拆除同步 | 释放 handle 前等待在途 stream 工作完成 | 见 `deferred_release` |
+| 设备丢失 | driver 报错向上传播，不重试、不静默丢弃 | |
+
 ## 为什么不添加 `ExecutionProvider::allocator()`
 
 ### 一个 EP 可能有多个内存域
@@ -295,9 +344,10 @@ allocator 真正释放
 
 ### 有效 allocator 可能切换
 
-CUDA EP 可能先使用普通 `cuMemAlloc`，之后安装 VMM arena。外部缓存旧
-allocator，再用它释放新 allocator 创建的 pointer，会造成
-cross-allocator free。
+CUDA EP 默认使用内建的 VMM arena，但调用方可以通过
+`CudaExecutionProvider::with_memory` 注入自己的 allocator，此时内建 arena 会被
+**替换**（见下一节）。外部缓存旧 allocator，再用它释放新 allocator 创建的
+pointer，会造成 cross-allocator free。
 
 ### 裸 allocator 容易绕过 Governor
 

@@ -2,8 +2,8 @@
 //!
 //! # Why not `cuMemAlloc`
 //!
-//! [`CudaDeviceAllocator`] calls `cuMemAlloc`, which allocates virtual *and*
-//! physical memory together. That is the "reservation-based" model vAttention
+//! `cuMemAlloc` allocates virtual *and* physical memory together. That is the
+//! "reservation-based" model vAttention
 //! ([arXiv 2405.04437](https://arxiv.org/abs/2405.04437)) identifies as the
 //! root of the problem PagedAttention exists to work around: because you cannot
 //! reserve an address range without also taking the physical memory behind it,
@@ -47,7 +47,15 @@
 //! request its own granule would turn ONNX Runtime's many small tensors into
 //! 2 MiB each, which is the failure mode this design exists to avoid.
 //!
-//! [`CudaDeviceAllocator`]: crate::device_allocator::CudaDeviceAllocator
+//! # Why there is no eager alternative to fall back to
+//!
+//! This is the **only** built-in CUDA memory mechanism. The eager `cuMemAlloc`
+//! allocator that used to sit beside it, and the environment flag that chose
+//! between them, are gone: a second built-in mechanism means every accounting,
+//! capture-safety and teardown invariant has to hold twice, and the eager one
+//! could not hold the capture-safety half at all. A caller who needs a
+//! different mechanism supplies it through the ordinary `DeviceAllocator`
+//! contract instead of flipping a flag.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::NonNull;
@@ -70,61 +78,48 @@ use crate::virtual_memory::{
 };
 use cudarc::driver::CudaContext;
 
-/// Environment switch selecting the VMM arena over `cuMemAlloc`.
-///
-/// # What enabling it does today
-///
-/// When set, the CUDA execution provider installs the VMM arena **at
-/// construction** (not at governor adoption) and routes every device
-/// allocation it makes — including the ORT scratch allocations
-/// (`KernelContext_GetScratchBuffer`) the plugin path projects through the
-/// provider's `allocate`/`deallocate` — through it. That is the caller the
-/// arena was always missing on the plugin/standalone path (#659, #956):
-/// repeated same-size scratch requests reuse committed memory from the
-/// retained physical-handle pool instead of calling `cuMemAlloc` per dispatch.
-///
-/// The construction-time install predates governor adoption on purpose: on the
-/// native path the session allocates every tensor while loading, before any
-/// governor reaches the provider, so an arena installed at adoption is
-/// installed at the one moment after which nothing will ask it for memory
-/// (#659). The construction-time install closed that gap for the native path;
-/// the standalone (plugin, no-governor) path uses the same install and, from
-/// #956 on, a default retained physical-handle pool so its scratch reuse is
-/// real rather than a per-cycle `cuMemCreate`/`cuMemRelease` churn.
-///
-/// # Why it is opt-in regardless
-///
-/// An allocator change is exactly the kind that looks free and is not. The
-/// default should move only after it is measured against `cuMemAlloc` on real
-/// models.
-pub const CUDA_VMM_ENV: &str = "ONNX_GENAI_CUDA_VMM";
 /// Opt-in retained-byte bound for the production physical-handle pool.
 ///
 /// When unset, the standalone (plugin) VMM path falls back to the
 /// `default_pool_bytes` its caller supplies (issue #956), so scratch reuse is
-/// pooled by default whenever the arena is enabled.
+/// pooled by default.
+///
+/// # Why there is no companion switch that turns the arena itself on
+///
+/// There used to be one (`ONNX_GENAI_CUDA_VMM`). It existed because the arena
+/// was the alternative to an eager `cuMemAlloc` allocator and the default was
+/// not to be moved until the arena had been measured against it. The arena is
+/// now the only built-in mechanism, so there is nothing for a switch to select
+/// between: an unset flag would have to mean "use the arena" and a set one
+/// would mean the same thing.
 pub const CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV: &str = "ONNX_GENAI_CUDA_PHYSICAL_HANDLE_POOL_BYTES";
 
-/// Whether the VMM arena is enabled. Any of `1`/`true`/`yes`/`on`.
-pub fn vmm_enabled() -> bool {
-    std::env::var(CUDA_VMM_ENV).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-}
-
-fn physical_handle_pool_bytes() -> Option<usize> {
-    std::env::var(CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV)
-        .ok()
+/// Parse a retained-byte pool bound, without reading the environment.
+///
+/// Split from [`physical_handle_pool_bytes`] so the parsing rules can be
+/// asserted directly. A test that has to set a process-global environment
+/// variable to reach them races every other test in the binary, and a racy
+/// test is one that will eventually be quietened rather than fixed.
+fn parse_physical_handle_pool_bytes(value: Option<&str>) -> Option<usize> {
+    value
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|&bytes| bytes > 0)
 }
 
+fn physical_handle_pool_bytes() -> Option<usize> {
+    parse_physical_handle_pool_bytes(
+        std::env::var(CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// Whether VMM allocations use the authority-owned production handle pool.
+///
+/// The arena is always the mechanism, so this asks only whether an explicit
+/// retained-byte bound was configured for it.
 pub fn production_physical_pool_enabled() -> bool {
-    vmm_enabled() && physical_handle_pool_bytes().is_some()
+    physical_handle_pool_bytes().is_some()
 }
 /// The device tier name used in errors raised before a governor is consulted.
 const TIER: &str = "device";
@@ -248,9 +243,9 @@ pub struct GlobalVmmStats {
 
 /// Read the process-global VMM arena counters.
 ///
-/// All zero means no arena was ever built -- which is the normal state when
-/// `ONNX_GENAI_CUDA_VMM` is unset, and is distinguishable from an arena that
-/// was built and never used (`reserved_bytes > 0`, `commits == 0`).
+/// All zero means no arena was ever built -- the state of a process that never
+/// constructed a CUDA provider -- and is distinguishable from an arena that was
+/// built and never used (`reserved_bytes > 0`, `commits == 0`).
 pub fn global_vmm_stats() -> GlobalVmmStats {
     GlobalVmmStats {
         commits: GLOBAL_COMMITS.load(Ordering::Relaxed),
@@ -2926,6 +2921,53 @@ impl Drop for CudaVmmAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The retained-pool bound is read from a value, not from the process
+    /// environment, and only a positive byte count configures a pool.
+    ///
+    /// This is the one knob left after Phase 7 removed the arena's on/off
+    /// switch, so it is also the only remaining way a caller can get the
+    /// arena's retention behaviour wrong. `Some(0)` and unparseable text both
+    /// have to mean "no bound configured" rather than "a bound of zero", which
+    /// would retain nothing and turn every reuse into a fresh `cuMemCreate`.
+    ///
+    /// Parsing is factored out of the environment read specifically so this can
+    /// be asserted without `set_var`, which is process-global and would make
+    /// the result depend on which other test happened to be running.
+    #[test]
+    fn only_a_positive_byte_count_configures_a_retained_physical_pool() {
+        assert_eq!(
+            parse_physical_handle_pool_bytes(Some("67108864")),
+            Some(1 << 26)
+        );
+        assert_eq!(
+            parse_physical_handle_pool_bytes(Some("  67108864 ")),
+            Some(1 << 26),
+            "a value with surrounding whitespace is still a configured bound"
+        );
+
+        assert_eq!(
+            parse_physical_handle_pool_bytes(None),
+            None,
+            "an unset variable configures no bound"
+        );
+        assert_eq!(
+            parse_physical_handle_pool_bytes(Some("0")),
+            None,
+            "zero must mean no pool rather than a pool that can retain nothing"
+        );
+        assert_eq!(
+            parse_physical_handle_pool_bytes(Some("64MiB")),
+            None,
+            "only a plain byte count is accepted; a unit suffix is not silently truncated"
+        );
+        assert_eq!(
+            parse_physical_handle_pool_bytes(Some("-1")),
+            None,
+            "a negative value must not wrap into an enormous bound"
+        );
+        assert_eq!(parse_physical_handle_pool_bytes(Some("")), None);
+    }
 
     #[test]
     fn weight_page_release_churn_is_one_run_per_page_not_one_per_granule() {
