@@ -518,6 +518,16 @@ pub(crate) struct NodePlan {
     pub inplace_dead_inputs: Vec<bool>,
     /// Lazy weight inputs this node may ask the EP to page at dispatch time.
     pub lazy_weight_inputs: Vec<ValueId>,
+    /// Intermediate values whose last consumer is this node, and whose buffers
+    /// may therefore be released once it has run.
+    ///
+    /// Distinct from [`NodePlan::inplace_dead_inputs`], which only ever lets a
+    /// kernel overwrite an input whose shape and dtype already match its output.
+    /// That covers elementwise chains and nothing else, so before this list
+    /// existed every intermediate buffer a graph produced stayed resident for the
+    /// whole run: a 2545-node vision encoder held all 2545 of them at once and
+    /// spent ~20x the memory its live set needs.
+    pub dead_after: Vec<ValueId>,
 }
 
 /// Map a [`crate::sequence::SequenceError`] into an actionable `SessionError`.
