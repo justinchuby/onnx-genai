@@ -3399,3 +3399,231 @@ raw Rayon call sites, but the remaining ones are the one-time prepack/dequant
 passes and the decode paths that already route to the persistent SPMD pool when
 a decode scope is active — neither is on the per-token critical path this phase
 was chasing.
+
+> Corrected in §36. One of those "remaining" sites, `parallel_output_rows`, is
+> on the per-token critical path of every int4 GEMM in the default build, and
+> routing it was worth up to 17.8×. The claim above was reasoning about which
+> code *looked* hot rather than measuring which code ran.
+
+## 36. Phase 16: the int4 GEMM never reached the code phase 15 fixed (#1363)
+
+§35.6 said the remaining raw Rayon call sites in `matmul_nbits.rs` were "the
+one-time prepack/dequant passes and the decode paths that already route to the
+persistent SPMD pool", and that neither was on the per-token critical path.
+That was wrong, and §33.9 had already recorded the evidence: the cell it named
+was still inverted with width. This phase found the site. It is the one every
+int4 GEMM in the default build goes through.
+
+### 36.1 The loss §33.9 named, re-measured
+
+`gemm_nbits_qwen3_0p6b_qkv_t8`, native p50, pure-native build (`bench-native`,
+no `mlas` feature — so no MLAS at runtime and no ORT CPU fallback):
+
+| t=8 | t=16 | t=32 |
+| --- | --- | --- |
+| 1.9 ms | 1.6 ms | **37.7 ms** |
+
+A 23× inversion between sixteen threads and thirty-two, worse than the 4.6×
+§33.9 recorded. Adding sixteen hardware threads made a 1.6 ms kernel take
+37.7 ms.
+
+### 36.2 The fixed path is switched off
+
+The obvious suspect is `borrowed_affine_int4_matmul_prefill` — the `m > 1`
+column fan-out, the native twin of the MLAS tiling phase 15 fixed. Routing it
+through the task runtime changed **nothing**, in either direction, on any cell.
+
+It is dead in the default build. It is gated on
+`borrowed_int4_prefill_block_enabled()`, which reads
+`ONNX_GENAI_CPU_MM_INT4_PREFILL` and defaults to *false*; its sibling
+`borrowed_int4_nblock_enabled()` (`ONNX_GENAI_CPU_MM_INT4_NBLK`) defaults false
+too. The default int4 route is `borrowed_affine_int4_matmul`, and that function
+has no `m > 1` fan-out at all — it loops over activation rows and calls
+`parallel_output_rows` **once per row**. An 8-token prefill is eight
+fork-joins; a 512-token prefill is five hundred and twelve.
+
+`parallel_output_rows` is the single flat fan-out shared by eight call sites
+(`int4_matmul_m1`, `packed_nbits_output_row`, `borrowed_affine_int4_matmul`,
+`borrowed_affine_int4_matmul_nblock`, `int8_row`, `gemv_nk`, `gemv_nk_u8`,
+`gemv_nk_u8_i16`). It was a bare `result.par_chunks_mut(chunk)` on whichever
+Rayon pool happened to be installed — the §26 disease, on the hottest path in
+the CPU EP, three phases after this document declared that path clean.
+
+### 36.3 Measuring anything at all on a host this contended
+
+The reference host carried a load average of 17–35 on 32 logical CPUs for the
+whole of this phase, because several agents share it. That is enough to make
+a single cell swing 5× between trials, so every number below comes from a
+three-arm driver invocation: `base`, `new`, and **`null` — a byte-identical
+copy of the `base` binary**. The null arm measures what the harness reports
+for a change that provably does not exist, and nothing is claimed that the
+null arm also shows.
+
+At t=32, 16 `gemm_nbits_*` cells, 5 trials × 7 runs, all three arms
+interleaved within each trial:
+
+| | geomean | worst cell | best cell |
+| ---- | ---- | ---- | ---- |
+| `null` (base against itself) | 1.00× | 0.72× | 1.20× |
+| `new` (this change) | **2.33×** | 0.65× | 16.6× |
+
+So a per-cell reading anywhere in 0.72–1.20 is indistinguishable from nothing
+on this host, and only the geometric mean and the large movements are
+load-bearing. A second, quieter invocation of the same grid put the geomean at
+2.15×, which is the reproduction.
+
+### 36.4 Routing it, and the regression that came back
+
+Routing `parallel_output_rows` through `task_runtime::for_each_range` produced
+the largest single-change movement in this document. It also produced the first
+reproducible *regression* of the campaign, and the regression is the
+interesting part.
+
+Native-only p50 at t=32, 5 trials × 7 runs, arms interleaved, routing applied
+unconditionally. Speedup is Rayon ÷ task runtime:
+
+| cell | Rayon | task runtime | speedup |
+| ---- | ---- | ---- | ---- |
+| `gemm_nbits_qwen3_0p6b_mlp_t1`   |  11.78 ms |   0.66 ms | **17.8×** |
+| `gemm_nbits_qwen3_0p6b_qkv_t8`   |  40.09 ms |   4.99 ms |  **8.0×** |
+| `gemm_nbits_llama3_8b_qkv_t1`    |  15.41 ms |   1.94 ms |  **7.9×** |
+| `gemm_nbits_qwen3_0p6b_mlp_t8`   |  56.28 ms |   8.27 ms |  **6.8×** |
+| `gemm_nbits_llama3_8b_mlp_t1`    |  16.90 ms |   6.76 ms |    2.5× |
+| `gemm_nbits_llama3_8b_qkv_t8`    |  64.89 ms |  27.54 ms |    2.4× |
+| `gemm_nbits_qwen3_0p6b_qkv_t128` |  74.44 ms |  48.10 ms |    1.6× |
+| `gemm_nbits_llama3_8b_mlp_t8`    |  68.56 ms |  44.61 ms |    1.5× |
+| `gemm_nbits_llama3_8b_mlp_t128`  | 270.11 ms | 291.75 ms | **0.93×** |
+| `gemm_nbits_llama3_8b_mlp_t512`  | 905.81 ms | 1057.8 ms | **0.86×** |
+
+### 36.5 Why one shape loses, and why no single threshold can express it
+
+`llama3_8b_mlp_t8` and `llama3_8b_mlp_t512` run the *same* fan-out: one
+`14336 × 4096` projection row, 56 Mi MACs. At 8 rows the task runtime is 1.5×
+faster and at 512 rows it is 1.17× slower. The per-call work is identical, so
+the discriminator is not work — it is **how many of them arrive back to back**.
+
+That is §33.4's park model read in the other direction. A parked Rayon worker
+takes 67–226 µs to reach its first task, which is why the runtime wins wherever
+fan-outs are sparse. But a kernel issuing one fan-out per activation row of a
+512-token prefill never lets the pool sleep: the park cost is paid once,
+amortised over 512 calls, and stops being charged at all. What is left is the
+runtime's SMT cap — 16 physical lanes against Rayon's 32 threads, the same cap
+§35.3 measured, with nothing on the other side of the ledger.
+
+Both conditions are needed, and no threshold on total operator work can
+substitute for the pair:
+
+| cell | fan-out MACs | calls | total | wants |
+| ---- | ---- | ---- | ---- | ---- |
+| `llama3_8b_mlp_t128` | 56 Mi | 128 |  7.2 Gi | Rayon |
+| `llama3_8b_qkv_t512` | 24 Mi | 512 | 12.3 Gi | task runtime |
+
+The cell that wants Rayon has *less* total work than the cell that wants the
+runtime, so `total >= X` cannot separate them, and reusing §35's
+`WIDE_PREFILL_MACS` would have thrown away five measured wins to fix two
+losses. `flat_fan_out` therefore takes the wide path only when **both** hold:
+`fan_out_macs >= HOT_FAN_OUT_MACS` (32 Mi — measured separation 24 Mi against
+56 Mi) and `calls >= HOT_FAN_OUT_CALLS` (32 — measured separation 8 against
+128). `parallel_output_rows` keeps its one-shot spelling and delegates with
+`calls = 1`, so a decode step can never take the wide path however large its
+projection; only the two row-looping int4 kernels pass `m`.
+
+### 36.6 The narrow-width half, and a pool that should not have existed
+
+The routing was worth 2.2× at t=32 and 1.07× at t=16, but the same grid at
+t=4 came back at a geomean of **0.81×** with six of eight cells losing — well
+outside the 0.95× the null arm shows at that width.
+
+The cause was not the routing. It was `task_runtime::width()`, which is
+documented to *build the pool* so a kernel can size a partition against it. The
+policy asked for the width, decided on Rayon anyway, and left behind a set of
+resident workers that spin before they park — on a machine that at four threads
+has three other workers doing the arithmetic. So `flat_fan_out` now takes
+`lanes` as a closure: the width test that needs no pool runs first, and a
+fan-out that is going to stay on Rayon never asks. The type makes it impossible
+to get wrong again.
+
+That accounts for most of it, and `MIN_ROUTED_FAN_OUT_WIDTH` accounts for the
+rest: below 16 Rayon threads there are too few wake-ups for their cost to be
+worth re-homing a fan-out for, so the whole `t ≤ 8` half of the grid is left
+exactly as it was. The crossover is measured between 8 and 16:
+
+| width | geomean, routed unconditionally | null arm |
+| --- | --- | --- |
+| t=1 | 1.01× | — |
+| t=2 | 1.01× | — |
+| t=4 | **0.81×** | 0.95× |
+| t=8 | **0.94×** | 0.97× |
+| t=16 | 1.07× | — |
+| t=32 | **2.22×** | 1.00× |
+
+t=1 and t=2 are flat because the partition policy declines to split at all and
+both arms run identical serial code.
+
+### 36.7 The matrix after the fix
+
+Same harness, same host, quieter invocation, native-only p50 at t=32 — the only
+width at which the policy can choose:
+
+| cell | fan-out | calls | path | Rayon | new | speedup |
+| ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+| `qwen3_0p6b_mlp_t1`   |  6 Mi |   1 | runtime |  10.68 ms |   1.24 ms | **8.6×** |
+| `qwen3_0p6b_qkv_t1`   |  3 Mi |   1 | runtime |   4.84 ms |   0.70 ms | **6.9×** |
+| `qwen3_0p6b_mlp_t8`   |  6 Mi |   8 | runtime |  60.20 ms |   9.98 ms | **6.0×** |
+| `qwen3_0p6b_qkv_t8`   |  3 Mi |   8 | runtime |  48.25 ms |   8.40 ms | **5.8×** |
+| `llama3_8b_qkv_t1`    | 24 Mi |   1 | runtime |  14.01 ms |   2.45 ms | **5.7×** |
+| `llama3_8b_qkv_t8`    | 24 Mi |   8 | runtime |  65.29 ms |  29.40 ms |    2.2× |
+| `llama3_8b_mlp_t1`    | 56 Mi |   1 | runtime |  16.92 ms |   8.26 ms |    2.1× |
+| `llama3_8b_mlp_t8`    | 56 Mi |   8 | runtime |  67.34 ms |  44.74 ms |    1.5× |
+| `qwen3_0p6b_qkv_t128` |  3 Mi | 128 | runtime |  80.11 ms |  53.13 ms |    1.5× |
+| `qwen3_0p6b_qkv_t512` |  3 Mi | 512 | runtime | 144.62 ms | 117.31 ms |    1.2× |
+| `llama3_8b_qkv_t128`  | 24 Mi | 128 | runtime | 180.50 ms | 158.75 ms |    1.1× |
+| `qwen3_0p6b_mlp_t512` |  6 Mi | 512 | runtime | 183.28 ms | 167.18 ms |    1.1× |
+| `llama3_8b_qkv_t512`  | 24 Mi | 512 | runtime | 528.29 ms | 490.51 ms |    1.1× |
+| `qwen3_0p6b_mlp_t128` |  6 Mi | 128 | runtime |  87.71 ms |  82.94 ms |    1.1× |
+| `llama3_8b_mlp_t512`  | 56 Mi | 512 | **wide** | 899.74 ms | 891.01 ms |    1.0× |
+| `llama3_8b_mlp_t128`  | 56 Mi | 128 | **wide** | 212.54 ms | 213.85 ms |    1.0× |
+
+Both regressions are gone and no win was traded for them. The two diverted
+cells were then re-measured on their own at 9 trials, three arms, to settle
+them past the noise §36.3 quantified:
+
+| cell | base | `null` | `new` |
+| ---- | ---- | ---- | ---- |
+| `llama3_8b_mlp_t128` | 270.1 ms | 262.5 ms (1.03×) | 264.0 ms (**1.02×**) |
+| `llama3_8b_mlp_t512` | 906.5 ms | 898.0 ms (1.01×) | 908.0 ms (**1.00×**) |
+
+The `new` arm tracks the null arm on both, which is the expected result for a
+policy that hands those two cells back to the code the base binary runs. Their
+readings in the contended grid (1.33× and 0.65×) were a demonstration of what
+§36.3 measured, not a result. The four dense f32 cells are the other control:
+this change cannot reach them, and they came back 0.96×–0.99×.
+
+Every cell reported `parity=PASS`. Row-sharding a GEMV is exactly associative —
+no cross-row reduction — so results are bit-identical however the rows are
+partitioned.
+
+### 36.8 What is still lost
+
+`gemm_nbits_qwen3_0p6b_qkv_t8` is 8.4 ms at t=32 against 1.6 ms at t=16. The
+inversion is 23× smaller than it was but it has not gone to zero, and the
+remaining shape — more threads, more time — is still a scheduler signature, not
+an arithmetic one. The leading hypothesis is `with_decode_pool`'s
+`pool.install(operation)`, which is itself a fork-join onto a pool that may be
+parked, paid once per `MatMulNBits` node call and now plausibly the dominant
+term. It is untested: skipping the install when the task runtime will serve the
+fan-out changes what `output_chunk_len` sees from
+`rayon::current_num_threads()`, so the probe needs care to stay a probe.
+
+Nesting is the other open item. `packed_nbits_output_row` and `int8_row` are
+called from inside a `par_chunks_mut` for `m > 1` with `parallel_columns` set,
+so several Rayon workers can now dispatch into the task pool concurrently. The
+pool's eight job slots make surplus dispatches fall back to inline execution,
+which is correct and bounded — but "correct and bounded" is an argument, not a
+measurement, and it has not been measured.
+
+The third item is this document's own method. §36.3 is the first null arm in
+the campaign, and it says that a large fraction of the per-cell readings in
+earlier phases — anything inside 0.72×–1.20× at t=32, or 0.69×–1.27× at t=4 —
+carried no information about the change being measured. The 5–15% movements
+tabulated in several earlier sections should be read with that in mind.
