@@ -990,12 +990,21 @@ impl CudaRuntime {
     /// Unlike [`synchronize`], this ignores the `defer_eager_sync` deferral
     /// (#1383). Eliding a *trailing per-op* eager sync is safe — the single
     /// in-order EP stream preserves kernel→kernel ordering — but eliding a
-    /// *pre-unmap* drain is a use-after-free: the granule is unmapped while an
-    /// in-flight decode kernel still references its VA, and under stable-slot
-    /// remapping (#716) a late read silently returns the successor weight's
-    /// bytes rather than faulting (#1439). Any caller that must know all prior
-    /// compute has retired before freeing/remapping memory MUST use this,
-    /// never `synchronize()`.
+    /// *pre-unmap* drain is a use-after-unmap: the granule is unmapped while an
+    /// in-flight decode kernel still references its VA. This was observed as
+    /// `CUDA_ERROR_ILLEGAL_ADDRESS` on the weight-offload repro (11/11 runs).
+    ///
+    /// A silent variant — a late read returning a *successor weight's* bytes
+    /// under stable-slot reuse (#716) — was hypothesised and then **falsified**:
+    /// stable slots are keyed by weight `key`, a slot's VA is reused only for
+    /// the same key, and on collision admission refuses rather than remaps, so a
+    /// stale read hits either decommitted physical memory (faults) or the same
+    /// weight's byte-identical bytes — never a different weight. The 11/11 runs
+    /// all crashed; 0 diverged. The hazard here is therefore a loud fault, not
+    /// silent corruption. See #1439 for the full chain.
+    ///
+    /// Any caller that must know all prior compute has retired before
+    /// freeing/remapping memory MUST use this, never `synchronize()`.
     pub fn drain_for_unmap(&self) -> Result<()> {
         self.force_synchronize()
     }
