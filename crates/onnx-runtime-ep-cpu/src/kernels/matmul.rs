@@ -1431,9 +1431,6 @@ fn gemm_bt_col_parallel(
     }
 }
 
-/// Whether this shape will reach the packed micro-kernel inside
-/// [`gemm_bt_block`]. Used by [`gemm_bt`] to widen the single-threaded row block
-/// so the pack is amortized once over the whole row extent; always `false` where
 /// Raw pointer to `c` wrapped so Rayon can hand disjoint column panels to
 /// worker threads. Each panel writes a disjoint set of columns of every row, so
 /// no two tasks touch the same element — the `Send`/`Sync` impls are sound
@@ -6730,12 +6727,20 @@ mod tests {
             (121, 2048, 85), // short final panel, both remainders
             (96, 2048, 147), // short final panel at two of the widths below
             (96, 2048, 163), // short final panel at two more
+            (74, 2048, 48),  // row remainder with no column remainder
         ];
         const THREADS: &[usize] = &[2, 3, 4, 8];
         // The panel width is derived from the column extent and the thread
         // count, so a shape list that happens to divide evenly at every width
         // would leave the short-final-panel path untested. Pin that it does
         // not.
+        assert!(
+            SHAPES
+                .iter()
+                .any(|&(m, _, n)| n % 16 == 0 && m % 6 != 0 && m / 6 >= *THREADS.last().unwrap()),
+            "no shape has a row remainder without a column remainder: the \
+             remainder pass would be reached for the wrong reason"
+        );
         assert!(
             !gemm_bt_avx2::available()
                 || THREADS.iter().any(|&t| {
