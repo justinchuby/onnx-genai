@@ -8,6 +8,25 @@ use onnx_runtime_ep_api::{
 /// needed for that slot, `None` when the input was used in place.
 type MaterializedInputs = Vec<Option<(Vec<u8>, Vec<i64>)>>;
 
+/// Whether GroupQueryAttention with capacity-bound (persistently bound, aliased
+/// in-place) present-KV outputs sizes its present shape from the host-known
+/// past-KV physical capacity instead of reading `seqlens_k`/`total_sequence_length`
+/// back to host per layer. On by default — this removes the dominant blocking
+/// scalar-D2H cost of eager decode (the present extent equals the fixed capacity,
+/// so the read-back is redundant). Disable via `ONNX_GENAI_GQA_SHAPE_ONDEVICE=0`
+/// to restore the always-read-back path (escape hatch for debugging).
+fn gqa_shape_capacity_bound_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ONNX_GENAI_GQA_SHAPE_ONDEVICE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .is_none_or(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no"))
+    })
+}
+
 struct WeightStoreRegionSource<'a>(&'a onnx_runtime_loader::weights::WeightStore);
 
 impl MmapRegionSource for WeightStoreRegionSource<'_> {
@@ -697,10 +716,35 @@ impl Executor {
         // output needs none, and the compute path sizes them just below.
         if outputs.iter().any(|v| !resolved.contains_key(v)) {
             let opset = effective_opset(&self.graph, node);
+            // GroupQueryAttention's present-KV output shape is the physical cache
+            // capacity (see `kernel_input_uses_physical_capacity`): the native EP
+            // binds present aliased in-place to the fixed-capacity past-KV, so the
+            // present sequence extent equals `past_key[2]` — known on host from the
+            // input *shape*. Reading its integer shape inputs (`seqlens_k`,
+            // `total_sequence_length`) back to host per layer is therefore
+            // unnecessary and, in eager decode, the dominant blocking-D2H launch
+            // cost. Skip materializing them; `dynamic_output_shapes` sizes present
+            // from the past-KV capacity when the total value is absent.
+            let is_gqa = node.domain == "com.microsoft" && node.op_type == "GroupQueryAttention";
+            // Only skip the shape-input read-backs when the present-KV outputs are
+            // externally (persistently) bound: their bound buffer shape is the
+            // authoritative fixed physical capacity, aliased in-place to past-KV,
+            // so `present_sequence == past_key[2]` (host-known) and reading
+            // `seqlens_k`/`total_sequence_length` back to host is redundant. A
+            // GQA node whose present outputs are NOT capacity-bound (e.g. a
+            // growing `past ⧺ current` cache) still reads `total_sequence_length`.
+            let gqa_present_capacity_bound = is_gqa
+                && gqa_shape_capacity_bound_enabled()
+                && outputs
+                    .get(1)
+                    .is_some_and(|vid| external.outputs.contains_key(vid));
             let input_values: Vec<Option<Vec<i64>>> = inputs
                 .iter()
                 .enumerate()
                 .map(|(i, v)| {
+                    if gqa_present_capacity_bound {
+                        return None;
+                    }
                     v.and_then(|vid| {
                         if node.is_default_domain() && node.op_type == "Compress" && i == 1 {
                             self.compress_condition_i64(vid, &input_shapes[i], input_dtypes[i])

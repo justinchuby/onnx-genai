@@ -110,6 +110,26 @@ const DECLINED: &[(&str, &str)] = &[
     ("com.microsoft", "LinearAttention"),
 ];
 
+/// Internal ops that exist only in a `--features mlas` research build.
+///
+/// The NCHWc layout pass is compiled only with the reference linked, so these
+/// six are absent from the registry of every shipped build. They belong to
+/// group 2 above: `CpuNchwcLayoutPropagation` emits them into the private
+/// `pkg.nxrt` domain *after* capability, so no model ever presents one and
+/// `GetCapability` is never asked about them. Kept in a separate list rather
+/// than folded into `DECLINED`, because in a default build naming them would
+/// fail the opposite assertion — they are not declined there, they do not
+/// exist.
+#[cfg(feature = "mlas")]
+const DECLINED_WITH_REFERENCE: &[(&str, &str)] = &[
+    ("pkg.nxrt", "NchwcAveragePool"),
+    ("pkg.nxrt", "NchwcConv"),
+    ("pkg.nxrt", "NchwcGlobalAveragePool"),
+    ("pkg.nxrt", "NchwcMaxPool"),
+    ("pkg.nxrt", "NchwcReorderToBlocked"),
+    ("pkg.nxrt", "NchwcReorderToNchw"),
+];
+
 /// Ops registered only so a test can exercise the registry machinery. They are
 /// not real ONNX ops and must never be expected in the shape table.
 const TEST_ONLY: &[&str] = &["TotallyFakeOp"];
@@ -214,6 +234,12 @@ fn every_registered_op_has_a_shape_rule_or_is_a_known_gap() {
         .iter()
         .map(|(d, o)| ((*d).to_string(), (*o).to_string()))
         .collect();
+    #[cfg(feature = "mlas")]
+    expected.extend(
+        DECLINED_WITH_REFERENCE
+            .iter()
+            .map(|(d, o)| ((*d).to_string(), (*o).to_string())),
+    );
     expected.sort();
 
     let newly_declined: Vec<_> = actual.iter().filter(|e| !expected.contains(e)).collect();
