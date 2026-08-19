@@ -43,8 +43,9 @@ pub fn build_testplugin() -> PathBuf {
         "onnx_runtime_memory_testplugin.dll"
     };
 
-    let mut command =
-        std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| String::from("cargo")));
+    let mut command = std::process::Command::new(
+        std::env::var("CARGO").unwrap_or_else(|_| String::from("cargo")),
+    );
     command.args(["build", "-p", "onnx-runtime-memory-testplugin"]);
     if profile != "debug" {
         command.args(["--profile", &profile]);
@@ -77,4 +78,3 @@ pub fn build_testplugin() -> PathBuf {
          {candidates:?}. Set NXMEM_TESTPLUGIN_PATH when using a custom target directory."
     );
 }
-

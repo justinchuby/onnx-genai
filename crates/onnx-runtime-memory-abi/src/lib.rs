@@ -100,6 +100,12 @@
 //! exposed here and never will be. Nothing that predates this contract is
 //! promised ABI compatibility.
 
+// `NxmemStatus` carries its message inline, in a fixed 256-byte buffer, so that
+// no heap allocation is ever owned across the dynamic-library boundary. That
+// makes every `Result<_, NxmemStatus>` "large" by clippy's measure. Boxing the
+// error, which is what the lint asks for, would reintroduce exactly the
+// cross-allocator ownership this ABI exists to forbid.
+#![allow(clippy::result_large_err)]
 #![deny(clippy::mem_forget)]
 
 pub mod status;
@@ -108,23 +114,22 @@ pub mod version;
 pub mod vtable;
 
 pub use status::{
-    catch_status_panic, catch_void_panic, NxmemStatus, NxmemStatusCode, NXMEM_STATUS_MESSAGE_BUF,
-    NXMEM_STATUS_MESSAGE_MAX,
+    NXMEM_STATUS_MESSAGE_BUF, NXMEM_STATUS_MESSAGE_MAX, NxmemStatus, NxmemStatusCode,
+    catch_status_panic, catch_void_panic,
 };
 pub use types::{
-    check_identity, NxmemAllocRequest, NxmemAllocResult, NxmemAllocation, NxmemByteRange,
-    NxmemDeviceId, NxmemHostCallbacks, NxmemRangeRequest, NxmemReclaimRequest,
-    NxmemReleaseCompletion, NxmemReleaseOutcome, NxmemSharedPrefixCommitInfo,
-    NxmemSharedPrefixCommitRequest, NxmemSharedPrefixHandle, NxmemUnloadReport,
     NXMEM_RELEASE_COMPLETE, NXMEM_RELEASE_FAILED, NXMEM_RELEASE_QUARANTINED, NXMEM_TIER_DEVICE,
-    NXMEM_TIER_DISK, NXMEM_TIER_HOST,
+    NXMEM_TIER_DISK, NXMEM_TIER_HOST, NxmemAllocRequest, NxmemAllocResult, NxmemAllocation,
+    NxmemByteRange, NxmemDeviceId, NxmemHostCallbacks, NxmemRangeRequest, NxmemReclaimRequest,
+    NxmemReleaseCompletion, NxmemReleaseOutcome, NxmemSharedPrefixCommitInfo,
+    NxmemSharedPrefixCommitRequest, NxmemSharedPrefixHandle, NxmemUnloadReport, check_identity,
 };
 pub use version::{
-    capability_min_minor, describe_capabilities, negotiate, negotiate_as, validate_negotiation,
-    NegotiationRejection, NxmemNegotiateRequest, NxmemNegotiateResponse, NxmemVersionRange,
     NXMEM_ABI_VERSION_MAJOR, NXMEM_ABI_VERSION_MINOR, NXMEM_ABI_VERSION_MINOR_BASELINE,
     NXMEM_CAP_ALLOCATOR, NXMEM_CAP_DEFERRED_RELEASE, NXMEM_CAP_KNOWN_MASK,
     NXMEM_CAP_SHARED_MAPPING, NXMEM_CAP_STRUCTURED_RELEASE, NXMEM_CAP_VIRTUAL_BACKING,
+    NegotiationRejection, NxmemNegotiateRequest, NxmemNegotiateResponse, NxmemVersionRange,
+    capability_min_minor, describe_capabilities, negotiate, negotiate_as, validate_negotiation,
 };
 pub use vtable::{
     NxmemAllocatorFactoryVtable, NxmemAllocatorVtable, NxmemOpenRequest, NxmemSharedMappingVtable,

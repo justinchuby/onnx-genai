@@ -25,6 +25,12 @@
 //! Backing storage is ordinary host memory from `std::alloc`, allocated **and
 //! freed inside this module**. No allocator ownership crosses the boundary.
 
+// `NxmemStatus` carries its message inline, in a fixed 256-byte buffer, so that
+// no heap allocation is ever owned across the dynamic-library boundary. That
+// makes every `Result<_, NxmemStatus>` "large" by clippy's measure. Boxing the
+// error, which is what the lint asks for, would reintroduce exactly the
+// cross-allocator ownership this ABI exists to forbid.
+#![allow(clippy::result_large_err)]
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -91,6 +97,12 @@ struct Behaviour {
     probe_host_callback: bool,
     /// Never retire a queued release, so unload stays refused.
     never_drain: bool,
+    /// Keep residual ownership of every released allocation instead of
+    /// completing it, so the host must quarantine rather than refund.
+    quarantine_on_release: bool,
+    /// Report a release state code from a future contract level the host has
+    /// never heard of.
+    unknown_release_state: bool,
 }
 
 impl Behaviour {
@@ -101,6 +113,8 @@ impl Behaviour {
             short_allocator_struct: false,
             probe_host_callback: false,
             never_drain: false,
+            quarantine_on_release: false,
+            unknown_release_state: false,
         }
     }
 }
@@ -163,6 +177,27 @@ const MECHANISMS: &[Mechanism] = &[
         },
     },
     Mechanism {
+        name: "quarantining",
+        c_name: c"quarantining",
+        behaviour: Behaviour {
+            // Models a mechanism that cannot fully unmap on release: the
+            // address must never be handed back out, and the host must not
+            // refund the residue.
+            quarantine_on_release: true,
+            ..Behaviour::base()
+        },
+    },
+    Mechanism {
+        name: "future-state",
+        c_name: c"future-state",
+        behaviour: Behaviour {
+            // Models a plugin from a later contract level reporting an
+            // outcome this host predates. The host must fail closed.
+            unknown_release_state: true,
+            ..Behaviour::base()
+        },
+    },
+    Mechanism {
         name: "sticky",
         c_name: c"sticky",
         behaviour: Behaviour {
@@ -185,6 +220,8 @@ pub const MECHANISM_NAMES: &[&str] = &[
     "short-struct",
     "callback-probe",
     "legacy-1-0",
+    "quarantining",
+    "future-state",
     "sticky",
 ];
 
@@ -246,6 +283,10 @@ struct AllocatorInner {
     blocks: HashMap<u64, Block>,
     queue: Vec<QueuedRelease>,
     prefixes: HashMap<u64, Prefix>,
+    /// Blocks this module kept residual ownership of. They are *not* free and
+    /// must never be reissued; the module frees them only when the allocator
+    /// itself is destroyed.
+    retained: Vec<Block>,
 }
 
 impl AllocatorState {
@@ -295,11 +336,7 @@ impl AllocatorState {
         };
         // SAFETY: `completion` is a valid local that outlives the call.
         let status = unsafe { release_completed(callbacks.host_ctx, completion as *const _) };
-        if status.is_ok() {
-            Ok(())
-        } else {
-            Err(status)
-        }
+        if status.is_ok() { Ok(()) } else { Err(status) }
     }
 }
 
@@ -568,6 +605,40 @@ unsafe extern "C" fn plugin_release_allocation(
 
         let unmapped = block.committed as u64;
         let bytes = block.bytes as u64;
+
+        if state.behaviour.unknown_release_state {
+            // Deliberately from the future. The block is kept, because a host
+            // that cannot interpret the state must not treat the address as
+            // reusable either.
+            let mut outcome = NxmemReleaseOutcome::complete(bytes, unmapped);
+            outcome.state = FUTURE_RELEASE_STATE;
+            retain_block(state, block);
+            counters().live_allocations.fetch_sub(1, Ordering::AcqRel);
+            // SAFETY: checked non-null above.
+            unsafe { *outcome_out = outcome };
+            return NxmemStatus::ok();
+        }
+
+        if state.behaviour.quarantine_on_release {
+            // Half the mapping came back; the module still owns the rest.
+            let returned = unmapped / 2;
+            retain_block(state, block);
+            counters().live_allocations.fetch_sub(1, Ordering::AcqRel);
+            // SAFETY: checked non-null above.
+            unsafe {
+                *outcome_out = NxmemReleaseOutcome::quarantined(
+                    bytes,
+                    returned,
+                    bytes - returned,
+                    NxmemStatus::with_message(
+                        NxmemStatusCode::ReleaseQuarantined,
+                        "testplugin: this mechanism cannot unmap the whole allocation",
+                    ),
+                );
+            }
+            return NxmemStatus::ok();
+        }
+
         free_block(block);
         counters().live_allocations.fetch_sub(1, Ordering::AcqRel);
         // SAFETY: checked non-null above.
@@ -757,6 +828,21 @@ unsafe extern "C" fn plugin_release(ctx: *mut c_void) {
 /// A queued release holds its own reference, so the state cannot be destroyed
 /// while a deferred free still names it. `retain`/`release` never call back
 /// into the host, as the contract requires.
+/// A release state code from a contract level this host predates.
+const FUTURE_RELEASE_STATE: u32 = 0x0BAD_F00D;
+
+/// Keep residual ownership of a block.
+///
+/// The memory is neither freed nor reissued: it is parked until the allocator
+/// is destroyed, which is exactly what "the plugin still owns it" means.
+fn retain_block(state: &AllocatorState, block: Block) {
+    // Losing the lock must not turn into a double free, so on poisoning the
+    // block is deliberately leaked for the lifetime of the process instead.
+    if let Ok(mut inner) = state.inner.lock() {
+        inner.retained.push(block);
+    }
+}
+
 fn release_state(state: &AllocatorState) {
     let previous = state.refcount.fetch_sub(1, Ordering::AcqRel);
     if previous != 1 {
@@ -778,6 +864,10 @@ fn release_state(state: &AllocatorState) {
             });
             counters().live_allocations.fetch_sub(1, Ordering::AcqRel);
             counters().queued_releases.fetch_sub(1, Ordering::AcqRel);
+        }
+        let retained: Vec<Block> = inner.retained.drain(..).collect();
+        for block in retained {
+            free_block(block);
         }
         let prefixes: Vec<Prefix> = inner.prefixes.drain().map(|(_, prefix)| prefix).collect();
         for prefix in prefixes {
@@ -1358,17 +1448,18 @@ unsafe extern "C" fn plugin_open_allocator(
                 vtable.committed_bytes = Some(plugin_committed_bytes);
                 Box::new(vtable)
             });
-        let shared_vtable = (behaviour.capability_flags & NXMEM_CAP_SHARED_MAPPING != 0).then(|| {
-            let mut vtable = NxmemSharedMappingVtable::zeroed();
-            vtable.abi_minor = abi_minor;
-            vtable.mechanism_id = mechanism_id;
-            vtable.create_shared_prefix = Some(plugin_create_shared_prefix);
-            vtable.retain_shared_prefix = Some(plugin_retain_shared_prefix);
-            vtable.release_shared_prefix = Some(plugin_release_shared_prefix);
-            vtable.incremental_owned_bytes = Some(plugin_incremental_owned_bytes);
-            vtable.commit_shared_prefix = Some(plugin_commit_shared_prefix);
-            Box::new(vtable)
-        });
+        let shared_vtable =
+            (behaviour.capability_flags & NXMEM_CAP_SHARED_MAPPING != 0).then(|| {
+                let mut vtable = NxmemSharedMappingVtable::zeroed();
+                vtable.abi_minor = abi_minor;
+                vtable.mechanism_id = mechanism_id;
+                vtable.create_shared_prefix = Some(plugin_create_shared_prefix);
+                vtable.retain_shared_prefix = Some(plugin_retain_shared_prefix);
+                vtable.release_shared_prefix = Some(plugin_release_shared_prefix);
+                vtable.incremental_owned_bytes = Some(plugin_incremental_owned_bytes);
+                vtable.commit_shared_prefix = Some(plugin_commit_shared_prefix);
+                Box::new(vtable)
+            });
 
         let mut allocator_vtable = NxmemAllocatorVtable::zeroed();
         allocator_vtable.abi_minor = abi_minor;

@@ -263,7 +263,9 @@ fn a_short_allocator_vtable_is_refused_before_any_slot_is_read() {
 
     let text = error.to_string();
     assert!(
-        text.contains("struct_size") || text.to_lowercase().contains("short") || text.contains("small"),
+        text.contains("struct_size")
+            || text.to_lowercase().contains("short")
+            || text.contains("small"),
         "the refusal must explain that the struct is too short, got: {text}"
     );
 }
@@ -411,6 +413,82 @@ fn a_release_that_misdescribes_the_allocation_is_refused() {
     // SAFETY: the allocation is still live with its original parameters.
     let outcome = unsafe { allocator.release(ptr, 4096, 64) };
     assert!(matches!(outcome, AllocationReleaseOutcome::Complete { .. }));
+}
+
+/// A plugin that keeps part of the mapping must be quarantined, not refunded.
+///
+/// This drives the real [`DeviceAllocator::release`] entry point rather than
+/// the private outcome-interpreting helper, because the branch worth pinning
+/// is the one the production caller actually reaches.
+#[test]
+fn a_partial_release_is_quarantined_rather_than_refunded() {
+    let _serial = serial();
+    let plugin = load();
+    let allocator = open(&plugin, "quarantining", NXMEM_CAP_ALLOCATOR);
+    let ptr = allocator.allocate(8192, 64).expect("allocation");
+
+    // SAFETY: the address is live with these exact parameters.
+    let outcome = unsafe { allocator.release(ptr, 8192, 64) };
+    let AllocationReleaseOutcome::Quarantined {
+        accounting,
+        residual,
+    } = outcome
+    else {
+        panic!("a partial release must quarantine, got {outcome:?}");
+    };
+    assert_eq!(
+        accounting.allocation_bytes, 8192,
+        "the full allocation size is still what was charged"
+    );
+    assert_eq!(
+        accounting.unmapped_bytes, 4096,
+        "only the part the plugin really gave back may be credited"
+    );
+    assert_eq!(
+        residual.retained_bytes, 4096,
+        "the rest stays owned by the plugin"
+    );
+    assert_eq!(
+        residual.address,
+        ptr.as_ptr() as usize,
+        "the quarantine record must name the address so it is never reissued"
+    );
+    assert_eq!(
+        allocator.core().live_allocation_count(),
+        0,
+        "the host no longer tracks it: the plugin does"
+    );
+}
+
+/// A release state from a later contract level fails closed.
+///
+/// The host has no way to know whether the memory is safe to reuse, so it must
+/// quarantine rather than guess in either direction.
+#[test]
+fn a_release_state_from_the_future_is_quarantined_not_guessed() {
+    let _serial = serial();
+    let plugin = load();
+    let allocator = open(&plugin, "future-state", NXMEM_CAP_ALLOCATOR);
+    let ptr = allocator.allocate(4096, 64).expect("allocation");
+
+    // SAFETY: the address is live with these exact parameters.
+    let outcome = unsafe { allocator.release(ptr, 4096, 64) };
+    let AllocationReleaseOutcome::Quarantined {
+        accounting,
+        residual,
+    } = outcome
+    else {
+        panic!("an uninterpretable state must fail closed, got {outcome:?}");
+    };
+    assert_eq!(
+        accounting.unmapped_bytes, 0,
+        "nothing may be credited back from a state the host cannot read"
+    );
+    assert_eq!(
+        residual.retained_bytes, 4096,
+        "the whole allocation is presumed still owned by the plugin"
+    );
+    assert_eq!(allocator.core().live_allocation_count(), 0);
 }
 
 // ─── lazy backing ───────────────────────────────────────────────────────────
@@ -650,7 +728,10 @@ fn a_refusing_host_callback_fails_the_allocation_cleanly() {
     let allocator = plugin
         .factory("callback-probe")
         .expect("the mechanism is published")
-        .open(NXMEM_CAP_ALLOCATOR, Some(ScriptedReclaim::granting(1 << 20)))
+        .open(
+            NXMEM_CAP_ALLOCATOR,
+            Some(ScriptedReclaim::granting(1 << 20)),
+        )
         .expect("the mechanism opens");
     let ptr = allocator
         .allocate(4096, 64)
@@ -904,7 +985,7 @@ fn every_factory_is_released_exactly_once() {
     let before = releases(&observer);
     let plugin = load();
     let count = plugin.factories().len() as u64;
-    assert_eq!(count, 6, "the test plugin publishes six mechanisms");
+    assert_eq!(count, 8, "the test plugin publishes eight mechanisms");
     plugin.try_unload().expect("an idle plugin unloads");
 
     assert_eq!(

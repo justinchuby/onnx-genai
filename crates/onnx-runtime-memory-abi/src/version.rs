@@ -431,7 +431,8 @@ pub fn validate_negotiation(
         NXMEM_CAP_DEFERRED_RELEASE,
         NXMEM_CAP_STRUCTURED_RELEASE,
     ] {
-        if response.capability_flags & flag != 0 && response.agreed_minor < capability_min_minor(flag)
+        if response.capability_flags & flag != 0
+            && response.agreed_minor < capability_min_minor(flag)
         {
             return reject(format!(
                 "plugin advertises capability {} at nxmem minor {} but that capability is only \

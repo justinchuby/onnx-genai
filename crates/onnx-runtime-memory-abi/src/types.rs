@@ -638,7 +638,10 @@ pub fn check_identity(
             &format!(
                 "nxmem: object belongs to device (tier {}, index {}) but device (tier {}, index \
                  {}) was addressed",
-                actual_device.tier, actual_device.index, expected_device.tier, expected_device.index
+                actual_device.tier,
+                actual_device.index,
+                expected_device.tier,
+                expected_device.index
             ),
         ));
     }
@@ -738,13 +741,6 @@ mod tests {
     #[test]
     fn unknown_tier_codes_are_not_guessed() {
         assert_eq!(NxmemDeviceId::HOST.tier_code(), Some(NXMEM_TIER_HOST));
-        assert_eq!(
-            NxmemDeviceId {
-                tier: 77,
-                index: 0
-            }
-            .tier_code(),
-            None
-        );
+        assert_eq!(NxmemDeviceId { tier: 77, index: 0 }.tier_code(), None);
     }
 }

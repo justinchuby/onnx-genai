@@ -97,7 +97,7 @@ fn check_vtable_ptr<T>(ptr: *const T, what: &str) -> Result<(), NxmemStatus> {
             &format!("nxmem: {what} vtable pointer is null"),
         ));
     }
-    if (ptr as usize) % core::mem::align_of::<T>() != 0 {
+    if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
         return Err(NxmemStatus::with_message(
             NxmemStatusCode::InvalidArgument,
             &format!(
@@ -123,11 +123,7 @@ unsafe fn copy_prefix<T: Copy>(ptr: *const T, declared_size: usize) -> T {
     // valid for `readable` bytes by this function's contract; the regions
     // cannot overlap because `out` is a local.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            ptr as *const u8,
-            out.as_mut_ptr() as *mut u8,
-            readable,
-        );
+        core::ptr::copy_nonoverlapping(ptr as *const u8, out.as_mut_ptr() as *mut u8, readable);
         out.assume_init()
     }
 }
@@ -292,7 +288,10 @@ impl NxmemAllocatorVtable {
     ///
     /// `ptr` must either be null (rejected) or point to a live vtable whose
     /// first `struct_size` bytes are readable for the duration of the call.
-    pub unsafe fn read_prefix(ptr: *const Self, negotiated_minor: u32) -> Result<Self, NxmemStatus> {
+    pub unsafe fn read_prefix(
+        ptr: *const Self,
+        negotiated_minor: u32,
+    ) -> Result<Self, NxmemStatus> {
         check_vtable_ptr(ptr, "allocator")?;
         // SAFETY: `ptr` was proved non-null and aligned; `struct_size` is the
         // first field of every version of this struct.
@@ -401,8 +400,9 @@ pub struct NxmemVirtualBackingVtable {
         ) -> NxmemStatus,
     >,
     /// Commit one span of an existing allocation.
-    pub commit_range:
-        Option<unsafe extern "C" fn(ctx: *mut c_void, request: *const NxmemRangeRequest) -> NxmemStatus>,
+    pub commit_range: Option<
+        unsafe extern "C" fn(ctx: *mut c_void, request: *const NxmemRangeRequest) -> NxmemStatus,
+    >,
     /// Decommit one span, writing the bytes actually unmapped.
     pub decommit_range: Option<
         unsafe extern "C" fn(
@@ -697,7 +697,10 @@ impl NxmemAllocatorFactoryVtable {
     /// # Safety
     ///
     /// Same contract as [`NxmemAllocatorVtable::read_prefix`].
-    pub unsafe fn read_prefix(ptr: *const Self, negotiated_minor: u32) -> Result<Self, NxmemStatus> {
+    pub unsafe fn read_prefix(
+        ptr: *const Self,
+        negotiated_minor: u32,
+    ) -> Result<Self, NxmemStatus> {
         check_vtable_ptr(ptr, "allocator-factory")?;
         // SAFETY: `ptr` was proved non-null and aligned.
         let declared_size = unsafe { read_struct_size(ptr) } as usize;
@@ -776,9 +779,12 @@ mod tests {
 
     #[test]
     fn the_minor_1_prefix_is_larger_than_the_minor_0_prefix() {
-        assert!(
+        // Compile-time, because a regression here is a layout bug that must
+        // not be allowed to link, let alone run.
+        const _: () = assert!(
             NxmemAllocatorVtable::MIN_STRUCT_SIZE_MINOR_1
-                > NxmemAllocatorVtable::MIN_STRUCT_SIZE_MINOR_0
+                > NxmemAllocatorVtable::MIN_STRUCT_SIZE_MINOR_0,
+            "minor 1 must require a longer prefix than minor 0"
         );
         assert_eq!(
             NxmemAllocatorVtable::MIN_STRUCT_SIZE_MINOR_1,
@@ -897,8 +903,8 @@ mod tests {
     #[test]
     fn a_misaligned_vtable_pointer_is_refused() {
         let vtable = conforming_allocator(1);
-        let misaligned = (&vtable as *const NxmemAllocatorVtable as usize + 1)
-            as *const NxmemAllocatorVtable;
+        let misaligned =
+            (&vtable as *const NxmemAllocatorVtable as usize + 1) as *const NxmemAllocatorVtable;
         // SAFETY: `read_prefix` rejects on alignment before dereferencing.
         let status =
             unsafe { NxmemAllocatorVtable::read_prefix(misaligned, 1) }.expect_err("misaligned");

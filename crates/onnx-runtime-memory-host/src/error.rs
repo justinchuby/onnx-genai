@@ -32,10 +32,16 @@ pub enum PluginError {
     Negotiation { path: String, reason: String },
 
     /// The plugin returned a failing status.
+    ///
+    /// The status is boxed because it carries a 256-byte inline message
+    /// buffer, which is right on the wire — the buffer is what keeps heap
+    /// ownership from crossing the boundary — but would otherwise make every
+    /// `PluginError` that size. This type never crosses FFI, so boxing here
+    /// costs nothing the ABI cares about.
     #[error("memory plugin call `{operation}` failed: {}", .status.describe())]
     Call {
         operation: &'static str,
-        status: NxmemStatus,
+        status: Box<NxmemStatus>,
     },
 
     /// The plugin violated the contract in a way that is not a mere failure.
@@ -54,7 +60,10 @@ pub enum PluginError {
 impl PluginError {
     /// Build a call failure from a status, for a named operation.
     pub fn call(operation: &'static str, status: NxmemStatus) -> Self {
-        Self::Call { operation, status }
+        Self::Call {
+            operation,
+            status: Box::new(status),
+        }
     }
 }
 
@@ -125,7 +134,8 @@ mod tests {
 
     #[test]
     fn a_wrong_mechanism_status_is_not_reported_as_out_of_memory() {
-        let status = NxmemStatus::with_message(NxmemStatusCode::WrongMechanism, "foreign allocation");
+        let status =
+            NxmemStatus::with_message(NxmemStatusCode::WrongMechanism, "foreign allocation");
         let error = status_to_memory_error("deallocate", Tier::Device, 0, &status);
         let text = error.to_string();
         assert!(text.contains("misdirected"), "{text}");

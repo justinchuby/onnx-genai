@@ -252,12 +252,11 @@ impl MemoryPlugin {
         // SAFETY: loading a dynamic library runs its initialisers. The caller
         // is trusted to name a library it intends to load, exactly as for any
         // other plugin surface in this workspace.
-        let library = unsafe { libloading::Library::new(&path) }.map_err(|source| {
-            PluginError::Open {
+        let library =
+            unsafe { libloading::Library::new(&path) }.map_err(|source| PluginError::Open {
                 path: display.clone(),
                 source,
-            }
-        })?;
+            })?;
 
         let negotiate = resolve::<NxmemNegotiateFn>(&library, NXMEM_SYMBOL_NEGOTIATE, &display)?;
         let create_factories = resolve::<NxmemCreateAllocatorFactoriesFn>(
@@ -407,9 +406,7 @@ impl MemoryPlugin {
         // Both sides agree nothing is live. Release the factories, then check
         // that nothing else still pins the module before letting it unmap.
         let Self {
-            factories,
-            module,
-            ..
+            factories, module, ..
         } = self;
         drop(factories);
 

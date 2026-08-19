@@ -32,6 +32,12 @@
 //!
 //! [report]: onnx_runtime_memory_abi::NxmemUnloadReport
 
+// `NxmemStatus` carries its message inline, in a fixed 256-byte buffer, so that
+// no heap allocation is ever owned across the dynamic-library boundary. That
+// makes every `Result<_, NxmemStatus>` "large" by clippy's measure. Boxing the
+// error, which is what the lint asks for, would reintroduce exactly the
+// cross-allocator ownership this ABI exists to forbid.
+#![allow(clippy::result_large_err)]
 pub mod allocator;
 pub mod error;
 pub mod loader;

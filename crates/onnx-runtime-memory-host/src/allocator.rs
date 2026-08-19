@@ -33,8 +33,8 @@ use onnx_runtime_memory_abi::{
 };
 use onnx_runtime_memory_api::{
     AllocationCommitRange, AllocationReleaseOutcome, DeviceAllocator, DeviceKey, MemoryError,
-    QuarantineReason, ReleaseAccounting, ResidualOwnership, SharedDevicePrefix,
-    SharedMapping, SharedPrefixCommitInfo, Tier, VirtualBacking,
+    QuarantineReason, ReleaseAccounting, ResidualOwnership, SharedDevicePrefix, SharedMapping,
+    SharedPrefixCommitInfo, Tier, VirtualBacking,
 };
 
 use crate::error::{PluginError, status_to_memory_error};
@@ -301,7 +301,11 @@ impl AllocatorCore {
     }
 
     fn allocation_record(&self, ptr: NonNull<u8>) -> Option<LiveAllocation> {
-        self.live.lock().ok()?.get(&(ptr.as_ptr() as usize)).copied()
+        self.live
+            .lock()
+            .ok()?
+            .get(&(ptr.as_ptr() as usize))
+            .copied()
     }
 
     /// Remove a live record, **releasing the lock before any ABI call**.
@@ -359,7 +363,7 @@ impl AllocatorCore {
                  allocation must return a live, unique address",
             ),
         })?;
-        if ptr.as_ptr() as usize % align.max(1) != 0 {
+        if !(ptr.as_ptr() as usize).is_multiple_of(align.max(1)) {
             // The plugin broke the alignment contract. Hand the bytes straight
             // back rather than letting a misaligned pointer escape.
             let record = LiveAllocation {
@@ -470,7 +474,8 @@ impl AllocatorCore {
             let mut outcome = NxmemReleaseOutcome::zeroed();
             // SAFETY: `ctx` came from this vtable; both pointers address valid
             // locals that outlive the call. No host lock is held.
-            let status = unsafe { release(self.vtable.ctx, &raw const allocation, &raw mut outcome) };
+            let status =
+                unsafe { release(self.vtable.ctx, &raw const allocation, &raw mut outcome) };
             if !status.is_ok() {
                 self.insert_allocation(ptr, record);
                 return AllocationReleaseOutcome::failed(format!(
@@ -682,8 +687,7 @@ impl PluginAllocator {
         core.module.release_queued();
         // SAFETY: `ctx` came from this vtable; both pointers address valid
         // locals. No host lock is held.
-        let status =
-            unsafe { enqueue(core.vtable.ctx, &raw const allocation, &raw mut ticket) };
+        let status = unsafe { enqueue(core.vtable.ctx, &raw const allocation, &raw mut ticket) };
         if !status.is_ok() {
             core.module.release_retired();
             core.insert_allocation(ptr, record);
@@ -755,8 +759,7 @@ impl DeviceAllocator for PluginAllocator {
         // SAFETY: `ctx` came from this vtable; both pointers address valid
         // locals that outlive the call. No host lock is held, so the plugin may
         // call back into the host from inside this call.
-        let status =
-            unsafe { allocate(core.vtable.ctx, &raw const request, &raw mut result) };
+        let status = unsafe { allocate(core.vtable.ctx, &raw const request, &raw mut result) };
         if !status.is_ok() {
             return Err(status_to_memory_error(
                 "allocate",
@@ -802,11 +805,15 @@ impl DeviceAllocator for PluginAllocator {
     }
 
     fn as_virtual_backing(&self) -> Option<&dyn VirtualBacking> {
-        self.backing.as_ref().map(|backing| backing as &dyn VirtualBacking)
+        self.backing
+            .as_ref()
+            .map(|backing| backing as &dyn VirtualBacking)
     }
 
     fn as_shared_mapping(&self) -> Option<&dyn SharedMapping> {
-        self.shared.as_ref().map(|shared| shared as &dyn SharedMapping)
+        self.shared
+            .as_ref()
+            .map(|shared| shared as &dyn SharedMapping)
     }
 }
 
@@ -892,9 +899,7 @@ impl VirtualBacking for PluginVirtualBacking {
         // SAFETY: `ctx` came from the backing vtable; `request` borrows `ranges`
         // which outlives the call, and `result` is a valid local. No host lock
         // is held.
-        let status = unsafe {
-            allocate(self.vtable().ctx, &raw const request, &raw mut result)
-        };
+        let status = unsafe { allocate(self.vtable().ctx, &raw const request, &raw mut result) };
         drop(ranges);
         if !status.is_ok() {
             return Err(status_to_memory_error(
@@ -988,9 +993,7 @@ impl VirtualBacking for PluginVirtualBacking {
             return Err(MemoryError::AllocationFailed {
                 tier: self.core.tier().name(),
                 requested: bytes as u64,
-                reason: String::from(
-                    "this mechanism provides no mapped_bytes_for_allocation slot",
-                ),
+                reason: String::from("this mechanism provides no mapped_bytes_for_allocation slot"),
             });
         };
         // A sizing query carries no allocation identity yet, so id zero is
@@ -998,8 +1001,7 @@ impl VirtualBacking for PluginVirtualBacking {
         let request = self.core.alloc_request(0, bytes, align);
         let mut out = 0u64;
         // SAFETY: both pointers address valid locals; no host lock is held.
-        let status =
-            unsafe { mapped(self.vtable().ctx, &raw const request, &raw mut out) };
+        let status = unsafe { mapped(self.vtable().ctx, &raw const request, &raw mut out) };
         if !status.is_ok() {
             return Err(status_to_memory_error(
                 "mapped_bytes_for_allocation",
@@ -1029,8 +1031,7 @@ impl VirtualBacking for PluginVirtualBacking {
         let request = self.range_request(ptr, allocation_bytes, align, offset, bytes)?;
         let mut unmapped = 0u64;
         // SAFETY: both pointers address valid locals; no host lock is held.
-        let status =
-            unsafe { decommit(self.vtable().ctx, &raw const request, &raw mut unmapped) };
+        let status = unsafe { decommit(self.vtable().ctx, &raw const request, &raw mut unmapped) };
         if !status.is_ok() {
             return Err(status_to_memory_error(
                 "decommit_range",
@@ -1060,9 +1061,7 @@ impl VirtualBacking for PluginVirtualBacking {
         let allocation = self.core.abi_allocation(ptr, record);
         let mut out = 0u64;
         // SAFETY: both pointers address valid locals; no host lock is held.
-        let status = unsafe {
-            committed(self.vtable().ctx, &raw const allocation, &raw mut out)
-        };
+        let status = unsafe { committed(self.vtable().ctx, &raw const allocation, &raw mut out) };
         if !status.is_ok() {
             return 0;
         }
@@ -1186,9 +1185,8 @@ impl SharedMapping for PluginSharedMapping {
         };
         let mut out = 0u64;
         // SAFETY: both pointers address valid locals; no host lock is held.
-        let status = unsafe {
-            incremental(self.vtable().ctx, &raw const prefix.handle, &raw mut out)
-        };
+        let status =
+            unsafe { incremental(self.vtable().ctx, &raw const prefix.handle, &raw mut out) };
         if !status.is_ok() {
             return Err(status_to_memory_error(
                 "incremental_owned_bytes",
@@ -1215,16 +1213,17 @@ impl SharedMapping for PluginSharedMapping {
                 reason: String::from("this mechanism provides no commit_shared_prefix slot"),
             });
         };
-        let record = self.core.allocation_record(ptr).ok_or_else(|| {
-            MemoryError::AllocationFailed {
-                tier: self.core.tier().name(),
-                requested: 0,
-                reason: format!(
-                    "address {:p} is not a live allocation of this mechanism",
-                    ptr.as_ptr()
-                ),
-            }
-        })?;
+        let record =
+            self.core
+                .allocation_record(ptr)
+                .ok_or_else(|| MemoryError::AllocationFailed {
+                    tier: self.core.tier().name(),
+                    requested: 0,
+                    reason: format!(
+                        "address {:p} is not a live allocation of this mechanism",
+                        ptr.as_ptr()
+                    ),
+                })?;
         if record.bytes != allocation_bytes {
             return Err(MemoryError::AllocationFailed {
                 tier: self.core.tier().name(),
@@ -1244,9 +1243,7 @@ impl SharedMapping for PluginSharedMapping {
         );
         let mut info = NxmemSharedPrefixCommitInfo::zeroed();
         // SAFETY: both pointers address valid locals; no host lock is held.
-        let status = unsafe {
-            commit(self.vtable().ctx, &raw const request, &raw mut info)
-        };
+        let status = unsafe { commit(self.vtable().ctx, &raw const request, &raw mut info) };
         if !status.is_ok() {
             return Err(status_to_memory_error(
                 "commit_shared_prefix",
@@ -1406,8 +1403,8 @@ pub(crate) fn open_allocator(
     // SAFETY: the plugin wrote this pointer in response to the call above.
     // `read_prefix` null-, alignment- and size-checks it before reading any
     // field, and copies rather than borrowing.
-    let vtable = unsafe { NxmemAllocatorVtable::read_prefix(raw_allocator, minor) }
-        .map_err(|status| {
+    let vtable =
+        unsafe { NxmemAllocatorVtable::read_prefix(raw_allocator, minor) }.map_err(|status| {
             // SAFETY: the vtable was refused, so nothing may be called through
             // it; `abandon_allocator` re-reads the prefix defensively and only
             // calls `release` when the struct is well-formed enough to locate
@@ -1501,9 +1498,8 @@ pub(crate) fn open_allocator(
 
     // SAFETY: the contract requires `name` to stay valid until the final
     // `release`, which has not been called.
-    let name = unsafe { read_optional_c_string(vtable.name) }.unwrap_or_else(|| {
-        factory.name().to_string()
-    });
+    let name = unsafe { read_optional_c_string(vtable.name) }
+        .unwrap_or_else(|| factory.name().to_string());
 
     module.allocator_opened();
     let core = Arc::new(AllocatorCore {
@@ -1522,18 +1518,12 @@ pub(crate) fn open_allocator(
         module,
     });
 
-    let backing_view = core
-        .backing
-        .is_some()
-        .then(|| PluginVirtualBacking {
-            core: Arc::clone(&core),
-        });
-    let shared_view = core
-        .shared
-        .is_some()
-        .then(|| PluginSharedMapping {
-            core: Arc::clone(&core),
-        });
+    let backing_view = core.backing.is_some().then(|| PluginVirtualBacking {
+        core: Arc::clone(&core),
+    });
+    let shared_view = core.shared.is_some().then(|| PluginSharedMapping {
+        core: Arc::clone(&core),
+    });
 
     Ok(PluginAllocator {
         backing: backing_view,

@@ -321,7 +321,11 @@ mod tests {
         for code in NxmemStatusCode::ALL {
             assert_eq!(NxmemStatusCode::from_u32(code as u32), Some(code));
             assert!(!code.name().is_empty());
-            assert!(!seen.contains(&code.name()), "duplicate name {}", code.name());
+            assert!(
+                !seen.contains(&code.name()),
+                "duplicate name {}",
+                code.name()
+            );
             seen.push(code.name());
         }
         assert_eq!(seen.len(), NxmemStatusCode::ALL.len());
@@ -342,7 +346,7 @@ mod tests {
         // truncation would split one and make `message_str` return None.
         let message = "\u{4e2d}".repeat(200);
         let status = NxmemStatus::with_message(NxmemStatusCode::DeviceError, &message);
-        assert_eq!(status.message_len, 255 - (255 % 3));
+        assert_eq!(status.message_len, NXMEM_STATUS_MESSAGE_MAX as u32);
         let recovered = status.message_str().expect("valid utf-8 after truncation");
         assert!(recovered.chars().all(|c| c == '\u{4e2d}'));
     }
