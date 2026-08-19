@@ -194,3 +194,28 @@ This is a "connect the threads" hand-off to the swiglu team, not a merge.
 Diagnostic instrument only (observability, no behaviour change): the batch-path per-step
 phase profiler and the `native_decode_batch_cuda_graph_segments` seam reporting that localised
 this cliff. The byte-identical perf fix is preserved on `squad/batch-swiglu-capture-fix`.
+
+---
+
+## e2e re-measurement on current `main` (2026-08-19, post-#1404 merge)
+
+**Baseline:** `origin/main` @ `156e1dd8` (#1404 + #1410 landed). Same `profile_native` binary, same box (RTX 4060, CUDA 13.1, driver 591.55). Box was under **heavy external contention** during this run — wall-clock numbers below are indicative and heavily caveated; **segment counts are contention-invariant and definitive**.
+
+**Finding: the penalty is NOT removed by default for resident Qwen 0.5B.** The #1404 fix is correct, but it is **gated off** for these models. Their fused gate/up node runs the **plain** path (`gamma=None`) — confirmed across `qwen05b-q4`, `-fresh`, `-main`, `-symzp`, `-q4-zp` — so the landed gamma-gated per-row GEMV loop never fires and M>1 falls to the capture-unsafe seam GEMM.
+
+Segments (`--native-decode-batch-sweep 1,2,4,8`, contention-invariant):
+
+| config | M=1 | M=2 | M=4 | M=8 |
+|---|---|---|---|---|
+| **default main** (fold OFF → gate/up plain, `gamma=None`) | 1 | **25** | **25** | **25** |
+| `ONNX_GENAI_RMSNORM_MIN_HIDDEN=512` (fold ON → rmsnorm path) | 1 | **1** | **1** | **1** |
+
+Seam at M≥2 default: `MatMulNBits[KernelCaptureUnsupported] ×24`. Forcing the fold on collapses 25→1 at every M and the fix engages; `row0_matches_batch1 = true` (byte-identical per-row).
+
+**Root cause.** `CudaSkipRmsNormMatMulFusion` (optimizer.rs) folds RMSNorm gamma into gate/up only when `norm_size >= RMSNORM_FUSION_MIN_HIDDEN = 1280` (optimizer.rs:1299). qwen05b hidden = **896 < 1280** → fold OFF → `gamma=None`. The floor was calibrated on **M=1** throughput (fold adds a serialized single-warp prologue, ~0.7 ms regression on tiny decoders). At M≥2 the ~20 ms segmentation penalty dwarfs that, so the M=1-calibrated floor makes the wrong call for batch decode. The fold is byte-identical, so a batch-aware gate is numerically safe.
+
+**Cost model when the fix engages** (fold ON, clean quiet window, indicative): M=1=3.5, M=2=5.86, M=4=9.02, M=8=16.98 ms/step → **~1.4 ms fixed + ~1.9 ms/row** (slope M2→M8 = 1.85 ms/row) — reproduces the `after fix` fit above. Default (fold off) stays on the ~20 ms flat penalty.
+
+**Phase breakdown re-check** (per-step CSV). Under contention, only the whole-graph-replay steps sampled cleanly: fold-off's clean steps are the M=1 ones (`kernel_host_dispatch=0`, whole-graph replay); fold-on has clean steps at every M with `kernel_host_dispatch≈0`. Consistent with the mechanistic view: the ~22 ms fixed cost is the segmented-replay `kernel_host_dispatch` term, removed wherever the fix engages. The remaining steady-state per-step cost is dominated by `logits_read_sync_ms` (~2.3–2.9 ms, the lm_head read-back), which becomes the largest single phase once dispatch is gone — the next target if batch decode is pushed further, but it is per-step shared work, not a batch penalty.
+
+**Disposition.** #1404 fix retained (correct). Follow-up to make the fold gate batch-aware tracked in **#1421**; MoE 61%-bytes/token lever remains gated for small resident RMSNorm models until then.
