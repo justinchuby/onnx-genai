@@ -4127,3 +4127,73 @@ value. Where it must stay fixed, an env override (as
 `ONNX_GENAI_DECODE_GEMV_LOOP_MAX_M` and `ONNX_GENAI_RMSNORM_MIN_HIDDEN` provide)
 at least makes the alternative regime measurable without a rebuild, which is how
 all three of these were diagnosed.
+
+## 41. The other recurring shape: a shared primitive changes contract, distant callers break silently
+
+§40 records thresholds that were correct in the regime they were calibrated in.
+This section records the neighbouring failure: a **shared primitive's contract
+changes**, and callers who depended on the old behaviour **without ever asserting
+it** break somewhere far away. Two instances landed within a day of each other,
+producing five distinct downstream failures between them.
+
+### 41.1 `CudaRuntime::synchronize()` becomes a no-op (#1383)
+
+`defer_eager_sync` made `synchronize()` return without draining, which is correct
+and valuable for its purpose: eliding a *trailing per-op* eager sync is safe,
+because the single in-order EP stream already preserves kernel-to-kernel ordering.
+
+Two sets of callers were relying on the same call for something else entirely:
+
+- **Six pre-`cuMemUnmap` barriers in `weight_paging.rs`.** These needed a real
+  drain, because unmapping a granule while an in-flight decode kernel still
+  references its VA is a use-after-unmap. With the deferral on by default this
+  surfaced as `CUDA_ERROR_ILLEGAL_ADDRESS` — 11/11 runs on the weight-offload
+  repro (#1439). Fixed in #1455 by giving those sites a dedicated
+  `drain_for_unmap()` that states the requirement rather than inheriting it.
+- **Two `graph::tests` capture tests**, which assert that `synchronize()` *errors*
+  inside an active capture. With the no-op they get `Ok`, so they fail on default
+  `main` and pass with `ONNX_GENAI_DEFER_EAGER_SYNC=0`. Stale assertions against a
+  changed contract, not a code defect.
+
+### 41.2 Marlin M>1 becomes default-on
+
+Enabling the direct Marlin int4 tensor-core GEMM by default changed what the M>1
+decode path *is*, and three assertions elsewhere were written against the old one:
+
+- the `m == 1` capture-safe invariant in `matmul_nbits.rs`, which production code
+  now contradicts because Marlin advertises `capture_safe = warm` for M>1 (#1405);
+- `fp16_gate_up_swiglu_is_bit_exact_to_two_op_path`, which passes only with
+  `ONNX_GENAI_MARLIN_M_GT_1=0` (Marlin's own parity tests use a `2e-2` tolerance,
+  not equality);
+- `fp16_gemv_matches_dequant_reference_block128`, same family and additionally
+  parallelism-sensitive.
+
+### 41.3 What makes this class expensive
+
+Neither change was wrong. Both were measured, deliberate, and beneficial in the
+regime their author was working in. The cost came from **implicit dependence**:
+`weight_paging.rs` never said "I need a real drain here", it just called the
+function that happened to provide one, and the tests never said "this asserts the
+pre-#1383 contract".
+
+The failures also surface far from the change, in a different crate or a
+different test file, which is why every one of these was found while investigating
+something else. A crash in a paging path does not look like a decode optimisation.
+
+### 41.4 The practice this suggests
+
+**When a caller depends on a *specific* guarantee from a general-purpose
+primitive, it should name that guarantee at the call site.** #1455's
+`drain_for_unmap()` is the shape: a distinct entry point whose doc-comment says
+why the deferral must not apply, so the dependency is visible to whoever next
+changes the primitive rather than being discovered by a crash.
+
+Conversely, **when changing a shared primitive, grep its call sites for callers
+who may want the old behaviour** — particularly ones in a different crate. Both
+instances here would have been caught by that, and both took hours to diagnose
+after the fact.
+
+For assertions specifically: a test that encodes a *contract* rather than a
+*result* should say so, so that the next reader can tell a stale expectation from
+a real regression. The distinction matters — updating a stale assertion is
+correct, and weakening a live one to get green is how a real bug ships.
