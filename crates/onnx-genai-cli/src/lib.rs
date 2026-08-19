@@ -43,7 +43,6 @@ mod output;
 mod pages;
 mod profile;
 mod transcribe;
-use commands::parse_decode_backend;
 use generate::generate;
 use interactive::run_repl;
 #[cfg(test)]
@@ -54,12 +53,19 @@ use interactive::{
     stage_attachment,
 };
 use model_inspection::{list, show, version};
+#[cfg(test)]
 use onnx_genai::engine::EngineDecodeBackend;
+#[cfg(all(test, feature = "native-backend"))]
 use onnx_genai::engine::native_decode_device::NativeDecodeDevice;
 use onnx_genai::text_to_audio::TextToAudioRequest;
 use onnx_genai::text_to_image::{TextToImageRequest, VaeDecoder};
-use onnx_genai::{EngineConfig, GenerateOptions, SamplingOverrides, StopSequence};
-use onnx_genai_server::{ServeArgs, run_serve};
+use onnx_genai::{GenerateOptions, SamplingOverrides, StopSequence};
+#[cfg(test)]
+use onnx_genai_server::runtime_args::DeviceChoice;
+use onnx_genai_server::{
+    ServeArgs, run_serve,
+    runtime_args::{CpuArgs, EngineArgs, decode_backend_name},
+};
 use output::write_merged_trace;
 use profile::RunProfile;
 use transcribe::transcribe;
@@ -152,36 +158,6 @@ struct SamplingArgs {
     raw: bool,
 }
 
-/// Shared CPU resource controls for `generate` and `run`.
-#[derive(Debug, Args)]
-struct CpuArgs {
-    /// Cap native CPU decode to N worker cores. Overrides
-    /// ONNX_GENAI_CPU_DECODE_THREADS; when neither is set, automatic sizing is
-    /// unchanged. Setting N now also bounds prefill/MLAS: the global Rayon pool
-    /// is built with N workers (not all logical CPUs) and, on Linux, the process
-    /// is pinned to N CPUs (packed on one NUMA node where possible), so
-    /// `--cpu-cores N` alone makes the engine coexist with other programs -- no
-    /// external `taskset` needed. An explicit ONNX_GENAI_CPU_DECODE_AFFINITY
-    /// still wins over the automatic pinning.
-    #[arg(long, value_name = "N")]
-    cpu_cores: Option<NonZeroUsize>,
-}
-
-impl CpuArgs {
-    fn apply(&self) -> anyhow::Result<()> {
-        #[cfg(feature = "native-backend")]
-        {
-            onnx_genai_engine::set_cpu_decode_thread_budget(self.cpu_cores.map(NonZeroUsize::get))
-                .map_err(anyhow::Error::msg)?;
-        }
-        #[cfg(not(feature = "native-backend"))]
-        {
-            let _ = self.cpu_cores;
-        }
-        Ok(())
-    }
-}
-
 impl SamplingArgs {
     fn to_options(&self) -> GenerateOptions {
         let mut options = GenerateOptions {
@@ -249,118 +225,6 @@ impl SamplingArgs {
             top_k: self.top_k,
         }
     }
-}
-
-/// Shared engine-tuning flags.
-#[derive(Debug, Args, Default, Clone)]
-struct EngineArgs {
-    /// Decoder backend for text generation.
-    #[arg(long, value_name = "auto|ort|native", value_parser = parse_decode_backend, default_value = "auto")]
-    backend: EngineDecodeBackend,
-
-    /// Memory ceiling the engine may use for weights and KV cache: a byte count
-    /// (`8GiB`), a fraction of detected capacity (`0.9`), or `auto`.
-    ///
-    /// An explicit byte value is authoritative — the runtime's device-capacity
-    /// probe is still provisional, so this is how you tell it what is really
-    /// available. Raising it enlarges the KV cache, and therefore the context
-    /// that fits.
-    #[arg(long, value_name = "LIMIT", value_parser = parse_limit)]
-    vram_limit: Option<onnx_genai::engine::ResourceLimit>,
-
-    /// Host RAM ceiling for the warm offload tier, in the same format.
-    #[arg(long, value_name = "LIMIT", value_parser = parse_limit)]
-    host_ram_limit: Option<onnx_genai::engine::ResourceLimit>,
-
-    /// Device the native decode backend runs on: `cpu`, `cuda`, `cuda:N`, or
-    /// `auto`.
-    ///
-    /// `auto` (the default) takes the device from the model's declared execution
-    /// providers. Most exported models declare none, which resolves to the CPU —
-    /// so on a machine with a GPU, `--backend native` alone will still run on the
-    /// CPU unless you say `--device cuda` (#1064). Ignored by the ORT backend,
-    /// which selects providers from the model's own session options.
-    #[arg(long, value_name = "auto|cpu|cuda[:N]", value_parser = parse_native_device)]
-    device: Option<NativeDeviceChoice>,
-}
-
-/// A `--device` value. `Auto` is distinct from an absent flag only in intent;
-/// both defer to the model's declared providers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeDeviceChoice {
-    Auto,
-    Cpu,
-    Cuda(Option<u32>),
-}
-
-/// Parse a `--device` value.
-///
-/// Refuses anything else rather than silently falling back: a user who asks for
-/// a device they cannot have should be told, not quietly given the CPU. That
-/// silent fallback is exactly what #1064 documents.
-fn parse_native_device(input: &str) -> Result<NativeDeviceChoice, String> {
-    let raw = input.trim();
-    let lowered = raw.to_ascii_lowercase();
-    match lowered.as_str() {
-        "auto" => Ok(NativeDeviceChoice::Auto),
-        "cpu" => Ok(NativeDeviceChoice::Cpu),
-        "cuda" | "gpu" => Ok(NativeDeviceChoice::Cuda(None)),
-        _ => match lowered.strip_prefix("cuda:") {
-            Some(index) => index
-                .parse::<u32>()
-                .map(|index| NativeDeviceChoice::Cuda(Some(index)))
-                .map_err(|_| {
-                    format!("'{raw}' is not a valid device: expected a CUDA index, as in 'cuda:0'")
-                }),
-            None => Err(format!(
-                "'{raw}' is not a valid device: expected 'auto', 'cpu', 'cuda', or 'cuda:N'"
-            )),
-        },
-    }
-}
-
-impl EngineArgs {
-    fn to_config(&self) -> EngineConfig {
-        let mut config = EngineConfig {
-            decode_backend: self.backend,
-            ..EngineConfig::default()
-        };
-        if let Some(limit) = self.vram_limit {
-            config.limits.vram_limit = limit;
-        }
-        if let Some(limit) = self.host_ram_limit {
-            config.limits.host_ram_limit = limit;
-        }
-        match self.device {
-            None | Some(NativeDeviceChoice::Auto) => {}
-            Some(NativeDeviceChoice::Cpu) => {
-                config.native_device = Some(NativeDecodeDevice::Cpu);
-            }
-            Some(NativeDeviceChoice::Cuda(index)) => {
-                config.native_device = Some(NativeDecodeDevice::Cuda { index });
-            }
-        }
-        config
-    }
-}
-
-fn decode_backend_name(backend: EngineDecodeBackend) -> &'static str {
-    match backend {
-        EngineDecodeBackend::Auto => "auto",
-        EngineDecodeBackend::Ort => "ort",
-        EngineDecodeBackend::Native => "native",
-    }
-}
-
-/// Parse a `--vram-limit` / `--host-ram-limit` value.
-fn parse_limit(input: &str) -> Result<onnx_genai::engine::ResourceLimit, String> {
-    onnx_genai::engine::parse_resource_limit(input).map_err(|error| {
-        format!(
-            "What: the memory limit {input:?} was rejected. \
-             Why: {error}. \
-             How: pass a byte count such as 8GiB, a fraction such as 0.9, or auto."
-        )
-    })
 }
 
 /// Shared profiling flags.
@@ -2053,96 +1917,23 @@ mod tests {
     }
 
     #[test]
-    fn a_toggle_reports_when_given_nothing_and_refuses_nonsense() {}
-
-    /// `--device` exists because `--backend native` alone silently ran on the CPU
-    /// on a GPU machine: device selection came only from the model's declared
-    /// execution providers, and typical exports declare none (#1064). Measured
-    /// 0 MiB of GPU memory across a whole native run before this flag existed.
-    #[test]
-    fn a_device_can_be_asked_for_explicitly_and_nonsense_is_refused() {
-        assert_eq!(parse_native_device("auto"), Ok(NativeDeviceChoice::Auto));
-        assert_eq!(parse_native_device("cpu"), Ok(NativeDeviceChoice::Cpu));
-        assert_eq!(
-            parse_native_device("cuda"),
-            Ok(NativeDeviceChoice::Cuda(None))
-        );
-        assert_eq!(
-            parse_native_device("CUDA:1"),
-            Ok(NativeDeviceChoice::Cuda(Some(1))),
-            "device names are case-insensitive"
-        );
-
-        // Refused rather than quietly resolved to the CPU: a silent fallback is
-        // the behaviour this flag exists to end.
-        let error = parse_native_device("cuda:x").expect_err("not a device index");
-        assert!(error.contains("cuda:0"), "{error}");
-        let error = parse_native_device("tpu").expect_err("not a device");
-        assert!(
-            error.contains("'auto', 'cpu', 'cuda', or 'cuda:N'"),
-            "{error}"
-        );
-    }
-
-    /// The flag has to reach `EngineConfig`, not merely parse. Absent and `auto`
-    /// both leave the engine's own resolution untouched.
-    #[test]
-    fn the_device_flag_reaches_the_engine_config() {
-        let args = EngineArgs::default();
-        assert!(
-            args.to_config().native_device.is_none(),
-            "an absent --device must not override the model's declared providers"
-        );
-
-        let auto = EngineArgs {
-            device: Some(NativeDeviceChoice::Auto),
-            ..EngineArgs::default()
-        };
-        assert!(auto.to_config().native_device.is_none());
-
-        let cuda = EngineArgs {
-            device: Some(NativeDeviceChoice::Cuda(Some(1))),
-            ..EngineArgs::default()
-        };
-        assert_eq!(
-            cuda.to_config().native_device,
-            Some(NativeDecodeDevice::Cuda { index: Some(1) })
-        );
-
-        let cpu = EngineArgs {
-            device: Some(NativeDeviceChoice::Cpu),
-            ..EngineArgs::default()
-        };
-        assert_eq!(cpu.to_config().native_device, Some(NativeDecodeDevice::Cpu));
-    }
-
-    #[test]
     fn interactive_session_preserves_the_requested_native_device() {
         let args = EngineArgs {
             backend: EngineDecodeBackend::Native,
-            device: Some(NativeDeviceChoice::Cuda(Some(3))),
+            device: Some(DeviceChoice::Cuda(Some(3))),
             ..EngineArgs::default()
         };
         let settings = interactive::SessionSettings::new(PathBuf::from("models/tiny"), &args);
 
         let config = settings.to_config();
         assert_eq!(config.decode_backend, EngineDecodeBackend::Native);
+        // A device only reaches the engine when the native decoder is compiled
+        // in; without it there is nothing that could honor one.
+        #[cfg(feature = "native-backend")]
         assert_eq!(
             config.native_device,
             Some(NativeDecodeDevice::Cuda { index: Some(3) })
         );
-    }
-
-    #[test]
-    fn decode_backends_are_named_by_the_engine_not_guessed() {
-        assert_eq!(parse_decode_backend("auto"), Ok(EngineDecodeBackend::Auto));
-        assert_eq!(parse_decode_backend("ort"), Ok(EngineDecodeBackend::Ort));
-        assert_eq!(
-            parse_decode_backend("native"),
-            Ok(EngineDecodeBackend::Native)
-        );
-        let error = parse_decode_backend("cuda").expect_err("not a backend");
-        assert!(error.contains("auto, ort, or native"), "{error}");
     }
 
     #[test]
