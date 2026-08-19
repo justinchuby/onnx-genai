@@ -59,30 +59,58 @@ under test.
 | `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 8 | **0.25** | 0.30 | **win** |
 | `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 16 | **0.23** | 0.23 | **win** |
 | `MatMulNBits` | 8-bit, block 32 | 1 | 4096 | 8 | **0.23** | 0.24 | **win** |
-| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 2 | **0.90** | 0.91 | **win** |
-| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 4 | **0.87** | 0.87 | **win** |
-| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 8 | **0.94** | 1.06 | **win** |
-| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 2 | 1.17 | 1.18 | gap (static M) |
-| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 4 | 1.15 | 1.16 | gap (static M) |
-| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 8 | 0.99 | 1.05 | gap (static M) |
-| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 2 | 1.41 | 1.42 | gap (static M) |
-| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 4 | 1.39 | 1.39 | gap (static M) |
-| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 8 | 1.25 | 1.32 | gap (static M) |
+| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 2 | **0.66** | 0.66 † | **win** (was 2.06) |
+| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 4 | **0.75** | 0.84 † | **win** (was 2.01) |
+| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 8 | **0.68** | 0.88 † | **win** (was 2.32) |
+| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 2 | **0.77** | 0.79 † | **win** (was 1.70) |
+| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 4 | **0.83** | 0.99 † | **win** (was 1.69) |
+| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 8 | **0.88** | 1.11 † | **win** (was 1.89) |
+| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 2 | **0.86** | 0.87 † | **win** (was 1.41) |
+| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 4 | **0.88** | 1.00 † | **win** (was 1.42) |
+| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 8 | 1.01 | 1.13 † | parity (was 1.54) |
 
-### The 8-bit win is bounded by row count
+† **not a p90.** On the nine rows above, that column is the per-trial *maximum* — the worst of 7-11
+interleaved trials — because `ab.py` reports `p50 [min-max]` rather than a p90. It is a strictly more
+pessimistic statistic than the p90 the rest of this table carries, and it is marked rather than
+converted so no cell here is ever compared to a p90 as though the two were the same number.
 
-The 8-bit keep is **not** unconditional in `M`. The win erodes as rows are added and crosses over
-between 128 and 256 -- and the crossover rows are the *low*-dispersion measurements in this whole
-document (spread 0.01-0.04), so it is not a contended-host artefact.
+### The 8-bit prefill loss was a 51 MB f32 weight rebuilt on every call
 
-A node whose row count is **statically** >= 256 is pure prefill: there is no decode traffic on it to
-amortise the loss against, so this is the shape where the gap is felt undiluted, and the one to
-optimize first.
+**Fixed.** On a native (non-`mlas`) build there was no borrowed route for `bits == 8, m > 1` at all:
+`try_prefill_mlas_nt` declines and the kernel materialized the whole `k x n` weight as f32 in the
+transposed `Kn` layout -- 51.4 MB for 3584x3584, written at stride `n`, **per call**, because
+nothing caches that layout. Generalizing #1117's fused-dequant GEBP to 8 bits removed it: each
+packed byte is read once per call into the L1-resident panel every row reuses. Kernel level, the
+same `3584` geometry gets **17.1x** at `m = 2`, **13.9x** at `m = 8`, **5.8x** at `m = 64`, **2.6x**
+at `m = 256` and **1.8x** at `m = 512`, and the two arms' outputs are bit-identical.
 
-A **dynamic** row count is the LLM case, where a single node serves both phases. There the loss is
-already repaid in practice: at 8 threads decode saves **6.06 ms per token** (1.78 ms ours vs 7.84 ms
-ORT) while a 512-row prefill costs **7.69 ms once** (38.58 vs 30.89). The *second* generated token
-has repaid the entire prefill loss.
+Full record, including the ORT-comparison method and the controls:
+[`docs/benchmarks/2026-08-19-int8-prefill-gebp.md`](../benchmarks/2026-08-19-int8-prefill-gebp.md).
+
+Four things about the table above are worth stating plainly.
+
+* **The `p90` column on the nine re-measured rows is the per-trial *maximum*** (marked `†` above).
+  Where it crosses 1.00 (`M = 256, t = 4/8` and `M = 512, t = 4/8`) that is one trial out of 7-11,
+  not the median behaviour.
+* **The `was` column is a paired re-measurement, not the historical number.** Both arms are one
+  build of the current tree, differing only by `ONNX_GENAI_CPU_MM_INT8_GEBP`, interleaved trial by
+  trial (7-11 trials x 9 runs). The `M = 512` prior rows reproduce the numbers this file has always
+  carried almost exactly (1.41 -> 1.41 at 2 threads, 1.39 -> 1.42 at 4); the `M = 128` and `M = 256`
+  prior rows do **not** -- this file recorded 0.90/0.87/0.94 and 1.17/1.15/0.99 where the paired
+  arm now reads 2.06/2.01/2.32 and 1.70/1.69/1.89. Those older rows come from a tree and build
+  configuration that can no longer be reconstructed here, so they are replaced rather than defended.
+  A `--features mlas` build of the *current* tree does not reproduce them either (it reads 0.56 at
+  `M = 128, t = 2`), which rules out "the old rows were an MLAS build" as the explanation.
+* **`M = 512` at 8 threads reaches parity, not a win.** 1.01 `[0.886-1.131]` over 11 trials. By this
+  file's own bar -- a >= 5% repeatable win beyond noise at *every* measured thread count -- the
+  512-row row is not closed. It is no longer the shape that motivates optimizing 8-bit first.
+* **Decode is untouched and still wins.** `M = 1` reads 0.153 / 0.181 / 0.219 at 2 / 4 / 8 threads
+  with the switch on, against 0.154 / 0.207 / 0.244 with it off: overlapping ranges, as it must be,
+  since `m == 1` never reaches this branch.
+
+For reference, a `--features mlas` research build of the same tree reads 0.56 / 0.50 at
+`M = 128` (2 / 8 threads) and 0.82 / 0.76 at `M = 512`. The pure-native path is now within
+1.05-1.35x of it, where before it was 2.5-3.7x behind.
 
 ### Block sizes ORT cannot build at all
 

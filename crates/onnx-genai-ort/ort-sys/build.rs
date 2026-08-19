@@ -13,28 +13,28 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-// Keep this aligned with the ORT headers used by bindgen. ORT 1.27.x exposes
-// ORT_API_VERSION 27, so the downloaded runtime must also be 1.27.x.
-const ORT_VERSION: &str = "1.27.0";
-const ORT_API_VERSION: &str = "27";
+// Keep this aligned with the ORT headers used by bindgen. ORT 1.28.x exposes
+// ORT_API_VERSION 28, so the downloaded runtime must also be 1.28.x.
+const ORT_VERSION: &str = "1.28.0";
+const ORT_API_VERSION: &str = "28";
 const ORT_RELEASE_BASE: &str = "https://github.com/microsoft/onnxruntime/releases/download";
 
 const ORT_ARCHIVE_CHECKSUMS: &[(&str, &str)] = &[
     (
-        "onnxruntime-linux-x64-1.27.0.tgz",
-        "547e40a48f1fe73e3f812d7c88a948612c23f896b91e4e2ee1e232d7b468246f",
+        "onnxruntime-linux-x64-1.28.0.tgz",
+        "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407",
     ),
     (
-        "onnxruntime-osx-arm64-1.27.0.tgz",
-        "545e81c58152353acb0d1e8bd6ce4b62f830c0961f5b3acfedc790ffd76e477a",
+        "onnxruntime-osx-arm64-1.28.0.tgz",
+        "1268b359718099bde2cedb55787f182a130067bc4f31e8c88478c445b850d3d8",
     ),
     (
-        "onnxruntime-win-x64-1.27.0.zip",
-        "c5c81710938e68079ff1a192b04897faabe4b43830d48f39f27ecd4e16138bfc",
+        "onnxruntime-win-x64-1.28.0.zip",
+        "abef733dacbe2f571547a7150b479b5cb9cc0df22f96c24983a42cadb1b4f8bc",
     ),
     (
-        "onnxruntime-win-arm64-1.27.0.zip",
-        "a32f2650575b3c20df462e337519fd1cc4105356130d11dba9771c6f374d952f",
+        "onnxruntime-win-arm64-1.28.0.zip",
+        "cbe4547463ece092b505c3581376ed5896d22b5429f39d5e645e425ecdd369ad",
     ),
 ];
 

@@ -214,7 +214,6 @@ mod pty_tty {
             .arg("generate")
             .arg(text_model())
             .arg("--raw")
-            .arg("--prompt")
             .arg("hi")
             .arg("--max-new-tokens")
             .arg("5")
@@ -292,7 +291,6 @@ mod pty_tty {
             .arg(text_model())
             .arg("--raw")
             .arg("--stream") // activates the conditional-newline path in run_generation_turn
-            .arg("--prompt")
             .arg("hi")
             .arg("--max-new-tokens")
             .arg("5")

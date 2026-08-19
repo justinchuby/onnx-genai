@@ -862,6 +862,177 @@ pub(crate) fn trace_capture_declines(trace: &TraceContext, report: &CaptureDecli
     }
 }
 
+/// The narrowest query width worth padding a prefill forward up to.
+///
+/// Below this the forward is so cheap that the padded rows cost more than the
+/// recompile they avoid.
+const MIN_PREFILL_QUERY_WIDTH: usize = 16;
+
+/// How many distinct query widths a prefill is allowed to use, from the chunk
+/// width down.
+///
+/// The kernel cache keeps a bounded number of compiled variants per node and
+/// evicts the rest, so a shape set larger than that bound thrashes instead of
+/// caching. Raising the bound is not the answer — a retained variant owns device
+/// scratch, and a bound wide enough for eight prefill widths pushed a
+/// 5.5k-token prompt past the mapped-memory ceiling. So the ladder is sized to
+/// fit the bound that exists: three prefill widths, leaving one slot for the
+/// single-token decode shape.
+///
+/// Keeping it above one is what stops a short prompt from paying for a full
+/// chunk of arithmetic.
+const PREFILL_QUERY_WIDTH_STEPS: usize = 3;
+
+/// The query width a multi-row forward should actually run at.
+///
+/// A forward is dispatched through a kernel cache keyed by its concrete input
+/// shapes, so a query width nobody has run before recompiles every node in the
+/// graph — for a 30B decoder, on the order of a thousand kernels. Prompt lengths
+/// are effectively unique per request, so left alone every request pays that
+/// bill, and the compiled variants pile up as device workspace nobody accounts
+/// for (#1362).
+///
+/// Rounding the width up to a power of two collapses that unbounded set to a
+/// handful of shapes shared by every request, at the cost of at most one
+/// duplicated row of arithmetic for each real one. It is the same bargain the
+/// KV cache already takes: GQA binds `past_key`/`past_value` at a fixed physical
+/// capacity and carries the true length in `seqlens_k`, rather than resizing the
+/// cache to the exact sequence and reshaping the graph every step.
+///
+/// `cap` is the declared prefill chunk width, which is the largest width this
+/// model is willing to run at; a forward wider than that is left alone, since it
+/// already amortizes its compile over enough work to not matter.
+/// Whether query-axis prefill padding is enabled at all.
+///
+/// Padding trades duplicated arithmetic for a smaller set of compiled shapes,
+/// and which side wins depends on the model and the request mix. The switch
+/// exists so the trade can be measured against the same binary rather than
+/// argued about.
+fn prefill_query_padding_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("ONNX_GENAI_PREFILL_QUERY_PADDING")
+                .unwrap_or_default()
+                .as_str(),
+            "0" | "off" | "false"
+        )
+    })
+}
+
+fn prefill_query_width(rows: usize, cap: usize) -> usize {
+    if rows <= 1 || cap == 0 || rows > cap {
+        return rows;
+    }
+    // Even steps rather than powers of two: a power-of-two ladder rounds 311
+    // rows up to 512, and the 65% of duplicated arithmetic that buys costs more
+    // than the recompile it saves. Even steps up to the chunk width bound the
+    // shape set just as well while capping the waste at one step.
+    // Round the step up, not down, so the last step lands exactly on the chunk
+    // width instead of just short of it and leaving a stray fourth width above.
+    let step = cap
+        .div_ceil(PREFILL_QUERY_WIDTH_STEPS)
+        .max(MIN_PREFILL_QUERY_WIDTH);
+    rows.div_ceil(step).saturating_mul(step).min(cap).max(rows)
+}
+
+/// Extend a `[1, rows, …]` per-token step tensor to `target_rows` rows by
+/// repeating its last row.
+///
+/// The duplicated rows are never read: their outputs are dropped and the KV they
+/// write sits past the sequence's logical length, where the next forward
+/// overwrites it. Repeating a real row rather than zeroing keeps the padded
+/// values in the same numeric range as the real ones, so the padding cannot be
+/// what makes a forward overflow.
+/// A multi-row forward widened to a padded query width.
+struct PaddedPrefill {
+    /// The prompt tokens followed by repeats of the last one.
+    tokens: Vec<TokenId>,
+    /// The supplied per-token ports, each widened to match.
+    step_inputs: Vec<(String, Tensor)>,
+}
+
+fn pad_step_tensor(tensor: &Tensor, rows: usize, target_rows: usize) -> Option<Tensor> {
+    if target_rows <= rows || rows == 0 {
+        return None;
+    }
+    let [1, tensor_rows, rest @ ..] = tensor.shape.as_slice() else {
+        return None;
+    };
+    if *tensor_rows != rows {
+        return None;
+    }
+    let bytes = tensor.as_bytes();
+    let row_bytes = bytes.len().checked_div(rows)?;
+    if row_bytes == 0 || row_bytes * rows != bytes.len() {
+        return None;
+    }
+    let mut padded = Vec::with_capacity(row_bytes * target_rows);
+    padded.extend_from_slice(bytes);
+    let last_row = &bytes[bytes.len() - row_bytes..];
+    for _ in rows..target_rows {
+        padded.extend_from_slice(last_row);
+    }
+    let mut shape = vec![1, target_rows];
+    shape.extend_from_slice(rest);
+    Tensor::from_raw(tensor.dtype, shape, &padded).ok()
+}
+
+impl NativeDecodeSession {
+    /// The query width this multi-row forward should run at, and the padded
+    /// token ids to run it with.
+    ///
+    /// Returns `None` when the forward must run at its exact width. Padding is
+    /// refused for a decoder carrying recurrent or convolutional state: that
+    /// state is not masked and not addressed by a logical length, so a
+    /// duplicated row would advance it past the real sequence and there is
+    /// nowhere to put the extra step back. Attention KV has no such problem —
+    /// the padded rows land beyond the logical length, where the next forward
+    /// overwrites them.
+    fn padded_prefill_plan(&self, token_ids: &[TokenId]) -> Option<(Vec<TokenId>, usize)> {
+        if !self.prefill_query_padding
+            || !prefill_query_padding_enabled()
+            || self.has_recurrent_state()
+        {
+            return None;
+        }
+        let cap = self.prefill_chunk_size.map(NonZeroUsize::get).unwrap_or(0);
+        let width = prefill_query_width(token_ids.len(), cap);
+        if width == token_ids.len() {
+            return None;
+        }
+        let mut padded = Vec::with_capacity(width);
+        padded.extend_from_slice(token_ids);
+        let last = *token_ids.last()?;
+        padded.resize(width, last);
+        Some((padded, width))
+    }
+
+    /// The padded token ids and per-step tensors a multi-row forward should run
+    /// with, or `None` to run at the exact width.
+    ///
+    /// Every supplied per-token tensor has to be paddable for the plan to hold:
+    /// a port whose rows this code cannot recognize (anything not shaped
+    /// `[1, rows, …]`) might not be per-token at all, and inventing rows for it
+    /// would change what the forward computes.
+    fn padded_prefill_inputs(
+        &self,
+        token_ids: &[TokenId],
+        step_inputs: &[(String, Tensor)],
+    ) -> Option<PaddedPrefill> {
+        let (tokens, width) = self.padded_prefill_plan(token_ids)?;
+        let mut padded_inputs = Vec::with_capacity(step_inputs.len());
+        for (name, tensor) in step_inputs {
+            let padded = pad_step_tensor(tensor, token_ids.len(), width)?;
+            padded_inputs.push((name.clone(), padded));
+        }
+        Some(PaddedPrefill {
+            tokens,
+            step_inputs: padded_inputs,
+        })
+    }
+}
+
 impl NativeDecodeSession {
     pub(crate) fn prepare_cuda_prefill_workspace(
         &mut self,
@@ -902,6 +1073,13 @@ impl NativeDecodeSession {
         // top-up. The subsequent prefill forward re-establishes the KV/mask
         // device state before it executes, so the decode pass's residual
         // single-token mask is not observed.
+        // Plan at the width the forward will actually run at: a padded prefill
+        // reserves workspace for its padded query rows, not its real ones.
+        let padded = self.padded_prefill_inputs(token_ids, step_inputs);
+        let (token_ids, step_inputs) = match &padded {
+            Some(padded) => (padded.tokens.as_slice(), padded.step_inputs.as_slice()),
+            None => (token_ids, step_inputs),
+        };
         let prefill = self.run_cuda_workspace_prepare_pass(token_ids, past_len, step_inputs)?;
         if token_ids.len() > 1 {
             let last_token = &token_ids[token_ids.len() - 1..];
@@ -1057,6 +1235,18 @@ impl NativeDecodeSession {
         total_len: usize,
         error_context: &str,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
+        // A multi-row forward is keyed in the kernel cache by its concrete input
+        // shapes, so a query width nobody has run before recompiles every node in
+        // the graph. Report the width and the compile count it cost, since that
+        // is the only place the cost of a novel prefill shape is observable.
+        let compiles_before = self.session.cache_stats().misses;
+        // The token axis is dim 1 for both `[1, rows]` token ids and
+        // `[1, rows, hidden]` embeddings; the last dim would report the hidden
+        // size for the latter.
+        let query_rows = owned
+            .first()
+            .and_then(|(_, tensor)| tensor.shape.get(1).copied())
+            .unwrap_or(0);
         let state = self
             .cuda
             .as_mut()
@@ -1104,6 +1294,15 @@ impl NativeDecodeSession {
         }
         state.set_logical_len(total_len)?;
         self.current_len = total_len;
+        let stats = self.session.cache_stats();
+        tracing::debug!(
+            query_rows,
+            total_len,
+            kernels_compiled = stats.misses - compiles_before,
+            kernel_cache_entries = stats.entries,
+            kernel_cache_evictions = stats.evictions,
+            "native CUDA multi-row forward"
+        );
         Ok(logits)
     }
 
@@ -1554,7 +1753,45 @@ impl NativeDecodeSession {
         Ok(attempt)
     }
 
+    /// Run one forward over `token_ids`, padding the query axis to a shape the
+    /// kernel cache is likely to hold already.
+    ///
+    /// The padded rows are pure waste arithmetically, but they are also
+    /// harmless: the causal mask keeps every real row from reading a padded
+    /// one, the padded rows' logits are dropped, and the KV they write lands
+    /// past the sequence's logical length, so the rewind below both hides it
+    /// from the next forward and lets that forward overwrite it.
     pub(crate) fn decode_cuda(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        step_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let rows = token_ids.len();
+        let Some(padded) = self.padded_prefill_inputs(token_ids, step_inputs) else {
+            return self.decode_cuda_exact(token_ids, past_len, step_inputs);
+        };
+        let padded_rows = padded.tokens.len();
+        let mut logits = self.decode_cuda_exact(&padded.tokens, past_len, &padded.step_inputs)?;
+        if logits.len() < padded_rows {
+            // This decoder does not answer one logits row per query row, so
+            // there is no way to tell a real row's logits from a padded row's.
+            // Give up on padding for good and redo the forward as asked.
+            self.prefill_query_padding = false;
+            self.rewind_inner(past_len)
+                .context("discard a padded native CUDA prefill this decoder cannot map back")?;
+            return self.decode_cuda_exact(token_ids, past_len, step_inputs);
+        }
+        logits.truncate(rows);
+        let real_len = past_len
+            .checked_add(rows)
+            .context("native decode context length overflow")?;
+        self.rewind_inner(real_len)
+            .context("roll a padded native CUDA prefill back to its real length")?;
+        Ok(logits)
+    }
+
+    fn decode_cuda_exact(
         &mut self,
         token_ids: &[TokenId],
         past_len: usize,
@@ -5881,5 +6118,116 @@ mod capture_step_inputs_gate_tests {
                 "{value:?} must keep capture on"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod prefill_query_width_tests {
+    use super::{Tensor, pad_step_tensor, prefill_query_width};
+
+    /// A single-row decode step keeps its exact shape: the steady-state decode
+    /// kernel is the one shape that must never be perturbed.
+    #[test]
+    fn a_single_query_row_is_never_padded() {
+        assert_eq!(prefill_query_width(1, 512), 1);
+    }
+
+    /// A model that declares no chunk width declares no working width either,
+    /// so there is nothing to round up to.
+    #[test]
+    fn without_a_declared_chunk_width_nothing_is_padded() {
+        for rows in [2, 37, 512, 4096] {
+            assert_eq!(prefill_query_width(rows, 0), rows);
+        }
+    }
+
+    /// Widths land on a three-step ladder up to the chunk width, leaving the
+    /// kernel cache's four-variant per-node bound one slot for the single-token
+    /// decode shape.
+    #[test]
+    fn widths_round_up_to_a_three_step_ladder() {
+        let widths: std::collections::BTreeSet<usize> = (2..=512)
+            .map(|rows| prefill_query_width(rows, 512))
+            .collect();
+        assert_eq!(widths.into_iter().collect::<Vec<_>>(), vec![171, 342, 512]);
+    }
+
+    /// Padding never costs more than one step of duplicated rows, and never
+    /// runs narrower than the real work.
+    #[test]
+    fn padding_never_narrows_and_never_overshoots_a_step() {
+        for rows in 2..=512 {
+            let width = prefill_query_width(rows, 512);
+            assert!(width >= rows, "{rows} rows must not run at {width}");
+            assert!(
+                width - rows < 171,
+                "{rows} rows wasted {} rows",
+                width - rows
+            );
+        }
+    }
+
+    /// A forward wider than the declared chunk already amortizes its compile
+    /// over enough work, and has no ladder step above it to round to.
+    #[test]
+    fn a_forward_wider_than_the_chunk_runs_exactly() {
+        assert_eq!(prefill_query_width(513, 512), 513);
+    }
+
+    /// A tiny chunk width still gets a floor, so a two-row forward is not
+    /// rounded to a ladder finer than the work is worth.
+    #[test]
+    fn a_tiny_chunk_width_keeps_the_minimum_step() {
+        assert_eq!(prefill_query_width(2, 32), 16);
+        assert_eq!(prefill_query_width(17, 32), 32);
+    }
+
+    /// The ladder never spends more slots than the kernel cache's per-node
+    /// bound leaves for prefill, whatever chunk width a model declares.
+    #[test]
+    fn the_ladder_never_outgrows_its_step_count() {
+        for cap in [32usize, 128, 256, 512, 1024, 4096] {
+            let widths: std::collections::BTreeSet<usize> = (2..=cap)
+                .map(|rows| prefill_query_width(rows, cap))
+                .collect();
+            assert!(
+                widths.len() <= super::PREFILL_QUERY_WIDTH_STEPS,
+                "chunk width {cap} produced {widths:?}"
+            );
+            assert!(widths.contains(&cap), "chunk width {cap} must be a step");
+        }
+    }
+
+    /// Padded rows repeat the last real row, so the extra rows carry values in
+    /// the same range as the real ones.
+    #[test]
+    fn padding_a_step_tensor_repeats_its_last_row() {
+        let tensor = Tensor::from_f32(&[1, 3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let padded = pad_step_tensor(&tensor, 3, 5).expect("a [1, rows, width] tensor pads");
+        assert_eq!(padded.shape, vec![1, 5, 2]);
+        assert_eq!(
+            padded.to_vec_f32(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 5.0, 6.0, 5.0, 6.0]
+        );
+    }
+
+    /// A port whose rows this code cannot recognize is refused rather than
+    /// guessed at: inventing rows for it would change what the forward computes.
+    #[test]
+    fn a_tensor_that_is_not_per_token_refuses_to_pad() {
+        let wrong_rows = Tensor::from_i64(&[1, 4], &[1, 2, 3, 4]).unwrap();
+        assert!(pad_step_tensor(&wrong_rows, 3, 5).is_none());
+        let wrong_batch = Tensor::from_i64(&[2, 3], &[1, 2, 3, 4, 5, 6]).unwrap();
+        assert!(pad_step_tensor(&wrong_batch, 3, 5).is_none());
+        let rank_one = Tensor::from_i64(&[3], &[1, 2, 3]).unwrap();
+        assert!(pad_step_tensor(&rank_one, 3, 5).is_none());
+    }
+
+    /// Asking for no extra rows is not padding, and reports so rather than
+    /// handing back a needless copy.
+    #[test]
+    fn padding_to_the_same_width_is_declined() {
+        let tensor = Tensor::from_i64(&[1, 3], &[1, 2, 3]).unwrap();
+        assert!(pad_step_tensor(&tensor, 3, 3).is_none());
     }
 }

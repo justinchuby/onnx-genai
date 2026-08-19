@@ -4077,3 +4077,133 @@ floor is 12–20%, and that at **two** threads the floor is small enough (0.22�
 for a properly controlled multi-threaded experiment to be worth running. That
 experiment — sharing one packed panel across row blocks rather than re-packing
 per block — is the open follow-up, and it now has a method that can answer it.
+
+## 40. The recurring shape: a threshold calibrated in one regime makes the wrong call in another
+
+This section records a pattern rather than a measurement. It surfaced three
+separate times in a single day, in unrelated parts of the codebase, each time
+costing real investigation to rediscover. It is written down so the fourth
+instance is recognised rather than re-derived.
+
+### 40.1 The three instances
+
+**#1261 — `PARALLEL_MIN_WORK` in the half GEMM.** The constant `1_048_576` was
+tuned on a 16-core Linux box. Measured on an Intel i7-13800H (14C/20T), the true
+serial/parallel crossover is ~2-3M MACs, so the shipped constant is conservative
+here. It cannot *regress* against the base behaviour (the base forks
+unconditionally), so it was safe to land as-is, but it is leaving work on the
+table on this hardware and would likely land somewhere else again on a many-core
+AMD server part. Three machines, three crossovers.
+
+**The `m == 1` decode-GEMV dispatch in `matmul_nbits`.** `m == 1` was routed to a
+specialised decode GEMV and `m > 1` to the tiled prefill GEMM. That split is
+correct for its original regime — prefill, where M is large — but at batch decode
+with M = 2..8 it meant re-reading the whole weight grid every step, costing 5.4x
+per step for 2x the work. The dispatch was not wrong; it was calibrated for a
+regime that batch decode does not occupy.
+
+**#1421 — the RMSNorm fold's hidden-size floor.** `CudaSkipRmsNormMatMulFusion`
+folds gamma into gate/up only for `hidden >= 1280` (`crates/onnx-runtime-ep-cuda/src/optimizer.rs:1295`). That
+floor was calibrated on **M=1** throughput, where the prologue costs ~0.7 ms on
+tiny decoders. At M>=2 the segmentation penalty it causes is ~20 ms — more than
+an order of magnitude larger than the cost it was protecting against. The floor
+is defensible in the regime it was measured in and wrong in the one next to it.
+
+### 40.2 What the three have in common
+
+In every case the constant was **correct when it was set**, measured honestly, and
+then became wrong because a *different regime* started using the same code path.
+None of them is a mistake by their author. The failure is that a threshold records
+a conclusion without recording the regime the conclusion was drawn in, so the next
+reader cannot tell whether it applies to them.
+
+Note also that two of the three were found only because something *else* was being
+investigated. A regime-mismatched threshold does not announce itself: it presents
+as "this path is slower than expected", and the constant is the last place anyone
+looks.
+
+### 40.3 The practice this suggests
+
+Consistent with §32.2's rule that a perf number must carry its hardware, thread
+count and reference baseline: **a tuning constant should carry the regime it was
+calibrated in**, next to the constant, in the same commit that introduces it. At
+minimum: what was varied, what was held fixed, and which workload shape the
+measurement came from (prefill vs decode, M=1 vs batch, resident vs streaming,
+core count).
+
+Where a constant is cheap to derive at runtime, deriving it beats recording it —
+see #1261's proposal for a hardware-aware crossover rather than any single tuned
+value. Where it must stay fixed, an env override (as
+`ONNX_GENAI_DECODE_GEMV_LOOP_MAX_M` and `ONNX_GENAI_RMSNORM_MIN_HIDDEN` provide)
+at least makes the alternative regime measurable without a rebuild, which is how
+all three of these were diagnosed.
+
+## 41. The other recurring shape: a shared primitive changes contract, distant callers break silently
+
+§40 records thresholds that were correct in the regime they were calibrated in.
+This section records the neighbouring failure: a **shared primitive's contract
+changes**, and callers who depended on the old behaviour **without ever asserting
+it** break somewhere far away. Two instances landed within a day of each other,
+producing five distinct downstream failures between them.
+
+### 41.1 `CudaRuntime::synchronize()` becomes a no-op (#1383)
+
+`defer_eager_sync` made `synchronize()` return without draining, which is correct
+and valuable for its purpose: eliding a *trailing per-op* eager sync is safe,
+because the single in-order EP stream already preserves kernel-to-kernel ordering.
+
+Two sets of callers were relying on the same call for something else entirely:
+
+- **Six pre-`cuMemUnmap` barriers in `weight_paging.rs`.** These needed a real
+  drain, because unmapping a granule while an in-flight decode kernel still
+  references its VA is a use-after-unmap. With the deferral on by default this
+  surfaced as `CUDA_ERROR_ILLEGAL_ADDRESS` — 11/11 runs on the weight-offload
+  repro (#1439). Fixed in #1455 by giving those sites a dedicated
+  `drain_for_unmap()` that states the requirement rather than inheriting it.
+- **Two `graph::tests` capture tests**, which assert that `synchronize()` *errors*
+  inside an active capture. With the no-op they get `Ok`, so they fail on default
+  `main` and pass with `ONNX_GENAI_DEFER_EAGER_SYNC=0`. Stale assertions against a
+  changed contract, not a code defect.
+
+### 41.2 Marlin M>1 becomes default-on
+
+Enabling the direct Marlin int4 tensor-core GEMM by default changed what the M>1
+decode path *is*, and three assertions elsewhere were written against the old one:
+
+- the `m == 1` capture-safe invariant in `matmul_nbits.rs`, which production code
+  now contradicts because Marlin advertises `capture_safe = warm` for M>1 (#1405);
+- `fp16_gate_up_swiglu_is_bit_exact_to_two_op_path`, which passes only with
+  `ONNX_GENAI_MARLIN_M_GT_1=0` (Marlin's own parity tests use a `2e-2` tolerance,
+  not equality);
+- `fp16_gemv_matches_dequant_reference_block128`, same family and additionally
+  parallelism-sensitive.
+
+### 41.3 What makes this class expensive
+
+Neither change was wrong. Both were measured, deliberate, and beneficial in the
+regime their author was working in. The cost came from **implicit dependence**:
+`weight_paging.rs` never said "I need a real drain here", it just called the
+function that happened to provide one, and the tests never said "this asserts the
+pre-#1383 contract".
+
+The failures also surface far from the change, in a different crate or a
+different test file, which is why every one of these was found while investigating
+something else. A crash in a paging path does not look like a decode optimisation.
+
+### 41.4 The practice this suggests
+
+**When a caller depends on a *specific* guarantee from a general-purpose
+primitive, it should name that guarantee at the call site.** #1455's
+`drain_for_unmap()` is the shape: a distinct entry point whose doc-comment says
+why the deferral must not apply, so the dependency is visible to whoever next
+changes the primitive rather than being discovered by a crash.
+
+Conversely, **when changing a shared primitive, grep its call sites for callers
+who may want the old behaviour** — particularly ones in a different crate. Both
+instances here would have been caught by that, and both took hours to diagnose
+after the fact.
+
+For assertions specifically: a test that encodes a *contract* rather than a
+*result* should say so, so that the next reader can tell a stale expectation from
+a real regression. The distinction matters — updating a stale assertion is
+correct, and weakening a live one to get green is how a real bug ships.

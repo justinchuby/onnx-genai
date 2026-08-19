@@ -40,3 +40,7 @@ Luv's current-main (`923dc592`) re-probe found captured verify B* still far abov
 
 - **PR #1317** (`squad/qmoe-expert-gemv`): block-parallel router TopK for decode shapes; 81.7→9.73 µs/layer (8.4×); V2-Lite capture decode 101.17→125.68 tok/s (+24.2%); byte-identical.
 - **PR #1323**: `qmoe_gate_up_activate_f32` occupancy default-ON + selective `__ldg` via `ReadOnly` template param (gate/up only); gate_up 42.68→34.24 µs (−19.8%); +2.23% V2-Lite capture decode; byte-identical. Key lesson: blanket `__ldg` on shared helper regressed fc2 +14.6%; selective scoping nets the full win.
+## 2026-08-19T11:56Z — Qwen3.5 family trio complete
+
+Scribe recorded the family-trio closure: Deckard's qwen3.5-0.8b text-only export via graph surgery merged in PR #1456 (`169febb1f`), establishing the hybrid graph-block moat at the small end. Sebastian's `CudaDropIdentityCast` PR #1459 (`792958ecf`) is a general byte-identical cleanup win (+3.0% short ctx) for hybrid graphs. Wallace completed the fair numeric 0.8B row, closing the {0.8B, 2B, 9B} qwen3.5 evidence set.
+
