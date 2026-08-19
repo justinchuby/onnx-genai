@@ -6715,6 +6715,7 @@ mod tests {
     /// production MoE experts look like; the row-block driver's own test covers
     /// the short-`k` shapes that this gate deliberately sends there.
     #[test]
+    #[cfg(not(feature = "mlas"))]
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn gemm_bt_packed_mt_matches_naive_across_thread_counts() {
         const SHAPES: &[(usize, usize, usize)] = &[
