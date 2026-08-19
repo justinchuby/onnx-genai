@@ -77,3 +77,7 @@ Full pre-compaction history in `history-archive.md`.
 - Probed qwen3.5-2b hybrid linear-attn, Phi-3.5-mini, and qwen3.5-9b multimodal paths in background, measure-only mode with no commits.
 - Verdict: qwen3.5-2b flips small-qwen2.5 eager framing because native owns GPU kernels/capture for linear-attn ops while ORT falls back; native eager/capture are 1.10×/1.65× vs ORT eager.
 - Follow-up lever: fp16 activations plus fused head_size=256 GQA decode to remove the 31% reference-attention hotspot; Phi needs native `If`/subgraph support and qwen3.5-9b needs a multimodal harness path.
+## 2026-08-19T11:56Z — Qwen3.5 numeric family trio complete
+
+Scribe recorded Wallace's profile-only qwen3.5-0.8B fixed-depth fair A/B as the final numeric row: native/ORT 3.45×@16 → 7.50×@1729, native reaches ~6000 ctx, and ORT is runnable only via raw onnxruntime CPU-fallback. Together with Deckard's 0.8B export and Sebastian's general identity-cast cleanup, the {0.8B, 2B, 9B} hybrid graph-block family moat is now fully evidenced.
+
