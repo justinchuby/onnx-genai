@@ -392,6 +392,10 @@ enum PrefillFanOut {
 ///
 /// Park latency is what makes the wide path safe above the threshold: 226 us of
 /// worst-case wake-up is 0.25% of a 90 ms fan-out, and 45% of a 0.5 ms one.
+/// Only the x86_64 prefill entry point consumes this, so on other
+/// architectures it is dead in a lib-only build while the tests below still
+/// need it. See `scripts/check_cross_compile.sh`.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const WIDE_PREFILL_MACS: usize = 1 << 29;
 
 /// Picks the prefill fan-out executor for `macs` of work, given the task
@@ -399,6 +403,10 @@ const WIDE_PREFILL_MACS: usize = 1 << 29;
 ///
 /// Split out as a pure function so the policy is testable without a machine
 /// that has SMT, and so the threshold has one place to be wrong.
+/// Only the x86_64 prefill entry point consumes this, so on other
+/// architectures it is dead in a lib-only build while the tests below still
+/// need it. See `scripts/check_cross_compile.sh`.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn prefill_fan_out(macs: usize, lanes: usize, wide: usize) -> PrefillFanOut {
     // Nothing to win from the wide path when it is not actually wider; prefer
     // the runtime's cheaper dispatch.
@@ -538,6 +546,10 @@ const MIN_PREFILL_TASK_MACS: usize = 1 << 19;
 ///
 /// Returns a *floor* the task runtime applies to its own partition; the runtime
 /// still uses a larger grain when there are more columns than workers.
+/// Only the x86_64 prefill entry point consumes this, so on other
+/// architectures it is dead in a lib-only build while the tests below still
+/// need it. See `scripts/check_cross_compile.sh`.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn prefill_column_grain(m: usize, k: usize, n: usize) -> usize {
     let macs_per_column = m.saturating_mul(k);
     if macs_per_column == 0 {
