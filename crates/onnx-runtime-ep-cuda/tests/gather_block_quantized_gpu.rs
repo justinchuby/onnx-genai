@@ -150,3 +150,73 @@ fn gather_block_quantized_bits4_matches_cpu() {
         }
     }
 }
+
+/// Signed native `Int4` blockwise gather (gpt-oss `model.embed_tokens.weight_Q4`
+/// class): data is a real ONNX `Int4` tensor (`components == 1`, sign-extended
+/// nibble) with NO `zero_points`, so the CUDA kernel must take the symmetric
+/// `offset == 0` branch. The CPU EP is uint8-packed-only here and is NOT a valid
+/// oracle for signed int4, so this checks against a hand-computed reference:
+/// `out = signed_nibble * scale[row, col / block_size]`. Locks the signed-unpack
+/// + symmetric-default path that enables gpt-oss's quantized embedding.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn gather_block_quantized_signed_int4_no_zero_points_matches_reference() {
+    let ep = require_cuda();
+    const ROWS: usize = 4;
+    const COLS: usize = 32;
+    const BLOCK: usize = 16;
+    const BLOCKS_PER_ROW: usize = COLS / BLOCK; // 2
+
+    // Deterministic signed nibbles in [-8, 7].
+    let nib = |r: usize, c: usize| -> i32 { (((r * 7 + c * 3) % 16) as i32) - 8 };
+
+    // Pack 2 nibbles/byte, low nibble first (matches the kernel's idx%2 order).
+    let mut data = vec![0u8; ROWS * COLS / 2];
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            let idx = r * COLS + c;
+            let code = (nib(r, c) & 0xF) as u8;
+            if idx % 2 == 0 {
+                data[idx / 2] |= code;
+            } else {
+                data[idx / 2] |= code << 4;
+            }
+        }
+    }
+
+    let scales: Vec<f32> = (0..ROWS * BLOCKS_PER_ROW)
+        .map(|i| 0.05 + 0.01 * i as f32)
+        .collect();
+    let indices = [1i64, 3, 0];
+    let out_shape = [indices.len(), COLS];
+
+    let inputs = vec![
+        input(DataType::Int4, &[ROWS, COLS], &data),
+        input(DataType::Int64, &[indices.len()], &indices),
+        float_input(DataType::Float32, &[scales.len()], &scales),
+        // No zero_points => symmetric offset 0.
+    ];
+    let outputs = vec![(DataType::Float32, out_shape.to_vec())];
+    let attrs = vec![
+        ("gather_axis", Attribute::Int(0)),
+        ("quantize_axis", Attribute::Int(1)),
+        ("block_size", Attribute::Int(BLOCK as i64)),
+        // No `bits` attribute => defaults to 4 (the gpt-oss embedding layout).
+    ];
+
+    let cuda = run_cuda(&ep, OP, DOMAIN, OPSET, &inputs, &outputs, &attrs);
+    let got = decode_floats(&cuda[0], DataType::Float32);
+
+    let mut expected = vec![0f32; indices.len() * COLS];
+    for (o, &row_i64) in indices.iter().enumerate() {
+        let row = row_i64 as usize;
+        for c in 0..COLS {
+            let scale = scales[row * BLOCKS_PER_ROW + c / BLOCK];
+            expected[o * COLS + c] = nib(row, c) as f32 * scale;
+        }
+    }
+    assert_close(OP, DataType::Float32, &got, &expected, 2e-5);
+}

@@ -85,7 +85,21 @@ static GLOBAL_VRAM_FREE_NS: AtomicU64 = AtomicU64::new(0);
 // consumers of the VA to finish — but under VMM over-subscription that in-flight
 // work is itself PCIe-fault-slowed, so folding it into `GLOBAL_VRAM_FREE_NS`
 // mis-attributes paging-stalled compute/copy as "free" time (#1295). Timed
-// separately so `vram_free_ns` measures only unmap/release.
+// separately so the stream drain is excluded from `vram_free_ns`.
+//
+// CAUTION (2026-08-19 reconciliation, docs/benchmarks/
+// 2026-08-19-vram-free-attribution-reconciliation.md): even with the drain
+// split out, `GLOBAL_VRAM_FREE_NS` is NOT "driver freeing time". It wraps the
+// whole free code path -- the `cuMemUnmap`/`cuMemRelease` driver calls AND the
+// per-granule Rust bookkeeping in `decommit_allocation_range`/`deallocate_span`
+// -- and the bookkeeping dominates: on an RTX 4060 weight-lending run the driver
+// `cuMemUnmap` was a stable ~16.9 ms/call (~101 ms total over 6 releases) while
+// `vram_free_ms` swung 82 ms <-> 2450 ms (~30x) on byte-identical deterministic
+// work. A metric that varies 30x while the work is constant is measuring
+// variable non-driver time (bookkeeping and/or lock/blocking), not freeing.
+// To isolate the driver cost, time the `cuMemUnmap` sites directly (see the
+// reconciliation doc's split instrumentation); do not read `vram_free_ms` as a
+// driver-freeing figure.
 static GLOBAL_VRAM_FREE_SYNC_NS: AtomicU64 = AtomicU64::new(0);
 // Process-lifetime high-water gauge. Resetting activity counters must not write
 // it: a concurrent page-in could otherwise be overwritten with a stale value.
@@ -177,6 +191,13 @@ pub struct GlobalOffloadStats {
     pub materialize_fallback_calls: u64,
     pub htod_bytes: u64,
     pub vram_alloc_ns: u64,
+    /// Weight-page free code path: the `cuMemUnmap`/`cuMemRelease` driver calls
+    /// plus the per-granule Rust bookkeeping in `decommit_allocation_range`/
+    /// `deallocate_span`. NOT a driver-freeing figure -- the bookkeeping
+    /// dominates and this counter swings ~30x on byte-identical work while the
+    /// driver `cuMemUnmap` stays ~17 ms/call (see `GLOBAL_VRAM_FREE_NS` and the
+    /// 2026-08-19 reconciliation doc). Excludes the pre-free stream drain, which
+    /// is timed into [`Self::vram_free_sync_ns`].
     pub vram_free_ns: u64,
     /// Pre-free stream drain time (`cuStreamSynchronize`) taken on the Drop-path
     /// eviction before unmapping. Split out of [`Self::vram_free_ns`] so the
@@ -1380,7 +1401,7 @@ impl CudaWeightPage {
                 // freeing anything (#1295).
                 if synchronize_streams {
                     let sync_start = std::time::Instant::now();
-                    let sync_failed = self.runtime.synchronize().is_err()
+                    let sync_failed = self.runtime.drain_for_unmap().is_err()
                         || self.runtime.copy_stream().synchronize().is_err();
                     add_duration(&GLOBAL_VRAM_FREE_SYNC_NS, sync_start.elapsed());
                     if sync_failed {
@@ -2926,7 +2947,7 @@ impl CudaWeightResidency {
                     // re-copying the original host source. If corruption
                     // vanishes under this, the retained device copy had gone
                     // stale (host bytes are unchanged) — the decisive control.
-                    self.runtime.synchronize().map_err(|error| {
+                    self.runtime.drain_for_unmap().map_err(|error| {
                         WeightHandleError::DeviceBinding(format!(
                             "pin-refill compute drain: {error}"
                         ))
@@ -3208,7 +3229,7 @@ impl CudaWeightResidency {
                         // not a pure aliasing/logic bug. Default OFF /
                         // byte-identical.
                         if sync_before_fill_enabled() {
-                            self.runtime.synchronize().map_err(|error| {
+                            self.runtime.drain_for_unmap().map_err(|error| {
                                 WeightHandleError::DeviceBinding(format!(
                                     "sync-before-fill compute drain: {error}"
                                 ))
@@ -3323,7 +3344,7 @@ impl CudaWeightResidency {
             };
             if !streams_drained {
                 let sync_start = std::time::Instant::now();
-                self.runtime.synchronize().map_err(|error| {
+                self.runtime.drain_for_unmap().map_err(|error| {
                     WeightHandleError::DeviceBinding(format!("compute stream sync: {error}"))
                 })?;
                 self.runtime.copy_stream().synchronize().map_err(|error| {
@@ -3425,7 +3446,7 @@ impl CudaWeightResidency {
         ptr: CUdeviceptr,
         len: usize,
     ) -> Result<Vec<u64>, WeightHandleError> {
-        self.runtime.synchronize().map_err(|error| {
+        self.runtime.drain_for_unmap().map_err(|error| {
             WeightHandleError::DeviceBinding(format!("pin-checksum compute drain: {error}"))
         })?;
         self.runtime.copy_stream().synchronize().map_err(|error| {
@@ -3481,7 +3502,7 @@ impl CudaWeightResidency {
         // synchronize is never capture-illegal.
         let sync_start = std::time::Instant::now();
         self.runtime
-            .synchronize()
+            .drain_for_unmap()
             .map_err(|error| WeightHandleError::DeviceBinding(format!("stream sync: {error}")))?;
         add_duration(&GLOBAL_ADMIT_SYNC_NS, sync_start.elapsed());
         let mut inner = self.lock();
