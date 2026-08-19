@@ -909,6 +909,7 @@ impl NativeDecodeSession {
             position_rank,
             decode_inline: DecodeInlineState::Untried,
             prefill_chunk_size: None,
+            prefill_query_padding: true,
         })
     }
 }
