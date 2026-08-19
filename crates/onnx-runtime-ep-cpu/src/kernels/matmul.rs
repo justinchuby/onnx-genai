@@ -2279,7 +2279,8 @@ fn bnns_half_dense_into(a: &[u16], b: &[u16], geom: &MatMulGeometry, out: &mut [
 }
 
 /// Select the runtime-gated AVX-512 BF16 microkernel when available; otherwise
-/// use the portable blocked half GEMM. The f16 path is always portable today.
+/// use the fused widen-pack prefill GEBP (x86-64, AVX2/FMA, `m` above the
+/// measured crossover) or the portable blocked half GEMM.
 fn half_gemm_tile(
     format: HalfFormat,
     a: &[u16],
@@ -2295,6 +2296,13 @@ fn half_gemm_tile(
         return;
     }
 
+    #[cfg(target_arch = "x86_64")]
+    if half_prefill_gebp_selected(format, m, k, n) && half_prefill_gebp_enabled() {
+        count_half_prefill_gebp();
+        x86_sgemm::half_prefill_gebp(format, a, b, c, m, k, n);
+        return;
+    }
+
     half_gemm::gemm(
         format,
         a,
@@ -2306,6 +2314,134 @@ fn half_gemm_tile(
         k,
         n,
     );
+}
+
+/// Whether a contiguous half GEMM tile is better served by the fused
+/// widen-pack GEBP ([`x86_sgemm::half_prefill_gebp`]) than by the blocked half
+/// GEMM.
+///
+/// The blocked half GEMM splits only over rows of C and re-widens/re-packs the
+/// whole of `B` per row block, so its weight traffic scales with `m`: at
+/// `m = 64` on this 32-thread host its own block size collapses to one row,
+/// i.e. 64 full passes over the weight. The GEBP traverses `B` once per column
+/// strip whatever `m` is, so the question is only whether a single widen-pack
+/// of `B` is repaid — which is why the gate is on the *weight* size and not on
+/// `m * k * n`.
+///
+/// Requires AVX2 + FMA because it reuses the f32 microkernel.
+#[cfg(target_arch = "x86_64")]
+fn half_prefill_gebp_selected(format: HalfFormat, m: usize, k: usize, n: usize) -> bool {
+    if !crate::backend::has_simd_x86() {
+        return false;
+    }
+    if k.saturating_mul(n) < HALF_PREFILL_GEBP_MIN_WEIGHT {
+        return false;
+    }
+    // `m == 1` keeps the f16 GEMV (`half_gemv::gemv_f16_kn`), which is
+    // bandwidth-optimal and measured a wash against this kernel. `bf16` has no
+    // such GEMV and falls through to the blocked half GEMM, where a single
+    // decode row still pays a full widen-pack of `B` -- so it takes this path
+    // too.
+    m >= HALF_PREFILL_GEBP_MIN_ROWS || format == HalfFormat::Bf16
+}
+
+/// Minimum `M` at which the fused widen-pack GEBP replaces the blocked half
+/// GEMM (`bf16` also takes it at `m == 1`; see
+/// [`half_prefill_gebp_selected`]).
+///
+/// Every `m >= 2` wins once the weight clears
+/// [`HALF_PREFILL_GEBP_MIN_WEIGHT`], so this is categorical (GEMV at `M=1` vs
+/// GEMM at `M>=2`) rather than a tuned crossover, and carries no
+/// machine-specific assumption.
+///
+/// `M=1` is where the two formats differ, and only because of what they can
+/// fall back to. `f16` has a dedicated GEMV (`half_gemv::gemv_f16_kn`) that
+/// intercepts contiguous 2-D decode before this tile is ever reached, so the
+/// threshold leaves `f16` decode bit-for-bit unchanged; measured through the
+/// production kernel, the `f16 m=1` rows move by less than run-to-run noise
+/// because both arms take that GEMV. `bf16` has no such GEMV: a single decode
+/// row lands on the blocked half GEMM and pays a full widen-pack of `B`
+/// anyway, which cost 31.4 ms for one token at `k=4096, n=11008`
+/// (`bench half_prefill_route_ab`) against 2.0 ms here -- so `bf16` takes this
+/// route at `m == 1` too. A native `bf16` GEMV would likely beat both and is
+/// left as separate work.
+#[cfg(target_arch = "x86_64")]
+const HALF_PREFILL_GEBP_MIN_ROWS: usize = 2;
+
+/// Minimum `B` size, in **elements** (`K * N`), before the fused widen-pack
+/// GEBP is used.
+///
+/// The GEBP widens and packs `B` once per column strip; below some weight size
+/// that single pass, plus the fork/join over strips, costs more than the
+/// re-packing it removes.
+///
+/// [`bench_half_prefill_gebp_crossover`], release build, p50 of 5, both routes
+/// interleaved rep-by-rep. Ratio is `blocked / gebp`, so > 1 means the GEBP
+/// wins; each cell is `T=32 / T=4`:
+///
+/// | K x N | elements | m=2 | m=4 | m=8 | m=16 |
+/// |---|---|---|---|---|---|
+/// | 256 x 256 | 65_536 | 0.60 / 0.77 | 0.59 / 0.86 | 0.56 / 1.02 | 3.42 / 1.09 |
+/// | 512 x 512 | 262_144 | 1.18 / 1.84 | 3.76 / 2.39 | 3.59 / 3.18 | 4.21 / 1.29 |
+/// | 768 x 768 | 589_824 | 4.42 / 3.08 | 5.44 / 3.39 | 3.84 / 3.71 | 5.76 / 1.64 |
+/// | **1024 x 1024** | **1_048_576** | **5.01 / 3.36** | **7.69 / 3.42** | **6.61 / 4.24** | **4.67 / 1.95** |
+/// | 1536 x 1536 | 2_359_296 | 6.79 / 3.59 | 6.63 / 5.53 | 7.67 / 5.53 | 7.38 / 2.47 |
+/// | 2048 x 2048 | 4_194_304 | 6.58 / 3.47 | 7.37 / 3.15 | 6.39 / 6.79 | 8.69 / 3.53 |
+///
+/// (`f16`; the `bf16` half of the same run agrees within noise.)
+///
+/// That harness times the two routes directly. End to end through the
+/// production kernel (`bench half_prefill_route_ab`, which also pays the
+/// dispatch and the narrowing of the output) the ratios are damped and
+/// `512 x 512` *loses* at `T=32` for `m = 2..8` (0.63x-0.98x) while still
+/// winning at `T=4`. `1_048_576` is the smallest weight that wins in **both**
+/// harnesses at both thread counts and in both formats, so that is the gate;
+/// `512 x 512` and `768 x 768` are left on the blocked route rather than
+/// claimed. Below the gate the loss is real, not noise: 0.56x at `256 x 256`.
+///
+/// Deliberately the same shape of rule -- and the same value -- as the sibling
+/// guard `half_gemm::PARALLEL_MIN_WORK`, which exists because the same
+/// fork/join stops paying at the same scale.
+#[cfg(target_arch = "x86_64")]
+const HALF_PREFILL_GEBP_MIN_WEIGHT: usize = 1_048_576;
+
+/// Whether the fused widen-pack prefill GEBP is enabled. On by default;
+/// `ONNX_GENAI_CPU_MM_HALF_GEBP=0` (or `off`) restores the blocked half GEMM
+/// for the whole process, so a regression can be bisected in the field without
+/// a rebuild. Read-only env probe -- production never mutates it at runtime.
+#[cfg(target_arch = "x86_64")]
+fn half_prefill_gebp_enabled() -> bool {
+    std::env::var("ONNX_GENAI_CPU_MM_HALF_GEBP")
+        .ok()
+        .map(|value| {
+            let value = value.trim();
+            value.is_empty() || (value != "0" && !value.eq_ignore_ascii_case("off"))
+        })
+        .unwrap_or(true)
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+thread_local! {
+    /// Test-only count of half GEMM tiles served by the fused widen-pack GEBP,
+    /// so a test can assert *which route* ran rather than only the numbers.
+    static HALF_PREFILL_GEBP_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn count_half_prefill_gebp() {
+    #[cfg(test)]
+    HALF_PREFILL_GEBP_CALLS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) fn half_prefill_gebp_calls() -> u64 {
+    HALF_PREFILL_GEBP_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) fn reset_half_prefill_gebp_calls() {
+    HALF_PREFILL_GEBP_CALLS.with(|c| c.set(0));
 }
 
 /// Compute `A @ B` (numpy semantics: batched, broadcast leading dims, 1-D
@@ -3638,6 +3774,91 @@ mod tests {
         }
     }
 
+    /// Sweep that sets [`HALF_PREFILL_GEBP_MIN_WEIGHT`]: blocked half GEMM vs
+    /// the fused widen-pack GEBP, interleaved rep-by-rep so both routes see the
+    /// same machine load. Both arms call the exact function the gate selects
+    /// between, so the crossover this prints is the crossover the gate must
+    /// encode -- and no environment variable is touched, which keeps it safe to
+    /// run inside the parallel test binary.
+    ///
+    /// Pin the run (`taskset -c 0-15`) and set `RAYON_NUM_THREADS`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "microbench: run explicitly with --ignored --nocapture"]
+    fn bench_half_prefill_gebp_crossover() {
+        use std::time::Instant;
+
+        fn median5(mut f: impl FnMut()) -> f64 {
+            let mut v: Vec<f64> = (0..5)
+                .map(|_| {
+                    let t = Instant::now();
+                    f();
+                    t.elapsed().as_secs_f64() * 1e3
+                })
+                .collect();
+            v.sort_by(f64::total_cmp);
+            v[2]
+        }
+
+        println!("threads={}", rayon::current_num_threads());
+        println!("format,m,k,n,weight,blocked_ms,gebp_ms,blocked/gebp");
+        for format in [HalfFormat::F16, HalfFormat::Bf16] {
+            for &(k, n) in &[
+                (256usize, 256usize), //    65_536
+                (512, 512),           //   262_144
+                (768, 768),           //   589_824
+                (1024, 1024),         // 1_048_576
+                (1536, 1536),         // 2_359_296
+                (2048, 2048),         // 4_194_304
+            ] {
+                let b: Vec<u16> = (0..k * n)
+                    .map(|i| narrow_bits(format, ((i % 31) as f32 - 15.0) / 16.0))
+                    .collect();
+                for &m in &[1usize, 2, 4, 8, 16] {
+                    let a: Vec<u16> = (0..m * k)
+                        .map(|i| narrow_bits(format, ((i % 23) as f32 - 11.0) / 16.0))
+                        .collect();
+                    let mut c = vec![0.0f32; m * n];
+                    let mut blocked = || {
+                        half_gemm::gemm(
+                            format,
+                            &a,
+                            MatrixLayout::row_major(k),
+                            &b,
+                            MatrixLayout::row_major(n),
+                            &mut c,
+                            m,
+                            k,
+                            n,
+                        );
+                    };
+                    blocked();
+                    let mut gebp_c = vec![0.0f32; m * n];
+                    let mut gebp =
+                        || x86_sgemm::half_prefill_gebp(format, &a, &b, &mut gebp_c, m, k, n);
+                    gebp();
+
+                    let blocked_ms = median5(&mut blocked);
+                    let gebp_ms = median5(&mut gebp);
+                    let weight = k * n;
+                    println!(
+                        "{format:?},{m},{k},{n},{weight},{blocked_ms:.4},{gebp_ms:.4},{:.2}",
+                        blocked_ms / gebp_ms
+                    );
+                }
+            }
+        }
+    }
+
+    /// Round an `f32` into the given 16-bit format and return its bits.
+    #[cfg(target_arch = "x86_64")]
+    fn narrow_bits(format: HalfFormat, value: f32) -> u16 {
+        match format {
+            HalfFormat::F16 => half::f16::from_f32(value).to_bits(),
+            HalfFormat::Bf16 => half::bf16::from_f32(value).to_bits(),
+        }
+    }
+
     /// Sweep that sets [`HALF_WIDEN_MIN_M`]: blocked half GEMM vs widening to
     /// `f32` and running the tuned SGEMM, over the `M` grid at the ambient
     /// thread count. Both arms run the exact code the two routes run, so the
@@ -4415,6 +4636,119 @@ mod tests {
     /// `N = 5` is below the kernel's 8-lane SIMD step, so the whole stripe
     /// runs through the scalar tail; `K = 137` is a long odd contraction.
     /// Together they exercise the edges the blocked kernel never sees.
+    /// The fused widen-pack prefill GEBP must agree with the blocked half GEMM
+    /// it replaces, *and* the assertion must be about the route that actually
+    /// ran -- so the call count is checked too, not inferred from the numbers.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn half_prefill_gebp_agrees_with_the_blocked_half_gemm_and_is_the_route() {
+        use onnx_runtime_ir::DataType;
+
+        // `k * n` must clear `HALF_PREFILL_GEBP_MIN_WEIGHT` for the route to be
+        // selected at all.
+        let (k, n) = (1024usize, 1024usize);
+        assert!(k * n >= HALF_PREFILL_GEBP_MIN_WEIGHT);
+        // Multiples of 1/16 in a small range are exact in both f16 and bf16, so
+        // any mismatch is the kernel's rather than the operands' rounding.
+        let b_data: Vec<f32> = (0..k * n)
+            .map(|i| ((i * 13 % 31) as f32 - 15.0) / 16.0)
+            .collect();
+
+        for dtype in [DataType::Float16, DataType::BFloat16] {
+            for m in [2usize, 5, 17] {
+                let a_data: Vec<f32> = (0..m * k)
+                    .map(|i| ((i * 7 % 23) as f32 - 11.0) / 16.0)
+                    .collect();
+                let (a, b) = match dtype {
+                    DataType::Float16 => {
+                        (Owned::f16(&[m, k], &a_data), Owned::f16(&[k, n], &b_data))
+                    }
+                    _ => (Owned::bf16(&[m, k], &a_data), Owned::bf16(&[k, n], &b_data)),
+                };
+                let mut out = Owned::zeros_f32(&[m, n]);
+
+                reset_half_prefill_gebp_calls();
+                let mut kernel = MatMulKernel::default();
+                kernel.set_constant_inputs(&[false, true]);
+                kernel
+                    .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                    .unwrap();
+                if !crate::backend::has_simd_x86() {
+                    continue; // No AVX2/FMA: the blocked half GEMM still runs.
+                }
+                assert_eq!(
+                    half_prefill_gebp_calls(),
+                    1,
+                    "{dtype:?} m={m}: prefill did not take the fused widen-pack GEBP"
+                );
+
+                let expected = naive_matmul(&a_data, &b_data, m, k, n);
+                for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+                    // Reordered reductions over 1024 terms need a scaled
+                    // tolerance; a fixed epsilon would be meaningless at these
+                    // magnitudes.
+                    let tol = 1e-3 * (1.0 + want.abs());
+                    assert!(
+                        (actual - want).abs() <= tol,
+                        "{dtype:?} m={m}: got {actual}, want {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Small weights must stay on the blocked half GEMM: the fused route pays a
+    /// widen-pack of `B` and a fork/join that a small `B` cannot repay (0.11x
+    /// at 256x256; see `HALF_PREFILL_GEBP_MIN_WEIGHT`).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn half_prefill_gebp_declines_a_weight_below_the_gate() {
+        let (k, n) = (64usize, 64usize);
+        assert!(k * n < HALF_PREFILL_GEBP_MIN_WEIGHT);
+        let a_data: Vec<f32> = (0..8 * k).map(|i| ((i % 17) as f32 - 8.0) / 16.0).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 19) as f32 - 9.0) / 16.0).collect();
+
+        reset_half_prefill_gebp_calls();
+        let a = Owned::f16(&[8, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[8, n]);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(
+            half_prefill_gebp_calls(),
+            0,
+            "a {k}x{n} weight must stay on the blocked half GEMM"
+        );
+    }
+
+    /// `f16` decode keeps its bandwidth-optimal GEMV: the fused route is a wash
+    /// there and decode numerics must not move.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn f16_decode_does_not_take_the_prefill_gebp() {
+        let (k, n) = (1024usize, 1024usize);
+        let a_data: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) / 16.0).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 19) as f32 - 9.0) / 16.0).collect();
+
+        reset_half_prefill_gebp_calls();
+        let a = Owned::f16(&[1, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(
+            half_prefill_gebp_calls(),
+            0,
+            "f16 M=1 decode must stay on the GEMV"
+        );
+    }
+
     #[test]
     fn f16_decode_gemv_agrees_with_the_blocked_half_gemm() {
         let k = 137usize;

@@ -291,6 +291,33 @@ The improvement stands on its own regardless: this EP runs its own f16 kernel in
 #1080 reports that kernel as 2.4x-14.3x faster than its predecessor. That range is ours-before over ours-after, from #1080's own report — it is a different
 quantity from this table's ours/ORT ratios and cannot be re-derived by dividing them.
 
+#### The default build never had #1080's route (**fixed natively**)
+
+#1080's f16 prefill gate is `#[cfg(feature = "mlas")]`, and `mlas` is **off by default**. Every row
+in the table above was measured with MLAS compiled in; the shipped default build had no such route
+and stayed on the row-blocked half GEMM, which re-widens and re-packs the whole of `B` once per row
+block (`m = 64` on 32 threads = 64 full passes over the weight).
+
+The native path now has its own answer: `f16`/`bf16` prefill widens `B` **directly into** the packed
+L1 panel of the existing AVX2/FMA f32 microkernel, so the weight is traversed once whatever `m` is,
+with no widened `B` copy retained. Self-A/B on the same host, default features, production kernel,
+p50 steady, `k = 4096, n = 11008` — **ours-before over ours-after**, a different quantity from this
+table's ours/ORT ratios:
+
+| dtype | m | before | after | gain |
+|---|---|---:|---:|---:|
+| f16 | 8 | 36.20 ms | 2.59 ms | **14.0x** |
+| f16 | 64 | 118.33 ms | 7.50 ms | **15.8x** |
+| f16 | 256 | 169.41 ms | 26.27 ms | **6.4x** |
+| bf16 | 1 | 31.36 ms | 1.96 ms | **16.0x** |
+| bf16 | 64 | 108.79 ms | 7.66 ms | **14.2x** |
+
+After the change `f16` prefill is at parity with this EP's own f32 SGEMM at `m = 64` (7.50 vs 7.42
+ms) and faster than it at `m = 8`. The **ours/ORT ratios above have not been re-measured** — this
+host has no model corpus to run the session-level A/B against, so the table stands as it was and
+this note is only about the native-vs-native change. Full record:
+`docs/benchmarks/2026-08-19-half-prefill-fused-widen-pack-gebp.md`.
+
 ### 3. Per-call packing — `QLinearMatMul` (**fixed**)
 
 #1058 bound MLAS's integer QGEMM and took u8 x u8 from **27-119x** down to 3-4x. What remained was

@@ -33,6 +33,9 @@
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use rayon::prelude::*;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use super::half_gemm::HalfFormat;
+
 /// Register-tile rows.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const MR: usize = 6;
@@ -498,6 +501,307 @@ unsafe fn micro_6x16(
     }
 }
 
+/// Fused widen→pack GEBP for a contiguous `f16`/`bf16` prefill GEMM:
+/// `c[m,n] = a[m,k] @ b[k,n]` in `f32` (overwrite), with both operands still in
+/// 16-bit storage.
+///
+/// The blocked half GEMM ([`super::half_gemm`]) splits only over rows of C, so
+/// every row block re-widens and re-packs the whole of `B`: at `m = 64` on a
+/// 32-thread host its own block size collapses to one row, i.e. 64 full passes
+/// over the weight. This kernel keeps the packed-panel structure of
+/// [`sgemm_simd_packed`] instead — `B` is widened *directly into* the L1
+/// `KC x NR` panel the existing [`micro_6x16`] consumes, so the weight is
+/// traversed once per column strip regardless of `m`, and the tuned microkernel
+/// is reused unchanged.
+///
+/// `A` is widened once into a dense `m*k` f32 buffer and packed by the shared
+/// [`pack_a`]; that transient is bounded by the activation, not the weight
+/// (`m*k*4` bytes, ~4 MB at `m = 256, k = 4096`), and is freed when the call
+/// returns. No f32 copy of `B` is ever materialized or retained, so this adds
+/// no weight-derived cache.
+///
+/// Because the panels produced here are element-for-element what [`pack_a`] and
+/// [`pack_b`] produce from the widened operands, results are **bit-identical**
+/// to `sgemm_simd(widen(a), widen(b))`.
+///
+/// The caller must ensure the host supports AVX2 + FMA
+/// ([`crate::backend::has_simd_x86`]).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) fn half_prefill_gebp(
+    format: HalfFormat,
+    a: &[u16],
+    b: &[u16],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        c.fill(0.0);
+        return;
+    }
+
+    let mut a_wide = vec![0.0f32; m * k];
+    widen_half(format, &a[..m * k], &mut a_wide);
+
+    let m_panels = m.div_ceil(MR);
+    let mut apack = vec![0.0f32; m_panels * k * MR];
+    pack_a(&a_wide, &mut apack, m, k);
+    drop(a_wide);
+
+    let widen = select_half_widen(format);
+    let n_panels = n.div_ceil(NR);
+    let threads = rayon::current_num_threads().max(1);
+    let target_tasks = threads.saturating_mul(8).max(1);
+    let panels_per_strip = n_panels.div_ceil(target_tasks).clamp(1, 16);
+    let strip_cols = panels_per_strip * NR;
+    let strip_count = n.div_ceil(strip_cols);
+
+    let cptr = CPtr(c.as_mut_ptr());
+    let apack = &apack;
+
+    (0..strip_count).into_par_iter().for_each(|s| {
+        let j0 = s * strip_cols;
+        let nc = strip_cols.min(n - j0);
+        let strip_panels = nc.div_ceil(NR);
+        let mut bpack = vec![0.0f32; KC * strip_panels * NR];
+        // SAFETY: `cptr` addresses the caller's `c`; this task only writes
+        // columns [j0, j0+nc), disjoint from every other strip.
+        let c_base = cptr.get();
+
+        let mut pc = 0usize;
+        while pc < k {
+            let kc = KC.min(k - pc);
+            pack_b_half(widen, b, &mut bpack, n, pc, kc, j0, nc);
+            let first = pc == 0;
+
+            for ip in 0..m_panels {
+                let i0 = ip * MR;
+                let mr = MR.min(m - i0);
+                let apanel = &apack[ip * k * MR + pc * MR..ip * k * MR + pc * MR + kc * MR];
+                let mut jr = 0usize;
+                let mut jp = 0usize;
+                while jr < nc {
+                    let nr = NR.min(nc - jr);
+                    let bpanel = &bpack[jp * KC * NR..jp * KC * NR + kc * NR];
+                    // SAFETY: AVX2/FMA verified by the caller; `c_base` points
+                    // at valid `m*n` storage and (i0, j0+jr) with (mr, nr)
+                    // stays in bounds; this strip owns these columns.
+                    unsafe {
+                        micro_6x16(
+                            apanel.as_ptr(),
+                            bpanel.as_ptr(),
+                            c_base.add(i0 * n + j0 + jr),
+                            n,
+                            kc,
+                            mr,
+                            nr,
+                            first,
+                        );
+                    }
+                    jr += NR;
+                    jp += 1;
+                }
+            }
+            pc += KC;
+        }
+    });
+}
+
+/// Widen a contiguous run of 16-bit floats into `f32`, using the vector
+/// conversion when the host has it. Delegates to the same helpers the blocked
+/// half GEMM packs with, so both kernels widen identically.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn widen_half(format: HalfFormat, source: &[u16], destination: &mut [f32]) {
+    super::half_gemm::widen_contiguous(format, source, destination);
+}
+
+/// Widen and pack a `kc x nc` block of a 16-bit `B` (rows `[pc,pc+kc)`, columns
+/// `[j0,j0+nc)`) into the `NR`-column `f32` panels [`micro_6x16`] reads,
+/// zero-padding columns past `nc`. The layout matches [`pack_b`] applied to a
+/// widened `B` exactly, panel stride `KC` included.
+///
+/// The whole block is packed under one feature dispatch: the conversion is
+/// otherwise a handful of instructions per 16 columns, so a per-panel call
+/// would cost more than the work it guards.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn pack_b_half(
+    widen: HalfWiden,
+    b: &[u16],
+    bpack: &mut [f32],
+    n: usize,
+    pc: usize,
+    kc: usize,
+    j0: usize,
+    nc: usize,
+) {
+    match widen {
+        HalfWiden::F16c => {
+            // SAFETY: `HalfWiden::F16c` is only selected after runtime
+            // detection of AVX2 and F16C.
+            unsafe { pack_b_half_f16c(b, bpack, n, pc, kc, j0, nc) }
+        }
+        HalfWiden::Bf16Avx2 => {
+            // SAFETY: `HalfWiden::Bf16Avx2` is only selected after runtime
+            // detection of AVX2.
+            unsafe { pack_b_half_bf16_avx2(b, bpack, n, pc, kc, j0, nc) }
+        }
+        HalfWiden::Scalar(format) => pack_b_half_scalar(format, b, bpack, n, pc, kc, j0, nc),
+    }
+}
+
+/// Which widening the host can use for a given 16-bit format. `f16` needs F16C
+/// for the hardware conversion; `bf16` widens with a shift, so AVX2 (already
+/// required by the microkernel) is enough.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HalfWiden {
+    F16c,
+    Bf16Avx2,
+    Scalar(HalfFormat),
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn select_half_widen(format: HalfFormat) -> HalfWiden {
+    match format {
+        HalfFormat::F16 if std::arch::is_x86_feature_detected!("f16c") => HalfWiden::F16c,
+        HalfFormat::Bf16 if std::arch::is_x86_feature_detected!("avx2") => HalfWiden::Bf16Avx2,
+        other => HalfWiden::Scalar(other),
+    }
+}
+
+/// Portable widen-and-pack, used when the host lacks the vector conversion.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn pack_b_half_scalar(
+    format: HalfFormat,
+    b: &[u16],
+    bpack: &mut [f32],
+    n: usize,
+    pc: usize,
+    kc: usize,
+    j0: usize,
+    nc: usize,
+) {
+    let n_panels = nc.div_ceil(NR);
+    for jp in 0..n_panels {
+        let jcol = j0 + jp * NR;
+        let nr = NR.min(nc - jp * NR);
+        let dst = &mut bpack[jp * KC * NR..jp * KC * NR + kc * NR];
+        for p in 0..kc {
+            let src = &b[(pc + p) * n + jcol..(pc + p) * n + jcol + nr];
+            let out = &mut dst[p * NR..p * NR + NR];
+            widen_half(format, src, &mut out[..nr]);
+            out[nr..NR].fill(0.0);
+        }
+    }
+}
+
+/// F16C widen-and-pack: each 16-column row segment is two `_mm256_cvtph_ps`
+/// conversions straight into the panel.
+///
+/// # Safety
+/// The host must support AVX2 + F16C. Indices are the same ones
+/// [`pack_b_half_scalar`] checks, so every access stays inside `b`/`bpack`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,f16c")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn pack_b_half_f16c(
+    b: &[u16],
+    bpack: &mut [f32],
+    n: usize,
+    pc: usize,
+    kc: usize,
+    j0: usize,
+    nc: usize,
+) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let n_panels = nc.div_ceil(NR);
+    for jp in 0..n_panels {
+        let jcol = j0 + jp * NR;
+        let nr = NR.min(nc - jp * NR);
+        let dst = &mut bpack[jp * KC * NR..jp * KC * NR + kc * NR];
+        for p in 0..kc {
+            let src = &b[(pc + p) * n + jcol..(pc + p) * n + jcol + nr];
+            let out = &mut dst[p * NR..p * NR + NR];
+            if nr == NR {
+                // SAFETY: `src` holds NR = 16 elements and `out` 16 f32.
+                unsafe {
+                    let lo = _mm_loadu_si128(src.as_ptr().cast());
+                    let hi = _mm_loadu_si128(src.as_ptr().add(8).cast());
+                    _mm256_storeu_ps(out.as_mut_ptr(), _mm256_cvtph_ps(lo));
+                    _mm256_storeu_ps(out.as_mut_ptr().add(8), _mm256_cvtph_ps(hi));
+                }
+                continue;
+            }
+            for (slot, &bits) in out[..nr].iter_mut().zip(src) {
+                *slot = half::f16::from_bits(bits).to_f32();
+            }
+            out[nr..NR].fill(0.0);
+        }
+    }
+}
+
+/// AVX2 widen-and-pack for `bf16`: widening is a 16-bit left shift, so each
+/// 16-column row segment is two shifts straight into the panel.
+///
+/// # Safety
+/// The host must support AVX2. Indices are the same ones
+/// [`pack_b_half_scalar`] checks, so every access stays inside `b`/`bpack`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn pack_b_half_bf16_avx2(
+    b: &[u16],
+    bpack: &mut [f32],
+    n: usize,
+    pc: usize,
+    kc: usize,
+    j0: usize,
+    nc: usize,
+) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let n_panels = nc.div_ceil(NR);
+    for jp in 0..n_panels {
+        let jcol = j0 + jp * NR;
+        let nr = NR.min(nc - jp * NR);
+        let dst = &mut bpack[jp * KC * NR..jp * KC * NR + kc * NR];
+        for p in 0..kc {
+            let src = &b[(pc + p) * n + jcol..(pc + p) * n + jcol + nr];
+            let out = &mut dst[p * NR..p * NR + NR];
+            if nr == NR {
+                // SAFETY: `src` holds NR = 16 elements and `out` 16 f32.
+                unsafe {
+                    let lo = _mm_loadu_si128(src.as_ptr().cast());
+                    let hi = _mm_loadu_si128(src.as_ptr().add(8).cast());
+                    let lo = _mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(lo));
+                    let hi = _mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(hi));
+                    _mm256_storeu_ps(out.as_mut_ptr(), _mm256_castsi256_ps(lo));
+                    _mm256_storeu_ps(out.as_mut_ptr().add(8), _mm256_castsi256_ps(hi));
+                }
+                continue;
+            }
+            for (slot, &bits) in out[..nr].iter_mut().zip(src) {
+                *slot = half::bf16::from_bits(bits).to_f32();
+            }
+            out[nr..NR].fill(0.0);
+        }
+    }
+}
+
 #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
 mod tests {
     use super::*;
@@ -695,4 +999,113 @@ mod tests {
     // parallel next to dozens of live `env::var` readers. The bit-exact
     // comparison in `the_default_entry_point_routes_m1_to_the_gemv` pins the
     // route without touching process state.
+
+    /// Round an f32 to the given 16-bit format and back, so a reference built
+    /// from the f32 values sees exactly the operand the kernel sees.
+    fn narrow(format: HalfFormat, value: f32) -> (u16, f32) {
+        match format {
+            HalfFormat::F16 => {
+                let bits = half::f16::from_f32(value);
+                (bits.to_bits(), bits.to_f32())
+            }
+            HalfFormat::Bf16 => {
+                let bits = half::bf16::from_f32(value);
+                (bits.to_bits(), bits.to_f32())
+            }
+        }
+    }
+
+    fn half_operand(format: HalfFormat, len: usize, seed: usize) -> (Vec<u16>, Vec<f32>) {
+        fill(len, seed)
+            .into_iter()
+            .map(|value| narrow(format, value))
+            .unzip()
+    }
+
+    /// The fused widen-pack GEBP must be *bit-identical* to the f32 kernel run
+    /// on the widened operands: it builds the same panels from the same values
+    /// and drives the same microkernel, so any difference is a packing bug, not
+    /// float reassociation.
+    fn check_half(format: HalfFormat, m: usize, k: usize, n: usize) {
+        if !has_simd_x86() {
+            return; // No AVX2/FMA: this path is never selected.
+        }
+        let (a_bits, a_wide) = half_operand(format, m * k, 1);
+        let (b_bits, b_wide) = half_operand(format, k * n, 2);
+
+        let mut expect = vec![0.0f32; m * n];
+        sgemm_simd(&a_wide, &b_wide, &mut expect, m, k, n);
+
+        let mut got = vec![0.0f32; m * n];
+        half_prefill_gebp(format, &a_bits, &b_bits, &mut got, m, k, n);
+
+        assert_eq!(
+            got, expect,
+            "{format:?} {m}x{k}x{n}: fused widen-pack GEBP must match the f32 \
+             kernel on the widened operands bit for bit"
+        );
+    }
+
+    #[test]
+    fn half_gebp_matches_the_widened_f32_kernel() {
+        for format in [HalfFormat::F16, HalfFormat::Bf16] {
+            check_half(format, 2, 64, 32);
+            check_half(format, 8, 128, 64);
+            check_half(format, 64, 96, 48);
+        }
+    }
+
+    #[test]
+    fn half_gebp_handles_tail_shapes() {
+        // M/N/K not multiples of MR(6)/NR(16)/KC(256), and a K larger than one
+        // K-panel so the accumulate-across-panels path runs.
+        for format in [HalfFormat::F16, HalfFormat::Bf16] {
+            check_half(format, 7, 33, 17);
+            check_half(format, 1, 5, 3);
+            check_half(format, 5, 300, 19);
+            check_half(format, 13, 260, 271);
+        }
+    }
+
+    #[test]
+    fn half_gebp_degenerate_shapes_write_nothing() {
+        if !has_simd_x86() {
+            return;
+        }
+        for format in [HalfFormat::F16, HalfFormat::Bf16] {
+            let mut c = Vec::new();
+            half_prefill_gebp(format, &[], &[], &mut c, 0, 4, 4);
+            assert!(c.is_empty());
+
+            // k == 0 is a zero-length reduction: C is all zeros, not untouched.
+            let mut c = vec![7.0f32; 6];
+            half_prefill_gebp(format, &[], &[], &mut c, 2, 0, 3);
+            assert_eq!(c, vec![0.0f32; 6]);
+        }
+    }
+
+    /// The scalar fallback exists for hosts without the vector conversion, so
+    /// it must produce the same panels as the SIMD one -- otherwise the
+    /// bit-exactness claim only holds on the machine it was measured on.
+    #[test]
+    fn scalar_and_simd_packing_agree() {
+        let (n, kc, nc) = (48usize, 5usize, 48usize);
+        for format in [HalfFormat::F16, HalfFormat::Bf16] {
+            let (b_bits, _) = half_operand(format, 8 * n, 3);
+            let mut scalar = vec![0.0f32; KC * nc.div_ceil(NR) * NR];
+            let mut simd = scalar.clone();
+            pack_b_half_scalar(format, &b_bits, &mut scalar, n, 1, kc, 0, nc);
+            pack_b_half(
+                select_half_widen(format),
+                &b_bits,
+                &mut simd,
+                n,
+                1,
+                kc,
+                0,
+                nc,
+            );
+            assert_eq!(scalar, simd, "{format:?} packing must not depend on ISA");
+        }
+    }
 }
