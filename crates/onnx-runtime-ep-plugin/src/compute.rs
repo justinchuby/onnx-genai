@@ -2395,6 +2395,14 @@ unsafe extern "C" fn compute_execute(
             }
 
             // Allocate intermediate buffer slots (uninitialized until written).
+            // Sized once and never grown. That is load-bearing, not incidental:
+            // an input `TensorView` is transmuted to `'static` below, and since
+            // shape/stride storage became inline it lives *inside* the
+            // `IntermediateBuf` rather than in a separately heap-allocated
+            // `Vec`. A push or resize here would move that storage while those
+            // views are live, turning a previously benign edit into a
+            // use-after-move. Slots are index-assigned and `take`n, never
+            // inserted.
             let mut intermediates: Vec<Option<IntermediateBuf>> = (0..routing
                 .num_intermediate_buffers)
                 .map(|_| None)
@@ -5480,9 +5488,14 @@ mod tests {
         for shape in cases {
             let mut out = Vec::new();
             super::contiguous_strides_into(shape, &mut out);
+            // Anchored to the IR crate's implementation, not to
+            // `contiguous_strides` -- that is a thin wrapper over the function
+            // under test here, so comparing against it would only prove
+            // determinism and would pass just as happily on a shared
+            // row-major/column-major mistake.
             assert_eq!(
                 out,
-                super::contiguous_strides(shape),
+                onnx_runtime_ir::compute_contiguous_strides(shape),
                 "mismatch for shape {shape:?}"
             );
         }
@@ -5547,7 +5560,7 @@ mod tests {
             let d = super::StrideDims::contiguous_for(shape);
             assert_eq!(
                 d.as_slice(),
-                super::contiguous_strides(shape).as_slice(),
+                onnx_runtime_ir::compute_contiguous_strides(shape).as_slice(),
                 "strides mismatch for shape {shape:?}"
             );
         }
