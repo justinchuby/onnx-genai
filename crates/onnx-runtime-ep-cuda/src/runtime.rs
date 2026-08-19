@@ -297,8 +297,9 @@ pub struct CudaRuntime {
     /// redundant trailing per-op eager device syncs (issued by kernels on the
     /// `!capturing` branch) are elided and launches pipeline on the in-order EP
     /// stream. Host-visible reads (`dtoh`/`dtod`) call the private
-    /// [`CudaRuntime::force_synchronize`] and are therefore unaffected. Off by
-    /// default; enabled via `ONNX_GENAI_DEFER_EAGER_SYNC`.
+    /// [`CudaRuntime::force_synchronize`] and are therefore unaffected. On by
+    /// default (eager decode is made consistent with the captured path, which
+    /// already elides these); disable via `ONNX_GENAI_DEFER_EAGER_SYNC=0`.
     defer_eager_sync: AtomicBool,
 }
 
@@ -447,12 +448,14 @@ impl CudaRuntime {
             next_fence_id: AtomicU64::new(1),
             capture_error: 0,
             defer_eager_sync: AtomicBool::new(
+                // On by default; only an explicit falsey value restores the old
+                // always-sync eager path (escape hatch for debugging).
                 std::env::var("ONNX_GENAI_DEFER_EAGER_SYNC")
                     .ok()
                     .as_deref()
                     .map(str::trim)
                     .map(str::to_ascii_lowercase)
-                    .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes")),
+                    .map_or(true, |v| !matches!(v.as_str(), "0" | "false" | "off" | "no")),
             ),
         }
         .with_capture_error_word()
@@ -954,12 +957,13 @@ impl CudaRuntime {
 
     /// Block until all submitted work on the EP's dedicated stream completes.
     ///
-    /// When `ONNX_GENAI_DEFER_EAGER_SYNC` is enabled this is a no-op: the
-    /// trailing per-op eager syncs are redundant because (a) kernel→kernel
-    /// ordering is guaranteed by the single in-order EP stream and (b) every
-    /// host-visible read (`dtoh`/`dtod`) issues its own [`force_synchronize`]
-    /// before the synchronous copy. Eliding these lets eager decode pipeline
-    /// launches the way a captured graph does.
+    /// Deferred by default (eager decode is made consistent with the captured
+    /// path); this becomes a no-op unless `ONNX_GENAI_DEFER_EAGER_SYNC=0`
+    /// restores the old always-sync behavior. The trailing per-op eager syncs
+    /// are redundant because (a) kernel→kernel ordering is guaranteed by the
+    /// single in-order EP stream and (b) every host-visible read (`dtoh`/`dtod`)
+    /// issues its own [`force_synchronize`] before the synchronous copy. Eliding
+    /// these lets eager decode pipeline launches the way a captured graph does.
     pub fn synchronize(&self) -> Result<()> {
         if self.defer_eager_sync.load(Ordering::Relaxed) {
             return Ok(());
