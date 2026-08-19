@@ -87,7 +87,10 @@ fn dense_extents(pairs: &mut [(i64, usize)]) -> bool {
     }
     // Sort by stride ascending.
     pairs.sort_unstable_by_key(|&(s, _)| s);
-    // The smallest stride must be 1 (element-adjacent).
+    // The smallest stride must be 1 (element-adjacent). The loop below would
+    // reject this case too, on its first iteration, since `expected_stride`
+    // starts at 1 -- mutation testing confirms removing this branch changes no
+    // result. It is kept as the statement of intent the loop obscures.
     if pairs[0].0 != 1 {
         return false;
     }
@@ -295,7 +298,12 @@ mod tests {
                         .collect()
                 };
                 let got = is_dense(&shape, &strides);
-                if got {
+                // Count only cases that actually reached the sort-and-product
+                // logic. A shape that is empty or all-ones returns `true` from
+                // the empty-extents early exit without exercising anything, so
+                // counting those would let this guard be satisfied by rank 0
+                // alone and assert nothing about the arm it names.
+                if got && shape.iter().any(|&d| d > 1) {
                     checked_dense += 1;
                 }
                 assert_eq!(
@@ -304,7 +312,8 @@ mod tests {
                     "disagreement for shape {shape:?} strides {strides:?}"
                 );
 
-                // Length mismatch must stay a rejection on both paths.
+                // Dropping a stride makes this a length mismatch for every
+                // rank but 0, where both sides see two empty slices.
                 let mut short = strides.clone();
                 short.pop();
                 assert_eq!(
@@ -316,9 +325,41 @@ mod tests {
         }
         assert!(
             checked_dense > 100,
-            "the corpus degenerated into rejections only; it proved nothing about \
-             the dense arm (only {checked_dense} dense cases)"
+            "the corpus degenerated into rejections and trivial shapes; it proved \
+             nothing about the sort-and-product arm (only {checked_dense} dense \
+             cases with a dimension above 1)"
         );
+    }
+
+    /// A rank of exactly `INLINE_RANK` with every dimension non-trivial is the
+    /// one input that fills the stack array completely, so `pairs[..len]` and
+    /// the whole array coincide and the truncation is a no-op. Pin it
+    /// deterministically rather than relying on the random corpus to land on
+    /// it, and cover dense-but-not-row-major while here.
+    #[test]
+    fn a_completely_full_inline_array_is_handled() {
+        let shape = [2usize; 8];
+        assert_eq!(shape.len(), 8, "this test must fill the inline array");
+
+        let strides = compute_contiguous_strides(&shape);
+        assert!(is_dense(&shape, &strides));
+        assert!(is_dense_reference(&shape, &strides));
+
+        // Dense without being row-major contiguous: reverse the axis order.
+        let mut permuted: Vec<i64> = strides.clone();
+        permuted.reverse();
+        assert!(!is_contiguous(&shape, &permuted));
+        assert_eq!(
+            is_dense(&shape, &permuted),
+            is_dense_reference(&shape, &permuted)
+        );
+        assert!(is_dense(&shape, &permuted));
+
+        // One stride off by one is a hole, and must be rejected.
+        let mut holed = strides.clone();
+        holed[0] += 1;
+        assert!(!is_dense(&shape, &holed));
+        assert!(!is_dense_reference(&shape, &holed));
     }
 
     /// The heap fallback must still be reachable and correct: a rank above
