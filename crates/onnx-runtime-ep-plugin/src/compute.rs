@@ -1544,6 +1544,24 @@ fn staging_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ONNX_GENAI_PLUGIN_TRANSFER_TRACE").as_deref() == Ok("1"))
 }
 
+/// Emit one staging-trace line, formatting the message only if the trace is on.
+///
+/// `staging_log` already returns immediately when the trace is disabled, but
+/// the argument is evaluated first: `staging_log!(…)` builds a
+/// `String` and formats every interpolated value on the way to a function that
+/// throws it away. One of those sits on the per-`Run` dispatch path, so it was
+/// paid by every dispatch in production to serve a debugging aid that is off.
+///
+/// This checks the gate first, so a disabled trace costs one relaxed load of a
+/// `OnceLock` and nothing else.
+macro_rules! staging_log {
+    ($($arg:tt)*) => {
+        if staging_trace_enabled() {
+            staging_log(&format!($($arg)*));
+        }
+    };
+}
+
 /// Emit one staging-trace line. Goes to stderr (buffered by pipes, so it can be
 /// lost when the process hangs) *and*, when `ONNX_GENAI_PLUGIN_TRANSFER_TRACE_FILE`
 /// is set, is appended to that file with an immediate flush — the file path is
@@ -1694,54 +1712,50 @@ unsafe fn stage_host_boundary_inputs(
 ) -> Result<(), String> {
     // First pass: which operands are host-resident data operands needing upload?
     let mut to_stage: Vec<usize> = Vec::new();
-    staging_log(&format!(
+    staging_log!(
         "[plugin/staging #982] {label}: enter operands={} host_operands={:?}",
         ort_indices.len(),
         host_operands
-    ));
+    );
     for (p, slot) in ort_indices.iter().enumerate() {
         let Some(ort_idx) = *slot else {
-            staging_log(&format!(
-                "[plugin/staging #982] {label}: op[{p}] skip (not ORT-bound)"
-            ));
+            staging_log!("[plugin/staging #982] {label}: op[{p}] skip (not ORT-bound)");
             continue;
         };
         if host_operands.contains(&p) {
-            staging_log(&format!(
+            staging_log!(
                 "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (host control operand)"
-            ));
+            );
             continue;
         }
         let view = &kernel_inputs[p];
         if view.is_absent() || view.data.0.is_null() {
-            staging_log(&format!(
+            staging_log!(
                 "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (absent/null)"
-            ));
+            );
             continue;
         }
         let numel: usize = view.shape.iter().product();
         if numel == 0 || view.dtype.byte_size() == 0 {
-            staging_log(&format!(
-                "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (empty)"
-            ));
+            staging_log!("[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (empty)");
             continue;
         }
         let Some(mem_info) = (unsafe { ort_input_mem_info(api, ctx, ort_idx) }) else {
-            staging_log(&format!(
+            staging_log!(
                 "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (no mem info)"
-            ));
+            );
             continue;
         };
         let dev_type = unsafe { mem_info_device_type(api, mem_info) };
         if unsafe { mem_info_is_device(api, mem_info) } {
-            staging_log(&format!(
+            staging_log!(
                 "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (already device, dev_type={dev_type:?})"
-            ));
+            );
             continue; // already on device — nothing to do
         }
-        staging_log(&format!(
+        staging_log!(
             "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} HOST (dev_type={dev_type:?}) → will stage"
-        ));
+        );
         to_stage.push(p);
     }
 
@@ -1772,10 +1786,10 @@ unsafe fn stage_host_boundary_inputs(
         && let Some(recon) = staging.recon_mem_info.as_ref()
     {
         device_mi = recon.ptr;
-        staging_log(&format!(
+        staging_log!(
             "[plugin/staging #982] {label}: no device OrtValue found; \
              falling back to reconstructed EP memory info recon={device_mi:?}"
-        ));
+        );
     }
     if device_mi.is_null() {
         return Err(format!(
@@ -1794,19 +1808,17 @@ unsafe fn stage_host_boundary_inputs(
         let byte_len = numel * view.dtype.byte_size();
         let dst = unsafe { alloc_scratch(api, ctx, device_mi, byte_len) }
             .map_err(|e| format!("{label}: staging scratch alloc failed: {e}"))?;
-        staging_log(&format!(
+        staging_log!(
             "[plugin/staging #982] {label}: staging op[{p}] byte_len={byte_len} \
              mem_dev={mem_dev:?} dst={dst:?} — issuing host→device upload"
-        ));
+        );
         // SAFETY: the source is a host tensor of `byte_len` contiguous bytes
         // (ORT-provided, contiguous strides); `dst` is device scratch of the
         // same size.
         let src = unsafe { std::slice::from_raw_parts(view.data.0.cast::<u8>(), byte_len) };
         unsafe { staging.copier.copy_host_to_device(src, dst) }
             .map_err(|e| format!("{label}: host→device upload failed: {e}"))?;
-        staging_log(&format!(
-            "[plugin/staging #982] {label}: op[{p}] host→device upload complete"
-        ));
+        staging_log!("[plugin/staging #982] {label}: op[{p}] host→device upload complete");
         kernel_inputs[p].data = DevicePtr(dst.cast_const());
     }
 
@@ -2184,12 +2196,12 @@ unsafe extern "C" fn compute_execute(
             return fail_status("Compute: no kernels compiled for this subgraph");
         }
 
-        staging_log(&format!(
+        staging_log!(
             "[plugin/staging #982] compute_execute enter: entries={} routing={} device_staging={}",
             exported.entries.len(),
             exported.routing.is_some(),
             exported.device_staging.is_some()
-        ));
+        );
 
         let api = crate::status::host_api();
         if api.is_null() {

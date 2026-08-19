@@ -72,7 +72,7 @@ pub const CPU_EP_SUPPORTED_DTYPES: &[DataType] = &[
 pub(crate) fn validate_dims(
     dims: &[i64],
     dtype: DataType,
-    context: &str,
+    context: impl std::fmt::Display,
 ) -> Result<(Vec<usize>, usize, usize), String> {
     let mut shape: Vec<usize> = Vec::with_capacity(dims.len());
     for (dim_idx, &d) in dims.iter().enumerate() {
@@ -252,9 +252,10 @@ pub(crate) unsafe fn read_inputs(
         unsafe { release_type_shape(type_shape) };
 
         // Validate ORT-supplied dims: reject negatives and detect overflow.
-        // Three allocations: the eager `format!` label, `shape`, and `strides`.
-        crate::dispatch_probe::count_n(crate::dispatch_probe::Event::DispatchAlloc, 3);
-        let (shape, _, _) = validate_dims(&dims, dtype, &format!("input {i}"))?;
+        // Two allocations: `shape` and `strides`. The label is `format_args!`,
+        // which borrows its arguments and formats only if an error is raised.
+        crate::dispatch_probe::count_n(crate::dispatch_probe::Event::DispatchAlloc, 2);
+        let (shape, _, _) = validate_dims(&dims, dtype, format_args!("input {i}"))?;
         let strides = onnx_runtime_ir::compute_contiguous_strides(&shape);
 
         // Data pointer.
@@ -711,20 +712,21 @@ mod dispatch_cost {
         );
     }
 
-    /// One input also costs five heap allocations: the `Vec<OwnedInput>` once
-    /// per `Run`, then per input the `dims` scratch, the eager
-    /// `format!("input {i}")` label built even when validation succeeds,
-    /// `shape`, and `strides`. The label is pure waste on the success path and
-    /// is the first thing to remove.
+    /// One input costs four heap allocations: the `Vec<OwnedInput>` once per
+    /// `Run`, then per input the `dims` scratch, `shape`, and `strides`.
+    ///
+    /// It was five until the error label stopped being built eagerly. That is
+    /// the counter earning its keep: the improvement is visible as a number
+    /// changing in a test, not as a claim in a commit message.
     #[test]
-    fn reading_one_input_costs_exactly_five_allocations() {
+    fn reading_one_input_costs_exactly_four_allocations() {
         let api = fake_api();
         let before = dispatch_probe::snapshot();
         let _ = unsafe { read_inputs(&api, std::ptr::null_mut()) }.expect("fake api is total");
         let d = dispatch_probe::snapshot().since(&before);
         assert_eq!(
             d.event(Event::DispatchAlloc),
-            1 + 4,
+            1 + 3,
             "allocations on the per-Run input path changed"
         );
     }
@@ -751,7 +753,7 @@ mod dispatch_cost {
 
         assert_eq!(inputs.len(), 3);
         assert_eq!(d.event(Event::OrtFfiCall), 1 + 3 * 7);
-        assert_eq!(d.event(Event::DispatchAlloc), 1 + 3 * 4);
+        assert_eq!(d.event(Event::DispatchAlloc), 1 + 3 * 3);
     }
 
     /// An absent optional input short-circuits: ORT hands back a null value and
