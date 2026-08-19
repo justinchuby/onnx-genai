@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
 use onnx_runtime_memory_api::{
@@ -1295,11 +1295,7 @@ impl ProcessMemoryManager {
             .book
             .charges_for_context(context.record.registered.identity());
         for charge in charges {
-            AllocationSettlementToken {
-                book: Arc::clone(&self.inner.book),
-                charge,
-            }
-            .context_terminated();
+            self.inner.book.context_terminated(&charge);
         }
         Ok(())
     }
@@ -1750,10 +1746,7 @@ impl ScopedMemoryBinding {
         }));
         charge.publish(&publication);
         self.manager.book.publish(&charge);
-        let settlement = AllocationSettlementToken {
-            book: Arc::clone(&self.manager.book),
-            charge,
-        };
+        let settlement = AllocationSettlementToken::new(Arc::clone(&self.manager.book), charge);
         Ok(ManagedAllocation {
             owner: Some(owner),
             settlement,
@@ -2017,10 +2010,7 @@ impl ScopedMemoryBinding {
         }));
         let managed = ManagedAllocation {
             owner: Some(owner),
-            settlement: AllocationSettlementToken {
-                book: Arc::clone(&self.manager.book),
-                charge,
-            },
+            settlement: AllocationSettlementToken::new(Arc::clone(&self.manager.book), charge),
         };
         match managed.release_now() {
             Ok(outcome) if outcome.is_complete() => {
@@ -2506,6 +2496,8 @@ struct ChargeState {
 struct ChargeCell {
     state: Mutex<ChargeState>,
     wake: Condvar,
+    settlement_tokens: AtomicUsize,
+    terminal: AtomicBool,
 }
 
 impl ChargeCell {
@@ -2513,6 +2505,8 @@ impl ChargeCell {
         Self {
             state: Mutex::new(state),
             wake: Condvar::new(),
+            settlement_tokens: AtomicUsize::new(0),
+            terminal: AtomicBool::new(false),
         }
     }
 
@@ -2559,6 +2553,20 @@ impl ChargeCell {
         let mut state = self.lock();
         if state.state == ManagedAllocationState::Live {
             state.state = ManagedAllocationState::Queued;
+        }
+    }
+
+    fn mark_settlement_abandoned(&self) {
+        let mut state = self.lock();
+        if !matches!(
+            state.state,
+            ManagedAllocationState::Released
+                | ManagedAllocationState::ContextTerminated
+                | ManagedAllocationState::Quarantined
+                | ManagedAllocationState::DeviceLost
+        ) {
+            state.state = ManagedAllocationState::Quarantined;
+            self.wake.notify_all();
         }
     }
 
@@ -2653,6 +2661,12 @@ impl ChargeCell {
             state.unattributed_bytes = state.unattributed_bytes.min(retained_bytes);
         }
         state.state = terminal;
+        if matches!(
+            terminal,
+            ManagedAllocationState::Released | ManagedAllocationState::ContextTerminated
+        ) {
+            self.terminal.store(true, Ordering::Release);
+        }
         let retained = retained_bytes != 0 || retained_process != 0 || retained_authority != 0;
         self.wake.notify_all();
         retained
@@ -2805,8 +2819,18 @@ impl SettlementBook {
     }
 
     fn retain_unsettled(&self, charge: &Arc<ChargeCell>) {
+        if charge.terminal.load(Ordering::Acquire) {
+            return;
+        }
         let identity = charge.snapshot().identity;
         let mut state = self.lock();
+        // Re-check under the book lock. Context termination publishes the
+        // terminal atomic before acquiring this lock to remove the entry, so
+        // either this declines insertion or termination removes what was
+        // inserted first. No book->charge lock inversion is introduced.
+        if charge.terminal.load(Ordering::Acquire) {
+            return;
+        }
         state.live.remove(&identity);
         state.quarantined.insert(identity, Arc::clone(charge));
     }
@@ -2857,13 +2881,18 @@ impl SettlementBook {
 }
 
 /// One-shot settlement handle retained through queued and quarantined release.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct AllocationSettlementToken {
     book: Arc<SettlementBook>,
     charge: Arc<ChargeCell>,
 }
 
 impl AllocationSettlementToken {
+    fn new(book: Arc<SettlementBook>, charge: Arc<ChargeCell>) -> Self {
+        charge.settlement_tokens.fetch_add(1, Ordering::AcqRel);
+        Self { book, charge }
+    }
+
     pub fn identity(&self) -> AllocationIdentity {
         self.charge.snapshot().identity
     }
@@ -2887,20 +2916,25 @@ impl AllocationSettlementToken {
     pub unsafe fn settle(&self, outcome: &AllocationReleaseOutcome) {
         self.settle_verified(outcome);
     }
+}
 
-    fn context_terminated(&self) {
-        self.book.context_terminated(&self.charge);
+impl Clone for AllocationSettlementToken {
+    fn clone(&self) -> Self {
+        Self::new(Arc::clone(&self.book), Arc::clone(&self.charge))
     }
 }
 
 impl Drop for AllocationSettlementToken {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.charge) == 1 {
+        let previous = self.charge.settlement_tokens.fetch_sub(1, Ordering::AcqRel);
+        debug_assert_ne!(previous, 0, "settlement token count underflow");
+        if previous == 1 {
             let snapshot = self.charge.snapshot();
             if !matches!(
                 snapshot.state,
                 ManagedAllocationState::Released | ManagedAllocationState::ContextTerminated
             ) {
+                self.charge.mark_settlement_abandoned();
                 self.book.retain_unsettled(&self.charge);
             }
         }
