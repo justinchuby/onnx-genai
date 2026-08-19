@@ -1256,6 +1256,93 @@ mod tests {
         );
     }
 
+    /// **A vtable too small to name its own level is refused before its level
+    /// is read.**
+    ///
+    /// `read_prefix` decides how many bytes it needs from `abi_minor`, at
+    /// offset 4 — so it has to establish that offset 4 is readable *before*
+    /// reading it, and that is what the `offset_of!(Self, allocate)` floor is
+    /// for. Every other short-struct test in this file declares a size well
+    /// above that floor and is caught by the later self-consistency check
+    /// instead, which leaves the floor itself unexercised.
+    ///
+    /// The two cases below are deliberately different tools for the same
+    /// defect. The first is a plain, deterministic assertion that runs
+    /// everywhere: an eight-byte buffer whose `abi_minor` word is *readable
+    /// but a lie*, so a reader that consults it produces a visibly different
+    /// refusal. The second is a four-byte allocation where consulting it is
+    /// an out-of-bounds read — that one is only diagnosed under Miri, which
+    /// does cover this crate's `--lib` tests.
+    #[test]
+    fn a_vtable_too_short_to_declare_its_own_minor_is_refused_without_reading_it() {
+        use std::alloc::{Layout, alloc_zeroed, dealloc};
+
+        // Case 1: `abi_minor` is in bounds but must not be trusted.
+        //
+        // Sixteen bytes is comfortably below the floor and comfortably above
+        // `abi_minor`, so both the correct reader and a reader that skipped
+        // the floor stay in bounds — the only difference is *which* refusal
+        // comes out, which makes this a deterministic assertion rather than a
+        // hope that undefined behaviour looks wrong.
+        // Over-aligned so the alignment check cannot be what refuses this —
+        // the point is the *size* floor. `align_offset` is deliberately not
+        // used to assert that: it is permitted to return `usize::MAX` for any
+        // input, and Miri exercises that permission.
+        #[repr(align(16))]
+        struct Aligned([u8; 16]);
+        let mut buffer = Aligned([0u8; 16]);
+        buffer.0[0..4].copy_from_slice(&8u32.to_le_bytes());
+        // A minor this sender cannot possibly satisfy in eight bytes.
+        buffer.0[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let ptr = buffer.0.as_ptr().cast::<NxmemAllocatorVtable>();
+        assert!(
+            core::mem::align_of::<NxmemAllocatorVtable>() <= 16,
+            "the buffer must be at least as aligned as the struct, or the test would be \
+             measuring the alignment check"
+        );
+        // SAFETY: `ptr` is non-null, aligned, and addresses sixteen readable
+        // bytes; nothing below reads past what it declares.
+        let status = unsafe { NxmemAllocatorVtable::read_prefix(ptr, 1) }
+            .expect_err("eight bytes cannot be a vtable");
+        assert_eq!(status.status_code(), Some(NxmemStatusCode::ShortStruct));
+        let text = status.describe();
+        assert!(
+            text.contains(&format!(
+                "minor 0 requires at least {} bytes",
+                NxmemAllocatorVtable::required_struct_size(0)
+            )),
+            "the refusal must be the floor's — stated against the baseline requirement, \
+             without consulting the sender's own minor — got: {text}"
+        );
+        assert!(
+            !text.contains("minor 1"),
+            "a struct too small to name its level must not have its claimed level believed, \
+             got: {text}"
+        );
+
+        // Case 2: reading `abi_minor` at all is out of bounds.
+        //
+        // Four bytes is exactly enough for `struct_size` and not one byte
+        // more. A reader that consults `abi_minor` here reads past the end of
+        // the allocation. Plain `cargo test` cannot see that; Miri can, and
+        // this crate's `--lib` tests run under it.
+        let layout = Layout::from_size_align(4, core::mem::align_of::<NxmemAllocatorVtable>())
+            .expect("a valid layout");
+        // SAFETY: a non-zero-sized layout.
+        let raw = unsafe { alloc_zeroed(layout) };
+        assert!(!raw.is_null(), "the allocation must succeed");
+        // SAFETY: four writable bytes.
+        unsafe { core::ptr::write_unaligned(raw.cast::<u32>(), 4u32) };
+        // SAFETY: `raw` is non-null, aligned, and has exactly four readable
+        // bytes — which is exactly the minimum this function's contract asks
+        // for, and exactly what the floor exists to stop it exceeding.
+        let status = unsafe { NxmemAllocatorVtable::read_prefix_unvalidated(raw.cast(), 1) }
+            .expect_err("four bytes cannot be a vtable");
+        assert_eq!(status.status_code(), Some(NxmemStatusCode::ShortStruct));
+        // SAFETY: same pointer and layout as the allocation above.
+        unsafe { dealloc(raw, layout) };
+    }
+
     /// Field **offsets**, not just sizes.
     ///
     /// `MIN_STRUCT_SIZE_MINOR_0` is derived from `offset_of!`, so inserting a

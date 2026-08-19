@@ -34,7 +34,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use onnx_runtime_memory_abi::{
@@ -87,6 +87,64 @@ fn next_prefix_handle() -> u64 {
     NEXT.fetch_add(1, Ordering::AcqRel) + 1
 }
 
+/// How many times the host has called a *terminal free* slot on this module.
+///
+/// Counts entries into `deallocate` and `release_allocation` — the two slots
+/// through which the host hands an allocation back. Deliberately **not** a
+/// count of blocks freed: the plugin also reclaims blocks during its own
+/// teardown, and a counter that could not tell the two apart would let a host
+/// that silently dropped its records look identical to one that reported
+/// them.
+static TERMINAL_RELEASES: AtomicU64 = AtomicU64::new(0);
+
+/// How many terminal free calls this module has received.
+///
+/// # Safety
+///
+/// Called across the ABI boundary; reads a process-global counter.
+#[unsafe(no_mangle)]
+pub extern "C" fn NxmemTestpluginTerminalReleases() -> u64 {
+    TERMINAL_RELEASES.load(Ordering::Acquire)
+}
+
+/// Exported name of [`NxmemTestpluginTerminalReleases`].
+pub const SYMBOL_TERMINAL_RELEASES: &[u8] = b"NxmemTestpluginTerminalReleases\0";
+
+/// How many of those entries went through the **minor-1** structured slot.
+///
+/// Split out from the total so a test can assert which slot the host chose,
+/// not merely that it freed the allocation somehow. A slot neither side
+/// negotiated must never be entered, and the only place that is observable is
+/// here, inside the module.
+static STRUCTURED_RELEASES: AtomicU64 = AtomicU64::new(0);
+
+/// How many `release_allocation` calls this module has received.
+///
+/// # Safety
+///
+/// Called across the ABI boundary; reads a process-global counter.
+#[unsafe(no_mangle)]
+pub extern "C" fn NxmemTestpluginStructuredReleases() -> u64 {
+    STRUCTURED_RELEASES.load(Ordering::Acquire)
+}
+
+/// Exported name of [`NxmemTestpluginStructuredReleases`].
+pub const SYMBOL_STRUCTURED_RELEASES: &[u8] = b"NxmemTestpluginStructuredReleases\0";
+
+/// How many times the host has entered `drain_releases` on this module.
+///
+/// Test-only introspection, read through
+/// [`NxmemTestpluginDrainCalls`]. It exists so the host's tests can assert on
+/// how many times the host actually crossed the boundary, which is a property
+/// of the *host's* loop that no host-side counter can honestly report.
+static DRAIN_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// The allocator state a `park_callbacks_for_hook` mechanism left behind.
+///
+/// Null unless such a mechanism is open. Cleared when the state is destroyed,
+/// so the hook can never dereference a freed state.
+static PARKED_STATE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+
 // ─── mechanism behaviour ────────────────────────────────────────────────────
 
 /// Which behaviours a named mechanism exhibits.
@@ -130,6 +188,29 @@ struct Behaviour {
     /// Report a release state code from a future contract level the host has
     /// never heard of.
     unknown_release_state: bool,
+    /// Park this allocator's stored host callback table where
+    /// [`NxmemTestpluginReportParkedCompletion`] can reach it, so a completion
+    /// can be reported from a plugin-owned thread **after** the host has
+    /// dropped its allocator.
+    park_callbacks_for_hook: bool,
+    /// Report the completion of a queued release synchronously, from inside
+    /// `enqueue_release`, and then call the host's reclaim hook so the host
+    /// can observe its own counters mid-call.
+    complete_inside_enqueue: bool,
+    /// Retire at most this many queued releases per `drain_releases` call,
+    /// whatever budget the host offers. Zero means unlimited.
+    ///
+    /// Models a stream-ordered mechanism that can only retire what its device
+    /// has actually finished with, so a caller has to come back.
+    drain_batch_cap: u64,
+    /// Refuse every `enqueue_release`, modelling a mechanism whose deferral
+    /// queue is full or whose stream is in an error state.
+    ///
+    /// The plugin has done nothing at that point — the allocation is still
+    /// entirely its caller's — so the host must undo everything it did in
+    /// anticipation of success, including putting the allocation back in the
+    /// map it took it out of.
+    refuse_enqueue: bool,
 }
 
 impl Behaviour {
@@ -146,6 +227,10 @@ impl Behaviour {
             never_drain: false,
             quarantine_on_release: false,
             unknown_release_state: false,
+            park_callbacks_for_hook: false,
+            complete_inside_enqueue: false,
+            drain_batch_cap: 0,
+            refuse_enqueue: false,
         }
     }
 }
@@ -282,6 +367,66 @@ const MECHANISMS: &[Mechanism] = &[
             ..Behaviour::base()
         },
     },
+    Mechanism {
+        name: "callback-after-drop",
+        c_name: c"callback-after-drop",
+        behaviour: Behaviour {
+            // Never retires through the ABI's drain slot, so the host's drop
+            // is forced to keep the callback table alive; the queued release
+            // is then reported from a plugin-owned thread through
+            // `NxmemTestpluginReportParkedCompletion`, long after
+            // `AllocatorCore::drop` has returned. That is the one shape the
+            // rest of this plugin cannot produce, because every other path
+            // into `release_completed` is reachable only from inside a host
+            // call.
+            capability_flags: NXMEM_CAP_ALLOCATOR
+                | NXMEM_CAP_DEFERRED_RELEASE
+                | NXMEM_CAP_STRUCTURED_RELEASE,
+            never_drain: true,
+            park_callbacks_for_hook: true,
+            ..Behaviour::base()
+        },
+    },
+    Mechanism {
+        name: "reentrant-completion",
+        c_name: c"reentrant-completion",
+        behaviour: Behaviour {
+            // Retires the release the host is still queueing, from inside
+            // `enqueue_release`, then calls back for reclaim so the host sees
+            // its own counters at that instant. Models a mechanism whose
+            // device work was already complete when the free was submitted.
+            capability_flags: NXMEM_CAP_ALLOCATOR
+                | NXMEM_CAP_DEFERRED_RELEASE
+                | NXMEM_CAP_STRUCTURED_RELEASE,
+            complete_inside_enqueue: true,
+            ..Behaviour::base()
+        },
+    },
+    Mechanism {
+        name: "refusing-deferred",
+        c_name: c"refusing-deferred",
+        behaviour: Behaviour {
+            capability_flags: NXMEM_CAP_ALLOCATOR
+                | NXMEM_CAP_DEFERRED_RELEASE
+                | NXMEM_CAP_STRUCTURED_RELEASE,
+            refuse_enqueue: true,
+            ..Behaviour::base()
+        },
+    },
+    Mechanism {
+        name: "drip",
+        c_name: c"drip",
+        behaviour: Behaviour {
+            // Retires exactly one queued release per drain call however large
+            // a budget it is offered, so emptying a queue of `n` genuinely
+            // takes `n` passes.
+            capability_flags: NXMEM_CAP_ALLOCATOR
+                | NXMEM_CAP_DEFERRED_RELEASE
+                | NXMEM_CAP_STRUCTURED_RELEASE,
+            drain_batch_cap: 1,
+            ..Behaviour::base()
+        },
+    },
 ];
 
 /// Mechanism names this plugin publishes, in factory order.
@@ -301,6 +446,10 @@ pub const MECHANISM_NAMES: &[&str] = &[
     "quarantining",
     "future-state",
     "sticky",
+    "callback-after-drop",
+    "reentrant-completion",
+    "refusing-deferred",
+    "drip",
 ];
 
 // ─── allocator state ────────────────────────────────────────────────────────
@@ -626,6 +775,7 @@ unsafe extern "C" fn plugin_deallocate(
     unmapped_out: *mut u64,
 ) -> NxmemStatus {
     catch_status_panic(|| {
+        TERMINAL_RELEASES.fetch_add(1, Ordering::AcqRel);
         let state = plugin_entry!(ctx);
         if allocation.is_null() || unmapped_out.is_null() {
             return NxmemStatus::with_message(
@@ -669,6 +819,8 @@ unsafe extern "C" fn plugin_release_allocation(
     outcome_out: *mut NxmemReleaseOutcome,
 ) -> NxmemStatus {
     catch_status_panic(|| {
+        TERMINAL_RELEASES.fetch_add(1, Ordering::AcqRel);
+        STRUCTURED_RELEASES.fetch_add(1, Ordering::AcqRel);
         let state = plugin_entry!(ctx);
         if allocation.is_null() || outcome_out.is_null() {
             return NxmemStatus::with_message(
@@ -750,6 +902,45 @@ unsafe extern "C" fn plugin_release_allocation(
     })
 }
 
+/// Retire one queued release: free the bytes, correct this module's tallies,
+/// tell the host, and drop the reference the enqueue took.
+///
+/// `state` **must not** be touched after this returns: the release it drops
+/// may have been the last one.
+fn retire_queued(state: &AllocatorState, queued: QueuedRelease) -> Result<(), NxmemStatus> {
+    free_block(Block {
+        address: queued.address,
+        bytes: queued.bytes,
+        align: queued.align,
+        committed: queued.bytes,
+        views: 0,
+    });
+    counters().live_allocations.fetch_sub(1, Ordering::AcqRel);
+    counters().queued_releases.fetch_sub(1, Ordering::AcqRel);
+
+    let completion = NxmemReleaseCompletion::new(
+        queued.ticket,
+        state.mechanism_id,
+        queued.allocation_id,
+        NxmemReleaseOutcome::complete(queued.bytes as u64, queued.bytes as u64),
+    );
+    let reported = state.report_completion(&completion);
+    // Drop the reference the enqueue took whether or not the host accepted
+    // the completion: the bytes are already gone, and holding the reference
+    // would pin the module forever.
+    release_state(state);
+    reported
+}
+
+/// Take one queued release off a state's queue, if it has one.
+fn take_one_queued(state: &AllocatorState) -> Option<QueuedRelease> {
+    let mut inner = state.inner.lock().ok()?;
+    if inner.queue.is_empty() {
+        return None;
+    }
+    Some(inner.queue.remove(0))
+}
+
 unsafe extern "C" fn plugin_enqueue_release(
     ctx: *mut c_void,
     allocation: *const NxmemAllocation,
@@ -767,6 +958,14 @@ unsafe extern "C" fn plugin_enqueue_release(
         let allocation = unsafe { &*allocation };
         if let Err(status) = state.check(allocation) {
             return status;
+        }
+        if state.behaviour.refuse_enqueue {
+            // Refuse *before* touching anything. The allocation is untouched
+            // and still belongs to whoever passed it in.
+            return NxmemStatus::with_message(
+                NxmemStatusCode::Busy,
+                "testplugin: this mechanism refuses to queue a deferred release",
+            );
         }
         let ticket = next_ticket();
         match state.inner.lock() {
@@ -801,6 +1000,33 @@ unsafe extern "C" fn plugin_enqueue_release(
         counters().queued_releases.fetch_add(1, Ordering::AcqRel);
         // SAFETY: checked non-null above.
         unsafe { *ticket_out = ticket };
+        if state.behaviour.complete_inside_enqueue {
+            // The device work was already finished when the free was
+            // submitted, so this mechanism retires it here rather than making
+            // the host come back for it. The host is still *inside* its own
+            // `enqueue_release`, which is the reentrancy the contract permits
+            // and the host's counting order has to survive.
+            if let Some(queued) = take_one_queued(state)
+                && let Err(status) = retire_queued(state, queued)
+            {
+                return NxmemStatus::with_message(
+                    NxmemStatusCode::CallbackFailed,
+                    &format!(
+                        "testplugin: the host rejected a reentrant release completion: {}",
+                        status.describe()
+                    ),
+                );
+            }
+            // Reach back into the host once more, now, so the host can read
+            // its own accounting at the instant the reentrant completion has
+            // been applied but its enqueue has not yet returned.
+            //
+            // Touching `state` after `retire_queued` is sound here and only
+            // here: the host is *inside* a call on its own allocator, so its
+            // open reference is still held and the release dropped above
+            // cannot have been the last one.
+            let _ = state.host_reclaim(allocation.bytes);
+        }
         NxmemStatus::ok()
     })
 }
@@ -818,17 +1044,25 @@ unsafe extern "C" fn plugin_drain_releases(
                 "testplugin: drain_releases received a null pointer",
             );
         }
+        DRAIN_CALLS.fetch_add(1, Ordering::AcqRel);
         if state.behaviour.never_drain {
             // SAFETY: checked non-null above.
             unsafe { *retired_out = 0 };
             return NxmemStatus::ok();
         }
 
+        // A mechanism may retire less than the host offers to pay for. `max`
+        // is a budget, not an instruction, and a stream-ordered mechanism can
+        // only retire what its device has actually finished with.
+        let budget = match state.behaviour.drain_batch_cap {
+            0 => max,
+            cap => max.min(cap),
+        };
         // Take the batch under the lock, then **drop the lock** before calling
         // back into the host: a host callback may re-enter this module.
         let batch: Vec<QueuedRelease> = match state.inner.lock() {
             Ok(mut inner) => {
-                let take = (max as usize).min(inner.queue.len());
+                let take = (budget as usize).min(inner.queue.len());
                 inner.queue.drain(..take).collect()
             }
             Err(_) => {
@@ -841,27 +1075,7 @@ unsafe extern "C" fn plugin_drain_releases(
 
         let mut retired = 0u64;
         for queued in batch {
-            free_block(Block {
-                address: queued.address,
-                bytes: queued.bytes,
-                align: queued.align,
-                committed: queued.bytes,
-                views: 0,
-            });
-            counters().live_allocations.fetch_sub(1, Ordering::AcqRel);
-            counters().queued_releases.fetch_sub(1, Ordering::AcqRel);
-
-            let completion = NxmemReleaseCompletion::new(
-                queued.ticket,
-                state.mechanism_id,
-                queued.allocation_id,
-                NxmemReleaseOutcome::complete(queued.bytes as u64, queued.bytes as u64),
-            );
-            let reported = state.report_completion(&completion);
-            // Drop the reference the enqueue took whether or not the host
-            // accepted the completion: the bytes are already gone, and holding
-            // the reference would pin the module forever.
-            release_state(state);
+            let reported = retire_queued(state, queued);
             retired += 1;
             if let Err(status) = reported {
                 // SAFETY: checked non-null above. A partial drain still reports
@@ -953,6 +1167,14 @@ fn release_state(state: &AllocatorState) {
     if previous != 1 {
         return;
     }
+    // The hook must never be able to reach a destroyed state, so the parked
+    // pointer is cleared here rather than by whoever used it last.
+    let _ = PARKED_STATE.compare_exchange(
+        (state as *const AllocatorState).cast_mut().cast(),
+        core::ptr::null_mut(),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
     // Reclaim anything still outstanding rather than leaking it.
     if let Ok(mut inner) = state.inner.lock() {
         for (_, block) in inner.blocks.drain() {
@@ -1644,6 +1866,15 @@ unsafe extern "C" fn plugin_open_allocator(
             // A reference the host never learns about and can never drop.
             state.refcount.fetch_add(1, Ordering::AcqRel);
         }
+        if behaviour.park_callbacks_for_hook {
+            // Park the state — and with it the `*const NxmemHostCallbacks`
+            // captured just above — where a plugin-owned thread can find it
+            // after the host has dropped its allocator. No extra reference is
+            // taken: a queued release takes one of its own, and that is
+            // exactly the condition under which the contract says the table
+            // is still ours to dereference.
+            PARKED_STATE.store(allocator_ctx, Ordering::Release);
+        }
 
         counters().live_allocators.fetch_add(1, Ordering::AcqRel);
         let published: *const NxmemAllocatorVtable = if behaviour.poisoned_tail_struct {
@@ -1822,6 +2053,78 @@ pub extern "C" fn NxmemTestpluginFactoryReleases() -> u64 {
     FACTORY_RELEASES.load(Ordering::Acquire)
 }
 
+/// The name of the drain-call introspection symbol.
+pub const SYMBOL_DRAIN_CALLS: &[u8] = b"NxmemTestpluginDrainCalls\0";
+
+/// Test-only introspection: how many times the host has entered
+/// `drain_releases` on this module.
+///
+/// **Not part of the nxmem ABI.** It exists because how many times the host
+/// crosses the boundary is a property of the *host's* drain loop, and only the
+/// far side of the boundary can count it honestly.
+#[unsafe(no_mangle)]
+pub extern "C" fn NxmemTestpluginDrainCalls() -> u64 {
+    DRAIN_CALLS.load(Ordering::Acquire)
+}
+
+/// The name of the parked-completion hook symbol.
+pub const SYMBOL_REPORT_PARKED_COMPLETION: &[u8] = b"NxmemTestpluginReportParkedCompletion\0";
+
+/// Test-only hook: report one parked queued release from a plugin-owned
+/// thread.
+///
+/// **Not part of the nxmem ABI.** It exists to reach the one situation the
+/// contract explicitly permits and that nothing else in this plugin can
+/// produce: the plugin dereferencing the host's `NxmemHostCallbacks` from a
+/// thread of its own, **after** the host has already dropped the allocator
+/// those callbacks were installed for. Every other caller of
+/// `release_completed` here runs synchronously inside a host call, where the
+/// table is trivially alive.
+///
+/// The work runs on a freshly spawned thread — so the pointer really is
+/// dereferenced by a thread the host never created — and this function joins
+/// it before returning, so the test is deterministic rather than racy. What
+/// that trades away is asynchrony beyond the join; what it keeps is the part
+/// that matters, which is that the host's table is touched from off-thread
+/// after `AllocatorCore::drop` has returned.
+///
+/// Returns the number of releases reported: 1 if one was parked and retired,
+/// 0 if there was nothing to do. A `0` therefore never lets a test pass by
+/// silently doing nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn NxmemTestpluginReportParkedCompletion() -> u64 {
+    let parked = PARKED_STATE.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    if parked.is_null() {
+        return 0;
+    }
+
+    /// A raw plugin-state pointer, moved to a plugin-owned thread.
+    struct ParkedState(*mut c_void);
+    // SAFETY: `AllocatorState` is `Send`; this only carries its address, and
+    // the state is kept alive by the queued release's own reference for the
+    // whole life of the thread below.
+    unsafe impl Send for ParkedState {}
+
+    let carried = ParkedState(parked);
+    let worker = std::thread::spawn(move || {
+        let carried = carried;
+        // SAFETY: the pointer was parked by `plugin_open_allocator` and is
+        // cleared by `release_state` before the state is destroyed, so a
+        // non-null value names a live state.
+        let Some(state) = (unsafe { state(carried.0) }) else {
+            return 0;
+        };
+        let Some(queued) = take_one_queued(state) else {
+            return 0;
+        };
+        // This is the dereference under test: `state.callbacks` is the host's
+        // table, captured at open, and the allocator it belonged to is gone.
+        let _ = retire_queued(state, queued);
+        1
+    });
+    worker.join().unwrap_or(0)
+}
+
 /// Set once the module has published its factory vtables.
 static FACTORIES_BUILT: AtomicBool = AtomicBool::new(false);
 
@@ -1922,7 +2225,39 @@ fn create_factories_impl(
     NxmemStatus::ok()
 }
 
+/// Set by [`NxmemTestpluginRefuseUnloadReport`] to make the module's unload
+/// readiness query fail.
+///
+/// A real plugin can end up here — a poisoned internal lock, a mechanism that
+/// has already torn its bookkeeping down — and the host's answer to "I cannot
+/// tell you what I still own" has to be the conservative one. There is no way
+/// to provoke that from the outside, so the plugin has to be able to do it on
+/// request. It is deliberately one-way: a module that has refused once has
+/// poisoned this process's view of it, which is why the test that uses it
+/// lives in a binary of its own.
+static REFUSE_UNLOAD_REPORT: AtomicBool = AtomicBool::new(false);
+
+/// Make every later unload-readiness query fail.
+///
+/// # Safety
+///
+/// Called across the ABI boundary; takes no arguments and touches only a
+/// process-global flag.
+#[unsafe(no_mangle)]
+pub extern "C" fn NxmemTestpluginRefuseUnloadReport() {
+    REFUSE_UNLOAD_REPORT.store(true, Ordering::Release);
+}
+
+/// Exported name of [`NxmemTestpluginRefuseUnloadReport`].
+pub const SYMBOL_REFUSE_UNLOAD_REPORT: &[u8] = b"NxmemTestpluginRefuseUnloadReport\0";
+
 fn unload_readiness_impl(report_out: *mut NxmemUnloadReport) -> NxmemStatus {
+    if REFUSE_UNLOAD_REPORT.load(Ordering::Acquire) {
+        return NxmemStatus::with_message(
+            NxmemStatusCode::InternalError,
+            "testplugin: this module has been asked to refuse unload readiness",
+        );
+    }
     if report_out.is_null() {
         return NxmemStatus::with_message(
             NxmemStatusCode::InvalidArgument,

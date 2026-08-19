@@ -41,13 +41,14 @@ use onnx_runtime_memory_api::{
 };
 use onnx_runtime_memory_host::{
     AllocatorCore as PluginAllocatorCore, HostReclaim, MemoryPlugin, PluginAllocator, PluginError,
+    PluginModule,
 };
 
 // ─── locating the plugin ────────────────────────────────────────────────────
 
 #[path = "support/testplugin.rs"]
 mod testplugin;
-use testplugin::testplugin_path;
+use testplugin::{drain_calls, structured_releases, terminal_releases, testplugin_path};
 
 /// Serialises the whole suite.
 ///
@@ -104,6 +105,47 @@ impl HostReclaim for ScriptedReclaim {
         } else {
             Ok(self.grant)
         }
+    }
+}
+
+/// A reclaim hook that reads the host's *own* release accounting at the moment
+/// the plugin calls it.
+///
+/// Everything else in this suite can only look at the host before or after a
+/// plugin call. Some invariants are only about the inside of one: the host
+/// increments its queued-release counters before it enters the plugin, and
+/// nothing outside the call can tell whether it did, because by the time the
+/// call returns the increment and the matching decrement have both landed and
+/// an unsigned wrap is indistinguishable from never having happened.
+///
+/// The weak references are set after `open`, and are weak so this hook can
+/// never keep alive the objects it is watching. Nothing here takes a host
+/// lock: this runs on the plugin's side of a call the host is already inside,
+/// and a host lock held across the boundary would deadlock rather than fail.
+#[derive(Debug, Default)]
+struct MidCallObserver {
+    core: std::sync::OnceLock<std::sync::Weak<PluginAllocatorCore>>,
+    module: std::sync::OnceLock<std::sync::Weak<PluginModule>>,
+    outstanding: AtomicU64,
+    module_queued: AtomicU64,
+    retired_at_observation: AtomicU64,
+    observations: AtomicU64,
+}
+
+impl HostReclaim for MidCallObserver {
+    fn request_reclaim(&self, _device: DeviceKey, _bytes: u64) -> Result<u64, String> {
+        if let Some(core) = self.core.get().and_then(std::sync::Weak::upgrade) {
+            self.outstanding
+                .store(core.outstanding_releases(), Ordering::Release);
+            self.retired_at_observation
+                .store(core.retired_releases().len() as u64, Ordering::Release);
+        }
+        if let Some(module) = self.module.get().and_then(std::sync::Weak::upgrade) {
+            self.module_queued
+                .store(module.host_live_counts().queued_releases, Ordering::Release);
+        }
+        self.observations.fetch_add(1, Ordering::AcqRel);
+        Ok(0)
     }
 }
 
@@ -202,11 +244,31 @@ fn an_older_host_range_still_drives_the_current_plugin() {
     // The whole allocate/free cycle still works at the baseline level, using
     // the minor-0 `deallocate` slot rather than structured release.
     let ptr = allocator.allocate(4096, 64).expect("baseline allocation");
+    let terminal_before = terminal_releases(&plugin);
+    let structured_before = structured_releases(&plugin);
     // SAFETY: `ptr` is live, and was allocated with exactly these parameters.
     let outcome = unsafe { allocator.release(ptr, 4096, 64) };
     assert!(
         matches!(outcome, AllocationReleaseOutcome::Complete { .. }),
         "the baseline release path must still report a complete release, got {outcome:?}"
+    );
+    // And it really was the baseline slot. `lazy` publishes the minor-1
+    // structured slot and claims the capability, so the only thing stopping
+    // the host calling it is the level this host negotiated — which makes the
+    // choice of slot the whole point of the test, and it was previously only
+    // asserted in a comment. A host that reached for a slot the negotiation
+    // excluded would be calling through a function pointer the sender is
+    // entitled to have left null.
+    assert_eq!(
+        structured_releases(&plugin),
+        structured_before,
+        "a baseline host must not enter a slot it did not negotiate, whatever the sender \
+         happens to publish"
+    );
+    assert_eq!(
+        terminal_releases(&plugin) - terminal_before,
+        1,
+        "it must still have freed the allocation, through the baseline slot"
     );
 }
 
@@ -456,6 +518,7 @@ fn dropping_an_allocator_drains_what_the_plugin_will_retire() {
 fn dropping_a_plugin_with_live_objects_keeps_the_module_mapped() {
     let _serial = serial();
     let before = MemoryPlugin::forced_module_leaks();
+    let unmapped_before = PluginModule::modules_unmapped();
 
     {
         let plugin = load();
@@ -475,6 +538,19 @@ fn dropping_a_plugin_with_live_objects_keeps_the_module_mapped() {
         drop(allocator);
     }
 
+    // The allocator has now gone too, so every reference the host ever handed
+    // out is released — every one except the reference the drop above kept on
+    // purpose. `PluginModule::drop` is the only path that drops the `library`
+    // field, and dropping that field *is* the `dlclose`, so this asserts on
+    // the unmap itself rather than on the host's record of having decided
+    // against it.
+    assert_eq!(
+        PluginModule::modules_unmapped(),
+        unmapped_before,
+        "a module dropped with live objects must never reach dlclose, even after \
+         those objects are gone"
+    );
+
     // An idle plugin, by contrast, unloads cleanly and costs nothing.
     let after_live_drop = MemoryPlugin::forced_module_leaks();
     load().try_unload().expect("an idle plugin unloads");
@@ -482,6 +558,13 @@ fn dropping_a_plugin_with_live_objects_keeps_the_module_mapped() {
         MemoryPlugin::forced_module_leaks(),
         after_live_drop,
         "a clean unload must not be counted as a forced leak"
+    );
+    // And it really did unmap, which is what makes the assertion above mean
+    // something: the counter is not simply stuck at zero.
+    assert_eq!(
+        PluginModule::modules_unmapped() - unmapped_before,
+        1,
+        "the clean unload must be the only module this test unmapped"
     );
 }
 
@@ -825,6 +908,115 @@ fn a_shared_prefix_is_reference_counted_and_costed_once() {
     assert!(matches!(outcome, AllocationReleaseOutcome::Complete { .. }));
 }
 
+/// **A committed prefix is a live *view*, and the unload gate is told about
+/// it.**
+///
+/// `live_capabilities` counts the prefix handle; `live_views` counts the
+/// mappings made *through* it into allocations, which is a different thing and
+/// a strictly longer-lived one — a view keeps a window open into an
+/// allocation's address range whether or not the handle that created it still
+/// exists. Unmapping the module with a view open would strand that window in
+/// freed text, so the plugin must report views separately and the gate must
+/// see them.
+///
+/// This asserts on deltas rather than absolutes because the counter lives
+/// inside the loaded module and is process-wide.
+#[test]
+fn a_committed_shared_prefix_is_reported_as_a_live_view() {
+    let _serial = serial();
+    let plugin = load();
+    let allocator = open(
+        &plugin,
+        "lazy",
+        NXMEM_CAP_ALLOCATOR | NXMEM_CAP_VIRTUAL_BACKING | NXMEM_CAP_SHARED_MAPPING,
+    );
+    let shared = allocator
+        .as_shared_mapping()
+        .expect("shared mapping was required at open time");
+
+    let views_before = plugin
+        .module()
+        .unload_report()
+        .expect("the plugin reports readiness")
+        .live_views;
+
+    let prefix = shared
+        .create_shared_prefix(16 * 1024)
+        .expect("creating a shared prefix");
+    assert_eq!(
+        plugin
+            .module()
+            .unload_report()
+            .expect("readiness")
+            .live_views,
+        views_before,
+        "a prefix that has not been mapped into anything is not yet a view"
+    );
+
+    let ptr = allocator.allocate(64 * 1024, 4096).expect("allocation");
+    shared
+        .commit_shared_prefix(prefix.as_ref(), ptr, 64 * 1024, 0)
+        .expect("committing the prefix into the allocation");
+
+    let committed = plugin
+        .module()
+        .unload_report()
+        .expect("the plugin reports readiness");
+    assert_eq!(
+        committed.live_views - views_before,
+        1,
+        "committing a prefix opens exactly one view into the allocation"
+    );
+
+    // The gate refuses while the view is open, and the refusal carries the
+    // count — this is the path the loader actually reads.
+    let rejection = plugin
+        .try_unload()
+        .expect_err("a plugin with a live view must not unload");
+    assert_eq!(
+        rejection.report.live_views - views_before,
+        1,
+        "the refusal must surface the open view, got: {:?}",
+        rejection.report
+    );
+    let plugin = rejection
+        .into_plugin()
+        .expect("this refusal is recoverable; the caller still owns the handle");
+
+    // A view outlives the handle that made it: dropping the prefix retires the
+    // capability, not the mapping.
+    drop(prefix);
+    assert_eq!(
+        plugin
+            .module()
+            .unload_report()
+            .expect("readiness")
+            .live_views
+            - views_before,
+        1,
+        "the view belongs to the allocation, not to the handle that opened it"
+    );
+
+    // It retires with the allocation it looks into.
+    // SAFETY: live allocation with matching parameters.
+    let outcome = unsafe { allocator.release(ptr, 64 * 1024, 4096) };
+    assert!(matches!(outcome, AllocationReleaseOutcome::Complete { .. }));
+    assert_eq!(
+        plugin
+            .module()
+            .unload_report()
+            .expect("readiness")
+            .live_views,
+        views_before,
+        "removing the block that was mapped into must retire its views"
+    );
+
+    drop(allocator);
+    plugin
+        .try_unload()
+        .expect("nothing is live once the view has retired");
+}
+
 // ─── deferred release ordering ──────────────────────────────────────────────
 
 /// **Release ordering**, plus module pinning across a deferred free.
@@ -883,6 +1075,463 @@ fn deferred_releases_retire_in_order_and_pin_the_module() {
         0,
         "the host's tally must return to zero once the queue drains"
     );
+}
+
+// ─── the host's drain loop on drop ──────────────────────────────────────────
+
+/// **An allocation the caller never freed is reported, not abandoned.**
+///
+/// Dropping an allocator with a live allocation is a host-side bug, but the
+/// plugin has already been told that allocation exists — it is in the module's
+/// tally and in whatever backing map the mechanism keeps. Simply dropping the
+/// host's record would strand the bytes on the plugin's side forever and
+/// wedge the unload gate shut on an object nobody can name any more. So the
+/// host must push each surviving allocation back through the plugin's
+/// terminal slot on its way out.
+///
+/// Both tallies are checked. The host's own is the weaker of the two — it
+/// would return to zero if the host merely stopped counting — so the binding
+/// assertion is the module's, which only moves if the plugin was really told.
+#[test]
+fn dropping_an_allocator_reports_allocations_the_caller_never_freed() {
+    let _serial = serial();
+    let plugin = load();
+    let allocator = open(&plugin, "eager", NXMEM_CAP_ALLOCATOR);
+
+    let _leaked_on_purpose = allocator.allocate(4096, 64).expect("allocation");
+    let _also_leaked = allocator.allocate(8192, 256).expect("allocation");
+    assert_eq!(
+        plugin.module().host_live_counts().allocations,
+        2,
+        "both allocations are live and neither will be freed by this test"
+    );
+    assert_eq!(
+        plugin
+            .module()
+            .unload_report()
+            .expect("readiness")
+            .live_allocations,
+        2,
+        "and the plugin knows about both of them"
+    );
+
+    let terminal_before = terminal_releases(&plugin);
+    drop(allocator);
+
+    // The binding assertion. The module's `live_allocations` returning to
+    // zero would *not* be enough on its own: this plugin also reclaims
+    // whatever is left during its own teardown, so that counter comes back to
+    // zero whether or not the host said anything. Counting entries into the
+    // terminal slot separates "the host handed these back" from "the plugin
+    // cleaned up after it", and only the first is the ABI's guarantee — a
+    // real mechanism may not be able to free a block safely on its own
+    // schedule.
+    assert_eq!(
+        terminal_releases(&plugin) - terminal_before,
+        2,
+        "every allocation the caller left behind must be pushed back through the plugin's \
+         terminal slot, not silently dropped"
+    );
+    assert_eq!(
+        plugin
+            .module()
+            .unload_report()
+            .expect("readiness")
+            .live_allocations,
+        0,
+        "and the plugin must end up owning nothing"
+    );
+    assert_eq!(
+        plugin.module().host_live_counts().allocations,
+        0,
+        "as must the host's own tally"
+    );
+    plugin
+        .try_unload()
+        .expect("nothing is left outstanding on either side");
+}
+
+/// **The drain on drop is a loop, and it has to be.**
+///
+/// A mechanism is entitled to retire less than it is offered — a stream-ordered
+/// allocator can only retire what its device has actually finished with — so
+/// one pass is not enough in general. `drip` retires exactly one release per
+/// call whatever budget it is given, which makes the pass count the binding
+/// constraint: three queued releases need three passes, and a host that made
+/// only one would strand two of them and leak the callback table.
+///
+/// The pass count is observed from the far side of the ABI, so the assertion is
+/// on the host's behaviour rather than on the host's opinion of it.
+#[test]
+fn dropping_an_allocator_drains_in_as_many_passes_as_the_plugin_needs() {
+    let _serial = serial();
+    let plugin = load();
+    let allocator = open(
+        &plugin,
+        "drip",
+        NXMEM_CAP_ALLOCATOR | NXMEM_CAP_DEFERRED_RELEASE,
+    );
+
+    for index in 0..3usize {
+        let bytes = 1024 * (index + 1);
+        let ptr = allocator.allocate(bytes, 64).expect("allocation");
+        // SAFETY: live allocation with matching parameters.
+        unsafe { allocator.enqueue_release(ptr, bytes, 64) }.expect("queued release");
+    }
+    assert_eq!(
+        allocator.core().outstanding_releases(),
+        3,
+        "three releases are queued and this mechanism retires one per call"
+    );
+
+    let calls_before = drain_calls(&plugin);
+    let leaks_before = PluginAllocatorCore::leaked_callback_tables();
+    drop(allocator);
+
+    assert_eq!(
+        drain_calls(&plugin) - calls_before,
+        3,
+        "the host must come back once per release the plugin was willing to retire"
+    );
+    assert_eq!(
+        plugin.module().host_live_counts().queued_releases,
+        0,
+        "every queued release must have retired, not just the first"
+    );
+    assert_eq!(
+        PluginAllocatorCore::leaked_callback_tables(),
+        leaks_before,
+        "a fully drained allocator must not leak its callback table"
+    );
+    plugin
+        .try_unload()
+        .expect("a fully drained allocator leaves nothing outstanding");
+}
+
+/// **Each pass offers an unbounded budget, and that is load-bearing.**
+///
+/// The pass count is bounded, so the per-pass budget cannot also be. `lazy`
+/// retires everything it is offered, and this queues more releases than the
+/// host will ever make passes — so the drain completes if and only if a single
+/// pass is allowed to retire an unbounded number. A host that offered a small
+/// budget per pass would run out of passes with releases still queued.
+#[test]
+fn dropping_an_allocator_offers_an_unbounded_budget_per_pass() {
+    let _serial = serial();
+    let plugin = load();
+    let allocator = open(
+        &plugin,
+        "lazy",
+        NXMEM_CAP_ALLOCATOR | NXMEM_CAP_DEFERRED_RELEASE,
+    );
+
+    // Comfortably more than the host's pass bound, so the budget is the only
+    // thing that can carry this.
+    const QUEUED: usize = 20;
+    for _ in 0..QUEUED {
+        let ptr = allocator.allocate(2048, 64).expect("allocation");
+        // SAFETY: live allocation with matching parameters.
+        unsafe { allocator.enqueue_release(ptr, 2048, 64) }.expect("queued release");
+    }
+    assert_eq!(allocator.core().outstanding_releases(), QUEUED as u64);
+
+    let calls_before = drain_calls(&plugin);
+    let leaks_before = PluginAllocatorCore::leaked_callback_tables();
+    drop(allocator);
+
+    assert_eq!(
+        drain_calls(&plugin) - calls_before,
+        1,
+        "an unbounded budget must let a willing mechanism retire the whole queue in one pass"
+    );
+    assert_eq!(
+        plugin.module().host_live_counts().queued_releases,
+        0,
+        "all twenty releases must have retired inside the host's pass bound"
+    );
+    assert_eq!(
+        PluginAllocatorCore::leaked_callback_tables(),
+        leaks_before,
+        "nothing was left outstanding, so nothing may be leaked"
+    );
+    plugin.try_unload().expect("the gate reopens");
+}
+
+/// **A completion arriving inside `enqueue_release` must never see an
+/// underflowed count.**
+///
+/// The host increments its queued-release counters *before* entering the
+/// plugin, precisely so a completion the plugin reports synchronously from
+/// inside that call decrements something that was already incremented. Count
+/// afterwards and the callback subtracts one from zero, and an unsigned
+/// counter does not go negative — it wraps to `u64::MAX`.
+///
+/// `reentrant-completion` retires the release from inside `enqueue_release`
+/// and then calls the host's reclaim hook, which is what lets the host read
+/// its own accounting at exactly that instant. Without that second callback
+/// the window closes before anything outside can look into it.
+#[test]
+fn a_completion_arriving_inside_enqueue_never_sees_an_underflowed_count() {
+    let _serial = serial();
+    let plugin = load();
+    let observer = Arc::new(MidCallObserver::default());
+    let allocator = plugin
+        .factory("reentrant-completion")
+        .expect("the mechanism is published")
+        .open(
+            NXMEM_CAP_ALLOCATOR | NXMEM_CAP_DEFERRED_RELEASE,
+            Some(observer.clone()),
+        )
+        .expect("the mechanism opens");
+    observer
+        .core
+        .set(Arc::downgrade(allocator.core()))
+        .expect("bound once");
+    observer
+        .module
+        .set(Arc::downgrade(plugin.module()))
+        .expect("bound once");
+
+    let ptr = allocator.allocate(4096, 64).expect("allocation");
+    // SAFETY: live allocation with matching parameters.
+    let ticket = unsafe { allocator.enqueue_release(ptr, 4096, 64) }.expect("queued release");
+
+    assert_eq!(
+        observer.observations.load(Ordering::Acquire),
+        1,
+        "the mechanism must actually have re-entered the host from inside enqueue_release; \
+         without that this test would be looking at nothing"
+    );
+    assert_eq!(
+        observer.retired_at_observation.load(Ordering::Acquire),
+        1,
+        "and it must have reported the completion before re-entering, or the window \
+         under test never opened"
+    );
+    assert_eq!(
+        observer.outstanding.load(Ordering::Acquire),
+        0,
+        "the reentrant completion decremented a count the host had already incremented; \
+         a count taken afterwards would read u64::MAX here"
+    );
+    assert_eq!(
+        observer.module_queued.load(Ordering::Acquire),
+        0,
+        "and the same for the module-wide tally the unload gate reads"
+    );
+
+    // The end state is ordinary, which is what makes the observation above the
+    // only thing this test could have caught.
+    let retired = allocator.core().retired_releases();
+    assert_eq!(retired.len(), 1, "the completion really did arrive");
+    assert_eq!(retired[0].ticket, ticket);
+    assert_eq!(allocator.core().outstanding_releases(), 0);
+    assert_eq!(plugin.module().host_live_counts().queued_releases, 0);
+
+    let leaks_before = PluginAllocatorCore::leaked_callback_tables();
+    drop(allocator);
+    assert_eq!(
+        PluginAllocatorCore::leaked_callback_tables(),
+        leaks_before,
+        "nothing is outstanding, so the callback table is freed normally"
+    );
+    plugin.try_unload().expect("the gate is open");
+}
+
+/// **A plugin thread may report a completion after the allocator is gone.**
+///
+/// This is the guarantee the ABI actually makes — the host's callback table
+/// outlives the allocator's final `release` *and every queued release naming
+/// it* — and it is the one thing every other test in this suite reaches only
+/// by accident, because every other path into `release_completed` runs
+/// synchronously inside a host call, where the table is trivially alive.
+///
+/// `callback-after-drop` refuses to retire through the drain slot, so the
+/// host's drop is forced to keep the table alive; the release is then reported
+/// from a thread the plugin spawns, after `AllocatorCore::drop` has returned.
+/// If the host had freed that box, this would be a use-after-free of the
+/// bridge the plugin dereferences.
+///
+/// Note on tooling: this cannot be run under Miri, which cannot execute the
+/// `dlopen`ed cdylib at all — the whole host integration suite is outside it.
+/// So the assertions below are ordinary observable ones, not sanitiser
+/// coverage, and they are chosen to fail deterministically rather than to rely
+/// on a freed allocation happening to look wrong.
+#[test]
+fn a_plugin_thread_reports_a_completion_after_its_allocator_is_gone() {
+    let _serial = serial();
+    let plugin = load();
+    let allocator = plugin
+        .factory("callback-after-drop")
+        .expect("the mechanism is published")
+        .open(NXMEM_CAP_ALLOCATOR | NXMEM_CAP_DEFERRED_RELEASE, None)
+        .expect("the mechanism opens");
+
+    let ptr = allocator.allocate(4096, 64).expect("allocation");
+    // SAFETY: live allocation with matching parameters.
+    let _ticket = unsafe { allocator.enqueue_release(ptr, 4096, 64) }.expect("queued release");
+    assert_eq!(allocator.core().outstanding_releases(), 1);
+
+    let leaks_before = PluginAllocatorCore::leaked_callback_tables();
+    let pins_before = Arc::strong_count(plugin.module());
+    drop(allocator);
+    assert_eq!(
+        PluginAllocatorCore::leaked_callback_tables() - leaks_before,
+        1,
+        "the host must keep the table the plugin still holds a pointer to"
+    );
+    assert_eq!(
+        plugin.module().host_live_counts().queued_releases,
+        1,
+        "and the release is still outstanding as far as the host knows"
+    );
+
+    // The allocator is gone. Now the plugin dereferences the host's callback
+    // table from a thread of its own — which is exactly what the contract
+    // says it may do, and exactly what freeing the table would have made
+    // undefined.
+    // SAFETY: an `extern "C" fn() -> u64` exported by the test plugin; the
+    // module is still mapped, which is itself part of what is under test.
+    let reported = {
+        let hook: libloading::Symbol<'_, unsafe extern "C" fn() -> u64> = unsafe {
+            plugin
+                .module()
+                .library()
+                .get(onnx_runtime_memory_testplugin::SYMBOL_REPORT_PARKED_COMPLETION)
+        }
+        .expect("the test plugin exports its parked-completion hook");
+        // SAFETY: as above.
+        unsafe { hook() }
+    };
+    assert_eq!(
+        reported, 1,
+        "the hook must actually have reported a completion; a zero here would mean \
+         this test proved nothing"
+    );
+
+    // The host accepted the completion through a table whose allocator no
+    // longer exists, and its accounting moved as a result.
+    assert_eq!(
+        plugin.module().host_live_counts().queued_releases,
+        0,
+        "the completion arrived and the host retired the queued release"
+    );
+    assert_eq!(
+        plugin.module().host_live_counts().allocations,
+        0,
+        "and closed the allocation it named"
+    );
+
+    // Both gates are open now, but the module still cannot be unmapped: the
+    // leaked table owns a module reference of its own and always will. That
+    // reference is the observable half of "the box was forgotten, not freed" —
+    // had it been freed, the reference would have gone with it and this unload
+    // would succeed.
+    assert_eq!(
+        Arc::strong_count(plugin.module()),
+        pins_before - 1,
+        "dropping the allocator releases the core's module reference and keeps the \
+         leaked table's own"
+    );
+    let unmapped_before = PluginModule::modules_unmapped();
+    let rejection = plugin
+        .try_unload()
+        .expect_err("a leaked callback table pins the module for the life of the process");
+    assert_eq!(
+        rejection.host.total(),
+        0,
+        "the host's half of the gate is open: {:?}",
+        rejection.host
+    );
+    assert_eq!(
+        rejection.report.total(),
+        0,
+        "and so is the plugin's: {:?}",
+        rejection.report
+    );
+    assert!(
+        rejection.reason.contains("pin the module"),
+        "the refusal must name the outside handle, got: {}",
+        rejection.reason
+    );
+    assert!(
+        rejection.into_plugin().is_none(),
+        "this refusal is terminal; there is nothing the caller can retire"
+    );
+    assert_eq!(
+        PluginModule::modules_unmapped(),
+        unmapped_before,
+        "and the module really did stay mapped"
+    );
+}
+
+/// **A refused `enqueue_release` leaves the allocation exactly as it was.**
+///
+/// To queue a release the host must first take the allocation out of its live
+/// map — it is about to stop being the host's to free — and it must count the
+/// release before entering the plugin. If the plugin then refuses, none of
+/// that happened: the plugin has taken on nothing and the allocation is still
+/// the caller's, with the caller still holding the pointer.
+///
+/// A host that only unwound its counters would leave the address unknown to
+/// itself, so the caller's eventual `release` would be refused as a stray
+/// pointer and the bytes would be stranded with no way to name them. The
+/// binding assertion here is therefore the one that follows the refusal: the
+/// same pointer must still be releasable, normally, afterwards.
+#[test]
+fn a_refused_enqueue_leaves_the_allocation_releasable() {
+    let _serial = serial();
+    let plugin = load();
+    let allocator = open(
+        &plugin,
+        "refusing-deferred",
+        NXMEM_CAP_ALLOCATOR | NXMEM_CAP_DEFERRED_RELEASE,
+    );
+
+    let ptr = allocator.allocate(4096, 64).expect("allocation");
+    // SAFETY: live allocation with matching parameters.
+    let error = unsafe { allocator.enqueue_release(ptr, 4096, 64) }
+        .expect_err("this mechanism refuses every deferral");
+    assert!(
+        format!("{error}").contains("refuses to queue"),
+        "the refusal must come from the plugin, not from the host's own bookkeeping, \
+         got: {error}"
+    );
+
+    assert_eq!(
+        allocator.core().outstanding_releases(),
+        0,
+        "a refused deferral is not an outstanding release"
+    );
+    assert_eq!(
+        plugin.module().host_live_counts().queued_releases,
+        0,
+        "nor a reason to hold the unload gate shut"
+    );
+    assert_eq!(
+        plugin.module().host_live_counts().allocations,
+        1,
+        "the allocation is still live and still the caller's"
+    );
+
+    // The assertion that binds: the host must still recognise the pointer.
+    // SAFETY: the allocation was never handed over, so it is still live with
+    // exactly these parameters.
+    let outcome = unsafe { allocator.release(ptr, 4096, 64) };
+    assert!(
+        matches!(outcome, AllocationReleaseOutcome::Complete { .. }),
+        "an allocation the plugin refused to take must still be releasable, got {outcome:?}"
+    );
+    assert_eq!(plugin.module().host_live_counts().allocations, 0);
+
+    let leaks_before = PluginAllocatorCore::leaked_callback_tables();
+    drop(allocator);
+    assert_eq!(
+        PluginAllocatorCore::leaked_callback_tables(),
+        leaks_before,
+        "a refused deferral must not cost a leaked callback table either"
+    );
+    plugin.try_unload().expect("nothing is outstanding");
 }
 
 // ─── callback failure ───────────────────────────────────────────────────────
@@ -995,15 +1644,24 @@ fn a_host_with_no_reclaim_hook_reports_the_capability_as_absent() {
 
 // ─── unload gating ──────────────────────────────────────────────────────────
 
-/// A plugin with nothing live unloads.
+/// A plugin with nothing live unloads — and really is unmapped.
 #[test]
 fn an_idle_plugin_unloads() {
     let _serial = serial();
     let plugin = load();
     assert_eq!(plugin.module().host_live_counts().total(), 0);
+    let unmapped_before = PluginModule::modules_unmapped();
     plugin
         .try_unload()
         .expect("a plugin with nothing live must unload");
+    // `try_unload` returning `Ok` only says the gate opened. This says the
+    // module actually reached `dlclose`: nothing outside the handle pinned it,
+    // so the last strong reference went and `PluginModule::drop` ran.
+    assert_eq!(
+        PluginModule::modules_unmapped() - unmapped_before,
+        1,
+        "a clean unload must actually unmap the module"
+    );
 }
 
 /// **Unload with live objects**, allocator case.
@@ -1200,7 +1858,11 @@ fn every_factory_is_released_exactly_once() {
     let before = releases(&observer);
     let plugin = load();
     let count = plugin.factories().len() as u64;
-    assert_eq!(count, 12, "the test plugin publishes twelve mechanisms");
+    assert_eq!(
+        count,
+        onnx_runtime_memory_testplugin::MECHANISM_NAMES.len() as u64,
+        "the host must take one factory per published mechanism"
+    );
     plugin.try_unload().expect("an idle plugin unloads");
 
     assert_eq!(

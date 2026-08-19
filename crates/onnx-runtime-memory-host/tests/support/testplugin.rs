@@ -78,3 +78,61 @@ pub fn build_testplugin() -> PathBuf {
          {candidates:?}. Set NXMEM_TESTPLUGIN_PATH when using a custom target directory."
     );
 }
+
+/// How many times the host has entered the plugin's `drain_releases`.
+///
+/// Read out of the **loaded module**, because how many times the host crosses
+/// the ABI boundary is a property of the host's own loop that no host-side
+/// counter could honestly report — the host would only be reading back its own
+/// belief about what it did.
+pub fn drain_calls(plugin: &onnx_runtime_memory_host::MemoryPlugin) -> u64 {
+    // SAFETY: `NxmemTestpluginDrainCalls` is an `extern "C" fn() -> u64`
+    // exported by the test plugin, and the module stays mapped for as long as
+    // the borrow of `plugin` lasts.
+    let symbol: libloading::Symbol<'_, unsafe extern "C" fn() -> u64> = unsafe {
+        plugin
+            .module()
+            .library()
+            .get(onnx_runtime_memory_testplugin::SYMBOL_DRAIN_CALLS)
+    }
+    .expect("the test plugin exports its drain-call counter");
+    // SAFETY: as above.
+    unsafe { symbol() }
+}
+
+/// How many terminal free calls the host has made into the plugin.
+///
+/// Read out of the **loaded module** for the same reason as [`drain_calls`]:
+/// whether the host actually handed an allocation back is only visible from
+/// the far side of the boundary.
+pub fn terminal_releases(plugin: &onnx_runtime_memory_host::MemoryPlugin) -> u64 {
+    // SAFETY: `NxmemTestpluginTerminalReleases` is an `extern "C" fn() -> u64`
+    // exported by the test plugin, and the module stays mapped for as long as
+    // the borrow of `plugin` lasts.
+    let symbol: libloading::Symbol<'_, unsafe extern "C" fn() -> u64> = unsafe {
+        plugin
+            .module()
+            .library()
+            .get(onnx_runtime_memory_testplugin::SYMBOL_TERMINAL_RELEASES)
+    }
+    .expect("the test plugin exports its terminal-release counter");
+    // SAFETY: as above.
+    unsafe { symbol() }
+}
+
+/// How many of the host's terminal free calls went through the **minor-1**
+/// structured slot rather than the baseline `deallocate` slot.
+pub fn structured_releases(plugin: &onnx_runtime_memory_host::MemoryPlugin) -> u64 {
+    // SAFETY: `NxmemTestpluginStructuredReleases` is an
+    // `extern "C" fn() -> u64` exported by the test plugin, and the module
+    // stays mapped for as long as the borrow of `plugin` lasts.
+    let symbol: libloading::Symbol<'_, unsafe extern "C" fn() -> u64> = unsafe {
+        plugin
+            .module()
+            .library()
+            .get(onnx_runtime_memory_testplugin::SYMBOL_STRUCTURED_RELEASES)
+    }
+    .expect("the test plugin exports its structured-release counter");
+    // SAFETY: as above.
+    unsafe { symbol() }
+}

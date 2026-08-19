@@ -254,6 +254,12 @@ impl CCompiler {
 /// deliverable is a binary contract that has to hold across toolchains. A
 /// layout test that never runs on the compiler most likely to break it is not
 /// a layout test.
+///
+/// Which is why, on a Windows target, `cl` is probed **first**. Probing
+/// clang/gcc first meant a Windows runner with LLVM anywhere on `PATH` checked
+/// the header against clang and never against MSVC — the compiler the test
+/// exists for — while still reporting success. `$CC` still wins over
+/// everything, so a job can pin either one explicitly.
 fn find_cc() -> Option<CCompiler> {
     if let Ok(cc) = std::env::var("CC")
         && !cc.is_empty()
@@ -267,6 +273,11 @@ fn find_cc() -> Option<CCompiler> {
             msvc,
         });
     }
+    if cfg!(target_os = "windows")
+        && let Some(cl) = probe_msvc()
+    {
+        return Some(cl);
+    }
     for candidate in ["cc", "clang", "gcc"] {
         if let Ok(output) = Command::new(candidate).arg("--version").output()
             && output.status.success()
@@ -277,16 +288,16 @@ fn find_cc() -> Option<CCompiler> {
             });
         }
     }
-    // `cl` has no `--version`; it prints a banner and its usage for `/?`.
-    if let Ok(output) = Command::new("cl").arg("/?").output()
-        && output.status.success()
-    {
-        return Some(CCompiler {
-            path: PathBuf::from("cl"),
-            msvc: true,
-        });
-    }
-    None
+    probe_msvc()
+}
+
+/// `cl` has no `--version`; it prints a banner and its usage for `/?`.
+fn probe_msvc() -> Option<CCompiler> {
+    let output = Command::new("cl").arg("/?").output().ok()?;
+    output.status.success().then(|| CCompiler {
+        path: PathBuf::from("cl"),
+        msvc: true,
+    })
 }
 
 /// The message every compiler-backed test fails with when there is none.

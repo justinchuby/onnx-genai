@@ -17,7 +17,7 @@
 //! poisoned for the rest of the process. Hence a binary of its own.
 
 use onnx_runtime_memory_abi::NXMEM_CAP_ALLOCATOR;
-use onnx_runtime_memory_host::MemoryPlugin;
+use onnx_runtime_memory_host::{MemoryPlugin, PluginModule};
 
 #[path = "support/testplugin.rs"]
 mod testplugin;
@@ -84,6 +84,7 @@ fn unload_is_refused_when_only_the_plugin_still_owns_something() {
     // plugin-side reference, so the only exit is a drop that keeps the module
     // mapped.
     let leaks_before = MemoryPlugin::forced_module_leaks();
+    let unmapped_before = PluginModule::modules_unmapped();
     let plugin = rejection
         .into_plugin()
         .expect("the refusal hands the plugin back");
@@ -92,5 +93,17 @@ fn unload_is_refused_when_only_the_plugin_still_owns_something() {
         MemoryPlugin::forced_module_leaks() - leaks_before,
         1,
         "a module the plugin still owns objects in must stay mapped"
+    );
+    // The counter above only records the *decision*. This one records what
+    // actually happened to the mapping: `PluginModule::drop` runs if and only
+    // if the last strong reference went, and dropping its `library` field is
+    // the `dlclose`. Nothing outside this handle pinned the module — the host
+    // let go of its allocator before `try_unload` — so if the drop above did
+    // not deliberately retain a reference, the module really would unmap here
+    // and the plugin's own worker would be left running unmapped code.
+    assert_eq!(
+        PluginModule::modules_unmapped(),
+        unmapped_before,
+        "the module must not reach dlclose while the plugin still owns an allocator"
     );
 }

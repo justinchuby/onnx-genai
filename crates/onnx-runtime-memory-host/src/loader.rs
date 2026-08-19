@@ -117,6 +117,21 @@ impl PluginModule {
         }
     }
 
+    /// How many modules this process has actually unmapped.
+    ///
+    /// Incremented from [`PluginModule`]'s own [`Drop`], which is the *only*
+    /// path on which the `library` field is dropped — and dropping that field
+    /// **is** the `dlclose`. So this is a direct proxy for "the module really
+    /// did reach `dlclose`", not a restatement of any decision made elsewhere:
+    /// a leaked strong reference means this drop never runs and the count
+    /// never moves, whatever the platform then chooses to do with the mapping.
+    ///
+    /// Process-wide, because unmapping a module is a process-wide act. Compare
+    /// deltas rather than absolute values.
+    pub fn modules_unmapped() -> u64 {
+        MODULES_UNMAPPED.load(Ordering::Acquire)
+    }
+
     /// Ask the plugin what it still owns.
     pub fn unload_report(&self) -> Result<NxmemUnloadReport, PluginError> {
         let mut report = NxmemUnloadReport::zeroed();
@@ -127,6 +142,21 @@ impl PluginModule {
             return Err(PluginError::call("NxmemQueryUnloadReadiness", status));
         }
         Ok(report)
+    }
+}
+
+/// How many loaded modules this process has let reach `dlclose`.
+static MODULES_UNMAPPED: AtomicU64 = AtomicU64::new(0);
+
+impl Drop for PluginModule {
+    fn drop(&mut self) {
+        // Reaching here means every strong reference is gone and the fields
+        // below are about to be dropped in declaration order — `library`
+        // last, which is the `dlclose` itself. Counting here rather than
+        // anywhere else keeps this an observation of the unmap actually
+        // happening, so a decision to leak a reference elsewhere shows up as
+        // this count *not* moving.
+        MODULES_UNMAPPED.fetch_add(1, Ordering::AcqRel);
     }
 }
 
