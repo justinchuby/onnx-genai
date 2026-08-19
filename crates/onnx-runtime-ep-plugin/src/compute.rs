@@ -1057,6 +1057,13 @@ struct WorkspacePlanCache {
     /// path. Waiting for a repeat costs one extra locked `Run` at startup and
     /// picks the recurring shape in both the static and the prefill/decode
     /// case.
+    ///
+    /// Exactly one signature is ever pinned, and it is never rotated. That
+    /// covers the shapes we care about (static graphs, and prefill-then-decode
+    /// where only the decode extent recurs), but a node that genuinely
+    /// alternates between two equally-recurring signatures keeps roughly half
+    /// its dispatches on the locked path. That is a missed optimisation, not a
+    /// correctness problem: a miss simply falls through to [`Self::lookup`].
     hot: std::sync::OnceLock<HotPlan>,
     /// Test-only: keep every dispatch on the locked path.
     ///
