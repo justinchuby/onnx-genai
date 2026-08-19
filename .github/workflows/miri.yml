@@ -8,6 +8,7 @@ on:
       - .github/workflows/miri.yml
       - crates/onnx-runtime-ep-api/**
       - crates/onnx-runtime-ep-cpu/**
+      - crates/onnx-runtime-ep-plugin/**
       - crates/onnx-runtime-session/**
       - crates/onnx-runtime-capi/**
       - crates/onnx-runtime-memory/**
@@ -22,6 +23,7 @@ on:
       - .github/workflows/miri.yml
       - crates/onnx-runtime-ep-api/**
       - crates/onnx-runtime-ep-cpu/**
+      - crates/onnx-runtime-ep-plugin/**
       - crates/onnx-runtime-session/**
       - crates/onnx-runtime-capi/**
       - crates/onnx-runtime-memory/**
@@ -128,6 +130,16 @@ jobs:
             cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib provider::tests
           run_miri "onnx-runtime-ep-cpu dtype" \
             cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib dtype::tests
+
+          # onnx-runtime-ep-plugin marshals ORT `OrtValue`s across the C ABI.
+          # Since #1246 `read_inputs` borrows the value's *own* shape array
+          # instead of copying it, and ORT spells a scalar as a null pointer
+          # with count 0 — `slice::from_raw_parts` on that is UB that no native
+          # run can observe. Miri is the only thing here that checks the guard,
+          # so `kernel_ctx::` is covered directly. The rest of the crate dlopens
+          # ORT and is not Miri-tractable.
+          run_miri "onnx-runtime-ep-plugin kernel context" \
+            cargo +nightly miri test --locked -p onnx-runtime-ep-plugin --lib kernel_ctx::
 
           run_miri "onnx-runtime-session tensor" \
             env MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --locked -p onnx-runtime-session --lib tensor::tests

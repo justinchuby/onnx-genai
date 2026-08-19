@@ -186,9 +186,11 @@ pub(crate) unsafe fn read_inputs(
         _ => None,
     };
     if get_type_and_shape_ref.is_none() && legacy_shape_hooks.is_none() {
-        return Err("OrtApi exposes neither GetTensorElementTypeAndShapeDataReference nor the \
+        return Err(
+            "OrtApi exposes neither GetTensorElementTypeAndShapeDataReference nor the \
                     GetTensorTypeAndShape family; input shapes cannot be read"
-            .into());
+                .into(),
+        );
     }
     let get_tensor_data = api.GetTensorData.ok_or("OrtApi.GetTensorData is null")?;
 
@@ -515,6 +517,23 @@ mod tests {
     static SHAPE_REF_CALLS: AtomicUsize = AtomicUsize::new(0);
     /// How many times the fake ORT below was asked to allocate shape info.
     static LEGACY_SHAPE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    /// Serialises the tests that assert *exact* counts on the two process-wide
+    /// counters above. libtest runs this binary's tests in parallel, so without
+    /// this one test's reset lands inside another's assertion window and the
+    /// exact-count asserts fail for a reason unrelated to their claim.
+    static SHAPE_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the counter lock and zero both counters, so a test starts from a
+    /// known state no matter what ran before it. Poisoning is irrelevant here:
+    /// the guarded state is two atomics this function resets anyway.
+    fn shape_counters_reset() -> std::sync::MutexGuard<'static, ()> {
+        let guard = SHAPE_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        SHAPE_REF_CALLS.store(0, Ordering::Relaxed);
+        LEGACY_SHAPE_CALLS.store(0, Ordering::Relaxed);
+        guard
+    }
     /// The shape the fake ORT reports for its single input.
     static FAKE_INPUT_DIMS: [i64; 3] = [2, 3, 4];
     /// Storage the fake `GetTensorData` hands back (2 * 3 * 4 f32).
@@ -686,8 +705,7 @@ mod tests {
         let api = api_with_both_shape_routes();
         let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
 
-        SHAPE_REF_CALLS.store(0, Ordering::Relaxed);
-        LEGACY_SHAPE_CALLS.store(0, Ordering::Relaxed);
+        let _counters = shape_counters_reset();
         let inputs = unsafe { read_inputs(&api, ctx) }.expect("the fake ORT reads successfully");
 
         assert_eq!(
@@ -713,6 +731,7 @@ mod tests {
         let reference = {
             let api = api_with_both_shape_routes();
             let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+            let _counters = shape_counters_reset();
             unsafe { read_inputs(&api, ctx) }.expect("the fake ORT reads successfully")
         };
 
@@ -720,8 +739,7 @@ mod tests {
         api.GetTensorElementTypeAndShapeDataReference = None;
         let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
 
-        SHAPE_REF_CALLS.store(0, Ordering::Relaxed);
-        LEGACY_SHAPE_CALLS.store(0, Ordering::Relaxed);
+        let _counters = shape_counters_reset();
         let fallback = unsafe { read_inputs(&api, ctx) }.expect("the fake ORT reads successfully");
 
         assert_eq!(
@@ -738,17 +756,24 @@ mod tests {
 
     /// ORT reports a scalar as a **null** shape pointer with count 0.
     /// `slice::from_raw_parts` is UB on null, so the borrowed path has to
-    /// special-case it — this is the test that would catch removing that guard
-    /// (under Miri; natively it asserts the resulting rank-0 shape).
+    /// special-case it. Natively this asserts the resulting rank-0 shape;
+    /// the UB itself is caught by the Miri lane, which runs exactly this
+    /// module (`.github/workflows/miri.yml`, "onnx-runtime-ep-plugin kernel
+    /// context") — without that lane the null guard would be untested.
     #[test]
     fn a_borrowed_scalar_shape_never_dereferences_null() {
         let mut api = api_with_both_shape_routes();
         api.GetTensorElementTypeAndShapeDataReference = Some(scalar_shape_reference);
         let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
 
-        SHAPE_REF_CALLS.store(0, Ordering::Relaxed);
+        let _counters = shape_counters_reset();
         let inputs = unsafe { read_inputs(&api, ctx) }.expect("a scalar input is legal");
 
+        assert_eq!(
+            SHAPE_REF_CALLS.load(Ordering::Relaxed),
+            1,
+            "the scalar must have gone through the borrowed path, not the fallback"
+        );
         assert_eq!(inputs[0].shape, Vec::<usize>::new());
         assert_eq!(inputs[0].strides, Vec::<i64>::new());
     }
