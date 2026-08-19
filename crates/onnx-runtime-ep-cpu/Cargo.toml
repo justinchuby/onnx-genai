@@ -84,6 +84,10 @@ name = "half_prefill_route_ab"
 harness = false
 
 [[bench]]
+name = "half_decode_gemv_ab"
+harness = false
+
+[[bench]]
 name = "kernels"
 harness = false
 

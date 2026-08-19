@@ -73,7 +73,7 @@ impl GemmKernel {
         if m == 1
             && b.is_contiguous()
             && b.numel() == k.saturating_mul(n)
-            && half_gemv::simd_available()
+            && half_gemv::simd_available(HalfFormat::F16)
         {
             b.validate()?;
             let a_dense = self.prepack.dense(0, a)?;
@@ -84,7 +84,7 @@ impl GemmKernel {
                 // and the view outlives this call.
                 let b_bits = unsafe { std::slice::from_raw_parts(b.data_ptr::<u16>(), k * n) };
                 let mut result = vec![0.0f32; n];
-                half_gemv::gemv_f16_kn(&a_dense, b_bits, &mut result, k, n);
+                half_gemv::gemv_half_kn(HalfFormat::F16, &a_dense, b_bits, &mut result, k, n);
                 return Ok(Some(result));
             }
         }

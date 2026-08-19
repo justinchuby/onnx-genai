@@ -318,6 +318,32 @@ host has no model corpus to run the session-level A/B against, so the table stan
 this note is only about the native-vs-native change. Full record:
 `docs/benchmarks/2026-08-19-half-prefill-fused-widen-pack-gebp.md`.
 
+#### `bf16` decode had no GEMV at all (**fixed natively**)
+
+The same audit found the mirror-image hole at `M = 1`. `f16` decode has had a dedicated GEMV since
+#1082 — at one row no packed panel is reused, so packing is overhead on a memory-bound problem —
+but `bf16` had none, and a single decode token widened and packed the whole weight to multiply it
+by one row.
+
+`half_gemv` now serves both formats (`bf16` widens by an AVX2 shift, so it does not require the
+`f16c` conversion unit the `f16` path needs). Measuring the GEMV against the fused prefill GEBP
+then **inverted the assumption behind the work**: a GEMV is the floor only while the weight is
+small enough that traffic, not parallelism, is the limit. At `n = 11008` the GEMV's 512-column
+stripes leave a third of a 32-thread pool idle, and the packing route wins. Decode therefore splits
+at 33.6M weight elements — measured at the wash, not at the first win:
+
+| dtype | `K x N` | before | after | gain |
+|---|---|---:|---:|---:|
+| bf16 | 1024x768 | 0.386 ms | 0.128 ms | **3.0x** |
+| bf16 | 512x512 | 0.079 ms | 0.014 ms | **5.6x** |
+| f16 | 896x151936 | 9.59 ms | 7.47 ms | **1.28x** |
+| bf16 | 896x151936 | 8.49 ms* | 6.45 ms | **1.32x*** |
+
+\* the `bf16` `lm_head` row compares against the GEMV, which is what that shape would have used had
+the format had one; against the route it actually took before (the fused GEBP, #1365) it is
+unchanged. Full record, including the `f32` control rows that establish this shared host's ~1.6x
+noise floor: `docs/benchmarks/2026-08-19-bf16-decode-gemv.md`.
+
 ### 3. Per-call packing — `QLinearMatMul` (**fixed**)
 
 #1058 bound MLAS's integer QGEMM and took u8 x u8 from **27-119x** down to 3-4x. What remained was
