@@ -167,19 +167,32 @@ pub(crate) unsafe fn read_inputs(
     let get_input = api
         .KernelContext_GetInput
         .ok_or("OrtApi.KernelContext_GetInput is null")?;
-    let get_type_shape = api
-        .GetTensorTypeAndShape
-        .ok_or("OrtApi.GetTensorTypeAndShape is null")?;
-    let get_elem_type = api
-        .GetTensorElementType
-        .ok_or("OrtApi.GetTensorElementType is null")?;
-    let get_dims_count = api
-        .GetDimensionsCount
-        .ok_or("OrtApi.GetDimensionsCount is null")?;
-    let get_dims = api.GetDimensions.ok_or("OrtApi.GetDimensions is null")?;
-    let release_type_shape = api
-        .ReleaseTensorTypeAndShapeInfo
-        .ok_or("OrtApi.ReleaseTensorTypeAndShapeInfo is null")?;
+    // One call that yields both the element type and a *reference* to the
+    // `OrtValue`'s own shape array. It replaces the five-call
+    // `GetTensorTypeAndShape` / `GetTensorElementType` / `GetDimensionsCount` /
+    // `GetDimensions` / `ReleaseTensorTypeAndShapeInfo` sequence below, and
+    // spares ORT the `OrtTensorTypeAndShapeInfo` it had to allocate and free
+    // for every input of every `Run`. Available since ORT API 24 and the
+    // plugin fails closed below API 27, so the fallback is unreachable in
+    // practice — it is kept so a host that leaves the hook null still works.
+    let get_type_and_shape_ref = api.GetTensorElementTypeAndShapeDataReference;
+    let legacy_shape_hooks = match (
+        api.GetTensorTypeAndShape,
+        api.GetTensorElementType,
+        api.GetDimensionsCount,
+        api.GetDimensions,
+        api.ReleaseTensorTypeAndShapeInfo,
+    ) {
+        (Some(a), Some(b), Some(c), Some(d), Some(e)) => Some((a, b, c, d, e)),
+        _ => None,
+    };
+    if get_type_and_shape_ref.is_none() && legacy_shape_hooks.is_none() {
+        return Err(
+            "OrtApi exposes neither GetTensorElementTypeAndShapeDataReference nor the \
+                    GetTensorTypeAndShape family; input shapes cannot be read"
+                .into(),
+        );
+    }
     let get_tensor_data = api.GetTensorData.ok_or("OrtApi.GetTensorData is null")?;
 
     let mut input_count: usize = 0;
@@ -213,49 +226,84 @@ pub(crate) unsafe fn read_inputs(
             continue;
         }
 
-        // Get type and shape info.
-        let mut type_shape: *mut ort::OrtTensorTypeAndShapeInfo = std::ptr::null_mut();
-        crate::dispatch_probe::ort_call();
-        let status = unsafe { get_type_shape(value, &mut type_shape) };
-        if !status.is_null() || type_shape.is_null() {
-            return Err(format!("GetTensorTypeAndShape failed for input {i}"));
-        }
-
-        // Element type.
+        // Element type and dimensions.
         let mut elem_type: ort::ONNXTensorElementDataType = 0;
-        crate::dispatch_probe::ort_call();
-        let status = unsafe { get_elem_type(type_shape, &mut elem_type) };
-        if !status.is_null() {
-            unsafe { release_type_shape(type_shape) };
-            return Err(format!("GetTensorElementType failed for input {i}"));
-        }
+        let mut borrowed_dims: *const i64 = std::ptr::null();
+        let mut borrowed_ndim: usize = 0;
+        let mut owned_dims: Vec<i64> = Vec::new();
+        let borrowed = match get_type_and_shape_ref {
+            Some(get_ref) => {
+                crate::dispatch_probe::ort_call();
+                let status = unsafe {
+                    get_ref(
+                        value,
+                        &mut elem_type,
+                        &mut borrowed_dims,
+                        &mut borrowed_ndim,
+                    )
+                };
+                if !status.is_null() {
+                    return Err(format!(
+                        "GetTensorElementTypeAndShapeDataReference failed for input {i}"
+                    ));
+                }
+                true
+            }
+            None => {
+                let (get_type_shape, get_elem_type, get_dims_count, get_dims, release_type_shape) =
+                    legacy_shape_hooks.expect("checked above: one of the two paths exists");
+                let mut type_shape: *mut ort::OrtTensorTypeAndShapeInfo = std::ptr::null_mut();
+                crate::dispatch_probe::ort_call();
+                let status = unsafe { get_type_shape(value, &mut type_shape) };
+                if !status.is_null() || type_shape.is_null() {
+                    return Err(format!("GetTensorTypeAndShape failed for input {i}"));
+                }
+                crate::dispatch_probe::ort_call();
+                let status = unsafe { get_elem_type(type_shape, &mut elem_type) };
+                if !status.is_null() {
+                    unsafe { release_type_shape(type_shape) };
+                    return Err(format!("GetTensorElementType failed for input {i}"));
+                }
+                let mut ndim: usize = 0;
+                crate::dispatch_probe::ort_call();
+                let status = unsafe { get_dims_count(type_shape, &mut ndim) };
+                if !status.is_null() {
+                    unsafe { release_type_shape(type_shape) };
+                    return Err(format!("GetDimensionsCount failed for input {i}"));
+                }
+                crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
+                owned_dims = vec![0i64; ndim];
+                crate::dispatch_probe::ort_call();
+                let status = unsafe { get_dims(type_shape, owned_dims.as_mut_ptr(), ndim) };
+                if !status.is_null() {
+                    unsafe { release_type_shape(type_shape) };
+                    return Err(format!("GetDimensions failed for input {i}"));
+                }
+                crate::dispatch_probe::ort_call();
+                unsafe { release_type_shape(type_shape) };
+                false
+            }
+        };
         let dtype = DataType::from_onnx(elem_type as i32)
             .ok_or_else(|| format!("unsupported element type {elem_type} for input {i}"))?;
-
-        // Dimensions.
-        let mut ndim: usize = 0;
-        crate::dispatch_probe::ort_call();
-        let status = unsafe { get_dims_count(type_shape, &mut ndim) };
-        if !status.is_null() {
-            unsafe { release_type_shape(type_shape) };
-            return Err(format!("GetDimensionsCount failed for input {i}"));
-        }
-        crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
-        let mut dims = vec![0i64; ndim];
-        crate::dispatch_probe::ort_call();
-        let status = unsafe { get_dims(type_shape, dims.as_mut_ptr(), ndim) };
-        if !status.is_null() {
-            unsafe { release_type_shape(type_shape) };
-            return Err(format!("GetDimensions failed for input {i}"));
-        }
-        crate::dispatch_probe::ort_call();
-        unsafe { release_type_shape(type_shape) };
+        // SAFETY: on the borrowed path ORT reports `shape_data` as its own
+        // storage for this `OrtValue`, valid until the value is released or
+        // reshaped — neither happens while this `Compute` call holds it. A
+        // scalar is reported as a null pointer with count 0, which must not be
+        // handed to `from_raw_parts`.
+        let dims: &[i64] = if !borrowed {
+            &owned_dims
+        } else if borrowed_ndim == 0 || borrowed_dims.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(borrowed_dims, borrowed_ndim) }
+        };
 
         // Validate ORT-supplied dims: reject negatives and detect overflow.
         // Two allocations: `shape` and `strides`. The label is `format_args!`,
         // which borrows its arguments and formats only if an error is raised.
         crate::dispatch_probe::count_n(crate::dispatch_probe::Event::DispatchAlloc, 2);
-        let (shape, _, _) = validate_dims(&dims, dtype, format_args!("input {i}"))?;
+        let (shape, _, _) = validate_dims(dims, dtype, format_args!("input {i}"))?;
         let strides = onnx_runtime_ir::compute_contiguous_strides(&shape);
 
         // Data pointer.
@@ -303,8 +351,23 @@ pub(crate) unsafe fn allocate_output(
         .GetTensorMutableData
         .ok_or("OrtApi.GetTensorMutableData is null")?;
 
-    crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
-    let dims: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
+    // ORT wants the shape as `i64`. Ranks this small are the whole population
+    // of shapes this path sees, so the conversion goes to the stack and a
+    // per-`Run`, per-output heap allocation disappears; a taller tensor still
+    // works, through the `Vec`.
+    const INLINE_RANK: usize = 8;
+    let mut inline_dims = [0i64; INLINE_RANK];
+    let heap_dims: Vec<i64>;
+    let dims: &[i64] = if shape.len() <= INLINE_RANK {
+        for (slot, &d) in inline_dims.iter_mut().zip(shape) {
+            *slot = d as i64;
+        }
+        &inline_dims[..shape.len()]
+    } else {
+        crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
+        heap_dims = shape.iter().map(|&d| d as i64).collect();
+        &heap_dims
+    };
     let mut value: *mut ort::OrtValue = std::ptr::null_mut();
     crate::dispatch_probe::ort_call();
     let status = unsafe { get_output(ctx, index, dims.as_ptr(), dims.len(), &mut value) };
@@ -371,6 +434,8 @@ mod tests {
     static MEM_INFO_CALLS: AtomicUsize = AtomicUsize::new(0);
     /// Storage the fake `GetTensorMutableData` hands back.
     static mut FAKE_OUTPUT: [f32; 4] = [0.0; 4];
+    /// The dims the recording fake `KernelContext_GetOutput` last saw.
+    static RECORDED_DIMS: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
 
     /// Stands in for ORT: yields an opaque non-null `OrtValue`.
     ///
@@ -384,6 +449,30 @@ mod tests {
         _dim_count: usize,
         out: *mut *mut ort::OrtValue,
     ) -> ort::OrtStatusPtr {
+        unsafe { *out = std::ptr::dangling_mut::<ort::OrtValue>() };
+        std::ptr::null_mut()
+    }
+
+    /// Stands in for ORT, recording the dims the caller passed so a test can
+    /// prove the inline-rank fast path sends the same shape as the heap path.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `dims` must point at `dim_count` i64 and
+    /// `out` must be a valid pointer.
+    unsafe extern "C" fn recording_get_output(
+        _ctx: *mut ort::OrtKernelContext,
+        _index: usize,
+        dims: *const i64,
+        dim_count: usize,
+        out: *mut *mut ort::OrtValue,
+    ) -> ort::OrtStatusPtr {
+        let seen = if dim_count == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(dims, dim_count) }.to_vec()
+        };
+        *RECORDED_DIMS.lock().expect("recorded dims lock") = seen;
         unsafe { *out = std::ptr::dangling_mut::<ort::OrtValue>() };
         std::ptr::null_mut()
     }
@@ -447,6 +536,394 @@ mod tests {
             1,
             "a staging caller still gets the output's memory info"
         );
+    }
+
+    /// How many times the fake ORT below was asked for a shape *reference*.
+    static SHAPE_REF_CALLS: AtomicUsize = AtomicUsize::new(0);
+    /// How many times the fake ORT below was asked to allocate shape info.
+    static LEGACY_SHAPE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    /// Serialises the tests that assert *exact* counts on the two process-wide
+    /// counters above. libtest runs this binary's tests in parallel, so without
+    /// this one test's reset lands inside another's assertion window and the
+    /// exact-count asserts fail for a reason unrelated to their claim.
+    static SHAPE_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the counter lock and zero both counters, so a test starts from a
+    /// known state no matter what ran before it. Poisoning is irrelevant here:
+    /// the guarded state is two atomics this function resets anyway.
+    fn shape_counters_reset() -> std::sync::MutexGuard<'static, ()> {
+        let guard = SHAPE_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        SHAPE_REF_CALLS.store(0, Ordering::Relaxed);
+        LEGACY_SHAPE_CALLS.store(0, Ordering::Relaxed);
+        guard
+    }
+    /// The shape the fake ORT reports for its single input.
+    static FAKE_INPUT_DIMS: [i64; 3] = [2, 3, 4];
+    /// Storage the fake `GetTensorData` hands back (2 * 3 * 4 f32).
+    static FAKE_INPUT_DATA: [f32; 24] = [0.0; 24];
+    /// `ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT`.
+    const ORT_ELEM_FLOAT: ort::ONNXTensorElementDataType = 1;
+
+    /// Stands in for ORT: exactly one input.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `out` must be a valid pointer.
+    unsafe extern "C" fn fake_get_input_count(
+        _ctx: *const ort::OrtKernelContext,
+        out: *mut usize,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = 1 };
+        std::ptr::null_mut()
+    }
+
+    /// Stands in for ORT: yields an opaque non-null `OrtValue`.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `out` must be a valid pointer.
+    unsafe extern "C" fn fake_get_input(
+        _ctx: *const ort::OrtKernelContext,
+        _index: usize,
+        out: *mut *const ort::OrtValue,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = std::ptr::dangling::<ort::OrtValue>() };
+        std::ptr::null_mut()
+    }
+
+    /// Stands in for ORT: points at `FAKE_INPUT_DATA`.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `out` must be a valid pointer.
+    unsafe extern "C" fn fake_get_tensor_data(
+        _value: *const ort::OrtValue,
+        out: *mut *const c_void,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = FAKE_INPUT_DATA.as_ptr().cast() };
+        std::ptr::null_mut()
+    }
+
+    /// Stands in for ORT's API-24 one-call type+shape reference, counting uses
+    /// and lending the value's *own* dims array exactly as ORT documents.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; all out pointers must be valid.
+    unsafe extern "C" fn counting_shape_reference(
+        _value: *const ort::OrtValue,
+        elem_type: *mut ort::ONNXTensorElementDataType,
+        shape_data: *mut *const i64,
+        shape_data_count: *mut usize,
+    ) -> ort::OrtStatusPtr {
+        SHAPE_REF_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            *elem_type = ORT_ELEM_FLOAT;
+            *shape_data = FAKE_INPUT_DIMS.as_ptr();
+            *shape_data_count = FAKE_INPUT_DIMS.len();
+        }
+        std::ptr::null_mut()
+    }
+
+    /// Same hook, reporting a scalar the way ORT documents it: a **null**
+    /// pointer with count 0, which must never reach `from_raw_parts`.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; all out pointers must be valid.
+    unsafe extern "C" fn scalar_shape_reference(
+        _value: *const ort::OrtValue,
+        elem_type: *mut ort::ONNXTensorElementDataType,
+        shape_data: *mut *const i64,
+        shape_data_count: *mut usize,
+    ) -> ort::OrtStatusPtr {
+        SHAPE_REF_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            *elem_type = ORT_ELEM_FLOAT;
+            *shape_data = std::ptr::null();
+            *shape_data_count = 0;
+        }
+        std::ptr::null_mut()
+    }
+
+    /// Stands in for the legacy allocating `GetTensorTypeAndShape`, counting
+    /// uses so a test can prove the five-call sequence was *not* taken.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `out` must be a valid pointer.
+    unsafe extern "C" fn counting_get_type_shape(
+        _value: *const ort::OrtValue,
+        out: *mut *mut ort::OrtTensorTypeAndShapeInfo,
+    ) -> ort::OrtStatusPtr {
+        LEGACY_SHAPE_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe { *out = std::ptr::dangling_mut::<ort::OrtTensorTypeAndShapeInfo>() };
+        std::ptr::null_mut()
+    }
+
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `out` must be a valid pointer.
+    unsafe extern "C" fn legacy_get_elem_type(
+        _info: *const ort::OrtTensorTypeAndShapeInfo,
+        out: *mut ort::ONNXTensorElementDataType,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = ORT_ELEM_FLOAT };
+        std::ptr::null_mut()
+    }
+
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `out` must be a valid pointer.
+    unsafe extern "C" fn legacy_get_dims_count(
+        _info: *const ort::OrtTensorTypeAndShapeInfo,
+        out: *mut usize,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = FAKE_INPUT_DIMS.len() };
+        std::ptr::null_mut()
+    }
+
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `out` must point at `count` writable i64.
+    unsafe extern "C" fn legacy_get_dims(
+        _info: *const ort::OrtTensorTypeAndShapeInfo,
+        out: *mut i64,
+        count: usize,
+    ) -> ort::OrtStatusPtr {
+        let n = count.min(FAKE_INPUT_DIMS.len());
+        unsafe { std::ptr::copy_nonoverlapping(FAKE_INPUT_DIMS.as_ptr(), out, n) };
+        std::ptr::null_mut()
+    }
+
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects.
+    unsafe extern "C" fn legacy_release_type_shape(_info: *mut ort::OrtTensorTypeAndShapeInfo) {}
+
+    /// An `OrtApi` with both shape routes wired and both counted.
+    fn api_with_both_shape_routes() -> ort::OrtApi {
+        let mut api: ort::OrtApi = unsafe { std::mem::zeroed() };
+        api.KernelContext_GetInputCount = Some(fake_get_input_count);
+        api.KernelContext_GetInput = Some(fake_get_input);
+        api.GetTensorData = Some(fake_get_tensor_data);
+        api.GetTensorElementTypeAndShapeDataReference = Some(counting_shape_reference);
+        api.GetTensorTypeAndShape = Some(counting_get_type_shape);
+        api.GetTensorElementType = Some(legacy_get_elem_type);
+        api.GetDimensionsCount = Some(legacy_get_dims_count);
+        api.GetDimensions = Some(legacy_get_dims);
+        api.ReleaseTensorTypeAndShapeInfo = Some(legacy_release_type_shape);
+        api
+    }
+
+    /// The whole point of the change: when ORT offers the API-24 hook, the
+    /// per-input, per-`Run` shape read is **one** call and the allocating
+    /// five-call sequence is never entered.
+    ///
+    /// Falsifier: point `read_inputs` back at the legacy family unconditionally
+    /// and this fails with `SHAPE_REF_CALLS 0` / `LEGACY_SHAPE_CALLS 1`
+    /// (verified).
+    #[test]
+    fn input_shapes_come_from_one_call_when_ort_offers_the_reference_hook() {
+        let api = api_with_both_shape_routes();
+        let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+
+        let _counters = shape_counters_reset();
+        let inputs = unsafe { read_inputs(&api, ctx) }.expect("the fake ORT reads successfully");
+
+        assert_eq!(
+            SHAPE_REF_CALLS.load(Ordering::Relaxed),
+            1,
+            "one input must cost exactly one shape call"
+        );
+        assert_eq!(
+            LEGACY_SHAPE_CALLS.load(Ordering::Relaxed),
+            0,
+            "the allocating five-call sequence must not run when the reference hook exists"
+        );
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].shape, vec![2, 3, 4]);
+        assert_eq!(inputs[0].strides, vec![12, 4, 1]);
+        assert_eq!(inputs[0].dtype, DataType::Float32);
+    }
+
+    /// The route test above proves *which* family runs; these pin what it
+    /// costs. Gated with the probe, like the other cost pins in this file.
+    #[cfg(feature = "dispatch_probe")]
+    mod reference_hook_cost {
+        use super::*;
+        use crate::dispatch_probe::{self, Event};
+
+        /// Without this, the central claim of #1246 -- fewer round trips into
+        /// ORT -- is untested, and a later refactor could restore the five
+        /// calls one at a time while `input_shapes_come_from_one_call...`
+        /// still passed (it only asserts the legacy *shape* entry point is
+        /// untouched).
+        ///
+        /// Three per input: `KernelContext_GetInput`,
+        /// `GetTensorElementTypeAndShapeDataReference`, `GetTensorData`, plus
+        /// the one shared `GetInputCount`. The legacy path pinned elsewhere in
+        /// this file costs `1 + 7`.
+        #[test]
+        fn the_reference_hook_path_costs_exactly_three_ort_calls_per_input() {
+            let api = api_with_both_shape_routes();
+            let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+
+            let _counters = shape_counters_reset();
+            let before = dispatch_probe::snapshot();
+            let inputs =
+                unsafe { read_inputs(&api, ctx) }.expect("the fake ORT reads successfully");
+            let d = dispatch_probe::snapshot().since(&before);
+
+            assert_eq!(inputs.len(), 1);
+            assert_eq!(
+                d.event(Event::OrtFfiCall),
+                1 + 3,
+                "per-input FFI round trips on the reference-hook path changed; if \
+                 this is an intentional improvement, lower the number -- if it went \
+                 up, the batching this PR exists for has regressed"
+            );
+        }
+
+        /// The five-call sequence also allocated: `GetDimensionsCount` then a
+        /// `dims` scratch `Vec` sized to the rank, before the shape and strides
+        /// were built from it. Borrowing the dims leaves the scratch with
+        /// nothing to do, so the reference-hook path must allocate strictly
+        /// less than the legacy one for the same input. Pinned as a comparison
+        /// rather than an absolute so it keeps its meaning as both paths
+        /// evolve.
+        #[test]
+        fn the_reference_hook_path_allocates_less_than_the_legacy_path() {
+            let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+
+            // One guard for both measurements: `shape_counters_reset` returns a
+            // `MutexGuard` and the lock is not reentrant, so taking it twice in
+            // one scope deadlocks (shadowing does not drop the first).
+            let _counters = shape_counters_reset();
+
+            let api = api_with_both_shape_routes();
+            let before = dispatch_probe::snapshot();
+            let fast = unsafe { read_inputs(&api, ctx) }.expect("the fake ORT reads successfully");
+            let fast_allocs = dispatch_probe::snapshot()
+                .since(&before)
+                .event(Event::DispatchAlloc);
+
+            let mut api = api_with_both_shape_routes();
+            api.GetTensorElementTypeAndShapeDataReference = None;
+            let before = dispatch_probe::snapshot();
+            let slow = unsafe { read_inputs(&api, ctx) }.expect("the fake ORT reads successfully");
+            let slow_allocs = dispatch_probe::snapshot()
+                .since(&before)
+                .event(Event::DispatchAlloc);
+
+            assert_eq!(fast[0].shape, slow[0].shape, "same input either way");
+            assert!(
+                fast_allocs < slow_allocs,
+                "the reference-hook path allocated {fast_allocs}, the legacy path \
+                 {slow_allocs}; borrowing the dims must skip the rank-sized scratch"
+            );
+        }
+    }
+
+    /// The fallback is not decoration: with the reference hook absent, the
+    /// five-call sequence must still produce the identical `OwnedInput`.
+    #[test]
+    fn the_five_call_fallback_produces_the_same_input_as_the_reference_hook() {
+        let reference = {
+            let api = api_with_both_shape_routes();
+            let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+            let _counters = shape_counters_reset();
+            unsafe { read_inputs(&api, ctx) }.expect("the fake ORT reads successfully")
+        };
+
+        let mut api = api_with_both_shape_routes();
+        api.GetTensorElementTypeAndShapeDataReference = None;
+        let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+
+        let _counters = shape_counters_reset();
+        let fallback = unsafe { read_inputs(&api, ctx) }.expect("the fake ORT reads successfully");
+
+        assert_eq!(
+            LEGACY_SHAPE_CALLS.load(Ordering::Relaxed),
+            1,
+            "a host without the reference hook must still get its shapes"
+        );
+        assert_eq!(fallback.len(), reference.len());
+        assert_eq!(fallback[0].shape, reference[0].shape);
+        assert_eq!(fallback[0].strides, reference[0].strides);
+        assert_eq!(fallback[0].dtype, reference[0].dtype);
+        assert_eq!(fallback[0].data_ptr, reference[0].data_ptr);
+    }
+
+    /// ORT reports a scalar as a **null** shape pointer with count 0.
+    /// `slice::from_raw_parts` is UB on null, so the borrowed path has to
+    /// special-case it. Natively this asserts the resulting rank-0 shape;
+    /// the UB itself is caught by the Miri lane, which runs exactly this
+    /// module (`.github/workflows/miri.yml`, "onnx-runtime-ep-plugin kernel
+    /// context") — without that lane the null guard would be untested.
+    #[test]
+    fn a_borrowed_scalar_shape_never_dereferences_null() {
+        let mut api = api_with_both_shape_routes();
+        api.GetTensorElementTypeAndShapeDataReference = Some(scalar_shape_reference);
+        let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+
+        let _counters = shape_counters_reset();
+        let inputs = unsafe { read_inputs(&api, ctx) }.expect("a scalar input is legal");
+
+        assert_eq!(
+            SHAPE_REF_CALLS.load(Ordering::Relaxed),
+            1,
+            "the scalar must have gone through the borrowed path, not the fallback"
+        );
+        assert_eq!(inputs[0].shape, Vec::<usize>::new());
+        assert_eq!(inputs[0].strides, Vec::<i64>::new());
+    }
+
+    /// A host offering neither route must fail closed with a message naming
+    /// both, not silently read garbage shapes.
+    #[test]
+    fn read_inputs_fails_closed_when_no_shape_route_exists() {
+        let mut api = api_with_both_shape_routes();
+        api.GetTensorElementTypeAndShapeDataReference = None;
+        api.GetDimensions = None;
+        let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+
+        let err = match unsafe { read_inputs(&api, ctx) } {
+            Ok(_) => panic!("no shape route must be fatal, not silently successful"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("GetTensorElementTypeAndShapeDataReference")
+                && err.contains("GetTensorTypeAndShape"),
+            "error must name both routes: {err}"
+        );
+    }
+
+    /// The output shape handed to ORT must be the same values whether it went
+    /// through the inline array or the `Vec`. The boundary is rank 8.
+    ///
+    /// Falsifier: drop the `heap_dims` arm and a rank-9 output silently sends
+    /// ORT a truncated shape; this fails on `dims_seen` (verified).
+    #[test]
+    fn output_dims_are_identical_on_the_inline_and_heap_ranks() {
+        let mut api: ort::OrtApi = unsafe { std::mem::zeroed() };
+        api.KernelContext_GetOutput = Some(recording_get_output);
+        api.GetTensorMutableData = Some(fake_get_mutable_data);
+        let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+
+        for rank in [0usize, 1, 8, 9, 12] {
+            let shape: Vec<usize> = (1..=rank).collect();
+            let _ = unsafe { allocate_output(&api, ctx, 0, &shape, DataType::Float32, false) }
+                .expect("the fake ORT allocates successfully");
+            let seen = RECORDED_DIMS.lock().expect("recorded dims lock");
+            let expected: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
+            assert_eq!(
+                *seen, expected,
+                "rank {rank} must reach ORT with every dimension intact"
+            );
+        }
     }
 
     #[test]
@@ -523,7 +1000,7 @@ mod tests {
     #[test]
     fn validate_dims_rejects_negative() {
         let dims = [4, -1, 8];
-        let err = super::validate_dims(&dims, DataType::Float32, "test").unwrap_err();
+        let err = super::validate_dims(&dims, DataType::Float32, format_args!("test")).unwrap_err();
         assert!(err.contains("dim[1] is -1"), "error: {err}");
         assert!(err.contains("negative"), "error: {err}");
     }
@@ -532,7 +1009,7 @@ mod tests {
     fn validate_dims_rejects_large_negative() {
         // ORT's dynamic-dim sentinel -1 as i64
         let dims = [2, -1i64];
-        let err = super::validate_dims(&dims, DataType::Float32, "x").unwrap_err();
+        let err = super::validate_dims(&dims, DataType::Float32, format_args!("x")).unwrap_err();
         assert!(err.contains("-1"), "error: {err}");
     }
 
@@ -540,7 +1017,7 @@ mod tests {
     fn validate_dims_overflow_element_count() {
         // Two huge dims that overflow usize on multiply
         let dims = [i64::MAX / 2, 4];
-        let err = super::validate_dims(&dims, DataType::Float32, "big").unwrap_err();
+        let err = super::validate_dims(&dims, DataType::Float32, format_args!("big")).unwrap_err();
         assert!(err.contains("overflows"), "error: {err}");
     }
 
@@ -554,7 +1031,7 @@ mod tests {
         // i64::MAX as usize = 2^63-1. For Float64 (8 bytes):
         // (2^63-1) * 8 overflows usize on 64-bit.
         let dims = [i64::MAX]; // huge but positive
-        let result = super::validate_dims(&dims, DataType::Float64, "bytes");
+        let result = super::validate_dims(&dims, DataType::Float64, format_args!("bytes"));
         // byte_size = 8, element_count = 2^63-1, product overflows
         assert!(result.is_err(), "should fail: {result:?}");
     }
@@ -564,7 +1041,7 @@ mod tests {
         // Zero-dim tensors are legal in ONNX (e.g. empty batch)
         let dims = [0i64, 3, 224, 224];
         let (shape, elem_count, byte_len) =
-            super::validate_dims(&dims, DataType::Float32, "zero").unwrap();
+            super::validate_dims(&dims, DataType::Float32, format_args!("zero")).unwrap();
         assert_eq!(shape, vec![0, 3, 224, 224]);
         assert_eq!(elem_count, 0);
         assert_eq!(byte_len, 0);
@@ -575,7 +1052,7 @@ mod tests {
         // Scalar: zero-rank tensor with 1 element
         let dims: [i64; 0] = [];
         let (shape, elem_count, byte_len) =
-            super::validate_dims(&dims, DataType::Float32, "scalar").unwrap();
+            super::validate_dims(&dims, DataType::Float32, format_args!("scalar")).unwrap();
         assert_eq!(shape, Vec::<usize>::new());
         assert_eq!(elem_count, 1); // product of empty = 1
         assert_eq!(byte_len, 4);
@@ -585,7 +1062,7 @@ mod tests {
     fn validate_dims_normal_shape() {
         let dims = [2i64, 3, 4];
         let (shape, elem_count, byte_len) =
-            super::validate_dims(&dims, DataType::Float32, "ok").unwrap();
+            super::validate_dims(&dims, DataType::Float32, format_args!("ok")).unwrap();
         assert_eq!(shape, vec![2, 3, 4]);
         assert_eq!(elem_count, 24);
         assert_eq!(byte_len, 96);
@@ -616,7 +1093,7 @@ mod tests {
         // A [4, 8] f16 tensor: 32 elements × 2 bytes = 64 bytes.
         let dims = [4i64, 8];
         let (shape, elem_count, byte_len) =
-            super::validate_dims(&dims, DataType::Float16, "f16").unwrap();
+            super::validate_dims(&dims, DataType::Float16, format_args!("f16")).unwrap();
         assert_eq!(shape, vec![4, 8]);
         assert_eq!(elem_count, 32);
         assert_eq!(byte_len, 64);
@@ -627,7 +1104,7 @@ mod tests {
         // A [3, 5] bf16 tensor: 15 elements × 2 bytes = 30 bytes.
         let dims = [3i64, 5];
         let (shape, elem_count, byte_len) =
-            super::validate_dims(&dims, DataType::BFloat16, "bf16").unwrap();
+            super::validate_dims(&dims, DataType::BFloat16, format_args!("bf16")).unwrap();
         assert_eq!(shape, vec![3, 5]);
         assert_eq!(elem_count, 15);
         assert_eq!(byte_len, 30);
@@ -640,7 +1117,8 @@ mod tests {
         // byte_len = 2^63 * 2 = 2^64 overflows usize — checked_mul must reject it.
         let half_max_plus_1 = i64::MAX / 2 + 1; // 4611686018427387904
         let dims = [half_max_plus_1, 2i64];
-        let err = super::validate_dims(&dims, DataType::Float16, "f16_overflow").unwrap_err();
+        let err = super::validate_dims(&dims, DataType::Float16, format_args!("f16_overflow"))
+            .unwrap_err();
         assert!(
             err.contains("overflows"),
             "expected overflow error, got: {err}"
