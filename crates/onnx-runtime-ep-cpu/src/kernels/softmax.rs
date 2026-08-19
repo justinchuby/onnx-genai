@@ -64,15 +64,24 @@ impl KernelFactory for SoftmaxLegacyFactory {
     }
 }
 
-/// Rows below which the row-major softmax stays on one thread. A row is at
-/// least a few hundred bytes of streaming work, so the crossover is set by the
-/// pool's wake-up cost rather than by cache residency; 64 rows of any realistic
-/// width clears it comfortably.
-const MIN_PARALLEL_SOFTMAX_ROWS: usize = 64;
-
 /// Elements below which the row-major softmax stays on one thread, so that a
 /// tall-and-very-thin tensor (many rows of 2) does not pay for a fan-out that
 /// buys nothing.
+///
+/// This is the *only* work threshold, deliberately. It used to sit next to a
+/// `MIN_PARALLEL_SOFTMAX_ROWS = 64` row floor, which was a proxy for the same
+/// quantity -- "is there enough work to amortise the pool wake-up?" -- but
+/// measured in the wrong unit. Work is `n * d`, and a row floor prices only
+/// `n`, so it refused shapes that are wide instead of tall: decode attention is
+/// `n = heads` by `d = kv_len`, and `32 x 8192` is 256 Ki elements, sixteen
+/// times this floor, yet 32 rows could never clear a floor of 64. Those shapes
+/// then ran single-threaded at every pool width. See section 42 of the CPU-EP
+/// benchmark ledger for the measurement that found it.
+///
+/// Removing the row floor admits nothing that this floor did not already admit
+/// at the same *work per chunk*: chunks are sized by [`ROW_TILE_BYTES`], so the
+/// newly-admitted `32 x 8192` yields 32 chunks of 8192 elements, exactly the
+/// chunk size the previously-admitted `64 x 256` yields.
 const MIN_PARALLEL_SOFTMAX_ELEMENTS: usize = 16 * 1024;
 
 /// Numerically stable row-major softmax of `n` contiguous rows of `d` elements,
@@ -278,8 +287,20 @@ pub(crate) fn softmax_rows(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
 /// to keep a run of rows in a core's private cache between the scale/mask write
 /// and the softmax's two reads; a chunk smaller than a tile could not fill that
 /// pipeline, and would call MLAS more often for less work each time.
+/// Whether an `n x d` softmax holds enough work to be worth waking the pool.
+///
+/// Split out from [`parallel_rows_per_task`] so the policy is testable without
+/// a multi-threaded runtime: the caller's other condition is the pool width,
+/// which a unit test cannot vary.
+///
+/// `n < 2` is not a threshold but an impossibility -- a chunk is a whole number
+/// of rows, so a single row cannot be split however large it is.
+fn fan_out_is_worthwhile(n: usize, d: usize) -> bool {
+    n >= 2 && n.saturating_mul(d) >= MIN_PARALLEL_SOFTMAX_ELEMENTS
+}
+
 fn parallel_rows_per_task(n: usize, d: usize) -> Option<usize> {
-    if n < MIN_PARALLEL_SOFTMAX_ROWS || n.saturating_mul(d) < MIN_PARALLEL_SOFTMAX_ELEMENTS {
+    if !fan_out_is_worthwhile(n, d) {
         return None;
     }
     if crate::task_runtime::width() < 2 {
@@ -1064,18 +1085,21 @@ mod vectorized_tests {
 
     /// The fan-out must not change a single bit relative to the serial path:
     /// rows are independent, so chunking cannot legitimately alter any result.
-    /// Sizes straddle `MIN_PARALLEL_SOFTMAX_ROWS` and
-    /// `MIN_PARALLEL_SOFTMAX_ELEMENTS` in both directions.
+    /// Sizes straddle `MIN_PARALLEL_SOFTMAX_ELEMENTS` in both directions, and
+    /// include the wide-and-short shapes the old row floor used to refuse.
     #[test]
     fn the_parallel_fan_out_is_bit_identical_to_the_serial_path() {
         for (n, d) in [
             (1usize, 1usize),
             (1, 4096),
-            (63, 512),   // below the row floor
-            (64, 8),     // clears rows, below the element floor
-            (64, 256),   // clears both
-            (4096, 128), // comfortably parallel
-            (129, 1000), // rows not divisible by any worker count
+            (63, 512),    // once refused by the row floor, now parallel
+            (64, 8),      // below the element floor, still serial
+            (64, 256),    // the smallest shape the old gate admitted
+            (4096, 128),  // comfortably parallel
+            (129, 1000),  // rows not divisible by any worker count
+            (32, 8192),   // decode attention: wide, short, formerly serial
+            (2, 8192),    // the fewest rows that can be split at all
+            (1, 1 << 20), // one enormous row: unsplittable, must stay serial
         ] {
             let src = synthetic(n, d, (n * 31 + d) as u32);
             let mut serial = src.clone();
@@ -1089,6 +1113,45 @@ mod vectorized_tests {
             softmax_rows(&src, &mut out_of_place, n, d);
             assert_eq!(serial, out_of_place, "out-of-place n={n} d={d}");
         }
+    }
+
+    /// The fan-out gate prices *work*, not row count. This is the property the
+    /// old `MIN_PARALLEL_SOFTMAX_ROWS = 64` floor got wrong: it refused
+    /// `32 x 8192` -- 256 Ki elements, sixteen times the element floor -- purely
+    /// for having 32 rows, which pinned decode attention to one thread at every
+    /// pool width no matter how much work it held.
+    #[test]
+    fn the_fan_out_gate_prices_work_not_row_count() {
+        // Wide and short: refused by a row floor, admitted by a work floor.
+        assert!(fan_out_is_worthwhile(32, 8192));
+        assert!(fan_out_is_worthwhile(2, 8192));
+        assert!(fan_out_is_worthwhile(63, 512));
+
+        // A single row is unsplittable at any size, because a chunk is a whole
+        // number of rows.
+        assert!(!fan_out_is_worthwhile(1, 1 << 20));
+        assert!(!fan_out_is_worthwhile(0, 1 << 20));
+
+        // The work floor itself still bites, and still bites exactly.
+        assert!(!fan_out_is_worthwhile(64, 8));
+        assert!(!fan_out_is_worthwhile(
+            2,
+            MIN_PARALLEL_SOFTMAX_ELEMENTS / 2 - 1
+        ));
+        assert!(fan_out_is_worthwhile(2, MIN_PARALLEL_SOFTMAX_ELEMENTS / 2));
+
+        // Newly-admitted shapes chunk to the same work per chunk as shapes the
+        // old gate already admitted, which is why this widening is safe: both
+        // yield 8192 elements per chunk.
+        let per_chunk =
+            |n: usize, d: usize| (ROW_TILE_BYTES / (d.max(1) * size_of::<f32>())).clamp(1, n) * d;
+        assert_eq!(per_chunk(32, 8192), per_chunk(64, 256));
+
+        // `n * d` must not wrap on absurd shapes. `saturating_mul` clamps
+        // *upward*, so an unrepresentable element count reads as "plenty of
+        // work" and fans out; a wrapping `*` would read as "none" and would
+        // silently pin the largest tensors to one thread.
+        assert!(fan_out_is_worthwhile(usize::MAX, usize::MAX));
     }
 
     /// The out-of-place softmax derives every output element from `src` alone.
