@@ -902,6 +902,14 @@ static MLAS_SQNBIT_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 static BORROWED_INT4_SYMMETRIC_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static BORROWED_INT4_ASYMMETRIC_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Positive-proof counter for the fused-dequant 8-bit prefill GEBP.
+///
+/// The route it replaces produces the same numbers to the last bit, so a test
+/// comparing values cannot tell which one ran. Incremented once per `execute`
+/// that routes into [`x86_sgemm::quant_prefill_gebp`] with an
+/// [`x86_sgemm::Int8Weight`].
+#[cfg(all(test, target_arch = "x86_64"))]
+static INT8_PREFILL_GEBP_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// Standard ONNX row-major packed NBits weight with affine block metadata.
 ///
 /// This preserves the wire layout instead of expanding it to f32. Direct
@@ -921,6 +929,18 @@ enum BorrowedScales<'a> {
 }
 
 impl BorrowedScales<'_> {
+    /// Only the x86-64 fused-dequant GEBP bounds-checks the borrowed scale
+    /// slice up front; every other reader indexes it through [`Self::get`].
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::F32(values) => values.len(),
+            Self::F16(values) => values.len(),
+            Self::Bf16(values) => values.len(),
+        }
+    }
+
     #[inline]
     fn get(&self, index: usize) -> f32 {
         match self {
@@ -1273,7 +1293,7 @@ impl Kernel for MatMulNBitsKernel {
             && !self.mlas_sqnbit_owns_fp32_compute(can_prepack, zero_points.is_some())
             && let Some(packed) = contiguous_host_slice::<u8>(&inputs[1])
             && let Some(scales) = borrowed_scales(&inputs[2])
-            && let Some(borrowed_zero_points) = borrow_optional_int4_zero_points(zero_points)
+            && let Some(borrowed_zero_points) = borrow_optional_packed_zero_points(zero_points)
         {
             // Gate on *symmetry* explicitly, not on "a zero_points input happens
             // to exist". Symmetric int4 (no zero_points) has the implicit
@@ -1311,7 +1331,7 @@ impl Kernel for MatMulNBitsKernel {
                 };
                 // SAFETY (feature contract): `has_simd_x86()` above is the
                 // AVX2 + FMA check the packed microkernel requires.
-                crate::kernels::matmul::x86_sgemm::int4_prefill_gebp(
+                crate::kernels::matmul::x86_sgemm::quant_prefill_gebp(
                     &activations,
                     &weight,
                     |index| scales.get(index),
@@ -1832,17 +1852,50 @@ impl Kernel for MatMulNBitsKernel {
                 result,
             )?;
             if !used_fast_nt {
-                let weight_kn =
-                    mm_profile::time_prepack("dequant-kn", self.nbits_weight_bytes(), || {
-                        self.dequantize_weight(
-                            &inputs[1],
-                            &inputs[2],
-                            zero_points,
-                            group_indices,
-                            WeightLayout::Kn,
-                        )
-                    })?;
-                gemm(&activations, &weight_kn, result, m, self.k, self.n)?;
+                // 8-bit prefill: fuse the dequant into the GEBP's B pack
+                // instead of materializing a `k * n` f32 weight per call.
+                //
+                // This is the only route left for `bits == 8, m > 1` on a
+                // native (non-MLAS) build, and it is the *worst* shape of the
+                // whole fallback: `dequantize_weight(Kn)` writes four bytes of
+                // f32 for every one byte of weight read, into a buffer far
+                // larger than any cache, at stride `n` -- and does it again on
+                // every call, because nothing here caches the `Kn` layout. A
+                // 3584x3584 8-bit node materializes 51 MB per prefill to
+                // multiply it once. Fusing dequant into the pack reads each
+                // packed byte once per call into an L1-resident panel that all
+                // `m` rows reuse, which is the same fix #1117 made for 4-bit,
+                // and it allocates only the per-strip scratch.
+                //
+                // Numerics are unchanged: same `(q - zero_point) * scale`, same
+                // f32 accumulation, applied in the same depth order. It is
+                // therefore not gated on `accuracy_level` -- the route it
+                // replaces was full-f32 compute at every level, and so is this.
+                #[cfg(target_arch = "x86_64")]
+                let used_gebp = self.try_int8_prefill_gebp(
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                    group_indices,
+                    &activations,
+                    m,
+                    result,
+                );
+                #[cfg(not(target_arch = "x86_64"))]
+                let used_gebp = false;
+                if !used_gebp {
+                    let weight_kn =
+                        mm_profile::time_prepack("dequant-kn", self.nbits_weight_bytes(), || {
+                            self.dequantize_weight(
+                                &inputs[1],
+                                &inputs[2],
+                                zero_points,
+                                group_indices,
+                                WeightLayout::Kn,
+                            )
+                        })?;
+                    gemm(&activations, &weight_kn, result, m, self.k, self.n)?;
+                }
             }
         }
         if let Some(bias) = bias {
@@ -1880,6 +1933,87 @@ impl MatMulNBitsKernel {
             scales: to_dense_compute_f32(scales)?,
             zero_points: zero_points.map(to_dense_bytes).transpose()?,
         })
+    }
+
+    /// Fused-dequant GEBP for an 8-bit `MatMulNBits` prefill, or `false` if this
+    /// call is not one it can serve.
+    ///
+    /// Deliberately consulted only *after* [`Self::try_prefill_mlas_nt`]
+    /// declines, so on an MLAS build the existing cached-`Nk` + `trans_b` route
+    /// keeps priority and nothing measured there changes. What this claims is
+    /// the native fallback, where the alternative is materializing the whole
+    /// `k * n` weight as f32 on every call.
+    ///
+    /// Declines, in order: a non-x86-64 host or one without AVX2 + FMA (the
+    /// `6x16` microkernel's contract); `bits != 8`; per-row `g_idx`, which the
+    /// column-contiguous pack cannot express; too few rows to amortize the pack
+    /// ([`INT8_PREFILL_GEBP_MIN_ROWS`]); the kill switch; and any operand that
+    /// cannot be borrowed in place, since copying it would give back the
+    /// allocation this route exists to avoid.
+    #[cfg(target_arch = "x86_64")]
+    #[allow(clippy::too_many_arguments)]
+    fn try_int8_prefill_gebp(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        group_indices: Option<&TensorView>,
+        activations: &[f32],
+        m: usize,
+        result: &mut [f32],
+    ) -> bool {
+        if self.bits != 8
+            || group_indices.is_some()
+            || m < INT8_PREFILL_GEBP_MIN_ROWS
+            || !crate::backend::has_simd_x86()
+            || !int8_prefill_gebp_enabled()
+        {
+            return false;
+        }
+        let Some(packed) = contiguous_host_slice::<u8>(packed) else {
+            return false;
+        };
+        let Some(scales) = borrowed_scales(scales) else {
+            return false;
+        };
+        let Some(borrowed_zero_points) = borrow_optional_packed_zero_points(zero_points) else {
+            return false;
+        };
+        let block_count = self.k.div_ceil(self.block_size);
+        // The pack indexes `packed[col * block_count * block_size + depth]` and
+        // `zero_points[col * block_count + block]` directly, so a short operand
+        // would be an out-of-bounds read rather than a wrong answer. `k` need
+        // not divide `block_size`; the trailing partial block is still stored
+        // full width, which is why this is `block_count * block_size` and not
+        // `k`.
+        if packed.len() < self.n * block_count * self.block_size
+            || scales.len() < self.n * block_count
+            || borrowed_zero_points.is_some_and(|zp| zp.len() < self.n * block_count)
+        {
+            return false;
+        }
+        let weight = crate::kernels::matmul::x86_sgemm::Int8Weight {
+            packed,
+            zero_points: borrowed_zero_points,
+            block_size: self.block_size,
+            block_count,
+        };
+        #[cfg(test)]
+        INT8_PREFILL_GEBP_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY (feature contract): `has_simd_x86()` above is the AVX2 + FMA
+        // check the packed microkernel requires. Bias is added by the caller
+        // for every branch of this fallback, so it is not passed here.
+        crate::kernels::matmul::x86_sgemm::quant_prefill_gebp(
+            activations,
+            &weight,
+            |index| scales.get(index),
+            None,
+            result,
+            m,
+            self.k,
+            self.n,
+        );
+        true
     }
 
     /// Route the blockwise-quantized MatMul through MLAS's `MlasQNBitGemmBatch`
@@ -6327,16 +6461,20 @@ fn packed_nbits_output_row(
     }
 }
 
-/// Borrow the optional int4 zero-point tensor for the zero-copy decode path.
+/// Borrow the optional zero-point tensor for the zero-copy borrowed paths.
 ///
 /// Returns `Some(None)` for a symmetric model (no zero_points input) — the
-/// borrowed kernel then uses the implicit midpoint 8. Returns `Some(Some(zp))`
-/// when an asymmetric uint8 zero_points input is present and host-contiguous.
-/// Returns `None` only when a zero_points input exists but cannot be borrowed
-/// in place, so the caller must fall through to another path. Gating on this
-/// (rather than on "a zero_points input happens to exist") is what lets
-/// symmetric int4 take the borrowed path instead of the resident f32 cache.
-fn borrow_optional_int4_zero_points<'a>(
+/// borrowed kernel then uses the implicit midpoint `1 << (bits - 1)`. Returns
+/// `Some(Some(zp))` when an asymmetric uint8 zero_points input is present and
+/// host-contiguous. Returns `None` only when a zero_points input exists but
+/// cannot be borrowed in place, so the caller must fall through to another
+/// path. Gating on this (rather than on "a zero_points input happens to exist")
+/// is what lets symmetric weights take the borrowed path instead of the
+/// resident f32 cache.
+///
+/// The bytes are handed back unpacked, so the *caller* owns the bit-width
+/// convention: 4-bit reads a nibble per block, 8-bit a whole byte.
+fn borrow_optional_packed_zero_points<'a>(
     zero_points: Option<&TensorView<'a>>,
 ) -> Option<Option<&'a [u8]>> {
     match zero_points {
@@ -6688,6 +6826,42 @@ const INT4_PREFILL_GEBP_MIN_ROWS: usize = 4;
 #[cfg(target_arch = "x86_64")]
 fn int4_prefill_gebp_enabled() -> bool {
     std::env::var("ONNX_GENAI_CPU_MM_INT4_GEBP")
+        .ok()
+        .map(|value| {
+            let value = value.trim();
+            value.is_empty() || (value != "0" && !value.eq_ignore_ascii_case("off"))
+        })
+        .unwrap_or(true)
+}
+
+/// Row count from which the fused-dequant GEBP takes over the **8-bit**
+/// prefill.
+///
+/// The 4-bit threshold ([`INT4_PREFILL_GEBP_MIN_ROWS`]) is a crossover against
+/// the row-serial *borrowed* kernel, which reads each packed byte once per row
+/// and so is genuinely cheaper at `m = 2`. There is no such competitor at
+/// 8 bits: the route this replaces materializes the entire `k * n` weight as
+/// f32 on every call regardless of `m`, so its cost is dominated by a term that
+/// does not shrink as rows are removed. Measured at `k = n = 3584`, the fused
+/// route is 17.0x faster at the smallest multi-row shape it can take
+/// (`m = 2`: 0.90 ms against 15.25 ms) and the ratio only grows from there, so
+/// the threshold is the GEBP's own lower bound rather than a crossover.
+/// `m = 1` never reaches here -- it is claimed earlier by the 8-bit decode
+/// GEMV -- so 2 is the smallest value this constant can express.
+///
+/// Derived in `benches/int8_prefill_route_ab.rs`; see
+/// `docs/benchmarks/2026-08-19-int8-prefill-gebp.md`.
+#[cfg(target_arch = "x86_64")]
+const INT8_PREFILL_GEBP_MIN_ROWS: usize = 2;
+
+/// Kill switch for the fused-dequant 8-bit prefill GEBP. Default **on**, like
+/// its 4-bit sibling: the route it replaces re-materializes the whole weight as
+/// f32 per call, so the burden of proof is on keeping that, not on removing it.
+/// Set `ONNX_GENAI_CPU_MM_INT8_GEBP=0` (or `off`) to fall back. Read-only env
+/// probe -- production never mutates it at runtime.
+#[cfg(target_arch = "x86_64")]
+fn int8_prefill_gebp_enabled() -> bool {
+    std::env::var("ONNX_GENAI_CPU_MM_INT8_GEBP")
         .ok()
         .map(|value| {
             let value = value.trim();
@@ -13865,6 +14039,217 @@ mod tests {
             kernel.weight_nk.get().is_none(),
             "batched asymmetric INT4 must not expand the weight to f32"
         );
+    }
+
+    /// The 8-bit prefill GEBP must equal the dequantized-f32 reference and must
+    /// actually be the route that ran.
+    ///
+    /// The route it replaces computes the same `(q - zp) * scale` in the same
+    /// depth order, so values alone cannot distinguish them -- hence the
+    /// counter. Covers symmetric and asymmetric, a `k` that is not a multiple
+    /// of `block_size` (partial trailing block, stored full width), an `n` that
+    /// is not a multiple of `NR = 16` (zero-padded panel), and row counts on
+    /// both sides of one `MR = 6` A panel.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn matmulnbits_int8_prefill_gebp_matches_reference_and_ran() {
+        let _probe = lock_dispatch_probe();
+        if !crate::backend::has_simd_x86() {
+            return;
+        }
+        for &(k, n, block_size) in &[(96usize, 20usize, 32usize), (100, 7, 32), (128, 16, 128)] {
+            let blocks = k.div_ceil(block_size);
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 19 % 37) as f32 - 9.0) / 10.0)
+                .collect();
+            for &asymmetric in &[false, true] {
+                let (packed, scales, zero_points, dequantized) =
+                    quantize_8bit(&weights, n, k, block_size, asymmetric);
+                let zp_shape = [n, blocks];
+                for &m in &[2usize, 3, 5, 8, 37] {
+                    let activations: Vec<f32> = (0..m * k)
+                        .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
+                        .collect();
+                    let (graph, node) = model_node(
+                        &[m, k],
+                        &[n, blocks, block_size],
+                        &[n, blocks],
+                        zero_points.as_ref().map(|_| &zp_shape[..]),
+                        &[m, n],
+                        k,
+                        n,
+                        block_size,
+                    );
+                    let mut graph = graph;
+                    graph
+                        .node_mut(node)
+                        .attributes
+                        .insert("bits".into(), Attribute::Int(8));
+                    let model = Model::new(&graph);
+                    let kernel = CpuExecutionProvider::new()
+                        .get_kernel(model.graph.node(node), &[], 1)
+                        .expect("bits=8 kernel must build");
+                    let a = Owned::f32(&[m, k], &activations);
+                    let b = Owned::u8(&[n, blocks, block_size], &packed);
+                    let scales_tensor = Owned::f32(&[n, blocks], &scales);
+                    let zp_owned = zero_points
+                        .as_ref()
+                        .map(|zp| Owned::u8(&[n, blocks], zp.as_slice()));
+                    let mut inputs = vec![a.view(), b.view(), scales_tensor.view()];
+                    if let Some(zp) = zp_owned.as_ref() {
+                        inputs.push(zp.view());
+                    }
+                    let mut y = Owned::zeros_f32(&[m, n]);
+                    let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
+                    kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                    assert_eq!(
+                        INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed),
+                        before + 1,
+                        "k={k} n={n} m={m} asymmetric={asymmetric}: the fused 8-bit GEBP \
+                         must be the route that ran"
+                    );
+                    // Scaled tolerance rather than `assert_close`'s fixed
+                    // 1e-5: the packed microkernel reduces in panel order, so
+                    // it differs from the reference in the last f32 ulps.
+                    let got = y.to_f32();
+                    let expect = reference(&activations, &dequantized, m, k, n);
+                    for (index, (&got, &expect)) in got.iter().zip(&expect).enumerate() {
+                        let tol = 1e-5 * (1.0 + expect.abs());
+                        assert!(
+                            (got - expect).abs() <= tol,
+                            "k={k} n={n} m={m} asymmetric={asymmetric} index {index}: \
+                             got={got}, expect={expect}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The kill switch switches.
+    ///
+    /// [`INT8_PREFILL_GEBP_MIN_ROWS`] is 2, so every prefill this kernel sees
+    /// is eligible; the only way back to the previous `dequantize_weight(Kn)` +
+    /// `gemm` route is `ONNX_GENAI_CPU_MM_INT8_GEBP=0`. A knob documented as a
+    /// fallback that no longer reaches the fallback is worse than no knob, so
+    /// assert the counter stays put *and* the numbers still land.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn matmulnbits_int8_gebp_kill_switch_restores_the_dequant_route() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size, m) = (96usize, 20usize, 32usize, 8usize);
+        let blocks = k.div_ceil(block_size);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 37) as f32 - 9.0) / 10.0)
+            .collect();
+        let (packed, scales, _, dequantized) = quantize_8bit(&weights, n, k, block_size, false);
+        let activations: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
+            .collect();
+        let (graph, node) = model_node(
+            &[m, k],
+            &[n, blocks, block_size],
+            &[n, blocks],
+            None,
+            &[m, n],
+            k,
+            n,
+            block_size,
+        );
+        let mut graph = graph;
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("bits".into(), Attribute::Int(8));
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .expect("bits=8 kernel must build");
+        let a = Owned::f32(&[m, k], &activations);
+        let b = Owned::u8(&[n, blocks, block_size], &packed);
+        let scales_tensor = Owned::f32(&[n, blocks], &scales);
+        let mut y = Owned::zeros_f32(&[m, n]);
+
+        let previous = std::env::var("ONNX_GENAI_CPU_MM_INT8_GEBP").ok();
+        // SAFETY: `_probe` is the lock every test that can reach this route
+        // takes, so no other test thread reads this var while it is swapped.
+        unsafe { std::env::set_var("ONNX_GENAI_CPU_MM_INT8_GEBP", "0") };
+        let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
+        let executed = kernel.execute(
+            &[a.view(), b.view(), scales_tensor.view()],
+            &mut [y.view_mut()],
+        );
+        let after = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
+        // SAFETY: same lock, still held via `_probe`.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("ONNX_GENAI_CPU_MM_INT8_GEBP", value),
+                None => std::env::remove_var("ONNX_GENAI_CPU_MM_INT8_GEBP"),
+            }
+        }
+        executed.unwrap();
+        assert_eq!(
+            after, before,
+            "the kill switch must send this prefill back to dequantize_weight(Kn)"
+        );
+        assert_close(&y.to_f32(), &reference(&a.to_f32(), &dequantized, m, k, n));
+    }
+
+    /// Decode is not diverted, and neither is a prefill too narrow to amortize
+    /// the pack.
+    ///
+    /// [`INT8_PREFILL_GEBP_MIN_ROWS`] is the whole of the row gate, and the
+    /// route below it must stay exactly what it was.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn matmulnbits_int8_gebp_declines_decode_and_narrow_prefill() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size) = (96usize, 20usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 37) as f32 - 9.0) / 10.0)
+            .collect();
+        let (packed, scales, _, _) = quantize_8bit(&weights, n, k, block_size, false);
+        for m in 1..INT8_PREFILL_GEBP_MIN_ROWS {
+            let activations: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
+                .collect();
+            let (graph, node) = model_node(
+                &[m, k],
+                &[n, blocks, block_size],
+                &[n, blocks],
+                None,
+                &[m, n],
+                k,
+                n,
+                block_size,
+            );
+            let mut graph = graph;
+            graph
+                .node_mut(node)
+                .attributes
+                .insert("bits".into(), Attribute::Int(8));
+            let model = Model::new(&graph);
+            let kernel = CpuExecutionProvider::new()
+                .get_kernel(model.graph.node(node), &[], 1)
+                .expect("bits=8 kernel must build");
+            let a = Owned::f32(&[m, k], &activations);
+            let b = Owned::u8(&[n, blocks, block_size], &packed);
+            let scales_tensor = Owned::f32(&[n, blocks], &scales);
+            let mut y = Owned::zeros_f32(&[m, n]);
+            let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
+            kernel
+                .execute(
+                    &[a.view(), b.view(), scales_tensor.view()],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+            assert_eq!(
+                INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed),
+                before,
+                "m={m} is below the row gate and must not reach the fused GEBP"
+            );
+        }
     }
 
     /// Prefill wide enough to reach the fused-dequant GEBP route (#1117) must

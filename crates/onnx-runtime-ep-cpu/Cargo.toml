@@ -84,6 +84,10 @@ name = "int4_prefill_route_ab"
 harness = false
 
 [[bench]]
+name = "int8_prefill_route_ab"
+harness = false
+
+[[bench]]
 name = "kernels"
 harness = false
 
