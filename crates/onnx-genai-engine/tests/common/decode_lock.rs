@@ -171,6 +171,48 @@ pub fn assert_native_long_context_eager_and_capture_match_prefix(
     Ok(())
 }
 
+/// Regression guard for the decode KV-bucket-growth workspace abort (Bug 1):
+/// generate `token_count` tokens from a short (single-token-bucket) prompt with
+/// the DEFAULT KV configuration and assert generation completes without the
+/// governed-workspace invariant abort (`workspace invariant mismatch` /
+/// `required > prepared`).
+///
+/// The KV capacity grows in powers of two (256, 512, 1024, …). Before the
+/// rebucket re-prepare fix, the single-token decode step grew the KV bucket via
+/// `ensure_capacity` but never re-sized the persistent `::Attention` fp32 score
+/// scratch (`batch·q_heads·q_seq·total_seq·4`), so the first execute past a
+/// power-of-two boundary needed exactly 2× the reserved workspace and hit the
+/// strict prepared-workspace invariant. Generating past the first boundary
+/// (256) from a short prompt is the minimal reproduction; a token_count of 320
+/// crosses 256→512 with margin.
+#[allow(dead_code)]
+pub fn assert_generation_completes(
+    model_dir_env: &str,
+    prompt: &str,
+    token_count: usize,
+) -> anyhow::Result<()> {
+    let Some(model_dir) = cuda_model_dir(model_dir_env) else {
+        return Ok(());
+    };
+    let tokens = generate(
+        &model_dir,
+        EngineDecodeBackend::Native,
+        Some(NativeDecodeDevice::Cuda { index: Some(0) }),
+        DecodePrecision::Model,
+        prompt,
+        token_count,
+    )?;
+    assert_eq!(
+        tokens.len(),
+        token_count,
+        "{model_dir_env} native CUDA generation returned {} of {token_count} tokens \
+         (a short return means generation aborted mid-stream, e.g. the decode \
+         KV-bucket-growth workspace invariant abort)",
+        tokens.len(),
+    );
+    Ok(())
+}
+
 fn cuda_model_dir(model_dir_env: &str) -> Option<PathBuf> {
     let Some(model_dir) = std::env::var_os(model_dir_env).map(PathBuf::from) else {
         eprintln!("skipping decode lock: set {model_dir_env}");
