@@ -48,6 +48,7 @@ mod nested_autoregressive;
 mod paged_decode;
 mod prefix_reuse;
 mod routing;
+pub use routing::is_missing_required_input;
 mod schedulers;
 #[cfg(feature = "native-backend")]
 pub(crate) use decoder_component::NativePipelineDecoder;
