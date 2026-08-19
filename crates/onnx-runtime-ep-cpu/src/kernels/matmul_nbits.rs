@@ -1298,10 +1298,10 @@ impl Kernel for MatMulNBitsKernel {
             // dense fallback's `sgemm_simd_packed`. Running it inside the
             // decode pool measured 2.4x slower purely from the narrower pool.
             #[cfg(target_arch = "x86_64")]
-            if int4_prefill_gebp_enabled()
-                && m >= INT4_PREFILL_GEBP_MIN_ROWS
+            if m >= INT4_PREFILL_GEBP_MIN_ROWS
                 && self.block_size.is_multiple_of(2)
                 && crate::backend::has_simd_x86()
+                && int4_prefill_gebp_enabled()
             {
                 let weight = crate::kernels::matmul::x86_sgemm::Int4Weight {
                     packed,

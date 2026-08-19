@@ -505,7 +505,7 @@ unsafe fn micro_6x16(
 /// bytes; two 4-bit values per byte, low nibble first. `zero_points`, when
 /// present, is one nibble per block in the same two-per-byte packing; absent
 /// means symmetric quantization with the implicit midpoint 8.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 pub(crate) struct Int4Weight<'a> {
     pub packed: &'a [u8],
     pub zero_points: Option<&'a [u8]>,
@@ -513,7 +513,7 @@ pub(crate) struct Int4Weight<'a> {
     pub block_count: usize,
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 impl Int4Weight<'_> {
     #[inline]
     fn packed_row_len(&self) -> usize {
@@ -559,7 +559,7 @@ impl Int4Weight<'_> {
 ///
 /// # Safety
 /// The caller must have verified AVX2 + FMA (i.e. [`crate::backend::has_simd_x86`]).
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn int4_prefill_gebp<S>(
     a: &[f32],
@@ -668,7 +668,7 @@ pub(crate) fn int4_prefill_gebp<S>(
 /// column's depths are contiguous — the same property that makes the transposed
 /// pack cheap. Scale and zero point are hoisted per block, so the inner loop is
 /// a nibble extract, a subtract and a multiply.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
 fn pack_b_int4<S>(
     weight: &Int4Weight<'_>,
@@ -918,6 +918,7 @@ mod tests {
     // comparison in `the_default_entry_point_routes_m1_to_the_gemv` pins the
     // route without touching process state.
 
+    #[cfg(target_arch = "x86_64")]
     /// Build a deterministic int4 weight in `MatMulNBits` layout plus the f32
     /// matrix it dequantizes to, so the fused kernel can be checked against the
     /// ordinary SGEMM on the *same* numbers.
@@ -964,6 +965,7 @@ mod tests {
         (packed, scales, zero_points, dense)
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn check_int4_gebp(m: usize, k: usize, n: usize, block_size: usize, asymmetric: bool) {
         if !has_simd_x86() {
             return;
@@ -1002,6 +1004,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn int4_gebp_matches_the_sgemm_on_the_dequantized_weight() {
         // Panel-aligned, then every awkward edge: m/n past the 6x16 tile, k
@@ -1015,6 +1018,7 @@ mod tests {
         check_int4_gebp(8, 128, 48, 128, true);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn int4_gebp_handles_a_k_that_is_not_a_whole_block() {
         // k = 70 with block_size 32 leaves a 6-deep tail block; the packed row
@@ -1023,6 +1027,7 @@ mod tests {
         check_int4_gebp(8, 70, 32, 32, true);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn int4_gebp_degenerate_shapes_are_bias_only_or_empty() {
         if !has_simd_x86() {
