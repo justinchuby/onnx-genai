@@ -7,11 +7,19 @@
 //! prefill, where every packed panel of `B` is reused across `MR` rows of `A`.
 //!
 //! At `M == 1` there is no reuse: each weight element is touched exactly once,
-//! so the kernel is purely memory-bound and every cycle spent packing is
-//! wasted.  Apple hosts already dodge this — `matmul` checks a NEON f16 GEMV
-//! *before* `try_matmul_half`, and the comment there records that the blocked
-//! GEMM is "~4x slower than the bandwidth-optimal NEON GEMV at M=1 decode
-//! shapes".  x86 had no such path and fell into the blocked kernel.
+//! so there is no arithmetic to amortise the packing against and every cycle
+//! spent packing is wasted.  Apple hosts already dodge this — `matmul` checks a
+//! NEON f16 GEMV *before* `try_matmul_half`, and the comment there records that
+//! the blocked GEMM is "~4x slower than the bandwidth-optimal NEON GEMV at M=1
+//! decode shapes".  x86 had no such path and fell into the blocked kernel.
+//!
+//! Touching each weight once is what makes memory speed the *ceiling*; it does
+//! not on its own put the kernel anywhere near it.  This one originally ran at
+//! 12-47 GB/s against a measured 75.8 GB/s host bandwidth, because accumulating
+//! straight into `acc` cost two more memory operations per FMA than the weight
+//! load itself.  Reaching 79-86% of the roofline took the register tiling
+//! described on [`TILE`].  See
+//! `docs/benchmarks/2026-08-19-f16-decode-gemv-register-tile.md`.
 //!
 //! # Why it reads `B` in `[K, N]` order rather than transposing
 //!
@@ -61,7 +69,6 @@
 /// Tiling does not re-read anything: a stripe's weight is swept once per tile
 /// over `STRIPE / TILE` disjoint column ranges, which is the same `k * STRIPE`
 /// elements in total and the same `n`-element stride between consecutive `p`.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const TILE: usize = 64;
 
 /// Output columns owned by one worker at a time.
@@ -343,7 +350,9 @@ mod tests {
         // blocks, then scalars, so every width class and every boundary
         // between them has to land on the same bits. Sweeping a contiguous
         // range rather than picked widths is what makes an off-by-one in the
-        // tile loop's `j + TILE <= w` bound impossible to miss.
+        // tile loop's `j + TILE <= w` bound impossible to miss. The top width
+        // is two whole tiles plus one 8-lane block plus one scalar, so the
+        // sweep ends having exercised all three in a single call.
         if !simd_available() {
             return;
         }
@@ -351,20 +360,21 @@ mod tests {
         let n = 300;
         let a = sample(k, 41);
         let b = f16v(&sample(k * n, 43));
+        let mut checked = 0usize;
         for w in 1..=(2 * TILE + 9) {
             for j0 in [0usize, 8, 64, 67] {
-                if j0 + w > n {
-                    continue;
-                }
+                assert!(j0 + w <= n, "the sweep must not skip j0={j0} w={w}");
                 let mut scalar = vec![f32::NAN; w];
                 stripe_scalar(&a, &b, &mut scalar, j0, k, n);
                 let mut simd = vec![f32::NAN; w];
                 // SAFETY: `simd_available()` checked above; `j0 + w <= n` is
-                // enforced by the guard, and `b` holds `k * n` elements.
+                // asserted, and `b` holds `k * n` elements.
                 unsafe { stripe_simd(&a, &b, &mut simd, j0, k, n) };
                 assert_eq!(bits(&simd), bits(&scalar), "stripe j0={j0} w={w}");
+                checked += 1;
             }
         }
+        assert_eq!(checked, 4 * (2 * TILE + 9), "the sweep silently shrank");
     }
 
     #[test]

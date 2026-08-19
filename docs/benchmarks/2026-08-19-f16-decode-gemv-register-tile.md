@@ -220,10 +220,12 @@ weakened to a tolerance.
 Two tests were added for the new structure:
 
 - `stripe_widths_around_the_tile_boundary_are_exact` sweeps every width from 1
-  to `2 * TILE + 8` at four stripe offsets and requires the SIMD stripe to match
+  to `2 * TILE + 9` at four stripe offsets and requires the SIMD stripe to match
   the scalar one bit for bit. A contiguous sweep rather than picked widths is
   what makes an off-by-one in the tile loop's `j + TILE <= w` bound impossible
-  to miss.
+  to miss. The top width is two whole tiles plus one 8-lane block plus one
+  scalar, so the sweep ends having exercised all three in a single call, and it
+  asserts its own combination count so a future `n` cannot silently shrink it.
 - `a_tile_never_straddles_a_stripe` pins `STRIPE % TILE == 0`, `TILE % 8 == 0`
   and `TILE * 2 % 64 == 0`, the three divisibility facts the no-extra-traffic
   argument rests on.

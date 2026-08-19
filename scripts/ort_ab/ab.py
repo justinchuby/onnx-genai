@@ -87,9 +87,12 @@ def run_one(
     if native_only:
         # There is no ORT arm to divide by, so the comparable metric is the
         # native time itself. Keeping the key name lets every downstream
-        # summary stay one code path.
+        # summary stay one code path, and `native_only` marks the CSV so a
+        # machine consumer reading `ratio` cannot mistake milliseconds for a
+        # dimensionless ratio.
         r["ort"] = float("nan")
         r["ratio"] = r["native"]
+    r["native_only"] = int(native_only)
     return r
 
 

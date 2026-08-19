@@ -84,6 +84,7 @@ performance cliff that only trained weights would trigger.
 | `gen_mha.py` | `com.microsoft::MultiHeadAttention` (the operator the vectorised `sdpa_f32` path serves) |
 | `gen_moe.py` | `com.microsoft::MoE` / `QMoE`, top-k routing, grouped experts |
 | `gen_transforms.py` | the transforms that *surround* attention: `Softmax`, `RotaryEmbedding`, KV-cache `Concat`, BSNH↔BNSH `Transpose` |
+| `gen_f16_gemv.py` | decode-shaped (`M = 1`) f16 `MatMul`, sweeping the weight working set from L2-resident to past LLC |
 
 Each takes an output directory:
 
@@ -137,6 +138,14 @@ python3 scripts/ort_ab/ab.py \
 
   and any arm whose delta is inside the null delta is printed as
   `WITHIN NOISE` instead of a number to paste into a table.
+* `--native-only` — run every arm with `--native-only` so no ORT session exists
+  in the child at all, and compare native times directly instead of
+  `native/ort`. **Use this for any native-vs-native A/B.** ORT's intra-op pool
+  spin-waits, so a paired run steals cores from the native arm: on the f16 GEMV
+  cells it depressed the native median by up to 6x and pushed the null control
+  to 27%, which was larger than most of the effects under test. The CSV marks
+  these runs with `native_only=1`, and in that mode the `ratio` column holds
+  native milliseconds rather than a ratio.
 * `--threads` — passed through as **both** `--native-threads N` and
   `--ort-intra-threads N`, so the two runtimes get matched pool widths.
   `--native-threads` sets `ONNX_GENAI_CPU_DECODE_THREADS` (a decode-pool width
