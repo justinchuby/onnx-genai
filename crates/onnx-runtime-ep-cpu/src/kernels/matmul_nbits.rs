@@ -4130,6 +4130,19 @@ fn deferred_decode_width() -> Option<usize> {
     (width > 0).then_some(width)
 }
 
+/// The pool width a fan-out should partition for.
+///
+/// Normally the installed pool's width. While a decode-pool install is deferred
+/// this is the width that pool *would* have had, so both the executor choice
+/// ([`flat_fan_out`]) and the grain ([`output_chunk_len`]) match the installed
+/// case exactly rather than reflecting whichever ambient pool happens to be
+/// current.
+fn effective_fan_out_width() -> usize {
+    deferred_decode_width()
+        .unwrap_or_else(rayon::current_num_threads)
+        .max(1)
+}
+
 /// Build and install the deferred decode pool around the one fan-out that needs
 /// it.
 ///
@@ -4295,9 +4308,7 @@ where
     // While a decode-pool install is deferred (see `with_decode_pool_lazy`) the
     // width the pool *would* have had is what the installed case reported here,
     // so routing is bit-identical either way.
-    let wide = deferred_decode_width()
-        .unwrap_or_else(rayon::current_num_threads)
-        .max(1);
+    let wide = effective_fan_out_width();
     let fan_out_macs = result.len().saturating_mul(k);
     let lanes = || crate::task_runtime::width().max(1);
     if flat_fan_out(fan_out_macs, calls, lanes, wide) == PrefillFanOut::Wide {
@@ -8945,7 +8956,7 @@ const MIN_OUTPUTS_PER_TASK: usize = 16;
 const MANY_THREAD_CUTOFF: usize = 48;
 
 pub(crate) fn output_chunk_len(n: usize, k: usize) -> usize {
-    let threads = rayon::current_num_threads();
+    let threads = effective_fan_out_width();
     let total_work = n.saturating_mul(k);
     // Small projections amortize Rayon well on one socket, but dispatching each
     // one across a larger pool costs more than its GEMV on the dual-socket host.
@@ -17701,6 +17712,41 @@ mod tests {
                 "row {index} was not written exactly once"
             );
         }
+    }
+
+    /// Deferring must reproduce the *grain* the installed pool would have used,
+    /// not just the executor choice.
+    ///
+    /// `output_chunk_len` reads the current pool width directly, so if it were
+    /// left on `rayon::current_num_threads()` a deferred fan-out would
+    /// partition for whichever ambient pool happened to be current -- a
+    /// different chunk size, and at the boundary a serial-vs-parallel flip,
+    /// whenever the global pool is wider than the decode pool (no explicit
+    /// budget). Results would still be correct, because row sharding is
+    /// associative, but "routing is unchanged" would not be true.
+    #[test]
+    fn a_deferred_fan_out_partitions_for_the_pool_it_would_have_installed() {
+        let (n, k) = (4096usize, 1024usize);
+
+        let one_wide = {
+            let _guard = DeferredDecodeGuard::enter(1);
+            output_chunk_len(n, k)
+        };
+        assert_eq!(
+            one_wide, n,
+            "a deferred one-wide pool must not split the output at all"
+        );
+
+        // The hint must not outlive the guard.
+        assert_eq!(
+            output_chunk_len(n, k),
+            {
+                let _guard = DeferredDecodeGuard::enter(rayon::current_num_threads().max(1));
+                output_chunk_len(n, k)
+            },
+            "with the hint equal to the ambient width the grain must be unchanged"
+        );
+        assert_eq!(deferred_decode_width(), None);
     }
 
     /// The fallback half: work that genuinely routes to Rayon must still run,
