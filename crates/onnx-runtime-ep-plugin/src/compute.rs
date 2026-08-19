@@ -2163,6 +2163,8 @@ unsafe extern "C" fn compute_execute(
     kernel_context: *mut ort::OrtKernelContext,
 ) -> *mut ort::OrtStatus {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::dispatch_probe::count(crate::dispatch_probe::Event::ComputeExecute);
+        let entry_probe = crate::dispatch_probe::Phase::CallbackEntry.enter();
         if info.is_null() || kernel_context.is_null() {
             return fail_status("Compute: null argument");
         }
@@ -2226,6 +2228,7 @@ unsafe extern "C" fn compute_execute(
             _ => None,
         };
 
+        entry_probe.end();
         let inputs = match unsafe { read_inputs(api_ref, kernel_context) } {
             Ok(v) => v,
             Err(e) => return fail_status(&format!("Compute: {e}")),
@@ -2579,6 +2582,9 @@ unsafe extern "C" fn compute_execute(
             // disagree, and panicking across the C ABI inside `Compute` turns
             // that into an opaque "internal panic" instead of a diagnosable
             // session error.
+            crate::dispatch_probe::count(crate::dispatch_probe::Event::NodeExecuted);
+            let bind_probe = crate::dispatch_probe::Phase::TensorBind.enter();
+            crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
             let mut kernel_inputs: Vec<TensorView<'_>> =
                 Vec::with_capacity(entry.input_slots.len());
             for (position, slot) in entry.input_slots.iter().enumerate() {
@@ -2597,12 +2603,15 @@ unsafe extern "C" fn compute_execute(
                     None => kernel_inputs.push(TensorView::absent(DataType::Undefined)),
                 }
             }
+            bind_probe.end();
+            let lookup_probe = crate::dispatch_probe::Phase::DispatchLookup.enter();
             let output_shapes = match infer_shapes(&entry.shape_inference, &kernel_inputs) {
                 Ok(s) => s,
                 Err(e) => {
                     return fail_status(&format!("Compute: shape inference failed: {e}"));
                 }
             };
+            lookup_probe.end();
             // Allocate outputs. Absent slots get a local scratch buffer so the
             // kernel sees the full output arity and can index by position,
             // while only present slots are allocated through ORT's kernel
@@ -2693,6 +2702,7 @@ unsafe extern "C" fn compute_execute(
             let mut ort_views: Vec<TensorMut<'_>> =
                 owned_outputs.iter_mut().map(|o| o.view_mut()).collect();
             let mut ort_view_iter = ort_views.drain(..);
+            crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
             let mut output_views: Vec<TensorMut<'_>> = Vec::with_capacity(slot_map.len());
             for (slot_idx, kind) in slot_map.iter().enumerate() {
                 match kind {
@@ -2728,6 +2738,8 @@ unsafe extern "C" fn compute_execute(
             // The single-node subgraph's operands are this node's operands, but
             // only the present ones are ORT-bound. Placement is resolved lazily
             // inside `prepare_workspace`, past the zero-byte and lifetime gates.
+            let lookup2_probe = crate::dispatch_probe::Phase::DispatchLookup.enter();
+            crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
             let node_ort_operands: Vec<usize> =
                 entry.input_slots.iter().flatten().copied().collect();
             let workspace = match unsafe {
@@ -2747,6 +2759,8 @@ unsafe extern "C" fn compute_execute(
                 Ok(w) => w,
                 Err(e) => return fail_status(&e),
             };
+            lookup2_probe.end();
+            let kernel_probe = crate::dispatch_probe::Phase::KernelInvoke.enter();
             if let Err(e) =
                 entry
                     .kernel
@@ -2754,6 +2768,7 @@ unsafe extern "C" fn compute_execute(
             {
                 return fail_status(&format!("Compute: kernel execution failed: {e}"));
             }
+            kernel_probe.end();
             EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
         } else {
             return fail_status(

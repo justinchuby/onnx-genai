@@ -160,6 +160,7 @@ pub(crate) unsafe fn read_inputs(
     api: &ort::OrtApi,
     ctx: *mut ort::OrtKernelContext,
 ) -> Result<Vec<OwnedInput>, String> {
+    let _probe = crate::dispatch_probe::Phase::MetadataQuery.enter();
     let get_input_count = api
         .KernelContext_GetInputCount
         .ok_or("OrtApi.KernelContext_GetInputCount is null")?;
@@ -182,14 +183,17 @@ pub(crate) unsafe fn read_inputs(
     let get_tensor_data = api.GetTensorData.ok_or("OrtApi.GetTensorData is null")?;
 
     let mut input_count: usize = 0;
+    crate::dispatch_probe::ort_call();
     let status = unsafe { get_input_count(ctx, &mut input_count) };
     if !status.is_null() {
         return Err("KernelContext_GetInputCount failed".into());
     }
 
+    crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
     let mut inputs = Vec::with_capacity(input_count);
     for i in 0..input_count {
         let mut value: *const ort::OrtValue = std::ptr::null();
+        crate::dispatch_probe::ort_call();
         let status = unsafe { get_input(ctx, i, &mut value) };
         if !status.is_null() {
             return Err(format!("KernelContext_GetInput({i}) failed"));
@@ -207,6 +211,7 @@ pub(crate) unsafe fn read_inputs(
 
         // Get type and shape info.
         let mut type_shape: *mut ort::OrtTensorTypeAndShapeInfo = std::ptr::null_mut();
+        crate::dispatch_probe::ort_call();
         let status = unsafe { get_type_shape(value, &mut type_shape) };
         if !status.is_null() || type_shape.is_null() {
             return Err(format!("GetTensorTypeAndShape failed for input {i}"));
@@ -214,6 +219,7 @@ pub(crate) unsafe fn read_inputs(
 
         // Element type.
         let mut elem_type: ort::ONNXTensorElementDataType = 0;
+        crate::dispatch_probe::ort_call();
         let status = unsafe { get_elem_type(type_shape, &mut elem_type) };
         if !status.is_null() {
             unsafe { release_type_shape(type_shape) };
@@ -224,25 +230,32 @@ pub(crate) unsafe fn read_inputs(
 
         // Dimensions.
         let mut ndim: usize = 0;
+        crate::dispatch_probe::ort_call();
         let status = unsafe { get_dims_count(type_shape, &mut ndim) };
         if !status.is_null() {
             unsafe { release_type_shape(type_shape) };
             return Err(format!("GetDimensionsCount failed for input {i}"));
         }
+        crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
         let mut dims = vec![0i64; ndim];
+        crate::dispatch_probe::ort_call();
         let status = unsafe { get_dims(type_shape, dims.as_mut_ptr(), ndim) };
         if !status.is_null() {
             unsafe { release_type_shape(type_shape) };
             return Err(format!("GetDimensions failed for input {i}"));
         }
+        crate::dispatch_probe::ort_call();
         unsafe { release_type_shape(type_shape) };
 
         // Validate ORT-supplied dims: reject negatives and detect overflow.
+        // Three allocations: the eager `format!` label, `shape`, and `strides`.
+        crate::dispatch_probe::count_n(crate::dispatch_probe::Event::DispatchAlloc, 3);
         let (shape, _, _) = validate_dims(&dims, dtype, &format!("input {i}"))?;
         let strides = onnx_runtime_ir::compute_contiguous_strides(&shape);
 
         // Data pointer.
         let mut data: *const c_void = std::ptr::null();
+        crate::dispatch_probe::ort_call();
         let status = unsafe { get_tensor_data(value, &mut data) };
         if !status.is_null() {
             return Err(format!("GetTensorData failed for input {i}"));
@@ -276,6 +289,7 @@ pub(crate) unsafe fn allocate_output(
     shape: &[usize],
     dtype: DataType,
 ) -> Result<OwnedOutput, String> {
+    let _probe = crate::dispatch_probe::Phase::Allocate.enter();
     let get_output = api
         .KernelContext_GetOutput
         .ok_or("OrtApi.KernelContext_GetOutput is null")?;
@@ -283,8 +297,10 @@ pub(crate) unsafe fn allocate_output(
         .GetTensorMutableData
         .ok_or("OrtApi.GetTensorMutableData is null")?;
 
+    crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
     let dims: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
     let mut value: *mut ort::OrtValue = std::ptr::null_mut();
+    crate::dispatch_probe::ort_call();
     let status = unsafe { get_output(ctx, index, dims.as_ptr(), dims.len(), &mut value) };
     if !status.is_null() {
         return Err(format!("KernelContext_GetOutput({index}) failed"));
@@ -294,6 +310,7 @@ pub(crate) unsafe fn allocate_output(
     }
 
     let mut data: *mut c_void = std::ptr::null_mut();
+    crate::dispatch_probe::ort_call();
     let status = unsafe { get_mutable_data(value, &mut data) };
     if !status.is_null() {
         return Err(format!("GetTensorMutableData failed for output {index}"));
@@ -310,6 +327,7 @@ pub(crate) unsafe fn allocate_output(
     let mem_info = match api.GetTensorMemoryInfo {
         Some(get_mem_info) => {
             let mut mi: *const ort::OrtMemoryInfo = std::ptr::null();
+            crate::dispatch_probe::ort_call();
             let status = unsafe { get_mem_info(value, &mut mi) };
             if status.is_null() {
                 mi
@@ -320,6 +338,7 @@ pub(crate) unsafe fn allocate_output(
         None => std::ptr::null(),
     };
 
+    crate::dispatch_probe::count_n(crate::dispatch_probe::Event::DispatchAlloc, 2);
     let strides = onnx_runtime_ir::compute_contiguous_strides(shape);
     Ok(OwnedOutput {
         data_ptr: data,
@@ -568,5 +587,210 @@ mod tests {
                 "dtype {dt:?} has no representable size"
             );
         }
+    }
+}
+
+/// A hand-built `OrtApi` that answers just enough of the C API for
+/// [`read_inputs`] to run, so the FFI-call and allocation counts of a dispatch
+/// can be asserted exactly without a live ONNX Runtime.
+///
+/// This is the regression guard the probe exists for: the numbers below are not
+/// aspirational, they are what the code does today. Any change that adds a
+/// round trip or an allocation to the per-`Run` path has to come here and
+/// change a number, in a diff a reviewer can see.
+#[cfg(all(test, feature = "dispatch_probe"))]
+mod dispatch_cost {
+    use super::*;
+    use crate::dispatch_probe::{self, Event};
+
+    const NDIM: usize = 2;
+    static DIMS: [i64; NDIM] = [2, 3];
+    static DATA: [f32; 6] = [0.0; 6];
+
+    // A non-null token handed back as the "type and shape info" handle. Never
+    // dereferenced — the fake accessors read from the statics above.
+    const INFO: *mut ort::OrtTensorTypeAndShapeInfo = std::ptr::without_provenance_mut(1);
+    const VALUE: *const ort::OrtValue = std::ptr::without_provenance(2);
+
+    unsafe extern "C" fn input_count(
+        _c: *const ort::OrtKernelContext,
+        out: *mut usize,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = 1 };
+        std::ptr::null_mut()
+    }
+    unsafe extern "C" fn get_input(
+        _c: *const ort::OrtKernelContext,
+        _i: usize,
+        out: *mut *const ort::OrtValue,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = VALUE };
+        std::ptr::null_mut()
+    }
+    unsafe extern "C" fn type_and_shape(
+        _v: *const ort::OrtValue,
+        out: *mut *mut ort::OrtTensorTypeAndShapeInfo,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = INFO };
+        std::ptr::null_mut()
+    }
+    unsafe extern "C" fn elem_type(
+        _i: *const ort::OrtTensorTypeAndShapeInfo,
+        out: *mut ort::ONNXTensorElementDataType,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = 1 }; // float32
+        std::ptr::null_mut()
+    }
+    unsafe extern "C" fn dims_count(
+        _i: *const ort::OrtTensorTypeAndShapeInfo,
+        out: *mut usize,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = NDIM };
+        std::ptr::null_mut()
+    }
+    unsafe extern "C" fn dims(
+        _i: *const ort::OrtTensorTypeAndShapeInfo,
+        out: *mut i64,
+        len: usize,
+    ) -> ort::OrtStatusPtr {
+        assert_eq!(len, NDIM, "read_inputs must size the dims buffer itself");
+        unsafe { std::ptr::copy_nonoverlapping(DIMS.as_ptr(), out, NDIM) };
+        std::ptr::null_mut()
+    }
+    unsafe extern "C" fn release(_i: *mut ort::OrtTensorTypeAndShapeInfo) {}
+    unsafe extern "C" fn tensor_data(
+        _v: *const ort::OrtValue,
+        out: *mut *const c_void,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = DATA.as_ptr().cast() };
+        std::ptr::null_mut()
+    }
+
+    /// `OrtApi` is a large struct of nullable function pointers; zeroing it
+    /// yields `None` in every slot (guaranteed by the null-pointer optimization
+    /// for `Option<extern "C" fn>`), which is exactly "this host offers no
+    /// entry points". We then fill in the handful `read_inputs` uses, so any
+    /// call it makes that this test did not anticipate faults loudly instead of
+    /// silently succeeding.
+    fn fake_api() -> ort::OrtApi {
+        let mut api: ort::OrtApi = unsafe { std::mem::zeroed() };
+        api.KernelContext_GetInputCount = Some(input_count);
+        api.KernelContext_GetInput = Some(get_input);
+        api.GetTensorTypeAndShape = Some(type_and_shape);
+        api.GetTensorElementType = Some(elem_type);
+        api.GetDimensionsCount = Some(dims_count);
+        api.GetDimensions = Some(dims);
+        api.ReleaseTensorTypeAndShapeInfo = Some(release);
+        api.GetTensorData = Some(tensor_data);
+        api
+    }
+
+    /// Reading one present input costs eight round trips into ORT: one shared
+    /// `GetInputCount`, then seven per input.
+    ///
+    /// Batching these is the point of #1246 and its successors; the count is
+    /// pinned here so a regression cannot quietly restore them one at a time.
+    #[test]
+    fn reading_one_input_costs_exactly_eight_ort_calls() {
+        let api = fake_api();
+        let before = dispatch_probe::snapshot();
+        let inputs = unsafe { read_inputs(&api, std::ptr::null_mut()) }.expect("fake api is total");
+        let d = dispatch_probe::snapshot().since(&before);
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].shape, vec![2, 3]);
+        assert_eq!(
+            d.event(Event::OrtFfiCall),
+            1 + 7,
+            "per-input FFI round trips changed; if this is an intentional \
+             improvement, lower the number — if it went up, justify it"
+        );
+    }
+
+    /// One input also costs five heap allocations: the `Vec<OwnedInput>` once
+    /// per `Run`, then per input the `dims` scratch, the eager
+    /// `format!("input {i}")` label built even when validation succeeds,
+    /// `shape`, and `strides`. The label is pure waste on the success path and
+    /// is the first thing to remove.
+    #[test]
+    fn reading_one_input_costs_exactly_five_allocations() {
+        let api = fake_api();
+        let before = dispatch_probe::snapshot();
+        let _ = unsafe { read_inputs(&api, std::ptr::null_mut()) }.expect("fake api is total");
+        let d = dispatch_probe::snapshot().since(&before);
+        assert_eq!(
+            d.event(Event::DispatchAlloc),
+            1 + 4,
+            "allocations on the per-Run input path changed"
+        );
+    }
+
+    /// The costs above must be *per input*, not amortised — three inputs cost
+    /// three times the per-input work plus the single shared `Vec`. This is
+    /// what makes the counters usable as a model rather than a single data
+    /// point.
+    #[test]
+    fn per_input_cost_scales_linearly() {
+        unsafe extern "C" fn three(
+            _c: *const ort::OrtKernelContext,
+            out: *mut usize,
+        ) -> ort::OrtStatusPtr {
+            unsafe { *out = 3 };
+            std::ptr::null_mut()
+        }
+        let mut api = fake_api();
+        api.KernelContext_GetInputCount = Some(three);
+
+        let before = dispatch_probe::snapshot();
+        let inputs = unsafe { read_inputs(&api, std::ptr::null_mut()) }.expect("fake api is total");
+        let d = dispatch_probe::snapshot().since(&before);
+
+        assert_eq!(inputs.len(), 3);
+        assert_eq!(d.event(Event::OrtFfiCall), 1 + 3 * 7);
+        assert_eq!(d.event(Event::DispatchAlloc), 1 + 3 * 4);
+    }
+
+    /// An absent optional input short-circuits: ORT hands back a null value and
+    /// we must not query it further. Optional slots are a documented
+    /// correctness requirement, and this pins the cheap path they take.
+    #[test]
+    fn an_absent_optional_input_short_circuits() {
+        unsafe extern "C" fn absent(
+            _c: *const ort::OrtKernelContext,
+            _i: usize,
+            out: *mut *const ort::OrtValue,
+        ) -> ort::OrtStatusPtr {
+            unsafe { *out = std::ptr::null() };
+            std::ptr::null_mut()
+        }
+        let mut api = fake_api();
+        api.KernelContext_GetInput = Some(absent);
+
+        let before = dispatch_probe::snapshot();
+        let inputs =
+            unsafe { read_inputs(&api, std::ptr::null_mut()) }.expect("absent is not an error");
+        let d = dispatch_probe::snapshot().since(&before);
+
+        assert_eq!(inputs.len(), 1);
+        assert!(inputs[0].data_ptr.is_null());
+        assert_eq!(
+            d.event(Event::OrtFfiCall),
+            2,
+            "an absent optional input must cost the input count plus one probe, nothing more"
+        );
+    }
+
+    /// The probe must not perturb what it measures: with the counters compiled
+    /// in, `read_inputs` still returns exactly the same tensor description.
+    #[test]
+    fn instrumentation_does_not_change_results() {
+        let api = fake_api();
+        let a = unsafe { read_inputs(&api, std::ptr::null_mut()) }.unwrap();
+        dispatch_probe::reset();
+        let b = unsafe { read_inputs(&api, std::ptr::null_mut()) }.unwrap();
+        assert_eq!(a[0].shape, b[0].shape);
+        assert_eq!(a[0].strides, b[0].strides);
+        assert_eq!(a[0].dtype, b[0].dtype);
+        assert_eq!(a[0].data_ptr, b[0].data_ptr);
     }
 }

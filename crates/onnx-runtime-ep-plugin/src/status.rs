@@ -47,6 +47,8 @@ pub(crate) fn invalid_arg_status(message: &str) -> *mut ort::OrtStatus {
 
 /// Create an `OrtStatus` with an explicit error code.
 pub(crate) fn status_with_code(code: ort::OrtErrorCode, message: &str) -> *mut ort::OrtStatus {
+    crate::dispatch_probe::count(crate::dispatch_probe::Event::StatusCreated);
+    let _probe = crate::dispatch_probe::Phase::StatusCrossing.enter();
     let c_msg = CString::new(message).unwrap_or_else(|_| CString::new("unknown error").unwrap());
     let api = host_api();
     if api.is_null() {
