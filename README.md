@@ -87,10 +87,10 @@ cargo build --release -p onnx-genai-cli
 
 ./target/release/onnx-genai generate \
   models/qwen2.5-0.5b \
+  "Write a short Rust hello-world program." \
   --max-new-tokens 64 \
   --temperature 0 \
-  --stream \
-  --prompt "Write a short Rust hello-world program."
+  --stream
 ```
 
 When `--max-new-tokens` is omitted, `generate` and `run` use whatever budget
@@ -187,13 +187,11 @@ inference metadata (`preprocessing.image` + `pipeline.vision` for images, an
 modalities on any package that declares one:
 
 ```bash
-./target/release/onnx-genai generate models/tiny-vlm \
-  --image ./cat.png \
-  --prompt "What is in this image?"
+./target/release/onnx-genai generate models/tiny-vlm "What is in this image?" \
+  --image ./cat.png
 
-./target/release/onnx-genai generate models/whisper-tiny \
-  --audio ./speech.wav \
-  --prompt ""
+./target/release/onnx-genai generate models/whisper-tiny "" \
+  --audio ./speech.wav
 ```
 
 Audio is transcription: the model's own decoder prompt replaces the typed text,
@@ -204,17 +202,17 @@ You do not have to know a model's image placeholder token. Pass the images and
 write the prompt normally — one placeholder per image is prepended for you:
 
 ```bash
-onnx-genai generate models/my-vlm \
-  --image left.png --image right.png \
-  --prompt "What changed between these two photos?"
+onnx-genai generate models/my-vlm "What changed between these two photos?" \
+  --image left.png --image right.png
 ```
 
 To control where each image sits in the sentence, write the placeholders
 yourself and they are honored verbatim:
 
 ```bash
-onnx-genai generate models/my-vlm --image cat.png --image dog.png \
-  --prompt "The first <image> is a cat and the second <image> is a dog. Compare them."
+onnx-genai generate models/my-vlm \
+  "The first <image> is a cat and the second <image> is a dog. Compare them." \
+  --image cat.png --image dog.png
 ```
 
 A *partial* set is rejected rather than topped up: once you start positioning
@@ -259,7 +257,7 @@ ONNX fixtures in `tests/fixtures/`; see
 `--profile` reports where the time went. It works on every subcommand:
 
 ```bash
-onnx-genai --profile generate models/qwen2.5-0.5b --prompt "..." --max-new-tokens 40
+onnx-genai --profile generate models/qwen2.5-0.5b "..." --max-new-tokens 40
 ```
 
 ```text
@@ -369,10 +367,10 @@ absent line means "not accounted here", never "nothing was used".
 
 ```bash
 # Machine-readable, for diffing runs or plotting in CI (`-` writes to stdout)
-onnx-genai --profile-json bench.json generate models/qwen2.5-0.5b --prompt "..."
+onnx-genai --profile-json bench.json generate models/qwen2.5-0.5b "..."
 
 # Chrome Trace Event timeline, viewable at https://ui.perfetto.dev
-onnx-genai --profile-trace trace.json generate models/qwen2.5-0.5b --prompt "..."
+onnx-genai --profile-trace trace.json generate models/qwen2.5-0.5b "..."
 ```
 
 ### Generate images
@@ -382,7 +380,7 @@ onnx-genai --profile-trace trace.json generate models/qwen2.5-0.5b --prompt "...
 
 ```bash
 ./target/release/onnx-genai generate models/stable-diffusion-1.5 \
-  --prompt "an astronaut riding a horse" \
+  "an astronaut riding a horse" \
   --negative-prompt "blurry, low quality" \
   --steps 25 --guidance-scale 7.5 --seed 0 \
   --width 512 --height 512 \
@@ -463,8 +461,7 @@ autoregressive decoder that emits audio codes followed by a `run_on: final_only`
 vocoder stage:
 
 ```bash
-./target/release/onnx-genai generate models/my-tts \
-  --prompt "Hello from onnx-genai." \
+./target/release/onnx-genai generate models/my-tts "Hello from onnx-genai." \
   --output-audio speech.wav
 ```
 

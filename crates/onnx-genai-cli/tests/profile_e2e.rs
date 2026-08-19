@@ -68,7 +68,6 @@ fn generate_profile_provider_comes_from_live_command_profile() {
         &profile.display().to_string(),
         "generate",
         &fixture("tiny-llm").display().to_string(),
-        "--prompt",
         "hi",
         "--max-new-tokens",
         "1",

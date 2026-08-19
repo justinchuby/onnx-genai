@@ -136,7 +136,6 @@ fn generate_sends_an_image_through_the_declared_vision_contract() {
         fixture("tiny-vlm-image-input").to_str().unwrap(),
         "--image",
         image.to_str().unwrap(),
-        "--prompt",
         "describe <image>",
         "--raw",
         "--max-new-tokens",
@@ -168,7 +167,6 @@ fn a_prompt_with_more_placeholders_than_images_is_rejected() {
         fixture("tiny-vlm-image-input").to_str().unwrap(),
         "--image",
         image.to_str().unwrap(),
-        "--prompt",
         "compare <image> and <image>",
         "--raw",
         "--max-new-tokens",
@@ -193,7 +191,6 @@ fn generate_transcribes_audio_through_the_declared_input_features_contract() {
         model.to_str().unwrap(),
         "--audio",
         model.join("tiny.wav").to_str().unwrap(),
-        "--prompt",
         "",
         "--raw",
         "--max-new-tokens",
@@ -219,7 +216,6 @@ fn a_text_only_model_rejects_attachments_by_naming_what_it_accepts() {
         fixture("tiny-llm").to_str().unwrap(),
         "--image",
         image.to_str().unwrap(),
-        "--prompt",
         "hi",
         "--max-new-tokens",
         "2",
@@ -245,7 +241,6 @@ fn piped_generate_stdout_is_byte_identical_with_or_without_default_stats() {
     let base = run(&[
         "generate",
         fixture("tiny-llm").to_str().unwrap(),
-        "--prompt",
         "hello",
         "--raw",
         "--max-new-tokens",
@@ -254,7 +249,6 @@ fn piped_generate_stdout_is_byte_identical_with_or_without_default_stats() {
     let no_stats = run(&[
         "generate",
         fixture("tiny-llm").to_str().unwrap(),
-        "--prompt",
         "hello",
         "--raw",
         "--max-new-tokens",
@@ -286,7 +280,6 @@ fn piped_stream_output_always_ends_with_a_trailing_newline() {
     let output = run(&[
         "generate",
         fixture("tiny-llm").to_str().unwrap(),
-        "--prompt",
         "hello",
         "--raw",
         "--max-new-tokens",
@@ -310,7 +303,6 @@ fn generate_renders_a_prompt_to_a_png() {
     let output = run(&[
         "generate",
         fixture("tiny-txt2img").to_str().unwrap(),
-        "--prompt",
         "an astronaut riding a horse",
         "--negative-prompt",
         "blurry low quality",
@@ -351,7 +343,6 @@ fn image_and_audio_cannot_be_combined_in_one_turn() {
         image.to_str().unwrap(),
         "--audio",
         model.join("tiny.wav").to_str().unwrap(),
-        "--prompt",
         "",
         "--raw",
         "--max-new-tokens",
@@ -370,7 +361,6 @@ fn rendering_against_a_non_diffusion_model_explains_why() {
     let output = run(&[
         "generate",
         fixture("tiny-llm").to_str().unwrap(),
-        "--prompt",
         "a cat",
         "--output-image",
         out.to_str().unwrap(),
@@ -388,7 +378,6 @@ fn rendering_rejects_sizes_that_the_vae_cannot_produce() {
     let output = run(&[
         "generate",
         fixture("tiny-txt2img").to_str().unwrap(),
-        "--prompt",
         "a cat",
         "--width",
         "7",
@@ -443,7 +432,6 @@ fn show_accepts_a_config_file_inside_the_model_directory() {
 fn list_enumerates_model_directories() {
     let output = run(&[
         "list",
-        "--models-dir",
         repository_root().join("tests/fixtures").to_str().unwrap(),
     ]);
 
@@ -479,7 +467,6 @@ fn generate_synthesizes_a_prompt_to_a_wav() {
     let output = run(&[
         "generate",
         fixture("tiny-tts").to_str().unwrap(),
-        "--prompt",
         "hello there",
         "--max-new-tokens",
         "4",
@@ -508,7 +495,6 @@ fn synthesizing_with_a_non_speech_model_explains_why() {
     let output = run(&[
         "generate",
         fixture("tiny-llm").to_str().unwrap(),
-        "--prompt",
         "hello",
         "--output-audio",
         out.to_str().unwrap(),
@@ -525,7 +511,6 @@ fn image_and_audio_output_cannot_be_requested_together() {
     let output = run(&[
         "generate",
         fixture("tiny-tts").to_str().unwrap(),
-        "--prompt",
         "hello",
         "--output-image",
         "/tmp/never.png",
@@ -551,7 +536,6 @@ fn a_single_image_needs_no_placeholder_in_the_prompt() {
         fixture("tiny-vlm-image-input").to_str().unwrap(),
         "--image",
         image.to_str().unwrap(),
-        "--prompt",
         "describe",
         "--raw",
         "--max-new-tokens",
@@ -574,7 +558,6 @@ fn an_explicitly_positioned_placeholder_is_honored() {
         fixture("tiny-vlm-image-input").to_str().unwrap(),
         "--image",
         image.to_str().unwrap(),
-        "--prompt",
         "describe <image> please",
         "--raw",
         "--max-new-tokens",
@@ -594,7 +577,6 @@ fn profile_reports_throughput_and_latency() {
         "--profile",
         "generate",
         fixture("tiny-llm").to_str().unwrap(),
-        "--prompt",
         "hello",
         "--raw",
         "--max-new-tokens",
@@ -634,7 +616,6 @@ fn profile_json_is_machine_readable() {
         path.to_str().unwrap(),
         "generate",
         fixture("tiny-llm").to_str().unwrap(),
-        "--prompt",
         "hello",
         "--raw",
         "--max-new-tokens",
@@ -662,7 +643,6 @@ fn profile_trace_writes_a_chrome_timeline() {
         path.to_str().unwrap(),
         "generate",
         fixture("tiny-llm").to_str().unwrap(),
-        "--prompt",
         "hello",
         "--raw",
         "--max-new-tokens",
@@ -694,7 +674,6 @@ fn profiling_a_render_reports_per_step_cost() {
         "--profile",
         "generate",
         fixture("tiny-txt2img").to_str().unwrap(),
-        "--prompt",
         "a cat",
         "--width",
         "8",
