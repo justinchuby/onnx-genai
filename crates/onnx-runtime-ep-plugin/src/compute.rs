@@ -2520,7 +2520,9 @@ unsafe extern "C" fn compute_execute(
                     let shape = &output_shapes[out_slot];
                     let numel: usize = shape.iter().product();
                     let byte_len = dtype.byte_size() * numel;
-                    let strides = contiguous_strides(shape);
+                    let (mut shape_buf, mut strides_buf) = take_intermediate_meta();
+                    shape_buf.extend_from_slice(shape);
+                    contiguous_strides_into(shape, &mut strides_buf);
                     let (data, scratch_ptr) = match intermediate_scratch {
                         Some(mem_info) => {
                             match unsafe {
@@ -2541,8 +2543,8 @@ unsafe extern "C" fn compute_execute(
                         IntermediateBuf {
                             data,
                             scratch_ptr,
-                            shape: shape.clone(),
-                            strides,
+                            shape: shape_buf,
+                            strides: strides_buf,
                             dtype,
                         },
                     ));
@@ -2646,7 +2648,7 @@ unsafe extern "C" fn compute_execute(
                         ));
                     }
                     if let Some(stale) = intermediates[buf_idx].take() {
-                        recycle_host_intermediate(stale.data);
+                        retire_intermediate(stale);
                     }
                     intermediates[buf_idx] = Some(buf);
                 }
@@ -2658,13 +2660,13 @@ unsafe extern "C" fn compute_execute(
                 for &buf_idx in &retire_items[retire_starts[node_idx]..retire_starts[node_idx + 1]]
                 {
                     if let Some(dead) = intermediates[buf_idx].take() {
-                        recycle_host_intermediate(dead.data);
+                        retire_intermediate(dead);
                     }
                 }
             }
 
             for slot in intermediates.drain(..).flatten() {
-                recycle_host_intermediate(slot.data);
+                retire_intermediate(slot);
             }
         } else if exported.entries.len() == 1 {
             // ── Fast path: single-kernel subgraph ─────────────────────────
@@ -2901,6 +2903,57 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// Retired shape/stride vectors from dead intermediates, per thread.
+    ///
+    /// Separate from [`HOST_INTERMEDIATE_POOL`] because an intermediate backed
+    /// by ORT scratch has an empty `data` vector but still owns real shape and
+    /// stride allocations — pooling them together would throw the metadata away
+    /// on exactly the path that allocates it.
+    static INTERMEDIATE_META_POOL: std::cell::RefCell<Vec<(Vec<usize>, Vec<i64>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Empty shape and stride vectors, reusing a retired pair's capacity.
+///
+/// Both come back **empty**, never resized. That is the property that makes
+/// stale metadata impossible rather than merely unlikely: there is no element
+/// for a caller to read before it writes one, so a reused pair cannot be
+/// mistaken for a filled one no matter what the previous tenant held. It also
+/// means a shorter shape can never inherit a longer one's trailing dimensions,
+/// which a `resize`-based reuse would allow.
+fn take_intermediate_meta() -> (Vec<usize>, Vec<i64>) {
+    INTERMEDIATE_META_POOL.with(|pool| pool.borrow_mut().pop().unwrap_or_default())
+}
+
+/// Hand a dead intermediate's shape and strides back for reuse.
+///
+/// Cleared on the way in, not on the way out, so the pool never holds readable
+/// stale dimensions.
+fn recycle_intermediate_meta(mut shape: Vec<usize>, mut strides: Vec<i64>) {
+    if shape.capacity() == 0 && strides.capacity() == 0 {
+        return;
+    }
+    shape.clear();
+    strides.clear();
+    INTERMEDIATE_META_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < HOST_INTERMEDIATE_POOL_SLOTS {
+            pool.push((shape, strides));
+        }
+    });
+}
+
+/// Retire a dead intermediate, reclaiming both its bytes and its metadata.
+///
+/// Single entry point so a caller cannot reclaim one and silently drop the
+/// other, which is what happened before: every death site recycled `data` and
+/// let `shape`/`strides` fall on the floor, costing two allocations per node.
+fn retire_intermediate(buf: IntermediateBuf) {
+    recycle_host_intermediate(buf.data);
+    recycle_intermediate_meta(buf.shape, buf.strides);
+}
+
 /// Storage for one host intermediate of `len` bytes, reusing a retired buffer
 /// when one is large enough.
 ///
@@ -2972,6 +3025,13 @@ fn recycle_host_intermediate(buf: Vec<u8>) {
 #[cfg(test)]
 fn drain_host_intermediate_pool() {
     HOST_INTERMEDIATE_POOL.with(|pool| pool.borrow_mut().clear());
+}
+
+/// Empty this thread's metadata pool. Same reasoning as
+/// [`drain_host_intermediate_pool`].
+#[cfg(test)]
+fn drain_intermediate_meta_pool() {
+    INTERMEDIATE_META_POOL.with(|pool| pool.borrow_mut().clear());
 }
 
 /// For each intermediate buffer, the highest node index that reads it, or
@@ -3063,11 +3123,21 @@ fn absent_slot_strides(
 }
 
 fn contiguous_strides(shape: &[usize]) -> Vec<i64> {
-    let mut strides = vec![1i64; shape.len()];
-    for i in (0..shape.len().saturating_sub(1)).rev() {
-        strides[i] = strides[i + 1] * shape[i + 1] as i64;
-    }
+    let mut strides = Vec::new();
+    contiguous_strides_into(shape, &mut strides);
     strides
+}
+
+/// Write `shape`'s contiguous strides into `out`, reusing its capacity.
+///
+/// `out` is cleared first, so any previous tenant's contents are gone before a
+/// single stride is written and a short shape cannot inherit a long one's tail.
+fn contiguous_strides_into(shape: &[usize], out: &mut Vec<i64>) {
+    out.clear();
+    out.resize(shape.len(), 1i64);
+    for i in (0..shape.len().saturating_sub(1)).rev() {
+        out[i] = out[i + 1] * shape[i + 1] as i64;
+    }
 }
 
 /// Build a mutable TensorView from an IntermediateBuf (unsafe: caller ensures
@@ -5352,6 +5422,124 @@ mod tests {
     // ── Intermediate buffer overflow test ─────────────────────────────────
 
     #[test]
+    /// The reusing writer must agree with the allocating one everywhere,
+    /// including the degenerate shapes that only show up in real models.
+    #[test]
+    fn contiguous_strides_into_matches_the_allocating_version() {
+        let cases: &[&[usize]] = &[
+            &[],
+            &[1],
+            &[0],
+            &[5],
+            &[2, 3],
+            &[2, 3, 4],
+            &[3, 0, 2],
+            &[1, 1, 1, 7],
+            &[6, 1, 1],
+        ];
+        for shape in cases {
+            let mut out = Vec::new();
+            super::contiguous_strides_into(shape, &mut out);
+            assert_eq!(
+                out,
+                super::contiguous_strides(shape),
+                "mismatch for shape {shape:?}"
+            );
+        }
+    }
+
+    /// A reused stride buffer must not keep the previous shape's tail.
+    ///
+    /// This is the failure a `resize`-without-clear would produce: the new
+    /// shape is shorter, so the extra trailing strides survive and the tensor
+    /// silently claims more dimensions than it has.
+    #[test]
+    fn a_reused_stride_buffer_cannot_inherit_a_longer_shapes_tail() {
+        let mut out = Vec::new();
+        super::contiguous_strides_into(&[2, 3, 4, 5], &mut out);
+        assert_eq!(out.len(), 4);
+        super::contiguous_strides_into(&[7], &mut out);
+        assert_eq!(out, super::contiguous_strides(&[7]));
+        assert_eq!(out.len(), 1, "trailing strides survived the reuse");
+    }
+
+    /// Recycled metadata must come back empty, with its capacity intact.
+    ///
+    /// Empty is the load-bearing half: it is what makes stale dimensions
+    /// unreadable rather than merely unlikely to be read.
+    #[test]
+    fn recycled_metadata_comes_back_empty_but_keeps_capacity() {
+        super::drain_intermediate_meta_pool();
+        let mut shape = Vec::with_capacity(16);
+        shape.extend_from_slice(&[9, 9, 9]);
+        let mut strides = Vec::with_capacity(16);
+        strides.extend_from_slice(&[9, 9, 9]);
+        super::recycle_intermediate_meta(shape, strides);
+
+        let (shape, strides) = super::take_intermediate_meta();
+        assert!(shape.is_empty(), "recycled shape came back non-empty");
+        assert!(strides.is_empty(), "recycled strides came back non-empty");
+        assert!(
+            shape.capacity() >= 16 && strides.capacity() >= 16,
+            "capacity was not reused: {} / {}",
+            shape.capacity(),
+            strides.capacity()
+        );
+        super::drain_intermediate_meta_pool();
+    }
+
+    /// Retiring an intermediate must reclaim its metadata, not just its bytes.
+    #[test]
+    fn retiring_an_intermediate_reclaims_its_metadata() {
+        super::drain_intermediate_meta_pool();
+        let buf = super::IntermediateBuf {
+            data: Vec::new(),
+            scratch_ptr: std::ptr::null_mut(),
+            shape: Vec::with_capacity(8),
+            strides: Vec::with_capacity(8),
+            dtype: DataType::Float32,
+        };
+        super::retire_intermediate(buf);
+        let (shape, strides) = super::take_intermediate_meta();
+        assert!(
+            shape.capacity() >= 8 && strides.capacity() >= 8,
+            "retire dropped the metadata instead of pooling it"
+        );
+        drop((shape, strides));
+        super::drain_intermediate_meta_pool();
+    }
+
+    /// A pathological graph must not pin unbounded metadata.
+    #[test]
+    fn the_metadata_pool_respects_its_cap() {
+        super::drain_intermediate_meta_pool();
+        for _ in 0..super::HOST_INTERMEDIATE_POOL_SLOTS * 4 {
+            super::recycle_intermediate_meta(Vec::with_capacity(4), Vec::with_capacity(4));
+        }
+        let mut held = Vec::new();
+        loop {
+            let (s, t) = super::take_intermediate_meta();
+            if s.capacity() == 0 && t.capacity() == 0 {
+                break;
+            }
+            held.push((s, t));
+            assert!(held.len() <= super::HOST_INTERMEDIATE_POOL_SLOTS, "pool exceeded its cap");
+        }
+        assert_eq!(held.len(), super::HOST_INTERMEDIATE_POOL_SLOTS);
+        super::drain_intermediate_meta_pool();
+    }
+
+    /// A zero-capacity pair is not worth a pool slot.
+    #[test]
+    fn recycling_empty_metadata_does_not_consume_a_slot() {
+        super::drain_intermediate_meta_pool();
+        super::recycle_intermediate_meta(Vec::new(), Vec::new());
+        let (s, t) = super::take_intermediate_meta();
+        assert_eq!(s.capacity(), 0);
+        assert_eq!(t.capacity(), 0);
+        super::drain_intermediate_meta_pool();
+    }
+
     fn contiguous_strides_empty_shape() {
         let s = super::contiguous_strides(&[]);
         assert_eq!(s, Vec::<i64>::new());
