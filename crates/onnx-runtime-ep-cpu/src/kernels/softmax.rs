@@ -290,22 +290,68 @@ fn parallel_rows_per_task(n: usize, d: usize) -> Option<usize> {
     Some((ROW_TILE_BYTES / (d.max(1) * size_of::<f32>())).clamp(1, n))
 }
 
-#[cfg(feature = "mlas")]
+/// Softmax one chunk of whole rows through whatever route this build selects.
+///
+/// Production is [`softmax_rows_serial_native`]. The non-default `mlas`
+/// research feature swaps in MLAS's SIMD row softmax while the native routine
+/// stays compiled beside it, which is what lets
+/// `tests/native_vs_mlas_differential.rs` hold the two against each other in
+/// one process.
+#[inline]
 fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
-    mlas_sys::compute_softmax_in_place(data, n, d);
+    record_softmax_route(data.len());
+    #[cfg(feature = "mlas")]
+    {
+        mlas_sys::compute_softmax_in_place(data, n, d);
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        softmax_rows_serial_native(data, n, d);
+    }
 }
 
 /// Out-of-place counterpart of [`softmax_rows_serial`]: read `src`, write `dst`,
 /// no copy. MLAS's non-log softmax streams `Input -> Output` and then rescales
 /// `Output` alone, so this is bit-identical to `dst.copy_from_slice(src)`
 /// followed by the in-place form.
-#[cfg(feature = "mlas")]
+#[inline]
 fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
-    mlas_sys::compute_softmax(src, dst, n, d);
+    record_softmax_route(src.len());
+    #[cfg(feature = "mlas")]
+    {
+        mlas_sys::compute_softmax(src, dst, n, d);
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        softmax_rows_serial_out_native(src, dst, n, d);
+    }
 }
 
-/// Portable fallback with the same semantics: subtract the row max, `exp`,
-/// normalize. Kept exact against the MLAS path by the parity tests below.
+/// Note the route this build takes, when the dispatch ledger is switched on.
+///
+/// Off — every shipped build, unless `NXRT_CPU_DISPATCH_LEDGER=1` — this is one
+/// relaxed atomic load, because the [`crate::dispatch_ledger::Observation`] is
+/// built inside the closure and never evaluated.
+#[inline]
+fn record_softmax_route(elements: usize) {
+    crate::dispatch_ledger::record_with(|| {
+        crate::dispatch_ledger::Observation::elementwise(
+            crate::dispatch_ledger::KernelFamily::Softmax,
+            if cfg!(feature = "mlas") {
+                crate::dispatch_ledger::Backend::Mlas
+            } else {
+                crate::dispatch_ledger::Backend::Native
+            },
+            "f32",
+            elements,
+        )
+    });
+}
+
+/// Portable implementation with the same semantics: subtract the row max,
+/// `exp`, normalize. **This is the production route** — and the baseline the
+/// MLAS reference is differentially tested against, so it is compiled in every
+/// configuration rather than only when MLAS is absent.
 ///
 /// The scalar `f32::exp` this used to call was one libm invocation per element
 /// and was the entire gap against ORT's vectorised CPU softmax (9-11x on the
@@ -314,8 +360,7 @@ fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
 /// `exp` eight lanes at a time on AVX2+FMA (with a scalar fallback). Sharing a
 /// single core is also what keeps the two forms bit-identical - see
 /// `out_of_place_softmax_is_bit_identical_on_pathological_rows`.
-#[cfg(not(feature = "mlas"))]
-fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
+pub fn softmax_rows_serial_native(data: &mut [f32], n: usize, d: usize) {
     for row in data.chunks_mut(d) {
         let ptr = row.as_mut_ptr();
         // SAFETY: `row` is exactly `d` elements, so `ptr` is valid for `d` f32
@@ -333,8 +378,7 @@ fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
 /// the in-place form because it calls the *same* [`softmax_row_core`] per row,
 /// reading each `src` element in place of the copied `dst` element it would
 /// otherwise have read.
-#[cfg(not(feature = "mlas"))]
-fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
+pub fn softmax_rows_serial_out_native(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
     for (srow, drow) in src.chunks(d).zip(dst.chunks_mut(d)) {
         debug_assert_eq!(srow.len(), d);
         debug_assert_eq!(drow.len(), d);
@@ -346,7 +390,7 @@ fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
     let _ = n;
 }
 
-/// The single row reducer shared by the in-place and out-of-place non-MLAS
+/// The single row reducer shared by the in-place and out-of-place native
 /// softmax paths: find the row max, write `exp(src - max)` into `dst`, and
 /// normalize by the row sum. Reading from `src` and writing to `dst` through
 /// one routine is what makes those two paths bit-identical (including on the
@@ -361,7 +405,6 @@ fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
 /// regions must be either identical (`src == dst`, the in-place case) or fully
 /// disjoint - never partially overlapping - because the AVX2 kernel loads a
 /// whole 8-lane block from `src` before storing the matching block to `dst`.
-#[cfg(not(feature = "mlas"))]
 #[inline]
 unsafe fn softmax_row_core(src: *const f32, dst: *mut f32, d: usize) {
     if d == 0 {
@@ -387,7 +430,6 @@ unsafe fn softmax_row_core(src: *const f32, dst: *mut f32, d: usize) {
 ///
 /// # Safety
 /// Same contract as [`softmax_row_core`].
-#[cfg(not(feature = "mlas"))]
 unsafe fn softmax_row_scalar(src: *const f32, dst: *mut f32, d: usize) {
     let mut max = f32::NEG_INFINITY;
     for i in 0..d {
@@ -429,10 +471,7 @@ unsafe fn softmax_row_scalar(src: *const f32, dst: *mut f32, d: usize) {
 /// masked row still normalizes to `NaN` and a partially masked row's masked
 /// positions are exactly `0`, matching the scalar reference bit for bit through
 /// the shared normalization.
-#[cfg(all(
-    not(feature = "mlas"),
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod softmax_avx2 {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;

@@ -6,28 +6,151 @@
 # which can split logical changes and surprise the author. An explicit
 # failure + exact fix command is faster to act on and educational.
 #
+# Windows-safe implementation. Two problems ruled out `cargo fmt --all`:
+#   1. `cargo fmt --all` passes every workspace file path to ONE rustfmt
+#      process. With 54 members / ~970 tracked .rs files this overflows the
+#      Windows ~32 KB command-line limit and exits 1 with
+#      "The filename or extension is too long. (os error 206)". (Linux CI is
+#      unaffected because ARG_MAX is ~2 MB.)
+#   2. Raw per-file `rustfmt --edition <E> --check` is not a safe substitute.
+#      This workspace is MIXED-EDITION (52 members on 2024, 2 on 2021). Running
+#      rustfmt with the wrong edition mis-parses 2024-only syntax (e.g. `let`
+#      chains: "error: let chains are only allowed in Rust 2024 or later") and
+#      fails. Only cargo knows each package's declared edition, so driving the
+#      check per package via `cargo fmt -p <pkg>` is the only correct approach.
+# So we map the staged .rs files to their owning workspace packages and run
+# `cargo fmt -p <pkg> -- --check`, which invokes rustfmt once per package with
+# that package's own edition. This is Windows-safe, faster than checking all
+# 54, and it does not block a commit on pre-existing drift in files the author
+# never touched.
+#
+# This mirrors CI's scope precisely: files that belong to a crate which is NOT
+# a workspace member (e.g. the root-level bench-* crates) are skipped with a
+# warning, because CI's `cargo fmt --all` does not cover them either. Blocking
+# on a non-member would recreate the very os-error-206 failure shape this hook
+# exists to avoid (`cargo fmt -p <non-member>` fails with "not a member of the
+# workspace"), and would wall people off behind drift they did not introduce.
+#
+# NOTE: stderr is intentionally NOT suppressed — the old `2>/dev/null` hid the
+# os-error-206 message and left contributors staring at a misleading "Fix:
+# cargo fmt --all" that also fails.
+#
 # Installed by: scripts/install-hooks.sh
 
 set -euo pipefail
 
-# Skip if cargo/rustfmt not available (non-Rust contributor)
+# Skip if cargo/rustfmt not available (non-Rust contributor).
 if ! command -v cargo &>/dev/null; then
     exit 0
 fi
 
-# Only check if any .rs files are staged (fast path for non-Rust commits)
-if ! git diff --cached --name-only --diff-filter=ACMR | grep -q '\.rs$'; then
+# Collect staged (added/copied/modified/renamed) .rs files.
+mapfile -t staged_rs < <(git diff --cached --name-only --diff-filter=ACMR | grep '\.rs$' || true)
+if [[ ${#staged_rs[@]} -eq 0 ]]; then
     exit 0
 fi
 
-# Run the format check
-if ! cargo fmt --all -- --check 2>/dev/null; then
+repo_root="$(git rev-parse --show-toplevel)"
+
+# Authoritative list of workspace members. Capture first, THEN read the exit
+# code — piping (e.g. `... | head`) would report the pipe's status, not
+# cargo's, which is exactly the trap that produced a false green elsewhere.
+# The `|| meta_exit=$?` keeps `set -e` from aborting so we can fail OPEN.
+meta=""
+meta_exit=0
+meta="$(cargo metadata --no-deps --format-version 1 2>/dev/null)" || meta_exit=$?
+if [[ $meta_exit -ne 0 || -z "$meta" ]]; then
+    echo "pre-commit: warning — 'cargo metadata' failed (exit $meta_exit); skipping the" >&2
+    echo "  rustfmt gate for this commit. A format gate must not lock you out of the repo." >&2
+    echo "  Check formatting manually with 'cargo fmt -p <pkg> -- --check' if needed." >&2
+    exit 0
+fi
+
+# Normalized member manifest directories (lowercase, forward slashes, no
+# trailing /Cargo.toml). manifest_path only appears on member packages in
+# --no-deps output, so this is unambiguous — unlike bare "name" keys, which are
+# also present on every dependency.
+member_dirs="$(printf '%s' "$meta" \
+    | grep -o '"manifest_path":"[^"]*"' \
+    | sed -e 's/^"manifest_path":"//' -e 's/"$//' -e 's#\\\\#/#g' -e 's#/Cargo.toml$##' \
+    | tr 'A-Z' 'a-z')"
+
+is_member_dir() {
+    printf '%s\n' "$member_dirs" | grep -Fxq "$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+}
+
+# Map each staged .rs file to the nearest ancestor Cargo.toml that declares a
+# [package] name — that is the crate which owns the file.
+declare -A pkgset
+unmapped=()
+nonmember=()
+for f in "${staged_rs[@]}"; do
+    dir="$repo_root/$(dirname "$f")"
+    found_name=""
+    found_dir=""
+    while [[ -n "$dir" && "$dir" == "$repo_root"* ]]; do
+        if [[ -f "$dir/Cargo.toml" ]]; then
+            name="$(awk '
+                /^\[package\]/ { inpkg = 1; next }
+                /^\[/          { inpkg = 0 }
+                inpkg && /^[[:space:]]*name[[:space:]]*=/ {
+                    gsub(/^[^"]*"/, ""); gsub(/".*/, ""); print; exit
+                }' "$dir/Cargo.toml")"
+            if [[ -n "$name" ]]; then
+                found_name="$name"
+                found_dir="$dir"
+                break
+            fi
+        fi
+        parent="$(dirname "$dir")"
+        [[ "$parent" == "$dir" ]] && break
+        dir="$parent"
+    done
+
+    if [[ -z "$found_name" ]]; then
+        unmapped+=("$f")
+    elif is_member_dir "$found_dir"; then
+        pkgset["$found_name"]=1
+    else
+        nonmember+=("$f ($found_name)")
+    fi
+done
+
+# Under `set -u`, expanding an empty array (associative arrays even in bash 5.x)
+# trips "unbound variable", so gate every read on the set-test form
+# ${arr[*]+x}, which is safe when the array has no elements.
+if [[ -n "${unmapped[*]+x}" ]]; then
+    echo "pre-commit: warning — could not map these staged .rs files to a crate:" >&2
+    printf '  %s\n' "${unmapped[@]}" >&2
+    echo "  (they will not be format-checked)" >&2
+fi
+
+if [[ -n "${nonmember[*]+x}" ]]; then
+    echo "pre-commit: warning — these staged .rs files belong to a crate that is NOT a" >&2
+    echo "  workspace member, so they are skipped (CI's 'cargo fmt --all' does not cover" >&2
+    echo "  them either):" >&2
+    printf '  %s\n' "${nonmember[@]}" >&2
+fi
+
+if [[ -z "${pkgset[*]+x}" ]]; then
+    exit 0
+fi
+
+pkg_args=()
+for p in "${!pkgset[@]}"; do
+    pkg_args+=(-p "$p")
+done
+
+if ! cargo fmt "${pkg_args[@]}" -- --check; then
     echo ""
     echo "─────────────────────────────────────────────────────────────"
     echo "  ✗ cargo fmt check failed — commit blocked"
     echo ""
-    echo "  Fix:  cargo fmt --all"
+    echo "  Fix:  cargo fmt ${pkg_args[*]}"
     echo "  Then: git add -u && git commit"
+    echo ""
+    echo "  (Do NOT use 'cargo fmt --all' on Windows in this workspace —"
+    echo "   it overflows the command-line limit: os error 206.)"
     echo "─────────────────────────────────────────────────────────────"
     echo ""
     exit 1

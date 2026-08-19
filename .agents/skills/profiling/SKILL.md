@@ -9,6 +9,12 @@ Source the repo's CUDA env script first (it puts the ORT libs and the nvidia
 wheel libs on `LD_LIBRARY_PATH` so cuBLAS/cuDNN resolve, and CUDA on `PATH`).
 `ncu`/`nsys`/`nvcc` ship in the CUDA toolkit `bin` directory.
 
+> The env script above is **Linux-oriented**. On a **Windows** dev box with no
+> CUDA toolkit (CUDA libs from pip wheels under `site-packages\nvidia`), see
+> [`docs/benchmarks/windows-cuda-runbook.md`](../../../docs/benchmarks/windows-cuda-runbook.md)
+> for the equivalent PowerShell env block that puts cuBLASLt/cuDNN on `PATH` and
+> `CUDA_PATH` at the NVRTC headers, plus a known-good smoke command.
+
 ## The workload: profile_native
 
 Build once, then run the steady-state decode loop:
