@@ -2390,6 +2390,32 @@ unsafe extern "C" fn compute_execute(
             let (retire_starts, retire_items) =
                 retirements_per_node(&routing.input_sources, routing.num_intermediate_buffers);
 
+            // Per-node scratch, hoisted so each node reuses the previous
+            // node's capacity instead of allocating its own. These were the
+            // largest single item in the dispatch allocation table: six of the
+            // ~12 allocations per node were these vectors being created and
+            // dropped once each.
+            //
+            // Each is cleared at the top of the iteration that uses it, so a
+            // node always starts from empty regardless of how the previous one
+            // exited. (Every early exit in this loop is a `return`, so a failed
+            // node cannot leak into a later one either way -- the clears are
+            // load-bearing for ordinary node-to-node reuse, not for errors.)
+            enum RoutedSlotKind {
+                Ort,
+                Buffer,
+                Absent(usize), // index into absent_scratch
+            }
+            let mut ort_outputs: Vec<crate::kernel_ctx::OwnedOutput> = Vec::new();
+            // Stores the *output slot*, not a copy of its shape: cloning the
+            // shape cost one more allocation per buffer-bound output, and the
+            // shape is already live in `output_shapes` for the whole iteration.
+            let mut buf_writes: Vec<(usize, usize, DataType)> = Vec::new();
+            let mut absent_scratch: Vec<(usize, Vec<u8>, DataType)> = Vec::new();
+            let mut slot_kinds: Vec<RoutedSlotKind> = Vec::new();
+            let mut new_bufs: Vec<(usize, IntermediateBuf)> = Vec::new();
+            let mut node_ort_operands: Vec<usize> = Vec::new();
+
             for (node_idx, entry) in exported.entries.iter().enumerate() {
                 let node_probe = crate::dispatch_probe::Phase::TensorBind.enter();
                 let sources = &routing.input_sources[node_idx];
@@ -2450,17 +2476,11 @@ unsafe extern "C" fn compute_execute(
                 // For outputs going to ORT we allocate via ORT API;
                 // for outputs going to intermediate buffers we allocate on heap;
                 // for absent slots we allocate a scratch buffer.
-                let mut ort_outputs: Vec<crate::kernel_ctx::OwnedOutput> = Vec::new();
-                let mut buf_writes: Vec<(usize, Vec<usize>, DataType)> = Vec::new();
-                let mut absent_scratch: Vec<(usize, Vec<u8>, DataType)> = Vec::new(); // (slot, buf, dtype)
-
-                // Per-slot view map to keep positions aligned end-to-end.
-                enum RoutedSlotKind {
-                    Ort,
-                    Buffer,
-                    Absent(usize), // index into absent_scratch
-                }
-                let mut slot_kinds: Vec<RoutedSlotKind> = Vec::with_capacity(sinks.len());
+                ort_outputs.clear();
+                buf_writes.clear();
+                absent_scratch.clear();
+                slot_kinds.clear();
+                slot_kinds.reserve(sinks.len());
 
                 // We need to know which output slot → which sink.
                 for (out_slot, shape) in output_shapes.iter().enumerate() {
@@ -2520,7 +2540,7 @@ unsafe extern "C" fn compute_execute(
                             slot_kinds.push(RoutedSlotKind::Ort);
                         }
                         NodeOutputSink::Buffer(buf_idx) => {
-                            buf_writes.push((*buf_idx, shape.clone(), out_dtype));
+                            buf_writes.push((*buf_idx, out_slot, out_dtype));
                             slot_kinds.push(RoutedSlotKind::Buffer);
                         }
                         NodeOutputSink::Absent => {
@@ -2574,8 +2594,12 @@ unsafe extern "C" fn compute_execute(
                 // intermediates live where the kernels execute; host EPs take a
                 // plain host buffer, which is both correct and measurably faster
                 // than ORT's host scratch allocator (see `intermediate_scratch`).
-                let mut new_bufs: Vec<(usize, IntermediateBuf)> = Vec::new();
-                for (buf_idx, shape, dtype) in &buf_writes {
+                // Redundant while `drain(..)` below is the only consumer, and
+                // kept so the invariant survives an early `continue` being
+                // added to this loop.
+                new_bufs.clear();
+                for &(buf_idx, out_slot, dtype) in &buf_writes {
+                    let shape = &output_shapes[out_slot];
                     let numel: usize = shape.iter().product();
                     let byte_len = dtype.byte_size() * numel;
                     let strides = contiguous_strides(shape);
@@ -2595,13 +2619,13 @@ unsafe extern "C" fn compute_execute(
                         None => (take_host_intermediate(byte_len), std::ptr::null_mut()),
                     };
                     new_bufs.push((
-                        *buf_idx,
+                        buf_idx,
                         IntermediateBuf {
                             data,
                             scratch_ptr,
                             shape: shape.clone(),
                             strides,
-                            dtype: *dtype,
+                            dtype,
                         },
                     ));
                 }
@@ -2661,13 +2685,11 @@ unsafe extern "C" fn compute_execute(
                 // This node's own ORT-bound operands — not subgraph input 0.
                 // Resolved lazily inside `prepare_workspace`, so a node that
                 // needs no workspace never queries ORT for placement.
-                let node_ort_operands: Vec<usize> = sources
-                    .iter()
-                    .filter_map(|src| match src {
-                        NodeInputSource::Ort(i) => Some(*i),
-                        NodeInputSource::Buffer(_) | NodeInputSource::Absent => None,
-                    })
-                    .collect();
+                node_ort_operands.clear();
+                node_ort_operands.extend(sources.iter().filter_map(|src| match src {
+                    NodeInputSource::Ort(i) => Some(*i),
+                    NodeInputSource::Buffer(_) | NodeInputSource::Absent => None,
+                }));
                 let workspace = match unsafe {
                     prepare_workspace(
                         api_ref,
@@ -2699,7 +2721,7 @@ unsafe extern "C" fn compute_execute(
                 EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
 
                 // Store new intermediate buffers.
-                for (buf_idx, buf) in new_bufs {
+                for (buf_idx, buf) in new_bufs.drain(..) {
                     if buf_idx >= intermediates.len() {
                         return fail_status(&format!(
                             "Compute: buffer index {buf_idx} out of range"
