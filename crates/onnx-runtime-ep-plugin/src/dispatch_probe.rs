@@ -580,9 +580,17 @@ pub fn ort_calls(n: u64) {
 /// of `u64`s written, or 0 if `out` is null or `len` is too small. The required
 /// length is `Phase::COUNT * 2 + Event::COUNT`.
 ///
+/// Only exported when the `dispatch_probe` feature is on. A shipped plugin must
+/// export the ORT plugin ABI and nothing else, and a `no_mangle` symbol is not
+/// free just because the code behind it is: it survives `--gc-sections`, is
+/// interposable, and appears in every dynamic symbol table. Absence *is* the
+/// "probe not compiled in" answer, which is what a `dlsym` caller already has to
+/// handle.
+///
 /// # Safety
 ///
 /// `out` must be null or point to `len` writable `u64`s.
+#[cfg(feature = "dispatch_probe")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nxrt_dispatch_probe_snapshot(out: *mut u64, len: usize) -> usize {
     let need = Phase::COUNT * 2 + Event::COUNT;
@@ -611,6 +619,10 @@ pub unsafe extern "C" fn nxrt_dispatch_probe_snapshot(out: *mut u64, len: usize)
 }
 
 /// Zero this thread's dispatch counters, for cdylib callers.
+///
+/// Feature-gated for the same reason as
+/// [`nxrt_dispatch_probe_snapshot`]: production exports the ORT plugin ABI only.
+#[cfg(feature = "dispatch_probe")]
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_dispatch_probe_reset() {
     reset();
@@ -620,6 +632,13 @@ pub extern "C" fn nxrt_dispatch_probe_reset() {
 ///
 /// Lets a harness tell "the probe reported zero" apart from "the probe is not
 /// there", which are very different answers to `did we make any FFI calls`.
+///
+/// This symbol only exists in a probe build, so resolving it *at all* already
+/// answers the question and it always returns 1. It is kept so a caller that
+/// resolved it can read a value rather than having to special-case a symbol it
+/// looked up successfully, and it still reads `compiled_in()` rather than
+/// hard-coding the answer so the two cannot drift apart.
+#[cfg(feature = "dispatch_probe")]
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_dispatch_probe_available() -> i32 {
     i32::from(compiled_in())
@@ -749,7 +768,10 @@ mod tests {
 
     /// The C entry point is what the cdylib harness uses; it must refuse a
     /// buffer it would overrun rather than writing past the end.
+    ///
+    /// Only exists in a probe build, because the entry point only exists there.
     #[test]
+    #[cfg(feature = "dispatch_probe")]
     fn c_snapshot_refuses_a_short_buffer() {
         let need = Phase::COUNT * 2 + Event::COUNT;
         let mut buf = vec![0u64; need];

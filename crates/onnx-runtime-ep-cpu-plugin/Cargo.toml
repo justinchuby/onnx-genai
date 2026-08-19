@@ -20,6 +20,13 @@ crate-type = ["cdylib", "lib"]
 # C++ toolchain can still build the cdylib.
 mlas = ["onnx-runtime-ep-cpu/mlas"]
 
+# Compile the dispatch probe into the cdylib, so a harness can resolve its
+# entry points across the ORT boundary. Never enabled for a shipped build: the
+# probe's `no_mangle` exports exist only under this feature precisely so the
+# shipped cdylib keeps exporting the ORT plugin ABI and nothing else
+# (`plugin_export_abi::l1_no_symbol_leakage` pins that).
+dispatch_probe = ["onnx-runtime-ep-plugin/dispatch_probe"]
+
 [dependencies]
 onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-ep-plugin = { path = "../onnx-runtime-ep-plugin", version = "=0.1.0-dev.5" }
